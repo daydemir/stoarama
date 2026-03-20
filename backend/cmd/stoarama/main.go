@@ -114,7 +114,7 @@ func runNode(args []string) {
 func runAuthConfigure(args []string) {
 	fs := flag.NewFlagSet("auth configure", flag.ExitOnError)
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-	apiKey := fs.String("api-key", "", "research API key")
+	apiKey := fs.String("api-key", "", "account API key")
 	_ = fs.Parse(args)
 
 	cfg, _ := loadCLIConfig()
@@ -154,7 +154,7 @@ func runAuthRequestLink(args []string) {
 func runAuthWhoAmI(args []string) {
 	fs := flag.NewFlagSet("auth whoami", flag.ExitOnError)
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-	apiKey := fs.String("api-key", "", "research API key")
+	apiKey := fs.String("api-key", "", "account API key")
 	_ = fs.Parse(args)
 
 	baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
@@ -174,7 +174,7 @@ func runAuthAPIKeys(args []string) {
 	case "list":
 		fs := flag.NewFlagSet("auth api-keys list", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-		apiKey := fs.String("api-key", "", "research API key")
+		apiKey := fs.String("api-key", "", "account API key")
 		_ = fs.Parse(args[1:])
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
@@ -185,7 +185,7 @@ func runAuthAPIKeys(args []string) {
 	case "create":
 		fs := flag.NewFlagSet("auth api-keys create", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-		apiKey := fs.String("api-key", "", "research API key")
+		apiKey := fs.String("api-key", "", "account API key")
 		label := fs.String("label", "default", "API key label")
 		expiresAt := fs.String("expires-at", "", "optional RFC3339 expiry")
 		save := fs.Bool("save", false, "save returned token into local config")
@@ -212,7 +212,7 @@ func runAuthAPIKeys(args []string) {
 	case "revoke":
 		fs := flag.NewFlagSet("auth api-keys revoke", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-		apiKey := fs.String("api-key", "", "research API key")
+		apiKey := fs.String("api-key", "", "account API key")
 		id := fs.Int64("id", 0, "API key id")
 		_ = fs.Parse(args[1:])
 		if *id <= 0 {
@@ -239,7 +239,7 @@ func runNodeEnrollmentTokens(args []string) {
 	case "list":
 		fs := flag.NewFlagSet("node enrollment-tokens list", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-		apiKey := fs.String("api-key", "", "research API key")
+		apiKey := fs.String("api-key", "", "account API key")
 		_ = fs.Parse(args[1:])
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
@@ -250,7 +250,7 @@ func runNodeEnrollmentTokens(args []string) {
 	case "create":
 		fs := flag.NewFlagSet("node enrollment-tokens create", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-		apiKey := fs.String("api-key", "", "research API key")
+		apiKey := fs.String("api-key", "", "account API key")
 		nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
 		label := fs.String("label", "", "token label")
 		expiresAt := fs.String("expires-at", "", "optional RFC3339 expiry")
@@ -271,7 +271,7 @@ func runNodeEnrollmentTokens(args []string) {
 	case "revoke":
 		fs := flag.NewFlagSet("node enrollment-tokens revoke", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
-		apiKey := fs.String("api-key", "", "research API key")
+		apiKey := fs.String("api-key", "", "account API key")
 		id := fs.Int64("id", 0, "token id")
 		_ = fs.Parse(args[1:])
 		if *id <= 0 {

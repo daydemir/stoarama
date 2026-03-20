@@ -23,7 +23,7 @@ Primary surfaces:
 Core identities:
 
 - browser session
-- researcher API key
+- user API key
 - node token
 
 Core platform objects:
