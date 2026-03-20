@@ -28,6 +28,7 @@ type accountPrincipal struct {
 	AccountID int64
 	Email     string
 	Name      string
+	Role      string
 	AuthType  string
 	SessionID *int64
 	APIKeyID  *int64
@@ -112,14 +113,14 @@ func (s *Server) lookupAccountSession(ctx context.Context, raw string) (accountP
 	var p accountPrincipal
 	var sessionID int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.id, a.email, a.name, rs.id
+		SELECT a.id, a.email, a.name, a.role, rs.id
 		FROM account_sessions rs
 		JOIN accounts a ON a.id=rs.account_id
 		WHERE rs.session_hash=$1
 		  AND rs.revoked_at IS NULL
 		  AND rs.expires_at > now()
 		  AND a.status='active'
-	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &sessionID)
+	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &sessionID)
 	if err != nil {
 		return accountPrincipal{}, err
 	}
@@ -134,14 +135,14 @@ func (s *Server) lookupAccountAPIKey(ctx context.Context, raw string) (accountPr
 	var p accountPrincipal
 	var keyID int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.id, a.email, a.name, k.id
+		SELECT a.id, a.email, a.name, a.role, k.id
 		FROM account_api_keys k
 		JOIN accounts a ON a.id=k.account_id
 		WHERE k.secret_hash=$1
 		  AND k.revoked_at IS NULL
 		  AND (k.expires_at IS NULL OR k.expires_at > now())
 		  AND a.status='active'
-	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &keyID)
+	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &keyID)
 	if err != nil {
 		return accountPrincipal{}, err
 	}
@@ -179,18 +180,23 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 
 	var accountID int64
 	var status string
+	role := bootstrapRoleForEmail(s.cfg.BootstrapAdminEmail, email)
 	if err := tx.QueryRow(r.Context(), `
-		INSERT INTO accounts (email, name, status)
-		VALUES ($1, $2, 'active')
+		INSERT INTO accounts (email, name, role, status)
+		VALUES ($1, $2, $3, 'active')
 		ON CONFLICT (email)
 		DO UPDATE SET
 			name=CASE
 				WHEN EXCLUDED.name <> '' AND accounts.name = '' THEN EXCLUDED.name
 				ELSE accounts.name
 			END,
+			role=CASE
+				WHEN EXCLUDED.role = 'admin' THEN 'admin'
+				ELSE accounts.role
+			END,
 			updated_at=now()
 		RETURNING id, status
-	`, email, name).Scan(&accountID, &status); err != nil {
+	`, email, name, role).Scan(&accountID, &status); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert account: %v", err))
 		return
 	}
@@ -340,6 +346,7 @@ func (s *Server) handleAccountMe(w http.ResponseWriter, r *http.Request) {
 			"id":        principal.AccountID,
 			"email":     principal.Email,
 			"name":      principal.Name,
+			"role":      principal.Role,
 			"auth_type": principal.AuthType,
 		},
 	})
@@ -505,7 +512,7 @@ func (s *Server) handleAccountAPIKeyRevoke(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleAdminAccountsList(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, email, name, status, email_verified_at, created_at, updated_at
+		SELECT id, email, name, role, status, email_verified_at, created_at, updated_at
 		FROM accounts
 		ORDER BY created_at DESC, id DESC
 		LIMIT 500
@@ -521,12 +528,13 @@ func (s *Server) handleAdminAccountsList(w http.ResponseWriter, r *http.Request)
 			id              int64
 			email           string
 			name            string
+			role            string
 			status          string
 			emailVerifiedAt *time.Time
 			createdAt       time.Time
 			updatedAt       time.Time
 		)
-		if err := rows.Scan(&id, &email, &name, &status, &emailVerifiedAt, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&id, &email, &name, &role, &status, &emailVerifiedAt, &createdAt, &updatedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan account: %v", err))
 			return
 		}
@@ -534,6 +542,7 @@ func (s *Server) handleAdminAccountsList(w http.ResponseWriter, r *http.Request)
 			"id":                id,
 			"email":             email,
 			"name":              name,
+			"role":              role,
 			"status":            status,
 			"email_verified_at": emailVerifiedAt,
 			"created_at":        createdAt.UTC(),
@@ -549,6 +558,14 @@ func (s *Server) handleAdminAccountDisable(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleAdminAccountEnable(w http.ResponseWriter, r *http.Request) {
 	s.handleAdminAccountStatus(w, r, "active")
+}
+
+func (s *Server) handleAdminAccountPromote(w http.ResponseWriter, r *http.Request) {
+	s.handleAdminAccountRole(w, r, "admin")
+}
+
+func (s *Server) handleAdminAccountDemote(w http.ResponseWriter, r *http.Request) {
+	s.handleAdminAccountRole(w, r, "member")
 }
 
 func (s *Server) handleAdminAccountStatus(w http.ResponseWriter, r *http.Request, status string) {
@@ -571,6 +588,28 @@ func (s *Server) handleAdminAccountStatus(w http.ResponseWriter, r *http.Request
 	}
 	_ = s.insertAccountAuthEvent(r.Context(), id, nil, "account_status_updated", "operator", "dashboard", map[string]any{"status": status})
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
+}
+
+func (s *Server) handleAdminAccountRole(w http.ResponseWriter, r *http.Request, role string) {
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	ct, err := s.pool.Exec(r.Context(), `
+		UPDATE accounts
+		SET role=$2, updated_at=now()
+		WHERE id=$1
+	`, id, role)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update account role: %v", err))
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		util.WriteError(w, http.StatusNotFound, "account not found")
+		return
+	}
+	_ = s.insertAccountAuthEvent(r.Context(), id, nil, "account_role_updated", "operator", "dashboard", map[string]any{"role": role})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "role": role})
 }
 
 func (s *Server) handleAdminAccountAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -682,6 +721,13 @@ func clearAccountSessionCookie(w http.ResponseWriter, r *http.Request) {
 
 func normalizeAccountEmail(raw string) string {
 	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func bootstrapRoleForEmail(bootstrapEmail string, email string) string {
+	if normalizeAccountEmail(bootstrapEmail) != "" && normalizeAccountEmail(bootstrapEmail) == normalizeAccountEmail(email) {
+		return "admin"
+	}
+	return "member"
 }
 
 func looksLikeEmail(raw string) bool {

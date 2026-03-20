@@ -24,7 +24,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/daydemir/stoarama/backend/internal/auth"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/email"
@@ -47,7 +46,6 @@ type Server struct {
 	frameExports  map[string]*frameExportJob
 }
 
-const dashboardSessionCookie = "stream_ops_session"
 const accountSessionCookie = "stoarama_session"
 
 const (
@@ -139,11 +137,19 @@ func (s *Server) router() http.Handler {
 			node.Get("/me", s.handleNodeMe)
 			node.Post("/heartbeat", s.handleNodeHeartbeat)
 		})
+		api.Route("/admin", func(admin chi.Router) {
+			admin.Use(s.requireAdminAuth)
+			admin.Get("/accounts", s.handleAdminAccountsList)
+			admin.Post("/accounts/{id}/disable", s.handleAdminAccountDisable)
+			admin.Post("/accounts/{id}/enable", s.handleAdminAccountEnable)
+			admin.Post("/accounts/{id}/promote-admin", s.handleAdminAccountPromote)
+			admin.Post("/accounts/{id}/demote-admin", s.handleAdminAccountDemote)
+			admin.Get("/accounts/{id}/api-keys", s.handleAdminAccountAPIKeys)
+			admin.Post("/api-keys/{id}/revoke", s.handleAdminAPIKeyRevoke)
+		})
 
 		api.Group(func(op chi.Router) {
-			op.Use(func(next http.Handler) http.Handler {
-				return auth.RequireAPIToken(s.cfg.APIToken, dashboardSessionCookie, next)
-			})
+			op.Use(s.requireAdminOrServiceAuth)
 
 			op.Post("/streams", s.handleStreamsCreate)
 			op.Patch("/streams/{id}", s.handleStreamsPatch)
@@ -188,11 +194,6 @@ func (s *Server) router() http.Handler {
 			op.Post("/media/upload-intents", s.handleUploadIntents)
 
 			op.Get("/frames", s.handleFramesList)
-			op.Get("/admin/accounts", s.handleAdminAccountsList)
-			op.Post("/admin/accounts/{id}/disable", s.handleAdminAccountDisable)
-			op.Post("/admin/accounts/{id}/enable", s.handleAdminAccountEnable)
-			op.Get("/admin/accounts/{id}/api-keys", s.handleAdminAccountAPIKeys)
-			op.Post("/admin/api-keys/{id}/revoke", s.handleAdminAPIKeyRevoke)
 
 			op.Get("/dashboard/overview", s.handleDashboardOverview)
 			op.Get("/dashboard/streams", s.handleDashboardStreams)
@@ -234,15 +235,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     dashboardSessionCookie,
-		Value:    s.cfg.APIToken,
-		Path:     "/api/v1",
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   60 * 60 * 24 * 30,
-	})
+	principal, err := s.authenticateAccountRequest(r)
+	if err != nil || principal.Role != "admin" {
+		http.Redirect(w, r, "/account?error=admin_required", http.StatusFound)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(s.dashboardHTML)

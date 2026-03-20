@@ -53,7 +53,6 @@ Feature sequence:
 
 ```bash
 export DATABASE_URL='postgres://...'
-export API_TOKEN='dev-token'
 
 export R2_ACCOUNT_ID='...'
 export R2_ACCESS_KEY_ID='...'
@@ -65,8 +64,12 @@ export R2_ENDPOINT='https://<account>.r2.cloudflarestorage.com'
 export AUTO_MIGRATE='true'
 export PORT='8080'
 
+export BOOTSTRAP_ADMIN_EMAIL='you@example.org'
 export APP_BASE_URL='http://127.0.0.1:8080'
 export EMAIL_PROVIDER='log'
+
+# Optional until machine workers are attached:
+# export SERVICE_TOKEN='runtime-service-token'
 ```
 
 ### Run API

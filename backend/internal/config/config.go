@@ -12,6 +12,8 @@ type Config struct {
 	Port                        int
 	DatabaseURL                 string
 	APIToken                    string
+	ServiceToken                string
+	BootstrapAdminEmail         string
 	MigrationDir                string
 	AutoMigrate                 bool
 	R2AccountID                 string
@@ -51,7 +53,9 @@ func Load() (Config, error) {
 	cfg := Config{
 		Port:                        intEnv("PORT", 8080),
 		DatabaseURL:                 os.Getenv("DATABASE_URL"),
-		APIToken:                    os.Getenv("API_TOKEN"),
+		APIToken:                    firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
+		ServiceToken:                firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
+		BootstrapAdminEmail:         strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		MigrationDir:                strEnv("MIGRATION_DIR", ""),
 		AutoMigrate:                 boolEnv("AUTO_MIGRATE", false),
 		R2AccountID:                 os.Getenv("R2_ACCOUNT_ID"),
@@ -99,9 +103,6 @@ func Load() (Config, error) {
 }
 
 func (c Config) ValidateAPI() error {
-	if strings.TrimSpace(c.APIToken) == "" {
-		return fmt.Errorf("missing API_TOKEN")
-	}
 	if err := c.ValidateR2(); err != nil {
 		return err
 	}

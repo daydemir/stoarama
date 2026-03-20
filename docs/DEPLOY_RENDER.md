@@ -9,12 +9,13 @@
 
 ## Required env vars
 
-- `API_TOKEN`
 - `R2_ACCOUNT_ID`
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
 - `R2_BUCKET`
+- `BOOTSTRAP_ADMIN_EMAIL`
 - optionally `R2_ENDPOINT`
+- optionally `SERVICE_TOKEN` for machine-to-machine runtime paths before node/service enrollment is expanded
 - optionally `APP_BASE_URL` if the Render hostname differs from the blueprint default
 
 ## Recommended initial values
@@ -28,10 +29,10 @@
 After Render deploys:
 
 1. open the service URL
-2. verify the root app responds
-3. verify `/account` loads
-4. verify the API process starts without migration/runtime errors
-5. run a simple `stoaramactl` call against the deployed API once credentials are set
+2. verify `/account` loads
+3. request a magic link for `BOOTSTRAP_ADMIN_EMAIL`
+4. verify that signed-in bootstrap account can open `/dashboard`
+5. verify the API process starts without migration/runtime errors
 
 ## What comes next
 
