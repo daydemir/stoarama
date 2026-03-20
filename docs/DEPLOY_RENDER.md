@@ -19,7 +19,7 @@
 
 ## Recommended initial values
 
-- `AUTO_MIGRATE=false`
+- `AUTO_MIGRATE=true` for first boot, then optional to turn off after schema is up
 - `EMAIL_PROVIDER=log`
 - `BOX_WORKER_EMBEDDED=true`
 

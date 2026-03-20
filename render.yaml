@@ -18,7 +18,7 @@ services:
           name: stoarama-db
           property: connectionString
       - key: AUTO_MIGRATE
-        value: "false"
+        value: "true"
       - key: API_TOKEN
         sync: false
       - key: R2_ACCOUNT_ID
