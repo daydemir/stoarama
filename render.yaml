@@ -19,8 +19,6 @@ services:
           property: connectionString
       - key: AUTO_MIGRATE
         value: "true"
-      - key: API_TOKEN
-        sync: false
       - key: R2_ACCOUNT_ID
         sync: false
       - key: R2_ACCESS_KEY_ID
@@ -37,6 +35,10 @@ services:
         value: 15m
       - key: APP_BASE_URL
         value: https://stoarama-api.onrender.com
+      - key: BOOTSTRAP_ADMIN_EMAIL
+        sync: false
+      - key: SERVICE_TOKEN
+        sync: false
       - key: EMAIL_PROVIDER
         value: log
       - key: MAGIC_LINK_TTL

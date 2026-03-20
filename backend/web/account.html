@@ -152,7 +152,9 @@
         const account = payload.account || {};
         accountStatus.textContent = '';
         accountBox.classList.remove('hidden');
-        accountMeta.innerHTML = `<div><b>${String(account.email || '')}</b></div><div class="status">Auth: ${String(account.auth_type || '')}</div>`;
+        const role = String(account.role || 'member');
+        const dashboardLink = role === 'admin' ? '<div style="margin-top:10px;"><a href="/dashboard">Open dashboard</a></div>' : '';
+        accountMeta.innerHTML = `<div><b>${String(account.email || '')}</b></div><div class="status">Role: ${role} · Auth: ${String(account.auth_type || '')}</div>${dashboardLink}`;
         keysEmpty.classList.add('hidden');
         keysBox.classList.remove('hidden');
         await refreshKeys();
