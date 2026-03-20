@@ -2,20 +2,11 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
-
-type servicePrincipal struct {
-	TokenType string
-}
-
-type serviceContextKey string
-
-const servicePrincipalContextKey serviceContextKey = "service_principal"
 
 func (s *Server) requireAdminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,8 +15,8 @@ func (s *Server) requireAdminAuth(next http.Handler) http.Handler {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		if principal.Role != "admin" {
-			util.WriteError(w, http.StatusForbidden, "forbidden")
+		if principal.Role != accountRoleAdmin {
+			util.WriteError(w, http.StatusForbidden, "admin access required")
 			return
 		}
 		ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
@@ -33,43 +24,22 @@ func (s *Server) requireAdminAuth(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) requireAdminOrServiceAuth(next http.Handler) http.Handler {
+func (s *Server) requireServiceAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if principal, err := s.authenticateAccountRequest(r); err == nil {
-			if principal.Role != "admin" {
-				util.WriteError(w, http.StatusForbidden, "forbidden")
-				return
-			}
-			ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
-			next.ServeHTTP(w, r.WithContext(ctx))
-			return
-		}
-
-		servicePrincipal, err := s.authenticateServiceRequest(r)
-		if err != nil {
+		if strings.TrimSpace(s.cfg.ServiceToken) == "" {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		ctx := context.WithValue(r.Context(), servicePrincipalContextKey, servicePrincipal)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		got := strings.TrimSpace(r.Header.Get("Authorization"))
+		if !strings.HasPrefix(got, "Bearer ") {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
+		if token == "" || token != strings.TrimSpace(s.cfg.ServiceToken) {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
-}
-
-func (s *Server) authenticateServiceRequest(r *http.Request) (servicePrincipal, error) {
-	if r == nil {
-		return servicePrincipal{}, fmt.Errorf("request is nil")
-	}
-	token := strings.TrimSpace(s.cfg.ServiceToken)
-	if token == "" {
-		return servicePrincipal{}, fmt.Errorf("service auth not configured")
-	}
-	got := strings.TrimSpace(r.Header.Get("Authorization"))
-	if !strings.HasPrefix(got, "Bearer ") {
-		return servicePrincipal{}, fmt.Errorf("missing service bearer token")
-	}
-	raw := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
-	if raw == "" || raw != token {
-		return servicePrincipal{}, fmt.Errorf("invalid service bearer token")
-	}
-	return servicePrincipal{TokenType: "service"}, nil
 }

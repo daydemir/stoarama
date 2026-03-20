@@ -22,7 +22,11 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-const accountScopeRead = "stoarama.read"
+const (
+	accountScopeRead  = "stoarama.read"
+	accountRoleMember = "member"
+	accountRoleAdmin  = "admin"
+)
 
 type accountPrincipal struct {
 	AccountID int64
@@ -180,7 +184,6 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 
 	var accountID int64
 	var status string
-	role := bootstrapRoleForEmail(s.cfg.BootstrapAdminEmail, email)
 	if err := tx.QueryRow(r.Context(), `
 		INSERT INTO accounts (email, name, role, status)
 		VALUES ($1, $2, $3, 'active')
@@ -190,13 +193,9 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 				WHEN EXCLUDED.name <> '' AND accounts.name = '' THEN EXCLUDED.name
 				ELSE accounts.name
 			END,
-			role=CASE
-				WHEN EXCLUDED.role = 'admin' THEN 'admin'
-				ELSE accounts.role
-			END,
 			updated_at=now()
 		RETURNING id, status
-	`, email, name, role).Scan(&accountID, &status); err != nil {
+	`, email, name, accountRoleMember).Scan(&accountID, &status); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert account: %v", err))
 		return
 	}
@@ -264,18 +263,19 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		accountID    int64
 		email        string
 		name         string
+		role         string
 		status       string
 		expiresAt    time.Time
 		consumedAt   *time.Time
 		redirectPath string
 	)
 	err = tx.QueryRow(r.Context(), `
-		SELECT ml.id, a.id, a.email, a.name, a.status, ml.expires_at, ml.consumed_at, ml.redirect_path
+		SELECT ml.id, a.id, a.email, a.name, a.role, a.status, ml.expires_at, ml.consumed_at, ml.redirect_path
 		FROM account_magic_links ml
 		JOIN accounts a ON a.id=ml.account_id
 		WHERE ml.token_hash=$1
 		FOR UPDATE
-	`, hash).Scan(&linkID, &accountID, &email, &name, &status, &expiresAt, &consumedAt, &redirectPath)
+	`, hash).Scan(&linkID, &accountID, &email, &name, &role, &status, &expiresAt, &consumedAt, &redirectPath)
 	if err != nil {
 		http.Redirect(w, r, "/account?error=invalid_token", http.StatusFound)
 		return
@@ -303,6 +303,36 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 	`, accountID); err != nil {
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
+	}
+	if s.shouldBootstrapAdmin(email) {
+		var otherAdminExists bool
+		if err := tx.QueryRow(r.Context(), `
+			SELECT EXISTS(
+				SELECT 1
+				FROM accounts
+				WHERE role=$1 AND id<>$2
+			)
+		`, accountRoleAdmin, accountID).Scan(&otherAdminExists); err != nil {
+			http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
+			return
+		}
+		if !otherAdminExists && role != accountRoleAdmin {
+			if _, err := tx.Exec(r.Context(), `
+				UPDATE accounts
+				SET role=$2, updated_at=now()
+				WHERE id=$1
+			`, accountID, accountRoleAdmin); err != nil {
+				http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
+				return
+			}
+			role = accountRoleAdmin
+			if err := s.insertAccountAuthEventTx(r.Context(), tx, accountID, nil, "account_bootstrap_admin", "system", email, map[string]any{
+				"bootstrap_admin_email": normalizeAccountEmail(s.cfg.BootstrapAdminEmail),
+			}); err != nil {
+				http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
+				return
+			}
+		}
 	}
 	rawSession, err := generateSecret(32)
 	if err != nil {
@@ -723,11 +753,12 @@ func normalizeAccountEmail(raw string) string {
 	return strings.ToLower(strings.TrimSpace(raw))
 }
 
-func bootstrapRoleForEmail(bootstrapEmail string, email string) string {
-	if normalizeAccountEmail(bootstrapEmail) != "" && normalizeAccountEmail(bootstrapEmail) == normalizeAccountEmail(email) {
-		return "admin"
+func (s *Server) shouldBootstrapAdmin(email string) bool {
+	bootstrapEmail := normalizeAccountEmail(s.cfg.BootstrapAdminEmail)
+	if bootstrapEmail == "" {
+		return false
 	}
-	return "member"
+	return normalizeAccountEmail(email) == bootstrapEmail
 }
 
 func looksLikeEmail(raw string) bool {
