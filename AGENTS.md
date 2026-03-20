@@ -27,7 +27,7 @@ The public `stoarama` CLI is narrower and is for account/node workflows, not ope
 
 - admin-curated streams
 - magic-link accounts
-- research API keys
+- account API keys
 - enrolled source/inference nodes
 - hosted capture
 - BYOC inference metadata and provenance

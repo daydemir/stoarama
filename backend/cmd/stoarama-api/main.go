@@ -54,10 +54,10 @@ func main() {
 	}
 
 	mailer, err := email.NewSender(email.Config{
-		Provider:  cfg.ResearchEmailProvider,
-		From:      cfg.ResearchEmailFrom,
-		ReplyTo:   cfg.ResearchEmailReplyTo,
-		ResendKey: cfg.ResearchEmailResendAPIKey,
+		Provider:  cfg.EmailProvider,
+		From:      cfg.EmailFrom,
+		ReplyTo:   cfg.EmailReplyTo,
+		ResendKey: cfg.EmailResendAPIKey,
 	})
 	if err != nil {
 		log.Fatalf("init email sender: %v", err)

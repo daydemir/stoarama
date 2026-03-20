@@ -12,104 +12,104 @@ import (
 )
 
 const (
-	researchNodeTypeYTRelaySource = "yt_relay_source"
-	researchNodeTypeInferenceNode = "inference_node"
+	nodeTypeYTRelaySource = "yt_relay_source"
+	nodeTypeInferenceNode = "inference_node"
 )
 
-type researchNodePrincipal struct {
+type nodePrincipal struct {
 	NodeID      int64
 	AccountID   int64
 	NodeType    string
 	DisplayName string
 }
 
-type researchNodeContextKey string
+type nodeContextKey string
 
-const researchNodePrincipalContextKey researchNodeContextKey = "research_node_principal"
+const nodePrincipalContextKey nodeContextKey = "node_principal"
 
-func normalizeResearchNodeType(raw string) (string, bool) {
+func normalizeNodeType(raw string) (string, bool) {
 	switch strings.TrimSpace(strings.ToLower(raw)) {
-	case researchNodeTypeYTRelaySource:
-		return researchNodeTypeYTRelaySource, true
-	case researchNodeTypeInferenceNode:
-		return researchNodeTypeInferenceNode, true
+	case nodeTypeYTRelaySource:
+		return nodeTypeYTRelaySource, true
+	case nodeTypeInferenceNode:
+		return nodeTypeInferenceNode, true
 	default:
 		return "", false
 	}
 }
 
-func (s *Server) requireResearchNodeAuth(next http.Handler) http.Handler {
+func (s *Server) requireNodeAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		principal, err := s.authenticateResearchNodeRequest(r)
+		principal, err := s.authenticateNodeRequest(r)
 		if err != nil {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		ctx := context.WithValue(r.Context(), researchNodePrincipalContextKey, principal)
+		ctx := context.WithValue(r.Context(), nodePrincipalContextKey, principal)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func researchNodePrincipalFromContext(ctx context.Context) (researchNodePrincipal, bool) {
+func nodePrincipalFromContext(ctx context.Context) (nodePrincipal, bool) {
 	if ctx == nil {
-		return researchNodePrincipal{}, false
+		return nodePrincipal{}, false
 	}
-	v := ctx.Value(researchNodePrincipalContextKey)
-	principal, ok := v.(researchNodePrincipal)
+	v := ctx.Value(nodePrincipalContextKey)
+	principal, ok := v.(nodePrincipal)
 	return principal, ok
 }
 
-func (s *Server) authenticateResearchNodeRequest(r *http.Request) (researchNodePrincipal, error) {
+func (s *Server) authenticateNodeRequest(r *http.Request) (nodePrincipal, error) {
 	if r == nil {
-		return researchNodePrincipal{}, fmt.Errorf("request is nil")
+		return nodePrincipal{}, fmt.Errorf("request is nil")
 	}
 	got := strings.TrimSpace(r.Header.Get("Authorization"))
 	if !strings.HasPrefix(got, "Bearer ") {
-		return researchNodePrincipal{}, fmt.Errorf("missing node bearer token")
+		return nodePrincipal{}, fmt.Errorf("missing node bearer token")
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
 	if token == "" {
-		return researchNodePrincipal{}, fmt.Errorf("missing node bearer token")
+		return nodePrincipal{}, fmt.Errorf("missing node bearer token")
 	}
-	return s.lookupResearchNodeToken(r.Context(), token)
+	return s.lookupNodeToken(r.Context(), token)
 }
 
-func (s *Server) lookupResearchNodeToken(ctx context.Context, raw string) (researchNodePrincipal, error) {
-	hash := hashResearchSecret(raw)
-	var principal researchNodePrincipal
+func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal, error) {
+	hash := hashSecret(raw)
+	var principal nodePrincipal
 	var tokenID int64
 	err := s.pool.QueryRow(ctx, `
 		SELECT n.id, n.account_id, n.node_type, n.display_name, t.id
-		FROM research_node_tokens t
-		JOIN research_nodes n ON n.id=t.node_id
-		JOIN research_accounts a ON a.id=n.account_id
+		FROM node_tokens t
+		JOIN nodes n ON n.id=t.node_id
+		JOIN accounts a ON a.id=n.account_id
 		WHERE t.secret_hash=$1
 		  AND t.revoked_at IS NULL
 		  AND n.status='active'
 		  AND a.status='active'
 	`, hash).Scan(&principal.NodeID, &principal.AccountID, &principal.NodeType, &principal.DisplayName, &tokenID)
 	if err != nil {
-		return researchNodePrincipal{}, err
+		return nodePrincipal{}, err
 	}
-	_, _ = s.pool.Exec(ctx, `UPDATE research_node_tokens SET last_used_at=now() WHERE id=$1`, tokenID)
+	_, _ = s.pool.Exec(ctx, `UPDATE node_tokens SET last_used_at=now() WHERE id=$1`, tokenID)
 	return principal, nil
 }
 
-type researchNodeEnrollmentCreateRequest struct {
+type nodeEnrollmentCreateRequest struct {
 	NodeType  string `json:"node_type"`
 	Label     string `json:"label"`
 	ExpiresAt string `json:"expires_at"`
 }
 
-func (s *Server) handleResearchNodeEnrollmentTokensList(w http.ResponseWriter, r *http.Request) {
-	principal, ok := researchPrincipalFromContext(r.Context())
+func (s *Server) handleAccountNodeEnrollmentTokensList(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT id, token_prefix, node_type, label, expires_at, consumed_at, revoked_at, created_at
-		FROM research_node_enrollment_tokens
+		FROM node_enrollment_tokens
 		WHERE account_id=$1
 		ORDER BY created_at DESC, id DESC
 	`, principal.AccountID)
@@ -152,18 +152,18 @@ func (s *Server) handleResearchNodeEnrollmentTokensList(w http.ResponseWriter, r
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
-func (s *Server) handleResearchNodeEnrollmentTokensCreate(w http.ResponseWriter, r *http.Request) {
-	principal, ok := researchPrincipalFromContext(r.Context())
+func (s *Server) handleAccountNodeEnrollmentTokensCreate(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	var req researchNodeEnrollmentCreateRequest
+	var req nodeEnrollmentCreateRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	nodeType, ok := normalizeResearchNodeType(req.NodeType)
+	nodeType, ok := normalizeNodeType(req.NodeType)
 	if !ok {
 		util.WriteError(w, http.StatusBadRequest, "invalid node_type")
 		return
@@ -185,20 +185,20 @@ func (s *Server) handleResearchNodeEnrollmentTokensCreate(w http.ResponseWriter,
 		}
 		expiresAt = tm.UTC()
 	}
-	rawToken, err := generateResearchSecret(36)
+	rawToken, err := generateSecret(36)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("generate node enrollment token: %v", err))
 		return
 	}
 	token := "sie_" + rawToken
-	tokenHash := hashResearchSecret(token)
+	tokenHash := hashSecret(token)
 	tokenPrefix := token
 	if len(tokenPrefix) > 16 {
 		tokenPrefix = tokenPrefix[:16]
 	}
 	var id int64
 	err = s.pool.QueryRow(r.Context(), `
-		INSERT INTO research_node_enrollment_tokens (account_id, token_prefix, token_hash, node_type, label, expires_at)
+		INSERT INTO node_enrollment_tokens (account_id, token_prefix, token_hash, node_type, label, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id
 	`, principal.AccountID, tokenPrefix, tokenHash, nodeType, label, expiresAt).Scan(&id)
@@ -206,7 +206,7 @@ func (s *Server) handleResearchNodeEnrollmentTokensCreate(w http.ResponseWriter,
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create node enrollment token: %v", err))
 		return
 	}
-	_ = s.insertResearchAuthEvent(r.Context(), principal.AccountID, nil, "node_enrollment_token_created", "account", principal.Email, map[string]any{
+	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "node_enrollment_token_created", "account", principal.Email, map[string]any{
 		"token_id":     id,
 		"token_prefix": tokenPrefix,
 		"node_type":    nodeType,
@@ -222,8 +222,8 @@ func (s *Server) handleResearchNodeEnrollmentTokensCreate(w http.ResponseWriter,
 	})
 }
 
-func (s *Server) handleResearchNodeEnrollmentTokenRevoke(w http.ResponseWriter, r *http.Request) {
-	principal, ok := researchPrincipalFromContext(r.Context())
+func (s *Server) handleAccountNodeEnrollmentTokenRevoke(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -233,7 +233,7 @@ func (s *Server) handleResearchNodeEnrollmentTokenRevoke(w http.ResponseWriter, 
 		return
 	}
 	ct, err := s.pool.Exec(r.Context(), `
-		UPDATE research_node_enrollment_tokens
+		UPDATE node_enrollment_tokens
 		SET revoked_at=COALESCE(revoked_at, now()), updated_at=now()
 		WHERE id=$1 AND account_id=$2
 	`, id, principal.AccountID)
@@ -245,21 +245,21 @@ func (s *Server) handleResearchNodeEnrollmentTokenRevoke(w http.ResponseWriter, 
 		util.WriteError(w, http.StatusNotFound, "node enrollment token not found")
 		return
 	}
-	_ = s.insertResearchAuthEvent(r.Context(), principal.AccountID, nil, "node_enrollment_token_revoked", "account", principal.Email, map[string]any{
+	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "node_enrollment_token_revoked", "account", principal.Email, map[string]any{
 		"token_id": id,
 	})
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *Server) handleResearchNodesList(w http.ResponseWriter, r *http.Request) {
-	principal, ok := researchPrincipalFromContext(r.Context())
+func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at
-		FROM research_nodes
+		FROM nodes
 		WHERE account_id=$1
 		ORDER BY created_at DESC, id DESC
 	`, principal.AccountID)
@@ -270,7 +270,7 @@ func (s *Server) handleResearchNodesList(w http.ResponseWriter, r *http.Request)
 	defer rows.Close()
 	items := make([]map[string]any, 0, 8)
 	for rows.Next() {
-		item, err := scanResearchNodeRow(rows)
+		item, err := scanNodeRow(rows)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan node: %v", err))
 			return
@@ -284,7 +284,7 @@ func (s *Server) handleResearchNodesList(w http.ResponseWriter, r *http.Request)
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
-type researchNodeEnrollRequest struct {
+type nodeEnrollRequest struct {
 	Token            string         `json:"token"`
 	NodeType         string         `json:"node_type"`
 	DisplayName      string         `json:"display_name"`
@@ -294,8 +294,8 @@ type researchNodeEnrollRequest struct {
 	MetadataJSON     map[string]any `json:"metadata_json"`
 }
 
-func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request) {
-	var req researchNodeEnrollRequest
+func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
+	var req nodeEnrollRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -310,12 +310,12 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, http.StatusBadRequest, "display_name is required")
 		return
 	}
-	nodeType, ok := normalizeResearchNodeType(req.NodeType)
+	nodeType, ok := normalizeNodeType(req.NodeType)
 	if !ok {
 		util.WriteError(w, http.StatusBadRequest, "invalid node_type")
 		return
 	}
-	tokenHash := hashResearchSecret(rawToken)
+	tokenHash := hashSecret(rawToken)
 	capBytes, err := json.Marshal(nonNilMap(req.CapabilitiesJSON))
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("marshal capabilities_json: %v", err))
@@ -346,8 +346,8 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 	)
 	err = tx.QueryRow(r.Context(), `
 		SELECT t.id, t.account_id, t.node_type, t.expires_at, t.consumed_at, t.revoked_at, a.email, a.status
-		FROM research_node_enrollment_tokens t
-		JOIN research_accounts a ON a.id=t.account_id
+		FROM node_enrollment_tokens t
+		JOIN accounts a ON a.id=t.account_id
 		WHERE t.token_hash=$1
 		FOR UPDATE
 	`, tokenHash).Scan(&enrollmentID, &accountID, &tokenType, &expiresAt, &consumedAt, &revokedAt, &accountEmail, &accountState)
@@ -370,7 +370,7 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 
 	var nodeID int64
 	err = tx.QueryRow(r.Context(), `
-		INSERT INTO research_nodes (
+		INSERT INTO nodes (
 			account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb
 		)
 		VALUES ($1, $2, $3, $4, $5, 'active', now(), now(), $6::jsonb, $7::jsonb)
@@ -382,7 +382,7 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 	}
 
 	if _, err := tx.Exec(r.Context(), `
-		UPDATE research_node_enrollment_tokens
+		UPDATE node_enrollment_tokens
 		SET consumed_at=now(), updated_at=now()
 		WHERE id=$1
 	`, enrollmentID); err != nil {
@@ -390,20 +390,20 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	rawNodeToken, err := generateResearchSecret(36)
+	rawNodeToken, err := generateSecret(36)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("generate node token: %v", err))
 		return
 	}
 	nodeToken := "sin_" + rawNodeToken
-	nodeTokenHash := hashResearchSecret(nodeToken)
+	nodeTokenHash := hashSecret(nodeToken)
 	nodeTokenPrefix := nodeToken
 	if len(nodeTokenPrefix) > 16 {
 		nodeTokenPrefix = nodeTokenPrefix[:16]
 	}
 	var nodeTokenID int64
 	err = tx.QueryRow(r.Context(), `
-		INSERT INTO research_node_tokens (node_id, key_prefix, secret_hash, last_used_at)
+		INSERT INTO node_tokens (node_id, key_prefix, secret_hash, last_used_at)
 		VALUES ($1, $2, $3, now())
 		RETURNING id
 	`, nodeID, nodeTokenPrefix, nodeTokenHash).Scan(&nodeTokenID)
@@ -412,7 +412,7 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := s.insertResearchAuthEventTx(r.Context(), tx, accountID, nil, "node_enrolled", "account", accountEmail, map[string]any{
+	if err := s.insertAccountAuthEventTx(r.Context(), tx, accountID, nil, "node_enrolled", "account", accountEmail, map[string]any{
 		"node_id":                 nodeID,
 		"node_type":               nodeType,
 		"display_name":            displayName,
@@ -429,7 +429,7 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	node, err := s.fetchResearchNodeByID(r.Context(), nodeID)
+	node, err := s.fetchNodeByID(r.Context(), nodeID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load node: %v", err))
 		return
@@ -440,13 +440,13 @@ func (s *Server) handleResearchNodeEnroll(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (s *Server) handleResearchNodeMe(w http.ResponseWriter, r *http.Request) {
-	principal, ok := researchNodePrincipalFromContext(r.Context())
+func (s *Server) handleNodeMe(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	node, err := s.fetchResearchNodeByID(r.Context(), principal.NodeID)
+	node, err := s.fetchNodeByID(r.Context(), principal.NodeID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load node: %v", err))
 		return
@@ -454,18 +454,18 @@ func (s *Server) handleResearchNodeMe(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, http.StatusOK, map[string]any{"node": node})
 }
 
-type researchNodeHeartbeatRequest struct {
+type nodeHeartbeatRequest struct {
 	CapabilitiesJSON map[string]any `json:"capabilities_json"`
 	MetadataJSON     map[string]any `json:"metadata_json"`
 }
 
-func (s *Server) handleResearchNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
-	principal, ok := researchNodePrincipalFromContext(r.Context())
+func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	var req researchNodeHeartbeatRequest
+	var req nodeHeartbeatRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -489,7 +489,7 @@ func (s *Server) handleResearchNodeHeartbeat(w http.ResponseWriter, r *http.Requ
 		metaArg = string(b)
 	}
 	ct, err := s.pool.Exec(r.Context(), `
-		UPDATE research_nodes
+		UPDATE nodes
 		SET
 			last_heartbeat_at=now(),
 			capabilities_jsonb=COALESCE($2::jsonb, capabilities_jsonb),
@@ -505,7 +505,7 @@ func (s *Server) handleResearchNodeHeartbeat(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusNotFound, "node not found")
 		return
 	}
-	node, err := s.fetchResearchNodeByID(r.Context(), principal.NodeID)
+	node, err := s.fetchNodeByID(r.Context(), principal.NodeID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load node: %v", err))
 		return
@@ -513,20 +513,20 @@ func (s *Server) handleResearchNodeHeartbeat(w http.ResponseWriter, r *http.Requ
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "node": node})
 }
 
-func (s *Server) fetchResearchNodeByID(ctx context.Context, id int64) (map[string]any, error) {
+func (s *Server) fetchNodeByID(ctx context.Context, id int64) (map[string]any, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at
-		FROM research_nodes
+		FROM nodes
 		WHERE id=$1
 	`, id)
-	return scanResearchNodeRow(row)
+	return scanNodeRow(row)
 }
 
-type researchNodeScanner interface {
+type nodeScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanResearchNodeRow(row researchNodeScanner) (map[string]any, error) {
+func scanNodeRow(row nodeScanner) (map[string]any, error) {
 	var (
 		id              int64
 		accountID       int64

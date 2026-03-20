@@ -22,13 +22,13 @@ type Config struct {
 	R2Endpoint                  string
 	R2SignGetTTL                time.Duration
 	R2SignPutTTL                time.Duration
-	ResearchAppBaseURL          string
-	ResearchMagicLinkTTL        time.Duration
-	ResearchSessionTTL          time.Duration
-	ResearchEmailProvider       string
-	ResearchEmailFrom           string
-	ResearchEmailReplyTo        string
-	ResearchEmailResendAPIKey   string
+	AppBaseURL                  string
+	MagicLinkTTL                time.Duration
+	SessionTTL                  time.Duration
+	EmailProvider               string
+	EmailFrom                   string
+	EmailReplyTo                string
+	EmailResendAPIKey           string
 	CaptureTickSec              int
 	CaptureConcurrency          int
 	CaptureModeAllowlist        string
@@ -62,13 +62,13 @@ func Load() (Config, error) {
 		R2Endpoint:                  os.Getenv("R2_ENDPOINT"),
 		R2SignGetTTL:                durEnv("R2_SIGN_GET_TTL", 10*time.Minute),
 		R2SignPutTTL:                durEnv("R2_SIGN_PUT_TTL", 15*time.Minute),
-		ResearchAppBaseURL:          strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
-		ResearchMagicLinkTTL:        durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 20*time.Minute)),
-		ResearchSessionTTL:          durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),
-		ResearchEmailProvider:       strEnv("EMAIL_PROVIDER", strEnv("RESEARCH_EMAIL_PROVIDER", "log")),
-		ResearchEmailFrom:           firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
-		ResearchEmailReplyTo:        firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
-		ResearchEmailResendAPIKey:   firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
+		AppBaseURL:                  strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
+		MagicLinkTTL:                durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 20*time.Minute)),
+		SessionTTL:                  durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),
+		EmailProvider:               strEnv("EMAIL_PROVIDER", strEnv("RESEARCH_EMAIL_PROVIDER", "log")),
+		EmailFrom:                   firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
+		EmailReplyTo:                firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
+		EmailResendAPIKey:           firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
 		CaptureTickSec:              intEnv("CAPTURE_TICK_SEC", 1),
 		CaptureConcurrency:          intEnv("CAPTURE_CONCURRENCY", 8),
 		CaptureModeAllowlist:        strEnv("CAPTURE_MODE_ALLOWLIST", ""),
@@ -89,11 +89,11 @@ func Load() (Config, error) {
 	if cfg.R2Endpoint == "" && cfg.R2AccountID != "" {
 		cfg.R2Endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)
 	}
-	if cfg.ResearchMagicLinkTTL <= 0 {
-		return Config{}, fmt.Errorf("invalid RESEARCH_MAGIC_LINK_TTL")
+	if cfg.MagicLinkTTL <= 0 {
+		return Config{}, fmt.Errorf("invalid MAGIC_LINK_TTL")
 	}
-	if cfg.ResearchSessionTTL <= 0 {
-		return Config{}, fmt.Errorf("invalid RESEARCH_SESSION_TTL")
+	if cfg.SessionTTL <= 0 {
+		return Config{}, fmt.Errorf("invalid SESSION_TTL")
 	}
 	return cfg, nil
 }

@@ -42,13 +42,13 @@ type Server struct {
 	r2            *r2.Client
 	mailer        email.Sender
 	dashboardHTML []byte
-	researchHTML  []byte
+	accountHTML   []byte
 	exportMu      sync.Mutex
 	frameExports  map[string]*frameExportJob
 }
 
 const dashboardSessionCookie = "stream_ops_session"
-const researchSessionCookie = "stoarama_session"
+const accountSessionCookie = "stoarama_session"
 
 const (
 	frameExportMaxFrames = 5000
@@ -92,7 +92,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
-	researchHTML, err := loadResearchHTML()
+	accountHTML, err := loadAccountHTML()
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		r2:            r2c,
 		mailer:        mailer,
 		dashboardHTML: html,
-		researchHTML:  researchHTML,
+		accountHTML:   accountHTML,
 		frameExports:  map[string]*frameExportJob{},
 	}
 	return s.router(), nil
@@ -116,28 +116,28 @@ func (s *Server) router() http.Handler {
 	r.Get("/dashboard", s.handleDashboard)
 	r.Get("/dashboard/{tab}", s.handleDashboard)
 	r.Get("/dashboard/stream/{id}", s.handleDashboard)
-	r.Get("/account", s.handleResearchApp)
-	r.Get("/auth/complete", s.handleResearchAuthComplete)
+	r.Get("/account", s.handleAccountApp)
+	r.Get("/auth/complete", s.handleAccountAuthComplete)
 
 	r.Route("/api/v1", func(api chi.Router) {
-		api.Post("/auth/request-link", s.handleResearchAuthRequestLink)
-		api.Post("/nodes/enroll", s.handleResearchNodeEnroll)
-		api.Route("/account", func(research chi.Router) {
-			research.Use(s.requireResearchAuth)
-			research.Get("/me", s.handleResearchMe)
-			research.Post("/logout", s.handleResearchLogout)
-			research.Get("/api-keys", s.handleResearchAPIKeysList)
-			research.Post("/api-keys", s.handleResearchAPIKeysCreate)
-			research.Post("/api-keys/{id}/revoke", s.handleResearchAPIKeyRevoke)
-			research.Get("/nodes", s.handleResearchNodesList)
-			research.Get("/node-enrollment-tokens", s.handleResearchNodeEnrollmentTokensList)
-			research.Post("/node-enrollment-tokens", s.handleResearchNodeEnrollmentTokensCreate)
-			research.Post("/node-enrollment-tokens/{id}/revoke", s.handleResearchNodeEnrollmentTokenRevoke)
+		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
+		api.Post("/nodes/enroll", s.handleNodeEnroll)
+		api.Route("/account", func(account chi.Router) {
+			account.Use(s.requireAccountAuth)
+			account.Get("/me", s.handleAccountMe)
+			account.Post("/logout", s.handleAccountLogout)
+			account.Get("/api-keys", s.handleAccountAPIKeysList)
+			account.Post("/api-keys", s.handleAccountAPIKeysCreate)
+			account.Post("/api-keys/{id}/revoke", s.handleAccountAPIKeyRevoke)
+			account.Get("/nodes", s.handleAccountNodesList)
+			account.Get("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensList)
+			account.Post("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensCreate)
+			account.Post("/node-enrollment-tokens/{id}/revoke", s.handleAccountNodeEnrollmentTokenRevoke)
 		})
 		api.Route("/node", func(node chi.Router) {
-			node.Use(s.requireResearchNodeAuth)
-			node.Get("/me", s.handleResearchNodeMe)
-			node.Post("/heartbeat", s.handleResearchNodeHeartbeat)
+			node.Use(s.requireNodeAuth)
+			node.Get("/me", s.handleNodeMe)
+			node.Post("/heartbeat", s.handleNodeHeartbeat)
 		})
 
 		api.Group(func(op chi.Router) {
@@ -188,11 +188,11 @@ func (s *Server) router() http.Handler {
 			op.Post("/media/upload-intents", s.handleUploadIntents)
 
 			op.Get("/frames", s.handleFramesList)
-			op.Get("/admin/accounts", s.handleResearchAdminAccountsList)
-			op.Post("/admin/accounts/{id}/disable", s.handleResearchAdminAccountDisable)
-			op.Post("/admin/accounts/{id}/enable", s.handleResearchAdminAccountEnable)
-			op.Get("/admin/accounts/{id}/api-keys", s.handleResearchAdminAccountAPIKeys)
-			op.Post("/admin/api-keys/{id}/revoke", s.handleResearchAdminAPIKeyRevoke)
+			op.Get("/admin/accounts", s.handleAdminAccountsList)
+			op.Post("/admin/accounts/{id}/disable", s.handleAdminAccountDisable)
+			op.Post("/admin/accounts/{id}/enable", s.handleAdminAccountEnable)
+			op.Get("/admin/accounts/{id}/api-keys", s.handleAdminAccountAPIKeys)
+			op.Post("/admin/api-keys/{id}/revoke", s.handleAdminAPIKeyRevoke)
 
 			op.Get("/dashboard/overview", s.handleDashboardOverview)
 			op.Get("/dashboard/streams", s.handleDashboardStreams)
