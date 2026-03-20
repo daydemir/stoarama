@@ -1,0 +1,27 @@
+project_name      = "Stoarama"
+region            = "nyc3"
+droplet_count     = 4
+droplet_size      = "s-2vcpu-4gb"
+instance_name_prefix = "si-capture"
+ssh_key_name      = "stoarama-capture-key"
+ssh_public_key    = "ssh-ed25519 AAAA..."
+
+repo_url          = "https://github.com/daydemir/stoarama.git"
+repo_ref          = "main"
+repo_clone_token  = ""
+
+backend_api_url   = "https://stoarama-api.onrender.com"
+backend_api_token = "set-via-env-or-tfvars"
+
+capture_shared_capacity = 6
+
+draining_modes                    = []
+capture_tick_sec                  = 5
+capture_heartbeat_sec             = 15
+capture_lease_sec                 = 45
+capture_unsupported_threshold     = 8
+capture_frame_queue_size          = 64
+capture_frame_enqueue_timeout_sec = 3
+capture_frame_writers             = 2
+
+admin_cidrs = ["0.0.0.0/0", "::/0"]

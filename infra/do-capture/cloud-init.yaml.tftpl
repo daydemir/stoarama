@@ -1,0 +1,110 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - ffmpeg
+  - git
+  - golang-go
+  - jq
+  - tmux
+  - yt-dlp
+
+write_files:
+  - path: /etc/stoarama/capture.env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      export BACKEND_API_URL='${backend_api_url}'
+      export API_TOKEN='${backend_api_token}'
+      export CAPTURE_SERVER_ID='${server_id}'
+      export CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY='${capture_shared_capacity}'
+      export CAPTURE_SERVER_EXECUTION_CLASSES='video_live,image_poll'
+      export CAPTURE_SERVER_DRAINING_EXECUTION_CLASSES='${draining_modes_csv}'
+      export CAPTURE_TICK_SEC='${capture_tick_sec}'
+      export CAPTURE_SERVER_HEARTBEAT_SEC='${capture_heartbeat_sec}'
+      export CAPTURE_SERVER_LEASE_SEC='${capture_lease_sec}'
+      export CAPTURE_UNSUPPORTED_THRESHOLD='${capture_unsupported_threshold}'
+      export CAPTURE_FRAME_QUEUE_SIZE='${capture_frame_queue_size}'
+      export CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC='${capture_frame_enqueue_timeout_s}'
+      export CAPTURE_FRAME_WRITERS='${capture_frame_writers}'
+      export CAPTURE_HEALTH_MAX_STALE_SEC='180'
+
+  - path: /etc/systemd/system/stoarama-capture.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Stoarama Capture Server
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      User=root
+      Group=root
+      WorkingDirectory=/opt/stoarama
+      Environment=SI_ENV_FILE=/etc/stoarama/capture.env
+      ExecStart=/opt/stoarama/backend/scripts/start-capture-server.sh
+      Restart=always
+      RestartSec=5
+      TimeoutStartSec=120
+      TimeoutStopSec=20
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/stoarama-capture-healthcheck.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Stoarama Capture Healthcheck
+      Wants=network-online.target
+      After=network-online.target stoarama-capture.service
+
+      [Service]
+      Type=oneshot
+      User=root
+      Group=root
+      WorkingDirectory=/opt/stoarama
+      Environment=SI_ENV_FILE=/etc/stoarama/capture.env
+      ExecStart=/opt/stoarama/backend/scripts/do-capture-healthcheck.sh
+
+  - path: /etc/systemd/system/stoarama-capture-healthcheck.timer
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Run Stoarama Capture Healthcheck
+
+      [Timer]
+      OnBootSec=3m
+      OnUnitActiveSec=2m
+      Unit=stoarama-capture-healthcheck.service
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - mkdir -p /opt
+  - |
+    clone_url='${repo_url}'
+    if [ -n '${repo_clone_token}' ]; then
+      clone_url="$(printf '%s' "${repo_url}" | sed 's#^https://#https://x-access-token:${repo_clone_token}@#')"
+    fi
+    if [ ! -d /opt/stoarama/.git ]; then
+      git clone --depth 1 --branch ${repo_ref} "$clone_url" /opt/stoarama
+    else
+      git -C /opt/stoarama remote set-url origin "$clone_url"
+      git -C /opt/stoarama fetch --depth 1 origin ${repo_ref}
+      git -C /opt/stoarama checkout ${repo_ref}
+      git -C /opt/stoarama reset --hard origin/${repo_ref}
+    fi
+  - chmod +x /opt/stoarama/backend/scripts/start-capture-server.sh
+  - chmod +x /opt/stoarama/backend/scripts/do-capture-healthcheck.sh
+  - systemctl daemon-reload
+  - systemctl enable --now stoarama-capture.service
+  - systemctl enable --now stoarama-capture-healthcheck.timer
