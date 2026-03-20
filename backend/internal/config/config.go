@@ -1,0 +1,179 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	Port                        int
+	DatabaseURL                 string
+	APIToken                    string
+	MigrationDir                string
+	AutoMigrate                 bool
+	R2AccountID                 string
+	R2AccessKeyID               string
+	R2SecretAccessKey           string
+	R2Bucket                    string
+	R2Region                    string
+	R2Endpoint                  string
+	R2SignGetTTL                time.Duration
+	R2SignPutTTL                time.Duration
+	ResearchAppBaseURL          string
+	ResearchMagicLinkTTL        time.Duration
+	ResearchSessionTTL          time.Duration
+	ResearchEmailProvider       string
+	ResearchEmailFrom           string
+	ResearchEmailReplyTo        string
+	ResearchEmailResendAPIKey   string
+	CaptureTickSec              int
+	CaptureConcurrency          int
+	CaptureModeAllowlist        string
+	CaptureLeaseSec             int
+	CaptureUnsupportedThreshold int
+	CaptureFrameQueueSize       int
+	CaptureFrameEnqueueTimeout  int
+	CaptureFrameWriters         int
+	InferenceBoxPollSec         int
+	InferenceBoxConcurrency     int
+	InferenceBoxLeaseSec        int
+	InferenceBoxMaxAttempts     int
+	InferenceBoxRetryBaseSec    int
+	InferenceBoxRetryMaxSec     int
+	BoxWorkerEmbedded           bool
+	WorkerID                    string
+}
+
+func Load() (Config, error) {
+	cfg := Config{
+		Port:                        intEnv("PORT", 8080),
+		DatabaseURL:                 os.Getenv("DATABASE_URL"),
+		APIToken:                    os.Getenv("API_TOKEN"),
+		MigrationDir:                strEnv("MIGRATION_DIR", ""),
+		AutoMigrate:                 boolEnv("AUTO_MIGRATE", false),
+		R2AccountID:                 os.Getenv("R2_ACCOUNT_ID"),
+		R2AccessKeyID:               os.Getenv("R2_ACCESS_KEY_ID"),
+		R2SecretAccessKey:           os.Getenv("R2_SECRET_ACCESS_KEY"),
+		R2Bucket:                    os.Getenv("R2_BUCKET"),
+		R2Region:                    strEnv("R2_REGION", "auto"),
+		R2Endpoint:                  os.Getenv("R2_ENDPOINT"),
+		R2SignGetTTL:                durEnv("R2_SIGN_GET_TTL", 10*time.Minute),
+		R2SignPutTTL:                durEnv("R2_SIGN_PUT_TTL", 15*time.Minute),
+		ResearchAppBaseURL:          strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
+		ResearchMagicLinkTTL:        durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 20*time.Minute)),
+		ResearchSessionTTL:          durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),
+		ResearchEmailProvider:       strEnv("EMAIL_PROVIDER", strEnv("RESEARCH_EMAIL_PROVIDER", "log")),
+		ResearchEmailFrom:           firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
+		ResearchEmailReplyTo:        firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
+		ResearchEmailResendAPIKey:   firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
+		CaptureTickSec:              intEnv("CAPTURE_TICK_SEC", 1),
+		CaptureConcurrency:          intEnv("CAPTURE_CONCURRENCY", 8),
+		CaptureModeAllowlist:        strEnv("CAPTURE_MODE_ALLOWLIST", ""),
+		CaptureLeaseSec:             intEnv("CAPTURE_LEASE_SEC", 30),
+		CaptureUnsupportedThreshold: intEnv("CAPTURE_UNSUPPORTED_THRESHOLD", 8),
+		CaptureFrameQueueSize:       intEnv("CAPTURE_FRAME_QUEUE_SIZE", 16),
+		CaptureFrameEnqueueTimeout:  intEnv("CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC", 3),
+		CaptureFrameWriters:         intEnv("CAPTURE_FRAME_WRITERS", 1),
+		InferenceBoxPollSec:         intEnv("BOX_WORKER_POLL_SEC", 2),
+		InferenceBoxConcurrency:     intEnv("BOX_WORKER_CONCURRENCY", 2),
+		InferenceBoxLeaseSec:        intEnv("BOX_WORKER_LEASE_SEC", 300),
+		InferenceBoxMaxAttempts:     intEnv("BOX_WORKER_MAX_ATTEMPTS", 8),
+		InferenceBoxRetryBaseSec:    intEnv("BOX_WORKER_RETRY_BASE_SEC", 5),
+		InferenceBoxRetryMaxSec:     intEnv("BOX_WORKER_RETRY_MAX_SEC", 300),
+		BoxWorkerEmbedded:           boolEnv("BOX_WORKER_EMBEDDED", false),
+		WorkerID:                    strEnv("WORKER_ID", "capture-worker-1"),
+	}
+	if cfg.R2Endpoint == "" && cfg.R2AccountID != "" {
+		cfg.R2Endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)
+	}
+	if cfg.ResearchMagicLinkTTL <= 0 {
+		return Config{}, fmt.Errorf("invalid RESEARCH_MAGIC_LINK_TTL")
+	}
+	if cfg.ResearchSessionTTL <= 0 {
+		return Config{}, fmt.Errorf("invalid RESEARCH_SESSION_TTL")
+	}
+	return cfg, nil
+}
+
+func (c Config) ValidateAPI() error {
+	if strings.TrimSpace(c.APIToken) == "" {
+		return fmt.Errorf("missing API_TOKEN")
+	}
+	if err := c.ValidateR2(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c Config) ValidateWorker() error {
+	return c.ValidateR2()
+}
+
+func (c Config) ValidateR2() error {
+	if strings.TrimSpace(c.R2AccountID) == "" || strings.TrimSpace(c.R2AccessKeyID) == "" || strings.TrimSpace(c.R2SecretAccessKey) == "" || strings.TrimSpace(c.R2Bucket) == "" {
+		return fmt.Errorf("missing required R2 env vars")
+	}
+	if strings.TrimSpace(c.R2Endpoint) == "" {
+		return fmt.Errorf("missing R2 endpoint")
+	}
+	return nil
+}
+
+func intEnv(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		panic(fmt.Sprintf("invalid int env %s=%q: %v", key, v, err))
+	}
+	return n
+}
+
+func durEnv(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		panic(fmt.Sprintf("invalid duration env %s=%q: %v", key, v, err))
+	}
+	return d
+}
+
+func strEnv(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func boolEnv(key string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	case "0", "false", "f", "no", "n", "off":
+		return false
+	default:
+		panic(fmt.Sprintf("invalid bool env %s=%q", key, v))
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}

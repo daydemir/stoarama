@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+.playwright-cli
+local
+output
+tests
+*.pt
+firebase-debug.log
+__pycache__
+*.pyc

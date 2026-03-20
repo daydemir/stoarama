@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stoarama Access</title>
+  <style>
+    :root {
+      --bg: #f4efe8;
+      --panel: #fffaf4;
+      --ink: #172026;
+      --muted: #6d716d;
+      --line: #d9cfc2;
+      --accent: #126b50;
+      --accent-soft: #dff2ea;
+      --danger: #9f2f22;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Iowan Old Style", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #efe1cc 0, transparent 26%),
+        linear-gradient(180deg, #f5eadb 0%, var(--bg) 55%, #efe5da 100%);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 32px 20px 64px; }
+    .hero h1 { margin: 0 0 10px; font-size: 42px; line-height: 1.05; }
+    .hero p { margin: 0; color: var(--muted); max-width: 680px; font-size: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 28px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 18px 40px rgba(30, 32, 30, 0.06);
+    }
+    h2 { margin: 0 0 12px; font-size: 22px; }
+    label { display: block; margin: 12px 0 6px; font-size: 14px; color: var(--muted); }
+    input, button {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      padding: 12px 14px;
+      font: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      border: none;
+      margin-top: 14px;
+    }
+    button.secondary {
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--ink);
+    }
+    .status { margin-top: 10px; font-size: 14px; color: var(--muted); min-height: 20px; }
+    .status.err { color: var(--danger); }
+    .status.ok { color: var(--accent); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .token-box {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      background: var(--accent-soft);
+      border: 1px solid #bfd9ce;
+      word-break: break-all;
+    }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+    th, td { text-align: left; padding: 10px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <h1>Stoarama Access</h1>
+      <p>Request a magic sign-in link, then create read-only API keys for Stoarama data access and automation.</p>
+    </div>
+    <div class="grid">
+      <section class="panel">
+        <h2>Email Sign-In</h2>
+        <label for="email">Email</label>
+        <input id="email" type="email" placeholder="researcher@example.org" />
+        <label for="name">Name</label>
+        <input id="name" type="text" placeholder="Optional name" />
+        <button id="requestLink">Email Magic Link</button>
+        <div id="requestStatus" class="status"></div>
+      </section>
+      <section class="panel">
+        <h2>Account</h2>
+        <div id="accountStatus" class="status">Checking session...</div>
+        <div id="accountBox" class="hidden">
+          <div id="accountMeta"></div>
+          <button id="logoutBtn" class="secondary">Log Out</button>
+        </div>
+      </section>
+    </div>
+    <section class="panel" style="margin-top:16px;">
+      <h2>API Keys</h2>
+      <div id="keysEmpty" class="status">Sign in first to create and manage keys.</div>
+      <div id="keysBox" class="hidden">
+        <label for="keyLabel">Key label</label>
+        <input id="keyLabel" type="text" placeholder="Laptop downloader" />
+        <button id="createKeyBtn">Create API Key</button>
+        <div id="createKeyStatus" class="status"></div>
+        <div id="newTokenBox" class="token-box hidden"></div>
+        <table>
+          <thead>
+            <tr><th>Prefix</th><th>Label</th><th>Created</th><th>Last Used</th><th></th></tr>
+          </thead>
+          <tbody id="keysRows"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <script>
+    const requestStatus = document.getElementById('requestStatus');
+    const accountStatus = document.getElementById('accountStatus');
+    const accountBox = document.getElementById('accountBox');
+    const accountMeta = document.getElementById('accountMeta');
+    const keysEmpty = document.getElementById('keysEmpty');
+    const keysBox = document.getElementById('keysBox');
+    const keysRows = document.getElementById('keysRows');
+    const createKeyStatus = document.getElementById('createKeyStatus');
+    const newTokenBox = document.getElementById('newTokenBox');
+
+    async function fetchJSON(path, opts) {
+      const res = await fetch(path, Object.assign({ credentials: 'include' }, opts || {}));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+      return data;
+    }
+
+    function setStatus(el, text, kind) {
+      el.textContent = text || '';
+      el.className = `status${kind ? ` ${kind}` : ''}`;
+    }
+
+    function formatDate(v) {
+      if (!v) return 'Never';
+      try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
+    }
+
+    async function refreshSession() {
+      try {
+        const payload = await fetchJSON('/api/v1/research/me');
+        const account = payload.account || {};
+        accountStatus.textContent = '';
+        accountBox.classList.remove('hidden');
+        accountMeta.innerHTML = `<div><b>${String(account.email || '')}</b></div><div class="status">Auth: ${String(account.auth_type || '')}</div>`;
+        keysEmpty.classList.add('hidden');
+        keysBox.classList.remove('hidden');
+        await refreshKeys();
+      } catch (err) {
+        accountBox.classList.add('hidden');
+        keysBox.classList.add('hidden');
+        keysEmpty.classList.remove('hidden');
+        setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
+      }
+    }
+
+    async function refreshKeys() {
+      const payload = await fetchJSON('/api/v1/research/api-keys');
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      keysRows.innerHTML = items.map((item) => `
+        <tr>
+          <td class="mono">${String(item.key_prefix || '')}</td>
+          <td>${String(item.label || '')}</td>
+          <td>${formatDate(item.created_at)}</td>
+          <td>${formatDate(item.last_used_at)}</td>
+          <td>${item.revoked_at ? '<span class="status">revoked</span>' : `<button data-revoke="${Number(item.id)}" class="secondary">Revoke</button>`}</td>
+        </tr>
+      `).join('');
+      keysRows.querySelectorAll('button[data-revoke]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = String(btn.getAttribute('data-revoke') || '').trim();
+          try {
+            await fetchJSON(`/api/v1/research/api-keys/${encodeURIComponent(id)}/revoke`, { method: 'POST' });
+            await refreshKeys();
+          } catch (err) {
+            setStatus(createKeyStatus, String(err), 'err');
+          }
+        });
+      });
+    }
+
+    document.getElementById('requestLink').addEventListener('click', async () => {
+      const email = String(document.getElementById('email').value || '').trim();
+      const name = String(document.getElementById('name').value || '').trim();
+      try {
+        await fetchJSON('/api/v1/research/auth/request-link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, name, redirect_path: '/research' }),
+        });
+        setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
+      } catch (err) {
+        setStatus(requestStatus, String(err), 'err');
+      }
+    });
+
+    document.getElementById('createKeyBtn').addEventListener('click', async () => {
+      const label = String(document.getElementById('keyLabel').value || '').trim();
+      try {
+        const payload = await fetchJSON('/api/v1/research/api-keys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label }),
+        });
+        newTokenBox.classList.remove('hidden');
+        newTokenBox.textContent = `Copy now. This token is only shown once.\n\n${String(payload.token || '')}`;
+        setStatus(createKeyStatus, 'API key created.', 'ok');
+        await refreshKeys();
+      } catch (err) {
+        setStatus(createKeyStatus, String(err), 'err');
+      }
+    });
+
+    document.getElementById('logoutBtn').addEventListener('click', async () => {
+      try {
+        await fetchJSON('/api/v1/research/logout', { method: 'POST' });
+      } catch (_) {}
+      window.location.reload();
+    });
+
+    refreshSession();
+  </script>
+</body>
+</html>

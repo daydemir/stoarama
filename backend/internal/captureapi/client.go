@@ -1,0 +1,915 @@
+package captureapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/model"
+)
+
+type ClientConfig struct {
+	BaseURL    string
+	APIToken   string
+	HTTPClient *http.Client
+}
+
+type Client struct {
+	baseURL  string
+	apiToken string
+	httpc    *http.Client
+}
+
+type IngestSuccessRequest struct {
+	StreamID           int64
+	CapturedAt         time.Time
+	SourceKind         string
+	EffectiveMode      capture.Mode
+	ResolvedURL        string
+	MIMEType           string
+	FrameBytes         []byte
+	RecordingHeartbeat bool
+}
+
+type IngestErrorRequest struct {
+	StreamID      int64
+	CapturedAt    time.Time
+	SourceKind    string
+	EffectiveMode capture.Mode
+	ResolvedURL   string
+	ErrorText     string
+}
+
+type WorkerHeartbeatRequest struct {
+	WorkerID       string
+	ExecutionClass string
+	Capacity       int
+	LeaseSec       int
+	MetadataJSON   map[string]any
+}
+
+type RecordingServerHeartbeatClass struct {
+	ExecutionClass string
+	MaxActive      int
+	Draining       bool
+}
+
+type RecordingServerHeartbeatRequest struct {
+	ServerID         string
+	LeaseSec         int
+	ExecutionClasses []RecordingServerHeartbeatClass
+	MetadataJSON     map[string]any
+}
+
+type RecordingProcessHeartbeatRequest struct {
+	StreamID       int64
+	ExecutionClass string
+	ServerID       string
+	AssignmentRev  int64
+	ProcessID      string
+	WorkerID       string
+	Status         string
+	LeaseSec       int
+	LastFrameAt    *time.Time
+	ErrorText      string
+	StartReason    string
+	RestartCount   int
+	LastHeartbeat  *time.Time
+}
+
+type RecordingProcessStoppedRequest struct {
+	StreamID       int64
+	ProcessID      string
+	WorkerID       string
+	ServerID       string
+	ExecutionClass string
+	AssignmentRev  int64
+	FinalStatus    string
+	StopReason     string
+	ErrorText      string
+	StoppedAt      *time.Time
+}
+
+type ingestResponse struct {
+	ConsecutiveErrors int  `json:"consecutive_errors"`
+	Unsupported       bool `json:"unsupported"`
+}
+
+type RecordingSettings struct {
+	IntervalSec int       `json:"interval_sec"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type RecordingAssignment struct {
+	StreamID           int64          `json:"stream_id"`
+	ServerID           string         `json:"server_id"`
+	ExecutionClass     string         `json:"execution_class"`
+	AssignmentRevision int64          `json:"assignment_revision"`
+	Provider           string         `json:"provider"`
+	StreamURL          string         `json:"source_url"`
+	SourcePageURL      string         `json:"source_page_url"`
+	CaptureType        string         `json:"capture_type"`
+	CaptureConfigJSON  map[string]any `json:"execution_config_json"`
+	RelayPullURL       string         `json:"relay_pull_url"`
+	RelayStatus        string         `json:"relay_status"`
+}
+
+type YouTubeRelaySourceHeartbeatRequest struct {
+	ServerID     string
+	ShardID      string
+	MaxActive    int
+	Draining     bool
+	LeaseSec     int
+	MetadataJSON map[string]any
+}
+
+type YouTubeRelayRoute struct {
+	StreamID           int64          `json:"stream_id"`
+	SourceServerID     string         `json:"source_server_id"`
+	SinkServerID       string         `json:"sink_server_id"`
+	AssignmentRevision int64          `json:"assignment_revision"`
+	Status             string         `json:"status"`
+	RelayPullURL       string         `json:"relay_pull_url"`
+	ErrorText          string         `json:"error_text"`
+	StreamURL          string         `json:"source_url"`
+	SourcePageURL      string         `json:"source_page_url"`
+	MetadataJSON       map[string]any `json:"metadata_json"`
+	CreatedAt          *time.Time     `json:"created_at,omitempty"`
+	UpdatedAt          *time.Time     `json:"updated_at,omitempty"`
+}
+
+type YouTubeRelayRouteStatusRequest struct {
+	StreamID     int64
+	Actor        string
+	Status       string
+	Reason       string
+	RelayPullURL string
+	ErrorText    string
+	MetadataJSON map[string]any
+}
+
+func NewClient(cfg ClientConfig) (*Client, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	if baseURL == "" {
+		return nil, fmt.Errorf("missing BaseURL")
+	}
+	if strings.TrimSpace(cfg.APIToken) == "" {
+		return nil, fmt.Errorf("missing APIToken")
+	}
+	httpc := cfg.HTTPClient
+	if httpc == nil {
+		httpc = &http.Client{Timeout: 20 * time.Second}
+	}
+	return &Client{
+		baseURL:  baseURL,
+		apiToken: strings.TrimSpace(cfg.APIToken),
+		httpc:    httpc,
+	}, nil
+}
+
+func (c *Client) ListRecordedStreams(ctx context.Context, limit int) ([]model.Stream, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	out := make([]model.Stream, 0, limit)
+	total := 1
+	offset := 0
+	for offset < total {
+		batch, t, err := c.listRecordedStreamsPage(ctx, model.RecordingStateOn, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		total = t
+		out = append(out, batch...)
+		if len(batch) == 0 {
+			break
+		}
+		offset += len(batch)
+	}
+	return out, nil
+}
+
+func (c *Client) listRecordedStreamsPage(ctx context.Context, state model.RecordingState, limit, offset int) ([]model.Stream, int, error) {
+	if state != model.RecordingStateOn && state != model.RecordingStateOff {
+		return nil, 0, fmt.Errorf("unsupported recording_state: %s", state)
+	}
+	u, err := url.Parse(c.baseURL + "/api/v1/capture/streams")
+	if err != nil {
+		return nil, 0, fmt.Errorf("parse capture streams URL: %w", err)
+	}
+	q := u.Query()
+	q.Set("recording_state", string(state))
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	q.Set("offset", fmt.Sprintf("%d", offset))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("build capture streams request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("capture streams request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return nil, 0, fmt.Errorf("capture streams status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var payload struct {
+		Total int `json:"total"`
+		Items []struct {
+			Stream model.Stream `json:"stream"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, 0, fmt.Errorf("decode capture streams response: %w", err)
+	}
+
+	batch := make([]model.Stream, 0, len(payload.Items))
+	for _, item := range payload.Items {
+		stream := item.Stream
+		normalizeStreamPayload(&stream)
+		batch = append(batch, stream)
+	}
+	return batch, payload.Total, nil
+}
+
+func (c *Client) GetStream(ctx context.Context, streamID int64) (model.Stream, error) {
+	if streamID <= 0 {
+		return model.Stream{}, fmt.Errorf("stream_id must be > 0")
+	}
+	u := fmt.Sprintf("%s/api/v1/dashboard/streams/%d?include_image_urls=false", c.baseURL, streamID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return model.Stream{}, fmt.Errorf("build stream detail request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return model.Stream{}, fmt.Errorf("stream detail request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return model.Stream{}, fmt.Errorf("stream detail status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var payload struct {
+		Stream model.Stream `json:"stream"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return model.Stream{}, fmt.Errorf("decode stream detail response: %w", err)
+	}
+	if payload.Stream.ID <= 0 {
+		return model.Stream{}, fmt.Errorf("stream detail missing stream payload for id=%d", streamID)
+	}
+	normalizeStreamPayload(&payload.Stream)
+	return payload.Stream, nil
+}
+
+func normalizeStreamPayload(stream *model.Stream) {
+	if stream == nil {
+		return
+	}
+	if stream.ExecutionConfigJSON == nil {
+		stream.ExecutionConfigJSON = map[string]any{}
+	}
+}
+
+func normalizeExecutionClassValue(raw string) (string, error) {
+	if executionClass, ok := capture.NormalizeExecutionClass(raw); ok {
+		return executionClass, nil
+	}
+	return "", fmt.Errorf("invalid execution_class %q", raw)
+}
+
+func (c *Client) GetRecordingSettings(ctx context.Context) (RecordingSettings, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/dashboard/recording/settings", nil)
+	if err != nil {
+		return RecordingSettings{}, fmt.Errorf("build recording settings request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return RecordingSettings{}, fmt.Errorf("recording settings request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return RecordingSettings{}, fmt.Errorf("recording settings status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var payload RecordingSettings
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return RecordingSettings{}, fmt.Errorf("decode recording settings response: %w", err)
+	}
+	if payload.IntervalSec <= 0 {
+		return RecordingSettings{}, fmt.Errorf("invalid recording interval from API: %d", payload.IntervalSec)
+	}
+	return payload, nil
+}
+
+func (c *Client) listRecordingAssignmentsPage(ctx context.Context, serverID string, executionClass string, limit int, offset int) ([]RecordingAssignment, error) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return nil, fmt.Errorf("server_id is required")
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	u, err := url.Parse(c.baseURL + "/api/v1/recording/assignments")
+	if err != nil {
+		return nil, fmt.Errorf("parse recording assignments URL: %w", err)
+	}
+	q := u.Query()
+	q.Set("server_id", serverID)
+	if strings.TrimSpace(executionClass) != "" {
+		q.Set("execution_class", strings.TrimSpace(executionClass))
+	}
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	q.Set("offset", fmt.Sprintf("%d", offset))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build recording assignments request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("recording assignments request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return nil, fmt.Errorf("recording assignments status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var payload struct {
+		Items []RecordingAssignment `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode recording assignments response: %w", err)
+	}
+	for i := range payload.Items {
+		if payload.Items[i].CaptureConfigJSON == nil {
+			payload.Items[i].CaptureConfigJSON = map[string]any{}
+		}
+	}
+	return payload.Items, nil
+}
+
+func (c *Client) ListRecordingAssignments(ctx context.Context, serverID string, executionClass string, limit int, offset int) ([]RecordingAssignment, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	out := make([]RecordingAssignment, 0, limit)
+	for {
+		items, err := c.listRecordingAssignmentsPage(ctx, serverID, executionClass, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
+		if len(items) < limit {
+			return out, nil
+		}
+		offset += len(items)
+	}
+}
+
+func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) error {
+	if req.StreamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	if len(req.FrameBytes) == 0 {
+		return fmt.Errorf("frame bytes are empty")
+	}
+	if req.CapturedAt.IsZero() {
+		req.CapturedAt = time.Now().UTC()
+	}
+	sourceKind := strings.TrimSpace(req.SourceKind)
+	if sourceKind == "" {
+		sourceKind = "live"
+	}
+	mimeType := strings.TrimSpace(req.MIMEType)
+	if mimeType == "" {
+		mimeType = "image/jpeg"
+	}
+
+	payload := map[string]any{
+		"stream_id":           req.StreamID,
+		"status":              "success",
+		"captured_at":         req.CapturedAt.UTC().Format(time.RFC3339Nano),
+		"source_kind":         sourceKind,
+		"execution_class":     capture.ModeToExecutionClass(req.EffectiveMode),
+		"resolved_url":        strings.TrimSpace(req.ResolvedURL),
+		"mime_type":           mimeType,
+		"frame_base64":        base64.StdEncoding.EncodeToString(req.FrameBytes),
+		"recording_heartbeat": req.RecordingHeartbeat,
+	}
+	var out ingestResponse
+	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) IngestError(ctx context.Context, req IngestErrorRequest) (int, error) {
+	if req.StreamID <= 0 {
+		return 0, fmt.Errorf("stream_id must be > 0")
+	}
+	errText := strings.TrimSpace(req.ErrorText)
+	if errText == "" {
+		return 0, fmt.Errorf("error_text is required")
+	}
+	if req.CapturedAt.IsZero() {
+		req.CapturedAt = time.Now().UTC()
+	}
+	sourceKind := strings.TrimSpace(req.SourceKind)
+	if sourceKind == "" {
+		sourceKind = "live"
+	}
+
+	payload := map[string]any{
+		"stream_id":       req.StreamID,
+		"status":          "error",
+		"captured_at":     req.CapturedAt.UTC().Format(time.RFC3339Nano),
+		"source_kind":     sourceKind,
+		"execution_class": capture.ModeToExecutionClass(req.EffectiveMode),
+		"resolved_url":    strings.TrimSpace(req.ResolvedURL),
+		"error_text":      errText,
+	}
+	var out ingestResponse
+	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {
+		return 0, err
+	}
+	return out.ConsecutiveErrors, nil
+}
+
+func (c *Client) MarkUnsupported(ctx context.Context, streamID int64, effective capture.Mode, resolvedURL, reason string) error {
+	if streamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return fmt.Errorf("reason is required")
+	}
+	payload := map[string]any{
+		"stream_id":       streamID,
+		"execution_class": capture.ModeToExecutionClass(effective),
+		"resolved_url":    strings.TrimSpace(resolvedURL),
+		"reason":          reason,
+	}
+	return c.postJSON(ctx, "/api/v1/capture/mark-unsupported", payload, nil)
+}
+
+func (c *Client) SetRuntimeStopped(ctx context.Context, streamID int64) error {
+	if streamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	payload := map[string]any{"stream_id": streamID}
+	return c.postJSON(ctx, "/api/v1/capture/runtime/stopped", payload, nil)
+}
+
+func (c *Client) WorkerHeartbeat(ctx context.Context, req WorkerHeartbeatRequest) error {
+	workerID := strings.TrimSpace(req.WorkerID)
+	if workerID == "" {
+		return fmt.Errorf("worker_id is required")
+	}
+	executionClass, err := normalizeExecutionClassValue(req.ExecutionClass)
+	if err != nil {
+		return err
+	}
+	if req.Capacity <= 0 {
+		return fmt.Errorf("capacity must be > 0")
+	}
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 45
+	}
+	payload := map[string]any{
+		"worker_id":       workerID,
+		"execution_class": executionClass,
+		"capacity":        req.Capacity,
+		"lease_sec":       leaseSec,
+		"metadata_json":   nonNilMap(req.MetadataJSON),
+	}
+	return c.postJSON(ctx, "/api/v1/capture/worker-heartbeat", payload, nil)
+}
+
+func nonNilMap(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
+}
+
+func (c *Client) WorkerStopped(ctx context.Context, workerID string, executionClass string) error {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return fmt.Errorf("worker_id is required")
+	}
+	executionClassValue, err := normalizeExecutionClassValue(executionClass)
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"worker_id":       workerID,
+		"execution_class": executionClassValue,
+	}
+	return c.postJSON(ctx, "/api/v1/capture/worker-stopped", payload, nil)
+}
+
+func (c *Client) RecordingServerHeartbeat(ctx context.Context, req RecordingServerHeartbeatRequest) error {
+	serverID := strings.TrimSpace(req.ServerID)
+	if serverID == "" {
+		return fmt.Errorf("server_id is required")
+	}
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 45
+	}
+	if leaseSec > 3600 {
+		return fmt.Errorf("lease_sec must be <= 3600")
+	}
+	if len(req.ExecutionClasses) == 0 {
+		return fmt.Errorf("execution_classes is required")
+	}
+	items := make([]map[string]any, 0, len(req.ExecutionClasses))
+	seen := map[string]struct{}{}
+	for _, modeItem := range req.ExecutionClasses {
+		executionClass, err := normalizeExecutionClassValue(modeItem.ExecutionClass)
+		if err != nil {
+			return err
+		}
+		if _, ok := seen[executionClass]; ok {
+			return fmt.Errorf("duplicate execution_class %q", executionClass)
+		}
+		seen[executionClass] = struct{}{}
+		if modeItem.MaxActive < 0 {
+			return fmt.Errorf("max_active must be >= 0 for execution_class %q", executionClass)
+		}
+		items = append(items, map[string]any{
+			"execution_class": executionClass,
+			"max_active":      modeItem.MaxActive,
+			"draining":        modeItem.Draining,
+		})
+	}
+	payload := map[string]any{
+		"server_id":         serverID,
+		"lease_sec":         leaseSec,
+		"execution_classes": items,
+		"metadata_json":     nonNilMap(req.MetadataJSON),
+	}
+	return c.postJSON(ctx, "/api/v1/recording/servers/heartbeat", payload, nil)
+}
+
+func (c *Client) RecordingServerStopped(ctx context.Context, serverID string) error {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return fmt.Errorf("server_id is required")
+	}
+	return c.postJSON(ctx, "/api/v1/recording/servers/stopped", map[string]any{
+		"server_id": serverID,
+	}, nil)
+}
+
+func (c *Client) YouTubeRelaySourceHeartbeat(ctx context.Context, req YouTubeRelaySourceHeartbeatRequest) error {
+	serverID := strings.TrimSpace(req.ServerID)
+	if serverID == "" {
+		return fmt.Errorf("server_id is required")
+	}
+	shardID := strings.TrimSpace(req.ShardID)
+	if shardID == "" {
+		return fmt.Errorf("shard_id is required")
+	}
+	if req.MaxActive <= 0 {
+		return fmt.Errorf("max_active must be > 0")
+	}
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 45
+	}
+	if leaseSec > 3600 {
+		return fmt.Errorf("lease_sec must be <= 3600")
+	}
+	payload := map[string]any{
+		"server_id":     serverID,
+		"shard_id":      shardID,
+		"max_active":    req.MaxActive,
+		"draining":      req.Draining,
+		"lease_sec":     leaseSec,
+		"metadata_json": nonNilMap(req.MetadataJSON),
+	}
+	return c.postJSON(ctx, "/api/v1/youtube-relay/sources/heartbeat", payload, nil)
+}
+
+func (c *Client) YouTubeRelaySourceStopped(ctx context.Context, serverID string) error {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return fmt.Errorf("server_id is required")
+	}
+	return c.postJSON(ctx, "/api/v1/youtube-relay/sources/stopped", map[string]any{
+		"server_id": serverID,
+	}, nil)
+}
+
+func (c *Client) ListYouTubeRelayRoutes(ctx context.Context, sourceServerID, sinkServerID, status string, limit, offset int) ([]YouTubeRelayRoute, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	u, err := url.Parse(c.baseURL + "/api/v1/youtube-relay/routes")
+	if err != nil {
+		return nil, fmt.Errorf("parse youtube relay routes URL: %w", err)
+	}
+	q := u.Query()
+	if v := strings.TrimSpace(sourceServerID); v != "" {
+		q.Set("source_server_id", v)
+	}
+	if v := strings.TrimSpace(sinkServerID); v != "" {
+		q.Set("sink_server_id", v)
+	}
+	if v := strings.TrimSpace(strings.ToLower(status)); v != "" {
+		q.Set("status", v)
+	}
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	q.Set("offset", fmt.Sprintf("%d", offset))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build youtube relay routes request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("youtube relay routes request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return nil, fmt.Errorf("youtube relay routes status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var payload struct {
+		Items []YouTubeRelayRoute `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode youtube relay routes response: %w", err)
+	}
+	for i := range payload.Items {
+		if payload.Items[i].MetadataJSON == nil {
+			payload.Items[i].MetadataJSON = map[string]any{}
+		}
+	}
+	return payload.Items, nil
+}
+
+func (c *Client) UpdateYouTubeRelayRouteStatus(ctx context.Context, req YouTubeRelayRouteStatusRequest) error {
+	if req.StreamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	actor := strings.TrimSpace(req.Actor)
+	if actor == "" {
+		return fmt.Errorf("actor is required")
+	}
+	status := strings.TrimSpace(strings.ToLower(req.Status))
+	switch status {
+	case "assigned", "source_ready", "running", "stopped", "failed":
+	default:
+		return fmt.Errorf("status must be one of assigned|source_ready|running|stopped|failed")
+	}
+	path := fmt.Sprintf("/api/v1/youtube-relay/routes/%d/status", req.StreamID)
+	payload := map[string]any{
+		"actor":          actor,
+		"status":         status,
+		"reason":         strings.TrimSpace(req.Reason),
+		"relay_pull_url": strings.TrimSpace(req.RelayPullURL),
+		"error_text":     strings.TrimSpace(req.ErrorText),
+		"metadata_json":  nonNilMap(req.MetadataJSON),
+	}
+	return c.postJSON(ctx, path, payload, nil)
+}
+
+func (c *Client) RecordingProcessHeartbeat(ctx context.Context, req RecordingProcessHeartbeatRequest) error {
+	if req.StreamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	executionClass, err := normalizeExecutionClassValue(req.ExecutionClass)
+	if err != nil {
+		return err
+	}
+	serverID := strings.TrimSpace(req.ServerID)
+	if serverID == "" {
+		return fmt.Errorf("server_id is required")
+	}
+	processID := strings.TrimSpace(req.ProcessID)
+	if processID == "" {
+		return fmt.Errorf("process_id is required")
+	}
+	workerID := strings.TrimSpace(req.WorkerID)
+	if workerID == "" {
+		return fmt.Errorf("worker_id is required")
+	}
+	status := strings.TrimSpace(strings.ToLower(req.Status))
+	if status != "starting" && status != "running" {
+		return fmt.Errorf("status must be starting|running")
+	}
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 20
+	}
+	if leaseSec > 3600 {
+		return fmt.Errorf("lease_sec must be <= 3600")
+	}
+	restartCount := req.RestartCount
+	if restartCount < 0 {
+		restartCount = 0
+	}
+	payload := map[string]any{
+		"stream_id":           req.StreamID,
+		"execution_class":     executionClass,
+		"server_id":           serverID,
+		"assignment_revision": req.AssignmentRev,
+		"process_id":          processID,
+		"worker_id":           workerID,
+		"status":              status,
+		"lease_sec":           leaseSec,
+		"last_frame_at":       req.LastFrameAt,
+		"error_text":          strings.TrimSpace(req.ErrorText),
+		"start_reason":        strings.TrimSpace(req.StartReason),
+		"restart_count":       restartCount,
+		"last_heartbeat_at":   req.LastHeartbeat,
+	}
+	return c.postJSON(ctx, "/api/v1/recording/process/heartbeat", payload, nil)
+}
+
+func (c *Client) RecordingProcessStopped(ctx context.Context, req RecordingProcessStoppedRequest) error {
+	if req.StreamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	processID := strings.TrimSpace(req.ProcessID)
+	if processID == "" {
+		return fmt.Errorf("process_id is required")
+	}
+	workerID := strings.TrimSpace(req.WorkerID)
+	if workerID == "" {
+		return fmt.Errorf("worker_id is required")
+	}
+	finalStatus := strings.TrimSpace(strings.ToLower(req.FinalStatus))
+	if finalStatus == "" {
+		finalStatus = "stopped"
+	}
+	serverID := strings.TrimSpace(req.ServerID)
+	executionClass := ""
+	if strings.TrimSpace(req.ExecutionClass) != "" {
+		var err error
+		executionClass, err = normalizeExecutionClassValue(req.ExecutionClass)
+		if err != nil {
+			return err
+		}
+	}
+	payload := map[string]any{
+		"stream_id":           req.StreamID,
+		"process_id":          processID,
+		"worker_id":           workerID,
+		"server_id":           serverID,
+		"execution_class":     executionClass,
+		"assignment_revision": req.AssignmentRev,
+		"final_status":        finalStatus,
+		"stop_reason":         strings.TrimSpace(req.StopReason),
+		"error_text":          strings.TrimSpace(req.ErrorText),
+	}
+	if req.StoppedAt != nil && !req.StoppedAt.IsZero() {
+		payload["stopped_at"] = req.StoppedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return c.postJSON(ctx, "/api/v1/recording/process/stopped", payload, nil)
+}
+
+func (c *Client) postJSON(ctx context.Context, path string, payload any, out any) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal request payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
+	if err != nil {
+		return fmt.Errorf("build request %s: %w", path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return fmt.Errorf("request %s failed: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return fmt.Errorf("request %s status=%d body=%s", path, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && !errorsIsEOF(err) {
+		return fmt.Errorf("decode %s response: %w", path, err)
+	}
+	return nil
+}
+
+func (c *Client) postJSONWithRetry(ctx context.Context, path string, payload any, out any, attempts int) error {
+	if attempts <= 1 {
+		return c.postJSON(ctx, path, payload, out)
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			delay := time.Duration(attempt-1) * time.Second
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		err := c.postJSON(ctx, path, payload, out)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryablePostError(err) {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func ingestMaxAttempts() int {
+	const fallback = 4
+	raw := strings.TrimSpace(os.Getenv("CAPTURE_API_INGEST_MAX_ATTEMPTS"))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 1 {
+		return fallback
+	}
+	return v
+}
+
+func isRetryablePostError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "context canceled") {
+		return false
+	}
+	if strings.Contains(msg, "status=429") ||
+		strings.Contains(msg, "status=500") ||
+		strings.Contains(msg, "status=502") ||
+		strings.Contains(msg, "status=503") ||
+		strings.Contains(msg, "status=504") ||
+		strings.Contains(msg, "status=522") ||
+		strings.Contains(msg, "status=524") {
+		return true
+	}
+	if strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "eof") {
+		return true
+	}
+	return false
+}
+
+func errorsIsEOF(err error) bool {
+	return err == io.EOF
+}
