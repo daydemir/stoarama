@@ -29,7 +29,7 @@ After Render deploys:
 
 1. open the service URL
 2. verify the root app responds
-3. verify `/research` loads
+3. verify `/account` loads
 4. verify the API process starts without migration/runtime errors
 5. run a simple `stoaramactl` call against the deployed API once credentials are set
 

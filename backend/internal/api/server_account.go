@@ -22,7 +22,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-const researchScopeRead = "research.read"
+const researchScopeRead = "stoarama.read"
 
 type researchPrincipal struct {
 	AccountID int64
@@ -45,10 +45,10 @@ func (s *Server) handleResearchApp(w http.ResponseWriter, r *http.Request) {
 
 func loadResearchHTML() ([]byte, error) {
 	candidates := []string{
-		"backend/web/research.html",
-		"web/research.html",
-		"../backend/web/research.html",
-		"../web/research.html",
+		"backend/web/account.html",
+		"web/account.html",
+		"../backend/web/account.html",
+		"../web/account.html",
 	}
 	for _, c := range candidates {
 		if b, err := os.ReadFile(c); err == nil {
@@ -242,13 +242,13 @@ func (s *Server) handleResearchAuthRequestLink(w http.ResponseWriter, r *http.Re
 func (s *Server) handleResearchAuthComplete(w http.ResponseWriter, r *http.Request) {
 	rawToken := strings.TrimSpace(r.URL.Query().Get("token"))
 	if rawToken == "" {
-		http.Redirect(w, r, "/research?error=missing_token", http.StatusFound)
+		http.Redirect(w, r, "/account?error=missing_token", http.StatusFound)
 		return
 	}
 	hash := hashResearchSecret(rawToken)
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
-		http.Redirect(w, r, "/research?error=server_error", http.StatusFound)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
@@ -271,15 +271,15 @@ func (s *Server) handleResearchAuthComplete(w http.ResponseWriter, r *http.Reque
 		FOR UPDATE
 	`, hash).Scan(&linkID, &accountID, &email, &name, &status, &expiresAt, &consumedAt, &redirectPath)
 	if err != nil {
-		http.Redirect(w, r, "/research?error=invalid_token", http.StatusFound)
+		http.Redirect(w, r, "/account?error=invalid_token", http.StatusFound)
 		return
 	}
 	if status != "active" {
-		http.Redirect(w, r, "/research?error=account_disabled", http.StatusFound)
+		http.Redirect(w, r, "/account?error=account_disabled", http.StatusFound)
 		return
 	}
 	if consumedAt != nil || !expiresAt.After(time.Now().UTC()) {
-		http.Redirect(w, r, "/research?error=expired_token", http.StatusFound)
+		http.Redirect(w, r, "/account?error=expired_token", http.StatusFound)
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `
@@ -287,7 +287,7 @@ func (s *Server) handleResearchAuthComplete(w http.ResponseWriter, r *http.Reque
 		SET consumed_at=now()
 		WHERE id=$1
 	`, linkID); err != nil {
-		http.Redirect(w, r, "/research?error=server_error", http.StatusFound)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `
@@ -295,12 +295,12 @@ func (s *Server) handleResearchAuthComplete(w http.ResponseWriter, r *http.Reque
 		SET email_verified_at=COALESCE(email_verified_at, now())
 		WHERE id=$1
 	`, accountID); err != nil {
-		http.Redirect(w, r, "/research?error=server_error", http.StatusFound)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	rawSession, err := generateResearchSecret(32)
 	if err != nil {
-		http.Redirect(w, r, "/research?error=server_error", http.StatusFound)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	sessionHash := hashResearchSecret(rawSession)
@@ -311,18 +311,18 @@ func (s *Server) handleResearchAuthComplete(w http.ResponseWriter, r *http.Reque
 		VALUES ($1, $2, $3, now())
 		RETURNING id
 	`, accountID, sessionHash, sessionExpiresAt).Scan(&sessionID); err != nil {
-		http.Redirect(w, r, "/research?error=server_error", http.StatusFound)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	if err := s.insertResearchAuthEventTx(r.Context(), tx, accountID, nil, "session_created", "account", email, map[string]any{
 		"session_id":    sessionID,
 		"magic_link_id": linkID,
 	}); err != nil {
-		http.Redirect(w, r, "/research?error=server_error", http.StatusFound)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		http.Redirect(w, r, "/research?error=server_error", http.StatusFound)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	setResearchSessionCookie(w, r, rawSession, sessionExpiresAt)
@@ -691,10 +691,10 @@ func looksLikeEmail(raw string) bool {
 func sanitizeResearchRedirectPath(raw string) string {
 	v := strings.TrimSpace(raw)
 	if v == "" {
-		return "/research"
+		return "/account"
 	}
 	if !strings.HasPrefix(v, "/") || strings.HasPrefix(v, "//") {
-		return "/research"
+		return "/account"
 	}
 	return v
 }
@@ -714,7 +714,7 @@ func (s *Server) buildResearchMagicLink(r *http.Request, token string) string {
 	if base == "" {
 		base = "http://localhost:8080"
 	}
-	return fmt.Sprintf("%s/research/complete?token=%s", base, url.QueryEscape(token))
+	return fmt.Sprintf("%s/auth/complete?token=%s", base, url.QueryEscape(token))
 }
 
 func buildResearchMagicLinkEmail(emailAddr, linkURL string) email.Message {
@@ -726,7 +726,7 @@ func buildResearchMagicLinkEmail(emailAddr, linkURL string) email.Message {
 		Subject:     subject,
 		PlainText:   text,
 		HTML:        html,
-		MessageType: "research_magic_link",
+		MessageType: "account_magic_link",
 	}
 }
 
