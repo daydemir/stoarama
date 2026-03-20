@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Stoarama Access</title>
+  <title>Stoarama Account</title>
   <style>
     :root {
       --bg: #f4efe8;
@@ -78,14 +78,14 @@
 <body>
   <div class="wrap">
     <div class="hero">
-      <h1>Stoarama Access</h1>
+      <h1>Stoarama Account</h1>
       <p>Request a magic sign-in link, then create read-only API keys for Stoarama data access and automation.</p>
     </div>
     <div class="grid">
       <section class="panel">
         <h2>Email Sign-In</h2>
         <label for="email">Email</label>
-        <input id="email" type="email" placeholder="researcher@example.org" />
+        <input id="email" type="email" placeholder="you@example.org" />
         <label for="name">Name</label>
         <input id="name" type="text" placeholder="Optional name" />
         <button id="requestLink">Email Magic Link</button>
@@ -148,7 +148,7 @@
 
     async function refreshSession() {
       try {
-        const payload = await fetchJSON('/api/v1/research/me');
+        const payload = await fetchJSON('/api/v1/account/me');
         const account = payload.account || {};
         accountStatus.textContent = '';
         accountBox.classList.remove('hidden');
@@ -165,7 +165,7 @@
     }
 
     async function refreshKeys() {
-      const payload = await fetchJSON('/api/v1/research/api-keys');
+      const payload = await fetchJSON('/api/v1/account/api-keys');
       const items = Array.isArray(payload.items) ? payload.items : [];
       keysRows.innerHTML = items.map((item) => `
         <tr>
@@ -180,7 +180,7 @@
         btn.addEventListener('click', async () => {
           const id = String(btn.getAttribute('data-revoke') || '').trim();
           try {
-            await fetchJSON(`/api/v1/research/api-keys/${encodeURIComponent(id)}/revoke`, { method: 'POST' });
+            await fetchJSON(`/api/v1/account/api-keys/${encodeURIComponent(id)}/revoke`, { method: 'POST' });
             await refreshKeys();
           } catch (err) {
             setStatus(createKeyStatus, String(err), 'err');
@@ -193,10 +193,10 @@
       const email = String(document.getElementById('email').value || '').trim();
       const name = String(document.getElementById('name').value || '').trim();
       try {
-        await fetchJSON('/api/v1/research/auth/request-link', {
+        await fetchJSON('/api/v1/auth/request-link', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, name, redirect_path: '/research' }),
+          body: JSON.stringify({ email, name, redirect_path: '/account' }),
         });
         setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
       } catch (err) {
@@ -207,7 +207,7 @@
     document.getElementById('createKeyBtn').addEventListener('click', async () => {
       const label = String(document.getElementById('keyLabel').value || '').trim();
       try {
-        const payload = await fetchJSON('/api/v1/research/api-keys', {
+        const payload = await fetchJSON('/api/v1/account/api-keys', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ label }),
@@ -223,7 +223,7 @@
 
     document.getElementById('logoutBtn').addEventListener('click', async () => {
       try {
-        await fetchJSON('/api/v1/research/logout', { method: 'POST' });
+        await fetchJSON('/api/v1/account/logout', { method: 'POST' });
       } catch (_) {}
       window.location.reload();
     });

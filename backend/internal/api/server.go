@@ -48,7 +48,7 @@ type Server struct {
 }
 
 const dashboardSessionCookie = "stream_ops_session"
-const researchSessionCookie = "research_session"
+const researchSessionCookie = "stoarama_session"
 
 const (
 	frameExportMaxFrames = 5000
@@ -116,13 +116,13 @@ func (s *Server) router() http.Handler {
 	r.Get("/dashboard", s.handleDashboard)
 	r.Get("/dashboard/{tab}", s.handleDashboard)
 	r.Get("/dashboard/stream/{id}", s.handleDashboard)
-	r.Get("/research", s.handleResearchApp)
-	r.Get("/research/complete", s.handleResearchAuthComplete)
+	r.Get("/account", s.handleResearchApp)
+	r.Get("/auth/complete", s.handleResearchAuthComplete)
 
 	r.Route("/api/v1", func(api chi.Router) {
-		api.Post("/research/auth/request-link", s.handleResearchAuthRequestLink)
-		api.Post("/research/nodes/enroll", s.handleResearchNodeEnroll)
-		api.Route("/research", func(research chi.Router) {
+		api.Post("/auth/request-link", s.handleResearchAuthRequestLink)
+		api.Post("/nodes/enroll", s.handleResearchNodeEnroll)
+		api.Route("/account", func(research chi.Router) {
 			research.Use(s.requireResearchAuth)
 			research.Get("/me", s.handleResearchMe)
 			research.Post("/logout", s.handleResearchLogout)
@@ -134,7 +134,7 @@ func (s *Server) router() http.Handler {
 			research.Post("/node-enrollment-tokens", s.handleResearchNodeEnrollmentTokensCreate)
 			research.Post("/node-enrollment-tokens/{id}/revoke", s.handleResearchNodeEnrollmentTokenRevoke)
 		})
-		api.Route("/research/node", func(node chi.Router) {
+		api.Route("/node", func(node chi.Router) {
 			node.Use(s.requireResearchNodeAuth)
 			node.Get("/me", s.handleResearchNodeMe)
 			node.Post("/heartbeat", s.handleResearchNodeHeartbeat)
@@ -188,11 +188,11 @@ func (s *Server) router() http.Handler {
 			op.Post("/media/upload-intents", s.handleUploadIntents)
 
 			op.Get("/frames", s.handleFramesList)
-			op.Get("/research-admin/accounts", s.handleResearchAdminAccountsList)
-			op.Post("/research-admin/accounts/{id}/disable", s.handleResearchAdminAccountDisable)
-			op.Post("/research-admin/accounts/{id}/enable", s.handleResearchAdminAccountEnable)
-			op.Get("/research-admin/accounts/{id}/api-keys", s.handleResearchAdminAccountAPIKeys)
-			op.Post("/research-admin/api-keys/{id}/revoke", s.handleResearchAdminAPIKeyRevoke)
+			op.Get("/admin/accounts", s.handleResearchAdminAccountsList)
+			op.Post("/admin/accounts/{id}/disable", s.handleResearchAdminAccountDisable)
+			op.Post("/admin/accounts/{id}/enable", s.handleResearchAdminAccountEnable)
+			op.Get("/admin/accounts/{id}/api-keys", s.handleResearchAdminAccountAPIKeys)
+			op.Post("/admin/api-keys/{id}/revoke", s.handleResearchAdminAPIKeyRevoke)
 
 			op.Get("/dashboard/overview", s.handleDashboardOverview)
 			op.Get("/dashboard/streams", s.handleDashboardStreams)

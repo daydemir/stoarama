@@ -141,7 +141,7 @@ func runAuthRequestLink(args []string) {
 		fatalf("--email is required")
 	}
 	var resp map[string]any
-	err := apiRequest("POST", normalizeBaseURL(*apiBaseURL)+"/api/v1/research/auth/request-link", map[string]any{
+	err := apiRequest("POST", normalizeBaseURL(*apiBaseURL)+"/api/v1/auth/request-link", map[string]any{
 		"email": *email,
 		"name":  *name,
 	}, "", &resp)
@@ -159,7 +159,7 @@ func runAuthWhoAmI(args []string) {
 
 	baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 	var resp map[string]any
-	if err := apiRequest("GET", baseURL+"/api/v1/research/me", nil, token, &resp); err != nil {
+	if err := apiRequest("GET", baseURL+"/api/v1/account/me", nil, token, &resp); err != nil {
 		fatalf("load account: %v", err)
 	}
 	printJSON(resp)
@@ -178,7 +178,7 @@ func runAuthAPIKeys(args []string) {
 		_ = fs.Parse(args[1:])
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
-		if err := apiRequest("GET", baseURL+"/api/v1/research/api-keys", nil, token, &resp); err != nil {
+		if err := apiRequest("GET", baseURL+"/api/v1/account/api-keys", nil, token, &resp); err != nil {
 			fatalf("list api keys: %v", err)
 		}
 		printJSON(resp)
@@ -192,7 +192,7 @@ func runAuthAPIKeys(args []string) {
 		_ = fs.Parse(args[1:])
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
-		if err := apiRequest("POST", baseURL+"/api/v1/research/api-keys", map[string]any{
+		if err := apiRequest("POST", baseURL+"/api/v1/account/api-keys", map[string]any{
 			"label":      *label,
 			"expires_at": strings.TrimSpace(*expiresAt),
 		}, token, &resp); err != nil {
@@ -220,7 +220,7 @@ func runAuthAPIKeys(args []string) {
 		}
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
-		if err := apiRequest("POST", fmt.Sprintf("%s/api/v1/research/api-keys/%d/revoke", baseURL, *id), map[string]any{}, token, &resp); err != nil {
+		if err := apiRequest("POST", fmt.Sprintf("%s/api/v1/account/api-keys/%d/revoke", baseURL, *id), map[string]any{}, token, &resp); err != nil {
 			fatalf("revoke api key: %v", err)
 		}
 		printJSON(resp)
@@ -243,7 +243,7 @@ func runNodeEnrollmentTokens(args []string) {
 		_ = fs.Parse(args[1:])
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
-		if err := apiRequest("GET", baseURL+"/api/v1/research/node-enrollment-tokens", nil, token, &resp); err != nil {
+		if err := apiRequest("GET", baseURL+"/api/v1/account/node-enrollment-tokens", nil, token, &resp); err != nil {
 			fatalf("list node enrollment tokens: %v", err)
 		}
 		printJSON(resp)
@@ -260,7 +260,7 @@ func runNodeEnrollmentTokens(args []string) {
 		}
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
-		if err := apiRequest("POST", baseURL+"/api/v1/research/node-enrollment-tokens", map[string]any{
+		if err := apiRequest("POST", baseURL+"/api/v1/account/node-enrollment-tokens", map[string]any{
 			"node_type":  strings.TrimSpace(*nodeType),
 			"label":      strings.TrimSpace(*label),
 			"expires_at": strings.TrimSpace(*expiresAt),
@@ -279,7 +279,7 @@ func runNodeEnrollmentTokens(args []string) {
 		}
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
-		if err := apiRequest("POST", fmt.Sprintf("%s/api/v1/research/node-enrollment-tokens/%d/revoke", baseURL, *id), map[string]any{}, token, &resp); err != nil {
+		if err := apiRequest("POST", fmt.Sprintf("%s/api/v1/account/node-enrollment-tokens/%d/revoke", baseURL, *id), map[string]any{}, token, &resp); err != nil {
 			fatalf("revoke node enrollment token: %v", err)
 		}
 		printJSON(resp)
@@ -327,7 +327,7 @@ func runNodeEnroll(args []string) {
 		} `json:"node"`
 		NodeToken string `json:"node_token"`
 	}
-	if err := apiRequest("POST", normalizeBaseURL(*apiBaseURL)+"/api/v1/research/nodes/enroll", payload, "", &resp); err != nil {
+	if err := apiRequest("POST", normalizeBaseURL(*apiBaseURL)+"/api/v1/nodes/enroll", payload, "", &resp); err != nil {
 		fatalf("enroll node: %v", err)
 	}
 	cfg, _ := loadCLIConfig()
@@ -354,7 +354,7 @@ func runNodeWhoAmI(args []string) {
 
 	baseURL, token := mustResolveNodeAuth(*apiBaseURL, *nodeToken)
 	var resp map[string]any
-	if err := apiRequest("GET", baseURL+"/api/v1/research/node/me", nil, token, &resp); err != nil {
+	if err := apiRequest("GET", baseURL+"/api/v1/node/me", nil, token, &resp); err != nil {
 		fatalf("load node: %v", err)
 	}
 	printJSON(resp)
@@ -373,7 +373,7 @@ func runNodeHeartbeat(args []string) {
 		nodeType = cfg.Node.NodeType
 	}
 	var resp map[string]any
-	if err := apiRequest("POST", baseURL+"/api/v1/research/node/heartbeat", map[string]any{
+	if err := apiRequest("POST", baseURL+"/api/v1/node/heartbeat", map[string]any{
 		"capabilities_json": defaultCapabilities(nodeType),
 		"metadata_json": map[string]any{
 			"cli_version": "phase1",
