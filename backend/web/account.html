@@ -128,6 +128,11 @@
     const keysRows = document.getElementById('keysRows');
     const createKeyStatus = document.getElementById('createKeyStatus');
     const newTokenBox = document.getElementById('newTokenBox');
+    const requestedRedirectPath = (() => {
+      const params = new URLSearchParams(window.location.search);
+      const raw = String(params.get('redirect_path') || '').trim();
+      return raw.startsWith('/') ? raw : '/account';
+    })();
 
     async function fetchJSON(path, opts) {
       const res = await fetch(path, Object.assign({ credentials: 'include' }, opts || {}));
@@ -198,7 +203,7 @@
         await fetchJSON('/api/v1/auth/request-link', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, name, redirect_path: '/account' }),
+          body: JSON.stringify({ email, name, redirect_path: requestedRedirectPath }),
         });
         setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
       } catch (err) {

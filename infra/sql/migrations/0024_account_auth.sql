@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   email TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+  role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'admin')),
   email_verified_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -100,5 +101,8 @@ CREATE TABLE IF NOT EXISTS account_auth_events (
 
 CREATE INDEX IF NOT EXISTS idx_account_auth_events_account_created
 ON account_auth_events (account_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_role_created
+ON accounts (role, created_at DESC);
 
 COMMIT;
