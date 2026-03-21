@@ -97,6 +97,11 @@ func DeriveCanonicalStreamFields(sourceURL string, sourcePageURL string, capture
 	if !ok || captureTypeValue == CaptureTypeUnknown {
 		return CanonicalStreamFields{}, fmt.Errorf("capture_type could not be derived; provide capture_type explicitly")
 	}
+	if looksLikeImageURL(fields.SourceURL) && captureTypeValue != CaptureTypeStillImage {
+		captureTypeValue = CaptureTypeStillImage
+		sourceFamilyRaw = ""
+		executionClassRaw = ""
+	}
 	fields.CaptureType = captureTypeValue
 
 	sourceFamily := strings.TrimSpace(sourceFamilyRaw)

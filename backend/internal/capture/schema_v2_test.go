@@ -30,6 +30,28 @@ func TestDeriveCanonicalStreamFieldsRejectsUnknown(t *testing.T) {
 	}
 }
 
+func TestDeriveCanonicalStreamFieldsOverridesExplicitVideoForImageURLs(t *testing.T) {
+	fields, err := DeriveCanonicalStreamFields(
+		"https://www.seattle.gov/trafficcams/images/3_Stewart_NS.jpg",
+		"https://www.seattle.gov/trafficcams/",
+		CaptureTypeHTTPVideo,
+		SourceFamilyVideoStream,
+		ExecutionClassVideoLive,
+	)
+	if err != nil {
+		t.Fatalf("derive canonical stream fields: %v", err)
+	}
+	if fields.CaptureType != CaptureTypeStillImage {
+		t.Fatalf("capture_type=%q want %q", fields.CaptureType, CaptureTypeStillImage)
+	}
+	if fields.SourceFamily != SourceFamilyStillImage {
+		t.Fatalf("source_family=%q want %q", fields.SourceFamily, SourceFamilyStillImage)
+	}
+	if fields.ExecutionClass != ExecutionClassImagePoll {
+		t.Fatalf("execution_class=%q want %q", fields.ExecutionClass, ExecutionClassImagePoll)
+	}
+}
+
 func TestInferCaptureTypePrefersYouTubeAndImages(t *testing.T) {
 	captureType, reason := InferCaptureType("YouTube", "https://youtu.be/abc123", "")
 	if captureType != CaptureTypeYouTubeWatch || reason != "youtube_watch_url" {
