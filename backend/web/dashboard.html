@@ -4409,6 +4409,45 @@ function buildStreamFilterParams() {
   return params;
 }
 
+function applyStreamListStateFromURL(params) {
+  if (!(params instanceof URLSearchParams)) return;
+  streamSearch.value = String(params.get('q') || '').trim();
+  streamTagFilter.value = String(params.get('tags') || '').trim();
+  streamTagExcludeFilter.value = String(params.get('tags_not') || '').trim();
+  streamRecordingStateFilter.value = normalizeRecordingStateFilter(params.get('recording_state'));
+  streamModeFilter.value = normalizeCaptureTypeFilter(params.get('capture_type'));
+  sourceFilter.value = String(params.get('source') || '').trim();
+  countryFilter.value = String(params.get('country') || '').trim();
+  cityFilter.value = String(params.get('city') || '').trim();
+
+  const sortBy = String(params.get('sort_by') || '').trim();
+  if (sortBy) streamSortBy = sortBy;
+  streamSortDir = normalizeSortDir(params.get('sort_dir'), 'desc');
+
+  const view = String(params.get('view') || '').trim().toLowerCase();
+  streamsView = view === 'map' ? 'map' : 'table';
+
+  const page = Number(params.get('page') || '1');
+  streamPage = Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
+
+  const pageSize = Number(params.get('page_size') || localStorage.getItem('streamPageSize') || '100');
+  streamPageSize = Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : 100;
+  streamPageSizeEl.value = String(streamPageSize);
+}
+
+function syncStreamListURL() {
+  const params = buildStreamFilterParams();
+  if (streamsView === 'map') params.set('view', 'map');
+  if (streamSortBy) params.set('sort_by', String(streamSortBy));
+  if (streamSortDir) params.set('sort_dir', normalizeSortDir(streamSortDir, 'desc'));
+  if (streamsView === 'table') {
+    params.set('page', String(Math.max(1, Math.floor(Number(streamPage) || 1))));
+    params.set('page_size', String(Math.max(1, Math.floor(Number(streamPageSize) || 100))));
+  }
+  const qs = params.toString();
+  history.replaceState(null, '', qs ? `/dashboard/streams?${qs}` : '/dashboard/streams');
+}
+
 async function refreshAllStreamFilterOptions() {
   populateCaptureTypeOptions(streamModeFilter, 'capture type: all');
   await loadSourceOptions(
@@ -4465,6 +4504,7 @@ function setStreamsView(view) {
     updateStreamPageControls();
   }
   setStreamsMapStatus(tableView ? '' : streamsMapStatus.textContent, streamsMapStatus.className.includes('err') ? 'err' : '');
+  syncStreamListURL();
 }
 
 function ensureStreamsMap() {
@@ -4619,6 +4659,7 @@ async function loadStreamsMap(opts = {}) {
   streamMapFilterKey = filterKey;
   streamTotal = total || items.length;
   if (streamsView === 'map') streamPageInfo.textContent = `map view · ${streamCountLabel(streamTotal)}`;
+  syncStreamListURL();
   renderStreamsMapRows(streamMapRows, streamTotal);
 }
 
@@ -4717,6 +4758,7 @@ async function loadStreams(opts = {}) {
   if (streamPage > pageCount) { streamPage = pageCount; return loadStreams(); }
   renderStreamRows();
   updateStreamPageControls();
+  syncStreamListURL();
 }
 
 // ─── Recording tab stream list ────────────────────────────────────────────────
@@ -6727,6 +6769,7 @@ document.addEventListener('keydown', (e) => {
     }
     else if (seg === 'streams') {
       mainTab = 'streams';
+      applyStreamListStateFromURL(params);
     }
     else if (seg === 'discovery') {
       mainTab = 'discovery';
@@ -6742,7 +6785,10 @@ document.addEventListener('keydown', (e) => {
     }
     else if (seg === 'recorded' || seg === 'all') {
       mainTab = 'streams';
-      streamRecordingStateFilter.value = '';
+      applyStreamListStateFromURL(params);
+      if (seg === 'recorded' && !params.get('recording_state')) {
+        streamRecordingStateFilter.value = 'on';
+      }
     }
     else if (seg === 'inferences') { mainTab = 'pipelines'; }
   }
@@ -6803,7 +6849,7 @@ document.addEventListener('keydown', (e) => {
       loadKnownStreamTagsSafe('all'),
     ]);
     await refreshAllStreamFilterOptions();
-    await loadStreamsForActiveView({ resetPage: true });
+    await loadStreamsForActiveView();
   } catch (err) {
     if (detailStreamID) setDetailStatus(String(err), 'err');
     else if (mainTab === 'overview') setOverviewStatus(String(err), 'err');
