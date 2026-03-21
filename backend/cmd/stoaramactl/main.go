@@ -3020,6 +3020,7 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		slug := optionalStringFlag(fs, "slug", "")
 		sourceURL := optionalStringFlag(fs, "source-url", "")
 		sourcePageURL := optionalStringFlag(fs, "source-page-url", "")
+		sourceChangeReason := optionalStringFlag(fs, "source-change-reason", "")
 		recordingState := optionalStringFlag(fs, "recording-state", "")
 		interval := optionalIntFlag(fs, "capture-interval", 0)
 		priority := optionalIntFlag(fs, "priority", 0)
@@ -3052,6 +3053,9 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		}
 		if sourcePageURL.set {
 			payload["source_page_url"] = strings.TrimSpace(sourcePageURL.value)
+		}
+		if sourceChangeReason.set {
+			payload["source_change_reason"] = strings.TrimSpace(sourceChangeReason.value)
 		}
 		if recordingState.set {
 			state := strings.ToLower(strings.TrimSpace(recordingState.value))

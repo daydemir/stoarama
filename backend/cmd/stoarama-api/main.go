@@ -17,6 +17,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/email"
 	"github.com/daydemir/stoarama/backend/internal/inferencebox"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/streamalerts"
 )
 
 func main() {
@@ -102,6 +103,21 @@ func main() {
 					continue
 				}
 				return
+			}
+		}()
+	}
+
+	if cfg.StreamAlertsEnabled {
+		go func() {
+			monitor := streamalerts.NewMonitor(pool, mailer, streamalerts.MonitorConfig{
+				AppBaseURL:      cfg.AppBaseURL,
+				PollInterval:    time.Duration(cfg.StreamAlertsPollSec) * time.Second,
+				ProblemDelay:    time.Duration(cfg.StreamAlertsProblemDelaySec) * time.Second,
+				RepeatInterval:  time.Duration(cfg.StreamAlertsRepeatSec) * time.Second,
+				ResolutionEmail: cfg.StreamAlertsResolutionEmail,
+			})
+			if err := monitor.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("stream-alert monitor exited: %v", err)
 			}
 		}()
 	}

@@ -31,6 +31,11 @@ type Config struct {
 	EmailFrom                   string
 	EmailReplyTo                string
 	EmailResendAPIKey           string
+	StreamAlertsEnabled         bool
+	StreamAlertsPollSec         int
+	StreamAlertsProblemDelaySec int
+	StreamAlertsRepeatSec       int
+	StreamAlertsResolutionEmail bool
 	CaptureTickSec              int
 	CaptureConcurrency          int
 	CaptureModeAllowlist        string
@@ -73,6 +78,11 @@ func Load() (Config, error) {
 		EmailFrom:                   firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
 		EmailReplyTo:                firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
 		EmailResendAPIKey:           firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
+		StreamAlertsEnabled:         boolEnv("STREAM_ALERTS_ENABLED", true),
+		StreamAlertsPollSec:         intEnv("STREAM_ALERTS_POLL_SEC", 60),
+		StreamAlertsProblemDelaySec: intEnv("STREAM_ALERTS_PROBLEM_DELAY_SEC", 300),
+		StreamAlertsRepeatSec:       intEnv("STREAM_ALERTS_REPEAT_SEC", 43200),
+		StreamAlertsResolutionEmail: boolEnv("STREAM_ALERTS_RESOLUTION_EMAIL", true),
 		CaptureTickSec:              intEnv("CAPTURE_TICK_SEC", 1),
 		CaptureConcurrency:          intEnv("CAPTURE_CONCURRENCY", 8),
 		CaptureModeAllowlist:        strEnv("CAPTURE_MODE_ALLOWLIST", ""),
