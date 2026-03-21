@@ -67,7 +67,49 @@
       border-radius: 12px;
       background: var(--accent-soft);
       border: 1px solid #bfd9ce;
-      word-break: break-all;
+    }
+    .token-box-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+      margin-bottom: 8px;
+    }
+    .token-value, .command-block {
+      margin: 0;
+      padding: 12px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid #bfd9ce;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .command-block { margin-top: 10px; }
+    .button-row {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+    .button-row button {
+      width: auto;
+      margin-top: 0;
+      min-width: 140px;
+    }
+    .button-row button.secondary {
+      border: 1px solid #bfd9ce;
+      background: rgba(255,255,255,0.82);
+    }
+    .stack {
+      display: grid;
+      gap: 10px;
+    }
+    .muted-note {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
     }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
     th, td { text-align: left; padding: 10px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -193,6 +235,65 @@
     function formatDate(v) {
       if (!v) return 'Never';
       try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
+    }
+
+    async function copyText(text, statusEl, okText) {
+      try {
+        await navigator.clipboard.writeText(String(text || ''));
+        if (statusEl) setStatus(statusEl, okText || 'Copied.', 'ok');
+      } catch (err) {
+        if (statusEl) setStatus(statusEl, `Copy failed: ${String(err)}`, 'err');
+      }
+    }
+
+    function renderTokenBox(container, opts) {
+      const title = String((opts && opts.title) || '').trim();
+      const value = String((opts && opts.value) || '').trim();
+      const commands = Array.isArray(opts && opts.commands) ? opts.commands : [];
+      if (!value && commands.length === 0) {
+        container.classList.add('hidden');
+        container.innerHTML = '';
+        return;
+      }
+      container.classList.remove('hidden');
+      const parts = [];
+      if (title) parts.push(`<div class="token-box-title">${title}</div>`);
+      if (value) {
+        parts.push(`<pre class="token-value">${escapeHTML(value)}</pre>`);
+        parts.push(`<div class="button-row"><button type="button" class="secondary" data-copy-value="1">Copy token</button></div>`);
+      }
+      if (commands.length > 0) {
+        parts.push('<div class="stack">');
+        commands.forEach((cmd, idx) => {
+          parts.push(`
+            <div>
+              <div class="muted-note">Step ${idx + 1}</div>
+              <pre class="command-block">${escapeHTML(String(cmd || ''))}</pre>
+              <div class="button-row"><button type="button" class="secondary" data-copy-command="${idx}">Copy command</button></div>
+            </div>
+          `);
+        });
+        parts.push('</div>');
+      }
+      container.innerHTML = parts.join('');
+      const statusTarget = opts && opts.statusEl;
+      const copyValueBtn = container.querySelector('[data-copy-value]');
+      if (copyValueBtn) {
+        copyValueBtn.addEventListener('click', () => copyText(value, statusTarget, 'Token copied.'));
+      }
+      container.querySelectorAll('[data-copy-command]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = Number(btn.getAttribute('data-copy-command'));
+          copyText(commands[idx] || '', statusTarget, 'Command copied.');
+        });
+      });
+    }
+
+    function escapeHTML(v) {
+      return String(v || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
     }
 
     async function refreshSession() {
@@ -330,8 +431,11 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ label }),
         });
-        newTokenBox.classList.remove('hidden');
-        newTokenBox.textContent = `Copy now. This token is only shown once.\n\n${String(payload.token || '')}`;
+        renderTokenBox(newTokenBox, {
+          title: 'Copy now. This API key is only shown once.',
+          value: String(payload.token || ''),
+          statusEl: createKeyStatus,
+        });
         setStatus(createKeyStatus, 'API key created.', 'ok');
         await refreshKeys();
       } catch (err) {
@@ -348,10 +452,18 @@
           body: JSON.stringify({ node_type: 'yt_relay_source', label }),
         });
         const token = String(payload.token || '');
-        newEnrollmentTokenBox.classList.remove('hidden');
-        newEnrollmentTokenBox.textContent = `Copy now. This enrollment token is only shown once.\n\n${token}`;
-        relayInstallBox.classList.remove('hidden');
-        relayInstallBox.textContent = `Next:\n1. stoarama node enroll --api-base-url ${window.location.origin} --token ${token} --node-type yt_relay_source --display-name \"Mac mini relay\"\n2. stoarama node yt-relay-source install-launchd --public-base-url https://your-relay-host.example --cookies-from-browser chrome`;
+        const enrollCmd = `stoarama node enroll --api-base-url ${window.location.origin} --token ${token} --node-type yt_relay_source --display-name "Mac mini relay"`;
+        const installCmd = `stoarama node yt-relay-source install-launchd --public-base-url https://your-relay-host.example --cookies-from-browser chrome`;
+        renderTokenBox(newEnrollmentTokenBox, {
+          title: 'Copy now. This enrollment token is only shown once.',
+          value: token,
+          statusEl: createEnrollmentStatus,
+        });
+        renderTokenBox(relayInstallBox, {
+          title: 'Next',
+          commands: [enrollCmd, installCmd],
+          statusEl: createEnrollmentStatus,
+        });
         setStatus(createEnrollmentStatus, 'Enrollment token created.', 'ok');
         await refreshEnrollmentTokens();
       } catch (err) {
