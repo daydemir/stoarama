@@ -252,7 +252,7 @@ func (c *Client) GetStream(ctx context.Context, streamID int64) (model.Stream, e
 	if streamID <= 0 {
 		return model.Stream{}, fmt.Errorf("stream_id must be > 0")
 	}
-	u := fmt.Sprintf("%s/api/v1/dashboard/streams/%d?include_image_urls=false", c.baseURL, streamID)
+	u := fmt.Sprintf("%s/api/v1/capture/streams/%d", c.baseURL, streamID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return model.Stream{}, fmt.Errorf("build stream detail request: %w", err)
