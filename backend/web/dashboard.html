@@ -3315,6 +3315,8 @@ function setDetailSubView(view) {
   detailCoverageSection.style.display = view === 'coverage' ? '' : 'none';
   detailTimelineSection.style.display = view === 'timeline' ? '' : 'none';
   detailFramesSection.style.display = view === 'frames' ? '' : 'none';
+  if (view === 'frames') startDetailLivePolling();
+  else stopDetailLivePolling();
 }
 
 function stopDetailLivePolling() {
@@ -3326,19 +3328,19 @@ function stopDetailLivePolling() {
 
 function startDetailLivePolling() {
   stopDetailLivePolling();
-  if (!detailStreamID) return;
+  if (!detailStreamID || detailView !== 'frames') return;
   detailLivePollTimer = setTimeout(async () => {
-    if (!detailStreamID || detailPanel.style.display === 'none') return;
+    if (!detailStreamID || detailPanel.style.display === 'none' || detailView !== 'frames') return;
     if (detailLivePollInFlight) {
       startDetailLivePolling();
       return;
     }
     detailLivePollInFlight = true;
     try {
-      await loadDetail({ quiet: true });
-      if (detailView === 'frames') {
-        await loadDetailFrames({ quiet: true });
-      }
+      await Promise.all([
+        loadDetailLiveFrames({ quiet: true }),
+        loadDetailFrames({ quiet: true }),
+      ]);
     } catch (_) {
       // Keep the previous state visible; explicit status is handled by section loaders.
     } finally {
@@ -5647,6 +5649,18 @@ async function fetchRecentFrames(limit = 60) {
   return Array.isArray(payload.items) ? payload.items : [];
 }
 
+async function loadDetailLiveFrames(options = {}) {
+  const quiet = Boolean(options && options.quiet);
+  if (!detailStreamID) return [];
+  if (!quiet && detailLiveFramesStatus) {
+    detailLiveFramesStatus.textContent = 'Loading recent frames...';
+  }
+  const items = await fetchRecentFrames(60);
+  renderDetailLiveFramesGrid(items);
+  detailRecentFramesData = items;
+  return items;
+}
+
 async function loadDetailFrames(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return;
@@ -5838,7 +5852,7 @@ async function loadDetail(options = {}) {
       framesStatusText.textContent = String(err);
     });
   }
-  if (!quiet) startDetailLivePolling();
+  if (!quiet && detailView === 'frames') startDetailLivePolling();
 }
 
 // ─── Stream table actions ────────────────────────────────────────────────────
@@ -6488,7 +6502,12 @@ detailTabTimeline.addEventListener('click', async () => {
 });
 detailTabFrames.addEventListener('click', async () => {
   setDetailSubView('frames');
-  try { await loadDetailFrames(); }
+  try {
+    await Promise.all([
+      loadDetailLiveFrames(),
+      loadDetailFrames(),
+    ]);
+  }
   catch (err) { framesStatusText.className = 'status-text err'; framesStatusText.textContent = String(err); }
 });
 detailFramesReload.addEventListener('click', async () => {
