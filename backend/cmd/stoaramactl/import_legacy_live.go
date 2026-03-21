@@ -29,51 +29,60 @@ type legacyDashboardPage struct {
 
 type legacyDashboardItem struct {
 	Stream          model.Stream `json:"stream"`
+	LatestCaptured  *time.Time   `json:"latest_captured_at"`
+	LatestFrameURL  string       `json:"latest_frame_url"`
 	RecordingHealth string       `json:"recording_health"`
+	LegacyOffset    int          `json:"-"`
 }
 
 type legacyImportResult struct {
-	LegacyID         int64     `json:"legacy_id"`
-	Provider         string    `json:"provider"`
-	ExternalID       string    `json:"external_id"`
-	Slug             string    `json:"slug"`
-	Name             string    `json:"name"`
-	RecordingHealth  string    `json:"recording_health"`
-	ProbeOK          bool      `json:"probe_ok"`
-	ProbeResolvedURL string    `json:"probe_resolved_url,omitempty"`
-	ProbeImage       bool      `json:"probe_is_image"`
-	ProbeWidth       int       `json:"probe_width,omitempty"`
-	ProbeHeight      int       `json:"probe_height,omitempty"`
-	ProbeMIMEType    string    `json:"probe_mime_type,omitempty"`
-	ProbeError       string    `json:"probe_error,omitempty"`
-	Imported         bool      `json:"imported"`
-	Created          bool      `json:"created"`
-	ImportedStreamID int64     `json:"imported_stream_id,omitempty"`
-	ImportedSlug     string    `json:"imported_slug,omitempty"`
-	ImportError      string    `json:"import_error,omitempty"`
-	StartedAt        time.Time `json:"started_at"`
-	FinishedAt       time.Time `json:"finished_at"`
-	DurationMs       int64     `json:"duration_ms"`
+	LegacyOffset        int       `json:"legacy_offset"`
+	LegacyID            int64     `json:"legacy_id"`
+	Provider            string    `json:"provider"`
+	ExternalID          string    `json:"external_id"`
+	Slug                string    `json:"slug"`
+	Name                string    `json:"name"`
+	RecordingHealth     string    `json:"recording_health"`
+	ProbeOK             bool      `json:"probe_ok"`
+	ProbeResolvedURL    string    `json:"probe_resolved_url,omitempty"`
+	ProbeImage          bool      `json:"probe_is_image"`
+	ProbeWidth          int       `json:"probe_width,omitempty"`
+	ProbeHeight         int       `json:"probe_height,omitempty"`
+	ProbeMIMEType       string    `json:"probe_mime_type,omitempty"`
+	ProbeError          string    `json:"probe_error,omitempty"`
+	Imported            bool      `json:"imported"`
+	Created             bool      `json:"created"`
+	ImportedStreamID    int64     `json:"imported_stream_id,omitempty"`
+	ImportedSlug        string    `json:"imported_slug,omitempty"`
+	LatestFrameImported bool      `json:"latest_frame_imported"`
+	LatestFrameError    string    `json:"latest_frame_error,omitempty"`
+	ImportError         string    `json:"import_error,omitempty"`
+	StartedAt           time.Time `json:"started_at"`
+	FinishedAt          time.Time `json:"finished_at"`
+	DurationMs          int64     `json:"duration_ms"`
 }
 
 type legacyImportReport struct {
-	LegacyAPIURL string               `json:"legacy_api_url"`
-	TargetAPIURL string               `json:"target_api_url"`
-	Offset       int                  `json:"offset"`
-	Limit        int                  `json:"limit"`
-	PageSize     int                  `json:"page_size"`
-	Concurrency  int                  `json:"concurrency"`
-	ProbeTimeout string               `json:"probe_timeout"`
-	Apply        bool                 `json:"apply"`
-	GeneratedAt  time.Time            `json:"generated_at"`
-	Processed    int                  `json:"processed"`
-	ProbedOK     int                  `json:"probed_ok"`
-	Imported     int                  `json:"imported"`
-	Created      int                  `json:"created"`
-	Updated      int                  `json:"updated"`
-	ProbeFailed  int                  `json:"probe_failed"`
-	ImportFailed int                  `json:"import_failed"`
-	Results      []legacyImportResult `json:"results"`
+	LegacyAPIURL         string               `json:"legacy_api_url"`
+	TargetAPIURL         string               `json:"target_api_url"`
+	Offset               int                  `json:"offset"`
+	Limit                int                  `json:"limit"`
+	PageSize             int                  `json:"page_size"`
+	Concurrency          int                  `json:"concurrency"`
+	ProbeTimeout         string               `json:"probe_timeout"`
+	Apply                bool                 `json:"apply"`
+	CheckpointJSONL      string               `json:"checkpoint_jsonl,omitempty"`
+	ImportLatestFrame    bool                 `json:"import_latest_frame"`
+	GeneratedAt          time.Time            `json:"generated_at"`
+	Processed            int                  `json:"processed"`
+	ProbedOK             int                  `json:"probed_ok"`
+	Imported             int                  `json:"imported"`
+	Created              int                  `json:"created"`
+	Updated              int                  `json:"updated"`
+	ProbeFailed          int                  `json:"probe_failed"`
+	ImportFailed         int                  `json:"import_failed"`
+	LatestFramesImported int                  `json:"latest_frames_imported"`
+	Results              []legacyImportResult `json:"results"`
 }
 
 func runImport(ctx context.Context, cfg config.Config, args []string) {
@@ -90,7 +99,7 @@ func runImport(ctx context.Context, cfg config.Config, args []string) {
 }
 
 func printImportUsage() {
-	fmt.Print("stoaramactl import legacy-live-streams [--legacy-api-url URL --legacy-api-token TOKEN --target-api-url URL --service-token TOKEN --offset 0 --limit 200 --page-size 50 --concurrency 4 --probe-timeout-sec 45 --legacy-recording-state off|on --legacy-provider P --apply --report-json out.json --json]\n")
+	fmt.Print("stoaramactl import legacy-live-streams [--legacy-api-url URL --legacy-api-token TOKEN --target-api-url URL --service-token TOKEN --offset N --limit 200 --page-size 50 --concurrency 4 --probe-timeout-sec 45 --legacy-recording-state off|on --legacy-provider P --apply --import-latest-frame --checkpoint-jsonl file --resume=true --report-json out.json --json]\n")
 }
 
 func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []string) {
@@ -99,7 +108,7 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	legacyAPIToken := fs.String("legacy-api-token", defaultLegacyAPIToken(), "legacy backend API token")
 	targetAPIURL := fs.String("target-api-url", defaultBackendAPIURL(), "target Stoarama API base URL")
 	serviceToken := fs.String("service-token", cfg.ServiceToken, "target Stoarama service token")
-	offset := fs.Int("offset", 0, "legacy stream offset")
+	offset := fs.Int("offset", -1, "legacy stream offset (-1 means infer from checkpoint when resuming)")
 	limit := fs.Int("limit", 200, "maximum legacy streams to process")
 	pageSize := fs.Int("page-size", 50, "legacy API page size")
 	concurrency := fs.Int("concurrency", 4, "probe/import worker concurrency")
@@ -107,6 +116,9 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	legacyRecordingState := fs.String("legacy-recording-state", "", "optional legacy recording state filter off|on")
 	legacyProvider := fs.String("legacy-provider", "", "optional legacy provider filter")
 	apply := fs.Bool("apply", false, "import live streams into Stoarama")
+	importLatestFrame := fs.Bool("import-latest-frame", false, "import the legacy latest frame as a snapshot for successfully imported streams")
+	checkpointJSONL := fs.String("checkpoint-jsonl", defaultLegacyImportCheckpointPath(), "append-only checkpoint jsonl path")
+	resume := fs.Bool("resume", true, "resume from checkpoint and skip already-checked legacy stream ids")
 	reportJSON := fs.String("report-json", "", "optional report JSON path")
 	asJSON := fs.Bool("json", false, "print JSON report")
 	_ = fs.Parse(args)
@@ -139,7 +151,25 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 		log.Fatalf("--probe-timeout-sec must be > 0")
 	}
 
-	items, err := fetchLegacyStreams(ctx, strings.TrimSpace(*legacyAPIURL), strings.TrimSpace(*legacyAPIToken), *offset, *limit, *pageSize, strings.TrimSpace(*legacyRecordingState), strings.TrimSpace(*legacyProvider))
+	seen := map[int64]legacyImportResult{}
+	resumeOffset := 0
+	if *resume && strings.TrimSpace(*checkpointJSONL) != "" {
+		loaded, maxOffset, err := loadLegacyImportCheckpoint(strings.TrimSpace(*checkpointJSONL))
+		if err != nil {
+			log.Fatalf("load checkpoint: %v", err)
+		}
+		seen = loaded
+		resumeOffset = maxOffset + 1
+	}
+	effectiveOffset := *offset
+	if effectiveOffset < 0 {
+		effectiveOffset = 0
+		if *resume && len(seen) > 0 {
+			effectiveOffset = resumeOffset
+		}
+	}
+
+	items, err := fetchLegacyStreams(ctx, strings.TrimSpace(*legacyAPIURL), strings.TrimSpace(*legacyAPIToken), effectiveOffset, *limit, *pageSize, strings.TrimSpace(*legacyRecordingState), strings.TrimSpace(*legacyProvider), *importLatestFrame, seen)
 	if err != nil {
 		log.Fatalf("fetch legacy streams: %v", err)
 	}
@@ -152,7 +182,12 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 		go func() {
 			defer wg.Done()
 			for idx := range workCh {
-				results[idx] = processLegacyImportItem(ctx, items[idx], strings.TrimSpace(*targetAPIURL), strings.TrimSpace(*serviceToken), time.Duration(*probeTimeoutSec)*time.Second, *apply)
+				results[idx] = processLegacyImportItem(ctx, items[idx], strings.TrimSpace(*targetAPIURL), strings.TrimSpace(*serviceToken), time.Duration(*probeTimeoutSec)*time.Second, *apply, *importLatestFrame)
+				if strings.TrimSpace(*checkpointJSONL) != "" {
+					if err := appendLegacyImportCheckpoint(strings.TrimSpace(*checkpointJSONL), results[idx]); err != nil {
+						log.Printf("append checkpoint legacy_id=%d: %v", results[idx].LegacyID, err)
+					}
+				}
 			}
 		}()
 	}
@@ -167,17 +202,19 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	})
 
 	report := legacyImportReport{
-		LegacyAPIURL: strings.TrimSpace(*legacyAPIURL),
-		TargetAPIURL: strings.TrimSpace(*targetAPIURL),
-		Offset:       *offset,
-		Limit:        *limit,
-		PageSize:     *pageSize,
-		Concurrency:  *concurrency,
-		ProbeTimeout: (time.Duration(*probeTimeoutSec) * time.Second).String(),
-		Apply:        *apply,
-		GeneratedAt:  time.Now().UTC(),
-		Processed:    len(results),
-		Results:      results,
+		LegacyAPIURL:      strings.TrimSpace(*legacyAPIURL),
+		TargetAPIURL:      strings.TrimSpace(*targetAPIURL),
+		Offset:            effectiveOffset,
+		Limit:             *limit,
+		PageSize:          *pageSize,
+		Concurrency:       *concurrency,
+		ProbeTimeout:      (time.Duration(*probeTimeoutSec) * time.Second).String(),
+		Apply:             *apply,
+		CheckpointJSONL:   strings.TrimSpace(*checkpointJSONL),
+		ImportLatestFrame: *importLatestFrame,
+		GeneratedAt:       time.Now().UTC(),
+		Processed:         len(results),
+		Results:           results,
 	}
 	for _, result := range results {
 		if result.ProbeOK {
@@ -195,6 +232,9 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 		}
 		if result.ImportError != "" {
 			report.ImportFailed++
+		}
+		if result.LatestFrameImported {
+			report.LatestFramesImported++
 		}
 	}
 
@@ -229,8 +269,9 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	}
 }
 
-func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limit, pageSize int, recordingState, provider string) ([]legacyDashboardItem, error) {
+func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limit, pageSize int, recordingState, provider string, includeImageURLs bool, seen map[int64]legacyImportResult) ([]legacyDashboardItem, error) {
 	items := make([]legacyDashboardItem, 0, limit)
+	scanOffset := offset
 	for len(items) < limit {
 		batchSize := pageSize
 		if remaining := limit - len(items); remaining < batchSize {
@@ -238,8 +279,12 @@ func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limi
 		}
 		q := url.Values{}
 		q.Set("limit", fmt.Sprintf("%d", batchSize))
-		q.Set("offset", fmt.Sprintf("%d", offset+len(items)))
-		q.Set("include_image_urls", "false")
+		q.Set("offset", fmt.Sprintf("%d", scanOffset))
+		if includeImageURLs {
+			q.Set("include_image_urls", "true")
+		} else {
+			q.Set("include_image_urls", "false")
+		}
 		if strings.TrimSpace(recordingState) != "" {
 			q.Set("recording_state", strings.TrimSpace(recordingState))
 		}
@@ -253,17 +298,28 @@ func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limi
 		if len(page.Items) == 0 {
 			break
 		}
-		items = append(items, page.Items...)
-		if len(page.Items) < batchSize {
+		for idx, item := range page.Items {
+			item.LegacyOffset = scanOffset + idx
+			if _, ok := seen[item.Stream.ID]; ok {
+				continue
+			}
+			items = append(items, item)
+			if len(items) >= limit {
+				break
+			}
+		}
+		if len(page.Items) < batchSize || len(items) >= limit {
 			break
 		}
+		scanOffset += len(page.Items)
 	}
 	return items, nil
 }
 
-func processLegacyImportItem(ctx context.Context, item legacyDashboardItem, targetAPIURL, serviceToken string, probeTimeout time.Duration, apply bool) (result legacyImportResult) {
+func processLegacyImportItem(ctx context.Context, item legacyDashboardItem, targetAPIURL, serviceToken string, probeTimeout time.Duration, apply bool, importLatestFrame bool) (result legacyImportResult) {
 	started := time.Now().UTC()
 	result = legacyImportResult{
+		LegacyOffset:    item.LegacyOffset,
 		LegacyID:        item.Stream.ID,
 		Provider:        item.Stream.Provider,
 		ExternalID:      item.Stream.ExternalID,
@@ -336,6 +392,25 @@ func processLegacyImportItem(ctx context.Context, item legacyDashboardItem, targ
 	result.Created = response.Created
 	result.ImportedStreamID = response.Stream.ID
 	result.ImportedSlug = response.Stream.Slug
+	if importLatestFrame && strings.TrimSpace(item.LatestFrameURL) != "" && result.ImportedStreamID > 0 {
+		payload := map[string]any{
+			"stream_id":    result.ImportedStreamID,
+			"frame_url":    strings.TrimSpace(item.LatestFrameURL),
+			"captured_at":  legacyCapturedAtString(item.LatestCaptured),
+			"source_kind":  "snapshot_url",
+			"source_label": "legacy-latest-frame",
+		}
+		var frameResp struct {
+			OK        bool   `json:"ok"`
+			Inserted  bool   `json:"inserted"`
+			ObjectKey string `json:"object_key"`
+		}
+		if err := postJSONWithToken(ctx, targetAPIURL, serviceToken, "/api/v1/imports/frames", payload, &frameResp); err != nil {
+			result.LatestFrameError = err.Error()
+		} else {
+			result.LatestFrameImported = frameResp.Inserted
+		}
+	}
 	return result
 }
 
@@ -370,6 +445,63 @@ func writeLegacyImportReport(path string, report legacyImportReport) error {
 		return err
 	}
 	return os.WriteFile(path, b, 0o644)
+}
+
+func appendLegacyImportCheckpoint(path string, result legacyImportResult) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	b, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func loadLegacyImportCheckpoint(path string) (map[int64]legacyImportResult, int, error) {
+	out := map[int64]legacyImportResult{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, -1, nil
+		}
+		return nil, 0, err
+	}
+	maxOffset := -1
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item legacyImportResult
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			return nil, 0, fmt.Errorf("decode checkpoint line: %w", err)
+		}
+		out[item.LegacyID] = item
+		if item.LegacyOffset > maxOffset {
+			maxOffset = item.LegacyOffset
+		}
+	}
+	return out, maxOffset, nil
+}
+
+func defaultLegacyImportCheckpointPath() string {
+	return "local/reports/legacy-import-checkpoint.jsonl"
+}
+
+func legacyCapturedAtString(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 func getJSONWithToken(ctx context.Context, baseURL, token, path string, out any) error {

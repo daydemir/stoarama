@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/model"
+	"github.com/daydemir/stoarama/backend/internal/storage"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -36,6 +38,14 @@ type serviceStreamImportRequest struct {
 	MetadataJSON        map[string]any `json:"metadata_json"`
 }
 
+type serviceFrameImportRequest struct {
+	StreamID    int64  `json:"stream_id"`
+	FrameURL    string `json:"frame_url"`
+	CapturedAt  string `json:"captured_at"`
+	SourceKind  string `json:"source_kind"`
+	SourceLabel string `json:"source_label"`
+}
+
 func (s *Server) handleServiceStreamImport(w http.ResponseWriter, r *http.Request) {
 	var req serviceStreamImportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -51,6 +61,103 @@ func (s *Server) handleServiceStreamImport(w http.ResponseWriter, r *http.Reques
 		"ok":      true,
 		"created": created,
 		"stream":  stream,
+	})
+}
+
+func (s *Server) handleServiceFrameImport(w http.ResponseWriter, r *http.Request) {
+	var req serviceFrameImportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	if req.StreamID <= 0 || strings.TrimSpace(req.FrameURL) == "" {
+		util.WriteError(w, http.StatusBadRequest, "stream_id and frame_url are required")
+		return
+	}
+	capturedAt := time.Now().UTC()
+	if raw := strings.TrimSpace(req.CapturedAt); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid captured_at: %v", err))
+			return
+		}
+		capturedAt = parsed.UTC()
+	}
+	sourceKind := strings.TrimSpace(req.SourceKind)
+	if sourceKind == "" {
+		sourceKind = "snapshot_url"
+	}
+	frame, err := capture.CaptureFrame(r.Context(), strings.TrimSpace(req.FrameURL))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("capture frame: %v", err))
+		return
+	}
+	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/import-%s-%d%s",
+		req.StreamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(),
+		sanitizePathToken(firstNonEmptyImport(req.SourceLabel, "legacy-latest-frame")),
+		capturedAt.UnixNano(), fileExtensionFromMIME(frame.MIMEType))
+
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin import frame tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	etag, err := s.r2.PutBytes(r.Context(), objectKey, frame.MIMEType, frame.Bytes)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upload imported frame: %v", err))
+		return
+	}
+	mediaID, err := storage.UpsertMediaObject(r.Context(), tx, storage.MediaObjectInput{
+		StorageProvider: "r2",
+		Bucket:          s.r2.Bucket(),
+		ObjectKey:       objectKey,
+		MIMEType:        frame.MIMEType,
+		SizeBytes:       frame.SizeBytes,
+		ETag:            etag,
+		SHA256:          frame.SHA256,
+		Width:           frame.Width,
+		Height:          frame.Height,
+	})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert media object: %v", err))
+		return
+	}
+	ct, err := tx.Exec(r.Context(), `
+		INSERT INTO frames (stream_id, capture_job_id, captured_at, raw_media_object_id, capture_status, capture_error, source_kind)
+		VALUES ($1, NULL, $2, $3, 'success', NULL, $4)
+		ON CONFLICT (stream_id, captured_at, raw_media_object_id) DO NOTHING
+	`, req.StreamID, capturedAt, mediaID, sourceKind)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert imported frame: %v", err))
+		return
+	}
+	inserted := ct.RowsAffected() == 1
+	if inserted {
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO stream_health (stream_id, captures_total, captures_success, captures_error, last_capture_at)
+			VALUES ($1, 1, 1, 0, $2)
+			ON CONFLICT (stream_id)
+			DO UPDATE SET
+				captures_total=stream_health.captures_total+1,
+				captures_success=stream_health.captures_success+1,
+				last_capture_at=GREATEST(stream_health.last_capture_at, EXCLUDED.last_capture_at),
+				updated_at=now()
+		`, req.StreamID, capturedAt); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update stream_health: %v", err))
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit imported frame tx: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"inserted":   inserted,
+		"media_id":   mediaID,
+		"object_key": objectKey,
 	})
 }
 
@@ -191,4 +298,13 @@ func ensureAvailableSlugTx(ctx context.Context, q slugQueryRower, raw string, ke
 		slug = fmt.Sprintf("%s-%d", base, attempt+2)
 	}
 	return "", newAPIStatusError(http.StatusConflict, "could not find available slug for %q", raw)
+}
+
+func firstNonEmptyImport(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
