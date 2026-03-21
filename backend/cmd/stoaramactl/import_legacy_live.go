@@ -580,8 +580,12 @@ func applyLegacyImportResultToState(state *legacyImportRunState, result legacyIm
 	state.ProcessedInRun++
 	state.UpdatedAt = time.Now().UTC()
 	state.LastLegacyID = result.LegacyID
-	state.LastLegacyOffset = result.LegacyOffset
-	state.NextSuggestedOffset = result.LegacyOffset + 1
+	if result.LegacyOffset > state.LastLegacyOffset {
+		state.LastLegacyOffset = result.LegacyOffset
+	}
+	if next := result.LegacyOffset + 1; next > state.NextSuggestedOffset {
+		state.NextSuggestedOffset = next
+	}
 	copyResult := result
 	state.LastResult = &copyResult
 	if result.ProbeOK {
