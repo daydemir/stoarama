@@ -6157,8 +6157,23 @@ detailActions.addEventListener('click', async (e) => {
   if (!action || !id) return;
   try {
     setDetailStatus('updating...');
+    if (action === 'recording-enable' || action === 'recording-disable') {
+      const nextState = action === 'recording-enable' ? 'on' : 'off';
+      await setStreamRecordingState(id, nextState);
+      await loadDetail();
+      void Promise.allSettled([
+        loadOverview(),
+        loadStreamsForActiveView(),
+        loadRecStreams(),
+        loadServersAssignments(),
+        loadRecordingCapacity(),
+      ]);
+      setDetailStatus('updated', 'ok');
+      return;
+    }
     await handleStreamTableAction(action, id, 'detail', btn);
     await loadDetail();
+    setDetailStatus('updated', 'ok');
   } catch (err) { setDetailStatus(String(err), 'err'); }
 });
 
