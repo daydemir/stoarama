@@ -17,7 +17,7 @@ func TestLoadDesiredStreamsWithStreamFilterIncludesNonRecordedStream(t *testing.
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/dashboard/recording/settings", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/recording/settings", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Fatalf("authorization header=%q", got)
 		}
@@ -79,7 +79,7 @@ func TestLoadAssignedStreamsUsesAssignmentModeAndRelayPullURL(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/dashboard/recording/settings", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/recording/settings", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"interval_sec": 1,
 			"updated_at":   time.Now().UTC().Format(time.RFC3339Nano),
@@ -267,7 +267,7 @@ func TestLoadDesiredStreamsRequiresServerIDWithoutStreamFilter(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/dashboard/recording/settings", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/recording/settings", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"interval_sec": 1,
 			"updated_at":   time.Now().UTC().Format(time.RFC3339Nano),

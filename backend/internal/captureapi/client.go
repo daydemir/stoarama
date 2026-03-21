@@ -299,7 +299,7 @@ func normalizeExecutionClassValue(raw string) (string, error) {
 }
 
 func (c *Client) GetRecordingSettings(ctx context.Context) (RecordingSettings, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/dashboard/recording/settings", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/recording/settings", nil)
 	if err != nil {
 		return RecordingSettings{}, fmt.Errorf("build recording settings request: %w", err)
 	}

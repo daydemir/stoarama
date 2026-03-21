@@ -217,6 +217,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/source-candidates/{id}/runs", s.handleSourceCandidateRunCreate)
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
+			service.Get("/recording/settings", s.handleServiceRecordingSettingsGet)
 			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
 			service.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
 			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)
@@ -4148,6 +4149,14 @@ type dashboardRecordingSettingsRequest struct {
 }
 
 func (s *Server) handleDashboardRecordingSettingsGet(w http.ResponseWriter, r *http.Request) {
+	s.writeRecordingSettings(w, r)
+}
+
+func (s *Server) handleServiceRecordingSettingsGet(w http.ResponseWriter, r *http.Request) {
+	s.writeRecordingSettings(w, r)
+}
+
+func (s *Server) writeRecordingSettings(w http.ResponseWriter, r *http.Request) {
 	rs, err := settings.GetRecordingSettings(r.Context(), s.pool)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
