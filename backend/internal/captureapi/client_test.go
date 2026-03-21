@@ -152,8 +152,8 @@ func TestListRecordingAssignmentsPaginatesUntilShortPage(t *testing.T) {
 
 	requests := make([]string, 0, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Path; got != "/api/v1/recording/assignments" {
-			t.Fatalf("path=%q want=/api/v1/recording/assignments", got)
+		if got := r.URL.Path; got != "/api/v1/service/recording/assignments" {
+			t.Fatalf("path=%q want=/api/v1/service/recording/assignments", got)
 		}
 		requests = append(requests, r.URL.RawQuery)
 		offset := r.URL.Query().Get("offset")

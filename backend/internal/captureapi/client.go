@@ -336,7 +336,7 @@ func (c *Client) listRecordingAssignmentsPage(ctx context.Context, serverID stri
 	if offset < 0 {
 		offset = 0
 	}
-	u, err := url.Parse(c.baseURL + "/api/v1/recording/assignments")
+	u, err := url.Parse(c.baseURL + "/api/v1/service/recording/assignments")
 	if err != nil {
 		return nil, fmt.Errorf("parse recording assignments URL: %w", err)
 	}
