@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -85,6 +86,42 @@ type legacyImportReport struct {
 	Results              []legacyImportResult `json:"results"`
 }
 
+type legacyImportRunState struct {
+	RunID                string              `json:"run_id"`
+	Status               string              `json:"status"`
+	LegacyAPIURL         string              `json:"legacy_api_url"`
+	TargetAPIURL         string              `json:"target_api_url"`
+	CheckpointJSONL      string              `json:"checkpoint_jsonl,omitempty"`
+	LockFile             string              `json:"lock_file,omitempty"`
+	Offset               int                 `json:"offset"`
+	Limit                int                 `json:"limit"`
+	PageSize             int                 `json:"page_size"`
+	Concurrency          int                 `json:"concurrency"`
+	ProbeTimeout         string              `json:"probe_timeout"`
+	Apply                bool                `json:"apply"`
+	ImportLatestFrame    bool                `json:"import_latest_frame"`
+	LegacyTotal          int64               `json:"legacy_total"`
+	StartedAt            time.Time           `json:"started_at"`
+	UpdatedAt            time.Time           `json:"updated_at"`
+	FinishedAt           *time.Time          `json:"finished_at,omitempty"`
+	Host                 string              `json:"host,omitempty"`
+	PID                  int                 `json:"pid"`
+	SeenStreams          int                 `json:"seen_streams"`
+	ProcessedInRun       int                 `json:"processed_in_run"`
+	ProbedOK             int                 `json:"probed_ok"`
+	ProbeFailed          int                 `json:"probe_failed"`
+	Imported             int                 `json:"imported"`
+	Created              int                 `json:"created"`
+	Updated              int                 `json:"updated"`
+	ImportFailed         int                 `json:"import_failed"`
+	LatestFramesImported int                 `json:"latest_frames_imported"`
+	LastLegacyID         int64               `json:"last_legacy_id,omitempty"`
+	LastLegacyOffset     int                 `json:"last_legacy_offset,omitempty"`
+	NextSuggestedOffset  int                 `json:"next_suggested_offset"`
+	LastError            string              `json:"last_error,omitempty"`
+	LastResult           *legacyImportResult `json:"last_result,omitempty"`
+}
+
 func runImport(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
 		printImportUsage()
@@ -118,6 +155,8 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	apply := fs.Bool("apply", false, "import live streams into Stoarama")
 	importLatestFrame := fs.Bool("import-latest-frame", false, "import the legacy latest frame as a snapshot for successfully imported streams")
 	checkpointJSONL := fs.String("checkpoint-jsonl", defaultLegacyImportCheckpointPath(), "append-only checkpoint jsonl path")
+	stateJSON := fs.String("state-json", defaultLegacyImportStatePath(), "run-state JSON path")
+	lockFile := fs.String("lock-file", defaultLegacyImportLockPath(), "advisory lock file path")
 	resume := fs.Bool("resume", true, "resume from checkpoint and skip already-checked legacy stream ids")
 	reportJSON := fs.String("report-json", "", "optional report JSON path")
 	asJSON := fs.Bool("json", false, "print JSON report")
@@ -150,6 +189,11 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	if *probeTimeoutSec <= 0 {
 		log.Fatalf("--probe-timeout-sec must be > 0")
 	}
+	unlock, err := acquireLegacyImportLock(strings.TrimSpace(*lockFile))
+	if err != nil {
+		log.Fatalf("acquire lock: %v", err)
+	}
+	defer unlock()
 
 	seen := map[int64]legacyImportResult{}
 	resumeOffset := 0
@@ -169,12 +213,55 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 		}
 	}
 
-	items, err := fetchLegacyStreams(ctx, strings.TrimSpace(*legacyAPIURL), strings.TrimSpace(*legacyAPIToken), effectiveOffset, *limit, *pageSize, strings.TrimSpace(*legacyRecordingState), strings.TrimSpace(*legacyProvider), *importLatestFrame, seen)
+	hostname, _ := os.Hostname()
+	state := legacyImportRunState{
+		RunID:               time.Now().UTC().Format("20060102T150405Z"),
+		Status:              "running",
+		LegacyAPIURL:        strings.TrimSpace(*legacyAPIURL),
+		TargetAPIURL:        strings.TrimSpace(*targetAPIURL),
+		CheckpointJSONL:     strings.TrimSpace(*checkpointJSONL),
+		LockFile:            strings.TrimSpace(*lockFile),
+		Offset:              effectiveOffset,
+		Limit:               *limit,
+		PageSize:            *pageSize,
+		Concurrency:         *concurrency,
+		ProbeTimeout:        (time.Duration(*probeTimeoutSec) * time.Second).String(),
+		Apply:               *apply,
+		ImportLatestFrame:   *importLatestFrame,
+		StartedAt:           time.Now().UTC(),
+		UpdatedAt:           time.Now().UTC(),
+		Host:                hostname,
+		PID:                 os.Getpid(),
+		SeenStreams:         len(seen),
+		NextSuggestedOffset: effectiveOffset,
+	}
+	if path := strings.TrimSpace(*stateJSON); path != "" {
+		if err := writeLegacyImportState(path, state); err != nil {
+			log.Fatalf("write initial state: %v", err)
+		}
+	}
+
+	items, total, err := fetchLegacyStreams(ctx, strings.TrimSpace(*legacyAPIURL), strings.TrimSpace(*legacyAPIToken), effectiveOffset, *limit, *pageSize, strings.TrimSpace(*legacyRecordingState), strings.TrimSpace(*legacyProvider), *importLatestFrame, seen)
 	if err != nil {
+		state.Status = "failed"
+		state.LastError = err.Error()
+		now := time.Now().UTC()
+		state.FinishedAt = &now
+		state.UpdatedAt = now
+		if path := strings.TrimSpace(*stateJSON); path != "" {
+			_ = writeLegacyImportState(path, state)
+		}
 		log.Fatalf("fetch legacy streams: %v", err)
+	}
+	state.LegacyTotal = total
+	if path := strings.TrimSpace(*stateJSON); path != "" {
+		if err := writeLegacyImportState(path, state); err != nil {
+			log.Fatalf("write fetched state: %v", err)
+		}
 	}
 
 	results := make([]legacyImportResult, len(items))
+	var stateMu sync.Mutex
 	var wg sync.WaitGroup
 	workCh := make(chan int)
 	for worker := 0; worker < *concurrency; worker++ {
@@ -188,6 +275,14 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 						log.Printf("append checkpoint legacy_id=%d: %v", results[idx].LegacyID, err)
 					}
 				}
+				stateMu.Lock()
+				applyLegacyImportResultToState(&state, results[idx])
+				if path := strings.TrimSpace(*stateJSON); path != "" {
+					if err := writeLegacyImportState(path, state); err != nil {
+						log.Printf("write state legacy_id=%d: %v", results[idx].LegacyID, err)
+					}
+				}
+				stateMu.Unlock()
 			}
 		}()
 	}
@@ -237,6 +332,17 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 			report.LatestFramesImported++
 		}
 	}
+	stateMu.Lock()
+	state.Status = "completed"
+	now := time.Now().UTC()
+	state.UpdatedAt = now
+	state.FinishedAt = &now
+	if path := strings.TrimSpace(*stateJSON); path != "" {
+		if err := writeLegacyImportState(path, state); err != nil {
+			log.Printf("write final state: %v", err)
+		}
+	}
+	stateMu.Unlock()
 
 	if path := strings.TrimSpace(*reportJSON); path != "" {
 		if err := writeLegacyImportReport(path, report); err != nil {
@@ -269,9 +375,10 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	}
 }
 
-func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limit, pageSize int, recordingState, provider string, includeImageURLs bool, seen map[int64]legacyImportResult) ([]legacyDashboardItem, error) {
+func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limit, pageSize int, recordingState, provider string, includeImageURLs bool, seen map[int64]legacyImportResult) ([]legacyDashboardItem, int64, error) {
 	items := make([]legacyDashboardItem, 0, limit)
 	scanOffset := offset
+	var total int64
 	for len(items) < limit {
 		batchSize := pageSize
 		if remaining := limit - len(items); remaining < batchSize {
@@ -293,7 +400,10 @@ func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limi
 		}
 		var page legacyDashboardPage
 		if err := getJSONWithToken(ctx, baseURL, token, "/api/v1/dashboard/streams?"+q.Encode(), &page); err != nil {
-			return nil, err
+			return nil, 0, err
+		}
+		if total == 0 {
+			total = page.Total
 		}
 		if len(page.Items) == 0 {
 			break
@@ -313,7 +423,7 @@ func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limi
 		}
 		scanOffset += len(page.Items)
 	}
-	return items, nil
+	return items, total, nil
 }
 
 func processLegacyImportItem(ctx context.Context, item legacyDashboardItem, targetAPIURL, serviceToken string, probeTimeout time.Duration, apply bool, importLatestFrame bool) (result legacyImportResult) {
@@ -466,6 +576,38 @@ func appendLegacyImportCheckpoint(path string, result legacyImportResult) error 
 	return nil
 }
 
+func applyLegacyImportResultToState(state *legacyImportRunState, result legacyImportResult) {
+	state.ProcessedInRun++
+	state.UpdatedAt = time.Now().UTC()
+	state.LastLegacyID = result.LegacyID
+	state.LastLegacyOffset = result.LegacyOffset
+	state.NextSuggestedOffset = result.LegacyOffset + 1
+	copyResult := result
+	state.LastResult = &copyResult
+	if result.ProbeOK {
+		state.ProbedOK++
+	} else {
+		state.ProbeFailed++
+	}
+	if result.Imported {
+		state.Imported++
+		if result.Created {
+			state.Created++
+		} else {
+			state.Updated++
+		}
+	}
+	if result.ImportError != "" {
+		state.ImportFailed++
+		state.LastError = result.ImportError
+	} else if result.ProbeError != "" {
+		state.LastError = result.ProbeError
+	}
+	if result.LatestFrameImported {
+		state.LatestFramesImported++
+	}
+}
+
 func loadLegacyImportCheckpoint(path string) (map[int64]legacyImportResult, int, error) {
 	out := map[int64]legacyImportResult{}
 	b, err := os.ReadFile(path)
@@ -495,6 +637,53 @@ func loadLegacyImportCheckpoint(path string) (map[int64]legacyImportResult, int,
 
 func defaultLegacyImportCheckpointPath() string {
 	return "local/reports/legacy-import-checkpoint.jsonl"
+}
+
+func defaultLegacyImportStatePath() string {
+	return "local/reports/legacy-import-state.json"
+}
+
+func defaultLegacyImportLockPath() string {
+	return "local/reports/legacy-import.lock"
+}
+
+func writeLegacyImportState(path string, state legacyImportRunState) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
+}
+
+func acquireLegacyImportLock(path string) (func(), error) {
+	if strings.TrimSpace(path) == "" {
+		return func() {}, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock already held for %s", path)
+	}
+	_, _ = f.Seek(0, 0)
+	if err := f.Truncate(0); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		return nil, err
+	}
+	_, _ = fmt.Fprintf(f, "pid=%d started_at=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 func legacyCapturedAtString(t *time.Time) string {
