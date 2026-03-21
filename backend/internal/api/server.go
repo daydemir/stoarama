@@ -229,6 +229,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/youtube-relay/sources/stopped", s.handleYouTubeRelaySourceStopped)
 			service.Post("/youtube-relay/routes/{stream_id}/status", s.handleYouTubeRelayRouteStatus)
 			service.Get("/capture/streams", s.handleCaptureStreams)
+			service.Get("/capture/streams/{id}", s.handleCaptureStreamDetail)
 			service.Get("/service/capture/catalog/candidates", s.handleServiceCaptureCatalogCandidates)
 			service.Get("/capture/runtime", s.handleCaptureRuntime)
 			service.Post("/capture/runtime/stopped", s.handleCaptureRuntimeStopped)
@@ -2201,6 +2202,23 @@ func (s *Server) handleCaptureStreams(w http.ResponseWriter, r *http.Request) {
 		"offset": offset,
 		"total":  total,
 	})
+}
+
+func (s *Server) handleCaptureStreamDetail(w http.ResponseWriter, r *http.Request) {
+	streamID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	stream, err := s.getStreamByID(r.Context(), streamID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			util.WriteError(w, http.StatusNotFound, "stream not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query capture stream detail: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"stream": stream})
 }
 
 func (s *Server) handleCaptureRuntime(w http.ResponseWriter, r *http.Request) {

@@ -29,7 +29,7 @@ func TestLoadDesiredStreamsWithStreamFilterIncludesNonRecordedStream(t *testing.
 	mux.HandleFunc("/api/v1/dashboard/streams", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("unexpected list endpoint call: %s", r.URL.Path)
 	})
-	mux.HandleFunc("/api/v1/dashboard/streams/123", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/capture/streams/123", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Fatalf("authorization header=%q", got)
 		}

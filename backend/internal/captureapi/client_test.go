@@ -67,6 +67,48 @@ func TestListRecordedStreamsOnOnly(t *testing.T) {
 	}
 }
 
+func TestGetStreamUsesCaptureDetailEndpoint(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/api/v1/capture/streams/42" {
+			t.Fatalf("path=%q want=/api/v1/capture/streams/42", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("authorization header=%q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"stream": map[string]any{
+				"id":              42,
+				"recording_state": "off",
+				"capture_type":    "hls",
+				"execution_class": "video_live",
+				"source_url":      "https://example.com/live.m3u8",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{
+		BaseURL:  server.URL,
+		APIToken: "test-token",
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	stream, err := client.GetStream(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetStream: %v", err)
+	}
+	if stream.ID != 42 {
+		t.Fatalf("id=%d want=42", stream.ID)
+	}
+	if stream.CaptureType != "hls" {
+		t.Fatalf("capture_type=%q want=hls", stream.CaptureType)
+	}
+}
+
 func TestIngestSuccessRetriesOnTransientFailure(t *testing.T) {
 	t.Parallel()
 
