@@ -85,7 +85,7 @@ func TestLoadAssignedStreamsUsesAssignmentModeAndRelayPullURL(t *testing.T) {
 			"updated_at":   time.Now().UTC().Format(time.RFC3339Nano),
 		})
 	})
-	mux.HandleFunc("/api/v1/recording/assignments", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/service/recording/assignments", func(w http.ResponseWriter, r *http.Request) {
 		if got := strings.TrimSpace(r.URL.Query().Get("server_id")); got != "sink-1" {
 			t.Fatalf("server_id=%q want sink-1", got)
 		}
