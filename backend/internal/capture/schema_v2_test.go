@@ -52,6 +52,28 @@ func TestDeriveCanonicalStreamFieldsOverridesExplicitVideoForImageURLs(t *testin
 	}
 }
 
+func TestDeriveCanonicalStreamFieldsOverridesExplicitHTTPVideoForHLSURLs(t *testing.T) {
+	fields, err := DeriveCanonicalStreamFields(
+		"https://example.com/live/cam.m3u8",
+		"https://example.com/cam",
+		CaptureTypeHTTPVideo,
+		SourceFamilyVideoStream,
+		ExecutionClassVideoLive,
+	)
+	if err != nil {
+		t.Fatalf("derive canonical stream fields: %v", err)
+	}
+	if fields.CaptureType != CaptureTypeHLS {
+		t.Fatalf("capture_type=%q want %q", fields.CaptureType, CaptureTypeHLS)
+	}
+	if fields.SourceFamily != SourceFamilyVideoManifest {
+		t.Fatalf("source_family=%q want %q", fields.SourceFamily, SourceFamilyVideoManifest)
+	}
+	if fields.ExecutionClass != ExecutionClassVideoLive {
+		t.Fatalf("execution_class=%q want %q", fields.ExecutionClass, ExecutionClassVideoLive)
+	}
+}
+
 func TestInferCaptureTypePrefersYouTubeAndImages(t *testing.T) {
 	captureType, reason := InferCaptureType("YouTube", "https://youtu.be/abc123", "")
 	if captureType != CaptureTypeYouTubeWatch || reason != "youtube_watch_url" {
@@ -61,6 +83,11 @@ func TestInferCaptureTypePrefersYouTubeAndImages(t *testing.T) {
 	captureType, reason = InferCaptureType("", "https://example.com/cam.jpg", "")
 	if captureType != CaptureTypeStillImage || reason != "still_image_url" {
 		t.Fatalf("still image infer = %q/%q", captureType, reason)
+	}
+
+	captureType, reason = InferCaptureType("", "https://example.com/manifest/live.mpd", "")
+	if captureType != CaptureTypeDASH || reason != "dash_url" {
+		t.Fatalf("dash infer = %q/%q", captureType, reason)
 	}
 }
 

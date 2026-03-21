@@ -79,6 +79,44 @@ type serviceStreamImageCaptureRepairItem struct {
 	LastFrameAt            *time.Time `json:"last_frame_at,omitempty"`
 }
 
+type serviceStreamCanonicalCaptureRepairRequest struct {
+	StreamID           int64  `json:"stream_id"`
+	SourceURLLike      string `json:"source_url_like"`
+	Provider           string `json:"provider"`
+	Limit              int    `json:"limit"`
+	Apply              bool   `json:"apply"`
+	OnlyChanged        bool   `json:"only_changed"`
+	OnlyReview         bool   `json:"only_review"`
+	LegacyImportedOnly bool   `json:"legacy_imported_only"`
+	NonYouTubeOnly     bool   `json:"non_youtube_only"`
+	RecordingActor     string `json:"recording_actor"`
+	RecordingReason    string `json:"recording_reason"`
+}
+
+type serviceStreamCanonicalCaptureRepairItem struct {
+	ID                     int64      `json:"id"`
+	Provider               string     `json:"provider"`
+	Name                   string     `json:"name"`
+	Slug                   string     `json:"slug"`
+	SourceURL              string     `json:"source_url"`
+	SourcePageURL          string     `json:"source_page_url"`
+	RecordingState         string     `json:"recording_state"`
+	CurrentSourceFamily    string     `json:"current_source_family"`
+	CurrentCaptureType     string     `json:"current_capture_type"`
+	CurrentExecutionClass  string     `json:"current_execution_class"`
+	ResolvedCaptureType    string     `json:"resolved_capture_type,omitempty"`
+	ProposedSourceFamily   string     `json:"proposed_source_family"`
+	ProposedCaptureType    string     `json:"proposed_capture_type"`
+	ProposedExecutionClass string     `json:"proposed_execution_class"`
+	WouldChange            bool       `json:"would_change"`
+	ReviewRequired         bool       `json:"review_required"`
+	Reasons                []string   `json:"reasons,omitempty"`
+	Applied                bool       `json:"applied,omitempty"`
+	PreviousServerID       *string    `json:"previous_server_id,omitempty"`
+	NewServerID            *string    `json:"new_server_id,omitempty"`
+	LastFrameAt            *time.Time `json:"last_frame_at,omitempty"`
+}
+
 type serviceStreamRecordingStateRequest struct {
 	StreamID        int64  `json:"stream_id"`
 	RecordingState  string `json:"recording_state"`
@@ -259,6 +297,76 @@ func (s *Server) handleServiceStreamImageCaptureRepair(w http.ResponseWriter, r 
 		"changed":  countStreamImageRepairItems(items, func(it serviceStreamImageCaptureRepairItem) bool { return it.WouldChange }),
 		"applied":  applied,
 		"items":    selected,
+	})
+}
+
+func (s *Server) handleServiceStreamCanonicalCaptureRepair(w http.ResponseWriter, r *http.Request) {
+	var req serviceStreamCanonicalCaptureRepairRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	if req.StreamID <= 0 && strings.TrimSpace(req.SourceURLLike) == "" && strings.TrimSpace(req.Provider) == "" && !req.LegacyImportedOnly {
+		util.WriteError(w, http.StatusBadRequest, "stream_id, source_url_like, provider, or legacy_imported_only is required")
+		return
+	}
+	if req.Limit < 0 {
+		util.WriteError(w, http.StatusBadRequest, "limit must be >= 0")
+		return
+	}
+	items, err := s.loadStreamCanonicalCaptureRepairItems(r.Context(), req)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load canonical capture repair items: %v", err))
+		return
+	}
+	selected := items
+	if req.OnlyChanged || req.OnlyReview {
+		selected = make([]serviceStreamCanonicalCaptureRepairItem, 0, len(items))
+		for _, item := range items {
+			if req.OnlyChanged && !item.WouldChange {
+				continue
+			}
+			if req.OnlyReview && !item.ReviewRequired {
+				continue
+			}
+			selected = append(selected, item)
+		}
+	}
+	applied := 0
+	if req.Apply {
+		actor := strings.TrimSpace(req.RecordingActor)
+		if actor == "" {
+			actor = "service.stream_canonical_capture_repair"
+		}
+		reason := strings.TrimSpace(req.RecordingReason)
+		if reason == "" {
+			reason = "repair canonical capture classification"
+		}
+		for i := range selected {
+			if !selected[i].WouldChange || selected[i].ReviewRequired {
+				continue
+			}
+			appliedItem, err := s.applyStreamCanonicalCaptureRepair(r.Context(), selected[i], actor, reason)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("apply canonical capture repair stream %d: %v", selected[i].ID, err))
+				return
+			}
+			selected[i] = appliedItem
+			applied++
+		}
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"total":            len(items),
+		"selected":         len(selected),
+		"changed":          countStreamCanonicalRepairItems(items, func(it serviceStreamCanonicalCaptureRepairItem) bool { return it.WouldChange }),
+		"review_required":  countStreamCanonicalRepairItems(items, func(it serviceStreamCanonicalCaptureRepairItem) bool { return it.ReviewRequired }),
+		"safe_to_apply":    countStreamCanonicalRepairItems(items, func(it serviceStreamCanonicalCaptureRepairItem) bool { return it.WouldChange && !it.ReviewRequired }),
+		"applied":          applied,
+		"proposed_types":   summarizeStreamCanonicalRepairItems(items, func(it serviceStreamCanonicalCaptureRepairItem) string { return it.ProposedCaptureType }),
+		"proposed_classes": summarizeStreamCanonicalRepairItems(items, func(it serviceStreamCanonicalCaptureRepairItem) string { return it.ProposedExecutionClass }),
+		"providers":        summarizeStreamCanonicalRepairItems(items, func(it serviceStreamCanonicalCaptureRepairItem) string { return it.Provider }),
+		"items":            selected,
 	})
 }
 
@@ -513,6 +621,207 @@ func countStreamImageRepairItems(items []serviceStreamImageCaptureRepairItem, ke
 		}
 	}
 	return count
+}
+
+func (s *Server) loadStreamCanonicalCaptureRepairItems(ctx context.Context, req serviceStreamCanonicalCaptureRepairRequest) ([]serviceStreamCanonicalCaptureRepairItem, error) {
+	where := []string{"s.source_url <> ''"}
+	args := make([]any, 0, 5)
+	if req.LegacyImportedOnly {
+		where = append(where, "s.tags @> ARRAY['imported:legacy-social-isolation']::text[]")
+	}
+	if req.StreamID > 0 {
+		args = append(args, req.StreamID)
+		where = append(where, fmt.Sprintf("s.id=$%d", len(args)))
+	}
+	if raw := strings.TrimSpace(req.SourceURLLike); raw != "" {
+		args = append(args, raw)
+		where = append(where, fmt.Sprintf("s.source_url ILIKE $%d", len(args)))
+	}
+	if raw := strings.TrimSpace(req.Provider); raw != "" {
+		args = append(args, raw)
+		where = append(where, fmt.Sprintf("LOWER(s.provider)=LOWER($%d)", len(args)))
+	}
+	query := fmt.Sprintf(`
+		SELECT
+			s.id,
+			s.provider,
+			s.name,
+			s.slug,
+			s.source_url,
+			s.source_page_url,
+			s.recording_state::text,
+			s.source_family,
+			s.capture_type,
+			s.execution_class,
+			COALESCE(rt.resolved_capture_type, ''),
+			rt.last_frame_at
+		FROM streams s
+		LEFT JOIN stream_capture_runtime rt ON rt.stream_id=s.id
+		WHERE %s
+		ORDER BY s.id ASC
+	`, strings.Join(where, " AND "))
+	if req.Limit > 0 {
+		args = append(args, req.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]serviceStreamCanonicalCaptureRepairItem, 0, 256)
+	for rows.Next() {
+		var item serviceStreamCanonicalCaptureRepairItem
+		var lastFrame pgtype.Timestamptz
+		if err := rows.Scan(
+			&item.ID,
+			&item.Provider,
+			&item.Name,
+			&item.Slug,
+			&item.SourceURL,
+			&item.SourcePageURL,
+			&item.RecordingState,
+			&item.CurrentSourceFamily,
+			&item.CurrentCaptureType,
+			&item.CurrentExecutionClass,
+			&item.ResolvedCaptureType,
+			&lastFrame,
+		); err != nil {
+			return nil, err
+		}
+		item.CurrentSourceFamily = strings.TrimSpace(item.CurrentSourceFamily)
+		item.CurrentCaptureType = strings.TrimSpace(item.CurrentCaptureType)
+		item.CurrentExecutionClass = strings.TrimSpace(item.CurrentExecutionClass)
+		item.ResolvedCaptureType = strings.TrimSpace(item.ResolvedCaptureType)
+		proposal := capture.ProposeCanonicalStreamRepair(capture.CanonicalRepairInput{
+			Provider:              item.Provider,
+			SourceURL:             item.SourceURL,
+			SourcePageURL:         item.SourcePageURL,
+			CurrentSourceFamily:   item.CurrentSourceFamily,
+			CurrentCaptureType:    item.CurrentCaptureType,
+			CurrentExecutionClass: item.CurrentExecutionClass,
+			ResolvedCaptureType:   item.ResolvedCaptureType,
+		})
+		if req.NonYouTubeOnly && (item.CurrentCaptureType == capture.CaptureTypeYouTubeWatch || proposal.ProposedCaptureType == capture.CaptureTypeYouTubeWatch) {
+			continue
+		}
+		item.ProposedSourceFamily = proposal.ProposedSourceFamily
+		item.ProposedCaptureType = proposal.ProposedCaptureType
+		item.ProposedExecutionClass = proposal.ProposedExecutionClass
+		item.WouldChange = proposal.WouldChange
+		item.ReviewRequired = proposal.ReviewRequired
+		item.Reasons = proposal.Reasons
+		if lastFrame.Valid {
+			ts := lastFrame.Time.UTC()
+			item.LastFrameAt = &ts
+		}
+		items = append(items, item)
+	}
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
+	return items, nil
+}
+
+func (s *Server) applyStreamCanonicalCaptureRepair(ctx context.Context, item serviceStreamCanonicalCaptureRepairItem, actor string, reason string) (serviceStreamCanonicalCaptureRepairItem, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return item, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE streams
+		SET source_family=$2, capture_type=$3, execution_class=$4, updated_at=now()
+		WHERE id=$1
+	`, item.ID, item.ProposedSourceFamily, item.ProposedCaptureType, item.ProposedExecutionClass); err != nil {
+		return item, err
+	}
+	updated, err := s.loadStreamForAssignmentTx(ctx, tx, item.ID)
+	if err != nil {
+		return item, err
+	}
+	assignment, existed, err := loadRecordingAssignmentTx(ctx, tx, item.ID)
+	if err != nil {
+		return item, err
+	}
+	if existed {
+		item.PreviousServerID = &assignment.ServerID
+		issues := buildRecordingAssignmentAuditIssues(updated, assignment, nil)
+		if len(issues) > 0 {
+			if _, _, err := s.unassignRecordingStreamTx(ctx, tx, item.ID, actor, reason); err != nil {
+				return item, err
+			}
+			existed = false
+		}
+	}
+	if updated.RecordingState == model.RecordingStateOn && !existed {
+		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", actor, reason)
+		if err != nil {
+			return item, err
+		}
+		if status != 0 {
+			return item, fmt.Errorf("assign repaired stream: %v", result["error"])
+		}
+		if serverID := strings.TrimSpace(fmt.Sprint(result["server_id"])); serverID != "" {
+			item.NewServerID = &serverID
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return item, err
+	}
+	stream, err := s.getStreamByID(ctx, item.ID)
+	if err == nil {
+		item.CurrentSourceFamily = stream.SourceFamily
+		item.CurrentCaptureType = stream.CaptureType
+		item.CurrentExecutionClass = stream.ExecutionClass
+	}
+	var serverID string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(server_id, '')
+		FROM recording_assignments
+		WHERE stream_id=$1
+	`, item.ID).Scan(&serverID); err == nil && strings.TrimSpace(serverID) != "" {
+		serverID = strings.TrimSpace(serverID)
+		item.NewServerID = &serverID
+	}
+	var lastFrame pgtype.Timestamptz
+	if err := s.pool.QueryRow(ctx, `
+		SELECT last_frame_at
+		FROM stream_capture_runtime
+		WHERE stream_id=$1
+	`, item.ID).Scan(&lastFrame); err != nil && err != pgx.ErrNoRows {
+		return item, err
+	}
+	if lastFrame.Valid {
+		ts := lastFrame.Time.UTC()
+		item.LastFrameAt = &ts
+	}
+	item.Applied = true
+	return item, nil
+}
+
+func countStreamCanonicalRepairItems(items []serviceStreamCanonicalCaptureRepairItem, keep func(serviceStreamCanonicalCaptureRepairItem) bool) int {
+	count := 0
+	for _, item := range items {
+		if keep(item) {
+			count++
+		}
+	}
+	return count
+}
+
+func summarizeStreamCanonicalRepairItems(items []serviceStreamCanonicalCaptureRepairItem, field func(serviceStreamCanonicalCaptureRepairItem) string) map[string]int {
+	out := map[string]int{}
+	for _, item := range items {
+		key := strings.TrimSpace(field(item))
+		if key == "" {
+			key = "<empty>"
+		}
+		out[key]++
+	}
+	return out
 }
 
 func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRequest) (model.Stream, bool, error) {
