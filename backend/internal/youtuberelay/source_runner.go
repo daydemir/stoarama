@@ -49,36 +49,36 @@ func (a NodeSourceAPI) UpdateYouTubeRelayRouteStatus(ctx context.Context, req ca
 }
 
 type SourceRunnerOptions struct {
-	ServerID                 string
-	ShardID                  string
-	Capacity                 int
-	HeartbeatSec             int
-	LeaseSec                 int
-	RefreshSec               int
-	ResolveTimeoutSec        int
-	ResolveFailureThreshold  int
-	BindAddr                 string
-	PublicBaseURL            string
-	SharedToken              string
-	CacheFile                string
-	NetworkTransport         string
-	TopologyID               string
-	TopologyRole             string
-	HubServerID              string
-	WGInterface              string
-	WGIP                     string
-	SourceEndpoint           string
-	MetadataJSON             map[string]any
-	CookiesFile              string
-	CookiesFromBrowser       string
-	YTDLPBin                 string
-	YTDLPFormat              string
-	YTDLPFormatSort          string
-	FFMPEGJPEGQuality        int
-	FFMPEGThreads            int
-	FFMPEGHWAccel            string
-	FFMPEGReconnect          bool
-	FFMPEGReconnectDelayMax  int
+	ServerID                string
+	ShardID                 string
+	Capacity                int
+	HeartbeatSec            int
+	LeaseSec                int
+	RefreshSec              int
+	ResolveTimeoutSec       int
+	ResolveFailureThreshold int
+	BindAddr                string
+	PublicBaseURL           string
+	SharedToken             string
+	CacheFile               string
+	NetworkTransport        string
+	TopologyID              string
+	TopologyRole            string
+	HubServerID             string
+	WGInterface             string
+	WGIP                    string
+	SourceEndpoint          string
+	MetadataJSON            map[string]any
+	CookiesFile             string
+	CookiesFromBrowser      string
+	YTDLPBin                string
+	YTDLPFormat             string
+	YTDLPFormatSort         string
+	FFMPEGJPEGQuality       int
+	FFMPEGThreads           int
+	FFMPEGHWAccel           string
+	FFMPEGReconnect         bool
+	FFMPEGReconnectDelayMax int
 }
 
 type relayRouteState struct {
@@ -388,7 +388,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		activeRouteIDs := map[int64]struct{}{}
 		for _, route := range routes {
 			status := strings.TrimSpace(strings.ToLower(route.Status))
-			if status != "assigned" && status != "source_ready" && status != "running" && status != "failed" {
+			if status != "assigned" && status != "source_ready" && status != "running" && status != "failed" && status != "stopped" {
 				continue
 			}
 			activeRouteIDs[route.StreamID] = struct{}{}

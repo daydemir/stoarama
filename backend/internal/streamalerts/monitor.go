@@ -292,7 +292,7 @@ func (m *Monitor) upsertOpenIncident(ctx context.Context, it problemStream, reas
 		for _, addr := range admins {
 			if err := m.mailer.Send(ctx, email.Message{
 				To:          addr,
-				Subject:     fmt.Sprintf("[Stoarama] Recording problem: %s (#%d)", it.Name, it.StreamID),
+				Subject:     fmt.Sprintf("[Stoarama] Recording problem: #%d %s", it.StreamID, compactAlertTitle(it.Name)),
 				PlainText:   m.problemPlainText(it, reason),
 				MessageType: "recording_problem",
 			}); err != nil {
@@ -362,7 +362,7 @@ func (m *Monitor) resolveRecoveredIncidents(ctx context.Context, open map[int64]
 			for _, addr := range admins {
 				if err := m.mailer.Send(ctx, email.Message{
 					To:          addr,
-					Subject:     fmt.Sprintf("[Stoarama] Recording recovered: %s (#%d)", name, incident.StreamID),
+					Subject:     fmt.Sprintf("[Stoarama] Recording recovered: #%d %s", incident.StreamID, compactAlertTitle(name)),
 					PlainText:   fmt.Sprintf("%s has recovered.\n\nView: %s/dashboard/stream/%d\n", name, strings.TrimRight(m.cfg.AppBaseURL, "/"), incident.StreamID),
 					MessageType: "recording_problem_resolved",
 				}); err != nil {
@@ -388,13 +388,40 @@ func (m *Monitor) problemPlainText(it problemStream, reason string) string {
 	if it.LastFrameAt != nil {
 		fmt.Fprintf(&b, "Last frame: %s\n", it.LastFrameAt.UTC().Format(time.RFC3339))
 	}
-	if errText := strings.TrimSpace(it.RuntimeError); errText != "" {
-		fmt.Fprintf(&b, "Runtime error: %s\n", errText)
-	} else if errText := strings.TrimSpace(it.RelayError); errText != "" {
-		fmt.Fprintf(&b, "Relay error: %s\n", errText)
+	if errText := compactAlertError(it.RuntimeError); errText != "" {
+		fmt.Fprintf(&b, "Error: %s\n", errText)
+	} else if errText := compactAlertError(it.RelayError); errText != "" {
+		fmt.Fprintf(&b, "Error: %s\n", errText)
 	}
 	if strings.TrimSpace(m.cfg.AppBaseURL) != "" {
 		fmt.Fprintf(&b, "\nView: %s/dashboard/stream/%d\n", strings.TrimRight(m.cfg.AppBaseURL, "/"), it.StreamID)
 	}
 	return b.String()
+}
+
+func compactAlertError(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	line := raw
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+	line = strings.TrimSpace(line)
+	if len(line) > 220 {
+		line = strings.TrimSpace(line[:217]) + "..."
+	}
+	return line
+}
+
+func compactAlertTitle(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "stream"
+	}
+	if len(raw) > 80 {
+		return strings.TrimSpace(raw[:77]) + "..."
+	}
+	return raw
 }
