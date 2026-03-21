@@ -17,9 +17,10 @@ import (
 )
 
 type cliConfig struct {
-	APIBaseURL string         `json:"api_base_url,omitempty"`
-	APIKey     string         `json:"api_key,omitempty"`
-	Node       *cliNodeConfig `json:"node,omitempty"`
+	APIBaseURL    string                  `json:"api_base_url,omitempty"`
+	APIKey        string                  `json:"api_key,omitempty"`
+	Node          *cliNodeConfig          `json:"node,omitempty"`
+	YTRelaySource *cliYTRelaySourceConfig `json:"yt_relay_source,omitempty"`
 }
 
 type cliNodeConfig struct {
@@ -30,6 +31,32 @@ type cliNodeConfig struct {
 	Platform    string `json:"platform,omitempty"`
 	Token       string `json:"token"`
 	APIBaseURL  string `json:"api_base_url,omitempty"`
+}
+
+type cliYTRelaySourceConfig struct {
+	PublicBaseURL           string `json:"public_base_url,omitempty"`
+	BindAddr                string `json:"bind_addr,omitempty"`
+	ShardID                 string `json:"shard_id,omitempty"`
+	Capacity                int    `json:"capacity,omitempty"`
+	HeartbeatSec            int    `json:"heartbeat_sec,omitempty"`
+	LeaseSec                int    `json:"lease_sec,omitempty"`
+	RefreshSec              int    `json:"refresh_sec,omitempty"`
+	ResolveTimeoutSec       int    `json:"resolve_timeout_sec,omitempty"`
+	ResolveFailureThreshold int    `json:"resolve_failure_threshold,omitempty"`
+	SharedToken             string `json:"shared_token,omitempty"`
+	CacheFile               string `json:"cache_file,omitempty"`
+	CookiesFile             string `json:"cookies_file,omitempty"`
+	CookiesFromBrowser      string `json:"cookies_from_browser,omitempty"`
+	YTDLPBin                string `json:"yt_dlp_bin,omitempty"`
+	YTDLPFormat             string `json:"yt_dlp_format,omitempty"`
+	YTDLPFormatSort         string `json:"yt_dlp_format_sort,omitempty"`
+	NetworkTransport        string `json:"network_transport,omitempty"`
+	TopologyID              string `json:"topology_id,omitempty"`
+	TopologyRole            string `json:"topology_role,omitempty"`
+	HubServerID             string `json:"hub_server_id,omitempty"`
+	WGInterface             string `json:"wg_interface,omitempty"`
+	WGIP                    string `json:"wg_ip,omitempty"`
+	SourceEndpoint          string `json:"source_endpoint,omitempty"`
 }
 
 func main() {
@@ -53,7 +80,7 @@ func main() {
 func usage() {
 	fmt.Print(`stoarama commands:
   stoarama auth configure [--api-base-url URL --api-key KEY]
-  stoarama auth request-link --email EMAIL [--name NAME] [--api-base-url URL]
+  stoarama auth request-link --email EMAIL [--api-base-url URL]
   stoarama auth whoami [--api-base-url URL --api-key KEY]
   stoarama auth api-keys list [--api-base-url URL --api-key KEY]
   stoarama auth api-keys create [--label LABEL --expires-at RFC3339 --save] [--api-base-url URL --api-key KEY]
@@ -62,10 +89,13 @@ func usage() {
   stoarama node enrollment-tokens list [--api-base-url URL --api-key KEY]
   stoarama node enrollment-tokens create --node-type yt_relay_source|inference_node [--label LABEL --expires-at RFC3339] [--api-base-url URL --api-key KEY]
   stoarama node enrollment-tokens revoke --id N [--api-base-url URL --api-key KEY]
-  stoarama node enroll --token TOKEN --node-type yt_relay_source|inference_node [--display-name NAME --hostname HOST --platform PLATFORM --api-base-url URL]
+ stoarama node enroll --token TOKEN --node-type yt_relay_source|inference_node [--display-name NAME --hostname HOST --platform PLATFORM --api-base-url URL]
   stoarama node whoami [--api-base-url URL --node-token TOKEN]
   stoarama node heartbeat [--api-base-url URL --node-token TOKEN]
   stoarama node doctor [--node-type yt_relay_source|inference_node]
+  stoarama node yt-relay-source run [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
+  stoarama node yt-relay-source install-launchd [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
+  stoarama node yt-relay-source uninstall-launchd
 `)
 }
 
@@ -105,6 +135,8 @@ func runNode(args []string) {
 		runNodeHeartbeat(args[1:])
 	case "doctor":
 		runNodeDoctor(args[1:])
+	case "yt-relay-source":
+		runNodeYTRelaySource(args[1:])
 	default:
 		usage()
 		os.Exit(2)
@@ -134,7 +166,6 @@ func runAuthRequestLink(args []string) {
 	fs := flag.NewFlagSet("auth request-link", flag.ExitOnError)
 	apiBaseURL := fs.String("api-base-url", defaultAPIBaseURL(), "Stoarama API base URL")
 	email := fs.String("email", "", "account email")
-	name := fs.String("name", "", "optional display name")
 	_ = fs.Parse(args)
 
 	if strings.TrimSpace(*email) == "" {
@@ -143,7 +174,6 @@ func runAuthRequestLink(args []string) {
 	var resp map[string]any
 	err := apiRequest("POST", normalizeBaseURL(*apiBaseURL)+"/api/v1/auth/request-link", map[string]any{
 		"email": *email,
-		"name":  *name,
 	}, "", &resp)
 	if err != nil {
 		fatalf("request sign-in link: %v", err)

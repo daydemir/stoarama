@@ -79,7 +79,7 @@
   <div class="wrap">
     <div class="hero">
       <h1>Stoarama Account</h1>
-      <p>Request a magic sign-in link, then create read-only API keys for Stoarama data access and automation.</p>
+      <p>Request a magic sign-in link, then manage API keys, enrolled nodes, and local YouTube relay sources from one place.</p>
     </div>
     <div class="grid">
       <section class="panel">
@@ -115,6 +115,43 @@
         </table>
       </div>
     </section>
+    <div class="grid">
+      <section class="panel" style="margin-top:16px;">
+        <h2>YouTube Relay Source</h2>
+        <div class="status">Run the Stoarama CLI on your own machine to provide YouTube relay capacity with local cookies only.</div>
+        <div style="margin-top:12px;"><a href="/docs/youtube-relay-source">Open install guide</a></div>
+        <div id="relayInstallBox" class="token-box hidden"></div>
+      </section>
+      <section class="panel" style="margin-top:16px;">
+        <h2>Node Enrollment</h2>
+        <div id="enrollmentEmpty" class="status">Sign in first to create node enrollment tokens.</div>
+        <div id="enrollmentBox" class="hidden">
+          <label for="enrollmentLabel">Token label</label>
+          <input id="enrollmentLabel" type="text" placeholder="Mac mini relay" />
+          <button id="createEnrollmentBtn">Create Relay Enrollment Token</button>
+          <div id="createEnrollmentStatus" class="status"></div>
+          <div id="newEnrollmentTokenBox" class="token-box hidden"></div>
+          <table>
+            <thead>
+              <tr><th>Prefix</th><th>Label</th><th>Expires</th><th>Status</th><th></th></tr>
+            </thead>
+            <tbody id="enrollmentRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+    <section class="panel" style="margin-top:16px;">
+      <h2>Nodes</h2>
+      <div id="nodesEmpty" class="status">Sign in first to view enrolled nodes.</div>
+      <div id="nodesBox" class="hidden">
+        <table>
+          <thead>
+            <tr><th>Node</th><th>Heartbeat</th><th>Relay</th><th>Slots</th></tr>
+          </thead>
+          <tbody id="nodesRows"></tbody>
+        </table>
+      </div>
+    </section>
   </div>
   <script>
     const requestStatus = document.getElementById('requestStatus');
@@ -126,6 +163,15 @@
     const keysRows = document.getElementById('keysRows');
     const createKeyStatus = document.getElementById('createKeyStatus');
     const newTokenBox = document.getElementById('newTokenBox');
+    const enrollmentEmpty = document.getElementById('enrollmentEmpty');
+    const enrollmentBox = document.getElementById('enrollmentBox');
+    const enrollmentRows = document.getElementById('enrollmentRows');
+    const createEnrollmentStatus = document.getElementById('createEnrollmentStatus');
+    const newEnrollmentTokenBox = document.getElementById('newEnrollmentTokenBox');
+    const nodesEmpty = document.getElementById('nodesEmpty');
+    const nodesBox = document.getElementById('nodesBox');
+    const nodesRows = document.getElementById('nodesRows');
+    const relayInstallBox = document.getElementById('relayInstallBox');
     const requestedRedirectPath = (() => {
       const params = new URLSearchParams(window.location.search);
       const raw = String(params.get('redirect_path') || '').trim();
@@ -160,11 +206,21 @@
         accountMeta.innerHTML = `<div><b>${String(account.email || '')}</b></div><div class="status">Role: ${role} · Auth: ${String(account.auth_type || '')}</div>${dashboardLink}`;
         keysEmpty.classList.add('hidden');
         keysBox.classList.remove('hidden');
+        enrollmentEmpty.classList.add('hidden');
+        enrollmentBox.classList.remove('hidden');
+        nodesEmpty.classList.add('hidden');
+        nodesBox.classList.remove('hidden');
         await refreshKeys();
+        await refreshEnrollmentTokens();
+        await refreshNodes();
       } catch (err) {
         accountBox.classList.add('hidden');
         keysBox.classList.add('hidden');
         keysEmpty.classList.remove('hidden');
+        enrollmentBox.classList.add('hidden');
+        enrollmentEmpty.classList.remove('hidden');
+        nodesBox.classList.add('hidden');
+        nodesEmpty.classList.remove('hidden');
         setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
       }
     }
@@ -192,6 +248,64 @@
           }
         });
       });
+    }
+
+    async function refreshEnrollmentTokens() {
+      const payload = await fetchJSON('/api/v1/account/node-enrollment-tokens');
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      enrollmentRows.innerHTML = items.map((item) => {
+        const revoked = !!item.revoked_at;
+        const consumed = !!item.consumed_at;
+        const status = revoked ? 'revoked' : (consumed ? 'consumed' : 'active');
+        return `
+          <tr>
+            <td class="mono">${String(item.token_prefix || '')}</td>
+            <td>${String(item.label || '')}</td>
+            <td>${formatDate(item.expires_at)}</td>
+            <td>${status}</td>
+            <td>${revoked || consumed ? '' : `<button data-revoke-enrollment="${Number(item.id)}" class="secondary">Revoke</button>`}</td>
+          </tr>
+        `;
+      }).join('');
+      enrollmentRows.querySelectorAll('button[data-revoke-enrollment]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = String(btn.getAttribute('data-revoke-enrollment') || '').trim();
+          try {
+            await fetchJSON(`/api/v1/account/node-enrollment-tokens/${encodeURIComponent(id)}/revoke`, { method: 'POST' });
+            await refreshEnrollmentTokens();
+          } catch (err) {
+            setStatus(createEnrollmentStatus, String(err), 'err');
+          }
+        });
+      });
+    }
+
+    function relaySummary(relay) {
+      if (!relay || !relay.registered) return '<span class="status">not running</span>';
+      const ready = relay.ready ? 'ready' : 'stale';
+      const shard = relay.shard_id ? ` · ${String(relay.shard_id)}` : '';
+      return `<div>${ready}${shard}</div><div class="status mono">${String(relay.server_id || '')}</div>`;
+    }
+
+    function relaySlots(relay) {
+      if (!relay || !relay.registered) return '-';
+      return `${Number(relay.available_slots || 0)} free / ${Number(relay.max_active || 0)} total`;
+    }
+
+    async function refreshNodes() {
+      const payload = await fetchJSON('/api/v1/account/nodes');
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      nodesRows.innerHTML = items.map((item) => {
+        const relay = item.yt_relay_source || null;
+        return `
+          <tr>
+            <td><b>${String(item.display_name || '')}</b><div class="status">${String(item.node_type || '')} · ${String(item.hostname || '')}</div></td>
+            <td>${formatDate(item.last_heartbeat_at)}</td>
+            <td>${relaySummary(relay)}</td>
+            <td>${relaySlots(relay)}</td>
+          </tr>
+        `;
+      }).join('');
     }
 
     document.getElementById('requestLink').addEventListener('click', async () => {
@@ -222,6 +336,26 @@
         await refreshKeys();
       } catch (err) {
         setStatus(createKeyStatus, String(err), 'err');
+      }
+    });
+
+    document.getElementById('createEnrollmentBtn').addEventListener('click', async () => {
+      const label = String(document.getElementById('enrollmentLabel').value || '').trim();
+      try {
+        const payload = await fetchJSON('/api/v1/account/node-enrollment-tokens', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ node_type: 'yt_relay_source', label }),
+        });
+        const token = String(payload.token || '');
+        newEnrollmentTokenBox.classList.remove('hidden');
+        newEnrollmentTokenBox.textContent = `Copy now. This enrollment token is only shown once.\n\n${token}`;
+        relayInstallBox.classList.remove('hidden');
+        relayInstallBox.textContent = `Next:\n1. stoarama node enroll --api-base-url ${window.location.origin} --token ${token} --node-type yt_relay_source --display-name \"Mac mini relay\"\n2. stoarama node yt-relay-source install-launchd --public-base-url https://your-relay-host.example --cookies-from-browser chrome`;
+        setStatus(createEnrollmentStatus, 'Enrollment token created.', 'ok');
+        await refreshEnrollmentTokens();
+      } catch (err) {
+        setStatus(createEnrollmentStatus, String(err), 'err');
       }
     });
 

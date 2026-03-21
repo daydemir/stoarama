@@ -3,10 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -275,6 +278,15 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan node: %v", err))
 			return
 		}
+		if nodeType, _ := item["node_type"].(string); nodeType == nodeTypeYTRelaySource {
+			nodeID, _ := item["id"].(int64)
+			relayState, err := s.fetchAccountNodeRelayState(r.Context(), nodeID)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load node relay state: %v", err))
+				return
+			}
+			item["yt_relay_source"] = relayState
+		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -282,6 +294,72 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) fetchAccountNodeRelayState(ctx context.Context, nodeID int64) (map[string]any, error) {
+	var (
+		serverID       string
+		shardID        string
+		maxActive      int
+		draining       bool
+		heartbeatAt    *time.Time
+		leaseExpiresAt *time.Time
+		metadataRaw    []byte
+		activeCount    int64
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+			src.server_id,
+			src.shard_id,
+			src.max_active,
+			src.draining,
+			src.heartbeat_at,
+			src.lease_expires_at,
+			src.metadata_jsonb,
+			COALESCE((
+				SELECT COUNT(*)::bigint
+				FROM youtube_relay_routes r
+				WHERE r.source_server_id=src.server_id
+				  AND r.status IN ('assigned', 'source_ready', 'running')
+			), 0) AS active_count
+		FROM youtube_relay_sources src
+		WHERE src.node_id=$1
+	`, nodeID).Scan(&serverID, &shardID, &maxActive, &draining, &heartbeatAt, &leaseExpiresAt, &metadataRaw, &activeCount)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return map[string]any{
+				"registered":       false,
+				"server_id":        youTubeRelaySourceServerIDForNode(nodeID),
+				"available_slots":  0,
+				"active_routes":    0,
+				"ready":            false,
+				"lease_expires_at": nil,
+			}, nil
+		}
+		return nil, err
+	}
+	meta := map[string]any{}
+	if len(metadataRaw) > 0 {
+		_ = json.Unmarshal(metadataRaw, &meta)
+	}
+	available := int64(maxActive) - activeCount
+	if available < 0 {
+		available = 0
+	}
+	ready := leaseExpiresAt != nil && leaseExpiresAt.After(time.Now().UTC()) && !draining
+	return map[string]any{
+		"registered":       true,
+		"ready":            ready,
+		"server_id":        serverID,
+		"shard_id":         shardID,
+		"max_active":       maxActive,
+		"active_routes":    activeCount,
+		"available_slots":  available,
+		"draining":         draining,
+		"heartbeat_at":     heartbeatAt,
+		"lease_expires_at": leaseExpiresAt,
+		"metadata_json":    nonNilMap(meta),
+	}, nil
 }
 
 type nodeEnrollRequest struct {
