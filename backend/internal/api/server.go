@@ -539,14 +539,10 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 			existed = false
 		}
 	}
-	shouldAutoAssignYouTube := updated.RecordingState == model.RecordingStateOn &&
-		func() bool {
-			captureType, ok := capture.NormalizeCaptureType(updated.CaptureType)
-			return ok && captureType == capture.CaptureTypeYouTubeWatch
-		}() &&
+	shouldAutoAssignRecording := updated.RecordingState == model.RecordingStateOn &&
 		!existed &&
-		((recordingStateChanged && targetRecordingState == model.RecordingStateOn) || canonicalInputsChanged)
-	if shouldAutoAssignYouTube {
+		((recordingStateChanged && targetRecordingState == model.RecordingStateOn) || canonicalInputsChanged || req.RecordingState != nil)
+	if shouldAutoAssignRecording {
 		result, status, err := s.assignRecordingStreamTx(r.Context(), tx, updated, "", "api.streams_patch", "recording enabled")
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, err.Error())

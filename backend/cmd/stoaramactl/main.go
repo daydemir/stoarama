@@ -1693,14 +1693,36 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			serverModes := make([]captureapi.RecordingServerHeartbeatClass, 0, len(modes))
+			serverModeByExecutionClass := make(map[string]captureapi.RecordingServerHeartbeatClass, len(modes))
 			for _, mode := range modes {
+				executionClass := capture.ModeToExecutionClass(mode)
+				if strings.TrimSpace(executionClass) == "" {
+					continue
+				}
 				_, draining := drainingModes[mode]
-				serverModes = append(serverModes, captureapi.RecordingServerHeartbeatClass{
-					ExecutionClass: capture.ModeToExecutionClass(mode),
+				item := captureapi.RecordingServerHeartbeatClass{
+					ExecutionClass: executionClass,
 					MaxActive:      modeCapacity[mode],
 					Draining:       draining,
-				})
+				}
+				if existing, ok := serverModeByExecutionClass[executionClass]; ok {
+					if item.MaxActive > existing.MaxActive {
+						existing.MaxActive = item.MaxActive
+					}
+					existing.Draining = existing.Draining || item.Draining
+					serverModeByExecutionClass[executionClass] = existing
+					continue
+				}
+				serverModeByExecutionClass[executionClass] = item
+			}
+			executionClasses := make([]string, 0, len(serverModeByExecutionClass))
+			for executionClass := range serverModeByExecutionClass {
+				executionClasses = append(executionClasses, executionClass)
+			}
+			sort.Strings(executionClasses)
+			serverModes := make([]captureapi.RecordingServerHeartbeatClass, 0, len(serverModeByExecutionClass))
+			for _, executionClass := range executionClasses {
+				serverModes = append(serverModes, serverModeByExecutionClass[executionClass])
 			}
 			err := runRecordingServerHeartbeatLoop(managedCtx, client, captureapi.RecordingServerHeartbeatRequest{
 				ServerID:         strings.TrimSpace(*serverID),
