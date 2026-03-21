@@ -298,6 +298,23 @@ func normalizeExecutionClassValue(raw string) (string, error) {
 	return "", fmt.Errorf("invalid execution_class %q", raw)
 }
 
+func assignmentReadyForWorker(item RecordingAssignment) bool {
+	executionClass := strings.TrimSpace(item.ExecutionClass)
+	if executionClass != capture.ExecutionClassYouTubeRelay {
+		return true
+	}
+	relayPullURL := strings.TrimSpace(item.RelayPullURL)
+	if relayPullURL == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(item.RelayStatus)) {
+	case "source_ready", "running":
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Client) GetRecordingSettings(ctx context.Context) (RecordingSettings, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/recording/settings", nil)
 	if err != nil {
@@ -376,7 +393,14 @@ func (c *Client) listRecordingAssignmentsPage(ctx context.Context, serverID stri
 			payload.Items[i].CaptureConfigJSON = map[string]any{}
 		}
 	}
-	return payload.Items, nil
+	items := make([]RecordingAssignment, 0, len(payload.Items))
+	for _, item := range payload.Items {
+		if !assignmentReadyForWorker(item) {
+			continue
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 func (c *Client) ListRecordingAssignments(ctx context.Context, serverID string, executionClass string, limit int, offset int) ([]RecordingAssignment, error) {

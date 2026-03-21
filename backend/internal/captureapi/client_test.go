@@ -198,3 +198,64 @@ func TestListRecordingAssignmentsPaginatesUntilShortPage(t *testing.T) {
 		t.Fatalf("requests=%d want=2", len(requests))
 	}
 }
+
+func TestListRecordingAssignmentsSkipsRelayRoutesUntilReady(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/api/v1/service/recording/assignments" {
+			t.Fatalf("path=%q want=/api/v1/service/recording/assignments", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{
+				{
+					"stream_id":       1,
+					"server_id":       "server-a",
+					"execution_class": "youtube_relay",
+					"relay_status":    "assigned",
+					"relay_pull_url":  "",
+				},
+				{
+					"stream_id":       2,
+					"server_id":       "server-a",
+					"execution_class": "youtube_relay",
+					"relay_status":    "source_ready",
+					"relay_pull_url":  "https://relay.example/2",
+				},
+				{
+					"stream_id":       3,
+					"server_id":       "server-a",
+					"execution_class": "youtube_relay",
+					"relay_status":    "failed",
+					"relay_pull_url":  "https://relay.example/3",
+				},
+				{
+					"stream_id":       4,
+					"server_id":       "server-a",
+					"execution_class": "video_live",
+				},
+			},
+			"total": 4,
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{
+		BaseURL:  server.URL,
+		APIToken: "test-token",
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	items, err := client.ListRecordingAssignments(context.Background(), "server-a", "", 10, 0)
+	if err != nil {
+		t.Fatalf("ListRecordingAssignments: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(items)=%d want=2", len(items))
+	}
+	if items[0].StreamID != 2 || items[1].StreamID != 4 {
+		t.Fatalf("stream ids=%v want=[2 4]", []int64{items[0].StreamID, items[1].StreamID})
+	}
+}
