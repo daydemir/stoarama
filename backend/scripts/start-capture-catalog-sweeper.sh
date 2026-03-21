@@ -33,7 +33,11 @@ require_cmd ffmpeg
 
 export BACKEND_API_URL="${BACKEND_API_URL:-${INFERCTL_API_URL:-}}"
 require_env BACKEND_API_URL
-require_env API_TOKEN
+AUTH_TOKEN="${SERVICE_TOKEN:-${API_TOKEN:-}}"
+if [[ -z "${AUTH_TOKEN}" ]]; then
+  echo "error: missing required env var: SERVICE_TOKEN (or legacy API_TOKEN)" >&2
+  exit 1
+fi
 require_env CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY
 
 trap 'echo "capture catalog sweeper: stopping"; exit 0' INT TERM
@@ -127,10 +131,10 @@ should_skip_hls_candidate() {
   return 1
 }
 
-fetch_ids_for_capture_type() {
-  local capture_type="$1"
+fetch_ids_for_execution_class_candidates() {
+  local execution_class="$1"
   local needed="$2"
-  local skip_recaptured="$3"
+  local skip_problematic="$3"
   local page_size="${CAPTURE_CATALOG_SWEEP_SCAN_PAGE_SIZE}"
   local offset=0
   local total=-1
@@ -140,9 +144,9 @@ fetch_ids_for_capture_type() {
   local -a oldest_ids=()
 
   while true; do
-    local url="${BACKEND_API_URL%/}/api/v1/dashboard/streams?recording_state=off&capture_type=${capture_type}&limit=${page_size}&offset=${offset}&include_image_urls=false&sort_by=captures_error&sort_dir=asc"
+    local url="${BACKEND_API_URL%/}/api/v1/service/capture/catalog/candidates?execution_class=${execution_class}&limit=${page_size}&offset=${offset}"
     if ! payload="$(curl -fsS --max-time "${CAPTURE_CATALOG_SWEEP_POLL_TIMEOUT_SEC}" \
-      -H "Authorization: Bearer ${API_TOKEN}" \
+      -H "Authorization: Bearer ${AUTH_TOKEN}" \
       "${url}")"; then
       return 1
     fi
@@ -162,9 +166,9 @@ fetch_ids_for_capture_type() {
       total=-1
     fi
 
-    while IFS=$'\t' read -r id captures_success captures_error runtime_status runtime_error; do
+    while IFS=$'\t' read -r id capture_type captures_success captures_error runtime_status runtime_error; do
       [[ "${id}" =~ ^[0-9]+$ ]] || continue
-      if [[ "${skip_recaptured}" -eq 1 ]]; then
+      if [[ "${skip_problematic}" -eq 1 ]] && [[ "${capture_type}" == "hls" || "${capture_type}" == "http_video" ]]; then
         if should_skip_hls_candidate "${captures_success}" "${captures_error}" "${runtime_status}" "${runtime_error}"; then
           continue
         fi
@@ -177,7 +181,7 @@ fetch_ids_for_capture_type() {
       elif [[ "${#oldest_ids[@]}" -lt "${needed}" ]]; then
         oldest_ids+=("${id}")
       fi
-    done < <(jq -r '.items[]? | [.stream.id, (.captures_success // 0), (.captures_error // 0), (.stream.capture_runtime_status // ""), (.stream.capture_runtime_last_error // "")] | @tsv' <<<"${payload}")
+    done < <(jq -r '.items[]? | [.stream_id, .capture_type, (.captures_success // 0), (.captures_error // 0), (.runtime_status // ""), (.runtime_error // "")] | @tsv' <<<"${payload}")
 
     if [[ "${#uncaptured_ids[@]}" -ge "${needed}" ]]; then
       break
@@ -192,8 +196,8 @@ fetch_ids_for_capture_type() {
     printf '%s\n' "${uncaptured_ids[@]:0:${needed}}"
     return 0
   fi
-  if [[ "${skip_recaptured}" -eq 1 ]]; then
-    # For HLS catalog sweep, do not backfill already-captured streams when every uncaptured
+  if [[ "${skip_problematic}" -eq 1 ]]; then
+    # For video_live catalog sweep, do not backfill already-captured streams when every uncaptured
     # candidate is known-dead/unsupported; this avoids wasting capacity on stale endpoints.
     return 0
   fi
@@ -233,13 +237,10 @@ fetch_ids_for_execution_class() {
 
   case "${execution_class}" in
     image_poll)
-      add_unique_ids < <(fetch_ids_for_capture_type "still_image" "${needed}" 0 || true)
+      add_unique_ids < <(fetch_ids_for_execution_class_candidates "image_poll" "${needed}" 0 || true)
       ;;
     video_live)
-      add_unique_ids < <(fetch_ids_for_capture_type "hls" "${needed}" 1 || true)
-      if [[ "${#selected_ids[@]}" -lt "${needed}" ]]; then
-        add_unique_ids < <(fetch_ids_for_capture_type "http_video" "$((needed - ${#selected_ids[@]}))" 0 || true)
-      fi
+      add_unique_ids < <(fetch_ids_for_execution_class_candidates "video_live" "${needed}" 1 || true)
       ;;
     *)
       echo "error: unsupported execution class in fetch_ids_for_execution_class: ${execution_class}" >&2
@@ -294,7 +295,7 @@ while true; do
     go run ./cmd/stoaramactl
     capture-server run
     --backend-api-url "${BACKEND_API_URL}"
-    --api-token "${API_TOKEN}"
+    --api-token "${AUTH_TOKEN}"
     --server-id "${CAPTURE_CATALOG_SWEEP_SERVER_ID}"
     --worker-id "${CAPTURE_CATALOG_SWEEP_WORKER_ID}"
     --capture-shared-capacity "${CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY}"
