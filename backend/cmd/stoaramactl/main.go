@@ -78,6 +78,8 @@ func main() {
 		runInference(ctx, cfg, os.Args[2:])
 	case "jobs":
 		runJobs(ctx, cfg, os.Args[2:])
+	case "alerts":
+		runAlerts(ctx, cfg, os.Args[2:])
 	case "overview":
 		runOverview(ctx, cfg, os.Args[2:])
 	case "import":
@@ -133,6 +135,7 @@ func usage() {
 	  stoaramactl jobs list [--status pending|leased|done|error --limit 200]
 	  stoaramactl jobs retry --id N
 	  stoaramactl jobs dead-letter [--limit 200]
+	  stoaramactl alerts send-test-email [--to email@example.com] [--stream-id N --stream-name NAME --reason capture_runtime_stopped]
 	  stoaramactl import legacy-live-streams [--legacy-api-url URL --legacy-api-token TOKEN --target-api-url URL --service-token TOKEN --offset 0 --limit 200 --page-size 50 --concurrency 4 --probe-timeout-sec 45 --legacy-recording-state off|on --legacy-provider P --apply --report-json out.json --json]
 	  stoaramactl overview summary [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl overview status [--backend-api-url URL --api-token TOKEN --hours 168]
