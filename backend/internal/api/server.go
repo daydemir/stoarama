@@ -165,6 +165,7 @@ func (s *Server) router() http.Handler {
 
 			admin.Post("/streams", s.handleStreamsCreate)
 			admin.Patch("/streams/{id}", s.handleStreamsPatch)
+			admin.Get("/streams/{id}/source-revisions", s.handleStreamSourceRevisionsList)
 			admin.Get("/streams", s.handleStreamsList)
 			admin.Get("/source-candidates", s.handleSourceCandidatesList)
 			admin.Post("/source-candidates/{id}/review", s.handleSourceCandidateReview)
@@ -352,6 +353,7 @@ type streamPatchRequest struct {
 	Slug                     *string         `json:"slug"`
 	StreamURL                *string         `json:"source_url"`
 	SourcePageURL            *string         `json:"source_page_url"`
+	SourceChangeReason       *string         `json:"source_change_reason"`
 	SourceFamily             *string         `json:"source_family"`
 	Lat                      *float64        `json:"lat"`
 	Lon                      *float64        `json:"lon"`
@@ -440,6 +442,10 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	recordingStateChanged := false
 	targetRecordingState := current.RecordingState
+	sourceChangeReason := "stream source updated"
+	if req.SourceChangeReason != nil && strings.TrimSpace(*req.SourceChangeReason) != "" {
+		sourceChangeReason = strings.TrimSpace(*req.SourceChangeReason)
+	}
 	if req.RecordingState != nil {
 		state, ok := parseRecordingState(strings.TrimSpace(*req.RecordingState))
 		if !ok {
@@ -551,7 +557,30 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load assignment: %v", err))
 		return
 	}
+	if streamSourceChanged(current, updated) {
+		metadata := map[string]any{}
+		if existed {
+			metadata["assignment_server_id"] = assignment.ServerID
+			metadata["assignment_revision"] = assignment.Revision
+		}
+		if err := insertStreamSourceRevisionTx(r.Context(), tx, streamSourceRevisionInput{
+			Actor:    "api.streams_patch",
+			Reason:   sourceChangeReason,
+			Previous: current,
+			Current:  updated,
+			Metadata: metadata,
+		}); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert stream source revision: %v", err))
+			return
+		}
+	}
 	if existed {
+		if streamSourceChanged(current, updated) {
+			if err := s.resetYouTubeRelayRouteForSourceChangeTx(r.Context(), tx, updated, assignment, "api.streams_patch", sourceChangeReason); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reset youtube relay route after source change: %v", err))
+				return
+			}
+		}
 		issues := buildRecordingAssignmentAuditIssues(updated, assignment, nil)
 		if len(issues) > 0 {
 			if _, _, err := s.unassignRecordingStreamTx(r.Context(), tx, id, "api.streams_patch", issues[0].Code); err != nil {
