@@ -86,8 +86,6 @@
         <h2>Email Sign-In</h2>
         <label for="email">Email</label>
         <input id="email" type="email" placeholder="you@example.org" />
-        <label for="name">Name</label>
-        <input id="name" type="text" placeholder="Optional name" />
         <button id="requestLink">Email Magic Link</button>
         <div id="requestStatus" class="status"></div>
       </section>
@@ -198,12 +196,11 @@
 
     document.getElementById('requestLink').addEventListener('click', async () => {
       const email = String(document.getElementById('email').value || '').trim();
-      const name = String(document.getElementById('name').value || '').trim();
       try {
         await fetchJSON('/api/v1/auth/request-link', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, name, redirect_path: requestedRedirectPath }),
+          body: JSON.stringify({ email, redirect_path: requestedRedirectPath }),
         });
         setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
       } catch (err) {
