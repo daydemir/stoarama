@@ -137,8 +137,8 @@ func (s *Server) handleNodeYouTubeRelaySourceHeartbeat(w http.ResponseWriter, r 
 			last_heartbeat_at=now(),
 			capabilities_jsonb=COALESCE(capabilities_jsonb, '{}'::jsonb) || jsonb_build_object(
 				'yt_relay_source', true,
-				'yt_relay_max_active', $2,
-				'yt_relay_shard_id', $3
+				'yt_relay_max_active', $2::int,
+				'yt_relay_shard_id', $3::text
 			),
 			metadata_jsonb=COALESCE(metadata_jsonb, '{}'::jsonb) || $4::jsonb,
 			updated_at=now()
