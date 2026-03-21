@@ -627,6 +627,32 @@ func (c *Client) YouTubeRelaySourceHeartbeat(ctx context.Context, req YouTubeRel
 	return c.postJSON(ctx, "/api/v1/youtube-relay/sources/heartbeat", payload, nil)
 }
 
+func (c *Client) NodeYouTubeRelaySourceHeartbeat(ctx context.Context, req YouTubeRelaySourceHeartbeatRequest) error {
+	shardID := strings.TrimSpace(req.ShardID)
+	if shardID == "" {
+		return fmt.Errorf("shard_id is required")
+	}
+	if req.MaxActive <= 0 {
+		return fmt.Errorf("max_active must be > 0")
+	}
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 45
+	}
+	if leaseSec > 3600 {
+		return fmt.Errorf("lease_sec must be <= 3600")
+	}
+	payload := map[string]any{
+		"server_id":     strings.TrimSpace(req.ServerID),
+		"shard_id":      shardID,
+		"max_active":    req.MaxActive,
+		"draining":      req.Draining,
+		"lease_sec":     leaseSec,
+		"metadata_json": nonNilMap(req.MetadataJSON),
+	}
+	return c.postJSON(ctx, "/api/v1/node/youtube-relay/source/heartbeat", payload, nil)
+}
+
 func (c *Client) YouTubeRelaySourceStopped(ctx context.Context, serverID string) error {
 	serverID = strings.TrimSpace(serverID)
 	if serverID == "" {
@@ -635,6 +661,10 @@ func (c *Client) YouTubeRelaySourceStopped(ctx context.Context, serverID string)
 	return c.postJSON(ctx, "/api/v1/youtube-relay/sources/stopped", map[string]any{
 		"server_id": serverID,
 	}, nil)
+}
+
+func (c *Client) NodeYouTubeRelaySourceStopped(ctx context.Context) error {
+	return c.postJSON(ctx, "/api/v1/node/youtube-relay/source/stopped", map[string]any{}, nil)
 }
 
 func (c *Client) ListYouTubeRelayRoutes(ctx context.Context, sourceServerID, sinkServerID, status string, limit, offset int) ([]YouTubeRelayRoute, error) {
@@ -691,6 +721,54 @@ func (c *Client) ListYouTubeRelayRoutes(ctx context.Context, sourceServerID, sin
 	return payload.Items, nil
 }
 
+func (c *Client) NodeListYouTubeRelayRoutes(ctx context.Context, status string, limit, offset int) ([]YouTubeRelayRoute, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	u, err := url.Parse(c.baseURL + "/api/v1/node/youtube-relay/routes")
+	if err != nil {
+		return nil, fmt.Errorf("parse node youtube relay routes URL: %w", err)
+	}
+	q := u.Query()
+	if v := strings.TrimSpace(strings.ToLower(status)); v != "" {
+		q.Set("status", v)
+	}
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	q.Set("offset", fmt.Sprintf("%d", offset))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build node youtube relay routes request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("node youtube relay routes request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return nil, fmt.Errorf("node youtube relay routes status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var payload struct {
+		Items []YouTubeRelayRoute `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode node youtube relay routes response: %w", err)
+	}
+	for i := range payload.Items {
+		if payload.Items[i].MetadataJSON == nil {
+			payload.Items[i].MetadataJSON = map[string]any{}
+		}
+	}
+	return payload.Items, nil
+}
+
 func (c *Client) UpdateYouTubeRelayRouteStatus(ctx context.Context, req YouTubeRelayRouteStatusRequest) error {
 	if req.StreamID <= 0 {
 		return fmt.Errorf("stream_id must be > 0")
@@ -706,6 +784,32 @@ func (c *Client) UpdateYouTubeRelayRouteStatus(ctx context.Context, req YouTubeR
 		return fmt.Errorf("status must be one of assigned|source_ready|running|stopped|failed")
 	}
 	path := fmt.Sprintf("/api/v1/youtube-relay/routes/%d/status", req.StreamID)
+	payload := map[string]any{
+		"actor":          actor,
+		"status":         status,
+		"reason":         strings.TrimSpace(req.Reason),
+		"relay_pull_url": strings.TrimSpace(req.RelayPullURL),
+		"error_text":     strings.TrimSpace(req.ErrorText),
+		"metadata_json":  nonNilMap(req.MetadataJSON),
+	}
+	return c.postJSON(ctx, path, payload, nil)
+}
+
+func (c *Client) NodeUpdateYouTubeRelayRouteStatus(ctx context.Context, req YouTubeRelayRouteStatusRequest) error {
+	if req.StreamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	actor := strings.TrimSpace(req.Actor)
+	if actor == "" {
+		return fmt.Errorf("actor is required")
+	}
+	status := strings.TrimSpace(strings.ToLower(req.Status))
+	switch status {
+	case "assigned", "source_ready", "running", "stopped", "failed":
+	default:
+		return fmt.Errorf("status must be one of assigned|source_ready|running|stopped|failed")
+	}
+	path := fmt.Sprintf("/api/v1/node/youtube-relay/routes/%d/status", req.StreamID)
 	payload := map[string]any{
 		"actor":          actor,
 		"status":         status,

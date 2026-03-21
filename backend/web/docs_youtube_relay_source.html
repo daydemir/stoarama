@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stoarama YouTube Relay Source</title>
+  <style>
+    :root {
+      --bg: #f4efe8;
+      --panel: #fffaf4;
+      --ink: #172026;
+      --muted: #6d716d;
+      --line: #d9cfc2;
+      --accent: #126b50;
+    }
+    body {
+      margin: 0;
+      font-family: Georgia, "Iowan Old Style", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #efe1cc 0, transparent 26%),
+        linear-gradient(180deg, #f5eadb 0%, var(--bg) 55%, #efe5da 100%);
+    }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 32px 20px 72px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 18px 40px rgba(30, 32, 30, 0.06);
+      margin-top: 16px;
+    }
+    h1 { margin: 0 0 12px; font-size: 40px; }
+    h2 { margin: 0 0 10px; font-size: 24px; }
+    p, li { line-height: 1.55; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre {
+      background: #f3ece3;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      overflow-x: auto;
+    }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>YouTube Relay Source</h1>
+    <p>Use a Stoarama relay source on your own computer when a stream needs local YouTube cookies. The source machine resolves the stream locally, serves relay bytes, and Stoarama’s recording sinks pull from that relay.</p>
+
+    <section class="panel">
+      <h2>What You Need</h2>
+      <ul>
+        <li>A Stoarama account and an enrolled <code>yt_relay_source</code> node.</li>
+        <li><code>ffmpeg</code> and <code>yt-dlp</code> installed locally.</li>
+        <li>A public or private relay URL reachable from Stoarama’s sink servers.</li>
+        <li>YouTube cookies stored only on your own machine.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Install Flow</h2>
+      <p>1. Create a node enrollment token from your <a href="/account">account page</a>.</p>
+      <p>2. Enroll your machine:</p>
+      <pre><code>stoarama node enroll \
+  --api-base-url https://stoarama.com \
+  --token &lt;enrollment-token&gt; \
+  --node-type yt_relay_source \
+  --display-name "Mac mini relay"</code></pre>
+      <p>3. Install the launchd service on macOS:</p>
+      <pre><code>stoarama node yt-relay-source install-launchd \
+  --public-base-url https://your-relay-host.example \
+  --cookies-from-browser chrome</code></pre>
+      <p>4. The service runs in the background and will show up on your account page with heartbeat status and available YouTube relay slots.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Foreground Run</h2>
+      <p>If you want to test without installing launchd:</p>
+      <pre><code>stoarama node yt-relay-source run \
+  --public-base-url https://your-relay-host.example \
+  --cookies-from-browser chrome</code></pre>
+    </section>
+
+    <section class="panel">
+      <h2>Important Rules</h2>
+      <ul>
+        <li>Cookies never leave your machine.</li>
+        <li>Stoarama only stores node state, route state, and relay metadata.</li>
+        <li>The recording sink stays remote; your source machine only resolves and relays.</li>
+      </ul>
+    </section>
+  </div>
+</body>
+</html>

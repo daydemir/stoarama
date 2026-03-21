@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,10 @@ type youTubeRelayRouteStatusRequest struct {
 	RelayPullURL string         `json:"relay_pull_url"`
 	ErrorText    string         `json:"error_text"`
 	MetadataJSON map[string]any `json:"metadata_json"`
+}
+
+func youTubeRelaySourceServerIDForNode(nodeID int64) string {
+	return fmt.Sprintf("node-%d-yt-relay-source", nodeID)
 }
 
 func (s *Server) handleYouTubeRelaySourceHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -68,21 +73,7 @@ func (s *Server) handleYouTubeRelaySourceHeartbeat(w http.ResponseWriter, r *htt
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid metadata_json: %v", err))
 		return
 	}
-	if _, err := s.pool.Exec(r.Context(), `
-		INSERT INTO youtube_relay_sources (
-			server_id, shard_id, max_active, draining, heartbeat_at, lease_expires_at, metadata_jsonb, updated_at
-		)
-		VALUES ($1, $2, $3, $4, now(), now() + make_interval(secs => $5), $6::jsonb, now())
-		ON CONFLICT (server_id)
-		DO UPDATE SET
-			shard_id=EXCLUDED.shard_id,
-			max_active=EXCLUDED.max_active,
-			draining=EXCLUDED.draining,
-			heartbeat_at=EXCLUDED.heartbeat_at,
-			lease_expires_at=EXCLUDED.lease_expires_at,
-			metadata_jsonb=EXCLUDED.metadata_jsonb,
-			updated_at=now()
-	`, serverID, shardID, req.MaxActive, req.Draining, leaseSec, string(metaBytes)); err != nil {
+	if err := s.upsertYouTubeRelaySource(r.Context(), 0, serverID, shardID, req.MaxActive, req.Draining, leaseSec, string(metaBytes)); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert youtube relay source: %v", err))
 		return
 	}
@@ -93,6 +84,100 @@ func (s *Server) handleYouTubeRelaySourceHeartbeat(w http.ResponseWriter, r *htt
 		"max_active": req.MaxActive,
 		"draining":   req.Draining,
 	})
+}
+
+func (s *Server) handleNodeYouTubeRelaySourceHeartbeat(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if principal.NodeType != nodeTypeYTRelaySource {
+		util.WriteError(w, http.StatusForbidden, "yt relay source node required")
+		return
+	}
+	var req youTubeRelaySourceHeartbeatRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	shardID := strings.TrimSpace(req.ShardID)
+	if shardID == "" {
+		util.WriteError(w, http.StatusBadRequest, "shard_id is required")
+		return
+	}
+	if req.MaxActive <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "max_active must be > 0")
+		return
+	}
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 45
+	}
+	if leaseSec > 3600 {
+		util.WriteError(w, http.StatusBadRequest, "lease_sec must be <= 3600")
+		return
+	}
+	meta := nonNilMap(req.MetadataJSON)
+	meta["node_id"] = principal.NodeID
+	meta["node_display_name"] = principal.DisplayName
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid metadata_json: %v", err))
+		return
+	}
+	serverID := youTubeRelaySourceServerIDForNode(principal.NodeID)
+	if err := s.upsertYouTubeRelaySource(r.Context(), principal.NodeID, serverID, shardID, req.MaxActive, req.Draining, leaseSec, string(metaBytes)); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert youtube relay source: %v", err))
+		return
+	}
+	if _, err := s.pool.Exec(r.Context(), `
+		UPDATE nodes
+		SET
+			last_heartbeat_at=now(),
+			capabilities_jsonb=COALESCE(capabilities_jsonb, '{}'::jsonb) || jsonb_build_object(
+				'yt_relay_source', true,
+				'yt_relay_max_active', $2,
+				'yt_relay_shard_id', $3
+			),
+			metadata_jsonb=COALESCE(metadata_jsonb, '{}'::jsonb) || $4::jsonb,
+			updated_at=now()
+		WHERE id=$1
+	`, principal.NodeID, req.MaxActive, shardID, string(metaBytes)); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update node relay heartbeat: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"server_id":  serverID,
+		"shard_id":   shardID,
+		"max_active": req.MaxActive,
+		"draining":   req.Draining,
+	})
+}
+
+func (s *Server) upsertYouTubeRelaySource(ctx context.Context, nodeID int64, serverID string, shardID string, maxActive int, draining bool, leaseSec int, metadataJSON string) error {
+	var nodeIDArg any
+	if nodeID > 0 {
+		nodeIDArg = nodeID
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO youtube_relay_sources (
+			server_id, node_id, shard_id, max_active, draining, heartbeat_at, lease_expires_at, metadata_jsonb, updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, now(), now() + make_interval(secs => $6), $7::jsonb, now())
+		ON CONFLICT (server_id)
+		DO UPDATE SET
+			node_id=EXCLUDED.node_id,
+			shard_id=EXCLUDED.shard_id,
+			max_active=EXCLUDED.max_active,
+			draining=EXCLUDED.draining,
+			heartbeat_at=EXCLUDED.heartbeat_at,
+			lease_expires_at=EXCLUDED.lease_expires_at,
+			metadata_jsonb=EXCLUDED.metadata_jsonb,
+			updated_at=now()
+	`, serverID, nodeIDArg, shardID, maxActive, draining, leaseSec, metadataJSON)
+	return err
 }
 
 func (s *Server) handleYouTubeRelaySourceStopped(w http.ResponseWriter, r *http.Request) {
@@ -106,14 +191,39 @@ func (s *Server) handleYouTubeRelaySourceStopped(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusBadRequest, "server_id is required")
 		return
 	}
-	tx, err := s.pool.Begin(r.Context())
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin youtube relay source stop tx: %v", err))
+	if err := s.markYouTubeRelaySourceStopped(r.Context(), serverID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer func() { _ = tx.Rollback(r.Context()) }()
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "server_id": serverID})
+}
 
-	if _, err := tx.Exec(r.Context(), `
+func (s *Server) handleNodeYouTubeRelaySourceStopped(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if principal.NodeType != nodeTypeYTRelaySource {
+		util.WriteError(w, http.StatusForbidden, "yt relay source node required")
+		return
+	}
+	serverID := youTubeRelaySourceServerIDForNode(principal.NodeID)
+	if err := s.markYouTubeRelaySourceStopped(r.Context(), serverID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "server_id": serverID})
+}
+
+func (s *Server) markYouTubeRelaySourceStopped(ctx context.Context, serverID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin youtube relay source stop tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
 		WITH failed AS (
 			UPDATE youtube_relay_routes
 			SET
@@ -131,18 +241,15 @@ func (s *Server) handleYouTubeRelaySourceStopped(w http.ResponseWriter, r *http.
 		SELECT stream_id, source_server_id, sink_server_id, 'failed', 'api.youtube_relay_source_stopped', 'source server stopped', 'source server stopped', '{}'::jsonb
 		FROM failed
 	`, serverID); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("mark relay routes failed for source stop: %v", err))
-		return
+		return fmt.Errorf("mark relay routes failed for source stop: %v", err)
 	}
-	if _, err := tx.Exec(r.Context(), `DELETE FROM youtube_relay_sources WHERE server_id=$1`, serverID); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete youtube relay source: %v", err))
-		return
+	if _, err := tx.Exec(ctx, `DELETE FROM youtube_relay_sources WHERE server_id=$1`, serverID); err != nil {
+		return fmt.Errorf("delete youtube relay source: %v", err)
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit youtube relay source stop tx: %v", err))
-		return
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit youtube relay source stop tx: %v", err)
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "server_id": serverID})
+	return nil
 }
 
 func (s *Server) handleYouTubeRelayRoutesList(w http.ResponseWriter, r *http.Request) {
@@ -242,6 +349,22 @@ func (s *Server) handleYouTubeRelayRoutesList(w http.ResponseWriter, r *http.Req
 		"offset": offset,
 		"total":  len(items),
 	})
+}
+
+func (s *Server) handleNodeYouTubeRelayRoutesList(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if principal.NodeType != nodeTypeYTRelaySource {
+		util.WriteError(w, http.StatusForbidden, "yt relay source node required")
+		return
+	}
+	q := r.URL.Query()
+	q.Set("source_server_id", youTubeRelaySourceServerIDForNode(principal.NodeID))
+	r.URL.RawQuery = q.Encode()
+	s.handleYouTubeRelayRoutesList(w, r)
 }
 
 func (s *Server) handleYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Request) {
@@ -345,4 +468,39 @@ func (s *Server) handleYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Re
 		"sink_server_id":   sinkServerID,
 		"relay_pull_url":   relayPullURL,
 	})
+}
+
+func (s *Server) handleNodeYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if principal.NodeType != nodeTypeYTRelaySource {
+		util.WriteError(w, http.StatusForbidden, "yt relay source node required")
+		return
+	}
+	streamID, ok := parseInt64Path(w, r, "stream_id")
+	if !ok {
+		return
+	}
+	expectedSourceServerID := youTubeRelaySourceServerIDForNode(principal.NodeID)
+	var sourceServerID string
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT source_server_id
+		FROM youtube_relay_routes
+		WHERE stream_id=$1
+	`, streamID).Scan(&sourceServerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "youtube relay route not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load youtube relay route: %v", err))
+		return
+	}
+	if strings.TrimSpace(sourceServerID) != expectedSourceServerID {
+		util.WriteError(w, http.StatusNotFound, "youtube relay route not found")
+		return
+	}
+	s.handleYouTubeRelayRouteStatus(w, r)
 }

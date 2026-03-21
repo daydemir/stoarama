@@ -43,6 +43,7 @@ type Server struct {
 	mailer        email.Sender
 	dashboardHTML []byte
 	accountHTML   []byte
+	docsHTML      []byte
 	exportMu      sync.Mutex
 	frameExports  map[string]*frameExportJob
 }
@@ -95,6 +96,10 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
+	docsHTML, err := loadYouTubeRelaySourceDocsHTML()
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		cfg:           cfg,
 		pool:          pool,
@@ -102,6 +107,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		mailer:        mailer,
 		dashboardHTML: html,
 		accountHTML:   accountHTML,
+		docsHTML:      docsHTML,
 		frameExports:  map[string]*frameExportJob{},
 	}
 	return s.router(), nil
@@ -116,6 +122,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/dashboard/{tab}", s.handleDashboard)
 	r.Get("/dashboard/stream/{id}", s.handleDashboard)
 	r.Get("/account", s.handleAccountApp)
+	r.Get("/docs/youtube-relay-source", s.handleYouTubeRelaySourceDocs)
 	r.Get("/auth/complete", s.handleAccountAuthComplete)
 
 	r.Route("/api/v1", func(api chi.Router) {
@@ -137,6 +144,10 @@ func (s *Server) router() http.Handler {
 			node.Use(s.requireNodeAuth)
 			node.Get("/me", s.handleNodeMe)
 			node.Post("/heartbeat", s.handleNodeHeartbeat)
+			node.Post("/youtube-relay/source/heartbeat", s.handleNodeYouTubeRelaySourceHeartbeat)
+			node.Post("/youtube-relay/source/stopped", s.handleNodeYouTubeRelaySourceStopped)
+			node.Get("/youtube-relay/routes", s.handleNodeYouTubeRelayRoutesList)
+			node.Post("/youtube-relay/routes/{stream_id}/status", s.handleNodeYouTubeRelayRouteStatus)
 		})
 		api.Route("/admin", func(admin chi.Router) {
 			admin.Use(s.requireAdminAuth)
