@@ -55,6 +55,7 @@ export CAPTURE_CATALOG_SWEEP_POLL_TIMEOUT_SEC="${CAPTURE_CATALOG_SWEEP_POLL_TIME
 export CAPTURE_CATALOG_SWEEP_REFRESH_SEC="${CAPTURE_CATALOG_SWEEP_REFRESH_SEC:-5}"
 export CAPTURE_CATALOG_SWEEP_SCAN_PAGE_SIZE="${CAPTURE_CATALOG_SWEEP_SCAN_PAGE_SIZE:-200}"
 export CAPTURE_CATALOG_SWEEP_HLS_SKIP_ERROR_THRESHOLD="${CAPTURE_CATALOG_SWEEP_HLS_SKIP_ERROR_THRESHOLD:-12}"
+export CAPTURE_CATALOG_SWEEP_IMAGE_SKIP_ERROR_THRESHOLD="${CAPTURE_CATALOG_SWEEP_IMAGE_SKIP_ERROR_THRESHOLD:-6}"
 if [[ -z "${CAPTURE_CATALOG_SWEEP_METADATA_JSON:-}" ]]; then
   export CAPTURE_CATALOG_SWEEP_METADATA_JSON='{"role":"capture_catalog_sweeper"}'
 fi
@@ -131,6 +132,29 @@ should_skip_hls_candidate() {
   return 1
 }
 
+should_skip_image_candidate() {
+  local captures_success="$1"
+  local captures_error="$2"
+  local runtime_status="$3"
+  local runtime_error="$4"
+  local lowered_error=""
+  lowered_error="$(echo "${runtime_error}" | tr '[:upper:]' '[:lower:]')"
+  runtime_status="$(echo "${runtime_status}" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "${runtime_status}" == "unsupported" ]]; then
+    return 0
+  fi
+  if [[ "${captures_success}" =~ ^[0-9]+$ ]] && [[ "${captures_success}" -eq 0 ]] && [[ "${captures_error}" =~ ^[0-9]+$ ]] && [[ "${captures_error}" -ge "${CAPTURE_CATALOG_SWEEP_IMAGE_SKIP_ERROR_THRESHOLD}" ]]; then
+    return 0
+  fi
+  case "${lowered_error}" in
+    *"image request failed status=403"*|*"image request failed status=404"*|*"content-type is not image"*|*"forbidden"*|*"access denied"*|*"capture disabled after "*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 fetch_ids_for_execution_class_candidates() {
   local execution_class="$1"
   local needed="$2"
@@ -168,9 +192,15 @@ fetch_ids_for_execution_class_candidates() {
 
     while IFS=$'\t' read -r id capture_type captures_success captures_error runtime_status runtime_error; do
       [[ "${id}" =~ ^[0-9]+$ ]] || continue
-      if [[ "${skip_problematic}" -eq 1 ]] && [[ "${capture_type}" == "hls" || "${capture_type}" == "http_video" ]]; then
-        if should_skip_hls_candidate "${captures_success}" "${captures_error}" "${runtime_status}" "${runtime_error}"; then
-          continue
+      if [[ "${skip_problematic}" -eq 1 ]]; then
+        if [[ "${capture_type}" == "hls" || "${capture_type}" == "http_video" ]]; then
+          if should_skip_hls_candidate "${captures_success}" "${captures_error}" "${runtime_status}" "${runtime_error}"; then
+            continue
+          fi
+        elif [[ "${capture_type}" == "still_image" ]]; then
+          if should_skip_image_candidate "${captures_success}" "${captures_error}" "${runtime_status}" "${runtime_error}"; then
+            continue
+          fi
         fi
       fi
       if [[ "${captures_success}" =~ ^[0-9]+$ ]] && [[ "${captures_success}" -eq 0 ]]; then
