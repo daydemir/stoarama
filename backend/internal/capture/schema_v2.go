@@ -89,16 +89,17 @@ func DeriveCanonicalStreamFields(sourceURL string, sourcePageURL string, capture
 	}
 
 	captureType := strings.TrimSpace(captureTypeRaw)
+	inferredCaptureType, _ := InferCaptureType("", fields.SourceURL, fields.SourcePageURL)
 	if captureType == "" {
-		inferred, _ := InferCaptureType("", fields.SourceURL, fields.SourcePageURL)
+		inferred := inferredCaptureType
 		captureType = inferred
 	}
 	captureTypeValue, ok := NormalizeCaptureType(captureType)
 	if !ok || captureTypeValue == CaptureTypeUnknown {
 		return CanonicalStreamFields{}, fmt.Errorf("capture_type could not be derived; provide capture_type explicitly")
 	}
-	if looksLikeImageURL(fields.SourceURL) && captureTypeValue != CaptureTypeStillImage {
-		captureTypeValue = CaptureTypeStillImage
+	if shouldOverrideExplicitCaptureType(captureTypeValue, inferredCaptureType) {
+		captureTypeValue = inferredCaptureType
 		sourceFamilyRaw = ""
 		executionClassRaw = ""
 	}
@@ -230,6 +231,8 @@ func InferCaptureType(provider string, sourceURL string, sourcePageURL string) (
 			return CaptureTypeStillImage, "still_image_url"
 		case strings.Contains(strings.ToLower(raw), ".m3u8") || strings.Contains(strings.ToLower(raw), "!hls"):
 			return CaptureTypeHLS, "hls_url"
+		case strings.Contains(strings.ToLower(raw), ".mpd"):
+			return CaptureTypeDASH, "dash_url"
 		case strings.HasPrefix(strings.ToLower(raw), "rtsp://"):
 			return CaptureTypeRTSP, "rtsp_url"
 		case strings.HasPrefix(strings.ToLower(raw), "rtmp://"):
@@ -248,6 +251,8 @@ func ResolvedCaptureTypeFromURL(raw string) string {
 		return ""
 	case strings.Contains(u, ".m3u8"):
 		return CaptureTypeHLS
+	case strings.Contains(u, ".mpd"):
+		return CaptureTypeDASH
 	case strings.HasPrefix(u, "rtsp://"):
 		return CaptureTypeRTSP
 	case strings.HasPrefix(u, "rtmp://"):

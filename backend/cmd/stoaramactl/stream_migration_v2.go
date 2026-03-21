@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -289,110 +288,22 @@ func proposeStreamV2Migration(row streamV2MigrationRow) streamV2MigrationItem {
 		ResolvedCaptureType:   normalizeCaptureType(row.ResolvedCaptureType),
 		ResolvedURL:           strings.TrimSpace(row.ResolvedURL),
 	}
-	reasons := make([]string, 0, 8)
-
-	proposedCaptureType := item.CurrentCaptureType
-	inferredCaptureType, inferredReason := capture.InferCaptureType(item.Provider, item.SourceURL, item.SourcePageURL)
-	if inferredCaptureType == capture.CaptureTypeYouTubeWatch {
-		proposedCaptureType = inferredCaptureType
-		reasons = append(reasons, inferredReason)
-	} else if item.ResolvedCaptureType != "" && item.ResolvedCaptureType != "unknown" {
-		proposedCaptureType = item.ResolvedCaptureType
-		reasons = append(reasons, "resolved_capture_type")
-	} else if inferredCaptureType != "" {
-		proposedCaptureType = inferredCaptureType
-		reasons = append(reasons, inferredReason)
-	}
-	if proposedCaptureType == "" {
-		proposedCaptureType = "unknown"
-		reasons = append(reasons, "capture_type_unknown")
-	}
-
-	proposedExecutionClass, executionReason, reviewForExecution := deriveExecutionClass(proposedCaptureType, item.CurrentExecutionClass)
-	if executionReason != "" {
-		reasons = append(reasons, executionReason)
-	}
-	proposedSourceFamily, familyReason := deriveSourceFamily(proposedCaptureType, item.CurrentSourceFamily)
-	if familyReason != "" {
-		reasons = append(reasons, familyReason)
-	}
-
-	reviewRequired := reviewForExecution
-	if proposedCaptureType == "unknown" || proposedExecutionClass == "" || proposedSourceFamily == "" {
-		reviewRequired = true
-	}
-	if item.SourceURL == "" && item.SourcePageURL == "" {
-		reviewRequired = true
-		reasons = append(reasons, "missing_source_url")
-	}
-	if item.CurrentExecutionClass == "youtube_relay" && proposedCaptureType != "youtube_watch" {
-		reviewRequired = true
-		reasons = append(reasons, "relay_non_youtube_mismatch")
-	}
-
-	item.ProposedCaptureType = proposedCaptureType
-	item.ProposedExecutionClass = proposedExecutionClass
-	item.ProposedSourceFamily = proposedSourceFamily
-	item.ReviewRequired = reviewRequired
-	item.Reasons = uniqueStrings(reasons)
-	item.WouldChange = item.CurrentSourceFamily != item.ProposedSourceFamily ||
-		item.CurrentCaptureType != item.ProposedCaptureType ||
-		item.CurrentExecutionClass != item.ProposedExecutionClass
+	proposal := capture.ProposeCanonicalStreamRepair(capture.CanonicalRepairInput{
+		Provider:              item.Provider,
+		SourceURL:             item.SourceURL,
+		SourcePageURL:         item.SourcePageURL,
+		CurrentSourceFamily:   item.CurrentSourceFamily,
+		CurrentCaptureType:    item.CurrentCaptureType,
+		CurrentExecutionClass: item.CurrentExecutionClass,
+		ResolvedCaptureType:   item.ResolvedCaptureType,
+	})
+	item.ProposedCaptureType = proposal.ProposedCaptureType
+	item.ProposedExecutionClass = proposal.ProposedExecutionClass
+	item.ProposedSourceFamily = proposal.ProposedSourceFamily
+	item.ReviewRequired = proposal.ReviewRequired
+	item.Reasons = proposal.Reasons
+	item.WouldChange = proposal.WouldChange
 	return item
-}
-
-func deriveExecutionClass(captureType, currentExecutionClass string) (string, string, bool) {
-	switch captureType {
-	case "youtube_watch":
-		if currentExecutionClass == "youtube_relay" {
-			return "youtube_relay", "keep_youtube_relay", false
-		}
-		return "youtube_relay", "youtube_relay_default", false
-	case "still_image":
-		return "image_poll", "image_poll_from_capture_type", false
-	case "hls", "dash", "rtsp", "rtmp", "http_video":
-		return "video_live", "video_live_from_capture_type", false
-	case "webrtc":
-		if currentExecutionClass != "" {
-			return currentExecutionClass, "keep_current_execution_class", true
-		}
-		return "", "webrtc_requires_review", true
-	case "unknown":
-		if currentExecutionClass != "" {
-			return currentExecutionClass, "keep_current_execution_class", true
-		}
-		return "", "unknown_requires_review", true
-	default:
-		if currentExecutionClass != "" {
-			return currentExecutionClass, "keep_current_execution_class", true
-		}
-		return "", "execution_class_unknown", true
-	}
-}
-
-func deriveSourceFamily(captureType, currentSourceFamily string) (string, string) {
-	switch captureType {
-	case "youtube_watch":
-		return "watch_page", "watch_page_from_capture_type"
-	case "hls", "dash":
-		return "video_manifest", "video_manifest_from_capture_type"
-	case "rtsp", "rtmp", "http_video":
-		return "video_stream", "video_stream_from_capture_type"
-	case "still_image":
-		return "still_image", "still_image_from_capture_type"
-	case "webrtc":
-		return "embed_page", "embed_page_from_capture_type"
-	case "unknown":
-		if currentSourceFamily != "" {
-			return currentSourceFamily, "keep_current_source_family"
-		}
-		return "", "source_family_unknown"
-	default:
-		if currentSourceFamily != "" {
-			return currentSourceFamily, "keep_current_source_family"
-		}
-		return "", "source_family_unknown"
-	}
 }
 
 func normalizeSourceFamily(v string) string {
@@ -414,27 +325,6 @@ func normalizeExecutionClass(v string) string {
 		return normalized
 	}
 	return ""
-}
-
-func uniqueStrings(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(in))
-	for _, v := range in {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			continue
-		}
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func countStreamV2Items(items []streamV2MigrationItem, keep func(streamV2MigrationItem) bool) int {
