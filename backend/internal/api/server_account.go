@@ -158,7 +158,6 @@ func (s *Server) lookupAccountAPIKey(ctx context.Context, raw string) (accountPr
 
 type accountAuthRequest struct {
 	Email        string `json:"email"`
-	Name         string `json:"name"`
 	RedirectPath string `json:"redirect_path"`
 }
 
@@ -173,7 +172,6 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, "valid email is required")
 		return
 	}
-	name := strings.TrimSpace(req.Name)
 	redirectPath := sanitizeAccountRedirectPath(req.RedirectPath)
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
@@ -195,7 +193,7 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 			END,
 			updated_at=now()
 		RETURNING id, status
-	`, email, name, accountRoleMember).Scan(&accountID, &status); err != nil {
+	`, email, "", accountRoleMember).Scan(&accountID, &status); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert account: %v", err))
 		return
 	}
