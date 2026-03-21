@@ -122,6 +122,7 @@ func usage() {
 	  stoaramactl streams migrate-v2 [--id N --limit 1000 --only-changed --only-review --apply --report-json out.json --json]
 	  stoaramactl streams repair-youtube [--id N --limit 1000 --only-changed --apply --report-json out.json --json]
 	  stoaramactl streams repair-image-capture [--id N --source-url-like %%pattern%% --provider P --limit 1000 --only-changed --apply --json]
+	  stoaramactl streams recording-state-service --id N --recording-state off|on [--json]
 	  stoaramactl discovery candidates list [--id N --review-status pending|accepted|rejected|invalid --provider P --capture-type TYPE --limit 200 --offset 0]
 	  stoaramactl discovery candidates review --id N --status accepted|rejected|invalid [--reviewer TEXT --reason TEXT --metadata-json JSON]
 	  stoaramactl discovery candidates import --id N [--provider P --external-id E --name N --slug S --source-url URL --source-page-url URL --source-family FAMILY --capture-type TYPE --execution-class CLASS --execution-config-json JSON --tags a,b --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC --metadata-json JSON]
@@ -2343,7 +2344,7 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 }
 
 func printStreamsUsage() {
-	fmt.Print("stoaramactl streams <list|detail|filters|frames|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture> ...\n")
+	fmt.Print("stoaramactl streams <list|detail|filters|frames|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|recording-state-service> ...\n")
 }
 
 func printDiscoveryUsage() {
@@ -3235,6 +3236,8 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		runStreamsRepairYouTube(ctx, cfg, args[1:])
 	case "repair-image-capture":
 		runStreamsRepairImageCapture(ctx, cfg, args[1:])
+	case "recording-state-service":
+		runStreamsRecordingStateService(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown streams subcommand: %s", sub)
 	}
