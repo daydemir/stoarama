@@ -542,11 +542,20 @@ func (s *Server) applyStreamImageCaptureRepair(ctx context.Context, item service
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	current, err := s.loadStreamForAssignmentTx(ctx, tx, item.ID)
+	if err != nil {
+		return item, err
+	}
+	profile, err := capture.DeriveCaptureProfile(current.Provider, current.SourceURL, current.SourcePageURL, item.ProposedCaptureType, item.ProposedSourceFamily, item.ProposedExecutionClass, current.ExecutionConfigJSON, nil, nil)
+	if err != nil {
+		return item, err
+	}
+
 	if _, err := tx.Exec(ctx, `
 		UPDATE streams
-		SET source_family=$2, capture_type=$3, execution_class=$4, updated_at=now()
+		SET source_family=$2, capture_type=$3, execution_class=$4, capture_family=$5, expected_fps=$6, expected_image_interval_sec=$7, updated_at=now()
 		WHERE id=$1
-	`, item.ID, item.ProposedSourceFamily, item.ProposedCaptureType, item.ProposedExecutionClass); err != nil {
+	`, item.ID, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec); err != nil {
 		return item, err
 	}
 	updated, err := s.loadStreamForAssignmentTx(ctx, tx, item.ID)
@@ -731,11 +740,20 @@ func (s *Server) applyStreamCanonicalCaptureRepair(ctx context.Context, item ser
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	current, err := s.loadStreamForAssignmentTx(ctx, tx, item.ID)
+	if err != nil {
+		return item, err
+	}
+	profile, err := capture.DeriveCaptureProfile(current.Provider, current.SourceURL, current.SourcePageURL, item.ProposedCaptureType, item.ProposedSourceFamily, item.ProposedExecutionClass, current.ExecutionConfigJSON, nil, nil)
+	if err != nil {
+		return item, err
+	}
+
 	if _, err := tx.Exec(ctx, `
 		UPDATE streams
-		SET source_family=$2, capture_type=$3, execution_class=$4, updated_at=now()
+		SET source_family=$2, capture_type=$3, execution_class=$4, capture_family=$5, expected_fps=$6, expected_image_interval_sec=$7, updated_at=now()
 		WHERE id=$1
-	`, item.ID, item.ProposedSourceFamily, item.ProposedCaptureType, item.ProposedExecutionClass); err != nil {
+	`, item.ID, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec); err != nil {
 		return item, err
 	}
 	updated, err := s.loadStreamForAssignmentTx(ctx, tx, item.ID)
@@ -832,7 +850,7 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 		return model.Stream{}, false, newAPIStatusError(http.StatusBadRequest, "provider, external_id, and name are required")
 	}
 
-	fields, err := capture.DeriveCanonicalStreamFields(req.SourceURL, req.SourcePageURL, req.CaptureType, req.SourceFamily, req.ExecutionClass)
+	profile, err := capture.DeriveCaptureProfile(provider, req.SourceURL, req.SourcePageURL, req.CaptureType, req.SourceFamily, req.ExecutionClass, nonNilMap(req.ExecutionConfigJSON), nil, nil)
 	if err != nil {
 		return model.Stream{}, false, newAPIStatusError(http.StatusBadRequest, "%s", err.Error())
 	}
@@ -877,14 +895,17 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 				source_family=$15,
 				capture_type=$16,
 				execution_class=$17,
-				execution_config_jsonb=$18,
-				tags=$19,
+				capture_family=$18,
+				expected_fps=$19,
+				expected_image_interval_sec=$20,
+				execution_config_jsonb=$21,
+				tags=$22,
 				updated_at=now()
 			WHERE id=$1
-		`, existingID, name, fields.SourceURL, fields.SourcePageURL,
+		`, existingID, name, profile.SourceURL, profile.SourcePageURL,
 			nil, nil, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
 			strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource),
-			metaBytes, fields.SourceFamily, fields.CaptureType, fields.ExecutionClass, cfgBytes, dedupeStrings(req.Tags),
+			metaBytes, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes, dedupeStrings(req.Tags),
 		); err != nil {
 			return model.Stream{}, false, fmt.Errorf("update imported stream: %w", err)
 		}
@@ -915,14 +936,14 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 		INSERT INTO streams (
 			provider, external_id, name, slug, source_url, source_page_url,
 			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
-			recording_state, source_family, capture_type, execution_class, execution_config_jsonb, tags
+			recording_state, source_family, capture_type, execution_class, capture_family, expected_fps, expected_image_interval_sec, execution_config_jsonb, tags
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		RETURNING id
-	`, provider, externalID, name, slug, fields.SourceURL, fields.SourcePageURL,
+	`, provider, externalID, name, slug, profile.SourceURL, profile.SourcePageURL,
 		nil, nil, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
 		strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource), metaBytes,
-		string(model.RecordingStateOff), fields.SourceFamily, fields.CaptureType, fields.ExecutionClass, cfgBytes, dedupeStrings(req.Tags),
+		string(model.RecordingStateOff), profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes, dedupeStrings(req.Tags),
 	).Scan(&id); err != nil {
 		return model.Stream{}, false, newAPIStatusError(http.StatusConflict, "create imported stream: %v", err)
 	}

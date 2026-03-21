@@ -4245,6 +4245,31 @@ function formatCaptureTypeLabel(captureType) {
   return key;
 }
 
+function formatCaptureFamilyLabel(captureFamily) {
+  const key = String(captureFamily || '').trim().toLowerCase();
+  if (key === 'continuous_video') return 'video';
+  if (key === 'snapshot_image') return 'image poll';
+  return '-';
+}
+
+function formatStreamCadenceLabel(stream) {
+  if (!stream || typeof stream !== 'object') return '';
+  const family = String(stream.capture_family || '').trim().toLowerCase();
+  if (family === 'continuous_video') {
+    const fps = Number(stream.expected_fps);
+    if (!Number.isFinite(fps) || fps <= 0) return '';
+    const text = Math.abs(fps - Math.round(fps)) < 0.001 ? String(Math.round(fps)) : fps.toFixed(1);
+    return `${text} fps`;
+  }
+  if (family === 'snapshot_image') {
+    const interval = Number(stream.expected_image_interval_sec);
+    if (!Number.isFinite(interval) || interval <= 0) return '';
+    if (interval % 60 === 0) return `${Math.round(interval / 60)} min/image`;
+    return `${Math.round(interval)} sec/image`;
+  }
+  return '';
+}
+
 function populateCaptureTypeOptions(selectEl, allLabel) {
   if (!(selectEl instanceof HTMLSelectElement)) return;
   const prev = normalizeCaptureTypeFilter(selectEl.value);
@@ -4689,6 +4714,8 @@ function renderStreamRows() {
       ? `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;"><button class="btn-sm" data-action="recording-disable" data-id="${s.id}">Turn Off</button></div>`
       : `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;"><button class="btn-sm" data-action="recording-enable" data-id="${s.id}">Turn On</button></div>`;
     const mode = String(s.capture_type || '-');
+    const captureFamily = formatCaptureFamilyLabel(s.capture_family);
+    const cadenceLabel = formatStreamCadenceLabel(s);
     const peopleMetric = peoplePerInferenceMetric(row);
 
     const tr = document.createElement('tr');
@@ -4719,7 +4746,7 @@ function renderStreamRows() {
         </div>
       </td>
       <td>${renderTagEditor(s, 'streams')}</td>
-      <td class="mono fs11">${esc(mode)}</td>
+      <td class="mono fs11"><div class="stack"><span>${esc(mode)}</span><span class="muted fs10">${esc(captureFamily)}${cadenceLabel ? ` · ${esc(cadenceLabel)}` : ''}</span></div></td>
     `;
     streamRowsEl.appendChild(tr);
   }
@@ -5853,6 +5880,8 @@ async function loadDetail(options = {}) {
     `<span class="tag tag-muted mono">${esc(s.slug)}</span>`,
     s.recording_state === 'on' ? `<span class="tag tag-ok">recording on</span>` : `<span class="tag tag-muted">recording off</span>`,
     s.capture_type ? `<span class="tag tag-muted">${esc(s.capture_type)}</span>` : '',
+    s.capture_family ? `<span class="tag tag-muted">${esc(formatCaptureFamilyLabel(s.capture_family))}</span>` : '',
+    formatStreamCadenceLabel(s) ? `<span class="tag tag-muted">${esc(formatStreamCadenceLabel(s))}</span>` : '',
     s.execution_class ? `<span class="tag tag-muted">${esc(s.execution_class)}</span>` : '',
   ].filter(Boolean).join('');
 

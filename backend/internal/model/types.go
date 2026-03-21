@@ -33,6 +33,9 @@ type Stream struct {
 	RecordingFailedAt      *time.Time     `json:"recording_failed_at,omitempty"`
 	CaptureType            string         `json:"capture_type"`
 	ExecutionClass         string         `json:"execution_class"`
+	CaptureFamily          string         `json:"capture_family"`
+	ExpectedFPS            *float64       `json:"expected_fps,omitempty"`
+	ExpectedImageInterval  *int           `json:"expected_image_interval_sec,omitempty"`
 	ExecutionConfigJSON    map[string]any `json:"execution_config_json"`
 	Tags                   []string       `json:"tags"`
 	CaptureRuntimeStatus   *string        `json:"capture_runtime_status,omitempty"`

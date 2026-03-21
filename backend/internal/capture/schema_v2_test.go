@@ -96,3 +96,55 @@ func TestDefaultExecutionClassForCaptureTypeUsesRelayForYouTube(t *testing.T) {
 		t.Fatalf("execution_class=%q want %q", got, ExecutionClassYouTubeRelay)
 	}
 }
+
+func TestDeriveCaptureProfileVideoDefaults(t *testing.T) {
+	profile, err := DeriveCaptureProfile(
+		"TOPIS",
+		"https://example.com/live/cam.m3u8",
+		"https://example.com/cam",
+		"",
+		"",
+		"",
+		map[string]any{},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("derive capture profile: %v", err)
+	}
+	if profile.CaptureFamily != CaptureFamilyContinuousVideo {
+		t.Fatalf("capture_family=%q want %q", profile.CaptureFamily, CaptureFamilyContinuousVideo)
+	}
+	if profile.ExpectedFPS == nil || *profile.ExpectedFPS != 1 {
+		t.Fatalf("expected_fps=%v want 1", profile.ExpectedFPS)
+	}
+	if profile.ExpectedImageIntervalSec != nil {
+		t.Fatalf("expected_image_interval_sec=%v want nil", profile.ExpectedImageIntervalSec)
+	}
+}
+
+func TestDeriveCaptureProfileSeattleImageDefaults(t *testing.T) {
+	profile, err := DeriveCaptureProfile(
+		"SDOT",
+		"https://www.seattle.gov/trafficcams/images/3_Stewart_NS.jpg",
+		"https://www.seattle.gov/trafficcams/lakecity_145th.htm",
+		"",
+		"",
+		"",
+		map[string]any{},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("derive capture profile: %v", err)
+	}
+	if profile.CaptureFamily != CaptureFamilySnapshotImage {
+		t.Fatalf("capture_family=%q want %q", profile.CaptureFamily, CaptureFamilySnapshotImage)
+	}
+	if profile.ExpectedFPS != nil {
+		t.Fatalf("expected_fps=%v want nil", profile.ExpectedFPS)
+	}
+	if profile.ExpectedImageIntervalSec == nil || *profile.ExpectedImageIntervalSec != 300 {
+		t.Fatalf("expected_image_interval_sec=%v want 300", profile.ExpectedImageIntervalSec)
+	}
+}

@@ -304,28 +304,30 @@ func normalizeSourceFamilyInput(raw string) (string, error) {
 }
 
 type streamCreateRequest struct {
-	Provider            string         `json:"provider"`
-	ExternalID          string         `json:"external_id"`
-	Name                string         `json:"name"`
-	Slug                string         `json:"slug"`
-	StreamURL           string         `json:"source_url"`
-	SourcePageURL       string         `json:"source_page_url"`
-	SourceFamily        string         `json:"source_family"`
-	Lat                 *float64       `json:"lat"`
-	Lon                 *float64       `json:"lon"`
-	LocationText        string         `json:"location_text"`
-	LocationCountry     string         `json:"location_country"`
-	LocationCountryCode string         `json:"location_country_code"`
-	LocationRegion      string         `json:"location_region"`
-	LocationCity        string         `json:"location_city"`
-	LocationLocality    string         `json:"location_locality"`
-	LocationSource      string         `json:"location_source"`
-	MetadataJSON        map[string]any `json:"metadata_json"`
-	RecordingState      string         `json:"recording_state"`
-	CaptureMode         string         `json:"capture_type"`
-	ExecutionClass      string         `json:"execution_class"`
-	CaptureConfigJSON   map[string]any `json:"execution_config_json"`
-	Tags                []string       `json:"tags"`
+	Provider                 string         `json:"provider"`
+	ExternalID               string         `json:"external_id"`
+	Name                     string         `json:"name"`
+	Slug                     string         `json:"slug"`
+	StreamURL                string         `json:"source_url"`
+	SourcePageURL            string         `json:"source_page_url"`
+	SourceFamily             string         `json:"source_family"`
+	Lat                      *float64       `json:"lat"`
+	Lon                      *float64       `json:"lon"`
+	LocationText             string         `json:"location_text"`
+	LocationCountry          string         `json:"location_country"`
+	LocationCountryCode      string         `json:"location_country_code"`
+	LocationRegion           string         `json:"location_region"`
+	LocationCity             string         `json:"location_city"`
+	LocationLocality         string         `json:"location_locality"`
+	LocationSource           string         `json:"location_source"`
+	MetadataJSON             map[string]any `json:"metadata_json"`
+	RecordingState           string         `json:"recording_state"`
+	CaptureMode              string         `json:"capture_type"`
+	ExecutionClass           string         `json:"execution_class"`
+	ExpectedFPS              *float64       `json:"expected_fps"`
+	ExpectedImageIntervalSec *int           `json:"expected_image_interval_sec"`
+	CaptureConfigJSON        map[string]any `json:"execution_config_json"`
+	Tags                     []string       `json:"tags"`
 }
 
 func (s *Server) handleStreamsCreate(w http.ResponseWriter, r *http.Request) {
@@ -346,26 +348,28 @@ func (s *Server) handleStreamsCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 type streamPatchRequest struct {
-	Name                *string         `json:"name"`
-	Slug                *string         `json:"slug"`
-	StreamURL           *string         `json:"source_url"`
-	SourcePageURL       *string         `json:"source_page_url"`
-	SourceFamily        *string         `json:"source_family"`
-	Lat                 *float64        `json:"lat"`
-	Lon                 *float64        `json:"lon"`
-	LocationText        *string         `json:"location_text"`
-	LocationCountry     *string         `json:"location_country"`
-	LocationCountryCode *string         `json:"location_country_code"`
-	LocationRegion      *string         `json:"location_region"`
-	LocationCity        *string         `json:"location_city"`
-	LocationLocality    *string         `json:"location_locality"`
-	LocationSource      *string         `json:"location_source"`
-	MetadataJSON        *map[string]any `json:"metadata_json"`
-	RecordingState      *string         `json:"recording_state"`
-	CaptureMode         *string         `json:"capture_type"`
-	ExecutionClass      *string         `json:"execution_class"`
-	CaptureConfigJSON   *map[string]any `json:"execution_config_json"`
-	Tags                *[]string       `json:"tags"`
+	Name                     *string         `json:"name"`
+	Slug                     *string         `json:"slug"`
+	StreamURL                *string         `json:"source_url"`
+	SourcePageURL            *string         `json:"source_page_url"`
+	SourceFamily             *string         `json:"source_family"`
+	Lat                      *float64        `json:"lat"`
+	Lon                      *float64        `json:"lon"`
+	LocationText             *string         `json:"location_text"`
+	LocationCountry          *string         `json:"location_country"`
+	LocationCountryCode      *string         `json:"location_country_code"`
+	LocationRegion           *string         `json:"location_region"`
+	LocationCity             *string         `json:"location_city"`
+	LocationLocality         *string         `json:"location_locality"`
+	LocationSource           *string         `json:"location_source"`
+	MetadataJSON             *map[string]any `json:"metadata_json"`
+	RecordingState           *string         `json:"recording_state"`
+	CaptureMode              *string         `json:"capture_type"`
+	ExecutionClass           *string         `json:"execution_class"`
+	ExpectedFPS              *float64        `json:"expected_fps"`
+	ExpectedImageIntervalSec *int            `json:"expected_image_interval_sec"`
+	CaptureConfigJSON        *map[string]any `json:"execution_config_json"`
+	Tags                     *[]string       `json:"tags"`
 }
 
 func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
@@ -446,8 +450,8 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		recordingStateChanged = targetRecordingState != current.RecordingState
 		add("recording_state", string(targetRecordingState))
 	}
-	canonicalInputsChanged := req.StreamURL != nil || req.SourcePageURL != nil || req.SourceFamily != nil || req.CaptureMode != nil || req.ExecutionClass != nil
-	if canonicalInputsChanged {
+	captureProfileChanged := req.StreamURL != nil || req.SourcePageURL != nil || req.SourceFamily != nil || req.CaptureMode != nil || req.ExecutionClass != nil || req.CaptureConfigJSON != nil || req.ExpectedFPS != nil || req.ExpectedImageIntervalSec != nil
+	if captureProfileChanged {
 		sourceURL := current.SourceURL
 		if req.StreamURL != nil {
 			sourceURL = strings.TrimSpace(*req.StreamURL)
@@ -468,20 +472,35 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		if req.ExecutionClass != nil {
 			executionClassRaw = strings.TrimSpace(*req.ExecutionClass)
 		}
-		fields, err := capture.DeriveCanonicalStreamFields(sourceURL, sourcePageURL, captureTypeRaw, sourceFamilyRaw, executionClassRaw)
+		executionConfig := current.ExecutionConfigJSON
+		if req.CaptureConfigJSON != nil {
+			executionConfig = nonNilMap(*req.CaptureConfigJSON)
+		}
+		expectedFPSOverride := current.ExpectedFPS
+		if req.ExpectedFPS != nil {
+			expectedFPSOverride = req.ExpectedFPS
+		}
+		expectedImageIntervalOverride := current.ExpectedImageInterval
+		if req.ExpectedImageIntervalSec != nil {
+			expectedImageIntervalOverride = req.ExpectedImageIntervalSec
+		}
+		profile, err := capture.DeriveCaptureProfile(current.Provider, sourceURL, sourcePageURL, captureTypeRaw, sourceFamilyRaw, executionClassRaw, executionConfig, expectedFPSOverride, expectedImageIntervalOverride)
 		if err != nil {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if req.StreamURL != nil {
-			add("source_url", fields.SourceURL)
+			add("source_url", profile.SourceURL)
 		}
 		if req.SourcePageURL != nil {
-			add("source_page_url", fields.SourcePageURL)
+			add("source_page_url", profile.SourcePageURL)
 		}
-		add("source_family", fields.SourceFamily)
-		add("capture_type", fields.CaptureType)
-		add("execution_class", fields.ExecutionClass)
+		add("source_family", profile.SourceFamily)
+		add("capture_type", profile.CaptureType)
+		add("execution_class", profile.ExecutionClass)
+		add("capture_family", profile.CaptureFamily)
+		add("expected_fps", profile.ExpectedFPS)
+		add("expected_image_interval_sec", profile.ExpectedImageIntervalSec)
 	}
 	if req.CaptureConfigJSON != nil {
 		b, err := json.Marshal(nonNilMap(*req.CaptureConfigJSON))
@@ -544,7 +563,7 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	shouldAutoAssignRecording := updated.RecordingState == model.RecordingStateOn &&
 		!existed &&
-		((recordingStateChanged && targetRecordingState == model.RecordingStateOn) || canonicalInputsChanged || req.RecordingState != nil)
+		((recordingStateChanged && targetRecordingState == model.RecordingStateOn) || captureProfileChanged || req.RecordingState != nil)
 	if shouldAutoAssignRecording {
 		result, status, err := s.assignRecordingStreamTx(r.Context(), tx, updated, "", "api.streams_patch", "recording enabled")
 		if err != nil {
@@ -604,6 +623,7 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 			SELECT
 				s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
 				s.source_family,
+				s.capture_family, s.expected_fps, s.expected_image_interval_sec,
 				s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
 				s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
 				s.created_at, s.updated_at,
@@ -650,6 +670,7 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 			if err := rows.Scan(
 				&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
 				&stream.SourceFamily,
+				&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
 				&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
 				&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
 				&stream.CreatedAt, &stream.UpdatedAt,
@@ -695,6 +716,7 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
 			s.source_family,
+			s.capture_family, s.expected_fps, s.expected_image_interval_sec,
 			s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
 			s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
 			s.created_at, s.updated_at
@@ -733,10 +755,12 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 }
 
 type streamCapturePatchRequest struct {
-	CaptureMode       string         `json:"capture_type"`
-	ExecutionClass    string         `json:"execution_class"`
-	SourceFamily      string         `json:"source_family"`
-	CaptureConfigJSON map[string]any `json:"execution_config_json"`
+	CaptureMode              string         `json:"capture_type"`
+	ExecutionClass           string         `json:"execution_class"`
+	SourceFamily             string         `json:"source_family"`
+	ExpectedFPS              *float64       `json:"expected_fps"`
+	ExpectedImageIntervalSec *int           `json:"expected_image_interval_sec"`
+	CaptureConfigJSON        map[string]any `json:"execution_config_json"`
 }
 
 func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Request) {
@@ -779,7 +803,7 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	fields, err := capture.DeriveCanonicalStreamFields(current.SourceURL, current.SourcePageURL, captureType, sourceFamily, executionClass)
+	profile, err := capture.DeriveCaptureProfile(current.Provider, current.SourceURL, current.SourcePageURL, captureType, sourceFamily, executionClass, nonNilMap(req.CaptureConfigJSON), req.ExpectedFPS, req.ExpectedImageIntervalSec)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -791,9 +815,9 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 	}
 	res, err := s.pool.Exec(r.Context(), `
 		UPDATE streams
-		SET source_family=$2, capture_type=$3, execution_class=$4, execution_config_jsonb=$5, updated_at=now()
+		SET source_family=$2, capture_type=$3, execution_class=$4, capture_family=$5, expected_fps=$6, expected_image_interval_sec=$7, execution_config_jsonb=$8, updated_at=now()
 		WHERE id=$1
-	`, id, fields.SourceFamily, fields.CaptureType, fields.ExecutionClass, cfgBytes)
+	`, id, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update stream capture: %v", err))
 		return
@@ -2108,6 +2132,7 @@ func (s *Server) handleCaptureStreams(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			id, provider, external_id, name, slug, source_url, source_page_url,
 			source_family,
+			capture_family, expected_fps, expected_image_interval_sec,
 			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
 			recording_state, recording_failed_reason, recording_failed_at, capture_type, execution_class, execution_config_jsonb, tags,
 			created_at, updated_at
@@ -3457,6 +3482,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			SELECT
 				s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
 				s.source_family,
+				s.capture_family, s.expected_fps, s.expected_image_interval_sec,
 				s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
 				s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
 				s.created_at, s.updated_at,
@@ -3499,6 +3525,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			if err := rows.Scan(
 				&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
 				&stream.SourceFamily,
+				&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
 				&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
 				&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
 				&stream.CreatedAt, &stream.UpdatedAt,
@@ -3656,6 +3683,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		SELECT
 			s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
 			s.source_family,
+			s.capture_family, s.expected_fps, s.expected_image_interval_sec,
 			s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
 			s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
 			s.created_at, s.updated_at,
@@ -3700,6 +3728,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			if err := rows.Scan(
 				&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
 				&stream.SourceFamily,
+				&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
 				&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
 				&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
 				&stream.CreatedAt, &stream.UpdatedAt,
@@ -7897,6 +7926,7 @@ func (s *Server) getStreamByID(ctx context.Context, id int64) (model.Stream, err
 		SELECT
 			id, provider, external_id, name, slug, source_url, source_page_url,
 			source_family,
+			capture_family, expected_fps, expected_image_interval_sec,
 			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
 			recording_state, recording_failed_reason, recording_failed_at, capture_type, execution_class, execution_config_jsonb, tags,
 			created_at, updated_at
@@ -7930,11 +7960,13 @@ func scanStream(rows pgx.Rows) (model.Stream, []byte, []byte, error) {
 	var recordingState string
 	var sourceURL string
 	var sourceFamily string
+	var captureFamily string
 	var captureType string
 	var executionClass string
 	if err := rows.Scan(
 		&s.ID, &s.Provider, &s.ExternalID, &s.Name, &s.Slug, &sourceURL, &s.SourcePageURL,
 		&sourceFamily,
+		&captureFamily, &s.ExpectedFPS, &s.ExpectedImageInterval,
 		&s.Lat, &s.Lon, &s.LocationText, &s.LocationCountry, &s.LocationCountryCode, &s.LocationRegion, &s.LocationCity, &s.LocationLocality, &s.LocationSource, &meta,
 		&recordingState, &s.RecordingFailedReason, &s.RecordingFailedAt, &captureType, &executionClass, &cfg, &s.Tags,
 		&s.CreatedAt, &s.UpdatedAt,
@@ -7943,6 +7975,7 @@ func scanStream(rows pgx.Rows) (model.Stream, []byte, []byte, error) {
 	}
 	s.SourceURL = sourceURL
 	s.SourceFamily = sourceFamily
+	s.CaptureFamily = captureFamily
 	s.CaptureType = captureType
 	s.ExecutionClass = executionClass
 	s.RecordingState = model.RecordingState(recordingState)

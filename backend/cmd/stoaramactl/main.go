@@ -5411,13 +5411,22 @@ func importLegacySQLite(ctx context.Context, pool *pgxpool.Pool, sqlitePath stri
 		if shortlistFlag != 0 {
 			recordingState = "on"
 		}
+		cfgJSON := map[string]any{"poll_interval_sec": defaultInterval}
+		cfgBytes, err := json.Marshal(cfgJSON)
+		if err != nil {
+			return inserted, updated, skipped, fmt.Errorf("marshal capture config: %w", err)
+		}
+		profile, err := capture.DeriveCaptureProfile(provider, streamURL, sourcePageURL, "", "", "", cfgJSON, nil, nil)
+		if err != nil {
+			return inserted, updated, skipped, fmt.Errorf("derive capture profile %s:%s: %w", provider, externalID, err)
+		}
 		ct, err := tx.Exec(ctx, `
 				INSERT INTO streams (
 					provider, external_id, name, slug, source_url, source_page_url,
 					lat, lon, location_text, metadata_jsonb,
-					recording_state, capture_type, execution_config_jsonb, tags
+					recording_state, source_family, capture_type, execution_class, capture_family, expected_fps, expected_image_interval_sec, execution_config_jsonb, tags
 				)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'auto',jsonb_build_object('poll_interval_sec', $12),ARRAY[]::text[])
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,ARRAY[]::text[])
 				ON CONFLICT (provider, external_id)
 				DO UPDATE SET
 					name=EXCLUDED.name,
@@ -5428,9 +5437,16 @@ func importLegacySQLite(ctx context.Context, pool *pgxpool.Pool, sqlitePath stri
 					lon=EXCLUDED.lon,
 					location_text=EXCLUDED.location_text,
 					metadata_jsonb=EXCLUDED.metadata_jsonb,
+					source_family=EXCLUDED.source_family,
+					capture_type=EXCLUDED.capture_type,
+					execution_class=EXCLUDED.execution_class,
+					capture_family=EXCLUDED.capture_family,
+					expected_fps=EXCLUDED.expected_fps,
+					expected_image_interval_sec=EXCLUDED.expected_image_interval_sec,
+					execution_config_jsonb=EXCLUDED.execution_config_jsonb,
 					recording_state=EXCLUDED.recording_state,
 					updated_at=now()
-			`, provider, externalID, name, slug, streamURL, sourcePageURL, latPtr, lonPtr, locationText, metaBytes, recordingState, defaultInterval)
+			`, provider, externalID, name, slug, profile.SourceURL, profile.SourcePageURL, latPtr, lonPtr, locationText, metaBytes, recordingState, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes)
 		if err != nil {
 			if strings.Contains(err.Error(), `duplicate key value violates unique constraint "streams_slug_key"`) {
 				skipped++
