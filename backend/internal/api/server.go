@@ -217,6 +217,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/source-candidates/{id}/runs", s.handleSourceCandidateRunCreate)
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
+			service.Post("/imports/streams/repair-image-capture", s.handleServiceStreamImageCaptureRepair)
 			service.Get("/recording/settings", s.handleServiceRecordingSettingsGet)
 			service.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
 			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
@@ -741,6 +742,15 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	current, err := s.getStreamByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "stream not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load stream: %v", err))
+		return
+	}
 	var req streamCapturePatchRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -767,6 +777,11 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	fields, err := capture.DeriveCanonicalStreamFields(current.SourceURL, current.SourcePageURL, captureType, sourceFamily, executionClass)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	cfgBytes, err := json.Marshal(nonNilMap(req.CaptureConfigJSON))
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid execution_config_json: %v", err))
@@ -776,7 +791,7 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 		UPDATE streams
 		SET source_family=$2, capture_type=$3, execution_class=$4, execution_config_jsonb=$5, updated_at=now()
 		WHERE id=$1
-	`, id, sourceFamily, captureType, executionClass, cfgBytes)
+	`, id, fields.SourceFamily, fields.CaptureType, fields.ExecutionClass, cfgBytes)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update stream capture: %v", err))
 		return

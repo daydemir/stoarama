@@ -95,7 +95,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Print(`stoaramactl commands:
+	_, _ = os.Stdout.WriteString(`stoaramactl commands:
 	  stoaramactl migrate up [--dir infra/sql/migrations]
 	  stoaramactl youtube-relay source run [--backend-api-url URL --api-token TOKEN --server-id ID --shard-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 30 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role source --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.2 --source-endpoint HOST:PORT --duration 0 --resolve-timeout-sec 30 --resolve-failure-threshold 3 --bind-addr :18080 --public-base-url URL --shared-token TOKEN --cache-file FILE --yt-dlp-cookies-file FILE|--yt-dlp-cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT]
 	  stoaramactl youtube-relay sink run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role sink --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.11 --relay-source-server-id ID --relay-source-public-base-url URL --duration 0]
@@ -121,6 +121,7 @@ func usage() {
 	  stoaramactl streams set-capture --id N --capture-type TYPE [--config-json JSON]
 	  stoaramactl streams migrate-v2 [--id N --limit 1000 --only-changed --only-review --apply --report-json out.json --json]
 	  stoaramactl streams repair-youtube [--id N --limit 1000 --only-changed --apply --report-json out.json --json]
+	  stoaramactl streams repair-image-capture [--id N --source-url-like %%pattern%% --provider P --limit 1000 --only-changed --apply --json]
 	  stoaramactl discovery candidates list [--id N --review-status pending|accepted|rejected|invalid --provider P --capture-type TYPE --limit 200 --offset 0]
 	  stoaramactl discovery candidates review --id N --status accepted|rejected|invalid [--reviewer TEXT --reason TEXT --metadata-json JSON]
 	  stoaramactl discovery candidates import --id N [--provider P --external-id E --name N --slug S --source-url URL --source-page-url URL --source-family FAMILY --capture-type TYPE --execution-class CLASS --execution-config-json JSON --tags a,b --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC --metadata-json JSON]
@@ -2342,7 +2343,7 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 }
 
 func printStreamsUsage() {
-	fmt.Print("stoaramactl streams <list|detail|filters|frames|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube> ...\n")
+	fmt.Print("stoaramactl streams <list|detail|filters|frames|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture> ...\n")
 }
 
 func printDiscoveryUsage() {
@@ -3232,6 +3233,8 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		runStreamsMigrateV2(ctx, cfg, args[1:])
 	case "repair-youtube":
 		runStreamsRepairYouTube(ctx, cfg, args[1:])
+	case "repair-image-capture":
+		runStreamsRepairImageCapture(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown streams subcommand: %s", sub)
 	}

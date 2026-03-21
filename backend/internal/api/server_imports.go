@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/model"
@@ -44,6 +45,38 @@ type serviceFrameImportRequest struct {
 	CapturedAt  string `json:"captured_at"`
 	SourceKind  string `json:"source_kind"`
 	SourceLabel string `json:"source_label"`
+}
+
+type serviceStreamImageCaptureRepairRequest struct {
+	StreamID        int64  `json:"stream_id"`
+	SourceURLLike   string `json:"source_url_like"`
+	Provider        string `json:"provider"`
+	Limit           int    `json:"limit"`
+	Apply           bool   `json:"apply"`
+	OnlyChanged     bool   `json:"only_changed"`
+	RecordingActor  string `json:"recording_actor"`
+	RecordingReason string `json:"recording_reason"`
+}
+
+type serviceStreamImageCaptureRepairItem struct {
+	ID                     int64      `json:"id"`
+	Provider               string     `json:"provider"`
+	Name                   string     `json:"name"`
+	Slug                   string     `json:"slug"`
+	SourceURL              string     `json:"source_url"`
+	SourcePageURL          string     `json:"source_page_url"`
+	RecordingState         string     `json:"recording_state"`
+	CurrentSourceFamily    string     `json:"current_source_family"`
+	CurrentCaptureType     string     `json:"current_capture_type"`
+	CurrentExecutionClass  string     `json:"current_execution_class"`
+	ProposedSourceFamily   string     `json:"proposed_source_family"`
+	ProposedCaptureType    string     `json:"proposed_capture_type"`
+	ProposedExecutionClass string     `json:"proposed_execution_class"`
+	WouldChange            bool       `json:"would_change"`
+	Applied                bool       `json:"applied,omitempty"`
+	PreviousServerID       *string    `json:"previous_server_id,omitempty"`
+	NewServerID            *string    `json:"new_server_id,omitempty"`
+	LastFrameAt            *time.Time `json:"last_frame_at,omitempty"`
 }
 
 func (s *Server) handleServiceStreamImport(w http.ResponseWriter, r *http.Request) {
@@ -159,6 +192,224 @@ func (s *Server) handleServiceFrameImport(w http.ResponseWriter, r *http.Request
 		"media_id":   mediaID,
 		"object_key": objectKey,
 	})
+}
+
+func (s *Server) handleServiceStreamImageCaptureRepair(w http.ResponseWriter, r *http.Request) {
+	var req serviceStreamImageCaptureRepairRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	if req.StreamID <= 0 && strings.TrimSpace(req.SourceURLLike) == "" && strings.TrimSpace(req.Provider) == "" {
+		util.WriteError(w, http.StatusBadRequest, "stream_id, source_url_like, or provider is required")
+		return
+	}
+	if req.Limit < 0 {
+		util.WriteError(w, http.StatusBadRequest, "limit must be >= 0")
+		return
+	}
+	items, err := s.loadStreamImageCaptureRepairItems(r.Context(), req)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load image capture repair items: %v", err))
+		return
+	}
+	selected := items
+	if req.OnlyChanged {
+		selected = make([]serviceStreamImageCaptureRepairItem, 0, len(items))
+		for _, item := range items {
+			if item.WouldChange {
+				selected = append(selected, item)
+			}
+		}
+	}
+	applied := 0
+	if req.Apply {
+		actor := strings.TrimSpace(req.RecordingActor)
+		if actor == "" {
+			actor = "service.stream_image_capture_repair"
+		}
+		reason := strings.TrimSpace(req.RecordingReason)
+		if reason == "" {
+			reason = "repair image capture classification"
+		}
+		for i := range selected {
+			if !selected[i].WouldChange {
+				continue
+			}
+			appliedItem, err := s.applyStreamImageCaptureRepair(r.Context(), selected[i], actor, reason)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("apply image capture repair stream %d: %v", selected[i].ID, err))
+				return
+			}
+			selected[i] = appliedItem
+			applied++
+		}
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"total":    len(items),
+		"selected": len(selected),
+		"changed":  countStreamImageRepairItems(items, func(it serviceStreamImageCaptureRepairItem) bool { return it.WouldChange }),
+		"applied":  applied,
+		"items":    selected,
+	})
+}
+
+func (s *Server) loadStreamImageCaptureRepairItems(ctx context.Context, req serviceStreamImageCaptureRepairRequest) ([]serviceStreamImageCaptureRepairItem, error) {
+	where := []string{"source_url <> ''"}
+	args := make([]any, 0, 4)
+	if req.StreamID > 0 {
+		args = append(args, req.StreamID)
+		where = append(where, fmt.Sprintf("id=$%d", len(args)))
+	}
+	if raw := strings.TrimSpace(req.SourceURLLike); raw != "" {
+		args = append(args, raw)
+		where = append(where, fmt.Sprintf("source_url ILIKE $%d", len(args)))
+	}
+	if raw := strings.TrimSpace(req.Provider); raw != "" {
+		args = append(args, raw)
+		where = append(where, fmt.Sprintf("LOWER(provider)=LOWER($%d)", len(args)))
+	}
+	query := fmt.Sprintf(`
+		SELECT id, provider, name, slug, source_url, source_page_url, recording_state, source_family, capture_type, execution_class
+		FROM streams
+		WHERE %s
+		ORDER BY id ASC
+	`, strings.Join(where, " AND "))
+	if req.Limit > 0 {
+		args = append(args, req.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]serviceStreamImageCaptureRepairItem, 0, 128)
+	for rows.Next() {
+		var item serviceStreamImageCaptureRepairItem
+		if err := rows.Scan(
+			&item.ID,
+			&item.Provider,
+			&item.Name,
+			&item.Slug,
+			&item.SourceURL,
+			&item.SourcePageURL,
+			&item.RecordingState,
+			&item.CurrentSourceFamily,
+			&item.CurrentCaptureType,
+			&item.CurrentExecutionClass,
+		); err != nil {
+			return nil, err
+		}
+		proposed, err := capture.DeriveCanonicalStreamFields(item.SourceURL, item.SourcePageURL, "", "", "")
+		if err != nil || proposed.CaptureType != capture.CaptureTypeStillImage {
+			continue
+		}
+		item.CurrentSourceFamily = strings.TrimSpace(item.CurrentSourceFamily)
+		item.CurrentCaptureType = strings.TrimSpace(item.CurrentCaptureType)
+		item.CurrentExecutionClass = strings.TrimSpace(item.CurrentExecutionClass)
+		item.ProposedSourceFamily = proposed.SourceFamily
+		item.ProposedCaptureType = proposed.CaptureType
+		item.ProposedExecutionClass = proposed.ExecutionClass
+		item.WouldChange = item.CurrentSourceFamily != item.ProposedSourceFamily ||
+			item.CurrentCaptureType != item.ProposedCaptureType ||
+			item.CurrentExecutionClass != item.ProposedExecutionClass
+		items = append(items, item)
+	}
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
+	return items, nil
+}
+
+func (s *Server) applyStreamImageCaptureRepair(ctx context.Context, item serviceStreamImageCaptureRepairItem, actor string, reason string) (serviceStreamImageCaptureRepairItem, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return item, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE streams
+		SET source_family=$2, capture_type=$3, execution_class=$4, updated_at=now()
+		WHERE id=$1
+	`, item.ID, item.ProposedSourceFamily, item.ProposedCaptureType, item.ProposedExecutionClass); err != nil {
+		return item, err
+	}
+	updated, err := s.loadStreamForAssignmentTx(ctx, tx, item.ID)
+	if err != nil {
+		return item, err
+	}
+	assignment, existed, err := loadRecordingAssignmentTx(ctx, tx, item.ID)
+	if err != nil {
+		return item, err
+	}
+	if existed {
+		item.PreviousServerID = &assignment.ServerID
+		issues := buildRecordingAssignmentAuditIssues(updated, assignment, nil)
+		if len(issues) > 0 {
+			if _, _, err := s.unassignRecordingStreamTx(ctx, tx, item.ID, actor, reason); err != nil {
+				return item, err
+			}
+			existed = false
+		}
+	}
+	if updated.RecordingState == model.RecordingStateOn && !existed {
+		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", actor, reason)
+		if err != nil {
+			return item, err
+		}
+		if status != 0 {
+			return item, fmt.Errorf("assign repaired stream: %v", result["error"])
+		}
+		if serverID := strings.TrimSpace(fmt.Sprint(result["server_id"])); serverID != "" {
+			item.NewServerID = &serverID
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return item, err
+	}
+	stream, err := s.getStreamByID(ctx, item.ID)
+	if err == nil {
+		item.CurrentSourceFamily = stream.SourceFamily
+		item.CurrentCaptureType = stream.CaptureType
+		item.CurrentExecutionClass = stream.ExecutionClass
+	}
+	var serverID string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(server_id, '')
+		FROM recording_assignments
+		WHERE stream_id=$1
+	`, item.ID).Scan(&serverID); err == nil && strings.TrimSpace(serverID) != "" {
+		serverID = strings.TrimSpace(serverID)
+		item.NewServerID = &serverID
+	}
+	var lastFrame pgtype.Timestamptz
+	if err := s.pool.QueryRow(ctx, `
+		SELECT last_frame_at
+		FROM stream_capture_runtime
+		WHERE stream_id=$1
+	`, item.ID).Scan(&lastFrame); err != nil && err != pgx.ErrNoRows {
+		return item, err
+	}
+	if lastFrame.Valid {
+		ts := lastFrame.Time.UTC()
+		item.LastFrameAt = &ts
+	}
+	item.Applied = true
+	return item, nil
+}
+
+func countStreamImageRepairItems(items []serviceStreamImageCaptureRepairItem, keep func(serviceStreamImageCaptureRepairItem) bool) int {
+	count := 0
+	for _, item := range items {
+		if keep(item) {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRequest) (model.Stream, bool, error) {
