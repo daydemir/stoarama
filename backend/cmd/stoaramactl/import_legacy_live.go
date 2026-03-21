@@ -70,6 +70,8 @@ type legacyImportReport struct {
 	Limit                int                  `json:"limit"`
 	PageSize             int                  `json:"page_size"`
 	Concurrency          int                  `json:"concurrency"`
+	SortBy               string               `json:"sort_by,omitempty"`
+	SortDir              string               `json:"sort_dir,omitempty"`
 	ProbeTimeout         string               `json:"probe_timeout"`
 	Apply                bool                 `json:"apply"`
 	CheckpointJSONL      string               `json:"checkpoint_jsonl,omitempty"`
@@ -97,6 +99,8 @@ type legacyImportRunState struct {
 	Limit                int                 `json:"limit"`
 	PageSize             int                 `json:"page_size"`
 	Concurrency          int                 `json:"concurrency"`
+	SortBy               string              `json:"sort_by,omitempty"`
+	SortDir              string              `json:"sort_dir,omitempty"`
 	ProbeTimeout         string              `json:"probe_timeout"`
 	Apply                bool                `json:"apply"`
 	ImportLatestFrame    bool                `json:"import_latest_frame"`
@@ -136,7 +140,7 @@ func runImport(ctx context.Context, cfg config.Config, args []string) {
 }
 
 func printImportUsage() {
-	fmt.Print("stoaramactl import legacy-live-streams [--legacy-api-url URL --legacy-api-token TOKEN --target-api-url URL --service-token TOKEN --offset N --limit 200 --page-size 50 --concurrency 4 --probe-timeout-sec 45 --legacy-recording-state off|on --legacy-provider P --apply --import-latest-frame --checkpoint-jsonl file --resume=true --report-json out.json --json]\n")
+	fmt.Print("stoaramactl import legacy-live-streams [--legacy-api-url URL --legacy-api-token TOKEN --target-api-url URL --service-token TOKEN --offset N --limit 200 --page-size 50 --concurrency 4 --sort-by avg_people_per_inferenced_capture --sort-dir desc --probe-timeout-sec 45 --legacy-recording-state off|on --legacy-provider P --apply --import-latest-frame --checkpoint-jsonl file --resume=true --report-json out.json --json]\n")
 }
 
 func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []string) {
@@ -149,6 +153,8 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	limit := fs.Int("limit", 200, "maximum legacy streams to process")
 	pageSize := fs.Int("page-size", 50, "legacy API page size")
 	concurrency := fs.Int("concurrency", 4, "probe/import worker concurrency")
+	sortBy := fs.String("sort-by", "avg_people_per_inferenced_capture", "legacy dashboard sort field")
+	sortDir := fs.String("sort-dir", "desc", "legacy dashboard sort direction asc|desc")
 	probeTimeoutSec := fs.Int("probe-timeout-sec", 45, "per-stream probe timeout seconds")
 	legacyRecordingState := fs.String("legacy-recording-state", "", "optional legacy recording state filter off|on")
 	legacyProvider := fs.String("legacy-provider", "", "optional legacy provider filter")
@@ -185,6 +191,10 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	}
 	if *concurrency <= 0 {
 		log.Fatalf("--concurrency must be > 0")
+	}
+	normalizedSortDir := strings.TrimSpace(strings.ToLower(*sortDir))
+	if normalizedSortDir != "asc" && normalizedSortDir != "desc" {
+		log.Fatalf("--sort-dir must be asc or desc")
 	}
 	if *probeTimeoutSec <= 0 {
 		log.Fatalf("--probe-timeout-sec must be > 0")
@@ -225,6 +235,8 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 		Limit:               *limit,
 		PageSize:            *pageSize,
 		Concurrency:         *concurrency,
+		SortBy:              strings.TrimSpace(*sortBy),
+		SortDir:             normalizedSortDir,
 		ProbeTimeout:        (time.Duration(*probeTimeoutSec) * time.Second).String(),
 		Apply:               *apply,
 		ImportLatestFrame:   *importLatestFrame,
@@ -241,7 +253,7 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 		}
 	}
 
-	items, total, err := fetchLegacyStreams(ctx, strings.TrimSpace(*legacyAPIURL), strings.TrimSpace(*legacyAPIToken), effectiveOffset, *limit, *pageSize, strings.TrimSpace(*legacyRecordingState), strings.TrimSpace(*legacyProvider), *importLatestFrame, seen)
+	items, total, err := fetchLegacyStreams(ctx, strings.TrimSpace(*legacyAPIURL), strings.TrimSpace(*legacyAPIToken), effectiveOffset, *limit, *pageSize, strings.TrimSpace(*legacyRecordingState), strings.TrimSpace(*legacyProvider), strings.TrimSpace(*sortBy), normalizedSortDir, *importLatestFrame, seen)
 	if err != nil {
 		state.Status = "failed"
 		state.LastError = err.Error()
@@ -303,6 +315,8 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 		Limit:             *limit,
 		PageSize:          *pageSize,
 		Concurrency:       *concurrency,
+		SortBy:            strings.TrimSpace(*sortBy),
+		SortDir:           normalizedSortDir,
 		ProbeTimeout:      (time.Duration(*probeTimeoutSec) * time.Second).String(),
 		Apply:             *apply,
 		CheckpointJSONL:   strings.TrimSpace(*checkpointJSONL),
@@ -375,7 +389,7 @@ func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []s
 	}
 }
 
-func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limit, pageSize int, recordingState, provider string, includeImageURLs bool, seen map[int64]legacyImportResult) ([]legacyDashboardItem, int64, error) {
+func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limit, pageSize int, recordingState, provider, sortBy, sortDir string, includeImageURLs bool, seen map[int64]legacyImportResult) ([]legacyDashboardItem, int64, error) {
 	items := make([]legacyDashboardItem, 0, limit)
 	scanOffset := offset
 	var total int64
@@ -397,6 +411,12 @@ func fetchLegacyStreams(ctx context.Context, baseURL, token string, offset, limi
 		}
 		if strings.TrimSpace(provider) != "" {
 			q.Set("provider", strings.TrimSpace(provider))
+		}
+		if strings.TrimSpace(sortBy) != "" {
+			q.Set("sort_by", strings.TrimSpace(sortBy))
+		}
+		if strings.TrimSpace(sortDir) != "" {
+			q.Set("sort_dir", strings.TrimSpace(sortDir))
 		}
 		var page legacyDashboardPage
 		if err := getJSONWithToken(ctx, baseURL, token, "/api/v1/dashboard/streams?"+q.Encode(), &page); err != nil {
