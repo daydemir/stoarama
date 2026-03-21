@@ -218,6 +218,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
 			service.Post("/imports/streams/repair-image-capture", s.handleServiceStreamImageCaptureRepair)
+			service.Post("/imports/streams/recording-state", s.handleServiceStreamRecordingState)
 			service.Get("/recording/settings", s.handleServiceRecordingSettingsGet)
 			service.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
 			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)

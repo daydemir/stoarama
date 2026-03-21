@@ -79,6 +79,13 @@ type serviceStreamImageCaptureRepairItem struct {
 	LastFrameAt            *time.Time `json:"last_frame_at,omitempty"`
 }
 
+type serviceStreamRecordingStateRequest struct {
+	StreamID        int64  `json:"stream_id"`
+	RecordingState  string `json:"recording_state"`
+	RecordingActor  string `json:"recording_actor"`
+	RecordingReason string `json:"recording_reason"`
+}
+
 func (s *Server) handleServiceStreamImport(w http.ResponseWriter, r *http.Request) {
 	var req serviceStreamImportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -252,6 +259,102 @@ func (s *Server) handleServiceStreamImageCaptureRepair(w http.ResponseWriter, r 
 		"changed":  countStreamImageRepairItems(items, func(it serviceStreamImageCaptureRepairItem) bool { return it.WouldChange }),
 		"applied":  applied,
 		"items":    selected,
+	})
+}
+
+func (s *Server) handleServiceStreamRecordingState(w http.ResponseWriter, r *http.Request) {
+	var req serviceStreamRecordingStateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	if req.StreamID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "stream_id is required")
+		return
+	}
+	state, ok := parseRecordingState(strings.TrimSpace(req.RecordingState))
+	if !ok {
+		util.WriteError(w, http.StatusBadRequest, "invalid recording_state; expected off|on")
+		return
+	}
+	actor := strings.TrimSpace(req.RecordingActor)
+	if actor == "" {
+		actor = "service.stream_recording_state"
+	}
+	reason := strings.TrimSpace(req.RecordingReason)
+	if reason == "" {
+		reason = "service recording state update"
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	stream, err := s.loadStreamForAssignmentTx(r.Context(), tx, req.StreamID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			util.WriteError(w, http.StatusNotFound, "stream not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load stream: %v", err))
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE streams
+		SET recording_state=$2, updated_at=now()
+		WHERE id=$1
+	`, req.StreamID, string(state)); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update stream recording_state: %v", err))
+		return
+	}
+	assignment, existed, err := loadRecordingAssignmentTx(r.Context(), tx, req.StreamID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load assignment: %v", err))
+		return
+	}
+	var serverID string
+	switch state {
+	case model.RecordingStateOff:
+		if existed {
+			serverID = assignment.ServerID
+			if _, _, err := s.unassignRecordingStreamTx(r.Context(), tx, req.StreamID, actor, reason); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("unassign stream: %v", err))
+				return
+			}
+		}
+	case model.RecordingStateOn:
+		stream.RecordingState = model.RecordingStateOn
+		if !existed {
+			result, status, err := s.assignRecordingStreamTx(r.Context(), tx, stream, "", actor, reason)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if status > 0 {
+				util.WriteJSON(w, status, result)
+				return
+			}
+			serverID = strings.TrimSpace(fmt.Sprint(result["server_id"]))
+		} else {
+			serverID = assignment.ServerID
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit stream recording_state: %v", err))
+		return
+	}
+	updated, err := s.getStreamByID(r.Context(), req.StreamID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reload stream: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"stream":          updated,
+		"recording_state": string(state),
+		"server_id":       strings.TrimSpace(serverID),
 	})
 }
 
