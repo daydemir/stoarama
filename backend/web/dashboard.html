@@ -3900,8 +3900,13 @@ function summarizeExecutionClasses(items) {
 function summarizeServerConnections(server) {
   const out = [];
   const seen = new Set();
+  const roleLabels = new Set();
   const addMeta = (meta) => {
     if (!meta || typeof meta !== 'object') return;
+    const serviceRole = String(meta.role || '').trim();
+    if (serviceRole) {
+      roleLabels.add(serviceRole);
+    }
     const transport = String(meta.network_transport || '').trim();
     const topology = String(meta.topology_id || meta.hub_server_id || '').trim();
     const role = String(meta.topology_role || '').trim();
@@ -3945,6 +3950,14 @@ function summarizeServerConnections(server) {
   for (const worker of workers) {
     const meta = worker && typeof worker === 'object' ? worker.metadata_json : null;
     addMeta(meta);
+  }
+
+  if (roleLabels.size) {
+    const labels = Array.from(roleLabels).sort().map((role) => {
+      const text = role === 'capture_catalog_sweeper' ? 'catalog recorder' : role.replaceAll('_', ' ');
+      return `<span class="tag tag-warn mono">${esc(text)}</span>`;
+    }).join(' ');
+    out.unshift(`<div class="mono fs10">${labels}</div>`);
   }
 
   if (!out.length) return '<span class="muted fs11">-</span>';
