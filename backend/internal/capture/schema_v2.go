@@ -28,6 +28,9 @@ const (
 	ExecutionClassYouTubeRelay  = "youtube_relay"
 	ExecutionClassVideoLive     = "video_live"
 	ExecutionClassImagePoll     = "image_poll"
+
+	CaptureFamilyContinuousVideo = "continuous_video"
+	CaptureFamilySnapshotImage   = "snapshot_image"
 )
 
 type CanonicalStreamFields struct {
@@ -36,6 +39,13 @@ type CanonicalStreamFields struct {
 	SourceFamily   string
 	CaptureType    string
 	ExecutionClass string
+}
+
+type CaptureProfile struct {
+	CanonicalStreamFields
+	CaptureFamily            string
+	ExpectedFPS              *float64
+	ExpectedImageIntervalSec *int
 }
 
 func NormalizeCaptureType(raw string) (string, bool) {
@@ -76,6 +86,16 @@ func NormalizeSourceFamily(raw string) (string, bool) {
 	v := strings.TrimSpace(strings.ToLower(raw))
 	switch v {
 	case SourceFamilyWatchPage, SourceFamilyVideoManifest, SourceFamilyVideoStream, SourceFamilyStillImage, SourceFamilyProviderAPI, SourceFamilyEmbedPage:
+		return v, true
+	default:
+		return "", false
+	}
+}
+
+func NormalizeCaptureFamily(raw string) (string, bool) {
+	v := strings.TrimSpace(strings.ToLower(raw))
+	switch v {
+	case CaptureFamilyContinuousVideo, CaptureFamilySnapshotImage:
 		return v, true
 	default:
 		return "", false
@@ -127,6 +147,23 @@ func DeriveCanonicalStreamFields(sourceURL string, sourcePageURL string, capture
 	return fields, nil
 }
 
+func DeriveCaptureProfile(provider string, sourceURL string, sourcePageURL string, captureTypeRaw string, sourceFamilyRaw string, executionClassRaw string, executionConfig map[string]any, explicitExpectedFPS *float64, explicitExpectedImageIntervalSec *int) (CaptureProfile, error) {
+	fields, err := DeriveCanonicalStreamFields(sourceURL, sourcePageURL, captureTypeRaw, sourceFamilyRaw, executionClassRaw)
+	if err != nil {
+		return CaptureProfile{}, err
+	}
+	family, expectedFPS, expectedImageIntervalSec, err := deriveCaptureCadence(provider, fields.SourceURL, fields.SourcePageURL, fields.CaptureType, executionConfig, explicitExpectedFPS, explicitExpectedImageIntervalSec)
+	if err != nil {
+		return CaptureProfile{}, err
+	}
+	return CaptureProfile{
+		CanonicalStreamFields:    fields,
+		CaptureFamily:            family,
+		ExpectedFPS:              expectedFPS,
+		ExpectedImageIntervalSec: expectedImageIntervalSec,
+	}, nil
+}
+
 func DefaultSourceFamilyForCaptureType(captureType string) string {
 	ct, ok := NormalizeCaptureType(captureType)
 	if !ok {
@@ -162,6 +199,19 @@ func DefaultExecutionClassForCaptureType(captureType string) string {
 		return ExecutionClassVideoLive
 	default:
 		return ""
+	}
+}
+
+func CaptureFamilyForCaptureType(captureType string) string {
+	ct, ok := NormalizeCaptureType(captureType)
+	if !ok {
+		return ""
+	}
+	switch ct {
+	case CaptureTypeStillImage:
+		return CaptureFamilySnapshotImage
+	default:
+		return CaptureFamilyContinuousVideo
 	}
 }
 
@@ -242,6 +292,91 @@ func InferCaptureType(provider string, sourceURL string, sourcePageURL string) (
 		}
 	}
 	return "", ""
+}
+
+func deriveCaptureCadence(provider string, sourceURL string, sourcePageURL string, captureType string, executionConfig map[string]any, explicitExpectedFPS *float64, explicitExpectedImageIntervalSec *int) (string, *float64, *int, error) {
+	family := CaptureFamilyForCaptureType(captureType)
+	if family == "" {
+		return "", nil, nil, fmt.Errorf("invalid capture family for capture_type %q", captureType)
+	}
+	switch family {
+	case CaptureFamilyContinuousVideo:
+		if explicitExpectedImageIntervalSec != nil {
+			return "", nil, nil, fmt.Errorf("expected_image_interval_sec is only valid for snapshot_image streams")
+		}
+		expectedFPS := clonePositiveFloat64(explicitExpectedFPS)
+		if expectedFPS == nil {
+			if configured := GetConfigInt(executionConfig, "expected_fps", 0); configured > 0 {
+				value := float64(configured)
+				expectedFPS = &value
+			}
+		}
+		if expectedFPS == nil {
+			value := float64(GetConfigInt(executionConfig, "target_fps", 1))
+			if value <= 0 {
+				value = 1
+			}
+			expectedFPS = &value
+		}
+		return family, expectedFPS, nil, nil
+	case CaptureFamilySnapshotImage:
+		if explicitExpectedFPS != nil {
+			return "", nil, nil, fmt.Errorf("expected_fps is only valid for continuous_video streams")
+		}
+		expectedImageIntervalSec := clonePositiveInt(explicitExpectedImageIntervalSec)
+		if expectedImageIntervalSec == nil {
+			if configured := GetConfigInt(executionConfig, "expected_image_interval_sec", 0); configured > 0 {
+				expectedImageIntervalSec = &configured
+			}
+		}
+		if expectedImageIntervalSec == nil {
+			if providerLooksLikeSeattleTraffic(provider, sourceURL, sourcePageURL) {
+				value := 300
+				expectedImageIntervalSec = &value
+			} else if configured := GetConfigInt(executionConfig, "poll_interval_sec", 0); configured > 1 {
+				expectedImageIntervalSec = &configured
+			} else {
+				value := 60
+				expectedImageIntervalSec = &value
+			}
+		}
+		return family, nil, expectedImageIntervalSec, nil
+	default:
+		return "", nil, nil, fmt.Errorf("unsupported capture family %q", family)
+	}
+}
+
+func providerLooksLikeSeattleTraffic(provider string, sourceURL string, sourcePageURL string) bool {
+	p := strings.TrimSpace(strings.ToLower(provider))
+	if p == "sdot" {
+		return true
+	}
+	for _, raw := range []string{sourceURL, sourcePageURL} {
+		value := strings.TrimSpace(strings.ToLower(raw))
+		if value == "" {
+			continue
+		}
+		if strings.Contains(value, "seattle.gov/trafficcams/images/") || strings.Contains(value, "seattle.gov/trafficcams/") {
+			return true
+		}
+	}
+	return false
+}
+
+func clonePositiveFloat64(value *float64) *float64 {
+	if value == nil || *value <= 0 {
+		return nil
+	}
+	out := *value
+	return &out
+}
+
+func clonePositiveInt(value *int) *int {
+	if value == nil || *value <= 0 {
+		return nil
+	}
+	out := *value
+	return &out
 }
 
 func ResolvedCaptureTypeFromURL(raw string) string {

@@ -100,7 +100,17 @@ func (s *Server) createStreamRecord(ctx context.Context, req streamCreateRequest
 	if requestedRecordingState != "" && requestedRecordingState != string(model.RecordingStateOff) {
 		return nil, newAPIStatusError(http.StatusBadRequest, "create stream with recording_state=off; then set recording_state=on and assign it when you are ready to record")
 	}
-	fields, err := capture.DeriveCanonicalStreamFields(req.StreamURL, req.SourcePageURL, req.CaptureMode, req.SourceFamily, req.ExecutionClass)
+	profile, err := capture.DeriveCaptureProfile(
+		req.Provider,
+		req.StreamURL,
+		req.SourcePageURL,
+		req.CaptureMode,
+		req.SourceFamily,
+		req.ExecutionClass,
+		nonNilMap(req.CaptureConfigJSON),
+		req.ExpectedFPS,
+		req.ExpectedImageIntervalSec,
+	)
 	if err != nil {
 		return nil, newAPIStatusError(http.StatusBadRequest, "%s", err.Error())
 	}
@@ -117,15 +127,15 @@ func (s *Server) createStreamRecord(ctx context.Context, req streamCreateRequest
 		INSERT INTO streams (
 			provider, external_id, name, slug, source_url, source_page_url,
 			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
-			recording_state, source_family, capture_type, execution_class, execution_config_jsonb, tags
+			recording_state, source_family, capture_type, execution_class, capture_family, expected_fps, expected_image_interval_sec, execution_config_jsonb, tags
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		RETURNING id
 	`, strings.TrimSpace(req.Provider), strings.TrimSpace(req.ExternalID), strings.TrimSpace(req.Name), slug,
-		fields.SourceURL, fields.SourcePageURL,
+		profile.SourceURL, profile.SourcePageURL,
 		req.Lat, req.Lon, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
 		strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource), metaBytes,
-		string(model.RecordingStateOff), fields.SourceFamily, fields.CaptureType, fields.ExecutionClass, captureCfgBytes, dedupeStrings(req.Tags),
+		string(model.RecordingStateOff), profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, captureCfgBytes, dedupeStrings(req.Tags),
 	).Scan(&id)
 	if err != nil {
 		return nil, newAPIStatusError(http.StatusConflict, "create stream: %v", err)
