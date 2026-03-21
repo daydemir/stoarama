@@ -203,6 +203,10 @@
     }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+    tr.server-focus td {
+      background: color-mix(in srgb, var(--accent) 10%, transparent);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+    }
     .tbl-wrap {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -1560,19 +1564,19 @@
     <!-- Latest images -->
     <div class="detail-images">
       <div class="image-card">
-        <div class="image-card-label">Latest raw capture</div>
+        <div class="image-card-label">Latest frame</div>
         <div id="latestRawCard"><span class="muted fs11">No image</span></div>
       </div>
       <div class="detail-summary-card">
-        <div class="detail-summary-title">Recording Now</div>
+        <div class="detail-summary-title">Recording</div>
         <div id="detailRecordingHero"><span class="muted fs11">Loading recording status...</span></div>
       </div>
     </div>
 
     <div class="detail-section-card" style="margin-top:10px;">
       <div class="detail-section-head">
-        <div class="detail-section-title">Current Recording Path</div>
-        <div class="detail-section-subtitle">Which server is recording this stream right now and whether the active path is healthy.</div>
+        <div class="detail-section-title">Recording Route</div>
+        <div class="detail-section-subtitle">Where Stoarama is recording this stream right now.</div>
       </div>
       <div class="toolbar" style="margin-top:0;">
         <button id="detailWorkloadReload" class="btn-sm">Reload recording</button>
@@ -1705,6 +1709,39 @@
 
     <!-- Frames section -->
     <div id="detailFramesSection" style="display:none;">
+      <div class="detail-section-head">
+        <div class="detail-section-title">Latest 60 Frames</div>
+        <div class="detail-section-subtitle">Auto-refreshes every second while this page is open.</div>
+      </div>
+      <div id="detailLiveFramesStatus" class="coverage-summary">Loading recent frames...</div>
+      <div id="detailLiveFramesGrid" class="detail-live-grid"></div>
+      <div class="detail-section-head" style="margin-top:12px;">
+        <div class="detail-section-title">Export Frames</div>
+        <div class="detail-section-subtitle">Download a manifest for any time window, or prepare a bounded ZIP archive.</div>
+      </div>
+      <div class="toolbar">
+        <button id="detailExportPreset1h" type="button">Last 1h</button>
+        <button id="detailExportPreset24h" type="button">Last 24h</button>
+        <button id="detailExportPreset7d" type="button">Last 7d</button>
+        <div class="toolbar-sep"></div>
+        <label class="check-label fs11" style="color:var(--muted);">From</label>
+        <input id="detailExportFrom" type="datetime-local" />
+        <label class="check-label fs11" style="color:var(--muted);">To</label>
+        <input id="detailExportTo" type="datetime-local" />
+        <select id="detailExportStatusFilter" style="min-width:150px;">
+          <option value="success" selected>success only</option>
+          <option value="all">all frame rows</option>
+          <option value="error">error rows only</option>
+        </select>
+        <button id="detailExportManifest" type="button">Download Manifest</button>
+        <button id="detailExportZip" class="primary" type="button">Prepare ZIP</button>
+        <span class="status-text" id="detailExportStatus"></span>
+      </div>
+      <div id="detailExportResult" class="coverage-summary">ZIP export currently supports up to 5000 frames or 2 GiB per request.</div>
+      <div class="detail-section-head" style="margin-top:12px;">
+        <div class="detail-section-title">Raw Capture Rows</div>
+        <div class="detail-section-subtitle">Recent persisted frame rows with status, preview, and object key.</div>
+      </div>
       <div class="toolbar">
         <select id="framesStatusFilter">
           <option value="">all status</option>
@@ -1737,37 +1774,8 @@
       <div class="coverage-panel">
         <div class="detail-section-head">
           <div class="detail-section-title">Recording</div>
-          <div class="detail-section-subtitle">Live proof that frames are still arriving, plus recent and historical capture health.</div>
+          <div class="detail-section-subtitle">Historical coverage, day-level heatmap, and stratified capture samples.</div>
         </div>
-        <div class="detail-section-head" style="margin-top:8px;">
-          <div class="detail-section-title">Latest 60 Frames</div>
-          <div class="detail-section-subtitle">Auto-refreshes every second while this page is open.</div>
-        </div>
-        <div id="detailLiveFramesStatus" class="coverage-summary">Loading recent frames...</div>
-        <div id="detailLiveFramesGrid" class="detail-live-grid"></div>
-        <div class="detail-section-head" style="margin-top:12px;">
-          <div class="detail-section-title">Export Frames</div>
-          <div class="detail-section-subtitle">Download a manifest for any time window, or prepare a bounded ZIP archive.</div>
-        </div>
-        <div class="toolbar">
-          <button id="detailExportPreset1h" type="button">Last 1h</button>
-          <button id="detailExportPreset24h" type="button">Last 24h</button>
-          <button id="detailExportPreset7d" type="button">Last 7d</button>
-          <div class="toolbar-sep"></div>
-          <label class="check-label fs11" style="color:var(--muted);">From</label>
-          <input id="detailExportFrom" type="datetime-local" />
-          <label class="check-label fs11" style="color:var(--muted);">To</label>
-          <input id="detailExportTo" type="datetime-local" />
-          <select id="detailExportStatusFilter" style="min-width:150px;">
-            <option value="success" selected>success only</option>
-            <option value="all">all frame rows</option>
-            <option value="error">error rows only</option>
-          </select>
-          <button id="detailExportManifest" type="button">Download Manifest</button>
-          <button id="detailExportZip" class="primary" type="button">Prepare ZIP</button>
-          <span class="status-text" id="detailExportStatus"></span>
-        </div>
-        <div id="detailExportResult" class="coverage-summary">ZIP export currently supports up to 5000 frames or 2 GiB per request.</div>
         <div class="detail-section-head" style="margin-top:12px;">
           <div class="detail-section-title">Historical Coverage</div>
           <div class="detail-section-subtitle">Day-level UTC view: each square is one day colored by recorded hours.</div>
@@ -2142,6 +2150,7 @@ let mainTab = 'overview';      // 'overview' | 'streams' | 'discovery' | 'record
 let inferenceScope = 'recorded';
 let detailStreamID = null;
 let detailView = 'coverage';
+let selectedServerID = '';
 let detailData = null;
 let detailRecordingData = null;
 let detailRecentFramesData = [];
@@ -2205,6 +2214,18 @@ if (coverageSampleCount) coverageSampleCount.value = '42';
 // ─── Utilities ───────────────────────────────────────────────────────────────
 function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function serverDashboardURL(serverID) {
+  const id = String(serverID || '').trim();
+  if (!id || id === '-') return '/dashboard/servers';
+  return `/dashboard/servers?server_id=${encodeURIComponent(id)}`;
+}
+
+function serverLinkHTML(serverID, fallback = '-') {
+  const id = String(serverID || '').trim();
+  if (!id || id === '-') return esc(fallback);
+  return `<a class="mono fs11" href="${serverDashboardURL(id)}">${esc(id)}</a>`;
 }
 
 function toJSON(v, max = 180) {
@@ -3431,8 +3452,9 @@ function renderDetailRecordingHero(payload, frames) {
   const stateLabel = state === 'healthy' ? 'Recording' : (state === 'off' ? 'Off' : 'Attention');
   const lastFrameText = latest && latest.captured_at ? formatDateTimeShort(latest.captured_at) : '-';
   const lastFrameAge = health.last_frame_age_sec != null ? ageLabel(health.last_frame_age_sec) : '-';
-  const assignmentText = assignment && assignment.server_id ? String(assignment.server_id) : 'unassigned';
-  const routeText = route && route.status ? String(route.status) : (String(stream.execution_class || '') === 'youtube_relay' ? 'no route' : '-');
+  const assignmentHTML = assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : 'unassigned';
+  const relaySourceHTML = route && route.source_server_id ? serverLinkHTML(route.source_server_id, '-') : '-';
+  const relayStatusText = route && route.status ? String(route.status) : (String(stream.execution_class || '') === 'youtube_relay' ? 'no route' : '-');
   const currentError = String(health.message || runtime.last_error_text || '').trim();
   detailRecordingHero.innerHTML = `
     <div class="detail-summary-main">
@@ -3441,8 +3463,8 @@ function renderDetailRecordingHero(payload, frames) {
     </div>
     <div class="detail-summary-meta">
       <div>last frame ${esc(lastFrameText)}${lastFrameAge !== '-' ? ` · ${esc(lastFrameAge)}` : ''}</div>
-      <div>assignment ${esc(assignmentText)} · execution ${esc(String(stream.execution_class || '-'))}</div>
-      <div>runtime ${esc(String(runtime.status || '-'))}${routeText !== '-' ? ` · route ${esc(routeText)}` : ''}</div>
+      <div>recording on ${assignmentHTML}</div>
+      ${String(stream.execution_class || '') === 'youtube_relay' ? `<div>via ${relaySourceHTML} relay · ${esc(relayStatusText)}</div>` : ''}
       ${currentError ? `<div style="color:var(--warn);">${esc(currentError)}</div>` : ''}
     </div>
   `;
@@ -3456,6 +3478,14 @@ function detailFactCard(label, value, meta = '') {
   </div>`;
 }
 
+function detailFactCardHTML(label, valueHTML, meta = '') {
+  return `<div class="detail-fact-card">
+    <div class="detail-fact-label">${esc(label)}</div>
+    <div class="detail-fact-value">${valueHTML || esc('-')}</div>
+    ${meta ? `<div class="detail-fact-meta">${meta}</div>` : ''}
+  </div>`;
+}
+
 function renderDetailCurrentPath(payload) {
   if (!(detailCurrentPath instanceof HTMLElement)) return;
   const stream = payload && payload.stream ? payload.stream : {};
@@ -3464,34 +3494,33 @@ function renderDetailCurrentPath(payload) {
   const health = payload && payload.current_health ? payload.current_health : {};
   const runtime = payload && payload.runtime ? payload.runtime : {};
   const stats = payload && payload.stats_24h ? payload.stats_24h : {};
-  const pathLabel = [stream.source_family, stream.capture_type, stream.execution_class].filter(Boolean).join(' -> ');
   const cards = [];
-  cards.push(detailFactCard(
-    'Current Health',
-    String(health.state || 'unknown'),
-    `${healthTagHTML(health.state, health.reason)}${health.message ? `<div style="margin-top:6px;">${esc(String(health.message))}</div>` : ''}`
-  ));
-  cards.push(detailFactCard(
-    'Assignment',
-    assignment && assignment.server_id ? String(assignment.server_id) : 'unassigned',
-    `revision ${esc(String(assignment && assignment.assignment_revision || '-'))}<br/>updated ${esc(formatDateTimeShort(assignment && assignment.updated_at || ''))}`
-  ));
-  cards.push(detailFactCard(
-    'Execution Path',
-    pathLabel || '-',
-    `runtime ${esc(String(runtime.status || '-'))}${runtime.last_resolved_at ? `<br/>resolved ${esc(formatDateTimeShort(runtime.last_resolved_at))}` : ''}`
+  cards.push(detailFactCardHTML(
+    'Recording Server',
+    assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : esc('unassigned'),
+    [
+      assignment && assignment.assigned_at ? `assigned ${esc(formatDateTimeShort(assignment.assigned_at))}` : '',
+      runtime && runtime.status ? `runtime ${esc(String(runtime.status))}` : '',
+      runtime && runtime.last_resolved_at ? `resolved ${esc(formatDateTimeShort(runtime.last_resolved_at))}` : '',
+    ].filter(Boolean).join('<br/>')
   ));
   if (String(stream.execution_class || '') === 'youtube_relay') {
+    cards.push(detailFactCardHTML(
+      'YouTube Relay',
+      esc(route && route.status ? String(route.status) : 'no route'),
+      `source ${serverLinkHTML(route && route.source_server_id || '-', '-')}<br/>sink ${serverLinkHTML(route && route.sink_server_id || '-', '-')}`
+    ));
+  } else {
     cards.push(detailFactCard(
-      'Relay',
-      route && route.status ? String(route.status) : 'no route',
-      `source ${esc(String(route && route.source_server_id || '-'))}<br/>sink ${esc(String(route && route.sink_server_id || '-'))}`
+      'Capture Mode',
+      String(stream.capture_type || '-'),
+      String(stream.execution_class || '').trim() ? `execution ${esc(String(stream.execution_class || '-'))}` : ''
     ));
   }
   cards.push(detailFactCard(
-    '24h Capture',
-    `${Number(stats.success_frames || 0)} success / ${Number(stats.missing_frames || 0)} missing`,
-    `errors ${Number(stats.error_frames || 0)} · loss ${Number(stats.loss_rate_pct || 0).toFixed(1)}%`
+    'Last 24h',
+    `${Number(stats.success_frames || 0)} frames`,
+    `${healthTagHTML(health.state, '')}<br/>errors ${Number(stats.error_frames || 0)}${stats.last_capture ? `<br/>latest ${esc(formatDateTimeShort(stats.last_capture))}` : ''}`
   ));
   detailCurrentPath.innerHTML = cards.join('');
 }
@@ -3513,12 +3542,12 @@ function renderDetailCurrentWorker(payload) {
   const restarts = Number(item.restart_count || 0);
   detailCurrentWorker.innerHTML = `
     <div class="detail-section-head" style="margin-bottom:6px;">
-      <div class="detail-section-title">Active Recording Process</div>
-      <div class="detail-section-subtitle">Current worker heartbeat and frame activity.</div>
+      <div class="detail-section-title">Current Worker</div>
+      <div class="detail-section-subtitle">Live worker heartbeat and recent frame activity.</div>
     </div>
     <div class="row">
       <span class="tag tag-ok">active</span>
-      <span class="mono fs11">${esc(serverID)}</span>
+      <span>${serverLinkHTML(serverID, '-')}</span>
       <span class="mono fs10 muted">${esc(processID)}</span>
       <span class="mono fs10 muted">${esc(workerID)}</span>
       <span class="muted fs10">status ${esc(status)}</span>
@@ -3981,14 +4010,29 @@ function renderServers(items) {
     setTableStateRow(serversRows, 8, 'No servers in lookback window');
     return;
   }
-  for (const it of items) {
+  const rows = Array.isArray(items) ? items.slice() : [];
+  if (selectedServerID) {
+    rows.sort((a, b) => {
+      const aMatch = String(a && a.server_id || '').trim() === selectedServerID ? 0 : 1;
+      const bMatch = String(b && b.server_id || '').trim() === selectedServerID ? 0 : 1;
+      if (aMatch !== bMatch) return aMatch - bMatch;
+      return String(a && a.server_id || '').localeCompare(String(b && b.server_id || ''));
+    });
+  }
+  let focusedRow = null;
+  for (const it of rows) {
     const id = String(it.server_id || '');
     const active = Boolean(it.active);
     const lastSeen = it.last_seen_at ? formatDateTimeShort(it.last_seen_at) : '-';
     const captureStreams = Array.isArray(it.active_capture_stream_ids) ? it.active_capture_stream_ids : [];
     const tr = document.createElement('tr');
+    if (selectedServerID && id === selectedServerID) {
+      tr.classList.add('server-focus');
+      tr.id = `server-${id}`;
+      focusedRow = tr;
+    }
     tr.innerHTML = `
-      <td class="mono fs11">${esc(id)}</td>
+      <td>${serverLinkHTML(id, '-')}</td>
       <td>${active ? '<span class="tag tag-ok">active</span>' : '<span class="tag tag-muted">stale</span>'}</td>
       <td class="mono fs11">${esc(lastSeen)}</td>
       <td>${summarizeExecutionClasses(it.execution_classes)}</td>
@@ -3998,6 +4042,11 @@ function renderServers(items) {
       <td>${summarizeActiveInference(it.active_inference)}</td>
     `;
     serversRows.appendChild(tr);
+  }
+  if (focusedRow) {
+    window.requestAnimationFrame(() => {
+      focusedRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    });
   }
 }
 
@@ -4025,7 +4074,7 @@ function renderServersAssignments(items) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${streamID > 0 ? `<a class="stream-link" href="/dashboard/stream/${streamID}">#${streamID}</a>` : '<span class="muted fs11">-</span>'}<div class="muted fs10">${esc(it.provider || '-')} / ${esc(it.stream_slug || '-')}</div></td>
-      <td class="mono fs11">${esc(it.server_id || '-')}</td>
+      <td>${serverLinkHTML(it.server_id || '-', '-')}</td>
       <td class="mono fs11">${esc(it.execution_class || '-')}</td>
       <td class="mono fs11">${esc(formatDateTimeShort(it.assigned_at) || '-')}</td>
       <td class="mono fs11">${esc(it.last_frame_at ? formatDateTimeShort(it.last_frame_at) : '-')}</td>
@@ -6630,6 +6679,8 @@ document.addEventListener('keydown', (e) => {
 // ─── Routing & init ───────────────────────────────────────────────────────────
 (function parseRoute() {
   const parts = window.location.pathname.split('/').filter(Boolean);
+  const params = new URLSearchParams(window.location.search);
+  selectedServerID = String(params.get('server_id') || '').trim();
   if (parts.length >= 3 && parts[0] === 'dashboard' && parts[1] === 'stream') {
     const n = Number(parts[2]);
     if (Number.isFinite(n) && n > 0) detailStreamID = n;
