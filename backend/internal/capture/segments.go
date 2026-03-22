@@ -33,7 +33,7 @@ func SegmentCaptureTimeout(segmentDuration time.Duration) time.Duration {
 	if segmentDuration <= 0 {
 		segmentDuration = 30 * time.Second
 	}
-	return segmentDuration + 20*time.Second
+	return segmentDuration + 60*time.Second
 }
 
 func CaptureSegment(ctx context.Context, sourceURL string, targetFPS int, segmentDuration time.Duration) (Segment, error) {
@@ -125,17 +125,17 @@ func buildFFmpegSegmentArgs(sourceURL string, targetFPS int, segmentDuration tim
 	}
 	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10)
 	args = append(args,
+		"-fflags", "+discardcorrupt",
 		"-i", sourceURL,
 		"-t", seconds,
 		"-map", "0:v:0",
 		"-map", "0:a?",
 		"-vf", fmt.Sprintf("fps=%d", targetFPS),
 		"-c:v", "libx264",
-		"-preset", "veryfast",
+		"-preset", "ultrafast",
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-b:a", "96k",
-		"-movflags", "+faststart",
 		outPath,
 	)
 	return args
