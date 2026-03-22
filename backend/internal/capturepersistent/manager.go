@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,8 @@ type ManagerConfig struct {
 	FrameQueueSize            int
 	FrameEnqueueTimeout       time.Duration
 	FrameWriterWorkers        int
+	SegmentDuration           time.Duration
+	SegmentTargetFPS          int
 	StreamIDs                 []int64
 	ModeAllowlist             []capture.Mode
 	RecordingHeartbeat        bool
@@ -88,6 +91,12 @@ func NewManager(pool *pgxpool.Pool, r2c *r2.Client, cfg ManagerConfig) *Manager 
 	}
 	if cfg.FrameWriterWorkers <= 0 {
 		cfg.FrameWriterWorkers = 2
+	}
+	if cfg.SegmentDuration <= 0 {
+		cfg.SegmentDuration = 30 * time.Second
+	}
+	if cfg.SegmentTargetFPS <= 0 {
+		cfg.SegmentTargetFPS = 10
 	}
 	if strings.TrimSpace(cfg.WorkerID) == "" {
 		cfg.WorkerID = "capture-persistent-1"
@@ -361,6 +370,38 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 
 		_ = m.setRuntimeRunning(ctx, s.ID, effectiveMode, resolved.URL, false)
 
+		if effectiveMode != capture.ModeImagePoll {
+			seg, err := capture.CaptureSegment(ctx, resolved.URL, m.cfg.SegmentTargetFPS, m.cfg.SegmentDuration)
+			if err == nil {
+				persistCtx, cancelPersist := persistCallContext(ctx)
+				err = m.persistSegmentSuccess(persistCtx, s, effectiveMode, resolved.URL, seg)
+				cancelPersist()
+				capture.CleanupSegment(seg)
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) {
+				continue
+			}
+			stop, recErr := m.recordSessionError(ctx, s, effectiveMode, resolved.URL, err)
+			if recErr != nil {
+				log.Printf("capture-persistent stream_id=%d record capture error failed: %v", s.ID, recErr)
+			}
+			if stop {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+
 		frameCh := make(chan frameEvent, m.cfg.FrameQueueSize)
 		var writerWG sync.WaitGroup
 		for i := 0; i < m.cfg.FrameWriterWorkers; i++ {
@@ -441,7 +482,7 @@ func (m *Manager) buildSpec(s streamConfig) capture.StreamSpec {
 		CaptureMode:        s.CaptureMode,
 		CaptureConfig:      s.CaptureConfig,
 		CaptureIntervalSec: intervalSec,
-		TargetFPS:          1,
+		TargetFPS:          m.cfg.SegmentTargetFPS,
 		MaxFrameBytes:      m.cfg.MaxFrameBytes,
 	}
 }
@@ -544,11 +585,99 @@ func (m *Manager) persistSuccess(ctx context.Context, s streamConfig, ev frameEv
 	return nil
 }
 
+func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, effective capture.Mode, resolvedURL string, seg capture.Segment) error {
+	body, err := os.ReadFile(seg.Path)
+	if err != nil {
+		_, _ = m.persistError(ctx, s, effective, resolvedURL, fmt.Errorf("read segment: %w", err))
+		return fmt.Errorf("read segment: %w", err)
+	}
+	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/segment-%d.mp4",
+		s.ID, seg.StartAt.Year(), int(seg.StartAt.Month()), seg.StartAt.Day(), seg.StartAt.UnixMilli())
+	etag, err := m.r2c.PutBytes(ctx, objectKey, seg.MIMEType, body)
+	if err != nil {
+		_, _ = m.persistError(ctx, s, effective, resolvedURL, fmt.Errorf("upload segment: %w", err))
+		return fmt.Errorf("upload segment: %w", err)
+	}
+
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{
+		StorageProvider: "r2",
+		Bucket:          m.r2c.Bucket(),
+		ObjectKey:       objectKey,
+		MIMEType:        seg.MIMEType,
+		SizeBytes:       seg.SizeBytes,
+		ETag:            etag,
+		SHA256:          seg.SHA256,
+	})
+	if err != nil {
+		return fmt.Errorf("upsert media object: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO capture_segments (
+			stream_id, capture_job_id, media_object_id, execution_class, resolved_capture_type, resolved_url,
+			segment_start_at, segment_end_at, duration_ms, target_fps, actual_fps,
+			video_codec, audio_codec, container, audio_present,
+			capture_status, capture_error, source_kind
+		)
+		VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11, $12, $13, 'success', NULL, $14)
+	`, s.ID, mediaID, capture.ModeToExecutionClass(effective), capture.ResolvedCaptureTypeFromURL(resolvedURL), resolvedURL,
+		seg.StartAt, seg.EndAt, seg.DurationMs, m.cfg.SegmentTargetFPS, nullableTrimmed(seg.VideoCodec), nullableTrimmed(seg.AudioCodec), seg.Container, seg.AudioPresent, seg.SourceKind); err != nil {
+		return fmt.Errorf("insert capture segment success: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO stream_health (stream_id, captures_total, captures_success, captures_error, last_capture_at, last_error_at, last_error_text)
+		VALUES ($1, 1, 1, 0, $2, NULL, NULL)
+		ON CONFLICT (stream_id)
+		DO UPDATE SET
+			captures_total=stream_health.captures_total+1,
+			captures_success=stream_health.captures_success+1,
+			last_capture_at=EXCLUDED.last_capture_at,
+			last_error_at=NULL,
+			last_error_text=NULL,
+			updated_at=now()
+	`, s.ID, seg.EndAt); err != nil {
+		return fmt.Errorf("update stream_health success: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO stream_capture_runtime (stream_id, execution_class, resolved_capture_type, resolved_url, status, last_resolved_at, last_frame_at, consecutive_errors, last_error_text)
+		VALUES ($1, $2, $3, $4, 'running', now(), $5, 0, NULL)
+		ON CONFLICT (stream_id)
+		DO UPDATE SET
+			execution_class=EXCLUDED.execution_class,
+			resolved_capture_type=COALESCE(EXCLUDED.resolved_capture_type, stream_capture_runtime.resolved_capture_type),
+			resolved_url=EXCLUDED.resolved_url,
+			status='running',
+			last_frame_at=EXCLUDED.last_frame_at,
+			consecutive_errors=0,
+			last_error_text=NULL,
+			updated_at=now()
+	`, s.ID, capture.ModeToExecutionClass(effective), capture.ResolvedCaptureTypeFromURL(resolvedURL), resolvedURL, seg.EndAt); err != nil {
+		return fmt.Errorf("update stream_capture_runtime success: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit success tx: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) shouldRecordingHeartbeat(effective capture.Mode) bool {
 	return m.cfg.RecordingHeartbeat && effective == capture.ModeYouTubeLive
 }
 
 func (m *Manager) persistError(ctx context.Context, s streamConfig, effective capture.Mode, resolvedURL string, captureErr error) (int, error) {
+	if effective != capture.ModeImagePoll {
+		return m.persistSegmentError(ctx, s, effective, resolvedURL, captureErr)
+	}
+
 	now := time.Now().UTC()
 	errText := strings.TrimSpace(captureErr.Error())
 	sourceKind := "live"
@@ -602,6 +731,73 @@ func (m *Manager) persistError(ctx context.Context, s streamConfig, effective ca
 
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit error tx: %w", err)
+	}
+	return consecutive, nil
+}
+
+func (m *Manager) persistSegmentError(ctx context.Context, s streamConfig, effective capture.Mode, resolvedURL string, captureErr error) (int, error) {
+	now := time.Now().UTC()
+	errText := strings.TrimSpace(captureErr.Error())
+	if errText == "" {
+		errText = "capture failed"
+	}
+	sourceKind := "live"
+	if effective == capture.ModeImagePoll {
+		sourceKind = "snapshot_url"
+	}
+
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin segment error tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO capture_segments (
+			stream_id, capture_job_id, media_object_id, execution_class, resolved_capture_type, resolved_url,
+			segment_start_at, segment_end_at, duration_ms, target_fps, actual_fps,
+			video_codec, audio_codec, container, audio_present,
+			capture_status, capture_error, source_kind
+		)
+		VALUES ($1, NULL, NULL, $2, $3, $4, $5, $5, 0, $6, NULL, NULL, NULL, 'mp4', false, 'error', $7, $8)
+	`, s.ID, capture.ModeToExecutionClass(effective), nullableTrimmed(capture.ResolvedCaptureTypeFromURL(resolvedURL)), nullableTrimmed(resolvedURL), now, max(1, m.cfg.SegmentTargetFPS), errText, sourceKind); err != nil {
+		return 0, fmt.Errorf("insert capture segment error: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO stream_health (stream_id, captures_total, captures_success, captures_error, last_capture_at, last_error_at, last_error_text)
+		VALUES ($1, 1, 0, 1, $2, $2, $3)
+		ON CONFLICT (stream_id)
+		DO UPDATE SET
+			captures_total=stream_health.captures_total+1,
+			captures_error=stream_health.captures_error+1,
+			last_capture_at=EXCLUDED.last_capture_at,
+			last_error_at=EXCLUDED.last_error_at,
+			last_error_text=EXCLUDED.last_error_text,
+			updated_at=now()
+	`, s.ID, now, errText); err != nil {
+		return 0, fmt.Errorf("update stream_health error: %w", err)
+	}
+
+	var consecutive int
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO stream_capture_runtime (stream_id, execution_class, resolved_capture_type, resolved_url, status, last_resolved_at, last_frame_at, consecutive_errors, last_error_text)
+		VALUES ($1, $2, $3, $4, 'error', now(), NULL, 1, $5)
+		ON CONFLICT (stream_id)
+		DO UPDATE SET
+			execution_class=EXCLUDED.execution_class,
+			resolved_capture_type=COALESCE(EXCLUDED.resolved_capture_type, stream_capture_runtime.resolved_capture_type),
+			resolved_url=COALESCE(NULLIF(EXCLUDED.resolved_url,''), stream_capture_runtime.resolved_url),
+			status='error',
+			consecutive_errors=stream_capture_runtime.consecutive_errors+1,
+			last_error_text=EXCLUDED.last_error_text,
+			updated_at=now()
+		RETURNING consecutive_errors
+	`, s.ID, capture.ModeToExecutionClass(effective), nullableTrimmed(capture.ResolvedCaptureTypeFromURL(resolvedURL)), nullableTrimmed(resolvedURL), errText).Scan(&consecutive); err != nil {
+		return 0, fmt.Errorf("update stream_capture_runtime error: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit segment error tx: %w", err)
 	}
 	return consecutive, nil
 }
@@ -764,4 +960,12 @@ func (m *Manager) releaseLease(ctx context.Context, streamID int64) {
 func persistCallContext(parent context.Context) (context.Context, context.CancelFunc) {
 	_ = parent
 	return context.WithTimeout(context.Background(), 20*time.Second)
+}
+
+func nullableTrimmed(v string) any {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	return v
 }

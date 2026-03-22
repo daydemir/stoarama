@@ -80,6 +80,8 @@ func main() {
 			FrameQueueSize:            cfg.CaptureFrameQueueSize,
 			FrameEnqueueTimeout:       time.Duration(cfg.CaptureFrameEnqueueTimeout) * time.Second,
 			FrameWriterWorkers:        cfg.CaptureFrameWriters,
+			SegmentDuration:           time.Duration(cfg.CaptureSegmentDurationSec) * time.Second,
+			SegmentTargetFPS:          cfg.CaptureSegmentTargetFPS,
 			ModeAllowlist:             parseModeAllowlist(cfg.CaptureModeAllowlist),
 			LeaseDuration:             time.Duration(cfg.CaptureLeaseSec) * time.Second,
 			LeaseRenewInterval:        time.Duration(maxInt(5, cfg.CaptureLeaseSec/3)) * time.Second,

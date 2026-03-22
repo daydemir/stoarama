@@ -41,6 +41,44 @@ type IngestSuccessRequest struct {
 	RecordingHeartbeat bool
 }
 
+type SegmentUploadIntentRequest struct {
+	StreamID  int64
+	MimeType  string
+	SizeBytes int64
+}
+
+type SegmentUploadIntent struct {
+	IntentID    string
+	Bucket      string
+	ObjectKey   string
+	UploadURL   string
+	ExpiresAt   time.Time
+	ContentType string
+}
+
+type IngestSegmentSuccessRequest struct {
+	StreamID           int64
+	SourceKind         string
+	EffectiveMode      capture.Mode
+	ResolvedURL        string
+	UploadIntentID     string
+	ObjectKey          string
+	MIMEType           string
+	SizeBytes          int64
+	ETag               string
+	SHA256             string
+	SegmentStartAt     time.Time
+	SegmentEndAt       time.Time
+	DurationMs         int64
+	TargetFPS          int
+	ActualFPS          *float64
+	VideoCodec         string
+	AudioCodec         string
+	Container          string
+	AudioPresent       bool
+	RecordingHeartbeat bool
+}
+
 type IngestErrorRequest struct {
 	StreamID      int64
 	CapturedAt    time.Time
@@ -452,6 +490,114 @@ func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) er
 		"resolved_url":        strings.TrimSpace(req.ResolvedURL),
 		"mime_type":           mimeType,
 		"frame_base64":        base64.StdEncoding.EncodeToString(req.FrameBytes),
+		"recording_heartbeat": req.RecordingHeartbeat,
+	}
+	var out ingestResponse
+	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadIntentRequest) (SegmentUploadIntent, error) {
+	if req.StreamID <= 0 {
+		return SegmentUploadIntent{}, fmt.Errorf("stream_id must be > 0")
+	}
+	mimeType := strings.TrimSpace(req.MimeType)
+	if mimeType == "" {
+		mimeType = "video/mp4"
+	}
+	payload := map[string]any{
+		"kind":      "capture_segment",
+		"stream_id": req.StreamID,
+		"mime_type": mimeType,
+		"size_bytes": func() any {
+			if req.SizeBytes > 0 {
+				return req.SizeBytes
+			}
+			return nil
+		}(),
+	}
+	var out struct {
+		IntentID    string    `json:"intent_id"`
+		Bucket      string    `json:"bucket"`
+		ObjectKey   string    `json:"object_key"`
+		UploadURL   string    `json:"upload_url"`
+		ExpiresAt   time.Time `json:"expires_at"`
+		ContentType string    `json:"content_type"`
+	}
+	if err := c.postJSON(ctx, "/api/v1/media/upload-intents", payload, &out); err != nil {
+		return SegmentUploadIntent{}, err
+	}
+	return SegmentUploadIntent{
+		IntentID:    strings.TrimSpace(out.IntentID),
+		Bucket:      strings.TrimSpace(out.Bucket),
+		ObjectKey:   strings.TrimSpace(out.ObjectKey),
+		UploadURL:   strings.TrimSpace(out.UploadURL),
+		ExpiresAt:   out.ExpiresAt,
+		ContentType: strings.TrimSpace(out.ContentType),
+	}, nil
+}
+
+func (c *Client) UploadSegment(ctx context.Context, uploadURL string, body []byte, mimeType string) error {
+	if strings.TrimSpace(uploadURL) == "" {
+		return fmt.Errorf("upload_url is required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build segment upload request: %w", err)
+	}
+	if strings.TrimSpace(mimeType) != "" {
+		req.Header.Set("Content-Type", strings.TrimSpace(mimeType))
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload segment failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return fmt.Errorf("upload segment status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+func (c *Client) IngestSegmentSuccess(ctx context.Context, req IngestSegmentSuccessRequest) error {
+	if req.StreamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	if req.SegmentStartAt.IsZero() || req.SegmentEndAt.IsZero() {
+		return fmt.Errorf("segment_start_at and segment_end_at are required")
+	}
+	sourceKind := strings.TrimSpace(req.SourceKind)
+	if sourceKind == "" {
+		sourceKind = "live"
+	}
+	mimeType := strings.TrimSpace(req.MIMEType)
+	if mimeType == "" {
+		mimeType = "video/mp4"
+	}
+	payload := map[string]any{
+		"stream_id":           req.StreamID,
+		"status":              "success",
+		"source_kind":         sourceKind,
+		"execution_class":     capture.ModeToExecutionClass(req.EffectiveMode),
+		"resolved_url":        strings.TrimSpace(req.ResolvedURL),
+		"upload_intent_id":    strings.TrimSpace(req.UploadIntentID),
+		"object_key":          strings.TrimSpace(req.ObjectKey),
+		"mime_type":           mimeType,
+		"size_bytes":          req.SizeBytes,
+		"etag":                strings.TrimSpace(req.ETag),
+		"sha256":              strings.TrimSpace(req.SHA256),
+		"segment_start_at":    req.SegmentStartAt.UTC().Format(time.RFC3339Nano),
+		"segment_end_at":      req.SegmentEndAt.UTC().Format(time.RFC3339Nano),
+		"duration_ms":         req.DurationMs,
+		"target_fps":          req.TargetFPS,
+		"actual_fps":          req.ActualFPS,
+		"video_codec":         strings.TrimSpace(req.VideoCodec),
+		"audio_codec":         strings.TrimSpace(req.AudioCodec),
+		"container":           strings.TrimSpace(req.Container),
+		"audio_present":       req.AudioPresent,
 		"recording_heartbeat": req.RecordingHeartbeat,
 	}
 	var out ingestResponse

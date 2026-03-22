@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +32,8 @@ type ManagerConfig struct {
 	FrameQueueSize            int
 	FrameEnqueueTimeout       time.Duration
 	FrameWriterWorkers        int
+	SegmentDuration           time.Duration
+	SegmentTargetFPS          int
 	StreamIDs                 []int64
 	ModeAllowlist             []capture.Mode
 	RecordingHeartbeat        bool
@@ -109,6 +112,12 @@ func NewManager(client *captureapi.Client, cfg ManagerConfig) *Manager {
 	}
 	if cfg.FrameWriterWorkers <= 0 {
 		cfg.FrameWriterWorkers = 2
+	}
+	if cfg.SegmentDuration <= 0 {
+		cfg.SegmentDuration = 30 * time.Second
+	}
+	if cfg.SegmentTargetFPS <= 0 {
+		cfg.SegmentTargetFPS = 10
 	}
 	if cfg.ProcessHeartbeatInterval <= 0 {
 		cfg.ProcessHeartbeatInterval = 15 * time.Second
@@ -683,6 +692,53 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 			continue
 		}
 
+		if effectiveMode != capture.ModeImagePoll {
+			seg, err := capture.CaptureSegment(runCtx, resolved.URL, m.cfg.SegmentTargetFPS, m.cfg.SegmentDuration)
+			if err == nil {
+				persistCtx, cancelPersist := persistCallContext(runCtx)
+				err = m.persistSegmentSuccess(persistCtx, s, effectiveMode, resolved.URL, seg)
+				cancelPersist()
+				capture.CleanupSegment(seg)
+			}
+			if runCtx.Err() != nil {
+				if ctx.Err() != nil {
+					finalStopReason = "context_done"
+				}
+				return
+			}
+			restartCount++
+			if err == nil {
+				if reporter != nil {
+					reporter.setLastFrame(seg.EndAt)
+				}
+				continue
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) {
+				continue
+			}
+			if reporter != nil {
+				reporter.setLastError(err.Error())
+			}
+			stop, recErr := m.recordSessionError(runCtx, s, effectiveMode, resolved.URL, err)
+			if recErr != nil {
+				log.Printf("capture-api-persistent stream_id=%d record capture error failed: %v", s.ID, recErr)
+			}
+			if stop {
+				finalStatus = "failed"
+				finalStopReason = "unsupported_threshold"
+				return
+			}
+			select {
+			case <-runCtx.Done():
+				if ctx.Err() != nil {
+					finalStopReason = "context_done"
+				}
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+
 		frameCh := make(chan frameEvent, m.cfg.FrameQueueSize)
 		if m.shouldRelayRouteStatus(s, effectiveMode) {
 			if err := m.client.UpdateYouTubeRelayRouteStatus(
@@ -802,7 +858,7 @@ func (m *Manager) buildSpec(s streamConfig) capture.StreamSpec {
 		CaptureMode:        s.CaptureMode,
 		CaptureConfig:      s.CaptureConfig,
 		CaptureIntervalSec: intervalSec,
-		TargetFPS:          1,
+		TargetFPS:          m.cfg.SegmentTargetFPS,
 		MaxFrameBytes:      m.cfg.MaxFrameBytes,
 	}
 }
@@ -837,6 +893,44 @@ func (m *Manager) persistSuccess(ctx context.Context, s streamConfig, ev frameEv
 		MIMEType:           ev.frame.MIMEType,
 		FrameBytes:         ev.frame.Bytes,
 		RecordingHeartbeat: m.shouldRecordingHeartbeat(ev.effective),
+	})
+}
+
+func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, effective capture.Mode, resolvedURL string, seg capture.Segment) error {
+	body, err := os.ReadFile(seg.Path)
+	if err != nil {
+		return fmt.Errorf("read segment: %w", err)
+	}
+	intent, err := m.client.ReserveSegmentUpload(ctx, captureapi.SegmentUploadIntentRequest{
+		StreamID:  s.ID,
+		MimeType:  seg.MIMEType,
+		SizeBytes: seg.SizeBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("reserve segment upload: %w", err)
+	}
+	if err := m.client.UploadSegment(ctx, intent.UploadURL, body, seg.MIMEType); err != nil {
+		return fmt.Errorf("upload segment: %w", err)
+	}
+	return m.client.IngestSegmentSuccess(ctx, captureapi.IngestSegmentSuccessRequest{
+		StreamID:           s.ID,
+		SourceKind:         seg.SourceKind,
+		EffectiveMode:      effective,
+		ResolvedURL:        resolvedURL,
+		UploadIntentID:     intent.IntentID,
+		ObjectKey:          intent.ObjectKey,
+		MIMEType:           seg.MIMEType,
+		SizeBytes:          seg.SizeBytes,
+		SHA256:             seg.SHA256,
+		SegmentStartAt:     seg.StartAt,
+		SegmentEndAt:       seg.EndAt,
+		DurationMs:         seg.DurationMs,
+		TargetFPS:          m.cfg.SegmentTargetFPS,
+		VideoCodec:         seg.VideoCodec,
+		AudioCodec:         seg.AudioCodec,
+		Container:          seg.Container,
+		AudioPresent:       seg.AudioPresent,
+		RecordingHeartbeat: m.shouldRecordingHeartbeat(effective),
 	})
 }
 

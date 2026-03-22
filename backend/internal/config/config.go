@@ -44,6 +44,8 @@ type Config struct {
 	CaptureFrameQueueSize       int
 	CaptureFrameEnqueueTimeout  int
 	CaptureFrameWriters         int
+	CaptureSegmentDurationSec   int
+	CaptureSegmentTargetFPS     int
 	InferenceBoxPollSec         int
 	InferenceBoxConcurrency     int
 	InferenceBoxLeaseSec        int
@@ -78,7 +80,7 @@ func Load() (Config, error) {
 		EmailFrom:                   firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
 		EmailReplyTo:                firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
 		EmailResendAPIKey:           firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
-		StreamAlertsEnabled:         boolEnv("STREAM_ALERTS_ENABLED", true),
+		StreamAlertsEnabled:         boolEnv("STREAM_ALERTS_ENABLED", false),
 		StreamAlertsPollSec:         intEnv("STREAM_ALERTS_POLL_SEC", 60),
 		StreamAlertsProblemDelaySec: intEnv("STREAM_ALERTS_PROBLEM_DELAY_SEC", 300),
 		StreamAlertsRepeatSec:       intEnv("STREAM_ALERTS_REPEAT_SEC", 43200),
@@ -91,6 +93,8 @@ func Load() (Config, error) {
 		CaptureFrameQueueSize:       intEnv("CAPTURE_FRAME_QUEUE_SIZE", 16),
 		CaptureFrameEnqueueTimeout:  intEnv("CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC", 3),
 		CaptureFrameWriters:         intEnv("CAPTURE_FRAME_WRITERS", 1),
+		CaptureSegmentDurationSec:   intEnv("CAPTURE_SEGMENT_DURATION_SEC", 30),
+		CaptureSegmentTargetFPS:     intEnv("CAPTURE_SEGMENT_TARGET_FPS", 10),
 		InferenceBoxPollSec:         intEnv("BOX_WORKER_POLL_SEC", 2),
 		InferenceBoxConcurrency:     intEnv("BOX_WORKER_CONCURRENCY", 2),
 		InferenceBoxLeaseSec:        intEnv("BOX_WORKER_LEASE_SEC", 300),
