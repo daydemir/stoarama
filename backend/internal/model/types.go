@@ -63,6 +63,36 @@ type Pipeline struct {
 	UpdatedAt      time.Time      `json:"updated_at"`
 }
 
+type PipelineVersion struct {
+	ID         int64          `json:"id"`
+	PipelineID string         `json:"pipeline_id"`
+	VersionID  string         `json:"version_id"`
+	RunnerKind string         `json:"runner_kind"`
+	SpecJSON   map[string]any `json:"spec_json"`
+	CreatedBy  string         `json:"created_by"`
+	CreatedAt  time.Time      `json:"created_at"`
+}
+
+type PipelineRun struct {
+	ID                int64          `json:"id"`
+	PipelineID        string         `json:"pipeline_id"`
+	PipelineVersionID int64          `json:"pipeline_version_id"`
+	VersionID         string         `json:"version_id"`
+	Label             string         `json:"label"`
+	Status            string         `json:"status"`
+	WorkerKind        string         `json:"worker_kind"`
+	SelectorJSON      map[string]any `json:"selector_json"`
+	MetadataJSON      map[string]any `json:"metadata_json"`
+	CreatedBy         string         `json:"created_by"`
+	TargetCount       int64          `json:"target_count"`
+	CompletedCount    int64          `json:"completed_count"`
+	ErrorCount        int64          `json:"error_count"`
+	LeasedCount       int64          `json:"leased_count"`
+	CreatedAt         time.Time      `json:"created_at"`
+	StartedAt         *time.Time     `json:"started_at,omitempty"`
+	FinishedAt        *time.Time     `json:"finished_at,omitempty"`
+}
+
 type SourceCandidate struct {
 	ID            int64          `json:"id"`
 	Provider      string         `json:"provider"`
