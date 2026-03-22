@@ -117,6 +117,96 @@ type PipelineRunTarget struct {
 	Height       int        `json:"height"`
 }
 
+type EvalSuite struct {
+	ID              int64          `json:"id"`
+	OwnerAccountID  *int64         `json:"owner_account_id,omitempty"`
+	Slug            string         `json:"slug"`
+	Title           string         `json:"title"`
+	Description     string         `json:"description"`
+	SourceKind      string         `json:"source_kind"`
+	PrimaryMetric   string         `json:"primary_metric"`
+	SourceURL       string         `json:"source_url"`
+	MetadataJSON    map[string]any `json:"metadata_json"`
+	CreatedBy       string         `json:"created_by"`
+	ItemCount       int64          `json:"item_count"`
+	AnnotationCount int64          `json:"annotation_count"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+}
+
+type EvalSuiteItem struct {
+	ID           int64          `json:"id"`
+	SuiteID      int64          `json:"suite_id"`
+	FrameID      *int64         `json:"frame_id,omitempty"`
+	ItemKey      string         `json:"item_key"`
+	Split        string         `json:"split"`
+	SourceLabel  string         `json:"source_label"`
+	SourceURL    string         `json:"source_url"`
+	MetadataJSON map[string]any `json:"metadata_json"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+}
+
+type EvalAnnotation struct {
+	ID             int64          `json:"id"`
+	SuiteItemID    int64          `json:"suite_item_id"`
+	AnnotationKind string         `json:"annotation_kind"`
+	LabelJSON      map[string]any `json:"label_json"`
+	CreatedBy      string         `json:"created_by"`
+	CreatedAt      time.Time      `json:"created_at"`
+}
+
+type PipelineExperiment struct {
+	ID             int64          `json:"id"`
+	OwnerAccountID *int64         `json:"owner_account_id,omitempty"`
+	PipelineID     string         `json:"pipeline_id"`
+	Slug           string         `json:"slug"`
+	Title          string         `json:"title"`
+	GoalText       string         `json:"goal_text"`
+	PrimaryMetric  string         `json:"primary_metric"`
+	Active         bool           `json:"active"`
+	MetadataJSON   map[string]any `json:"metadata_json"`
+	CreatedBy      string         `json:"created_by"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+}
+
+type PipelineExperimentIteration struct {
+	ID                         int64          `json:"id"`
+	ExperimentID               int64          `json:"experiment_id"`
+	CandidatePipelineVersionID *int64         `json:"candidate_pipeline_version_id,omitempty"`
+	BaselinePipelineVersionID  *int64         `json:"baseline_pipeline_version_id,omitempty"`
+	IterationIndex             int            `json:"iteration_index"`
+	Status                     string         `json:"status"`
+	HypothesisText             string         `json:"hypothesis_text"`
+	ChangeSummary              string         `json:"change_summary"`
+	ChangeJSON                 map[string]any `json:"change_json"`
+	ResultClassification       string         `json:"result_classification"`
+	PrimaryMetricBefore        *float64       `json:"primary_metric_before,omitempty"`
+	PrimaryMetricAfter         *float64       `json:"primary_metric_after,omitempty"`
+	PrimaryMetricDelta         *float64       `json:"primary_metric_delta,omitempty"`
+	LogURL                     string         `json:"log_url"`
+	ArtifactURL                string         `json:"artifact_url"`
+	MetadataJSON               map[string]any `json:"metadata_json"`
+	CreatedBy                  string         `json:"created_by"`
+	CreatedAt                  time.Time      `json:"created_at"`
+	UpdatedAt                  time.Time      `json:"updated_at"`
+}
+
+type PipelineEvalMetric struct {
+	ID                    int64          `json:"id"`
+	ExperimentIterationID *int64         `json:"experiment_iteration_id,omitempty"`
+	SuiteID               int64          `json:"suite_id"`
+	PipelineID            string         `json:"pipeline_id"`
+	PipelineVersionID     *int64         `json:"pipeline_version_id,omitempty"`
+	PipelineRunID         *int64         `json:"pipeline_run_id,omitempty"`
+	MetricName            string         `json:"metric_name"`
+	Split                 string         `json:"split"`
+	MetricValue           float64        `json:"metric_value"`
+	MetadataJSON          map[string]any `json:"metadata_json"`
+	CreatedAt             time.Time      `json:"created_at"`
+}
+
 type SourceCandidate struct {
 	ID            int64          `json:"id"`
 	Provider      string         `json:"provider"`
