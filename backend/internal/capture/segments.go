@@ -29,6 +29,13 @@ type Segment struct {
 	AudioPresent bool
 }
 
+func SegmentCaptureTimeout(segmentDuration time.Duration) time.Duration {
+	if segmentDuration <= 0 {
+		segmentDuration = 30 * time.Second
+	}
+	return segmentDuration + 20*time.Second
+}
+
 func CaptureSegment(ctx context.Context, sourceURL string, targetFPS int, segmentDuration time.Duration) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")

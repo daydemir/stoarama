@@ -371,7 +371,9 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 		_ = m.setRuntimeRunning(ctx, s.ID, effectiveMode, resolved.URL, false)
 
 		if effectiveMode != capture.ModeImagePoll {
-			seg, err := capture.CaptureSegment(ctx, resolved.URL, m.cfg.SegmentTargetFPS, m.cfg.SegmentDuration)
+			segmentCtx, cancelSegment := context.WithTimeout(ctx, capture.SegmentCaptureTimeout(m.cfg.SegmentDuration))
+			seg, err := capture.CaptureSegment(segmentCtx, resolved.URL, m.cfg.SegmentTargetFPS, m.cfg.SegmentDuration)
+			cancelSegment()
 			if err == nil {
 				persistCtx, cancelPersist := persistCallContext(ctx)
 				err = m.persistSegmentSuccess(persistCtx, s, effectiveMode, resolved.URL, seg)
