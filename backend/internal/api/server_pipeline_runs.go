@@ -16,11 +16,12 @@ import (
 )
 
 type pipelineVersionSpec struct {
-	PipelineID string         `json:"pipeline_id"`
-	VersionID  string         `json:"version_id"`
-	RunnerKind string         `json:"runner_kind"`
-	SpecJSON   map[string]any `json:"spec_json"`
-	CreatedBy  string         `json:"created_by"`
+	PipelineID     string         `json:"pipeline_id"`
+	OwnerAccountID *int64         `json:"owner_account_id,omitempty"`
+	VersionID      string         `json:"version_id"`
+	RunnerKind     string         `json:"runner_kind"`
+	SpecJSON       map[string]any `json:"spec_json"`
+	CreatedBy      string         `json:"created_by"`
 }
 
 type pipelineVersionSyncRequest struct {
@@ -28,17 +29,18 @@ type pipelineVersionSyncRequest struct {
 }
 
 type pipelineRunCreateRequest struct {
-	PipelineID           string         `json:"pipeline_id"`
-	VersionID            string         `json:"version_id"`
-	Label                string         `json:"label"`
-	WorkerKind           string         `json:"worker_kind"`
-	FrameIDs             []int64        `json:"frame_ids"`
-	StreamIDs            []int64        `json:"stream_ids"`
-	Tags                 []string       `json:"tags"`
-	LatestOnlyPerStream  bool           `json:"latest_only_per_stream"`
-	Limit                int            `json:"limit"`
-	MetadataJSON         map[string]any `json:"metadata_json"`
-	CreatedBy            string         `json:"created_by"`
+	PipelineID          string         `json:"pipeline_id"`
+	OwnerAccountID      *int64         `json:"owner_account_id,omitempty"`
+	VersionID           string         `json:"version_id"`
+	Label               string         `json:"label"`
+	WorkerKind          string         `json:"worker_kind"`
+	FrameIDs            []int64        `json:"frame_ids"`
+	StreamIDs           []int64        `json:"stream_ids"`
+	Tags                []string       `json:"tags"`
+	LatestOnlyPerStream bool           `json:"latest_only_per_stream"`
+	Limit               int            `json:"limit"`
+	MetadataJSON        map[string]any `json:"metadata_json"`
+	CreatedBy           string         `json:"created_by"`
 }
 
 type pipelineRunClaimRequest struct {
@@ -46,6 +48,66 @@ type pipelineRunClaimRequest struct {
 	Limit      int    `json:"limit"`
 	LeaseSec   int    `json:"lease_sec"`
 	ForceRerun bool   `json:"force_rerun"`
+}
+
+func pipelineOwnerAccountScope(ctx context.Context) (int64, bool) {
+	if adminOverrideFromContext(ctx) {
+		return 0, false
+	}
+	if principal, ok := accountPrincipalFromContext(ctx); ok {
+		return principal.AccountID, true
+	}
+	if principal, ok := nodePrincipalFromContext(ctx); ok {
+		return principal.AccountID, true
+	}
+	return 0, false
+}
+
+func pipelineNodeScope(ctx context.Context) (nodePrincipal, bool) {
+	return nodePrincipalFromContext(ctx)
+}
+
+func normalizeNodeClaimedBy(principal nodePrincipal, raw string) (string, error) {
+	prefix := fmt.Sprintf("node:%d", principal.NodeID)
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return prefix, nil
+	}
+	if value == prefix || strings.HasPrefix(value, prefix+":") {
+		return value, nil
+	}
+	return "", newAPIStatusError(http.StatusForbidden, "claimed_by must use node prefix %s", prefix)
+}
+
+func (s *Server) resolvePipelineOwnerForSync(ctx context.Context, pipelineID string, explicit *int64) (*int64, error) {
+	if principal, ok := accountPrincipalFromContext(ctx); ok {
+		if explicit != nil && *explicit > 0 && *explicit != principal.AccountID {
+			return nil, newAPIStatusError(http.StatusForbidden, "owner_account_id must match the authenticated account")
+		}
+		owner := principal.AccountID
+		return &owner, nil
+	}
+
+	var existingOwner *int64
+	err := s.pool.QueryRow(ctx, `SELECT owner_account_id FROM pipelines WHERE id=$1`, strings.TrimSpace(pipelineID)).Scan(&existingOwner)
+	switch {
+	case err == nil:
+		if existingOwner != nil {
+			if explicit != nil && *explicit > 0 && *existingOwner != *explicit {
+				return nil, newAPIStatusError(http.StatusConflict, "pipeline owner is immutable once created")
+			}
+			return existingOwner, nil
+		}
+	case err == pgx.ErrNoRows:
+	default:
+		return nil, fmt.Errorf("load pipeline owner: %w", err)
+	}
+
+	if explicit == nil || *explicit <= 0 {
+		return nil, newAPIStatusError(http.StatusBadRequest, "owner_account_id is required for service/admin pipeline sync")
+	}
+	owner := *explicit
+	return &owner, nil
 }
 
 func (s *Server) handlePipelineVersionsSync(w http.ResponseWriter, r *http.Request) {
@@ -76,14 +138,25 @@ func (s *Server) handlePipelineVersionsSync(w http.ResponseWriter, r *http.Reque
 			util.WriteError(w, http.StatusBadRequest, "pipeline_id and version_id are required")
 			return
 		}
-		var pipelineExists bool
-		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM pipelines WHERE id=$1)`, pipelineID).Scan(&pipelineExists); err != nil {
+		var pipelineOwnerID *int64
+		if err := tx.QueryRow(r.Context(), `SELECT owner_account_id FROM pipelines WHERE id=$1`, pipelineID).Scan(&pipelineOwnerID); err != nil {
+			if err == pgx.ErrNoRows {
+				util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("pipeline not found: %s", pipelineID))
+				return
+			}
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check pipeline: %v", err))
 			return
 		}
-		if !pipelineExists {
-			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("pipeline not found: %s", pipelineID))
-			return
+		if ownerAccountID, ok := pipelineOwnerAccountScope(r.Context()); ok {
+			if pipelineOwnerID == nil || *pipelineOwnerID != ownerAccountID {
+				util.WriteError(w, http.StatusForbidden, "pipeline does not belong to the authenticated account")
+				return
+			}
+		} else if spec.OwnerAccountID != nil && *spec.OwnerAccountID > 0 {
+			if pipelineOwnerID != nil && *pipelineOwnerID != *spec.OwnerAccountID {
+				util.WriteError(w, http.StatusConflict, "pipeline version owner must match the pipeline owner")
+				return
+			}
 		}
 		runnerKind := strings.TrimSpace(spec.RunnerKind)
 		if runnerKind == "" {
@@ -110,9 +183,9 @@ func (s *Server) handlePipelineVersionsSync(w http.ResponseWriter, r *http.Reque
 			}
 		case err == pgx.ErrNoRows:
 			if _, err := tx.Exec(r.Context(), `
-				INSERT INTO pipeline_versions (pipeline_id, version_id, runner_kind, spec_jsonb, created_by)
-				VALUES ($1,$2,$3,$4,$5)
-			`, pipelineID, versionID, runnerKind, specBytes, strings.TrimSpace(spec.CreatedBy)); err != nil {
+				INSERT INTO pipeline_versions (pipeline_id, owner_account_id, version_id, runner_kind, spec_jsonb, created_by)
+				VALUES ($1,$2,$3,$4,$5,$6)
+			`, pipelineID, pipelineOwnerID, versionID, runnerKind, specBytes, strings.TrimSpace(spec.CreatedBy)); err != nil {
 				util.WriteError(w, http.StatusConflict, fmt.Sprintf("insert pipeline version %s@%s: %v", pipelineID, versionID, err))
 				return
 			}
@@ -130,15 +203,24 @@ func (s *Server) handlePipelineVersionsSync(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handlePipelineVersionsList(w http.ResponseWriter, r *http.Request) {
 	pipelineID := strings.TrimSpace(r.URL.Query().Get("pipeline_id"))
+	where := []string{"1=1"}
 	args := []any{}
-	query := `
-		SELECT id, pipeline_id, version_id, runner_kind, spec_jsonb, created_by, created_at
-		FROM pipeline_versions
-	`
 	if pipelineID != "" {
 		args = append(args, pipelineID)
-		query += ` WHERE pipeline_id=$1`
+		where = append(where, fmt.Sprintf("pipeline_id=$%d", len(args)))
 	}
+	if ownerAccountID, ok := pipelineOwnerAccountScope(r.Context()); ok {
+		args = append(args, ownerAccountID)
+		where = append(where, fmt.Sprintf("owner_account_id=$%d", len(args)))
+	} else if owner := parseInt64QueryPtr(r, "owner_account_id"); owner != nil {
+		args = append(args, *owner)
+		where = append(where, fmt.Sprintf("owner_account_id=$%d", len(args)))
+	}
+	query := `
+		SELECT id, pipeline_id, owner_account_id, version_id, runner_kind, spec_jsonb, created_by, created_at
+		FROM pipeline_versions
+	`
+	query += ` WHERE ` + strings.Join(where, " AND ")
 	query += ` ORDER BY pipeline_id ASC, created_at DESC, id DESC`
 	rows, err := s.pool.Query(r.Context(), query, args...)
 	if err != nil {
@@ -150,7 +232,7 @@ func (s *Server) handlePipelineVersionsList(w http.ResponseWriter, r *http.Reque
 	for rows.Next() {
 		var item model.PipelineVersion
 		var specBytes []byte
-		if err := rows.Scan(&item.ID, &item.PipelineID, &item.VersionID, &item.RunnerKind, &specBytes, &item.CreatedBy, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.PipelineID, &item.OwnerAccountID, &item.VersionID, &item.RunnerKind, &specBytes, &item.CreatedBy, &item.CreatedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan pipeline version: %v", err))
 			return
 		}
@@ -340,6 +422,10 @@ func (s *Server) queryPipelineRuns(ctx context.Context, runID int64, pipelineID 
 		args = append(args, strings.TrimSpace(pipelineID))
 		where = append(where, fmt.Sprintf("pr.pipeline_id=$%d", len(args)))
 	}
+	if ownerAccountID, ok := pipelineOwnerAccountScope(ctx); ok {
+		args = append(args, ownerAccountID)
+		where = append(where, fmt.Sprintf("pr.owner_account_id=$%d", len(args)))
+	}
 	if limit <= 0 {
 		limit = 200
 	}
@@ -349,8 +435,8 @@ func (s *Server) queryPipelineRuns(ctx context.Context, runID int64, pipelineID 
 	args = append(args, limit, offset)
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
 		SELECT
-			pr.id, pr.pipeline_id, pr.pipeline_version_id, pv.version_id, pr.label, pr.status, pr.worker_kind,
-			pr.selector_jsonb, pr.metadata_jsonb, pr.created_by, pr.created_at, pr.started_at, pr.finished_at,
+			pr.id, pr.pipeline_id, pr.owner_account_id, pr.pipeline_version_id, pv.version_id, pv.runner_kind, pv.spec_jsonb,
+			pr.label, pr.status, pr.worker_kind, pr.selector_jsonb, pr.metadata_jsonb, pr.created_by, pr.created_at, pr.started_at, pr.finished_at,
 			COUNT(prt.id)::bigint AS target_count,
 			COUNT(*) FILTER (WHERE prt.status='completed')::bigint AS completed_count,
 			COUNT(*) FILTER (WHERE prt.status='error')::bigint AS error_count,
@@ -373,9 +459,10 @@ func (s *Server) queryPipelineRuns(ctx context.Context, runID int64, pipelineID 
 		var item model.PipelineRun
 		var selectorBytes []byte
 		var metadataBytes []byte
+		var versionSpecBytes []byte
 		if err := rows.Scan(
-			&item.ID, &item.PipelineID, &item.PipelineVersionID, &item.VersionID, &item.Label, &item.Status, &item.WorkerKind,
-			&selectorBytes, &metadataBytes, &item.CreatedBy, &item.CreatedAt, &item.StartedAt, &item.FinishedAt,
+			&item.ID, &item.PipelineID, &item.OwnerAccountID, &item.PipelineVersionID, &item.VersionID, &item.VersionRunnerKind, &versionSpecBytes,
+			&item.Label, &item.Status, &item.WorkerKind, &selectorBytes, &metadataBytes, &item.CreatedBy, &item.CreatedAt, &item.StartedAt, &item.FinishedAt,
 			&item.TargetCount, &item.CompletedCount, &item.ErrorCount, &item.LeasedCount,
 		); err != nil {
 			return nil, fmt.Errorf("scan pipeline run: %w", err)
@@ -385,6 +472,9 @@ func (s *Server) queryPipelineRuns(ctx context.Context, runID int64, pipelineID 
 		}
 		if err := json.Unmarshal(metadataBytes, &item.MetadataJSON); err != nil {
 			return nil, fmt.Errorf("decode pipeline run metadata: %w", err)
+		}
+		if err := json.Unmarshal(versionSpecBytes, &item.VersionSpecJSON); err != nil {
+			return nil, fmt.Errorf("decode pipeline run version spec: %w", err)
 		}
 		items = append(items, item)
 	}
@@ -421,6 +511,76 @@ func (s *Server) handlePipelineRunGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, items[0])
+}
+
+func (s *Server) queryPipelineRunTargets(ctx context.Context, runID int64, status string, limit int, offset int) ([]model.PipelineRunTarget, error) {
+	where := []string{"prt.run_id=$1"}
+	args := []any{runID}
+	if ownerAccountID, ok := pipelineOwnerAccountScope(ctx); ok {
+		args = append(args, ownerAccountID)
+		where = append(where, fmt.Sprintf("pr.owner_account_id=$%d", len(args)))
+	}
+	if trimmed := strings.TrimSpace(status); trimmed != "" {
+		args = append(args, trimmed)
+		where = append(where, fmt.Sprintf("prt.status=$%d", len(args)))
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	args = append(args, limit, offset)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
+		SELECT
+			prt.id, prt.run_id, prt.frame_id, prt.stream_id, prt.status, prt.claim_id, prt.claimed_by,
+			prt.lease_expires_at, prt.result_id, prt.error_text,
+			f.captured_at, mo.object_key, mo.mime_type, mo.size_bytes, COALESCE(mo.width, 0), COALESCE(mo.height, 0)
+		FROM pipeline_run_targets prt
+		JOIN pipeline_runs pr ON pr.id = prt.run_id
+		JOIN frames f ON f.id = prt.frame_id
+		JOIN media_objects mo ON mo.id = f.raw_media_object_id
+		WHERE %s
+		ORDER BY f.captured_at DESC, prt.id DESC
+		LIMIT $%d OFFSET $%d
+	`, strings.Join(where, " AND "), len(args)-1, len(args)), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query pipeline run targets: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]model.PipelineRunTarget, 0, limit)
+	for rows.Next() {
+		var item model.PipelineRunTarget
+		if err := rows.Scan(
+			&item.ID, &item.RunID, &item.FrameID, &item.StreamID, &item.Status, &item.ClaimID, &item.ClaimedBy,
+			&item.LeaseExpires, &item.ResultID, &item.ErrorText,
+			&item.CapturedAt, &item.ObjectKey, &item.MIMEType, &item.SizeBytes, &item.Width, &item.Height,
+		); err != nil {
+			return nil, fmt.Errorf("scan pipeline run target: %w", err)
+		}
+		items = append(items, item)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("iterate pipeline run targets: %w", rows.Err())
+	}
+	return items, nil
+}
+
+func (s *Server) handlePipelineRunTargetsList(w http.ResponseWriter, r *http.Request) {
+	runID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	limit := parseIntQuery(r, "limit", 200, 1, 2000)
+	offset := parseIntQuery(r, "offset", 0, 0, 1000000)
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	items, err := s.queryPipelineRunTargets(r.Context(), runID, status, limit, offset)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (s *Server) handlePipelineRunsCreate(w http.ResponseWriter, r *http.Request) {
@@ -463,12 +623,13 @@ func (s *Server) handlePipelineRunsCreate(w http.ResponseWriter, r *http.Request
 
 	var versionRowID int64
 	var resolvedPipelineID string
+	var ownerAccountID *int64
 	if err := tx.QueryRow(r.Context(), `
-		SELECT pv.id, pv.pipeline_id
+		SELECT pv.id, pv.pipeline_id, p.owner_account_id
 		FROM pipeline_versions pv
 		JOIN pipelines p ON p.id = pv.pipeline_id
 		WHERE pv.pipeline_id=$1 AND pv.version_id=$2 AND p.active=true
-	`, pipelineID, versionID).Scan(&versionRowID, &resolvedPipelineID); err != nil {
+	`, pipelineID, versionID).Scan(&versionRowID, &resolvedPipelineID, &ownerAccountID); err != nil {
 		if err == pgx.ErrNoRows {
 			util.WriteError(w, http.StatusBadRequest, "active pipeline version not found")
 			return
@@ -476,25 +637,36 @@ func (s *Server) handlePipelineRunsCreate(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load pipeline version: %v", err))
 		return
 	}
+	if scopedOwnerID, ok := pipelineOwnerAccountScope(r.Context()); ok {
+		if ownerAccountID == nil || *ownerAccountID != scopedOwnerID {
+			util.WriteError(w, http.StatusForbidden, "pipeline run does not belong to the authenticated account")
+			return
+		}
+	} else if req.OwnerAccountID != nil && *req.OwnerAccountID > 0 {
+		if ownerAccountID != nil && *ownerAccountID != *req.OwnerAccountID {
+			util.WriteError(w, http.StatusConflict, "pipeline run owner must match the pipeline owner")
+			return
+		}
+	}
 
 	var runID int64
 	workerKind := normalizePipelineRunWorkerKind(req.WorkerKind)
 	if err := tx.QueryRow(r.Context(), `
 		INSERT INTO pipeline_runs (
-			pipeline_id, pipeline_version_id, label, status, worker_kind, selector_jsonb, metadata_jsonb, created_by
+			pipeline_id, owner_account_id, pipeline_version_id, label, status, worker_kind, selector_jsonb, metadata_jsonb, created_by
 		)
-		VALUES ($1,$2,$3,'pending',$4,$5,$6,$7)
+		VALUES ($1,$2,$3,$4,'pending',$5,$6,$7,$8)
 		RETURNING id
-	`, resolvedPipelineID, versionRowID, strings.TrimSpace(req.Label), workerKind, selectorBytes, metadataBytes, strings.TrimSpace(req.CreatedBy)).Scan(&runID); err != nil {
+	`, resolvedPipelineID, ownerAccountID, versionRowID, strings.TrimSpace(req.Label), workerKind, selectorBytes, metadataBytes, strings.TrimSpace(req.CreatedBy)).Scan(&runID); err != nil {
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("create pipeline run: %v", err))
 		return
 	}
 	if _, err := materializePipelineRunTargets(r.Context(), tx, runID, map[string]any{
-		"frame_ids":               dedupeInt64s(req.FrameIDs),
-		"stream_ids":              dedupeInt64s(req.StreamIDs),
-		"tags":                    dedupeStrings(req.Tags),
-		"latest_only_per_stream":  req.LatestOnlyPerStream,
-		"limit":                   req.Limit,
+		"frame_ids":              dedupeInt64s(req.FrameIDs),
+		"stream_ids":             dedupeInt64s(req.StreamIDs),
+		"tags":                   dedupeStrings(req.Tags),
+		"latest_only_per_stream": req.LatestOnlyPerStream,
+		"limit":                  req.Limit,
 	}); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -525,7 +697,14 @@ func (s *Server) handlePipelineRunClaims(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if strings.TrimSpace(req.ClaimedBy) == "" {
+	if principal, ok := pipelineNodeScope(r.Context()); ok {
+		claimedBy, err := normalizeNodeClaimedBy(principal, req.ClaimedBy)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		req.ClaimedBy = claimedBy
+	} else if strings.TrimSpace(req.ClaimedBy) == "" {
 		util.WriteError(w, http.StatusBadRequest, "claimed_by is required")
 		return
 	}
@@ -534,6 +713,21 @@ func (s *Server) handlePipelineRunClaims(w http.ResponseWriter, r *http.Request)
 	}
 	if req.LeaseSec <= 0 {
 		req.LeaseSec = 600
+	}
+	if ownerAccountID, ok := pipelineOwnerAccountScope(r.Context()); ok {
+		var runOwnerID *int64
+		if err := s.pool.QueryRow(r.Context(), `SELECT owner_account_id FROM pipeline_runs WHERE id=$1`, runID).Scan(&runOwnerID); err != nil {
+			if err == pgx.ErrNoRows {
+				util.WriteError(w, http.StatusNotFound, "pipeline run not found")
+				return
+			}
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load pipeline run owner: %v", err))
+			return
+		}
+		if runOwnerID == nil || *runOwnerID != ownerAccountID {
+			util.WriteError(w, http.StatusForbidden, "pipeline run does not belong to the authenticated account")
+			return
+		}
 	}
 	claims, err := queue.ClaimFramesForRun(r.Context(), s.pool, queue.RunClaimFilter{
 		RunID:      runID,
@@ -557,21 +751,21 @@ func (s *Server) handlePipelineRunClaims(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	type claimResp struct {
-		ClaimID           int64      `json:"claim_id"`
-		RunID             int64      `json:"run_id"`
-		FrameID           int64      `json:"frame_id"`
-		StreamID          int64      `json:"stream_id"`
-		CapturedAt        time.Time  `json:"captured_at"`
-		PipelineID        string     `json:"pipeline_id"`
-		PipelineVersionID *int64     `json:"pipeline_version_id,omitempty"`
-		LeaseExpires      time.Time  `json:"lease_expires_at"`
-		ObjectKey         string     `json:"object_key"`
-		MIMEType          string     `json:"mime_type"`
-		SizeBytes         int64      `json:"size_bytes"`
-		Width             int        `json:"width"`
-		Height            int        `json:"height"`
-		DownloadURL       string     `json:"download_url"`
-		ClaimedBy         string     `json:"claimed_by"`
+		ClaimID           int64     `json:"claim_id"`
+		RunID             int64     `json:"run_id"`
+		FrameID           int64     `json:"frame_id"`
+		StreamID          int64     `json:"stream_id"`
+		CapturedAt        time.Time `json:"captured_at"`
+		PipelineID        string    `json:"pipeline_id"`
+		PipelineVersionID *int64    `json:"pipeline_version_id,omitempty"`
+		LeaseExpires      time.Time `json:"lease_expires_at"`
+		ObjectKey         string    `json:"object_key"`
+		MIMEType          string    `json:"mime_type"`
+		SizeBytes         int64     `json:"size_bytes"`
+		Width             int       `json:"width"`
+		Height            int       `json:"height"`
+		DownloadURL       string    `json:"download_url"`
+		ClaimedBy         string    `json:"claimed_by"`
 	}
 	items := make([]claimResp, 0, len(claims))
 	for _, c := range claims {

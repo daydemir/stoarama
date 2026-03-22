@@ -55,6 +55,7 @@ func (s Stream) IsRecordingOn() bool {
 
 type Pipeline struct {
 	ID             string         `json:"id"`
+	OwnerAccountID *int64         `json:"owner_account_id,omitempty"`
 	PipelineFamily string         `json:"pipeline_family"`
 	Kind           string         `json:"kind"`
 	SpecJSON       map[string]any `json:"spec_json"`
@@ -64,20 +65,24 @@ type Pipeline struct {
 }
 
 type PipelineVersion struct {
-	ID         int64          `json:"id"`
-	PipelineID string         `json:"pipeline_id"`
-	VersionID  string         `json:"version_id"`
-	RunnerKind string         `json:"runner_kind"`
-	SpecJSON   map[string]any `json:"spec_json"`
-	CreatedBy  string         `json:"created_by"`
-	CreatedAt  time.Time      `json:"created_at"`
+	ID             int64          `json:"id"`
+	PipelineID     string         `json:"pipeline_id"`
+	OwnerAccountID *int64         `json:"owner_account_id,omitempty"`
+	VersionID      string         `json:"version_id"`
+	RunnerKind     string         `json:"runner_kind"`
+	SpecJSON       map[string]any `json:"spec_json"`
+	CreatedBy      string         `json:"created_by"`
+	CreatedAt      time.Time      `json:"created_at"`
 }
 
 type PipelineRun struct {
 	ID                int64          `json:"id"`
 	PipelineID        string         `json:"pipeline_id"`
+	OwnerAccountID    *int64         `json:"owner_account_id,omitempty"`
 	PipelineVersionID int64          `json:"pipeline_version_id"`
 	VersionID         string         `json:"version_id"`
+	VersionRunnerKind string         `json:"version_runner_kind"`
+	VersionSpecJSON   map[string]any `json:"version_spec_json"`
 	Label             string         `json:"label"`
 	Status            string         `json:"status"`
 	WorkerKind        string         `json:"worker_kind"`
@@ -91,6 +96,25 @@ type PipelineRun struct {
 	CreatedAt         time.Time      `json:"created_at"`
 	StartedAt         *time.Time     `json:"started_at,omitempty"`
 	FinishedAt        *time.Time     `json:"finished_at,omitempty"`
+}
+
+type PipelineRunTarget struct {
+	ID           int64      `json:"id"`
+	RunID        int64      `json:"run_id"`
+	FrameID      int64      `json:"frame_id"`
+	StreamID     int64      `json:"stream_id"`
+	Status       string     `json:"status"`
+	ClaimID      *int64     `json:"claim_id,omitempty"`
+	ClaimedBy    string     `json:"claimed_by"`
+	LeaseExpires *time.Time `json:"lease_expires_at,omitempty"`
+	ResultID     *int64     `json:"result_id,omitempty"`
+	ErrorText    string     `json:"error_text"`
+	CapturedAt   time.Time  `json:"captured_at"`
+	ObjectKey    string     `json:"object_key"`
+	MIMEType     string     `json:"mime_type"`
+	SizeBytes    int64      `json:"size_bytes"`
+	Width        int        `json:"width"`
+	Height       int        `json:"height"`
 }
 
 type SourceCandidate struct {

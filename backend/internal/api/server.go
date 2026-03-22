@@ -139,6 +139,14 @@ func (s *Server) router() http.Handler {
 			account.Get("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensList)
 			account.Post("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensCreate)
 			account.Post("/node-enrollment-tokens/{id}/revoke", s.handleAccountNodeEnrollmentTokenRevoke)
+			account.Post("/pipelines/sync", s.handlePipelinesSync)
+			account.Get("/pipelines", s.handlePipelinesList)
+			account.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
+			account.Get("/pipeline-versions", s.handlePipelineVersionsList)
+			account.Post("/pipeline-runs", s.handlePipelineRunsCreate)
+			account.Get("/pipeline-runs", s.handlePipelineRunsList)
+			account.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
+			account.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
 		})
 		api.Route("/node", func(node chi.Router) {
 			node.Use(s.requireNodeAuth)
@@ -148,6 +156,13 @@ func (s *Server) router() http.Handler {
 			node.Post("/youtube-relay/source/stopped", s.handleNodeYouTubeRelaySourceStopped)
 			node.Get("/youtube-relay/routes", s.handleNodeYouTubeRelayRoutesList)
 			node.Post("/youtube-relay/routes/{stream_id}/status", s.handleNodeYouTubeRelayRouteStatus)
+			node.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
+			node.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
+			node.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
+			node.Post("/processing/worker-heartbeat", s.handleProcessingWorkerHeartbeat)
+			node.Post("/processing/worker-stopped", s.handleProcessingWorkerStopped)
+			node.Post("/inference/commit", s.handleInferenceCommit)
+			node.Post("/inference/fail", s.handleInferenceFail)
 		})
 		api.Route("/admin", func(admin chi.Router) {
 			admin.Use(s.requireAdminAuth)
@@ -183,6 +198,7 @@ func (s *Server) router() http.Handler {
 			admin.Post("/pipeline-runs", s.handlePipelineRunsCreate)
 			admin.Get("/pipeline-runs", s.handlePipelineRunsList)
 			admin.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
+			admin.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
 			admin.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
 			admin.Get("/capture/schema", s.handleCaptureSchema)
 			admin.Get("/frames", s.handleFramesList)
@@ -230,6 +246,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/pipeline-runs", s.handlePipelineRunsCreate)
 			service.Get("/pipeline-runs", s.handlePipelineRunsList)
 			service.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
+			service.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
 			service.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
@@ -882,6 +899,7 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 
 type pipelineSpec struct {
 	ID             string         `json:"id"`
+	OwnerAccountID *int64         `json:"owner_account_id,omitempty"`
 	PipelineFamily string         `json:"pipeline_family"`
 	Kind           string         `json:"kind"`
 	SpecJSON       map[string]any `json:"spec_json"`
@@ -941,12 +959,23 @@ func (s *Server) handlePipelinesSync(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid pipeline spec_json for %s: %v", p.ID, err))
 			return
 		}
+		ownerAccountID, err := s.resolvePipelineOwnerForSync(r.Context(), strings.TrimSpace(p.ID), p.OwnerAccountID)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
 		if _, err := tx.Exec(r.Context(), `
-			INSERT INTO pipelines (id, pipeline_family, kind, spec_jsonb, active)
-			VALUES ($1,$2,$3,$4,$5)
+			INSERT INTO pipelines (id, owner_account_id, pipeline_family, kind, spec_jsonb, active)
+			VALUES ($1,$2,$3,$4,$5,$6)
 			ON CONFLICT (id)
-			DO UPDATE SET pipeline_family=EXCLUDED.pipeline_family, kind=EXCLUDED.kind, spec_jsonb=EXCLUDED.spec_jsonb, active=EXCLUDED.active, updated_at=now()
-		`, strings.TrimSpace(p.ID), pipelineFamily, kind, specBytes, active); err != nil {
+			DO UPDATE SET
+				owner_account_id=COALESCE(pipelines.owner_account_id, EXCLUDED.owner_account_id),
+				pipeline_family=EXCLUDED.pipeline_family,
+				kind=EXCLUDED.kind,
+				spec_jsonb=EXCLUDED.spec_jsonb,
+				active=EXCLUDED.active,
+				updated_at=now()
+		`, strings.TrimSpace(p.ID), ownerAccountID, pipelineFamily, kind, specBytes, active); err != nil {
 			util.WriteError(w, http.StatusConflict, fmt.Sprintf("upsert pipeline %s: %v", p.ID, err))
 			return
 		}
@@ -959,7 +988,21 @@ func (s *Server) handlePipelinesSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePipelinesList(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.pool.Query(r.Context(), `SELECT id, pipeline_family, kind, spec_jsonb, active, created_at, updated_at FROM pipelines ORDER BY id ASC`)
+	where := []string{"1=1"}
+	args := []any{}
+	if ownerAccountID, ok := pipelineOwnerAccountScope(r.Context()); ok {
+		args = append(args, ownerAccountID)
+		where = append(where, fmt.Sprintf("owner_account_id=$%d", len(args)))
+	} else if owner := parseInt64QueryPtr(r, "owner_account_id"); owner != nil {
+		args = append(args, *owner)
+		where = append(where, fmt.Sprintf("owner_account_id=$%d", len(args)))
+	}
+	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
+		SELECT id, owner_account_id, pipeline_family, kind, spec_jsonb, active, created_at, updated_at
+		FROM pipelines
+		WHERE %s
+		ORDER BY id ASC
+	`, strings.Join(where, " AND ")), args...)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list pipelines: %v", err))
 		return
@@ -969,7 +1012,7 @@ func (s *Server) handlePipelinesList(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var p model.Pipeline
 		var specBytes []byte
-		if err := rows.Scan(&p.ID, &p.PipelineFamily, &p.Kind, &specBytes, &p.Active, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.OwnerAccountID, &p.PipelineFamily, &p.Kind, &specBytes, &p.Active, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan pipeline: %v", err))
 			return
 		}
@@ -1039,21 +1082,21 @@ func (s *Server) handleInferenceClaims(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type claimResp struct {
-		ClaimID           int64      `json:"claim_id"`
-		FrameID           int64      `json:"frame_id"`
-		StreamID          int64      `json:"stream_id"`
-		CapturedAt        time.Time  `json:"captured_at"`
-		PipelineID        string     `json:"pipeline_id"`
-		PipelineVersionID *int64     `json:"pipeline_version_id,omitempty"`
-		PipelineRunID     *int64     `json:"pipeline_run_id,omitempty"`
-		LeaseExpires      time.Time  `json:"lease_expires_at"`
-		ObjectKey         string     `json:"object_key"`
-		MIMEType          string     `json:"mime_type"`
-		SizeBytes         int64      `json:"size_bytes"`
-		Width             int        `json:"width"`
-		Height            int        `json:"height"`
-		DownloadURL       string     `json:"download_url"`
-		ClaimedBy         string     `json:"claimed_by"`
+		ClaimID           int64     `json:"claim_id"`
+		FrameID           int64     `json:"frame_id"`
+		StreamID          int64     `json:"stream_id"`
+		CapturedAt        time.Time `json:"captured_at"`
+		PipelineID        string    `json:"pipeline_id"`
+		PipelineVersionID *int64    `json:"pipeline_version_id,omitempty"`
+		PipelineRunID     *int64    `json:"pipeline_run_id,omitempty"`
+		LeaseExpires      time.Time `json:"lease_expires_at"`
+		ObjectKey         string    `json:"object_key"`
+		MIMEType          string    `json:"mime_type"`
+		SizeBytes         int64     `json:"size_bytes"`
+		Width             int       `json:"width"`
+		Height            int       `json:"height"`
+		DownloadURL       string    `json:"download_url"`
+		ClaimedBy         string    `json:"claimed_by"`
 	}
 	items := make([]claimResp, 0, len(claims))
 	for _, c := range claims {
@@ -1234,6 +1277,14 @@ func (s *Server) handleInferenceCommit(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if principal, ok := nodePrincipalFromContext(r.Context()); ok {
+		claimedBy, err := normalizeNodeClaimedBy(principal, req.ClaimedBy)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		req.ClaimedBy = claimedBy
+	}
 	if strings.TrimSpace(req.PipelineID) == "" || req.FrameID <= 0 || req.ClaimID <= 0 || strings.TrimSpace(req.ClaimedBy) == "" {
 		util.WriteError(w, http.StatusBadRequest, "claim_id, pipeline_id, frame_id, claimed_by are required")
 		return
@@ -1276,6 +1327,14 @@ func (s *Server) handleInferenceFail(w http.ResponseWriter, r *http.Request) {
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if principal, ok := nodePrincipalFromContext(r.Context()); ok {
+		claimedBy, err := normalizeNodeClaimedBy(principal, req.ClaimedBy)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		req.ClaimedBy = claimedBy
 	}
 	if strings.TrimSpace(req.PipelineID) == "" || req.FrameID <= 0 || req.ClaimID <= 0 || strings.TrimSpace(req.ClaimedBy) == "" || strings.TrimSpace(req.ErrorText) == "" {
 		util.WriteError(w, http.StatusBadRequest, "claim_id, pipeline_id, frame_id, claimed_by, error_text are required")

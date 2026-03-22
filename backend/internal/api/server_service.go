@@ -8,6 +8,10 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
+type adminOverrideContextKey string
+
+const adminOverrideKey adminOverrideContextKey = "admin_override"
+
 func (s *Server) requireAdminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, err := s.authenticateAccountRequest(r)
@@ -20,8 +24,17 @@ func (s *Server) requireAdminAuth(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
+		ctx = context.WithValue(ctx, adminOverrideKey, true)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func adminOverrideFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(adminOverrideKey).(bool)
+	return v
 }
 
 func (s *Server) requireServiceAuth(next http.Handler) http.Handler {
