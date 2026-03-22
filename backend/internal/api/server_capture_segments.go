@@ -104,7 +104,7 @@ func (s *Server) finalizeCaptureSegmentUpload(ctx context.Context, tx pgx.Tx, st
 	if strings.TrimSpace(payload.IntentID) != "" {
 		if _, err := tx.Exec(ctx, `
 			UPDATE upload_intents
-			SET status='completed'
+			SET status='consumed'
 			WHERE id=$1::uuid
 		`, payload.IntentID); err != nil {
 			return 0, fmt.Errorf("complete capture upload intent: %w", err)
