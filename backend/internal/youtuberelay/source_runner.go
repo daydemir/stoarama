@@ -236,7 +236,9 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			http.Error(w, "missing relay stream id", http.StatusNotFound)
 			return
 		}
+		relaySuffix := ""
 		if idx := strings.IndexByte(pathPart, '/'); idx >= 0 {
+			relaySuffix = strings.Trim(strings.TrimSpace(pathPart[idx+1:]), "/")
 			pathPart = pathPart[:idx]
 		}
 		if idx := strings.IndexByte(pathPart, '.'); idx >= 0 {
@@ -254,7 +256,19 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			http.Error(w, "relay route not ready", http.StatusNotFound)
 			return
 		}
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, state.UpstreamURL, nil)
+		upstreamURL := strings.TrimSpace(state.UpstreamURL)
+		if relaySuffix != "" {
+			if relaySuffix != "segment" {
+				http.Error(w, "unknown relay path", http.StatusNotFound)
+				return
+			}
+			upstreamURL = strings.TrimSpace(r.URL.Query().Get("u"))
+			if upstreamURL == "" {
+				http.Error(w, "missing upstream segment url", http.StatusBadRequest)
+				return
+			}
+		}
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, nil)
 		if err != nil {
 			http.Error(w, "build upstream request failed", http.StatusBadGateway)
 			return
@@ -283,6 +297,23 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		}
 		w.Header().Set("X-Youtube-Relay-Server", strings.TrimSpace(opts.ServerID))
 		w.Header().Set("X-Youtube-Relay-Stream", strconv.FormatInt(streamID, 10))
+		if relaySuffix == "" && r.Method == http.MethodGet && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				http.Error(w, fmt.Sprintf("read upstream response failed: %v", readErr), http.StatusBadGateway)
+				return
+			}
+			if rewritten, ok := rewriteRelayPlaylist(relayBaseURL, streamID, strings.TrimSpace(opts.SharedToken), upstreamURL, body); ok {
+				w.Header().Del("Content-Length")
+				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(rewritten)
+				return
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+			return
+		}
 		w.WriteHeader(resp.StatusCode)
 		if r.Method == http.MethodHead {
 			return
@@ -569,6 +600,102 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			}
 			resolveFailures = 0
 		}
+	}
+}
+
+const relayPlaylistTailSegments = 12
+
+func rewriteRelayPlaylist(relayBaseURL string, streamID int64, token string, upstreamPlaylistURL string, body []byte) ([]byte, bool) {
+	trimmedBody := bytes.TrimSpace(body)
+	if !bytes.HasPrefix(trimmedBody, []byte("#EXTM3U")) {
+		return nil, false
+	}
+	baseURL, err := url.Parse(strings.TrimSpace(upstreamPlaylistURL))
+	if err != nil {
+		return nil, false
+	}
+	lines := strings.Split(strings.ReplaceAll(string(trimmedBody), "\r\n", "\n"), "\n")
+	header := []string{}
+	blocks := make([][]string, 0, 32)
+	current := []string{}
+	mediaSequence := -1
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.EqualFold(line, "#EXT-X-ENDLIST") {
+			continue
+		}
+		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
+			if v, parseErr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"))); parseErr == nil {
+				mediaSequence = v
+			}
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			segmentURL := line
+			if ref, parseErr := url.Parse(line); parseErr == nil {
+				segmentURL = baseURL.ResolveReference(ref).String()
+			}
+			current = append(current, fmt.Sprintf("%s/relay/%d/segment?token=%s&u=%s", relayBaseURL, streamID, url.QueryEscape(token), url.QueryEscape(segmentURL)))
+			blocks = append(blocks, append([]string(nil), current...))
+			current = current[:0]
+			continue
+		}
+		if len(blocks) == 0 && len(current) == 0 && isGlobalPlaylistTag(line) {
+			header = append(header, line)
+			continue
+		}
+		current = append(current, line)
+	}
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	dropped := 0
+	if len(blocks) > relayPlaylistTailSegments {
+		dropped = len(blocks) - relayPlaylistTailSegments
+		blocks = blocks[dropped:]
+	}
+	out := make([]string, 0, len(header)+1+(len(blocks)*4))
+	if len(header) == 0 || header[0] != "#EXTM3U" {
+		out = append(out, "#EXTM3U")
+	}
+	for _, line := range header {
+		if line == "#EXTM3U" {
+			if len(out) == 0 || out[0] != "#EXTM3U" {
+				out = append(out, line)
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	if mediaSequence >= 0 {
+		out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", mediaSequence+dropped))
+	}
+	for _, block := range blocks {
+		out = append(out, block...)
+	}
+	return []byte(strings.Join(out, "\n") + "\n"), true
+}
+
+func isGlobalPlaylistTag(line string) bool {
+	switch {
+	case line == "#EXTM3U":
+		return true
+	case strings.HasPrefix(line, "#EXT-X-VERSION:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-TARGETDURATION:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-PLAYLIST-TYPE:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-INDEPENDENT-SEGMENTS"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-START:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-ALLOW-CACHE:"):
+		return true
+	default:
+		return false
 	}
 }
 
