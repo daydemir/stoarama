@@ -115,6 +115,9 @@ func buildFFmpegSegmentArgs(sourceURL string, targetFPS int, segmentDuration tim
 	args := []string{
 		"-y",
 		"-loglevel", "error",
+	}
+	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10)
+	args = append(args,
 		"-i", sourceURL,
 		"-t", seconds,
 		"-map", "0:v:0",
@@ -127,7 +130,7 @@ func buildFFmpegSegmentArgs(sourceURL string, targetFPS int, segmentDuration tim
 		"-b:a", "96k",
 		"-movflags", "+faststart",
 		outPath,
-	}
+	)
 	return args
 }
 

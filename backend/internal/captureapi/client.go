@@ -347,7 +347,7 @@ func assignmentReadyForWorker(item RecordingAssignment) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(item.RelayStatus)) {
-	case "source_ready", "running", "failed", "stopped":
+	case "source_ready", "running":
 		return true
 	default:
 		return false
