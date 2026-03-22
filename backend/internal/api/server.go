@@ -178,6 +178,12 @@ func (s *Server) router() http.Handler {
 			admin.Patch("/streams/{id}/capture", s.handleStreamsCapturePatch)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Get("/pipelines", s.handlePipelinesList)
+			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
+			admin.Get("/pipeline-versions", s.handlePipelineVersionsList)
+			admin.Post("/pipeline-runs", s.handlePipelineRunsCreate)
+			admin.Get("/pipeline-runs", s.handlePipelineRunsList)
+			admin.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
+			admin.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
 			admin.Get("/capture/schema", s.handleCaptureSchema)
 			admin.Get("/frames", s.handleFramesList)
 			admin.Get("/dashboard/overview", s.handleDashboardOverview)
@@ -217,6 +223,14 @@ func (s *Server) router() http.Handler {
 			service.Post("/source-candidates", s.handleSourceCandidatesUpsert)
 			service.Post("/source-candidates/{id}/runs", s.handleSourceCandidateRunCreate)
 			service.Post("/source-candidates/{id}/auto-import", s.handleServiceSourceCandidateAutoImport)
+			service.Post("/pipelines/sync", s.handlePipelinesSync)
+			service.Get("/pipelines", s.handlePipelinesList)
+			service.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
+			service.Get("/pipeline-versions", s.handlePipelineVersionsList)
+			service.Post("/pipeline-runs", s.handlePipelineRunsCreate)
+			service.Get("/pipeline-runs", s.handlePipelineRunsList)
+			service.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
+			service.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
 			service.Post("/imports/streams/repair-canonical-capture", s.handleServiceStreamCanonicalCaptureRepair)
@@ -1025,19 +1039,21 @@ func (s *Server) handleInferenceClaims(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type claimResp struct {
-		ClaimID      int64     `json:"claim_id"`
-		FrameID      int64     `json:"frame_id"`
-		StreamID     int64     `json:"stream_id"`
-		CapturedAt   time.Time `json:"captured_at"`
-		PipelineID   string    `json:"pipeline_id"`
-		LeaseExpires time.Time `json:"lease_expires_at"`
-		ObjectKey    string    `json:"object_key"`
-		MIMEType     string    `json:"mime_type"`
-		SizeBytes    int64     `json:"size_bytes"`
-		Width        int       `json:"width"`
-		Height       int       `json:"height"`
-		DownloadURL  string    `json:"download_url"`
-		ClaimedBy    string    `json:"claimed_by"`
+		ClaimID           int64      `json:"claim_id"`
+		FrameID           int64      `json:"frame_id"`
+		StreamID          int64      `json:"stream_id"`
+		CapturedAt        time.Time  `json:"captured_at"`
+		PipelineID        string     `json:"pipeline_id"`
+		PipelineVersionID *int64     `json:"pipeline_version_id,omitempty"`
+		PipelineRunID     *int64     `json:"pipeline_run_id,omitempty"`
+		LeaseExpires      time.Time  `json:"lease_expires_at"`
+		ObjectKey         string     `json:"object_key"`
+		MIMEType          string     `json:"mime_type"`
+		SizeBytes         int64      `json:"size_bytes"`
+		Width             int        `json:"width"`
+		Height            int        `json:"height"`
+		DownloadURL       string     `json:"download_url"`
+		ClaimedBy         string     `json:"claimed_by"`
 	}
 	items := make([]claimResp, 0, len(claims))
 	for _, c := range claims {
@@ -1047,19 +1063,21 @@ func (s *Server) handleInferenceClaims(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		items = append(items, claimResp{
-			ClaimID:      c.ClaimID,
-			FrameID:      c.FrameID,
-			StreamID:     c.StreamID,
-			CapturedAt:   c.CapturedAt,
-			PipelineID:   c.PipelineID,
-			LeaseExpires: c.LeaseExpires,
-			ObjectKey:    c.ObjectKey,
-			MIMEType:     c.MIMEType,
-			SizeBytes:    c.SizeBytes,
-			Width:        c.Width,
-			Height:       c.Height,
-			DownloadURL:  url,
-			ClaimedBy:    strings.TrimSpace(req.ClaimedBy),
+			ClaimID:           c.ClaimID,
+			FrameID:           c.FrameID,
+			StreamID:          c.StreamID,
+			CapturedAt:        c.CapturedAt,
+			PipelineID:        c.PipelineID,
+			PipelineVersionID: c.PipelineVersionID,
+			PipelineRunID:     c.PipelineRunID,
+			LeaseExpires:      c.LeaseExpires,
+			ObjectKey:         c.ObjectKey,
+			MIMEType:          c.MIMEType,
+			SizeBytes:         c.SizeBytes,
+			Width:             c.Width,
+			Height:            c.Height,
+			DownloadURL:       url,
+			ClaimedBy:         strings.TrimSpace(req.ClaimedBy),
 		})
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
@@ -1189,6 +1207,8 @@ type inferenceSignal struct {
 type inferenceCommitRequest struct {
 	ClaimID           int64                `json:"claim_id"`
 	PipelineID        string               `json:"pipeline_id"`
+	PipelineRunID     int64                `json:"pipeline_run_id"`
+	PipelineVersionID *int64               `json:"pipeline_version_id,omitempty"`
 	FrameID           int64                `json:"frame_id"`
 	ClaimedBy         string               `json:"claimed_by"`
 	ForceRerun        bool                 `json:"force_rerun"`
@@ -1238,12 +1258,14 @@ func (s *Server) handleInferenceCommit(w http.ResponseWriter, r *http.Request) {
 }
 
 type inferenceFailRequest struct {
-	ClaimID        int64          `json:"claim_id"`
-	PipelineID     string         `json:"pipeline_id"`
-	FrameID        int64          `json:"frame_id"`
-	ClaimedBy      string         `json:"claimed_by"`
-	ErrorText      string         `json:"error_text"`
-	RunnerInfoJSON map[string]any `json:"runner_info_json"`
+	ClaimID           int64          `json:"claim_id"`
+	PipelineID        string         `json:"pipeline_id"`
+	PipelineRunID     int64          `json:"pipeline_run_id"`
+	PipelineVersionID *int64         `json:"pipeline_version_id,omitempty"`
+	FrameID           int64          `json:"frame_id"`
+	ClaimedBy         string         `json:"claimed_by"`
+	ErrorText         string         `json:"error_text"`
+	RunnerInfoJSON    map[string]any `json:"runner_info_json"`
 }
 
 func (s *Server) handleInferenceFail(w http.ResponseWriter, r *http.Request) {
@@ -1260,14 +1282,16 @@ func (s *Server) handleInferenceFail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _, err := s.commitInference(r.Context(), inferenceCommitRequest{
-		ClaimID:        req.ClaimID,
-		PipelineID:     req.PipelineID,
-		FrameID:        req.FrameID,
-		ClaimedBy:      req.ClaimedBy,
-		Status:         "error",
-		ErrorText:      req.ErrorText,
-		RunnerInfoJSON: req.RunnerInfoJSON,
-		SummaryJSON:    map[string]any{"status": "error"},
+		ClaimID:           req.ClaimID,
+		PipelineID:        req.PipelineID,
+		PipelineRunID:     req.PipelineRunID,
+		PipelineVersionID: req.PipelineVersionID,
+		FrameID:           req.FrameID,
+		ClaimedBy:         req.ClaimedBy,
+		Status:            "error",
+		ErrorText:         req.ErrorText,
+		RunnerInfoJSON:    req.RunnerInfoJSON,
+		SummaryJSON:       map[string]any{"status": "error"},
 	})
 	if err != nil {
 		if errors.Is(err, errConflict) {
@@ -1346,12 +1370,14 @@ func (s *Server) commitInference(ctx context.Context, req inferenceCommitRequest
 	var claimStatus string
 	var leaseExpires time.Time
 	var claimOwner string
+	var claimPipelineVersionID *int64
+	var claimPipelineRunID *int64
 	err = tx.QueryRow(ctx, `
-		SELECT status, lease_expires_at, claimed_by
+		SELECT status, lease_expires_at, claimed_by, pipeline_version_id, pipeline_run_id
 		FROM inference_claims
 		WHERE id=$1 AND pipeline_id=$2 AND frame_id=$3
 		FOR UPDATE
-	`, req.ClaimID, strings.TrimSpace(req.PipelineID), req.FrameID).Scan(&claimStatus, &leaseExpires, &claimOwner)
+	`, req.ClaimID, strings.TrimSpace(req.PipelineID), req.FrameID).Scan(&claimStatus, &leaseExpires, &claimOwner, &claimPipelineVersionID, &claimPipelineRunID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, 0, fmt.Errorf("%w: claim not found", errBadRequest)
@@ -1364,9 +1390,28 @@ func (s *Server) commitInference(ctx context.Context, req inferenceCommitRequest
 	if strings.TrimSpace(claimOwner) != strings.TrimSpace(req.ClaimedBy) {
 		return 0, 0, fmt.Errorf("%w: claim owner mismatch", errConflict)
 	}
+	if req.PipelineRunID > 0 {
+		if claimPipelineRunID == nil || *claimPipelineRunID != req.PipelineRunID {
+			return 0, 0, fmt.Errorf("%w: claim run mismatch", errConflict)
+		}
+	}
+	if req.PipelineVersionID != nil {
+		if claimPipelineVersionID == nil || *claimPipelineVersionID != *req.PipelineVersionID {
+			return 0, 0, fmt.Errorf("%w: claim version mismatch", errConflict)
+		}
+	}
 	if leaseExpires.Before(time.Now().UTC()) {
 		if _, err := tx.Exec(ctx, `UPDATE inference_claims SET status='abandoned', updated_at=now() WHERE id=$1`, req.ClaimID); err != nil {
 			return 0, 0, fmt.Errorf("expire claim: %w", err)
+		}
+		if claimPipelineRunID != nil {
+			if _, err := tx.Exec(ctx, `
+				UPDATE pipeline_run_targets
+				SET status='abandoned', claim_id=NULL, claimed_by='', lease_expires_at=NULL, updated_at=now()
+				WHERE run_id=$1 AND frame_id=$2
+			`, *claimPipelineRunID, req.FrameID); err != nil {
+				return 0, 0, fmt.Errorf("expire pipeline run target: %w", err)
+			}
 		}
 		return 0, 0, fmt.Errorf("%w: claim lease expired", errConflict)
 	}
@@ -1388,19 +1433,36 @@ func (s *Server) commitInference(ctx context.Context, req inferenceCommitRequest
 	}
 
 	var hasSuccessful bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM inference_results
-			WHERE pipeline_id=$1 AND frame_id=$2 AND status='success'
-		)
-	`, strings.TrimSpace(req.PipelineID), req.FrameID).Scan(&hasSuccessful); err != nil {
-		return 0, 0, fmt.Errorf("check successful result: %w", err)
+	if claimPipelineRunID != nil {
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM inference_results
+				WHERE pipeline_run_id=$1 AND frame_id=$2 AND status='success'
+			)
+		`, *claimPipelineRunID, req.FrameID).Scan(&hasSuccessful); err != nil {
+			return 0, 0, fmt.Errorf("check successful run result: %w", err)
+		}
+	} else {
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM inference_results
+				WHERE pipeline_id=$1 AND frame_id=$2 AND pipeline_run_id IS NULL AND status='success'
+			)
+		`, strings.TrimSpace(req.PipelineID), req.FrameID).Scan(&hasSuccessful); err != nil {
+			return 0, 0, fmt.Errorf("check successful result: %w", err)
+		}
 	}
 
 	force := req.ForceRerun || strings.EqualFold(strings.TrimSpace(req.RevisionMode), "force_rerun")
 	var maxRev int
-	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(revision), 0) FROM inference_results WHERE pipeline_id=$1 AND frame_id=$2`, strings.TrimSpace(req.PipelineID), req.FrameID).Scan(&maxRev); err != nil {
-		return 0, 0, fmt.Errorf("load max revision: %w", err)
+	if claimPipelineRunID != nil {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(revision), 0) FROM inference_results WHERE pipeline_run_id=$1 AND frame_id=$2`, *claimPipelineRunID, req.FrameID).Scan(&maxRev); err != nil {
+			return 0, 0, fmt.Errorf("load max run revision: %w", err)
+		}
+	} else {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(revision), 0) FROM inference_results WHERE pipeline_id=$1 AND frame_id=$2 AND pipeline_run_id IS NULL`, strings.TrimSpace(req.PipelineID), req.FrameID).Scan(&maxRev); err != nil {
+			return 0, 0, fmt.Errorf("load max revision: %w", err)
+		}
 	}
 	revision, err := resolveInferenceRevision(maxRev, hasSuccessful, force)
 	if err != nil {
@@ -1432,13 +1494,13 @@ func (s *Server) commitInference(ctx context.Context, req inferenceCommitRequest
 	var resultID int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO inference_results (
-			pipeline_id, frame_id, revision, status,
+			pipeline_id, pipeline_version_id, pipeline_run_id, frame_id, revision, status,
 			summary_jsonb, boxed_media_object_id, raw_output_jsonb,
 			error_text, runner_info_jsonb, started_at, finished_at
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		RETURNING id
-	`, strings.TrimSpace(req.PipelineID), req.FrameID, revision, storedStatus,
+	`, strings.TrimSpace(req.PipelineID), claimPipelineVersionID, claimPipelineRunID, req.FrameID, revision, storedStatus,
 		summaryJSON, boxedMediaID, rawOutJSON,
 		nullableTrimmed(req.ErrorText), runnerJSON, startedAt, finishedAt).Scan(&resultID); err != nil {
 		return 0, 0, fmt.Errorf("insert inference_result: %w", err)
@@ -1513,6 +1575,22 @@ func (s *Server) commitInference(ctx context.Context, req inferenceCommitRequest
 
 	if _, err := tx.Exec(ctx, `UPDATE inference_claims SET status='completed', updated_at=now() WHERE id=$1`, req.ClaimID); err != nil {
 		return 0, 0, fmt.Errorf("complete inference claim: %w", err)
+	}
+	if claimPipelineRunID != nil {
+		targetStatus := "completed"
+		if status == "error" {
+			targetStatus = "error"
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE pipeline_run_targets
+			SET status=$3, claim_id=$4, claimed_by=$5, lease_expires_at=NULL, result_id=$6, error_text=$7, updated_at=now()
+			WHERE run_id=$1 AND frame_id=$2
+		`, *claimPipelineRunID, req.FrameID, targetStatus, req.ClaimID, strings.TrimSpace(req.ClaimedBy), resultID, strings.TrimSpace(req.ErrorText)); err != nil {
+			return 0, 0, fmt.Errorf("update pipeline run target: %w", err)
+		}
+		if err := refreshPipelineRunStatus(ctx, tx, *claimPipelineRunID); err != nil {
+			return 0, 0, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {

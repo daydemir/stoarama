@@ -21,6 +21,8 @@ type FrameClaim struct {
 	Width        int
 	Height       int
 	PipelineID   string
+	PipelineVersionID *int64
+	PipelineRunID     *int64
 	LeaseExpires time.Time
 }
 
@@ -133,10 +135,10 @@ func ClaimFrames(ctx context.Context, pool *pgxpool.Pool, f ClaimFilter) ([]Fram
 			INSERT INTO inference_claims (pipeline_id, frame_id, claimed_by, lease_expires_at, status)
 			SELECT $1, c.frame_id, $3, now() + make_interval(secs => $4), 'leased'
 			FROM candidates c
-			ON CONFLICT (pipeline_id, frame_id) WHERE status='leased' DO NOTHING
-			RETURNING id, frame_id, pipeline_id, lease_expires_at
+			ON CONFLICT (pipeline_id, frame_id) WHERE status='leased' AND pipeline_run_id IS NULL DO NOTHING
+			RETURNING id, frame_id, pipeline_id, pipeline_version_id, pipeline_run_id, lease_expires_at
 		)
-		SELECT i.id, i.frame_id, c.stream_id, c.captured_at, c.object_key, c.mime_type, c.size_bytes, c.width, c.height, i.pipeline_id, i.lease_expires_at
+		SELECT i.id, i.frame_id, c.stream_id, c.captured_at, c.object_key, c.mime_type, c.size_bytes, c.width, c.height, i.pipeline_id, i.pipeline_version_id, i.pipeline_run_id, i.lease_expires_at
 		FROM ins i
 		JOIN candidates c ON c.frame_id = i.frame_id
 	`
@@ -162,7 +164,7 @@ func ClaimFrames(ctx context.Context, pool *pgxpool.Pool, f ClaimFilter) ([]Fram
 	claims := make([]FrameClaim, 0)
 	for rows.Next() {
 		var c FrameClaim
-		if err := rows.Scan(&c.ClaimID, &c.FrameID, &c.StreamID, &c.CapturedAt, &c.ObjectKey, &c.MIMEType, &c.SizeBytes, &c.Width, &c.Height, &c.PipelineID, &c.LeaseExpires); err != nil {
+		if err := rows.Scan(&c.ClaimID, &c.FrameID, &c.StreamID, &c.CapturedAt, &c.ObjectKey, &c.MIMEType, &c.SizeBytes, &c.Width, &c.Height, &c.PipelineID, &c.PipelineVersionID, &c.PipelineRunID, &c.LeaseExpires); err != nil {
 			return nil, fmt.Errorf("scan claim row: %w", err)
 		}
 		claims = append(claims, c)
