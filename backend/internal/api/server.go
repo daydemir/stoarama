@@ -2977,6 +2977,7 @@ func (s *Server) handleRecordingProcessStopped(w http.ResponseWriter, r *http.Re
 type processingWorkerHeartbeatRequest struct {
 	WorkerID       string         `json:"worker_id"`
 	WorkerKind     string         `json:"worker_kind"`
+	Mode           string         `json:"mode"`
 	ExecutionClass string         `json:"execution_class"`
 	PipelineID     string         `json:"pipeline_id"`
 	LeaseSec       int            `json:"lease_sec"`
@@ -3009,10 +3010,14 @@ func (s *Server) handleProcessingWorkerHeartbeat(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusBadRequest, "worker_kind must be one of capture|inference|inference_box|other")
 		return
 	}
-	executionClass, err := normalizeExecutionClassInput(req.ExecutionClass)
-	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
+	executionClass := strings.TrimSpace(strings.ToLower(req.ExecutionClass))
+	if executionClass != "" {
+		normalizedExecutionClass, err := normalizeExecutionClassInput(executionClass)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		executionClass = normalizedExecutionClass
 	}
 	pipelineID := strings.TrimSpace(req.PipelineID)
 	leaseSec := req.LeaseSec
@@ -3051,6 +3056,7 @@ func (s *Server) handleProcessingWorkerHeartbeat(w http.ResponseWriter, r *http.
 type processingWorkerStoppedRequest struct {
 	WorkerID       string `json:"worker_id"`
 	WorkerKind     string `json:"worker_kind"`
+	Mode           string `json:"mode"`
 	ExecutionClass string `json:"execution_class"`
 	PipelineID     string `json:"pipeline_id"`
 }
