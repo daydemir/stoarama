@@ -56,8 +56,15 @@ export CAPTURE_CATALOG_SWEEP_REFRESH_SEC="${CAPTURE_CATALOG_SWEEP_REFRESH_SEC:-5
 export CAPTURE_CATALOG_SWEEP_SCAN_PAGE_SIZE="${CAPTURE_CATALOG_SWEEP_SCAN_PAGE_SIZE:-200}"
 export CAPTURE_CATALOG_SWEEP_HLS_SKIP_ERROR_THRESHOLD="${CAPTURE_CATALOG_SWEEP_HLS_SKIP_ERROR_THRESHOLD:-12}"
 export CAPTURE_CATALOG_SWEEP_IMAGE_SKIP_ERROR_THRESHOLD="${CAPTURE_CATALOG_SWEEP_IMAGE_SKIP_ERROR_THRESHOLD:-6}"
+export CAPTURE_CATALOG_SWEEP_VIDEO_COOLDOWN_SEC="${CAPTURE_CATALOG_SWEEP_VIDEO_COOLDOWN_SEC:-43200}"
+export CAPTURE_CATALOG_SWEEP_IMAGE_COOLDOWN_SEC="${CAPTURE_CATALOG_SWEEP_IMAGE_COOLDOWN_SEC:-21600}"
+export CAPTURE_CATALOG_SWEEP_STATE_FILE="${CAPTURE_CATALOG_SWEEP_STATE_FILE:-${ROOT_DIR}/local/capture-catalog-cooldowns.json}"
 if [[ -z "${CAPTURE_CATALOG_SWEEP_METADATA_JSON:-}" ]]; then
   export CAPTURE_CATALOG_SWEEP_METADATA_JSON='{"role":"capture_catalog_sweeper"}'
+fi
+mkdir -p "$(dirname "${CAPTURE_CATALOG_SWEEP_STATE_FILE}")"
+if [[ ! -f "${CAPTURE_CATALOG_SWEEP_STATE_FILE}" ]]; then
+  printf '{}\n' >"${CAPTURE_CATALOG_SWEEP_STATE_FILE}"
 fi
 
 if [[ "${CAPTURE_CATALOG_SWEEP_BATCH_PER_CLASS}" -le 0 ]]; then
@@ -155,10 +162,49 @@ should_skip_image_candidate() {
   return 1
 }
 
+prune_cooldowns() {
+  local now_epoch tmp_file
+  now_epoch="$(date +%s)"
+  tmp_file="$(mktemp)"
+  if ! jq --argjson now "${now_epoch}" 'with_entries(select((.value | tonumber? // 0) > $now))' "${CAPTURE_CATALOG_SWEEP_STATE_FILE}" >"${tmp_file}"; then
+    rm -f "${tmp_file}"
+    return 1
+  fi
+  mv "${tmp_file}" "${CAPTURE_CATALOG_SWEEP_STATE_FILE}"
+}
+
+cooldown_until_epoch() {
+  local stream_id="$1"
+  jq -r --arg id "${stream_id}" '.[$id] // 0' "${CAPTURE_CATALOG_SWEEP_STATE_FILE}" 2>/dev/null || echo 0
+}
+
+stream_in_cooldown() {
+  local stream_id="$1"
+  local until_epoch now_epoch
+  until_epoch="$(cooldown_until_epoch "${stream_id}")"
+  now_epoch="$(date +%s)"
+  [[ "${until_epoch}" =~ ^[0-9]+$ ]] && [[ "${until_epoch}" -gt "${now_epoch}" ]]
+}
+
+set_stream_cooldown() {
+  local stream_id="$1"
+  local duration_sec="$2"
+  local now_epoch until_epoch tmp_file
+  now_epoch="$(date +%s)"
+  until_epoch=$((now_epoch + duration_sec))
+  tmp_file="$(mktemp)"
+  if ! jq --arg id "${stream_id}" --argjson until "${until_epoch}" '.[$id] = $until' "${CAPTURE_CATALOG_SWEEP_STATE_FILE}" >"${tmp_file}"; then
+    rm -f "${tmp_file}"
+    return 1
+  fi
+  mv "${tmp_file}" "${CAPTURE_CATALOG_SWEEP_STATE_FILE}"
+}
+
 fetch_ids_for_execution_class_candidates() {
   local execution_class="$1"
   local needed="$2"
   local skip_problematic="$3"
+  local allow_oldest_fallback="$4"
   local page_size="${CAPTURE_CATALOG_SWEEP_SCAN_PAGE_SIZE}"
   local offset=0
   local total=-1
@@ -192,13 +238,18 @@ fetch_ids_for_execution_class_candidates() {
 
     while IFS=$'\t' read -r id capture_type captures_success captures_error runtime_status runtime_error; do
       [[ "${id}" =~ ^[0-9]+$ ]] || continue
+      if stream_in_cooldown "${id}"; then
+        continue
+      fi
       if [[ "${skip_problematic}" -eq 1 ]]; then
         if [[ "${capture_type}" == "hls" || "${capture_type}" == "http_video" ]]; then
           if should_skip_hls_candidate "${captures_success}" "${captures_error}" "${runtime_status}" "${runtime_error}"; then
+            set_stream_cooldown "${id}" "${CAPTURE_CATALOG_SWEEP_VIDEO_COOLDOWN_SEC}" || true
             continue
           fi
         elif [[ "${capture_type}" == "still_image" ]]; then
           if should_skip_image_candidate "${captures_success}" "${captures_error}" "${runtime_status}" "${runtime_error}"; then
+            set_stream_cooldown "${id}" "${CAPTURE_CATALOG_SWEEP_IMAGE_COOLDOWN_SEC}" || true
             continue
           fi
         fi
@@ -226,7 +277,7 @@ fetch_ids_for_execution_class_candidates() {
     printf '%s\n' "${uncaptured_ids[@]:0:${needed}}"
     return 0
   fi
-  if [[ "${skip_problematic}" -eq 1 ]]; then
+  if [[ "${skip_problematic}" -eq 1 && "${allow_oldest_fallback}" -ne 1 ]]; then
     # For video_live catalog sweep, do not backfill already-captured streams when every uncaptured
     # candidate is known-dead/unsupported; this avoids wasting capacity on stale endpoints.
     return 0
@@ -267,10 +318,10 @@ fetch_ids_for_execution_class() {
 
   case "${execution_class}" in
     image_poll)
-      add_unique_ids < <(fetch_ids_for_execution_class_candidates "image_poll" "${needed}" 0 || true)
+      add_unique_ids < <(fetch_ids_for_execution_class_candidates "image_poll" "${needed}" 1 1 || true)
       ;;
     video_live)
-      add_unique_ids < <(fetch_ids_for_execution_class_candidates "video_live" "${needed}" 1 || true)
+      add_unique_ids < <(fetch_ids_for_execution_class_candidates "video_live" "${needed}" 1 0 || true)
       ;;
     *)
       echo "error: unsupported execution class in fetch_ids_for_execution_class: ${execution_class}" >&2
@@ -287,6 +338,7 @@ echo "starting capture catalog sweeper: server_id=${CAPTURE_CATALOG_SWEEP_SERVER
 
 cd "${BACKEND_DIR}"
 while true; do
+  prune_cooldowns || true
   declare -a stream_ids=()
 
   for execution_class in "${execution_class_list[@]}"; do
