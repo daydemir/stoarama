@@ -3576,49 +3576,78 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	var recHealthy, recDegraded, recStale int64
-	if err := s.pool.QueryRow(r.Context(), `
-		WITH recent_success AS (
-			SELECT f.stream_id, COUNT(*)::bigint AS success_frames_60s
-			FROM frames f
-			JOIN streams s ON s.id=f.stream_id
-			WHERE s.recording_state='on'
-			  AND f.capture_status='success'
-			  AND f.captured_at >= now() - interval '60 seconds'
-			GROUP BY f.stream_id
-		),
-		base AS (
-			SELECT
-				s.id,
-				COALESCE(rt.last_frame_at, sh.last_capture_at) AS last_seen,
-				COALESCE(rs.success_frames_60s, 0) AS success_frames_60s
-			FROM streams s
-			LEFT JOIN stream_capture_runtime rt ON rt.stream_id=s.id
-			LEFT JOIN stream_health sh ON sh.stream_id=s.id
-			LEFT JOIN recent_success rs ON rs.stream_id=s.id
-			WHERE s.recording_state='on'
-		),
-		with_health AS (
-			SELECT
-				CASE
-					WHEN last_seen IS NULL THEN NULL
-					ELSE GREATEST(0, EXTRACT(EPOCH FROM now() - last_seen)::bigint)
-				END AS freshness_sec,
-				CASE
-					WHEN $1::bigint <= 0 THEN 100.0
-					ELSE
-						100.0 * GREATEST($1::bigint - success_frames_60s, 0)::double precision / $1::double precision
-				END AS loss_rate_pct
-			FROM base
-		)
+	type overviewStreamHealthRow struct {
+		StreamID       int64
+		ExecutionClass string
+		RuntimeClass   *string
+		LastSeen       *time.Time
+	}
+	summaryRows, err := s.pool.Query(r.Context(), `
 		SELECT
-			COUNT(*) FILTER (WHERE freshness_sec IS NOT NULL AND freshness_sec <= 15 AND loss_rate_pct <= 20)::bigint AS healthy,
-			COUNT(*) FILTER (WHERE freshness_sec IS NOT NULL AND freshness_sec <= 15 AND loss_rate_pct > 20)::bigint AS degraded,
-			COUNT(*) FILTER (WHERE freshness_sec IS NULL OR freshness_sec > 15)::bigint AS stale
-		FROM with_health
-	`, expectedFramesPer60s(recordingSettings.CaptureIntervalSec)).Scan(&recHealthy, &recDegraded, &recStale); err != nil {
+			s.id,
+			s.execution_class,
+			rt.execution_class,
+			COALESCE(rt.last_frame_at, sh.last_capture_at) AS last_seen
+		FROM streams s
+		LEFT JOIN stream_capture_runtime rt ON rt.stream_id=s.id
+		LEFT JOIN stream_health sh ON sh.stream_id=s.id
+		WHERE s.recording_state='on'
+	`)
+	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording health counts: %v", err))
 		return
+	}
+	overviewItems := make([]overviewStreamHealthRow, 0, recordingOn)
+	frameIDs := make([]int64, 0, recordingOn)
+	clipIDs := make([]int64, 0, recordingOn)
+	for summaryRows.Next() {
+		var row overviewStreamHealthRow
+		if err := summaryRows.Scan(&row.StreamID, &row.ExecutionClass, &row.RuntimeClass, &row.LastSeen); err != nil {
+			summaryRows.Close()
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan recording health counts: %v", err))
+			return
+		}
+		overviewItems = append(overviewItems, row)
+		if isClipNativeExecutionClass(firstNonEmpty(row.ExecutionClass, derefString(row.RuntimeClass))) {
+			clipIDs = append(clipIDs, row.StreamID)
+		} else {
+			frameIDs = append(frameIDs, row.StreamID)
+		}
+	}
+	summaryRows.Close()
+	if summaryRows.Err() != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recording health counts: %v", summaryRows.Err()))
+		return
+	}
+	success60s, err := s.successCaptureCountsSince(r.Context(), frameIDs, clipIDs, 60*time.Second)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording health counters: %v", err))
+		return
+	}
+	var recHealthy, recDegraded, recStale int64
+	now := time.Now().UTC()
+	for _, row := range overviewItems {
+		mode := firstNonEmpty(row.ExecutionClass, derefString(row.RuntimeClass))
+		if row.LastSeen == nil {
+			recStale++
+			continue
+		}
+		freshness := int64(now.Sub(row.LastSeen.UTC()).Seconds())
+		if freshness < 0 {
+			freshness = 0
+		}
+		expected := expectedCapturesPer60s(mode, recordingSettings.CaptureIntervalSec)
+		lossRate := 100.0
+		if expected > 0 {
+			lossRate = 100.0 * float64(maxInt64(expected-success60s[row.StreamID], 0)) / float64(expected)
+		}
+		if freshness > staleThresholdSecForExecutionClass(mode, recordingSettings.CaptureIntervalSec) {
+			recStale++
+		} else if lossRate > 20 {
+			recDegraded++
+		} else {
+			recHealthy++
+		}
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"streams_total":            streamsTotal,
