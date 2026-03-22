@@ -11,7 +11,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -320,15 +319,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	principal, err := s.authenticateAccountRequest(r)
-	if err != nil {
-		http.Redirect(w, r, "/account?redirect_path="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
-		return
-	}
-	if principal.Role != accountRoleAdmin {
-		util.WriteError(w, http.StatusForbidden, "admin access required")
-		return
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(s.dashboardHTML)
