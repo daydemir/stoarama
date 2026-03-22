@@ -491,6 +491,9 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		if resolveWorkers <= 0 {
 			resolveWorkers = 1
 		}
+		if resolveWorkers > 3 {
+			resolveWorkers = 3
+		}
 		if len(activeRoutes) > 0 && resolveWorkers > len(activeRoutes) {
 			resolveWorkers = len(activeRoutes)
 		}
