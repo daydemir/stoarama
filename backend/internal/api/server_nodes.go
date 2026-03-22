@@ -99,9 +99,66 @@ func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal
 }
 
 type nodeEnrollmentCreateRequest struct {
-	NodeType  string `json:"node_type"`
-	Label     string `json:"label"`
-	ExpiresAt string `json:"expires_at"`
+	OwnerAccountID *int64 `json:"owner_account_id,omitempty"`
+	OwnerEmail     string `json:"owner_email,omitempty"`
+	NodeType       string `json:"node_type"`
+	Label          string `json:"label"`
+	ExpiresAt      string `json:"expires_at"`
+}
+
+func (s *Server) createNodeEnrollmentToken(ctx context.Context, accountID int64, accountEmail string, req nodeEnrollmentCreateRequest) (map[string]any, error) {
+	nodeType, ok := normalizeNodeType(req.NodeType)
+	if !ok {
+		return nil, newAPIStatusError(http.StatusBadRequest, "invalid node_type")
+	}
+	label := strings.TrimSpace(req.Label)
+	if label == "" {
+		label = nodeType
+	}
+	expiresAt := time.Now().UTC().Add(24 * time.Hour)
+	if raw := strings.TrimSpace(req.ExpiresAt); raw != "" {
+		tm, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return nil, newAPIStatusError(http.StatusBadRequest, "expires_at must be RFC3339")
+		}
+		if !tm.After(time.Now().UTC()) {
+			return nil, newAPIStatusError(http.StatusBadRequest, "expires_at must be in the future")
+		}
+		expiresAt = tm.UTC()
+	}
+	rawToken, err := generateSecret(36)
+	if err != nil {
+		return nil, fmt.Errorf("generate node enrollment token: %w", err)
+	}
+	token := "sie_" + rawToken
+	tokenHash := hashSecret(token)
+	tokenPrefix := token
+	if len(tokenPrefix) > 16 {
+		tokenPrefix = tokenPrefix[:16]
+	}
+	var id int64
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO node_enrollment_tokens (account_id, token_prefix, token_hash, node_type, label, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id
+	`, accountID, tokenPrefix, tokenHash, nodeType, label, expiresAt).Scan(&id)
+	if err != nil {
+		return nil, fmt.Errorf("create node enrollment token: %w", err)
+	}
+	_ = s.insertAccountAuthEvent(ctx, accountID, nil, "node_enrollment_token_created", "account", accountEmail, map[string]any{
+		"token_id":     id,
+		"token_prefix": tokenPrefix,
+		"node_type":    nodeType,
+		"label":        label,
+	})
+	return map[string]any{
+		"id":           id,
+		"token":        token,
+		"token_prefix": tokenPrefix,
+		"node_type":    nodeType,
+		"label":        label,
+		"expires_at":   expiresAt.UTC(),
+	}, nil
 }
 
 func (s *Server) handleAccountNodeEnrollmentTokensList(w http.ResponseWriter, r *http.Request) {
@@ -166,63 +223,44 @@ func (s *Server) handleAccountNodeEnrollmentTokensCreate(w http.ResponseWriter, 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	nodeType, ok := normalizeNodeType(req.NodeType)
-	if !ok {
-		util.WriteError(w, http.StatusBadRequest, "invalid node_type")
+	resp, err := s.createNodeEnrollmentToken(r.Context(), principal.AccountID, principal.Email, req)
+	if err != nil {
+		writeAPIError(w, err)
 		return
 	}
-	label := strings.TrimSpace(req.Label)
-	if label == "" {
-		label = nodeType
+	util.WriteJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleServiceNodeEnrollmentTokensCreate(w http.ResponseWriter, r *http.Request) {
+	var req nodeEnrollmentCreateRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	expiresAt := time.Now().UTC().Add(24 * time.Hour)
-	if raw := strings.TrimSpace(req.ExpiresAt); raw != "" {
-		tm, err := time.Parse(time.RFC3339, raw)
-		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "expires_at must be RFC3339")
+	ownerAccountID, err := s.resolveAccountRef(r.Context(), req.OwnerAccountID, req.OwnerEmail)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if ownerAccountID == nil || *ownerAccountID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "owner_account_id or owner_email is required")
+		return
+	}
+	var accountEmail string
+	if err := s.pool.QueryRow(r.Context(), `SELECT email FROM accounts WHERE id=$1`, *ownerAccountID).Scan(&accountEmail); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusBadRequest, "account not found")
 			return
 		}
-		if !tm.After(time.Now().UTC()) {
-			util.WriteError(w, http.StatusBadRequest, "expires_at must be in the future")
-			return
-		}
-		expiresAt = tm.UTC()
-	}
-	rawToken, err := generateSecret(36)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("generate node enrollment token: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load account email: %v", err))
 		return
 	}
-	token := "sie_" + rawToken
-	tokenHash := hashSecret(token)
-	tokenPrefix := token
-	if len(tokenPrefix) > 16 {
-		tokenPrefix = tokenPrefix[:16]
-	}
-	var id int64
-	err = s.pool.QueryRow(r.Context(), `
-		INSERT INTO node_enrollment_tokens (account_id, token_prefix, token_hash, node_type, label, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id
-	`, principal.AccountID, tokenPrefix, tokenHash, nodeType, label, expiresAt).Scan(&id)
+	resp, err := s.createNodeEnrollmentToken(r.Context(), *ownerAccountID, accountEmail, req)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create node enrollment token: %v", err))
+		writeAPIError(w, err)
 		return
 	}
-	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "node_enrollment_token_created", "account", principal.Email, map[string]any{
-		"token_id":     id,
-		"token_prefix": tokenPrefix,
-		"node_type":    nodeType,
-		"label":        label,
-	})
-	util.WriteJSON(w, http.StatusCreated, map[string]any{
-		"id":           id,
-		"token":        token,
-		"token_prefix": tokenPrefix,
-		"node_type":    nodeType,
-		"label":        label,
-		"expires_at":   expiresAt.UTC(),
-	})
+	util.WriteJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) handleAccountNodeEnrollmentTokenRevoke(w http.ResponseWriter, r *http.Request) {

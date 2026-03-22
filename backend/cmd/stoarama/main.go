@@ -17,10 +17,11 @@ import (
 )
 
 type cliConfig struct {
-	APIBaseURL    string                  `json:"api_base_url,omitempty"`
-	APIKey        string                  `json:"api_key,omitempty"`
-	Node          *cliNodeConfig          `json:"node,omitempty"`
-	YTRelaySource *cliYTRelaySourceConfig `json:"yt_relay_source,omitempty"`
+	APIBaseURL    string                    `json:"api_base_url,omitempty"`
+	APIKey        string                    `json:"api_key,omitempty"`
+	Node          *cliNodeConfig            `json:"node,omitempty"`
+	Nodes         map[string]*cliNodeConfig `json:"nodes,omitempty"`
+	YTRelaySource *cliYTRelaySourceConfig   `json:"yt_relay_source,omitempty"`
 }
 
 type cliNodeConfig struct {
@@ -90,8 +91,8 @@ func usage() {
   stoarama node enrollment-tokens create --node-type yt_relay_source|inference_node [--label LABEL --expires-at RFC3339] [--api-base-url URL --api-key KEY]
   stoarama node enrollment-tokens revoke --id N [--api-base-url URL --api-key KEY]
  stoarama node enroll --token TOKEN --node-type yt_relay_source|inference_node [--display-name NAME --hostname HOST --platform PLATFORM --api-base-url URL]
-  stoarama node whoami [--api-base-url URL --node-token TOKEN]
-  stoarama node heartbeat [--api-base-url URL --node-token TOKEN]
+  stoarama node whoami [--node-type yt_relay_source|inference_node --api-base-url URL --node-token TOKEN]
+  stoarama node heartbeat [--node-type yt_relay_source|inference_node --api-base-url URL --node-token TOKEN]
   stoarama node doctor [--node-type yt_relay_source|inference_node]
   stoarama node yt-relay-source run [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
   stoarama node yt-relay-source install-launchd [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
@@ -361,7 +362,7 @@ func runNodeEnroll(args []string) {
 		fatalf("enroll node: %v", err)
 	}
 	cfg, _ := loadCLIConfig()
-	cfg.Node = &cliNodeConfig{
+	setNodeConfig(&cfg, &cliNodeConfig{
 		ID:          resp.Node.ID,
 		NodeType:    resp.Node.NodeType,
 		DisplayName: resp.Node.DisplayName,
@@ -369,7 +370,7 @@ func runNodeEnroll(args []string) {
 		Platform:    resp.Node.Platform,
 		Token:       strings.TrimSpace(resp.NodeToken),
 		APIBaseURL:  normalizeBaseURL(*apiBaseURL),
-	}
+	})
 	if err := saveCLIConfig(cfg); err != nil {
 		fatalf("save config: %v", err)
 	}
@@ -378,11 +379,12 @@ func runNodeEnroll(args []string) {
 
 func runNodeWhoAmI(args []string) {
 	fs := flag.NewFlagSet("node whoami", flag.ExitOnError)
+	nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 	nodeToken := fs.String("node-token", "", "node bearer token")
 	_ = fs.Parse(args)
 
-	baseURL, token := mustResolveNodeAuth(*apiBaseURL, *nodeToken)
+	baseURL, token := mustResolveNodeAuthForType(*apiBaseURL, *nodeToken, *nodeType)
 	var resp map[string]any
 	if err := apiRequest("GET", baseURL+"/api/v1/node/me", nil, token, &resp); err != nil {
 		fatalf("load node: %v", err)
@@ -392,19 +394,22 @@ func runNodeWhoAmI(args []string) {
 
 func runNodeHeartbeat(args []string) {
 	fs := flag.NewFlagSet("node heartbeat", flag.ExitOnError)
+	nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 	nodeToken := fs.String("node-token", "", "node bearer token")
 	_ = fs.Parse(args)
 
-	baseURL, token := mustResolveNodeAuth(*apiBaseURL, *nodeToken)
+	baseURL, token := mustResolveNodeAuthForType(*apiBaseURL, *nodeToken, *nodeType)
 	cfg, _ := loadCLIConfig()
-	nodeType := ""
-	if cfg.Node != nil {
-		nodeType = cfg.Node.NodeType
+	effectiveType := strings.TrimSpace(*nodeType)
+	if effectiveType == "" {
+		if nodeCfg := nodeConfigForType(cfg, ""); nodeCfg != nil {
+			effectiveType = nodeCfg.NodeType
+		}
 	}
 	var resp map[string]any
 	if err := apiRequest("POST", baseURL+"/api/v1/node/heartbeat", map[string]any{
-		"capabilities_json": defaultCapabilities(nodeType),
+		"capabilities_json": defaultCapabilities(effectiveType),
 		"metadata_json": map[string]any{
 			"cli_version": "phase1",
 			"hostname":    defaultHostname(),
@@ -423,8 +428,10 @@ func runNodeDoctor(args []string) {
 
 	cfg, _ := loadCLIConfig()
 	effectiveType := strings.TrimSpace(*nodeType)
-	if effectiveType == "" && cfg.Node != nil {
-		effectiveType = cfg.Node.NodeType
+	if effectiveType == "" {
+		if nodeCfg := nodeConfigForType(cfg, ""); nodeCfg != nil {
+			effectiveType = nodeCfg.NodeType
+		}
 	}
 	if effectiveType == "" {
 		effectiveType = "yt_relay_source"
@@ -450,10 +457,17 @@ func mustResolveUserAuth(apiBaseURLFlag, apiKeyFlag string) (string, string) {
 }
 
 func mustResolveNodeAuth(apiBaseURLFlag, nodeTokenFlag string) (string, string) {
+	return mustResolveNodeAuthForType(apiBaseURLFlag, nodeTokenFlag, "")
+}
+
+func mustResolveNodeAuthForType(apiBaseURLFlag, nodeTokenFlag, explicitNodeType string) (string, string) {
 	cfg, _ := loadCLIConfig()
-	baseURL := normalizeBaseURL(firstNonEmpty(strings.TrimSpace(apiBaseURLFlag), nodeAPIBaseURL(cfg), defaultAPIBaseURL()))
-	token := strings.TrimSpace(firstNonEmpty(nodeTokenFlag, nodeToken(cfg), os.Getenv("STOARAMA_NODE_TOKEN")))
+	baseURL := normalizeBaseURL(firstNonEmpty(strings.TrimSpace(apiBaseURLFlag), nodeAPIBaseURLForType(cfg, explicitNodeType), defaultAPIBaseURL()))
+	token := strings.TrimSpace(firstNonEmpty(nodeTokenFlag, nodeTokenForType(cfg, explicitNodeType), os.Getenv("STOARAMA_NODE_TOKEN")))
 	if token == "" {
+		if strings.TrimSpace(explicitNodeType) != "" {
+			fatalf("missing node token for %s; pass --node-token or run `stoarama node enroll --node-type %s ...`", strings.TrimSpace(explicitNodeType), strings.TrimSpace(explicitNodeType))
+		}
 		fatalf("missing node token; pass --node-token or run `stoarama node enroll ...`")
 	}
 	return baseURL, token
@@ -519,6 +533,16 @@ func loadCLIConfig() (cliConfig, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return cliConfig{}, err
 	}
+	if cfg.Nodes == nil {
+		cfg.Nodes = map[string]*cliNodeConfig{}
+	}
+	if cfg.Node != nil && strings.TrimSpace(cfg.Node.NodeType) != "" {
+		nodeType := strings.TrimSpace(cfg.Node.NodeType)
+		if _, ok := cfg.Nodes[nodeType]; !ok {
+			cp := *cfg.Node
+			cfg.Nodes[nodeType] = &cp
+		}
+	}
 	return cfg, nil
 }
 
@@ -529,6 +553,23 @@ func saveCLIConfig(cfg cliConfig) error {
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
+	}
+	if len(cfg.Nodes) == 0 && cfg.Node != nil && strings.TrimSpace(cfg.Node.NodeType) != "" {
+		cp := *cfg.Node
+		cfg.Nodes = map[string]*cliNodeConfig{strings.TrimSpace(cp.NodeType): &cp}
+	}
+	switch len(cfg.Nodes) {
+	case 0:
+		cfg.Node = nil
+	case 1:
+		for _, node := range cfg.Nodes {
+			if node != nil {
+				cp := *node
+				cfg.Node = &cp
+			}
+		}
+	default:
+		cfg.Node = nil
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -622,17 +663,67 @@ func firstNonEmpty(values ...string) string {
 }
 
 func nodeAPIBaseURL(cfg cliConfig) string {
-	if cfg.Node == nil {
+	return nodeAPIBaseURLForType(cfg, "")
+}
+
+func nodeAPIBaseURLForType(cfg cliConfig, nodeType string) string {
+	node := nodeConfigForType(cfg, nodeType)
+	if node == nil {
 		return ""
 	}
-	return strings.TrimSpace(cfg.Node.APIBaseURL)
+	return strings.TrimSpace(node.APIBaseURL)
 }
 
 func nodeToken(cfg cliConfig) string {
-	if cfg.Node == nil {
+	return nodeTokenForType(cfg, "")
+}
+
+func nodeTokenForType(cfg cliConfig, nodeType string) string {
+	node := nodeConfigForType(cfg, nodeType)
+	if node == nil {
 		return ""
 	}
-	return strings.TrimSpace(cfg.Node.Token)
+	return strings.TrimSpace(node.Token)
+}
+
+func nodeConfigForType(cfg cliConfig, requestedType string) *cliNodeConfig {
+	want := strings.TrimSpace(requestedType)
+	if want != "" {
+		if cfg.Nodes != nil {
+			if node := cfg.Nodes[want]; node != nil {
+				return node
+			}
+		}
+		if cfg.Node != nil && strings.TrimSpace(cfg.Node.NodeType) == want {
+			return cfg.Node
+		}
+		return nil
+	}
+	if cfg.Node != nil && strings.TrimSpace(cfg.Node.NodeType) != "" {
+		return cfg.Node
+	}
+	if len(cfg.Nodes) == 1 {
+		for _, node := range cfg.Nodes {
+			if node != nil {
+				return node
+			}
+		}
+	}
+	return nil
+}
+
+func setNodeConfig(cfg *cliConfig, node *cliNodeConfig) {
+	if cfg == nil || node == nil {
+		return
+	}
+	if cfg.Nodes == nil {
+		cfg.Nodes = map[string]*cliNodeConfig{}
+	}
+	cp := *node
+	cfg.Nodes[strings.TrimSpace(cp.NodeType)] = &cp
+	if len(cfg.Nodes) == 1 {
+		cfg.Node = &cp
+	}
 }
 
 func fatalf(format string, args ...any) {

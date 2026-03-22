@@ -25,6 +25,7 @@ func runPipelineRegister(ctx context.Context, cfg config.Config, args []string) 
 	apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 	id := fs.String("id", "", "pipeline id")
 	ownerAccountID := fs.Int64("owner-account-id", 0, "optional owner account id for service/admin auth")
+	ownerEmail := fs.String("owner-email", "", "optional owner account email for service/admin auth")
 	family := fs.String("family", "", "pipeline family")
 	kind := fs.String("kind", "detector", "pipeline kind")
 	specJSON := fs.String("spec-json", "{}", "pipeline spec JSON object")
@@ -43,6 +44,7 @@ func runPipelineRegister(ctx context.Context, cfg config.Config, args []string) 
 		"pipelines": []map[string]any{{
 			"id":               strings.TrimSpace(*id),
 			"owner_account_id": optionalInt64(*ownerAccountID),
+			"owner_email":      strings.TrimSpace(*ownerEmail),
 			"pipeline_family":  strings.TrimSpace(*family),
 			"kind":             strings.TrimSpace(*kind),
 			"spec_json":        spec,
@@ -72,6 +74,7 @@ func runPipelineVersions(ctx context.Context, cfg config.Config, args []string) 
 		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 		pipelineID := fs.String("pipeline-id", "", "pipeline id")
 		ownerAccountID := fs.Int64("owner-account-id", 0, "optional owner account id for service/admin auth")
+		ownerEmail := fs.String("owner-email", "", "optional owner account email for service/admin auth")
 		versionID := fs.String("version-id", "", "version id")
 		runnerKind := fs.String("runner-kind", "external", "runner kind")
 		specJSON := fs.String("spec-json", "{}", "version spec JSON object")
@@ -89,6 +92,7 @@ func runPipelineVersions(ctx context.Context, cfg config.Config, args []string) 
 			"versions": []map[string]any{{
 				"pipeline_id":      strings.TrimSpace(*pipelineID),
 				"owner_account_id": optionalInt64(*ownerAccountID),
+				"owner_email":      strings.TrimSpace(*ownerEmail),
 				"version_id":       strings.TrimSpace(*versionID),
 				"runner_kind":      strings.TrimSpace(*runnerKind),
 				"spec_json":        spec,
@@ -144,6 +148,7 @@ func runPipelineRuns(ctx context.Context, cfg config.Config, args []string) {
 		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 		pipelineID := fs.String("pipeline-id", "", "pipeline id")
 		ownerAccountID := fs.Int64("owner-account-id", 0, "optional owner account id for service/admin auth")
+		ownerEmail := fs.String("owner-email", "", "optional owner account email for service/admin auth")
 		versionID := fs.String("version-id", "", "pipeline version id")
 		label := fs.String("label", "", "run label")
 		workerKind := fs.String("worker-kind", "external", "worker kind")
@@ -174,6 +179,7 @@ func runPipelineRuns(ctx context.Context, cfg config.Config, args []string) {
 		payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/pipeline-runs", map[string]any{
 			"pipeline_id":            strings.TrimSpace(*pipelineID),
 			"owner_account_id":       optionalInt64(*ownerAccountID),
+			"owner_email":            strings.TrimSpace(*ownerEmail),
 			"version_id":             strings.TrimSpace(*versionID),
 			"label":                  strings.TrimSpace(*label),
 			"worker_kind":            strings.TrimSpace(*workerKind),

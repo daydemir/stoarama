@@ -236,6 +236,7 @@ func (s *Server) router() http.Handler {
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
 
+			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)
 			service.Post("/source-candidates", s.handleSourceCandidatesUpsert)
 			service.Post("/source-candidates/{id}/runs", s.handleSourceCandidateRunCreate)
 			service.Post("/source-candidates/{id}/auto-import", s.handleServiceSourceCandidateAutoImport)
@@ -900,6 +901,7 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 type pipelineSpec struct {
 	ID             string         `json:"id"`
 	OwnerAccountID *int64         `json:"owner_account_id,omitempty"`
+	OwnerEmail     string         `json:"owner_email,omitempty"`
 	PipelineFamily string         `json:"pipeline_family"`
 	Kind           string         `json:"kind"`
 	SpecJSON       map[string]any `json:"spec_json"`
@@ -959,7 +961,7 @@ func (s *Server) handlePipelinesSync(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid pipeline spec_json for %s: %v", p.ID, err))
 			return
 		}
-		ownerAccountID, err := s.resolvePipelineOwnerForSync(r.Context(), strings.TrimSpace(p.ID), p.OwnerAccountID)
+		ownerAccountID, err := s.resolvePipelineOwnerForSync(r.Context(), strings.TrimSpace(p.ID), p.OwnerAccountID, p.OwnerEmail)
 		if err != nil {
 			writeAPIError(w, err)
 			return
