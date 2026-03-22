@@ -459,6 +459,7 @@ func (s *Server) handleSourceCandidatesUpsert(w http.ResponseWriter, r *http.Req
 			)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending','')
 			ON CONFLICT (provider, external_id)
+			WHERE btrim(provider) <> '' AND btrim(external_id) <> ''
 			DO UPDATE SET
 				source_family=EXCLUDED.source_family,
 				capture_type=EXCLUDED.capture_type,
