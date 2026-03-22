@@ -41,8 +41,8 @@ func runNodeYTRelaySourceRun(args []string) {
 	current := defaultYTRelaySourceConfig(cfg)
 
 	fs := flag.NewFlagSet("node yt-relay-source run", flag.ExitOnError)
-	apiBaseURL := fs.String("api-base-url", nodeAPIBaseURL(cfg), "Stoarama API base URL")
-	nodeToken := fs.String("node-token", nodeToken(cfg), "node bearer token")
+	apiBaseURL := fs.String("api-base-url", nodeAPIBaseURLForType(cfg, "yt_relay_source"), "Stoarama API base URL")
+	nodeToken := fs.String("node-token", nodeTokenForType(cfg, "yt_relay_source"), "node bearer token")
 	publicBaseURL := fs.String("public-base-url", current.PublicBaseURL, "public relay base URL")
 	bindAddr := fs.String("bind-addr", current.BindAddr, "relay bind address")
 	shardID := fs.String("shard-id", current.ShardID, "relay shard id")
@@ -68,7 +68,7 @@ func runNodeYTRelaySourceRun(args []string) {
 	sourceEndpoint := fs.String("source-endpoint", current.SourceEndpoint, "source endpoint host:port")
 	_ = fs.Parse(args)
 
-	baseURL, token := mustResolveNodeAuth(*apiBaseURL, *nodeToken)
+	baseURL, token := mustResolveNodeAuthForType(*apiBaseURL, *nodeToken, "yt_relay_source")
 	node := mustLoadNodeInfo(baseURL, token)
 	if strings.TrimSpace(node.Node.NodeType) != "yt_relay_source" {
 		fatalf("node type %q cannot run yt relay source", node.Node.NodeType)
@@ -174,7 +174,7 @@ func runNodeYTRelaySourceInstallLaunchd(args []string) {
 	sharedToken := fs.String("shared-token", current.SharedToken, "relay shared token")
 	_ = fs.Parse(args)
 
-	nodeCfg := cfg.Node
+	nodeCfg := nodeConfigForType(cfg, "yt_relay_source")
 	if nodeCfg == nil || strings.TrimSpace(nodeCfg.NodeType) != "yt_relay_source" {
 		fatalf("enroll a yt_relay_source node first with `stoarama node enroll ...`")
 	}

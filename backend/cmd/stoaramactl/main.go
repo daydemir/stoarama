@@ -86,6 +86,8 @@ func main() {
 		runImport(ctx, cfg, os.Args[2:])
 	case "pipelines":
 		runPipelines(ctx, cfg, os.Args[2:])
+	case "nodes":
+		runNodes(ctx, cfg, os.Args[2:])
 	case "recording":
 		runRecording(ctx, cfg, os.Args[2:])
 	case "servers":
@@ -141,15 +143,16 @@ func usage() {
 	  stoaramactl overview status [--backend-api-url URL --api-token TOKEN --hours 168]
 	  stoaramactl overview queue-health [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines list
-	  stoaramactl pipelines register --id P --family FAMILY [--kind detector --spec-json JSON --active=true] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl pipelines versions sync --pipeline-id P --version-id V [--runner-kind external --spec-json JSON --created-by stoaramactl] [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl pipelines register --id P --family FAMILY [--kind detector --spec-json JSON --active=true --owner-email EMAIL] [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl pipelines versions sync --pipeline-id P --version-id V [--runner-kind external --spec-json JSON --created-by stoaramactl --owner-email EMAIL] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines versions list [--pipeline-id P] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl pipelines runs create --pipeline-id P --version-id V [--label LABEL --worker-kind external --frame-ids 1,2 --stream-ids 3,4 --tags a,b --latest-only-per-stream --limit 100 --metadata-json JSON --created-by stoaramactl] [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl pipelines runs create --pipeline-id P --version-id V [--label LABEL --worker-kind external --frame-ids 1,2 --stream-ids 3,4 --tags a,b --latest-only-per-stream --limit 100 --metadata-json JSON --created-by stoaramactl --owner-email EMAIL] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs list [--pipeline-id P --limit 200 --offset 0] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs get --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs claim --id N --claimed-by WORKER [--limit 100 --lease-sec 600 --force-rerun] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs complete --claim-id N --pipeline-id P --pipeline-run-id N --frame-id N --claimed-by WORKER [--pipeline-version-id N --summary-json JSON --raw-output-json JSON --runner-info-json JSON --detections-json JSON --signals-json JSON --started-at RFC3339 --finished-at RFC3339 --force-rerun --revision-mode force_rerun] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs fail --claim-id N --pipeline-id P --pipeline-run-id N --frame-id N --claimed-by WORKER --error-text TEXT [--pipeline-version-id N --runner-info-json JSON] [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines overview [--backend-api-url URL --api-token TOKEN --include-inactive=true]
 	  stoaramactl pipelines stream-list --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines set --stream-id N --pipeline-id P --enabled=true|false [--updated-by stoaramactl --backend-api-url URL --api-token TOKEN]

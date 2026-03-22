@@ -18,6 +18,7 @@ import (
 type pipelineVersionSpec struct {
 	PipelineID     string         `json:"pipeline_id"`
 	OwnerAccountID *int64         `json:"owner_account_id,omitempty"`
+	OwnerEmail     string         `json:"owner_email,omitempty"`
 	VersionID      string         `json:"version_id"`
 	RunnerKind     string         `json:"runner_kind"`
 	SpecJSON       map[string]any `json:"spec_json"`
@@ -31,6 +32,7 @@ type pipelineVersionSyncRequest struct {
 type pipelineRunCreateRequest struct {
 	PipelineID          string         `json:"pipeline_id"`
 	OwnerAccountID      *int64         `json:"owner_account_id,omitempty"`
+	OwnerEmail          string         `json:"owner_email,omitempty"`
 	VersionID           string         `json:"version_id"`
 	Label               string         `json:"label"`
 	WorkerKind          string         `json:"worker_kind"`
@@ -67,6 +69,32 @@ func pipelineNodeScope(ctx context.Context) (nodePrincipal, bool) {
 	return nodePrincipalFromContext(ctx)
 }
 
+func (s *Server) resolveAccountRef(ctx context.Context, explicitID *int64, explicitEmail string) (*int64, error) {
+	email := normalizeAccountEmail(explicitEmail)
+	var resolvedByEmail *int64
+	if email != "" {
+		var accountID int64
+		if err := s.pool.QueryRow(ctx, `SELECT id FROM accounts WHERE email=$1`, email).Scan(&accountID); err != nil {
+			if err == pgx.ErrNoRows {
+				return nil, newAPIStatusError(http.StatusBadRequest, "account not found for owner_email")
+			}
+			return nil, fmt.Errorf("lookup owner_email: %w", err)
+		}
+		resolvedByEmail = &accountID
+	}
+	if explicitID != nil && *explicitID > 0 {
+		if resolvedByEmail != nil && *resolvedByEmail != *explicitID {
+			return nil, newAPIStatusError(http.StatusConflict, "owner_account_id and owner_email refer to different accounts")
+		}
+		owner := *explicitID
+		return &owner, nil
+	}
+	if resolvedByEmail != nil {
+		return resolvedByEmail, nil
+	}
+	return nil, nil
+}
+
 func normalizeNodeClaimedBy(principal nodePrincipal, raw string) (string, error) {
 	prefix := fmt.Sprintf("node:%d", principal.NodeID)
 	value := strings.TrimSpace(raw)
@@ -79,21 +107,29 @@ func normalizeNodeClaimedBy(principal nodePrincipal, raw string) (string, error)
 	return "", newAPIStatusError(http.StatusForbidden, "claimed_by must use node prefix %s", prefix)
 }
 
-func (s *Server) resolvePipelineOwnerForSync(ctx context.Context, pipelineID string, explicit *int64) (*int64, error) {
+func (s *Server) resolvePipelineOwnerForSync(ctx context.Context, pipelineID string, explicit *int64, explicitEmail string) (*int64, error) {
 	if principal, ok := accountPrincipalFromContext(ctx); ok {
 		if explicit != nil && *explicit > 0 && *explicit != principal.AccountID {
 			return nil, newAPIStatusError(http.StatusForbidden, "owner_account_id must match the authenticated account")
+		}
+		if email := normalizeAccountEmail(explicitEmail); email != "" && email != normalizeAccountEmail(principal.Email) {
+			return nil, newAPIStatusError(http.StatusForbidden, "owner_email must match the authenticated account")
 		}
 		owner := principal.AccountID
 		return &owner, nil
 	}
 
+	resolvedExplicit, err := s.resolveAccountRef(ctx, explicit, explicitEmail)
+	if err != nil {
+		return nil, err
+	}
+
 	var existingOwner *int64
-	err := s.pool.QueryRow(ctx, `SELECT owner_account_id FROM pipelines WHERE id=$1`, strings.TrimSpace(pipelineID)).Scan(&existingOwner)
+	err = s.pool.QueryRow(ctx, `SELECT owner_account_id FROM pipelines WHERE id=$1`, strings.TrimSpace(pipelineID)).Scan(&existingOwner)
 	switch {
 	case err == nil:
 		if existingOwner != nil {
-			if explicit != nil && *explicit > 0 && *existingOwner != *explicit {
+			if resolvedExplicit != nil && *existingOwner != *resolvedExplicit {
 				return nil, newAPIStatusError(http.StatusConflict, "pipeline owner is immutable once created")
 			}
 			return existingOwner, nil
@@ -103,10 +139,10 @@ func (s *Server) resolvePipelineOwnerForSync(ctx context.Context, pipelineID str
 		return nil, fmt.Errorf("load pipeline owner: %w", err)
 	}
 
-	if explicit == nil || *explicit <= 0 {
-		return nil, newAPIStatusError(http.StatusBadRequest, "owner_account_id is required for service/admin pipeline sync")
+	if resolvedExplicit == nil || *resolvedExplicit <= 0 {
+		return nil, newAPIStatusError(http.StatusBadRequest, "owner_account_id or owner_email is required for service/admin pipeline sync")
 	}
-	owner := *explicit
+	owner := *resolvedExplicit
 	return &owner, nil
 }
 
@@ -152,8 +188,13 @@ func (s *Server) handlePipelineVersionsSync(w http.ResponseWriter, r *http.Reque
 				util.WriteError(w, http.StatusForbidden, "pipeline does not belong to the authenticated account")
 				return
 			}
-		} else if spec.OwnerAccountID != nil && *spec.OwnerAccountID > 0 {
-			if pipelineOwnerID != nil && *pipelineOwnerID != *spec.OwnerAccountID {
+		} else {
+			resolvedOwner, err := s.resolveAccountRef(r.Context(), spec.OwnerAccountID, spec.OwnerEmail)
+			if err != nil {
+				writeAPIError(w, err)
+				return
+			}
+			if resolvedOwner != nil && pipelineOwnerID != nil && *pipelineOwnerID != *resolvedOwner {
 				util.WriteError(w, http.StatusConflict, "pipeline version owner must match the pipeline owner")
 				return
 			}
@@ -643,8 +684,13 @@ func (s *Server) handlePipelineRunsCreate(w http.ResponseWriter, r *http.Request
 			util.WriteError(w, http.StatusForbidden, "pipeline run does not belong to the authenticated account")
 			return
 		}
-	} else if req.OwnerAccountID != nil && *req.OwnerAccountID > 0 {
-		if ownerAccountID != nil && *ownerAccountID != *req.OwnerAccountID {
+	} else {
+		resolvedOwner, err := s.resolveAccountRef(r.Context(), req.OwnerAccountID, req.OwnerEmail)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		if resolvedOwner != nil && ownerAccountID != nil && *ownerAccountID != *resolvedOwner {
 			util.WriteError(w, http.StatusConflict, "pipeline run owner must match the pipeline owner")
 			return
 		}
