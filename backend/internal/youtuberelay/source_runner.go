@@ -428,18 +428,16 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			return fmt.Errorf("list youtube relay routes: %w", err)
 		}
 		activeRouteIDs := map[int64]struct{}{}
+		activeRoutes := make([]captureapi.YouTubeRelayRoute, 0, len(routes))
 		for _, route := range routes {
 			status := strings.TrimSpace(strings.ToLower(route.Status))
 			if status != "assigned" && status != "source_ready" && status != "running" && status != "failed" && status != "stopped" {
 				continue
 			}
 			activeRouteIDs[route.StreamID] = struct{}{}
+			activeRoutes = append(activeRoutes, route)
 		}
-		for _, route := range routes {
-			status := strings.TrimSpace(strings.ToLower(route.Status))
-			if status != "assigned" && status != "source_ready" && status != "running" && status != "failed" && status != "stopped" {
-				continue
-			}
+		for _, route := range activeRoutes {
 			relayPullURL := fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, route.StreamID, url.QueryEscape(strings.TrimSpace(opts.SharedToken)))
 			if lastUpstreamURL[route.StreamID] == "" {
 				if cached, ok := routeCache[route.StreamID]; ok && strings.TrimSpace(cached.UpstreamURL) != "" {
@@ -473,22 +471,72 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 					})
 				}
 			}
-			spec := capture.StreamSpec{
-				ID:            route.StreamID,
-				Provider:      "youtube",
-				StreamURL:     strings.TrimSpace(route.StreamURL),
-				SourcePageURL: strings.TrimSpace(route.SourcePageURL),
-				CaptureMode:   capture.ModeYouTubeLive,
-			}
-			resolveCtx, resolveCancel := context.WithTimeout(ctx, time.Duration(opts.ResolveTimeoutSec)*time.Second)
-			resolved, err := ytAdapter.Resolve(resolveCtx, spec)
-			resolveCancel()
-			if err != nil {
+		}
+
+		type resolveResult struct {
+			route        captureapi.YouTubeRelayRoute
+			relayPullURL string
+			upstreamURL  string
+			err          error
+		}
+
+		resolveWorkers := opts.Capacity
+		if resolveWorkers <= 0 {
+			resolveWorkers = 1
+		}
+		if len(activeRoutes) > 0 && resolveWorkers > len(activeRoutes) {
+			resolveWorkers = len(activeRoutes)
+		}
+		if resolveWorkers <= 0 {
+			resolveWorkers = 1
+		}
+
+		resultsCh := make(chan resolveResult, len(activeRoutes))
+		var resolveWG sync.WaitGroup
+		resolveSem := make(chan struct{}, resolveWorkers)
+		for _, route := range activeRoutes {
+			resolveWG.Add(1)
+			go func(route captureapi.YouTubeRelayRoute) {
+				defer resolveWG.Done()
+				resolveSem <- struct{}{}
+				defer func() { <-resolveSem }()
+
+				spec := capture.StreamSpec{
+					ID:            route.StreamID,
+					Provider:      "youtube",
+					StreamURL:     strings.TrimSpace(route.StreamURL),
+					SourcePageURL: strings.TrimSpace(route.SourcePageURL),
+					CaptureMode:   capture.ModeYouTubeLive,
+				}
+				resolveCtx, resolveCancel := context.WithTimeout(ctx, time.Duration(opts.ResolveTimeoutSec)*time.Second)
+				resolved, err := ytAdapter.Resolve(resolveCtx, spec)
+				resolveCancel()
+
+				upstreamURL := ""
+				if err == nil {
+					upstreamURL = strings.TrimSpace(resolved.URL)
+				}
+				resultsCh <- resolveResult{
+					route:        route,
+					relayPullURL: fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, route.StreamID, url.QueryEscape(strings.TrimSpace(opts.SharedToken))),
+					upstreamURL:  upstreamURL,
+					err:          err,
+				}
+			}(route)
+		}
+		resolveWG.Wait()
+		close(resultsCh)
+
+		for result := range resultsCh {
+			route := result.route
+			status := strings.TrimSpace(strings.ToLower(route.Status))
+			relayPullURL := result.relayPullURL
+			if result.err != nil {
 				routeResolveFailures[route.StreamID]++
 				if lastUpstreamURL[route.StreamID] != "" &&
 					lastPublishedPullURL[route.StreamID] == relayPullURL &&
 					(lastStatus[route.StreamID] == "source_ready" || lastStatus[route.StreamID] == "running") {
-					log.Printf("youtube-relay source keeping previous route stream_id=%d after resolve failure consecutive=%d/%d: %v", route.StreamID, routeResolveFailures[route.StreamID], opts.ResolveFailureThreshold, err)
+					log.Printf("youtube-relay source keeping previous route stream_id=%d after resolve failure consecutive=%d/%d: %v", route.StreamID, routeResolveFailures[route.StreamID], opts.ResolveFailureThreshold, result.err)
 					continue
 				}
 				relayState.mu.Lock()
@@ -499,7 +547,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 					Actor:     "youtube_relay_source",
 					Status:    "failed",
 					Reason:    "resolve_failed",
-					ErrorText: strings.TrimSpace(err.Error()),
+					ErrorText: strings.TrimSpace(result.err.Error()),
 					MetadataJSON: map[string]any{
 						"source_server_id":  strings.TrimSpace(opts.ServerID),
 						"relay_public_url":  relayPullURL,
@@ -511,7 +559,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 				})
 				continue
 			}
-			upstreamURL := strings.TrimSpace(resolved.URL)
+			upstreamURL := result.upstreamURL
 			if upstreamURL == "" {
 				continue
 			}
