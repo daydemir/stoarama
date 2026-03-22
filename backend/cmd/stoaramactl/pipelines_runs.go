@@ -24,6 +24,7 @@ func runPipelineRegister(ctx context.Context, cfg config.Config, args []string) 
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 	id := fs.String("id", "", "pipeline id")
+	ownerAccountID := fs.Int64("owner-account-id", 0, "optional owner account id for service/admin auth")
 	family := fs.String("family", "", "pipeline family")
 	kind := fs.String("kind", "detector", "pipeline kind")
 	specJSON := fs.String("spec-json", "{}", "pipeline spec JSON object")
@@ -40,11 +41,12 @@ func runPipelineRegister(ctx context.Context, cfg config.Config, args []string) 
 	spec := parseJSONObjectFlag("--spec-json", *specJSON)
 	payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/pipelines/sync", map[string]any{
 		"pipelines": []map[string]any{{
-			"id":              strings.TrimSpace(*id),
-			"pipeline_family": strings.TrimSpace(*family),
-			"kind":            strings.TrimSpace(*kind),
-			"spec_json":       spec,
-			"active":          *active,
+			"id":               strings.TrimSpace(*id),
+			"owner_account_id": optionalInt64(*ownerAccountID),
+			"pipeline_family":  strings.TrimSpace(*family),
+			"kind":             strings.TrimSpace(*kind),
+			"spec_json":        spec,
+			"active":           *active,
 		}},
 	})
 	if *asJSON {
@@ -69,6 +71,7 @@ func runPipelineVersions(ctx context.Context, cfg config.Config, args []string) 
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 		pipelineID := fs.String("pipeline-id", "", "pipeline id")
+		ownerAccountID := fs.Int64("owner-account-id", 0, "optional owner account id for service/admin auth")
 		versionID := fs.String("version-id", "", "version id")
 		runnerKind := fs.String("runner-kind", "external", "runner kind")
 		specJSON := fs.String("spec-json", "{}", "version spec JSON object")
@@ -84,11 +87,12 @@ func runPipelineVersions(ctx context.Context, cfg config.Config, args []string) 
 		spec := parseJSONObjectFlag("--spec-json", *specJSON)
 		payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/pipeline-versions/sync", map[string]any{
 			"versions": []map[string]any{{
-				"pipeline_id": strings.TrimSpace(*pipelineID),
-				"version_id":  strings.TrimSpace(*versionID),
-				"runner_kind": strings.TrimSpace(*runnerKind),
-				"spec_json":   spec,
-				"created_by":  strings.TrimSpace(*createdBy),
+				"pipeline_id":      strings.TrimSpace(*pipelineID),
+				"owner_account_id": optionalInt64(*ownerAccountID),
+				"version_id":       strings.TrimSpace(*versionID),
+				"runner_kind":      strings.TrimSpace(*runnerKind),
+				"spec_json":        spec,
+				"created_by":       strings.TrimSpace(*createdBy),
 			}},
 		})
 		if *asJSON {
@@ -126,11 +130,11 @@ func runPipelineVersions(ctx context.Context, cfg config.Config, args []string) 
 
 func runPipelineRuns(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Print("stoaramactl pipelines runs <create|list|get|claim|complete|fail> ...\n")
+		fmt.Print("stoaramactl pipelines runs <create|list|get|targets|claim|complete|fail> ...\n")
 		return
 	}
 	if len(args) < 1 {
-		fmt.Print("stoaramactl pipelines runs <create|list|get|claim|complete|fail> ...\n")
+		fmt.Print("stoaramactl pipelines runs <create|list|get|targets|claim|complete|fail> ...\n")
 		return
 	}
 	switch args[0] {
@@ -139,6 +143,7 @@ func runPipelineRuns(ctx context.Context, cfg config.Config, args []string) {
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 		pipelineID := fs.String("pipeline-id", "", "pipeline id")
+		ownerAccountID := fs.Int64("owner-account-id", 0, "optional owner account id for service/admin auth")
 		versionID := fs.String("version-id", "", "pipeline version id")
 		label := fs.String("label", "", "run label")
 		workerKind := fs.String("worker-kind", "external", "worker kind")
@@ -168,6 +173,7 @@ func runPipelineRuns(ctx context.Context, cfg config.Config, args []string) {
 		metadata := parseJSONObjectFlag("--metadata-json", *metadataJSON)
 		payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/pipeline-runs", map[string]any{
 			"pipeline_id":            strings.TrimSpace(*pipelineID),
+			"owner_account_id":       optionalInt64(*ownerAccountID),
 			"version_id":             strings.TrimSpace(*versionID),
 			"label":                  strings.TrimSpace(*label),
 			"worker_kind":            strings.TrimSpace(*workerKind),
@@ -224,6 +230,37 @@ func runPipelineRuns(ctx context.Context, cfg config.Config, args []string) {
 			return
 		}
 		printPipelineRunItem(payload)
+	case "targets":
+		fs := flag.NewFlagSet("pipelines runs targets", flag.ExitOnError)
+		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
+		id := fs.Int64("id", 0, "run id")
+		status := fs.String("status", "", "optional target status filter")
+		limit := fs.Int("limit", 200, "row limit")
+		offset := fs.Int("offset", 0, "row offset")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if *id <= 0 {
+			log.Fatalf("--id is required")
+		}
+		q := url.Values{}
+		q.Set("limit", strconv.Itoa(*limit))
+		q.Set("offset", strconv.Itoa(*offset))
+		if v := strings.TrimSpace(*status); v != "" {
+			q.Set("status", v)
+		}
+		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/pipeline-runs/%d/targets?%s", *id, q.Encode()))
+		if *asJSON {
+			printJSON(payload)
+			return
+		}
+		items, _ := payload["items"].([]any)
+		for _, raw := range items {
+			it := asMap(raw)
+			fmt.Printf("target_id=%v run_id=%v frame_id=%v stream_id=%v status=%s captured_at=%s claim_id=%v result_id=%v claimed_by=%s object_key=%s\n",
+				it["id"], it["run_id"], it["frame_id"], it["stream_id"], fmt.Sprint(it["status"]), fmt.Sprint(it["captured_at"]),
+				it["claim_id"], it["result_id"], fmt.Sprint(it["claimed_by"]), fmt.Sprint(it["object_key"]))
+		}
 	case "claim":
 		fs := flag.NewFlagSet("pipelines runs claim", flag.ExitOnError)
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
@@ -388,6 +425,13 @@ func parseJSONObjectFlag(flagName string, raw string) map[string]any {
 		return map[string]any{}
 	}
 	return out
+}
+
+func optionalInt64(v int64) any {
+	if v <= 0 {
+		return nil
+	}
+	return v
 }
 
 func parseJSONArrayFlag(flagName string, raw string) []any {
