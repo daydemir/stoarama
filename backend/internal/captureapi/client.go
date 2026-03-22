@@ -3,6 +3,7 @@ package captureapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -526,7 +527,10 @@ func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadInte
 		ExpiresAt   time.Time `json:"expires_at"`
 		ContentType string    `json:"content_type"`
 	}
-	if err := c.postJSON(ctx, "/api/v1/media/upload-intents", payload, &out); err != nil {
+	headers := map[string]string{
+		"Idempotency-Key": buildIdempotencyKey("capture-segment", req.StreamID),
+	}
+	if err := c.postJSONWithHeaders(ctx, "/api/v1/media/upload-intents", payload, headers, &out); err != nil {
 		return SegmentUploadIntent{}, err
 	}
 	return SegmentUploadIntent{
@@ -1087,6 +1091,10 @@ func (c *Client) RecordingProcessStopped(ctx context.Context, req RecordingProce
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, out any) error {
+	return c.postJSONWithHeaders(ctx, path, payload, nil, out)
+}
+
+func (c *Client) postJSONWithHeaders(ctx context.Context, path string, payload any, headers map[string]string, out any) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal request payload: %w", err)
@@ -1098,6 +1106,12 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any, out any
 	req.Header.Set("Authorization", "Bearer "+c.apiToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	for k, v := range headers {
+		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {
@@ -1115,6 +1129,19 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any, out any
 		return fmt.Errorf("decode %s response: %w", path, err)
 	}
 	return nil
+}
+
+func buildIdempotencyKey(prefix string, streamID int64) string {
+	const fallback = "capture-segment"
+	p := strings.TrimSpace(prefix)
+	if p == "" {
+		p = fallback
+	}
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("%s-%d-%d", p, streamID, time.Now().UTC().UnixNano())
+	}
+	return fmt.Sprintf("%s-%d-%x", p, streamID, buf[:])
 }
 
 func (c *Client) postJSONWithRetry(ctx context.Context, path string, payload any, out any, attempts int) error {
