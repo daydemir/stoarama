@@ -205,7 +205,14 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 	}{
 		routes: map[int64]relayRouteState{},
 	}
-	relayHTTPClient := &http.Client{}
+	relayHTTPClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyFromEnvironment,
+			DisableKeepAlives: true,
+			ForceAttemptHTTP2: false,
+		},
+	}
 	isHopByHopHeader := func(k string) bool {
 		switch strings.ToLower(strings.TrimSpace(k)) {
 		case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
