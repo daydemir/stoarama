@@ -443,6 +443,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		}
 		activeRouteIDs := map[int64]struct{}{}
 		activeRoutes := make([]captureapi.YouTubeRelayRoute, 0, len(routes))
+		routesToResolve := make([]captureapi.YouTubeRelayRoute, 0, len(routes))
 		for _, route := range routes {
 			status := strings.TrimSpace(strings.ToLower(route.Status))
 			if status != "assigned" && status != "source_ready" && status != "running" && status != "failed" && status != "stopped" {
@@ -500,6 +501,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 					continue
 				}
 			}
+			routesToResolve = append(routesToResolve, route)
 		}
 
 		type resolveResult struct {
@@ -516,17 +518,17 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		if resolveWorkers > 3 {
 			resolveWorkers = 3
 		}
-		if len(activeRoutes) > 0 && resolveWorkers > len(activeRoutes) {
-			resolveWorkers = len(activeRoutes)
+		if len(routesToResolve) > 0 && resolveWorkers > len(routesToResolve) {
+			resolveWorkers = len(routesToResolve)
 		}
 		if resolveWorkers <= 0 {
 			resolveWorkers = 1
 		}
 
-		resultsCh := make(chan resolveResult, len(activeRoutes))
+		resultsCh := make(chan resolveResult, len(routesToResolve))
 		var resolveWG sync.WaitGroup
 		resolveSem := make(chan struct{}, resolveWorkers)
-		for _, route := range activeRoutes {
+		for _, route := range routesToResolve {
 			resolveWG.Add(1)
 			go func(route captureapi.YouTubeRelayRoute) {
 				defer resolveWG.Done()

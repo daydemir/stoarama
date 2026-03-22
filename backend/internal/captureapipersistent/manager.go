@@ -567,7 +567,7 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 		if telemetryDone != nil {
 			<-telemetryDone
 		}
-		if m.shouldRelayRouteStatus(s, effectiveMode) {
+		if m.shouldPublishRelayTerminalStatus(s, effectiveMode, finalStatus) {
 			relayStatus := "stopped"
 			if finalStatus == "failed" || finalStatus == "crashed" {
 				relayStatus = "failed"
@@ -945,6 +945,16 @@ func (m *Manager) shouldRelayRouteStatus(s streamConfig, effective capture.Mode)
 		s.AssignmentRevision > 0 &&
 		effective == capture.ModeYouTubeRelay &&
 		strings.TrimSpace(m.cfg.ServerID) != ""
+}
+
+func (m *Manager) shouldPublishRelayTerminalStatus(s streamConfig, effective capture.Mode, finalStatus string) bool {
+	if !m.shouldRelayRouteStatus(s, effective) {
+		return false
+	}
+	// Clip-native relay workers restart cleanly between segments and on reconcile. Do not
+	// downgrade a healthy route to stopped on ordinary shutdown; only publish terminal sink
+	// status when the session actually failed.
+	return finalStatus == "failed" || finalStatus == "crashed"
 }
 
 func (m *Manager) recordSessionError(ctx context.Context, s streamConfig, effective capture.Mode, resolvedURL string, runErr error) (bool, error) {
