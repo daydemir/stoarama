@@ -216,6 +216,8 @@ func (s *Server) router() http.Handler {
 			admin.Post("/pipeline-experiment-iterations/sync", s.handlePipelineExperimentIterationsSync)
 			admin.Get("/capture/schema", s.handleCaptureSchema)
 			admin.Get("/frames", s.handleFramesList)
+			admin.Get("/capture/streams/{id}/segments", s.handleCaptureStreamSegmentsList)
+			admin.Get("/capture/streams/{id}/segments/latest", s.handleCaptureStreamSegmentLatest)
 			admin.Get("/dashboard/overview", s.handleDashboardOverview)
 			admin.Get("/dashboard/streams", s.handleDashboardStreams)
 			admin.Get("/dashboard/countries", s.handleDashboardCountries)
@@ -286,6 +288,8 @@ func (s *Server) router() http.Handler {
 			service.Post("/youtube-relay/routes/{stream_id}/status", s.handleYouTubeRelayRouteStatus)
 			service.Get("/capture/streams", s.handleCaptureStreams)
 			service.Get("/capture/streams/{id}", s.handleCaptureStreamDetail)
+			service.Get("/capture/streams/{id}/segments", s.handleCaptureStreamSegmentsList)
+			service.Get("/capture/streams/{id}/segments/latest", s.handleCaptureStreamSegmentLatest)
 			service.Get("/service/capture/catalog/candidates", s.handleServiceCaptureCatalogCandidates)
 			service.Get("/capture/runtime", s.handleCaptureRuntime)
 			service.Post("/capture/runtime/stopped", s.handleCaptureRuntimeStopped)
@@ -1196,37 +1200,51 @@ func (s *Server) handleUploadIntents(w http.ResponseWriter, r *http.Request) {
 	if kind == "" {
 		kind = "boxed"
 	}
-	if kind != "boxed" {
-		util.WriteError(w, http.StatusBadRequest, "kind must be boxed")
+	if kind != "boxed" && kind != "capture_segment" {
+		util.WriteError(w, http.StatusBadRequest, "kind must be boxed or capture_segment")
 		return
 	}
-	if strings.TrimSpace(req.PipelineID) == "" {
-		util.WriteError(w, http.StatusBadRequest, "pipeline_id is required")
-		return
+	if kind == "boxed" {
+		if strings.TrimSpace(req.PipelineID) == "" {
+			util.WriteError(w, http.StatusBadRequest, "pipeline_id is required")
+			return
+		}
+		if req.StreamID <= 0 {
+			if req.FrameID <= 0 {
+				util.WriteError(w, http.StatusBadRequest, "stream_id or frame_id is required")
+				return
+			}
+			if err := s.pool.QueryRow(r.Context(), `SELECT stream_id FROM frames WHERE id=$1`, req.FrameID).Scan(&req.StreamID); err != nil {
+				util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("frame not found: %v", err))
+				return
+			}
+		}
 	}
-	if req.StreamID <= 0 {
-		if req.FrameID <= 0 {
-			util.WriteError(w, http.StatusBadRequest, "stream_id or frame_id is required")
-			return
-		}
-		if err := s.pool.QueryRow(r.Context(), `SELECT stream_id FROM frames WHERE id=$1`, req.FrameID).Scan(&req.StreamID); err != nil {
-			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("frame not found: %v", err))
-			return
-		}
+	if kind == "capture_segment" && req.StreamID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "stream_id is required for capture_segment")
+		return
 	}
 	mimeType := strings.TrimSpace(req.MimeType)
-	if mimeType == "" {
-		mimeType = "image/jpeg"
-	}
 	now := time.Now().UTC()
-	ext := fileExtensionFromMIME(mimeType)
-	if ext == "" {
-		ext = ".jpg"
-	}
 	intentID := uuid.New()
-	objectKey := fmt.Sprintf("boxed/pipeline/%s/stream/%d/%04d/%02d/%02d/%s%s",
-		sanitizePathToken(req.PipelineID), req.StreamID,
-		now.Year(), int(now.Month()), now.Day(), intentID.String(), ext)
+	objectKey := ""
+	if kind == "boxed" {
+		if mimeType == "" {
+			mimeType = "image/jpeg"
+		}
+		ext := fileExtensionFromMIME(mimeType)
+		if ext == "" {
+			ext = ".jpg"
+		}
+		objectKey = fmt.Sprintf("boxed/pipeline/%s/stream/%d/%04d/%02d/%02d/%s%s",
+			sanitizePathToken(req.PipelineID), req.StreamID,
+			now.Year(), int(now.Month()), now.Day(), intentID.String(), ext)
+	} else {
+		if mimeType == "" {
+			mimeType = "video/mp4"
+		}
+		objectKey = buildCaptureSegmentObjectKey(req.StreamID, now, mimeType)
+	}
 	expiresAt := now.Add(s.cfg.R2SignPutTTL)
 
 	if _, err := s.pool.Exec(r.Context(), `
@@ -3126,6 +3144,20 @@ type captureIngestRequest struct {
 	EffectiveMode      string     `json:"execution_class"`
 	ResolvedURL        string     `json:"resolved_url"`
 	CapturedAt         *time.Time `json:"captured_at"`
+	UploadIntentID     string     `json:"upload_intent_id"`
+	ObjectKey          string     `json:"object_key"`
+	SizeBytes          *int64     `json:"size_bytes"`
+	ETag               string     `json:"etag"`
+	SHA256             string     `json:"sha256"`
+	SegmentStartAt     *time.Time `json:"segment_start_at"`
+	SegmentEndAt       *time.Time `json:"segment_end_at"`
+	DurationMs         *int64     `json:"duration_ms"`
+	TargetFPS          *int       `json:"target_fps"`
+	ActualFPS          *float64   `json:"actual_fps"`
+	VideoCodec         string     `json:"video_codec"`
+	AudioCodec         string     `json:"audio_codec"`
+	Container          string     `json:"container"`
+	AudioPresent       *bool      `json:"audio_present"`
 	FrameBase64        string     `json:"frame_base64"`
 	MimeType           string     `json:"mime_type"`
 	SourceKind         string     `json:"source_kind"`
@@ -3159,6 +3191,12 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 	if req.CaptureError == "" {
 		req.CaptureError = strings.TrimSpace(req.ErrorText)
 	}
+	intentID, err := parseUUIDString(req.UploadIntentID)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, "upload_intent_id must be a uuid")
+		return
+	}
+	req.UploadIntentID = intentID
 	req.FrameBase64 = strings.TrimSpace(req.FrameBase64)
 	if req.Status == "" {
 		if req.CaptureError != "" {
@@ -3175,20 +3213,35 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, "error_text or capture_error is required when status=error")
 		return
 	}
-	if req.Status == "success" && req.FrameBase64 == "" {
-		util.WriteError(w, http.StatusBadRequest, "frame_base64 is required when status=success")
+	hasSegmentUpload := req.UploadIntentID != "" || strings.TrimSpace(req.ObjectKey) != ""
+	if req.Status == "success" && req.FrameBase64 == "" && !hasSegmentUpload {
+		util.WriteError(w, http.StatusBadRequest, "frame_base64 or clip upload reference is required when status=success")
 		return
 	}
-	if req.CaptureError == "" && req.FrameBase64 == "" {
-		util.WriteError(w, http.StatusBadRequest, "frame_base64 or capture_error is required")
+	if req.CaptureError == "" && req.FrameBase64 == "" && !hasSegmentUpload {
+		util.WriteError(w, http.StatusBadRequest, "frame_base64, clip upload reference, or capture_error is required")
 		return
 	}
-	if req.CaptureError != "" && req.FrameBase64 != "" {
-		util.WriteError(w, http.StatusBadRequest, "provide only one of frame_base64 or capture_error")
+	if req.CaptureError != "" && (req.FrameBase64 != "" || hasSegmentUpload) {
+		util.WriteError(w, http.StatusBadRequest, "provide either success payload or capture_error, not both")
 		return
 	}
 
 	if req.Status == "error" {
+		if executionClass != capture.ExecutionClassImagePoll {
+			consecutive, err := s.persistCaptureSegmentError(r.Context(), req.StreamID, executionClass, strings.TrimSpace(req.ResolvedURL), req.SourceKind, req.CaptureError)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("persist capture segment error: %v", err))
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, map[string]any{
+				"ok":                 true,
+				"status":             capture.RuntimeError,
+				"consecutive_errors": consecutive,
+				"unsupported":        false,
+			})
+			return
+		}
 		consecutive, err := s.persistCaptureError(r.Context(), req.StreamID, executionClass, strings.TrimSpace(req.ResolvedURL), req.SourceKind, req.CaptureError)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("persist capture error: %v", err))
@@ -3198,6 +3251,64 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 			"ok":                 true,
 			"status":             capture.RuntimeError,
 			"consecutive_errors": consecutive,
+			"unsupported":        false,
+		})
+		return
+	}
+
+	if executionClass != capture.ExecutionClassImagePoll {
+		if req.UploadIntentID == "" && strings.TrimSpace(req.ObjectKey) == "" {
+			util.WriteError(w, http.StatusBadRequest, "upload_intent_id or object_key is required for live-video clip ingest")
+			return
+		}
+		if req.SegmentStartAt == nil || req.SegmentEndAt == nil || req.SegmentStartAt.IsZero() || req.SegmentEndAt.IsZero() {
+			util.WriteError(w, http.StatusBadRequest, "segment_start_at and segment_end_at are required for live-video clip ingest")
+			return
+		}
+		targetFPS := 10
+		if req.TargetFPS != nil && *req.TargetFPS > 0 {
+			targetFPS = *req.TargetFPS
+		}
+		durationMs := int64(req.SegmentEndAt.UTC().Sub(req.SegmentStartAt.UTC()) / time.Millisecond)
+		if req.DurationMs != nil && *req.DurationMs > 0 {
+			durationMs = *req.DurationMs
+		}
+		audioPresent := false
+		if req.AudioPresent != nil {
+			audioPresent = *req.AudioPresent
+		}
+		sizeBytes := int64(0)
+		if req.SizeBytes != nil && *req.SizeBytes > 0 {
+			sizeBytes = *req.SizeBytes
+		}
+		if err := s.persistCaptureSegmentSuccess(r.Context(), req.StreamID, captureSegmentFinalize{
+			IntentID:       req.UploadIntentID,
+			ObjectKey:      strings.TrimSpace(req.ObjectKey),
+			MIMEType:       strings.TrimSpace(req.MimeType),
+			SizeBytes:      sizeBytes,
+			ETag:           strings.TrimSpace(req.ETag),
+			SHA256:         strings.TrimSpace(req.SHA256),
+			SegmentStartAt: req.SegmentStartAt.UTC(),
+			SegmentEndAt:   req.SegmentEndAt.UTC(),
+			DurationMs:     durationMs,
+			TargetFPS:      targetFPS,
+			ActualFPS:      req.ActualFPS,
+			VideoCodec:     strings.TrimSpace(req.VideoCodec),
+			AudioCodec:     strings.TrimSpace(req.AudioCodec),
+			Container:      firstNonEmpty(strings.TrimSpace(req.Container), "mp4"),
+			AudioPresent:   audioPresent,
+			SourceKind:     req.SourceKind,
+			ExecutionClass: executionClass,
+			ResolvedURL:    strings.TrimSpace(req.ResolvedURL),
+			CaptureType:    capture.ResolvedCaptureTypeFromURL(strings.TrimSpace(req.ResolvedURL)),
+		}); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("persist capture segment success: %v", err))
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{
+			"ok":                 true,
+			"status":             capture.RuntimeRunning,
+			"consecutive_errors": 0,
 			"unsupported":        false,
 		})
 		return
@@ -8714,6 +8825,8 @@ func fileExtensionFromMIME(m string) string {
 		return ".png"
 	case "image/webp":
 		return ".webp"
+	case "video/mp4":
+		return ".mp4"
 	default:
 		return ""
 	}

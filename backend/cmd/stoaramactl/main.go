@@ -115,6 +115,8 @@ func usage() {
 	  stoaramactl streams detail (--id N | --slug S) [--pipeline-id P --results-limit 10 --detections-limit 50]
 	  stoaramactl streams filters --kind tags|countries|cities|sources|youtube-channels [--recording-state off|on --capture-type TYPE --country C --city CITY --source SRC --youtube-channel CH --tags a,b --tags-not x,y]
 	  stoaramactl streams frames [--stream-id N --pipeline-id P --uninferenced --unprocessed --sort-by captured_at --sort-dir desc --limit 200 --offset 0]
+	  stoaramactl streams clips --stream-id N [--limit 100 --offset 0]
+	  stoaramactl streams clip-latest --stream-id N
 	  stoaramactl streams timeline --id N [--day YYYY-MM-DD --pipeline-id P]
 	  stoaramactl streams image-urls --stream-ids 1,2,3
 	  stoaramactl streams add --source-url URL --name N [--provider P --external-id E --slug S --source-page-url URL --capture-type TYPE --execution-config-json JSON --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC --tags a,b]
@@ -2360,7 +2362,7 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 }
 
 func printStreamsUsage() {
-	fmt.Print("stoaramactl streams <list|detail|filters|frames|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service> ...\n")
+	fmt.Print("stoaramactl streams <list|detail|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service> ...\n")
 }
 
 func printDiscoveryUsage() {
@@ -2891,6 +2893,61 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 			fmt.Printf("frame_id=%v stream_id=%v captured_at=%v status=%v error=%v source=%v object_key=%v\n",
 				it["id"], it["stream_id"], it["captured_at"], it["capture_status"], it["capture_error"], it["source_kind"], it["object_key"])
 		}
+	case "clips":
+		fs := flag.NewFlagSet("streams clips", flag.ExitOnError)
+		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
+		streamID := fs.Int64("stream-id", 0, "stream id")
+		limit := fs.Int("limit", 100, "row limit")
+		offset := fs.Int("offset", 0, "row offset")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if *streamID <= 0 {
+			log.Fatalf("--stream-id is required")
+		}
+		if *limit <= 0 || *limit > 1000 {
+			log.Fatalf("--limit must be between 1 and 1000")
+		}
+		if *offset < 0 {
+			log.Fatalf("--offset must be >= 0")
+		}
+		q := url.Values{}
+		q.Set("limit", strconv.Itoa(*limit))
+		q.Set("offset", strconv.Itoa(*offset))
+		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/capture/streams/%d/segments?%s", *streamID, q.Encode()))
+		if *asJSON {
+			printJSON(payload)
+			return
+		}
+		items, _ := payload["items"].([]any)
+		fmt.Printf("clips=%d limit=%d offset=%d\n", len(items), *limit, *offset)
+		for _, raw := range items {
+			it := asMap(raw)
+			fmt.Printf("segment_id=%v stream_id=%v start=%v end=%v status=%v fps=%v object_key=%v error=%v\n",
+				it["id"], it["stream_id"], it["segment_start_at"], it["segment_end_at"], it["capture_status"], it["target_fps"], it["object_key"], it["capture_error"])
+		}
+	case "clip-latest":
+		fs := flag.NewFlagSet("streams clip-latest", flag.ExitOnError)
+		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
+		streamID := fs.Int64("stream-id", 0, "stream id")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if *streamID <= 0 {
+			log.Fatalf("--stream-id is required")
+		}
+		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/capture/streams/%d/segments/latest", *streamID))
+		if *asJSON {
+			printJSON(payload)
+			return
+		}
+		item := asMap(payload["item"])
+		if len(item) == 0 {
+			fmt.Println("latest_clip=none")
+			return
+		}
+		fmt.Printf("segment_id=%v stream_id=%v start=%v end=%v status=%v fps=%v object_key=%v download_url=%v\n",
+			item["id"], item["stream_id"], item["segment_start_at"], item["segment_end_at"], item["capture_status"], item["target_fps"], item["object_key"], item["download_url"])
 	case "timeline":
 		fs := flag.NewFlagSet("streams timeline", flag.ExitOnError)
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
