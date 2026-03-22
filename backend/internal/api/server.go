@@ -3800,6 +3800,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 	type item struct {
 		Stream                        model.Stream `json:"stream"`
 		LatestCaptured                *time.Time   `json:"latest_captured_at,omitempty"`
+		LastCaptureAt                 *time.Time   `json:"last_capture_at,omitempty"`
 		LatestFrameURL                string       `json:"latest_frame_url,omitempty"`
 		CapturesTotal                 int64        `json:"captures_total"`
 		CapturesSuccess               int64        `json:"captures_success"`
@@ -3808,8 +3809,10 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		PersonDetectionsTotal         int64        `json:"person_detections_total"`
 		AvgPeoplePerInferencedCapture float64      `json:"avg_people_per_inferenced_capture"`
 		SuccessFrames60s              int64        `json:"success_frames_60s"`
+		SuccessCaptures60s            int64        `json:"success_captures_60s"`
 		TargetFPS                     int          `json:"target_fps"`
 		ExpectedFrames60s             int64        `json:"expected_frames_60s"`
+		ExpectedCaptures60s           int64        `json:"expected_captures_60s"`
 		LossRatePct                   float64      `json:"loss_rate_pct"`
 		FreshnessSec                  *int64       `json:"freshness_sec,omitempty"`
 		RecordingHealth               string       `json:"recording_health"`
@@ -3890,6 +3893,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			it := item{
 				Stream:                        stream,
 				LatestCaptured:                capturedAt,
+				LastCaptureAt:                 capturedAt,
 				CapturesTotal:                 capturesTotal,
 				CapturesSuccess:               capturesSuccess,
 				CapturesError:                 capturesError,
@@ -3906,6 +3910,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 				it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
 				if runtimeLastFrame != nil {
 					it.LatestCaptured = runtimeLastFrame
+					it.LastCaptureAt = runtimeLastFrame
 				}
 			} else if stream.RecordingState == model.RecordingStateOn {
 				it.TargetFPS = 1
@@ -3917,6 +3922,8 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 				}
 				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
 			}
+			it.SuccessCaptures60s = it.SuccessFrames60s
+			it.ExpectedCaptures60s = it.ExpectedFrames60s
 			items = append(items, it)
 		}
 		if rows.Err() != nil {
@@ -7207,6 +7214,7 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		"resolved_url":       resolvedURL,
 		"last_resolved_at":   runtimeLastResolved,
 		"last_frame_at":      runtimeLastFrame,
+		"last_capture_at":    runtimeLastFrame,
 		"consecutive_errors": runtimeConsecutiveErrors,
 		"last_error_text":    runtimeErr,
 	}
@@ -7215,6 +7223,14 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	for _, item := range captureWorkers {
+		if item == nil {
+			continue
+		}
+		if _, exists := item["last_capture_at"]; !exists {
+			item["last_capture_at"] = item["last_frame_at"]
+		}
 	}
 	var activeCaptureWorker map[string]any
 	for _, item := range captureWorkers {
@@ -7282,6 +7298,7 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 			"stopped_at":        stoppedAt,
 			"last_heartbeat_at": lastHeartbeatAt,
 			"last_frame_at":     lastFrameAt,
+			"last_capture_at":   lastFrameAt,
 			"restart_count":     restartCount,
 			"last_error_text":   lastErrorText,
 			"created_at":        createdAt,
@@ -7465,12 +7482,18 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 			"message":            healthMessage,
 			"last_frame_at":      lastFrameAt,
 			"last_frame_age_sec": lastFrameAgeSec,
+			"last_capture_at":    lastFrameAt,
+			"last_capture_age_sec": lastFrameAgeSec,
 		},
 		"stats_24h": map[string]any{
 			"expected_frames": expectedFrames24h,
 			"success_frames":  successFrames24h,
 			"error_frames":    errorFrames24h,
 			"missing_frames":  missingFrames24h,
+			"expected_captures": expectedFrames24h,
+			"success_captures":  successFrames24h,
+			"error_captures":    errorFrames24h,
+			"missing_captures":  missingFrames24h,
 			"loss_rate_pct":   lossRate24h,
 			"first_capture":   firstCapture24h,
 			"last_capture":    lastCapture24h,

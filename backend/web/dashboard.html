@@ -1816,6 +1816,7 @@
       </div>
       <div id="detailLiveFramesStatus" class="coverage-summary">Loading recent frames...</div>
       <div id="detailLiveFramesGrid" class="detail-live-grid"></div>
+      <div id="detailExportBlock">
       <div class="detail-section-head" style="margin-top:12px;">
         <div class="detail-section-title" id="detailExportTitle">Export Frames</div>
         <div class="detail-section-subtitle" id="detailExportSubtitle">Download a manifest for any time window, or prepare a bounded ZIP archive.</div>
@@ -1831,7 +1832,7 @@
         <input id="detailExportTo" type="datetime-local" />
         <select id="detailExportStatusFilter" style="min-width:150px;">
           <option value="success" selected>success only</option>
-          <option value="all">all frame rows</option>
+          <option id="detailExportStatusAllOption" value="all">all frame rows</option>
           <option value="error">error rows only</option>
         </select>
         <button id="detailExportManifest" type="button">Download Manifest</button>
@@ -1839,6 +1840,7 @@
         <span class="status-text" id="detailExportStatus"></span>
       </div>
       <div id="detailExportResult" class="coverage-summary">ZIP export currently supports up to 5000 frames or 2 GiB per request.</div>
+      </div>
       <div class="detail-section-head" style="margin-top:12px;">
         <div class="detail-section-title" id="detailRawCaptureRowsTitle">Raw Capture Rows</div>
         <div class="detail-section-subtitle" id="detailRawCaptureRowsSubtitle">Recent persisted frame rows with status, preview, and object key.</div>
@@ -1858,10 +1860,10 @@
 	          <thead>
 	            <tr>
 	              <th style="width:42px;" data-sort-key="id">#</th>
-	              <th data-sort-key="captured_at">Captured</th>
+	              <th id="framesCapturedHeader" data-sort-key="captured_at">Captured</th>
 	              <th data-sort-key="status">Status</th>
 	              <th data-sort-key="error">Error</th>
-	              <th style="width:128px;">Raw</th>
+	              <th id="framesRawHeader" style="width:128px;">Raw</th>
 	              <th data-sort-key="object_key">Object key</th>
 	            </tr>
 	          </thead>
@@ -2165,6 +2167,7 @@ const detailLiveFramesStatus = $('detailLiveFramesStatus');
 const detailLiveFramesGrid = $('detailLiveFramesGrid');
 const detailFramesRecentTitle = $('detailFramesRecentTitle');
 const detailFramesRecentSubtitle = $('detailFramesRecentSubtitle');
+const detailExportBlock = $('detailExportBlock');
 const detailExportTitle = $('detailExportTitle');
 const detailExportSubtitle = $('detailExportSubtitle');
 const detailExportPreset1h = $('detailExportPreset1h');
@@ -2173,6 +2176,7 @@ const detailExportPreset7d = $('detailExportPreset7d');
 const detailExportFrom = $('detailExportFrom');
 const detailExportTo = $('detailExportTo');
 const detailExportStatusFilter = $('detailExportStatusFilter');
+const detailExportStatusAllOption = $('detailExportStatusAllOption');
 const detailExportManifest = $('detailExportManifest');
 const detailExportZip = $('detailExportZip');
 const detailExportStatus = $('detailExportStatus');
@@ -2219,6 +2223,8 @@ const detailFramesReload = $('detailFramesReload');
 const framesStatusText = $('framesStatusText');
 const framesRowsEl = $('framesRows');
 const framesTable = $('framesTable');
+const framesCapturedHeader = $('framesCapturedHeader');
+const framesRawHeader = $('framesRawHeader');
 const timelinePrevDay = $('timelinePrevDay');
 const timelineNextDay = $('timelineNextDay');
 const timelineDayInput = $('timelineDay');
@@ -3593,8 +3599,8 @@ function renderDetailRecordingHero(payload, frames) {
   const latest = Array.isArray(frames) && frames.length ? frames[0] : null;
   const state = String(health.state || (String(stream.recording_state || '').trim().toLowerCase() === 'on' ? 'degraded' : 'off'));
   const stateLabel = state === 'healthy' ? 'Recording' : (state === 'off' ? 'Off' : 'Attention');
-  const lastFrameText = latest ? formatDateTimeShort(captureTimestampValue(latest)) : '-';
-  const lastFrameAge = health.last_frame_age_sec != null ? ageLabel(health.last_frame_age_sec) : '-';
+  const lastCaptureText = latest ? formatDateTimeShort(captureTimestampValue(latest)) : '-';
+  const lastCaptureAge = health.last_capture_age_sec != null ? ageLabel(health.last_capture_age_sec) : (health.last_frame_age_sec != null ? ageLabel(health.last_frame_age_sec) : '-');
   const assignmentHTML = assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : 'unassigned';
   const relaySourceHTML = route && route.source_server_id ? serverLinkHTML(route.source_server_id, '-') : '-';
   const relayStatusText = route && route.status ? String(route.status) : (String(stream.execution_class || '') === 'youtube_relay' ? 'no route' : '-');
@@ -3605,7 +3611,7 @@ function renderDetailRecordingHero(payload, frames) {
       <div class="detail-summary-state">${esc(stateLabel)}</div>
     </div>
     <div class="detail-summary-meta">
-      <div>last ${esc(captureMeta.singular)} ${esc(lastFrameText)}${lastFrameAge !== '-' ? ` · ${esc(lastFrameAge)}` : ''}</div>
+      <div>last ${esc(captureMeta.singular)} ${esc(lastCaptureText)}${lastCaptureAge !== '-' ? ` · ${esc(lastCaptureAge)}` : ''}</div>
       <div>recording on ${assignmentHTML}</div>
       ${String(stream.execution_class || '') === 'youtube_relay' ? `<div>via ${relaySourceHTML} relay · ${esc(relayStatusText)}</div>` : ''}
       ${currentError ? `<div style="color:var(--warn);">${esc(currentError)}</div>` : ''}
@@ -3683,7 +3689,7 @@ function renderDetailCurrentWorker(payload) {
   const status = String(item.status || '-');
   const started = item.started_at ? formatDateTimeShort(item.started_at) : '-';
   const heartbeat = item.heartbeat_at ? formatDateTimeShort(item.heartbeat_at) : '-';
-  const lastFrame = item.last_frame_at ? formatDateTimeShort(item.last_frame_at) : '-';
+  const lastCapture = item.last_capture_at ? formatDateTimeShort(item.last_capture_at) : (item.last_frame_at ? formatDateTimeShort(item.last_frame_at) : '-');
   const restarts = Number(item.restart_count || 0);
   detailCurrentWorker.innerHTML = `
     <div class="detail-section-head" style="margin-bottom:6px;">
@@ -3698,7 +3704,7 @@ function renderDetailCurrentWorker(payload) {
       <span class="muted fs10">status ${esc(status)}</span>
       <span class="muted fs10">started ${esc(started)}</span>
       <span class="muted fs10">heartbeat ${esc(heartbeat)}</span>
-      <span class="muted fs10">${esc(captureMeta.singular)} ${esc(lastFrame)}</span>
+      <span class="muted fs10">latest ${esc(captureMeta.singular)} ${esc(lastCapture)}</span>
       ${restarts > 0 ? `<span class="muted fs10">restarts ${restarts}</span>` : ''}
     </div>
   `;
@@ -4368,7 +4374,7 @@ function summarizeProcesses(items) {
     const streamsHTML = streamIDs.length ? `<span class="muted">streams ${listStreamLinks(streamIDs, 4)}</span>` : '';
     const statusHTML = status ? `<span class="muted">status ${esc(status)}</span>` : '';
     const restartHTML = restartCount > 0 ? `<span class="muted">restarts ${restartCount}</span>` : '';
-    const lastFrameHTML = it.last_frame_at ? `<span class="muted">last frame ${esc(formatDateTimeShort(it.last_frame_at))}</span>` : '';
+    const lastFrameHTML = it.last_frame_at ? `<span class="muted">last capture ${esc(formatDateTimeShort(it.last_frame_at))}</span>` : '';
     const extraLine = [claimsHTML, streamsHTML, statusHTML, restartHTML, lastFrameHTML].filter((v) => v).join(' · ');
     const workerHTML = workerID && workerID !== processID ? `<div class="mono fs10 muted">worker ${esc(workerID)}</div>` : '';
     return `<div class="mono fs11">
@@ -5188,12 +5194,14 @@ function renderRecRows() {
     const streamName = latinizedLabelParts(s.name);
     const latestCap = row.latest_captured_at ? String(row.latest_captured_at).replace('T', ' ').slice(0, 19) : '-';
     const runtimeStatus = s.capture_runtime_status || '-';
-    const freshness = Number(row.freshness_sec);
-    const freshnessTxt = Number.isFinite(freshness) ? `${Math.max(0, Math.floor(freshness))}s` : '-';
+    const freshnessSec = Number(row.freshness_sec);
+    const freshnessTxt = Number.isFinite(freshnessSec) ? `${Math.max(0, Math.floor(freshnessSec))}s` : '-';
     const loss = Number(row.loss_rate_pct || 0);
-    const expectedFrames = Number(row.expected_frames_60s || 60);
+    const expectedCaptures = Number(row.expected_captures_60s || row.expected_frames_60s || 60);
+    const successCaptures = Number(row.success_captures_60s || row.success_frames_60s || 0);
     const health = String(row.recording_health || 'unknown');
     const captureUnit = String(row.capture_unit || 'frames');
+    const captureSingular = captureUnit.endsWith('s') ? captureUnit.slice(0, -1) : captureUnit;
     const peopleMetric = peoplePerInferenceMetric(row);
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -5212,8 +5220,8 @@ function renderRecRows() {
       <td>
         <div class="stack fs11 mono">
           <span class="tag tag-muted">${esc(health)}</span>
-          <span>loss ${loss.toFixed(1)}% · ${esc(captureUnit)} ${Number(row.success_frames_60s || 0)}/${expectedFrames} per 60s</span>
-          <span>freshness ${freshnessTxt}</span>
+          <span>loss ${loss.toFixed(1)}% · ${esc(captureUnit)} ${successCaptures}/${expectedCaptures} per 60s</span>
+          <span>latest ${esc(captureSingular)} age ${freshnessTxt}</span>
           <span class="muted fs10">${latestCap}</span>
         </div>
       </td>
@@ -6210,7 +6218,7 @@ function renderDetailCaptureWorkers(items) {
     const active = Boolean(it.active);
     const hb = it.heartbeat_at ? formatDateTimeShort(it.heartbeat_at) : '-';
     const started = it.started_at ? formatDateTimeShort(it.started_at) : '-';
-    const lastFrame = it.last_frame_at ? formatDateTimeShort(it.last_frame_at) : '-';
+    const lastCapture = it.last_capture_at ? formatDateTimeShort(it.last_capture_at) : (it.last_frame_at ? formatDateTimeShort(it.last_frame_at) : '-');
     const restarts = Number(it.restart_count || 0);
     const lastErrorText = String(it.last_error_text || '').trim();
     const serverHTML = serverID ? `<span class="mono fs11">${esc(serverID)}</span>` : '<span class="mono fs11">-</span>';
@@ -6223,7 +6231,7 @@ function renderDetailCaptureWorkers(items) {
       <span class="muted fs10">status ${esc(status)}</span>
       <span class="muted fs10">started ${esc(started)}</span>
       <span class="muted fs10">heartbeat ${esc(hb)}</span>
-      <span class="muted fs10">${esc(captureMeta.singular)} ${esc(lastFrame)}</span>
+      <span class="muted fs10">latest ${esc(captureMeta.singular)} ${esc(lastCapture)}</span>
       ${restarts > 0 ? `<span class="muted fs10">restarts ${restarts}</span>` : ''}
       ${lastErrorText ? `<span class="mono fs10" style="color:#ef4444;">${esc(lastErrorText)}</span>` : ''}
     </div>`;
@@ -6343,10 +6351,15 @@ async function loadDetail(options = {}) {
   if (!captureMeta.clipNative) ensureDetailExportWindow(latestFrame);
   if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = captureMeta.clipNative ? 'Latest 60 Clips' : 'Latest 60 Frames';
   if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = captureMeta.clipNative ? 'Auto-refreshes every few seconds while this page is open.' : 'Auto-refreshes every second while this page is open.';
-  if (detailExportTitle) detailExportTitle.textContent = captureMeta.clipNative ? 'Frame Export' : 'Export Frames';
-  if (detailExportSubtitle) detailExportSubtitle.textContent = captureMeta.clipNative ? 'Frame export is not available for clip-native streams until extraction is wired.' : 'Download a manifest for any time window, or prepare a bounded ZIP archive.';
+  if (detailExportBlock) detailExportBlock.style.display = captureMeta.clipNative ? 'none' : '';
+  if (detailExportTitle) detailExportTitle.textContent = 'Export Frames';
+  if (detailExportSubtitle) detailExportSubtitle.textContent = 'Download a manifest for any time window, or prepare a bounded ZIP archive.';
+  if (detailExportStatusAllOption) detailExportStatusAllOption.textContent = 'all frame rows';
   if (detailRawCaptureRowsTitle) detailRawCaptureRowsTitle.textContent = captureMeta.clipNative ? 'Clip Segment Rows' : 'Raw Capture Rows';
   if (detailRawCaptureRowsSubtitle) detailRawCaptureRowsSubtitle.textContent = captureMeta.clipNative ? 'Recent persisted clip segments with status, download link, and object key.' : 'Recent persisted frame rows with status, preview, and object key.';
+  if (detailFramesReload) detailFramesReload.textContent = captureMeta.clipNative ? 'Reload clips' : 'Reload captures';
+  if (framesCapturedHeader) framesCapturedHeader.textContent = captureMeta.clipNative ? 'Window' : 'Captured';
+  if (framesRawHeader) framesRawHeader.textContent = captureMeta.clipNative ? 'Clip' : 'Raw';
   if (detailCoverageSubtitle) detailCoverageSubtitle.textContent = captureMeta.clipNative ? 'Historical coverage is still frame-native; new clip-native live video will appear here after frame extraction is wired.' : 'Historical coverage, day-level heatmap, and stratified capture samples.';
   if (detailCoverageSamplesSubtitle) detailCoverageSamplesSubtitle.textContent = captureMeta.clipNative ? 'History samples below still reflect frame-based capture history only.' : 'Stratified snapshots across full capture history (not just recent frames).';
   if (detailTimelineSubtitle) detailTimelineSubtitle.textContent = captureMeta.clipNative ? 'Timeline is still frame-native; new clip-native live video will appear here after extraction is wired.' : 'UTC minute timeline for recorded frames, inferenced frames, and person detections.';
