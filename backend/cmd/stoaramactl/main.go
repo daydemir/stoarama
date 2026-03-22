@@ -790,25 +790,36 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 
 		refreshTicker := time.NewTicker(time.Duration(*refreshSec) * time.Second)
 		defer refreshTicker.Stop()
-		lastUpstreamURL := map[int64]string{}
-		lastPublishedPullURL := map[int64]string{}
-		lastStatus := map[int64]string{}
-		routeResolveFailures := map[int64]int{}
-		routeCache, err := loadRelaySourceRouteCache(strings.TrimSpace(*cacheFile))
+			lastUpstreamURL := map[int64]string{}
+			lastPublishedPullURL := map[int64]string{}
+			lastStatus := map[int64]string{}
+			routeResolveFailures := map[int64]int{}
+			routeCache, err := loadRelaySourceRouteCache(strings.TrimSpace(*cacheFile))
 		if err != nil {
 			log.Printf("youtube-relay source cache load failed path=%s: %v", strings.TrimSpace(*cacheFile), err)
 			routeCache = map[int64]relaySourceRouteCacheEntry{}
 		}
-		saveRouteCache := func() {
-			if strings.TrimSpace(*cacheFile) == "" {
-				return
+			saveRouteCache := func() {
+				if strings.TrimSpace(*cacheFile) == "" {
+					return
+				}
+				if err := saveRelaySourceRouteCache(strings.TrimSpace(*cacheFile), routeCache); err != nil {
+					log.Printf("youtube-relay source cache save failed path=%s: %v", strings.TrimSpace(*cacheFile), err)
+				}
 			}
-			if err := saveRelaySourceRouteCache(strings.TrimSpace(*cacheFile), routeCache); err != nil {
-				log.Printf("youtube-relay source cache save failed path=%s: %v", strings.TrimSpace(*cacheFile), err)
+			for streamID, cached := range routeCache {
+				cachedURL := strings.TrimSpace(cached.UpstreamURL)
+				if cachedURL == "" {
+					continue
+				}
+				relayState.routes[streamID] = relayRouteState{UpstreamURL: cachedURL}
+				lastUpstreamURL[streamID] = cachedURL
+				lastPublishedPullURL[streamID] = fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, streamID, url.QueryEscape(strings.TrimSpace(*sharedToken)))
+				lastStatus[streamID] = "source_ready"
+				log.Printf("youtube-relay source preloaded cached route stream_id=%d age=%s", streamID, time.Since(cached.UpdatedAt).Round(time.Second))
 			}
-		}
 
-		resolveOnce := func() error {
+			resolveOnce := func() error {
 			routes, err := client.ListYouTubeRelayRoutes(runCtx, strings.TrimSpace(*serverID), "", "", 1000, 0)
 			if err != nil {
 				return fmt.Errorf("list youtube relay routes: %w", err)
@@ -820,6 +831,12 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 					continue
 				}
 				activeRouteIDs[route.StreamID] = struct{}{}
+			}
+			for _, route := range routes {
+				status := strings.TrimSpace(strings.ToLower(route.Status))
+				if status != "assigned" && status != "source_ready" && status != "running" && status != "failed" {
+					continue
+				}
 				relayPullURL := fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, route.StreamID, url.QueryEscape(strings.TrimSpace(*sharedToken)))
 				if lastUpstreamURL[route.StreamID] == "" {
 					if cached, ok := routeCache[route.StreamID]; ok && strings.TrimSpace(cached.UpstreamURL) != "" {
@@ -906,54 +923,20 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 					continue
 				}
 				routeResolveFailures[route.StreamID] = 0
+				relayState.mu.RLock()
+				currentRoute, currentRouteOK := relayState.routes[route.StreamID]
+				relayState.mu.RUnlock()
 				if status != "failed" &&
 					lastUpstreamURL[route.StreamID] == upstreamURL &&
 					lastPublishedPullURL[route.StreamID] == relayPullURL &&
-					(lastStatus[route.StreamID] == "source_ready" || lastStatus[route.StreamID] == "running") {
+					(lastStatus[route.StreamID] == "source_ready" || lastStatus[route.StreamID] == "running") &&
+					currentRouteOK &&
+					strings.TrimSpace(currentRoute.UpstreamURL) == upstreamURL {
 					continue
 				}
 				relayState.mu.Lock()
 				relayState.routes[route.StreamID] = relayRouteState{UpstreamURL: upstreamURL}
 				relayState.mu.Unlock()
-				preflightCtx, preflightCancel := context.WithTimeout(runCtx, 10*time.Second)
-				preflightStatus, preflightErr := probeRelayPullURL(preflightCtx, relayHTTPClient, relayPullURL)
-				preflightCancel()
-				if preflightErr != nil {
-					if lastUpstreamURL[route.StreamID] != "" &&
-						lastPublishedPullURL[route.StreamID] == relayPullURL &&
-						(lastStatus[route.StreamID] == "source_ready" || lastStatus[route.StreamID] == "running") {
-						relayState.mu.Lock()
-						relayState.routes[route.StreamID] = relayRouteState{UpstreamURL: lastUpstreamURL[route.StreamID]}
-						relayState.mu.Unlock()
-						log.Printf(
-							"youtube-relay source keeping previous route stream_id=%d after preflight failure: %v",
-							route.StreamID,
-							preflightErr,
-						)
-						continue
-					}
-					relayState.mu.Lock()
-					delete(relayState.routes, route.StreamID)
-					relayState.mu.Unlock()
-					_ = client.UpdateYouTubeRelayRouteStatus(runCtx, captureapi.YouTubeRelayRouteStatusRequest{
-						StreamID:  route.StreamID,
-						Actor:     "youtube_relay_source",
-						Status:    "failed",
-						Reason:    relayRouteFailureReason(preflightStatus, preflightErr.Error()),
-						ErrorText: strings.TrimSpace(preflightErr.Error()),
-						MetadataJSON: map[string]any{
-							"source_server_id":  strings.TrimSpace(*serverID),
-							"relay_public_url":  relayPullURL,
-							"relay_bind_addr":   strings.TrimSpace(*bindAddr),
-							"network_transport": strings.TrimSpace(*networkTransport),
-							"topology_id":       strings.TrimSpace(*topologyID),
-							"topology_role":     strings.TrimSpace(*topologyRole),
-							"hub_server_id":     strings.TrimSpace(*hubServerID),
-							"preflight_status":  preflightStatus,
-						},
-					})
-					continue
-				}
 				if err := client.UpdateYouTubeRelayRouteStatus(runCtx, captureapi.YouTubeRelayRouteStatusRequest{
 					StreamID:     route.StreamID,
 					Actor:        "youtube_relay_source",

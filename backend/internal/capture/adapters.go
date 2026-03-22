@@ -380,13 +380,7 @@ func buildFFmpegSessionArgs(spec StreamSpec, srcURL string, targetFPS int) []str
 	if hwaccel != "" {
 		args = append(args, "-hwaccel", hwaccel)
 	}
-	if useReconnect && (strings.HasPrefix(srcURL, "http://") || strings.HasPrefix(srcURL, "https://")) {
-		args = append(args,
-			"-reconnect", "1",
-			"-reconnect_streamed", "1",
-			"-reconnect_delay_max", strconv.Itoa(reconnectDelayMax),
-		)
-	}
+	args = appendFFmpegHTTPInputArgs(args, srcURL, useReconnect, reconnectDelayMax)
 
 	args = append(args,
 		"-i", srcURL,

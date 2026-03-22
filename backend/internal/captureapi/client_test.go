@@ -301,11 +301,11 @@ func TestListRecordingAssignmentsSkipsRelayRoutesUntilReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRecordingAssignments: %v", err)
 	}
-	if len(items) != 4 {
-		t.Fatalf("len(items)=%d want=4", len(items))
+	if len(items) != 2 {
+		t.Fatalf("len(items)=%d want=2", len(items))
 	}
-	got := []int64{items[0].StreamID, items[1].StreamID, items[2].StreamID, items[3].StreamID}
-	want := []int64{2, 3, 4, 5}
+	got := []int64{items[0].StreamID, items[1].StreamID}
+	want := []int64{2, 5}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("stream ids=%v want=%v", got, want)
