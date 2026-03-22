@@ -720,7 +720,7 @@ func rewriteRelayPlaylist(relayBaseURL string, streamID int64, token string, ups
 			if ref, parseErr := url.Parse(line); parseErr == nil {
 				segmentURL = baseURL.ResolveReference(ref).String()
 			}
-			current = append(current, fmt.Sprintf("%s/relay/%d/segment?token=%s&u=%s", relayBaseURL, streamID, url.QueryEscape(token), url.QueryEscape(segmentURL)))
+			current = append(current, segmentURL)
 			blocks = append(blocks, append([]string(nil), current...))
 			current = current[:0]
 			continue
