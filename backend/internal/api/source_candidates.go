@@ -167,25 +167,27 @@ type sourceCandidateReviewRequest struct {
 }
 
 type sourceCandidateImportRequest struct {
-	Provider            string         `json:"provider"`
-	ExternalID          string         `json:"external_id"`
-	Name                string         `json:"name"`
-	Slug                string         `json:"slug"`
-	SourceURL           string         `json:"source_url"`
-	SourcePageURL       string         `json:"source_page_url"`
-	SourceFamily        string         `json:"source_family"`
-	CaptureType         string         `json:"capture_type"`
-	ExecutionClass      string         `json:"execution_class"`
-	ExecutionConfigJSON map[string]any `json:"execution_config_json"`
-	Tags                []string       `json:"tags"`
-	LocationText        string         `json:"location_text"`
-	LocationCountry     string         `json:"location_country"`
-	LocationCountryCode string         `json:"location_country_code"`
-	LocationRegion      string         `json:"location_region"`
-	LocationCity        string         `json:"location_city"`
-	LocationLocality    string         `json:"location_locality"`
-	LocationSource      string         `json:"location_source"`
-	MetadataJSON        map[string]any `json:"metadata_json"`
+	Provider                 string         `json:"provider"`
+	ExternalID               string         `json:"external_id"`
+	Name                     string         `json:"name"`
+	Slug                     string         `json:"slug"`
+	SourceURL                string         `json:"source_url"`
+	SourcePageURL            string         `json:"source_page_url"`
+	SourceFamily             string         `json:"source_family"`
+	CaptureType              string         `json:"capture_type"`
+	ExecutionClass           string         `json:"execution_class"`
+	ExpectedFPS              *float64       `json:"expected_fps"`
+	ExpectedImageIntervalSec *int           `json:"expected_image_interval_sec"`
+	ExecutionConfigJSON      map[string]any `json:"execution_config_json"`
+	Tags                     []string       `json:"tags"`
+	LocationText             string         `json:"location_text"`
+	LocationCountry          string         `json:"location_country"`
+	LocationCountryCode      string         `json:"location_country_code"`
+	LocationRegion           string         `json:"location_region"`
+	LocationCity             string         `json:"location_city"`
+	LocationLocality         string         `json:"location_locality"`
+	LocationSource           string         `json:"location_source"`
+	MetadataJSON             map[string]any `json:"metadata_json"`
 }
 
 type sourceCandidateRunRequest struct {
@@ -194,6 +196,13 @@ type sourceCandidateRunRequest struct {
 	Status       string         `json:"status"`
 	ErrorText    string         `json:"error_text"`
 	MetadataJSON map[string]any `json:"metadata_json"`
+}
+
+type serviceSourceCandidateAutoImportRequest struct {
+	Reviewer           string                       `json:"reviewer"`
+	ReviewReason       string                       `json:"review_reason"`
+	ReviewMetadataJSON map[string]any               `json:"review_metadata_json"`
+	Import             sourceCandidateImportRequest `json:"import"`
 }
 
 func normalizeSourceCandidateReviewStatus(raw string) (string, bool) {
@@ -212,6 +221,150 @@ func normalizeSourceCandidateRunStatus(raw string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func (s *Server) reviewSourceCandidate(ctx context.Context, id int64, req sourceCandidateReviewRequest) (model.SourceCandidate, error) {
+	status, ok := normalizeSourceCandidateReviewStatus(req.Status)
+	if !ok || status == "pending" {
+		return model.SourceCandidate{}, newAPIStatusError(http.StatusBadRequest, "status must be accepted|rejected|invalid")
+	}
+	metaBytes, err := json.Marshal(nonNilMap(req.MetadataJSON))
+	if err != nil {
+		return model.SourceCandidate{}, newAPIStatusError(http.StatusBadRequest, "invalid metadata_json: %v", err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.SourceCandidate{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO source_candidate_reviews (candidate_id, reviewer, status, reason, metadata_jsonb)
+		VALUES ($1,$2,$3,$4,$5)
+	`, id, strings.TrimSpace(req.Reviewer), status, strings.TrimSpace(req.Reason), metaBytes); err != nil {
+		return model.SourceCandidate{}, newAPIStatusError(http.StatusConflict, "insert source candidate review: %v", err)
+	}
+	ct, err := tx.Exec(ctx, `
+		UPDATE source_candidates
+		SET review_status=$2, review_reason=$3, updated_at=now()
+		WHERE id=$1
+	`, id, status, strings.TrimSpace(req.Reason))
+	if err != nil {
+		return model.SourceCandidate{}, fmt.Errorf("update source candidate review status: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return model.SourceCandidate{}, newAPIStatusError(http.StatusNotFound, "source candidate not found")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return model.SourceCandidate{}, fmt.Errorf("commit review tx: %w", err)
+	}
+	item, err := s.getSourceCandidateByID(ctx, id)
+	if err != nil {
+		return model.SourceCandidate{}, fmt.Errorf("load source candidate: %w", err)
+	}
+	return item, nil
+}
+
+func (s *Server) importSourceCandidate(ctx context.Context, id int64, req sourceCandidateImportRequest) (model.SourceCandidate, *model.Stream, error) {
+	candidate, err := s.getSourceCandidateByID(ctx, id)
+	if err != nil {
+		return model.SourceCandidate{}, nil, newAPIStatusError(http.StatusNotFound, "source candidate not found")
+	}
+	if candidate.ReviewStatus != "accepted" {
+		return model.SourceCandidate{}, nil, newAPIStatusError(http.StatusConflict, "source candidate must be accepted before import")
+	}
+	if importedID, ok := candidate.MetadataJSON["imported_stream_id"]; ok {
+		switch v := importedID.(type) {
+		case float64:
+			stream, err := s.getStreamByID(ctx, int64(v))
+			if err == nil {
+				return candidate, &stream, nil
+			}
+		case int64:
+			stream, err := s.getStreamByID(ctx, v)
+			if err == nil {
+				return candidate, &stream, nil
+			}
+		case int:
+			stream, err := s.getStreamByID(ctx, int64(v))
+			if err == nil {
+				return candidate, &stream, nil
+			}
+		}
+	}
+	provider := strings.TrimSpace(req.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(candidate.Provider)
+	}
+	if provider == "" {
+		return model.SourceCandidate{}, nil, newAPIStatusError(http.StatusBadRequest, "provider is required to import source candidate")
+	}
+	sourceURL := strings.TrimSpace(req.SourceURL)
+	if sourceURL == "" {
+		sourceURL = strings.TrimSpace(candidate.SourceURL)
+	}
+	if sourceURL == "" {
+		return model.SourceCandidate{}, nil, newAPIStatusError(http.StatusBadRequest, "source_url is required to import source candidate")
+	}
+	externalID := strings.TrimSpace(req.ExternalID)
+	if externalID == "" {
+		externalID = strings.TrimSpace(candidate.ExternalID)
+	}
+	if externalID == "" {
+		externalID = defaultDiscoveryExternalID(sourceURL)
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = defaultImportedStreamName(candidate)
+	}
+	metadataJSON := mergeJSONMaps(candidate.MetadataJSON, req.MetadataJSON)
+	metadataJSON["source_candidate_id"] = candidate.ID
+	stream, err := s.createStreamRecord(ctx, streamCreateRequest{
+		Provider:                 provider,
+		ExternalID:               externalID,
+		Name:                     name,
+		Slug:                     strings.TrimSpace(req.Slug),
+		StreamURL:                sourceURL,
+		SourcePageURL:            firstNonEmpty(strings.TrimSpace(req.SourcePageURL), candidate.SourcePageURL),
+		SourceFamily:             firstNonEmpty(strings.TrimSpace(req.SourceFamily), candidate.SourceFamily),
+		LocationText:             strings.TrimSpace(req.LocationText),
+		LocationCountry:          strings.TrimSpace(req.LocationCountry),
+		LocationCountryCode:      strings.TrimSpace(req.LocationCountryCode),
+		LocationRegion:           strings.TrimSpace(req.LocationRegion),
+		LocationCity:             strings.TrimSpace(req.LocationCity),
+		LocationLocality:         strings.TrimSpace(req.LocationLocality),
+		LocationSource:           strings.TrimSpace(req.LocationSource),
+		MetadataJSON:             metadataJSON,
+		RecordingState:           string(model.RecordingStateOff),
+		CaptureMode:              firstNonEmpty(strings.TrimSpace(req.CaptureType), candidate.CaptureType),
+		ExecutionClass:           strings.TrimSpace(req.ExecutionClass),
+		ExpectedFPS:              req.ExpectedFPS,
+		ExpectedImageIntervalSec: req.ExpectedImageIntervalSec,
+		CaptureConfigJSON:        req.ExecutionConfigJSON,
+		Tags:                     req.Tags,
+	})
+	if err != nil {
+		return model.SourceCandidate{}, nil, err
+	}
+	importMetaBytes, err := json.Marshal(map[string]any{
+		"imported_stream_id":   stream.ID,
+		"imported_stream_slug": stream.Slug,
+		"imported_at":          time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return model.SourceCandidate{}, nil, fmt.Errorf("marshal import metadata: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE source_candidates
+		SET metadata_jsonb = COALESCE(metadata_jsonb, '{}'::jsonb) || $2::jsonb, updated_at=now()
+		WHERE id=$1
+	`, candidate.ID, importMetaBytes); err != nil {
+		return model.SourceCandidate{}, nil, fmt.Errorf("update source candidate import metadata: %w", err)
+	}
+	candidate, err = s.getSourceCandidateByID(ctx, id)
+	if err != nil {
+		return model.SourceCandidate{}, nil, fmt.Errorf("reload source candidate: %w", err)
+	}
+	return candidate, stream, nil
 }
 
 func decodeSourceCandidate(row candidateRow) (model.SourceCandidate, error) {
@@ -440,49 +593,9 @@ func (s *Server) handleSourceCandidateReview(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	status, ok := normalizeSourceCandidateReviewStatus(req.Status)
-	if !ok || status == "pending" {
-		util.WriteError(w, http.StatusBadRequest, "status must be accepted|rejected|invalid")
-		return
-	}
-	metaBytes, err := json.Marshal(nonNilMap(req.MetadataJSON))
+	item, err := s.reviewSourceCandidate(r.Context(), id, req)
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid metadata_json: %v", err))
-		return
-	}
-	tx, err := s.pool.Begin(r.Context())
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin tx: %v", err))
-		return
-	}
-	defer func() { _ = tx.Rollback(r.Context()) }()
-	if _, err := tx.Exec(r.Context(), `
-		INSERT INTO source_candidate_reviews (candidate_id, reviewer, status, reason, metadata_jsonb)
-		VALUES ($1,$2,$3,$4,$5)
-	`, id, strings.TrimSpace(req.Reviewer), status, strings.TrimSpace(req.Reason), metaBytes); err != nil {
-		util.WriteError(w, http.StatusConflict, fmt.Sprintf("insert source candidate review: %v", err))
-		return
-	}
-	ct, err := tx.Exec(r.Context(), `
-		UPDATE source_candidates
-		SET review_status=$2, review_reason=$3, updated_at=now()
-		WHERE id=$1
-	`, id, status, strings.TrimSpace(req.Reason))
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update source candidate review status: %v", err))
-		return
-	}
-	if ct.RowsAffected() == 0 {
-		util.WriteError(w, http.StatusNotFound, "source candidate not found")
-		return
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit review tx: %v", err))
-		return
-	}
-	item, err := s.getSourceCandidateByID(r.Context(), id)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load source candidate: %v", err))
+		writeAPIError(w, err)
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, item)
@@ -547,90 +660,51 @@ func (s *Server) handleSourceCandidateImport(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	candidate, stream, err := s.importSourceCandidate(r.Context(), id, req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	util.WriteJSON(w, http.StatusCreated, map[string]any{
+		"candidate": candidate,
+		"stream":    stream,
+	})
+}
+
+func (s *Server) handleServiceSourceCandidateAutoImport(w http.ResponseWriter, r *http.Request) {
+	if !s.requireIdempotency(w, r, "POST:/api/v1/source-candidates/{id}/auto-import") {
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req serviceSourceCandidateAutoImportRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	candidate, err := s.getSourceCandidateByID(r.Context(), id)
 	if err != nil {
 		util.WriteError(w, http.StatusNotFound, "source candidate not found")
 		return
 	}
 	if candidate.ReviewStatus != "accepted" {
-		util.WriteError(w, http.StatusConflict, "source candidate must be accepted before import")
-		return
+		reviewed, err := s.reviewSourceCandidate(r.Context(), id, sourceCandidateReviewRequest{
+			Status:       "accepted",
+			Reviewer:     strings.TrimSpace(req.Reviewer),
+			Reason:       firstNonEmpty(strings.TrimSpace(req.ReviewReason), "auto-accepted by discovery pipeline"),
+			MetadataJSON: req.ReviewMetadataJSON,
+		})
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		candidate = reviewed
 	}
-	provider := strings.TrimSpace(req.Provider)
-	if provider == "" {
-		provider = strings.TrimSpace(candidate.Provider)
-	}
-	if provider == "" {
-		util.WriteError(w, http.StatusBadRequest, "provider is required to import source candidate")
-		return
-	}
-	sourceURL := strings.TrimSpace(req.SourceURL)
-	if sourceURL == "" {
-		sourceURL = strings.TrimSpace(candidate.SourceURL)
-	}
-	if sourceURL == "" {
-		util.WriteError(w, http.StatusBadRequest, "source_url is required to import source candidate")
-		return
-	}
-	externalID := strings.TrimSpace(req.ExternalID)
-	if externalID == "" {
-		externalID = strings.TrimSpace(candidate.ExternalID)
-	}
-	if externalID == "" {
-		externalID = defaultDiscoveryExternalID(sourceURL)
-	}
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		name = defaultImportedStreamName(candidate)
-	}
-	metadataJSON := mergeJSONMaps(candidate.MetadataJSON, req.MetadataJSON)
-	metadataJSON["source_candidate_id"] = candidate.ID
-	stream, err := s.createStreamRecord(r.Context(), streamCreateRequest{
-		Provider:            provider,
-		ExternalID:          externalID,
-		Name:                name,
-		Slug:                strings.TrimSpace(req.Slug),
-		StreamURL:           sourceURL,
-		SourcePageURL:       firstNonEmpty(strings.TrimSpace(req.SourcePageURL), candidate.SourcePageURL),
-		SourceFamily:        firstNonEmpty(strings.TrimSpace(req.SourceFamily), candidate.SourceFamily),
-		LocationText:        strings.TrimSpace(req.LocationText),
-		LocationCountry:     strings.TrimSpace(req.LocationCountry),
-		LocationCountryCode: strings.TrimSpace(req.LocationCountryCode),
-		LocationRegion:      strings.TrimSpace(req.LocationRegion),
-		LocationCity:        strings.TrimSpace(req.LocationCity),
-		LocationLocality:    strings.TrimSpace(req.LocationLocality),
-		LocationSource:      strings.TrimSpace(req.LocationSource),
-		MetadataJSON:        metadataJSON,
-		RecordingState:      string(model.RecordingStateOff),
-		CaptureMode:         firstNonEmpty(strings.TrimSpace(req.CaptureType), candidate.CaptureType),
-		ExecutionClass:      strings.TrimSpace(req.ExecutionClass),
-		CaptureConfigJSON:   req.ExecutionConfigJSON,
-		Tags:                req.Tags,
-	})
+	candidate, stream, err := s.importSourceCandidate(r.Context(), id, req.Import)
 	if err != nil {
 		writeAPIError(w, err)
-		return
-	}
-	importMetaBytes, err := json.Marshal(map[string]any{
-		"imported_stream_id":   stream.ID,
-		"imported_stream_slug": stream.Slug,
-		"imported_at":          time.Now().UTC().Format(time.RFC3339),
-	})
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("marshal import metadata: %v", err))
-		return
-	}
-	if _, err := s.pool.Exec(r.Context(), `
-		UPDATE source_candidates
-		SET metadata_jsonb = COALESCE(metadata_jsonb, '{}'::jsonb) || $2::jsonb, updated_at=now()
-		WHERE id=$1
-	`, candidate.ID, importMetaBytes); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update source candidate import metadata: %v", err))
-		return
-	}
-	candidate, err = s.getSourceCandidateByID(r.Context(), id)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reload source candidate: %v", err))
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{

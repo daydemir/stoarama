@@ -216,6 +216,7 @@ func (s *Server) router() http.Handler {
 
 			service.Post("/source-candidates", s.handleSourceCandidatesUpsert)
 			service.Post("/source-candidates/{id}/runs", s.handleSourceCandidateRunCreate)
+			service.Post("/source-candidates/{id}/auto-import", s.handleServiceSourceCandidateAutoImport)
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
 			service.Post("/imports/streams/repair-canonical-capture", s.handleServiceStreamCanonicalCaptureRepair)
