@@ -561,15 +561,18 @@ func saveCLIConfig(cfg cliConfig) error {
 	switch len(cfg.Nodes) {
 	case 0:
 		cfg.Node = nil
-	case 1:
+	default:
+		if ytNode := cfg.Nodes["yt_relay_source"]; ytNode != nil {
+			cp := *ytNode
+			cfg.Node = &cp
+			break
+		}
 		for _, node := range cfg.Nodes {
 			if node != nil {
 				cp := *node
 				cfg.Node = &cp
 			}
 		}
-	default:
-		cfg.Node = nil
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
