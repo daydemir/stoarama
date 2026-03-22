@@ -262,6 +262,13 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			return
 		}
 		upstreamURL := strings.TrimSpace(state.UpstreamURL)
+		if relaySuffix == "" {
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Youtube-Relay-Server", strings.TrimSpace(opts.ServerID))
+			w.Header().Set("X-Youtube-Relay-Stream", strconv.FormatInt(streamID, 10))
+			http.Redirect(w, r, upstreamURL, http.StatusTemporaryRedirect)
+			return
+		}
 		if relaySuffix != "" {
 			if relaySuffix != "segment" {
 				http.Error(w, "unknown relay path", http.StatusNotFound)
