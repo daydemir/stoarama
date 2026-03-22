@@ -1665,7 +1665,7 @@
     <!-- Latest images -->
     <div class="detail-images">
       <div class="image-card">
-        <div class="image-card-label">Latest frame</div>
+        <div class="image-card-label" id="latestCaptureLabel">Latest frame</div>
         <div id="latestRawCard"><span class="muted fs11">No image</span></div>
       </div>
       <div class="detail-summary-card">
@@ -1811,14 +1811,14 @@
     <!-- Frames section -->
     <div id="detailFramesSection" style="display:none;">
       <div class="detail-section-head">
-        <div class="detail-section-title">Latest 60 Frames</div>
-        <div class="detail-section-subtitle">Auto-refreshes every second while this page is open.</div>
+        <div class="detail-section-title" id="detailFramesRecentTitle">Latest 60 Frames</div>
+        <div class="detail-section-subtitle" id="detailFramesRecentSubtitle">Auto-refreshes every second while this page is open.</div>
       </div>
       <div id="detailLiveFramesStatus" class="coverage-summary">Loading recent frames...</div>
       <div id="detailLiveFramesGrid" class="detail-live-grid"></div>
       <div class="detail-section-head" style="margin-top:12px;">
-        <div class="detail-section-title">Export Frames</div>
-        <div class="detail-section-subtitle">Download a manifest for any time window, or prepare a bounded ZIP archive.</div>
+        <div class="detail-section-title" id="detailExportTitle">Export Frames</div>
+        <div class="detail-section-subtitle" id="detailExportSubtitle">Download a manifest for any time window, or prepare a bounded ZIP archive.</div>
       </div>
       <div class="toolbar">
         <button id="detailExportPreset1h" type="button">Last 1h</button>
@@ -1840,8 +1840,8 @@
       </div>
       <div id="detailExportResult" class="coverage-summary">ZIP export currently supports up to 5000 frames or 2 GiB per request.</div>
       <div class="detail-section-head" style="margin-top:12px;">
-        <div class="detail-section-title">Raw Capture Rows</div>
-        <div class="detail-section-subtitle">Recent persisted frame rows with status, preview, and object key.</div>
+        <div class="detail-section-title" id="detailRawCaptureRowsTitle">Raw Capture Rows</div>
+        <div class="detail-section-subtitle" id="detailRawCaptureRowsSubtitle">Recent persisted frame rows with status, preview, and object key.</div>
       </div>
       <div class="toolbar">
         <select id="framesStatusFilter">
@@ -1875,7 +1875,7 @@
       <div class="coverage-panel">
         <div class="detail-section-head">
           <div class="detail-section-title">Recording</div>
-          <div class="detail-section-subtitle">Historical coverage, day-level heatmap, and stratified capture samples.</div>
+          <div class="detail-section-subtitle" id="detailCoverageSubtitle">Historical coverage, day-level heatmap, and stratified capture samples.</div>
         </div>
         <div class="detail-section-head" style="margin-top:12px;">
           <div class="detail-section-title">Historical Coverage</div>
@@ -1916,7 +1916,7 @@
         </div>
         <div class="detail-section-head" style="margin-top:8px;">
           <div class="detail-section-title">History Samples</div>
-          <div class="detail-section-subtitle">Stratified snapshots across full capture history (not just recent frames).</div>
+          <div class="detail-section-subtitle" id="detailCoverageSamplesSubtitle">Stratified snapshots across full capture history (not just recent frames).</div>
         </div>
         <div id="coverageSamplesSummary" class="coverage-summary">No samples loaded.</div>
         <div id="coverageSampleGrid" class="coverage-sample-grid"></div>
@@ -1928,7 +1928,7 @@
       <div class="timeline-panel">
         <div class="detail-section-head">
           <div class="detail-section-title">Recording vs Inference Timeline</div>
-          <div class="detail-section-subtitle">UTC minute timeline for recorded frames, inferenced frames, and person detections.</div>
+          <div class="detail-section-subtitle" id="detailTimelineSubtitle">UTC minute timeline for recorded frames, inferenced frames, and person detections.</div>
         </div>
         <div class="toolbar">
           <button id="timelinePrevDay" type="button">&#8592; Prev day</button>
@@ -2156,12 +2156,17 @@ const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
 const detailTagEditor = $('detailTagEditor');
 const detailActions = $('detailActions');
+const latestCaptureLabel = $('latestCaptureLabel');
 const latestRawCard = $('latestRawCard');
 const detailRecordingHero = $('detailRecordingHero');
 const detailCurrentPath = $('detailCurrentPath');
 const detailCurrentWorker = $('detailCurrentWorker');
 const detailLiveFramesStatus = $('detailLiveFramesStatus');
 const detailLiveFramesGrid = $('detailLiveFramesGrid');
+const detailFramesRecentTitle = $('detailFramesRecentTitle');
+const detailFramesRecentSubtitle = $('detailFramesRecentSubtitle');
+const detailExportTitle = $('detailExportTitle');
+const detailExportSubtitle = $('detailExportSubtitle');
 const detailExportPreset1h = $('detailExportPreset1h');
 const detailExportPreset24h = $('detailExportPreset24h');
 const detailExportPreset7d = $('detailExportPreset7d');
@@ -2172,6 +2177,8 @@ const detailExportManifest = $('detailExportManifest');
 const detailExportZip = $('detailExportZip');
 const detailExportStatus = $('detailExportStatus');
 const detailExportResult = $('detailExportResult');
+const detailRawCaptureRowsTitle = $('detailRawCaptureRowsTitle');
+const detailRawCaptureRowsSubtitle = $('detailRawCaptureRowsSubtitle');
 const detailTabInference = $('detailTabInference');
 const detailTabCoverage = $('detailTabCoverage');
 const detailTabTimeline = $('detailTabTimeline');
@@ -2180,6 +2187,9 @@ const detailInferenceSection = $('detailInferenceSection');
 const detailCoverageSection = $('detailCoverageSection');
 const detailTimelineSection = $('detailTimelineSection');
 const detailFramesSection = $('detailFramesSection');
+const detailCoverageSubtitle = $('detailCoverageSubtitle');
+const detailCoverageSamplesSubtitle = $('detailCoverageSamplesSubtitle');
+const detailTimelineSubtitle = $('detailTimelineSubtitle');
 const pipelineFilter = $('pipelineFilter');
 const detailStatusFilter = $('detailStatusFilter');
 const detailHasBoxed = $('detailHasBoxed');
@@ -3579,10 +3589,11 @@ function renderDetailRecordingHero(payload, frames) {
   const assignment = payload && payload.assignment ? payload.assignment : null;
   const route = payload && payload.relay_route ? payload.relay_route : null;
   const runtime = payload && payload.runtime ? payload.runtime : {};
+  const captureMeta = detailCaptureMeta(payload);
   const latest = Array.isArray(frames) && frames.length ? frames[0] : null;
   const state = String(health.state || (String(stream.recording_state || '').trim().toLowerCase() === 'on' ? 'degraded' : 'off'));
   const stateLabel = state === 'healthy' ? 'Recording' : (state === 'off' ? 'Off' : 'Attention');
-  const lastFrameText = latest && latest.captured_at ? formatDateTimeShort(latest.captured_at) : '-';
+  const lastFrameText = latest ? formatDateTimeShort(captureTimestampValue(latest)) : '-';
   const lastFrameAge = health.last_frame_age_sec != null ? ageLabel(health.last_frame_age_sec) : '-';
   const assignmentHTML = assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : 'unassigned';
   const relaySourceHTML = route && route.source_server_id ? serverLinkHTML(route.source_server_id, '-') : '-';
@@ -3594,7 +3605,7 @@ function renderDetailRecordingHero(payload, frames) {
       <div class="detail-summary-state">${esc(stateLabel)}</div>
     </div>
     <div class="detail-summary-meta">
-      <div>last frame ${esc(lastFrameText)}${lastFrameAge !== '-' ? ` · ${esc(lastFrameAge)}` : ''}</div>
+      <div>last ${esc(captureMeta.singular)} ${esc(lastFrameText)}${lastFrameAge !== '-' ? ` · ${esc(lastFrameAge)}` : ''}</div>
       <div>recording on ${assignmentHTML}</div>
       ${String(stream.execution_class || '') === 'youtube_relay' ? `<div>via ${relaySourceHTML} relay · ${esc(relayStatusText)}</div>` : ''}
       ${currentError ? `<div style="color:var(--warn);">${esc(currentError)}</div>` : ''}
@@ -3626,6 +3637,7 @@ function renderDetailCurrentPath(payload) {
   const health = payload && payload.current_health ? payload.current_health : {};
   const runtime = payload && payload.runtime ? payload.runtime : {};
   const stats = payload && payload.stats_24h ? payload.stats_24h : {};
+  const captureMeta = detailCaptureMeta(payload);
   const cards = [];
   cards.push(detailFactCardHTML(
     'Recording Server',
@@ -3651,7 +3663,7 @@ function renderDetailCurrentPath(payload) {
   }
   cards.push(detailFactCard(
     'Last 24h',
-    `${Number(stats.success_frames || 0)} frames`,
+    `${Number(stats.success_frames || 0)} ${captureMeta.plural}`,
     `${healthTagHTML(health.state, '')}<br/>errors ${Number(stats.error_frames || 0)}${stats.last_capture ? `<br/>latest ${esc(formatDateTimeShort(stats.last_capture))}` : ''}`
   ));
   detailCurrentPath.innerHTML = cards.join('');
@@ -3660,6 +3672,7 @@ function renderDetailCurrentPath(payload) {
 function renderDetailCurrentWorker(payload) {
   if (!(detailCurrentWorker instanceof HTMLElement)) return;
   const item = payload && payload.active_capture_worker ? payload.active_capture_worker : null;
+  const captureMeta = detailCaptureMeta(payload);
   if (!item) {
     detailCurrentWorker.innerHTML = '<span class="muted fs11">No active recording process is reporting right now.</span>';
     return;
@@ -3675,7 +3688,7 @@ function renderDetailCurrentWorker(payload) {
   detailCurrentWorker.innerHTML = `
     <div class="detail-section-head" style="margin-bottom:6px;">
       <div class="detail-section-title">Current Worker</div>
-      <div class="detail-section-subtitle">Live worker heartbeat and recent frame activity.</div>
+      <div class="detail-section-subtitle">Live worker heartbeat and recent ${esc(captureMeta.singular)} activity.</div>
     </div>
     <div class="row">
       <span class="tag tag-ok">active</span>
@@ -3685,30 +3698,33 @@ function renderDetailCurrentWorker(payload) {
       <span class="muted fs10">status ${esc(status)}</span>
       <span class="muted fs10">started ${esc(started)}</span>
       <span class="muted fs10">heartbeat ${esc(heartbeat)}</span>
-      <span class="muted fs10">frame ${esc(lastFrame)}</span>
+      <span class="muted fs10">${esc(captureMeta.singular)} ${esc(lastFrame)}</span>
       ${restarts > 0 ? `<span class="muted fs10">restarts ${restarts}</span>` : ''}
     </div>
   `;
 }
 
 function buildDetailLiveFrameCard(it) {
+  const captureMeta = detailCaptureMeta(detailRecordingData);
   const streamIDRaw = Number(detailStreamID || 0);
   const streamAttr = Number.isFinite(streamIDRaw) && streamIDRaw > 0 ? ` data-stream-id="${streamIDRaw}"` : '';
   const statusTag = String(it.capture_status || '').trim() === 'success'
     ? '<span class="tag tag-ok">success</span>'
     : '<span class="tag tag-warn">error</span>';
   const url = String(it.download_url || '').trim();
-  const imageHTML = url
-    ? `<a class="table-image-link" href="${esc(url)}" data-image-url="${esc(url)}" data-image-scope="frames"${streamAttr}><img class="thumb-sm" src="${esc(url)}" alt="frame" loading="lazy" decoding="async" /></a>`
-    : '<div class="img-slot"><span class="muted fs10">no image</span></div>';
   const card = document.createElement('div');
   card.className = 'detail-live-frame';
   card.setAttribute('data-frame-id', String(Number(it.id || 0)));
+  const mediaHTML = captureMeta.clipNative
+    ? `<div class="img-slot"><span class="muted fs10">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">open clip</a>` : 'no clip'}</span></div>`
+    : (url
+      ? `<a class="table-image-link" href="${esc(url)}" data-image-url="${esc(url)}" data-image-scope="frames"${streamAttr}><img class="thumb-sm" src="${esc(url)}" alt="frame" loading="lazy" decoding="async" /></a>`
+      : '<div class="img-slot"><span class="muted fs10">no image</span></div>');
   card.innerHTML = `
-    ${imageHTML}
+    ${mediaHTML}
     <div class="detail-live-frame-meta">
       ${statusTag}
-      <span class="mono fs10">${esc(formatDateTimeShort(it.captured_at || ''))}</span>
+      <span class="mono fs10">${esc(captureWindowLabel(it))}</span>
       <span class="mono fs10 muted">${esc(String(it.object_key || '-'))}</span>
     </div>
   `;
@@ -3717,13 +3733,14 @@ function buildDetailLiveFrameCard(it) {
 
 function renderDetailLiveFramesGrid(items) {
   if (!(detailLiveFramesGrid instanceof HTMLElement) || !(detailLiveFramesStatus instanceof HTMLElement)) return;
+  const captureMeta = detailCaptureMeta(detailRecordingData);
   if (!Array.isArray(items) || !items.length) {
-    detailLiveFramesStatus.textContent = 'No recent frames yet.';
-    detailLiveFramesGrid.innerHTML = '<div class="muted fs11">No recent frames</div>';
+    detailLiveFramesStatus.textContent = `No recent ${captureMeta.plural} yet.`;
+    detailLiveFramesGrid.innerHTML = `<div class="muted fs11">No recent ${esc(captureMeta.plural)}</div>`;
     return;
   }
   const latest = items[0];
-  detailLiveFramesStatus.textContent = `${items.length} recent frames · latest ${formatDateTimeShort(latest.captured_at || '')}`;
+  detailLiveFramesStatus.textContent = `${items.length} recent ${captureMeta.plural} · latest ${formatDateTimeShort(captureTimestampValue(latest) || '')}`;
   const previousIDs = Array.isArray(detailRecentFramesData) ? detailRecentFramesData.map((it) => Number(it.id || 0)) : [];
   const nextIDs = items.map((it) => Number(it.id || 0));
   const sameOrder = previousIDs.length === nextIDs.length && previousIDs.every((id, idx) => id === nextIDs[idx]);
@@ -5176,6 +5193,7 @@ function renderRecRows() {
     const loss = Number(row.loss_rate_pct || 0);
     const expectedFrames = Number(row.expected_frames_60s || 60);
     const health = String(row.recording_health || 'unknown');
+    const captureUnit = String(row.capture_unit || 'frames');
     const peopleMetric = peoplePerInferenceMetric(row);
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -5194,7 +5212,7 @@ function renderRecRows() {
       <td>
         <div class="stack fs11 mono">
           <span class="tag tag-muted">${esc(health)}</span>
-          <span>loss ${loss.toFixed(1)}% · frames ${Number(row.success_frames_60s || 0)}/${expectedFrames} per 60s</span>
+          <span>loss ${loss.toFixed(1)}% · ${esc(captureUnit)} ${Number(row.success_frames_60s || 0)}/${expectedFrames} per 60s</span>
           <span>freshness ${freshnessTxt}</span>
           <span class="muted fs10">${latestCap}</span>
         </div>
@@ -5577,12 +5595,51 @@ async function loadAllInference() {
 }
 
 // ─── Detail view ──────────────────────────────────────────────────────────────
-function renderLatestCard(container, imageURL, objectKey, capturedAt, frameID = 0) {
+function detailCaptureMeta(payload) {
+  const stream = payload && payload.stream ? payload.stream : {};
+  const unit = String(payload && payload.capture_unit || '').trim().toLowerCase();
+  const clipNative = unit === 'clips' || Boolean(payload && payload.clip_native) || (String(stream.execution_class || '').trim() !== '' && String(stream.execution_class || '').trim().toLowerCase() !== 'image_poll');
+  return clipNative
+    ? { clipNative: true, singular: 'clip', plural: 'clips' }
+    : { clipNative: false, singular: 'frame', plural: 'frames' };
+}
+
+function captureTimestampValue(it) {
+  return it && (it.segment_end_at || it.captured_at || it.created_at) ? String(it.segment_end_at || it.captured_at || it.created_at) : '';
+}
+
+function captureWindowLabel(it) {
+  if (!it) return '-';
+  if (it.segment_start_at || it.segment_end_at) {
+    return `${formatDateTimeShort(it.segment_start_at || '')} → ${formatDateTimeShort(it.segment_end_at || '')}`;
+  }
+  return formatDateTimeShort(it.captured_at || '');
+}
+
+function renderLatestCard(container, payload, latestCapture, previewImage) {
+  const meta = detailCaptureMeta(payload);
+  if (latestCaptureLabel) latestCaptureLabel.textContent = meta.clipNative ? 'Latest clip' : 'Latest frame';
+  if (meta.clipNative) {
+    const url = String((latestCapture && latestCapture.download_url) || '').trim();
+    const objectKey = String((latestCapture && latestCapture.object_key) || '-');
+    const windowLabel = captureWindowLabel(latestCapture);
+    container.removeAttribute('data-frame-id');
+    container.innerHTML = latestCapture ? `
+      <div class="stack">
+        ${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm primary" type="button">Open Latest Clip</button></a>` : '<span class="muted fs11">No clip URL</span>'}
+        <span class="muted fs10 mono">${esc(windowLabel)}</span>
+        <span class="muted fs10 mono">${esc(objectKey)}</span>
+      </div>
+    ` : '<span class="muted fs11">No clip yet</span>';
+    return;
+  }
+  const imageURL = previewImage && previewImage.download_url ? String(previewImage.download_url) : '';
   if (!imageURL) {
     container.removeAttribute('data-frame-id');
     container.innerHTML = '<span class="muted fs11">No image</span>';
     return;
   }
+  const frameID = Number(previewImage && previewImage.id || 0);
   const nextID = Number(frameID || 0);
   const currentID = Number(container.getAttribute('data-frame-id') || '0');
   if (nextID > 0 && currentID === nextID) {
@@ -5594,8 +5651,8 @@ function renderLatestCard(container, imageURL, objectKey, capturedAt, frameID = 
       <a href="${esc(imageURL)}" target="_blank" rel="noopener noreferrer">
         <img class="thumb-lg" src="${esc(imageURL)}" alt="preview" loading="lazy" decoding="async" />
       </a>
-      <span class="muted fs10 mono">${esc(capturedAt || '-')}</span>
-      <span class="muted fs10 mono">${esc(objectKey || '-')}</span>
+      <span class="muted fs10 mono">${esc(previewImage && previewImage.captured_at || '-')}</span>
+      <span class="muted fs10 mono">${esc(previewImage && previewImage.object_key || '-')}</span>
     </div>
   `;
 }
@@ -5735,6 +5792,7 @@ function renderSignals(items, latestResult) {
 
 function renderFramesRows(items) {
   framesRowsEl.innerHTML = '';
+  const captureMeta = detailCaptureMeta(detailRecordingData);
   const statusF = String(framesStatusFilter.value || '').trim().toLowerCase();
   const filtered = (items || []).filter((it) => !statusF || String(it.capture_status || '').toLowerCase() === statusF);
   if (!filtered.length) {
@@ -5748,13 +5806,16 @@ function renderFramesRows(items) {
     const modalStreamIDRaw = Number(detailStreamID || 0);
     const modalStreamID = Number.isFinite(modalStreamIDRaw) && modalStreamIDRaw > 0 ? Math.floor(modalStreamIDRaw) : 0;
     const modalStreamAttr = modalStreamID ? ` data-stream-id="${modalStreamID}"` : '';
-    const rawImg = it.download_url
-      ? `<a class="table-image-link" href="${esc(it.download_url)}" data-image-url="${esc(it.download_url)}" data-image-scope="frames"${modalStreamAttr}><img class="thumb-sm" src="${esc(it.download_url)}" alt="frame" loading="lazy" decoding="async" /></a>`
-      : '<span class="muted fs11">-</span>';
+    const rawImg = captureMeta.clipNative
+      ? (it.download_url ? `<a href="${esc(it.download_url)}" target="_blank" rel="noopener noreferrer">open clip</a>` : '<span class="muted fs11">-</span>')
+      : (it.download_url
+        ? `<a class="table-image-link" href="${esc(it.download_url)}" data-image-url="${esc(it.download_url)}" data-image-scope="frames"${modalStreamAttr}><img class="thumb-sm" src="${esc(it.download_url)}" alt="frame" loading="lazy" decoding="async" /></a>`
+        : '<span class="muted fs11">-</span>');
+    const capturedText = captureMeta.clipNative ? captureWindowLabel(it) : String(it.captured_at || '-');
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="mono fs11 muted">${it.id}</td>
-      <td class="mono fs11 muted">${esc(it.captured_at || '-')}</td>
+      <td class="mono fs11 muted">${esc(capturedText)}</td>
       <td><span class="tag ${statusCls}">${esc(it.capture_status || '-')}</span></td>
       <td class="fs11 muted">${esc(it.capture_error || '-')}</td>
       <td>${rawImg}</td>
@@ -6088,13 +6149,22 @@ async function fetchRecentFrames(limit = 60) {
   return Array.isArray(payload.items) ? payload.items : [];
 }
 
+async function fetchRecentClips(limit = 60) {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  params.set('offset', '0');
+  const payload = await fetchJSON(`/api/v1/capture/streams/${detailStreamID}/segments?${params}`);
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
 async function loadDetailLiveFrames(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return [];
+  const meta = detailCaptureMeta(detailRecordingData);
   if (!quiet && detailLiveFramesStatus) {
-    detailLiveFramesStatus.textContent = 'Loading recent frames...';
+    detailLiveFramesStatus.textContent = `Loading recent ${meta.plural}...`;
   }
-  const items = await fetchRecentFrames(60);
+  const items = meta.clipNative ? await fetchRecentClips(60) : await fetchRecentFrames(60);
   renderDetailLiveFramesGrid(items);
   detailRecentFramesData = items;
   return items;
@@ -6103,24 +6173,30 @@ async function loadDetailLiveFrames(options = {}) {
 async function loadDetailFrames(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return;
+  const meta = detailCaptureMeta(detailRecordingData);
   if (!quiet) {
     setTableLoadingRow(framesRowsEl, 6, 'Loading captures...');
     framesStatusText.className = 'status-text';
     framesStatusText.textContent = 'loading...';
   }
   const limit = sanitizeLimit(framesLimit.value, 200, 20, 1000);
-  const params = new URLSearchParams();
-  params.set('stream_id', String(detailStreamID));
-  params.set('limit', String(limit));
-  params.set('offset', '0');
-  params.set('sort_by', String(framesSortBy || 'captured_at'));
-  params.set('sort_dir', normalizeSortDir(framesSortDir, 'desc'));
-  const payload = await fetchJSON(`/api/v1/frames?${params}`);
-  detailFramesData = payload.items || [];
+  if (meta.clipNative) {
+    detailFramesData = await fetchRecentClips(limit);
+  } else {
+    const params = new URLSearchParams();
+    params.set('stream_id', String(detailStreamID));
+    params.set('limit', String(limit));
+    params.set('offset', '0');
+    params.set('sort_by', String(framesSortBy || 'captured_at'));
+    params.set('sort_dir', normalizeSortDir(framesSortDir, 'desc'));
+    const payload = await fetchJSON(`/api/v1/frames?${params}`);
+    detailFramesData = payload.items || [];
+  }
   renderFramesRows(detailFramesData);
 }
 
 function renderDetailCaptureWorkers(items) {
+  const captureMeta = detailCaptureMeta(detailRecordingData);
   const rows = Array.isArray(items) ? items.filter((it) => !Boolean(it && it.active)) : [];
   if (!rows.length) {
     detailCaptureWorkers.innerHTML = '<span class="muted fs11">No stale process history to show.</span>';
@@ -6147,7 +6223,7 @@ function renderDetailCaptureWorkers(items) {
       <span class="muted fs10">status ${esc(status)}</span>
       <span class="muted fs10">started ${esc(started)}</span>
       <span class="muted fs10">heartbeat ${esc(hb)}</span>
-      <span class="muted fs10">frame ${esc(lastFrame)}</span>
+      <span class="muted fs10">${esc(captureMeta.singular)} ${esc(lastFrame)}</span>
       ${restarts > 0 ? `<span class="muted fs10">restarts ${restarts}</span>` : ''}
       ${lastErrorText ? `<span class="mono fs10" style="color:#ef4444;">${esc(lastErrorText)}</span>` : ''}
     </div>`;
@@ -6232,15 +6308,14 @@ async function loadDetailInference() {
 async function loadDetail(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return;
-  if (!quiet) {
-    setDetailWorkloadStatus('loading...');
-    if (detailLiveFramesStatus) detailLiveFramesStatus.textContent = 'Loading recent frames...';
-  }
-  const [recordingPayload, recentFrames] = await Promise.all([
-    fetchJSON(`/api/v1/dashboard/streams/${detailStreamID}/recording`),
-    fetchRecentFrames(60),
-  ]);
+  if (!quiet) setDetailWorkloadStatus('loading...');
+  const recordingPayload = await fetchJSON(`/api/v1/dashboard/streams/${detailStreamID}/recording`);
   detailRecordingData = recordingPayload;
+  const captureMeta = detailCaptureMeta(recordingPayload);
+  if (!quiet && detailLiveFramesStatus) {
+    detailLiveFramesStatus.textContent = `Loading recent ${captureMeta.plural}...`;
+  }
+  const recentFrames = captureMeta.clipNative ? await fetchRecentClips(60) : await fetchRecentFrames(60);
   const s = recordingPayload.stream || {};
   const detailName = latinizedLabelParts(s.name);
 
@@ -6265,13 +6340,31 @@ async function loadDetail(options = {}) {
   detailTagEditor.innerHTML = renderTagEditor(s, 'detail');
 
   const latestFrame = recentFrames.length ? recentFrames[0] : null;
-  ensureDetailExportWindow(latestFrame);
+  if (!captureMeta.clipNative) ensureDetailExportWindow(latestFrame);
+  if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = captureMeta.clipNative ? 'Latest 60 Clips' : 'Latest 60 Frames';
+  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = captureMeta.clipNative ? 'Auto-refreshes every few seconds while this page is open.' : 'Auto-refreshes every second while this page is open.';
+  if (detailExportTitle) detailExportTitle.textContent = captureMeta.clipNative ? 'Frame Export' : 'Export Frames';
+  if (detailExportSubtitle) detailExportSubtitle.textContent = captureMeta.clipNative ? 'Frame export is not available for clip-native streams until extraction is wired.' : 'Download a manifest for any time window, or prepare a bounded ZIP archive.';
+  if (detailRawCaptureRowsTitle) detailRawCaptureRowsTitle.textContent = captureMeta.clipNative ? 'Clip Segment Rows' : 'Raw Capture Rows';
+  if (detailRawCaptureRowsSubtitle) detailRawCaptureRowsSubtitle.textContent = captureMeta.clipNative ? 'Recent persisted clip segments with status, download link, and object key.' : 'Recent persisted frame rows with status, preview, and object key.';
+  if (detailCoverageSubtitle) detailCoverageSubtitle.textContent = captureMeta.clipNative ? 'Historical coverage is still frame-native; new clip-native live video will appear here after frame extraction is wired.' : 'Historical coverage, day-level heatmap, and stratified capture samples.';
+  if (detailCoverageSamplesSubtitle) detailCoverageSamplesSubtitle.textContent = captureMeta.clipNative ? 'History samples below still reflect frame-based capture history only.' : 'Stratified snapshots across full capture history (not just recent frames).';
+  if (detailTimelineSubtitle) detailTimelineSubtitle.textContent = captureMeta.clipNative ? 'Timeline is still frame-native; new clip-native live video will appear here after extraction is wired.' : 'UTC minute timeline for recorded frames, inferenced frames, and person detections.';
+  if (detailExportManifest) detailExportManifest.disabled = captureMeta.clipNative;
+  if (detailExportZip) detailExportZip.disabled = captureMeta.clipNative;
+  if (detailExportPreset1h) detailExportPreset1h.disabled = captureMeta.clipNative;
+  if (detailExportPreset24h) detailExportPreset24h.disabled = captureMeta.clipNative;
+  if (detailExportPreset7d) detailExportPreset7d.disabled = captureMeta.clipNative;
+  if (detailExportResult) {
+    detailExportResult.textContent = captureMeta.clipNative
+      ? 'Frame export is disabled for clip-native streams until the extraction pipeline lands.'
+      : 'ZIP export currently supports up to 5000 frames or 2 GiB per request.';
+  }
   renderLatestCard(
     latestRawCard,
-    latestFrame && latestFrame.download_url,
-    latestFrame && latestFrame.object_key,
-    latestFrame && latestFrame.captured_at,
-    latestFrame && latestFrame.id
+    recordingPayload,
+    latestFrame,
+    latestFrame
   );
   renderDetailRecordingHero(recordingPayload, recentFrames);
   renderDetailCurrentPath(recordingPayload);
@@ -6282,7 +6375,7 @@ async function loadDetail(options = {}) {
   setDetailWorkloadStatus(`updated ${formatDateTimeShort(new Date())}`, 'ok');
 
   if (!detailTimelineDay) {
-    detailTimelineDay = toUTCDateKey((latestFrame && latestFrame.captured_at) || new Date());
+    detailTimelineDay = toUTCDateKey(captureTimestampValue(latestFrame) || new Date());
   }
   timelineDayInput.value = detailTimelineDay;
   if (!quiet && detailView === 'coverage') void loadDetailCoverage().catch((err) => setCoverageStatus(String(err), 'err'));

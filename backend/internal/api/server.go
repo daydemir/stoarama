@@ -3813,6 +3813,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		LossRatePct                   float64      `json:"loss_rate_pct"`
 		FreshnessSec                  *int64       `json:"freshness_sec,omitempty"`
 		RecordingHealth               string       `json:"recording_health"`
+		CaptureUnit                   string       `json:"capture_unit"`
 	}
 	items := make([]item, 0, limit)
 	if recordingOnlyFastPath {
@@ -3895,8 +3896,18 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 				InferencedCaptures:            inferencedCaptures,
 				PersonDetectionsTotal:         personDetectionsTotal,
 				AvgPeoplePerInferencedCapture: avgPeoplePerInferencedCapture,
+				CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
 			}
-			if stream.RecordingState == model.RecordingStateOn {
+			if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
+				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+				if it.TargetFPS <= 0 {
+					it.TargetFPS = 10
+				}
+				it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
+				if runtimeLastFrame != nil {
+					it.LatestCaptured = runtimeLastFrame
+				}
+			} else if stream.RecordingState == model.RecordingStateOn {
 				it.TargetFPS = 1
 				it.ExpectedFrames60s = expectedFramesPer60s(recordingSettings.CaptureIntervalSec)
 			} else {
@@ -4098,8 +4109,18 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 				InferencedCaptures:            inferencedCaptures,
 				PersonDetectionsTotal:         personDetectionsTotal,
 				AvgPeoplePerInferencedCapture: avgPeoplePerInferencedCapture,
+				CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
 			}
-			if stream.RecordingState == model.RecordingStateOn {
+			if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
+				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+				if it.TargetFPS <= 0 {
+					it.TargetFPS = 10
+				}
+				it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
+				if runtimeLastFrame != nil {
+					it.LatestCaptured = runtimeLastFrame
+				}
+			} else if stream.RecordingState == model.RecordingStateOn {
 				it.TargetFPS = 1
 				it.ExpectedFrames60s = expectedFramesPer60s(recordingSettings.CaptureIntervalSec)
 			} else {
@@ -4118,11 +4139,16 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if len(items) > 0 {
-		streamIDs := make([]int64, 0, len(items))
+		frameStreamIDs := make([]int64, 0, len(items))
+		clipStreamIDs := make([]int64, 0, len(items))
 		for _, it := range items {
-			streamIDs = append(streamIDs, it.Stream.ID)
+			if isClipNativeExecutionClass(firstNonEmpty(string(it.Stream.ExecutionClass), derefString(it.Stream.CaptureRuntimeClass))) {
+				clipStreamIDs = append(clipStreamIDs, it.Stream.ID)
+			} else {
+				frameStreamIDs = append(frameStreamIDs, it.Stream.ID)
+			}
 		}
-		success60s, err := s.successFrameCountsSince(r.Context(), streamIDs, 60*time.Second)
+		success60s, err := s.successCaptureCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 60*time.Second)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard success counters query: %v", err))
 			return
@@ -4150,7 +4176,8 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			}
 			switch items[i].Stream.RecordingState {
 			case model.RecordingStateOn:
-				if items[i].FreshnessSec != nil && *items[i].FreshnessSec > 15 {
+				staleThreshold := staleThresholdSecForExecutionClass(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), recordingSettings.CaptureIntervalSec)
+				if items[i].FreshnessSec != nil && *items[i].FreshnessSec > staleThreshold {
 					items[i].RecordingHealth = "stale"
 				} else if items[i].LossRatePct > 20 {
 					items[i].RecordingHealth = "degraded"
@@ -4701,48 +4728,77 @@ func (s *Server) handleDashboardRecordingSummary(w http.ResponseWriter, r *http.
 	}
 
 	var healthy, degraded, stale int64
-	if err := s.pool.QueryRow(r.Context(), `
-		WITH recent_success AS (
-			SELECT f.stream_id, COUNT(*)::bigint AS success_frames_60s
-			FROM frames f
-			JOIN streams s ON s.id=f.stream_id
-			WHERE s.recording_state='on'
-			  AND f.capture_status='success'
-			  AND f.captured_at >= now() - interval '60 seconds'
-			GROUP BY f.stream_id
-		),
-		base AS (
-			SELECT
-				s.id,
-				COALESCE(rt.last_frame_at, sh.last_capture_at) AS last_seen,
-				COALESCE(rs.success_frames_60s, 0) AS success_frames_60s
-			FROM streams s
-			LEFT JOIN stream_capture_runtime rt ON rt.stream_id=s.id
-			LEFT JOIN stream_health sh ON sh.stream_id=s.id
-			LEFT JOIN recent_success rs ON rs.stream_id=s.id
-			WHERE s.recording_state='on'
-		),
-		with_health AS (
-			SELECT
-				CASE
-					WHEN last_seen IS NULL THEN NULL
-					ELSE GREATEST(0, EXTRACT(EPOCH FROM now() - last_seen)::bigint)
-				END AS freshness_sec,
-				CASE
-					WHEN $1::bigint <= 0 THEN 100.0
-					ELSE
-						100.0 * GREATEST($1::bigint - success_frames_60s, 0)::double precision / $1::double precision
-				END AS loss_rate_pct
-			FROM base
-		)
+	type summaryStreamHealthRow struct {
+		StreamID       int64
+		ExecutionClass string
+		RuntimeClass   *string
+		LastSeen       *time.Time
+	}
+	summaryRows, err := s.pool.Query(r.Context(), `
 		SELECT
-			COUNT(*) FILTER (WHERE freshness_sec IS NOT NULL AND freshness_sec <= 15 AND loss_rate_pct <= 20)::bigint AS healthy,
-			COUNT(*) FILTER (WHERE freshness_sec IS NOT NULL AND freshness_sec <= 15 AND loss_rate_pct > 20)::bigint AS degraded,
-			COUNT(*) FILTER (WHERE freshness_sec IS NULL OR freshness_sec > 15)::bigint AS stale
-		FROM with_health
-	`, expectedFramesPer60s(recordingSettings.CaptureIntervalSec)).Scan(&healthy, &degraded, &stale); err != nil {
+			s.id,
+			s.execution_class,
+			rt.execution_class,
+			COALESCE(rt.last_frame_at, sh.last_capture_at) AS last_seen
+		FROM streams s
+		LEFT JOIN stream_capture_runtime rt ON rt.stream_id=s.id
+		LEFT JOIN stream_health sh ON sh.stream_id=s.id
+		WHERE s.recording_state='on'
+	`)
+	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording summary health: %v", err))
 		return
+	}
+	summaryItems := make([]summaryStreamHealthRow, 0, onTotal)
+	frameSummaryIDs := make([]int64, 0, onTotal)
+	clipSummaryIDs := make([]int64, 0, onTotal)
+	for summaryRows.Next() {
+		var row summaryStreamHealthRow
+		if err := summaryRows.Scan(&row.StreamID, &row.ExecutionClass, &row.RuntimeClass, &row.LastSeen); err != nil {
+			summaryRows.Close()
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan recording summary health: %v", err))
+			return
+		}
+		summaryItems = append(summaryItems, row)
+		if isClipNativeExecutionClass(firstNonEmpty(row.ExecutionClass, derefString(row.RuntimeClass))) {
+			clipSummaryIDs = append(clipSummaryIDs, row.StreamID)
+		} else {
+			frameSummaryIDs = append(frameSummaryIDs, row.StreamID)
+		}
+	}
+	summaryRows.Close()
+	if summaryRows.Err() != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recording summary health: %v", summaryRows.Err()))
+		return
+	}
+	success60s, err := s.successCaptureCountsSince(r.Context(), frameSummaryIDs, clipSummaryIDs, 60*time.Second)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording summary counters: %v", err))
+		return
+	}
+	now := time.Now().UTC()
+	for _, row := range summaryItems {
+		mode := firstNonEmpty(row.ExecutionClass, derefString(row.RuntimeClass))
+		if row.LastSeen == nil {
+			stale++
+			continue
+		}
+		freshness := int64(now.Sub(row.LastSeen.UTC()).Seconds())
+		if freshness < 0 {
+			freshness = 0
+		}
+		expected := expectedCapturesPer60s(mode, recordingSettings.CaptureIntervalSec)
+		lossRate := 100.0
+		if expected > 0 {
+			lossRate = 100.0 * float64(maxInt64(expected-success60s[row.StreamID], 0)) / float64(expected)
+		}
+		if freshness > staleThresholdSecForExecutionClass(mode, recordingSettings.CaptureIntervalSec) {
+			stale++
+		} else if lossRate > 20 {
+			degraded++
+		} else {
+			healthy++
+		}
 	}
 
 	var activeProcesses, staleProcesses int64
@@ -7282,26 +7338,47 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	captureMode := firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode), assignedExecutionClass)
+	clipNative := isClipNativeExecutionClass(captureMode)
 	var successFrames24h, errorFrames24h int64
 	var firstCapture24h, lastCapture24h *time.Time
-	if err := s.pool.QueryRow(r.Context(), `
-		SELECT
-			COUNT(*) FILTER (WHERE capture_status='success')::bigint,
-			COUNT(*) FILTER (WHERE capture_status='error')::bigint,
-			MIN(captured_at),
-			MAX(captured_at)
-		FROM frames
-		WHERE stream_id=$1
-		  AND captured_at >= now() - interval '24 hours'
-	`, id).Scan(&successFrames24h, &errorFrames24h, &firstCapture24h, &lastCapture24h); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query stream recording frame stats: %v", err))
-		return
+	if clipNative {
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT
+				COUNT(*) FILTER (WHERE capture_status='success')::bigint,
+				COUNT(*) FILTER (WHERE capture_status='error')::bigint,
+				MIN(segment_end_at),
+				MAX(segment_end_at)
+			FROM capture_segments
+			WHERE stream_id=$1
+			  AND segment_end_at >= now() - interval '24 hours'
+		`, id).Scan(&successFrames24h, &errorFrames24h, &firstCapture24h, &lastCapture24h); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query stream recording clip stats: %v", err))
+			return
+		}
+	} else {
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT
+				COUNT(*) FILTER (WHERE capture_status='success')::bigint,
+				COUNT(*) FILTER (WHERE capture_status='error')::bigint,
+				MIN(captured_at),
+				MAX(captured_at)
+			FROM frames
+			WHERE stream_id=$1
+			  AND captured_at >= now() - interval '24 hours'
+		`, id).Scan(&successFrames24h, &errorFrames24h, &firstCapture24h, &lastCapture24h); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query stream recording frame stats: %v", err))
+			return
+		}
 	}
 	intervalSec := recordingSettings.CaptureIntervalSec
 	if intervalSec <= 0 {
 		intervalSec = 1
 	}
 	expectedFrames24h := int64(24 * 60 * 60 / intervalSec)
+	if clipNative {
+		expectedFrames24h = int64(24 * 60 * 60 / 30)
+	}
 	if expectedFrames24h <= 0 {
 		expectedFrames24h = 1
 	}
@@ -7318,14 +7395,13 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		}
 	}
 	now := time.Now().UTC()
-	healthyWindowSec := intervalSec * 5
-	if healthyWindowSec < 15 {
-		healthyWindowSec = 15
-	}
+	healthyWindowSec := int(staleThresholdSecForExecutionClass(captureMode, recordingSettings.CaptureIntervalSec))
 	healthState := "off"
 	healthReason := "recording_off"
 	healthMessage := "recording is off"
 	var lastFrameAgeSec *int64
+	captureUnitSingular := strings.TrimSuffix(captureUnitLabelForExecutionClass(captureMode), "s")
+	captureUnitPlural := captureUnitLabelForExecutionClass(captureMode)
 	if strings.EqualFold(strings.TrimSpace(string(stream.RecordingState)), "on") {
 		healthState = "degraded"
 		healthReason = "unassigned"
@@ -7333,8 +7409,8 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		switch {
 		case assignment == nil:
 		case lastFrameAt == nil:
-			healthReason = "no_recent_frame"
-			healthMessage = "recording is assigned but no recent frame has been observed"
+			healthReason = "no_recent_capture"
+			healthMessage = fmt.Sprintf("recording is assigned but no recent %s has been observed", captureUnitSingular)
 		default:
 			age := int64(now.Sub((*lastFrameAt).UTC()).Seconds())
 			if age < 0 {
@@ -7343,11 +7419,11 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 			lastFrameAgeSec = &age
 			if age <= int64(healthyWindowSec) {
 				healthState = "healthy"
-				healthReason = "fresh_frames"
-				healthMessage = "fresh frames are arriving"
+				healthReason = "fresh_captures"
+				healthMessage = fmt.Sprintf("fresh %s are arriving", captureUnitPlural)
 			} else {
-				healthReason = "stale_frames"
-				healthMessage = "the latest frame is stale"
+				healthReason = "stale_captures"
+				healthMessage = fmt.Sprintf("the latest %s is stale", captureUnitSingular)
 			}
 		}
 		if healthState != "healthy" && relayRoute != nil {
@@ -7381,6 +7457,8 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		"process_runs":          processRuns,
 		"state_events":          stateEvents,
 		"recording_config":      map[string]any{"interval_sec": recordingSettings.CaptureIntervalSec},
+		"capture_unit":          captureUnitPlural,
+		"clip_native":           clipNative,
 		"current_health": map[string]any{
 			"state":              healthState,
 			"reason":             healthReason,
@@ -8595,6 +8673,105 @@ func (s *Server) successFrameCountsSince(ctx context.Context, streamIDs []int64,
 		return nil, fmt.Errorf("iterate success frame counts: %w", rows.Err())
 	}
 	return out, nil
+}
+
+func (s *Server) successSegmentCountsSince(ctx context.Context, streamIDs []int64, window time.Duration) (map[int64]int64, error) {
+	out := make(map[int64]int64, len(streamIDs))
+	if len(streamIDs) == 0 {
+		return out, nil
+	}
+	if window <= 0 {
+		window = 60 * time.Second
+	}
+	seconds := int64(window.Seconds())
+	if seconds <= 0 {
+		seconds = 60
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT cs.stream_id, COUNT(*)::bigint
+		FROM capture_segments cs
+		WHERE cs.stream_id = ANY($1::bigint[])
+		  AND cs.capture_status='success'
+		  AND cs.segment_end_at >= now() - make_interval(secs => $2)
+		GROUP BY cs.stream_id
+	`, streamIDs, seconds)
+	if err != nil {
+		return nil, fmt.Errorf("query success segment counts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var streamID int64
+		var count int64
+		if err := rows.Scan(&streamID, &count); err != nil {
+			return nil, fmt.Errorf("scan success segment count: %w", err)
+		}
+		out[streamID] = count
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("iterate success segment counts: %w", rows.Err())
+	}
+	return out, nil
+}
+
+func (s *Server) successCaptureCountsSince(ctx context.Context, frameStreamIDs, clipStreamIDs []int64, window time.Duration) (map[int64]int64, error) {
+	out := make(map[int64]int64, len(frameStreamIDs)+len(clipStreamIDs))
+	frameCounts, err := s.successFrameCountsSince(ctx, frameStreamIDs, window)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range frameCounts {
+		out[k] = v
+	}
+	segmentCounts, err := s.successSegmentCountsSince(ctx, clipStreamIDs, window)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range segmentCounts {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func isClipNativeExecutionClass(raw string) bool {
+	mode := capture.NormalizeMode(raw)
+	switch mode {
+	case capture.ModeYouTubeLive, capture.ModeYouTubeRelay, capture.ModeHLSLive, capture.ModeFFmpegDirect:
+		return true
+	default:
+		return false
+	}
+}
+
+func captureUnitLabelForExecutionClass(raw string) string {
+	if isClipNativeExecutionClass(raw) {
+		return "clips"
+	}
+	return "frames"
+}
+
+func expectedCapturesPer60s(raw string, recordingIntervalSec int) int64 {
+	if isClipNativeExecutionClass(raw) {
+		return 2
+	}
+	return expectedFramesPer60s(recordingIntervalSec)
+}
+
+func staleThresholdSecForExecutionClass(raw string, recordingIntervalSec int) int64 {
+	if isClipNativeExecutionClass(raw) {
+		return 150
+	}
+	threshold := int64(recordingIntervalSec * 5)
+	if threshold < 15 {
+		threshold = 15
+	}
+	return threshold
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *Server) requireIdempotency(w http.ResponseWriter, r *http.Request, endpoint string) bool {
