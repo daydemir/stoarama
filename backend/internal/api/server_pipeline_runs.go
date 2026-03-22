@@ -445,7 +445,8 @@ func (s *Server) queryPipelineRuns(ctx context.Context, runID int64, pipelineID 
 		JOIN pipeline_versions pv ON pv.id = pr.pipeline_version_id
 		LEFT JOIN pipeline_run_targets prt ON prt.run_id = pr.id
 		WHERE %s
-		GROUP BY pr.id, pv.version_id
+		GROUP BY pr.id, pr.pipeline_id, pr.owner_account_id, pr.pipeline_version_id, pv.version_id, pv.runner_kind, pv.spec_jsonb,
+		         pr.label, pr.status, pr.worker_kind, pr.selector_jsonb, pr.metadata_jsonb, pr.created_by, pr.created_at, pr.started_at, pr.finished_at
 		ORDER BY pr.created_at DESC, pr.id DESC
 		LIMIT $%d OFFSET $%d
 	`, strings.Join(where, " AND "), len(args)-1, len(args)), args...)
