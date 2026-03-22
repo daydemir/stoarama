@@ -147,6 +147,13 @@ func (s *Server) router() http.Handler {
 			account.Get("/pipeline-runs", s.handlePipelineRunsList)
 			account.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
 			account.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
+			account.Post("/eval-suites/sync", s.handleEvalSuitesSync)
+			account.Get("/eval-suites", s.handleEvalSuitesList)
+			account.Get("/eval-suites/{id}", s.handleEvalSuiteGet)
+			account.Post("/pipeline-experiments/sync", s.handlePipelineExperimentsSync)
+			account.Get("/pipeline-experiments", s.handlePipelineExperimentsList)
+			account.Get("/pipeline-experiments/{id}", s.handlePipelineExperimentGet)
+			account.Post("/pipeline-experiment-iterations/sync", s.handlePipelineExperimentIterationsSync)
 		})
 		api.Route("/node", func(node chi.Router) {
 			node.Use(s.requireNodeAuth)
@@ -200,6 +207,13 @@ func (s *Server) router() http.Handler {
 			admin.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
 			admin.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
 			admin.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
+			admin.Post("/eval-suites/sync", s.handleEvalSuitesSync)
+			admin.Get("/eval-suites", s.handleEvalSuitesList)
+			admin.Get("/eval-suites/{id}", s.handleEvalSuiteGet)
+			admin.Post("/pipeline-experiments/sync", s.handlePipelineExperimentsSync)
+			admin.Get("/pipeline-experiments", s.handlePipelineExperimentsList)
+			admin.Get("/pipeline-experiments/{id}", s.handlePipelineExperimentGet)
+			admin.Post("/pipeline-experiment-iterations/sync", s.handlePipelineExperimentIterationsSync)
 			admin.Get("/capture/schema", s.handleCaptureSchema)
 			admin.Get("/frames", s.handleFramesList)
 			admin.Get("/dashboard/overview", s.handleDashboardOverview)
@@ -219,6 +233,8 @@ func (s *Server) router() http.Handler {
 			admin.Get("/dashboard/recording/summary", s.handleDashboardRecordingSummary)
 			admin.Get("/dashboard/servers", s.handleDashboardServers)
 			admin.Get("/dashboard/pipelines/overview", s.handleDashboardPipelinesOverview)
+			admin.Get("/dashboard/pipelines/{pipeline_id}", s.handleDashboardPipelineDetail)
+			admin.Get("/dashboard/pipelines/{pipeline_id}/streams", s.handleDashboardPipelineStreams)
 			admin.Get("/dashboard/queue-health", s.handleDashboardQueueHealth)
 			admin.Get("/dashboard/streams/{id}", s.handleDashboardStreamDetail)
 			admin.Get("/dashboard/streams/{id}/pipelines", s.handleDashboardStreamPipelinesList)
@@ -249,6 +265,13 @@ func (s *Server) router() http.Handler {
 			service.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
 			service.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
 			service.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
+			service.Post("/eval-suites/sync", s.handleEvalSuitesSync)
+			service.Get("/eval-suites", s.handleEvalSuitesList)
+			service.Get("/eval-suites/{id}", s.handleEvalSuiteGet)
+			service.Post("/pipeline-experiments/sync", s.handlePipelineExperimentsSync)
+			service.Get("/pipeline-experiments", s.handlePipelineExperimentsList)
+			service.Get("/pipeline-experiments/{id}", s.handlePipelineExperimentGet)
+			service.Post("/pipeline-experiment-iterations/sync", s.handlePipelineExperimentIterationsSync)
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
 			service.Post("/imports/streams/repair-canonical-capture", s.handleServiceStreamCanonicalCaptureRepair)
@@ -3526,6 +3549,7 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	source := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("source")))
 	youtubeChannel := strings.TrimSpace(r.URL.Query().Get("youtube_channel"))
 	captureModeRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("capture_type")))
+	touchedPipelineID := strings.TrimSpace(r.URL.Query().Get("touched_pipeline_id"))
 	tags := dedupeStrings(strings.Split(r.URL.Query().Get("tags"), ","))
 	tagsNot := dedupeStrings(strings.Split(r.URL.Query().Get("tags_not"), ","))
 
@@ -3585,6 +3609,15 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	if cfg.IncludeCaptureMode && captureModeRaw != "" {
 		args = append(args, captureType)
 		where = append(where, fmt.Sprintf("s.capture_type=$%d", len(args)))
+	}
+	if touchedPipelineID != "" {
+		args = append(args, touchedPipelineID)
+		where = append(where, fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM frames f_touch
+			JOIN inference_results ir_touch ON ir_touch.frame_id=f_touch.id
+			WHERE f_touch.stream_id=s.id AND ir_touch.pipeline_id=$%d
+		)`, len(args)))
 	}
 	return where, args, nil
 }

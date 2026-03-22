@@ -1426,6 +1426,107 @@
         <tbody id="infRows"></tbody>
       </table>
     </div>
+    <div class="rec-settings-panel" style="margin-top:10px;">
+      <div class="row" style="gap:10px; margin-bottom:8px;">
+        <span class="fw600 fs11">Selected Pipeline</span>
+        <button id="pipelineDetailReload" class="btn-sm">Reload</button>
+        <span class="status-text" id="pipelineDetailStatus"></span>
+      </div>
+      <div id="pipelineDetailEmpty" class="muted fs11">Select a pipeline above to inspect versions, runs, touched streams, and experiment history.</div>
+      <div id="pipelineDetailBody" style="display:none;">
+        <div class="metrics-row" id="pipelineDetailChips"></div>
+        <div class="toolbar" style="margin-top:8px;">
+          <button id="pipelineDetailShowInference" class="btn-sm">Filter Inference To Pipeline</button>
+          <button id="pipelineDetailShowStreams" class="btn-sm">Show Touched Streams</button>
+          <button id="pipelineDetailClearStreams" class="btn-sm">Clear Stream Filter</button>
+          <span class="status-text" id="pipelineExperimentStatus"></span>
+        </div>
+        <div class="tbl-wrap" style="margin-top:8px;">
+          <table id="pipelineVersionsTable">
+            <thead>
+              <tr>
+                <th>Version</th>
+                <th>Runner</th>
+                <th>Created</th>
+              </tr>
+            </thead>
+            <tbody id="pipelineVersionsRows"></tbody>
+          </table>
+        </div>
+        <div class="tbl-wrap" style="margin-top:8px;">
+          <table id="pipelineRunsTable">
+            <thead>
+              <tr>
+                <th>Run</th>
+                <th>Status</th>
+                <th>Targets</th>
+                <th>Version</th>
+                <th>Created</th>
+              </tr>
+            </thead>
+            <tbody id="pipelineRunsRows"></tbody>
+          </table>
+        </div>
+        <div class="detail-section-head" style="margin-top:10px;">
+          <div class="detail-section-title">Streams Touched</div>
+          <div class="detail-section-subtitle">Streams with at least one inference result from this pipeline.</div>
+        </div>
+        <div class="tbl-wrap">
+          <table id="pipelineTouchedStreamsTable">
+            <thead>
+              <tr>
+                <th>Stream</th>
+                <th>State</th>
+                <th>Latest</th>
+                <th>Inference Rows</th>
+                <th>Detections</th>
+                <th>Runs</th>
+              </tr>
+            </thead>
+            <tbody id="pipelineTouchedStreamsRows"></tbody>
+          </table>
+        </div>
+        <div class="detail-section-head" style="margin-top:10px;">
+          <div class="detail-section-title">Ground Truth Suites</div>
+          <div class="detail-section-subtitle">Benchmark suites linked to this pipeline’s experiment history.</div>
+        </div>
+        <div class="tbl-wrap">
+          <table id="pipelineEvalSuitesTable">
+            <thead>
+              <tr>
+                <th>Suite</th>
+                <th>Source</th>
+                <th>Items</th>
+                <th>Annotations</th>
+                <th>Primary Metric</th>
+              </tr>
+            </thead>
+            <tbody id="pipelineEvalSuitesRows"></tbody>
+          </table>
+        </div>
+        <div class="detail-section-head" style="margin-top:10px;">
+          <div class="detail-section-title">Autoresearch Log</div>
+          <div class="detail-section-subtitle">Metric progression and experiment changes over time for this pipeline.</div>
+        </div>
+        <div id="pipelineExperimentGraph" class="coverage-summary">No experiment series yet.</div>
+        <div class="tbl-wrap" style="margin-top:8px;">
+          <table id="pipelineExperimentsTable">
+            <thead>
+              <tr>
+                <th>Iteration</th>
+                <th>Status</th>
+                <th>Metric</th>
+                <th>Delta</th>
+                <th>Change</th>
+                <th>Ground Truth</th>
+                <th>Logs</th>
+              </tr>
+            </thead>
+            <tbody id="pipelineExperimentsRows"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- SERVERS PANEL -->
@@ -2005,6 +2106,21 @@ const pipelineOverviewReload = $('pipelineOverviewReload');
 const pipelineOverviewStatus = $('pipelineOverviewStatus');
 const pipelineQueueChips = $('pipelineQueueChips');
 const pipelineOverviewRows = $('pipelineOverviewRows');
+const pipelineDetailReload = $('pipelineDetailReload');
+const pipelineDetailStatus = $('pipelineDetailStatus');
+const pipelineDetailEmpty = $('pipelineDetailEmpty');
+const pipelineDetailBody = $('pipelineDetailBody');
+const pipelineDetailChips = $('pipelineDetailChips');
+const pipelineDetailShowInference = $('pipelineDetailShowInference');
+const pipelineDetailShowStreams = $('pipelineDetailShowStreams');
+const pipelineDetailClearStreams = $('pipelineDetailClearStreams');
+const pipelineExperimentStatus = $('pipelineExperimentStatus');
+const pipelineVersionsRows = $('pipelineVersionsRows');
+const pipelineRunsRows = $('pipelineRunsRows');
+const pipelineTouchedStreamsRows = $('pipelineTouchedStreamsRows');
+const pipelineEvalSuitesRows = $('pipelineEvalSuitesRows');
+const pipelineExperimentGraph = $('pipelineExperimentGraph');
+const pipelineExperimentsRows = $('pipelineExperimentsRows');
 
 // servers
 const serversHours = $('serversHours');
@@ -2148,6 +2264,9 @@ const streamJsonBody = $('streamJsonBody');
 // ─── State ───────────────────────────────────────────────────────────────────
 let mainTab = 'overview';      // 'overview' | 'streams' | 'discovery' | 'recording' | 'pipelines' | 'servers'
 let inferenceScope = 'recorded';
+let selectedPipelineID = '';
+let selectedPipelineExperimentID = 0;
+let streamTouchedPipelineID = '';
 let detailStreamID = null;
 let detailView = 'coverage';
 let selectedServerID = '';
@@ -2883,11 +3002,12 @@ function updateStreamFilterSummary() {
   const excludeTag = String(streamTagExcludeFilter.value || '').trim() || 'none';
   const sourceRaw = String(sourceFilter.value || '').trim();
   const source = sourceRaw ? formatSourceLabel(sourceRaw) : 'all';
+  const touched = String(streamTouchedPipelineID || '').trim() || 'none';
   const countryRaw = String(countryFilter.value || '').trim();
   const country = countryRaw ? countryDisplayLabel(countryRaw) : 'all';
   const cityRaw = String(cityFilter.value || '').trim();
   const city = cityRaw ? cityDisplayLabel(cityRaw) : 'all';
-  streamFilterSummary.textContent = `Filters: recording=${recordingState} · capture_type=${captureType} · source=${source} · include_tag=${includeTag} · exclude_tag=${excludeTag} · country=${country} · city=${city}`;
+  streamFilterSummary.textContent = `Filters: recording=${recordingState} · capture_type=${captureType} · source=${source} · include_tag=${includeTag} · exclude_tag=${excludeTag} · touched_pipeline=${touched} · country=${country} · city=${city}`;
 }
 function setInfStatus(msg, cls = '') {
   infStatus.className = `status-text ${cls}`;
@@ -2896,6 +3016,16 @@ function setInfStatus(msg, cls = '') {
 function setPipelinesStatus(msg, cls = '') {
   pipelineOverviewStatus.className = `status-text ${cls}`;
   pipelineOverviewStatus.textContent = msg;
+}
+function setPipelineDetailStatus(msg, cls = '') {
+  if (!(pipelineDetailStatus instanceof HTMLElement)) return;
+  pipelineDetailStatus.className = `status-text ${cls}`;
+  pipelineDetailStatus.textContent = msg;
+}
+function setPipelineExperimentStatus(msg, cls = '') {
+  if (!(pipelineExperimentStatus instanceof HTMLElement)) return;
+  pipelineExperimentStatus.className = `status-text ${cls}`;
+  pipelineExperimentStatus.textContent = msg;
 }
 function setServersStatus(msg, cls = '') {
   serversStatus.className = `status-text ${cls}`;
@@ -3806,6 +3936,8 @@ function renderPipelineOverview(items) {
     const status = String(it.last_result_status || '').trim() || '-';
     const lastAt = it.last_result_at ? formatDateTimeShort(it.last_result_at) : '-';
     const tr = document.createElement('tr');
+    tr.setAttribute('data-pipeline-id', pid);
+    tr.style.cursor = 'pointer';
     tr.innerHTML = `
       <td class="mono fs11">${esc(pid)}</td>
       <td class="mono fs11">${esc(it.kind || '-')}</td>
@@ -3821,6 +3953,220 @@ function renderPipelineOverview(items) {
   }
 }
 
+function renderPipelineDetailEmpty(message = 'Select a pipeline above to inspect versions, runs, touched streams, and experiment history.') {
+  if (pipelineDetailEmpty) pipelineDetailEmpty.textContent = message;
+  if (pipelineDetailEmpty) pipelineDetailEmpty.style.display = '';
+  if (pipelineDetailBody) pipelineDetailBody.style.display = 'none';
+  if (pipelineDetailChips) pipelineDetailChips.innerHTML = '';
+}
+
+function renderPipelineVersions(items) {
+  if (!(pipelineVersionsRows instanceof HTMLElement)) return;
+  pipelineVersionsRows.innerHTML = '';
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    setTableStateRow(pipelineVersionsRows, 3, 'No versions');
+    return;
+  }
+  for (const it of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono fs11">${esc(String(it.version_id || '-'))}</td>
+      <td class="mono fs11">${esc(String(it.runner_kind || '-'))}</td>
+      <td class="mono fs11">${esc(formatDateTimeShort(it.created_at || ''))}</td>
+    `;
+    pipelineVersionsRows.appendChild(tr);
+  }
+}
+
+function renderPipelineRuns(items) {
+  if (!(pipelineRunsRows instanceof HTMLElement)) return;
+  pipelineRunsRows.innerHTML = '';
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    setTableStateRow(pipelineRunsRows, 5, 'No runs');
+    return;
+  }
+  for (const it of rows) {
+    const tr = document.createElement('tr');
+    const runID = Number(it.id || 0);
+    tr.innerHTML = `
+      <td class="mono fs11">${runID > 0 ? `#${runID}` : '-'}<div class="muted fs10">${esc(String(it.label || ''))}</div></td>
+      <td class="mono fs11">${esc(String(it.status || '-'))}</td>
+      <td class="mono fs11">${Number(it.completed_count || 0)}/${Number(it.target_count || 0)}<div class="muted fs10">errors ${Number(it.error_count || 0)} · leased ${Number(it.leased_count || 0)}</div></td>
+      <td class="mono fs11">${esc(String(it.version_id || '-'))}</td>
+      <td class="mono fs11">${esc(formatDateTimeShort(it.created_at || ''))}</td>
+    `;
+    pipelineRunsRows.appendChild(tr);
+  }
+}
+
+function renderPipelineTouchedStreams(items) {
+  if (!(pipelineTouchedStreamsRows instanceof HTMLElement)) return;
+  pipelineTouchedStreamsRows.innerHTML = '';
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    setTableStateRow(pipelineTouchedStreamsRows, 6, 'No touched streams');
+    return;
+  }
+  for (const it of rows) {
+    const streamID = Number(it.stream_id || 0);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><a href="/dashboard/stream/${streamID}" class="mono fs11">${streamID > 0 ? `#${streamID}` : '-'} ${esc(String(it.name || ''))}</a><div class="muted fs10">${esc(String(it.provider || '-'))}</div></td>
+      <td class="mono fs11">${esc(String(it.recording_state || '-'))}<div class="muted fs10">${esc(String(it.capture_type || '-'))}</div></td>
+      <td class="mono fs11">${esc(formatDateTimeShort(it.latest_inference_at || ''))}</td>
+      <td class="mono fs11">${Number(it.inference_rows || 0)}</td>
+      <td class="mono fs11">${Number(it.detections_total || 0)}</td>
+      <td class="mono fs11">${Number(it.run_count || 0)}</td>
+    `;
+    pipelineTouchedStreamsRows.appendChild(tr);
+  }
+}
+
+function renderPipelineEvalSuites(items) {
+  if (!(pipelineEvalSuitesRows instanceof HTMLElement)) return;
+  pipelineEvalSuitesRows.innerHTML = '';
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    setTableStateRow(pipelineEvalSuitesRows, 5, 'No linked eval suites');
+    return;
+  }
+  for (const it of rows) {
+    const sourceURL = String(it.source_url || '').trim();
+    const sourceLabel = sourceURL ? `<a href="${esc(sourceURL)}" target="_blank" rel="noopener noreferrer">source</a>` : '<span class="muted fs11">-</span>';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="fw600">${esc(String(it.title || '-'))}<div class="muted fs10 mono">${esc(String(it.slug || '-'))}</div></td>
+      <td class="mono fs11">${esc(String(it.source_kind || '-'))}<div class="muted fs10">${sourceLabel}</div></td>
+      <td class="mono fs11">${Number(it.item_count || 0)}</td>
+      <td class="mono fs11">${Number(it.annotation_count || 0)}</td>
+      <td class="mono fs11">${esc(String(it.primary_metric || '-'))}</td>
+    `;
+    pipelineEvalSuitesRows.appendChild(tr);
+  }
+}
+
+function renderMetricLineGraph(points, metricName = 'metric') {
+  const rows = Array.isArray(points) ? points.filter((p) => Number.isFinite(Number(p && p.primary_metric_after))) : [];
+  if (!rows.length) {
+    pipelineExperimentGraph.textContent = 'No completed experiment metric series yet.';
+    return;
+  }
+  const width = 720;
+  const height = 180;
+  const padX = 30;
+  const padY = 20;
+  const values = rows.map((p) => Number(p.primary_metric_after || 0));
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(0.0001, max - min);
+  const pointsAttr = rows.map((p, idx) => {
+    const x = padX + ((width - padX * 2) * idx / Math.max(1, rows.length - 1));
+    const y = height - padY - ((Number(p.primary_metric_after || 0) - min) / span) * (height - padY * 2);
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(' ');
+  const circles = rows.map((p, idx) => {
+    const x = padX + ((width - padX * 2) * idx / Math.max(1, rows.length - 1));
+    const y = height - padY - ((Number(p.primary_metric_after || 0) - min) / span) * (height - padY * 2);
+    return `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="4" fill="#22c55e"><title>iter ${esc(String(p.iteration_index || idx + 1))}: ${(Number(p.primary_metric_after || 0)).toFixed(4)}</title></circle>`;
+  }).join('');
+  pipelineExperimentGraph.innerHTML = `
+    <div class="fw600 fs11" style="margin-bottom:6px;">${esc(metricName)} over experiment iterations</div>
+    <svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="${esc(metricName)} over experiment iterations">
+      <line x1="${padX}" y1="${height - padY}" x2="${width - padX}" y2="${height - padY}" stroke="rgba(255,255,255,0.15)" />
+      <line x1="${padX}" y1="${padY}" x2="${padX}" y2="${height - padY}" stroke="rgba(255,255,255,0.15)" />
+      <polyline fill="none" stroke="#22c55e" stroke-width="3" points="${pointsAttr}" />
+      ${circles}
+    </svg>
+    <div class="muted fs10">min ${(min).toFixed(4)} · max ${(max).toFixed(4)} · latest ${(values[values.length - 1]).toFixed(4)}</div>
+  `;
+}
+
+function renderPipelineExperimentIterations(payload) {
+  if (!(pipelineExperimentsRows instanceof HTMLElement)) return;
+  const experiment = payload && payload.experiment ? payload.experiment : null;
+  const iterations = Array.isArray(payload && payload.iterations) ? payload.iterations : [];
+  const suites = Array.isArray(payload && payload.suites) ? payload.suites : [];
+  const suiteByID = new Map(suites.map((it) => [Number(it.id || 0), it]));
+  pipelineExperimentsRows.innerHTML = '';
+  if (!experiment || !iterations.length) {
+    setTableStateRow(pipelineExperimentsRows, 7, 'No experiment iterations yet');
+    renderMetricLineGraph([], 'primary metric');
+    return;
+  }
+  renderMetricLineGraph(payload.metric_graph || [], String(experiment.primary_metric || 'primary metric'));
+  const suiteIDsByIteration = payload.iteration_suite_ids || {};
+  for (const it of iterations) {
+    const suiteIDs = Array.isArray(suiteIDsByIteration[String(it.id)]) ? suiteIDsByIteration[String(it.id)] : (suiteIDsByIteration[it.id] || []);
+    const suiteLinks = suiteIDs.map((id) => {
+      const suite = suiteByID.get(Number(id || 0));
+      if (!suite) return `#${id}`;
+      const sourceURL = String(suite.source_url || '').trim();
+      if (!sourceURL) return esc(String(suite.title || suite.slug || `#${id}`));
+      return `<a href="${esc(sourceURL)}" target="_blank" rel="noopener noreferrer">${esc(String(suite.title || suite.slug || `#${id}`))}</a>`;
+    }).join('<br>');
+    const logs = [
+      String(it.log_url || '').trim() ? `<a href="${esc(String(it.log_url))}" target="_blank" rel="noopener noreferrer">log</a>` : '',
+      String(it.artifact_url || '').trim() ? `<a href="${esc(String(it.artifact_url))}" target="_blank" rel="noopener noreferrer">artifacts</a>` : '',
+    ].filter(Boolean).join(' · ') || '<span class="muted fs11">-</span>';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono fs11">#${Number(it.iteration_index || 0)}</td>
+      <td class="mono fs11">${esc(String(it.status || '-'))}<div class="muted fs10">${esc(String(it.result_classification || '-'))}</div></td>
+      <td class="mono fs11">${it.primary_metric_after !== null && it.primary_metric_after !== undefined ? Number(it.primary_metric_after).toFixed(4) : '-'}</td>
+      <td class="mono fs11">${it.primary_metric_delta !== null && it.primary_metric_delta !== undefined ? Number(it.primary_metric_delta).toFixed(4) : '-'}</td>
+      <td class="fs11">${esc(String(it.change_summary || '-'))}<div class="muted fs10">${esc(String(it.hypothesis_text || ''))}</div></td>
+      <td class="fs11">${suiteLinks || '<span class="muted fs11">-</span>'}</td>
+      <td class="fs11">${logs}</td>
+    `;
+    pipelineExperimentsRows.appendChild(tr);
+  }
+}
+
+async function loadPipelineDetail(pipelineID = selectedPipelineID) {
+  selectedPipelineID = String(pipelineID || '').trim();
+  if (!selectedPipelineID) {
+    renderPipelineDetailEmpty();
+    setPipelineDetailStatus('');
+    setPipelineExperimentStatus('');
+    return;
+  }
+  setPipelineDetailStatus(`loading ${selectedPipelineID}...`);
+  const detail = await fetchJSON(`/api/v1/dashboard/pipelines/${encodeURIComponent(selectedPipelineID)}`);
+  const touched = await fetchJSON(`/api/v1/dashboard/pipelines/${encodeURIComponent(selectedPipelineID)}/streams?limit=100`);
+  const experiments = Array.isArray(detail.experiments) ? detail.experiments : [];
+  const summary = detail.summary || {};
+  if (pipelineDetailEmpty) pipelineDetailEmpty.style.display = 'none';
+  if (pipelineDetailBody) pipelineDetailBody.style.display = '';
+  if (pipelineDetailChips) {
+    pipelineDetailChips.innerHTML = [
+      queueChip('pipeline', selectedPipelineID),
+      queueChip('touched streams', Number(summary.touched_streams_total || 0)),
+      queueChip('inference rows', Number(summary.inference_rows_total || 0)),
+      queueChip('detections', Number(summary.detections_total || 0)),
+      queueChip('versions', Array.isArray(detail.versions) ? detail.versions.length : 0),
+      queueChip('recent runs', Array.isArray(detail.recent_runs) ? detail.recent_runs.length : 0),
+      queueChip('experiments', experiments.length),
+    ].join('');
+  }
+  renderPipelineVersions(detail.versions || []);
+  renderPipelineRuns(detail.recent_runs || []);
+  renderPipelineTouchedStreams(touched.items || []);
+  selectedPipelineExperimentID = experiments.length ? Number(experiments[0].id || 0) : 0;
+  if (selectedPipelineExperimentID > 0) {
+    const exp = await fetchJSON(`/api/v1/pipeline-experiments/${selectedPipelineExperimentID}`);
+    renderPipelineEvalSuites(exp.suites || []);
+    renderPipelineExperimentIterations(exp);
+    setPipelineExperimentStatus(`${experiments.length} experiment${experiments.length === 1 ? '' : 's'} · showing ${String(experiments[0].slug || experiments[0].title || 'latest')}`, 'ok');
+  } else {
+    renderPipelineEvalSuites([]);
+    renderPipelineExperimentIterations(null);
+    setPipelineExperimentStatus('No experiment history yet');
+  }
+  setPipelineDetailStatus(`loaded ${selectedPipelineID}`, 'ok');
+}
+
 async function loadPipelineOverview() {
   setPipelinesStatus('loading...');
   setTableLoadingRow(pipelineOverviewRows, 9, 'Loading pipelines...');
@@ -3831,6 +4177,15 @@ async function loadPipelineOverview() {
   renderQueueHealth(queue);
   renderPipelineOverview(overview.items || []);
   setPipelinesStatus(`${Number(overview.pipelines_total || 0)} pipelines · backlog ${Number(overview.backlog_frames_total || 0)} frames`, 'ok');
+  if (selectedPipelineID) {
+    try {
+      await loadPipelineDetail(selectedPipelineID);
+    } catch (err) {
+      setPipelineDetailStatus(String(err), 'err');
+    }
+  } else {
+    renderPipelineDetailEmpty();
+  }
 }
 
 function listToMeta(items, max = 6) {
@@ -4444,6 +4799,7 @@ function buildStreamFilterParams() {
   if (sourceFilter.value.trim()) params.set('source', sourceFilter.value.trim());
   if (countryFilter.value.trim()) params.set('country', countryFilter.value.trim());
   if (cityFilter.value.trim()) params.set('city', cityFilter.value.trim());
+  if (String(streamTouchedPipelineID || '').trim()) params.set('touched_pipeline_id', String(streamTouchedPipelineID).trim());
   return params;
 }
 
@@ -4457,6 +4813,7 @@ function applyStreamListStateFromURL(params) {
   sourceFilter.value = String(params.get('source') || '').trim();
   countryFilter.value = String(params.get('country') || '').trim();
   cityFilter.value = String(params.get('city') || '').trim();
+  streamTouchedPipelineID = String(params.get('touched_pipeline_id') || '').trim();
 
   const sortBy = String(params.get('sort_by') || '').trim();
   if (sortBy) streamSortBy = sortBy;
@@ -6339,7 +6696,7 @@ if (tabDiscovery) {
 tabPipelines.addEventListener('click', () => {
   if (mainTab === 'pipelines') return;
   mainTab = 'pipelines';
-  history.replaceState(null, '', '/dashboard/pipelines');
+  history.replaceState(null, '', selectedPipelineID ? `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/dashboard/pipelines');
   showPanel('pipelines');
   setPipelinesStatus('loading...');
   void (async () => {
@@ -6389,6 +6746,72 @@ pipelineOverviewReload.addEventListener('click', async () => {
   try { setPipelinesStatus('loading...'); await loadPipelineOverview(); }
   catch (err) { setPipelinesStatus(String(err), 'err'); }
 });
+if (pipelineDetailReload) {
+  pipelineDetailReload.addEventListener('click', async () => {
+    try {
+      await loadPipelineDetail(selectedPipelineID);
+    } catch (err) {
+      setPipelineDetailStatus(String(err), 'err');
+    }
+  });
+}
+if (pipelineDetailShowInference) {
+  pipelineDetailShowInference.addEventListener('click', async () => {
+    if (!selectedPipelineID) return;
+    try {
+      infPipeline.value = selectedPipelineID;
+      await loadAllInference();
+      setPipelineExperimentStatus(`global inference filtered to ${selectedPipelineID}`, 'ok');
+    } catch (err) {
+      setPipelineExperimentStatus(String(err), 'err');
+    }
+  });
+}
+if (pipelineDetailShowStreams) {
+  pipelineDetailShowStreams.addEventListener('click', async () => {
+    if (!selectedPipelineID) return;
+    mainTab = 'streams';
+    streamTouchedPipelineID = selectedPipelineID;
+    history.replaceState(null, '', `/dashboard/streams?${buildStreamFilterParams().toString()}`);
+    showPanel('streams');
+    setStreamsView(streamsView);
+    try {
+      await loadStreamsForActiveView({ resetPage: true });
+    } catch (err) {
+      setStreamStatus(String(err), 'err');
+    }
+  });
+}
+if (pipelineDetailClearStreams) {
+  pipelineDetailClearStreams.addEventListener('click', async () => {
+    streamTouchedPipelineID = '';
+    if (mainTab !== 'streams') return;
+    try {
+      syncStreamListURL();
+      await loadStreamsForActiveView({ resetPage: true });
+    } catch (err) {
+      setStreamStatus(String(err), 'err');
+    }
+  });
+}
+if (pipelineOverviewRows) {
+  pipelineOverviewRows.addEventListener('click', (e) => {
+    const row = e.target instanceof HTMLElement ? e.target.closest('[data-pipeline-id]') : null;
+    if (!(row instanceof HTMLElement)) return;
+    const pipelineID = String(row.getAttribute('data-pipeline-id') || '').trim();
+    if (!pipelineID) return;
+    void (async () => {
+      try {
+        selectedPipelineID = pipelineID;
+        history.replaceState(null, '', `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}`);
+        infPipeline.value = selectedPipelineID;
+        await Promise.all([loadPipelineDetail(selectedPipelineID), loadAllInference()]);
+      } catch (err) {
+        setPipelineDetailStatus(String(err), 'err');
+      }
+    })();
+  });
+}
 serversReload.addEventListener('click', async () => {
   try { await reloadServerDomainViews(); }
   catch (err) { setServersStatus(String(err), 'err'); }
@@ -6824,6 +7247,7 @@ document.addEventListener('keydown', (e) => {
     }
     else if (seg === 'pipelines') {
       mainTab = 'pipelines';
+      selectedPipelineID = String(params.get('pipeline_id') || '').trim();
     }
     else if (seg === 'recorded' || seg === 'all') {
       mainTab = 'streams';
