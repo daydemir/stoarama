@@ -7602,16 +7602,16 @@ type dashboardStreamCoverageSummary struct {
 }
 
 type dashboardStreamCaptureSample struct {
-	Day                  string    `json:"day"`
-	SegmentID            int64     `json:"segment_id"`
-	FrameID              int64     `json:"frame_id,omitempty"`
-	CapturedAt           time.Time `json:"captured_at"`
-	SegmentStartAt       time.Time `json:"segment_start_at"`
-	SegmentEndAt         time.Time `json:"segment_end_at"`
-	ObjectKey            string    `json:"object_key"`
-	DownloadURL          string    `json:"download_url,omitempty"`
-	ThumbnailObjectKey   string    `json:"thumbnail_object_key,omitempty"`
-	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
+	Day                  string     `json:"day"`
+	SegmentID            int64      `json:"segment_id"`
+	FrameID              int64      `json:"frame_id,omitempty"`
+	CapturedAt           time.Time  `json:"captured_at"`
+	SegmentStartAt       time.Time  `json:"segment_start_at"`
+	SegmentEndAt         time.Time  `json:"segment_end_at"`
+	ObjectKey            string     `json:"object_key"`
+	DownloadURL          string     `json:"download_url,omitempty"`
+	ThumbnailObjectKey   *string    `json:"thumbnail_object_key,omitempty"`
+	ThumbnailDownloadURL string     `json:"thumbnail_download_url,omitempty"`
 }
 
 func ensureTimelinePoint(pointsByMinute map[int]*dashboardStreamTimelinePoint, minute int) *dashboardStreamTimelinePoint {
@@ -7690,10 +7690,10 @@ func (s *Server) handleDashboardStreamCoverage(w http.ResponseWriter, r *http.Re
 	rows, err := s.pool.Query(r.Context(), `
 		WITH day_series AS (
 			SELECT
-				day::date AS day,
-				(day::timestamp AT TIME ZONE 'UTC') AS day_start,
-				((day + 1)::timestamp AT TIME ZONE 'UTC') AS day_end
-			FROM generate_series($2::date, ($3::date - interval '1 day')::date, interval '1 day') AS day
+				gs.day::date AS day,
+				(gs.day::date::timestamp AT TIME ZONE 'UTC') AS day_start,
+				(((gs.day::date + 1)::timestamp) AT TIME ZONE 'UTC') AS day_end
+			FROM generate_series($2::date, ($3::date - interval '1 day')::date, interval '1 day') AS gs(day)
 		),
 		relevant_segments AS (
 			SELECT
@@ -7980,8 +7980,8 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 				sample.DownloadURL = url
 			}
 		}
-		if sample.ThumbnailObjectKey != "" {
-			if url, err := s.r2.PresignGet(r.Context(), sample.ThumbnailObjectKey, s.cfg.R2SignGetTTL); err == nil {
+		if sample.ThumbnailObjectKey != nil && strings.TrimSpace(*sample.ThumbnailObjectKey) != "" {
+			if url, err := s.r2.PresignGet(r.Context(), strings.TrimSpace(*sample.ThumbnailObjectKey), s.cfg.R2SignGetTTL); err == nil {
 				sample.ThumbnailDownloadURL = url
 			}
 		}
