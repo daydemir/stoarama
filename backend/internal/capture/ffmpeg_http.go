@@ -9,12 +9,6 @@ func appendFFmpegHTTPInputArgs(args []string, sourceURL string, reconnect bool, 
 	if !strings.HasPrefix(sourceURL, "http://") && !strings.HasPrefix(sourceURL, "https://") {
 		return args
 	}
-	// Live HLS inputs can rotate CDN hosts across playlist/segment requests.
-	// Disabling HTTP persistence avoids ffmpeg reusing a keepalive connection
-	// for a different host, which can otherwise abort relay-backed streams.
-	args = append(args,
-		"-http_persistent", "0",
-	)
 	if reconnect {
 		if reconnectDelayMax < 1 {
 			reconnectDelayMax = 1
