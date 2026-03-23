@@ -4242,7 +4242,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		for _, it := range items {
 			streamIDs = append(streamIDs, it.Stream.ID)
 		}
-		rawKeys, err := s.latestFrameObjectKeys(r.Context(), streamIDs)
+		rawKeys, err := s.latestPreviewObjectKeys(r.Context(), streamIDs)
 		if err == nil {
 			for i := range items {
 				if rawKey, ok := rawKeys[items[i].Stream.ID]; ok && rawKey != "" {
@@ -4508,25 +4508,38 @@ type dashboardStreamImageURLsRequest struct {
 	StreamIDs []int64 `json:"stream_ids"`
 }
 
-func (s *Server) latestFrameObjectKeys(ctx context.Context, streamIDs []int64) (map[int64]string, error) {
+func (s *Server) latestPreviewObjectKeys(ctx context.Context, streamIDs []int64) (map[int64]string, error) {
 	if len(streamIDs) == 0 {
 		return map[int64]string{}, nil
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT ids.stream_id, m.object_key
+		SELECT
+			ids.stream_id,
+			COALESCE(frame_media.object_key, segment_thumb.object_key)
 		FROM UNNEST($1::bigint[]) AS ids(stream_id)
-		JOIN LATERAL (
-			SELECT f.raw_media_object_id
+		LEFT JOIN LATERAL (
+			SELECT m.object_key
 			FROM frames f
+			JOIN media_objects m ON m.id = f.raw_media_object_id
 			WHERE f.stream_id = ids.stream_id
 			  AND f.capture_status = 'success'
 			ORDER BY f.captured_at DESC, f.id DESC
 			LIMIT 1
-		) latest ON true
-		JOIN media_objects m ON m.id = latest.raw_media_object_id
+		) frame_media ON true
+		LEFT JOIN LATERAL (
+			SELECT m.object_key
+			FROM capture_segments cs
+			JOIN media_objects m ON m.id = cs.thumbnail_media_object_id
+			WHERE cs.stream_id = ids.stream_id
+			  AND cs.capture_status = 'success'
+			  AND cs.thumbnail_media_object_id IS NOT NULL
+			ORDER BY cs.segment_end_at DESC, cs.id DESC
+			LIMIT 1
+		) segment_thumb ON true
+		WHERE COALESCE(frame_media.object_key, segment_thumb.object_key, '') <> ''
 	`, streamIDs)
 	if err != nil {
-		return nil, fmt.Errorf("query latest frame keys: %w", err)
+		return nil, fmt.Errorf("query latest preview keys: %w", err)
 	}
 	defer rows.Close()
 
@@ -4535,12 +4548,12 @@ func (s *Server) latestFrameObjectKeys(ctx context.Context, streamIDs []int64) (
 		var streamID int64
 		var objectKey string
 		if err := rows.Scan(&streamID, &objectKey); err != nil {
-			return nil, fmt.Errorf("scan latest frame key: %w", err)
+			return nil, fmt.Errorf("scan latest preview key: %w", err)
 		}
 		out[streamID] = objectKey
 	}
 	if rows.Err() != nil {
-		return nil, fmt.Errorf("iterate latest frame keys: %w", rows.Err())
+		return nil, fmt.Errorf("iterate latest preview keys: %w", rows.Err())
 	}
 	return out, nil
 }
@@ -4576,7 +4589,7 @@ func (s *Server) handleDashboardStreamImageURLs(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	rawObjectKeys, err := s.latestFrameObjectKeys(r.Context(), uniq)
+	rawObjectKeys, err := s.latestPreviewObjectKeys(r.Context(), uniq)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard stream images query: %v", err))
 		return
