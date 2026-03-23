@@ -3722,7 +3722,7 @@ function buildDetailLiveFrameCard(it) {
   card.className = 'detail-live-frame';
   card.setAttribute('data-frame-id', String(Number(it.id || 0)));
   const mediaHTML = captureMeta.clipNative
-    ? `<div class="img-slot"><span class="muted fs10">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">open clip</a>` : 'no clip'}</span></div>`
+    ? renderClipVideo(url, 'thumb-sm')
     : (url
       ? `<a class="table-image-link" href="${esc(url)}" data-image-url="${esc(url)}" data-image-scope="frames"${streamAttr}><img class="thumb-sm" src="${esc(url)}" alt="frame" loading="lazy" decoding="async" /></a>`
       : '<div class="img-slot"><span class="muted fs10">no image</span></div>');
@@ -5624,6 +5624,19 @@ function captureWindowLabel(it) {
   return formatDateTimeShort(it.captured_at || '');
 }
 
+function renderClipVideo(url, sizeClass = 'thumb-sm') {
+  const safeURL = String(url || '').trim();
+  if (!safeURL) {
+    return '<div class="img-slot"><span class="muted fs10">no clip</span></div>';
+  }
+  return `
+    <div class="stack" style="gap:6px;">
+      <video class="${esc(sizeClass)}" src="${esc(safeURL)}" controls preload="metadata" playsinline muted></video>
+      <a href="${esc(safeURL)}" target="_blank" rel="noopener noreferrer" class="fs11">open clip</a>
+    </div>
+  `;
+}
+
 function renderLatestCard(container, payload, latestCapture, previewImage) {
   const meta = detailCaptureMeta(payload);
   if (latestCaptureLabel) latestCaptureLabel.textContent = meta.clipNative ? 'Latest clip' : 'Latest frame';
@@ -5634,7 +5647,7 @@ function renderLatestCard(container, payload, latestCapture, previewImage) {
     container.removeAttribute('data-frame-id');
     container.innerHTML = latestCapture ? `
       <div class="stack">
-        ${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm primary" type="button">Open Latest Clip</button></a>` : '<span class="muted fs11">No clip URL</span>'}
+        ${renderClipVideo(url, 'thumb-lg')}
         <span class="muted fs10 mono">${esc(windowLabel)}</span>
         <span class="muted fs10 mono">${esc(objectKey)}</span>
       </div>
@@ -5815,7 +5828,7 @@ function renderFramesRows(items) {
     const modalStreamID = Number.isFinite(modalStreamIDRaw) && modalStreamIDRaw > 0 ? Math.floor(modalStreamIDRaw) : 0;
     const modalStreamAttr = modalStreamID ? ` data-stream-id="${modalStreamID}"` : '';
     const rawImg = captureMeta.clipNative
-      ? (it.download_url ? `<a href="${esc(it.download_url)}" target="_blank" rel="noopener noreferrer">open clip</a>` : '<span class="muted fs11">-</span>')
+      ? renderClipVideo(it.download_url, 'thumb-sm')
       : (it.download_url
         ? `<a class="table-image-link" href="${esc(it.download_url)}" data-image-url="${esc(it.download_url)}" data-image-scope="frames"${modalStreamAttr}><img class="thumb-sm" src="${esc(it.download_url)}" alt="frame" loading="lazy" decoding="async" /></a>`
         : '<span class="muted fs11">-</span>');
@@ -6350,13 +6363,13 @@ async function loadDetail(options = {}) {
   const latestFrame = recentFrames.length ? recentFrames[0] : null;
   if (!captureMeta.clipNative) ensureDetailExportWindow(latestFrame);
   if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = captureMeta.clipNative ? 'Latest 60 Clips' : 'Latest 60 Frames';
-  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = captureMeta.clipNative ? 'Auto-refreshes every few seconds while this page is open.' : 'Auto-refreshes every second while this page is open.';
+  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = captureMeta.clipNative ? 'Auto-refreshes every few seconds while this page is open. Each clip can be scrubbed inline or opened in a new tab.' : 'Auto-refreshes every second while this page is open.';
   if (detailExportBlock) detailExportBlock.style.display = captureMeta.clipNative ? 'none' : '';
   if (detailExportTitle) detailExportTitle.textContent = 'Export Frames';
   if (detailExportSubtitle) detailExportSubtitle.textContent = 'Download a manifest for any time window, or prepare a bounded ZIP archive.';
   if (detailExportStatusAllOption) detailExportStatusAllOption.textContent = 'all frame rows';
   if (detailRawCaptureRowsTitle) detailRawCaptureRowsTitle.textContent = captureMeta.clipNative ? 'Clip Segment Rows' : 'Raw Capture Rows';
-  if (detailRawCaptureRowsSubtitle) detailRawCaptureRowsSubtitle.textContent = captureMeta.clipNative ? 'Recent persisted clip segments with status, download link, and object key.' : 'Recent persisted frame rows with status, preview, and object key.';
+  if (detailRawCaptureRowsSubtitle) detailRawCaptureRowsSubtitle.textContent = captureMeta.clipNative ? 'Recent persisted clip segments with status, inline video preview, open link, and object key.' : 'Recent persisted frame rows with status, preview, and object key.';
   if (detailFramesReload) detailFramesReload.textContent = captureMeta.clipNative ? 'Reload clips' : 'Reload captures';
   if (framesCapturedHeader) framesCapturedHeader.textContent = captureMeta.clipNative ? 'Window' : 'Captured';
   if (framesRawHeader) framesRawHeader.textContent = captureMeta.clipNative ? 'Clip' : 'Raw';
