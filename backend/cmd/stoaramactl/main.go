@@ -2385,6 +2385,9 @@ func inferRecordingAssignmentExecutionClassesForCLI(stream map[string]any) []str
 			if norm == capture.ExecutionClassYouTubeDirect || norm == capture.ExecutionClassYouTubeRelay {
 				return []string{capture.ExecutionClassYouTubeRelay}
 			}
+			if norm == capture.ExecutionClassImagePoll {
+				return nil
+			}
 			return []string{norm}
 		}
 	}
@@ -2395,7 +2398,7 @@ func inferRecordingAssignmentExecutionClassesForCLI(stream map[string]any) []str
 			case capture.CaptureTypeYouTubeWatch:
 				return []string{capture.ExecutionClassYouTubeRelay}
 			case capture.CaptureTypeStillImage:
-				return []string{capture.ExecutionClassImagePoll}
+				return nil
 			case capture.CaptureTypeHLS, capture.CaptureTypeDASH, capture.CaptureTypeRTSP, capture.CaptureTypeRTMP, capture.CaptureTypeHTTPVideo:
 				return []string{capture.ExecutionClassVideoLive}
 			}
@@ -2462,6 +2465,9 @@ func recordingCandidateSupportsExecutionClassesForCLI(row map[string]any, desire
 func autoSelectRecordingServer(ctx context.Context, backendAPIURL string, apiToken string, streamID int64) string {
 	stream := loadDashboardStream(ctx, backendAPIURL, apiToken, streamID)
 	desiredExecutionClasses := inferRecordingAssignmentExecutionClassesForCLI(stream)
+	if len(desiredExecutionClasses) == 0 {
+		log.Fatalf("stream %d is not startable in the clip-native recording path", streamID)
+	}
 	payload := mustAPIGet(ctx, strings.TrimSpace(backendAPIURL), strings.TrimSpace(apiToken), "/api/v1/dashboard/recording/server-capacity")
 	items, _ := payload["items"].([]any)
 	candidates := make([]map[string]any, 0, len(items))
@@ -4945,7 +4951,7 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 		avgHours, _ := asFloat64(summary["avg_recorded_hours_per_day"])
 		maxHours, _ := asFloat64(summary["max_recorded_hours_per_day"])
 		fmt.Printf(
-			"stream_id=%d days=%d captured_days=%v/%v total_hours=%.2f avg_hours_day=%.2f max_hours_day=%.2f streak_days=%v longest_gap_days=%v last_capture=%v points=%d\n",
+			"stream_id=%d days=%d recorded_days=%v/%v total_hours=%.2f avg_hours_day=%.2f max_hours_day=%.2f streak_days=%v longest_gap_days=%v last_capture=%v points=%d\n",
 			*streamID, *days, summary["days_with_capture"], summary["days_total"], totalHours, avgHours, maxHours,
 			summary["current_streak_days"], summary["longest_gap_days"], summary["last_capture_at"], len(points),
 		)
@@ -4979,13 +4985,13 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 			if !ok {
 				continue
 			}
-			frameID := fmt.Sprint(it["frame_id"])
-			if fv, ok := asFloat64(it["frame_id"]); ok {
-				frameID = strconv.FormatInt(int64(fv), 10)
+			segmentID := fmt.Sprint(it["segment_id"])
+			if fv, ok := asFloat64(it["segment_id"]); ok {
+				segmentID = strconv.FormatInt(int64(fv), 10)
 			}
 			fmt.Printf(
-				"day=%v frame_id=%v captured_at=%v object_key=%v\n",
-				it["day"], frameID, it["captured_at"], it["object_key"],
+				"day=%v segment_id=%v captured_at=%v object_key=%v thumbnail=%v\n",
+				it["day"], segmentID, it["captured_at"], it["object_key"], it["thumbnail_object_key"],
 			)
 		}
 	default:

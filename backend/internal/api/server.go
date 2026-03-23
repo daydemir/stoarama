@@ -495,6 +495,7 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	recordingStateChanged := false
 	targetRecordingState := current.RecordingState
+	targetExecutionClass := strings.TrimSpace(current.ExecutionClass)
 	sourceChangeReason := "stream source updated"
 	if req.SourceChangeReason != nil && strings.TrimSpace(*req.SourceChangeReason) != "" {
 		sourceChangeReason = strings.TrimSpace(*req.SourceChangeReason)
@@ -557,6 +558,7 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		add("source_family", profile.SourceFamily)
 		add("capture_type", profile.CaptureType)
 		add("execution_class", profile.ExecutionClass)
+		targetExecutionClass = strings.TrimSpace(profile.ExecutionClass)
 		add("capture_family", profile.CaptureFamily)
 		add("expected_fps", profile.ExpectedFPS)
 		add("expected_image_interval_sec", profile.ExpectedImageIntervalSec)
@@ -577,6 +579,12 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Lon != nil {
 		add("lon", *req.Lon)
+	}
+	if targetRecordingState == model.RecordingStateOn {
+		if normalizedExecutionClass, ok := capture.NormalizeExecutionClass(targetExecutionClass); ok && normalizedExecutionClass == capture.ExecutionClassImagePoll {
+			util.WriteError(w, http.StatusBadRequest, "image_poll recording is deprecated; clip-native recording only")
+			return
+		}
 	}
 	if len(sets) == 0 {
 		util.WriteError(w, http.StatusBadRequest, "no fields to update")
@@ -2303,7 +2311,6 @@ func (s *Server) handleCaptureSchema(w http.ResponseWriter, r *http.Request) {
 			capture.ExecutionClassYouTubeDirect,
 			capture.ExecutionClassYouTubeRelay,
 			capture.ExecutionClassVideoLive,
-			capture.ExecutionClassImagePoll,
 		},
 	})
 }
@@ -7563,17 +7570,20 @@ type dashboardStreamTimelineTotals struct {
 }
 
 type dashboardStreamCoveragePoint struct {
-	Day                 string     `json:"day"`
-	RecordedMinutes     int        `json:"recorded_minutes"`
-	RecordedHours       float64    `json:"recorded_hours"`
-	SuccessMinutes      int        `json:"success_minutes"`
-	ErrorMinutes        int        `json:"error_minutes"`
-	RecordedTotalFrames int64      `json:"recorded_total_frames"`
-	RecordedSuccess     int64      `json:"recorded_success_frames"`
-	RecordedError       int64      `json:"recorded_error_frames"`
-	CoveragePctOfDay    float64    `json:"coverage_pct_of_day"`
-	FirstCaptureAt      *time.Time `json:"first_capture_at,omitempty"`
-	LastCaptureAt       *time.Time `json:"last_capture_at,omitempty"`
+	Day                     string     `json:"day"`
+	RecordedMinutes         int        `json:"recorded_minutes"`
+	RecordedHours           float64    `json:"recorded_hours"`
+	SuccessMinutes          int        `json:"success_minutes"`
+	ErrorMinutes            int        `json:"error_minutes"`
+	RecordedTotalCaptures   int64      `json:"recorded_total_captures"`
+	RecordedSuccessCaptures int64      `json:"recorded_success_captures"`
+	RecordedErrorCaptures   int64      `json:"recorded_error_captures"`
+	RecordedTotalFrames     int64      `json:"recorded_total_frames"`
+	RecordedSuccess         int64      `json:"recorded_success_frames"`
+	RecordedError           int64      `json:"recorded_error_frames"`
+	CoveragePctOfDay        float64    `json:"coverage_pct_of_day"`
+	FirstCaptureAt          *time.Time `json:"first_capture_at,omitempty"`
+	LastCaptureAt           *time.Time `json:"last_capture_at,omitempty"`
 }
 
 type dashboardStreamCoverageSummary struct {
@@ -7592,11 +7602,16 @@ type dashboardStreamCoverageSummary struct {
 }
 
 type dashboardStreamCaptureSample struct {
-	Day         string    `json:"day"`
-	FrameID     int64     `json:"frame_id"`
-	CapturedAt  time.Time `json:"captured_at"`
-	ObjectKey   string    `json:"object_key"`
-	DownloadURL string    `json:"download_url,omitempty"`
+	Day                  string    `json:"day"`
+	SegmentID            int64     `json:"segment_id"`
+	FrameID              int64     `json:"frame_id,omitempty"`
+	CapturedAt           time.Time `json:"captured_at"`
+	SegmentStartAt       time.Time `json:"segment_start_at"`
+	SegmentEndAt         time.Time `json:"segment_end_at"`
+	ObjectKey            string    `json:"object_key"`
+	DownloadURL          string    `json:"download_url,omitempty"`
+	ThumbnailObjectKey   string    `json:"thumbnail_object_key,omitempty"`
+	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
 }
 
 func ensureTimelinePoint(pointsByMinute map[int]*dashboardStreamTimelinePoint, minute int) *dashboardStreamTimelinePoint {
@@ -7674,37 +7689,69 @@ func (s *Server) handleDashboardStreamCoverage(w http.ResponseWriter, r *http.Re
 
 	rows, err := s.pool.Query(r.Context(), `
 		WITH day_series AS (
-			SELECT generate_series($2::date, ($3::date - interval '1 day')::date, interval '1 day')::date AS day
-		),
-		frame_stats AS (
 			SELECT
-				(f.captured_at AT TIME ZONE 'UTC')::date AS day,
-				COUNT(*)::bigint AS recorded_total_frames,
-				COUNT(*) FILTER (WHERE f.capture_status='success')::bigint AS recorded_success_frames,
-				COUNT(*) FILTER (WHERE f.capture_status='error')::bigint AS recorded_error_frames,
-				COUNT(DISTINCT date_trunc('minute', f.captured_at AT TIME ZONE 'UTC'))::int AS recorded_minutes,
-				COUNT(DISTINCT date_trunc('minute', f.captured_at AT TIME ZONE 'UTC')) FILTER (WHERE f.capture_status='success')::int AS success_minutes,
-				COUNT(DISTINCT date_trunc('minute', f.captured_at AT TIME ZONE 'UTC')) FILTER (WHERE f.capture_status='error')::int AS error_minutes,
-				MIN(f.captured_at) AS first_capture_at,
-				MAX(f.captured_at) AS last_capture_at
-			FROM frames f
-			WHERE f.stream_id=$1
-			  AND f.captured_at >= $2
-			  AND f.captured_at < $3
+				day::date AS day,
+				(day::timestamp AT TIME ZONE 'UTC') AS day_start,
+				((day + 1)::timestamp AT TIME ZONE 'UTC') AS day_end
+			FROM generate_series($2::date, ($3::date - interval '1 day')::date, interval '1 day') AS day
+		),
+		relevant_segments AS (
+			SELECT
+				ds.day,
+				cs.id,
+				cs.capture_status,
+				GREATEST(cs.segment_start_at, ds.day_start) AS overlap_start,
+				LEAST(cs.segment_end_at, ds.day_end) AS overlap_end
+			FROM day_series ds
+			JOIN capture_segments cs
+			  ON cs.stream_id=$1
+			 AND cs.segment_end_at > ds.day_start
+			 AND cs.segment_start_at < ds.day_end
+		),
+		segment_stats AS (
+			SELECT
+				day,
+				COUNT(DISTINCT id)::bigint AS recorded_total_captures,
+				COUNT(DISTINCT id) FILTER (WHERE capture_status='success')::bigint AS recorded_success_captures,
+				COUNT(DISTINCT id) FILTER (WHERE capture_status='error')::bigint AS recorded_error_captures,
+				MIN(overlap_start) AS first_capture_at,
+				MAX(overlap_end) AS last_capture_at
+			FROM relevant_segments
+			GROUP BY 1
+		),
+		minute_stats AS (
+			SELECT
+				day,
+				COUNT(DISTINCT minute_bucket)::int AS recorded_minutes,
+				COUNT(DISTINCT minute_bucket) FILTER (WHERE capture_status='success')::int AS success_minutes,
+				COUNT(DISTINCT minute_bucket) FILTER (WHERE capture_status='error')::int AS error_minutes
+			FROM (
+				SELECT
+					rs.day,
+					rs.capture_status,
+					gs.minute_bucket
+				FROM relevant_segments rs
+				JOIN LATERAL generate_series(
+					date_trunc('minute', rs.overlap_start),
+					date_trunc('minute', rs.overlap_end - interval '1 microsecond'),
+					interval '1 minute'
+				) AS gs(minute_bucket) ON rs.overlap_end > rs.overlap_start
+			) buckets
 			GROUP BY 1
 		)
 		SELECT
 			ds.day,
-			COALESCE(fs.recorded_minutes, 0)::int,
-			COALESCE(fs.success_minutes, 0)::int,
-			COALESCE(fs.error_minutes, 0)::int,
-			COALESCE(fs.recorded_total_frames, 0)::bigint,
-			COALESCE(fs.recorded_success_frames, 0)::bigint,
-			COALESCE(fs.recorded_error_frames, 0)::bigint,
-			fs.first_capture_at,
-			fs.last_capture_at
+			COALESCE(ms.recorded_minutes, 0)::int,
+			COALESCE(ms.success_minutes, 0)::int,
+			COALESCE(ms.error_minutes, 0)::int,
+			COALESCE(ss.recorded_total_captures, 0)::bigint,
+			COALESCE(ss.recorded_success_captures, 0)::bigint,
+			COALESCE(ss.recorded_error_captures, 0)::bigint,
+			ss.first_capture_at,
+			ss.last_capture_at
 		FROM day_series ds
-		LEFT JOIN frame_stats fs ON fs.day=ds.day
+		LEFT JOIN minute_stats ms ON ms.day=ds.day
+		LEFT JOIN segment_stats ss ON ss.day=ds.day
 		ORDER BY ds.day ASC
 	`, id, windowStart, windowEnd)
 	if err != nil {
@@ -7734,9 +7781,9 @@ func (s *Server) handleDashboardStreamCoverage(w http.ResponseWriter, r *http.Re
 			&p.RecordedMinutes,
 			&p.SuccessMinutes,
 			&p.ErrorMinutes,
-			&p.RecordedTotalFrames,
-			&p.RecordedSuccess,
-			&p.RecordedError,
+			&p.RecordedTotalCaptures,
+			&p.RecordedSuccessCaptures,
+			&p.RecordedErrorCaptures,
 			&p.FirstCaptureAt,
 			&p.LastCaptureAt,
 		); err != nil {
@@ -7746,6 +7793,9 @@ func (s *Server) handleDashboardStreamCoverage(w http.ResponseWriter, r *http.Re
 		p.Day = day.UTC().Format("2006-01-02")
 		p.RecordedHours = float64(p.RecordedMinutes) / 60.0
 		p.CoveragePctOfDay = 100.0 * float64(p.RecordedMinutes) / 1440.0
+		p.RecordedTotalFrames = p.RecordedTotalCaptures
+		p.RecordedSuccess = p.RecordedSuccessCaptures
+		p.RecordedError = p.RecordedErrorCaptures
 		points = append(points, p)
 
 		if p.RecordedMinutes > 0 {
@@ -7830,11 +7880,11 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 	count := parseIntQuery(r, "count", 42, 1, 180)
 
 	dayRows, err := s.pool.Query(r.Context(), `
-		SELECT DISTINCT (f.captured_at AT TIME ZONE 'UTC')::date AS day
-		FROM frames f
-		JOIN media_objects mo ON mo.id=f.raw_media_object_id
-		WHERE f.stream_id=$1
-		  AND f.capture_status='success'
+		SELECT DISTINCT (cs.segment_end_at AT TIME ZONE 'UTC')::date AS day
+		FROM capture_segments cs
+		JOIN media_objects mo ON mo.id=cs.media_object_id
+		WHERE cs.stream_id=$1
+		  AND cs.capture_status='success'
 		  AND mo.object_key IS NOT NULL
 		ORDER BY day ASC
 	`, id)
@@ -7885,24 +7935,28 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 		picked AS (
 			SELECT
 				db.day,
-				fr.id AS frame_id,
-				fr.captured_at,
-				mo.object_key
+				seg.id AS segment_id,
+				seg.segment_start_at,
+				seg.segment_end_at,
+				seg.segment_end_at AS captured_at,
+				mo.object_key,
+				thumb.object_key AS thumbnail_object_key
 			FROM day_bounds db
 			JOIN LATERAL (
-				SELECT f.id, f.captured_at, f.raw_media_object_id
-				FROM frames f
-				WHERE f.stream_id=$1
-				  AND f.capture_status='success'
-				  AND f.raw_media_object_id IS NOT NULL
-				  AND f.captured_at >= db.day_start
-				  AND f.captured_at < db.day_end
-				ORDER BY f.captured_at DESC, f.id DESC
+				SELECT cs.id, cs.segment_start_at, cs.segment_end_at, cs.media_object_id, cs.thumbnail_media_object_id
+				FROM capture_segments cs
+				WHERE cs.stream_id=$1
+				  AND cs.capture_status='success'
+				  AND cs.media_object_id IS NOT NULL
+				  AND cs.segment_end_at >= db.day_start
+				  AND cs.segment_end_at < db.day_end
+				ORDER BY cs.segment_end_at DESC, cs.id DESC
 				LIMIT 1
-			) fr ON true
-			JOIN media_objects mo ON mo.id=fr.raw_media_object_id
+			) seg ON true
+			JOIN media_objects mo ON mo.id=seg.media_object_id
+			LEFT JOIN media_objects thumb ON thumb.id=seg.thumbnail_media_object_id
 		)
-		SELECT day, frame_id, captured_at, object_key
+		SELECT day, segment_id, segment_start_at, segment_end_at, captured_at, object_key, thumbnail_object_key
 		FROM picked
 		ORDER BY day ASC
 	`, id, selectedDays)
@@ -7916,7 +7970,7 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 	for rows.Next() {
 		var day time.Time
 		var sample dashboardStreamCaptureSample
-		if err := rows.Scan(&day, &sample.FrameID, &sample.CapturedAt, &sample.ObjectKey); err != nil {
+		if err := rows.Scan(&day, &sample.SegmentID, &sample.SegmentStartAt, &sample.SegmentEndAt, &sample.CapturedAt, &sample.ObjectKey, &sample.ThumbnailObjectKey); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan stream capture sample: %v", err))
 			return
 		}
@@ -7924,6 +7978,11 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 		if sample.ObjectKey != "" {
 			if url, err := s.r2.PresignGet(r.Context(), sample.ObjectKey, s.cfg.R2SignGetTTL); err == nil {
 				sample.DownloadURL = url
+			}
+		}
+		if sample.ThumbnailObjectKey != "" {
+			if url, err := s.r2.PresignGet(r.Context(), sample.ThumbnailObjectKey, s.cfg.R2SignGetTTL); err == nil {
+				sample.ThumbnailDownloadURL = url
 			}
 		}
 		items = append(items, sample)

@@ -35,9 +35,9 @@ func (s *Server) handleServiceCaptureCatalogCandidates(w http.ResponseWriter, r 
 		return
 	}
 	switch executionClass {
-	case capture.ExecutionClassVideoLive, capture.ExecutionClassImagePoll:
+	case capture.ExecutionClassVideoLive:
 	default:
-		util.WriteError(w, http.StatusBadRequest, "execution_class must be video_live or image_poll")
+		util.WriteError(w, http.StatusBadRequest, "execution_class must be video_live")
 		return
 	}
 
