@@ -14,7 +14,6 @@ func appendFFmpegHTTPInputArgs(args []string, sourceURL string, reconnect bool, 
 	// for a different host, which can otherwise abort relay-backed streams.
 	args = append(args,
 		"-http_persistent", "0",
-		"-http_multiple", "0",
 	)
 	if reconnect {
 		if reconnectDelayMax < 1 {
