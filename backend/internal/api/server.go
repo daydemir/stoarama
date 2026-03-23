@@ -8778,7 +8778,14 @@ func (s *Server) successCaptureCountsSince(ctx context.Context, frameStreamIDs, 
 }
 
 func isClipNativeExecutionClass(raw string) bool {
-	mode := capture.NormalizeMode(raw)
+	normalized := strings.TrimSpace(strings.ToLower(raw))
+	switch normalized {
+	case capture.ExecutionClassVideoLive, capture.ExecutionClassYouTubeRelay:
+		return true
+	case capture.ExecutionClassImagePoll:
+		return false
+	}
+	mode := capture.NormalizeMode(normalized)
 	switch mode {
 	case capture.ModeYouTubeLive, capture.ModeYouTubeRelay, capture.ModeHLSLive, capture.ModeFFmpegDirect:
 		return true
