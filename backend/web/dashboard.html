@@ -5113,9 +5113,10 @@ function renderStreamRows() {
     const captureRate = fmtPct(row.captures_success, row.captures_total);
     const latestCap = row.latest_captured_at ? String(row.latest_captured_at).replace('T', ' ').slice(0, 19) : '-';
     const state = String(s.recording_state || 'off');
+    const canStartRecording = supportsClipRecording(s);
     const recHtml = state === 'on'
       ? `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;"><button class="btn-sm" data-action="recording-disable" data-id="${s.id}">Turn Off</button></div>`
-      : `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;"><button class="btn-sm" data-action="recording-enable" data-id="${s.id}">Turn On</button></div>`;
+      : `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${canStartRecording ? `<button class="btn-sm" data-action="recording-enable" data-id="${s.id}">Turn On</button>` : '<span class="tag tag-muted">clip-only hard cut</span>'}</div>`;
     const mode = String(s.capture_type || '-');
     const captureFamily = formatCaptureFamilyLabel(s.capture_family);
     const cadenceLabel = formatStreamCadenceLabel(s);
@@ -5319,6 +5320,9 @@ function inferRecordingAssignmentExecutionClasses(stream) {
     if (explicitExecutionClass === 'youtube_direct' || explicitExecutionClass === 'youtube_relay') {
       return ['youtube_relay'];
     }
+    if (explicitExecutionClass === 'image_poll') {
+      return [];
+    }
     return [explicitExecutionClass];
   }
   const explicitCaptureType = normalizeCanonicalValue(stream && stream.capture_type);
@@ -5327,7 +5331,7 @@ function inferRecordingAssignmentExecutionClasses(stream) {
       return ['youtube_relay'];
     }
     if (explicitCaptureType === 'still_image') {
-      return ['image_poll'];
+      return [];
     }
     if (['hls', 'dash', 'rtsp', 'rtmp', 'http_video'].includes(explicitCaptureType)) {
       return ['video_live'];
@@ -5338,6 +5342,10 @@ function inferRecordingAssignmentExecutionClasses(stream) {
     return ['youtube_relay'];
   }
   return [];
+}
+
+function supportsClipRecording(stream) {
+  return inferRecordingAssignmentExecutionClasses(stream).length > 0;
 }
 
 function recordingCandidateExecutionClassList(row) {
@@ -5495,6 +5503,9 @@ async function chooseServerForRecordingAssign(stream) {
     throw new Error('invalid stream id for assignment');
   }
   const desiredExecutionClasses = inferRecordingAssignmentExecutionClasses(stream);
+  if (!desiredExecutionClasses.length) {
+    throw new Error('this stream is not startable in the clip-native recording path');
+  }
   const payload = await fetchJSON('/api/v1/dashboard/recording/server-capacity');
   const rows = Array.isArray(payload && payload.items) ? payload.items : [];
   let candidates = rows.filter((row) => {
@@ -6067,15 +6078,15 @@ function renderCoverageHeatmap(points) {
     const successMinutes = Number(p.success_minutes || 0);
     const errorMinutes = Number(p.error_minutes || 0);
     const recordedHours = Number(p.recorded_hours || 0);
-    const totalFrames = Number(p.recorded_total_frames || 0);
-    const successFrames = Number(p.recorded_success_frames || 0);
-    const errorFrames = Number(p.recorded_error_frames || 0);
+    const totalCaptures = Number(p.recorded_total_captures || p.recorded_total_frames || 0);
+    const successCaptures = Number(p.recorded_success_captures || p.recorded_success_frames || 0);
+    const errorCaptures = Number(p.recorded_error_captures || p.recorded_error_frames || 0);
     const firstCapture = p.first_capture_at ? formatDateTimeShort(p.first_capture_at) : '-';
     const lastCapture = p.last_capture_at ? formatDateTimeShort(p.last_capture_at) : '-';
     const title = [
       `${p.day}: ${recordedHours.toFixed(2)}h`,
       `minutes ${recordedMinutes} (success ${successMinutes} / error ${errorMinutes})`,
-      `frames ${successFrames}/${totalFrames}${errorFrames > 0 ? ` (error ${errorFrames})` : ''}`,
+      `clips ${successCaptures}/${totalCaptures}${errorCaptures > 0 ? ` (error ${errorCaptures})` : ''}`,
       `first ${firstCapture}`,
       `last ${lastCapture}`,
     ].join(' · ');
@@ -6117,7 +6128,7 @@ function renderCoverageSamples(payload) {
   const items = Array.isArray(payload && payload.items) ? payload.items : [];
   coverageSampleGrid.innerHTML = '';
   if (!items.length) {
-    coverageSamplesSummary.textContent = 'No sampleable captured images in this stream yet.';
+    coverageSamplesSummary.textContent = 'No sampleable captured clips in this stream yet.';
     coverageSampleGrid.innerHTML = '<div class="muted fs11">No samples</div>';
     return;
   }
@@ -6125,19 +6136,17 @@ function renderCoverageSamples(payload) {
   const availableDays = Number(payload.available_days || 0);
   const selectedDays = Number(payload.selected_days || items.length);
   coverageSamplesSummary.textContent =
-    `${items.length} sampled snapshots · requested ${requested} · selected days ${selectedDays}/${availableDays}`;
-  const streamIDRaw = Number(detailStreamID || 0);
-  const streamID = Number.isFinite(streamIDRaw) && streamIDRaw > 0 ? Math.floor(streamIDRaw) : 0;
+    `${items.length} sampled clips · requested ${requested} · selected days ${selectedDays}/${availableDays}`;
   for (const it of items) {
     const url = String(it.download_url || '').trim();
-    const title = `${it.day || '-'} · ${formatDateTimeShort(it.captured_at || '')}`;
-    const imageHTML = url
-      ? `<a class="table-image-link" href="${esc(url)}" data-image-url="${esc(url)}" data-image-scope="coverage"${streamID ? ` data-stream-id="${streamID}"` : ''}><img class="thumb-sm" src="${esc(url)}" alt="sample ${esc(String(it.day || ''))}" loading="lazy" decoding="async" /></a>`
-      : '<span class="muted fs11">no image</span>';
+    const title = `${it.day || '-'} · ${captureWindowLabel(it)}`;
+    const mediaHTML = url
+      ? renderClipActions(it, false, 'thumb-sm', true)
+      : renderClipThumbnail(it, 'thumb-sm');
     const el = document.createElement('div');
     el.className = 'coverage-sample-card';
     el.innerHTML = `
-      ${imageHTML}
+      ${mediaHTML}
       <div class="coverage-sample-meta">${esc(title)}</div>
       <div class="coverage-sample-meta mono">${esc(String(it.object_key || '-'))}</div>
     `;
@@ -6397,6 +6406,7 @@ async function loadDetail(options = {}) {
   }
   const recentFrames = captureMeta.clipNative ? await fetchRecentClips(60) : await fetchRecentFrames(60);
   const s = recordingPayload.stream || {};
+  const canStartRecording = supportsClipRecording(s);
   const detailName = latinizedLabelParts(s.name);
 
   detailTitle.textContent = detailName.primary || `${s.name || detailStreamID}`;
@@ -6412,7 +6422,11 @@ async function loadDetail(options = {}) {
 
   const youtubeWatchURL = buildYouTubeWatchURL(s);
   detailActions.innerHTML = `
-    <button class="btn-sm" data-detail-action="${s.recording_state === 'on' ? 'recording-disable' : 'recording-enable'}" data-id="${s.id}">${s.recording_state === 'on' ? 'Turn Recording Off' : 'Turn Recording On'}</button>
+    ${s.recording_state === 'on'
+      ? `<button class="btn-sm" data-detail-action="recording-disable" data-id="${s.id}">Turn Recording Off</button>`
+      : (canStartRecording
+        ? `<button class="btn-sm" data-detail-action="recording-enable" data-id="${s.id}">Turn Recording On</button>`
+        : `<span class="tag tag-muted">clip-only hard cut</span>`)}
     ${youtubeWatchURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
     ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open Stream URL</button></a>` : ''}
     ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Source Page</button></a>` : ''}
@@ -6433,8 +6447,8 @@ async function loadDetail(options = {}) {
   if (detailFramesReload) detailFramesReload.textContent = captureMeta.clipNative ? 'Reload clips' : 'Reload captures';
   if (framesCapturedHeader) framesCapturedHeader.textContent = captureMeta.clipNative ? 'Window' : 'Captured';
   if (framesRawHeader) framesRawHeader.textContent = captureMeta.clipNative ? 'Clip' : 'Raw';
-  if (detailCoverageSubtitle) detailCoverageSubtitle.textContent = captureMeta.clipNative ? 'Historical coverage is still frame-native; new clip-native live video will appear here after frame extraction is wired.' : 'Historical coverage, day-level heatmap, and stratified capture samples.';
-  if (detailCoverageSamplesSubtitle) detailCoverageSamplesSubtitle.textContent = captureMeta.clipNative ? 'History samples below still reflect frame-based capture history only.' : 'Stratified snapshots across full capture history (not just recent frames).';
+  if (detailCoverageSubtitle) detailCoverageSubtitle.textContent = 'Historical clip coverage, day-level heatmap, and sampled clip history.';
+  if (detailCoverageSamplesSubtitle) detailCoverageSamplesSubtitle.textContent = 'Representative clip samples across full capture history, using saved thumbnails when available.';
   if (detailTimelineSubtitle) detailTimelineSubtitle.textContent = captureMeta.clipNative ? 'Timeline is still frame-native; new clip-native live video will appear here after extraction is wired.' : 'UTC minute timeline for recorded frames, inferenced frames, and person detections.';
   if (detailExportManifest) detailExportManifest.disabled = captureMeta.clipNative;
   if (detailExportZip) detailExportZip.disabled = captureMeta.clipNative;
@@ -6504,6 +6518,9 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
 
   if (action === 'recording-enable' || action === 'recording-disable') {
     const nextState = action === 'recording-enable' ? 'on' : 'off';
+    if (nextState === 'on' && !supportsClipRecording(stream)) {
+      throw new Error('this stream is not startable in the clip-native recording path');
+    }
     await setStreamRecordingState(id, nextState);
     await Promise.all([
       loadOverview(),
