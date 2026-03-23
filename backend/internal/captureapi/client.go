@@ -77,6 +77,8 @@ type IngestSegmentSuccessRequest struct {
 	AudioCodec         string
 	Container          string
 	AudioPresent       bool
+	ThumbnailBytes     []byte
+	ThumbnailMIMEType  string
 	RecordingHeartbeat bool
 }
 
@@ -603,6 +605,14 @@ func (c *Client) IngestSegmentSuccess(ctx context.Context, req IngestSegmentSucc
 		"container":           strings.TrimSpace(req.Container),
 		"audio_present":       req.AudioPresent,
 		"recording_heartbeat": req.RecordingHeartbeat,
+	}
+	if len(req.ThumbnailBytes) > 0 {
+		thumbType := strings.TrimSpace(req.ThumbnailMIMEType)
+		if thumbType == "" {
+			thumbType = "image/jpeg"
+		}
+		payload["thumbnail_base64"] = base64.StdEncoding.EncodeToString(req.ThumbnailBytes)
+		payload["thumbnail_mime_type"] = thumbType
 	}
 	var out ingestResponse
 	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {

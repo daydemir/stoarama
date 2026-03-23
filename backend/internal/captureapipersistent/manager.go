@@ -903,6 +903,16 @@ func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, eff
 	if err != nil {
 		return fmt.Errorf("read segment: %w", err)
 	}
+	var thumbnailBytes []byte
+	var thumbnailMIME string
+	if seg.Thumbnail != nil && strings.TrimSpace(seg.Thumbnail.Path) != "" {
+		if b, err := os.ReadFile(seg.Thumbnail.Path); err != nil {
+			log.Printf("capture-api-persistent stream_id=%d thumbnail read failed: %v", s.ID, err)
+		} else {
+			thumbnailBytes = b
+			thumbnailMIME = strings.TrimSpace(seg.Thumbnail.MIMEType)
+		}
+	}
 	intent, err := m.client.ReserveSegmentUpload(ctx, captureapi.SegmentUploadIntentRequest{
 		StreamID:  s.ID,
 		MimeType:  seg.MIMEType,
@@ -932,6 +942,8 @@ func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, eff
 		AudioCodec:         seg.AudioCodec,
 		Container:          seg.Container,
 		AudioPresent:       seg.AudioPresent,
+		ThumbnailBytes:     thumbnailBytes,
+		ThumbnailMIMEType:  thumbnailMIME,
 		RecordingHeartbeat: m.shouldRecordingHeartbeat(effective),
 	})
 }
