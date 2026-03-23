@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -619,17 +620,26 @@ func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, eff
 	if err != nil {
 		return fmt.Errorf("upsert media object: %w", err)
 	}
+	var thumbnailMediaID any
+	if seg.Thumbnail != nil && strings.TrimSpace(seg.Thumbnail.Path) != "" {
+		if id, thumbErr := m.persistSegmentThumbnail(ctx, tx, s.ID, seg); thumbErr != nil {
+			log.Printf("capture-persistent stream_id=%d thumbnail persist failed: %v", s.ID, thumbErr)
+		} else if id > 0 {
+			thumbnailMediaID = id
+		}
+	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO capture_segments (
 			stream_id, capture_job_id, media_object_id, execution_class, resolved_capture_type, resolved_url,
+			thumbnail_media_object_id,
 			segment_start_at, segment_end_at, duration_ms, target_fps, actual_fps,
 			video_codec, audio_codec, container, audio_present,
 			capture_status, capture_error, source_kind
 		)
-		VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11, $12, $13, 'success', NULL, $14)
+		VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13, $14, 'success', NULL, $15)
 	`, s.ID, mediaID, capture.ModeToExecutionClass(effective), capture.ResolvedCaptureTypeFromURL(resolvedURL), resolvedURL,
-		seg.StartAt, seg.EndAt, seg.DurationMs, m.cfg.SegmentTargetFPS, nullableTrimmed(seg.VideoCodec), nullableTrimmed(seg.AudioCodec), seg.Container, seg.AudioPresent, seg.SourceKind); err != nil {
+		thumbnailMediaID, seg.StartAt, seg.EndAt, seg.DurationMs, m.cfg.SegmentTargetFPS, nullableTrimmed(seg.VideoCodec), nullableTrimmed(seg.AudioCodec), seg.Container, seg.AudioPresent, seg.SourceKind); err != nil {
 		return fmt.Errorf("insert capture segment success: %w", err)
 	}
 
@@ -669,6 +679,41 @@ func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, eff
 		return fmt.Errorf("commit success tx: %w", err)
 	}
 	return nil
+}
+
+func (m *Manager) persistSegmentThumbnail(ctx context.Context, tx pgx.Tx, streamID int64, seg capture.Segment) (int64, error) {
+	if seg.Thumbnail == nil || strings.TrimSpace(seg.Thumbnail.Path) == "" {
+		return 0, nil
+	}
+	body, err := os.ReadFile(seg.Thumbnail.Path)
+	if err != nil {
+		return 0, fmt.Errorf("read thumbnail: %w", err)
+	}
+	mimeType := strings.TrimSpace(seg.Thumbnail.MIMEType)
+	if mimeType == "" {
+		mimeType = "image/jpeg"
+	}
+	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/segment-%d.jpg",
+		streamID, seg.StartAt.Year(), int(seg.StartAt.Month()), seg.StartAt.Day(), seg.StartAt.UnixMilli())
+	etag, err := m.r2c.PutBytes(ctx, objectKey, mimeType, body)
+	if err != nil {
+		return 0, fmt.Errorf("upload thumbnail: %w", err)
+	}
+	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{
+		StorageProvider: "r2",
+		Bucket:          m.r2c.Bucket(),
+		ObjectKey:       objectKey,
+		MIMEType:        mimeType,
+		SizeBytes:       seg.Thumbnail.SizeBytes,
+		ETag:            etag,
+		SHA256:          seg.Thumbnail.SHA256,
+		Width:           seg.Thumbnail.Width,
+		Height:          seg.Thumbnail.Height,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("upsert thumbnail media object: %w", err)
+	}
+	return mediaID, nil
 }
 
 func (m *Manager) shouldRecordingHeartbeat(effective capture.Mode) bool {

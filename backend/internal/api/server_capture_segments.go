@@ -1,9 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -36,6 +42,8 @@ type captureSegmentFinalize struct {
 	ExecutionClass string
 	ResolvedURL    string
 	CaptureType    string
+	ThumbnailBytes []byte
+	ThumbnailMIME  string
 }
 
 func buildCaptureSegmentObjectKey(streamID int64, startAt time.Time, mimeType string) string {
@@ -46,6 +54,12 @@ func buildCaptureSegmentObjectKey(streamID int64, startAt time.Time, mimeType st
 	startAt = startAt.UTC()
 	return fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/segment-%d%s",
 		streamID, startAt.Year(), int(startAt.Month()), startAt.Day(), startAt.UnixMilli(), ext)
+}
+
+func buildCaptureSegmentThumbnailObjectKey(streamID int64, startAt time.Time) string {
+	startAt = startAt.UTC()
+	return fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/segment-%d.jpg",
+		streamID, startAt.Year(), int(startAt.Month()), startAt.Day(), startAt.UnixMilli())
 }
 
 func (s *Server) finalizeCaptureSegmentUpload(ctx context.Context, tx pgx.Tx, streamID int64, payload captureSegmentFinalize) (int64, error) {
@@ -135,16 +149,25 @@ func (s *Server) persistCaptureSegmentSuccess(ctx context.Context, streamID int6
 	if err != nil {
 		return err
 	}
+	var thumbnailMediaID any
+	if len(payload.ThumbnailBytes) > 0 {
+		if id, thumbErr := s.persistCaptureSegmentThumbnail(ctx, tx, streamID, payload.SegmentStartAt, payload.ThumbnailBytes, payload.ThumbnailMIME); thumbErr != nil {
+			log.Printf("capture-segment thumbnail stream_id=%d start=%s error=%v", streamID, payload.SegmentStartAt.UTC().Format(time.RFC3339), thumbErr)
+		} else if id > 0 {
+			thumbnailMediaID = id
+		}
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO capture_segments (
 			stream_id, capture_job_id, media_object_id, execution_class, resolved_capture_type, resolved_url,
+			thumbnail_media_object_id,
 			segment_start_at, segment_end_at, duration_ms, target_fps, actual_fps,
 			video_codec, audio_codec, container, audio_present,
 			capture_status, capture_error, source_kind
 		)
-		VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'success', NULL, $15)
+		VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'success', NULL, $16)
 		ON CONFLICT (stream_id, segment_start_at, media_object_id) DO NOTHING
-	`, streamID, mediaID, payload.ExecutionClass, nullableTrimmed(payload.CaptureType), nullableTrimmed(payload.ResolvedURL),
+	`, streamID, mediaID, payload.ExecutionClass, nullableTrimmed(payload.CaptureType), nullableTrimmed(payload.ResolvedURL), thumbnailMediaID,
 		payload.SegmentStartAt, payload.SegmentEndAt, payload.DurationMs, payload.TargetFPS, payload.ActualFPS,
 		nullableTrimmed(payload.VideoCodec), nullableTrimmed(payload.AudioCodec), payload.Container, payload.AudioPresent, payload.SourceKind); err != nil {
 		return fmt.Errorf("insert capture segment success: %w", err)
@@ -183,6 +206,40 @@ func (s *Server) persistCaptureSegmentSuccess(ctx context.Context, streamID int6
 		return fmt.Errorf("commit segment success tx: %w", err)
 	}
 	return nil
+}
+
+func (s *Server) persistCaptureSegmentThumbnail(ctx context.Context, tx pgx.Tx, streamID int64, startAt time.Time, body []byte, mimeType string) (int64, error) {
+	if len(body) == 0 {
+		return 0, nil
+	}
+	if strings.TrimSpace(mimeType) == "" {
+		mimeType = "image/jpeg"
+	}
+	objectKey := buildCaptureSegmentThumbnailObjectKey(streamID, startAt)
+	etag, err := s.r2.PutBytes(ctx, objectKey, mimeType, body)
+	if err != nil {
+		return 0, fmt.Errorf("upload thumbnail: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(body))
+	if err != nil {
+		cfg = image.Config{}
+	}
+	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{
+		StorageProvider: "r2",
+		Bucket:          s.r2.Bucket(),
+		ObjectKey:       objectKey,
+		MIMEType:        mimeType,
+		SizeBytes:       int64(len(body)),
+		ETag:            strings.TrimSpace(etag),
+		SHA256:          hex.EncodeToString(sum[:]),
+		Width:           cfg.Width,
+		Height:          cfg.Height,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("upsert thumbnail media object: %w", err)
+	}
+	return mediaID, nil
 }
 
 func (s *Server) persistCaptureSegmentError(ctx context.Context, streamID int64, executionClass string, resolvedURL string, sourceKind string, captureErr string) (int, error) {
@@ -250,29 +307,33 @@ func (s *Server) persistCaptureSegmentError(ctx context.Context, streamID int64,
 }
 
 type captureSegmentListItem struct {
-	ID                  int64     `json:"id"`
-	StreamID            int64     `json:"stream_id"`
-	CaptureJobID        *int64    `json:"capture_job_id,omitempty"`
-	ExecutionClass      string    `json:"execution_class"`
-	ResolvedCaptureType *string   `json:"resolved_capture_type,omitempty"`
-	ResolvedURL         *string   `json:"resolved_url,omitempty"`
-	SegmentStartAt      time.Time `json:"segment_start_at"`
-	SegmentEndAt        time.Time `json:"segment_end_at"`
-	DurationMs          int64     `json:"duration_ms"`
-	TargetFPS           int       `json:"target_fps"`
-	ActualFPS           *float64  `json:"actual_fps,omitempty"`
-	VideoCodec          *string   `json:"video_codec,omitempty"`
-	AudioCodec          *string   `json:"audio_codec,omitempty"`
-	Container           *string   `json:"container,omitempty"`
-	AudioPresent        bool      `json:"audio_present"`
-	CaptureStatus       string    `json:"capture_status"`
-	CaptureError        *string   `json:"capture_error,omitempty"`
-	SourceKind          string    `json:"source_kind"`
-	ObjectKey           *string   `json:"object_key,omitempty"`
-	MIMEType            *string   `json:"mime_type,omitempty"`
-	SizeBytes           *int64    `json:"size_bytes,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	DownloadURL         string    `json:"download_url,omitempty"`
+	ID                   int64     `json:"id"`
+	StreamID             int64     `json:"stream_id"`
+	CaptureJobID         *int64    `json:"capture_job_id,omitempty"`
+	ExecutionClass       string    `json:"execution_class"`
+	ResolvedCaptureType  *string   `json:"resolved_capture_type,omitempty"`
+	ResolvedURL          *string   `json:"resolved_url,omitempty"`
+	SegmentStartAt       time.Time `json:"segment_start_at"`
+	SegmentEndAt         time.Time `json:"segment_end_at"`
+	DurationMs           int64     `json:"duration_ms"`
+	TargetFPS            int       `json:"target_fps"`
+	ActualFPS            *float64  `json:"actual_fps,omitempty"`
+	VideoCodec           *string   `json:"video_codec,omitempty"`
+	AudioCodec           *string   `json:"audio_codec,omitempty"`
+	Container            *string   `json:"container,omitempty"`
+	AudioPresent         bool      `json:"audio_present"`
+	CaptureStatus        string    `json:"capture_status"`
+	CaptureError         *string   `json:"capture_error,omitempty"`
+	SourceKind           string    `json:"source_kind"`
+	ObjectKey            *string   `json:"object_key,omitempty"`
+	MIMEType             *string   `json:"mime_type,omitempty"`
+	SizeBytes            *int64    `json:"size_bytes,omitempty"`
+	ThumbnailObjectKey   *string   `json:"thumbnail_object_key,omitempty"`
+	ThumbnailMIMEType    *string   `json:"thumbnail_mime_type,omitempty"`
+	ThumbnailSizeBytes   *int64    `json:"thumbnail_size_bytes,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	DownloadURL          string    `json:"download_url,omitempty"`
+	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
 }
 
 func (s *Server) queryCaptureSegments(ctx context.Context, streamID int64, limit int, offset int) ([]captureSegmentListItem, error) {
@@ -299,9 +360,13 @@ func (s *Server) queryCaptureSegments(ctx context.Context, streamID int64, limit
 			mo.object_key,
 			mo.mime_type,
 			mo.size_bytes,
+			tmo.object_key,
+			tmo.mime_type,
+			tmo.size_bytes,
 			cs.created_at
 		FROM capture_segments cs
 		LEFT JOIN media_objects mo ON mo.id = cs.media_object_id
+		LEFT JOIN media_objects tmo ON tmo.id = cs.thumbnail_media_object_id
 		WHERE cs.stream_id = $1
 		ORDER BY cs.segment_start_at DESC, cs.id DESC
 		LIMIT $2 OFFSET $3
@@ -336,6 +401,9 @@ func (s *Server) queryCaptureSegments(ctx context.Context, streamID int64, limit
 			&it.ObjectKey,
 			&it.MIMEType,
 			&it.SizeBytes,
+			&it.ThumbnailObjectKey,
+			&it.ThumbnailMIMEType,
+			&it.ThumbnailSizeBytes,
 			&it.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan capture segment: %w", err)
@@ -343,6 +411,11 @@ func (s *Server) queryCaptureSegments(ctx context.Context, streamID int64, limit
 		if it.ObjectKey != nil && strings.TrimSpace(*it.ObjectKey) != "" {
 			if url, err := s.r2.PresignGet(ctx, *it.ObjectKey, s.cfg.R2SignGetTTL); err == nil {
 				it.DownloadURL = url
+			}
+		}
+		if it.ThumbnailObjectKey != nil && strings.TrimSpace(*it.ThumbnailObjectKey) != "" {
+			if url, err := s.r2.PresignGet(ctx, *it.ThumbnailObjectKey, s.cfg.R2SignGetTTL); err == nil {
+				it.ThumbnailDownloadURL = url
 			}
 		}
 		items = append(items, it)

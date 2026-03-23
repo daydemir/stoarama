@@ -1,11 +1,14 @@
 package capture
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +30,16 @@ type Segment struct {
 	VideoCodec   string
 	AudioCodec   string
 	AudioPresent bool
+	Thumbnail    *SegmentThumbnail
+}
+
+type SegmentThumbnail struct {
+	Path      string
+	MIMEType  string
+	SizeBytes int64
+	SHA256    string
+	Width     int
+	Height    int
 }
 
 func SegmentCaptureTimeout(segmentDuration time.Duration) time.Duration {
@@ -94,6 +107,11 @@ func CaptureSegment(ctx context.Context, sourceURL string, targetFPS int, segmen
 		}
 	}
 
+	thumb, thumbErr := extractSegmentThumbnail(ctx, outPath)
+	if thumbErr != nil {
+		thumb = nil
+	}
+
 	return Segment{
 		Path:         outPath,
 		MIMEType:     "video/mp4",
@@ -107,6 +125,7 @@ func CaptureSegment(ctx context.Context, sourceURL string, targetFPS int, segmen
 		VideoCodec:   videoCodec,
 		AudioCodec:   audioCodec,
 		AudioPresent: audioPresent,
+		Thumbnail:    thumb,
 	}, nil
 }
 
@@ -139,6 +158,47 @@ func buildFFmpegSegmentArgs(sourceURL string, targetFPS int, segmentDuration tim
 		outPath,
 	)
 	return args
+}
+
+func extractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentThumbnail, error) {
+	thumbPath := filepath.Join(filepath.Dir(segmentPath), "thumbnail.jpg")
+	thumbCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(thumbCtx,
+		"ffmpeg",
+		"-y",
+		"-loglevel", "error",
+		"-ss", "1",
+		"-i", segmentPath,
+		"-frames:v", "1",
+		"-vf", "scale=240:-1:force_original_aspect_ratio=decrease",
+		"-q:v", "8",
+		thumbPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("ffmpeg thumbnail failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	info, err := os.Stat(thumbPath)
+	if err != nil {
+		return nil, fmt.Errorf("stat thumbnail: %w", err)
+	}
+	body, err := os.ReadFile(thumbPath)
+	if err != nil {
+		return nil, fmt.Errorf("read thumbnail: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(body))
+	if err != nil {
+		cfg = image.Config{}
+	}
+	return &SegmentThumbnail{
+		Path:      thumbPath,
+		MIMEType:  "image/jpeg",
+		SizeBytes: info.Size(),
+		SHA256:    hex.EncodeToString(sum[:]),
+		Width:     cfg.Width,
+		Height:    cfg.Height,
+	}, nil
 }
 
 type ffprobeMeta struct {

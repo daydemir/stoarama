@@ -790,36 +790,36 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 
 		refreshTicker := time.NewTicker(time.Duration(*refreshSec) * time.Second)
 		defer refreshTicker.Stop()
-			lastUpstreamURL := map[int64]string{}
-			lastPublishedPullURL := map[int64]string{}
-			lastStatus := map[int64]string{}
-			routeResolveFailures := map[int64]int{}
-			routeCache, err := loadRelaySourceRouteCache(strings.TrimSpace(*cacheFile))
+		lastUpstreamURL := map[int64]string{}
+		lastPublishedPullURL := map[int64]string{}
+		lastStatus := map[int64]string{}
+		routeResolveFailures := map[int64]int{}
+		routeCache, err := loadRelaySourceRouteCache(strings.TrimSpace(*cacheFile))
 		if err != nil {
 			log.Printf("youtube-relay source cache load failed path=%s: %v", strings.TrimSpace(*cacheFile), err)
 			routeCache = map[int64]relaySourceRouteCacheEntry{}
 		}
-			saveRouteCache := func() {
-				if strings.TrimSpace(*cacheFile) == "" {
-					return
-				}
-				if err := saveRelaySourceRouteCache(strings.TrimSpace(*cacheFile), routeCache); err != nil {
-					log.Printf("youtube-relay source cache save failed path=%s: %v", strings.TrimSpace(*cacheFile), err)
-				}
+		saveRouteCache := func() {
+			if strings.TrimSpace(*cacheFile) == "" {
+				return
 			}
-			for streamID, cached := range routeCache {
-				cachedURL := strings.TrimSpace(cached.UpstreamURL)
-				if cachedURL == "" {
-					continue
-				}
-				relayState.routes[streamID] = relayRouteState{UpstreamURL: cachedURL}
-				lastUpstreamURL[streamID] = cachedURL
-				lastPublishedPullURL[streamID] = fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, streamID, url.QueryEscape(strings.TrimSpace(*sharedToken)))
-				lastStatus[streamID] = "source_ready"
-				log.Printf("youtube-relay source preloaded cached route stream_id=%d age=%s", streamID, time.Since(cached.UpdatedAt).Round(time.Second))
+			if err := saveRelaySourceRouteCache(strings.TrimSpace(*cacheFile), routeCache); err != nil {
+				log.Printf("youtube-relay source cache save failed path=%s: %v", strings.TrimSpace(*cacheFile), err)
 			}
+		}
+		for streamID, cached := range routeCache {
+			cachedURL := strings.TrimSpace(cached.UpstreamURL)
+			if cachedURL == "" {
+				continue
+			}
+			relayState.routes[streamID] = relayRouteState{UpstreamURL: cachedURL}
+			lastUpstreamURL[streamID] = cachedURL
+			lastPublishedPullURL[streamID] = fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, streamID, url.QueryEscape(strings.TrimSpace(*sharedToken)))
+			lastStatus[streamID] = "source_ready"
+			log.Printf("youtube-relay source preloaded cached route stream_id=%d age=%s", streamID, time.Since(cached.UpdatedAt).Round(time.Second))
+		}
 
-			resolveOnce := func() error {
+		resolveOnce := func() error {
 			routes, err := client.ListYouTubeRelayRoutes(runCtx, strings.TrimSpace(*serverID), "", "", 1000, 0)
 			if err != nil {
 				return fmt.Errorf("list youtube relay routes: %w", err)
@@ -2906,8 +2906,8 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		fmt.Printf("clips=%d limit=%d offset=%d\n", len(items), *limit, *offset)
 		for _, raw := range items {
 			it := asMap(raw)
-			fmt.Printf("segment_id=%v stream_id=%v start=%v end=%v status=%v fps=%v object_key=%v error=%v\n",
-				it["id"], it["stream_id"], it["segment_start_at"], it["segment_end_at"], it["capture_status"], it["target_fps"], it["object_key"], it["capture_error"])
+			fmt.Printf("segment_id=%v stream_id=%v start=%v end=%v status=%v fps=%v object_key=%v thumbnail=%v error=%v\n",
+				it["id"], it["stream_id"], it["segment_start_at"], it["segment_end_at"], it["capture_status"], it["target_fps"], it["object_key"], it["thumbnail_object_key"], it["capture_error"])
 		}
 	case "clip-latest":
 		fs := flag.NewFlagSet("streams clip-latest", flag.ExitOnError)
@@ -2929,8 +2929,8 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 			fmt.Println("latest_clip=none")
 			return
 		}
-		fmt.Printf("segment_id=%v stream_id=%v start=%v end=%v status=%v fps=%v object_key=%v download_url=%v\n",
-			item["id"], item["stream_id"], item["segment_start_at"], item["segment_end_at"], item["capture_status"], item["target_fps"], item["object_key"], item["download_url"])
+		fmt.Printf("segment_id=%v stream_id=%v start=%v end=%v status=%v fps=%v object_key=%v thumbnail=%v download_url=%v thumbnail_download_url=%v\n",
+			item["id"], item["stream_id"], item["segment_start_at"], item["segment_end_at"], item["capture_status"], item["target_fps"], item["object_key"], item["thumbnail_object_key"], item["download_url"], item["thumbnail_download_url"])
 	case "timeline":
 		fs := flag.NewFlagSet("streams timeline", flag.ExitOnError)
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")

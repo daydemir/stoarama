@@ -5634,20 +5634,16 @@ function captureWindowLabel(it) {
   return formatDateTimeShort(it.captured_at || '');
 }
 
-function renderClipVideo(url, sizeClass = 'thumb-sm') {
-  const safeURL = String(url || '').trim();
-  if (!safeURL) {
-    return '<div class="img-slot"><span class="muted fs10">no clip</span></div>';
+function renderClipThumbnail(it, sizeClass = 'thumb-sm') {
+  const thumbURL = String((it && it.thumbnail_download_url) || '').trim();
+  if (thumbURL) {
+    return `<img class="${esc(sizeClass)}" src="${esc(thumbURL)}" alt="clip thumbnail" loading="lazy" decoding="async" />`;
   }
-  return `
-    <div class="stack" style="gap:6px;">
-      <video class="${esc(sizeClass)}" src="${esc(safeURL)}" controls preload="metadata" playsinline muted></video>
-      <a href="${esc(safeURL)}" target="_blank" rel="noopener noreferrer" class="fs11">open clip</a>
-    </div>
-  `;
+  const slotClass = sizeClass === 'thumb-lg' ? 'img-slot-lg' : 'img-slot';
+  return `<div class="${esc(slotClass)}"><span class="muted fs10">no thumb</span></div>`;
 }
 
-function renderClipActions(it, emphasizeOpen = false) {
+function renderClipActions(it, emphasizeOpen = false, sizeClass = 'thumb-sm', includeThumbnail = true) {
   const url = String((it && it.download_url) || '').trim();
   if (!url) {
     return '<span class="muted fs11">-</span>';
@@ -5659,8 +5655,11 @@ function renderClipActions(it, emphasizeOpen = false) {
   ].join(' ');
   return `
     <div class="stack" style="gap:6px;">
-      <button class="btn-sm" type="button" data-clip-preview="1" ${attrs}>Preview</button>
-      <a href="${esc(url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm${emphasizeOpen ? ' primary' : ''}" type="button">Open clip</button></a>
+      ${includeThumbnail ? renderClipThumbnail(it, sizeClass) : ''}
+      <div class="row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+        <button class="btn-sm" type="button" data-clip-preview="1" ${attrs}>Preview</button>
+        <a href="${esc(url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm${emphasizeOpen ? ' primary' : ''}" type="button">Open clip</button></a>
+      </div>
     </div>
   `;
 }
@@ -5702,13 +5701,12 @@ function renderLatestCard(container, payload, latestCapture, previewImage) {
   const meta = detailCaptureMeta(payload);
   if (latestCaptureLabel) latestCaptureLabel.textContent = meta.clipNative ? 'Latest clip' : 'Latest frame';
   if (meta.clipNative) {
-    const url = String((latestCapture && latestCapture.download_url) || '').trim();
     const objectKey = String((latestCapture && latestCapture.object_key) || '-');
     const windowLabel = captureWindowLabel(latestCapture);
     container.removeAttribute('data-frame-id');
     container.innerHTML = latestCapture ? `
       <div class="stack">
-        ${renderClipVideo(url, 'thumb-lg')}
+        ${renderClipActions(latestCapture, true, 'thumb-lg', true)}
         <span class="muted fs10 mono">${esc(windowLabel)}</span>
         <span class="muted fs10 mono">${esc(objectKey)}</span>
       </div>
@@ -7000,6 +6998,11 @@ if (pipelineOverviewRows) {
 }
 if (detailLiveFramesGrid) {
   detailLiveFramesGrid.addEventListener('click', (e) => {
+    if (handleClipPreviewClick(e)) e.preventDefault();
+  });
+}
+if (latestRawCard) {
+  latestRawCard.addEventListener('click', (e) => {
     if (handleClipPreviewClick(e)) e.preventDefault();
   });
 }

@@ -3150,6 +3150,8 @@ type captureIngestRequest struct {
 	Container          string     `json:"container"`
 	AudioPresent       *bool      `json:"audio_present"`
 	FrameBase64        string     `json:"frame_base64"`
+	ThumbnailBase64    string     `json:"thumbnail_base64"`
+	ThumbnailMimeType  string     `json:"thumbnail_mime_type"`
 	MimeType           string     `json:"mime_type"`
 	SourceKind         string     `json:"source_kind"`
 	CaptureError       string     `json:"capture_error"`
@@ -3189,6 +3191,7 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	req.UploadIntentID = intentID
 	req.FrameBase64 = strings.TrimSpace(req.FrameBase64)
+	req.ThumbnailBase64 = strings.TrimSpace(req.ThumbnailBase64)
 	if req.Status == "" {
 		if req.CaptureError != "" {
 			req.Status = "error"
@@ -3272,6 +3275,15 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 		if req.SizeBytes != nil && *req.SizeBytes > 0 {
 			sizeBytes = *req.SizeBytes
 		}
+		var thumbnailBytes []byte
+		if req.ThumbnailBase64 != "" {
+			decoded, err := base64.StdEncoding.DecodeString(req.ThumbnailBase64)
+			if err != nil {
+				util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("decode thumbnail_base64: %v", err))
+				return
+			}
+			thumbnailBytes = decoded
+		}
 		if err := s.persistCaptureSegmentSuccess(r.Context(), req.StreamID, captureSegmentFinalize{
 			IntentID:       req.UploadIntentID,
 			ObjectKey:      strings.TrimSpace(req.ObjectKey),
@@ -3292,6 +3304,8 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 			ExecutionClass: executionClass,
 			ResolvedURL:    strings.TrimSpace(req.ResolvedURL),
 			CaptureType:    capture.ResolvedCaptureTypeFromURL(strings.TrimSpace(req.ResolvedURL)),
+			ThumbnailBytes: thumbnailBytes,
+			ThumbnailMIME:  strings.TrimSpace(req.ThumbnailMimeType),
 		}); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("persist capture segment success: %v", err))
 			return
@@ -7497,26 +7511,26 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		"capture_unit":          captureUnitPlural,
 		"clip_native":           clipNative,
 		"current_health": map[string]any{
-			"state":              healthState,
-			"reason":             healthReason,
-			"message":            healthMessage,
-			"last_frame_at":      lastFrameAt,
-			"last_frame_age_sec": lastFrameAgeSec,
-			"last_capture_at":    lastFrameAt,
+			"state":                healthState,
+			"reason":               healthReason,
+			"message":              healthMessage,
+			"last_frame_at":        lastFrameAt,
+			"last_frame_age_sec":   lastFrameAgeSec,
+			"last_capture_at":      lastFrameAt,
 			"last_capture_age_sec": lastFrameAgeSec,
 		},
 		"stats_24h": map[string]any{
-			"expected_frames": expectedFrames24h,
-			"success_frames":  successFrames24h,
-			"error_frames":    errorFrames24h,
-			"missing_frames":  missingFrames24h,
+			"expected_frames":   expectedFrames24h,
+			"success_frames":    successFrames24h,
+			"error_frames":      errorFrames24h,
+			"missing_frames":    missingFrames24h,
 			"expected_captures": expectedFrames24h,
 			"success_captures":  successFrames24h,
 			"error_captures":    errorFrames24h,
 			"missing_captures":  missingFrames24h,
-			"loss_rate_pct":   lossRate24h,
-			"first_capture":   firstCapture24h,
-			"last_capture":    lastCapture24h,
+			"loss_rate_pct":     lossRate24h,
+			"first_capture":     firstCapture24h,
+			"last_capture":      lastCapture24h,
 		},
 		"limits": map[string]any{
 			"runs_limit":   runsLimit,
