@@ -8,8 +8,8 @@ func TestAppendFFmpegHTTPInputArgsHTTP(t *testing.T) {
 	for _, arg := range args {
 		joined[arg] = true
 	}
-	if !joined["-http_persistent"] {
-		t.Fatalf("expected -http_persistent in args: %#v", args)
+	if joined["-http_persistent"] {
+		t.Fatalf("did not expect -http_persistent in args: %#v", args)
 	}
 	if joined["-http_multiple"] {
 		t.Fatalf("did not expect -http_multiple in args: %#v", args)

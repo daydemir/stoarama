@@ -511,19 +511,11 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			err          error
 		}
 
-		resolveWorkers := opts.Capacity
-		if resolveWorkers <= 0 {
-			resolveWorkers = 1
-		}
-		if resolveWorkers > 3 {
-			resolveWorkers = 3
-		}
-		if len(routesToResolve) > 0 && resolveWorkers > len(routesToResolve) {
-			resolveWorkers = len(routesToResolve)
-		}
-		if resolveWorkers <= 0 {
-			resolveWorkers = 1
-		}
+		// Keep source-side yt-dlp resolution serialized. On the Mac relay source,
+		// concurrent browser-cookie resolves can get killed under refresh load,
+		// which leaves new routes stuck at assigned even though they resolve fine
+		// individually.
+		resolveWorkers := 1
 
 		resultsCh := make(chan resolveResult, len(routesToResolve))
 		var resolveWG sync.WaitGroup
