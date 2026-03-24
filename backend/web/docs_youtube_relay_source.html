@@ -4,93 +4,269 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Stoarama YouTube Relay Source</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg: #f4efe8;
-      --panel: #fffaf4;
-      --ink: #172026;
-      --muted: #6d716d;
-      --line: #d9cfc2;
-      --accent: #126b50;
+      --bg: #0a0f1a;
+      --panel: #111827;
+      --panel2: #182233;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --border: #1e293b;
+      --accent: #06b6d4;
+      --mono: "IBM Plex Mono", monospace;
+      --sans: "IBM Plex Sans", system-ui, sans-serif;
     }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f1f5f9;
+        --panel: #ffffff;
+        --panel2: #f8fafc;
+        --text: #0f172a;
+        --muted: #4b5563;
+        --border: #e2e8f0;
+        --accent: #0891b2;
+      }
+    }
+    * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: Georgia, "Iowan Old Style", serif;
-      color: var(--ink);
+      min-height: 100vh;
+      font-family: var(--sans);
+      color: var(--text);
       background:
-        radial-gradient(circle at top left, #efe1cc 0, transparent 26%),
-        linear-gradient(180deg, #f5eadb 0%, var(--bg) 55%, #efe5da 100%);
+        radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 10%, transparent) 0, transparent 28%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #000) 0%, var(--bg) 58%, color-mix(in srgb, var(--bg) 88%, #07101f) 100%);
     }
-    .wrap { max-width: 900px; margin: 0 auto; padding: 32px 20px 72px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .shell { max-width: 1120px; margin: 0 auto; padding: 18px 20px 42px; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .topbar-left {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .site-title {
+      font-family: var(--mono);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      color: var(--accent);
+    }
+    .site-subtitle {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .global-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel) 90%, #000);
+    }
+    .global-nav a {
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+    }
+    .global-nav a:hover {
+      color: var(--text);
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+      background: color-mix(in srgb, var(--panel2) 82%, transparent);
+    }
+    .global-nav a.active {
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .hero,
     .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+      border: 1px solid var(--border);
       border-radius: 18px;
-      padding: 18px;
-      box-shadow: 0 18px 40px rgba(30, 32, 30, 0.06);
-      margin-top: 16px;
+      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.18);
     }
-    h1 { margin: 0 0 12px; font-size: 40px; }
-    h2 { margin: 0 0 10px; font-size: 24px; }
-    p, li { line-height: 1.55; }
-    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .hero {
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .eyebrow {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(34px, 5vw, 46px);
+      line-height: 0.98;
+      letter-spacing: -0.03em;
+    }
+    h2 {
+      margin: 0 0 10px;
+      font-size: 22px;
+    }
+    p, li {
+      line-height: 1.6;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .panel { padding: 18px; }
+    code, pre {
+      font-family: var(--mono);
+      font-size: 12px;
+    }
     pre {
-      background: #f3ece3;
-      border: 1px solid var(--line);
-      border-radius: 14px;
+      margin: 12px 0 0;
       padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 88%, transparent);
       overflow-x: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: var(--text);
+      line-height: 1.55;
     }
-    a { color: var(--accent); }
+    .metric-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .metric-chip {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 88%, transparent);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .metric-chip b { color: var(--text); font-weight: 500; }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>YouTube Relay Source</h1>
-    <p>Use a Stoarama relay source on your own computer when a stream needs local YouTube cookies. The source machine resolves the stream locally, serves relay bytes, and Stoarama’s recording sinks pull from that relay.</p>
+  <div class="shell">
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="site-title">STREAM CONTROL</span>
+        <span class="site-subtitle">Relay Docs</span>
+      </div>
+      <nav class="global-nav" aria-label="Global">
+        <a href="/dashboard">Dashboard</a>
+        <a href="/account">Account</a>
+        <a href="/docs/youtube-relay-source" class="active">Relay Docs</a>
+      </nav>
+    </div>
 
-    <section class="panel">
-      <h2>What You Need</h2>
-      <ul>
-        <li>A Stoarama account and an enrolled <code>yt_relay_source</code> node.</li>
-        <li><code>ffmpeg</code> and <code>yt-dlp</code> installed locally.</li>
-        <li>A public or private relay URL reachable from Stoarama’s sink servers.</li>
-        <li>YouTube cookies stored only on your own machine.</li>
-      </ul>
+    <section class="hero">
+      <div class="eyebrow">Local helper for restricted sources</div>
+      <h1>Run a YouTube relay source on your own machine.</h1>
+      <p>Use this when a stream needs browser cookies locally. Your machine resolves the source and relays bytes, while Stoarama keeps the catalog, assignment state, and recording sinks.</p>
+      <div class="metric-row">
+        <span class="metric-chip">Cookies <b>stay local</b></span>
+        <span class="metric-chip">Relay node <b>belongs to your account</b></span>
+        <span class="metric-chip">Recording sink <b>stays remote</b></span>
+      </div>
     </section>
 
-    <section class="panel">
-      <h2>Install Flow</h2>
-      <p>1. Create a node enrollment token from your <a href="/account">account page</a>.</p>
-      <p>2. Enroll your machine:</p>
-      <pre><code>stoarama node enroll \
+    <div class="grid">
+      <section class="panel">
+        <div class="eyebrow">Prereqs</div>
+        <h2>What you need</h2>
+        <ul>
+          <li>A Stoarama account and an enrolled <code>yt_relay_source</code> node.</li>
+          <li><code>ffmpeg</code> and <code>yt-dlp</code> installed locally.</li>
+          <li>A relay URL reachable from Stoarama sink servers.</li>
+          <li>YouTube cookies stored only on your own machine.</li>
+        </ul>
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">Account setup</div>
+        <h2>Create a node enrollment token</h2>
+        <p>Generate the token from your <a href="/account">account page</a>. The account page also shows the node once it starts heartbeating.</p>
+        <pre><code>Open /account
+Create a relay enrollment token
+Copy the token once
+Enroll the node on the source machine</code></pre>
+      </section>
+    </div>
+
+    <div class="grid" style="margin-top:16px;">
+      <section class="panel">
+        <div class="eyebrow">Install flow</div>
+        <h2>Enroll the machine</h2>
+        <pre><code>stoarama node enroll \
   --api-base-url https://stoarama.com \
   --token &lt;enrollment-token&gt; \
   --node-type yt_relay_source \
   --display-name "Mac mini relay"</code></pre>
-      <p>3. Install the launchd service on macOS:</p>
-      <pre><code>stoarama node yt-relay-source install-launchd \
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">macOS background service</div>
+        <h2>Install launchd</h2>
+        <pre><code>stoarama node yt-relay-source install-launchd \
   --public-base-url https://your-relay-host.example \
   --cookies-from-browser chrome</code></pre>
-      <p>4. The service runs in the background and will show up on your account page with heartbeat status and available YouTube relay slots.</p>
-    </section>
+      </section>
+    </div>
 
-    <section class="panel">
-      <h2>Foreground Run</h2>
-      <p>If you want to test without installing launchd:</p>
-      <pre><code>stoarama node yt-relay-source run \
+    <div class="grid" style="margin-top:16px;">
+      <section class="panel">
+        <div class="eyebrow">Foreground testing</div>
+        <h2>Run without launchd</h2>
+        <pre><code>stoarama node yt-relay-source run \
   --public-base-url https://your-relay-host.example \
   --cookies-from-browser chrome</code></pre>
-    </section>
+      </section>
 
-    <section class="panel">
-      <h2>Important Rules</h2>
-      <ul>
-        <li>Cookies never leave your machine.</li>
-        <li>Stoarama only stores node state, route state, and relay metadata.</li>
-        <li>The recording sink stays remote; your source machine only resolves and relays.</li>
-      </ul>
-    </section>
+      <section class="panel">
+        <div class="eyebrow">Rules</div>
+        <h2>Operational boundaries</h2>
+        <ul>
+          <li>Cookies never leave your machine.</li>
+          <li>Stoarama stores node state, route state, and relay metadata only.</li>
+          <li>The recording sink remains remote; the source machine resolves and relays.</li>
+        </ul>
+      </section>
+    </div>
   </div>
 </body>
 </html>
