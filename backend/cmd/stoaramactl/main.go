@@ -101,6 +101,7 @@ func main() {
 func usage() {
 	_, _ = os.Stdout.WriteString(`stoaramactl commands:
 	  stoaramactl migrate up [--dir infra/sql/migrations]
+	  stoaramactl capture backfill-missing [--backend-api-url URL --api-token TOKEN --limit 0 --concurrency 4 --timeout-sec 90 --dry-run --json]
 	  stoaramactl youtube-relay source run [--backend-api-url URL --api-token TOKEN --server-id ID --shard-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 30 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role source --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.2 --source-endpoint HOST:PORT --duration 0 --resolve-timeout-sec 30 --resolve-failure-threshold 3 --bind-addr :18080 --public-base-url URL --shared-token TOKEN --cache-file FILE --yt-dlp-cookies-file FILE|--yt-dlp-cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT]
 	  stoaramactl youtube-relay sink run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role sink --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.11 --relay-source-server-id ID --relay-source-public-base-url URL --duration 0]
 	  stoaramactl youtube-relay routes [--source-server-id ID --sink-server-id ID --status assigned|source_ready|running|stopped|failed --limit 500 --offset 0]
@@ -1832,7 +1833,7 @@ func runMigrate(ctx context.Context, cfg config.Config, args []string) {
 
 func runCapture(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl capture <probe|classify|audit|runtime> ...")
+		log.Fatalf("usage: stoaramactl capture <backfill-missing|probe|classify|audit|runtime> ...")
 	}
 	registry, err := capture.NewDefaultRegistry()
 	if err != nil {
@@ -1841,6 +1842,8 @@ func runCapture(ctx context.Context, cfg config.Config, args []string) {
 
 	sub := args[0]
 	switch sub {
+	case "backfill-missing":
+		runCaptureBackfillMissing(ctx, cfg, args[1:])
 	case "probe":
 		fs := flag.NewFlagSet("capture probe", flag.ExitOnError)
 		id := fs.Int64("id", 0, "stream id from database")
