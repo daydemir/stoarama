@@ -336,8 +336,32 @@ type captureSegmentListItem struct {
 	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
 }
 
-func (s *Server) queryCaptureSegments(ctx context.Context, streamID int64, limit int, offset int) ([]captureSegmentListItem, error) {
-	rows, err := s.pool.Query(ctx, `
+type captureSegmentQueryOptions struct {
+	StreamID                    int64
+	SegmentIDs                  []int64
+	Limit                       int
+	Offset                      int
+	IncludeDownloadURL          bool
+	IncludeThumbnailDownloadURL bool
+}
+
+func (s *Server) queryCaptureSegments(ctx context.Context, opts captureSegmentQueryOptions) ([]captureSegmentListItem, error) {
+	where := []string{"cs.stream_id = $1"}
+	args := []any{opts.StreamID}
+	if len(opts.SegmentIDs) > 0 {
+		args = append(args, opts.SegmentIDs)
+		where = append(where, fmt.Sprintf("cs.id = ANY($%d::bigint[])", len(args)))
+	}
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	offset := opts.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	args = append(args, limit, offset)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
 		SELECT
 			cs.id,
 			cs.stream_id,
@@ -367,10 +391,10 @@ func (s *Server) queryCaptureSegments(ctx context.Context, streamID int64, limit
 		FROM capture_segments cs
 		LEFT JOIN media_objects mo ON mo.id = cs.media_object_id
 		LEFT JOIN media_objects tmo ON tmo.id = cs.thumbnail_media_object_id
-		WHERE cs.stream_id = $1
+		WHERE %s
 		ORDER BY cs.segment_start_at DESC, cs.id DESC
-		LIMIT $2 OFFSET $3
-	`, streamID, limit, offset)
+		LIMIT $%d OFFSET $%d
+	`, strings.Join(where, " AND "), len(args)-1, len(args)), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query capture segments: %w", err)
 	}
@@ -408,12 +432,12 @@ func (s *Server) queryCaptureSegments(ctx context.Context, streamID int64, limit
 		); err != nil {
 			return nil, fmt.Errorf("scan capture segment: %w", err)
 		}
-		if it.ObjectKey != nil && strings.TrimSpace(*it.ObjectKey) != "" {
+		if opts.IncludeDownloadURL && it.ObjectKey != nil && strings.TrimSpace(*it.ObjectKey) != "" {
 			if url, err := s.r2.PresignGet(ctx, *it.ObjectKey, s.cfg.R2SignGetTTL); err == nil {
 				it.DownloadURL = url
 			}
 		}
-		if it.ThumbnailObjectKey != nil && strings.TrimSpace(*it.ThumbnailObjectKey) != "" {
+		if opts.IncludeThumbnailDownloadURL && it.ThumbnailObjectKey != nil && strings.TrimSpace(*it.ThumbnailObjectKey) != "" {
 			if url, err := s.r2.PresignGet(ctx, *it.ThumbnailObjectKey, s.cfg.R2SignGetTTL); err == nil {
 				it.ThumbnailDownloadURL = url
 			}
@@ -433,7 +457,13 @@ func (s *Server) handleCaptureStreamSegmentsList(w http.ResponseWriter, r *http.
 	}
 	limit := parseIntQuery(r, "limit", 100, 1, 1000)
 	offset := parseIntQuery(r, "offset", 0, 0, 1_000_000)
-	items, err := s.queryCaptureSegments(r.Context(), streamID, limit, offset)
+	items, err := s.queryCaptureSegments(r.Context(), captureSegmentQueryOptions{
+		StreamID:                    streamID,
+		Limit:                       limit,
+		Offset:                      offset,
+		IncludeDownloadURL:          true,
+		IncludeThumbnailDownloadURL: true,
+	})
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -450,7 +480,13 @@ func (s *Server) handleCaptureStreamSegmentLatest(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	items, err := s.queryCaptureSegments(r.Context(), streamID, 1, 0)
+	items, err := s.queryCaptureSegments(r.Context(), captureSegmentQueryOptions{
+		StreamID:                    streamID,
+		Limit:                       1,
+		Offset:                      0,
+		IncludeDownloadURL:          true,
+		IncludeThumbnailDownloadURL: true,
+	})
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return

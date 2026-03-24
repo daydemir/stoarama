@@ -84,6 +84,22 @@ func (s *Server) requireAccountAuth(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) requireAccountSessionAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, err := s.authenticateAccountRequest(r)
+		if err != nil {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		if principal.SessionID == nil {
+			util.WriteError(w, http.StatusUnauthorized, "browser session required")
+			return
+		}
+		ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func accountPrincipalFromContext(ctx context.Context) (accountPrincipal, bool) {
 	if ctx == nil {
 		return accountPrincipal{}, false
@@ -91,6 +107,17 @@ func accountPrincipalFromContext(ctx context.Context) (accountPrincipal, bool) {
 	v := ctx.Value(accountPrincipalContextKey)
 	principal, ok := v.(accountPrincipal)
 	return principal, ok
+}
+
+func accountActorLabel(principal accountPrincipal, fallback string) string {
+	email := strings.TrimSpace(principal.Email)
+	if email != "" {
+		return "account:" + email
+	}
+	if principal.AccountID > 0 {
+		return fmt.Sprintf("account:%d", principal.AccountID)
+	}
+	return strings.TrimSpace(fallback)
 }
 
 func (s *Server) authenticateAccountRequest(r *http.Request) (accountPrincipal, error) {

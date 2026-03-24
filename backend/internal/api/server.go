@@ -134,6 +134,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/api-keys", s.handleAccountAPIKeysList)
 			account.Post("/api-keys", s.handleAccountAPIKeysCreate)
 			account.Post("/api-keys/{id}/revoke", s.handleAccountAPIKeyRevoke)
+			account.Get("/streams/{id}/clips", s.handleAccountStreamClipsList)
+			account.Post("/clips/download-prepare", s.handleAccountClipDownloadPrepare)
 			account.Get("/nodes", s.handleAccountNodesList)
 			account.Get("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensList)
 			account.Post("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensCreate)
@@ -182,6 +184,7 @@ func (s *Server) router() http.Handler {
 		})
 
 		api.Group(func(public chi.Router) {
+			public.Get("/data-access-spec", s.handleDataAccessSpec)
 			public.Get("/source-candidates", s.handleSourceCandidatesList)
 			public.Get("/recording/assignments", s.handleRecordingAssignmentsList)
 			public.Get("/pipelines", s.handlePipelinesList)
@@ -229,8 +232,6 @@ func (s *Server) router() http.Handler {
 			admin.Get("/streams", s.handleStreamsList)
 			admin.Post("/source-candidates/{id}/review", s.handleSourceCandidateReview)
 			admin.Post("/source-candidates/{id}/import", s.handleSourceCandidateImport)
-			admin.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
-			admin.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 			admin.Get("/recording/assignments/audit", s.handleRecordingAssignmentsAudit)
 			admin.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
 			admin.Patch("/streams/{id}/capture", s.handleStreamsCapturePatch)
@@ -251,6 +252,12 @@ func (s *Server) router() http.Handler {
 			admin.Put("/dashboard/recording/settings", s.handleDashboardRecordingSettingsPut)
 			admin.Put("/dashboard/streams/{id}/pipelines/{pipeline_id}", s.handleDashboardStreamPipelineUpsert)
 			admin.Post("/dashboard/streams/{id}/frame-exports", s.handleDashboardStreamFrameExportCreate)
+		})
+
+		api.Group(func(accountWrites chi.Router) {
+			accountWrites.Use(s.requireAccountSessionAuth)
+			accountWrites.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
+			accountWrites.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 		})
 
 		api.Group(func(service chi.Router) {
@@ -7615,16 +7622,16 @@ type dashboardStreamCoverageSummary struct {
 }
 
 type dashboardStreamCaptureSample struct {
-	Day                  string     `json:"day"`
-	SegmentID            int64      `json:"segment_id"`
-	FrameID              int64      `json:"frame_id,omitempty"`
-	CapturedAt           time.Time  `json:"captured_at"`
-	SegmentStartAt       time.Time  `json:"segment_start_at"`
-	SegmentEndAt         time.Time  `json:"segment_end_at"`
-	ObjectKey            string     `json:"object_key"`
-	DownloadURL          string     `json:"download_url,omitempty"`
-	ThumbnailObjectKey   *string    `json:"thumbnail_object_key,omitempty"`
-	ThumbnailDownloadURL string     `json:"thumbnail_download_url,omitempty"`
+	Day                  string    `json:"day"`
+	SegmentID            int64     `json:"segment_id"`
+	FrameID              int64     `json:"frame_id,omitempty"`
+	CapturedAt           time.Time `json:"captured_at"`
+	SegmentStartAt       time.Time `json:"segment_start_at"`
+	SegmentEndAt         time.Time `json:"segment_end_at"`
+	ObjectKey            string    `json:"object_key"`
+	DownloadURL          string    `json:"download_url,omitempty"`
+	ThumbnailObjectKey   *string   `json:"thumbnail_object_key,omitempty"`
+	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
 }
 
 func ensureTimelinePoint(pointsByMinute map[int]*dashboardStreamTimelinePoint, minute int) *dashboardStreamTimelinePoint {
@@ -9140,6 +9147,8 @@ func fileExtensionFromMIME(m string) string {
 		return ".webp"
 	case "video/mp4":
 		return ".mp4"
+	case "video/webm":
+		return ".webm"
 	default:
 		return ""
 	}

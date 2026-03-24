@@ -61,7 +61,21 @@
       margin-bottom: 14px;
     }
     .topbar-left { display: flex; align-items: baseline; gap: 10px; }
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
     .site-title { font-size: 15px; font-weight: 600; letter-spacing: 0.05em; color: var(--accent); font-family: var(--mono); }
+    .site-subtitle {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
     .metrics-row { display: flex; flex-wrap: wrap; gap: 6px; }
     .metric-chip {
       font-family: var(--mono);
@@ -74,6 +88,62 @@
       white-space: nowrap;
     }
     .metric-chip b { color: var(--text); font-weight: 500; }
+    .global-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel) 90%, #000);
+    }
+    .global-nav a {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+      transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+    }
+    .global-nav a:hover {
+      color: var(--text);
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+      background: color-mix(in srgb, var(--panel2) 78%, transparent);
+      text-decoration: none;
+    }
+    .global-nav a.active {
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .account-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .account-chip a {
+      color: var(--text);
+      text-decoration: none;
+    }
+    .account-chip a:hover {
+      text-decoration: underline;
+    }
 
     /* Tab bar */
     .tabbar {
@@ -1179,7 +1249,16 @@
   <div class="topbar">
     <div class="topbar-left">
       <span class="site-title">STREAM CONTROL</span>
+      <span class="site-subtitle">Stoarama</span>
       <div class="metrics-row" id="metricsRow"></div>
+    </div>
+    <div class="topbar-right">
+      <nav class="global-nav" aria-label="Global">
+        <a href="/dashboard" class="active">Dashboard</a>
+        <a id="accountNavLink" href="/account">Account</a>
+        <a href="/docs/youtube-relay-source">Relay Docs</a>
+      </nav>
+      <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
     </div>
   </div>
 
@@ -2046,6 +2125,8 @@ const inferencesPanel = $('inferencesPanel');
 const serversPanel = $('serversPanel');
 const recordingPanel = $('recordingPanel');
 const detailPanel = $('detailPanel');
+const accountNavLink = $('accountNavLink');
+const topbarAccountStatus = $('topbarAccountStatus');
 
 // top tabs
 const tabOverview = $('tabOverview');
@@ -2942,7 +3023,27 @@ async function setStreamRecordingState(streamID, recordingState) {
   if (normalized !== 'on' && normalized !== 'off') {
     throw new Error('recording_state must be on or off');
   }
-  return patchStreamFields(streamID, { recording_state: normalized });
+  try {
+    if (normalized === 'on') {
+      const stream = await loadStreamForAssignment(streamID);
+      return assignRecordingStream(stream, 'dashboard stream toggle');
+    }
+    const confirmToken = `unassign:${streamID}`;
+    const entered = window.prompt(`Type ${confirmToken} to stop recording for stream ${streamID}.`, '');
+    if (String(entered || '').trim() !== confirmToken) {
+      throw new Error(`recording disable cancelled (confirmation must equal ${confirmToken})`);
+    }
+    return fetchJSON(`/api/v1/recording/streams/${streamID}/unassign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        confirm: confirmToken,
+        reason: 'dashboard stream toggle',
+      }),
+    });
+  } catch (err) {
+    throw new Error(formatAccountAuthError(err, 'recording changes require a signed-in account'));
+  }
 }
 
 // ─── Loading overlay ─────────────────────────────────────────────────────────
@@ -2985,6 +3086,47 @@ async function fetchJSON(path, opts = {}) {
   const payload = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(payload.error || `http ${res.status}`);
   return payload;
+}
+
+function dashboardRedirectPath() {
+  const path = `${window.location.pathname || '/dashboard'}${window.location.search || ''}${window.location.hash || ''}`;
+  return path.startsWith('/') ? path : '/dashboard';
+}
+
+function accountRedirectURL() {
+  return `/account?redirect_path=${encodeURIComponent(dashboardRedirectPath())}`;
+}
+
+function isUnauthorizedMessage(message) {
+  const normalized = String(message || '').trim().toLowerCase();
+  return normalized === 'unauthorized' || normalized.includes('http 401') || normalized.includes('401');
+}
+
+function formatAccountAuthError(err, prefix = 'signed-in account required') {
+  const message = String(err && err.message ? err.message : err || '').trim();
+  if (!isUnauthorizedMessage(message)) {
+    return message || prefix;
+  }
+  return `${prefix}. Sign in at ${accountRedirectURL()}`;
+}
+
+async function refreshTopbarAccountStatus() {
+  if (!(topbarAccountStatus instanceof HTMLElement)) return;
+  const accountHref = accountRedirectURL();
+  if (accountNavLink instanceof HTMLAnchorElement) {
+    accountNavLink.href = accountHref;
+  }
+  try {
+    const payload = await fetchJSON('/api/v1/account/me');
+    const account = payload && payload.account ? payload.account : {};
+    const email = String(account.email || '').trim();
+    const authType = String(account.auth_type || '').trim();
+    topbarAccountStatus.innerHTML = email
+      ? `<a href="${accountHref}">${esc(email)}</a>${authType ? ` <span class="muted">· ${esc(authType)}</span>` : ''}`
+      : `<a href="${accountHref}">Account</a>`;
+  } catch (_) {
+    topbarAccountStatus.innerHTML = `<a href="${accountHref}">Sign in for recording</a>`;
+  }
 }
 
 // ─── Status helpers ──────────────────────────────────────────────────────────
@@ -6607,7 +6749,7 @@ if (serversAssignmentsRows) {
         await Promise.all([loadServers(), loadServersAssignments(), loadRecordingCapacity(), loadOverview(), loadRecStreams()]);
         setServersAssignmentsStatus('updated', 'ok');
       } catch (err) {
-        setServersAssignmentsStatus(String(err), 'err');
+        setServersAssignmentsStatus(formatAccountAuthError(err, 'recording changes require a signed-in account'), 'err');
       }
     })();
   });
@@ -6624,7 +6766,7 @@ if (serversAssignOpen) {
       }
       setServersAssignStatus(`assigned stream ${Number(stream.id || streamID)}`, 'ok');
     } catch (err) {
-      setServersAssignStatus(String(err), 'err');
+      setServersAssignStatus(formatAccountAuthError(err, 'recording changes require a signed-in account'), 'err');
     }
   });
 }
@@ -7478,6 +7620,7 @@ document.addEventListener('keydown', (e) => {
 
 (async function init() {
   try {
+    void refreshTopbarAccountStatus();
     setDetailSubView('coverage');
 
     if (detailStreamID) {

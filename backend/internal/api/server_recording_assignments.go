@@ -879,6 +879,9 @@ func (s *Server) handleRecordingStreamAssign(w http.ResponseWriter, r *http.Requ
 	if actor == "" {
 		actor = "api.recording_assign"
 	}
+	if principal, ok := accountPrincipalFromContext(r.Context()); ok {
+		actor = accountActorLabel(principal, actor)
+	}
 
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
@@ -934,6 +937,9 @@ func (s *Server) handleRecordingStreamUnassign(w http.ResponseWriter, r *http.Re
 	actor := strings.TrimSpace(req.Actor)
 	if actor == "" {
 		actor = "api.recording_unassign"
+	}
+	if principal, ok := accountPrincipalFromContext(r.Context()); ok {
+		actor = accountActorLabel(principal, actor)
 	}
 
 	tx, err := s.pool.Begin(r.Context())
