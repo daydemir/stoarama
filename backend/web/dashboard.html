@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Sto-A-Rama Control Plane</title>
+  <title>Sto-A-Rama Dashboard</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -146,83 +146,6 @@
     }
     .account-chip a:hover {
       text-decoration: underline;
-    }
-    .scope-banner {
-      display: grid;
-      grid-template-columns: minmax(0, 1.7fr) minmax(320px, 1fr);
-      gap: 14px;
-      margin-bottom: 14px;
-    }
-    .scope-panel {
-      background: color-mix(in srgb, var(--panel) 94%, #000);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 16px 18px;
-      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.16);
-    }
-    .scope-eyebrow {
-      margin-bottom: 8px;
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-    }
-    .scope-title {
-      font-size: clamp(28px, 4vw, 40px);
-      line-height: 0.96;
-      letter-spacing: -0.03em;
-      margin-bottom: 10px;
-      max-width: 860px;
-    }
-    .scope-copy {
-      max-width: 820px;
-      color: var(--muted);
-      line-height: 1.55;
-    }
-    .scope-notes {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 14px;
-    }
-    .scope-note {
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 88%, transparent);
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-    }
-    .scope-grid {
-      display: grid;
-      gap: 10px;
-      align-content: start;
-    }
-    .scope-list {
-      display: grid;
-      gap: 8px;
-      margin-top: 8px;
-    }
-    .scope-item {
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 72%, transparent);
-    }
-    .scope-item strong {
-      display: block;
-      margin-bottom: 4px;
-      font-size: 12px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      font-family: var(--mono);
-    }
-    .scope-item span {
-      display: block;
-      color: var(--muted);
-      line-height: 1.45;
     }
     .overview-card-grid {
       display: grid;
@@ -1506,9 +1429,6 @@
       min-height: 16px;
     }
     @media (max-width: 1100px) {
-      .scope-banner {
-        grid-template-columns: 1fr;
-      }
       .filter-grid-primary,
       .filter-grid-secondary {
         grid-template-columns: 1fr;
@@ -1535,7 +1455,7 @@
   <div class="topbar">
     <div class="topbar-left">
       <span class="site-title">STO-A-RAMA</span>
-      <span class="site-subtitle">Control Plane</span>
+      <span class="site-subtitle">Dashboard</span>
       <div class="metrics-row" id="metricsRow"></div>
     </div>
     <div class="topbar-right">
@@ -1548,50 +1468,19 @@
     </div>
   </div>
 
-  <div class="scope-banner">
-    <section class="scope-panel">
-      <div class="scope-eyebrow">Product Scope</div>
-      <div class="scope-title">Canonical streams, recording runtime, fleet operations, and inference provenance.</div>
-      <div class="scope-copy">Use Sto-A-Rama for product control-plane work. Thesis discovery, prelabels, benchmarks, and ground-truth review stay in Social Isolation and should not shape the primary dashboard here.</div>
-      <div class="scope-notes">
-        <span class="scope-note">Canonical catalog</span>
-        <span class="scope-note">Recording controls</span>
-        <span class="scope-note">Node and server fleet</span>
-        <span class="scope-note">Inference runs and provenance</span>
-      </div>
-    </section>
-    <section class="scope-grid">
-      <div class="scope-panel">
-        <div class="scope-eyebrow">Owns</div>
-        <div class="scope-list">
-          <div class="scope-item"><strong>Catalog</strong><span>Streams, tags, capture profiles, and recording state.</span></div>
-          <div class="scope-item"><strong>Runtime</strong><span>Recording health, assignments, intervals, and operator-facing fleet controls.</span></div>
-          <div class="scope-item"><strong>Provenance</strong><span>Pipeline versions, runs, result rows, and evaluation references attached to canonical media.</span></div>
-        </div>
-      </div>
-      <div class="scope-panel">
-        <div class="scope-eyebrow">Outside Sto-A-Rama</div>
-        <div class="scope-list">
-          <div class="scope-item"><strong>Research Discovery</strong><span>Thesis stream intake, local review history, and prelabel sweeps belong in Social Isolation.</span></div>
-          <div class="scope-item"><strong>Ground Truth Workflows</strong><span>Benchmark authoring, CVAT exports, and experiment iteration stay thesis-side even when they reference Sto-A-Rama media.</span></div>
-        </div>
-      </div>
-    </section>
-  </div>
-
   <!-- Tab bar -->
   <div class="tabbar">
     <button class="tab-btn active" id="tabOverview">Overview</button>
-    <button class="tab-btn" id="tabStreams">Catalog</button>
+    <button class="tab-btn" id="tabStreams">Streams</button>
     <button class="tab-btn" id="tabRecording">Recording</button>
-    <button class="tab-btn" id="tabOperations">Operations</button>
+    <button class="tab-btn" id="tabOperations">Tools</button>
   </div>
 
   <!-- OVERVIEW PANEL -->
   <div id="overviewPanel">
     <div class="rec-settings-panel" style="margin-bottom:10px;">
       <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Platform Snapshot</span>
+        <span class="fw600 fs11">At a Glance</span>
         <span class="status-text" id="overviewStatus"></span>
       </div>
       <div class="metrics-row" id="overviewSummaryChips"></div>
@@ -1600,42 +1489,37 @@
     <div class="rec-settings-panel">
       <div class="panel-intro">
         <div class="panel-intro-main">
-          <div class="panel-intro-kicker">Workspace Split</div>
-          <div class="panel-intro-title">Keep Sto-A-Rama on the product path.</div>
-          <div class="panel-intro-copy">Catalog and recording stay front and center. Account access and relay setup support those product workflows. Intake, compute, and fleet live in the operations workspace, while thesis-only curation and evaluation authoring stay outside the control plane.</div>
+          <div class="panel-intro-kicker">Overview</div>
+          <div class="panel-intro-title">Manage streams, recording, and tools in one place.</div>
+          <div class="panel-intro-copy">Find streams, check recording, manage your account, and open extra tools when you need them.</div>
         </div>
-        <div class="panel-intro-meta">Product runtime first, thesis workflow elsewhere</div>
+        <div class="panel-intro-meta">Everyday use first</div>
       </div>
       <div class="overview-card-grid">
         <article class="overview-card">
-          <div class="overview-card-title">Catalog</div>
-          <strong>Canonical stream inventory and metadata.</strong>
-          <p>Search the live registry, inspect locations, update tags, and manage capture profiles without mixing in thesis-local context.</p>
+          <div class="overview-card-title">Streams</div>
+          <strong>Live streams, places, and settings.</strong>
+          <p>Search the full stream list, inspect locations, update tags, and manage capture settings.</p>
           <div class="overview-card-actions">
-            <a class="overview-card-link" href="/dashboard/streams">Open Catalog</a>
+            <a class="overview-card-link" href="/dashboard/streams">Open Streams</a>
           </div>
         </article>
         <article class="overview-card">
           <div class="overview-card-title">Recording</div>
-          <strong>Runtime health, direct actions, and coverage.</strong>
-          <p>See what is actively capturing, inspect stream health, and use account-gated recording actions through the same operational model the CLIs use.</p>
+          <strong>Recording status, quick actions, and history.</strong>
+          <p>See what is recording now, check stream health, and use signed-in recording controls from the same page.</p>
           <div class="overview-card-actions">
             <a class="overview-card-link" href="/dashboard/recording">Open Recording</a>
             <a class="overview-card-link" href="/account">Account Access</a>
           </div>
         </article>
         <article class="overview-card">
-          <div class="overview-card-title">Operations</div>
-          <strong>Intake, compute throughput, and fleet state.</strong>
-          <p>Admin import review, inference backlog, and live server capacity are still available here, but grouped away from the day-to-day catalog and recording path.</p>
+          <div class="overview-card-title">Tools</div>
+          <strong>Imports, processing, and servers.</strong>
+          <p>Use the extra tools here to review imports, check processing queues, and see server capacity.</p>
           <div class="overview-card-actions">
-            <a class="overview-card-link" href="/dashboard/pipelines">Open Operations</a>
+            <a class="overview-card-link" href="/dashboard/pipelines">Open Tools</a>
           </div>
-        </article>
-        <article class="overview-card">
-          <div class="overview-card-title">Social Isolation</div>
-          <strong>Thesis curation, prelabels, and validation authoring.</strong>
-          <p>Sto-A-Rama can reference evaluation metadata, but thesis-specific discovery review, corpus shaping, and benchmark workflow should not drive the main product interface.</p>
         </article>
       </div>
     </div>
@@ -1644,8 +1528,8 @@
   <!-- STREAMS PANEL -->
   <div id="streamsPanel" style="display:none;">
     <div class="domain-intro">
-      <div class="domain-intro-title">Canonical Catalog</div>
-      <div class="domain-intro-copy">This is the product stream registry: canonical metadata, capture settings, tags, and recording state.</div>
+      <div class="domain-intro-title">Streams</div>
+      <div class="domain-intro-copy">Browse every stream, location, tag, and recording setting in one place.</div>
     </div>
     <div class="filter-stack-card">
       <div class="filter-grid filter-grid-primary">
@@ -1759,12 +1643,12 @@
 
   <div id="operationsPanel" style="display:none;">
     <div class="domain-intro operations-shell">
-      <div class="domain-intro-title">Operations Workspace</div>
-      <div class="operations-copy">Use this area for admin intake, compute runtime, and fleet state. Shared validation metadata can still be referenced here, but workflow authoring stays outside the control plane.</div>
+      <div class="domain-intro-title">More Tools</div>
+      <div class="operations-copy">Use these pages for stream imports, processing jobs, and server status.</div>
       <div class="subtabs">
-        <button class="subtab-btn" id="opsViewDiscovery">Intake</button>
-        <button class="subtab-btn active" id="opsViewPipelines">Inference</button>
-        <button class="subtab-btn" id="opsViewServers">Fleet</button>
+        <button class="subtab-btn" id="opsViewDiscovery">Imports</button>
+        <button class="subtab-btn active" id="opsViewPipelines">Processing</button>
+        <button class="subtab-btn" id="opsViewServers">Servers</button>
       </div>
     </div>
   </div>
@@ -1772,8 +1656,8 @@
   <!-- DISCOVERY PANEL -->
   <div id="discoveryPanel" style="display:none;">
     <div class="domain-intro">
-      <div class="domain-intro-title">Import Intake</div>
-      <div class="domain-intro-copy">Keep this queue limited to admin-curated stream import review before new entries become canonical streams.</div>
+      <div class="domain-intro-title">Stream Imports</div>
+      <div class="domain-intro-copy">Review stream imports here before they are added to the main stream list.</div>
     </div>
     <div class="toolbar">
       <select id="discoveryReviewFilter" style="min-width:180px;">
@@ -1796,7 +1680,7 @@
           <tr>
             <th>ID</th>
             <th>Candidate</th>
-            <th>Canonical</th>
+            <th>Existing Stream</th>
             <th>Review</th>
             <th>Source</th>
             <th>Actions</th>
@@ -1810,12 +1694,12 @@
   <!-- PIPELINES PANEL -->
   <div id="inferencesPanel" style="display:none;">
     <div class="domain-intro">
-      <div class="domain-intro-title">Inference Operations</div>
-      <div class="domain-intro-copy">Sto-A-Rama tracks registered pipelines, queue health, runs, and result provenance against canonical media. Attached validation metadata can live here, but runtime and provenance remain the primary product concern.</div>
+      <div class="domain-intro-title">Processing</div>
+      <div class="domain-intro-copy">Check processing queues, recent runs, and results for recorded media.</div>
     </div>
     <div class="rec-settings-panel" style="margin-bottom:10px;">
       <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Inference Queue</span>
+        <span class="fw600 fs11">Processing Queue</span>
         <button id="pipelineOverviewReload" class="btn-sm">Reload</button>
         <span class="status-text" id="pipelineOverviewStatus"></span>
       </div>
@@ -1909,12 +1793,12 @@
         <button id="pipelineDetailReload" class="btn-sm">Reload</button>
         <span class="status-text" id="pipelineDetailStatus"></span>
       </div>
-      <div id="pipelineDetailEmpty" class="muted fs11">Select a pipeline above to inspect versions, runs, catalog reach, and optional validation metadata.</div>
+      <div id="pipelineDetailEmpty" class="muted fs11">Select a pipeline above to inspect versions, runs, matching streams, and optional validation data.</div>
       <div id="pipelineDetailBody" style="display:none;">
         <div class="metrics-row" id="pipelineDetailChips"></div>
         <div class="toolbar" style="margin-top:8px;">
           <button id="pipelineDetailShowInference" class="btn-sm">Filter Results To Pipeline</button>
-          <button id="pipelineDetailShowStreams" class="btn-sm">Show Catalog Matches</button>
+          <button id="pipelineDetailShowStreams" class="btn-sm">Show Matching Streams</button>
           <button id="pipelineDetailClearStreams" class="btn-sm">Clear Stream Filter</button>
           <span class="status-text" id="pipelineExperimentStatus"></span>
         </div>
@@ -1946,7 +1830,7 @@
         </div>
         <div class="detail-section-head" style="margin-top:10px;">
           <div class="detail-section-title">Pipeline Reach</div>
-          <div class="detail-section-subtitle">Canonical streams with at least one inference result from this pipeline.</div>
+          <div class="detail-section-subtitle">Streams with at least one result from this pipeline.</div>
         </div>
         <div class="tbl-wrap">
           <table id="pipelineTouchedStreamsTable">
@@ -1967,7 +1851,7 @@
           <summary>Advanced evaluation context</summary>
           <div class="detail-section-head" style="margin-top:10px;">
             <div class="detail-section-title">Evaluation Suites</div>
-            <div class="detail-section-subtitle">Reference suites linked to this pipeline’s provenance and shared evaluation history.</div>
+            <div class="detail-section-subtitle">Reference suites linked to this pipeline’s evaluation history.</div>
           </div>
           <div class="tbl-wrap">
             <table id="pipelineEvalSuitesTable">
@@ -2015,8 +1899,8 @@
   <!-- SERVERS PANEL -->
   <div id="serversPanel" style="display:none;">
     <div class="domain-intro">
-      <div class="domain-intro-title">Fleet Operations</div>
-      <div class="domain-intro-copy">Use this surface for live server capacity, assignments, and runtime health across the active Sto-A-Rama fleet.</div>
+      <div class="domain-intro-title">Servers</div>
+      <div class="domain-intro-copy">Check live server capacity, assignments, and health across Sto-A-Rama.</div>
     </div>
     <div class="toolbar">
       <label class="check-label fs11" style="color:var(--muted);">Lookback (hours)</label>
@@ -2090,8 +1974,8 @@
   <!-- RECORDING PANEL -->
   <div id="recordingPanel" style="display:none;">
     <div class="domain-intro">
-      <div class="domain-intro-title">Recording Operations</div>
-      <div class="domain-intro-copy">Recording is a product runtime concern: global interval, live health, assignment state, and historical coverage for canonical streams.</div>
+      <div class="domain-intro-title">Recording</div>
+      <div class="domain-intro-copy">Manage the global recording schedule, live health, assignments, and coverage for streams.</div>
     </div>
     <div class="rec-settings-panel">
       <div class="row" style="gap:10px; margin-bottom:10px;">
@@ -2128,7 +2012,7 @@
         <thead>
           <tr>
             <th data-sort-key="name">Stream</th>
-            <th data-sort-key="runtime_status">Runtime status</th>
+            <th data-sort-key="runtime_status">Status</th>
             <th data-sort-key="latest_captured_at">Health</th>
             <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
             <th data-sort-key="tags_count">Tags</th>
@@ -2144,7 +2028,7 @@
   <div id="detailPanel" style="display:none;">
     <div class="detail-header">
       <div class="detail-header-left">
-        <a href="/dashboard/streams" class="back-link" id="backLink">&#8592; Catalog</a>
+        <a href="/dashboard/streams" class="back-link" id="backLink">&#8592; Streams</a>
         <div class="detail-title" id="detailTitle"></div>
         <div class="detail-meta" id="detailMeta"></div>
         <div id="detailTagEditor"></div>
@@ -4217,7 +4101,7 @@ function renderDetailCurrentPath(payload) {
     assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : esc('unassigned'),
     [
       assignment && assignment.assigned_at ? `assigned ${esc(formatDateTimeShort(assignment.assigned_at))}` : '',
-      runtime && runtime.status ? `runtime ${esc(String(runtime.status))}` : '',
+      runtime && runtime.status ? `status ${esc(String(runtime.status))}` : '',
       runtime && runtime.last_resolved_at ? `resolved ${esc(formatDateTimeShort(runtime.last_resolved_at))}` : '',
     ].filter(Boolean).join('<br/>')
   ));
