@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Stoarama Account</title>
+  <title>Sto-A-Rama Account</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -161,6 +161,15 @@
       color: var(--muted);
       font-family: var(--mono);
       font-size: 11px;
+    }
+    .hero-split {
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 72%, transparent);
+      color: var(--muted);
+      line-height: 1.5;
     }
     .hero-side {
       display: grid;
@@ -488,14 +497,14 @@
   <div class="shell">
     <div class="topbar">
       <div class="topbar-left">
-        <span class="site-title">STREAM CONTROL</span>
-        <span class="site-subtitle">Stoarama Account</span>
+        <span class="site-title">STO-A-RAMA</span>
+        <span class="site-subtitle">Account</span>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
         <nav class="global-nav" aria-label="Global">
           <a href="/dashboard">Dashboard</a>
           <a href="/account" class="active">Account</a>
-          <a href="/docs/youtube-relay-source">Relay Docs</a>
+          <a href="/docs/youtube-relay-source">Relay Guide</a>
         </nav>
         <div class="account-chip" id="accountChip">Checking session...</div>
       </div>
@@ -504,7 +513,7 @@
     <div class="hero">
       <section class="panel hero-copy">
         <div class="eyebrow">Public catalog + account automation</div>
-        <h1>Access Stoarama data without guessing the auth model.</h1>
+        <h1>Account access for Sto-A-Rama product workflows.</h1>
         <p>Public stream metadata stays open. Sign in when you want to turn recording on, browse recorded clips, create API keys for scripts, or manage relay nodes from the same account.</p>
         <div class="hero-notes">
           <span class="hero-note">Public stream search</span>
@@ -512,6 +521,7 @@
           <span class="hero-note">API keys for scripts and downloads</span>
           <span class="hero-note">Clip browser with batch prepare</span>
         </div>
+        <div class="hero-split">Sto-A-Rama owns product access, canonical media, and runtime control. Thesis discovery, prelabels, and benchmark workflows stay in Social Isolation even when they reference Sto-A-Rama streams and clips.</div>
       </section>
       <section class="panel hero-side session-card">
         <div>
@@ -713,7 +723,7 @@
             <div class="eyebrow">Relay</div>
             <h2>YouTube relay source</h2>
           </div>
-          <p>Run the Stoarama CLI locally when a source needs browser cookies on your machine.</p>
+          <p>Run the Sto-A-Rama CLI locally when a source needs browser cookies on your machine.</p>
         </div>
         <div class="button-row">
           <a href="/docs/youtube-relay-source">Open install guide</a>
