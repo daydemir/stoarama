@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Stream Control</title>
+  <title>Sto-A-Rama Control Plane</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -42,7 +42,9 @@
     body {
       font-family: var(--sans);
       font-size: 13px;
-      background: var(--bg);
+      background:
+        radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 10%, transparent) 0, transparent 24%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #000) 0%, var(--bg) 58%, color-mix(in srgb, var(--bg) 88%, #07101f) 100%);
       color: var(--text);
       min-height: 100vh;
     }
@@ -55,12 +57,13 @@
     /* Topbar */
     .topbar {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
+      flex-wrap: wrap;
       margin-bottom: 14px;
     }
-    .topbar-left { display: flex; align-items: baseline; gap: 10px; }
+    .topbar-left { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
     .topbar-right {
       display: flex;
       align-items: center;
@@ -144,14 +147,187 @@
     .account-chip a:hover {
       text-decoration: underline;
     }
+    .scope-banner {
+      display: grid;
+      grid-template-columns: minmax(0, 1.7fr) minmax(320px, 1fr);
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .scope-panel {
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.16);
+    }
+    .scope-eyebrow {
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .scope-title {
+      font-size: clamp(28px, 4vw, 40px);
+      line-height: 0.96;
+      letter-spacing: -0.03em;
+      margin-bottom: 10px;
+      max-width: 860px;
+    }
+    .scope-copy {
+      max-width: 820px;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+    .scope-notes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .scope-note {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 88%, transparent);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .scope-grid {
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+    .scope-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .scope-item {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 72%, transparent);
+    }
+    .scope-item strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-family: var(--mono);
+    }
+    .scope-item span {
+      display: block;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .overview-card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .overview-card {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 140px;
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 76%, transparent);
+    }
+    .overview-card-title {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .overview-card strong {
+      display: block;
+      font-size: 16px;
+      line-height: 1.2;
+      color: var(--text);
+    }
+    .overview-card p {
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .overview-card-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: auto;
+    }
+    .overview-card-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 30px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 88%, #000);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      text-decoration: none;
+    }
+    .overview-card-link:hover {
+      text-decoration: none;
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+      color: var(--accent);
+    }
+    .panel-intro {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px 16px;
+      margin-bottom: 12px;
+    }
+    .panel-intro-main {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .panel-intro-kicker {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .panel-intro-title {
+      font-size: 18px;
+      line-height: 1.15;
+      font-weight: 600;
+    }
+    .panel-intro-copy {
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 860px;
+    }
+    .panel-intro-meta {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
 
     /* Tab bar */
     .tabbar {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: 8px;
-      width: max-content;
-      max-width: 100%;
+      width: 100%;
       padding: 6px;
       border: 1px solid var(--border);
       border-radius: 10px;
@@ -607,7 +783,104 @@
     }
     .detail-history summary:hover { color: var(--accent); }
     .detail-history summary::-webkit-details-marker { display: none; }
-
+    .domain-intro {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 10px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--panel2) 72%, var(--panel));
+    }
+    .domain-intro-title {
+      font-size: 11px;
+      font-family: var(--mono);
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .domain-intro-copy {
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 920px;
+    }
+    .operations-shell {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .operations-copy {
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 1100px;
+    }
+    .filter-stack-card {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 10px;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+    }
+    .filter-grid {
+      display: grid;
+      gap: 10px 12px;
+    }
+    .filter-grid-primary {
+      grid-template-columns: minmax(260px, 2.1fr) repeat(2, minmax(170px, 1fr));
+    }
+    .filter-grid-secondary {
+      grid-template-columns: repeat(5, minmax(140px, 1fr));
+      padding-top: 12px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+    }
+    .filter-field {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .filter-field-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .filter-footer {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px 14px;
+    }
+    .filter-footer .row {
+      gap: 8px;
+    }
+    .filter-status-row {
+      margin-bottom: 8px;
+    }
+    .secondary-card {
+      margin-top: 10px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+    }
+    .secondary-card summary {
+      cursor: pointer;
+      list-style: none;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .secondary-card summary::-webkit-details-marker { display: none; }
+    .secondary-card-body {
+      margin-top: 10px;
+    }
     /* Detail header */
     .detail-header {
       display: flex;
@@ -1233,6 +1506,19 @@
       min-height: 16px;
     }
     @media (max-width: 1100px) {
+      .scope-banner {
+        grid-template-columns: 1fr;
+      }
+      .filter-grid-primary,
+      .filter-grid-secondary {
+        grid-template-columns: 1fr;
+      }
+      .panel-intro {
+        align-items: flex-start;
+      }
+      .panel-intro-meta {
+        white-space: normal;
+      }
       .image-modal-main {
         grid-template-columns: 1fr;
         grid-template-rows: minmax(0, 1fr) auto;
@@ -1248,106 +1534,198 @@
   <!-- Topbar -->
   <div class="topbar">
     <div class="topbar-left">
-      <span class="site-title">STREAM CONTROL</span>
-      <span class="site-subtitle">Stoarama</span>
+      <span class="site-title">STO-A-RAMA</span>
+      <span class="site-subtitle">Control Plane</span>
       <div class="metrics-row" id="metricsRow"></div>
     </div>
     <div class="topbar-right">
       <nav class="global-nav" aria-label="Global">
         <a href="/dashboard" class="active">Dashboard</a>
         <a id="accountNavLink" href="/account">Account</a>
-        <a href="/docs/youtube-relay-source">Relay Docs</a>
+        <a href="/docs/youtube-relay-source">Relay Guide</a>
       </nav>
       <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
     </div>
   </div>
 
+  <div class="scope-banner">
+    <section class="scope-panel">
+      <div class="scope-eyebrow">Product Scope</div>
+      <div class="scope-title">Canonical streams, recording runtime, fleet operations, and inference provenance.</div>
+      <div class="scope-copy">Use Sto-A-Rama for product control-plane work. Thesis discovery, prelabels, benchmarks, and ground-truth review stay in Social Isolation and should not shape the primary dashboard here.</div>
+      <div class="scope-notes">
+        <span class="scope-note">Canonical catalog</span>
+        <span class="scope-note">Recording controls</span>
+        <span class="scope-note">Node and server fleet</span>
+        <span class="scope-note">Inference runs and provenance</span>
+      </div>
+    </section>
+    <section class="scope-grid">
+      <div class="scope-panel">
+        <div class="scope-eyebrow">Owns</div>
+        <div class="scope-list">
+          <div class="scope-item"><strong>Catalog</strong><span>Streams, tags, capture profiles, and recording state.</span></div>
+          <div class="scope-item"><strong>Runtime</strong><span>Recording health, assignments, intervals, and operator-facing fleet controls.</span></div>
+          <div class="scope-item"><strong>Provenance</strong><span>Pipeline versions, runs, result rows, and evaluation references attached to canonical media.</span></div>
+        </div>
+      </div>
+      <div class="scope-panel">
+        <div class="scope-eyebrow">Outside Sto-A-Rama</div>
+        <div class="scope-list">
+          <div class="scope-item"><strong>Research Discovery</strong><span>Thesis stream intake, local review history, and prelabel sweeps belong in Social Isolation.</span></div>
+          <div class="scope-item"><strong>Ground Truth Workflows</strong><span>Benchmark authoring, CVAT exports, and experiment iteration stay thesis-side even when they reference Sto-A-Rama media.</span></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
   <!-- Tab bar -->
   <div class="tabbar">
     <button class="tab-btn active" id="tabOverview">Overview</button>
-    <button class="tab-btn" id="tabStreams">Streams</button>
-    <button class="tab-btn" id="tabDiscovery">Discovery</button>
+    <button class="tab-btn" id="tabStreams">Catalog</button>
     <button class="tab-btn" id="tabRecording">Recording</button>
-    <button class="tab-btn" id="tabPipelines">Pipelines</button>
-    <button class="tab-btn" id="tabServers">Servers</button>
+    <button class="tab-btn" id="tabOperations">Operations</button>
   </div>
 
   <!-- OVERVIEW PANEL -->
   <div id="overviewPanel">
     <div class="rec-settings-panel" style="margin-bottom:10px;">
       <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">System Overview</span>
+        <span class="fw600 fs11">Platform Snapshot</span>
         <span class="status-text" id="overviewStatus"></span>
       </div>
       <div class="metrics-row" id="overviewSummaryChips"></div>
       <div class="metrics-row" id="overviewQueueChips" style="margin-top:8px;"></div>
     </div>
     <div class="rec-settings-panel">
-      <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Quick Paths</span>
-        <span class="muted fs11">Overview is summary-only. Use the domain tabs for details and actions.</span>
+      <div class="panel-intro">
+        <div class="panel-intro-main">
+          <div class="panel-intro-kicker">Workspace Split</div>
+          <div class="panel-intro-title">Keep Sto-A-Rama on the product path.</div>
+          <div class="panel-intro-copy">Catalog and recording stay front and center. Account access and relay setup support those product workflows. Intake, compute, and fleet live in the operations workspace, while thesis-only curation and evaluation authoring stay outside the control plane.</div>
+        </div>
+        <div class="panel-intro-meta">Product runtime first, thesis workflow elsewhere</div>
       </div>
-      <div class="metrics-row">
-        <span class="metric-chip">Streams <b>catalog / config</b></span>
-        <span class="metric-chip">Discovery <b>review / import</b></span>
-        <span class="metric-chip">Recording <b>status / runs / coverage</b></span>
-        <span class="metric-chip">Pipelines <b>backlog / results</b></span>
-        <span class="metric-chip">Servers <b>fleet / capacity / assignments</b></span>
+      <div class="overview-card-grid">
+        <article class="overview-card">
+          <div class="overview-card-title">Catalog</div>
+          <strong>Canonical stream inventory and metadata.</strong>
+          <p>Search the live registry, inspect locations, update tags, and manage capture profiles without mixing in thesis-local context.</p>
+          <div class="overview-card-actions">
+            <a class="overview-card-link" href="/dashboard/streams">Open Catalog</a>
+          </div>
+        </article>
+        <article class="overview-card">
+          <div class="overview-card-title">Recording</div>
+          <strong>Runtime health, direct actions, and coverage.</strong>
+          <p>See what is actively capturing, inspect stream health, and use account-gated recording actions through the same operational model the CLIs use.</p>
+          <div class="overview-card-actions">
+            <a class="overview-card-link" href="/dashboard/recording">Open Recording</a>
+            <a class="overview-card-link" href="/account">Account Access</a>
+          </div>
+        </article>
+        <article class="overview-card">
+          <div class="overview-card-title">Operations</div>
+          <strong>Intake, compute throughput, and fleet state.</strong>
+          <p>Admin import review, inference backlog, and live server capacity are still available here, but grouped away from the day-to-day catalog and recording path.</p>
+          <div class="overview-card-actions">
+            <a class="overview-card-link" href="/dashboard/pipelines">Open Operations</a>
+          </div>
+        </article>
+        <article class="overview-card">
+          <div class="overview-card-title">Social Isolation</div>
+          <strong>Thesis curation, prelabels, and validation authoring.</strong>
+          <p>Sto-A-Rama can reference evaluation metadata, but thesis-specific discovery review, corpus shaping, and benchmark workflow should not drive the main product interface.</p>
+        </article>
       </div>
     </div>
   </div>
 
   <!-- STREAMS PANEL -->
   <div id="streamsPanel" style="display:none;">
-    <div class="toolbar">
-      <div class="subtabs">
-        <button class="subtab-btn active" id="streamViewTable">Table</button>
-        <button class="subtab-btn" id="streamViewMap">Map</button>
+    <div class="domain-intro">
+      <div class="domain-intro-title">Canonical Catalog</div>
+      <div class="domain-intro-copy">This is the product stream registry: canonical metadata, capture settings, tags, and recording state.</div>
+    </div>
+    <div class="filter-stack-card">
+      <div class="filter-grid filter-grid-primary">
+        <div class="filter-field">
+          <div class="filter-field-label">Search</div>
+          <input id="streamSearch" placeholder="Search stream / provider / slug" />
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Recording</div>
+          <select id="streamRecordingState">
+            <option value="" selected>all recording states</option>
+            <option value="on">recording on</option>
+            <option value="off">recording off</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Capture Type</div>
+          <select id="streamModeFilter">
+            <option value="">all capture types</option>
+          </select>
+        </div>
       </div>
-      <div class="toolbar-sep"></div>
-      <span class="status-text" id="streamsMapStatus"></span>
+      <div class="filter-grid filter-grid-secondary">
+        <div class="filter-field">
+          <div class="filter-field-label">Include Tag</div>
+          <select id="streamTagFilter">
+            <option value="">any tag</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Exclude Tag</div>
+          <select id="streamTagExcludeFilter">
+            <option value="">none</option>
+            <option value="archive" selected>archive</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Source</div>
+          <select id="sourceFilter">
+            <option value="">all sources</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Country</div>
+          <select id="countryFilter">
+            <option value="">all countries</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">City</div>
+          <select id="cityFilter">
+            <option value="">all cities</option>
+          </select>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="subtabs">
+          <button class="subtab-btn active" id="streamViewTable">Table</button>
+          <button class="subtab-btn" id="streamViewMap">Geographic View</button>
+        </div>
+        <div class="toolbar-sep"></div>
+        <span class="status-text" id="streamsMapStatus"></span>
+      </div>
+      <div class="filter-footer">
+        <div class="row">
+          <label class="check-label fs11" style="color:var(--muted);">Page size</label>
+          <select id="streamPageSize" style="width:80px;">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+          </select>
+          <button id="streamPrev">Prev</button>
+          <button id="streamNext">Next</button>
+          <span class="status-text" id="streamPageInfo">page 1/1</span>
+        </div>
+        <span class="status-text" id="streamStatus"></span>
+      </div>
     </div>
-    <!-- Sub-filter + toolbar -->
-    <div class="toolbar">
-      <input id="streamSearch" placeholder="Search stream / provider / slug" style="min-width:240px;" />
-      <select id="streamTagFilter" style="width:180px;">
-        <option value="">include tag: any</option>
-      </select>
-      <select id="streamTagExcludeFilter" style="width:180px;">
-        <option value="">exclude tag: none</option>
-        <option value="archive" selected>exclude tag: archive</option>
-      </select>
-      <select id="streamRecordingState" style="width:170px;">
-        <option value="" selected>recording: all</option>
-        <option value="on">recording on</option>
-        <option value="off">recording off</option>
-      </select>
-      <select id="streamModeFilter" style="min-width:170px;">
-        <option value="">capture type: all</option>
-      </select>
-      <select id="sourceFilter" style="min-width:160px;">
-        <option value="">source: all</option>
-      </select>
-      <select id="countryFilter" style="min-width:160px;">
-        <option value="">all countries</option>
-      </select>
-      <select id="cityFilter" style="min-width:160px;">
-        <option value="">all cities</option>
-      </select>
-      <div class="toolbar-sep"></div>
-      <select id="streamPageSize" style="width:80px;">
-        <option value="50">50</option>
-        <option value="100" selected>100</option>
-        <option value="200">200</option>
-        <option value="500">500</option>
-      </select>
-      <button id="streamPrev">Prev</button>
-      <button id="streamNext">Next</button>
-      <span class="status-text" id="streamPageInfo">page 1/1</span>
-      <div class="toolbar-sep"></div>
-      <span class="status-text" id="streamStatus"></span>
-    </div>
-    <div class="toolbar" style="margin-top:-4px; margin-bottom:8px;">
+    <div class="toolbar filter-status-row">
       <span class="status-text" id="streamFilterSummary"></span>
     </div>
 
@@ -1379,8 +1757,24 @@
     </div>
   </div>
 
+  <div id="operationsPanel" style="display:none;">
+    <div class="domain-intro operations-shell">
+      <div class="domain-intro-title">Operations Workspace</div>
+      <div class="operations-copy">Use this area for admin intake, compute runtime, and fleet state. Shared validation metadata can still be referenced here, but workflow authoring stays outside the control plane.</div>
+      <div class="subtabs">
+        <button class="subtab-btn" id="opsViewDiscovery">Intake</button>
+        <button class="subtab-btn active" id="opsViewPipelines">Inference</button>
+        <button class="subtab-btn" id="opsViewServers">Fleet</button>
+      </div>
+    </div>
+  </div>
+
   <!-- DISCOVERY PANEL -->
   <div id="discoveryPanel" style="display:none;">
+    <div class="domain-intro">
+      <div class="domain-intro-title">Import Intake</div>
+      <div class="domain-intro-copy">Keep this queue limited to admin-curated stream import review before new entries become canonical streams.</div>
+    </div>
     <div class="toolbar">
       <select id="discoveryReviewFilter" style="min-width:180px;">
         <option value="">review: all</option>
@@ -1415,9 +1809,13 @@
 
   <!-- PIPELINES PANEL -->
   <div id="inferencesPanel" style="display:none;">
+    <div class="domain-intro">
+      <div class="domain-intro-title">Inference Operations</div>
+      <div class="domain-intro-copy">Sto-A-Rama tracks registered pipelines, queue health, runs, and result provenance against canonical media. Attached validation metadata can live here, but runtime and provenance remain the primary product concern.</div>
+    </div>
     <div class="rec-settings-panel" style="margin-bottom:10px;">
       <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Queue Health</span>
+        <span class="fw600 fs11">Inference Queue</span>
         <button id="pipelineOverviewReload" class="btn-sm">Reload</button>
         <span class="status-text" id="pipelineOverviewStatus"></span>
       </div>
@@ -1511,12 +1909,12 @@
         <button id="pipelineDetailReload" class="btn-sm">Reload</button>
         <span class="status-text" id="pipelineDetailStatus"></span>
       </div>
-      <div id="pipelineDetailEmpty" class="muted fs11">Select a pipeline above to inspect versions, runs, touched streams, and experiment history.</div>
+      <div id="pipelineDetailEmpty" class="muted fs11">Select a pipeline above to inspect versions, runs, catalog reach, and optional validation metadata.</div>
       <div id="pipelineDetailBody" style="display:none;">
         <div class="metrics-row" id="pipelineDetailChips"></div>
         <div class="toolbar" style="margin-top:8px;">
-          <button id="pipelineDetailShowInference" class="btn-sm">Filter Inference To Pipeline</button>
-          <button id="pipelineDetailShowStreams" class="btn-sm">Show Touched Streams</button>
+          <button id="pipelineDetailShowInference" class="btn-sm">Filter Results To Pipeline</button>
+          <button id="pipelineDetailShowStreams" class="btn-sm">Show Catalog Matches</button>
           <button id="pipelineDetailClearStreams" class="btn-sm">Clear Stream Filter</button>
           <span class="status-text" id="pipelineExperimentStatus"></span>
         </div>
@@ -1547,8 +1945,8 @@
           </table>
         </div>
         <div class="detail-section-head" style="margin-top:10px;">
-          <div class="detail-section-title">Streams Touched</div>
-          <div class="detail-section-subtitle">Streams with at least one inference result from this pipeline.</div>
+          <div class="detail-section-title">Pipeline Reach</div>
+          <div class="detail-section-subtitle">Canonical streams with at least one inference result from this pipeline.</div>
         </div>
         <div class="tbl-wrap">
           <table id="pipelineTouchedStreamsTable">
@@ -1565,94 +1963,60 @@
             <tbody id="pipelineTouchedStreamsRows"></tbody>
           </table>
         </div>
-        <div class="detail-section-head" style="margin-top:10px;">
-          <div class="detail-section-title">Ground Truth Suites</div>
-          <div class="detail-section-subtitle">Benchmark suites linked to this pipeline’s experiment history.</div>
-        </div>
-        <div class="tbl-wrap">
-          <table id="pipelineEvalSuitesTable">
-            <thead>
-              <tr>
-                <th>Suite</th>
-                <th>Source</th>
-                <th>Items</th>
-                <th>Annotations</th>
-                <th>Primary Metric</th>
-              </tr>
-            </thead>
-            <tbody id="pipelineEvalSuitesRows"></tbody>
-          </table>
-        </div>
-        <div class="detail-section-head" style="margin-top:10px;">
-          <div class="detail-section-title">Autoresearch Log</div>
-          <div class="detail-section-subtitle">Metric progression and experiment changes over time for this pipeline.</div>
-        </div>
-        <div id="pipelineExperimentGraph" class="coverage-summary">No experiment series yet.</div>
-        <div class="tbl-wrap" style="margin-top:8px;">
-          <table id="pipelineExperimentsTable">
-            <thead>
-              <tr>
-                <th>Iteration</th>
-                <th>Status</th>
-                <th>Metric</th>
-                <th>Delta</th>
-                <th>Change</th>
-                <th>Ground Truth</th>
-                <th>Logs</th>
-              </tr>
-            </thead>
-            <tbody id="pipelineExperimentsRows"></tbody>
-          </table>
-        </div>
+        <details class="detail-history">
+          <summary>Advanced evaluation context</summary>
+          <div class="detail-section-head" style="margin-top:10px;">
+            <div class="detail-section-title">Evaluation Suites</div>
+            <div class="detail-section-subtitle">Reference suites linked to this pipeline’s provenance and shared evaluation history.</div>
+          </div>
+          <div class="tbl-wrap">
+            <table id="pipelineEvalSuitesTable">
+              <thead>
+                <tr>
+                  <th>Suite</th>
+                  <th>Source</th>
+                  <th>Items</th>
+                  <th>Annotations</th>
+                  <th>Primary Metric</th>
+                </tr>
+              </thead>
+              <tbody id="pipelineEvalSuitesRows"></tbody>
+            </table>
+          </div>
+        </details>
+        <details class="detail-history">
+          <summary>Advanced validation history</summary>
+          <div class="detail-section-head" style="margin-top:10px;">
+            <div class="detail-section-title">Validation Iteration History</div>
+            <div class="detail-section-subtitle">Optional metric progression and iteration notes attached to this pipeline.</div>
+          </div>
+          <div id="pipelineExperimentGraph" class="coverage-summary">No validation series yet.</div>
+          <div class="tbl-wrap" style="margin-top:8px;">
+            <table id="pipelineExperimentsTable">
+              <thead>
+                <tr>
+                  <th>Iteration</th>
+                  <th>Status</th>
+                  <th>Metric</th>
+                  <th>Delta</th>
+                  <th>Change</th>
+                  <th>Suites</th>
+                  <th>Logs</th>
+                </tr>
+              </thead>
+              <tbody id="pipelineExperimentsRows"></tbody>
+            </table>
+          </div>
+        </details>
       </div>
     </div>
   </div>
 
   <!-- SERVERS PANEL -->
   <div id="serversPanel" style="display:none;">
-    <div class="rec-settings-panel">
-      <div class="row" style="gap:10px; margin-bottom:10px;">
-        <span class="fw600 fs11">Server Capacity Groups</span>
-        <span class="muted fs11">Live capacity is heartbeat-managed and owned by the Servers domain.</span>
-      </div>
-      <div id="recordingCapacityRows" class="stack" style="gap:6px;"></div>
-      <div class="row" style="gap:8px; margin-top:8px;">
-        <button id="reloadRecordingCapacity" class="primary">Reload capacity</button>
-        <span class="status-text" id="recordingCapacityStatus"></span>
-      </div>
-    </div>
-    <div class="rec-settings-panel" style="margin-bottom:10px;">
-      <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Manual Assignment</span>
-        <span class="muted fs11">Assign a stream from the Servers domain using live capacity.</span>
-      </div>
-      <div class="toolbar">
-        <label class="check-label fs11" style="color:var(--muted);">Stream ID</label>
-        <input id="serversAssignStreamID" type="number" min="1" step="1" placeholder="stream id" style="width:120px;" />
-        <button id="serversAssignOpen" class="primary" type="button">Assign stream</button>
-        <span class="status-text" id="serversAssignStatus"></span>
-      </div>
-    </div>
-    <div class="rec-settings-panel" style="margin-bottom:10px;">
-      <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Recording Assignments</span>
-        <span class="status-text" id="serversAssignmentsStatus"></span>
-      </div>
-      <div class="tbl-wrap">
-        <table id="serversAssignmentsTable">
-          <thead>
-            <tr>
-              <th>Stream</th>
-              <th>Server</th>
-              <th>Execution Class</th>
-              <th>Assigned</th>
-              <th>Last Frame</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="serversAssignmentsRows"></tbody>
-        </table>
-      </div>
+    <div class="domain-intro">
+      <div class="domain-intro-title">Fleet Operations</div>
+      <div class="domain-intro-copy">Use this surface for live server capacity, assignments, and runtime health across the active Sto-A-Rama fleet.</div>
     </div>
     <div class="toolbar">
       <label class="check-label fs11" style="color:var(--muted);">Lookback (hours)</label>
@@ -1678,10 +2042,57 @@
         <tbody id="serversRows"></tbody>
       </table>
     </div>
+    <div class="rec-settings-panel">
+      <div class="row" style="gap:10px; margin-bottom:10px;">
+        <span class="fw600 fs11">Server Capacity Groups</span>
+        <span class="muted fs11">Live capacity is heartbeat-managed and owned by the Servers domain.</span>
+      </div>
+      <div id="recordingCapacityRows" class="stack" style="gap:6px;"></div>
+      <div class="row" style="gap:8px; margin-top:8px;">
+        <button id="reloadRecordingCapacity" class="primary">Reload capacity</button>
+        <span class="status-text" id="recordingCapacityStatus"></span>
+      </div>
+    </div>
+    <div class="rec-settings-panel" style="margin-bottom:10px;">
+      <div class="row" style="gap:10px; margin-bottom:8px;">
+        <span class="fw600 fs11">Recording Assignments</span>
+        <span class="status-text" id="serversAssignmentsStatus"></span>
+      </div>
+      <div class="tbl-wrap">
+        <table id="serversAssignmentsTable">
+          <thead>
+            <tr>
+              <th>Stream</th>
+              <th>Server</th>
+              <th>Execution Class</th>
+              <th>Assigned</th>
+              <th>Last Frame</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="serversAssignmentsRows"></tbody>
+        </table>
+      </div>
+    </div>
+    <details class="secondary-card">
+      <summary>Manual Assignment</summary>
+      <div class="secondary-card-body">
+        <div class="toolbar" style="margin-bottom:0;">
+          <label class="check-label fs11" style="color:var(--muted);">Stream ID</label>
+          <input id="serversAssignStreamID" type="number" min="1" step="1" placeholder="stream id" style="width:120px;" />
+          <button id="serversAssignOpen" class="primary" type="button">Assign stream</button>
+          <span class="status-text" id="serversAssignStatus"></span>
+        </div>
+      </div>
+    </details>
   </div>
 
   <!-- RECORDING PANEL -->
   <div id="recordingPanel" style="display:none;">
+    <div class="domain-intro">
+      <div class="domain-intro-title">Recording Operations</div>
+      <div class="domain-intro-copy">Recording is a product runtime concern: global interval, live health, assignment state, and historical coverage for canonical streams.</div>
+    </div>
     <div class="rec-settings-panel">
       <div class="row" style="gap:10px; margin-bottom:10px;">
         <span class="fw600 fs11">Global Recording Settings</span>
@@ -1733,7 +2144,7 @@
   <div id="detailPanel" style="display:none;">
     <div class="detail-header">
       <div class="detail-header-left">
-        <a href="/dashboard/streams" class="back-link" id="backLink">&#8592; Streams</a>
+        <a href="/dashboard/streams" class="back-link" id="backLink">&#8592; Catalog</a>
         <div class="detail-title" id="detailTitle"></div>
         <div class="detail-meta" id="detailMeta"></div>
         <div id="detailTagEditor"></div>
@@ -1751,23 +2162,6 @@
         <div class="detail-summary-title">Recording</div>
         <div id="detailRecordingHero"><span class="muted fs11">Loading recording status...</span></div>
       </div>
-    </div>
-
-    <div class="detail-section-card" style="margin-top:10px;">
-      <div class="detail-section-head">
-        <div class="detail-section-title">Recording Route</div>
-        <div class="detail-section-subtitle">Where Stoarama is recording this stream right now.</div>
-      </div>
-      <div class="toolbar" style="margin-top:0;">
-        <button id="detailWorkloadReload" class="btn-sm">Refresh status</button>
-        <span class="status-text" id="detailWorkloadStatus"></span>
-      </div>
-      <div id="detailCurrentPath" class="detail-fact-grid"></div>
-      <div id="detailCurrentWorker" style="margin-top:10px;"></div>
-      <details class="detail-history">
-        <summary>Recent worker history</summary>
-        <div class="stack" id="detailCaptureWorkers" style="gap:4px; margin-top:10px;"></div>
-      </details>
     </div>
 
     <!-- Sub tabs -->
@@ -1960,6 +2354,22 @@
 
     <!-- Recording section -->
     <div id="detailCoverageSection" style="display:none;">
+      <div class="detail-section-card" style="margin-bottom:12px;">
+        <div class="detail-section-head">
+          <div class="detail-section-title">Recording Route</div>
+          <div class="detail-section-subtitle">Where Sto-A-Rama is recording this stream right now.</div>
+        </div>
+        <div class="toolbar" style="margin-top:0;">
+          <button id="detailWorkloadReload" class="btn-sm">Refresh status</button>
+          <span class="status-text" id="detailWorkloadStatus"></span>
+        </div>
+        <div id="detailCurrentPath" class="detail-fact-grid"></div>
+        <div id="detailCurrentWorker" style="margin-top:10px;"></div>
+        <details class="detail-history">
+          <summary>Recent worker history</summary>
+          <div class="stack" id="detailCaptureWorkers" style="gap:4px; margin-top:10px;"></div>
+        </details>
+      </div>
       <div class="coverage-panel">
         <div class="detail-section-head">
           <div class="detail-section-title">Recording</div>
@@ -2120,6 +2530,7 @@ const $ = (id) => document.getElementById(id);
 // panels
 const overviewPanel = $('overviewPanel');
 const streamsPanel = $('streamsPanel');
+const operationsPanel = $('operationsPanel');
 const discoveryPanel = $('discoveryPanel');
 const inferencesPanel = $('inferencesPanel');
 const serversPanel = $('serversPanel');
@@ -2131,10 +2542,11 @@ const topbarAccountStatus = $('topbarAccountStatus');
 // top tabs
 const tabOverview = $('tabOverview');
 const tabStreams = $('tabStreams');
-const tabDiscovery = $('tabDiscovery');
 const tabRecording = $('tabRecording');
-const tabPipelines = $('tabPipelines');
-const tabServers = $('tabServers');
+const tabOperations = $('tabOperations');
+const opsViewDiscovery = $('opsViewDiscovery');
+const opsViewPipelines = $('opsViewPipelines');
+const opsViewServers = $('opsViewServers');
 
 // overview
 const overviewStatus = $('overviewStatus');
@@ -3252,8 +3664,10 @@ function showPanel(which) {
     stopDetailLivePolling();
     stopDetailFrameExportPolling();
   }
+  const operationsVisible = which === 'discovery' || which === 'pipelines' || which === 'servers';
   if (overviewPanel) overviewPanel.style.display = which === 'overview' ? '' : 'none';
   streamsPanel.style.display = which === 'streams' ? '' : 'none';
+  if (operationsPanel) operationsPanel.style.display = operationsVisible ? '' : 'none';
   if (discoveryPanel) discoveryPanel.style.display = which === 'discovery' ? '' : 'none';
   inferencesPanel.style.display = which === 'pipelines' ? '' : 'none';
   if (serversPanel) serversPanel.style.display = which === 'servers' ? '' : 'none';
@@ -3262,10 +3676,11 @@ function showPanel(which) {
 
   if (tabOverview) tabOverview.classList.toggle('active', which === 'overview');
   tabStreams.classList.toggle('active', which === 'streams' || which === 'detail');
-  if (tabDiscovery) tabDiscovery.classList.toggle('active', which === 'discovery');
   if (tabRecording) tabRecording.classList.toggle('active', which === 'recording');
-  if (tabPipelines) tabPipelines.classList.toggle('active', which === 'pipelines');
-  if (tabServers) tabServers.classList.toggle('active', which === 'servers');
+  if (tabOperations) tabOperations.classList.toggle('active', operationsVisible);
+  if (opsViewDiscovery) opsViewDiscovery.classList.toggle('active', which === 'discovery');
+  if (opsViewPipelines) opsViewPipelines.classList.toggle('active', which === 'pipelines');
+  if (opsViewServers) opsViewServers.classList.toggle('active', which === 'servers');
 }
 
 function isStreamJSONModalOpen() {
@@ -4128,7 +4543,7 @@ function renderPipelineOverview(items) {
   }
 }
 
-function renderPipelineDetailEmpty(message = 'Select a pipeline above to inspect versions, runs, touched streams, and experiment history.') {
+function renderPipelineDetailEmpty(message = 'Select a pipeline above to inspect versions, runs, catalog reach, and optional validation metadata.') {
   if (pipelineDetailEmpty) pipelineDetailEmpty.textContent = message;
   if (pipelineDetailEmpty) pipelineDetailEmpty.style.display = '';
   if (pipelineDetailBody) pipelineDetailBody.style.display = 'none';
@@ -4225,7 +4640,7 @@ function renderPipelineEvalSuites(items) {
 function renderMetricLineGraph(points, metricName = 'metric') {
   const rows = Array.isArray(points) ? points.filter((p) => Number.isFinite(Number(p && p.primary_metric_after))) : [];
   if (!rows.length) {
-    pipelineExperimentGraph.textContent = 'No completed experiment metric series yet.';
+    pipelineExperimentGraph.textContent = 'No completed validation metric series yet.';
     return;
   }
   const width = 720;
@@ -4247,8 +4662,8 @@ function renderMetricLineGraph(points, metricName = 'metric') {
     return `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="4" fill="#22c55e"><title>iter ${esc(String(p.iteration_index || idx + 1))}: ${(Number(p.primary_metric_after || 0)).toFixed(4)}</title></circle>`;
   }).join('');
   pipelineExperimentGraph.innerHTML = `
-    <div class="fw600 fs11" style="margin-bottom:6px;">${esc(metricName)} over experiment iterations</div>
-    <svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="${esc(metricName)} over experiment iterations">
+    <div class="fw600 fs11" style="margin-bottom:6px;">${esc(metricName)} over validation iterations</div>
+    <svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="${esc(metricName)} over validation iterations">
       <line x1="${padX}" y1="${height - padY}" x2="${width - padX}" y2="${height - padY}" stroke="rgba(255,255,255,0.15)" />
       <line x1="${padX}" y1="${padY}" x2="${padX}" y2="${height - padY}" stroke="rgba(255,255,255,0.15)" />
       <polyline fill="none" stroke="#22c55e" stroke-width="3" points="${pointsAttr}" />
@@ -4266,7 +4681,7 @@ function renderPipelineExperimentIterations(payload) {
   const suiteByID = new Map(suites.map((it) => [Number(it.id || 0), it]));
   pipelineExperimentsRows.innerHTML = '';
   if (!experiment || !iterations.length) {
-    setTableStateRow(pipelineExperimentsRows, 7, 'No experiment iterations yet');
+    setTableStateRow(pipelineExperimentsRows, 7, 'No validation iterations yet');
     renderMetricLineGraph([], 'primary metric');
     return;
   }
@@ -4322,7 +4737,7 @@ async function loadPipelineDetail(pipelineID = selectedPipelineID) {
       queueChip('detections', Number(summary.detections_total || 0)),
       queueChip('versions', Array.isArray(detail.versions) ? detail.versions.length : 0),
       queueChip('recent runs', Array.isArray(detail.recent_runs) ? detail.recent_runs.length : 0),
-      queueChip('experiments', experiments.length),
+      queueChip('validation refs', experiments.length),
     ].join('');
   }
   renderPipelineVersions(detail.versions || []);
@@ -4333,11 +4748,11 @@ async function loadPipelineDetail(pipelineID = selectedPipelineID) {
     const exp = await fetchJSON(`/api/v1/pipeline-experiments/${selectedPipelineExperimentID}`);
     renderPipelineEvalSuites(exp.suites || []);
     renderPipelineExperimentIterations(exp);
-    setPipelineExperimentStatus(`${experiments.length} experiment${experiments.length === 1 ? '' : 's'} · showing ${String(experiments[0].slug || experiments[0].title || 'latest')}`, 'ok');
+    setPipelineExperimentStatus(`${experiments.length} validation ref${experiments.length === 1 ? '' : 's'} · showing ${String(experiments[0].slug || experiments[0].title || 'latest')}`, 'ok');
   } else {
     renderPipelineEvalSuites([]);
     renderPipelineExperimentIterations(null);
-    setPipelineExperimentStatus('No experiment history yet');
+    setPipelineExperimentStatus('No validation metadata yet');
   }
   setPipelineDetailStatus(`loaded ${selectedPipelineID}`, 'ok');
 }
@@ -5272,9 +5687,6 @@ function renderStreamRows() {
           <a href="/dashboard/stream/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
           ${streamName.secondary ? `<span class="muted fs10">${esc(streamName.secondary)}</span>` : ''}
           <span class="muted fs10 mono">${esc(s.provider)} / ${esc(s.slug)}</span>
-          <div class="row">
-            <button class="btn-sm" data-action="show-stream-json" data-id="${s.id}" title="Show full stream row JSON">Raw JSON</button>
-          </div>
         </div>
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
@@ -6569,6 +6981,7 @@ async function loadDetail(options = {}) {
       : (canStartRecording
         ? `<button class="btn-sm" data-detail-action="recording-enable" data-id="${s.id}">Turn Recording On</button>`
         : `<span class="tag tag-muted">clip-only hard cut</span>`)}
+    <button class="btn-sm" data-detail-action="show-stream-json" data-id="${s.id}" title="Inspect full stream payload">Inspect JSON</button>
     ${youtubeWatchURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
     ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open Stream URL</button></a>` : ''}
     ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Source Page</button></a>` : ''}
@@ -6940,7 +7353,8 @@ detailActions.addEventListener('click', async (e) => {
   const id = Number(btn.getAttribute('data-id'));
   if (!action || !id) return;
   try {
-    setDetailStatus('updating...');
+    const localOnlyAction = action === 'show-stream-json';
+    if (!localOnlyAction) setDetailStatus('updating...');
     if (action === 'recording-enable' || action === 'recording-disable') {
       const nextState = action === 'recording-enable' ? 'on' : 'off';
       await setStreamRecordingState(id, nextState);
@@ -6956,6 +7370,7 @@ detailActions.addEventListener('click', async (e) => {
       return;
     }
     await handleStreamTableAction(action, id, 'detail', btn);
+    if (localOnlyAction) return;
     await loadDetail();
     setDetailStatus('updated', 'ok');
   } catch (err) { setDetailStatus(String(err), 'err'); }
@@ -7024,8 +7439,41 @@ tabStreams.addEventListener('click', () => {
   })();
 });
 
-if (tabDiscovery) {
-  tabDiscovery.addEventListener('click', () => {
+if (tabOperations) {
+  tabOperations.addEventListener('click', () => {
+    if (mainTab === 'discovery') {
+      history.replaceState(null, '', '/dashboard/discovery');
+      showPanel('discovery');
+      setDiscoveryStatus('loading...');
+      populateCaptureTypeOptions(discoveryCaptureTypeFilter, 'capture type: all');
+      void loadDiscoveryCandidates().catch((err) => setDiscoveryStatus(String(err), 'err'));
+      return;
+    }
+    if (mainTab === 'servers') {
+      history.replaceState(null, '', '/dashboard/servers');
+      showPanel('servers');
+      setServersStatus('loading...');
+      void (async () => {
+        try {
+          await reloadServerDomainViews();
+        } catch (err) { setServersStatus(String(err), 'err'); }
+      })();
+      return;
+    }
+    mainTab = 'pipelines';
+    history.replaceState(null, '', selectedPipelineID ? `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/dashboard/pipelines');
+    showPanel('pipelines');
+    setPipelinesStatus('loading...');
+    void (async () => {
+      try {
+        await Promise.all([loadPipelineOverview(), loadAllInference()]);
+      } catch (err) { setPipelinesStatus(String(err), 'err'); }
+    })();
+  });
+}
+
+if (opsViewDiscovery) {
+  opsViewDiscovery.addEventListener('click', () => {
     if (mainTab === 'discovery') return;
     mainTab = 'discovery';
     history.replaceState(null, '', '/dashboard/discovery');
@@ -7036,21 +7484,23 @@ if (tabDiscovery) {
   });
 }
 
-tabPipelines.addEventListener('click', () => {
-  if (mainTab === 'pipelines') return;
-  mainTab = 'pipelines';
-  history.replaceState(null, '', selectedPipelineID ? `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/dashboard/pipelines');
-  showPanel('pipelines');
-  setPipelinesStatus('loading...');
-  void (async () => {
-    try {
-      await Promise.all([loadPipelineOverview(), loadAllInference()]);
-    } catch (err) { setPipelinesStatus(String(err), 'err'); }
-  })();
-});
+if (opsViewPipelines) {
+  opsViewPipelines.addEventListener('click', () => {
+    if (mainTab === 'pipelines') return;
+    mainTab = 'pipelines';
+    history.replaceState(null, '', selectedPipelineID ? `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/dashboard/pipelines');
+    showPanel('pipelines');
+    setPipelinesStatus('loading...');
+    void (async () => {
+      try {
+        await Promise.all([loadPipelineOverview(), loadAllInference()]);
+      } catch (err) { setPipelinesStatus(String(err), 'err'); }
+    })();
+  });
+}
 
-if (tabServers) {
-  tabServers.addEventListener('click', () => {
+if (opsViewServers) {
+  opsViewServers.addEventListener('click', () => {
     if (mainTab === 'servers') return;
     mainTab = 'servers';
     history.replaceState(null, '', '/dashboard/servers');

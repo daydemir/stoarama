@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Stoarama YouTube Relay Source</title>
+  <title>Sto-A-Rama Relay Guide</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -184,20 +184,20 @@
   <div class="shell">
     <div class="topbar">
       <div class="topbar-left">
-        <span class="site-title">STREAM CONTROL</span>
-        <span class="site-subtitle">Relay Docs</span>
+        <span class="site-title">STO-A-RAMA</span>
+        <span class="site-subtitle">Relay Guide</span>
       </div>
       <nav class="global-nav" aria-label="Global">
         <a href="/dashboard">Dashboard</a>
         <a href="/account">Account</a>
-        <a href="/docs/youtube-relay-source" class="active">Relay Docs</a>
+        <a href="/docs/youtube-relay-source" class="active">Relay Guide</a>
       </nav>
     </div>
 
     <section class="hero">
       <div class="eyebrow">Local helper for restricted sources</div>
       <h1>Run a YouTube relay source on your own machine.</h1>
-      <p>Use this when a stream needs browser cookies locally. Your machine resolves the source and relays bytes, while Stoarama keeps the catalog, assignment state, and recording sinks.</p>
+      <p>Use this when a stream needs browser cookies locally. Your machine resolves the source and relays bytes, while Sto-A-Rama keeps the catalog, assignment state, and recording sinks.</p>
       <div class="metric-row">
         <span class="metric-chip">Cookies <b>stay local</b></span>
         <span class="metric-chip">Relay node <b>belongs to your account</b></span>
@@ -210,9 +210,9 @@
         <div class="eyebrow">Prereqs</div>
         <h2>What you need</h2>
         <ul>
-          <li>A Stoarama account and an enrolled <code>yt_relay_source</code> node.</li>
+          <li>A Sto-A-Rama account and an enrolled <code>yt_relay_source</code> node.</li>
           <li><code>ffmpeg</code> and <code>yt-dlp</code> installed locally.</li>
-          <li>A relay URL reachable from Stoarama sink servers.</li>
+          <li>A relay URL reachable from Sto-A-Rama sink servers.</li>
           <li>YouTube cookies stored only on your own machine.</li>
         </ul>
       </section>
@@ -262,7 +262,7 @@ Enroll the node on the source machine</code></pre>
         <h2>Operational boundaries</h2>
         <ul>
           <li>Cookies never leave your machine.</li>
-          <li>Stoarama stores node state, route state, and relay metadata only.</li>
+          <li>Sto-A-Rama stores node state, route state, and relay metadata only.</li>
           <li>The recording sink remains remote; the source machine resolves and relays.</li>
         </ul>
       </section>
