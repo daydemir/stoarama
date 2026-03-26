@@ -300,20 +300,35 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		w.Header().Set("X-Youtube-Relay-Server", strings.TrimSpace(opts.ServerID))
 		w.Header().Set("X-Youtube-Relay-Stream", strconv.FormatInt(streamID, 10))
 		if relaySuffix == "" && r.Method == http.MethodGet && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			body, readErr := io.ReadAll(resp.Body)
+			prefix, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
 			if readErr != nil {
 				http.Error(w, fmt.Sprintf("read upstream response failed: %v", readErr), http.StatusBadGateway)
 				return
 			}
-			if rewritten, ok := rewriteRelayPlaylist(relayBaseURL, streamID, strings.TrimSpace(opts.SharedToken), upstreamURL, body); ok {
-				w.Header().Del("Content-Length")
-				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			if relayResponseLooksLikePlaylist(resp.Header.Get("Content-Type"), upstreamURL, prefix) {
+				body := append([]byte(nil), prefix...)
+				rest, err := io.ReadAll(resp.Body)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("read upstream response failed: %v", err), http.StatusBadGateway)
+					return
+				}
+				body = append(body, rest...)
+				if rewritten, ok := rewriteRelayPlaylist(relayBaseURL, streamID, strings.TrimSpace(opts.SharedToken), upstreamURL, body); ok {
+					w.Header().Del("Content-Length")
+					w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+					w.WriteHeader(resp.StatusCode)
+					_, _ = w.Write(rewritten)
+					return
+				}
 				w.WriteHeader(resp.StatusCode)
-				_, _ = w.Write(rewritten)
+				_, _ = w.Write(body)
 				return
 			}
 			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(body)
+			if len(prefix) > 0 {
+				_, _ = w.Write(prefix)
+			}
+			_, _ = io.Copy(w, resp.Body)
 			return
 		}
 		w.WriteHeader(resp.StatusCode)
@@ -877,9 +892,12 @@ func probeRelayPlaylist(ctx context.Context, relayHTTPClient *http.Client, relay
 	if err != nil {
 		return fmt.Errorf("read relay playlist: %w", err)
 	}
+	if relayResponseLooksLikeDirectMedia(resp.Header.Get("Content-Type"), body) {
+		return nil
+	}
 	trimmed := bytes.TrimSpace(body)
 	if !bytes.HasPrefix(trimmed, []byte("#EXTM3U")) {
-		return fmt.Errorf("relay playlist is not valid hls")
+		return fmt.Errorf("relay response is not valid hls or direct media")
 	}
 	segmentURL := ""
 	for _, rawLine := range strings.Split(strings.ReplaceAll(string(trimmed), "\r\n", "\n"), "\n") {
@@ -912,6 +930,34 @@ func probeRelayPlaylist(ctx context.Context, relayHTTPClient *http.Client, relay
 		return fmt.Errorf("read relay segment probe: %w", err)
 	}
 	return nil
+}
+
+func relayResponseLooksLikePlaylist(contentType string, upstreamURL string, bodyPrefix []byte) bool {
+	if looksLikeM3U8URL(upstreamURL) {
+		return true
+	}
+	lowerType := strings.ToLower(strings.TrimSpace(contentType))
+	if strings.Contains(lowerType, "mpegurl") || strings.Contains(lowerType, "m3u8") {
+		return true
+	}
+	return bytes.HasPrefix(bytes.TrimSpace(bodyPrefix), []byte("#EXTM3U"))
+}
+
+func relayResponseLooksLikeDirectMedia(contentType string, bodyPrefix []byte) bool {
+	lowerType := strings.ToLower(strings.TrimSpace(contentType))
+	if strings.HasPrefix(lowerType, "video/") || strings.HasPrefix(lowerType, "audio/") || strings.Contains(lowerType, "application/octet-stream") {
+		return true
+	}
+	trimmed := bytes.TrimSpace(bodyPrefix)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return !bytes.HasPrefix(trimmed, []byte("#EXTM3U")) && !bytes.HasPrefix(trimmed, []byte("<"))
+}
+
+func looksLikeM3U8URL(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	return strings.Contains(lower, ".m3u8") || strings.Contains(lower, "hls_playlist")
 }
 
 func isGlobalPlaylistTag(line string) bool {

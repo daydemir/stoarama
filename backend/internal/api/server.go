@@ -321,6 +321,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
 			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)
 			service.Post("/youtube-relay/sources/stopped", s.handleYouTubeRelaySourceStopped)
+			service.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
 			service.Post("/youtube-relay/routes/{stream_id}/status", s.handleYouTubeRelayRouteStatus)
 			service.Get("/capture/streams", s.handleCaptureStreams)
 			service.Get("/capture/streams/{id}", s.handleCaptureStreamDetail)
