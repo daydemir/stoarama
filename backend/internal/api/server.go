@@ -315,6 +315,8 @@ func (s *Server) router() http.Handler {
 			service.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
 			service.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			service.Get("/recording/incidents", s.handleRecordingIncidentsList)
+			service.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
+			service.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
 			service.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
 			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)

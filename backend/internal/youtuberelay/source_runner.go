@@ -273,20 +273,14 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 				return
 			}
 		}
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, nil)
-		if err != nil {
-			http.Error(w, "build upstream request failed", http.StatusBadGateway)
-			return
-		}
-		for k, vals := range r.Header {
-			if isHopByHopHeader(k) || strings.EqualFold(k, "host") {
-				continue
-			}
-			for _, v := range vals {
-				upstreamReq.Header.Add(k, v)
+		var upstreamHeaders http.Header
+		if relaySuffix != "" {
+			if rangeHeader := strings.TrimSpace(r.Header.Get("Range")); rangeHeader != "" {
+				upstreamHeaders = make(http.Header)
+				upstreamHeaders.Set("Range", rangeHeader)
 			}
 		}
-		resp, err := relayHTTPClient.Do(upstreamReq)
+		resp, err := fetchRelayUpstream(r.Context(), r.Method, upstreamURL, upstreamHeaders)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
 			return
@@ -806,6 +800,64 @@ func rewriteRelayPlaylist(relayBaseURL string, streamID int64, token string, ups
 		out = append(out, block...)
 	}
 	return []byte(strings.Join(out, "\n") + "\n"), true
+}
+
+func fetchRelayUpstream(ctx context.Context, method string, upstreamURL string, headers http.Header) (*http.Response, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	transport.ForceAttemptHTTP2 = true
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	currentURL := strings.TrimSpace(upstreamURL)
+	if currentURL == "" {
+		return nil, fmt.Errorf("missing upstream url")
+	}
+	for redirects := 0; redirects < 10; redirects++ {
+		req, err := http.NewRequestWithContext(ctx, method, currentURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build upstream request: %w", err)
+		}
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("User-Agent", "stoarama-youtube-relay/1.0")
+		for k, vals := range headers {
+			for _, v := range vals {
+				req.Header.Add(k, v)
+			}
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		location := strings.TrimSpace(resp.Header.Get("Location"))
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 && location != "" {
+			nextURL, err := resolveRelayRedirectURL(currentURL, location)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			currentURL = nextURL
+			continue
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("too many upstream redirects")
+}
+
+func resolveRelayRedirectURL(currentURL string, location string) (string, error) {
+	base, err := url.Parse(strings.TrimSpace(currentURL))
+	if err != nil {
+		return "", fmt.Errorf("parse current upstream url: %w", err)
+	}
+	next, err := base.Parse(strings.TrimSpace(location))
+	if err != nil {
+		return "", fmt.Errorf("parse upstream redirect location: %w", err)
+	}
+	return next.String(), nil
 }
 
 func probeRelayPlaylist(ctx context.Context, relayHTTPClient *http.Client, relayPullURL string) error {

@@ -346,7 +346,7 @@ func supervisorReassign(ctx context.Context, backendAPIURL, apiToken string, ite
 		return nil
 	}
 	if _, err := supervisorAPIRequest(ctx, http.MethodPost, backendAPIURL, apiToken, fmt.Sprintf("/api/v1/recording/streams/%d/unassign", streamID), map[string]any{
-		"confirm": "yes",
+		"confirm": fmt.Sprintf("unassign:%d", streamID),
 		"reason":  "supervisor recycle: " + reason,
 		"actor":   actor,
 	}); err != nil {
