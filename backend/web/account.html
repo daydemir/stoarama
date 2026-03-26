@@ -52,33 +52,49 @@
     a:hover { text-decoration: underline; }
     .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
     .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      min-height: 40px;
+    }
+    .topbar-left,
+    .topbar-center,
+    .topbar-right {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-      margin-bottom: 16px;
+      min-width: 0;
     }
-    .topbar-left {
-      display: flex;
-      align-items: baseline;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
+    .topbar-left { gap: 10px; overflow: hidden; }
+    .topbar-center { justify-content: center; }
+    .topbar-right { gap: 10px; justify-content: flex-end; }
     .site-title {
       font-family: var(--mono);
       font-size: 15px;
       font-weight: 600;
       letter-spacing: 0.05em;
       color: var(--accent);
+      white-space: nowrap;
     }
-    .site-subtitle {
+    .metrics-row {
+      display: flex;
+      flex-wrap: nowrap;
+      gap: 6px;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .metric-chip {
       font-family: var(--mono);
       font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
       color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 7px;
+      white-space: nowrap;
     }
+    .metric-chip b { color: var(--text); font-weight: 500; }
     .global-nav {
       display: inline-flex;
       align-items: center;
@@ -100,6 +116,7 @@
       text-transform: uppercase;
       color: var(--muted);
       text-decoration: none;
+      white-space: nowrap;
     }
     .global-nav a:hover {
       color: var(--text);
@@ -122,12 +139,22 @@
       color: var(--muted);
       font-family: var(--mono);
       font-size: 11px;
+      white-space: nowrap;
     }
-    .hero {
-      display: grid;
-      grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.85fr);
-      gap: 16px;
-      margin-bottom: 16px;
+    .account-chip a { color: var(--text); text-decoration: none; }
+    .admin-chip {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      text-decoration: none;
     }
     .panel {
       background: color-mix(in srgb, var(--panel) 94%, #000);
@@ -136,22 +163,40 @@
       padding: 18px;
       box-shadow: 0 22px 50px rgba(15, 23, 42, 0.18);
     }
-    .hero-copy h1 {
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.8fr);
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .eyebrow {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    h1 {
       margin: 0 0 10px;
       font-size: clamp(34px, 5vw, 48px);
       line-height: 0.96;
       letter-spacing: -0.03em;
     }
-    .hero-copy p {
-      margin: 0 0 14px;
+    h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      line-height: 1.15;
+    }
+    p, .note, .muted {
       color: var(--muted);
-      max-width: 760px;
       line-height: 1.55;
     }
     .hero-notes {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
+      margin-top: 14px;
     }
     .hero-note {
       padding: 6px 10px;
@@ -162,43 +207,20 @@
       font-family: var(--mono);
       font-size: 11px;
     }
-    .hero-split {
-      margin-top: 14px;
-      padding: 12px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 72%, transparent);
-      color: var(--muted);
-      line-height: 1.5;
-    }
-    .hero-side {
+    .grid-2 {
       display: grid;
-      gap: 12px;
-      align-content: start;
-    }
-    .session-card h2,
-    .panel h2 {
-      margin: 0 0 10px;
-      font-size: 18px;
-      line-height: 1.15;
-    }
-    .eyebrow {
-      margin-bottom: 10px;
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .grid-2,
-    .grid-3 {
-      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 16px;
       margin-bottom: 16px;
     }
-    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .stack { display: grid; gap: 10px; }
+    .section-title {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
     .status {
       min-height: 18px;
       color: var(--muted);
@@ -207,6 +229,7 @@
     }
     .status.ok { color: var(--ok); }
     .status.err { color: var(--err); }
+    .hidden { display: none !important; }
     label {
       display: block;
       margin-bottom: 6px;
@@ -215,7 +238,7 @@
       text-transform: uppercase;
       letter-spacing: 0.04em;
     }
-    input, button, select {
+    input, button {
       width: 100%;
       min-height: 40px;
       border-radius: 10px;
@@ -233,41 +256,30 @@
       color: #f8fafc;
       font-weight: 600;
     }
-    button:hover {
-      background: color-mix(in srgb, var(--accent) 28%, var(--panel2));
-    }
+    button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
     button.secondary {
       background: transparent;
       color: var(--text);
-    }
-    button.ghost {
-      background: transparent;
-      border-style: dashed;
-      color: var(--muted);
-    }
-    button:disabled {
-      opacity: 0.55;
-      cursor: default;
     }
     .button-row {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
     }
-    .button-row button {
+    .button-row > * {
       width: auto;
       min-width: 140px;
     }
-    .token-box,
-    .code-box {
+    .session-meta {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+    }
+    .token-box {
       border-radius: 14px;
       border: 1px solid var(--border);
       background: color-mix(in srgb, var(--panel2) 88%, transparent);
       padding: 12px;
-    }
-    .token-box.hidden,
-    .hidden {
-      display: none;
     }
     .token-box-title {
       margin-bottom: 8px;
@@ -277,9 +289,7 @@
       letter-spacing: 0.04em;
       color: var(--muted);
     }
-    .mono,
-    code,
-    pre {
+    .mono, code, pre {
       font-family: var(--mono);
       font-size: 12px;
     }
@@ -290,137 +300,15 @@
       line-height: 1.55;
       color: var(--text);
     }
-    .note {
+    .empty-state {
+      padding: 16px;
+      border: 1px dashed var(--border);
+      border-radius: 14px;
       color: var(--muted);
-      font-size: 13px;
       line-height: 1.5;
+      text-align: center;
     }
-    .metric-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .metric-chip {
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 88%, transparent);
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-    }
-    .metric-chip b { color: var(--text); font-weight: 500; }
-    .data-grid {
-      display: grid;
-      grid-template-columns: minmax(320px, 0.9fr) minmax(0, 1.4fr);
-      gap: 16px;
-    }
-    .section-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-    .section-title p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .endpoint-list,
-    .stream-result-list,
-    .clip-download-list {
-      display: grid;
-      gap: 10px;
-    }
-    .endpoint-card,
-    .stream-result,
-    .summary-card {
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 84%, transparent);
-      padding: 12px;
-    }
-    .endpoint-header,
-    .stream-result-header,
-    .summary-card-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 6px;
-    }
-    .auth-badge,
-    .method-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 4px 8px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      font-family: var(--mono);
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--muted);
-    }
-    .auth-badge.public { color: var(--ok); }
-    .auth-badge.account { color: var(--accent); }
-    .search-bar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
-    }
-    .search-bar button { width: auto; min-width: 120px; }
-    .stream-result-title {
-      font-size: 15px;
-      font-weight: 600;
-      line-height: 1.3;
-    }
-    .stream-result-meta,
-    .muted {
-      color: var(--muted);
-    }
-    .stream-result-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 10px;
-    }
-    .stream-result-actions a,
-    .stream-result-actions button {
-      width: auto;
-      min-width: 0;
-    }
-    .examples-grid {
-      display: grid;
-      gap: 12px;
-    }
-    .example-card {
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 88%, transparent);
-      padding: 12px;
-    }
-    .example-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 8px;
-    }
-    .example-header h3 {
-      margin: 0;
-      font-size: 14px;
-    }
-    .clip-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-bottom: 10px;
-    }
-    .clip-table-wrap {
+    .table-wrap {
       overflow-x: auto;
       border-radius: 14px;
       border: 1px solid var(--border);
@@ -444,51 +332,15 @@
       letter-spacing: 0.05em;
       font-family: var(--mono);
     }
-    td input[type="checkbox"] {
-      width: 16px;
-      min-height: 16px;
-      padding: 0;
-      border-radius: 4px;
-    }
-    .clip-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .clip-actions a,
-    .clip-actions button {
-      width: auto;
-      min-width: 0;
-      padding: 7px 10px;
-      min-height: 0;
-      font-size: 12px;
-    }
-    .session-summary {
-      display: grid;
-      gap: 8px;
-    }
-    .session-meta {
-      display: grid;
-      gap: 4px;
-      color: var(--muted);
-    }
-    .empty-state {
-      padding: 16px;
-      border: 1px dashed var(--border);
-      border-radius: 14px;
-      color: var(--muted);
-      line-height: 1.5;
-      text-align: center;
-    }
-    @media (max-width: 1080px) {
-      .hero,
-      .grid-2,
-      .grid-3,
-      .data-grid {
-        grid-template-columns: 1fr;
-      }
+    @media (max-width: 1100px) {
+      .hero, .grid-2 { grid-template-columns: 1fr; }
       .topbar {
-        align-items: flex-start;
+        grid-template-columns: minmax(0, 1fr);
+        overflow-x: auto;
+      }
+      .topbar-center,
+      .topbar-right {
+        justify-content: flex-start;
       }
     }
   </style>
@@ -498,38 +350,38 @@
     <div class="topbar">
       <div class="topbar-left">
         <span class="site-title">STO-A-RAMA</span>
-        <span class="site-subtitle">Account</span>
+        <div class="metrics-row" id="metricsRow"></div>
       </div>
-      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <div class="topbar-center">
         <nav class="global-nav" aria-label="Global">
-          <a href="/dashboard">Dashboard</a>
-          <a href="/account" class="active">Account</a>
-          <a href="/docs/youtube-relay-source">Relay Guide</a>
+          <a href="/streams">Streams</a>
+          <a href="/recording">Recording</a>
+          <a href="/docs/getting-started">Docs</a>
         </nav>
+      </div>
+      <div class="topbar-right">
+        <a id="adminChip" class="admin-chip" href="/admin" aria-label="Admin">⚙</a>
         <div class="account-chip" id="accountChip">Checking session...</div>
       </div>
     </div>
 
     <div class="hero">
-      <section class="panel hero-copy">
-        <div class="eyebrow">Public streams + account tools</div>
-        <h1>Use your Sto-A-Rama account to manage downloads, keys, and nodes.</h1>
-        <p>Public stream metadata stays open. Sign in when you want to turn recording on, browse recorded clips, create API keys for scripts, or manage relay nodes.</p>
+      <section class="panel">
+        <div class="eyebrow">Account tools</div>
+        <h1>Manage sessions, API keys, and enrolled nodes.</h1>
+        <p>Use this page for browser sign-in, automation credentials, node enrollment, and future billing state. Stream browsing, clip downloads, and API examples now live on their own route pages.</p>
         <div class="hero-notes">
-          <span class="hero-note">Public stream search</span>
-          <span class="hero-note">Signed-in recording controls</span>
-          <span class="hero-note">API keys for scripts and downloads</span>
-          <span class="hero-note">Clip browser with batch prepare</span>
+          <span class="hero-note">Email session management</span>
+          <span class="hero-note">API keys for scripts</span>
+          <span class="hero-note">Node enrollment</span>
+          <span class="hero-note">Billing placeholder</span>
         </div>
-        <div class="hero-split">Use this page for account access, automation credentials, clip downloads, and node enrollment tied to your Sto-A-Rama account.</div>
       </section>
-      <section class="panel hero-side session-card">
-        <div>
-          <div class="eyebrow">Session</div>
-          <h2>Account state</h2>
-        </div>
+      <section class="panel">
+        <div class="eyebrow">Session</div>
+        <h2>Account state</h2>
         <div id="accountStatus" class="status">Checking session...</div>
-        <div id="accountBox" class="session-summary hidden">
+        <div id="accountBox" class="stack hidden">
           <div id="accountMeta" class="session-meta"></div>
           <div class="button-row">
             <button id="logoutBtn" class="secondary" type="button">Log Out</button>
@@ -545,7 +397,7 @@
             <div class="eyebrow">Sign in</div>
             <h2>Email magic link</h2>
           </div>
-          <p>Use browser auth for recording toggles and clip browsing.</p>
+          <p>Browser auth is used for recording actions, downloads, and account-scoped tools.</p>
         </div>
         <label for="email">Email</label>
         <input id="email" type="email" placeholder="you@example.org" />
@@ -558,13 +410,18 @@
       <section class="panel">
         <div class="section-title">
           <div>
-            <div class="eyebrow">What auth does</div>
-            <h2>Simple split</h2>
+            <div class="eyebrow">Relay</div>
+            <h2>Self-serve setup</h2>
           </div>
-          <p>Public reads stay public. Account auth covers changes and private downloads.</p>
+          <p>Relay setup docs now live under Docs instead of this page.</p>
         </div>
-        <div id="authModelChips" class="metric-row"></div>
-        <div id="authModelSummary" class="stack note" style="margin-top:12px;"></div>
+        <div class="stack">
+          <div class="note">Use self-serve relay or node infrastructure when a source requires your own cookies, network path, or researcher-managed hardware.</div>
+          <div class="button-row">
+            <a href="/docs/relay-guide">Relay Guide</a>
+            <a href="/docs/self-serve">Self-Serve Setup</a>
+          </div>
+        </div>
       </section>
     </div>
 
@@ -574,7 +431,7 @@
           <div class="eyebrow">API Keys</div>
           <h2>Automation credentials</h2>
         </div>
-        <p>Not needed for public catalog reads. Use them for scripts, downloads, and account-scoped API access.</p>
+        <p>Create scoped account tokens for scripts, clip retrieval, and account-authenticated API use.</p>
       </div>
       <div id="keysEmpty" class="empty-state">Sign in first to create and manage API keys.</div>
       <div id="keysBox" class="hidden">
@@ -589,7 +446,7 @@
         </div>
         <div id="createKeyStatus" class="status"></div>
         <div id="newTokenBox" class="token-box hidden"></div>
-        <div class="clip-table-wrap" style="margin-top:12px;">
+        <div class="table-wrap" style="margin-top:12px;">
           <table>
             <thead>
               <tr><th>Prefix</th><th>Label</th><th>Created</th><th>Last Used</th><th></th></tr>
@@ -600,144 +457,14 @@
       </div>
     </section>
 
-    <section class="panel" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">Data Access</div>
-          <h2>Find a stream, inspect the API, and pull recorded clips</h2>
-        </div>
-        <p>Generated from the live backend spec so the examples match the actual API surface.</p>
-      </div>
-      <div class="data-grid">
-        <div class="stack">
-          <div class="summary-card">
-            <div class="summary-card-header">
-              <div>
-                <div class="eyebrow">Search</div>
-                <h2 style="margin:0; font-size:17px;">Public stream catalog</h2>
-              </div>
-              <span class="auth-badge public">public</span>
-            </div>
-            <div class="search-bar">
-              <input id="streamSearch" type="text" placeholder="Search streams, places, or providers" />
-              <button id="streamSearchBtn" type="button">Search</button>
-            </div>
-            <div id="streamSearchStatus" class="status" style="margin-top:10px;"></div>
-          </div>
-
-          <div id="selectedStreamBox" class="summary-card hidden">
-            <div class="summary-card-header">
-              <div>
-                <div class="eyebrow">Selected stream</div>
-                <h2 id="selectedStreamTitle" style="margin:0; font-size:17px;"></h2>
-              </div>
-              <a id="selectedStreamDashboardLink" href="/dashboard" target="_blank" rel="noopener noreferrer">Open in dashboard</a>
-            </div>
-            <div id="selectedStreamMeta" class="stack note"></div>
-            <div class="metric-row" id="selectedStreamChips" style="margin-top:10px;"></div>
-          </div>
-
-          <div>
-            <div class="eyebrow">Endpoints</div>
-            <div id="endpointList" class="endpoint-list"></div>
-          </div>
-
-          <div>
-            <div class="eyebrow">Results</div>
-            <div id="streamResults" class="stream-result-list"></div>
-          </div>
-        </div>
-
-        <div class="stack">
-          <div class="examples-grid">
-            <div class="example-card">
-              <div class="example-header">
-                <h3>Fetch public stream metadata</h3>
-                <button class="secondary" id="copyPublicExampleBtn" type="button">Copy</button>
-              </div>
-              <div class="code-box"><pre id="publicExample"></pre></div>
-            </div>
-            <div class="example-card">
-              <div class="example-header">
-                <h3>List recorded clips with an API key</h3>
-                <button class="secondary" id="copyClipExampleBtn" type="button">Copy</button>
-              </div>
-              <div class="code-box"><pre id="clipExample"></pre></div>
-            </div>
-            <div class="example-card">
-              <div class="example-header">
-                <h3>Turn recording on from a signed-in browser</h3>
-                <button class="secondary" id="copyRecordingExampleBtn" type="button">Copy</button>
-              </div>
-              <div class="code-box"><pre id="recordingExample"></pre></div>
-            </div>
-          </div>
-
-          <div class="summary-card">
-            <div class="section-title">
-              <div>
-                <div class="eyebrow">Recorded clips</div>
-                <h2 style="margin:0; font-size:17px;">Authenticated browser</h2>
-              </div>
-              <p>Sign in to browse clips and prepare up to 120 downloads at once.</p>
-            </div>
-            <div class="clip-toolbar">
-              <div class="button-row">
-                <button id="clipsReloadBtn" class="secondary" type="button">Reload</button>
-                <button id="clipsPrevBtn" class="secondary" type="button">Previous</button>
-                <button id="clipsNextBtn" class="secondary" type="button">Next</button>
-              </div>
-              <div class="button-row">
-                <button id="selectAllClipsBtn" class="secondary" type="button">Select page</button>
-                <button id="downloadSelectedBtn" type="button" disabled>Download selected</button>
-              </div>
-            </div>
-            <div id="clipsStatus" class="status"></div>
-            <div id="clipsEmpty" class="empty-state">Select a stream to inspect clips. Clip browsing requires a signed-in account.</div>
-            <div id="clipsTableWrap" class="clip-table-wrap hidden">
-              <table>
-                <thead>
-                  <tr>
-                    <th style="width:40px;"><input id="clipSelectPageCheckbox" type="checkbox" /></th>
-                    <th>Start</th>
-                    <th>Duration</th>
-                    <th>Format</th>
-                    <th>Size</th>
-                    <th>Preview</th>
-                    <th>Download</th>
-                  </tr>
-                </thead>
-                <tbody id="clipsRows"></tbody>
-              </table>
-            </div>
-            <div id="clipDownloadResults" class="token-box hidden" style="margin-top:12px;"></div>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <div class="grid-2">
-      <section class="panel">
-        <div class="section-title">
-          <div>
-            <div class="eyebrow">Relay</div>
-            <h2>YouTube relay source</h2>
-          </div>
-          <p>Run the Sto-A-Rama CLI locally when a source needs browser cookies on your machine.</p>
-        </div>
-        <div class="button-row">
-          <a href="/docs/youtube-relay-source">Open install guide</a>
-        </div>
-        <div id="relayInstallBox" class="token-box hidden" style="margin-top:12px;"></div>
-      </section>
-
       <section class="panel">
         <div class="section-title">
           <div>
             <div class="eyebrow">Node Enrollment</div>
             <h2>Enroll relay nodes</h2>
           </div>
-          <p>Use enrollment tokens once, then manage the resulting nodes below.</p>
+          <p>Create one-time enrollment tokens, then use the docs-linked setup flow on your own machine.</p>
         </div>
         <div id="enrollmentEmpty" class="empty-state">Sign in first to create node enrollment tokens.</div>
         <div id="enrollmentBox" class="hidden">
@@ -752,7 +479,7 @@
           </div>
           <div id="createEnrollmentStatus" class="status"></div>
           <div id="newEnrollmentTokenBox" class="token-box hidden"></div>
-          <div class="clip-table-wrap" style="margin-top:12px;">
+          <div class="table-wrap" style="margin-top:12px;">
             <table>
               <thead>
                 <tr><th>Prefix</th><th>Label</th><th>Expires</th><th>Status</th><th></th></tr>
@@ -762,27 +489,38 @@
           </div>
         </div>
       </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <div>
+            <div class="eyebrow">Nodes</div>
+            <h2>Enrolled infrastructure</h2>
+          </div>
+          <p>Nodes and relay state stay bound to your account.</p>
+        </div>
+        <div id="nodesEmpty" class="empty-state">Sign in first to view enrolled nodes.</div>
+        <div id="nodesBox" class="hidden">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Node</th><th>Heartbeat</th><th>Relay</th><th>Slots</th></tr>
+              </thead>
+              <tbody id="nodesRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
     </div>
 
     <section class="panel">
       <div class="section-title">
         <div>
-          <div class="eyebrow">Nodes</div>
-          <h2>Enrolled infrastructure</h2>
+          <div class="eyebrow">Billing</div>
+          <h2>Subscription placeholder</h2>
         </div>
-        <p>Nodes and relay state stay bound to your account.</p>
+        <p>Future billing and subscription management will appear here once researcher plans and request-recording flows are wired.</p>
       </div>
-      <div id="nodesEmpty" class="empty-state">Sign in first to view enrolled nodes.</div>
-      <div id="nodesBox" class="hidden">
-        <div class="clip-table-wrap">
-          <table>
-            <thead>
-              <tr><th>Node</th><th>Heartbeat</th><th>Relay</th><th>Slots</th></tr>
-            </thead>
-            <tbody id="nodesRows"></tbody>
-          </table>
-        </div>
-      </div>
+      <div class="empty-state">No billing actions yet.</div>
     </section>
   </div>
 
@@ -792,6 +530,8 @@
     const accountBox = document.getElementById('accountBox');
     const accountMeta = document.getElementById('accountMeta');
     const accountChip = document.getElementById('accountChip');
+    const adminChip = document.getElementById('adminChip');
+    const metricsRow = document.getElementById('metricsRow');
     const keysEmpty = document.getElementById('keysEmpty');
     const keysBox = document.getElementById('keysBox');
     const keysRows = document.getElementById('keysRows');
@@ -805,33 +545,6 @@
     const nodesEmpty = document.getElementById('nodesEmpty');
     const nodesBox = document.getElementById('nodesBox');
     const nodesRows = document.getElementById('nodesRows');
-    const relayInstallBox = document.getElementById('relayInstallBox');
-    const authModelChips = document.getElementById('authModelChips');
-    const authModelSummary = document.getElementById('authModelSummary');
-    const endpointList = document.getElementById('endpointList');
-    const streamSearch = document.getElementById('streamSearch');
-    const streamSearchBtn = document.getElementById('streamSearchBtn');
-    const streamSearchStatus = document.getElementById('streamSearchStatus');
-    const streamResults = document.getElementById('streamResults');
-    const selectedStreamBox = document.getElementById('selectedStreamBox');
-    const selectedStreamTitle = document.getElementById('selectedStreamTitle');
-    const selectedStreamMeta = document.getElementById('selectedStreamMeta');
-    const selectedStreamChips = document.getElementById('selectedStreamChips');
-    const selectedStreamDashboardLink = document.getElementById('selectedStreamDashboardLink');
-    const publicExample = document.getElementById('publicExample');
-    const clipExample = document.getElementById('clipExample');
-    const recordingExample = document.getElementById('recordingExample');
-    const clipsStatus = document.getElementById('clipsStatus');
-    const clipsEmpty = document.getElementById('clipsEmpty');
-    const clipsTableWrap = document.getElementById('clipsTableWrap');
-    const clipsRows = document.getElementById('clipsRows');
-    const clipDownloadResults = document.getElementById('clipDownloadResults');
-    const clipsReloadBtn = document.getElementById('clipsReloadBtn');
-    const clipsPrevBtn = document.getElementById('clipsPrevBtn');
-    const clipsNextBtn = document.getElementById('clipsNextBtn');
-    const selectAllClipsBtn = document.getElementById('selectAllClipsBtn');
-    const clipSelectPageCheckbox = document.getElementById('clipSelectPageCheckbox');
-    const downloadSelectedBtn = document.getElementById('downloadSelectedBtn');
     const requestedRedirectPath = (() => {
       const params = new URLSearchParams(window.location.search);
       const raw = String(params.get('redirect_path') || '').trim();
@@ -839,12 +552,6 @@
     })();
 
     let currentAccount = null;
-    let latestCreatedAPIKey = '';
-    let dataAccessSpec = null;
-    let selectedStream = null;
-    let clipItems = [];
-    let clipOffset = 0;
-    const clipLimit = 25;
 
     async function fetchJSON(path, opts = {}) {
       const method = String((opts && opts.method) || 'GET').toUpperCase();
@@ -877,32 +584,16 @@
         .replaceAll('"', '&quot;');
     }
 
-    function formatDurationMs(ms) {
-      const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
-      const h = Math.floor(total / 3600);
-      const m = Math.floor((total % 3600) / 60);
-      const s = total % 60;
-      if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
-      if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
-      return `${s}s`;
+    function relaySummary(relay) {
+      if (!relay || !relay.registered) return '<span class="muted">not running</span>';
+      const ready = relay.ready ? 'ready' : 'stale';
+      const shard = relay.shard_id ? ` · ${escapeHTML(String(relay.shard_id))}` : '';
+      return `<div>${ready}${shard}</div><div class="muted mono">${escapeHTML(String(relay.server_id || ''))}</div>`;
     }
 
-    function formatBytes(bytes) {
-      const value = Number(bytes || 0);
-      if (!Number.isFinite(value) || value <= 0) return '-';
-      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-      let idx = 0;
-      let current = value;
-      while (current >= 1024 && idx < units.length - 1) {
-        current /= 1024;
-        idx += 1;
-      }
-      return `${current.toFixed(current >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
-    }
-
-    function setVisibility(el, show) {
-      if (!(el instanceof HTMLElement)) return;
-      el.classList.toggle('hidden', !show);
+    function relaySlots(relay) {
+      if (!relay || !relay.registered) return '-';
+      return `${Number(relay.available_slots || 0)} free / ${Number(relay.max_active || 0)} total`;
     }
 
     async function copyText(text, statusEl, okText) {
@@ -914,12 +605,26 @@
       }
     }
 
+    async function refreshTopbarMetrics() {
+      if (!(metricsRow instanceof HTMLElement)) return;
+      try {
+        const payload = await fetchJSON('/api/v1/dashboard/overview');
+        metricsRow.innerHTML = [
+          ['streams', payload.streams_total],
+          ['recording', payload.recording_on],
+        ].map(([label, value]) => (
+          `<span class="metric-chip">${escapeHTML(label)} <b>${escapeHTML(String(Number(value || 0)))}</b></span>`
+        )).join('');
+      } catch (_) {
+        metricsRow.innerHTML = '';
+      }
+    }
+
     function renderTokenBox(container, opts) {
       const title = String((opts && opts.title) || '').trim();
       const value = String((opts && opts.value) || '').trim();
       const commands = Array.isArray(opts && opts.commands) ? opts.commands : [];
-      const extraHTML = String((opts && opts.extraHTML) || '').trim();
-      if (!value && commands.length === 0 && !extraHTML) {
+      if (!value && commands.length === 0) {
         container.classList.add('hidden');
         container.innerHTML = '';
         return;
@@ -942,7 +647,6 @@
           `);
         });
       }
-      if (extraHTML) parts.push(extraHTML);
       container.innerHTML = parts.join('');
       const statusTarget = opts && opts.statusEl;
       const copyValueBtn = container.querySelector('[data-copy-value]');
@@ -957,387 +661,18 @@
       });
     }
 
-    function relaySummary(relay) {
-      if (!relay || !relay.registered) return '<span class="muted">not running</span>';
-      const ready = relay.ready ? 'ready' : 'stale';
-      const shard = relay.shard_id ? ` · ${escapeHTML(String(relay.shard_id))}` : '';
-      return `<div>${ready}${shard}</div><div class="muted mono">${escapeHTML(String(relay.server_id || ''))}</div>`;
-    }
-
-    function relaySlots(relay) {
-      if (!relay || !relay.registered) return '-';
-      return `${Number(relay.available_slots || 0)} free / ${Number(relay.max_active || 0)} total`;
-    }
-
-    function exampleAPIKey() {
-      return latestCreatedAPIKey || '<YOUR_API_KEY>';
-    }
-
-    function selectedStreamID() {
-      return Number(selectedStream && selectedStream.id || 0);
-    }
-
     function updateAccountChrome() {
+      const accountHref = `/account?redirect_path=${encodeURIComponent(requestedRedirectPath)}`;
       if (!currentAccount) {
-        accountChip.textContent = 'Signed out';
+        accountChip.innerHTML = `<a href="${accountHref}">Account</a>`;
+        if (adminChip instanceof HTMLElement) adminChip.style.display = 'none';
         return;
       }
       const email = String(currentAccount.email || '').trim();
       const authType = String(currentAccount.auth_type || '').trim();
+      const role = String(currentAccount.role || '').trim().toLowerCase();
       accountChip.textContent = authType ? `${email} · ${authType}` : email;
-    }
-
-    function renderAuthModel() {
-      const model = dataAccessSpec && dataAccessSpec.auth_model ? dataAccessSpec.auth_model : {};
-      authModelChips.innerHTML = '';
-      authModelSummary.innerHTML = '';
-      const chipMap = [
-        ['Public', model.public_reads],
-        ['Session', model.account_session],
-        ['API key', model.api_key],
-      ];
-      chipMap.forEach(([label, description]) => {
-        if (!description) return;
-        const chip = document.createElement('span');
-        chip.className = 'metric-chip';
-        chip.innerHTML = `${escapeHTML(label)} <b>${escapeHTML(description.split('.')[0] || '')}</b>`;
-        authModelChips.appendChild(chip);
-        const row = document.createElement('div');
-        row.textContent = description;
-        authModelSummary.appendChild(row);
-      });
-    }
-
-    function renderDataAccessSpec() {
-      const endpoints = Array.isArray(dataAccessSpec && dataAccessSpec.endpoints) ? dataAccessSpec.endpoints : [];
-      endpointList.innerHTML = endpoints.map((endpoint) => {
-        const query = endpoint && endpoint.query && typeof endpoint.query === 'object'
-          ? Object.entries(endpoint.query).map(([key, value]) => `<div class="muted mono">${escapeHTML(key)}: ${escapeHTML(String(value || ''))}</div>`).join('')
-          : '';
-        return `
-          <div class="endpoint-card">
-            <div class="endpoint-header">
-              <div>
-                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                  <span class="method-badge">${escapeHTML(String(endpoint.method || 'GET'))}</span>
-                  <span class="auth-badge ${escapeHTML(String(endpoint.auth || 'public'))}">${escapeHTML(String(endpoint.auth || 'public'))}</span>
-                </div>
-                <div style="margin-top:8px; font-weight:600;">${escapeHTML(String(endpoint.path || ''))}</div>
-              </div>
-            </div>
-            <div class="note">${escapeHTML(String(endpoint.description || ''))}</div>
-            ${query ? `<div style="margin-top:8px;">${query}</div>` : ''}
-          </div>
-        `;
-      }).join('');
-    }
-
-    function renderGeneratedExamples() {
-      const origin = window.location.origin;
-      const streamID = selectedStreamID() || 15944;
-      const sampleSegmentIDs = clipItems.slice(0, 2).map((item) => Number(item.id || 0)).filter((id) => id > 0);
-      publicExample.textContent =
-`curl "${origin}/api/v1/dashboard/streams?recording_state=on&limit=5&q=${encodeURIComponent(String(streamSearch.value || 'seoul'))}"`;
-      clipExample.textContent =
-`curl -H "Authorization: Bearer ${exampleAPIKey()}" \\
-  "${origin}/api/v1/account/streams/${streamID}/clips?limit=5&offset=0"\n\ncurl -X POST "${origin}/api/v1/account/clips/download-prepare" \\
-  -H "Authorization: Bearer ${exampleAPIKey()}" \\
-  -H "Content-Type: application/json" \\
-  -d '${JSON.stringify({ stream_id: streamID, segment_ids: sampleSegmentIDs.length ? sampleSegmentIDs : [12345, 12346] })}'`;
-      recordingExample.textContent =
-`await fetch("/api/v1/recording/streams/${streamID}/assign", {
-  method: "POST",
-  credentials: "include",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ server_id: "capture-node-1", reason: "account page example" })
-});`;
-    }
-
-    function renderSelectedStream() {
-      if (!selectedStream || selectedStreamID() <= 0) {
-        setVisibility(selectedStreamBox, false);
-        renderGeneratedExamples();
-        return;
-      }
-      setVisibility(selectedStreamBox, true);
-      selectedStreamTitle.textContent = String(selectedStream.title || selectedStream.slug || `#${selectedStreamID()}`);
-      selectedStreamDashboardLink.href = `/dashboard/stream/${selectedStreamID()}`;
-      selectedStreamMeta.innerHTML = [
-        `<div><b>ID</b> <span class="mono">#${selectedStreamID()}</span></div>`,
-        `<div><b>Provider</b> ${escapeHTML(String(selectedStream.provider || '-'))}</div>`,
-        `<div><b>Slug</b> <span class="mono">${escapeHTML(String(selectedStream.slug || '-'))}</span></div>`,
-        `<div><b>Location</b> ${escapeHTML(String(selectedStream.location_text || selectedStream.location_city || '-'))}</div>`,
-      ].join('');
-      selectedStreamChips.innerHTML = '';
-      [
-        ['Recording', String(selectedStream.recording_state || 'off')],
-        ['Capture', String(selectedStream.capture_type || '-')],
-        ['Source', String(selectedStream.source_family || '-')],
-      ].forEach(([label, value]) => {
-        const chip = document.createElement('span');
-        chip.className = 'metric-chip';
-        chip.innerHTML = `${escapeHTML(label)} <b>${escapeHTML(value)}</b>`;
-        selectedStreamChips.appendChild(chip);
-      });
-      renderGeneratedExamples();
-    }
-
-    function renderStreamResults(items) {
-      if (!Array.isArray(items) || !items.length) {
-        streamResults.innerHTML = '<div class="empty-state">No streams matched that search.</div>';
-        return;
-      }
-      streamResults.innerHTML = items.map((item) => {
-        const id = Number(item.id || 0);
-        const title = String(item.title || item.slug || `#${id}`);
-        const location = String(item.location_text || item.location_city || '').trim();
-        return `
-          <div class="stream-result">
-            <div class="stream-result-header">
-              <div>
-                <div class="stream-result-title">${escapeHTML(title)}</div>
-                <div class="stream-result-meta">${escapeHTML(String(item.provider || '-'))} / <span class="mono">${escapeHTML(String(item.slug || '-'))}</span>${location ? ` · ${escapeHTML(location)}` : ''}</div>
-              </div>
-              <span class="auth-badge public">${escapeHTML(String(item.recording_state || 'off'))}</span>
-            </div>
-            <div class="metric-row">
-              <span class="metric-chip">Capture <b>${escapeHTML(String(item.capture_type || '-'))}</b></span>
-              <span class="metric-chip">ID <b>#${id}</b></span>
-            </div>
-            <div class="stream-result-actions">
-              <button type="button" class="secondary" data-select-stream="${id}">Use stream</button>
-              <a href="/dashboard/stream/${id}" target="_blank" rel="noopener noreferrer">Open dashboard</a>
-            </div>
-          </div>
-        `;
-      }).join('');
-      streamResults.querySelectorAll('[data-select-stream]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const id = Number(btn.getAttribute('data-select-stream'));
-          if (!Number.isFinite(id) || id <= 0) return;
-          await selectStreamByID(id);
-        });
-      });
-    }
-
-    async function loadDataAccessSpec() {
-      try {
-        dataAccessSpec = await fetchJSON('/api/v1/data-access-spec');
-      } catch (err) {
-        setStatus(streamSearchStatus, String(err), 'err');
-        dataAccessSpec = null;
-      }
-      renderAuthModel();
-      renderDataAccessSpec();
-      renderGeneratedExamples();
-    }
-
-    async function runStreamSearch() {
-      try {
-        setStatus(streamSearchStatus, 'Searching...', '');
-        const params = new URLSearchParams();
-        const query = String(streamSearch.value || '').trim();
-        if (query) params.set('q', query);
-        params.set('recording_state', 'on');
-        params.set('include_image_urls', '0');
-        params.set('limit', '12');
-        params.set('offset', '0');
-        const payload = await fetchJSON(`/api/v1/dashboard/streams?${params}`);
-        const items = Array.isArray(payload.items) ? payload.items : [];
-        renderStreamResults(items);
-        setStatus(streamSearchStatus, `${items.length} stream${items.length === 1 ? '' : 's'} shown`, 'ok');
-      } catch (err) {
-        renderStreamResults([]);
-        setStatus(streamSearchStatus, String(err), 'err');
-      }
-    }
-
-    async function selectStreamByID(id) {
-      try {
-        setStatus(streamSearchStatus, `Loading stream #${id}...`, '');
-        const payload = await fetchJSON(`/api/v1/dashboard/streams/${id}`);
-        selectedStream = payload && payload.stream ? payload.stream : null;
-        clipOffset = 0;
-        renderSelectedStream();
-        await refreshClips();
-        setStatus(streamSearchStatus, `Selected stream #${id}`, 'ok');
-      } catch (err) {
-        setStatus(streamSearchStatus, String(err), 'err');
-      }
-    }
-
-    function selectedClipIDs() {
-      return Array.from(clipsRows.querySelectorAll('input[data-clip-id]:checked'))
-        .map((input) => Number(input.getAttribute('data-clip-id')))
-        .filter((id) => Number.isFinite(id) && id > 0);
-    }
-
-    function updateClipSelectionState() {
-      const selected = selectedClipIDs();
-      const maxSegments = Number(dataAccessSpec && dataAccessSpec.batch_limits && dataAccessSpec.batch_limits.clip_download_prepare_max_segments || 120);
-      if (selected.length > maxSegments) {
-        setStatus(clipsStatus, `Select at most ${maxSegments} clips per batch.`, 'err');
-      } else if (selected.length > 0) {
-        setStatus(clipsStatus, `${selected.length} clip${selected.length === 1 ? '' : 's'} selected`, 'ok');
-      }
-      downloadSelectedBtn.disabled = selected.length === 0 || selected.length > maxSegments;
-      if (clipSelectPageCheckbox instanceof HTMLInputElement) {
-        const pageIDs = clipItems.map((item) => Number(item.id || 0)).filter((id) => id > 0);
-        clipSelectPageCheckbox.checked = pageIDs.length > 0 && pageIDs.every((id) => selected.includes(id));
-      }
-    }
-
-    function renderClips(items) {
-      clipItems = Array.isArray(items) ? items : [];
-      if (!currentAccount) {
-        clipsRows.innerHTML = '';
-        setVisibility(clipsTableWrap, false);
-        setVisibility(clipsEmpty, true);
-        setStatus(clipsStatus, 'Sign in to browse recorded clips and prepare downloads.', '');
-        downloadSelectedBtn.disabled = true;
-        return;
-      }
-      if (!selectedStream || selectedStreamID() <= 0) {
-        clipsRows.innerHTML = '';
-        setVisibility(clipsTableWrap, false);
-        setVisibility(clipsEmpty, true);
-        setStatus(clipsStatus, 'Select a stream to browse recorded clips.', '');
-        downloadSelectedBtn.disabled = true;
-        return;
-      }
-      if (!clipItems.length) {
-        clipsRows.innerHTML = '';
-        setVisibility(clipsTableWrap, false);
-        setVisibility(clipsEmpty, true);
-        setStatus(clipsStatus, `No clips found for stream #${selectedStreamID()} at offset ${clipOffset}.`, '');
-        downloadSelectedBtn.disabled = true;
-        return;
-      }
-      setVisibility(clipsEmpty, false);
-      setVisibility(clipsTableWrap, true);
-      clipsRows.innerHTML = clipItems.map((item) => `
-        <tr>
-          <td><input type="checkbox" data-clip-id="${Number(item.id || 0)}" /></td>
-          <td><div>${formatDate(item.segment_start_at)}</div><div class="muted mono">${formatDate(item.segment_end_at)}</div></td>
-          <td>${escapeHTML(formatDurationMs(item.duration_ms))}</td>
-          <td><div>${escapeHTML(String(item.container || item.mime_type || '-'))}</div><div class="muted mono">${escapeHTML(String(item.execution_class || '-'))}</div></td>
-          <td>${escapeHTML(formatBytes(item.size_bytes))}</td>
-          <td>${item.thumbnail_download_url ? `<a href="${escapeHTML(String(item.thumbnail_download_url))}" target="_blank" rel="noopener noreferrer">Thumbnail</a>` : '<span class="muted">-</span>'}</td>
-          <td>
-            <div class="clip-actions">
-              ${item.download_url ? `<a href="${escapeHTML(String(item.download_url))}" target="_blank" rel="noopener noreferrer">Download</a>` : '<span class="muted">Unavailable</span>'}
-            </div>
-          </td>
-        </tr>
-      `).join('');
-      clipsRows.querySelectorAll('input[data-clip-id]').forEach((input) => {
-        input.addEventListener('change', updateClipSelectionState);
-      });
-      updateClipSelectionState();
-      renderGeneratedExamples();
-      setStatus(clipsStatus, `Showing ${clipItems.length} clip${clipItems.length === 1 ? '' : 's'} for stream #${selectedStreamID()} (offset ${clipOffset}).`, 'ok');
-    }
-
-    async function refreshClips() {
-      if (!currentAccount || !selectedStream || selectedStreamID() <= 0) {
-        renderClips([]);
-        return;
-      }
-      try {
-        setStatus(clipsStatus, 'Loading clips...', '');
-        const payload = await fetchJSON(`/api/v1/account/streams/${selectedStreamID()}/clips?limit=${clipLimit}&offset=${clipOffset}`);
-        renderClips(Array.isArray(payload.items) ? payload.items : []);
-      } catch (err) {
-        renderClips([]);
-        setStatus(clipsStatus, String(err), 'err');
-      }
-    }
-
-    async function prepareSelectedDownloads() {
-      const ids = selectedClipIDs();
-      const maxSegments = Number(dataAccessSpec && dataAccessSpec.batch_limits && dataAccessSpec.batch_limits.clip_download_prepare_max_segments || 120);
-      if (!ids.length) {
-        setStatus(clipsStatus, 'Select at least one clip.', 'err');
-        return;
-      }
-      if (ids.length > maxSegments) {
-        setStatus(clipsStatus, `Select at most ${maxSegments} clips per batch.`, 'err');
-        return;
-      }
-      try {
-        setStatus(clipsStatus, 'Preparing downloads...', '');
-        const payload = await fetchJSON('/api/v1/account/clips/download-prepare', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ stream_id: selectedStreamID(), segment_ids: ids }),
-        });
-        const items = Array.isArray(payload.items) ? payload.items : [];
-        renderTokenBox(clipDownloadResults, {
-          title: `Prepared ${items.length} clip download${items.length === 1 ? '' : 's'}`,
-          extraHTML: `
-            <div class="clip-download-list" style="margin-top:10px;">
-              ${items.map((item) => `<div><a href="${escapeHTML(String(item.download_url || ''))}" target="_blank" rel="noopener noreferrer">${escapeHTML(String(item.filename || `clip-${item.id}`))}</a></div>`).join('')}
-            </div>
-          `,
-        });
-        items.forEach((item, idx) => {
-          const href = String(item.download_url || '').trim();
-          if (!href) return;
-          window.setTimeout(() => {
-            const anchor = document.createElement('a');
-            anchor.href = href;
-            anchor.download = String(item.filename || `clip-${item.id}`);
-            anchor.rel = 'noopener noreferrer';
-            anchor.target = '_blank';
-            document.body.appendChild(anchor);
-            anchor.click();
-            anchor.remove();
-          }, idx * 120);
-        });
-        setStatus(clipsStatus, `Prepared ${items.length} download${items.length === 1 ? '' : 's'}. Larger retrievals should use the API with pagination.`, 'ok');
-      } catch (err) {
-        setStatus(clipsStatus, String(err), 'err');
-      }
-    }
-
-    async function refreshSession() {
-      try {
-        const payload = await fetchJSON('/api/v1/account/me');
-        currentAccount = payload.account || {};
-        accountBox.classList.remove('hidden');
-        const role = String(currentAccount.role || 'member');
-        const authType = String(currentAccount.auth_type || 'session');
-        accountMeta.innerHTML = `
-          <div><b>${escapeHTML(String(currentAccount.email || ''))}</b></div>
-          <div class="muted">Role: ${escapeHTML(role)} · Auth: ${escapeHTML(authType)}</div>
-          <div class="muted">Signed-in account auth can browse clips and toggle recording.</div>
-        `;
-        setStatus(accountStatus, 'Signed in.', 'ok');
-        keysEmpty.classList.add('hidden');
-        keysBox.classList.remove('hidden');
-        enrollmentEmpty.classList.add('hidden');
-        enrollmentBox.classList.remove('hidden');
-        nodesEmpty.classList.add('hidden');
-        nodesBox.classList.remove('hidden');
-        await Promise.all([
-          refreshKeys(),
-          refreshEnrollmentTokens(),
-          refreshNodes(),
-        ]);
-      } catch (err) {
-        currentAccount = null;
-        accountBox.classList.add('hidden');
-        keysBox.classList.add('hidden');
-        keysEmpty.classList.remove('hidden');
-        enrollmentBox.classList.add('hidden');
-        enrollmentEmpty.classList.remove('hidden');
-        nodesBox.classList.add('hidden');
-        nodesEmpty.classList.remove('hidden');
-        setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
-      }
-      updateAccountChrome();
-      await refreshClips();
-      renderGeneratedExamples();
+      if (adminChip instanceof HTMLElement) adminChip.style.display = role === 'admin' ? 'inline-flex' : 'none';
     }
 
     async function refreshKeys() {
@@ -1411,6 +746,44 @@
       }).join('');
     }
 
+    async function refreshSession() {
+      try {
+        const payload = await fetchJSON('/api/v1/account/me');
+        currentAccount = payload.account || {};
+        accountBox.classList.remove('hidden');
+        const role = String(currentAccount.role || 'member');
+        const authType = String(currentAccount.auth_type || 'session');
+        accountMeta.innerHTML = `
+          <div><b>${escapeHTML(String(currentAccount.email || ''))}</b></div>
+          <div class="muted">Role: ${escapeHTML(role)} · Auth: ${escapeHTML(authType)}</div>
+          <div class="muted">Use this session for account-scoped tools and downloads.</div>
+        `;
+        setStatus(accountStatus, 'Signed in.', 'ok');
+        keysEmpty.classList.add('hidden');
+        keysBox.classList.remove('hidden');
+        enrollmentEmpty.classList.add('hidden');
+        enrollmentBox.classList.remove('hidden');
+        nodesEmpty.classList.add('hidden');
+        nodesBox.classList.remove('hidden');
+        await Promise.all([
+          refreshKeys(),
+          refreshEnrollmentTokens(),
+          refreshNodes(),
+        ]);
+      } catch (_) {
+        currentAccount = null;
+        accountBox.classList.add('hidden');
+        keysBox.classList.add('hidden');
+        keysEmpty.classList.remove('hidden');
+        enrollmentBox.classList.add('hidden');
+        enrollmentEmpty.classList.remove('hidden');
+        nodesBox.classList.add('hidden');
+        nodesEmpty.classList.remove('hidden');
+        setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
+      }
+      updateAccountChrome();
+    }
+
     document.getElementById('requestLink').addEventListener('click', async () => {
       const email = String(document.getElementById('email').value || '').trim();
       try {
@@ -1433,13 +806,11 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ label }),
         });
-        latestCreatedAPIKey = String(payload.token || '').trim();
         renderTokenBox(newTokenBox, {
           title: 'Copy now. This API key is shown once.',
-          value: latestCreatedAPIKey,
+          value: String(payload.token || '').trim(),
           statusEl: createKeyStatus,
         });
-        renderGeneratedExamples();
         setStatus(createKeyStatus, 'API key created.', 'ok');
         await refreshKeys();
       } catch (err) {
@@ -1461,10 +832,6 @@
         renderTokenBox(newEnrollmentTokenBox, {
           title: 'Copy now. This enrollment token is shown once.',
           value: token,
-          statusEl: createEnrollmentStatus,
-        });
-        renderTokenBox(relayInstallBox, {
-          title: 'Next',
           commands: [enrollCmd, installCmd],
           statusEl: createEnrollmentStatus,
         });
@@ -1482,46 +849,8 @@
       window.location.reload();
     });
 
-    streamSearchBtn.addEventListener('click', () => {
-      void runStreamSearch();
-    });
-    streamSearch.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter') return;
-      e.preventDefault();
-      void runStreamSearch();
-    });
-
-    document.getElementById('copyPublicExampleBtn').addEventListener('click', () => copyText(publicExample.textContent || '', streamSearchStatus, 'Public example copied.'));
-    document.getElementById('copyClipExampleBtn').addEventListener('click', () => copyText(clipExample.textContent || '', clipsStatus, 'Clip example copied.'));
-    document.getElementById('copyRecordingExampleBtn').addEventListener('click', () => copyText(recordingExample.textContent || '', clipsStatus, 'Recording example copied.'));
-
-    clipsReloadBtn.addEventListener('click', () => { void refreshClips(); });
-    clipsPrevBtn.addEventListener('click', () => {
-      clipOffset = Math.max(0, clipOffset - clipLimit);
-      void refreshClips();
-    });
-    clipsNextBtn.addEventListener('click', () => {
-      clipOffset += clipLimit;
-      void refreshClips();
-    });
-    selectAllClipsBtn.addEventListener('click', () => {
-      clipsRows.querySelectorAll('input[data-clip-id]').forEach((input) => { input.checked = true; });
-      updateClipSelectionState();
-    });
-    clipSelectPageCheckbox.addEventListener('change', () => {
-      const checked = !!clipSelectPageCheckbox.checked;
-      clipsRows.querySelectorAll('input[data-clip-id]').forEach((input) => { input.checked = checked; });
-      updateClipSelectionState();
-    });
-    downloadSelectedBtn.addEventListener('click', () => { void prepareSelectedDownloads(); });
-
-    (async function init() {
-      await Promise.all([
-        loadDataAccessSpec(),
-        refreshSession(),
-      ]);
-      await runStreamSearch();
-    })();
+    void refreshSession();
+    void refreshTopbarMetrics();
   </script>
 </body>
 </html>

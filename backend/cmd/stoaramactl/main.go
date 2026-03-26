@@ -105,6 +105,7 @@ func usage() {
 	  stoaramactl youtube-relay source run [--backend-api-url URL --api-token TOKEN --server-id ID --shard-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 30 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role source --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.2 --source-endpoint HOST:PORT --duration 0 --resolve-timeout-sec 30 --resolve-failure-threshold 3 --bind-addr :18080 --public-base-url URL --shared-token TOKEN --cache-file FILE --yt-dlp-cookies-file FILE|--yt-dlp-cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT]
 	  stoaramactl youtube-relay sink run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role sink --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.11 --relay-source-server-id ID --relay-source-public-base-url URL --duration 0]
 	  stoaramactl youtube-relay routes [--source-server-id ID --sink-server-id ID --status assigned|source_ready|running|stopped|failed --limit 500 --offset 0]
+	  stoaramactl youtube-relay doctor (--stream-id N | --source-server-id ID) [--sink-server-id ID --backend-api-url URL --api-token TOKEN --timeout-sec 20 --json]
 	  stoaramactl youtube-relay route-status --stream-id N --actor source|sink|operator --status assigned|source_ready|running|stopped|failed [--relay-pull-url URL --reason TEXT --error-text TEXT]
 	  stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]
 	  stoaramactl capture probe (--id N | --provider P --source-url URL) [--source-page-url URL --capture-type TYPE --capture-timeout-sec 60]
@@ -168,6 +169,10 @@ func usage() {
 	  stoaramactl recording queue [--hours 24] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording coverage --id N [--days 365] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording samples --id N [--count 42] [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl recording reconcile --id N [--apply --backend-api-url URL --api-token TOKEN]
+	  stoaramactl recording supervisor run [--backend-api-url URL --api-token TOKEN --interval-sec 60 --limit 500 --dry-run --once]
+	  stoaramactl recording supervisor incidents [--status open|resolved --limit 200 --json]
+	  stoaramactl recording supervisor reconcile --id N [--apply --backend-api-url URL --api-token TOKEN]
 	  stoaramactl servers list [--backend-api-url URL --api-token TOKEN --hours 168 --include-stale=false --show-processes=true]
 	  stoaramactl servers assignments [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl servers assignments audit [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]
@@ -453,7 +458,7 @@ func runYouTubeServer(ctx context.Context, cfg config.Config, args []string) {
 
 func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl youtube-relay <source|sink|routes|route-status> ...")
+		log.Fatalf("usage: stoaramactl youtube-relay <source|sink|routes|doctor|route-status> ...")
 	}
 	switch args[0] {
 	case "source":
@@ -626,6 +631,59 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 			routes: map[int64]relayRouteState{},
 		}
 		relayHTTPClient := &http.Client{}
+		probeRelayPlaylist := func(ctx context.Context, relayPullURL string) error {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, relayPullURL, nil)
+			if err != nil {
+				return fmt.Errorf("build relay probe request: %w", err)
+			}
+			resp, err := relayHTTPClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("fetch relay playlist: %w", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return fmt.Errorf("relay playlist status=%d", resp.StatusCode)
+			}
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+			if err != nil {
+				return fmt.Errorf("read relay playlist: %w", err)
+			}
+			trimmed := bytes.TrimSpace(body)
+			if !bytes.HasPrefix(trimmed, []byte("#EXTM3U")) {
+				return fmt.Errorf("relay playlist is not valid hls")
+			}
+			segmentURL := ""
+			for _, rawLine := range strings.Split(strings.ReplaceAll(string(trimmed), "\r\n", "\n"), "\n") {
+				line := strings.TrimSpace(rawLine)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				segmentURL = line
+				break
+			}
+			if segmentURL == "" {
+				return fmt.Errorf("relay playlist has no segment entries")
+			}
+			if !strings.Contains(segmentURL, "/segment?") {
+				return fmt.Errorf("relay playlist did not rewrite segment urls")
+			}
+			segReq, err := http.NewRequestWithContext(ctx, http.MethodGet, segmentURL, nil)
+			if err != nil {
+				return fmt.Errorf("build relay segment probe request: %w", err)
+			}
+			segResp, err := relayHTTPClient.Do(segReq)
+			if err != nil {
+				return fmt.Errorf("fetch relay segment: %w", err)
+			}
+			defer segResp.Body.Close()
+			if segResp.StatusCode < 200 || segResp.StatusCode >= 300 {
+				return fmt.Errorf("relay segment status=%d", segResp.StatusCode)
+			}
+			if _, err := io.Copy(io.Discard, io.LimitReader(segResp.Body, 1024)); err != nil {
+				return fmt.Errorf("read relay segment probe: %w", err)
+			}
+			return nil
+		}
 		isHopByHopHeader := func(k string) bool {
 			switch strings.ToLower(strings.TrimSpace(k)) {
 			case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
@@ -655,7 +713,9 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 				http.Error(w, "missing relay stream id", http.StatusNotFound)
 				return
 			}
+			relaySuffix := ""
 			if idx := strings.IndexByte(pathPart, '/'); idx >= 0 {
+				relaySuffix = strings.Trim(strings.TrimSpace(pathPart[idx+1:]), "/")
 				pathPart = pathPart[:idx]
 			}
 			if idx := strings.IndexByte(pathPart, '.'); idx >= 0 {
@@ -673,7 +733,19 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 				http.Error(w, "relay route not ready", http.StatusNotFound)
 				return
 			}
-			upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, state.UpstreamURL, nil)
+			upstreamURL := strings.TrimSpace(state.UpstreamURL)
+			if relaySuffix != "" {
+				if relaySuffix != "segment" {
+					http.Error(w, "unknown relay path", http.StatusNotFound)
+					return
+				}
+				upstreamURL = strings.TrimSpace(r.URL.Query().Get("u"))
+				if upstreamURL == "" {
+					http.Error(w, "missing upstream segment url", http.StatusBadRequest)
+					return
+				}
+			}
+			upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, nil)
 			if err != nil {
 				http.Error(w, "build upstream request failed", http.StatusBadGateway)
 				return
@@ -700,8 +772,28 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 					w.Header().Add(k, v)
 				}
 			}
+			if relaySuffix == "" {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			w.Header().Set("X-Youtube-Relay-Server", strings.TrimSpace(*serverID))
 			w.Header().Set("X-Youtube-Relay-Stream", strconv.FormatInt(streamID, 10))
+			if relaySuffix == "" && r.Method == http.MethodGet && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				body, readErr := io.ReadAll(resp.Body)
+				if readErr != nil {
+					http.Error(w, fmt.Sprintf("read upstream response failed: %v", readErr), http.StatusBadGateway)
+					return
+				}
+				if rewritten, ok := rewriteRelayPlaylist(strings.TrimRight(strings.TrimSpace(*publicBaseURL), "/"), streamID, strings.TrimSpace(*sharedToken), upstreamURL, body); ok {
+					w.Header().Del("Content-Length")
+					w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+					w.WriteHeader(resp.StatusCode)
+					_, _ = w.Write(rewritten)
+					return
+				}
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(body)
+				return
+			}
 			w.WriteHeader(resp.StatusCode)
 			if r.Method == http.MethodHead {
 				return
@@ -855,6 +947,30 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 							route.StreamID,
 							time.Since(cached.UpdatedAt).Round(time.Second),
 						)
+						probeCtx, probeCancel := context.WithTimeout(runCtx, 15*time.Second)
+						probeErr := probeRelayPlaylist(probeCtx, relayPullURL)
+						probeCancel()
+						if probeErr != nil {
+							relayState.mu.Lock()
+							delete(relayState.routes, route.StreamID)
+							relayState.mu.Unlock()
+							delete(lastUpstreamURL, route.StreamID)
+							delete(lastPublishedPullURL, route.StreamID)
+							delete(lastStatus, route.StreamID)
+							_ = client.UpdateYouTubeRelayRouteStatus(runCtx, captureapi.YouTubeRelayRouteStatusRequest{
+								StreamID:  route.StreamID,
+								Actor:     "youtube_relay_source",
+								Status:    "failed",
+								Reason:    "source_probe_failed",
+								ErrorText: strings.TrimSpace(probeErr.Error()),
+								MetadataJSON: map[string]any{
+									"source_server_id": strings.TrimSpace(*serverID),
+									"relay_public_url": relayPullURL,
+									"cache_restored":   true,
+								},
+							})
+							continue
+						}
 						_ = client.UpdateYouTubeRelayRouteStatus(runCtx, captureapi.YouTubeRelayRouteStatusRequest{
 							StreamID:     route.StreamID,
 							Actor:        "youtube_relay_source",
@@ -863,14 +979,15 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 							RelayPullURL: relayPullURL,
 							ErrorText:    "",
 							MetadataJSON: map[string]any{
-								"source_server_id":  strings.TrimSpace(*serverID),
-								"relay_public_url":  relayPullURL,
-								"relay_bind_addr":   strings.TrimSpace(*bindAddr),
-								"network_transport": strings.TrimSpace(*networkTransport),
-								"topology_id":       strings.TrimSpace(*topologyID),
-								"topology_role":     strings.TrimSpace(*topologyRole),
-								"hub_server_id":     strings.TrimSpace(*hubServerID),
-								"cache_restored":    true,
+								"source_server_id":   strings.TrimSpace(*serverID),
+								"relay_public_url":   relayPullURL,
+								"relay_bind_addr":    strings.TrimSpace(*bindAddr),
+								"network_transport":  strings.TrimSpace(*networkTransport),
+								"topology_id":        strings.TrimSpace(*topologyID),
+								"topology_role":      strings.TrimSpace(*topologyRole),
+								"hub_server_id":      strings.TrimSpace(*hubServerID),
+								"cache_restored":     true,
+								"source_verified_at": time.Now().UTC().Format(time.RFC3339Nano),
 							},
 						})
 					}
@@ -938,6 +1055,26 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 				relayState.mu.Lock()
 				relayState.routes[route.StreamID] = relayRouteState{UpstreamURL: upstreamURL}
 				relayState.mu.Unlock()
+				probeCtx, probeCancel := context.WithTimeout(runCtx, 15*time.Second)
+				probeErr := probeRelayPlaylist(probeCtx, relayPullURL)
+				probeCancel()
+				if probeErr != nil {
+					relayState.mu.Lock()
+					delete(relayState.routes, route.StreamID)
+					relayState.mu.Unlock()
+					_ = client.UpdateYouTubeRelayRouteStatus(runCtx, captureapi.YouTubeRelayRouteStatusRequest{
+						StreamID:  route.StreamID,
+						Actor:     "youtube_relay_source",
+						Status:    "failed",
+						Reason:    "source_probe_failed",
+						ErrorText: strings.TrimSpace(probeErr.Error()),
+						MetadataJSON: map[string]any{
+							"source_server_id": strings.TrimSpace(*serverID),
+							"relay_public_url": relayPullURL,
+						},
+					})
+					continue
+				}
 				if err := client.UpdateYouTubeRelayRouteStatus(runCtx, captureapi.YouTubeRelayRouteStatusRequest{
 					StreamID:     route.StreamID,
 					Actor:        "youtube_relay_source",
@@ -946,13 +1083,14 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 					RelayPullURL: relayPullURL,
 					ErrorText:    "",
 					MetadataJSON: map[string]any{
-						"source_server_id":  strings.TrimSpace(*serverID),
-						"relay_public_url":  relayPullURL,
-						"relay_bind_addr":   strings.TrimSpace(*bindAddr),
-						"network_transport": strings.TrimSpace(*networkTransport),
-						"topology_id":       strings.TrimSpace(*topologyID),
-						"topology_role":     strings.TrimSpace(*topologyRole),
-						"hub_server_id":     strings.TrimSpace(*hubServerID),
+						"source_server_id":   strings.TrimSpace(*serverID),
+						"relay_public_url":   relayPullURL,
+						"relay_bind_addr":    strings.TrimSpace(*bindAddr),
+						"network_transport":  strings.TrimSpace(*networkTransport),
+						"topology_id":        strings.TrimSpace(*topologyID),
+						"topology_role":      strings.TrimSpace(*topologyRole),
+						"hub_server_id":      strings.TrimSpace(*hubServerID),
+						"source_verified_at": time.Now().UTC().Format(time.RFC3339Nano),
 					},
 				}); err != nil {
 					return fmt.Errorf("update youtube relay route status stream_id=%d: %w", route.StreamID, err)
@@ -1303,6 +1441,8 @@ func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
 				route.StreamID, route.SourceServerID, route.SinkServerID, route.Status, route.AssignmentRevision, route.RelayPullURL, route.ErrorText,
 			)
 		}
+	case "doctor":
+		runYouTubeRelayDoctor(ctx, cfg, args[1:])
 	case "route-status":
 		fs := flag.NewFlagSet("youtube-relay route-status", flag.ExitOnError)
 		streamID := fs.Int64("stream-id", 0, "stream id")
@@ -2013,6 +2153,10 @@ func runCapture(ctx context.Context, cfg config.Config, args []string) {
 			go func() {
 				defer wg.Done()
 				for s := range workCh {
+					targetFPS := capture.GetConfigInt(s.Cfg, "target_fps", 10)
+					if targetFPS <= 0 {
+						targetFPS = 10
+					}
 					spec := capture.StreamSpec{
 						ID:                 s.ID,
 						Provider:           s.Provider,
@@ -2021,7 +2165,7 @@ func runCapture(ctx context.Context, cfg config.Config, args []string) {
 						CaptureMode:        capture.LegacyModeForStream(s.CaptureType, s.ExecutionClass),
 						CaptureConfig:      s.Cfg,
 						CaptureIntervalSec: maxInt(1, capture.GetConfigInt(s.Cfg, "poll_interval_sec", 1)),
-						TargetFPS:          maxInt(1, capture.GetConfigInt(s.Cfg, "target_fps", 1)),
+						TargetFPS:          targetFPS,
 					}
 					effective := capture.EffectiveMode(spec)
 					item := auditResult{
@@ -2356,7 +2500,107 @@ func printDiscoveryUsage() {
 }
 
 func printRecordingUsage() {
-	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples> ...\n")
+	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples|reconcile|supervisor> ...\n")
+}
+
+const relayPlaylistTailSegments = 12
+
+func rewriteRelayPlaylist(relayBaseURL string, streamID int64, token string, upstreamPlaylistURL string, body []byte) ([]byte, bool) {
+	trimmedBody := bytes.TrimSpace(body)
+	if !bytes.HasPrefix(trimmedBody, []byte("#EXTM3U")) {
+		return nil, false
+	}
+	baseURL, err := url.Parse(strings.TrimSpace(upstreamPlaylistURL))
+	if err != nil {
+		return nil, false
+	}
+	lines := strings.Split(strings.ReplaceAll(string(trimmedBody), "\r\n", "\n"), "\n")
+	header := []string{}
+	blocks := make([][]string, 0, 32)
+	current := []string{}
+	mediaSequence := -1
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.EqualFold(line, "#EXT-X-ENDLIST") {
+			continue
+		}
+		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
+			if v, parseErr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"))); parseErr == nil {
+				mediaSequence = v
+			}
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			segmentURL := line
+			if ref, parseErr := url.Parse(line); parseErr == nil {
+				segmentURL = baseURL.ResolveReference(ref).String()
+			}
+			current = append(current, fmt.Sprintf("%s/relay/%d/segment?token=%s&u=%s", strings.TrimRight(strings.TrimSpace(relayBaseURL), "/"), streamID, url.QueryEscape(strings.TrimSpace(token)), url.QueryEscape(segmentURL)))
+			blocks = append(blocks, append([]string(nil), current...))
+			current = current[:0]
+			continue
+		}
+		if len(blocks) == 0 && len(current) == 0 && isGlobalPlaylistTag(line) {
+			header = append(header, line)
+			continue
+		}
+		current = append(current, line)
+	}
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	dropped := 0
+	if len(blocks) > relayPlaylistTailSegments {
+		dropped = len(blocks) - relayPlaylistTailSegments
+		blocks = blocks[dropped:]
+	}
+	out := make([]string, 0, len(header)+1+(len(blocks)*4))
+	if len(header) == 0 || header[0] != "#EXTM3U" {
+		out = append(out, "#EXTM3U")
+	}
+	for _, line := range header {
+		if line == "#EXTM3U" {
+			if len(out) == 0 || out[0] != "#EXTM3U" {
+				out = append(out, line)
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	if mediaSequence >= 0 {
+		out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", mediaSequence+dropped))
+	}
+	for _, block := range blocks {
+		out = append(out, block...)
+	}
+	return []byte(strings.Join(out, "\n") + "\n"), true
+}
+
+func isGlobalPlaylistTag(line string) bool {
+	switch {
+	case line == "#EXTM3U":
+		return true
+	case strings.HasPrefix(line, "#EXT-X-VERSION:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-INDEPENDENT-SEGMENTS"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-TARGETDURATION:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-PLAYLIST-TYPE:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-SERVER-CONTROL:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-PART-INF:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-START:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"):
+		return true
+	case strings.HasPrefix(line, "#EXT-X-MAP:"):
+		return true
+	default:
+		return false
+	}
 }
 
 func patchStreamRecordingState(ctx context.Context, backendAPIURL string, apiToken string, streamID int64, state model.RecordingState) map[string]any {
@@ -4541,21 +4785,33 @@ func runOverviewSurface(ctx context.Context, cfg config.Config, args []string) {
 		queue := mustAPIGet(ctx, apiURL, token, "/api/v1/dashboard/queue-health")
 		servers := mustAPIGet(ctx, apiURL, token, fmt.Sprintf("/api/v1/dashboard/servers?hours=%d&include_stale=%t", *hours, *includeStale))
 		pipelines := mustAPIGet(ctx, apiURL, token, "/api/v1/dashboard/pipelines/overview?include_inactive=false")
+		supervision := mustAPIGet(ctx, apiURL, token, "/api/v1/recording/supervision?limit=1")
+		alertRecipientsConfigured := len(splitCSV(cfg.StreamAlertsRecipients)) > 0
+		alertDeliveryMode := defaultString(strings.TrimSpace(cfg.EmailProvider), "log")
 		if *asJSON {
 			printJSON(map[string]any{
 				"queue_health": queue,
 				"servers":      servers,
 				"pipelines":    pipelines,
+				"supervision":  supervision,
+				"alerts": map[string]any{
+					"email_provider":              alertDeliveryMode,
+					"configured_recipients":       alertRecipientsConfigured,
+					"embedded_api_monitor_active": false,
+					"supervisor_command":          "stoaramactl recording supervisor run",
+				},
 			})
 			return
 		}
 		serverItems, _ := servers["items"].([]any)
 		pipelineItems, _ := pipelines["items"].([]any)
 		fmt.Printf(
-			"recording_on=%v capture_sessions=%v capture_workers=%v inference_workers=%v inference_claims=%v backlog_frames=%v pipelines=%d active_servers=%v/%d\n",
+			"recording_on=%v capture_sessions=%v capture_workers=%v inference_workers=%v inference_claims=%v backlog_frames=%v pipelines=%d active_servers=%v/%d healthy=%v down_10m=%v spotty_2h=%v incidents_open=%v alerts_provider=%s alerts_recipients=%t supervisor=cli\n",
 			queue["recording_on"],
 			queue["capture_active_sessions"], queue["capture_active_workers"], queue["inference_active_workers"],
 			queue["inference_active_claims"], queue["inference_backlog_frames"], len(pipelineItems), servers["active"], len(serverItems),
+			supervision["healthy_total"], supervision["down_10m_total"], supervision["spotty_2h_total"], supervision["incidents_open"],
+			alertDeliveryMode, alertRecipientsConfigured,
 		)
 	case "servers":
 		fs := flag.NewFlagSet("servers list", flag.ExitOnError)
@@ -4997,6 +5253,10 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 				it["day"], segmentID, it["captured_at"], it["object_key"], it["thumbnail_object_key"],
 			)
 		}
+	case "reconcile":
+		runRecordingReconcile(ctx, cfg, args[1:])
+	case "supervisor":
+		runRecordingSupervisor(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown recording subcommand: %s", args[0])
 	}

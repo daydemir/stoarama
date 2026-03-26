@@ -312,9 +312,9 @@ func deriveCaptureCadence(provider string, sourceURL string, sourcePageURL strin
 			}
 		}
 		if expectedFPS == nil {
-			value := float64(GetConfigInt(executionConfig, "target_fps", 1))
+			value := float64(GetConfigInt(executionConfig, "target_fps", 10))
 			if value <= 0 {
-				value = 1
+				value = 10
 			}
 			expectedFPS = &value
 		}

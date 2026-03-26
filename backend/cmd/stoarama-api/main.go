@@ -17,7 +17,6 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/email"
 	"github.com/daydemir/stoarama/backend/internal/inferencebox"
 	"github.com/daydemir/stoarama/backend/internal/r2"
-	"github.com/daydemir/stoarama/backend/internal/streamalerts"
 )
 
 func main() {
@@ -108,18 +107,7 @@ func main() {
 	}
 
 	if cfg.StreamAlertsEnabled {
-		go func() {
-			monitor := streamalerts.NewMonitor(pool, mailer, streamalerts.MonitorConfig{
-				AppBaseURL:      cfg.AppBaseURL,
-				PollInterval:    time.Duration(cfg.StreamAlertsPollSec) * time.Second,
-				ProblemDelay:    time.Duration(cfg.StreamAlertsProblemDelaySec) * time.Second,
-				RepeatInterval:  time.Duration(cfg.StreamAlertsRepeatSec) * time.Second,
-				ResolutionEmail: cfg.StreamAlertsResolutionEmail,
-			})
-			if err := monitor.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("stream-alert monitor exited: %v", err)
-			}
-		}()
+		log.Printf("STREAM_ALERTS_ENABLED is deprecated in stoarama-api; run `stoaramactl recording supervisor run` for recording supervision and alert delivery")
 	}
 
 	httpSrv := &http.Server{

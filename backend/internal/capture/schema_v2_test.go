@@ -115,8 +115,8 @@ func TestDeriveCaptureProfileVideoDefaults(t *testing.T) {
 	if profile.CaptureFamily != CaptureFamilyContinuousVideo {
 		t.Fatalf("capture_family=%q want %q", profile.CaptureFamily, CaptureFamilyContinuousVideo)
 	}
-	if profile.ExpectedFPS == nil || *profile.ExpectedFPS != 1 {
-		t.Fatalf("expected_fps=%v want 1", profile.ExpectedFPS)
+	if profile.ExpectedFPS == nil || *profile.ExpectedFPS != 10 {
+		t.Fatalf("expected_fps=%v want 10", profile.ExpectedFPS)
 	}
 	if profile.ExpectedImageIntervalSec != nil {
 		t.Fatalf("expected_image_interval_sec=%v want nil", profile.ExpectedImageIntervalSec)

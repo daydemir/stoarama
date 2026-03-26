@@ -40,9 +40,11 @@ type Server struct {
 	pool          *pgxpool.Pool
 	r2            *r2.Client
 	mailer        email.Sender
-	dashboardHTML []byte
+	streamsHTML   []byte
+	recordingHTML []byte
 	accountHTML   []byte
 	docsHTML      []byte
+	adminHTML     []byte
 	exportMu      sync.Mutex
 	frameExports  map[string]*frameExportJob
 }
@@ -87,7 +89,11 @@ type frameExportRow struct {
 }
 
 func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer email.Sender) (http.Handler, error) {
-	html, err := loadDashboardHTML()
+	streamsHTML, err := loadStreamsHTML()
+	if err != nil {
+		return nil, err
+	}
+	recordingHTML, err := loadRecordingHTML()
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +101,11 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
-	docsHTML, err := loadYouTubeRelaySourceDocsHTML()
+	docsHTML, err := loadDocsHTML()
+	if err != nil {
+		return nil, err
+	}
+	adminHTML, err := loadAdminHTML()
 	if err != nil {
 		return nil, err
 	}
@@ -104,9 +114,11 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		pool:          pool,
 		r2:            r2c,
 		mailer:        mailer,
-		dashboardHTML: html,
+		streamsHTML:   streamsHTML,
+		recordingHTML: recordingHTML,
 		accountHTML:   accountHTML,
 		docsHTML:      docsHTML,
+		adminHTML:     adminHTML,
 		frameExports:  map[string]*frameExportJob{},
 	}
 	return s.router(), nil
@@ -116,12 +128,21 @@ func (s *Server) router() http.Handler {
 	r := chi.NewRouter()
 
 	r.Get("/healthz", s.handleHealth)
-	r.Get("/", s.handleDashboard)
-	r.Get("/dashboard", s.handleDashboard)
-	r.Get("/dashboard/{tab}", s.handleDashboard)
-	r.Get("/dashboard/stream/{id}", s.handleDashboard)
+	r.Get("/", s.handleStreamsApp)
+	r.Get("/streams", s.handleStreamsApp)
+	r.Get("/streams/{id}", s.handleStreamsApp)
+	r.Get("/recording", s.handleRecordingApp)
+	r.Get("/docs", s.handleDocsRoot)
+	r.Get("/docs/getting-started", s.handleDocsApp)
+	r.Get("/docs/api", s.handleDocsApp)
+	r.Get("/docs/relay-guide", s.handleDocsApp)
+	r.Get("/docs/self-serve", s.handleDocsApp)
 	r.Get("/account", s.handleAccountApp)
-	r.Get("/docs/youtube-relay-source", s.handleYouTubeRelaySourceDocs)
+	r.Get("/admin", s.handleAdminApp)
+	r.Get("/dashboard", s.redirectDashboard)
+	r.Get("/dashboard/{tab}", s.redirectDashboard)
+	r.Get("/dashboard/stream/{id}", s.redirectDashboard)
+	r.Get("/docs/youtube-relay-source", s.redirectLegacyRelayGuide)
 	r.Get("/auth/complete", s.handleAccountAuthComplete)
 
 	r.Route("/api/v1", func(api chi.Router) {
@@ -233,6 +254,8 @@ func (s *Server) router() http.Handler {
 			admin.Post("/source-candidates/{id}/review", s.handleSourceCandidateReview)
 			admin.Post("/source-candidates/{id}/import", s.handleSourceCandidateImport)
 			admin.Get("/recording/assignments/audit", s.handleRecordingAssignmentsAudit)
+			admin.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
+			admin.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			admin.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
 			admin.Patch("/streams/{id}/capture", s.handleStreamsCapturePatch)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
@@ -290,6 +313,8 @@ func (s *Server) router() http.Handler {
 			service.Post("/imports/streams/recording-state", s.handleServiceStreamRecordingState)
 			service.Get("/recording/settings", s.handleServiceRecordingSettingsGet)
 			service.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
+			service.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
+			service.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
 			service.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
 			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)
@@ -321,12 +346,6 @@ func (s *Server) router() http.Handler {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(s.dashboardHTML)
 }
 
 func requestIsHTTPS(r *http.Request) bool {
@@ -3961,12 +3980,15 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 					it.LastCaptureAt = runtimeLastFrame
 				}
 			} else if stream.RecordingState == model.RecordingStateOn {
-				it.TargetFPS = 1
-				it.ExpectedFrames60s = expectedFramesPer60s(recordingSettings.CaptureIntervalSec)
-			} else {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 1)
+				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
 				if it.TargetFPS <= 0 {
-					it.TargetFPS = 1
+					it.TargetFPS = 10
+				}
+				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
+			} else {
+				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+				if it.TargetFPS <= 0 {
+					it.TargetFPS = 10
 				}
 				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
 			}
@@ -4176,12 +4198,15 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 					it.LatestCaptured = runtimeLastFrame
 				}
 			} else if stream.RecordingState == model.RecordingStateOn {
-				it.TargetFPS = 1
-				it.ExpectedFrames60s = expectedFramesPer60s(recordingSettings.CaptureIntervalSec)
-			} else {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 1)
+				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
 				if it.TargetFPS <= 0 {
-					it.TargetFPS = 1
+					it.TargetFPS = 10
+				}
+				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
+			} else {
+				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+				if it.TargetFPS <= 0 {
+					it.TargetFPS = 10
 				}
 				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
 			}
@@ -8687,7 +8712,7 @@ func runtimeModeForStream(st model.Stream) capture.Mode {
 		CaptureMode:        mode,
 		CaptureConfig:      cfg,
 		CaptureIntervalSec: capture.GetConfigInt(cfg, "poll_interval_sec", 1),
-		TargetFPS:          capture.GetConfigInt(cfg, "target_fps", 1),
+		TargetFPS:          capture.GetConfigInt(cfg, "target_fps", 10),
 		MaxFrameBytes:      25 << 20,
 	}
 	return capture.EffectiveMode(spec)
@@ -8762,7 +8787,7 @@ func (s *Server) activeCountsByRuntimeMode(ctx context.Context) (map[string]int6
 			CaptureMode:        capture.LegacyModeForStream(captureType, executionClass),
 			CaptureConfig:      cfg,
 			CaptureIntervalSec: capture.GetConfigInt(cfg, "poll_interval_sec", 1),
-			TargetFPS:          capture.GetConfigInt(cfg, "target_fps", 1),
+			TargetFPS:          capture.GetConfigInt(cfg, "target_fps", 10),
 			MaxFrameBytes:      25 << 20,
 		})
 		counts[string(mode)]++
@@ -8945,30 +8970,6 @@ func (s *Server) reserveIdempotency(ctx context.Context, endpoint, key string) (
 		return false, err
 	}
 	return ct.RowsAffected() == 1, nil
-}
-
-func loadDashboardHTML() ([]byte, error) {
-	candidates := []string{
-		"backend/web/dashboard.html",
-		"web/dashboard.html",
-		"../backend/web/dashboard.html",
-		"../web/dashboard.html",
-	}
-	for _, c := range candidates {
-		if b, err := os.ReadFile(c); err == nil {
-			return b, nil
-		}
-	}
-	cwd, _ := os.Getwd()
-	if cwd != "" {
-		for _, rel := range candidates {
-			p := filepath.Join(cwd, rel)
-			if b, err := os.ReadFile(p); err == nil {
-				return b, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("dashboard html not found")
 }
 
 func parseInt64Path(w http.ResponseWriter, r *http.Request, key string) (int64, bool) {

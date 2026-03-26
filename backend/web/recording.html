@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Sto-A-Rama Dashboard</title>
+  <title>Sto-A-Rama Recording</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -13,7 +13,7 @@
     :root {
       --bg: #0a0f1a;
       --panel: #111827;
-      --panel2: #1a2235;
+      --panel2: #182233;
       --text: #e2e8f0;
       --muted: #94a3b8;
       --border: #1e293b;
@@ -52,34 +52,28 @@
     a:hover { text-decoration: underline; }
 
     /* Layout */
-    .shell { max-width: 1960px; margin: 0 auto; padding: 16px 20px 40px; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
 
     /* Topbar */
     .topbar {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
       gap: 12px;
-      flex-wrap: wrap;
-      margin-bottom: 14px;
+      margin-bottom: 16px;
+      min-height: 40px;
     }
-    .topbar-left { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; overflow: hidden; }
+    .topbar-center { display: flex; align-items: center; justify-content: center; min-width: 0; }
     .topbar-right {
       display: flex;
       align-items: center;
       gap: 10px;
-      flex-wrap: wrap;
       justify-content: flex-end;
     }
     .site-title { font-size: 15px; font-weight: 600; letter-spacing: 0.05em; color: var(--accent); font-family: var(--mono); }
-    .site-subtitle {
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .metrics-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .site-subtitle { display: none; }
+    .metrics-row { display: flex; flex-wrap: nowrap; gap: 6px; min-width: 0; overflow: hidden; }
     .metric-chip {
       font-family: var(--mono);
       font-size: 11px;
@@ -147,6 +141,49 @@
     .account-chip a:hover {
       text-decoration: underline;
     }
+    .admin-chip {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      text-decoration: none;
+      flex: 0 0 auto;
+    }
+    .admin-chip:hover {
+      text-decoration: none;
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+      color: var(--accent);
+    }
+    .recording-cta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .recording-cta-card {
+      display: grid;
+      gap: 8px;
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 76%, transparent);
+    }
+    .recording-cta-card h3 {
+      font-size: 16px;
+      line-height: 1.2;
+    }
+    .recording-cta-card p {
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .tabbar { display: none !important; }
     .overview-card-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -1446,6 +1483,17 @@
       .image-modal-meta {
         max-height: 34vh;
       }
+      .topbar {
+        grid-template-columns: minmax(0, 1fr);
+        overflow-x: auto;
+      }
+      .topbar-center,
+      .topbar-right {
+        justify-content: flex-start;
+      }
+      .recording-cta-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -1455,527 +1503,46 @@
   <div class="topbar">
     <div class="topbar-left">
       <span class="site-title">STO-A-RAMA</span>
-      <span class="site-subtitle">Dashboard</span>
       <div class="metrics-row" id="metricsRow"></div>
     </div>
-    <div class="topbar-right">
+    <div class="topbar-center">
       <nav class="global-nav" aria-label="Global">
-        <a href="/dashboard" class="active">Dashboard</a>
-        <a id="accountNavLink" href="/account">Account</a>
-        <a href="/docs/youtube-relay-source">Relay Guide</a>
+        <a href="/streams">Streams</a>
+        <a href="/recording" class="active">Recording</a>
+        <a href="/docs/getting-started">Docs</a>
       </nav>
+    </div>
+    <div class="topbar-right">
+      <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">⚙</a>
       <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
     </div>
   </div>
 
-  <!-- Tab bar -->
-  <div class="tabbar">
-    <button class="tab-btn active" id="tabOverview">Overview</button>
-    <button class="tab-btn" id="tabStreams">Streams</button>
-    <button class="tab-btn" id="tabRecording">Recording</button>
-    <button class="tab-btn" id="tabOperations">Tools</button>
-  </div>
-
-  <!-- OVERVIEW PANEL -->
-  <div id="overviewPanel">
-    <div class="rec-settings-panel" style="margin-bottom:10px;">
-      <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">At a Glance</span>
-        <span class="status-text" id="overviewStatus"></span>
-      </div>
-      <div class="metrics-row" id="overviewSummaryChips"></div>
-      <div class="metrics-row" id="overviewQueueChips" style="margin-top:8px;"></div>
-    </div>
-    <div class="rec-settings-panel">
-      <div class="panel-intro">
-        <div class="panel-intro-main">
-          <div class="panel-intro-kicker">Overview</div>
-          <div class="panel-intro-title">Manage streams, recording, and tools in one place.</div>
-          <div class="panel-intro-copy">Find streams, check recording, manage your account, and open extra tools when you need them.</div>
-        </div>
-        <div class="panel-intro-meta">Everyday use first</div>
-      </div>
-      <div class="overview-card-grid">
-        <article class="overview-card">
-          <div class="overview-card-title">Streams</div>
-          <strong>Live streams, places, and settings.</strong>
-          <p>Search the full stream list, inspect locations, update tags, and manage capture settings.</p>
-          <div class="overview-card-actions">
-            <a class="overview-card-link" href="/dashboard/streams">Open Streams</a>
-          </div>
-        </article>
-        <article class="overview-card">
-          <div class="overview-card-title">Recording</div>
-          <strong>Recording status, quick actions, and history.</strong>
-          <p>See what is recording now, check stream health, and use signed-in recording controls from the same page.</p>
-          <div class="overview-card-actions">
-            <a class="overview-card-link" href="/dashboard/recording">Open Recording</a>
-            <a class="overview-card-link" href="/account">Account Access</a>
-          </div>
-        </article>
-        <article class="overview-card">
-          <div class="overview-card-title">Tools</div>
-          <strong>Imports, processing, and servers.</strong>
-          <p>Use the extra tools here to review imports, check processing queues, and see server capacity.</p>
-          <div class="overview-card-actions">
-            <a class="overview-card-link" href="/dashboard/pipelines">Open Tools</a>
-          </div>
-        </article>
-      </div>
-    </div>
-  </div>
-
-  <!-- STREAMS PANEL -->
-  <div id="streamsPanel" style="display:none;">
-    <div class="domain-intro">
-      <div class="domain-intro-title">Streams</div>
-      <div class="domain-intro-copy">Browse every stream, location, tag, and recording setting in one place.</div>
-    </div>
-    <div class="filter-stack-card">
-      <div class="filter-grid filter-grid-primary">
-        <div class="filter-field">
-          <div class="filter-field-label">Search</div>
-          <input id="streamSearch" placeholder="Search stream / provider / slug" />
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Recording</div>
-          <select id="streamRecordingState">
-            <option value="" selected>all recording states</option>
-            <option value="on">recording on</option>
-            <option value="off">recording off</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Capture Type</div>
-          <select id="streamModeFilter">
-            <option value="">all capture types</option>
-          </select>
-        </div>
-      </div>
-      <div class="filter-grid filter-grid-secondary">
-        <div class="filter-field">
-          <div class="filter-field-label">Include Tag</div>
-          <select id="streamTagFilter">
-            <option value="">any tag</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Exclude Tag</div>
-          <select id="streamTagExcludeFilter">
-            <option value="">none</option>
-            <option value="archive" selected>archive</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Source</div>
-          <select id="sourceFilter">
-            <option value="">all sources</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Country</div>
-          <select id="countryFilter">
-            <option value="">all countries</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">City</div>
-          <select id="cityFilter">
-            <option value="">all cities</option>
-          </select>
-        </div>
-      </div>
-      <div class="toolbar">
-        <div class="subtabs">
-          <button class="subtab-btn active" id="streamViewTable">Table</button>
-          <button class="subtab-btn" id="streamViewMap">Geographic View</button>
-        </div>
-        <div class="toolbar-sep"></div>
-        <span class="status-text" id="streamsMapStatus"></span>
-      </div>
-      <div class="filter-footer">
-        <div class="row">
-          <label class="check-label fs11" style="color:var(--muted);">Page size</label>
-          <select id="streamPageSize" style="width:80px;">
-            <option value="50">50</option>
-            <option value="100" selected>100</option>
-            <option value="200">200</option>
-            <option value="500">500</option>
-          </select>
-          <button id="streamPrev">Prev</button>
-          <button id="streamNext">Next</button>
-          <span class="status-text" id="streamPageInfo">page 1/1</span>
-        </div>
-        <span class="status-text" id="streamStatus"></span>
-      </div>
-    </div>
-    <div class="toolbar filter-status-row">
-      <span class="status-text" id="streamFilterSummary"></span>
-    </div>
-
-	    <div id="streamsTableWrap" class="tbl-wrap">
-	      <table id="streamsTable">
-	        <thead>
-	          <tr>
-	            <th style="width:128px;">Thumb</th>
-	            <th data-sort-key="name">Stream</th>
-	            <th data-sort-key="location_city">Location</th>
-	            <th data-sort-key="recording_state">Recording</th>
-	            <th data-sort-key="captures_success">Captures</th>
-	            <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
-	            <th data-sort-key="tags_count">Tags</th>
-	            <th data-sort-key="mode">Capture Type</th>
-	          </tr>
-	        </thead>
-	        <tbody id="streamRows"></tbody>
-	      </table>
-	    </div>
-    <div id="streamsMapWrap" class="streams-map-wrap" style="display:none;">
-      <div class="streams-map-legend">
-        <span class="streams-map-legend-item"><span class="streams-map-legend-dot exact"></span> exact coordinate</span>
-        <span class="streams-map-legend-item"><span class="streams-map-legend-dot approx"></span> estimated coordinate (region shown)</span>
-        <span class="streams-map-legend-item"><span class="streams-map-legend-dot unknown"></span> no coordinate</span>
-      </div>
-      <div id="streamsMap" class="streams-map-canvas"></div>
-      <div id="streamsMapSummary" class="streams-map-summary">Map not loaded</div>
-    </div>
-  </div>
-
-  <div id="operationsPanel" style="display:none;">
-    <div class="domain-intro operations-shell">
-      <div class="domain-intro-title">More Tools</div>
-      <div class="operations-copy">Use these pages for stream imports, processing jobs, and server status.</div>
-      <div class="subtabs">
-        <button class="subtab-btn" id="opsViewDiscovery">Imports</button>
-        <button class="subtab-btn active" id="opsViewPipelines">Processing</button>
-        <button class="subtab-btn" id="opsViewServers">Servers</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- DISCOVERY PANEL -->
-  <div id="discoveryPanel" style="display:none;">
-    <div class="domain-intro">
-      <div class="domain-intro-title">Stream Imports</div>
-      <div class="domain-intro-copy">Review stream imports here before they are added to the main stream list.</div>
-    </div>
-    <div class="toolbar">
-      <select id="discoveryReviewFilter" style="min-width:180px;">
-        <option value="">review: all</option>
-        <option value="pending">pending</option>
-        <option value="accepted">accepted</option>
-        <option value="rejected">rejected</option>
-        <option value="invalid">invalid</option>
-      </select>
-      <input id="discoveryProviderFilter" placeholder="provider" style="width:140px;" />
-      <select id="discoveryCaptureTypeFilter" style="min-width:170px;">
-        <option value="">capture type: all</option>
-      </select>
-      <button id="discoveryReload" class="primary">Reload</button>
-      <span class="status-text" id="discoveryStatus"></span>
-    </div>
-    <div class="tbl-wrap">
-      <table id="discoveryTable">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Candidate</th>
-            <th>Existing Stream</th>
-            <th>Review</th>
-            <th>Source</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="discoveryRows"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- PIPELINES PANEL -->
-  <div id="inferencesPanel" style="display:none;">
-    <div class="domain-intro">
-      <div class="domain-intro-title">Processing</div>
-      <div class="domain-intro-copy">Check processing queues, recent runs, and results for recorded media.</div>
-    </div>
-    <div class="rec-settings-panel" style="margin-bottom:10px;">
-      <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Processing Queue</span>
-        <button id="pipelineOverviewReload" class="btn-sm">Reload</button>
-        <span class="status-text" id="pipelineOverviewStatus"></span>
-      </div>
-      <div class="metrics-row" id="pipelineQueueChips"></div>
-      <div class="tbl-wrap" style="margin-top:8px;">
-        <table id="pipelineOverviewTable">
-          <thead>
-            <tr>
-              <th>Pipeline</th>
-              <th>Kind</th>
-              <th>Enabled Streams</th>
-              <th>Recording Streams</th>
-              <th>Backlog Frames</th>
-              <th>Active Claims</th>
-              <th>Workers</th>
-              <th>Throughput / 1h</th>
-              <th>Latest</th>
-            </tr>
-          </thead>
-          <tbody id="pipelineOverviewRows"></tbody>
-        </table>
-      </div>
-    </div>
-    <div class="toolbar">
-      <div class="subtabs">
-        <button class="subtab-btn active" id="infSubRecorded">Recorded</button>
-        <button class="subtab-btn" id="infSubAll">All streams</button>
-      </div>
-      <div class="toolbar-sep"></div>
-      <input id="infSearch" placeholder="Search stream / pipeline / error" style="min-width:220px;" />
-      <input id="infPipeline" placeholder="pipeline_id" style="width:150px;" />
-      <select id="infStatusFilter">
-        <option value="">all status</option>
-        <option value="queued_boxed">queued_boxed</option>
-        <option value="success">success</option>
-        <option value="error">error</option>
-      </select>
-      <select id="infHasBoxed">
-        <option value="">boxed any</option>
-        <option value="true">boxed yes</option>
-        <option value="false">boxed no</option>
-      </select>
-      <input id="infClassName" placeholder="class name" style="width:140px;" />
-      <input id="infMinConfidence" type="number" min="0" max="1" step="0.001" placeholder="min conf" style="width:100px;" />
-    </div>
-    <div class="toolbar">
-      <input id="infCreatedFrom" type="datetime-local" />
-      <input id="infCreatedTo" type="datetime-local" />
-      <select id="infSortBy">
-        <option value="created_at">sort: created</option>
-        <option value="captured_at">sort: captured</option>
-        <option value="pipeline_id">sort: pipeline</option>
-        <option value="status">sort: status</option>
-        <option value="detection_count">sort: detections</option>
-        <option value="signal_count">sort: signals</option>
-        <option value="signal_strength">sort: signal strength</option>
-        <option value="max_confidence">sort: max conf</option>
-        <option value="stream_id">sort: stream</option>
-      </select>
-      <select id="infSortDir">
-        <option value="desc">desc</option>
-        <option value="asc">asc</option>
-      </select>
-      <input id="infLimit" type="number" min="10" max="2000" step="10" value="200" style="width:80px;" />
-      <button id="infApply" class="primary">Apply</button>
-      <span class="status-text" id="infStatus"></span>
-    </div>
-    <div class="tbl-wrap">
-	      <table id="infTable">
-	        <thead>
-	          <tr>
-	            <th style="width:42px;" data-sort-key="created_at">#</th>
-	            <th data-sort-key="stream_id">Stream</th>
-	            <th data-sort-key="pipeline_id">Pipeline</th>
-	            <th data-sort-key="status">Status</th>
-	            <th data-sort-key="captured_at">Captured</th>
-	            <th data-sort-key="created_at">Created</th>
-	            <th data-sort-key="detection_count">Detections</th>
-	            <th data-sort-key="signal_count">Signals</th>
-	            <th style="width:128px;">Raw</th>
-	            <th style="width:128px;">Boxed</th>
-	            <th>Summary</th>
-	          </tr>
-        </thead>
-        <tbody id="infRows"></tbody>
-      </table>
-    </div>
-    <div class="rec-settings-panel" style="margin-top:10px;">
-      <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Selected Pipeline</span>
-        <button id="pipelineDetailReload" class="btn-sm">Reload</button>
-        <span class="status-text" id="pipelineDetailStatus"></span>
-      </div>
-      <div id="pipelineDetailEmpty" class="muted fs11">Select a pipeline above to inspect versions, runs, matching streams, and optional validation data.</div>
-      <div id="pipelineDetailBody" style="display:none;">
-        <div class="metrics-row" id="pipelineDetailChips"></div>
-        <div class="toolbar" style="margin-top:8px;">
-          <button id="pipelineDetailShowInference" class="btn-sm">Filter Results To Pipeline</button>
-          <button id="pipelineDetailShowStreams" class="btn-sm">Show Matching Streams</button>
-          <button id="pipelineDetailClearStreams" class="btn-sm">Clear Stream Filter</button>
-          <span class="status-text" id="pipelineExperimentStatus"></span>
-        </div>
-        <div class="tbl-wrap" style="margin-top:8px;">
-          <table id="pipelineVersionsTable">
-            <thead>
-              <tr>
-                <th>Version</th>
-                <th>Runner</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody id="pipelineVersionsRows"></tbody>
-          </table>
-        </div>
-        <div class="tbl-wrap" style="margin-top:8px;">
-          <table id="pipelineRunsTable">
-            <thead>
-              <tr>
-                <th>Run</th>
-                <th>Status</th>
-                <th>Targets</th>
-                <th>Version</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody id="pipelineRunsRows"></tbody>
-          </table>
-        </div>
-        <div class="detail-section-head" style="margin-top:10px;">
-          <div class="detail-section-title">Pipeline Reach</div>
-          <div class="detail-section-subtitle">Streams with at least one result from this pipeline.</div>
-        </div>
-        <div class="tbl-wrap">
-          <table id="pipelineTouchedStreamsTable">
-            <thead>
-              <tr>
-                <th>Stream</th>
-                <th>State</th>
-                <th>Latest</th>
-                <th>Inference Rows</th>
-                <th>Detections</th>
-                <th>Runs</th>
-              </tr>
-            </thead>
-            <tbody id="pipelineTouchedStreamsRows"></tbody>
-          </table>
-        </div>
-        <details class="detail-history">
-          <summary>Advanced evaluation context</summary>
-          <div class="detail-section-head" style="margin-top:10px;">
-            <div class="detail-section-title">Evaluation Suites</div>
-            <div class="detail-section-subtitle">Reference suites linked to this pipeline’s evaluation history.</div>
-          </div>
-          <div class="tbl-wrap">
-            <table id="pipelineEvalSuitesTable">
-              <thead>
-                <tr>
-                  <th>Suite</th>
-                  <th>Source</th>
-                  <th>Items</th>
-                  <th>Annotations</th>
-                  <th>Primary Metric</th>
-                </tr>
-              </thead>
-              <tbody id="pipelineEvalSuitesRows"></tbody>
-            </table>
-          </div>
-        </details>
-        <details class="detail-history">
-          <summary>Advanced validation history</summary>
-          <div class="detail-section-head" style="margin-top:10px;">
-            <div class="detail-section-title">Validation Iteration History</div>
-            <div class="detail-section-subtitle">Optional metric progression and iteration notes attached to this pipeline.</div>
-          </div>
-          <div id="pipelineExperimentGraph" class="coverage-summary">No validation series yet.</div>
-          <div class="tbl-wrap" style="margin-top:8px;">
-            <table id="pipelineExperimentsTable">
-              <thead>
-                <tr>
-                  <th>Iteration</th>
-                  <th>Status</th>
-                  <th>Metric</th>
-                  <th>Delta</th>
-                  <th>Change</th>
-                  <th>Suites</th>
-                  <th>Logs</th>
-                </tr>
-              </thead>
-              <tbody id="pipelineExperimentsRows"></tbody>
-            </table>
-          </div>
-        </details>
-      </div>
-    </div>
-  </div>
-
-  <!-- SERVERS PANEL -->
-  <div id="serversPanel" style="display:none;">
-    <div class="domain-intro">
-      <div class="domain-intro-title">Servers</div>
-      <div class="domain-intro-copy">Check live server capacity, assignments, and health across Sto-A-Rama.</div>
-    </div>
-    <div class="toolbar">
-      <label class="check-label fs11" style="color:var(--muted);">Lookback (hours)</label>
-      <input id="serversHours" type="number" min="1" max="720" step="1" value="24" style="width:90px;" />
-      <label class="check-label fs11" style="color:var(--muted);"><input id="serversIncludeStale" type="checkbox" /> show stale</label>
-      <button id="serversReload" class="primary">Reload</button>
-      <span class="status-text" id="serversStatus"></span>
-    </div>
-    <div class="tbl-wrap">
-      <table id="serversTable">
-        <thead>
-          <tr>
-            <th>Server</th>
-            <th>State</th>
-            <th>Last Seen</th>
-            <th>Execution Capacity</th>
-            <th>Connections</th>
-            <th>Processes</th>
-            <th>Capture Streams</th>
-            <th>Active Inference</th>
-          </tr>
-        </thead>
-        <tbody id="serversRows"></tbody>
-      </table>
-    </div>
-    <div class="rec-settings-panel">
-      <div class="row" style="gap:10px; margin-bottom:10px;">
-        <span class="fw600 fs11">Server Capacity Groups</span>
-        <span class="muted fs11">Live capacity is heartbeat-managed and owned by the Servers domain.</span>
-      </div>
-      <div id="recordingCapacityRows" class="stack" style="gap:6px;"></div>
-      <div class="row" style="gap:8px; margin-top:8px;">
-        <button id="reloadRecordingCapacity" class="primary">Reload capacity</button>
-        <span class="status-text" id="recordingCapacityStatus"></span>
-      </div>
-    </div>
-    <div class="rec-settings-panel" style="margin-bottom:10px;">
-      <div class="row" style="gap:10px; margin-bottom:8px;">
-        <span class="fw600 fs11">Recording Assignments</span>
-        <span class="status-text" id="serversAssignmentsStatus"></span>
-      </div>
-      <div class="tbl-wrap">
-        <table id="serversAssignmentsTable">
-          <thead>
-            <tr>
-              <th>Stream</th>
-              <th>Server</th>
-              <th>Execution Class</th>
-              <th>Assigned</th>
-              <th>Last Frame</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="serversAssignmentsRows"></tbody>
-        </table>
-      </div>
-    </div>
-    <details class="secondary-card">
-      <summary>Manual Assignment</summary>
-      <div class="secondary-card-body">
-        <div class="toolbar" style="margin-bottom:0;">
-          <label class="check-label fs11" style="color:var(--muted);">Stream ID</label>
-          <input id="serversAssignStreamID" type="number" min="1" step="1" placeholder="stream id" style="width:120px;" />
-          <button id="serversAssignOpen" class="primary" type="button">Assign stream</button>
-          <span class="status-text" id="serversAssignStatus"></span>
-        </div>
-      </div>
-    </details>
-  </div>
-
-  <!-- RECORDING PANEL -->
-  <div id="recordingPanel" style="display:none;">
+  <div id="recordingPanel">
     <div class="domain-intro">
       <div class="domain-intro-title">Recording</div>
       <div class="domain-intro-copy">Manage the global recording schedule, live health, assignments, and coverage for streams.</div>
+    </div>
+    <div class="rec-settings-panel" style="margin-bottom:10px;">
+      <div class="row" style="gap:10px; margin-bottom:8px;">
+        <span class="fw600 fs11">At a Glance</span>
+        <span class="status-text" id="recordingSummaryStatus"></span>
+      </div>
+      <div class="metrics-row" id="recordingSummaryChips"></div>
+    </div>
+    <div class="recording-cta-grid">
+      <article class="recording-cta-card">
+        <div class="overview-card-title">Request Recording</div>
+        <h3>Ask Stoarama to record a stream for you.</h3>
+        <p>Use the active recording list below to turn on supported streams, or sign in if you need account-scoped recording actions.</p>
+        <div><a href="/account">Open account session</a></div>
+      </article>
+      <article class="recording-cta-card">
+        <div class="overview-card-title">Self-Serve Setup</div>
+        <h3>Run your own relay and source infrastructure.</h3>
+        <p>Follow the docs for local relay setup, node enrollment, and researcher-managed recording infrastructure.</p>
+        <div><a href="/docs/self-serve">Open self-serve docs</a></div>
+      </article>
     </div>
     <div class="rec-settings-panel">
       <div class="row" style="gap:10px; margin-bottom:10px;">
@@ -2013,7 +1580,7 @@
           <tr>
             <th data-sort-key="name">Stream</th>
             <th data-sort-key="runtime_status">Status</th>
-            <th data-sort-key="latest_captured_at">Health</th>
+            <th data-sort-key="latest_captured_at" id="recordingHealthHeader">Health</th>
             <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
             <th data-sort-key="tags_count">Tags</th>
             <th>Actions</th>
@@ -2024,332 +1591,6 @@
     </div>
   </div>
 
-  <!-- DETAIL PANEL -->
-  <div id="detailPanel" style="display:none;">
-    <div class="detail-header">
-      <div class="detail-header-left">
-        <a href="/dashboard/streams" class="back-link" id="backLink">&#8592; Streams</a>
-        <div class="detail-title" id="detailTitle"></div>
-        <div class="detail-meta" id="detailMeta"></div>
-        <div id="detailTagEditor"></div>
-      </div>
-      <div class="action-bar" id="detailActions"></div>
-    </div>
-
-    <!-- Latest images -->
-    <div class="detail-images">
-      <div class="image-card">
-        <div class="image-card-label" id="latestCaptureLabel">Latest frame</div>
-        <div id="latestRawCard"><span class="muted fs11">No image</span></div>
-      </div>
-      <div class="detail-summary-card">
-        <div class="detail-summary-title">Recording</div>
-        <div id="detailRecordingHero"><span class="muted fs11">Loading recording status...</span></div>
-      </div>
-    </div>
-
-    <!-- Sub tabs -->
-    <div class="toolbar" style="margin-bottom:10px;">
-      <div class="subtabs">
-        <button class="subtab-btn" id="detailTabInference">Inference</button>
-        <button class="subtab-btn active" id="detailTabCoverage">Recording</button>
-        <button class="subtab-btn" id="detailTabTimeline">Timeline</button>
-        <button class="subtab-btn" id="detailTabFrames">Raw Captures</button>
-      </div>
-    </div>
-
-    <!-- Inference section -->
-    <div id="detailInferenceSection">
-      <div class="detail-section-card">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Inference Filters</div>
-          <div class="detail-section-subtitle">Refine by pipeline, status, confidence, and time window.</div>
-        </div>
-        <div class="toolbar">
-          <label class="check-label fs11" style="color:var(--muted);">Pipeline</label>
-          <select id="pipelineFilter" style="min-width:200px;"></select>
-          <select id="detailStatusFilter">
-            <option value="">all status</option>
-            <option value="queued_boxed">queued_boxed</option>
-            <option value="success">success</option>
-            <option value="error">error</option>
-          </select>
-          <select id="detailHasBoxed">
-            <option value="">boxed any</option>
-            <option value="true">boxed yes</option>
-            <option value="false">boxed no</option>
-          </select>
-          <input id="detailClassName" placeholder="class name" style="width:140px;" />
-          <input id="detailMinConfidence" type="number" min="0" max="1" step="0.001" placeholder="min conf" style="width:100px;" />
-        </div>
-        <div class="toolbar">
-          <input id="detailSearch" placeholder="Search pipeline / error / summary" style="min-width:220px;" />
-          <input id="detailCreatedFrom" type="datetime-local" />
-          <input id="detailCreatedTo" type="datetime-local" />
-          <select id="detailSortBy">
-            <option value="created_at">sort: created</option>
-            <option value="captured_at">sort: captured</option>
-            <option value="pipeline_id">sort: pipeline</option>
-            <option value="status">sort: status</option>
-            <option value="detection_count">sort: detections</option>
-            <option value="signal_count">sort: signals</option>
-            <option value="signal_strength">sort: signal strength</option>
-            <option value="max_confidence">sort: max conf</option>
-          </select>
-          <select id="detailSortDir">
-            <option value="desc">desc</option>
-            <option value="asc">asc</option>
-          </select>
-          <input id="detailLimit" type="number" min="10" max="500" step="10" value="200" style="width:80px;" />
-          <button id="detailReload" class="primary">Reload</button>
-          <span class="status-text" id="detailStatus"></span>
-        </div>
-      </div>
-      <div id="detailInferenceKpis" class="detail-kpis"></div>
-
-	      <div class="tbl-wrap" style="margin-bottom:14px;">
-	        <table id="detailInferenceTable">
-	          <thead>
-	            <tr>
-	              <th style="width:42px;" data-sort-key="created_at">#</th>
-	              <th data-sort-key="pipeline_id">Pipeline</th>
-	              <th data-sort-key="status">Status</th>
-	              <th data-sort-key="created_at">Created</th>
-	              <th data-sort-key="detection_count">Detections</th>
-	              <th data-sort-key="signal_count">Signals</th>
-	              <th style="width:128px;">Raw</th>
-	              <th style="width:128px;">Boxed</th>
-	              <th>Summary</th>
-	            </tr>
-	          </thead>
-          <tbody id="inferenceRows"></tbody>
-        </table>
-      </div>
-
-      <div class="detail-section-head">
-        <div class="detail-section-title">Latest Detections</div>
-        <div class="detail-section-subtitle" id="detectionMetaSummary">Selected pipeline result</div>
-      </div>
-      <div id="detectionMetaChips" class="detection-meta"></div>
-	      <div class="tbl-wrap">
-	        <table id="detectionTable">
-	          <thead>
-	            <tr>
-	              <th data-sort-key="class_name">Class</th>
-	              <th data-sort-key="confidence">Confidence</th>
-	              <th data-sort-key="x1">x1 px</th><th data-sort-key="y1">y1 px</th><th data-sort-key="x2">x2 px</th><th data-sort-key="y2">y2 px</th>
-	              <th data-sort-key="area_px">Area (px)</th>
-	            </tr>
-	          </thead>
-	          <tbody id="detectionRows"></tbody>
-	        </table>
-      </div>
-
-      <div class="detail-section-head" style="margin-top:10px;">
-        <div class="detail-section-title">Latest Signals</div>
-        <div class="detail-section-subtitle" id="signalMetaSummary">Selected pipeline result</div>
-      </div>
-      <div class="tbl-wrap">
-        <table id="signalTable">
-          <thead>
-            <tr>
-              <th>Type</th>
-              <th>Key</th>
-              <th>Confidence</th>
-              <th>Value</th>
-              <th>Meta</th>
-            </tr>
-          </thead>
-          <tbody id="signalRows"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Frames section -->
-    <div id="detailFramesSection" style="display:none;">
-      <div class="detail-section-head">
-        <div class="detail-section-title" id="detailFramesRecentTitle">Latest 60 Frames</div>
-        <div class="detail-section-subtitle" id="detailFramesRecentSubtitle">Auto-refreshes every second while this page is open.</div>
-      </div>
-      <div id="detailLiveFramesStatus" class="coverage-summary">Loading recent frames...</div>
-      <div id="detailLiveFramesGrid" class="detail-live-grid"></div>
-      <div id="detailExportBlock">
-      <div class="detail-section-head" style="margin-top:12px;">
-        <div class="detail-section-title" id="detailExportTitle">Export Frames</div>
-        <div class="detail-section-subtitle" id="detailExportSubtitle">Download a manifest for any time window, or prepare a bounded ZIP archive.</div>
-      </div>
-      <div class="toolbar">
-        <button id="detailExportPreset1h" type="button">Last 1h</button>
-        <button id="detailExportPreset24h" type="button">Last 24h</button>
-        <button id="detailExportPreset7d" type="button">Last 7d</button>
-        <div class="toolbar-sep"></div>
-        <label class="check-label fs11" style="color:var(--muted);">From</label>
-        <input id="detailExportFrom" type="datetime-local" />
-        <label class="check-label fs11" style="color:var(--muted);">To</label>
-        <input id="detailExportTo" type="datetime-local" />
-        <select id="detailExportStatusFilter" style="min-width:150px;">
-          <option value="success" selected>success only</option>
-          <option id="detailExportStatusAllOption" value="all">all frame rows</option>
-          <option value="error">error rows only</option>
-        </select>
-        <button id="detailExportManifest" type="button">Download Manifest</button>
-        <button id="detailExportZip" class="primary" type="button">Prepare ZIP</button>
-        <span class="status-text" id="detailExportStatus"></span>
-      </div>
-      <div id="detailExportResult" class="coverage-summary">ZIP export currently supports up to 5000 frames or 2 GiB per request.</div>
-      </div>
-      <div class="detail-section-head" style="margin-top:12px;">
-        <div class="detail-section-title" id="detailRawCaptureRowsTitle">Raw Capture Rows</div>
-        <div class="detail-section-subtitle" id="detailRawCaptureRowsSubtitle">Recent persisted frame rows with status, preview, and object key.</div>
-      </div>
-      <div id="detailClipPreviewBlock" class="detail-section-card" style="margin-bottom:12px; display:none;">
-        <div class="detail-section-head" style="margin-top:0;">
-          <div class="detail-section-title">Clip Preview</div>
-          <div class="detail-section-subtitle" id="detailClipPreviewStatus">Select a clip to scrub it inline here.</div>
-        </div>
-        <div id="detailClipPreviewSlot"><span class="muted fs11">No clip selected.</span></div>
-      </div>
-      <div class="toolbar">
-        <select id="framesStatusFilter">
-          <option value="">all status</option>
-          <option value="success">success</option>
-          <option value="error">error</option>
-        </select>
-        <input id="framesLimit" type="number" min="20" max="1000" step="20" value="200" style="width:80px;" />
-        <button id="detailFramesReload" class="primary">Reload captures</button>
-        <span class="status-text" id="framesStatusText"></span>
-      </div>
-	      <div class="tbl-wrap">
-	        <table id="framesTable">
-	          <thead>
-	            <tr>
-	              <th style="width:42px;" data-sort-key="id">#</th>
-	              <th id="framesCapturedHeader" data-sort-key="captured_at">Captured</th>
-	              <th data-sort-key="status">Status</th>
-	              <th data-sort-key="error">Error</th>
-	              <th id="framesRawHeader" style="width:128px;">Raw</th>
-	              <th data-sort-key="object_key">Object key</th>
-	            </tr>
-	          </thead>
-	          <tbody id="framesRows"></tbody>
-	        </table>
-      </div>
-    </div>
-
-    <!-- Recording section -->
-    <div id="detailCoverageSection" style="display:none;">
-      <div class="detail-section-card" style="margin-bottom:12px;">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recording Route</div>
-          <div class="detail-section-subtitle">Where Sto-A-Rama is recording this stream right now.</div>
-        </div>
-        <div class="toolbar" style="margin-top:0;">
-          <button id="detailWorkloadReload" class="btn-sm">Refresh status</button>
-          <span class="status-text" id="detailWorkloadStatus"></span>
-        </div>
-        <div id="detailCurrentPath" class="detail-fact-grid"></div>
-        <div id="detailCurrentWorker" style="margin-top:10px;"></div>
-        <details class="detail-history">
-          <summary>Recent worker history</summary>
-          <div class="stack" id="detailCaptureWorkers" style="gap:4px; margin-top:10px;"></div>
-        </details>
-      </div>
-      <div class="coverage-panel">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recording</div>
-          <div class="detail-section-subtitle" id="detailCoverageSubtitle">Historical coverage, day-level heatmap, and stratified capture samples.</div>
-        </div>
-        <div class="detail-section-head" style="margin-top:12px;">
-          <div class="detail-section-title">Historical Coverage</div>
-          <div class="detail-section-subtitle">Day-level UTC view: each square is one day colored by recorded hours.</div>
-        </div>
-        <div class="toolbar">
-          <label class="check-label fs11" style="color:var(--muted);">Window (days)</label>
-          <select id="coverageDays" style="min-width:160px;">
-            <option value="30">last 30 days</option>
-            <option value="90">last 90 days</option>
-            <option value="180">last 180 days</option>
-            <option value="365" selected>last 365 days</option>
-            <option value="730">last 730 days</option>
-          </select>
-          <label class="check-label fs11" style="color:var(--muted);">Samples</label>
-          <select id="coverageSampleCount" style="min-width:130px;">
-            <option value="24">24</option>
-            <option value="42" selected>42</option>
-            <option value="60">60</option>
-            <option value="84">84</option>
-          </select>
-          <button id="detailCoverageReload" class="primary" type="button">Reload coverage</button>
-          <span class="status-text" id="coverageStatusText"></span>
-        </div>
-        <div id="coverageMetricChips" class="timeline-metrics"></div>
-        <div id="coverageSummary" class="coverage-summary">No coverage data loaded.</div>
-        <div class="coverage-heatmap-wrap">
-          <div id="coverageHeatmapGrid" class="coverage-heatmap-grid"></div>
-        </div>
-        <div class="coverage-legend">
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell none"></span>0h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h1"></span>&lt;=1h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h2"></span>&lt;=4h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h3"></span>&lt;=8h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h4"></span>&lt;=16h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h5"></span>&gt;16h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell error-only"></span>error-only day</span>
-        </div>
-        <div class="detail-section-head" style="margin-top:8px;">
-          <div class="detail-section-title">History Samples</div>
-          <div class="detail-section-subtitle" id="detailCoverageSamplesSubtitle">Stratified snapshots across full capture history (not just recent frames).</div>
-        </div>
-        <div id="coverageSamplesSummary" class="coverage-summary">No samples loaded.</div>
-        <div id="coverageSampleGrid" class="coverage-sample-grid"></div>
-      </div>
-    </div>
-
-    <!-- Timeline section -->
-    <div id="detailTimelineSection" style="display:none;">
-      <div class="timeline-panel">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recording vs Inference Timeline</div>
-          <div class="detail-section-subtitle" id="detailTimelineSubtitle">UTC minute timeline for recorded frames, inferenced frames, and person detections.</div>
-        </div>
-        <div class="toolbar">
-          <button id="timelinePrevDay" type="button">&#8592; Prev day</button>
-          <input id="timelineDay" type="date" />
-          <button id="timelineNextDay" type="button">Next day &#8594;</button>
-          <div class="toolbar-sep"></div>
-          <label class="check-label fs11" style="color:var(--muted);">Pipeline</label>
-          <select id="timelinePipelineFilter" style="min-width:220px;">
-            <option value="">All pipelines</option>
-          </select>
-          <button id="detailTimelineReload" class="primary" type="button">Reload timeline</button>
-          <span class="status-text" id="timelineStatusText"></span>
-        </div>
-        <div id="timelineMetricChips" class="timeline-metrics"></div>
-        <div id="timelineSummary" class="timeline-summary">No timeline data loaded.</div>
-        <div id="timelineViewport" class="timeline-viewport">
-          <div id="timelineScale" class="timeline-scale"></div>
-          <div class="timeline-row">
-            <div class="timeline-row-label">Recorded</div>
-            <div id="timelineRecordedTrack" class="timeline-track"></div>
-          </div>
-          <div class="timeline-row">
-            <div class="timeline-row-label">Inferenced</div>
-            <div id="timelineInferencedTrack" class="timeline-track"></div>
-          </div>
-          <div class="timeline-row">
-            <div class="timeline-row-label">People</div>
-            <div id="timelinePeopleTrack" class="timeline-track"></div>
-          </div>
-        </div>
-        <div class="timeline-legend">
-          <span class="timeline-legend-item"><span class="timeline-dot recorded-success"></span>recorded success</span>
-          <span class="timeline-legend-item"><span class="timeline-dot recorded-error"></span>recorded errors only</span>
-          <span class="timeline-legend-item"><span class="timeline-dot inferenced"></span>inferenced frame present</span>
-          <span class="timeline-legend-item"><span class="timeline-dot people"></span>people detections intensity</span>
-        </div>
-      </div>
-    </div>
-  </div>
 </div>
 
 <div id="loadingOverlay" class="loading-overlay">
@@ -2409,7 +1650,20 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script>
 // ─── DOM refs ────────────────────────────────────────────────────────────────
-const $ = (id) => document.getElementById(id);
+const missingDomCache = new Map();
+function createMissingNode(id) {
+  const el = document.createElement('div');
+  el.id = `missing-${id}`;
+  el.style.display = 'none';
+  el.value = '';
+  el.checked = false;
+  return el;
+}
+const $ = (id) => document.getElementById(id) || missingDomCache.get(id) || (() => {
+  const el = createMissingNode(id);
+  missingDomCache.set(id, el);
+  return el;
+})();
 
 // panels
 const overviewPanel = $('overviewPanel');
@@ -2420,8 +1674,8 @@ const inferencesPanel = $('inferencesPanel');
 const serversPanel = $('serversPanel');
 const recordingPanel = $('recordingPanel');
 const detailPanel = $('detailPanel');
-const accountNavLink = $('accountNavLink');
 const topbarAccountStatus = $('topbarAccountStatus');
+const topbarAdminLink = $('topbarAdminLink');
 
 // top tabs
 const tabOverview = $('tabOverview');
@@ -2536,6 +1790,7 @@ const recCityFilter = $('recCityFilter');
 const recStatus = $('recStatus');
 const recRowsEl = $('recRows');
 const recordingTable = $('recordingTable');
+const recordingHealthHeader = $('recordingHealthHeader');
 
 // detail
 const detailTitle = $('detailTitle');
@@ -2639,6 +1894,8 @@ const detailCaptureWorkers = $('detailCaptureWorkers');
 const detailPipelineRows = $('detailPipelineRows');
 const detailPipelinesTable = $('detailPipelinesTable');
 const metricsRow = $('metricsRow');
+const recordingSummaryStatus = $('recordingSummaryStatus');
+const recordingSummaryChips = $('recordingSummaryChips');
 const loadingOverlay = $('loadingOverlay');
 const loadingMessage = $('loadingMessage');
 const recordingAssignModal = $('recordingAssignModal');
@@ -2721,6 +1978,21 @@ let detectionSortBy = 'confidence';
 let detectionSortDir = 'desc';
 let framesSortBy = 'captured_at';
 let framesSortDir = 'desc';
+let currentAccount = null;
+const DEFAULT_REC_SORT_BY = 'avg_people_per_inferenced_capture';
+const DEFAULT_REC_SORT_DIR = 'desc';
+
+function detectTimezoneLabel() {
+  try {
+    const parts = new Intl.DateTimeFormat([], { timeZoneName: 'short' }).formatToParts(new Date());
+    const part = parts.find((it) => it.type === 'timeZoneName');
+    return String(part && part.value || '').trim() || 'UTC';
+  } catch (_) {
+    return 'UTC';
+  }
+}
+
+const localTimezoneLabel = detectTimezoneLabel();
 
 const streamImageCache = new Map();
 const queuedImageStreamIDs = new Set();
@@ -2740,8 +2012,8 @@ function esc(v) {
 
 function serverDashboardURL(serverID) {
   const id = String(serverID || '').trim();
-  if (!id || id === '-') return '/dashboard/servers';
-  return `/dashboard/servers?server_id=${encodeURIComponent(id)}`;
+  if (!id || id === '-') return '/admin';
+  return `/admin?server_id=${encodeURIComponent(id)}`;
 }
 
 function serverLinkHTML(serverID, fallback = '-') {
@@ -2799,7 +2071,15 @@ function minuteToLabel(minute) {
 function formatDateTimeShort(raw) {
   const d = new Date(raw);
   if (!Number.isFinite(d.getTime())) return String(raw || '-');
-  return d.toISOString().replace('T', ' ').slice(0, 19);
+  return d.toLocaleString([], {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
 }
 
 function formatAgo(raw) {
@@ -3385,12 +2665,21 @@ async function fetchJSON(path, opts = {}) {
 }
 
 function dashboardRedirectPath() {
-  const path = `${window.location.pathname || '/dashboard'}${window.location.search || ''}${window.location.hash || ''}`;
-  return path.startsWith('/') ? path : '/dashboard';
+  const path = `${window.location.pathname || '/recording'}${window.location.search || ''}${window.location.hash || ''}`;
+  return path.startsWith('/') ? path : '/recording';
 }
 
 function accountRedirectURL() {
   return `/account?redirect_path=${encodeURIComponent(dashboardRedirectPath())}`;
+}
+
+function updateHistoryURL(targetURL, replace = false) {
+  const currentURL = `${window.location.pathname}${window.location.search}`;
+  if (replace || currentURL === targetURL) {
+    history.replaceState(null, '', targetURL);
+    return;
+  }
+  history.pushState(null, '', targetURL);
 }
 
 function isUnauthorizedMessage(message) {
@@ -3409,19 +2698,46 @@ function formatAccountAuthError(err, prefix = 'signed-in account required') {
 async function refreshTopbarAccountStatus() {
   if (!(topbarAccountStatus instanceof HTMLElement)) return;
   const accountHref = accountRedirectURL();
-  if (accountNavLink instanceof HTMLAnchorElement) {
-    accountNavLink.href = accountHref;
-  }
   try {
     const payload = await fetchJSON('/api/v1/account/me');
     const account = payload && payload.account ? payload.account : {};
+    currentAccount = account;
     const email = String(account.email || '').trim();
     const authType = String(account.auth_type || '').trim();
+    const role = String(account.role || '').trim().toLowerCase();
+    if (topbarAdminLink instanceof HTMLAnchorElement) {
+      topbarAdminLink.style.display = role === 'admin' ? 'inline-flex' : 'none';
+    }
     topbarAccountStatus.innerHTML = email
       ? `<a href="${accountHref}">${esc(email)}</a>${authType ? ` <span class="muted">· ${esc(authType)}</span>` : ''}`
       : `<a href="${accountHref}">Account</a>`;
   } catch (_) {
+    currentAccount = null;
+    if (topbarAdminLink instanceof HTMLAnchorElement) {
+      topbarAdminLink.style.display = 'none';
+    }
     topbarAccountStatus.innerHTML = `<a href="${accountHref}">Sign in for recording</a>`;
+  }
+}
+
+async function loadRecordingLandingSummary() {
+  if (!(recordingSummaryChips instanceof HTMLElement)) return;
+  recordingSummaryChips.innerHTML = '';
+  if (recordingSummaryStatus instanceof HTMLElement) recordingSummaryStatus.textContent = 'loading...';
+  try {
+    const payload = await fetchJSON('/api/v1/dashboard/recording/summary');
+    const chips = [
+      ['recording on', payload.recording_on],
+      ['healthy', payload.recording_healthy_total],
+      ['stale', payload.recording_stale_total],
+      ['interval sec', payload.recording_interval_sec],
+    ];
+    recordingSummaryChips.innerHTML = chips.map(([label, value]) => (
+      `<span class="metric-chip">${esc(String(label))} <b>${esc(String(Number(value || 0)))}</b></span>`
+    )).join('');
+    if (recordingSummaryStatus instanceof HTMLElement) recordingSummaryStatus.textContent = '';
+  } catch (err) {
+    if (recordingSummaryStatus instanceof HTMLElement) recordingSummaryStatus.textContent = String(err);
   }
 }
 
@@ -4343,15 +3659,7 @@ async function loadOverview() {
   streamAllTotal = Number(ov.streams_total || 0);
   const chips = [
     ['streams', ov.streams_total],
-    ['recording on', ov.recording_on],
-    ['recording off', ov.recording_off],
-    ['healthy', ov.recording_healthy_total],
-    ['degraded', ov.recording_degraded_total],
-    ['stale', ov.recording_stale_total],
-    ['interval sec', ov.recording_interval_sec],
-    ['capture workers', qh.capture_active_workers],
-    ['inference workers', qh.inference_active_workers],
-    ['backlog frames', qh.inference_backlog_frames],
+    ['recording', ov.recording_on],
   ];
   metricsRow.innerHTML = chips.map(([label, val]) =>
     `<span class="metric-chip">${esc(label)} <b>${esc(String(val ?? 0))}</b></span>`
@@ -4487,7 +3795,7 @@ function renderPipelineTouchedStreams(items) {
     const streamID = Number(it.stream_id || 0);
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td><a href="/dashboard/stream/${streamID}" class="mono fs11">${streamID > 0 ? `#${streamID}` : '-'} ${esc(String(it.name || ''))}</a><div class="muted fs10">${esc(String(it.provider || '-'))}</div></td>
+      <td><a href="/streams/${streamID}" class="mono fs11">${streamID > 0 ? `#${streamID}` : '-'} ${esc(String(it.name || ''))}</a><div class="muted fs10">${esc(String(it.provider || '-'))}</div></td>
       <td class="mono fs11">${esc(String(it.recording_state || '-'))}<div class="muted fs10">${esc(String(it.capture_type || '-'))}</div></td>
       <td class="mono fs11">${esc(formatDateTimeShort(it.latest_inference_at || ''))}</td>
       <td class="mono fs11">${Number(it.inference_rows || 0)}</td>
@@ -4688,7 +3996,7 @@ function streamLink(id) {
   const n = Number(id);
   if (!Number.isFinite(n) || n <= 0) return '-';
   const sid = Math.floor(n);
-  return `<a class="mono fs11" href="/dashboard/stream/${sid}">#${sid}</a>`;
+  return `<a class="mono fs11" href="/streams/${sid}">#${sid}</a>`;
 }
 
 function listStreamLinks(streamIDs, max = 6) {
@@ -4917,7 +4225,7 @@ function renderServersAssignments(items) {
     const streamID = Number(it.stream_id || 0);
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td>${streamID > 0 ? `<a class="stream-link" href="/dashboard/stream/${streamID}">#${streamID}</a>` : '<span class="muted fs11">-</span>'}<div class="muted fs10">${esc(it.provider || '-')} / ${esc(it.stream_slug || '-')}</div></td>
+      <td>${streamID > 0 ? `<a class="stream-link" href="/streams/${streamID}">#${streamID}</a>` : '<span class="muted fs11">-</span>'}<div class="muted fs10">${esc(it.provider || '-')} / ${esc(it.stream_slug || '-')}</div></td>
       <td>${serverLinkHTML(it.server_id || '-', '-')}</td>
       <td class="mono fs11">${esc(it.execution_class || '-')}</td>
       <td class="mono fs11">${esc(formatDateTimeShort(it.assigned_at) || '-')}</td>
@@ -4992,7 +4300,7 @@ function candidateImportedStreamLink(candidate) {
   const streamID = Number(meta && meta.imported_stream_id || 0);
   if (!Number.isFinite(streamID) || streamID <= 0) return '';
   const slug = String(meta && meta.imported_stream_slug || '').trim();
-  return `<a class="mono fs11" href="/dashboard/stream/${streamID}">#${streamID}${slug ? ` · ${esc(slug)}` : ''}</a>`;
+  return `<a class="mono fs11" href="/streams/${streamID}">#${streamID}${slug ? ` · ${esc(slug)}` : ''}</a>`;
 }
 
 function renderDiscoveryCandidates(items) {
@@ -5197,7 +4505,7 @@ function renderInferenceTable(tbodyEl, items, opts = {}) {
     const streamCell = showStream ? `
       <td>
         <div class="stack">
-          <a href="/dashboard/stream/${it.stream_id}" class="stream-link">${esc(inferenceName.primary || String(it.stream_id))}</a>
+          <a href="/streams/${it.stream_id}" class="stream-link">${esc(inferenceName.primary || String(it.stream_id))}</a>
           ${inferenceName.secondary ? `<span class="muted fs10">${esc(inferenceName.secondary)}</span>` : ''}
           <span class="muted fs10 mono">${esc(it.stream_provider)} / ${esc(it.stream_slug)}</span>
           ${it.recording_state === 'on' ? '<span class="tag tag-ok">rec</span>' : ''}
@@ -5314,7 +4622,7 @@ function syncStreamListURL() {
     params.set('page_size', String(Math.max(1, Math.floor(Number(streamPageSize) || 100))));
   }
   const qs = params.toString();
-  history.replaceState(null, '', qs ? `/dashboard/streams?${qs}` : '/dashboard/streams');
+  history.replaceState(null, '', qs ? `/streams?${qs}` : '/streams');
 }
 
 async function refreshAllStreamFilterOptions() {
@@ -5462,7 +4770,7 @@ function renderStreamsMapRows(rows, totalCount) {
       const country = countryDisplayLabel(stream.location_country || '');
       const city = cityDisplayLabel(stream.location_city || '');
       const loc = [country, city].filter((v) => v).join(' / ') || latinizedLabelParts(stream.location_text || '').primary;
-      return `<li><a href="/dashboard/stream/${stream.id}">${esc(name)}</a><div class="map-popup-meta">${esc(stream.provider || '-')} / ${esc(stream.slug || '-')} ${loc ? `· ${esc(loc)}` : ''}</div></li>`;
+      return `<li><a href="/streams/${stream.id}">${esc(name)}</a><div class="map-popup-meta">${esc(stream.provider || '-')} / ${esc(stream.slug || '-')} ${loc ? `· ${esc(loc)}` : ''}</div></li>`;
     }).join('');
     const overflow = g.streams.length > 20 ? `<div class="map-popup-meta">+${g.streams.length - 20} more streams at this point</div>` : '';
     marker.bindPopup(`
@@ -5552,12 +4860,12 @@ function renderStreamRows() {
     const s = row.stream;
     const streamName = latinizedLabelParts(s.name);
     const captureRate = fmtPct(row.captures_success, row.captures_total);
-    const latestCap = row.latest_captured_at ? String(row.latest_captured_at).replace('T', ' ').slice(0, 19) : '-';
+    const latestCap = row.latest_captured_at ? formatDateTimeShort(row.latest_captured_at) : '-';
     const state = String(s.recording_state || 'off');
     const canStartRecording = supportsClipRecording(s);
     const recHtml = state === 'on'
       ? `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;"><button class="btn-sm" data-action="recording-disable" data-id="${s.id}">Turn Off</button></div>`
-      : `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${canStartRecording ? `<button class="btn-sm" data-action="recording-enable" data-id="${s.id}">Turn On</button>` : '<span class="tag tag-muted">clip-only hard cut</span>'}</div>`;
+      : `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${canStartRecording ? `<button class="btn-sm" data-action="recording-enable" data-id="${s.id}">Turn On</button>` : '<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>'}</div>`;
     const mode = String(s.capture_type || '-');
     const captureFamily = formatCaptureFamilyLabel(s.capture_family);
     const cadenceLabel = formatStreamCadenceLabel(s);
@@ -5568,7 +4876,7 @@ function renderStreamRows() {
       <td style="padding:6px 10px;">${renderImageSlot(s.id, 'streams')}</td>
       <td>
         <div class="stack">
-          <a href="/dashboard/stream/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
+          <a href="/streams/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
           ${streamName.secondary ? `<span class="muted fs10">${esc(streamName.secondary)}</span>` : ''}
           <span class="muted fs10 mono">${esc(s.provider)} / ${esc(s.slug)}</span>
         </div>
@@ -5641,7 +4949,7 @@ function renderRecRows() {
   for (const row of recStreamRows) {
     const s = row.stream;
     const streamName = latinizedLabelParts(s.name);
-    const latestCap = row.latest_captured_at ? String(row.latest_captured_at).replace('T', ' ').slice(0, 19) : '-';
+    const latestCap = row.latest_captured_at ? formatDateTimeShort(row.latest_captured_at) : '-';
     const runtimeStatus = s.capture_runtime_status || '-';
     const freshnessSec = Number(row.freshness_sec);
     const freshnessTxt = Number.isFinite(freshnessSec) ? `${Math.max(0, Math.floor(freshnessSec))}s` : '-';
@@ -5656,7 +4964,7 @@ function renderRecRows() {
     tr.innerHTML = `
       <td>
         <div class="stack">
-          <a href="/dashboard/stream/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
+          <a href="/streams/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
           ${streamName.secondary ? `<span class="muted fs10">${esc(streamName.secondary)}</span>` : ''}
           <span class="muted fs10 mono">${esc(s.provider)} / ${esc(s.slug)}</span>
         </div>
@@ -5690,23 +4998,46 @@ function renderRecRows() {
   setRecStatus(`${recStreamRows.length} recording streams`);
 }
 
-async function loadRecStreams() {
+async function loadRecStreams(opts = {}) {
   setTableLoadingRow(recRowsEl, 6, 'Loading recording streams...');
-  const params = new URLSearchParams();
+  const params = buildRecordingFilterParams();
   params.set('recording_state', 'on');
+  params.set('limit', '500');
+  params.set('offset', '0');
+  params.set('include_image_urls', 'false');
+  const payload = await fetchJSON(`/api/v1/dashboard/streams?${params}`);
+  recStreamRows = payload.items || [];
+  renderRecRows();
+  syncRecordingURL({ replace: opts.replaceURL === true });
+}
+
+function buildRecordingFilterParams() {
+  const params = new URLSearchParams();
   const recCaptureType = normalizeCaptureTypeFilter(recModeFilter.value);
   if (recCaptureType) params.set('capture_type', recCaptureType);
   if (recSearch.value.trim()) params.set('q', recSearch.value.trim());
   if (recTagFilter.value.trim()) params.set('tags', recTagFilter.value.trim());
   if (recCountryFilter.value.trim()) params.set('country', recCountryFilter.value.trim());
   if (recCityFilter.value.trim()) params.set('city', recCityFilter.value.trim());
-  params.set('limit', '500');
-  params.set('offset', '0');
-  params.set('include_image_urls', 'false');
   applyStreamsSortParams(params, recSortBy, recSortDir);
-  const payload = await fetchJSON(`/api/v1/dashboard/streams?${params}`);
-  recStreamRows = payload.items || [];
-  renderRecRows();
+  return params;
+}
+
+function applyRecordingStateFromURL(params) {
+  if (!(params instanceof URLSearchParams)) return;
+  recSearch.value = String(params.get('q') || params.get('stream_id') || '').trim();
+  recTagFilter.value = String(params.get('tags') || '').trim();
+  recModeFilter.value = normalizeCaptureTypeFilter(params.get('capture_type'));
+  recCountryFilter.value = String(params.get('country') || '').trim();
+  recCityFilter.value = String(params.get('city') || '').trim();
+  recSortBy = String(params.get('sort_by') || '').trim() || DEFAULT_REC_SORT_BY;
+  recSortDir = normalizeSortDir(params.get('sort_dir'), DEFAULT_REC_SORT_DIR);
+}
+
+function syncRecordingURL(opts = {}) {
+  const params = buildRecordingFilterParams();
+  const qs = params.toString();
+  updateHistoryURL(qs ? `/recording?${qs}` : '/recording', opts.replace === true);
 }
 
 function renderRecordingCapacityRows(items) {
@@ -6025,6 +5356,16 @@ function startRecordingTabLoad() {
       const msg = String(err);
       setRecSettingsStatus(msg, 'err');
     });
+}
+
+async function applyRecordingRouteState(opts = {}) {
+  const params = new URLSearchParams(window.location.search);
+  mainTab = 'recording';
+  applyRecordingStateFromURL(params);
+  if (recordingHealthHeader) recordingHealthHeader.textContent = `Health (${localTimezoneLabel})`;
+  showPanel('recording');
+  await loadRecordingTabControls();
+  await loadRecStreams({ replaceURL: opts.replaceURL === true });
 }
 
 // ─── Global inferences ────────────────────────────────────────────────────────
@@ -6864,7 +6205,7 @@ async function loadDetail(options = {}) {
       ? `<button class="btn-sm" data-detail-action="recording-disable" data-id="${s.id}">Turn Recording Off</button>`
       : (canStartRecording
         ? `<button class="btn-sm" data-detail-action="recording-enable" data-id="${s.id}">Turn Recording On</button>`
-        : `<span class="tag tag-muted">clip-only hard cut</span>`)}
+        : `<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>`)}
     <button class="btn-sm" data-detail-action="show-stream-json" data-id="${s.id}" title="Inspect full stream payload">Inspect JSON</button>
     ${youtubeWatchURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
     ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open Stream URL</button></a>` : ''}
@@ -7297,7 +6638,7 @@ if (tabOverview) {
   tabOverview.addEventListener('click', () => {
     if (mainTab === 'overview') return;
     mainTab = 'overview';
-    history.replaceState(null, '', '/dashboard/overview');
+    history.replaceState(null, '', '/recording');
     showPanel('overview');
     setOverviewStatus('loading...');
     void loadOverview().catch((err) => setOverviewStatus(String(err), 'err'));
@@ -7307,7 +6648,7 @@ if (tabOverview) {
 tabStreams.addEventListener('click', () => {
   if (mainTab === 'streams') return;
   mainTab = 'streams';
-  history.replaceState(null, '', '/dashboard/streams');
+  history.replaceState(null, '', '/streams');
   showPanel('streams');
   setStreamStatus('loading...');
   void (async () => {
@@ -7326,7 +6667,7 @@ tabStreams.addEventListener('click', () => {
 if (tabOperations) {
   tabOperations.addEventListener('click', () => {
     if (mainTab === 'discovery') {
-      history.replaceState(null, '', '/dashboard/discovery');
+      history.replaceState(null, '', '/admin');
       showPanel('discovery');
       setDiscoveryStatus('loading...');
       populateCaptureTypeOptions(discoveryCaptureTypeFilter, 'capture type: all');
@@ -7334,7 +6675,7 @@ if (tabOperations) {
       return;
     }
     if (mainTab === 'servers') {
-      history.replaceState(null, '', '/dashboard/servers');
+      history.replaceState(null, '', '/admin');
       showPanel('servers');
       setServersStatus('loading...');
       void (async () => {
@@ -7345,7 +6686,7 @@ if (tabOperations) {
       return;
     }
     mainTab = 'pipelines';
-    history.replaceState(null, '', selectedPipelineID ? `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/dashboard/pipelines');
+    history.replaceState(null, '', selectedPipelineID ? `/admin?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/admin');
     showPanel('pipelines');
     setPipelinesStatus('loading...');
     void (async () => {
@@ -7360,7 +6701,7 @@ if (opsViewDiscovery) {
   opsViewDiscovery.addEventListener('click', () => {
     if (mainTab === 'discovery') return;
     mainTab = 'discovery';
-    history.replaceState(null, '', '/dashboard/discovery');
+    history.replaceState(null, '', '/admin');
     showPanel('discovery');
     setDiscoveryStatus('loading...');
     populateCaptureTypeOptions(discoveryCaptureTypeFilter, 'capture type: all');
@@ -7372,7 +6713,7 @@ if (opsViewPipelines) {
   opsViewPipelines.addEventListener('click', () => {
     if (mainTab === 'pipelines') return;
     mainTab = 'pipelines';
-    history.replaceState(null, '', selectedPipelineID ? `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/dashboard/pipelines');
+    history.replaceState(null, '', selectedPipelineID ? `/admin?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/admin');
     showPanel('pipelines');
     setPipelinesStatus('loading...');
     void (async () => {
@@ -7387,7 +6728,7 @@ if (opsViewServers) {
   opsViewServers.addEventListener('click', () => {
     if (mainTab === 'servers') return;
     mainTab = 'servers';
-    history.replaceState(null, '', '/dashboard/servers');
+    history.replaceState(null, '', '/admin');
     showPanel('servers');
     setServersStatus('loading...');
     void (async () => {
@@ -7402,7 +6743,7 @@ if (tabRecording) {
   tabRecording.addEventListener('click', () => {
     if (mainTab === 'recording') return;
     mainTab = 'recording';
-    history.replaceState(null, '', '/dashboard/recording');
+    history.replaceState(null, '', '/recording');
     showPanel('recording');
     startRecordingTabLoad();
   });
@@ -7449,7 +6790,7 @@ if (pipelineDetailShowStreams) {
     if (!selectedPipelineID) return;
     mainTab = 'streams';
     streamTouchedPipelineID = selectedPipelineID;
-    history.replaceState(null, '', `/dashboard/streams?${buildStreamFilterParams().toString()}`);
+    history.replaceState(null, '', `/streams?${buildStreamFilterParams().toString()}`);
     showPanel('streams');
     setStreamsView(streamsView);
     try {
@@ -7480,7 +6821,7 @@ if (pipelineOverviewRows) {
     void (async () => {
       try {
         selectedPipelineID = pipelineID;
-        history.replaceState(null, '', `/dashboard/pipelines?pipeline_id=${encodeURIComponent(selectedPipelineID)}`);
+        history.replaceState(null, '', `/admin?pipeline_id=${encodeURIComponent(selectedPipelineID)}`);
         infPipeline.value = selectedPipelineID;
         await Promise.all([loadPipelineDetail(selectedPipelineID), loadAllInference()]);
       } catch (err) {
@@ -7911,112 +7252,23 @@ document.addEventListener('keydown', (e) => {
 
 // ─── Routing & init ───────────────────────────────────────────────────────────
 (function parseRoute() {
-  const parts = window.location.pathname.split('/').filter(Boolean);
-  const params = new URLSearchParams(window.location.search);
-  selectedServerID = String(params.get('server_id') || '').trim();
-  if (parts.length >= 3 && parts[0] === 'dashboard' && parts[1] === 'stream') {
-    const n = Number(parts[2]);
-    if (Number.isFinite(n) && n > 0) detailStreamID = n;
-    return;
-  }
-  if (parts.length >= 2 && parts[0] === 'dashboard') {
-    const seg = parts[1].toLowerCase();
-    if (seg === 'overview') {
-      mainTab = 'overview';
-    }
-    else if (seg === 'streams') {
-      mainTab = 'streams';
-      applyStreamListStateFromURL(params);
-    }
-    else if (seg === 'discovery') {
-      mainTab = 'discovery';
-    }
-    else if (seg === 'recording') {
-      mainTab = 'recording';
-    }
-    else if (seg === 'servers') {
-      mainTab = 'servers';
-    }
-    else if (seg === 'pipelines') {
-      mainTab = 'pipelines';
-      selectedPipelineID = String(params.get('pipeline_id') || '').trim();
-    }
-    else if (seg === 'recorded' || seg === 'all') {
-      mainTab = 'streams';
-      applyStreamListStateFromURL(params);
-      if (seg === 'recorded' && !params.get('recording_state')) {
-        streamRecordingStateFilter.value = 'on';
-      }
-    }
-    else if (seg === 'inferences') { mainTab = 'pipelines'; }
-  }
+  mainTab = 'recording';
 })();
+
+window.addEventListener('popstate', () => {
+  void applyRecordingRouteState({ replaceURL: true }).catch((err) => {
+    setRecStatus(String(err), 'err');
+  });
+});
 
 (async function init() {
   try {
-    void refreshTopbarAccountStatus();
+    await refreshTopbarAccountStatus();
     setDetailSubView('coverage');
-
-    if (detailStreamID) {
-      showPanel('detail');
-      void loadKnownStreamTagsSafe('all').catch(() => {});
-      await loadDetail();
-      return;
-    }
-
-    if (mainTab === 'overview') {
-      showPanel('overview');
-      setOverviewStatus('loading...');
-      await loadOverview();
-      return;
-    }
-
-    if (mainTab === 'discovery') {
-      showPanel('discovery');
-      populateCaptureTypeOptions(discoveryCaptureTypeFilter, 'capture type: all');
-      setDiscoveryStatus('loading...');
-      await loadDiscoveryCandidates();
-      return;
-    }
-
-    if (mainTab === 'pipelines') {
-      showPanel('pipelines');
-      setPipelinesStatus('loading...');
-      await Promise.all([loadPipelineOverview(), loadAllInference()]);
-      return;
-    }
-
-    if (mainTab === 'servers') {
-      showPanel('servers');
-      setServersStatus('loading...');
-      await Promise.all([loadServers(), loadRecordingCapacity(), loadServersAssignments()]);
-      return;
-    }
-
-    if (mainTab === 'recording') {
-      showPanel('recording');
-      startRecordingTabLoad();
-      return;
-    }
-
-    // Default: streams
-    showPanel('streams');
-    setStreamsView(streamsView);
-    setStreamStatus('loading...');
-    await Promise.all([
-      loadOverview(),
-      loadKnownStreamTagsSafe('all'),
-    ]);
-    await refreshAllStreamFilterOptions();
-    await loadStreamsForActiveView();
+    await loadRecordingLandingSummary();
+    await applyRecordingRouteState({ replaceURL: true });
   } catch (err) {
-    if (detailStreamID) setDetailStatus(String(err), 'err');
-    else if (mainTab === 'overview') setOverviewStatus(String(err), 'err');
-    else if (mainTab === 'discovery') setDiscoveryStatus(String(err), 'err');
-    else if (mainTab === 'pipelines') setPipelinesStatus(String(err), 'err');
-    else if (mainTab === 'servers') setServersStatus(String(err), 'err');
-    else if (mainTab === 'recording') setRecStatus(String(err), 'err');
-    else setStreamStatus(String(err), 'err');
+    setRecStatus(String(err), 'err');
   }
 })();
 </script>
