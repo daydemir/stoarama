@@ -189,6 +189,10 @@ func processCaptureBackfillMissingTarget(
 	result.CaptureType = stream.CaptureType
 	result.ExecutionClass = stream.ExecutionClass
 	result.EffectiveMode = string(mode)
+	targetFPS := capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+	if targetFPS <= 0 {
+		targetFPS = 10
+	}
 
 	spec := capture.StreamSpec{
 		ID:            stream.ID,
@@ -197,7 +201,7 @@ func processCaptureBackfillMissingTarget(
 		SourcePageURL: stream.SourcePageURL,
 		CaptureMode:   mode,
 		CaptureConfig: stream.ExecutionConfigJSON,
-		TargetFPS:     maxInt(1, capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 1)),
+		TargetFPS:     targetFPS,
 	}
 
 	effective := capture.EffectiveMode(spec)

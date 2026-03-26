@@ -262,13 +262,6 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			return
 		}
 		upstreamURL := strings.TrimSpace(state.UpstreamURL)
-		if relaySuffix == "" {
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("X-Youtube-Relay-Server", strings.TrimSpace(opts.ServerID))
-			w.Header().Set("X-Youtube-Relay-Stream", strconv.FormatInt(streamID, 10))
-			http.Redirect(w, r, upstreamURL, http.StatusTemporaryRedirect)
-			return
-		}
 		if relaySuffix != "" {
 			if relaySuffix != "segment" {
 				http.Error(w, "unknown relay path", http.StatusNotFound)
@@ -306,6 +299,9 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			for _, v := range vals {
 				w.Header().Add(k, v)
 			}
+		}
+		if relaySuffix == "" {
+			w.Header().Set("Cache-Control", "no-cache")
 		}
 		w.Header().Set("X-Youtube-Relay-Server", strings.TrimSpace(opts.ServerID))
 		w.Header().Set("X-Youtube-Relay-Stream", strconv.FormatInt(streamID, 10))
@@ -470,6 +466,35 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 						nextResolveAt[route.StreamID] = cached.UpdatedAt.Add(defaultRelayRouteRefreshDelay)
 					}
 					log.Printf("youtube-relay source restored cached route stream_id=%d age=%s", route.StreamID, time.Since(cached.UpdatedAt).Round(time.Second))
+					probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
+					probeErr := probeRelayPlaylist(probeCtx, relayHTTPClient, relayPullURL)
+					probeCancel()
+					if probeErr != nil {
+						relayState.mu.Lock()
+						delete(relayState.routes, route.StreamID)
+						relayState.mu.Unlock()
+						delete(lastUpstreamURL, route.StreamID)
+						delete(lastPublishedPullURL, route.StreamID)
+						delete(lastStatus, route.StreamID)
+						nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveRetryBackoff)
+						_ = api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
+							StreamID:  route.StreamID,
+							Actor:     "youtube_relay_source",
+							Status:    "failed",
+							Reason:    "source_probe_failed",
+							ErrorText: strings.TrimSpace(probeErr.Error()),
+							MetadataJSON: map[string]any{
+								"source_server_id":  strings.TrimSpace(opts.ServerID),
+								"relay_public_url":  relayPullURL,
+								"network_transport": strings.TrimSpace(opts.NetworkTransport),
+								"topology_id":       strings.TrimSpace(opts.TopologyID),
+								"topology_role":     strings.TrimSpace(opts.TopologyRole),
+								"hub_server_id":     strings.TrimSpace(opts.HubServerID),
+								"cache_restored":    true,
+							},
+						})
+						continue
+					}
 					_ = api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
 						StreamID:     route.StreamID,
 						Actor:        "youtube_relay_source",
@@ -478,14 +503,15 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 						RelayPullURL: relayPullURL,
 						ErrorText:    "",
 						MetadataJSON: map[string]any{
-							"source_server_id":  strings.TrimSpace(opts.ServerID),
-							"relay_public_url":  relayPullURL,
-							"relay_bind_addr":   strings.TrimSpace(opts.BindAddr),
-							"network_transport": strings.TrimSpace(opts.NetworkTransport),
-							"topology_id":       strings.TrimSpace(opts.TopologyID),
-							"topology_role":     strings.TrimSpace(opts.TopologyRole),
-							"hub_server_id":     strings.TrimSpace(opts.HubServerID),
-							"cache_restored":    true,
+							"source_server_id":   strings.TrimSpace(opts.ServerID),
+							"relay_public_url":   relayPullURL,
+							"relay_bind_addr":    strings.TrimSpace(opts.BindAddr),
+							"network_transport":  strings.TrimSpace(opts.NetworkTransport),
+							"topology_id":        strings.TrimSpace(opts.TopologyID),
+							"topology_role":      strings.TrimSpace(opts.TopologyRole),
+							"hub_server_id":      strings.TrimSpace(opts.HubServerID),
+							"cache_restored":     true,
+							"source_verified_at": time.Now().UTC().Format(time.RFC3339Nano),
 						},
 					})
 				}
@@ -606,6 +632,32 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			relayState.mu.Lock()
 			relayState.routes[route.StreamID] = relayRouteState{UpstreamURL: upstreamURL}
 			relayState.mu.Unlock()
+			probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
+			probeErr := probeRelayPlaylist(probeCtx, relayHTTPClient, relayPullURL)
+			probeCancel()
+			if probeErr != nil {
+				routeResolveFailures[route.StreamID]++
+				relayState.mu.Lock()
+				delete(relayState.routes, route.StreamID)
+				relayState.mu.Unlock()
+				_ = api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
+					StreamID:  route.StreamID,
+					Actor:     "youtube_relay_source",
+					Status:    "failed",
+					Reason:    "source_probe_failed",
+					ErrorText: strings.TrimSpace(probeErr.Error()),
+					MetadataJSON: map[string]any{
+						"source_server_id":  strings.TrimSpace(opts.ServerID),
+						"relay_public_url":  relayPullURL,
+						"network_transport": strings.TrimSpace(opts.NetworkTransport),
+						"topology_id":       strings.TrimSpace(opts.TopologyID),
+						"topology_role":     strings.TrimSpace(opts.TopologyRole),
+						"hub_server_id":     strings.TrimSpace(opts.HubServerID),
+					},
+				})
+				nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveRetryBackoff)
+				continue
+			}
 			if err := api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
 				StreamID:     route.StreamID,
 				Actor:        "youtube_relay_source",
@@ -614,13 +666,14 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 				RelayPullURL: relayPullURL,
 				ErrorText:    "",
 				MetadataJSON: map[string]any{
-					"source_server_id":  strings.TrimSpace(opts.ServerID),
-					"relay_public_url":  relayPullURL,
-					"relay_bind_addr":   strings.TrimSpace(opts.BindAddr),
-					"network_transport": strings.TrimSpace(opts.NetworkTransport),
-					"topology_id":       strings.TrimSpace(opts.TopologyID),
-					"topology_role":     strings.TrimSpace(opts.TopologyRole),
-					"hub_server_id":     strings.TrimSpace(opts.HubServerID),
+					"source_server_id":   strings.TrimSpace(opts.ServerID),
+					"relay_public_url":   relayPullURL,
+					"relay_bind_addr":    strings.TrimSpace(opts.BindAddr),
+					"network_transport":  strings.TrimSpace(opts.NetworkTransport),
+					"topology_id":        strings.TrimSpace(opts.TopologyID),
+					"topology_role":      strings.TrimSpace(opts.TopologyRole),
+					"hub_server_id":      strings.TrimSpace(opts.HubServerID),
+					"source_verified_at": now.Format(time.RFC3339Nano),
 				},
 			}); err != nil {
 				return fmt.Errorf("update youtube relay route status stream_id=%d: %w", route.StreamID, err)
@@ -714,7 +767,7 @@ func rewriteRelayPlaylist(relayBaseURL string, streamID int64, token string, ups
 			if ref, parseErr := url.Parse(line); parseErr == nil {
 				segmentURL = baseURL.ResolveReference(ref).String()
 			}
-			current = append(current, segmentURL)
+			current = append(current, fmt.Sprintf("%s/relay/%d/segment?token=%s&u=%s", strings.TrimRight(strings.TrimSpace(relayBaseURL), "/"), streamID, url.QueryEscape(strings.TrimSpace(token)), url.QueryEscape(segmentURL)))
 			blocks = append(blocks, append([]string(nil), current...))
 			current = current[:0]
 			continue
@@ -753,6 +806,60 @@ func rewriteRelayPlaylist(relayBaseURL string, streamID int64, token string, ups
 		out = append(out, block...)
 	}
 	return []byte(strings.Join(out, "\n") + "\n"), true
+}
+
+func probeRelayPlaylist(ctx context.Context, relayHTTPClient *http.Client, relayPullURL string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, relayPullURL, nil)
+	if err != nil {
+		return fmt.Errorf("build relay probe request: %w", err)
+	}
+	resp, err := relayHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch relay playlist: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("relay playlist status=%d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return fmt.Errorf("read relay playlist: %w", err)
+	}
+	trimmed := bytes.TrimSpace(body)
+	if !bytes.HasPrefix(trimmed, []byte("#EXTM3U")) {
+		return fmt.Errorf("relay playlist is not valid hls")
+	}
+	segmentURL := ""
+	for _, rawLine := range strings.Split(strings.ReplaceAll(string(trimmed), "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		segmentURL = line
+		break
+	}
+	if segmentURL == "" {
+		return fmt.Errorf("relay playlist has no segment entries")
+	}
+	if !strings.Contains(segmentURL, "/segment?") {
+		return fmt.Errorf("relay playlist did not rewrite segment urls")
+	}
+	segReq, err := http.NewRequestWithContext(ctx, http.MethodGet, segmentURL, nil)
+	if err != nil {
+		return fmt.Errorf("build relay segment probe request: %w", err)
+	}
+	segResp, err := relayHTTPClient.Do(segReq)
+	if err != nil {
+		return fmt.Errorf("fetch relay segment: %w", err)
+	}
+	defer segResp.Body.Close()
+	if segResp.StatusCode < 200 || segResp.StatusCode >= 300 {
+		return fmt.Errorf("relay segment status=%d", segResp.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, io.LimitReader(segResp.Body, 1024)); err != nil {
+		return fmt.Errorf("read relay segment probe: %w", err)
+	}
+	return nil
 }
 
 func isGlobalPlaylistTag(line string) bool {

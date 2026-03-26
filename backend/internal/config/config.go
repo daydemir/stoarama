@@ -31,6 +31,7 @@ type Config struct {
 	EmailFrom                   string
 	EmailReplyTo                string
 	EmailResendAPIKey           string
+	StreamAlertsRecipients      string
 	StreamAlertsEnabled         bool
 	StreamAlertsPollSec         int
 	StreamAlertsProblemDelaySec int
@@ -80,6 +81,7 @@ func Load() (Config, error) {
 		EmailFrom:                   firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
 		EmailReplyTo:                firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
 		EmailResendAPIKey:           firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
+		StreamAlertsRecipients:      firstNonEmpty(os.Getenv("STREAM_ALERTS_RECIPIENTS"), os.Getenv("RESEARCH_STREAM_ALERTS_RECIPIENTS")),
 		StreamAlertsEnabled:         boolEnv("STREAM_ALERTS_ENABLED", false),
 		StreamAlertsPollSec:         intEnv("STREAM_ALERTS_POLL_SEC", 60),
 		StreamAlertsProblemDelaySec: intEnv("STREAM_ALERTS_PROBLEM_DELAY_SEC", 300),

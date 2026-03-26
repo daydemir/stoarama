@@ -204,13 +204,10 @@ func startFFmpegSession(ctx context.Context, spec StreamSpec, src ResolvedSource
 	}
 	targetFPS := spec.TargetFPS
 	if targetFPS <= 0 {
-		targetFPS = 1
+		targetFPS = 10
 	}
 	if targetFPS > 30 {
 		targetFPS = 30
-	}
-	if captureIntervalSec > 1 && targetFPS > 1 {
-		targetFPS = 1
 	}
 	maxFrameBytes := spec.MaxFrameBytes
 	if maxFrameBytes <= 0 {

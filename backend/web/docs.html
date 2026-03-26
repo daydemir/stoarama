@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sto-A-Rama Docs</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0f1a;
+      --panel: #111827;
+      --panel2: #182233;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --border: #1e293b;
+      --accent: #06b6d4;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --mono: "IBM Plex Mono", monospace;
+      --sans: "IBM Plex Sans", system-ui, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f1f5f9;
+        --panel: #ffffff;
+        --panel2: #f8fafc;
+        --text: #0f172a;
+        --muted: #4b5563;
+        --border: #e2e8f0;
+        --accent: #0891b2;
+        --ok: #16a34a;
+        --warn: #d97706;
+        --err: #dc2626;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      font-family: var(--sans);
+      font-size: 13px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 10%, transparent) 0, transparent 28%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #000) 0%, var(--bg) 58%, color-mix(in srgb, var(--bg) 88%, #07101f) 100%);
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      min-height: 40px;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; overflow: hidden; }
+    .topbar-center { display: flex; align-items: center; justify-content: center; min-width: 0; }
+    .topbar-right { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+    .site-title {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      color: var(--accent);
+      font-family: var(--mono);
+    }
+    .metrics-row { display: flex; flex-wrap: nowrap; gap: 6px; min-width: 0; overflow: hidden; }
+    .metric-chip {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 7px;
+      white-space: nowrap;
+    }
+    .metric-chip b { color: var(--text); font-weight: 500; }
+    .global-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel) 90%, #000);
+    }
+    .global-nav a {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+    }
+    .global-nav a:hover {
+      color: var(--text);
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+      background: color-mix(in srgb, var(--panel2) 82%, transparent);
+    }
+    .global-nav a.active {
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .account-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .account-chip a { color: var(--text); text-decoration: none; }
+    .admin-chip {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      text-decoration: none;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .sidebar, .panel {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.18);
+    }
+    .sidebar {
+      padding: 14px;
+      position: sticky;
+      top: 18px;
+    }
+    .sidebar-title, .eyebrow {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .sidebar-nav {
+      display: grid;
+      gap: 8px;
+    }
+    .sidebar-nav a {
+      display: block;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      color: var(--muted);
+      background: color-mix(in srgb, var(--panel2) 72%, transparent);
+    }
+    .sidebar-nav a.active {
+      color: #fff;
+      background: color-mix(in srgb, var(--accent) 25%, var(--panel2));
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    }
+    .content {
+      display: grid;
+      gap: 16px;
+    }
+    .panel { padding: 18px; }
+    h1 {
+      margin-bottom: 10px;
+      font-size: clamp(32px, 5vw, 44px);
+      line-height: 0.98;
+      letter-spacing: -0.03em;
+    }
+    h2 {
+      margin-bottom: 10px;
+      font-size: 20px;
+    }
+    p, li {
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    ul { padding-left: 18px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    pre, code {
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    pre {
+      margin-top: 12px;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 88%, transparent);
+      overflow-x: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .code-block-wrap { position: relative; }
+    .code-copy-btn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 56px;
+      height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .code-copy-btn:hover {
+      color: var(--text);
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+    }
+    .section { display: none; }
+    .section.active { display: block; }
+    @media (max-width: 1100px) {
+      .topbar {
+        grid-template-columns: minmax(0, 1fr);
+        overflow-x: auto;
+      }
+      .topbar-center, .topbar-right {
+        justify-content: flex-start;
+      }
+      .layout, .grid {
+        grid-template-columns: 1fr;
+      }
+      .sidebar {
+        position: static;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="site-title">STO-A-RAMA</span>
+        <div class="metrics-row" id="metricsRow"></div>
+      </div>
+      <div class="topbar-center">
+        <nav class="global-nav" aria-label="Global">
+          <a href="/streams">Streams</a>
+          <a href="/recording">Recording</a>
+          <a href="/docs/getting-started" class="active">Docs</a>
+        </nav>
+      </div>
+      <div class="topbar-right">
+        <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">⚙</a>
+        <div class="account-chip" id="accountChip">Checking session...</div>
+      </div>
+    </div>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="sidebar-title">Docs</div>
+        <nav class="sidebar-nav" aria-label="Docs sections">
+          <a id="navGettingStarted" href="/docs/getting-started">Getting Started</a>
+          <a id="navAPI" href="/docs/api">API Reference</a>
+          <a id="navRelayGuide" href="/docs/relay-guide">Relay Guide</a>
+          <a id="navSelfServe" href="/docs/self-serve">Self-Serve Setup</a>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <section id="sectionGettingStarted" class="section panel">
+          <div class="eyebrow">Getting Started</div>
+          <h1>Browse first, authenticate when you act.</h1>
+          <p>Stoarama keeps stream discovery public so researchers can explore the catalog without setup. Sign in only when you need recording controls, clip downloads, API keys, or node management.</p>
+          <p>All video streams are captured at 10 frames per second. Image-poll streams capture individual frames on a configurable polling interval.</p>
+          <div class="grid" style="margin-top:16px;">
+            <div class="panel">
+              <div class="eyebrow">Core flow</div>
+              <h2>How researchers typically work</h2>
+              <ul>
+                <li>Search the public stream catalog on <code>/streams</code>.</li>
+                <li>Open a stream detail page to inspect metadata and recorded clips.</li>
+                <li>Go to <code>/recording</code> when you want to start or monitor recording.</li>
+                <li>Use <code>/account</code> for session, API keys, and node enrollment.</li>
+              </ul>
+            </div>
+            <div class="panel">
+              <div class="eyebrow">Auth model</div>
+              <h2>What needs a signed-in account</h2>
+              <ul>
+                <li>Preparing authenticated clip downloads.</li>
+                <li>Turning recording on or off from the browser.</li>
+                <li>Creating or revoking API keys.</li>
+                <li>Enrolling and managing relay nodes.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <section id="sectionAPI" class="section panel">
+          <div class="eyebrow">API Reference</div>
+          <h1>Public reads plus account-scoped actions.</h1>
+          <p>The backend API stays unchanged. Use public dashboard endpoints for browsing and account-scoped endpoints when working with clips, keys, or browser-authenticated recording actions.</p>
+          <div class="grid" style="margin-top:16px;">
+            <div class="panel">
+              <div class="eyebrow">Public catalog</div>
+              <h2>Search streams</h2>
+              <pre><code>curl "https://stoarama.example/api/v1/dashboard/streams?limit=25&amp;q=seoul"
+
+curl "https://stoarama.example/api/v1/dashboard/streams/15944"
+
+curl "https://stoarama.example/api/v1/dashboard/recording/summary"</code></pre>
+            </div>
+            <div class="panel">
+              <div class="eyebrow">Authenticated clips</div>
+              <h2>List and prepare downloads</h2>
+              <pre><code>curl -H "Authorization: Bearer &lt;api-key&gt;" \
+  "https://stoarama.example/api/v1/account/streams/15944/clips?limit=25&amp;offset=0"
+
+curl -X POST "https://stoarama.example/api/v1/account/clips/download-prepare" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer &lt;api-key&gt;" \
+  -d '{"stream_id":15944,"segment_ids":[101,102,103]}'</code></pre>
+            </div>
+          </div>
+          <div class="panel" style="margin-top:16px;">
+            <div class="eyebrow">Browser session</div>
+            <h2>Recording actions from the UI</h2>
+            <pre><code>POST /api/v1/recording/streams/{id}/assign
+POST /api/v1/recording/streams/{id}/unassign
+GET  /api/v1/account/me
+GET  /api/v1/account/api-keys
+POST /api/v1/account/api-keys</code></pre>
+          </div>
+        </section>
+
+        <section id="sectionRelayGuide" class="section panel">
+          <div class="eyebrow">Relay Guide</div>
+          <h1>Run a YouTube relay source on your own machine.</h1>
+          <p>Use this when a stream needs local browser cookies. Your machine resolves the source and relays bytes, while Stoarama keeps the catalog, assignment state, and recording sinks.</p>
+          <div class="grid" style="margin-top:16px;">
+            <div class="panel">
+              <div class="eyebrow">Prereqs</div>
+              <h2>What you need</h2>
+              <ul>
+                <li>A Sto-A-Rama account and an enrolled <code>yt_relay_source</code> node.</li>
+                <li><code>ffmpeg</code> and <code>yt-dlp</code> installed locally.</li>
+                <li>A relay URL reachable from Sto-A-Rama sink servers.</li>
+                <li>YouTube cookies stored only on your own machine.</li>
+              </ul>
+            </div>
+            <div class="panel">
+              <div class="eyebrow">Install flow</div>
+              <h2>Enroll the machine</h2>
+              <pre><code>stoarama node enroll \
+  --api-base-url https://stoarama.com \
+  --token &lt;enrollment-token&gt; \
+  --node-type yt_relay_source \
+  --display-name "Mac mini relay"</code></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="sectionSelfServe" class="section panel">
+          <div class="eyebrow">Self-Serve Setup</div>
+          <h1>Bring your own relay, node, and operational flow.</h1>
+          <p>Self-serve is the right path when researchers need local credentials, region-specific connectivity, or their own capture infrastructure while still using Stoarama’s catalog and account model.</p>
+          <div class="grid" style="margin-top:16px;">
+            <div class="panel">
+              <div class="eyebrow">Account setup</div>
+              <h2>Start in account tools</h2>
+              <ul>
+                <li>Sign in with an email magic link.</li>
+                <li>Create a node enrollment token on <code>/account</code>.</li>
+                <li>Enroll the machine and verify it appears in node management.</li>
+              </ul>
+            </div>
+            <div class="panel">
+              <div class="eyebrow">Operational split</div>
+              <h2>What stays local vs remote</h2>
+              <ul>
+                <li>Cookies and local browser auth stay on your own machine.</li>
+                <li>Stoarama stores node state, assignment state, and relay metadata.</li>
+                <li>Researchers still browse streams and monitor recording in the main web UI.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    const metricsRow = document.getElementById('metricsRow');
+    const accountChip = document.getElementById('accountChip');
+    const topbarAdminLink = document.getElementById('topbarAdminLink');
+    const routes = {
+      '/docs/getting-started': ['navGettingStarted', 'sectionGettingStarted'],
+      '/docs/api': ['navAPI', 'sectionAPI'],
+      '/docs/relay-guide': ['navRelayGuide', 'sectionRelayGuide'],
+      '/docs/self-serve': ['navSelfServe', 'sectionSelfServe'],
+    };
+
+    async function fetchJSON(path) {
+      const res = await fetch(path, { credentials: 'same-origin' });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.error || `http ${res.status}`);
+      return payload;
+    }
+
+    function escapeHTML(v) {
+      return String(v || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    async function copyText(text, button) {
+      const original = button ? button.textContent : '';
+      try {
+        await navigator.clipboard.writeText(String(text || ''));
+        if (button) button.textContent = 'Copied';
+      } catch (_) {
+        if (button) button.textContent = 'Failed';
+      }
+      if (button) {
+        window.setTimeout(() => {
+          button.textContent = original || 'Copy';
+        }, 1200);
+      }
+    }
+
+    function installCopyButtons() {
+      document.querySelectorAll('pre').forEach((pre) => {
+        if (!(pre instanceof HTMLElement) || pre.parentElement?.classList.contains('code-block-wrap')) return;
+        const wrap = document.createElement('div');
+        wrap.className = 'code-block-wrap';
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'code-copy-btn';
+        button.textContent = 'Copy';
+        button.addEventListener('click', () => copyText(pre.textContent || '', button));
+        wrap.appendChild(button);
+      });
+    }
+
+    async function refreshTopbarMetrics() {
+      if (!(metricsRow instanceof HTMLElement)) return;
+      try {
+        const payload = await fetchJSON('/api/v1/dashboard/overview');
+        metricsRow.innerHTML = [
+          ['streams', payload.streams_total],
+          ['recording', payload.recording_on],
+        ].map(([label, value]) => (
+          `<span class="metric-chip">${escapeHTML(label)} <b>${escapeHTML(String(Number(value || 0)))}</b></span>`
+        )).join('');
+      } catch (_) {
+        metricsRow.innerHTML = '';
+      }
+    }
+
+    function activateSection() {
+      const path = routes[window.location.pathname] ? window.location.pathname : '/docs/getting-started';
+      Object.values(routes).forEach(([navID, sectionID]) => {
+        const nav = document.getElementById(navID);
+        const section = document.getElementById(sectionID);
+        if (nav) nav.classList.toggle('active', navID === routes[path][0]);
+        if (section) section.classList.toggle('active', sectionID === routes[path][1]);
+      });
+    }
+
+    async function refreshChrome() {
+      const redirectPath = encodeURIComponent(`${window.location.pathname}${window.location.search}${window.location.hash}`);
+      try {
+        const payload = await fetchJSON('/api/v1/account/me');
+        const account = payload && payload.account ? payload.account : {};
+        const email = String(account.email || '').trim();
+        const authType = String(account.auth_type || '').trim();
+        const role = String(account.role || '').trim().toLowerCase();
+        if (accountChip) {
+          accountChip.innerHTML = email
+            ? `<a href="/account?redirect_path=${redirectPath}">${email}</a>${authType ? ` <span class="muted">· ${authType}</span>` : ''}`
+            : `<a href="/account?redirect_path=${redirectPath}">Account</a>`;
+        }
+        if (topbarAdminLink) {
+          topbarAdminLink.style.display = role === 'admin' ? 'inline-flex' : 'none';
+        }
+      } catch (_) {
+        if (accountChip) {
+          accountChip.innerHTML = `<a href="/account?redirect_path=${redirectPath}">Sign in for recording</a>`;
+        }
+        if (topbarAdminLink) {
+          topbarAdminLink.style.display = 'none';
+        }
+      }
+    }
+
+    activateSection();
+    installCopyButtons();
+    void refreshChrome();
+    void refreshTopbarMetrics();
+  </script>
+</body>
+</html>
