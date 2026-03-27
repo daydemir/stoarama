@@ -508,7 +508,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		routesToResolve := make([]captureapi.YouTubeRelayRoute, 0, len(routes))
 		for _, route := range routes {
 			status := strings.TrimSpace(strings.ToLower(route.Status))
-			if status != "assigned" && status != "source_ready" && status != "running" && status != "failed" && status != "stopped" {
+			if status != "assigned" && status != "source_ready" && status != "running" {
 				continue
 			}
 			activeRouteIDs[route.StreamID] = struct{}{}
