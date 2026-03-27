@@ -22,8 +22,15 @@ type Message struct {
 	MessageType string
 }
 
+type DeliveryReceipt struct {
+	Provider        string         `json:"provider"`
+	MessageID       string         `json:"message_id"`
+	Status          string         `json:"status"`
+	ProviderPayload map[string]any `json:"provider_payload,omitempty"`
+}
+
 type Sender interface {
-	Send(ctx context.Context, msg Message) error
+	Send(ctx context.Context, msg Message) (DeliveryReceipt, error)
 }
 
 type Config struct {
@@ -58,7 +65,7 @@ func NewSender(cfg Config) (Sender, error) {
 
 type logSender struct{}
 
-func (logSender) Send(_ context.Context, msg Message) error {
+func (logSender) Send(_ context.Context, msg Message) (DeliveryReceipt, error) {
 	log.Printf(
 		"email provider=log type=%s to=%s subject=%q text=%q html_len=%d",
 		strings.TrimSpace(msg.MessageType),
@@ -67,7 +74,15 @@ func (logSender) Send(_ context.Context, msg Message) error {
 		strings.TrimSpace(msg.PlainText),
 		len(strings.TrimSpace(msg.HTML)),
 	)
-	return nil
+	return DeliveryReceipt{
+		Provider: "log",
+		Status:   "accepted",
+		ProviderPayload: map[string]any{
+			"message_type": strings.TrimSpace(msg.MessageType),
+			"to":           strings.TrimSpace(msg.To),
+			"subject":      strings.TrimSpace(msg.Subject),
+		},
+	}, nil
 }
 
 type resendSender struct {
@@ -78,7 +93,7 @@ type resendSender struct {
 	httpClient *http.Client
 }
 
-func (s *resendSender) Send(ctx context.Context, msg Message) error {
+func (s *resendSender) Send(ctx context.Context, msg Message) (DeliveryReceipt, error) {
 	from := strings.TrimSpace(msg.From)
 	if from == "" {
 		from = s.from
@@ -103,22 +118,35 @@ func (s *resendSender) Send(ctx context.Context, msg Message) error {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal resend payload: %w", err)
+		return DeliveryReceipt{}, fmt.Errorf("marshal resend payload: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build resend request: %w", err)
+		return DeliveryReceipt{}, fmt.Errorf("build resend request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send resend request: %w", err)
+		return DeliveryReceipt{}, fmt.Errorf("send resend request: %w", err)
 	}
 	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("resend send failed status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return DeliveryReceipt{}, fmt.Errorf("resend send failed status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
-	return nil
+	receipt := DeliveryReceipt{
+		Provider: "resend",
+		Status:   "accepted",
+	}
+	if len(respBody) > 0 {
+		var payload map[string]any
+		if err := json.Unmarshal(respBody, &payload); err == nil {
+			receipt.ProviderPayload = payload
+			if v := strings.TrimSpace(fmt.Sprint(payload["id"])); v != "" && v != "<nil>" {
+				receipt.MessageID = v
+			}
+		}
+	}
+	return receipt, nil
 }

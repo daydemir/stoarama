@@ -157,6 +157,11 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 		return
 	}
 
+	success10m, err := s.successCaptureCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 10*time.Minute)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording supervision success counters 10m: %v", err))
+		return
+	}
 	success2h, err := s.successCaptureCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 2*time.Hour)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording supervision success counters: %v", err))
@@ -167,6 +172,11 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording supervision process issues: %v", err))
 		return
 	}
+	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 2*time.Hour, 2*time.Minute)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording supervision outage episodes: %v", err))
+		return
+	}
 
 	now := time.Now().UTC()
 	type outputItem map[string]any
@@ -174,66 +184,32 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 	var healthyTotal, down10mTotal, spotty2hTotal, incidentsOpenTotal int64
 	for _, row := range items {
 		modeClass := firstNonEmpty(row.AssignmentClass, derefString(row.RuntimeClass), row.StreamExecutionClass)
-		expected2h := expectedCapturesPer60s(modeClass, recordingSettings.CaptureIntervalSec) * 120
+		expected10m := expectedCapturesForWindow(modeClass, recordingSettings.CaptureIntervalSec, 10*time.Minute)
+		expected2h := expectedCapturesForWindow(modeClass, recordingSettings.CaptureIntervalSec, 2*time.Hour)
+		successCount10m := success10m[row.StreamID]
 		successCount2h := success2h[row.StreamID]
-		lossRate2h := 0.0
-		if expected2h > 0 {
-			lossRate2h = 100.0 * float64(maxInt64(expected2h-successCount2h, 0)) / float64(expected2h)
-		}
+		lossRate10m := lossRateForWindow(expected10m, successCount10m)
+		lossRate2h := lossRateForWindow(expected2h, successCount2h)
 		processIssues2h := processIssueCounts2h[row.StreamID]
-		state := "healthy"
-		reason := "fresh_captures"
-		unhealthySince := (*time.Time)(nil)
-		downThreshold := 10 * time.Minute
-		spottyEligible := row.AssignedAt != nil && now.Sub(row.AssignedAt.UTC()) >= 2*time.Hour
+		outageCount2h := outageEpisodes2h[row.StreamID]
 		if row.IncidentType != nil && strings.TrimSpace(*row.IncidentType) != "" {
 			incidentsOpenTotal++
 		}
-
-		switch {
-		case strings.TrimSpace(row.ServerID) == "":
-			if now.Sub(row.StreamUpdatedAt.UTC()) >= downThreshold {
-				state = "down_10m"
-				reason = "recording_on_but_unassigned"
-				unhealthySince = &row.StreamUpdatedAt
-			} else {
-				reason = "waiting_for_assignment"
-			}
-		case row.LastFrameAt == nil:
-			if row.AssignedAt != nil && now.Sub(row.AssignedAt.UTC()) >= downThreshold {
-				state = "down_10m"
-				reason = "no_successful_frames"
-				unhealthySince = row.AssignedAt
-			} else {
-				reason = "warmup"
-			}
-		default:
-			lastFrameAt := row.LastFrameAt.UTC()
-			age := now.Sub(lastFrameAt)
-			if age < 0 {
-				age = 0
-			}
-			if age >= downThreshold {
-				state = "down_10m"
-				reason = "stale_frames_10m"
-				unhealthySince = row.LastFrameAt
-			} else if strings.TrimSpace(row.RuntimeStatus) == "stopped" || strings.TrimSpace(row.RuntimeStatus) == "error" {
-				if age >= downThreshold {
-					state = "down_10m"
-					reason = "capture_runtime_" + strings.TrimSpace(row.RuntimeStatus)
-					unhealthySince = row.LastFrameAt
-				}
-			} else if spottyEligible && (lossRate2h > 20 || processIssues2h >= 3) {
-				state = "spotty_2h"
-				if processIssues2h >= 3 {
-					reason = "process_restarts_2h"
-				} else {
-					reason = "loss_rate_2h"
-				}
-				assignedAt := row.AssignedAt.UTC()
-				unhealthySince = &assignedAt
-			}
-		}
+		state, reason, unhealthySince := classifyRecordingSupervision(now, recordingSupervisionInput{
+			RecordingState:  row.RecordingState,
+			ModeClass:       modeClass,
+			ServerID:        strings.TrimSpace(row.ServerID),
+			RuntimeStatus:   strings.TrimSpace(row.RuntimeStatus),
+			AssignedAt:      row.AssignedAt,
+			LastFrameAt:     row.LastFrameAt,
+			StreamUpdatedAt: row.StreamUpdatedAt,
+			Metrics: recordingSupervisionMetrics{
+				LossRate10m:      lossRate10m,
+				LossRate2h:       lossRate2h,
+				ProcessIssues2h:  processIssues2h,
+				OutageEpisodes2h: outageCount2h,
+			},
+		})
 
 		switch state {
 		case "healthy":
@@ -267,10 +243,14 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 			"consecutive_errors":         row.ConsecutiveErrors,
 			"relay_status":               row.RelayStatus,
 			"relay_error_text":           row.RelayErrorText,
+			"success_captures_10m":       successCount10m,
+			"expected_captures_10m":      expected10m,
+			"loss_rate_10m":              lossRate10m,
 			"success_captures_2h":        successCount2h,
 			"expected_captures_2h":       expected2h,
 			"loss_rate_2h":               lossRate2h,
 			"process_issues_2h":          processIssues2h,
+			"outage_episodes_2h":         outageCount2h,
 			"supervision_state":          state,
 			"supervision_reason":         reason,
 			"unhealthy_since":            unhealthySince,
