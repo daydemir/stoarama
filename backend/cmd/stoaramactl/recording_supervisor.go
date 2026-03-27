@@ -578,10 +578,6 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		"outage_episodes_2h":  item["outage_episodes_2h"],
 		"last_frame_at":       item["last_frame_at"],
 	}
-	detailsBytes, err := json.Marshal(details)
-	if err != nil {
-		return supervisorIncidentUpdate{}, err
-	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -595,6 +591,7 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		lastNotifiedAt  *time.Time
 		notifyCount     int
 		existingRaw     []byte
+		existingDetails map[string]any
 		existing        bool
 	)
 	err = tx.QueryRow(ctx, `
@@ -607,6 +604,8 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 	`, streamID, incidentType).Scan(&incidentID, &firstObservedAt, &lastNotifiedAt, &notifyCount, &existingRaw)
 	if err == nil {
 		existing = true
+		existingDetails = map[string]any{}
+		_ = json.Unmarshal(existingRaw, &existingDetails)
 	} else if !strings.Contains(strings.ToLower(err.Error()), "no rows") {
 		return supervisorIncidentUpdate{}, err
 	}
@@ -614,8 +613,6 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 	currentRevision := int64FromAny(item["assignment_revision"])
 	shouldRemediate := !existing
 	if existing {
-		existingDetails := map[string]any{}
-		_ = json.Unmarshal(existingRaw, &existingDetails)
 		existingRevision := int64FromAny(existingDetails["assignment_revision"])
 		lastRemediatedAt := parseAnyTime(existingDetails["last_remediated_at"])
 		if currentRevision > 0 && existingRevision > 0 && existingRevision != currentRevision {
@@ -631,6 +628,19 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		} else if lastRemediatedAt == nil || now.Sub(lastRemediatedAt.UTC()) >= remediationRetry {
 			shouldRemediate = true
 		}
+	}
+
+	if existing {
+		if value, ok := existingDetails["last_remediated_at"]; ok && value != nil {
+			details["last_remediated_at"] = value
+		}
+		if value, ok := existingDetails["remediation_count"]; ok && value != nil {
+			details["remediation_count"] = value
+		}
+	}
+	detailsBytes, err := json.Marshal(details)
+	if err != nil {
+		return supervisorIncidentUpdate{}, err
 	}
 
 	if !existing {
