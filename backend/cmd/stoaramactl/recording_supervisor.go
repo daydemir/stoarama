@@ -604,9 +604,9 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		WHERE stream_id=$1
 		  AND status='open'
 		  AND incident_type IN ($2, $3)
-		FOR UPDATE
 		ORDER BY updated_at DESC, id DESC
 		LIMIT 1
+		FOR UPDATE
 	`, streamID, supervisionIncidentDown10m, supervisionIncidentSpotty2h).Scan(&incidentID, &existingType, &firstObservedAt, &lastNotifiedAt, &notifyCount, &existingRaw)
 	if err == nil {
 		existing = true
