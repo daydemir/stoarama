@@ -9,6 +9,40 @@ import (
 	"time"
 )
 
+func TestRelayResolveBackoffForRateLimitError(t *testing.T) {
+	t.Parallel()
+
+	backoff := relayResolveBackoffForError(context.DeadlineExceeded)
+	if backoff != relayResolveRetryBackoff {
+		t.Fatalf("expected default backoff for generic error, got %s", backoff)
+	}
+
+	rateLimited := relayResolveBackoffForError(assertErr("Video unavailable. This content isn't available, try again later. The current session has been rate-limited by YouTube for up to an hour."))
+	if rateLimited != relayResolveRateLimitBackoff {
+		t.Fatalf("expected rate-limit backoff %s, got %s", relayResolveRateLimitBackoff, rateLimited)
+	}
+}
+
+func TestRelayRefreshDelayForStreamAddsDeterministicJitter(t *testing.T) {
+	t.Parallel()
+
+	delayA := relayRefreshDelayForStream(1)
+	delayB := relayRefreshDelayForStream(2)
+	if delayA < defaultRelayRouteRefreshDelay || delayA > defaultRelayRouteRefreshDelay+relayRefreshJitterWindow {
+		t.Fatalf("delayA out of range: %s", delayA)
+	}
+	if delayB < defaultRelayRouteRefreshDelay || delayB > defaultRelayRouteRefreshDelay+relayRefreshJitterWindow {
+		t.Fatalf("delayB out of range: %s", delayB)
+	}
+	if delayA == delayB {
+		t.Fatalf("expected different deterministic jitter for different stream ids")
+	}
+}
+
+type assertErr string
+
+func (e assertErr) Error() string { return string(e) }
+
 func TestRewriteRelayPlaylistRewritesSegmentURLs(t *testing.T) {
 	t.Parallel()
 

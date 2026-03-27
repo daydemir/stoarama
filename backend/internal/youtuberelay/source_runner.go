@@ -111,8 +111,10 @@ type relaySourceRouteCacheEntry struct {
 }
 
 const (
-	defaultRelayRouteRefreshDelay = 10 * time.Minute
+	defaultRelayRouteRefreshDelay = 30 * time.Minute
 	relayResolveRetryBackoff      = 2 * time.Minute
+	relayResolveRateLimitBackoff  = 45 * time.Minute
+	relayRefreshJitterWindow      = 5 * time.Minute
 )
 
 func sourceRouteShouldStaySticky(status string) bool {
@@ -122,6 +124,29 @@ func sourceRouteShouldStaySticky(status string) bool {
 	default:
 		return false
 	}
+}
+
+func relayRefreshDelayForStream(streamID int64) time.Duration {
+	base := defaultRelayRouteRefreshDelay
+	if streamID <= 0 {
+		return base
+	}
+	jitterSec := streamID % int64((relayRefreshJitterWindow/time.Second)+1)
+	return base + (time.Duration(jitterSec) * time.Second)
+}
+
+func relayResolveBackoffForError(err error) time.Duration {
+	if err == nil {
+		return relayResolveRetryBackoff
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(msg, "rate-limited by youtube") ||
+		strings.Contains(msg, "try again later") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "confirm you're not a bot") {
+		return relayResolveRateLimitBackoff
+	}
+	return relayResolveRetryBackoff
 }
 
 func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) error {
@@ -466,7 +491,10 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		lastUpstreamURL[streamID] = cachedURL
 		lastPublishedPullURL[streamID] = fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, streamID, url.QueryEscape(strings.TrimSpace(opts.SharedToken)))
 		lastStatus[streamID] = "source_ready"
-		nextResolveAt[streamID] = cached.UpdatedAt.Add(defaultRelayRouteRefreshDelay)
+		nextResolveAt[streamID] = cached.UpdatedAt.Add(relayRefreshDelayForStream(streamID))
+		if nextResolveAt[streamID].Before(time.Now().UTC()) {
+			nextResolveAt[streamID] = time.Now().UTC().Add(relayRefreshDelayForStream(streamID) / 4)
+		}
 		log.Printf("youtube-relay source preloaded cached route stream_id=%d age=%s", streamID, time.Since(cached.UpdatedAt).Round(time.Second))
 	}
 
@@ -504,7 +532,10 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 						lastStatus[route.StreamID] = "source_ready"
 					}
 					if nextResolveAt[route.StreamID].IsZero() {
-						nextResolveAt[route.StreamID] = cached.UpdatedAt.Add(defaultRelayRouteRefreshDelay)
+						nextResolveAt[route.StreamID] = cached.UpdatedAt.Add(relayRefreshDelayForStream(route.StreamID))
+						if nextResolveAt[route.StreamID].Before(time.Now().UTC()) {
+							nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayRefreshDelayForStream(route.StreamID) / 4)
+						}
 					}
 					log.Printf("youtube-relay source restored cached route stream_id=%d age=%s", route.StreamID, time.Since(cached.UpdatedAt).Round(time.Second))
 					probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
@@ -517,7 +548,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 						delete(lastUpstreamURL, route.StreamID)
 						delete(lastPublishedPullURL, route.StreamID)
 						delete(lastStatus, route.StreamID)
-						nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveRetryBackoff)
+						nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveBackoffForError(probeErr))
 						_ = api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
 							StreamID:  route.StreamID,
 							Actor:     "youtube_relay_source",
@@ -598,7 +629,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 					}
 					lastStatus[route.StreamID] = "source_ready"
 					if nextResolveAt[route.StreamID].IsZero() {
-						nextResolveAt[route.StreamID] = time.Now().UTC().Add(defaultRelayRouteRefreshDelay)
+						nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayRefreshDelayForStream(route.StreamID))
 					}
 					continue
 				}
@@ -672,8 +703,9 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 				if lastUpstreamURL[route.StreamID] != "" &&
 					lastPublishedPullURL[route.StreamID] == relayPullURL &&
 					(lastStatus[route.StreamID] == "source_ready" || lastStatus[route.StreamID] == "running") {
-					nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveRetryBackoff)
-					log.Printf("youtube-relay source keeping previous route stream_id=%d after resolve failure consecutive=%d/%d: %v", route.StreamID, routeResolveFailures[route.StreamID], opts.ResolveFailureThreshold, result.err)
+					backoff := relayResolveBackoffForError(result.err)
+					nextResolveAt[route.StreamID] = time.Now().UTC().Add(backoff)
+					log.Printf("youtube-relay source keeping previous route stream_id=%d after resolve failure consecutive=%d/%d backoff=%s: %v", route.StreamID, routeResolveFailures[route.StreamID], opts.ResolveFailureThreshold, backoff, result.err)
 					continue
 				}
 				relayState.mu.Lock()
@@ -739,12 +771,12 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 						"hub_server_id":     strings.TrimSpace(opts.HubServerID),
 					},
 				})
-				nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveRetryBackoff)
+				nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveBackoffForError(probeErr))
 				continue
 			}
 			lastUpstreamURL[route.StreamID] = upstreamURL
 			lastPublishedPullURL[route.StreamID] = relayPullURL
-			refreshAfter := defaultRelayRouteRefreshDelay
+			refreshAfter := relayRefreshDelayForStream(route.StreamID)
 			nextResolveAt[route.StreamID] = now.Add(refreshAfter)
 			routeCache[route.StreamID] = relaySourceRouteCacheEntry{UpstreamURL: upstreamURL, UpdatedAt: now}
 			saveRouteCache()
