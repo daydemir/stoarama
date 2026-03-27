@@ -22,8 +22,8 @@ import (
 const (
 	supervisionIncidentDown10m  = "down_10m"
 	supervisionIncidentSpotty2h = "spotty_2h"
-	supervisionNotifyRepeat     = 12 * time.Hour
 	supervisionRemediateRetry   = 10 * time.Minute
+	supervisionStateHistoryMax  = 25
 )
 
 type supervisorIncidentUpdate struct {
@@ -119,10 +119,7 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 			if incidentType != supervisionIncidentDown10m && incidentType != supervisionIncidentSpotty2h {
 				continue
 			}
-			if err := resolveSupervisorIncidentsExcept(ctx, pool, streamID, incidentType); err != nil {
-				log.Printf("recording supervisor resolve stale incident types stream_id=%d keep=%s: %v", streamID, incidentType, err)
-			}
-			update, err := upsertSupervisorIncident(ctx, pool, item, incidentType, supervisionNotifyRepeat, supervisionRemediateRetry)
+			update, err := upsertSupervisorIncident(ctx, pool, item, incidentType, supervisionRemediateRetry)
 			if err != nil {
 				log.Printf("recording supervisor upsert incident stream_id=%d: %v", streamID, err)
 				continue
@@ -163,7 +160,7 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 				if err := supervisorReassign(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), item, *dryRun); err != nil {
 					log.Printf("recording supervisor reassign stream_id=%d: %v", streamID, err)
 				} else if !*dryRun {
-					if err := markSupervisorIncidentRemediated(ctx, pool, streamID, incidentType); err != nil {
+					if err := markSupervisorIncidentRemediated(ctx, pool, streamID); err != nil {
 						log.Printf("recording supervisor mark remediated stream_id=%d: %v", streamID, err)
 					}
 				}
@@ -558,7 +555,7 @@ func loadSupervisorRecipients(ctx context.Context, pool *pgxpool.Pool, cfg confi
 	return out, nil
 }
 
-func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[string]any, incidentType string, repeatInterval time.Duration, remediationRetry time.Duration) (supervisorIncidentUpdate, error) {
+func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[string]any, incidentType string, remediationRetry time.Duration) (supervisorIncidentUpdate, error) {
 	streamID := int64FromAny(item["stream_id"])
 	if streamID <= 0 {
 		return supervisorIncidentUpdate{}, fmt.Errorf("missing stream_id")
@@ -580,6 +577,9 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		"process_issues_2h":   item["process_issues_2h"],
 		"outage_episodes_2h":  item["outage_episodes_2h"],
 		"last_frame_at":       item["last_frame_at"],
+		"current_state":       incidentType,
+		"current_reason":      strings.TrimSpace(fmt.Sprint(item["supervision_reason"])),
+		"severity":            supervisorIncidentSeverity(incidentType),
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -590,6 +590,7 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 
 	var (
 		incidentID      int64
+		existingType    string
 		firstObservedAt time.Time
 		lastNotifiedAt  *time.Time
 		notifyCount     int
@@ -598,13 +599,15 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		existing        bool
 	)
 	err = tx.QueryRow(ctx, `
-		SELECT id, first_observed_at, last_notified_at, notify_count, details_jsonb
+		SELECT id, incident_type, first_observed_at, last_notified_at, notify_count, details_jsonb
 		FROM stream_recording_incidents
 		WHERE stream_id=$1
-		  AND incident_type=$2
 		  AND status='open'
+		  AND incident_type IN ($2, $3)
 		FOR UPDATE
-	`, streamID, incidentType).Scan(&incidentID, &firstObservedAt, &lastNotifiedAt, &notifyCount, &existingRaw)
+		ORDER BY updated_at DESC, id DESC
+		LIMIT 1
+	`, streamID, supervisionIncidentDown10m, supervisionIncidentSpotty2h).Scan(&incidentID, &existingType, &firstObservedAt, &lastNotifiedAt, &notifyCount, &existingRaw)
 	if err == nil {
 		existing = true
 		existingDetails = map[string]any{}
@@ -613,22 +616,10 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		return supervisorIncidentUpdate{}, err
 	}
 
-	currentRevision := int64FromAny(item["assignment_revision"])
 	shouldRemediate := !existing
 	if existing {
-		existingRevision := int64FromAny(existingDetails["assignment_revision"])
 		lastRemediatedAt := parseAnyTime(existingDetails["last_remediated_at"])
-		if currentRevision > 0 && existingRevision > 0 && existingRevision != currentRevision {
-			if _, err := tx.Exec(ctx, `
-				UPDATE stream_recording_incidents
-				SET status='resolved', resolved_at=$2, last_observed_at=$2, updated_at=now()
-				WHERE id=$1
-			`, incidentID, now); err != nil {
-				return supervisorIncidentUpdate{}, err
-			}
-			existing = false
-			shouldRemediate = true
-		} else if lastRemediatedAt == nil || now.Sub(lastRemediatedAt.UTC()) >= remediationRetry {
+		if lastRemediatedAt == nil || now.Sub(lastRemediatedAt.UTC()) >= remediationRetry {
 			shouldRemediate = true
 		}
 	}
@@ -639,6 +630,20 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		}
 		if value, ok := existingDetails["remediation_count"]; ok && value != nil {
 			details["remediation_count"] = value
+		}
+		details = mergeSupervisorIncidentDetails(existingDetails, details, strings.TrimSpace(existingType), incidentType, now)
+	} else {
+		details["opened_state"] = incidentType
+		details["opened_reason"] = strings.TrimSpace(fmt.Sprint(item["supervision_reason"]))
+		details["last_state_change_at"] = now.Format(time.RFC3339Nano)
+		details["state_transitions"] = []map[string]any{
+			{
+				"at":          now.Format(time.RFC3339Nano),
+				"from_state":  "",
+				"to_state":    incidentType,
+				"from_reason": "",
+				"to_reason":   strings.TrimSpace(fmt.Sprint(item["supervision_reason"])),
+			},
 		}
 	}
 	detailsBytes, err := json.Marshal(details)
@@ -660,14 +665,14 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 	} else {
 		if _, err := tx.Exec(ctx, `
 			UPDATE stream_recording_incidents
-			SET last_observed_at=$2, details_jsonb=$3::jsonb, updated_at=now()
+			SET incident_type=$2, last_observed_at=$3, details_jsonb=$4::jsonb, updated_at=now()
 			WHERE id=$1
-		`, incidentID, now, string(detailsBytes)); err != nil {
+		`, incidentID, incidentType, now, string(detailsBytes)); err != nil {
 			return supervisorIncidentUpdate{}, err
 		}
 	}
 
-	shouldNotify := !existing || lastNotifiedAt == nil || now.Sub(lastNotifiedAt.UTC()) >= repeatInterval
+	shouldNotify := lastNotifiedAt == nil
 	if err := tx.Commit(ctx); err != nil {
 		return supervisorIncidentUpdate{}, err
 	}
@@ -703,22 +708,6 @@ func resolveSupervisorIncidents(ctx context.Context, pool *pgxpool.Pool, streamI
 	return err
 }
 
-func resolveSupervisorIncidentsExcept(ctx context.Context, pool *pgxpool.Pool, streamID int64, keepIncidentType string) error {
-	keep := strings.TrimSpace(keepIncidentType)
-	if streamID <= 0 || keep == "" {
-		return fmt.Errorf("stream id and keep incident type are required")
-	}
-	_, err := pool.Exec(ctx, `
-		UPDATE stream_recording_incidents
-		SET status='resolved', resolved_at=now(), last_observed_at=now(), updated_at=now()
-		WHERE stream_id=$1
-		  AND status='open'
-		  AND incident_type IN ($2, $3)
-		  AND incident_type <> $4
-	`, streamID, supervisionIncidentDown10m, supervisionIncidentSpotty2h, keep)
-	return err
-}
-
 func resolveInactiveSupervisorIncidents(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `
 		UPDATE stream_recording_incidents i
@@ -732,9 +721,9 @@ func resolveInactiveSupervisorIncidents(ctx context.Context, pool *pgxpool.Pool)
 	return err
 }
 
-func markSupervisorIncidentRemediated(ctx context.Context, pool *pgxpool.Pool, streamID int64, incidentType string) error {
-	if streamID <= 0 || strings.TrimSpace(incidentType) == "" {
-		return fmt.Errorf("stream id and incident type are required")
+func markSupervisorIncidentRemediated(ctx context.Context, pool *pgxpool.Pool, streamID int64) error {
+	if streamID <= 0 {
+		return fmt.Errorf("stream id is required")
 	}
 	_, err := pool.Exec(ctx, `
 		UPDATE stream_recording_incidents
@@ -752,10 +741,67 @@ func markSupervisorIncidentRemediated(ctx context.Context, pool *pgxpool.Pool, s
 			),
 			updated_at=now()
 		WHERE stream_id=$1
-		  AND incident_type=$2
 		  AND status='open'
-	`, streamID, strings.TrimSpace(incidentType))
+		  AND incident_type IN ($2, $3)
+	`, streamID, supervisionIncidentDown10m, supervisionIncidentSpotty2h)
 	return err
+}
+
+func supervisorIncidentSeverity(incidentType string) string {
+	switch strings.TrimSpace(incidentType) {
+	case supervisionIncidentDown10m:
+		return "critical"
+	case supervisionIncidentSpotty2h:
+		return "degraded"
+	default:
+		return "warning"
+	}
+}
+
+func mergeSupervisorIncidentDetails(existing, current map[string]any, previousType, nextType string, now time.Time) map[string]any {
+	out := map[string]any{}
+	for k, v := range existing {
+		out[k] = v
+	}
+	for k, v := range current {
+		out[k] = v
+	}
+	prevState := strings.TrimSpace(fmt.Sprint(existing["current_state"]))
+	if prevState == "" {
+		prevState = strings.TrimSpace(previousType)
+	}
+	prevReason := strings.TrimSpace(fmt.Sprint(existing["current_reason"]))
+	nextReason := strings.TrimSpace(fmt.Sprint(current["current_reason"]))
+	if prevState != strings.TrimSpace(nextType) || prevReason != nextReason {
+		out["last_state_change_at"] = now.Format(time.RFC3339Nano)
+		out["state_transitions"] = appendSupervisorIncidentTransition(existing["state_transitions"], map[string]any{
+			"at":          now.Format(time.RFC3339Nano),
+			"from_state":  prevState,
+			"to_state":    strings.TrimSpace(nextType),
+			"from_reason": prevReason,
+			"to_reason":   nextReason,
+		})
+	}
+	return out
+}
+
+func appendSupervisorIncidentTransition(raw any, entry map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, supervisionStateHistoryMax)
+	switch typed := raw.(type) {
+	case []map[string]any:
+		out = append(out, typed...)
+	case []any:
+		for _, item := range typed {
+			if mapped, ok := item.(map[string]any); ok {
+				out = append(out, mapped)
+			}
+		}
+	}
+	out = append(out, entry)
+	if len(out) > supervisionStateHistoryMax {
+		out = out[len(out)-supervisionStateHistoryMax:]
+	}
+	return out
 }
 
 func createAlertDeliveryAttempt(ctx context.Context, pool *pgxpool.Pool, incidentID int64, item map[string]any, recipient string) (int64, error) {
