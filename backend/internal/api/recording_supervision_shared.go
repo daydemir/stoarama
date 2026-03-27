@@ -48,11 +48,13 @@ func classifyRecordingSupervision(now time.Time, input recordingSupervisionInput
 		if age < 0 {
 			age = 0
 		}
+		if input.RuntimeStatus == "stopped" || input.RuntimeStatus == "error" {
+			if age >= downThreshold {
+				return "down_10m", "capture_runtime_" + input.RuntimeStatus, input.LastFrameAt
+			}
+		}
 		if age >= downThreshold {
 			return "down_10m", "stale_frames_10m", input.LastFrameAt
-		}
-		if input.RuntimeStatus == "stopped" || input.RuntimeStatus == "error" {
-			return "down_10m", "capture_runtime_" + input.RuntimeStatus, input.LastFrameAt
 		}
 		if input.Metrics.OutageEpisodes2h >= 3 {
 			unhealthySince = input.AssignedAt
