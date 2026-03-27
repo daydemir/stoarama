@@ -115,6 +115,15 @@ const (
 	relayResolveRetryBackoff      = 2 * time.Minute
 )
 
+func sourceRouteShouldStaySticky(status string) bool {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case "running":
+		return true
+	default:
+		return false
+	}
+}
+
 func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) error {
 	if api == nil {
 		return fmt.Errorf("source api is required")
@@ -480,6 +489,9 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 		for _, route := range activeRoutes {
 			relayPullURL := fmt.Sprintf("%s/relay/%d?token=%s", relayBaseURL, route.StreamID, url.QueryEscape(strings.TrimSpace(opts.SharedToken)))
 			status := strings.TrimSpace(strings.ToLower(route.Status))
+			if status == "running" {
+				lastStatus[route.StreamID] = "running"
+			}
 			if lastUpstreamURL[route.StreamID] == "" {
 				if cached, ok := routeCache[route.StreamID]; ok && strings.TrimSpace(cached.UpstreamURL) != "" {
 					cachedURL := strings.TrimSpace(cached.UpstreamURL)
@@ -524,25 +536,30 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 						})
 						continue
 					}
-					_ = api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
-						StreamID:     route.StreamID,
-						Actor:        "youtube_relay_source",
-						Status:       "source_ready",
-						Reason:       "restored_from_cache",
-						RelayPullURL: relayPullURL,
-						ErrorText:    "",
-						MetadataJSON: map[string]any{
-							"source_server_id":   strings.TrimSpace(opts.ServerID),
-							"relay_public_url":   relayPullURL,
-							"relay_bind_addr":    strings.TrimSpace(opts.BindAddr),
-							"network_transport":  strings.TrimSpace(opts.NetworkTransport),
-							"topology_id":        strings.TrimSpace(opts.TopologyID),
-							"topology_role":      strings.TrimSpace(opts.TopologyRole),
-							"hub_server_id":      strings.TrimSpace(opts.HubServerID),
-							"cache_restored":     true,
-							"source_verified_at": time.Now().UTC().Format(time.RFC3339Nano),
-						},
-					})
+					if sourceRouteShouldStaySticky(status) {
+						lastStatus[route.StreamID] = status
+					} else {
+						_ = api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
+							StreamID:     route.StreamID,
+							Actor:        "youtube_relay_source",
+							Status:       "source_ready",
+							Reason:       "restored_from_cache",
+							RelayPullURL: relayPullURL,
+							ErrorText:    "",
+							MetadataJSON: map[string]any{
+								"source_server_id":   strings.TrimSpace(opts.ServerID),
+								"relay_public_url":   relayPullURL,
+								"relay_bind_addr":    strings.TrimSpace(opts.BindAddr),
+								"network_transport":  strings.TrimSpace(opts.NetworkTransport),
+								"topology_id":        strings.TrimSpace(opts.TopologyID),
+								"topology_role":      strings.TrimSpace(opts.TopologyRole),
+								"hub_server_id":      strings.TrimSpace(opts.HubServerID),
+								"cache_restored":     true,
+								"source_verified_at": time.Now().UTC().Format(time.RFC3339Nano),
+							},
+						})
+						lastStatus[route.StreamID] = "source_ready"
+					}
 				}
 			}
 			relayState.mu.RLock()
@@ -725,6 +742,17 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 				nextResolveAt[route.StreamID] = time.Now().UTC().Add(relayResolveRetryBackoff)
 				continue
 			}
+			lastUpstreamURL[route.StreamID] = upstreamURL
+			lastPublishedPullURL[route.StreamID] = relayPullURL
+			refreshAfter := defaultRelayRouteRefreshDelay
+			nextResolveAt[route.StreamID] = now.Add(refreshAfter)
+			routeCache[route.StreamID] = relaySourceRouteCacheEntry{UpstreamURL: upstreamURL, UpdatedAt: now}
+			saveRouteCache()
+			if sourceRouteShouldStaySticky(status) {
+				lastStatus[route.StreamID] = status
+				log.Printf("youtube-relay source refreshed upstream stream_id=%d route_status=%s without external state change", route.StreamID, status)
+				continue
+			}
 			if err := api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
 				StreamID:     route.StreamID,
 				Actor:        "youtube_relay_source",
@@ -745,13 +773,7 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			}); err != nil {
 				return fmt.Errorf("update youtube relay route status stream_id=%d: %w", route.StreamID, err)
 			}
-			lastUpstreamURL[route.StreamID] = upstreamURL
-			lastPublishedPullURL[route.StreamID] = relayPullURL
 			lastStatus[route.StreamID] = "source_ready"
-			refreshAfter := defaultRelayRouteRefreshDelay
-			nextResolveAt[route.StreamID] = now.Add(refreshAfter)
-			routeCache[route.StreamID] = relaySourceRouteCacheEntry{UpstreamURL: upstreamURL, UpdatedAt: now}
-			saveRouteCache()
 		}
 
 		relayState.mu.Lock()

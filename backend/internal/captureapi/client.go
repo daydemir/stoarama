@@ -189,6 +189,19 @@ type YouTubeRelayRoute struct {
 	UpdatedAt          *time.Time     `json:"updated_at,omitempty"`
 }
 
+type YouTubeRelayEvent struct {
+	ID             int64          `json:"id"`
+	StreamID       int64          `json:"stream_id"`
+	SourceServerID string         `json:"source_server_id"`
+	SinkServerID   string         `json:"sink_server_id"`
+	Status         string         `json:"status"`
+	Actor          string         `json:"actor"`
+	Reason         string         `json:"reason"`
+	ErrorText      string         `json:"error_text"`
+	MetadataJSON   map[string]any `json:"metadata_json"`
+	CreatedAt      *time.Time     `json:"created_at,omitempty"`
+}
+
 type YouTubeRelayRouteStatusRequest struct {
 	StreamID     int64
 	Actor        string
@@ -1003,6 +1016,52 @@ func (c *Client) NodeUpdateYouTubeRelayRouteStatus(ctx context.Context, req YouT
 		"metadata_json":  nonNilMap(req.MetadataJSON),
 	}
 	return c.postJSON(ctx, path, payload, nil)
+}
+
+func (c *Client) ListYouTubeRelayRouteEvents(ctx context.Context, streamID int64, limit, offset int) ([]YouTubeRelayEvent, error) {
+	if streamID <= 0 {
+		return nil, fmt.Errorf("stream_id must be > 0")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	u, err := url.Parse(fmt.Sprintf("%s/api/v1/youtube-relay/routes/%d/events", c.baseURL, streamID))
+	if err != nil {
+		return nil, fmt.Errorf("parse youtube relay events url: %w", err)
+	}
+	q := u.Query()
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	q.Set("offset", fmt.Sprintf("%d", offset))
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build youtube relay events request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("youtube relay events request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return nil, fmt.Errorf("youtube relay events status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var payload struct {
+		Items []YouTubeRelayEvent `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode youtube relay events response: %w", err)
+	}
+	for i := range payload.Items {
+		if payload.Items[i].MetadataJSON == nil {
+			payload.Items[i].MetadataJSON = map[string]any{}
+		}
+	}
+	return payload.Items, nil
 }
 
 func (c *Client) RecordingProcessHeartbeat(ctx context.Context, req RecordingProcessHeartbeatRequest) error {
