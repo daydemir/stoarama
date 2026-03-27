@@ -640,7 +640,35 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 	}
 
 	restartCount := 0
-	relayRunningPublished := false
+	var relayRunningMu sync.Mutex
+	lastRelayRunningPublish := time.Time{}
+	publishRelayRunning := func(capturedAt time.Time, resolvedURL string) error {
+		if !m.shouldRelayRouteStatus(s, effectiveMode) {
+			return nil
+		}
+		now := time.Now().UTC()
+		relayRunningMu.Lock()
+		if !lastRelayRunningPublish.IsZero() && now.Sub(lastRelayRunningPublish) < 30*time.Second {
+			relayRunningMu.Unlock()
+			return nil
+		}
+		lastRelayRunningPublish = now
+		relayRunningMu.Unlock()
+		return m.client.UpdateYouTubeRelayRouteStatus(
+			runCtx,
+			captureapi.YouTubeRelayRouteStatusRequest{
+				StreamID:     s.ID,
+				Actor:        "youtube_relay_sink",
+				Status:       "running",
+				Reason:       "capture_persisted",
+				RelayPullURL: strings.TrimSpace(resolvedURL),
+				MetadataJSON: map[string]any{
+					"sink_server_id": strings.TrimSpace(m.cfg.ServerID),
+					"last_frame_at":  capturedAt.UTC().Format(time.RFC3339Nano),
+				},
+			},
+		)
+	}
 	for {
 		if telemetryErrCh != nil {
 			select {
@@ -701,30 +729,13 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 				persistCtx, cancelPersist := persistCallContext(runCtx)
 				err = m.persistSegmentSuccess(persistCtx, s, effectiveMode, resolved.URL, seg)
 				cancelPersist()
-				if err == nil && m.shouldRelayRouteStatus(s, effectiveMode) && !relayRunningPublished {
-					if routeErr := m.client.UpdateYouTubeRelayRouteStatus(
-						runCtx,
-						captureapi.YouTubeRelayRouteStatusRequest{
-							StreamID:     s.ID,
-							Actor:        "youtube_relay_sink",
-							Status:       "running",
-							Reason:       "first_capture_persisted",
-							RelayPullURL: strings.TrimSpace(resolved.URL),
-							MetadataJSON: map[string]any{
-								"sink_server_id": strings.TrimSpace(m.cfg.ServerID),
-								"first_frame_at": seg.EndAt.UTC().Format(time.RFC3339Nano),
-							},
-						},
-					); routeErr != nil {
+				if err == nil {
+					if routeErr := publishRelayRunning(seg.EndAt, resolved.URL); routeErr != nil {
 						if reporter != nil {
 							reporter.setLastError(routeErr.Error())
 						}
-						capture.CleanupSegment(seg)
-						finalStatus = "failed"
-						finalStopReason = "relay_status_update_failed"
-						return
+						log.Printf("capture-api-persistent stream_id=%d relay running status update failed: %v", s.ID, routeErr)
 					}
-					relayRunningPublished = true
 				}
 				capture.CleanupSegment(seg)
 			}
@@ -768,7 +779,6 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 		}
 
 		frameCh := make(chan frameEvent, m.cfg.FrameQueueSize)
-		var relayRunningOnce sync.Once
 		var writerWG sync.WaitGroup
 		for i := 0; i < m.cfg.FrameWriterWorkers; i++ {
 			writerWG.Add(1)
@@ -785,28 +795,11 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 						log.Printf("capture-api-persistent stream_id=%d persist success failed: %v", s.ID, err)
 						continue
 					}
-					if m.shouldRelayRouteStatus(s, effectiveMode) {
-						relayRunningOnce.Do(func() {
-							if routeErr := m.client.UpdateYouTubeRelayRouteStatus(
-								runCtx,
-								captureapi.YouTubeRelayRouteStatusRequest{
-									StreamID:     s.ID,
-									Actor:        "youtube_relay_sink",
-									Status:       "running",
-									Reason:       "first_capture_persisted",
-									RelayPullURL: strings.TrimSpace(resolved.URL),
-									MetadataJSON: map[string]any{
-										"sink_server_id": strings.TrimSpace(m.cfg.ServerID),
-										"first_frame_at": ev.capturedAt.UTC().Format(time.RFC3339Nano),
-									},
-								},
-							); routeErr != nil {
-								if reporter != nil {
-									reporter.setLastError(routeErr.Error())
-								}
-								log.Printf("capture-api-persistent stream_id=%d relay running status update failed: %v", s.ID, routeErr)
-							}
-						})
+					if routeErr := publishRelayRunning(ev.capturedAt, resolved.URL); routeErr != nil {
+						if reporter != nil {
+							reporter.setLastError(routeErr.Error())
+						}
+						log.Printf("capture-api-persistent stream_id=%d relay running status update failed: %v", s.ID, routeErr)
 					}
 					if reporter != nil {
 						reporter.setLastFrame(ev.capturedAt)

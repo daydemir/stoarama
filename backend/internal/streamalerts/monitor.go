@@ -290,7 +290,7 @@ func (m *Monitor) upsertOpenIncident(ctx context.Context, it problemStream, reas
 	}
 	if shouldNotify {
 		for _, addr := range admins {
-			if err := m.mailer.Send(ctx, email.Message{
+			if _, err := m.mailer.Send(ctx, email.Message{
 				To:          addr,
 				Subject:     fmt.Sprintf("[Stoarama] Recording problem: #%d %s", it.StreamID, compactAlertTitle(it.Name)),
 				PlainText:   m.problemPlainText(it, reason),
@@ -360,7 +360,7 @@ func (m *Monitor) resolveRecoveredIncidents(ctx context.Context, open map[int64]
 				name = fmt.Sprintf("stream #%d", incident.StreamID)
 			}
 			for _, addr := range admins {
-				if err := m.mailer.Send(ctx, email.Message{
+				if _, err := m.mailer.Send(ctx, email.Message{
 					To:          addr,
 					Subject:     fmt.Sprintf("[Stoarama] Recording recovered: #%d %s", incident.StreamID, compactAlertTitle(name)),
 					PlainText:   fmt.Sprintf("%s has recovered.\n\nView: %s/dashboard/stream/%d\n", name, strings.TrimRight(m.cfg.AppBaseURL, "/"), incident.StreamID),

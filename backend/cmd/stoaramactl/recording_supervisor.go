@@ -27,6 +27,7 @@ const (
 )
 
 type supervisorIncidentUpdate struct {
+	IncidentID      int64
 	ShouldNotify    bool
 	ShouldRemediate bool
 }
@@ -99,6 +100,9 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 		if len(recipients) == 0 {
 			log.Printf("recording supervisor warning: no alert recipients configured; set STREAM_ALERTS_RECIPIENTS or add an active verified admin")
 		}
+		if err := resolveInactiveSupervisorIncidents(ctx, pool); err != nil {
+			log.Printf("recording supervisor resolve inactive incidents: %v", err)
+		}
 		for _, item := range items {
 			state := strings.TrimSpace(fmt.Sprint(item["supervision_state"]))
 			streamID := int64FromAny(item["stream_id"])
@@ -121,14 +125,34 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 				continue
 			}
 			if update.ShouldNotify && len(recipients) > 0 {
+				notified := false
 				for _, addr := range recipients {
-					if err := mailer.Send(ctx, email.Message{
+					deliveryID, deliveryErr := createAlertDeliveryAttempt(ctx, pool, update.IncidentID, item, addr)
+					if deliveryErr != nil {
+						log.Printf("recording supervisor create alert delivery stream_id=%d to=%s: %v", streamID, addr, deliveryErr)
+					}
+					receipt, err := mailer.Send(ctx, email.Message{
 						To:          addr,
 						Subject:     supervisorIncidentSubject(item),
 						PlainText:   supervisorIncidentBody(strings.TrimSpace(*backendAPIURL), item),
 						MessageType: "recording_problem",
-					}); err != nil {
+					})
+					if err != nil {
+						if deliveryID > 0 {
+							_ = markAlertDeliveryFailed(ctx, pool, deliveryID, err)
+						}
 						log.Printf("recording supervisor send alert stream_id=%d to=%s: %v", streamID, addr, err)
+						continue
+					}
+					notified = true
+					if deliveryID > 0 {
+						_ = markAlertDeliverySent(ctx, pool, deliveryID, receipt)
+					}
+					log.Printf("recording supervisor sent alert stream_id=%d incident_id=%d to=%s provider=%s message_id=%s status=%s", streamID, update.IncidentID, addr, receipt.Provider, receipt.MessageID, receipt.Status)
+				}
+				if notified {
+					if err := markSupervisorIncidentNotified(ctx, pool, update.IncidentID); err != nil {
+						log.Printf("recording supervisor mark notified stream_id=%d incident_id=%d: %v", streamID, update.IncidentID, err)
 					}
 				}
 			}
@@ -548,8 +572,10 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		"relay_status":        strings.TrimSpace(fmt.Sprint(item["relay_status"])),
 		"last_error_text":     strings.TrimSpace(fmt.Sprint(item["last_error_text"])),
 		"relay_error_text":    strings.TrimSpace(fmt.Sprint(item["relay_error_text"])),
+		"loss_rate_10m":       item["loss_rate_10m"],
 		"loss_rate_2h":        item["loss_rate_2h"],
 		"process_issues_2h":   item["process_issues_2h"],
+		"outage_episodes_2h":  item["outage_episodes_2h"],
 		"last_frame_at":       item["last_frame_at"],
 	}
 	detailsBytes, err := json.Marshal(details)
@@ -629,24 +655,28 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 	}
 
 	shouldNotify := !existing || lastNotifiedAt == nil || now.Sub(lastNotifiedAt.UTC()) >= repeatInterval
-	if shouldNotify {
-		if _, err := tx.Exec(ctx, `
-			UPDATE stream_recording_incidents
-			SET last_notified_at=$2, notify_count=notify_count+1, updated_at=now()
-			WHERE id=$1
-		`, incidentID, now); err != nil {
-			return supervisorIncidentUpdate{}, err
-		}
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return supervisorIncidentUpdate{}, err
 	}
 	_ = firstObservedAt
 	_ = notifyCount
 	return supervisorIncidentUpdate{
+		IncidentID:      incidentID,
 		ShouldNotify:    shouldNotify,
 		ShouldRemediate: shouldRemediate,
 	}, nil
+}
+
+func markSupervisorIncidentNotified(ctx context.Context, pool *pgxpool.Pool, incidentID int64) error {
+	if incidentID <= 0 {
+		return fmt.Errorf("incident id is required")
+	}
+	_, err := pool.Exec(ctx, `
+		UPDATE stream_recording_incidents
+		SET last_notified_at=now(), notify_count=notify_count+1, updated_at=now()
+		WHERE id=$1
+	`, incidentID)
+	return err
 }
 
 func resolveSupervisorIncidents(ctx context.Context, pool *pgxpool.Pool, streamID int64) error {
@@ -657,6 +687,19 @@ func resolveSupervisorIncidents(ctx context.Context, pool *pgxpool.Pool, streamI
 		  AND status='open'
 		  AND incident_type IN ($2, $3)
 	`, streamID, supervisionIncidentDown10m, supervisionIncidentSpotty2h)
+	return err
+}
+
+func resolveInactiveSupervisorIncidents(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `
+		UPDATE stream_recording_incidents i
+		SET status='resolved', resolved_at=now(), last_observed_at=now(), updated_at=now()
+		FROM streams s
+		WHERE s.id=i.stream_id
+		  AND s.recording_state <> 'on'
+		  AND i.status='open'
+		  AND i.incident_type IN ($1, $2)
+	`, supervisionIncidentDown10m, supervisionIncidentSpotty2h)
 	return err
 }
 
@@ -683,6 +726,68 @@ func markSupervisorIncidentRemediated(ctx context.Context, pool *pgxpool.Pool, s
 		  AND incident_type=$2
 		  AND status='open'
 	`, streamID, strings.TrimSpace(incidentType))
+	return err
+}
+
+func createAlertDeliveryAttempt(ctx context.Context, pool *pgxpool.Pool, incidentID int64, item map[string]any, recipient string) (int64, error) {
+	streamID := int64FromAny(item["stream_id"])
+	if streamID <= 0 {
+		return 0, fmt.Errorf("stream id is required")
+	}
+	payload := map[string]any{
+		"stream_id":          streamID,
+		"stream_name":        strings.TrimSpace(fmt.Sprint(item["name"])),
+		"stream_slug":        strings.TrimSpace(fmt.Sprint(item["slug"])),
+		"supervision_state":  strings.TrimSpace(fmt.Sprint(item["supervision_state"])),
+		"supervision_reason": strings.TrimSpace(fmt.Sprint(item["supervision_reason"])),
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+	var id int64
+	err = pool.QueryRow(ctx, `
+		INSERT INTO alert_delivery_events (
+			incident_id, stream_id, recipient, message_type, provider, provider_status, subject, payload_jsonb
+		)
+		VALUES ($1, $2, $3, 'recording_problem', '', 'pending', $4, $5::jsonb)
+		RETURNING id
+	`, nullableInt64(incidentID), streamID, strings.TrimSpace(recipient), supervisorIncidentSubject(item), string(payloadBytes)).Scan(&id)
+	return id, err
+}
+
+func markAlertDeliverySent(ctx context.Context, pool *pgxpool.Pool, deliveryID int64, receipt email.DeliveryReceipt) error {
+	if deliveryID <= 0 {
+		return fmt.Errorf("delivery id is required")
+	}
+	payloadBytes, err := json.Marshal(nonNilMap(receipt.ProviderPayload))
+	if err != nil {
+		return err
+	}
+	_, err = pool.Exec(ctx, `
+		UPDATE alert_delivery_events
+		SET
+			provider=$2,
+			provider_message_id=$3,
+			provider_status=$4,
+			provider_payload_jsonb=$5::jsonb,
+			sent_at=now(),
+			error_text='',
+			updated_at=now()
+		WHERE id=$1
+	`, deliveryID, strings.TrimSpace(receipt.Provider), strings.TrimSpace(receipt.MessageID), defaultString(strings.TrimSpace(receipt.Status), "accepted"), string(payloadBytes))
+	return err
+}
+
+func markAlertDeliveryFailed(ctx context.Context, pool *pgxpool.Pool, deliveryID int64, sendErr error) error {
+	if deliveryID <= 0 {
+		return fmt.Errorf("delivery id is required")
+	}
+	_, err := pool.Exec(ctx, `
+		UPDATE alert_delivery_events
+		SET provider_status='failed', error_text=$2, updated_at=now()
+		WHERE id=$1
+	`, deliveryID, strings.TrimSpace(fmt.Sprint(sendErr)))
 	return err
 }
 
@@ -738,4 +843,11 @@ func parseAnyTime(v any) *time.Time {
 		}
 	}
 	return nil
+}
+
+func nullableInt64(v int64) any {
+	if v <= 0 {
+		return nil
+	}
+	return v
 }

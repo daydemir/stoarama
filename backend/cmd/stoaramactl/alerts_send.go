@@ -15,11 +15,13 @@ import (
 
 func runAlerts(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl alerts send-test-email [--to email@example.com] [--stream-id N --stream-name NAME --reason capture_runtime_stopped]")
+		log.Fatalf("usage: stoaramactl alerts <send-test-email|history> ...")
 	}
 	switch args[0] {
 	case "send-test-email":
 		runAlertsSendTestEmail(ctx, cfg, args[1:])
+	case "history":
+		runAlertsHistory(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown alerts subcommand %q", args[0])
 	}
@@ -98,7 +100,7 @@ func runAlertsSendTestEmail(ctx context.Context, cfg config.Config, args []strin
 	)
 
 	for _, addr := range recipients {
-		if err := mailer.Send(ctx, email.Message{
+		if _, err := mailer.Send(ctx, email.Message{
 			To:          addr,
 			Subject:     subject,
 			PlainText:   body,
@@ -108,4 +110,61 @@ func runAlertsSendTestEmail(ctx context.Context, cfg config.Config, args []strin
 		}
 		fmt.Printf("sent test alert email to %s\n", addr)
 	}
+}
+
+func runAlertsHistory(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("alerts history", flag.ExitOnError)
+	limit := fs.Int("limit", 50, "row limit")
+	status := fs.String("status", "", "optional provider status filter")
+	streamID := fs.Int64("stream-id", 0, "optional stream id filter")
+	_ = fs.Parse(args)
+
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer pool.Close()
+
+	where := []string{"1=1"}
+	sqlArgs := make([]any, 0, 4)
+	if strings.TrimSpace(*status) != "" {
+		sqlArgs = append(sqlArgs, strings.TrimSpace(*status))
+		where = append(where, fmt.Sprintf("e.provider_status=$%d", len(sqlArgs)))
+	}
+	if *streamID > 0 {
+		sqlArgs = append(sqlArgs, *streamID)
+		where = append(where, fmt.Sprintf("e.stream_id=$%d", len(sqlArgs)))
+	}
+	sqlArgs = append(sqlArgs, *limit)
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT e.id, e.stream_id, s.name, e.recipient, e.provider, e.provider_message_id, e.provider_status, e.subject, e.sent_at, e.delivered_at, e.opened_at, e.bounced_at, e.error_text, e.created_at
+		FROM alert_delivery_events e
+		JOIN streams s ON s.id=e.stream_id
+		WHERE %s
+		ORDER BY e.created_at DESC, e.id DESC
+		LIMIT $%d
+	`, strings.Join(where, " AND "), len(sqlArgs)), sqlArgs...)
+	if err != nil {
+		log.Fatalf("query alert history: %v", err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var (
+			id, rowStreamID                                                          int64
+			name, recipient, provider, messageID, providerStatus, subject, errorText string
+			sentAt, deliveredAt, openedAt, bouncedAt                                 *time.Time
+			createdAt                                                                time.Time
+		)
+		if err := rows.Scan(&id, &rowStreamID, &name, &recipient, &provider, &messageID, &providerStatus, &subject, &sentAt, &deliveredAt, &openedAt, &bouncedAt, &errorText, &createdAt); err != nil {
+			log.Fatalf("scan alert history: %v", err)
+		}
+		count++
+		fmt.Printf("id=%d stream_id=%d status=%s provider=%s message_id=%q recipient=%s sent_at=%v delivered_at=%v opened_at=%v bounced_at=%v created_at=%s subject=%q error=%q\n",
+			id, rowStreamID, providerStatus, provider, messageID, recipient, sentAt, deliveredAt, openedAt, bouncedAt, createdAt.UTC().Format(time.RFC3339), subject, errorText)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("iterate alert history: %v", err)
+	}
+	fmt.Printf("rows=%d\n", count)
 }

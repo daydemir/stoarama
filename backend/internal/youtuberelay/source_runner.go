@@ -32,6 +32,10 @@ type NodeSourceAPI struct {
 	Client *captureapi.Client
 }
 
+type ServiceSourceAPI struct {
+	Client *captureapi.Client
+}
+
 func (a NodeSourceAPI) YouTubeRelaySourceHeartbeat(ctx context.Context, req captureapi.YouTubeRelaySourceHeartbeatRequest) error {
 	return a.Client.NodeYouTubeRelaySourceHeartbeat(ctx, req)
 }
@@ -46,6 +50,22 @@ func (a NodeSourceAPI) ListYouTubeRelayRoutes(ctx context.Context, _ string, _ s
 
 func (a NodeSourceAPI) UpdateYouTubeRelayRouteStatus(ctx context.Context, req captureapi.YouTubeRelayRouteStatusRequest) error {
 	return a.Client.NodeUpdateYouTubeRelayRouteStatus(ctx, req)
+}
+
+func (a ServiceSourceAPI) YouTubeRelaySourceHeartbeat(ctx context.Context, req captureapi.YouTubeRelaySourceHeartbeatRequest) error {
+	return a.Client.YouTubeRelaySourceHeartbeat(ctx, req)
+}
+
+func (a ServiceSourceAPI) YouTubeRelaySourceStopped(ctx context.Context, serverID string) error {
+	return a.Client.YouTubeRelaySourceStopped(ctx, serverID)
+}
+
+func (a ServiceSourceAPI) ListYouTubeRelayRoutes(ctx context.Context, sourceServerID, sinkServerID, status string, limit, offset int) ([]captureapi.YouTubeRelayRoute, error) {
+	return a.Client.ListYouTubeRelayRoutes(ctx, sourceServerID, sinkServerID, status, limit, offset)
+}
+
+func (a ServiceSourceAPI) UpdateYouTubeRelayRouteStatus(ctx context.Context, req captureapi.YouTubeRelayRouteStatusRequest) error {
+	return a.Client.UpdateYouTubeRelayRouteStatus(ctx, req)
 }
 
 type SourceRunnerOptions struct {
@@ -528,6 +548,44 @@ func RunSource(ctx context.Context, api SourceAPI, opts SourceRunnerOptions) err
 			relayState.mu.RLock()
 			currentRoute, currentRouteOK := relayState.routes[route.StreamID]
 			relayState.mu.RUnlock()
+			if status == "assigned" &&
+				currentRouteOK &&
+				strings.TrimSpace(currentRoute.UpstreamURL) != "" &&
+				lastUpstreamURL[route.StreamID] != "" &&
+				lastPublishedPullURL[route.StreamID] == relayPullURL &&
+				(lastStatus[route.StreamID] == "source_ready" || lastStatus[route.StreamID] == "running") {
+				probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
+				probeErr := probeRelayPlaylist(probeCtx, relayHTTPClient, relayPullURL)
+				probeCancel()
+				if probeErr == nil {
+					if err := api.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
+						StreamID:     route.StreamID,
+						Actor:        "youtube_relay_source",
+						Status:       "source_ready",
+						Reason:       "reused_existing_route",
+						RelayPullURL: relayPullURL,
+						ErrorText:    "",
+						MetadataJSON: map[string]any{
+							"source_server_id":   strings.TrimSpace(opts.ServerID),
+							"relay_public_url":   relayPullURL,
+							"relay_bind_addr":    strings.TrimSpace(opts.BindAddr),
+							"network_transport":  strings.TrimSpace(opts.NetworkTransport),
+							"topology_id":        strings.TrimSpace(opts.TopologyID),
+							"topology_role":      strings.TrimSpace(opts.TopologyRole),
+							"hub_server_id":      strings.TrimSpace(opts.HubServerID),
+							"cache_reused":       true,
+							"source_verified_at": time.Now().UTC().Format(time.RFC3339Nano),
+						},
+					}); err != nil {
+						return fmt.Errorf("update youtube relay route status stream_id=%d: %w", route.StreamID, err)
+					}
+					lastStatus[route.StreamID] = "source_ready"
+					if nextResolveAt[route.StreamID].IsZero() {
+						nextResolveAt[route.StreamID] = time.Now().UTC().Add(defaultRelayRouteRefreshDelay)
+					}
+					continue
+				}
+			}
 			if (status == "source_ready" || status == "running") &&
 				currentRouteOK &&
 				strings.TrimSpace(currentRoute.UpstreamURL) != "" &&

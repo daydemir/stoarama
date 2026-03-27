@@ -144,6 +144,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/dashboard/stream/{id}", s.redirectDashboard)
 	r.Get("/docs/youtube-relay-source", s.redirectLegacyRelayGuide)
 	r.Get("/auth/complete", s.handleAccountAuthComplete)
+	r.Post("/webhooks/email/resend", s.handleResendWebhook)
 
 	r.Route("/api/v1", func(api chi.Router) {
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
@@ -256,7 +257,9 @@ func (s *Server) router() http.Handler {
 			admin.Get("/recording/assignments/audit", s.handleRecordingAssignmentsAudit)
 			admin.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			admin.Get("/recording/incidents", s.handleRecordingIncidentsList)
+			admin.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
 			admin.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
+			admin.Get("/youtube-relay/routes/{stream_id}/events", s.handleYouTubeRelayRouteEventsList)
 			admin.Patch("/streams/{id}/capture", s.handleStreamsCapturePatch)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
@@ -315,6 +318,7 @@ func (s *Server) router() http.Handler {
 			service.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
 			service.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			service.Get("/recording/incidents", s.handleRecordingIncidentsList)
+			service.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
 			service.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
 			service.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
@@ -322,6 +326,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)
 			service.Post("/youtube-relay/sources/stopped", s.handleYouTubeRelaySourceStopped)
 			service.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
+			service.Get("/youtube-relay/routes/{stream_id}/events", s.handleYouTubeRelayRouteEventsList)
 			service.Post("/youtube-relay/routes/{stream_id}/status", s.handleYouTubeRelayRouteStatus)
 			service.Get("/capture/streams", s.handleCaptureStreams)
 			service.Get("/capture/streams/{id}", s.handleCaptureStreamDetail)
@@ -3657,9 +3662,19 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recording health counts: %v", summaryRows.Err()))
 		return
 	}
-	success60s, err := s.successCaptureCountsSince(r.Context(), frameIDs, clipIDs, 60*time.Second)
+	success2h, err := s.successCaptureCountsSince(r.Context(), frameIDs, clipIDs, 2*time.Hour)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording health counters: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording health counters 2h: %v", err))
+		return
+	}
+	processIssueCounts2h, err := s.recordingProcessIssueCountsSince(r.Context(), 2*time.Hour)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording process issue counters: %v", err))
+		return
+	}
+	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameIDs, clipIDs, 2*time.Hour, 2*time.Minute)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording outage counters: %v", err))
 		return
 	}
 	var recHealthy, recDegraded, recStale int64
@@ -3670,20 +3685,25 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 			recStale++
 			continue
 		}
-		freshness := int64(now.Sub(row.LastSeen.UTC()).Seconds())
-		if freshness < 0 {
-			freshness = 0
-		}
-		expected := expectedCapturesPer60s(mode, recordingSettings.CaptureIntervalSec)
-		lossRate := 100.0
-		if expected > 0 {
-			lossRate = 100.0 * float64(maxInt64(expected-success60s[row.StreamID], 0)) / float64(expected)
-		}
-		if freshness > staleThresholdSecForExecutionClass(mode, recordingSettings.CaptureIntervalSec) {
+		state, _, _ := classifyRecordingSupervision(now, recordingSupervisionInput{
+			RecordingState:  "on",
+			ModeClass:       mode,
+			ServerID:        "assigned",
+			RuntimeStatus:   "running",
+			LastFrameAt:     row.LastSeen,
+			StreamUpdatedAt: now,
+			Metrics: recordingSupervisionMetrics{
+				LossRate2h:       lossRateForWindow(expectedCapturesForWindow(mode, recordingSettings.CaptureIntervalSec, 2*time.Hour), success2h[row.StreamID]),
+				ProcessIssues2h:  processIssueCounts2h[row.StreamID],
+				OutageEpisodes2h: outageEpisodes2h[row.StreamID],
+			},
+		})
+		switch state {
+		case "down_10m":
 			recStale++
-		} else if lossRate > 20 {
+		case "spotty_2h":
 			recDegraded++
-		} else {
+		default:
 			recHealthy++
 		}
 	}
@@ -4231,21 +4251,34 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 				frameStreamIDs = append(frameStreamIDs, it.Stream.ID)
 			}
 		}
-		success60s, err := s.successCaptureCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 60*time.Second)
+		success10m, err := s.successCaptureCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 10*time.Minute)
 		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard success counters query: %v", err))
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard success counters query 10m: %v", err))
+			return
+		}
+		success2h, err := s.successCaptureCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 2*time.Hour)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard success counters query 2h: %v", err))
+			return
+		}
+		processIssueCounts2h, err := s.recordingProcessIssueCountsSince(r.Context(), 2*time.Hour)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard process issue counters query: %v", err))
+			return
+		}
+		outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 2*time.Hour, 2*time.Minute)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard outage counters query: %v", err))
 			return
 		}
 		now := time.Now().UTC()
 		for i := range items {
-			items[i].SuccessFrames60s = success60s[items[i].Stream.ID]
-			if items[i].ExpectedFrames60s > 0 {
-				loss := 100.0 * float64(items[i].ExpectedFrames60s-items[i].SuccessFrames60s) / float64(items[i].ExpectedFrames60s)
-				if loss < 0 {
-					loss = 0
-				}
-				items[i].LossRatePct = loss
-			}
+			items[i].SuccessFrames60s = success10m[items[i].Stream.ID]
+			items[i].ExpectedFrames60s = expectedCapturesForWindow(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), recordingSettings.CaptureIntervalSec, 10*time.Minute)
+			items[i].LossRatePct = lossRateForWindow(
+				expectedCapturesForWindow(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), recordingSettings.CaptureIntervalSec, 2*time.Hour),
+				success2h[items[i].Stream.ID],
+			)
 			lastFrame := items[i].Stream.CaptureRuntimeLastSeen
 			if lastFrame == nil {
 				lastFrame = items[i].LatestCaptured
@@ -4259,14 +4292,21 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			}
 			switch items[i].Stream.RecordingState {
 			case model.RecordingStateOn:
-				staleThreshold := staleThresholdSecForExecutionClass(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), recordingSettings.CaptureIntervalSec)
-				if items[i].FreshnessSec != nil && *items[i].FreshnessSec > staleThreshold {
-					items[i].RecordingHealth = "stale"
-				} else if items[i].LossRatePct > 20 {
-					items[i].RecordingHealth = "degraded"
-				} else {
-					items[i].RecordingHealth = "healthy"
-				}
+				state, _, _ := classifyRecordingSupervision(now, recordingSupervisionInput{
+					RecordingState:  "on",
+					ModeClass:       firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)),
+					ServerID:        "assigned",
+					RuntimeStatus:   strings.TrimSpace(derefString(items[i].Stream.CaptureRuntimeStatus)),
+					LastFrameAt:     lastFrame,
+					StreamUpdatedAt: items[i].Stream.UpdatedAt,
+					Metrics: recordingSupervisionMetrics{
+						LossRate10m:      lossRateForWindow(items[i].ExpectedFrames60s, items[i].SuccessFrames60s),
+						LossRate2h:       items[i].LossRatePct,
+						ProcessIssues2h:  processIssueCounts2h[items[i].Stream.ID],
+						OutageEpisodes2h: outageEpisodes2h[items[i].Stream.ID],
+					},
+				})
+				items[i].RecordingHealth = dashboardHealthFromSupervision(state)
 			default:
 				items[i].RecordingHealth = "off"
 			}
@@ -4867,9 +4907,19 @@ func (s *Server) handleDashboardRecordingSummary(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recording summary health: %v", summaryRows.Err()))
 		return
 	}
-	success60s, err := s.successCaptureCountsSince(r.Context(), frameSummaryIDs, clipSummaryIDs, 60*time.Second)
+	success2h, err := s.successCaptureCountsSince(r.Context(), frameSummaryIDs, clipSummaryIDs, 2*time.Hour)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording summary counters: %v", err))
+		return
+	}
+	processIssueCounts2h, err := s.recordingProcessIssueCountsSince(r.Context(), 2*time.Hour)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording summary process issues: %v", err))
+		return
+	}
+	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameSummaryIDs, clipSummaryIDs, 2*time.Hour, 2*time.Minute)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording summary outage counters: %v", err))
 		return
 	}
 	now := time.Now().UTC()
@@ -4879,20 +4929,25 @@ func (s *Server) handleDashboardRecordingSummary(w http.ResponseWriter, r *http.
 			stale++
 			continue
 		}
-		freshness := int64(now.Sub(row.LastSeen.UTC()).Seconds())
-		if freshness < 0 {
-			freshness = 0
-		}
-		expected := expectedCapturesPer60s(mode, recordingSettings.CaptureIntervalSec)
-		lossRate := 100.0
-		if expected > 0 {
-			lossRate = 100.0 * float64(maxInt64(expected-success60s[row.StreamID], 0)) / float64(expected)
-		}
-		if freshness > staleThresholdSecForExecutionClass(mode, recordingSettings.CaptureIntervalSec) {
+		state, _, _ := classifyRecordingSupervision(now, recordingSupervisionInput{
+			RecordingState:  "on",
+			ModeClass:       mode,
+			ServerID:        "assigned",
+			RuntimeStatus:   "running",
+			LastFrameAt:     row.LastSeen,
+			StreamUpdatedAt: now,
+			Metrics: recordingSupervisionMetrics{
+				LossRate2h:       lossRateForWindow(expectedCapturesForWindow(mode, recordingSettings.CaptureIntervalSec, 2*time.Hour), success2h[row.StreamID]),
+				ProcessIssues2h:  processIssueCounts2h[row.StreamID],
+				OutageEpisodes2h: outageEpisodes2h[row.StreamID],
+			},
+		})
+		switch state {
+		case "down_10m":
 			stale++
-		} else if lossRate > 20 {
+		case "spotty_2h":
 			degraded++
-		} else {
+		default:
 			healthy++
 		}
 	}

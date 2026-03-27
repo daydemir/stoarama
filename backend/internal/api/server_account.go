@@ -912,5 +912,6 @@ func (s *Server) sendAccountMagicLink(ctx context.Context, emailAddr, linkURL st
 	msg := buildAccountMagicLinkEmail(emailAddr, linkURL)
 	msg.From = strings.TrimSpace(s.cfg.EmailFrom)
 	msg.ReplyTo = strings.TrimSpace(s.cfg.EmailReplyTo)
-	return s.mailer.Send(ctx, msg)
+	_, err := s.mailer.Send(ctx, msg)
+	return err
 }

@@ -36,6 +36,57 @@ type youTubeRelayRouteStatusRequest struct {
 	MetadataJSON map[string]any `json:"metadata_json"`
 }
 
+func isYouTubeRelaySourceActor(actor string) bool {
+	actor = strings.TrimSpace(strings.ToLower(actor))
+	return actor == "youtube_relay_source" || strings.Contains(actor, "source")
+}
+
+func isYouTubeRelaySinkActor(actor string) bool {
+	actor = strings.TrimSpace(strings.ToLower(actor))
+	return actor == "youtube_relay_sink" || strings.Contains(actor, "sink")
+}
+
+func validateYouTubeRelayRouteTransition(actor, currentStatus, nextStatus string) error {
+	actor = strings.TrimSpace(strings.ToLower(actor))
+	currentStatus = strings.TrimSpace(strings.ToLower(currentStatus))
+	nextStatus = strings.TrimSpace(strings.ToLower(nextStatus))
+	if currentStatus == "stopped" && nextStatus != "stopped" {
+		return fmt.Errorf("stopped routes require reassignment before %s", nextStatus)
+	}
+	if isYouTubeRelaySourceActor(actor) {
+		switch nextStatus {
+		case "source_ready":
+			if currentStatus == "running" || currentStatus == "failed" {
+				return fmt.Errorf("source actor cannot move %s route to source_ready", currentStatus)
+			}
+			return nil
+		case "failed":
+			return nil
+		default:
+			return fmt.Errorf("source actor cannot set route status %s", nextStatus)
+		}
+	}
+	if isYouTubeRelaySinkActor(actor) {
+		switch nextStatus {
+		case "running":
+			if currentStatus == "stopped" {
+				return fmt.Errorf("sink actor cannot revive stopped route")
+			}
+			return nil
+		case "failed", "stopped":
+			return nil
+		default:
+			return fmt.Errorf("sink actor cannot set route status %s", nextStatus)
+		}
+	}
+	switch nextStatus {
+	case "assigned", "failed", "stopped":
+		return nil
+	default:
+		return fmt.Errorf("operator actor cannot set route status %s", nextStatus)
+	}
+}
+
 func youTubeRelaySourceServerIDForNode(nodeID int64) string {
 	return fmt.Sprintf("node-%d-yt-relay-source", nodeID)
 }
@@ -367,6 +418,68 @@ func (s *Server) handleNodeYouTubeRelayRoutesList(w http.ResponseWriter, r *http
 	s.handleYouTubeRelayRoutesList(w, r)
 }
 
+func (s *Server) handleYouTubeRelayRouteEventsList(w http.ResponseWriter, r *http.Request) {
+	streamID, ok := parseInt64Path(w, r, "stream_id")
+	if !ok {
+		return
+	}
+	limit := parseIntQuery(r, "limit", 200, 1, 2000)
+	offset := parseIntQuery(r, "offset", 0, 0, 1000000)
+	rows, err := s.pool.Query(r.Context(), `
+		SELECT id, source_server_id, sink_server_id, status, actor, reason, error_text, metadata_jsonb, created_at
+		FROM youtube_relay_events
+		WHERE stream_id=$1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2 OFFSET $3
+	`, streamID, limit, offset)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query youtube relay events: %v", err))
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0, limit)
+	for rows.Next() {
+		var id int64
+		var sourceServerID, sinkServerID, status, actor, reason, errorText string
+		var metadataRaw []byte
+		var createdAt time.Time
+		if err := rows.Scan(&id, &sourceServerID, &sinkServerID, &status, &actor, &reason, &errorText, &metadataRaw, &createdAt); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan youtube relay event: %v", err))
+			return
+		}
+		meta := map[string]any{}
+		if len(metadataRaw) > 0 {
+			if err := json.Unmarshal(metadataRaw, &meta); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("decode youtube relay event metadata: %v", err))
+				return
+			}
+		}
+		items = append(items, map[string]any{
+			"id":               id,
+			"stream_id":        streamID,
+			"source_server_id": sourceServerID,
+			"sink_server_id":   sinkServerID,
+			"status":           status,
+			"actor":            actor,
+			"reason":           reason,
+			"error_text":       errorText,
+			"metadata_json":    meta,
+			"created_at":       createdAt.UTC(),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate youtube relay events: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":     items,
+		"limit":     limit,
+		"offset":    offset,
+		"stream_id": streamID,
+		"total":     len(items),
+	})
+}
+
 func (s *Server) handleYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Request) {
 	streamID, ok := parseInt64Path(w, r, "stream_id")
 	if !ok {
@@ -403,13 +516,13 @@ func (s *Server) handleYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Re
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	var sourceServerID, sinkServerID, currentPullURL string
+	var sourceServerID, sinkServerID, currentPullURL, currentStatus string
 	if err := tx.QueryRow(r.Context(), `
-		SELECT source_server_id, sink_server_id, relay_pull_url
+		SELECT source_server_id, sink_server_id, relay_pull_url, status
 		FROM youtube_relay_routes
 		WHERE stream_id=$1
 		FOR UPDATE
-	`, streamID).Scan(&sourceServerID, &sinkServerID, &currentPullURL); err != nil {
+	`, streamID).Scan(&sourceServerID, &sinkServerID, &currentPullURL, &currentStatus); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "youtube relay route not found")
 			return
@@ -422,6 +535,10 @@ func (s *Server) handleYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Re
 	}
 	if (status == youtubeRelayRouteStatusSourceReady || status == youtubeRelayRouteStatusRunning) && relayPullURL == "" {
 		util.WriteError(w, http.StatusBadRequest, "relay_pull_url is required for status source_ready|running")
+		return
+	}
+	if err := validateYouTubeRelayRouteTransition(actor, currentStatus, status); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
 
