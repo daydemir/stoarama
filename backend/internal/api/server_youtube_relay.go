@@ -87,6 +87,20 @@ func validateYouTubeRelayRouteTransition(actor, currentStatus, nextStatus string
 	}
 }
 
+func shouldIgnoreYouTubeRelayRouteStatusMissing(actor string) bool {
+	return isYouTubeRelaySourceActor(actor) || isYouTubeRelaySinkActor(actor)
+}
+
+func shouldIgnoreYouTubeRelayRouteStatusConflict(actor, currentStatus, nextStatus string) bool {
+	actor = strings.TrimSpace(strings.ToLower(actor))
+	currentStatus = strings.TrimSpace(strings.ToLower(currentStatus))
+	nextStatus = strings.TrimSpace(strings.ToLower(nextStatus))
+	if isYouTubeRelaySourceActor(actor) && nextStatus == "source_ready" && (currentStatus == "running" || currentStatus == "failed") {
+		return true
+	}
+	return false
+}
+
 func youTubeRelaySourceServerIDForNode(nodeID int64) string {
 	return fmt.Sprintf("node-%d-yt-relay-source", nodeID)
 }
@@ -524,6 +538,17 @@ func (s *Server) handleYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Re
 		FOR UPDATE
 	`, streamID).Scan(&sourceServerID, &sinkServerID, &currentPullURL, &currentStatus); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			if shouldIgnoreYouTubeRelayRouteStatusMissing(actor) {
+				_ = tx.Rollback(r.Context())
+				util.WriteJSON(w, http.StatusOK, map[string]any{
+					"ok":             true,
+					"ignored":        true,
+					"ignored_reason": "route_not_found",
+					"stream_id":      streamID,
+					"status":         status,
+				})
+				return
+			}
 			util.WriteError(w, http.StatusNotFound, "youtube relay route not found")
 			return
 		}
@@ -538,6 +563,18 @@ func (s *Server) handleYouTubeRelayRouteStatus(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := validateYouTubeRelayRouteTransition(actor, currentStatus, status); err != nil {
+		if shouldIgnoreYouTubeRelayRouteStatusConflict(actor, currentStatus, status) {
+			_ = tx.Rollback(r.Context())
+			util.WriteJSON(w, http.StatusOK, map[string]any{
+				"ok":             true,
+				"ignored":        true,
+				"ignored_reason": "transition_conflict",
+				"stream_id":      streamID,
+				"status":         currentStatus,
+				"current_status": currentStatus,
+			})
+			return
+		}
 		util.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -609,7 +646,12 @@ func (s *Server) handleNodeYouTubeRelayRouteStatus(w http.ResponseWriter, r *htt
 		WHERE stream_id=$1
 	`, streamID).Scan(&sourceServerID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			util.WriteError(w, http.StatusNotFound, "youtube relay route not found")
+			util.WriteJSON(w, http.StatusOK, map[string]any{
+				"ok":             true,
+				"ignored":        true,
+				"ignored_reason": "route_not_found",
+				"stream_id":      streamID,
+			})
 			return
 		}
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load youtube relay route: %v", err))

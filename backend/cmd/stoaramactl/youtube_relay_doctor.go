@@ -23,6 +23,7 @@ func runYouTubeRelayDoctor(ctx context.Context, cfg config.Config, args []string
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 	timeoutSec := fs.Int("timeout-sec", 20, "relay probe timeout seconds")
+	eventsLimit := fs.Int("events-limit", 5, "recent relay events to include per stream")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
 
@@ -31,6 +32,9 @@ func runYouTubeRelayDoctor(ctx context.Context, cfg config.Config, args []string
 	}
 	if *timeoutSec <= 0 {
 		log.Fatalf("--timeout-sec must be > 0")
+	}
+	if *eventsLimit < 0 {
+		log.Fatalf("--events-limit must be >= 0")
 	}
 
 	client, err := captureapi.NewClient(captureapi.ClientConfig{
@@ -83,6 +87,14 @@ func runYouTubeRelayDoctor(ctx context.Context, cfg config.Config, args []string
 			} else if supervisionItem != nil {
 				item["supervision"] = supervisionItem
 			}
+			if *eventsLimit > 0 {
+				events, eventsErr := client.ListYouTubeRelayRouteEvents(ctx, route.StreamID, *eventsLimit, 0)
+				if eventsErr != nil {
+					item["route_events_error"] = eventsErr.Error()
+				} else {
+					item["route_events"] = events
+				}
+			}
 		}
 		if strings.TrimSpace(route.RelayPullURL) != "" {
 			probeCtx, cancel := context.WithTimeout(ctx, time.Duration(*timeoutSec)*time.Second)
@@ -132,6 +144,22 @@ func runYouTubeRelayDoctor(ctx context.Context, cfg config.Config, args []string
 			}
 			if errText := strings.TrimSpace(fmt.Sprint(supervision["last_error_text"])); errText != "" {
 				fmt.Printf("  supervision runtime_error=%s\n", errText)
+			}
+		}
+		if events, ok := item["route_events"].([]captureapi.YouTubeRelayEvent); ok && len(events) > 0 {
+			fmt.Printf("  recent_events:\n")
+			for _, event := range events {
+				eventAt := "<unknown>"
+				if event.CreatedAt != nil {
+					eventAt = event.CreatedAt.UTC().Format(time.RFC3339)
+				}
+				fmt.Printf("    %s %s actor=%s reason=%s err=%s\n",
+					eventAt,
+					event.Status,
+					event.Actor,
+					event.Reason,
+					strings.TrimSpace(event.ErrorText),
+				)
 			}
 		}
 	}

@@ -34,6 +34,18 @@ func TestValidateYouTubeRelayRouteTransition(t *testing.T) {
 	}
 }
 
+func TestShouldIgnoreYouTubeRelayRouteStatusConflict(t *testing.T) {
+	if !shouldIgnoreYouTubeRelayRouteStatusConflict("youtube_relay_source", "running", "source_ready") {
+		t.Fatalf("expected running->source_ready conflict from source to be ignored")
+	}
+	if !shouldIgnoreYouTubeRelayRouteStatusConflict("youtube_relay_source", "failed", "source_ready") {
+		t.Fatalf("expected failed->source_ready conflict from source to be ignored")
+	}
+	if shouldIgnoreYouTubeRelayRouteStatusConflict("youtube_relay_sink", "stopped", "running") {
+		t.Fatalf("did not expect sink stopped->running conflict to be ignored")
+	}
+}
+
 func TestResendWebhookStatusAndTimes(t *testing.T) {
 	deliveredAt := "2026-03-27T00:44:19.331226Z"
 	status, delivered, opened, bounced := resendWebhookStatusAndTimes("email.delivered", map[string]any{
