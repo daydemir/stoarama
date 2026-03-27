@@ -119,6 +119,9 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 			if incidentType != supervisionIncidentDown10m && incidentType != supervisionIncidentSpotty2h {
 				continue
 			}
+			if err := resolveSupervisorIncidentsExcept(ctx, pool, streamID, incidentType); err != nil {
+				log.Printf("recording supervisor resolve stale incident types stream_id=%d keep=%s: %v", streamID, incidentType, err)
+			}
 			update, err := upsertSupervisorIncident(ctx, pool, item, incidentType, supervisionNotifyRepeat, supervisionRemediateRetry)
 			if err != nil {
 				log.Printf("recording supervisor upsert incident stream_id=%d: %v", streamID, err)
@@ -697,6 +700,22 @@ func resolveSupervisorIncidents(ctx context.Context, pool *pgxpool.Pool, streamI
 		  AND status='open'
 		  AND incident_type IN ($2, $3)
 	`, streamID, supervisionIncidentDown10m, supervisionIncidentSpotty2h)
+	return err
+}
+
+func resolveSupervisorIncidentsExcept(ctx context.Context, pool *pgxpool.Pool, streamID int64, keepIncidentType string) error {
+	keep := strings.TrimSpace(keepIncidentType)
+	if streamID <= 0 || keep == "" {
+		return fmt.Errorf("stream id and keep incident type are required")
+	}
+	_, err := pool.Exec(ctx, `
+		UPDATE stream_recording_incidents
+		SET status='resolved', resolved_at=now(), last_observed_at=now(), updated_at=now()
+		WHERE stream_id=$1
+		  AND status='open'
+		  AND incident_type IN ($2, $3)
+		  AND incident_type <> $4
+	`, streamID, supervisionIncidentDown10m, supervisionIncidentSpotty2h, keep)
 	return err
 }
 
