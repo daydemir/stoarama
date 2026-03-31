@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -47,6 +48,65 @@ func TestMaskSecretForLog(t *testing.T) {
 	}
 	if got := maskSecretForLog("abcdefghijklmnopqrstuvwxyz"); got != "abcdef...wxyz" {
 		t.Fatalf("long mask=%q want abcdef...wxyz", got)
+	}
+}
+
+func TestHandleAccountMeIncludesCapabilitiesAndSession(t *testing.T) {
+	s := &Server{}
+	sessionID := int64(42)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/me", nil)
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{
+		AccountID: 7,
+		Email:     "deniz@example.com",
+		Name:      "Deniz",
+		Role:      accountRoleAdmin,
+		AuthType:  "session",
+		SessionID: &sessionID,
+	}))
+	rec := httptest.NewRecorder()
+
+	s.handleAccountMe(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want %d", rec.Code, http.StatusOK)
+	}
+	var payload struct {
+		Authenticated bool `json:"authenticated"`
+		Account       struct {
+			ID       int64  `json:"id"`
+			Email    string `json:"email"`
+			Name     string `json:"name"`
+			Role     string `json:"role"`
+			AuthType string `json:"auth_type"`
+		} `json:"account"`
+		Capabilities struct {
+			CanToggleRecording bool `json:"can_toggle_recording"`
+			CanManageAPIKeys   bool `json:"can_manage_api_keys"`
+			CanDownloadClips   bool `json:"can_download_clips"`
+			CanEditTags        bool `json:"can_edit_tags"`
+		} `json:"capabilities"`
+		Session struct {
+			AuthType       string `json:"auth_type"`
+			BrowserSession bool   `json:"browser_session"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode json: %v", err)
+	}
+	if !payload.Authenticated {
+		t.Fatalf("authenticated=false want true")
+	}
+	if payload.Account.Email != "deniz@example.com" {
+		t.Fatalf("email=%q want deniz@example.com", payload.Account.Email)
+	}
+	if !payload.Capabilities.CanToggleRecording || !payload.Capabilities.CanManageAPIKeys || !payload.Capabilities.CanDownloadClips {
+		t.Fatalf("capabilities=%+v want browser-session capabilities enabled", payload.Capabilities)
+	}
+	if payload.Capabilities.CanEditTags {
+		t.Fatalf("can_edit_tags=true want false")
+	}
+	if payload.Session.AuthType != "session" || !payload.Session.BrowserSession {
+		t.Fatalf("session=%+v want session browser_session=true", payload.Session)
 	}
 }
 

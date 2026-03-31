@@ -110,6 +110,16 @@ func accountPrincipalFromContext(ctx context.Context) (accountPrincipal, bool) {
 	return principal, ok
 }
 
+func accountSessionCapabilities(principal accountPrincipal) map[string]any {
+	hasBrowserSession := principal.SessionID != nil
+	return map[string]any{
+		"can_toggle_recording": hasBrowserSession,
+		"can_manage_api_keys":  hasBrowserSession,
+		"can_download_clips":   hasBrowserSession,
+		"can_edit_tags":        false,
+	}
+}
+
 func accountActorLabel(principal accountPrincipal, fallback string) string {
 	email := strings.TrimSpace(principal.Email)
 	if email != "" {
@@ -421,13 +431,20 @@ func (s *Server) handleAccountMe(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	hasBrowserSession := principal.SessionID != nil
 	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"authenticated": true,
 		"account": map[string]any{
 			"id":        principal.AccountID,
 			"email":     principal.Email,
 			"name":      principal.Name,
 			"role":      principal.Role,
 			"auth_type": principal.AuthType,
+		},
+		"capabilities": accountSessionCapabilities(principal),
+		"session": map[string]any{
+			"auth_type":       principal.AuthType,
+			"browser_session": hasBrowserSession,
 		},
 	})
 }

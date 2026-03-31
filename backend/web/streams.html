@@ -2626,7 +2626,7 @@ let detailTimelineDay = '';
 let detailTimelinePipeline = '';
 let detailCoverageData = null;
 let detailCaptureSamplesData = null;
-let detailHealthHoursWindow = normalizeHealthHoursWindow(localStorage.getItem('detailHealthHours') || '72');
+let detailHealthHoursWindow = 72;
 let detailInferenceLoaded = false;
 let detailLivePollTimer = null;
 let detailLivePollInFlight = false;
@@ -2665,7 +2665,13 @@ let detectionSortBy = 'confidence';
 let detectionSortDir = 'desc';
 let framesSortBy = 'captured_at';
 let framesSortDir = 'desc';
-let currentAccount = null;
+let authState = {
+  status: 'checking',
+  account: null,
+  capabilities: null,
+  session: null,
+  error: '',
+};
 let detailClipItems = [];
 let detailClipOffset = 0;
 const detailClipLimit = 25;
@@ -3136,9 +3142,15 @@ function resolveStreamMapCoordinate(stream) {
 function findStreamByID(id) {
   const n = Number(id);
   if (!Number.isFinite(n) || n <= 0) return null;
-  const row = streamRows.find((x) => Number(x.stream.id) === n)
-    || recStreamRows.find((x) => Number(x.stream.id) === n);
-  if (row && row.stream) return row.stream;
+  const row = streamRows.find((x) => {
+    const stream = getRowStream(x);
+    return stream && Number(stream.id) === n;
+  }) || recStreamRows.find((x) => {
+    const stream = getRowStream(x);
+    return stream && Number(stream.id) === n;
+  });
+  const stream = getRowStream(row);
+  if (stream) return stream;
   if (detailData && detailData.stream && Number(detailData.stream.id) === n) return detailData.stream;
   return null;
 }
@@ -3146,18 +3158,25 @@ function findStreamByID(id) {
 function findStreamRowByID(id) {
   const n = Number(id);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return streamRows.find((x) => Number(x.stream.id) === n)
-    || recStreamRows.find((x) => Number(x.stream.id) === n)
+  return streamRows.find((x) => {
+    const stream = getRowStream(x);
+    return stream && Number(stream.id) === n;
+  }) || recStreamRows.find((x) => {
+    const stream = getRowStream(x);
+    return stream && Number(stream.id) === n;
+  })
     || null;
 }
 
 function setCachedStreamTags(streamID, tags) {
   const normalized = normalizeTags(tags);
   for (const row of streamRows) {
-    if (Number(row.stream.id) === Number(streamID)) row.stream.tags = normalized;
+    const stream = getRowStream(row);
+    if (stream && Number(stream.id) === Number(streamID)) stream.tags = normalized;
   }
   for (const row of recStreamRows) {
-    if (Number(row.stream.id) === Number(streamID)) row.stream.tags = normalized;
+    const stream = getRowStream(row);
+    if (stream && Number(stream.id) === Number(streamID)) stream.tags = normalized;
   }
   if (detailData && detailData.stream && Number(detailData.stream.id) === Number(streamID)) {
     detailData.stream.tags = normalized;
@@ -3171,8 +3190,8 @@ function mergeCachedStreamPatch(streamID, patch) {
       stream[key] = value;
     }
   };
-  for (const row of streamRows) applyPatch(row && row.stream);
-  for (const row of recStreamRows) applyPatch(row && row.stream);
+  for (const row of streamRows) applyPatch(getRowStream(row));
+  for (const row of recStreamRows) applyPatch(getRowStream(row));
   if (detailData && detailData.stream) applyPatch(detailData.stream);
 }
 
@@ -3201,8 +3220,14 @@ function refreshTagFilterSelectOptions() {
 
 function collectKnownTagsFromRows() {
   const fromRows = [];
-  for (const row of streamRows) fromRows.push(...(row.stream.tags || []));
-  for (const row of recStreamRows) fromRows.push(...(row.stream.tags || []));
+  for (const row of streamRows) {
+    const stream = getRowStream(row);
+    if (stream) fromRows.push(...(stream.tags || []));
+  }
+  for (const row of recStreamRows) {
+    const stream = getRowStream(row);
+    if (stream) fromRows.push(...(stream.tags || []));
+  }
   knownStreamTags = normalizeTags(knownStreamTags.concat(fromRows));
   refreshTagSuggestionList();
   refreshTagFilterSelectOptions();
@@ -3230,15 +3255,12 @@ function renderTagEditor(stream, tableKey) {
   const streamID = Number(stream.id);
   const currentTags = normalizeTags(stream.tags || []);
   const current = currentTags.length
-    ? currentTags.map((tag) => `<button class="tag-chip-btn" data-action="tag-remove" data-id="${streamID}" data-table="${esc(tableKey)}" data-tag="${esc(tag)}">${esc(tag)} ×</button>`).join('')
+    ? currentTags.map((tag) => `<span class="tag tag-muted">${esc(tag)}</span>`).join('')
     : '<span class="muted fs10">no tags</span>';
   return `
     <div class="stack tag-editor" data-tag-editor="1" data-id="${streamID}" data-table="${esc(tableKey)}">
       <div class="row">${current}</div>
-      <div class="row">
-        <input class="tag-editor-input" data-tag-input="1" list="streamTagSuggestionsList" placeholder="add tags csv" />
-        <button class="btn-sm" data-action="tag-add" data-id="${streamID}" data-table="${esc(tableKey)}">Add</button>
-      </div>
+      <div class="muted fs10">Tags are read-only in this public view.</div>
     </div>
   `;
 }
@@ -3274,6 +3296,9 @@ async function patchStreamTags(streamID, tags) {
 }
 
 async function handleTagMutation(action, streamID, rawTagValue) {
+  if (!hasAuthCapability('can_edit_tags')) {
+    throw new Error('tag editing is unavailable in this public UI');
+  }
   const stream = findStreamByID(streamID);
   if (!stream) throw new Error(`stream ${streamID} not found in current table view`);
 
@@ -3301,6 +3326,9 @@ async function setStreamRecordingState(streamID, recordingState) {
   const normalized = String(recordingState || '').trim().toLowerCase();
   if (normalized !== 'on' && normalized !== 'off') {
     throw new Error('recording_state must be on or off');
+  }
+  if (!hasAuthCapability('can_toggle_recording')) {
+    throw new Error(authStatusMessage('toggle recording'));
   }
   try {
     if (normalized === 'on') {
@@ -3409,44 +3437,260 @@ function formatAccountAuthError(err, prefix = 'signed-in account required') {
   return `${prefix}. Sign in at ${accountRedirectURL()}`;
 }
 
-async function refreshTopbarAccountStatus() {
-  if (!(topbarAccountStatus instanceof HTMLElement)) return;
-  const accountHref = accountRedirectURL();
-  try {
-    const payload = await fetchJSON('/api/v1/account/me');
-    const account = payload && payload.account ? payload.account : {};
-    currentAccount = account;
-    const email = String(account.email || '').trim();
-    const authType = String(account.auth_type || '').trim();
-    const role = String(account.role || '').trim().toLowerCase();
-    if (topbarAdminLink instanceof HTMLAnchorElement) {
-      topbarAdminLink.style.display = role === 'admin' ? 'inline-flex' : 'none';
-    }
-    topbarAccountStatus.innerHTML = email
-      ? `<a href="${accountHref}">${esc(email)}</a>${authType ? ` <span class="muted">· ${esc(authType)}</span>` : ''}`
-      : `<a href="${accountHref}">Account</a>`;
-  } catch (_) {
-    currentAccount = null;
-    if (topbarAdminLink instanceof HTMLAnchorElement) {
-      topbarAdminLink.style.display = 'none';
-    }
-    topbarAccountStatus.innerHTML = `<a href="${accountHref}">Sign in for recording</a>`;
+const AUTH_CHECK_TIMEOUT_MS = 3500;
+const DEFAULT_AUTH_CAPABILITIES = Object.freeze({
+  can_toggle_recording: false,
+  can_manage_api_keys: false,
+  can_download_clips: false,
+  can_edit_tags: false,
+});
+let authResolveToken = 0;
+
+function cloneDefaultAuthCapabilities() {
+  return { ...DEFAULT_AUTH_CAPABILITIES };
+}
+
+function buildAnonymousAuthState(status = 'anonymous', error = '') {
+  return {
+    status,
+    account: null,
+    capabilities: cloneDefaultAuthCapabilities(),
+    session: {
+      auth_type: '',
+      browser_session: false,
+    },
+    error: String(error || '').trim(),
+  };
+}
+
+function normalizeAuthAccount(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const email = String(raw.email || '').trim();
+  if (!email) return null;
+  return {
+    id: Number(raw.id || 0),
+    email,
+    name: String(raw.name || '').trim(),
+    role: String(raw.role || '').trim().toLowerCase(),
+    auth_type: String(raw.auth_type || '').trim(),
+  };
+}
+
+function normalizeAuthCapabilities(raw) {
+  const next = cloneDefaultAuthCapabilities();
+  if (!raw || typeof raw !== 'object') return next;
+  for (const key of Object.keys(next)) {
+    next[key] = Boolean(raw[key]);
   }
+  return next;
+}
+
+function normalizeAuthSession(raw, account) {
+  const authType = String((raw && raw.auth_type) || (account && account.auth_type) || '').trim();
+  return {
+    auth_type: authType,
+    browser_session: Boolean(raw && raw.browser_session),
+  };
+}
+
+function normalizeAuthState(raw) {
+  if (!raw || typeof raw !== 'object') return buildAnonymousAuthState();
+  const status = String(raw.status || '').trim().toLowerCase();
+  if (status === 'checking') {
+    return {
+      status: 'checking',
+      account: normalizeAuthAccount(raw.account),
+      capabilities: normalizeAuthCapabilities(raw.capabilities),
+      session: normalizeAuthSession(raw.session, raw.account),
+      error: '',
+    };
+  }
+  const account = normalizeAuthAccount(raw.account);
+  const authenticated = Boolean(raw.authenticated ?? account);
+  if (!authenticated || !account) {
+    if (status === 'degraded') return buildAnonymousAuthState('degraded', raw.error);
+    return buildAnonymousAuthState('anonymous', raw.error);
+  }
+  return {
+    status: 'authenticated',
+    account,
+    capabilities: normalizeAuthCapabilities(raw.capabilities),
+    session: normalizeAuthSession(raw.session, account),
+    error: '',
+  };
+}
+
+function currentAccount() {
+  return authState && authState.account ? authState.account : null;
+}
+
+function isAuthenticatedAccount() {
+  const account = currentAccount();
+  return Boolean(authState && authState.status === 'authenticated' && account && account.email);
+}
+
+function hasAuthCapability(capability) {
+  return Boolean(isAuthenticatedAccount() && authState && authState.capabilities && authState.capabilities[capability]);
+}
+
+function authStatusMessage(actionText) {
+  const action = String(actionText || 'continue').trim() || 'continue';
+  if (authState && authState.status === 'checking') return 'Checking session...';
+  return `Sign in to ${action}.`;
+}
+
+async function fetchJSONWithTimeout(path, opts = {}, timeoutMs = 0, timeoutMessage = 'request timed out') {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return fetchJSON(path, opts);
+  }
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchJSON(path, { ...opts, signal: controller.signal });
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      throw new Error(timeoutMessage);
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function renderTopbarAccountStatus() {
+  if (!(topbarAccountStatus instanceof HTMLElement)) return;
+  const signInURL = accountRedirectURL();
+  const account = currentAccount();
+  const role = String(account && account.role || '').trim().toLowerCase();
+  const authType = String(authState && authState.session && authState.session.auth_type || '').trim();
+  if (topbarAdminLink instanceof HTMLAnchorElement) {
+    topbarAdminLink.style.display = role === 'admin' ? 'inline-flex' : 'none';
+  }
+  if (authState && authState.status === 'checking') {
+    topbarAccountStatus.textContent = 'Checking session...';
+    return;
+  }
+  if (isAuthenticatedAccount() && account) {
+    topbarAccountStatus.innerHTML = `<a href="${signInURL}">${esc(account.email)}</a>${authType ? ` <span class="muted">· ${esc(authType)}</span>` : ''}`;
+    return;
+  }
+  if (authState && authState.status === 'degraded') {
+    topbarAccountStatus.innerHTML = `<a href="${signInURL}">Sign in for recording</a> <span class="muted">· session unavailable</span>`;
+    return;
+  }
+  topbarAccountStatus.innerHTML = `<a href="${signInURL}">Sign in for recording</a>`;
+}
+
+function syncAuthDependentUI() {
+  renderTopbarAccountStatus();
   syncDetailAuthState();
+  if (streamRows.length) renderStreamRows();
+  if (recStreamRows.length) renderRecRows();
+  if (detailRecordingData && detailRecordingData.stream) {
+    syncDetailMutationUI(detailRecordingData.stream);
+  }
+  if (detailStreamID) {
+    if (hasAuthCapability('can_download_clips')) {
+      void refreshDetailClips();
+    } else {
+      renderDetailClips([]);
+    }
+  }
+}
+
+function setAuthState(next) {
+  authState = normalizeAuthState(next);
+  syncAuthDependentUI();
+}
+
+async function resolveSessionState() {
+  const token = ++authResolveToken;
+  setAuthState({ status: 'checking', account: currentAccount(), capabilities: authState && authState.capabilities, session: authState && authState.session });
+  try {
+    const payload = await fetchJSONWithTimeout('/api/v1/account/me', {}, AUTH_CHECK_TIMEOUT_MS, 'session check timed out');
+    if (token !== authResolveToken) return;
+    setAuthState(payload);
+  } catch (err) {
+    if (token !== authResolveToken) return;
+    if (isUnauthorizedMessage(err)) {
+      setAuthState({ status: 'anonymous' });
+      return;
+    }
+    setAuthState({ status: 'degraded', error: String(err && err.message ? err.message : err || '') });
+  }
 }
 
 function syncDetailAuthState() {
-  const signedIn = !!(currentAccount && currentAccount.email);
+  const signedIn = isAuthenticatedAccount();
+  const account = currentAccount();
   const signInURL = accountRedirectURL();
   if (detailClipsAuth instanceof HTMLElement) {
     detailClipsAuth.innerHTML = signedIn
-      ? `Signed in as <b>${esc(String(currentAccount.email || ''))}</b>. Clip downloads stay scoped to this stream.`
+      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Clip downloads stay scoped to this stream.`
       : `Clip downloads require a signed-in account. <a href="${signInURL}">Sign in</a> to prepare downloads.`;
   }
   if (detailSettingsAuth instanceof HTMLElement) {
     detailSettingsAuth.innerHTML = signedIn
-      ? `Signed in as <b>${esc(String(currentAccount.email || ''))}</b>. Changes here use your browser session.`
-      : `Recording changes and tag edits require a signed-in account. <a href="${signInURL}">Sign in</a> first.`;
+      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Recording changes use your browser session.`
+      : `Recording changes require a signed-in account. <a href="${signInURL}">Sign in</a> first.`;
+  }
+}
+
+function renderDisabledButton(label, title = '') {
+  return `<button class="btn-sm" type="button" disabled${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</button>`;
+}
+
+function recordingToggleHintText() {
+  return authStatusMessage('toggle recording');
+}
+
+function renderRecordingToggleControl(stream, options = {}) {
+  const s = stream || {};
+  const detailMode = options && options.detail === true;
+  const actionAttr = detailMode ? 'data-detail-action' : 'data-action';
+  const actionOn = detailMode ? 'recording-enable' : 'recording-enable';
+  const actionOff = detailMode ? 'recording-disable' : 'recording-disable';
+  const buttonLabelOn = detailMode ? 'Turn Recording On' : 'Turn On';
+  const buttonLabelOff = detailMode ? 'Turn Recording Off' : 'Turn Off';
+  const canStartRecording = supportsClipRecording(s);
+  const state = String(s.recording_state || 'off').trim().toLowerCase();
+  const canToggle = hasAuthCapability('can_toggle_recording');
+  const disabledTitle = recordingToggleHintText();
+  if (state === 'on') {
+    const buttonHTML = canToggle
+      ? `<button class="btn-sm" ${actionAttr}="${actionOff}" data-id="${s.id}">${buttonLabelOff}</button>`
+      : renderDisabledButton(buttonLabelOff, disabledTitle);
+    return `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;">${buttonHTML}</div>`;
+  }
+  if (!canStartRecording) {
+    return '<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>';
+  }
+  const buttonHTML = canToggle
+    ? `<button class="btn-sm" ${actionAttr}="${actionOn}" data-id="${s.id}">${buttonLabelOn}</button>`
+    : renderDisabledButton(buttonLabelOn, disabledTitle);
+  return `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${buttonHTML}</div>`;
+}
+
+function syncDetailMutationUI(stream) {
+  if (!(detailActions instanceof HTMLElement)) return;
+  const s = stream || {};
+  const youtubeWatchURL = buildYouTubeWatchURL(s);
+  const recordThisStreamHTML = hasAuthCapability('can_toggle_recording')
+    ? `<a href="/recording?stream_id=${s.id}"><button class="btn-sm">Record This Stream</button></a>`
+    : renderDisabledButton('Record This Stream', recordingToggleHintText());
+  if (detailRecordCTA instanceof HTMLAnchorElement) {
+    detailRecordCTA.href = `/recording?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
+  }
+  detailActions.innerHTML = `
+    ${recordThisStreamHTML}
+    ${renderRecordingToggleControl(s, { detail: true })}
+    <button class="btn-sm" data-detail-action="show-stream-json" data-id="${s.id}" title="Inspect full stream payload">Inspect JSON</button>
+    ${youtubeWatchURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
+    ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open Stream URL</button></a>` : ''}
+    ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Source Page</button></a>` : ''}
+  `;
+  if (detailTagEditor instanceof HTMLElement) {
+    detailTagEditor.innerHTML = renderTagEditor(s, 'detail');
   }
 }
 
@@ -3460,7 +3704,7 @@ function selectedDetailClipIDs() {
 function updateDetailClipSelectionState() {
   const selected = selectedDetailClipIDs();
   if (detailDownloadSelectedBtn instanceof HTMLButtonElement) {
-    detailDownloadSelectedBtn.disabled = selected.length === 0 || !currentAccount;
+    detailDownloadSelectedBtn.disabled = selected.length === 0 || !hasAuthCapability('can_download_clips');
   }
   if (detailClipSelectPageCheckbox instanceof HTMLInputElement) {
     const pageIDs = detailClipItems.map((item) => Number(item.id || 0)).filter((id) => id > 0);
@@ -3471,7 +3715,7 @@ function updateDetailClipSelectionState() {
 function renderDetailClips(items) {
   detailClipItems = Array.isArray(items) ? items : [];
   if (!(detailClipsRows instanceof HTMLElement)) return;
-  if (!currentAccount) {
+  if (!hasAuthCapability('can_download_clips')) {
     detailClipsRows.innerHTML = '';
     if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = 'none';
     if (detailClipsEmpty instanceof HTMLElement) detailClipsEmpty.style.display = '';
@@ -3526,7 +3770,7 @@ function renderDetailClips(items) {
 }
 
 async function refreshDetailClips() {
-  if (!currentAccount || !detailStreamID) {
+  if (!hasAuthCapability('can_download_clips') || !detailStreamID) {
     renderDetailClips([]);
     return;
   }
@@ -3542,7 +3786,7 @@ async function refreshDetailClips() {
 
 async function prepareDetailClipDownloads() {
   const ids = selectedDetailClipIDs();
-  if (!currentAccount) {
+  if (!hasAuthCapability('can_download_clips')) {
     if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Sign in to prepare clip downloads.';
     return;
   }
@@ -3796,7 +4040,7 @@ function setStreamJSONModalOpenState(open) {
 }
 
 function buildStreamRowDebugPayload(row) {
-  const stream = row && row.stream && typeof row.stream === 'object' ? row.stream : {};
+  const stream = getRowStream(row) || {};
   return {
     row: row || {},
     stream: stream,
@@ -3818,7 +4062,7 @@ function buildStreamRowDebugPayload(row) {
 function openStreamJSONModal(streamID) {
   const row = findStreamRowByID(streamID);
   if (!row) throw new Error(`stream row ${streamID} not found in current table cache`);
-  const stream = row.stream || {};
+  const stream = getRowStream(row) || {};
   streamJsonTitle.textContent = `Stream #${stream.id || '?'} data · ${String(stream.name || '').trim() || 'untitled'}`;
   streamJsonBody.textContent = toPrettyJSON(buildStreamRowDebugPayload(row));
   setStreamJSONModalOpenState(true);
@@ -3860,7 +4104,8 @@ async function resolveAllStreamImagesForCurrentPage() {
   const orderedIDs = [];
   const seen = new Set();
   for (const row of streamRows) {
-    const id = Number(row && row.stream && row.stream.id);
+    const stream = getRowStream(row);
+    const id = Number(stream && stream.id);
     if (!Number.isFinite(id) || id <= 0) continue;
     if (seen.has(id)) continue;
     seen.add(id);
@@ -3960,9 +4205,7 @@ function renderImageModalMetadata(linkEl) {
   const tagHTML = tags.length
     ? tags.map((tag) => `<span class="tag ${tag === 'shortlist' ? 'tag-ok' : tag === 'archive' ? 'tag-warn' : 'tag-muted'}">${esc(tag)}</span>`).join('')
     : '<span class="muted fs11">no tags</span>';
-  const shortcutHint = scope === 'streams'
-    ? `<span class="muted fs11 mono">Shortcuts: <b>S</b> shortlist (${shortlistOn ? 'remove' : 'add'}), <b>A</b> archive (${archiveOn ? 'remove' : 'add'})</span>`
-    : '<span class="muted fs11 mono">Shortcuts S/A are available in Streams table only</span>';
+  const shortcutHint = '<span class="muted fs11 mono">Tag shortcuts are unavailable in the public view</span>';
   const locationText = stream ? String(stream.location_text || '').trim() : '';
   const modeText = stream ? String(stream.capture_type || '').trim() : '';
   const recordingState = stream ? String(stream.recording_state || 'off').trim().toLowerCase() : '';
@@ -4024,6 +4267,7 @@ function rerenderTagEditorsForStream(streamID) {
 }
 
 async function toggleStreamTagFromImageModal(tagName) {
+  if (!hasAuthCapability('can_edit_tags')) throw new Error('tag editing is unavailable in this public UI');
   const tag = String(tagName || '').trim().toLowerCase();
   if (!tag) throw new Error('tag is required');
   if (imageModalShortlistBusy) return;
@@ -5828,11 +6072,7 @@ function renderStreamRows() {
     const streamName = latinizedLabelParts(s.name);
     const captureRate = fmtPct(row.captures_success, row.captures_total);
     const latestCap = row.latest_captured_at ? formatDateTimeShort(row.latest_captured_at) : '-';
-    const state = String(s.recording_state || 'off');
-    const canStartRecording = supportsClipRecording(s);
-    const recHtml = state === 'on'
-      ? `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;"><button class="btn-sm" data-action="recording-disable" data-id="${s.id}">Turn Off</button></div>`
-      : `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${canStartRecording ? `<button class="btn-sm" data-action="recording-enable" data-id="${s.id}">Turn On</button>` : '<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>'}</div>`;
+    const recHtml = renderRecordingToggleControl(s);
     const mode = String(s.capture_type || '-');
     const captureFamily = formatCaptureFamilyLabel(s.capture_family);
     const cadenceLabel = formatStreamCadenceLabel(s);
@@ -5928,6 +6168,7 @@ function renderRecRows() {
     const captureUnit = String(row.capture_unit || 'frames');
     const captureSingular = captureUnit.endsWith('s') ? captureUnit.slice(0, -1) : captureUnit;
     const peopleMetric = peoplePerInferenceMetric(row);
+    const recordingToggleHTML = renderRecordingToggleControl(s);
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>
@@ -5957,7 +6198,7 @@ function renderRecRows() {
         </div>
       </td>
       <td>${renderTagEditor(s, 'recording')}</td>
-      <td><button class="btn-sm" data-action="recording-disable" data-id="${s.id}">Turn Off</button></td>
+      <td>${recordingToggleHTML}</td>
     `;
     recRowsEl.appendChild(tr);
   }
@@ -7468,7 +7709,6 @@ async function loadDetail(options = {}) {
   }
   const recentFrames = captureMeta.clipNative ? await fetchRecentClips(60) : await fetchRecentFrames(60);
   const s = recordingPayload.stream || {};
-  const canStartRecording = supportsClipRecording(s);
   const detailName = latinizedLabelParts(s.name);
 
   detailTitle.textContent = detailName.primary || `${s.name || detailStreamID}`;
@@ -7482,23 +7722,7 @@ async function loadDetail(options = {}) {
     s.execution_class ? `<span class="tag tag-muted">${esc(s.execution_class)}</span>` : '',
   ].filter(Boolean).join('');
 
-  const youtubeWatchURL = buildYouTubeWatchURL(s);
-  if (detailRecordCTA instanceof HTMLAnchorElement) {
-    detailRecordCTA.href = `/recording?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
-  }
-  detailActions.innerHTML = `
-    <a href="/recording?stream_id=${s.id}"><button class="btn-sm">Record This Stream</button></a>
-    ${s.recording_state === 'on'
-      ? `<button class="btn-sm" data-detail-action="recording-disable" data-id="${s.id}">Turn Recording Off</button>`
-      : (canStartRecording
-        ? `<button class="btn-sm" data-detail-action="recording-enable" data-id="${s.id}">Turn Recording On</button>`
-        : `<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>`)}
-    <button class="btn-sm" data-detail-action="show-stream-json" data-id="${s.id}" title="Inspect full stream payload">Inspect JSON</button>
-    ${youtubeWatchURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
-    ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open Stream URL</button></a>` : ''}
-    ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Source Page</button></a>` : ''}
-  `;
-  detailTagEditor.innerHTML = renderTagEditor(s, 'detail');
+  syncDetailMutationUI(s);
 
   const latestFrame = recentFrames.length ? recentFrames[0] : null;
   if (!captureMeta.clipNative) ensureDetailExportWindow(latestFrame);
@@ -8668,7 +8892,8 @@ window.addEventListener('popstate', () => {
 
 (async function init() {
   try {
-    void refreshTopbarAccountStatus();
+    detailHealthHoursWindow = normalizeHealthHoursWindow(localStorage.getItem('detailHealthHours') || '72');
+    void resolveSessionState();
     await loadKnownStreamTagsSafe('all');
     await loadOverview();
     await applyStreamsRouteState();
