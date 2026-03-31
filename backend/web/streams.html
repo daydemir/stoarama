@@ -798,10 +798,10 @@
       gap: 10px 12px;
     }
     .filter-grid-primary {
-      grid-template-columns: minmax(260px, 2.1fr) repeat(2, minmax(170px, 1fr));
+      grid-template-columns: minmax(0, 2.1fr) repeat(2, minmax(0, 1fr));
     }
     .filter-grid-secondary {
-      grid-template-columns: repeat(5, minmax(140px, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       padding-top: 12px;
       border-top: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
     }
@@ -809,6 +809,12 @@
       display: grid;
       gap: 6px;
       min-width: 0;
+    }
+    .filter-field > input,
+    .filter-field > select {
+      width: 100%;
+      min-width: 0;
+      max-width: 100%;
     }
     .filter-field-label {
       font-family: var(--mono);
