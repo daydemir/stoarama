@@ -3424,13 +3424,23 @@ function accountRedirectURL() {
   return `/account?redirect_path=${encodeURIComponent(dashboardRedirectPath())}`;
 }
 
+function authErrorMessage(err) {
+  if (err instanceof Error && typeof err.message === 'string') {
+    return err.message.trim();
+  }
+  if (err && typeof err === 'object' && typeof err.message === 'string') {
+    return String(err.message || '').trim();
+  }
+  return String(err || '').trim();
+}
+
 function isUnauthorizedMessage(message) {
-  const normalized = String(message || '').trim().toLowerCase();
+  const normalized = authErrorMessage(message).toLowerCase();
   return normalized === 'unauthorized' || normalized.includes('http 401') || normalized.includes('401');
 }
 
 function formatAccountAuthError(err, prefix = 'signed-in account required') {
-  const message = String(err && err.message ? err.message : err || '').trim();
+  const message = authErrorMessage(err);
   if (!isUnauthorizedMessage(message)) {
     return message || prefix;
   }
@@ -3496,6 +3506,7 @@ function normalizeAuthSession(raw, account) {
 function normalizeAuthState(raw) {
   if (!raw || typeof raw !== 'object') return buildAnonymousAuthState();
   const status = String(raw.status || '').trim().toLowerCase();
+  const errorMessage = authErrorMessage(raw.error);
   if (status === 'checking') {
     return {
       status: 'checking',
@@ -3508,8 +3519,10 @@ function normalizeAuthState(raw) {
   const account = normalizeAuthAccount(raw.account);
   const authenticated = Boolean(raw.authenticated ?? account);
   if (!authenticated || !account) {
-    if (status === 'degraded') return buildAnonymousAuthState('degraded', raw.error);
-    return buildAnonymousAuthState('anonymous', raw.error);
+    if (status === 'degraded' && !isUnauthorizedMessage(errorMessage)) {
+      return buildAnonymousAuthState('degraded', errorMessage);
+    }
+    return buildAnonymousAuthState('anonymous', errorMessage);
   }
   return {
     status: 'authenticated',
@@ -3612,11 +3625,12 @@ async function resolveSessionState() {
     setAuthState(payload);
   } catch (err) {
     if (token !== authResolveToken) return;
-    if (isUnauthorizedMessage(err)) {
-      setAuthState({ status: 'anonymous' });
+    const message = authErrorMessage(err);
+    if (isUnauthorizedMessage(message)) {
+      setAuthState({ status: 'anonymous', error: message });
       return;
     }
-    setAuthState({ status: 'degraded', error: String(err && err.message ? err.message : err || '') });
+    setAuthState({ status: 'degraded', error: message });
   }
 }
 
