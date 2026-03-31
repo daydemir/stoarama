@@ -98,6 +98,40 @@ func TestPrepareBellevueStreamRejectsExcludedRows(t *testing.T) {
 	}
 }
 
+func TestPrepareBellevueStreamsDedupesExternalIDs(t *testing.T) {
+	features := []bellevueFeature{
+		{
+			Geometry: bellevueGeometry{Coordinates: []float64{-122.1234, 47.6101}},
+			Properties: bellevueProperties{
+				ID:             "cctv174",
+				DisplayAddress: "150th Ave SE & SE 38th St",
+				OwnedBy:        "Bellevue",
+				Media:          "Stream",
+			},
+		},
+		{
+			Geometry: bellevueGeometry{Coordinates: []float64{-122.1234, 47.6101}},
+			Properties: bellevueProperties{
+				ID:             "CCTV174",
+				DisplayAddress: "150th Ave SE & SE 38th St",
+				OwnedBy:        "Bellevue",
+				Media:          "Stream",
+			},
+		},
+	}
+
+	prepared, skipped := prepareBellevueStreams(features, "https://example.test/query", bellevueSourcePageURL)
+	if len(prepared) != 1 {
+		t.Fatalf("prepared=%d want 1", len(prepared))
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("skipped=%d want 1", len(skipped))
+	}
+	if skipped[0].SkipReason != "duplicate_external_id" {
+		t.Fatalf("skipReason=%q want duplicate_external_id", skipped[0].SkipReason)
+	}
+}
+
 func TestBellevueOwnerTag(t *testing.T) {
 	if got := bellevueOwnerTag("Bellevue"); got != "owner:bellevue" {
 		t.Fatalf("owner tag=%q", got)
