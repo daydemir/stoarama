@@ -110,6 +110,7 @@ type bellevueImportReport struct {
 	Limit           int                    `json:"limit"`
 	Concurrency     int                    `json:"concurrency"`
 	ProbeTimeout    string                 `json:"probe_timeout"`
+	ImportTimeout   string                 `json:"import_timeout"`
 	Apply           bool                   `json:"apply"`
 	GeneratedAt     time.Time              `json:"generated_at"`
 	CatalogCount    int                    `json:"catalog_count"`
@@ -134,6 +135,7 @@ func runImportBellevueStreams(ctx context.Context, cfg config.Config, args []str
 	limit := fs.Int("limit", 0, "maximum eligible Bellevue streams to process (0 means all)")
 	concurrency := fs.Int("concurrency", 8, "probe/import worker concurrency")
 	probeTimeoutSec := fs.Int("probe-timeout-sec", 15, "per-stream probe timeout seconds")
+	importTimeoutSec := fs.Int("import-timeout-sec", 30, "per-stream import request timeout seconds")
 	apply := fs.Bool("apply", false, "import Bellevue streams into Stoarama")
 	reportJSON := fs.String("report-json", "local/reports/bellevue-import-report.json", "optional report JSON path")
 	asJSON := fs.Bool("json", false, "print JSON report")
@@ -157,6 +159,9 @@ func runImportBellevueStreams(ctx context.Context, cfg config.Config, args []str
 	if *probeTimeoutSec <= 0 {
 		log.Fatalf("--probe-timeout-sec must be > 0")
 	}
+	if *importTimeoutSec <= 0 {
+		log.Fatalf("--import-timeout-sec must be > 0")
+	}
 
 	features, err := fetchBellevueCameraCatalog(ctx, strings.TrimSpace(*camQueryURL))
 	if err != nil {
@@ -175,7 +180,16 @@ func runImportBellevueStreams(ctx context.Context, cfg config.Config, args []str
 
 	results := append([]bellevueImportResult{}, skipped...)
 	if len(prepared) > 0 {
-		processed := processBellevuePreparedStreams(ctx, prepared, strings.TrimSpace(*targetAPIURL), strings.TrimSpace(*serviceToken), time.Duration(*probeTimeoutSec)*time.Second, *apply, *concurrency)
+		processed := processBellevuePreparedStreams(
+			ctx,
+			prepared,
+			strings.TrimSpace(*targetAPIURL),
+			strings.TrimSpace(*serviceToken),
+			time.Duration(*probeTimeoutSec)*time.Second,
+			time.Duration(*importTimeoutSec)*time.Second,
+			*apply,
+			*concurrency,
+		)
 		results = append(results, processed...)
 	}
 	sort.Slice(results, func(i, j int) bool {
@@ -193,6 +207,7 @@ func runImportBellevueStreams(ctx context.Context, cfg config.Config, args []str
 		Limit:           *limit,
 		Concurrency:     *concurrency,
 		ProbeTimeout:    (time.Duration(*probeTimeoutSec) * time.Second).String(),
+		ImportTimeout:   (time.Duration(*importTimeoutSec) * time.Second).String(),
 		Apply:           *apply,
 		GeneratedAt:     time.Now().UTC(),
 		CatalogCount:    len(features),
@@ -351,7 +366,7 @@ func prepareBellevueStream(feature bellevueFeature, camQueryURL, sourcePageURL s
 	}, ""
 }
 
-func processBellevuePreparedStreams(ctx context.Context, items []bellevuePreparedStream, targetAPIURL, serviceToken string, probeTimeout time.Duration, apply bool, concurrency int) []bellevueImportResult {
+func processBellevuePreparedStreams(ctx context.Context, items []bellevuePreparedStream, targetAPIURL, serviceToken string, probeTimeout, importTimeout time.Duration, apply bool, concurrency int) []bellevueImportResult {
 	results := make([]bellevueImportResult, len(items))
 	jobs := make(chan int)
 	var wg sync.WaitGroup
@@ -364,7 +379,7 @@ func processBellevuePreparedStreams(ctx context.Context, items []bellevuePrepare
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				results[idx] = processBellevuePreparedStream(ctx, items[idx], targetAPIURL, serviceToken, probeTimeout, apply)
+				results[idx] = processBellevuePreparedStream(ctx, items[idx], targetAPIURL, serviceToken, probeTimeout, importTimeout, apply)
 			}
 		}()
 	}
@@ -376,7 +391,7 @@ func processBellevuePreparedStreams(ctx context.Context, items []bellevuePrepare
 	return results
 }
 
-func processBellevuePreparedStream(ctx context.Context, item bellevuePreparedStream, targetAPIURL, serviceToken string, probeTimeout time.Duration, apply bool) (result bellevueImportResult) {
+func processBellevuePreparedStream(ctx context.Context, item bellevuePreparedStream, targetAPIURL, serviceToken string, probeTimeout, importTimeout time.Duration, apply bool) (result bellevueImportResult) {
 	started := time.Now().UTC()
 	result = bellevueImportResult{
 		ExternalID:       item.ExternalID,
@@ -452,7 +467,9 @@ func processBellevuePreparedStream(ctx context.Context, item bellevuePreparedStr
 		Created bool         `json:"created"`
 		Stream  model.Stream `json:"stream"`
 	}
-	if err := postJSONWithToken(ctx, targetAPIURL, serviceToken, "/api/v1/imports/streams", payload, &response); err != nil {
+	importCtx, importCancel := context.WithTimeout(ctx, importTimeout)
+	defer importCancel()
+	if err := postJSONWithToken(importCtx, targetAPIURL, serviceToken, "/api/v1/imports/streams", payload, &response); err != nil {
 		result.ImportError = err.Error()
 		return result
 	}
