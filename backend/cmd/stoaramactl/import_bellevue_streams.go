@@ -280,6 +280,7 @@ func fetchBellevueCameraCatalog(ctx context.Context, camQueryURL string) ([]bell
 func prepareBellevueStreams(features []bellevueFeature, camQueryURL, sourcePageURL string) ([]bellevuePreparedStream, []bellevueImportResult) {
 	prepared := make([]bellevuePreparedStream, 0, len(features))
 	skipped := make([]bellevueImportResult, 0)
+	seenExternalIDs := make(map[string]struct{}, len(features))
 	for _, feature := range features {
 		item, skipReason := prepareBellevueStream(feature, camQueryURL, sourcePageURL)
 		if skipReason != "" {
@@ -292,6 +293,17 @@ func prepareBellevueStreams(features []bellevueFeature, camQueryURL, sourcePageU
 			})
 			continue
 		}
+		if _, exists := seenExternalIDs[item.ExternalID]; exists {
+			skipped = append(skipped, bellevueImportResult{
+				ExternalID:       item.ExternalID,
+				Name:             item.Name,
+				OwnedBy:          item.Owner,
+				LocationLocality: item.LocationLocality,
+				SkipReason:       "duplicate_external_id",
+			})
+			continue
+		}
+		seenExternalIDs[item.ExternalID] = struct{}{}
 		prepared = append(prepared, item)
 	}
 	return prepared, skipped
