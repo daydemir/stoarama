@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -272,12 +273,15 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Request) {
 	rawToken := strings.TrimSpace(r.URL.Query().Get("token"))
 	if rawToken == "" {
+		log.Printf("account auth complete missing_token host=%s ip=%s ua=%q", strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=missing_token", http.StatusFound)
 		return
 	}
 	hash := hashSecret(rawToken)
+	maskedToken := maskSecretForLog(rawToken)
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
+		log.Printf("account auth complete server_error token=%s host=%s ip=%s ua=%q err=%v", maskedToken, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
@@ -302,14 +306,17 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		FOR UPDATE
 	`, hash).Scan(&linkID, &accountID, &email, &name, &role, &status, &expiresAt, &consumedAt, &redirectPath)
 	if err != nil {
+		log.Printf("account auth complete invalid_token token=%s host=%s ip=%s ua=%q", maskedToken, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=invalid_token", http.StatusFound)
 		return
 	}
 	if status != "active" {
+		log.Printf("account auth complete disabled_account token=%s link_id=%d email=%s host=%s ip=%s ua=%q", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=account_disabled", http.StatusFound)
 		return
 	}
 	if consumedAt != nil || !expiresAt.After(time.Now().UTC()) {
+		log.Printf("account auth complete expired_or_consumed token=%s link_id=%d email=%s consumed_at=%v expires_at=%s host=%s ip=%s ua=%q", maskedToken, linkID, email, consumedAt, expiresAt.UTC().Format(time.RFC3339), strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=expired_token", http.StatusFound)
 		return
 	}
@@ -318,6 +325,7 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		SET consumed_at=now()
 		WHERE id=$1
 	`, linkID); err != nil {
+		log.Printf("account auth complete consume_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
@@ -326,6 +334,7 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		SET email_verified_at=COALESCE(email_verified_at, now())
 		WHERE id=$1
 	`, accountID); err != nil {
+		log.Printf("account auth complete verify_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
@@ -382,12 +391,28 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
+	if err := s.insertAccountAuthEventTx(r.Context(), tx, accountID, nil, "magic_link_consumed", "account", email, map[string]any{
+		"magic_link_id":  linkID,
+		"session_id":     sessionID,
+		"redirect_path":  sanitizeAccountRedirectPath(redirectPath),
+		"request_host":   strings.TrimSpace(r.Host),
+		"requester_ip":   requesterIP(r),
+		"request_origin": r.Header.Get("Origin"),
+		"user_agent":     requestUserAgent(r),
+		"token_prefix":   maskedToken,
+	}); err != nil {
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
+		return
+	}
 	if err := tx.Commit(r.Context()); err != nil {
+		log.Printf("account auth complete commit_failed token=%s link_id=%d email=%s session_id=%d host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, sessionID, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	setAccountSessionCookie(w, r, rawSession, sessionExpiresAt)
-	http.Redirect(w, r, sanitizeAccountRedirectPath(redirectPath), http.StatusFound)
+	finalRedirectPath := buildAccountPostAuthRedirectPath(redirectPath)
+	log.Printf("account auth complete success token=%s link_id=%d email=%s session_id=%d redirect=%q host=%s ip=%s ua=%q", maskedToken, linkID, email, sessionID, finalRedirectPath, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
+	http.Redirect(w, r, finalRedirectPath, http.StatusFound)
 }
 
 func (s *Server) handleAccountMe(w http.ResponseWriter, r *http.Request) {
@@ -799,6 +824,24 @@ func sanitizeAccountRedirectPath(raw string) string {
 		return "/account"
 	}
 	return v
+}
+
+func buildAccountPostAuthRedirectPath(redirectPath string) string {
+	params := url.Values{}
+	params.Set("auth", "complete")
+	params.Set("redirect_path", sanitizeAccountRedirectPath(redirectPath))
+	return "/account?" + params.Encode()
+}
+
+func maskSecretForLog(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	if len(v) <= 10 {
+		return v[:2] + "..." + v[len(v)-2:]
+	}
+	return v[:6] + "..." + v[len(v)-4:]
 }
 
 func (s *Server) buildAccountMagicLink(r *http.Request, token string) string {

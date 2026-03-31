@@ -545,13 +545,15 @@
     const nodesEmpty = document.getElementById('nodesEmpty');
     const nodesBox = document.getElementById('nodesBox');
     const nodesRows = document.getElementById('nodesRows');
+    const authParams = new URLSearchParams(window.location.search);
+    const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const requestedRedirectPath = (() => {
-      const params = new URLSearchParams(window.location.search);
-      const raw = String(params.get('redirect_path') || '').trim();
+      const raw = String(authParams.get('redirect_path') || '').trim();
       return raw.startsWith('/') ? raw : '/account';
     })();
 
     let currentAccount = null;
+    let authFlowRedirectTimer = null;
 
     async function fetchJSON(path, opts = {}) {
       const method = String((opts && opts.method) || 'GET').toUpperCase();
@@ -582,6 +584,54 @@
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;');
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => window.setTimeout(resolve, ms));
+    }
+
+    function accountContinueTarget() {
+      return requestedRedirectPath !== '/account' ? requestedRedirectPath : '';
+    }
+
+    function clearAuthCompleteParam() {
+      if (!authCompleted) return;
+      const next = new URL(window.location.href);
+      next.searchParams.delete('auth');
+      const search = next.searchParams.toString();
+      history.replaceState(null, '', `${next.pathname}${search ? `?${search}` : ''}${next.hash || ''}`);
+    }
+
+    async function fetchCurrentAccountWithRetry() {
+      let lastErr = null;
+      const attempts = authCompleted ? 6 : 1;
+      for (let i = 0; i < attempts; i += 1) {
+        try {
+          const payload = await fetchJSON('/api/v1/account/me');
+          return payload.account || {};
+        } catch (err) {
+          lastErr = err;
+          if (i < attempts - 1) {
+            await sleep(250);
+          }
+        }
+      }
+      throw lastErr || new Error('unauthorized');
+    }
+
+    function scheduleAuthFlowContinue() {
+      if (authFlowRedirectTimer) {
+        window.clearTimeout(authFlowRedirectTimer);
+        authFlowRedirectTimer = null;
+      }
+      const target = accountContinueTarget();
+      if (!target) {
+        clearAuthCompleteParam();
+        return;
+      }
+      authFlowRedirectTimer = window.setTimeout(() => {
+        window.location.assign(target);
+      }, 1600);
     }
 
     function relaySummary(relay) {
@@ -748,17 +798,19 @@
 
     async function refreshSession() {
       try {
-        const payload = await fetchJSON('/api/v1/account/me');
-        currentAccount = payload.account || {};
+        currentAccount = await fetchCurrentAccountWithRetry();
         accountBox.classList.remove('hidden');
         const role = String(currentAccount.role || 'member');
         const authType = String(currentAccount.auth_type || 'session');
+        const email = String(currentAccount.email || '').trim();
+        const continueTarget = accountContinueTarget();
         accountMeta.innerHTML = `
-          <div><b>${escapeHTML(String(currentAccount.email || ''))}</b></div>
+          <div><b>${escapeHTML(email)}</b></div>
           <div class="muted">Role: ${escapeHTML(role)} · Auth: ${escapeHTML(authType)}</div>
-          <div class="muted">Use this session for account-scoped tools and downloads.</div>
+          <div class="muted">${authCompleted ? 'Verified in this browser.' : 'Use this session for account-scoped tools and downloads.'}</div>
+          ${authCompleted && continueTarget ? `<div class="muted">Continuing to ${escapeHTML(continueTarget)}...</div>` : ''}
         `;
-        setStatus(accountStatus, 'Signed in.', 'ok');
+        setStatus(accountStatus, authCompleted ? `Signed in as ${email} in this browser.` : 'Signed in.', 'ok');
         keysEmpty.classList.add('hidden');
         keysBox.classList.remove('hidden');
         enrollmentEmpty.classList.add('hidden');
@@ -770,6 +822,7 @@
           refreshEnrollmentTokens(),
           refreshNodes(),
         ]);
+        if (authCompleted) scheduleAuthFlowContinue();
       } catch (_) {
         currentAccount = null;
         accountBox.classList.add('hidden');
@@ -779,7 +832,11 @@
         enrollmentEmpty.classList.remove('hidden');
         nodesBox.classList.add('hidden');
         nodesEmpty.classList.remove('hidden');
-        setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
+        if (authCompleted) {
+          setStatus(accountStatus, 'Magic link was opened, but this browser still has no active session. Open the link in the same browser you want to use.', 'err');
+        } else {
+          setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
+        }
       }
       updateAccountChrome();
     }
