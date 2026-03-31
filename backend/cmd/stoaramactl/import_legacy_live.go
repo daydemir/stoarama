@@ -134,6 +134,8 @@ func runImport(ctx context.Context, cfg config.Config, args []string) {
 	switch args[0] {
 	case "legacy-live-streams":
 		runImportLegacyLiveStreams(ctx, cfg, args[1:])
+	case "bellevue-streams":
+		runImportBellevueStreams(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown import subcommand: %s", args[0])
 	}
@@ -141,6 +143,7 @@ func runImport(ctx context.Context, cfg config.Config, args []string) {
 
 func printImportUsage() {
 	fmt.Print("stoaramactl import legacy-live-streams [--legacy-api-url URL --legacy-api-token TOKEN --target-api-url URL --service-token TOKEN --offset N --limit 200 --page-size 50 --concurrency 4 --sort-by avg_people_per_inferenced_capture --sort-dir desc --probe-timeout-sec 45 --legacy-recording-state off|on --legacy-provider P --apply --import-latest-frame --checkpoint-jsonl file --resume=true --report-json out.json --json]\n")
+	fmt.Print("stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]\n")
 }
 
 func runImportLegacyLiveStreams(ctx context.Context, cfg config.Config, args []string) {
@@ -496,6 +499,8 @@ func processLegacyImportItem(ctx context.Context, item legacyDashboardItem, targ
 		"source_url":            strings.TrimSpace(item.Stream.SourceURL),
 		"source_page_url":       strings.TrimSpace(item.Stream.SourcePageURL),
 		"source_family":         strings.TrimSpace(item.Stream.SourceFamily),
+		"lat":                   item.Stream.Lat,
+		"lon":                   item.Stream.Lon,
 		"capture_type":          strings.TrimSpace(item.Stream.CaptureType),
 		"execution_class":       strings.TrimSpace(item.Stream.ExecutionClass),
 		"execution_config_json": item.Stream.ExecutionConfigJSON,

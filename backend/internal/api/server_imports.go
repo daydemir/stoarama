@@ -25,6 +25,8 @@ type serviceStreamImportRequest struct {
 	SourceURL           string         `json:"source_url"`
 	SourcePageURL       string         `json:"source_page_url"`
 	SourceFamily        string         `json:"source_family"`
+	Lat                 *float64       `json:"lat"`
+	Lon                 *float64       `json:"lon"`
 	CaptureType         string         `json:"capture_type"`
 	ExecutionClass      string         `json:"execution_class"`
 	ExecutionConfigJSON map[string]any `json:"execution_config_json"`
@@ -876,6 +878,9 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 		WHERE provider=$1 AND external_id=$2
 	`, provider, externalID).Scan(&existingID)
 	if err == nil {
+		if err := ensureImportedSourceURLProviderConflictFree(r.Context(), tx, profile.SourceURL, provider, existingID); err != nil {
+			return model.Stream{}, false, err
+		}
 		if _, err := tx.Exec(r.Context(), `
 			UPDATE streams
 			SET
@@ -903,7 +908,7 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 				updated_at=now()
 			WHERE id=$1
 		`, existingID, name, profile.SourceURL, profile.SourcePageURL,
-			nil, nil, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
+			req.Lat, req.Lon, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
 			strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource),
 			metaBytes, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes, dedupeStrings(req.Tags),
 		); err != nil {
@@ -920,6 +925,9 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 	}
 	if err != nil && err != pgx.ErrNoRows {
 		return model.Stream{}, false, fmt.Errorf("query imported stream existence: %w", err)
+	}
+	if err := ensureImportedSourceURLProviderConflictFree(r.Context(), tx, profile.SourceURL, provider, 0); err != nil {
+		return model.Stream{}, false, err
 	}
 
 	slug := strings.TrimSpace(req.Slug)
@@ -941,7 +949,7 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		RETURNING id
 	`, provider, externalID, name, slug, profile.SourceURL, profile.SourcePageURL,
-		nil, nil, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
+		req.Lat, req.Lon, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
 		strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource), metaBytes,
 		string(model.RecordingStateOff), profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes, dedupeStrings(req.Tags),
 	).Scan(&id); err != nil {
@@ -955,6 +963,33 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 		return model.Stream{}, false, fmt.Errorf("load imported stream %d: %w", id, err)
 	}
 	return stream, true, nil
+}
+
+func ensureImportedSourceURLProviderConflictFree(ctx context.Context, tx pgx.Tx, sourceURL string, provider string, keepID int64) error {
+	sourceURL = strings.TrimSpace(sourceURL)
+	provider = strings.TrimSpace(provider)
+	if sourceURL == "" || provider == "" {
+		return nil
+	}
+	var existingID int64
+	var existingProvider string
+	err := tx.QueryRow(ctx, `
+		SELECT id, provider
+		FROM streams
+		WHERE source_url=$1 AND provider<>$2
+		ORDER BY id ASC
+		LIMIT 1
+	`, sourceURL, provider).Scan(&existingID, &existingProvider)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("query imported stream source_url conflict: %w", err)
+	}
+	if keepID > 0 && existingID == keepID {
+		return nil
+	}
+	return newAPIStatusError(http.StatusConflict, "source_url already exists on stream %d under provider %s", existingID, strings.TrimSpace(existingProvider))
 }
 
 type slugQueryRower interface {
