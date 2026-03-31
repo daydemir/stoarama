@@ -30,6 +30,26 @@ func TestBuildAccountMagicLinkFallsBackToRequestHost(t *testing.T) {
 	}
 }
 
+func TestBuildAccountPostAuthRedirectPath(t *testing.T) {
+	got := buildAccountPostAuthRedirectPath("/streams/1?tab=details")
+	want := "/account?auth=complete&redirect_path=%2Fstreams%2F1%3Ftab%3Ddetails"
+	if got != want {
+		t.Fatalf("post auth redirect=%q want %q", got, want)
+	}
+}
+
+func TestMaskSecretForLog(t *testing.T) {
+	if got := maskSecretForLog(""); got != "" {
+		t.Fatalf("blank mask=%q want empty", got)
+	}
+	if got := maskSecretForLog("abcdefgh"); got != "ab...gh" {
+		t.Fatalf("short mask=%q want ab...gh", got)
+	}
+	if got := maskSecretForLog("abcdefghijklmnopqrstuvwxyz"); got != "abcdef...wxyz" {
+		t.Fatalf("long mask=%q want abcdef...wxyz", got)
+	}
+}
+
 func TestHashSecretStable(t *testing.T) {
 	if got := hashSecret("test-token"); got != hashSecret("test-token") {
 		t.Fatalf("hash should be stable")
