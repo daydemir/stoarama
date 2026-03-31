@@ -1194,6 +1194,192 @@
       color: var(--muted);
       line-height: 1.4;
     }
+    /* Stream recording health */
+    .health-panel {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      background: color-mix(in srgb, var(--panel) 90%, #000);
+    }
+    .health-grid-wrap {
+      border: 1px solid color-mix(in srgb, var(--border) 72%, #fff 8%);
+      border-radius: 8px;
+      background: #071126;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 10px;
+      margin-top: 8px;
+      margin-bottom: 8px;
+    }
+    .health-grid {
+      display: grid;
+      grid-template-columns: 126px repeat(24, minmax(44px, 1fr));
+      gap: 6px;
+      min-width: 1380px;
+      align-items: stretch;
+    }
+    .health-axis-label,
+    .health-row-label,
+    .health-cell {
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .health-axis-label,
+    .health-row-label {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 6px 8px;
+      background: rgba(15, 23, 42, 0.85);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      text-align: center;
+    }
+    .health-axis-label {
+      min-height: 28px;
+      justify-content: flex-end;
+      color: color-mix(in srgb, var(--muted) 85%, #fff 15%);
+      background: transparent;
+      border-color: transparent;
+      padding: 0 8px 0 0;
+    }
+    .health-axis-label.hour {
+      justify-content: center;
+      padding: 0;
+    }
+    .health-row-label {
+      justify-content: space-between;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
+      text-align: left;
+      background: rgba(8, 16, 31, 0.9);
+      border-color: rgba(148, 163, 184, 0.16);
+    }
+    .health-row-label .health-row-label-title {
+      color: var(--text);
+      font-size: 11px;
+      line-height: 1.15;
+      font-weight: 600;
+      font-family: var(--mono);
+      letter-spacing: 0.02em;
+    }
+    .health-row-label .health-row-label-meta {
+      color: var(--muted);
+      font-size: 9px;
+      line-height: 1.2;
+      font-family: var(--mono);
+      text-transform: none;
+    }
+    .health-cell {
+      min-height: 44px;
+      padding: 5px 6px 4px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 2px;
+      background: rgba(148, 163, 184, 0.08);
+      color: var(--text);
+      transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+    }
+    .health-cell:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+      border-color: rgba(255, 255, 255, 0.28);
+      z-index: 1;
+      position: relative;
+    }
+    .health-cell.empty {
+      background: rgba(148, 163, 184, 0.08);
+      border-color: rgba(148, 163, 184, 0.18);
+      color: rgba(226, 232, 240, 0.55);
+    }
+    .health-cell.loss-0 { background: rgba(15, 23, 42, 0.92); border-color: rgba(148, 163, 184, 0.16); }
+    .health-cell.loss-1 { background: rgba(14, 116, 144, 0.35); border-color: rgba(34, 211, 238, 0.26); }
+    .health-cell.loss-2 { background: rgba(6, 182, 212, 0.42); border-color: rgba(34, 211, 238, 0.34); }
+    .health-cell.loss-3 { background: rgba(34, 197, 94, 0.48); border-color: rgba(74, 222, 128, 0.34); }
+    .health-cell.loss-4 { background: rgba(245, 158, 11, 0.56); border-color: rgba(251, 191, 36, 0.48); }
+    .health-cell.loss-5 { background: rgba(249, 115, 22, 0.68); border-color: rgba(251, 146, 60, 0.54); }
+    .health-cell.loss-6 { background: rgba(220, 38, 38, 0.74); border-color: rgba(248, 113, 113, 0.56); }
+    .health-cell.loss-7 { background: rgba(153, 27, 27, 0.8); border-color: rgba(248, 113, 113, 0.64); }
+    .health-cell.error {
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04), 0 0 0 1px rgba(251, 146, 60, 0.7);
+    }
+    .health-cell.no-data {
+      background: rgba(51, 65, 85, 0.55);
+      border-color: rgba(148, 163, 184, 0.18);
+    }
+    .health-cell-top,
+    .health-cell-bottom {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      min-width: 0;
+    }
+    .health-hour,
+    .health-percent,
+    .health-count {
+      font-family: var(--mono);
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+    .health-hour {
+      font-size: 9px;
+      color: rgba(248, 250, 252, 0.85);
+    }
+    .health-percent {
+      font-size: 16px;
+      font-weight: 600;
+      line-height: 1;
+      color: #fff;
+      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.22);
+    }
+    .health-count {
+      font-size: 9px;
+      color: rgba(248, 250, 252, 0.84);
+    }
+    .health-row-label-empty {
+      background: transparent;
+      border-color: transparent;
+      min-height: 28px;
+    }
+    .health-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 6px;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 10px;
+      font-family: var(--mono);
+    }
+    .health-legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .health-legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      border: 1px solid rgba(255, 255, 255, 0.26);
+      display: inline-block;
+    }
+    .health-legend-swatch.loss-0 { background: rgba(15, 23, 42, 0.92); }
+    .health-legend-swatch.loss-2 { background: rgba(6, 182, 212, 0.42); }
+    .health-legend-swatch.loss-4 { background: rgba(245, 158, 11, 0.56); }
+    .health-legend-swatch.loss-6 { background: rgba(220, 38, 38, 0.74); }
+    .health-legend-swatch.error { background: rgba(251, 146, 60, 0.92); }
+    .health-summary {
+      margin: 8px 0 10px;
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
     .coverage-samples {
       margin-top: 10px;
     }
@@ -1678,6 +1864,7 @@
         <a class="subtab-btn active" id="detailTabInference" href="#">Inference</a>
         <a class="subtab-btn" id="detailTabCoverage" href="#">Coverage</a>
         <a class="subtab-btn" id="detailTabTimeline" href="#">Timeline</a>
+        <a class="subtab-btn" id="detailTabHealth" href="#">Health</a>
         <a class="subtab-btn" id="detailTabFrames" href="#">Frames</a>
       </div>
     </div>
@@ -1970,6 +2157,40 @@
           <span class="timeline-legend-item"><span class="timeline-dot recorded-error"></span>recorded errors only</span>
           <span class="timeline-legend-item"><span class="timeline-dot inferenced"></span>inferenced frame present</span>
           <span class="timeline-legend-item"><span class="timeline-dot people"></span>people detections intensity</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="detailHealthSection" style="display:none;">
+      <div class="health-panel">
+        <div class="detail-section-head">
+          <div class="detail-section-title">Recording Health</div>
+          <div class="detail-section-subtitle" id="detailHealthSubtitle">Hourly loss rate and explicit error rows over the selected UTC window.</div>
+        </div>
+        <div class="toolbar">
+          <label class="check-label fs11" style="color:var(--muted);">Window (hours)</label>
+          <select id="detailHealthHours" style="min-width:160px;">
+            <option value="24">last 24 hours</option>
+            <option value="48">last 48 hours</option>
+            <option value="72" selected>last 72 hours</option>
+            <option value="96">last 96 hours</option>
+            <option value="120">last 120 hours</option>
+            <option value="168">last 168 hours</option>
+          </select>
+          <button id="detailHealthReload" class="primary" type="button">Reload health</button>
+          <span class="status-text" id="healthStatusText"></span>
+        </div>
+        <div id="healthMetricChips" class="timeline-metrics"></div>
+        <div id="healthSummary" class="health-summary">No recording health data loaded.</div>
+        <div class="health-grid-wrap">
+          <div id="healthGrid" class="health-grid"></div>
+        </div>
+        <div class="health-legend">
+          <span class="health-legend-item"><span class="health-legend-swatch loss-0"></span>0% loss</span>
+          <span class="health-legend-item"><span class="health-legend-swatch loss-2"></span>low loss</span>
+          <span class="health-legend-item"><span class="health-legend-swatch loss-4"></span>spotty</span>
+          <span class="health-legend-item"><span class="health-legend-swatch loss-6"></span>severe loss</span>
+          <span class="health-legend-item"><span class="health-legend-swatch error"></span>explicit error rows</span>
         </div>
       </div>
     </div>
@@ -2267,10 +2488,12 @@ const detailClipPreviewSlot = $('detailClipPreviewSlot');
 const detailTabInference = $('detailTabInference');
 const detailTabCoverage = $('detailTabCoverage');
 const detailTabTimeline = $('detailTabTimeline');
+const detailTabHealth = $('detailTabHealth');
 const detailTabFrames = $('detailTabFrames');
 const detailInferenceSection = $('detailInferenceSection');
 const detailCoverageSection = $('detailCoverageSection');
 const detailTimelineSection = $('detailTimelineSection');
+const detailHealthSection = $('detailHealthSection');
 const detailFramesSection = $('detailFramesSection');
 const detailClipsSection = $('detailClipsSection');
 const detailSettingsSection = $('detailSettingsSection');
@@ -2290,6 +2513,13 @@ const detailClipDownloadResults = $('detailClipDownloadResults');
 const detailCoverageSubtitle = $('detailCoverageSubtitle');
 const detailCoverageSamplesSubtitle = $('detailCoverageSamplesSubtitle');
 const detailTimelineSubtitle = $('detailTimelineSubtitle');
+const detailHealthSubtitle = $('detailHealthSubtitle');
+const detailHealthHours = $('detailHealthHours');
+const detailHealthReload = $('detailHealthReload');
+const healthStatusText = $('healthStatusText');
+const healthMetricChips = $('healthMetricChips');
+const healthSummary = $('healthSummary');
+const healthGrid = $('healthGrid');
 const pipelineFilter = $('pipelineFilter');
 const detailStatusFilter = $('detailStatusFilter');
 const detailHasBoxed = $('detailHasBoxed');
@@ -2390,11 +2620,13 @@ let detailRecordingData = null;
 let detailRecentFramesData = [];
 let detailFramesData = [];
 let detailTimelineData = null;
+let detailHealthData = null;
 let detailPipelineData = null;
 let detailTimelineDay = '';
 let detailTimelinePipeline = '';
 let detailCoverageData = null;
 let detailCaptureSamplesData = null;
+let detailHealthHoursWindow = normalizeHealthHoursWindow(localStorage.getItem('detailHealthHours') || '72');
 let detailInferenceLoaded = false;
 let detailLivePollTimer = null;
 let detailLivePollInFlight = false;
@@ -3135,6 +3367,26 @@ async function fetchJSON(path, opts = {}) {
   return payload;
 }
 
+function dashboardStreamsCollectionURL(params) {
+  const qs = params instanceof URLSearchParams ? params.toString() : String(params || '').trim();
+  return qs ? `/api/v1/dashboard/streams?${qs}` : '/api/v1/dashboard/streams';
+}
+
+function dashboardStreamURL(streamID, suffix = '', params = null) {
+  const id = Number(streamID);
+  const base = `/api/v1/dashboard/streams/${Number.isFinite(id) ? Math.floor(id) : streamID}${suffix || ''}`;
+  if (!(params instanceof URLSearchParams)) return base;
+  const qs = params.toString();
+  return qs ? `${base}?${qs}` : base;
+}
+
+function getRowStream(row) {
+  if (!row || typeof row !== 'object') return null;
+  if (row.stream && typeof row.stream === 'object') return row.stream;
+  if (Number.isFinite(Number(row.id || 0)) && Number(row.id || 0) > 0) return row;
+  return null;
+}
+
 function dashboardRedirectPath() {
   const path = `${window.location.pathname || '/streams'}${window.location.search || ''}${window.location.hash || ''}`;
   return path.startsWith('/') ? path : '/streams';
@@ -3329,6 +3581,7 @@ function updateDetailTabHrefs() {
   if (detailTabInference instanceof HTMLAnchorElement) detailTabInference.href = base;
   if (detailTabCoverage instanceof HTMLAnchorElement) detailTabCoverage.href = `${base}?tab=details&subtab=coverage`;
   if (detailTabTimeline instanceof HTMLAnchorElement) detailTabTimeline.href = `${base}?tab=details&subtab=timeline`;
+  if (detailTabHealth instanceof HTMLAnchorElement) detailTabHealth.href = `${base}?tab=details&subtab=health&health_hours=${Math.max(1, Math.floor(Number(detailHealthHoursWindow) || 72))}`;
   if (detailTabFrames instanceof HTMLAnchorElement) detailTabFrames.href = `${base}?tab=details&subtab=frames`;
 }
 
@@ -3350,6 +3603,7 @@ function setDetailMainView(which, opts = {}) {
     if (detailInferenceSection) detailInferenceSection.style.display = 'none';
     if (detailCoverageSection) detailCoverageSection.style.display = 'none';
     if (detailTimelineSection) detailTimelineSection.style.display = 'none';
+    if (detailHealthSection) detailHealthSection.style.display = 'none';
     if (detailFramesSection) detailFramesSection.style.display = 'none';
     stopDetailLivePolling();
   }
@@ -3472,6 +3726,10 @@ function setDetailWorkloadStatus(msg, cls = '') {
 function setTimelineStatus(msg, cls = '') {
   timelineStatusText.className = `status-text ${cls}`;
   timelineStatusText.textContent = msg;
+}
+function setHealthStatus(msg, cls = '') {
+  healthStatusText.className = `status-text ${cls}`;
+  healthStatusText.textContent = msg;
 }
 function setCoverageStatus(msg, cls = '') {
   coverageStatusText.className = `status-text ${cls}`;
@@ -3860,11 +4118,12 @@ function moveImageModal(step) {
 
 function setDetailSubView(view, opts = {}) {
   detailView = normalizeDetailSubtab(view);
-  const hasLegacySubtabs = detailTabInference.isConnected || detailTabCoverage.isConnected || detailTabTimeline.isConnected || detailTabFrames.isConnected;
+  const hasLegacySubtabs = detailTabInference.isConnected || detailTabCoverage.isConnected || detailTabTimeline.isConnected || detailTabHealth.isConnected || detailTabFrames.isConnected;
   if (!hasLegacySubtabs) {
     detailInferenceSection.style.display = '';
     detailCoverageSection.style.display = '';
     detailTimelineSection.style.display = '';
+    detailHealthSection.style.display = '';
     detailFramesSection.style.display = '';
     stopDetailLivePolling();
     return;
@@ -3872,10 +4131,12 @@ function setDetailSubView(view, opts = {}) {
   detailTabInference.classList.toggle('active', detailView === 'inference');
   detailTabCoverage.classList.toggle('active', detailView === 'coverage');
   detailTabTimeline.classList.toggle('active', detailView === 'timeline');
+  detailTabHealth.classList.toggle('active', detailView === 'health');
   detailTabFrames.classList.toggle('active', detailView === 'frames');
   detailInferenceSection.style.display = detailView === 'inference' ? '' : 'none';
   detailCoverageSection.style.display = detailView === 'coverage' ? '' : 'none';
   detailTimelineSection.style.display = detailView === 'timeline' ? '' : 'none';
+  detailHealthSection.style.display = detailView === 'health' ? '' : 'none';
   detailFramesSection.style.display = detailView === 'frames' ? '' : 'none';
   if (detailView === 'frames') startDetailLivePolling();
   else stopDetailLivePolling();
@@ -4233,7 +4494,7 @@ function hydrateImageSlots() {
 
 async function fetchStreamImageURLs(ids) {
   if (!ids.length) return;
-  const payload = await fetchJSON('/api/v1/streams/image-urls', {
+  const payload = await fetchJSON('/api/v1/dashboard/streams/image-urls', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ stream_ids: ids }),
@@ -5272,13 +5533,17 @@ function normalizeDetailMainTab(raw) {
 
 function normalizeDetailSubtab(raw) {
   const value = String(raw || '').trim().toLowerCase();
-  if (value === 'coverage' || value === 'timeline' || value === 'frames') return value;
+  if (value === 'coverage' || value === 'timeline' || value === 'health' || value === 'frames') return value;
   return 'inference';
 }
 
 function applyDetailRouteStateFromURL(params) {
   detailMainView = normalizeDetailMainTab(params && params.get('tab'));
   detailView = normalizeDetailSubtab(params && params.get('subtab'));
+  const healthHoursParam = Number((params && params.get('health_hours')) || '');
+  if (Number.isFinite(healthHoursParam) && healthHoursParam > 0) {
+    detailHealthHoursWindow = normalizeHealthHoursWindow(healthHoursParam);
+  }
 }
 
 function syncStreamListURL(opts = {}) {
@@ -5302,6 +5567,9 @@ function syncDetailURL(opts = {}) {
   } else if (detailView !== 'inference') {
     params.set('tab', 'details');
     params.set('subtab', detailView);
+    if (detailView === 'health') {
+      params.set('health_hours', String(Math.max(1, Math.floor(Number(detailHealthHoursWindow) || 72))));
+    }
   }
   const qs = params.toString();
   updateHistoryURL(qs ? `/streams/${detailStreamID}?${qs}` : `/streams/${detailStreamID}`, opts.replace === true);
@@ -5396,7 +5664,7 @@ function renderStreamsMapRows(rows, totalCount) {
   let unknownCount = 0;
 
   for (const row of rows) {
-    const stream = row && row.stream ? row.stream : null;
+    const stream = getRowStream(row);
     if (!stream) continue;
     const coord = resolveStreamMapCoordinate(stream);
     if (!coord) {
@@ -5502,7 +5770,7 @@ async function loadStreamsMap(opts = {}) {
     params.set('limit', String(pageSize));
     params.set('offset', String(offset));
     params.set('include_image_urls', 'false');
-    const payload = await fetchJSON(`/api/v1/streams?${params}`);
+    const payload = await fetchJSON(dashboardStreamsCollectionURL(params));
     if (requestToken !== streamMapLoadToken) return;
 
     const batch = payload.items || [];
@@ -5555,7 +5823,8 @@ function renderStreamRows() {
     return;
   }
   for (const row of streamRows) {
-    const s = row.stream;
+    const s = getRowStream(row);
+    if (!s) continue;
     const streamName = latinizedLabelParts(s.name);
     const captureRate = fmtPct(row.captures_success, row.captures_total);
     const latestCap = row.latest_captured_at ? formatDateTimeShort(row.latest_captured_at) : '-';
@@ -5625,7 +5894,7 @@ async function loadStreams(opts = {}) {
   params.set('offset', String((streamPage - 1) * streamPageSize));
   params.set('include_image_urls', 'false');
   applyStreamsSortParams(params, streamSortBy, streamSortDir);
-  const payload = await fetchJSON(`/api/v1/streams?${params}`);
+  const payload = await fetchJSON(dashboardStreamsCollectionURL(params));
   streamRows = payload.items || [];
   streamTotal = Number(payload.total || 0);
   streamMapFilterKey = '';
@@ -5645,7 +5914,8 @@ function renderRecRows() {
     return;
   }
   for (const row of recStreamRows) {
-    const s = row.stream;
+    const s = getRowStream(row);
+    if (!s) continue;
     const streamName = latinizedLabelParts(s.name);
     const latestCap = row.latest_captured_at ? String(row.latest_captured_at).replace('T', ' ').slice(0, 19) : '-';
     const runtimeStatus = s.capture_runtime_status || '-';
@@ -5710,7 +5980,7 @@ async function loadRecStreams() {
   params.set('offset', '0');
   params.set('include_image_urls', 'false');
   applyStreamsSortParams(params, recSortBy, recSortDir);
-  const payload = await fetchJSON(`/api/v1/streams?${params}`);
+  const payload = await fetchJSON(dashboardStreamsCollectionURL(params));
   recStreamRows = payload.items || [];
   renderRecRows();
 }
@@ -6598,6 +6868,354 @@ function renderCoverageSamples(payload) {
   }
 }
 
+const HEALTH_HOUR_WINDOWS = [24, 48, 72, 96, 120, 168];
+
+function normalizeHealthHoursWindow(raw) {
+  const value = Math.floor(Number(raw));
+  if (!Number.isFinite(value) || value <= 0) return 72;
+  if (HEALTH_HOUR_WINDOWS.includes(value)) return value;
+  let best = 72;
+  let bestDelta = Infinity;
+  for (const candidate of HEALTH_HOUR_WINDOWS) {
+    const delta = Math.abs(candidate - value);
+    if (delta < bestDelta) {
+      best = candidate;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
+function setDetailHealthHoursWindow(next, opts = {}) {
+  detailHealthHoursWindow = normalizeHealthHoursWindow(next);
+  if (detailHealthHours instanceof HTMLSelectElement) {
+    detailHealthHours.value = String(detailHealthHoursWindow);
+  }
+  try {
+    localStorage.setItem('detailHealthHours', String(detailHealthHoursWindow));
+  } catch (_) {}
+  updateDetailTabHrefs();
+  if (opts.syncURL !== false && detailMainView === 'details' && detailView === 'health' && detailStreamID) {
+    syncDetailURL({ replace: opts.replaceURL === true });
+  }
+}
+
+function toHealthNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+}
+
+function formatUTCDateHourLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '-';
+  return `${date.toISOString().slice(0, 13).replace('T', ' ')}:00 UTC`;
+}
+
+function formatUTCDateLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '-';
+  return `${date.toISOString().slice(0, 10)} UTC`;
+}
+
+function formatUTCDateRangeLabel(startValue, endValue) {
+  const startLabel = formatUTCDateLabel(startValue);
+  const endLabel = formatUTCDateLabel(endValue);
+  return startLabel === endLabel ? startLabel : `${startLabel.replace(' UTC', '')} → ${endLabel}`;
+}
+
+function healthSeverityClass(lossPct) {
+  const value = Math.max(0, Number(lossPct) || 0);
+  if (value <= 0.5) return 'loss-0';
+  if (value <= 2) return 'loss-1';
+  if (value <= 5) return 'loss-2';
+  if (value <= 10) return 'loss-3';
+  if (value <= 20) return 'loss-4';
+  if (value <= 35) return 'loss-5';
+  if (value <= 60) return 'loss-6';
+  return 'loss-7';
+}
+
+function normalizeHealthBucket(raw, index = 0) {
+  const hourStart = String((raw && (raw.hour_start_utc || raw.hour_start || raw.hour || raw.bucket_start || raw.start || raw.timestamp || raw.ts)) || '').trim();
+  let expected = toHealthNumber(raw && (raw.expected_captures ?? raw.expected ?? raw.total_expected_captures ?? raw.total_expected ?? raw.capacity ?? raw.total));
+  const success = toHealthNumber(raw && (raw.success_captures ?? raw.success ?? raw.recorded_success ?? raw.ok ?? raw.captures_success));
+  const errors = toHealthNumber(raw && (raw.error_captures ?? raw.errors ?? raw.capture_errors ?? raw.failed_captures ?? raw.captures_error));
+  let missing = toHealthNumber(raw && (raw.missing_captures ?? raw.missing ?? raw.lost_captures ?? raw.loss_captures));
+  let lossPct = Number(raw && (raw.loss_rate_pct ?? raw.loss_rate ?? raw.loss_pct));
+  if (Number.isFinite(lossPct) && lossPct > 0 && lossPct <= 1 && !(raw && raw.loss_rate_pct !== undefined)) {
+    lossPct *= 100;
+  }
+  if (!Number.isFinite(lossPct)) {
+    if (!expected && (success > 0 || errors > 0 || missing > 0)) {
+      expected = Math.max(0, success + errors + missing);
+    }
+    if (!missing && expected > 0) {
+      missing = Math.max(0, expected - success);
+    }
+    lossPct = expected > 0 ? (100 * Math.max(0, missing)) / expected : 0;
+  }
+  const hourDate = hourStart ? new Date(hourStart) : null;
+  const validHour = !!(hourDate && !Number.isNaN(hourDate.getTime()));
+  return {
+    index,
+    hourStart: validHour ? hourDate.toISOString() : '',
+    displayHour: validHour ? `${hourDate.toISOString().slice(11, 16)} UTC` : '-',
+    displayHourLong: validHour ? formatUTCDateHourLabel(hourDate.toISOString()) : '-',
+    expected,
+    success,
+    errors,
+    missing,
+    lossPct: Number.isFinite(lossPct) ? Math.max(0, lossPct) : 0,
+    hasData: validHour || expected > 0 || success > 0 || errors > 0 || missing > 0,
+  };
+}
+
+function renderDetailHealthMetricChips(buckets, summary) {
+  const hours = Number(summary.total_hours || buckets.length || 0);
+  const avgLoss = Number(summary.average_loss_pct || 0);
+  const worstLoss = Number(summary.worst_loss_pct || 0);
+  const worstHour = String(summary.worst_hour || '').trim() || '-';
+  const spottyHours = Number(summary.spotty_hours || 0);
+  const errorHours = Number(summary.error_hours || 0);
+  const zeroCaptureHours = Number(summary.zero_capture_hours || 0);
+  const explicitErrors = Number(summary.error_rows || 0);
+  const expectedTotal = Number(summary.expected_total || 0);
+  const expectedPerHour = Number(summary.expected_per_hour || 0);
+  const captureUnit = String(summary.capture_unit || 'captures').trim() || 'captures';
+  healthMetricChips.innerHTML = `
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Expected Rate</div>
+      <div class="detail-kpi-value">${expectedPerHour > 0 ? expectedPerHour : '-'}</div>
+      <div class="detail-kpi-meta">${esc(captureUnit)} per UTC hour</div>
+    </div>
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Hours</div>
+      <div class="detail-kpi-value">${hours}</div>
+      <div class="detail-kpi-meta">${summary.window_hours || detailHealthHoursWindow}h requested</div>
+    </div>
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Average Loss</div>
+      <div class="detail-kpi-value">${avgLoss.toFixed(2)}%</div>
+      <div class="detail-kpi-meta">weighted by expected captures</div>
+    </div>
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Worst Hour</div>
+      <div class="detail-kpi-value">${worstLoss.toFixed(2)}%</div>
+      <div class="detail-kpi-meta">${esc(worstHour)}</div>
+    </div>
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Spotty Hours</div>
+      <div class="detail-kpi-value">${spottyHours}</div>
+      <div class="detail-kpi-meta">loss &ge; 20%</div>
+    </div>
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Error Hours</div>
+      <div class="detail-kpi-value">${errorHours}</div>
+      <div class="detail-kpi-meta">hours with explicit error rows</div>
+    </div>
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Explicit Errors</div>
+      <div class="detail-kpi-value">${explicitErrors}</div>
+      <div class="detail-kpi-meta">capture_status = error</div>
+    </div>
+    <div class="detail-kpi">
+      <div class="detail-kpi-label">Zero-Capture Hours</div>
+      <div class="detail-kpi-value">${zeroCaptureHours}</div>
+      <div class="detail-kpi-meta">${expectedTotal > 0 ? `${expectedTotal} expected captures total` : 'expected count unavailable'}</div>
+    </div>
+  `;
+}
+
+function renderDetailHealthGrid(buckets, summary = {}) {
+  const rows = Array.isArray(buckets) ? buckets.slice() : [];
+  if (!rows.length) {
+    healthGrid.innerHTML = '<div class="muted fs11">No recording health data.</div>';
+    return;
+  }
+  const pad = (24 - (rows.length % 24)) % 24;
+  const padded = Array.from({ length: pad }, () => null).concat(rows);
+  const header = ['<div class="health-axis-label">UTC</div>'];
+  for (let hour = 0; hour < 24; hour += 1) {
+    header.push(`<div class="health-axis-label hour">${String(hour).padStart(2, '0')}</div>`);
+  }
+  const html = [header.join('')];
+  for (let rowIndex = 0; rowIndex < padded.length; rowIndex += 24) {
+    const slice = padded.slice(rowIndex, rowIndex + 24);
+    const actual = slice.filter(Boolean);
+    const rowStart = actual.length ? actual[0].hourStart : '';
+    const rowEnd = actual.length ? actual[actual.length - 1].hourStart : '';
+    const rowLoss = actual.length ? actual.reduce((sum, it) => sum + Number(it.lossPct || 0), 0) / actual.length : 0;
+    const rowErrors = actual.reduce((sum, it) => sum + Number(it.errors || 0), 0);
+    const rowSpotty = actual.filter((it) => Number(it.lossPct || 0) >= 20).length;
+    html.push(`
+      <div class="health-row-label">
+        <span class="health-row-label-title">${esc(formatUTCDateRangeLabel(rowStart || rowEnd, rowEnd || rowStart))}</span>
+        <span class="health-row-label-meta">${actual.length}h · avg ${rowLoss.toFixed(1)}% · ${rowSpotty} spotty${rowErrors > 0 ? ` · ${rowErrors} err` : ''}</span>
+      </div>
+    `);
+    for (const item of slice) {
+      if (!item) {
+        html.push('<div class="health-cell no-data empty" aria-hidden="true"></div>');
+        continue;
+      }
+      const lossClass = healthSeverityClass(item.lossPct);
+      const errorCount = Number(item.errors || 0);
+      const expected = Number(item.expected || 0);
+      const success = Number(item.success || 0);
+      const missing = Number(item.missing || 0);
+      const hourLabel = String(item.displayHour || '-');
+      const hourLong = String(item.displayHourLong || '-');
+      const title = [
+        hourLong,
+        `loss ${Number(item.lossPct || 0).toFixed(2)}%`,
+        `success ${success}/${expected || '-'}`,
+        errorCount > 0 ? `explicit errors ${errorCount}` : 'no explicit errors',
+        expected > 0 ? `missing ${missing}` : 'expected count unavailable',
+      ].join(' · ');
+      html.push(`
+        <div class="health-cell ${lossClass}${errorCount > 0 ? ' error' : ''}${expected <= 0 && success <= 0 && errorCount <= 0 ? ' no-data' : ''}" title="${esc(title)}">
+          <div class="health-cell-top">
+            <span class="health-hour">${esc(hourLabel)}</span>
+            ${errorCount > 0 ? `<span class="tag tag-warn" style="height:16px; padding:0 5px; font-size:9px; line-height:14px;">E${errorCount}</span>` : '<span></span>'}
+          </div>
+          <div class="health-percent">${Number(item.lossPct || 0).toFixed(0)}%</div>
+          <div class="health-cell-bottom">
+            <span class="health-count">${expected > 0 ? `${success}/${expected}` : '-'}</span>
+            <span class="health-count">${errorCount > 0 ? `err ${errorCount}` : missing > 0 ? `miss ${missing}` : 'ok'}</span>
+          </div>
+        </div>
+      `);
+    }
+  }
+  healthGrid.innerHTML = html.join('');
+}
+
+function renderDetailHealth(payload) {
+  const items = Array.isArray(payload && (payload.items || payload.points || payload.buckets || payload.hours)) ? (payload.items || payload.points || payload.buckets || payload.hours) : [];
+  const buckets = items.map((raw, index) => normalizeHealthBucket(raw, index))
+    .filter((bucket) => bucket && bucket.hasData)
+    .sort((a, b) => String(a.hourStart || '').localeCompare(String(b.hourStart || '')));
+  const summary = payload && payload.summary ? payload.summary : {};
+  const streamMeta = payload && payload.stream ? payload.stream : {};
+  if (!buckets.length) {
+    renderDetailHealthMetricChips([], {
+      total_hours: 0,
+      window_hours: Number(payload && payload.hours || detailHealthHoursWindow || 72),
+      average_loss_pct: 0,
+      worst_loss_pct: 0,
+      worst_hour: '-',
+      spotty_hours: 0,
+      error_hours: 0,
+      error_rows: 0,
+      zero_capture_hours: 0,
+      expected_total: 0,
+      expected_per_hour: Number(payload && payload.expected_captures_per_hour || 0),
+      capture_unit: String(streamMeta.capture_unit || 'captures'),
+    });
+    renderDetailHealthGrid([], summary);
+    if (healthSummary instanceof HTMLElement) {
+      const expectedPerHour = Number(payload && payload.expected_captures_per_hour || 0);
+      const captureUnit = String(streamMeta.capture_unit || 'captures').trim() || 'captures';
+      healthSummary.textContent = `No hourly health buckets returned.${expectedPerHour > 0 ? ` Expected ${expectedPerHour} ${captureUnit}/hour. ` : ' '}Loss is missing expected captures; errors are capture rows with status error.`;
+    }
+    return;
+  }
+  let expectedTotal = 0;
+  let successTotal = 0;
+  let errorRows = 0;
+  let spottyHours = 0;
+  let errorHours = 0;
+  let zeroCaptureHours = 0;
+  let worstBucket = null;
+  for (const bucket of buckets) {
+    expectedTotal += Number(bucket.expected || 0);
+    successTotal += Number(bucket.success || 0);
+    errorRows += Number(bucket.errors || 0);
+    if (Number(bucket.lossPct || 0) >= 20) spottyHours += 1;
+    if (Number(bucket.errors || 0) > 0) errorHours += 1;
+    if (Number(bucket.expected || 0) > 0 && Number(bucket.success || 0) <= 0) zeroCaptureHours += 1;
+    if (!worstBucket || Number(bucket.lossPct || 0) > Number(worstBucket.lossPct || 0)) {
+      worstBucket = bucket;
+    }
+  }
+  const missingTotal = Math.max(0, expectedTotal - successTotal);
+  const weightedLoss = expectedTotal > 0 ? (100 * missingTotal) / expectedTotal : 0;
+  const averageLoss = summary.average_loss_pct !== undefined && summary.average_loss_pct !== null
+    ? Number(summary.average_loss_pct)
+    : summary.avg_loss_rate_pct !== undefined && summary.avg_loss_rate_pct !== null
+      ? Number(summary.avg_loss_rate_pct)
+      : weightedLoss;
+  const worstLoss = summary.worst_loss_pct !== undefined && summary.worst_loss_pct !== null
+    ? Number(summary.worst_loss_pct)
+    : summary.max_loss_rate_pct !== undefined && summary.max_loss_rate_pct !== null
+      ? Number(summary.max_loss_rate_pct)
+      : Number(worstBucket ? worstBucket.lossPct : 0);
+  const worstHour = String(summary.worst_hour || (worstBucket ? worstBucket.hourStart : '') || '').trim();
+  const firstHour = buckets.length ? buckets[0].hourStart : '';
+  const lastHour = buckets.length ? buckets[buckets.length - 1].hourStart : '';
+  const totalHours = Number(summary.total_hours !== undefined ? summary.total_hours : summary.buckets !== undefined ? summary.buckets : buckets.length);
+  const spottyCount = Number(summary.spotty_hours !== undefined ? summary.spotty_hours : summary.hours_with_loss !== undefined ? summary.hours_with_loss : spottyHours);
+  const errorHourCount = Number(summary.error_hours !== undefined ? summary.error_hours : summary.hours_with_errors !== undefined ? summary.hours_with_errors : errorHours);
+  const explicitErrorRows = Number(summary.error_rows !== undefined ? summary.error_rows : summary.total_error_captures !== undefined ? summary.total_error_captures : errorRows);
+  const summaryExpectedTotal = Number(summary.expected_total !== undefined ? summary.expected_total : summary.total_expected_captures !== undefined ? summary.total_expected_captures : expectedTotal);
+  const summarySuccessTotal = Number(summary.total_success_captures !== undefined ? summary.total_success_captures : successTotal);
+  const summaryMissingTotal = Number(summary.total_missing_captures !== undefined ? summary.total_missing_captures : Math.max(0, summaryExpectedTotal - summarySuccessTotal));
+  const summaryZeroCaptureHours = Number(summary.zero_capture_hours !== undefined ? summary.zero_capture_hours : zeroCaptureHours);
+
+  renderDetailHealthMetricChips(buckets, {
+    total_hours: totalHours,
+    window_hours: Number(payload && payload.hours || detailHealthHoursWindow || 72),
+    average_loss_pct: averageLoss,
+    worst_loss_pct: worstLoss,
+    worst_hour: worstHour ? formatUTCDateHourLabel(worstHour) : '-',
+    spotty_hours: spottyCount,
+    error_hours: errorHourCount,
+    error_rows: explicitErrorRows,
+    zero_capture_hours: summaryZeroCaptureHours,
+    expected_total: summaryExpectedTotal,
+    expected_per_hour: Number(payload && payload.expected_captures_per_hour || 0),
+    capture_unit: String(streamMeta.capture_unit || 'captures'),
+  });
+  renderDetailHealthGrid(buckets, summary);
+  if (healthSummary instanceof HTMLElement) {
+    const expectedPerHour = Number(payload && payload.expected_captures_per_hour || 0);
+    const captureUnit = String(streamMeta.capture_unit || 'captures').trim() || 'captures';
+    healthSummary.textContent =
+      `${formatUTCDateHourLabel(firstHour || lastHour || new Date())} to ${formatUTCDateHourLabel(lastHour || firstHour || new Date())} · ` +
+      `average loss ${averageLoss.toFixed(2)}% · ${spottyCount} spotty hours · ${errorHourCount} error hours · ${explicitErrorRows} explicit error rows. ` +
+      `${expectedPerHour > 0 ? `Expected ${expectedPerHour} ${captureUnit}/hour. ` : ''}` +
+      `Loss is missing expected captures; errors are capture rows with status error.`;
+  }
+}
+
+async function loadDetailHealth() {
+  if (!detailStreamID) return;
+  const hours = normalizeHealthHoursWindow(detailHealthHoursWindow);
+  setDetailHealthHoursWindow(hours, { syncURL: false });
+  setHealthStatus('loading...');
+  if (healthMetricChips instanceof HTMLElement) healthMetricChips.innerHTML = '';
+  if (healthSummary instanceof HTMLElement) healthSummary.textContent = 'Loading recording health...';
+  if (healthGrid instanceof HTMLElement) healthGrid.innerHTML = '<div class="muted fs11">Loading...</div>';
+  const payload = await fetchJSON(`/api/v1/dashboard/streams/${detailStreamID}/recording-health?hours=${hours}`);
+  detailHealthData = payload;
+  renderDetailHealth(payload);
+  const buckets = Array.isArray(payload && (payload.items || payload.points || payload.buckets || payload.hours))
+    ? (payload.items || payload.points || payload.buckets || payload.hours)
+    : [];
+  const loadedCount = buckets.length;
+  const summary = payload && payload.summary ? payload.summary : {};
+  const errorRows = Number(summary.error_rows !== undefined ? summary.error_rows : summary.total_error_captures !== undefined ? summary.total_error_captures : buckets.reduce((sum, raw) => sum + toHealthNumber(raw && (raw.error_captures ?? raw.errors ?? raw.capture_errors ?? raw.failed_captures ?? raw.captures_error)), 0));
+  const spottyHours = Number(summary.spotty_hours !== undefined ? summary.spotty_hours : summary.hours_with_loss !== undefined ? summary.hours_with_loss : buckets.filter((bucket) => Number(normalizeHealthBucket(bucket).lossPct || 0) >= 20).length);
+  const avgLoss = Number(summary.average_loss_pct !== undefined ? summary.average_loss_pct : summary.avg_loss_rate_pct !== undefined ? summary.avg_loss_rate_pct : 0);
+  setHealthStatus(`${loadedCount} hourly buckets · ${avgLoss.toFixed(2)}% avg loss · ${spottyHours} spotty hours · ${errorRows} error rows`, 'ok');
+  if (detailHealthSubtitle instanceof HTMLElement) {
+    detailHealthSubtitle.textContent = `Hourly loss rate and explicit error rows over the last ${hours} UTC hours. Loss is missing expected captures; error rows are explicit capture failures.`;
+  }
+  if (detailHealthHours instanceof HTMLSelectElement) {
+    detailHealthHours.value = String(hours);
+  }
+}
+
 async function loadDetailCoverage() {
   if (!detailStreamID) return;
   const days = Number(coverageDays.value || 365);
@@ -6616,8 +7234,8 @@ async function loadDetailCoverage() {
   coverageSampleGrid.innerHTML = '';
 
   const [coveragePayload, samplePayload] = await Promise.all([
-    fetchJSON(`/api/v1/streams/${detailStreamID}/coverage?days=${Math.floor(days)}`),
-    fetchJSON(`/api/v1/streams/${detailStreamID}/capture-samples?count=${Math.floor(sampleCount)}`),
+    fetchJSON(dashboardStreamURL(detailStreamID, `/coverage?days=${Math.floor(days)}`)),
+    fetchJSON(dashboardStreamURL(detailStreamID, `/capture-samples?count=${Math.floor(sampleCount)}`)),
   ]);
   detailCoverageData = coveragePayload;
   detailCaptureSamplesData = samplePayload;
@@ -6642,7 +7260,7 @@ async function loadDetailTimeline() {
   const params = new URLSearchParams();
   params.set('day', day);
   if (pipelineID) params.set('pipeline_id', pipelineID);
-  const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/timeline?${params}`);
+  const payload = await fetchJSON(dashboardStreamURL(detailStreamID, '/timeline', params));
   detailTimelineData = payload;
   setTimelinePipelineOptions(payload.available_pipeline_ids || [], payload.selected_pipeline_id || pipelineID);
   renderTimeline(payload);
@@ -6794,7 +7412,7 @@ async function loadDetailWorkload() {
   if (!detailStreamID) return;
   setDetailWorkloadStatus('loading...');
   if (detailPipelineRows) setTableLoadingRow(detailPipelineRows, 8, 'Loading stream workload...');
-  const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/pipelines`);
+  const payload = await fetchJSON(dashboardStreamURL(detailStreamID, '/pipelines'));
   detailPipelineData = payload;
   if (detailPipelineRows) renderDetailPipelines(payload.items || []);
   setDetailWorkloadStatus(`${(payload.capture_workers || []).length} capture workers · ${(payload.items || []).length} pipelines`, 'ok');
@@ -6811,7 +7429,7 @@ async function loadDetailInference() {
   const detailParams = buildDetailParams();
   const detectionParams = new URLSearchParams(detailParams.toString());
   detectionParams.set('limit', '500');
-  const detail = await fetchJSON(`/api/v1/streams/${detailStreamID}?${detailParams}`);
+  const detail = await fetchJSON(dashboardStreamURL(detailStreamID, '', detailParams));
   detailData = detail;
   populatePipelineOptions(detail.inference || [], (pipelineFilter.value || '').trim());
   renderInferenceTable(inferenceRowsEl, detail.inference || [], { showStream: false });
@@ -6822,7 +7440,7 @@ async function loadDetailInference() {
 
   void (async () => {
     try {
-      const det = await fetchJSON(`/api/v1/streams/${detailStreamID}/detections?${detectionParams}`);
+      const det = await fetchJSON(dashboardStreamURL(detailStreamID, '/detections', detectionParams));
       detailDetectionsData = det.detections || [];
       detailSignalsData = det.signals || [];
       detailLatestDetectionResult = det.latest_result || null;
@@ -6842,7 +7460,7 @@ async function loadDetail(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return;
   if (!quiet) setDetailWorkloadStatus('loading...');
-  const recordingPayload = await fetchJSON(`/api/v1/streams/${detailStreamID}/recording`);
+  const recordingPayload = await fetchJSON(dashboardStreamURL(detailStreamID, '/recording'));
   detailRecordingData = recordingPayload;
   const captureMeta = detailCaptureMeta(recordingPayload);
   if (!quiet && detailLiveFramesStatus) {
@@ -6932,11 +7550,17 @@ async function loadDetail(options = {}) {
     detailTimelineDay = toUTCDateKey(captureTimestampValue(latestFrame) || new Date());
   }
   timelineDayInput.value = detailTimelineDay;
+  setDetailHealthHoursWindow(detailHealthHoursWindow, { syncURL: false });
+  if (detailHealthSubtitle instanceof HTMLElement) {
+    detailHealthSubtitle.textContent = 'Hourly loss rate and explicit error rows over the selected UTC window. Loss is missing expected captures; errors are explicit capture rows with status error.';
+  }
   if (detailMainView === 'details') {
     if (detailView === 'coverage') {
       if (!quiet) void loadDetailCoverage().catch((err) => setCoverageStatus(String(err), 'err'));
     } else if (detailView === 'timeline') {
       void loadDetailTimeline().catch((err) => setTimelineStatus(String(err), 'err'));
+    } else if (detailView === 'health') {
+      void loadDetailHealth().catch((err) => setHealthStatus(String(err), 'err'));
     } else if (detailView === 'frames') {
       void loadDetailFrames({ quiet }).catch((err) => {
         framesStatusText.className = 'status-text err';
@@ -7758,6 +8382,14 @@ detailTabTimeline.addEventListener('click', async (e) => {
   try { await loadDetailTimeline(); }
   catch (err) { setTimelineStatus(String(err), 'err'); }
 });
+detailTabHealth.addEventListener('click', async (e) => {
+  if (shouldBypassClientRouting(e)) return;
+  e.preventDefault();
+  setDetailMainView('details', { syncURL: false });
+  setDetailSubView('health');
+  try { await loadDetailHealth(); }
+  catch (err) { setHealthStatus(String(err), 'err'); }
+});
 detailTabFrames.addEventListener('click', async (e) => {
   if (shouldBypassClientRouting(e)) return;
   e.preventDefault();
@@ -7774,6 +8406,17 @@ detailTabFrames.addEventListener('click', async (e) => {
 detailFramesReload.addEventListener('click', async () => {
   try { await loadDetailFrames(); }
   catch (err) { framesStatusText.className = 'status-text err'; framesStatusText.textContent = String(err); }
+});
+if (detailHealthReload instanceof HTMLElement) detailHealthReload.addEventListener('click', async () => {
+  try { await loadDetailHealth(); }
+  catch (err) { setHealthStatus(String(err), 'err'); }
+});
+if (detailHealthHours instanceof HTMLSelectElement) detailHealthHours.addEventListener('change', async () => {
+  setDetailHealthHoursWindow(detailHealthHours.value, { syncURL: true });
+  if (detailMainView === 'details' && detailView === 'health') {
+    try { await loadDetailHealth(); }
+    catch (err) { setHealthStatus(String(err), 'err'); }
+  }
 });
 if (detailClipsReloadBtn) detailClipsReloadBtn.addEventListener('click', () => { void refreshDetailClips(); });
 if (detailClipsPrevBtn) detailClipsPrevBtn.addEventListener('click', () => {
