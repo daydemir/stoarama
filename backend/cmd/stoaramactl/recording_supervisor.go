@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
@@ -20,10 +21,11 @@ import (
 )
 
 const (
-	supervisionIncidentDown10m  = "down_10m"
-	supervisionIncidentSpotty2h = "spotty_2h"
-	supervisionRemediateRetry   = 10 * time.Minute
-	supervisionStateHistoryMax  = 25
+	supervisionIncidentDown10m      = "down_10m"
+	supervisionIncidentSpotty2h     = "spotty_2h"
+	supervisionRemediateRetry       = 10 * time.Minute
+	supervisionSpottyNotifyCooldown = 2 * time.Hour
+	supervisionStateHistoryMax      = 25
 )
 
 type supervisorIncidentUpdate struct {
@@ -672,7 +674,11 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		}
 	}
 
-	shouldNotify := lastNotifiedAt == nil
+	recentNotifiedAt, err := latestSupervisorIncidentNotificationAt(ctx, tx, streamID, incidentType, incidentID)
+	if err != nil {
+		return supervisorIncidentUpdate{}, err
+	}
+	shouldNotify := shouldNotifySupervisorIncident(now, incidentType, lastNotifiedAt, recentNotifiedAt)
 	if err := tx.Commit(ctx); err != nil {
 		return supervisorIncidentUpdate{}, err
 	}
@@ -683,6 +689,46 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		ShouldNotify:    shouldNotify,
 		ShouldRemediate: shouldRemediate,
 	}, nil
+}
+
+func latestSupervisorIncidentNotificationAt(ctx context.Context, tx pgx.Tx, streamID int64, incidentType string, excludeIncidentID int64) (*time.Time, error) {
+	if streamID <= 0 {
+		return nil, fmt.Errorf("stream id is required")
+	}
+	if strings.TrimSpace(incidentType) == "" {
+		return nil, fmt.Errorf("incident type is required")
+	}
+	var notifiedAt *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT last_notified_at
+		FROM stream_recording_incidents
+		WHERE stream_id=$1
+		  AND incident_type=$2
+		  AND id <> $3
+		  AND last_notified_at IS NOT NULL
+		ORDER BY last_notified_at DESC, id DESC
+		LIMIT 1
+	`, streamID, incidentType, excludeIncidentID).Scan(&notifiedAt)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no rows") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return notifiedAt, nil
+}
+
+func shouldNotifySupervisorIncident(now time.Time, incidentType string, currentLastNotifiedAt, previousLastNotifiedAt *time.Time) bool {
+	if currentLastNotifiedAt != nil {
+		return false
+	}
+	if strings.TrimSpace(incidentType) != supervisionIncidentSpotty2h {
+		return true
+	}
+	if previousLastNotifiedAt == nil {
+		return true
+	}
+	return now.Sub(previousLastNotifiedAt.UTC()) >= supervisionSpottyNotifyCooldown
 }
 
 func markSupervisorIncidentNotified(ctx context.Context, pool *pgxpool.Pool, incidentID int64) error {

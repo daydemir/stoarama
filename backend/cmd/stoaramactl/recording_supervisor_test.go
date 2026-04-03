@@ -54,3 +54,57 @@ func TestAppendSupervisorIncidentTransitionCapsHistory(t *testing.T) {
 		t.Fatalf("expected latest transition retained, got %v", last)
 	}
 }
+
+func TestShouldNotifySupervisorIncident(t *testing.T) {
+	now := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-30 * time.Minute)
+	old := now.Add(-(supervisionSpottyNotifyCooldown + 5*time.Minute))
+	current := now.Add(-5 * time.Minute)
+
+	tests := []struct {
+		name                 string
+		incidentType         string
+		currentLastNotified  *time.Time
+		previousLastNotified *time.Time
+		want                 bool
+	}{
+		{
+			name:         "down incidents notify immediately",
+			incidentType: supervisionIncidentDown10m,
+			want:         true,
+		},
+		{
+			name:         "new spotty incident notifies when no history exists",
+			incidentType: supervisionIncidentSpotty2h,
+			want:         true,
+		},
+		{
+			name:                 "open incident does not renotify",
+			incidentType:         supervisionIncidentSpotty2h,
+			currentLastNotified:  &current,
+			previousLastNotified: &old,
+			want:                 false,
+		},
+		{
+			name:                 "reopened spotty incident is suppressed within cooldown",
+			incidentType:         supervisionIncidentSpotty2h,
+			previousLastNotified: &recent,
+			want:                 false,
+		},
+		{
+			name:                 "reopened spotty incident notifies after cooldown",
+			incidentType:         supervisionIncidentSpotty2h,
+			previousLastNotified: &old,
+			want:                 true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldNotifySupervisorIncident(now, tt.incidentType, tt.currentLastNotified, tt.previousLastNotified)
+			if got != tt.want {
+				t.Fatalf("shouldNotifySupervisorIncident()=%v want %v", got, tt.want)
+			}
+		})
+	}
+}
