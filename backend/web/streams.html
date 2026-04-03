@@ -1893,8 +1893,8 @@
 
     <div class="toolbar" style="margin-bottom:10px;">
       <div class="subtabs">
-        <a class="subtab-btn" id="detailMainTabDetails" href="#">Details</a>
-        <a class="subtab-btn active" id="detailMainTabClips" href="#">Clips</a>
+        <a class="subtab-btn active" id="detailMainTabDetails" href="#">Details</a>
+        <a class="subtab-btn" id="detailMainTabClips" href="#">Clips</a>
         <a class="subtab-btn" id="detailMainTabSettings" href="#">Settings</a>
       </div>
     </div>
@@ -3939,8 +3939,8 @@ async function prepareDetailClipDownloads() {
 function updateDetailTabHrefs() {
   if (!detailStreamID) return;
   const base = `/streams/${detailStreamID}`;
-  if (detailMainTabDetails instanceof HTMLAnchorElement) detailMainTabDetails.href = `${base}?tab=details`;
-  if (detailMainTabClips instanceof HTMLAnchorElement) detailMainTabClips.href = base;
+  if (detailMainTabDetails instanceof HTMLAnchorElement) detailMainTabDetails.href = base;
+  if (detailMainTabClips instanceof HTMLAnchorElement) detailMainTabClips.href = `${base}?tab=clips`;
   if (detailMainTabSettings instanceof HTMLAnchorElement) detailMainTabSettings.href = `${base}?tab=settings`;
   if (detailTabCoverage instanceof HTMLAnchorElement) detailTabCoverage.href = `${base}?tab=details`;
   if (detailTabTimeline instanceof HTMLAnchorElement) detailTabTimeline.href = `${base}?tab=details&subtab=timeline`;
@@ -5925,8 +5925,8 @@ function applyStreamListStateFromURL(params) {
 
 function normalizeDetailMainTab(raw) {
   const value = String(raw || '').trim().toLowerCase();
-  if (value === 'details' || value === 'settings') return value;
-  return 'clips';
+  if (value === 'clips' || value === 'settings') return value;
+  return 'details';
 }
 
 function normalizeDetailSubtab(raw) {
@@ -5960,7 +5960,7 @@ function syncStreamListURL(opts = {}) {
 function syncDetailURL(opts = {}) {
   if (!detailStreamID) return;
   const params = new URLSearchParams();
-  if (detailMainView !== 'clips') {
+  if (detailMainView !== 'details') {
     params.set('tab', detailMainView);
   }
   if (detailMainView === 'details' && detailView !== 'coverage') {
