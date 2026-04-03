@@ -402,54 +402,14 @@ func (s *Server) handleServiceStreamRecordingState(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	stream, err := s.loadStreamForAssignmentTx(r.Context(), tx, req.StreamID)
+	result, status, err := s.setStreamRecordingStateTx(r.Context(), tx, req.StreamID, state, actor, reason)
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			util.WriteError(w, http.StatusNotFound, "stream not found")
-			return
-		}
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load stream: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if _, err := tx.Exec(r.Context(), `
-		UPDATE streams
-		SET recording_state=$2, updated_at=now()
-		WHERE id=$1
-	`, req.StreamID, string(state)); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update stream recording_state: %v", err))
+	if status > 0 {
+		util.WriteJSON(w, status, result)
 		return
-	}
-	assignment, existed, err := loadRecordingAssignmentTx(r.Context(), tx, req.StreamID)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load assignment: %v", err))
-		return
-	}
-	var serverID string
-	switch state {
-	case model.RecordingStateOff:
-		if existed {
-			serverID = assignment.ServerID
-			if _, _, err := s.unassignRecordingStreamTx(r.Context(), tx, req.StreamID, actor, reason); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("unassign stream: %v", err))
-				return
-			}
-		}
-	case model.RecordingStateOn:
-		stream.RecordingState = model.RecordingStateOn
-		if !existed {
-			result, status, err := s.assignRecordingStreamTx(r.Context(), tx, stream, "", actor, reason)
-			if err != nil {
-				util.WriteError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if status > 0 {
-				util.WriteJSON(w, status, result)
-				return
-			}
-			serverID = strings.TrimSpace(fmt.Sprint(result["server_id"]))
-		} else {
-			serverID = assignment.ServerID
-		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit stream recording_state: %v", err))
@@ -460,12 +420,8 @@ func (s *Server) handleServiceStreamRecordingState(w http.ResponseWriter, r *htt
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reload stream: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"ok":              true,
-		"stream":          updated,
-		"recording_state": string(state),
-		"server_id":       strings.TrimSpace(serverID),
-	})
+	result["stream"] = updated
+	util.WriteJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) loadStreamImageCaptureRepairItems(ctx context.Context, req serviceStreamImageCaptureRepairRequest) ([]serviceStreamImageCaptureRepairItem, error) {

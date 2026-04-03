@@ -30,6 +30,12 @@ type recordingUnassignRequest struct {
 	Actor   string `json:"actor"`
 }
 
+type recordingStateRequest struct {
+	RecordingState string `json:"recording_state"`
+	Reason         string `json:"reason"`
+	Actor          string `json:"actor"`
+}
+
 type recordingAssignmentItem struct {
 	StreamID            int64      `json:"stream_id"`
 	ServerID            string     `json:"server_id"`
@@ -995,6 +1001,62 @@ func (s *Server) handleRecordingStreamUnassign(w http.ResponseWriter, r *http.Re
 	})
 }
 
+func (s *Server) handleRecordingStreamState(w http.ResponseWriter, r *http.Request) {
+	streamID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req recordingStateRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	state, ok := parseRecordingState(strings.TrimSpace(req.RecordingState))
+	if !ok {
+		util.WriteError(w, http.StatusBadRequest, "invalid recording_state; expected off|on")
+		return
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "recording state update"
+	}
+	actor := strings.TrimSpace(req.Actor)
+	if actor == "" {
+		actor = "api.recording_state"
+	}
+	if principal, ok := accountPrincipalFromContext(r.Context()); ok {
+		actor = accountActorLabel(principal, actor)
+	}
+
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	result, status, err := s.setStreamRecordingStateTx(r.Context(), tx, streamID, state, actor, reason)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if status > 0 {
+		util.WriteJSON(w, status, result)
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit stream recording_state: %v", err))
+		return
+	}
+	updated, err := s.getStreamByID(r.Context(), streamID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reload stream: %v", err))
+		return
+	}
+	result["stream"] = updated
+	util.WriteJSON(w, http.StatusOK, result)
+}
+
 func loadRecordingAssignmentTx(ctx context.Context, tx pgx.Tx, streamID int64) (recordingAssignmentRow, bool, error) {
 	var assignment recordingAssignmentRow
 	err := tx.QueryRow(ctx, `
@@ -1017,6 +1079,57 @@ func loadRecordingAssignmentTx(ctx context.Context, tx pgx.Tx, streamID int64) (
 		return recordingAssignmentRow{}, false, err
 	}
 	return assignment, true, nil
+}
+
+func (s *Server) setStreamRecordingStateTx(ctx context.Context, tx pgx.Tx, streamID int64, state model.RecordingState, actor string, reason string) (map[string]any, int, error) {
+	stream, err := s.loadStreamForAssignmentTx(ctx, tx, streamID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return map[string]any{"error": "stream not found"}, http.StatusNotFound, nil
+		}
+		return nil, 0, fmt.Errorf("load stream: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE streams
+		SET recording_state=$2, updated_at=now()
+		WHERE id=$1
+	`, streamID, string(state)); err != nil {
+		return nil, 0, fmt.Errorf("update stream recording_state: %v", err)
+	}
+	assignment, existed, err := loadRecordingAssignmentTx(ctx, tx, streamID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("load assignment: %v", err)
+	}
+	var serverID string
+	switch state {
+	case model.RecordingStateOff:
+		if existed {
+			serverID = assignment.ServerID
+			if _, _, err := s.unassignRecordingStreamTx(ctx, tx, streamID, actor, reason); err != nil {
+				return nil, 0, fmt.Errorf("unassign stream: %v", err)
+			}
+		}
+	case model.RecordingStateOn:
+		stream.RecordingState = model.RecordingStateOn
+		if !existed {
+			result, status, err := s.assignRecordingStreamTx(ctx, tx, stream, "", actor, reason)
+			if err != nil {
+				return nil, 0, err
+			}
+			if status > 0 {
+				return result, status, nil
+			}
+			serverID = strings.TrimSpace(fmt.Sprint(result["server_id"]))
+		} else {
+			serverID = assignment.ServerID
+		}
+	}
+	return map[string]any{
+		"ok":              true,
+		"stream_id":       streamID,
+		"recording_state": string(state),
+		"server_id":       strings.TrimSpace(serverID),
+	}, 0, nil
 }
 
 func (s *Server) unassignRecordingStreamTx(ctx context.Context, tx pgx.Tx, streamID int64, actor string, reason string) (recordingAssignmentRow, bool, error) {

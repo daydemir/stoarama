@@ -89,6 +89,13 @@ func (s *Server) handleDataAccessSpec(w http.ResponseWriter, r *http.Request) {
 				Limit:       accountClipBatchLimit,
 			},
 			{
+				Key:         "recording_state",
+				Method:      http.MethodPost,
+				Path:        "/api/v1/recording/streams/{id}/state",
+				Auth:        "session",
+				Description: "Set desired recording state and apply assignment changes from a signed-in browser session.",
+			},
+			{
 				Key:         "recording_assign",
 				Method:      http.MethodPost,
 				Path:        "/api/v1/recording/streams/{id}/assign",

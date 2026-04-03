@@ -2600,20 +2600,18 @@ async function setStreamRecordingState(streamID, recordingState) {
     throw new Error('recording_state must be on or off');
   }
   try {
-    if (normalized === 'on') {
-      const stream = await loadStreamForAssignment(streamID);
-      return assignRecordingStream(stream, 'dashboard stream toggle');
+    if (normalized === 'off') {
+      const confirmToken = `unassign:${streamID}`;
+      const entered = window.prompt(`Type ${confirmToken} to stop recording for stream ${streamID}.`, '');
+      if (String(entered || '').trim() !== confirmToken) {
+        throw new Error(`recording disable cancelled (confirmation must equal ${confirmToken})`);
+      }
     }
-    const confirmToken = `unassign:${streamID}`;
-    const entered = window.prompt(`Type ${confirmToken} to stop recording for stream ${streamID}.`, '');
-    if (String(entered || '').trim() !== confirmToken) {
-      throw new Error(`recording disable cancelled (confirmation must equal ${confirmToken})`);
-    }
-    return fetchJSON(`/api/v1/recording/streams/${streamID}/unassign`, {
+    return fetchJSON(`/api/v1/recording/streams/${streamID}/state`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        confirm: confirmToken,
+        recording_state: normalized,
         reason: 'dashboard stream toggle',
       }),
     });
