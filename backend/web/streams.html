@@ -5473,7 +5473,7 @@ async function loadStreamForAssignment(streamID) {
   }
   const cached = findStreamByID(id);
   if (cached) return cached;
-  const payload = await fetchJSON(`/api/v1/streams/${Math.floor(id)}`);
+  const payload = await fetchJSON(`/api/v1/dashboard/streams/${Math.floor(id)}`);
   const stream = payload && payload.stream && typeof payload.stream === 'object' ? payload.stream : null;
   if (!stream || Number(stream.id || 0) !== Math.floor(id)) {
     throw new Error(`stream ${Math.floor(id)} not found`);
