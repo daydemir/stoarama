@@ -112,7 +112,7 @@ func accountSessionCapabilities(principal accountPrincipal) map[string]any {
 		"can_toggle_recording": hasBrowserSession,
 		"can_manage_api_keys":  hasBrowserSession,
 		"can_download_clips":   hasBrowserSession,
-		"can_edit_tags":        false,
+		"can_edit_tags":        hasBrowserSession,
 	}
 }
 
