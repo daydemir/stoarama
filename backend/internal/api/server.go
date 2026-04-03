@@ -281,10 +281,10 @@ func (s *Server) router() http.Handler {
 			admin.Post("/dashboard/streams/{id}/frame-exports", s.handleDashboardStreamFrameExportCreate)
 		})
 
-		api.Group(func(accountWrites chi.Router) {
-			accountWrites.Use(s.requireAccountSessionAuth)
-			accountWrites.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
-			accountWrites.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
+		api.Group(func(recordingWrites chi.Router) {
+			recordingWrites.Use(s.requireRecordingMutationAuth)
+			recordingWrites.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
+			recordingWrites.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 		})
 
 		api.Group(func(service chi.Router) {
@@ -320,8 +320,6 @@ func (s *Server) router() http.Handler {
 			service.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			service.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			service.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
-			service.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
-			service.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
 			service.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
 			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)

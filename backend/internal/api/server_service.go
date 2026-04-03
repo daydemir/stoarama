@@ -56,3 +56,27 @@ func (s *Server) requireServiceAuth(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+func (s *Server) requireRecordingMutationAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serviceToken := strings.TrimSpace(s.cfg.ServiceToken)
+		if serviceToken != "" {
+			got := strings.TrimSpace(r.Header.Get("Authorization"))
+			if strings.HasPrefix(got, "Bearer ") {
+				token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
+				if token != "" && token == serviceToken {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+
+		principal, err := s.authenticateAccountSessionRequest(r)
+		if err != nil {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}

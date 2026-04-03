@@ -87,35 +87,9 @@ func (s *Server) requireAccountAuth(next http.Handler) http.Handler {
 
 func (s *Server) requireAccountSessionAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		principal, err := s.authenticateAccountRequest(r)
+		principal, err := s.authenticateAccountSessionRequest(r)
 		if err != nil {
-			log.Printf(
-				"account session auth failed method=%s path=%s host=%s origin=%q referer=%q cookie_present=%t auth_header=%t err=%v",
-				strings.TrimSpace(r.Method),
-				strings.TrimSpace(r.URL.Path),
-				strings.TrimSpace(r.Host),
-				strings.TrimSpace(r.Header.Get("Origin")),
-				strings.TrimSpace(r.Header.Get("Referer")),
-				func() bool { _, cookieErr := r.Cookie(accountSessionCookie); return cookieErr == nil }(),
-				strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer "),
-				err,
-			)
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		if principal.SessionID == nil {
-			log.Printf(
-				"account session required method=%s path=%s host=%s origin=%q referer=%q account_id=%d email=%s auth_type=%s",
-				strings.TrimSpace(r.Method),
-				strings.TrimSpace(r.URL.Path),
-				strings.TrimSpace(r.Host),
-				strings.TrimSpace(r.Header.Get("Origin")),
-				strings.TrimSpace(r.Header.Get("Referer")),
-				principal.AccountID,
-				strings.TrimSpace(principal.Email),
-				strings.TrimSpace(principal.AuthType),
-			)
-			util.WriteError(w, http.StatusUnauthorized, "browser session required")
 			return
 		}
 		ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
@@ -170,6 +144,21 @@ func (s *Server) authenticateAccountRequest(r *http.Request) (accountPrincipal, 
 		}
 	}
 	return accountPrincipal{}, fmt.Errorf("missing account auth")
+}
+
+func (s *Server) authenticateAccountSessionRequest(r *http.Request) (accountPrincipal, error) {
+	if r == nil {
+		return accountPrincipal{}, fmt.Errorf("request is nil")
+	}
+	c, err := r.Cookie(accountSessionCookie)
+	if err != nil {
+		return accountPrincipal{}, fmt.Errorf("missing account session")
+	}
+	token := strings.TrimSpace(c.Value)
+	if token == "" {
+		return accountPrincipal{}, fmt.Errorf("missing account session")
+	}
+	return s.lookupAccountSession(r.Context(), token)
 }
 
 func (s *Server) lookupAccountSession(ctx context.Context, raw string) (accountPrincipal, error) {
