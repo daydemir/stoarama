@@ -1832,6 +1832,7 @@
 	            <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
 	            <th data-sort-key="tags_count">Tags</th>
 	            <th data-sort-key="mode">Capture Type</th>
+	            <th>View</th>
 	          </tr>
 	        </thead>
 	        <tbody id="streamRows"></tbody>
@@ -6131,7 +6132,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="8" style="padding:20px;">
+        <td colspan="9" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -6160,6 +6161,10 @@ function renderStreamRows() {
     const captureFamily = formatCaptureFamilyLabel(s.capture_family);
     const cadenceLabel = formatStreamCadenceLabel(s);
     const peopleMetric = peoplePerInferenceMetric(row);
+    const preferredViewURL = buildPreferredViewURL(s);
+    const viewActionHTML = preferredViewURL
+      ? `<a href="${esc(preferredViewURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm" type="button">View Stream</button></a>`
+      : '<span class="muted fs11">-</span>';
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -6187,6 +6192,7 @@ function renderStreamRows() {
       </td>
       <td>${renderTagEditor(s, 'streams')}</td>
       <td class="mono fs11"><div class="stack"><span>${esc(mode)}</span><span class="muted fs10">${esc(captureFamily)}${cadenceLabel ? ` · ${esc(cadenceLabel)}` : ''}</span></div></td>
+      <td class="mono fs11">${viewActionHTML}</td>
     `;
     streamRowsEl.appendChild(tr);
   }
@@ -6211,7 +6217,7 @@ async function loadStreams(opts = {}) {
   if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
   localStorage.setItem('streamPageSize', String(streamPageSize));
 
-  setTableLoadingRow(streamRowsEl, 8, 'Loading streams...');
+  setTableLoadingRow(streamRowsEl, 9, 'Loading streams...');
   const params = buildStreamFilterParams();
   params.set('limit', String(streamPageSize));
   params.set('offset', String((streamPage - 1) * streamPageSize));
