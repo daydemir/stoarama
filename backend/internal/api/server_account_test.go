@@ -102,8 +102,8 @@ func TestHandleAccountMeIncludesCapabilitiesAndSession(t *testing.T) {
 	if !payload.Capabilities.CanToggleRecording || !payload.Capabilities.CanManageAPIKeys || !payload.Capabilities.CanDownloadClips {
 		t.Fatalf("capabilities=%+v want browser-session capabilities enabled", payload.Capabilities)
 	}
-	if payload.Capabilities.CanEditTags {
-		t.Fatalf("can_edit_tags=true want false")
+	if !payload.Capabilities.CanEditTags {
+		t.Fatalf("can_edit_tags=false want true")
 	}
 	if payload.Session.AuthType != "session" || !payload.Session.BrowserSession {
 		t.Fatalf("session=%+v want session browser_session=true", payload.Session)

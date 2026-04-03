@@ -3306,13 +3306,27 @@ async function loadKnownStreamTagsSafe(scope = 'all') {
 function renderTagEditor(stream, tableKey) {
   const streamID = Number(stream.id);
   const currentTags = normalizeTags(stream.tags || []);
+  if (!hasAuthCapability('can_edit_tags')) {
+    const current = currentTags.length
+      ? currentTags.map((tag) => `<span class="tag tag-muted">${esc(tag)}</span>`).join('')
+      : '<span class="muted fs10">no tags</span>';
+    return `
+      <div class="stack tag-editor" data-tag-editor="1" data-id="${streamID}" data-table="${esc(tableKey)}">
+        <div class="row">${current}</div>
+        <div class="muted fs10">Tags are read-only in this public view.</div>
+      </div>
+    `;
+  }
   const current = currentTags.length
-    ? currentTags.map((tag) => `<span class="tag tag-muted">${esc(tag)}</span>`).join('')
+    ? currentTags.map((tag) => `<button class="tag-chip-btn" data-action="tag-remove" data-id="${streamID}" data-table="${esc(tableKey)}" data-tag="${esc(tag)}">${esc(tag)} ×</button>`).join('')
     : '<span class="muted fs10">no tags</span>';
   return `
     <div class="stack tag-editor" data-tag-editor="1" data-id="${streamID}" data-table="${esc(tableKey)}">
       <div class="row">${current}</div>
-      <div class="muted fs10">Tags are read-only in this public view.</div>
+      <div class="row">
+        <input class="tag-editor-input" data-tag-input="1" list="streamTagSuggestionsList" placeholder="add tags csv" />
+        <button class="btn-sm" data-action="tag-add" data-id="${streamID}" data-table="${esc(tableKey)}">Add</button>
+      </div>
     </div>
   `;
 }
