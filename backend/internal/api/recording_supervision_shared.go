@@ -31,6 +31,8 @@ func classifyRecordingSupervision(now time.Time, input recordingSupervisionInput
 		return "off", "recording_disabled", nil
 	}
 	downThreshold := 10 * time.Minute
+	spottyThreshold := 2 * time.Hour
+	continuousOnSince := recordingContinuousOnSince(input)
 	switch {
 	case input.ServerID == "":
 		if now.Sub(input.StreamUpdatedAt.UTC()) >= downThreshold {
@@ -56,29 +58,45 @@ func classifyRecordingSupervision(now time.Time, input recordingSupervisionInput
 		if age >= downThreshold {
 			return "down_10m", "stale_frames_10m", input.LastFrameAt
 		}
+		if now.Sub(continuousOnSince) < spottyThreshold {
+			return state, reason, nil
+		}
 		if input.Metrics.OutageEpisodes2h >= 3 {
-			unhealthySince = input.AssignedAt
-			if unhealthySince == nil {
-				unhealthySince = input.LastFrameAt
-			}
+			unhealthySince = supervisionAnchorTime(continuousOnSince, input.LastFrameAt)
 			return "spotty_2h", "outage_episodes_2h", unhealthySince
 		}
 		if input.Metrics.ProcessIssues2h >= 3 {
-			unhealthySince = input.AssignedAt
-			if unhealthySince == nil {
-				unhealthySince = input.LastFrameAt
-			}
+			unhealthySince = supervisionAnchorTime(continuousOnSince, input.LastFrameAt)
 			return "spotty_2h", "process_restarts_2h", unhealthySince
 		}
 		if input.Metrics.LossRate2h > 20 {
-			unhealthySince = input.AssignedAt
-			if unhealthySince == nil {
-				unhealthySince = input.LastFrameAt
-			}
+			unhealthySince = supervisionAnchorTime(continuousOnSince, input.LastFrameAt)
 			return "spotty_2h", "loss_rate_2h", unhealthySince
 		}
 		return state, reason, nil
 	}
+}
+
+func recordingContinuousOnSince(input recordingSupervisionInput) time.Time {
+	since := input.StreamUpdatedAt.UTC()
+	if input.AssignedAt != nil {
+		assignedAt := input.AssignedAt.UTC()
+		if assignedAt.Before(since) {
+			since = assignedAt
+		}
+	}
+	return since
+}
+
+func supervisionAnchorTime(primary time.Time, fallback *time.Time) *time.Time {
+	anchor := primary.UTC()
+	if fallback != nil {
+		fallbackUTC := fallback.UTC()
+		if fallbackUTC.Before(anchor) {
+			anchor = fallbackUTC
+		}
+	}
+	return &anchor
 }
 
 func dashboardHealthFromSupervision(state string) string {
