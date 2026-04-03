@@ -224,6 +224,16 @@
       border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
       color: var(--accent);
     }
+    .overview-card-link.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .overview-card-link.primary:hover {
+      color: #fff;
+      opacity: 0.88;
+      border-color: var(--accent);
+    }
     .panel-intro {
       display: flex;
       flex-wrap: wrap;
@@ -6250,6 +6260,15 @@ async function fetchRecentClips(limit = 60) {
   return Array.isArray(payload.items) ? payload.items : [];
 }
 
+function buildPreferredViewURL(stream) {
+  const s = stream || {};
+  const sourceURL = String(s.source_url || '').trim();
+  if (sourceURL) return sourceURL;
+  const youtubeWatchURL = String(buildYouTubeWatchURL(s) || '').trim();
+  if (youtubeWatchURL) return youtubeWatchURL;
+  return String(s.source_page_url || '').trim();
+}
+
 async function loadDetailLiveFrames(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return [];
@@ -6425,15 +6444,16 @@ async function loadDetail(options = {}) {
   ].filter(Boolean).join('');
 
   const youtubeWatchURL = buildYouTubeWatchURL(s);
+  const preferredViewURL = buildPreferredViewURL(s);
   detailActions.innerHTML = `
+    ${preferredViewURL ? `<a href="${esc(preferredViewURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm primary">View Live Stream</button></a>` : ''}
     ${s.recording_state === 'on'
       ? `<button class="btn-sm" data-detail-action="recording-disable" data-id="${s.id}">Turn Recording Off</button>`
       : (canStartRecording
         ? `<button class="btn-sm" data-detail-action="recording-enable" data-id="${s.id}">Turn Recording On</button>`
         : `<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>`)}
     <button class="btn-sm" data-detail-action="show-stream-json" data-id="${s.id}" title="Inspect full stream payload">Inspect JSON</button>
-    ${youtubeWatchURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
-    ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open Stream URL</button></a>` : ''}
+    ${youtubeWatchURL && youtubeWatchURL !== preferredViewURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
     ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Source Page</button></a>` : ''}
   `;
   detailTagEditor.innerHTML = renderTagEditor(s, 'detail');
