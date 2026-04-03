@@ -618,13 +618,7 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		return supervisorIncidentUpdate{}, err
 	}
 
-	shouldRemediate := !existing
-	if existing {
-		lastRemediatedAt := parseAnyTime(existingDetails["last_remediated_at"])
-		if lastRemediatedAt == nil || now.Sub(lastRemediatedAt.UTC()) >= remediationRetry {
-			shouldRemediate = true
-		}
-	}
+	shouldRemediate := shouldRemediateSupervisorIncident(now, incidentType, existing, existingDetails, remediationRetry)
 
 	if existing {
 		if value, ok := existingDetails["last_remediated_at"]; ok && value != nil {
@@ -729,6 +723,20 @@ func shouldNotifySupervisorIncident(now time.Time, incidentType string, currentL
 		return true
 	}
 	return now.Sub(previousLastNotifiedAt.UTC()) >= supervisionSpottyNotifyCooldown
+}
+
+func shouldRemediateSupervisorIncident(now time.Time, incidentType string, existing bool, existingDetails map[string]any, remediationRetry time.Duration) bool {
+	if strings.TrimSpace(incidentType) != supervisionIncidentDown10m {
+		return false
+	}
+	if !existing {
+		return true
+	}
+	lastRemediatedAt := parseAnyTime(existingDetails["last_remediated_at"])
+	if lastRemediatedAt == nil {
+		return true
+	}
+	return now.Sub(lastRemediatedAt.UTC()) >= remediationRetry
 }
 
 func markSupervisorIncidentNotified(ctx context.Context, pool *pgxpool.Pool, incidentID int64) error {
