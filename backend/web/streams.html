@@ -1893,16 +1893,15 @@
 
     <div class="toolbar" style="margin-bottom:10px;">
       <div class="subtabs">
-        <a class="subtab-btn active" id="detailMainTabDetails" href="#">Details</a>
-        <a class="subtab-btn" id="detailMainTabClips" href="#">Clips</a>
+        <a class="subtab-btn" id="detailMainTabDetails" href="#">Details</a>
+        <a class="subtab-btn active" id="detailMainTabClips" href="#">Clips</a>
         <a class="subtab-btn" id="detailMainTabSettings" href="#">Settings</a>
       </div>
     </div>
 
     <div class="toolbar" id="detailDetailsSubtabs" style="margin-bottom:10px;">
       <div class="subtabs">
-        <a class="subtab-btn active" id="detailTabInference" href="#">Inference</a>
-        <a class="subtab-btn" id="detailTabCoverage" href="#">Coverage</a>
+        <a class="subtab-btn active" id="detailTabCoverage" href="#">Coverage</a>
         <a class="subtab-btn" id="detailTabTimeline" href="#">Timeline</a>
         <a class="subtab-btn" id="detailTabHealth" href="#">Health</a>
         <a class="subtab-btn" id="detailTabFrames" href="#">Frames</a>
@@ -3935,11 +3934,10 @@ async function prepareDetailClipDownloads() {
 function updateDetailTabHrefs() {
   if (!detailStreamID) return;
   const base = `/streams/${detailStreamID}`;
-  if (detailMainTabDetails instanceof HTMLAnchorElement) detailMainTabDetails.href = base;
-  if (detailMainTabClips instanceof HTMLAnchorElement) detailMainTabClips.href = `${base}?tab=clips`;
+  if (detailMainTabDetails instanceof HTMLAnchorElement) detailMainTabDetails.href = `${base}?tab=details`;
+  if (detailMainTabClips instanceof HTMLAnchorElement) detailMainTabClips.href = base;
   if (detailMainTabSettings instanceof HTMLAnchorElement) detailMainTabSettings.href = `${base}?tab=settings`;
-  if (detailTabInference instanceof HTMLAnchorElement) detailTabInference.href = base;
-  if (detailTabCoverage instanceof HTMLAnchorElement) detailTabCoverage.href = `${base}?tab=details&subtab=coverage`;
+  if (detailTabCoverage instanceof HTMLAnchorElement) detailTabCoverage.href = `${base}?tab=details`;
   if (detailTabTimeline instanceof HTMLAnchorElement) detailTabTimeline.href = `${base}?tab=details&subtab=timeline`;
   if (detailTabHealth instanceof HTMLAnchorElement) detailTabHealth.href = `${base}?tab=details&subtab=health&health_hours=${Math.max(1, Math.floor(Number(detailHealthHoursWindow) || 72))}`;
   if (detailTabFrames instanceof HTMLAnchorElement) detailTabFrames.href = `${base}?tab=details&subtab=frames`;
@@ -4488,7 +4486,12 @@ function moveImageModal(step) {
 
 function setDetailSubView(view, opts = {}) {
   detailView = normalizeDetailSubtab(view);
-  const hasLegacySubtabs = detailTabInference.isConnected || detailTabCoverage.isConnected || detailTabTimeline.isConnected || detailTabHealth.isConnected || detailTabFrames.isConnected;
+  const hasLegacySubtabs = Boolean(
+    (detailTabCoverage && detailTabCoverage.isConnected)
+    || (detailTabTimeline && detailTabTimeline.isConnected)
+    || (detailTabHealth && detailTabHealth.isConnected)
+    || (detailTabFrames && detailTabFrames.isConnected)
+  );
   if (!hasLegacySubtabs) {
     detailInferenceSection.style.display = '';
     detailCoverageSection.style.display = '';
@@ -4498,11 +4501,10 @@ function setDetailSubView(view, opts = {}) {
     stopDetailLivePolling();
     return;
   }
-  detailTabInference.classList.toggle('active', detailView === 'inference');
-  detailTabCoverage.classList.toggle('active', detailView === 'coverage');
-  detailTabTimeline.classList.toggle('active', detailView === 'timeline');
-  detailTabHealth.classList.toggle('active', detailView === 'health');
-  detailTabFrames.classList.toggle('active', detailView === 'frames');
+  if (detailTabCoverage) detailTabCoverage.classList.toggle('active', detailView === 'coverage');
+  if (detailTabTimeline) detailTabTimeline.classList.toggle('active', detailView === 'timeline');
+  if (detailTabHealth) detailTabHealth.classList.toggle('active', detailView === 'health');
+  if (detailTabFrames) detailTabFrames.classList.toggle('active', detailView === 'frames');
   detailInferenceSection.style.display = detailView === 'inference' ? '' : 'none';
   detailCoverageSection.style.display = detailView === 'coverage' ? '' : 'none';
   detailTimelineSection.style.display = detailView === 'timeline' ? '' : 'none';
@@ -5905,14 +5907,15 @@ function applyStreamListStateFromURL(params) {
 
 function normalizeDetailMainTab(raw) {
   const value = String(raw || '').trim().toLowerCase();
-  if (value === 'clips' || value === 'settings') return value;
-  return 'details';
+  if (value === 'details' || value === 'settings') return value;
+  return 'clips';
 }
 
 function normalizeDetailSubtab(raw) {
   const value = String(raw || '').trim().toLowerCase();
+  if (value === 'inference') return 'coverage';
   if (value === 'coverage' || value === 'timeline' || value === 'health' || value === 'frames') return value;
-  return 'inference';
+  return 'coverage';
 }
 
 function applyDetailRouteStateFromURL(params) {
@@ -5939,10 +5942,10 @@ function syncStreamListURL(opts = {}) {
 function syncDetailURL(opts = {}) {
   if (!detailStreamID) return;
   const params = new URLSearchParams();
-  if (detailMainView !== 'details') {
+  if (detailMainView !== 'clips') {
     params.set('tab', detailMainView);
-  } else if (detailView !== 'inference') {
-    params.set('tab', 'details');
+  }
+  if (detailMainView === 'details' && detailView !== 'coverage') {
     params.set('subtab', detailView);
     if (detailView === 'health') {
       params.set('health_hours', String(Math.max(1, Math.floor(Number(detailHealthHoursWindow) || 72))));
@@ -8716,17 +8719,6 @@ if (detailMainTabSettings) detailMainTabSettings.addEventListener('click', (e) =
   if (shouldBypassClientRouting(e)) return;
   e.preventDefault();
   setDetailMainView('settings');
-});
-detailTabInference.addEventListener('click', async (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('details', { syncURL: false });
-  setDetailSubView('inference');
-  try {
-    await Promise.all([loadDetailInference(), loadDetailWorkload()]);
-  } catch (err) {
-    setDetailStatus(String(err), 'err');
-  }
 });
 detailTabCoverage.addEventListener('click', async (e) => {
   if (shouldBypassClientRouting(e)) return;
