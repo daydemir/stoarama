@@ -108,3 +108,71 @@ func TestShouldNotifySupervisorIncident(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldRemediateSupervisorIncident(t *testing.T) {
+	now := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-30 * time.Minute)
+	old := now.Add(-2 * time.Hour)
+	retry := time.Hour
+
+	tests := []struct {
+		name             string
+		incidentType     string
+		existing         bool
+		existingDetails  map[string]any
+		remediationRetry time.Duration
+		want             bool
+	}{
+		{
+			name:             "new down incident remediates immediately",
+			incidentType:     supervisionIncidentDown10m,
+			remediationRetry: retry,
+			want:             true,
+		},
+		{
+			name:         "existing down incident waits for retry window",
+			incidentType: supervisionIncidentDown10m,
+			existing:     true,
+			existingDetails: map[string]any{
+				"last_remediated_at": recent.Format(time.RFC3339Nano),
+			},
+			remediationRetry: retry,
+			want:             false,
+		},
+		{
+			name:         "existing down incident remediates after retry window",
+			incidentType: supervisionIncidentDown10m,
+			existing:     true,
+			existingDetails: map[string]any{
+				"last_remediated_at": old.Format(time.RFC3339Nano),
+			},
+			remediationRetry: retry,
+			want:             true,
+		},
+		{
+			name:             "spotty incident is alert only",
+			incidentType:     supervisionIncidentSpotty2h,
+			remediationRetry: retry,
+			want:             false,
+		},
+		{
+			name:         "existing spotty incident stays alert only",
+			incidentType: supervisionIncidentSpotty2h,
+			existing:     true,
+			existingDetails: map[string]any{
+				"last_remediated_at": old.Format(time.RFC3339Nano),
+			},
+			remediationRetry: retry,
+			want:             false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldRemediateSupervisorIncident(now, tt.incidentType, tt.existing, tt.existingDetails, tt.remediationRetry)
+			if got != tt.want {
+				t.Fatalf("shouldRemediateSupervisorIncident()=%v want %v", got, tt.want)
+			}
+		})
+	}
+}
