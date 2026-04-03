@@ -3383,6 +3383,15 @@ async function setStreamRecordingState(streamID, recordingState) {
       }),
     });
   } catch (err) {
+    console.error('[recording-toggle] failure', {
+      streamID,
+      recordingState: normalized,
+      path: window.location.pathname,
+      href: window.location.href,
+      authStatus: authState && authState.status,
+      canToggleRecording: hasAuthCapability('can_toggle_recording'),
+      error: authErrorMessage(err),
+    });
     throw new Error(formatAccountAuthError(err, 'recording changes require a signed-in account'));
   }
 }
@@ -5487,6 +5496,15 @@ async function assignRecordingStream(stream, reason = 'dashboard servers assign'
     throw new Error('invalid stream id for assignment');
   }
   const serverID = await chooseServerForRecordingAssign(stream);
+  console.info('[recording-toggle] assign request', {
+    streamID,
+    serverID,
+    reason,
+    path: window.location.pathname,
+    href: window.location.href,
+    authStatus: authState && authState.status,
+    canToggleRecording: hasAuthCapability('can_toggle_recording'),
+  });
   return fetchJSON(`/api/v1/recording/streams/${streamID}/assign`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
