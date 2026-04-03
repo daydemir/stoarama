@@ -8,7 +8,6 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
   <style>
     :root {
       --bg: #0a0f1a;
@@ -1824,10 +1823,7 @@
       <div class="toolbar">
         <div class="subtabs">
           <button class="subtab-btn active" id="streamViewTable">Table</button>
-          <button class="subtab-btn" id="streamViewMap">Geographic View</button>
         </div>
-        <div class="toolbar-sep"></div>
-        <span class="status-text" id="streamsMapStatus"></span>
       </div>
       <div class="filter-footer">
         <div class="row">
@@ -1867,15 +1863,6 @@
 	        <tbody id="streamRows"></tbody>
 	      </table>
 	    </div>
-    <div id="streamsMapWrap" class="streams-map-wrap" style="display:none;">
-      <div class="streams-map-legend">
-        <span class="streams-map-legend-item"><span class="streams-map-legend-dot exact"></span> exact coordinate</span>
-        <span class="streams-map-legend-item"><span class="streams-map-legend-dot approx"></span> estimated coordinate (region shown)</span>
-        <span class="streams-map-legend-item"><span class="streams-map-legend-dot unknown"></span> no coordinate</span>
-      </div>
-      <div id="streamsMap" class="streams-map-canvas"></div>
-      <div id="streamsMapSummary" class="streams-map-summary">Map not loaded</div>
-    </div>
   </div>
 
   <!-- DETAIL PANEL -->
@@ -2356,7 +2343,6 @@
 </div>
 <datalist id="streamTagSuggestionsList"></datalist>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script>
 // ─── DOM refs ────────────────────────────────────────────────────────────────
 const missingDomCache = new Map();
@@ -5871,8 +5857,7 @@ function applyStreamListStateFromURL(params) {
   streamSortBy = sortBy || DEFAULT_STREAM_SORT_BY;
   streamSortDir = normalizeSortDir(params.get('sort_dir'), 'desc');
 
-  const view = String(params.get('view') || '').trim().toLowerCase();
-  streamsView = view === 'map' ? 'map' : 'table';
+  streamsView = 'table';
 
   const page = Number(params.get('page') || '1');
   streamPage = Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
@@ -5905,7 +5890,6 @@ function applyDetailRouteStateFromURL(params) {
 
 function syncStreamListURL(opts = {}) {
   const params = buildStreamFilterParams();
-  if (streamsView === 'map') params.set('view', 'map');
   if (streamSortBy) params.set('sort_by', String(streamSortBy));
   if (streamSortDir) params.set('sort_dir', normalizeSortDir(streamSortDir, 'desc'));
   if (streamsView === 'table') {
