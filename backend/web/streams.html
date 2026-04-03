@@ -3204,6 +3204,7 @@ function findStreamByID(id) {
   const stream = getRowStream(row);
   if (stream) return stream;
   if (detailData && detailData.stream && Number(detailData.stream.id) === n) return detailData.stream;
+  if (detailRecordingData && detailRecordingData.stream && Number(detailRecordingData.stream.id) === n) return detailRecordingData.stream;
   return null;
 }
 
@@ -3233,6 +3234,9 @@ function setCachedStreamTags(streamID, tags) {
   if (detailData && detailData.stream && Number(detailData.stream.id) === Number(streamID)) {
     detailData.stream.tags = normalized;
   }
+  if (detailRecordingData && detailRecordingData.stream && Number(detailRecordingData.stream.id) === Number(streamID)) {
+    detailRecordingData.stream.tags = normalized;
+  }
 }
 
 function mergeCachedStreamPatch(streamID, patch) {
@@ -3245,6 +3249,7 @@ function mergeCachedStreamPatch(streamID, patch) {
   for (const row of streamRows) applyPatch(getRowStream(row));
   for (const row of recStreamRows) applyPatch(getRowStream(row));
   if (detailData && detailData.stream) applyPatch(detailData.stream);
+  if (detailRecordingData && detailRecordingData.stream) applyPatch(detailRecordingData.stream);
 }
 
 function refreshTagSuggestionList() {
