@@ -1870,6 +1870,7 @@
       <span id="imageModalCounter" class="image-modal-counter">0 / 0</span>
       <div class="image-modal-toolbar-right">
         <a id="imageModalOpenOriginal" class="image-modal-btn" href="#" target="_blank" rel="noopener noreferrer">Open</a>
+        <a id="imageModalOpenStream" class="image-modal-btn" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">Open Stream</a>
         <button id="imageModalClose" class="image-modal-btn" type="button" aria-label="Close image viewer">Close</button>
       </div>
     </div>
@@ -2161,6 +2162,7 @@ const imageModalPrev = $('imageModalPrev');
 const imageModalNext = $('imageModalNext');
 const imageModalClose = $('imageModalClose');
 const imageModalOpenOriginal = $('imageModalOpenOriginal');
+const imageModalOpenStream = $('imageModalOpenStream');
 const imageModalMeta = $('imageModalMeta');
 const streamJsonModal = $('streamJsonModal');
 const streamJsonBackdrop = $('streamJsonBackdrop');
@@ -3223,6 +3225,11 @@ function resolveImageLinkStreamID(linkEl) {
   return Math.floor(raw);
 }
 
+function resolveImageLinkStreamHref(linkEl) {
+  const streamID = resolveImageLinkStreamID(linkEl);
+  return streamID > 0 ? `/streams/${streamID}` : '';
+}
+
 async function resolveAllStreamImagesForCurrentPage() {
   if (!Array.isArray(streamRows) || streamRows.length === 0) return;
   const orderedIDs = [];
@@ -3445,6 +3452,9 @@ function renderImageModalFrame() {
   imageModalImg.alt = imgEl ? String(imgEl.getAttribute('alt') || 'preview') : 'preview';
   imageModalCounter.textContent = `${imageModalIndex + 1} / ${total}`;
   imageModalOpenOriginal.href = url;
+  const streamHref = resolveImageLinkStreamHref(linkEl);
+  imageModalOpenStream.href = streamHref || '#';
+  imageModalOpenStream.style.display = streamHref ? 'inline-flex' : 'none';
   const disableNav = total <= 1;
   imageModalPrev.disabled = disableNav;
   imageModalNext.disabled = disableNav;
@@ -3471,6 +3481,8 @@ function closeImageModal() {
   setImageModalOpenState(false);
   imageModalImg.removeAttribute('src');
   imageModalOpenOriginal.href = '#';
+  imageModalOpenStream.href = '#';
+  imageModalOpenStream.style.display = 'none';
   imageModalCounter.textContent = '0 / 0';
   imageModalMeta.innerHTML = '<div class="image-modal-meta-title">Stream Metadata</div><div class="muted fs11">No stream metadata</div>';
   imageModalLinks = [];
