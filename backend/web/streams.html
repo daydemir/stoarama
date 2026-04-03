@@ -3719,6 +3719,11 @@ function recordingToggleHintText() {
 
 function buildPreferredViewURL(stream) {
   const s = stream || {};
+  const streamID = Number(s.id || 0);
+  const captureType = String(s.capture_type || '').trim().toLowerCase();
+  if (streamID > 0 && ['hls', 'dash', 'rtsp', 'rtmp', 'http_video'].includes(captureType)) {
+    return `/streams/${Math.floor(streamID)}`;
+  }
   const sourceURL = String(s.source_url || '').trim();
   if (sourceURL) return sourceURL;
   const youtubeWatchURL = String(buildYouTubeWatchURL(s) || '').trim();
