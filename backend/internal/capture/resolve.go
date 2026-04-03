@@ -131,6 +131,14 @@ func resolveIndirectURL(ctx context.Context, rawURL string, timeout time.Duratio
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", false, fmt.Errorf("resolve request status=%d", resp.StatusCode)
 	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL := strings.TrimSpace(resp.Request.URL.String())
+		if finalURL != "" && finalURL != strings.TrimSpace(rawURL) {
+			if strings.HasPrefix(finalURL, "http://") || strings.HasPrefix(finalURL, "https://") {
+				return finalURL, true, nil
+			}
+		}
+	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
 	if err != nil {
 		return "", false, fmt.Errorf("read resolve body: %w", err)

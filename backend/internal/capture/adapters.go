@@ -91,14 +91,22 @@ func (a *hlsLiveAdapter) Resolve(ctx context.Context, spec StreamSpec) (Resolved
 	if u == "" {
 		return ResolvedSource{}, fmt.Errorf("hls_live requires source_url or source_page_url")
 	}
-	if strings.Contains(strings.ToLower(u), "!hls") {
+	for range 3 {
+		lower := strings.ToLower(u)
+		if strings.Contains(lower, ".m3u8") {
+			break
+		}
+		if !strings.Contains(lower, "!hls") && !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+			break
+		}
 		resolved, ok, err := resolveIndirectURL(ctx, u, 20*time.Second)
 		if err != nil {
 			return ResolvedSource{}, err
 		}
-		if ok {
-			u = resolved
+		if !ok || strings.TrimSpace(resolved) == "" || strings.TrimSpace(resolved) == strings.TrimSpace(u) {
+			break
 		}
+		u = resolved
 	}
 	if !strings.Contains(strings.ToLower(u), ".m3u8") {
 		return ResolvedSource{}, fmt.Errorf("hls_live expected m3u8 URL after resolve")
