@@ -250,6 +250,16 @@
       border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
       color: var(--accent);
     }
+    .overview-card-link.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .overview-card-link.primary:hover {
+      color: #fff;
+      opacity: 0.88;
+      border-color: var(--accent);
+    }
     .panel-intro {
       display: flex;
       flex-wrap: wrap;
@@ -866,6 +876,12 @@
       margin-bottom: 14px;
     }
     .detail-header-left { display: flex; flex-direction: column; gap: 6px; }
+    .detail-header-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
     .detail-title { font-size: 16px; font-weight: 600; }
     .detail-meta { display: flex; flex-wrap: wrap; gap: 5px; }
     .detail-section-card {
@@ -1841,6 +1857,7 @@
         <div class="detail-meta" id="detailMeta"></div>
       </div>
       <div class="detail-header-actions">
+        <a id="detailViewCTA" class="overview-card-link primary" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">View live stream</a>
         <a id="detailRecordCTA" class="overview-card-link" href="/recording">Record this stream</a>
       </div>
     </div>
@@ -2456,6 +2473,7 @@ const recordingTable = $('recordingTable');
 // detail
 const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
+const detailViewCTA = $('detailViewCTA');
 const detailRecordCTA = $('detailRecordCTA');
 const detailTagEditor = $('detailTagEditor');
 const detailActions = $('detailActions');
@@ -3674,6 +3692,15 @@ function recordingToggleHintText() {
   return authStatusMessage('toggle recording');
 }
 
+function buildPreferredViewURL(stream) {
+  const s = stream || {};
+  const sourceURL = String(s.source_url || '').trim();
+  if (sourceURL) return sourceURL;
+  const youtubeWatchURL = String(buildYouTubeWatchURL(s) || '').trim();
+  if (youtubeWatchURL) return youtubeWatchURL;
+  return String(s.source_page_url || '').trim();
+}
+
 function renderRecordingToggleControl(stream, options = {}) {
   const s = stream || {};
   const detailMode = options && options.detail === true;
@@ -3705,18 +3732,28 @@ function syncDetailMutationUI(stream) {
   if (!(detailActions instanceof HTMLElement)) return;
   const s = stream || {};
   const youtubeWatchURL = buildYouTubeWatchURL(s);
+  const preferredViewURL = buildPreferredViewURL(s);
   const recordThisStreamHTML = hasAuthCapability('can_toggle_recording')
     ? `<a href="/recording?stream_id=${s.id}"><button class="btn-sm">Record This Stream</button></a>`
     : renderDisabledButton('Record This Stream', recordingToggleHintText());
   if (detailRecordCTA instanceof HTMLAnchorElement) {
     detailRecordCTA.href = `/recording?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
   }
+  if (detailViewCTA instanceof HTMLAnchorElement) {
+    if (preferredViewURL) {
+      detailViewCTA.href = preferredViewURL;
+      detailViewCTA.style.display = '';
+    } else {
+      detailViewCTA.href = '#';
+      detailViewCTA.style.display = 'none';
+    }
+  }
   detailActions.innerHTML = `
+    ${preferredViewURL ? `<a href="${esc(preferredViewURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm primary">View Live Stream</button></a>` : ''}
     ${recordThisStreamHTML}
     ${renderRecordingToggleControl(s, { detail: true })}
     <button class="btn-sm" data-detail-action="show-stream-json" data-id="${s.id}" title="Inspect full stream payload">Inspect JSON</button>
-    ${youtubeWatchURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
-    ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open Stream URL</button></a>` : ''}
+    ${youtubeWatchURL && youtubeWatchURL !== preferredViewURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
     ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Source Page</button></a>` : ''}
   `;
   if (detailTagEditor instanceof HTMLElement) {
