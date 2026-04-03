@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -879,9 +880,27 @@ func (s *Server) handleRecordingStreamAssign(w http.ResponseWriter, r *http.Requ
 	if actor == "" {
 		actor = "api.recording_assign"
 	}
+	principalEmail := ""
+	principalAuthType := ""
+	principalSession := false
 	if principal, ok := accountPrincipalFromContext(r.Context()); ok {
 		actor = accountActorLabel(principal, actor)
+		principalEmail = strings.TrimSpace(principal.Email)
+		principalAuthType = strings.TrimSpace(principal.AuthType)
+		principalSession = principal.SessionID != nil
 	}
+	log.Printf(
+		"recording assign request stream_id=%d server_id=%q actor=%q host=%s origin=%q referer=%q principal_email=%q principal_auth_type=%q principal_session=%t",
+		streamID,
+		serverID,
+		actor,
+		strings.TrimSpace(r.Host),
+		strings.TrimSpace(r.Header.Get("Origin")),
+		strings.TrimSpace(r.Header.Get("Referer")),
+		principalEmail,
+		principalAuthType,
+		principalSession,
+	)
 
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
@@ -901,17 +920,21 @@ func (s *Server) handleRecordingStreamAssign(w http.ResponseWriter, r *http.Requ
 	}
 	result, status, err := s.assignRecordingStreamTx(r.Context(), tx, stream, serverID, actor, reason)
 	if err != nil {
+		log.Printf("recording assign error stream_id=%d server_id=%q actor=%q err=%v", streamID, serverID, actor, err)
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if status > 0 {
+		log.Printf("recording assign conflict stream_id=%d server_id=%q actor=%q status=%d result=%v", streamID, serverID, actor, status, result)
 		util.WriteJSON(w, status, result)
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
+		log.Printf("recording assign commit error stream_id=%d server_id=%q actor=%q err=%v", streamID, serverID, actor, err)
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit assign tx: %v", err))
 		return
 	}
+	log.Printf("recording assign success stream_id=%d server_id=%q actor=%q", streamID, serverID, actor)
 	util.WriteJSON(w, http.StatusOK, result)
 }
 
