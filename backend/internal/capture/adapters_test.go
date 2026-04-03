@@ -2,6 +2,8 @@ package capture
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -180,5 +182,38 @@ func TestYouTubeRelayResolveAcceptsRelayPullURL(t *testing.T) {
 	}
 	if src.URL != "http://10.77.0.2:18080/relay/123?token=abc" {
 		t.Fatalf("url=%q", src.URL)
+	}
+}
+
+func TestHLSResolveFollowsIndirectBodyAndRedirectToM3U8(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	mux.HandleFunc("/manifest.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\n"))
+	})
+	mux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, server.URL+"/manifest.m3u8", http.StatusFound)
+	})
+	mux.HandleFunc("/indirect!hls", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(server.URL + "/redirect\n"))
+	})
+
+	a := &hlsLiveAdapter{}
+	src, err := a.Resolve(context.Background(), StreamSpec{
+		StreamURL: server.URL + "/indirect!hls",
+	})
+	if err != nil {
+		t.Fatalf("resolve failed: %v", err)
+	}
+	if src.Mode != ModeHLSLive {
+		t.Fatalf("mode=%q want %q", src.Mode, ModeHLSLive)
+	}
+	if src.URL != server.URL+"/manifest.m3u8" {
+		t.Fatalf("url=%q want %q", src.URL, server.URL+"/manifest.m3u8")
 	}
 }
