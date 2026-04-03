@@ -1563,7 +1563,7 @@
         <option value="">all tags</option>
       </select>
       <select id="recModeFilter" style="min-width:170px;">
-        <option value="">capture type: all</option>
+        <option value="">all capture types</option>
       </select>
       <select id="recCountryFilter" style="min-width:160px;">
         <option value="">all countries</option>
@@ -2297,6 +2297,10 @@ function renderLatinizedLabel(raw, emptyLabel = '-') {
   return `<span>${esc(parts.primary)}</span><span class="muted fs10">${esc(parts.secondary)}</span>`;
 }
 
+function compareOptionLabels(a, b) {
+  return String(a || '').localeCompare(String(b || ''), undefined, { numeric: true, sensitivity: 'base' });
+}
+
 const APPROX_PLACE_RULES = [
   { label: 'Seoul', lat: 37.5665, lon: 126.9780, radiusM: 18000, terms: ['seoul', '서울'] },
   { label: 'Busan', lat: 35.1796, lon: 129.0756, radiusM: 22000, terms: ['busan', '부산'] },
@@ -2485,15 +2489,16 @@ function refreshTagFilterSelectOptions() {
   const update = (sel, emptyLabel, formatOptionLabel = (tag) => tag) => {
     if (!sel) return;
     const prev = String(sel.value || '');
+    const sortedTags = knownStreamTags.slice().sort((a, b) => compareOptionLabels(formatOptionLabel(a), formatOptionLabel(b)));
     sel.innerHTML = `<option value="">${esc(emptyLabel)}</option>` +
-      knownStreamTags.map((tag) => `<option value="${esc(tag)}"${tag === prev ? ' selected' : ''}>${esc(formatOptionLabel(tag))}</option>`).join('');
+      sortedTags.map((tag) => `<option value="${esc(tag)}"${tag === prev ? ' selected' : ''}>${esc(formatOptionLabel(tag))}</option>`).join('');
     if (prev && !knownStreamTags.includes(prev)) {
       sel.innerHTML += `<option value="${esc(prev)}" selected>${esc(formatOptionLabel(prev))}</option>`;
       sel.value = prev;
     }
   };
-  update(streamTagFilter, 'include tag: any', (tag) => `include tag: ${tag}`);
-  update(streamTagExcludeFilter, 'exclude tag: none', (tag) => `exclude tag: ${tag}`);
+  update(streamTagFilter, 'any tag');
+  update(streamTagExcludeFilter, 'exclude none');
   update(recTagFilter, 'all tags');
   updateStreamFilterSummary();
 }
@@ -4433,8 +4438,12 @@ function formatStreamCadenceLabel(stream) {
 function populateCaptureTypeOptions(selectEl, allLabel) {
   if (!(selectEl instanceof HTMLSelectElement)) return;
   const prev = normalizeCaptureTypeFilter(selectEl.value);
-  const options = [`<option value="">${esc(allLabel || 'capture type: all')}</option>`]
-    .concat(CAPTURE_TYPES.map((captureType) => `<option value="${esc(captureType)}"${captureType === prev ? ' selected' : ''}>capture type: ${esc(formatCaptureTypeLabel(captureType))}</option>`));
+  const sortedCaptureTypes = CAPTURE_TYPES.slice().sort((a, b) => compareOptionLabels(formatCaptureTypeLabel(a), formatCaptureTypeLabel(b)));
+  const normalizedAllLabel = String(allLabel || '').trim().toLowerCase().startsWith('capture type:')
+    ? 'all capture types'
+    : (allLabel || 'all capture types');
+  const options = [`<option value="">${esc(normalizedAllLabel)}</option>`]
+    .concat(sortedCaptureTypes.map((captureType) => `<option value="${esc(captureType)}"${captureType === prev ? ' selected' : ''}>${esc(formatCaptureTypeLabel(captureType))}</option>`));
   selectEl.innerHTML = options.join('');
   if (!prev) selectEl.value = '';
 }
@@ -4443,7 +4452,10 @@ async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingSt
   const prev = targetSelect.value || '';
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType);
   const payload = await fetchJSON(`/api/v1/dashboard/countries?${params}`);
-  const values = (payload.items || []).map((v) => String(v)).filter((v) => v.trim().length > 0);
+  const values = (payload.items || [])
+    .map((v) => String(v))
+    .filter((v) => v.trim().length > 0)
+    .sort((a, b) => compareOptionLabels(countryDisplayLabel(a), countryDisplayLabel(b)));
   targetSelect.innerHTML = '<option value="">all countries</option>' +
     values.map((c) => `<option value="${esc(c)}"${c === prev ? ' selected' : ''}>${esc(countryDisplayLabel(c))}</option>`).join('');
   if (!values.includes(prev)) targetSelect.value = '';
@@ -4453,7 +4465,10 @@ async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState
   const prev = targetSelect.value || '';
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType);
   const payload = await fetchJSON(`/api/v1/dashboard/cities?${params}`);
-  const values = (payload.items || []).map((v) => String(v)).filter((v) => v.trim().length > 0);
+  const values = (payload.items || [])
+    .map((v) => String(v))
+    .filter((v) => v.trim().length > 0)
+    .sort((a, b) => compareOptionLabels(cityDisplayLabel(a), cityDisplayLabel(b)));
   targetSelect.innerHTML = '<option value="">all cities</option>' +
     values.map((c) => `<option value="${esc(c)}"${c === prev ? ' selected' : ''}>${esc(cityDisplayLabel(c))}</option>`).join('');
   if (!values.includes(prev)) targetSelect.value = '';
@@ -4464,9 +4479,12 @@ async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingSta
   const prev = String(targetSelect.value || '').trim().toLowerCase();
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType);
   const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`);
-  const values = (payload.items || []).map((v) => String(v).trim().toLowerCase()).filter((v) => v.length > 0);
-  targetSelect.innerHTML = '<option value="">source: all</option>' +
-    values.map((v) => `<option value="${esc(v)}"${v === prev ? ' selected' : ''}>source: ${esc(formatSourceLabel(v))}</option>`).join('');
+  const values = (payload.items || [])
+    .map((v) => String(v).trim().toLowerCase())
+    .filter((v) => v.length > 0)
+    .sort((a, b) => compareOptionLabels(formatSourceLabel(a), formatSourceLabel(b)));
+  targetSelect.innerHTML = '<option value="">all sources</option>' +
+    values.map((v) => `<option value="${esc(v)}"${v === prev ? ' selected' : ''}>${esc(formatSourceLabel(v))}</option>`).join('');
   if (!values.includes(prev)) targetSelect.value = '';
 }
 
