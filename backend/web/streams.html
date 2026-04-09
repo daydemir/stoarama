@@ -2974,10 +2974,10 @@ function renderLocalRecordCommands(stream) {
     <div class="coverage-summary">Run this command to start recording. Keep the process running while recording is needed.</div>
     <div class="coverage-summary">To stop, press <code>Ctrl + C</code> (or close the terminal) and the recording process will end.</div>
     <div class="detail-section-subtitle">Install local tooling (one-time setup):</div>
-    <div class="coverage-summary">macOS</div>
+    <div class="coverage-summary">macOS (Terminal)</div>
     <div class="coverage-summary">Install <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">Homebrew</a>, then run:</div>
     <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(command).macos)}</code></pre>
-    <div class="coverage-summary">Windows (run in PowerShell or Windows Terminal)</div>
+    <div class="coverage-summary">Windows (PowerShell or Windows Terminal)</div>
     <div class="coverage-summary">Install <a href="https://aka.ms/getwinget" target="_blank" rel="noopener noreferrer">Winget</a> via App Installer, then run:</div>
     <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(command).windows)}</code></pre>
     <div class="coverage-summary">Notes: ${esc(localRecordOutputHint(command, stream))}</div>
