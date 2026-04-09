@@ -2981,6 +2981,7 @@ function renderLocalRecordCommands(stream) {
     <div class="coverage-summary">Run this command to start recording. Keep the process running while recording is needed.</div>
     <div class="coverage-summary">To stop, press <code>Ctrl + C</code> (or close the terminal) and the recording process will end.</div>
     <div class="detail-section-subtitle">Install local tooling (one-time setup):</div>
+    <div class="coverage-summary">On macOS, install Homebrew first: <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">brew.sh</a>.</div>
     <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(command))}</code></pre>
     <div class="coverage-summary">Notes: ${esc(localRecordOutputHint(command, stream))}</div>
     <div class="coverage-summary">Use local browser cookies for private/restricted YouTube sources (command uses Chrome by default).</div>
