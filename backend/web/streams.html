@@ -2939,6 +2939,31 @@ function localRecordCommand(stream) {
   return `yt-dlp --cookies-from-browser chrome "${targetURL}"`;
 }
 
+function localRecordInstallInstructions(command) {
+  if (!command.startsWith('ffmpeg')) {
+    return [
+      'python -m pip install -U yt-dlp',
+      'brew install yt-dlp',
+      'winget install -e --id yt-dlp.yt-dlp',
+    ].join('\n');
+  }
+  return [
+    'brew install ffmpeg',
+    'sudo apt update && sudo apt install -y ffmpeg',
+    'winget install Gyan.FFmpeg',
+  ].join('\n');
+}
+
+function localRecordOutputHint(command, stream) {
+  const s = stream || {};
+  const streamID = Number(s.id || 0);
+  if (command.startsWith('ffmpeg')) {
+    const fileBase = streamID > 0 ? `stream-${streamID}` : 'stream';
+    return `This records to "${fileBase}.mp4" while the command is running.`;
+  }
+  return 'Recording output path is controlled by yt-dlp defaults unless you add -o.';
+}
+
 function renderLocalRecordCommands(stream) {
   if (!(detailLocalRecordCommands instanceof HTMLElement)) return;
   const command = localRecordCommand(stream);
@@ -2953,7 +2978,12 @@ function renderLocalRecordCommands(stream) {
       <div class="detail-section-title">Record on your computer</div>
       <div class="detail-section-subtitle">Run this on your own machine.</div>
     </div>
-    <div class="coverage-summary">Assumes you are on a local computer with common capture tools installed. Use browser cookies locally for restricted/private YouTube sources.</div>
+    <div class="coverage-summary">Run this command to start recording. Keep the process running while recording is needed.</div>
+    <div class="coverage-summary">To stop, press <code>Ctrl + C</code> (or close the terminal) and the recording process will end.</div>
+    <div class="detail-section-subtitle">Install local tooling (one-time setup):</div>
+    <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(command))}</code></pre>
+    <div class="coverage-summary">Notes: ${esc(localRecordOutputHint(command, stream))}</div>
+    <div class="coverage-summary">Use local browser cookies for private/restricted YouTube sources (command uses Chrome by default).</div>
     <pre class="command-snippet"><code class="mono fs11">${esc(command)}</code></pre>
   `;
 }
