@@ -939,6 +939,21 @@
       font-size: 11px;
       color: var(--muted);
     }
+    .command-snippet {
+      margin: 0;
+      border: 1px solid color-mix(in srgb, var(--border) 66%, transparent);
+      border-radius: 8px;
+      padding: 8px;
+      background: color-mix(in srgb, var(--bg) 82%, #021022);
+      overflow-x: auto;
+      color: var(--text);
+      line-height: 1.45;
+    }
+    .command-snippet code {
+      font-size: 11px;
+      white-space: pre-wrap;
+      font-family: var(--mono);
+    }
     .detail-kpis {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -2282,6 +2297,7 @@
         </div>
         <div id="detailSettingsAuth" class="coverage-summary">Checking session...</div>
         <div id="detailTagEditor" style="margin-top:12px;"></div>
+        <div id="detailLocalRecordCommands" style="display:none; margin-top:12px;"></div>
         <div class="action-bar" id="detailActions" style="margin-top:12px;"></div>
       </div>
     </div>
@@ -2493,6 +2509,7 @@ const detailViewCTA = $('detailViewCTA');
 const detailRecordCTA = $('detailRecordCTA');
 const detailTagEditor = $('detailTagEditor');
 const detailActions = $('detailActions');
+const detailLocalRecordCommands = $('detailLocalRecordCommands');
 const detailMainTabDetails = $('detailMainTabDetails');
 const detailMainTabClips = $('detailMainTabClips');
 const detailMainTabSettings = $('detailMainTabSettings');
@@ -2887,6 +2904,58 @@ function buildYouTubeWatchURL(stream) {
     } catch (_) {}
   }
   return '';
+}
+
+function isYouTubeSourceURL(rawURL) {
+  const value = String(rawURL || '').trim();
+  if (!value) return false;
+  try {
+    const parsed = new URL(value);
+    const host = String(parsed.hostname || '').toLowerCase();
+    return host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com' || host.endsWith('.youtube.com') || host === 'youtu.be';
+  } catch (_) {
+    return false;
+  }
+}
+
+function localRecordCommand(stream) {
+  const s = stream || {};
+  const streamID = Number(s.id || 0);
+  const captureType = String(s.capture_type || '').trim().toLowerCase();
+  const provider = String(s.provider || '').trim().toLowerCase();
+  const sourceURL = String(s.source_url || '').trim();
+  const sourcePageURL = String(s.source_page_url || '').trim();
+  const directVideo = ['hls', 'dash', 'rtsp', 'rtmp', 'http_video'].includes(captureType);
+
+  if (directVideo && sourceURL) {
+    const fileBase = streamID > 0 ? `stream-${streamID}` : 'stream';
+    return `ffmpeg -i "${sourceURL}" -c copy "${fileBase}.mp4"`;
+  }
+
+  const youtubeLike = captureType === 'youtube_watch' || provider === 'youtube' || isYouTubeSourceURL(sourceURL) || isYouTubeSourceURL(sourcePageURL);
+  if (!youtubeLike) return '';
+  const targetURL = buildYouTubeWatchURL(s) || sourcePageURL || sourceURL;
+  if (!targetURL) return '';
+  return `yt-dlp --cookies-from-browser chrome "${targetURL}"`;
+}
+
+function renderLocalRecordCommands(stream) {
+  if (!(detailLocalRecordCommands instanceof HTMLElement)) return;
+  const command = localRecordCommand(stream);
+  if (!command) {
+    detailLocalRecordCommands.style.display = 'none';
+    detailLocalRecordCommands.innerHTML = '';
+    return;
+  }
+  detailLocalRecordCommands.style.display = '';
+  detailLocalRecordCommands.innerHTML = `
+    <div class="detail-section-head">
+      <div class="detail-section-title">Record on your computer</div>
+      <div class="detail-section-subtitle">Run this on your own machine.</div>
+    </div>
+    <div class="coverage-summary">Assumes you are on a local computer with common capture tools installed. Use browser cookies locally for restricted/private YouTube sources.</div>
+    <pre class="command-snippet"><code class="mono fs11">${esc(command)}</code></pre>
+  `;
 }
 
 function sanitizeLimit(raw, fallback, min, max) {
@@ -3812,6 +3881,7 @@ function syncDetailMutationUI(stream) {
   if (detailTagEditor instanceof HTMLElement) {
     detailTagEditor.innerHTML = renderTagEditor(s, 'detail');
   }
+  renderLocalRecordCommands(s);
 }
 
 function selectedDetailClipIDs() {
