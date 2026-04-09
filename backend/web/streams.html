@@ -2942,14 +2942,12 @@ function localRecordCommand(stream) {
 function localRecordInstallInstructions(command) {
   if (!command.startsWith('ffmpeg')) {
     return [
-      'python -m pip install -U yt-dlp',
       'brew install yt-dlp',
       'winget install -e --id yt-dlp.yt-dlp',
     ].join('\n');
   }
   return [
     'brew install ffmpeg',
-    'sudo apt update && sudo apt install -y ffmpeg',
     'winget install Gyan.FFmpeg',
   ].join('\n');
 }
@@ -2981,7 +2979,7 @@ function renderLocalRecordCommands(stream) {
     <div class="coverage-summary">Run this command to start recording. Keep the process running while recording is needed.</div>
     <div class="coverage-summary">To stop, press <code>Ctrl + C</code> (or close the terminal) and the recording process will end.</div>
     <div class="detail-section-subtitle">Install local tooling (one-time setup):</div>
-    <div class="coverage-summary">On macOS, install Homebrew first: <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">brew.sh</a>.</div>
+    <div class="coverage-summary">Install <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">Homebrew</a> (macOS) or <a href="https://aka.ms/getwinget" target="_blank" rel="noopener noreferrer">Winget</a> (Windows) first.</div>
     <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(command))}</code></pre>
     <div class="coverage-summary">Notes: ${esc(localRecordOutputHint(command, stream))}</div>
     <div class="coverage-summary">Use local browser cookies for private/restricted YouTube sources (command uses Chrome by default).</div>
