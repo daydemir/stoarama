@@ -65,3 +65,20 @@ cd backend
 ```
 
 The launcher reads `SI_ENV_FILE` (default: `local/capture-server.env`).
+
+## Refresh a DO Capture Node
+
+DigitalOcean capture nodes run from the repo checked out at `/opt/stoarama`. After a capture-runtime fix lands, refresh the node and restart the service so it actually runs the new code:
+
+```bash
+sudo /opt/stoarama/backend/scripts/refresh-do-capture-node.sh main
+```
+
+This command:
+
+- fetches the target ref
+- hard-resets `/opt/stoarama` to `origin/<ref>`
+- restarts `stoarama-capture.service`
+- prints the active git SHA after restart
+
+Use this before validating direct-video fixes on assigned streams such as London `http_video` cameras.

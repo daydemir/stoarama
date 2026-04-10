@@ -2921,7 +2921,7 @@ function isYouTubeSourceURL(rawURL) {
   }
 }
 
-function localRecordCommand(stream) {
+function localRecordCommands(stream) {
   const s = stream || {};
   const streamID = Number(s.id || 0);
   const captureType = String(s.capture_type || '').trim().toLowerCase();
@@ -2932,14 +2932,31 @@ function localRecordCommand(stream) {
 
   if (directVideo && sourceURL) {
     const fileBase = streamID > 0 ? `stream-${streamID}` : 'stream';
-    return `ffmpeg -i "${sourceURL}" -c copy "${fileBase}.mp4"`;
+    return [
+      {
+        label: 'Continuous recording',
+        note: 'Runs until you stop it.',
+        command: `ffmpeg -i "${sourceURL}" -c copy "${fileBase}.mp4"`,
+      },
+      {
+        label: 'Timed sample',
+        note: 'Stops automatically after 60 seconds. Change 60 to any duration you want.',
+        command: `ffmpeg -i "${sourceURL}" -t 60 -c copy "${fileBase}-60s.mp4"`,
+      },
+    ];
   }
 
   const youtubeLike = captureType === 'youtube_watch' || provider === 'youtube' || isYouTubeSourceURL(sourceURL) || isYouTubeSourceURL(sourcePageURL);
-  if (!youtubeLike) return '';
+  if (!youtubeLike) return [];
   const targetURL = buildYouTubeWatchURL(s) || sourcePageURL || sourceURL;
-  if (!targetURL) return '';
-  return `yt-dlp --cookies-from-browser chrome "${targetURL}"`;
+  if (!targetURL) return [];
+  return [
+    {
+      label: 'Download with yt-dlp',
+      note: 'Output path follows yt-dlp defaults unless you add -o.',
+      command: `yt-dlp --cookies-from-browser chrome "${targetURL}"`,
+    },
+  ];
 }
 
 function localRecordInstallInstructions(command) {
@@ -2962,12 +2979,14 @@ function localRecordOutputHint(command, stream) {
 
 function renderLocalRecordCommands(stream) {
   if (!(detailLocalRecordCommands instanceof HTMLElement)) return;
-  const command = localRecordCommand(stream);
-  if (!command) {
+  const commands = localRecordCommands(stream);
+  if (!commands.length) {
     detailLocalRecordCommands.style.display = 'none';
     detailLocalRecordCommands.innerHTML = '';
     return;
   }
+  const primaryCommand = commands[0].command;
+  const showCookieNote = commands.some((item) => item.command.startsWith('yt-dlp'));
   detailLocalRecordCommands.style.display = '';
   detailLocalRecordCommands.innerHTML = `
     <div class="detail-section-head">
@@ -2979,13 +2998,17 @@ function renderLocalRecordCommands(stream) {
     <div class="detail-section-subtitle">Install local tooling (one-time setup):</div>
     <div class="coverage-summary">macOS (Terminal)</div>
     <div class="coverage-summary">Install <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">Homebrew</a>, then run:</div>
-    <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(command).macos)}</code></pre>
+    <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(primaryCommand).macos)}</code></pre>
     <div class="coverage-summary">Windows (PowerShell or Windows Terminal)</div>
     <div class="coverage-summary">Install <a href="https://aka.ms/getwinget" target="_blank" rel="noopener noreferrer">Winget</a> via App Installer, then run:</div>
-    <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(command).windows)}</code></pre>
-    <div class="coverage-summary">Notes: ${esc(localRecordOutputHint(command, stream))}</div>
-    <div class="coverage-summary">Use local browser cookies for private/restricted YouTube sources (command uses Chrome by default).</div>
-    <pre class="command-snippet"><code class="mono fs11">${esc(command)}</code></pre>
+    <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(primaryCommand).windows)}</code></pre>
+    <div class="coverage-summary">Notes: ${esc(localRecordOutputHint(primaryCommand, stream))}</div>
+    ${showCookieNote ? '<div class="coverage-summary">Use local browser cookies for private/restricted YouTube sources (command uses Chrome by default).</div>' : ''}
+    ${commands.map((item) => `
+      <div class="detail-section-subtitle">${esc(item.label)}</div>
+      <div class="coverage-summary">${esc(item.note)}</div>
+      <pre class="command-snippet"><code class="mono fs11">${esc(item.command)}</code></pre>
+    `).join('')}
   `;
 }
 
