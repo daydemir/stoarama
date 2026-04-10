@@ -1024,6 +1024,34 @@ func (s *Server) handleRecordingStreamState(w http.ResponseWriter, r *http.Reque
 	if actor == "" {
 		actor = "api.recording_state"
 	}
+
+	hasAuth := false
+	serviceToken := strings.TrimSpace(s.cfg.ServiceToken)
+	if serviceToken != "" {
+		got := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(got, "Bearer ") {
+			token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
+			if token != "" && token == serviceToken {
+				hasAuth = true
+			}
+		}
+	}
+	if !hasAuth {
+		if principal, err := s.authenticateAccountSessionRequest(r); err == nil {
+			hasAuth = true
+			ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
+			r = r.WithContext(ctx)
+		}
+	}
+	if state == model.RecordingStateOff && !hasAuth {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if state == model.RecordingStateOn && !hasAuth {
+		actor = "public.recording_state"
+		reason = "public recording state start request"
+	}
+
 	if principal, ok := accountPrincipalFromContext(r.Context()); ok {
 		actor = accountActorLabel(principal, actor)
 	}

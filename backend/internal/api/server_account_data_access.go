@@ -92,8 +92,8 @@ func (s *Server) handleDataAccessSpec(w http.ResponseWriter, r *http.Request) {
 				Key:         "recording_state",
 				Method:      http.MethodPost,
 				Path:        "/api/v1/recording/streams/{id}/state",
-				Auth:        "session",
-				Description: "Set desired recording state and apply assignment changes from a signed-in browser session.",
+				Auth:        "session (off), public (on)",
+				Description: "Set desired recording state: start requires no session, stop still requires a session or service token.",
 			},
 			{
 				Key:         "recording_assign",
