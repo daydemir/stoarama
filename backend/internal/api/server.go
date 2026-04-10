@@ -651,57 +651,26 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reload stream: %v", err))
 		return
 	}
-	assignment, existed, err := loadRecordingAssignmentTx(r.Context(), tx, id)
+	shouldAutoAssignRecording := updated.RecordingState == model.RecordingStateOn &&
+		((recordingStateChanged && targetRecordingState == model.RecordingStateOn) || captureProfileChanged || req.RecordingState != nil)
+	result, status, err := s.reconcileStreamRecordingAssignments(
+		r.Context(),
+		tx,
+		updated.ID,
+		"api.streams_patch",
+		"recording enabled",
+		sourceChangeReason,
+		current,
+		updated,
+		shouldAutoAssignRecording,
+	)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load assignment: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if streamSourceChanged(current, updated) {
-		metadata := map[string]any{}
-		if existed {
-			metadata["assignment_server_id"] = assignment.ServerID
-			metadata["assignment_revision"] = assignment.Revision
-		}
-		if err := insertStreamSourceRevisionTx(r.Context(), tx, streamSourceRevisionInput{
-			Actor:    "api.streams_patch",
-			Reason:   sourceChangeReason,
-			Previous: current,
-			Current:  updated,
-			Metadata: metadata,
-		}); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert stream source revision: %v", err))
-			return
-		}
-	}
-	if existed {
-		if streamSourceChanged(current, updated) {
-			if err := s.resetYouTubeRelayRouteForSourceChangeTx(r.Context(), tx, updated, assignment, "api.streams_patch", sourceChangeReason); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reset youtube relay route after source change: %v", err))
-				return
-			}
-		}
-		issues := buildRecordingAssignmentAuditIssues(updated, assignment, nil)
-		if len(issues) > 0 {
-			if _, _, err := s.unassignRecordingStreamTx(r.Context(), tx, id, "api.streams_patch", issues[0].Code); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("clear invalid assignment: %v", err))
-				return
-			}
-			existed = false
-		}
-	}
-	shouldAutoAssignRecording := updated.RecordingState == model.RecordingStateOn &&
-		!existed &&
-		((recordingStateChanged && targetRecordingState == model.RecordingStateOn) || captureProfileChanged || req.RecordingState != nil)
-	if shouldAutoAssignRecording {
-		result, status, err := s.assignRecordingStreamTx(r.Context(), tx, updated, "", "api.streams_patch", "recording enabled")
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if status > 0 {
-			util.WriteJSON(w, status, result)
-			return
-		}
+	if status > 0 {
+		util.WriteJSON(w, status, result)
+		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit stream update: %v", err))
@@ -713,6 +682,62 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, stream)
+}
+
+func (s *Server) reconcileStreamRecordingAssignments(
+	ctx context.Context,
+	tx pgx.Tx,
+	streamID int64,
+	actor string,
+	assignReason string,
+	sourceChangeReason string,
+	current model.Stream,
+	updated model.Stream,
+	shouldAutoAssign bool,
+) (map[string]any, int, error) {
+	assignment, existed, err := loadRecordingAssignmentTx(ctx, tx, streamID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("load assignment: %w", err)
+	}
+	sourceChanged := streamSourceChanged(current, updated)
+	if sourceChanged {
+		metadata := map[string]any{}
+		if existed {
+			metadata["assignment_server_id"] = assignment.ServerID
+			metadata["assignment_revision"] = assignment.Revision
+		}
+		if err := insertStreamSourceRevisionTx(ctx, tx, streamSourceRevisionInput{
+			Actor:    actor,
+			Reason:   sourceChangeReason,
+			Previous: current,
+			Current:  updated,
+			Metadata: metadata,
+		}); err != nil {
+			return nil, 0, fmt.Errorf("insert stream source revision: %w", err)
+		}
+	}
+	if existed {
+		if sourceChanged {
+			if err := s.resetYouTubeRelayRouteForSourceChangeTx(ctx, tx, updated, assignment, actor, sourceChangeReason); err != nil {
+				return nil, 0, fmt.Errorf("reset youtube relay route after source change: %w", err)
+			}
+		}
+		issues := buildRecordingAssignmentAuditIssues(updated, assignment, nil)
+		if len(issues) > 0 {
+			if _, _, err := s.unassignRecordingStreamTx(ctx, tx, streamID, actor, issues[0].Code); err != nil {
+				return nil, 0, fmt.Errorf("clear invalid assignment: %w", err)
+			}
+			existed = false
+		}
+	}
+	if shouldAutoAssign && updated.RecordingState == model.RecordingStateOn && !existed {
+		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", actor, assignReason)
+		if err != nil {
+			return nil, 0, err
+		}
+		return result, status, nil
+	}
+	return nil, 0, nil
 }
 
 func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
@@ -896,7 +921,13 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	current, err := s.getStreamByID(r.Context(), id)
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin update stream capture patch tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	current, err := s.loadStreamForAssignmentTx(r.Context(), tx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "stream not found")
@@ -941,7 +972,13 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid execution_config_json: %v", err))
 		return
 	}
-	res, err := s.pool.Exec(r.Context(), `
+	if normalizedExecutionClass, ok := capture.NormalizeExecutionClass(profile.ExecutionClass); ok && normalizedExecutionClass == capture.ExecutionClassImagePoll {
+		if current.RecordingState == model.RecordingStateOn {
+			util.WriteError(w, http.StatusBadRequest, "image_poll recording is deprecated; clip-native recording only")
+			return
+		}
+	}
+	_, err = tx.Exec(r.Context(), `
 		UPDATE streams
 		SET source_family=$2, capture_type=$3, execution_class=$4, capture_family=$5, expected_fps=$6, expected_image_interval_sec=$7, execution_config_jsonb=$8, updated_at=now()
 		WHERE id=$1
@@ -950,8 +987,32 @@ func (s *Server) handleStreamsCapturePatch(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update stream capture: %v", err))
 		return
 	}
-	if res.RowsAffected() == 0 {
-		util.WriteError(w, http.StatusNotFound, "stream not found")
+	updated, err := s.loadStreamForAssignmentTx(r.Context(), tx, id)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reload stream: %v", err))
+		return
+	}
+	result, status, err := s.reconcileStreamRecordingAssignments(
+		r.Context(),
+		tx,
+		updated.ID,
+		"api.streams_capture_patch",
+		"capture profile updated",
+		"stream capture updated",
+		current,
+		updated,
+		updated.RecordingState == model.RecordingStateOn,
+	)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if status > 0 {
+		util.WriteJSON(w, status, result)
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit stream capture patch: %v", err))
 		return
 	}
 	stream, err := s.getStreamByID(r.Context(), id)
