@@ -2698,6 +2698,9 @@ let streamsView = 'table';      // 'table' | 'map'
 let streamPageSize = Number(localStorage.getItem('streamPageSize') || '100');
 let streamSortBy = 'avg_people_per_inferenced_capture';
 let streamSortDir = 'desc';
+let overviewRecordingCapacity = 0;
+let overviewStreamsTotal = 0;
+let overviewRecordingOn = 0;
 if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
 streamPageSizeEl.value = String(streamPageSize);
 
@@ -5025,13 +5028,9 @@ async function loadOverview() {
     fetchJSON('/api/v1/dashboard/queue-health'),
   ]);
   streamAllTotal = Number(ov.streams_total || 0);
-  const chips = [
-    ['streams', ov.streams_total],
-    ['recording', ov.recording_on],
-  ];
-  metricsRow.innerHTML = chips.map(([label, val]) =>
-    `<span class="metric-chip">${esc(label)} <b>${esc(String(val ?? 0))}</b></span>`
-  ).join('');
+  overviewStreamsTotal = Number(ov.streams_total || 0);
+  overviewRecordingOn = Number(ov.recording_on || 0);
+  renderOverviewMetricChips();
   if (overviewSummaryChips) {
     overviewSummaryChips.innerHTML = [
       queueChip('streams', ov.streams_total),
@@ -5054,6 +5053,16 @@ async function loadOverview() {
     ].join('');
   }
   setOverviewStatus(`recording on ${Number(ov.recording_on || 0)} · backlog ${Number(qh.inference_backlog_frames || 0)}`, 'ok');
+}
+
+function renderOverviewMetricChips() {
+  metricsRow.innerHTML = [
+    ['streams', overviewStreamsTotal],
+    ['recording', overviewRecordingOn],
+    ['recording capacity', overviewRecordingCapacity],
+  ].map(([label, val]) =>
+    `<span class="metric-chip">${esc(label)} <b>${esc(String(val ?? 0))}</b></span>`
+  ).join('');
 }
 
 function queueChip(label, value) {
@@ -6489,7 +6498,10 @@ function renderRecordingCapacityRows(items) {
 
 async function loadRecordingCapacity() {
   const payload = await fetchJSON('/api/v1/dashboard/recording/capacity');
-  renderRecordingCapacityRows(payload.items || []);
+  const capacityItems = payload && Array.isArray(payload.items) ? payload.items : [];
+  overviewRecordingCapacity = capacityItems.reduce((acc, it) => acc + Number(it && it.max_active || 0), 0);
+  renderOverviewMetricChips();
+  renderRecordingCapacityRows(capacityItems);
 }
 
 function normalizeCanonicalValue(raw) {
