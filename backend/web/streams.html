@@ -2253,7 +2253,7 @@
       <div class="detail-section-card">
         <div class="detail-section-head">
           <div class="detail-section-title">Recorded Clips</div>
-          <div class="detail-section-subtitle">Browse clips for this stream and prepare authenticated downloads in place.</div>
+          <div class="detail-section-subtitle">Browse recorded clips for this stream and prepare downloads.</div>
         </div>
         <div id="detailClipsAuth" class="coverage-summary">Checking session...</div>
         <div class="clip-toolbar" style="margin-top:12px;">
@@ -2268,7 +2268,7 @@
           </div>
         </div>
         <div id="detailClipsStatus" class="status-text" style="margin-top:8px;"></div>
-        <div id="detailClipsEmpty" class="coverage-summary">Select a signed-in account to browse clips for this stream.</div>
+        <div id="detailClipsEmpty" class="coverage-summary">No clips are available yet for this stream.</div>
         <div id="detailClipsTableWrap" class="tbl-wrap" style="display:none; margin-top:10px;">
           <table>
             <thead>
@@ -3782,11 +3782,7 @@ function syncAuthDependentUI() {
     syncDetailMutationUI(detailRecordingData.stream);
   }
   if (detailStreamID) {
-    if (hasAuthCapability('can_download_clips')) {
-      void refreshDetailClips();
-    } else {
-      renderDetailClips([]);
-    }
+    void refreshDetailClips();
   }
 }
 
@@ -3819,8 +3815,8 @@ function syncDetailAuthState() {
   const signInURL = accountRedirectURL();
   if (detailClipsAuth instanceof HTMLElement) {
     detailClipsAuth.innerHTML = signedIn
-      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Clip downloads stay scoped to this stream.`
-      : `Clip downloads require a signed-in account. <a href="${signInURL}">Sign in</a> to prepare downloads.`;
+      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Clip downloads are available for this stream.`
+      : `Clip browsing is public. <a href="${signInURL}">Sign in</a> for download history and account-specific actions.`;
   }
   if (detailSettingsAuth instanceof HTMLElement) {
     detailSettingsAuth.innerHTML = signedIn
@@ -3918,7 +3914,7 @@ function selectedDetailClipIDs() {
 function updateDetailClipSelectionState() {
   const selected = selectedDetailClipIDs();
   if (detailDownloadSelectedBtn instanceof HTMLButtonElement) {
-    detailDownloadSelectedBtn.disabled = selected.length === 0 || !hasAuthCapability('can_download_clips');
+    detailDownloadSelectedBtn.disabled = selected.length === 0;
   }
   if (detailClipSelectPageCheckbox instanceof HTMLInputElement) {
     const pageIDs = detailClipItems.map((item) => Number(item.id || 0)).filter((id) => id > 0);
@@ -3929,14 +3925,6 @@ function updateDetailClipSelectionState() {
 function renderDetailClips(items) {
   detailClipItems = Array.isArray(items) ? items : [];
   if (!(detailClipsRows instanceof HTMLElement)) return;
-  if (!hasAuthCapability('can_download_clips')) {
-    detailClipsRows.innerHTML = '';
-    if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = 'none';
-    if (detailClipsEmpty instanceof HTMLElement) detailClipsEmpty.style.display = '';
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Sign in to browse recorded clips.';
-    updateDetailClipSelectionState();
-    return;
-  }
   if (!detailStreamID) {
     detailClipsRows.innerHTML = '';
     if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = 'none';
