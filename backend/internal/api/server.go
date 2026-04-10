@@ -282,8 +282,8 @@ func (s *Server) router() http.Handler {
 		})
 
 		api.Group(func(recordingWrites chi.Router) {
-			recordingWrites.Use(s.requireRecordingMutationAuth)
 			recordingWrites.Post("/recording/streams/{id}/state", s.handleRecordingStreamState)
+			recordingWrites.Use(s.requireRecordingMutationAuth)
 			recordingWrites.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
 			recordingWrites.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 		})

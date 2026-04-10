@@ -1534,7 +1534,7 @@
       <article class="recording-cta-card">
         <div class="overview-card-title">Request Recording</div>
         <h3>Ask Stoarama to record a stream for you.</h3>
-        <p>Use the active recording list below to turn on supported streams, or sign in if you need account-scoped recording actions.</p>
+        <p>Use the active recording list below to turn on supported streams. Sign in for session-scoped stop/unassign actions.</p>
         <div><a href="/account">Open account session</a></div>
       </article>
       <article class="recording-cta-card">
@@ -2721,7 +2721,7 @@ async function refreshTopbarAccountStatus() {
     if (topbarAdminLink instanceof HTMLAnchorElement) {
       topbarAdminLink.style.display = 'none';
     }
-    topbarAccountStatus.innerHTML = `<a href="${accountHref}">Sign in for recording</a>`;
+    topbarAccountStatus.innerHTML = `<a href="${accountHref}">Sign in for protected recording actions</a>`;
   }
 }
 
