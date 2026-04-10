@@ -69,6 +69,26 @@ func (s *Server) handleDataAccessSpec(w http.ResponseWriter, r *http.Request) {
 				Description: "Load public stream detail, including preview-oriented metadata.",
 			},
 			{
+				Key:         "clip_list",
+				Method:      http.MethodGet,
+				Path:        "/api/v1/streams/{id}/clips",
+				Auth:        "public",
+				Description: "Browse recorded clips for one stream without signing in.",
+				Query: map[string]string{
+					"limit":  "page size",
+					"offset": "page offset",
+				},
+				Limit: 200,
+			},
+			{
+				Key:         "clip_download_prepare",
+				Method:      http.MethodPost,
+				Path:        "/api/v1/clips/download-prepare",
+				Auth:        "public",
+				Description: "Prepare up to 120 clip downloads for a selected stream without signing in.",
+				Limit:       accountClipBatchLimit,
+			},
+			{
 				Key:         "account_clip_list",
 				Method:      http.MethodGet,
 				Path:        "/api/v1/account/streams/{id}/clips",
@@ -85,7 +105,7 @@ func (s *Server) handleDataAccessSpec(w http.ResponseWriter, r *http.Request) {
 				Method:      http.MethodPost,
 				Path:        "/api/v1/account/clips/download-prepare",
 				Auth:        "account",
-				Description: "Prepare up to 120 authenticated clip downloads for a selected stream.",
+				Description: "Prepare up to 120 clip downloads for a selected stream with session or API key auth.",
 				Limit:       accountClipBatchLimit,
 			},
 			{
@@ -114,6 +134,14 @@ func (s *Server) handleDataAccessSpec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountStreamClipsList(w http.ResponseWriter, r *http.Request) {
+	s.handleStreamClipsList(w, r)
+}
+
+func (s *Server) handlePublicStreamClipsList(w http.ResponseWriter, r *http.Request) {
+	s.handleStreamClipsList(w, r)
+}
+
+func (s *Server) handleStreamClipsList(w http.ResponseWriter, r *http.Request) {
 	streamID, ok := parseInt64Path(w, r, "id")
 	if !ok {
 		return
@@ -144,6 +172,14 @@ func (s *Server) handleAccountStreamClipsList(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) handleAccountClipDownloadPrepare(w http.ResponseWriter, r *http.Request) {
+	s.handleClipDownloadPrepare(w, r)
+}
+
+func (s *Server) handlePublicClipDownloadPrepare(w http.ResponseWriter, r *http.Request) {
+	s.handleClipDownloadPrepare(w, r)
+}
+
+func (s *Server) handleClipDownloadPrepare(w http.ResponseWriter, r *http.Request) {
 	var req accountClipDownloadPrepareRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())

@@ -208,6 +208,8 @@ func (s *Server) router() http.Handler {
 		api.Group(func(public chi.Router) {
 			public.Get("/data-access-spec", s.handleDataAccessSpec)
 			public.Get("/source-candidates", s.handleSourceCandidatesList)
+			public.Get("/streams/{id}/clips", s.handlePublicStreamClipsList)
+			public.Post("/clips/download-prepare", s.handlePublicClipDownloadPrepare)
 			public.Get("/recording/assignments", s.handleRecordingAssignmentsList)
 			public.Get("/pipelines", s.handlePipelinesList)
 			public.Get("/pipeline-versions", s.handlePipelineVersionsList)

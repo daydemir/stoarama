@@ -3984,13 +3984,13 @@ function renderDetailClips(items) {
 }
 
 async function refreshDetailClips() {
-  if (!hasAuthCapability('can_download_clips') || !detailStreamID) {
+  if (!detailStreamID) {
     renderDetailClips([]);
     return;
   }
   if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Loading clips...';
   try {
-    const payload = await fetchJSON(`/api/v1/account/streams/${detailStreamID}/clips?limit=${detailClipLimit}&offset=${detailClipOffset}`);
+    const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/clips?limit=${detailClipLimit}&offset=${detailClipOffset}`);
     renderDetailClips(Array.isArray(payload.items) ? payload.items : []);
   } catch (err) {
     renderDetailClips([]);
@@ -4000,17 +4000,13 @@ async function refreshDetailClips() {
 
 async function prepareDetailClipDownloads() {
   const ids = selectedDetailClipIDs();
-  if (!hasAuthCapability('can_download_clips')) {
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Sign in to prepare clip downloads.';
-    return;
-  }
   if (!ids.length) {
     if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Select at least one clip.';
     return;
   }
   if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Preparing downloads...';
   try {
-    const payload = await fetchJSON('/api/v1/account/clips/download-prepare', {
+    const payload = await fetchJSON('/api/v1/clips/download-prepare', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ stream_id: detailStreamID, segment_ids: ids }),
