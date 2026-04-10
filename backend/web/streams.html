@@ -2293,7 +2293,7 @@
       <div class="detail-section-card">
         <div class="detail-section-head">
           <div class="detail-section-title">Stream Settings</div>
-          <div class="detail-section-subtitle">Configure tags and recording actions for this stream. Changes require a signed-in account.</div>
+        <div class="detail-section-subtitle">Start recording is available without sign-in. Sign in to stop, unassign, and edit tags.</div>
         </div>
         <div id="detailSettingsAuth" class="coverage-summary">Checking session...</div>
         <div id="detailTagEditor" style="margin-top:12px;"></div>
@@ -3499,8 +3499,8 @@ async function setStreamRecordingState(streamID, recordingState) {
   if (normalized !== 'on' && normalized !== 'off') {
     throw new Error('recording_state must be on or off');
   }
-  if (!hasAuthCapability('can_toggle_recording')) {
-    throw new Error(authStatusMessage('toggle recording'));
+  if (normalized === 'off' && !hasAuthCapability('can_toggle_recording')) {
+    throw new Error(authStatusMessage('stop recording'));
   }
   try {
     if (normalized === 'off') {
@@ -3824,8 +3824,8 @@ function syncDetailAuthState() {
   }
   if (detailSettingsAuth instanceof HTMLElement) {
     detailSettingsAuth.innerHTML = signedIn
-      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Recording changes use your browser session.`
-      : `Recording changes require a signed-in account. <a href="${signInURL}">Sign in</a> first.`;
+      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Stop/unassign actions use your browser session.`
+      : `Start recording is available without sign-in. <a href="${signInURL}">Sign in</a> to stop/unassign recordings or edit tags.`;
   }
 }
 
@@ -3861,10 +3861,10 @@ function renderRecordingToggleControl(stream, options = {}) {
   const buttonLabelOff = detailMode ? 'Turn Recording Off' : 'Turn Off';
   const canStartRecording = supportsClipRecording(s);
   const state = String(s.recording_state || 'off').trim().toLowerCase();
-  const canToggle = hasAuthCapability('can_toggle_recording');
+  const canStop = hasAuthCapability('can_toggle_recording');
   const disabledTitle = recordingToggleHintText();
   if (state === 'on') {
-    const buttonHTML = canToggle
+    const buttonHTML = canStop
       ? `<button class="btn-sm" ${actionAttr}="${actionOff}" data-id="${s.id}">${buttonLabelOff}</button>`
       : renderDisabledButton(buttonLabelOff, disabledTitle);
     return `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;">${buttonHTML}</div>`;
@@ -3872,9 +3872,7 @@ function renderRecordingToggleControl(stream, options = {}) {
   if (!canStartRecording) {
     return '<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>';
   }
-  const buttonHTML = canToggle
-    ? `<button class="btn-sm" ${actionAttr}="${actionOn}" data-id="${s.id}">${buttonLabelOn}</button>`
-    : renderDisabledButton(buttonLabelOn, disabledTitle);
+  const buttonHTML = `<button class="btn-sm" ${actionAttr}="${actionOn}" data-id="${s.id}">${buttonLabelOn}</button>`;
   return `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${buttonHTML}</div>`;
 }
 
@@ -3883,9 +3881,7 @@ function syncDetailMutationUI(stream) {
   const s = stream || {};
   const youtubeWatchURL = buildYouTubeWatchURL(s);
   const preferredViewURL = buildPreferredViewURL(s);
-  const recordThisStreamHTML = hasAuthCapability('can_toggle_recording')
-    ? `<a href="/recording?stream_id=${s.id}"><button class="btn-sm">Record This Stream</button></a>`
-    : renderDisabledButton('Record This Stream', recordingToggleHintText());
+  const recordThisStreamHTML = `<a href="/recording?stream_id=${s.id}"><button class="btn-sm">Record This Stream</button></a>`;
   if (detailRecordCTA instanceof HTMLAnchorElement) {
     detailRecordCTA.href = `/recording?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
   }
