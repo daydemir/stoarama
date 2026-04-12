@@ -405,30 +405,26 @@ func (s *Server) queryClipAvailabilityHours(ctx context.Context, streamID int64,
 	day = day.UTC()
 	rows, err := s.pool.Query(ctx, `
 		WITH hours AS (
-			SELECT generate_series($2::timestamptz, $2::timestamptz + interval '23 hours', interval '1 hour') AS hour_start
-		),
-		stats AS (
 			SELECT
-				date_trunc('hour', cs.segment_start_at) AS hour_start,
-				COUNT(*)::bigint AS clip_count,
-				COALESCE(SUM(cs.duration_ms)::bigint, 0) AS total_duration_ms,
-				COALESCE(SUM(mo.size_bytes)::bigint, 0) AS total_size_bytes
-			FROM capture_segments cs
-			JOIN media_objects mo ON mo.id = cs.media_object_id
-			WHERE cs.stream_id=$1
-			  AND cs.capture_status='success'
-			  AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
-			  AND cs.segment_start_at >= $2
-			  AND cs.segment_start_at < $2 + interval '1 day'
-			GROUP BY 1
+				gs.hour_start,
+				gs.hour_start + interval '1 hour' AS hour_end
+			FROM generate_series($2::timestamptz, $2::timestamptz + interval '23 hours', interval '1 hour') AS gs(hour_start)
 		)
 		SELECT
 			h.hour_start,
-			COALESCE(s.clip_count, 0)::bigint,
-			COALESCE(s.total_duration_ms, 0)::bigint,
-			COALESCE(s.total_size_bytes, 0)::bigint
+			COUNT(mo.id)::bigint,
+			COALESCE(SUM(cs.duration_ms) FILTER (WHERE mo.id IS NOT NULL)::bigint, 0),
+			COALESCE(SUM(mo.size_bytes)::bigint, 0)
 		FROM hours h
-		LEFT JOIN stats s ON s.hour_start = h.hour_start
+		LEFT JOIN capture_segments cs
+		  ON cs.stream_id=$1
+		 AND cs.capture_status='success'
+		 AND cs.segment_end_at > h.hour_start
+		 AND cs.segment_start_at < h.hour_end
+		LEFT JOIN media_objects mo
+		  ON mo.id = cs.media_object_id
+		 AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
+		GROUP BY h.hour_start
 		ORDER BY h.hour_start ASC
 	`, streamID, day)
 	if err != nil {

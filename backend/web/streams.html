@@ -4038,9 +4038,34 @@ function setDetailClipViewMode(mode, opts = {}) {
   if (opts.syncURL !== false) syncDetailURL({ replace: opts.replaceURL === true });
 }
 
-function formatClipTimeInput(hour) {
-  const h = Math.max(0, Math.min(23, Math.floor(Number(hour) || 0)));
-  return `${String(h).padStart(2, '0')}:00`;
+function formatClipMinuteInput(minutes) {
+  const normalized = ((Math.floor(Number(minutes) || 0) % (24 * 60)) + (24 * 60)) % (24 * 60);
+  const hour = Math.floor(normalized / 60);
+  const minute = normalized % 60;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function clipTimeInputMinutes(raw) {
+  const parts = String(raw || '').split(':').map((v) => Number(v));
+  if (parts.length < 2 || !Number.isFinite(parts[0]) || !Number.isFinite(parts[1])) {
+    throw new Error('invalid clip time');
+  }
+  return (Math.floor(parts[0]) * 60) + Math.floor(parts[1]);
+}
+
+function setClipRangeInputs(from, to) {
+  if (!(from instanceof Date) || !(to instanceof Date) || !Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+    throw new Error('invalid clip range');
+  }
+  if (detailClipRangeDay instanceof HTMLSelectElement) detailClipRangeDay.value = from.toISOString().slice(0, 10);
+  if (detailClipRangeStart instanceof HTMLInputElement) detailClipRangeStart.value = from.toISOString().slice(11, 16);
+  if (detailClipRangeEnd instanceof HTMLInputElement) detailClipRangeEnd.value = to.toISOString().slice(11, 16);
+}
+
+function setClipRangeFromBucket(bucket) {
+  const from = new Date(bucket && bucket.hour_start || '');
+  if (!Number.isFinite(from.getTime())) throw new Error('invalid clip hour bucket');
+  setClipRangeInputs(from, new Date(from.getTime() + 60 * 60 * 1000));
 }
 
 function selectedClipRange() {
@@ -4049,8 +4074,11 @@ function selectedClipRange() {
   const end = String(detailClipRangeEnd && detailClipRangeEnd.value || '').trim();
   if (!day || !start || !end) throw new Error('select a day, start time, and end time');
   const from = new Date(`${day}T${start}:00Z`);
-  const to = new Date(`${day}T${end}:00Z`);
+  let to = new Date(`${day}T${end}:00Z`);
   if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) throw new Error('invalid clip range');
+  if (clipTimeInputMinutes(end) <= clipTimeInputMinutes(start)) {
+    to = new Date(to.getTime() + 24 * 60 * 60 * 1000);
+  }
   if (to <= from) throw new Error('end time must be after start time');
   if (to.getTime() - from.getTime() > CLIP_RANGE_MAX_MS) throw new Error('clip range cannot exceed 4 hours');
   return { from, to };
@@ -4081,17 +4109,10 @@ function renderClipRangeSummary(payload = null) {
 
 function syncClipRangeEndLimit() {
   if (!(detailClipRangeStart instanceof HTMLInputElement) || !(detailClipRangeEnd instanceof HTMLInputElement)) return;
-  const startParts = String(detailClipRangeStart.value || '').split(':').map((v) => Number(v));
-  if (startParts.length < 2 || !Number.isFinite(startParts[0]) || !Number.isFinite(startParts[1])) return;
-  const maxMinutes = Math.min((24 * 60) - 1, startParts[0] * 60 + startParts[1] + 240);
-  const endParts = String(detailClipRangeEnd.value || '').split(':').map((v) => Number(v));
-  const endMinutes = endParts.length >= 2 && Number.isFinite(endParts[0]) && Number.isFinite(endParts[1])
-    ? endParts[0] * 60 + endParts[1]
-    : maxMinutes;
-  const nextMinutes = Math.min(Math.max(startParts[0] * 60 + startParts[1] + 30, endMinutes), maxMinutes);
-  const hour = Math.floor(nextMinutes / 60);
-  const minute = nextMinutes % 60;
-  detailClipRangeEnd.value = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  let startMinutes;
+  try { startMinutes = clipTimeInputMinutes(detailClipRangeStart.value); } catch (_) { return; }
+  const nextMinutes = startMinutes + 60;
+  detailClipRangeEnd.value = formatClipMinuteInput(nextMinutes);
 }
 
 function renderClipHourBuckets(items) {
@@ -4121,18 +4142,13 @@ async function loadClipAvailability(day = '') {
     const from = new Date(pendingClipRangeFrom);
     const to = new Date(pendingClipRangeTo);
     if (Number.isFinite(from.getTime()) && Number.isFinite(to.getTime())) {
-      if (detailClipRangeDay instanceof HTMLSelectElement) detailClipRangeDay.value = from.toISOString().slice(0, 10);
-      if (detailClipRangeStart instanceof HTMLInputElement) detailClipRangeStart.value = from.toISOString().slice(11, 16);
-      if (detailClipRangeEnd instanceof HTMLInputElement) detailClipRangeEnd.value = to.toISOString().slice(11, 16);
+      setClipRangeInputs(from, to);
     }
     pendingClipRangeFrom = '';
     pendingClipRangeTo = '';
   } else if (detailClipRangeStart instanceof HTMLInputElement && detailClipRangeEnd instanceof HTMLInputElement) {
     const firstHour = (Array.isArray(payload.hour_buckets) ? payload.hour_buckets : []).find((item) => Number(item.clip_count || 0) > 0);
-    const date = new Date(firstHour && firstHour.hour_start || '');
-    const hour = Number.isFinite(date.getTime()) ? date.getUTCHours() : 0;
-    detailClipRangeStart.value = formatClipTimeInput(hour);
-    detailClipRangeEnd.value = hour >= 23 ? '23:59' : formatClipTimeInput(hour + 1);
+    if (firstHour) setClipRangeFromBucket(firstHour);
   }
   renderClipHourBuckets(Array.isArray(payload.hour_buckets) ? payload.hour_buckets : []);
   renderClipRangeSummary();
@@ -9158,8 +9174,12 @@ if (detailClipHourBuckets) detailClipHourBuckets.addEventListener('click', (e) =
   if (!(btn instanceof HTMLElement)) return;
   const hour = Number(btn.getAttribute('data-hour'));
   if (!Number.isFinite(hour)) return;
-  if (detailClipRangeStart instanceof HTMLInputElement) detailClipRangeStart.value = formatClipTimeInput(hour);
-  if (detailClipRangeEnd instanceof HTMLInputElement) detailClipRangeEnd.value = hour >= 23 ? '23:59' : formatClipTimeInput(hour + 1);
+  const buckets = detailClipAvailability && Array.isArray(detailClipAvailability.hour_buckets) ? detailClipAvailability.hour_buckets : [];
+  const bucket = buckets.find((item) => {
+    const date = new Date(item && item.hour_start || '');
+    return Number.isFinite(date.getTime()) && date.getUTCHours() === Math.floor(hour);
+  });
+  if (bucket) setClipRangeFromBucket(bucket);
   renderClipHourBuckets(detailClipAvailability && Array.isArray(detailClipAvailability.hour_buckets) ? detailClipAvailability.hour_buckets : []);
   renderClipRangeSummary();
   syncDetailURL({ replace: true });
