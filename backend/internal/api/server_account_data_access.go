@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -13,6 +16,7 @@ import (
 const accountClipBatchLimit = 120
 const clipRangeMaxDuration = 4 * time.Hour
 const clipRangeMaxItems = 5000
+const clipAvailabilityDays = 45
 
 type clipTimeRange struct {
 	From time.Time `json:"captured_from"`
@@ -364,6 +368,25 @@ func parseClipTimeRange(fromRaw, toRaw string) (*clipTimeRange, error) {
 }
 
 func (s *Server) queryClipAvailabilityDays(ctx context.Context, streamID int64) ([]clipAvailabilityDay, error) {
+	var latestDay time.Time
+	if err := s.pool.QueryRow(ctx, `
+		SELECT (cs.segment_start_at AT TIME ZONE 'UTC')::date AS day
+		FROM capture_segments cs
+		JOIN media_objects mo ON mo.id = cs.media_object_id
+		WHERE cs.stream_id=$1
+		  AND cs.capture_status='success'
+		  AND cs.media_object_id IS NOT NULL
+		  AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
+		ORDER BY cs.segment_start_at DESC, cs.id DESC
+		LIMIT 1
+	`, streamID).Scan(&latestDay); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return []clipAvailabilityDay{}, nil
+		}
+		return nil, fmt.Errorf("query latest clip day: %w", err)
+	}
+	windowStart := latestDay.UTC().AddDate(0, 0, -(clipAvailabilityDays - 1))
+	windowEnd := latestDay.UTC().AddDate(0, 0, 1)
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 			(cs.segment_start_at AT TIME ZONE 'UTC')::date AS day,
@@ -372,10 +395,13 @@ func (s *Server) queryClipAvailabilityDays(ctx context.Context, streamID int64) 
 		JOIN media_objects mo ON mo.id = cs.media_object_id
 		WHERE cs.stream_id=$1
 		  AND cs.capture_status='success'
+		  AND cs.media_object_id IS NOT NULL
 		  AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
+		  AND cs.segment_start_at >= $2
+		  AND cs.segment_start_at < $3
 		GROUP BY 1
 		ORDER BY 1 DESC
-	`, streamID)
+	`, streamID, windowStart, windowEnd)
 	if err != nil {
 		return nil, fmt.Errorf("query clip availability days: %w", err)
 	}
@@ -403,6 +429,7 @@ func (s *Server) queryClipAvailabilityHours(ctx context.Context, streamID int64,
 		return nil, fmt.Errorf("invalid day; expected YYYY-MM-DD")
 	}
 	day = day.UTC()
+	dayEnd := day.AddDate(0, 0, 1)
 	rows, err := s.pool.Query(ctx, `
 		WITH hours AS (
 			SELECT
@@ -419,14 +446,17 @@ func (s *Server) queryClipAvailabilityHours(ctx context.Context, streamID int64,
 		LEFT JOIN capture_segments cs
 		  ON cs.stream_id=$1
 		 AND cs.capture_status='success'
+		 AND cs.media_object_id IS NOT NULL
 		 AND cs.segment_end_at > h.hour_start
 		 AND cs.segment_start_at < h.hour_end
+		 AND cs.segment_end_at > $2
+		 AND cs.segment_start_at < $3
 		LEFT JOIN media_objects mo
 		  ON mo.id = cs.media_object_id
 		 AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
 		GROUP BY h.hour_start
 		ORDER BY h.hour_start ASC
-	`, streamID, day)
+	`, streamID, day, dayEnd)
 	if err != nil {
 		return nil, fmt.Errorf("query clip availability hours: %w", err)
 	}

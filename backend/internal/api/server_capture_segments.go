@@ -366,6 +366,7 @@ func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 		where = append(where, fmt.Sprintf("cs.capture_status = $%d", len(args)))
 	}
 	if opts.RequireDownloadable {
+		where = append(where, "cs.media_object_id IS NOT NULL")
 		where = append(where, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL")
 	}
 	return where, args
