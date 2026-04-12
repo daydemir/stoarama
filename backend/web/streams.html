@@ -4084,6 +4084,45 @@ function selectedClipRange() {
   return { from, to };
 }
 
+function hasSelectedClipRange() {
+  try {
+    selectedClipRange();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function ensureClipRangeDayOption(day) {
+  const value = String(day || '').trim();
+  if (!value || !(detailClipRangeDay instanceof HTMLSelectElement)) return;
+  const exists = Array.from(detailClipRangeDay.options).some((option) => option.value === value);
+  if (!exists) detailClipRangeDay.add(new Option(value, value));
+}
+
+function applyPendingClipRange() {
+  if (!pendingClipRangeFrom || !pendingClipRangeTo) return false;
+  const from = new Date(pendingClipRangeFrom);
+  const to = new Date(pendingClipRangeTo);
+  pendingClipRangeFrom = '';
+  pendingClipRangeTo = '';
+  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) return false;
+  ensureClipRangeDayOption(from.toISOString().slice(0, 10));
+  setClipRangeInputs(from, to);
+  return true;
+}
+
+async function ensureDefaultClipRange() {
+  if (applyPendingClipRange() || hasSelectedClipRange()) return;
+  const clips = await fetchRecentClips(1);
+  const latest = clips.length ? clips[0] : null;
+  const end = new Date(captureTimestampValue(latest) || new Date());
+  if (!Number.isFinite(end.getTime())) throw new Error('latest clip has invalid timestamp');
+  const from = new Date(end.getTime() - 60 * 60 * 1000);
+  ensureClipRangeDayOption(from.toISOString().slice(0, 10));
+  setClipRangeInputs(from, end);
+}
+
 function clipRangeParams(range) {
   const params = new URLSearchParams();
   params.set('captured_from', range.from.toISOString());
@@ -4136,17 +4175,13 @@ async function loadClipAvailability(day = '') {
   const days = Array.isArray(payload.days) ? payload.days : [];
   if (detailClipRangeDay instanceof HTMLSelectElement) {
     detailClipRangeDay.innerHTML = days.map((item) => `<option value="${esc(String(item.day || ''))}">${esc(String(item.day || ''))} (${Number(item.clip_count || 0)})</option>`).join('');
-    detailClipRangeDay.value = String(payload.selected_day || (days[0] && days[0].day) || '');
+    const selectedDay = String(payload.selected_day || (days[0] && days[0].day) || '');
+    ensureClipRangeDayOption(selectedDay);
+    detailClipRangeDay.value = selectedDay;
   }
   if (pendingClipRangeFrom && pendingClipRangeTo) {
-    const from = new Date(pendingClipRangeFrom);
-    const to = new Date(pendingClipRangeTo);
-    if (Number.isFinite(from.getTime()) && Number.isFinite(to.getTime())) {
-      setClipRangeInputs(from, to);
-    }
-    pendingClipRangeFrom = '';
-    pendingClipRangeTo = '';
-  } else if (detailClipRangeStart instanceof HTMLInputElement && detailClipRangeEnd instanceof HTMLInputElement) {
+    applyPendingClipRange();
+  } else if (!hasSelectedClipRange() && detailClipRangeStart instanceof HTMLInputElement && detailClipRangeEnd instanceof HTMLInputElement) {
     const firstHour = (Array.isArray(payload.hour_buckets) ? payload.hour_buckets : []).find((item) => Number(item.clip_count || 0) > 0);
     if (firstHour) setClipRangeFromBucket(firstHour);
   }
@@ -4295,7 +4330,12 @@ function setDetailMainView(which, opts = {}) {
   if (detailMainView === 'clips') {
     setDetailClipViewMode(detailClipViewMode, { syncURL: false });
     void (async () => {
-      if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) await loadClipAvailability();
+      if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) {
+        await ensureDefaultClipRange();
+        void loadClipAvailability(String(detailClipRangeDay && detailClipRangeDay.value || '')).catch((err) => {
+          if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
+        });
+      }
       await refreshDetailClips();
     })().catch((err) => {
       if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
@@ -9144,7 +9184,10 @@ if (detailHealthHours instanceof HTMLSelectElement) detailHealthHours.addEventLi
 if (detailClipModeRangeBtn) detailClipModeRangeBtn.addEventListener('click', () => {
   setDetailClipViewMode(CLIP_VIEW_MODE.RANGE);
   void (async () => {
-    await loadClipAvailability(String(detailClipRangeDay && detailClipRangeDay.value || ''));
+    await ensureDefaultClipRange();
+    void loadClipAvailability(String(detailClipRangeDay && detailClipRangeDay.value || '')).catch((err) => {
+      if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
+    });
     await refreshDetailClips();
   })().catch((err) => {
     if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);

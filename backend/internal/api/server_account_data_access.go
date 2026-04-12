@@ -372,11 +372,9 @@ func (s *Server) queryClipAvailabilityDays(ctx context.Context, streamID int64) 
 	if err := s.pool.QueryRow(ctx, `
 		SELECT (cs.segment_start_at AT TIME ZONE 'UTC')::date AS day
 		FROM capture_segments cs
-		JOIN media_objects mo ON mo.id = cs.media_object_id
 		WHERE cs.stream_id=$1
 		  AND cs.capture_status='success'
 		  AND cs.media_object_id IS NOT NULL
-		  AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
 		ORDER BY cs.segment_start_at DESC, cs.id DESC
 		LIMIT 1
 	`, streamID).Scan(&latestDay); err != nil {
@@ -392,11 +390,9 @@ func (s *Server) queryClipAvailabilityDays(ctx context.Context, streamID int64) 
 			(cs.segment_start_at AT TIME ZONE 'UTC')::date AS day,
 			COUNT(*)::bigint AS clip_count
 		FROM capture_segments cs
-		JOIN media_objects mo ON mo.id = cs.media_object_id
 		WHERE cs.stream_id=$1
 		  AND cs.capture_status='success'
 		  AND cs.media_object_id IS NOT NULL
-		  AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
 		  AND cs.segment_start_at >= $2
 		  AND cs.segment_start_at < $3
 		GROUP BY 1
@@ -439,9 +435,9 @@ func (s *Server) queryClipAvailabilityHours(ctx context.Context, streamID int64,
 		)
 		SELECT
 			h.hour_start,
-			COUNT(mo.id)::bigint,
-			COALESCE(SUM(cs.duration_ms) FILTER (WHERE mo.id IS NOT NULL)::bigint, 0),
-			COALESCE(SUM(mo.size_bytes)::bigint, 0)
+			COUNT(cs.id)::bigint,
+			COALESCE(SUM(cs.duration_ms)::bigint, 0),
+			0::bigint
 		FROM hours h
 		LEFT JOIN capture_segments cs
 		  ON cs.stream_id=$1
@@ -451,9 +447,6 @@ func (s *Server) queryClipAvailabilityHours(ctx context.Context, streamID int64,
 		 AND cs.segment_start_at < h.hour_end
 		 AND cs.segment_end_at > $2
 		 AND cs.segment_start_at < $3
-		LEFT JOIN media_objects mo
-		  ON mo.id = cs.media_object_id
-		 AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
 		GROUP BY h.hour_start
 		ORDER BY h.hour_start ASC
 	`, streamID, day, dayEnd)
