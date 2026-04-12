@@ -154,6 +154,8 @@ func (s *Server) handleStreamClipsList(w http.ResponseWriter, r *http.Request) {
 	offset := parseIntQuery(r, "offset", 0, 0, 1_000_000)
 	items, err := s.queryCaptureSegments(r.Context(), captureSegmentQueryOptions{
 		StreamID:                    streamID,
+		CaptureStatus:               "success",
+		RequireDownloadable:         true,
 		Limit:                       limit,
 		Offset:                      offset,
 		IncludeDownloadURL:          true,
@@ -206,6 +208,8 @@ func (s *Server) handleClipDownloadPrepare(w http.ResponseWriter, r *http.Reques
 	items, err := s.queryCaptureSegments(r.Context(), captureSegmentQueryOptions{
 		StreamID:                    req.StreamID,
 		SegmentIDs:                  segmentIDs,
+		CaptureStatus:               "success",
+		RequireDownloadable:         true,
 		Limit:                       len(segmentIDs),
 		Offset:                      0,
 		IncludeDownloadURL:          true,

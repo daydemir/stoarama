@@ -339,19 +339,33 @@ type captureSegmentListItem struct {
 type captureSegmentQueryOptions struct {
 	StreamID                    int64
 	SegmentIDs                  []int64
+	CaptureStatus               string
+	RequireDownloadable         bool
 	Limit                       int
 	Offset                      int
 	IncludeDownloadURL          bool
 	IncludeThumbnailDownloadURL bool
 }
 
-func (s *Server) queryCaptureSegments(ctx context.Context, opts captureSegmentQueryOptions) ([]captureSegmentListItem, error) {
+func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 	where := []string{"cs.stream_id = $1"}
 	args := []any{opts.StreamID}
 	if len(opts.SegmentIDs) > 0 {
 		args = append(args, opts.SegmentIDs)
 		where = append(where, fmt.Sprintf("cs.id = ANY($%d::bigint[])", len(args)))
 	}
+	if status := strings.TrimSpace(opts.CaptureStatus); status != "" {
+		args = append(args, status)
+		where = append(where, fmt.Sprintf("cs.capture_status = $%d", len(args)))
+	}
+	if opts.RequireDownloadable {
+		where = append(where, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL")
+	}
+	return where, args
+}
+
+func (s *Server) queryCaptureSegments(ctx context.Context, opts captureSegmentQueryOptions) ([]captureSegmentListItem, error) {
+	where, args := captureSegmentWhere(opts)
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = 100

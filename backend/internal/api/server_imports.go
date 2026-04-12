@@ -834,6 +834,10 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 		WHERE provider=$1 AND external_id=$2
 	`, provider, externalID).Scan(&existingID)
 	if err == nil {
+		current, err := s.loadStreamForAssignmentTx(r.Context(), tx, existingID)
+		if err != nil {
+			return model.Stream{}, false, fmt.Errorf("load existing imported stream: %w", err)
+		}
 		if err := ensureImportedSourceURLProviderConflictFree(r.Context(), tx, profile.SourceURL, provider, existingID); err != nil {
 			return model.Stream{}, false, err
 		}
@@ -869,6 +873,27 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 			metaBytes, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes, dedupeStrings(req.Tags),
 		); err != nil {
 			return model.Stream{}, false, fmt.Errorf("update imported stream: %w", err)
+		}
+		updated, err := s.loadStreamForAssignmentTx(r.Context(), tx, existingID)
+		if err != nil {
+			return model.Stream{}, false, fmt.Errorf("reload imported stream: %w", err)
+		}
+		result, status, err := s.reconcileStreamRecordingAssignments(
+			r.Context(),
+			tx,
+			existingID,
+			"service.stream_import",
+			"stream import updated recording assignment",
+			"stream import updated source",
+			current,
+			updated,
+			updated.RecordingState == model.RecordingStateOn,
+		)
+		if err != nil {
+			return model.Stream{}, false, err
+		}
+		if status > 0 {
+			return model.Stream{}, false, newAPIStatusError(status, "reconcile imported stream assignment: %v", result["error"])
 		}
 		if err := tx.Commit(r.Context()); err != nil {
 			return model.Stream{}, false, fmt.Errorf("commit imported stream update: %w", err)

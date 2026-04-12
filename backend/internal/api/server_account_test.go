@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -166,6 +167,31 @@ func TestBuildAccountClipFilenameUsesStreamSlugAndMimeExtension(t *testing.T) {
 	want := "seoul-square-20260324T123456Z.webm"
 	if got != want {
 		t.Fatalf("filename=%q want %q", got, want)
+	}
+}
+
+func TestCaptureSegmentWhereFiltersSuccessfulDownloadableClips(t *testing.T) {
+	where, args := captureSegmentWhere(captureSegmentQueryOptions{
+		StreamID:            17205,
+		SegmentIDs:          []int64{10, 11},
+		CaptureStatus:       "success",
+		RequireDownloadable: true,
+	})
+	joined := strings.Join(where, " AND ")
+	if !strings.Contains(joined, "cs.stream_id = $1") {
+		t.Fatalf("where=%q missing stream filter", joined)
+	}
+	if !strings.Contains(joined, "cs.id = ANY($2::bigint[])") {
+		t.Fatalf("where=%q missing segment id filter", joined)
+	}
+	if !strings.Contains(joined, "cs.capture_status = $3") {
+		t.Fatalf("where=%q missing capture status filter", joined)
+	}
+	if !strings.Contains(joined, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL") {
+		t.Fatalf("where=%q missing downloadable media filter", joined)
+	}
+	if len(args) != 3 || args[0] != int64(17205) || args[2] != "success" {
+		t.Fatalf("args=%#v want stream id, segment ids, success", args)
 	}
 }
 
