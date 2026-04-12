@@ -1090,7 +1090,7 @@ func configureYouTubeCaptureEnv(
 
 func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 || args[0] != "run" {
-		log.Fatalf("usage: stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]")
+		log.Fatalf("usage: stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --segment-target-fps 10 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]")
 	}
 	fs := flag.NewFlagSet("capture-server run", flag.ExitOnError)
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
@@ -1104,6 +1104,7 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	heartbeatSec := fs.Int("heartbeat-sec", 15, "heartbeat interval seconds")
 	leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
 	refreshSec := fs.Int("refresh-sec", cfg.CaptureTickSec, "capture reconcile interval seconds")
+	segmentTargetFPS := fs.Int("segment-target-fps", cfg.CaptureSegmentTargetFPS, "target FPS for captured video segments")
 	frameQueueSize := fs.Int("frame-queue-size", 64, "per-stream frame queue size")
 	frameEnqueueTimeoutSec := fs.Int("frame-enqueue-timeout-sec", 3, "per-stream frame enqueue timeout seconds")
 	frameWriterWorkers := fs.Int("frame-writer-workers", 2, "per-stream frame persistence workers")
@@ -1135,6 +1136,9 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if *refreshSec <= 0 {
 		log.Fatalf("--refresh-sec must be > 0")
+	}
+	if *segmentTargetFPS <= 0 {
+		log.Fatalf("--segment-target-fps must be > 0")
 	}
 	if *frameQueueSize <= 0 {
 		log.Fatalf("--frame-queue-size must be > 0")
@@ -1369,6 +1373,7 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 			FrameQueueSize:            *frameQueueSize,
 			FrameEnqueueTimeout:       time.Duration(*frameEnqueueTimeoutSec) * time.Second,
 			FrameWriterWorkers:        *frameWriterWorkers,
+			SegmentTargetFPS:          *segmentTargetFPS,
 			StreamIDs:                 streamIDs,
 			ModeAllowlist:             []capture.Mode{mode},
 			RecordingHeartbeat:        false,

@@ -87,6 +87,12 @@ variable "capture_shared_capacity" {
   default     = 6
 }
 
+variable "capture_segment_target_fps" {
+  description = "Target FPS for captured video segments."
+  type        = number
+  default     = 10
+}
+
 variable "draining_modes" {
   description = "Modes marked draining on heartbeat."
   type        = list(string)
