@@ -168,6 +168,39 @@
       gap: 10px;
       flex-wrap: wrap;
     }
+    .clip-range-panel {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      background: color-mix(in srgb, var(--panel) 90%, #000);
+      margin-top: 10px;
+    }
+    .clip-hour-grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(34px, 1fr));
+      gap: 5px;
+      margin-top: 8px;
+    }
+    .clip-hour {
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 6px 4px;
+      background: rgba(148, 163, 184, 0.08);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      cursor: pointer;
+    }
+    .clip-hour.has-clips {
+      color: var(--text);
+      border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+      background: color-mix(in srgb, var(--accent) 20%, transparent);
+    }
+    .clip-hour.active {
+      color: #001018;
+      background: var(--accent);
+      border-color: var(--accent);
+    }
     .admin-chip {
       display: none;
       align-items: center;
@@ -2253,11 +2286,15 @@
       <div class="detail-section-card">
         <div class="detail-section-head">
           <div class="detail-section-title">Recorded Clips</div>
-          <div class="detail-section-subtitle">Browse recorded clips for this stream and prepare downloads.</div>
+          <div class="detail-section-subtitle">Pick a day and a range up to 4 hours, then open every clip in that window.</div>
         </div>
         <div id="detailClipsAuth" class="coverage-summary">Checking session...</div>
         <div class="clip-toolbar" style="margin-top:12px;">
           <div class="button-row">
+            <button id="detailClipModeRangeBtn" class="primary" type="button">Range</button>
+            <button id="detailClipModeLinearBtn" class="secondary" type="button">Linear</button>
+          </div>
+          <div class="button-row" id="detailClipLinearControls">
             <button id="detailClipsReloadBtn" class="secondary" type="button">Reload</button>
             <button id="detailClipsPrevBtn" class="secondary" type="button">Previous</button>
             <button id="detailClipsNextBtn" class="secondary" type="button">Next</button>
@@ -2266,6 +2303,25 @@
             <button id="detailSelectAllClipsBtn" class="secondary" type="button">Select page</button>
             <button id="detailDownloadSelectedBtn" type="button" disabled>Download selected</button>
           </div>
+        </div>
+        <div id="detailClipRangePanel" class="clip-range-panel">
+          <div class="filter-row">
+            <label>
+              <span>Day</span>
+              <select id="detailClipRangeDay"></select>
+            </label>
+            <label>
+              <span>Start (UTC)</span>
+              <input id="detailClipRangeStart" type="time" step="1800" />
+            </label>
+            <label>
+              <span>End (UTC)</span>
+              <input id="detailClipRangeEnd" type="time" step="1800" />
+            </label>
+            <button id="detailOpenClipRangeBtn" class="primary" type="button">Open clips in range</button>
+          </div>
+          <div id="detailClipHourBuckets" class="clip-hour-grid"></div>
+          <div id="detailClipRangeSummary" class="coverage-summary">Select a day and time range.</div>
         </div>
         <div id="detailClipsStatus" class="status-text" style="margin-top:8px;"></div>
         <div id="detailClipsEmpty" class="coverage-summary">No clips are available yet for this stream.</div>
@@ -2560,6 +2616,16 @@ const detailClipsStatus = $('detailClipsStatus');
 const detailClipsEmpty = $('detailClipsEmpty');
 const detailClipsTableWrap = $('detailClipsTableWrap');
 const detailClipsRows = $('detailClipsRows');
+const detailClipModeRangeBtn = $('detailClipModeRangeBtn');
+const detailClipModeLinearBtn = $('detailClipModeLinearBtn');
+const detailClipRangePanel = $('detailClipRangePanel');
+const detailClipLinearControls = $('detailClipLinearControls');
+const detailClipRangeDay = $('detailClipRangeDay');
+const detailClipRangeStart = $('detailClipRangeStart');
+const detailClipRangeEnd = $('detailClipRangeEnd');
+const detailClipHourBuckets = $('detailClipHourBuckets');
+const detailClipRangeSummary = $('detailClipRangeSummary');
+const detailOpenClipRangeBtn = $('detailOpenClipRangeBtn');
 const detailClipsReloadBtn = $('detailClipsReloadBtn');
 const detailClipsPrevBtn = $('detailClipsPrevBtn');
 const detailClipsNextBtn = $('detailClipsNextBtn');
@@ -2736,6 +2802,12 @@ let authState = {
 let detailClipItems = [];
 let detailClipOffset = 0;
 const detailClipLimit = 25;
+const CLIP_VIEW_MODE = Object.freeze({ RANGE: 'range', LINEAR: 'linear' });
+const CLIP_RANGE_MAX_MS = 4 * 60 * 60 * 1000;
+let detailClipViewMode = CLIP_VIEW_MODE.RANGE;
+let detailClipAvailability = null;
+let pendingClipRangeFrom = '';
+let pendingClipRangeTo = '';
 const DEFAULT_STREAM_SORT_BY = 'avg_people_per_inferenced_capture';
 const DEFAULT_STREAM_SORT_DIR = 'desc';
 
@@ -3948,6 +4020,124 @@ function updateDetailClipSelectionState() {
   }
 }
 
+function normalizeClipViewMode(raw) {
+  return String(raw || '').trim().toLowerCase() === CLIP_VIEW_MODE.LINEAR ? CLIP_VIEW_MODE.LINEAR : CLIP_VIEW_MODE.RANGE;
+}
+
+function setDetailClipViewMode(mode, opts = {}) {
+  detailClipViewMode = normalizeClipViewMode(mode);
+  const isRange = detailClipViewMode === CLIP_VIEW_MODE.RANGE;
+  if (detailClipModeRangeBtn instanceof HTMLButtonElement) {
+    detailClipModeRangeBtn.className = isRange ? 'primary' : 'secondary';
+  }
+  if (detailClipModeLinearBtn instanceof HTMLButtonElement) {
+    detailClipModeLinearBtn.className = isRange ? 'secondary' : 'primary';
+  }
+  if (detailClipRangePanel instanceof HTMLElement) detailClipRangePanel.style.display = isRange ? '' : 'none';
+  if (detailClipLinearControls instanceof HTMLElement) detailClipLinearControls.style.display = isRange ? 'none' : '';
+  if (opts.syncURL !== false) syncDetailURL({ replace: opts.replaceURL === true });
+}
+
+function formatClipTimeInput(hour) {
+  const h = Math.max(0, Math.min(23, Math.floor(Number(hour) || 0)));
+  return `${String(h).padStart(2, '0')}:00`;
+}
+
+function selectedClipRange() {
+  const day = String(detailClipRangeDay && detailClipRangeDay.value || '').trim();
+  const start = String(detailClipRangeStart && detailClipRangeStart.value || '').trim();
+  const end = String(detailClipRangeEnd && detailClipRangeEnd.value || '').trim();
+  if (!day || !start || !end) throw new Error('select a day, start time, and end time');
+  const from = new Date(`${day}T${start}:00Z`);
+  const to = new Date(`${day}T${end}:00Z`);
+  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) throw new Error('invalid clip range');
+  if (to <= from) throw new Error('end time must be after start time');
+  if (to.getTime() - from.getTime() > CLIP_RANGE_MAX_MS) throw new Error('clip range cannot exceed 4 hours');
+  return { from, to };
+}
+
+function clipRangeParams(range) {
+  const params = new URLSearchParams();
+  params.set('captured_from', range.from.toISOString());
+  params.set('captured_to', range.to.toISOString());
+  return params;
+}
+
+function renderClipRangeSummary(payload = null) {
+  if (!(detailClipRangeSummary instanceof HTMLElement)) return;
+  try {
+    const range = selectedClipRange();
+    const hours = (range.to.getTime() - range.from.getTime()) / (60 * 60 * 1000);
+    const count = payload ? Number(payload.count ?? payload.total ?? 0) : null;
+    const bytes = payload ? Number(payload.total_size_bytes || 0) : 0;
+    const parts = [`${range.from.toISOString().slice(0, 16).replace('T', ' ')} UTC`, `${hours.toFixed(1)}h`];
+    if (count !== null) parts.push(`${count} clip${count === 1 ? '' : 's'}`);
+    if (bytes > 0) parts.push(formatBytes(bytes));
+    detailClipRangeSummary.textContent = parts.join(' · ');
+  } catch (err) {
+    detailClipRangeSummary.textContent = String(err);
+  }
+}
+
+function syncClipRangeEndLimit() {
+  if (!(detailClipRangeStart instanceof HTMLInputElement) || !(detailClipRangeEnd instanceof HTMLInputElement)) return;
+  const startParts = String(detailClipRangeStart.value || '').split(':').map((v) => Number(v));
+  if (startParts.length < 2 || !Number.isFinite(startParts[0]) || !Number.isFinite(startParts[1])) return;
+  const maxMinutes = Math.min((24 * 60) - 1, startParts[0] * 60 + startParts[1] + 240);
+  const endParts = String(detailClipRangeEnd.value || '').split(':').map((v) => Number(v));
+  const endMinutes = endParts.length >= 2 && Number.isFinite(endParts[0]) && Number.isFinite(endParts[1])
+    ? endParts[0] * 60 + endParts[1]
+    : maxMinutes;
+  const nextMinutes = Math.min(Math.max(startParts[0] * 60 + startParts[1] + 30, endMinutes), maxMinutes);
+  const hour = Math.floor(nextMinutes / 60);
+  const minute = nextMinutes % 60;
+  detailClipRangeEnd.value = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function renderClipHourBuckets(items) {
+  if (!(detailClipHourBuckets instanceof HTMLElement)) return;
+  const rangeHour = String(detailClipRangeStart && detailClipRangeStart.value || '00:00').slice(0, 2);
+  detailClipHourBuckets.innerHTML = (items || []).map((item) => {
+    const date = new Date(item.hour_start || '');
+    const hour = Number.isFinite(date.getTime()) ? date.getUTCHours() : 0;
+    const count = Number(item.clip_count || 0);
+    const active = String(hour).padStart(2, '0') === rangeHour;
+    return `<button class="clip-hour${count > 0 ? ' has-clips' : ''}${active ? ' active' : ''}" type="button" data-hour="${hour}">${String(hour).padStart(2, '0')}<br>${count}</button>`;
+  }).join('');
+}
+
+async function loadClipAvailability(day = '') {
+  if (!detailStreamID) return;
+  const params = new URLSearchParams();
+  if (day) params.set('day', day);
+  const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/clips/availability${params.toString() ? `?${params}` : ''}`);
+  detailClipAvailability = payload;
+  const days = Array.isArray(payload.days) ? payload.days : [];
+  if (detailClipRangeDay instanceof HTMLSelectElement) {
+    detailClipRangeDay.innerHTML = days.map((item) => `<option value="${esc(String(item.day || ''))}">${esc(String(item.day || ''))} (${Number(item.clip_count || 0)})</option>`).join('');
+    detailClipRangeDay.value = String(payload.selected_day || (days[0] && days[0].day) || '');
+  }
+  if (pendingClipRangeFrom && pendingClipRangeTo) {
+    const from = new Date(pendingClipRangeFrom);
+    const to = new Date(pendingClipRangeTo);
+    if (Number.isFinite(from.getTime()) && Number.isFinite(to.getTime())) {
+      if (detailClipRangeDay instanceof HTMLSelectElement) detailClipRangeDay.value = from.toISOString().slice(0, 10);
+      if (detailClipRangeStart instanceof HTMLInputElement) detailClipRangeStart.value = from.toISOString().slice(11, 16);
+      if (detailClipRangeEnd instanceof HTMLInputElement) detailClipRangeEnd.value = to.toISOString().slice(11, 16);
+    }
+    pendingClipRangeFrom = '';
+    pendingClipRangeTo = '';
+  } else if (detailClipRangeStart instanceof HTMLInputElement && detailClipRangeEnd instanceof HTMLInputElement) {
+    const firstHour = (Array.isArray(payload.hour_buckets) ? payload.hour_buckets : []).find((item) => Number(item.clip_count || 0) > 0);
+    const date = new Date(firstHour && firstHour.hour_start || '');
+    const hour = Number.isFinite(date.getTime()) ? date.getUTCHours() : 0;
+    detailClipRangeStart.value = formatClipTimeInput(hour);
+    detailClipRangeEnd.value = hour >= 23 ? '23:59' : formatClipTimeInput(hour + 1);
+  }
+  renderClipHourBuckets(Array.isArray(payload.hour_buckets) ? payload.hour_buckets : []);
+  renderClipRangeSummary();
+}
+
 function renderDetailClips(items) {
   detailClipItems = Array.isArray(items) ? items : [];
   if (!(detailClipsRows instanceof HTMLElement)) return;
@@ -3963,7 +4153,9 @@ function renderDetailClips(items) {
     detailClipsRows.innerHTML = '';
     if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = 'none';
     if (detailClipsEmpty instanceof HTMLElement) detailClipsEmpty.style.display = '';
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = `No clips found for stream #${detailStreamID} at offset ${detailClipOffset}.`;
+    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = detailClipViewMode === CLIP_VIEW_MODE.RANGE
+      ? `No clips found in selected range for stream #${detailStreamID}.`
+      : `No clips found for stream #${detailStreamID} at offset ${detailClipOffset}.`;
     updateDetailClipSelectionState();
     return;
   }
@@ -3971,7 +4163,7 @@ function renderDetailClips(items) {
   if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = '';
   detailClipsRows.innerHTML = detailClipItems.map((item) => {
     const start = formatDateTimeShort(item.segment_start_at || item.captured_at || item.created_at || '');
-    const duration = Number(item.duration_sec || 0);
+    const duration = Number(item.duration_sec || 0) || Number(item.duration_ms || 0) / 1000;
     const format = String(item.mime_type || item.format || 'clip');
     const size = Number(item.size_bytes || 0);
     const previewURL = String(item.preview_url || item.thumbnail_url || item.download_url || '');
@@ -3992,7 +4184,9 @@ function renderDetailClips(items) {
     input.addEventListener('change', updateDetailClipSelectionState);
   });
   if (detailClipsStatus instanceof HTMLElement) {
-    detailClipsStatus.textContent = `Showing ${detailClipItems.length} clip${detailClipItems.length === 1 ? '' : 's'} for stream #${detailStreamID} (offset ${detailClipOffset}).`;
+    detailClipsStatus.textContent = detailClipViewMode === CLIP_VIEW_MODE.RANGE
+      ? `Showing ${detailClipItems.length} clip${detailClipItems.length === 1 ? '' : 's'} in selected range.`
+      : `Showing ${detailClipItems.length} clip${detailClipItems.length === 1 ? '' : 's'} for stream #${detailStreamID} (offset ${detailClipOffset}).`;
   }
   updateDetailClipSelectionState();
 }
@@ -4004,8 +4198,14 @@ async function refreshDetailClips() {
   }
   if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Loading clips...';
   try {
-    const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/clips?limit=${detailClipLimit}&offset=${detailClipOffset}`);
+    const payload = detailClipViewMode === CLIP_VIEW_MODE.RANGE
+      ? await fetchJSON(`/api/v1/streams/${detailStreamID}/clips/range?${clipRangeParams(selectedClipRange())}`)
+      : await fetchJSON(`/api/v1/streams/${detailStreamID}/clips?limit=${detailClipLimit}&offset=${detailClipOffset}`);
     renderDetailClips(Array.isArray(payload.items) ? payload.items : []);
+    if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) {
+      renderClipRangeSummary(payload);
+      syncDetailURL({ replace: true });
+    }
   } catch (err) {
     renderDetailClips([]);
     if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
@@ -4077,7 +4277,13 @@ function setDetailMainView(which, opts = {}) {
   if (detailClipsSection) detailClipsSection.style.display = detailMainView === 'clips' ? '' : 'none';
   if (detailSettingsSection) detailSettingsSection.style.display = detailMainView === 'settings' ? '' : 'none';
   if (detailMainView === 'clips') {
-    void refreshDetailClips();
+    setDetailClipViewMode(detailClipViewMode, { syncURL: false });
+    void (async () => {
+      if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) await loadClipAvailability();
+      await refreshDetailClips();
+    })().catch((err) => {
+      if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
+    });
   }
   updateDetailTabHrefs();
   if (detailStreamID && opts.syncURL !== false) {
@@ -6052,6 +6258,9 @@ function normalizeDetailSubtab(raw) {
 function applyDetailRouteStateFromURL(params) {
   detailMainView = normalizeDetailMainTab(params && params.get('tab'));
   detailView = normalizeDetailSubtab(params && params.get('subtab'));
+  detailClipViewMode = normalizeClipViewMode(params && params.get('clip_mode'));
+  pendingClipRangeFrom = String(params && params.get('captured_from') || '').trim();
+  pendingClipRangeTo = String(params && params.get('captured_to') || '').trim();
   const healthHoursParam = Number((params && params.get('health_hours')) || '');
   if (Number.isFinite(healthHoursParam) && healthHoursParam > 0) {
     detailHealthHoursWindow = normalizeHealthHoursWindow(healthHoursParam);
@@ -6075,6 +6284,16 @@ function syncDetailURL(opts = {}) {
   const params = new URLSearchParams();
   if (detailMainView !== 'details') {
     params.set('tab', detailMainView);
+  }
+  if (detailMainView === 'clips') {
+    params.set('clip_mode', detailClipViewMode);
+    if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) {
+      try {
+        const range = selectedClipRange();
+        params.set('captured_from', range.from.toISOString());
+        params.set('captured_to', range.to.toISOString());
+      } catch (_) {}
+    }
   }
   if (detailMainView === 'details' && detailView !== 'coverage') {
     params.set('subtab', detailView);
@@ -8905,6 +9124,49 @@ if (detailHealthHours instanceof HTMLSelectElement) detailHealthHours.addEventLi
     try { await loadDetailHealth(); }
     catch (err) { setHealthStatus(String(err), 'err'); }
   }
+});
+if (detailClipModeRangeBtn) detailClipModeRangeBtn.addEventListener('click', () => {
+  setDetailClipViewMode(CLIP_VIEW_MODE.RANGE);
+  void (async () => {
+    await loadClipAvailability(String(detailClipRangeDay && detailClipRangeDay.value || ''));
+    await refreshDetailClips();
+  })().catch((err) => {
+    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
+  });
+});
+if (detailClipModeLinearBtn) detailClipModeLinearBtn.addEventListener('click', () => {
+  setDetailClipViewMode(CLIP_VIEW_MODE.LINEAR);
+  void refreshDetailClips();
+});
+if (detailClipRangeDay) detailClipRangeDay.addEventListener('change', () => {
+  void loadClipAvailability(String(detailClipRangeDay.value || '')).catch((err) => {
+    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
+  });
+});
+if (detailClipRangeStart) detailClipRangeStart.addEventListener('change', () => {
+  syncClipRangeEndLimit();
+  renderClipHourBuckets(detailClipAvailability && Array.isArray(detailClipAvailability.hour_buckets) ? detailClipAvailability.hour_buckets : []);
+  renderClipRangeSummary();
+  syncDetailURL({ replace: true });
+});
+if (detailClipRangeEnd) detailClipRangeEnd.addEventListener('change', () => {
+  renderClipRangeSummary();
+  syncDetailURL({ replace: true });
+});
+if (detailClipHourBuckets) detailClipHourBuckets.addEventListener('click', (e) => {
+  const btn = e.target instanceof HTMLElement ? e.target.closest('[data-hour]') : null;
+  if (!(btn instanceof HTMLElement)) return;
+  const hour = Number(btn.getAttribute('data-hour'));
+  if (!Number.isFinite(hour)) return;
+  if (detailClipRangeStart instanceof HTMLInputElement) detailClipRangeStart.value = formatClipTimeInput(hour);
+  if (detailClipRangeEnd instanceof HTMLInputElement) detailClipRangeEnd.value = hour >= 23 ? '23:59' : formatClipTimeInput(hour + 1);
+  renderClipHourBuckets(detailClipAvailability && Array.isArray(detailClipAvailability.hour_buckets) ? detailClipAvailability.hour_buckets : []);
+  renderClipRangeSummary();
+  syncDetailURL({ replace: true });
+});
+if (detailOpenClipRangeBtn) detailOpenClipRangeBtn.addEventListener('click', () => {
+  setDetailClipViewMode(CLIP_VIEW_MODE.RANGE);
+  void refreshDetailClips();
 });
 if (detailClipsReloadBtn) detailClipsReloadBtn.addEventListener('click', () => { void refreshDetailClips(); });
 if (detailClipsPrevBtn) detailClipsPrevBtn.addEventListener('click', () => {

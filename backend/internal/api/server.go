@@ -156,6 +156,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/api-keys", s.handleAccountAPIKeysList)
 			account.Post("/api-keys", s.handleAccountAPIKeysCreate)
 			account.Post("/api-keys/{id}/revoke", s.handleAccountAPIKeyRevoke)
+			account.Get("/streams/{id}/clips/availability", s.handleAccountStreamClipsAvailability)
+			account.Get("/streams/{id}/clips/range", s.handleAccountStreamClipsRange)
 			account.Get("/streams/{id}/clips", s.handleAccountStreamClipsList)
 			account.Post("/clips/download-prepare", s.handleAccountClipDownloadPrepare)
 			account.Get("/nodes", s.handleAccountNodesList)
@@ -208,6 +210,8 @@ func (s *Server) router() http.Handler {
 		api.Group(func(public chi.Router) {
 			public.Get("/data-access-spec", s.handleDataAccessSpec)
 			public.Get("/source-candidates", s.handleSourceCandidatesList)
+			public.Get("/streams/{id}/clips/availability", s.handlePublicStreamClipsAvailability)
+			public.Get("/streams/{id}/clips/range", s.handlePublicStreamClipsRange)
 			public.Get("/streams/{id}/clips", s.handlePublicStreamClipsList)
 			public.Post("/clips/download-prepare", s.handlePublicClipDownloadPrepare)
 			public.Get("/recording/assignments", s.handleRecordingAssignmentsList)

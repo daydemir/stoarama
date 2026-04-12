@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,6 +11,25 @@ import (
 )
 
 const accountClipBatchLimit = 120
+const clipRangeMaxDuration = 4 * time.Hour
+const clipRangeMaxItems = 5000
+
+type clipTimeRange struct {
+	From time.Time `json:"captured_from"`
+	To   time.Time `json:"captured_to"`
+}
+
+type clipAvailabilityDay struct {
+	Day       string `json:"day"`
+	ClipCount int64  `json:"clip_count"`
+}
+
+type clipAvailabilityHour struct {
+	HourStart       time.Time `json:"hour_start"`
+	ClipCount       int64     `json:"clip_count"`
+	TotalDurationMs int64     `json:"total_duration_ms"`
+	TotalSizeBytes  int64     `json:"total_size_bytes"`
+}
 
 type dataAccessSpecEndpoint struct {
 	Key         string            `json:"key"`
@@ -137,8 +157,24 @@ func (s *Server) handleAccountStreamClipsList(w http.ResponseWriter, r *http.Req
 	s.handleStreamClipsList(w, r)
 }
 
+func (s *Server) handleAccountStreamClipsAvailability(w http.ResponseWriter, r *http.Request) {
+	s.handleStreamClipsAvailability(w, r)
+}
+
+func (s *Server) handleAccountStreamClipsRange(w http.ResponseWriter, r *http.Request) {
+	s.handleStreamClipsRange(w, r)
+}
+
 func (s *Server) handlePublicStreamClipsList(w http.ResponseWriter, r *http.Request) {
 	s.handleStreamClipsList(w, r)
+}
+
+func (s *Server) handlePublicStreamClipsAvailability(w http.ResponseWriter, r *http.Request) {
+	s.handleStreamClipsAvailability(w, r)
+}
+
+func (s *Server) handlePublicStreamClipsRange(w http.ResponseWriter, r *http.Request) {
+	s.handleStreamClipsRange(w, r)
 }
 
 func (s *Server) handleStreamClipsList(w http.ResponseWriter, r *http.Request) {
@@ -152,25 +188,267 @@ func (s *Server) handleStreamClipsList(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := parseIntQuery(r, "limit", 60, 1, 200)
 	offset := parseIntQuery(r, "offset", 0, 0, 1_000_000)
-	items, err := s.queryCaptureSegments(r.Context(), captureSegmentQueryOptions{
+	clipRange, err := parseOptionalClipTimeRange(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	opts := captureSegmentQueryOptions{
 		StreamID:                    streamID,
+		TimeRange:                   clipRange,
 		CaptureStatus:               "success",
 		RequireDownloadable:         true,
 		Limit:                       limit,
 		Offset:                      offset,
 		IncludeDownloadURL:          true,
 		IncludeThumbnailDownloadURL: true,
-	})
+	}
+	total, err := s.countCaptureSegments(r.Context(), opts)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{
+	items, err := s.queryCaptureSegments(r.Context(), opts)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	payload := map[string]any{
 		"stream_id": streamID,
 		"limit":     limit,
 		"offset":    offset,
+		"total":     total,
 		"items":     items,
+	}
+	if clipRange != nil {
+		payload["captured_from"] = clipRange.From
+		payload["captured_to"] = clipRange.To
+	}
+	util.WriteJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) handleStreamClipsAvailability(w http.ResponseWriter, r *http.Request) {
+	streamID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	if _, err := s.getStreamByID(r.Context(), streamID); err != nil {
+		util.WriteError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	days, err := s.queryClipAvailabilityDays(r.Context(), streamID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	day := strings.TrimSpace(r.URL.Query().Get("day"))
+	if day == "" && len(days) > 0 {
+		day = days[0].Day
+	}
+	hours := []clipAvailabilityHour{}
+	if day != "" {
+		var err error
+		hours, err = s.queryClipAvailabilityHours(r.Context(), streamID, day)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"stream_id":     streamID,
+		"selected_day":  day,
+		"days":          days,
+		"hour_buckets":  hours,
+		"max_range_sec": int64(clipRangeMaxDuration.Seconds()),
 	})
+}
+
+func (s *Server) handleStreamClipsRange(w http.ResponseWriter, r *http.Request) {
+	streamID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	stream, err := s.getStreamByID(r.Context(), streamID)
+	if err != nil {
+		util.WriteError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	clipRange, err := parseRequiredClipTimeRange(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	opts := captureSegmentQueryOptions{
+		StreamID:            streamID,
+		TimeRange:           clipRange,
+		CaptureStatus:       "success",
+		RequireDownloadable: true,
+		Limit:               clipRangeMaxItems,
+		Offset:              0,
+		IncludeDownloadURL:  true,
+	}
+	total, err := s.countCaptureSegments(r.Context(), opts)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if total > clipRangeMaxItems {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("clip range has %d clips; max=%d", total, clipRangeMaxItems))
+		return
+	}
+	items, err := s.queryCaptureSegments(r.Context(), opts)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	totalDurationMs := int64(0)
+	totalSizeBytes := int64(0)
+	for _, item := range items {
+		totalDurationMs += item.DurationMs
+		if item.SizeBytes != nil {
+			totalSizeBytes += *item.SizeBytes
+		}
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"stream_id":         streamID,
+		"stream_slug":       stream.Slug,
+		"captured_from":     clipRange.From,
+		"captured_to":       clipRange.To,
+		"count":             len(items),
+		"total_duration_ms": totalDurationMs,
+		"total_size_bytes":  totalSizeBytes,
+		"items":             items,
+		"max_range_sec":     int64(clipRangeMaxDuration.Seconds()),
+	})
+}
+
+func parseOptionalClipTimeRange(r *http.Request) (*clipTimeRange, error) {
+	fromRaw := strings.TrimSpace(r.URL.Query().Get("captured_from"))
+	toRaw := strings.TrimSpace(r.URL.Query().Get("captured_to"))
+	if fromRaw == "" && toRaw == "" {
+		return nil, nil
+	}
+	if fromRaw == "" || toRaw == "" {
+		return nil, fmt.Errorf("captured_from and captured_to are required together")
+	}
+	return parseClipTimeRange(fromRaw, toRaw)
+}
+
+func parseRequiredClipTimeRange(r *http.Request) (*clipTimeRange, error) {
+	fromRaw := strings.TrimSpace(r.URL.Query().Get("captured_from"))
+	toRaw := strings.TrimSpace(r.URL.Query().Get("captured_to"))
+	if fromRaw == "" || toRaw == "" {
+		return nil, fmt.Errorf("captured_from and captured_to are required")
+	}
+	return parseClipTimeRange(fromRaw, toRaw)
+}
+
+func parseClipTimeRange(fromRaw, toRaw string) (*clipTimeRange, error) {
+	from, err := time.Parse(time.RFC3339Nano, fromRaw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid captured_from; expected RFC3339")
+	}
+	to, err := time.Parse(time.RFC3339Nano, toRaw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid captured_to; expected RFC3339")
+	}
+	from = from.UTC()
+	to = to.UTC()
+	if !to.After(from) {
+		return nil, fmt.Errorf("captured_to must be after captured_from")
+	}
+	if to.Sub(from) > clipRangeMaxDuration {
+		return nil, fmt.Errorf("clip range cannot exceed 4 hours")
+	}
+	return &clipTimeRange{From: from, To: to}, nil
+}
+
+func (s *Server) queryClipAvailabilityDays(ctx context.Context, streamID int64) ([]clipAvailabilityDay, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			(cs.segment_start_at AT TIME ZONE 'UTC')::date AS day,
+			COUNT(*)::bigint AS clip_count
+		FROM capture_segments cs
+		JOIN media_objects mo ON mo.id = cs.media_object_id
+		WHERE cs.stream_id=$1
+		  AND cs.capture_status='success'
+		  AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
+		GROUP BY 1
+		ORDER BY 1 DESC
+	`, streamID)
+	if err != nil {
+		return nil, fmt.Errorf("query clip availability days: %w", err)
+	}
+	defer rows.Close()
+
+	days := []clipAvailabilityDay{}
+	for rows.Next() {
+		var day time.Time
+		var item clipAvailabilityDay
+		if err := rows.Scan(&day, &item.ClipCount); err != nil {
+			return nil, fmt.Errorf("scan clip availability day: %w", err)
+		}
+		item.Day = day.UTC().Format("2006-01-02")
+		days = append(days, item)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("iterate clip availability days: %w", rows.Err())
+	}
+	return days, nil
+}
+
+func (s *Server) queryClipAvailabilityHours(ctx context.Context, streamID int64, dayRaw string) ([]clipAvailabilityHour, error) {
+	day, err := time.Parse("2006-01-02", strings.TrimSpace(dayRaw))
+	if err != nil {
+		return nil, fmt.Errorf("invalid day; expected YYYY-MM-DD")
+	}
+	day = day.UTC()
+	rows, err := s.pool.Query(ctx, `
+		WITH hours AS (
+			SELECT generate_series($2::timestamptz, $2::timestamptz + interval '23 hours', interval '1 hour') AS hour_start
+		),
+		stats AS (
+			SELECT
+				date_trunc('hour', cs.segment_start_at) AS hour_start,
+				COUNT(*)::bigint AS clip_count,
+				COALESCE(SUM(cs.duration_ms)::bigint, 0) AS total_duration_ms,
+				COALESCE(SUM(mo.size_bytes)::bigint, 0) AS total_size_bytes
+			FROM capture_segments cs
+			JOIN media_objects mo ON mo.id = cs.media_object_id
+			WHERE cs.stream_id=$1
+			  AND cs.capture_status='success'
+			  AND NULLIF(TRIM(mo.object_key), '') IS NOT NULL
+			  AND cs.segment_start_at >= $2
+			  AND cs.segment_start_at < $2 + interval '1 day'
+			GROUP BY 1
+		)
+		SELECT
+			h.hour_start,
+			COALESCE(s.clip_count, 0)::bigint,
+			COALESCE(s.total_duration_ms, 0)::bigint,
+			COALESCE(s.total_size_bytes, 0)::bigint
+		FROM hours h
+		LEFT JOIN stats s ON s.hour_start = h.hour_start
+		ORDER BY h.hour_start ASC
+	`, streamID, day)
+	if err != nil {
+		return nil, fmt.Errorf("query clip availability hours: %w", err)
+	}
+	defer rows.Close()
+
+	hours := make([]clipAvailabilityHour, 0, 24)
+	for rows.Next() {
+		var item clipAvailabilityHour
+		if err := rows.Scan(&item.HourStart, &item.ClipCount, &item.TotalDurationMs, &item.TotalSizeBytes); err != nil {
+			return nil, fmt.Errorf("scan clip availability hour: %w", err)
+		}
+		item.HourStart = item.HourStart.UTC()
+		hours = append(hours, item)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("iterate clip availability hours: %w", rows.Err())
+	}
+	return hours, nil
 }
 
 func (s *Server) handleAccountClipDownloadPrepare(w http.ResponseWriter, r *http.Request) {

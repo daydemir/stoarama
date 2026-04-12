@@ -339,6 +339,7 @@ type captureSegmentListItem struct {
 type captureSegmentQueryOptions struct {
 	StreamID                    int64
 	SegmentIDs                  []int64
+	TimeRange                   *clipTimeRange
 	CaptureStatus               string
 	RequireDownloadable         bool
 	Limit                       int
@@ -354,6 +355,12 @@ func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 		args = append(args, opts.SegmentIDs)
 		where = append(where, fmt.Sprintf("cs.id = ANY($%d::bigint[])", len(args)))
 	}
+	if opts.TimeRange != nil {
+		args = append(args, opts.TimeRange.From)
+		where = append(where, fmt.Sprintf("cs.segment_end_at > $%d", len(args)))
+		args = append(args, opts.TimeRange.To)
+		where = append(where, fmt.Sprintf("cs.segment_start_at < $%d", len(args)))
+	}
 	if status := strings.TrimSpace(opts.CaptureStatus); status != "" {
 		args = append(args, status)
 		where = append(where, fmt.Sprintf("cs.capture_status = $%d", len(args)))
@@ -362,6 +369,20 @@ func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 		where = append(where, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL")
 	}
 	return where, args
+}
+
+func (s *Server) countCaptureSegments(ctx context.Context, opts captureSegmentQueryOptions) (int64, error) {
+	where, args := captureSegmentWhere(opts)
+	var total int64
+	if err := s.pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT COUNT(*)::bigint
+		FROM capture_segments cs
+		LEFT JOIN media_objects mo ON mo.id = cs.media_object_id
+		WHERE %s
+	`, strings.Join(where, " AND ")), args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count capture segments: %w", err)
+	}
+	return total, nil
 }
 
 func (s *Server) queryCaptureSegments(ctx context.Context, opts captureSegmentQueryOptions) ([]captureSegmentListItem, error) {
