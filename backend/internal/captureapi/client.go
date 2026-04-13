@@ -57,6 +57,29 @@ type SegmentUploadIntent struct {
 	ContentType string
 }
 
+type RecordingStateUpdateRequest struct {
+	StreamID int64
+	State    model.RecordingState
+	Actor    string
+	Reason   string
+}
+
+type RecordingAssignRequest struct {
+	StreamID       int64
+	ServerID       string
+	ExecutionClass string
+	Actor          string
+	Reason         string
+}
+
+type RecordingAssignResponse struct {
+	StreamID           int64  `json:"stream_id"`
+	ServerID           string `json:"server_id"`
+	ExecutionClass     string `json:"execution_class"`
+	AssignmentRevision int64  `json:"assignment_revision"`
+	EventType          string `json:"event_type"`
+}
+
 type IngestSegmentSuccessRequest struct {
 	StreamID           int64
 	SourceKind         string
@@ -343,6 +366,42 @@ func normalizeStreamPayload(stream *model.Stream) {
 	if stream.ExecutionConfigJSON == nil {
 		stream.ExecutionConfigJSON = map[string]any{}
 	}
+}
+
+func (c *Client) SetRecordingState(ctx context.Context, req RecordingStateUpdateRequest) error {
+	if req.StreamID <= 0 {
+		return fmt.Errorf("stream_id must be > 0")
+	}
+	if req.State != model.RecordingStateOn && req.State != model.RecordingStateOff {
+		return fmt.Errorf("recording state must be off|on")
+	}
+	payload := map[string]any{
+		"recording_state": string(req.State),
+		"actor":           strings.TrimSpace(req.Actor),
+		"reason":          strings.TrimSpace(req.Reason),
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/streams/%d/state", req.StreamID), payload, nil)
+}
+
+func (c *Client) AssignRecordingStream(ctx context.Context, req RecordingAssignRequest) (RecordingAssignResponse, error) {
+	if req.StreamID <= 0 {
+		return RecordingAssignResponse{}, fmt.Errorf("stream_id must be > 0")
+	}
+	serverID := strings.TrimSpace(req.ServerID)
+	if serverID == "" {
+		return RecordingAssignResponse{}, fmt.Errorf("server_id is required")
+	}
+	payload := map[string]any{
+		"server_id":       serverID,
+		"execution_class": strings.TrimSpace(req.ExecutionClass),
+		"actor":           strings.TrimSpace(req.Actor),
+		"reason":          strings.TrimSpace(req.Reason),
+	}
+	var out RecordingAssignResponse
+	if err := c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/streams/%d/assign", req.StreamID), payload, &out); err != nil {
+		return RecordingAssignResponse{}, err
+	}
+	return out, nil
 }
 
 func normalizeExecutionClassValue(raw string) (string, error) {

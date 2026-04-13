@@ -150,3 +150,25 @@ func TestRecordingAllowedExecutionClasses_YouTubeRelayOnly(t *testing.T) {
 		t.Fatalf("allowed=%v want [%s]", allowed, capture.ExecutionClassYouTubeRelay)
 	}
 }
+
+func TestRecordingAllowedExecutionClassesWithPreference_YouTubeDirect(t *testing.T) {
+	stream := model.Stream{
+		ID:             3557,
+		Provider:       "GIGAEYES",
+		SourceURL:      "https://www.youtube.com/watch?v=abc123",
+		SourceFamily:   capture.SourceFamilyWatchPage,
+		CaptureType:    capture.CaptureTypeYouTubeWatch,
+		ExecutionClass: capture.ExecutionClassYouTubeRelay,
+		RecordingState: model.RecordingStateOn,
+	}
+	requested, allowed, err := recordingAllowedExecutionClassesWithPreference(stream, capture.ExecutionClassYouTubeDirect)
+	if err != nil {
+		t.Fatalf("recordingAllowedExecutionClassesWithPreference err=%v", err)
+	}
+	if requested != capture.ExecutionClassYouTubeDirect {
+		t.Fatalf("requested=%q want %q", requested, capture.ExecutionClassYouTubeDirect)
+	}
+	if !reflect.DeepEqual(allowed, []string{capture.ExecutionClassYouTubeDirect}) {
+		t.Fatalf("allowed=%v want [%s]", allowed, capture.ExecutionClassYouTubeDirect)
+	}
+}

@@ -158,7 +158,7 @@ func usage() {
 	  stoaramactl pipelines runs claim --id N --claimed-by WORKER [--limit 100 --lease-sec 600 --force-rerun] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs complete --claim-id N --pipeline-id P --pipeline-run-id N --frame-id N --claimed-by WORKER [--pipeline-version-id N --summary-json JSON --raw-output-json JSON --runner-info-json JSON --detections-json JSON --signals-json JSON --started-at RFC3339 --finished-at RFC3339 --force-rerun --revision-mode force_rerun] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs fail --claim-id N --pipeline-id P --pipeline-run-id N --frame-id N --claimed-by WORKER --error-text TEXT [--pipeline-version-id N --runner-info-json JSON] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source|local_recorder [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines overview [--backend-api-url URL --api-token TOKEN --include-inactive=true]
 	  stoaramactl pipelines stream-list --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines set --stream-id N --pipeline-id P --enabled=true|false [--updated-by stoaramactl --backend-api-url URL --api-token TOKEN]
@@ -1956,7 +1956,7 @@ func printDiscoveryUsage() {
 }
 
 func printRecordingUsage() {
-	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples|reconcile|supervisor> ...\n")
+	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples|mark-relay-broken|reconcile|supervisor> ...\n")
 }
 
 const relayPlaylistTailSegments = 12
@@ -4708,6 +4708,76 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 				"day=%v segment_id=%v captured_at=%v object_key=%v thumbnail=%v\n",
 				it["day"], segmentID, it["captured_at"], it["object_key"], it["thumbnail_object_key"],
 			)
+		}
+	case "mark-relay-broken":
+		fs := flag.NewFlagSet("recording mark-relay-broken", flag.ExitOnError)
+		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
+		tag := fs.String("tag", "youtube_relay_broken_2026_04", "tag to add to affected streams")
+		limit := fs.Int("limit", 500, "assignment row limit")
+		apply := fs.Bool("apply", false, "apply tag updates")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if *limit <= 0 || *limit > 2000 {
+			log.Fatalf("--limit must be between 1 and 2000")
+		}
+		tagList := normalizeTags([]string{*tag})
+		if len(tagList) != 1 {
+			log.Fatalf("--tag is required")
+		}
+		q := url.Values{}
+		q.Set("execution_class", capture.ExecutionClassYouTubeRelay)
+		q.Set("limit", strconv.Itoa(*limit))
+		q.Set("offset", "0")
+		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/recording/assignments?"+q.Encode())
+		items, _ := payload["items"].([]any)
+		results := make([]map[string]any, 0, len(items))
+		for _, raw := range items {
+			item := asMap(raw)
+			streamID := int64FromAny(item["stream_id"])
+			if streamID <= 0 {
+				continue
+			}
+			stream := loadDashboardStream(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), streamID)
+			if strings.TrimSpace(fmt.Sprint(stream["capture_type"])) != capture.CaptureTypeYouTubeWatch {
+				continue
+			}
+			if strings.TrimSpace(fmt.Sprint(stream["recording_state"])) != string(model.RecordingStateOn) {
+				continue
+			}
+			currentTags := normalizeTags(asStringSlice(stream["tags"]))
+			updatedTags := normalizeTags(append(currentTags, tagList[0]))
+			alreadyTagged := len(updatedTags) == len(currentTags)
+			if *apply && !alreadyTagged {
+				out := mustAPIRequest(ctx, http.MethodPatch, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/streams/%d", streamID), map[string]any{
+					"tags": updatedTags,
+				})
+				updatedTags = normalizeTags(asStringSlice(out["tags"]))
+			}
+			results = append(results, map[string]any{
+				"stream_id":      streamID,
+				"name":           stream["name"],
+				"slug":           stream["slug"],
+				"server_id":      item["server_id"],
+				"relay_status":   item["relay_status"],
+				"already_tagged": alreadyTagged,
+				"applied":        *apply && !alreadyTagged,
+				"tag":            tagList[0],
+				"resulting_tags": updatedTags,
+			})
+		}
+		if *asJSON {
+			printJSON(map[string]any{"tag": tagList[0], "apply": *apply, "items": results})
+			return
+		}
+		action := "dry-run"
+		if *apply {
+			action = "applied"
+		}
+		fmt.Printf("relay_broken_candidates=%d tag=%s action=%s\n", len(results), tagList[0], action)
+		for _, item := range results {
+			fmt.Printf("stream_id=%v slug=%v server_id=%v relay_status=%v applied=%v already_tagged=%v\n",
+				item["stream_id"], item["slug"], item["server_id"], item["relay_status"], item["applied"], item["already_tagged"])
 		}
 	case "reconcile":
 		runRecordingReconcile(ctx, cfg, args[1:])

@@ -12,11 +12,11 @@ import (
 
 func runNodes(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
+		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source|local_recorder [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
 		return
 	}
 	if len(args) < 1 {
-		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
+		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source|local_recorder [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
 		return
 	}
 	switch args[0] {
@@ -29,11 +29,11 @@ func runNodes(ctx context.Context, cfg config.Config, args []string) {
 
 func runNodesEnrollmentToken(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
+		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source|local_recorder [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
 		return
 	}
 	if len(args) < 1 {
-		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
+		fmt.Print("stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source|local_recorder [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]\n")
 		return
 	}
 	switch args[0] {
@@ -42,7 +42,7 @@ func runNodesEnrollmentToken(ctx context.Context, cfg config.Config, args []stri
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 		ownerEmail := fs.String("owner-email", "", "owner account email")
-		nodeType := fs.String("node-type", "", "inference_node or yt_relay_source")
+		nodeType := fs.String("node-type", "", "inference_node, yt_relay_source, or local_recorder")
 		label := fs.String("label", "", "optional label")
 		expiresAt := fs.String("expires-at", "", "optional RFC3339 expiry")
 		asJSON := fs.Bool("json", false, "print JSON")

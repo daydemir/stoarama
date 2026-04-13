@@ -72,6 +72,8 @@ func main() {
 		runAuth(os.Args[2:])
 	case "node":
 		runNode(os.Args[2:])
+	case "recording":
+		runRecording(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -88,15 +90,17 @@ func usage() {
   stoarama auth api-keys revoke --id N [--api-base-url URL --api-key KEY]
 
   stoarama node enrollment-tokens list [--api-base-url URL --api-key KEY]
-  stoarama node enrollment-tokens create --node-type yt_relay_source|inference_node [--label LABEL --expires-at RFC3339] [--api-base-url URL --api-key KEY]
+  stoarama node enrollment-tokens create --node-type yt_relay_source|inference_node|local_recorder [--label LABEL --expires-at RFC3339] [--api-base-url URL --api-key KEY]
   stoarama node enrollment-tokens revoke --id N [--api-base-url URL --api-key KEY]
- stoarama node enroll --token TOKEN --node-type yt_relay_source|inference_node [--display-name NAME --hostname HOST --platform PLATFORM --api-base-url URL]
-  stoarama node whoami [--node-type yt_relay_source|inference_node --api-base-url URL --node-token TOKEN]
-  stoarama node heartbeat [--node-type yt_relay_source|inference_node --api-base-url URL --node-token TOKEN]
-  stoarama node doctor [--node-type yt_relay_source|inference_node]
+  stoarama node enroll --token TOKEN --node-type yt_relay_source|inference_node|local_recorder [--display-name NAME --hostname HOST --platform PLATFORM --api-base-url URL]
+  stoarama node whoami [--node-type yt_relay_source|inference_node|local_recorder --api-base-url URL --node-token TOKEN]
+  stoarama node heartbeat [--node-type yt_relay_source|inference_node|local_recorder --api-base-url URL --node-token TOKEN]
+  stoarama node doctor [--node-type yt_relay_source|inference_node|local_recorder]
   stoarama node yt-relay-source run [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
   stoarama node yt-relay-source install-launchd [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
   stoarama node yt-relay-source uninstall-launchd
+
+  stoarama recording youtube run --stream-id N [--cookies-file FILE|--cookies-from-browser BROWSER]
 `)
 }
 
@@ -282,7 +286,7 @@ func runNodeEnrollmentTokens(args []string) {
 		fs := flag.NewFlagSet("node enrollment-tokens create", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 		apiKey := fs.String("api-key", "", "account API key")
-		nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
+		nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
 		label := fs.String("label", "", "token label")
 		expiresAt := fs.String("expires-at", "", "optional RFC3339 expiry")
 		_ = fs.Parse(args[1:])
@@ -324,7 +328,7 @@ func runNodeEnroll(args []string) {
 	fs := flag.NewFlagSet("node enroll", flag.ExitOnError)
 	apiBaseURL := fs.String("api-base-url", defaultAPIBaseURL(), "Stoarama API base URL")
 	token := fs.String("token", "", "node enrollment token")
-	nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
+	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
 	displayName := fs.String("display-name", defaultNodeDisplayName(), "node display name")
 	hostname := fs.String("hostname", defaultHostname(), "node hostname")
 	platform := fs.String("platform", defaultPlatform(), "node platform")
@@ -379,7 +383,7 @@ func runNodeEnroll(args []string) {
 
 func runNodeWhoAmI(args []string) {
 	fs := flag.NewFlagSet("node whoami", flag.ExitOnError)
-	nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
+	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 	nodeToken := fs.String("node-token", "", "node bearer token")
 	_ = fs.Parse(args)
@@ -394,7 +398,7 @@ func runNodeWhoAmI(args []string) {
 
 func runNodeHeartbeat(args []string) {
 	fs := flag.NewFlagSet("node heartbeat", flag.ExitOnError)
-	nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
+	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 	nodeToken := fs.String("node-token", "", "node bearer token")
 	_ = fs.Parse(args)
@@ -423,7 +427,7 @@ func runNodeHeartbeat(args []string) {
 
 func runNodeDoctor(args []string) {
 	fs := flag.NewFlagSet("node doctor", flag.ExitOnError)
-	nodeType := fs.String("node-type", "", "yt_relay_source or inference_node")
+	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
 	_ = fs.Parse(args)
 
 	cfg, _ := loadCLIConfig()
@@ -440,7 +444,8 @@ func runNodeDoctor(args []string) {
 		"node_type": effectiveType,
 		"checks": []map[string]any{
 			checkBinary("ffmpeg", true),
-			checkBinary("yt-dlp", effectiveType == "yt_relay_source"),
+			checkBinary("yt-dlp", effectiveType == "yt_relay_source" || effectiveType == "local_recorder"),
+			checkBinary("ffprobe", effectiveType == "local_recorder"),
 		},
 	}
 	printJSON(report)

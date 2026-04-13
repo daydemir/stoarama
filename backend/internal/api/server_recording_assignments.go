@@ -19,9 +19,10 @@ import (
 )
 
 type recordingAssignRequest struct {
-	ServerID string `json:"server_id"`
-	Reason   string `json:"reason"`
-	Actor    string `json:"actor"`
+	ServerID       string `json:"server_id"`
+	ExecutionClass string `json:"execution_class"`
+	Reason         string `json:"reason"`
+	Actor          string `json:"actor"`
 }
 
 type recordingUnassignRequest struct {
@@ -242,6 +243,34 @@ func recordingAllowedExecutionClasses(stream model.Stream) (string, []string, er
 	return requestedExecutionClass, []string{requestedExecutionClass}, nil
 }
 
+func recordingAllowedExecutionClassesWithPreference(stream model.Stream, preferredExecutionClass string) (string, []string, error) {
+	preferred := strings.TrimSpace(preferredExecutionClass)
+	if preferred == "" {
+		return recordingAllowedExecutionClasses(stream)
+	}
+	preferred, ok := capture.NormalizeExecutionClass(preferred)
+	if !ok {
+		return "", nil, fmt.Errorf("invalid preferred execution_class")
+	}
+	captureType, _ := capture.NormalizeCaptureType(stream.CaptureType)
+	if captureType == capture.CaptureTypeYouTubeWatch {
+		switch preferred {
+		case capture.ExecutionClassYouTubeDirect, capture.ExecutionClassYouTubeRelay:
+			return preferred, []string{preferred}, nil
+		default:
+			return "", nil, fmt.Errorf("preferred execution_class is not compatible with youtube_watch")
+		}
+	}
+	requestedExecutionClass, candidates, err := recordingAllowedExecutionClasses(stream)
+	if err != nil {
+		return "", nil, err
+	}
+	if preferred != requestedExecutionClass {
+		return "", nil, fmt.Errorf("preferred execution_class is not compatible with stream")
+	}
+	return requestedExecutionClass, candidates, nil
+}
+
 type recordingAssignmentTarget struct {
 	ServerID       string
 	ExecutionClass string
@@ -358,7 +387,7 @@ func selectRecordingAssignmentTarget(capacitySnapshot *recordingCapacitySnapshot
 	}, nil
 }
 
-func (s *Server) assignRecordingStreamTx(ctx context.Context, tx pgx.Tx, stream model.Stream, serverID string, actor string, reason string) (map[string]any, int, error) {
+func (s *Server) assignRecordingStreamTx(ctx context.Context, tx pgx.Tx, stream model.Stream, serverID string, preferredExecutionClass string, actor string, reason string) (map[string]any, int, error) {
 	if stream.RecordingState != model.RecordingStateOn {
 		return map[string]any{
 			"error":           "stream recording_state must be on before assignment",
@@ -367,7 +396,7 @@ func (s *Server) assignRecordingStreamTx(ctx context.Context, tx pgx.Tx, stream 
 			"stream_id":       stream.ID,
 		}, http.StatusConflict, nil
 	}
-	requestedExecutionClass, executionClassCandidates, err := recordingAllowedExecutionClasses(stream)
+	requestedExecutionClass, executionClassCandidates, err := recordingAllowedExecutionClassesWithPreference(stream, preferredExecutionClass)
 	if err != nil {
 		return map[string]any{
 			"error":           "unsupported stream execution class for assignment",
@@ -895,6 +924,10 @@ func (s *Server) handleRecordingStreamAssign(w http.ResponseWriter, r *http.Requ
 		principalAuthType = strings.TrimSpace(principal.AuthType)
 		principalSession = principal.SessionID != nil
 	}
+	if principal, ok := nodePrincipalFromContext(r.Context()); ok {
+		actor = fmt.Sprintf("node:%d:%s", principal.NodeID, strings.TrimSpace(principal.NodeType))
+		principalAuthType = "node"
+	}
 	log.Printf(
 		"recording assign request stream_id=%d server_id=%q actor=%q host=%s origin=%q referer=%q principal_email=%q principal_auth_type=%q principal_session=%t",
 		streamID,
@@ -924,7 +957,7 @@ func (s *Server) handleRecordingStreamAssign(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load stream: %v", err))
 		return
 	}
-	result, status, err := s.assignRecordingStreamTx(r.Context(), tx, stream, serverID, actor, reason)
+	result, status, err := s.assignRecordingStreamTx(r.Context(), tx, stream, serverID, strings.TrimSpace(req.ExecutionClass), actor, reason)
 	if err != nil {
 		log.Printf("recording assign error stream_id=%d server_id=%q actor=%q err=%v", streamID, serverID, actor, err)
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -1026,14 +1059,14 @@ func (s *Server) handleRecordingStreamState(w http.ResponseWriter, r *http.Reque
 	}
 
 	hasAuth := false
-	serviceToken := strings.TrimSpace(s.cfg.ServiceToken)
-	if serviceToken != "" {
-		got := strings.TrimSpace(r.Header.Get("Authorization"))
-		if strings.HasPrefix(got, "Bearer ") {
-			token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
-			if token != "" && token == serviceToken {
-				hasAuth = true
-			}
+	if s.hasServiceBearerToken(r) {
+		hasAuth = true
+	}
+	if !hasAuth {
+		if principal, err := s.authenticateNodeRequest(r); err == nil && strings.TrimSpace(principal.NodeType) == nodeTypeLocalRecorder {
+			hasAuth = true
+			ctx := context.WithValue(r.Context(), nodePrincipalContextKey, principal)
+			r = r.WithContext(ctx)
 		}
 	}
 	if !hasAuth {
@@ -1054,6 +1087,9 @@ func (s *Server) handleRecordingStreamState(w http.ResponseWriter, r *http.Reque
 
 	if principal, ok := accountPrincipalFromContext(r.Context()); ok {
 		actor = accountActorLabel(principal, actor)
+	}
+	if principal, ok := nodePrincipalFromContext(r.Context()); ok {
+		actor = fmt.Sprintf("node:%d:%s", principal.NodeID, strings.TrimSpace(principal.NodeType))
 	}
 
 	tx, err := s.pool.Begin(r.Context())
@@ -1140,7 +1176,7 @@ func (s *Server) setStreamRecordingStateTx(ctx context.Context, tx pgx.Tx, strea
 	case model.RecordingStateOn:
 		stream.RecordingState = model.RecordingStateOn
 		if !existed {
-			result, status, err := s.assignRecordingStreamTx(ctx, tx, stream, "", actor, reason)
+			result, status, err := s.assignRecordingStreamTx(ctx, tx, stream, "", "", actor, reason)
 			if err != nil {
 				return nil, 0, err
 			}

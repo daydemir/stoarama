@@ -295,6 +295,27 @@ func (s *Server) router() http.Handler {
 			recordingWrites.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
 		})
 
+		api.Group(func(worker chi.Router) {
+			worker.Use(s.requireServiceOrLocalRecorderNodeAuth)
+
+			worker.Get("/recording/settings", s.handleServiceRecordingSettingsGet)
+			worker.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
+			worker.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
+			worker.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
+			worker.Get("/service/dashboard/streams/{id}/recording-health", s.handleDashboardStreamRecordingHealth)
+			worker.Get("/capture/streams", s.handleCaptureStreams)
+			worker.Get("/capture/streams/{id}", s.handleCaptureStreamDetail)
+			worker.Get("/capture/runtime", s.handleCaptureRuntime)
+			worker.Post("/capture/runtime/stopped", s.handleCaptureRuntimeStopped)
+			worker.Post("/capture/worker-heartbeat", s.handleCaptureWorkerHeartbeat)
+			worker.Post("/capture/worker-stopped", s.handleCaptureWorkerStopped)
+			worker.Post("/recording/process/heartbeat", s.handleRecordingProcessHeartbeat)
+			worker.Post("/recording/process/stopped", s.handleRecordingProcessStopped)
+			worker.Post("/capture/ingest", s.handleCaptureIngest)
+			worker.Post("/capture/mark-unsupported", s.handleCaptureMarkUnsupported)
+			worker.Post("/media/upload-intents", s.handleUploadIntents)
+		})
+
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
 
@@ -323,37 +344,21 @@ func (s *Server) router() http.Handler {
 			service.Post("/imports/streams/repair-canonical-capture", s.handleServiceStreamCanonicalCaptureRepair)
 			service.Post("/imports/streams/repair-image-capture", s.handleServiceStreamImageCaptureRepair)
 			service.Post("/imports/streams/recording-state", s.handleServiceStreamRecordingState)
-			service.Get("/recording/settings", s.handleServiceRecordingSettingsGet)
-			service.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
 			service.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			service.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			service.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
-			service.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
-			service.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
 			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)
 			service.Post("/youtube-relay/sources/stopped", s.handleYouTubeRelaySourceStopped)
 			service.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
 			service.Get("/youtube-relay/routes/{stream_id}/events", s.handleYouTubeRelayRouteEventsList)
 			service.Post("/youtube-relay/routes/{stream_id}/status", s.handleYouTubeRelayRouteStatus)
-			service.Get("/service/dashboard/streams/{id}/recording-health", s.handleDashboardStreamRecordingHealth)
-			service.Get("/capture/streams", s.handleCaptureStreams)
-			service.Get("/capture/streams/{id}", s.handleCaptureStreamDetail)
 			service.Get("/service/capture/catalog/candidates", s.handleServiceCaptureCatalogCandidates)
-			service.Get("/capture/runtime", s.handleCaptureRuntime)
-			service.Post("/capture/runtime/stopped", s.handleCaptureRuntimeStopped)
-			service.Post("/capture/worker-heartbeat", s.handleCaptureWorkerHeartbeat)
-			service.Post("/capture/worker-stopped", s.handleCaptureWorkerStopped)
-			service.Post("/recording/process/heartbeat", s.handleRecordingProcessHeartbeat)
-			service.Post("/recording/process/stopped", s.handleRecordingProcessStopped)
 			service.Post("/processing/worker-heartbeat", s.handleProcessingWorkerHeartbeat)
 			service.Post("/processing/worker-stopped", s.handleProcessingWorkerStopped)
-			service.Post("/capture/ingest", s.handleCaptureIngest)
-			service.Post("/capture/mark-unsupported", s.handleCaptureMarkUnsupported)
 			service.Post("/inference/claims", s.handleInferenceClaims)
 			service.Post("/inference/claims/abandon", s.handleInferenceClaimsAbandon)
 			service.Post("/inference/commit", s.handleInferenceCommit)
 			service.Post("/inference/fail", s.handleInferenceFail)
-			service.Post("/media/upload-intents", s.handleUploadIntents)
 		})
 	})
 
@@ -735,7 +740,7 @@ func (s *Server) reconcileStreamRecordingAssignments(
 		}
 	}
 	if shouldAutoAssign && updated.RecordingState == model.RecordingStateOn && !existed {
-		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", actor, assignReason)
+		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", "", actor, assignReason)
 		if err != nil {
 			return nil, 0, err
 		}

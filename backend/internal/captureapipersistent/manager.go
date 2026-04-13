@@ -35,6 +35,7 @@ type ManagerConfig struct {
 	SegmentDuration           time.Duration
 	SegmentTargetFPS          int
 	StreamIDs                 []int64
+	PreferAssignedStreamIDs   bool
 	ModeAllowlist             []capture.Mode
 	RecordingHeartbeat        bool
 	UnsupportedErrorThreshold int
@@ -272,6 +273,15 @@ func (m *Manager) loadDesiredStreams(ctx context.Context) ([]streamConfig, error
 		return nil, fmt.Errorf("load recording settings: %w", err)
 	}
 	if len(m.streamFilter) > 0 {
+		if m.cfg.PreferAssignedStreamIDs && strings.TrimSpace(m.cfg.ServerID) != "" {
+			assigned, assignedErr := m.loadAssignedStreamFilterTargets(ctx, recordingSettings.IntervalSec)
+			if assignedErr != nil {
+				return nil, assignedErr
+			}
+			if len(assigned) > 0 {
+				return assigned, nil
+			}
+		}
 		return m.loadStreamFilterTargets(ctx, recordingSettings.IntervalSec)
 	}
 	serverID := strings.TrimSpace(m.cfg.ServerID)
@@ -288,52 +298,76 @@ func (m *Manager) loadAssignedStreams(ctx context.Context, captureIntervalSec in
 	}
 	out := make([]streamConfig, 0, len(assignments))
 	for _, asn := range assignments {
-		mode := capture.LegacyModeForStream(asn.CaptureType, asn.ExecutionClass)
-		s := streamConfig{
-			ID:                 asn.StreamID,
-			Provider:           asn.Provider,
-			StreamURL:          asn.StreamURL,
-			SourcePageURL:      asn.SourcePageURL,
-			CaptureMode:        mode,
-			AssignmentRevision: asn.AssignmentRevision,
-			Assigned:           true,
-		}
-		if s.ID <= 0 {
+		s := streamConfigFromAssignment(asn, captureIntervalSec)
+		if s.ID <= 0 || (strings.TrimSpace(s.StreamURL) == "" && strings.TrimSpace(s.SourcePageURL) == "") {
 			continue
 		}
-		if strings.TrimSpace(s.StreamURL) == "" && strings.TrimSpace(s.SourcePageURL) == "" {
-			continue
-		}
-		cfg := asn.CaptureConfigJSON
-		if cfg == nil {
-			cfg = map[string]any{}
-		} else {
-			cloned := make(map[string]any, len(cfg))
-			for k, v := range cfg {
-				cloned[k] = v
-			}
-			cfg = cloned
-		}
-		if relayPullURL := strings.TrimSpace(asn.RelayPullURL); relayPullURL != "" {
-			cfg["relay_pull_url"] = relayPullURL
-		}
-		s.CaptureConfig = cfg
-		if captureIntervalSec <= 0 {
-			captureIntervalSec = settings.DefaultRecordingIntervalSec
-		}
-		s.CaptureIntervalSec = captureIntervalSec
-		cfgRaw, _ := json.Marshal(s.CaptureConfig)
-		s.fingerprint = fmt.Sprintf(
-			"%d|%s|%s|%s|%s|%d|%s|%s|%d",
-			s.ID, s.Provider, s.StreamURL, s.SourcePageURL, s.CaptureMode, s.CaptureIntervalSec,
-			strings.TrimSpace(string(cfgRaw)), strings.TrimSpace(asn.ServerID), asn.AssignmentRevision,
-		)
 		if !m.modeAllowed(s) {
 			continue
 		}
 		out = append(out, s)
 	}
 	return prioritizeAndCap(out, m.cfg.MaxSessions), nil
+}
+
+func (m *Manager) loadAssignedStreamFilterTargets(ctx context.Context, captureIntervalSec int) ([]streamConfig, error) {
+	assignments, err := m.client.ListRecordingAssignments(ctx, strings.TrimSpace(m.cfg.ServerID), "", 1000, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list recording assignments: %w", err)
+	}
+	out := make([]streamConfig, 0, len(assignments))
+	for _, asn := range assignments {
+		if _, ok := m.streamFilter[asn.StreamID]; !ok {
+			continue
+		}
+		s := streamConfigFromAssignment(asn, captureIntervalSec)
+		if s.ID <= 0 || (strings.TrimSpace(s.StreamURL) == "" && strings.TrimSpace(s.SourcePageURL) == "") {
+			continue
+		}
+		if !m.modeAllowed(s) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return prioritizeAndCap(out, m.cfg.MaxSessions), nil
+}
+
+func streamConfigFromAssignment(asn captureapi.RecordingAssignment, captureIntervalSec int) streamConfig {
+	mode := capture.LegacyModeForStream(asn.CaptureType, asn.ExecutionClass)
+	s := streamConfig{
+		ID:                 asn.StreamID,
+		Provider:           asn.Provider,
+		StreamURL:          asn.StreamURL,
+		SourcePageURL:      asn.SourcePageURL,
+		CaptureMode:        mode,
+		AssignmentRevision: asn.AssignmentRevision,
+		Assigned:           true,
+	}
+	cfg := asn.CaptureConfigJSON
+	if cfg == nil {
+		cfg = map[string]any{}
+	} else {
+		cloned := make(map[string]any, len(cfg))
+		for k, v := range cfg {
+			cloned[k] = v
+		}
+		cfg = cloned
+	}
+	if relayPullURL := strings.TrimSpace(asn.RelayPullURL); relayPullURL != "" {
+		cfg["relay_pull_url"] = relayPullURL
+	}
+	s.CaptureConfig = cfg
+	if captureIntervalSec <= 0 {
+		captureIntervalSec = settings.DefaultRecordingIntervalSec
+	}
+	s.CaptureIntervalSec = captureIntervalSec
+	cfgRaw, _ := json.Marshal(s.CaptureConfig)
+	s.fingerprint = fmt.Sprintf(
+		"%d|%s|%s|%s|%s|%d|%s|%s|%d",
+		s.ID, s.Provider, s.StreamURL, s.SourcePageURL, s.CaptureMode, s.CaptureIntervalSec,
+		strings.TrimSpace(string(cfgRaw)), strings.TrimSpace(asn.ServerID), asn.AssignmentRevision,
+	)
+	return s
 }
 
 func (m *Manager) loadStreamFilterTargets(ctx context.Context, captureIntervalSec int) ([]streamConfig, error) {

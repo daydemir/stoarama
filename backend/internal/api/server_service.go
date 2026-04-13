@@ -39,17 +39,7 @@ func adminOverrideFromContext(ctx context.Context) bool {
 
 func (s *Server) requireServiceAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.TrimSpace(s.cfg.ServiceToken) == "" {
-			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		got := strings.TrimSpace(r.Header.Get("Authorization"))
-		if !strings.HasPrefix(got, "Bearer ") {
-			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
-		if token == "" || token != strings.TrimSpace(s.cfg.ServiceToken) {
+		if !s.hasServiceBearerToken(r) {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -57,18 +47,44 @@ func (s *Server) requireServiceAuth(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) hasServiceBearerToken(r *http.Request) bool {
+	if r == nil || strings.TrimSpace(s.cfg.ServiceToken) == "" {
+		return false
+	}
+	got := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(got, "Bearer ") {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
+	return token != "" && token == strings.TrimSpace(s.cfg.ServiceToken)
+}
+
+func (s *Server) requireServiceOrLocalRecorderNodeAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.hasServiceBearerToken(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		principal, err := s.authenticateNodeRequest(r)
+		if err != nil || strings.TrimSpace(principal.NodeType) != nodeTypeLocalRecorder {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		ctx := context.WithValue(r.Context(), nodePrincipalContextKey, principal)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func (s *Server) requireRecordingMutationAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serviceToken := strings.TrimSpace(s.cfg.ServiceToken)
-		if serviceToken != "" {
-			got := strings.TrimSpace(r.Header.Get("Authorization"))
-			if strings.HasPrefix(got, "Bearer ") {
-				token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
-				if token != "" && token == serviceToken {
-					next.ServeHTTP(w, r)
-					return
-				}
-			}
+		if s.hasServiceBearerToken(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if principal, err := s.authenticateNodeRequest(r); err == nil && strings.TrimSpace(principal.NodeType) == nodeTypeLocalRecorder {
+			ctx := context.WithValue(r.Context(), nodePrincipalContextKey, principal)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
 		}
 
 		principal, err := s.authenticateAccountSessionRequest(r)

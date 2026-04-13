@@ -17,6 +17,7 @@ import (
 const (
 	nodeTypeYTRelaySource = "yt_relay_source"
 	nodeTypeInferenceNode = "inference_node"
+	nodeTypeLocalRecorder = "local_recorder"
 )
 
 type nodePrincipal struct {
@@ -36,6 +37,8 @@ func normalizeNodeType(raw string) (string, bool) {
 		return nodeTypeYTRelaySource, true
 	case nodeTypeInferenceNode:
 		return nodeTypeInferenceNode, true
+	case nodeTypeLocalRecorder:
+		return nodeTypeLocalRecorder, true
 	default:
 		return "", false
 	}

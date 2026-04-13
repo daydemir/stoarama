@@ -535,7 +535,7 @@ func (s *Server) applyStreamImageCaptureRepair(ctx context.Context, item service
 		}
 	}
 	if updated.RecordingState == model.RecordingStateOn && !existed {
-		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", actor, reason)
+		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", "", actor, reason)
 		if err != nil {
 			return item, err
 		}
@@ -733,7 +733,7 @@ func (s *Server) applyStreamCanonicalCaptureRepair(ctx context.Context, item ser
 		}
 	}
 	if updated.RecordingState == model.RecordingStateOn && !existed {
-		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", actor, reason)
+		result, status, err := s.assignRecordingStreamTx(ctx, tx, updated, "", "", actor, reason)
 		if err != nil {
 			return item, err
 		}
