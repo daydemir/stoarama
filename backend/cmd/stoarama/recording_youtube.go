@@ -43,7 +43,7 @@ func runRecordingYouTube(args []string) {
 	cfg, _ := loadCLIConfig()
 	fs := flag.NewFlagSet("recording youtube run", flag.ExitOnError)
 	apiBaseURL := fs.String("api-base-url", nodeAPIBaseURLForType(cfg, nodeTypeLocalRecorderCLI), "Stoarama API base URL")
-	nodeToken := fs.String("node-token", nodeTokenForType(cfg, nodeTypeLocalRecorderCLI), "local recorder node bearer token")
+	nodeToken := fs.String("node-token", "", "local recorder node bearer token")
 	streamID := fs.Int64("stream-id", 0, "YouTube watch stream id")
 	serverID := fs.String("server-id", defaultLocalRecorderServerID(), "stable recorder server id")
 	workerID := fs.String("worker-id", defaultLocalRecorderWorkerID(), "stable recorder worker id")
