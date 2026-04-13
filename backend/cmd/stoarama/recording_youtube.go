@@ -151,10 +151,11 @@ func runRecordingYouTube(args []string) {
 	}
 	if !stream.IsRecordingOn() {
 		if err := client.SetRecordingState(runCtx, captureapi.RecordingStateUpdateRequest{
-			StreamID: stream.ID,
-			State:    model.RecordingStateOn,
-			Actor:    "stoarama.local_recorder",
-			Reason:   "local recorder start",
+			StreamID:       stream.ID,
+			State:          model.RecordingStateOn,
+			ExecutionClass: capture.ExecutionClassYouTubeDirect,
+			Actor:          "stoarama.local_recorder",
+			Reason:         "local recorder start",
 		}); err != nil {
 			fatalf("turn recording on: %v", err)
 		}

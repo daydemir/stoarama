@@ -58,10 +58,11 @@ type SegmentUploadIntent struct {
 }
 
 type RecordingStateUpdateRequest struct {
-	StreamID int64
-	State    model.RecordingState
-	Actor    string
-	Reason   string
+	StreamID       int64
+	State          model.RecordingState
+	ExecutionClass string
+	Actor          string
+	Reason         string
 }
 
 type RecordingAssignRequest struct {
@@ -377,6 +378,7 @@ func (c *Client) SetRecordingState(ctx context.Context, req RecordingStateUpdate
 	}
 	payload := map[string]any{
 		"recording_state": string(req.State),
+		"execution_class": strings.TrimSpace(req.ExecutionClass),
 		"actor":           strings.TrimSpace(req.Actor),
 		"reason":          strings.TrimSpace(req.Reason),
 	}

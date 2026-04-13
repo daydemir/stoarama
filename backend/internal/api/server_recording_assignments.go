@@ -33,6 +33,7 @@ type recordingUnassignRequest struct {
 
 type recordingStateRequest struct {
 	RecordingState string `json:"recording_state"`
+	ExecutionClass string `json:"execution_class"`
 	Reason         string `json:"reason"`
 	Actor          string `json:"actor"`
 }
@@ -1099,7 +1100,7 @@ func (s *Server) handleRecordingStreamState(w http.ResponseWriter, r *http.Reque
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	result, status, err := s.setStreamRecordingStateTx(r.Context(), tx, streamID, state, actor, reason)
+	result, status, err := s.setStreamRecordingStateTx(r.Context(), tx, streamID, state, strings.TrimSpace(req.ExecutionClass), actor, reason)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1145,7 +1146,7 @@ func loadRecordingAssignmentTx(ctx context.Context, tx pgx.Tx, streamID int64) (
 	return assignment, true, nil
 }
 
-func (s *Server) setStreamRecordingStateTx(ctx context.Context, tx pgx.Tx, streamID int64, state model.RecordingState, actor string, reason string) (map[string]any, int, error) {
+func (s *Server) setStreamRecordingStateTx(ctx context.Context, tx pgx.Tx, streamID int64, state model.RecordingState, preferredExecutionClass string, actor string, reason string) (map[string]any, int, error) {
 	stream, err := s.loadStreamForAssignmentTx(ctx, tx, streamID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1176,7 +1177,7 @@ func (s *Server) setStreamRecordingStateTx(ctx context.Context, tx pgx.Tx, strea
 	case model.RecordingStateOn:
 		stream.RecordingState = model.RecordingStateOn
 		if !existed {
-			result, status, err := s.assignRecordingStreamTx(ctx, tx, stream, "", "", actor, reason)
+			result, status, err := s.assignRecordingStreamTx(ctx, tx, stream, "", preferredExecutionClass, actor, reason)
 			if err != nil {
 				return nil, 0, err
 			}

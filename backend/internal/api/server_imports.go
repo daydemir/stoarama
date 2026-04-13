@@ -402,7 +402,7 @@ func (s *Server) handleServiceStreamRecordingState(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	result, status, err := s.setStreamRecordingStateTx(r.Context(), tx, req.StreamID, state, actor, reason)
+	result, status, err := s.setStreamRecordingStateTx(r.Context(), tx, req.StreamID, state, "", actor, reason)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
