@@ -4318,7 +4318,7 @@ function setDetailMainView(which, opts = {}) {
   if (detailMainTabSettings) detailMainTabSettings.classList.toggle('active', detailMainView === 'settings');
   if (detailDetailsSubtabs) detailDetailsSubtabs.style.display = detailsVisible ? '' : 'none';
   if (detailsVisible) {
-    setDetailSubView(detailView, { syncURL: false, replaceURL: opts.replaceURL === true });
+    setDetailSubView(detailView, { syncURL: false, replaceURL: opts.replaceURL === true, livePolling: opts.livePolling !== false });
   } else {
     if (detailInferenceSection) detailInferenceSection.style.display = 'none';
     if (detailCoverageSection) detailCoverageSection.style.display = 'none';
@@ -4885,7 +4885,7 @@ function setDetailSubView(view, opts = {}) {
   detailTimelineSection.style.display = detailView === 'timeline' ? '' : 'none';
   detailHealthSection.style.display = detailView === 'health' ? '' : 'none';
   detailFramesSection.style.display = detailView === 'frames' ? '' : 'none';
-  if (detailView === 'frames') startDetailLivePolling();
+  if (detailView === 'frames' && opts.livePolling !== false) startDetailLivePolling();
   else stopDetailLivePolling();
   if (detailMainView === 'details' && detailStreamID && opts.syncURL !== false) {
     syncDetailURL({ replace: opts.replaceURL === true });
@@ -9487,8 +9487,8 @@ async function applyStreamsRouteState(opts = {}) {
     detailStreamID = streamID;
     applyDetailRouteStateFromURL(params);
     updateDetailTabHrefs();
-    setDetailMainView(detailMainView, { syncURL: false, replaceURL: true });
-    setDetailSubView(detailView, { syncURL: false, replaceURL: true });
+    setDetailMainView(detailMainView, { syncURL: false, replaceURL: true, livePolling: false });
+    setDetailSubView(detailView, { syncURL: false, replaceURL: true, livePolling: false });
     showPanel('detail');
     await loadDetail({ quiet: Boolean(opts.quiet) });
     return;
