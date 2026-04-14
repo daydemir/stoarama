@@ -116,6 +116,7 @@ func usage() {
 	  stoaramactl capture runtime reset --id N
 	  stoaramactl streams list [--recording-state off|on --capture-type TYPE --tags a,b --limit 200]
 	  stoaramactl streams detail (--id N | --slug S) [--pipeline-id P --results-limit 10 --detections-limit 50]
+	  stoaramactl streams page-load --id N [--recent-limit 24 --include-thumbnails=true --include-coverage --include-inference --timeout-sec 20 --json]
 	  stoaramactl streams filters --kind tags|countries|cities|sources|youtube-channels [--recording-state off|on --capture-type TYPE --country C --city CITY --source SRC --youtube-channel CH --tags a,b --tags-not x,y]
 	  stoaramactl streams frames [--stream-id N --pipeline-id P --uninferenced --unprocessed --sort-by captured_at --sort-dir desc --limit 200 --offset 0]
 	  stoaramactl streams clips --stream-id N [--limit 100 --offset 0]
@@ -1948,7 +1949,7 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 }
 
 func printStreamsUsage() {
-	fmt.Print("stoaramactl streams <list|detail|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service> ...\n")
+	fmt.Print("stoaramactl streams <list|detail|page-load|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service> ...\n")
 }
 
 func printDiscoveryUsage() {
@@ -2066,6 +2067,185 @@ func patchStreamRecordingState(ctx context.Context, backendAPIURL string, apiTok
 	return mustAPIRequest(ctx, http.MethodPatch, strings.TrimSpace(backendAPIURL), strings.TrimSpace(apiToken), fmt.Sprintf("/api/v1/streams/%d", streamID), map[string]any{
 		"recording_state": string(state),
 	})
+}
+
+type streamPageLoadOptions struct {
+	RecentLimit       int
+	IncludeThumbnails bool
+	IncludeCoverage   bool
+	IncludeInference  bool
+	Timeout           time.Duration
+}
+
+type streamPageLoadStep struct {
+	Name           string `json:"name"`
+	Method         string `json:"method"`
+	Path           string `json:"path"`
+	StatusCode     int    `json:"status_code,omitempty"`
+	DurationMS     int64  `json:"duration_ms"`
+	OK             bool   `json:"ok"`
+	Items          int    `json:"items"`
+	RecentCaptures int    `json:"recent_captures"`
+	Error          string `json:"error,omitempty"`
+}
+
+type streamPageLoadReport struct {
+	StreamID        int64                `json:"stream_id"`
+	OK              bool                 `json:"ok"`
+	TotalDurationMS int64                `json:"total_duration_ms"`
+	Steps           []streamPageLoadStep `json:"steps"`
+}
+
+func probeStreamPageLoad(ctx context.Context, backendAPIURL string, apiToken string, streamID int64, opts streamPageLoadOptions) streamPageLoadReport {
+	started := time.Now()
+	report := streamPageLoadReport{
+		StreamID: streamID,
+		OK:       true,
+		Steps:    []streamPageLoadStep{},
+	}
+	add := func(name string, method string, path string, payload any) map[string]any {
+		step, response := timedAPIRequest(ctx, method, backendAPIURL, apiToken, path, payload, opts.Timeout)
+		step.Name = name
+		if !step.OK {
+			report.OK = false
+		}
+		report.Steps = append(report.Steps, step)
+		return response
+	}
+
+	recordingQuery := url.Values{}
+	recordingQuery.Set("include_recent_captures", strconv.Itoa(opts.RecentLimit))
+	recordingPath := fmt.Sprintf("/api/v1/dashboard/streams/%d/recording?%s", streamID, recordingQuery.Encode())
+	recording := add("recording", http.MethodGet, recordingPath, nil)
+	if len(report.Steps) > 0 {
+		last := &report.Steps[len(report.Steps)-1]
+		last.RecentCaptures = arrayLen(recording["recent_captures"])
+		last.Items = -1
+	}
+
+	if opts.IncludeThumbnails {
+		thumbs := add("thumbnails", http.MethodPost, "/api/v1/dashboard/streams/image-urls", map[string]any{
+			"stream_ids": []int64{streamID},
+		})
+		if len(report.Steps) > 0 {
+			last := &report.Steps[len(report.Steps)-1]
+			last.Items = arrayLen(thumbs["items"])
+			last.RecentCaptures = -1
+		}
+	}
+	if opts.IncludeCoverage {
+		coverage := add("coverage", http.MethodGet, fmt.Sprintf("/api/v1/dashboard/streams/%d/coverage?days=365", streamID), nil)
+		if len(report.Steps) > 0 {
+			last := &report.Steps[len(report.Steps)-1]
+			last.Items = arrayLen(coverage["points"])
+			last.RecentCaptures = -1
+		}
+		samples := add("capture-samples", http.MethodGet, fmt.Sprintf("/api/v1/dashboard/streams/%d/capture-samples?count=42", streamID), nil)
+		if len(report.Steps) > 0 {
+			last := &report.Steps[len(report.Steps)-1]
+			last.Items = arrayLen(samples["items"])
+			last.RecentCaptures = -1
+		}
+	}
+	if opts.IncludeInference {
+		detailQuery := url.Values{}
+		detailQuery.Set("limit", "10")
+		detailQuery.Set("offset", "0")
+		detailQuery.Set("sort_by", "created_at")
+		detailQuery.Set("sort_dir", "desc")
+		detail := add("inference", http.MethodGet, fmt.Sprintf("/api/v1/dashboard/streams/%d?%s", streamID, detailQuery.Encode()), nil)
+		if len(report.Steps) > 0 {
+			last := &report.Steps[len(report.Steps)-1]
+			last.Items = arrayLen(detail["inference"])
+			last.RecentCaptures = -1
+		}
+		detectionQuery := url.Values{}
+		detectionQuery.Set("limit", "500")
+		detections := add("detections", http.MethodGet, fmt.Sprintf("/api/v1/dashboard/streams/%d/detections?%s", streamID, detectionQuery.Encode()), nil)
+		if len(report.Steps) > 0 {
+			last := &report.Steps[len(report.Steps)-1]
+			last.Items = arrayLen(detections["detections"])
+			last.RecentCaptures = -1
+		}
+	}
+	report.TotalDurationMS = time.Since(started).Milliseconds()
+	return report
+}
+
+func timedAPIRequest(ctx context.Context, method string, baseURL string, apiToken string, path string, payload any, timeout time.Duration) (step streamPageLoadStep, out map[string]any) {
+	step = streamPageLoadStep{
+		Method:         strings.TrimSpace(strings.ToUpper(method)),
+		Path:           path,
+		Items:          -1,
+		RecentCaptures: -1,
+	}
+	started := time.Now()
+	defer func() {
+		step.DurationMS = time.Since(started).Milliseconds()
+	}()
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		step.Error = "--backend-api-url is required"
+		return step, out
+	}
+	token := strings.TrimSpace(apiToken)
+	if token == "" {
+		step.Error = "--api-token is required"
+		return step, out
+	}
+	p := strings.TrimSpace(path)
+	if p == "" {
+		step.Error = "api path is required"
+		return step, out
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	step.Path = p
+	var body io.Reader
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			step.Error = fmt.Sprintf("marshal api payload: %v", err)
+			return step, out
+		}
+		body = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, step.Method, base+p, body)
+	if err != nil {
+		step.Error = fmt.Sprintf("build api request: %v", err)
+		return step, out
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	switch step.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("%s:%s:%d", step.Method, p, time.Now().UnixNano()))
+	}
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		step.Error = err.Error()
+		return step, out
+	}
+	defer resp.Body.Close()
+	step.StatusCode = resp.StatusCode
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		step.Error = strings.TrimSpace(string(body))
+		return step, out
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		step.Error = fmt.Sprintf("decode api response: %v", err)
+		return step, out
+	}
+	step.OK = true
+	return step, out
 }
 
 func loadDashboardStream(ctx context.Context, backendAPIURL string, apiToken string, streamID int64) map[string]any {
@@ -2431,6 +2611,59 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 			area, _ := asFloat64(d["area_px"])
 			fmt.Printf("  - class=%s conf=%.4f bbox=[%.1f,%.1f,%.1f,%.1f] area=%.1f\n",
 				fmt.Sprint(d["class_name"]), conf, x1, y1, x2, y2, area)
+		}
+	case "page-load":
+		fs := flag.NewFlagSet("streams page-load", flag.ExitOnError)
+		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
+		id := fs.Int64("id", 0, "stream id")
+		recentLimit := fs.Int("recent-limit", 24, "recent captures included with the recording payload")
+		includeThumbnails := fs.Bool("include-thumbnails", true, "include list thumbnail lookup")
+		includeCoverage := fs.Bool("include-coverage", false, "include coverage and capture sample calls")
+		includeInference := fs.Bool("include-inference", false, "include inference detail and detection calls")
+		timeoutSec := fs.Int("timeout-sec", 20, "per-call timeout seconds")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if *id <= 0 {
+			log.Fatalf("--id is required")
+		}
+		if *recentLimit < 0 || *recentLimit > 100 {
+			log.Fatalf("--recent-limit must be between 0 and 100")
+		}
+		if *timeoutSec <= 0 || *timeoutSec > 300 {
+			log.Fatalf("--timeout-sec must be between 1 and 300")
+		}
+		report := probeStreamPageLoad(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), *id, streamPageLoadOptions{
+			RecentLimit:       *recentLimit,
+			IncludeThumbnails: *includeThumbnails,
+			IncludeCoverage:   *includeCoverage,
+			IncludeInference:  *includeInference,
+			Timeout:           time.Duration(*timeoutSec) * time.Second,
+		})
+		if *asJSON {
+			printJSON(report)
+		} else {
+			fmt.Printf("stream_id=%d ok=%t total_ms=%d\n", report.StreamID, report.OK, report.TotalDurationMS)
+			for _, step := range report.Steps {
+				status := "-"
+				if step.StatusCode > 0 {
+					status = strconv.Itoa(step.StatusCode)
+				}
+				line := fmt.Sprintf("  %s method=%s status=%s ok=%t duration_ms=%d", step.Name, step.Method, status, step.OK, step.DurationMS)
+				if step.Items >= 0 {
+					line += fmt.Sprintf(" items=%d", step.Items)
+				}
+				if step.RecentCaptures >= 0 {
+					line += fmt.Sprintf(" recent_captures=%d", step.RecentCaptures)
+				}
+				if step.Error != "" {
+					line += fmt.Sprintf(" error=%q", step.Error)
+				}
+				fmt.Println(line)
+			}
+		}
+		if !report.OK {
+			os.Exit(1)
 		}
 	case "filters":
 		fs := flag.NewFlagSet("streams filters", flag.ExitOnError)
@@ -7189,6 +7422,14 @@ func asStringSlice(v any) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+func arrayLen(v any) int {
+	raw, ok := v.([]any)
+	if !ok {
+		return 0
+	}
+	return len(raw)
 }
 
 func int64FromAny(v any) int64 {

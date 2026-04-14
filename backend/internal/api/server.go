@@ -1809,6 +1809,64 @@ func (s *Server) commitInference(ctx context.Context, req inferenceCommitRequest
 	return resultID, revision, nil
 }
 
+type recentFrameItem struct {
+	ID          int64     `json:"id"`
+	StreamID    int64     `json:"stream_id"`
+	CaptureJob  *int64    `json:"capture_job_id,omitempty"`
+	CapturedAt  time.Time `json:"captured_at"`
+	Status      string    `json:"capture_status"`
+	Error       *string   `json:"capture_error,omitempty"`
+	SourceKind  string    `json:"source_kind"`
+	ObjectKey   *string   `json:"object_key,omitempty"`
+	MIMEType    *string   `json:"mime_type,omitempty"`
+	SizeBytes   *int64    `json:"size_bytes,omitempty"`
+	Width       int       `json:"width"`
+	Height      int       `json:"height"`
+	DownloadURL string    `json:"download_url,omitempty"`
+}
+
+func (s *Server) queryRecentFrameItems(ctx context.Context, streamID int64, limit int) ([]recentFrameItem, error) {
+	if streamID <= 0 {
+		return nil, fmt.Errorf("stream_id is required")
+	}
+	if limit <= 0 {
+		return []recentFrameItem{}, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			f.id, f.stream_id, f.capture_job_id, f.captured_at,
+			f.capture_status, f.capture_error, f.source_kind,
+			mo.object_key, mo.mime_type, mo.size_bytes,
+			COALESCE(mo.width, 0), COALESCE(mo.height, 0)
+		FROM frames f
+		LEFT JOIN media_objects mo ON mo.id = f.raw_media_object_id
+		WHERE f.stream_id=$1
+		ORDER BY f.captured_at DESC NULLS LAST, f.id DESC
+		LIMIT $2
+	`, streamID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query recent frames: %w", err)
+	}
+	defer rows.Close()
+	items := make([]recentFrameItem, 0, limit)
+	for rows.Next() {
+		var it recentFrameItem
+		if err := rows.Scan(&it.ID, &it.StreamID, &it.CaptureJob, &it.CapturedAt, &it.Status, &it.Error, &it.SourceKind, &it.ObjectKey, &it.MIMEType, &it.SizeBytes, &it.Width, &it.Height); err != nil {
+			return nil, fmt.Errorf("scan recent frame: %w", err)
+		}
+		if it.ObjectKey != nil && strings.TrimSpace(*it.ObjectKey) != "" {
+			if url, err := s.r2.PresignGet(ctx, *it.ObjectKey, s.cfg.R2SignGetTTL); err == nil {
+				it.DownloadURL = url
+			}
+		}
+		items = append(items, it)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("iterate recent frames: %w", rows.Err())
+	}
+	return items, nil
+}
+
 func (s *Server) handleFramesList(w http.ResponseWriter, r *http.Request) {
 	limit := parseIntQuery(r, "limit", 200, 1, 5000)
 	offset := parseIntQuery(r, "offset", 0, 0, 1000000)
@@ -3910,7 +3968,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		"avg_people_per_inferenced_capture": "COALESCE(sis.avg_people_per_inferenced_capture, 0)",
 		"inferenced_captures":               "COALESCE(sis.inferenced_captures, 0)",
 		"person_detections_total":           "COALESCE(sis.person_detections_total, 0)",
-		"latest_captured_at":                "sh.last_capture_at",
+		"latest_captured_at":                "CASE WHEN s.execution_class IN ('video_live','youtube_relay') OR rt.execution_class IN ('video_live','youtube_relay') THEN COALESCE(rt.last_frame_at, sh.last_capture_at) ELSE sh.last_capture_at END",
 		"captures_total":                    "COALESCE(sh.captures_total, 0)",
 		"captures_success":                  "COALESCE(sh.captures_success, 0)",
 		"captures_error":                    "COALESCE(sh.captures_error, 0)",
@@ -3927,7 +3985,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		"tags_count":                        "COALESCE(array_length(s.tags, 1), 0)",
 		"id":                                "s.id",
 	}
-	orderExpr, sortBy, sortDir, ok := parseSortQuery(w, r, orderColumns, "avg_people_per_inferenced_capture", "desc")
+	orderExpr, _, sortDir, ok := parseSortQuery(w, r, orderColumns, "avg_people_per_inferenced_capture", "desc")
 	if !ok {
 		return
 	}
@@ -3941,10 +3999,6 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	recordingStateParam := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("recording_state")))
-	tabParam := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("tab")))
-	recordingOnlyFastPath := recordingStateParam == "on" || (recordingStateParam == "" && (tabParam == "recording" || tabParam == "recordings"))
-
 	recordingSettings, err := settings.GetRecordingSettings(r.Context(), s.pool)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -3984,225 +4038,12 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		CaptureUnit                   string       `json:"capture_unit"`
 	}
 	items := make([]item, 0, limit)
-	if recordingOnlyFastPath {
-		rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
-			SELECT
-				s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
-				s.source_family,
-				s.capture_family, s.expected_fps, s.expected_image_interval_sec,
-				s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
-				s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
-				s.created_at, s.updated_at,
-				sh.last_capture_at,
-				COALESCE(sh.captures_total, 0),
-				COALESCE(sh.captures_success, 0),
-				COALESCE(sh.captures_error, 0),
-				rt.status,
-				rt.execution_class,
-				rt.resolved_url,
-				rt.last_frame_at,
-				rt.consecutive_errors,
-				rt.last_error_text,
-				COALESCE(sis.inferenced_captures, 0)::bigint,
-				COALESCE(sis.person_detections_total, 0)::bigint,
-				COALESCE(sis.avg_people_per_inferenced_capture, 0)::double precision
-			FROM streams s
-			LEFT JOIN stream_health sh ON sh.stream_id = s.id
-			LEFT JOIN stream_capture_runtime rt ON rt.stream_id = s.id
-			LEFT JOIN stream_inference_stats sis ON sis.stream_id = s.id
-			WHERE %s
-		`, whereSQL), args...)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard stream query: %v", err))
-			return
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var stream model.Stream
-			var metaBytes []byte
-			var cfgBytes []byte
-			var state string
-			var capturedAt *time.Time
-			var capturesTotal, capturesSuccess, capturesError int64
-			var inferencedCaptures, personDetectionsTotal int64
-			var avgPeoplePerInferencedCapture float64
-			var runtimeStatus, runtimeMode, runtimeResolved, runtimeError *string
-			var runtimeLastFrame *time.Time
-			var runtimeErrors *int
-			if err := rows.Scan(
-				&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
-				&stream.SourceFamily,
-				&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
-				&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
-				&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
-				&stream.CreatedAt, &stream.UpdatedAt,
-				&capturedAt,
-				&capturesTotal, &capturesSuccess, &capturesError,
-				&runtimeStatus, &runtimeMode, &runtimeResolved, &runtimeLastFrame, &runtimeErrors, &runtimeError,
-				&inferencedCaptures, &personDetectionsTotal, &avgPeoplePerInferencedCapture,
-			); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan dashboard stream: %v", err))
-				return
-			}
-			stream.RecordingState = model.RecordingState(state)
-			if err := decodeStreamPayload(&stream, metaBytes, cfgBytes); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("decode stream metadata: %v", err))
-				return
-			}
-			stream.CaptureRuntimeStatus = runtimeStatus
-			stream.CaptureRuntimeClass = runtimeMode
-			stream.CaptureRuntimeResolved = runtimeResolved
-			stream.CaptureRuntimeLastSeen = runtimeLastFrame
-			stream.CaptureRuntimeErrors = runtimeErrors
-			stream.CaptureRuntimeError = runtimeError
-			it := item{
-				Stream:                        stream,
-				LatestCaptured:                capturedAt,
-				LastCaptureAt:                 capturedAt,
-				CapturesTotal:                 capturesTotal,
-				CapturesSuccess:               capturesSuccess,
-				CapturesError:                 capturesError,
-				InferencedCaptures:            inferencedCaptures,
-				PersonDetectionsTotal:         personDetectionsTotal,
-				AvgPeoplePerInferencedCapture: avgPeoplePerInferencedCapture,
-				CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
-			}
-			if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-				if it.TargetFPS <= 0 {
-					it.TargetFPS = 10
-				}
-				it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
-				if runtimeLastFrame != nil {
-					it.LatestCaptured = runtimeLastFrame
-					it.LastCaptureAt = runtimeLastFrame
-				}
-			} else if stream.RecordingState == model.RecordingStateOn {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-				if it.TargetFPS <= 0 {
-					it.TargetFPS = 10
-				}
-				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
-			} else {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-				if it.TargetFPS <= 0 {
-					it.TargetFPS = 10
-				}
-				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
-			}
-			it.SuccessCaptures60s = it.SuccessFrames60s
-			it.ExpectedCaptures60s = it.ExpectedFrames60s
-			items = append(items, it)
-		}
-		if rows.Err() != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate dashboard streams: %v", rows.Err()))
-			return
-		}
-		if len(items) > 0 {
-			sort.SliceStable(items, func(i, j int) bool {
-				a := items[i]
-				b := items[j]
-				lessNumeric := func(x, y float64) bool {
-					if sortDir == "asc" {
-						return x < y
-					}
-					return x > y
-				}
-				lessTime := func(x, y *time.Time) bool {
-					var xv, yv int64
-					if x != nil {
-						xv = x.UTC().UnixNano()
-					}
-					if y != nil {
-						yv = y.UTC().UnixNano()
-					}
-					return lessNumeric(float64(xv), float64(yv))
-				}
-				lessString := func(x, y string) bool {
-					x = strings.ToLower(strings.TrimSpace(x))
-					y = strings.ToLower(strings.TrimSpace(y))
-					if x == y {
-						if sortDir == "asc" {
-							return a.Stream.ID < b.Stream.ID
-						}
-						return a.Stream.ID > b.Stream.ID
-					}
-					if sortDir == "asc" {
-						return x < y
-					}
-					return x > y
-				}
-				switch sortBy {
-				case "avg_people_per_inferenced_capture":
-					if a.AvgPeoplePerInferencedCapture == b.AvgPeoplePerInferencedCapture {
-						return a.Stream.ID < b.Stream.ID
-					}
-					return lessNumeric(a.AvgPeoplePerInferencedCapture, b.AvgPeoplePerInferencedCapture)
-				case "inferenced_captures":
-					if a.InferencedCaptures == b.InferencedCaptures {
-						return a.Stream.ID < b.Stream.ID
-					}
-					return lessNumeric(float64(a.InferencedCaptures), float64(b.InferencedCaptures))
-				case "person_detections_total":
-					if a.PersonDetectionsTotal == b.PersonDetectionsTotal {
-						return a.Stream.ID < b.Stream.ID
-					}
-					return lessNumeric(float64(a.PersonDetectionsTotal), float64(b.PersonDetectionsTotal))
-				case "latest_captured_at":
-					return lessTime(a.LatestCaptured, b.LatestCaptured)
-				case "captures_total":
-					return lessNumeric(float64(a.CapturesTotal), float64(b.CapturesTotal))
-				case "captures_success":
-					return lessNumeric(float64(a.CapturesSuccess), float64(b.CapturesSuccess))
-				case "captures_error":
-					return lessNumeric(float64(a.CapturesError), float64(b.CapturesError))
-				case "name":
-					return lessString(a.Stream.Name, b.Stream.Name)
-				case "location":
-					return lessString(a.Stream.LocationText, b.Stream.LocationText)
-				case "location_country":
-					return lessString(a.Stream.LocationCountry, b.Stream.LocationCountry)
-				case "location_city":
-					return lessString(a.Stream.LocationCity, b.Stream.LocationCity)
-				case "provider":
-					return lessString(a.Stream.Provider, b.Stream.Provider)
-				case "recording_state":
-					return lessString(string(a.Stream.RecordingState), string(b.Stream.RecordingState))
-				case "mode":
-					return lessString(a.Stream.CaptureType, b.Stream.CaptureType)
-				case "runtime_status":
-					return lessString(derefString(a.Stream.CaptureRuntimeStatus), derefString(b.Stream.CaptureRuntimeStatus))
-				case "tags_count":
-					return lessNumeric(float64(len(a.Stream.Tags)), float64(len(b.Stream.Tags)))
-				case "id":
-					if sortDir == "asc" {
-						return a.Stream.ID < b.Stream.ID
-					}
-					return a.Stream.ID > b.Stream.ID
-				default:
-					if sortDir == "asc" {
-						return a.Stream.ID < b.Stream.ID
-					}
-					return a.Stream.ID > b.Stream.ID
-				}
-			})
-			if offset >= len(items) {
-				items = items[:0]
-			} else {
-				end := offset + limit
-				if end > len(items) {
-					end = len(items)
-				}
-				items = items[offset:end]
-			}
-		}
-	} else {
-		args = append(args, limit, offset)
-		rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
-		WITH filtered_streams AS (
-			SELECT s.id
-			FROM streams s
-			WHERE %s
+	args = append(args, limit, offset)
+	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
+			WITH filtered_streams AS (
+				SELECT s.id
+				FROM streams s
+				WHERE %s
 		)
 		SELECT
 			s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
@@ -4232,88 +4073,87 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			ORDER BY %s %s NULLS LAST, s.id ASC
 			LIMIT $%d OFFSET $%d
 		`, whereSQL, orderExpr, sortDir, len(args)-1, len(args)), args...)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard stream query: %v", err))
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard stream query: %v", err))
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var stream model.Stream
+		var metaBytes []byte
+		var cfgBytes []byte
+		var state string
+		var capturedAt *time.Time
+		var capturesTotal, capturesSuccess, capturesError int64
+		var inferencedCaptures, personDetectionsTotal int64
+		var avgPeoplePerInferencedCapture float64
+		var runtimeStatus, runtimeMode, runtimeResolved, runtimeError *string
+		var runtimeLastFrame *time.Time
+		var runtimeErrors *int
+		if err := rows.Scan(
+			&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
+			&stream.SourceFamily,
+			&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
+			&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
+			&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
+			&stream.CreatedAt, &stream.UpdatedAt,
+			&capturedAt,
+			&capturesTotal, &capturesSuccess, &capturesError,
+			&runtimeStatus, &runtimeMode, &runtimeResolved, &runtimeLastFrame, &runtimeErrors, &runtimeError,
+			&inferencedCaptures, &personDetectionsTotal, &avgPeoplePerInferencedCapture,
+		); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan dashboard stream: %v", err))
 			return
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var stream model.Stream
-			var metaBytes []byte
-			var cfgBytes []byte
-			var state string
-			var capturedAt *time.Time
-			var capturesTotal, capturesSuccess, capturesError int64
-			var inferencedCaptures, personDetectionsTotal int64
-			var avgPeoplePerInferencedCapture float64
-			var runtimeStatus, runtimeMode, runtimeResolved, runtimeError *string
-			var runtimeLastFrame *time.Time
-			var runtimeErrors *int
-			if err := rows.Scan(
-				&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
-				&stream.SourceFamily,
-				&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
-				&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
-				&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
-				&stream.CreatedAt, &stream.UpdatedAt,
-				&capturedAt,
-				&capturesTotal, &capturesSuccess, &capturesError,
-				&runtimeStatus, &runtimeMode, &runtimeResolved, &runtimeLastFrame, &runtimeErrors, &runtimeError,
-				&inferencedCaptures, &personDetectionsTotal, &avgPeoplePerInferencedCapture,
-			); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan dashboard stream: %v", err))
-				return
-			}
-			stream.RecordingState = model.RecordingState(state)
-			if err := decodeStreamPayload(&stream, metaBytes, cfgBytes); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("decode stream metadata: %v", err))
-				return
-			}
-			stream.CaptureRuntimeStatus = runtimeStatus
-			stream.CaptureRuntimeClass = runtimeMode
-			stream.CaptureRuntimeResolved = runtimeResolved
-			stream.CaptureRuntimeLastSeen = runtimeLastFrame
-			stream.CaptureRuntimeErrors = runtimeErrors
-			stream.CaptureRuntimeError = runtimeError
-			it := item{
-				Stream:                        stream,
-				LatestCaptured:                capturedAt,
-				CapturesTotal:                 capturesTotal,
-				CapturesSuccess:               capturesSuccess,
-				CapturesError:                 capturesError,
-				InferencedCaptures:            inferencedCaptures,
-				PersonDetectionsTotal:         personDetectionsTotal,
-				AvgPeoplePerInferencedCapture: avgPeoplePerInferencedCapture,
-				CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
-			}
-			if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-				if it.TargetFPS <= 0 {
-					it.TargetFPS = 10
-				}
-				it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
-				if runtimeLastFrame != nil {
-					it.LatestCaptured = runtimeLastFrame
-				}
-			} else if stream.RecordingState == model.RecordingStateOn {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-				if it.TargetFPS <= 0 {
-					it.TargetFPS = 10
-				}
-				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
-			} else {
-				it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-				if it.TargetFPS <= 0 {
-					it.TargetFPS = 10
-				}
-				it.ExpectedFrames60s = int64(it.TargetFPS) * 60
-			}
-			items = append(items, it)
-		}
-		if rows.Err() != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate dashboard streams: %v", rows.Err()))
+		stream.RecordingState = model.RecordingState(state)
+		if err := decodeStreamPayload(&stream, metaBytes, cfgBytes); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("decode stream metadata: %v", err))
 			return
 		}
+		stream.CaptureRuntimeStatus = runtimeStatus
+		stream.CaptureRuntimeClass = runtimeMode
+		stream.CaptureRuntimeResolved = runtimeResolved
+		stream.CaptureRuntimeLastSeen = runtimeLastFrame
+		stream.CaptureRuntimeErrors = runtimeErrors
+		stream.CaptureRuntimeError = runtimeError
+		it := item{
+			Stream:                        stream,
+			LatestCaptured:                capturedAt,
+			CapturesTotal:                 capturesTotal,
+			CapturesSuccess:               capturesSuccess,
+			CapturesError:                 capturesError,
+			InferencedCaptures:            inferencedCaptures,
+			PersonDetectionsTotal:         personDetectionsTotal,
+			AvgPeoplePerInferencedCapture: avgPeoplePerInferencedCapture,
+			CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
+		}
+		if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
+			it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+			if it.TargetFPS <= 0 {
+				it.TargetFPS = 10
+			}
+			it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
+			if runtimeLastFrame != nil {
+				it.LatestCaptured = runtimeLastFrame
+			}
+		} else if stream.RecordingState == model.RecordingStateOn {
+			it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+			if it.TargetFPS <= 0 {
+				it.TargetFPS = 10
+			}
+			it.ExpectedFrames60s = int64(it.TargetFPS) * 60
+		} else {
+			it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
+			if it.TargetFPS <= 0 {
+				it.TargetFPS = 10
+			}
+			it.ExpectedFrames60s = int64(it.TargetFPS) * 60
+		}
+		items = append(items, it)
+	}
+	if rows.Err() != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate dashboard streams: %v", rows.Err()))
+		return
 	}
 
 	if len(items) > 0 {
@@ -4339,11 +4179,6 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		processIssueCounts2h, err := s.recordingProcessIssueCountsSince(r.Context(), 2*time.Hour)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard process issue counters query: %v", err))
-			return
-		}
-		outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 2*time.Hour, 2*time.Minute)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard outage counters query: %v", err))
 			return
 		}
 		now := time.Now().UTC()
@@ -4378,7 +4213,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 						LossRate10m:      lossRateForWindow(items[i].ExpectedFrames60s, items[i].SuccessFrames60s),
 						LossRate2h:       items[i].LossRatePct,
 						ProcessIssues2h:  processIssueCounts2h[items[i].Stream.ID],
-						OutageEpisodes2h: outageEpisodes2h[items[i].Stream.ID],
+						OutageEpisodes2h: -1,
 					},
 				})
 				items[i].RecordingHealth = dashboardHealthFromSupervision(state)
@@ -7363,6 +7198,7 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 
 	runsLimit := parseIntQuery(r, "runs_limit", 200, 1, 1000)
 	eventsLimit := parseIntQuery(r, "events_limit", 200, 1, 1000)
+	includeRecentCaptures := parseIntQuery(r, "include_recent_captures", 0, 0, 100)
 	recordingSettings, err := settings.GetRecordingSettings(r.Context(), s.pool)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -7576,6 +7412,30 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 
 	captureMode := firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode), assignedExecutionClass)
 	clipNative := isClipNativeExecutionClass(captureMode)
+	var recentCaptures any = []any{}
+	if includeRecentCaptures > 0 {
+		if clipNative {
+			items, err := s.queryCaptureSegments(r.Context(), captureSegmentQueryOptions{
+				StreamID:                    id,
+				Limit:                       includeRecentCaptures,
+				Offset:                      0,
+				IncludeDownloadURL:          true,
+				IncludeThumbnailDownloadURL: true,
+			})
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recent stream clips: %v", err))
+				return
+			}
+			recentCaptures = items
+		} else {
+			items, err := s.queryRecentFrameItems(r.Context(), id, includeRecentCaptures)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recent stream frames: %v", err))
+				return
+			}
+			recentCaptures = items
+		}
+	}
 	var successFrames24h, errorFrames24h int64
 	var firstCapture24h, lastCapture24h *time.Time
 	if clipNative {
@@ -7695,6 +7555,7 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		"recording_config":      map[string]any{"interval_sec": recordingSettings.CaptureIntervalSec},
 		"capture_unit":          captureUnitPlural,
 		"clip_native":           clipNative,
+		"recent_captures":       recentCaptures,
 		"current_health": map[string]any{
 			"state":                healthState,
 			"reason":               healthReason,

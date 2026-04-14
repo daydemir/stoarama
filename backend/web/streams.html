@@ -2731,6 +2731,8 @@ const streamJsonBody = $('streamJsonBody');
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let mainTab = 'streams';
+const STREAM_ROUTE = Object.freeze({ LIST: 'stream_list', DETAIL: 'stream_detail' });
+let currentStreamRoute = STREAM_ROUTE.LIST;
 let inferenceScope = 'recorded';
 let selectedPipelineID = '';
 let selectedPipelineExperimentID = 0;
@@ -4487,6 +4489,8 @@ function setDiscoveryStatus(msg, cls = '') {
 
 // ─── Panel visibility ─────────────────────────────────────────────────────────
 function showPanel(which) {
+  if (which === 'detail') currentStreamRoute = STREAM_ROUTE.DETAIL;
+  if (which === 'streams') currentStreamRoute = STREAM_ROUTE.LIST;
   if (which !== 'detail') {
     stopDetailLivePolling();
     stopDetailFrameExportPolling();
@@ -4906,17 +4910,14 @@ function startDetailLivePolling() {
     }
     detailLivePollInFlight = true;
     try {
-      await Promise.all([
-        loadDetailLiveFrames({ quiet: true }),
-        loadDetailFrames({ quiet: true }),
-      ]);
+      await loadDetailLiveFrames({ quiet: true });
     } catch (_) {
       // Keep the previous state visible; explicit status is handled by section loaders.
     } finally {
       detailLivePollInFlight = false;
       startDetailLivePolling();
     }
-  }, 1000);
+  }, 5000);
 }
 
 function ageLabel(seconds) {
@@ -5210,6 +5211,9 @@ function renderImageSlot(streamID, tableEl) {
   const scopeAttr = scope ? ` data-image-scope="${esc(scope)}"` : '';
   const streamAttr = id > 0 ? ` data-stream-id="${id}"` : '';
   const cache = streamImageCache.get(id);
+  if (cache && cache.error) {
+    return `<button class="btn-sm" type="button" data-image-retry="1"${scopeAttr}${streamAttr}>retry image</button>`;
+  }
   if (cache && cache.resolved) {
     if (!cache.rawURL) return `<span class="muted fs11">no image</span>`;
     return `<a class="table-image-link" href="${esc(cache.rawURL)}" data-image-url="${esc(cache.rawURL)}"${scopeAttr}${streamAttr}><img class="thumb-sm" src="${esc(cache.rawURL)}" alt="raw" loading="lazy" decoding="async" /></a>`;
@@ -5226,10 +5230,12 @@ function hydrateImageSlots() {
     const scopeAttr = scope ? ` data-image-scope="${esc(scope)}"` : '';
     const streamAttr = Number.isFinite(id) && id > 0 ? ` data-stream-id="${id}"` : '';
     const cache = streamImageCache.get(id);
-    if (!cache || !cache.resolved) continue;
-    if (cache.rawURL) {
+    if (!cache) continue;
+    if (cache.error) {
+      slot.outerHTML = `<button class="btn-sm" type="button" data-image-retry="1"${scopeAttr}${streamAttr}>retry image</button>`;
+    } else if (cache.resolved && cache.rawURL) {
       slot.outerHTML = `<a class="table-image-link" href="${esc(cache.rawURL)}" data-image-url="${esc(cache.rawURL)}"${scopeAttr}${streamAttr}><img class="thumb-sm" src="${esc(cache.rawURL)}" alt="raw" loading="lazy" decoding="async" /></a>`;
-    } else {
+    } else if (cache.resolved) {
       slot.outerHTML = `<span class="muted fs11">no image</span>`;
     }
   }
@@ -5248,6 +5254,7 @@ async function fetchStreamImageURLs(ids) {
     streamImageCache.set(id, {
       resolved: true,
       rawURL: it && it.latest_frame_url ? String(it.latest_frame_url) : '',
+      error: '',
     });
     inFlightImageStreamIDs.delete(id);
   }
@@ -5262,8 +5269,11 @@ function scheduleImageFetch() {
     if (!ids.length) return;
     const batch = ids.slice(0, 80);
     for (const id of batch) { queuedImageStreamIDs.delete(id); inFlightImageStreamIDs.add(id); }
-    try { await fetchStreamImageURLs(batch); } catch (_) {
-      for (const id of batch) { inFlightImageStreamIDs.delete(id); streamImageCache.set(id, { resolved: true, rawURL: '' }); }
+    try { await fetchStreamImageURLs(batch); } catch (err) {
+      for (const id of batch) {
+        inFlightImageStreamIDs.delete(id);
+        streamImageCache.set(id, { resolved: false, rawURL: '', error: String(err || 'image lookup failed') });
+      }
       hydrateImageSlots();
     }
     if (queuedImageStreamIDs.size > 0) scheduleImageFetch();
@@ -5272,7 +5282,8 @@ function scheduleImageFetch() {
 
 function queueImageLoad(streamID) {
   if (!Number.isFinite(streamID) || streamID <= 0) return;
-  if (streamImageCache.get(streamID)?.resolved) return;
+  const cached = streamImageCache.get(streamID);
+  if (cached && !cached.error && cached.resolved) return;
   if (inFlightImageStreamIDs.has(streamID)) return;
   queuedImageStreamIDs.add(streamID);
   scheduleImageFetch();
@@ -6324,6 +6335,7 @@ function applyDetailRouteStateFromURL(params) {
 }
 
 function syncStreamListURL(opts = {}) {
+  if (currentStreamRoute !== STREAM_ROUTE.LIST) return;
   const params = buildStreamFilterParams();
   if (streamSortBy) params.set('sort_by', String(streamSortBy));
   if (streamSortDir) params.set('sort_dir', normalizeSortDir(streamSortDir, 'desc'));
@@ -6336,7 +6348,7 @@ function syncStreamListURL(opts = {}) {
 }
 
 function syncDetailURL(opts = {}) {
-  if (!detailStreamID) return;
+  if (currentStreamRoute !== STREAM_ROUTE.DETAIL || !detailStreamID) return;
   const params = new URLSearchParams();
   if (detailMainView !== 'details') {
     params.set('tab', detailMainView);
@@ -8251,13 +8263,18 @@ async function loadDetail(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return;
   if (!quiet) setDetailWorkloadStatus('loading...');
-  const recordingPayload = await fetchJSON(dashboardStreamURL(detailStreamID, '/recording'));
+  const recordingParams = new URLSearchParams();
+  recordingParams.set('include_recent_captures', '24');
+  const recordingPayload = await fetchJSON(dashboardStreamURL(detailStreamID, '/recording', recordingParams));
   detailRecordingData = recordingPayload;
   const captureMeta = detailCaptureMeta(recordingPayload);
   if (!quiet && detailLiveFramesStatus) {
     detailLiveFramesStatus.textContent = `Loading recent ${captureMeta.plural}...`;
   }
-  const recentFrames = captureMeta.clipNative ? await fetchRecentClips(60) : await fetchRecentFrames(60);
+  if (!Array.isArray(recordingPayload.recent_captures)) {
+    throw new Error('recording payload missing recent_captures');
+  }
+  const recentFrames = recordingPayload.recent_captures;
   const s = recordingPayload.stream || {};
   const detailName = latinizedLabelParts(s.name);
 
@@ -8276,8 +8293,8 @@ async function loadDetail(options = {}) {
 
   const latestFrame = recentFrames.length ? recentFrames[0] : null;
   if (!captureMeta.clipNative) ensureDetailExportWindow(latestFrame);
-  if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = captureMeta.clipNative ? 'Latest 60 Clips' : 'Latest 60 Frames';
-  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = captureMeta.clipNative ? 'Auto-refreshes every few seconds while this page is open. Select any clip to preview it inline or open it in a new tab.' : 'Auto-refreshes every second while this page is open.';
+  if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = captureMeta.clipNative ? 'Latest Clips' : 'Latest Frames';
+  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = captureMeta.clipNative ? 'Auto-refreshes every few seconds while this page is open. Select any clip to preview it inline or open it in a new tab.' : 'Auto-refreshes every few seconds while this page is open.';
   if (detailExportBlock) detailExportBlock.style.display = captureMeta.clipNative ? 'none' : '';
   if (detailExportTitle) detailExportTitle.textContent = 'Export Frames';
   if (detailExportSubtitle) detailExportSubtitle.textContent = 'Download a manifest for any time window, or prepare a bounded ZIP archive.';
@@ -9352,6 +9369,18 @@ if (detailPipelineRows) detailPipelineRows.addEventListener('click', (e) => {
 // Table image modal
 document.addEventListener('click', (e) => {
   const target = e.target instanceof HTMLElement ? e.target : null;
+  const retry = target && target.closest('[data-image-retry]');
+  if (retry instanceof HTMLElement) {
+    const id = Number(retry.getAttribute('data-stream-id'));
+    const scope = String(retry.getAttribute('data-image-scope') || '').trim();
+    if (Number.isFinite(id) && id > 0) {
+      e.preventDefault();
+      streamImageCache.delete(id);
+      retry.outerHTML = renderImageSlot(id, scope);
+      queueImageLoad(id);
+    }
+    return;
+  }
   const link = target && target.closest('a.table-image-link');
   if (!(link instanceof HTMLAnchorElement)) return;
   const url = resolveImageLinkURL(link);
@@ -9453,6 +9482,8 @@ async function applyStreamsRouteState(opts = {}) {
   const { params, streamID, isList } = parseStreamsLocation();
   updateTimezoneLabels();
   if (Number.isFinite(streamID) && streamID > 0) {
+    currentStreamRoute = STREAM_ROUTE.DETAIL;
+    mainTab = 'streams';
     detailStreamID = streamID;
     applyDetailRouteStateFromURL(params);
     updateDetailTabHrefs();
@@ -9463,6 +9494,7 @@ async function applyStreamsRouteState(opts = {}) {
     return;
   }
   if (!isList) return;
+  currentStreamRoute = STREAM_ROUTE.LIST;
   mainTab = 'streams';
   detailStreamID = null;
   applyStreamListStateFromURL(params);
@@ -9483,9 +9515,9 @@ window.addEventListener('popstate', () => {
   try {
     detailHealthHoursWindow = normalizeHealthHoursWindow(localStorage.getItem('detailHealthHours') || '72');
     void resolveSessionState();
-    await loadKnownStreamTagsSafe('all');
-    await loadOverview();
     await applyStreamsRouteState();
+    void loadKnownStreamTagsSafe('all').catch(() => {});
+    void loadOverview().catch(() => {});
   } catch (err) {
     if (detailStreamID) setDetailStatus(String(err), 'err');
     else setStreamStatus(String(err), 'err');
