@@ -4749,8 +4749,8 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 			updatedTags := normalizeTags(append(currentTags, tagList[0]))
 			alreadyTagged := len(updatedTags) == len(currentTags)
 			if *apply && !alreadyTagged {
-				out := mustAPIRequest(ctx, http.MethodPatch, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/streams/%d", streamID), map[string]any{
-					"tags": updatedTags,
+				out := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/service/streams/%d/tags", streamID), map[string]any{
+					"tags": tagList,
 				})
 				updatedTags = normalizeTags(asStringSlice(out["tags"]))
 			}

@@ -344,6 +344,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/imports/streams/repair-canonical-capture", s.handleServiceStreamCanonicalCaptureRepair)
 			service.Post("/imports/streams/repair-image-capture", s.handleServiceStreamImageCaptureRepair)
 			service.Post("/imports/streams/recording-state", s.handleServiceStreamRecordingState)
+			service.Post("/service/streams/{id}/tags", s.handleServiceStreamTagsAdd)
 			service.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			service.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			service.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
