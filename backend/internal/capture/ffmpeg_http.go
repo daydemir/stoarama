@@ -9,6 +9,10 @@ func appendFFmpegHTTPInputArgs(args []string, sourceURL string, reconnect bool, 
 	if !strings.HasPrefix(sourceURL, "http://") && !strings.HasPrefix(sourceURL, "https://") {
 		return args
 	}
+	args = append(args,
+		"-rw_timeout", "15000000",
+		"-timeout", "15000000",
+	)
 	if reconnect {
 		if reconnectDelayMax < 1 {
 			reconnectDelayMax = 1

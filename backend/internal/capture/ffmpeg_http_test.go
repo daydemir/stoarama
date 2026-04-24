@@ -17,6 +17,12 @@ func TestAppendFFmpegHTTPInputArgsHTTP(t *testing.T) {
 	if !joined["-reconnect"] {
 		t.Fatalf("expected reconnect args in %#v", args)
 	}
+	if !joined["-rw_timeout"] || !joined["15000000"] {
+		t.Fatalf("expected read timeout args in %#v", args)
+	}
+	if !joined["-timeout"] {
+		t.Fatalf("expected connection timeout args in %#v", args)
+	}
 }
 
 func TestAppendFFmpegHTTPInputArgsNonHTTP(t *testing.T) {

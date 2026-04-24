@@ -24,6 +24,8 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 		"-reconnect_on_network_error 1",
 		"-reconnect_on_http_error 4xx,5xx",
 		"-reconnect_delay_max 10",
+		"-rw_timeout 15000000",
+		"-timeout 15000000",
 		"-nostdin",
 		"-fflags +discardcorrupt",
 		"-i https://example.com/live.mp4",
