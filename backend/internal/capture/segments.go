@@ -182,19 +182,22 @@ func probeSourceFrameRate(ctx context.Context, sourceURL string) *float64 {
 		return nil
 	}
 	var payload struct {
-		Streams []struct {
-			AvgFrameRate string `json:"avg_frame_rate"`
-			RFrameRate   string `json:"r_frame_rate"`
-		} `json:"streams"`
+		Streams []sourceFrameRateProbeStream `json:"streams"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		return nil
 	}
-	for _, stream := range payload.Streams {
+	return sourceFrameRateFromProbe(payload.Streams)
+}
+
+type sourceFrameRateProbeStream struct {
+	AvgFrameRate string `json:"avg_frame_rate"`
+	RFrameRate   string `json:"r_frame_rate"`
+}
+
+func sourceFrameRateFromProbe(streams []sourceFrameRateProbeStream) *float64 {
+	for _, stream := range streams {
 		if fps := parseFrameRate(stream.AvgFrameRate); fps != nil {
-			return fps
-		}
-		if fps := parseFrameRate(stream.RFrameRate); fps != nil {
 			return fps
 		}
 	}

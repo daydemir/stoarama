@@ -54,6 +54,15 @@ func TestBuildFFmpegSegmentArgsNormalizesUnknownFPS(t *testing.T) {
 	}
 }
 
+func TestSourceFrameRateProbeIgnoresRFrameRate(t *testing.T) {
+	if got := sourceFrameRateFromProbe([]sourceFrameRateProbeStream{{
+		AvgFrameRate: "0/0",
+		RFrameRate:   "90000/1",
+	}}); got != nil {
+		t.Fatalf("sourceFrameRateFromProbe returned %v for unknown average frame rate", *got)
+	}
+}
+
 func TestParseFrameRate(t *testing.T) {
 	tests := map[string]float64{
 		"25/1":       25,
