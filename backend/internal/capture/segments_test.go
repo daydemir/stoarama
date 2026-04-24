@@ -30,7 +30,6 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 		"-t 30",
 		"-map 0:v:0",
 		"-map 0:a?",
-		"-vf fps=30",
 		"-c:v libx264",
 		"-preset ultrafast",
 		"-pix_fmt yuv420p",
@@ -40,6 +39,31 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("expected %q in args: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "fps=30") {
+		t.Fatalf("segment capture should preserve source frame rate, got args: %s", joined)
+	}
+}
+
+func TestParseFrameRate(t *testing.T) {
+	tests := map[string]float64{
+		"25/1":       25,
+		"30000/1001": 29.97002997002997,
+		"30":         30,
+	}
+	for raw, want := range tests {
+		got := parseFrameRate(raw)
+		if got == nil {
+			t.Fatalf("parseFrameRate(%q)=nil", raw)
+		}
+		if diff := *got - want; diff < -0.000001 || diff > 0.000001 {
+			t.Fatalf("parseFrameRate(%q)=%v want %v", raw, *got, want)
+		}
+	}
+	for _, raw := range []string{"", "0/0", "bad", "1/0"} {
+		if got := parseFrameRate(raw); got != nil {
+			t.Fatalf("parseFrameRate(%q)=%v want nil", raw, *got)
 		}
 	}
 }

@@ -32,6 +32,7 @@ type Segment struct {
 	EndAt        time.Time
 	DurationMs   int64
 	Container    string
+	ActualFPS    *float64
 	VideoCodec   string
 	AudioCodec   string
 	AudioPresent bool
@@ -89,10 +90,12 @@ func CaptureSegment(ctx context.Context, sourceURL string) (Segment, error) {
 	videoCodec := "h264"
 	audioCodec := ""
 	audioPresent := false
+	var actualFPS *float64
 	if metaErr == nil {
 		if meta.DurationMs > 0 {
 			durationMs = meta.DurationMs
 		}
+		actualFPS = meta.ActualFPS
 		if meta.VideoCodec != "" {
 			videoCodec = meta.VideoCodec
 		}
@@ -118,6 +121,7 @@ func CaptureSegment(ctx context.Context, sourceURL string) (Segment, error) {
 		EndAt:        endAt,
 		DurationMs:   durationMs,
 		Container:    "mp4",
+		ActualFPS:    actualFPS,
 		VideoCodec:   videoCodec,
 		AudioCodec:   audioCodec,
 		AudioPresent: audioPresent,
@@ -146,7 +150,6 @@ func buildFFmpegSegmentArgs(sourceURL string, outPath string) []string {
 		"-t", seconds,
 		"-map", "0:v:0",
 		"-map", "0:a?",
-		"-vf", fmt.Sprintf("fps=%d", SegmentTargetFPS),
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
 		"-pix_fmt", "yuv420p",
@@ -200,6 +203,7 @@ func extractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentT
 
 type ffprobeMeta struct {
 	DurationMs   int64
+	ActualFPS    *float64
 	VideoCodec   string
 	AudioCodec   string
 	AudioPresent bool
@@ -211,7 +215,7 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 	cmd := exec.CommandContext(probeCtx,
 		"ffprobe",
 		"-v", "error",
-		"-show_entries", "format=duration:stream=codec_type,codec_name",
+		"-show_entries", "format=duration:stream=codec_type,codec_name,avg_frame_rate,r_frame_rate",
 		"-of", "json",
 		path,
 	)
@@ -224,8 +228,10 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 			Duration string `json:"duration"`
 		} `json:"format"`
 		Streams []struct {
-			CodecType string `json:"codec_type"`
-			CodecName string `json:"codec_name"`
+			CodecType    string `json:"codec_type"`
+			CodecName    string `json:"codec_name"`
+			AvgFrameRate string `json:"avg_frame_rate"`
+			RFrameRate   string `json:"r_frame_rate"`
 		} `json:"streams"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
@@ -243,6 +249,13 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 			if meta.VideoCodec == "" {
 				meta.VideoCodec = strings.TrimSpace(stream.CodecName)
 			}
+			if meta.ActualFPS == nil {
+				frameRate := strings.TrimSpace(stream.AvgFrameRate)
+				if frameRate == "" {
+					frameRate = strings.TrimSpace(stream.RFrameRate)
+				}
+				meta.ActualFPS = parseFrameRate(frameRate)
+			}
 		case "audio":
 			if meta.AudioCodec == "" {
 				meta.AudioCodec = strings.TrimSpace(stream.CodecName)
@@ -251,4 +264,29 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 		}
 	}
 	return meta, nil
+}
+
+func parseFrameRate(raw string) *float64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "0/0" {
+		return nil
+	}
+	parts := strings.Split(raw, "/")
+	if len(parts) == 1 {
+		value, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil || value <= 0 {
+			return nil
+		}
+		return &value
+	}
+	if len(parts) != 2 {
+		return nil
+	}
+	num, errNum := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	den, errDen := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if errNum != nil || errDen != nil || num <= 0 || den <= 0 {
+		return nil
+	}
+	value := num / den
+	return &value
 }

@@ -921,6 +921,7 @@ func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, eff
 		SegmentEndAt:       seg.EndAt,
 		DurationMs:         seg.DurationMs,
 		TargetFPS:          capture.SegmentTargetFPS,
+		ActualFPS:          seg.ActualFPS,
 		VideoCodec:         seg.VideoCodec,
 		AudioCodec:         seg.AudioCodec,
 		Container:          seg.Container,
