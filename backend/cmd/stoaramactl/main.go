@@ -117,6 +117,7 @@ func usage() {
 	  stoaramactl streams update --id N [--name N --slug S --source-url URL --recording-state off|on --tags a,b --capture-type TYPE --execution-config-json JSON --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC]
 	  stoaramactl streams tags-add (--id N | --slug S) --tags a,b
 	  stoaramactl streams tags-remove (--id N | --slug S) --tags a,b
+	  stoaramactl streams cleanup-location-tags [--recording-state off|on --limit 0 --apply --json]
 	  stoaramactl streams metadata-audit [--backend-api-url URL --api-token TOKEN --recording-state off|on --page-size 500 --sample-limit 40 --allow-generic-location-city --apply --apply-generic-location-fixes --max-updates 0]
 	  stoaramactl streams set-capture --id N --capture-type TYPE [--config-json JSON]
 	  stoaramactl streams migrate-v2 [--id N --limit 1000 --only-changed --only-review --apply --report-json out.json --json]
@@ -1029,7 +1030,7 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 }
 
 func printStreamsUsage() {
-	fmt.Print("stoaramactl streams <list|detail|page-load|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service> ...\n")
+	fmt.Print("stoaramactl streams <list|detail|page-load|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|cleanup-location-tags|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service> ...\n")
 }
 
 func printDiscoveryUsage() {
@@ -2201,6 +2202,8 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 			return
 		}
 		fmt.Printf("stream %d tags=%s\n", streamID, strings.Join(updatedTags, ","))
+	case "cleanup-location-tags":
+		runStreamsCleanupLocationTags(ctx, cfg, args[1:])
 	case "metadata-audit":
 		runStreamMetadataAudit(ctx, cfg, args[1:])
 	case "recording-interval":
@@ -2405,6 +2408,174 @@ func runDiscovery(ctx context.Context, cfg config.Config, args []string) {
 		fmt.Printf("candidate %d imported stream_id=%d slug=%s capture_type=%s execution_class=%s\n", *id, int64FromAny(stream["id"]), fmt.Sprint(stream["slug"]), fmt.Sprint(stream["capture_type"]), fmt.Sprint(stream["execution_class"]))
 	default:
 		log.Fatalf("unknown discovery candidates subcommand: %s", args[1])
+	}
+}
+
+type locationTagCleanupRow struct {
+	ID                  int64
+	Tags                []string
+	LocationCountry     string
+	LocationCountryCode string
+	LocationRegion      string
+	LocationCity        string
+}
+
+type locationTagCleanupResult struct {
+	UpdatedTags []string
+	RemovedTags []string
+}
+
+func cleanupLocationTagsForStream(row locationTagCleanupRow) locationTagCleanupResult {
+	updated := make([]string, 0, len(row.Tags))
+	removed := make([]string, 0, 4)
+	hasCountry := strings.TrimSpace(row.LocationCountry) != "" || strings.TrimSpace(row.LocationCountryCode) != ""
+	hasRegion := strings.TrimSpace(row.LocationRegion) != ""
+	hasCity := strings.TrimSpace(row.LocationCity) != ""
+	for _, tag := range row.Tags {
+		clean := strings.TrimSpace(tag)
+		if clean == "" {
+			continue
+		}
+		lower := strings.ToLower(clean)
+		drop := false
+		switch {
+		case strings.HasPrefix(lower, "city:"):
+			drop = hasCity
+		case strings.HasPrefix(lower, "country:"):
+			drop = hasCountry
+		case strings.HasPrefix(lower, "state:"):
+			drop = hasRegion
+		}
+		if drop {
+			removed = append(removed, clean)
+			continue
+		}
+		updated = append(updated, clean)
+	}
+	updated = normalizeTags(updated)
+	if updated == nil {
+		updated = []string{}
+	}
+	return locationTagCleanupResult{
+		UpdatedTags: updated,
+		RemovedTags: normalizeTags(removed),
+	}
+}
+
+func runStreamsCleanupLocationTags(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("streams cleanup-location-tags", flag.ExitOnError)
+	recordingState := fs.String("recording-state", "", "optional recording state off|on")
+	limit := fs.Int("limit", 0, "optional max streams to scan")
+	apply := fs.Bool("apply", false, "apply changes")
+	asJSON := fs.Bool("json", false, "print JSON")
+	_ = fs.Parse(args)
+	if *limit < 0 {
+		log.Fatalf("--limit must be >= 0")
+	}
+	state := strings.ToLower(strings.TrimSpace(*recordingState))
+	if state != "" && state != string(model.RecordingStateOff) && state != string(model.RecordingStateOn) {
+		log.Fatalf("--recording-state must be off|on")
+	}
+
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+
+	where := []string{"EXISTS (SELECT 1 FROM unnest(tags) t WHERE lower(trim(t)) ~ '^(city|country|state):')"}
+	queryArgs := []any{}
+	if state != "" {
+		queryArgs = append(queryArgs, state)
+		where = append(where, fmt.Sprintf("recording_state=$%d", len(queryArgs)))
+	}
+	limitClause := ""
+	if *limit > 0 {
+		queryArgs = append(queryArgs, *limit)
+		limitClause = fmt.Sprintf(" LIMIT $%d", len(queryArgs))
+	}
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT id, tags, location_country, location_country_code, location_region, location_city
+		FROM streams
+		WHERE %s
+		ORDER BY id ASC%s
+	`, strings.Join(where, " AND "), limitClause), queryArgs...)
+	if err != nil {
+		log.Fatalf("query location-tag streams: %v", err)
+	}
+	candidates := make([]locationTagCleanupRow, 0, 1024)
+	for rows.Next() {
+		var row locationTagCleanupRow
+		if err := rows.Scan(&row.ID, &row.Tags, &row.LocationCountry, &row.LocationCountryCode, &row.LocationRegion, &row.LocationCity); err != nil {
+			rows.Close()
+			log.Fatalf("scan location-tag stream: %v", err)
+		}
+		candidates = append(candidates, row)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		log.Fatalf("iterate location-tag streams: %v", err)
+	}
+	rows.Close()
+
+	type changedRow struct {
+		ID          int64    `json:"id"`
+		RemovedTags []string `json:"removed_tags"`
+		UpdatedTags []string `json:"updated_tags,omitempty"`
+	}
+	changed := make([]changedRow, 0, len(candidates))
+	removedTotal := 0
+	for _, row := range candidates {
+		result := cleanupLocationTagsForStream(row)
+		if len(result.RemovedTags) == 0 {
+			continue
+		}
+		removedTotal += len(result.RemovedTags)
+		changed = append(changed, changedRow{
+			ID:          row.ID,
+			RemovedTags: result.RemovedTags,
+			UpdatedTags: result.UpdatedTags,
+		})
+	}
+
+	if *apply && len(changed) > 0 {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			log.Fatalf("begin location-tag cleanup: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		for _, row := range changed {
+			if _, err := tx.Exec(ctx, `
+				UPDATE streams
+				SET tags=$2, updated_at=now()
+				WHERE id=$1
+			`, row.ID, row.UpdatedTags); err != nil {
+				log.Fatalf("update stream %d tags: %v", row.ID, err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			log.Fatalf("commit location-tag cleanup: %v", err)
+		}
+	}
+
+	if *asJSON {
+		printJSON(map[string]any{
+			"apply":        *apply,
+			"scanned":      len(candidates),
+			"changed":      len(changed),
+			"removed_tags": removedTotal,
+			"items":        changed,
+		})
+		return
+	}
+	action := "dry_run"
+	if *apply {
+		action = "applied"
+	}
+	fmt.Printf("location_tag_cleanup=%s scanned=%d changed=%d removed_tags=%d\n", action, len(candidates), len(changed), removedTotal)
+	for i, row := range changed {
+		if i >= 20 {
+			fmt.Printf("... %d more changed streams\n", len(changed)-i)
+			break
+		}
+		fmt.Printf("stream_id=%d removed=%s\n", row.ID, strings.Join(row.RemovedTags, ","))
 	}
 }
 
