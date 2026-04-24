@@ -64,8 +64,7 @@ func CaptureSegment(ctx context.Context, sourceURL string) (Segment, error) {
 
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
-	sourceFPS := probeSourceFrameRate(ctx, sourceURL)
-	args := buildFFmpegSegmentArgs(sourceURL, outPath, sourceFPS == nil)
+	args := buildFFmpegSegmentArgs(sourceURL, outPath)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -137,7 +136,7 @@ func CleanupSegment(seg Segment) {
 	_ = os.RemoveAll(filepath.Dir(seg.Path))
 }
 
-func buildFFmpegSegmentArgs(sourceURL string, outPath string, normalizeUnknownFPS bool) []string {
+func buildFFmpegSegmentArgs(sourceURL string, outPath string) []string {
 	seconds := strconv.FormatFloat(SegmentDuration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
@@ -151,57 +150,10 @@ func buildFFmpegSegmentArgs(sourceURL string, outPath string, normalizeUnknownFP
 		"-t", seconds,
 		"-map", "0:v:0",
 		"-map", "0:a?",
-	)
-	if normalizeUnknownFPS {
-		args = append(args, "-vf", fmt.Sprintf("fps=%d", SegmentTargetFPS))
-	}
-	args = append(args,
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-pix_fmt", "yuv420p",
-		"-c:a", "aac",
-		"-b:a", "96k",
+		"-c", "copy",
 		outPath,
 	)
 	return args
-}
-
-func probeSourceFrameRate(ctx context.Context, sourceURL string) *float64 {
-	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(probeCtx,
-		"ffprobe",
-		"-v", "error",
-		"-select_streams", "v:0",
-		"-show_entries", "stream=avg_frame_rate,r_frame_rate",
-		"-of", "json",
-		sourceURL,
-	)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	var payload struct {
-		Streams []sourceFrameRateProbeStream `json:"streams"`
-	}
-	if err := json.Unmarshal(out, &payload); err != nil {
-		return nil
-	}
-	return sourceFrameRateFromProbe(payload.Streams)
-}
-
-type sourceFrameRateProbeStream struct {
-	AvgFrameRate string `json:"avg_frame_rate"`
-	RFrameRate   string `json:"r_frame_rate"`
-}
-
-func sourceFrameRateFromProbe(streams []sourceFrameRateProbeStream) *float64 {
-	for _, stream := range streams {
-		if fps := parseFrameRate(stream.AvgFrameRate); fps != nil {
-			return fps
-		}
-	}
-	return nil
 }
 
 func extractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentThumbnail, error) {

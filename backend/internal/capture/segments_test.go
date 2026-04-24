@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", false)
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4")
 	joined := strings.Join(args, " ")
 
 	for _, unwanted := range []string{
@@ -30,11 +30,7 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 		"-t 30",
 		"-map 0:v:0",
 		"-map 0:a?",
-		"-c:v libx264",
-		"-preset ultrafast",
-		"-pix_fmt yuv420p",
-		"-c:a aac",
-		"-b:a 96k",
+		"-c copy",
 		"/tmp/segment.mp4",
 	} {
 		if !strings.Contains(joined, want) {
@@ -44,22 +40,10 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 	if strings.Contains(joined, "fps=30") {
 		t.Fatalf("segment capture should preserve source frame rate, got args: %s", joined)
 	}
-}
-
-func TestBuildFFmpegSegmentArgsNormalizesUnknownFPS(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.m3u8", "/tmp/segment.mp4", true)
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "-vf fps=30") {
-		t.Fatalf("unknown fps segment capture should default to 30fps, got args: %s", joined)
-	}
-}
-
-func TestSourceFrameRateProbeIgnoresRFrameRate(t *testing.T) {
-	if got := sourceFrameRateFromProbe([]sourceFrameRateProbeStream{{
-		AvgFrameRate: "0/0",
-		RFrameRate:   "90000/1",
-	}}); got != nil {
-		t.Fatalf("sourceFrameRateFromProbe returned %v for unknown average frame rate", *got)
+	for _, unwanted := range []string{"libx264", "-preset", "-pix_fmt", "-c:a", "-b:a"} {
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("segment capture should not transcode with %q, got args: %s", unwanted, joined)
+		}
 	}
 }
 
