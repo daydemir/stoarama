@@ -2164,10 +2164,10 @@
         <div class="toolbar">
           <label class="check-label fs11" style="color:var(--muted);">Window (days)</label>
           <select id="coverageDays" style="min-width:160px;">
-            <option value="30">last 30 days</option>
+            <option value="30" selected>last 30 days</option>
             <option value="90">last 90 days</option>
             <option value="180">last 180 days</option>
-            <option value="365" selected>last 365 days</option>
+            <option value="365">last 365 days</option>
             <option value="730">last 730 days</option>
           </select>
           <label class="check-label fs11" style="color:var(--muted);">Samples</label>
@@ -2833,7 +2833,7 @@ let streamImageObserver = null;
 
 recordingIntervalSecInput.value = '1';
 streamRecordingStateFilter.value = '';
-if (coverageDays) coverageDays.value = '365';
+if (coverageDays) coverageDays.value = '30';
 if (coverageSampleCount) coverageSampleCount.value = '42';
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -8008,7 +8008,7 @@ async function loadDetailHealth() {
 
 async function loadDetailCoverage() {
   if (!detailStreamID) return;
-  const days = Number(coverageDays.value || 365);
+  const days = Number(coverageDays.value || 30);
   const sampleCount = Number(coverageSampleCount.value || 42);
   if (!Number.isFinite(days) || days < 14 || days > 1095) {
     throw new Error('coverage days must be between 14 and 1095');

@@ -7607,7 +7607,7 @@ func (s *Server) handleDashboardStreamCoverage(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	days := parseIntQuery(r, "days", 365, 14, 1095)
+	days := parseIntQuery(r, "days", 30, 14, 1095)
 	nowUTC := time.Now().UTC()
 	endDay := time.Date(nowUTC.Year(), nowUTC.Month(), nowUTC.Day(), 0, 0, 0, 0, time.UTC)
 	startDay := endDay.AddDate(0, 0, -(days - 1))

@@ -2250,7 +2250,7 @@ let streamImageObserver = null;
 
 recordingIntervalSecInput.value = '1';
 streamRecordingStateFilter.value = '';
-if (coverageDays) coverageDays.value = '365';
+if (coverageDays) coverageDays.value = '30';
 if (coverageSampleCount) coverageSampleCount.value = '42';
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -6175,7 +6175,7 @@ function renderCoverageSamples(payload) {
 
 async function loadDetailCoverage() {
   if (!detailStreamID) return;
-  const days = Number(coverageDays.value || 365);
+  const days = Number(coverageDays.value || 30);
   const sampleCount = Number(coverageSampleCount.value || 42);
   if (!Number.isFinite(days) || days < 14 || days > 1095) {
     throw new Error('coverage days must be between 14 and 1095');
