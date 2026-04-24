@@ -14,10 +14,10 @@
   - `/api/v1/recording/servers/stopped` for server capacity cleanup.
 
 Execution-class behavior:
-- `video_live`: records HLS, HTTP video, RTSP, and RTMP streams as fixed-length clips.
+- `video_live`: records HLS, HTTP video, RTSP, and RTMP streams as source-native fixed-length clips.
 - `image_poll`: catalog/probe only; it is not recording capacity.
 
-Clip bytes are uploaded from the capture node directly to R2 through presigned URLs. Render only issues upload intents and records metadata.
+Clip capture is a hard source-copy/remux path (`ffmpeg -c copy`), not a 30fps transcode. The recorder preserves source cadence/codecs and stores `actual_fps` when `ffprobe` can report it. Normalized derivatives can be produced later by downstream jobs. Clip bytes are uploaded from the capture node directly to R2 through presigned URLs. Render only issues upload intents and records metadata.
 
 ## Usage
 
