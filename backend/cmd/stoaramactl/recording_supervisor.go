@@ -571,9 +571,7 @@ func upsertSupervisorIncident(ctx context.Context, pool *pgxpool.Pool, item map[
 		"server_id":           strings.TrimSpace(fmt.Sprint(item["server_id"])),
 		"assignment_revision": int64FromAny(item["assignment_revision"]),
 		"runtime_status":      strings.TrimSpace(fmt.Sprint(item["runtime_status"])),
-		"relay_status":        strings.TrimSpace(fmt.Sprint(item["relay_status"])),
 		"last_error_text":     strings.TrimSpace(fmt.Sprint(item["last_error_text"])),
-		"relay_error_text":    strings.TrimSpace(fmt.Sprint(item["relay_error_text"])),
 		"loss_rate_10m":       item["loss_rate_10m"],
 		"loss_rate_2h":        item["loss_rate_2h"],
 		"process_issues_2h":   item["process_issues_2h"],
@@ -937,7 +935,7 @@ func supervisorIncidentBody(appBaseURL string, item map[string]any) string {
 		name = fmt.Sprintf("stream #%d", streamID)
 	}
 	return fmt.Sprintf(
-		"Stoarama detected a recording problem that requires intervention.\n\nStream: %s (#%d)\nState: %s\nReason: %s\nServer: %s\nAssignment revision: %d\nRuntime status: %s\nRelay status: %s\nLast frame: %v\nLoss rate 2h: %v\nProcess issues 2h: %v\n\nView: %s/streams/%d\n",
+		"Stoarama detected a recording problem that requires intervention.\n\nStream: %s (#%d)\nState: %s\nReason: %s\nServer: %s\nAssignment revision: %d\nRuntime status: %s\nLast frame: %v\nLoss rate 2h: %v\nProcess issues 2h: %v\n\nView: %s/streams/%d\n",
 		name,
 		streamID,
 		strings.TrimSpace(fmt.Sprint(item["supervision_state"])),
@@ -945,7 +943,6 @@ func supervisorIncidentBody(appBaseURL string, item map[string]any) string {
 		strings.TrimSpace(fmt.Sprint(item["server_id"])),
 		int64FromAny(item["assignment_revision"]),
 		strings.TrimSpace(fmt.Sprint(item["runtime_status"])),
-		strings.TrimSpace(fmt.Sprint(item["relay_status"])),
 		item["last_frame_at"],
 		item["loss_rate_2h"],
 		item["process_issues_2h"],

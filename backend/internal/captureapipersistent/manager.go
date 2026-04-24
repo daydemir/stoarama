@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -32,8 +31,6 @@ type ManagerConfig struct {
 	FrameQueueSize            int
 	FrameEnqueueTimeout       time.Duration
 	FrameWriterWorkers        int
-	SegmentDuration           time.Duration
-	SegmentTargetFPS          int
 	StreamIDs                 []int64
 	PreferAssignedStreamIDs   bool
 	ModeAllowlist             []capture.Mode
@@ -113,12 +110,6 @@ func NewManager(client *captureapi.Client, cfg ManagerConfig) *Manager {
 	}
 	if cfg.FrameWriterWorkers <= 0 {
 		cfg.FrameWriterWorkers = 2
-	}
-	if cfg.SegmentDuration <= 0 {
-		cfg.SegmentDuration = 30 * time.Second
-	}
-	if cfg.SegmentTargetFPS <= 0 {
-		cfg.SegmentTargetFPS = 10
 	}
 	if cfg.ProcessHeartbeatInterval <= 0 {
 		cfg.ProcessHeartbeatInterval = 15 * time.Second
@@ -334,6 +325,9 @@ func (m *Manager) loadAssignedStreamFilterTargets(ctx context.Context, captureIn
 
 func streamConfigFromAssignment(asn captureapi.RecordingAssignment, captureIntervalSec int) streamConfig {
 	mode := capture.LegacyModeForStream(asn.CaptureType, asn.ExecutionClass)
+	if mode == capture.ModeYouTubeRelay {
+		mode = capture.ModeYouTubeLive
+	}
 	s := streamConfig{
 		ID:                 asn.StreamID,
 		Provider:           asn.Provider,
@@ -352,9 +346,6 @@ func streamConfigFromAssignment(asn captureapi.RecordingAssignment, captureInter
 			cloned[k] = v
 		}
 		cfg = cloned
-	}
-	if relayPullURL := strings.TrimSpace(asn.RelayPullURL); relayPullURL != "" {
-		cfg["relay_pull_url"] = relayPullURL
 	}
 	s.CaptureConfig = cfg
 	if captureIntervalSec <= 0 {
@@ -601,30 +592,6 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 		if telemetryDone != nil {
 			<-telemetryDone
 		}
-		if m.shouldPublishRelayTerminalStatus(s, effectiveMode, finalStatus) {
-			relayStatus := "stopped"
-			if finalStatus == "failed" || finalStatus == "crashed" {
-				relayStatus = "failed"
-			}
-			errorText := ""
-			if reporter != nil {
-				_, lastErr, _ := reporter.snapshot()
-				errorText = strings.TrimSpace(lastErr)
-			}
-			if err := m.client.UpdateYouTubeRelayRouteStatus(
-				context.Background(),
-				captureapi.YouTubeRelayRouteStatusRequest{
-					StreamID:     s.ID,
-					Actor:        "youtube_relay_sink",
-					Status:       relayStatus,
-					Reason:       finalStopReason,
-					ErrorText:    errorText,
-					MetadataJSON: map[string]any{"sink_server_id": strings.TrimSpace(m.cfg.ServerID)},
-				},
-			); err != nil {
-				log.Printf("capture-api-persistent stream_id=%d relay stop status update failed: %v", s.ID, err)
-			}
-		}
 		if reporter != nil {
 			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			if err := reporter.stop(stopCtx, finalStatus, finalStopReason); err != nil {
@@ -674,35 +641,6 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 	}
 
 	restartCount := 0
-	var relayRunningMu sync.Mutex
-	lastRelayRunningPublish := time.Time{}
-	publishRelayRunning := func(capturedAt time.Time, resolvedURL string) error {
-		if !m.shouldRelayRouteStatus(s, effectiveMode) {
-			return nil
-		}
-		now := time.Now().UTC()
-		relayRunningMu.Lock()
-		if !lastRelayRunningPublish.IsZero() && now.Sub(lastRelayRunningPublish) < 30*time.Second {
-			relayRunningMu.Unlock()
-			return nil
-		}
-		lastRelayRunningPublish = now
-		relayRunningMu.Unlock()
-		return m.client.UpdateYouTubeRelayRouteStatus(
-			runCtx,
-			captureapi.YouTubeRelayRouteStatusRequest{
-				StreamID:     s.ID,
-				Actor:        "youtube_relay_sink",
-				Status:       "running",
-				Reason:       "capture_persisted",
-				RelayPullURL: strings.TrimSpace(resolvedURL),
-				MetadataJSON: map[string]any{
-					"sink_server_id": strings.TrimSpace(m.cfg.ServerID),
-					"last_frame_at":  capturedAt.UTC().Format(time.RFC3339Nano),
-				},
-			},
-		)
-	}
 	for {
 		if telemetryErrCh != nil {
 			select {
@@ -756,21 +694,13 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 		}
 
 		if effectiveMode != capture.ModeImagePoll {
-			segmentCtx, cancelSegment := context.WithTimeout(runCtx, capture.SegmentCaptureTimeout(m.cfg.SegmentDuration))
-			seg, err := capture.CaptureSegment(segmentCtx, resolved.URL, m.cfg.SegmentTargetFPS, m.cfg.SegmentDuration)
+			segmentCtx, cancelSegment := context.WithTimeout(runCtx, capture.SegmentCaptureTimeout())
+			seg, err := capture.CaptureSegment(segmentCtx, resolved.URL)
 			cancelSegment()
 			if err == nil {
 				persistCtx, cancelPersist := persistCallContext(runCtx)
 				err = m.persistSegmentSuccess(persistCtx, s, effectiveMode, resolved.URL, seg)
 				cancelPersist()
-				if err == nil {
-					if routeErr := publishRelayRunning(seg.EndAt, resolved.URL); routeErr != nil {
-						if reporter != nil {
-							reporter.setLastError(routeErr.Error())
-						}
-						log.Printf("capture-api-persistent stream_id=%d relay running status update failed: %v", s.ID, routeErr)
-					}
-				}
 				capture.CleanupSegment(seg)
 			}
 			if runCtx.Err() != nil {
@@ -828,12 +758,6 @@ func (m *Manager) runManagedStream(ctx context.Context, s streamConfig) {
 						}
 						log.Printf("capture-api-persistent stream_id=%d persist success failed: %v", s.ID, err)
 						continue
-					}
-					if routeErr := publishRelayRunning(ev.capturedAt, resolved.URL); routeErr != nil {
-						if reporter != nil {
-							reporter.setLastError(routeErr.Error())
-						}
-						log.Printf("capture-api-persistent stream_id=%d relay running status update failed: %v", s.ID, routeErr)
 					}
 					if reporter != nil {
 						reporter.setLastFrame(ev.capturedAt)
@@ -917,7 +841,7 @@ func (m *Manager) buildSpec(s streamConfig) capture.StreamSpec {
 		CaptureMode:        s.CaptureMode,
 		CaptureConfig:      s.CaptureConfig,
 		CaptureIntervalSec: intervalSec,
-		TargetFPS:          m.cfg.SegmentTargetFPS,
+		TargetFPS:          capture.SegmentTargetFPS,
 		MaxFrameBytes:      m.cfg.MaxFrameBytes,
 	}
 }
@@ -956,20 +880,6 @@ func (m *Manager) persistSuccess(ctx context.Context, s streamConfig, ev frameEv
 }
 
 func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, effective capture.Mode, resolvedURL string, seg capture.Segment) error {
-	body, err := os.ReadFile(seg.Path)
-	if err != nil {
-		return fmt.Errorf("read segment: %w", err)
-	}
-	var thumbnailBytes []byte
-	var thumbnailMIME string
-	if seg.Thumbnail != nil && strings.TrimSpace(seg.Thumbnail.Path) != "" {
-		if b, err := os.ReadFile(seg.Thumbnail.Path); err != nil {
-			log.Printf("capture-api-persistent stream_id=%d thumbnail read failed: %v", s.ID, err)
-		} else {
-			thumbnailBytes = b
-			thumbnailMIME = strings.TrimSpace(seg.Thumbnail.MIMEType)
-		}
-	}
 	intent, err := m.client.ReserveSegmentUpload(ctx, captureapi.SegmentUploadIntentRequest{
 		StreamID:  s.ID,
 		MimeType:  seg.MIMEType,
@@ -978,8 +888,24 @@ func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, eff
 	if err != nil {
 		return fmt.Errorf("reserve segment upload: %w", err)
 	}
-	if err := m.client.UploadSegment(ctx, intent.UploadURL, body, seg.MIMEType); err != nil {
+	if err := m.client.UploadFile(ctx, intent.UploadURL, seg.Path, seg.MIMEType); err != nil {
 		return fmt.Errorf("upload segment: %w", err)
+	}
+	var thumbnailIntent *captureapi.SegmentUploadIntent
+	if seg.Thumbnail != nil && strings.TrimSpace(seg.Thumbnail.Path) != "" {
+		intent, err := m.client.ReserveSegmentThumbnailUpload(ctx, captureapi.SegmentUploadIntentRequest{
+			StreamID:  s.ID,
+			MimeType:  seg.Thumbnail.MIMEType,
+			SizeBytes: seg.Thumbnail.SizeBytes,
+			StartAt:   seg.StartAt,
+		})
+		if err != nil {
+			log.Printf("capture segment thumbnail upload skipped stream_id=%d start=%s error=%v", s.ID, seg.StartAt.UTC().Format(time.RFC3339), err)
+		} else if err := m.client.UploadFile(ctx, intent.UploadURL, seg.Thumbnail.Path, seg.Thumbnail.MIMEType); err != nil {
+			log.Printf("capture segment thumbnail upload skipped stream_id=%d start=%s error=%v", s.ID, seg.StartAt.UTC().Format(time.RFC3339), err)
+		} else {
+			thumbnailIntent = &intent
+		}
 	}
 	return m.client.IngestSegmentSuccess(ctx, captureapi.IngestSegmentSuccessRequest{
 		StreamID:           s.ID,
@@ -994,36 +920,34 @@ func (m *Manager) persistSegmentSuccess(ctx context.Context, s streamConfig, eff
 		SegmentStartAt:     seg.StartAt,
 		SegmentEndAt:       seg.EndAt,
 		DurationMs:         seg.DurationMs,
-		TargetFPS:          m.cfg.SegmentTargetFPS,
+		TargetFPS:          capture.SegmentTargetFPS,
 		VideoCodec:         seg.VideoCodec,
 		AudioCodec:         seg.AudioCodec,
 		Container:          seg.Container,
 		AudioPresent:       seg.AudioPresent,
-		ThumbnailBytes:     thumbnailBytes,
-		ThumbnailMIMEType:  thumbnailMIME,
 		RecordingHeartbeat: m.shouldRecordingHeartbeat(effective),
+		ThumbnailIntent:    thumbnailIntent,
+		ThumbnailSizeBytes: thumbnailSizeBytes(seg.Thumbnail),
+		ThumbnailSHA256:    thumbnailSHA256(seg.Thumbnail),
 	})
+}
+
+func thumbnailSizeBytes(thumb *capture.SegmentThumbnail) int64 {
+	if thumb == nil {
+		return 0
+	}
+	return thumb.SizeBytes
+}
+
+func thumbnailSHA256(thumb *capture.SegmentThumbnail) string {
+	if thumb == nil {
+		return ""
+	}
+	return strings.TrimSpace(thumb.SHA256)
 }
 
 func (m *Manager) shouldRecordingHeartbeat(effective capture.Mode) bool {
 	return m.cfg.RecordingHeartbeat && effective == capture.ModeYouTubeLive
-}
-
-func (m *Manager) shouldRelayRouteStatus(s streamConfig, effective capture.Mode) bool {
-	return s.Assigned &&
-		s.AssignmentRevision > 0 &&
-		effective == capture.ModeYouTubeRelay &&
-		strings.TrimSpace(m.cfg.ServerID) != ""
-}
-
-func (m *Manager) shouldPublishRelayTerminalStatus(s streamConfig, effective capture.Mode, finalStatus string) bool {
-	if !m.shouldRelayRouteStatus(s, effective) {
-		return false
-	}
-	// Clip-native relay workers restart cleanly between segments and on reconcile. Do not
-	// downgrade a healthy route to stopped on ordinary shutdown; only publish terminal sink
-	// status when the session actually failed.
-	return finalStatus == "failed" || finalStatus == "crashed"
 }
 
 func (m *Manager) recordSessionError(ctx context.Context, s streamConfig, effective capture.Mode, resolvedURL string, runErr error) (bool, error) {
@@ -1038,22 +962,6 @@ func (m *Manager) recordSessionError(ctx context.Context, s streamConfig, effect
 	})
 	if err != nil {
 		return false, err
-	}
-	if m.shouldRelayRouteStatus(s, effective) {
-		if err := m.client.UpdateYouTubeRelayRouteStatus(
-			ctx,
-			captureapi.YouTubeRelayRouteStatusRequest{
-				StreamID:     s.ID,
-				Actor:        "youtube_relay_sink",
-				Status:       "failed",
-				Reason:       relayRouteReasonForError(errText),
-				RelayPullURL: strings.TrimSpace(resolvedURL),
-				ErrorText:    errText,
-				MetadataJSON: map[string]any{"sink_server_id": strings.TrimSpace(m.cfg.ServerID)},
-			},
-		); err != nil {
-			return false, err
-		}
 	}
 	if consecutive >= m.cfg.UnsupportedErrorThreshold {
 		reason := fmt.Sprintf("capture disabled after %d consecutive errors: %s", consecutive, errText)
@@ -1075,18 +983,4 @@ func sourceKindForMode(mode capture.Mode) string {
 func persistCallContext(parent context.Context) (context.Context, context.CancelFunc) {
 	_ = parent
 	return context.WithTimeout(context.Background(), 20*time.Second)
-}
-
-func relayRouteReasonForError(errText string) string {
-	lower := strings.ToLower(strings.TrimSpace(errText))
-	switch {
-	case strings.Contains(lower, "404 not found") || strings.Contains(lower, "server returned 404") || strings.Contains(lower, "the server returned 404"):
-		return "relay_404"
-	case strings.Contains(lower, "401"), strings.Contains(lower, "403"), strings.Contains(lower, "unauthorized"), strings.Contains(lower, "forbidden"):
-		return "relay_auth_failed"
-	case strings.Contains(lower, "connection refused"), strings.Contains(lower, "no route to host"), strings.Contains(lower, "dial tcp"), strings.Contains(lower, "i/o timeout"):
-		return "relay_source_unreachable"
-	default:
-		return "relay_stream_error"
-	}
 }

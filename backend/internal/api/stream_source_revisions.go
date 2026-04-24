@@ -10,7 +10,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -76,37 +75,6 @@ func insertStreamSourceRevisionTx(ctx context.Context, tx pgx.Tx, in streamSourc
 	)
 	if err != nil {
 		return fmt.Errorf("insert source revision: %w", err)
-	}
-	return nil
-}
-
-func (s *Server) resetYouTubeRelayRouteForSourceChangeTx(
-	ctx context.Context,
-	tx pgx.Tx,
-	stream model.Stream,
-	assignment recordingAssignmentRow,
-	actor string,
-	reason string,
-) error {
-	if strings.TrimSpace(assignment.ExecutionClass) != capture.ExecutionClassYouTubeRelay {
-		return nil
-	}
-	if err := s.clearYouTubeRelayRouteTx(ctx, tx, stream.ID, actor, reason); err != nil {
-		return fmt.Errorf("clear youtube relay route for source change: %w", err)
-	}
-	if _, err := s.allocateYouTubeRelayRouteTx(ctx, tx, stream, assignment.ServerID, assignment.Revision, actor, reason); err != nil {
-		return fmt.Errorf("allocate youtube relay route after source change: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE stream_capture_runtime
-		SET
-			status='stopped',
-			last_error_text=NULL,
-			consecutive_errors=0,
-			updated_at=now()
-		WHERE stream_id=$1
-	`, stream.ID); err != nil {
-		return fmt.Errorf("reset capture runtime after source change: %w", err)
 	}
 	return nil
 }

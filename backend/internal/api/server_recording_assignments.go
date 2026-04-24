@@ -54,8 +54,6 @@ type recordingAssignmentItem struct {
 	SourcePageURL       string     `json:"source_page_url,omitempty"`
 	CaptureType         string     `json:"capture_type,omitempty"`
 	CaptureConfigJSON   any        `json:"execution_config_json,omitempty"`
-	RelayPullURL        string     `json:"relay_pull_url,omitempty"`
-	RelayStatus         string     `json:"relay_status,omitempty"`
 	RecordingRuntimeAt  *time.Time `json:"last_frame_at,omitempty"`
 	RecordingRuntimeErr *string    `json:"last_error_text,omitempty"`
 }
@@ -101,37 +99,14 @@ type recordingServerStoppedRequest struct {
 
 const recordingCapacityGroupCaptureShared = "capture_shared"
 
-const (
-	youtubeRelayRouteStatusAssigned    = "assigned"
-	youtubeRelayRouteStatusSourceReady = "source_ready"
-	youtubeRelayRouteStatusRunning     = "running"
-	youtubeRelayRouteStatusStopped     = "stopped"
-	youtubeRelayRouteStatusFailed      = "failed"
-)
-
-func validYouTubeRelayRouteStatus(status string) bool {
-	switch strings.TrimSpace(strings.ToLower(status)) {
-	case youtubeRelayRouteStatusAssigned,
-		youtubeRelayRouteStatusSourceReady,
-		youtubeRelayRouteStatusRunning,
-		youtubeRelayRouteStatusStopped,
-		youtubeRelayRouteStatusFailed:
-		return true
-	default:
-		return false
-	}
-}
-
 func recordingCapacityGroup(executionClass string) string {
 	switch normalized, ok := capture.NormalizeExecutionClass(executionClass); {
 	case !ok:
 		return strings.TrimSpace(executionClass)
-	case normalized == capture.ExecutionClassVideoLive || normalized == capture.ExecutionClassImagePoll:
+	case normalized == capture.ExecutionClassVideoLive:
 		return recordingCapacityGroupCaptureShared
 	case normalized == capture.ExecutionClassYouTubeDirect:
 		return capture.ExecutionClassYouTubeDirect
-	case normalized == capture.ExecutionClassYouTubeRelay:
-		return capture.ExecutionClassYouTubeRelay
 	default:
 		return normalized
 	}
@@ -140,7 +115,7 @@ func recordingCapacityGroup(executionClass string) string {
 func recordingCapacityGroupModes(executionClass string) []string {
 	switch recordingCapacityGroup(executionClass) {
 	case recordingCapacityGroupCaptureShared:
-		return []string{capture.ExecutionClassVideoLive, capture.ExecutionClassImagePoll}
+		return []string{capture.ExecutionClassVideoLive}
 	default:
 		if normalized, ok := capture.NormalizeExecutionClass(executionClass); ok {
 			return []string{normalized}
@@ -226,7 +201,7 @@ func (g *recordingCapacityGroupSnapshot) stateForExecutionClass(executionClass s
 
 func recordingRequestedExecutionClass(stream model.Stream) (string, error) {
 	if captureType, ok := capture.NormalizeCaptureType(stream.CaptureType); ok && captureType == capture.CaptureTypeYouTubeWatch {
-		return capture.ExecutionClassYouTubeRelay, nil
+		return capture.ExecutionClassYouTubeDirect, nil
 	}
 	executionMode := runtimeModeForStream(stream)
 	executionClass := capture.ModeToExecutionClass(executionMode)
@@ -256,8 +231,10 @@ func recordingAllowedExecutionClassesWithPreference(stream model.Stream, preferr
 	captureType, _ := capture.NormalizeCaptureType(stream.CaptureType)
 	if captureType == capture.CaptureTypeYouTubeWatch {
 		switch preferred {
-		case capture.ExecutionClassYouTubeDirect, capture.ExecutionClassYouTubeRelay:
+		case capture.ExecutionClassYouTubeDirect:
 			return preferred, []string{preferred}, nil
+		case capture.ExecutionClassYouTubeRelay:
+			return "", nil, fmt.Errorf("preferred execution_class youtube_relay is disabled for new youtube assignments")
 		default:
 			return "", nil, fmt.Errorf("preferred execution_class is not compatible with youtube_watch")
 		}
@@ -468,27 +445,6 @@ func (s *Server) assignRecordingStreamTx(ctx context.Context, tx pgx.Tx, stream 
 		}
 	}
 
-	var relayRoute map[string]any
-	if target.ExecutionClass == capture.ExecutionClassYouTubeRelay {
-		relayRoute, err = s.allocateYouTubeRelayRouteTx(ctx, tx, stream, target.ServerID, nextRevision, actor, reason)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return map[string]any{
-					"error":           "no active youtube relay source capacity",
-					"error_code":      "youtube_relay_source_unavailable",
-					"server_id":       target.ServerID,
-					"execution_class": target.ExecutionClass,
-					"stream_id":       stream.ID,
-				}, http.StatusConflict, nil
-			}
-			return nil, 0, fmt.Errorf("allocate youtube relay route: %w", err)
-		}
-	} else if existing && strings.TrimSpace(existingExecutionClass) == capture.ExecutionClassYouTubeRelay {
-		if err := s.clearYouTubeRelayRouteTx(ctx, tx, stream.ID, actor, "assignment execution class changed"); err != nil {
-			return nil, 0, fmt.Errorf("clear youtube relay route: %w", err)
-		}
-	}
-
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO recording_assignments (
 			stream_id, server_id, execution_class, assignment_revision,
@@ -536,7 +492,6 @@ func (s *Server) assignRecordingStreamTx(ctx context.Context, tx pgx.Tx, stream 
 		"assigned_count":      assignedCount + 1,
 		"free_slots":          freeSlots,
 		"lease_expires_at":    leaseExpiresAt,
-		"youtube_relay_route": relayRoute,
 	}, 0, nil
 }
 
@@ -1202,11 +1157,6 @@ func (s *Server) unassignRecordingStreamTx(ctx context.Context, tx pgx.Tx, strea
 	if err != nil || !existed {
 		return assignment, existed, err
 	}
-	if strings.TrimSpace(assignment.ExecutionClass) == capture.ExecutionClassYouTubeRelay {
-		if err := s.clearYouTubeRelayRouteTx(ctx, tx, streamID, actor, reason); err != nil {
-			return recordingAssignmentRow{}, false, err
-		}
-	}
 	if _, err := tx.Exec(ctx, `DELETE FROM recording_assignments WHERE stream_id=$1`, streamID); err != nil {
 		return recordingAssignmentRow{}, false, err
 	}
@@ -1285,13 +1235,10 @@ func (s *Server) handleRecordingAssignmentsList(w http.ResponseWriter, r *http.R
 			s.source_page_url,
 			s.capture_type,
 			s.execution_config_jsonb,
-			COALESCE(yr.relay_pull_url, '') AS relay_pull_url,
-			COALESCE(yr.status, '') AS relay_status,
 			rt.last_frame_at,
 			rt.last_error_text
 		FROM recording_assignments ra
 		JOIN streams s ON s.id=ra.stream_id
-		LEFT JOIN youtube_relay_routes yr ON yr.stream_id=ra.stream_id
 		LEFT JOIN stream_capture_runtime rt ON rt.stream_id=ra.stream_id
 		WHERE %s
 		ORDER BY ra.server_id ASC, ra.execution_class ASC, ra.stream_id ASC
@@ -1311,7 +1258,7 @@ func (s *Server) handleRecordingAssignmentsList(w http.ResponseWriter, r *http.R
 			&it.StreamID, &it.ServerID, &it.ExecutionClass, &it.AssignmentRevision, &it.AssignedBy,
 			&it.AssignedReason, &it.AssignedAt, &it.UpdatedAt,
 			&it.StreamName, &it.StreamSlug, &it.Provider, &it.StreamURL, &it.SourcePageURL,
-			&it.CaptureType, &cfgBytes, &it.RelayPullURL, &it.RelayStatus, &it.RecordingRuntimeAt, &it.RecordingRuntimeErr,
+			&it.CaptureType, &cfgBytes, &it.RecordingRuntimeAt, &it.RecordingRuntimeErr,
 		); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan recording assignment: %v", err))
 			return
@@ -1538,6 +1485,14 @@ func (s *Server) handleRecordingServerHeartbeat(w http.ResponseWriter, r *http.R
 			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid execution_class %q", item.ExecutionClass))
 			return
 		}
+		if executionClass == capture.ExecutionClassYouTubeRelay {
+			util.WriteError(w, http.StatusBadRequest, "execution_class youtube_relay is gone; use youtube_direct")
+			return
+		}
+		if executionClass == capture.ExecutionClassImagePoll {
+			util.WriteError(w, http.StatusBadRequest, "execution_class image_poll is gone for recording capacity; use video_live")
+			return
+		}
 		if item.MaxActive < 0 {
 			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid max_active for execution_class %s", executionClass))
 			return
@@ -1660,139 +1615,6 @@ func (s *Server) handleDashboardRecordingServerCapacity(w http.ResponseWriter, r
 		"include_inactive": includeInactive,
 		"total":            len(items),
 	})
-}
-
-func (s *Server) allocateYouTubeRelayRouteTx(
-	ctx context.Context,
-	tx pgx.Tx,
-	stream model.Stream,
-	sinkServerID string,
-	assignmentRevision int64,
-	actor string,
-	reason string,
-) (map[string]any, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT
-			src.server_id,
-			src.shard_id,
-			src.max_active,
-			(
-				SELECT COUNT(*)::bigint
-				FROM youtube_relay_routes r
-				WHERE r.source_server_id=src.server_id
-				  AND r.status IN ('assigned', 'source_ready', 'running')
-				  AND r.stream_id <> $1
-			) AS active_count
-		FROM youtube_relay_sources src
-		WHERE src.lease_expires_at > now()
-		  AND src.draining=false
-		ORDER BY active_count ASC, src.server_id ASC
-		FOR UPDATE OF src
-	`, stream.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	sourceServerID := ""
-	sourceShardID := ""
-	sourceMaxActive := 0
-	sourceActiveCount := int64(0)
-	for rows.Next() {
-		var serverID string
-		var shardID string
-		var maxActive int
-		var activeCount int64
-		if err := rows.Scan(&serverID, &shardID, &maxActive, &activeCount); err != nil {
-			return nil, err
-		}
-		if maxActive <= int(activeCount) {
-			continue
-		}
-		sourceServerID = strings.TrimSpace(serverID)
-		sourceShardID = strings.TrimSpace(shardID)
-		sourceMaxActive = maxActive
-		sourceActiveCount = activeCount
-		break
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
-	if sourceServerID == "" {
-		return nil, pgx.ErrNoRows
-	}
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO youtube_relay_routes (
-			stream_id, source_server_id, sink_server_id, assignment_revision,
-			status, relay_pull_url, error_text, started_at, stopped_at, metadata_jsonb, created_at, updated_at
-		)
-		VALUES ($1, $2, $3, $4, 'assigned', '', '', NULL, NULL, '{}'::jsonb, now(), now())
-		ON CONFLICT (stream_id)
-		DO UPDATE SET
-			source_server_id=EXCLUDED.source_server_id,
-			sink_server_id=EXCLUDED.sink_server_id,
-			assignment_revision=EXCLUDED.assignment_revision,
-			status='assigned',
-			relay_pull_url='',
-			error_text='',
-			started_at=NULL,
-			stopped_at=NULL,
-			metadata_jsonb='{}'::jsonb,
-			updated_at=now()
-	`, stream.ID, sourceServerID, sinkServerID, assignmentRevision); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO youtube_relay_events (
-			stream_id, source_server_id, sink_server_id, status, actor, reason, error_text, metadata_jsonb
-		)
-		VALUES ($1, $2, $3, 'assigned', $4, $5, '', '{}'::jsonb)
-	`, stream.ID, sourceServerID, sinkServerID, actor, strings.TrimSpace(reason)); err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"stream_id":             stream.ID,
-		"source_server_id":      sourceServerID,
-		"source_shard_id":       sourceShardID,
-		"sink_server_id":        sinkServerID,
-		"status":                youtubeRelayRouteStatusAssigned,
-		"source_max_active":     sourceMaxActive,
-		"source_assigned_count": sourceActiveCount + 1,
-	}, nil
-}
-
-func (s *Server) clearYouTubeRelayRouteTx(
-	ctx context.Context,
-	tx pgx.Tx,
-	streamID int64,
-	actor string,
-	reason string,
-) error {
-	var sourceServerID, sinkServerID string
-	if err := tx.QueryRow(ctx, `
-		SELECT source_server_id, sink_server_id
-		FROM youtube_relay_routes
-		WHERE stream_id=$1
-	`, streamID).Scan(&sourceServerID, &sinkServerID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		return err
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM youtube_relay_routes WHERE stream_id=$1`, streamID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO youtube_relay_events (
-			stream_id, source_server_id, sink_server_id, status, actor, reason, error_text, metadata_jsonb
-		)
-		VALUES ($1, $2, $3, 'stopped', $4, $5, '', '{}'::jsonb)
-	`, streamID, sourceServerID, sinkServerID, strings.TrimSpace(actor), strings.TrimSpace(reason)); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (s *Server) loadStreamForAssignmentTx(ctx context.Context, tx pgx.Tx, streamID int64) (model.Stream, error) {

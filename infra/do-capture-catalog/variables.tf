@@ -88,7 +88,7 @@ variable "backend_api_token" {
 }
 
 variable "capture_shared_capacity" {
-  description = "Shared max active stream capacity for each catalog sweep batch."
+  description = "Shared capacity for each catalog sweep batch."
   type        = number
   default     = 10
 }

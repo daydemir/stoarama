@@ -19,7 +19,7 @@ func TestExpectedCapturesPerHourUsesRecordingSemantics(t *testing.T) {
 	}{
 		{
 			name:        "clip_native_ignores_interval",
-			class:       capture.ExecutionClassYouTubeRelay,
+			class:       capture.ExecutionClassVideoLive,
 			intervalSec: 7,
 			want:        120,
 		},

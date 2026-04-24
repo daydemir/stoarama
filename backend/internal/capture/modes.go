@@ -83,7 +83,6 @@ func NewRegistry(adapters ...Adapter) (*Registry, error) {
 func NewDefaultRegistry() (*Registry, error) {
 	return NewRegistry(
 		&youtubeLiveAdapter{},
-		&youtubeRelayAdapter{},
 		&hlsLiveAdapter{},
 		&imagePollAdapter{},
 		&ffmpegDirectAdapter{},
@@ -158,6 +157,9 @@ func EffectiveMode(spec StreamSpec) Mode {
 	}
 	if mode == ModeAuto {
 		return ClassifyMode(spec)
+	}
+	if mode == ModeYouTubeRelay {
+		return ModeYouTubeLive
 	}
 	return mode
 }

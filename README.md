@@ -24,7 +24,7 @@ Stoarama v1 is:
 - admin-curated streams
 - individual user accounts with magic-link auth
 - hosted capture with simple per-user quotas
-- user-enrolled YouTube relay source nodes
+- user-enrolled local recorder nodes
 - BYOC inference nodes
 - metadata-registered pipelines
 - private-by-default results with provenance
@@ -47,7 +47,7 @@ Feature sequence:
 - Go `1.24+`
 - Postgres
 - Cloudflare R2-compatible bucket
-- `ffmpeg` and `yt-dlp` on machines that run capture/relay flows
+- `ffmpeg` and `yt-dlp` on machines that run local capture flows
 
 ### Minimal env
 
@@ -99,9 +99,7 @@ go run ./cmd/stoarama --help
 cd backend
 go run ./cmd/stoarama auth request-link --email you@example.com
 go run ./cmd/stoarama auth configure --api-base-url http://127.0.0.1:8080 --api-key sir_...
-go run ./cmd/stoarama node enrollment-tokens create --node-type yt_relay_source
-go run ./cmd/stoarama node enroll --token sie_... --node-type yt_relay_source
-go run ./cmd/stoarama node doctor
+go run ./cmd/stoarama recording youtube run --stream-id 123 --cookies-from-browser chrome
 ```
 
 ## Render

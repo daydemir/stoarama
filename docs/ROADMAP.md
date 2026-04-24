@@ -53,6 +53,6 @@ Once Render, domain, and email are live:
 
 - import only live streams from the old system
 - migrate selected artifacts into the new bucket
-- enroll first real relay source and inference nodes
+- enroll first local recorder and inference nodes
 - move active workloads from the old stack
 - refine the web IA so it mirrors `stoaramactl`

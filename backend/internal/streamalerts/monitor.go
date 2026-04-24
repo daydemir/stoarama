@@ -41,8 +41,6 @@ type problemStream struct {
 	LastFrameAt     *time.Time
 	RuntimeUpdated  *time.Time
 	RuntimeError    string
-	RelayStatus     string
-	RelayError      string
 	StreamUpdatedAt time.Time
 }
 
@@ -156,13 +154,10 @@ func (m *Monitor) loadProblemCandidates(ctx context.Context) ([]problemStream, e
 			rt.last_frame_at,
 			rt.updated_at,
 			COALESCE(rt.last_error_text, ''),
-			COALESCE(yr.status, ''),
-			COALESCE(yr.error_text, ''),
 			s.updated_at
 		FROM streams s
 		LEFT JOIN recording_assignments ra ON ra.stream_id=s.id
 		LEFT JOIN stream_capture_runtime rt ON rt.stream_id=s.id
-		LEFT JOIN youtube_relay_routes yr ON yr.stream_id=s.id
 		WHERE s.recording_state='on'
 		ORDER BY s.id ASC
 	`)
@@ -185,8 +180,6 @@ func (m *Monitor) loadProblemCandidates(ctx context.Context) ([]problemStream, e
 			&it.LastFrameAt,
 			&it.RuntimeUpdated,
 			&it.RuntimeError,
-			&it.RelayStatus,
-			&it.RelayError,
 			&it.StreamUpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan problem candidate: %w", err)
@@ -218,14 +211,6 @@ func (m *Monitor) problemReason(it problemStream, now time.Time) string {
 	case "stopped":
 		return "capture_runtime_stopped"
 	}
-	if strings.TrimSpace(it.ExecutionClass) == "youtube_relay" {
-		switch strings.TrimSpace(it.RelayStatus) {
-		case "failed":
-			return "youtube_relay_failed"
-		case "stopped":
-			return "youtube_relay_stopped"
-		}
-	}
 	if it.LastFrameAt == nil && now.Sub(it.StreamUpdatedAt) >= threshold {
 		return "no_successful_frames"
 	}
@@ -246,8 +231,6 @@ func (m *Monitor) upsertOpenIncident(ctx context.Context, it problemStream, reas
 		"server_id":       it.ServerID,
 		"runtime_status":  it.RuntimeStatus,
 		"runtime_error":   strings.TrimSpace(it.RuntimeError),
-		"relay_status":    it.RelayStatus,
-		"relay_error":     strings.TrimSpace(it.RelayError),
 		"last_frame_at":   it.LastFrameAt,
 	}
 	detailsBytes, err := json.Marshal(details)
@@ -389,8 +372,6 @@ func (m *Monitor) problemPlainText(it problemStream, reason string) string {
 		fmt.Fprintf(&b, "Last frame: %s\n", it.LastFrameAt.UTC().Format(time.RFC3339))
 	}
 	if errText := compactAlertError(it.RuntimeError); errText != "" {
-		fmt.Fprintf(&b, "Error: %s\n", errText)
-	} else if errText := compactAlertError(it.RelayError); errText != "" {
 		fmt.Fprintf(&b, "Error: %s\n", errText)
 	}
 	if strings.TrimSpace(m.cfg.AppBaseURL) != "" {

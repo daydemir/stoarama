@@ -75,7 +75,7 @@ func (s *Server) handleDocsRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) redirectLegacyRelayGuide(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/docs/relay-guide", http.StatusMovedPermanently)
+	http.Redirect(w, r, "/docs/self-serve", http.StatusMovedPermanently)
 }
 
 func (s *Server) redirectDashboard(w http.ResponseWriter, r *http.Request) {

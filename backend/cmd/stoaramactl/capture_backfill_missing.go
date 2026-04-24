@@ -189,11 +189,6 @@ func processCaptureBackfillMissingTarget(
 	result.CaptureType = stream.CaptureType
 	result.ExecutionClass = stream.ExecutionClass
 	result.EffectiveMode = string(mode)
-	targetFPS := capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-	if targetFPS <= 0 {
-		targetFPS = 10
-	}
-
 	spec := capture.StreamSpec{
 		ID:            stream.ID,
 		Provider:      stream.Provider,
@@ -201,7 +196,7 @@ func processCaptureBackfillMissingTarget(
 		SourcePageURL: stream.SourcePageURL,
 		CaptureMode:   mode,
 		CaptureConfig: stream.ExecutionConfigJSON,
-		TargetFPS:     targetFPS,
+		TargetFPS:     capture.SegmentTargetFPS,
 	}
 
 	effective := capture.EffectiveMode(spec)
@@ -307,7 +302,7 @@ func loadCaptureBackfillMissingTargets(ctx context.Context, baseURL, apiToken st
 
 func backfillMissingEffectiveMode(stream model.Stream) capture.Mode {
 	mode := capture.LegacyModeForStream(stream.CaptureType, stream.ExecutionClass)
-	if mode == capture.ModeYouTubeRelay && strings.TrimSpace(capture.GetConfigString(stream.ExecutionConfigJSON, "relay_pull_url", "")) == "" {
+	if mode == capture.ModeYouTubeRelay {
 		return capture.ModeYouTubeLive
 	}
 	return mode

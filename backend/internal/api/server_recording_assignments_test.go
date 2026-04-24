@@ -12,7 +12,6 @@ func TestRecordingCapacityGroupModes_SharedCaptureModes(t *testing.T) {
 	got := recordingCapacityGroupModes(capture.ExecutionClassVideoLive)
 	want := []string{
 		capture.ExecutionClassVideoLive,
-		capture.ExecutionClassImagePoll,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("recordingCapacityGroupModes(video_live)=%v want %v", got, want)
@@ -20,10 +19,11 @@ func TestRecordingCapacityGroupModes_SharedCaptureModes(t *testing.T) {
 }
 
 func TestRecordingCapacityGroup_SharedCaptureModes(t *testing.T) {
-	for _, mode := range []string{capture.ExecutionClassVideoLive, capture.ExecutionClassImagePoll} {
-		if got := recordingCapacityGroup(mode); got != "capture_shared" {
-			t.Fatalf("recordingCapacityGroup(%s)=%q want capture_shared", mode, got)
-		}
+	if got := recordingCapacityGroup(capture.ExecutionClassVideoLive); got != "capture_shared" {
+		t.Fatalf("recordingCapacityGroup(video_live)=%q want capture_shared", got)
+	}
+	if got := recordingCapacityGroup(capture.ExecutionClassImagePoll); got != capture.ExecutionClassImagePoll {
+		t.Fatalf("recordingCapacityGroup(image_poll)=%q want %q", got, capture.ExecutionClassImagePoll)
 	}
 }
 
@@ -36,10 +36,9 @@ func TestRecordingCapacityGroup_NonSharedModes(t *testing.T) {
 func TestEffectiveGroupMaxActive_UsesMinimumPositive(t *testing.T) {
 	got := effectiveGroupMaxActive(6, map[string]int{
 		capture.ExecutionClassVideoLive: 6,
-		capture.ExecutionClassImagePoll: 3,
 	}, recordingCapacityGroupModes(capture.ExecutionClassVideoLive))
-	if got != 3 {
-		t.Fatalf("effectiveGroupMaxActive(...)=%d want 3", got)
+	if got != 6 {
+		t.Fatalf("effectiveGroupMaxActive(...)=%d want 6", got)
 	}
 }
 
@@ -65,7 +64,7 @@ func TestRecordingSharedCapacityInvalidReason_MismatchedCapacities(t *testing.T)
 			Present:        true,
 			MaxActive:      3,
 		},
-	}, recordingCapacityGroupModes(capture.ExecutionClassVideoLive))
+	}, []string{capture.ExecutionClassVideoLive, capture.ExecutionClassImagePoll})
 	if reason == "" {
 		t.Fatalf("expected invalid reason for mismatched shared capacity")
 	}
@@ -129,7 +128,7 @@ func TestBuildRecordingAssignmentAuditIssues_FlagsRecordingStateOff(t *testing.T
 	}
 }
 
-func TestRecordingAllowedExecutionClasses_YouTubeRelayOnly(t *testing.T) {
+func TestRecordingAllowedExecutionClasses_YouTubeDirectOnly(t *testing.T) {
 	stream := model.Stream{
 		ID:             3557,
 		Provider:       "GIGAEYES",
@@ -143,11 +142,11 @@ func TestRecordingAllowedExecutionClasses_YouTubeRelayOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recordingAllowedExecutionClasses err=%v", err)
 	}
-	if requested != capture.ExecutionClassYouTubeRelay {
-		t.Fatalf("requested=%q want %q", requested, capture.ExecutionClassYouTubeRelay)
+	if requested != capture.ExecutionClassYouTubeDirect {
+		t.Fatalf("requested=%q want %q", requested, capture.ExecutionClassYouTubeDirect)
 	}
-	if !reflect.DeepEqual(allowed, []string{capture.ExecutionClassYouTubeRelay}) {
-		t.Fatalf("allowed=%v want [%s]", allowed, capture.ExecutionClassYouTubeRelay)
+	if !reflect.DeepEqual(allowed, []string{capture.ExecutionClassYouTubeDirect}) {
+		t.Fatalf("allowed=%v want [%s]", allowed, capture.ExecutionClassYouTubeDirect)
 	}
 }
 

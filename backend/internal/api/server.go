@@ -135,14 +135,13 @@ func (s *Server) router() http.Handler {
 	r.Get("/docs", s.handleDocsRoot)
 	r.Get("/docs/getting-started", s.handleDocsApp)
 	r.Get("/docs/api", s.handleDocsApp)
-	r.Get("/docs/relay-guide", s.handleDocsApp)
+	r.Get("/docs/relay-guide", s.redirectLegacyRelayGuide)
 	r.Get("/docs/self-serve", s.handleDocsApp)
 	r.Get("/account", s.handleAccountApp)
 	r.Get("/admin", s.handleAdminApp)
 	r.Get("/dashboard", s.redirectDashboard)
 	r.Get("/dashboard/{tab}", s.redirectDashboard)
 	r.Get("/dashboard/stream/{id}", s.redirectDashboard)
-	r.Get("/docs/youtube-relay-source", s.redirectLegacyRelayGuide)
 	r.Get("/auth/complete", s.handleAccountAuthComplete)
 	r.Post("/webhooks/email/resend", s.handleResendWebhook)
 
@@ -184,10 +183,6 @@ func (s *Server) router() http.Handler {
 			node.Use(s.requireNodeAuth)
 			node.Get("/me", s.handleNodeMe)
 			node.Post("/heartbeat", s.handleNodeHeartbeat)
-			node.Post("/youtube-relay/source/heartbeat", s.handleNodeYouTubeRelaySourceHeartbeat)
-			node.Post("/youtube-relay/source/stopped", s.handleNodeYouTubeRelaySourceStopped)
-			node.Get("/youtube-relay/routes", s.handleNodeYouTubeRelayRoutesList)
-			node.Post("/youtube-relay/routes/{stream_id}/status", s.handleNodeYouTubeRelayRouteStatus)
 			node.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
 			node.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)
 			node.Post("/pipeline-runs/{id}/claims", s.handlePipelineRunClaims)
@@ -265,8 +260,6 @@ func (s *Server) router() http.Handler {
 			admin.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			admin.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			admin.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
-			admin.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
-			admin.Get("/youtube-relay/routes/{stream_id}/events", s.handleYouTubeRelayRouteEventsList)
 			admin.Patch("/streams/{id}/capture", s.handleStreamsCapturePatch)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
@@ -348,11 +341,6 @@ func (s *Server) router() http.Handler {
 			service.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			service.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			service.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
-			service.Post("/youtube-relay/sources/heartbeat", s.handleYouTubeRelaySourceHeartbeat)
-			service.Post("/youtube-relay/sources/stopped", s.handleYouTubeRelaySourceStopped)
-			service.Get("/youtube-relay/routes", s.handleYouTubeRelayRoutesList)
-			service.Get("/youtube-relay/routes/{stream_id}/events", s.handleYouTubeRelayRouteEventsList)
-			service.Post("/youtube-relay/routes/{stream_id}/status", s.handleYouTubeRelayRouteStatus)
 			service.Get("/service/capture/catalog/candidates", s.handleServiceCaptureCatalogCandidates)
 			service.Post("/processing/worker-heartbeat", s.handleProcessingWorkerHeartbeat)
 			service.Post("/processing/worker-stopped", s.handleProcessingWorkerStopped)
@@ -393,6 +381,9 @@ func normalizeExecutionClassInput(raw string) (string, error) {
 	executionClass, ok := capture.NormalizeExecutionClass(raw)
 	if !ok {
 		return "", fmt.Errorf("invalid execution_class")
+	}
+	if executionClass == capture.ExecutionClassYouTubeRelay {
+		return "", fmt.Errorf("execution_class youtube_relay is gone; use youtube_direct")
 	}
 	return executionClass, nil
 }
@@ -727,11 +718,6 @@ func (s *Server) reconcileStreamRecordingAssignments(
 		}
 	}
 	if existed {
-		if sourceChanged {
-			if err := s.resetYouTubeRelayRouteForSourceChangeTx(ctx, tx, updated, assignment, actor, sourceChangeReason); err != nil {
-				return nil, 0, fmt.Errorf("reset youtube relay route after source change: %w", err)
-			}
-		}
 		issues := buildRecordingAssignmentAuditIssues(updated, assignment, nil)
 		if len(issues) > 0 {
 			if _, _, err := s.unassignRecordingStreamTx(ctx, tx, streamID, actor, issues[0].Code); err != nil {
@@ -1286,13 +1272,14 @@ func (s *Server) handleInferenceClaimsAbandon(w http.ResponseWriter, r *http.Req
 }
 
 type uploadIntentRequest struct {
-	Kind         string `json:"kind"`
-	PipelineID   string `json:"pipeline_id"`
-	StreamID     int64  `json:"stream_id"`
-	FrameID      int64  `json:"frame_id"`
-	MimeType     string `json:"mime_type"`
-	ExpectedETag string `json:"expected_etag"`
-	SizeBytes    *int64 `json:"size_bytes"`
+	Kind           string     `json:"kind"`
+	PipelineID     string     `json:"pipeline_id"`
+	StreamID       int64      `json:"stream_id"`
+	FrameID        int64      `json:"frame_id"`
+	MimeType       string     `json:"mime_type"`
+	ExpectedETag   string     `json:"expected_etag"`
+	SizeBytes      *int64     `json:"size_bytes"`
+	SegmentStartAt *time.Time `json:"segment_start_at"`
 }
 
 func (s *Server) handleUploadIntents(w http.ResponseWriter, r *http.Request) {
@@ -1308,8 +1295,8 @@ func (s *Server) handleUploadIntents(w http.ResponseWriter, r *http.Request) {
 	if kind == "" {
 		kind = "boxed"
 	}
-	if kind != "boxed" && kind != "capture_segment" {
-		util.WriteError(w, http.StatusBadRequest, "kind must be boxed or capture_segment")
+	if kind != "boxed" && kind != "capture_segment" && kind != "capture_segment_thumbnail" {
+		util.WriteError(w, http.StatusBadRequest, "kind must be boxed, capture_segment, or capture_segment_thumbnail")
 		return
 	}
 	if kind == "boxed" {
@@ -1328,8 +1315,12 @@ func (s *Server) handleUploadIntents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if kind == "capture_segment" && req.StreamID <= 0 {
-		util.WriteError(w, http.StatusBadRequest, "stream_id is required for capture_segment")
+	if (kind == "capture_segment" || kind == "capture_segment_thumbnail") && req.StreamID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "stream_id is required for capture segment uploads")
+		return
+	}
+	if kind == "capture_segment_thumbnail" && (req.SegmentStartAt == nil || req.SegmentStartAt.IsZero()) {
+		util.WriteError(w, http.StatusBadRequest, "segment_start_at is required for capture_segment_thumbnail")
 		return
 	}
 	mimeType := strings.TrimSpace(req.MimeType)
@@ -1347,11 +1338,16 @@ func (s *Server) handleUploadIntents(w http.ResponseWriter, r *http.Request) {
 		objectKey = fmt.Sprintf("boxed/pipeline/%s/stream/%d/%04d/%02d/%02d/%s%s",
 			sanitizePathToken(req.PipelineID), req.StreamID,
 			now.Year(), int(now.Month()), now.Day(), intentID.String(), ext)
-	} else {
+	} else if kind == "capture_segment" {
 		if mimeType == "" {
 			mimeType = "video/mp4"
 		}
 		objectKey = buildCaptureSegmentObjectKey(req.StreamID, now, mimeType)
+	} else {
+		if mimeType == "" {
+			mimeType = "image/jpeg"
+		}
+		objectKey = buildCaptureSegmentThumbnailObjectKey(req.StreamID, req.SegmentStartAt.UTC())
 	}
 	expiresAt := now.Add(s.cfg.R2SignPutTTL)
 
@@ -2476,7 +2472,6 @@ func (s *Server) handleCaptureSchema(w http.ResponseWriter, r *http.Request) {
 		},
 		"execution_classes": []string{
 			capture.ExecutionClassYouTubeDirect,
-			capture.ExecutionClassYouTubeRelay,
 			capture.ExecutionClassVideoLive,
 		},
 	})
@@ -3325,7 +3320,11 @@ type captureIngestRequest struct {
 	AudioPresent       *bool      `json:"audio_present"`
 	FrameBase64        string     `json:"frame_base64"`
 	ThumbnailBase64    string     `json:"thumbnail_base64"`
+	ThumbnailIntentID  string     `json:"thumbnail_upload_intent_id"`
+	ThumbnailObjectKey string     `json:"thumbnail_object_key"`
 	ThumbnailMimeType  string     `json:"thumbnail_mime_type"`
+	ThumbnailSizeBytes *int64     `json:"thumbnail_size_bytes"`
+	ThumbnailSHA256    string     `json:"thumbnail_sha256"`
 	MimeType           string     `json:"mime_type"`
 	SourceKind         string     `json:"source_kind"`
 	CaptureError       string     `json:"capture_error"`
@@ -3366,6 +3365,8 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 	req.UploadIntentID = intentID
 	req.FrameBase64 = strings.TrimSpace(req.FrameBase64)
 	req.ThumbnailBase64 = strings.TrimSpace(req.ThumbnailBase64)
+	req.ThumbnailIntentID = strings.TrimSpace(req.ThumbnailIntentID)
+	req.ThumbnailObjectKey = strings.TrimSpace(req.ThumbnailObjectKey)
 	if req.Status == "" {
 		if req.CaptureError != "" {
 			req.Status = "error"
@@ -3433,9 +3434,14 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, "segment_start_at and segment_end_at are required for live-video clip ingest")
 			return
 		}
-		targetFPS := 10
-		if req.TargetFPS != nil && *req.TargetFPS > 0 {
-			targetFPS = *req.TargetFPS
+		targetFPS := capture.SegmentTargetFPS
+		if req.TargetFPS != nil && *req.TargetFPS != capture.SegmentTargetFPS {
+			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("target_fps must be %d", capture.SegmentTargetFPS))
+			return
+		}
+		if req.ThumbnailBase64 != "" {
+			util.WriteError(w, http.StatusBadRequest, "thumbnail_base64 is not accepted for live-video clip ingest; upload thumbnails directly to R2")
+			return
 		}
 		durationMs := int64(req.SegmentEndAt.UTC().Sub(req.SegmentStartAt.UTC()) / time.Millisecond)
 		if req.DurationMs != nil && *req.DurationMs > 0 {
@@ -3449,37 +3455,35 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 		if req.SizeBytes != nil && *req.SizeBytes > 0 {
 			sizeBytes = *req.SizeBytes
 		}
-		var thumbnailBytes []byte
-		if req.ThumbnailBase64 != "" {
-			decoded, err := base64.StdEncoding.DecodeString(req.ThumbnailBase64)
-			if err != nil {
-				util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("decode thumbnail_base64: %v", err))
-				return
-			}
-			thumbnailBytes = decoded
+		thumbnailSizeBytes := int64(0)
+		if req.ThumbnailSizeBytes != nil && *req.ThumbnailSizeBytes > 0 {
+			thumbnailSizeBytes = *req.ThumbnailSizeBytes
 		}
 		if err := s.persistCaptureSegmentSuccess(r.Context(), req.StreamID, captureSegmentFinalize{
-			IntentID:       req.UploadIntentID,
-			ObjectKey:      strings.TrimSpace(req.ObjectKey),
-			MIMEType:       strings.TrimSpace(req.MimeType),
-			SizeBytes:      sizeBytes,
-			ETag:           strings.TrimSpace(req.ETag),
-			SHA256:         strings.TrimSpace(req.SHA256),
-			SegmentStartAt: req.SegmentStartAt.UTC(),
-			SegmentEndAt:   req.SegmentEndAt.UTC(),
-			DurationMs:     durationMs,
-			TargetFPS:      targetFPS,
-			ActualFPS:      req.ActualFPS,
-			VideoCodec:     strings.TrimSpace(req.VideoCodec),
-			AudioCodec:     strings.TrimSpace(req.AudioCodec),
-			Container:      firstNonEmpty(strings.TrimSpace(req.Container), "mp4"),
-			AudioPresent:   audioPresent,
-			SourceKind:     req.SourceKind,
-			ExecutionClass: executionClass,
-			ResolvedURL:    strings.TrimSpace(req.ResolvedURL),
-			CaptureType:    capture.ResolvedCaptureTypeFromURL(strings.TrimSpace(req.ResolvedURL)),
-			ThumbnailBytes: thumbnailBytes,
-			ThumbnailMIME:  strings.TrimSpace(req.ThumbnailMimeType),
+			IntentID:           req.UploadIntentID,
+			ObjectKey:          strings.TrimSpace(req.ObjectKey),
+			MIMEType:           strings.TrimSpace(req.MimeType),
+			SizeBytes:          sizeBytes,
+			ETag:               strings.TrimSpace(req.ETag),
+			SHA256:             strings.TrimSpace(req.SHA256),
+			SegmentStartAt:     req.SegmentStartAt.UTC(),
+			SegmentEndAt:       req.SegmentEndAt.UTC(),
+			DurationMs:         durationMs,
+			TargetFPS:          targetFPS,
+			ActualFPS:          req.ActualFPS,
+			VideoCodec:         strings.TrimSpace(req.VideoCodec),
+			AudioCodec:         strings.TrimSpace(req.AudioCodec),
+			Container:          firstNonEmpty(strings.TrimSpace(req.Container), "mp4"),
+			AudioPresent:       audioPresent,
+			SourceKind:         req.SourceKind,
+			ExecutionClass:     executionClass,
+			ResolvedURL:        strings.TrimSpace(req.ResolvedURL),
+			CaptureType:        capture.ResolvedCaptureTypeFromURL(strings.TrimSpace(req.ResolvedURL)),
+			ThumbnailIntentID:  req.ThumbnailIntentID,
+			ThumbnailObjectKey: req.ThumbnailObjectKey,
+			ThumbnailMIME:      strings.TrimSpace(req.ThumbnailMimeType),
+			ThumbnailSizeBytes: thumbnailSizeBytes,
+			ThumbnailSHA256:    strings.TrimSpace(req.ThumbnailSHA256),
 		}); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("persist capture segment success: %v", err))
 			return
@@ -3968,7 +3972,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		"avg_people_per_inferenced_capture": "COALESCE(sis.avg_people_per_inferenced_capture, 0)",
 		"inferenced_captures":               "COALESCE(sis.inferenced_captures, 0)",
 		"person_detections_total":           "COALESCE(sis.person_detections_total, 0)",
-		"latest_captured_at":                "CASE WHEN s.execution_class IN ('video_live','youtube_relay') OR rt.execution_class IN ('video_live','youtube_relay') THEN COALESCE(rt.last_frame_at, sh.last_capture_at) ELSE sh.last_capture_at END",
+		"latest_captured_at":                "CASE WHEN s.execution_class='video_live' OR rt.execution_class='video_live' THEN COALESCE(rt.last_frame_at, sh.last_capture_at) ELSE sh.last_capture_at END",
 		"captures_total":                    "COALESCE(sh.captures_total, 0)",
 		"captures_success":                  "COALESCE(sh.captures_success, 0)",
 		"captures_error":                    "COALESCE(sh.captures_error, 0)",
@@ -4128,25 +4132,16 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
 		}
 		if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
-			it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-			if it.TargetFPS <= 0 {
-				it.TargetFPS = 10
-			}
+			it.TargetFPS = capture.SegmentTargetFPS
 			it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
 			if runtimeLastFrame != nil {
 				it.LatestCaptured = runtimeLastFrame
 			}
 		} else if stream.RecordingState == model.RecordingStateOn {
-			it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-			if it.TargetFPS <= 0 {
-				it.TargetFPS = 10
-			}
+			it.TargetFPS = capture.SegmentTargetFPS
 			it.ExpectedFrames60s = int64(it.TargetFPS) * 60
 		} else {
-			it.TargetFPS = capture.GetConfigInt(stream.ExecutionConfigJSON, "target_fps", 10)
-			if it.TargetFPS <= 0 {
-				it.TargetFPS = 10
-			}
+			it.TargetFPS = capture.SegmentTargetFPS
 			it.ExpectedFrames60s = int64(it.TargetFPS) * 60
 		}
 		items = append(items, it)
@@ -4700,7 +4695,6 @@ func (s *Server) handleDashboardRecordingCapacityList(w http.ResponseWriter, r *
 
 	groupOrder := []string{
 		recordingCapacityGroupCaptureShared,
-		capture.ExecutionClassYouTubeRelay,
 		capture.ExecutionClassYouTubeDirect,
 	}
 	for group := range groupTotals {
@@ -5544,70 +5538,6 @@ func (s *Server) handleDashboardServers(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 
-	youtubeRelaySourceRows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
-		SELECT server_id, shard_id, max_active, draining, heartbeat_at, lease_expires_at, metadata_jsonb
-		FROM youtube_relay_sources
-		WHERE %s
-		ORDER BY server_id ASC, shard_id ASC
-	`, heartbeatWhere), heartbeatArgs...)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query youtube relay sources: %v", err))
-		return
-	}
-	for youtubeRelaySourceRows.Next() {
-		var serverID, shardID string
-		var maxActive int
-		var draining bool
-		var metadataBytes []byte
-		var heartbeatAt, leaseExpiresAt time.Time
-		if err := youtubeRelaySourceRows.Scan(&serverID, &shardID, &maxActive, &draining, &heartbeatAt, &leaseExpiresAt, &metadataBytes); err != nil {
-			youtubeRelaySourceRows.Close()
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan youtube relay source heartbeat: %v", err))
-			return
-		}
-		metadata := map[string]any{}
-		if len(metadataBytes) > 0 {
-			if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
-				youtubeRelaySourceRows.Close()
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("decode youtube relay source metadata: %v", err))
-				return
-			}
-		}
-		it := getServerByID(serverID, metadata)
-		it.LastSeenAt = maxTimePtr(it.LastSeenAt, heartbeatAt)
-		if leaseExpiresAt.After(now) {
-			it.Active = true
-		}
-		it.ExecutionClasses = append(it.ExecutionClasses, map[string]any{
-			"server_id":        it.ServerID,
-			"execution_class":  "youtube_relay_source",
-			"capacity_group":   "youtube_relay_source",
-			"capacity":         maxActive,
-			"draining":         draining,
-			"metadata_json":    metadata,
-			"heartbeat_at":     heartbeatAt,
-			"lease_expires_at": leaseExpiresAt,
-			"active":           leaseExpiresAt.After(now),
-		})
-		appendProcess(it, map[string]any{
-			"process_id":       fmt.Sprintf("youtube-relay-source:%s:%s", strings.TrimSpace(serverID), strings.TrimSpace(shardID)),
-			"worker_id":        strings.TrimSpace(serverID),
-			"source":           "youtube_relay_source_heartbeat",
-			"worker_kind":      "capture",
-			"execution_class":  "youtube_relay_source",
-			"metadata_json":    metadata,
-			"heartbeat_at":     heartbeatAt,
-			"lease_expires_at": leaseExpiresAt,
-			"active":           leaseExpiresAt.After(now),
-		})
-	}
-	if youtubeRelaySourceRows.Err() != nil {
-		youtubeRelaySourceRows.Close()
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate youtube relay sources: %v", youtubeRelaySourceRows.Err()))
-		return
-	}
-	youtubeRelaySourceRows.Close()
-
 	processingRows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
 		SELECT worker_id, worker_kind, execution_class, pipeline_id, metadata_jsonb, heartbeat_at, lease_expires_at
 		FROM processing_worker_heartbeats
@@ -5653,7 +5583,7 @@ func (s *Server) handleDashboardServers(w http.ResponseWriter, r *http.Request) 
 		processName := strings.TrimSpace(stringFromMetadata(metadata, "process_name"))
 		processNameLower := strings.ToLower(processName)
 		isRecordingProcessHeartbeat := processNameLower == "recording-stream-runner"
-		isModeSupervisorHeartbeat := processNameLower == "capture-server-mode" || processNameLower == "youtube-server-mode"
+		isModeSupervisorHeartbeat := processNameLower == "capture-server-mode"
 		if !isRecordingProcessHeartbeat && !isModeSupervisorHeartbeat {
 			appendProcess(it, map[string]any{
 				"process_id":       workerID,
@@ -7228,28 +7158,6 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	var relayRoute map[string]any
-	var relaySourceServerID, relaySinkServerID, relayStatus, relayPullURL string
-	var relayErrorText *string
-	var relayUpdatedAt *time.Time
-	if err := s.pool.QueryRow(r.Context(), `
-		SELECT source_server_id, sink_server_id, status, relay_pull_url, error_text, updated_at
-		FROM youtube_relay_routes
-		WHERE stream_id=$1
-	`, id).Scan(&relaySourceServerID, &relaySinkServerID, &relayStatus, &relayPullURL, &relayErrorText, &relayUpdatedAt); err == nil {
-		relayRoute = map[string]any{
-			"source_server_id": relaySourceServerID,
-			"sink_server_id":   relaySinkServerID,
-			"status":           relayStatus,
-			"relay_pull_url":   relayPullURL,
-			"error_text":       relayErrorText,
-			"updated_at":       relayUpdatedAt,
-		}
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query stream relay route: %v", err))
-		return
-	}
-
 	var runtimeStatus, runtimeMode, resolvedURL, runtimeErr *string
 	var runtimeLastResolved, runtimeLastFrame *time.Time
 	var runtimeConsecutiveErrors *int
@@ -7522,32 +7430,12 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 				healthMessage = fmt.Sprintf("the latest %s is stale", captureUnitSingular)
 			}
 		}
-		if healthState != "healthy" && relayRoute != nil {
-			if status, _ := relayRoute["status"].(string); strings.EqualFold(strings.TrimSpace(status), "failed") {
-				healthReason = "relay_failed"
-				healthMessage = "relay route is failed"
-				if errText, _ := relayRoute["error_text"].(string); errText != "" {
-					lower := strings.ToLower(strings.TrimSpace(errText))
-					switch {
-					case strings.Contains(lower, "404"):
-						healthMessage = "relay route returned 404"
-					case strings.Contains(lower, "unauthorized"), strings.Contains(lower, "forbidden"), strings.Contains(lower, "401"), strings.Contains(lower, "403"):
-						healthMessage = "relay route rejected authorization"
-					case strings.Contains(lower, "dial tcp"), strings.Contains(lower, "connection refused"), strings.Contains(lower, "no route to host"), strings.Contains(lower, "i/o timeout"):
-						healthMessage = "relay source is unreachable"
-					default:
-						healthMessage = fmt.Sprintf("relay route is failed: %s", errText)
-					}
-				}
-			}
-		}
 	}
 
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"stream":                stream,
 		"runtime":               runtime,
 		"assignment":            assignment,
-		"relay_route":           relayRoute,
 		"capture_workers":       captureWorkers,
 		"active_capture_worker": activeCaptureWorker,
 		"process_runs":          processRuns,
@@ -8706,7 +8594,7 @@ func runtimeModeForStream(st model.Stream) capture.Mode {
 		CaptureMode:        mode,
 		CaptureConfig:      cfg,
 		CaptureIntervalSec: capture.GetConfigInt(cfg, "poll_interval_sec", 1),
-		TargetFPS:          capture.GetConfigInt(cfg, "target_fps", 10),
+		TargetFPS:          capture.SegmentTargetFPS,
 		MaxFrameBytes:      25 << 20,
 	}
 	return capture.EffectiveMode(spec)
@@ -8781,7 +8669,7 @@ func (s *Server) activeCountsByRuntimeMode(ctx context.Context) (map[string]int6
 			CaptureMode:        capture.LegacyModeForStream(captureType, executionClass),
 			CaptureConfig:      cfg,
 			CaptureIntervalSec: capture.GetConfigInt(cfg, "poll_interval_sec", 1),
-			TargetFPS:          capture.GetConfigInt(cfg, "target_fps", 10),
+			TargetFPS:          capture.SegmentTargetFPS,
 			MaxFrameBytes:      25 << 20,
 		})
 		counts[string(mode)]++
@@ -8890,14 +8778,14 @@ func (s *Server) successCaptureCountsSince(ctx context.Context, frameStreamIDs, 
 func isClipNativeExecutionClass(raw string) bool {
 	normalized := strings.TrimSpace(strings.ToLower(raw))
 	switch normalized {
-	case capture.ExecutionClassVideoLive, capture.ExecutionClassYouTubeRelay:
+	case capture.ExecutionClassVideoLive:
 		return true
 	case capture.ExecutionClassImagePoll:
 		return false
 	}
 	mode := capture.NormalizeMode(normalized)
 	switch mode {
-	case capture.ModeYouTubeLive, capture.ModeYouTubeRelay, capture.ModeHLSLive, capture.ModeFFmpegDirect:
+	case capture.ModeYouTubeLive, capture.ModeHLSLive, capture.ModeFFmpegDirect:
 		return true
 	default:
 		return false

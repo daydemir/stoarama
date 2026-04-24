@@ -410,15 +410,14 @@
       <section class="panel">
         <div class="section-title">
           <div>
-            <div class="eyebrow">Relay</div>
+            <div class="eyebrow">Recording</div>
             <h2>Self-serve setup</h2>
           </div>
-          <p>Relay setup docs now live under Docs instead of this page.</p>
+          <p>Local recording setup now lives under Docs.</p>
         </div>
         <div class="stack">
-          <div class="note">Use self-serve relay or node infrastructure when a source requires your own cookies, network path, or researcher-managed hardware.</div>
+          <div class="note">Use local recording when a source requires your own cookies, network path, or researcher-managed hardware.</div>
           <div class="button-row">
-            <a href="/docs/relay-guide">Relay Guide</a>
             <a href="/docs/self-serve">Self-Serve Setup</a>
           </div>
         </div>
@@ -462,19 +461,19 @@
         <div class="section-title">
           <div>
             <div class="eyebrow">Node Enrollment</div>
-            <h2>Enroll relay nodes</h2>
+            <h2>Enroll local recorder nodes</h2>
           </div>
-          <p>Create one-time enrollment tokens, then use the docs-linked setup flow on your own machine.</p>
+          <p>Create one-time enrollment tokens for local recorder infrastructure.</p>
         </div>
         <div id="enrollmentEmpty" class="empty-state">Sign in first to create node enrollment tokens.</div>
         <div id="enrollmentBox" class="hidden">
           <div class="grid-2" style="margin-bottom:12px;">
             <div>
               <label for="enrollmentLabel">Token label</label>
-              <input id="enrollmentLabel" type="text" placeholder="Mac mini relay" />
+              <input id="enrollmentLabel" type="text" placeholder="Mac mini recorder" />
             </div>
             <div class="button-row" style="align-items:end;">
-              <button id="createEnrollmentBtn" type="button">Create Relay Enrollment Token</button>
+              <button id="createEnrollmentBtn" type="button">Create Recorder Enrollment Token</button>
             </div>
           </div>
           <div id="createEnrollmentStatus" class="status"></div>
@@ -496,14 +495,14 @@
             <div class="eyebrow">Nodes</div>
             <h2>Enrolled infrastructure</h2>
           </div>
-          <p>Nodes and relay state stay bound to your account.</p>
+          <p>Nodes and recorder state stay bound to your account.</p>
         </div>
         <div id="nodesEmpty" class="empty-state">Sign in first to view enrolled nodes.</div>
         <div id="nodesBox" class="hidden">
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>Node</th><th>Heartbeat</th><th>Relay</th><th>Slots</th></tr>
+                <tr><th>Node</th><th>Heartbeat</th></tr>
               </thead>
               <tbody id="nodesRows"></tbody>
             </table>
@@ -632,18 +631,6 @@
       authFlowRedirectTimer = window.setTimeout(() => {
         window.location.assign(target);
       }, 1600);
-    }
-
-    function relaySummary(relay) {
-      if (!relay || !relay.registered) return '<span class="muted">not running</span>';
-      const ready = relay.ready ? 'ready' : 'stale';
-      const shard = relay.shard_id ? ` · ${escapeHTML(String(relay.shard_id))}` : '';
-      return `<div>${ready}${shard}</div><div class="muted mono">${escapeHTML(String(relay.server_id || ''))}</div>`;
-    }
-
-    function relaySlots(relay) {
-      if (!relay || !relay.registered) return '-';
-      return `${Number(relay.available_slots || 0)} free / ${Number(relay.max_active || 0)} total`;
     }
 
     async function copyText(text, statusEl, okText) {
@@ -783,17 +770,12 @@
     async function refreshNodes() {
       const payload = await fetchJSON('/api/v1/account/nodes');
       const items = Array.isArray(payload.items) ? payload.items : [];
-      nodesRows.innerHTML = items.map((item) => {
-        const relay = item.yt_relay_source || null;
-        return `
+      nodesRows.innerHTML = items.map((item) => `
           <tr>
             <td><b>${escapeHTML(String(item.display_name || ''))}</b><div class="muted">${escapeHTML(String(item.node_type || ''))} · ${escapeHTML(String(item.hostname || ''))}</div></td>
             <td>${escapeHTML(formatDate(item.last_heartbeat_at))}</td>
-            <td>${relaySummary(relay)}</td>
-            <td>${escapeHTML(relaySlots(relay))}</td>
           </tr>
-        `;
-      }).join('');
+        `).join('');
     }
 
     async function refreshSession() {
@@ -881,15 +863,15 @@
         const payload = await fetchJSON('/api/v1/account/node-enrollment-tokens', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ node_type: 'yt_relay_source', label }),
+          body: JSON.stringify({ node_type: 'local_recorder', label }),
         });
         const token = String(payload.token || '');
-        const enrollCmd = `stoarama node enroll --api-base-url ${window.location.origin} --token ${token} --node-type yt_relay_source --display-name "Mac mini relay"`;
-        const installCmd = 'stoarama node yt-relay-source install-launchd --public-base-url https://your-relay-host.example --cookies-from-browser chrome';
+        const enrollCmd = `stoarama node enroll --api-base-url ${window.location.origin} --token ${token} --node-type local_recorder --display-name "Mac mini recorder"`;
+        const runCmd = `stoarama recording youtube run --api-base-url ${window.location.origin} --stream-id <stream-id>`;
         renderTokenBox(newEnrollmentTokenBox, {
           title: 'Copy now. This enrollment token is shown once.',
           value: token,
-          commands: [enrollCmd, installCmd],
+          commands: [enrollCmd, runCmd],
           statusEl: createEnrollmentStatus,
         });
         setStatus(createEnrollmentStatus, 'Enrollment token created.', 'ok');

@@ -15,8 +15,8 @@ func TestProposeStreamV2MigrationYouTubeWatch(t *testing.T) {
 	if item.ProposedCaptureType != "youtube_watch" {
 		t.Fatalf("capture_type=%q want youtube_watch", item.ProposedCaptureType)
 	}
-	if item.ProposedExecutionClass != "youtube_relay" {
-		t.Fatalf("execution_class=%q want youtube_relay", item.ProposedExecutionClass)
+	if item.ProposedExecutionClass != "youtube_direct" {
+		t.Fatalf("execution_class=%q want youtube_direct", item.ProposedExecutionClass)
 	}
 	if item.ProposedSourceFamily != "watch_page" {
 		t.Fatalf("source_family=%q want watch_page", item.ProposedSourceFamily)
@@ -44,15 +44,15 @@ func TestProposeStreamV2MigrationPrefersYouTubeIdentityOverResolvedHLS(t *testin
 	if item.ProposedCaptureType != "youtube_watch" {
 		t.Fatalf("capture_type=%q want youtube_watch", item.ProposedCaptureType)
 	}
-	if item.ProposedExecutionClass != "youtube_relay" {
-		t.Fatalf("execution_class=%q want youtube_relay", item.ProposedExecutionClass)
+	if item.ProposedExecutionClass != "youtube_direct" {
+		t.Fatalf("execution_class=%q want youtube_direct", item.ProposedExecutionClass)
 	}
 	if item.ProposedSourceFamily != "watch_page" {
 		t.Fatalf("source_family=%q want watch_page", item.ProposedSourceFamily)
 	}
 }
 
-func TestProposeStreamV2MigrationKeepsRelay(t *testing.T) {
+func TestProposeStreamV2MigrationMovesRelayToDirect(t *testing.T) {
 	item := proposeStreamV2Migration(streamV2MigrationRow{
 		ID:             2,
 		Provider:       "YouTube",
@@ -62,8 +62,8 @@ func TestProposeStreamV2MigrationKeepsRelay(t *testing.T) {
 		ExecutionClass: "youtube_relay",
 	})
 
-	if item.ProposedExecutionClass != "youtube_relay" {
-		t.Fatalf("execution_class=%q want youtube_relay", item.ProposedExecutionClass)
+	if item.ProposedExecutionClass != "youtube_direct" {
+		t.Fatalf("execution_class=%q want youtube_direct", item.ProposedExecutionClass)
 	}
 	if item.ReviewRequired {
 		t.Fatalf("review_required=true want false")

@@ -40,7 +40,6 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/settings"
 	"github.com/daydemir/stoarama/backend/internal/storage"
-	"github.com/daydemir/stoarama/backend/internal/youtuberelay"
 )
 
 func main() {
@@ -63,10 +62,6 @@ func main() {
 		runMigrate(ctx, cfg, os.Args[2:])
 	case "capture":
 		runCapture(ctx, cfg, os.Args[2:])
-	case "youtube-server":
-		runYouTubeServer(ctx, cfg, os.Args[2:])
-	case "youtube-relay":
-		runYouTubeRelay(ctx, cfg, os.Args[2:])
 	case "capture-server":
 		runCaptureServer(ctx, cfg, os.Args[2:])
 	case "streams":
@@ -103,11 +98,6 @@ func usage() {
 	_, _ = os.Stdout.WriteString(`stoaramactl commands:
 	  stoaramactl migrate up [--dir infra/sql/migrations]
 	  stoaramactl capture backfill-missing [--backend-api-url URL --api-token TOKEN --limit 0 --concurrency 4 --timeout-sec 90 --dry-run --json]
-	  stoaramactl youtube-relay source run [--backend-api-url URL --api-token TOKEN --server-id ID --shard-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 30 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role source --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.2 --source-endpoint HOST:PORT --duration 0 --resolve-timeout-sec 30 --resolve-failure-threshold 3 --bind-addr :18080 --public-base-url URL --shared-token TOKEN --cache-file FILE --yt-dlp-cookies-file FILE|--yt-dlp-cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT]
-	  stoaramactl youtube-relay sink run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role sink --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.11 --relay-source-server-id ID --relay-source-public-base-url URL --duration 0]
-	  stoaramactl youtube-relay routes [--source-server-id ID --sink-server-id ID --status assigned|source_ready|running|stopped|failed --limit 500 --offset 0]
-	  stoaramactl youtube-relay doctor (--stream-id N | --source-server-id ID) [--sink-server-id ID --backend-api-url URL --api-token TOKEN --timeout-sec 20 --json]
-	  stoaramactl youtube-relay route-status --stream-id N --actor source|sink|operator --status assigned|source_ready|running|stopped|failed [--relay-pull-url URL --reason TEXT --error-text TEXT]
 	  stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]
 	  stoaramactl capture probe (--id N | --provider P --source-url URL) [--source-page-url URL --capture-type TYPE --capture-timeout-sec 60]
 	  stoaramactl capture audit --all [--concurrency 16 --timeout-sec 20 --json]
@@ -159,7 +149,7 @@ func usage() {
 	  stoaramactl pipelines runs claim --id N --claimed-by WORKER [--limit 100 --lease-sec 600 --force-rerun] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs complete --claim-id N --pipeline-id P --pipeline-run-id N --frame-id N --claimed-by WORKER [--pipeline-version-id N --summary-json JSON --raw-output-json JSON --runner-info-json JSON --detections-json JSON --signals-json JSON --started-at RFC3339 --finished-at RFC3339 --force-rerun --revision-mode force_rerun] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines runs fail --claim-id N --pipeline-id P --pipeline-run-id N --frame-id N --claimed-by WORKER --error-text TEXT [--pipeline-version-id N --runner-info-json JSON] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|yt_relay_source|local_recorder [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl nodes enrollment-token create --owner-email EMAIL --node-type inference_node|local_recorder [--label LABEL --expires-at RFC3339] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines overview [--backend-api-url URL --api-token TOKEN --include-inactive=true]
 	  stoaramactl pipelines stream-list --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines set --stream-id N --pipeline-id P --enabled=true|false [--updated-by stoaramactl --backend-api-url URL --api-token TOKEN]
@@ -189,923 +179,22 @@ func usage() {
 `)
 }
 
-func runYouTubeServer(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) < 1 || args[0] != "run" {
-		log.Fatalf("usage: stoaramactl youtube-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capacity 10 --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --max-sessions 0 --stream-ids 1,2 --duration 1h --unsupported-threshold 8 --frame-queue-size 256 --frame-enqueue-timeout-sec 8 --frame-writer-workers 6 --recording-heartbeat=false --metadata-json JSON --yt-dlp-cookies-file FILE|--yt-dlp-cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT --ffmpeg-jpeg-quality 4 --ffmpeg-threads 1 --ffmpeg-hwaccel videotoolbox --ffmpeg-reconnect=true --ffmpeg-reconnect-delay-max-sec 2]")
-	}
-	fs := flag.NewFlagSet("youtube-server run", flag.ExitOnError)
-	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-	apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-	workerID := fs.String("worker-id", defaultLocalYouTubeWorkerID(cfg.WorkerID), "worker id")
-	serverID := fs.String("server-id", defaultCaptureServerID(""), "server id")
-	refreshSec := fs.Int("refresh-sec", cfg.CaptureTickSec, "reconcile interval seconds")
-	maxSessions := fs.Int("max-sessions", 0, "maximum active youtube sessions (0=all recording-on youtube streams)")
-	capacity := fs.Int("capacity", 10, "youtube_live server capacity contribution")
-	heartbeatSec := fs.Int("heartbeat-sec", 15, "heartbeat interval seconds")
-	leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
-	streamIDsRaw := fs.String("stream-ids", "", "optional comma-separated stream ids to run")
-	duration := fs.Duration("duration", 0, "optional run duration (e.g. 30s, 5m, 8h)")
-	unsupportedThreshold := fs.Int("unsupported-threshold", cfg.CaptureUnsupportedThreshold, "mark unsupported after this many consecutive errors")
-	frameQueueSize := fs.Int("frame-queue-size", 256, "per-stream frame queue size")
-	frameEnqueueTimeoutSec := fs.Int("frame-enqueue-timeout-sec", 8, "per-stream frame enqueue timeout seconds")
-	frameWriterWorkers := fs.Int("frame-writer-workers", 6, "per-stream frame persistence workers")
-	recordingHeartbeat := fs.Bool("recording-heartbeat", false, "legacy stream runtime heartbeat; keep false for assignment-managed capture")
-	metadataJSON := fs.String("metadata-json", "{}", "server metadata JSON object")
-	ytDlpCookiesFile := fs.String("yt-dlp-cookies-file", strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FILE")), "path to yt-dlp cookies file")
-	ytDlpCookiesFromBrowser := fs.String("yt-dlp-cookies-from-browser", strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FROM_BROWSER")), "browser profile for yt-dlp cookies (e.g. chrome)")
-	ytDlpBin := fs.String("yt-dlp-bin", strings.TrimSpace(os.Getenv("YT_DLP_BIN")), "optional yt-dlp binary path")
-	ytDlpFormat := fs.String("yt-dlp-format", strings.TrimSpace(os.Getenv("YT_DLP_FORMAT")), "yt-dlp format selector (e.g. bestvideo[vcodec^=avc1]/bestvideo/best)")
-	ytDlpFormatSort := fs.String("yt-dlp-format-sort", strings.TrimSpace(os.Getenv("YT_DLP_FORMAT_SORT")), "yt-dlp format sorting expression")
-	ffmpegJpegQuality := fs.Int("ffmpeg-jpeg-quality", maxInt(1, envInt("CAPTURE_FFMPEG_JPEG_Q", 2)), "ffmpeg MJPEG quality 1..31 (lower is higher quality and more CPU)")
-	ffmpegThreads := fs.Int("ffmpeg-threads", maxInt(1, envInt("CAPTURE_FFMPEG_THREADS", 1)), "ffmpeg threads 1..8")
-	ffmpegHWAccel := fs.String("ffmpeg-hwaccel", strings.TrimSpace(os.Getenv("CAPTURE_FFMPEG_HWACCEL")), "optional ffmpeg hwaccel (e.g. videotoolbox)")
-	ffmpegReconnect := fs.Bool("ffmpeg-reconnect", envBool("CAPTURE_FFMPEG_RECONNECT", true), "enable ffmpeg reconnect for http(s) inputs")
-	ffmpegReconnectDelayMaxSec := fs.Int("ffmpeg-reconnect-delay-max-sec", maxInt(1, envInt("CAPTURE_FFMPEG_RECONNECT_DELAY_MAX_SEC", 2)), "ffmpeg reconnect delay max seconds")
-	_ = fs.Parse(args[1:])
-
-	if strings.TrimSpace(*backendAPIURL) == "" {
-		log.Fatalf("--backend-api-url is required")
-	}
-	if strings.TrimSpace(*apiToken) == "" {
-		log.Fatalf("--api-token is required")
-	}
-	if strings.TrimSpace(*workerID) == "" {
-		log.Fatalf("--worker-id is required")
-	}
-	if strings.TrimSpace(*serverID) == "" {
-		log.Fatalf("--server-id is required")
-	}
-	if *refreshSec <= 0 {
-		log.Fatalf("--refresh-sec must be > 0")
-	}
-	if *maxSessions < 0 {
-		log.Fatalf("--max-sessions must be >= 0")
-	}
-	if *capacity <= 0 {
-		log.Fatalf("--capacity must be > 0")
-	}
-	if *heartbeatSec <= 0 {
-		log.Fatalf("--heartbeat-sec must be > 0")
-	}
-	if *leaseSec <= 0 || *leaseSec > 3600 {
-		log.Fatalf("--lease-sec must be between 1 and 3600")
-	}
-	if *leaseSec <= *heartbeatSec {
-		log.Fatalf("--lease-sec must be greater than --heartbeat-sec")
-	}
-	if *maxSessions > 0 && *maxSessions > *capacity {
-		log.Fatalf("--max-sessions must be <= --capacity when max-sessions > 0")
-	}
-	if *unsupportedThreshold <= 0 {
-		log.Fatalf("--unsupported-threshold must be > 0")
-	}
-	if *frameQueueSize <= 0 {
-		log.Fatalf("--frame-queue-size must be > 0")
-	}
-	if *frameEnqueueTimeoutSec <= 0 {
-		log.Fatalf("--frame-enqueue-timeout-sec must be > 0")
-	}
-	if *frameWriterWorkers <= 0 {
-		log.Fatalf("--frame-writer-workers must be > 0")
-	}
-	if *ffmpegJpegQuality < 1 || *ffmpegJpegQuality > 31 {
-		log.Fatalf("--ffmpeg-jpeg-quality must be between 1 and 31")
-	}
-	if *ffmpegThreads < 1 || *ffmpegThreads > 8 {
-		log.Fatalf("--ffmpeg-threads must be between 1 and 8")
-	}
-	if *ffmpegReconnectDelayMaxSec <= 0 || *ffmpegReconnectDelayMaxSec > 60 {
-		log.Fatalf("--ffmpeg-reconnect-delay-max-sec must be between 1 and 60")
-	}
-
-	configureYouTubeCaptureEnv(
-		strings.TrimSpace(*ytDlpCookiesFile),
-		strings.TrimSpace(*ytDlpCookiesFromBrowser),
-		strings.TrimSpace(*ytDlpBin),
-		strings.TrimSpace(*ytDlpFormat),
-		strings.TrimSpace(*ytDlpFormatSort),
-		*ffmpegJpegQuality,
-		*ffmpegThreads,
-		strings.TrimSpace(*ffmpegHWAccel),
-		*ffmpegReconnect,
-		*ffmpegReconnectDelayMaxSec,
-	)
-
-	streamIDs, err := parseInt64CSV(*streamIDsRaw)
-	if err != nil {
-		log.Fatalf("parse --stream-ids: %v", err)
-	}
-	streamFilterMode := len(streamIDs) > 0
-
-	if strings.TrimSpace(*streamIDsRaw) == "" && *maxSessions == 0 {
-		*maxSessions = *capacity
-		log.Printf("youtube auto-discovery: --max-sessions not set; using --capacity=%d", *capacity)
-	}
-
-	meta := map[string]any{}
-	rawMeta := strings.TrimSpace(*metadataJSON)
-	if rawMeta != "" {
-		if err := json.Unmarshal([]byte(rawMeta), &meta); err != nil {
-			log.Fatalf("invalid --metadata-json: %v", err)
-		}
-	}
-	hostName := ""
-	if h, err := os.Hostname(); err == nil {
-		hostName = strings.TrimSpace(h)
-	}
-	meta["host"] = hostName
-	meta["server_id"] = strings.TrimSpace(*serverID)
-	meta["worker_id"] = strings.TrimSpace(*workerID)
-	meta["process_name"] = "youtube-server"
-	meta["process_id"] = strings.TrimSpace(*workerID)
-
-	client, err := captureapi.NewClient(captureapi.ClientConfig{
-		BaseURL:  strings.TrimSpace(*backendAPIURL),
-		APIToken: strings.TrimSpace(*apiToken),
-	})
-	if err != nil {
-		log.Fatalf("init capture api client: %v", err)
-	}
-	registry, err := capture.NewDefaultRegistry()
-	if err != nil {
-		log.Fatalf("init capture registry: %v", err)
-	}
-
-	runCtx := ctx
-	cancel := func() {}
-	if *duration > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, *duration)
-	}
-	defer cancel()
-	managedCtx, managedCancel := context.WithCancel(runCtx)
-	defer managedCancel()
-
-	if !streamFilterMode {
-		defer func() {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer stopCancel()
-			if stopErr := client.WorkerStopped(stopCtx, strings.TrimSpace(*workerID), capture.ExecutionClassYouTubeDirect); stopErr != nil {
-				log.Printf("youtube-server worker stop signal failed worker_id=%s: %v", strings.TrimSpace(*workerID), stopErr)
-			}
-			if stopErr := client.RecordingServerStopped(stopCtx, strings.TrimSpace(*serverID)); stopErr != nil {
-				log.Printf("youtube-server server stop signal failed server_id=%s: %v", strings.TrimSpace(*serverID), stopErr)
-			}
-		}()
-	}
-
-	errCh := make(chan error, 4)
-	sendErr := func(err error) {
-		if err == nil {
-			return
-		}
-		select {
-		case errCh <- err:
-		default:
-			log.Printf("youtube-server dropped async error due full channel: %v", err)
-		}
-	}
-
-	var wg sync.WaitGroup
-	heartbeatInterval := time.Duration(*heartbeatSec) * time.Second
-
-	if !streamFilterMode {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := runRecordingServerHeartbeatLoop(managedCtx, client, captureapi.RecordingServerHeartbeatRequest{
-				ServerID: strings.TrimSpace(*serverID),
-				LeaseSec: *leaseSec,
-				ExecutionClasses: []captureapi.RecordingServerHeartbeatClass{
-					{
-						ExecutionClass: capture.ExecutionClassYouTubeDirect,
-						MaxActive:      *capacity,
-						Draining:       false,
-					},
-				},
-				MetadataJSON: meta,
-			}, heartbeatInterval)
-			if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-				sendErr(fmt.Errorf("recording server heartbeat loop: %w", err))
-			}
-		}()
-
-		modeMeta := cloneMap(meta)
-		modeMeta["execution_class"] = capture.ExecutionClassYouTubeDirect
-		modeMeta["runtime_mode"] = string(capture.ModeYouTubeLive)
-		modeMeta["process_name"] = "youtube-server-mode"
-		modeMeta["process_id"] = strings.TrimSpace(*workerID)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := runWorkerHeartbeatLoop(managedCtx, client, captureapi.WorkerHeartbeatRequest{
-				WorkerID:       strings.TrimSpace(*workerID),
-				ExecutionClass: capture.ExecutionClassYouTubeDirect,
-				Capacity:       *capacity,
-				LeaseSec:       *leaseSec,
-				MetadataJSON:   modeMeta,
-			}, heartbeatInterval)
-			if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-				sendErr(fmt.Errorf("capture worker heartbeat: %w", err))
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		mgr := captureapipersistent.NewManager(client, captureapipersistent.ManagerConfig{
-			WorkerID:                  strings.TrimSpace(*workerID),
-			ServerID:                  strings.TrimSpace(*serverID),
-			RefreshInterval:           time.Duration(*refreshSec) * time.Second,
-			ProcessHeartbeatInterval:  heartbeatInterval,
-			ProcessHeartbeatLeaseSec:  *leaseSec,
-			ProcessStartReason:        "youtube_server_supervisor",
-			ProcessTelemetry:          !streamFilterMode,
-			MaxSessions:               *maxSessions,
-			MaxFrameBytes:             25 << 20,
-			FrameQueueSize:            *frameQueueSize,
-			FrameEnqueueTimeout:       time.Duration(*frameEnqueueTimeoutSec) * time.Second,
-			FrameWriterWorkers:        *frameWriterWorkers,
-			StreamIDs:                 streamIDs,
-			ModeAllowlist:             []capture.Mode{capture.ModeYouTubeLive},
-			RecordingHeartbeat:        *recordingHeartbeat,
-			UnsupportedErrorThreshold: *unsupportedThreshold,
-			Registry:                  registry,
-		})
-		err := mgr.Run(managedCtx)
-		if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-			sendErr(fmt.Errorf("capture manager mode=%s: %w", capture.ModeYouTubeLive, err))
-		}
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		wg.Wait()
-	}()
-
-	select {
-	case <-runCtx.Done():
-		managedCancel()
-		<-done
-		if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return
-		}
-		log.Fatalf("youtube-server canceled: %v", runCtx.Err())
-	case err := <-errCh:
-		managedCancel()
-		<-done
-		log.Fatalf("youtube-server run failed: %v", err)
-	}
-}
-
-func runYouTubeRelay(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl youtube-relay <source|sink|routes|doctor|route-status> ...")
-	}
-	switch args[0] {
-	case "source":
-		if len(args) < 2 || args[1] != "run" {
-			log.Fatalf("usage: stoaramactl youtube-relay source run [--backend-api-url URL --api-token TOKEN --server-id ID --shard-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 30 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role source --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.2 --source-endpoint HOST:PORT --duration 0 --resolve-timeout-sec 30 --resolve-failure-threshold 3 --bind-addr :18080 --public-base-url URL --shared-token TOKEN --cache-file FILE --yt-dlp-cookies-file FILE|--yt-dlp-cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT]")
-		}
-		fs := flag.NewFlagSet("youtube-relay source run", flag.ExitOnError)
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		serverID := fs.String("server-id", defaultCaptureServerID(""), "source server id")
-		shardID := fs.String("shard-id", "", "source shard id (e.g. yt-account-1)")
-		capacity := fs.Int("capacity", 4, "max active relay routes for this source")
-		heartbeatSec := fs.Int("heartbeat-sec", 15, "source heartbeat interval seconds")
-		leaseSec := fs.Int("lease-sec", 45, "source heartbeat lease seconds")
-		refreshSec := fs.Int("refresh-sec", 30, "route polling + resolve interval seconds")
-		resolveTimeoutSec := fs.Int("resolve-timeout-sec", 30, "per-route resolve timeout seconds")
-		resolveFailureThreshold := fs.Int("resolve-failure-threshold", 3, "fail source after this many consecutive route sync failures")
-		ytDlpCookiesFile := fs.String("yt-dlp-cookies-file", strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FILE")), "path to yt-dlp cookies file")
-		ytDlpCookiesFromBrowser := fs.String("yt-dlp-cookies-from-browser", strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FROM_BROWSER")), "browser profile for yt-dlp cookies (e.g. chrome)")
-		ytDlpBin := fs.String("yt-dlp-bin", strings.TrimSpace(os.Getenv("YT_DLP_BIN")), "optional yt-dlp binary path")
-		ytDlpFormat := fs.String("yt-dlp-format", strings.TrimSpace(os.Getenv("YT_DLP_FORMAT")), "yt-dlp format selector")
-		ytDlpFormatSort := fs.String("yt-dlp-format-sort", strings.TrimSpace(os.Getenv("YT_DLP_FORMAT_SORT")), "yt-dlp format sorting expression")
-		bindAddr := fs.String("bind-addr", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_SOURCE_BIND_ADDR"), ":18080")), "relay server listen address host:port")
-		publicBaseURL := fs.String("public-base-url", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_SOURCE_PUBLIC_BASE_URL")), "relay base URL reachable from sinks; may include a path prefix, e.g. https://relay.example/ytrelay or http://10.77.0.2:18080")
-		sharedToken := fs.String("shared-token", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_SHARED_TOKEN")), "shared token required by relay endpoint")
-		cacheFile := fs.String("cache-file", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_SOURCE_CACHE_FILE")), "path to local relay source cache file")
-		networkTransport := fs.String("network-transport", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_NETWORK_TRANSPORT"), "wireguard")), "relay network transport label")
-		topologyID := fs.String("topology-id", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_TOPOLOGY_ID"), "do-youtube-relay-hub")), "relay topology identifier")
-		topologyRole := fs.String("topology-role", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_TOPOLOGY_ROLE"), "source")), "relay topology role label")
-		hubServerID := fs.String("hub-server-id", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_HUB_SERVER_ID"), "do-youtube-relay-hub")), "relay hub server identifier")
-		wgInterface := fs.String("wg-interface", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_WG_INTERFACE"), "wg0")), "wireguard interface name")
-		wgIP := fs.String("wg-ip", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_WG_IP")), "wireguard source peer IP")
-		sourceEndpoint := fs.String("source-endpoint", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_SOURCE_ENDPOINT")), "source endpoint host:port used by sinks")
-		metadataJSON := fs.String("metadata-json", "{}", "source metadata JSON object")
-		duration := fs.Duration("duration", 0, "optional run duration")
-		_ = fs.Parse(args[2:])
-
-		if strings.TrimSpace(*backendAPIURL) == "" {
-			log.Fatalf("--backend-api-url is required")
-		}
-		if strings.TrimSpace(*apiToken) == "" {
-			log.Fatalf("--api-token is required")
-		}
-		if strings.TrimSpace(*serverID) == "" {
-			log.Fatalf("--server-id is required")
-		}
-		if strings.TrimSpace(*shardID) == "" {
-			log.Fatalf("--shard-id is required")
-		}
-		if *capacity <= 0 {
-			log.Fatalf("--capacity must be > 0")
-		}
-		if *heartbeatSec <= 0 {
-			log.Fatalf("--heartbeat-sec must be > 0")
-		}
-		if *leaseSec <= 0 || *leaseSec > 3600 {
-			log.Fatalf("--lease-sec must be between 1 and 3600")
-		}
-		if *leaseSec <= *heartbeatSec {
-			log.Fatalf("--lease-sec must be greater than --heartbeat-sec")
-		}
-		if *refreshSec <= 0 {
-			log.Fatalf("--refresh-sec must be > 0")
-		}
-		if *resolveTimeoutSec <= 0 {
-			log.Fatalf("--resolve-timeout-sec must be > 0")
-		}
-		if *resolveFailureThreshold <= 0 {
-			log.Fatalf("--resolve-failure-threshold must be > 0")
-		}
-		if strings.TrimSpace(*bindAddr) == "" {
-			log.Fatalf("--bind-addr is required")
-		}
-		if strings.TrimSpace(*publicBaseURL) == "" {
-			log.Fatalf("--public-base-url is required")
-		}
-		if strings.TrimSpace(*sharedToken) == "" {
-			log.Fatalf("--shared-token is required")
-		}
-		if strings.TrimSpace(*networkTransport) == "" {
-			log.Fatalf("--network-transport is required")
-		}
-		if strings.TrimSpace(*topologyID) == "" {
-			log.Fatalf("--topology-id is required")
-		}
-		if strings.TrimSpace(*topologyRole) == "" {
-			log.Fatalf("--topology-role is required")
-		}
-		if strings.TrimSpace(*hubServerID) == "" {
-			log.Fatalf("--hub-server-id is required")
-		}
-		meta := map[string]any{}
-		if raw := strings.TrimSpace(*metadataJSON); raw != "" {
-			if err := json.Unmarshal([]byte(raw), &meta); err != nil {
-				log.Fatalf("invalid --metadata-json: %v", err)
-			}
-		}
-		client, err := captureapi.NewClient(captureapi.ClientConfig{
-			BaseURL:  strings.TrimSpace(*backendAPIURL),
-			APIToken: strings.TrimSpace(*apiToken),
-		})
-		if err != nil {
-			log.Fatalf("init capture api client: %v", err)
-		}
-		runCtx := ctx
-		cancel := func() {}
-		if *duration > 0 {
-			runCtx, cancel = context.WithTimeout(ctx, *duration)
-		}
-		defer cancel()
-		if err := youtuberelay.RunSource(runCtx, youtuberelay.ServiceSourceAPI{Client: client}, youtuberelay.SourceRunnerOptions{
-			ServerID:                strings.TrimSpace(*serverID),
-			ShardID:                 strings.TrimSpace(*shardID),
-			Capacity:                *capacity,
-			HeartbeatSec:            *heartbeatSec,
-			LeaseSec:                *leaseSec,
-			RefreshSec:              *refreshSec,
-			ResolveTimeoutSec:       *resolveTimeoutSec,
-			ResolveFailureThreshold: *resolveFailureThreshold,
-			BindAddr:                strings.TrimSpace(*bindAddr),
-			PublicBaseURL:           strings.TrimSpace(*publicBaseURL),
-			SharedToken:             strings.TrimSpace(*sharedToken),
-			CacheFile:               strings.TrimSpace(*cacheFile),
-			NetworkTransport:        strings.TrimSpace(*networkTransport),
-			TopologyID:              strings.TrimSpace(*topologyID),
-			TopologyRole:            strings.TrimSpace(*topologyRole),
-			HubServerID:             strings.TrimSpace(*hubServerID),
-			WGInterface:             strings.TrimSpace(*wgInterface),
-			WGIP:                    strings.TrimSpace(*wgIP),
-			SourceEndpoint:          strings.TrimSpace(*sourceEndpoint),
-			MetadataJSON:            meta,
-			CookiesFile:             strings.TrimSpace(*ytDlpCookiesFile),
-			CookiesFromBrowser:      strings.TrimSpace(*ytDlpCookiesFromBrowser),
-			YTDLPBin:                strings.TrimSpace(*ytDlpBin),
-			YTDLPFormat:             strings.TrimSpace(*ytDlpFormat),
-			YTDLPFormatSort:         strings.TrimSpace(*ytDlpFormatSort),
-			FFMPEGJPEGQuality:       maxInt(1, envInt("CAPTURE_FFMPEG_JPEG_Q", 2)),
-			FFMPEGThreads:           maxInt(1, envInt("CAPTURE_FFMPEG_THREADS", 1)),
-			FFMPEGHWAccel:           strings.TrimSpace(os.Getenv("CAPTURE_FFMPEG_HWACCEL")),
-			FFMPEGReconnect:         envBool("CAPTURE_FFMPEG_RECONNECT", true),
-			FFMPEGReconnectDelayMax: maxInt(1, envInt("CAPTURE_FFMPEG_RECONNECT_DELAY_MAX_SEC", 2)),
-		}); err != nil {
-			log.Fatalf("youtube-relay source run failed: %v", err)
-		}
-		return
-	case "sink":
-		if len(args) < 2 || args[1] != "run" {
-			log.Fatalf("usage: stoaramactl youtube-relay sink run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capacity N --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --network-transport wireguard --topology-id ID --topology-role sink --hub-server-id ID --wg-interface wg0 --wg-ip 10.77.0.11 --relay-source-server-id ID --relay-source-public-base-url URL --duration 0]")
-		}
-		fs := flag.NewFlagSet("youtube-relay sink run", flag.ExitOnError)
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		workerID := fs.String("worker-id", defaultCaptureServerWorkerID(cfg.WorkerID)+"-youtube-relay", "worker id")
-		serverID := fs.String("server-id", defaultCaptureServerID(defaultCaptureServerWorkerID(cfg.WorkerID)), "server id")
-		capacity := fs.Int("capacity", 8, "youtube_relay max active streams")
-		heartbeatSec := fs.Int("heartbeat-sec", 15, "heartbeat interval seconds")
-		leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
-		refreshSec := fs.Int("refresh-sec", cfg.CaptureTickSec, "capture reconcile interval seconds")
-		frameQueueSize := fs.Int("frame-queue-size", 64, "per-stream frame queue size")
-		frameEnqueueTimeoutSec := fs.Int("frame-enqueue-timeout-sec", 3, "per-stream frame enqueue timeout seconds")
-		frameWriterWorkers := fs.Int("frame-writer-workers", 2, "per-stream frame persistence workers")
-		unsupportedThreshold := fs.Int("unsupported-threshold", cfg.CaptureUnsupportedThreshold, "mark unsupported after this many consecutive errors")
-		networkTransport := fs.String("network-transport", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_NETWORK_TRANSPORT"), "wireguard")), "relay network transport label")
-		topologyID := fs.String("topology-id", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_TOPOLOGY_ID"), "do-youtube-relay-hub")), "relay topology identifier")
-		topologyRole := fs.String("topology-role", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_TOPOLOGY_ROLE"), "sink")), "relay topology role label")
-		hubServerID := fs.String("hub-server-id", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_HUB_SERVER_ID"), "do-youtube-relay-hub")), "relay hub server identifier")
-		wgInterface := fs.String("wg-interface", strings.TrimSpace(defaultString(os.Getenv("YOUTUBE_RELAY_WG_INTERFACE"), "wg0")), "wireguard interface name")
-		wgIP := fs.String("wg-ip", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_WG_IP")), "wireguard sink peer IP")
-		relaySourceServerID := fs.String("relay-source-server-id", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_SOURCE_SERVER_ID")), "relay source server identifier")
-		relaySourcePublicBaseURL := fs.String("relay-source-public-base-url", strings.TrimSpace(os.Getenv("YOUTUBE_RELAY_SOURCE_PUBLIC_BASE_URL")), "relay source base URL")
-		metadataJSON := fs.String("metadata-json", "{}", "server metadata JSON object")
-		duration := fs.Duration("duration", 0, "optional run duration")
-		_ = fs.Parse(args[2:])
-
-		if strings.TrimSpace(*backendAPIURL) == "" {
-			log.Fatalf("--backend-api-url is required")
-		}
-		if strings.TrimSpace(*apiToken) == "" {
-			log.Fatalf("--api-token is required")
-		}
-		if strings.TrimSpace(*workerID) == "" {
-			log.Fatalf("--worker-id is required")
-		}
-		if strings.TrimSpace(*serverID) == "" {
-			log.Fatalf("--server-id is required")
-		}
-		if *capacity <= 0 {
-			log.Fatalf("--capacity must be > 0")
-		}
-		if *heartbeatSec <= 0 {
-			log.Fatalf("--heartbeat-sec must be > 0")
-		}
-		if *leaseSec <= 0 || *leaseSec > 3600 {
-			log.Fatalf("--lease-sec must be between 1 and 3600")
-		}
-		if *leaseSec <= *heartbeatSec {
-			log.Fatalf("--lease-sec must be greater than --heartbeat-sec")
-		}
-		if *refreshSec <= 0 {
-			log.Fatalf("--refresh-sec must be > 0")
-		}
-		if *frameQueueSize <= 0 {
-			log.Fatalf("--frame-queue-size must be > 0")
-		}
-		if *frameEnqueueTimeoutSec <= 0 {
-			log.Fatalf("--frame-enqueue-timeout-sec must be > 0")
-		}
-		if *frameWriterWorkers <= 0 {
-			log.Fatalf("--frame-writer-workers must be > 0")
-		}
-		if *unsupportedThreshold <= 0 {
-			log.Fatalf("--unsupported-threshold must be > 0")
-		}
-		if strings.TrimSpace(*networkTransport) == "" {
-			log.Fatalf("--network-transport is required")
-		}
-		if strings.TrimSpace(*topologyID) == "" {
-			log.Fatalf("--topology-id is required")
-		}
-		if strings.TrimSpace(*topologyRole) == "" {
-			log.Fatalf("--topology-role is required")
-		}
-		if strings.TrimSpace(*hubServerID) == "" {
-			log.Fatalf("--hub-server-id is required")
-		}
-
-		meta := map[string]any{}
-		rawMeta := strings.TrimSpace(*metadataJSON)
-		if rawMeta != "" {
-			if err := json.Unmarshal([]byte(rawMeta), &meta); err != nil {
-				log.Fatalf("invalid --metadata-json: %v", err)
-			}
-		}
-		hostName := ""
-		if h, err := os.Hostname(); err == nil {
-			hostName = strings.TrimSpace(h)
-		}
-		meta["host"] = hostName
-		meta["server_id"] = strings.TrimSpace(*serverID)
-		meta["worker_id"] = strings.TrimSpace(*workerID)
-		meta["process_name"] = "youtube-relay-sink"
-		meta["process_id"] = strings.TrimSpace(*workerID)
-		meta["network_transport"] = strings.TrimSpace(*networkTransport)
-		meta["topology_id"] = strings.TrimSpace(*topologyID)
-		meta["topology_role"] = strings.TrimSpace(*topologyRole)
-		meta["hub_server_id"] = strings.TrimSpace(*hubServerID)
-		if v := strings.TrimSpace(*wgInterface); v != "" {
-			meta["wg_interface"] = v
-		}
-		if v := strings.TrimSpace(*wgIP); v != "" {
-			meta["wg_ip"] = v
-		}
-		if v := strings.TrimSpace(*relaySourceServerID); v != "" {
-			meta["relay_source_server_id"] = v
-		}
-		if v := strings.TrimSpace(*relaySourcePublicBaseURL); v != "" {
-			meta["relay_source_public_base_url"] = v
-		}
-
-		client, err := captureapi.NewClient(captureapi.ClientConfig{
-			BaseURL:  strings.TrimSpace(*backendAPIURL),
-			APIToken: strings.TrimSpace(*apiToken),
-		})
-		if err != nil {
-			log.Fatalf("init capture api client: %v", err)
-		}
-		registry, err := capture.NewDefaultRegistry()
-		if err != nil {
-			log.Fatalf("init capture registry: %v", err)
-		}
-
-		runCtx := ctx
-		cancel := func() {}
-		if *duration > 0 {
-			runCtx, cancel = context.WithTimeout(ctx, *duration)
-		}
-		defer cancel()
-		managedCtx, managedCancel := context.WithCancel(runCtx)
-		defer managedCancel()
-
-		defer func() {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer stopCancel()
-			if workerStopErr := client.WorkerStopped(stopCtx, strings.TrimSpace(*workerID), capture.ExecutionClassYouTubeRelay); workerStopErr != nil {
-				log.Printf("youtube-relay sink worker stop signal failed worker_id=%s: %v", strings.TrimSpace(*workerID), workerStopErr)
-			}
-			if stopErr := client.RecordingServerStopped(stopCtx, strings.TrimSpace(*serverID)); stopErr != nil {
-				log.Printf("youtube-relay sink server stop signal failed server_id=%s: %v", strings.TrimSpace(*serverID), stopErr)
-			}
-		}()
-
-		errCh := make(chan error, 4)
-		sendErr := func(err error) {
-			if err == nil {
-				return
-			}
-			select {
-			case errCh <- err:
-			default:
-				log.Printf("youtube-relay sink dropped async error due full channel: %v", err)
-			}
-		}
-		var wg sync.WaitGroup
-		heartbeatInterval := time.Duration(*heartbeatSec) * time.Second
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := runRecordingServerHeartbeatLoop(managedCtx, client, captureapi.RecordingServerHeartbeatRequest{
-				ServerID: strings.TrimSpace(*serverID),
-				LeaseSec: *leaseSec,
-				ExecutionClasses: []captureapi.RecordingServerHeartbeatClass{
-					{
-						ExecutionClass: capture.ExecutionClassYouTubeRelay,
-						MaxActive:      *capacity,
-						Draining:       false,
-					},
-				},
-				MetadataJSON: meta,
-			}, heartbeatInterval)
-			if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-				sendErr(fmt.Errorf("recording server heartbeat loop: %w", err))
-			}
-		}()
-
-		modeMeta := cloneMap(meta)
-		modeMeta["execution_class"] = capture.ExecutionClassYouTubeRelay
-		modeMeta["runtime_mode"] = string(capture.ModeYouTubeRelay)
-		modeMeta["process_name"] = "youtube-relay-sink-mode"
-		modeMeta["process_id"] = strings.TrimSpace(*workerID)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := runWorkerHeartbeatLoop(managedCtx, client, captureapi.WorkerHeartbeatRequest{
-				WorkerID:       strings.TrimSpace(*workerID),
-				ExecutionClass: capture.ExecutionClassYouTubeRelay,
-				Capacity:       *capacity,
-				LeaseSec:       *leaseSec,
-				MetadataJSON:   modeMeta,
-			}, heartbeatInterval)
-			if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-				sendErr(fmt.Errorf("capture worker heartbeat: %w", err))
-			}
-		}()
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			mgr := captureapipersistent.NewManager(client, captureapipersistent.ManagerConfig{
-				WorkerID:                  strings.TrimSpace(*workerID),
-				ServerID:                  strings.TrimSpace(*serverID),
-				RefreshInterval:           time.Duration(*refreshSec) * time.Second,
-				ProcessHeartbeatInterval:  heartbeatInterval,
-				ProcessHeartbeatLeaseSec:  *leaseSec,
-				ProcessStartReason:        "youtube_relay_sink_supervisor",
-				ProcessTelemetry:          true,
-				MaxSessions:               *capacity,
-				MaxFrameBytes:             25 << 20,
-				FrameQueueSize:            *frameQueueSize,
-				FrameEnqueueTimeout:       time.Duration(*frameEnqueueTimeoutSec) * time.Second,
-				FrameWriterWorkers:        *frameWriterWorkers,
-				ModeAllowlist:             []capture.Mode{capture.ModeYouTubeRelay},
-				RecordingHeartbeat:        false,
-				UnsupportedErrorThreshold: *unsupportedThreshold,
-				Registry:                  registry,
-			})
-			err := mgr.Run(managedCtx)
-			if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-				sendErr(fmt.Errorf("capture manager mode=%s: %w", capture.ModeYouTubeRelay, err))
-			}
-		}()
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			wg.Wait()
-		}()
-
-		select {
-		case <-runCtx.Done():
-			managedCancel()
-			<-done
-			if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-				return
-			}
-			log.Fatalf("youtube-relay sink canceled: %v", runCtx.Err())
-		case err := <-errCh:
-			managedCancel()
-			<-done
-			log.Fatalf("youtube-relay sink run failed: %v", err)
-		}
-	case "routes":
-		fs := flag.NewFlagSet("youtube-relay routes", flag.ExitOnError)
-		sourceServerID := fs.String("source-server-id", "", "optional source server filter")
-		sinkServerID := fs.String("sink-server-id", "", "optional sink server filter")
-		status := fs.String("status", "", "optional status assigned|source_ready|running|stopped|failed")
-		limit := fs.Int("limit", 500, "row limit")
-		offset := fs.Int("offset", 0, "row offset")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *limit <= 0 || *limit > 2000 {
-			log.Fatalf("--limit must be between 1 and 2000")
-		}
-		if *offset < 0 {
-			log.Fatalf("--offset must be >= 0")
-		}
-		client, err := captureapi.NewClient(captureapi.ClientConfig{
-			BaseURL:  strings.TrimSpace(*backendAPIURL),
-			APIToken: strings.TrimSpace(*apiToken),
-		})
-		if err != nil {
-			log.Fatalf("init capture api client: %v", err)
-		}
-		routes, err := client.ListYouTubeRelayRoutes(ctx, strings.TrimSpace(*sourceServerID), strings.TrimSpace(*sinkServerID), strings.TrimSpace(*status), *limit, *offset)
-		if err != nil {
-			log.Fatalf("list youtube relay routes: %v", err)
-		}
-		if *asJSON {
-			out := map[string]any{"items": routes, "limit": *limit, "offset": *offset, "total": len(routes)}
-			printJSON(out)
-			return
-		}
-		fmt.Printf("routes=%d\n", len(routes))
-		for _, route := range routes {
-			fmt.Printf(
-				"stream_id=%d source=%s sink=%s status=%s revision=%d pull_url=%q error=%q\n",
-				route.StreamID, route.SourceServerID, route.SinkServerID, route.Status, route.AssignmentRevision, route.RelayPullURL, route.ErrorText,
-			)
-		}
-	case "doctor":
-		runYouTubeRelayDoctor(ctx, cfg, args[1:])
-	case "route-status":
-		fs := flag.NewFlagSet("youtube-relay route-status", flag.ExitOnError)
-		streamID := fs.Int64("stream-id", 0, "stream id")
-		actor := fs.String("actor", "operator", "status actor")
-		status := fs.String("status", "", "status assigned|source_ready|running|stopped|failed")
-		reason := fs.String("reason", "", "status reason")
-		relayPullURL := fs.String("relay-pull-url", "", "resolved relay pull URL")
-		errorText := fs.String("error-text", "", "error text")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		_ = fs.Parse(args[1:])
-		if *streamID <= 0 {
-			log.Fatalf("--stream-id must be > 0")
-		}
-		client, err := captureapi.NewClient(captureapi.ClientConfig{
-			BaseURL:  strings.TrimSpace(*backendAPIURL),
-			APIToken: strings.TrimSpace(*apiToken),
-		})
-		if err != nil {
-			log.Fatalf("init capture api client: %v", err)
-		}
-		if err := client.UpdateYouTubeRelayRouteStatus(ctx, captureapi.YouTubeRelayRouteStatusRequest{
-			StreamID:     *streamID,
-			Actor:        strings.TrimSpace(*actor),
-			Status:       strings.TrimSpace(*status),
-			Reason:       strings.TrimSpace(*reason),
-			RelayPullURL: strings.TrimSpace(*relayPullURL),
-			ErrorText:    strings.TrimSpace(*errorText),
-			MetadataJSON: map[string]any{},
-		}); err != nil {
-			log.Fatalf("update youtube relay route status: %v", err)
-		}
-		fmt.Printf("stream_id=%d status_updated=%s\n", *streamID, strings.TrimSpace(*status))
-	default:
-		log.Fatalf("unknown youtube-relay subcommand: %s", args[0])
-	}
-}
-
-func probeRelayPullURL(ctx context.Context, httpClient *http.Client, relayPullURL string) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, strings.TrimSpace(relayPullURL), nil)
-	if err != nil {
-		return 0, fmt.Errorf("build relay preflight request: %w", err)
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("relay preflight request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		return resp.StatusCode, nil
-	}
-	return resp.StatusCode, fmt.Errorf("relay preflight returned %s", resp.Status)
-}
-
-type relaySourceRouteCacheEntry struct {
-	UpstreamURL string    `json:"upstream_url"`
-	UpdatedAt   time.Time `json:"updated_at"`
-}
-
-func loadRelaySourceRouteCache(path string) (map[int64]relaySourceRouteCacheEntry, error) {
-	if strings.TrimSpace(path) == "" {
-		return map[int64]relaySourceRouteCacheEntry{}, nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return map[int64]relaySourceRouteCacheEntry{}, nil
-		}
-		return nil, err
-	}
-	cache := map[int64]relaySourceRouteCacheEntry{}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return cache, nil
-	}
-	if err := json.Unmarshal(data, &cache); err != nil {
-		return nil, err
-	}
-	return cache, nil
-}
-
-func saveRelaySourceRouteCache(path string, cache map[int64]relaySourceRouteCacheEntry) error {
-	if strings.TrimSpace(path) == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(cache, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
-}
-
-func relayRouteFailureReason(statusCode int, errText string) string {
-	switch statusCode {
-	case http.StatusNotFound:
-		return "relay_404"
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return "relay_auth_failed"
-	}
-	lower := strings.ToLower(strings.TrimSpace(errText))
-	switch {
-	case strings.Contains(lower, "404"):
-		return "relay_404"
-	case strings.Contains(lower, "401"), strings.Contains(lower, "403"), strings.Contains(lower, "unauthorized"), strings.Contains(lower, "forbidden"):
-		return "relay_auth_failed"
-	case strings.Contains(lower, "connection refused"), strings.Contains(lower, "no route to host"), strings.Contains(lower, "dial tcp"), strings.Contains(lower, "i/o timeout"):
-		return "relay_source_unreachable"
-	default:
-		return "relay_preflight_failed"
-	}
-}
-
-func configureYouTubeCaptureEnv(
-	cookiesFile string,
-	cookiesBrowser string,
-	ytDlpBin string,
-	ytDlpFormat string,
-	ytDlpFormatSort string,
-	ffmpegJpegQuality int,
-	ffmpegThreads int,
-	ffmpegHWAccel string,
-	ffmpegReconnect bool,
-	ffmpegReconnectDelayMaxSec int,
-) {
-	if cookiesFile == "" && cookiesBrowser == "" {
-		log.Fatalf("set --yt-dlp-cookies-file or --yt-dlp-cookies-from-browser")
-	}
-	if cookiesFile != "" {
-		st, err := os.Stat(cookiesFile)
-		if err != nil {
-			log.Fatalf("--yt-dlp-cookies-file: %v", err)
-		}
-		if st.IsDir() {
-			log.Fatalf("--yt-dlp-cookies-file must be a file, got directory: %s", cookiesFile)
-		}
-		if err := os.Setenv("YT_DLP_COOKIES_FILE", cookiesFile); err != nil {
-			log.Fatalf("setenv YT_DLP_COOKIES_FILE: %v", err)
-		}
-	} else {
-		_ = os.Unsetenv("YT_DLP_COOKIES_FILE")
-	}
-	if cookiesBrowser != "" {
-		if err := os.Setenv("YT_DLP_COOKIES_FROM_BROWSER", cookiesBrowser); err != nil {
-			log.Fatalf("setenv YT_DLP_COOKIES_FROM_BROWSER: %v", err)
-		}
-	} else {
-		_ = os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
-	}
-	if ytDlpBin != "" {
-		if err := os.Setenv("YT_DLP_BIN", ytDlpBin); err != nil {
-			log.Fatalf("setenv YT_DLP_BIN: %v", err)
-		}
-	}
-	if ytDlpFormat != "" {
-		if err := os.Setenv("YT_DLP_FORMAT", ytDlpFormat); err != nil {
-			log.Fatalf("setenv YT_DLP_FORMAT: %v", err)
-		}
-	} else {
-		_ = os.Unsetenv("YT_DLP_FORMAT")
-	}
-	if ytDlpFormatSort != "" {
-		if err := os.Setenv("YT_DLP_FORMAT_SORT", ytDlpFormatSort); err != nil {
-			log.Fatalf("setenv YT_DLP_FORMAT_SORT: %v", err)
-		}
-	} else {
-		_ = os.Unsetenv("YT_DLP_FORMAT_SORT")
-	}
-	if err := os.Setenv("CAPTURE_FFMPEG_JPEG_Q", strconv.Itoa(ffmpegJpegQuality)); err != nil {
-		log.Fatalf("setenv CAPTURE_FFMPEG_JPEG_Q: %v", err)
-	}
-	if err := os.Setenv("CAPTURE_FFMPEG_THREADS", strconv.Itoa(ffmpegThreads)); err != nil {
-		log.Fatalf("setenv CAPTURE_FFMPEG_THREADS: %v", err)
-	}
-	if ffmpegHWAccel != "" {
-		if err := os.Setenv("CAPTURE_FFMPEG_HWACCEL", ffmpegHWAccel); err != nil {
-			log.Fatalf("setenv CAPTURE_FFMPEG_HWACCEL: %v", err)
-		}
-	} else {
-		_ = os.Unsetenv("CAPTURE_FFMPEG_HWACCEL")
-	}
-	if err := os.Setenv("CAPTURE_FFMPEG_RECONNECT", strconv.FormatBool(ffmpegReconnect)); err != nil {
-		log.Fatalf("setenv CAPTURE_FFMPEG_RECONNECT: %v", err)
-	}
-	if err := os.Setenv("CAPTURE_FFMPEG_RECONNECT_DELAY_MAX_SEC", strconv.Itoa(ffmpegReconnectDelayMaxSec)); err != nil {
-		log.Fatalf("setenv CAPTURE_FFMPEG_RECONNECT_DELAY_MAX_SEC: %v", err)
-	}
-}
-
 func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 || args[0] != "run" {
-		log.Fatalf("usage: stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --segment-target-fps 10 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]")
+		log.Fatalf("usage: stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]")
 	}
 	fs := flag.NewFlagSet("capture-server run", flag.ExitOnError)
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
 	workerID := fs.String("worker-id", defaultCaptureServerWorkerID(cfg.WorkerID), "worker id prefix")
 	serverID := fs.String("server-id", defaultCaptureServerID(defaultCaptureServerWorkerID(cfg.WorkerID)), "server id")
-	captureSharedCapacity := fs.Int("capture-shared-capacity", envIntOrDefault("CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY", 0), "shared max active streams across video_live and image_poll execution classes")
-	executionClassesRaw := fs.String("execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_EXECUTION_CLASSES")), "optional comma-separated execution classes to run (video_live,image_poll)")
+	captureSharedCapacity := fs.Int("capture-shared-capacity", envIntOrDefault("CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY", 0), "shared max active live-video streams")
+	executionClassesRaw := fs.String("execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_EXECUTION_CLASSES")), "optional comma-separated execution classes to run (video_live)")
 	streamIDsRaw := fs.String("stream-ids", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_STREAM_IDS")), "optional comma-separated stream ids to run in stream-filter mode")
 	drainingExecutionClassesRaw := fs.String("draining-execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_DRAINING_EXECUTION_CLASSES")), "optional comma-separated draining execution classes")
 	heartbeatSec := fs.Int("heartbeat-sec", 15, "heartbeat interval seconds")
 	leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
 	refreshSec := fs.Int("refresh-sec", cfg.CaptureTickSec, "capture reconcile interval seconds")
-	segmentTargetFPS := fs.Int("segment-target-fps", cfg.CaptureSegmentTargetFPS, "target FPS for captured video segments")
 	frameQueueSize := fs.Int("frame-queue-size", 64, "per-stream frame queue size")
 	frameEnqueueTimeoutSec := fs.Int("frame-enqueue-timeout-sec", 3, "per-stream frame enqueue timeout seconds")
 	frameWriterWorkers := fs.Int("frame-writer-workers", 2, "per-stream frame persistence workers")
@@ -1138,9 +227,6 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	if *refreshSec <= 0 {
 		log.Fatalf("--refresh-sec must be > 0")
 	}
-	if *segmentTargetFPS <= 0 {
-		log.Fatalf("--segment-target-fps must be > 0")
-	}
 	if *frameQueueSize <= 0 {
 		log.Fatalf("--frame-queue-size must be > 0")
 	}
@@ -1170,13 +256,12 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	modeCapacity := map[capture.Mode]int{
 		capture.ModeHLSLive:      *captureSharedCapacity,
 		capture.ModeFFmpegDirect: *captureSharedCapacity,
-		capture.ModeImagePoll:    *captureSharedCapacity,
 	}
 	if len(requestedModes) > 0 {
 		filtered := make(map[capture.Mode]int, len(requestedModes))
 		for _, mode := range requestedModes {
 			switch mode {
-			case capture.ModeHLSLive, capture.ModeImagePoll, capture.ModeFFmpegDirect:
+			case capture.ModeHLSLive, capture.ModeFFmpegDirect:
 				filtered[mode] = *captureSharedCapacity
 			default:
 				log.Fatalf("--execution-classes resolved unsupported mode %s for capture-server", mode)
@@ -1184,7 +269,7 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 		}
 		modeCapacity = filtered
 		if len(modeCapacity) == 0 {
-			log.Fatalf("--execution-classes must include at least one of video_live,image_poll")
+			log.Fatalf("--execution-classes must include video_live")
 		}
 	}
 
@@ -1374,7 +459,6 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 			FrameQueueSize:            *frameQueueSize,
 			FrameEnqueueTimeout:       time.Duration(*frameEnqueueTimeoutSec) * time.Second,
 			FrameWriterWorkers:        *frameWriterWorkers,
-			SegmentTargetFPS:          *segmentTargetFPS,
 			StreamIDs:                 streamIDs,
 			ModeAllowlist:             []capture.Mode{mode},
 			RecordingHeartbeat:        false,
@@ -1610,10 +694,6 @@ func runCapture(ctx context.Context, cfg config.Config, args []string) {
 			go func() {
 				defer wg.Done()
 				for s := range workCh {
-					targetFPS := capture.GetConfigInt(s.Cfg, "target_fps", 10)
-					if targetFPS <= 0 {
-						targetFPS = 10
-					}
 					spec := capture.StreamSpec{
 						ID:                 s.ID,
 						Provider:           s.Provider,
@@ -1622,7 +702,7 @@ func runCapture(ctx context.Context, cfg config.Config, args []string) {
 						CaptureMode:        capture.LegacyModeForStream(s.CaptureType, s.ExecutionClass),
 						CaptureConfig:      s.Cfg,
 						CaptureIntervalSec: maxInt(1, capture.GetConfigInt(s.Cfg, "poll_interval_sec", 1)),
-						TargetFPS:          targetFPS,
+						TargetFPS:          capture.SegmentTargetFPS,
 					}
 					effective := capture.EffectiveMode(spec)
 					item := auditResult{
@@ -1957,80 +1037,7 @@ func printDiscoveryUsage() {
 }
 
 func printRecordingUsage() {
-	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples|mark-relay-broken|reconcile|supervisor> ...\n")
-}
-
-const relayPlaylistTailSegments = 12
-
-func rewriteRelayPlaylist(relayBaseURL string, streamID int64, token string, upstreamPlaylistURL string, body []byte) ([]byte, bool) {
-	trimmedBody := bytes.TrimSpace(body)
-	if !bytes.HasPrefix(trimmedBody, []byte("#EXTM3U")) {
-		return nil, false
-	}
-	baseURL, err := url.Parse(strings.TrimSpace(upstreamPlaylistURL))
-	if err != nil {
-		return nil, false
-	}
-	lines := strings.Split(strings.ReplaceAll(string(trimmedBody), "\r\n", "\n"), "\n")
-	header := []string{}
-	blocks := make([][]string, 0, 32)
-	current := []string{}
-	mediaSequence := -1
-	for _, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.EqualFold(line, "#EXT-X-ENDLIST") {
-			continue
-		}
-		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
-			if v, parseErr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"))); parseErr == nil {
-				mediaSequence = v
-			}
-			continue
-		}
-		if !strings.HasPrefix(line, "#") {
-			segmentURL := line
-			if ref, parseErr := url.Parse(line); parseErr == nil {
-				segmentURL = baseURL.ResolveReference(ref).String()
-			}
-			current = append(current, fmt.Sprintf("%s/relay/%d/segment?token=%s&u=%s", strings.TrimRight(strings.TrimSpace(relayBaseURL), "/"), streamID, url.QueryEscape(strings.TrimSpace(token)), url.QueryEscape(segmentURL)))
-			blocks = append(blocks, append([]string(nil), current...))
-			current = current[:0]
-			continue
-		}
-		if len(blocks) == 0 && len(current) == 0 && isGlobalPlaylistTag(line) {
-			header = append(header, line)
-			continue
-		}
-		current = append(current, line)
-	}
-	if len(blocks) == 0 {
-		return nil, false
-	}
-	dropped := 0
-	if len(blocks) > relayPlaylistTailSegments {
-		dropped = len(blocks) - relayPlaylistTailSegments
-		blocks = blocks[dropped:]
-	}
-	out := make([]string, 0, len(header)+1+(len(blocks)*4))
-	if len(header) == 0 || header[0] != "#EXTM3U" {
-		out = append(out, "#EXTM3U")
-	}
-	for _, line := range header {
-		if line == "#EXTM3U" {
-			if len(out) == 0 || out[0] != "#EXTM3U" {
-				out = append(out, line)
-			}
-			continue
-		}
-		out = append(out, line)
-	}
-	if mediaSequence >= 0 {
-		out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", mediaSequence+dropped))
-	}
-	for _, block := range blocks {
-		out = append(out, block...)
-	}
-	return []byte(strings.Join(out, "\n") + "\n"), true
+	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples|reconcile|supervisor> ...\n")
 }
 
 func isGlobalPlaylistTag(line string) bool {
@@ -2266,7 +1273,7 @@ func inferRecordingAssignmentExecutionClassesForCLI(stream map[string]any) []str
 		norm, ok := capture.NormalizeExecutionClass(executionClass)
 		if ok {
 			if norm == capture.ExecutionClassYouTubeDirect || norm == capture.ExecutionClassYouTubeRelay {
-				return []string{capture.ExecutionClassYouTubeRelay}
+				return []string{capture.ExecutionClassYouTubeDirect}
 			}
 			if norm == capture.ExecutionClassImagePoll {
 				return nil
@@ -2279,7 +1286,7 @@ func inferRecordingAssignmentExecutionClassesForCLI(stream map[string]any) []str
 		if norm, ok := capture.NormalizeCaptureType(captureType); ok {
 			switch norm {
 			case capture.CaptureTypeYouTubeWatch:
-				return []string{capture.ExecutionClassYouTubeRelay}
+				return []string{capture.ExecutionClassYouTubeDirect}
 			case capture.CaptureTypeStillImage:
 				return nil
 			case capture.CaptureTypeHLS, capture.CaptureTypeDASH, capture.CaptureTypeRTSP, capture.CaptureTypeRTMP, capture.CaptureTypeHTTPVideo:
@@ -2289,7 +1296,7 @@ func inferRecordingAssignmentExecutionClassesForCLI(stream map[string]any) []str
 	}
 	sourceFamily := strings.ToLower(strings.TrimSpace(fmt.Sprint(stream["source_family"])))
 	if sourceFamily == capture.SourceFamilyWatchPage {
-		return []string{capture.ExecutionClassYouTubeRelay}
+		return []string{capture.ExecutionClassYouTubeDirect}
 	}
 	return nil
 }
@@ -4942,76 +3949,6 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 				it["day"], segmentID, it["captured_at"], it["object_key"], it["thumbnail_object_key"],
 			)
 		}
-	case "mark-relay-broken":
-		fs := flag.NewFlagSet("recording mark-relay-broken", flag.ExitOnError)
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		tag := fs.String("tag", "youtube_relay_broken_2026_04", "tag to add to affected streams")
-		limit := fs.Int("limit", 500, "assignment row limit")
-		apply := fs.Bool("apply", false, "apply tag updates")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *limit <= 0 || *limit > 2000 {
-			log.Fatalf("--limit must be between 1 and 2000")
-		}
-		tagList := normalizeTags([]string{*tag})
-		if len(tagList) != 1 {
-			log.Fatalf("--tag is required")
-		}
-		q := url.Values{}
-		q.Set("execution_class", capture.ExecutionClassYouTubeRelay)
-		q.Set("limit", strconv.Itoa(*limit))
-		q.Set("offset", "0")
-		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/recording/assignments?"+q.Encode())
-		items, _ := payload["items"].([]any)
-		results := make([]map[string]any, 0, len(items))
-		for _, raw := range items {
-			item := asMap(raw)
-			streamID := int64FromAny(item["stream_id"])
-			if streamID <= 0 {
-				continue
-			}
-			stream := loadDashboardStream(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), streamID)
-			if strings.TrimSpace(fmt.Sprint(stream["capture_type"])) != capture.CaptureTypeYouTubeWatch {
-				continue
-			}
-			if strings.TrimSpace(fmt.Sprint(stream["recording_state"])) != string(model.RecordingStateOn) {
-				continue
-			}
-			currentTags := normalizeTags(asStringSlice(stream["tags"]))
-			updatedTags := normalizeTags(append(currentTags, tagList[0]))
-			alreadyTagged := len(updatedTags) == len(currentTags)
-			if *apply && !alreadyTagged {
-				out := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/service/streams/%d/tags", streamID), map[string]any{
-					"tags": tagList,
-				})
-				updatedTags = normalizeTags(asStringSlice(out["tags"]))
-			}
-			results = append(results, map[string]any{
-				"stream_id":      streamID,
-				"name":           stream["name"],
-				"slug":           stream["slug"],
-				"server_id":      item["server_id"],
-				"relay_status":   item["relay_status"],
-				"already_tagged": alreadyTagged,
-				"applied":        *apply && !alreadyTagged,
-				"tag":            tagList[0],
-				"resulting_tags": updatedTags,
-			})
-		}
-		if *asJSON {
-			printJSON(map[string]any{"tag": tagList[0], "apply": *apply, "items": results})
-			return
-		}
-		action := "dry-run"
-		if *apply {
-			action = "applied"
-		}
-		fmt.Printf("relay_broken_candidates=%d tag=%s action=%s\n", len(results), tagList[0], action)
-		for _, item := range results {
-			fmt.Printf("stream_id=%v slug=%v server_id=%v relay_status=%v applied=%v already_tagged=%v\n",
-				item["stream_id"], item["slug"], item["server_id"], item["relay_status"], item["applied"], item["already_tagged"])
-		}
 	case "reconcile":
 		runRecordingReconcile(ctx, cfg, args[1:])
 	case "supervisor":
@@ -5089,7 +4026,7 @@ func runServerControl(ctx context.Context, cfg config.Config, args []string) {
 		if len(args) >= 2 && (args[1] == "audit" || args[1] == "reconcile") {
 			fs := flag.NewFlagSet("servers assignments "+args[1], flag.ExitOnError)
 			serverID := fs.String("server-id", "", "optional server id filter")
-			executionClassRaw := fs.String("execution-class", "", "optional execution class filter youtube_direct|youtube_relay|video_live|image_poll")
+			executionClassRaw := fs.String("execution-class", "", "optional execution class filter youtube_direct|video_live|image_poll")
 			limit := fs.Int("limit", 500, "row limit")
 			offset := fs.Int("offset", 0, "row offset")
 			apply := fs.Bool("apply", false, "apply unassignments for invalid rows (reconcile only)")
@@ -5109,7 +4046,10 @@ func runServerControl(ctx context.Context, cfg config.Config, args []string) {
 			if executionClass != "" {
 				norm, ok := capture.NormalizeExecutionClass(executionClass)
 				if !ok {
-					log.Fatalf("--execution-class must be one of youtube_direct|youtube_relay|video_live|image_poll")
+					log.Fatalf("--execution-class must be one of youtube_direct|video_live|image_poll")
+				}
+				if norm == capture.ExecutionClassYouTubeRelay {
+					norm = capture.ExecutionClassYouTubeDirect
 				}
 				executionClass = norm
 			}
@@ -5178,7 +4118,7 @@ func runServerControl(ctx context.Context, cfg config.Config, args []string) {
 		}
 		fs := flag.NewFlagSet("servers assignments", flag.ExitOnError)
 		serverID := fs.String("server-id", "", "optional server id filter")
-		executionClassRaw := fs.String("execution-class", "", "optional execution class filter youtube_direct|youtube_relay|video_live|image_poll")
+		executionClassRaw := fs.String("execution-class", "", "optional execution class filter youtube_direct|video_live|image_poll")
 		limit := fs.Int("limit", 500, "row limit")
 		offset := fs.Int("offset", 0, "row offset")
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
@@ -5195,7 +4135,10 @@ func runServerControl(ctx context.Context, cfg config.Config, args []string) {
 		if executionClass != "" {
 			norm, ok := capture.NormalizeExecutionClass(executionClass)
 			if !ok {
-				log.Fatalf("--execution-class must be one of youtube_direct|youtube_relay|video_live|image_poll")
+				log.Fatalf("--execution-class must be one of youtube_direct|video_live|image_poll")
+			}
+			if norm == capture.ExecutionClassYouTubeRelay {
+				norm = capture.ExecutionClassYouTubeDirect
 			}
 			executionClass = norm
 		}
@@ -5332,7 +4275,7 @@ func runServerControl(ctx context.Context, cfg config.Config, args []string) {
 		case "heartbeat":
 			fs := flag.NewFlagSet("servers capacity heartbeat", flag.ExitOnError)
 			serverID := fs.String("server-id", "", "server id")
-			captureSharedCapacity := fs.Int("capture-shared-capacity", 0, "shared max active streams across video_live and image_poll execution classes")
+			captureSharedCapacity := fs.Int("capture-shared-capacity", 0, "max active video_live streams")
 			executionClassCapacityRaw := fs.String("execution-class-capacity", "", "comma-separated execution_class=max_active list (e.g. video_live=8,youtube_direct=2)")
 			drainingExecutionClassesRaw := fs.String("draining-execution-classes", "", "optional comma-separated execution classes to mark draining")
 			leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
@@ -5350,7 +4293,6 @@ func runServerControl(ctx context.Context, cfg config.Config, args []string) {
 			executionClassCapacity := map[string]int{}
 			if *captureSharedCapacity > 0 {
 				executionClassCapacity[capture.ExecutionClassVideoLive] = *captureSharedCapacity
-				executionClassCapacity[capture.ExecutionClassImagePoll] = *captureSharedCapacity
 			}
 			if strings.TrimSpace(*executionClassCapacityRaw) != "" {
 				if len(executionClassCapacity) > 0 {
@@ -6582,11 +5524,8 @@ func summarizeServerConnectionsDashboard(item map[string]any) string {
 		hub := stringAny(meta["hub_server_id"])
 		wgIface := stringAny(meta["wg_interface"])
 		wgIP := stringAny(meta["wg_ip"])
-		sourceServer := stringAny(meta["relay_source_server_id"])
-		sourceBaseURL := stringAny(meta["relay_source_public_base_url"])
-		relayBaseURL := stringAny(meta["relay_public_base_url"])
 		sourceEndpoint := stringAny(meta["source_endpoint"])
-		if transport == "" && topologyID == "" && role == "" && hub == "" && wgIface == "" && wgIP == "" && sourceServer == "" && sourceBaseURL == "" && relayBaseURL == "" && sourceEndpoint == "" {
+		if transport == "" && topologyID == "" && role == "" && hub == "" && wgIface == "" && wgIP == "" && sourceEndpoint == "" {
 			return
 		}
 		parts := make([]string, 0, 8)
@@ -6612,17 +5551,8 @@ func summarizeServerConnectionsDashboard(item map[string]any) string {
 				parts = append(parts, "wg_ip="+wgIP)
 			}
 		}
-		if sourceServer != "" {
-			parts = append(parts, "source_server="+sourceServer)
-		}
 		if sourceEndpoint != "" {
 			parts = append(parts, "source_endpoint="+sourceEndpoint)
-		}
-		if sourceBaseURL != "" {
-			parts = append(parts, "relay_source_url="+sourceBaseURL)
-		}
-		if relayBaseURL != "" {
-			parts = append(parts, "relay_url="+relayBaseURL)
 		}
 		entry := strings.Join(parts, " ")
 		if entry == "" {
@@ -7170,8 +6100,6 @@ func parseCaptureServerExecutionClassesCSV(v string) ([]capture.Mode, error) {
 		switch executionClass {
 		case capture.ExecutionClassVideoLive:
 			modes = []capture.Mode{capture.ModeHLSLive, capture.ModeFFmpegDirect}
-		case capture.ExecutionClassImagePoll:
-			modes = []capture.Mode{capture.ModeImagePoll}
 		default:
 			return nil, fmt.Errorf("execution_class %s is unsupported for capture-server", executionClass)
 		}
@@ -7279,26 +6207,6 @@ func localServerID(hostname string, fallbackWorkerID string) string {
 		}
 	}
 	return "local-runner"
-}
-
-func defaultLocalYouTubeWorkerID(fallback string) string {
-	if raw, err := os.Hostname(); err == nil {
-		host := strings.TrimSpace(raw)
-		if host != "" {
-			if i := strings.IndexByte(host, '.'); i > 0 {
-				host = host[:i]
-			}
-			host = sanitizeFilename(host)
-			if host != "" {
-				return "local-youtube-worker-" + host
-			}
-		}
-	}
-	fallback = strings.TrimSpace(fallback)
-	if fallback == "" {
-		fallback = "capture-worker-1"
-	}
-	return "local-youtube-worker-" + sanitizeFilename(fallback)
 }
 
 func defaultCaptureServerWorkerID(fallback string) string {

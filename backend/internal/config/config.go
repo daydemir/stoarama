@@ -45,8 +45,6 @@ type Config struct {
 	CaptureFrameQueueSize       int
 	CaptureFrameEnqueueTimeout  int
 	CaptureFrameWriters         int
-	CaptureSegmentDurationSec   int
-	CaptureSegmentTargetFPS     int
 	InferenceBoxPollSec         int
 	InferenceBoxConcurrency     int
 	InferenceBoxLeaseSec        int
@@ -95,8 +93,6 @@ func Load() (Config, error) {
 		CaptureFrameQueueSize:       intEnv("CAPTURE_FRAME_QUEUE_SIZE", 16),
 		CaptureFrameEnqueueTimeout:  intEnv("CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC", 3),
 		CaptureFrameWriters:         intEnv("CAPTURE_FRAME_WRITERS", 1),
-		CaptureSegmentDurationSec:   intEnv("CAPTURE_SEGMENT_DURATION_SEC", 30),
-		CaptureSegmentTargetFPS:     intEnv("CAPTURE_SEGMENT_TARGET_FPS", 10),
 		InferenceBoxPollSec:         intEnv("BOX_WORKER_POLL_SEC", 2),
 		InferenceBoxConcurrency:     intEnv("BOX_WORKER_CONCURRENCY", 2),
 		InferenceBoxLeaseSec:        intEnv("BOX_WORKER_LEASE_SEC", 300),

@@ -150,41 +150,6 @@ func TestFFmpegDirectResolveAcceptsVideoURLs(t *testing.T) {
 	}
 }
 
-func TestYouTubeRelayResolveRequiresRelayPullURL(t *testing.T) {
-	t.Parallel()
-
-	a := &youtubeRelayAdapter{}
-	_, err := a.Resolve(context.Background(), StreamSpec{
-		StreamURL: "https://www.youtube.com/watch?v=abc123",
-	})
-	if err == nil {
-		t.Fatalf("expected error when relay_pull_url is missing")
-	}
-	if !strings.Contains(err.Error(), "requires capture_config.relay_pull_url") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestYouTubeRelayResolveAcceptsRelayPullURL(t *testing.T) {
-	t.Parallel()
-
-	a := &youtubeRelayAdapter{}
-	src, err := a.Resolve(context.Background(), StreamSpec{
-		CaptureConfig: map[string]any{
-			"relay_pull_url": "http://10.77.0.2:18080/relay/123?token=abc",
-		},
-	})
-	if err != nil {
-		t.Fatalf("resolve failed: %v", err)
-	}
-	if src.Mode != ModeYouTubeRelay {
-		t.Fatalf("mode=%q want %q", src.Mode, ModeYouTubeRelay)
-	}
-	if src.URL != "http://10.77.0.2:18080/relay/123?token=abc" {
-		t.Fatalf("url=%q", src.URL)
-	}
-}
-
 func TestHLSResolveFollowsIndirectBodyAndRedirectToM3U8(t *testing.T) {
 	t.Parallel()
 

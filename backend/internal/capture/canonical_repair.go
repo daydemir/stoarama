@@ -116,9 +116,9 @@ func proposeExecutionClass(captureType string, currentExecutionClass string) (st
 	switch captureType {
 	case CaptureTypeYouTubeWatch:
 		if currentExecutionClass == ExecutionClassYouTubeRelay {
-			return ExecutionClassYouTubeRelay, "keep_youtube_relay", false
+			return ExecutionClassYouTubeDirect, "youtube_relay_hard_cut", false
 		}
-		return ExecutionClassYouTubeRelay, "youtube_relay_default", false
+		return ExecutionClassYouTubeDirect, "youtube_direct_default", false
 	case CaptureTypeStillImage:
 		return ExecutionClassImagePoll, "image_poll_from_capture_type", false
 	case CaptureTypeHLS, CaptureTypeDASH, CaptureTypeRTSP, CaptureTypeRTMP, CaptureTypeHTTPVideo:

@@ -99,6 +99,11 @@ func TestEffectiveMode(t *testing.T) {
 	if got := EffectiveMode(spec); got != ModeImagePoll {
 		t.Fatalf("EffectiveMode(explicit)=%q want %q", got, ModeImagePoll)
 	}
+
+	spec = StreamSpec{CaptureMode: ModeYouTubeRelay}
+	if got := EffectiveMode(spec); got != ModeYouTubeLive {
+		t.Fatalf("EffectiveMode(relay)=%q want %q", got, ModeYouTubeLive)
+	}
 }
 
 func TestGetConfigInt(t *testing.T) {

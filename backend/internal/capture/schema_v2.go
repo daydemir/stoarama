@@ -192,7 +192,7 @@ func DefaultExecutionClassForCaptureType(captureType string) string {
 	}
 	switch ct {
 	case CaptureTypeYouTubeWatch:
-		return ExecutionClassYouTubeRelay
+		return ExecutionClassYouTubeDirect
 	case CaptureTypeStillImage:
 		return ExecutionClassImagePoll
 	case CaptureTypeHLS, CaptureTypeDASH, CaptureTypeRTSP, CaptureTypeRTMP, CaptureTypeHTTPVideo:
@@ -217,10 +217,8 @@ func CaptureFamilyForCaptureType(captureType string) string {
 
 func ModeToExecutionClass(mode Mode) string {
 	switch NormalizeMode(string(mode)) {
-	case ModeYouTubeLive:
+	case ModeYouTubeLive, ModeYouTubeRelay:
 		return ExecutionClassYouTubeDirect
-	case ModeYouTubeRelay:
-		return ExecutionClassYouTubeRelay
 	case ModeHLSLive, ModeFFmpegDirect:
 		return ExecutionClassVideoLive
 	case ModeImagePoll:
@@ -304,21 +302,11 @@ func deriveCaptureCadence(provider string, sourceURL string, sourcePageURL strin
 		if explicitExpectedImageIntervalSec != nil {
 			return "", nil, nil, fmt.Errorf("expected_image_interval_sec is only valid for snapshot_image streams")
 		}
-		expectedFPS := clonePositiveFloat64(explicitExpectedFPS)
-		if expectedFPS == nil {
-			if configured := GetConfigInt(executionConfig, "expected_fps", 0); configured > 0 {
-				value := float64(configured)
-				expectedFPS = &value
-			}
+		if explicitExpectedFPS != nil && *explicitExpectedFPS != float64(SegmentTargetFPS) {
+			return "", nil, nil, fmt.Errorf("expected_fps must be %d for continuous_video streams", SegmentTargetFPS)
 		}
-		if expectedFPS == nil {
-			value := float64(GetConfigInt(executionConfig, "target_fps", 10))
-			if value <= 0 {
-				value = 10
-			}
-			expectedFPS = &value
-		}
-		return family, expectedFPS, nil, nil
+		value := float64(SegmentTargetFPS)
+		return family, &value, nil, nil
 	case CaptureFamilySnapshotImage:
 		if explicitExpectedFPS != nil {
 			return "", nil, nil, fmt.Errorf("expected_fps is only valid for continuous_video streams")
@@ -432,10 +420,8 @@ func LegacyModeForStream(captureType string, executionClass string) Mode {
 	if executionClass != "" {
 		if execClass, ok := NormalizeExecutionClass(executionClass); ok {
 			switch execClass {
-			case ExecutionClassYouTubeDirect:
+			case ExecutionClassYouTubeDirect, ExecutionClassYouTubeRelay:
 				return ModeYouTubeLive
-			case ExecutionClassYouTubeRelay:
-				return ModeYouTubeRelay
 			case ExecutionClassImagePoll:
 				return ModeImagePoll
 			case ExecutionClassVideoLive:

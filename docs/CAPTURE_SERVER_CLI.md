@@ -1,10 +1,10 @@
 # Capture Server CLI
 
-`stoaramactl capture-server run` is the non-YouTube assignment-managed capture supervisor for server nodes.
+`stoaramactl capture-server run` is the assignment-managed `video_live` recording supervisor for server nodes.
 
 ## Behavior
 
-- Announces shared capture-group server capacity heartbeat to backend (`server_execution_capacity`).
+- Announces shared `video_live` server capacity heartbeat to backend (`server_execution_capacity`).
 - Announces capture worker heartbeats per active execution class (`capture_worker_heartbeats`, `processing_worker_heartbeats`).
 - Runs one persistent capture manager per active execution class with assignment polling:
   - source: `GET /api/v1/recording/assignments?server_id=...`
@@ -14,8 +14,10 @@
   - `/api/v1/recording/servers/stopped` for server capacity cleanup.
 
 Execution-class behavior:
-- `video_live`: resolves HLS manifests when needed and otherwise passes direct video URLs through FFmpeg; still-image endpoints must use `image_poll`.
-- `image_poll`: polls still-image sources directly.
+- `video_live`: records HLS, HTTP video, RTSP, and RTMP streams as fixed-length clips.
+- `image_poll`: catalog/probe only; it is not recording capacity.
+
+Clip bytes are uploaded from the capture node directly to R2 through presigned URLs. Render only issues upload intents and records metadata.
 
 ## Usage
 
@@ -40,7 +42,7 @@ go run ./cmd/stoaramactl capture-server run \
 
 - `--backend-api-url`
 - `--api-token`
-- `--capture-shared-capacity` (>0; shared across `video_live` and `image_poll`)
+- `--capture-shared-capacity` (>0; `video_live` recording slots)
 
 ## Optional Flags
 

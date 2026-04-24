@@ -91,9 +91,9 @@ func TestInferCaptureTypePrefersYouTubeAndImages(t *testing.T) {
 	}
 }
 
-func TestDefaultExecutionClassForCaptureTypeUsesRelayForYouTube(t *testing.T) {
-	if got := DefaultExecutionClassForCaptureType(CaptureTypeYouTubeWatch); got != ExecutionClassYouTubeRelay {
-		t.Fatalf("execution_class=%q want %q", got, ExecutionClassYouTubeRelay)
+func TestDefaultExecutionClassForCaptureTypeUsesDirectForYouTube(t *testing.T) {
+	if got := DefaultExecutionClassForCaptureType(CaptureTypeYouTubeWatch); got != ExecutionClassYouTubeDirect {
+		t.Fatalf("execution_class=%q want %q", got, ExecutionClassYouTubeDirect)
 	}
 }
 
@@ -115,8 +115,8 @@ func TestDeriveCaptureProfileVideoDefaults(t *testing.T) {
 	if profile.CaptureFamily != CaptureFamilyContinuousVideo {
 		t.Fatalf("capture_family=%q want %q", profile.CaptureFamily, CaptureFamilyContinuousVideo)
 	}
-	if profile.ExpectedFPS == nil || *profile.ExpectedFPS != 10 {
-		t.Fatalf("expected_fps=%v want 10", profile.ExpectedFPS)
+	if profile.ExpectedFPS == nil || *profile.ExpectedFPS != 30 {
+		t.Fatalf("expected_fps=%v want 30", profile.ExpectedFPS)
 	}
 	if profile.ExpectedImageIntervalSec != nil {
 		t.Fatalf("expected_image_interval_sec=%v want nil", profile.ExpectedImageIntervalSec)

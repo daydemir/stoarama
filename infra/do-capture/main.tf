@@ -40,7 +40,6 @@ resource "digitalocean_droplet" "capture" {
     backend_api_url                 = var.backend_api_url
     backend_api_token               = var.backend_api_token
     capture_shared_capacity         = var.capture_shared_capacity
-    capture_segment_target_fps      = var.capture_segment_target_fps
     draining_modes_csv              = local.draining_csv
     capture_tick_sec                = var.capture_tick_sec
     capture_heartbeat_sec           = var.capture_heartbeat_sec

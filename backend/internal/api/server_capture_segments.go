@@ -1,14 +1,9 @@
 package api
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
-	"image"
-	_ "image/jpeg"
 	"log"
 	"net/http"
 	"strings"
@@ -23,27 +18,30 @@ import (
 )
 
 type captureSegmentFinalize struct {
-	IntentID       string
-	ObjectKey      string
-	MIMEType       string
-	SizeBytes      int64
-	ETag           string
-	SHA256         string
-	SegmentStartAt time.Time
-	SegmentEndAt   time.Time
-	DurationMs     int64
-	TargetFPS      int
-	ActualFPS      *float64
-	VideoCodec     string
-	AudioCodec     string
-	Container      string
-	AudioPresent   bool
-	SourceKind     string
-	ExecutionClass string
-	ResolvedURL    string
-	CaptureType    string
-	ThumbnailBytes []byte
-	ThumbnailMIME  string
+	IntentID           string
+	ObjectKey          string
+	MIMEType           string
+	SizeBytes          int64
+	ETag               string
+	SHA256             string
+	SegmentStartAt     time.Time
+	SegmentEndAt       time.Time
+	DurationMs         int64
+	TargetFPS          int
+	ActualFPS          *float64
+	VideoCodec         string
+	AudioCodec         string
+	Container          string
+	AudioPresent       bool
+	SourceKind         string
+	ExecutionClass     string
+	ResolvedURL        string
+	CaptureType        string
+	ThumbnailIntentID  string
+	ThumbnailObjectKey string
+	ThumbnailMIME      string
+	ThumbnailSizeBytes int64
+	ThumbnailSHA256    string
 }
 
 func buildCaptureSegmentObjectKey(streamID int64, startAt time.Time, mimeType string) string {
@@ -127,6 +125,64 @@ func (s *Server) finalizeCaptureSegmentUpload(ctx context.Context, tx pgx.Tx, st
 	return mediaID, nil
 }
 
+func (s *Server) finalizeCaptureSegmentThumbnailUpload(ctx context.Context, tx pgx.Tx, payload captureSegmentFinalize) (int64, error) {
+	var intentObjectKey string
+	var expectedSize sql.NullInt64
+	if strings.TrimSpace(payload.ThumbnailIntentID) != "" {
+		if err := tx.QueryRow(ctx, `
+			SELECT object_key, expected_size_bytes
+			FROM upload_intents
+			WHERE id=$1::uuid AND kind='capture_segment_thumbnail' AND status='pending'
+		`, payload.ThumbnailIntentID).Scan(&intentObjectKey, &expectedSize); err != nil {
+			return 0, fmt.Errorf("load thumbnail upload intent: %w", err)
+		}
+	}
+
+	objectKey := strings.TrimSpace(payload.ThumbnailObjectKey)
+	if objectKey == "" {
+		objectKey = strings.TrimSpace(intentObjectKey)
+	}
+	if objectKey == "" {
+		return 0, fmt.Errorf("thumbnail_object_key is required")
+	}
+	mimeType := strings.TrimSpace(payload.ThumbnailMIME)
+	if mimeType == "" {
+		mimeType = "image/jpeg"
+	}
+	sizeBytes := payload.ThumbnailSizeBytes
+	if sizeBytes <= 0 {
+		head, err := s.r2.Head(ctx, objectKey)
+		if err != nil {
+			return 0, fmt.Errorf("head uploaded thumbnail: %w", err)
+		}
+		sizeBytes = head.SizeBytes
+	}
+	if expectedSize.Valid && expectedSize.Int64 > 0 && sizeBytes > 0 && sizeBytes != expectedSize.Int64 {
+		return 0, fmt.Errorf("uploaded thumbnail size mismatch: got=%d expected=%d", sizeBytes, expectedSize.Int64)
+	}
+	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{
+		StorageProvider: "r2",
+		Bucket:          s.r2.Bucket(),
+		ObjectKey:       objectKey,
+		MIMEType:        mimeType,
+		SizeBytes:       sizeBytes,
+		SHA256:          strings.TrimSpace(payload.ThumbnailSHA256),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("upsert thumbnail media object: %w", err)
+	}
+	if strings.TrimSpace(payload.ThumbnailIntentID) != "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE upload_intents
+			SET status='consumed'
+			WHERE id=$1::uuid
+		`, payload.ThumbnailIntentID); err != nil {
+			return 0, fmt.Errorf("complete thumbnail upload intent: %w", err)
+		}
+	}
+	return mediaID, nil
+}
+
 func parseUUIDString(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -150,9 +206,9 @@ func (s *Server) persistCaptureSegmentSuccess(ctx context.Context, streamID int6
 		return err
 	}
 	var thumbnailMediaID any
-	if len(payload.ThumbnailBytes) > 0 {
-		if id, thumbErr := s.persistCaptureSegmentThumbnail(ctx, tx, streamID, payload.SegmentStartAt, payload.ThumbnailBytes, payload.ThumbnailMIME); thumbErr != nil {
-			log.Printf("capture-segment thumbnail stream_id=%d start=%s error=%v", streamID, payload.SegmentStartAt.UTC().Format(time.RFC3339), thumbErr)
+	if strings.TrimSpace(payload.ThumbnailIntentID) != "" || strings.TrimSpace(payload.ThumbnailObjectKey) != "" {
+		if id, thumbErr := s.finalizeCaptureSegmentThumbnailUpload(ctx, tx, payload); thumbErr != nil {
+			log.Printf("capture-segment thumbnail upload stream_id=%d start=%s error=%v", streamID, payload.SegmentStartAt.UTC().Format(time.RFC3339), thumbErr)
 		} else if id > 0 {
 			thumbnailMediaID = id
 		}
@@ -208,40 +264,6 @@ func (s *Server) persistCaptureSegmentSuccess(ctx context.Context, streamID int6
 	return nil
 }
 
-func (s *Server) persistCaptureSegmentThumbnail(ctx context.Context, tx pgx.Tx, streamID int64, startAt time.Time, body []byte, mimeType string) (int64, error) {
-	if len(body) == 0 {
-		return 0, nil
-	}
-	if strings.TrimSpace(mimeType) == "" {
-		mimeType = "image/jpeg"
-	}
-	objectKey := buildCaptureSegmentThumbnailObjectKey(streamID, startAt)
-	etag, err := s.r2.PutBytes(ctx, objectKey, mimeType, body)
-	if err != nil {
-		return 0, fmt.Errorf("upload thumbnail: %w", err)
-	}
-	sum := sha256.Sum256(body)
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(body))
-	if err != nil {
-		cfg = image.Config{}
-	}
-	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{
-		StorageProvider: "r2",
-		Bucket:          s.r2.Bucket(),
-		ObjectKey:       objectKey,
-		MIMEType:        mimeType,
-		SizeBytes:       int64(len(body)),
-		ETag:            strings.TrimSpace(etag),
-		SHA256:          hex.EncodeToString(sum[:]),
-		Width:           cfg.Width,
-		Height:          cfg.Height,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("upsert thumbnail media object: %w", err)
-	}
-	return mediaID, nil
-}
-
 func (s *Server) persistCaptureSegmentError(ctx context.Context, streamID int64, executionClass string, resolvedURL string, sourceKind string, captureErr string) (int, error) {
 	errText := strings.TrimSpace(captureErr)
 	if errText == "" {
@@ -265,7 +287,7 @@ func (s *Server) persistCaptureSegmentError(ctx context.Context, streamID int64,
 			capture_status, capture_error, source_kind
 		)
 		VALUES ($1, NULL, NULL, $2, $3, $4, $5, $5, 0, $6, NULL, NULL, NULL, 'mp4', false, 'error', $7, $8)
-	`, streamID, executionClass, nullableTrimmed(capture.ResolvedCaptureTypeFromURL(resolvedURL)), nullableTrimmed(resolvedURL), now, max(1, s.cfg.CaptureSegmentTargetFPS), errText, sourceKind); err != nil {
+	`, streamID, executionClass, nullableTrimmed(capture.ResolvedCaptureTypeFromURL(resolvedURL)), nullableTrimmed(resolvedURL), now, capture.SegmentTargetFPS, errText, sourceKind); err != nil {
 		return 0, fmt.Errorf("insert capture segment error: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `

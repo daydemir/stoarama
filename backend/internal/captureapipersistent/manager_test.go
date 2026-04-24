@@ -75,7 +75,7 @@ func TestLoadDesiredStreamsWithStreamFilterIncludesNonRecordedStream(t *testing.
 	}
 }
 
-func TestLoadAssignedStreamsUsesAssignmentModeAndRelayPullURL(t *testing.T) {
+func TestLoadAssignedStreamsMapsLegacyRelayToYouTubeLive(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
@@ -101,8 +101,6 @@ func TestLoadAssignedStreamsUsesAssignmentModeAndRelayPullURL(t *testing.T) {
 					"source_page_url":       "",
 					"capture_type":          "youtube_watch",
 					"execution_config_json": map[string]any{},
-					"relay_pull_url":        "https://rr.example/live.m3u8",
-					"relay_status":          "source_ready",
 				},
 			},
 		})
@@ -119,7 +117,7 @@ func TestLoadAssignedStreamsUsesAssignmentModeAndRelayPullURL(t *testing.T) {
 	}
 	mgr := NewManager(client, ManagerConfig{
 		ServerID:      "sink-1",
-		ModeAllowlist: []capture.Mode{capture.ModeYouTubeRelay},
+		ModeAllowlist: []capture.Mode{capture.ModeYouTubeLive},
 	})
 	streams, err := mgr.loadDesiredStreams(context.Background())
 	if err != nil {
@@ -128,11 +126,8 @@ func TestLoadAssignedStreamsUsesAssignmentModeAndRelayPullURL(t *testing.T) {
 	if len(streams) != 1 {
 		t.Fatalf("len(streams)=%d want=1", len(streams))
 	}
-	if streams[0].CaptureMode != capture.ModeYouTubeRelay {
-		t.Fatalf("capture_mode=%s want=%s", streams[0].CaptureMode, capture.ModeYouTubeRelay)
-	}
-	if got := strings.TrimSpace(capture.GetConfigString(streams[0].CaptureConfig, "relay_pull_url", "")); got != "https://rr.example/live.m3u8" {
-		t.Fatalf("relay_pull_url=%q want https://rr.example/live.m3u8", got)
+	if streams[0].CaptureMode != capture.ModeYouTubeLive {
+		t.Fatalf("capture_mode=%s want=%s", streams[0].CaptureMode, capture.ModeYouTubeLive)
 	}
 }
 
@@ -229,37 +224,6 @@ func TestManagerShouldRecordingHeartbeat(t *testing.T) {
 	disabled := NewManager(&captureapi.Client{}, ManagerConfig{RecordingHeartbeat: false})
 	if disabled.shouldRecordingHeartbeat(capture.ModeYouTubeLive) {
 		t.Fatalf("did not expect recording heartbeat when disabled")
-	}
-}
-
-func TestManagerShouldRelayRouteStatus(t *testing.T) {
-	base := streamConfig{
-		ID:                 777,
-		Assigned:           true,
-		AssignmentRevision: 2,
-	}
-	mgr := NewManager(&captureapi.Client{}, ManagerConfig{
-		ServerID: "do-sink-1",
-	})
-	if !mgr.shouldRelayRouteStatus(base, capture.ModeYouTubeRelay) {
-		t.Fatalf("expected relay route status for assigned youtube_relay stream")
-	}
-	if mgr.shouldRelayRouteStatus(base, capture.ModeYouTubeLive) {
-		t.Fatalf("did not expect relay route status for youtube_live")
-	}
-	noServer := NewManager(&captureapi.Client{}, ManagerConfig{})
-	if noServer.shouldRelayRouteStatus(base, capture.ModeYouTubeRelay) {
-		t.Fatalf("did not expect relay route status without server id")
-	}
-	notAssigned := base
-	notAssigned.Assigned = false
-	if mgr.shouldRelayRouteStatus(notAssigned, capture.ModeYouTubeRelay) {
-		t.Fatalf("did not expect relay route status when stream is not assignment-managed")
-	}
-	noRevision := base
-	noRevision.AssignmentRevision = 0
-	if mgr.shouldRelayRouteStatus(noRevision, capture.ModeYouTubeRelay) {
-		t.Fatalf("did not expect relay route status without assignment revision")
 	}
 }
 

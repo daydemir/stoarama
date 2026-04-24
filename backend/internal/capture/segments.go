@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+const (
+	SegmentTargetFPS = 30
+	SegmentDuration  = 30 * time.Second
+)
+
 type Segment struct {
 	Path         string
 	MIMEType     string
@@ -42,22 +47,13 @@ type SegmentThumbnail struct {
 	Height    int
 }
 
-func SegmentCaptureTimeout(segmentDuration time.Duration) time.Duration {
-	if segmentDuration <= 0 {
-		segmentDuration = 30 * time.Second
-	}
-	return segmentDuration + 60*time.Second
+func SegmentCaptureTimeout() time.Duration {
+	return SegmentDuration + 90*time.Second
 }
 
-func CaptureSegment(ctx context.Context, sourceURL string, targetFPS int, segmentDuration time.Duration) (Segment, error) {
+func CaptureSegment(ctx context.Context, sourceURL string) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
-	}
-	if targetFPS <= 0 {
-		targetFPS = 10
-	}
-	if segmentDuration <= 0 {
-		segmentDuration = 30 * time.Second
 	}
 
 	tmpDir, err := os.MkdirTemp("", "capture-segment-*")
@@ -67,7 +63,7 @@ func CaptureSegment(ctx context.Context, sourceURL string, targetFPS int, segmen
 
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
-	args := buildFFmpegSegmentArgs(sourceURL, targetFPS, segmentDuration, outPath)
+	args := buildFFmpegSegmentArgs(sourceURL, outPath)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -89,7 +85,7 @@ func CaptureSegment(ctx context.Context, sourceURL string, targetFPS int, segmen
 
 	meta, metaErr := probeSegment(ctx, outPath)
 	endAt := time.Now().UTC()
-	durationMs := int64(segmentDuration / time.Millisecond)
+	durationMs := int64(SegmentDuration / time.Millisecond)
 	videoCodec := "h264"
 	audioCodec := ""
 	audioPresent := false
@@ -136,10 +132,11 @@ func CleanupSegment(seg Segment) {
 	_ = os.RemoveAll(filepath.Dir(seg.Path))
 }
 
-func buildFFmpegSegmentArgs(sourceURL string, targetFPS int, segmentDuration time.Duration, outPath string) []string {
-	seconds := strconv.FormatFloat(segmentDuration.Seconds(), 'f', -1, 64)
+func buildFFmpegSegmentArgs(sourceURL string, outPath string) []string {
+	seconds := strconv.FormatFloat(SegmentDuration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
+		"-nostdin",
 		"-loglevel", "error",
 	}
 	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10)
@@ -149,7 +146,7 @@ func buildFFmpegSegmentArgs(sourceURL string, targetFPS int, segmentDuration tim
 		"-t", seconds,
 		"-map", "0:v:0",
 		"-map", "0:a?",
-		"-vf", fmt.Sprintf("fps=%d", targetFPS),
+		"-vf", fmt.Sprintf("fps=%d", SegmentTargetFPS),
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
 		"-pix_fmt", "yuv420p",

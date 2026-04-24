@@ -5,47 +5,6 @@ import (
 	"time"
 )
 
-func TestValidateYouTubeRelayRouteTransition(t *testing.T) {
-	tests := []struct {
-		name    string
-		actor   string
-		current string
-		next    string
-		wantErr bool
-	}{
-		{name: "source can ready assigned", actor: "youtube_relay_source", current: "assigned", next: "source_ready"},
-		{name: "source cannot clobber running", actor: "youtube_relay_source", current: "running", next: "source_ready", wantErr: true},
-		{name: "sink can mark running from ready", actor: "youtube_relay_sink", current: "source_ready", next: "running"},
-		{name: "sink can recover failed to running", actor: "youtube_relay_sink", current: "failed", next: "running"},
-		{name: "source cannot mark running", actor: "youtube_relay_source", current: "source_ready", next: "running", wantErr: true},
-		{name: "operator can stop", actor: "operator", current: "running", next: "stopped"},
-		{name: "stopped cannot revive", actor: "youtube_relay_sink", current: "stopped", next: "running", wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateYouTubeRelayRouteTransition(tt.actor, tt.current, tt.next)
-			if tt.wantErr && err == nil {
-				t.Fatalf("expected error for actor=%s current=%s next=%s", tt.actor, tt.current, tt.next)
-			}
-			if !tt.wantErr && err != nil {
-				t.Fatalf("unexpected error for actor=%s current=%s next=%s: %v", tt.actor, tt.current, tt.next, err)
-			}
-		})
-	}
-}
-
-func TestShouldIgnoreYouTubeRelayRouteStatusConflict(t *testing.T) {
-	if !shouldIgnoreYouTubeRelayRouteStatusConflict("youtube_relay_source", "running", "source_ready") {
-		t.Fatalf("expected running->source_ready conflict from source to be ignored")
-	}
-	if !shouldIgnoreYouTubeRelayRouteStatusConflict("youtube_relay_source", "failed", "source_ready") {
-		t.Fatalf("expected failed->source_ready conflict from source to be ignored")
-	}
-	if shouldIgnoreYouTubeRelayRouteStatusConflict("youtube_relay_sink", "stopped", "running") {
-		t.Fatalf("did not expect sink stopped->running conflict to be ignored")
-	}
-}
-
 func TestResendWebhookStatusAndTimes(t *testing.T) {
 	deliveredAt := "2026-03-27T00:44:19.331226Z"
 	status, delivered, opened, bounced := resendWebhookStatusAndTimes("email.delivered", map[string]any{

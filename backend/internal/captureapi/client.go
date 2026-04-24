@@ -46,6 +46,7 @@ type SegmentUploadIntentRequest struct {
 	StreamID  int64
 	MimeType  string
 	SizeBytes int64
+	StartAt   time.Time
 }
 
 type SegmentUploadIntent struct {
@@ -101,8 +102,9 @@ type IngestSegmentSuccessRequest struct {
 	AudioCodec         string
 	Container          string
 	AudioPresent       bool
-	ThumbnailBytes     []byte
-	ThumbnailMIMEType  string
+	ThumbnailIntent    *SegmentUploadIntent
+	ThumbnailSizeBytes int64
+	ThumbnailSHA256    string
 	RecordingHeartbeat bool
 }
 
@@ -185,55 +187,6 @@ type RecordingAssignment struct {
 	SourcePageURL      string         `json:"source_page_url"`
 	CaptureType        string         `json:"capture_type"`
 	CaptureConfigJSON  map[string]any `json:"execution_config_json"`
-	RelayPullURL       string         `json:"relay_pull_url"`
-	RelayStatus        string         `json:"relay_status"`
-}
-
-type YouTubeRelaySourceHeartbeatRequest struct {
-	ServerID     string
-	ShardID      string
-	MaxActive    int
-	Draining     bool
-	LeaseSec     int
-	MetadataJSON map[string]any
-}
-
-type YouTubeRelayRoute struct {
-	StreamID           int64          `json:"stream_id"`
-	SourceServerID     string         `json:"source_server_id"`
-	SinkServerID       string         `json:"sink_server_id"`
-	AssignmentRevision int64          `json:"assignment_revision"`
-	Status             string         `json:"status"`
-	RelayPullURL       string         `json:"relay_pull_url"`
-	ErrorText          string         `json:"error_text"`
-	StreamURL          string         `json:"source_url"`
-	SourcePageURL      string         `json:"source_page_url"`
-	MetadataJSON       map[string]any `json:"metadata_json"`
-	CreatedAt          *time.Time     `json:"created_at,omitempty"`
-	UpdatedAt          *time.Time     `json:"updated_at,omitempty"`
-}
-
-type YouTubeRelayEvent struct {
-	ID             int64          `json:"id"`
-	StreamID       int64          `json:"stream_id"`
-	SourceServerID string         `json:"source_server_id"`
-	SinkServerID   string         `json:"sink_server_id"`
-	Status         string         `json:"status"`
-	Actor          string         `json:"actor"`
-	Reason         string         `json:"reason"`
-	ErrorText      string         `json:"error_text"`
-	MetadataJSON   map[string]any `json:"metadata_json"`
-	CreatedAt      *time.Time     `json:"created_at,omitempty"`
-}
-
-type YouTubeRelayRouteStatusRequest struct {
-	StreamID     int64
-	Actor        string
-	Status       string
-	Reason       string
-	RelayPullURL string
-	ErrorText    string
-	MetadataJSON map[string]any
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -413,23 +366,6 @@ func normalizeExecutionClassValue(raw string) (string, error) {
 	return "", fmt.Errorf("invalid execution_class %q", raw)
 }
 
-func assignmentReadyForWorker(item RecordingAssignment) bool {
-	executionClass := strings.TrimSpace(item.ExecutionClass)
-	if executionClass != capture.ExecutionClassYouTubeRelay {
-		return true
-	}
-	relayPullURL := strings.TrimSpace(item.RelayPullURL)
-	if relayPullURL == "" {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(item.RelayStatus)) {
-	case "source_ready", "running":
-		return true
-	default:
-		return false
-	}
-}
-
 func (c *Client) GetRecordingSettings(ctx context.Context) (RecordingSettings, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/recording/settings", nil)
 	if err != nil {
@@ -508,14 +444,7 @@ func (c *Client) listRecordingAssignmentsPage(ctx context.Context, serverID stri
 			payload.Items[i].CaptureConfigJSON = map[string]any{}
 		}
 	}
-	items := make([]RecordingAssignment, 0, len(payload.Items))
-	for _, item := range payload.Items {
-		if !assignmentReadyForWorker(item) {
-			continue
-		}
-		items = append(items, item)
-	}
-	return items, nil
+	return payload.Items, nil
 }
 
 func (c *Client) ListRecordingAssignments(ctx context.Context, serverID string, executionClass string, limit int, offset int) ([]RecordingAssignment, error) {
@@ -577,6 +506,17 @@ func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) er
 }
 
 func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadIntentRequest) (SegmentUploadIntent, error) {
+	return c.reserveSegmentUpload(ctx, "capture_segment", "capture-segment", req)
+}
+
+func (c *Client) ReserveSegmentThumbnailUpload(ctx context.Context, req SegmentUploadIntentRequest) (SegmentUploadIntent, error) {
+	if req.StartAt.IsZero() {
+		return SegmentUploadIntent{}, fmt.Errorf("start_at is required")
+	}
+	return c.reserveSegmentUpload(ctx, "capture_segment_thumbnail", "capture-segment-thumbnail", req)
+}
+
+func (c *Client) reserveSegmentUpload(ctx context.Context, kind string, idempotencyPrefix string, req SegmentUploadIntentRequest) (SegmentUploadIntent, error) {
 	if req.StreamID <= 0 {
 		return SegmentUploadIntent{}, fmt.Errorf("stream_id must be > 0")
 	}
@@ -585,7 +525,7 @@ func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadInte
 		mimeType = "video/mp4"
 	}
 	payload := map[string]any{
-		"kind":      "capture_segment",
+		"kind":      kind,
 		"stream_id": req.StreamID,
 		"mime_type": mimeType,
 		"size_bytes": func() any {
@@ -594,6 +534,9 @@ func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadInte
 			}
 			return nil
 		}(),
+	}
+	if !req.StartAt.IsZero() {
+		payload["segment_start_at"] = req.StartAt.UTC().Format(time.RFC3339Nano)
 	}
 	var out struct {
 		IntentID    string    `json:"intent_id"`
@@ -604,7 +547,7 @@ func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadInte
 		ContentType string    `json:"content_type"`
 	}
 	headers := map[string]string{
-		"Idempotency-Key": buildIdempotencyKey("capture-segment", req.StreamID),
+		"Idempotency-Key": buildIdempotencyKey(idempotencyPrefix, req.StreamID),
 	}
 	if err := c.postJSONWithHeaders(ctx, "/api/v1/media/upload-intents", payload, headers, &out); err != nil {
 		return SegmentUploadIntent{}, err
@@ -619,10 +562,40 @@ func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadInte
 	}, nil
 }
 
-func (c *Client) UploadSegment(ctx context.Context, uploadURL string, body []byte, mimeType string) error {
+func (c *Client) UploadFile(ctx context.Context, uploadURL string, path string, mimeType string) error {
 	if strings.TrimSpace(uploadURL) == "" {
 		return fmt.Errorf("upload_url is required")
 	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open upload file: %w", err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat upload file: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, f)
+	if err != nil {
+		return fmt.Errorf("build upload request: %w", err)
+	}
+	req.ContentLength = st.Size()
+	if strings.TrimSpace(mimeType) != "" {
+		req.Header.Set("Content-Type", strings.TrimSpace(mimeType))
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload file failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return fmt.Errorf("upload file status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+func (c *Client) UploadSegment(ctx context.Context, uploadURL string, body []byte, mimeType string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build segment upload request: %w", err)
@@ -680,13 +653,12 @@ func (c *Client) IngestSegmentSuccess(ctx context.Context, req IngestSegmentSucc
 		"audio_present":       req.AudioPresent,
 		"recording_heartbeat": req.RecordingHeartbeat,
 	}
-	if len(req.ThumbnailBytes) > 0 {
-		thumbType := strings.TrimSpace(req.ThumbnailMIMEType)
-		if thumbType == "" {
-			thumbType = "image/jpeg"
-		}
-		payload["thumbnail_base64"] = base64.StdEncoding.EncodeToString(req.ThumbnailBytes)
-		payload["thumbnail_mime_type"] = thumbType
+	if req.ThumbnailIntent != nil {
+		payload["thumbnail_upload_intent_id"] = strings.TrimSpace(req.ThumbnailIntent.IntentID)
+		payload["thumbnail_object_key"] = strings.TrimSpace(req.ThumbnailIntent.ObjectKey)
+		payload["thumbnail_mime_type"] = strings.TrimSpace(req.ThumbnailIntent.ContentType)
+		payload["thumbnail_size_bytes"] = req.ThumbnailSizeBytes
+		payload["thumbnail_sha256"] = strings.TrimSpace(req.ThumbnailSHA256)
 	}
 	var out ingestResponse
 	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {
@@ -853,276 +825,6 @@ func (c *Client) RecordingServerStopped(ctx context.Context, serverID string) er
 	return c.postJSON(ctx, "/api/v1/recording/servers/stopped", map[string]any{
 		"server_id": serverID,
 	}, nil)
-}
-
-func (c *Client) YouTubeRelaySourceHeartbeat(ctx context.Context, req YouTubeRelaySourceHeartbeatRequest) error {
-	serverID := strings.TrimSpace(req.ServerID)
-	if serverID == "" {
-		return fmt.Errorf("server_id is required")
-	}
-	shardID := strings.TrimSpace(req.ShardID)
-	if shardID == "" {
-		return fmt.Errorf("shard_id is required")
-	}
-	if req.MaxActive <= 0 {
-		return fmt.Errorf("max_active must be > 0")
-	}
-	leaseSec := req.LeaseSec
-	if leaseSec <= 0 {
-		leaseSec = 45
-	}
-	if leaseSec > 3600 {
-		return fmt.Errorf("lease_sec must be <= 3600")
-	}
-	payload := map[string]any{
-		"server_id":     serverID,
-		"shard_id":      shardID,
-		"max_active":    req.MaxActive,
-		"draining":      req.Draining,
-		"lease_sec":     leaseSec,
-		"metadata_json": nonNilMap(req.MetadataJSON),
-	}
-	return c.postJSON(ctx, "/api/v1/youtube-relay/sources/heartbeat", payload, nil)
-}
-
-func (c *Client) NodeYouTubeRelaySourceHeartbeat(ctx context.Context, req YouTubeRelaySourceHeartbeatRequest) error {
-	shardID := strings.TrimSpace(req.ShardID)
-	if shardID == "" {
-		return fmt.Errorf("shard_id is required")
-	}
-	if req.MaxActive <= 0 {
-		return fmt.Errorf("max_active must be > 0")
-	}
-	leaseSec := req.LeaseSec
-	if leaseSec <= 0 {
-		leaseSec = 45
-	}
-	if leaseSec > 3600 {
-		return fmt.Errorf("lease_sec must be <= 3600")
-	}
-	payload := map[string]any{
-		"server_id":     strings.TrimSpace(req.ServerID),
-		"shard_id":      shardID,
-		"max_active":    req.MaxActive,
-		"draining":      req.Draining,
-		"lease_sec":     leaseSec,
-		"metadata_json": nonNilMap(req.MetadataJSON),
-	}
-	return c.postJSON(ctx, "/api/v1/node/youtube-relay/source/heartbeat", payload, nil)
-}
-
-func (c *Client) YouTubeRelaySourceStopped(ctx context.Context, serverID string) error {
-	serverID = strings.TrimSpace(serverID)
-	if serverID == "" {
-		return fmt.Errorf("server_id is required")
-	}
-	return c.postJSON(ctx, "/api/v1/youtube-relay/sources/stopped", map[string]any{
-		"server_id": serverID,
-	}, nil)
-}
-
-func (c *Client) NodeYouTubeRelaySourceStopped(ctx context.Context) error {
-	return c.postJSON(ctx, "/api/v1/node/youtube-relay/source/stopped", map[string]any{}, nil)
-}
-
-func (c *Client) ListYouTubeRelayRoutes(ctx context.Context, sourceServerID, sinkServerID, status string, limit, offset int) ([]YouTubeRelayRoute, error) {
-	if limit <= 0 {
-		limit = 500
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	u, err := url.Parse(c.baseURL + "/api/v1/youtube-relay/routes")
-	if err != nil {
-		return nil, fmt.Errorf("parse youtube relay routes URL: %w", err)
-	}
-	q := u.Query()
-	if v := strings.TrimSpace(sourceServerID); v != "" {
-		q.Set("source_server_id", v)
-	}
-	if v := strings.TrimSpace(sinkServerID); v != "" {
-		q.Set("sink_server_id", v)
-	}
-	if v := strings.TrimSpace(strings.ToLower(status)); v != "" {
-		q.Set("status", v)
-	}
-	q.Set("limit", fmt.Sprintf("%d", limit))
-	q.Set("offset", fmt.Sprintf("%d", offset))
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("build youtube relay routes request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiToken)
-
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("youtube relay routes request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return nil, fmt.Errorf("youtube relay routes status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	var payload struct {
-		Items []YouTubeRelayRoute `json:"items"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode youtube relay routes response: %w", err)
-	}
-	for i := range payload.Items {
-		if payload.Items[i].MetadataJSON == nil {
-			payload.Items[i].MetadataJSON = map[string]any{}
-		}
-	}
-	return payload.Items, nil
-}
-
-func (c *Client) NodeListYouTubeRelayRoutes(ctx context.Context, status string, limit, offset int) ([]YouTubeRelayRoute, error) {
-	if limit <= 0 {
-		limit = 500
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	u, err := url.Parse(c.baseURL + "/api/v1/node/youtube-relay/routes")
-	if err != nil {
-		return nil, fmt.Errorf("parse node youtube relay routes URL: %w", err)
-	}
-	q := u.Query()
-	if v := strings.TrimSpace(strings.ToLower(status)); v != "" {
-		q.Set("status", v)
-	}
-	q.Set("limit", fmt.Sprintf("%d", limit))
-	q.Set("offset", fmt.Sprintf("%d", offset))
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("build node youtube relay routes request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiToken)
-
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("node youtube relay routes request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return nil, fmt.Errorf("node youtube relay routes status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	var payload struct {
-		Items []YouTubeRelayRoute `json:"items"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode node youtube relay routes response: %w", err)
-	}
-	for i := range payload.Items {
-		if payload.Items[i].MetadataJSON == nil {
-			payload.Items[i].MetadataJSON = map[string]any{}
-		}
-	}
-	return payload.Items, nil
-}
-
-func (c *Client) UpdateYouTubeRelayRouteStatus(ctx context.Context, req YouTubeRelayRouteStatusRequest) error {
-	if req.StreamID <= 0 {
-		return fmt.Errorf("stream_id must be > 0")
-	}
-	actor := strings.TrimSpace(req.Actor)
-	if actor == "" {
-		return fmt.Errorf("actor is required")
-	}
-	status := strings.TrimSpace(strings.ToLower(req.Status))
-	switch status {
-	case "assigned", "source_ready", "running", "stopped", "failed":
-	default:
-		return fmt.Errorf("status must be one of assigned|source_ready|running|stopped|failed")
-	}
-	path := fmt.Sprintf("/api/v1/youtube-relay/routes/%d/status", req.StreamID)
-	payload := map[string]any{
-		"actor":          actor,
-		"status":         status,
-		"reason":         strings.TrimSpace(req.Reason),
-		"relay_pull_url": strings.TrimSpace(req.RelayPullURL),
-		"error_text":     strings.TrimSpace(req.ErrorText),
-		"metadata_json":  nonNilMap(req.MetadataJSON),
-	}
-	return c.postJSON(ctx, path, payload, nil)
-}
-
-func (c *Client) NodeUpdateYouTubeRelayRouteStatus(ctx context.Context, req YouTubeRelayRouteStatusRequest) error {
-	if req.StreamID <= 0 {
-		return fmt.Errorf("stream_id must be > 0")
-	}
-	actor := strings.TrimSpace(req.Actor)
-	if actor == "" {
-		return fmt.Errorf("actor is required")
-	}
-	status := strings.TrimSpace(strings.ToLower(req.Status))
-	switch status {
-	case "assigned", "source_ready", "running", "stopped", "failed":
-	default:
-		return fmt.Errorf("status must be one of assigned|source_ready|running|stopped|failed")
-	}
-	path := fmt.Sprintf("/api/v1/node/youtube-relay/routes/%d/status", req.StreamID)
-	payload := map[string]any{
-		"actor":          actor,
-		"status":         status,
-		"reason":         strings.TrimSpace(req.Reason),
-		"relay_pull_url": strings.TrimSpace(req.RelayPullURL),
-		"error_text":     strings.TrimSpace(req.ErrorText),
-		"metadata_json":  nonNilMap(req.MetadataJSON),
-	}
-	return c.postJSON(ctx, path, payload, nil)
-}
-
-func (c *Client) ListYouTubeRelayRouteEvents(ctx context.Context, streamID int64, limit, offset int) ([]YouTubeRelayEvent, error) {
-	if streamID <= 0 {
-		return nil, fmt.Errorf("stream_id must be > 0")
-	}
-	if limit <= 0 {
-		limit = 50
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	u, err := url.Parse(fmt.Sprintf("%s/api/v1/youtube-relay/routes/%d/events", c.baseURL, streamID))
-	if err != nil {
-		return nil, fmt.Errorf("parse youtube relay events url: %w", err)
-	}
-	q := u.Query()
-	q.Set("limit", fmt.Sprintf("%d", limit))
-	q.Set("offset", fmt.Sprintf("%d", offset))
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("build youtube relay events request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiToken)
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("youtube relay events request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return nil, fmt.Errorf("youtube relay events status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	var payload struct {
-		Items []YouTubeRelayEvent `json:"items"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode youtube relay events response: %w", err)
-	}
-	for i := range payload.Items {
-		if payload.Items[i].MetadataJSON == nil {
-			payload.Items[i].MetadataJSON = map[string]any{}
-		}
-	}
-	return payload.Items, nil
 }
 
 func (c *Client) RecordingProcessHeartbeat(ctx context.Context, req RecordingProcessHeartbeatRequest) error {

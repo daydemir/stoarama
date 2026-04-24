@@ -15,8 +15,6 @@ import (
 
 type youtubeLiveAdapter struct{}
 
-type youtubeRelayAdapter struct{}
-
 type hlsLiveAdapter struct{}
 
 type imagePollAdapter struct{}
@@ -49,27 +47,6 @@ func (a *youtubeLiveAdapter) Resolve(ctx context.Context, spec StreamSpec) (Reso
 }
 
 func (a *youtubeLiveAdapter) StartSession(ctx context.Context, spec StreamSpec, src ResolvedSource, emit EmitFrameFunc) error {
-	return startFFmpegSession(ctx, spec, src, emit)
-}
-
-func (a *youtubeRelayAdapter) Mode() Mode { return ModeYouTubeRelay }
-
-func (a *youtubeRelayAdapter) Supports(spec StreamSpec) bool {
-	return strings.TrimSpace(GetConfigString(spec.CaptureConfig, "relay_pull_url", "")) != ""
-}
-
-func (a *youtubeRelayAdapter) Resolve(_ context.Context, spec StreamSpec) (ResolvedSource, error) {
-	u := strings.TrimSpace(GetConfigString(spec.CaptureConfig, "relay_pull_url", ""))
-	if u == "" {
-		return ResolvedSource{}, fmt.Errorf("youtube_relay requires capture_config.relay_pull_url")
-	}
-	if looksLikeImageURL(u) {
-		return ResolvedSource{}, fmt.Errorf("youtube_relay requires a video stream URL; got still-image URL")
-	}
-	return ResolvedSource{URL: u, IsImage: false, RefreshAfter: 5 * time.Minute, Mode: ModeYouTubeRelay}, nil
-}
-
-func (a *youtubeRelayAdapter) StartSession(ctx context.Context, spec StreamSpec, src ResolvedSource, emit EmitFrameFunc) error {
 	return startFFmpegSession(ctx, spec, src, emit)
 }
 
@@ -210,13 +187,7 @@ func startFFmpegSession(ctx context.Context, spec StreamSpec, src ResolvedSource
 	if captureIntervalSec <= 0 {
 		captureIntervalSec = 1
 	}
-	targetFPS := spec.TargetFPS
-	if targetFPS <= 0 {
-		targetFPS = 10
-	}
-	if targetFPS > 30 {
-		targetFPS = 30
-	}
+	targetFPS := SegmentTargetFPS
 	maxFrameBytes := spec.MaxFrameBytes
 	if maxFrameBytes <= 0 {
 		maxFrameBytes = 25 << 20

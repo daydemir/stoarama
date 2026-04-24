@@ -30,8 +30,6 @@ type recordingSupervisionRow struct {
 	LastFrameAt          *time.Time
 	LastErrorText        string
 	ConsecutiveErrors    int
-	RelayStatus          string
-	RelayErrorText       string
 	IncidentType         *string
 	IncidentFirstSeenAt  *time.Time
 	IncidentLastSeenAt   *time.Time
@@ -79,8 +77,6 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 			rt.last_frame_at,
 			COALESCE(rt.last_error_text, ''),
 			COALESCE(rt.consecutive_errors, 0),
-			COALESCE(yr.status, ''),
-			COALESCE(yr.error_text, ''),
 			inc.incident_type,
 			inc.first_observed_at,
 			inc.last_observed_at,
@@ -90,7 +86,6 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 		FROM streams s
 		LEFT JOIN recording_assignments ra ON ra.stream_id=s.id
 		LEFT JOIN stream_capture_runtime rt ON rt.stream_id=s.id
-		LEFT JOIN youtube_relay_routes yr ON yr.stream_id=s.id
 		LEFT JOIN LATERAL (
 			SELECT incident_type, first_observed_at, last_observed_at, last_notified_at, notify_count, details_jsonb
 			FROM stream_recording_incidents
@@ -132,8 +127,6 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 			&row.LastFrameAt,
 			&row.LastErrorText,
 			&row.ConsecutiveErrors,
-			&row.RelayStatus,
-			&row.RelayErrorText,
 			&row.IncidentType,
 			&row.IncidentFirstSeenAt,
 			&row.IncidentLastSeenAt,
@@ -241,8 +234,6 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 			"last_frame_at":              row.LastFrameAt,
 			"last_error_text":            row.LastErrorText,
 			"consecutive_errors":         row.ConsecutiveErrors,
-			"relay_status":               row.RelayStatus,
-			"relay_error_text":           row.RelayErrorText,
 			"success_captures_10m":       successCount10m,
 			"expected_captures_10m":      expected10m,
 			"loss_rate_10m":              lossRate10m,

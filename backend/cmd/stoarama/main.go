@@ -17,11 +17,10 @@ import (
 )
 
 type cliConfig struct {
-	APIBaseURL    string                    `json:"api_base_url,omitempty"`
-	APIKey        string                    `json:"api_key,omitempty"`
-	Node          *cliNodeConfig            `json:"node,omitempty"`
-	Nodes         map[string]*cliNodeConfig `json:"nodes,omitempty"`
-	YTRelaySource *cliYTRelaySourceConfig   `json:"yt_relay_source,omitempty"`
+	APIBaseURL string                    `json:"api_base_url,omitempty"`
+	APIKey     string                    `json:"api_key,omitempty"`
+	Node       *cliNodeConfig            `json:"node,omitempty"`
+	Nodes      map[string]*cliNodeConfig `json:"nodes,omitempty"`
 }
 
 type cliNodeConfig struct {
@@ -32,32 +31,6 @@ type cliNodeConfig struct {
 	Platform    string `json:"platform,omitempty"`
 	Token       string `json:"token"`
 	APIBaseURL  string `json:"api_base_url,omitempty"`
-}
-
-type cliYTRelaySourceConfig struct {
-	PublicBaseURL           string `json:"public_base_url,omitempty"`
-	BindAddr                string `json:"bind_addr,omitempty"`
-	ShardID                 string `json:"shard_id,omitempty"`
-	Capacity                int    `json:"capacity,omitempty"`
-	HeartbeatSec            int    `json:"heartbeat_sec,omitempty"`
-	LeaseSec                int    `json:"lease_sec,omitempty"`
-	RefreshSec              int    `json:"refresh_sec,omitempty"`
-	ResolveTimeoutSec       int    `json:"resolve_timeout_sec,omitempty"`
-	ResolveFailureThreshold int    `json:"resolve_failure_threshold,omitempty"`
-	SharedToken             string `json:"shared_token,omitempty"`
-	CacheFile               string `json:"cache_file,omitempty"`
-	CookiesFile             string `json:"cookies_file,omitempty"`
-	CookiesFromBrowser      string `json:"cookies_from_browser,omitempty"`
-	YTDLPBin                string `json:"yt_dlp_bin,omitempty"`
-	YTDLPFormat             string `json:"yt_dlp_format,omitempty"`
-	YTDLPFormatSort         string `json:"yt_dlp_format_sort,omitempty"`
-	NetworkTransport        string `json:"network_transport,omitempty"`
-	TopologyID              string `json:"topology_id,omitempty"`
-	TopologyRole            string `json:"topology_role,omitempty"`
-	HubServerID             string `json:"hub_server_id,omitempty"`
-	WGInterface             string `json:"wg_interface,omitempty"`
-	WGIP                    string `json:"wg_ip,omitempty"`
-	SourceEndpoint          string `json:"source_endpoint,omitempty"`
 }
 
 func main() {
@@ -90,15 +63,12 @@ func usage() {
   stoarama auth api-keys revoke --id N [--api-base-url URL --api-key KEY]
 
   stoarama node enrollment-tokens list [--api-base-url URL --api-key KEY]
-  stoarama node enrollment-tokens create --node-type yt_relay_source|inference_node|local_recorder [--label LABEL --expires-at RFC3339] [--api-base-url URL --api-key KEY]
+  stoarama node enrollment-tokens create --node-type inference_node|local_recorder [--label LABEL --expires-at RFC3339] [--api-base-url URL --api-key KEY]
   stoarama node enrollment-tokens revoke --id N [--api-base-url URL --api-key KEY]
-  stoarama node enroll --token TOKEN --node-type yt_relay_source|inference_node|local_recorder [--display-name NAME --hostname HOST --platform PLATFORM --api-base-url URL]
-  stoarama node whoami [--node-type yt_relay_source|inference_node|local_recorder --api-base-url URL --node-token TOKEN]
-  stoarama node heartbeat [--node-type yt_relay_source|inference_node|local_recorder --api-base-url URL --node-token TOKEN]
-  stoarama node doctor [--node-type yt_relay_source|inference_node|local_recorder]
-  stoarama node yt-relay-source run [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
-  stoarama node yt-relay-source install-launchd [--public-base-url URL --cookies-file FILE|--cookies-from-browser BROWSER]
-  stoarama node yt-relay-source uninstall-launchd
+  stoarama node enroll --token TOKEN --node-type inference_node|local_recorder [--display-name NAME --hostname HOST --platform PLATFORM --api-base-url URL]
+  stoarama node whoami [--node-type inference_node|local_recorder --api-base-url URL --node-token TOKEN]
+  stoarama node heartbeat [--node-type inference_node|local_recorder --api-base-url URL --node-token TOKEN]
+  stoarama node doctor [--node-type inference_node|local_recorder]
 
   stoarama recording youtube run --stream-id N [--cookies-file FILE|--cookies-from-browser BROWSER]
 `)
@@ -140,8 +110,6 @@ func runNode(args []string) {
 		runNodeHeartbeat(args[1:])
 	case "doctor":
 		runNodeDoctor(args[1:])
-	case "yt-relay-source":
-		runNodeYTRelaySource(args[1:])
 	default:
 		usage()
 		os.Exit(2)
@@ -286,12 +254,15 @@ func runNodeEnrollmentTokens(args []string) {
 		fs := flag.NewFlagSet("node enrollment-tokens create", flag.ExitOnError)
 		apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 		apiKey := fs.String("api-key", "", "account API key")
-		nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
+		nodeType := fs.String("node-type", "", "inference_node or local_recorder")
 		label := fs.String("label", "", "token label")
 		expiresAt := fs.String("expires-at", "", "optional RFC3339 expiry")
 		_ = fs.Parse(args[1:])
 		if strings.TrimSpace(*nodeType) == "" {
 			fatalf("--node-type is required")
+		}
+		if strings.TrimSpace(*nodeType) == "yt_relay_source" {
+			fatalf("yt_relay_source enrollment is disabled; use local_recorder or `stoarama recording youtube run`")
 		}
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any
@@ -328,7 +299,7 @@ func runNodeEnroll(args []string) {
 	fs := flag.NewFlagSet("node enroll", flag.ExitOnError)
 	apiBaseURL := fs.String("api-base-url", defaultAPIBaseURL(), "Stoarama API base URL")
 	token := fs.String("token", "", "node enrollment token")
-	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
+	nodeType := fs.String("node-type", "", "inference_node or local_recorder")
 	displayName := fs.String("display-name", defaultNodeDisplayName(), "node display name")
 	hostname := fs.String("hostname", defaultHostname(), "node hostname")
 	platform := fs.String("platform", defaultPlatform(), "node platform")
@@ -339,6 +310,9 @@ func runNodeEnroll(args []string) {
 	}
 	if strings.TrimSpace(*nodeType) == "" {
 		fatalf("--node-type is required")
+	}
+	if strings.TrimSpace(*nodeType) == "yt_relay_source" {
+		fatalf("yt_relay_source enrollment is disabled; use local_recorder or `stoarama recording youtube run`")
 	}
 
 	payload := map[string]any{
@@ -383,7 +357,7 @@ func runNodeEnroll(args []string) {
 
 func runNodeWhoAmI(args []string) {
 	fs := flag.NewFlagSet("node whoami", flag.ExitOnError)
-	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
+	nodeType := fs.String("node-type", "", "inference_node or local_recorder")
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 	nodeToken := fs.String("node-token", "", "node bearer token")
 	_ = fs.Parse(args)
@@ -398,7 +372,7 @@ func runNodeWhoAmI(args []string) {
 
 func runNodeHeartbeat(args []string) {
 	fs := flag.NewFlagSet("node heartbeat", flag.ExitOnError)
-	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
+	nodeType := fs.String("node-type", "", "inference_node or local_recorder")
 	apiBaseURL := fs.String("api-base-url", "", "Stoarama API base URL")
 	nodeToken := fs.String("node-token", "", "node bearer token")
 	_ = fs.Parse(args)
@@ -427,7 +401,7 @@ func runNodeHeartbeat(args []string) {
 
 func runNodeDoctor(args []string) {
 	fs := flag.NewFlagSet("node doctor", flag.ExitOnError)
-	nodeType := fs.String("node-type", "", "yt_relay_source, inference_node, or local_recorder")
+	nodeType := fs.String("node-type", "", "inference_node or local_recorder")
 	_ = fs.Parse(args)
 
 	cfg, _ := loadCLIConfig()
@@ -438,13 +412,13 @@ func runNodeDoctor(args []string) {
 		}
 	}
 	if effectiveType == "" {
-		effectiveType = "yt_relay_source"
+		effectiveType = "local_recorder"
 	}
 	report := map[string]any{
 		"node_type": effectiveType,
 		"checks": []map[string]any{
 			checkBinary("ffmpeg", true),
-			checkBinary("yt-dlp", effectiveType == "yt_relay_source" || effectiveType == "local_recorder"),
+			checkBinary("yt-dlp", effectiveType == "local_recorder"),
 			checkBinary("ffprobe", effectiveType == "local_recorder"),
 		},
 	}
@@ -567,11 +541,6 @@ func saveCLIConfig(cfg cliConfig) error {
 	case 0:
 		cfg.Node = nil
 	default:
-		if ytNode := cfg.Nodes["yt_relay_source"]; ytNode != nil {
-			cp := *ytNode
-			cfg.Node = &cp
-			break
-		}
 		for _, node := range cfg.Nodes {
 			if node != nil {
 				cp := *node

@@ -14,7 +14,6 @@ backend_api_url   = "https://stoarama-api.onrender.com"
 backend_api_token = "set-via-env-or-tfvars"
 
 capture_shared_capacity    = 6
-capture_segment_target_fps = 10
 
 draining_modes                    = []
 capture_tick_sec                  = 5

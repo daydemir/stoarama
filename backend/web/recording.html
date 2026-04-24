@@ -1539,8 +1539,8 @@
       </article>
       <article class="recording-cta-card">
         <div class="overview-card-title">Self-Serve Setup</div>
-        <h3>Run your own relay and source infrastructure.</h3>
-        <p>Follow the docs for local relay setup, node enrollment, and researcher-managed recording infrastructure.</p>
+        <h3>Run local recording infrastructure.</h3>
+        <p>Follow the docs for local recording setup, node enrollment, and researcher-managed infrastructure.</p>
         <div><a href="/docs/self-serve">Open self-serve docs</a></div>
       </article>
     </div>
@@ -3375,7 +3375,6 @@ function renderDetailRecordingHero(payload, frames) {
   const stream = payload && payload.stream ? payload.stream : {};
   const health = payload && payload.current_health ? payload.current_health : {};
   const assignment = payload && payload.assignment ? payload.assignment : null;
-  const route = payload && payload.relay_route ? payload.relay_route : null;
   const runtime = payload && payload.runtime ? payload.runtime : {};
   const captureMeta = detailCaptureMeta(payload);
   const latest = Array.isArray(frames) && frames.length ? frames[0] : null;
@@ -3384,8 +3383,6 @@ function renderDetailRecordingHero(payload, frames) {
   const lastCaptureText = latest ? formatDateTimeShort(captureTimestampValue(latest)) : '-';
   const lastCaptureAge = health.last_capture_age_sec != null ? ageLabel(health.last_capture_age_sec) : (health.last_frame_age_sec != null ? ageLabel(health.last_frame_age_sec) : '-');
   const assignmentHTML = assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : 'unassigned';
-  const relaySourceHTML = route && route.source_server_id ? serverLinkHTML(route.source_server_id, '-') : '-';
-  const relayStatusText = route && route.status ? String(route.status) : (String(stream.execution_class || '') === 'youtube_relay' ? 'no route' : '-');
   const currentError = String(health.message || runtime.last_error_text || '').trim();
   detailRecordingHero.innerHTML = `
     <div class="detail-summary-main">
@@ -3395,7 +3392,6 @@ function renderDetailRecordingHero(payload, frames) {
     <div class="detail-summary-meta">
       <div>last ${esc(captureMeta.singular)} ${esc(lastCaptureText)}${lastCaptureAge !== '-' ? ` · ${esc(lastCaptureAge)}` : ''}</div>
       <div>recording on ${assignmentHTML}</div>
-      ${String(stream.execution_class || '') === 'youtube_relay' ? `<div>via ${relaySourceHTML} relay · ${esc(relayStatusText)}</div>` : ''}
       ${currentError ? `<div style="color:var(--warn);">${esc(currentError)}</div>` : ''}
     </div>
   `;
@@ -3421,7 +3417,6 @@ function renderDetailCurrentPath(payload) {
   if (!(detailCurrentPath instanceof HTMLElement)) return;
   const stream = payload && payload.stream ? payload.stream : {};
   const assignment = payload && payload.assignment ? payload.assignment : null;
-  const route = payload && payload.relay_route ? payload.relay_route : null;
   const health = payload && payload.current_health ? payload.current_health : {};
   const runtime = payload && payload.runtime ? payload.runtime : {};
   const stats = payload && payload.stats_24h ? payload.stats_24h : {};
@@ -3436,19 +3431,11 @@ function renderDetailCurrentPath(payload) {
       runtime && runtime.last_resolved_at ? `resolved ${esc(formatDateTimeShort(runtime.last_resolved_at))}` : '',
     ].filter(Boolean).join('<br/>')
   ));
-  if (String(stream.execution_class || '') === 'youtube_relay') {
-    cards.push(detailFactCardHTML(
-      'YouTube Relay',
-      esc(route && route.status ? String(route.status) : 'no route'),
-      `source ${serverLinkHTML(route && route.source_server_id || '-', '-')}<br/>sink ${serverLinkHTML(route && route.sink_server_id || '-', '-')}`
-    ));
-  } else {
-    cards.push(detailFactCard(
-      'Capture Mode',
-      String(stream.capture_type || '-'),
-      String(stream.execution_class || '').trim() ? `execution ${esc(String(stream.execution_class || '-'))}` : ''
-    ));
-  }
+  cards.push(detailFactCard(
+    'Capture Mode',
+    String(stream.capture_type || '-'),
+    String(stream.execution_class || '').trim() ? `execution ${esc(String(stream.execution_class || '-'))}` : ''
+  ));
   cards.push(detailFactCard(
     'Last 24h',
     `${Number(stats.success_frames || 0)} ${captureMeta.plural}`,
@@ -4027,6 +4014,7 @@ function summarizeExecutionClasses(items) {
   const groups = new Map();
   for (const it of items) {
     const executionClass = String(it.execution_class || '').trim();
+    if (executionClass === 'image_poll') continue;
     if (!executionClass) continue;
     const group = String(it.capacity_group || executionClass).trim();
     const cap = Number(it.capacity || 0);
@@ -4065,11 +4053,8 @@ function summarizeServerConnections(server) {
     const hub = String(meta.hub_server_id || '').trim();
     const wgIf = String(meta.wg_interface || '').trim();
     const wgIP = String(meta.wg_ip || '').trim();
-    const sourceServer = String(meta.relay_source_server_id || '').trim();
-    const sourceURL = String(meta.relay_source_public_base_url || '').trim();
-    const relayURL = String(meta.relay_public_base_url || '').trim();
     const sourceEndpoint = String(meta.source_endpoint || '').trim();
-    if (!transport && !topology && !role && !hub && !wgIf && !wgIP && !sourceServer && !sourceURL && !relayURL && !sourceEndpoint) return;
+    if (!transport && !topology && !role && !hub && !wgIf && !wgIP && !sourceEndpoint) return;
     const parts = [];
     if (transport) parts.push(`transport:${esc(transport)}`);
     if (topology) parts.push(`topology:${esc(topology)}`);
@@ -4078,10 +4063,7 @@ function summarizeServerConnections(server) {
     if (wgIf && wgIP) parts.push(`wg:${esc(wgIf)}@${esc(wgIP)}`);
     else if (wgIf) parts.push(`wg:${esc(wgIf)}`);
     else if (wgIP) parts.push(`wg_ip:${esc(wgIP)}`);
-    if (sourceServer) parts.push(`source:${esc(sourceServer)}`);
     if (sourceEndpoint) parts.push(`endpoint:${esc(sourceEndpoint)}`);
-    if (sourceURL) parts.push(`source_url:${esc(sourceURL)}`);
-    if (relayURL) parts.push(`relay_url:${esc(relayURL)}`);
     const key = parts.join(' | ');
     if (!key || seen.has(key)) return;
     seen.add(key);
@@ -4421,10 +4403,7 @@ function formatStreamCadenceLabel(stream) {
   if (!stream || typeof stream !== 'object') return '';
   const family = String(stream.capture_family || '').trim().toLowerCase();
   if (family === 'continuous_video') {
-    const fps = Number(stream.expected_fps);
-    if (!Number.isFinite(fps) || fps <= 0) return '';
-    const text = Math.abs(fps - Math.round(fps)) < 0.001 ? String(Math.round(fps)) : fps.toFixed(1);
-    return `${text} fps`;
+    return '';
   }
   if (family === 'snapshot_image') {
     const interval = Number(stream.expected_image_interval_sec);
@@ -5072,7 +5051,8 @@ function renderRecordingCapacityRows(items) {
   recordingCapacityRows.innerHTML = '';
   for (const it of (items || [])) {
     const group = String(it.capacity_group || it.mode || '').trim() || '-';
-    const executionClasses = Array.isArray(it.execution_classes) ? it.execution_classes.map((v) => String(v || '').trim()).filter((v) => v) : [];
+    const executionClasses = Array.isArray(it.execution_classes) ? it.execution_classes.map((v) => String(v || '').trim()).filter((v) => v && v !== 'image_poll') : [];
+    if (group === 'image_poll' || executionClasses.length === 0) continue;
     const maxActive = Number(it.max_active || 0);
     const activeWorkers = Number(it.active_workers || 0);
     const modeDisabled = maxActive === 0;
@@ -5115,7 +5095,7 @@ function inferRecordingAssignmentExecutionClasses(stream) {
   const explicitExecutionClass = normalizeCanonicalValue(stream && stream.execution_class);
   if (explicitExecutionClass) {
     if (explicitExecutionClass === 'youtube_direct' || explicitExecutionClass === 'youtube_relay') {
-      return ['youtube_relay'];
+      return ['youtube_direct'];
     }
     if (explicitExecutionClass === 'image_poll') {
       return [];
@@ -5125,7 +5105,7 @@ function inferRecordingAssignmentExecutionClasses(stream) {
   const explicitCaptureType = normalizeCanonicalValue(stream && stream.capture_type);
   if (explicitCaptureType && explicitCaptureType !== 'unknown') {
     if (isYouTube && explicitCaptureType === 'youtube_watch') {
-      return ['youtube_relay'];
+      return ['youtube_direct'];
     }
     if (explicitCaptureType === 'still_image') {
       return [];
@@ -5136,7 +5116,7 @@ function inferRecordingAssignmentExecutionClasses(stream) {
     return [explicitCaptureType];
   }
   if (isYouTube) {
-    return ['youtube_relay'];
+    return ['youtube_direct'];
   }
   return [];
 }
@@ -5164,6 +5144,7 @@ function recordingCandidateExecutionClassList(row) {
   const pushUnique = (items) => {
     for (const raw of items || []) {
       const executionClass = normalizeCanonicalValue(raw);
+      if (executionClass === 'image_poll') continue;
       if (!executionClass || out.includes(executionClass)) continue;
       out.push(executionClass);
     }
@@ -5194,12 +5175,8 @@ function renderRecordingCandidateHint(row) {
   if (!row) return '';
   const meta = (row && typeof row.metadata_json === 'object' && row.metadata_json) ? row.metadata_json : {};
   const topology = String(meta.topology_id || meta.hub_server_id || '').trim();
-  const relaySink = String(meta.relay_sink_server_id || '').trim();
-  const sourceServer = String(meta.relay_source_server_id || '').trim();
   const parts = [];
   if (topology) parts.push(`topology ${topology}`);
-  if (relaySink) parts.push(`sink ${relaySink}`);
-  if (sourceServer) parts.push(`source ${sourceServer}`);
   return parts.join(' · ');
 }
 

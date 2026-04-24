@@ -241,7 +241,7 @@ func TestListRecordingAssignmentsPaginatesUntilShortPage(t *testing.T) {
 	}
 }
 
-func TestListRecordingAssignmentsSkipsRelayRoutesUntilReady(t *testing.T) {
+func TestListRecordingAssignmentsReturnsLegacyRelayRows(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -254,37 +254,14 @@ func TestListRecordingAssignmentsSkipsRelayRoutesUntilReady(t *testing.T) {
 					"stream_id":       1,
 					"server_id":       "server-a",
 					"execution_class": "youtube_relay",
-					"relay_status":    "assigned",
-					"relay_pull_url":  "",
 				},
 				{
 					"stream_id":       2,
 					"server_id":       "server-a",
-					"execution_class": "youtube_relay",
-					"relay_status":    "source_ready",
-					"relay_pull_url":  "https://relay.example/2",
-				},
-				{
-					"stream_id":       3,
-					"server_id":       "server-a",
-					"execution_class": "youtube_relay",
-					"relay_status":    "failed",
-					"relay_pull_url":  "https://relay.example/3",
-				},
-				{
-					"stream_id":       4,
-					"server_id":       "server-a",
-					"execution_class": "youtube_relay",
-					"relay_status":    "stopped",
-					"relay_pull_url":  "https://relay.example/4",
-				},
-				{
-					"stream_id":       5,
-					"server_id":       "server-a",
 					"execution_class": "video_live",
 				},
 			},
-			"total": 5,
+			"total": 2,
 		})
 	}))
 	defer server.Close()
@@ -305,7 +282,7 @@ func TestListRecordingAssignmentsSkipsRelayRoutesUntilReady(t *testing.T) {
 		t.Fatalf("len(items)=%d want=2", len(items))
 	}
 	got := []int64{items[0].StreamID, items[1].StreamID}
-	want := []int64{2, 5}
+	want := []int64{1, 2}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("stream ids=%v want=%v", got, want)

@@ -82,15 +82,9 @@ variable "backend_api_token" {
 }
 
 variable "capture_shared_capacity" {
-  description = "Shared max active stream capacity across hls_live, ffmpeg_direct, and image_poll on each DO server."
+  description = "Shared video_live recording capacity on each DO server."
   type        = number
   default     = 6
-}
-
-variable "capture_segment_target_fps" {
-  description = "Target FPS for captured video segments."
-  type        = number
-  default     = 10
 }
 
 variable "draining_modes" {

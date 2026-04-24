@@ -37,7 +37,7 @@ func runRecording(args []string) {
 
 func runRecordingYouTube(args []string) {
 	if len(args) < 1 || args[0] != "run" {
-		fatalf("usage: stoarama recording youtube run --stream-id N [--api-base-url URL --node-token TOKEN --server-id ID --worker-id ID --segment-duration 30s --target-fps 10 --cookies-file FILE|--cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT --duration 0]")
+		fatalf("usage: stoarama recording youtube run --stream-id N [--api-base-url URL --node-token TOKEN --server-id ID --worker-id ID --cookies-file FILE|--cookies-from-browser BROWSER --yt-dlp-bin PATH --yt-dlp-format FORMAT --yt-dlp-format-sort SORT --duration 0]")
 	}
 
 	cfg, _ := loadCLIConfig()
@@ -50,8 +50,6 @@ func runRecordingYouTube(args []string) {
 	heartbeatSec := fs.Int("heartbeat-sec", 15, "recording heartbeat interval seconds")
 	leaseSec := fs.Int("lease-sec", 45, "recording heartbeat lease seconds")
 	refreshSec := fs.Int("refresh-sec", 5, "assignment refresh interval seconds")
-	segmentDuration := fs.Duration("segment-duration", 30*time.Second, "segment duration")
-	targetFPS := fs.Int("target-fps", 10, "target FPS for captured segments")
 	frameQueueSize := fs.Int("frame-queue-size", 64, "per-stream frame queue size")
 	frameEnqueueTimeoutSec := fs.Int("frame-enqueue-timeout-sec", 3, "per-stream frame enqueue timeout seconds")
 	frameWriterWorkers := fs.Int("frame-writer-workers", 2, "per-stream frame persistence workers")
@@ -81,12 +79,6 @@ func runRecordingYouTube(args []string) {
 	}
 	if *refreshSec <= 0 {
 		fatalf("--refresh-sec must be > 0")
-	}
-	if *segmentDuration <= 0 {
-		fatalf("--segment-duration must be > 0")
-	}
-	if *targetFPS <= 0 {
-		fatalf("--target-fps must be > 0")
 	}
 	if *frameQueueSize <= 0 || *frameEnqueueTimeoutSec <= 0 || *frameWriterWorkers <= 0 {
 		fatalf("frame queue, timeout, and writer worker values must be > 0")
@@ -205,8 +197,6 @@ func runRecordingYouTube(args []string) {
 		FrameQueueSize:            *frameQueueSize,
 		FrameEnqueueTimeout:       time.Duration(*frameEnqueueTimeoutSec) * time.Second,
 		FrameWriterWorkers:        *frameWriterWorkers,
-		SegmentDuration:           *segmentDuration,
-		SegmentTargetFPS:          *targetFPS,
 		StreamIDs:                 []int64{stream.ID},
 		PreferAssignedStreamIDs:   true,
 		ModeAllowlist:             []capture.Mode{capture.ModeYouTubeLive},

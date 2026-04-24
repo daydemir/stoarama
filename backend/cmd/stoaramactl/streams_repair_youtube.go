@@ -208,15 +208,15 @@ func proposeYouTubeRepair(row youtubeStreamRepairRow) (youtubeStreamRepairItem, 
 	if inferredCaptureType == capture.CaptureTypeYouTubeWatch && inferredReason != "" {
 		reasons = append(reasons, inferredReason)
 	}
-	if item.CurrentCaptureType == capture.CaptureTypeYouTubeWatch && item.CurrentExecutionClass == capture.ExecutionClassYouTubeDirect {
-		reasons = append(reasons, "youtube_direct_to_relay")
+	if item.CurrentCaptureType == capture.CaptureTypeYouTubeWatch && item.CurrentExecutionClass == capture.ExecutionClassYouTubeRelay {
+		reasons = append(reasons, "youtube_relay_hard_cut")
 	}
 	if item.CurrentCaptureType == capture.CaptureTypeHLS || item.CurrentExecutionClass == capture.ExecutionClassVideoLive {
 		reasons = append(reasons, "resolved_runtime_youtube_misclassified")
 	}
 	item.ProposedSourceFamily = capture.SourceFamilyWatchPage
 	item.ProposedCaptureType = capture.CaptureTypeYouTubeWatch
-	item.ProposedExecutionClass = capture.ExecutionClassYouTubeRelay
+	item.ProposedExecutionClass = capture.ExecutionClassYouTubeDirect
 	item.Reasons = uniqueStrings(reasons)
 	item.WouldChange = item.CurrentSourceFamily != item.ProposedSourceFamily ||
 		item.CurrentCaptureType != item.ProposedCaptureType ||
