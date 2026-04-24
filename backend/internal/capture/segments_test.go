@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4")
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", false)
 	joined := strings.Join(args, " ")
 
 	for _, unwanted := range []string{
@@ -43,6 +43,14 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 	}
 	if strings.Contains(joined, "fps=30") {
 		t.Fatalf("segment capture should preserve source frame rate, got args: %s", joined)
+	}
+}
+
+func TestBuildFFmpegSegmentArgsNormalizesUnknownFPS(t *testing.T) {
+	args := buildFFmpegSegmentArgs("https://example.com/live.m3u8", "/tmp/segment.mp4", true)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-vf fps=30") {
+		t.Fatalf("unknown fps segment capture should default to 30fps, got args: %s", joined)
 	}
 }
 
