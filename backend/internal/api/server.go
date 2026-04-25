@@ -302,6 +302,11 @@ func (s *Server) router() http.Handler {
 			worker.Post("/capture/runtime/stopped", s.handleCaptureRuntimeStopped)
 			worker.Post("/capture/worker-heartbeat", s.handleCaptureWorkerHeartbeat)
 			worker.Post("/capture/worker-stopped", s.handleCaptureWorkerStopped)
+			worker.Post("/capture/jobs/enqueue-due", s.handleCaptureJobsEnqueueDue)
+			worker.Post("/capture/jobs/lease", s.handleCaptureJobsLease)
+			worker.Post("/capture/jobs/{id}/complete", s.handleCaptureJobsComplete)
+			worker.Post("/capture/jobs/{id}/complete-without-next", s.handleCaptureJobsCompleteWithoutNext)
+			worker.Post("/capture/jobs/{id}/fail", s.handleCaptureJobsFail)
 			worker.Post("/recording/process/heartbeat", s.handleRecordingProcessHeartbeat)
 			worker.Post("/recording/process/stopped", s.handleRecordingProcessStopped)
 			worker.Post("/capture/ingest", s.handleCaptureIngest)
@@ -2735,6 +2740,109 @@ func (s *Server) handleCaptureWorkerHeartbeat(w http.ResponseWriter, r *http.Req
 type captureWorkerStoppedRequest struct {
 	WorkerID       string `json:"worker_id"`
 	ExecutionClass string `json:"execution_class"`
+}
+
+func (s *Server) handleCaptureJobsEnqueueDue(w http.ResponseWriter, r *http.Request) {
+	rs, err := settings.GetRecordingSettings(r.Context(), s.pool)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := queue.EnqueueDueCaptureJobs(r.Context(), s.pool, queue.CaptureSamplingPolicy{
+		MinIntervalSec: rs.SampleIntervalMinSec,
+		MaxIntervalSec: rs.SampleIntervalMaxSec,
+	}); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type captureJobLeaseRequest struct {
+	WorkerID string `json:"worker_id"`
+	LeaseSec int    `json:"lease_sec"`
+}
+
+func (s *Server) handleCaptureJobsLease(w http.ResponseWriter, r *http.Request) {
+	var req captureJobLeaseRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	workerID := strings.TrimSpace(req.WorkerID)
+	if workerID == "" {
+		util.WriteError(w, http.StatusBadRequest, "worker_id is required")
+		return
+	}
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 45
+	}
+	job, err := queue.LeaseOneCaptureJob(r.Context(), s.pool, workerID, leaseSec)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"job": job})
+}
+
+type captureJobNextRequest struct {
+	NextDelaySec int `json:"next_delay_sec"`
+}
+
+func (s *Server) handleCaptureJobsComplete(w http.ResponseWriter, r *http.Request) {
+	jobID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req captureJobNextRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := queue.CompleteCaptureJob(r.Context(), s.pool, jobID, req.NextDelaySec); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCaptureJobsCompleteWithoutNext(w http.ResponseWriter, r *http.Request) {
+	jobID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	if err := queue.CompleteCaptureJobWithoutNext(r.Context(), s.pool, jobID); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type captureJobFailRequest struct {
+	ErrorText    string `json:"error_text"`
+	NextDelaySec int    `json:"next_delay_sec"`
+}
+
+func (s *Server) handleCaptureJobsFail(w http.ResponseWriter, r *http.Request) {
+	jobID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req captureJobFailRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.ErrorText) == "" {
+		util.WriteError(w, http.StatusBadRequest, "error_text is required")
+		return
+	}
+	if err := queue.FailCaptureJob(r.Context(), s.pool, jobID, req.ErrorText, req.NextDelaySec); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleCaptureWorkerStopped(w http.ResponseWriter, r *http.Request) {

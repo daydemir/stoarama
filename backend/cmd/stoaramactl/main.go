@@ -271,10 +271,7 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	}
 	defer cancel()
 
-	pool := mustOpenPool(runCtx, cfg)
-	defer pool.Close()
 	worker, err := capturescheduled.NewWorker(capturescheduled.Config{
-		Pool:              pool,
 		Client:            client,
 		Registry:          registry,
 		WorkerID:          strings.TrimSpace(*workerID),

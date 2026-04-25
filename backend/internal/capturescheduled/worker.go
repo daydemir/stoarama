@@ -10,17 +10,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/captureapi"
 	"github.com/daydemir/stoarama/backend/internal/model"
-	"github.com/daydemir/stoarama/backend/internal/queue"
 	"github.com/daydemir/stoarama/backend/internal/settings"
 )
 
 type Config struct {
-	Pool              *pgxpool.Pool
 	Client            *captureapi.Client
 	Registry          *capture.Registry
 	WorkerID          string
@@ -39,9 +35,6 @@ type Worker struct {
 }
 
 func NewWorker(cfg Config) (*Worker, error) {
-	if cfg.Pool == nil {
-		return nil, fmt.Errorf("pool is required")
-	}
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("client is required")
 	}
@@ -152,15 +145,11 @@ func (w *Worker) heartbeat(ctx context.Context) error {
 }
 
 func (w *Worker) tick(ctx context.Context, sem chan struct{}) error {
-	rs, err := settings.GetRecordingSettings(ctx, w.cfg.Pool)
+	rs, err := w.cfg.Client.GetRecordingSettings(ctx)
 	if err != nil {
 		return err
 	}
-	policy := queue.CaptureSamplingPolicy{
-		MinIntervalSec: rs.SampleIntervalMinSec,
-		MaxIntervalSec: rs.SampleIntervalMaxSec,
-	}
-	if err := queue.EnqueueDueCaptureJobs(ctx, w.cfg.Pool, policy); err != nil {
+	if err := w.cfg.Client.EnqueueDueCaptureJobs(ctx); err != nil {
 		return err
 	}
 	for {
@@ -169,7 +158,7 @@ func (w *Worker) tick(ctx context.Context, sem chan struct{}) error {
 		default:
 			return nil
 		}
-		job, err := queue.LeaseOneCaptureJob(ctx, w.cfg.Pool, w.cfg.WorkerID, w.cfg.LeaseSec)
+		job, err := w.cfg.Client.LeaseCaptureJob(ctx, w.cfg.WorkerID, w.cfg.LeaseSec)
 		if err != nil {
 			<-sem
 			return err
@@ -180,20 +169,20 @@ func (w *Worker) tick(ctx context.Context, sem chan struct{}) error {
 		}
 		go func() {
 			defer func() { <-sem }()
-			w.processJob(ctx, *job, policy)
+			w.processJob(ctx, *job, rs)
 		}()
 	}
 }
 
-func (w *Worker) processJob(ctx context.Context, job queue.CaptureJob, policy queue.CaptureSamplingPolicy) {
-	nextDelaySec := randomDelaySec(policy)
+func (w *Worker) processJob(ctx context.Context, job captureapi.CaptureJob, rs captureapi.RecordingSettings) {
+	nextDelaySec := randomDelaySec(rs)
 	stream, err := w.cfg.Client.GetStream(ctx, job.StreamID)
 	if err != nil {
 		w.failJob(ctx, job, capture.ModeUnsupported, "", err, nextDelaySec)
 		return
 	}
 	if !w.shouldCapture(stream) {
-		if err := queue.CompleteCaptureJobWithoutNext(ctx, w.cfg.Pool, job.ID); err != nil {
+		if err := w.cfg.Client.CompleteCaptureJobWithoutNext(ctx, job.ID); err != nil {
 			log.Printf("sampled capture stream_id=%d complete without next failed: %v", job.StreamID, err)
 		}
 		return
@@ -222,7 +211,7 @@ func (w *Worker) processJob(ctx context.Context, job queue.CaptureJob, policy qu
 		w.failJob(ctx, job, effective, resolved.URL, err, nextDelaySec)
 		return
 	}
-	if err := queue.CompleteCaptureJob(ctx, w.cfg.Pool, job.ID, nextDelaySec); err != nil {
+	if err := w.cfg.Client.CompleteCaptureJob(ctx, job.ID, nextDelaySec); err != nil {
 		log.Printf("sampled capture stream_id=%d complete failed: %v", stream.ID, err)
 		return
 	}
@@ -310,7 +299,7 @@ func (w *Worker) persistSegmentSuccess(ctx context.Context, streamID int64, effe
 	})
 }
 
-func (w *Worker) failJob(ctx context.Context, job queue.CaptureJob, effective capture.Mode, resolvedURL string, runErr error, nextDelaySec int) {
+func (w *Worker) failJob(ctx context.Context, job captureapi.CaptureJob, effective capture.Mode, resolvedURL string, runErr error, nextDelaySec int) {
 	errText := strings.TrimSpace(runErr.Error())
 	if errText == "" {
 		errText = "capture failed"
@@ -332,16 +321,16 @@ func (w *Worker) failJob(ctx context.Context, job queue.CaptureJob, effective ca
 	if consecutive >= 2 {
 		log.Printf("sampled capture stream_id=%d consecutive_errors=%d error=%s", job.StreamID, consecutive, errText)
 	}
-	if err := queue.FailCaptureJob(ctx, w.cfg.Pool, job.ID, errText, nextDelaySec); err != nil {
+	if err := w.cfg.Client.FailCaptureJob(ctx, job.ID, errText, nextDelaySec); err != nil {
 		log.Printf("sampled capture stream_id=%d fail job failed: %v", job.StreamID, err)
 	}
 }
 
-func randomDelaySec(policy queue.CaptureSamplingPolicy) int {
-	if policy.MaxIntervalSec <= policy.MinIntervalSec {
-		return policy.MinIntervalSec
+func randomDelaySec(rs captureapi.RecordingSettings) int {
+	if rs.SampleIntervalMaxSec <= rs.SampleIntervalMinSec {
+		return rs.SampleIntervalMinSec
 	}
-	return policy.MinIntervalSec + rand.Intn(policy.MaxIntervalSec-policy.MinIntervalSec+1)
+	return rs.SampleIntervalMinSec + rand.Intn(rs.SampleIntervalMaxSec-rs.SampleIntervalMinSec+1)
 }
 
 func sourceKindForMode(mode capture.Mode) string {

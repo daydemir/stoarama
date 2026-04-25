@@ -180,6 +180,14 @@ type RecordingSettings struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 
+type CaptureJob struct {
+	ID             int64     `json:"id"`
+	StreamID       int64     `json:"stream_id"`
+	ScheduledFor   time.Time `json:"scheduled_for"`
+	AttemptCount   int       `json:"attempt_count"`
+	IdempotencyKey string    `json:"idempotency_key"`
+}
+
 type RecordingAssignment struct {
 	StreamID           int64          `json:"stream_id"`
 	ServerID           string         `json:"server_id"`
@@ -394,6 +402,54 @@ func (c *Client) GetRecordingSettings(ctx context.Context) (RecordingSettings, e
 		return RecordingSettings{}, fmt.Errorf("invalid recording settings from API: %+v", payload)
 	}
 	return payload, nil
+}
+
+func (c *Client) EnqueueDueCaptureJobs(ctx context.Context) error {
+	return c.postJSON(ctx, "/api/v1/capture/jobs/enqueue-due", map[string]any{}, nil)
+}
+
+func (c *Client) LeaseCaptureJob(ctx context.Context, workerID string, leaseSec int) (*CaptureJob, error) {
+	payload := map[string]any{
+		"worker_id": strings.TrimSpace(workerID),
+		"lease_sec": leaseSec,
+	}
+	var out struct {
+		Job *CaptureJob `json:"job"`
+	}
+	if err := c.postJSON(ctx, "/api/v1/capture/jobs/lease", payload, &out); err != nil {
+		return nil, err
+	}
+	return out.Job, nil
+}
+
+func (c *Client) CompleteCaptureJob(ctx context.Context, jobID int64, nextDelaySec int) error {
+	if jobID <= 0 {
+		return fmt.Errorf("job_id must be > 0")
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/capture/jobs/%d/complete", jobID), map[string]any{
+		"next_delay_sec": nextDelaySec,
+	}, nil)
+}
+
+func (c *Client) CompleteCaptureJobWithoutNext(ctx context.Context, jobID int64) error {
+	if jobID <= 0 {
+		return fmt.Errorf("job_id must be > 0")
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/capture/jobs/%d/complete-without-next", jobID), map[string]any{}, nil)
+}
+
+func (c *Client) FailCaptureJob(ctx context.Context, jobID int64, errText string, nextDelaySec int) error {
+	if jobID <= 0 {
+		return fmt.Errorf("job_id must be > 0")
+	}
+	errText = strings.TrimSpace(errText)
+	if errText == "" {
+		return fmt.Errorf("error_text is required")
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/capture/jobs/%d/fail", jobID), map[string]any{
+		"error_text":     errText,
+		"next_delay_sec": nextDelaySec,
+	}, nil)
 }
 
 func (c *Client) listRecordingAssignmentsPage(ctx context.Context, serverID string, executionClass string, limit int, offset int) ([]RecordingAssignment, error) {
