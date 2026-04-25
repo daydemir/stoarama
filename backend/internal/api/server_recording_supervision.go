@@ -50,6 +50,7 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = recordingSettings
 
 	where := "s.recording_state='on'"
 	args := []any{limit, offset}
@@ -165,7 +166,7 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording supervision process issues: %v", err))
 		return
 	}
-	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 2*time.Hour, 2*time.Minute)
+	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameStreamIDs, clipStreamIDs, 2*time.Hour, 0)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording supervision outage episodes: %v", err))
 		return
@@ -177,8 +178,8 @@ func (s *Server) handleRecordingSupervisionStatus(w http.ResponseWriter, r *http
 	var healthyTotal, down10mTotal, spotty2hTotal, incidentsOpenTotal int64
 	for _, row := range items {
 		modeClass := firstNonEmpty(row.AssignmentClass, derefString(row.RuntimeClass), row.StreamExecutionClass)
-		expected10m := expectedCapturesForWindow(modeClass, recordingSettings.CaptureIntervalSec, 10*time.Minute)
-		expected2h := expectedCapturesForWindow(modeClass, recordingSettings.CaptureIntervalSec, 2*time.Hour)
+		expected10m := expectedCapturesForWindow(modeClass, settings.DefaultRecordingIntervalSec, 10*time.Minute)
+		expected2h := expectedCapturesForWindow(modeClass, settings.DefaultRecordingIntervalSec, 2*time.Hour)
 		successCount10m := success10m[row.StreamID]
 		successCount2h := success2h[row.StreamID]
 		lossRate10m := lossRateForWindow(expected10m, successCount10m)

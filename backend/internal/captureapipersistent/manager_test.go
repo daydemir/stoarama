@@ -22,8 +22,11 @@ func TestLoadDesiredStreamsWithStreamFilterIncludesNonRecordedStream(t *testing.
 			t.Fatalf("authorization header=%q", got)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"interval_sec": 3,
-			"updated_at":   time.Now().UTC().Format(time.RFC3339Nano),
+			"clip_duration_sec":       30,
+			"sample_interval_min_sec": 240,
+			"sample_interval_max_sec": 480,
+			"stale_grace_sec":         300,
+			"updated_at":              time.Now().UTC().Format(time.RFC3339Nano),
 		})
 	})
 	mux.HandleFunc("/api/v1/dashboard/streams", func(w http.ResponseWriter, r *http.Request) {
@@ -70,8 +73,8 @@ func TestLoadDesiredStreamsWithStreamFilterIncludesNonRecordedStream(t *testing.
 	if streams[0].ID != 123 {
 		t.Fatalf("stream id=%d want=123", streams[0].ID)
 	}
-	if streams[0].CaptureIntervalSec != 3 {
-		t.Fatalf("capture interval=%d want=3", streams[0].CaptureIntervalSec)
+	if streams[0].CaptureIntervalSec != 1 {
+		t.Fatalf("capture interval=%d want=1", streams[0].CaptureIntervalSec)
 	}
 }
 
@@ -81,8 +84,11 @@ func TestLoadAssignedStreamsMapsLegacyRelayToYouTubeLive(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/recording/settings", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"interval_sec": 1,
-			"updated_at":   time.Now().UTC().Format(time.RFC3339Nano),
+			"clip_duration_sec":       30,
+			"sample_interval_min_sec": 240,
+			"sample_interval_max_sec": 480,
+			"stale_grace_sec":         300,
+			"updated_at":              time.Now().UTC().Format(time.RFC3339Nano),
 		})
 	})
 	mux.HandleFunc("/api/v1/service/recording/assignments", func(w http.ResponseWriter, r *http.Request) {
@@ -233,8 +239,11 @@ func TestLoadDesiredStreamsRequiresServerIDWithoutStreamFilter(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/recording/settings", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"interval_sec": 1,
-			"updated_at":   time.Now().UTC().Format(time.RFC3339Nano),
+			"clip_duration_sec":       30,
+			"sample_interval_min_sec": 240,
+			"sample_interval_max_sec": 480,
+			"stale_grace_sec":         300,
+			"updated_at":              time.Now().UTC().Format(time.RFC3339Nano),
 		})
 	})
 	srv := httptest.NewServer(mux)

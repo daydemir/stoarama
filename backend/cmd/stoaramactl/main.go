@@ -33,12 +33,11 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/captureapi"
-	"github.com/daydemir/stoarama/backend/internal/captureapipersistent"
+	"github.com/daydemir/stoarama/backend/internal/capturescheduled"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/r2"
-	"github.com/daydemir/stoarama/backend/internal/settings"
 	"github.com/daydemir/stoarama/backend/internal/storage"
 )
 
@@ -98,7 +97,7 @@ func usage() {
 	_, _ = os.Stdout.WriteString(`stoaramactl commands:
 	  stoaramactl migrate up [--dir infra/sql/migrations]
 	  stoaramactl capture backfill-missing [--backend-api-url URL --api-token TOKEN --limit 0 --concurrency 4 --timeout-sec 90 --dry-run --json]
-	  stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]
+	  stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --stream-ids 1,2 --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --metadata-json JSON --duration 0]
 	  stoaramactl capture probe (--id N | --provider P --source-url URL) [--source-page-url URL --capture-type TYPE --capture-timeout-sec 60]
 	  stoaramactl capture audit --all [--concurrency 16 --timeout-sec 20 --json]
 	  stoaramactl capture runtime list [--status running|unsupported|error] [--limit 200] [--json]
@@ -154,7 +153,6 @@ func usage() {
 	  stoaramactl pipelines overview [--backend-api-url URL --api-token TOKEN --include-inactive=true]
 	  stoaramactl pipelines stream-list --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines set --stream-id N --pipeline-id P --enabled=true|false [--updated-by stoaramactl --backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording interval --seconds N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording enable --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording disable --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording settings [--backend-api-url URL --api-token TOKEN]
@@ -182,24 +180,24 @@ func usage() {
 
 func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 || args[0] != "run" {
-		log.Fatalf("usage: stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --execution-classes CLASS[,CLASS...] --stream-ids 1,2 --draining-execution-classes CLASS[,CLASS...] --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --unsupported-threshold 8 --frame-queue-size 64 --frame-enqueue-timeout-sec 3 --frame-writer-workers 2 --metadata-json JSON --duration 0]")
+		log.Fatalf("usage: stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --stream-ids 1,2 --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --metadata-json JSON --duration 0]")
 	}
 	fs := flag.NewFlagSet("capture-server run", flag.ExitOnError)
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-	workerID := fs.String("worker-id", defaultCaptureServerWorkerID(cfg.WorkerID), "worker id prefix")
+	workerID := fs.String("worker-id", defaultCaptureServerWorkerID(cfg.WorkerID), "worker id")
 	serverID := fs.String("server-id", defaultCaptureServerID(defaultCaptureServerWorkerID(cfg.WorkerID)), "server id")
-	captureSharedCapacity := fs.Int("capture-shared-capacity", envIntOrDefault("CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY", 0), "shared max active live-video streams")
-	executionClassesRaw := fs.String("execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_EXECUTION_CLASSES")), "optional comma-separated execution classes to run (video_live)")
+	captureSharedCapacity := fs.Int("capture-shared-capacity", envIntOrDefault("CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY", 1), "concurrent sampled clip captures")
+	_ = fs.String("execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_EXECUTION_CLASSES")), "removed; sampled capture worker handles all continuous video streams")
 	streamIDsRaw := fs.String("stream-ids", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_STREAM_IDS")), "optional comma-separated stream ids to run in stream-filter mode")
-	drainingExecutionClassesRaw := fs.String("draining-execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_DRAINING_EXECUTION_CLASSES")), "optional comma-separated draining execution classes")
+	_ = fs.String("draining-execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_DRAINING_EXECUTION_CLASSES")), "removed; sampled capture worker does not use assignments")
 	heartbeatSec := fs.Int("heartbeat-sec", 15, "heartbeat interval seconds")
 	leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
-	refreshSec := fs.Int("refresh-sec", cfg.CaptureTickSec, "capture reconcile interval seconds")
-	frameQueueSize := fs.Int("frame-queue-size", 64, "per-stream frame queue size")
-	frameEnqueueTimeoutSec := fs.Int("frame-enqueue-timeout-sec", 3, "per-stream frame enqueue timeout seconds")
-	frameWriterWorkers := fs.Int("frame-writer-workers", 2, "per-stream frame persistence workers")
-	unsupportedThreshold := fs.Int("unsupported-threshold", cfg.CaptureUnsupportedThreshold, "mark unsupported after this many consecutive errors")
+	refreshSec := fs.Int("refresh-sec", cfg.CaptureTickSec, "capture job poll interval seconds")
+	_ = fs.Int("frame-queue-size", 64, "removed; sampled capture writes one segment per job")
+	_ = fs.Int("frame-enqueue-timeout-sec", 3, "removed; sampled capture writes one segment per job")
+	_ = fs.Int("frame-writer-workers", 2, "removed; sampled capture writes one segment per job")
+	_ = fs.Int("unsupported-threshold", cfg.CaptureUnsupportedThreshold, "removed; sampled capture alerts after repeated failures without disabling")
 	metadataJSON := fs.String("metadata-json", "{}", "server metadata JSON object")
 	duration := fs.Duration("duration", 0, "optional run duration (e.g. 30m, 8h)")
 	_ = fs.Parse(args[1:])
@@ -228,19 +226,6 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	if *refreshSec <= 0 {
 		log.Fatalf("--refresh-sec must be > 0")
 	}
-	if *frameQueueSize <= 0 {
-		log.Fatalf("--frame-queue-size must be > 0")
-	}
-	if *frameEnqueueTimeoutSec <= 0 {
-		log.Fatalf("--frame-enqueue-timeout-sec must be > 0")
-	}
-	if *frameWriterWorkers <= 0 {
-		log.Fatalf("--frame-writer-workers must be > 0")
-	}
-	if *unsupportedThreshold <= 0 {
-		log.Fatalf("--unsupported-threshold must be > 0")
-	}
-
 	if *captureSharedCapacity <= 0 {
 		log.Fatalf("--capture-shared-capacity must be > 0")
 	}
@@ -248,58 +233,6 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 	streamIDs, err := parseInt64CSV(*streamIDsRaw)
 	if err != nil {
 		log.Fatalf("parse --stream-ids: %v", err)
-	}
-	requestedModes, err := parseCaptureServerExecutionClassesCSV(*executionClassesRaw)
-	if err != nil {
-		log.Fatalf("parse --execution-classes: %v", err)
-	}
-
-	modeCapacity := map[capture.Mode]int{
-		capture.ModeHLSLive:      *captureSharedCapacity,
-		capture.ModeFFmpegDirect: *captureSharedCapacity,
-	}
-	if len(requestedModes) > 0 {
-		filtered := make(map[capture.Mode]int, len(requestedModes))
-		for _, mode := range requestedModes {
-			switch mode {
-			case capture.ModeHLSLive, capture.ModeFFmpegDirect:
-				filtered[mode] = *captureSharedCapacity
-			default:
-				log.Fatalf("--execution-classes resolved unsupported mode %s for capture-server", mode)
-			}
-		}
-		modeCapacity = filtered
-		if len(modeCapacity) == 0 {
-			log.Fatalf("--execution-classes must include video_live")
-		}
-	}
-
-	streamFilterMode := len(streamIDs) > 0
-	drainingModes, err := parseCaptureServerExecutionClassesSetCSV(strings.TrimSpace(*drainingExecutionClassesRaw))
-	if err != nil {
-		log.Fatalf("parse --draining-execution-classes: %v", err)
-	}
-	for mode := range drainingModes {
-		if _, ok := modeCapacity[mode]; !ok {
-			log.Fatalf("--draining-execution-classes resolved unsupported mode %s for capture-server", mode)
-		}
-	}
-
-	modes := make([]capture.Mode, 0, len(modeCapacity))
-	activeModes := make([]capture.Mode, 0, len(modeCapacity))
-	for mode, capVal := range modeCapacity {
-		modes = append(modes, mode)
-		if capVal > 0 {
-			activeModes = append(activeModes, mode)
-		}
-	}
-	sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
-	sort.Slice(activeModes, func(i, j int) bool { return activeModes[i] < activeModes[j] })
-	if len(activeModes) == 0 {
-		log.Fatalf("at least one mode must have max_active > 0")
-	}
-	if streamFilterMode && len(drainingModes) > 0 {
-		log.Printf("capture-server stream-filter mode ignores draining state for assignments: stream_ids=%d", len(streamIDs))
 	}
 
 	meta := map[string]any{}
@@ -337,163 +270,33 @@ func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
 		runCtx, cancel = context.WithTimeout(ctx, *duration)
 	}
 	defer cancel()
-	managedCtx, managedCancel := context.WithCancel(runCtx)
-	defer managedCancel()
 
-	modeWorkerIDs := make(map[capture.Mode]string, len(activeModes))
-	for _, mode := range activeModes {
-		modeWorkerIDs[mode] = fmt.Sprintf("%s-%s", strings.TrimSpace(*workerID), string(mode))
+	pool := mustOpenPool(runCtx, cfg)
+	defer pool.Close()
+	worker, err := capturescheduled.NewWorker(capturescheduled.Config{
+		Pool:              pool,
+		Client:            client,
+		Registry:          registry,
+		WorkerID:          strings.TrimSpace(*workerID),
+		ServerID:          strings.TrimSpace(*serverID),
+		Concurrency:       *captureSharedCapacity,
+		LeaseSec:          *leaseSec,
+		PollInterval:      time.Duration(*refreshSec) * time.Second,
+		HeartbeatInterval: time.Duration(*heartbeatSec) * time.Second,
+		MetadataJSON:      meta,
+		StreamIDs:         streamIDs,
+	})
+	if err != nil {
+		log.Fatalf("init sampled capture worker: %v", err)
 	}
-
-	if !streamFilterMode {
-		defer func() {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer stopCancel()
-			for _, mode := range activeModes {
-				workerStopErr := client.WorkerStopped(stopCtx, modeWorkerIDs[mode], capture.ModeToExecutionClass(mode))
-				if workerStopErr != nil {
-					log.Printf("capture-server worker stop signal failed mode=%s worker_id=%s: %v", mode, modeWorkerIDs[mode], workerStopErr)
-				}
-			}
-			if stopErr := client.RecordingServerStopped(stopCtx, strings.TrimSpace(*serverID)); stopErr != nil {
-				log.Printf("capture-server server stop signal failed server_id=%s: %v", strings.TrimSpace(*serverID), stopErr)
-			}
-		}()
-	}
-
-	errCh := make(chan error, len(activeModes)*2+1)
-	sendErr := func(err error) {
-		if err == nil {
-			return
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		if workerStopErr := client.WorkerStopped(stopCtx, strings.TrimSpace(*workerID), capture.ExecutionClassVideoLive); workerStopErr != nil {
+			log.Printf("capture-server worker stop signal failed worker_id=%s: %v", strings.TrimSpace(*workerID), workerStopErr)
 		}
-		select {
-		case errCh <- err:
-		default:
-			log.Printf("capture-server dropped async error due full channel: %v", err)
-		}
-	}
-
-	var wg sync.WaitGroup
-	heartbeatInterval := time.Duration(*heartbeatSec) * time.Second
-	if !streamFilterMode {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			serverModeByExecutionClass := make(map[string]captureapi.RecordingServerHeartbeatClass, len(modes))
-			for _, mode := range modes {
-				executionClass := capture.ModeToExecutionClass(mode)
-				if strings.TrimSpace(executionClass) == "" {
-					continue
-				}
-				_, draining := drainingModes[mode]
-				item := captureapi.RecordingServerHeartbeatClass{
-					ExecutionClass: executionClass,
-					MaxActive:      modeCapacity[mode],
-					Draining:       draining,
-				}
-				if existing, ok := serverModeByExecutionClass[executionClass]; ok {
-					if item.MaxActive > existing.MaxActive {
-						existing.MaxActive = item.MaxActive
-					}
-					existing.Draining = existing.Draining || item.Draining
-					serverModeByExecutionClass[executionClass] = existing
-					continue
-				}
-				serverModeByExecutionClass[executionClass] = item
-			}
-			executionClasses := make([]string, 0, len(serverModeByExecutionClass))
-			for executionClass := range serverModeByExecutionClass {
-				executionClasses = append(executionClasses, executionClass)
-			}
-			sort.Strings(executionClasses)
-			serverModes := make([]captureapi.RecordingServerHeartbeatClass, 0, len(serverModeByExecutionClass))
-			for _, executionClass := range executionClasses {
-				serverModes = append(serverModes, serverModeByExecutionClass[executionClass])
-			}
-			err := runRecordingServerHeartbeatLoop(managedCtx, client, captureapi.RecordingServerHeartbeatRequest{
-				ServerID:         strings.TrimSpace(*serverID),
-				LeaseSec:         *leaseSec,
-				ExecutionClasses: serverModes,
-				MetadataJSON:     meta,
-			}, heartbeatInterval)
-			if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-				sendErr(fmt.Errorf("recording server heartbeat loop: %w", err))
-			}
-		}()
-	}
-
-	for _, mode := range activeModes {
-		mode := mode
-		workerIDMode := modeWorkerIDs[mode]
-		modeMeta := cloneMap(meta)
-		modeMeta["execution_class"] = capture.ModeToExecutionClass(mode)
-		modeMeta["runtime_mode"] = string(mode)
-		modeMeta["process_name"] = "capture-server-mode"
-		modeMeta["process_id"] = workerIDMode
-		if !streamFilterMode {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				err := runWorkerHeartbeatLoop(managedCtx, client, captureapi.WorkerHeartbeatRequest{
-					WorkerID:       workerIDMode,
-					ExecutionClass: capture.ModeToExecutionClass(mode),
-					Capacity:       modeCapacity[mode],
-					LeaseSec:       *leaseSec,
-					MetadataJSON:   modeMeta,
-				}, heartbeatInterval)
-				if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-					sendErr(fmt.Errorf("capture worker heartbeat mode=%s: %w", mode, err))
-				}
-			}()
-		}
-
-		mgrCfg := captureapipersistent.ManagerConfig{
-			WorkerID:                  workerIDMode,
-			ServerID:                  strings.TrimSpace(*serverID),
-			RefreshInterval:           time.Duration(*refreshSec) * time.Second,
-			ProcessHeartbeatInterval:  heartbeatInterval,
-			ProcessHeartbeatLeaseSec:  *leaseSec,
-			ProcessStartReason:        "capture_server_supervisor",
-			ProcessTelemetry:          !streamFilterMode,
-			MaxSessions:               modeCapacity[mode],
-			MaxFrameBytes:             25 << 20,
-			FrameQueueSize:            *frameQueueSize,
-			FrameEnqueueTimeout:       time.Duration(*frameEnqueueTimeoutSec) * time.Second,
-			FrameWriterWorkers:        *frameWriterWorkers,
-			StreamIDs:                 streamIDs,
-			ModeAllowlist:             []capture.Mode{mode},
-			RecordingHeartbeat:        false,
-			UnsupportedErrorThreshold: *unsupportedThreshold,
-			Registry:                  registry,
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			mgr := captureapipersistent.NewManager(client, mgrCfg)
-			err := mgr.Run(managedCtx)
-			if err != nil && !errors.Is(err, context.Canceled) && !(errors.Is(err, context.DeadlineExceeded) && managedCtx.Err() != nil) {
-				sendErr(fmt.Errorf("capture manager mode=%s: %w", mode, err))
-			}
-		}()
-	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		wg.Wait()
 	}()
-
-	select {
-	case <-runCtx.Done():
-		managedCancel()
-		<-done
-		if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return
-		}
-		log.Fatalf("capture-server canceled: %v", runCtx.Err())
-	case err := <-errCh:
-		managedCancel()
-		<-done
+	if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Fatalf("capture-server run failed: %v", err)
 	}
 }
@@ -2207,7 +2010,7 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 	case "metadata-audit":
 		runStreamMetadataAudit(ctx, cfg, args[1:])
 	case "recording-interval":
-		log.Fatalf("streams recording-interval is removed; use `stoaramactl recording interval --seconds N`")
+		log.Fatalf("streams recording-interval is removed; sampled clip recording is fixed at 30s clips every 4-8 minutes")
 	case "set-capture":
 		fs := flag.NewFlagSet("streams set-capture", flag.ExitOnError)
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
@@ -3875,23 +3678,7 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 	}
 	switch args[0] {
 	case "interval":
-		fs := flag.NewFlagSet("recording interval", flag.ExitOnError)
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		seconds := fs.Int("seconds", settings.DefaultRecordingIntervalSec, "global capture interval seconds for recording-on streams")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *seconds <= 0 {
-			log.Fatalf("--seconds must be > 0")
-		}
-		payload := mustAPIRequest(ctx, http.MethodPut, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/dashboard/recording/settings", map[string]any{
-			"interval_sec": *seconds,
-		})
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf("recording interval=%ss updated_at=%s\n", fmt.Sprint(payload["interval_sec"]), fmt.Sprint(payload["updated_at"]))
+		log.Fatalf("recording interval is removed; sampled clip recording is fixed at 30s clips every 4-8 minutes")
 	case "enable", "disable":
 		fs := flag.NewFlagSet("recording "+args[0], flag.ExitOnError)
 		streamID := fs.Int64("id", 0, "stream id")
@@ -3920,7 +3707,8 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 			printJSON(payload)
 			return
 		}
-		fmt.Printf("interval_sec=%v updated_at=%v\n", payload["interval_sec"], payload["updated_at"])
+		fmt.Printf("clip_duration_sec=%v sample_interval=%v-%vs stale_grace_sec=%v updated_at=%v\n",
+			payload["clip_duration_sec"], payload["sample_interval_min_sec"], payload["sample_interval_max_sec"], payload["stale_grace_sec"], payload["updated_at"])
 	case "status":
 		fs := flag.NewFlagSet("recording status", flag.ExitOnError)
 		streamID := fs.Int64("id", 0, "optional stream id")

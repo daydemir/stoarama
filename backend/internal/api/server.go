@@ -2729,27 +2729,6 @@ func (s *Server) handleCaptureWorkerHeartbeat(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert capture processing heartbeat: %v", err))
 		return
 	}
-	serverID := strings.TrimSpace(stringFromMetadata(metadata, "server_id"))
-	if serverID == "" {
-		serverID = deriveServerID(workerID, metadata)
-	}
-	if _, err := s.pool.Exec(r.Context(), `
-		INSERT INTO server_execution_capacity (
-            server_id, execution_class, max_active, draining, heartbeat_at, lease_expires_at, metadata_jsonb, updated_at
-		)
-		VALUES ($1, $2, $3, false, now(), now() + make_interval(secs => $4), $5::jsonb, now())
-		ON CONFLICT (server_id, execution_class)
-		DO UPDATE SET
-			max_active=EXCLUDED.max_active,
-			draining=EXCLUDED.draining,
-			heartbeat_at=EXCLUDED.heartbeat_at,
-			lease_expires_at=EXCLUDED.lease_expires_at,
-			metadata_jsonb=EXCLUDED.metadata_jsonb,
-			updated_at=now()
-	`, serverID, executionClass, req.Capacity, leaseSec, string(metaBytes)); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert server execution class capacity from capture heartbeat: %v", err))
-		return
-	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -2774,18 +2753,6 @@ func (s *Server) handleCaptureWorkerStopped(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	serverID := ""
-	_ = s.pool.QueryRow(r.Context(), `
-		SELECT COALESCE(metadata_jsonb->>'server_id', '')
-		FROM processing_worker_heartbeats
-		WHERE worker_id=$1 AND worker_kind='capture' AND execution_class=$2 AND pipeline_id=''
-		LIMIT 1
-	`, workerID, executionClass).Scan(&serverID)
-	serverID = strings.TrimSpace(serverID)
-	if serverID == "" {
-		serverID = deriveServerID(workerID, nil)
-	}
-
 	if _, err := s.pool.Exec(r.Context(), `
 		DELETE FROM capture_worker_heartbeats
 		WHERE worker_id=$1 AND execution_class=$2
@@ -2798,13 +2765,6 @@ func (s *Server) handleCaptureWorkerStopped(w http.ResponseWriter, r *http.Reque
 		WHERE worker_id=$1 AND worker_kind='capture' AND execution_class=$2 AND pipeline_id=''
 	`, workerID, executionClass); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete capture processing heartbeat: %v", err))
-		return
-	}
-	if _, err := s.pool.Exec(r.Context(), `
-		DELETE FROM server_execution_capacity
-		WHERE server_id=$1 AND execution_class=$2
-	`, serverID, executionClass); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete server execution class capacity from capture stop: %v", err))
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -3756,6 +3716,7 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = recordingSettings
 	type overviewStreamHealthRow struct {
 		StreamID       int64
 		ExecutionClass string
@@ -3809,7 +3770,7 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording process issue counters: %v", err))
 		return
 	}
-	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameIDs, clipIDs, 2*time.Hour, 2*time.Minute)
+	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameIDs, clipIDs, 2*time.Hour, 0)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording outage counters: %v", err))
 		return
@@ -3830,7 +3791,7 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 			LastFrameAt:     row.LastSeen,
 			StreamUpdatedAt: now,
 			Metrics: recordingSupervisionMetrics{
-				LossRate2h:       lossRateForWindow(expectedCapturesForWindow(mode, recordingSettings.CaptureIntervalSec, 2*time.Hour), success2h[row.StreamID]),
+				LossRate2h:       lossRateForWindow(expectedCapturesForWindow(mode, settings.DefaultRecordingIntervalSec, 2*time.Hour), success2h[row.StreamID]),
 				ProcessIssues2h:  processIssueCounts2h[row.StreamID],
 				OutageEpisodes2h: outageEpisodes2h[row.StreamID],
 			},
@@ -3848,7 +3809,7 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 		"streams_total":            streamsTotal,
 		"recording_on":             recordingOn,
 		"recording_off":            recordingOff,
-		"recording_interval_sec":   recordingSettings.CaptureIntervalSec,
+		"recording_interval_sec":   settings.DefaultRecordingIntervalSec,
 		"recording_healthy_total":  recHealthy,
 		"recording_degraded_total": recDegraded,
 		"recording_stale_total":    recStale,
@@ -4008,6 +3969,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = recordingSettings
 
 	whereSQL := strings.Join(where, " AND ")
 	var total int64
@@ -4133,7 +4095,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		}
 		if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
 			it.TargetFPS = capture.SegmentTargetFPS
-			it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), recordingSettings.CaptureIntervalSec)
+			it.ExpectedFrames60s = expectedCapturesPer60s(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode)), settings.DefaultRecordingIntervalSec)
 			if runtimeLastFrame != nil {
 				it.LatestCaptured = runtimeLastFrame
 			}
@@ -4179,9 +4141,9 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		now := time.Now().UTC()
 		for i := range items {
 			items[i].SuccessFrames60s = success10m[items[i].Stream.ID]
-			items[i].ExpectedFrames60s = expectedCapturesForWindow(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), recordingSettings.CaptureIntervalSec, 10*time.Minute)
+			items[i].ExpectedFrames60s = expectedCapturesForWindow(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), settings.DefaultRecordingIntervalSec, 10*time.Minute)
 			items[i].LossRatePct = lossRateForWindow(
-				expectedCapturesForWindow(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), recordingSettings.CaptureIntervalSec, 2*time.Hour),
+				expectedCapturesForWindow(firstNonEmpty(string(items[i].Stream.ExecutionClass), derefString(items[i].Stream.CaptureRuntimeClass)), settings.DefaultRecordingIntervalSec, 2*time.Hour),
 				success2h[items[i].Stream.ID],
 			)
 			lastFrame := items[i].Stream.CaptureRuntimeLastSeen
@@ -4594,7 +4556,10 @@ func (s *Server) handleDashboardStreamImageURLs(w http.ResponseWriter, r *http.R
 }
 
 type dashboardRecordingSettingsRequest struct {
-	IntervalSec int `json:"interval_sec"`
+	ClipDurationSec      int `json:"clip_duration_sec"`
+	SampleIntervalMinSec int `json:"sample_interval_min_sec"`
+	SampleIntervalMaxSec int `json:"sample_interval_max_sec"`
+	StaleGraceSec        int `json:"stale_grace_sec"`
 }
 
 func (s *Server) handleDashboardRecordingSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -4612,8 +4577,11 @@ func (s *Server) writeRecordingSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"interval_sec": rs.CaptureIntervalSec,
-		"updated_at":   rs.UpdatedAt,
+		"clip_duration_sec":       rs.ClipDurationSec,
+		"sample_interval_min_sec": rs.SampleIntervalMinSec,
+		"sample_interval_max_sec": rs.SampleIntervalMaxSec,
+		"stale_grace_sec":         rs.StaleGraceSec,
+		"updated_at":              rs.UpdatedAt,
 	})
 }
 
@@ -4623,14 +4591,22 @@ func (s *Server) handleDashboardRecordingSettingsPut(w http.ResponseWriter, r *h
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rs, err := settings.SetRecordingIntervalSec(r.Context(), s.pool, req.IntervalSec)
+	rs, err := settings.SetRecordingSamplingPolicy(r.Context(), s.pool, settings.RecordingSettings{
+		ClipDurationSec:      req.ClipDurationSec,
+		SampleIntervalMinSec: req.SampleIntervalMinSec,
+		SampleIntervalMaxSec: req.SampleIntervalMaxSec,
+		StaleGraceSec:        req.StaleGraceSec,
+	})
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"interval_sec": rs.CaptureIntervalSec,
-		"updated_at":   rs.UpdatedAt,
+		"clip_duration_sec":       rs.ClipDurationSec,
+		"sample_interval_min_sec": rs.SampleIntervalMinSec,
+		"sample_interval_max_sec": rs.SampleIntervalMaxSec,
+		"stale_grace_sec":         rs.StaleGraceSec,
+		"updated_at":              rs.UpdatedAt,
 	})
 }
 
@@ -4754,6 +4730,7 @@ func (s *Server) handleDashboardRecordingSummary(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = recordingSettings
 
 	var streamsTotal, onTotal, offTotal int64
 	if err := s.pool.QueryRow(r.Context(), `
@@ -4821,7 +4798,7 @@ func (s *Server) handleDashboardRecordingSummary(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording summary process issues: %v", err))
 		return
 	}
-	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameSummaryIDs, clipSummaryIDs, 2*time.Hour, 2*time.Minute)
+	outageEpisodes2h, err := s.outageEpisodeCountsSince(r.Context(), frameSummaryIDs, clipSummaryIDs, 2*time.Hour, 0)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query recording summary outage counters: %v", err))
 		return
@@ -4841,7 +4818,7 @@ func (s *Server) handleDashboardRecordingSummary(w http.ResponseWriter, r *http.
 			LastFrameAt:     row.LastSeen,
 			StreamUpdatedAt: now,
 			Metrics: recordingSupervisionMetrics{
-				LossRate2h:       lossRateForWindow(expectedCapturesForWindow(mode, recordingSettings.CaptureIntervalSec, 2*time.Hour), success2h[row.StreamID]),
+				LossRate2h:       lossRateForWindow(expectedCapturesForWindow(mode, settings.DefaultRecordingIntervalSec, 2*time.Hour), success2h[row.StreamID]),
 				ProcessIssues2h:  processIssueCounts2h[row.StreamID],
 				OutageEpisodes2h: outageEpisodes2h[row.StreamID],
 			},
@@ -5016,7 +4993,7 @@ func (s *Server) handleDashboardRecordingSummary(w http.ResponseWriter, r *http.
 
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"hours":                     hours,
-		"recording_interval_sec":    recordingSettings.CaptureIntervalSec,
+		"recording_interval_sec":    settings.DefaultRecordingIntervalSec,
 		"streams_total":             streamsTotal,
 		"recording_on":              onTotal,
 		"recording_off":             offTotal,
@@ -7375,13 +7352,13 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 			return
 		}
 	}
-	intervalSec := recordingSettings.CaptureIntervalSec
+	intervalSec := settings.DefaultRecordingIntervalSec
 	if intervalSec <= 0 {
 		intervalSec = 1
 	}
 	expectedFrames24h := int64(24 * 60 * 60 / intervalSec)
 	if clipNative {
-		expectedFrames24h = int64(24 * 60 * 60 / 30)
+		expectedFrames24h = int64(24 * settings.DefaultSampleExpectedPerHour)
 	}
 	if expectedFrames24h <= 0 {
 		expectedFrames24h = 1
@@ -7399,7 +7376,7 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		}
 	}
 	now := time.Now().UTC()
-	healthyWindowSec := int(staleThresholdSecForExecutionClass(captureMode, recordingSettings.CaptureIntervalSec))
+	healthyWindowSec := int(staleThresholdSecForExecutionClass(captureMode, settings.DefaultRecordingIntervalSec))
 	healthState := "off"
 	healthReason := "recording_off"
 	healthMessage := "recording is off"
@@ -7411,10 +7388,9 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		healthReason = "unassigned"
 		healthMessage = "recording is on but no active assignment exists"
 		switch {
-		case assignment == nil:
 		case lastFrameAt == nil:
 			healthReason = "no_recent_capture"
-			healthMessage = fmt.Sprintf("recording is assigned but no recent %s has been observed", captureUnitSingular)
+			healthMessage = fmt.Sprintf("recording is on but no recent %s has been observed", captureUnitSingular)
 		default:
 			age := int64(now.Sub((*lastFrameAt).UTC()).Seconds())
 			if age < 0 {
@@ -7440,10 +7416,15 @@ func (s *Server) handleDashboardStreamRecording(w http.ResponseWriter, r *http.R
 		"active_capture_worker": activeCaptureWorker,
 		"process_runs":          processRuns,
 		"state_events":          stateEvents,
-		"recording_config":      map[string]any{"interval_sec": recordingSettings.CaptureIntervalSec},
-		"capture_unit":          captureUnitPlural,
-		"clip_native":           clipNative,
-		"recent_captures":       recentCaptures,
+		"recording_config": map[string]any{
+			"clip_duration_sec":       recordingSettings.ClipDurationSec,
+			"sample_interval_min_sec": recordingSettings.SampleIntervalMinSec,
+			"sample_interval_max_sec": recordingSettings.SampleIntervalMaxSec,
+			"stale_grace_sec":         recordingSettings.StaleGraceSec,
+		},
+		"capture_unit":    captureUnitPlural,
+		"clip_native":     clipNative,
+		"recent_captures": recentCaptures,
 		"current_health": map[string]any{
 			"state":                healthState,
 			"reason":               healthReason,
@@ -8801,14 +8782,14 @@ func captureUnitLabelForExecutionClass(raw string) string {
 
 func expectedCapturesPer60s(raw string, recordingIntervalSec int) int64 {
 	if isClipNativeExecutionClass(raw) {
-		return 2
+		return 0
 	}
 	return expectedFramesPer60s(recordingIntervalSec)
 }
 
 func staleThresholdSecForExecutionClass(raw string, recordingIntervalSec int) int64 {
 	if isClipNativeExecutionClass(raw) {
-		return 150
+		return settings.DefaultSampleStaleWindowSec
 	}
 	threshold := int64(recordingIntervalSec * 5)
 	if threshold < 15 {

@@ -18,10 +18,10 @@ func TestExpectedCapturesPerHourUsesRecordingSemantics(t *testing.T) {
 		want        int64
 	}{
 		{
-			name:        "clip_native_ignores_interval",
+			name:        "clip_native_uses_sampled_cadence",
 			class:       capture.ExecutionClassVideoLive,
 			intervalSec: 7,
-			want:        120,
+			want:        7,
 		},
 		{
 			name:        "frame_based_uses_interval",

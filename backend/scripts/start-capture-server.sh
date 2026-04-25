@@ -43,10 +43,6 @@ export CAPTURE_SERVER_ID="${CAPTURE_SERVER_ID:-}"
 export CAPTURE_TICK_SEC="${CAPTURE_TICK_SEC:-5}"
 export CAPTURE_SERVER_HEARTBEAT_SEC="${CAPTURE_SERVER_HEARTBEAT_SEC:-15}"
 export CAPTURE_SERVER_LEASE_SEC="${CAPTURE_SERVER_LEASE_SEC:-45}"
-export CAPTURE_UNSUPPORTED_THRESHOLD="${CAPTURE_UNSUPPORTED_THRESHOLD:-8}"
-export CAPTURE_FRAME_QUEUE_SIZE="${CAPTURE_FRAME_QUEUE_SIZE:-64}"
-export CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC="${CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC:-3}"
-export CAPTURE_FRAME_WRITERS="${CAPTURE_FRAME_WRITERS:-2}"
 export CAPTURE_SERVER_METADATA_JSON="${CAPTURE_SERVER_METADATA_JSON:-{}}"
 
 if [[ -z "${CAPTURE_SERVER_ID}" && -n "${default_host_id}" ]]; then
@@ -71,7 +67,7 @@ if [[ -z "${CAPTURE_SERVER_ID}" ]]; then
 fi
 
 if [[ -n "${CAPTURE_SERVER_STREAM_IDS:-}" && "${ALLOW_UNMANAGED_STREAM_FILTER:-0}" != "1" ]]; then
-  echo "error: CAPTURE_SERVER_STREAM_IDS is disabled for production launchers; use assignments or set ALLOW_UNMANAGED_STREAM_FILTER=1 for explicit debug-only runs" >&2
+  echo "error: CAPTURE_SERVER_STREAM_IDS is disabled for production launchers; unset it or set ALLOW_UNMANAGED_STREAM_FILTER=1 for explicit debug-only runs" >&2
   exit 1
 fi
 
@@ -84,27 +80,14 @@ cmd=(
   --heartbeat-sec "${CAPTURE_SERVER_HEARTBEAT_SEC}"
   --lease-sec "${CAPTURE_SERVER_LEASE_SEC}"
   --refresh-sec "${CAPTURE_TICK_SEC}"
-  --unsupported-threshold "${CAPTURE_UNSUPPORTED_THRESHOLD}"
-  --frame-queue-size "${CAPTURE_FRAME_QUEUE_SIZE}"
-  --frame-enqueue-timeout-sec "${CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC}"
-  --frame-writer-workers "${CAPTURE_FRAME_WRITERS}"
   --metadata-json "${CAPTURE_SERVER_METADATA_JSON}"
 )
 cmd+=(--server-id "${CAPTURE_SERVER_ID}")
-if [[ -n "${CAPTURE_SERVER_EXECUTION_CLASSES:-}" ]]; then
-  cmd+=(--execution-classes "${CAPTURE_SERVER_EXECUTION_CLASSES}")
-fi
 if [[ -n "${CAPTURE_SERVER_STREAM_IDS:-}" ]]; then
   cmd+=(--stream-ids "${CAPTURE_SERVER_STREAM_IDS}")
 fi
-if [[ -n "${CAPTURE_SERVER_DRAINING_EXECUTION_CLASSES:-}" ]]; then
-  cmd+=(--draining-execution-classes "${CAPTURE_SERVER_DRAINING_EXECUTION_CLASSES}")
-fi
 
-echo "starting capture-server: worker_id=${WORKER_ID} server_id=${CAPTURE_SERVER_ID} video_live_capacity=${CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY} heartbeat_sec=${CAPTURE_SERVER_HEARTBEAT_SEC} lease_sec=${CAPTURE_SERVER_LEASE_SEC} refresh_sec=${CAPTURE_TICK_SEC}"
-if [[ -n "${CAPTURE_SERVER_EXECUTION_CLASSES:-}" ]]; then
-  echo "execution class filter: ${CAPTURE_SERVER_EXECUTION_CLASSES}"
-fi
+echo "starting sampled capture-server: worker_id=${WORKER_ID} server_id=${CAPTURE_SERVER_ID} concurrency=${CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY} heartbeat_sec=${CAPTURE_SERVER_HEARTBEAT_SEC} lease_sec=${CAPTURE_SERVER_LEASE_SEC} refresh_sec=${CAPTURE_TICK_SEC}"
 if [[ -n "${CAPTURE_SERVER_STREAM_IDS:-}" ]]; then
   echo "stream filter: ${CAPTURE_SERVER_STREAM_IDS}"
 fi

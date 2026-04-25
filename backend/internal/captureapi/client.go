@@ -173,8 +173,11 @@ type ingestResponse struct {
 }
 
 type RecordingSettings struct {
-	IntervalSec int       `json:"interval_sec"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ClipDurationSec      int       `json:"clip_duration_sec"`
+	SampleIntervalMinSec int       `json:"sample_interval_min_sec"`
+	SampleIntervalMaxSec int       `json:"sample_interval_max_sec"`
+	StaleGraceSec        int       `json:"stale_grace_sec"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 type RecordingAssignment struct {
@@ -387,8 +390,8 @@ func (c *Client) GetRecordingSettings(ctx context.Context) (RecordingSettings, e
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return RecordingSettings{}, fmt.Errorf("decode recording settings response: %w", err)
 	}
-	if payload.IntervalSec <= 0 {
-		return RecordingSettings{}, fmt.Errorf("invalid recording interval from API: %d", payload.IntervalSec)
+	if payload.ClipDurationSec <= 0 || payload.SampleIntervalMinSec <= 0 || payload.SampleIntervalMaxSec < payload.SampleIntervalMinSec || payload.StaleGraceSec < 0 {
+		return RecordingSettings{}, fmt.Errorf("invalid recording settings from API: %+v", payload)
 	}
 	return payload, nil
 }

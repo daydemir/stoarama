@@ -42,31 +42,36 @@ func (f fakeQueryRower) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row 
 func TestGetRecordingSettings(t *testing.T) {
 	now := time.Now().UTC()
 	got, err := GetRecordingSettings(context.Background(), fakeQueryRower{
-		row: fakeRow{values: []any{2, now}},
+		row: fakeRow{values: []any{30, 240, 480, 300, now}},
 	})
 	if err != nil {
 		t.Fatalf("GetRecordingSettings error: %v", err)
 	}
-	if got.CaptureIntervalSec != 2 {
-		t.Fatalf("interval=%d want=2", got.CaptureIntervalSec)
+	if got.ClipDurationSec != 30 || got.SampleIntervalMinSec != 240 || got.SampleIntervalMaxSec != 480 || got.StaleGraceSec != 300 {
+		t.Fatalf("settings=%+v", got)
 	}
 	if !got.UpdatedAt.Equal(now) {
 		t.Fatalf("updated_at mismatch")
 	}
 }
 
-func TestGetRecordingSettingsRejectsInvalidInterval(t *testing.T) {
+func TestGetRecordingSettingsRejectsInvalidClipDuration(t *testing.T) {
 	_, err := GetRecordingSettings(context.Background(), fakeQueryRower{
-		row: fakeRow{values: []any{0, time.Now().UTC()}},
+		row: fakeRow{values: []any{60, 240, 480, 300, time.Now().UTC()}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "invalid recording interval") {
-		t.Fatalf("expected invalid interval error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid clip duration") {
+		t.Fatalf("expected invalid clip duration error, got: %v", err)
 	}
 }
 
-func TestSetRecordingIntervalSecValidatesInput(t *testing.T) {
-	_, err := SetRecordingIntervalSec(context.Background(), fakeQueryRower{}, 0)
-	if err == nil || !strings.Contains(err.Error(), "interval_sec must be > 0") {
+func TestSetRecordingSamplingPolicyValidatesInput(t *testing.T) {
+	_, err := SetRecordingSamplingPolicy(context.Background(), fakeQueryRower{}, RecordingSettings{
+		ClipDurationSec:      30,
+		SampleIntervalMinSec: 480,
+		SampleIntervalMaxSec: 240,
+		StaleGraceSec:        300,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid sample interval max") {
 		t.Fatalf("expected validation error, got: %v", err)
 	}
 }

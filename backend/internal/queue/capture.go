@@ -9,6 +9,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type CaptureSamplingPolicy struct {
+	MinIntervalSec int
+	MaxIntervalSec int
+}
+
 type CaptureJob struct {
 	ID             int64
 	StreamID       int64
@@ -17,23 +22,24 @@ type CaptureJob struct {
 	IdempotencyKey string
 }
 
-func EnqueueDueCaptureJobs(ctx context.Context, pool *pgxpool.Pool) error {
+func EnqueueDueCaptureJobs(ctx context.Context, pool *pgxpool.Pool, policy CaptureSamplingPolicy) error {
+	if err := policy.Validate(); err != nil {
+		return err
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE capture_jobs
+		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, updated_at=now()
+		WHERE status='leased' AND lease_expires_at < now()
+	`); err != nil {
+		return fmt.Errorf("release expired capture jobs: %w", err)
+	}
 	q := `
 	WITH due AS (
 	  SELECT s.id AS stream_id,
-	         now() AS scheduled_for,
-	         concat('stream:', s.id, ':', floor(extract(epoch from now()))::bigint) AS idem
+	         now() + make_interval(secs => floor($1::double precision + random() * (($2 - $1 + 1)::double precision))::int) AS scheduled_for
 	  FROM streams s
-	  JOIN recording_settings rs ON rs.id=true
-	  LEFT JOIN LATERAL (
-	    SELECT f.captured_at
-	    FROM frames f
-	    WHERE f.stream_id = s.id AND f.capture_status='success'
-	    ORDER BY f.captured_at DESC
-	    LIMIT 1
-	  ) lf ON true
 	  WHERE s.recording_state = 'on'
-	    AND (lf.captured_at IS NULL OR lf.captured_at <= now() - make_interval(secs => rs.capture_interval_sec))
+	    AND COALESCE(NULLIF(s.capture_family, ''), 'continuous_video') = 'continuous_video'
 	    AND NOT EXISTS (
 	      SELECT 1 FROM capture_jobs j
 	      WHERE j.stream_id=s.id
@@ -41,13 +47,23 @@ func EnqueueDueCaptureJobs(ctx context.Context, pool *pgxpool.Pool) error {
 	    )
 	)
 	INSERT INTO capture_jobs (stream_id, scheduled_for, status, attempt_count, idempotency_key)
-	SELECT stream_id, scheduled_for, 'pending', 0, idem
+	SELECT stream_id, scheduled_for, 'pending', 0, concat('sampled-clip:', stream_id, ':', floor(extract(epoch from scheduled_for))::bigint)
 	FROM due
 	ON CONFLICT (idempotency_key) DO NOTHING
 	`
-	_, err := pool.Exec(ctx, q)
+	_, err := pool.Exec(ctx, q, policy.MinIntervalSec, policy.MaxIntervalSec)
 	if err != nil {
 		return fmt.Errorf("enqueue due capture jobs: %w", err)
+	}
+	return nil
+}
+
+func (p CaptureSamplingPolicy) Validate() error {
+	if p.MinIntervalSec <= 0 {
+		return fmt.Errorf("capture sampling min interval must be > 0")
+	}
+	if p.MaxIntervalSec < p.MinIntervalSec {
+		return fmt.Errorf("capture sampling max interval must be >= min interval")
 	}
 	return nil
 }
@@ -91,27 +107,90 @@ func LeaseOneCaptureJob(ctx context.Context, pool *pgxpool.Pool, workerID string
 	return &job, nil
 }
 
-func CompleteCaptureJob(ctx context.Context, pool *pgxpool.Pool, jobID int64) error {
-	_, err := pool.Exec(ctx, `
-		UPDATE capture_jobs
-		SET status='done', updated_at=now(), lease_owner=NULL, lease_expires_at=NULL
-		WHERE id=$1
-	`, jobID)
+func CompleteCaptureJob(ctx context.Context, pool *pgxpool.Pool, jobID int64, nextDelaySec int) error {
+	if nextDelaySec <= 0 {
+		return fmt.Errorf("next delay must be > 0")
+	}
+	err := finishCaptureJob(ctx, pool, jobID, "done", "", nextDelaySec)
 	if err != nil {
 		return fmt.Errorf("complete capture job %d: %w", jobID, err)
 	}
 	return nil
 }
 
-func FailCaptureJob(ctx context.Context, pool *pgxpool.Pool, jobID int64, errText string) error {
+func CompleteCaptureJobWithoutNext(ctx context.Context, pool *pgxpool.Pool, jobID int64) error {
 	_, err := pool.Exec(ctx, `
 		UPDATE capture_jobs
-		SET status='error', updated_at=now(), lease_owner=NULL, lease_expires_at=NULL,
-		    attempt_count=attempt_count+1, error_text=$2
+		SET status='done', updated_at=now(), completed_at=now(), lease_owner=NULL, lease_expires_at=NULL
 		WHERE id=$1
-	`, jobID, errText)
+	`, jobID)
+	if err != nil {
+		return fmt.Errorf("complete capture job without next %d: %w", jobID, err)
+	}
+	return nil
+}
+
+func FailCaptureJob(ctx context.Context, pool *pgxpool.Pool, jobID int64, errText string, nextDelaySec int) error {
+	if nextDelaySec <= 0 {
+		return fmt.Errorf("next delay must be > 0")
+	}
+	err := finishCaptureJob(ctx, pool, jobID, "error", errText, nextDelaySec)
 	if err != nil {
 		return fmt.Errorf("fail capture job %d: %w", jobID, err)
+	}
+	return nil
+}
+
+func finishCaptureJob(ctx context.Context, pool *pgxpool.Pool, jobID int64, status string, errText string, nextDelaySec int) error {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin finish tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var streamID int64
+	switch status {
+	case "done":
+		err = tx.QueryRow(ctx, `
+			UPDATE capture_jobs
+			SET status='done', updated_at=now(), completed_at=now(), lease_owner=NULL, lease_expires_at=NULL
+			WHERE id=$1
+			RETURNING stream_id
+		`, jobID).Scan(&streamID)
+	case "error":
+		err = tx.QueryRow(ctx, `
+			UPDATE capture_jobs
+			SET status='error', updated_at=now(), completed_at=now(), lease_owner=NULL, lease_expires_at=NULL,
+			    attempt_count=attempt_count+1, error_text=$2
+			WHERE id=$1
+			RETURNING stream_id
+		`, jobID, errText).Scan(&streamID)
+	default:
+		return fmt.Errorf("unsupported capture job status %q", status)
+	}
+	if err != nil {
+		return fmt.Errorf("update capture job: %w", err)
+	}
+	nextScheduled := time.Now().UTC().Add(time.Duration(nextDelaySec) * time.Second)
+	_, err = tx.Exec(ctx, `
+		INSERT INTO capture_jobs (stream_id, scheduled_for, status, attempt_count, idempotency_key)
+		SELECT s.id, $2, 'pending', 0, concat('sampled-clip:', s.id, ':', floor(extract(epoch from $2::timestamptz))::bigint)
+		FROM streams s
+		WHERE s.id=$1
+		  AND s.recording_state='on'
+		  AND COALESCE(NULLIF(s.capture_family, ''), 'continuous_video') = 'continuous_video'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM capture_jobs j
+		    WHERE j.stream_id=s.id
+		      AND j.status IN ('pending','leased')
+		  )
+		ON CONFLICT (idempotency_key) DO NOTHING
+	`, streamID, nextScheduled)
+	if err != nil {
+		return fmt.Errorf("schedule next capture job: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit finish tx: %w", err)
 	}
 	return nil
 }

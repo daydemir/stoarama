@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/settings"
 )
 
 type recordingSupervisionMetrics struct {
@@ -30,18 +32,17 @@ func classifyRecordingSupervision(now time.Time, input recordingSupervisionInput
 	if input.RecordingState != "on" {
 		return "off", "recording_disabled", nil
 	}
-	downThreshold := 10 * time.Minute
+	downThreshold := time.Duration(settings.DefaultSampleStaleWindowSec) * time.Second
 	spottyThreshold := 2 * time.Hour
 	continuousOnSince := recordingContinuousOnSince(input)
 	switch {
-	case input.ServerID == "":
-		if now.Sub(input.StreamUpdatedAt.UTC()) >= downThreshold {
-			return "down_10m", "recording_on_but_unassigned", &input.StreamUpdatedAt
-		}
-		return "healthy", "waiting_for_assignment", nil
 	case input.LastFrameAt == nil:
-		if input.AssignedAt != nil && now.Sub(input.AssignedAt.UTC()) >= downThreshold {
-			return "down_10m", "no_successful_frames", input.AssignedAt
+		since := input.StreamUpdatedAt.UTC()
+		if input.AssignedAt != nil && input.AssignedAt.UTC().Before(since) {
+			since = input.AssignedAt.UTC()
+		}
+		if now.Sub(since) >= downThreshold {
+			return "down_10m", "no_successful_captures", &since
 		}
 		return "healthy", "warmup", nil
 	default:
@@ -56,7 +57,7 @@ func classifyRecordingSupervision(now time.Time, input recordingSupervisionInput
 			}
 		}
 		if age >= downThreshold {
-			return "down_10m", "stale_frames_10m", input.LastFrameAt
+			return "down_10m", "stale_captures", input.LastFrameAt
 		}
 		if now.Sub(continuousOnSince) < spottyThreshold {
 			return state, reason, nil
@@ -117,10 +118,7 @@ func expectedCapturesForWindow(modeClass string, recordingIntervalSec int, windo
 		return 0
 	}
 	if isClipNativeExecutionClass(modeClass) {
-		if window < time.Minute {
-			return expectedCapturesPer60s(modeClass, recordingIntervalSec)
-		}
-		return int64(window / (30 * time.Second))
+		return int64(window / (time.Duration(settings.DefaultSampleIntervalMaxSec) * time.Second))
 	}
 	return expectedFramesPer60s(recordingIntervalSec) * int64(window/time.Minute)
 }
@@ -139,7 +137,7 @@ func lossRateForWindow(expected, success int64) float64 {
 func (s *Server) outageEpisodeCountsSince(ctx context.Context, frameStreamIDs, clipStreamIDs []int64, window, gap time.Duration) (map[int64]int64, error) {
 	out := map[int64]int64{}
 	if gap <= 0 {
-		gap = 2 * time.Minute
+		gap = time.Duration(settings.DefaultSampleStaleWindowSec) * time.Second
 	}
 	if window <= 0 {
 		window = 2 * time.Hour

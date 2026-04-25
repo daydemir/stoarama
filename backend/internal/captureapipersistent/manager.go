@@ -263,9 +263,10 @@ func (m *Manager) loadDesiredStreams(ctx context.Context) ([]streamConfig, error
 	if err != nil {
 		return nil, fmt.Errorf("load recording settings: %w", err)
 	}
+	_ = recordingSettings
 	if len(m.streamFilter) > 0 {
 		if m.cfg.PreferAssignedStreamIDs && strings.TrimSpace(m.cfg.ServerID) != "" {
-			assigned, assignedErr := m.loadAssignedStreamFilterTargets(ctx, recordingSettings.IntervalSec)
+			assigned, assignedErr := m.loadAssignedStreamFilterTargets(ctx, settings.DefaultRecordingIntervalSec)
 			if assignedErr != nil {
 				return nil, assignedErr
 			}
@@ -273,13 +274,13 @@ func (m *Manager) loadDesiredStreams(ctx context.Context) ([]streamConfig, error
 				return assigned, nil
 			}
 		}
-		return m.loadStreamFilterTargets(ctx, recordingSettings.IntervalSec)
+		return m.loadStreamFilterTargets(ctx, settings.DefaultRecordingIntervalSec)
 	}
 	serverID := strings.TrimSpace(m.cfg.ServerID)
 	if serverID == "" {
 		return nil, fmt.Errorf("server_id is required when stream filter is empty")
 	}
-	return m.loadAssignedStreams(ctx, recordingSettings.IntervalSec)
+	return m.loadAssignedStreams(ctx, settings.DefaultRecordingIntervalSec)
 }
 
 func (m *Manager) loadAssignedStreams(ctx context.Context, captureIntervalSec int) ([]streamConfig, error) {

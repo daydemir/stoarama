@@ -89,10 +89,7 @@ func (s *Server) handleDashboardStreamRecordingHealth(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if recordingSettings.CaptureIntervalSec <= 0 {
-		recordingSettings.CaptureIntervalSec = settings.DefaultRecordingIntervalSec
-	}
-
+	_ = recordingSettings
 	stream, err := s.getStreamByID(r.Context(), streamID)
 	if err != nil {
 		util.WriteError(w, http.StatusNotFound, err.Error())
@@ -115,7 +112,7 @@ func (s *Server) handleDashboardStreamRecordingHealth(w http.ResponseWriter, r *
 		stream.ExecutionClass,
 	)
 	captureUnit := captureUnitLabelForExecutionClass(effectiveExecutionClass)
-	expectedPerHour := expectedCapturesPerHour(effectiveExecutionClass, recordingSettings.CaptureIntervalSec)
+	expectedPerHour := expectedCapturesPerHour(effectiveExecutionClass, settings.DefaultRecordingIntervalSec)
 
 	windowEnd := time.Now().UTC().Truncate(time.Hour)
 	windowStart := windowEnd.Add(-time.Duration(hours) * time.Hour)
@@ -156,7 +153,7 @@ func (s *Server) handleDashboardStreamRecordingHealth(w http.ResponseWriter, r *
 		Hours:                   hours,
 		WindowStartUTC:          windowStart,
 		WindowEndUTCExclusive:   windowEnd,
-		RecordingIntervalSec:    recordingSettings.CaptureIntervalSec,
+		RecordingIntervalSec:    settings.DefaultRecordingIntervalSec,
 		ExpectedCapturesPerHour: expectedPerHour,
 		Buckets:                 buckets,
 		Summary:                 summary,
@@ -262,6 +259,9 @@ func buildRecordingHealthBuckets(windowStart, windowEnd time.Time, expectedPerHo
 }
 
 func expectedCapturesPerHour(raw string, recordingIntervalSec int) int64 {
+	if isClipNativeExecutionClass(raw) {
+		return settings.DefaultSampleExpectedPerHour
+	}
 	return expectedCapturesPer60s(raw, recordingIntervalSec) * 60
 }
 

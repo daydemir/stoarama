@@ -1,17 +1,13 @@
 # Capture Server CLI
 
-`stoaramactl capture-server run` is the assignment-managed `video_live` recording supervisor for server nodes.
+`stoaramactl capture-server run` is the sampled clip recorder for server nodes.
 
 ## Behavior
 
-- Announces shared `video_live` server capacity heartbeat to backend (`server_execution_capacity`).
-- Announces capture worker heartbeats per active execution class (`capture_worker_heartbeats`, `processing_worker_heartbeats`).
-- Runs one persistent capture manager per active execution class with assignment polling:
-  - source: `GET /api/v1/recording/assignments?server_id=...`
-  - only assigned streams for that server are captured.
-- On shutdown, sends:
-  - `/api/v1/capture/worker-stopped` per active mode
-  - `/api/v1/recording/servers/stopped` for server capacity cleanup.
+- Announces one sampled capture worker heartbeat (`capture_worker_heartbeats`, `processing_worker_heartbeats`).
+- Uses `capture_jobs` as the hard-cut schedule: one 30s clip every 4-8 minutes, jittered per stream.
+- Captures every `recording_state=on` continuous-video stream unless `--stream-ids` is supplied for an explicit debug run.
+- On shutdown, sends `/api/v1/capture/worker-stopped`.
 
 Execution-class behavior:
 - `video_live`: records HLS, HTTP video, RTSP, and RTMP streams as source-native fixed-length clips.
@@ -31,18 +27,14 @@ go run ./cmd/stoaramactl capture-server run \
   --capture-shared-capacity 6 \
   --heartbeat-sec 15 \
   --lease-sec 45 \
-  --refresh-sec 5 \
-  --unsupported-threshold 8 \
-  --frame-queue-size 64 \
-  --frame-enqueue-timeout-sec 3 \
-  --frame-writer-workers 2
+  --refresh-sec 5
 ```
 
 ## Required Flags
 
 - `--backend-api-url`
 - `--api-token`
-- `--capture-shared-capacity` (>0; `video_live` recording slots)
+- `--capture-shared-capacity` (>0; concurrent sampled clip captures)
 
 ## Optional Flags
 
@@ -50,8 +42,6 @@ go run ./cmd/stoaramactl capture-server run \
   - default: `do-<metadata-id>` on DO hosts, otherwise local hostname fallback.
 - `--worker-id`:
   - default: `capture-server-<hostname>`.
-- `--draining-execution-classes`:
-  - optional execution-class set marked draining in server heartbeat.
 - `--metadata-json`:
   - merged into heartbeat metadata.
 - `--duration`:

@@ -246,11 +246,7 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 				meta.VideoCodec = strings.TrimSpace(stream.CodecName)
 			}
 			if meta.ActualFPS == nil {
-				frameRate := strings.TrimSpace(stream.AvgFrameRate)
-				if frameRate == "" {
-					frameRate = strings.TrimSpace(stream.RFrameRate)
-				}
-				meta.ActualFPS = parseFrameRate(frameRate)
+				meta.ActualFPS = parseFrameRate(strings.TrimSpace(stream.AvgFrameRate))
 			}
 		case "audio":
 			if meta.AudioCodec == "" {
