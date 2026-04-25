@@ -13,13 +13,13 @@ variable "region" {
 variable "droplet_count" {
   description = "Number of capture droplets."
   type        = number
-  default     = 4
+  default     = 2
 }
 
 variable "droplet_size" {
   description = "Droplet size slug."
   type        = string
-  default     = "s-2vcpu-4gb"
+  default     = "s-2vcpu-4gb-amd"
 }
 
 variable "droplet_image" {
@@ -84,7 +84,7 @@ variable "backend_api_token" {
 variable "capture_shared_capacity" {
   description = "Concurrent sampled clip captures on each DO server."
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "draining_modes" {

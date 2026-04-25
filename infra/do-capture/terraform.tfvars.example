@@ -1,7 +1,7 @@
 project_name      = "Stoarama"
 region            = "nyc3"
-droplet_count     = 4
-droplet_size      = "s-2vcpu-4gb"
+droplet_count     = 2
+droplet_size      = "s-2vcpu-4gb-amd"
 instance_name_prefix = "si-capture"
 ssh_key_name      = "stoarama-capture-key"
 ssh_public_key    = "ssh-ed25519 AAAA..."
@@ -13,7 +13,7 @@ repo_clone_token  = ""
 backend_api_url   = "https://stoarama-api.onrender.com"
 backend_api_token = "set-via-env-or-tfvars"
 
-capture_shared_capacity    = 1
+capture_shared_capacity    = 2
 
 draining_modes                    = []
 capture_tick_sec                  = 5
