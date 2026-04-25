@@ -9,13 +9,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/captureapi"
-	"github.com/daydemir/stoarama/backend/internal/captureapipersistent"
+	"github.com/daydemir/stoarama/backend/internal/capturescheduled"
 	"github.com/daydemir/stoarama/backend/internal/model"
 )
 
@@ -49,11 +48,7 @@ func runRecordingYouTube(args []string) {
 	workerID := fs.String("worker-id", defaultLocalRecorderWorkerID(), "stable recorder worker id")
 	heartbeatSec := fs.Int("heartbeat-sec", 15, "recording heartbeat interval seconds")
 	leaseSec := fs.Int("lease-sec", 45, "recording heartbeat lease seconds")
-	refreshSec := fs.Int("refresh-sec", 5, "assignment refresh interval seconds")
-	frameQueueSize := fs.Int("frame-queue-size", 64, "per-stream frame queue size")
-	frameEnqueueTimeoutSec := fs.Int("frame-enqueue-timeout-sec", 3, "per-stream frame enqueue timeout seconds")
-	frameWriterWorkers := fs.Int("frame-writer-workers", 2, "per-stream frame persistence workers")
-	unsupportedThreshold := fs.Int("unsupported-threshold", 8, "mark unsupported after this many consecutive errors")
+	refreshSec := fs.Int("refresh-sec", 5, "capture queue refresh interval seconds")
 	duration := fs.Duration("duration", 0, "optional run duration")
 	cookiesFile := fs.String("cookies-file", strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FILE")), "yt-dlp cookies file")
 	cookiesFromBrowser := fs.String("cookies-from-browser", strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FROM_BROWSER")), "yt-dlp cookies-from-browser value")
@@ -79,12 +74,6 @@ func runRecordingYouTube(args []string) {
 	}
 	if *refreshSec <= 0 {
 		fatalf("--refresh-sec must be > 0")
-	}
-	if *frameQueueSize <= 0 || *frameEnqueueTimeoutSec <= 0 || *frameWriterWorkers <= 0 {
-		fatalf("frame queue, timeout, and writer worker values must be > 0")
-	}
-	if *unsupportedThreshold <= 0 {
-		fatalf("--unsupported-threshold must be > 0")
 	}
 
 	requireBinary("ffmpeg")
@@ -162,7 +151,7 @@ func runRecordingYouTube(args []string) {
 	if err != nil {
 		fatalf("assign stream to local recorder: %v", err)
 	}
-	log.Printf("recording youtube stream_id=%d server_id=%s assignment_revision=%d", stream.ID, assignment.ServerID, assignment.AssignmentRevision)
+	log.Printf("recording youtube sampled stream_id=%d server_id=%s assignment_revision=%d", stream.ID, assignment.ServerID, assignment.AssignmentRevision)
 
 	managedCtx, managedCancel := context.WithCancel(runCtx)
 	defer managedCancel()
@@ -175,57 +164,52 @@ func runRecordingYouTube(args []string) {
 	}()
 
 	errCh := make(chan error, 2)
-	var wg sync.WaitGroup
-	wg.Add(1)
+	heartbeatDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer close(heartbeatDone)
 		if err := runLocalRecorderServerHeartbeatLoop(managedCtx, client, hbReq, time.Duration(*heartbeatSec)*time.Second); err != nil {
 			errCh <- err
 		}
 	}()
 
-	mgr := captureapipersistent.NewManager(client, captureapipersistent.ManagerConfig{
-		WorkerID:                  strings.TrimSpace(*workerID),
-		ServerID:                  strings.TrimSpace(*serverID),
-		RefreshInterval:           time.Duration(*refreshSec) * time.Second,
-		ProcessHeartbeatInterval:  time.Duration(*heartbeatSec) * time.Second,
-		ProcessHeartbeatLeaseSec:  *leaseSec,
-		ProcessStartReason:        "local_recorder_cli",
-		ProcessTelemetry:          true,
-		MaxSessions:               1,
-		MaxFrameBytes:             25 << 20,
-		FrameQueueSize:            *frameQueueSize,
-		FrameEnqueueTimeout:       time.Duration(*frameEnqueueTimeoutSec) * time.Second,
-		FrameWriterWorkers:        *frameWriterWorkers,
-		StreamIDs:                 []int64{stream.ID},
-		PreferAssignedStreamIDs:   true,
-		ModeAllowlist:             []capture.Mode{capture.ModeYouTubeLive},
-		RecordingHeartbeat:        true,
-		UnsupportedErrorThreshold: *unsupportedThreshold,
-		Registry:                  registry,
+	worker, err := capturescheduled.NewWorker(capturescheduled.Config{
+		Client:            client,
+		Registry:          registry,
+		WorkerID:          strings.TrimSpace(*workerID),
+		ServerID:          strings.TrimSpace(*serverID),
+		Concurrency:       1,
+		LeaseSec:          *leaseSec,
+		PollInterval:      time.Duration(*refreshSec) * time.Second,
+		HeartbeatInterval: time.Duration(*heartbeatSec) * time.Second,
+		MetadataJSON:      meta,
+		StreamIDs:         []int64{stream.ID},
+		ExecutionClass:    capture.ExecutionClassYouTubeDirect,
 	})
+	if err != nil {
+		fatalf("init sampled youtube worker: %v", err)
+	}
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		runErrCh <- mgr.Run(managedCtx)
+		runErrCh <- worker.Run(managedCtx)
 	}()
 
 	select {
 	case <-runCtx.Done():
 		managedCancel()
 		err := <-runErrCh
-		wg.Wait()
+		<-heartbeatDone
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			fatalf("recording stopped with error: %v", err)
 		}
 	case err := <-errCh:
 		managedCancel()
 		<-runErrCh
-		wg.Wait()
+		<-heartbeatDone
 		fatalf("recording heartbeat failed: %v", err)
 	case err := <-runErrCh:
 		managedCancel()
-		wg.Wait()
+		<-heartbeatDone
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			fatalf("recording failed: %v", err)
 		}

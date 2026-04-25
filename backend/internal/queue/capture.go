@@ -68,19 +68,35 @@ func (p CaptureSamplingPolicy) Validate() error {
 	return nil
 }
 
-func LeaseOneCaptureJob(ctx context.Context, pool *pgxpool.Pool, workerID string, leaseSec int) (*CaptureJob, error) {
+func LeaseOneCaptureJob(ctx context.Context, pool *pgxpool.Pool, workerID string, leaseSec int, streamIDs []int64) (*CaptureJob, error) {
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	filteredStreamIDs := make([]int64, 0, len(streamIDs))
+	for _, id := range streamIDs {
+		if id > 0 {
+			filteredStreamIDs = append(filteredStreamIDs, id)
+		}
+	}
 	q := `
 	WITH cte AS (
-	  SELECT id
-	  FROM capture_jobs
-	  WHERE status='pending' AND scheduled_for <= now()
-	  ORDER BY scheduled_for ASC, id ASC
+	  SELECT j.id
+	  FROM capture_jobs j
+	  JOIN streams s ON s.id=j.stream_id
+	  WHERE j.status='pending'
+	    AND j.scheduled_for <= now()
+	    AND (
+	      cardinality($3::bigint[]) > 0
+	      OR s.capture_type <> 'youtube_watch'
+	    )
+	    AND (
+	      cardinality($3::bigint[]) = 0
+	      OR j.stream_id = ANY($3::bigint[])
+	    )
+	  ORDER BY j.scheduled_for ASC, j.id ASC
 	  LIMIT 1
 	  FOR UPDATE SKIP LOCKED
 	)
@@ -94,7 +110,7 @@ func LeaseOneCaptureJob(ctx context.Context, pool *pgxpool.Pool, workerID string
 	RETURNING j.id, j.stream_id, j.scheduled_for, j.attempt_count, j.idempotency_key
 	`
 	var job CaptureJob
-	err = tx.QueryRow(ctx, q, workerID, leaseSec).Scan(&job.ID, &job.StreamID, &job.ScheduledFor, &job.AttemptCount, &job.IdempotencyKey)
+	err = tx.QueryRow(ctx, q, workerID, leaseSec, filteredStreamIDs).Scan(&job.ID, &job.StreamID, &job.ScheduledFor, &job.AttemptCount, &job.IdempotencyKey)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil

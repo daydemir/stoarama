@@ -408,10 +408,11 @@ func (c *Client) EnqueueDueCaptureJobs(ctx context.Context) error {
 	return c.postJSON(ctx, "/api/v1/capture/jobs/enqueue-due", map[string]any{}, nil)
 }
 
-func (c *Client) LeaseCaptureJob(ctx context.Context, workerID string, leaseSec int) (*CaptureJob, error) {
+func (c *Client) LeaseCaptureJob(ctx context.Context, workerID string, leaseSec int, streamIDs []int64) (*CaptureJob, error) {
 	payload := map[string]any{
-		"worker_id": strings.TrimSpace(workerID),
-		"lease_sec": leaseSec,
+		"worker_id":  strings.TrimSpace(workerID),
+		"lease_sec":  leaseSec,
+		"stream_ids": streamIDs,
 	}
 	var out struct {
 		Job *CaptureJob `json:"job"`

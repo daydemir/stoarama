@@ -27,6 +27,7 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	MetadataJSON      map[string]any
 	StreamIDs         []int64
+	ExecutionClass    string
 }
 
 type Worker struct {
@@ -135,9 +136,13 @@ func (w *Worker) heartbeat(ctx context.Context) error {
 	meta["process_name"] = "sampled-capture-worker"
 	meta["sample_interval_min_sec"] = settings.DefaultSampleIntervalMinSec
 	meta["sample_interval_max_sec"] = settings.DefaultSampleIntervalMaxSec
+	executionClass := strings.TrimSpace(w.cfg.ExecutionClass)
+	if executionClass == "" {
+		executionClass = capture.ExecutionClassVideoLive
+	}
 	return w.cfg.Client.WorkerHeartbeat(ctx, captureapi.WorkerHeartbeatRequest{
 		WorkerID:       w.cfg.WorkerID,
-		ExecutionClass: capture.ExecutionClassVideoLive,
+		ExecutionClass: executionClass,
 		Capacity:       w.cfg.Concurrency,
 		LeaseSec:       w.cfg.LeaseSec,
 		MetadataJSON:   meta,
@@ -158,7 +163,7 @@ func (w *Worker) tick(ctx context.Context, sem chan struct{}) error {
 		default:
 			return nil
 		}
-		job, err := w.cfg.Client.LeaseCaptureJob(ctx, w.cfg.WorkerID, w.cfg.LeaseSec)
+		job, err := w.cfg.Client.LeaseCaptureJob(ctx, w.cfg.WorkerID, w.cfg.LeaseSec, w.cfg.StreamIDs)
 		if err != nil {
 			<-sem
 			return err

@@ -2759,8 +2759,9 @@ func (s *Server) handleCaptureJobsEnqueueDue(w http.ResponseWriter, r *http.Requ
 }
 
 type captureJobLeaseRequest struct {
-	WorkerID string `json:"worker_id"`
-	LeaseSec int    `json:"lease_sec"`
+	WorkerID  string  `json:"worker_id"`
+	LeaseSec  int     `json:"lease_sec"`
+	StreamIDs []int64 `json:"stream_ids"`
 }
 
 func (s *Server) handleCaptureJobsLease(w http.ResponseWriter, r *http.Request) {
@@ -2778,7 +2779,7 @@ func (s *Server) handleCaptureJobsLease(w http.ResponseWriter, r *http.Request) 
 	if leaseSec <= 0 {
 		leaseSec = 45
 	}
-	job, err := queue.LeaseOneCaptureJob(r.Context(), s.pool, workerID, leaseSec)
+	job, err := queue.LeaseOneCaptureJob(r.Context(), s.pool, workerID, leaseSec, req.StreamIDs)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -8868,6 +8869,8 @@ func isClipNativeExecutionClass(raw string) bool {
 	normalized := strings.TrimSpace(strings.ToLower(raw))
 	switch normalized {
 	case capture.ExecutionClassVideoLive:
+		return true
+	case capture.ExecutionClassYouTubeDirect:
 		return true
 	case capture.ExecutionClassImagePoll:
 		return false
