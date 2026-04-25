@@ -24,7 +24,7 @@ go run ./cmd/stoaramactl capture-server run \
   --api-token "$API_TOKEN" \
   --server-id "do-123456789" \
   --worker-id "capture-server-do-123456789" \
-  --capture-shared-capacity 6 \
+  --capture-shared-capacity 1 \
   --heartbeat-sec 15 \
   --lease-sec 45 \
   --refresh-sec 5

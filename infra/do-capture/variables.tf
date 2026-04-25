@@ -82,9 +82,9 @@ variable "backend_api_token" {
 }
 
 variable "capture_shared_capacity" {
-  description = "Shared video_live recording capacity on each DO server."
+  description = "Concurrent sampled clip captures on each DO server."
   type        = number
-  default     = 6
+  default     = 1
 }
 
 variable "draining_modes" {

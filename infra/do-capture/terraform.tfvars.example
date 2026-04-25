@@ -13,7 +13,7 @@ repo_clone_token  = ""
 backend_api_url   = "https://stoarama-api.onrender.com"
 backend_api_token = "set-via-env-or-tfvars"
 
-capture_shared_capacity    = 6
+capture_shared_capacity    = 1
 
 draining_modes                    = []
 capture_tick_sec                  = 5
