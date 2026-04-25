@@ -15,11 +15,11 @@ type CaptureSamplingPolicy struct {
 }
 
 type CaptureJob struct {
-	ID             int64
-	StreamID       int64
-	ScheduledFor   time.Time
-	AttemptCount   int
-	IdempotencyKey string
+	ID             int64     `json:"id"`
+	StreamID       int64     `json:"stream_id"`
+	ScheduledFor   time.Time `json:"scheduled_for"`
+	AttemptCount   int       `json:"attempt_count"`
+	IdempotencyKey string    `json:"idempotency_key"`
 }
 
 func EnqueueDueCaptureJobs(ctx context.Context, pool *pgxpool.Pool, policy CaptureSamplingPolicy) error {
