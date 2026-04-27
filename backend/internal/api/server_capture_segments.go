@@ -364,6 +364,8 @@ type captureSegmentQueryOptions struct {
 	TimeRange                   *clipTimeRange
 	CaptureStatus               string
 	RequireDownloadable         bool
+	BeforeSegmentStartAt        *time.Time
+	BeforeID                    int64
 	Limit                       int
 	Offset                      int
 	IncludeDownloadURL          bool
@@ -390,6 +392,10 @@ func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 	if opts.RequireDownloadable {
 		where = append(where, "cs.media_object_id IS NOT NULL")
 		where = append(where, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL")
+	}
+	if opts.BeforeSegmentStartAt != nil && opts.BeforeID > 0 {
+		args = append(args, opts.BeforeSegmentStartAt.UTC(), opts.BeforeID)
+		where = append(where, fmt.Sprintf("(cs.segment_start_at, cs.id) < ($%d, $%d)", len(args)-1, len(args)))
 	}
 	return where, args
 }
@@ -515,6 +521,17 @@ func (s *Server) handleCaptureStreamSegmentsList(w http.ResponseWriter, r *http.
 	}
 	limit := parseIntQuery(r, "limit", 100, 1, 1000)
 	offset := parseIntQuery(r, "offset", 0, 0, 1_000_000)
+	beforeID := int64(parseIntQuery(r, "before_id", 0, 0, 1_000_000_000))
+	var beforeSegmentStartAt *time.Time
+	if raw := strings.TrimSpace(r.URL.Query().Get("before_segment_start_at")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, "before_segment_start_at must be RFC3339")
+			return
+		}
+		beforeSegmentStartAt = &parsed
+		offset = 0
+	}
 	includeDownloadURLs := true
 	if v := parseBoolQueryPtr(r, "include_download_urls"); v != nil {
 		includeDownloadURLs = *v
@@ -527,6 +544,8 @@ func (s *Server) handleCaptureStreamSegmentsList(w http.ResponseWriter, r *http.
 		StreamID:                    streamID,
 		Limit:                       limit,
 		Offset:                      offset,
+		BeforeSegmentStartAt:        beforeSegmentStartAt,
+		BeforeID:                    beforeID,
 		IncludeDownloadURL:          includeDownloadURLs,
 		IncludeThumbnailDownloadURL: includeThumbnailDownloadURLs,
 	})
