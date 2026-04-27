@@ -515,12 +515,20 @@ func (s *Server) handleCaptureStreamSegmentsList(w http.ResponseWriter, r *http.
 	}
 	limit := parseIntQuery(r, "limit", 100, 1, 1000)
 	offset := parseIntQuery(r, "offset", 0, 0, 1_000_000)
+	includeDownloadURLs := true
+	if v := parseBoolQueryPtr(r, "include_download_urls"); v != nil {
+		includeDownloadURLs = *v
+	}
+	includeThumbnailDownloadURLs := true
+	if v := parseBoolQueryPtr(r, "include_thumbnail_download_urls"); v != nil {
+		includeThumbnailDownloadURLs = *v
+	}
 	items, err := s.queryCaptureSegments(r.Context(), captureSegmentQueryOptions{
 		StreamID:                    streamID,
 		Limit:                       limit,
 		Offset:                      offset,
-		IncludeDownloadURL:          true,
-		IncludeThumbnailDownloadURL: true,
+		IncludeDownloadURL:          includeDownloadURLs,
+		IncludeThumbnailDownloadURL: includeThumbnailDownloadURLs,
 	})
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
