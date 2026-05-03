@@ -51,12 +51,13 @@ type accountClipDownloadPrepareRequest struct {
 }
 
 type accountClipDownloadItem struct {
-	ID           int64     `json:"id"`
-	StreamID     int64     `json:"stream_id"`
-	SegmentStart time.Time `json:"segment_start_at"`
-	SegmentEnd   time.Time `json:"segment_end_at"`
-	DownloadURL  string    `json:"download_url"`
-	Filename     string    `json:"filename"`
+	ID                   int64     `json:"id"`
+	StreamID             int64     `json:"stream_id"`
+	SegmentStart         time.Time `json:"segment_start_at"`
+	SegmentEnd           time.Time `json:"segment_end_at"`
+	DownloadURL          string    `json:"download_url"`
+	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
+	Filename             string    `json:"filename"`
 }
 
 func (s *Server) handleDataAccessSpec(w http.ResponseWriter, r *http.Request) {
@@ -510,7 +511,7 @@ func (s *Server) handleClipDownloadPrepare(w http.ResponseWriter, r *http.Reques
 		Limit:                       len(segmentIDs),
 		Offset:                      0,
 		IncludeDownloadURL:          true,
-		IncludeThumbnailDownloadURL: false,
+		IncludeThumbnailDownloadURL: true,
 	})
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -532,12 +533,13 @@ func (s *Server) handleClipDownloadPrepare(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		out = append(out, accountClipDownloadItem{
-			ID:           item.ID,
-			StreamID:     item.StreamID,
-			SegmentStart: item.SegmentStartAt,
-			SegmentEnd:   item.SegmentEndAt,
-			DownloadURL:  item.DownloadURL,
-			Filename:     buildAccountClipFilename(stream.Slug, item),
+			ID:                   item.ID,
+			StreamID:             item.StreamID,
+			SegmentStart:         item.SegmentStartAt,
+			SegmentEnd:           item.SegmentEndAt,
+			DownloadURL:          item.DownloadURL,
+			ThumbnailDownloadURL: item.ThumbnailDownloadURL,
+			Filename:             buildAccountClipFilename(stream.Slug, item),
 		})
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
