@@ -1697,6 +1697,25 @@
       tab-size: 2;
       background: color-mix(in srgb, var(--panel) 94%, #000);
     }
+    .source-url-cell {
+      max-width: 300px;
+      overflow-wrap: anywhere;
+    }
+    .source-panel-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 8px;
+    }
+    .source-panel-row {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      background: color-mix(in srgb, var(--panel2) 52%, transparent);
+    }
+    .source-panel-value {
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
     .assign-modal {
       position: fixed;
       inset: 0;
@@ -1906,6 +1925,7 @@
 	            <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
 	            <th data-sort-key="tags_count">Tags</th>
 	            <th data-sort-key="mode">Capture Type</th>
+	            <th>Source</th>
 	            <th class="table-view-cell">View</th>
 	          </tr>
 	        </thead>
@@ -2355,6 +2375,7 @@
         <div id="detailSettingsAuth" class="coverage-summary">Checking session...</div>
         <div id="detailTagEditor" style="margin-top:12px;"></div>
         <div id="detailLocalRecordCommands" style="display:none; margin-top:12px;"></div>
+        <div id="detailSourcePanel" style="margin-top:12px;"></div>
         <div class="action-bar" id="detailActions" style="margin-top:12px;"></div>
       </div>
     </div>
@@ -2567,6 +2588,7 @@ const detailRecordCTA = $('detailRecordCTA');
 const detailTagEditor = $('detailTagEditor');
 const detailActions = $('detailActions');
 const detailLocalRecordCommands = $('detailLocalRecordCommands');
+const detailSourcePanel = $('detailSourcePanel');
 const detailMainTabDetails = $('detailMainTabDetails');
 const detailMainTabClips = $('detailMainTabClips');
 const detailMainTabSettings = $('detailMainTabSettings');
@@ -3956,6 +3978,81 @@ function buildPreferredViewURL(stream) {
   return String(s.source_page_url || '').trim();
 }
 
+function streamSourceURL(stream) {
+  return String((stream || {}).source_url || '').trim();
+}
+
+function streamSourcePageURL(stream) {
+  return String((stream || {}).source_page_url || '').trim();
+}
+
+function shortURLLabel(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '-';
+  if (value.length <= 72) return value;
+  return `${value.slice(0, 36)}...${value.slice(-28)}`;
+}
+
+function renderTableSourceCell(stream) {
+  const sourceURL = streamSourceURL(stream);
+  if (!sourceURL) return '<span class="muted fs11">-</span>';
+  return `
+    <div class="stack source-url-cell">
+      <span class="mono fs10" title="${esc(sourceURL)}">${esc(shortURLLabel(sourceURL))}</span>
+      <div class="row">
+        <button class="btn-sm" data-action="copy-source-url" data-id="${stream.id}" type="button">Copy HLS</button>
+        <a class="table-view-link" href="${esc(sourceURL)}" target="_blank" rel="noopener noreferrer">Open</a>
+      </div>
+    </div>
+  `;
+}
+
+function renderSourcePanelRow(label, value, options = {}) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const href = options && options.href ? String(options.href).trim() : '';
+  const copy = options && options.copy === true;
+  const streamID = Number(options && options.streamID);
+  return `
+    <div class="source-panel-row">
+      <div class="muted fs10">${esc(label)}</div>
+      <div class="source-panel-value mono fs11">${href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(raw)}</a>` : esc(raw)}</div>
+      ${copy && Number.isFinite(streamID) && streamID > 0 ? `<div class="row" style="margin-top:6px;"><button class="btn-sm" data-detail-action="copy-source-url" data-id="${Math.floor(streamID)}" type="button">Copy URL</button></div>` : ''}
+    </div>
+  `;
+}
+
+function renderDetailSourcePanel(stream) {
+  const s = stream || {};
+  const sourceURL = streamSourceURL(s);
+  const sourcePageURL = streamSourcePageURL(s);
+  return `
+    <div class="detail-section-head">
+      <div class="detail-section-title">Original Source</div>
+      <div class="detail-section-subtitle">Canonical upstream stream and source page for this record.</div>
+    </div>
+    <div class="source-panel-grid">
+      ${renderSourcePanelRow('HLS stream URL', sourceURL, { href: sourceURL, copy: true, streamID: Number(s.id || 0) })}
+      ${renderSourcePanelRow('Source page', sourcePageURL, { href: sourcePageURL })}
+      ${renderSourcePanelRow('Provider', String(s.provider || ''))}
+      ${renderSourcePanelRow('External ID', String(s.external_id || ''))}
+      ${renderSourcePanelRow('Capture type', String(s.capture_type || ''))}
+      ${renderSourcePanelRow('Source family', String(s.source_family || ''))}
+    </div>
+  `;
+}
+
+async function copyStreamSourceURL(streamID) {
+  const stream = findStreamByID(streamID);
+  if (!stream) throw new Error(`stream ${streamID} not found`);
+  const sourceURL = streamSourceURL(stream);
+  if (!sourceURL) throw new Error('stream source_url is empty');
+  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+    throw new Error('clipboard API is unavailable');
+  }
+  await navigator.clipboard.writeText(sourceURL);
+}
+
 function renderRecordingToggleControl(stream, options = {}) {
   const s = stream || {};
   const detailMode = options && options.detail === true;
@@ -4009,6 +4106,9 @@ function syncDetailMutationUI(stream) {
   `;
   if (detailTagEditor instanceof HTMLElement) {
     detailTagEditor.innerHTML = renderTagEditor(s, 'detail');
+  }
+  if (detailSourcePanel instanceof HTMLElement) {
+    detailSourcePanel.innerHTML = renderDetailSourcePanel(s);
   }
   renderLocalRecordCommands(s);
 }
@@ -6628,7 +6728,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="9" style="padding:20px;">
+        <td colspan="10" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -6688,6 +6788,7 @@ function renderStreamRows() {
       </td>
       <td>${renderTagEditor(s, 'streams')}</td>
       <td class="mono fs11"><div class="stack"><span>${esc(mode)}</span><span class="muted fs10">${esc(captureFamily)}${cadenceLabel ? ` · ${esc(cadenceLabel)}` : ''}</span></div></td>
+      <td>${renderTableSourceCell(s)}</td>
       <td class="mono fs11 table-view-cell">${viewActionHTML}</td>
     `;
     streamRowsEl.appendChild(tr);
@@ -6713,7 +6814,7 @@ async function loadStreams(opts = {}) {
   if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
   localStorage.setItem('streamPageSize', String(streamPageSize));
 
-  setTableLoadingRow(streamRowsEl, 9, 'Loading streams...');
+  setTableLoadingRow(streamRowsEl, 10, 'Loading streams...');
   const params = buildStreamFilterParams();
   params.set('limit', String(streamPageSize));
   params.set('offset', String((streamPage - 1) * streamPageSize));
@@ -8405,6 +8506,14 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
     return;
   }
 
+  if (action === 'copy-source-url') {
+    await copyStreamSourceURL(id);
+    if (tableKey === 'streams') setStreamStatus('source URL copied', 'ok');
+    else if (tableKey === 'recording') setRecStatus('source URL copied', 'ok');
+    else setDetailStatus('source URL copied', 'ok');
+    return;
+  }
+
   if (action === 'tag-add' || action === 'tag-remove') {
     const tagValue = String(rawTag || extractTagInputValue(actionEl)).trim();
     await handleTagMutation(action, id, tagValue);
@@ -8445,7 +8554,7 @@ async function onStreamTableClick(e, tableKey) {
   const action = String(btn.getAttribute('data-action') || '').trim();
   const id = Number(btn.getAttribute('data-id'));
   if (!action || !Number.isFinite(id) || id <= 0) return;
-  const localOnlyAction = action === 'show-stream-json';
+  const localOnlyAction = action === 'show-stream-json' || action === 'copy-source-url';
   try {
     if (!localOnlyAction) {
       if (tableKey === 'streams') setStreamStatus('updating...');
@@ -8699,7 +8808,7 @@ detailActions.addEventListener('click', async (e) => {
   const id = Number(btn.getAttribute('data-id'));
   if (!action || !id) return;
   try {
-    const localOnlyAction = action === 'show-stream-json';
+    const localOnlyAction = action === 'show-stream-json' || action === 'copy-source-url';
     if (!localOnlyAction) setDetailStatus('updating...');
     if (action === 'recording-enable' || action === 'recording-disable') {
       const nextState = action === 'recording-enable' ? 'on' : 'off';
@@ -8720,6 +8829,19 @@ detailActions.addEventListener('click', async (e) => {
     await loadDetail();
     setDetailStatus('updated', 'ok');
   } catch (err) { setDetailStatus(String(err), 'err'); }
+});
+
+detailSourcePanel.addEventListener('click', async (e) => {
+  const btn = e.target instanceof HTMLElement && e.target.closest('[data-detail-action]');
+  if (!btn || !(btn instanceof HTMLElement)) return;
+  const action = btn.getAttribute('data-detail-action');
+  const id = Number(btn.getAttribute('data-id'));
+  if (!action || !Number.isFinite(id) || id <= 0) return;
+  try {
+    await handleStreamTableAction(action, id, 'detail', btn);
+  } catch (err) {
+    setDetailStatus(String(err), 'err');
+  }
 });
 
 // ─── Recording settings ───────────────────────────────────────────────────────

@@ -14,13 +14,15 @@ var loadKoreaInventoryCmd = korea.LoadInventory
 
 func runKorea(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl korea <inventory|audit>")
+		log.Fatalf("usage: stoaramactl korea <inventory|audit|utic>")
 	}
 	switch args[0] {
 	case "inventory":
 		runKoreaInventory(ctx, cfg, false)
 	case "audit":
 		runKoreaInventory(ctx, cfg, true)
+	case "utic":
+		runKoreaUTIC(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown korea subcommand: %s", args[0])
 	}

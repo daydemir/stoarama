@@ -169,6 +169,9 @@ func usage() {
 	  stoaramactl recording supervisor reconcile --id N [--apply --backend-api-url URL --api-token TOKEN]
 	  stoaramactl korea inventory
 	  stoaramactl korea audit
+	  stoaramactl korea utic scrape [--api-url URL --service-key KEY --out report.json --json]
+	  stoaramactl korea utic ingest [--api-url URL --service-key KEY --backend-api-url URL --api-token TOKEN --auto-import=true --dry-run --limit 0 --report-json out.json --json]
+	  stoaramactl korea utic refresh-frames [--backend-api-url URL --api-token TOKEN --concurrency 4 --timeout-sec 90 --limit 0 --dry-run --allow-failures --report-json out.json --json]
 	  stoaramactl servers list [--backend-api-url URL --api-token TOKEN --hours 168 --include-stale=false --show-processes=true]
 	  stoaramactl servers assignments [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl servers assignments audit [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]
