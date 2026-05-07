@@ -45,6 +45,7 @@ type Server struct {
 	accountHTML   []byte
 	docsHTML      []byte
 	adminHTML     []byte
+	koreaHTML     []byte
 	exportMu      sync.Mutex
 	frameExports  map[string]*frameExportJob
 }
@@ -109,6 +110,10 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
+	koreaHTML, err := loadKoreaHTML()
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		cfg:           cfg,
 		pool:          pool,
@@ -119,6 +124,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		accountHTML:   accountHTML,
 		docsHTML:      docsHTML,
 		adminHTML:     adminHTML,
+		koreaHTML:     koreaHTML,
 		frameExports:  map[string]*frameExportJob{},
 	}
 	return s.router(), nil
@@ -132,6 +138,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/streams", s.handleStreamsApp)
 	r.Get("/streams/{id}", s.handleStreamsApp)
 	r.Get("/recording", s.handleRecordingApp)
+	r.Get("/korea", s.handleKoreaApp)
 	r.Get("/docs", s.handleDocsRoot)
 	r.Get("/docs/getting-started", s.handleDocsApp)
 	r.Get("/docs/api", s.handleDocsApp)
@@ -217,6 +224,7 @@ func (s *Server) router() http.Handler {
 			public.Get("/frames", s.handleFramesList)
 			public.Get("/capture/streams/{id}/segments", s.handleCaptureStreamSegmentsList)
 			public.Get("/capture/streams/{id}/segments/latest", s.handleCaptureStreamSegmentLatest)
+			public.Get("/korea/inventory", s.handleKoreaInventory)
 			public.Get("/dashboard/overview", s.handleDashboardOverview)
 			public.Get("/dashboard/streams", s.handleDashboardStreams)
 			public.Get("/dashboard/countries", s.handleDashboardCountries)

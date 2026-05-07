@@ -77,6 +77,8 @@ func main() {
 		runAlerts(ctx, cfg, os.Args[2:])
 	case "overview":
 		runOverview(ctx, cfg, os.Args[2:])
+	case "korea":
+		runKorea(ctx, cfg, os.Args[2:])
 	case "import":
 		runImport(ctx, cfg, os.Args[2:])
 	case "pipelines":
@@ -165,6 +167,8 @@ func usage() {
 	  stoaramactl recording supervisor run [--backend-api-url URL --api-token TOKEN --interval-sec 60 --limit 500 --dry-run --once]
 	  stoaramactl recording supervisor incidents [--status open|resolved --limit 200 --json]
 	  stoaramactl recording supervisor reconcile --id N [--apply --backend-api-url URL --api-token TOKEN]
+	  stoaramactl korea inventory
+	  stoaramactl korea audit
 	  stoaramactl servers list [--backend-api-url URL --api-token TOKEN --hours 168 --include-stale=false --show-processes=true]
 	  stoaramactl servers assignments [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl servers assignments audit [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]

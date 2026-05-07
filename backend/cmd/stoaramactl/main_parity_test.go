@@ -42,6 +42,10 @@ func TestDashboardAPISurfaceHasBackendctlParity(t *testing.T) {
 		"/api/v1/streams/%d",
 		"/api/v1/recording/streams/%d/assign",
 		"/api/v1/recording/streams/%d/unassign",
+		"case \"korea\":",
+		"runKorea(ctx, cfg, os.Args[2:])",
+		"stoaramactl korea inventory",
+		"stoaramactl korea audit",
 	}
 	for _, frag := range requiredFragments {
 		if !strings.Contains(src, frag) {
