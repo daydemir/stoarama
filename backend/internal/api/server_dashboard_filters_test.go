@@ -64,6 +64,32 @@ func TestDashboardBuildStreamWhereInvalidCaptureType(t *testing.T) {
 	}
 }
 
+func TestDashboardBuildStreamWhereKoreaFamilyFilter(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?korea_family=topis", nil)
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(args) != 0 {
+		t.Fatalf("args len=%d want=0", len(args))
+	}
+	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "TOPIS") || !strings.Contains(sqlWhere, "topiscctv") {
+		t.Fatalf("where missing topis korea family predicate: %s", sqlWhere)
+	}
+}
+
+func TestDashboardBuildStreamWhereInvalidKoreaFamily(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?korea_family=naver", nil)
+	_, _, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})
+	if err == nil {
+		t.Fatalf("expected error for invalid korea_family")
+	}
+	if !strings.Contains(err.Error(), "invalid korea_family") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestDashboardBuildStreamWhereRecordingTabDefault(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?tab=recording", nil)
 	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})

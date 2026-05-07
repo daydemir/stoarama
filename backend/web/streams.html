@@ -2733,6 +2733,14 @@ const streamJsonBody = $('streamJsonBody');
 // ─── State ───────────────────────────────────────────────────────────────────
 let mainTab = 'streams';
 const STREAM_ROUTE = Object.freeze({ LIST: 'stream_list', DETAIL: 'stream_detail' });
+const KOREA_FAMILIES = Object.freeze([
+  { value: 'utic', label: 'UTIC / 경찰청' },
+  { value: 'topis', label: 'TOPIS' },
+  { value: 'spatic', label: 'SPATIC' },
+  { value: 'kbs', label: 'KBS' },
+  { value: 'gigaeyes', label: 'GiGAeyes' },
+]);
+const isKoreaPage = window.location.pathname === '/korea';
 let currentStreamRoute = STREAM_ROUTE.LIST;
 let inferenceScope = 'recorded';
 let selectedPipelineID = '';
@@ -6051,13 +6059,30 @@ function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', ta
   if (String(tagsNotCSV || '').trim()) params.set('tags_not', String(tagsNotCSV).trim());
   if (String(country || '').trim()) params.set('country', String(country).trim());
   if (String(city || '').trim()) params.set('city', String(city).trim());
-  if (String(source || '').trim()) params.set('source', String(source).trim());
+  if (isKoreaPage) {
+    params.set('korea_family', normalizeKoreaFamily(source) || 'all');
+  } else if (String(source || '').trim()) {
+    params.set('source', String(source).trim());
+  }
   return params;
+}
+
+function normalizeKoreaFamily(raw) {
+  const key = String(raw || '').trim().toLowerCase();
+  if (!key || key === 'all') return '';
+  return KOREA_FAMILIES.some((item) => item.value === key) ? key : '';
+}
+
+function formatKoreaFamilyLabel(raw) {
+  const key = normalizeKoreaFamily(raw);
+  const found = KOREA_FAMILIES.find((item) => item.value === key);
+  return found ? found.label : 'all';
 }
 
 function formatSourceLabel(source) {
   const key = String(source || '').trim().toLowerCase();
   if (!key) return '-';
+  if (KOREA_FAMILIES.some((item) => item.value === key)) return formatKoreaFamilyLabel(key);
   if (key === 'youtube') return 'YouTube';
   return key.toUpperCase();
 }
@@ -6132,6 +6157,14 @@ async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState
 
 async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '') {
   const prev = String(targetSelect.value || '').trim().toLowerCase();
+  if (isKoreaPage && targetSelect === sourceFilter) {
+    const values = KOREA_FAMILIES.map((item) => item.value);
+    targetSelect.innerHTML = '<option value="">all sources</option>' +
+      KOREA_FAMILIES.map((item) => `<option value="${esc(item.value)}"${item.value === prev ? ' selected' : ''}>${esc(item.label)}</option>`).join('');
+    if (!values.includes(prev)) targetSelect.value = '';
+    updateStreamFilterSummary();
+    return;
+  }
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType);
   const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`);
   const values = (payload.items || [])
@@ -6261,7 +6294,11 @@ function buildStreamFilterParams() {
   if (streamSearch.value.trim()) params.set('q', streamSearch.value.trim());
   if (streamTagFilter.value.trim()) params.set('tags', streamTagFilter.value.trim());
   if (streamTagExcludeFilter.value.trim()) params.set('tags_not', streamTagExcludeFilter.value.trim());
-  if (sourceFilter.value.trim()) params.set('source', sourceFilter.value.trim());
+  if (isKoreaPage) {
+    params.set('korea_family', normalizeKoreaFamily(sourceFilter.value) || 'all');
+  } else if (sourceFilter.value.trim()) {
+    params.set('source', sourceFilter.value.trim());
+  }
   if (countryFilter.value.trim()) params.set('country', countryFilter.value.trim());
   if (cityFilter.value.trim()) params.set('city', cityFilter.value.trim());
   if (String(streamTouchedPipelineID || '').trim()) params.set('touched_pipeline_id', String(streamTouchedPipelineID).trim());
@@ -6273,9 +6310,12 @@ function applyStreamListStateFromURL(params) {
   streamSearch.value = String(params.get('q') || '').trim();
   streamTagFilter.value = String(params.get('tags') || '').trim();
   streamTagExcludeFilter.value = String(params.get('tags_not') || '').trim();
+  if (isKoreaPage && !params.has('tags_not')) streamTagExcludeFilter.value = '';
   streamRecordingStateFilter.value = normalizeRecordingStateFilter(params.get('recording_state'));
   streamModeFilter.value = normalizeCaptureTypeFilter(params.get('capture_type'));
-  sourceFilter.value = String(params.get('source') || '').trim();
+  sourceFilter.value = isKoreaPage
+    ? normalizeKoreaFamily(params.get('korea_family') || params.get('source'))
+    : String(params.get('source') || '').trim();
   countryFilter.value = String(params.get('country') || '').trim();
   cityFilter.value = String(params.get('city') || '').trim();
   streamTouchedPipelineID = String(params.get('touched_pipeline_id') || '').trim();
@@ -6329,7 +6369,8 @@ function syncStreamListURL(opts = {}) {
     params.set('page_size', String(Math.max(1, Math.floor(Number(streamPageSize) || 100))));
   }
   const qs = params.toString();
-  updateHistoryURL(qs ? `/streams?${qs}` : '/streams', opts.replace === true);
+  const path = isKoreaPage ? '/korea' : '/streams';
+  updateHistoryURL(qs ? `${path}?${qs}` : path, opts.replace === true);
 }
 
 function syncDetailURL(opts = {}) {
@@ -9451,6 +9492,18 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ─── Routing & init ───────────────────────────────────────────────────────────
+function applyKoreaPageMode() {
+  if (!isKoreaPage) return;
+  document.querySelectorAll('.global-nav a').forEach((link) => {
+    const href = String(link.getAttribute('href') || '');
+    link.classList.toggle('active', href === '/korea');
+  });
+  const title = document.querySelector('.domain-intro-title');
+  if (title) title.textContent = 'Korea';
+  const copy = document.querySelector('.domain-intro-copy');
+  if (copy) copy.textContent = 'Browse Seoul CCTV streams by upstream source family.';
+}
+
 function parseStreamsLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean);
   const params = new URLSearchParams(window.location.search);
@@ -9463,7 +9516,7 @@ function parseStreamsLocation() {
     const n = Number(parts[2]);
     if (Number.isFinite(n) && n > 0) streamID = n;
   }
-  return { params, streamID, isList: parts.length === 0 || (parts.length === 1 && parts[0] === 'streams') };
+  return { params, streamID, isList: parts.length === 0 || (parts.length === 1 && (parts[0] === 'streams' || parts[0] === 'korea')) };
 }
 
 async function applyStreamsRouteState(opts = {}) {
@@ -9502,6 +9555,7 @@ window.addEventListener('popstate', () => {
 (async function init() {
   try {
     detailHealthHoursWindow = normalizeHealthHoursWindow(localStorage.getItem('detailHealthHours') || '72');
+    applyKoreaPageMode();
     void resolveSessionState();
     await applyStreamsRouteState();
     void loadKnownStreamTagsSafe('all').catch(() => {});

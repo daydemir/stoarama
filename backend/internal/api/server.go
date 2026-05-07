@@ -45,7 +45,6 @@ type Server struct {
 	accountHTML   []byte
 	docsHTML      []byte
 	adminHTML     []byte
-	koreaHTML     []byte
 	exportMu      sync.Mutex
 	frameExports  map[string]*frameExportJob
 }
@@ -110,10 +109,6 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
-	koreaHTML, err := loadKoreaHTML()
-	if err != nil {
-		return nil, err
-	}
 	s := &Server{
 		cfg:           cfg,
 		pool:          pool,
@@ -124,7 +119,6 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		accountHTML:   accountHTML,
 		docsHTML:      docsHTML,
 		adminHTML:     adminHTML,
-		koreaHTML:     koreaHTML,
 		frameExports:  map[string]*frameExportJob{},
 	}
 	return s.router(), nil
@@ -3945,6 +3939,48 @@ func dashboardSourceExprSQL() string {
 	return "LOWER(TRIM(CASE WHEN s.capture_type='youtube_watch' THEN 'youtube' ELSE COALESCE(NULLIF(s.provider, ''), NULLIF(s.metadata_jsonb->>'discovery_provider', '')) END))"
 }
 
+func dashboardKoreaFamilyPredicateSQL(family string) (string, bool) {
+	provider := "UPPER(REPLACE(TRIM(COALESCE(s.provider, '')), ' ', '_'))"
+	sourceURL := "LOWER(COALESCE(s.source_url, ''))"
+	sourcePageURL := "LOWER(COALESCE(s.source_page_url, ''))"
+	sourceFamily := "LOWER(COALESCE(s.source_family, ''))"
+	switch family {
+	case "utic":
+		return fmt.Sprintf("(%s IN ('UTIC','POLICE','UTIC_POLICE') OR %s='utic' OR %s LIKE '%%ktict.co.kr%%' OR %s LIKE '%%koroad%%' OR %s LIKE '%%utic.go.kr%%')", provider, sourceFamily, sourceURL, sourceURL, sourcePageURL), true
+	case "topis":
+		return fmt.Sprintf("(%s='TOPIS' OR %s='topis' OR %s LIKE '%%topiscctv%%' OR %s LIKE '%%topis.seoul.go.kr%%')", provider, sourceFamily, sourceURL, sourcePageURL), true
+	case "spatic":
+		return fmt.Sprintf("(%s='SPATIC' OR %s='spatic' OR %s LIKE '%%spatic.go.kr%%' OR %s LIKE '%%spatic.go.kr%%')", provider, sourceFamily, sourceURL, sourcePageURL), true
+	case "kbs":
+		return fmt.Sprintf("(%s='KBS' OR %s='kbs' OR %s LIKE '%%loomex.net%%' OR %s LIKE '%%d.kbs.co.kr%%')", provider, sourceFamily, sourceURL, sourcePageURL), true
+	case "gigaeyes":
+		return fmt.Sprintf("(%s='GIGAEYES' OR %s='gigaeyes' OR (%s LIKE '%%youtube.com%%' AND %s LIKE '%%@gigaeyeslivetv%%'))", provider, sourceFamily, sourcePageURL, sourcePageURL), true
+	default:
+		return "", false
+	}
+}
+
+func dashboardKoreaFamilyWhereSQL(raw string) (string, error) {
+	family := strings.TrimSpace(strings.ToLower(raw))
+	if family == "" {
+		return "", nil
+	}
+	if family != "all" {
+		predicate, ok := dashboardKoreaFamilyPredicateSQL(family)
+		if !ok {
+			return "", fmt.Errorf("invalid korea_family; expected all|utic|topis|spatic|kbs|gigaeyes")
+		}
+		return predicate, nil
+	}
+	families := []string{"utic", "topis", "spatic", "kbs", "gigaeyes"}
+	predicates := make([]string, 0, len(families))
+	for _, name := range families {
+		predicate, _ := dashboardKoreaFamilyPredicateSQL(name)
+		predicates = append(predicates, predicate)
+	}
+	return "(" + strings.Join(predicates, " OR ") + ")", nil
+}
+
 func dashboardYouTubeChannelExprSQL() string {
 	return "TRIM(COALESCE(NULLIF(s.metadata_jsonb->>'channel', ''), NULLIF(s.metadata_jsonb->>'uploader', ''), NULLIF(s.metadata_jsonb->>'channel_name', ''), NULLIF(s.metadata_jsonb->>'uploader_id', ''), NULLIF(s.metadata_jsonb->>'author', ''), CASE WHEN POSITION(':' IN s.name) BETWEEN 2 AND 64 THEN TRIM(SPLIT_PART(s.name, ':', 1)) WHEN POSITION('|' IN s.name) BETWEEN 2 AND 64 THEN TRIM(SPLIT_PART(s.name, '|', 1)) ELSE '' END))"
 }
@@ -3963,6 +3999,7 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	country := strings.TrimSpace(r.URL.Query().Get("country"))
 	city := strings.TrimSpace(r.URL.Query().Get("city"))
 	source := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("source")))
+	koreaFamily := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("korea_family")))
 	youtubeChannel := strings.TrimSpace(r.URL.Query().Get("youtube_channel"))
 	captureModeRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("capture_type")))
 	touchedPipelineID := strings.TrimSpace(r.URL.Query().Get("touched_pipeline_id"))
@@ -4017,6 +4054,11 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	if cfg.IncludeSource && source != "" {
 		args = append(args, source)
 		where = append(where, fmt.Sprintf("%s = $%d", dashboardSourceExprSQL(), len(args)))
+	}
+	if koreaFamilyWhere, err := dashboardKoreaFamilyWhereSQL(koreaFamily); err != nil {
+		return nil, nil, err
+	} else if koreaFamilyWhere != "" {
+		where = append(where, koreaFamilyWhere)
 	}
 	if cfg.IncludeYouTubeChannel && youtubeChannel != "" {
 		args = append(args, strings.ToLower(youtubeChannel))
