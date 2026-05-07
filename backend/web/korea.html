@@ -257,16 +257,47 @@
 
   <div class="domain-intro">
     <div class="domain-intro-title">Korea</div>
-    <div class="domain-intro-copy">Browse the Korean CCTV families by their upstream source, then drill into the streams, source pages, and manifests behind each family.</div>
+    <div class="domain-intro-copy">Browse the Korean CCTV streams by upstream source family.</div>
   </div>
 
   <div class="summary-row" id="summaryRow"></div>
-  <div id="families"></div>
-  <div id="unresolved"></div>
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">
+        <strong>Streams</strong>
+        <span>filtered by upstream source family</span>
+      </div>
+      <div class="section-meta">
+        <label class="chip" style="display:inline-flex; gap:8px; align-items:center;">
+          <span>Source</span>
+          <select id="sourceFilter" style="height:24px; padding:2px 8px; min-width:180px;">
+            <option value="">all sources</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="entrypoint" style="border-top: 0;">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 34%;">Stream</th>
+            <th style="width: 12%;">Source</th>
+            <th style="width: 14%;">Entrypoint</th>
+            <th style="width: 20%;">Source page</th>
+            <th style="width: 20%;">Stream URL</th>
+          </tr>
+        </thead>
+        <tbody id="streamRows"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
+const sourceFilter = $('sourceFilter');
+const streamRowsEl = $('streamRows');
+let flatStreams = [];
 function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
@@ -278,13 +309,25 @@ async function loadJSON(path) {
 function chip(label, value, cls = '') {
   return `<span class="summary-chip ${cls}">${esc(label)} <b>${esc(String(value ?? 0))}</b></span>`;
 }
-function statusBadge(inv) {
-  return inv && inv.summary && inv.summary.complete
-    ? '<span class="badge ok">complete</span>'
-    : '<span class="badge warn">needs review</span>';
+function flattenInventory(inv) {
+  const out = [];
+  for (const family of (inv && inv.families) || []) {
+    for (const group of (family.entrypoints || [])) {
+      for (const item of (group.streams || [])) {
+        out.push({
+          family: String(family.family || ''),
+          family_label: String(family.label || family.family || ''),
+          entrypoint: String(group.entrypoint || ''),
+          entrypoint_label: String(group.label || group.entrypoint || ''),
+          stream: item && item.stream ? item.stream : {},
+        });
+      }
+    }
+  }
+  return out;
 }
 function renderSummary(inv) {
-  const summary = inv.summary || {};
+  const summary = inv && inv.summary ? inv.summary : {};
   $('summaryRow').innerHTML = [
     chip('families', summary.total_families),
     chip('covered', summary.covered_families),
@@ -298,128 +341,59 @@ function renderSummary(inv) {
     `<span class="metric-chip">streams <b>${esc(String(summary.total_streams ?? 0))}</b></span>`,
     `<span class="metric-chip">unresolved <b>${esc(String(summary.unresolved_streams ?? 0))}</b></span>`,
   ].join('');
-  $('statusChip').innerHTML = `${statusBadge(inv)} <span class="muted">${esc(new Date(inv.retrieved_at).toLocaleString())}</span>`;
+  $('statusChip').innerHTML = `<span class="badge ${summary.complete ? 'ok' : 'warn'}">${summary.complete ? 'complete' : 'needs review'}</span> <span class="muted">${esc(new Date(inv.retrieved_at).toLocaleString())}</span>`;
 }
-function renderStreamRow(item) {
-  const s = item.stream || {};
-  return `
-    <tr>
-      <td>
-        <div class="stream-name">
-          <strong><a href="/streams/${esc(s.id)}">${esc(String(s.name || `#${s.id}`))}</a></strong>
-          <span>#${esc(s.id)} · ${esc(String(s.provider || '-'))} · ${esc(String(s.recording_state || '-'))}</span>
-          ${s.location_text ? `<span>${esc(String(s.location_text))}</span>` : ''}
-        </div>
-      </td>
-      <td class="mono">${esc(String(s.capture_type || '-'))}</td>
-      <td class="mono">${esc(String(item.entrypoint_label || '-'))}</td>
-      <td class="links">
-        ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer">${esc(s.source_page_url)}</a>` : '<span class="muted">-</span>'}
-      </td>
-      <td class="links">
-        ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer">${esc(s.source_url)}</a>` : '<span class="muted">-</span>'}
-      </td>
-    </tr>
-  `;
-}
-function renderEntrypointGroup(group) {
-  const rows = (group.streams || []).map(renderStreamRow).join('');
-  return `
-    <div class="entrypoint">
-      <div class="entrypoint-head">
-        <strong>${esc(group.label || group.entrypoint || '-')}</strong>
-        <span>${esc(String(group.stream_count ?? 0))} streams</span>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th style="width: 36%;">Stream</th>
-            <th style="width: 10%;">Type</th>
-            <th style="width: 12%;">Source</th>
-            <th style="width: 21%;">Source page</th>
-            <th style="width: 21%;">Stream URL</th>
-          </tr>
-        </thead>
-        <tbody>${rows || '<tr><td colspan="5" class="empty">No streams</td></tr>'}</tbody>
-      </table>
-    </div>
-  `;
-}
-function renderFamily(family) {
-  const entrypoints = (family.entrypoints || []).map(renderEntrypointGroup).join('');
-  const chips = [
-    chip('streams', family.stream_count),
-    chip('present', family.present ? 'yes' : 'no', family.present ? 'ok' : 'warn'),
-  ].join('');
-  return `
-    <section class="section">
-      <div class="section-head">
-        <div class="section-title">
-          <strong>${esc(family.label || family.family || '-')}</strong>
-          <span>${esc(String(family.family || '-'))}</span>
-        </div>
-        <div class="section-meta">
-          ${chips}
-        </div>
-      </div>
-      ${entrypoints || '<div class="empty">No streams in this family</div>'}
-    </section>
-  `;
-}
-function renderUnresolved(items) {
-  if (!items || !items.length) {
-    $('unresolved').innerHTML = '';
-    return;
+function renderSourceOptions(inv) {
+  const families = (inv && inv.families) || [];
+  const prev = String(sourceFilter.value || '').trim();
+  sourceFilter.innerHTML = '<option value="">all sources</option>' + families.map((family) => {
+    const value = String(family.family || '').trim();
+    const label = String(family.label || value || '-');
+    return `<option value="${esc(value)}"${value === prev ? ' selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+  if (!families.some((family) => String(family.family || '') === prev)) {
+    sourceFilter.value = '';
   }
-  const rows = items.map((item) => {
+}
+function renderRows() {
+  const selected = String(sourceFilter.value || '').trim();
+  const rows = flatStreams.filter((item) => !selected || String(item.family || '') === selected);
+  streamRowsEl.innerHTML = rows.length ? rows.map((item) => {
     const s = item.stream || {};
     return `
       <tr>
         <td>
           <div class="stream-name">
-            <strong>${esc(String(s.name || `#${s.id}`))}</strong>
-            <span>#${esc(s.id)} · ${esc(String(s.provider || '-'))}</span>
+            <strong><a href="/streams/${esc(s.id)}">${esc(String(s.name || `#${s.id}`))}</a></strong>
+            <span>#${esc(s.id)} · ${esc(String(s.provider || '-'))} · ${esc(String(s.recording_state || '-'))}</span>
+            ${s.location_text ? `<span>${esc(String(s.location_text))}</span>` : ''}
           </div>
         </td>
-        <td class="mono">${esc(String(item.reason || '-'))}</td>
-        <td class="links">${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer">${esc(s.source_page_url)}</a>` : '<span class="muted">-</span>'}</td>
-        <td class="links">${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer">${esc(s.source_url)}</a>` : '<span class="muted">-</span>'}</td>
+        <td class="mono">${esc(item.family_label || item.family || '-')}</td>
+        <td class="mono">${esc(item.entrypoint_label || item.entrypoint || '-')}</td>
+        <td class="links">
+          ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer">${esc(s.source_page_url)}</a>` : '<span class="muted">-</span>'}
+        </td>
+        <td class="links">
+          ${s.source_url ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer">${esc(s.source_url)}</a>` : '<span class="muted">-</span>'}
+        </td>
       </tr>
     `;
-  }).join('');
-  $('unresolved').innerHTML = `
-    <section class="unresolved">
-      <div class="section-head" style="border-bottom: 1px solid var(--border); margin-bottom: 0; padding-left: 0; padding-right: 0;">
-        <div class="section-title">
-          <strong>Unresolved</strong>
-          <span>${esc(String(items.length))} candidate streams need source mapping</span>
-        </div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th style="width: 34%;">Stream</th>
-            <th style="width: 18%;">Reason</th>
-            <th style="width: 24%;">Source page</th>
-            <th style="width: 24%;">Stream URL</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </section>
-  `;
+  }).join('') : '<tr><td colspan="5" class="empty">No streams in this source</td></tr>';
 }
 async function main() {
   try {
     const payload = await loadJSON('/api/v1/korea/inventory');
+    flatStreams = flattenInventory(payload);
     renderSummary(payload);
-    $('families').innerHTML = (payload.families || []).map(renderFamily).join('');
-    renderUnresolved(payload.unresolved || []);
+    renderSourceOptions(payload);
+    renderRows();
   } catch (err) {
     $('summaryRow').innerHTML = '<span class="summary-chip warn">failed to load</span>';
-    $('families').innerHTML = `<div class="section"><div class="empty">${esc(String(err || 'failed to load'))}</div></div>`;
+    streamRowsEl.innerHTML = `<tr><td colspan="5" class="empty">${esc(String(err || 'failed to load'))}</td></tr>`;
   }
 }
+sourceFilter.addEventListener('change', () => renderRows());
 main();
 </script>
 </body>
