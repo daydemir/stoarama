@@ -87,6 +87,9 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 	if strings.TrimSpace(cfg.EmailProvider) == "" || strings.EqualFold(strings.TrimSpace(cfg.EmailProvider), "log") {
 		log.Printf("recording supervisor warning: email provider=%q; alerts will not be delivered externally", defaultString(strings.TrimSpace(cfg.EmailProvider), "log"))
 	}
+	if !cfg.StreamAlertsEnabled {
+		log.Printf("recording supervisor info: alert email delivery disabled by STREAM_ALERTS_ENABLED=false")
+	}
 
 	runOnce := func() {
 		items, err := fetchRecordingSupervisionItems(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), *limit)
@@ -94,16 +97,19 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 			log.Printf("recording supervisor fetch error: %v", err)
 			return
 		}
-		recipients, err := loadSupervisorRecipients(ctx, pool, cfg)
-		if err != nil {
-			log.Printf("recording supervisor recipient load error: %v", err)
-			return
-		}
-		if len(recipients) == 0 {
-			log.Printf("recording supervisor warning: no alert recipients configured; set STREAM_ALERTS_RECIPIENTS or add an active verified admin")
-		}
 		if err := resolveInactiveSupervisorIncidents(ctx, pool); err != nil {
 			log.Printf("recording supervisor resolve inactive incidents: %v", err)
+		}
+		var recipients []string
+		if cfg.StreamAlertsEnabled {
+			recipients, err = loadSupervisorRecipients(ctx, pool, cfg)
+			if err != nil {
+				log.Printf("recording supervisor recipient load error: %v", err)
+				return
+			}
+			if len(recipients) == 0 {
+				log.Printf("recording supervisor warning: no alert recipients configured; set STREAM_ALERTS_RECIPIENTS or add an active verified admin")
+			}
 		}
 		for _, item := range items {
 			state := strings.TrimSpace(fmt.Sprint(item["supervision_state"]))
@@ -126,7 +132,7 @@ func runRecordingSupervisorLoop(ctx context.Context, cfg config.Config, args []s
 				log.Printf("recording supervisor upsert incident stream_id=%d: %v", streamID, err)
 				continue
 			}
-			if update.ShouldNotify && len(recipients) > 0 {
+			if cfg.StreamAlertsEnabled && update.ShouldNotify && len(recipients) > 0 {
 				notified := false
 				for _, addr := range recipients {
 					deliveryID, deliveryErr := createAlertDeliveryAttempt(ctx, pool, update.IncidentID, item, addr)
