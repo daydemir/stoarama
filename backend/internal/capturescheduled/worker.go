@@ -204,8 +204,9 @@ func (w *Worker) processJob(ctx context.Context, job captureapi.CaptureJob, rs c
 		w.failJob(ctx, job, effective, "", err, nextDelaySec)
 		return
 	}
-	segmentCtx, cancel := context.WithTimeout(ctx, capture.SegmentCaptureTimeout())
-	seg, err := capture.CaptureSegment(segmentCtx, resolved.URL)
+	segmentDuration := time.Duration(rs.ClipDurationSec) * time.Second
+	segmentCtx, cancel := context.WithTimeout(ctx, capture.SegmentCaptureTimeout(segmentDuration))
+	seg, err := capture.CaptureSegment(segmentCtx, resolved.URL, segmentDuration)
 	cancel()
 	if err != nil {
 		w.failJob(ctx, job, effective, resolved.URL, err, nextDelaySec)

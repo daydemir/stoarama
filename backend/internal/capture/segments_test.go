@@ -3,10 +3,11 @@ package capture
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4")
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", DefaultSegmentDuration)
 	joined := strings.Join(args, " ")
 
 	for _, unwanted := range []string{
@@ -46,6 +47,14 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 		if strings.Contains(joined, unwanted) {
 			t.Fatalf("segment capture should not transcode with %q, got args: %s", unwanted, joined)
 		}
+	}
+}
+
+func TestBuildFFmpegSegmentArgsUsesRequestedDuration(t *testing.T) {
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", 90*time.Second)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-t 90") {
+		t.Fatalf("expected 90s segment duration in args: %s", joined)
 	}
 }
 

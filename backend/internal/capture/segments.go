@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	SegmentTargetFPS = 30
-	SegmentDuration  = 30 * time.Second
+	SegmentTargetFPS       = 30
+	DefaultSegmentDuration = 30 * time.Second
 )
 
 type Segment struct {
@@ -48,13 +48,16 @@ type SegmentThumbnail struct {
 	Height    int
 }
 
-func SegmentCaptureTimeout() time.Duration {
-	return SegmentDuration + 90*time.Second
+func SegmentCaptureTimeout(duration time.Duration) time.Duration {
+	return duration + 90*time.Second
 }
 
-func CaptureSegment(ctx context.Context, sourceURL string) (Segment, error) {
+func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duration) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
+	}
+	if duration <= 0 {
+		return Segment{}, fmt.Errorf("segment duration must be > 0")
 	}
 
 	tmpDir, err := os.MkdirTemp("", "capture-segment-*")
@@ -64,7 +67,7 @@ func CaptureSegment(ctx context.Context, sourceURL string) (Segment, error) {
 
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
-	args := buildFFmpegSegmentArgs(sourceURL, outPath)
+	args := buildFFmpegSegmentArgs(sourceURL, outPath, duration)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -86,7 +89,7 @@ func CaptureSegment(ctx context.Context, sourceURL string) (Segment, error) {
 
 	meta, metaErr := probeSegment(ctx, outPath)
 	endAt := time.Now().UTC()
-	durationMs := int64(SegmentDuration / time.Millisecond)
+	durationMs := int64(duration / time.Millisecond)
 	videoCodec := "h264"
 	audioCodec := ""
 	audioPresent := false
@@ -136,8 +139,8 @@ func CleanupSegment(seg Segment) {
 	_ = os.RemoveAll(filepath.Dir(seg.Path))
 }
 
-func buildFFmpegSegmentArgs(sourceURL string, outPath string) []string {
-	seconds := strconv.FormatFloat(SegmentDuration.Seconds(), 'f', -1, 64)
+func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Duration) []string {
+	seconds := strconv.FormatFloat(duration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
 		"-nostdin",
