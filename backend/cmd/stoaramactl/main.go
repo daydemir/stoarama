@@ -3733,7 +3733,7 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 			if !settings.IsAllowedClipDurationSec(*clipDurationSec) {
 				log.Fatalf("--clip-duration-sec must be 30 or 90")
 			}
-			payload := mustAPIRequest(ctx, http.MethodPut, apiURL, token, "/api/v1/dashboard/recording/settings", map[string]any{
+			payload := mustAPIRequest(ctx, http.MethodPut, apiURL, token, "/api/v1/recording/settings", map[string]any{
 				"clip_duration_sec":       *clipDurationSec,
 				"sample_interval_min_sec": settings.DefaultSampleIntervalMinSec,
 				"sample_interval_max_sec": settings.DefaultSampleIntervalMaxSec,
@@ -3747,23 +3747,13 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 				payload["clip_duration_sec"], payload["sample_interval_min_sec"], payload["sample_interval_max_sec"], payload["stale_grace_sec"], payload["updated_at"])
 			return
 		}
-		client, err := captureapi.NewClient(captureapi.ClientConfig{
-			BaseURL:  apiURL,
-			APIToken: token,
-		})
-		if err != nil {
-			log.Fatalf("init capture api client: %v", err)
-		}
-		rs, err := client.GetRecordingSettings(ctx)
-		if err != nil {
-			log.Fatalf("get recording settings: %v", err)
-		}
+		payload := mustAPIGet(ctx, apiURL, token, "/api/v1/dashboard/recording/settings")
 		if *asJSON {
-			printJSON(rs)
+			printJSON(payload)
 			return
 		}
 		fmt.Printf("clip_duration_sec=%v sample_interval=%v-%vs stale_grace_sec=%v updated_at=%v\n",
-			rs.ClipDurationSec, rs.SampleIntervalMinSec, rs.SampleIntervalMaxSec, rs.StaleGraceSec, rs.UpdatedAt)
+			payload["clip_duration_sec"], payload["sample_interval_min_sec"], payload["sample_interval_max_sec"], payload["stale_grace_sec"], payload["updated_at"])
 	case "status":
 		fs := flag.NewFlagSet("recording status", flag.ExitOnError)
 		streamID := fs.Int64("id", 0, "optional stream id")

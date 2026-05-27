@@ -294,6 +294,7 @@ func (s *Server) router() http.Handler {
 			worker.Use(s.requireServiceOrLocalRecorderNodeAuth)
 
 			worker.Get("/recording/settings", s.handleServiceRecordingSettingsGet)
+			worker.Put("/recording/settings", s.handleDashboardRecordingSettingsPut)
 			worker.Get("/service/recording/assignments", s.handleRecordingAssignmentsList)
 			worker.Post("/recording/servers/heartbeat", s.handleRecordingServerHeartbeat)
 			worker.Post("/recording/servers/stopped", s.handleRecordingServerStopped)
