@@ -38,6 +38,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/settings"
 	"github.com/daydemir/stoarama/backend/internal/storage"
 )
 
@@ -107,8 +108,8 @@ func usage() {
 	  stoaramactl capture runtime list [--status running|unsupported|error] [--limit 200] [--json]
 	  stoaramactl capture runtime show --id N [--json]
 	  stoaramactl capture runtime reset --id N
-	  stoaramactl archive mp4-to-glacier bucket-create [--aws-profile personal --aws-bucket stoarama-deep-archive-000000000000 --apply]
-	  stoaramactl archive mp4-to-glacier manifest --out manifest.jsonl [--aws-bucket stoarama-deep-archive-000000000000 --limit 0]
+	  stoaramactl archive mp4-to-glacier bucket-create [--aws-profile personal --aws-bucket stoarama-archives --apply]
+	  stoaramactl archive mp4-to-glacier manifest --out manifest.jsonl [--aws-bucket stoarama-archives --limit 0]
 	  stoaramactl archive mp4-to-glacier copy --manifest manifest.jsonl [--aws-profile personal --apply]
 	  stoaramactl archive mp4-to-glacier verify --manifest manifest.jsonl [--aws-profile personal --apply]
 	  stoaramactl archive mp4-to-glacier delete-r2 --manifest manifest.jsonl [--apply]
@@ -165,7 +166,7 @@ func usage() {
 	  stoaramactl pipelines set --stream-id N --pipeline-id P --enabled=true|false [--updated-by stoaramactl --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording enable --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording disable --id N [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording settings [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl recording settings [--clip-duration-sec 30|90] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording status [--id N --hours 24 --runs-limit 100 --events-limit 100] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording runs [--stream-id N --limit 100 --hours 24] [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recording queue [--hours 24] [--backend-api-url URL --api-token TOKEN]
@@ -854,6 +855,7 @@ func printDiscoveryUsage() {
 
 func printRecordingUsage() {
 	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples|reconcile|supervisor> ...\n")
+	fmt.Print("stoaramactl recording settings [--clip-duration-sec 30|90] [--backend-api-url URL --api-token TOKEN]\n")
 }
 
 func isGlobalPlaylistTag(line string) bool {
@@ -2030,7 +2032,7 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 	case "metadata-audit":
 		runStreamMetadataAudit(ctx, cfg, args[1:])
 	case "recording-interval":
-		log.Fatalf("streams recording-interval is removed; sampled clip recording is fixed at 30s clips every 4-8 minutes")
+		log.Fatalf("streams recording-interval is removed; sampled clip recording uses service-wide clip duration every 4-8 minutes")
 	case "set-capture":
 		fs := flag.NewFlagSet("streams set-capture", flag.ExitOnError)
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
@@ -3700,7 +3702,7 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 	}
 	switch args[0] {
 	case "interval":
-		log.Fatalf("recording interval is removed; sampled clip recording is fixed at 30s clips every 4-8 minutes")
+		log.Fatalf("recording interval is removed; sampled clip recording uses service-wide clip duration every 4-8 minutes")
 	case "enable", "disable":
 		fs := flag.NewFlagSet("recording "+args[0], flag.ExitOnError)
 		streamID := fs.Int64("id", 0, "stream id")
@@ -3722,15 +3724,46 @@ func runRecording(ctx context.Context, cfg config.Config, args []string) {
 		fs := flag.NewFlagSet("recording settings", flag.ExitOnError)
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
+		clipDurationSec := fs.Int("clip-duration-sec", 0, "set clip duration seconds; allowed values: 30, 90")
 		asJSON := fs.Bool("json", false, "print JSON")
 		_ = fs.Parse(args[1:])
-		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/dashboard/recording/settings")
+		apiURL := strings.TrimSpace(*backendAPIURL)
+		token := strings.TrimSpace(*apiToken)
+		if *clipDurationSec != 0 {
+			if !settings.IsAllowedClipDurationSec(*clipDurationSec) {
+				log.Fatalf("--clip-duration-sec must be 30 or 90")
+			}
+			payload := mustAPIRequest(ctx, http.MethodPut, apiURL, token, "/api/v1/dashboard/recording/settings", map[string]any{
+				"clip_duration_sec":       *clipDurationSec,
+				"sample_interval_min_sec": settings.DefaultSampleIntervalMinSec,
+				"sample_interval_max_sec": settings.DefaultSampleIntervalMaxSec,
+				"stale_grace_sec":         settings.DefaultSampleStaleGraceSec,
+			})
+			if *asJSON {
+				printJSON(payload)
+				return
+			}
+			fmt.Printf("clip_duration_sec=%v sample_interval=%v-%vs stale_grace_sec=%v updated_at=%v\n",
+				payload["clip_duration_sec"], payload["sample_interval_min_sec"], payload["sample_interval_max_sec"], payload["stale_grace_sec"], payload["updated_at"])
+			return
+		}
+		client, err := captureapi.NewClient(captureapi.ClientConfig{
+			BaseURL:  apiURL,
+			APIToken: token,
+		})
+		if err != nil {
+			log.Fatalf("init capture api client: %v", err)
+		}
+		rs, err := client.GetRecordingSettings(ctx)
+		if err != nil {
+			log.Fatalf("get recording settings: %v", err)
+		}
 		if *asJSON {
-			printJSON(payload)
+			printJSON(rs)
 			return
 		}
 		fmt.Printf("clip_duration_sec=%v sample_interval=%v-%vs stale_grace_sec=%v updated_at=%v\n",
-			payload["clip_duration_sec"], payload["sample_interval_min_sec"], payload["sample_interval_max_sec"], payload["stale_grace_sec"], payload["updated_at"])
+			rs.ClipDurationSec, rs.SampleIntervalMinSec, rs.SampleIntervalMaxSec, rs.StaleGraceSec, rs.UpdatedAt)
 	case "status":
 		fs := flag.NewFlagSet("recording status", flag.ExitOnError)
 		streamID := fs.Int64("id", 0, "optional stream id")

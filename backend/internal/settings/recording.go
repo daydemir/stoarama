@@ -11,6 +11,7 @@ import (
 const (
 	DefaultRecordingIntervalSec  = 1
 	DefaultClipDurationSec       = 30
+	ExtendedClipDurationSec      = 90
 	DefaultSampleIntervalMinSec  = 4 * 60
 	DefaultSampleIntervalMaxSec  = 8 * 60
 	DefaultSampleStaleGraceSec   = 5 * 60
@@ -49,19 +50,23 @@ func GetRecordingSettings(ctx context.Context, q queryRower) (RecordingSettings,
 }
 
 func (s RecordingSettings) Validate() error {
-	if s.ClipDurationSec != DefaultClipDurationSec {
+	if !IsAllowedClipDurationSec(s.ClipDurationSec) {
 		return fmt.Errorf("invalid clip duration in DB: %d", s.ClipDurationSec)
 	}
-	if s.SampleIntervalMinSec <= 0 {
+	if s.SampleIntervalMinSec != DefaultSampleIntervalMinSec {
 		return fmt.Errorf("invalid sample interval min in DB: %d", s.SampleIntervalMinSec)
 	}
-	if s.SampleIntervalMaxSec < s.SampleIntervalMinSec {
-		return fmt.Errorf("invalid sample interval max in DB: %d < %d", s.SampleIntervalMaxSec, s.SampleIntervalMinSec)
+	if s.SampleIntervalMaxSec != DefaultSampleIntervalMaxSec {
+		return fmt.Errorf("invalid sample interval max in DB: %d", s.SampleIntervalMaxSec)
 	}
-	if s.StaleGraceSec < 0 {
+	if s.StaleGraceSec != DefaultSampleStaleGraceSec {
 		return fmt.Errorf("invalid stale grace in DB: %d", s.StaleGraceSec)
 	}
 	return nil
+}
+
+func IsAllowedClipDurationSec(v int) bool {
+	return v == DefaultClipDurationSec || v == ExtendedClipDurationSec
 }
 
 func SetRecordingSamplingPolicy(ctx context.Context, q queryRower, policy RecordingSettings) (RecordingSettings, error) {
