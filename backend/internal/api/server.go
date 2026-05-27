@@ -7715,6 +7715,7 @@ type dashboardStreamCaptureSample struct {
 	SegmentStartAt       time.Time `json:"segment_start_at"`
 	SegmentEndAt         time.Time `json:"segment_end_at"`
 	ObjectKey            string    `json:"object_key"`
+	ArchiveStatus        string    `json:"archive_status"`
 	DownloadURL          string    `json:"download_url,omitempty"`
 	ThumbnailObjectKey   *string   `json:"thumbnail_object_key,omitempty"`
 	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
@@ -8046,6 +8047,7 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 				seg.segment_end_at,
 				seg.segment_end_at AS captured_at,
 				mo.object_key,
+				COALESCE(mo.archive_status, 'none') AS archive_status,
 				thumb.object_key AS thumbnail_object_key
 			FROM day_bounds db
 			JOIN LATERAL (
@@ -8062,7 +8064,7 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 			JOIN media_objects mo ON mo.id=seg.media_object_id
 			LEFT JOIN media_objects thumb ON thumb.id=seg.thumbnail_media_object_id
 		)
-		SELECT day, segment_id, segment_start_at, segment_end_at, captured_at, object_key, thumbnail_object_key
+		SELECT day, segment_id, segment_start_at, segment_end_at, captured_at, object_key, archive_status, thumbnail_object_key
 		FROM picked
 		ORDER BY day ASC
 	`, id, selectedDays)
@@ -8076,12 +8078,12 @@ func (s *Server) handleDashboardStreamCaptureSamples(w http.ResponseWriter, r *h
 	for rows.Next() {
 		var day time.Time
 		var sample dashboardStreamCaptureSample
-		if err := rows.Scan(&day, &sample.SegmentID, &sample.SegmentStartAt, &sample.SegmentEndAt, &sample.CapturedAt, &sample.ObjectKey, &sample.ThumbnailObjectKey); err != nil {
+		if err := rows.Scan(&day, &sample.SegmentID, &sample.SegmentStartAt, &sample.SegmentEndAt, &sample.CapturedAt, &sample.ObjectKey, &sample.ArchiveStatus, &sample.ThumbnailObjectKey); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan stream capture sample: %v", err))
 			return
 		}
 		sample.Day = day.UTC().Format("2006-01-02")
-		if sample.ObjectKey != "" {
+		if sample.ObjectKey != "" && !model.IsSourceDeletedArchiveStatus(sample.ArchiveStatus) {
 			if url, err := s.r2.PresignGet(r.Context(), sample.ObjectKey, s.cfg.R2SignGetTTL); err == nil {
 				sample.DownloadURL = url
 			}

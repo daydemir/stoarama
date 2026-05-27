@@ -398,7 +398,6 @@ func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 	if opts.RequireDownloadable {
 		where = append(where, "cs.media_object_id IS NOT NULL")
 		where = append(where, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL")
-		where = append(where, "mo.archive_status <> 'source_deleted'")
 	}
 	if opts.BeforeSegmentStartAt != nil && opts.BeforeID > 0 {
 		args = append(args, opts.BeforeSegmentStartAt.UTC(), opts.BeforeID)
