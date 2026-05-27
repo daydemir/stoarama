@@ -12,6 +12,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type Client struct {
@@ -32,6 +33,13 @@ type Config struct {
 type ObjectHead struct {
 	ETag      string
 	SizeBytes int64
+}
+
+type ObjectInfo struct {
+	Key          string
+	ETag         string
+	SizeBytes    int64
+	LastModified time.Time
 }
 
 func New(ctx context.Context, cfg Config) (*Client, error) {
@@ -149,6 +157,66 @@ func (c *Client) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("open object %s: %w", key, err)
 	}
 	return out.Body, nil
+}
+
+func (c *Client) ListPrefix(ctx context.Context, prefix string, limit int, fn func(ObjectInfo) error) error {
+	var token *string
+	seen := 0
+	for {
+		out, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return fmt.Errorf("list prefix %s: %w", prefix, err)
+		}
+		for _, obj := range out.Contents {
+			info := ObjectInfo{
+				Key:          aws.ToString(obj.Key),
+				ETag:         cleanETag(aws.ToString(obj.ETag)),
+				SizeBytes:    aws.ToInt64(obj.Size),
+				LastModified: aws.ToTime(obj.LastModified),
+			}
+			if err := fn(info); err != nil {
+				return err
+			}
+			seen++
+			if limit > 0 && seen >= limit {
+				return nil
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return nil
+		}
+		token = out.NextContinuationToken
+	}
+}
+
+func (c *Client) DeleteObjects(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	objects := make([]types.ObjectIdentifier, 0, len(keys))
+	for _, key := range keys {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			return fmt.Errorf("delete object key is empty")
+		}
+		objects = append(objects, types.ObjectIdentifier{Key: aws.String(trimmed)})
+	}
+	out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(c.bucket),
+		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+	})
+	if err != nil {
+		return fmt.Errorf("delete objects: %w", err)
+	}
+	if len(out.Errors) > 0 {
+		first := out.Errors[0]
+		return fmt.Errorf("delete object %s: %s %s", aws.ToString(first.Key), aws.ToString(first.Code), aws.ToString(first.Message))
+	}
+	return nil
 }
 
 func cleanETag(v string) string {

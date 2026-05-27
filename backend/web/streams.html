@@ -1921,6 +1921,7 @@
 	            <th data-sort-key="name">Stream</th>
 	            <th data-sort-key="location_city">Location</th>
 	            <th data-sort-key="recording_state">Recording</th>
+	            <th data-sort-key="recorded_total_hours">Coverage</th>
 	            <th data-sort-key="captures_success" id="streamsCapturesHeader">Captures</th>
 	            <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
 	            <th data-sort-key="tags_count">Tags</th>
@@ -3196,6 +3197,26 @@ function peoplePerInferenceMetric(row) {
   };
 }
 
+function recordedCoverageMetric(row) {
+  const hours = Number(row && row.recorded_total_hours);
+  const segments = Number(row && row.recorded_success_segments);
+  const archivedBytes = Number(row && row.archived_mp4_size_bytes);
+  const sourceDeletedBytes = Number(row && row.source_deleted_mp4_size_bytes);
+  const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 0;
+  const safeSegments = Number.isFinite(segments) && segments > 0 ? Math.floor(segments) : 0;
+  const hoursText = safeHours >= 100 ? `${Math.round(safeHours)}h` : safeHours > 0 ? `${safeHours.toFixed(1)}h` : '-';
+  const lastText = row && row.recorded_last_segment_at ? formatDateTimeShort(row.recorded_last_segment_at) : 'no successful clips';
+  const archiveText = Number.isFinite(sourceDeletedBytes) && sourceDeletedBytes > 0
+    ? ` · ${formatBytes(sourceDeletedBytes)} archived`
+    : Number.isFinite(archivedBytes) && archivedBytes > 0
+      ? ` · ${formatBytes(archivedBytes)} copied`
+      : '';
+  return {
+    hoursText,
+    detailText: `${safeSegments} clips · ${lastText}${archiveText}`,
+  };
+}
+
 function debounce(fn, ms) {
   let t = null;
   return (...args) => {
@@ -4328,8 +4349,15 @@ function renderDetailClips(items) {
     const duration = Number(item.duration_sec || 0) || Number(item.duration_ms || 0) / 1000;
     const format = String(item.mime_type || item.format || 'clip');
     const size = Number(item.size_bytes || 0);
-    const previewURL = String(item.preview_url || item.thumbnail_url || item.download_url || '');
-    const downloadURL = String(item.download_url || '');
+    const archiveStatus = String(item.archive_status || 'none');
+    const archived = archiveStatus === 'source_deleted';
+    const previewURL = String(item.preview_url || item.thumbnail_url || item.thumbnail_download_url || item.download_url || '');
+    const downloadURL = archived ? '' : String(item.download_url || '');
+    const downloadCell = archived
+      ? '<span class="tag tag-warn">Glacier Deep Archive</span>'
+      : downloadURL
+        ? `<a href="${esc(downloadURL)}" target="_blank" rel="noopener noreferrer">Direct</a>`
+        : '<span class="muted fs11">prepare batch</span>';
     return `
       <tr>
         <td><input type="checkbox" data-clip-id="${Number(item.id || 0)}" /></td>
@@ -4338,7 +4366,7 @@ function renderDetailClips(items) {
         <td class="mono fs11">${esc(format)}</td>
         <td class="mono fs11">${size > 0 ? esc(formatBytes(size)) : '-'}</td>
         <td>${previewURL ? `<a href="${esc(previewURL)}" target="_blank" rel="noopener noreferrer">Open</a>` : '<span class="muted fs11">-</span>'}</td>
-        <td>${downloadURL ? `<a href="${esc(downloadURL)}" target="_blank" rel="noopener noreferrer">Direct</a>` : '<span class="muted fs11">prepare batch</span>'}</td>
+        <td>${downloadCell}</td>
       </tr>
     `;
   }).join('');
@@ -6728,7 +6756,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="10" style="padding:20px;">
+        <td colspan="11" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -6752,6 +6780,7 @@ function renderStreamRows() {
     const streamName = latinizedLabelParts(s.name);
     const captureRate = fmtPct(row.captures_success, row.captures_total);
     const latestCap = row.latest_captured_at ? formatDateTimeShort(row.latest_captured_at) : '-';
+    const coverageMetric = recordedCoverageMetric(row);
     const recHtml = renderRecordingToggleControl(s);
     const mode = String(s.capture_type || '-');
     const captureFamily = formatCaptureFamilyLabel(s.capture_family);
@@ -6774,6 +6803,12 @@ function renderStreamRows() {
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
       <td>${recHtml}</td>
+      <td>
+        <div class="stack fs11 mono">
+          <span>${esc(coverageMetric.hoursText)}</span>
+          <span class="muted fs10">${esc(coverageMetric.detailText)}</span>
+        </div>
+      </td>
       <td>
         <div class="stack fs11 mono">
           <span>${row.captures_success}/${row.captures_total} <span class="muted">(${captureRate})</span></span>
@@ -6814,7 +6849,7 @@ async function loadStreams(opts = {}) {
   if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
   localStorage.setItem('streamPageSize', String(streamPageSize));
 
-  setTableLoadingRow(streamRowsEl, 10, 'Loading streams...');
+  setTableLoadingRow(streamRowsEl, 11, 'Loading streams...');
   const params = buildStreamFilterParams();
   params.set('limit', String(streamPageSize));
   params.set('offset', String((streamPage - 1) * streamPageSize));

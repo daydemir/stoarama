@@ -89,6 +89,8 @@ func main() {
 		runRecording(ctx, cfg, os.Args[2:])
 	case "servers":
 		runServers(ctx, cfg, os.Args[2:])
+	case "archive":
+		runArchive(ctx, cfg, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -105,6 +107,12 @@ func usage() {
 	  stoaramactl capture runtime list [--status running|unsupported|error] [--limit 200] [--json]
 	  stoaramactl capture runtime show --id N [--json]
 	  stoaramactl capture runtime reset --id N
+	  stoaramactl archive mp4-to-glacier bucket-create [--aws-profile personal --aws-bucket stoarama-deep-archive-000000000000 --apply]
+	  stoaramactl archive mp4-to-glacier manifest --out manifest.jsonl [--aws-bucket stoarama-deep-archive-000000000000 --limit 0]
+	  stoaramactl archive mp4-to-glacier copy --manifest manifest.jsonl [--aws-profile personal --apply]
+	  stoaramactl archive mp4-to-glacier verify --manifest manifest.jsonl [--aws-profile personal --apply]
+	  stoaramactl archive mp4-to-glacier delete-r2 --manifest manifest.jsonl [--apply]
+	  stoaramactl archive mp4-to-glacier status [--json]
 	  stoaramactl streams list [--recording-state off|on --capture-type TYPE --tags a,b --limit 200]
 	  stoaramactl streams detail (--id N | --slug S) [--pipeline-id P --results-limit 10 --detections-limit 50]
 	  stoaramactl streams page-load --id N [--recent-limit 24 --include-thumbnails=true --include-coverage --include-inference --timeout-sec 20 --json]
@@ -837,7 +845,7 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 }
 
 func printStreamsUsage() {
-	fmt.Print("stoaramactl streams <list|detail|page-load|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|cleanup-location-tags|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service> ...\n")
+	fmt.Print("stoaramactl streams <list|detail|page-load|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|cleanup-location-tags|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service|recording-state-bulk> ...\n")
 }
 
 func printDiscoveryUsage() {
@@ -1261,6 +1269,8 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		city := fs.String("city", "", "optional city filter")
 		limit := fs.Int("limit", 200, "row limit")
 		offset := fs.Int("offset", 0, "row offset")
+		sortBy := fs.String("sort-by", "", "sort key")
+		sortDir := fs.String("sort-dir", "", "sort direction asc|desc")
 		asJSON := fs.Bool("json", false, "print JSON")
 		_ = fs.Parse(args[1:])
 		if *limit <= 0 || *limit > 2000 {
@@ -1304,6 +1314,12 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		}
 		if v := strings.TrimSpace(*city); v != "" {
 			q.Set("city", v)
+		}
+		if v := strings.TrimSpace(*sortBy); v != "" {
+			q.Set("sort_by", v)
+		}
+		if v := strings.TrimSpace(*sortDir); v != "" {
+			q.Set("sort_dir", v)
 		}
 		path := "/api/v1/dashboard/streams?" + q.Encode()
 		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
@@ -2055,6 +2071,8 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		runStreamsRepairCanonicalCapture(ctx, cfg, args[1:])
 	case "recording-state-service":
 		runStreamsRecordingStateService(ctx, cfg, args[1:])
+	case "recording-state-bulk":
+		runStreamsRecordingStateBulk(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown streams subcommand: %s", sub)
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/storage"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -353,6 +354,11 @@ type captureSegmentListItem struct {
 	ThumbnailObjectKey   *string   `json:"thumbnail_object_key,omitempty"`
 	ThumbnailMIMEType    *string   `json:"thumbnail_mime_type,omitempty"`
 	ThumbnailSizeBytes   *int64    `json:"thumbnail_size_bytes,omitempty"`
+	ArchiveStatus        string    `json:"archive_status"`
+	ArchiveBucket        string    `json:"archive_bucket,omitempty"`
+	ArchiveObjectKey     string    `json:"archive_object_key,omitempty"`
+	ArchiveStorageClass  string    `json:"archive_storage_class,omitempty"`
+	ArchiveSizeBytes     int64     `json:"archive_size_bytes,omitempty"`
 	CreatedAt            time.Time `json:"created_at"`
 	DownloadURL          string    `json:"download_url,omitempty"`
 	ThumbnailDownloadURL string    `json:"thumbnail_download_url,omitempty"`
@@ -392,6 +398,7 @@ func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 	if opts.RequireDownloadable {
 		where = append(where, "cs.media_object_id IS NOT NULL")
 		where = append(where, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL")
+		where = append(where, "mo.archive_status <> 'source_deleted'")
 	}
 	if opts.BeforeSegmentStartAt != nil && opts.BeforeID > 0 {
 		args = append(args, opts.BeforeSegmentStartAt.UTC(), opts.BeforeID)
@@ -451,6 +458,11 @@ func (s *Server) queryCaptureSegments(ctx context.Context, opts captureSegmentQu
 			tmo.object_key,
 			tmo.mime_type,
 			tmo.size_bytes,
+			COALESCE(mo.archive_status, 'none'),
+			COALESCE(mo.archive_bucket, ''),
+			COALESCE(mo.archive_object_key, ''),
+			COALESCE(mo.archive_storage_class, ''),
+			COALESCE(mo.archive_size_bytes, 0),
 			cs.created_at
 		FROM capture_segments cs
 		LEFT JOIN media_objects mo ON mo.id = cs.media_object_id
@@ -492,11 +504,16 @@ func (s *Server) queryCaptureSegments(ctx context.Context, opts captureSegmentQu
 			&it.ThumbnailObjectKey,
 			&it.ThumbnailMIMEType,
 			&it.ThumbnailSizeBytes,
+			&it.ArchiveStatus,
+			&it.ArchiveBucket,
+			&it.ArchiveObjectKey,
+			&it.ArchiveStorageClass,
+			&it.ArchiveSizeBytes,
 			&it.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan capture segment: %w", err)
 		}
-		if opts.IncludeDownloadURL && it.ObjectKey != nil && strings.TrimSpace(*it.ObjectKey) != "" {
+		if opts.IncludeDownloadURL && !model.IsSourceDeletedArchiveStatus(it.ArchiveStatus) && it.ObjectKey != nil && strings.TrimSpace(*it.ObjectKey) != "" {
 			if url, err := s.r2.PresignGet(ctx, *it.ObjectKey, s.cfg.R2SignGetTTL); err == nil {
 				it.DownloadURL = url
 			}

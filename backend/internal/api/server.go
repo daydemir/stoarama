@@ -4104,6 +4104,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		"source":                            dashboardSourceExprSQL(),
 		"youtube_channel":                   fmt.Sprintf("COALESCE(%s, '')", dashboardYouTubeChannelExprSQL()),
 		"recording_state":                   "s.recording_state",
+		"recorded_total_hours":              "(COALESCE(rc.recorded_success_duration_ms, 0)::double precision / 3600000.0)",
 		"mode":                              "s.capture_type",
 		"runtime_status":                    "COALESCE(rt.status, '')",
 		"tags_count":                        "COALESCE(array_length(s.tags, 1), 0)",
@@ -4157,6 +4158,12 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		TargetFPS                     int          `json:"target_fps"`
 		ExpectedFrames60s             int64        `json:"expected_frames_60s"`
 		ExpectedCaptures60s           int64        `json:"expected_captures_60s"`
+		RecordedTotalHours            float64      `json:"recorded_total_hours"`
+		RecordedSuccessSegments       int64        `json:"recorded_success_segments"`
+		RecordedLastSegmentAt         *time.Time   `json:"recorded_last_segment_at,omitempty"`
+		R2MP4SizeBytes                int64        `json:"r2_mp4_size_bytes"`
+		ArchivedMP4SizeBytes          int64        `json:"archived_mp4_size_bytes"`
+		SourceDeletedMP4SizeBytes     int64        `json:"source_deleted_mp4_size_bytes"`
 		LossRatePct                   float64      `json:"loss_rate_pct"`
 		FreshnessSec                  *int64       `json:"freshness_sec,omitempty"`
 		RecordingHealth               string       `json:"recording_health"`
@@ -4169,6 +4176,19 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 				SELECT s.id
 				FROM streams s
 				WHERE %s
+			), recorded_coverage AS (
+				SELECT
+					cs.stream_id,
+					COALESCE(SUM(cs.duration_ms) FILTER (WHERE cs.capture_status='success'), 0)::bigint AS recorded_success_duration_ms,
+					COUNT(*) FILTER (WHERE cs.capture_status='success')::bigint AS recorded_success_segments,
+					MAX(cs.segment_end_at) FILTER (WHERE cs.capture_status='success') AS recorded_last_segment_at,
+					COALESCE(SUM(mo.size_bytes) FILTER (WHERE cs.capture_status='success' AND COALESCE(mo.archive_status, 'none') <> 'source_deleted'), 0)::bigint AS r2_mp4_size_bytes,
+					COALESCE(SUM(mo.archive_size_bytes) FILTER (WHERE cs.capture_status='success' AND mo.archive_provider='aws_s3' AND mo.archive_status IN ('copied', 'verified', 'source_deleted')), 0)::bigint AS archived_mp4_size_bytes,
+					COALESCE(SUM(mo.archive_size_bytes) FILTER (WHERE cs.capture_status='success' AND mo.archive_provider='aws_s3' AND mo.archive_status='source_deleted'), 0)::bigint AS source_deleted_mp4_size_bytes
+				FROM capture_segments cs
+				JOIN filtered_streams fs ON fs.id = cs.stream_id
+				LEFT JOIN media_objects mo ON mo.id = cs.media_object_id
+				GROUP BY cs.stream_id
 		)
 		SELECT
 			s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
@@ -4189,12 +4209,19 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			rt.last_error_text,
 			COALESCE(sis.inferenced_captures, 0)::bigint,
 			COALESCE(sis.person_detections_total, 0)::bigint,
-			COALESCE(sis.avg_people_per_inferenced_capture, 0)::double precision
+			COALESCE(sis.avg_people_per_inferenced_capture, 0)::double precision,
+			(COALESCE(rc.recorded_success_duration_ms, 0)::double precision / 3600000.0),
+			COALESCE(rc.recorded_success_segments, 0)::bigint,
+			rc.recorded_last_segment_at,
+			COALESCE(rc.r2_mp4_size_bytes, 0)::bigint,
+			COALESCE(rc.archived_mp4_size_bytes, 0)::bigint,
+			COALESCE(rc.source_deleted_mp4_size_bytes, 0)::bigint
 		FROM streams s
 		JOIN filtered_streams fs ON fs.id = s.id
 		LEFT JOIN stream_health sh ON sh.stream_id = s.id
 		LEFT JOIN stream_capture_runtime rt ON rt.stream_id = s.id
 		LEFT JOIN stream_inference_stats sis ON sis.stream_id = s.id
+		LEFT JOIN recorded_coverage rc ON rc.stream_id = s.id
 			ORDER BY %s %s NULLS LAST, s.id ASC
 			LIMIT $%d OFFSET $%d
 		`, whereSQL, orderExpr, sortDir, len(args)-1, len(args)), args...)
@@ -4212,6 +4239,10 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		var capturesTotal, capturesSuccess, capturesError int64
 		var inferencedCaptures, personDetectionsTotal int64
 		var avgPeoplePerInferencedCapture float64
+		var recordedTotalHours float64
+		var recordedSuccessSegments int64
+		var recordedLastSegmentAt *time.Time
+		var r2MP4SizeBytes, archivedMP4SizeBytes, sourceDeletedMP4SizeBytes int64
 		var runtimeStatus, runtimeMode, runtimeResolved, runtimeError *string
 		var runtimeLastFrame *time.Time
 		var runtimeErrors *int
@@ -4226,6 +4257,8 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			&capturesTotal, &capturesSuccess, &capturesError,
 			&runtimeStatus, &runtimeMode, &runtimeResolved, &runtimeLastFrame, &runtimeErrors, &runtimeError,
 			&inferencedCaptures, &personDetectionsTotal, &avgPeoplePerInferencedCapture,
+			&recordedTotalHours, &recordedSuccessSegments, &recordedLastSegmentAt,
+			&r2MP4SizeBytes, &archivedMP4SizeBytes, &sourceDeletedMP4SizeBytes,
 		); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan dashboard stream: %v", err))
 			return
@@ -4250,6 +4283,12 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			InferencedCaptures:            inferencedCaptures,
 			PersonDetectionsTotal:         personDetectionsTotal,
 			AvgPeoplePerInferencedCapture: avgPeoplePerInferencedCapture,
+			RecordedTotalHours:            recordedTotalHours,
+			RecordedSuccessSegments:       recordedSuccessSegments,
+			RecordedLastSegmentAt:         recordedLastSegmentAt,
+			R2MP4SizeBytes:                r2MP4SizeBytes,
+			ArchivedMP4SizeBytes:          archivedMP4SizeBytes,
+			SourceDeletedMP4SizeBytes:     sourceDeletedMP4SizeBytes,
 			CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
 		}
 		if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {

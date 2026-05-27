@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type RecordingState string
 
@@ -8,6 +11,92 @@ const (
 	RecordingStateOff RecordingState = "off"
 	RecordingStateOn  RecordingState = "on"
 )
+
+type StreamProvider string
+
+const (
+	StreamProviderGigaeyes StreamProvider = "GIGAEYES"
+	StreamProviderKBS      StreamProvider = "KBS"
+	StreamProviderSPATIC   StreamProvider = "SPATIC"
+	StreamProviderTOPIS    StreamProvider = "TOPIS"
+)
+
+func IsKoreaRecordingProvider(provider string) bool {
+	switch StreamProvider(strings.ToUpper(strings.TrimSpace(provider))) {
+	case StreamProviderGigaeyes, StreamProviderKBS, StreamProviderSPATIC, StreamProviderTOPIS:
+		return true
+	default:
+		return false
+	}
+}
+
+type ArchiveProvider string
+
+const (
+	ArchiveProviderNone  ArchiveProvider = "none"
+	ArchiveProviderAWSS3 ArchiveProvider = "aws_s3"
+)
+
+func ParseArchiveProvider(raw string) (ArchiveProvider, bool) {
+	switch ArchiveProvider(strings.ToLower(strings.TrimSpace(raw))) {
+	case ArchiveProviderNone:
+		return ArchiveProviderNone, true
+	case ArchiveProviderAWSS3:
+		return ArchiveProviderAWSS3, true
+	default:
+		return "", false
+	}
+}
+
+type ArchiveStatus string
+
+const (
+	ArchiveStatusNone          ArchiveStatus = "none"
+	ArchiveStatusCopied        ArchiveStatus = "copied"
+	ArchiveStatusVerified      ArchiveStatus = "verified"
+	ArchiveStatusSourceDeleted ArchiveStatus = "source_deleted"
+	ArchiveStatusError         ArchiveStatus = "error"
+)
+
+func ParseArchiveStatus(raw string) (ArchiveStatus, bool) {
+	switch ArchiveStatus(strings.ToLower(strings.TrimSpace(raw))) {
+	case ArchiveStatusNone:
+		return ArchiveStatusNone, true
+	case ArchiveStatusCopied:
+		return ArchiveStatusCopied, true
+	case ArchiveStatusVerified:
+		return ArchiveStatusVerified, true
+	case ArchiveStatusSourceDeleted:
+		return ArchiveStatusSourceDeleted, true
+	case ArchiveStatusError:
+		return ArchiveStatusError, true
+	default:
+		return "", false
+	}
+}
+
+type ArchiveStorageClass string
+
+const (
+	ArchiveStorageClassNone        ArchiveStorageClass = ""
+	ArchiveStorageClassDeepArchive ArchiveStorageClass = "DEEP_ARCHIVE"
+)
+
+func ParseArchiveStorageClass(raw string) (ArchiveStorageClass, bool) {
+	switch ArchiveStorageClass(strings.ToUpper(strings.TrimSpace(raw))) {
+	case ArchiveStorageClassNone:
+		return ArchiveStorageClassNone, true
+	case ArchiveStorageClassDeepArchive:
+		return ArchiveStorageClassDeepArchive, true
+	default:
+		return "", false
+	}
+}
+
+func IsSourceDeletedArchiveStatus(status string) bool {
+	parsed, ok := ParseArchiveStatus(status)
+	return ok && parsed == ArchiveStatusSourceDeleted
+}
 
 type Stream struct {
 	ID                     int64          `json:"id"`
