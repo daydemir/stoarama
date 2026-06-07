@@ -84,6 +84,13 @@ func fetchImage(ctx context.Context, u string) ([]byte, string, error) {
 	return b, ct, nil
 }
 
+func ffmpegBin() string {
+	if v := strings.TrimSpace(os.Getenv("FFMPEG_BIN")); v != "" {
+		return v
+	}
+	return "ffmpeg"
+}
+
 func captureWithFFmpeg(ctx context.Context, sourceURL string) ([]byte, error) {
 	tmpDir, err := os.MkdirTemp("", "capture-frame-*")
 	if err != nil {
@@ -92,7 +99,7 @@ func captureWithFFmpeg(ctx context.Context, sourceURL string) ([]byte, error) {
 	defer os.RemoveAll(tmpDir)
 	outPath := filepath.Join(tmpDir, "frame.jpg")
 	cmd := exec.CommandContext(ctx,
-		"ffmpeg",
+		ffmpegBin(),
 		"-y",
 		"-loglevel", "error",
 		"-i", sourceURL,

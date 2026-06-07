@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,11 +13,13 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
+	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/email"
 	"github.com/daydemir/stoarama/backend/internal/inferencebox"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/survey"
 )
 
 func main() {
@@ -102,6 +105,49 @@ func main() {
 					continue
 				}
 				return
+			}
+		}()
+	}
+
+	if cfg.SurveyEnabled {
+		if cfg.SurveyConcurrency <= 0 || cfg.SurveyResolveTimeoutSec <= 0 || cfg.SurveyCaptureTimeoutSec <= 0 {
+			log.Fatalf("invalid embedded survey config")
+		}
+		registry, err := capture.NewDefaultRegistry()
+		if err != nil {
+			log.Fatalf("init survey capture registry: %v", err)
+		}
+		resolveTimeout := time.Duration(cfg.SurveyResolveTimeoutSec) * time.Second
+		captureTimeout := time.Duration(cfg.SurveyCaptureTimeoutSec) * time.Second
+		go func() {
+			log.Printf(
+				"stoarama-api embedded survey scheduler enabled (one sweep/day at a randomized time) concurrency=%d",
+				cfg.SurveyConcurrency,
+			)
+			for {
+				now := time.Now().UTC()
+				startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+				next := startOfDay.Add(time.Duration(rand.Intn(86400)) * time.Second)
+				if !next.After(now) {
+					// today's randomized slot already passed; pick one tomorrow
+					next = startOfDay.Add(24*time.Hour + time.Duration(rand.Intn(86400))*time.Second)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Until(next)):
+				}
+				day := time.Now().UTC()
+				targets, err := survey.SelectTargets(ctx, pool)
+				if err != nil {
+					log.Printf("survey scheduler: select targets failed: %v", err)
+					continue
+				}
+				res := survey.RunOnce(ctx, pool, r2c, registry, targets, day, cfg.SurveyConcurrency, resolveTimeout, captureTimeout, func(streamID int64, err error) {
+					log.Printf("survey scheduler: stream %d capture failed: %v", streamID, err)
+				})
+				log.Printf("survey scheduler: day=%s total=%d success=%d skipped=%d failed=%d",
+					day.Format("2006-01-02"), res.Total, res.Success, res.Skipped, res.Failed)
 			}
 		}()
 	}

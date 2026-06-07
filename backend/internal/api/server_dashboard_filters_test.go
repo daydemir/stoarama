@@ -175,11 +175,16 @@ func TestDashboardBuildStreamWhereIgnoresDisabledFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got, want := len(where), 1; got != want {
+	// Baseline = "1=1" plus the always-on soft-prune predicate. Disabled optional
+	// filters (search/source/youtube_channel) add nothing beyond that.
+	if got, want := len(where), 2; got != want {
 		t.Fatalf("where len=%d want=%d", got, want)
 	}
 	if got, want := where[0], "1=1"; got != want {
 		t.Fatalf("where[0]=%q want=%q", got, want)
+	}
+	if got, want := where[1], "s.enabled = true AND s.excluded_flag = false"; got != want {
+		t.Fatalf("where[1]=%q want=%q", got, want)
 	}
 	if len(args) != 0 {
 		t.Fatalf("args len=%d want=0", len(args))

@@ -53,6 +53,10 @@ type Config struct {
 	InferenceBoxRetryMaxSec     int
 	BoxWorkerEmbedded           bool
 	WorkerID                    string
+	SurveyEnabled               bool
+	SurveyConcurrency           int
+	SurveyResolveTimeoutSec     int
+	SurveyCaptureTimeoutSec     int
 }
 
 func Load() (Config, error) {
@@ -101,6 +105,10 @@ func Load() (Config, error) {
 		InferenceBoxRetryMaxSec:     intEnv("BOX_WORKER_RETRY_MAX_SEC", 300),
 		BoxWorkerEmbedded:           boolEnv("BOX_WORKER_EMBEDDED", false),
 		WorkerID:                    strEnv("WORKER_ID", "capture-worker-1"),
+		SurveyEnabled:               boolEnv("SURVEY_ENABLED", false),
+		SurveyConcurrency:           intEnv("SURVEY_CONCURRENCY", 4),
+		SurveyResolveTimeoutSec:     intEnv("SURVEY_RESOLVE_TIMEOUT_SEC", 60),
+		SurveyCaptureTimeoutSec:     intEnv("SURVEY_CAPTURE_TIMEOUT_SEC", 60),
 	}
 	if cfg.R2Endpoint == "" && cfg.R2AccountID != "" {
 		cfg.R2Endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)

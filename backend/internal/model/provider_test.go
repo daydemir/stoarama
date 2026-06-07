@@ -8,7 +8,7 @@ func TestIsKoreaRecordingProvider(t *testing.T) {
 			t.Fatalf("provider %q should be preserved", provider)
 		}
 	}
-	for _, provider := range []string{"YOUTUBE", "WOLFF_EU_SQUARES", "SDOT", "BELLEVUE_TRAFFICMAP", ""} {
+	for _, provider := range []string{"YOUTUBE", "EU_SQUARES", "SDOT", "BELLEVUE_TRAFFICMAP", ""} {
 		if IsKoreaRecordingProvider(provider) {
 			t.Fatalf("provider %q should not be preserved", provider)
 		}

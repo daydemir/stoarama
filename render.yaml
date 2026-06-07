@@ -10,7 +10,21 @@ services:
     env: go
     rootDir: backend
     autoDeployTrigger: commit
-    buildCommand: go build -o bin/stoarama-api ./cmd/stoarama-api
+    # Vendor a static linux ffmpeg into bin/ during build. Render env:go has no
+    # ffmpeg on PATH, and capture.CaptureFrame shells to $FFMPEG_BIN for
+    # non-image streams (needed by the survey feature). The static build is
+    # downloaded fresh each build, extracted, and placed at bin/ffmpeg.
+    # FFMPEG_BIN below points the app at it. rootDir is backend, so bin/ and the
+    # ./bin/ffmpeg path both resolve relative to backend/.
+    buildCommand: |
+      set -euo pipefail
+      go build -o bin/stoarama-api ./cmd/stoarama-api
+      curl -fsSL -o /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+      mkdir -p /tmp/ffmpeg-extract
+      tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+      cp /tmp/ffmpeg-extract/ffmpeg bin/ffmpeg
+      chmod +x bin/ffmpeg
+      ./bin/ffmpeg -version
     startCommand: ./bin/stoarama-api
     envVars:
       - key: DATABASE_URL
@@ -65,3 +79,9 @@ services:
         value: "5"
       - key: BOX_WORKER_RETRY_MAX_SEC
         value: "300"
+      - key: FFMPEG_BIN
+        value: ./bin/ffmpeg
+      - key: SURVEY_ENABLED
+        value: "false"
+      - key: SURVEY_CONCURRENCY
+        value: "4"
