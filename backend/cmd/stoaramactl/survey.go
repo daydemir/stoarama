@@ -5,12 +5,21 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/survey"
 )
+
+// dailyGateHour returns a deterministic per-day UTC hour in [0,24) for the given
+// date, so an hourly cron can run the full sweep at a different time each day.
+func dailyGateHour(day time.Time) int {
+	d := day.UTC()
+	seed := int64(d.Year())*10000 + int64(d.Month())*100 + int64(d.Day())
+	return rand.New(rand.NewSource(seed)).Intn(24)
+}
 
 func runSurvey(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -39,10 +48,19 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 	resolveTimeoutSec := fs.Int("resolve-timeout-sec", 60, "per-stream resolve timeout seconds")
 	captureTimeoutSec := fs.Int("capture-timeout-sec", 60, "per-stream one-frame capture timeout seconds")
 	limit := fs.Int("limit", 0, "max streams to survey this run (0 = all non-pruned); useful for verifying a small sample")
+	dailyGate := fs.Bool("daily-gate", false, "for an hourly cron: only run during one per-day deterministic random UTC hour, skip otherwise (gives a different capture time each day)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
 	if *concurrency <= 0 || *resolveTimeoutSec <= 0 || *captureTimeoutSec <= 0 {
 		log.Fatalf("--concurrency, --resolve-timeout-sec, --capture-timeout-sec must all be > 0")
+	}
+	if *dailyGate {
+		now := time.Now().UTC()
+		chosen := dailyGateHour(now)
+		if now.Hour() != chosen {
+			fmt.Printf("survey run-once: skipped (daily-gate chosen_hour=%d current_hour=%d)\n", chosen, now.Hour())
+			return
+		}
 	}
 	registry, err := capture.NewDefaultRegistry()
 	if err != nil {

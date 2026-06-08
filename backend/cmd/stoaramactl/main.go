@@ -193,7 +193,7 @@ func usage() {
 	  stoaramactl servers capacity groups [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl servers capacity heartbeat --server-id ID [--capture-shared-capacity N | --execution-class-capacity CLASS=N[,CLASS=N...]] [--draining-execution-classes CLASS[,CLASS...]] [--lease-sec 45 --metadata-json JSON --backend-api-url URL --api-token TOKEN]
 	  stoaramactl servers capacity stopped --server-id ID [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl survey run-once [--limit 0 --concurrency 4 --resolve-timeout-sec 60 --capture-timeout-sec 60 --json]
+	  stoaramactl survey run-once [--limit 0 --daily-gate --concurrency 4 --resolve-timeout-sec 60 --capture-timeout-sec 60 --json]
 	  stoaramactl survey coverage [--json]
 	  stoaramactl survey soft-prune --id N [--exclude]
 	  stoaramactl survey delete-stream-captures --id N --apply

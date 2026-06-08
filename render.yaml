@@ -81,7 +81,56 @@ services:
         value: "300"
       - key: FFMPEG_BIN
         value: ./bin/ffmpeg
+      # Survey runs on the dedicated stoarama-survey cron service below, not on
+      # this web dyno (keeps the public API stable). Leave embedded survey off.
       - key: SURVEY_ENABLED
         value: "false"
       - key: SURVEY_CONCURRENCY
         value: "4"
+
+  # Daily stream survey: one JPEG per non-pruned stream per day, captured on an
+  # isolated cron instance so the heavy ffmpeg/yt-dlp work never touches the
+  # public API dyno. The cron fires hourly; --daily-gate makes the full sweep
+  # actually run during one per-day randomized UTC hour (so capture time varies
+  # day to day), and the sweep is idempotent (skips streams already captured
+  # today). Billed only while running. starter plan + concurrency 3 keeps peak
+  # memory under 512MB.
+  - type: cron
+    name: stoarama-survey
+    env: go
+    rootDir: backend
+    plan: starter
+    schedule: "0 * * * *"
+    autoDeployTrigger: commit
+    buildCommand: |
+      set -euo pipefail
+      go build -o bin/stoaramactl ./cmd/stoaramactl
+      curl -fsSL -o /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+      mkdir -p /tmp/ffmpeg-extract
+      tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+      cp /tmp/ffmpeg-extract/ffmpeg bin/ffmpeg
+      chmod +x bin/ffmpeg
+      ./bin/ffmpeg -version
+      curl -fsSL -o bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
+      chmod +x bin/yt-dlp
+      ./bin/yt-dlp --version
+    startCommand: ./bin/stoaramactl survey run-once --daily-gate --concurrency 3 --json
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stoarama-db
+          property: connectionString
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_REGION
+        value: auto
+      - key: FFMPEG_BIN
+        value: ./bin/ffmpeg
+      - key: YT_DLP_BIN
+        value: ./bin/yt-dlp
