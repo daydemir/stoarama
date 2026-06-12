@@ -35,8 +35,8 @@ func ObjectKey(streamID int64, day time.Time) string {
 	return fmt.Sprintf("survey/stream/%d/%04d-%02d-%02d.jpg", streamID, d.Year(), int(d.Month()), d.Day())
 }
 
-// SelectTargets returns all non-pruned streams (enabled=true AND
-// excluded_flag=false), independent of recording_state.
+// SelectTargets returns all streams to survey, independent of recording_state.
+// Pruning is deferred, so no exclusion filter is applied yet.
 func SelectTargets(ctx context.Context, pool *pgxpool.Pool) ([]Target, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT id,
@@ -47,7 +47,6 @@ func SelectTargets(ctx context.Context, pool *pgxpool.Pool) ([]Target, error) {
 		       COALESCE(source_family, ''),
 		       COALESCE(execution_class, '')
 		FROM streams
-		WHERE enabled = true AND excluded_flag = false
 		ORDER BY id
 	`)
 	if err != nil {
@@ -256,13 +255,11 @@ func ComputeCoverage(ctx context.Context, pool *pgxpool.Pool, day time.Time) (Co
 	var c Coverage
 	if err := pool.QueryRow(ctx, `
 		SELECT
-			(SELECT COUNT(*) FROM streams s WHERE s.enabled = true AND s.excluded_flag = false),
+			(SELECT COUNT(*) FROM streams),
 			(SELECT COUNT(*) FROM streams s
-			   WHERE s.enabled = true AND s.excluded_flag = false
-			     AND EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey')),
+			   WHERE EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey')),
 			(SELECT COUNT(*) FROM streams s
-			   WHERE s.enabled = true AND s.excluded_flag = false
-			     AND EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey'
+			   WHERE EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey'
 			                   AND (f.captured_at AT TIME ZONE 'UTC')::date = $1::date))
 	`, dateStr).Scan(&c.NonPrunedTotal, &c.WithAnySurvey, &c.WithTodaySurvey); err != nil {
 		return Coverage{}, fmt.Errorf("compute survey coverage: %w", err)
@@ -314,20 +311,4 @@ func DeleteStreamCaptures(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Clien
 		return 0, fmt.Errorf("commit survey delete tx: %w", err)
 	}
 	return len(keys), nil
-}
-
-// SoftPrune disables a stream so it is hidden from the public catalog. It is
-// reversible: enabled=false (and optionally excluded_flag=true). Returns whether
-// a row was updated.
-func SoftPrune(ctx context.Context, pool *pgxpool.Pool, streamID int64, exclude bool) (bool, error) {
-	tag, err := pool.Exec(ctx, `
-		UPDATE streams
-		SET enabled = false,
-		    excluded_flag = CASE WHEN $2 THEN true ELSE excluded_flag END
-		WHERE id = $1
-	`, streamID, exclude)
-	if err != nil {
-		return false, fmt.Errorf("soft-prune stream %d: %w", streamID, err)
-	}
-	return tag.RowsAffected() > 0, nil
 }

@@ -4026,10 +4026,6 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 
 	where := []string{"1=1"}
 	args := []any{}
-	// Soft-prune baseline: hide pruned streams from the public catalog. This is a
-	// no-op until a stream is pruned (streams.enabled defaults true,
-	// excluded_flag defaults false per 0001_init.sql).
-	where = append(where, "s.enabled = true AND s.excluded_flag = false")
 	if recordingState != nil {
 		args = append(args, string(*recordingState))
 		where = append(where, fmt.Sprintf("s.recording_state=$%d", len(args)))

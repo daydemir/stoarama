@@ -187,7 +187,6 @@ func usage() {
 	  stoaramactl servers capacity stopped --server-id ID [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl survey run-once [--limit 0 --daily-gate --concurrency 4 --resolve-timeout-sec 60 --capture-timeout-sec 60 --json]
 	  stoaramactl survey coverage [--json]
-	  stoaramactl survey soft-prune --id N [--exclude]
 	  stoaramactl survey delete-stream-captures --id N --apply
 `)
 }

@@ -23,15 +23,13 @@ func dailyGateHour(day time.Time) int {
 
 func runSurvey(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl survey <run-once|coverage|soft-prune|delete-stream-captures> ...")
+		log.Fatalf("usage: stoaramactl survey <run-once|coverage|delete-stream-captures> ...")
 	}
 	switch args[0] {
 	case "run-once":
 		runSurveyRunOnce(ctx, cfg, args[1:])
 	case "coverage":
 		runSurveyCoverage(ctx, cfg, args[1:])
-	case "soft-prune":
-		runSurveySoftPrune(ctx, cfg, args[1:])
 	case "delete-stream-captures":
 		runSurveyDeleteStreamCaptures(ctx, cfg, args[1:])
 	default:
@@ -125,28 +123,6 @@ func runSurveyCoverage(ctx context.Context, cfg config.Config, args []string) {
 	}
 	fmt.Printf("survey coverage day=%s non_pruned_total=%d with_any_survey=%d with_today_survey=%d\n",
 		day.Format("2006-01-02"), c.NonPrunedTotal, c.WithAnySurvey, c.WithTodaySurvey)
-}
-
-// runSurveySoftPrune disables a stream so it is hidden from the public catalog.
-// Reversible: enabled=false, and excluded_flag=true when --exclude is set.
-func runSurveySoftPrune(ctx context.Context, cfg config.Config, args []string) {
-	fs := flag.NewFlagSet("survey soft-prune", flag.ExitOnError)
-	id := fs.Int64("id", 0, "stream id to soft-prune")
-	exclude := fs.Bool("exclude", false, "also set excluded_flag=true")
-	_ = fs.Parse(args)
-	if *id <= 0 {
-		log.Fatalf("--id is required")
-	}
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
-	updated, err := survey.SoftPrune(ctx, pool, *id, *exclude)
-	if err != nil {
-		log.Fatalf("soft-prune stream %d: %v", *id, err)
-	}
-	if !updated {
-		log.Fatalf("stream %d not found", *id)
-	}
-	fmt.Printf("soft-pruned stream=%d exclude=%t\n", *id, *exclude)
 }
 
 // runSurveyDeleteStreamCaptures deletes a stream's survey objects from R2 and
