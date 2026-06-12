@@ -27,16 +27,16 @@ on API traffic instead of also spending CPU on background boxed-artifact work.
 
 ## Key Code Facts
 
-- [backend/cmd/stoarama-api/main.go](/Users/deniz/Build/thesis/stoarama/backend/cmd/stoarama-api/main.go):71
+- [backend/cmd/stoarama-api/main.go](backend/cmd/stoarama-api/main.go):71
   starts the embedded inference-box worker only when
   `cfg.BoxWorkerEmbedded` is true.
-- [backend/internal/config/config.go](/Users/deniz/Build/thesis/stoarama/backend/internal/config/config.go):100
+- [backend/internal/config/config.go](backend/internal/config/config.go):100
   loads `BOX_WORKER_*` settings and defaults `BOX_WORKER_EMBEDDED` to `false`.
-- [backend/internal/inferencebox/manager.go](/Users/deniz/Build/thesis/stoarama/backend/internal/inferencebox/manager.go):71
+- [backend/internal/inferencebox/manager.go](backend/internal/inferencebox/manager.go):71
   runs the background worker loop that claims `inference_box_jobs`.
-- [backend/internal/inferencebox/manager.go](/Users/deniz/Build/thesis/stoarama/backend/internal/inferencebox/manager.go):219
+- [backend/internal/inferencebox/manager.go](backend/internal/inferencebox/manager.go):219
   renders boxed images, uploads them, and marks results complete.
-- [backend/cmd/inference-box-worker/main.go](/Users/deniz/Build/thesis/stoarama/backend/cmd/inference-box-worker/main.go):21
+- [backend/cmd/inference-box-worker/main.go](backend/cmd/inference-box-worker/main.go):21
   is the standalone worker path if boxed inference should run outside the web
   API process.
 
@@ -45,9 +45,9 @@ on API traffic instead of also spending CPU on background boxed-artifact work.
 The stash hunk reviewed earlier was narrow and matched this scope:
 
 - remove the `BOX_WORKER_*` env block from
-  [render.yaml](/Users/deniz/Build/thesis/stoarama/render.yaml)
+  [render.yaml](render.yaml)
 - change `BOX_WORKER_EMBEDDED=true` to `BOX_WORKER_EMBEDDED=false` in
-  [docs/DEPLOY_RENDER.md](/Users/deniz/Build/thesis/stoarama/docs/DEPLOY_RENDER.md)
+  [docs/DEPLOY_RENDER.md](docs/DEPLOY_RENDER.md)
 
 No Go code changes were part of that proposal.
 

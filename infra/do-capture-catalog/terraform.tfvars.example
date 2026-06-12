@@ -11,7 +11,7 @@ repo_url          = "https://github.com/daydemir/stoarama.git"
 repo_ref          = "main"
 repo_clone_token  = ""
 
-backend_api_url   = "https://stoarama-api.onrender.com"
+backend_api_url   = "https://your-stoarama-api.example.com"
 backend_api_token = "replace-me"
 
 capture_shared_capacity = 10

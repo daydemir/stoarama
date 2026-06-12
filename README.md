@@ -113,4 +113,8 @@ Expected deployment shape:
 - fresh Stoarama R2 bucket configured through env vars
 - email can remain in `log` mode until custom domain and Resend are wired
 
-See [docs/DEPLOY_RENDER.md](/Users/deniz/Build/thesis/stoarama/docs/DEPLOY_RENDER.md) and [docs/ROADMAP.md](/Users/deniz/Build/thesis/stoarama/docs/ROADMAP.md).
+See [docs/DEPLOY_RENDER.md](docs/DEPLOY_RENDER.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

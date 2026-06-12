@@ -29,3 +29,7 @@ build/
 .terraform/
 *.tfstate
 *.tfstate.*
+
+# local-only artifacts (never publish)
+tmp/
+docs/HANDOFF_R2_COST_CLEANUP_2026-05-26.md

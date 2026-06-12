@@ -90,8 +90,6 @@ func main() {
 		runRecording(ctx, cfg, os.Args[2:])
 	case "servers":
 		runServers(ctx, cfg, os.Args[2:])
-	case "archive":
-		runArchive(ctx, cfg, os.Args[2:])
 	case "survey":
 		runSurvey(ctx, cfg, os.Args[2:])
 	default:
@@ -110,12 +108,6 @@ func usage() {
 	  stoaramactl capture runtime list [--status running|unsupported|error] [--limit 200] [--json]
 	  stoaramactl capture runtime show --id N [--json]
 	  stoaramactl capture runtime reset --id N
-	  stoaramactl archive mp4-to-glacier bucket-create [--aws-profile personal --aws-bucket stoarama-archives --apply]
-	  stoaramactl archive mp4-to-glacier manifest --out manifest.jsonl [--aws-bucket stoarama-archives --limit 0]
-	  stoaramactl archive mp4-to-glacier copy --manifest manifest.jsonl [--aws-profile personal --apply]
-	  stoaramactl archive mp4-to-glacier verify --manifest manifest.jsonl [--aws-profile personal --apply]
-	  stoaramactl archive mp4-to-glacier delete-r2 --manifest manifest.jsonl [--apply]
-	  stoaramactl archive mp4-to-glacier status [--json]
 	  stoaramactl streams list [--recording-state off|on --capture-type TYPE --tags a,b --limit 200]
 	  stoaramactl streams detail (--id N | --slug S) [--pipeline-id P --results-limit 10 --detections-limit 50]
 	  stoaramactl streams page-load --id N [--recent-limit 24 --include-thumbnails=true --include-coverage --include-inference --timeout-sec 20 --json]
