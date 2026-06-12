@@ -1921,7 +1921,6 @@
 	            <th data-sort-key="name">Stream</th>
 	            <th data-sort-key="location_city">Location</th>
 	            <th data-sort-key="recording_state">Recording</th>
-	            <th data-sort-key="recorded_total_hours">Coverage</th>
 	            <th data-sort-key="captures_success" id="streamsCapturesHeader">Captures</th>
 	            <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
 	            <th data-sort-key="tags_count">Tags</th>
@@ -3194,26 +3193,6 @@ function peoplePerInferenceMetric(row) {
   return {
     avgText: safeAvg.toFixed(2),
     detailText: `${safePersonTotal} person / ${safeInferenced} inferenced`,
-  };
-}
-
-function recordedCoverageMetric(row) {
-  const hours = Number(row && row.recorded_total_hours);
-  const segments = Number(row && row.recorded_success_segments);
-  const archivedBytes = Number(row && row.archived_mp4_size_bytes);
-  const sourceDeletedBytes = Number(row && row.source_deleted_mp4_size_bytes);
-  const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 0;
-  const safeSegments = Number.isFinite(segments) && segments > 0 ? Math.floor(segments) : 0;
-  const hoursText = safeHours >= 100 ? `${Math.round(safeHours)}h` : safeHours > 0 ? `${safeHours.toFixed(1)}h` : '-';
-  const lastText = row && row.recorded_last_segment_at ? formatDateTimeShort(row.recorded_last_segment_at) : 'no successful clips';
-  const archiveText = Number.isFinite(sourceDeletedBytes) && sourceDeletedBytes > 0
-    ? ` · ${formatBytes(sourceDeletedBytes)} archived`
-    : Number.isFinite(archivedBytes) && archivedBytes > 0
-      ? ` · ${formatBytes(archivedBytes)} copied`
-      : '';
-  return {
-    hoursText,
-    detailText: `${safeSegments} clips · ${lastText}${archiveText}`,
   };
 }
 
@@ -6780,7 +6759,6 @@ function renderStreamRows() {
     const streamName = latinizedLabelParts(s.name);
     const captureRate = fmtPct(row.captures_success, row.captures_total);
     const latestCap = row.latest_captured_at ? formatDateTimeShort(row.latest_captured_at) : '-';
-    const coverageMetric = recordedCoverageMetric(row);
     const recHtml = renderRecordingToggleControl(s);
     const mode = String(s.capture_type || '-');
     const captureFamily = formatCaptureFamilyLabel(s.capture_family);
@@ -6803,12 +6781,6 @@ function renderStreamRows() {
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
       <td>${recHtml}</td>
-      <td>
-        <div class="stack fs11 mono">
-          <span>${esc(coverageMetric.hoursText)}</span>
-          <span class="muted fs10">${esc(coverageMetric.detailText)}</span>
-        </div>
-      </td>
       <td>
         <div class="stack fs11 mono">
           <span>${row.captures_success}/${row.captures_total} <span class="muted">(${captureRate})</span></span>
