@@ -187,7 +187,7 @@ func TestCaptureSegmentWhereFiltersSuccessfulDownloadableClips(t *testing.T) {
 	if !strings.Contains(joined, "cs.capture_status = $3") {
 		t.Fatalf("where=%q missing capture status filter", joined)
 	}
-	if !strings.Contains(joined, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL") {
+	if !strings.Contains(joined, "cs.media_object_id IS NOT NULL") {
 		t.Fatalf("where=%q missing downloadable media filter", joined)
 	}
 	if len(args) != 3 || args[0] != int64(17205) || args[2] != "success" {

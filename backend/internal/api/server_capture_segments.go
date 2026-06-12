@@ -396,8 +396,10 @@ func captureSegmentWhere(opts captureSegmentQueryOptions) ([]string, []any) {
 		where = append(where, fmt.Sprintf("cs.capture_status = $%d", len(args)))
 	}
 	if opts.RequireDownloadable {
+		// media_objects.object_key is NOT NULL and non-empty by write-time
+		// invariant (storage.UpsertMediaObject), so a present media_object_id is
+		// sufficient; no media_objects join is needed to decide downloadability.
 		where = append(where, "cs.media_object_id IS NOT NULL")
-		where = append(where, "NULLIF(TRIM(mo.object_key), '') IS NOT NULL")
 	}
 	if opts.BeforeSegmentStartAt != nil && opts.BeforeID > 0 {
 		args = append(args, opts.BeforeSegmentStartAt.UTC(), opts.BeforeID)
@@ -412,7 +414,6 @@ func (s *Server) countCaptureSegments(ctx context.Context, opts captureSegmentQu
 	if err := s.pool.QueryRow(ctx, fmt.Sprintf(`
 		SELECT COUNT(*)::bigint
 		FROM capture_segments cs
-		LEFT JOIN media_objects mo ON mo.id = cs.media_object_id
 		WHERE %s
 	`, strings.Join(where, " AND ")), args...).Scan(&total); err != nil {
 		return 0, fmt.Errorf("count capture segments: %w", err)

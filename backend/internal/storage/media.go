@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -24,6 +25,11 @@ type MediaObjectInput struct {
 }
 
 func UpsertMediaObject(ctx context.Context, db queryRower, in MediaObjectInput) (int64, error) {
+	// Downloadability checks rely on every media object having a non-empty
+	// bucket and object key; enforce the invariant here at the single write site.
+	if strings.TrimSpace(in.Bucket) == "" || strings.TrimSpace(in.ObjectKey) == "" {
+		return 0, fmt.Errorf("upsert media object: empty bucket %q or object key %q", in.Bucket, in.ObjectKey)
+	}
 	var id int64
 	err := db.QueryRow(ctx, `
 		INSERT INTO media_objects (storage_provider, bucket, object_key, mime_type, size_bytes, etag, sha256, width, height)
