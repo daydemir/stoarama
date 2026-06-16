@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -417,40 +416,39 @@ func (s *Server) runDayZipJob(jobID, streamSlug string, dayStart, dayEnd time.Ti
 		return
 	}
 
-	tmp, err := os.CreateTemp("", fmt.Sprintf("stream-day-zip-%d-*.zip", job.StreamID))
-	if err != nil {
-		failJob("create temp day-zip: %v", err)
-		return
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	processed, err := buildDayZip(ctx, tmp, rows, streamSlug, job.StreamID, s.r2.Open, func(n int) {
-		s.updateDayZipJob(jobID, func(job *dayZipJob) {
-			job.Processed = n
+	// Stream the archive directly from R2 (read) -> zip -> R2 (multipart write)
+	// through a pipe. The whole zip is never materialized on this instance:
+	// writing/reading a ~2.5GB temp file fills the container page cache and gets
+	// the small (512MB) instance OOM-restarted. With the pipe + multipart
+	// uploader, peak footprint is just the in-flight upload parts (~tens of MB).
+	pr, pw := io.Pipe()
+	buildDone := make(chan error, 1)
+	go func() {
+		_, buildErr := buildDayZip(ctx, pw, rows, streamSlug, job.StreamID, s.r2.Open, func(n int) {
+			s.updateDayZipJob(jobID, func(j *dayZipJob) { j.Processed = n })
 		})
-	})
-	if err != nil {
-		_ = tmp.Close()
-		failJob("%v", err)
+		// Close the writer so the uploader's reads see EOF (success) or the error.
+		_ = pw.CloseWithError(buildErr)
+		buildDone <- buildErr
+	}()
+
+	_, upErr := s.r2.PutMultipart(ctx, job.ZipKey, "application/zip", pr)
+	// If the upload stopped early, unblock any pending write in the builder.
+	_ = pr.CloseWithError(upErr)
+	buildErr := <-buildDone
+
+	if buildErr != nil {
+		failJob("%v", buildErr)
 		return
 	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		_ = tmp.Close()
-		failJob("rewind archive: %v", err)
+	if upErr != nil {
+		failJob("upload archive: %v", upErr)
 		return
 	}
-	if _, err := s.r2.PutMultipart(ctx, job.ZipKey, "application/zip", tmp); err != nil {
-		_ = tmp.Close()
-		failJob("upload archive: %v", err)
-		return
-	}
-	_ = tmp.Close()
 
 	finishedAt := time.Now().UTC()
 	s.updateDayZipJob(jobID, func(job *dayZipJob) {
 		job.Status = "complete"
-		job.Processed = processed
 		job.FinishedAt = &finishedAt
 		job.ErrorText = ""
 	})
