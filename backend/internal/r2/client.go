@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -123,6 +124,30 @@ func (c *Client) PutReader(ctx context.Context, key, contentType string, body io
 	out, err := c.s3.PutObject(ctx, in)
 	if err != nil {
 		return "", fmt.Errorf("put object %s: %w", key, err)
+	}
+	return cleanETag(aws.ToString(out.ETag)), nil
+}
+
+// PutMultipart uploads body to key using S3 multipart upload with a bounded
+// part size, so peak memory stays flat (PartSize * Concurrency) regardless of
+// total object size. Use for multi-GB objects on small instances, where a
+// single PutObject of the whole body can exhaust memory. R2 is multipart-compatible.
+func (c *Client) PutMultipart(ctx context.Context, key, contentType string, body io.Reader) (string, error) {
+	uploader := manager.NewUploader(c.s3, func(u *manager.Uploader) {
+		u.PartSize = 16 * 1024 * 1024 // 16 MiB per part
+		u.Concurrency = 2             // ~32 MiB peak buffered
+	})
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+		Body:   body,
+	}
+	if contentType != "" {
+		in.ContentType = aws.String(contentType)
+	}
+	out, err := uploader.Upload(ctx, in)
+	if err != nil {
+		return "", fmt.Errorf("multipart put %s: %w", key, err)
 	}
 	return cleanETag(aws.ToString(out.ETag)), nil
 }

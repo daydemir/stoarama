@@ -440,7 +440,7 @@ func (s *Server) runDayZipJob(jobID, streamSlug string, dayStart, dayEnd time.Ti
 		failJob("rewind archive: %v", err)
 		return
 	}
-	if _, err := s.r2.PutReader(ctx, job.ZipKey, "application/zip", tmp); err != nil {
+	if _, err := s.r2.PutMultipart(ctx, job.ZipKey, "application/zip", tmp); err != nil {
 		_ = tmp.Close()
 		failJob("upload archive: %v", err)
 		return
