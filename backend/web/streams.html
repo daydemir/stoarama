@@ -2340,7 +2340,10 @@
               <input id="detailClipRangeEnd" type="time" step="1800" />
             </label>
             <button id="detailOpenClipRangeBtn" class="primary" type="button">Open clips in range</button>
+            <button id="detailDownloadDayZipBtn" class="secondary" type="button" disabled>Download this day (zip)</button>
+            <span id="detailDayZipStatus" class="status-text"></span>
           </div>
+          <div id="detailDayZipResult" class="coverage-summary" style="display:none; margin-top:8px;"></div>
           <div id="detailClipHourBuckets" class="clip-hour-grid"></div>
           <div id="detailClipRangeSummary" class="coverage-summary">Select a day and time range.</div>
         </div>
@@ -2649,6 +2652,9 @@ const detailClipRangeEnd = $('detailClipRangeEnd');
 const detailClipHourBuckets = $('detailClipHourBuckets');
 const detailClipRangeSummary = $('detailClipRangeSummary');
 const detailOpenClipRangeBtn = $('detailOpenClipRangeBtn');
+const detailDownloadDayZipBtn = $('detailDownloadDayZipBtn');
+const detailDayZipStatus = $('detailDayZipStatus');
+const detailDayZipResult = $('detailDayZipResult');
 const detailClipsReloadBtn = $('detailClipsReloadBtn');
 const detailClipsPrevBtn = $('detailClipsPrevBtn');
 const detailClipsNextBtn = $('detailClipsNextBtn');
@@ -2789,6 +2795,8 @@ let detailLivePollTimer = null;
 let detailLivePollInFlight = false;
 let detailFrameExportJobID = '';
 let detailFrameExportPollTimer = null;
+let detailDayZipPollTimer = null;
+let detailDayZipPollAttempts = 0;
 let streamRows = [];
 let streamTotal = 0;
 let streamAllTotal = null;
@@ -4290,6 +4298,7 @@ async function loadClipAvailability(day = '') {
     ensureClipRangeDayOption(selectedDay);
     detailClipRangeDay.value = selectedDay;
   }
+  updateDayZipButtonState();
   if (pendingClipRangeFrom && pendingClipRangeTo) {
     applyPendingClipRange();
   } else if (!hasSelectedClipRange() && detailClipRangeStart instanceof HTMLInputElement && detailClipRangeEnd instanceof HTMLInputElement) {
@@ -4407,6 +4416,106 @@ async function prepareDetailClipDownloads() {
   } catch (err) {
     if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
   }
+}
+
+function stopDayZipPolling() {
+  if (detailDayZipPollTimer) {
+    clearTimeout(detailDayZipPollTimer);
+    detailDayZipPollTimer = null;
+  }
+}
+
+function setDayZipStatus(msg) {
+  if (detailDayZipStatus instanceof HTMLElement) detailDayZipStatus.textContent = String(msg || '');
+}
+
+function renderDayZipDownloadLink(url) {
+  if (!(detailDayZipResult instanceof HTMLElement)) return;
+  detailDayZipResult.style.display = '';
+  detailDayZipResult.innerHTML = `<a href="${esc(String(url || ''))}" target="_blank" rel="noopener noreferrer">Download archive (.zip)</a>`;
+}
+
+async function prepareDayZip() {
+  stopDayZipPolling();
+  if (detailDayZipResult instanceof HTMLElement) {
+    detailDayZipResult.style.display = 'none';
+    detailDayZipResult.innerHTML = '';
+  }
+  const day = String(detailClipRangeDay && detailClipRangeDay.value || '').trim();
+  if (!detailStreamID) {
+    setDayZipStatus('No stream selected.');
+    return;
+  }
+  if (!day) {
+    setDayZipStatus('Select a day first.');
+    return;
+  }
+  setDayZipStatus('Preparing archive...');
+  try {
+    const res = await fetch(`/api/v1/capture/streams/${detailStreamID}/day-zip`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ day }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (res.status === 202 && payload.job_id) {
+      detailDayZipPollAttempts = 0;
+      void pollDayZip(String(payload.job_id));
+      return;
+    }
+    if (res.status === 200 && payload.status === 'complete' && payload.download_url) {
+      setDayZipStatus('Archive ready.');
+      renderDayZipDownloadLink(payload.download_url);
+      return;
+    }
+    if (res.status === 409) {
+      setDayZipStatus('A download is being prepared, try again in a moment.');
+      return;
+    }
+    setDayZipStatus(String(payload.error || `http ${res.status}`));
+  } catch (err) {
+    setDayZipStatus(String(err));
+  }
+}
+
+async function pollDayZip(jobID) {
+  if (!jobID) return;
+  detailDayZipPollAttempts += 1;
+  if (detailDayZipPollAttempts > 100) {
+    setDayZipStatus('Still preparing - this is taking a while. Try again later.');
+    stopDayZipPolling();
+    return;
+  }
+  try {
+    const payload = await fetchJSON(`/api/v1/capture/day-zip/${encodeURIComponent(jobID)}`);
+    const status = String(payload.status || '').trim();
+    if (status === 'complete' && payload.download_url) {
+      setDayZipStatus('Archive ready.');
+      renderDayZipDownloadLink(payload.download_url);
+      stopDayZipPolling();
+      return;
+    }
+    if (status === 'error') {
+      setDayZipStatus(String(payload.error || 'archive build failed'));
+      stopDayZipPolling();
+      return;
+    }
+    setDayZipStatus(`Preparing... (${Number(payload.processed || 0)}/${Number(payload.total || 0)})`);
+    stopDayZipPolling();
+    detailDayZipPollTimer = setTimeout(() => {
+      void pollDayZip(jobID).catch((err) => setDayZipStatus(String(err)));
+    }, 3000);
+  } catch (err) {
+    setDayZipStatus(String(err));
+    stopDayZipPolling();
+  }
+}
+
+function updateDayZipButtonState() {
+  if (!(detailDownloadDayZipBtn instanceof HTMLButtonElement)) return;
+  const day = String(detailClipRangeDay && detailClipRangeDay.value || '').trim();
+  detailDownloadDayZipBtn.disabled = !day;
 }
 
 function updateDetailTabHrefs() {
@@ -9373,6 +9482,7 @@ if (detailClipModeLinearBtn) detailClipModeLinearBtn.addEventListener('click', (
   void refreshDetailClips();
 });
 if (detailClipRangeDay) detailClipRangeDay.addEventListener('change', () => {
+  updateDayZipButtonState();
   void loadClipAvailability(String(detailClipRangeDay.value || '')).catch((err) => {
     if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
   });
@@ -9406,6 +9516,7 @@ if (detailOpenClipRangeBtn) detailOpenClipRangeBtn.addEventListener('click', () 
   setDetailClipViewMode(CLIP_VIEW_MODE.RANGE);
   void refreshDetailClips();
 });
+if (detailDownloadDayZipBtn) detailDownloadDayZipBtn.addEventListener('click', () => { void prepareDayZip(); });
 if (detailClipsReloadBtn) detailClipsReloadBtn.addEventListener('click', () => { void refreshDetailClips(); });
 if (detailClipsPrevBtn) detailClipsPrevBtn.addEventListener('click', () => {
   detailClipOffset = Math.max(0, detailClipOffset - detailClipLimit);

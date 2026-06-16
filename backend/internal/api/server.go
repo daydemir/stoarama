@@ -47,6 +47,9 @@ type Server struct {
 	adminHTML     []byte
 	exportMu      sync.Mutex
 	frameExports  map[string]*frameExportJob
+	dayZipMu      sync.Mutex
+	dayZips       map[string]*dayZipJob
+	dayZipSlot    chan struct{}
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -54,7 +57,24 @@ const accountSessionCookie = "stoarama_session"
 const (
 	frameExportMaxFrames = 5000
 	frameExportMaxBytes  = int64(2 << 30)
+	dayZipMaxItems       = 5000
+	dayZipMaxBytes       = int64(6 << 30)
 )
+
+type dayZipJob struct {
+	ID          string     `json:"id"`
+	StreamID    int64      `json:"stream_id"`
+	Day         string     `json:"day"`
+	Status      string     `json:"status"`
+	ZipKey      string     `json:"zip_key,omitempty"`
+	DownloadURL string     `json:"download_url,omitempty"`
+	SizeBytes   int64      `json:"size_bytes"`
+	ItemCount   int        `json:"item_count"`
+	Processed   int        `json:"processed"`
+	ErrorText   string     `json:"error_text,omitempty"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
+}
 
 type frameExportJob struct {
 	ID            string     `json:"id"`
@@ -120,6 +140,8 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		docsHTML:      docsHTML,
 		adminHTML:     adminHTML,
 		frameExports:  map[string]*frameExportJob{},
+		dayZips:       map[string]*dayZipJob{},
+		dayZipSlot:    make(chan struct{}, 1),
 	}
 	return s.router(), nil
 }
@@ -218,6 +240,8 @@ func (s *Server) router() http.Handler {
 			public.Get("/frames", s.handleFramesList)
 			public.Get("/capture/streams/{id}/segments", s.handleCaptureStreamSegmentsList)
 			public.Get("/capture/streams/{id}/segments/latest", s.handleCaptureStreamSegmentLatest)
+			public.Post("/capture/streams/{id}/day-zip", s.handleDayZipCreate)
+			public.Get("/capture/day-zip/{jobId}", s.handleDayZipGet)
 			public.Get("/korea/inventory", s.handleKoreaInventory)
 			public.Get("/dashboard/overview", s.handleDashboardOverview)
 			public.Get("/dashboard/streams", s.handleDashboardStreams)
@@ -2094,10 +2118,45 @@ func frameExportName(capturedAt time.Time, frameID int64, objectKey string, mime
 	return fmt.Sprintf("frames/%s-frame-%d%s", capturedAt.UTC().Format("20060102T150405Z"), frameID, frameExportExt(objectKey, mimeType))
 }
 
+// frameExportJobMaxEntries caps how many job records are retained in memory as a
+// hard backstop against unbounded growth.
+const frameExportJobMaxEntries = 256
+
 func (s *Server) setFrameExportJob(job *frameExportJob) {
 	s.exportMu.Lock()
 	defer s.exportMu.Unlock()
+	s.reapFrameExportJobsLocked()
 	s.frameExports[job.ID] = job
+}
+
+// reapFrameExportJobsLocked prunes finished (complete/error) job records: it evicts
+// any whose FinishedAt is older than R2SignGetTTL, and, if the map is still over the
+// hard cap, drops the oldest finished entries until under the cap. The caller must
+// hold exportMu. In-flight (pending/running) jobs are never evicted.
+func (s *Server) reapFrameExportJobsLocked() {
+	now := time.Now()
+	for id, job := range s.frameExports {
+		if job.FinishedAt != nil && now.Sub(*job.FinishedAt) > s.cfg.R2SignGetTTL {
+			delete(s.frameExports, id)
+		}
+	}
+	for len(s.frameExports) >= frameExportJobMaxEntries {
+		var oldestID string
+		var oldest *time.Time
+		for id, job := range s.frameExports {
+			if job.FinishedAt == nil {
+				continue
+			}
+			if oldest == nil || job.FinishedAt.Before(*oldest) {
+				oldest = job.FinishedAt
+				oldestID = id
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		delete(s.frameExports, oldestID)
+	}
 }
 
 func (s *Server) getFrameExportJob(id string) (*frameExportJob, bool) {
