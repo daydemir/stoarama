@@ -29,6 +29,73 @@ Stoarama v1 is:
 - metadata-registered pipelines
 - private-by-default results with provenance
 
+## Public Data API
+
+A hosted instance runs at `https://stoarama-api.onrender.com` (browse it in a
+browser at `/streams`). Stream metadata, per-stream sample frames, and recorded
+clips are **public reads — no account or key required.** The endpoints below are
+the canonical contract; the server also self-documents at
+`GET /api/v1/data-access-spec`.
+
+Presigned download URLs (`download_url`, `thumbnail_download_url`) point straight
+at object storage and expire after ~10 minutes, so fetch them, then download.
+
+```bash
+BASE=https://stoarama-api.onrender.com
+```
+
+### Browse and filter the catalog
+
+`GET /api/v1/dashboard/streams` returns `{ items, total, limit, offset }`, where
+each item has a `stream` object plus capture/recording stats.
+
+```bash
+# Free-text search
+curl "$BASE/api/v1/dashboard/streams?q=seoul&limit=20"
+
+# Filters (combine freely): country (full name), capture_type, source,
+# tags, recording_state=on, plus limit/offset (max limit 2000)
+curl "$BASE/api/v1/dashboard/streams?country=South%20Korea&capture_type=hls&limit=50"
+```
+
+Filter facets (valid values) come from `GET /api/v1/dashboard/{countries,cities,sources,tags}`.
+
+### Inspect one stream
+
+```bash
+# Full detail
+curl "$BASE/api/v1/dashboard/streams/415"
+
+# A few representative sample frames across the stream's history
+# -> items[]: { day, captured_at, object_key, download_url }
+curl "$BASE/api/v1/dashboard/streams/415/capture-samples?count=6"
+```
+
+### List and download recorded clips
+
+`GET /api/v1/streams/{id}/clips` returns `{ items, total }`. Each clip already
+includes a ready-to-fetch `download_url` and `thumbnail_download_url`.
+
+```bash
+# Newest clips for a stream (limit max 200)
+curl "$BASE/api/v1/streams/415/clips?limit=20"
+```
+
+For a batch, `POST /api/v1/clips/download-prepare` mints presigned URLs for up to
+120 segments at once:
+
+```bash
+curl -X POST "$BASE/api/v1/clips/download-prepare" \
+  -H 'content-type: application/json' \
+  -d '{"stream_id":415,"segment_ids":[4252509,4252507]}'
+# -> items[]: { id, download_url, thumbnail_download_url, filename }
+```
+
+Authenticated mirrors of the clip endpoints live under `/api/v1/account/...` and
+accept a session cookie or an API key (`stoarama auth api-keys create`); they
+exist for per-account download history and scripted access, but the public
+endpoints above cover read-only browsing and download.
+
 ## CLI-First Rule
 
 All product functionality must exist in `stoaramactl` before it is considered complete in the web UI.
