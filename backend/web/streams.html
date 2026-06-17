@@ -4470,7 +4470,12 @@ async function prepareDayZip() {
       return;
     }
     if (res.status === 409) {
-      setDayZipStatus('A download is being prepared, try again in a moment.');
+      // A build (this day or another) is already running; the endpoint serializes
+      // to one at a time. Wait and retry — when it frees up, or this day finishes
+      // and lands in the cache, a later create returns the link.
+      setDayZipStatus('Another archive is being prepared; waiting...');
+      stopDayZipPolling();
+      detailDayZipPollTimer = setTimeout(() => { void prepareDayZip(); }, 8000);
       return;
     }
     setDayZipStatus(String(payload.error || `http ${res.status}`));
@@ -4479,12 +4484,19 @@ async function prepareDayZip() {
   }
 }
 
+// ~15 min at 3s/poll: a full day (~720 clips, ~2.5GB) typically builds in a few
+// minutes but can run longer when the shared instance is busy.
+const DAY_ZIP_MAX_POLLS = 300;
+
 async function pollDayZip(jobID) {
   if (!jobID) return;
   detailDayZipPollAttempts += 1;
-  if (detailDayZipPollAttempts > 100) {
-    setDayZipStatus('Still preparing - this is taking a while. Try again later.');
+  if (detailDayZipPollAttempts > DAY_ZIP_MAX_POLLS) {
+    // Unusually long. Re-issue create: if the build has since finished it returns
+    // the cached link; if still running we get 409 and keep waiting.
+    setDayZipStatus('Still preparing - re-checking...');
     stopDayZipPolling();
+    void prepareDayZip();
     return;
   }
   try {
@@ -4507,8 +4519,12 @@ async function pollDayZip(jobID) {
       void pollDayZip(jobID).catch((err) => setDayZipStatus(String(err)));
     }, 3000);
   } catch (err) {
-    setDayZipStatus(String(err));
+    // Most likely a 404: the in-memory job was lost (e.g. instance restart).
+    // Recover by re-issuing create, which returns the cached archive if the
+    // build finished, or starts a fresh one.
+    setDayZipStatus('Reconnecting...');
     stopDayZipPolling();
+    detailDayZipPollTimer = setTimeout(() => { void prepareDayZip(); }, 4000);
   }
 }
 
