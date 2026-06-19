@@ -54,7 +54,7 @@ services:
       - key: SERVICE_TOKEN
         sync: false
       - key: EMAIL_PROVIDER
-        value: log
+        value: resend
       - key: MAGIC_LINK_TTL
         value: 20m
       - key: SESSION_TTL
