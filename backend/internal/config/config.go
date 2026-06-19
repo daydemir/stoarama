@@ -24,6 +24,7 @@ type Config struct {
 	R2Endpoint                  string
 	R2SignGetTTL                time.Duration
 	R2SignPutTTL                time.Duration
+	StorageCredKey              string
 	AppBaseURL                  string
 	MagicLinkTTL                time.Duration
 	SessionTTL                  time.Duration
@@ -76,6 +77,7 @@ func Load() (Config, error) {
 		R2Endpoint:                  os.Getenv("R2_ENDPOINT"),
 		R2SignGetTTL:                durEnv("R2_SIGN_GET_TTL", 10*time.Minute),
 		R2SignPutTTL:                durEnv("R2_SIGN_PUT_TTL", 15*time.Minute),
+		StorageCredKey:              strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),
 		AppBaseURL:                  strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
 		MagicLinkTTL:                durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 20*time.Minute)),
 		SessionTTL:                  durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),

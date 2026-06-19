@@ -30,6 +30,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/queue"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
 	"github.com/daydemir/stoarama/backend/internal/settings"
 	"github.com/daydemir/stoarama/backend/internal/storage"
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -39,6 +40,7 @@ type Server struct {
 	cfg           config.Config
 	pool          *pgxpool.Pool
 	r2            *r2.Client
+	secrets       *secretbox.Cipher
 	mailer        email.Sender
 	streamsHTML   []byte
 	recordingHTML []byte
@@ -143,6 +145,13 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		dayZips:       map[string]*dayZipJob{},
 		dayZipSlot:    make(chan struct{}, 1),
 	}
+	if key := strings.TrimSpace(cfg.StorageCredKey); key != "" {
+		cipher, err := secretbox.NewFromBase64Key(key)
+		if err != nil {
+			return nil, fmt.Errorf("init storage credential cipher: %w", err)
+		}
+		s.secrets = cipher
+	}
 	return s.router(), nil
 }
 
@@ -182,6 +191,9 @@ func (s *Server) router() http.Handler {
 			account.Get("/streams/{id}/clips/range", s.handleAccountStreamClipsRange)
 			account.Get("/streams/{id}/clips", s.handleAccountStreamClipsList)
 			account.Post("/clips/download-prepare", s.handleAccountClipDownloadPrepare)
+			account.Get("/storage-destinations", s.handleAccountStorageDestinationsList)
+			account.Post("/storage-destinations", s.handleAccountStorageDestinationsCreate)
+			account.Delete("/storage-destinations/{id}", s.handleAccountStorageDestinationDelete)
 			account.Get("/nodes", s.handleAccountNodesList)
 			account.Get("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensList)
 			account.Post("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensCreate)
