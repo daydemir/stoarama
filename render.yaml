@@ -87,6 +87,17 @@ services:
         value: "false"
       - key: SURVEY_CONCURRENCY
         value: "4"
+      # Standalone stream-recorder billing (Stripe). The API serves Checkout,
+      # the customer portal, and the signature-verified webhook. Leaving these
+      # unset disables billing and runs recordings in free mode.
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: STRIPE_LIVEMODE
+        sync: false
 
   # Daily stream survey: one JPEG per non-pruned stream per day, captured on an
   # isolated cron instance so the heavy ffmpeg/yt-dlp work never touches the
@@ -134,3 +145,105 @@ services:
         value: ./bin/ffmpeg
       - key: YT_DLP_BIN
         value: ./bin/yt-dlp
+
+  # Standalone stream-recorder control plane: a single always-on instance that
+  # runs the cron scheduler (materializing one recording_jobs row per fire) AND
+  # the droplet-pool autoscaler off the public API dyno, mirroring stoarama-survey.
+  # No ffmpeg here; the heavy capture work runs on autoscaled recorder droplets.
+  # STRIPE_* presence flips the billable gate on; STORAGE_CRED_KEY is not needed
+  # (presign happens on the API). Single replica => no leader election.
+  - type: worker
+    name: stoarama-recorder-control
+    env: go
+    rootDir: backend
+    plan: starter
+    numInstances: 1
+    autoDeployTrigger: commit
+    buildCommand: |
+      set -euo pipefail
+      go build -o bin/stoaramactl ./cmd/stoaramactl
+    startCommand: ./bin/stoaramactl recorder-control run
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stoarama-db
+          property: connectionString
+      - key: SERVICE_TOKEN
+        sync: false
+      - key: APP_BASE_URL
+        value: https://stoarama-api.onrender.com
+      - key: REC_SCHED_ENABLED
+        value: "false"
+      - key: REC_SCHED_TICK_SEC
+        value: "15"
+      - key: REC_SCHED_CATCHUP_SEC
+        value: "900"
+      - key: REC_SCHED_MIN_INTERVAL_SEC
+        value: "600"
+      - key: REC_SCHED_MAX_JOBS_PER_TICK
+        value: "500"
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: STRIPE_LIVEMODE
+        sync: false
+      # Droplet-pool autoscaler. DO_API_TOKEN is the operator-scoped DigitalOcean
+      # token. DROPLET_POOL_OPERATOR_EMAIL (defaults to BOOTSTRAP_ADMIN_EMAIL) is
+      # the admin account that owns the per-droplet local_recorder node tokens.
+      # The project + firewall ids reuse the existing DO project and the egress
+      # firewall that blocks the metadata IP / RFC1918 (S-1). DROPLET_POOL_MAX is
+      # the hard spend cap. Leave DROPLET_POOL_ENABLED=false until the prebuilt
+      # image (DROPLET_POOL_IMAGE) and firewall are provisioned.
+      - key: DO_API_TOKEN
+        sync: false
+      - key: BOOTSTRAP_ADMIN_EMAIL
+        sync: false
+      - key: DROPLET_POOL_ENABLED
+        value: "false"
+      - key: DROPLET_POOL_TICK_SEC
+        value: "30"
+      - key: DROPLET_POOL_LOOKAHEAD_SEC
+        value: "1800"
+      - key: DROPLET_POOL_CAPACITY
+        value: "1"
+      - key: RECORDING_WORKER_CONCURRENCY
+        value: "1"
+      - key: DROPLET_POOL_PROVISION_LEAD_SEC
+        value: "600"
+      - key: DROPLET_POOL_PROVISION_TIMEOUT_SEC
+        value: "900"
+      - key: DROPLET_POOL_IDLE_GRACE_SEC
+        value: "600"
+      - key: DROPLET_POOL_DRAIN_TIMEOUT_SEC
+        value: "600"
+      - key: DROPLET_POOL_SCALEUP_COOLDOWN_SEC
+        value: "60"
+      - key: DROPLET_POOL_SCALEDOWN_COOLDOWN_SEC
+        value: "300"
+      - key: DROPLET_POOL_MIN
+        value: "0"
+      - key: DROPLET_POOL_MAX
+        value: "5"
+      - key: DROPLET_POOL_REGION
+        value: nyc1
+      - key: DROPLET_POOL_SIZE
+        value: s-2vcpu-4gb
+      - key: DROPLET_POOL_IMAGE
+        sync: false
+      - key: DROPLET_POOL_SSH_KEY
+        sync: false
+      - key: DROPLET_POOL_PROJECT_ID
+        sync: false
+      - key: DROPLET_POOL_FIREWALL_ID
+        sync: false
+      - key: DROPLET_POOL_BACKEND_API_URL
+        value: https://stoarama-api.onrender.com
+      - key: DROPLET_POOL_REPO_URL
+        value: https://github.com/daydemir/stoarama.git
+      - key: DROPLET_POOL_REPO_REF
+        value: main
+      - key: DROPLET_POOL_REPO_CLONE_TOKEN
+        sync: false

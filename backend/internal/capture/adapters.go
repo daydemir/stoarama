@@ -356,7 +356,7 @@ func buildFFmpegSessionArgs(spec StreamSpec, srcURL string, targetFPS int) []str
 	if hwaccel != "" {
 		args = append(args, "-hwaccel", hwaccel)
 	}
-	args = appendFFmpegHTTPInputArgs(args, srcURL, useReconnect, reconnectDelayMax)
+	args = appendFFmpegHTTPInputArgs(args, srcURL, useReconnect, reconnectDelayMax, "")
 
 	args = append(args,
 		"-i", srcURL,

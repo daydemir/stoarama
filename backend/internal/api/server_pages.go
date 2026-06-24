@@ -48,6 +48,10 @@ func loadAdminHTML() ([]byte, error) {
 	return loadHTMLPage("admin.html")
 }
 
+func loadRecordingsHTML() ([]byte, error) {
+	return loadHTMLPage("recordings.html")
+}
+
 func writeHTML(w http.ResponseWriter, body []byte) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -68,6 +72,10 @@ func (s *Server) handleDocsApp(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleAdminApp(w http.ResponseWriter, _ *http.Request) {
 	writeHTML(w, s.adminHTML)
+}
+
+func (s *Server) handleRecordingsApp(w http.ResponseWriter, _ *http.Request) {
+	writeHTML(w, s.recordingsHTML)
 }
 
 func (s *Server) handleKoreaApp(w http.ResponseWriter, _ *http.Request) {

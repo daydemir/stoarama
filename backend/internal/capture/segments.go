@@ -52,7 +52,11 @@ func SegmentCaptureTimeout(duration time.Duration) time.Duration {
 	return duration + 90*time.Second
 }
 
-func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duration) (Segment, error) {
+// CaptureSegment records a clip from sourceURL. pinHost, when non-empty, is the
+// original hostname carried as the HTTP Host header / TLS SNI while sourceURL
+// already points at the SSRF-validated literal IP, pinning the ffmpeg socket to
+// that address. Pass "" to leave DNS resolution to ffmpeg.
+func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duration, pinHost string) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
 	}
@@ -67,7 +71,7 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
-	args := buildFFmpegSegmentArgs(sourceURL, outPath, duration)
+	args := buildFFmpegSegmentArgs(sourceURL, outPath, duration, pinHost)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -132,6 +136,34 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 	}, nil
 }
 
+// ProbeReachable verifies that sourceURL opens and yields at least one packet
+// within ctx's deadline, without writing a file. It is used by the recorder
+// create flow to fail fast on an unreachable/unsupported URL. The caller is
+// responsible for SSRF-validating sourceURL first; pinHost carries the original
+// hostname (as Host header / SNI) when sourceURL has been pinned to the
+// validated literal IP, so the probe connects to the same address ValidatePublicURL
+// approved. It uses the same ffmpeg binary resolution as capture so deployments
+// need only vendor ffmpeg.
+func ProbeReachable(ctx context.Context, sourceURL string, pinHost string) error {
+	if strings.TrimSpace(sourceURL) == "" {
+		return fmt.Errorf("source_url is empty")
+	}
+	args := []string{"-nostdin", "-loglevel", "error"}
+	args = appendFFmpegHTTPInputArgs(args, sourceURL, false, 0, pinHost)
+	args = append(args,
+		"-i", sourceURL,
+		"-map", "0:v:0",
+		"-frames:v", "1",
+		"-f", "null",
+		"-",
+	)
+	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("stream not reachable: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func CleanupSegment(seg Segment) {
 	if strings.TrimSpace(seg.Path) == "" {
 		return
@@ -139,14 +171,14 @@ func CleanupSegment(seg Segment) {
 	_ = os.RemoveAll(filepath.Dir(seg.Path))
 }
 
-func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Duration) []string {
+func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Duration, pinHost string) []string {
 	seconds := strconv.FormatFloat(duration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
 		"-nostdin",
 		"-loglevel", "error",
 	}
-	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10)
+	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10, pinHost)
 	args = append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", sourceURL,

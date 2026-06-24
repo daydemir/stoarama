@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/email"
@@ -42,12 +43,14 @@ type Server struct {
 	r2            *r2.Client
 	secrets       *secretbox.Cipher
 	mailer        email.Sender
-	streamsHTML   []byte
-	recordingHTML []byte
-	accountHTML   []byte
-	docsHTML      []byte
-	adminHTML     []byte
-	exportMu      sync.Mutex
+	streamsHTML    []byte
+	recordingHTML  []byte
+	recordingsHTML []byte
+	accountHTML    []byte
+	docsHTML       []byte
+	adminHTML      []byte
+	billing        *billing.Client
+	exportMu       sync.Mutex
 	frameExports  map[string]*frameExportJob
 	dayZipMu      sync.Mutex
 	dayZips       map[string]*dayZipJob
@@ -131,19 +134,24 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
+	recordingsHTML, err := loadRecordingsHTML()
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
-		cfg:           cfg,
-		pool:          pool,
-		r2:            r2c,
-		mailer:        mailer,
-		streamsHTML:   streamsHTML,
-		recordingHTML: recordingHTML,
-		accountHTML:   accountHTML,
-		docsHTML:      docsHTML,
-		adminHTML:     adminHTML,
-		frameExports:  map[string]*frameExportJob{},
-		dayZips:       map[string]*dayZipJob{},
-		dayZipSlot:    make(chan struct{}, 1),
+		cfg:            cfg,
+		pool:           pool,
+		r2:             r2c,
+		mailer:         mailer,
+		streamsHTML:    streamsHTML,
+		recordingHTML:  recordingHTML,
+		recordingsHTML: recordingsHTML,
+		accountHTML:    accountHTML,
+		docsHTML:       docsHTML,
+		adminHTML:      adminHTML,
+		frameExports:   map[string]*frameExportJob{},
+		dayZips:        map[string]*dayZipJob{},
+		dayZipSlot:     make(chan struct{}, 1),
 	}
 	if key := strings.TrimSpace(cfg.StorageCredKey); key != "" {
 		cipher, err := secretbox.NewFromBase64Key(key)
@@ -151,6 +159,13 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 			return nil, fmt.Errorf("init storage credential cipher: %w", err)
 		}
 		s.secrets = cipher
+	}
+	if strings.TrimSpace(cfg.StripeSecretKey) != "" && strings.TrimSpace(cfg.StripeWebhookSecret) != "" && strings.TrimSpace(cfg.StripePriceID) != "" {
+		bc, err := billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.AppBaseURL, cfg.StripeLivemode)
+		if err != nil {
+			return nil, fmt.Errorf("init stripe billing client: %w", err)
+		}
+		s.billing = bc
 	}
 	return s.router(), nil
 }
@@ -170,12 +185,14 @@ func (s *Server) router() http.Handler {
 	r.Get("/docs/relay-guide", s.redirectLegacyRelayGuide)
 	r.Get("/docs/self-serve", s.handleDocsApp)
 	r.Get("/account", s.handleAccountApp)
+	r.Get("/recordings", s.handleRecordingsApp)
 	r.Get("/admin", s.handleAdminApp)
 	r.Get("/dashboard", s.redirectDashboard)
 	r.Get("/dashboard/{tab}", s.redirectDashboard)
 	r.Get("/dashboard/stream/{id}", s.redirectDashboard)
 	r.Get("/auth/complete", s.handleAccountAuthComplete)
 	r.Post("/webhooks/email/resend", s.handleResendWebhook)
+	r.Post("/webhooks/billing/stripe", s.handleStripeWebhook)
 
 	r.Route("/api/v1", func(api chi.Router) {
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
@@ -194,6 +211,15 @@ func (s *Server) router() http.Handler {
 			account.Get("/storage-destinations", s.handleAccountStorageDestinationsList)
 			account.Post("/storage-destinations", s.handleAccountStorageDestinationsCreate)
 			account.Delete("/storage-destinations/{id}", s.handleAccountStorageDestinationDelete)
+			account.Get("/recordings", s.handleAccountRecordingsList)
+			account.Post("/recordings", s.handleAccountRecordingsCreate)
+			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
+			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
+			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
+			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)
+			account.Get("/billing", s.handleAccountBillingMe)
+			account.Post("/billing/checkout", s.handleAccountBillingCheckout)
+			account.Post("/billing/portal", s.handleAccountBillingPortal)
 			account.Get("/nodes", s.handleAccountNodesList)
 			account.Get("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensList)
 			account.Post("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensCreate)
@@ -295,6 +321,7 @@ func (s *Server) router() http.Handler {
 			admin.Post("/source-candidates/{id}/review", s.handleSourceCandidateReview)
 			admin.Post("/source-candidates/{id}/import", s.handleSourceCandidateImport)
 			admin.Get("/recording/assignments/audit", s.handleRecordingAssignmentsAudit)
+			admin.Get("/recorder-pool", s.handleAdminRecorderPool)
 			admin.Get("/recording/supervision", s.handleRecordingSupervisionStatus)
 			admin.Get("/recording/incidents", s.handleRecordingIncidentsList)
 			admin.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
@@ -324,6 +351,18 @@ func (s *Server) router() http.Handler {
 			recordingWrites.Use(s.requireRecordingMutationAuth)
 			recordingWrites.Post("/recording/streams/{id}/assign", s.handleRecordingStreamAssign)
 			recordingWrites.Post("/recording/streams/{id}/unassign", s.handleRecordingStreamUnassign)
+		})
+
+		api.Group(func(rec chi.Router) {
+			rec.Use(s.requireRecorderNodeAuth)
+
+			rec.Post("/recording/jobs/lease", s.handleRecordingJobsLease)
+			rec.Post("/recording/upload-intents", s.handleRecordingUploadIntent)
+			rec.Post("/recording/clips/ingest", s.handleRecordingClipIngest)
+			rec.Post("/recording/droplets/heartbeat", s.handleRecordingDropletHeartbeat)
+			rec.Post("/recording/jobs/{id}/heartbeat", s.handleRecordingJobHeartbeat)
+			rec.Post("/recording/jobs/{id}/complete", s.handleRecordingJobComplete)
+			rec.Post("/recording/jobs/{id}/fail", s.handleRecordingJobFail)
 		})
 
 		api.Group(func(worker chi.Router) {

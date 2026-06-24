@@ -156,6 +156,13 @@ func main() {
 		log.Printf("STREAM_ALERTS_ENABLED is deprecated in stoarama-api; run `stoaramactl recording supervisor run` for recording supervision and alert delivery")
 	}
 
+	// The standalone stream-recorder cron scheduler and droplet autoscaler do NOT
+	// run on this public web dyno. They run on the dedicated single-instance
+	// control service via `stoaramactl recorder-control run` (see render.yaml).
+	if cfg.RecSchedEnabled {
+		log.Printf("REC_SCHED_ENABLED is set but the recorder scheduler runs on the stoarama-recorder-control service, not stoarama-api; ignoring here")
+	}
+
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           router,

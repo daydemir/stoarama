@@ -58,6 +58,51 @@ type Config struct {
 	SurveyConcurrency           int
 	SurveyResolveTimeoutSec     int
 	SurveyCaptureTimeoutSec     int
+
+	// Standalone stream recorder: cron scheduler (runs on the dedicated control service).
+	RecSchedEnabled        bool
+	RecSchedTickSec        int
+	RecSchedCatchupSec     int
+	RecSchedMinIntervalSec int
+	RecSchedMaxJobsPerTick int
+
+	// Standalone stream recorder: Stripe billing (set on stoarama-api; nil/empty disables).
+	StripeSecretKey     string
+	StripeWebhookSecret string
+	StripePriceID       string
+	StripeLivemode      bool
+
+	// Standalone stream recorder: worker (consumed on the recorder droplet/node).
+	RecordingWorkerConcurrency  int
+	RecordingWorkerHeartbeatSec int
+	RecordingWorkerPollSec      int
+
+	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
+	// control service alongside the scheduler). Empty/disabled by default.
+	DOAPIToken                      string
+	DropletPoolEnabled              bool
+	DropletPoolTickSec              int
+	DropletPoolLookaheadSec         int
+	DropletPoolCapacity             int
+	DropletPoolProvisionLeadSec     int
+	DropletPoolProvisionTimeoutSec  int
+	DropletPoolIdleGraceSec         int
+	DropletPoolDrainTimeoutSec      int
+	DropletPoolScaleUpCooldownSec   int
+	DropletPoolScaleDownCooldownSec int
+	DropletPoolMin                  int
+	DropletPoolMax                  int
+	DropletPoolRegion               string
+	DropletPoolSize                 string
+	DropletPoolImage                string
+	DropletPoolSSHKey               string
+	DropletPoolProjectID            string
+	DropletPoolFirewallID           string
+	DropletPoolOperatorEmail        string
+	DropletPoolRepoURL              string
+	DropletPoolRepoRef              string
+	DropletPoolRepoCloneToken       string
+	DropletPoolBackendAPIURL        string
 }
 
 func Load() (Config, error) {
@@ -111,6 +156,46 @@ func Load() (Config, error) {
 		SurveyConcurrency:           intEnv("SURVEY_CONCURRENCY", 4),
 		SurveyResolveTimeoutSec:     intEnv("SURVEY_RESOLVE_TIMEOUT_SEC", 60),
 		SurveyCaptureTimeoutSec:     intEnv("SURVEY_CAPTURE_TIMEOUT_SEC", 60),
+
+		RecSchedEnabled:        boolEnv("REC_SCHED_ENABLED", false),
+		RecSchedTickSec:        intEnv("REC_SCHED_TICK_SEC", 15),
+		RecSchedCatchupSec:     intEnv("REC_SCHED_CATCHUP_SEC", 900),
+		RecSchedMinIntervalSec: intEnv("REC_SCHED_MIN_INTERVAL_SEC", 600),
+		RecSchedMaxJobsPerTick: intEnv("REC_SCHED_MAX_JOBS_PER_TICK", 500),
+
+		StripeSecretKey:     strings.TrimSpace(os.Getenv("STRIPE_SECRET_KEY")),
+		StripeWebhookSecret: strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
+		StripePriceID:       strings.TrimSpace(os.Getenv("STRIPE_PRICE_ID")),
+		StripeLivemode:      boolEnv("STRIPE_LIVEMODE", false),
+
+		RecordingWorkerConcurrency:  intEnv("RECORDING_WORKER_CONCURRENCY", 1),
+		RecordingWorkerHeartbeatSec: intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),
+		RecordingWorkerPollSec:      intEnv("RECORDING_WORKER_POLL_SEC", 5),
+
+		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
+		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
+		DropletPoolTickSec:              intEnv("DROPLET_POOL_TICK_SEC", 30),
+		DropletPoolLookaheadSec:         intEnv("DROPLET_POOL_LOOKAHEAD_SEC", 1800),
+		DropletPoolCapacity:             intEnv("DROPLET_POOL_CAPACITY", 1),
+		DropletPoolProvisionLeadSec:     intEnv("DROPLET_POOL_PROVISION_LEAD_SEC", 600),
+		DropletPoolProvisionTimeoutSec:  intEnv("DROPLET_POOL_PROVISION_TIMEOUT_SEC", 900),
+		DropletPoolIdleGraceSec:         intEnv("DROPLET_POOL_IDLE_GRACE_SEC", 600),
+		DropletPoolDrainTimeoutSec:      intEnv("DROPLET_POOL_DRAIN_TIMEOUT_SEC", 600),
+		DropletPoolScaleUpCooldownSec:   intEnv("DROPLET_POOL_SCALEUP_COOLDOWN_SEC", 60),
+		DropletPoolScaleDownCooldownSec: intEnv("DROPLET_POOL_SCALEDOWN_COOLDOWN_SEC", 300),
+		DropletPoolMin:                  intEnv("DROPLET_POOL_MIN", 0),
+		DropletPoolMax:                  intEnv("DROPLET_POOL_MAX", 5),
+		DropletPoolRegion:               strEnv("DROPLET_POOL_REGION", "nyc1"),
+		DropletPoolSize:                 strEnv("DROPLET_POOL_SIZE", "s-2vcpu-4gb"),
+		DropletPoolImage:                strEnv("DROPLET_POOL_IMAGE", "ubuntu-24-04-x64"),
+		DropletPoolSSHKey:               strings.TrimSpace(os.Getenv("DROPLET_POOL_SSH_KEY")),
+		DropletPoolProjectID:            strings.TrimSpace(os.Getenv("DROPLET_POOL_PROJECT_ID")),
+		DropletPoolFirewallID:           strings.TrimSpace(os.Getenv("DROPLET_POOL_FIREWALL_ID")),
+		DropletPoolOperatorEmail:        strings.ToLower(strings.TrimSpace(firstNonEmpty(os.Getenv("DROPLET_POOL_OPERATOR_EMAIL"), os.Getenv("BOOTSTRAP_ADMIN_EMAIL")))),
+		DropletPoolRepoURL:              strings.TrimSpace(os.Getenv("DROPLET_POOL_REPO_URL")),
+		DropletPoolRepoRef:              strEnv("DROPLET_POOL_REPO_REF", "main"),
+		DropletPoolRepoCloneToken:       strings.TrimSpace(os.Getenv("DROPLET_POOL_REPO_CLONE_TOKEN")),
+		DropletPoolBackendAPIURL:        strings.TrimRight(strings.TrimSpace(firstNonEmpty(os.Getenv("DROPLET_POOL_BACKEND_API_URL"), os.Getenv("BACKEND_API_URL"))), "/"),
 	}
 	if cfg.R2Endpoint == "" && cfg.R2AccountID != "" {
 		cfg.R2Endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)
@@ -141,6 +226,47 @@ func (c Config) ValidateR2() error {
 	}
 	if strings.TrimSpace(c.R2Endpoint) == "" {
 		return fmt.Errorf("missing R2 endpoint")
+	}
+	return nil
+}
+
+// ValidatePool enforces the autoscaler's required config when the pool is
+// enabled. The droplet-side worker concurrency MUST equal the per-droplet
+// capacity the forecaster divides by (C-cap), or the pool would over- or
+// under-provision. Provisioning needs the DO token, an operator account to own
+// the per-droplet node tokens, a backend URL for the droplet to call home, and
+// the existing DO project + firewall so droplets are spend-audited and egress
+// -restricted (S-1).
+func (c Config) ValidatePool() error {
+	if strings.TrimSpace(c.DOAPIToken) == "" {
+		return fmt.Errorf("DROPLET_POOL_ENABLED requires DO_API_TOKEN")
+	}
+	if strings.TrimSpace(c.DropletPoolBackendAPIURL) == "" {
+		return fmt.Errorf("DROPLET_POOL_ENABLED requires DROPLET_POOL_BACKEND_API_URL (or BACKEND_API_URL)")
+	}
+	if strings.TrimSpace(c.DropletPoolProjectID) == "" {
+		return fmt.Errorf("DROPLET_POOL_ENABLED requires DROPLET_POOL_PROJECT_ID")
+	}
+	if strings.TrimSpace(c.DropletPoolFirewallID) == "" {
+		return fmt.Errorf("DROPLET_POOL_ENABLED requires DROPLET_POOL_FIREWALL_ID (egress block, S-1)")
+	}
+	if strings.TrimSpace(c.DropletPoolOperatorEmail) == "" {
+		return fmt.Errorf("DROPLET_POOL_ENABLED requires DROPLET_POOL_OPERATOR_EMAIL (or BOOTSTRAP_ADMIN_EMAIL) to own per-droplet node tokens")
+	}
+	if c.DropletPoolCapacity <= 0 {
+		return fmt.Errorf("DROPLET_POOL_CAPACITY must be > 0")
+	}
+	if c.DropletPoolCapacity != c.RecordingWorkerConcurrency {
+		return fmt.Errorf("DROPLET_POOL_CAPACITY (%d) must equal RECORDING_WORKER_CONCURRENCY (%d) (C-cap)", c.DropletPoolCapacity, c.RecordingWorkerConcurrency)
+	}
+	if c.DropletPoolMax <= 0 {
+		return fmt.Errorf("DROPLET_POOL_MAX must be > 0 (hard spend cap)")
+	}
+	if c.DropletPoolMin < 0 || c.DropletPoolMin > c.DropletPoolMax {
+		return fmt.Errorf("DROPLET_POOL_MIN must be between 0 and DROPLET_POOL_MAX")
+	}
+	if strings.TrimSpace(c.DropletPoolRegion) == "" || strings.TrimSpace(c.DropletPoolSize) == "" || strings.TrimSpace(c.DropletPoolImage) == "" {
+		return fmt.Errorf("DROPLET_POOL_REGION, DROPLET_POOL_SIZE, and DROPLET_POOL_IMAGE are required")
 	}
 	return nil
 }

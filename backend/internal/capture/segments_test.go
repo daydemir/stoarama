@@ -7,7 +7,7 @@ import (
 )
 
 func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", DefaultSegmentDuration)
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", DefaultSegmentDuration, "")
 	joined := strings.Join(args, " ")
 
 	for _, unwanted := range []string{
@@ -51,7 +51,7 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 }
 
 func TestBuildFFmpegSegmentArgsUsesRequestedDuration(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", 90*time.Second)
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", 90*time.Second, "")
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "-t 90") {
 		t.Fatalf("expected 90s segment duration in args: %s", joined)

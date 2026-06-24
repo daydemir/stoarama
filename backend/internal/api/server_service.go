@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
@@ -56,7 +57,10 @@ func (s *Server) hasServiceBearerToken(r *http.Request) bool {
 		return false
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
-	return token != "" && token == strings.TrimSpace(s.cfg.ServiceToken)
+	if token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(strings.TrimSpace(s.cfg.ServiceToken))) == 1
 }
 
 func (s *Server) requireServiceOrLocalRecorderNodeAuth(next http.Handler) http.Handler {

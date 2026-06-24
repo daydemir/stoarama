@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -107,7 +110,11 @@ func (s *Server) handleAccountStorageDestinationsCreate(w http.ResponseWriter, r
 	endpoint := strings.TrimSpace(req.Endpoint)
 	region := strings.TrimSpace(req.Region)
 	bucket := strings.TrimSpace(req.Bucket)
-	keyPrefix := strings.Trim(strings.TrimSpace(req.KeyPrefix), "/")
+	keyPrefix, err := sanitizeStorageKeyPrefix(req.KeyPrefix)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	accessKeyID := strings.TrimSpace(req.AccessKeyID)
 	secret := strings.TrimSpace(req.SecretAccessKey)
 	for label, val := range map[string]string{
@@ -211,6 +218,11 @@ func (s *Server) handleAccountStorageDestinationDelete(w http.ResponseWriter, r 
 		WHERE id=$1 AND account_id=$2
 	`, id, principal.AccountID)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+			util.WriteError(w, http.StatusConflict, "storage destination is in use by a recording")
+			return
+		}
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete storage destination: %v", err))
 		return
 	}
@@ -222,6 +234,35 @@ func (s *Server) handleAccountStorageDestinationDelete(w http.ResponseWriter, r 
 		"destination_id": id,
 	})
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// sanitizeStorageKeyPrefix normalizes a user-supplied object-key prefix and
+// rejects path-traversal and control-character injection. An empty prefix is
+// valid (objects land at the bucket root). It strips surrounding whitespace and
+// edge slashes, then refuses backslashes, control characters, and any "."/".."
+// path segment, so the prefix can be safely composed into recording object keys.
+func sanitizeStorageKeyPrefix(raw string) (string, error) {
+	trimmed := strings.Trim(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return "", nil
+	}
+	for _, r := range trimmed {
+		if r == '\\' {
+			return "", fmt.Errorf("key_prefix must not contain backslashes")
+		}
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("key_prefix must not contain control characters")
+		}
+	}
+	for _, seg := range strings.Split(trimmed, "/") {
+		if seg == "" {
+			return "", fmt.Errorf("key_prefix must not contain empty path segments")
+		}
+		if seg == "." || seg == ".." {
+			return "", fmt.Errorf("key_prefix must not contain '.' or '..' path segments")
+		}
+	}
+	return trimmed, nil
 }
 
 // verifyStorageDestination proves the credentials can write, read, and delete in

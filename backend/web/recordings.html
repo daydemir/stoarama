@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sto-A-Rama Recordings</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0f1a;
+      --panel: #111827;
+      --panel2: #182233;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --border: #1e293b;
+      --accent: #06b6d4;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --mono: "IBM Plex Mono", monospace;
+      --sans: "IBM Plex Sans", system-ui, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f1f5f9;
+        --panel: #ffffff;
+        --panel2: #f8fafc;
+        --text: #0f172a;
+        --muted: #4b5563;
+        --border: #e2e8f0;
+        --accent: #0891b2;
+        --ok: #16a34a;
+        --warn: #d97706;
+        --err: #dc2626;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--sans);
+      font-size: 14px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 10%, transparent) 0, transparent 28%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #000) 0%, var(--bg) 58%, color-mix(in srgb, var(--bg) 88%, #07101f) 100%);
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      min-height: 40px;
+    }
+    .topbar-left, .topbar-center, .topbar-right { display: flex; align-items: center; min-width: 0; }
+    .topbar-left { gap: 10px; overflow: hidden; }
+    .topbar-center { justify-content: center; }
+    .topbar-right { gap: 10px; justify-content: flex-end; }
+    .site-title {
+      font-family: var(--mono);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      color: var(--accent);
+      white-space: nowrap;
+    }
+    .global-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel) 90%, #000);
+    }
+    .global-nav a {
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .global-nav a:hover {
+      color: var(--text);
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+      background: color-mix(in srgb, var(--panel2) 82%, transparent);
+    }
+    .global-nav a.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+    .account-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 36px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .account-chip a { color: var(--text); text-decoration: none; }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.18);
+    }
+    .eyebrow {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    h1 { margin: 0 0 10px; font-size: clamp(28px, 4vw, 40px); line-height: 0.98; letter-spacing: -0.03em; }
+    h2 { margin: 0 0 10px; font-size: 18px; line-height: 1.15; }
+    p, .note, .muted { color: var(--muted); line-height: 1.55; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
+    .stack { display: grid; gap: 10px; }
+    .section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .status { min-height: 18px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .hidden { display: none !important; }
+    label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+    input, select, button {
+      width: 100%;
+      min-height: 40px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 84%, transparent);
+      color: var(--text);
+      font: inherit;
+      padding: 10px 12px;
+    }
+    input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
+    button { cursor: pointer; background: color-mix(in srgb, var(--accent) 18%, var(--panel2)); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); color: #f8fafc; font-weight: 600; }
+    button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
+    button.secondary { background: transparent; color: var(--text); }
+    button.danger { background: transparent; color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+    .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .button-row > * { width: auto; min-width: 140px; }
+    .field { margin-bottom: 12px; }
+    .hint { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 11px;
+      border: 1px solid var(--border);
+    }
+    .badge.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+    .badge.off { color: var(--muted); }
+    .badge.healthy { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+    .badge.degraded { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+    .badge.failing { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+    .badge.idle { color: var(--muted); }
+    .empty-state { padding: 16px; border: 1px dashed var(--border); border-radius: 14px; color: var(--muted); line-height: 1.5; text-align: center; }
+    .table-wrap { overflow-x: auto; border-radius: 14px; border: 1px solid var(--border); background: color-mix(in srgb, var(--panel2) 86%, transparent); }
+    table { width: 100%; border-collapse: collapse; min-width: 860px; }
+    th, td { padding: 11px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-family: var(--mono); }
+    .mono, code { font-family: var(--mono); font-size: 12px; }
+    @media (max-width: 1100px) {
+      .grid-2 { grid-template-columns: 1fr; }
+      .topbar { grid-template-columns: minmax(0, 1fr); overflow-x: auto; }
+      .topbar-center, .topbar-right { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="site-title">STO-A-RAMA</span>
+      </div>
+      <div class="topbar-center">
+        <nav class="global-nav" aria-label="Global">
+          <a href="/streams">Streams</a>
+          <a href="/recording">Recording</a>
+          <a href="/recordings" class="active">Recordings</a>
+          <a href="/account">Account</a>
+          <a href="/docs/getting-started">Docs</a>
+        </nav>
+      </div>
+      <div class="topbar-right">
+        <div class="account-chip" id="accountChip">Checking session...</div>
+      </div>
+    </div>
+
+    <section class="panel" style="margin-bottom:16px;">
+      <div class="eyebrow">Stream recorder</div>
+      <h1>Schedule clips from a stream to your own bucket.</h1>
+      <p>Point a recording at an HLS or HTTPS stream, pick one of your storage destinations, set a cron schedule, and we capture one clip per fire to your bucket. Each recording is about $8/mo. A recording captures only while it is active and paid.</p>
+    </section>
+
+    <div id="signedOut" class="panel hidden" style="margin-bottom:16px;">
+      <div class="section-title">
+        <div><div class="eyebrow">Sign in</div><h2>Email magic link</h2></div>
+        <p>Recordings are bound to your account. Sign in to manage them.</p>
+      </div>
+      <label for="email">Email</label>
+      <input id="email" type="email" placeholder="you@example.org" />
+      <div class="button-row" style="margin-top:12px;"><button id="requestLink" type="button">Email Magic Link</button></div>
+      <div id="requestStatus" class="status"></div>
+    </div>
+
+    <div id="signedIn" class="hidden">
+      <section class="panel" id="billingPanel" style="margin-bottom:16px;">
+        <div class="section-title">
+          <div><div class="eyebrow">Billing</div><h2>Subscription</h2></div>
+        </div>
+        <div id="billingStatus" class="status"></div>
+        <div class="button-row" style="margin-top:12px;">
+          <button id="subscribeBtn" type="button">Subscribe</button>
+          <button id="portalBtn" class="secondary" type="button">Manage billing</button>
+        </div>
+        <div id="billingActionStatus" class="status"></div>
+      </section>
+
+      <div class="grid-2">
+        <section class="panel">
+          <div class="section-title">
+            <div><div class="eyebrow">New recording</div><h2>Configure a capture</h2></div>
+          </div>
+          <div class="field">
+            <label for="recName">Name</label>
+            <input id="recName" type="text" placeholder="Lobby camera" />
+          </div>
+          <div class="field">
+            <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
+            <input id="recURL" type="url" placeholder="https://example.com/live/index.m3u8" />
+          </div>
+          <div class="field">
+            <label for="recDest">Storage destination</label>
+            <select id="recDest"></select>
+            <div class="hint">Don't see your bucket? <a href="/account">Add a storage destination</a>, then reload.</div>
+          </div>
+          <div class="field">
+            <label for="recCron">Cron schedule (5 fields, UTC by default)</label>
+            <input id="recCron" type="text" placeholder="0 * * * *" />
+            <div id="cronPreview" class="hint"></div>
+          </div>
+          <div class="grid-2" style="margin-bottom:0;">
+            <div class="field">
+              <label for="recTZ">Timezone (IANA)</label>
+              <input id="recTZ" type="text" placeholder="UTC" />
+            </div>
+            <div class="field">
+              <label for="recClip">Clip duration (seconds)</label>
+              <input id="recClip" type="number" min="5" max="900" value="60" />
+            </div>
+          </div>
+          <div class="button-row"><button id="createRecBtn" type="button">Create Recording</button></div>
+          <div id="createRecStatus" class="status"></div>
+        </section>
+
+        <section class="panel">
+          <div class="section-title">
+            <div><div class="eyebrow">Notes</div><h2>How scheduling works</h2></div>
+          </div>
+          <div class="stack">
+            <div class="note">A recording must be active and within your paid quantity to capture. Pausing keeps the configuration but stops capture. Deleting cancels it and frees the seat.</div>
+            <div class="note">The minimum gap between fires and the maximum clip length are validated server-side; the clip must be shorter than the gap between fires.</div>
+            <div class="note">The schedule preview here is advisory. The server is the source of truth.</div>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel">
+        <div class="section-title">
+          <div><div class="eyebrow">Recordings</div><h2>Your captures</h2></div>
+          <button id="refreshBtn" class="secondary" type="button" style="width:auto;min-width:120px;">Refresh</button>
+        </div>
+        <div id="recEmpty" class="empty-state">No recordings yet. Create one above.</div>
+        <div id="recBox" class="hidden table-wrap">
+          <table>
+            <thead>
+              <tr><th>Name</th><th>State</th><th>Health</th><th>Schedule</th><th>Last clip</th><th>24h</th><th></th></tr>
+            </thead>
+            <tbody id="recRows"></tbody>
+          </table>
+        </div>
+        <div id="recListStatus" class="status"></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const accountChip = document.getElementById('accountChip');
+    const signedOut = document.getElementById('signedOut');
+    const signedIn = document.getElementById('signedIn');
+    const requestStatus = document.getElementById('requestStatus');
+    const recDest = document.getElementById('recDest');
+    const createRecStatus = document.getElementById('createRecStatus');
+    const recEmpty = document.getElementById('recEmpty');
+    const recBox = document.getElementById('recBox');
+    const recRows = document.getElementById('recRows');
+    const recListStatus = document.getElementById('recListStatus');
+    const cronPreview = document.getElementById('cronPreview');
+    const billingStatus = document.getElementById('billingStatus');
+    const billingActionStatus = document.getElementById('billingActionStatus');
+
+    const authParams = new URLSearchParams(window.location.search);
+    const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
+
+    async function fetchJSON(path, opts = {}) {
+      const method = String((opts && opts.method) || 'GET').toUpperCase();
+      const headers = { ...(opts.headers || {}) };
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && !headers['Idempotency-Key']) {
+        headers['Idempotency-Key'] = `${method}:${path}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+      }
+      const res = await fetch(path, { ...opts, credentials: 'include', headers });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+      return data;
+    }
+
+    function setStatus(el, text, kind) {
+      if (!(el instanceof HTMLElement)) return;
+      el.textContent = text || '';
+      el.className = `status${kind ? ` ${kind}` : ''}`;
+    }
+
+    function formatDate(v) {
+      if (!v) return 'Never';
+      try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
+    }
+
+    function escapeHTML(v) {
+      return String(v || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+    }
+
+    function sleep(ms) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
+
+    async function fetchAccountWithRetry() {
+      let lastErr = null;
+      const attempts = authCompleted ? 6 : 1;
+      for (let i = 0; i < attempts; i += 1) {
+        try {
+          const payload = await fetchJSON('/api/v1/account/me');
+          return payload.account || {};
+        } catch (err) {
+          lastErr = err;
+          if (i < attempts - 1) await sleep(250);
+        }
+      }
+      throw lastErr || new Error('unauthorized');
+    }
+
+    function updateCronPreview() {
+      const expr = String(document.getElementById('recCron').value || '').trim();
+      if (!expr) { cronPreview.textContent = ''; return; }
+      const fields = expr.split(/\s+/);
+      if (fields.length !== 5) {
+        cronPreview.textContent = 'Cron must have exactly 5 fields (minute hour day-of-month month day-of-week).';
+        return;
+      }
+      cronPreview.textContent = 'Will be validated on save (min gap and clip-shorter-than-gap are enforced server-side).';
+    }
+
+    async function refreshDestinations() {
+      try {
+        const payload = await fetchJSON('/api/v1/account/storage-destinations');
+        const items = (Array.isArray(payload.items) ? payload.items : []).filter((d) => String(d.status) === 'verified');
+        if (items.length === 0) {
+          recDest.innerHTML = '<option value="">No verified destinations</option>';
+          return;
+        }
+        recDest.innerHTML = items.map((d) => `<option value="${Number(d.id)}">${escapeHTML(String(d.name || ''))} (${escapeHTML(String(d.bucket || ''))})</option>`).join('');
+      } catch (err) {
+        recDest.innerHTML = '<option value="">Failed to load destinations</option>';
+      }
+    }
+
+    async function refreshBilling() {
+      try {
+        const b = await fetchJSON('/api/v1/account/billing');
+        if (!b.billing_enabled) {
+          setStatus(billingStatus, 'Billing is not enabled on this deployment. Recordings run in free mode.', '');
+        } else {
+          const parts = [`Status: ${escapeHTML(String(b.subscription_status || 'none'))}`, `Paid recordings: ${Number(b.paid_quantity || 0)}`];
+          if (b.current_period_end) parts.push(`Renews ${formatDate(b.current_period_end)}`);
+          if (b.cancel_at_period_end) parts.push('(cancels at period end)');
+          setStatus(billingStatus, parts.join(' . '), 'ok');
+        }
+      } catch (err) {
+        setStatus(billingStatus, String(err), 'err');
+      }
+    }
+
+    function badgeState(rec) {
+      if (rec.status === 'canceled') return '<span class="badge off">canceled</span>';
+      if (rec.live) return '<span class="badge live">live</span>';
+      if (rec.status === 'paused') return '<span class="badge off">paused</span>';
+      if (rec.status === 'active' && !rec.billable) return '<span class="badge off">not active (billing)</span>';
+      return '<span class="badge off">' + escapeHTML(String(rec.status || '')) + '</span>';
+    }
+
+    function badgeHealth(rec) {
+      const h = String(rec.health || 'idle');
+      return `<span class="badge ${escapeHTML(h)}">${escapeHTML(h)}</span>`;
+    }
+
+    async function refreshRecordings() {
+      try {
+        const payload = await fetchJSON('/api/v1/account/recordings');
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        if (items.length === 0) {
+          recBox.classList.add('hidden');
+          recEmpty.classList.remove('hidden');
+          return;
+        }
+        recEmpty.classList.add('hidden');
+        recBox.classList.remove('hidden');
+        recRows.innerHTML = items.map((rec) => {
+          const id = Number(rec.id);
+          const pauseResume = rec.status === 'active'
+            ? `<button type="button" class="secondary" data-pause="${id}" style="width:auto;min-width:90px;">Pause</button>`
+            : (rec.status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}" style="width:auto;min-width:90px;">Resume</button>` : '');
+          return `
+            <tr>
+              <td><b>${escapeHTML(String(rec.name || ''))}</b><div class="muted mono">${escapeHTML(String(rec.stream_url || ''))}</div></td>
+              <td>${badgeState(rec)}</td>
+              <td>${badgeHealth(rec)}</td>
+              <td><span class="mono">${escapeHTML(String(rec.cron_expr || ''))}</span><div class="muted">${escapeHTML(String(rec.cron_timezone || 'UTC'))} . ${Number(rec.clip_duration_sec || 0)}s clips</div></td>
+              <td>${escapeHTML(formatDate(rec.last_clip_at))}</td>
+              <td>${Number(rec.recent_clip_count || 0)}</td>
+              <td><div class="button-row">${pauseResume}<button type="button" class="danger" data-delete="${id}" style="width:auto;min-width:90px;">Delete</button></div></td>
+            </tr>
+          `;
+        }).join('');
+        wireRowActions();
+      } catch (err) {
+        setStatus(recListStatus, String(err), 'err');
+      }
+    }
+
+    function wireRowActions() {
+      recRows.querySelectorAll('button[data-pause]').forEach((btn) => {
+        btn.addEventListener('click', () => mutateRecording(btn.getAttribute('data-pause'), 'pause'));
+      });
+      recRows.querySelectorAll('button[data-resume]').forEach((btn) => {
+        btn.addEventListener('click', () => mutateRecording(btn.getAttribute('data-resume'), 'resume'));
+      });
+      recRows.querySelectorAll('button[data-delete]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          if (!window.confirm('Delete this recording? This cancels it and frees the billing seat.')) return;
+          const id = String(btn.getAttribute('data-delete') || '').trim();
+          try {
+            await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            await Promise.all([refreshRecordings(), refreshBilling()]);
+          } catch (err) {
+            setStatus(recListStatus, String(err), 'err');
+          }
+        });
+      });
+    }
+
+    async function mutateRecording(id, action) {
+      const rid = String(id || '').trim();
+      try {
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(rid)}/${action}`, { method: 'POST' });
+        await refreshRecordings();
+      } catch (err) {
+        setStatus(recListStatus, String(err), 'err');
+      }
+    }
+
+    document.getElementById('createRecBtn').addEventListener('click', async () => {
+      const body = {
+        name: String(document.getElementById('recName').value || '').trim(),
+        stream_url: String(document.getElementById('recURL').value || '').trim(),
+        storage_destination_id: Number(recDest.value || 0),
+        cron_expr: String(document.getElementById('recCron').value || '').trim(),
+        cron_timezone: String(document.getElementById('recTZ').value || '').trim() || 'UTC',
+        clip_duration_sec: Number(document.getElementById('recClip').value || 60),
+      };
+      try {
+        await fetchJSON('/api/v1/account/recordings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        setStatus(createRecStatus, 'Recording created.', 'ok');
+        document.getElementById('recName').value = '';
+        document.getElementById('recURL').value = '';
+        await Promise.all([refreshRecordings(), refreshBilling()]);
+      } catch (err) {
+        setStatus(createRecStatus, String(err), 'err');
+      }
+    });
+
+    document.getElementById('subscribeBtn').addEventListener('click', async () => {
+      try {
+        const out = await fetchJSON('/api/v1/account/billing/checkout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        if (out.checkout_url) { window.location.assign(out.checkout_url); return; }
+        if (out.portal_url) { window.location.assign(out.portal_url); return; }
+        setStatus(billingActionStatus, 'No checkout URL returned.', 'err');
+      } catch (err) {
+        setStatus(billingActionStatus, String(err), 'err');
+      }
+    });
+
+    document.getElementById('portalBtn').addEventListener('click', async () => {
+      try {
+        const out = await fetchJSON('/api/v1/account/billing/portal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        if (out.url) { window.location.assign(out.url); return; }
+        setStatus(billingActionStatus, 'No portal URL returned.', 'err');
+      } catch (err) {
+        setStatus(billingActionStatus, String(err), 'err');
+      }
+    });
+
+    document.getElementById('requestLink').addEventListener('click', async () => {
+      const email = String(document.getElementById('email').value || '').trim();
+      try {
+        await fetchJSON('/api/v1/auth/request-link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, redirect_path: '/recordings' }),
+        });
+        setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
+      } catch (err) {
+        setStatus(requestStatus, String(err), 'err');
+      }
+    });
+
+    document.getElementById('refreshBtn').addEventListener('click', () => { void refreshRecordings(); });
+    document.getElementById('recCron').addEventListener('input', updateCronPreview);
+
+    async function boot() {
+      try {
+        const account = await fetchAccountWithRetry();
+        const email = String(account.email || '').trim();
+        accountChip.innerHTML = email ? escapeHTML(email) : '<a href="/account">Account</a>';
+        signedOut.classList.add('hidden');
+        signedIn.classList.remove('hidden');
+        await Promise.all([refreshDestinations(), refreshBilling(), refreshRecordings()]);
+      } catch (_) {
+        accountChip.innerHTML = '<a href="/account">Sign in</a>';
+        signedIn.classList.add('hidden');
+        signedOut.classList.remove('hidden');
+      }
+    }
+
+    void boot();
+  </script>
+</body>
+</html>

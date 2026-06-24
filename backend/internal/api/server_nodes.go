@@ -53,6 +53,22 @@ func (s *Server) requireNodeAuth(next http.Handler) http.Handler {
 	})
 }
 
+// requireRecorderNodeAuth authenticates a per-droplet local_recorder node token
+// and authorizes ONLY the recorder endpoints. It never accepts the shared
+// SERVICE_TOKEN and never grants the capture/inference/media worker surface, so
+// a recorder droplet's blast radius is limited to its own recording jobs.
+func (s *Server) requireRecorderNodeAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, err := s.authenticateNodeRequest(r)
+		if err != nil || strings.TrimSpace(principal.NodeType) != nodeTypeLocalRecorder {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		ctx := context.WithValue(r.Context(), nodePrincipalContextKey, principal)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func nodePrincipalFromContext(ctx context.Context) (nodePrincipal, bool) {
 	if ctx == nil {
 		return nodePrincipal{}, false
