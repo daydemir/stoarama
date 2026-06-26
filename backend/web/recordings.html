@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <style>
     :root {
       --bg: #0a0f1a;
@@ -223,6 +224,15 @@
     .seg button.on { color: #fff; background: var(--accent); border-color: var(--accent); }
     .preview { margin-top: 8px; font-size: 13px; color: var(--text); }
     .preview .muted { color: var(--muted); }
+    .video-preview {
+      margin-top: 10px;
+      width: 100%;
+      max-height: 280px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #000;
+      display: block;
+    }
     .disclose { margin-top: 10px; }
     .disclose > summary { cursor: pointer; color: var(--accent); font-size: 13px; list-style: none; }
     .disclose > summary::-webkit-details-marker { display: none; }
@@ -307,6 +317,8 @@
         <div class="field">
           <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
           <input id="recURL" type="url" placeholder="https://example.com/live/stream.m3u8" />
+          <div id="streamStatus" class="status" style="margin-top:8px;"></div>
+          <video id="streamPreview" class="video-preview hidden" muted playsinline controls></video>
         </div>
         <div class="field">
           <label for="recName">Name (optional)</label>
@@ -371,6 +383,8 @@
         <!-- Where clips go -->
         <div class="field">
           <label>Where clips go</label>
+          <!-- Connection state for the selected/connected bucket (gates Start) -->
+          <div id="bucketState" class="status" style="margin-bottom:10px;">Not connected</div>
           <!-- Dropdown of saved buckets (shown when at least one verified bucket exists) -->
           <div id="destPicker" class="hidden">
             <select id="recDest"></select>
@@ -423,7 +437,7 @@
               </div>
             </details>
             <div class="button-row" style="margin-top:14px;">
-              <button id="cnTestBtn" type="button">Test connection</button>
+              <button id="cnTestBtn" type="button">Check connection</button>
               <button id="cnCancelBtn" type="button" class="secondary">Cancel</button>
             </div>
             <div id="cnStatus" class="status" style="margin-top:8px;"></div>
@@ -456,6 +470,8 @@
       composer: document.getElementById('composer'),
       composerClose: document.getElementById('composerClose'),
       recURL: document.getElementById('recURL'),
+      streamStatus: document.getElementById('streamStatus'),
+      streamPreview: document.getElementById('streamPreview'),
       recName: document.getElementById('recName'),
       schedSeg: document.getElementById('schedSeg'),
       dailyControls: document.getElementById('dailyControls'),
@@ -469,6 +485,7 @@
       clipSeg: document.getElementById('clipSeg'),
       clipCustomWrap: document.getElementById('clipCustomWrap'),
       clipCustom: document.getElementById('clipCustom'),
+      bucketState: document.getElementById('bucketState'),
       destPicker: document.getElementById('destPicker'),
       recDest: document.getElementById('recDest'),
       connectAnotherBtn: document.getElementById('connectAnotherBtn'),
@@ -520,6 +537,11 @@
       clipSelected: 60,
       verifiedDestId: 0, // a bucket just verified inline this session
       starting: false,
+      // Bucket connection gate (change 1): 'idle' | 'checking' | 'connected' | 'error'.
+      bucketState: 'idle',
+      // Stream probe gate (change 2): the authoritative server verdict. ok===true
+      // is required for Start; the in-browser preview never gates on its own.
+      streamProbe: { token: 0, ok: false },
     };
 
     async function fetchJSON(path, opts = {}) {
@@ -723,6 +745,30 @@
       refreshStartEnabled();
     }
 
+    // ---- Bucket connection state (change 1) ----
+
+    // Single writer for the bucket gate. Renders the visible state line and
+    // re-evaluates Start. text overrides the default copy (used for errors).
+    function setBucketState(s, text) {
+      state.bucketState = s;
+      const map = {
+        idle: { msg: 'Not connected', kind: '' },
+        checking: { msg: 'Checking...', kind: '' },
+        connected: { msg: 'Connected', kind: 'ok' },
+        error: { msg: 'Not connected', kind: 'err' },
+      };
+      const m = map[s] || map.idle;
+      setStatus(els.bucketState, text || m.msg, m.kind);
+      refreshStartEnabled();
+    }
+
+    // Selecting a saved/verified bucket from the dropdown counts as Connected.
+    function syncBucketStateFromSelection() {
+      const dest = selectedDestId();
+      if (dest > 0) setBucketState('connected');
+      else setBucketState('idle');
+    }
+
     // ---- Provider connect form ----
 
     function fillProviderSelect() {
@@ -766,11 +812,12 @@
         secret_access_key: String(els.cnSecret.value || '').trim(),
       };
       if (!body.name) body.name = body.bucket;
-      setStatus(els.cnStatus, 'Testing connection...', '');
+      setStatus(els.cnStatus, 'Checking connection...', '');
       els.cnTestBtn.disabled = true;
+      setBucketState('checking');
       try {
         // POST only persists on a green PutObject -> Head -> Delete probe, so a 201
-        // response is a verified, saved bucket.
+        // response is a verified, saved bucket == Connected.
         const created = await fetchJSON('/api/v1/account/storage-destinations', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -783,9 +830,11 @@
         closeConnectForm();
         els.destPicker.classList.remove('hidden');
         if (state.verifiedDestId > 0) els.recDest.value = String(state.verifiedDestId);
-        refreshStartEnabled();
+        syncBucketStateFromSelection();
       } catch (err) {
-        setStatus(els.cnStatus, String(err.message || err), 'err');
+        const msg = String(err.message || err);
+        setStatus(els.cnStatus, msg, 'err');
+        setBucketState('error', `Not connected: ${msg}`);
       } finally {
         els.cnTestBtn.disabled = false;
       }
@@ -813,6 +862,7 @@
         // No verified bucket: the connect form is the way to choose one.
         openConnectForm('Connect your S3 bucket');
         els.cnCancelBtn.classList.add('hidden');
+        syncBucketStateFromSelection();
         return;
       }
       els.cnCancelBtn.classList.remove('hidden');
@@ -823,6 +873,8 @@
       els.destPicker.classList.remove('hidden');
       const want = state.verifiedDestId > 0 ? String(state.verifiedDestId) : prev;
       if (want && items.some((d) => String(d.id) === want)) els.recDest.value = want;
+      // A verified bucket selected in the dropdown counts as Connected.
+      syncBucketStateFromSelection();
     }
 
     function selectedDestId() {
@@ -830,13 +882,134 @@
       return 0;
     }
 
+    // ---- Stream probe + inline preview (change 2) ----
+
+    let streamDebounce = 0;          // setTimeout handle for the debounce
+    let activeHls = null;            // live hls.js instance, if any
+
+    function isHLSURL(url) {
+      const u = String(url || '').toLowerCase();
+      return u.includes('.m3u8') || u.includes('!hls');
+    }
+
+    // Tear down any mounted player and hide the <video>. Idempotent.
+    function teardownPreview() {
+      if (activeHls) { try { activeHls.destroy(); } catch (_) { /* ignore */ } activeHls = null; }
+      const v = els.streamPreview;
+      try { v.pause(); } catch (_) { /* ignore */ }
+      v.removeAttribute('src');
+      try { v.load(); } catch (_) { /* ignore */ }
+      v.classList.add('hidden');
+    }
+
+    // Mount an in-browser player for a probe-confirmed source. Browser playback is
+    // best-effort only: on error/timeout we show a soft note and DO NOT gate Start.
+    // token guards against a stale URL winning a race with a newer one.
+    function mountPreview(url, token) {
+      teardownPreview();
+      const v = els.streamPreview;
+      const softNote = () => {
+        if (token !== state.streamProbe.token) return;
+        setStatus(els.streamStatus,
+          'Stream is reachable. In-browser preview is unavailable for this source (often a browser CORS limit); it will still record.',
+          'warn');
+      };
+      let settled = false;
+      const timer = window.setTimeout(() => { if (!settled) { settled = true; teardownPreview(); softNote(); } }, 8000);
+      const onPlaying = () => {
+        if (settled) return;
+        settled = true; window.clearTimeout(timer);
+        if (token !== state.streamProbe.token) { teardownPreview(); return; }
+        v.classList.remove('hidden');
+      };
+      const onError = () => {
+        if (settled) return;
+        settled = true; window.clearTimeout(timer);
+        teardownPreview(); softNote();
+      };
+      v.addEventListener('playing', onPlaying, { once: true });
+
+      if (isHLSURL(url)) {
+        if (window.Hls && window.Hls.isSupported()) {
+          const hls = new window.Hls({ enableWorker: true });
+          activeHls = hls;
+          hls.on(window.Hls.Events.ERROR, (_evt, data) => { if (data && data.fatal) onError(); });
+          hls.loadSource(url);
+          hls.attachMedia(v);
+          v.classList.remove('hidden');
+          v.play().catch(() => { /* autoplay may be blocked; controls remain */ });
+        } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+          // Native HLS (Safari).
+          v.src = url;
+          v.addEventListener('error', onError, { once: true });
+          v.classList.remove('hidden');
+          v.play().catch(() => { /* controls remain */ });
+        } else {
+          window.clearTimeout(timer); settled = true;
+          softNote();
+        }
+      } else {
+        // Direct http(s) video URL.
+        v.src = url;
+        v.addEventListener('error', onError, { once: true });
+        v.classList.remove('hidden');
+        v.play().catch(() => { /* controls remain */ });
+      }
+    }
+
+    // Authoritative server probe (POST /recordings/probe). ok:true is the Start
+    // gate for the stream half; ok:false is a hard error that keeps Start disabled.
+    async function probeStream(url) {
+      const token = state.streamProbe.token + 1;
+      state.streamProbe = { token, ok: false };
+      teardownPreview();
+      if (!url) { setStatus(els.streamStatus, '', ''); refreshStartEnabled(); return; }
+      setStatus(els.streamStatus, 'Checking...', '');
+      refreshStartEnabled();
+      try {
+        const out = await fetchJSON('/api/v1/account/recordings/probe', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stream_url: url }),
+        });
+        if (token !== state.streamProbe.token) return; // a newer URL superseded us
+        if (out && out.ok === true) {
+          state.streamProbe = { token, ok: true };
+          setStatus(els.streamStatus, 'Valid', 'ok');
+          mountPreview(url, token);
+        } else {
+          state.streamProbe = { token, ok: false };
+          setStatus(els.streamStatus, `Invalid: ${String((out && out.error) || 'stream could not be validated')}`, 'err');
+        }
+      } catch (err) {
+        if (token !== state.streamProbe.token) return;
+        state.streamProbe = { token, ok: false };
+        setStatus(els.streamStatus, `Invalid: ${String(err.message || err)}`, 'err');
+      } finally {
+        if (token === state.streamProbe.token) refreshStartEnabled();
+      }
+    }
+
+    function scheduleStreamProbe() {
+      // URL changed: drop any prior verdict immediately so Start can't fire on a
+      // stale ok while the new URL is still unvalidated.
+      state.streamProbe = { token: state.streamProbe.token + 1, ok: false };
+      refreshStartEnabled();
+      window.clearTimeout(streamDebounce);
+      const url = String(els.recURL.value || '').trim();
+      streamDebounce = window.setTimeout(() => probeStream(url), 600);
+    }
+
     // ---- Start enabled gate ----
 
+    // Start requires BOTH gates: bucket Connected AND stream probe ok:true (plus a
+    // valid schedule/clip and no in-flight start).
     function refreshStartEnabled() {
       const url = String(els.recURL.value || '').trim();
       const schedOK = refreshScheduleUIQuiet();
       const dest = selectedDestId();
-      const ready = !state.starting && !!url && schedOK && dest > 0;
+      const bucketOK = state.bucketState === 'connected' && dest > 0;
+      const streamOK = state.streamProbe.ok === true;
+      const ready = !state.starting && !!url && schedOK && bucketOK && streamOK;
       els.startBtn.disabled = !ready;
     }
 
@@ -1054,6 +1227,10 @@
 
     function closeComposer() {
       els.composer.classList.add('hidden');
+      window.clearTimeout(streamDebounce);
+      teardownPreview();
+      state.streamProbe = { token: state.streamProbe.token + 1, ok: false };
+      setStatus(els.streamStatus, '', '');
     }
 
     // ---- Start handler ----
@@ -1267,8 +1444,12 @@
     els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.schedTZCustom.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.clipCustom.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
-    els.recURL.addEventListener('input', refreshStartEnabled);
-    els.recDest.addEventListener('change', refreshStartEnabled);
+    els.recURL.addEventListener('input', scheduleStreamProbe);
+    els.recURL.addEventListener('blur', () => {
+      window.clearTimeout(streamDebounce);
+      probeStream(String(els.recURL.value || '').trim());
+    });
+    els.recDest.addEventListener('change', syncBucketStateFromSelection);
     els.cnProvider.addEventListener('change', applyProviderDefaults);
     els.cnTestBtn.addEventListener('click', testConnection);
     els.cnCancelBtn.addEventListener('click', () => {

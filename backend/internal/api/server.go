@@ -213,6 +213,7 @@ func (s *Server) router() http.Handler {
 			account.Delete("/storage-destinations/{id}", s.handleAccountStorageDestinationDelete)
 			account.Get("/recordings", s.handleAccountRecordingsList)
 			account.Post("/recordings", s.handleAccountRecordingsCreate)
+			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
 			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)

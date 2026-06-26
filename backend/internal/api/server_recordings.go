@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -19,6 +20,10 @@ import (
 
 // recordingProbeTimeout bounds the create-time ffmpeg reachability probe.
 const recordingProbeTimeout = 8 * time.Second
+
+type recordingProbeRequest struct {
+	StreamURL string `json:"stream_url"`
+}
 
 type recordingCreateRequest struct {
 	Name                 string `json:"name"`
@@ -111,15 +116,9 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// S-1: SSRF guard on the user-supplied URL before it ever reaches ffmpeg.
-	validatedIP, err := netguard.ValidatePublicURL(streamURL)
-	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	// HLS/HTTPS only. Reject youtube/image/rtsp/unsupported sources for this feature.
-	sourceKind, err := classifyRecordingSource(streamURL)
+	// S-1: SSRF guard + HLS/HTTPS classify on the user-supplied URL before it ever
+	// reaches ffmpeg. This is the validate half of the shared validate+probe path.
+	validatedIP, sourceKind, err := validateRecordingStreamURL(streamURL)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -151,14 +150,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 
 	// Reachability probe pinned to the validated IP, so the probe socket cannot
 	// be redirected by a DNS rebind between validation above and connect time.
-	pinnedProbeURL, probeHost, err := netguard.PinnedURL(streamURL, validatedIP)
-	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	probeCtx, cancel := context.WithTimeout(r.Context(), recordingProbeTimeout)
-	defer cancel()
-	if err := probeStreamReachable(probeCtx, pinnedProbeURL, probeHost); err != nil {
+	if err := probeRecordingStreamReachable(r.Context(), streamURL, validatedIP); err != nil {
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream not reachable: %v", err))
 		return
 	}
@@ -260,6 +252,41 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 
 	util.WriteJSON(w, http.StatusCreated, resp)
+}
+
+// handleAccountRecordingsProbe authoritatively validates a stream URL the same
+// way create does (SSRF guard -> HLS/HTTPS classify -> IP-pinned ffmpeg
+// reachability probe) so the frontend can verify a source before/while creating
+// a recording. Because it shells ffmpeg on our dyno against a user-supplied URL,
+// the SSRF guard is mandatory. A guard/classify/probe failure returns 200 with
+// {"ok":false,"error":...} so the UI can show the reason inline; 4xx is reserved
+// for malformed requests / a missing stream_url.
+func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Request) {
+	if _, ok := accountPrincipalFromContext(r.Context()); !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req recordingProbeRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	streamURL := strings.TrimSpace(req.StreamURL)
+	if streamURL == "" {
+		util.WriteError(w, http.StatusBadRequest, "stream_url is required")
+		return
+	}
+
+	validatedIP, sourceKind, err := validateRecordingStreamURL(streamURL)
+	if err != nil {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if err := probeRecordingStreamReachable(r.Context(), streamURL, validatedIP); err != nil {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf("stream not reachable: %v", err)})
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "source_kind": sourceKind})
 }
 
 func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Request) {
@@ -497,11 +524,35 @@ func classifyRecordingSource(streamURL string) (string, error) {
 	}
 }
 
-// probeStreamReachable runs a bounded ffmpeg open against the (already
-// SSRF-validated, IP-pinned) URL to confirm the source is live before
-// persisting. pinHost carries the original hostname for the Host header / SNI.
-func probeStreamReachable(ctx context.Context, streamURL string, pinHost string) error {
-	return capture.ProbeReachable(ctx, streamURL, pinHost)
+// validateRecordingStreamURL is the shared validate half of the create/probe
+// path: it runs the SSRF guard (rejecting loopback/link-local/metadata/RFC1918)
+// and the HLS/HTTPS-only classifier, returning the validated IP to pin the probe
+// to and the resolved source_kind.
+func validateRecordingStreamURL(streamURL string) (net.IP, string, error) {
+	validatedIP, err := netguard.ValidatePublicURL(streamURL)
+	if err != nil {
+		return nil, "", err
+	}
+	sourceKind, err := classifyRecordingSource(streamURL)
+	if err != nil {
+		return nil, "", err
+	}
+	return validatedIP, sourceKind, nil
+}
+
+// probeRecordingStreamReachable is the shared probe half of the create/probe
+// path: it pins the (already SSRF-validated) URL to validatedIP so the probe
+// socket cannot be redirected by a DNS rebind between validation and connect
+// time, then runs a bounded ffmpeg open to confirm the source is live. pinHost
+// carries the original hostname for the Host header / SNI.
+func probeRecordingStreamReachable(ctx context.Context, streamURL string, validatedIP net.IP) error {
+	pinnedProbeURL, probeHost, err := netguard.PinnedURL(streamURL, validatedIP)
+	if err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, recordingProbeTimeout)
+	defer cancel()
+	return capture.ProbeReachable(probeCtx, pinnedProbeURL, probeHost)
 }
 
 func scanRecordingListRow(row pgx.Row) (map[string]any, error) {
