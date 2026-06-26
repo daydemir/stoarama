@@ -11,8 +11,8 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 )
 
-// forecastRecording is one active+billable recording's schedule, loaded for the
-// demand forecast.
+// forecastRecording is one capturing recording's schedule, loaded for the demand
+// forecast (status='active', window open now, card on file when billing is on).
 type forecastRecording struct {
 	cronExpr        string
 	cronTimezone    string
@@ -36,22 +36,21 @@ type jobInterval struct {
 	End   time.Time
 }
 
-// ForecastDemand loads every capturing recording (status='active' and, when
-// billing is enabled, billable) and forecasts the peak concurrent clip count and
-// the earliest fire in [now, now+lookahead]. It reads, never writes, the queue.
+// ForecastDemand loads every capturing recording (status='active', inside its
+// [start_at, end_at) window, and, when billing is enabled, whose account has a
+// card on file) and forecasts the peak concurrent clip count and the earliest
+// fire in [now, now+lookahead]. It reads, never writes, the queue.
 func ForecastDemand(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, now time.Time, lookahead time.Duration) (Forecast, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec
 		FROM recordings rec
 		WHERE rec.status='active'
+		  AND rec.start_at <= now()
+		  AND (rec.end_at IS NULL OR now() < rec.end_at)
 		  AND ($1 OR EXISTS (
 		        SELECT 1 FROM account_billing b
 		        WHERE b.account_id = rec.account_id
-		          AND b.subscription_status IN ('active','trialing','past_due')
-		          AND (b.subscription_status <> 'past_due' OR b.current_period_end > now())
-		          AND (SELECT count(*) FROM recordings r2
-		                 WHERE r2.account_id = rec.account_id AND r2.status <> 'canceled'
-		                   AND (r2.created_at, r2.id) <= (rec.created_at, rec.id)) <= b.paid_quantity))
+		          AND b.has_payment_method))
 	`, !billingEnabled)
 	if err != nil {
 		return Forecast{}, fmt.Errorf("forecast: select capturing recordings: %w", err)

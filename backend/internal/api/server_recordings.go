@@ -26,12 +26,16 @@ type recordingProbeRequest struct {
 }
 
 type recordingCreateRequest struct {
-	Name                 string `json:"name"`
-	StreamURL            string `json:"stream_url"`
-	StorageDestinationID int64  `json:"storage_destination_id"`
-	CronExpr             string `json:"cron_expr"`
-	CronTimezone         string `json:"cron_timezone"`
-	ClipDurationSec      int    `json:"clip_duration_sec"`
+	Name                 string     `json:"name"`
+	StreamURL            string     `json:"stream_url"`
+	StorageDestinationID int64      `json:"storage_destination_id"`
+	CronExpr             string     `json:"cron_expr"`
+	CronTimezone         string     `json:"cron_timezone"`
+	ClipDurationSec      int        `json:"clip_duration_sec"`
+	// Capture window. StartAt defaults to now() (start immediately); EndAt is
+	// open-ended when nil. When both are set, EndAt must be strictly after StartAt.
+	StartAt *time.Time `json:"start_at"`
+	EndAt   *time.Time `json:"end_at"`
 }
 
 func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Request) {
@@ -44,15 +48,15 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		SELECT
 			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
 			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec,
-			rec.status, rec.next_fire_at, rec.last_clip_at,
+			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
 			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
-			COALESCE(bs.billable, false) AS billable,
+			COALESCE((SELECT b.has_payment_method FROM account_billing b
+			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 			rec.created_at
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-		LEFT JOIN recording_billing_state bs ON bs.recording_id = rec.id
 		WHERE rec.account_id=$1 AND rec.status <> 'canceled'
 		ORDER BY rec.created_at DESC, rec.id DESC
 	`, principal.AccountID)
@@ -63,7 +67,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	defer rows.Close()
 	items := make([]map[string]any, 0, 8)
 	for rows.Next() {
-		item, err := scanRecordingListRow(rows)
+		item, err := scanRecordingListRow(rows, s.billing != nil)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan recording: %v", err))
 			return
@@ -114,6 +118,23 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	if clipDuration < 5 || clipDuration > 900 {
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
+	}
+
+	// Capture window: start_at defaults to now() (start immediately), end_at is
+	// open-ended when nil. When both are present, end_at must be strictly after
+	// start_at (mirrors the recordings_window_chk DB constraint).
+	startAt := time.Now().UTC()
+	if req.StartAt != nil {
+		startAt = req.StartAt.UTC()
+	}
+	var endAtArg any
+	if req.EndAt != nil {
+		endAt := req.EndAt.UTC()
+		if !endAt.After(startAt) {
+			util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+			return
+		}
+		endAtArg = endAt
 	}
 
 	// S-1: SSRF guard + HLS/HTTPS classify on the user-supplied URL before it ever
@@ -187,13 +208,15 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	var (
 		id        int64
 		createdAt time.Time
+		startOut  time.Time
+		endOut    *time.Time
 	)
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, name, stream_url, source_kind, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)
-		RETURNING id, created_at
-	`, principal.AccountID, req.StorageDestinationID, name, streamURL, sourceKind, cronExpr, cronTimezone, clipDuration, nextFireArg).Scan(&id, &createdAt)
+			(account_id, storage_destination_id, name, stream_url, source_kind, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at, start_at, end_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10,$11)
+		RETURNING id, created_at, start_at, end_at
+	`, principal.AccountID, req.StorageDestinationID, name, streamURL, sourceKind, cronExpr, cronTimezone, clipDuration, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -201,14 +224,6 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			return
 		}
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create recording: %v", err))
-		return
-	}
-
-	// B-3: the Stripe quantity is the absolute live recording count, recomputed in
-	// the same tx so a concurrent create/delete cannot push a stale seat count. A
-	// missing billing client / subscription item is a no-op (free mode still works).
-	if err := s.syncSubscriptionQuantity(r.Context(), tx, principal.AccountID); err != nil {
-		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("sync billing quantity: %v", err))
 		return
 	}
 
@@ -226,32 +241,16 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		"clip_duration_sec": clipDuration,
 	})
 
-	resp := map[string]any{
+	// Create just inserts: capture is held by the scheduler gate until a card is on
+	// file (the list payload surfaces needs_card), and the new usage model never
+	// charges at start, so there is no checkout_url here.
+	util.WriteJSON(w, http.StatusCreated, map[string]any{
 		"id":         id,
 		"status":     "active",
 		"created_at": createdAt.UTC(),
-	}
-	// Start = pay: if the account has no access-granting subscription, the new
-	// recording is not billable and will not capture until Checkout completes, so
-	// mint a Checkout session and return its url. If the sub already grants access,
-	// the in-tx syncSubscriptionQuantity above already covered the new seat.
-	grants, err := s.accountSubscriptionGrantsAccess(r.Context(), principal.AccountID)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load billing coverage: %v", err))
-		return
-	}
-	if !grants {
-		checkoutURL, err := s.ensureRecordingCheckoutURL(r.Context(), principal.AccountID, principal.Email)
-		if err != nil {
-			util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("mint checkout session: %v", err))
-			return
-		}
-		if checkoutURL != "" {
-			resp["checkout_url"] = checkoutURL
-		}
-	}
-
-	util.WriteJSON(w, http.StatusCreated, resp)
+		"start_at":   startOut.UTC(),
+		"end_at":     endOut,
+	})
 }
 
 // handleAccountRecordingsProbe authoritatively validates a stream URL the same
@@ -303,18 +302,18 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		SELECT
 			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
 			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec,
-			rec.status, rec.next_fire_at, rec.last_clip_at,
+			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
 			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
-			COALESCE(bs.billable, false) AS billable,
+			COALESCE((SELECT b.has_payment_method FROM account_billing b
+			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 			rec.created_at
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-		LEFT JOIN recording_billing_state bs ON bs.recording_id = rec.id
 		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
 	`, id, principal.AccountID)
-	item, err := scanRecordingListRow(row)
+	item, err := scanRecordingListRow(row, s.billing != nil)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
@@ -408,14 +407,6 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 		return
 	}
 
-	// Pause drops the Stripe seat (paused = not billed); resume bumps it back, in
-	// the same tx so a concurrent change cannot push a stale seat count. A drop to
-	// zero active recordings cancels the subscription (see syncSubscriptionQuantity).
-	if err := s.syncSubscriptionQuantity(r.Context(), tx, principal.AccountID); err != nil {
-		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("sync billing quantity: %v", err))
-		return
-	}
-
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit status tx: %v", err))
 		return
@@ -425,29 +416,9 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 		"recording_id": id,
 	})
 
-	resp := map[string]any{"id": id, "status": toStatus}
-	// Resume = pay: if resuming leaves the account with an active recording but no
-	// access-granting subscription, the resumed recording is not billable and will
-	// not capture until Checkout completes, so mint a Checkout session and return
-	// its url (uniform with Start).
-	if toStatus == "active" {
-		grants, err := s.accountSubscriptionGrantsAccess(r.Context(), principal.AccountID)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load billing coverage: %v", err))
-			return
-		}
-		if !grants {
-			checkoutURL, err := s.ensureRecordingCheckoutURL(r.Context(), principal.AccountID, principal.Email)
-			if err != nil {
-				util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("mint checkout session: %v", err))
-				return
-			}
-			if checkoutURL != "" {
-				resp["checkout_url"] = checkoutURL
-			}
-		}
-	}
-	util.WriteJSON(w, http.StatusOK, resp)
+	// Pause/resume only flip status; the usage model never charges at resume, and
+	// capture is held by the scheduler gate until a card is on file.
+	util.WriteJSON(w, http.StatusOK, map[string]any{"id": id, "status": toStatus})
 }
 
 func (s *Server) handleAccountRecordingDelete(w http.ResponseWriter, r *http.Request) {
@@ -489,12 +460,6 @@ func (s *Server) handleAccountRecordingDelete(w http.ResponseWriter, r *http.Req
 		WHERE recording_id=$1 AND status IN ('pending','leased')
 	`, id); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("cancel recording jobs: %v", err))
-		return
-	}
-
-	// B-3: push the new absolute seat count (never paid_quantity-1) in the same tx.
-	if err := s.syncSubscriptionQuantity(r.Context(), tx, principal.AccountID); err != nil {
-		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("sync billing quantity: %v", err))
 		return
 	}
 
@@ -555,7 +520,12 @@ func probeRecordingStreamReachable(ctx context.Context, streamURL string, valida
 	return capture.ProbeReachable(probeCtx, pinnedProbeURL, probeHost)
 }
 
-func scanRecordingListRow(row pgx.Row) (map[string]any, error) {
+// scanRecordingListRow scans one row of the list/get SELECT into the API payload.
+// billingEnabled (s.billing != nil) is threaded in so needs_card can be surfaced:
+// a recording is "live" only when it is active, inside its [start_at, end_at)
+// window, and the account has a card on file; needs_card flags the account-level
+// "add a card to capture" state.
+func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, error) {
 	var (
 		id               int64
 		name             string
@@ -567,25 +537,30 @@ func scanRecordingListRow(row pgx.Row) (map[string]any, error) {
 		cronTimezone     string
 		clipDurationSec  int
 		status           string
+		startAt          time.Time
+		endAt            *time.Time
 		nextFireAt       *time.Time
 		lastClipAt       *time.Time
 		lastErrorText    string
 		lastErrorAt      *time.Time
 		consecutiveFails int
-		billable         bool
+		hasPaymentMethod bool
 		recentClipCount  int64
 		createdAt        time.Time
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
 		&sourceKind, &cronExpr, &cronTimezone, &clipDurationSec,
-		&status, &nextFireAt, &lastClipAt,
+		&status, &startAt, &endAt, &nextFireAt, &lastClipAt,
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
-		&billable, &recentClipCount, &createdAt,
+		&hasPaymentMethod, &recentClipCount, &createdAt,
 	); err != nil {
 		return nil, err
 	}
-	live := status == "active" && billable
+	now := time.Now().UTC()
+	inWindow := !startAt.After(now) && (endAt == nil || now.Before(*endAt))
+	live := status == "active" && inWindow && hasPaymentMethod
+	needsCard := billingEnabled && !hasPaymentMethod
 	return map[string]any{
 		"id":                       id,
 		"name":                     name,
@@ -597,8 +572,11 @@ func scanRecordingListRow(row pgx.Row) (map[string]any, error) {
 		"cron_timezone":            cronTimezone,
 		"clip_duration_sec":        clipDurationSec,
 		"status":                   status,
-		"billable":                 billable,
+		"start_at":                 startAt.UTC(),
+		"end_at":                   endAt,
+		"has_payment_method":       hasPaymentMethod,
 		"live":                     live,
+		"needs_card":               needsCard,
 		"health":                   recordingHealth(status, consecutiveFails),
 		"next_fire_at":             nextFireAt,
 		"last_clip_at":             lastClipAt,

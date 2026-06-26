@@ -70,6 +70,7 @@ type Config struct {
 	StripeSecretKey     string
 	StripeWebhookSecret string
 	StripePriceID       string
+	StripeMeterID       string
 	StripeLivemode      bool
 
 	// Standalone stream recorder: worker (consumed on the recorder droplet/node).
@@ -166,6 +167,7 @@ func Load() (Config, error) {
 		StripeSecretKey:     strings.TrimSpace(os.Getenv("STRIPE_SECRET_KEY")),
 		StripeWebhookSecret: strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
 		StripePriceID:       strings.TrimSpace(os.Getenv("STRIPE_PRICE_ID")),
+		StripeMeterID:       strings.TrimSpace(os.Getenv("STRIPE_METER_ID")),
 		StripeLivemode:      boolEnv("STRIPE_LIVEMODE", false),
 
 		RecordingWorkerConcurrency:  intEnv("RECORDING_WORKER_CONCURRENCY", 1),

@@ -293,10 +293,19 @@
       <!-- Cost ledger -->
       <div id="ledger" class="ledger hidden"></div>
 
+      <!-- Account-level card-needed banner (shown when billing on + no card on file) -->
+      <div id="cardBanner" class="panel hidden" style="margin-bottom:16px;border-color:color-mix(in srgb, var(--warn) 40%, var(--border));">
+        <div class="section-title" style="margin-bottom:6px;">
+          <div><div class="eyebrow">Card needed</div><h2>Add a card to begin capturing</h2></div>
+          <button id="cardBannerBtn" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Add a card</button>
+        </div>
+        <p class="muted" style="margin:0;">No charge now. You are billed $0.50 for each day a recording captures, monthly.</p>
+      </div>
+
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
       <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
         <h1>Capture a stream to your own bucket, on a schedule.</h1>
-        <p class="empty-hero-sub">Point a recording at an HLS or HTTPS stream, pick how often to grab a clip, and it lands in your S3 bucket. About $10/mo per recording while it is active.</p>
+        <p class="empty-hero-sub">Point a recording at an HLS or HTTPS stream, pick how often to grab a clip, and it lands in your S3 bucket. $0.50/day, billed monthly for days you record. No charge until a day you actually record.</p>
       </div>
 
       <!-- Recording cards -->
@@ -363,6 +372,23 @@
 
           <div id="schedPreview" class="preview"></div>
           <div id="schedWarn" class="hint warn"></div>
+        </div>
+
+        <!-- Recording window (start/stop dates) -->
+        <div class="field">
+          <label>When to capture</label>
+          <div class="grid-2">
+            <div>
+              <label for="startAt">Start</label>
+              <input id="startAt" type="datetime-local" />
+            </div>
+            <div>
+              <label for="endAt">Stop (optional)</label>
+              <input id="endAt" type="datetime-local" />
+            </div>
+          </div>
+          <div class="hint">Leave Stop empty to record open-ended until you pause or delete.</div>
+          <div id="windowWarn" class="hint warn"></div>
         </div>
 
         <!-- Clip length -->
@@ -452,8 +478,6 @@
   </div>
 
   <script>
-    const PRICE_PER_REC = 10;
-
     const els = {
       accountArea: document.getElementById('accountArea'),
       accountChip: document.getElementById('accountChip'),
@@ -463,6 +487,8 @@
       returnPanel: document.getElementById('returnPanel'),
       returnBody: document.getElementById('returnBody'),
       ledger: document.getElementById('ledger'),
+      cardBanner: document.getElementById('cardBanner'),
+      cardBannerBtn: document.getElementById('cardBannerBtn'),
       heroCopy: document.getElementById('heroCopy'),
       cards: document.getElementById('cards'),
       newRecRow: document.getElementById('newRecRow'),
@@ -482,6 +508,9 @@
       schedTZCustom: document.getElementById('schedTZCustom'),
       schedPreview: document.getElementById('schedPreview'),
       schedWarn: document.getElementById('schedWarn'),
+      startAt: document.getElementById('startAt'),
+      endAt: document.getElementById('endAt'),
+      windowWarn: document.getElementById('windowWarn'),
       clipSeg: document.getElementById('clipSeg'),
       clipCustomWrap: document.getElementById('clipCustomWrap'),
       clipCustom: document.getElementById('clipCustom'),
@@ -531,6 +560,9 @@
     const state = {
       account: null,
       billingEnabled: true,
+      // Latest GET /billing payload (usage model): has_payment_method gates Start
+      // and the read-only arrears estimate.
+      billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_days_this_month: 0, estimated_amount_cents: 0 },
       recordings: [],
       destinations: [],
       schedPreset: 'hourly',
@@ -1000,17 +1032,49 @@
       streamDebounce = window.setTimeout(() => probeStream(url), 600);
     }
 
+    // ---- Recording window (start/stop dates) ----
+
+    // Parse a datetime-local value (local wall time, no zone) into a Date, or null.
+    function parseLocalDateTime(v) {
+      const s = String(v || '').trim();
+      if (!s) return null;
+      const d = new Date(s);
+      return Number.isFinite(d.getTime()) ? d : null;
+    }
+
+    // Returns { startISO, endISO } for the create body. start defaults to now when
+    // the input is empty; end stays null (open-ended) when empty.
+    function compiledWindow() {
+      const start = parseLocalDateTime(els.startAt.value) || new Date();
+      const end = parseLocalDateTime(els.endAt.value);
+      return { startISO: start.toISOString(), endISO: end ? end.toISOString() : null };
+    }
+
+    // The window is valid unless a Stop is set that is not strictly after Start.
+    function windowValid() {
+      const start = parseLocalDateTime(els.startAt.value) || new Date();
+      const end = parseLocalDateTime(els.endAt.value);
+      return !(end && end.getTime() <= start.getTime());
+    }
+
+    function refreshWindowUI() {
+      els.windowWarn.textContent = windowValid() ? '' : 'Stop must be after Start.';
+      refreshStartEnabled();
+    }
+
     // ---- Start enabled gate ----
 
     // Start requires BOTH gates: bucket Connected AND stream probe ok:true (plus a
-    // valid schedule/clip and no in-flight start).
+    // valid schedule/clip, a valid window, and no in-flight start). When billing is
+    // on and no card is on file the button instead drives the one-time add-card
+    // step, so it is enabled as soon as the capture config is valid.
     function refreshStartEnabled() {
       const url = String(els.recURL.value || '').trim();
       const schedOK = refreshScheduleUIQuiet();
       const dest = selectedDestId();
       const bucketOK = state.bucketState === 'connected' && dest > 0;
       const streamOK = state.streamProbe.ok === true;
-      const ready = !state.starting && !!url && schedOK && bucketOK && streamOK;
+      const ready = !state.starting && !!url && schedOK && bucketOK && streamOK && windowValid();
       els.startBtn.disabled = !ready;
     }
 
@@ -1026,18 +1090,19 @@
       return true;
     }
 
-    // ---- Cost ledger ----
+    // ---- Cost ledger (read-only arrears estimate from GET /billing) ----
 
-    function activeCount() {
-      return state.recordings.filter((r) => String(r.status) === 'active').length;
+    function formatUSD(cents) {
+      return (Number(cents || 0) / 100).toFixed(2);
     }
 
     function renderLedger() {
+      const b = state.billing || {};
       if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
-      const n = activeCount();
-      if (n < 1) { els.ledger.classList.add('hidden'); return; }
-      const noun = n === 1 ? 'active recording' : 'active recordings';
-      els.ledger.innerHTML = `<b>${n} ${noun}</b> &middot; $${n * PRICE_PER_REC}/mo`;
+      const days = Number(b.recording_days_this_month || 0);
+      if (days < 1) { els.ledger.classList.add('hidden'); return; }
+      const noun = days === 1 ? 'recording-day' : 'recording-days';
+      els.ledger.innerHTML = `<b>${days} ${noun} this month</b> &middot; est. $${formatUSD(b.estimated_amount_cents)}`;
       els.ledger.classList.remove('hidden');
     }
 
@@ -1078,11 +1143,20 @@
       return `${day}d ago`;
     }
 
+    // A recording whose start_at is still in the future is Scheduled, not yet
+    // capturing. end_at in the past is reflected by the server flipping to
+    // 'completed', but we also treat an elapsed window defensively.
+    function isScheduled(rec) {
+      const s = rec.start_at ? new Date(rec.start_at).getTime() : 0;
+      return Number.isFinite(s) && s > Date.now();
+    }
+
     function statusLine(rec) {
       const status = String(rec.status || '');
-      if (status === 'paused') return { cls: 'paused', text: 'Paused &middot; not billed' };
-      if (status === 'active' && !rec.billable) return { cls: 'pending', text: 'Pending payment &middot; Finish setup' };
-      if (status === 'active') return { cls: 'active', text: state.billingEnabled ? `Active &middot; $${PRICE_PER_REC}/mo` : 'Active' };
+      if (status === 'paused') return { cls: 'paused', text: 'Paused' };
+      if (status === 'completed') return { cls: 'paused', text: 'Completed' };
+      if (status === 'active' && isScheduled(rec)) return { cls: 'pending', text: 'Scheduled' };
+      if (status === 'active') return { cls: 'active', text: 'Active' };
       return { cls: 'paused', text: escapeHTML(status) };
     }
 
@@ -1101,7 +1175,6 @@
         const id = Number(rec.id);
         const st = statusLine(rec);
         const status = String(rec.status || '');
-        const isPending = status === 'active' && !rec.billable;
         const clip = Number(rec.clip_duration_sec || 0);
         const last = relativeTime(rec.last_clip_at);
         const health = String(rec.health || 'idle');
@@ -1117,10 +1190,7 @@
         }
 
         let actions = '';
-        if (isPending) {
-          actions = `<button type="button" data-finish="${id}">Finish setup</button>`
-            + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
-        } else if (status === 'active') {
+        if (status === 'active') {
           actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
             + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
         } else if (status === 'paused') {
@@ -1155,8 +1225,6 @@
         b.addEventListener('click', () => mutateRecording(b.getAttribute('data-pause'), 'pause')));
       els.cards.querySelectorAll('button[data-resume]').forEach((b) =>
         b.addEventListener('click', () => mutateRecording(b.getAttribute('data-resume'), 'resume')));
-      els.cards.querySelectorAll('button[data-finish]').forEach((b) =>
-        b.addEventListener('click', () => finishSetup(b)));
       els.cards.querySelectorAll('button[data-delete]').forEach((b) =>
         b.addEventListener('click', () => deleteRecording(b)));
     }
@@ -1164,10 +1232,7 @@
     async function mutateRecording(id, action) {
       const rid = String(id || '').trim();
       try {
-        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(rid)}/${action}`, { method: 'POST' });
-        // Resume = pay: a resumed recording with no access-granting sub returns a
-        // checkout_url, same as Start.
-        if (out && out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(rid)}/${action}`, { method: 'POST' });
         await refreshRecordings();
       } catch (err) {
         window.alert(String(err.message || err));
@@ -1175,32 +1240,13 @@
     }
 
     async function deleteRecording(btn) {
-      const charge = state.billingEnabled ? ` and the $${PRICE_PER_REC}/mo charge` : '';
-      if (!window.confirm(`Delete this recording? This stops capture${charge}.`)) return;
+      if (!window.confirm('Delete this recording? This stops capture.')) return;
       const id = String(btn.getAttribute('data-delete') || '').trim();
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' });
         await refreshRecordings();
       } catch (err) {
         window.alert(String(err.message || err));
-      }
-    }
-
-    // Finish setup re-opens Checkout for a recording stranded by an abandoned
-    // payment (it already exists; we just re-derive the Checkout session).
-    async function finishSetup(btn) {
-      btn.disabled = true;
-      try {
-        const out = await fetchJSON('/api/v1/account/billing/checkout', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-        });
-        if (out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
-        if (out.portal_url) { window.location.assign(out.portal_url); return; }
-        window.alert('No checkout URL returned.');
-      } catch (err) {
-        window.alert(String(err.message || err));
-      } finally {
-        btn.disabled = false;
       }
     }
 
@@ -1219,9 +1265,19 @@
 
     // ---- Composer open/close ----
 
+    // Format a Date as the local-wall-time string a datetime-local input expects
+    // (YYYY-MM-DDTHH:MM), accounting for the timezone offset.
+    function toLocalInputValue(d) {
+      const off = d.getTimezoneOffset() * 60000;
+      return new Date(d.getTime() - off).toISOString().slice(0, 16);
+    }
+
     function openComposer(asHero) {
       els.composer.classList.remove('hidden');
       els.composerClose.classList.toggle('hidden', !!asHero);
+      // Default Start to now (open-ended Stop) each time the composer opens empty.
+      if (!els.startAt.value) els.startAt.value = toLocalInputValue(new Date());
+      refreshWindowUI();
       if (!asHero) els.composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
       refreshStartEnabled();
     }
@@ -1232,6 +1288,10 @@
       teardownPreview();
       state.streamProbe = { token: state.streamProbe.token + 1, ok: false };
       setStatus(els.streamStatus, '', '');
+      // Reset the window so the next open re-defaults Start to now.
+      els.startAt.value = '';
+      els.endAt.value = '';
+      els.windowWarn.textContent = '';
     }
 
     // ---- Start handler ----
@@ -1243,7 +1303,7 @@
       els.returnBody.innerHTML = `
         <div class="eyebrow">One more step</div>
         <h2>Add a card</h2>
-        <p class="interstitial-body">Your bucket is connected. To start recording we need a card on file. You will be charged $${PRICE_PER_REC}/mo per active recording, prorated, only while it is running.</p>
+        <p class="interstitial-body">Add a card to start recording. No charge now; you are billed $0.50 for each day a recording captures, monthly.</p>
         <p class="muted" style="margin:0;">Redirecting to secure checkout. We never see your card.</p>`;
       window.setTimeout(() => window.location.assign(url), 700);
     }
@@ -1254,6 +1314,22 @@
 
     async function startRecording() {
       if (state.starting) return;
+
+      // One-time card-on-file step: when billing is on and no card is saved, the
+      // primary action is "add a card" -> Checkout, not a create. Capture is held
+      // by the server gate until the card lands.
+      if (state.billingEnabled && state.billing.has_payment_method !== true) {
+        els.startBtn.disabled = true;
+        setStatus(els.startStatus, 'Redirecting to add a card...', '');
+        try {
+          await startCardCheckout();
+        } catch (err) {
+          setStatus(els.startStatus, String(err.message || err), 'err');
+          refreshStartEnabled();
+        }
+        return;
+      }
+
       const url = String(els.recURL.value || '').trim();
       const dest = selectedDestId();
       const sched = compiledSchedule();
@@ -1262,8 +1338,10 @@
       if (dest <= 0) { setStatus(els.startStatus, 'Connect or select a bucket first.', 'err'); return; }
       if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
       if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
+      if (!windowValid()) { setStatus(els.startStatus, 'Stop must be after Start.', 'err'); return; }
 
       const name = String(els.recName.value || '').trim() || deriveName(url);
+      const win = compiledWindow();
       const body = {
         name,
         stream_url: url,
@@ -1271,16 +1349,16 @@
         cron_expr: sched.cron,
         cron_timezone: sched.tz,
         clip_duration_sec: clip,
+        start_at: win.startISO,
+        end_at: win.endISO,
       };
       state.starting = true;
       els.startBtn.disabled = true;
       setStatus(els.startStatus, 'Starting...', '');
       try {
-        const out = await fetchJSON('/api/v1/account/recordings', {
+        await fetchJSON('/api/v1/account/recordings', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         });
-        if (out && out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
-        // Covered by an existing subscription (or free mode): the new card is Active.
         els.recURL.value = '';
         els.recName.value = '';
         closeComposer();
@@ -1295,9 +1373,12 @@
     }
 
     function startButtonLabel() {
-      els.startBtn.textContent = state.billingEnabled ? `Start recording - $${PRICE_PER_REC}/mo` : 'Start recording';
+      const needsCard = state.billingEnabled && state.billing.has_payment_method !== true;
+      els.startBtn.textContent = needsCard ? 'Add a card to start recording' : 'Start recording';
       els.composerFootnote.textContent = state.billingEnabled
-        ? `Starting adds $${PRICE_PER_REC}/mo while active. Pause or delete stops it.`
+        ? (needsCard
+            ? 'Add a card to start recording. No charge now; you are billed $0.50 for each day a recording captures, monthly.'
+            : '$0.50/day, billed monthly for days you record.')
         : '';
       els.composerFootnote.classList.toggle('hidden', !state.billingEnabled);
     }
@@ -1365,37 +1446,32 @@
       if (billingReturn === 'success') {
         els.signedIn.classList.add('hidden');
         els.returnPanel.classList.remove('hidden');
-        els.returnBody.innerHTML = `<div class="eyebrow">Payment received</div><h2>Finishing setup...</h2><p class="muted" style="margin:0;">Confirming your subscription and starting your recording.</p>`;
-        // Poll /me + the recordings list briefly for the webhook to flip the gate.
+        els.returnBody.innerHTML = `<div class="eyebrow">Card saved</div><h2>Finishing setup...</h2><p class="muted" style="margin:0;">Confirming your card. No charge now; you are billed monthly for days you record.</p>`;
+        // Poll /billing briefly for the webhook to flip has_payment_method.
         for (let i = 0; i < 8; i += 1) {
           try {
-            const me = await fetchJSON('/api/v1/account/billing');
-            await refreshRecordings();
-            if (subActive(me) && activeBillableExists()) break;
+            const b = await fetchJSON('/api/v1/account/billing');
+            state.billing = b || state.billing;
+            if (b && b.has_payment_method === true) break;
           } catch (_) { /* keep polling */ }
           await sleep(900);
         }
         clearBillingQuery();
+        renderCardBanner();
+        startButtonLabel();
+        await refreshRecordings();
         els.returnPanel.classList.add('hidden');
         els.signedIn.classList.remove('hidden');
         return;
       }
       if (billingReturn === 'cancel') {
-        // The recording already exists; show it as a Pending-payment card.
+        // Card setup abandoned; surface the card-needed banner and the list.
         clearBillingQuery();
+        await loadBilling();
         await refreshRecordings();
         return;
       }
       await refreshRecordings();
-    }
-
-    function subActive(me) {
-      const s = String((me && me.subscription_status) || '');
-      return s === 'active' || s === 'trialing' || s === 'past_due';
-    }
-
-    function activeBillableExists() {
-      return state.recordings.some((r) => String(r.status) === 'active' && r.billable);
     }
 
     function clearBillingQuery() {
@@ -1423,13 +1499,37 @@
       throw lastErr || new Error('unauthorized');
     }
 
-    async function loadBillingEnabled() {
+    // Pull the usage-model billing snapshot (billing_enabled, has_customer,
+    // has_payment_method, recording_days_this_month, estimated_amount_cents) and
+    // refresh the ledger + card-needed banner + Start label off it.
+    async function loadBilling() {
       try {
         const b = await fetchJSON('/api/v1/account/billing');
-        state.billingEnabled = b.billing_enabled !== false;
+        state.billing = b || state.billing;
+        state.billingEnabled = b && b.billing_enabled !== false;
       } catch (_) {
         state.billingEnabled = true;
       }
+      renderLedger();
+      renderCardBanner();
+      startButtonLabel();
+    }
+
+    function renderCardBanner() {
+      const b = state.billing || {};
+      const needsCard = state.billingEnabled && b.has_payment_method !== true;
+      els.cardBanner.classList.toggle('hidden', !needsCard);
+    }
+
+    // POST /billing/card -> {checkout_url} (no card yet) or {portal_url} (card on
+    // file). For the add-card flow we expect checkout_url and redirect to it.
+    async function startCardCheckout() {
+      const out = await fetchJSON('/api/v1/account/billing/card', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      if (out && out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
+      if (out && out.portal_url) { window.location.assign(out.portal_url); return; }
+      window.alert('No checkout URL returned.');
     }
 
     // ---- Wiring ----
@@ -1445,6 +1545,8 @@
     els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.schedTZCustom.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.clipCustom.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.startAt.addEventListener('input', refreshWindowUI);
+    els.endAt.addEventListener('input', refreshWindowUI);
     els.recURL.addEventListener('input', scheduleStreamProbe);
     els.recURL.addEventListener('blur', () => {
       window.clearTimeout(streamDebounce);
@@ -1461,6 +1563,15 @@
     els.newRecBtn.addEventListener('click', () => openComposer(false));
     els.composerClose.addEventListener('click', closeComposer);
     els.startBtn.addEventListener('click', startRecording);
+    els.cardBannerBtn.addEventListener('click', async () => {
+      els.cardBannerBtn.disabled = true;
+      try {
+        await startCardCheckout();
+      } catch (err) {
+        window.alert(String(err.message || err));
+        els.cardBannerBtn.disabled = false;
+      }
+    });
 
     document.getElementById('requestLink').addEventListener('click', async () => {
       const email = String(document.getElementById('email').value || '').trim();
@@ -1487,8 +1598,7 @@
         els.signedOut.classList.add('hidden');
         els.signedIn.classList.remove('hidden');
         buildAccountChip();
-        await loadBillingEnabled();
-        startButtonLabel();
+        await loadBilling();
         await refreshDestinations();
         await handleBillingReturn();
       } catch (_) {

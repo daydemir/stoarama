@@ -21,8 +21,14 @@ import (
 // are far smaller than this.
 const stripeWebhookMaxBody = 64 * 1024
 
-// handleAccountBillingMe returns the account's billing summary, with safe
-// defaults when no account_billing row exists yet.
+// recordingDayRateCents is the per-recording-day usage price (50 cents); the live
+// UI estimate is days * this. The authoritative charge is Stripe's meter sum.
+const recordingDayRateCents = 50
+
+// handleAccountBillingMe returns the account's usage-billing summary: whether a
+// card is on file plus a live (DB-derived, never Stripe) estimate of this
+// calendar month's recording-days and dollar amount. Stripe meter aggregation is
+// async, so the UI estimate always reads our own recording_billing_days view.
 func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -30,47 +36,45 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var (
-		customerID         *string
-		subscriptionStatus string
-		paidQuantity       int
-		currentPeriodEnd   *time.Time
-		cancelAtPeriodEnd  bool
+		customerID       *string
+		hasPaymentMethod bool
 	)
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT stripe_customer_id, subscription_status, paid_quantity, current_period_end, cancel_at_period_end
+		SELECT stripe_customer_id, has_payment_method
 		FROM account_billing
 		WHERE account_id=$1
-	`, principal.AccountID).Scan(&customerID, &subscriptionStatus, &paidQuantity, &currentPeriodEnd, &cancelAtPeriodEnd)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			util.WriteJSON(w, http.StatusOK, map[string]any{
-				"billing_enabled":      s.billing != nil,
-				"has_customer":         false,
-				"subscription_status":  "none",
-				"paid_quantity":        0,
-				"current_period_end":   nil,
-				"cancel_at_period_end": false,
-			})
-			return
-		}
+	`, principal.AccountID).Scan(&customerID, &hasPaymentMethod)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load billing: %v", err))
 		return
 	}
+
+	// Live month-to-date estimate from our own ledger (never Stripe summaries).
+	var days int
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT count(*) FROM recording_billing_days
+		WHERE account_id=$1 AND rec_day >= date_trunc('month', now() AT TIME ZONE 'UTC')::date
+	`, principal.AccountID).Scan(&days); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count recording days: %v", err))
+		return
+	}
+
 	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"billing_enabled":      s.billing != nil,
-		"has_customer":         customerID != nil && strings.TrimSpace(*customerID) != "",
-		"subscription_status":  subscriptionStatus,
-		"paid_quantity":        paidQuantity,
-		"current_period_end":   currentPeriodEnd,
-		"cancel_at_period_end": cancelAtPeriodEnd,
+		"billing_enabled":           s.billing != nil,
+		"has_customer":              customerID != nil && strings.TrimSpace(*customerID) != "",
+		"has_payment_method":        hasPaymentMethod,
+		"recording_days_this_month": days,
+		"estimated_amount_cents":    days * recordingDayRateCents,
 	})
 }
 
-// handleAccountBillingCheckout opens Stripe Checkout for the account, serializing
-// per-account via a FOR UPDATE lock so concurrent clicks cannot mint two
-// customers or two subscriptions. If a subscription already exists it returns the
-// portal URL instead of a second Checkout.
-func (s *Server) handleAccountBillingCheckout(w http.ResponseWriter, r *http.Request) {
+// handleAccountBillingCard returns the URL the account should be sent to manage
+// its card on file, serializing per-account via a FOR UPDATE lock so concurrent
+// clicks cannot mint two Stripe customers. If a card is already on file it returns
+// the Stripe customer portal; otherwise it opens a $0 card-on-file Checkout (which
+// creates the metered subscription and saves the card). Starting a recording never
+// charges; this endpoint is only ever about the card.
+func (s *Server) handleAccountBillingCard(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
@@ -83,7 +87,7 @@ func (s *Server) handleAccountBillingCheckout(w http.ResponseWriter, r *http.Req
 
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin checkout tx: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin card tx: %v", err))
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
@@ -96,14 +100,13 @@ func (s *Server) handleAccountBillingCheckout(w http.ResponseWriter, r *http.Req
 	}
 
 	var (
-		customerID         *string
-		subscriptionID     *string
-		subscriptionStatus string
+		customerID       *string
+		hasPaymentMethod bool
 	)
 	if err := tx.QueryRow(r.Context(), `
-		SELECT stripe_customer_id, stripe_subscription_id, subscription_status
+		SELECT stripe_customer_id, has_payment_method
 		FROM account_billing WHERE account_id=$1 FOR UPDATE
-	`, principal.AccountID).Scan(&customerID, &subscriptionID, &subscriptionStatus); err != nil {
+	`, principal.AccountID).Scan(&customerID, &hasPaymentMethod); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock billing row: %v", err))
 		return
 	}
@@ -126,116 +129,31 @@ func (s *Server) handleAccountBillingCheckout(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	hasActiveSub := subscriptionID != nil && strings.TrimSpace(*subscriptionID) != "" &&
-		subscriptionStatusGrantsAccess(subscriptionStatus)
-
-	if hasActiveSub {
-		// Already subscribed: send them to the portal instead of a 2nd Checkout.
+	if hasPaymentMethod {
+		// Card already on file: send them to the portal to update/remove it.
 		portalURL, err := s.billing.CreatePortalSession(r.Context(), custID, s.cfg.AppBaseURL+"/recordings")
 		if err != nil {
 			util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("create portal session: %v", err))
 			return
 		}
 		if err := tx.Commit(r.Context()); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit checkout tx: %v", err))
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit card tx: %v", err))
 			return
 		}
 		util.WriteJSON(w, http.StatusOK, map[string]any{"portal_url": portalURL})
 		return
 	}
 
-	qty := int64(s.countLiveRecordings(r.Context(), tx, principal.AccountID))
-	if qty < 1 {
-		qty = 1
-	}
-	checkoutURL, err := s.billing.CreateCheckoutSession(r.Context(), custID, principal.AccountID, qty)
+	checkoutURL, err := s.billing.CreateCardOnFileCheckoutSession(r.Context(), custID, principal.AccountID)
 	if err != nil {
-		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("create checkout session: %v", err))
+		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("create card checkout session: %v", err))
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit checkout tx: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit card tx: %v", err))
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"checkout_url": checkoutURL})
-}
-
-// ensureRecordingCheckoutURL mints a Stripe Checkout session for the account so
-// that pressing Start/Resume is the act of paying when the account has no
-// access-granting subscription. It reuses handleAccountBillingCheckout's logic
-// (FOR UPDATE lock, EnsureCustomer, countLiveRecordings as quantity,
-// CreateCheckoutSession) so a concurrent click cannot mint two customers. Returns
-// "" with no error when billing is disabled (free mode) so create/resume still
-// succeed without a redirect.
-func (s *Server) ensureRecordingCheckoutURL(ctx context.Context, accountID int64, email string) (string, error) {
-	if s.billing == nil {
-		return "", nil
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return "", fmt.Errorf("begin checkout tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO account_billing (account_id) VALUES ($1) ON CONFLICT (account_id) DO NOTHING
-	`, accountID); err != nil {
-		return "", fmt.Errorf("ensure billing row: %w", err)
-	}
-
-	var customerID *string
-	if err := tx.QueryRow(ctx, `
-		SELECT stripe_customer_id FROM account_billing WHERE account_id=$1 FOR UPDATE
-	`, accountID).Scan(&customerID); err != nil {
-		return "", fmt.Errorf("lock billing row: %w", err)
-	}
-
-	custID := ""
-	if customerID != nil {
-		custID = strings.TrimSpace(*customerID)
-	}
-	if custID == "" {
-		custID, err = s.billing.EnsureCustomer(ctx, accountID, email)
-		if err != nil {
-			return "", fmt.Errorf("ensure stripe customer: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE account_billing SET stripe_customer_id=$2, updated_at=now() WHERE account_id=$1
-		`, accountID, custID); err != nil {
-			return "", fmt.Errorf("store stripe customer: %w", err)
-		}
-	}
-
-	qty := int64(s.countLiveRecordings(ctx, tx, accountID))
-	if qty < 1 {
-		qty = 1
-	}
-	checkoutURL, err := s.billing.CreateCheckoutSession(ctx, custID, accountID, qty)
-	if err != nil {
-		return "", fmt.Errorf("create checkout session: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return "", fmt.Errorf("commit checkout tx: %w", err)
-	}
-	return checkoutURL, nil
-}
-
-// accountSubscriptionGrantsAccess reports whether the account currently has an
-// access-granting subscription. When false, a newly active recording is not
-// billable and will not capture until Checkout completes, so create/resume must
-// return a checkout_url.
-func (s *Server) accountSubscriptionGrantsAccess(ctx context.Context, accountID int64) (bool, error) {
-	var status string
-	err := s.pool.QueryRow(ctx, `
-		SELECT subscription_status FROM account_billing WHERE account_id=$1
-	`, accountID).Scan(&status)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return subscriptionStatusGrantsAccess(status), nil
 }
 
 // handleAccountBillingPortal opens the Stripe customer portal for the account.
@@ -267,105 +185,6 @@ func (s *Server) handleAccountBillingPortal(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"url": url})
-}
-
-// syncSubscriptionQuantity recomputes the absolute billed recording count (active
-// only) under a FOR UPDATE lock and pushes it to Stripe when a subscription item
-// exists. The subscription ids are read ONLY from the authed account's billing
-// row (never from request input), and a missing billing client / item is a no-op
-// so free-mode create/delete still works.
-//
-// Quantity-0 edge: Stripe rejects quantity 0 on a licensed item, so when the
-// active count drops to 0 we CANCEL the subscription (and null the stored ids,
-// mirroring syncBillingFromSubscription's terminal-status nulling) instead of
-// calling SetSubscriptionQuantity(0). The account then pays nothing, and the next
-// active recording re-subscribes via Checkout (create/resume re-checkout whenever
-// there is no access-granting sub). This keeps deleting/pausing the last active
-// recording from 502-ing on Stripe's zero-quantity rejection.
-func (s *Server) syncSubscriptionQuantity(ctx context.Context, tx pgx.Tx, accountID int64) error {
-	var (
-		subID     *string
-		subItemID *string
-	)
-	err := tx.QueryRow(ctx, `
-		SELECT stripe_subscription_id, stripe_subscription_item_id
-		FROM account_billing WHERE account_id=$1 FOR UPDATE
-	`, accountID).Scan(&subID, &subItemID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("lock billing row for quantity sync: %w", err)
-	}
-	if subItemID == nil || strings.TrimSpace(*subItemID) == "" {
-		return nil
-	}
-	if s.billing == nil {
-		return nil
-	}
-	qty := int64(s.countLiveRecordings(ctx, tx, accountID))
-	if quantitySyncCancels(qty) {
-		if subID != nil && strings.TrimSpace(*subID) != "" {
-			if err := s.billing.CancelSubscription(ctx, strings.TrimSpace(*subID)); err != nil {
-				return fmt.Errorf("cancel zero-quantity subscription: %w", err)
-			}
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE account_billing
-			SET stripe_subscription_id=NULL,
-			    stripe_subscription_item_id=NULL,
-			    subscription_status='canceled',
-			    paid_quantity=0,
-			    updated_at=now()
-			WHERE account_id=$1
-		`, accountID); err != nil {
-			return fmt.Errorf("null canceled subscription: %w", err)
-		}
-		return nil
-	}
-	if err := s.billing.SetSubscriptionQuantity(ctx, strings.TrimSpace(*subItemID), qty); err != nil {
-		return fmt.Errorf("set subscription quantity: %w", err)
-	}
-	return nil
-}
-
-// quantitySyncCancels reports whether a quantity sync must cancel the
-// subscription instead of pushing the quantity. Stripe rejects quantity 0 on a
-// licensed item, so a drop to 0 active recordings cancels the subscription rather
-// than setting quantity 0.
-func quantitySyncCancels(activeQty int64) bool {
-	return activeQty <= 0
-}
-
-// countLiveRecordings is the absolute billed seat count: only ACTIVE recordings
-// are billed (paused recordings are stopped and not charged). Used as the Stripe
-// quantity everywhere.
-func (s *Server) countLiveRecordings(ctx context.Context, q pgxQuerier, accountID int64) int {
-	var n int
-	if err := q.QueryRow(ctx, `
-		SELECT count(*) FROM recordings WHERE account_id=$1 AND status = 'active'
-	`, accountID).Scan(&n); err != nil {
-		return 0
-	}
-	return n
-}
-
-// recordingIsBillable reports whether a single recording is currently billable
-// per the gate view. The scheduler/lease inline this predicate; this exists for
-// targeted checks and tests.
-func (s *Server) recordingIsBillable(ctx context.Context, accountID, recordingID int64) (bool, error) {
-	var billable bool
-	err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(billable, false) FROM recording_billing_state
-		WHERE recording_id=$1 AND account_id=$2
-	`, recordingID, accountID).Scan(&billable)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return billable, nil
 }
 
 // handleStripeWebhook verifies the Stripe signature, dedups the event, and
@@ -435,10 +254,18 @@ func (s *Server) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// applyStripeEvent re-derives the account's billing state from the event's
-// subscription, re-fetching the authoritative subscription object. It resolves
-// the account only via the locally-stored customer id (and the checkout
+// applyStripeEvent maps the usage-billing webhook events onto account_billing,
+// resolving the account only via the locally-stored customer id (and the checkout
 // client_reference_id), never minting a billing row from an arbitrary customer.
+//
+//   - checkout.session.completed (mode=subscription): the card was saved; flip
+//     has_payment_method=true and store the subscription id + default payment
+//     method id so the nightly metering job and the portal have them.
+//   - invoice.paid / invoice.payment_failed: track last_payment_failed_at only
+//     (set on failure, cleared on payment). No quantity/period writes; Stripe owns
+//     the usage math.
+//   - payment_method.detached / customer.subscription.deleted: the card is gone;
+//     flip has_payment_method=false so capture is gated again.
 func (s *Server) applyStripeEvent(ctx context.Context, tx pgx.Tx, event stripe.Event) error {
 	switch event.Type {
 	case "checkout.session.completed":
@@ -446,105 +273,104 @@ func (s *Server) applyStripeEvent(ctx context.Context, tx pgx.Tx, event stripe.E
 		if err := json.Unmarshal(event.Data.Raw, &sess); err != nil {
 			return fmt.Errorf("decode checkout session: %w", err)
 		}
+		if sess.Mode != stripe.CheckoutSessionModeSubscription {
+			return nil
+		}
 		accountID, err := s.resolveBillingAccount(ctx, tx, customerIDOf(sess.Customer), clientRefAccountID(sess.ClientReferenceID))
 		if err != nil || accountID == 0 {
 			return err
 		}
-		if sess.Subscription == nil || strings.TrimSpace(sess.Subscription.ID) == "" {
-			return nil
+		subID := ""
+		if sess.Subscription != nil {
+			subID = strings.TrimSpace(sess.Subscription.ID)
 		}
-		return s.syncBillingFromSubscription(ctx, tx, accountID, sess.Subscription.ID, eventCreated(event))
-
-	case "customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted":
-		var sub stripe.Subscription
-		if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
-			return fmt.Errorf("decode subscription: %w", err)
+		var subIDArg any
+		if subID != "" {
+			subIDArg = subID
 		}
-		accountID, err := s.resolveBillingAccount(ctx, tx, customerIDOf(sub.Customer), 0)
-		if err != nil || accountID == 0 {
-			return err
+		pmID := checkoutDefaultPaymentMethodID(&sess)
+		var pmIDArg any
+		if pmID != "" {
+			pmIDArg = pmID
 		}
-		return s.syncBillingFromSubscription(ctx, tx, accountID, sub.ID, eventCreated(event))
+		if _, err := tx.Exec(ctx, `
+			UPDATE account_billing
+			SET has_payment_method=true,
+			    stripe_subscription_id=COALESCE($2, stripe_subscription_id),
+			    stripe_default_payment_method_id=COALESCE($3, stripe_default_payment_method_id),
+			    last_event_at=GREATEST(COALESCE(last_event_at, 'epoch'::timestamptz), COALESCE($4::timestamptz, now())),
+			    updated_at=now()
+			WHERE account_id=$1
+		`, accountID, subIDArg, pmIDArg, eventCreatedArg(event)); err != nil {
+			return fmt.Errorf("apply checkout completed: %w", err)
+		}
+		return nil
 
 	case "invoice.paid", "invoice.payment_failed":
 		var inv stripe.Invoice
 		if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
 			return fmt.Errorf("decode invoice: %w", err)
 		}
-		subID := invoiceSubscriptionID(&inv)
-		if subID == "" {
-			return nil
-		}
 		accountID, err := s.resolveBillingAccount(ctx, tx, customerIDOf(inv.Customer), 0)
 		if err != nil || accountID == 0 {
 			return err
 		}
+		var failedAtExpr string
 		if event.Type == "invoice.payment_failed" {
-			evAt := eventCreated(event)
-			var evAtArg any
-			if !evAt.IsZero() {
-				evAtArg = evAt
-			}
-			// Gate on event ordering so a redelivered/out-of-order failed-invoice
-			// cannot re-mark an account that has since recovered.
-			if _, err := tx.Exec(ctx, `
-				UPDATE account_billing SET last_payment_failed_at=now(), updated_at=now()
-				WHERE account_id=$1
-				  AND ($2::timestamptz IS NULL OR last_event_at IS NULL OR $2::timestamptz >= last_event_at)
-			`, accountID, evAtArg); err != nil {
-				return fmt.Errorf("mark payment failed: %w", err)
-			}
+			failedAtExpr = "now()"
+		} else {
+			failedAtExpr = "NULL"
 		}
-		return s.syncBillingFromSubscription(ctx, tx, accountID, subID, eventCreated(event))
+		// Gate on event ordering so a redelivered/out-of-order invoice event cannot
+		// overwrite newer state.
+		if _, err := tx.Exec(ctx, `
+			UPDATE account_billing
+			SET last_payment_failed_at=`+failedAtExpr+`,
+			    last_event_at=GREATEST(COALESCE(last_event_at, 'epoch'::timestamptz), COALESCE($2::timestamptz, now())),
+			    updated_at=now()
+			WHERE account_id=$1
+			  AND ($2::timestamptz IS NULL OR last_event_at IS NULL OR $2::timestamptz >= last_event_at)
+		`, accountID, eventCreatedArg(event)); err != nil {
+			return fmt.Errorf("apply invoice event: %w", err)
+		}
+		return nil
+
+	case "payment_method.detached", "customer.subscription.deleted":
+		var customerID string
+		switch event.Type {
+		case "payment_method.detached":
+			var pm stripe.PaymentMethod
+			if err := json.Unmarshal(event.Data.Raw, &pm); err != nil {
+				return fmt.Errorf("decode payment method: %w", err)
+			}
+			customerID = customerIDOf(pm.Customer)
+		default:
+			var sub stripe.Subscription
+			if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
+				return fmt.Errorf("decode subscription: %w", err)
+			}
+			customerID = customerIDOf(sub.Customer)
+		}
+		accountID, err := s.resolveBillingAccount(ctx, tx, customerID, 0)
+		if err != nil || accountID == 0 {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE account_billing
+			SET has_payment_method=false,
+			    last_event_at=GREATEST(COALESCE(last_event_at, 'epoch'::timestamptz), COALESCE($2::timestamptz, now())),
+			    updated_at=now()
+			WHERE account_id=$1
+			  AND ($2::timestamptz IS NULL OR last_event_at IS NULL OR $2::timestamptz >= last_event_at)
+		`, accountID, eventCreatedArg(event)); err != nil {
+			return fmt.Errorf("clear payment method: %w", err)
+		}
+		return nil
 
 	default:
 		// Unhandled event types are acknowledged (already deduped/stored).
 		return nil
 	}
-}
-
-// syncBillingFromSubscription re-fetches the subscription from Stripe and writes
-// status/quantity/period to account_billing, guarded so a stale out-of-order
-// event never overwrites newer state (last_event_at monotonic).
-func (s *Server) syncBillingFromSubscription(ctx context.Context, tx pgx.Tx, accountID int64, subID string, eventAt time.Time) error {
-	sub, err := s.billing.GetSubscription(ctx, subID)
-	if err != nil {
-		return err
-	}
-	status := string(sub.Status)
-	if !validSubscriptionStatus(status) {
-		status = "none"
-	}
-	itemID, quantity, periodEnd := recorderLineItem(sub, s.cfg.StripePriceID)
-	var periodEndArg any
-	if !periodEnd.IsZero() {
-		periodEndArg = periodEnd
-	}
-	var itemIDArg any
-	if strings.TrimSpace(itemID) != "" {
-		itemIDArg = itemID
-	}
-	var eventAtArg any
-	if !eventAt.IsZero() {
-		eventAtArg = eventAt
-	}
-
-	if _, err := tx.Exec(ctx, `
-		UPDATE account_billing
-		SET stripe_subscription_id=CASE WHEN $4 IN ('canceled','unpaid','incomplete_expired') THEN NULL ELSE $2 END,
-		    stripe_subscription_item_id=CASE WHEN $4 IN ('canceled','unpaid','incomplete_expired') THEN NULL ELSE COALESCE($3, stripe_subscription_item_id) END,
-		    subscription_status=$4,
-		    paid_quantity=$5,
-		    current_period_end=$6,
-		    cancel_at_period_end=$7,
-		    last_event_at=GREATEST(COALESCE(last_event_at, 'epoch'::timestamptz), COALESCE($8::timestamptz, now())),
-		    updated_at=now()
-		WHERE account_id=$1
-		  AND ($8::timestamptz IS NULL OR last_event_at IS NULL OR $8::timestamptz >= last_event_at)
-	`, accountID, sub.ID, itemIDArg, status, quantity, periodEndArg, subscriptionCancelAtPeriodEnd(sub), eventAtArg); err != nil {
-		return fmt.Errorf("upsert account billing: %w", err)
-	}
-	return nil
 }
 
 // resolveBillingAccount maps a Stripe customer id to a local account id ONLY via
@@ -594,65 +420,18 @@ type pgxQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func subscriptionStatusGrantsAccess(status string) bool {
-	switch strings.TrimSpace(status) {
-	case "active", "trialing", "past_due":
-		return true
-	default:
-		return false
+// checkoutDefaultPaymentMethodID reads the saved default payment method off a
+// completed Checkout session when Stripe expanded it onto the session's
+// subscription. It returns "" when unavailable (the portal/Stripe still hold it);
+// has_payment_method does not depend on this id.
+func checkoutDefaultPaymentMethodID(sess *stripe.CheckoutSession) string {
+	if sess == nil || sess.Subscription == nil {
+		return ""
 	}
-}
-
-func validSubscriptionStatus(status string) bool {
-	switch strings.TrimSpace(status) {
-	case "none", "incomplete", "trialing", "active", "past_due", "canceled", "unpaid", "incomplete_expired":
-		return true
-	default:
-		return false
+	if pm := sess.Subscription.DefaultPaymentMethod; pm != nil {
+		return strings.TrimSpace(pm.ID)
 	}
-}
-
-// recorderLineItem returns the subscription item id, quantity, and period end
-// for the recorder price line. In stripe-go v82, current_period_end lives on the
-// subscription item, not the subscription.
-func recorderLineItem(sub *stripe.Subscription, priceID string) (string, int, time.Time) {
-	if sub == nil || sub.Items == nil {
-		return "", 0, time.Time{}
-	}
-	priceID = strings.TrimSpace(priceID)
-	for _, item := range sub.Items.Data {
-		if item == nil {
-			continue
-		}
-		if priceID != "" && (item.Price == nil || item.Price.ID != priceID) {
-			continue
-		}
-		var periodEnd time.Time
-		if item.CurrentPeriodEnd > 0 {
-			periodEnd = time.Unix(item.CurrentPeriodEnd, 0).UTC()
-		}
-		return item.ID, int(item.Quantity), periodEnd
-	}
-	// Fall back to the first item if the price id did not match (e.g. price
-	// renamed); period end still comes from that item.
-	for _, item := range sub.Items.Data {
-		if item == nil {
-			continue
-		}
-		var periodEnd time.Time
-		if item.CurrentPeriodEnd > 0 {
-			periodEnd = time.Unix(item.CurrentPeriodEnd, 0).UTC()
-		}
-		return item.ID, int(item.Quantity), periodEnd
-	}
-	return "", 0, time.Time{}
-}
-
-func subscriptionCancelAtPeriodEnd(sub *stripe.Subscription) bool {
-	if sub == nil {
-		return false
-	}
-	return sub.CancelAtPeriodEnd
+	return ""
 }
 
 func customerIDOf(c *stripe.Customer) string {
@@ -670,19 +449,11 @@ func clientRefAccountID(ref string) int64 {
 	return v
 }
 
-func eventCreated(event stripe.Event) time.Time {
+// eventCreatedArg returns the event's created instant as a query arg (nil when
+// the event carries no timestamp), so the out-of-order guard can compare it.
+func eventCreatedArg(event stripe.Event) any {
 	if event.Created <= 0 {
-		return time.Time{}
+		return nil
 	}
 	return time.Unix(event.Created, 0).UTC()
-}
-
-func invoiceSubscriptionID(inv *stripe.Invoice) string {
-	if inv == nil {
-		return ""
-	}
-	if inv.Parent != nil && inv.Parent.SubscriptionDetails != nil && inv.Parent.SubscriptionDetails.Subscription != nil {
-		return strings.TrimSpace(inv.Parent.SubscriptionDetails.Subscription.ID)
-	}
-	return ""
 }

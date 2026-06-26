@@ -19,13 +19,14 @@ type Config struct {
 	CatchupWindow  time.Duration
 	MinIntervalSec int
 	MaxJobsPerTick int
-	// BillingEnabled gates capture on the billable predicate. When false (free
-	// mode / no Stripe), the gate is status='active' alone.
+	// BillingEnabled gates capture on the account having a card on file. When false
+	// (free mode / no Stripe), the gate is the open capture window alone.
 	BillingEnabled bool
 }
 
-// Scheduler materializes one recording_jobs row per cron fire for every active
-// (and, when billing is enabled, billable) recording.
+// Scheduler materializes one recording_jobs row per cron fire for every recording
+// whose capture window is open (and, when billing is enabled, whose account has a
+// card on file).
 type Scheduler struct {
 	pool *pgxpool.Pool
 	cfg  Config
@@ -71,18 +72,45 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
-// tick reclaims expired leases and enqueues due jobs in a single transaction.
+// tick auto-stops windows that have closed, reclaims expired leases, and enqueues
+// due jobs in a single transaction.
 func (s *Scheduler) tick(ctx context.Context) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin scheduler tick: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.autoStopExpiredRecordings(ctx, tx); err != nil {
+		return err
+	}
 	if err := s.EnqueueDueRecordingJobs(ctx, tx); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit scheduler tick: %w", err)
+	}
+	return nil
+}
+
+// autoStopExpiredRecordings enforces the window upper bound between cron ticks:
+// any active recording whose end_at has passed flips to 'completed' (a terminal
+// state distinct from 'canceled' = user deleted) with next_fire_at cleared, and
+// its still-pending/leased jobs are canceled so the worker stops capturing it.
+func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `
+		UPDATE recordings
+		SET status='completed', next_fire_at=NULL, updated_at=now()
+		WHERE status='active' AND end_at IS NOT NULL AND end_at <= now()
+	`); err != nil {
+		return fmt.Errorf("auto-stop expired recordings: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE recording_jobs
+		SET status='canceled', updated_at=now()
+		WHERE status IN ('pending','leased')
+		  AND recording_id IN (SELECT id FROM recordings WHERE status='completed')
+	`); err != nil {
+		return fmt.Errorf("cancel jobs for completed recordings: %w", err)
 	}
 	return nil
 }
@@ -110,19 +138,21 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 		return fmt.Errorf("reclaim expired recording leases: %w", err)
 	}
 
-	// (b) select active (+ billable when enabled) recordings.
+	// (b) select recordings whose window is open now and (when billing is enabled)
+	// whose account has a card on file. Usage billing: starting a recording does not
+	// charge, so the only capture gate is window + has_payment_method. A failed
+	// stream writes no clip row, so a down day is simply never billed (no gate
+	// change needed for "fails => free").
 	rows, err := tx.Query(ctx, `
 		SELECT rec.id, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec, rec.last_enqueued_fire_at
 		FROM recordings rec
 		WHERE rec.status='active'
+		  AND rec.start_at <= now()
+		  AND (rec.end_at IS NULL OR now() < rec.end_at)
 		  AND ($1 OR EXISTS (
 		        SELECT 1 FROM account_billing b
 		        WHERE b.account_id = rec.account_id
-		          AND b.subscription_status IN ('active','trialing','past_due')
-		          AND (b.subscription_status <> 'past_due' OR b.current_period_end > now())
-		          AND (SELECT count(*) FROM recordings r2
-		                 WHERE r2.account_id = rec.account_id AND r2.status = 'active'
-		                   AND (r2.created_at, r2.id) <= (rec.created_at, rec.id)) <= b.paid_quantity))
+		          AND b.has_payment_method))
 		ORDER BY rec.id ASC
 	`, !s.cfg.BillingEnabled)
 	if err != nil {

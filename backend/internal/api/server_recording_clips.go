@@ -38,12 +38,12 @@ type recordingLeaseResponse struct {
 
 // handleRecordingJobsLease leases at most one due recording job for the calling
 // droplet. It locks ONLY recording_jobs in the CTE (mirroring the capture lease)
-// and inlines the billable predicate non-windowed (the gate VIEW cannot be used
-// under FOR UPDATE). Leasing is restricted to operator-managed pool droplets:
-// recorder_droplets rows are created only by the autoscaler under the operator
-// account, so a self-enrolled local_recorder node (which has no such row) can
-// lease nothing and therefore cannot observe another tenant's stream_url or deny
-// their capture.
+// and inlines the capture gate (status='active', window open, and, when billing is
+// enabled, account has a card on file), matching the scheduler/forecast gate.
+// Leasing is restricted to operator-managed pool droplets: recorder_droplets rows
+// are created only by the autoscaler under the operator account, so a self-enrolled
+// local_recorder node (which has no such row) can lease nothing and therefore
+// cannot observe another tenant's stream_url or deny their capture.
 func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request) {
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
@@ -65,14 +65,12 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		  JOIN recordings rec ON rec.id = j.recording_id
 		  WHERE j.status='pending' AND j.scheduled_for <= now()
 		    AND rec.status='active'
+		    AND rec.start_at <= now()
+		    AND (rec.end_at IS NULL OR now() < rec.end_at)
 		    AND ($2 OR EXISTS (
 		          SELECT 1 FROM account_billing b
 		          WHERE b.account_id = rec.account_id
-		            AND b.subscription_status IN ('active','trialing','past_due')
-		            AND (b.subscription_status <> 'past_due' OR b.current_period_end > now())
-		            AND (SELECT count(*) FROM recordings r2
-		                   WHERE r2.account_id = rec.account_id AND r2.status <> 'canceled'
-		                     AND (r2.created_at, r2.id) <= (rec.created_at, rec.id)) <= b.paid_quantity))
+		            AND b.has_payment_method))
 		    AND EXISTS (
 		          SELECT 1 FROM recorder_droplets d
 		          WHERE d.name = $1 AND d.state <> 'draining')

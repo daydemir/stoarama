@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
@@ -71,6 +72,25 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 		}()
 	} else {
 		log.Printf("recorder-control: DROPLET_POOL_ENABLED is false; autoscaler not started.")
+	}
+
+	// Monthly usage metering: the only place recording-days are reported to Stripe.
+	// Gated on billingEnabled (same secret+webhook+price gate as capture), so free
+	// mode never charges. Runs under the same restart-with-backoff loop.
+	if billingEnabled {
+		reporter, err := billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.AppBaseURL, cfg.StripeLivemode)
+		if err != nil {
+			log.Fatalf("init stripe billing client for metering: %v", err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runWithBackoff(ctx, "recording metering", restartDelay, func(ctx context.Context) error {
+				return runRecordingMetering(ctx, pool, reporter)
+			})
+		}()
+	} else {
+		log.Printf("recorder-control: billing disabled; usage metering not started.")
 	}
 
 	wg.Wait()

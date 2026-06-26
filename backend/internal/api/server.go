@@ -219,7 +219,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
 			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)
 			account.Get("/billing", s.handleAccountBillingMe)
-			account.Post("/billing/checkout", s.handleAccountBillingCheckout)
+			account.Post("/billing/card", s.handleAccountBillingCard)
 			account.Post("/billing/portal", s.handleAccountBillingPortal)
 			account.Get("/nodes", s.handleAccountNodesList)
 			account.Get("/node-enrollment-tokens", s.handleAccountNodeEnrollmentTokensList)

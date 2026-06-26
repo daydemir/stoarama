@@ -1,21 +1,31 @@
 // Package billing isolates the Stripe SDK behind a small typed client, the same
-// way internal/r2 isolates the S3 SDK. It owns checkout, the customer portal,
-// quantity sync, subscription re-fetch, and signature-verified webhook parsing.
-// One subscription per account; quantity is the absolute live recording count.
+// way internal/r2 isolates the S3 SDK. It owns the card-on-file Checkout, the
+// customer portal, metered usage reporting (recording-days), reading a
+// subscription's billing period, and signature-verified webhook parsing.
+//
+// Billing model: one metered Subscription per account. Usage is reported as
+// Stripe Billing Meter events (event_name "recording_day", value = number of
+// billable recording-days in the period); Stripe sums them and bills the saved
+// card monthly in arrears. priceID is the meter-backed metered price.
 package billing
 
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	stripe "github.com/stripe/stripe-go/v82"
 	"github.com/stripe/stripe-go/v82/client"
 	"github.com/stripe/stripe-go/v82/webhook"
 )
 
+// recordingDayEventName is the meter's event_name (see the billing-setup meter).
+const recordingDayEventName = "recording_day"
+
 // Client wraps a per-instance Stripe API client (no global stripe.Key mutation)
-// plus the recorder's single price id and the app base URL for redirects.
+// plus the metered recording-day price id and the app base URL for redirects.
 type Client struct {
 	sc         *client.API
 	priceID    string
@@ -23,8 +33,8 @@ type Client struct {
 	livemode   bool
 }
 
-// New builds a Stripe client bound to secretKey. priceID is the recurring
-// monthly recorder price; appBaseURL is used for Checkout/Portal redirect URLs.
+// New builds a Stripe client bound to secretKey. priceID is the metered
+// recording-day price; appBaseURL is used for Checkout/Portal redirect URLs.
 func New(secretKey, priceID, appBaseURL string, livemode bool) (*Client, error) {
 	secretKey = strings.TrimSpace(secretKey)
 	if secretKey == "" {
@@ -78,28 +88,36 @@ func (c *Client) EnsureCustomer(ctx context.Context, accountID int64, email stri
 	return cust.ID, nil
 }
 
-// CreateCheckoutSession opens a subscription Checkout for qty recorder seats.
-func (c *Client) CreateCheckoutSession(ctx context.Context, customerID string, accountID int64, qty int64) (string, error) {
+// CreateCardOnFileCheckoutSession opens a $0 metered-subscription Checkout that
+// SAVES the card as the customer's default payment method. The metered line has
+// no quantity (Stripe rejects a quantity on a metered price); billing_mode is
+// flexible so a metered-only subscription owes $0 at creation and no empty
+// invoice is finalized. Returns the hosted Checkout URL.
+func (c *Client) CreateCardOnFileCheckoutSession(ctx context.Context, customerID string, accountID int64) (string, error) {
 	if strings.TrimSpace(customerID) == "" {
 		return "", fmt.Errorf("customer id is required")
 	}
-	if qty < 1 {
-		qty = 1
-	}
 	params := &stripe.CheckoutSessionParams{
-		Mode:              strPtr(string(stripe.CheckoutSessionModeSubscription)),
-		Customer:          strPtr(customerID),
-		ClientReferenceID: strPtr(fmt.Sprintf("%d", accountID)),
-		SuccessURL:        strPtr(c.appBaseURL + "/recordings?billing=success"),
-		CancelURL:         strPtr(c.appBaseURL + "/recordings?billing=cancel"),
+		Mode:                    strPtr(string(stripe.CheckoutSessionModeSubscription)),
+		Customer:                strPtr(customerID),
+		ClientReferenceID:       strPtr(fmt.Sprintf("%d", accountID)),
+		PaymentMethodCollection: strPtr(string(stripe.CheckoutSessionPaymentMethodCollectionAlways)),
+		SuccessURL:              strPtr(c.appBaseURL + "/recordings?billing=success"),
+		CancelURL:               strPtr(c.appBaseURL + "/recordings?billing=cancel"),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
-			{Price: strPtr(c.priceID), Quantity: stripe.Int64(qty)},
+			{Price: strPtr(c.priceID)}, // no Quantity on a metered line
+		},
+		SubscriptionData: &stripe.CheckoutSessionSubscriptionDataParams{
+			BillingMode: &stripe.CheckoutSessionSubscriptionDataBillingModeParams{
+				Type: strPtr(string(stripe.SubscriptionBillingModeTypeFlexible)),
+			},
+			Metadata: map[string]string{"account_id": fmt.Sprintf("%d", accountID)},
 		},
 	}
 	params.Context = ctx
 	sess, err := c.sc.CheckoutSessions.New(params)
 	if err != nil {
-		return "", fmt.Errorf("create checkout session: %w", err)
+		return "", fmt.Errorf("create card-on-file checkout: %w", err)
 	}
 	return sess.URL, nil
 }
@@ -124,55 +142,72 @@ func (c *Client) CreatePortalSession(ctx context.Context, customerID, returnURL 
 	return sess.URL, nil
 }
 
-// SetSubscriptionQuantity updates the recorder line item to qty seats with
-// prorations enabled.
-func (c *Client) SetSubscriptionQuantity(ctx context.Context, subItemID string, qty int64) error {
-	if strings.TrimSpace(subItemID) == "" {
-		return fmt.Errorf("subscription item id is required")
+// ReportRecordingDays pushes one idempotent meter event recording the number of
+// billable recording-days for an account's billing period. days must be > 0
+// (a zero-day period reports nothing; Stripe suppresses the empty invoice).
+//
+// Identifier is "<accountID>-<periodKey>", a per-customer-per-period key, so the
+// monthly job is re-runnable without double-billing: Stripe enforces identifier
+// uniqueness within a rolling window of at least 24 hours, and the per-period
+// key keeps re-sends within a period a no-op. The customer is mapped via the
+// payload "stripe_customer_id" (the meter's customer_mapping) and the day count
+// via "value" (the meter's value_settings). Timestamp is omitted, so Stripe
+// stamps "now".
+func (c *Client) ReportRecordingDays(ctx context.Context, customerID string, accountID int64, periodKey string, days int) error {
+	if strings.TrimSpace(customerID) == "" {
+		return fmt.Errorf("customer id is required")
 	}
-	if qty < 0 {
-		qty = 0
+	if strings.TrimSpace(periodKey) == "" {
+		return fmt.Errorf("period key is required")
 	}
-	params := &stripe.SubscriptionItemParams{
-		Quantity:          stripe.Int64(qty),
-		ProrationBehavior: strPtr("create_prorations"),
+	if days <= 0 {
+		return fmt.Errorf("days must be positive, got %d", days)
 	}
-	params.Context = ctx
-	if _, err := c.sc.SubscriptionItems.Update(subItemID, params); err != nil {
-		return fmt.Errorf("set subscription quantity: %w", err)
+	ev := &stripe.BillingMeterEventParams{
+		EventName:  strPtr(recordingDayEventName),
+		Identifier: strPtr(fmt.Sprintf("%d-%s", accountID, periodKey)),
+		Payload: map[string]string{
+			"stripe_customer_id": customerID,
+			"value":              strconv.Itoa(days),
+		},
+	}
+	ev.Context = ctx
+	if _, err := c.sc.BillingMeterEvents.New(ev); err != nil {
+		return fmt.Errorf("report recording days: %w", err)
 	}
 	return nil
 }
 
-// CancelSubscription cancels the subscription immediately. Used when the account
-// drops to zero active recordings: Stripe rejects quantity 0 on a licensed item,
-// so instead of setting quantity 0 we cancel the subscription so the account pays
-// nothing, and the next active recording cleanly re-subscribes via Checkout.
-func (c *Client) CancelSubscription(ctx context.Context, subID string) error {
+// GetSubscriptionPeriod returns the current billing-period bounds for the
+// metering job. In v82 the period lives on the subscription ITEM (mirroring how
+// the old recorderLineItem read CurrentPeriodEnd), so this reads the first
+// item's current_period_start/end.
+func (c *Client) GetSubscriptionPeriod(ctx context.Context, subID string) (start, end time.Time, err error) {
 	if strings.TrimSpace(subID) == "" {
-		return fmt.Errorf("subscription id is required")
-	}
-	params := &stripe.SubscriptionCancelParams{}
-	params.Context = ctx
-	if _, err := c.sc.Subscriptions.Cancel(strings.TrimSpace(subID), params); err != nil {
-		return fmt.Errorf("cancel subscription: %w", err)
-	}
-	return nil
-}
-
-// GetSubscription re-fetches the authoritative subscription object so the
-// webhook handler never trusts a possibly-stale event payload for state.
-func (c *Client) GetSubscription(ctx context.Context, subID string) (*stripe.Subscription, error) {
-	if strings.TrimSpace(subID) == "" {
-		return nil, fmt.Errorf("subscription id is required")
+		return time.Time{}, time.Time{}, fmt.Errorf("subscription id is required")
 	}
 	params := &stripe.SubscriptionParams{}
 	params.Context = ctx
-	sub, err := c.sc.Subscriptions.Get(subID, params)
+	sub, err := c.sc.Subscriptions.Get(strings.TrimSpace(subID), params)
 	if err != nil {
-		return nil, fmt.Errorf("get subscription: %w", err)
+		return time.Time{}, time.Time{}, fmt.Errorf("get subscription: %w", err)
 	}
-	return sub, nil
+	if sub.Items == nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("subscription has no items")
+	}
+	for _, item := range sub.Items.Data {
+		if item == nil {
+			continue
+		}
+		if item.CurrentPeriodStart > 0 {
+			start = time.Unix(item.CurrentPeriodStart, 0).UTC()
+		}
+		if item.CurrentPeriodEnd > 0 {
+			end = time.Unix(item.CurrentPeriodEnd, 0).UTC()
+		}
+		return start, end, nil
+	}
+	return time.Time{}, time.Time{}, fmt.Errorf("subscription has no items")
 }
 
 // ConstructEvent verifies the Stripe-Signature header (HMAC + the default 5-min
@@ -184,8 +219,7 @@ func (c *Client) GetSubscription(ctx context.Context, subID string) (*stripe.Sub
 // version differs, which would 400 every webhook and prevent any account from
 // ever becoming billable. This is safe: the HMAC signature is still verified, and
 // we only read stable identifiers (customer/subscription/client_reference ids)
-// off the event, then re-fetch the authoritative subscription via the pinned API
-// client, so cross-version field-shape drift in the payload cannot corrupt state.
+// off the event.
 func (c *Client) ConstructEvent(payload []byte, sigHeader, secret string) (stripe.Event, error) {
 	return webhook.ConstructEventWithOptions(payload, sigHeader, secret, webhook.ConstructEventOptions{
 		IgnoreAPIVersionMismatch: true,
