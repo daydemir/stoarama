@@ -161,8 +161,19 @@ func (c *Client) GetSubscription(ctx context.Context, subID string) (*stripe.Sub
 
 // ConstructEvent verifies the Stripe-Signature header (HMAC + the default 5-min
 // timestamp tolerance) and returns the parsed event, failing closed on any error.
+//
+// IgnoreAPIVersionMismatch is set because the account's default API version
+// (used by the Dashboard and the Stripe CLI) advances independently of the
+// stripe-go version pinned here, and stripe-go otherwise REJECTS any event whose
+// version differs, which would 400 every webhook and prevent any account from
+// ever becoming billable. This is safe: the HMAC signature is still verified, and
+// we only read stable identifiers (customer/subscription/client_reference ids)
+// off the event, then re-fetch the authoritative subscription via the pinned API
+// client, so cross-version field-shape drift in the payload cannot corrupt state.
 func (c *Client) ConstructEvent(payload []byte, sigHeader, secret string) (stripe.Event, error) {
-	return webhook.ConstructEvent(payload, sigHeader, secret)
+	return webhook.ConstructEventWithOptions(payload, sigHeader, secret, webhook.ConstructEventOptions{
+		IgnoreAPIVersionMismatch: true,
+	})
 }
 
 func strPtr(s string) *string { return &s }
