@@ -144,6 +144,22 @@ func (c *Client) SetSubscriptionQuantity(ctx context.Context, subItemID string, 
 	return nil
 }
 
+// CancelSubscription cancels the subscription immediately. Used when the account
+// drops to zero active recordings: Stripe rejects quantity 0 on a licensed item,
+// so instead of setting quantity 0 we cancel the subscription so the account pays
+// nothing, and the next active recording cleanly re-subscribes via Checkout.
+func (c *Client) CancelSubscription(ctx context.Context, subID string) error {
+	if strings.TrimSpace(subID) == "" {
+		return fmt.Errorf("subscription id is required")
+	}
+	params := &stripe.SubscriptionCancelParams{}
+	params.Context = ctx
+	if _, err := c.sc.Subscriptions.Cancel(strings.TrimSpace(subID), params); err != nil {
+		return fmt.Errorf("cancel subscription: %w", err)
+	}
+	return nil
+}
+
 // GetSubscription re-fetches the authoritative subscription object so the
 // webhook handler never trusts a possibly-stale event payload for state.
 func (c *Client) GetSubscription(ctx context.Context, subID string) (*stripe.Subscription, error) {

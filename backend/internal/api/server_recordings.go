@@ -234,11 +234,32 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		"clip_duration_sec": clipDuration,
 	})
 
-	util.WriteJSON(w, http.StatusCreated, map[string]any{
+	resp := map[string]any{
 		"id":         id,
 		"status":     "active",
 		"created_at": createdAt.UTC(),
-	})
+	}
+	// Start = pay: if the account has no access-granting subscription, the new
+	// recording is not billable and will not capture until Checkout completes, so
+	// mint a Checkout session and return its url. If the sub already grants access,
+	// the in-tx syncSubscriptionQuantity above already covered the new seat.
+	grants, err := s.accountSubscriptionGrantsAccess(r.Context(), principal.AccountID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load billing coverage: %v", err))
+		return
+	}
+	if !grants {
+		checkoutURL, err := s.ensureRecordingCheckoutURL(r.Context(), principal.AccountID, principal.Email)
+		if err != nil {
+			util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("mint checkout session: %v", err))
+			return
+		}
+		if checkoutURL != "" {
+			resp["checkout_url"] = checkoutURL
+		}
+	}
+
+	util.WriteJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Request) {
@@ -339,7 +360,14 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 		}
 	}
 
-	ct, err := s.pool.Exec(r.Context(), `
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin status tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE recordings
 		SET status=$3, next_fire_at=$4, updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND status=$5
@@ -353,10 +381,46 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 		return
 	}
 
+	// Pause drops the Stripe seat (paused = not billed); resume bumps it back, in
+	// the same tx so a concurrent change cannot push a stale seat count. A drop to
+	// zero active recordings cancels the subscription (see syncSubscriptionQuantity).
+	if err := s.syncSubscriptionQuantity(r.Context(), tx, principal.AccountID); err != nil {
+		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("sync billing quantity: %v", err))
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit status tx: %v", err))
+		return
+	}
+
 	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, eventType, "account", principal.Email, map[string]any{
 		"recording_id": id,
 	})
-	util.WriteJSON(w, http.StatusOK, map[string]any{"id": id, "status": toStatus})
+
+	resp := map[string]any{"id": id, "status": toStatus}
+	// Resume = pay: if resuming leaves the account with an active recording but no
+	// access-granting subscription, the resumed recording is not billable and will
+	// not capture until Checkout completes, so mint a Checkout session and return
+	// its url (uniform with Start).
+	if toStatus == "active" {
+		grants, err := s.accountSubscriptionGrantsAccess(r.Context(), principal.AccountID)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load billing coverage: %v", err))
+			return
+		}
+		if !grants {
+			checkoutURL, err := s.ensureRecordingCheckoutURL(r.Context(), principal.AccountID, principal.Email)
+			if err != nil {
+				util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("mint checkout session: %v", err))
+				return
+			}
+			if checkoutURL != "" {
+				resp["checkout_url"] = checkoutURL
+			}
+		}
+	}
+	util.WriteJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAccountRecordingDelete(w http.ResponseWriter, r *http.Request) {

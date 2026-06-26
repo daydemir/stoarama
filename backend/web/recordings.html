@@ -50,19 +50,18 @@
     }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
+    .shell { max-width: 880px; margin: 0 auto; padding: 18px 20px 42px; }
     .topbar {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       align-items: center;
       gap: 12px;
-      margin-bottom: 16px;
+      margin-bottom: 18px;
       min-height: 40px;
     }
-    .topbar-left, .topbar-center, .topbar-right { display: flex; align-items: center; min-width: 0; }
+    .topbar-left, .topbar-right { display: flex; align-items: center; min-width: 0; }
     .topbar-left { gap: 10px; overflow: hidden; }
-    .topbar-center { justify-content: center; }
-    .topbar-right { gap: 10px; justify-content: flex-end; }
+    .topbar-right { gap: 10px; justify-content: flex-end; position: relative; }
     .site-title {
       font-family: var(--mono);
       font-size: 15px;
@@ -71,38 +70,10 @@
       color: var(--accent);
       white-space: nowrap;
     }
-    .global-nav {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: color-mix(in srgb, var(--panel) 90%, #000);
-    }
-    .global-nav a {
-      display: inline-flex;
-      align-items: center;
-      padding: 7px 12px;
-      border-radius: 999px;
-      border: 1px solid transparent;
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      text-decoration: none;
-      white-space: nowrap;
-    }
-    .global-nav a:hover {
-      color: var(--text);
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      background: color-mix(in srgb, var(--panel2) 82%, transparent);
-    }
-    .global-nav a.active { color: #fff; background: var(--accent); border-color: var(--accent); }
     .account-chip {
       display: inline-flex;
       align-items: center;
+      gap: 7px;
       min-height: 36px;
       padding: 0 12px;
       border-radius: 999px;
@@ -112,8 +83,38 @@
       font-family: var(--mono);
       font-size: 11px;
       white-space: nowrap;
+      cursor: pointer;
+      width: auto;
+      min-width: 0;
     }
-    .account-chip a { color: var(--text); text-decoration: none; }
+    .account-chip:hover { color: var(--text); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+    .account-chip .caret { font-size: 9px; opacity: 0.8; }
+    .account-menu {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      min-width: 220px;
+      z-index: 30;
+      padding: 6px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 96%, #000);
+      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.35);
+    }
+    .account-menu button {
+      width: 100%;
+      text-align: left;
+      min-height: 38px;
+      padding: 9px 12px;
+      border-radius: 9px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text);
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .account-menu button:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); }
+    .account-menu .menu-sep { height: 1px; margin: 6px 4px; background: var(--border); }
     .panel {
       background: color-mix(in srgb, var(--panel) 94%, #000);
       border: 1px solid var(--border);
@@ -129,18 +130,19 @@
       text-transform: uppercase;
       letter-spacing: 0.04em;
     }
-    h1 { margin: 0 0 10px; font-size: clamp(28px, 4vw, 40px); line-height: 0.98; letter-spacing: -0.03em; }
+    h1 { margin: 0 0 10px; font-size: clamp(26px, 4vw, 36px); line-height: 1.02; letter-spacing: -0.03em; }
     h2 { margin: 0 0 10px; font-size: 18px; line-height: 1.15; }
     p, .note, .muted { color: var(--muted); line-height: 1.55; }
-    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
     .stack { display: grid; gap: 10px; }
     .section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-    .status { min-height: 18px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .status { min-height: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .status:empty { display: none; }
     .status.ok { color: var(--ok); }
     .status.err { color: var(--err); }
+    .status.warn { color: var(--warn); }
     .hidden { display: none !important; }
     label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
-    input, select, button {
+    input, select, textarea, button {
       width: 100%;
       min-height: 40px;
       border-radius: 10px;
@@ -150,41 +152,100 @@
       font: inherit;
       padding: 10px 12px;
     }
-    input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
+    textarea { min-height: 44px; resize: vertical; }
+    input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
     button { cursor: pointer; background: color-mix(in srgb, var(--accent) 18%, var(--panel2)); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); color: #f8fafc; font-weight: 600; }
     button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
     button.secondary { background: transparent; color: var(--text); }
+    button.secondary:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); }
     button.danger { background: transparent; color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+    button.danger:hover { background: color-mix(in srgb, var(--err) 12%, transparent); }
     .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
-    .button-row > * { width: auto; min-width: 140px; }
-    .field { margin-bottom: 12px; }
-    .hint { margin-top: 4px; color: var(--muted); font-size: 12px; }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 2px 8px;
-      border-radius: 999px;
+    .button-row > * { width: auto; min-width: 120px; }
+    .field { margin-bottom: 14px; }
+    .field:last-child { margin-bottom: 0; }
+    .hint { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .hint.warn { color: var(--warn); }
+    .mono { font-family: var(--mono); font-size: 12px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    /* Cost ledger */
+    .ledger {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 14px;
+      padding: 2px 2px 0;
       font-family: var(--mono);
-      font-size: 11px;
-      border: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--muted);
     }
-    .badge.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
-    .badge.off { color: var(--muted); }
-    .badge.healthy { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
-    .badge.degraded { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
-    .badge.failing { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
-    .badge.idle { color: var(--muted); }
-    .empty-state { padding: 16px; border: 1px dashed var(--border); border-radius: 14px; color: var(--muted); line-height: 1.5; text-align: center; }
-    .table-wrap { overflow-x: auto; border-radius: 14px; border: 1px solid var(--border); background: color-mix(in srgb, var(--panel2) 86%, transparent); }
-    table { width: 100%; border-collapse: collapse; min-width: 860px; }
-    th, td { padding: 11px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
-    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-family: var(--mono); }
-    .mono, code { font-family: var(--mono); font-size: 12px; }
-    @media (max-width: 1100px) {
+    .ledger b { color: var(--text); font-weight: 600; }
+    /* Recording cards */
+    .cards { display: grid; gap: 12px; margin-bottom: 16px; }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+    }
+    .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .card-name { font-size: 15px; font-weight: 600; color: var(--text); }
+    .card-url { margin-top: 3px; font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
+    .card-status { font-family: var(--mono); font-size: 12px; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+    .card-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+    .card-status.active { color: var(--ok); }
+    .card-status.active .dot { background: var(--ok); }
+    .card-status.paused { color: var(--muted); }
+    .card-status.pending { color: var(--warn); }
+    .card-status.pending .dot { background: var(--warn); }
+    .card-meta { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+    .card-meta .meta-strong { color: var(--text); }
+    .card-meta .health-healthy { color: var(--ok); }
+    .card-meta .health-degraded { color: var(--warn); }
+    .card-meta .health-failing { color: var(--err); }
+    .card-actions { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+    .card-actions button { width: auto; min-width: 96px; min-height: 36px; }
+    .card-err { margin-top: 10px; color: var(--err); font-size: 12px; line-height: 1.45; }
+    /* Segmented control */
+    .seg { display: flex; flex-wrap: wrap; gap: 6px; }
+    .seg button {
+      width: auto; min-width: 0; flex: 0 0 auto;
+      min-height: 36px; padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 80%, transparent);
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 13px;
+    }
+    .seg button:hover { color: var(--text); }
+    .seg button.on { color: #fff; background: var(--accent); border-color: var(--accent); }
+    .preview { margin-top: 8px; font-size: 13px; color: var(--text); }
+    .preview .muted { color: var(--muted); }
+    .disclose { margin-top: 10px; }
+    .disclose > summary { cursor: pointer; color: var(--accent); font-size: 13px; list-style: none; }
+    .disclose > summary::-webkit-details-marker { display: none; }
+    .disclose > summary::before { content: "+ "; }
+    .disclose[open] > summary::before { content: "- "; }
+    .disclose > div { margin-top: 12px; }
+    /* Where clips go / connect form */
+    .subpanel {
+      margin-top: 8px;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--panel2) 70%, transparent);
+    }
+    .subpanel h3 { margin: 0 0 12px; font-size: 14px; }
+    .inline-link { width: auto; min-width: 0; min-height: 0; padding: 0; border: 0; background: none; color: var(--accent); font-weight: 500; font-size: 13px; cursor: pointer; }
+    .inline-link:hover { text-decoration: underline; background: none; }
+    .empty-hero-sub { color: var(--muted); font-size: 15px; line-height: 1.5; margin: 0 0 18px; }
+    .composer-footnote { margin: 14px 0 12px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+    .interstitial-body { color: var(--muted); line-height: 1.6; margin: 0 0 16px; }
+    @media (max-width: 640px) {
       .grid-2 { grid-template-columns: 1fr; }
-      .topbar { grid-template-columns: minmax(0, 1fr); overflow-x: auto; }
-      .topbar-center, .topbar-right { justify-content: flex-start; }
+      .card-head { flex-direction: column; }
     }
   </style>
 </head>
@@ -192,137 +253,274 @@
   <div class="shell">
     <div class="topbar">
       <div class="topbar-left">
-        <span class="site-title">STO-A-RAMA</span>
+        <a href="/recordings" class="site-title">STO-A-RAMA</a>
       </div>
-      <div class="topbar-center">
-        <nav class="global-nav" aria-label="Global">
-          <a href="/streams">Streams</a>
-          <a href="/recording">Recording</a>
-          <a href="/recordings" class="active">Recordings</a>
-          <a href="/account">Account</a>
-          <a href="/docs/getting-started">Docs</a>
-        </nav>
-      </div>
-      <div class="topbar-right">
+      <div class="topbar-right" id="accountArea">
         <div class="account-chip" id="accountChip">Checking session...</div>
       </div>
     </div>
 
-    <section class="panel" style="margin-bottom:16px;">
-      <div class="eyebrow">Stream recorder</div>
-      <h1>Schedule clips from a stream to your own bucket.</h1>
-      <p>Point a recording at an HLS or HTTPS stream, pick one of your storage destinations, set a cron schedule, and we capture one clip per fire to your bucket. Each recording is about $8/mo. A recording captures only while it is active and paid.</p>
-    </section>
-
-    <div id="signedOut" class="panel hidden" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div><div class="eyebrow">Sign in</div><h2>Email magic link</h2></div>
-        <p>Recordings are bound to your account. Sign in to manage them.</p>
+    <!-- Signed-out: single magic-link panel -->
+    <div id="signedOut" class="panel hidden">
+      <div class="eyebrow">Sign in</div>
+      <h2>Email magic link</h2>
+      <p style="margin-top:0;">Capture an HLS or HTTPS stream to your own S3 bucket, on a schedule. Sign in to start.</p>
+      <div class="field" style="margin-top:14px;">
+        <label for="email">Email</label>
+        <input id="email" type="email" placeholder="you@example.org" autocomplete="email" />
       </div>
-      <label for="email">Email</label>
-      <input id="email" type="email" placeholder="you@example.org" />
-      <div class="button-row" style="margin-top:12px;"><button id="requestLink" type="button">Email Magic Link</button></div>
+      <div class="button-row"><button id="requestLink" type="button">Email magic link</button></div>
       <div id="requestStatus" class="status"></div>
     </div>
 
+    <!-- Billing-return interstitial (checkout success/cancel handled inline) -->
+    <div id="returnPanel" class="panel hidden" style="margin-bottom:16px;">
+      <div id="returnBody"></div>
+    </div>
+
+    <!-- Signed-in app -->
     <div id="signedIn" class="hidden">
-      <section class="panel" id="billingPanel" style="margin-bottom:16px;">
-        <div class="section-title">
-          <div><div class="eyebrow">Billing</div><h2>Subscription</h2></div>
-        </div>
-        <div id="billingStatus" class="status"></div>
-        <div class="button-row" style="margin-top:12px;">
-          <button id="subscribeBtn" type="button">Subscribe</button>
-          <button id="portalBtn" class="secondary" type="button">Manage billing</button>
-        </div>
-        <div id="billingActionStatus" class="status"></div>
-      </section>
+      <!-- Cost ledger -->
+      <div id="ledger" class="ledger hidden"></div>
 
-      <div class="grid-2">
-        <section class="panel">
-          <div class="section-title">
-            <div><div class="eyebrow">New recording</div><h2>Configure a capture</h2></div>
-          </div>
-          <div class="field">
-            <label for="recName">Name</label>
-            <input id="recName" type="text" placeholder="Lobby camera" />
-          </div>
-          <div class="field">
-            <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
-            <input id="recURL" type="url" placeholder="https://example.com/live/index.m3u8" />
-          </div>
-          <div class="field">
-            <label for="recDest">Storage destination</label>
-            <select id="recDest"></select>
-            <div class="hint">Don't see your bucket? <a href="/account">Add a storage destination</a>, then reload.</div>
-          </div>
-          <div class="field">
-            <label for="recCron">Cron schedule (5 fields, UTC by default)</label>
-            <input id="recCron" type="text" placeholder="0 * * * *" />
-            <div id="cronPreview" class="hint"></div>
-          </div>
-          <div class="grid-2" style="margin-bottom:0;">
-            <div class="field">
-              <label for="recTZ">Timezone (IANA)</label>
-              <input id="recTZ" type="text" placeholder="UTC" />
-            </div>
-            <div class="field">
-              <label for="recClip">Clip duration (seconds)</label>
-              <input id="recClip" type="number" min="5" max="900" value="60" />
-            </div>
-          </div>
-          <div class="button-row"><button id="createRecBtn" type="button">Create Recording</button></div>
-          <div id="createRecStatus" class="status"></div>
-        </section>
-
-        <section class="panel">
-          <div class="section-title">
-            <div><div class="eyebrow">Notes</div><h2>How scheduling works</h2></div>
-          </div>
-          <div class="stack">
-            <div class="note">A recording must be active and within your paid quantity to capture. Pausing keeps the configuration but stops capture. Deleting cancels it and frees the seat.</div>
-            <div class="note">The minimum gap between fires and the maximum clip length are validated server-side; the clip must be shorter than the gap between fires.</div>
-            <div class="note">The schedule preview here is advisory. The server is the source of truth.</div>
-          </div>
-        </section>
+      <!-- Empty-state hero copy (shown only when there are no recordings) -->
+      <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
+        <h1>Capture a stream to your own bucket, on a schedule.</h1>
+        <p class="empty-hero-sub">Point a recording at an HLS or HTTPS stream, pick how often to grab a clip, and it lands in your S3 bucket. About $10/mo per recording while it is active.</p>
       </div>
 
-      <section class="panel">
+      <!-- Recording cards -->
+      <div id="cards" class="cards"></div>
+
+      <!-- + New recording trigger (hidden in empty state; composer is the hero there) -->
+      <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
+        <button id="newRecBtn" type="button">+ New recording</button>
+      </div>
+
+      <!-- Inline composer -->
+      <section id="composer" class="panel hidden">
         <div class="section-title">
-          <div><div class="eyebrow">Recordings</div><h2>Your captures</h2></div>
-          <button id="refreshBtn" class="secondary" type="button" style="width:auto;min-width:120px;">Refresh</button>
+          <div><div class="eyebrow">New recording</div><h2>Configure a capture</h2></div>
+          <button id="composerClose" class="secondary" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Cancel</button>
         </div>
-        <div id="recEmpty" class="empty-state">No recordings yet. Create one above.</div>
-        <div id="recBox" class="hidden table-wrap">
-          <table>
-            <thead>
-              <tr><th>Name</th><th>State</th><th>Health</th><th>Schedule</th><th>Last clip</th><th>24h</th><th></th></tr>
-            </thead>
-            <tbody id="recRows"></tbody>
-          </table>
+
+        <div class="field">
+          <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
+          <input id="recURL" type="url" placeholder="https://example.com/live/stream.m3u8" />
         </div>
-        <div id="recListStatus" class="status"></div>
+        <div class="field">
+          <label for="recName">Name (optional)</label>
+          <input id="recName" type="text" placeholder="Front-door camera" />
+        </div>
+
+        <!-- Schedule -->
+        <div class="field">
+          <label>Schedule</label>
+          <div class="seg" id="schedSeg">
+            <button type="button" data-preset="15m">Every 15 min</button>
+            <button type="button" data-preset="30m">Every 30 min</button>
+            <button type="button" data-preset="hourly">Hourly</button>
+            <button type="button" data-preset="4h">Every 4 hours</button>
+            <button type="button" data-preset="daily">Daily at...</button>
+            <button type="button" data-preset="custom">Custom</button>
+          </div>
+
+          <!-- Daily controls -->
+          <div id="dailyControls" class="grid-2 hidden" style="margin-top:12px;">
+            <div>
+              <label for="dailyTime">Time</label>
+              <input id="dailyTime" type="time" value="09:00" />
+            </div>
+            <div>
+              <label for="schedTZ">Timezone</label>
+              <select id="schedTZ"></select>
+            </div>
+          </div>
+
+          <!-- Custom cron controls -->
+          <div id="customControls" class="hidden" style="margin-top:12px;">
+            <div class="field">
+              <label for="cronExpr">Cron (5 fields)</label>
+              <textarea id="cronExpr" rows="1" placeholder="0 */3 * * *"></textarea>
+            </div>
+            <div class="field" style="margin-bottom:0;">
+              <label for="schedTZCustom">Timezone</label>
+              <select id="schedTZCustom"></select>
+            </div>
+          </div>
+
+          <div id="schedPreview" class="preview"></div>
+          <div id="schedWarn" class="hint warn"></div>
+        </div>
+
+        <!-- Clip length -->
+        <div class="field">
+          <label>Clip length</label>
+          <div class="seg" id="clipSeg">
+            <button type="button" data-clip="60">1 min</button>
+            <button type="button" data-clip="300">5 min</button>
+            <button type="button" data-clip="900">15 min</button>
+            <button type="button" data-clip="custom">Custom</button>
+          </div>
+          <div id="clipCustomWrap" class="field hidden" style="margin-top:12px;margin-bottom:0;max-width:240px;">
+            <label for="clipCustom">Clip length (seconds)</label>
+            <input id="clipCustom" type="number" min="5" max="900" value="60" />
+          </div>
+        </div>
+
+        <!-- Where clips go -->
+        <div class="field">
+          <label>Where clips go</label>
+          <!-- Dropdown of saved buckets (shown when at least one verified bucket exists) -->
+          <div id="destPicker" class="hidden">
+            <select id="recDest"></select>
+            <div class="hint"><button type="button" class="inline-link" id="connectAnotherBtn">+ Connect another bucket</button></div>
+          </div>
+          <!-- Inline connect form (shown when no verified bucket, or when "connect another" is clicked) -->
+          <div id="connectForm" class="subpanel hidden">
+            <h3 id="connectFormTitle">Connect your S3 bucket</h3>
+            <div class="field">
+              <label for="cnProvider">Provider</label>
+              <select id="cnProvider"></select>
+            </div>
+            <div class="grid-2">
+              <div class="field">
+                <label for="cnName">Nickname</label>
+                <input id="cnName" type="text" placeholder="my-clips" />
+              </div>
+              <div class="field">
+                <label for="cnBucket">Bucket</label>
+                <input id="cnBucket" type="text" placeholder="my-clips" />
+              </div>
+            </div>
+            <div class="grid-2">
+              <div class="field">
+                <label for="cnKey">Access Key ID</label>
+                <input id="cnKey" type="text" autocomplete="off" spellcheck="false" />
+              </div>
+              <div class="field">
+                <label for="cnSecret">Secret Access Key</label>
+                <input id="cnSecret" type="password" autocomplete="off" />
+              </div>
+            </div>
+            <details class="disclose">
+              <summary>Advanced (endpoint, region, key prefix)</summary>
+              <div>
+                <div class="grid-2">
+                  <div class="field">
+                    <label for="cnEndpoint">Endpoint</label>
+                    <input id="cnEndpoint" type="text" placeholder="https://s3.amazonaws.com" />
+                  </div>
+                  <div class="field">
+                    <label for="cnRegion">Region</label>
+                    <input id="cnRegion" type="text" placeholder="us-east-1" />
+                  </div>
+                </div>
+                <div class="field" style="margin-bottom:0;">
+                  <label for="cnPrefix">Key prefix (optional)</label>
+                  <input id="cnPrefix" type="text" placeholder="recordings/" />
+                </div>
+              </div>
+            </details>
+            <div class="button-row" style="margin-top:14px;">
+              <button id="cnTestBtn" type="button">Test connection</button>
+              <button id="cnCancelBtn" type="button" class="secondary">Cancel</button>
+            </div>
+            <div id="cnStatus" class="status" style="margin-top:8px;"></div>
+          </div>
+        </div>
+
+        <div id="composerFootnote" class="composer-footnote"></div>
+        <div class="button-row"><button id="startBtn" type="button" disabled>Start recording</button></div>
+        <div id="startStatus" class="status"></div>
       </section>
     </div>
   </div>
 
   <script>
-    const accountChip = document.getElementById('accountChip');
-    const signedOut = document.getElementById('signedOut');
-    const signedIn = document.getElementById('signedIn');
-    const requestStatus = document.getElementById('requestStatus');
-    const recDest = document.getElementById('recDest');
-    const createRecStatus = document.getElementById('createRecStatus');
-    const recEmpty = document.getElementById('recEmpty');
-    const recBox = document.getElementById('recBox');
-    const recRows = document.getElementById('recRows');
-    const recListStatus = document.getElementById('recListStatus');
-    const cronPreview = document.getElementById('cronPreview');
-    const billingStatus = document.getElementById('billingStatus');
-    const billingActionStatus = document.getElementById('billingActionStatus');
+    const PRICE_PER_REC = 10;
+
+    const els = {
+      accountArea: document.getElementById('accountArea'),
+      accountChip: document.getElementById('accountChip'),
+      signedOut: document.getElementById('signedOut'),
+      signedIn: document.getElementById('signedIn'),
+      requestStatus: document.getElementById('requestStatus'),
+      returnPanel: document.getElementById('returnPanel'),
+      returnBody: document.getElementById('returnBody'),
+      ledger: document.getElementById('ledger'),
+      heroCopy: document.getElementById('heroCopy'),
+      cards: document.getElementById('cards'),
+      newRecRow: document.getElementById('newRecRow'),
+      newRecBtn: document.getElementById('newRecBtn'),
+      composer: document.getElementById('composer'),
+      composerClose: document.getElementById('composerClose'),
+      recURL: document.getElementById('recURL'),
+      recName: document.getElementById('recName'),
+      schedSeg: document.getElementById('schedSeg'),
+      dailyControls: document.getElementById('dailyControls'),
+      dailyTime: document.getElementById('dailyTime'),
+      schedTZ: document.getElementById('schedTZ'),
+      customControls: document.getElementById('customControls'),
+      cronExpr: document.getElementById('cronExpr'),
+      schedTZCustom: document.getElementById('schedTZCustom'),
+      schedPreview: document.getElementById('schedPreview'),
+      schedWarn: document.getElementById('schedWarn'),
+      clipSeg: document.getElementById('clipSeg'),
+      clipCustomWrap: document.getElementById('clipCustomWrap'),
+      clipCustom: document.getElementById('clipCustom'),
+      destPicker: document.getElementById('destPicker'),
+      recDest: document.getElementById('recDest'),
+      connectAnotherBtn: document.getElementById('connectAnotherBtn'),
+      connectForm: document.getElementById('connectForm'),
+      connectFormTitle: document.getElementById('connectFormTitle'),
+      cnProvider: document.getElementById('cnProvider'),
+      cnName: document.getElementById('cnName'),
+      cnBucket: document.getElementById('cnBucket'),
+      cnKey: document.getElementById('cnKey'),
+      cnSecret: document.getElementById('cnSecret'),
+      cnEndpoint: document.getElementById('cnEndpoint'),
+      cnRegion: document.getElementById('cnRegion'),
+      cnPrefix: document.getElementById('cnPrefix'),
+      cnTestBtn: document.getElementById('cnTestBtn'),
+      cnCancelBtn: document.getElementById('cnCancelBtn'),
+      cnStatus: document.getElementById('cnStatus'),
+      composerFootnote: document.getElementById('composerFootnote'),
+      startBtn: document.getElementById('startBtn'),
+      startStatus: document.getElementById('startStatus'),
+    };
+
+    // Server invariants mirrored client-side (REC_SCHED_MIN_INTERVAL_SEC=600;
+    // clip must be strictly shorter than the gap). Pre-flight only; server is truth.
+    const MIN_GAP_SEC = 600;
+
+    // Provider presets. Endpoint/region are auto-filled where the host is fixed;
+    // R2 and "Other" leave the endpoint editable because the host is account-specific.
+    const PROVIDERS = [
+      { id: 'cloudflare_r2', label: 'Cloudflare R2', endpoint: '', region: 'auto', editable: true,
+        endpointHint: 'https://<account-id>.r2.cloudflarestorage.com' },
+      { id: 'aws_s3', label: 'Amazon S3', endpoint: 'https://s3.us-east-1.amazonaws.com', region: 'us-east-1', editable: true },
+      { id: 'backblaze_b2', label: 'Backblaze B2', endpoint: 'https://s3.us-west-002.backblazeb2.com', region: 'us-west-002', editable: true },
+      { id: 'wasabi', label: 'Wasabi', endpoint: 'https://s3.us-east-1.wasabisys.com', region: 'us-east-1', editable: true },
+      { id: 'digitalocean_spaces', label: 'DigitalOcean Spaces', endpoint: 'https://nyc3.digitaloceanspaces.com', region: 'nyc3', editable: true },
+      { id: 's3_compatible', label: 'Other (S3-compatible)', endpoint: '', region: '', editable: true },
+    ];
 
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
+    const billingReturn = String(authParams.get('billing') || '').trim().toLowerCase();
+
+    // Mutable view state.
+    const state = {
+      account: null,
+      billingEnabled: true,
+      recordings: [],
+      destinations: [],
+      schedPreset: 'hourly',
+      clipSelected: 60,
+      verifiedDestId: 0, // a bucket just verified inline this session
+      starting: false,
+    };
 
     async function fetchJSON(path, opts = {}) {
       const method = String((opts && opts.method) || 'GET').toUpperCase();
@@ -342,16 +540,695 @@
       el.className = `status${kind ? ` ${kind}` : ''}`;
     }
 
-    function formatDate(v) {
-      if (!v) return 'Never';
-      try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
-    }
-
     function escapeHTML(v) {
-      return String(v || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+      return String(v == null ? '' : v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
     }
 
     function sleep(ms) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
+
+    function browserTimezone() {
+      try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) { return 'UTC'; }
+    }
+
+    // A small, valid IANA list with the browser zone and UTC always present.
+    function timezoneOptions() {
+      const base = [
+        'UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+        'America/Sao_Paulo', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Istanbul',
+        'Asia/Dubai', 'Asia/Kolkata', 'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Seoul', 'Australia/Sydney',
+      ];
+      const tz = browserTimezone();
+      const set = [tz, ...base.filter((z) => z !== tz)];
+      return [...new Set(set)];
+    }
+
+    function fillTimezoneSelect(sel) {
+      if (!sel) return;
+      const tz = browserTimezone();
+      sel.innerHTML = timezoneOptions().map((z) => `<option value="${escapeHTML(z)}"${z === tz ? ' selected' : ''}>${escapeHTML(z)}</option>`).join('');
+    }
+
+    // ---- Schedule: preset -> cron + preview + pre-flight validation ----
+
+    function activeTZSelect() {
+      return state.schedPreset === 'custom' ? els.schedTZCustom : els.schedTZ;
+    }
+
+    function selectedTimezone() {
+      const sel = activeTZSelect();
+      const v = sel ? String(sel.value || '').trim() : '';
+      return v || browserTimezone();
+    }
+
+    // Returns { cron, tz } for the current schedule selection. cron is null when
+    // a custom expression is empty or malformed (handled by the caller).
+    function compiledSchedule() {
+      const tz = selectedTimezone();
+      switch (state.schedPreset) {
+        case '15m': return { cron: '*/15 * * * *', tz };
+        case '30m': return { cron: '*/30 * * * *', tz };
+        case 'hourly': return { cron: '0 * * * *', tz };
+        case '4h': return { cron: '0 */4 * * *', tz };
+        case 'daily': {
+          const t = String(els.dailyTime.value || '').trim();
+          const m = /^(\d{1,2}):(\d{2})$/.exec(t);
+          if (!m) return { cron: null, tz };
+          const hh = Number(m[1]); const mm = Number(m[2]);
+          if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return { cron: null, tz };
+          return { cron: `${mm} ${hh} * * *`, tz };
+        }
+        case 'custom': {
+          const raw = String(els.cronExpr.value || '').trim().replace(/\s+/g, ' ');
+          if (!raw || raw.split(' ').length !== 5) return { cron: null, tz };
+          return { cron: raw, tz };
+        }
+        default: return { cron: null, tz };
+      }
+    }
+
+    // The minimum gap (seconds) between consecutive fires for a known preset.
+    // Custom returns null (the server validates the real gap on submit).
+    function presetMinGapSec() {
+      switch (state.schedPreset) {
+        case '15m': return 900;
+        case '30m': return 1800;
+        case 'hourly': return 3600;
+        case '4h': return 14400;
+        case 'daily': return 86400;
+        default: return null;
+      }
+    }
+
+    function selectedClipSec() {
+      if (state.clipSelected === 'custom') {
+        const n = Number(els.clipCustom.value || 0);
+        return Number.isFinite(n) ? Math.trunc(n) : 0;
+      }
+      return Number(state.clipSelected) || 0;
+    }
+
+    // Compute the next fire time for a known preset, for the advisory preview.
+    function nextRunDate(now) {
+      const d = new Date(now.getTime());
+      d.setSeconds(0, 0);
+      switch (state.schedPreset) {
+        case '15m': { const add = 15 - (d.getMinutes() % 15 || 15); d.setMinutes(d.getMinutes() + (d.getMinutes() % 15 === 0 ? 15 : add)); return d; }
+        case '30m': { const add = 30 - (d.getMinutes() % 30 || 30); d.setMinutes(d.getMinutes() + (d.getMinutes() % 30 === 0 ? 30 : add)); return d; }
+        case 'hourly': { d.setMinutes(0); d.setHours(d.getHours() + 1); return d; }
+        case '4h': { d.setMinutes(0); const h = d.getHours(); const next = (Math.floor(h / 4) + 1) * 4; d.setHours(next); return d; }
+        case 'daily': {
+          const m = /^(\d{1,2}):(\d{2})$/.exec(String(els.dailyTime.value || ''));
+          if (!m) return null;
+          const t = new Date(now.getTime());
+          t.setSeconds(0, 0); t.setHours(Number(m[1]), Number(m[2]), 0, 0);
+          if (t.getTime() <= now.getTime()) t.setDate(t.getDate() + 1);
+          return t;
+        }
+        default: return null;
+      }
+    }
+
+    function formatNextRun(d) {
+      if (!d) return '';
+      const now = new Date();
+      const sameDay = d.toDateString() === now.toDateString();
+      const tomorrow = new Date(now.getTime() + 86400000);
+      const isTomorrow = d.toDateString() === tomorrow.toDateString();
+      const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      let when = d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+      if (sameDay) when = 'today';
+      else if (isTomorrow) when = 'tomorrow';
+      return `${when} at ${time}`;
+    }
+
+    // Updates the preview line + the inline gap/clip pre-flight warning, and
+    // returns true when the schedule + clip pass the client-side checks.
+    function refreshScheduleUI() {
+      const clip = selectedClipSec();
+      const gap = presetMinGapSec();
+      let ok = true;
+
+      if (state.schedPreset === 'custom') {
+        const c = compiledSchedule();
+        if (!c.cron) {
+          els.schedPreview.innerHTML = '<span class="muted">Enter a 5-field cron expression.</span>';
+          ok = false;
+        } else {
+          els.schedPreview.innerHTML = `<span class="muted">Cron </span><span class="mono">${escapeHTML(c.cron)}</span><span class="muted"> &middot; validated on save</span>`;
+        }
+      } else {
+        const d = nextRunDate(new Date());
+        els.schedPreview.innerHTML = d
+          ? `<span class="muted">Next run: </span>${escapeHTML(formatNextRun(d))} <span class="muted">(your time)</span>`
+          : '';
+      }
+
+      // Pre-flight: gap >= 600s and clip strictly shorter than the gap.
+      els.schedWarn.textContent = '';
+      if (clip <= 0 || clip < 5 || clip > 900) {
+        els.schedWarn.textContent = 'Clip length must be between 5 and 900 seconds.';
+        ok = false;
+      } else if (gap !== null) {
+        if (gap < MIN_GAP_SEC) {
+          els.schedWarn.textContent = 'This schedule fires too often (minimum gap is 10 minutes).';
+          ok = false;
+        } else if (clip >= gap) {
+          els.schedWarn.textContent = 'Clip length must be shorter than the gap between runs.';
+          ok = false;
+        }
+      }
+      // Custom presets with a known-bad gap cannot be pre-checked here; the server
+      // enforces gap>=600 and clip<gap on submit.
+      return ok;
+    }
+
+    function setSchedPreset(preset) {
+      state.schedPreset = preset;
+      els.schedSeg.querySelectorAll('button[data-preset]').forEach((b) => {
+        b.classList.toggle('on', b.getAttribute('data-preset') === preset);
+      });
+      els.dailyControls.classList.toggle('hidden', preset !== 'daily');
+      els.customControls.classList.toggle('hidden', preset !== 'custom');
+      refreshScheduleUI();
+      refreshStartEnabled();
+    }
+
+    function setClip(clip) {
+      state.clipSelected = clip;
+      els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
+        b.classList.toggle('on', b.getAttribute('data-clip') === String(clip));
+      });
+      els.clipCustomWrap.classList.toggle('hidden', clip !== 'custom');
+      refreshScheduleUI();
+      refreshStartEnabled();
+    }
+
+    // ---- Provider connect form ----
+
+    function fillProviderSelect() {
+      els.cnProvider.innerHTML = PROVIDERS.map((p) => `<option value="${escapeHTML(p.id)}">${escapeHTML(p.label)}</option>`).join('');
+      applyProviderDefaults();
+    }
+
+    function currentProvider() {
+      return PROVIDERS.find((p) => p.id === els.cnProvider.value) || PROVIDERS[PROVIDERS.length - 1];
+    }
+
+    function applyProviderDefaults() {
+      const p = currentProvider();
+      els.cnEndpoint.value = p.endpoint;
+      els.cnRegion.value = p.region;
+      els.cnEndpoint.placeholder = p.endpointHint || 'https://s3.example.com';
+    }
+
+    function openConnectForm(title) {
+      els.connectFormTitle.textContent = title || 'Connect your S3 bucket';
+      els.connectForm.classList.remove('hidden');
+      setStatus(els.cnStatus, '', '');
+    }
+
+    function closeConnectForm() {
+      els.connectForm.classList.add('hidden');
+      els.cnSecret.value = '';
+      setStatus(els.cnStatus, '', '');
+    }
+
+    async function testConnection() {
+      const provider = currentProvider();
+      const body = {
+        name: String(els.cnName.value || '').trim(),
+        provider: provider.id,
+        endpoint: String(els.cnEndpoint.value || '').trim(),
+        region: String(els.cnRegion.value || '').trim(),
+        bucket: String(els.cnBucket.value || '').trim(),
+        key_prefix: String(els.cnPrefix.value || '').trim(),
+        access_key_id: String(els.cnKey.value || '').trim(),
+        secret_access_key: String(els.cnSecret.value || '').trim(),
+      };
+      if (!body.name) body.name = body.bucket;
+      setStatus(els.cnStatus, 'Testing connection...', '');
+      els.cnTestBtn.disabled = true;
+      try {
+        // POST only persists on a green PutObject -> Head -> Delete probe, so a 201
+        // response is a verified, saved bucket.
+        const created = await fetchJSON('/api/v1/account/storage-destinations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        setStatus(els.cnStatus, 'Connected. Bucket saved.', 'ok');
+        state.verifiedDestId = Number(created.id || 0);
+        els.cnSecret.value = '';
+        await refreshDestinations();
+        closeConnectForm();
+        els.destPicker.classList.remove('hidden');
+        if (state.verifiedDestId > 0) els.recDest.value = String(state.verifiedDestId);
+        refreshStartEnabled();
+      } catch (err) {
+        setStatus(els.cnStatus, String(err.message || err), 'err');
+      } finally {
+        els.cnTestBtn.disabled = false;
+      }
+    }
+
+    // ---- Destinations ----
+
+    async function refreshDestinations() {
+      try {
+        const payload = await fetchJSON('/api/v1/account/storage-destinations');
+        const items = (Array.isArray(payload.items) ? payload.items : []).filter((d) => String(d.status) === 'verified');
+        state.destinations = items;
+        renderDestPicker();
+      } catch (_) {
+        state.destinations = [];
+        renderDestPicker();
+      }
+    }
+
+    function renderDestPicker() {
+      const items = state.destinations;
+      if (items.length === 0) {
+        els.recDest.innerHTML = '';
+        els.destPicker.classList.add('hidden');
+        // No verified bucket: the connect form is the way to choose one.
+        openConnectForm('Connect your S3 bucket');
+        els.cnCancelBtn.classList.add('hidden');
+        return;
+      }
+      els.cnCancelBtn.classList.remove('hidden');
+      const prev = String(els.recDest.value || '');
+      els.recDest.innerHTML = items.map((d) =>
+        `<option value="${Number(d.id)}">${escapeHTML(String(d.name || ''))} (${escapeHTML(String(d.bucket || ''))})</option>`
+      ).join('');
+      els.destPicker.classList.remove('hidden');
+      const want = state.verifiedDestId > 0 ? String(state.verifiedDestId) : prev;
+      if (want && items.some((d) => String(d.id) === want)) els.recDest.value = want;
+    }
+
+    function selectedDestId() {
+      if (!els.destPicker.classList.contains('hidden')) return Number(els.recDest.value || 0);
+      return 0;
+    }
+
+    // ---- Start enabled gate ----
+
+    function refreshStartEnabled() {
+      const url = String(els.recURL.value || '').trim();
+      const schedOK = refreshScheduleUIQuiet();
+      const dest = selectedDestId();
+      const ready = !state.starting && !!url && schedOK && dest > 0;
+      els.startBtn.disabled = !ready;
+    }
+
+    // refreshScheduleUI without re-triggering start-enable (avoids recursion).
+    function refreshScheduleUIQuiet() {
+      const clip = selectedClipSec();
+      const gap = presetMinGapSec();
+      const c = compiledSchedule();
+      if (state.schedPreset === 'custom' && !c.cron) return false;
+      if (state.schedPreset === 'daily' && !c.cron) return false;
+      if (clip <= 0 || clip < 5 || clip > 900) return false;
+      if (gap !== null && (gap < MIN_GAP_SEC || clip >= gap)) return false;
+      return true;
+    }
+
+    // ---- Cost ledger ----
+
+    function activeCount() {
+      return state.recordings.filter((r) => String(r.status) === 'active').length;
+    }
+
+    function renderLedger() {
+      if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
+      const n = activeCount();
+      if (n < 1) { els.ledger.classList.add('hidden'); return; }
+      const noun = n === 1 ? 'active recording' : 'active recordings';
+      els.ledger.innerHTML = `<b>${n} ${noun}</b> &middot; $${n * PRICE_PER_REC}/mo`;
+      els.ledger.classList.remove('hidden');
+    }
+
+    // ---- Recording cards (schedule reverse-map + health word) ----
+
+    const CRON_PRESET_LABEL = {
+      '*/15 * * * *': 'Every 15 min',
+      '*/30 * * * *': 'Every 30 min',
+      '0 * * * *': 'Hourly',
+      '0 */4 * * *': 'Every 4 hours',
+    };
+
+    function scheduleLabel(rec) {
+      const expr = String(rec.cron_expr || '').trim().replace(/\s+/g, ' ');
+      if (CRON_PRESET_LABEL[expr]) return CRON_PRESET_LABEL[expr];
+      const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(expr);
+      if (daily) {
+        const hh = Number(daily[2]); const mm = Number(daily[1]);
+        const d = new Date(); d.setHours(hh, mm, 0, 0);
+        const t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        const tz = String(rec.cron_timezone || 'UTC');
+        return `Daily at ${t} ${tz}`;
+      }
+      return `Cron ${expr}`;
+    }
+
+    function relativeTime(v) {
+      if (!v) return null;
+      const then = new Date(v).getTime();
+      if (!Number.isFinite(then)) return null;
+      const diff = Math.max(0, Date.now() - then);
+      const min = Math.round(diff / 60000);
+      if (min < 1) return 'just now';
+      if (min < 60) return `${min} min ago`;
+      const hr = Math.round(min / 60);
+      if (hr < 24) return `${hr}h ago`;
+      const day = Math.round(hr / 24);
+      return `${day}d ago`;
+    }
+
+    function statusLine(rec) {
+      const status = String(rec.status || '');
+      if (status === 'paused') return { cls: 'paused', text: 'Paused &middot; not billed' };
+      if (status === 'active' && !rec.billable) return { cls: 'pending', text: 'Pending payment &middot; Finish setup' };
+      if (status === 'active') return { cls: 'active', text: state.billingEnabled ? `Active &middot; $${PRICE_PER_REC}/mo` : 'Active' };
+      return { cls: 'paused', text: escapeHTML(status) };
+    }
+
+    function renderCards() {
+      const items = state.recordings;
+      const empty = items.length === 0;
+      els.heroCopy.classList.toggle('hidden', !empty);
+      els.newRecRow.classList.toggle('hidden', empty);
+      els.cards.classList.toggle('hidden', empty);
+      if (empty) {
+        els.cards.innerHTML = '';
+        openComposer(true);
+        return;
+      }
+      els.cards.innerHTML = items.map((rec) => {
+        const id = Number(rec.id);
+        const st = statusLine(rec);
+        const status = String(rec.status || '');
+        const isPending = status === 'active' && !rec.billable;
+        const clip = Number(rec.clip_duration_sec || 0);
+        const last = relativeTime(rec.last_clip_at);
+        const health = String(rec.health || 'idle');
+        const metaParts = [];
+        metaParts.push(`<span class="meta-strong">${escapeHTML(scheduleLabel(rec))}</span>`);
+        metaParts.push(`${clip}s clips`);
+        if (last) {
+          let word = '';
+          if (status === 'active' && health !== 'idle') word = ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>`;
+          metaParts.push(`Last clip: ${escapeHTML(last)}${word}`);
+        } else {
+          metaParts.push('No clips yet');
+        }
+
+        let actions = '';
+        if (isPending) {
+          actions = `<button type="button" data-finish="${id}">Finish setup</button>`
+            + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+        } else if (status === 'active') {
+          actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
+            + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+        } else if (status === 'paused') {
+          actions = `<button type="button" class="secondary" data-resume="${id}">Resume</button>`
+            + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+        } else {
+          actions = `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+        }
+
+        const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
+          ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
+
+        return `
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-name">${escapeHTML(String(rec.name || ''))}</div>
+                <div class="card-url">${escapeHTML(String(rec.stream_url || ''))}</div>
+              </div>
+              <div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>
+            </div>
+            <div class="card-meta">${metaParts.join('')}</div>
+            ${errLine}
+            <div class="card-actions">${actions}</div>
+          </div>`;
+      }).join('');
+      wireCardActions();
+    }
+
+    function wireCardActions() {
+      els.cards.querySelectorAll('button[data-pause]').forEach((b) =>
+        b.addEventListener('click', () => mutateRecording(b.getAttribute('data-pause'), 'pause')));
+      els.cards.querySelectorAll('button[data-resume]').forEach((b) =>
+        b.addEventListener('click', () => mutateRecording(b.getAttribute('data-resume'), 'resume')));
+      els.cards.querySelectorAll('button[data-finish]').forEach((b) =>
+        b.addEventListener('click', () => finishSetup(b)));
+      els.cards.querySelectorAll('button[data-delete]').forEach((b) =>
+        b.addEventListener('click', () => deleteRecording(b)));
+    }
+
+    async function mutateRecording(id, action) {
+      const rid = String(id || '').trim();
+      try {
+        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(rid)}/${action}`, { method: 'POST' });
+        // Resume = pay: a resumed recording with no access-granting sub returns a
+        // checkout_url, same as Start.
+        if (out && out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
+        await refreshRecordings();
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    async function deleteRecording(btn) {
+      const charge = state.billingEnabled ? ` and the $${PRICE_PER_REC}/mo charge` : '';
+      if (!window.confirm(`Delete this recording? This stops capture${charge}.`)) return;
+      const id = String(btn.getAttribute('data-delete') || '').trim();
+      try {
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        await refreshRecordings();
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    // Finish setup re-opens Checkout for a recording stranded by an abandoned
+    // payment (it already exists; we just re-derive the Checkout session).
+    async function finishSetup(btn) {
+      btn.disabled = true;
+      try {
+        const out = await fetchJSON('/api/v1/account/billing/checkout', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        if (out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
+        if (out.portal_url) { window.location.assign(out.portal_url); return; }
+        window.alert('No checkout URL returned.');
+      } catch (err) {
+        window.alert(String(err.message || err));
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function refreshRecordings() {
+      try {
+        const payload = await fetchJSON('/api/v1/account/recordings');
+        state.recordings = Array.isArray(payload.items) ? payload.items : [];
+        renderLedger();
+        renderCards();
+      } catch (err) {
+        // Keep the surface usable; surface the error near the ledger area.
+        els.ledger.classList.remove('hidden');
+        els.ledger.innerHTML = `<span style="color:var(--err)">${escapeHTML(String(err.message || err))}</span>`;
+      }
+    }
+
+    // ---- Composer open/close ----
+
+    function openComposer(asHero) {
+      els.composer.classList.remove('hidden');
+      els.composerClose.classList.toggle('hidden', !!asHero);
+      if (!asHero) els.composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      refreshStartEnabled();
+    }
+
+    function closeComposer() {
+      els.composer.classList.add('hidden');
+    }
+
+    // ---- Start handler ----
+
+    function redirectToCheckout(url) {
+      // One-line "add a card" interstitial, then Stripe Checkout.
+      els.signedIn.classList.add('hidden');
+      els.returnPanel.classList.remove('hidden');
+      els.returnBody.innerHTML = `
+        <div class="eyebrow">One more step</div>
+        <h2>Add a card</h2>
+        <p class="interstitial-body">Your bucket is connected. To start recording we need a card on file. You will be charged $${PRICE_PER_REC}/mo per active recording, prorated, only while it is running.</p>
+        <p class="muted" style="margin:0;">Redirecting to secure checkout. We never see your card.</p>`;
+      window.setTimeout(() => window.location.assign(url), 700);
+    }
+
+    function deriveName(url) {
+      try { return new URL(url).hostname || 'Recording'; } catch (_) { return 'Recording'; }
+    }
+
+    async function startRecording() {
+      if (state.starting) return;
+      const url = String(els.recURL.value || '').trim();
+      const dest = selectedDestId();
+      const sched = compiledSchedule();
+      const clip = selectedClipSec();
+      if (!url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
+      if (dest <= 0) { setStatus(els.startStatus, 'Connect or select a bucket first.', 'err'); return; }
+      if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
+      if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
+
+      const name = String(els.recName.value || '').trim() || deriveName(url);
+      const body = {
+        name,
+        stream_url: url,
+        storage_destination_id: dest,
+        cron_expr: sched.cron,
+        cron_timezone: sched.tz,
+        clip_duration_sec: clip,
+      };
+      state.starting = true;
+      els.startBtn.disabled = true;
+      setStatus(els.startStatus, 'Starting...', '');
+      try {
+        const out = await fetchJSON('/api/v1/account/recordings', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        if (out && out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
+        // Covered by an existing subscription (or free mode): the new card is Active.
+        els.recURL.value = '';
+        els.recName.value = '';
+        closeComposer();
+        await refreshRecordings();
+        setStatus(els.startStatus, '', '');
+      } catch (err) {
+        setStatus(els.startStatus, String(err.message || err), 'err');
+      } finally {
+        state.starting = false;
+        refreshStartEnabled();
+      }
+    }
+
+    function startButtonLabel() {
+      els.startBtn.textContent = state.billingEnabled ? `Start recording - $${PRICE_PER_REC}/mo` : 'Start recording';
+      els.composerFootnote.textContent = state.billingEnabled
+        ? `Starting adds $${PRICE_PER_REC}/mo while active. Pause or delete stops it.`
+        : '';
+      els.composerFootnote.classList.toggle('hidden', !state.billingEnabled);
+    }
+
+    // ---- Account chip dropdown ----
+
+    function buildAccountChip() {
+      const acct = state.account || {};
+      const email = String(acct.email || '').trim();
+      els.accountChip.innerHTML = `${escapeHTML(email || 'Account')} <span class="caret">v</span>`;
+      els.accountChip.onclick = (e) => { e.stopPropagation(); toggleAccountMenu(); };
+    }
+
+    function showOperatorLink() {
+      const acct = state.account || {};
+      return acct.role === 'admin' || acct.has_keys_or_nodes === true;
+    }
+
+    function toggleAccountMenu() {
+      const existing = document.getElementById('accountMenu');
+      if (existing) { existing.remove(); return; }
+      const menu = document.createElement('div');
+      menu.className = 'account-menu';
+      menu.id = 'accountMenu';
+      const op = showOperatorLink()
+        ? `<div class="menu-sep"></div><button type="button" data-act="operator">Developer / nodes</button>` : '';
+      const billing = state.billingEnabled
+        ? `<button type="button" data-act="portal">Billing &amp; card</button>` : '';
+      menu.innerHTML = `${billing}<button type="button" data-act="signout">Sign out</button>${op}`;
+      els.accountArea.appendChild(menu);
+      menu.querySelector('[data-act="portal"]')?.addEventListener('click', openPortal);
+      menu.querySelector('[data-act="signout"]')?.addEventListener('click', signOut);
+      menu.querySelector('[data-act="operator"]')?.addEventListener('click', () => window.location.assign('/account'));
+    }
+
+    document.addEventListener('click', () => {
+      const existing = document.getElementById('accountMenu');
+      if (existing) existing.remove();
+    });
+
+    async function openPortal() {
+      try {
+        const out = await fetchJSON('/api/v1/account/billing/portal', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        if (out.url) { window.location.assign(out.url); return; }
+        window.alert('No billing portal URL returned.');
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    async function signOut() {
+      try {
+        await fetchJSON('/api/v1/account/logout', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+      } catch (_) { /* fall through to reload regardless */ }
+      window.location.assign('/recordings');
+    }
+
+    // ---- Billing return (?billing=success | ?billing=cancel) ----
+
+    async function handleBillingReturn() {
+      if (billingReturn === 'success') {
+        els.signedIn.classList.add('hidden');
+        els.returnPanel.classList.remove('hidden');
+        els.returnBody.innerHTML = `<div class="eyebrow">Payment received</div><h2>Finishing setup...</h2><p class="muted" style="margin:0;">Confirming your subscription and starting your recording.</p>`;
+        // Poll /me + the recordings list briefly for the webhook to flip the gate.
+        for (let i = 0; i < 8; i += 1) {
+          try {
+            const me = await fetchJSON('/api/v1/account/billing');
+            await refreshRecordings();
+            if (subActive(me) && activeBillableExists()) break;
+          } catch (_) { /* keep polling */ }
+          await sleep(900);
+        }
+        clearBillingQuery();
+        els.returnPanel.classList.add('hidden');
+        els.signedIn.classList.remove('hidden');
+        return;
+      }
+      if (billingReturn === 'cancel') {
+        // The recording already exists; show it as a Pending-payment card.
+        clearBillingQuery();
+        await refreshRecordings();
+        return;
+      }
+      await refreshRecordings();
+    }
+
+    function subActive(me) {
+      const s = String((me && me.subscription_status) || '');
+      return s === 'active' || s === 'trialing' || s === 'past_due';
+    }
+
+    function activeBillableExists() {
+      return state.recordings.some((r) => String(r.status) === 'active' && r.billable);
+    }
+
+    function clearBillingQuery() {
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.delete('billing');
+        window.history.replaceState({}, '', u.pathname + (u.search || '') + u.hash);
+      } catch (_) { /* ignore */ }
+    }
+
+    // ---- Account bootstrap ----
 
     async function fetchAccountWithRetry() {
       let lastErr = null;
@@ -368,199 +1245,76 @@
       throw lastErr || new Error('unauthorized');
     }
 
-    function updateCronPreview() {
-      const expr = String(document.getElementById('recCron').value || '').trim();
-      if (!expr) { cronPreview.textContent = ''; return; }
-      const fields = expr.split(/\s+/);
-      if (fields.length !== 5) {
-        cronPreview.textContent = 'Cron must have exactly 5 fields (minute hour day-of-month month day-of-week).';
-        return;
-      }
-      cronPreview.textContent = 'Will be validated on save (min gap and clip-shorter-than-gap are enforced server-side).';
-    }
-
-    async function refreshDestinations() {
-      try {
-        const payload = await fetchJSON('/api/v1/account/storage-destinations');
-        const items = (Array.isArray(payload.items) ? payload.items : []).filter((d) => String(d.status) === 'verified');
-        if (items.length === 0) {
-          recDest.innerHTML = '<option value="">No verified destinations</option>';
-          return;
-        }
-        recDest.innerHTML = items.map((d) => `<option value="${Number(d.id)}">${escapeHTML(String(d.name || ''))} (${escapeHTML(String(d.bucket || ''))})</option>`).join('');
-      } catch (err) {
-        recDest.innerHTML = '<option value="">Failed to load destinations</option>';
-      }
-    }
-
-    async function refreshBilling() {
+    async function loadBillingEnabled() {
       try {
         const b = await fetchJSON('/api/v1/account/billing');
-        if (!b.billing_enabled) {
-          setStatus(billingStatus, 'Billing is not enabled on this deployment. Recordings run in free mode.', '');
-        } else {
-          const parts = [`Status: ${escapeHTML(String(b.subscription_status || 'none'))}`, `Paid recordings: ${Number(b.paid_quantity || 0)}`];
-          if (b.current_period_end) parts.push(`Renews ${formatDate(b.current_period_end)}`);
-          if (b.cancel_at_period_end) parts.push('(cancels at period end)');
-          setStatus(billingStatus, parts.join(' . '), 'ok');
-        }
-      } catch (err) {
-        setStatus(billingStatus, String(err), 'err');
+        state.billingEnabled = b.billing_enabled !== false;
+      } catch (_) {
+        state.billingEnabled = true;
       }
     }
 
-    function badgeState(rec) {
-      if (rec.status === 'canceled') return '<span class="badge off">canceled</span>';
-      if (rec.live) return '<span class="badge live">live</span>';
-      if (rec.status === 'paused') return '<span class="badge off">paused</span>';
-      if (rec.status === 'active' && !rec.billable) return '<span class="badge off">not active (billing)</span>';
-      return '<span class="badge off">' + escapeHTML(String(rec.status || '')) + '</span>';
-    }
+    // ---- Wiring ----
 
-    function badgeHealth(rec) {
-      const h = String(rec.health || 'idle');
-      return `<span class="badge ${escapeHTML(h)}">${escapeHTML(h)}</span>`;
-    }
-
-    async function refreshRecordings() {
-      try {
-        const payload = await fetchJSON('/api/v1/account/recordings');
-        const items = Array.isArray(payload.items) ? payload.items : [];
-        if (items.length === 0) {
-          recBox.classList.add('hidden');
-          recEmpty.classList.remove('hidden');
-          return;
-        }
-        recEmpty.classList.add('hidden');
-        recBox.classList.remove('hidden');
-        recRows.innerHTML = items.map((rec) => {
-          const id = Number(rec.id);
-          const pauseResume = rec.status === 'active'
-            ? `<button type="button" class="secondary" data-pause="${id}" style="width:auto;min-width:90px;">Pause</button>`
-            : (rec.status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}" style="width:auto;min-width:90px;">Resume</button>` : '');
-          return `
-            <tr>
-              <td><b>${escapeHTML(String(rec.name || ''))}</b><div class="muted mono">${escapeHTML(String(rec.stream_url || ''))}</div></td>
-              <td>${badgeState(rec)}</td>
-              <td>${badgeHealth(rec)}</td>
-              <td><span class="mono">${escapeHTML(String(rec.cron_expr || ''))}</span><div class="muted">${escapeHTML(String(rec.cron_timezone || 'UTC'))} . ${Number(rec.clip_duration_sec || 0)}s clips</div></td>
-              <td>${escapeHTML(formatDate(rec.last_clip_at))}</td>
-              <td>${Number(rec.recent_clip_count || 0)}</td>
-              <td><div class="button-row">${pauseResume}<button type="button" class="danger" data-delete="${id}" style="width:auto;min-width:90px;">Delete</button></div></td>
-            </tr>
-          `;
-        }).join('');
-        wireRowActions();
-      } catch (err) {
-        setStatus(recListStatus, String(err), 'err');
-      }
-    }
-
-    function wireRowActions() {
-      recRows.querySelectorAll('button[data-pause]').forEach((btn) => {
-        btn.addEventListener('click', () => mutateRecording(btn.getAttribute('data-pause'), 'pause'));
-      });
-      recRows.querySelectorAll('button[data-resume]').forEach((btn) => {
-        btn.addEventListener('click', () => mutateRecording(btn.getAttribute('data-resume'), 'resume'));
-      });
-      recRows.querySelectorAll('button[data-delete]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          if (!window.confirm('Delete this recording? This cancels it and frees the billing seat.')) return;
-          const id = String(btn.getAttribute('data-delete') || '').trim();
-          try {
-            await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' });
-            await Promise.all([refreshRecordings(), refreshBilling()]);
-          } catch (err) {
-            setStatus(recListStatus, String(err), 'err');
-          }
-        });
-      });
-    }
-
-    async function mutateRecording(id, action) {
-      const rid = String(id || '').trim();
-      try {
-        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(rid)}/${action}`, { method: 'POST' });
-        await refreshRecordings();
-      } catch (err) {
-        setStatus(recListStatus, String(err), 'err');
-      }
-    }
-
-    document.getElementById('createRecBtn').addEventListener('click', async () => {
-      const body = {
-        name: String(document.getElementById('recName').value || '').trim(),
-        stream_url: String(document.getElementById('recURL').value || '').trim(),
-        storage_destination_id: Number(recDest.value || 0),
-        cron_expr: String(document.getElementById('recCron').value || '').trim(),
-        cron_timezone: String(document.getElementById('recTZ').value || '').trim() || 'UTC',
-        clip_duration_sec: Number(document.getElementById('recClip').value || 60),
-      };
-      try {
-        await fetchJSON('/api/v1/account/recordings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        setStatus(createRecStatus, 'Recording created.', 'ok');
-        document.getElementById('recName').value = '';
-        document.getElementById('recURL').value = '';
-        await Promise.all([refreshRecordings(), refreshBilling()]);
-      } catch (err) {
-        setStatus(createRecStatus, String(err), 'err');
-      }
+    els.schedSeg.querySelectorAll('button[data-preset]').forEach((b) =>
+      b.addEventListener('click', () => setSchedPreset(b.getAttribute('data-preset'))));
+    els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
+      const v = b.getAttribute('data-clip');
+      b.addEventListener('click', () => setClip(v === 'custom' ? 'custom' : Number(v)));
     });
-
-    document.getElementById('subscribeBtn').addEventListener('click', async () => {
-      try {
-        const out = await fetchJSON('/api/v1/account/billing/checkout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-        if (out.checkout_url) { window.location.assign(out.checkout_url); return; }
-        if (out.portal_url) { window.location.assign(out.portal_url); return; }
-        setStatus(billingActionStatus, 'No checkout URL returned.', 'err');
-      } catch (err) {
-        setStatus(billingActionStatus, String(err), 'err');
-      }
+    els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.schedTZCustom.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.clipCustom.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.recURL.addEventListener('input', refreshStartEnabled);
+    els.recDest.addEventListener('change', refreshStartEnabled);
+    els.cnProvider.addEventListener('change', applyProviderDefaults);
+    els.cnTestBtn.addEventListener('click', testConnection);
+    els.cnCancelBtn.addEventListener('click', () => {
+      closeConnectForm();
+      if (state.destinations.length > 0) els.destPicker.classList.remove('hidden');
     });
-
-    document.getElementById('portalBtn').addEventListener('click', async () => {
-      try {
-        const out = await fetchJSON('/api/v1/account/billing/portal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-        if (out.url) { window.location.assign(out.url); return; }
-        setStatus(billingActionStatus, 'No portal URL returned.', 'err');
-      } catch (err) {
-        setStatus(billingActionStatus, String(err), 'err');
-      }
-    });
+    els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
+    els.newRecBtn.addEventListener('click', () => openComposer(false));
+    els.composerClose.addEventListener('click', closeComposer);
+    els.startBtn.addEventListener('click', startRecording);
 
     document.getElementById('requestLink').addEventListener('click', async () => {
       const email = String(document.getElementById('email').value || '').trim();
       try {
         await fetchJSON('/api/v1/auth/request-link', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, redirect_path: '/recordings' }),
         });
-        setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
+        setStatus(els.requestStatus, 'Magic link sent if the email is accepted.', 'ok');
       } catch (err) {
-        setStatus(requestStatus, String(err), 'err');
+        setStatus(els.requestStatus, String(err.message || err), 'err');
       }
     });
 
-    document.getElementById('refreshBtn').addEventListener('click', () => { void refreshRecordings(); });
-    document.getElementById('recCron').addEventListener('input', updateCronPreview);
-
     async function boot() {
+      fillTimezoneSelect(els.schedTZ);
+      fillTimezoneSelect(els.schedTZCustom);
+      fillProviderSelect();
+      setSchedPreset('hourly');
+      setClip(60);
       try {
         const account = await fetchAccountWithRetry();
-        const email = String(account.email || '').trim();
-        accountChip.innerHTML = email ? escapeHTML(email) : '<a href="/account">Account</a>';
-        signedOut.classList.add('hidden');
-        signedIn.classList.remove('hidden');
-        await Promise.all([refreshDestinations(), refreshBilling(), refreshRecordings()]);
+        state.account = account;
+        els.signedOut.classList.add('hidden');
+        els.signedIn.classList.remove('hidden');
+        buildAccountChip();
+        await loadBillingEnabled();
+        startButtonLabel();
+        await refreshDestinations();
+        await handleBillingReturn();
       } catch (_) {
-        accountChip.innerHTML = '<a href="/account">Sign in</a>';
-        signedIn.classList.add('hidden');
-        signedOut.classList.remove('hidden');
+        els.accountChip.textContent = 'Sign in';
+        els.accountChip.style.cursor = 'default';
+        els.accountChip.onclick = null;
+        els.signedIn.classList.add('hidden');
+        els.signedOut.classList.remove('hidden');
       }
     }
 

@@ -84,6 +84,23 @@ func TestSubscriptionStatusGrantsAccess(t *testing.T) {
 	}
 }
 
+func TestQuantitySyncCancels(t *testing.T) {
+	// Stripe rejects quantity 0 on a licensed item, so a drop to 0 active
+	// recordings must cancel the subscription instead of pushing quantity 0.
+	cancels := []int64{0, -1, -5}
+	for _, q := range cancels {
+		if !quantitySyncCancels(q) {
+			t.Fatalf("quantitySyncCancels(%d) = false, want true (cancel on zero/empty)", q)
+		}
+	}
+	keeps := []int64{1, 2, 50}
+	for _, q := range keeps {
+		if quantitySyncCancels(q) {
+			t.Fatalf("quantitySyncCancels(%d) = true, want false (push quantity)", q)
+		}
+	}
+}
+
 func TestClientRefAccountID(t *testing.T) {
 	cases := map[string]int64{
 		"42":    42,

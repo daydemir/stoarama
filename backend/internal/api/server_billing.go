@@ -160,6 +160,84 @@ func (s *Server) handleAccountBillingCheckout(w http.ResponseWriter, r *http.Req
 	util.WriteJSON(w, http.StatusOK, map[string]any{"checkout_url": checkoutURL})
 }
 
+// ensureRecordingCheckoutURL mints a Stripe Checkout session for the account so
+// that pressing Start/Resume is the act of paying when the account has no
+// access-granting subscription. It reuses handleAccountBillingCheckout's logic
+// (FOR UPDATE lock, EnsureCustomer, countLiveRecordings as quantity,
+// CreateCheckoutSession) so a concurrent click cannot mint two customers. Returns
+// "" with no error when billing is disabled (free mode) so create/resume still
+// succeed without a redirect.
+func (s *Server) ensureRecordingCheckoutURL(ctx context.Context, accountID int64, email string) (string, error) {
+	if s.billing == nil {
+		return "", nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin checkout tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO account_billing (account_id) VALUES ($1) ON CONFLICT (account_id) DO NOTHING
+	`, accountID); err != nil {
+		return "", fmt.Errorf("ensure billing row: %w", err)
+	}
+
+	var customerID *string
+	if err := tx.QueryRow(ctx, `
+		SELECT stripe_customer_id FROM account_billing WHERE account_id=$1 FOR UPDATE
+	`, accountID).Scan(&customerID); err != nil {
+		return "", fmt.Errorf("lock billing row: %w", err)
+	}
+
+	custID := ""
+	if customerID != nil {
+		custID = strings.TrimSpace(*customerID)
+	}
+	if custID == "" {
+		custID, err = s.billing.EnsureCustomer(ctx, accountID, email)
+		if err != nil {
+			return "", fmt.Errorf("ensure stripe customer: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE account_billing SET stripe_customer_id=$2, updated_at=now() WHERE account_id=$1
+		`, accountID, custID); err != nil {
+			return "", fmt.Errorf("store stripe customer: %w", err)
+		}
+	}
+
+	qty := int64(s.countLiveRecordings(ctx, tx, accountID))
+	if qty < 1 {
+		qty = 1
+	}
+	checkoutURL, err := s.billing.CreateCheckoutSession(ctx, custID, accountID, qty)
+	if err != nil {
+		return "", fmt.Errorf("create checkout session: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit checkout tx: %w", err)
+	}
+	return checkoutURL, nil
+}
+
+// accountSubscriptionGrantsAccess reports whether the account currently has an
+// access-granting subscription. When false, a newly active recording is not
+// billable and will not capture until Checkout completes, so create/resume must
+// return a checkout_url.
+func (s *Server) accountSubscriptionGrantsAccess(ctx context.Context, accountID int64) (bool, error) {
+	var status string
+	err := s.pool.QueryRow(ctx, `
+		SELECT subscription_status FROM account_billing WHERE account_id=$1
+	`, accountID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return subscriptionStatusGrantsAccess(status), nil
+}
+
 // handleAccountBillingPortal opens the Stripe customer portal for the account.
 func (s *Server) handleAccountBillingPortal(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
@@ -191,16 +269,28 @@ func (s *Server) handleAccountBillingPortal(w http.ResponseWriter, r *http.Reque
 	util.WriteJSON(w, http.StatusOK, map[string]any{"url": url})
 }
 
-// syncSubscriptionQuantity recomputes the absolute live recording count under a
-// FOR UPDATE lock and pushes it to Stripe when a subscription item exists. The
-// subscription item id is read ONLY from the authed account's billing row
-// (never from request input), and a missing billing client / item is a no-op so
-// free-mode create/delete still works.
+// syncSubscriptionQuantity recomputes the absolute billed recording count (active
+// only) under a FOR UPDATE lock and pushes it to Stripe when a subscription item
+// exists. The subscription ids are read ONLY from the authed account's billing
+// row (never from request input), and a missing billing client / item is a no-op
+// so free-mode create/delete still works.
+//
+// Quantity-0 edge: Stripe rejects quantity 0 on a licensed item, so when the
+// active count drops to 0 we CANCEL the subscription (and null the stored ids,
+// mirroring syncBillingFromSubscription's terminal-status nulling) instead of
+// calling SetSubscriptionQuantity(0). The account then pays nothing, and the next
+// active recording re-subscribes via Checkout (create/resume re-checkout whenever
+// there is no access-granting sub). This keeps deleting/pausing the last active
+// recording from 502-ing on Stripe's zero-quantity rejection.
 func (s *Server) syncSubscriptionQuantity(ctx context.Context, tx pgx.Tx, accountID int64) error {
-	var subItemID *string
+	var (
+		subID     *string
+		subItemID *string
+	)
 	err := tx.QueryRow(ctx, `
-		SELECT stripe_subscription_item_id FROM account_billing WHERE account_id=$1 FOR UPDATE
-	`, accountID).Scan(&subItemID)
+		SELECT stripe_subscription_id, stripe_subscription_item_id
+		FROM account_billing WHERE account_id=$1 FOR UPDATE
+	`, accountID).Scan(&subID, &subItemID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -214,18 +304,46 @@ func (s *Server) syncSubscriptionQuantity(ctx context.Context, tx pgx.Tx, accoun
 		return nil
 	}
 	qty := int64(s.countLiveRecordings(ctx, tx, accountID))
+	if quantitySyncCancels(qty) {
+		if subID != nil && strings.TrimSpace(*subID) != "" {
+			if err := s.billing.CancelSubscription(ctx, strings.TrimSpace(*subID)); err != nil {
+				return fmt.Errorf("cancel zero-quantity subscription: %w", err)
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE account_billing
+			SET stripe_subscription_id=NULL,
+			    stripe_subscription_item_id=NULL,
+			    subscription_status='canceled',
+			    paid_quantity=0,
+			    updated_at=now()
+			WHERE account_id=$1
+		`, accountID); err != nil {
+			return fmt.Errorf("null canceled subscription: %w", err)
+		}
+		return nil
+	}
 	if err := s.billing.SetSubscriptionQuantity(ctx, strings.TrimSpace(*subItemID), qty); err != nil {
 		return fmt.Errorf("set subscription quantity: %w", err)
 	}
 	return nil
 }
 
-// countLiveRecordings is the absolute seat count: recordings the account intends
-// to keep (not canceled). Used as the Stripe quantity everywhere.
+// quantitySyncCancels reports whether a quantity sync must cancel the
+// subscription instead of pushing the quantity. Stripe rejects quantity 0 on a
+// licensed item, so a drop to 0 active recordings cancels the subscription rather
+// than setting quantity 0.
+func quantitySyncCancels(activeQty int64) bool {
+	return activeQty <= 0
+}
+
+// countLiveRecordings is the absolute billed seat count: only ACTIVE recordings
+// are billed (paused recordings are stopped and not charged). Used as the Stripe
+// quantity everywhere.
 func (s *Server) countLiveRecordings(ctx context.Context, q pgxQuerier, accountID int64) int {
 	var n int
 	if err := q.QueryRow(ctx, `
-		SELECT count(*) FROM recordings WHERE account_id=$1 AND status <> 'canceled'
+		SELECT count(*) FROM recordings WHERE account_id=$1 AND status = 'active'
 	`, accountID).Scan(&n); err != nil {
 		return 0
 	}

@@ -350,14 +350,10 @@
     <div class="topbar">
       <div class="topbar-left">
         <span class="site-title">STO-A-RAMA</span>
-        <div class="metrics-row" id="metricsRow"></div>
       </div>
       <div class="topbar-center">
         <nav class="global-nav" aria-label="Global">
-          <a href="/streams">Streams</a>
-          <a href="/recording">Recording</a>
           <a href="/recordings">Recordings</a>
-          <a href="/docs/getting-started">Docs</a>
         </nav>
       </div>
       <div class="topbar-right">
@@ -368,14 +364,12 @@
 
     <div class="hero">
       <section class="panel">
-        <div class="eyebrow">Account tools</div>
-        <h1>Manage sessions, API keys, and enrolled nodes.</h1>
-        <p>Use this page for browser sign-in, automation credentials, node enrollment, and future billing state. Stream browsing, clip downloads, and API examples now live on their own route pages.</p>
+        <div class="eyebrow">Operator tools</div>
+        <h1>Manage API keys and enrolled nodes.</h1>
+        <p>Use this page for automation credentials and local recorder node enrollment. Recordings, billing, and clip access live on the Recordings page.</p>
         <div class="hero-notes">
-          <span class="hero-note">Email session management</span>
           <span class="hero-note">API keys for scripts</span>
           <span class="hero-note">Node enrollment</span>
-          <span class="hero-note">Billing placeholder</span>
         </div>
       </section>
       <section class="panel">
@@ -391,39 +385,21 @@
       </section>
     </div>
 
-    <div class="grid-2">
-      <section class="panel">
-        <div class="section-title">
-          <div>
-            <div class="eyebrow">Sign in</div>
-            <h2>Email magic link</h2>
-          </div>
-          <p>Browser auth is used for recording actions, downloads, and account-scoped tools.</p>
+    <section class="panel" style="margin-bottom:16px;">
+      <div class="section-title">
+        <div>
+          <div class="eyebrow">Sign in</div>
+          <h2>Email magic link</h2>
         </div>
-        <label for="email">Email</label>
-        <input id="email" type="email" placeholder="you@example.org" />
-        <div class="button-row" style="margin-top:12px;">
-          <button id="requestLink" type="button">Email Magic Link</button>
-        </div>
-        <div id="requestStatus" class="status"></div>
-      </section>
-
-      <section class="panel">
-        <div class="section-title">
-          <div>
-            <div class="eyebrow">Recording</div>
-            <h2>Self-serve setup</h2>
-          </div>
-          <p>Local recording setup now lives under Docs.</p>
-        </div>
-        <div class="stack">
-          <div class="note">Use local recording when a source requires your own cookies, network path, or researcher-managed hardware.</div>
-          <div class="button-row">
-            <a href="/docs/self-serve">Self-Serve Setup</a>
-          </div>
-        </div>
-      </section>
-    </div>
+        <p>Enter your email to get a magic link for browser sign-in.</p>
+      </div>
+      <label for="email">Email</label>
+      <input id="email" type="email" placeholder="you@example.org" />
+      <div class="button-row" style="margin-top:12px;">
+        <button id="requestLink" type="button">Email Magic Link</button>
+      </div>
+      <div id="requestStatus" class="status"></div>
+    </section>
 
     <section class="panel" style="margin-bottom:16px;">
       <div class="section-title">
@@ -511,17 +487,6 @@
         </div>
       </section>
     </div>
-
-    <section class="panel">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">Billing</div>
-          <h2>Subscription placeholder</h2>
-        </div>
-        <p>Future billing and subscription management will appear here once researcher plans and request-recording flows are wired.</p>
-      </div>
-      <div class="empty-state">No billing actions yet.</div>
-    </section>
   </div>
 
   <script>
@@ -531,7 +496,6 @@
     const accountMeta = document.getElementById('accountMeta');
     const accountChip = document.getElementById('accountChip');
     const adminChip = document.getElementById('adminChip');
-    const metricsRow = document.getElementById('metricsRow');
     const keysEmpty = document.getElementById('keysEmpty');
     const keysBox = document.getElementById('keysBox');
     const keysRows = document.getElementById('keysRows');
@@ -640,21 +604,6 @@
         if (statusEl) setStatus(statusEl, okText || 'Copied.', 'ok');
       } catch (err) {
         if (statusEl) setStatus(statusEl, `Copy failed: ${String(err)}`, 'err');
-      }
-    }
-
-    async function refreshTopbarMetrics() {
-      if (!(metricsRow instanceof HTMLElement)) return;
-      try {
-        const payload = await fetchJSON('/api/v1/dashboard/overview');
-        metricsRow.innerHTML = [
-          ['streams', payload.streams_total],
-          ['recording', payload.recording_on],
-        ].map(([label, value]) => (
-          `<span class="metric-chip">${escapeHTML(label)} <b>${escapeHTML(String(Number(value || 0)))}</b></span>`
-        )).join('');
-      } catch (_) {
-        metricsRow.innerHTML = '';
       }
     }
 
@@ -782,6 +731,14 @@
     async function refreshSession() {
       try {
         currentAccount = await fetchCurrentAccountWithRetry();
+        // Operator-only guard: a non-admin account with no API keys or enrolled
+        // nodes has no business on this page; send it back to the app.
+        const guardRole = String(currentAccount.role || '').trim().toLowerCase();
+        const hasKeysOrNodes = currentAccount.has_keys_or_nodes === true;
+        if (guardRole !== 'admin' && !hasKeysOrNodes) {
+          window.location.replace('/recordings');
+          return;
+        }
         accountBox.classList.remove('hidden');
         const role = String(currentAccount.role || 'member');
         const authType = String(currentAccount.auth_type || 'session');
@@ -890,7 +847,6 @@
     });
 
     void refreshSession();
-    void refreshTopbarMetrics();
   </script>
 </body>
 </html>

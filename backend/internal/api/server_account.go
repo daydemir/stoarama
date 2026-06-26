@@ -443,14 +443,25 @@ func (s *Server) handleAccountMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hasBrowserSession := principal.SessionID != nil
+	// has_keys_or_nodes gates the operator-only Developer/nodes link for non-admin
+	// accounts that already enrolled nodes or minted API keys.
+	var hasKeysOrNodes bool
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT EXISTS(SELECT 1 FROM account_api_keys WHERE account_id=$1 AND revoked_at IS NULL)
+		    OR EXISTS(SELECT 1 FROM nodes WHERE account_id=$1)
+	`, principal.AccountID).Scan(&hasKeysOrNodes); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load account flags: %v", err))
+		return
+	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"account": map[string]any{
-			"id":        principal.AccountID,
-			"email":     principal.Email,
-			"name":      principal.Name,
-			"role":      principal.Role,
-			"auth_type": principal.AuthType,
+			"id":                principal.AccountID,
+			"email":             principal.Email,
+			"name":              principal.Name,
+			"role":              principal.Role,
+			"auth_type":         principal.AuthType,
+			"has_keys_or_nodes": hasKeysOrNodes,
 		},
 		"capabilities": accountSessionCapabilities(principal),
 		"session": map[string]any{

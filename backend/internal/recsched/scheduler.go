@@ -121,7 +121,7 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 		          AND b.subscription_status IN ('active','trialing','past_due')
 		          AND (b.subscription_status <> 'past_due' OR b.current_period_end > now())
 		          AND (SELECT count(*) FROM recordings r2
-		                 WHERE r2.account_id = rec.account_id AND r2.status <> 'canceled'
+		                 WHERE r2.account_id = rec.account_id AND r2.status = 'active'
 		                   AND (r2.created_at, r2.id) <= (rec.created_at, rec.id)) <= b.paid_quantity))
 		ORDER BY rec.id ASC
 	`, !s.cfg.BillingEnabled)
