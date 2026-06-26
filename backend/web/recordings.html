@@ -318,7 +318,7 @@
           <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
           <input id="recURL" type="url" placeholder="https://example.com/live/stream.m3u8" />
           <div id="streamStatus" class="status" style="margin-top:8px;"></div>
-          <video id="streamPreview" class="video-preview hidden" muted playsinline controls></video>
+          <video id="streamPreview" class="video-preview hidden" muted playsinline autoplay></video>
         </div>
         <div class="field">
           <label for="recName">Name (optional)</label>
@@ -911,7 +911,7 @@
       const softNote = () => {
         if (token !== state.streamProbe.token) return;
         setStatus(els.streamStatus,
-          'Stream is reachable. In-browser preview is unavailable for this source (often a browser CORS limit); it will still record.',
+          'Valid. Live preview not loading here, but the video will still be recorded. If recording fails, you are not charged.',
           'warn');
       };
       let settled = false;
@@ -931,7 +931,8 @@
 
       if (isHLSURL(url)) {
         if (window.Hls && window.Hls.isSupported()) {
-          const hls = new window.Hls({ enableWorker: true });
+          // Live edge only: low latency, no back buffer (no rewind/scrubber), stay near live.
+          const hls = new window.Hls({ enableWorker: true, lowLatencyMode: true, backBufferLength: 0, liveSyncDurationCount: 3 });
           activeHls = hls;
           hls.on(window.Hls.Events.ERROR, (_evt, data) => { if (data && data.fatal) onError(); });
           hls.loadSource(url);
