@@ -39,7 +39,11 @@ type recordingLeaseResponse struct {
 // handleRecordingJobsLease leases at most one due recording job for the calling
 // droplet. It locks ONLY recording_jobs in the CTE (mirroring the capture lease)
 // and inlines the billable predicate non-windowed (the gate VIEW cannot be used
-// under FOR UPDATE). A worker with no recorder_droplets row is never drained.
+// under FOR UPDATE). Leasing is restricted to operator-managed pool droplets:
+// recorder_droplets rows are created only by the autoscaler under the operator
+// account, so a self-enrolled local_recorder node (which has no such row) can
+// lease nothing and therefore cannot observe another tenant's stream_url or deny
+// their capture.
 func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request) {
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
@@ -69,9 +73,9 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		            AND (SELECT count(*) FROM recordings r2
 		                   WHERE r2.account_id = rec.account_id AND r2.status <> 'canceled'
 		                     AND (r2.created_at, r2.id) <= (rec.created_at, rec.id)) <= b.paid_quantity))
-		    AND NOT EXISTS (
+		    AND EXISTS (
 		          SELECT 1 FROM recorder_droplets d
-		          WHERE d.name = $1 AND d.state = 'draining')
+		          WHERE d.name = $1 AND d.state <> 'draining')
 		  ORDER BY j.scheduled_for ASC, j.id ASC
 		  LIMIT 1
 		  FOR UPDATE SKIP LOCKED

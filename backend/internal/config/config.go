@@ -213,6 +213,22 @@ func (c Config) ValidateAPI() error {
 	if err := c.ValidateR2(); err != nil {
 		return err
 	}
+	return c.ValidateStripe()
+}
+
+// ValidateStripe asserts the configured mode matches the secret-key prefix, so a
+// live key with STRIPE_LIVEMODE=false (which would make the webhook reject every
+// live event with 400 and silently leave all accounts unbillable) refuses to
+// start instead of failing silently in production. Billing is optional: an empty
+// or non-sk_ key skips the check (the server boots in free mode).
+func (c Config) ValidateStripe() error {
+	key := strings.TrimSpace(c.StripeSecretKey)
+	if strings.HasPrefix(key, "sk_live_") && !c.StripeLivemode {
+		return fmt.Errorf("STRIPE_SECRET_KEY is a live key but STRIPE_LIVEMODE is false; set STRIPE_LIVEMODE=true")
+	}
+	if strings.HasPrefix(key, "sk_test_") && c.StripeLivemode {
+		return fmt.Errorf("STRIPE_SECRET_KEY is a test key but STRIPE_LIVEMODE is true; set STRIPE_LIVEMODE=false")
+	}
 	return nil
 }
 

@@ -362,9 +362,18 @@ func (s *Server) applyStripeEvent(ctx context.Context, tx pgx.Tx, event stripe.E
 			return err
 		}
 		if event.Type == "invoice.payment_failed" {
+			evAt := eventCreated(event)
+			var evAtArg any
+			if !evAt.IsZero() {
+				evAtArg = evAt
+			}
+			// Gate on event ordering so a redelivered/out-of-order failed-invoice
+			// cannot re-mark an account that has since recovered.
 			if _, err := tx.Exec(ctx, `
-				UPDATE account_billing SET last_payment_failed_at=now(), updated_at=now() WHERE account_id=$1
-			`, accountID); err != nil {
+				UPDATE account_billing SET last_payment_failed_at=now(), updated_at=now()
+				WHERE account_id=$1
+				  AND ($2::timestamptz IS NULL OR last_event_at IS NULL OR $2::timestamptz >= last_event_at)
+			`, accountID, evAtArg); err != nil {
 				return fmt.Errorf("mark payment failed: %w", err)
 			}
 		}
@@ -404,8 +413,8 @@ func (s *Server) syncBillingFromSubscription(ctx context.Context, tx pgx.Tx, acc
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE account_billing
-		SET stripe_subscription_id=$2,
-		    stripe_subscription_item_id=COALESCE($3, stripe_subscription_item_id),
+		SET stripe_subscription_id=CASE WHEN $4 IN ('canceled','unpaid','incomplete_expired') THEN NULL ELSE $2 END,
+		    stripe_subscription_item_id=CASE WHEN $4 IN ('canceled','unpaid','incomplete_expired') THEN NULL ELSE COALESCE($3, stripe_subscription_item_id) END,
 		    subscription_status=$4,
 		    paid_quantity=$5,
 		    current_period_end=$6,

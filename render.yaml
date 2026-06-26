@@ -98,6 +98,13 @@ services:
         sync: false
       - key: STRIPE_LIVEMODE
         sync: false
+      # secretbox master key (base64, e.g. `openssl rand -base64 32`). REQUIRED
+      # for the recorder: seals storage-destination credentials and unseals the
+      # per-destination secret when presigning each clip upload. Must be the SAME
+      # key used to encrypt existing destinations. Unset => storage-destination
+      # CRUD and clip upload-intents return 503 and no clip can ever be stored.
+      - key: STORAGE_CRED_KEY
+        sync: false
 
   # Daily stream survey: one JPEG per non-pruned stream per day, captured on an
   # isolated cron instance so the heavy ffmpeg/yt-dlp work never touches the
@@ -173,7 +180,7 @@ services:
       - key: APP_BASE_URL
         value: https://stoarama-api.onrender.com
       - key: REC_SCHED_ENABLED
-        value: "false"
+        value: "true"
       - key: REC_SCHED_TICK_SEC
         value: "15"
       - key: REC_SCHED_CATCHUP_SEC
