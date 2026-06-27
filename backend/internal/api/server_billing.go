@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,6 +25,10 @@ const stripeWebhookMaxBody = 64 * 1024
 // recordingDayRateCents is the per-recording-day usage price (50 cents); the live
 // UI estimate is days * this. The authoritative charge is Stripe's meter sum.
 const recordingDayRateCents = 50
+
+// gbMonthRateCents is the managed-storage price (10 cents per GB-month); the live
+// UI estimate is avg_gb * this. The authoritative charge is Stripe's gb_month meter.
+const gbMonthRateCents = 10
 
 // handleAccountBillingMe returns the account's usage-billing summary: whether a
 // card is on file plus a live (DB-derived, never Stripe) estimate of this
@@ -59,12 +64,38 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Month-to-date average GB of managed storage, from our own daily snapshots.
+	// avg_gb = SUM(bytes_stored)/count(snapshot days)/1e9 across the current UTC
+	// month; 0 when there are no snapshots. Mirrors the period-average the
+	// gb_month meter reports at period close.
+	var snapBytes int64
+	var snapDays int
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT COALESCE(SUM(bytes_stored),0), COUNT(*)
+		FROM account_storage_snapshots
+		WHERE account_id=$1 AND snapshot_date >= date_trunc('month', now() AT TIME ZONE 'UTC')::date
+	`, principal.AccountID).Scan(&snapBytes, &snapDays); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load storage snapshots: %v", err))
+		return
+	}
+	avgGB := 0.0
+	if snapDays > 0 {
+		avgGB = float64(snapBytes) / float64(snapDays) / 1e9
+	}
+
+	// Managed storage is offered only when billing is on AND the operator R2 is
+	// configured; otherwise the UI shows BYO only and the provision endpoint 503s.
+	managedAvailable := s.billing != nil && s.r2 != nil && s.cfg.ValidateR2() == nil
+
 	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"billing_enabled":           s.billing != nil,
-		"has_customer":              customerID != nil && strings.TrimSpace(*customerID) != "",
-		"has_payment_method":        hasPaymentMethod,
-		"recording_days_this_month": days,
-		"estimated_amount_cents":    days * recordingDayRateCents,
+		"billing_enabled":                s.billing != nil,
+		"has_customer":                   customerID != nil && strings.TrimSpace(*customerID) != "",
+		"has_payment_method":             hasPaymentMethod,
+		"recording_days_this_month":      days,
+		"estimated_amount_cents":         days * recordingDayRateCents,
+		"managed_available":              managedAvailable,
+		"storage_gb_month_avg":           strconv.FormatFloat(avgGB, 'f', 3, 64),
+		"estimated_storage_amount_cents": int64(math.Round(avgGB * float64(gbMonthRateCents))),
 	})
 }
 

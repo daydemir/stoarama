@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -21,6 +22,7 @@ const meteringTickInterval = time.Hour
 type meteringStripe interface {
 	GetSubscriptionPeriod(ctx context.Context, subID string) (start, end time.Time, err error)
 	ReportRecordingDays(ctx context.Context, customerID string, accountID int64, periodKey string, days int) error
+	ReportGBMonth(ctx context.Context, customerID string, accountID int64, periodKey, gbDecimal string) error
 }
 
 // meterableAccount is one account the metering job may bill: it has a Stripe
@@ -45,6 +47,15 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 	runOnce := func() {
 		today := time.Now().UTC().Format("2006-01-02")
 		if today == lastRunDay {
+			return
+		}
+		// Snapshot first: record today's managed-storage byte total per account so
+		// the gb_month period-average (computed in meterAccount) includes today.
+		if err := snapshotManagedStorage(ctx, pool); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("managed storage snapshot error: %v", err)
 			return
 		}
 		if err := meterAllAccounts(ctx, pool, reporter); err != nil {
@@ -140,6 +151,25 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 		}
 	}
 
+	// gb_month: average GB of managed storage across the same closing period, from
+	// the daily snapshots in [start, end). BYO / zero-GB accounts have no snapshots
+	// and report nothing (mirrors the zero-day suppression). Reported BEFORE the
+	// cursor advance so a re-run is a no-op for both meters.
+	var sumBytes int64
+	var snapDays int
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(bytes_stored), 0), COUNT(*)
+		FROM account_storage_snapshots
+		WHERE account_id=$1 AND snapshot_date >= $2::date AND snapshot_date < $3::date
+	`, a.accountID, start, end).Scan(&sumBytes, &snapDays); err != nil {
+		return fmt.Errorf("read storage snapshots: %w", err)
+	}
+	if gbDecimal, ok := gbMonthMeterValue(sumBytes, snapDays); ok {
+		if err := reporter.ReportGBMonth(ctx, a.customerID, a.accountID, meterPeriodKey(end), gbDecimal); err != nil {
+			return fmt.Errorf("report gb-month: %w", err)
+		}
+	}
+
 	if _, err := pool.Exec(ctx, `
 		UPDATE account_billing SET last_metered_period_end=$2::date, updated_at=now()
 		WHERE account_id=$1
@@ -147,6 +177,46 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 		return fmt.Errorf("advance metering cursor: %w", err)
 	}
 	return nil
+}
+
+// snapshotManagedStorage records today's managed-storage byte total per account:
+// SUM(recording_clips.size_bytes) over each managed account's non-purged clips,
+// keyed (account_id, CURRENT_DATE). Idempotent within a day via ON CONFLICT
+// (a same-day re-run overwrites). Only managed accounts get rows, so BYO accounts
+// never accrue snapshots and never report gb_month. Purged clips are excluded, so
+// once the purge job sets purged_at the bytes drop out of the next snapshot and
+// stop billing.
+func snapshotManagedStorage(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored)
+		SELECT r.account_id, CURRENT_DATE, COALESCE(SUM(c.size_bytes), 0)
+		FROM recording_clips c
+		JOIN recordings r            ON r.id = c.recording_id
+		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
+		WHERE sd.managed AND c.purged_at IS NULL
+		GROUP BY r.account_id
+		ON CONFLICT (account_id, snapshot_date)
+		DO UPDATE SET bytes_stored = EXCLUDED.bytes_stored
+	`); err != nil {
+		return fmt.Errorf("snapshot managed storage: %w", err)
+	}
+	return nil
+}
+
+// gbMonthMeterValue computes the gb_month meter value from a period's snapshot
+// rows: the average GB stored = SUM(bytes_stored) / numSnapshotDays / 1e9,
+// formatted to 3 decimals as a decimal string (the v1 Meter Events API accepts a
+// decimal value; the price is $0.10 per 1 GB unit so the value IS the billable GB,
+// no rounding to whole GB). It reports (value, true) only when there is at least
+// one snapshot day AND non-zero bytes; otherwise (",", false) so the caller sends
+// nothing (matching the zero-day suppression). The denominator is the snapshot-row
+// count, so a mid-period opt-in averages only over the days the data existed.
+func gbMonthMeterValue(sumBytes int64, snapDays int) (string, bool) {
+	if snapDays <= 0 || sumBytes <= 0 {
+		return "", false
+	}
+	avgGB := float64(sumBytes) / float64(snapDays) / 1e9
+	return strconv.FormatFloat(avgGB, 'f', 3, 64), true
 }
 
 // periodAlreadyMetered is the idempotency guard: a period is skipped when its end

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -18,6 +20,7 @@ import (
 const storageVerifyTimeout = 20 * time.Second
 
 type storageDestinationCreateRequest struct {
+	Managed         bool   `json:"managed"`
 	Name            string `json:"name"`
 	Provider        string `json:"provider"`
 	Endpoint        string `json:"endpoint"`
@@ -35,7 +38,7 @@ func (s *Server) handleAccountStorageDestinationsList(w http.ResponseWriter, r *
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, name, provider, endpoint, region, bucket, key_prefix, access_key_id, status, last_verify_error, verified_at, created_at
+		SELECT id, name, provider, endpoint, region, bucket, key_prefix, access_key_id, status, last_verify_error, verified_at, created_at, managed
 		FROM storage_destinations
 		WHERE account_id=$1
 		ORDER BY created_at DESC, id DESC
@@ -60,10 +63,18 @@ func (s *Server) handleAccountStorageDestinationsList(w http.ResponseWriter, r *
 			lastVerifyError string
 			verifiedAt      *time.Time
 			createdAt       time.Time
+			managed         bool
 		)
-		if err := rows.Scan(&id, &name, &provider, &endpoint, &region, &bucket, &keyPrefix, &accessKeyID, &status, &lastVerifyError, &verifiedAt, &createdAt); err != nil {
+		if err := rows.Scan(&id, &name, &provider, &endpoint, &region, &bucket, &keyPrefix, &accessKeyID, &status, &lastVerifyError, &verifiedAt, &createdAt, &managed); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan storage destination: %v", err))
 			return
+		}
+		// Managed rows carry the OPERATOR's R2 coordinates and access key; blank the
+		// operator-owned fields so the per-account UI never sees or leaks them.
+		if managed {
+			endpoint = ""
+			bucket = ""
+			accessKeyID = ""
 		}
 		items = append(items, map[string]any{
 			"id":                id,
@@ -78,6 +89,7 @@ func (s *Server) handleAccountStorageDestinationsList(w http.ResponseWriter, r *
 			"last_verify_error": lastVerifyError,
 			"verified_at":       verifiedAt,
 			"created_at":        createdAt.UTC(),
+			"managed":           managed,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -100,6 +112,10 @@ func (s *Server) handleAccountStorageDestinationsCreate(w http.ResponseWriter, r
 	var req storageDestinationCreateRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Managed {
+		s.handleAccountStorageManagedCreate(w, r, principal)
 		return
 	}
 	name := strings.TrimSpace(req.Name)
@@ -234,6 +250,111 @@ func (s *Server) handleAccountStorageDestinationDelete(w http.ResponseWriter, r 
 		"destination_id": id,
 	})
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleAccountStorageManagedCreate provisions (or re-uses) the account's single
+// managed destination: a real storage_destinations row holding the OPERATOR's R2
+// coordinates + the encrypted operator secret, isolated by a per-account
+// key_prefix. It skips ALL BYO validation (name/endpoint/.../verify probe) because
+// the operator bucket is already trusted. After provisioning it lazily adds the
+// gb_month metered item to the account's existing subscription (Option A backfill),
+// then returns the masked payload (operator creds blanked).
+func (s *Server) handleAccountStorageManagedCreate(w http.ResponseWriter, r *http.Request, principal accountPrincipal) {
+	id, keyPrefix, err := s.provisionManagedDestination(r.Context(), principal.AccountID)
+	if err != nil {
+		if errors.Is(err, errManagedUnavailable) {
+			util.WriteError(w, http.StatusServiceUnavailable, "managed storage is not available (operator R2 or billing is not configured)")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("provision managed destination: %v", err))
+		return
+	}
+
+	// Lazily add the gb_month metered item to a pre-existing subscription that
+	// predates managed storage, so opting in starts accruing storage charges on the
+	// same subscription. New accounts already get both items at Checkout. Best
+	// effort: a Stripe hiccup must not fail provisioning (the nightly metering job
+	// reports nothing until the item exists, and a later opt-in retries this).
+	if s.billing != nil {
+		var subID *string
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT stripe_subscription_id FROM account_billing WHERE account_id=$1
+		`, principal.AccountID).Scan(&subID); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				log.Printf("managed provision: read subscription for account %d: %v", principal.AccountID, err)
+			}
+		} else if subID != nil && strings.TrimSpace(*subID) != "" {
+			if err := s.billing.EnsureGBMonthItem(r.Context(), *subID); err != nil {
+				log.Printf("managed provision: ensure gb_month item for account %d: %v", principal.AccountID, err)
+			}
+		}
+	}
+
+	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "storage_destination_created", "account", principal.Email, map[string]any{
+		"destination_id": id,
+		"name":           managedDestinationName,
+		"provider":       managedDestinationProvider,
+		"managed":        true,
+	})
+
+	// Masked payload: operator endpoint/bucket/access_key_id are never returned.
+	util.WriteJSON(w, http.StatusCreated, map[string]any{
+		"id":            id,
+		"name":          managedDestinationName,
+		"provider":      managedDestinationProvider,
+		"endpoint":      "",
+		"region":        s.cfg.R2Region,
+		"bucket":        "",
+		"key_prefix":    keyPrefix,
+		"access_key_id": "",
+		"status":        "verified",
+		"managed":       true,
+	})
+}
+
+// errManagedUnavailable is returned by provisionManagedDestination when managed
+// storage is gated off (no operator R2 client / config, or no secret cipher),
+// which the handler maps to 503.
+var errManagedUnavailable = errors.New("managed storage unavailable")
+
+const (
+	managedDestinationName     = "Stoarama-managed"
+	managedDestinationProvider = "r2_managed"
+)
+
+// provisionManagedDestination idempotently creates the account's managed
+// destination row and returns its id + key_prefix. The row stores the OPERATOR's
+// R2 endpoint/region/bucket/access_key_id and the secretbox-encrypted operator
+// secret, so the upload-intent presign and ingest Head paths build a client and
+// presign IDENTICALLY for managed and BYO (no fork). The unique partial index
+// on (account_id) WHERE managed makes the INSERT ... ON CONFLICT DO NOTHING a
+// no-op on re-provision; the follow-up SELECT always returns the existing id.
+func (s *Server) provisionManagedDestination(ctx context.Context, accountID int64) (destID int64, keyPrefix string, err error) {
+	if s.r2 == nil || s.secrets == nil || s.cfg.ValidateR2() != nil {
+		return 0, "", errManagedUnavailable
+	}
+	keyPrefix = fmt.Sprintf("managed/acct-%d", accountID)
+	sealed, err := s.secrets.Encrypt([]byte(s.cfg.R2SecretAccessKey))
+	if err != nil {
+		return 0, "", fmt.Errorf("encrypt operator secret: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO storage_destinations
+			(account_id, name, provider, endpoint, region, bucket, key_prefix, access_key_id, secret_access_key_enc, status, managed, verified_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'verified',true,now())
+		ON CONFLICT (account_id) WHERE managed DO NOTHING
+	`,
+		accountID, managedDestinationName, managedDestinationProvider,
+		s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket, keyPrefix, s.cfg.R2AccessKeyID, sealed,
+	); err != nil {
+		return 0, "", fmt.Errorf("insert managed destination: %w", err)
+	}
+	if err := s.pool.QueryRow(ctx, `
+		SELECT id FROM storage_destinations WHERE account_id=$1 AND managed
+	`, accountID).Scan(&destID); err != nil {
+		return 0, "", fmt.Errorf("read managed destination: %w", err)
+	}
+	return destID, keyPrefix, nil
 }
 
 // sanitizeStorageKeyPrefix normalizes a user-supplied object-key prefix and

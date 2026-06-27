@@ -38,7 +38,7 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	defer pool.Close()
 
 	// Billing gates capture on the billable predicate only when Stripe is wired.
-	billingEnabled := cfg.StripeSecretKey != "" && cfg.StripeWebhookSecret != "" && cfg.StripePriceID != ""
+	billingEnabled := cfg.StripeSecretKey != "" && cfg.StripeWebhookSecret != "" && cfg.StripePriceID != "" && cfg.StripeGBMonthPriceID != ""
 
 	const restartDelay = 3 * time.Second
 	var wg sync.WaitGroup
@@ -78,7 +78,7 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	// Gated on billingEnabled (same secret+webhook+price gate as capture), so free
 	// mode never charges. Runs under the same restart-with-backoff loop.
 	if billingEnabled {
-		reporter, err := billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.AppBaseURL, cfg.StripeLivemode)
+		reporter, err := billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.StripeGBMonthPriceID, cfg.AppBaseURL, cfg.StripeLivemode)
 		if err != nil {
 			log.Fatalf("init stripe billing client for metering: %v", err)
 		}
@@ -91,6 +91,23 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 		}()
 	} else {
 		log.Printf("recorder-control: billing disabled; usage metering not started.")
+	}
+
+	// Managed-storage retention/purge: deletes stopped-payers' managed R2 objects
+	// after the grace period. Gated on billing AND a valid operator R2 config (the
+	// same creds managed-provision seals into each managed destination row). Runs
+	// under the same restart-with-backoff loop. Never touches BYO objects.
+	if billingEnabled && cfg.ValidateR2() == nil {
+		purgeR2 := mustOperatorR2Client(ctx, cfg)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runWithBackoff(ctx, "managed storage purge", restartDelay, func(ctx context.Context) error {
+				return runManagedPurge(ctx, pool, purgeR2)
+			})
+		}()
+	} else {
+		log.Printf("recorder-control: managed-storage purge not started (billing disabled or operator R2 unconfigured).")
 	}
 
 	wg.Wait()

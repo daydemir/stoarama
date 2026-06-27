@@ -24,18 +24,25 @@ import (
 // recordingDayEventName is the meter's event_name (see the billing-setup meter).
 const recordingDayEventName = "recording_day"
 
+// gbMonthEventName is the managed-storage meter's event_name (a SECOND Billing
+// Meter, aggregation=SUM, value = average GB stored over the period).
+const gbMonthEventName = "gb_month"
+
 // Client wraps a per-instance Stripe API client (no global stripe.Key mutation)
-// plus the metered recording-day price id and the app base URL for redirects.
+// plus the metered recording-day price id, the metered gb-month (managed storage)
+// price id, and the app base URL for redirects.
 type Client struct {
-	sc         *client.API
-	priceID    string
-	appBaseURL string
-	livemode   bool
+	sc             *client.API
+	priceID        string
+	gbMonthPriceID string
+	appBaseURL     string
+	livemode       bool
 }
 
 // New builds a Stripe client bound to secretKey. priceID is the metered
-// recording-day price; appBaseURL is used for Checkout/Portal redirect URLs.
-func New(secretKey, priceID, appBaseURL string, livemode bool) (*Client, error) {
+// recording-day price; gbMonthPriceID is the metered managed-storage ($/GB-month)
+// price; appBaseURL is used for Checkout/Portal redirect URLs.
+func New(secretKey, priceID, gbMonthPriceID, appBaseURL string, livemode bool) (*Client, error) {
 	secretKey = strings.TrimSpace(secretKey)
 	if secretKey == "" {
 		return nil, fmt.Errorf("stripe secret key is required")
@@ -43,14 +50,18 @@ func New(secretKey, priceID, appBaseURL string, livemode bool) (*Client, error) 
 	if strings.TrimSpace(priceID) == "" {
 		return nil, fmt.Errorf("stripe price id is required")
 	}
+	if strings.TrimSpace(gbMonthPriceID) == "" {
+		return nil, fmt.Errorf("stripe gb-month price id is required")
+	}
 	if strings.TrimSpace(appBaseURL) == "" {
 		return nil, fmt.Errorf("app base url is required for stripe redirects")
 	}
 	return &Client{
-		sc:         client.New(secretKey, nil),
-		priceID:    strings.TrimSpace(priceID),
-		appBaseURL: strings.TrimRight(strings.TrimSpace(appBaseURL), "/"),
-		livemode:   livemode,
+		sc:             client.New(secretKey, nil),
+		priceID:        strings.TrimSpace(priceID),
+		gbMonthPriceID: strings.TrimSpace(gbMonthPriceID),
+		appBaseURL:     strings.TrimRight(strings.TrimSpace(appBaseURL), "/"),
+		livemode:       livemode,
 	}, nil
 }
 
@@ -105,7 +116,8 @@ func (c *Client) CreateCardOnFileCheckoutSession(ctx context.Context, customerID
 		SuccessURL:              strPtr(c.appBaseURL + "/recordings?billing=success"),
 		CancelURL:               strPtr(c.appBaseURL + "/recordings?billing=cancel"),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
-			{Price: strPtr(c.priceID)}, // no Quantity on a metered line
+			{Price: strPtr(c.priceID)},        // recording_day (no Quantity on a metered line)
+			{Price: strPtr(c.gbMonthPriceID)}, // gb_month managed storage (no Quantity)
 		},
 		SubscriptionData: &stripe.CheckoutSessionSubscriptionDataParams{
 			BillingMode: &stripe.CheckoutSessionSubscriptionDataBillingModeParams{
@@ -174,6 +186,78 @@ func (c *Client) ReportRecordingDays(ctx context.Context, customerID string, acc
 	ev.Context = ctx
 	if _, err := c.sc.BillingMeterEvents.New(ev); err != nil {
 		return fmt.Errorf("report recording days: %w", err)
+	}
+	return nil
+}
+
+// ReportGBMonth pushes one idempotent meter event recording the average GB of
+// managed storage for an account's billing period. It mirrors ReportRecordingDays
+// but targets the gb_month meter and sends a DECIMAL string value (e.g. "2.471"),
+// which the v1 Meter Events API accepts via the same payload "value" channel.
+//
+// Identifier is "<accountID>-gbm-<periodKey>": the distinct "-gbm-" namespace
+// guarantees it can never collide with the recording_day identifier
+// "<accountID>-<periodKey>", so the two meters dedup independently within Stripe's
+// rolling window. The customer is mapped via payload "stripe_customer_id".
+func (c *Client) ReportGBMonth(ctx context.Context, customerID string, accountID int64, periodKey, gbDecimal string) error {
+	if strings.TrimSpace(customerID) == "" {
+		return fmt.Errorf("customer id is required")
+	}
+	if strings.TrimSpace(periodKey) == "" {
+		return fmt.Errorf("period key is required")
+	}
+	if strings.TrimSpace(gbDecimal) == "" {
+		return fmt.Errorf("gb decimal value is required")
+	}
+	ev := &stripe.BillingMeterEventParams{
+		EventName:  strPtr(gbMonthEventName),
+		Identifier: strPtr(fmt.Sprintf("%d-gbm-%s", accountID, periodKey)),
+		Payload: map[string]string{
+			"stripe_customer_id": customerID,
+			"value":              gbDecimal,
+		},
+	}
+	ev.Context = ctx
+	if _, err := c.sc.BillingMeterEvents.New(ev); err != nil {
+		return fmt.Errorf("report gb-month: %w", err)
+	}
+	return nil
+}
+
+// EnsureGBMonthItem lazily adds the gb_month metered item to an EXISTING
+// subscription that predates managed storage (Option A backfill; no bulk
+// migration). It lists the subscription's items and, only if none already uses
+// gbMonthPriceID, creates one with no quantity (Stripe rejects a quantity on a
+// metered price). Idempotent: a re-run finds the item present and no-ops.
+//
+// Exported because the managed-provision path (server_storage.go) calls it
+// cross-package as s.billing.EnsureGBMonthItem the moment an account opts into
+// managed storage.
+func (c *Client) EnsureGBMonthItem(ctx context.Context, subscriptionID string) error {
+	if strings.TrimSpace(subscriptionID) == "" {
+		return fmt.Errorf("subscription id is required")
+	}
+	listParams := &stripe.SubscriptionItemListParams{
+		Subscription: strPtr(strings.TrimSpace(subscriptionID)),
+	}
+	listParams.Context = ctx
+	iter := c.sc.SubscriptionItems.List(listParams)
+	for iter.Next() {
+		item := iter.SubscriptionItem()
+		if item != nil && item.Price != nil && item.Price.ID == c.gbMonthPriceID {
+			return nil // already present; idempotent no-op.
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("list subscription items: %w", err)
+	}
+	params := &stripe.SubscriptionItemParams{
+		Subscription: strPtr(strings.TrimSpace(subscriptionID)),
+		Price:        strPtr(c.gbMonthPriceID), // no Quantity on a metered line
+	}
+	params.Context = ctx
+	if _, err := c.sc.SubscriptionItems.New(params); err != nil {
+		return fmt.Errorf("add gb-month subscription item: %w", err)
 	}
 	return nil
 }

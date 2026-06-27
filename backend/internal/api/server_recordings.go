@@ -54,7 +54,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
-			rec.created_at
+			rec.created_at, sd.managed
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		WHERE rec.account_id=$1 AND rec.status <> 'canceled'
@@ -308,7 +308,7 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
-			rec.created_at
+			rec.created_at, sd.managed
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
@@ -547,13 +547,14 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		hasPaymentMethod bool
 		recentClipCount  int64
 		createdAt        time.Time
+		managed          bool
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
 		&sourceKind, &cronExpr, &cronTimezone, &clipDurationSec,
 		&status, &startAt, &endAt, &nextFireAt, &lastClipAt,
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
-		&hasPaymentMethod, &recentClipCount, &createdAt,
+		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
 	); err != nil {
 		return nil, err
 	}
@@ -567,6 +568,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"stream_url":               streamURL,
 		"storage_destination_id":   storageDestID,
 		"storage_destination_name": storageDestName,
+		"storage_managed":          managed,
 		"source_kind":              sourceKind,
 		"cron_expr":                cronExpr,
 		"cron_timezone":            cronTimezone,

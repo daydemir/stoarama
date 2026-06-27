@@ -411,6 +411,13 @@
           <label>Where clips go</label>
           <!-- Connection state for the selected/connected bucket (gates Start) -->
           <div id="bucketState" class="status" style="margin-bottom:10px;">Not connected</div>
+          <!-- Storage chooser: managed (operator R2) vs BYO. Shown only when the
+               managed option is available per GET /billing; otherwise BYO only. -->
+          <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
+            <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10/GB-mo)</button>
+            <button type="button" data-storage="byo">Connect your own S3 bucket</button>
+          </div>
+          <div id="managedStatus" class="status hidden" style="margin-bottom:10px;"></div>
           <!-- Dropdown of saved buckets (shown when at least one verified bucket exists) -->
           <div id="destPicker" class="hidden">
             <select id="recDest"></select>
@@ -515,6 +522,8 @@
       clipCustomWrap: document.getElementById('clipCustomWrap'),
       clipCustom: document.getElementById('clipCustom'),
       bucketState: document.getElementById('bucketState'),
+      storageChooser: document.getElementById('storageChooser'),
+      managedStatus: document.getElementById('managedStatus'),
       destPicker: document.getElementById('destPicker'),
       recDest: document.getElementById('recDest'),
       connectAnotherBtn: document.getElementById('connectAnotherBtn'),
@@ -562,12 +571,16 @@
       billingEnabled: true,
       // Latest GET /billing payload (usage model): has_payment_method gates Start
       // and the read-only arrears estimate.
-      billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_days_this_month: 0, estimated_amount_cents: 0 },
+      billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_days_this_month: 0, estimated_amount_cents: 0, managed_available: false, storage_gb_month_avg: '0.000', estimated_storage_amount_cents: 0 },
       recordings: [],
       destinations: [],
       schedPreset: 'hourly',
       clipSelected: 60,
       verifiedDestId: 0, // a bucket just verified inline this session
+      // Storage choice when the chooser is shown: '' (none yet) | 'managed' | 'byo'.
+      storageChoice: '',
+      provisioningManaged: false,
+      destinationsLoaded: false,
       starting: false,
       // Bucket connection gate (change 1): 'idle' | 'checking' | 'connected' | 'error'.
       bucketState: 'idle',
@@ -801,6 +814,136 @@
       else setBucketState('idle');
     }
 
+    // ---- Storage chooser (managed vs BYO) ----
+
+    // Managed storage is offered only when GET /billing reports it available
+    // (billing on + operator R2 configured). Otherwise the chooser is hidden and
+    // only the BYO connect flow is shown.
+    function managedAvailable() {
+      const b = state.billing || {};
+      return state.billingEnabled && b.managed_available === true;
+    }
+
+    // The managed destination already saved for this account, if any (a verified
+    // storage_destinations row with managed=true).
+    function managedDest() {
+      return (state.destinations || []).find((d) => d.managed === true) || null;
+    }
+
+    // Render the chooser and switch which sub-UI (managed confirmation vs BYO
+    // form/picker) is visible. Called whenever destinations or billing change.
+    function renderStorageChooser() {
+      if (!managedAvailable()) {
+        // BYO-only: hide the chooser, let the BYO picker/form drive as before.
+        els.storageChooser.classList.add('hidden');
+        els.managedStatus.classList.add('hidden');
+        state.storageChoice = 'byo';
+        return;
+      }
+      els.storageChooser.classList.remove('hidden');
+      // Default to managed the first time, unless the user already connected a
+      // BYO bucket this session.
+      if (!state.storageChoice) state.storageChoice = managedDest() || state.destinations.length === 0 ? 'managed' : 'byo';
+      els.storageChooser.querySelectorAll('button[data-storage]').forEach((btn) => {
+        btn.classList.toggle('on', btn.getAttribute('data-storage') === state.storageChoice);
+      });
+      // When managed is the active choice but no managed row exists yet, provision
+      // it now so the Start gate is satisfied without an extra click. Idempotent
+      // server-side (ON CONFLICT), and chooseManaged guards re-entry.
+      if (state.destinationsLoaded && state.storageChoice === 'managed' && !managedDest()) { chooseManaged(); return; }
+      applyStorageChoiceUI();
+    }
+
+    // Show/hide the managed confirmation vs the BYO picker+form for the current
+    // choice, without re-provisioning.
+    function applyStorageChoiceUI() {
+      if (state.storageChoice === 'managed') {
+        // Managed: hide the BYO picker and connect form entirely.
+        els.destPicker.classList.add('hidden');
+        els.connectForm.classList.add('hidden');
+        const md = managedDest();
+        if (md) {
+          state.verifiedDestId = Number(md.id || 0);
+          els.managedStatus.classList.remove('hidden');
+          setStatus(els.managedStatus, 'Connected to Stoarama-managed storage. Clips are billed $0.10/GB-month.', 'ok');
+          setBucketState('connected');
+        } else {
+          els.managedStatus.classList.add('hidden');
+          setBucketState('idle');
+        }
+        startButtonLabel();
+        return;
+      }
+      // BYO: hide the managed note and restore the BYO picker/form.
+      els.managedStatus.classList.add('hidden');
+      renderByoStorageUI();
+      startButtonLabel();
+    }
+
+    // Restore the BYO destination picker or connect form (the pre-chooser default).
+    function renderByoStorageUI() {
+      const byo = (state.destinations || []).filter((d) => d.managed !== true);
+      if (byo.length === 0) {
+        els.recDest.innerHTML = '';
+        els.destPicker.classList.add('hidden');
+        openConnectForm('Connect your S3 bucket');
+        els.cnCancelBtn.classList.toggle('hidden', !managedAvailable());
+        syncBucketStateFromSelection();
+        return;
+      }
+      els.cnCancelBtn.classList.remove('hidden');
+      const prev = String(els.recDest.value || '');
+      els.recDest.innerHTML = byo.map((d) =>
+        `<option value="${Number(d.id)}">${escapeHTML(String(d.name || ''))} (${escapeHTML(String(d.bucket || ''))})</option>`
+      ).join('');
+      els.destPicker.classList.remove('hidden');
+      els.connectForm.classList.add('hidden');
+      const want = state.verifiedDestId > 0 ? String(state.verifiedDestId) : prev;
+      if (want && byo.some((d) => String(d.id) === want)) els.recDest.value = want;
+      syncBucketStateFromSelection();
+    }
+
+    // Provision (or reuse) the managed destination. POST {managed:true} returns the
+    // managed destination id; no keys are required and no connection check is run.
+    async function chooseManaged() {
+      state.storageChoice = 'managed';
+      els.storageChooser.querySelectorAll('button[data-storage]').forEach((btn) => {
+        btn.classList.toggle('on', btn.getAttribute('data-storage') === 'managed');
+      });
+      els.destPicker.classList.add('hidden');
+      els.connectForm.classList.add('hidden');
+      const existing = managedDest();
+      if (existing) { applyStorageChoiceUI(); return; }
+      if (state.provisioningManaged) return;
+      state.provisioningManaged = true;
+      els.managedStatus.classList.remove('hidden');
+      setStatus(els.managedStatus, 'Setting up Stoarama-managed storage...', '');
+      setBucketState('checking');
+      try {
+        const created = await fetchJSON('/api/v1/account/storage-destinations', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ managed: true }),
+        });
+        state.verifiedDestId = Number(created.id || 0);
+        await refreshDestinations();
+        applyStorageChoiceUI();
+      } catch (err) {
+        const msg = String(err.message || err);
+        setStatus(els.managedStatus, `Could not set up managed storage: ${msg}`, 'err');
+        setBucketState('error', `Not connected: ${msg}`);
+      } finally {
+        state.provisioningManaged = false;
+      }
+    }
+
+    function chooseByo() {
+      state.storageChoice = 'byo';
+      els.storageChooser.querySelectorAll('button[data-storage]').forEach((btn) => {
+        btn.classList.toggle('on', btn.getAttribute('data-storage') === 'byo');
+      });
+      applyStorageChoiceUI();
+    }
+
     // ---- Provider connect form ----
 
     function fillProviderSelect() {
@@ -857,6 +1000,7 @@
         });
         setStatus(els.cnStatus, 'Connected. Bucket saved.', 'ok');
         state.verifiedDestId = Number(created.id || 0);
+        state.storageChoice = 'byo';
         els.cnSecret.value = '';
         await refreshDestinations();
         closeConnectForm();
@@ -879,37 +1023,25 @@
         const payload = await fetchJSON('/api/v1/account/storage-destinations');
         const items = (Array.isArray(payload.items) ? payload.items : []).filter((d) => String(d.status) === 'verified');
         state.destinations = items;
+        state.destinationsLoaded = true;
         renderDestPicker();
       } catch (_) {
         state.destinations = [];
+        state.destinationsLoaded = true;
         renderDestPicker();
       }
     }
 
+    // The chooser (when managed is available) decides which sub-UI shows; the BYO
+    // picker/form is restored by renderByoStorageUI. When managed is unavailable,
+    // this falls back to the original BYO-only behavior.
     function renderDestPicker() {
-      const items = state.destinations;
-      if (items.length === 0) {
-        els.recDest.innerHTML = '';
-        els.destPicker.classList.add('hidden');
-        // No verified bucket: the connect form is the way to choose one.
-        openConnectForm('Connect your S3 bucket');
-        els.cnCancelBtn.classList.add('hidden');
-        syncBucketStateFromSelection();
-        return;
-      }
-      els.cnCancelBtn.classList.remove('hidden');
-      const prev = String(els.recDest.value || '');
-      els.recDest.innerHTML = items.map((d) =>
-        `<option value="${Number(d.id)}">${escapeHTML(String(d.name || ''))} (${escapeHTML(String(d.bucket || ''))})</option>`
-      ).join('');
-      els.destPicker.classList.remove('hidden');
-      const want = state.verifiedDestId > 0 ? String(state.verifiedDestId) : prev;
-      if (want && items.some((d) => String(d.id) === want)) els.recDest.value = want;
-      // A verified bucket selected in the dropdown counts as Connected.
-      syncBucketStateFromSelection();
+      renderStorageChooser();
     }
 
     function selectedDestId() {
+      // Managed: the picker is hidden; the verified managed dest id is authoritative.
+      if (state.storageChoice === 'managed') return Number(state.verifiedDestId || 0);
       if (!els.destPicker.classList.contains('hidden')) return Number(els.recDest.value || 0);
       return 0;
     }
@@ -1099,10 +1231,20 @@
     function renderLedger() {
       const b = state.billing || {};
       if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
+      const lines = [];
       const days = Number(b.recording_days_this_month || 0);
-      if (days < 1) { els.ledger.classList.add('hidden'); return; }
-      const noun = days === 1 ? 'recording-day' : 'recording-days';
-      els.ledger.innerHTML = `<b>${days} ${noun} this month</b> &middot; est. $${formatUSD(b.estimated_amount_cents)}`;
+      if (days >= 1) {
+        const noun = days === 1 ? 'recording-day' : 'recording-days';
+        lines.push(`<b>${days} ${noun} this month</b> &middot; est. $${formatUSD(b.estimated_amount_cents)}`);
+      }
+      // Managed storage line: month-to-date average GB-month from /billing. Hidden
+      // when the account has no managed data (avg = 0).
+      const gb = Number(b.storage_gb_month_avg || 0);
+      if (gb > 0) {
+        lines.push(`<b>${gb.toFixed(3)} GB-month storage</b> &middot; est. $${formatUSD(b.estimated_storage_amount_cents)}`);
+      }
+      if (lines.length === 0) { els.ledger.classList.add('hidden'); return; }
+      els.ledger.innerHTML = lines.join('<br/>');
       els.ledger.classList.remove('hidden');
     }
 
@@ -1374,11 +1516,16 @@
 
     function startButtonLabel() {
       const needsCard = state.billingEnabled && state.billing.has_payment_method !== true;
+      const managed = state.storageChoice === 'managed';
       els.startBtn.textContent = needsCard ? 'Add a card to start recording' : 'Start recording';
+      const daysCharge = '$0.50 for each day a recording captures';
+      const storageCharge = ', plus $0.10/GB-month for managed storage';
       els.composerFootnote.textContent = state.billingEnabled
         ? (needsCard
-            ? 'Add a card to start recording. No charge now; you are billed $0.50 for each day a recording captures, monthly.'
-            : '$0.50/day, billed monthly for days you record.')
+            ? `Add a card to start recording. No charge now; you are billed ${daysCharge}${managed ? storageCharge : ''}, monthly.`
+            : (managed
+                ? '$0.50/day for days you record, plus $0.10/GB-month for managed storage, billed monthly.'
+                : '$0.50/day, billed monthly for days you record.'))
         : '';
       els.composerFootnote.classList.toggle('hidden', !state.billingEnabled);
     }
@@ -1512,6 +1659,7 @@
       }
       renderLedger();
       renderCardBanner();
+      renderStorageChooser();
       startButtonLabel();
     }
 
@@ -1557,7 +1705,13 @@
     els.cnTestBtn.addEventListener('click', testConnection);
     els.cnCancelBtn.addEventListener('click', () => {
       closeConnectForm();
-      if (state.destinations.length > 0) els.destPicker.classList.remove('hidden');
+      renderByoStorageUI();
+    });
+    els.storageChooser.querySelectorAll('button[data-storage]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (btn.getAttribute('data-storage') === 'managed') chooseManaged();
+        else chooseByo();
+      });
     });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => openComposer(false));

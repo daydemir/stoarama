@@ -67,11 +67,13 @@ type Config struct {
 	RecSchedMaxJobsPerTick int
 
 	// Standalone stream recorder: Stripe billing (set on stoarama-api; nil/empty disables).
-	StripeSecretKey     string
-	StripeWebhookSecret string
-	StripePriceID       string
-	StripeMeterID       string
-	StripeLivemode      bool
+	StripeSecretKey      string
+	StripeWebhookSecret  string
+	StripePriceID        string
+	StripeMeterID        string
+	StripeGBMonthPriceID string // env STRIPE_GB_MONTH_PRICE_ID
+	StripeGBMonthMeterID string // env STRIPE_GB_MONTH_METER_ID (parsed for symmetry; unused like StripeMeterID)
+	StripeLivemode       bool
 
 	// Standalone stream recorder: worker (consumed on the recorder droplet/node).
 	RecordingWorkerConcurrency  int
@@ -164,11 +166,13 @@ func Load() (Config, error) {
 		RecSchedMinIntervalSec: intEnv("REC_SCHED_MIN_INTERVAL_SEC", 600),
 		RecSchedMaxJobsPerTick: intEnv("REC_SCHED_MAX_JOBS_PER_TICK", 500),
 
-		StripeSecretKey:     strings.TrimSpace(os.Getenv("STRIPE_SECRET_KEY")),
-		StripeWebhookSecret: strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
-		StripePriceID:       strings.TrimSpace(os.Getenv("STRIPE_PRICE_ID")),
-		StripeMeterID:       strings.TrimSpace(os.Getenv("STRIPE_METER_ID")),
-		StripeLivemode:      boolEnv("STRIPE_LIVEMODE", false),
+		StripeSecretKey:      strings.TrimSpace(os.Getenv("STRIPE_SECRET_KEY")),
+		StripeWebhookSecret:  strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
+		StripePriceID:        strings.TrimSpace(os.Getenv("STRIPE_PRICE_ID")),
+		StripeMeterID:        strings.TrimSpace(os.Getenv("STRIPE_METER_ID")),
+		StripeGBMonthPriceID: strings.TrimSpace(os.Getenv("STRIPE_GB_MONTH_PRICE_ID")),
+		StripeGBMonthMeterID: strings.TrimSpace(os.Getenv("STRIPE_GB_MONTH_METER_ID")),
+		StripeLivemode:       boolEnv("STRIPE_LIVEMODE", false),
 
 		RecordingWorkerConcurrency:  intEnv("RECORDING_WORKER_CONCURRENCY", 1),
 		RecordingWorkerHeartbeatSec: intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),

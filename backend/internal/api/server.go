@@ -160,8 +160,8 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		}
 		s.secrets = cipher
 	}
-	if strings.TrimSpace(cfg.StripeSecretKey) != "" && strings.TrimSpace(cfg.StripeWebhookSecret) != "" && strings.TrimSpace(cfg.StripePriceID) != "" {
-		bc, err := billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.AppBaseURL, cfg.StripeLivemode)
+	if strings.TrimSpace(cfg.StripeSecretKey) != "" && strings.TrimSpace(cfg.StripeWebhookSecret) != "" && strings.TrimSpace(cfg.StripePriceID) != "" && strings.TrimSpace(cfg.StripeGBMonthPriceID) != "" {
+		bc, err := billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.StripeGBMonthPriceID, cfg.AppBaseURL, cfg.StripeLivemode)
 		if err != nil {
 			return nil, fmt.Errorf("init stripe billing client: %w", err)
 		}
