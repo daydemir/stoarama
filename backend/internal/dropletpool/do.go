@@ -386,9 +386,14 @@ runcmd:
     # binary baked into the image, so pushed worker changes ship on the next
     # droplet without a snapshot rebake. A rebaked image whose .sha matches HEAD
     # skips the build for a fast (~1-2 min) boot; the build uses the image's warm
-    # Go cache so an incremental rebuild is seconds. A build failure exits non-zero
-    # so provisioning fails fast rather than running a stale binary.
+    # Go module + build caches under /root. A build failure exits non-zero so
+    # provisioning fails fast rather than running a stale binary. cloud-init runcmd
+    # has no HOME/PATH for the Go 1.24 toolchain or its caches, so set them here.
     set -e
+    export HOME=/root
+    export PATH=/usr/local/go/bin:$PATH
+    export GOPATH=/root/go
+    export GOCACHE=/root/.cache/go-build
     HEAD_SHA="$(git -C /opt/stoarama rev-parse HEAD)"
     BUILT_SHA="$(cat /opt/stoarama/bin/.stoaramactl.sha 2>/dev/null || true)"
     if [ ! -x /opt/stoarama/bin/stoaramactl ] || [ "$HEAD_SHA" != "$BUILT_SHA" ]; then
