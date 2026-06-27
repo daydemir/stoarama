@@ -256,6 +256,10 @@
     @media (max-width: 640px) {
       .grid-2 { grid-template-columns: 1fr; }
       .card-head { flex-direction: column; }
+      /* Long storage-chooser labels can't shrink (flex 0 0 auto); stack them full
+         width with wrapping text so they don't force horizontal overflow. */
+      #storageChooser { flex-direction: column; }
+      #storageChooser button { width: 100%; white-space: normal; }
     }
   </style>
 </head>
