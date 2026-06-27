@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/netguard"
 )
 
 // ResolveCaptureInput converts provider/page URLs into a direct capture input URL.
@@ -113,16 +116,51 @@ func ytDLPResolveArgs(watchURL string) []string {
 	return append(args, watchURL)
 }
 
+// resolveValidateURL and resolveDialControl are the SSRF guards applied to the
+// indirect-resolve fetch (host pre-check, per-redirect re-check, and a dialer
+// Control that rejects any private/metadata socket address). They are package
+// vars so same-package tests can point them at a loopback test server;
+// production always uses the netguard implementations.
+var (
+	resolveValidateURL = netguard.ValidatePublicURL
+	resolveDialControl = netguard.ControlReject
+)
+
 func resolveIndirectURL(ctx context.Context, rawURL string, timeout time.Duration) (string, bool, error) {
 	if timeout <= 0 {
 		timeout = 20 * time.Second
+	}
+	// SSRF: rawURL is user-supplied (recorder), so validate its host before the
+	// fetch, and guard every redirect hop + the actual socket dial against
+	// private/metadata/RFC1918 addresses (a 302 to 169.254.169.254 or a DNS
+	// rebind would otherwise be followed and its body returned).
+	if _, err := resolveValidateURL(rawURL); err != nil {
+		return "", false, fmt.Errorf("resolve target rejected: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", false, fmt.Errorf("build resolve request: %w", err)
 	}
 	req.Header.Set("User-Agent", "stoarama-capture/1.0")
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control:   resolveDialControl,
+			}).DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects resolving stream reference")
+			}
+			if _, err := resolveValidateURL(req.URL.String()); err != nil {
+				return fmt.Errorf("redirect target rejected: %w", err)
+			}
+			return nil
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", false, fmt.Errorf("resolve request failed: %w", err)

@@ -117,3 +117,33 @@ func TestIsPublicIP_RebindingContract(t *testing.T) {
 		}
 	}
 }
+
+func TestControlReject(t *testing.T) {
+	allowed := []string{"8.8.8.8:443", "1.1.1.1:80", "[2606:4700:4700::1111]:443"}
+	for _, addr := range allowed {
+		if err := ControlReject("tcp", addr, nil); err != nil {
+			t.Fatalf("ControlReject(%q) = %v, want nil (public)", addr, err)
+		}
+	}
+	rejected := []string{
+		"127.0.0.1:80",
+		"169.254.169.254:80",
+		"10.0.0.5:443",
+		"192.168.1.1:443",
+		"172.16.0.1:443",
+		"100.64.0.1:443",
+		"[::1]:443",
+		"[fc00::1]:443",
+		"[fe80::1]:443",
+	}
+	for _, addr := range rejected {
+		if err := ControlReject("tcp", addr, nil); err == nil {
+			t.Fatalf("ControlReject(%q) = nil, want error (non-public)", addr)
+		}
+	}
+	// A non-IP-literal dial address (DNS name) must be rejected: the dialer
+	// passes a resolved IP:port, so a hostname here is unexpected.
+	if err := ControlReject("tcp", "example.com:443", nil); err == nil {
+		t.Fatal("ControlReject with a hostname should error")
+	}
+}

@@ -2,11 +2,15 @@ package capture
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/netguard"
 )
 
 func TestFrameStallTimeout(t *testing.T) {
@@ -151,7 +155,16 @@ func TestFFmpegDirectResolveAcceptsVideoURLs(t *testing.T) {
 }
 
 func TestHLSResolveFollowsIndirectBodyAndRedirectToM3U8(t *testing.T) {
-	t.Parallel()
+	// Not parallel: this overrides the package SSRF guards so the loopback
+	// httptest server is reachable, then restores them via t.Cleanup before any
+	// parallel test resumes. The guards are exercised against loopback in
+	// TestHLSResolveRejectsLoopbackIndirect.
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -180,5 +193,28 @@ func TestHLSResolveFollowsIndirectBodyAndRedirectToM3U8(t *testing.T) {
 	}
 	if src.URL != server.URL+"/manifest.m3u8" {
 		t.Fatalf("url=%q want %q", src.URL, server.URL+"/manifest.m3u8")
+	}
+}
+
+// TestHLSResolveRejectsLoopbackIndirect proves the SSRF guard rejects an indirect
+// '!hls' reference whose host is loopback before any fetch happens (the recorder
+// resolves user-supplied references, so this guard prevents pointing the resolve
+// fetch at metadata/RFC1918/loopback). Runs with the production guards.
+func TestHLSResolveRejectsLoopbackIndirect(t *testing.T) {
+	t.Parallel()
+
+	hit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		_, _ = w.Write([]byte("https://example.com/x.m3u8\n"))
+	}))
+	defer server.Close()
+
+	a := &hlsLiveAdapter{}
+	if _, err := a.Resolve(context.Background(), StreamSpec{StreamURL: server.URL + "/indirect!hls"}); err == nil {
+		t.Fatal("expected resolve to be rejected for a loopback indirect reference")
+	}
+	if hit {
+		t.Fatal("guard should reject before the fetch reaches the loopback server")
 	}
 }

@@ -21,6 +21,11 @@ import (
 // recordingProbeTimeout bounds the create-time ffmpeg reachability probe.
 const recordingProbeTimeout = 8 * time.Second
 
+// recordingResolveTimeout bounds the create/probe-time stream reference
+// resolution (an HTTP fetch for indirect '!hls' sources; a passthrough for
+// direct .m3u8).
+const recordingResolveTimeout = 30 * time.Second
+
 type recordingProbeRequest struct {
 	StreamURL string `json:"stream_url"`
 }
@@ -137,9 +142,19 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		endAtArg = endAt
 	}
 
-	// S-1: SSRF guard + HLS/HTTPS classify on the user-supplied URL before it ever
+	// Resolve the pasted reference (e.g. a KBS '!hls' indirect URL) to the live
+	// playable URL before validating/probing, so a reference ffmpeg cannot open
+	// directly can still be scheduled. The raw reference is what gets stored
+	// (below); the worker re-resolves it fresh on every capture.
+	resolvedForProbe, err := resolveRecordingStreamURL(r.Context(), streamURL)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// S-1: SSRF guard + HLS/HTTPS classify on the resolved URL before it ever
 	// reaches ffmpeg. This is the validate half of the shared validate+probe path.
-	validatedIP, sourceKind, err := validateRecordingStreamURL(streamURL)
+	validatedIP, sourceKind, err := validateRecordingStreamURL(resolvedForProbe)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -171,7 +186,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 
 	// Reachability probe pinned to the validated IP, so the probe socket cannot
 	// be redirected by a DNS rebind between validation above and connect time.
-	if err := probeRecordingStreamReachable(r.Context(), streamURL, validatedIP); err != nil {
+	if err := probeRecordingStreamReachable(r.Context(), resolvedForProbe, validatedIP); err != nil {
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream not reachable: %v", err))
 		return
 	}
@@ -276,16 +291,21 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	validatedIP, sourceKind, err := validateRecordingStreamURL(streamURL)
+	resolved, err := resolveRecordingStreamURL(r.Context(), streamURL)
 	if err != nil {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	if err := probeRecordingStreamReachable(r.Context(), streamURL, validatedIP); err != nil {
+	validatedIP, sourceKind, err := validateRecordingStreamURL(resolved)
+	if err != nil {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if err := probeRecordingStreamReachable(r.Context(), resolved, validatedIP); err != nil {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf("stream not reachable: %v", err)})
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "source_kind": sourceKind})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "source_kind": sourceKind, "resolved_url": resolved})
 }
 
 func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Request) {
@@ -518,6 +538,26 @@ func probeRecordingStreamReachable(ctx context.Context, streamURL string, valida
 	probeCtx, cancel := context.WithTimeout(ctx, recordingProbeTimeout)
 	defer cancel()
 	return capture.ProbeReachable(probeCtx, pinnedProbeURL, probeHost)
+}
+
+// resolveRecordingStreamURL resolves a pasted stream reference (e.g. a KBS '!hls'
+// indirect URL) to the live playable URL so validation and the reachability probe
+// run on the actual stream, and the composer previews the real stream. A direct
+// .m3u8 passes through unchanged. The resolve fetch is SSRF-guarded inside
+// capture.ResolveCaptureInput. Image sources are rejected (the recorder is
+// video-only). The stored reference is left untouched; the worker re-resolves it
+// fresh on every capture so expiring tokens never break a schedule.
+func resolveRecordingStreamURL(ctx context.Context, streamURL string) (string, error) {
+	resolveCtx, cancel := context.WithTimeout(ctx, recordingResolveTimeout)
+	defer cancel()
+	resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", streamURL, "")
+	if err != nil {
+		return "", fmt.Errorf("could not resolve stream reference: %w", err)
+	}
+	if isImage {
+		return "", fmt.Errorf("image sources are not supported for recording")
+	}
+	return resolved, nil
 }
 
 // scanRecordingListRow scans one row of the list/get SELECT into the API payload.

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"syscall"
 )
 
 // ValidatePublicURL parses rawURL, requires an http/https scheme with no
@@ -118,4 +119,24 @@ func isPublicIP(ip net.IP) bool {
 		return false
 	}
 	return true
+}
+
+// ControlReject is a net.Dialer.Control hook that rejects any dial to a
+// non-public IP (loopback/link-local/metadata/RFC1918/CGNAT/ULA/multicast). It
+// runs after DNS resolution on the concrete socket address, so installed on a
+// Transport.DialContext it guards redirect targets and DNS-rebinding for any
+// http.Client that follows redirects against a user-supplied URL.
+func ControlReject(network, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("netguard: parse dial address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("netguard: dial address %q is not an IP literal", host)
+	}
+	if !isPublicIP(ip) {
+		return fmt.Errorf("netguard: refusing to dial disallowed address %s", ip)
+	}
+	return nil
 }

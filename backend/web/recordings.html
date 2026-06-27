@@ -1144,7 +1144,10 @@
         if (out && out.ok === true) {
           state.streamProbe = { token, ok: true };
           setStatus(els.streamStatus, 'Valid', 'ok');
-          mountPreview(url, token);
+          // Preview the resolved playable stream (e.g. a KBS '!hls' reference
+          // resolves to a tokenized .m3u8 the browser can actually play); a
+          // direct .m3u8 resolves to itself.
+          mountPreview((out && out.resolved_url) || url, token);
         } else {
           state.streamProbe = { token, ok: false };
           setStatus(els.streamStatus, `Invalid: ${String((out && out.error) || 'stream could not be validated')}`, 'err');

@@ -382,11 +382,18 @@ runcmd:
       git -C /opt/stoarama reset --hard origin/{{.RepoRef}}
     fi
   - |
-    # Prefer a prebuilt binary baked into the image ($0 idle, ~1-2 min boot). Build
-    # the compiled binary once only if the image did not ship one; the worker always
-    # execs the compiled binary, never an interpreted per-fire invocation.
-    if [ ! -x /opt/stoarama/bin/stoaramactl ]; then
+    # Build the worker binary when the freshly-reset source has moved past the
+    # binary baked into the image, so pushed worker changes ship on the next
+    # droplet without a snapshot rebake. A rebaked image whose .sha matches HEAD
+    # skips the build for a fast (~1-2 min) boot; the build uses the image's warm
+    # Go cache so an incremental rebuild is seconds. A build failure exits non-zero
+    # so provisioning fails fast rather than running a stale binary.
+    set -e
+    HEAD_SHA="$(git -C /opt/stoarama rev-parse HEAD)"
+    BUILT_SHA="$(cat /opt/stoarama/bin/.stoaramactl.sha 2>/dev/null || true)"
+    if [ ! -x /opt/stoarama/bin/stoaramactl ] || [ "$HEAD_SHA" != "$BUILT_SHA" ]; then
       (cd /opt/stoarama/backend && go build -o bin/stoaramactl ./cmd/stoaramactl)
+      printf '%s' "$HEAD_SHA" > /opt/stoarama/bin/.stoaramactl.sha
     fi
   - chmod +x /opt/stoarama/backend/scripts/start-recording-worker.sh
   - systemctl daemon-reload

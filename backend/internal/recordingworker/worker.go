@@ -144,15 +144,31 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 
 	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID)
 
-	// S-1: re-resolve and re-check the URL right before ffmpeg, then pin the
-	// connection to the validated IP so a DNS rebind cannot point ffmpeg's
-	// socket at a private/metadata address between this check and connect time.
-	validatedIP, err := netguard.ValidatePublicURL(job.SourceURL)
+	// Resolve the stored reference (e.g. a KBS '!hls' indirect URL) to a live
+	// playable URL fresh on every capture, so an expiring token (the KBS Wowza
+	// m3u8 token rolls every 24h) never breaks a schedule. A direct .m3u8 passes
+	// through unchanged. The resolve fetch is SSRF-guarded inside ResolveCaptureInput.
+	resolveCtx, resolveCancel := context.WithTimeout(jobCtx, 30*time.Second)
+	sourceURL, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", job.SourceURL, "")
+	resolveCancel()
+	if err != nil {
+		w.fail(ctx, job.JobID, fmt.Errorf("resolve source url: %w", err))
+		return
+	}
+	if isImage {
+		w.fail(ctx, job.JobID, fmt.Errorf("image sources are not supported by the recorder"))
+		return
+	}
+
+	// S-1: re-check the resolved URL right before ffmpeg, then pin the connection
+	// to the validated IP so a DNS rebind cannot point ffmpeg's socket at a
+	// private/metadata address between this check and connect time.
+	validatedIP, err := netguard.ValidatePublicURL(sourceURL)
 	if err != nil {
 		w.fail(ctx, job.JobID, fmt.Errorf("ssrf guard rejected source url: %w", err))
 		return
 	}
-	pinnedURL, pinHost, err := netguard.PinnedURL(job.SourceURL, validatedIP)
+	pinnedURL, pinHost, err := netguard.PinnedURL(sourceURL, validatedIP)
 	if err != nil {
 		w.fail(ctx, job.JobID, fmt.Errorf("pin source url to validated ip: %w", err))
 		return
@@ -197,7 +213,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 		AudioPresent: seg.AudioPresent,
 		ActualFPS:    seg.ActualFPS,
 		Container:    seg.Container,
-		ResolvedURL:  job.SourceURL,
+		ResolvedURL:  sourceURL,
 		ClipStartAt:  seg.StartAt,
 		ClipEndAt:    seg.EndAt,
 	}); err != nil {
