@@ -16,6 +16,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
 // runRecorderControl is the entrypoint for the dedicated single-instance control
@@ -110,7 +111,41 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 		log.Printf("recorder-control: managed-storage purge not started (billing disabled or operator R2 unconfigured).")
 	}
 
+	// Clip transfer: async "send my recorded clip to my own S3 bucket". A
+	// background COPY (streamed GET source -> PUT target) leased from
+	// clip_transfer_jobs. It needs the storage credential cipher to decrypt both
+	// the source and target destination secrets; if STORAGE_CRED_KEY is unset the
+	// loop logs one warning and idles (runClipTransfer handles the nil cipher), so
+	// the control process never crashes for lack of a key. Runs under the same
+	// restart-with-backoff loop.
+	transferCipher := mustBuildStorageCipher(cfg)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runWithBackoff(ctx, "clip transfer", restartDelay, func(ctx context.Context) error {
+			return runClipTransfer(ctx, pool, transferCipher)
+		})
+	}()
+
 	wg.Wait()
+}
+
+// mustBuildStorageCipher builds the storage credential cipher (AES-256-GCM) from
+// STORAGE_CRED_KEY, mirroring how the API server constructs s.secrets. An unset
+// key returns nil (not a fatal error): the clip-transfer worker treats a nil
+// cipher as "idle", since it cannot decrypt any destination secret. A present
+// but invalid key is fatal, because it means a misconfiguration the operator
+// must fix.
+func mustBuildStorageCipher(cfg config.Config) *secretbox.Cipher {
+	key := strings.TrimSpace(cfg.StorageCredKey)
+	if key == "" {
+		return nil
+	}
+	cipher, err := secretbox.NewFromBase64Key(key)
+	if err != nil {
+		log.Fatalf("init storage credential cipher: %v", err)
+	}
+	return cipher
 }
 
 // mustBuildDropletPool validates the pool config, resolves the operator account

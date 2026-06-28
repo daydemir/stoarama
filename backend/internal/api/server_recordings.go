@@ -416,7 +416,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	}
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, object_key, purged_at
+		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, object_key, storage_destination_id, purged_at
 		FROM recording_clips
 		WHERE recording_id=$1
 		ORDER BY fire_at DESC
@@ -430,28 +430,30 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	items := make([]map[string]any, 0, 16)
 	for rows.Next() {
 		var (
-			clipID      int64
-			fireAt      time.Time
-			clipStartAt time.Time
-			clipEndAt   time.Time
-			sizeBytes   int64
-			durationMs  int64
-			objectKey   string
-			purgedAt    *time.Time
+			clipID       int64
+			fireAt       time.Time
+			clipStartAt  time.Time
+			clipEndAt    time.Time
+			sizeBytes    int64
+			durationMs   int64
+			objectKey    string
+			sourceDestID int64
+			purgedAt     *time.Time
 		)
-		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &objectKey, &purgedAt); err != nil {
+		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &objectKey, &sourceDestID, &purgedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
 			return
 		}
 		items = append(items, map[string]any{
-			"id":            clipID,
-			"fire_at":       fireAt.UTC(),
-			"clip_start_at": clipStartAt.UTC(),
-			"clip_end_at":   clipEndAt.UTC(),
-			"size_bytes":    sizeBytes,
-			"duration_ms":   durationMs,
-			"object_key":    objectKey,
-			"purged":        purgedAt != nil,
+			"id":                     clipID,
+			"fire_at":                fireAt.UTC(),
+			"clip_start_at":          clipStartAt.UTC(),
+			"clip_end_at":            clipEndAt.UTC(),
+			"size_bytes":             sizeBytes,
+			"duration_ms":            durationMs,
+			"object_key":             objectKey,
+			"storage_destination_id": sourceDestID,
+			"purged":                 purgedAt != nil,
 		})
 	}
 	if err := rows.Err(); err != nil {

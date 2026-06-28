@@ -222,6 +222,14 @@
     .clip-bulk { margin: 12px 0 8px; }
     .clip-bulk button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
     .clip-actions-note { margin-top: 12px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 10px; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    .clip-xfer { margin: 4px 0 8px; padding: 8px 10px; border-left: 2px solid var(--border); font-size: 12px; }
+    .clip-xfer-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .clip-xfer-row select { width: auto; min-width: 140px; min-height: 28px; padding: 4px 8px; font-size: 12px; }
+    .clip-xfer-row button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
+    .clip-xfer-note { color: var(--muted); }
+    .clip-xfer-status { color: var(--muted); padding: 2px 0; }
+    .clip-xfer-status.status-done b { color: var(--ok, #2e7d32); }
+    .clip-xfer-status.status-error b { color: var(--err); }
     /* Per-card blocking "no card" state */
     .card-blocked { margin-top: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 13px; color: var(--text); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
     .card-blocked b { color: var(--warn); }
@@ -1555,27 +1563,40 @@
       const bulk = liveCount > 0
         ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
         : '';
+      // Eligible transfer targets are this account's verified destinations other
+      // than the clip's own source destination (a copy onto itself is rejected by
+      // the API anyway). state.destinations is loaded at init.
       const rows = items.map((c) => {
         const cid = Number(c.id);
         const purged = c.purged === true;
+        const sourceDestId = Number(c.storage_destination_id || 0);
+        const targets = (state.destinations || []).filter((d) => Number(d.id) !== sourceDestId);
+        const transferBtn = (!purged && targets.length > 0)
+          ? `<button type="button" class="secondary" data-cliptransfer="${recId}:${cid}:${sourceDestId}">Send to my S3</button>`
+          : '';
         const actions = purged
           ? `<span>deleted</span>`
           : `<div class="clip-row-actions">`
             + `<button type="button" class="secondary" data-clipdownload="${recId}:${cid}">Download</button>`
+            + transferBtn
             + `<button type="button" class="danger" data-clipdelete="${recId}:${cid}">Delete</button>`
             + `</div>`;
         return `
-        <div class="clip-row${purged ? ' purged' : ''}">
+        <div class="clip-row${purged ? ' purged' : ''}" data-cliprow="${cid}">
           <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
           <span>${escapeHTML(formatDuration(c.duration_ms))}</span>
           <span>${escapeHTML(formatBytes(c.size_bytes))}</span>
           ${actions}
-        </div>`;
+        </div>
+        <div class="clip-xfer hidden" data-clipxfer="${cid}"></div>`;
       }).join('');
-      // "Send to my S3" / transfer is a labeled placeholder wired in a later increment.
-      const placeholder = `<div class="clip-actions-note">Send to my S3 (transfer to another bucket) is coming in a later phase.</div>`;
-      panel.innerHTML = summary + bulk + `<div class="clip-list">${rows}</div>` + placeholder;
+      const eligibleTargets = (state.destinations || []).length;
+      const note = eligibleTargets > 0
+        ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
+        : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="#" data-connectbucket="1">connect a bucket first</a>.</div>`;
+      panel.innerHTML = summary + bulk + `<div class="clip-list">${rows}</div>` + note;
       wireClipActions(panel);
+      void reloadTransfers(panel, recId);
     }
 
     function wireClipActions(panel) {
@@ -1585,6 +1606,109 @@
         b.addEventListener('click', () => deleteClip(panel, b.getAttribute('data-clipdelete'))));
       panel.querySelectorAll('button[data-clipsdeleteall]').forEach((b) =>
         b.addEventListener('click', () => deleteAllClips(panel, b.getAttribute('data-clipsdeleteall'))));
+      panel.querySelectorAll('button[data-cliptransfer]').forEach((b) =>
+        b.addEventListener('click', () => openClipTransfer(panel, b.getAttribute('data-cliptransfer'))));
+      panel.querySelectorAll('a[data-connectbucket]').forEach((a) =>
+        a.addEventListener('click', (ev) => { ev.preventDefault(); openComposer(false); }));
+    }
+
+    // Open the inline "Send to my S3" target picker under a clip row. Targets are
+    // the account's verified destinations other than the clip's own source.
+    function openClipTransfer(panel, ref) {
+      const [recId, clipId, sourceDestId] = String(ref || '').split(':');
+      const cid = Number(clipId);
+      const box = panel.querySelector(`[data-clipxfer="${cid}"]`);
+      if (!box) return;
+      if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
+      const targets = (state.destinations || []).filter((d) => Number(d.id) !== Number(sourceDestId));
+      if (targets.length === 0) {
+        box.innerHTML = `<div class="clip-xfer-note">No other bucket to copy to. <a href="#" data-connectbucket="1">Connect a bucket first</a>.</div>`;
+        box.querySelectorAll('a[data-connectbucket]').forEach((a) =>
+          a.addEventListener('click', (ev) => { ev.preventDefault(); openComposer(false); }));
+        box.classList.remove('hidden');
+        return;
+      }
+      const opts = targets.map((d) => `<option value="${Number(d.id)}">${escapeHTML(d.name || ('bucket #' + d.id))}</option>`).join('');
+      box.innerHTML = `
+        <div class="clip-xfer-row">
+          <select data-xfertarget="${cid}">${opts}</select>
+          <button type="button" class="secondary" data-xfersend="${recId}:${cid}">Send</button>
+        </div>`;
+      box.querySelector(`button[data-xfersend]`).addEventListener('click', () => sendClipTransfer(panel, recId, cid));
+      box.classList.remove('hidden');
+    }
+
+    async function sendClipTransfer(panel, recId, clipId) {
+      const box = panel.querySelector(`[data-clipxfer="${clipId}"]`);
+      if (!box) return;
+      const sel = box.querySelector(`select[data-xfertarget="${clipId}"]`);
+      const targetId = Number(sel && sel.value);
+      if (!targetId) return;
+      const btn = box.querySelector('button[data-xfersend]');
+      if (btn) { btn.disabled = true; btn.textContent = 'Sending...'; }
+      try {
+        await fetchJSON(
+          `/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/transfer`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target_storage_destination_id: targetId }) },
+        );
+        box.classList.add('hidden');
+        await reloadTransfers(panel, recId);
+        scheduleTransferPoll(panel, recId);
+      } catch (err) {
+        if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
+        window.alert(String(err.message || err));
+      }
+    }
+
+    // Fetch and render the recording's transfer jobs, grouped under each clip row.
+    async function reloadTransfers(panel, recId) {
+      let items = [];
+      try {
+        const payload = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/transfers`);
+        items = Array.isArray(payload.items) ? payload.items : [];
+      } catch (_) {
+        return; // transient; leave existing UI as-is
+      }
+      const byClip = new Map();
+      for (const t of items) {
+        const k = Number(t.recording_clip_id);
+        if (!byClip.has(k)) byClip.set(k, []);
+        byClip.get(k).push(t);
+      }
+      panel.querySelectorAll('[data-clipxfer]').forEach((box) => {
+        const cid = Number(box.getAttribute('data-clipxfer'));
+        const jobs = byClip.get(cid);
+        // Don't clobber an open target picker (it has a select); only render status
+        // when the box is either hidden or already showing status.
+        if (box.querySelector('select')) return;
+        if (!jobs || jobs.length === 0) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+        box.innerHTML = jobs.map(transferStatusLine).join('');
+        box.classList.remove('hidden');
+      });
+    }
+
+    function transferStatusLine(t) {
+      const name = escapeHTML(t.target_name || ('bucket #' + t.target_storage_destination_id));
+      const status = String(t.status || '');
+      let detail = '';
+      if (status === 'done') detail = ` &middot; ${escapeHTML(formatBytes(t.bytes_copied))} copied`;
+      else if (status === 'error') detail = ` &middot; ${escapeHTML(t.error_text || 'failed')}`;
+      else if (status === 'pending' || status === 'leased') detail = ' &middot; in progress';
+      return `<div class="clip-xfer-status status-${escapeHTML(status)}">→ ${name}: <b>${escapeHTML(status)}</b>${detail}</div>`;
+    }
+
+    // Poll transfers a few times after an enqueue so pending → done/error is
+    // reflected without a manual refresh. Stops when no job is still in flight.
+    function scheduleTransferPoll(panel, recId) {
+      let ticks = 0;
+      const tick = async () => {
+        ticks += 1;
+        if (!document.body.contains(panel) || panel.classList.contains('hidden')) return;
+        await reloadTransfers(panel, recId);
+        const inflight = panel.querySelectorAll('.clip-xfer-status.status-pending, .clip-xfer-status.status-leased').length;
+        if (inflight > 0 && ticks < 40) window.setTimeout(tick, 3000);
+      };
+      window.setTimeout(tick, 3000);
     }
 
     // Resolve a presigned URL for one clip and navigate to it to trigger the

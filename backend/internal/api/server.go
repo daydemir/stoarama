@@ -212,6 +212,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/{id}/clips/{clipId}/download", s.handleAccountRecordingClipDownload)
 			account.Delete("/recordings/{id}/clips/{clipId}", s.handleAccountRecordingClipDelete)
 			account.Delete("/recordings/{id}/clips", s.handleAccountRecordingClipsDeleteAll)
+			account.Post("/recordings/{id}/clips/{clipId}/transfer", s.handleAccountRecordingClipTransfer)
+			account.Get("/recordings/{id}/transfers", s.handleAccountRecordingTransfers)
 			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
 			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)
