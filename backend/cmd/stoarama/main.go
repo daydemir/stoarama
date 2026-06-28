@@ -45,8 +45,6 @@ func main() {
 		runAuth(os.Args[2:])
 	case "node":
 		runNode(os.Args[2:])
-	case "recording":
-		runRecording(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -69,8 +67,6 @@ func usage() {
   stoarama node whoami [--node-type inference_node|local_recorder --api-base-url URL --node-token TOKEN]
   stoarama node heartbeat [--node-type inference_node|local_recorder --api-base-url URL --node-token TOKEN]
   stoarama node doctor [--node-type inference_node|local_recorder]
-
-  stoarama recording youtube run --stream-id N [--cookies-file FILE|--cookies-from-browser BROWSER]
 `)
 }
 
@@ -262,7 +258,7 @@ func runNodeEnrollmentTokens(args []string) {
 			fatalf("--node-type is required")
 		}
 		if strings.TrimSpace(*nodeType) == "yt_relay_source" {
-			fatalf("yt_relay_source enrollment is disabled; use local_recorder or `stoarama recording youtube run`")
+			fatalf("yt_relay_source enrollment is disabled; use local_recorder")
 		}
 		baseURL, token := mustResolveUserAuth(*apiBaseURL, *apiKey)
 		var resp map[string]any

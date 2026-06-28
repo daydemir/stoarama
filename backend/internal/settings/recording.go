@@ -9,14 +9,13 @@ import (
 )
 
 const (
-	DefaultRecordingIntervalSec  = 1
-	DefaultClipDurationSec       = 30
-	ExtendedClipDurationSec      = 90
-	DefaultSampleIntervalMinSec  = 4 * 60
-	DefaultSampleIntervalMaxSec  = 8 * 60
-	DefaultSampleStaleGraceSec   = 5 * 60
-	DefaultSampleStaleWindowSec  = DefaultSampleIntervalMaxSec + DefaultSampleStaleGraceSec
-	DefaultSampleExpectedPerHour = 3600 / DefaultSampleIntervalMaxSec
+	DefaultRecordingIntervalSec = 1
+	DefaultClipDurationSec      = 30
+	ExtendedClipDurationSec     = 90
+	DefaultSampleIntervalMinSec = 4 * 60
+	DefaultSampleIntervalMaxSec = 8 * 60
+	DefaultSampleStaleGraceSec  = 5 * 60
+	DefaultSampleStaleWindowSec = DefaultSampleIntervalMaxSec + DefaultSampleStaleGraceSec
 )
 
 type RecordingSettings struct {
@@ -67,37 +66,4 @@ func (s RecordingSettings) Validate() error {
 
 func IsAllowedClipDurationSec(v int) bool {
 	return v == DefaultClipDurationSec || v == ExtendedClipDurationSec
-}
-
-func SetRecordingSamplingPolicy(ctx context.Context, q queryRower, policy RecordingSettings) (RecordingSettings, error) {
-	if q == nil {
-		return RecordingSettings{}, fmt.Errorf("recording settings query target is nil")
-	}
-	if err := policy.Validate(); err != nil {
-		return RecordingSettings{}, err
-	}
-	var out RecordingSettings
-	if err := q.QueryRow(ctx, `
-		INSERT INTO recording_settings (
-			id, capture_interval_sec, clip_duration_sec, sample_interval_min_sec, sample_interval_max_sec, stale_grace_sec, updated_at
-		)
-		VALUES (true, 1, $1, $2, $3, $4, now())
-		ON CONFLICT (id)
-		DO UPDATE SET
-			capture_interval_sec=1,
-			clip_duration_sec=EXCLUDED.clip_duration_sec,
-			sample_interval_min_sec=EXCLUDED.sample_interval_min_sec,
-			sample_interval_max_sec=EXCLUDED.sample_interval_max_sec,
-			stale_grace_sec=EXCLUDED.stale_grace_sec,
-			updated_at=now()
-		RETURNING clip_duration_sec, sample_interval_min_sec, sample_interval_max_sec, stale_grace_sec, updated_at
-	`, policy.ClipDurationSec, policy.SampleIntervalMinSec, policy.SampleIntervalMaxSec, policy.StaleGraceSec).Scan(
-		&out.ClipDurationSec, &out.SampleIntervalMinSec, &out.SampleIntervalMaxSec, &out.StaleGraceSec, &out.UpdatedAt,
-	); err != nil {
-		return RecordingSettings{}, fmt.Errorf("upsert recording settings: %w", err)
-	}
-	if err := out.Validate(); err != nil {
-		return RecordingSettings{}, err
-	}
-	return out, nil
 }

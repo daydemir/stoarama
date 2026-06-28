@@ -133,27 +133,6 @@ func (s *Server) handleDataAccessSpec(w http.ResponseWriter, r *http.Request) {
 				Description: "Prepare up to 120 clip downloads for a selected stream with session or API key auth.",
 				Limit:       accountClipBatchLimit,
 			},
-			{
-				Key:         "recording_state",
-				Method:      http.MethodPost,
-				Path:        "/api/v1/recording/streams/{id}/state",
-				Auth:        "session (off), public (on)",
-				Description: "Set desired recording state: start requires no session, stop still requires a session or service token.",
-			},
-			{
-				Key:         "recording_assign",
-				Method:      http.MethodPost,
-				Path:        "/api/v1/recording/streams/{id}/assign",
-				Auth:        "session",
-				Description: "Turn recording on for a stream from a signed-in browser session.",
-			},
-			{
-				Key:         "recording_unassign",
-				Method:      http.MethodPost,
-				Path:        "/api/v1/recording/streams/{id}/unassign",
-				Auth:        "session",
-				Description: "Turn recording off for a stream from a signed-in browser session.",
-			},
 		},
 	})
 }

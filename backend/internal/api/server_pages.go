@@ -36,10 +36,6 @@ func loadStreamsHTML() ([]byte, error) {
 	return loadHTMLPage("streams.html")
 }
 
-func loadRecordingHTML() ([]byte, error) {
-	return loadHTMLPage("recording.html")
-}
-
 func loadDocsHTML() ([]byte, error) {
 	return loadHTMLPage("docs.html")
 }
@@ -60,10 +56,6 @@ func writeHTML(w http.ResponseWriter, body []byte) {
 
 func (s *Server) handleStreamsApp(w http.ResponseWriter, _ *http.Request) {
 	writeHTML(w, s.streamsHTML)
-}
-
-func (s *Server) handleRecordingApp(w http.ResponseWriter, _ *http.Request) {
-	writeHTML(w, s.recordingHTML)
 }
 
 func (s *Server) handleDocsApp(w http.ResponseWriter, _ *http.Request) {
@@ -96,8 +88,6 @@ func (s *Server) redirectDashboard(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/dashboard", path == "/dashboard/overview", path == "/dashboard/streams":
 		target = "/streams"
-	case path == "/dashboard/recording":
-		target = "/recording"
 	case strings.HasPrefix(path, "/dashboard/stream/"):
 		id := strings.TrimPrefix(path, "/dashboard/stream/")
 		id = strings.TrimSpace(id)

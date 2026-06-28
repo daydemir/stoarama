@@ -32,13 +32,10 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
-	"github.com/daydemir/stoarama/backend/internal/captureapi"
-	"github.com/daydemir/stoarama/backend/internal/capturescheduled"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/r2"
-	"github.com/daydemir/stoarama/backend/internal/settings"
 	"github.com/daydemir/stoarama/backend/internal/storage"
 )
 
@@ -62,8 +59,6 @@ func main() {
 		runMigrate(ctx, cfg, os.Args[2:])
 	case "capture":
 		runCapture(ctx, cfg, os.Args[2:])
-	case "capture-server":
-		runCaptureServer(ctx, cfg, os.Args[2:])
 	case "streams":
 		runStreams(ctx, cfg, os.Args[2:])
 	case "discovery":
@@ -72,8 +67,6 @@ func main() {
 		runMedia(ctx, cfg, os.Args[2:])
 	case "inference":
 		runInference(ctx, cfg, os.Args[2:])
-	case "jobs":
-		runJobs(ctx, cfg, os.Args[2:])
 	case "alerts":
 		runAlerts(ctx, cfg, os.Args[2:])
 	case "overview":
@@ -86,10 +79,6 @@ func main() {
 		runPipelines(ctx, cfg, os.Args[2:])
 	case "nodes":
 		runNodes(ctx, cfg, os.Args[2:])
-	case "recording":
-		runRecording(ctx, cfg, os.Args[2:])
-	case "servers":
-		runServers(ctx, cfg, os.Args[2:])
 	case "survey":
 		runSurvey(ctx, cfg, os.Args[2:])
 	case "recorder-control":
@@ -106,7 +95,6 @@ func usage() {
 	_, _ = os.Stdout.WriteString(`stoaramactl commands:
 	  stoaramactl migrate up [--dir infra/sql/migrations]
 	  stoaramactl capture backfill-missing [--backend-api-url URL --api-token TOKEN --limit 0 --concurrency 4 --timeout-sec 90 --dry-run --json]
-	  stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --stream-ids 1,2 --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --metadata-json JSON --duration 0]
 	  stoaramactl capture probe (--id N | --provider P --source-url URL) [--source-page-url URL --capture-type TYPE --capture-timeout-sec 60]
 	  stoaramactl capture audit --all [--concurrency 16 --timeout-sec 20 --json]
 	  stoaramactl capture runtime list [--status running|unsupported|error] [--limit 200] [--json]
@@ -128,23 +116,18 @@ func usage() {
 	  stoaramactl streams cleanup-location-tags [--recording-state off|on --limit 0 --apply --json]
 	  stoaramactl streams metadata-audit [--backend-api-url URL --api-token TOKEN --recording-state off|on --page-size 500 --sample-limit 40 --allow-generic-location-city --apply --apply-generic-location-fixes --max-updates 0]
 	  stoaramactl streams set-capture --id N --capture-type TYPE [--config-json JSON]
-	  stoaramactl streams migrate-v2 [--id N --limit 1000 --only-changed --only-review --apply --report-json out.json --json]
 	  stoaramactl streams repair-youtube [--id N --limit 1000 --only-changed --apply --report-json out.json --json]
 	  stoaramactl streams repair-image-capture [--id N --source-url-like %%pattern%% --provider P --limit 1000 --only-changed --apply --json]
 	  stoaramactl streams repair-canonical-capture [--id N --source-url-like %%pattern%% --provider P --limit 1000 --only-changed --only-review --legacy-imported-only=true --non-youtube-only=true --apply --json]
-	  stoaramactl streams recording-state-service --id N --recording-state off|on [--json]
 	  stoaramactl discovery candidates list [--id N --review-status pending|accepted|rejected|invalid --provider P --capture-type TYPE --limit 200 --offset 0]
 	  stoaramactl discovery candidates review --id N --status accepted|rejected|invalid [--reviewer TEXT --reason TEXT --metadata-json JSON]
 	  stoaramactl discovery candidates import --id N [--provider P --external-id E --name N --slug S --source-url URL --source-page-url URL --source-family FAMILY --capture-type TYPE --execution-class CLASS --execution-config-json JSON --tags a,b --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC --metadata-json JSON]
   stoaramactl media backfill --snapshot-root local/snapshots [--concurrency 8 --dry-run]
   stoaramactl inference list [--stream-id N --pipeline-id P --status queued_boxed|success|error --class-name person --search TEXT --min-confidence 0.5 --sort-by created_at --sort-dir desc --limit 200 --offset 0]
   stoaramactl inference cleanup-unboxed [--pipeline-id P --mode requeue|delete --dry-run]
-	  stoaramactl jobs list [--status pending|leased|done|error --limit 200]
-	  stoaramactl jobs retry --id N
-	  stoaramactl jobs dead-letter [--limit 200]
 	  stoaramactl alerts send-test-email [--to email@example.com] [--stream-id N --stream-name NAME --reason capture_runtime_stopped]
 	  stoaramactl alerts history [--limit 50 --status accepted|delivered|opened|bounced|failed --stream-id N]
-	  stoaramactl import legacy-live-streams [--legacy-api-url URL --legacy-api-token TOKEN --target-api-url URL --service-token TOKEN --offset 0 --limit 200 --page-size 50 --concurrency 4 --probe-timeout-sec 45 --legacy-recording-state off|on --legacy-provider P --apply --report-json out.json --json]
+	  stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]
 	  stoaramactl overview summary [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl overview status [--backend-api-url URL --api-token TOKEN --hours 168]
 	  stoaramactl overview queue-health [--backend-api-url URL --api-token TOKEN]
@@ -162,33 +145,11 @@ func usage() {
 	  stoaramactl pipelines overview [--backend-api-url URL --api-token TOKEN --include-inactive=true]
 	  stoaramactl pipelines stream-list --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines set --stream-id N --pipeline-id P --enabled=true|false [--updated-by stoaramactl --backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording enable --id N [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording disable --id N [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording settings [--clip-duration-sec 30|90] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording status [--id N --hours 24 --runs-limit 100 --events-limit 100] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording runs [--stream-id N --limit 100 --hours 24] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording queue [--hours 24] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording coverage --id N [--days 365] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording samples --id N [--count 42] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording reconcile --id N [--apply --backend-api-url URL --api-token TOKEN]
-	  stoaramactl recording supervisor run [--backend-api-url URL --api-token TOKEN --interval-sec 60 --limit 500 --dry-run --once]
-	  stoaramactl recording supervisor incidents [--status open|resolved --limit 200 --json]
-	  stoaramactl recording supervisor reconcile --id N [--apply --backend-api-url URL --api-token TOKEN]
 	  stoaramactl korea inventory
 	  stoaramactl korea audit
 	  stoaramactl korea utic scrape [--api-url URL --service-key KEY --out report.json --json]
 	  stoaramactl korea utic ingest [--api-url URL --service-key KEY --backend-api-url URL --api-token TOKEN --auto-import=true --dry-run --limit 0 --report-json out.json --json]
 	  stoaramactl korea utic refresh-frames [--backend-api-url URL --api-token TOKEN --concurrency 4 --timeout-sec 90 --limit 0 --dry-run --allow-failures --report-json out.json --json]
-	  stoaramactl servers list [--backend-api-url URL --api-token TOKEN --hours 168 --include-stale=false --show-processes=true]
-	  stoaramactl servers assignments [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers assignments audit [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers assignments reconcile [--server-id ID --execution-class CLASS --limit 500 --offset 0 --apply --actor TEXT --reason TEXT] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers assign --id N [--server-id ID|--auto] [--reason TEXT --actor TEXT --backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers unassign --id N --yes [--reason TEXT --actor TEXT --backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers capacity list [--include-inactive=false] [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers capacity groups [--backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers capacity heartbeat --server-id ID [--capture-shared-capacity N | --execution-class-capacity CLASS=N[,CLASS=N...]] [--draining-execution-classes CLASS[,CLASS...]] [--lease-sec 45 --metadata-json JSON --backend-api-url URL --api-token TOKEN]
-	  stoaramactl servers capacity stopped --server-id ID [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl survey run-once [--limit 0 --daily-gate --concurrency 4 --resolve-timeout-sec 60 --capture-timeout-sec 60 --json]
 	  stoaramactl survey coverage [--json]
 	  stoaramactl survey delete-stream-captures --id N --apply
@@ -197,124 +158,66 @@ func usage() {
 `)
 }
 
-func runCaptureServer(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) < 1 || args[0] != "run" {
-		log.Fatalf("usage: stoaramactl capture-server run [--backend-api-url URL --api-token TOKEN --server-id ID --worker-id ID --capture-shared-capacity 6 --stream-ids 1,2 --heartbeat-sec 15 --lease-sec 45 --refresh-sec 5 --metadata-json JSON --duration 0]")
+func runImport(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) < 1 {
+		printImportUsage()
+		return
 	}
-	fs := flag.NewFlagSet("capture-server run", flag.ExitOnError)
-	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-	apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-	workerID := fs.String("worker-id", defaultCaptureServerWorkerID(cfg.WorkerID), "worker id")
-	serverID := fs.String("server-id", defaultCaptureServerID(defaultCaptureServerWorkerID(cfg.WorkerID)), "server id")
-	captureSharedCapacity := fs.Int("capture-shared-capacity", envIntOrDefault("CAPTURE_SERVER_CAPTURE_SHARED_CAPACITY", 1), "concurrent sampled clip captures")
-	_ = fs.String("execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_EXECUTION_CLASSES")), "removed; sampled capture worker handles all continuous video streams")
-	streamIDsRaw := fs.String("stream-ids", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_STREAM_IDS")), "optional comma-separated stream ids to run in stream-filter mode")
-	_ = fs.String("draining-execution-classes", strings.TrimSpace(os.Getenv("CAPTURE_SERVER_DRAINING_EXECUTION_CLASSES")), "removed; sampled capture worker does not use assignments")
-	heartbeatSec := fs.Int("heartbeat-sec", 15, "heartbeat interval seconds")
-	leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
-	refreshSec := fs.Int("refresh-sec", cfg.CaptureTickSec, "capture job poll interval seconds")
-	_ = fs.Int("frame-queue-size", 64, "removed; sampled capture writes one segment per job")
-	_ = fs.Int("frame-enqueue-timeout-sec", 3, "removed; sampled capture writes one segment per job")
-	_ = fs.Int("frame-writer-workers", 2, "removed; sampled capture writes one segment per job")
-	_ = fs.Int("unsupported-threshold", cfg.CaptureUnsupportedThreshold, "removed; sampled capture alerts after repeated failures without disabling")
-	metadataJSON := fs.String("metadata-json", "{}", "server metadata JSON object")
-	duration := fs.Duration("duration", 0, "optional run duration (e.g. 30m, 8h)")
-	_ = fs.Parse(args[1:])
+	switch args[0] {
+	case "bellevue-streams":
+		runImportBellevueStreams(ctx, cfg, args[1:])
+	default:
+		log.Fatalf("unknown import subcommand: %s", args[0])
+	}
+}
 
-	if strings.TrimSpace(*backendAPIURL) == "" {
-		log.Fatalf("--backend-api-url is required")
-	}
-	if strings.TrimSpace(*apiToken) == "" {
-		log.Fatalf("--api-token is required")
-	}
-	if strings.TrimSpace(*workerID) == "" {
-		log.Fatalf("--worker-id is required")
-	}
-	if strings.TrimSpace(*serverID) == "" {
-		log.Fatalf("--server-id is required")
-	}
-	if *heartbeatSec <= 0 {
-		log.Fatalf("--heartbeat-sec must be > 0")
-	}
-	if *leaseSec <= 0 || *leaseSec > 3600 {
-		log.Fatalf("--lease-sec must be between 1 and 3600")
-	}
-	if *leaseSec <= *heartbeatSec {
-		log.Fatalf("--lease-sec must be greater than --heartbeat-sec")
-	}
-	if *refreshSec <= 0 {
-		log.Fatalf("--refresh-sec must be > 0")
-	}
-	if *captureSharedCapacity <= 0 {
-		log.Fatalf("--capture-shared-capacity must be > 0")
-	}
+func printImportUsage() {
+	fmt.Print("stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]\n")
+}
 
-	streamIDs, err := parseInt64CSV(*streamIDsRaw)
+func postJSONWithToken(ctx context.Context, baseURL, token, path string, payload, out any) error {
+	b, err := json.Marshal(payload)
 	if err != nil {
-		log.Fatalf("parse --stream-ids: %v", err)
+		return err
 	}
-
-	meta := map[string]any{}
-	rawMeta := strings.TrimSpace(*metadataJSON)
-	if rawMeta != "" {
-		if err := json.Unmarshal([]byte(rawMeta), &meta); err != nil {
-			log.Fatalf("invalid --metadata-json: %v", err)
-		}
-	}
-	hostName := ""
-	if h, err := os.Hostname(); err == nil {
-		hostName = strings.TrimSpace(h)
-	}
-	meta["host"] = hostName
-	meta["server_id"] = strings.TrimSpace(*serverID)
-	meta["worker_id"] = strings.TrimSpace(*workerID)
-	meta["process_name"] = "capture-server"
-	meta["process_id"] = strings.TrimSpace(*workerID)
-
-	client, err := captureapi.NewClient(captureapi.ClientConfig{
-		BaseURL:  strings.TrimSpace(*backendAPIURL),
-		APIToken: strings.TrimSpace(*apiToken),
-	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+path, strings.NewReader(string(b)))
 	if err != nil {
-		log.Fatalf("init capture api client: %v", err)
+		return err
 	}
-	registry, err := capture.NewDefaultRegistry()
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Fatalf("init capture registry: %v", err)
+		return err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var errPayload map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&errPayload)
+		return fmt.Errorf("POST %s: status=%d body=%v", path, resp.StatusCode, errPayload)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
 
-	runCtx := ctx
-	cancel := func() {}
-	if *duration > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, *duration)
+func normalizeSourceFamily(v string) string {
+	if normalized, ok := capture.NormalizeSourceFamily(v); ok {
+		return normalized
 	}
-	defer cancel()
+	return ""
+}
 
-	worker, err := capturescheduled.NewWorker(capturescheduled.Config{
-		Client:            client,
-		Registry:          registry,
-		WorkerID:          strings.TrimSpace(*workerID),
-		ServerID:          strings.TrimSpace(*serverID),
-		Concurrency:       *captureSharedCapacity,
-		LeaseSec:          *leaseSec,
-		PollInterval:      time.Duration(*refreshSec) * time.Second,
-		HeartbeatInterval: time.Duration(*heartbeatSec) * time.Second,
-		MetadataJSON:      meta,
-		StreamIDs:         streamIDs,
-	})
-	if err != nil {
-		log.Fatalf("init sampled capture worker: %v", err)
+func normalizeCaptureType(v string) string {
+	if normalized, ok := capture.NormalizeCaptureType(v); ok {
+		return normalized
 	}
-	defer func() {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer stopCancel()
-		if workerStopErr := client.WorkerStopped(stopCtx, strings.TrimSpace(*workerID), capture.ExecutionClassVideoLive); workerStopErr != nil {
-			log.Printf("capture-server worker stop signal failed worker_id=%s: %v", strings.TrimSpace(*workerID), workerStopErr)
-		}
-	}()
-	if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		log.Fatalf("capture-server run failed: %v", err)
+	return ""
+}
+
+func normalizeExecutionClass(v string) string {
+	if normalized, ok := capture.NormalizeExecutionClass(v); ok {
+		return normalized
 	}
+	return ""
 }
 
 func runMigrate(ctx context.Context, cfg config.Config, args []string) {
@@ -849,16 +752,11 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 }
 
 func printStreamsUsage() {
-	fmt.Print("stoaramactl streams <list|detail|page-load|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|cleanup-location-tags|metadata-audit|set-capture|migrate-v2|repair-youtube|repair-image-capture|repair-canonical-capture|recording-state-service|recording-state-bulk> ...\n")
+	fmt.Print("stoaramactl streams <list|detail|page-load|filters|frames|clips|clip-latest|timeline|image-urls|add|update|tags-add|tags-remove|cleanup-location-tags|metadata-audit|set-capture|repair-youtube|repair-image-capture|repair-canonical-capture> ...\n")
 }
 
 func printDiscoveryUsage() {
 	fmt.Print("stoaramactl discovery candidates <list|review|import> ...\n")
-}
-
-func printRecordingUsage() {
-	fmt.Print("stoaramactl recording <interval|enable|disable|settings|status|runs|queue|coverage|samples|reconcile|supervisor> ...\n")
-	fmt.Print("stoaramactl recording settings [--clip-duration-sec 30|90] [--backend-api-url URL --api-token TOKEN]\n")
 }
 
 func isGlobalPlaylistTag(line string) bool {
@@ -886,15 +784,6 @@ func isGlobalPlaylistTag(line string) bool {
 	default:
 		return false
 	}
-}
-
-func patchStreamRecordingState(ctx context.Context, backendAPIURL string, apiToken string, streamID int64, state model.RecordingState) map[string]any {
-	if streamID <= 0 {
-		log.Fatalf("--id is required")
-	}
-	return mustAPIRequest(ctx, http.MethodPatch, strings.TrimSpace(backendAPIURL), strings.TrimSpace(apiToken), fmt.Sprintf("/api/v1/streams/%d", streamID), map[string]any{
-		"recording_state": string(state),
-	})
 }
 
 type streamPageLoadOptions struct {
@@ -1074,180 +963,6 @@ func timedAPIRequest(ctx context.Context, method string, baseURL string, apiToke
 	}
 	step.OK = true
 	return step, out
-}
-
-func loadDashboardStream(ctx context.Context, backendAPIURL string, apiToken string, streamID int64) map[string]any {
-	if streamID <= 0 {
-		log.Fatalf("--id is required")
-	}
-	payload := mustAPIGet(ctx, strings.TrimSpace(backendAPIURL), strings.TrimSpace(apiToken), fmt.Sprintf("/api/v1/dashboard/streams/%d?limit=1", streamID))
-	stream := asMap(payload["stream"])
-	if int64FromAny(stream["id"]) != streamID {
-		log.Fatalf("stream %d not found", streamID)
-	}
-	return stream
-}
-
-func inferRecordingAssignmentExecutionClassesForCLI(stream map[string]any) []string {
-	executionClass := strings.TrimSpace(fmt.Sprint(stream["execution_class"]))
-	if executionClass != "" && executionClass != "<nil>" {
-		norm, ok := capture.NormalizeExecutionClass(executionClass)
-		if ok {
-			if norm == capture.ExecutionClassYouTubeDirect || norm == capture.ExecutionClassYouTubeRelay {
-				return []string{capture.ExecutionClassYouTubeDirect}
-			}
-			if norm == capture.ExecutionClassImagePoll {
-				return nil
-			}
-			return []string{norm}
-		}
-	}
-	captureType := strings.TrimSpace(fmt.Sprint(stream["capture_type"]))
-	if captureType != "" && captureType != "<nil>" {
-		if norm, ok := capture.NormalizeCaptureType(captureType); ok {
-			switch norm {
-			case capture.CaptureTypeYouTubeWatch:
-				return []string{capture.ExecutionClassYouTubeDirect}
-			case capture.CaptureTypeStillImage:
-				return nil
-			case capture.CaptureTypeHLS, capture.CaptureTypeDASH, capture.CaptureTypeRTSP, capture.CaptureTypeRTMP, capture.CaptureTypeHTTPVideo:
-				return []string{capture.ExecutionClassVideoLive}
-			}
-		}
-	}
-	sourceFamily := strings.ToLower(strings.TrimSpace(fmt.Sprint(stream["source_family"])))
-	if sourceFamily == capture.SourceFamilyWatchPage {
-		return []string{capture.ExecutionClassYouTubeDirect}
-	}
-	return nil
-}
-
-func recordingCandidateExecutionClassListForCLI(row map[string]any) []string {
-	out := make([]string, 0, 4)
-	seen := map[string]struct{}{}
-	push := func(raw any) {
-		v := strings.TrimSpace(fmt.Sprint(raw))
-		if v == "" || v == "<nil>" {
-			return
-		}
-		norm, ok := capture.NormalizeExecutionClass(v)
-		if !ok {
-			return
-		}
-		if _, exists := seen[norm]; exists {
-			return
-		}
-		seen[norm] = struct{}{}
-		out = append(out, norm)
-	}
-	if arr, ok := row["available_execution_classes"].([]any); ok {
-		for _, raw := range arr {
-			push(raw)
-		}
-	}
-	if arr, ok := row["execution_classes"].([]any); ok {
-		for _, raw := range arr {
-			push(raw)
-		}
-	}
-	return out
-}
-
-func recordingCandidateSupportsExecutionClassesForCLI(row map[string]any, desired []string) bool {
-	if len(desired) == 0 {
-		return true
-	}
-	have := recordingCandidateExecutionClassListForCLI(row)
-	if len(have) == 0 {
-		return false
-	}
-	haveSet := map[string]struct{}{}
-	for _, executionClass := range have {
-		haveSet[executionClass] = struct{}{}
-	}
-	for _, executionClass := range desired {
-		if _, ok := haveSet[executionClass]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func autoSelectRecordingServer(ctx context.Context, backendAPIURL string, apiToken string, streamID int64) string {
-	stream := loadDashboardStream(ctx, backendAPIURL, apiToken, streamID)
-	desiredExecutionClasses := inferRecordingAssignmentExecutionClassesForCLI(stream)
-	if len(desiredExecutionClasses) == 0 {
-		log.Fatalf("stream %d is not startable in the clip-native recording path", streamID)
-	}
-	payload := mustAPIGet(ctx, strings.TrimSpace(backendAPIURL), strings.TrimSpace(apiToken), "/api/v1/dashboard/recording/server-capacity")
-	items, _ := payload["items"].([]any)
-	candidates := make([]map[string]any, 0, len(items))
-	for _, raw := range items {
-		row := asMap(raw)
-		serverID := strings.TrimSpace(fmt.Sprint(row["server_id"]))
-		if serverID == "" || serverID == "<nil>" {
-			continue
-		}
-		if !boolFromAny(row["active"]) || boolFromAny(row["draining"]) {
-			continue
-		}
-		freeSlots := int64FromAny(row["free_slots"])
-		if freeSlots <= 0 {
-			continue
-		}
-		if !recordingCandidateSupportsExecutionClassesForCLI(row, desiredExecutionClasses) {
-			continue
-		}
-		candidates = append(candidates, row)
-	}
-	if len(candidates) == 0 {
-		available := make([]string, 0, 8)
-		seen := map[string]struct{}{}
-		for _, raw := range items {
-			row := asMap(raw)
-			for _, executionClass := range recordingCandidateExecutionClassListForCLI(row) {
-				if _, ok := seen[executionClass]; ok {
-					continue
-				}
-				seen[executionClass] = struct{}{}
-				available = append(available, executionClass)
-			}
-		}
-		sort.Strings(available)
-		if len(desiredExecutionClasses) > 0 {
-			log.Fatalf("no recording server has free capacity for %s (available execution classes: %s)", strings.Join(desiredExecutionClasses, "/"), defaultString(strings.Join(available, "/"), "none"))
-		}
-		log.Fatalf("no recording server has free capacity")
-	}
-	rank := func(row map[string]any) int {
-		executionClasses := recordingCandidateExecutionClassListForCLI(row)
-		if len(desiredExecutionClasses) == 0 {
-			return 0
-		}
-		best := len(desiredExecutionClasses) + 1
-		for _, executionClass := range executionClasses {
-			for idx, desired := range desiredExecutionClasses {
-				if executionClass == desired && idx < best {
-					best = idx
-				}
-			}
-		}
-		return best
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		rankI := rank(candidates[i])
-		rankJ := rank(candidates[j])
-		if rankI != rankJ {
-			return rankI < rankJ
-		}
-		freeI := int64FromAny(candidates[i]["free_slots"])
-		freeJ := int64FromAny(candidates[j]["free_slots"])
-		if freeI != freeJ {
-			return freeI > freeJ
-		}
-		return strings.TrimSpace(fmt.Sprint(candidates[i]["server_id"])) < strings.TrimSpace(fmt.Sprint(candidates[j]["server_id"]))
-	})
-	return strings.TrimSpace(fmt.Sprint(candidates[0]["server_id"]))
 }
 
 func runStreams(ctx context.Context, cfg config.Config, args []string) {
@@ -2066,18 +1781,12 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 			return
 		}
 		fmt.Printf("stream %d capture_type=%s execution_class=%s updated\n", *id, captureTypeValue, executionClassValue)
-	case "migrate-v2":
-		runStreamsMigrateV2(ctx, cfg, args[1:])
 	case "repair-youtube":
 		runStreamsRepairYouTube(ctx, cfg, args[1:])
 	case "repair-image-capture":
 		runStreamsRepairImageCapture(ctx, cfg, args[1:])
 	case "repair-canonical-capture":
 		runStreamsRepairCanonicalCapture(ctx, cfg, args[1:])
-	case "recording-state-service":
-		runStreamsRecordingStateService(ctx, cfg, args[1:])
-	case "recording-state-bulk":
-		runStreamsRecordingStateBulk(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown streams subcommand: %s", sub)
 	}
@@ -3172,106 +2881,6 @@ func runInference(ctx context.Context, cfg config.Config, args []string) {
 	}
 }
 
-func runJobs(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl jobs <list|retry|dead-letter>")
-	}
-	sub := args[0]
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
-
-	switch sub {
-	case "list":
-		fs := flag.NewFlagSet("jobs list", flag.ExitOnError)
-		status := fs.String("status", "", "status filter")
-		limit := fs.Int("limit", 200, "limit")
-		_ = fs.Parse(args[1:])
-		where := "1=1"
-		queryArgs := []any{*limit}
-		if strings.TrimSpace(*status) != "" {
-			where = "status=$1"
-			queryArgs = []any{*status, *limit}
-		}
-		rows, err := pool.Query(ctx, fmt.Sprintf(`
-			SELECT id, stream_id, scheduled_for, status, lease_owner, lease_expires_at, attempt_count, max_attempts, error_text, created_at, updated_at
-			FROM capture_jobs
-			WHERE %s
-			ORDER BY id DESC
-			LIMIT $%d
-		`, where, len(queryArgs)), queryArgs...)
-		if err != nil {
-			log.Fatalf("jobs list query: %v", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, streamID int64
-			var statusVal string
-			var scheduledFor, createdAt, updatedAt time.Time
-			var leaseOwner *string
-			var leaseExpires *time.Time
-			var attempts, maxAttempts int
-			var errText *string
-			if err := rows.Scan(&id, &streamID, &scheduledFor, &statusVal, &leaseOwner, &leaseExpires, &attempts, &maxAttempts, &errText, &createdAt, &updatedAt); err != nil {
-				log.Fatalf("jobs list scan: %v", err)
-			}
-			fmt.Printf("id=%d stream_id=%d status=%s scheduled_for=%s lease_owner=%s attempts=%d/%d err=%s\n",
-				id, streamID, statusVal, scheduledFor.Format(time.RFC3339), derefString(leaseOwner), attempts, maxAttempts, derefString(errText))
-		}
-		if rows.Err() != nil {
-			log.Fatalf("jobs list iterate: %v", rows.Err())
-		}
-	case "retry":
-		fs := flag.NewFlagSet("jobs retry", flag.ExitOnError)
-		id := fs.Int64("id", 0, "job id")
-		_ = fs.Parse(args[1:])
-		if *id <= 0 {
-			log.Fatalf("--id is required")
-		}
-		res, err := pool.Exec(ctx, `
-			UPDATE capture_jobs
-			SET status='pending', lease_owner=NULL, lease_expires_at=NULL, error_text=NULL, updated_at=now()
-			WHERE id=$1 AND status='error'
-		`, *id)
-		if err != nil {
-			log.Fatalf("retry job: %v", err)
-		}
-		if res.RowsAffected() == 0 {
-			log.Fatalf("job not found in error state")
-		}
-		fmt.Printf("job %d moved to pending\n", *id)
-	case "dead-letter":
-		fs := flag.NewFlagSet("jobs dead-letter", flag.ExitOnError)
-		limit := fs.Int("limit", 200, "limit")
-		_ = fs.Parse(args[1:])
-		rows, err := pool.Query(ctx, `
-			SELECT id, stream_id, scheduled_for, attempt_count, max_attempts, error_text
-			FROM capture_jobs
-			WHERE status='error'
-			ORDER BY updated_at DESC, id DESC
-			LIMIT $1
-		`, *limit)
-		if err != nil {
-			log.Fatalf("dead-letter query: %v", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, streamID int64
-			var scheduledFor time.Time
-			var attemptCount, maxAttempts int
-			var errText *string
-			if err := rows.Scan(&id, &streamID, &scheduledFor, &attemptCount, &maxAttempts, &errText); err != nil {
-				log.Fatalf("dead-letter scan: %v", err)
-			}
-			fmt.Printf("id=%d stream_id=%d scheduled_for=%s attempts=%d/%d error=%s\n", id, streamID, scheduledFor.Format(time.RFC3339), attemptCount, maxAttempts, derefString(errText))
-		}
-		if rows.Err() != nil {
-			log.Fatalf("dead-letter iterate: %v", rows.Err())
-		}
-	default:
-		log.Fatalf("unknown jobs subcommand: %s", sub)
-	}
-}
-
 func runPipelines(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
 		printPipelinesUsage()
@@ -3405,44 +3014,6 @@ func runOverview(ctx context.Context, cfg config.Config, args []string) {
 		runOverviewSurface(ctx, cfg, args)
 	default:
 		log.Fatalf("usage: stoaramactl overview <summary|status|queue-health> ...")
-	}
-}
-
-func runServers(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Print("stoaramactl servers <list|status|assignments|assign|unassign|capacity> ...\n")
-		return
-	}
-	if len(args) < 1 {
-		fmt.Print("stoaramactl servers <list|status|assignments|assign|unassign|capacity> ...\n")
-		return
-	}
-	if len(args) >= 2 && (args[1] == "-h" || args[1] == "--help") {
-		switch args[0] {
-		case "list", "status":
-			fmt.Print("stoaramactl servers list [--backend-api-url URL --api-token TOKEN --hours 168 --include-stale=false --show-processes=true]\n")
-		case "assignments":
-			fmt.Print("stoaramactl servers assignments [--server-id ID --execution-class CLASS --limit 500 --offset 0]\n")
-			fmt.Print("stoaramactl servers assignments audit [--server-id ID --execution-class CLASS --limit 500 --offset 0] [--backend-api-url URL --api-token TOKEN]\n")
-			fmt.Print("stoaramactl servers assignments reconcile [--server-id ID --execution-class CLASS --limit 500 --offset 0 --apply --actor TEXT --reason TEXT] [--backend-api-url URL --api-token TOKEN]\n")
-		case "assign":
-			fmt.Print("stoaramactl servers assign --id N [--server-id ID|--auto] [--reason TEXT --actor TEXT --backend-api-url URL --api-token TOKEN]\n")
-		case "unassign":
-			fmt.Print("stoaramactl servers unassign --id N --yes [--reason TEXT --actor TEXT --backend-api-url URL --api-token TOKEN]\n")
-		case "capacity":
-			fmt.Print("stoaramactl servers capacity <list|groups|heartbeat|stopped> ...\n")
-		default:
-			log.Fatalf("usage: stoaramactl servers <list|status|assignments|assign|unassign|capacity> ...")
-		}
-		return
-	}
-	switch args[0] {
-	case "list", "status":
-		runOverviewSurface(ctx, cfg, append([]string{"servers"}, args[1:]...))
-	case "assignments", "assign", "unassign", "capacity":
-		runServerControl(ctx, cfg, args)
-	default:
-		log.Fatalf("unknown servers subcommand: %s", args[0])
 	}
 }
 
@@ -3691,687 +3262,6 @@ func runOverviewSurface(ctx context.Context, cfg config.Config, args []string) {
 		)
 	default:
 		log.Fatalf("unknown overview surface subcommand: %s", sub)
-	}
-}
-
-func runRecording(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		printRecordingUsage()
-		return
-	}
-	if len(args) < 1 {
-		printRecordingUsage()
-		return
-	}
-	switch args[0] {
-	case "interval":
-		log.Fatalf("recording interval is removed; sampled clip recording uses service-wide clip duration every 4-8 minutes")
-	case "enable", "disable":
-		fs := flag.NewFlagSet("recording "+args[0], flag.ExitOnError)
-		streamID := fs.Int64("id", 0, "stream id")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		state := model.RecordingStateOff
-		if args[0] == "enable" {
-			state = model.RecordingStateOn
-		}
-		payload := patchStreamRecordingState(ctx, *backendAPIURL, *apiToken, *streamID, state)
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf("stream_id=%d slug=%s recording_state=%s\n", int64FromAny(payload["id"]), fmt.Sprint(payload["slug"]), fmt.Sprint(payload["recording_state"]))
-	case "settings":
-		fs := flag.NewFlagSet("recording settings", flag.ExitOnError)
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		clipDurationSec := fs.Int("clip-duration-sec", 0, "set clip duration seconds; allowed values: 30, 90")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		apiURL := strings.TrimSpace(*backendAPIURL)
-		token := strings.TrimSpace(*apiToken)
-		if *clipDurationSec != 0 {
-			if !settings.IsAllowedClipDurationSec(*clipDurationSec) {
-				log.Fatalf("--clip-duration-sec must be 30 or 90")
-			}
-			payload := mustAPIRequest(ctx, http.MethodPut, apiURL, token, "/api/v1/recording/settings", map[string]any{
-				"clip_duration_sec":       *clipDurationSec,
-				"sample_interval_min_sec": settings.DefaultSampleIntervalMinSec,
-				"sample_interval_max_sec": settings.DefaultSampleIntervalMaxSec,
-				"stale_grace_sec":         settings.DefaultSampleStaleGraceSec,
-			})
-			if *asJSON {
-				printJSON(payload)
-				return
-			}
-			fmt.Printf("clip_duration_sec=%v sample_interval=%v-%vs stale_grace_sec=%v updated_at=%v\n",
-				payload["clip_duration_sec"], payload["sample_interval_min_sec"], payload["sample_interval_max_sec"], payload["stale_grace_sec"], payload["updated_at"])
-			return
-		}
-		payload := mustAPIGet(ctx, apiURL, token, "/api/v1/dashboard/recording/settings")
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf("clip_duration_sec=%v sample_interval=%v-%vs stale_grace_sec=%v updated_at=%v\n",
-			payload["clip_duration_sec"], payload["sample_interval_min_sec"], payload["sample_interval_max_sec"], payload["stale_grace_sec"], payload["updated_at"])
-	case "status":
-		fs := flag.NewFlagSet("recording status", flag.ExitOnError)
-		streamID := fs.Int64("id", 0, "optional stream id")
-		hours := fs.Int("hours", 24, "lookback hours for summary")
-		runsLimit := fs.Int("runs-limit", 100, "recent runs limit")
-		eventsLimit := fs.Int("events-limit", 100, "recent state events limit")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *hours <= 0 {
-			log.Fatalf("--hours must be > 0")
-		}
-		if *runsLimit <= 0 {
-			log.Fatalf("--runs-limit must be > 0")
-		}
-		if *eventsLimit <= 0 {
-			log.Fatalf("--events-limit must be > 0")
-		}
-		apiURL := strings.TrimSpace(*backendAPIURL)
-		token := strings.TrimSpace(*apiToken)
-		if *streamID > 0 {
-			path := fmt.Sprintf("/api/v1/dashboard/streams/%d/recording?runs_limit=%d&events_limit=%d", *streamID, *runsLimit, *eventsLimit)
-			payload := mustAPIGet(ctx, apiURL, token, path)
-			if *asJSON {
-				printJSON(payload)
-				return
-			}
-			runs, _ := payload["process_runs"].([]any)
-			events, _ := payload["state_events"].([]any)
-			runtime, _ := payload["runtime"].(map[string]any)
-			stats24h, _ := payload["stats_24h"].(map[string]any)
-			lossRate24h, _ := asFloat64(stats24h["loss_rate_pct"])
-			fmt.Printf(
-				"stream_id=%d runtime_status=%v runtime_execution_class=%v last_frame=%v runs=%d events=%d success_24h=%v loss_rate_24h=%.2f%%\n",
-				*streamID, runtime["status"], runtime["execution_class"], runtime["last_frame_at"],
-				len(runs), len(events), stats24h["success_frames"], lossRate24h,
-			)
-			return
-		}
-		path := fmt.Sprintf("/api/v1/dashboard/recording/summary?hours=%d&runs_limit=%d&events_limit=%d", *hours, *runsLimit, *eventsLimit)
-		payload := mustAPIGet(ctx, apiURL, token, path)
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf(
-			"streams_total=%v on=%v off=%v healthy=%v degraded=%v stale=%v active_processes=%v stale_processes=%v interval_sec=%v\n",
-			payload["streams_total"], payload["recording_on"], payload["recording_off"],
-			payload["recording_healthy"], payload["recording_degraded"], payload["recording_stale"],
-			payload["active_processes"], payload["stale_processes"], payload["recording_interval_sec"],
-		)
-	case "runs":
-		fs := flag.NewFlagSet("recording runs", flag.ExitOnError)
-		streamID := fs.Int64("stream-id", 0, "optional stream id")
-		limit := fs.Int("limit", 100, "recent runs limit")
-		hours := fs.Int("hours", 24, "lookback hours for global runs")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *limit <= 0 {
-			log.Fatalf("--limit must be > 0")
-		}
-		if *hours <= 0 {
-			log.Fatalf("--hours must be > 0")
-		}
-		apiURL := strings.TrimSpace(*backendAPIURL)
-		token := strings.TrimSpace(*apiToken)
-		if *streamID > 0 {
-			path := fmt.Sprintf("/api/v1/dashboard/streams/%d/recording?runs_limit=%d&events_limit=1", *streamID, *limit)
-			payload := mustAPIGet(ctx, apiURL, token, path)
-			runs, _ := payload["process_runs"].([]any)
-			if *asJSON {
-				printJSON(map[string]any{"stream_id": *streamID, "runs": runs})
-				return
-			}
-			fmt.Printf("stream_id=%d runs=%d\n", *streamID, len(runs))
-			for _, raw := range runs {
-				it, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				fmt.Printf(
-					"run_id=%v execution_class=%v server=%v process=%v status=%v started_at=%v stopped_at=%v last_frame=%v restart_count=%v\n",
-					it["id"], it["execution_class"], it["server_id"], it["process_id"], it["status"], it["started_at"], it["stopped_at"], it["last_frame_at"], it["restart_count"],
-				)
-			}
-			return
-		}
-		path := fmt.Sprintf("/api/v1/dashboard/recording/summary?hours=%d&runs_limit=%d&events_limit=1", *hours, *limit)
-		payload := mustAPIGet(ctx, apiURL, token, path)
-		runs, _ := payload["recent_runs"].([]any)
-		if *asJSON {
-			printJSON(map[string]any{"hours": *hours, "runs": runs})
-			return
-		}
-		fmt.Printf("runs=%d hours=%d\n", len(runs), *hours)
-		for _, raw := range runs {
-			it, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			fmt.Printf(
-				"run_id=%v stream_id=%v execution_class=%v server=%v process=%v status=%v started_at=%v stopped_at=%v last_frame=%v\n",
-				it["id"], it["stream_id"], it["execution_class"], it["server_id"], it["process_id"], it["status"], it["started_at"], it["stopped_at"], it["last_frame_at"],
-			)
-		}
-	case "queue":
-		fs := flag.NewFlagSet("recording queue", flag.ExitOnError)
-		hours := fs.Int("hours", 24, "lookback hours")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *hours <= 0 {
-			log.Fatalf("--hours must be > 0")
-		}
-		path := fmt.Sprintf("/api/v1/dashboard/recording/summary?hours=%d&runs_limit=1&events_limit=1", *hours)
-		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf(
-			"on=%v off=%v healthy=%v degraded=%v stale=%v active_processes=%v stale_processes=%v\n",
-			payload["recording_on"], payload["recording_off"],
-			payload["recording_healthy"], payload["recording_degraded"], payload["recording_stale"],
-			payload["active_processes"], payload["stale_processes"],
-		)
-	case "coverage":
-		fs := flag.NewFlagSet("recording coverage", flag.ExitOnError)
-		streamID := fs.Int64("id", 0, "stream id")
-		days := fs.Int("days", 365, "lookback days (14-1095)")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *streamID <= 0 {
-			log.Fatalf("--id is required")
-		}
-		if *days < 14 || *days > 1095 {
-			log.Fatalf("--days must be between 14 and 1095")
-		}
-		path := fmt.Sprintf("/api/v1/dashboard/streams/%d/coverage?days=%d", *streamID, *days)
-		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		summary, _ := payload["summary"].(map[string]any)
-		points, _ := payload["points"].([]any)
-		totalHours, _ := asFloat64(summary["total_recorded_hours"])
-		avgHours, _ := asFloat64(summary["avg_recorded_hours_per_day"])
-		maxHours, _ := asFloat64(summary["max_recorded_hours_per_day"])
-		fmt.Printf(
-			"stream_id=%d days=%d recorded_days=%v/%v total_hours=%.2f avg_hours_day=%.2f max_hours_day=%.2f streak_days=%v longest_gap_days=%v last_capture=%v points=%d\n",
-			*streamID, *days, summary["days_with_capture"], summary["days_total"], totalHours, avgHours, maxHours,
-			summary["current_streak_days"], summary["longest_gap_days"], summary["last_capture_at"], len(points),
-		)
-	case "samples":
-		fs := flag.NewFlagSet("recording samples", flag.ExitOnError)
-		streamID := fs.Int64("id", 0, "stream id")
-		count := fs.Int("count", 42, "sample count (1-180)")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *streamID <= 0 {
-			log.Fatalf("--id is required")
-		}
-		if *count < 1 || *count > 180 {
-			log.Fatalf("--count must be between 1 and 180")
-		}
-		path := fmt.Sprintf("/api/v1/dashboard/streams/%d/capture-samples?count=%d", *streamID, *count)
-		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
-		items, _ := payload["items"].([]any)
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf(
-			"stream_id=%d requested=%d available_days=%v selected_days=%v samples=%d\n",
-			*streamID, *count, payload["available_days"], payload["selected_days"], len(items),
-		)
-		for _, raw := range items {
-			it, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			segmentID := fmt.Sprint(it["segment_id"])
-			if fv, ok := asFloat64(it["segment_id"]); ok {
-				segmentID = strconv.FormatInt(int64(fv), 10)
-			}
-			fmt.Printf(
-				"day=%v segment_id=%v captured_at=%v object_key=%v thumbnail=%v\n",
-				it["day"], segmentID, it["captured_at"], it["object_key"], it["thumbnail_object_key"],
-			)
-		}
-	case "reconcile":
-		runRecordingReconcile(ctx, cfg, args[1:])
-	case "supervisor":
-		runRecordingSupervisor(ctx, cfg, args[1:])
-	default:
-		log.Fatalf("unknown recording subcommand: %s", args[0])
-	}
-}
-
-func runServerControl(ctx context.Context, cfg config.Config, args []string) {
-	switch args[0] {
-	case "assign":
-		fs := flag.NewFlagSet("servers assign", flag.ExitOnError)
-		streamID := fs.Int64("id", 0, "stream id")
-		serverID := fs.String("server-id", "", "target server id (omit with --auto to choose the best live server)")
-		auto := fs.Bool("auto", false, "auto-select the best live server with matching free capacity")
-		reason := fs.String("reason", "", "assignment reason")
-		actor := fs.String("actor", "", "assignment actor")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *streamID <= 0 {
-			log.Fatalf("--id must be > 0")
-		}
-		selectedServerID := strings.TrimSpace(*serverID)
-		if *auto && selectedServerID != "" {
-			log.Fatalf("use either --server-id or --auto, not both")
-		}
-		if selectedServerID == "" {
-			selectedServerID = autoSelectRecordingServer(ctx, *backendAPIURL, *apiToken, *streamID)
-		}
-		path := fmt.Sprintf("/api/v1/recording/streams/%d/assign", *streamID)
-		payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path, map[string]any{
-			"server_id": selectedServerID,
-			"reason":    strings.TrimSpace(*reason),
-			"actor":     strings.TrimSpace(*actor),
-		})
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf(
-			"stream_id=%d server_id=%v execution_class=%v revision=%v assigned=%v/%v free_slots=%v event=%v\n",
-			*streamID, payload["server_id"], payload["execution_class"], payload["assignment_revision"], payload["assigned_count"], payload["max_active"], payload["free_slots"], payload["event_type"],
-		)
-	case "unassign":
-		fs := flag.NewFlagSet("servers unassign", flag.ExitOnError)
-		streamID := fs.Int64("id", 0, "stream id")
-		confirm := fs.Bool("yes", false, "required confirmation flag")
-		reason := fs.String("reason", "", "stop reason")
-		actor := fs.String("actor", "", "unassignment actor")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *streamID <= 0 {
-			log.Fatalf("--id must be > 0")
-		}
-		if !*confirm {
-			log.Fatalf("--yes is required to unassign recording (destructive)")
-		}
-		path := fmt.Sprintf("/api/v1/recording/streams/%d/unassign", *streamID)
-		payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path, map[string]any{
-			"confirm": fmt.Sprintf("unassign:%d", *streamID),
-			"reason":  strings.TrimSpace(*reason),
-			"actor":   strings.TrimSpace(*actor),
-		})
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		fmt.Printf("stream_id=%d unassigned=%v previous_server=%v previous_execution_class=%v\n", *streamID, payload["unassigned"], payload["previous_server_id"], payload["previous_execution_class"])
-	case "assignments":
-		if len(args) >= 2 && (args[1] == "audit" || args[1] == "reconcile") {
-			fs := flag.NewFlagSet("servers assignments "+args[1], flag.ExitOnError)
-			serverID := fs.String("server-id", "", "optional server id filter")
-			executionClassRaw := fs.String("execution-class", "", "optional execution class filter youtube_direct|video_live|image_poll")
-			limit := fs.Int("limit", 500, "row limit")
-			offset := fs.Int("offset", 0, "row offset")
-			apply := fs.Bool("apply", false, "apply unassignments for invalid rows (reconcile only)")
-			reason := fs.String("reason", "reconcile invalid assignment", "unassignment reason (reconcile only)")
-			actor := fs.String("actor", "stoaramactl.servers_assignments_reconcile", "unassignment actor (reconcile only)")
-			backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-			apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-			asJSON := fs.Bool("json", false, "print JSON")
-			_ = fs.Parse(args[2:])
-			if *limit <= 0 || *limit > 2000 {
-				log.Fatalf("--limit must be between 1 and 2000")
-			}
-			if *offset < 0 {
-				log.Fatalf("--offset must be >= 0")
-			}
-			executionClass := strings.TrimSpace(*executionClassRaw)
-			if executionClass != "" {
-				norm, ok := capture.NormalizeExecutionClass(executionClass)
-				if !ok {
-					log.Fatalf("--execution-class must be one of youtube_direct|video_live|image_poll")
-				}
-				if norm == capture.ExecutionClassYouTubeRelay {
-					norm = capture.ExecutionClassYouTubeDirect
-				}
-				executionClass = norm
-			}
-			q := url.Values{}
-			if v := strings.TrimSpace(*serverID); v != "" {
-				q.Set("server_id", v)
-			}
-			if executionClass != "" {
-				q.Set("execution_class", executionClass)
-			}
-			q.Set("limit", strconv.Itoa(*limit))
-			q.Set("offset", strconv.Itoa(*offset))
-			path := "/api/v1/recording/assignments/audit?" + q.Encode()
-			payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
-			items, _ := payload["items"].([]any)
-			if args[1] == "reconcile" && *apply {
-				reconciled := 0
-				for _, raw := range items {
-					it := asMap(raw)
-					issues, _ := it["issues"].([]any)
-					if len(issues) == 0 {
-						continue
-					}
-					streamID := int64FromAny(it["stream_id"])
-					if streamID <= 0 {
-						continue
-					}
-					mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/recording/streams/%d/unassign", streamID), map[string]any{
-						"confirm": fmt.Sprintf("unassign:%d", streamID),
-						"reason":  strings.TrimSpace(*reason),
-						"actor":   strings.TrimSpace(*actor),
-					})
-					reconciled++
-				}
-				payload = mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
-				payload["reconciled"] = reconciled
-			}
-			if *asJSON {
-				printJSON(payload)
-				return
-			}
-			invalidTotal := int64FromAny(payload["invalid_total"])
-			fmt.Printf("assignment_audit total=%v invalid=%d limit=%d offset=%d\n", payload["total"], invalidTotal, *limit, *offset)
-			if args[1] == "reconcile" && *apply {
-				fmt.Printf("reconciled=%v\n", payload["reconciled"])
-			}
-			for _, raw := range items {
-				it := asMap(raw)
-				issues, _ := it["issues"].([]any)
-				issueCodes := make([]string, 0, len(issues))
-				for _, issueRaw := range issues {
-					issue := asMap(issueRaw)
-					if code := strings.TrimSpace(fmt.Sprint(issue["code"])); code != "" {
-						issueCodes = append(issueCodes, code)
-					}
-				}
-				if len(issueCodes) == 0 && args[1] == "audit" {
-					continue
-				}
-				fmt.Printf(
-					"stream_id=%v server_id=%v assignment_execution_class=%v requested_execution_class=%v recording_state=%v capture_type=%v stream_execution_class=%v issues=%s last_frame=%v slug=%v\n",
-					it["stream_id"], it["server_id"], it["assignment_execution_class"], it["requested_execution_class"], it["recording_state"], it["stream_capture_type"], it["stream_execution_class"], strings.Join(issueCodes, ","), it["last_frame_at"], it["stream_slug"],
-				)
-			}
-			return
-		}
-		fs := flag.NewFlagSet("servers assignments", flag.ExitOnError)
-		serverID := fs.String("server-id", "", "optional server id filter")
-		executionClassRaw := fs.String("execution-class", "", "optional execution class filter youtube_direct|video_live|image_poll")
-		limit := fs.Int("limit", 500, "row limit")
-		offset := fs.Int("offset", 0, "row offset")
-		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-		asJSON := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		if *limit <= 0 || *limit > 2000 {
-			log.Fatalf("--limit must be between 1 and 2000")
-		}
-		if *offset < 0 {
-			log.Fatalf("--offset must be >= 0")
-		}
-		executionClass := strings.TrimSpace(*executionClassRaw)
-		if executionClass != "" {
-			norm, ok := capture.NormalizeExecutionClass(executionClass)
-			if !ok {
-				log.Fatalf("--execution-class must be one of youtube_direct|video_live|image_poll")
-			}
-			if norm == capture.ExecutionClassYouTubeRelay {
-				norm = capture.ExecutionClassYouTubeDirect
-			}
-			executionClass = norm
-		}
-		q := url.Values{}
-		if v := strings.TrimSpace(*serverID); v != "" {
-			q.Set("server_id", v)
-		}
-		if executionClass != "" {
-			q.Set("execution_class", executionClass)
-		}
-		q.Set("limit", strconv.Itoa(*limit))
-		q.Set("offset", strconv.Itoa(*offset))
-		path := "/api/v1/recording/assignments?" + q.Encode()
-		payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
-		if *asJSON {
-			printJSON(payload)
-			return
-		}
-		items, _ := payload["items"].([]any)
-		fmt.Printf("assignments=%d limit=%d offset=%d\n", len(items), *limit, *offset)
-		for _, raw := range items {
-			it, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			fmt.Printf(
-				"stream_id=%v server_id=%v execution_class=%v revision=%v provider=%v slug=%v assigned_at=%v last_frame=%v\n",
-				it["stream_id"], it["server_id"], it["execution_class"], it["assignment_revision"], it["provider"], it["stream_slug"], it["assigned_at"], it["last_frame_at"],
-			)
-		}
-	case "capacity":
-		if len(args) < 2 {
-			log.Fatalf("usage: stoaramactl servers capacity <list|groups|heartbeat|stopped> ...")
-		}
-		switch args[1] {
-		case "list":
-			fs := flag.NewFlagSet("servers capacity list", flag.ExitOnError)
-			includeInactive := fs.Bool("include-inactive", false, "include inactive/stale capacity rows")
-			backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-			apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-			asJSON := fs.Bool("json", false, "print JSON")
-			_ = fs.Parse(args[2:])
-			path := fmt.Sprintf("/api/v1/dashboard/recording/server-capacity?include_inactive=%t", *includeInactive)
-			payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
-			if *asJSON {
-				printJSON(payload)
-				return
-			}
-			items, _ := payload["items"].([]any)
-			fmt.Printf("capacity_rows=%d include_inactive=%t\n", len(items), *includeInactive)
-			for _, raw := range items {
-				it, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				group := strings.TrimSpace(fmt.Sprint(it["capacity_group"]))
-				if group == "" || group == "<nil>" {
-					group = strings.TrimSpace(fmt.Sprint(it["execution_class"]))
-				}
-				executionClasses := "-"
-				if arr, ok := it["execution_classes"].([]any); ok && len(arr) > 0 {
-					parts := make([]string, 0, len(arr))
-					for _, rawExecutionClass := range arr {
-						v := strings.TrimSpace(fmt.Sprint(rawExecutionClass))
-						if v != "" && v != "<nil>" {
-							parts = append(parts, v)
-						}
-					}
-					sort.Strings(parts)
-					if len(parts) > 0 {
-						executionClasses = strings.Join(parts, ",")
-					}
-				}
-				availableExecutionClasses := "-"
-				if arr, ok := it["available_execution_classes"].([]any); ok && len(arr) > 0 {
-					parts := make([]string, 0, len(arr))
-					for _, rawExecutionClass := range arr {
-						v := strings.TrimSpace(fmt.Sprint(rawExecutionClass))
-						if v != "" && v != "<nil>" {
-							parts = append(parts, v)
-						}
-					}
-					sort.Strings(parts)
-					if len(parts) > 0 {
-						availableExecutionClasses = strings.Join(parts, ",")
-					}
-				}
-				fmt.Printf(
-					"server_id=%v group=%s execution_classes=%s available=%s active=%v draining=%v assigned=%v/%v free=%v lease_expires_at=%v\n",
-					it["server_id"], group, executionClasses, availableExecutionClasses, it["active"], it["draining"], it["assigned_count"], it["max_active"], it["free_slots"], it["lease_expires_at"],
-				)
-			}
-		case "groups":
-			fs := flag.NewFlagSet("servers capacity groups", flag.ExitOnError)
-			backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-			apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-			asJSON := fs.Bool("json", false, "print JSON")
-			_ = fs.Parse(args[2:])
-			payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/dashboard/recording/capacity")
-			if *asJSON {
-				printJSON(payload)
-				return
-			}
-			items, _ := payload["items"].([]any)
-			fmt.Printf("capacity_groups=%d\n", len(items))
-			for _, raw := range items {
-				it, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				group := strings.TrimSpace(fmt.Sprint(it["capacity_group"]))
-				if group == "" || group == "<nil>" {
-					group = strings.TrimSpace(fmt.Sprint(it["execution_class"]))
-				}
-				executionClasses := "-"
-				if arr, ok := it["execution_classes"].([]any); ok && len(arr) > 0 {
-					parts := make([]string, 0, len(arr))
-					for _, rawExecutionClass := range arr {
-						v := strings.TrimSpace(fmt.Sprint(rawExecutionClass))
-						if v != "" && v != "<nil>" {
-							parts = append(parts, v)
-						}
-					}
-					sort.Strings(parts)
-					if len(parts) > 0 {
-						executionClasses = strings.Join(parts, ",")
-					}
-				}
-				fmt.Printf("group=%s execution_classes=%s max_active=%v active=%v workers=%v managed=%v source=%v updated_at=%v\n",
-					group, executionClasses, it["max_active"], it["active"], it["active_workers"], it["managed"], it["capacity_source"], it["updated_at"])
-			}
-		case "set", "set-bulk":
-			log.Fatalf("servers capacity %s is removed; capacity is heartbeat-managed. Use `stoaramactl servers capacity heartbeat` from the server process path instead", args[1])
-		case "heartbeat":
-			fs := flag.NewFlagSet("servers capacity heartbeat", flag.ExitOnError)
-			serverID := fs.String("server-id", "", "server id")
-			captureSharedCapacity := fs.Int("capture-shared-capacity", 0, "max active video_live streams")
-			executionClassCapacityRaw := fs.String("execution-class-capacity", "", "comma-separated execution_class=max_active list (e.g. video_live=8,youtube_direct=2)")
-			drainingExecutionClassesRaw := fs.String("draining-execution-classes", "", "optional comma-separated execution classes to mark draining")
-			leaseSec := fs.Int("lease-sec", 45, "heartbeat lease seconds")
-			metadataJSON := fs.String("metadata-json", "{}", "metadata JSON object")
-			backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-			apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-			asJSON := fs.Bool("json", false, "print JSON")
-			_ = fs.Parse(args[2:])
-			if strings.TrimSpace(*serverID) == "" {
-				log.Fatalf("--server-id is required")
-			}
-			if *leaseSec <= 0 || *leaseSec > 3600 {
-				log.Fatalf("--lease-sec must be between 1 and 3600")
-			}
-			executionClassCapacity := map[string]int{}
-			if *captureSharedCapacity > 0 {
-				executionClassCapacity[capture.ExecutionClassVideoLive] = *captureSharedCapacity
-			}
-			if strings.TrimSpace(*executionClassCapacityRaw) != "" {
-				if len(executionClassCapacity) > 0 {
-					log.Fatalf("use either --capture-shared-capacity or --execution-class-capacity, not both")
-				}
-				parsedExecutionClassCapacity, err := parseExecutionClassCapacityCSV(*executionClassCapacityRaw)
-				if err != nil {
-					log.Fatalf("parse --execution-class-capacity: %v", err)
-				}
-				executionClassCapacity = parsedExecutionClassCapacity
-			}
-			if len(executionClassCapacity) == 0 {
-				log.Fatalf("one of --capture-shared-capacity or --execution-class-capacity is required")
-			}
-			drainingExecutionClasses, err := parseExecutionClassSetCSV(*drainingExecutionClassesRaw)
-			if err != nil {
-				log.Fatalf("parse --draining-execution-classes: %v", err)
-			}
-			meta := map[string]any{}
-			if raw := strings.TrimSpace(*metadataJSON); raw != "" {
-				if err := json.Unmarshal([]byte(raw), &meta); err != nil {
-					log.Fatalf("invalid --metadata-json: %v", err)
-				}
-			}
-			executionClasses := make([]string, 0, len(executionClassCapacity))
-			for executionClass := range executionClassCapacity {
-				executionClasses = append(executionClasses, executionClass)
-			}
-			sort.Strings(executionClasses)
-			items := make([]map[string]any, 0, len(executionClasses))
-			for _, executionClass := range executionClasses {
-				_, draining := drainingExecutionClasses[executionClass]
-				items = append(items, map[string]any{
-					"execution_class": executionClass,
-					"max_active":      executionClassCapacity[executionClass],
-					"draining":        draining,
-				})
-			}
-			payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/recording/servers/heartbeat", map[string]any{
-				"server_id":         strings.TrimSpace(*serverID),
-				"lease_sec":         *leaseSec,
-				"execution_classes": items,
-				"metadata_json":     meta,
-			})
-			if *asJSON {
-				printJSON(payload)
-				return
-			}
-			fmt.Printf("server_id=%v heartbeat_ok=%v execution_classes=%v\n", payload["server_id"], payload["ok"], payload["execution_classes"])
-		case "stopped":
-			fs := flag.NewFlagSet("servers capacity stopped", flag.ExitOnError)
-			serverID := fs.String("server-id", "", "server id")
-			backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-			apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
-			asJSON := fs.Bool("json", false, "print JSON")
-			_ = fs.Parse(args[2:])
-			if strings.TrimSpace(*serverID) == "" {
-				log.Fatalf("--server-id is required")
-			}
-			payload := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/recording/servers/stopped", map[string]any{
-				"server_id": strings.TrimSpace(*serverID),
-			})
-			if *asJSON {
-				printJSON(payload)
-				return
-			}
-			fmt.Printf("server_id=%s stopped=%v\n", strings.TrimSpace(*serverID), payload["ok"])
-		default:
-			log.Fatalf("unknown servers capacity subcommand: %s", args[1])
-		}
-	default:
-		log.Fatalf("unknown servers subcommand: %s", args[0])
 	}
 }
 
@@ -5663,151 +4553,6 @@ func maxInt(a, b int) int {
 	return b
 }
 
-func runWorkerHeartbeatLoop(ctx context.Context, client *captureapi.Client, req captureapi.WorkerHeartbeatRequest, interval time.Duration) error {
-	if client == nil {
-		return fmt.Errorf("capture api client is nil")
-	}
-	if strings.TrimSpace(req.WorkerID) == "" {
-		return fmt.Errorf("worker heartbeat requires worker_id")
-	}
-	if req.Capacity <= 0 {
-		return fmt.Errorf("worker heartbeat requires capacity > 0")
-	}
-	if _, ok := capture.NormalizeExecutionClass(req.ExecutionClass); !ok {
-		return fmt.Errorf("worker heartbeat requires valid execution_class")
-	}
-	if interval <= 0 {
-		interval = 15 * time.Second
-	}
-	if req.LeaseSec <= 0 {
-		req.LeaseSec = int((3 * interval).Seconds())
-	}
-	retryDelay := 5 * time.Second
-	if retryDelay > interval {
-		retryDelay = interval
-	}
-	send := func() error {
-		hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer hbCancel()
-		return client.WorkerHeartbeat(hbCtx, req)
-	}
-	consecutiveFailures := 0
-	var firstFailureAt time.Time
-	nextDelay := time.Duration(0)
-	for {
-		if nextDelay > 0 {
-			timer := time.NewTimer(nextDelay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-		err := send()
-		if err != nil {
-			consecutiveFailures++
-			if firstFailureAt.IsZero() {
-				firstFailureAt = time.Now().UTC()
-			}
-			log.Printf(
-				"worker heartbeat loop: heartbeat failed consecutive=%d degraded_for=%s: %v",
-				consecutiveFailures,
-				time.Since(firstFailureAt).Round(time.Second),
-				err,
-			)
-			nextDelay = retryDelay
-			continue
-		}
-		if consecutiveFailures > 0 {
-			log.Printf(
-				"worker heartbeat loop: recovered after %d consecutive failures degraded_for=%s",
-				consecutiveFailures,
-				time.Since(firstFailureAt).Round(time.Second),
-			)
-			consecutiveFailures = 0
-			firstFailureAt = time.Time{}
-		}
-		nextDelay = interval
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-	}
-}
-
-func runRecordingServerHeartbeatLoop(ctx context.Context, client *captureapi.Client, req captureapi.RecordingServerHeartbeatRequest, interval time.Duration) error {
-	if client == nil {
-		return fmt.Errorf("capture api client is nil")
-	}
-	if strings.TrimSpace(req.ServerID) == "" {
-		return fmt.Errorf("recording server heartbeat requires server_id")
-	}
-	if len(req.ExecutionClasses) == 0 {
-		return fmt.Errorf("recording server heartbeat requires execution_classes")
-	}
-	if interval <= 0 {
-		interval = 15 * time.Second
-	}
-	if req.LeaseSec <= 0 {
-		req.LeaseSec = int((3 * interval).Seconds())
-	}
-	retryDelay := 5 * time.Second
-	if retryDelay > interval {
-		retryDelay = interval
-	}
-	send := func() error {
-		hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer hbCancel()
-		return client.RecordingServerHeartbeat(hbCtx, req)
-	}
-	consecutiveFailures := 0
-	var firstFailureAt time.Time
-	nextDelay := time.Duration(0)
-	for {
-		if nextDelay > 0 {
-			timer := time.NewTimer(nextDelay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-		err := send()
-		if err != nil {
-			consecutiveFailures++
-			if firstFailureAt.IsZero() {
-				firstFailureAt = time.Now().UTC()
-			}
-			log.Printf(
-				"recording server heartbeat loop: heartbeat failed consecutive=%d degraded_for=%s: %v",
-				consecutiveFailures,
-				time.Since(firstFailureAt).Round(time.Second),
-				err,
-			)
-			nextDelay = retryDelay
-			continue
-		}
-		if consecutiveFailures > 0 {
-			log.Printf(
-				"recording server heartbeat loop: recovered after %d consecutive failures degraded_for=%s",
-				consecutiveFailures,
-				time.Since(firstFailureAt).Round(time.Second),
-			)
-			consecutiveFailures = 0
-			firstFailureAt = time.Time{}
-		}
-		nextDelay = interval
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-	}
-}
-
 func printStreamDetail(ctx context.Context, pool *pgxpool.Pool, streamID int64, pipelineID string, resultsLimit int, detectionsLimit int) {
 	type streamDetail struct {
 		ID             int64
@@ -6042,136 +4787,6 @@ func parseInt64CSV(v string) ([]int64, error) {
 	return out, nil
 }
 
-func parseModeCSV(v string) ([]capture.Mode, error) {
-	parts := splitCSV(v)
-	out := make([]capture.Mode, 0, len(parts))
-	for _, p := range parts {
-		mode := capture.NormalizeMode(p)
-		if mode == capture.ModeUnsupported {
-			return nil, fmt.Errorf("invalid capture mode %q", p)
-		}
-		out = append(out, mode)
-	}
-	return out, nil
-}
-
-func parseModeSetCSV(v string) (map[capture.Mode]struct{}, error) {
-	parts := splitCSV(v)
-	out := make(map[capture.Mode]struct{}, len(parts))
-	for _, p := range parts {
-		mode := capture.NormalizeMode(p)
-		if mode == capture.ModeAuto || mode == capture.ModeUnsupported {
-			return nil, fmt.Errorf("invalid capture mode %q", p)
-		}
-		out[mode] = struct{}{}
-	}
-	return out, nil
-}
-
-func parseModeCapacityCSV(v string) (map[capture.Mode]int, error) {
-	parts := splitCSV(v)
-	out := make(map[capture.Mode]int, len(parts))
-	for _, part := range parts {
-		eq := strings.Index(part, "=")
-		if eq <= 0 || eq >= len(part)-1 {
-			return nil, fmt.Errorf("invalid mode capacity %q, expected mode=max_active", part)
-		}
-		modeRaw := strings.TrimSpace(part[:eq])
-		mode := capture.NormalizeMode(modeRaw)
-		if mode == capture.ModeAuto || mode == capture.ModeUnsupported {
-			return nil, fmt.Errorf("invalid mode %q", modeRaw)
-		}
-		nRaw := strings.TrimSpace(part[eq+1:])
-		n, err := strconv.Atoi(nRaw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid capacity for mode %s: %w", mode, err)
-		}
-		if n < 0 {
-			return nil, fmt.Errorf("capacity must be >= 0 for mode %s", mode)
-		}
-		out[mode] = n
-	}
-	return out, nil
-}
-
-func parseCaptureServerExecutionClassesCSV(v string) ([]capture.Mode, error) {
-	parts := splitCSV(v)
-	out := make([]capture.Mode, 0, len(parts)*2)
-	seen := make(map[capture.Mode]struct{}, len(parts)*2)
-	for _, part := range parts {
-		executionClass, ok := capture.NormalizeExecutionClass(part)
-		if !ok {
-			return nil, fmt.Errorf("invalid execution_class %q", part)
-		}
-		var modes []capture.Mode
-		switch executionClass {
-		case capture.ExecutionClassVideoLive:
-			modes = []capture.Mode{capture.ModeHLSLive, capture.ModeFFmpegDirect}
-		default:
-			return nil, fmt.Errorf("execution_class %s is unsupported for capture-server", executionClass)
-		}
-		for _, mode := range modes {
-			if _, ok := seen[mode]; ok {
-				continue
-			}
-			seen[mode] = struct{}{}
-			out = append(out, mode)
-		}
-	}
-	return out, nil
-}
-
-func parseCaptureServerExecutionClassesSetCSV(v string) (map[capture.Mode]struct{}, error) {
-	modes, err := parseCaptureServerExecutionClassesCSV(v)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[capture.Mode]struct{}, len(modes))
-	for _, mode := range modes {
-		out[mode] = struct{}{}
-	}
-	return out, nil
-}
-
-func parseExecutionClassSetCSV(v string) (map[string]struct{}, error) {
-	parts := splitCSV(v)
-	out := make(map[string]struct{}, len(parts))
-	for _, p := range parts {
-		executionClass, ok := capture.NormalizeExecutionClass(p)
-		if !ok {
-			return nil, fmt.Errorf("invalid execution_class %q", p)
-		}
-		out[executionClass] = struct{}{}
-	}
-	return out, nil
-}
-
-func parseExecutionClassCapacityCSV(v string) (map[string]int, error) {
-	parts := splitCSV(v)
-	out := make(map[string]int, len(parts))
-	for _, part := range parts {
-		eq := strings.Index(part, "=")
-		if eq <= 0 || eq >= len(part)-1 {
-			return nil, fmt.Errorf("invalid execution_class capacity %q, expected execution_class=max_active", part)
-		}
-		executionClassRaw := strings.TrimSpace(part[:eq])
-		executionClass, ok := capture.NormalizeExecutionClass(executionClassRaw)
-		if !ok {
-			return nil, fmt.Errorf("invalid execution_class %q", executionClassRaw)
-		}
-		nRaw := strings.TrimSpace(part[eq+1:])
-		n, err := strconv.Atoi(nRaw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid capacity for execution_class %s: %w", executionClass, err)
-		}
-		if n < 0 {
-			return nil, fmt.Errorf("capacity must be >= 0 for execution_class %s", executionClass)
-		}
-		out[executionClass] = n
-	}
-	return out, nil
-}
-
 func defaultBackendAPIURL() string {
 	if v := strings.TrimSpace(os.Getenv("BACKEND_API_URL")); v != "" {
 		return v
@@ -6179,79 +4794,11 @@ func defaultBackendAPIURL() string {
 	return strings.TrimSpace(os.Getenv("INFERCTL_API_URL"))
 }
 
-func envIntOrDefault(key string, fallback int) int {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		log.Fatalf("invalid %s: %v", key, err)
-	}
-	return n
-}
-
 func defaultString(v string, fallback string) string {
 	if strings.TrimSpace(v) == "" {
 		return fallback
 	}
 	return v
-}
-
-func localServerID(hostname string, fallbackWorkerID string) string {
-	fallback := strings.TrimSpace(fallbackWorkerID)
-	if fallback != "" {
-		return strings.ToLower(sanitizeFilename(fallback))
-	}
-	host := strings.TrimSpace(hostname)
-	if host != "" {
-		if i := strings.IndexByte(host, '.'); i > 0 {
-			host = host[:i]
-		}
-		host = sanitizeFilename(host)
-		if host != "" {
-			return strings.ToLower(host)
-		}
-	}
-	return "local-runner"
-}
-
-func defaultCaptureServerWorkerID(fallback string) string {
-	host := ""
-	if raw, err := os.Hostname(); err == nil {
-		host = strings.TrimSpace(raw)
-	}
-	if host != "" {
-		if i := strings.IndexByte(host, '.'); i > 0 {
-			host = host[:i]
-		}
-		host = sanitizeFilename(host)
-		if host != "" {
-			return "capture-server-" + strings.ToLower(host)
-		}
-	}
-	fallback = strings.TrimSpace(fallback)
-	if fallback == "" {
-		fallback = "capture-server"
-	}
-	return "capture-server-" + sanitizeFilename(fallback)
-}
-
-func defaultCaptureServerID(fallbackWorkerID string) string {
-	if rawID := strings.TrimSpace(doMetadataValue("id")); rawID != "" {
-		return "do-" + sanitizeFilename(rawID)
-	}
-	if rawName := strings.TrimSpace(doMetadataValue("hostname")); rawName != "" {
-		name := sanitizeFilename(rawName)
-		if name != "" {
-			return "do-" + strings.ToLower(name)
-		}
-	}
-	host := ""
-	if raw, err := os.Hostname(); err == nil {
-		host = strings.TrimSpace(raw)
-	}
-	return localServerID(host, fallbackWorkerID)
 }
 
 func doMetadataValue(path string) string {
