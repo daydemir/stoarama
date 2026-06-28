@@ -38,9 +38,9 @@ type recordingCreateRequest struct {
 	// worker re-resolves each fire); any client-sent stream_url is ignored.
 	StreamID             *int64 `json:"stream_id"`
 	StorageDestinationID int64  `json:"storage_destination_id"`
-	CronExpr             string     `json:"cron_expr"`
-	CronTimezone         string     `json:"cron_timezone"`
-	ClipDurationSec      int        `json:"clip_duration_sec"`
+	CronExpr             string `json:"cron_expr"`
+	CronTimezone         string `json:"cron_timezone"`
+	ClipDurationSec      int    `json:"clip_duration_sec"`
 	// Capture window. StartAt defaults to now() (start immediately); EndAt is
 	// open-ended when nil. When both are set, EndAt must be strictly after StartAt.
 	StartAt *time.Time `json:"start_at"`
@@ -416,7 +416,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	}
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, object_key
+		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, object_key, purged_at
 		FROM recording_clips
 		WHERE recording_id=$1
 		ORDER BY fire_at DESC
@@ -430,24 +430,28 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	items := make([]map[string]any, 0, 16)
 	for rows.Next() {
 		var (
+			clipID      int64
 			fireAt      time.Time
 			clipStartAt time.Time
 			clipEndAt   time.Time
 			sizeBytes   int64
 			durationMs  int64
 			objectKey   string
+			purgedAt    *time.Time
 		)
-		if err := rows.Scan(&fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &objectKey); err != nil {
+		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &objectKey, &purgedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
 			return
 		}
 		items = append(items, map[string]any{
+			"id":            clipID,
 			"fire_at":       fireAt.UTC(),
 			"clip_start_at": clipStartAt.UTC(),
 			"clip_end_at":   clipEndAt.UTC(),
 			"size_bytes":    sizeBytes,
 			"duration_ms":   durationMs,
 			"object_key":    objectKey,
+			"purged":        purgedAt != nil,
 		})
 	}
 	if err := rows.Err(); err != nil {

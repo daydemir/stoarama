@@ -214,9 +214,18 @@
     .clip-summary { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
     .clip-summary b { color: var(--text); }
     .clip-list { display: grid; gap: 6px; }
-    .clip-row { display: flex; flex-wrap: wrap; gap: 4px 16px; font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 6px 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+    .clip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 6px 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
     .clip-row .clip-when { color: var(--text); }
+    .clip-row.purged { opacity: 0.45; text-decoration: line-through; }
+    .clip-row-actions { margin-left: auto; display: flex; gap: 6px; }
+    .clip-row-actions button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
+    .clip-bulk { margin: 12px 0 8px; }
+    .clip-bulk button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
     .clip-actions-note { margin-top: 12px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 10px; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    /* Per-card blocking "no card" state */
+    .card-blocked { margin-top: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 13px; color: var(--text); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+    .card-blocked b { color: var(--warn); }
+    .card-blocked button { width: auto; min-width: 0; min-height: 30px; padding: 5px 12px; font-size: 13px; }
     /* Segmented control */
     .seg { display: flex; flex-wrap: wrap; gap: 6px; }
     .seg button {
@@ -261,6 +270,7 @@
     .inline-link:hover { text-decoration: underline; background: none; }
     .empty-hero-sub { color: var(--muted); font-size: 15px; line-height: 1.5; margin: 0 0 18px; }
     .composer-footnote { margin: 14px 0 12px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+    .composer-footnote.warn { color: var(--warn); font-weight: 500; }
     .interstitial-body { color: var(--muted); line-height: 1.6; margin: 0 0 16px; }
     @media (max-width: 640px) {
       .grid-2 { grid-template-columns: 1fr; }
@@ -1383,6 +1393,14 @@
       const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
         ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
 
+      // Blocking no-card state: when the account has no card on file, capture is
+      // held by the server gate. Make that unmistakable per card so a researcher
+      // never assumes recording is happening when it is silently held.
+      const blocked = rec.needs_card === true
+        ? `<div class="card-blocked"><span><b>Not recording</b> — add a card to start capturing.</span>`
+          + `<button type="button" data-addcard="${id}">Add a card</button></div>`
+        : '';
+
       // Linked to a catalog stream: title = stream name, subtitle = location.
       // Otherwise the source URL is the subtitle, as before.
       const streamName = String(rec.stream_name || '').trim();
@@ -1405,6 +1423,7 @@
           </div>
           <div class="card-meta">${metaParts.join('')}</div>
           ${errLine}
+          ${blocked}
           <div class="card-actions">${actions}</div>
           <div class="clip-detail hidden" data-clipdetail="${id}"></div>
         </div>`;
@@ -1445,6 +1464,19 @@
         b.addEventListener('click', () => deleteRecording(b)));
       els.cards.querySelectorAll('button[data-clips]').forEach((b) =>
         b.addEventListener('click', () => toggleClipDetail(b.getAttribute('data-clips'))));
+      els.cards.querySelectorAll('button[data-addcard]').forEach((b) =>
+        b.addEventListener('click', () => addCardFromCard(b)));
+    }
+
+    // Per-card "Add a card" action: same Checkout flow the top banner triggers.
+    async function addCardFromCard(btn) {
+      btn.disabled = true;
+      try {
+        await startCardCheckout();
+      } catch (err) {
+        window.alert(String(err.message || err));
+        btn.disabled = false;
+      }
     }
 
     // ---- Clip detail (per-recording clip periods) ----
@@ -1490,16 +1522,22 @@
       panel.classList.remove('hidden');
       if (panel.getAttribute('data-loaded') === '1') return;
       panel.innerHTML = `<div class="clip-summary">Loading clips...</div>`;
+      await reloadClipDetail(panel, id);
+      panel.setAttribute('data-loaded', '1');
+    }
+
+    // Fetch + render a recording's clip panel; used on first open and after any
+    // per-clip or bulk delete so the list reflects the new purged state.
+    async function reloadClipDetail(panel, id) {
       try {
         const payload = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}/clips`);
-        renderClipDetail(panel, payload);
-        panel.setAttribute('data-loaded', '1');
+        renderClipDetail(panel, id, payload);
       } catch (err) {
         panel.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
       }
     }
 
-    function renderClipDetail(panel, payload) {
+    function renderClipDetail(panel, recId, payload) {
       const items = Array.isArray(payload.items) ? payload.items : [];
       const total = Number(payload.total || items.length);
       if (items.length === 0) {
@@ -1513,14 +1551,74 @@
       const lastWhen = new Date(newest.fire_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
       const shownNote = total > items.length ? ` (showing latest ${items.length})` : '';
       const summary = `<div class="clip-summary"><b>${total}</b> clip${total === 1 ? '' : 's'}${shownNote} &middot; ${escapeHTML(firstWhen)} → ${escapeHTML(lastWhen)}</div>`;
-      const rows = items.map((c) => `
-        <div class="clip-row">
+      const liveCount = items.filter((c) => c.purged !== true).length;
+      const bulk = liveCount > 0
+        ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
+        : '';
+      const rows = items.map((c) => {
+        const cid = Number(c.id);
+        const purged = c.purged === true;
+        const actions = purged
+          ? `<span>deleted</span>`
+          : `<div class="clip-row-actions">`
+            + `<button type="button" class="secondary" data-clipdownload="${recId}:${cid}">Download</button>`
+            + `<button type="button" class="danger" data-clipdelete="${recId}:${cid}">Delete</button>`
+            + `</div>`;
+        return `
+        <div class="clip-row${purged ? ' purged' : ''}">
           <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
           <span>${escapeHTML(formatDuration(c.duration_ms))}</span>
           <span>${escapeHTML(formatBytes(c.size_bytes))}</span>
-        </div>`).join('');
-      const placeholder = `<div class="clip-actions-note">Per-clip Download / Send to S3 / Delete actions are coming in a later phase.</div>`;
-      panel.innerHTML = summary + `<div class="clip-list">${rows}</div>` + placeholder;
+          ${actions}
+        </div>`;
+      }).join('');
+      // "Send to my S3" / transfer is a labeled placeholder wired in a later increment.
+      const placeholder = `<div class="clip-actions-note">Send to my S3 (transfer to another bucket) is coming in a later phase.</div>`;
+      panel.innerHTML = summary + bulk + `<div class="clip-list">${rows}</div>` + placeholder;
+      wireClipActions(panel);
+    }
+
+    function wireClipActions(panel) {
+      panel.querySelectorAll('button[data-clipdownload]').forEach((b) =>
+        b.addEventListener('click', () => downloadClip(b.getAttribute('data-clipdownload'))));
+      panel.querySelectorAll('button[data-clipdelete]').forEach((b) =>
+        b.addEventListener('click', () => deleteClip(panel, b.getAttribute('data-clipdelete'))));
+      panel.querySelectorAll('button[data-clipsdeleteall]').forEach((b) =>
+        b.addEventListener('click', () => deleteAllClips(panel, b.getAttribute('data-clipsdeleteall'))));
+    }
+
+    // Resolve a presigned URL for one clip and navigate to it to trigger the
+    // browser download.
+    async function downloadClip(ref) {
+      const [recId, clipId] = String(ref || '').split(':');
+      try {
+        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download`);
+        if (out && out.url) { window.location.assign(out.url); return; }
+        window.alert('No download URL returned.');
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    async function deleteClip(panel, ref) {
+      const [recId, clipId] = String(ref || '').split(':');
+      if (!window.confirm('Delete this clip from your bucket? This cannot be undone.')) return;
+      try {
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}`, { method: 'DELETE' });
+        await reloadClipDetail(panel, recId);
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    async function deleteAllClips(panel, recId) {
+      if (!window.confirm('Delete ALL clips for this recording from your bucket? This cannot be undone.')) return;
+      try {
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips`, { method: 'DELETE' });
+        await reloadClipDetail(panel, recId);
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
     }
 
     async function mutateRecording(id, action) {
@@ -1760,11 +1858,12 @@
       const storageCharge = ', plus $0.10/GB-month for managed storage';
       els.composerFootnote.textContent = state.billingEnabled
         ? (needsCard
-            ? `Add a card to start recording. No charge now; you are billed ${daysCharge}${managed ? storageCharge : ''}, monthly.`
+            ? `Nothing will be captured until you add a card. No charge now; you are billed ${daysCharge}${managed ? storageCharge : ''}, monthly.`
             : (managed
                 ? '$0.50/day for days you record, plus $0.10/GB-month for managed storage, billed monthly.'
                 : '$0.50/day, billed monthly for days you record.'))
         : '';
+      els.composerFootnote.classList.toggle('warn', state.billingEnabled && needsCard);
       els.composerFootnote.classList.toggle('hidden', !state.billingEnabled);
     }
 

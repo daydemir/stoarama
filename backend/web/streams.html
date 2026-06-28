@@ -1785,7 +1785,6 @@ const operationsPanel = $('operationsPanel');
 const discoveryPanel = $('discoveryPanel');
 const inferencesPanel = $('inferencesPanel');
 const serversPanel = $('serversPanel');
-const recordingPanel = $('recordingPanel');
 const detailPanel = $('detailPanel');
 const topbarAccountStatus = $('topbarAccountStatus');
 const topbarAdminLink = $('topbarAdminLink');
@@ -1793,7 +1792,6 @@ const topbarAdminLink = $('topbarAdminLink');
 // top tabs
 const tabOverview = $('tabOverview');
 const tabStreams = $('tabStreams');
-const tabRecording = $('tabRecording');
 const tabOperations = $('tabOperations');
 const opsViewDiscovery = $('opsViewDiscovery');
 const opsViewPipelines = $('opsViewPipelines');
@@ -1887,13 +1885,7 @@ const serversAssignStatus = $('serversAssignStatus');
 const serversAssignmentsStatus = $('serversAssignmentsStatus');
 const serversAssignmentsRows = $('serversAssignmentsRows');
 
-// recording tab
-const recordingIntervalSecInput = $('recordingIntervalSec');
-const saveRecordingIntervalBtn = $('saveRecordingInterval');
-const recordingSettingsStatus = $('recordingSettingsStatus');
-const recordingCapacityRows = $('recordingCapacityRows');
-const reloadRecordingCapacityBtn = $('reloadRecordingCapacity');
-const recordingCapacityStatus = $('recordingCapacityStatus');
+// recording streams table
 const recSearch = $('recSearch');
 const recTagFilter = $('recTagFilter');
 const recModeFilter = $('recModeFilter');
@@ -1999,7 +1991,6 @@ let streamsView = 'table';      // 'table' | 'map'
 let streamPageSize = Number(localStorage.getItem('streamPageSize') || '100');
 let streamSortBy = 'avg_people_per_inferenced_capture';
 let streamSortDir = 'desc';
-let overviewRecordingCapacity = 0;
 let overviewStreamsTotal = 0;
 let overviewRecordingOn = 0;
 if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
@@ -2063,8 +2054,6 @@ const queuedImageStreamIDs = new Set();
 const inFlightImageStreamIDs = new Set();
 let imageQueueTimer = null;
 let streamImageObserver = null;
-
-recordingIntervalSecInput.value = '1';
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 function esc(v) {
@@ -3259,14 +3248,6 @@ function setRecStatus(msg, cls = '') {
   recStatus.className = `status-text ${cls}`;
   recStatus.textContent = msg;
 }
-function setRecSettingsStatus(msg, cls = '') {
-  recordingSettingsStatus.className = `status-text ${cls}`;
-  recordingSettingsStatus.textContent = msg;
-}
-function setRecCapacityStatus(msg, cls = '') {
-  recordingCapacityStatus.className = `status-text ${cls}`;
-  recordingCapacityStatus.textContent = msg;
-}
 function setOverviewStatus(msg, cls = '') {
   overviewStatus.className = `status-text ${cls}`;
   overviewStatus.textContent = msg;
@@ -3291,12 +3272,10 @@ function showPanel(which) {
   if (discoveryPanel) discoveryPanel.style.display = which === 'discovery' ? '' : 'none';
   inferencesPanel.style.display = which === 'pipelines' ? '' : 'none';
   if (serversPanel) serversPanel.style.display = which === 'servers' ? '' : 'none';
-  if (recordingPanel) recordingPanel.style.display = which === 'recording' ? '' : 'none';
   detailPanel.style.display = which === 'detail' ? '' : 'none';
 
   if (tabOverview) tabOverview.classList.toggle('active', which === 'overview');
   tabStreams.classList.toggle('active', which === 'streams' || which === 'detail');
-  if (tabRecording) tabRecording.classList.toggle('active', which === 'recording');
   if (tabOperations) tabOperations.classList.toggle('active', operationsVisible);
   if (opsViewDiscovery) opsViewDiscovery.classList.toggle('active', which === 'discovery');
   if (opsViewPipelines) opsViewPipelines.classList.toggle('active', which === 'pipelines');
@@ -3876,21 +3855,13 @@ function clearImageCache() {
 
 // ─── Overview metrics ─────────────────────────────────────────────────────────
 async function loadOverview() {
-  const [ov, qh, capacityPayload] = await Promise.all([
+  const [ov, qh] = await Promise.all([
     fetchJSON('/api/v1/dashboard/overview'),
     fetchJSON('/api/v1/dashboard/queue-health'),
-    fetchJSON('/api/v1/dashboard/recording/capacity'),
   ]);
   streamAllTotal = Number(ov.streams_total || 0);
   overviewStreamsTotal = Number(ov.streams_total || 0);
   overviewRecordingOn = Number(ov.recording_on || 0);
-  const capacityItems = capacityPayload && Array.isArray(capacityPayload.items) ? capacityPayload.items : [];
-  overviewRecordingCapacity = capacityItems.reduce((acc, it) => {
-    const group = String(it && (it.capacity_group || it.mode) || '').trim();
-    const executionClasses = Array.isArray(it && it.execution_classes) ? it.execution_classes.map((v) => String(v || '').trim()).filter((v) => v && v !== 'image_poll') : [];
-    if (group === 'image_poll' || executionClasses.length === 0) return acc;
-    return acc + Number(it && it.max_active || 0);
-  }, 0);
   renderOverviewMetricChips();
   if (overviewSummaryChips) {
     overviewSummaryChips.innerHTML = [
@@ -3920,7 +3891,6 @@ function renderOverviewMetricChips() {
   metricsRow.innerHTML = [
     ['streams', overviewStreamsTotal],
     ['recording', overviewRecordingOn],
-    ['recording capacity', overviewRecordingCapacity],
   ].map(([label, val]) =>
     `<span class="metric-chip">${esc(label)} <b>${esc(String(val ?? 0))}</b></span>`
   ).join('');
@@ -4497,7 +4467,6 @@ async function reloadServerDomainViews() {
   await Promise.all([
     loadOverview(),
     loadServers(),
-    loadRecordingCapacity(),
     loadServersAssignments(),
   ]);
 }
@@ -4506,9 +4475,6 @@ async function runServersAssignFlow(streamID) {
   const stream = await loadStreamForAssignment(streamID);
   await assignRecordingStream(stream);
   await reloadServerDomainViews();
-  if (mainTab === 'recording') {
-    await loadRecStreams();
-  }
   if (detailData && detailData.stream && Number(detailData.stream.id || 0) === Number(stream.id || 0)) {
     await loadDetail();
   }
@@ -5283,44 +5249,6 @@ async function loadRecStreams() {
   renderRecRows();
 }
 
-function renderRecordingCapacityRows(items) {
-  recordingCapacityRows.innerHTML = '';
-  for (const it of (items || [])) {
-    const group = String(it.capacity_group || it.mode || '').trim() || '-';
-    const executionClasses = Array.isArray(it.execution_classes) ? it.execution_classes.map((v) => String(v || '').trim()).filter((v) => v && v !== 'image_poll') : [];
-    if (group === 'image_poll' || executionClasses.length === 0) continue;
-    const maxActive = Number(it.max_active || 0);
-    const activeWorkers = Number(it.active_workers || 0);
-    const modeDisabled = maxActive === 0;
-    const sourceLabel = String(it.capacity_source || '').trim() || 'server_heartbeat';
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.style.gap = '8px';
-    row.innerHTML = `
-      <span class="mono fs11" style="min-width:120px;">${esc(group)}</span>
-      <span class="muted fs10 mono">${esc(executionClasses.join('/'))}</span>
-      <span class="check-label fs11">max ${maxActive}</span>
-      <span class="muted fs11 mono">active ${Number(it.active || 0)}/${maxActive}</span>
-      <span class="tag tag-muted">${esc(sourceLabel)} (${activeWorkers} servers)</span>
-      ${modeDisabled ? '<span class="tag tag-muted">disabled</span>' : ''}
-    `;
-    recordingCapacityRows.appendChild(row);
-  }
-}
-
-async function loadRecordingCapacity() {
-  const payload = await fetchJSON('/api/v1/dashboard/recording/capacity');
-  const capacityItems = payload && Array.isArray(payload.items) ? payload.items : [];
-  overviewRecordingCapacity = capacityItems.reduce((acc, it) => {
-    const group = String(it && (it.capacity_group || it.mode) || '').trim();
-    const executionClasses = Array.isArray(it && it.execution_classes) ? it.execution_classes.map((v) => String(v || '').trim()).filter((v) => v && v !== 'image_poll') : [];
-    if (group === 'image_poll' || executionClasses.length === 0) return acc;
-    return acc + Number(it && it.max_active || 0);
-  }, 0);
-  renderOverviewMetricChips();
-  renderRecordingCapacityRows(capacityItems);
-}
-
 function normalizeCanonicalValue(raw) {
   return String(raw || '').trim().toLowerCase();
 }
@@ -5513,98 +5441,6 @@ async function selectRecordingServerFromModal(streamID, candidates, desiredExecu
     recordingAssignBackdrop.addEventListener('click', onBackdrop);
     document.addEventListener('keydown', onKey);
   });
-}
-
-async function chooseServerForRecordingAssign(stream) {
-  const streamID = Number(stream && stream.id);
-  if (!Number.isFinite(streamID) || streamID <= 0) {
-    throw new Error('invalid stream id for assignment');
-  }
-  const desiredExecutionClasses = inferRecordingAssignmentExecutionClasses(stream);
-  if (!desiredExecutionClasses.length) {
-    throw new Error('this stream is not startable in the clip-native recording path');
-  }
-  const payload = await fetchJSON('/api/v1/dashboard/recording/server-capacity');
-  const rows = Array.isArray(payload && payload.items) ? payload.items : [];
-  let candidates = rows.filter((row) => {
-    const serverID = String(row && row.server_id || '').trim();
-    const active = Boolean(row && row.active);
-    const draining = Boolean(row && row.draining);
-    const freeSlots = Number(row && row.free_slots || 0);
-    return serverID && active && !draining && freeSlots > 0;
-  });
-  if (!candidates.length) {
-    throw new Error('no recording server has free capacity');
-  }
-
-  if (desiredExecutionClasses.length) {
-    candidates = candidates.filter((row) => recordingCandidateSupportsExecutionClasses(row, desiredExecutionClasses));
-    if (!candidates.length) {
-      const allExecutionClasses = [...new Set(rows.flatMap((row) => recordingCandidateExecutionClassList(row)).filter((executionClass) => executionClass))];
-      const availableLabel = allExecutionClasses.length ? allExecutionClasses.join('/') : 'none';
-      throw new Error(`no recording server has free capacity for ${desiredExecutionClasses.join('/')} (available execution classes: ${availableLabel})`);
-    }
-  }
-  candidates.sort((a, b) => {
-    const rank = (row) => {
-      const executionClasses = recordingCandidateExecutionClassList(row);
-      if (!desiredExecutionClasses.length) return 0;
-      let best = desiredExecutionClasses.length + 1;
-      for (const executionClass of executionClasses) {
-        const idx = desiredExecutionClasses.indexOf(executionClass);
-        if (idx >= 0 && idx < best) best = idx;
-      }
-      return best;
-    };
-    const rankA = rank(a);
-    const rankB = rank(b);
-    if (rankA !== rankB) return rankA - rankB;
-    const freeA = Number(a && a.free_slots || 0);
-    const freeB = Number(b && b.free_slots || 0);
-    if (freeA !== freeB) return freeB - freeA;
-    const aID = String(a && a.server_id || '').trim();
-    const bID = String(b && b.server_id || '').trim();
-    return aID.localeCompare(bID);
-  });
-  return await selectRecordingServerFromModal(streamID, candidates, desiredExecutionClasses);
-}
-
-async function loadRecordingSettings() {
-  const payload = await fetchJSON('/api/v1/dashboard/recording/settings');
-  const intervalSec = Number(payload.interval_sec || 1);
-  if (!Number.isFinite(intervalSec) || intervalSec <= 0) {
-    throw new Error('invalid recording interval from API');
-  }
-  recordingIntervalSecInput.value = String(Math.floor(intervalSec));
-}
-
-async function loadRecordingTabControls() {
-  populateCaptureTypeOptions(recModeFilter, 'capture type: all');
-  await loadRecordingSettings();
-  void loadOverview().catch(() => {});
-  void loadKnownStreamTagsSafe('all').catch(() => {});
-  void (async () => {
-    try {
-      await loadCountryOptions(recCountryFilter, 'recording', recTagFilter.value, 'on', '', '', '', recModeFilter.value);
-      await loadCityOptions(recCityFilter, 'recording', recTagFilter.value, 'on', '', recCountryFilter.value, '', '', recModeFilter.value);
-    } catch (_) {
-      // Keep controls responsive even if optional filter option loads fail.
-    }
-  })();
-}
-
-function startRecordingTabLoad() {
-  setRecSettingsStatus('loading...');
-  setRecStatus('loading recording streams...');
-  void loadRecStreams().catch((err) => setRecStatus(String(err), 'err'));
-  void loadRecordingTabControls()
-    .then(() => {
-      if (recordingSettingsStatus.textContent === 'loading...') setRecSettingsStatus('');
-    })
-    .catch((err) => {
-      const msg = String(err);
-      setRecSettingsStatus(msg, 'err');
-    });
 }
 
 // ─── Global inferences ────────────────────────────────────────────────────────
@@ -6051,38 +5887,6 @@ detailSourcePanel.addEventListener('click', async (e) => {
     await handleStreamTableAction(action, id, 'detail', btn);
   } catch (err) {
     setDetailStatus(String(err), 'err');
-  }
-});
-
-// ─── Recording settings ───────────────────────────────────────────────────────
-saveRecordingIntervalBtn.addEventListener('click', async () => {
-  const value = Number(recordingIntervalSecInput.value);
-  if (!Number.isFinite(value) || value <= 0) { setRecSettingsStatus('invalid interval', 'err'); return; }
-  const intervalSec = Math.floor(value);
-  setRecSettingsStatus('saving...');
-  try {
-    const payload = await fetchJSON('/api/v1/dashboard/recording/settings', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ interval_sec: intervalSec }),
-    });
-    const saved = Number(payload.interval_sec || intervalSec);
-    recordingIntervalSecInput.value = String(saved);
-    setRecSettingsStatus(`saved ${saved}s`, 'ok');
-    void loadOverview().catch(() => {});
-    void loadRecStreams().catch((err) => setRecStatus(String(err), 'err'));
-  } catch (err) {
-    setRecSettingsStatus(String(err), 'err');
-  }
-});
-
-reloadRecordingCapacityBtn.addEventListener('click', async () => {
-  try {
-    setRecCapacityStatus('loading...');
-    await reloadServerDomainViews();
-    setRecCapacityStatus('loaded', 'ok');
-  } catch (err) {
-    setRecCapacityStatus(String(err), 'err');
   }
 });
 
