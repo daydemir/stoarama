@@ -3056,12 +3056,6 @@ func (s *Server) handleDashboardOverview(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query stream counts: %v", err))
 		return
 	}
-	recordingSettings, err := settings.GetRecordingSettings(r.Context(), s.pool)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	_ = recordingSettings
 	type overviewStreamHealthRow struct {
 		StreamID       int64
 		ExecutionClass string
@@ -3357,13 +3351,6 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	recordingSettings, err := settings.GetRecordingSettings(r.Context(), s.pool)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	_ = recordingSettings
-
 	whereSQL := strings.Join(where, " AND ")
 	var total int64
 	if err := s.pool.QueryRow(r.Context(), fmt.Sprintf(`

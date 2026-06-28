@@ -489,10 +489,6 @@
     }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
-    tr.server-focus td {
-      background: color-mix(in srgb, var(--accent) 10%, transparent);
-      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
-    }
     .tbl-wrap {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -1500,67 +1496,6 @@
       margin-top: 4px;
       overflow-wrap: anywhere;
     }
-    .assign-modal {
-      position: fixed;
-      inset: 0;
-      z-index: 70;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      padding: 12px;
-    }
-    .assign-modal.open { display: flex; }
-    .assign-modal-backdrop {
-      position: absolute;
-      inset: 0;
-      background: rgba(2, 6, 23, 0.78);
-      backdrop-filter: blur(2px);
-    }
-    .assign-modal-card {
-      position: relative;
-      z-index: 1;
-      width: min(560px, 96vw);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: color-mix(in srgb, var(--panel) 92%, #000);
-      padding: 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .assign-modal-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--text);
-      letter-spacing: 0.01em;
-    }
-    .assign-modal-subtitle {
-      font-size: 11px;
-      color: var(--muted);
-      line-height: 1.4;
-    }
-    .assign-modal-select {
-      width: 100%;
-      min-height: 36px;
-      font-size: 12px;
-      font-family: var(--mono);
-    }
-    .assign-modal-hint {
-      font-size: 11px;
-      color: var(--muted);
-      line-height: 1.35;
-      word-break: break-word;
-      min-height: 16px;
-    }
-    .assign-modal-actions {
-      display: flex;
-      justify-content: flex-end;
-      align-items: center;
-      gap: 8px;
-    }
-    .assign-modal-status {
-      min-height: 16px;
-    }
     @media (max-width: 1100px) {
       .filter-grid-primary,
       .filter-grid-secondary {
@@ -1709,20 +1644,6 @@
 <div id="loadingOverlay" class="loading-overlay">
   <div class="loading-card" id="loadingMessage">Loading...</div>
 </div>
-<div id="recordingAssignModal" class="assign-modal" aria-hidden="true">
-  <div id="recordingAssignBackdrop" class="assign-modal-backdrop" data-assign-modal-close="1"></div>
-  <div class="assign-modal-card" role="dialog" aria-modal="true" aria-labelledby="recordingAssignTitle">
-    <div id="recordingAssignTitle" class="assign-modal-title">Assign Recording Server</div>
-    <div id="recordingAssignSubtitle" class="assign-modal-subtitle">Select a server for this stream assignment.</div>
-    <select id="recordingAssignSelect" class="assign-modal-select"></select>
-    <div id="recordingAssignHint" class="assign-modal-hint"></div>
-    <div id="recordingAssignStatus" class="status-text assign-modal-status"></div>
-    <div class="assign-modal-actions">
-      <button id="recordingAssignCancel" type="button">Cancel</button>
-      <button id="recordingAssignConfirm" class="primary" type="button">Assign</button>
-    </div>
-  </div>
-</div>
 <div id="imageModal" class="image-modal" aria-hidden="true">
   <div class="image-modal-backdrop" data-image-modal-close="1"></div>
   <div class="image-modal-content" role="dialog" aria-modal="true" aria-label="Image preview">
@@ -1784,7 +1705,6 @@ const streamsPanel = $('streamsPanel');
 const operationsPanel = $('operationsPanel');
 const discoveryPanel = $('discoveryPanel');
 const inferencesPanel = $('inferencesPanel');
-const serversPanel = $('serversPanel');
 const detailPanel = $('detailPanel');
 const topbarAccountStatus = $('topbarAccountStatus');
 const topbarAdminLink = $('topbarAdminLink');
@@ -1795,7 +1715,6 @@ const tabStreams = $('tabStreams');
 const tabOperations = $('tabOperations');
 const opsViewDiscovery = $('opsViewDiscovery');
 const opsViewPipelines = $('opsViewPipelines');
-const opsViewServers = $('opsViewServers');
 
 // overview
 const overviewStatus = $('overviewStatus');
@@ -1873,28 +1792,6 @@ const pipelineEvalSuitesRows = $('pipelineEvalSuitesRows');
 const pipelineExperimentGraph = $('pipelineExperimentGraph');
 const pipelineExperimentsRows = $('pipelineExperimentsRows');
 
-// servers
-const serversHours = $('serversHours');
-const serversIncludeStale = $('serversIncludeStale');
-const serversReload = $('serversReload');
-const serversStatus = $('serversStatus');
-const serversRows = $('serversRows');
-const serversAssignStreamID = $('serversAssignStreamID');
-const serversAssignOpen = $('serversAssignOpen');
-const serversAssignStatus = $('serversAssignStatus');
-const serversAssignmentsStatus = $('serversAssignmentsStatus');
-const serversAssignmentsRows = $('serversAssignmentsRows');
-
-// recording streams table
-const recSearch = $('recSearch');
-const recTagFilter = $('recTagFilter');
-const recModeFilter = $('recModeFilter');
-const recCountryFilter = $('recCountryFilter');
-const recCityFilter = $('recCityFilter');
-const recStatus = $('recStatus');
-const recRowsEl = $('recRows');
-const recordingTable = $('recordingTable');
-
 // detail
 const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
@@ -1920,14 +1817,6 @@ const streamsCapturesHeader = $('streamsCapturesHeader');
 const detailClipsStartHeader = $('detailClipsStartHeader');
 const loadingOverlay = $('loadingOverlay');
 const loadingMessage = $('loadingMessage');
-const recordingAssignModal = $('recordingAssignModal');
-const recordingAssignBackdrop = $('recordingAssignBackdrop');
-const recordingAssignSubtitle = $('recordingAssignSubtitle');
-const recordingAssignSelect = $('recordingAssignSelect');
-const recordingAssignHint = $('recordingAssignHint');
-const recordingAssignStatus = $('recordingAssignStatus');
-const recordingAssignCancel = $('recordingAssignCancel');
-const recordingAssignConfirm = $('recordingAssignConfirm');
 const streamTagSuggestionsList = $('streamTagSuggestionsList');
 const imageModal = $('imageModal');
 const imageModalImg = $('imageModalImg');
@@ -1963,7 +1852,6 @@ let streamTouchedPipelineID = '';
 let detailStreamID = null;
 let detailView = 'inference';
 let detailMainView = 'details';
-let selectedServerID = '';
 let detailData = null;
 let detailRecordingData = null;
 let detailRecentFramesData = [];
@@ -1996,9 +1884,6 @@ let overviewRecordingOn = 0;
 if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
 streamPageSizeEl.value = String(streamPageSize);
 
-let recStreamRows = [];
-let recSortBy = 'avg_people_per_inferenced_capture';
-let recSortDir = 'desc';
 let discoveryRowsData = [];
 let knownStreamTags = [];
 let loadingDepth = 0;
@@ -2060,12 +1945,6 @@ function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
 
-function serverDashboardURL(serverID) {
-  const id = String(serverID || '').trim();
-  if (!id || id === '-') return '/admin';
-  return `/admin?server_id=${encodeURIComponent(id)}`;
-}
-
 function updateHistoryURL(targetURL, replace = false) {
   const currentURL = `${window.location.pathname}${window.location.search}`;
   if (replace || currentURL === targetURL) {
@@ -2077,12 +1956,6 @@ function updateHistoryURL(targetURL, replace = false) {
 
 function shouldBypassClientRouting(e) {
   return !e || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
-}
-
-function serverLinkHTML(serverID, fallback = '-') {
-  const id = String(serverID || '').trim();
-  if (!id || id === '-') return esc(fallback);
-  return `<a class="mono fs11" href="${serverDashboardURL(id)}">${esc(id)}</a>`;
 }
 
 function toJSON(v, max = 180) {
@@ -2525,9 +2398,6 @@ function findStreamByID(id) {
   const row = streamRows.find((x) => {
     const stream = getRowStream(x);
     return stream && Number(stream.id) === n;
-  }) || recStreamRows.find((x) => {
-    const stream = getRowStream(x);
-    return stream && Number(stream.id) === n;
   });
   const stream = getRowStream(row);
   if (stream) return stream;
@@ -2542,9 +2412,6 @@ function findStreamRowByID(id) {
   return streamRows.find((x) => {
     const stream = getRowStream(x);
     return stream && Number(stream.id) === n;
-  }) || recStreamRows.find((x) => {
-    const stream = getRowStream(x);
-    return stream && Number(stream.id) === n;
   })
     || null;
 }
@@ -2552,10 +2419,6 @@ function findStreamRowByID(id) {
 function setCachedStreamTags(streamID, tags) {
   const normalized = normalizeTags(tags);
   for (const row of streamRows) {
-    const stream = getRowStream(row);
-    if (stream && Number(stream.id) === Number(streamID)) stream.tags = normalized;
-  }
-  for (const row of recStreamRows) {
     const stream = getRowStream(row);
     if (stream && Number(stream.id) === Number(streamID)) stream.tags = normalized;
   }
@@ -2575,7 +2438,6 @@ function mergeCachedStreamPatch(streamID, patch) {
     }
   };
   for (const row of streamRows) applyPatch(getRowStream(row));
-  for (const row of recStreamRows) applyPatch(getRowStream(row));
   if (detailData && detailData.stream) applyPatch(detailData.stream);
   if (detailRecordingData && detailRecordingData.stream) applyPatch(detailRecordingData.stream);
 }
@@ -2600,17 +2462,12 @@ function refreshTagFilterSelectOptions() {
   };
   update(streamTagFilter, 'any tag');
   update(streamTagExcludeFilter, 'exclude none');
-  update(recTagFilter, 'all tags');
   updateStreamFilterSummary();
 }
 
 function collectKnownTagsFromRows() {
   const fromRows = [];
   for (const row of streamRows) {
-    const stream = getRowStream(row);
-    if (stream) fromRows.push(...(stream.tags || []));
-  }
-  for (const row of recStreamRows) {
     const stream = getRowStream(row);
     if (stream) fromRows.push(...(stream.tags || []));
   }
@@ -2967,7 +2824,6 @@ function syncAuthDependentUI() {
   renderTopbarAccountStatus();
   syncDetailAuthState();
   if (streamRows.length) renderStreamRows();
-  if (recStreamRows.length) renderRecRows();
   if (detailRecordingData && detailRecordingData.stream) {
     syncDetailMutationUI(detailRecordingData.stream);
   }
@@ -3226,27 +3082,9 @@ function setPipelineExperimentStatus(msg, cls = '') {
   pipelineExperimentStatus.className = `status-text ${cls}`;
   pipelineExperimentStatus.textContent = msg;
 }
-function setServersStatus(msg, cls = '') {
-  serversStatus.className = `status-text ${cls}`;
-  serversStatus.textContent = msg;
-}
-function setServersAssignmentsStatus(msg, cls = '') {
-  if (!(serversAssignmentsStatus instanceof HTMLElement)) return;
-  serversAssignmentsStatus.className = `status-text ${cls}`;
-  serversAssignmentsStatus.textContent = msg;
-}
-function setServersAssignStatus(msg, cls = '') {
-  if (!(serversAssignStatus instanceof HTMLElement)) return;
-  serversAssignStatus.className = `status-text ${cls}`;
-  serversAssignStatus.textContent = msg;
-}
 function setDetailStatus(msg, cls = '') {
   detailStatusEl.className = `status-text ${cls}`;
   detailStatusEl.textContent = msg;
-}
-function setRecStatus(msg, cls = '') {
-  recStatus.className = `status-text ${cls}`;
-  recStatus.textContent = msg;
 }
 function setOverviewStatus(msg, cls = '') {
   overviewStatus.className = `status-text ${cls}`;
@@ -3265,13 +3103,12 @@ function showPanel(which) {
     stopDetailLivePolling();
     stopDetailFrameExportPolling();
   }
-  const operationsVisible = which === 'discovery' || which === 'pipelines' || which === 'servers';
+  const operationsVisible = which === 'discovery' || which === 'pipelines';
   if (overviewPanel) overviewPanel.style.display = which === 'overview' ? '' : 'none';
   streamsPanel.style.display = which === 'streams' ? '' : 'none';
   if (operationsPanel) operationsPanel.style.display = operationsVisible ? '' : 'none';
   if (discoveryPanel) discoveryPanel.style.display = which === 'discovery' ? '' : 'none';
   inferencesPanel.style.display = which === 'pipelines' ? '' : 'none';
-  if (serversPanel) serversPanel.style.display = which === 'servers' ? '' : 'none';
   detailPanel.style.display = which === 'detail' ? '' : 'none';
 
   if (tabOverview) tabOverview.classList.toggle('active', which === 'overview');
@@ -3279,7 +3116,6 @@ function showPanel(which) {
   if (tabOperations) tabOperations.classList.toggle('active', operationsVisible);
   if (opsViewDiscovery) opsViewDiscovery.classList.toggle('active', which === 'discovery');
   if (opsViewPipelines) opsViewPipelines.classList.toggle('active', which === 'pipelines');
-  if (opsViewServers) opsViewServers.classList.toggle('active', which === 'servers');
 }
 
 function isStreamJSONModalOpen() {
@@ -4185,125 +4021,6 @@ function listToMeta(items, max = 6) {
   return `<span class="mono fs11">${vals.join(', ')}</span>`;
 }
 
-function normalizeStreamIDs(raw) {
-  const out = [];
-  const seen = new Set();
-  const arr = Array.isArray(raw) ? raw : [raw];
-  for (const it of arr) {
-    const n = Number(it);
-    if (!Number.isFinite(n) || n <= 0) continue;
-    const id = Math.floor(n);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    out.push(id);
-  }
-  return out;
-}
-
-function streamLink(id) {
-  const n = Number(id);
-  if (!Number.isFinite(n) || n <= 0) return '-';
-  const sid = Math.floor(n);
-  return `<a class="mono fs11" href="/streams/${sid}">#${sid}</a>`;
-}
-
-function listStreamLinks(streamIDs, max = 6) {
-  const ids = normalizeStreamIDs(streamIDs);
-  if (!ids.length) return '<span class="muted fs11">-</span>';
-  const vals = ids.slice(0, max).map((id) => streamLink(id));
-  if (ids.length > max) vals.push(`<span class="mono fs11 muted">+${ids.length - max}</span>`);
-  return vals.join(', ');
-}
-
-function summarizeExecutionClasses(items) {
-  if (!Array.isArray(items) || !items.length) return '<span class="muted fs11">-</span>';
-  const groups = new Map();
-  for (const it of items) {
-    const executionClass = String(it.execution_class || '').trim();
-    if (executionClass === 'image_poll') continue;
-    if (!executionClass) continue;
-    const group = String(it.capacity_group || executionClass).trim();
-    const cap = Number(it.capacity || 0);
-    const active = Boolean(it.active);
-    const draining = Boolean(it.draining);
-    if (!groups.has(group)) {
-      groups.set(group, { capacity: cap, active: active, draining: draining, executionClasses: [] });
-    }
-    const agg = groups.get(group);
-    agg.executionClasses.push(executionClass);
-    if (cap > 0 && (agg.capacity <= 0 || cap < agg.capacity)) agg.capacity = cap;
-    agg.active = agg.active || active;
-    agg.draining = agg.draining || draining;
-  }
-  return Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([group, agg]) => {
-    const executionClasses = Array.from(new Set(agg.executionClasses)).sort().join('/');
-    const status = agg.active ? 'tag-ok' : 'tag-muted';
-    const suffix = agg.draining ? ' (draining)' : '';
-    return `<span class="tag ${status} mono">${esc(group)}:${agg.capacity}${suffix}</span><span class="muted fs10"> ${esc(executionClasses)}</span>`;
-  }).join(' ');
-}
-
-function summarizeServerConnections(server) {
-  const out = [];
-  const seen = new Set();
-  const roleLabels = new Set();
-  const addMeta = (meta) => {
-    if (!meta || typeof meta !== 'object') return;
-    const serviceRole = String(meta.role || '').trim();
-    if (serviceRole) {
-      roleLabels.add(serviceRole);
-    }
-    const transport = String(meta.network_transport || '').trim();
-    const topology = String(meta.topology_id || meta.hub_server_id || '').trim();
-    const role = String(meta.topology_role || '').trim();
-    const hub = String(meta.hub_server_id || '').trim();
-    const wgIf = String(meta.wg_interface || '').trim();
-    const wgIP = String(meta.wg_ip || '').trim();
-    const sourceEndpoint = String(meta.source_endpoint || '').trim();
-    if (!transport && !topology && !role && !hub && !wgIf && !wgIP && !sourceEndpoint) return;
-    const parts = [];
-    if (transport) parts.push(`transport:${esc(transport)}`);
-    if (topology) parts.push(`topology:${esc(topology)}`);
-    if (role) parts.push(`role:${esc(role)}`);
-    if (hub) parts.push(`hub:${esc(hub)}`);
-    if (wgIf && wgIP) parts.push(`wg:${esc(wgIf)}@${esc(wgIP)}`);
-    else if (wgIf) parts.push(`wg:${esc(wgIf)}`);
-    else if (wgIP) parts.push(`wg_ip:${esc(wgIP)}`);
-    if (sourceEndpoint) parts.push(`endpoint:${esc(sourceEndpoint)}`);
-    const key = parts.join(' | ');
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    out.push(`<div class="mono fs10">${parts.map((p) => `<span class="tag tag-muted">${p}</span>`).join(' ')}</div>`);
-  };
-
-  const executionClasses = Array.isArray(server?.execution_classes) ? server.execution_classes : [];
-  for (const executionClass of executionClasses) {
-    const meta = executionClass && typeof executionClass === 'object' ? executionClass.metadata_json : null;
-    addMeta(meta);
-  }
-  const processes = Array.isArray(server?.processes) ? server.processes : [];
-  for (const proc of processes) {
-    const meta = proc && typeof proc === 'object' ? proc.metadata_json : null;
-    addMeta(meta);
-  }
-  const workers = Array.isArray(server?.processing_workers) ? server.processing_workers : [];
-  for (const worker of workers) {
-    const meta = worker && typeof worker === 'object' ? worker.metadata_json : null;
-    addMeta(meta);
-  }
-
-  if (roleLabels.size) {
-    const labels = Array.from(roleLabels).sort().map((role) => {
-      const text = role === 'capture_catalog_sweeper' ? 'catalog recorder' : role.replaceAll('_', ' ');
-      return `<span class="tag tag-warn mono">${esc(text)}</span>`;
-    }).join(' ');
-    out.unshift(`<div class="mono fs10">${labels}</div>`);
-  }
-
-  if (!out.length) return '<span class="muted fs11">-</span>';
-  return out.join('');
-}
-
 function summarizeProcessingWorkers(items) {
   if (!Array.isArray(items) || !items.length) return '<span class="muted fs11">-</span>';
   return items.map((it) => {
@@ -4313,172 +4030,6 @@ function summarizeProcessingWorkers(items) {
     const suffix = pipeline || executionClass || '-';
     return `<span class="tag tag-muted mono">${esc(kind)}:${esc(suffix)}</span>`;
   }).join(' ');
-}
-
-function summarizeProcesses(items) {
-  if (!Array.isArray(items) || !items.length) return '<span class="muted fs11">-</span>';
-  return items.map((it) => {
-    const active = Boolean(it.active);
-    const processID = String(it.process_id || '-');
-    const workerID = String(it.worker_id || '').trim();
-    const source = String(it.source || '').trim();
-    const workerKind = String(it.worker_kind || '').trim();
-    const executionClass = String(it.execution_class || '').trim();
-    const pipelineID = String(it.pipeline_id || '').trim();
-    const metadata = it.metadata_json && typeof it.metadata_json === 'object' ? it.metadata_json : {};
-    const processName = String(metadata.process_name || '').trim();
-    const label = processName || [workerKind, pipelineID || executionClass || source].filter((v) => v).join(':');
-    const claims = Number(it.active_claims || 0);
-    const status = String(it.status || '').trim();
-    const restartCount = Number(it.restart_count || 0);
-    const streamIDs = normalizeStreamIDs((Array.isArray(it.active_capture_stream_ids) ? it.active_capture_stream_ids : []).concat(it.stream_id || []));
-    const claimsHTML = claims > 0 ? `<span class="muted">claims ${claims}</span>` : '';
-    const streamsHTML = streamIDs.length ? `<span class="muted">streams ${listStreamLinks(streamIDs, 4)}</span>` : '';
-    const statusHTML = status ? `<span class="muted">status ${esc(status)}</span>` : '';
-    const restartHTML = restartCount > 0 ? `<span class="muted">restarts ${restartCount}</span>` : '';
-    const lastFrameHTML = it.last_frame_at ? `<span class="muted">last capture ${esc(formatDateTimeShort(it.last_frame_at))}</span>` : '';
-    const extraLine = [claimsHTML, streamsHTML, statusHTML, restartHTML, lastFrameHTML].filter((v) => v).join(' · ');
-    const workerHTML = workerID && workerID !== processID ? `<div class="mono fs10 muted">worker ${esc(workerID)}</div>` : '';
-    return `<div class="mono fs11">
-      ${active ? '<span class="tag tag-ok">active</span>' : '<span class="tag tag-muted">stale</span>'}
-      ${esc(label || source || workerKind || 'process')}
-      <span class="muted">${esc(processID)}</span>
-      ${extraLine ? `<div class="mono fs10">${extraLine}</div>` : ''}
-      ${workerHTML}
-    </div>`;
-  }).join('');
-}
-
-function summarizeActiveInference(items) {
-  if (!Array.isArray(items) || !items.length) return '<span class="muted fs11">-</span>';
-  return items.map((it) => {
-    const pid = String(it.pipeline_id || '-');
-    const claims = Number(it.active_claims || 0);
-    const streams = Number(it.stream_count || (Array.isArray(it.stream_ids) ? it.stream_ids.length : 0));
-    return `<div class="mono fs11">${esc(pid)} · claims ${claims} · streams ${streams}</div>`;
-  }).join('');
-}
-
-function renderServers(items) {
-  serversRows.innerHTML = '';
-  if (!items || !items.length) {
-    setTableStateRow(serversRows, 8, 'No servers in lookback window');
-    return;
-  }
-  const rows = Array.isArray(items) ? items.slice() : [];
-  if (selectedServerID) {
-    rows.sort((a, b) => {
-      const aMatch = String(a && a.server_id || '').trim() === selectedServerID ? 0 : 1;
-      const bMatch = String(b && b.server_id || '').trim() === selectedServerID ? 0 : 1;
-      if (aMatch !== bMatch) return aMatch - bMatch;
-      return String(a && a.server_id || '').localeCompare(String(b && b.server_id || ''));
-    });
-  }
-  let focusedRow = null;
-  for (const it of rows) {
-    const id = String(it.server_id || '');
-    const active = Boolean(it.active);
-    const lastSeen = it.last_seen_at ? formatDateTimeShort(it.last_seen_at) : '-';
-    const captureStreams = Array.isArray(it.active_capture_stream_ids) ? it.active_capture_stream_ids : [];
-    const tr = document.createElement('tr');
-    if (selectedServerID && id === selectedServerID) {
-      tr.classList.add('server-focus');
-      tr.id = `server-${id}`;
-      focusedRow = tr;
-    }
-    tr.innerHTML = `
-      <td>${serverLinkHTML(id, '-')}</td>
-      <td>${active ? '<span class="tag tag-ok">active</span>' : '<span class="tag tag-muted">stale</span>'}</td>
-      <td class="mono fs11">${esc(lastSeen)}</td>
-      <td>${summarizeExecutionClasses(it.execution_classes)}</td>
-      <td>${summarizeServerConnections(it)}</td>
-      <td>${summarizeProcesses(it.processes)}</td>
-      <td>${listStreamLinks(captureStreams, 8)}</td>
-      <td>${summarizeActiveInference(it.active_inference)}</td>
-    `;
-    serversRows.appendChild(tr);
-  }
-  if (focusedRow) {
-    window.requestAnimationFrame(() => {
-      focusedRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    });
-  }
-}
-
-async function loadServers() {
-  const hours = Number(serversHours.value || 168);
-  const includeStale = Boolean(serversIncludeStale && serversIncludeStale.checked);
-  if (!Number.isFinite(hours) || hours <= 0) {
-    throw new Error('lookback hours must be > 0');
-  }
-  setServersStatus('loading...');
-  setTableLoadingRow(serversRows, 8, 'Loading servers...');
-  const payload = await fetchJSON(`/api/v1/dashboard/servers?hours=${Math.floor(hours)}&include_stale=${includeStale ? 'true' : 'false'}`);
-  renderServers(payload.items || []);
-  setServersStatus(`${Number(payload.active || 0)}/${Number(payload.total || 0)} active shown · lookback ${Math.floor(hours)}h${includeStale ? ' · stale included' : ''}`, 'ok');
-}
-
-function renderServersAssignments(items) {
-  serversAssignmentsRows.innerHTML = '';
-  if (!items || !items.length) {
-    setTableStateRow(serversAssignmentsRows, 6, 'No recording assignments');
-    return;
-  }
-  for (const it of items) {
-    const streamID = Number(it.stream_id || 0);
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${streamID > 0 ? `<a class="stream-link" href="/streams/${streamID}">#${streamID}</a>` : '<span class="muted fs11">-</span>'}<div class="muted fs10">${esc(it.provider || '-')} / ${esc(it.stream_slug || '-')}</div></td>
-      <td>${serverLinkHTML(it.server_id || '-', '-')}</td>
-      <td class="mono fs11">${esc(it.execution_class || '-')}</td>
-      <td class="mono fs11">${esc(formatDateTimeShort(it.assigned_at) || '-')}</td>
-      <td class="mono fs11">${esc(it.last_frame_at ? formatDateTimeShort(it.last_frame_at) : '-')}</td>
-      <td><button class="btn-sm" data-server-action="unassign" data-stream-id="${streamID}">Unassign</button></td>
-    `;
-    serversAssignmentsRows.appendChild(tr);
-  }
-}
-
-async function loadServersAssignments() {
-  renderServersAssignments([]);
-  setServersAssignmentsStatus('recording assignment has moved to the recorder', 'ok');
-}
-
-async function loadStreamForAssignment(streamID) {
-  const id = Number(streamID);
-  if (!Number.isFinite(id) || id <= 0) {
-    throw new Error('stream id must be a positive integer');
-  }
-  const cached = findStreamByID(id);
-  if (cached) return cached;
-  const payload = await fetchJSON(`/api/v1/dashboard/streams/${Math.floor(id)}`);
-  const stream = payload && payload.stream && typeof payload.stream === 'object' ? payload.stream : null;
-  if (!stream || Number(stream.id || 0) !== Math.floor(id)) {
-    throw new Error(`stream ${Math.floor(id)} not found`);
-  }
-  return stream;
-}
-
-async function assignRecordingStream() {
-  throw new Error('recording assignment has moved to the recorder; use /recordings');
-}
-
-async function reloadServerDomainViews() {
-  await Promise.all([
-    loadOverview(),
-    loadServers(),
-    loadServersAssignments(),
-  ]);
-}
-
-async function runServersAssignFlow(streamID) {
-  const stream = await loadStreamForAssignment(streamID);
-  await assignRecordingStream(stream);
-  await reloadServerDomainViews();
-  if (detailData && detailData.stream && Number(detailData.stream.id || 0) === Number(stream.id || 0)) {
-    await loadDetail();
-  }
-  return stream;
 }
 
 function candidateImportedStreamLink(candidate) {
@@ -5168,281 +4719,6 @@ async function loadStreams(opts = {}) {
   syncStreamListURL({ replace: opts.replaceURL === true });
 }
 
-// ─── Recording tab stream list ────────────────────────────────────────────────
-function renderRecRows() {
-  recRowsEl.innerHTML = '';
-  if (!recStreamRows.length) {
-    updateSortableHeaders(recordingTable, recSortBy, recSortDir);
-    setTableStateRow(recRowsEl, 6, 'No recording streams');
-    return;
-  }
-  for (const row of recStreamRows) {
-    const s = getRowStream(row);
-    if (!s) continue;
-    const streamName = latinizedLabelParts(s.name);
-    const latestCap = row.latest_captured_at ? String(row.latest_captured_at).replace('T', ' ').slice(0, 19) : '-';
-    const runtimeStatus = s.capture_runtime_status || '-';
-    const freshnessSec = Number(row.freshness_sec);
-    const freshnessTxt = Number.isFinite(freshnessSec) ? `${Math.max(0, Math.floor(freshnessSec))}s` : '-';
-    const loss = Number(row.loss_rate_pct || 0);
-    const expectedCaptures = Number(row.expected_captures_60s || row.expected_frames_60s || 60);
-    const successCaptures = Number(row.success_captures_60s || row.success_frames_60s || 0);
-    const health = String(row.recording_health || 'unknown');
-    const captureUnit = String(row.capture_unit || 'frames');
-    const captureSingular = captureUnit.endsWith('s') ? captureUnit.slice(0, -1) : captureUnit;
-    const peopleMetric = peoplePerInferenceMetric(row);
-    const recordingToggleHTML = `<a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a>`;
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>
-        <div class="stack">
-          <a href="/streams/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
-          ${streamName.secondary ? `<span class="muted fs10">${esc(streamName.secondary)}</span>` : ''}
-          <span class="muted fs10 mono">${esc(s.provider)} / ${esc(s.slug)}</span>
-        </div>
-      </td>
-      <td>
-        <div class="row">
-          <span class="fs11 muted">${esc(runtimeStatus)}</span>
-        </div>
-      </td>
-      <td>
-        <div class="stack fs11 mono">
-          <span class="tag tag-muted">${esc(health)}</span>
-          <span>loss ${loss.toFixed(1)}% · ${esc(captureUnit)} ${successCaptures}/${expectedCaptures} per 60s</span>
-          <span>latest ${esc(captureSingular)} age ${freshnessTxt}</span>
-          <span class="muted fs10">${latestCap}</span>
-        </div>
-      </td>
-      <td>
-        <div class="stack fs11 mono">
-          <span>${esc(peopleMetric.avgText)}</span>
-          <span class="muted fs10">${esc(peopleMetric.detailText)}</span>
-        </div>
-      </td>
-      <td>${renderTagEditor(s, 'recording')}</td>
-      <td>${recordingToggleHTML}</td>
-    `;
-    recRowsEl.appendChild(tr);
-  }
-  collectKnownTagsFromRows();
-  updateSortableHeaders(recordingTable, recSortBy, recSortDir);
-  setRecStatus(`${recStreamRows.length} recording streams`);
-}
-
-async function loadRecStreams() {
-  setTableLoadingRow(recRowsEl, 6, 'Loading recording streams...');
-  const params = new URLSearchParams();
-  params.set('recording_state', 'on');
-  const recCaptureType = normalizeCaptureTypeFilter(recModeFilter.value);
-  if (recCaptureType) params.set('capture_type', recCaptureType);
-  if (recSearch.value.trim()) params.set('q', recSearch.value.trim());
-  if (recTagFilter.value.trim()) params.set('tags', recTagFilter.value.trim());
-  if (recCountryFilter.value.trim()) params.set('country', recCountryFilter.value.trim());
-  if (recCityFilter.value.trim()) params.set('city', recCityFilter.value.trim());
-  params.set('limit', '500');
-  params.set('offset', '0');
-  params.set('include_image_urls', 'false');
-  applyStreamsSortParams(params, recSortBy, recSortDir);
-  const payload = await fetchJSON(dashboardStreamsCollectionURL(params));
-  recStreamRows = payload.items || [];
-  renderRecRows();
-}
-
-function normalizeCanonicalValue(raw) {
-  return String(raw || '').trim().toLowerCase();
-}
-
-function inferRecordingAssignmentExecutionClasses(stream) {
-  const provider = normalizeCanonicalValue(stream && stream.provider);
-  const streamURL = String(stream && stream.source_url || '').toLowerCase();
-  const sourceURL = String(stream && stream.source_page_url || '').toLowerCase();
-  const externalID = String(stream && stream.external_id || '').trim();
-  const isYouTube = provider === 'youtube' ||
-    streamURL.includes('youtube.com') ||
-    streamURL.includes('youtu.be') ||
-    sourceURL.includes('youtube.com') ||
-    sourceURL.includes('youtu.be') ||
-    externalID !== '';
-  const explicitExecutionClass = normalizeCanonicalValue(stream && stream.execution_class);
-  if (explicitExecutionClass) {
-    if (explicitExecutionClass === 'youtube_direct' || explicitExecutionClass === 'youtube_relay') {
-      return ['youtube_direct'];
-    }
-    if (explicitExecutionClass === 'image_poll') {
-      return [];
-    }
-    return [explicitExecutionClass];
-  }
-  const explicitCaptureType = normalizeCanonicalValue(stream && stream.capture_type);
-  if (explicitCaptureType && explicitCaptureType !== 'unknown') {
-    if (isYouTube && explicitCaptureType === 'youtube_watch') {
-      return ['youtube_direct'];
-    }
-    if (explicitCaptureType === 'still_image') {
-      return [];
-    }
-    if (['hls', 'dash', 'rtsp', 'rtmp', 'http_video'].includes(explicitCaptureType)) {
-      return ['video_live'];
-    }
-    return [explicitCaptureType];
-  }
-  if (isYouTube) {
-    return ['youtube_direct'];
-  }
-  return [];
-}
-
-function supportsClipRecording(stream) {
-  return inferRecordingAssignmentExecutionClasses(stream).length > 0;
-}
-
-function recordingCandidateExecutionClassList(row) {
-  const out = [];
-  const pushUnique = (items) => {
-    for (const raw of items || []) {
-      const executionClass = normalizeCanonicalValue(raw);
-      if (executionClass === 'image_poll') continue;
-      if (!executionClass || out.includes(executionClass)) continue;
-      out.push(executionClass);
-    }
-  };
-  pushUnique(Array.isArray(row && row.available_execution_classes) ? row.available_execution_classes : []);
-  pushUnique(Array.isArray(row && row.execution_classes) ? row.execution_classes : []);
-  return out;
-}
-
-function recordingCandidateSupportsExecutionClasses(row, desiredExecutionClasses) {
-  if (!Array.isArray(desiredExecutionClasses) || !desiredExecutionClasses.length) return true;
-  const executionClassSet = recordingCandidateExecutionClassList(row);
-  if (!executionClassSet.length) return false;
-  return desiredExecutionClasses.some((executionClass) => executionClassSet.includes(executionClass));
-}
-
-function formatRecordingCandidateLabel(row) {
-  const serverID = String(row && row.server_id || '').trim() || '-';
-  const group = String(row && row.capacity_group || row && row.mode || '').trim() || '-';
-  const freeSlots = Number(row && row.free_slots || 0);
-  const maxActive = Number(row && row.max_active || 0);
-  const executionClasses = recordingCandidateExecutionClassList(row);
-  const executionClassesLabel = executionClasses.length ? executionClasses.join('/') : '-';
-  return `${serverID}  |  group ${group}  |  free ${freeSlots}/${maxActive}  |  execution classes ${executionClassesLabel}`;
-}
-
-function renderRecordingCandidateHint(row) {
-  if (!row) return '';
-  const meta = (row && typeof row.metadata_json === 'object' && row.metadata_json) ? row.metadata_json : {};
-  const topology = String(meta.topology_id || meta.hub_server_id || '').trim();
-  const parts = [];
-  if (topology) parts.push(`topology ${topology}`);
-  return parts.join(' · ');
-}
-
-function setRecordingAssignStatus(msg, cls = '') {
-  if (!(recordingAssignStatus instanceof HTMLElement)) return;
-  recordingAssignStatus.className = `status-text assign-modal-status ${cls}`;
-  recordingAssignStatus.textContent = String(msg || '');
-}
-
-function setRecordingAssignModalOpen(open) {
-  if (!(recordingAssignModal instanceof HTMLElement)) return;
-  if (open) {
-    recordingAssignModal.classList.add('open');
-    recordingAssignModal.setAttribute('aria-hidden', 'false');
-    return;
-  }
-  recordingAssignModal.classList.remove('open');
-  recordingAssignModal.setAttribute('aria-hidden', 'true');
-}
-
-async function selectRecordingServerFromModal(streamID, candidates, desiredExecutionClasses) {
-  if (!(recordingAssignSelect instanceof HTMLSelectElement)) {
-    throw new Error('recording server select control missing');
-  }
-  if (!Array.isArray(candidates) || !candidates.length) {
-    throw new Error('no candidate recording servers');
-  }
-  const executionClassLabel = desiredExecutionClasses.length ? desiredExecutionClasses.join('/') : 'any execution class';
-  recordingAssignSubtitle.textContent = `Stream ${streamID} assignment (${executionClassLabel}).`;
-  recordingAssignSelect.innerHTML = '';
-  for (const row of candidates) {
-    const serverID = String(row && row.server_id || '').trim();
-    if (!serverID) continue;
-    const opt = document.createElement('option');
-    opt.value = serverID;
-    opt.textContent = formatRecordingCandidateLabel(row);
-    recordingAssignSelect.appendChild(opt);
-  }
-  const refreshHint = () => {
-    const selected = String(recordingAssignSelect.value || '').trim();
-    const row = candidates.find((it) => String(it && it.server_id || '').trim() === selected);
-    recordingAssignHint.textContent = renderRecordingCandidateHint(row);
-  };
-  refreshHint();
-  setRecordingAssignStatus('');
-  setRecordingAssignModalOpen(true);
-  setTimeout(() => {
-    if (recordingAssignSelect instanceof HTMLSelectElement) recordingAssignSelect.focus();
-  }, 0);
-
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (err, value = '') => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      setRecordingAssignModalOpen(false);
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(String(value || '').trim());
-    };
-    const onChange = () => {
-      refreshHint();
-      setRecordingAssignStatus('');
-    };
-    const onCancel = () => {
-      finish(new Error('assign cancelled'));
-    };
-    const onBackdrop = (e) => {
-      if (!(e.target instanceof HTMLElement)) return;
-      if (e.target.getAttribute('data-assign-modal-close') === '1') onCancel();
-    };
-    const onConfirm = () => {
-      const selected = String(recordingAssignSelect.value || '').trim();
-      if (!selected) {
-        setRecordingAssignStatus('select a server before assigning', 'err');
-        return;
-      }
-      if (!candidates.some((row) => String(row && row.server_id || '').trim() === selected)) {
-        setRecordingAssignStatus(`invalid server_id: ${selected}`, 'err');
-        return;
-      }
-      finish(null, selected);
-    };
-    const onKey = (e) => {
-      if (!(e instanceof KeyboardEvent)) return;
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onCancel();
-      }
-    };
-    const cleanup = () => {
-      recordingAssignSelect.removeEventListener('change', onChange);
-      recordingAssignCancel.removeEventListener('click', onCancel);
-      recordingAssignConfirm.removeEventListener('click', onConfirm);
-      recordingAssignBackdrop.removeEventListener('click', onBackdrop);
-      document.removeEventListener('keydown', onKey);
-    };
-    recordingAssignSelect.addEventListener('change', onChange);
-    recordingAssignCancel.addEventListener('click', onCancel);
-    recordingAssignConfirm.addEventListener('click', onConfirm);
-    recordingAssignBackdrop.addEventListener('click', onBackdrop);
-    document.addEventListener('keydown', onKey);
-  });
-}
-
 // ─── Global inferences ────────────────────────────────────────────────────────
 function buildInfParams() {
   const params = new URLSearchParams();
@@ -5672,7 +4948,6 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
   if (action === 'copy-source-url') {
     await copyStreamSourceURL(id);
     if (tableKey === 'streams') setStreamStatus('source URL copied', 'ok');
-    else if (tableKey === 'recording') setRecStatus('source URL copied', 'ok');
     else setDetailStatus('source URL copied', 'ok');
     return;
   }
@@ -5682,8 +4957,6 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
     await handleTagMutation(action, id, tagValue);
     if (tableKey === 'streams') {
       await loadStreams();
-    } else if (tableKey === 'recording') {
-      await loadRecStreams();
     }
     await loadKnownStreamTagsSafe('all');
     return;
@@ -5700,18 +4973,11 @@ async function onStreamTableClick(e, tableKey) {
   if (!action || !Number.isFinite(id) || id <= 0) return;
   const localOnlyAction = action === 'show-stream-json' || action === 'copy-source-url';
   try {
-    if (!localOnlyAction) {
-      if (tableKey === 'streams') setStreamStatus('updating...');
-      else setRecStatus('updating...');
-    }
+    if (!localOnlyAction) setStreamStatus('updating...');
     await handleStreamTableAction(action, id, tableKey, btn);
-    if (!localOnlyAction) {
-      if (tableKey === 'streams') setStreamStatus('updated', 'ok');
-      else setRecStatus('updated', 'ok');
-    }
+    if (!localOnlyAction) setStreamStatus('updated', 'ok');
   } catch (err) {
-    if (tableKey === 'streams') setStreamStatus(String(err), 'err');
-    else setRecStatus(String(err), 'err');
+    setStreamStatus(String(err), 'err');
   }
 }
 
@@ -5727,57 +4993,13 @@ async function onStreamTableTagInputEnter(e, tableKey) {
   const raw = e.target.value.trim();
   if (!raw) return;
   try {
-    if (tableKey === 'streams') setStreamStatus('updating tags...');
-    else setRecStatus('updating tags...');
+    setStreamStatus('updating tags...');
     await handleStreamTableAction('tag-add', id, tableKey, e.target, raw);
     e.target.value = '';
-    if (tableKey === 'streams') setStreamStatus('tags updated', 'ok');
-    else setRecStatus('tags updated', 'ok');
+    setStreamStatus('tags updated', 'ok');
   } catch (err) {
-    if (tableKey === 'streams') setStreamStatus(String(err), 'err');
-    else setRecStatus(String(err), 'err');
+    setStreamStatus(String(err), 'err');
   }
-}
-
-if (serversAssignmentsRows) {
-  serversAssignmentsRows.addEventListener('click', (e) => {
-    const btn = e.target instanceof HTMLElement && e.target.closest('[data-server-action="unassign"]');
-    if (!(btn instanceof HTMLElement)) return;
-    const streamID = Number(btn.getAttribute('data-stream-id'));
-    if (!Number.isFinite(streamID) || streamID <= 0) return;
-    void (async () => {
-      try {
-        throw new Error('recording assignment has moved to the recorder; use /recordings');
-      } catch (err) {
-        setServersAssignmentsStatus(formatAccountAuthError(err, 'recording changes require a signed-in account'), 'err');
-      }
-    })();
-  });
-}
-
-if (serversAssignOpen) {
-  serversAssignOpen.addEventListener('click', async () => {
-    try {
-      setServersAssignStatus('loading...');
-      const streamID = Number(serversAssignStreamID && serversAssignStreamID.value || '0');
-      const stream = await runServersAssignFlow(streamID);
-      if (serversAssignStreamID instanceof HTMLInputElement) {
-        serversAssignStreamID.value = String(Number(stream.id || streamID));
-      }
-      setServersAssignStatus(`assigned stream ${Number(stream.id || streamID)}`, 'ok');
-    } catch (err) {
-      setServersAssignStatus(formatAccountAuthError(err, 'recording changes require a signed-in account'), 'err');
-    }
-  });
-}
-if (serversAssignStreamID) {
-  serversAssignStreamID.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter') return;
-    e.preventDefault();
-    if (serversAssignOpen instanceof HTMLButtonElement) {
-      serversAssignOpen.click();
-    }
-  });
 }
 
 if (discoveryRows) {
@@ -5816,9 +5038,7 @@ if (discoveryRows) {
 }
 
 streamRowsEl.addEventListener('click', (e) => { void onStreamTableClick(e, 'streams'); });
-recRowsEl.addEventListener('click', (e) => { void onStreamTableClick(e, 'recording'); });
 streamRowsEl.addEventListener('keydown', (e) => { void onStreamTableTagInputEnter(e, 'streams'); });
-recRowsEl.addEventListener('keydown', (e) => { void onStreamTableTagInputEnter(e, 'recording'); });
 
 function sortHeaderKeyFromEvent(e) {
   const target = e.target instanceof HTMLElement ? e.target : null;
@@ -5835,16 +5055,6 @@ if (streamsTable) {
     streamSortDir = nextSortDir(streamSortBy, streamSortDir, sortKey, 'desc');
     streamSortBy = sortKey;
     void loadStreams({ resetPage: true }).catch((err) => setStreamStatus(String(err), 'err'));
-  });
-}
-
-if (recordingTable) {
-  recordingTable.addEventListener('click', (e) => {
-    const sortKey = sortHeaderKeyFromEvent(e);
-    if (!sortKey) return;
-    recSortDir = nextSortDir(recSortBy, recSortDir, sortKey, 'desc');
-    recSortBy = sortKey;
-    void loadRecStreams().catch((err) => setRecStatus(String(err), 'err'));
   });
 }
 
@@ -5931,17 +5141,6 @@ if (tabOperations) {
       void loadDiscoveryCandidates().catch((err) => setDiscoveryStatus(String(err), 'err'));
       return;
     }
-    if (mainTab === 'servers') {
-      history.replaceState(null, '', '/admin');
-      showPanel('servers');
-      setServersStatus('loading...');
-      void (async () => {
-        try {
-          await reloadServerDomainViews();
-        } catch (err) { setServersStatus(String(err), 'err'); }
-      })();
-      return;
-    }
     mainTab = 'pipelines';
     history.replaceState(null, '', selectedPipelineID ? `/admin?pipeline_id=${encodeURIComponent(selectedPipelineID)}` : '/admin');
     showPanel('pipelines');
@@ -5977,21 +5176,6 @@ if (opsViewPipelines) {
       try {
         await Promise.all([loadPipelineOverview(), loadAllInference()]);
       } catch (err) { setPipelinesStatus(String(err), 'err'); }
-    })();
-  });
-}
-
-if (opsViewServers) {
-  opsViewServers.addEventListener('click', () => {
-    if (mainTab === 'servers') return;
-    mainTab = 'servers';
-    history.replaceState(null, '', '/admin');
-    showPanel('servers');
-    setServersStatus('loading...');
-    void (async () => {
-      try {
-        await reloadServerDomainViews();
-      } catch (err) { setServersStatus(String(err), 'err'); }
     })();
   });
 }
@@ -6087,23 +5271,6 @@ if (latestRawCard) {
     if (handleClipPreviewClick(e)) e.preventDefault();
   });
 }
-serversReload.addEventListener('click', async () => {
-  try { await reloadServerDomainViews(); }
-  catch (err) { setServersStatus(String(err), 'err'); }
-});
-serversHours.addEventListener('keydown', async (e) => {
-  if (e.key !== 'Enter') return;
-  e.preventDefault();
-  try { await reloadServerDomainViews(); }
-  catch (err) { setServersStatus(String(err), 'err'); }
-});
-if (serversIncludeStale) {
-  serversIncludeStale.addEventListener('change', async () => {
-    try { await reloadServerDomainViews(); }
-    catch (err) { setServersStatus(String(err), 'err'); }
-  });
-}
-
 if (discoveryReload) {
   discoveryReload.addEventListener('click', async () => {
     try { await loadDiscoveryCandidates(); }
@@ -6199,35 +5366,6 @@ countryFilter.addEventListener('change', async () => {
 });
 cityFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: false });
-});
-
-// Rec tab filters
-const reloadRecDebounced = debounce(async () => {
-  try { await loadRecStreams(); } catch (err) { setRecStatus(String(err), 'err'); }
-}, 250);
-recSearch.addEventListener('input', reloadRecDebounced);
-recTagFilter.addEventListener('change', async () => {
-  try {
-    await loadCountryOptions(recCountryFilter, 'recording', recTagFilter.value, 'on', '', '', '', recModeFilter.value);
-    await loadCityOptions(recCityFilter, 'recording', recTagFilter.value, 'on', '', recCountryFilter.value, '', '', recModeFilter.value);
-    await loadRecStreams();
-  } catch (err) { setRecStatus(String(err), 'err'); }
-});
-recModeFilter.addEventListener('change', async () => {
-  try {
-    await loadCountryOptions(recCountryFilter, 'recording', recTagFilter.value, 'on', '', '', '', recModeFilter.value);
-    await loadCityOptions(recCityFilter, 'recording', recTagFilter.value, 'on', '', recCountryFilter.value, '', '', recModeFilter.value);
-    await loadRecStreams();
-  } catch (err) { setRecStatus(String(err), 'err'); }
-});
-recCountryFilter.addEventListener('change', async () => {
-  try {
-    await loadCityOptions(recCityFilter, 'recording', recTagFilter.value, 'on', '', recCountryFilter.value, '', '', recModeFilter.value);
-    await loadRecStreams();
-  } catch (err) { setRecStatus(String(err), 'err'); }
-});
-recCityFilter.addEventListener('change', async () => {
-  try { await loadRecStreams(); } catch (err) { setRecStatus(String(err), 'err'); }
 });
 
 // Pagination
@@ -6379,7 +5517,6 @@ function parseStreamsLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean);
   const params = new URLSearchParams(window.location.search);
   let streamID = null;
-  selectedServerID = String(params.get('server_id') || '').trim();
   if (parts.length >= 2 && parts[0] === 'streams') {
     const n = Number(parts[1]);
     if (Number.isFinite(n) && n > 0) streamID = n;
