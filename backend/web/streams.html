@@ -1096,197 +1096,7 @@
       color: var(--accent);
     }
 
-    /* Stream timeline */
-    .timeline-panel {
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 10px;
-      background: color-mix(in srgb, var(--panel) 90%, #000);
-    }
-    .timeline-metrics {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 7px;
-      margin-bottom: 8px;
-    }
-    .timeline-summary {
-      margin: 8px 0 10px;
-      font-size: 11px;
-      color: var(--muted);
-      line-height: 1.4;
-    }
-    .timeline-viewport {
-      border: 1px solid color-mix(in srgb, var(--border) 72%, #fff 8%);
-      border-radius: 8px;
-      background: #071126;
-      overflow-x: auto;
-      overflow-y: hidden;
-      padding: 10px;
-    }
-    .timeline-scale,
-    .timeline-track {
-      position: relative;
-      width: 2880px;
-      min-width: 2880px;
-      display: grid;
-      grid-template-columns: repeat(1440, 1fr);
-      gap: 0;
-    }
-    .timeline-scale {
-      height: 18px;
-      margin-bottom: 6px;
-    }
-    .timeline-scale-cell {
-      border-left: 1px solid transparent;
-      position: relative;
-    }
-    .timeline-scale-cell.hour {
-      border-left-color: rgba(255, 255, 255, 0.18);
-    }
-    .timeline-scale-cell.hour::after {
-      content: attr(data-hour);
-      position: absolute;
-      top: 0;
-      left: 2px;
-      font-size: 9px;
-      color: rgba(255, 255, 255, 0.56);
-      font-family: var(--mono);
-      line-height: 1;
-    }
-    .timeline-row {
-      display: grid;
-      grid-template-columns: 110px minmax(0, 1fr);
-      gap: 10px;
-      align-items: center;
-      margin-bottom: 8px;
-    }
-    .timeline-row-label {
-      font-size: 10px;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: var(--muted);
-      font-family: var(--mono);
-      font-weight: 600;
-    }
-    .timeline-track {
-      height: 18px;
-      border-radius: 6px;
-      overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, 0.14);
-      background: linear-gradient(to right, rgba(255,255,255,0.035) 0, rgba(255,255,255,0.035) 1px, transparent 1px);
-      background-size: 120px 100%;
-    }
-    .timeline-cell {
-      border-left: 1px solid transparent;
-      background: transparent;
-      opacity: 0;
-      transition: opacity 120ms ease;
-    }
-    .timeline-cell.hour {
-      border-left-color: rgba(255, 255, 255, 0.1);
-    }
-    .timeline-cell.recorded-success {
-      background: #16a34a;
-    }
-    .timeline-cell.recorded-error {
-      background: #ea580c;
-    }
-    .timeline-cell.inferenced {
-      background: #0ea5e9;
-    }
-    .timeline-cell.people {
-      background: #f59e0b;
-    }
-    .timeline-legend {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-top: 8px;
-      font-size: 10px;
-      color: var(--muted);
-      font-family: var(--mono);
-    }
-    .timeline-legend-item {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .timeline-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      display: inline-block;
-      border: 1px solid rgba(255, 255, 255, 0.35);
-    }
-    .timeline-dot.recorded-success { background: #16a34a; }
-    .timeline-dot.recorded-error { background: #ea580c; }
-    .timeline-dot.inferenced { background: #0ea5e9; }
-    .timeline-dot.people { background: #f59e0b; }
-
-    /* Stream capture coverage */
-    .coverage-panel {
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 10px;
-      background: color-mix(in srgb, var(--panel) 90%, #000);
-    }
-    .coverage-heatmap-wrap {
-      border: 1px solid color-mix(in srgb, var(--border) 72%, #fff 8%);
-      border-radius: 8px;
-      background: #071126;
-      overflow-x: auto;
-      overflow-y: hidden;
-      padding: 10px;
-      margin-top: 8px;
-      margin-bottom: 8px;
-    }
-    .coverage-heatmap-grid {
-      display: grid;
-      grid-auto-flow: column;
-      grid-auto-columns: 14px;
-      grid-template-rows: repeat(7, 14px);
-      gap: 2px;
-      min-height: 110px;
-      width: max-content;
-    }
-    .coverage-cell {
-      width: 14px;
-      height: 14px;
-      border-radius: 2px;
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      background: rgba(148, 163, 184, 0.1);
-      cursor: default;
-    }
-    .coverage-cell.none { background: rgba(148, 163, 184, 0.08); border-color: rgba(148, 163, 184, 0.2); }
-    .coverage-cell.h1 { background: rgba(6, 182, 212, 0.22); border-color: rgba(6, 182, 212, 0.45); }
-    .coverage-cell.h2 { background: rgba(6, 182, 212, 0.36); border-color: rgba(6, 182, 212, 0.55); }
-    .coverage-cell.h3 { background: rgba(6, 182, 212, 0.50); border-color: rgba(6, 182, 212, 0.66); }
-    .coverage-cell.h4 { background: rgba(34, 197, 94, 0.58); border-color: rgba(34, 197, 94, 0.74); }
-    .coverage-cell.h5 { background: rgba(34, 197, 94, 0.82); border-color: rgba(34, 197, 94, 0.92); }
-    .coverage-cell.error-only { background: rgba(234, 88, 12, 0.72); border-color: rgba(234, 88, 12, 0.92); }
-    .coverage-legend {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 6px;
-      margin-bottom: 10px;
-      color: var(--muted);
-      font-size: 10px;
-      font-family: var(--mono);
-    }
-    .coverage-legend-item {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-    }
-    .coverage-legend-swatch {
-      width: 10px;
-      height: 10px;
-      border-radius: 2px;
-      border: 1px solid rgba(255, 255, 255, 0.26);
-      display: inline-block;
-    }
-    .coverage-summary {
+    .detail-note {
       margin: 8px 0 10px;
       font-size: 11px;
       color: var(--muted);
@@ -1478,32 +1288,6 @@
       color: var(--muted);
       line-height: 1.4;
     }
-    .coverage-samples {
-      margin-top: 10px;
-    }
-    .coverage-sample-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-      gap: 8px;
-      margin-top: 8px;
-    }
-    .coverage-sample-card {
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: color-mix(in srgb, var(--panel2) 62%, var(--panel));
-      padding: 6px;
-      display: flex;
-      flex-direction: column;
-      gap: 5px;
-    }
-    .coverage-sample-meta {
-      font-family: var(--mono);
-      font-size: 10px;
-      color: var(--muted);
-      line-height: 1.3;
-      word-break: break-word;
-    }
-
     /* Fullscreen image modal (table image viewer) */
     .image-modal {
       position: fixed;
@@ -1819,7 +1603,6 @@
       <nav class="global-nav" aria-label="Global">
         <a href="/streams" class="active">Streams</a>
         <a href="/korea">Korea</a>
-        <a href="/recording">Recording</a>
         <a href="/docs/getting-started">Docs</a>
       </nav>
     </div>
@@ -1838,42 +1621,7 @@
       <div class="filter-grid filter-grid-primary">
         <div class="filter-field">
           <div class="filter-field-label">Search</div>
-          <input id="streamSearch" placeholder="Search stream / provider / slug" />
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Recording</div>
-          <select id="streamRecordingState">
-            <option value="" selected>all recording states</option>
-            <option value="on">recording on</option>
-            <option value="off">recording off</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Capture Type</div>
-          <select id="streamModeFilter">
-            <option value="">all capture types</option>
-          </select>
-        </div>
-      </div>
-      <div class="filter-grid filter-grid-secondary">
-        <div class="filter-field">
-          <div class="filter-field-label">Include Tag</div>
-          <select id="streamTagFilter">
-            <option value="">any tag</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Exclude Tag</div>
-          <select id="streamTagExcludeFilter">
-            <option value="">none</option>
-            <option value="archive" selected>archive</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <div class="filter-field-label">Source</div>
-          <select id="sourceFilter">
-            <option value="">all sources</option>
-          </select>
+          <input id="streamSearch" placeholder="Search stream / location" />
         </div>
         <div class="filter-field">
           <div class="filter-field-label">Country</div>
@@ -1886,11 +1634,6 @@
           <select id="cityFilter">
             <option value="">all cities</option>
           </select>
-        </div>
-      </div>
-      <div class="toolbar">
-        <div class="subtabs">
-          <button class="subtab-btn active" id="streamViewTable">Table</button>
         </div>
       </div>
       <div class="filter-footer">
@@ -1920,13 +1663,7 @@
 	            <th style="width:128px;">Thumb</th>
 	            <th data-sort-key="name">Stream</th>
 	            <th data-sort-key="location_city">Location</th>
-	            <th data-sort-key="recording_state">Recording</th>
-	            <th data-sort-key="captures_success" id="streamsCapturesHeader">Captures</th>
-	            <th data-sort-key="avg_people_per_inferenced_capture">People / Inference</th>
-	            <th data-sort-key="tags_count">Tags</th>
-	            <th data-sort-key="mode">Capture Type</th>
-	            <th>Source</th>
-	            <th class="table-view-cell">View</th>
+	            <th>Record</th>
 	          </tr>
 	        </thead>
 	        <tbody id="streamRows"></tbody>
@@ -1944,7 +1681,7 @@
       </div>
       <div class="detail-header-actions">
         <a id="detailViewCTA" class="overview-card-link primary" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">View live stream</a>
-        <a id="detailRecordCTA" class="overview-card-link" href="/recording">Record this stream</a>
+        <a id="detailRecordCTA" class="overview-card-link" href="/recordings">Record this stream</a>
       </div>
     </div>
 
@@ -1954,434 +1691,18 @@
         <div class="image-card-label" id="latestCaptureLabel">Latest frame</div>
         <div id="latestRawCard"><span class="muted fs11">No image</span></div>
       </div>
-      <div class="detail-summary-card">
-        <div class="detail-summary-title">Recording</div>
-        <div id="detailRecordingHero"><span class="muted fs11">Loading recording status...</span></div>
-      </div>
-    </div>
-
-    <div class="toolbar" style="margin-bottom:10px;">
-      <div class="subtabs">
-        <a class="subtab-btn active" id="detailMainTabDetails" href="#">Details</a>
-        <a class="subtab-btn" id="detailMainTabClips" href="#">Clips</a>
-        <a class="subtab-btn" id="detailMainTabSettings" href="#">Settings</a>
-      </div>
-    </div>
-
-    <div class="toolbar" id="detailDetailsSubtabs" style="margin-bottom:10px;">
-      <div class="subtabs">
-        <a class="subtab-btn active" id="detailTabCoverage" href="#">Coverage</a>
-        <a class="subtab-btn" id="detailTabTimeline" href="#">Timeline</a>
-        <a class="subtab-btn" id="detailTabHealth" href="#">Health</a>
-        <a class="subtab-btn" id="detailTabFrames" href="#">Frames</a>
-      </div>
-    </div>
-
-    <!-- Inference section -->
-    <div id="detailInferenceSection">
-      <div class="detail-section-card">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Inference Filters</div>
-          <div class="detail-section-subtitle">Refine by pipeline, status, confidence, and time window.</div>
-        </div>
-        <div class="toolbar">
-          <label class="check-label fs11" style="color:var(--muted);">Pipeline</label>
-          <select id="pipelineFilter" style="min-width:200px;"></select>
-          <select id="detailStatusFilter">
-            <option value="">all status</option>
-            <option value="queued_boxed">queued_boxed</option>
-            <option value="success">success</option>
-            <option value="error">error</option>
-          </select>
-          <select id="detailHasBoxed">
-            <option value="">boxed any</option>
-            <option value="true">boxed yes</option>
-            <option value="false">boxed no</option>
-          </select>
-          <input id="detailClassName" placeholder="class name" style="width:140px;" />
-          <input id="detailMinConfidence" type="number" min="0" max="1" step="0.001" placeholder="min conf" style="width:100px;" />
-        </div>
-        <div class="toolbar">
-          <input id="detailSearch" placeholder="Search pipeline / error / summary" style="min-width:220px;" />
-          <input id="detailCreatedFrom" type="datetime-local" />
-          <input id="detailCreatedTo" type="datetime-local" />
-          <select id="detailSortBy">
-            <option value="created_at">sort: created</option>
-            <option value="captured_at">sort: captured</option>
-            <option value="pipeline_id">sort: pipeline</option>
-            <option value="status">sort: status</option>
-            <option value="detection_count">sort: detections</option>
-            <option value="signal_count">sort: signals</option>
-            <option value="signal_strength">sort: signal strength</option>
-            <option value="max_confidence">sort: max conf</option>
-          </select>
-          <select id="detailSortDir">
-            <option value="desc">desc</option>
-            <option value="asc">asc</option>
-          </select>
-          <input id="detailLimit" type="number" min="10" max="500" step="10" value="200" style="width:80px;" />
-          <button id="detailReload" class="primary">Reload</button>
-          <span class="status-text" id="detailStatus"></span>
-        </div>
-      </div>
-      <div id="detailInferenceKpis" class="detail-kpis"></div>
-
-	      <div class="tbl-wrap" style="margin-bottom:14px;">
-	        <table id="detailInferenceTable">
-	          <thead>
-	            <tr>
-	              <th style="width:42px;" data-sort-key="created_at">#</th>
-	              <th data-sort-key="pipeline_id">Pipeline</th>
-	              <th data-sort-key="status">Status</th>
-	              <th data-sort-key="created_at">Created</th>
-	              <th data-sort-key="detection_count">Detections</th>
-	              <th data-sort-key="signal_count">Signals</th>
-	              <th style="width:128px;">Raw</th>
-	              <th style="width:128px;">Boxed</th>
-	              <th>Summary</th>
-	            </tr>
-	          </thead>
-          <tbody id="inferenceRows"></tbody>
-        </table>
-      </div>
-
-      <div class="detail-section-head">
-        <div class="detail-section-title">Latest Detections</div>
-        <div class="detail-section-subtitle" id="detectionMetaSummary">Selected pipeline result</div>
-      </div>
-      <div id="detectionMetaChips" class="detection-meta"></div>
-	      <div class="tbl-wrap">
-	        <table id="detectionTable">
-	          <thead>
-	            <tr>
-	              <th data-sort-key="class_name">Class</th>
-	              <th data-sort-key="confidence">Confidence</th>
-	              <th data-sort-key="x1">x1 px</th><th data-sort-key="y1">y1 px</th><th data-sort-key="x2">x2 px</th><th data-sort-key="y2">y2 px</th>
-	              <th data-sort-key="area_px">Area (px)</th>
-	            </tr>
-	          </thead>
-	          <tbody id="detectionRows"></tbody>
-	        </table>
-      </div>
-
-      <div class="detail-section-head" style="margin-top:10px;">
-        <div class="detail-section-title">Latest Signals</div>
-        <div class="detail-section-subtitle" id="signalMetaSummary">Selected pipeline result</div>
-      </div>
-      <div class="tbl-wrap">
-        <table id="signalTable">
-          <thead>
-            <tr>
-              <th>Type</th>
-              <th>Key</th>
-              <th>Confidence</th>
-              <th>Value</th>
-              <th>Meta</th>
-            </tr>
-          </thead>
-          <tbody id="signalRows"></tbody>
-        </table>
-      </div>
     </div>
 
     <!-- Frames section -->
-    <div id="detailFramesSection" style="display:none;">
+    <div id="detailFramesSection">
       <div class="detail-section-head">
-        <div class="detail-section-title" id="detailFramesRecentTitle">Latest 60 Frames</div>
-        <div class="detail-section-subtitle" id="detailFramesRecentSubtitle">Auto-refreshes every second while this page is open.</div>
+        <div class="detail-section-title" id="detailFramesRecentTitle">Latest Frames</div>
+        <div class="detail-section-subtitle" id="detailFramesRecentSubtitle">Auto-refreshes every few seconds while this page is open.</div>
       </div>
-      <div id="detailLiveFramesStatus" class="coverage-summary">Loading recent frames...</div>
+      <div id="detailLiveFramesStatus" class="detail-note">Loading recent frames...</div>
       <div id="detailLiveFramesGrid" class="detail-live-grid"></div>
-      <div id="detailExportBlock">
-      <div class="detail-section-head" style="margin-top:12px;">
-        <div class="detail-section-title" id="detailExportTitle">Export Frames</div>
-        <div class="detail-section-subtitle" id="detailExportSubtitle">Download a manifest for any time window, or prepare a bounded ZIP archive.</div>
-      </div>
-      <div class="toolbar">
-        <button id="detailExportPreset1h" type="button">Last 1h</button>
-        <button id="detailExportPreset24h" type="button">Last 24h</button>
-        <button id="detailExportPreset7d" type="button">Last 7d</button>
-        <div class="toolbar-sep"></div>
-        <label class="check-label fs11" style="color:var(--muted);">From</label>
-        <input id="detailExportFrom" type="datetime-local" />
-        <label class="check-label fs11" style="color:var(--muted);">To</label>
-        <input id="detailExportTo" type="datetime-local" />
-        <select id="detailExportStatusFilter" style="min-width:150px;">
-          <option value="success" selected>success only</option>
-          <option id="detailExportStatusAllOption" value="all">all frame rows</option>
-          <option value="error">error rows only</option>
-        </select>
-        <button id="detailExportManifest" type="button">Download Manifest</button>
-        <button id="detailExportZip" class="primary" type="button">Prepare ZIP</button>
-        <span class="status-text" id="detailExportStatus"></span>
-      </div>
-      <div id="detailExportResult" class="coverage-summary">ZIP export currently supports up to 5000 frames or 2 GiB per request.</div>
-      </div>
-      <div class="detail-section-head" style="margin-top:12px;">
-        <div class="detail-section-title" id="detailRawCaptureRowsTitle">Raw Capture Rows</div>
-        <div class="detail-section-subtitle" id="detailRawCaptureRowsSubtitle">Recent persisted frame rows with status, preview, and object key.</div>
-      </div>
-      <div id="detailClipPreviewBlock" class="detail-section-card" style="margin-bottom:12px; display:none;">
-        <div class="detail-section-head" style="margin-top:0;">
-          <div class="detail-section-title">Clip Preview</div>
-          <div class="detail-section-subtitle" id="detailClipPreviewStatus">Select a clip to scrub it inline here.</div>
-        </div>
-        <div id="detailClipPreviewSlot"><span class="muted fs11">No clip selected.</span></div>
-      </div>
-      <div class="toolbar">
-        <select id="framesStatusFilter">
-          <option value="">all status</option>
-          <option value="success">success</option>
-          <option value="error">error</option>
-        </select>
-        <input id="framesLimit" type="number" min="20" max="1000" step="20" value="200" style="width:80px;" />
-        <button id="detailFramesReload" class="primary">Reload captures</button>
-        <span class="status-text" id="framesStatusText"></span>
-      </div>
-	      <div class="tbl-wrap">
-	        <table id="framesTable">
-	          <thead>
-	            <tr>
-	              <th style="width:42px;" data-sort-key="id">#</th>
-	              <th id="framesCapturedHeader" data-sort-key="captured_at">Captured</th>
-	              <th data-sort-key="status">Status</th>
-	              <th data-sort-key="error">Error</th>
-	              <th id="framesRawHeader" style="width:128px;">Raw</th>
-	              <th data-sort-key="object_key">Object key</th>
-	            </tr>
-	          </thead>
-	          <tbody id="framesRows"></tbody>
-	        </table>
-      </div>
     </div>
 
-    <!-- Recording section -->
-    <div id="detailCoverageSection" style="display:none;">
-      <div class="detail-section-card" style="margin-bottom:12px;">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recording Route</div>
-          <div class="detail-section-subtitle">Where Sto-A-Rama is recording this stream right now.</div>
-        </div>
-        <div class="toolbar" style="margin-top:0;">
-          <button id="detailWorkloadReload" class="btn-sm">Refresh status</button>
-          <span class="status-text" id="detailWorkloadStatus"></span>
-        </div>
-        <div id="detailCurrentPath" class="detail-fact-grid"></div>
-        <div id="detailCurrentWorker" style="margin-top:10px;"></div>
-        <details class="detail-history">
-          <summary>Recent worker history</summary>
-          <div class="stack" id="detailCaptureWorkers" style="gap:4px; margin-top:10px;"></div>
-        </details>
-      </div>
-      <div class="coverage-panel">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recording</div>
-          <div class="detail-section-subtitle" id="detailCoverageSubtitle">Historical coverage, day-level heatmap, and stratified capture samples.</div>
-        </div>
-        <div class="detail-section-head" style="margin-top:12px;">
-          <div class="detail-section-title">Historical Coverage</div>
-          <div class="detail-section-subtitle">Day-level UTC view: each square is one day colored by recorded hours.</div>
-        </div>
-        <div class="toolbar">
-          <label class="check-label fs11" style="color:var(--muted);">Window (days)</label>
-          <select id="coverageDays" style="min-width:160px;">
-            <option value="30" selected>last 30 days</option>
-            <option value="90">last 90 days</option>
-            <option value="180">last 180 days</option>
-            <option value="365">last 365 days</option>
-            <option value="730">last 730 days</option>
-          </select>
-          <label class="check-label fs11" style="color:var(--muted);">Samples</label>
-          <select id="coverageSampleCount" style="min-width:130px;">
-            <option value="24">24</option>
-            <option value="42" selected>42</option>
-            <option value="60">60</option>
-            <option value="84">84</option>
-          </select>
-          <button id="detailCoverageReload" class="primary" type="button">Reload coverage</button>
-          <span class="status-text" id="coverageStatusText"></span>
-        </div>
-        <div id="coverageMetricChips" class="timeline-metrics"></div>
-        <div id="coverageSummary" class="coverage-summary">No coverage data loaded.</div>
-        <div class="coverage-heatmap-wrap">
-          <div id="coverageHeatmapGrid" class="coverage-heatmap-grid"></div>
-        </div>
-        <div class="coverage-legend">
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell none"></span>0h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h1"></span>&lt;=1h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h2"></span>&lt;=4h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h3"></span>&lt;=8h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h4"></span>&lt;=16h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell h5"></span>&gt;16h</span>
-          <span class="coverage-legend-item"><span class="coverage-legend-swatch coverage-cell error-only"></span>error-only day</span>
-        </div>
-        <div class="detail-section-head" style="margin-top:8px;">
-          <div class="detail-section-title">History Samples</div>
-          <div class="detail-section-subtitle" id="detailCoverageSamplesSubtitle">Stratified snapshots across full capture history (not just recent frames).</div>
-        </div>
-        <div id="coverageSamplesSummary" class="coverage-summary">No samples loaded.</div>
-        <div id="coverageSampleGrid" class="coverage-sample-grid"></div>
-      </div>
-    </div>
-
-    <!-- Timeline section -->
-    <div id="detailTimelineSection" style="display:none;">
-      <div class="timeline-panel">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recording vs Inference Timeline</div>
-          <div class="detail-section-subtitle" id="detailTimelineSubtitle">UTC minute timeline for recorded frames, inferenced frames, and person detections.</div>
-        </div>
-        <div class="toolbar">
-          <button id="timelinePrevDay" type="button">&#8592; Prev day</button>
-          <input id="timelineDay" type="date" />
-          <button id="timelineNextDay" type="button">Next day &#8594;</button>
-          <div class="toolbar-sep"></div>
-          <label class="check-label fs11" style="color:var(--muted);">Pipeline</label>
-          <select id="timelinePipelineFilter" style="min-width:220px;">
-            <option value="">All pipelines</option>
-          </select>
-          <button id="detailTimelineReload" class="primary" type="button">Reload timeline</button>
-          <span class="status-text" id="timelineStatusText"></span>
-        </div>
-        <div id="timelineMetricChips" class="timeline-metrics"></div>
-        <div id="timelineSummary" class="timeline-summary">No timeline data loaded.</div>
-        <div id="timelineViewport" class="timeline-viewport">
-          <div id="timelineScale" class="timeline-scale"></div>
-          <div class="timeline-row">
-            <div class="timeline-row-label">Recorded</div>
-            <div id="timelineRecordedTrack" class="timeline-track"></div>
-          </div>
-          <div class="timeline-row">
-            <div class="timeline-row-label">Inferenced</div>
-            <div id="timelineInferencedTrack" class="timeline-track"></div>
-          </div>
-          <div class="timeline-row">
-            <div class="timeline-row-label">People</div>
-            <div id="timelinePeopleTrack" class="timeline-track"></div>
-          </div>
-        </div>
-        <div class="timeline-legend">
-          <span class="timeline-legend-item"><span class="timeline-dot recorded-success"></span>recorded success</span>
-          <span class="timeline-legend-item"><span class="timeline-dot recorded-error"></span>recorded errors only</span>
-          <span class="timeline-legend-item"><span class="timeline-dot inferenced"></span>inferenced frame present</span>
-          <span class="timeline-legend-item"><span class="timeline-dot people"></span>people detections intensity</span>
-        </div>
-      </div>
-    </div>
-
-    <div id="detailHealthSection" style="display:none;">
-      <div class="health-panel">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recording Health</div>
-          <div class="detail-section-subtitle" id="detailHealthSubtitle">Hourly loss rate and explicit error rows over the selected UTC window.</div>
-        </div>
-        <div class="toolbar">
-          <label class="check-label fs11" style="color:var(--muted);">Window (hours)</label>
-          <select id="detailHealthHours" style="min-width:160px;">
-            <option value="24">last 24 hours</option>
-            <option value="48">last 48 hours</option>
-            <option value="72" selected>last 72 hours</option>
-            <option value="96">last 96 hours</option>
-            <option value="120">last 120 hours</option>
-            <option value="168">last 168 hours</option>
-          </select>
-          <button id="detailHealthReload" class="primary" type="button">Reload health</button>
-          <span class="status-text" id="healthStatusText"></span>
-        </div>
-        <div id="healthMetricChips" class="timeline-metrics"></div>
-        <div id="healthSummary" class="health-summary">No recording health data loaded.</div>
-        <div class="health-grid-wrap">
-          <div id="healthGrid" class="health-grid"></div>
-        </div>
-        <div class="health-legend">
-          <span class="health-legend-item"><span class="health-legend-swatch loss-0"></span>0% loss</span>
-          <span class="health-legend-item"><span class="health-legend-swatch loss-2"></span>low loss</span>
-          <span class="health-legend-item"><span class="health-legend-swatch loss-4"></span>spotty</span>
-          <span class="health-legend-item"><span class="health-legend-swatch loss-6"></span>severe loss</span>
-          <span class="health-legend-item"><span class="health-legend-swatch error"></span>explicit error rows</span>
-        </div>
-      </div>
-    </div>
-
-    <div id="detailClipsSection" style="display:none;">
-      <div class="detail-section-card">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Recorded Clips</div>
-          <div class="detail-section-subtitle">Pick a day and a range up to 4 hours, then open every clip in that window.</div>
-        </div>
-        <div id="detailClipsAuth" class="coverage-summary">Checking session...</div>
-        <div class="clip-toolbar" style="margin-top:12px;">
-          <div class="button-row">
-            <button id="detailClipModeRangeBtn" class="primary" type="button">Range</button>
-            <button id="detailClipModeLinearBtn" class="secondary" type="button">Linear</button>
-          </div>
-          <div class="button-row" id="detailClipLinearControls">
-            <button id="detailClipsReloadBtn" class="secondary" type="button">Reload</button>
-            <button id="detailClipsPrevBtn" class="secondary" type="button">Previous</button>
-            <button id="detailClipsNextBtn" class="secondary" type="button">Next</button>
-          </div>
-          <div class="button-row">
-            <button id="detailSelectAllClipsBtn" class="secondary" type="button">Select page</button>
-            <button id="detailDownloadSelectedBtn" type="button" disabled>Download selected</button>
-          </div>
-        </div>
-        <div id="detailClipRangePanel" class="clip-range-panel">
-          <div class="filter-row">
-            <label>
-              <span>Day</span>
-              <select id="detailClipRangeDay"></select>
-            </label>
-            <label>
-              <span>Start (UTC)</span>
-              <input id="detailClipRangeStart" type="time" step="1800" />
-            </label>
-            <label>
-              <span>End (UTC)</span>
-              <input id="detailClipRangeEnd" type="time" step="1800" />
-            </label>
-            <button id="detailOpenClipRangeBtn" class="primary" type="button">Open clips in range</button>
-            <button id="detailDownloadDayZipBtn" class="secondary" type="button" disabled>Download this day (zip)</button>
-            <span id="detailDayZipStatus" class="status-text"></span>
-          </div>
-          <div id="detailDayZipResult" class="coverage-summary" style="display:none; margin-top:8px;"></div>
-          <div id="detailClipHourBuckets" class="clip-hour-grid"></div>
-          <div id="detailClipRangeSummary" class="coverage-summary">Select a day and time range.</div>
-        </div>
-        <div id="detailClipsStatus" class="status-text" style="margin-top:8px;"></div>
-        <div id="detailClipsEmpty" class="coverage-summary">No clips are available yet for this stream.</div>
-        <div id="detailClipsTableWrap" class="tbl-wrap" style="display:none; margin-top:10px;">
-          <table>
-            <thead>
-              <tr>
-                <th style="width:40px;"><input id="detailClipSelectPageCheckbox" type="checkbox" /></th>
-                <th id="detailClipsStartHeader">Start</th>
-                <th>Duration</th>
-                <th>Format</th>
-                <th>Size</th>
-                <th>Preview</th>
-                <th>Download</th>
-              </tr>
-            </thead>
-            <tbody id="detailClipsRows"></tbody>
-          </table>
-        </div>
-        <div id="detailClipDownloadResults" class="coverage-summary" style="display:none; margin-top:10px;"></div>
-      </div>
-    </div>
-
-    <div id="detailSettingsSection" style="display:none;">
-      <div class="detail-section-card">
-        <div class="detail-section-head">
-          <div class="detail-section-title">Stream Settings</div>
-        <div class="detail-section-subtitle">Start recording is available without sign-in. Sign in to stop, unassign, and edit tags.</div>
-        </div>
-        <div id="detailSettingsAuth" class="coverage-summary">Checking session...</div>
-        <div id="detailTagEditor" style="margin-top:12px;"></div>
-        <div id="detailLocalRecordCommands" style="display:none; margin-top:12px;"></div>
-        <div id="detailSourcePanel" style="margin-top:12px;"></div>
-        <div class="action-bar" id="detailActions" style="margin-top:12px;"></div>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -2560,7 +1881,6 @@ const serversIncludeStale = $('serversIncludeStale');
 const serversReload = $('serversReload');
 const serversStatus = $('serversStatus');
 const serversRows = $('serversRows');
-const serversTable = $('serversTable');
 const serversAssignStreamID = $('serversAssignStreamID');
 const serversAssignOpen = $('serversAssignOpen');
 const serversAssignStatus = $('serversAssignStatus');
@@ -2588,147 +1908,21 @@ const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
 const detailViewCTA = $('detailViewCTA');
 const detailRecordCTA = $('detailRecordCTA');
-const detailTagEditor = $('detailTagEditor');
 const detailActions = $('detailActions');
-const detailLocalRecordCommands = $('detailLocalRecordCommands');
 const detailSourcePanel = $('detailSourcePanel');
-const detailMainTabDetails = $('detailMainTabDetails');
-const detailMainTabClips = $('detailMainTabClips');
-const detailMainTabSettings = $('detailMainTabSettings');
-const detailDetailsSubtabs = $('detailDetailsSubtabs');
 const latestCaptureLabel = $('latestCaptureLabel');
 const latestRawCard = $('latestRawCard');
-const detailRecordingHero = $('detailRecordingHero');
-const detailCurrentPath = $('detailCurrentPath');
-const detailCurrentWorker = $('detailCurrentWorker');
 const detailLiveFramesStatus = $('detailLiveFramesStatus');
 const detailLiveFramesGrid = $('detailLiveFramesGrid');
 const detailFramesRecentTitle = $('detailFramesRecentTitle');
 const detailFramesRecentSubtitle = $('detailFramesRecentSubtitle');
-const detailExportBlock = $('detailExportBlock');
-const detailExportTitle = $('detailExportTitle');
-const detailExportSubtitle = $('detailExportSubtitle');
-const detailExportPreset1h = $('detailExportPreset1h');
-const detailExportPreset24h = $('detailExportPreset24h');
-const detailExportPreset7d = $('detailExportPreset7d');
-const detailExportFrom = $('detailExportFrom');
-const detailExportTo = $('detailExportTo');
-const detailExportStatusFilter = $('detailExportStatusFilter');
-const detailExportStatusAllOption = $('detailExportStatusAllOption');
-const detailExportManifest = $('detailExportManifest');
-const detailExportZip = $('detailExportZip');
-const detailExportStatus = $('detailExportStatus');
-const detailExportResult = $('detailExportResult');
-const detailRawCaptureRowsTitle = $('detailRawCaptureRowsTitle');
-const detailRawCaptureRowsSubtitle = $('detailRawCaptureRowsSubtitle');
 const detailClipPreviewBlock = $('detailClipPreviewBlock');
 const detailClipPreviewStatus = $('detailClipPreviewStatus');
 const detailClipPreviewSlot = $('detailClipPreviewSlot');
-const detailTabInference = $('detailTabInference');
-const detailTabCoverage = $('detailTabCoverage');
-const detailTabTimeline = $('detailTabTimeline');
-const detailTabHealth = $('detailTabHealth');
-const detailTabFrames = $('detailTabFrames');
-const detailInferenceSection = $('detailInferenceSection');
-const detailCoverageSection = $('detailCoverageSection');
-const detailTimelineSection = $('detailTimelineSection');
-const detailHealthSection = $('detailHealthSection');
 const detailFramesSection = $('detailFramesSection');
-const detailClipsSection = $('detailClipsSection');
-const detailSettingsSection = $('detailSettingsSection');
 const detailClipsAuth = $('detailClipsAuth');
 const detailSettingsAuth = $('detailSettingsAuth');
-const detailClipsStatus = $('detailClipsStatus');
-const detailClipsEmpty = $('detailClipsEmpty');
-const detailClipsTableWrap = $('detailClipsTableWrap');
-const detailClipsRows = $('detailClipsRows');
-const detailClipModeRangeBtn = $('detailClipModeRangeBtn');
-const detailClipModeLinearBtn = $('detailClipModeLinearBtn');
-const detailClipRangePanel = $('detailClipRangePanel');
-const detailClipLinearControls = $('detailClipLinearControls');
-const detailClipRangeDay = $('detailClipRangeDay');
-const detailClipRangeStart = $('detailClipRangeStart');
-const detailClipRangeEnd = $('detailClipRangeEnd');
-const detailClipHourBuckets = $('detailClipHourBuckets');
-const detailClipRangeSummary = $('detailClipRangeSummary');
-const detailOpenClipRangeBtn = $('detailOpenClipRangeBtn');
-const detailDownloadDayZipBtn = $('detailDownloadDayZipBtn');
-const detailDayZipStatus = $('detailDayZipStatus');
-const detailDayZipResult = $('detailDayZipResult');
-const detailClipsReloadBtn = $('detailClipsReloadBtn');
-const detailClipsPrevBtn = $('detailClipsPrevBtn');
-const detailClipsNextBtn = $('detailClipsNextBtn');
-const detailSelectAllClipsBtn = $('detailSelectAllClipsBtn');
-const detailDownloadSelectedBtn = $('detailDownloadSelectedBtn');
-const detailClipSelectPageCheckbox = $('detailClipSelectPageCheckbox');
-const detailClipDownloadResults = $('detailClipDownloadResults');
-const detailCoverageSubtitle = $('detailCoverageSubtitle');
-const detailCoverageSamplesSubtitle = $('detailCoverageSamplesSubtitle');
-const detailTimelineSubtitle = $('detailTimelineSubtitle');
-const detailHealthSubtitle = $('detailHealthSubtitle');
-const detailHealthHours = $('detailHealthHours');
-const detailHealthReload = $('detailHealthReload');
-const healthStatusText = $('healthStatusText');
-const healthMetricChips = $('healthMetricChips');
-const healthSummary = $('healthSummary');
-const healthGrid = $('healthGrid');
-const pipelineFilter = $('pipelineFilter');
-const detailStatusFilter = $('detailStatusFilter');
-const detailHasBoxed = $('detailHasBoxed');
-const detailClassName = $('detailClassName');
-const detailMinConfidence = $('detailMinConfidence');
-const detailSearch = $('detailSearch');
-const detailCreatedFrom = $('detailCreatedFrom');
-const detailCreatedTo = $('detailCreatedTo');
-const detailSortBy = $('detailSortBy');
-const detailSortDir = $('detailSortDir');
-const detailLimit = $('detailLimit');
-const detailReload = $('detailReload');
 const detailStatusEl = $('detailStatus');
-const detailInferenceKpis = $('detailInferenceKpis');
-const inferenceRowsEl = $('inferenceRows');
-const detailInferenceTable = $('detailInferenceTable');
-const detectionMetaSummary = $('detectionMetaSummary');
-const detectionMetaChips = $('detectionMetaChips');
-const detectionRowsEl = $('detectionRows');
-const detectionTable = $('detectionTable');
-const signalMetaSummary = $('signalMetaSummary');
-const signalRowsEl = $('signalRows');
-const signalTable = $('signalTable');
-const framesStatusFilter = $('framesStatusFilter');
-const framesLimit = $('framesLimit');
-const detailFramesReload = $('detailFramesReload');
-const framesStatusText = $('framesStatusText');
-const framesRowsEl = $('framesRows');
-const framesTable = $('framesTable');
-const framesCapturedHeader = $('framesCapturedHeader');
-const framesRawHeader = $('framesRawHeader');
-const timelinePrevDay = $('timelinePrevDay');
-const timelineNextDay = $('timelineNextDay');
-const timelineDayInput = $('timelineDay');
-const timelinePipelineFilter = $('timelinePipelineFilter');
-const detailTimelineReload = $('detailTimelineReload');
-const timelineStatusText = $('timelineStatusText');
-const timelineMetricChips = $('timelineMetricChips');
-const timelineSummary = $('timelineSummary');
-const timelineScale = $('timelineScale');
-const timelineRecordedTrack = $('timelineRecordedTrack');
-const timelineInferencedTrack = $('timelineInferencedTrack');
-const timelinePeopleTrack = $('timelinePeopleTrack');
-const coverageDays = $('coverageDays');
-const coverageSampleCount = $('coverageSampleCount');
-const detailCoverageReload = $('detailCoverageReload');
-const coverageStatusText = $('coverageStatusText');
-const coverageMetricChips = $('coverageMetricChips');
-const coverageSummary = $('coverageSummary');
-const coverageHeatmapGrid = $('coverageHeatmapGrid');
-const coverageSamplesSummary = $('coverageSamplesSummary');
-const coverageSampleGrid = $('coverageSampleGrid');
-const detailWorkloadReload = $('detailWorkloadReload');
-const detailWorkloadStatus = $('detailWorkloadStatus');
-const detailCaptureWorkers = $('detailCaptureWorkers');
-const detailPipelineRows = $('detailPipelineRows');
-const detailPipelinesTable = $('detailPipelinesTable');
 const metricsRow = $('metricsRow');
 const streamsCapturesHeader = $('streamsCapturesHeader');
 const detailClipsStartHeader = $('detailClipsStartHeader');
@@ -2871,9 +2065,6 @@ let imageQueueTimer = null;
 let streamImageObserver = null;
 
 recordingIntervalSecInput.value = '1';
-streamRecordingStateFilter.value = '';
-if (coverageDays) coverageDays.value = '30';
-if (coverageSampleCount) coverageSampleCount.value = '42';
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 function esc(v) {
@@ -3032,97 +2223,6 @@ function isYouTubeSourceURL(rawURL) {
   } catch (_) {
     return false;
   }
-}
-
-function localRecordCommands(stream) {
-  const s = stream || {};
-  const streamID = Number(s.id || 0);
-  const captureType = String(s.capture_type || '').trim().toLowerCase();
-  const provider = String(s.provider || '').trim().toLowerCase();
-  const sourceURL = String(s.source_url || '').trim();
-  const sourcePageURL = String(s.source_page_url || '').trim();
-  const directVideo = ['hls', 'dash', 'rtsp', 'rtmp', 'http_video'].includes(captureType);
-
-  if (directVideo && sourceURL) {
-    const fileBase = streamID > 0 ? `stream-${streamID}` : 'stream';
-    return [
-      {
-        label: 'Continuous recording',
-        note: 'Runs until you stop it.',
-        command: `ffmpeg -i "${sourceURL}" -c copy "${fileBase}.mp4"`,
-      },
-      {
-        label: 'Timed sample',
-        note: 'Stops automatically after 60 seconds. Change 60 to any duration you want.',
-        command: `ffmpeg -i "${sourceURL}" -t 60 -c copy "${fileBase}-60s.mp4"`,
-      },
-    ];
-  }
-
-  const youtubeLike = captureType === 'youtube_watch' || provider === 'youtube' || isYouTubeSourceURL(sourceURL) || isYouTubeSourceURL(sourcePageURL);
-  if (!youtubeLike) return [];
-  const targetURL = buildYouTubeWatchURL(s) || sourcePageURL || sourceURL;
-  if (!targetURL) return [];
-  return [
-    {
-      label: 'Download with yt-dlp',
-      note: 'Output path follows yt-dlp defaults unless you add -o.',
-      command: `yt-dlp --cookies-from-browser chrome "${targetURL}"`,
-    },
-  ];
-}
-
-function localRecordInstallInstructions(command) {
-  const isFFmpeg = command.startsWith('ffmpeg');
-  return {
-    macos: isFFmpeg ? 'brew install ffmpeg' : 'brew install yt-dlp',
-    windows: isFFmpeg ? 'winget install Gyan.FFmpeg' : 'winget install -e --id yt-dlp.yt-dlp',
-  };
-}
-
-function localRecordOutputHint(command, stream) {
-  const s = stream || {};
-  const streamID = Number(s.id || 0);
-  if (command.startsWith('ffmpeg')) {
-    const fileBase = streamID > 0 ? `stream-${streamID}` : 'stream';
-    return `This records to "${fileBase}.mp4" while the command is running.`;
-  }
-  return 'Recording output path is controlled by yt-dlp defaults unless you add -o.';
-}
-
-function renderLocalRecordCommands(stream) {
-  if (!(detailLocalRecordCommands instanceof HTMLElement)) return;
-  const commands = localRecordCommands(stream);
-  if (!commands.length) {
-    detailLocalRecordCommands.style.display = 'none';
-    detailLocalRecordCommands.innerHTML = '';
-    return;
-  }
-  const primaryCommand = commands[0].command;
-  const showCookieNote = commands.some((item) => item.command.startsWith('yt-dlp'));
-  detailLocalRecordCommands.style.display = '';
-  detailLocalRecordCommands.innerHTML = `
-    <div class="detail-section-head">
-      <div class="detail-section-title">Record on your computer</div>
-    <div class="detail-section-subtitle">Run this on your own machine. No account is required.</div>
-    </div>
-    <div class="coverage-summary">Run this command to start recording. Keep the process running while recording is needed.</div>
-    <div class="coverage-summary">To stop, press <code>Ctrl + C</code> (or close the terminal) and the recording process will end.</div>
-    <div class="detail-section-subtitle">Install local tooling (one-time setup):</div>
-    <div class="coverage-summary">macOS (Terminal)</div>
-    <div class="coverage-summary">Install <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">Homebrew</a>, then run:</div>
-    <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(primaryCommand).macos)}</code></pre>
-    <div class="coverage-summary">Windows (PowerShell or Windows Terminal)</div>
-    <div class="coverage-summary">Install <a href="https://aka.ms/getwinget" target="_blank" rel="noopener noreferrer">Winget</a> via App Installer, then run:</div>
-    <pre class="command-snippet"><code class="mono fs11">${esc(localRecordInstallInstructions(primaryCommand).windows)}</code></pre>
-    <div class="coverage-summary">Notes: ${esc(localRecordOutputHint(primaryCommand, stream))}</div>
-    ${showCookieNote ? '<div class="coverage-summary">Use local browser cookies for private/restricted YouTube sources (command uses Chrome by default).</div>' : ''}
-    ${commands.map((item) => `
-      <div class="detail-section-subtitle">${esc(item.label)}</div>
-      <div class="coverage-summary">${esc(item.note)}</div>
-      <pre class="command-snippet"><code class="mono fs11">${esc(item.command)}</code></pre>
-    `).join('')}
-  `;
 }
 
 function sanitizeLimit(raw, fallback, min, max) {
@@ -3633,44 +2733,6 @@ async function handleTagMutation(action, streamID, rawTagValue) {
   return patchStreamTags(streamID, next);
 }
 
-async function setStreamRecordingState(streamID, recordingState) {
-  const normalized = String(recordingState || '').trim().toLowerCase();
-  if (normalized !== 'on' && normalized !== 'off') {
-    throw new Error('recording_state must be on or off');
-  }
-  if (normalized === 'off' && !hasAuthCapability('can_toggle_recording')) {
-    throw new Error(authStatusMessage('stop recording'));
-  }
-  try {
-    if (normalized === 'off') {
-      const confirmToken = `unassign:${streamID}`;
-      const entered = window.prompt(`Type ${confirmToken} to stop recording for stream ${streamID}.`, '');
-      if (String(entered || '').trim() !== confirmToken) {
-        throw new Error(`recording disable cancelled (confirmation must equal ${confirmToken})`);
-      }
-    }
-    return fetchJSON(`/api/v1/recording/streams/${streamID}/state`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        recording_state: normalized,
-        reason: 'dashboard stream toggle',
-      }),
-    });
-  } catch (err) {
-    console.error('[recording-toggle] failure', {
-      streamID,
-      recordingState: normalized,
-      path: window.location.pathname,
-      href: window.location.href,
-      authStatus: authState && authState.status,
-      canToggleRecording: hasAuthCapability('can_toggle_recording'),
-      error: authErrorMessage(err),
-    });
-    throw new Error(formatAccountAuthError(err, 'recording changes require a signed-in account'));
-  }
-}
-
 // ─── Loading overlay ─────────────────────────────────────────────────────────
 function setLoading(active, msg = 'Loading...') {
   if (active) {
@@ -3920,9 +2982,6 @@ function syncAuthDependentUI() {
   if (detailRecordingData && detailRecordingData.stream) {
     syncDetailMutationUI(detailRecordingData.stream);
   }
-  if (detailStreamID) {
-    void refreshDetailClips();
-  }
 }
 
 function setAuthState(next) {
@@ -4061,39 +3120,11 @@ async function copyStreamSourceURL(streamID) {
   await navigator.clipboard.writeText(sourceURL);
 }
 
-function renderRecordingToggleControl(stream, options = {}) {
-  const s = stream || {};
-  const detailMode = options && options.detail === true;
-  const actionAttr = detailMode ? 'data-detail-action' : 'data-action';
-  const actionOn = detailMode ? 'recording-enable' : 'recording-enable';
-  const actionOff = detailMode ? 'recording-disable' : 'recording-disable';
-  const buttonLabelOn = detailMode ? 'Turn Recording On' : 'Turn On';
-  const buttonLabelOff = detailMode ? 'Turn Recording Off' : 'Turn Off';
-  const canStartRecording = supportsClipRecording(s);
-  const state = String(s.recording_state || 'off').trim().toLowerCase();
-  const canStop = hasAuthCapability('can_toggle_recording');
-  const disabledTitle = recordingToggleHintText();
-  if (state === 'on') {
-    const buttonHTML = canStop
-      ? `<button class="btn-sm" ${actionAttr}="${actionOff}" data-id="${s.id}">${buttonLabelOff}</button>`
-      : renderDisabledButton(buttonLabelOff, disabledTitle);
-    return `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;">${buttonHTML}</div>`;
-  }
-  if (!canStartRecording) {
-    return '<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>';
-  }
-  const buttonHTML = `<button class="btn-sm" ${actionAttr}="${actionOn}" data-id="${s.id}">${buttonLabelOn}</button>`;
-  return `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${buttonHTML}</div>`;
-}
-
 function syncDetailMutationUI(stream) {
-  if (!(detailActions instanceof HTMLElement)) return;
   const s = stream || {};
-  const youtubeWatchURL = buildYouTubeWatchURL(s);
   const preferredViewURL = buildPreferredViewURL(s);
-  const recordThisStreamHTML = `<a href="/recording?stream_id=${s.id}"><button class="btn-sm">Record This Stream</button></a>`;
   if (detailRecordCTA instanceof HTMLAnchorElement) {
-    detailRecordCTA.href = `/recording?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
+    detailRecordCTA.href = `/recordings?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
   }
   if (detailViewCTA instanceof HTMLAnchorElement) {
     if (preferredViewURL) {
@@ -4104,446 +3135,9 @@ function syncDetailMutationUI(stream) {
       detailViewCTA.style.display = 'none';
     }
   }
-  detailActions.innerHTML = `
-    ${preferredViewURL ? `<a href="${esc(preferredViewURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm primary">View Live Stream</button></a>` : ''}
-    ${recordThisStreamHTML}
-    ${renderRecordingToggleControl(s, { detail: true })}
-    <button class="btn-sm" data-detail-action="show-stream-json" data-id="${s.id}" title="Inspect full stream payload">Inspect JSON</button>
-    ${youtubeWatchURL && youtubeWatchURL !== preferredViewURL ? `<a href="${esc(youtubeWatchURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Open YouTube</button></a>` : ''}
-    ${s.source_page_url ? `<a href="${esc(s.source_page_url)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm">Source Page</button></a>` : ''}
-  `;
-  if (detailTagEditor instanceof HTMLElement) {
-    detailTagEditor.innerHTML = renderTagEditor(s, 'detail');
-  }
-  if (detailSourcePanel instanceof HTMLElement) {
-    detailSourcePanel.innerHTML = renderDetailSourcePanel(s);
-  }
-  renderLocalRecordCommands(s);
-}
-
-function selectedDetailClipIDs() {
-  if (!(detailClipsRows instanceof HTMLElement)) return [];
-  return Array.from(detailClipsRows.querySelectorAll('input[data-clip-id]:checked'))
-    .map((input) => Number(input.getAttribute('data-clip-id')))
-    .filter((id) => Number.isFinite(id) && id > 0);
-}
-
-function updateDetailClipSelectionState() {
-  const selected = selectedDetailClipIDs();
-  if (detailDownloadSelectedBtn instanceof HTMLButtonElement) {
-    detailDownloadSelectedBtn.disabled = selected.length === 0;
-  }
-  if (detailClipSelectPageCheckbox instanceof HTMLInputElement) {
-    const pageIDs = detailClipItems.map((item) => Number(item.id || 0)).filter((id) => id > 0);
-    detailClipSelectPageCheckbox.checked = pageIDs.length > 0 && pageIDs.every((id) => selected.includes(id));
-  }
-}
-
-function normalizeClipViewMode(raw) {
-  return String(raw || '').trim().toLowerCase() === CLIP_VIEW_MODE.LINEAR ? CLIP_VIEW_MODE.LINEAR : CLIP_VIEW_MODE.RANGE;
-}
-
-function setDetailClipViewMode(mode, opts = {}) {
-  detailClipViewMode = normalizeClipViewMode(mode);
-  const isRange = detailClipViewMode === CLIP_VIEW_MODE.RANGE;
-  if (detailClipModeRangeBtn instanceof HTMLButtonElement) {
-    detailClipModeRangeBtn.className = isRange ? 'primary' : 'secondary';
-  }
-  if (detailClipModeLinearBtn instanceof HTMLButtonElement) {
-    detailClipModeLinearBtn.className = isRange ? 'secondary' : 'primary';
-  }
-  if (detailClipRangePanel instanceof HTMLElement) detailClipRangePanel.style.display = isRange ? '' : 'none';
-  if (detailClipLinearControls instanceof HTMLElement) detailClipLinearControls.style.display = isRange ? 'none' : '';
-  if (opts.syncURL !== false) syncDetailURL({ replace: opts.replaceURL === true });
-}
-
-function formatClipMinuteInput(minutes) {
-  const normalized = ((Math.floor(Number(minutes) || 0) % (24 * 60)) + (24 * 60)) % (24 * 60);
-  const hour = Math.floor(normalized / 60);
-  const minute = normalized % 60;
-  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-}
-
-function clipTimeInputMinutes(raw) {
-  const parts = String(raw || '').split(':').map((v) => Number(v));
-  if (parts.length < 2 || !Number.isFinite(parts[0]) || !Number.isFinite(parts[1])) {
-    throw new Error('invalid clip time');
-  }
-  return (Math.floor(parts[0]) * 60) + Math.floor(parts[1]);
-}
-
-function setClipRangeInputs(from, to) {
-  if (!(from instanceof Date) || !(to instanceof Date) || !Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
-    throw new Error('invalid clip range');
-  }
-  if (detailClipRangeDay instanceof HTMLSelectElement) detailClipRangeDay.value = from.toISOString().slice(0, 10);
-  if (detailClipRangeStart instanceof HTMLInputElement) detailClipRangeStart.value = from.toISOString().slice(11, 16);
-  if (detailClipRangeEnd instanceof HTMLInputElement) detailClipRangeEnd.value = to.toISOString().slice(11, 16);
-}
-
-function setClipRangeFromBucket(bucket) {
-  const from = new Date(bucket && bucket.hour_start || '');
-  if (!Number.isFinite(from.getTime())) throw new Error('invalid clip hour bucket');
-  setClipRangeInputs(from, new Date(from.getTime() + 60 * 60 * 1000));
-}
-
-function selectedClipRange() {
-  const day = String(detailClipRangeDay && detailClipRangeDay.value || '').trim();
-  const start = String(detailClipRangeStart && detailClipRangeStart.value || '').trim();
-  const end = String(detailClipRangeEnd && detailClipRangeEnd.value || '').trim();
-  if (!day || !start || !end) throw new Error('select a day, start time, and end time');
-  const from = new Date(`${day}T${start}:00Z`);
-  let to = new Date(`${day}T${end}:00Z`);
-  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) throw new Error('invalid clip range');
-  if (clipTimeInputMinutes(end) <= clipTimeInputMinutes(start)) {
-    to = new Date(to.getTime() + 24 * 60 * 60 * 1000);
-  }
-  if (to <= from) throw new Error('end time must be after start time');
-  if (to.getTime() - from.getTime() > CLIP_RANGE_MAX_MS) throw new Error('clip range cannot exceed 4 hours');
-  return { from, to };
-}
-
-function hasSelectedClipRange() {
-  try {
-    selectedClipRange();
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-function ensureClipRangeDayOption(day) {
-  const value = String(day || '').trim();
-  if (!value || !(detailClipRangeDay instanceof HTMLSelectElement)) return;
-  const exists = Array.from(detailClipRangeDay.options).some((option) => option.value === value);
-  if (!exists) detailClipRangeDay.add(new Option(value, value));
-}
-
-function applyPendingClipRange() {
-  if (!pendingClipRangeFrom || !pendingClipRangeTo) return false;
-  const from = new Date(pendingClipRangeFrom);
-  const to = new Date(pendingClipRangeTo);
-  pendingClipRangeFrom = '';
-  pendingClipRangeTo = '';
-  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) return false;
-  ensureClipRangeDayOption(from.toISOString().slice(0, 10));
-  setClipRangeInputs(from, to);
-  return true;
-}
-
-async function ensureDefaultClipRange() {
-  if (applyPendingClipRange() || hasSelectedClipRange()) return;
-  const clips = await fetchRecentClips(1);
-  const latest = clips.length ? clips[0] : null;
-  const end = new Date(captureTimestampValue(latest) || new Date());
-  if (!Number.isFinite(end.getTime())) throw new Error('latest clip has invalid timestamp');
-  const from = new Date(end.getTime() - 60 * 60 * 1000);
-  ensureClipRangeDayOption(from.toISOString().slice(0, 10));
-  setClipRangeInputs(from, end);
-}
-
-function clipRangeParams(range) {
-  const params = new URLSearchParams();
-  params.set('captured_from', range.from.toISOString());
-  params.set('captured_to', range.to.toISOString());
-  return params;
-}
-
-function renderClipRangeSummary(payload = null) {
-  if (!(detailClipRangeSummary instanceof HTMLElement)) return;
-  try {
-    const range = selectedClipRange();
-    const hours = (range.to.getTime() - range.from.getTime()) / (60 * 60 * 1000);
-    const count = payload ? Number(payload.count ?? payload.total ?? 0) : null;
-    const bytes = payload ? Number(payload.total_size_bytes || 0) : 0;
-    const parts = [`${range.from.toISOString().slice(0, 16).replace('T', ' ')} UTC`, `${hours.toFixed(1)}h`];
-    if (count !== null) parts.push(`${count} clip${count === 1 ? '' : 's'}`);
-    if (bytes > 0) parts.push(formatBytes(bytes));
-    detailClipRangeSummary.textContent = parts.join(' · ');
-  } catch (err) {
-    detailClipRangeSummary.textContent = String(err);
-  }
-}
-
-function syncClipRangeEndLimit() {
-  if (!(detailClipRangeStart instanceof HTMLInputElement) || !(detailClipRangeEnd instanceof HTMLInputElement)) return;
-  let startMinutes;
-  try { startMinutes = clipTimeInputMinutes(detailClipRangeStart.value); } catch (_) { return; }
-  const nextMinutes = startMinutes + 60;
-  detailClipRangeEnd.value = formatClipMinuteInput(nextMinutes);
-}
-
-function renderClipHourBuckets(items) {
-  if (!(detailClipHourBuckets instanceof HTMLElement)) return;
-  const rangeHour = String(detailClipRangeStart && detailClipRangeStart.value || '00:00').slice(0, 2);
-  detailClipHourBuckets.innerHTML = (items || []).map((item) => {
-    const date = new Date(item.hour_start || '');
-    const hour = Number.isFinite(date.getTime()) ? date.getUTCHours() : 0;
-    const count = Number(item.clip_count || 0);
-    const active = String(hour).padStart(2, '0') === rangeHour;
-    return `<button class="clip-hour${count > 0 ? ' has-clips' : ''}${active ? ' active' : ''}" type="button" data-hour="${hour}">${String(hour).padStart(2, '0')}<br>${count}</button>`;
-  }).join('');
-}
-
-async function loadClipAvailability(day = '') {
-  if (!detailStreamID) return;
-  const params = new URLSearchParams();
-  if (day) params.set('day', day);
-  const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/clips/availability${params.toString() ? `?${params}` : ''}`);
-  detailClipAvailability = payload;
-  const days = Array.isArray(payload.days) ? payload.days : [];
-  if (detailClipRangeDay instanceof HTMLSelectElement) {
-    detailClipRangeDay.innerHTML = days.map((item) => `<option value="${esc(String(item.day || ''))}">${esc(String(item.day || ''))} (${Number(item.clip_count || 0)})</option>`).join('');
-    const selectedDay = String(payload.selected_day || (days[0] && days[0].day) || '');
-    ensureClipRangeDayOption(selectedDay);
-    detailClipRangeDay.value = selectedDay;
-  }
-  updateDayZipButtonState();
-  if (pendingClipRangeFrom && pendingClipRangeTo) {
-    applyPendingClipRange();
-  } else if (!hasSelectedClipRange() && detailClipRangeStart instanceof HTMLInputElement && detailClipRangeEnd instanceof HTMLInputElement) {
-    const firstHour = (Array.isArray(payload.hour_buckets) ? payload.hour_buckets : []).find((item) => Number(item.clip_count || 0) > 0);
-    if (firstHour) setClipRangeFromBucket(firstHour);
-  }
-  renderClipHourBuckets(Array.isArray(payload.hour_buckets) ? payload.hour_buckets : []);
-  renderClipRangeSummary();
-}
-
-function renderDetailClips(items) {
-  detailClipItems = Array.isArray(items) ? items : [];
-  if (!(detailClipsRows instanceof HTMLElement)) return;
-  if (!detailStreamID) {
-    detailClipsRows.innerHTML = '';
-    if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = 'none';
-    if (detailClipsEmpty instanceof HTMLElement) detailClipsEmpty.style.display = '';
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'No stream selected.';
-    updateDetailClipSelectionState();
-    return;
-  }
-  if (!detailClipItems.length) {
-    detailClipsRows.innerHTML = '';
-    if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = 'none';
-    if (detailClipsEmpty instanceof HTMLElement) detailClipsEmpty.style.display = '';
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = detailClipViewMode === CLIP_VIEW_MODE.RANGE
-      ? `No clips found in selected range for stream #${detailStreamID}.`
-      : `No clips found for stream #${detailStreamID} at offset ${detailClipOffset}.`;
-    updateDetailClipSelectionState();
-    return;
-  }
-  if (detailClipsEmpty instanceof HTMLElement) detailClipsEmpty.style.display = 'none';
-  if (detailClipsTableWrap instanceof HTMLElement) detailClipsTableWrap.style.display = '';
-  detailClipsRows.innerHTML = detailClipItems.map((item) => {
-    const start = formatDateTimeShort(item.segment_start_at || item.captured_at || item.created_at || '');
-    const duration = Number(item.duration_sec || 0) || Number(item.duration_ms || 0) / 1000;
-    const format = String(item.mime_type || item.format || 'clip');
-    const size = Number(item.size_bytes || 0);
-    const archiveStatus = String(item.archive_status || 'none');
-    const archived = archiveStatus === 'source_deleted';
-    const previewURL = String(item.preview_url || item.thumbnail_url || item.thumbnail_download_url || item.download_url || '');
-    const downloadURL = archived ? '' : String(item.download_url || '');
-    const downloadCell = archived
-      ? '<span class="tag tag-warn">Glacier Deep Archive</span>'
-      : downloadURL
-        ? `<a href="${esc(downloadURL)}" target="_blank" rel="noopener noreferrer">Direct</a>`
-        : '<span class="muted fs11">prepare batch</span>';
-    return `
-      <tr>
-        <td><input type="checkbox" data-clip-id="${Number(item.id || 0)}" /></td>
-        <td class="mono fs11">${esc(start || '-')}</td>
-        <td class="mono fs11">${duration > 0 ? esc(`${duration.toFixed(1)}s`) : '-'}</td>
-        <td class="mono fs11">${esc(format)}</td>
-        <td class="mono fs11">${size > 0 ? esc(formatBytes(size)) : '-'}</td>
-        <td>${previewURL ? `<a href="${esc(previewURL)}" target="_blank" rel="noopener noreferrer">Open</a>` : '<span class="muted fs11">-</span>'}</td>
-        <td>${downloadCell}</td>
-      </tr>
-    `;
-  }).join('');
-  detailClipsRows.querySelectorAll('input[data-clip-id]').forEach((input) => {
-    input.addEventListener('change', updateDetailClipSelectionState);
-  });
-  if (detailClipsStatus instanceof HTMLElement) {
-    detailClipsStatus.textContent = detailClipViewMode === CLIP_VIEW_MODE.RANGE
-      ? `Showing ${detailClipItems.length} clip${detailClipItems.length === 1 ? '' : 's'} in selected range.`
-      : `Showing ${detailClipItems.length} clip${detailClipItems.length === 1 ? '' : 's'} for stream #${detailStreamID} (offset ${detailClipOffset}).`;
-  }
-  updateDetailClipSelectionState();
-}
-
-async function refreshDetailClips() {
-  if (!detailStreamID) {
-    renderDetailClips([]);
-    return;
-  }
-  if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Loading clips...';
-  try {
-    const payload = detailClipViewMode === CLIP_VIEW_MODE.RANGE
-      ? await fetchJSON(`/api/v1/streams/${detailStreamID}/clips/range?${clipRangeParams(selectedClipRange())}`)
-      : await fetchJSON(`/api/v1/streams/${detailStreamID}/clips?limit=${detailClipLimit}&offset=${detailClipOffset}`);
-    renderDetailClips(Array.isArray(payload.items) ? payload.items : []);
-    if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) {
-      renderClipRangeSummary(payload);
-      syncDetailURL({ replace: true });
-    }
-  } catch (err) {
-    renderDetailClips([]);
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
-  }
-}
-
-async function prepareDetailClipDownloads() {
-  const ids = selectedDetailClipIDs();
-  if (!ids.length) {
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Select at least one clip.';
-    return;
-  }
-  if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = 'Preparing downloads...';
-  try {
-    const payload = await fetchJSON('/api/v1/clips/download-prepare', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stream_id: detailStreamID, segment_ids: ids }),
-    });
-    const items = Array.isArray(payload.items) ? payload.items : [];
-    if (detailClipDownloadResults instanceof HTMLElement) {
-      detailClipDownloadResults.style.display = '';
-      detailClipDownloadResults.innerHTML = items.length
-        ? items.map((item) => `<div><a href="${esc(String(item.download_url || ''))}" target="_blank" rel="noopener noreferrer">${esc(String(item.filename || `clip-${item.id}`))}</a></div>`).join('')
-        : 'No downloads prepared.';
-    }
-    if (detailClipsStatus instanceof HTMLElement) {
-      detailClipsStatus.textContent = `Prepared ${items.length} download${items.length === 1 ? '' : 's'}.`;
-    }
-  } catch (err) {
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
-  }
-}
-
-function stopDayZipPolling() {
-  if (detailDayZipPollTimer) {
-    clearTimeout(detailDayZipPollTimer);
-    detailDayZipPollTimer = null;
-  }
-}
-
-function setDayZipStatus(msg) {
-  if (detailDayZipStatus instanceof HTMLElement) detailDayZipStatus.textContent = String(msg || '');
-}
-
-function renderDayZipDownloadLink(url) {
-  if (!(detailDayZipResult instanceof HTMLElement)) return;
-  detailDayZipResult.style.display = '';
-  detailDayZipResult.innerHTML = `<a href="${esc(String(url || ''))}" target="_blank" rel="noopener noreferrer">Download archive (.zip)</a>`;
-}
-
-async function prepareDayZip() {
-  stopDayZipPolling();
-  if (detailDayZipResult instanceof HTMLElement) {
-    detailDayZipResult.style.display = 'none';
-    detailDayZipResult.innerHTML = '';
-  }
-  const day = String(detailClipRangeDay && detailClipRangeDay.value || '').trim();
-  if (!detailStreamID) {
-    setDayZipStatus('No stream selected.');
-    return;
-  }
-  if (!day) {
-    setDayZipStatus('Select a day first.');
-    return;
-  }
-  setDayZipStatus('Preparing archive...');
-  try {
-    const res = await fetch(`/api/v1/capture/streams/${detailStreamID}/day-zip`, {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ day }),
-    });
-    const payload = await res.json().catch(() => ({}));
-    if (res.status === 202 && payload.job_id) {
-      detailDayZipPollAttempts = 0;
-      void pollDayZip(String(payload.job_id));
-      return;
-    }
-    if (res.status === 200 && payload.status === 'complete' && payload.download_url) {
-      setDayZipStatus('Archive ready.');
-      renderDayZipDownloadLink(payload.download_url);
-      return;
-    }
-    if (res.status === 409) {
-      // A build (this day or another) is already running; the endpoint serializes
-      // to one at a time. Wait and retry — when it frees up, or this day finishes
-      // and lands in the cache, a later create returns the link.
-      setDayZipStatus('Another archive is being prepared; waiting...');
-      stopDayZipPolling();
-      detailDayZipPollTimer = setTimeout(() => { void prepareDayZip(); }, 8000);
-      return;
-    }
-    setDayZipStatus(String(payload.error || `http ${res.status}`));
-  } catch (err) {
-    setDayZipStatus(String(err));
-  }
-}
-
-// ~15 min at 3s/poll: a full day (~720 clips, ~2.5GB) typically builds in a few
-// minutes but can run longer when the shared instance is busy.
-const DAY_ZIP_MAX_POLLS = 300;
-
-async function pollDayZip(jobID) {
-  if (!jobID) return;
-  detailDayZipPollAttempts += 1;
-  if (detailDayZipPollAttempts > DAY_ZIP_MAX_POLLS) {
-    // Unusually long. Re-issue create: if the build has since finished it returns
-    // the cached link; if still running we get 409 and keep waiting.
-    setDayZipStatus('Still preparing - re-checking...');
-    stopDayZipPolling();
-    void prepareDayZip();
-    return;
-  }
-  try {
-    const payload = await fetchJSON(`/api/v1/capture/day-zip/${encodeURIComponent(jobID)}`);
-    const status = String(payload.status || '').trim();
-    if (status === 'complete' && payload.download_url) {
-      setDayZipStatus('Archive ready.');
-      renderDayZipDownloadLink(payload.download_url);
-      stopDayZipPolling();
-      return;
-    }
-    if (status === 'error') {
-      setDayZipStatus(String(payload.error || 'archive build failed'));
-      stopDayZipPolling();
-      return;
-    }
-    setDayZipStatus(`Preparing... (${Number(payload.processed || 0)}/${Number(payload.total || 0)})`);
-    stopDayZipPolling();
-    detailDayZipPollTimer = setTimeout(() => {
-      void pollDayZip(jobID).catch((err) => setDayZipStatus(String(err)));
-    }, 3000);
-  } catch (err) {
-    // Most likely a 404: the in-memory job was lost (e.g. instance restart).
-    // Recover by re-issuing create, which returns the cached archive if the
-    // build finished, or starts a fresh one.
-    setDayZipStatus('Reconnecting...');
-    stopDayZipPolling();
-    detailDayZipPollTimer = setTimeout(() => { void prepareDayZip(); }, 4000);
-  }
-}
-
-function updateDayZipButtonState() {
-  if (!(detailDownloadDayZipBtn instanceof HTMLButtonElement)) return;
-  const day = String(detailClipRangeDay && detailClipRangeDay.value || '').trim();
-  detailDownloadDayZipBtn.disabled = !day;
 }
 
 function updateDetailTabHrefs() {
-  if (!detailStreamID) return;
-  const base = `/streams/${detailStreamID}`;
-  if (detailMainTabDetails instanceof HTMLAnchorElement) detailMainTabDetails.href = base;
-  if (detailMainTabClips instanceof HTMLAnchorElement) detailMainTabClips.href = `${base}?tab=clips`;
-  if (detailMainTabSettings instanceof HTMLAnchorElement) detailMainTabSettings.href = `${base}?tab=settings`;
-  if (detailTabCoverage instanceof HTMLAnchorElement) detailTabCoverage.href = `${base}?tab=details`;
-  if (detailTabTimeline instanceof HTMLAnchorElement) detailTabTimeline.href = `${base}?tab=details&subtab=timeline`;
-  if (detailTabHealth instanceof HTMLAnchorElement) detailTabHealth.href = `${base}?tab=details&subtab=health&health_hours=${Math.max(1, Math.floor(Number(detailHealthHoursWindow) || 72))}`;
-  if (detailTabFrames instanceof HTMLAnchorElement) detailTabFrames.href = `${base}?tab=details&subtab=frames`;
 }
 
 function updateTimezoneLabels() {
@@ -4552,39 +3146,9 @@ function updateTimezoneLabels() {
 }
 
 function setDetailMainView(which, opts = {}) {
-  detailMainView = normalizeDetailMainTab(which);
-  const detailsVisible = detailMainView === 'details';
-  if (detailMainTabDetails) detailMainTabDetails.classList.toggle('active', detailMainView === 'details');
-  if (detailMainTabClips) detailMainTabClips.classList.toggle('active', detailMainView === 'clips');
-  if (detailMainTabSettings) detailMainTabSettings.classList.toggle('active', detailMainView === 'settings');
-  if (detailDetailsSubtabs) detailDetailsSubtabs.style.display = detailsVisible ? '' : 'none';
-  if (detailsVisible) {
-    setDetailSubView(detailView, { syncURL: false, replaceURL: opts.replaceURL === true, livePolling: opts.livePolling !== false });
-  } else {
-    if (detailInferenceSection) detailInferenceSection.style.display = 'none';
-    if (detailCoverageSection) detailCoverageSection.style.display = 'none';
-    if (detailTimelineSection) detailTimelineSection.style.display = 'none';
-    if (detailHealthSection) detailHealthSection.style.display = 'none';
-    if (detailFramesSection) detailFramesSection.style.display = 'none';
-    stopDetailLivePolling();
-  }
-  if (detailClipsSection) detailClipsSection.style.display = detailMainView === 'clips' ? '' : 'none';
-  if (detailSettingsSection) detailSettingsSection.style.display = detailMainView === 'settings' ? '' : 'none';
-  if (detailMainView === 'clips') {
-    setDetailClipViewMode(detailClipViewMode, { syncURL: false });
-    void (async () => {
-      if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) {
-        await ensureDefaultClipRange();
-        void loadClipAvailability(String(detailClipRangeDay && detailClipRangeDay.value || '')).catch((err) => {
-          if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
-        });
-      }
-      await refreshDetailClips();
-    })().catch((err) => {
-      if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
-    });
-  }
-  updateDetailTabHrefs();
+  detailMainView = 'details';
+  if (detailFramesSection) detailFramesSection.style.display = '';
+  if (opts.livePolling === false) stopDetailLivePolling();
   if (detailStreamID && opts.syncURL !== false) {
     syncDetailURL({ replace: opts.replaceURL === true });
   }
@@ -4690,22 +3254,6 @@ function setServersAssignStatus(msg, cls = '') {
 function setDetailStatus(msg, cls = '') {
   detailStatusEl.className = `status-text ${cls}`;
   detailStatusEl.textContent = msg;
-}
-function setDetailWorkloadStatus(msg, cls = '') {
-  detailWorkloadStatus.className = `status-text ${cls}`;
-  detailWorkloadStatus.textContent = msg;
-}
-function setTimelineStatus(msg, cls = '') {
-  timelineStatusText.className = `status-text ${cls}`;
-  timelineStatusText.textContent = msg;
-}
-function setHealthStatus(msg, cls = '') {
-  healthStatusText.className = `status-text ${cls}`;
-  healthStatusText.textContent = msg;
-}
-function setCoverageStatus(msg, cls = '') {
-  coverageStatusText.className = `status-text ${cls}`;
-  coverageStatusText.textContent = msg;
 }
 function setRecStatus(msg, cls = '') {
   recStatus.className = `status-text ${cls}`;
@@ -5101,36 +3649,10 @@ function moveImageModal(step) {
 }
 
 function setDetailSubView(view, opts = {}) {
-  detailView = normalizeDetailSubtab(view);
-  const hasLegacySubtabs = Boolean(
-    (detailTabCoverage && detailTabCoverage.isConnected)
-    || (detailTabTimeline && detailTabTimeline.isConnected)
-    || (detailTabHealth && detailTabHealth.isConnected)
-    || (detailTabFrames && detailTabFrames.isConnected)
-  );
-  if (!hasLegacySubtabs) {
-    detailInferenceSection.style.display = '';
-    detailCoverageSection.style.display = '';
-    detailTimelineSection.style.display = '';
-    detailHealthSection.style.display = '';
-    detailFramesSection.style.display = '';
-    stopDetailLivePolling();
-    return;
-  }
-  if (detailTabCoverage) detailTabCoverage.classList.toggle('active', detailView === 'coverage');
-  if (detailTabTimeline) detailTabTimeline.classList.toggle('active', detailView === 'timeline');
-  if (detailTabHealth) detailTabHealth.classList.toggle('active', detailView === 'health');
-  if (detailTabFrames) detailTabFrames.classList.toggle('active', detailView === 'frames');
-  detailInferenceSection.style.display = detailView === 'inference' ? '' : 'none';
-  detailCoverageSection.style.display = detailView === 'coverage' ? '' : 'none';
-  detailTimelineSection.style.display = detailView === 'timeline' ? '' : 'none';
-  detailHealthSection.style.display = detailView === 'health' ? '' : 'none';
-  detailFramesSection.style.display = detailView === 'frames' ? '' : 'none';
-  if (detailView === 'frames' && opts.livePolling !== false) startDetailLivePolling();
+  detailView = 'frames';
+  if (detailFramesSection) detailFramesSection.style.display = '';
+  if (opts.livePolling !== false) startDetailLivePolling();
   else stopDetailLivePolling();
-  if (detailMainView === 'details' && detailStreamID && opts.syncURL !== false) {
-    syncDetailURL({ replace: opts.replaceURL === true });
-  }
 }
 
 function stopDetailLivePolling() {
@@ -5161,20 +3683,6 @@ function startDetailLivePolling() {
   }, 5000);
 }
 
-function ageLabel(seconds) {
-  const n = Number(seconds);
-  if (!Number.isFinite(n) || n < 0) return '-';
-  if (n < 60) return `${Math.floor(n)}s ago`;
-  if (n < 3600) return `${Math.floor(n / 60)}m ago`;
-  return `${Math.floor(n / 3600)}h ago`;
-}
-
-function setDetailExportStatus(msg, cls = '') {
-  if (!(detailExportStatus instanceof HTMLElement)) return;
-  detailExportStatus.className = `status-text ${cls}`;
-  detailExportStatus.textContent = String(msg || '');
-}
-
 function stopDetailFrameExportPolling() {
   if (detailFrameExportPollTimer) {
     clearTimeout(detailFrameExportPollTimer);
@@ -5182,185 +3690,6 @@ function stopDetailFrameExportPolling() {
   }
 }
 
-function localDateTimeInputValue(input) {
-  const d = input instanceof Date ? input : new Date(input);
-  if (!Number.isFinite(d.getTime())) return '';
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const min = String(d.getMinutes()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
-}
-
-function setDetailExportWindow(hoursBack) {
-  const end = new Date();
-  const start = new Date(end.getTime() - (Number(hoursBack || 1) * 3600 * 1000));
-  if (detailExportFrom instanceof HTMLInputElement) detailExportFrom.value = localDateTimeInputValue(start);
-  if (detailExportTo instanceof HTMLInputElement) detailExportTo.value = localDateTimeInputValue(end);
-}
-
-function ensureDetailExportWindow(latestFrame) {
-  if (!(detailExportFrom instanceof HTMLInputElement) || !(detailExportTo instanceof HTMLInputElement)) return;
-  if (String(detailExportFrom.value || '').trim() && String(detailExportTo.value || '').trim()) return;
-  const end = latestFrame && latestFrame.captured_at ? new Date(latestFrame.captured_at) : new Date();
-  const start = new Date(end.getTime() - (3600 * 1000));
-  detailExportFrom.value = localDateTimeInputValue(start);
-  detailExportTo.value = localDateTimeInputValue(end);
-}
-
-function detailExportQueryString() {
-  const capturedFrom = toISO(detailExportFrom && detailExportFrom.value);
-  const capturedTo = toISO(detailExportTo && detailExportTo.value);
-  if (!capturedFrom || !capturedTo) throw new Error('export window requires both from/to');
-  const params = new URLSearchParams();
-  params.set('captured_from', capturedFrom);
-  params.set('captured_to', capturedTo);
-  params.set('capture_status', String(detailExportStatusFilter && detailExportStatusFilter.value || 'success'));
-  return params.toString();
-}
-
-async function pollDetailFrameExportJob(jobID) {
-  if (!detailStreamID || !jobID) return;
-  const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/frame-exports/${encodeURIComponent(jobID)}`);
-  detailFrameExportJobID = jobID;
-  const status = String(payload.status || '').trim();
-  if (status === 'complete' && payload.download_url) {
-    setDetailExportStatus('zip ready', 'ok');
-    detailExportResult.innerHTML = `ZIP ready · ${Number(payload.frame_count || 0)} frames · <a href="${esc(String(payload.download_url))}" target="_blank" rel="noopener noreferrer">Download archive</a>`;
-    stopDetailFrameExportPolling();
-    return;
-  }
-  if (status === 'failed') {
-    setDetailExportStatus('zip failed', 'err');
-    detailExportResult.textContent = String(payload.error_text || 'zip export failed');
-    stopDetailFrameExportPolling();
-    return;
-  }
-  setDetailExportStatus(`zip ${status}...`);
-  detailExportResult.textContent = `${Number(payload.frame_count || 0)} frames selected · ${Math.round(Number(payload.total_bytes || 0) / (1024 * 1024))} MiB estimated`;
-  stopDetailFrameExportPolling();
-  detailFrameExportPollTimer = setTimeout(() => {
-    void pollDetailFrameExportJob(jobID).catch((err) => setDetailExportStatus(String(err), 'err'));
-  }, 2000);
-}
-
-function healthTagHTML(state, reason) {
-  const normalized = String(state || '').trim().toLowerCase();
-  if (normalized === 'healthy') return `<span class="tag tag-ok">healthy</span>`;
-  if (normalized === 'off') return `<span class="tag tag-muted">off</span>`;
-  const extra = reason ? ` · ${esc(String(reason))}` : '';
-  return `<span class="tag tag-warn">degraded${extra}</span>`;
-}
-
-function renderDetailRecordingHero(payload, frames) {
-  if (!(detailRecordingHero instanceof HTMLElement)) return;
-  const stream = payload && payload.stream ? payload.stream : {};
-  const health = payload && payload.current_health ? payload.current_health : {};
-  const assignment = payload && payload.assignment ? payload.assignment : null;
-  const runtime = payload && payload.runtime ? payload.runtime : {};
-  const captureMeta = detailCaptureMeta(payload);
-  const latest = Array.isArray(frames) && frames.length ? frames[0] : null;
-  const state = String(health.state || (String(stream.recording_state || '').trim().toLowerCase() === 'on' ? 'degraded' : 'off'));
-  const stateLabel = state === 'healthy' ? 'Recording' : (state === 'off' ? 'Off' : 'Attention');
-  const lastCaptureText = latest ? formatDateTimeShort(captureTimestampValue(latest)) : '-';
-  const lastCaptureAge = health.last_capture_age_sec != null ? ageLabel(health.last_capture_age_sec) : (health.last_frame_age_sec != null ? ageLabel(health.last_frame_age_sec) : '-');
-  const assignmentHTML = assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : 'unassigned';
-  const currentError = String(health.message || runtime.last_error_text || '').trim();
-  detailRecordingHero.innerHTML = `
-    <div class="detail-summary-main">
-      ${healthTagHTML(state, '')}
-      <div class="detail-summary-state">${esc(stateLabel)}</div>
-    </div>
-    <div class="detail-summary-meta">
-      <div>last ${esc(captureMeta.singular)} ${esc(lastCaptureText)}${lastCaptureAge !== '-' ? ` · ${esc(lastCaptureAge)}` : ''}</div>
-      <div>recording on ${assignmentHTML}</div>
-      ${currentError ? `<div style="color:var(--warn);">${esc(currentError)}</div>` : ''}
-    </div>
-  `;
-}
-
-function detailFactCard(label, value, meta = '') {
-  return `<div class="detail-fact-card">
-    <div class="detail-fact-label">${esc(label)}</div>
-    <div class="detail-fact-value">${esc(value || '-')}</div>
-    ${meta ? `<div class="detail-fact-meta">${meta}</div>` : ''}
-  </div>`;
-}
-
-function detailFactCardHTML(label, valueHTML, meta = '') {
-  return `<div class="detail-fact-card">
-    <div class="detail-fact-label">${esc(label)}</div>
-    <div class="detail-fact-value">${valueHTML || esc('-')}</div>
-    ${meta ? `<div class="detail-fact-meta">${meta}</div>` : ''}
-  </div>`;
-}
-
-function renderDetailCurrentPath(payload) {
-  if (!(detailCurrentPath instanceof HTMLElement)) return;
-  const stream = payload && payload.stream ? payload.stream : {};
-  const assignment = payload && payload.assignment ? payload.assignment : null;
-  const health = payload && payload.current_health ? payload.current_health : {};
-  const runtime = payload && payload.runtime ? payload.runtime : {};
-  const stats = payload && payload.stats_24h ? payload.stats_24h : {};
-  const captureMeta = detailCaptureMeta(payload);
-  const cards = [];
-  cards.push(detailFactCardHTML(
-    'Recording Server',
-    assignment && assignment.server_id ? serverLinkHTML(assignment.server_id, 'unassigned') : esc('unassigned'),
-    [
-      assignment && assignment.assigned_at ? `assigned ${esc(formatDateTimeShort(assignment.assigned_at))}` : '',
-      runtime && runtime.status ? `status ${esc(String(runtime.status))}` : '',
-      runtime && runtime.last_resolved_at ? `resolved ${esc(formatDateTimeShort(runtime.last_resolved_at))}` : '',
-    ].filter(Boolean).join('<br/>')
-  ));
-  cards.push(detailFactCard(
-    'Capture Mode',
-    String(stream.capture_type || '-'),
-    String(stream.execution_class || '').trim() ? `execution ${esc(String(stream.execution_class || '-'))}` : ''
-  ));
-  cards.push(detailFactCard(
-    'Last 24h',
-    `${Number(stats.success_frames || 0)} ${captureMeta.plural}`,
-    `${healthTagHTML(health.state, '')}<br/>errors ${Number(stats.error_frames || 0)}${stats.last_capture ? `<br/>latest ${esc(formatDateTimeShort(stats.last_capture))}` : ''}`
-  ));
-  detailCurrentPath.innerHTML = cards.join('');
-}
-
-function renderDetailCurrentWorker(payload) {
-  if (!(detailCurrentWorker instanceof HTMLElement)) return;
-  const item = payload && payload.active_capture_worker ? payload.active_capture_worker : null;
-  const captureMeta = detailCaptureMeta(payload);
-  if (!item) {
-    detailCurrentWorker.innerHTML = '<span class="muted fs11">No active recording process is reporting right now.</span>';
-    return;
-  }
-  const serverID = String(item.server_id || '-');
-  const processID = String(item.process_id || '-');
-  const workerID = String(item.worker_id || '-');
-  const status = String(item.status || '-');
-  const started = item.started_at ? formatDateTimeShort(item.started_at) : '-';
-  const heartbeat = item.heartbeat_at ? formatDateTimeShort(item.heartbeat_at) : '-';
-  const lastCapture = item.last_capture_at ? formatDateTimeShort(item.last_capture_at) : (item.last_frame_at ? formatDateTimeShort(item.last_frame_at) : '-');
-  const restarts = Number(item.restart_count || 0);
-  detailCurrentWorker.innerHTML = `
-    <div class="detail-section-head" style="margin-bottom:6px;">
-      <div class="detail-section-title">Current Worker</div>
-      <div class="detail-section-subtitle">Live worker heartbeat and recent ${esc(captureMeta.singular)} activity.</div>
-    </div>
-    <div class="row">
-      <span class="tag tag-ok">active</span>
-      <span>${serverLinkHTML(serverID, '-')}</span>
-      <span class="mono fs10 muted">${esc(processID)}</span>
-      <span class="mono fs10 muted">${esc(workerID)}</span>
-      <span class="muted fs10">status ${esc(status)}</span>
-      <span class="muted fs10">started ${esc(started)}</span>
-      <span class="muted fs10">heartbeat ${esc(heartbeat)}</span>
-      <span class="muted fs10">latest ${esc(captureMeta.singular)} ${esc(lastCapture)}</span>
-      ${restarts > 0 ? `<span class="muted fs10">restarts ${restarts}</span>` : ''}
-    </div>
-  `;
-}
 
 function buildDetailLiveFrameCard(it) {
   const captureMeta = detailCaptureMeta(detailRecordingData);
@@ -6141,9 +4470,8 @@ function renderServersAssignments(items) {
 }
 
 async function loadServersAssignments() {
-  const payload = await fetchJSON('/api/v1/recording/assignments?limit=500&offset=0');
-  renderServersAssignments(payload.items || []);
-  setServersAssignmentsStatus(`${Number((payload.items || []).length)} assignments`, 'ok');
+  renderServersAssignments([]);
+  setServersAssignmentsStatus('recording assignment has moved to the recorder', 'ok');
 }
 
 async function loadStreamForAssignment(streamID) {
@@ -6161,29 +4489,8 @@ async function loadStreamForAssignment(streamID) {
   return stream;
 }
 
-async function assignRecordingStream(stream, reason = 'dashboard servers assign') {
-  const streamID = Number(stream && stream.id || 0);
-  if (!Number.isFinite(streamID) || streamID <= 0) {
-    throw new Error('invalid stream id for assignment');
-  }
-  const serverID = await chooseServerForRecordingAssign(stream);
-  console.info('[recording-toggle] assign request', {
-    streamID,
-    serverID,
-    reason,
-    path: window.location.pathname,
-    href: window.location.href,
-    authStatus: authState && authState.status,
-    canToggleRecording: hasAuthCapability('can_toggle_recording'),
-  });
-  return fetchJSON(`/api/v1/recording/streams/${streamID}/assign`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      server_id: serverID,
-      reason,
-    }),
-  });
+async function assignRecordingStream() {
+  throw new Error('recording assignment has moved to the recorder; use /recordings');
 }
 
 async function reloadServerDomainViews() {
@@ -6566,29 +4873,9 @@ function applyStreamListStateFromURL(params) {
   streamPageSizeEl.value = String(streamPageSize);
 }
 
-function normalizeDetailMainTab(raw) {
-  const value = String(raw || '').trim().toLowerCase();
-  if (value === 'clips' || value === 'settings') return value;
-  return 'details';
-}
-
-function normalizeDetailSubtab(raw) {
-  const value = String(raw || '').trim().toLowerCase();
-  if (value === 'inference') return 'coverage';
-  if (value === 'coverage' || value === 'timeline' || value === 'health' || value === 'frames') return value;
-  return 'coverage';
-}
-
-function applyDetailRouteStateFromURL(params) {
-  detailMainView = normalizeDetailMainTab(params && params.get('tab'));
-  detailView = normalizeDetailSubtab(params && params.get('subtab'));
-  detailClipViewMode = normalizeClipViewMode(params && params.get('clip_mode'));
-  pendingClipRangeFrom = String(params && params.get('captured_from') || '').trim();
-  pendingClipRangeTo = String(params && params.get('captured_to') || '').trim();
-  const healthHoursParam = Number((params && params.get('health_hours')) || '');
-  if (Number.isFinite(healthHoursParam) && healthHoursParam > 0) {
-    detailHealthHoursWindow = normalizeHealthHoursWindow(healthHoursParam);
-  }
+function applyDetailRouteStateFromURL() {
+  detailMainView = 'details';
+  detailView = 'frames';
 }
 
 function syncStreamListURL(opts = {}) {
@@ -6607,28 +4894,7 @@ function syncStreamListURL(opts = {}) {
 
 function syncDetailURL(opts = {}) {
   if (currentStreamRoute !== STREAM_ROUTE.DETAIL || !detailStreamID) return;
-  const params = new URLSearchParams();
-  if (detailMainView !== 'details') {
-    params.set('tab', detailMainView);
-  }
-  if (detailMainView === 'clips') {
-    params.set('clip_mode', detailClipViewMode);
-    if (detailClipViewMode === CLIP_VIEW_MODE.RANGE) {
-      try {
-        const range = selectedClipRange();
-        params.set('captured_from', range.from.toISOString());
-        params.set('captured_to', range.to.toISOString());
-      } catch (_) {}
-    }
-  }
-  if (detailMainView === 'details' && detailView !== 'coverage') {
-    params.set('subtab', detailView);
-    if (detailView === 'health') {
-      params.set('health_hours', String(Math.max(1, Math.floor(Number(detailHealthHoursWindow) || 72))));
-    }
-  }
-  const qs = params.toString();
-  updateHistoryURL(qs ? `/streams/${detailStreamID}?${qs}` : `/streams/${detailStreamID}`, opts.replace === true);
+  updateHistoryURL(`/streams/${detailStreamID}`, opts.replace === true);
 }
 
 async function refreshAllStreamFilterOptions() {
@@ -6860,7 +5126,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="11" style="padding:20px;">
+        <td colspan="4" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -6882,17 +5148,6 @@ function renderStreamRows() {
     const s = getRowStream(row);
     if (!s) continue;
     const streamName = latinizedLabelParts(s.name);
-    const captureRate = fmtPct(row.captures_success, row.captures_total);
-    const latestCap = row.latest_captured_at ? formatDateTimeShort(row.latest_captured_at) : '-';
-    const recHtml = renderRecordingToggleControl(s);
-    const mode = String(s.capture_type || '-');
-    const captureFamily = formatCaptureFamilyLabel(s.capture_family);
-    const cadenceLabel = formatStreamCadenceLabel(s);
-    const peopleMetric = peoplePerInferenceMetric(row);
-    const preferredViewURL = buildPreferredViewURL(s);
-    const viewActionHTML = preferredViewURL
-      ? `<a class="table-view-link" href="${esc(preferredViewURL)}" target="_blank" rel="noopener noreferrer">View Stream</a>`
-      : '<span class="muted fs11">-</span>';
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -6905,23 +5160,7 @@ function renderStreamRows() {
         </div>
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
-      <td>${recHtml}</td>
-      <td>
-        <div class="stack fs11 mono">
-          <span>${row.captures_success}/${row.captures_total} <span class="muted">(${captureRate})</span></span>
-          <span class="muted fs10">${latestCap}</span>
-        </div>
-      </td>
-      <td>
-        <div class="stack fs11 mono">
-          <span>${esc(peopleMetric.avgText)}</span>
-          <span class="muted fs10">${esc(peopleMetric.detailText)}</span>
-        </div>
-      </td>
-      <td>${renderTagEditor(s, 'streams')}</td>
-      <td class="mono fs11"><div class="stack"><span>${esc(mode)}</span><span class="muted fs10">${esc(captureFamily)}${cadenceLabel ? ` · ${esc(cadenceLabel)}` : ''}</span></div></td>
-      <td>${renderTableSourceCell(s)}</td>
-      <td class="mono fs11 table-view-cell">${viewActionHTML}</td>
+      <td><a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a></td>
     `;
     streamRowsEl.appendChild(tr);
   }
@@ -6986,7 +5225,7 @@ function renderRecRows() {
     const captureUnit = String(row.capture_unit || 'frames');
     const captureSingular = captureUnit.endsWith('s') ? captureUnit.slice(0, -1) : captureUnit;
     const peopleMetric = peoplePerInferenceMetric(row);
-    const recordingToggleHTML = renderRecordingToggleControl(s);
+    const recordingToggleHTML = `<a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a>`;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>
@@ -7527,833 +5766,6 @@ function renderLatestCard(container, payload, latestCapture, previewImage) {
   `;
 }
 
-function populatePipelineOptions(items, selected) {
-  const set = new Set();
-  for (const it of items || []) { if (it.pipeline_id) set.add(it.pipeline_id); }
-  if (selected) set.add(selected);
-  const vals = [''].concat(Array.from(set).sort());
-  pipelineFilter.innerHTML = vals.map((v) =>
-    `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${v ? esc(v) : 'All pipelines'}</option>`
-  ).join('');
-}
-
-function renderDetailInferenceKpis(inferenceItems, detectionItems, signalItems, latestResult) {
-  const rows = inferenceItems || [];
-  const detections = detectionItems || [];
-  const signals = signalItems || [];
-  const success = rows.filter((it) => String(it.status || '') === 'success').length;
-  const queued = rows.filter((it) => String(it.status || '') === 'queued_boxed').length;
-  const errors = rows.filter((it) => String(it.status || '') === 'error').length;
-  const withDetections = rows.filter((it) => Number(it.detection_count || 0) > 0).length;
-  const withSignals = rows.filter((it) => Number(it.signal_count || 0) > 0).length;
-  const persons = detections.filter((d) => String(d.class_name || '').toLowerCase() === 'person').length;
-  const latestAt = latestResult && latestResult.created_at ? formatDateTimeShort(latestResult.created_at) : '-';
-  const latestAgo = latestResult && latestResult.created_at ? formatAgo(latestResult.created_at) : '-';
-  detailInferenceKpis.innerHTML = `
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Rows</div>
-      <div class="detail-kpi-value">${rows.length}</div>
-      <div class="detail-kpi-meta">current filters</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Success / Queued / Error</div>
-      <div class="detail-kpi-value">${success} / ${queued} / ${errors}</div>
-      <div class="detail-kpi-meta">${rows.length ? `error ${(100 * errors / rows.length).toFixed(1)}% · queued ${(100 * queued / rows.length).toFixed(1)}%` : 'error 0% · queued 0%'}</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Rows With Detections</div>
-      <div class="detail-kpi-value">${withDetections}</div>
-      <div class="detail-kpi-meta">${rows.length ? `${(100 * withDetections / rows.length).toFixed(1)}%` : '0%'} of rows</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Rows With Signals</div>
-      <div class="detail-kpi-value">${withSignals}</div>
-      <div class="detail-kpi-meta">${rows.length ? `${(100 * withSignals / rows.length).toFixed(1)}%` : '0%'} of rows</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Latest Result</div>
-      <div class="detail-kpi-value">${esc(latestAgo)}</div>
-      <div class="detail-kpi-meta">${esc(latestAt)}</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">People (Latest Result)</div>
-      <div class="detail-kpi-value">${persons}</div>
-      <div class="detail-kpi-meta">${detections.length} total detections</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Signals (Latest Result)</div>
-      <div class="detail-kpi-value">${signals.length}</div>
-      <div class="detail-kpi-meta">${latestResult && latestResult.signal_count !== undefined ? `${Number(latestResult.signal_count || 0)} stored` : 'no latest result'}</div>
-    </div>
-  `;
-}
-
-function renderDetections(items, latestResult) {
-  detectionRowsEl.innerHTML = '';
-  const latest = latestResult || null;
-  if (!latest) {
-    detectionMetaSummary.textContent = 'No inference result available for selected filters.';
-    detectionMetaChips.innerHTML = '';
-  } else {
-    detectionMetaSummary.textContent = `Result ${latest.inference_result_id} from pipeline ${latest.pipeline_id || '-'} · ${formatDateTimeShort(latest.created_at)} (${formatAgo(latest.created_at)})`;
-    const status = String(latest.status || '').toLowerCase();
-    const statusTag = status === 'success' ? 'tag-ok' : status === 'queued_boxed' ? 'tag-warn' : status === 'error' ? 'tag-err' : 'tag-muted';
-    detectionMetaChips.innerHTML = [
-      `<span class="tag ${statusTag}">${esc(status || 'unknown')}</span>`,
-      latest.revision !== undefined && latest.revision !== null ? `<span class="tag tag-muted">rev ${esc(String(latest.revision))}</span>` : '',
-      latest.pipeline_id ? `<span class="tag tag-muted mono">${esc(latest.pipeline_id)}</span>` : '',
-    ].filter(Boolean).join('');
-  }
-  const sourceItems = Array.isArray(items) ? items.slice() : [];
-  if (!sourceItems.length) {
-    updateSortableHeaders(detectionTable, detectionSortBy, detectionSortDir);
-    setTableStateRow(detectionRowsEl, 7, 'No detections');
-    return;
-  }
-  const dirMul = normalizeSortDir(detectionSortDir, 'desc') === 'asc' ? 1 : -1;
-  sourceItems.sort((a, b) => dirMul * compareSortValues(a && a[detectionSortBy], b && b[detectionSortBy]));
-  for (const d of sourceItems) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td class="fw600">${esc(d.class_name)}</td>
-      <td class="mono fs11">${Number(d.confidence || 0).toFixed(4)}</td>
-      <td class="mono fs11">${Number(d.x1 || 0).toFixed(1)}</td>
-      <td class="mono fs11">${Number(d.y1 || 0).toFixed(1)}</td>
-      <td class="mono fs11">${Number(d.x2 || 0).toFixed(1)}</td>
-      <td class="mono fs11">${Number(d.y2 || 0).toFixed(1)}</td>
-      <td class="mono fs11">${Number(d.area_px || 0).toFixed(1)}</td>
-    `;
-    detectionRowsEl.appendChild(tr);
-  }
-  updateSortableHeaders(detectionTable, detectionSortBy, detectionSortDir);
-}
-
-function renderSignals(items, latestResult) {
-  signalRowsEl.innerHTML = '';
-  const latest = latestResult || null;
-  if (!latest) {
-    signalMetaSummary.textContent = 'No inference result available for selected filters.';
-  } else {
-    const count = Number(latest.signal_count || 0);
-    signalMetaSummary.textContent = `Result ${latest.inference_result_id} · ${count} signals`;
-  }
-  const source = Array.isArray(items) ? items.slice() : [];
-  if (!source.length) {
-    setTableStateRow(signalRowsEl, 5, 'No signals');
-    return;
-  }
-  for (const s of source) {
-    const conf = Number.isFinite(Number(s.confidence)) ? Number(s.confidence).toFixed(4) : '-';
-    const valueNum = Number.isFinite(Number(s.value_num)) ? Number(s.value_num).toFixed(4) : '';
-    const valueText = String(s.value_text || '').trim();
-    const value = valueText || valueNum || '-';
-    const extra = toJSON(s.extra, 110);
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td class="mono fs11">${esc(String(s.signal_type || '-'))}</td>
-      <td class="mono fs11">${esc(String(s.signal_key || '-'))}</td>
-      <td class="mono fs11">${esc(conf)}</td>
-      <td class="mono fs11">${esc(value)}</td>
-      <td class="muted fs10">${extra === '{}' ? '-' : esc(extra)}</td>
-    `;
-    signalRowsEl.appendChild(tr);
-  }
-}
-
-function renderFramesRows(items) {
-  framesRowsEl.innerHTML = '';
-  const captureMeta = detailCaptureMeta(detailRecordingData);
-  const statusF = String(framesStatusFilter.value || '').trim().toLowerCase();
-  const filtered = (items || []).filter((it) => !statusF || String(it.capture_status || '').toLowerCase() === statusF);
-  if (!filtered.length) {
-    updateSortableHeaders(framesTable, framesSortBy, framesSortDir);
-    setTableStateRow(framesRowsEl, 6, 'No captures');
-    framesStatusText.textContent = '0 rows';
-    return;
-  }
-  for (const it of filtered) {
-    const statusCls = it.capture_status === 'success' ? 'tag-ok' : it.capture_status === 'error' ? 'tag-err' : 'tag-muted';
-    const modalStreamIDRaw = Number(detailStreamID || 0);
-    const modalStreamID = Number.isFinite(modalStreamIDRaw) && modalStreamIDRaw > 0 ? Math.floor(modalStreamIDRaw) : 0;
-    const modalStreamAttr = modalStreamID ? ` data-stream-id="${modalStreamID}"` : '';
-    const rawImg = captureMeta.clipNative
-      ? renderClipActions(it, true)
-      : (it.download_url
-        ? `<a class="table-image-link" href="${esc(it.download_url)}" data-image-url="${esc(it.download_url)}" data-image-scope="frames"${modalStreamAttr}><img class="thumb-sm" src="${esc(it.download_url)}" alt="frame" loading="lazy" decoding="async" /></a>`
-        : '<span class="muted fs11">-</span>');
-    const capturedText = captureMeta.clipNative ? captureWindowLabel(it) : String(it.captured_at || '-');
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td class="mono fs11 muted">${it.id}</td>
-      <td class="mono fs11 muted">${esc(capturedText)}</td>
-      <td><span class="tag ${statusCls}">${esc(it.capture_status || '-')}</span></td>
-      <td class="fs11 muted">${esc(it.capture_error || '-')}</td>
-      <td>${rawImg}</td>
-      <td class="mono fs10 muted" style="max-width:200px;word-break:break-all;">${esc(it.object_key || '-')}</td>
-    `;
-    framesRowsEl.appendChild(tr);
-  }
-  updateSortableHeaders(framesTable, framesSortBy, framesSortDir);
-  framesStatusText.className = 'status-text';
-  framesStatusText.textContent = `${filtered.length} rows`;
-}
-
-function renderTimelineScale() {
-  if (timelineScale.getAttribute('data-rendered') === '1') return;
-  const cells = [];
-  for (let minute = 0; minute < 1440; minute += 1) {
-    const hourMark = minute % 60 === 0;
-    const hourLabel = hourMark ? String(Math.floor(minute / 60)).padStart(2, '0') : '';
-    cells.push(`<div class="timeline-scale-cell${hourMark ? ' hour' : ''}" data-hour="${esc(hourLabel)}"></div>`);
-  }
-  timelineScale.innerHTML = cells.join('');
-  timelineScale.setAttribute('data-rendered', '1');
-}
-
-function renderTimelineTrack(kind, minuteData, maxPeoplePerMinute = 1) {
-  const cells = [];
-  const maxPeople = Math.max(1, Number(maxPeoplePerMinute) || 1);
-  for (let minute = 0; minute < 1440; minute += 1) {
-    const p = minuteData[minute];
-    const hourMark = minute % 60 === 0 ? ' hour' : '';
-    const label = minuteToLabel(minute);
-    if (kind === 'recorded') {
-      const total = Number(p.recorded_total_frames || 0);
-      const success = Number(p.recorded_success_frames || 0);
-      const errors = Number(p.recorded_error_frames || 0);
-      if (total <= 0) {
-        cells.push(`<div class="timeline-cell${hourMark}" title="${esc(`${label} · no captures`)}"></div>`);
-        continue;
-      }
-      if (success > 0) {
-        const opacity = Math.max(0.30, Math.min(1, 0.30 + (success / 3) * 0.70));
-        const title = `${label} · recorded ${success}/${total}${errors > 0 ? ` · errors ${errors}` : ''}`;
-        cells.push(`<div class="timeline-cell recorded-success${hourMark}" style="opacity:${opacity.toFixed(3)}" title="${esc(title)}"></div>`);
-        continue;
-      }
-      const title = `${label} · capture errors ${errors}`;
-      cells.push(`<div class="timeline-cell recorded-error${hourMark}" style="opacity:0.95" title="${esc(title)}"></div>`);
-      continue;
-    }
-    if (kind === 'inferenced') {
-      const inferenced = Number(p.inferenced_frames || 0);
-      if (inferenced <= 0) {
-        cells.push(`<div class="timeline-cell${hourMark}" title="${esc(`${label} · not inferenced`)}"></div>`);
-        continue;
-      }
-      const opacity = Math.max(0.25, Math.min(1, 0.25 + (inferenced / 3) * 0.75));
-      cells.push(`<div class="timeline-cell inferenced${hourMark}" style="opacity:${opacity.toFixed(3)}" title="${esc(`${label} · inferenced ${inferenced}`)}"></div>`);
-      continue;
-    }
-    const people = Number(p.person_detections || 0);
-    if (people <= 0) {
-      cells.push(`<div class="timeline-cell${hourMark}" title="${esc(`${label} · no people detected`)}"></div>`);
-      continue;
-    }
-    const opacity = Math.max(0.14, Math.min(1, people / maxPeople));
-    cells.push(`<div class="timeline-cell people${hourMark}" style="opacity:${opacity.toFixed(3)}" title="${esc(`${label} · people detections ${people}`)}"></div>`);
-  }
-  return cells.join('');
-}
-
-function setTimelinePipelineOptions(pipelineIDs, selected = '') {
-  const unique = [];
-  const seen = new Set();
-  for (const raw of (pipelineIDs || [])) {
-    const v = String(raw || '').trim();
-    if (!v || seen.has(v)) continue;
-    seen.add(v);
-    unique.push(v);
-  }
-  const target = String(selected || detailTimelinePipeline || '').trim();
-  if (target && !seen.has(target)) unique.push(target);
-  unique.sort();
-  timelinePipelineFilter.innerHTML = ['<option value="">All pipelines</option>']
-    .concat(unique.map((v) => `<option value="${esc(v)}"${v === target ? ' selected' : ''}>${esc(v)}</option>`))
-    .join('');
-  timelinePipelineFilter.value = target;
-  detailTimelinePipeline = target;
-}
-
-function renderTimeline(payload) {
-  renderTimelineScale();
-  const minuteData = Array.from({ length: 1440 }, () => ({
-    recorded_total_frames: 0,
-    recorded_success_frames: 0,
-    recorded_error_frames: 0,
-    inferenced_frames: 0,
-    person_detections: 0,
-  }));
-  for (const raw of (payload.points || [])) {
-    const minute = Number(raw.minute);
-    if (!Number.isFinite(minute)) continue;
-    const idx = Math.floor(minute);
-    if (idx < 0 || idx >= 1440) continue;
-    minuteData[idx] = {
-      recorded_total_frames: Number(raw.recorded_total_frames || 0),
-      recorded_success_frames: Number(raw.recorded_success_frames || 0),
-      recorded_error_frames: Number(raw.recorded_error_frames || 0),
-      inferenced_frames: Number(raw.inferenced_frames || 0),
-      person_detections: Number(raw.person_detections || 0),
-    };
-  }
-  const totals = payload.totals || {};
-  const recordedMinutes = Number(totals.recorded_minutes || 0);
-  const inferencedMinutes = Number(totals.inferenced_minutes || 0);
-  const personMinutes = Number(totals.person_minutes || 0);
-  const successFrames = Number(totals.recorded_success_frames || 0);
-  const errorFrames = Number(totals.recorded_error_frames || 0);
-  const inferenceFrames = Number(totals.inferenced_frames || 0);
-  const personDetections = Number(totals.person_detections || 0);
-  const peakPeople = Number(totals.max_people_per_minute || 0);
-  const selectedPipeline = String(payload.selected_pipeline_id || '').trim();
-  const coveragePct = recordedMinutes > 0 ? (100 * inferencedMinutes / recordedMinutes) : 0;
-
-  timelineRecordedTrack.innerHTML = renderTimelineTrack('recorded', minuteData);
-  timelineInferencedTrack.innerHTML = renderTimelineTrack('inferenced', minuteData);
-  timelinePeopleTrack.innerHTML = renderTimelineTrack('people', minuteData, Number(totals.max_people_per_minute || 0));
-  timelineMetricChips.innerHTML = `
-    <div class="detail-kpi"><div class="detail-kpi-label">Recorded Minutes</div><div class="detail-kpi-value">${recordedMinutes}</div><div class="detail-kpi-meta">of 1440</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Inferenced Minutes</div><div class="detail-kpi-value">${inferencedMinutes}</div><div class="detail-kpi-meta">${coveragePct.toFixed(1)}% of recorded</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Person Minutes</div><div class="detail-kpi-value">${personMinutes}</div><div class="detail-kpi-meta">minutes with person detections</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Recorded Frames</div><div class="detail-kpi-value">${successFrames}</div><div class="detail-kpi-meta">${errorFrames} error frames</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Inference Frames</div><div class="detail-kpi-value">${inferenceFrames}</div><div class="detail-kpi-meta">${personDetections} person detections total</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Peak People / Minute</div><div class="detail-kpi-value">${peakPeople}</div><div class="detail-kpi-meta">${selectedPipeline ? `pipeline ${selectedPipeline}` : 'all pipelines'}</div></div>
-  `;
-  timelineSummary.textContent =
-    `UTC day ${payload.day || '-'} · ${selectedPipeline ? `pipeline ${selectedPipeline}` : 'all pipelines'} · ` +
-    `${recordedMinutes} recorded min, ${inferencedMinutes} inferenced min, ${personMinutes} min with people`;
-}
-
-function coverageCellClass(point) {
-  const recordedMinutes = Number(point && point.recorded_minutes || 0);
-  const successMinutes = Number(point && point.success_minutes || 0);
-  const errorMinutes = Number(point && point.error_minutes || 0);
-  if (recordedMinutes <= 0) return 'none';
-  if (successMinutes <= 0 && errorMinutes > 0) return 'error-only';
-  const hours = recordedMinutes / 60;
-  if (hours <= 1) return 'h1';
-  if (hours <= 4) return 'h2';
-  if (hours <= 8) return 'h3';
-  if (hours <= 16) return 'h4';
-  return 'h5';
-}
-
-function renderCoverageHeatmap(points) {
-  coverageHeatmapGrid.innerHTML = '';
-  const rows = Array.isArray(points) ? points : [];
-  if (!rows.length) {
-    coverageHeatmapGrid.innerHTML = '<div class="muted fs11">No capture history.</div>';
-    return;
-  }
-  const start = new Date(`${rows[0].day}T00:00:00Z`);
-  const lead = Number.isFinite(start.getTime()) ? ((start.getUTCDay() + 6) % 7) : 0; // Monday first
-  const html = [];
-  for (let i = 0; i < lead; i += 1) {
-    html.push('<div class="coverage-cell none" style="opacity:0;" aria-hidden="true"></div>');
-  }
-  for (const p of rows) {
-    const recordedMinutes = Number(p.recorded_minutes || 0);
-    const successMinutes = Number(p.success_minutes || 0);
-    const errorMinutes = Number(p.error_minutes || 0);
-    const recordedHours = Number(p.recorded_hours || 0);
-    const totalCaptures = Number(p.recorded_total_captures || p.recorded_total_frames || 0);
-    const successCaptures = Number(p.recorded_success_captures || p.recorded_success_frames || 0);
-    const errorCaptures = Number(p.recorded_error_captures || p.recorded_error_frames || 0);
-    const firstCapture = p.first_capture_at ? formatDateTimeShort(p.first_capture_at) : '-';
-    const lastCapture = p.last_capture_at ? formatDateTimeShort(p.last_capture_at) : '-';
-    const title = [
-      `${p.day}: ${recordedHours.toFixed(2)}h`,
-      `minutes ${recordedMinutes} (success ${successMinutes} / error ${errorMinutes})`,
-      `clips ${successCaptures}/${totalCaptures}${errorCaptures > 0 ? ` (error ${errorCaptures})` : ''}`,
-      `first ${firstCapture}`,
-      `last ${lastCapture}`,
-    ].join(' · ');
-    html.push(`<div class="coverage-cell ${coverageCellClass(p)}" title="${esc(title)}"></div>`);
-  }
-  coverageHeatmapGrid.innerHTML = html.join('');
-}
-
-function renderCoverageSummary(payload) {
-  const summary = payload && payload.summary ? payload.summary : {};
-  const totalHours = Number(summary.total_recorded_hours || 0);
-  const totalSuccessHours = Number(summary.total_success_hours || 0);
-  const totalErrorHours = Number(summary.total_error_hours || 0);
-  const avgHours = Number(summary.avg_recorded_hours_per_day || 0);
-  const maxHours = Number(summary.max_recorded_hours_per_day || 0);
-  const daysTotal = Number(summary.days_total || 0);
-  const daysWithCapture = Number(summary.days_with_capture || 0);
-  const daysWithoutCapture = Number(summary.days_without_capture || 0);
-  const streakDays = Number(summary.current_streak_days || 0);
-  const longestGap = Number(summary.longest_gap_days || 0);
-  const firstCapture = summary.first_capture_at ? formatDateTimeShort(summary.first_capture_at) : '-';
-  const lastCapture = summary.last_capture_at ? formatDateTimeShort(summary.last_capture_at) : '-';
-  const coveragePct = daysTotal > 0 ? (100 * daysWithCapture / daysTotal) : 0;
-  coverageMetricChips.innerHTML = `
-    <div class="detail-kpi"><div class="detail-kpi-label">Captured Days</div><div class="detail-kpi-value">${daysWithCapture}</div><div class="detail-kpi-meta">${coveragePct.toFixed(1)}% of window</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Total Recorded Hours</div><div class="detail-kpi-value">${totalHours.toFixed(1)}</div><div class="detail-kpi-meta">success ${totalSuccessHours.toFixed(1)}h · error ${totalErrorHours.toFixed(1)}h</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Avg / Max Hours (day)</div><div class="detail-kpi-value">${avgHours.toFixed(2)} / ${maxHours.toFixed(2)}</div><div class="detail-kpi-meta">window ${daysTotal} days</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Current Streak</div><div class="detail-kpi-value">${streakDays}</div><div class="detail-kpi-meta">days with capture from today backward</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">Longest Gap</div><div class="detail-kpi-value">${longestGap}</div><div class="detail-kpi-meta">days without capture</div></div>
-    <div class="detail-kpi"><div class="detail-kpi-label">No-Capture Days</div><div class="detail-kpi-value">${daysWithoutCapture}</div><div class="detail-kpi-meta">first ${esc(firstCapture)} · last ${esc(lastCapture)}</div></div>
-  `;
-  coverageSummary.textContent =
-    `UTC day window ${payload.start_day || '-'} to ${payload.end_day || '-'} · ` +
-    `${daysWithCapture}/${daysTotal} captured days · total ${totalHours.toFixed(2)}h · ` +
-    `current streak ${streakDays}d · longest gap ${longestGap}d`;
-}
-
-function renderCoverageSamples(payload) {
-  const items = Array.isArray(payload && payload.items) ? payload.items : [];
-  coverageSampleGrid.innerHTML = '';
-  if (!items.length) {
-    coverageSamplesSummary.textContent = 'No sampleable captured clips in this stream yet.';
-    coverageSampleGrid.innerHTML = '<div class="muted fs11">No samples</div>';
-    return;
-  }
-  const requested = Number(payload.requested_count || 0);
-  const availableDays = Number(payload.available_days || 0);
-  const selectedDays = Number(payload.selected_days || items.length);
-  coverageSamplesSummary.textContent =
-    `${items.length} sampled clips · requested ${requested} · selected days ${selectedDays}/${availableDays}`;
-  for (const it of items) {
-    const url = String(it.download_url || '').trim();
-    const title = `${it.day || '-'} · ${captureWindowLabel(it)}`;
-    const mediaHTML = url
-      ? renderClipActions(it, false, 'thumb-sm', true)
-      : renderClipThumbnail(it, 'thumb-sm');
-    const el = document.createElement('div');
-    el.className = 'coverage-sample-card';
-    el.innerHTML = `
-      ${mediaHTML}
-      <div class="coverage-sample-meta">${esc(title)}</div>
-      <div class="coverage-sample-meta mono">${esc(String(it.object_key || '-'))}</div>
-    `;
-    coverageSampleGrid.appendChild(el);
-  }
-}
-
-const HEALTH_HOUR_WINDOWS = [24, 48, 72, 96, 120, 168];
-
-function normalizeHealthHoursWindow(raw) {
-  const value = Math.floor(Number(raw));
-  if (!Number.isFinite(value) || value <= 0) return 72;
-  if (HEALTH_HOUR_WINDOWS.includes(value)) return value;
-  let best = 72;
-  let bestDelta = Infinity;
-  for (const candidate of HEALTH_HOUR_WINDOWS) {
-    const delta = Math.abs(candidate - value);
-    if (delta < bestDelta) {
-      best = candidate;
-      bestDelta = delta;
-    }
-  }
-  return best;
-}
-
-function setDetailHealthHoursWindow(next, opts = {}) {
-  detailHealthHoursWindow = normalizeHealthHoursWindow(next);
-  if (detailHealthHours instanceof HTMLSelectElement) {
-    detailHealthHours.value = String(detailHealthHoursWindow);
-  }
-  try {
-    localStorage.setItem('detailHealthHours', String(detailHealthHoursWindow));
-  } catch (_) {}
-  updateDetailTabHrefs();
-  if (opts.syncURL !== false && detailMainView === 'details' && detailView === 'health' && detailStreamID) {
-    syncDetailURL({ replace: opts.replaceURL === true });
-  }
-}
-
-function toHealthNumber(value) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : 0;
-}
-
-function formatUTCDateHourLabel(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '-';
-  return `${date.toISOString().slice(0, 13).replace('T', ' ')}:00 UTC`;
-}
-
-function formatUTCDateLabel(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '-';
-  return `${date.toISOString().slice(0, 10)} UTC`;
-}
-
-function formatUTCDateRangeLabel(startValue, endValue) {
-  const startLabel = formatUTCDateLabel(startValue);
-  const endLabel = formatUTCDateLabel(endValue);
-  return startLabel === endLabel ? startLabel : `${startLabel.replace(' UTC', '')} → ${endLabel}`;
-}
-
-function healthSeverityClass(lossPct) {
-  const value = Math.max(0, Number(lossPct) || 0);
-  if (value <= 0.5) return 'loss-0';
-  if (value <= 2) return 'loss-1';
-  if (value <= 5) return 'loss-2';
-  if (value <= 10) return 'loss-3';
-  if (value <= 20) return 'loss-4';
-  if (value <= 35) return 'loss-5';
-  if (value <= 60) return 'loss-6';
-  return 'loss-7';
-}
-
-function normalizeHealthBucket(raw, index = 0) {
-  const hourStart = String((raw && (raw.hour_start_utc || raw.hour_start || raw.hour || raw.bucket_start || raw.start || raw.timestamp || raw.ts)) || '').trim();
-  let expected = toHealthNumber(raw && (raw.expected_captures ?? raw.expected ?? raw.total_expected_captures ?? raw.total_expected ?? raw.capacity ?? raw.total));
-  const success = toHealthNumber(raw && (raw.success_captures ?? raw.success ?? raw.recorded_success ?? raw.ok ?? raw.captures_success));
-  const errors = toHealthNumber(raw && (raw.error_captures ?? raw.errors ?? raw.capture_errors ?? raw.failed_captures ?? raw.captures_error));
-  let missing = toHealthNumber(raw && (raw.missing_captures ?? raw.missing ?? raw.lost_captures ?? raw.loss_captures));
-  let lossPct = Number(raw && (raw.loss_rate_pct ?? raw.loss_rate ?? raw.loss_pct));
-  if (Number.isFinite(lossPct) && lossPct > 0 && lossPct <= 1 && !(raw && raw.loss_rate_pct !== undefined)) {
-    lossPct *= 100;
-  }
-  if (!Number.isFinite(lossPct)) {
-    if (!expected && (success > 0 || errors > 0 || missing > 0)) {
-      expected = Math.max(0, success + errors + missing);
-    }
-    if (!missing && expected > 0) {
-      missing = Math.max(0, expected - success);
-    }
-    lossPct = expected > 0 ? (100 * Math.max(0, missing)) / expected : 0;
-  }
-  const hourDate = hourStart ? new Date(hourStart) : null;
-  const validHour = !!(hourDate && !Number.isNaN(hourDate.getTime()));
-  return {
-    index,
-    hourStart: validHour ? hourDate.toISOString() : '',
-    displayHour: validHour ? `${hourDate.toISOString().slice(11, 16)} UTC` : '-',
-    displayHourLong: validHour ? formatUTCDateHourLabel(hourDate.toISOString()) : '-',
-    expected,
-    success,
-    errors,
-    missing,
-    lossPct: Number.isFinite(lossPct) ? Math.max(0, lossPct) : 0,
-    hasData: validHour || expected > 0 || success > 0 || errors > 0 || missing > 0,
-  };
-}
-
-function renderDetailHealthMetricChips(buckets, summary) {
-  const hours = Number(summary.total_hours || buckets.length || 0);
-  const avgLoss = Number(summary.average_loss_pct || 0);
-  const worstLoss = Number(summary.worst_loss_pct || 0);
-  const worstHour = String(summary.worst_hour || '').trim() || '-';
-  const spottyHours = Number(summary.spotty_hours || 0);
-  const errorHours = Number(summary.error_hours || 0);
-  const zeroCaptureHours = Number(summary.zero_capture_hours || 0);
-  const explicitErrors = Number(summary.error_rows || 0);
-  const expectedTotal = Number(summary.expected_total || 0);
-  const expectedPerHour = Number(summary.expected_per_hour || 0);
-  const captureUnit = String(summary.capture_unit || 'captures').trim() || 'captures';
-  healthMetricChips.innerHTML = `
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Expected Rate</div>
-      <div class="detail-kpi-value">${expectedPerHour > 0 ? expectedPerHour : '-'}</div>
-      <div class="detail-kpi-meta">${esc(captureUnit)} per UTC hour</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Hours</div>
-      <div class="detail-kpi-value">${hours}</div>
-      <div class="detail-kpi-meta">${summary.window_hours || detailHealthHoursWindow}h requested</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Average Loss</div>
-      <div class="detail-kpi-value">${avgLoss.toFixed(2)}%</div>
-      <div class="detail-kpi-meta">weighted by expected captures</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Worst Hour</div>
-      <div class="detail-kpi-value">${worstLoss.toFixed(2)}%</div>
-      <div class="detail-kpi-meta">${esc(worstHour)}</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Spotty Hours</div>
-      <div class="detail-kpi-value">${spottyHours}</div>
-      <div class="detail-kpi-meta">loss &ge; 20%</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Error Hours</div>
-      <div class="detail-kpi-value">${errorHours}</div>
-      <div class="detail-kpi-meta">hours with explicit error rows</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Explicit Errors</div>
-      <div class="detail-kpi-value">${explicitErrors}</div>
-      <div class="detail-kpi-meta">capture_status = error</div>
-    </div>
-    <div class="detail-kpi">
-      <div class="detail-kpi-label">Zero-Capture Hours</div>
-      <div class="detail-kpi-value">${zeroCaptureHours}</div>
-      <div class="detail-kpi-meta">${expectedTotal > 0 ? `${expectedTotal} expected captures total` : 'expected count unavailable'}</div>
-    </div>
-  `;
-}
-
-function renderDetailHealthGrid(buckets, summary = {}) {
-  const rows = Array.isArray(buckets) ? buckets.slice() : [];
-  if (!rows.length) {
-    healthGrid.innerHTML = '<div class="muted fs11">No recording health data.</div>';
-    return;
-  }
-  const pad = (24 - (rows.length % 24)) % 24;
-  const padded = Array.from({ length: pad }, () => null).concat(rows);
-  const header = ['<div class="health-axis-label">UTC</div>'];
-  for (let hour = 0; hour < 24; hour += 1) {
-    header.push(`<div class="health-axis-label hour">${String(hour).padStart(2, '0')}</div>`);
-  }
-  const html = [header.join('')];
-  for (let rowIndex = 0; rowIndex < padded.length; rowIndex += 24) {
-    const slice = padded.slice(rowIndex, rowIndex + 24);
-    const actual = slice.filter(Boolean);
-    const rowStart = actual.length ? actual[0].hourStart : '';
-    const rowEnd = actual.length ? actual[actual.length - 1].hourStart : '';
-    const rowLoss = actual.length ? actual.reduce((sum, it) => sum + Number(it.lossPct || 0), 0) / actual.length : 0;
-    const rowErrors = actual.reduce((sum, it) => sum + Number(it.errors || 0), 0);
-    const rowSpotty = actual.filter((it) => Number(it.lossPct || 0) >= 20).length;
-    html.push(`
-      <div class="health-row-label">
-        <span class="health-row-label-title">${esc(formatUTCDateRangeLabel(rowStart || rowEnd, rowEnd || rowStart))}</span>
-        <span class="health-row-label-meta">${actual.length}h · avg ${rowLoss.toFixed(1)}% · ${rowSpotty} spotty${rowErrors > 0 ? ` · ${rowErrors} err` : ''}</span>
-      </div>
-    `);
-    for (const item of slice) {
-      if (!item) {
-        html.push('<div class="health-cell no-data empty" aria-hidden="true"></div>');
-        continue;
-      }
-      const lossClass = healthSeverityClass(item.lossPct);
-      const errorCount = Number(item.errors || 0);
-      const expected = Number(item.expected || 0);
-      const success = Number(item.success || 0);
-      const missing = Number(item.missing || 0);
-      const hourLabel = String(item.displayHour || '-');
-      const hourLong = String(item.displayHourLong || '-');
-      const title = [
-        hourLong,
-        `loss ${Number(item.lossPct || 0).toFixed(2)}%`,
-        `success ${success}/${expected || '-'}`,
-        errorCount > 0 ? `explicit errors ${errorCount}` : 'no explicit errors',
-        expected > 0 ? `missing ${missing}` : 'expected count unavailable',
-      ].join(' · ');
-      html.push(`
-        <div class="health-cell ${lossClass}${errorCount > 0 ? ' error' : ''}${expected <= 0 && success <= 0 && errorCount <= 0 ? ' no-data' : ''}" title="${esc(title)}">
-          <div class="health-cell-top">
-            <span class="health-hour">${esc(hourLabel)}</span>
-            ${errorCount > 0 ? `<span class="tag tag-warn" style="height:16px; padding:0 5px; font-size:9px; line-height:14px;">E${errorCount}</span>` : '<span></span>'}
-          </div>
-          <div class="health-percent">${Number(item.lossPct || 0).toFixed(0)}%</div>
-          <div class="health-cell-bottom">
-            <span class="health-count">${expected > 0 ? `${success}/${expected}` : '-'}</span>
-            <span class="health-count">${errorCount > 0 ? `err ${errorCount}` : missing > 0 ? `miss ${missing}` : 'ok'}</span>
-          </div>
-        </div>
-      `);
-    }
-  }
-  healthGrid.innerHTML = html.join('');
-}
-
-function renderDetailHealth(payload) {
-  const items = Array.isArray(payload && (payload.items || payload.points || payload.buckets || payload.hours)) ? (payload.items || payload.points || payload.buckets || payload.hours) : [];
-  const buckets = items.map((raw, index) => normalizeHealthBucket(raw, index))
-    .filter((bucket) => bucket && bucket.hasData)
-    .sort((a, b) => String(a.hourStart || '').localeCompare(String(b.hourStart || '')));
-  const summary = payload && payload.summary ? payload.summary : {};
-  const streamMeta = payload && payload.stream ? payload.stream : {};
-  if (!buckets.length) {
-    renderDetailHealthMetricChips([], {
-      total_hours: 0,
-      window_hours: Number(payload && payload.hours || detailHealthHoursWindow || 72),
-      average_loss_pct: 0,
-      worst_loss_pct: 0,
-      worst_hour: '-',
-      spotty_hours: 0,
-      error_hours: 0,
-      error_rows: 0,
-      zero_capture_hours: 0,
-      expected_total: 0,
-      expected_per_hour: Number(payload && payload.expected_captures_per_hour || 0),
-      capture_unit: String(streamMeta.capture_unit || 'captures'),
-    });
-    renderDetailHealthGrid([], summary);
-    if (healthSummary instanceof HTMLElement) {
-      const expectedPerHour = Number(payload && payload.expected_captures_per_hour || 0);
-      const captureUnit = String(streamMeta.capture_unit || 'captures').trim() || 'captures';
-      healthSummary.textContent = `No hourly health buckets returned.${expectedPerHour > 0 ? ` Expected ${expectedPerHour} ${captureUnit}/hour. ` : ' '}Loss is missing expected captures; errors are capture rows with status error.`;
-    }
-    return;
-  }
-  let expectedTotal = 0;
-  let successTotal = 0;
-  let errorRows = 0;
-  let spottyHours = 0;
-  let errorHours = 0;
-  let zeroCaptureHours = 0;
-  let worstBucket = null;
-  for (const bucket of buckets) {
-    expectedTotal += Number(bucket.expected || 0);
-    successTotal += Number(bucket.success || 0);
-    errorRows += Number(bucket.errors || 0);
-    if (Number(bucket.lossPct || 0) >= 20) spottyHours += 1;
-    if (Number(bucket.errors || 0) > 0) errorHours += 1;
-    if (Number(bucket.expected || 0) > 0 && Number(bucket.success || 0) <= 0) zeroCaptureHours += 1;
-    if (!worstBucket || Number(bucket.lossPct || 0) > Number(worstBucket.lossPct || 0)) {
-      worstBucket = bucket;
-    }
-  }
-  const missingTotal = Math.max(0, expectedTotal - successTotal);
-  const weightedLoss = expectedTotal > 0 ? (100 * missingTotal) / expectedTotal : 0;
-  const averageLoss = summary.average_loss_pct !== undefined && summary.average_loss_pct !== null
-    ? Number(summary.average_loss_pct)
-    : summary.avg_loss_rate_pct !== undefined && summary.avg_loss_rate_pct !== null
-      ? Number(summary.avg_loss_rate_pct)
-      : weightedLoss;
-  const worstLoss = summary.worst_loss_pct !== undefined && summary.worst_loss_pct !== null
-    ? Number(summary.worst_loss_pct)
-    : summary.max_loss_rate_pct !== undefined && summary.max_loss_rate_pct !== null
-      ? Number(summary.max_loss_rate_pct)
-      : Number(worstBucket ? worstBucket.lossPct : 0);
-  const worstHour = String(summary.worst_hour || (worstBucket ? worstBucket.hourStart : '') || '').trim();
-  const firstHour = buckets.length ? buckets[0].hourStart : '';
-  const lastHour = buckets.length ? buckets[buckets.length - 1].hourStart : '';
-  const totalHours = Number(summary.total_hours !== undefined ? summary.total_hours : summary.buckets !== undefined ? summary.buckets : buckets.length);
-  const spottyCount = Number(summary.spotty_hours !== undefined ? summary.spotty_hours : summary.hours_with_loss !== undefined ? summary.hours_with_loss : spottyHours);
-  const errorHourCount = Number(summary.error_hours !== undefined ? summary.error_hours : summary.hours_with_errors !== undefined ? summary.hours_with_errors : errorHours);
-  const explicitErrorRows = Number(summary.error_rows !== undefined ? summary.error_rows : summary.total_error_captures !== undefined ? summary.total_error_captures : errorRows);
-  const summaryExpectedTotal = Number(summary.expected_total !== undefined ? summary.expected_total : summary.total_expected_captures !== undefined ? summary.total_expected_captures : expectedTotal);
-  const summarySuccessTotal = Number(summary.total_success_captures !== undefined ? summary.total_success_captures : successTotal);
-  const summaryMissingTotal = Number(summary.total_missing_captures !== undefined ? summary.total_missing_captures : Math.max(0, summaryExpectedTotal - summarySuccessTotal));
-  const summaryZeroCaptureHours = Number(summary.zero_capture_hours !== undefined ? summary.zero_capture_hours : zeroCaptureHours);
-
-  renderDetailHealthMetricChips(buckets, {
-    total_hours: totalHours,
-    window_hours: Number(payload && payload.hours || detailHealthHoursWindow || 72),
-    average_loss_pct: averageLoss,
-    worst_loss_pct: worstLoss,
-    worst_hour: worstHour ? formatUTCDateHourLabel(worstHour) : '-',
-    spotty_hours: spottyCount,
-    error_hours: errorHourCount,
-    error_rows: explicitErrorRows,
-    zero_capture_hours: summaryZeroCaptureHours,
-    expected_total: summaryExpectedTotal,
-    expected_per_hour: Number(payload && payload.expected_captures_per_hour || 0),
-    capture_unit: String(streamMeta.capture_unit || 'captures'),
-  });
-  renderDetailHealthGrid(buckets, summary);
-  if (healthSummary instanceof HTMLElement) {
-    const expectedPerHour = Number(payload && payload.expected_captures_per_hour || 0);
-    const captureUnit = String(streamMeta.capture_unit || 'captures').trim() || 'captures';
-    healthSummary.textContent =
-      `${formatUTCDateHourLabel(firstHour || lastHour || new Date())} to ${formatUTCDateHourLabel(lastHour || firstHour || new Date())} · ` +
-      `average loss ${averageLoss.toFixed(2)}% · ${spottyCount} spotty hours · ${errorHourCount} error hours · ${explicitErrorRows} explicit error rows. ` +
-      `${expectedPerHour > 0 ? `Expected ${expectedPerHour} ${captureUnit}/hour. ` : ''}` +
-      `Loss is missing expected captures; errors are capture rows with status error.`;
-  }
-}
-
-async function loadDetailHealth() {
-  if (!detailStreamID) return;
-  const hours = normalizeHealthHoursWindow(detailHealthHoursWindow);
-  setDetailHealthHoursWindow(hours, { syncURL: false });
-  setHealthStatus('loading...');
-  if (healthMetricChips instanceof HTMLElement) healthMetricChips.innerHTML = '';
-  if (healthSummary instanceof HTMLElement) healthSummary.textContent = 'Loading recording health...';
-  if (healthGrid instanceof HTMLElement) healthGrid.innerHTML = '<div class="muted fs11">Loading...</div>';
-  const payload = await fetchJSON(`/api/v1/dashboard/streams/${detailStreamID}/recording-health?hours=${hours}`);
-  detailHealthData = payload;
-  renderDetailHealth(payload);
-  const buckets = Array.isArray(payload && (payload.items || payload.points || payload.buckets || payload.hours))
-    ? (payload.items || payload.points || payload.buckets || payload.hours)
-    : [];
-  const loadedCount = buckets.length;
-  const summary = payload && payload.summary ? payload.summary : {};
-  const errorRows = Number(summary.error_rows !== undefined ? summary.error_rows : summary.total_error_captures !== undefined ? summary.total_error_captures : buckets.reduce((sum, raw) => sum + toHealthNumber(raw && (raw.error_captures ?? raw.errors ?? raw.capture_errors ?? raw.failed_captures ?? raw.captures_error)), 0));
-  const spottyHours = Number(summary.spotty_hours !== undefined ? summary.spotty_hours : summary.hours_with_loss !== undefined ? summary.hours_with_loss : buckets.filter((bucket) => Number(normalizeHealthBucket(bucket).lossPct || 0) >= 20).length);
-  const avgLoss = Number(summary.average_loss_pct !== undefined ? summary.average_loss_pct : summary.avg_loss_rate_pct !== undefined ? summary.avg_loss_rate_pct : 0);
-  setHealthStatus(`${loadedCount} hourly buckets · ${avgLoss.toFixed(2)}% avg loss · ${spottyHours} spotty hours · ${errorRows} error rows`, 'ok');
-  if (detailHealthSubtitle instanceof HTMLElement) {
-    detailHealthSubtitle.textContent = `Hourly loss rate and explicit error rows over the last ${hours} UTC hours. Loss is missing expected captures; error rows are explicit capture failures.`;
-  }
-  if (detailHealthHours instanceof HTMLSelectElement) {
-    detailHealthHours.value = String(hours);
-  }
-}
-
-async function loadDetailCoverage() {
-  if (!detailStreamID) return;
-  const days = Number(coverageDays.value || 30);
-  const sampleCount = Number(coverageSampleCount.value || 42);
-  if (!Number.isFinite(days) || days < 14 || days > 1095) {
-    throw new Error('coverage days must be between 14 and 1095');
-  }
-  if (!Number.isFinite(sampleCount) || sampleCount < 1 || sampleCount > 180) {
-    throw new Error('coverage sample count must be between 1 and 180');
-  }
-  setCoverageStatus('loading...');
-  coverageMetricChips.innerHTML = '';
-  coverageSummary.textContent = 'Loading capture coverage...';
-  coverageHeatmapGrid.innerHTML = '<div class="muted fs11">Loading...</div>';
-  coverageSamplesSummary.textContent = 'Loading sampled captures...';
-  coverageSampleGrid.innerHTML = '';
-
-  const [coveragePayload, samplePayload] = await Promise.all([
-    fetchJSON(dashboardStreamURL(detailStreamID, `/coverage?days=${Math.floor(days)}`)),
-    fetchJSON(dashboardStreamURL(detailStreamID, `/capture-samples?count=${Math.floor(sampleCount)}`)),
-  ]);
-  detailCoverageData = coveragePayload;
-  detailCaptureSamplesData = samplePayload;
-  renderCoverageSummary(coveragePayload);
-  renderCoverageHeatmap(coveragePayload.points || []);
-  renderCoverageSamples(samplePayload);
-  const pointCount = Array.isArray(coveragePayload.points) ? coveragePayload.points.length : 0;
-  const sampleRows = Array.isArray(samplePayload.items) ? samplePayload.items.length : 0;
-  setCoverageStatus(`${pointCount} days loaded · ${sampleRows} sample images`, 'ok');
-}
-
-async function loadDetailTimeline() {
-  if (!detailStreamID) return;
-  const inputDay = String(timelineDayInput.value || detailTimelineDay || '').trim();
-  const day = inputDay || toUTCDateKey(new Date());
-  detailTimelineDay = day;
-  timelineDayInput.value = day;
-  const pipelineID = String(timelinePipelineFilter.value || detailTimelinePipeline || '').trim();
-  detailTimelinePipeline = pipelineID;
-
-  setTimelineStatus('loading...');
-  const params = new URLSearchParams();
-  params.set('day', day);
-  if (pipelineID) params.set('pipeline_id', pipelineID);
-  const payload = await fetchJSON(dashboardStreamURL(detailStreamID, '/timeline', params));
-  detailTimelineData = payload;
-  setTimelinePipelineOptions(payload.available_pipeline_ids || [], payload.selected_pipeline_id || pipelineID);
-  renderTimeline(payload);
-  setTimelineStatus(`${(payload.points || []).length} minute buckets`, 'ok');
-}
-
-function buildDetailParams() {
-  const params = new URLSearchParams();
-  params.set('limit', sanitizeLimit(detailLimit.value, 200, 10, 500));
-  params.set('offset', '0');
-  params.set('sort_by', detailSortBy.value || 'created_at');
-  params.set('sort_dir', detailSortDir.value || 'desc');
-  const sel = (pipelineFilter.value || '').trim();
-  if (sel) params.set('pipeline_id', sel);
-  if (detailStatusFilter.value) params.set('status', detailStatusFilter.value);
-  const hb = parseBool(detailHasBoxed.value);
-  if (hb) params.set('has_boxed', hb);
-  if (detailClassName.value.trim()) params.set('class_name', detailClassName.value.trim());
-  if (detailSearch.value.trim()) params.set('q', detailSearch.value.trim());
-  const mc = Number(detailMinConfidence.value);
-  if (Number.isFinite(mc) && mc >= 0) params.set('min_confidence', String(mc));
-  const cf = toISO(detailCreatedFrom.value);
-  const ct = toISO(detailCreatedTo.value);
-  if (cf) params.set('created_from', cf);
-  if (ct) params.set('created_to', ct);
-  return params;
-}
-
 async function fetchRecentFrames(limit = 60) {
   const params = new URLSearchParams();
   params.set('stream_id', String(detailStreamID));
@@ -8365,267 +5777,50 @@ async function fetchRecentFrames(limit = 60) {
   return Array.isArray(payload.items) ? payload.items : [];
 }
 
-async function fetchRecentClips(limit = 60) {
-  const params = new URLSearchParams();
-  params.set('limit', String(limit));
-  params.set('offset', '0');
-  const payload = await fetchJSON(`/api/v1/capture/streams/${detailStreamID}/segments?${params}`);
-  return Array.isArray(payload.items) ? payload.items : [];
-}
-
 async function loadDetailLiveFrames(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return [];
-  const meta = detailCaptureMeta(detailRecordingData);
   if (!quiet && detailLiveFramesStatus) {
-    detailLiveFramesStatus.textContent = `Loading recent ${meta.plural}...`;
+    detailLiveFramesStatus.textContent = 'Loading recent frames...';
   }
-  const items = meta.clipNative ? await fetchRecentClips(60) : await fetchRecentFrames(60);
+  const items = await fetchRecentFrames(60);
   renderDetailLiveFramesGrid(items);
   detailRecentFramesData = items;
   return items;
 }
 
-async function loadDetailFrames(options = {}) {
-  const quiet = Boolean(options && options.quiet);
-  if (!detailStreamID) return;
-  const meta = detailCaptureMeta(detailRecordingData);
-  if (!quiet) {
-    setTableLoadingRow(framesRowsEl, 6, 'Loading captures...');
-    framesStatusText.className = 'status-text';
-    framesStatusText.textContent = 'loading...';
-  }
-  const limit = sanitizeLimit(framesLimit.value, 200, 20, 1000);
-  if (meta.clipNative) {
-    detailFramesData = await fetchRecentClips(limit);
-  } else {
-    const params = new URLSearchParams();
-    params.set('stream_id', String(detailStreamID));
-    params.set('limit', String(limit));
-    params.set('offset', '0');
-    params.set('sort_by', String(framesSortBy || 'captured_at'));
-    params.set('sort_dir', normalizeSortDir(framesSortDir, 'desc'));
-    const payload = await fetchJSON(`/api/v1/frames?${params}`);
-    detailFramesData = payload.items || [];
-  }
-  renderFramesRows(detailFramesData);
-}
-
-function renderDetailCaptureWorkers(items) {
-  const captureMeta = detailCaptureMeta(detailRecordingData);
-  const rows = Array.isArray(items) ? items.filter((it) => !Boolean(it && it.active)) : [];
-  if (!rows.length) {
-    detailCaptureWorkers.innerHTML = '<span class="muted fs11">No stale process history to show.</span>';
-    return;
-  }
-  detailCaptureWorkers.innerHTML = rows.map((it) => {
-    const wid = String(it.worker_id || 'unknown');
-    const serverID = String(it.server_id || '').trim();
-    const processID = String(it.process_id || '').trim();
-    const status = String(it.status || '').trim() || '-';
-    const active = Boolean(it.active);
-    const hb = it.heartbeat_at ? formatDateTimeShort(it.heartbeat_at) : '-';
-    const started = it.started_at ? formatDateTimeShort(it.started_at) : '-';
-    const lastCapture = it.last_capture_at ? formatDateTimeShort(it.last_capture_at) : (it.last_frame_at ? formatDateTimeShort(it.last_frame_at) : '-');
-    const restarts = Number(it.restart_count || 0);
-    const lastErrorText = String(it.last_error_text || '').trim();
-    const serverHTML = serverID ? `<span class="mono fs11">${esc(serverID)}</span>` : '<span class="mono fs11">-</span>';
-    const processHTML = processID ? `<span class="mono fs10 muted">${esc(processID)}</span>` : '';
-    return `<div class="row" style="gap:8px; align-items:center;">
-      <span class="tag tag-muted">recording history</span>
-      <span class="mono fs11">${esc(wid)}</span>
-      ${serverHTML}
-      ${processHTML}
-      <span class="muted fs10">status ${esc(status)}</span>
-      <span class="muted fs10">started ${esc(started)}</span>
-      <span class="muted fs10">heartbeat ${esc(hb)}</span>
-      <span class="muted fs10">latest ${esc(captureMeta.singular)} ${esc(lastCapture)}</span>
-      ${restarts > 0 ? `<span class="muted fs10">restarts ${restarts}</span>` : ''}
-      ${lastErrorText ? `<span class="mono fs10" style="color:#ef4444;">${esc(lastErrorText)}</span>` : ''}
-    </div>`;
-  }).join('');
-}
-
-function renderDetailPipelines(items) {
-  detailPipelineRows.innerHTML = '';
-  if (!Array.isArray(items) || !items.length) {
-    detailPipelineRows.innerHTML = '<tr><td colspan="8" class="muted fs11" style="padding:16px;">No pipelines configured</td></tr>';
-    return;
-  }
-  for (const it of items) {
-    const pid = String(it.pipeline_id || '');
-    const enabled = Boolean(it.enabled);
-    const workers = Array.isArray(it.active_workers) ? it.active_workers : [];
-    const latest = it.last_result_at ? formatDateTimeShort(it.last_result_at) : '-';
-    const status = String(it.last_result_status || '').trim() || '-';
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td class="mono fs11">${esc(pid)}<div class="muted fs10">${esc(String(it.kind || '-'))}</div></td>
-      <td>${enabled ? '<span class="tag tag-ok">enabled</span>' : '<span class="tag tag-muted">disabled</span>'}</td>
-      <td class="mono fs11">${Number(it.processed_frames || 0)}</td>
-      <td class="mono fs11">${Number(it.backlog_frames || 0)}</td>
-      <td class="mono fs11">${Number(it.active_claims || 0)}</td>
-      <td>${workers.length ? listToMeta(workers) : '<span class="muted fs11">-</span>'}</td>
-      <td class="mono fs11">${esc(status)}<div class="muted fs10">${esc(latest)}</div></td>
-      <td><button class="btn-sm" data-detail-action="pipeline-toggle" data-pipeline-id="${esc(pid)}" data-enabled="${enabled ? '1' : '0'}">${enabled ? 'Disable' : 'Enable'}</button></td>
-    `;
-    detailPipelineRows.appendChild(tr);
-  }
-}
-
-async function loadDetailWorkload() {
-  if (!detailStreamID) return;
-  setDetailWorkloadStatus('loading...');
-  if (detailPipelineRows) setTableLoadingRow(detailPipelineRows, 8, 'Loading stream workload...');
-  const payload = await fetchJSON(dashboardStreamURL(detailStreamID, '/pipelines'));
-  detailPipelineData = payload;
-  if (detailPipelineRows) renderDetailPipelines(payload.items || []);
-  setDetailWorkloadStatus(`${(payload.capture_workers || []).length} capture workers · ${(payload.items || []).length} pipelines`, 'ok');
-}
-
-async function loadDetailInference() {
-  if (!detailStreamID) return;
-  setDetailStatus('loading stream...');
-  setTableLoadingRow(inferenceRowsEl, 10, 'Loading stream inferences...');
-  setTableLoadingRow(detectionRowsEl, 7, 'Loading detections...');
-  setTableLoadingRow(signalRowsEl, 8, 'Loading signals...');
-  detectionMetaSummary.textContent = 'Loading detections...';
-  signalMetaSummary.textContent = 'Loading signals...';
-  const detailParams = buildDetailParams();
-  const detectionParams = new URLSearchParams(detailParams.toString());
-  detectionParams.set('limit', '500');
-  const detail = await fetchJSON(dashboardStreamURL(detailStreamID, '', detailParams));
-  detailData = detail;
-  populatePipelineOptions(detail.inference || [], (pipelineFilter.value || '').trim());
-  renderInferenceTable(inferenceRowsEl, detail.inference || [], { showStream: false });
-  updateSortableHeaders(detailInferenceTable, detailSortBy.value || 'created_at', detailSortDir.value || 'desc');
-  renderDetailInferenceKpis(detail.inference || [], [], [], null);
-  const inferenceRowsCount = (detail.inference || []).length;
-  setDetailStatus(`${inferenceRowsCount} inference rows · loading detections...`);
-
-  void (async () => {
-    try {
-      const det = await fetchJSON(dashboardStreamURL(detailStreamID, '/detections', detectionParams));
-      detailDetectionsData = det.detections || [];
-      detailSignalsData = det.signals || [];
-      detailLatestDetectionResult = det.latest_result || null;
-      renderDetailInferenceKpis(detail.inference || [], detailDetectionsData, detailSignalsData, detailLatestDetectionResult);
-      renderDetections(detailDetectionsData, detailLatestDetectionResult);
-      renderSignals(detailSignalsData, detailLatestDetectionResult);
-      const selectedPipeline = String((pipelineFilter.value || '').trim());
-      setDetailStatus(`${inferenceRowsCount} inference rows · ${(det.detections || []).length} detections · ${(det.signals || []).length} signals${selectedPipeline ? ` · ${selectedPipeline}` : ''}`, 'ok');
-    } catch (err) {
-      setDetailStatus(String(err), 'err');
-    }
-  })();
-  detailInferenceLoaded = true;
-}
-
 async function loadDetail(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return;
-  if (!quiet) setDetailWorkloadStatus('loading...');
-  const recordingParams = new URLSearchParams();
-  recordingParams.set('include_recent_captures', '24');
-  const recordingPayload = await fetchJSON(dashboardStreamURL(detailStreamID, '/recording', recordingParams));
-  detailRecordingData = recordingPayload;
-  const captureMeta = detailCaptureMeta(recordingPayload);
-  if (!quiet && detailLiveFramesStatus) {
-    detailLiveFramesStatus.textContent = `Loading recent ${captureMeta.plural}...`;
-  }
-  if (!Array.isArray(recordingPayload.recent_captures)) {
-    throw new Error('recording payload missing recent_captures');
-  }
-  const recentFrames = recordingPayload.recent_captures;
-  const s = recordingPayload.stream || {};
+  const payload = await fetchJSON(dashboardStreamURL(detailStreamID));
+  const s = payload.stream || {};
   const detailName = latinizedLabelParts(s.name);
 
   detailTitle.textContent = detailName.primary || `${s.name || detailStreamID}`;
+  const description = String(s.description || '').trim();
   detailMeta.innerHTML = [
     `<span class="tag tag-muted">${esc(s.provider)}</span>`,
     `<span class="tag tag-muted mono">${esc(s.slug)}</span>`,
-    s.recording_state === 'on' ? `<span class="tag tag-ok">recording on</span>` : `<span class="tag tag-muted">recording off</span>`,
-    s.capture_type ? `<span class="tag tag-muted">${esc(s.capture_type)}</span>` : '',
-    s.capture_family ? `<span class="tag tag-muted">${esc(formatCaptureFamilyLabel(s.capture_family))}</span>` : '',
-    formatStreamCadenceLabel(s) ? `<span class="tag tag-muted">${esc(formatStreamCadenceLabel(s))}</span>` : '',
-    s.execution_class ? `<span class="tag tag-muted">${esc(s.execution_class)}</span>` : '',
+    renderLocationHierarchy(s),
+    description ? `<div class="muted fs11" style="margin-top:6px;">${esc(description)}</div>` : '',
   ].filter(Boolean).join('');
 
   syncDetailMutationUI(s);
 
-  const latestFrame = recentFrames.length ? recentFrames[0] : null;
-  if (!captureMeta.clipNative) ensureDetailExportWindow(latestFrame);
-  if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = captureMeta.clipNative ? 'Latest Clips' : 'Latest Frames';
-  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = captureMeta.clipNative ? 'Auto-refreshes every few seconds while this page is open. Select any clip to preview it inline or open it in a new tab.' : 'Auto-refreshes every few seconds while this page is open.';
-  if (detailExportBlock) detailExportBlock.style.display = captureMeta.clipNative ? 'none' : '';
-  if (detailExportTitle) detailExportTitle.textContent = 'Export Frames';
-  if (detailExportSubtitle) detailExportSubtitle.textContent = 'Download a manifest for any time window, or prepare a bounded ZIP archive.';
-  if (detailExportStatusAllOption) detailExportStatusAllOption.textContent = 'all frame rows';
-  if (detailRawCaptureRowsTitle) detailRawCaptureRowsTitle.textContent = captureMeta.clipNative ? 'Clip Segment Rows' : 'Raw Capture Rows';
-  if (detailRawCaptureRowsSubtitle) detailRawCaptureRowsSubtitle.textContent = captureMeta.clipNative ? 'Recent persisted clip segments with status, preview action, open link, and object key.' : 'Recent persisted frame rows with status, preview, and object key.';
-  if (detailClipPreviewBlock) detailClipPreviewBlock.style.display = captureMeta.clipNative ? '' : 'none';
-  if (detailFramesReload) detailFramesReload.textContent = captureMeta.clipNative ? 'Reload clips' : 'Reload captures';
-  if (framesCapturedHeader) framesCapturedHeader.textContent = captureMeta.clipNative ? 'Window' : 'Captured';
-  if (framesRawHeader) framesRawHeader.textContent = captureMeta.clipNative ? 'Clip' : 'Raw';
-  if (detailCoverageSubtitle) detailCoverageSubtitle.textContent = 'Historical clip coverage, day-level heatmap, and sampled clip history.';
-  if (detailCoverageSamplesSubtitle) detailCoverageSamplesSubtitle.textContent = 'Representative clip samples across full capture history, using saved thumbnails when available.';
-  if (detailTimelineSubtitle) detailTimelineSubtitle.textContent = captureMeta.clipNative ? 'Timeline is still frame-native; new clip-native live video will appear here after extraction is wired.' : 'UTC minute timeline for recorded frames, inferenced frames, and person detections.';
-  if (detailExportManifest) detailExportManifest.disabled = captureMeta.clipNative;
-  if (detailExportZip) detailExportZip.disabled = captureMeta.clipNative;
-  if (detailExportPreset1h) detailExportPreset1h.disabled = captureMeta.clipNative;
-  if (detailExportPreset24h) detailExportPreset24h.disabled = captureMeta.clipNative;
-  if (detailExportPreset7d) detailExportPreset7d.disabled = captureMeta.clipNative;
-  if (detailExportResult) {
-    detailExportResult.textContent = captureMeta.clipNative
-      ? 'Frame export is disabled for clip-native streams until the extraction pipeline lands.'
-      : 'ZIP export currently supports up to 5000 frames or 2 GiB per request.';
-  }
+  const latestFrame = payload.latest_frame || null;
+  if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = 'Latest Frames';
+  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = 'Auto-refreshes every few seconds while this page is open.';
   renderLatestCard(
     latestRawCard,
-    recordingPayload,
+    payload,
     latestFrame,
     latestFrame
   );
-  if (captureMeta.clipNative && latestFrame && latestFrame.download_url) {
-    updateDetailClipPreview(latestFrame.download_url, captureWindowLabel(latestFrame), latestFrame.object_key || '-');
-  } else {
-    updateDetailClipPreview('', '', '');
-  }
-  renderDetailRecordingHero(recordingPayload, recentFrames);
-  renderDetailCurrentPath(recordingPayload);
-  renderDetailCurrentWorker(recordingPayload);
-  renderDetailCaptureWorkers(recordingPayload.capture_workers || []);
-  renderDetailLiveFramesGrid(recentFrames);
-  detailRecentFramesData = recentFrames;
-  setDetailWorkloadStatus(`updated ${formatDateTimeShort(new Date())}`, 'ok');
 
-  if (!detailTimelineDay) {
-    detailTimelineDay = toUTCDateKey(captureTimestampValue(latestFrame) || new Date());
-  }
-  timelineDayInput.value = detailTimelineDay;
-  setDetailHealthHoursWindow(detailHealthHoursWindow, { syncURL: false });
-  if (detailHealthSubtitle instanceof HTMLElement) {
-    detailHealthSubtitle.textContent = 'Hourly loss rate and explicit error rows over the selected UTC window. Loss is missing expected captures; errors are explicit capture rows with status error.';
-  }
-  if (detailMainView === 'details') {
-    if (detailView === 'coverage') {
-      if (!quiet) void loadDetailCoverage().catch((err) => setCoverageStatus(String(err), 'err'));
-    } else if (detailView === 'timeline') {
-      void loadDetailTimeline().catch((err) => setTimelineStatus(String(err), 'err'));
-    } else if (detailView === 'health') {
-      void loadDetailHealth().catch((err) => setHealthStatus(String(err), 'err'));
-    } else if (detailView === 'frames') {
-      void loadDetailFrames({ quiet }).catch((err) => {
-        framesStatusText.className = 'status-text err';
-        framesStatusText.textContent = String(err);
-      });
-      if (!quiet) startDetailLivePolling();
-    } else {
-      stopDetailLivePolling();
-    }
-  } else if (detailMainView !== 'clips') {
-    stopDetailLivePolling();
-  }
+  void loadDetailLiveFrames({ quiet }).catch((err) => {
+    if (detailLiveFramesStatus) detailLiveFramesStatus.textContent = String(err);
+  });
+  if (!quiet) startDetailLivePolling();
 }
 
 // ─── Stream table actions ────────────────────────────────────────────────────
@@ -8655,25 +5850,6 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
       await loadRecStreams();
     }
     await loadKnownStreamTagsSafe('all');
-    return;
-  }
-
-  if (action === 'recording-enable' || action === 'recording-disable') {
-    const nextState = action === 'recording-enable' ? 'on' : 'off';
-    if (nextState === 'on' && !supportsClipRecording(stream)) {
-      throw new Error('this stream is not startable in the clip-native recording path');
-    }
-    await setStreamRecordingState(id, nextState);
-    await Promise.all([
-      loadOverview(),
-      loadStreamsForActiveView(),
-      loadRecStreams(),
-      loadServersAssignments(),
-      loadRecordingCapacity(),
-    ]);
-    if (detailData && detailData.stream && Number(detailData.stream.id || 0) === id) {
-      await loadDetail();
-    }
     return;
   }
 
@@ -8735,19 +5911,7 @@ if (serversAssignmentsRows) {
     if (!Number.isFinite(streamID) || streamID <= 0) return;
     void (async () => {
       try {
-        const confirmToken = `unassign:${streamID}`;
-        const entered = window.prompt(`Type ${confirmToken} to remove recording assignment for stream ${streamID}.`, '');
-        if (String(entered || '').trim() !== confirmToken) {
-          throw new Error(`unassign cancelled (confirmation must equal ${confirmToken})`);
-        }
-        setServersAssignmentsStatus('updating...');
-        await fetchJSON(`/api/v1/recording/streams/${streamID}/unassign`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ confirm: confirmToken, reason: 'dashboard servers unassign' }),
-        });
-        await Promise.all([loadServers(), loadServersAssignments(), loadRecordingCapacity(), loadOverview(), loadRecStreams()]);
-        setServersAssignmentsStatus('updated', 'ok');
+        throw new Error('recording assignment has moved to the recorder; use /recordings');
       } catch (err) {
         setServersAssignmentsStatus(formatAccountAuthError(err, 'recording changes require a signed-in account'), 'err');
       }
@@ -8860,78 +6024,6 @@ if (infTable) {
   });
 }
 
-if (detailInferenceTable) {
-  detailInferenceTable.addEventListener('click', (e) => {
-    const sortKey = sortHeaderKeyFromEvent(e);
-    if (!sortKey) return;
-    const currentBy = detailSortBy.value || 'created_at';
-    const currentDir = detailSortDir.value || 'desc';
-    detailSortBy.value = sortKey;
-    detailSortDir.value = nextSortDir(currentBy, currentDir, sortKey, 'desc');
-    void loadDetail().catch((err) => setDetailStatus(String(err), 'err'));
-  });
-}
-
-if (framesTable) {
-  framesTable.addEventListener('click', (e) => {
-    const sortKey = sortHeaderKeyFromEvent(e);
-    if (!sortKey) return;
-    framesSortDir = nextSortDir(framesSortBy, framesSortDir, sortKey, 'desc');
-    framesSortBy = sortKey;
-    void loadDetailFrames().catch((err) => {
-      framesStatusText.className = 'status-text err';
-      framesStatusText.textContent = String(err);
-    });
-  });
-}
-
-if (detectionTable) {
-  detectionTable.addEventListener('click', (e) => {
-    const sortKey = sortHeaderKeyFromEvent(e);
-    if (!sortKey) return;
-    detectionSortDir = nextSortDir(detectionSortBy, detectionSortDir, sortKey, 'desc');
-    detectionSortBy = sortKey;
-    renderDetections(detailDetectionsData, detailLatestDetectionResult);
-  });
-}
-
-detailTagEditor.addEventListener('click', async (e) => {
-  const btn = e.target instanceof HTMLElement && e.target.closest('[data-action]');
-  if (!btn || !(btn instanceof HTMLElement)) return;
-  const action = String(btn.getAttribute('data-action') || '').trim();
-  const id = Number(btn.getAttribute('data-id'));
-  if (!action || !Number.isFinite(id) || id <= 0) return;
-  try {
-    setDetailStatus('updating tags...');
-    await handleStreamTableAction(action, id, 'detail', btn);
-    await loadDetail();
-    setDetailStatus('tags updated', 'ok');
-  } catch (err) {
-    setDetailStatus(String(err), 'err');
-  }
-});
-
-detailTagEditor.addEventListener('keydown', async (e) => {
-  if (!(e.target instanceof HTMLInputElement)) return;
-  if (e.target.getAttribute('data-tag-input') !== '1') return;
-  if (e.key !== 'Enter') return;
-  e.preventDefault();
-  const editor = e.target.closest('[data-tag-editor]');
-  if (!(editor instanceof HTMLElement)) return;
-  const id = Number(editor.getAttribute('data-id'));
-  if (!Number.isFinite(id) || id <= 0) return;
-  const raw = e.target.value.trim();
-  if (!raw) return;
-  try {
-    setDetailStatus('updating tags...');
-    await handleStreamTableAction('tag-add', id, 'detail', e.target, raw);
-    await loadDetail();
-    setDetailStatus('tags updated', 'ok');
-  } catch (err) {
-    setDetailStatus(String(err), 'err');
-  }
-});
-
 // Detail action bar
 detailActions.addEventListener('click', async (e) => {
   const btn = e.target instanceof HTMLElement && e.target.closest('[data-detail-action]');
@@ -8942,20 +6034,6 @@ detailActions.addEventListener('click', async (e) => {
   try {
     const localOnlyAction = action === 'show-stream-json' || action === 'copy-source-url';
     if (!localOnlyAction) setDetailStatus('updating...');
-    if (action === 'recording-enable' || action === 'recording-disable') {
-      const nextState = action === 'recording-enable' ? 'on' : 'off';
-      await setStreamRecordingState(id, nextState);
-      await loadDetail();
-      void Promise.allSettled([
-        loadOverview(),
-        loadStreamsForActiveView(),
-        loadRecStreams(),
-        loadServersAssignments(),
-        loadRecordingCapacity(),
-      ]);
-      setDetailStatus('updated', 'ok');
-      return;
-    }
     await handleStreamTableAction(action, id, 'detail', btn);
     if (localOnlyAction) return;
     await loadDetail();
@@ -9114,16 +6192,6 @@ if (opsViewServers) {
   });
 }
 
-if (tabRecording) {
-  tabRecording.addEventListener('click', () => {
-    if (mainTab === 'recording') return;
-    mainTab = 'recording';
-    history.replaceState(null, '', '/recording');
-    showPanel('recording');
-    startRecordingTabLoad();
-  });
-}
-
 // Inference scope sub-filters
 infSubRecorded.addEventListener('click', async () => {
   inferenceScope = 'recorded';
@@ -9212,11 +6280,6 @@ if (detailLiveFramesGrid) {
 }
 if (latestRawCard) {
   latestRawCard.addEventListener('click', (e) => {
-    if (handleClipPreviewClick(e)) e.preventDefault();
-  });
-}
-if (framesTable) {
-  framesTable.addEventListener('click', (e) => {
     if (handleClipPreviewClick(e)) e.preventDefault();
   });
 }
@@ -9399,258 +6462,6 @@ infApply.addEventListener('click', async () => {
   });
 });
 
-// Detail controls
-pipelineFilter.addEventListener('change', async () => {
-  try { await loadDetailInference(); }
-  catch (err) { setDetailStatus(String(err), 'err'); }
-});
-detailReload.addEventListener('click', async () => {
-  try { await loadDetailInference(); }
-  catch (err) { setDetailStatus(String(err), 'err'); }
-});
-detailWorkloadReload.addEventListener('click', async () => {
-  try { await loadDetail(); }
-  catch (err) { setDetailWorkloadStatus(String(err), 'err'); }
-});
-if (detailMainTabDetails) detailMainTabDetails.addEventListener('click', async (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('details');
-  try { await loadDetail(); }
-  catch (err) { setDetailStatus(String(err), 'err'); }
-});
-if (detailMainTabClips) detailMainTabClips.addEventListener('click', (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('clips');
-});
-if (detailMainTabSettings) detailMainTabSettings.addEventListener('click', (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('settings');
-});
-detailTabCoverage.addEventListener('click', async (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('details', { syncURL: false });
-  setDetailSubView('coverage');
-  try { await loadDetailCoverage(); }
-  catch (err) { setCoverageStatus(String(err), 'err'); }
-});
-detailTabTimeline.addEventListener('click', async (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('details', { syncURL: false });
-  setDetailSubView('timeline');
-  try { await loadDetailTimeline(); }
-  catch (err) { setTimelineStatus(String(err), 'err'); }
-});
-detailTabHealth.addEventListener('click', async (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('details', { syncURL: false });
-  setDetailSubView('health');
-  try { await loadDetailHealth(); }
-  catch (err) { setHealthStatus(String(err), 'err'); }
-});
-detailTabFrames.addEventListener('click', async (e) => {
-  if (shouldBypassClientRouting(e)) return;
-  e.preventDefault();
-  setDetailMainView('details', { syncURL: false });
-  setDetailSubView('frames');
-  try {
-    await Promise.all([
-      loadDetailLiveFrames(),
-      loadDetailFrames(),
-    ]);
-  }
-  catch (err) { framesStatusText.className = 'status-text err'; framesStatusText.textContent = String(err); }
-});
-detailFramesReload.addEventListener('click', async () => {
-  try { await loadDetailFrames(); }
-  catch (err) { framesStatusText.className = 'status-text err'; framesStatusText.textContent = String(err); }
-});
-if (detailHealthReload instanceof HTMLElement) detailHealthReload.addEventListener('click', async () => {
-  try { await loadDetailHealth(); }
-  catch (err) { setHealthStatus(String(err), 'err'); }
-});
-if (detailHealthHours instanceof HTMLSelectElement) detailHealthHours.addEventListener('change', async () => {
-  setDetailHealthHoursWindow(detailHealthHours.value, { syncURL: true });
-  if (detailMainView === 'details' && detailView === 'health') {
-    try { await loadDetailHealth(); }
-    catch (err) { setHealthStatus(String(err), 'err'); }
-  }
-});
-if (detailClipModeRangeBtn) detailClipModeRangeBtn.addEventListener('click', () => {
-  setDetailClipViewMode(CLIP_VIEW_MODE.RANGE);
-  void (async () => {
-    await ensureDefaultClipRange();
-    void loadClipAvailability(String(detailClipRangeDay && detailClipRangeDay.value || '')).catch((err) => {
-      if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
-    });
-    await refreshDetailClips();
-  })().catch((err) => {
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
-  });
-});
-if (detailClipModeLinearBtn) detailClipModeLinearBtn.addEventListener('click', () => {
-  setDetailClipViewMode(CLIP_VIEW_MODE.LINEAR);
-  void refreshDetailClips();
-});
-if (detailClipRangeDay) detailClipRangeDay.addEventListener('change', () => {
-  updateDayZipButtonState();
-  void loadClipAvailability(String(detailClipRangeDay.value || '')).catch((err) => {
-    if (detailClipsStatus instanceof HTMLElement) detailClipsStatus.textContent = String(err);
-  });
-});
-if (detailClipRangeStart) detailClipRangeStart.addEventListener('change', () => {
-  syncClipRangeEndLimit();
-  renderClipHourBuckets(detailClipAvailability && Array.isArray(detailClipAvailability.hour_buckets) ? detailClipAvailability.hour_buckets : []);
-  renderClipRangeSummary();
-  syncDetailURL({ replace: true });
-});
-if (detailClipRangeEnd) detailClipRangeEnd.addEventListener('change', () => {
-  renderClipRangeSummary();
-  syncDetailURL({ replace: true });
-});
-if (detailClipHourBuckets) detailClipHourBuckets.addEventListener('click', (e) => {
-  const btn = e.target instanceof HTMLElement ? e.target.closest('[data-hour]') : null;
-  if (!(btn instanceof HTMLElement)) return;
-  const hour = Number(btn.getAttribute('data-hour'));
-  if (!Number.isFinite(hour)) return;
-  const buckets = detailClipAvailability && Array.isArray(detailClipAvailability.hour_buckets) ? detailClipAvailability.hour_buckets : [];
-  const bucket = buckets.find((item) => {
-    const date = new Date(item && item.hour_start || '');
-    return Number.isFinite(date.getTime()) && date.getUTCHours() === Math.floor(hour);
-  });
-  if (bucket) setClipRangeFromBucket(bucket);
-  renderClipHourBuckets(detailClipAvailability && Array.isArray(detailClipAvailability.hour_buckets) ? detailClipAvailability.hour_buckets : []);
-  renderClipRangeSummary();
-  syncDetailURL({ replace: true });
-});
-if (detailOpenClipRangeBtn) detailOpenClipRangeBtn.addEventListener('click', () => {
-  setDetailClipViewMode(CLIP_VIEW_MODE.RANGE);
-  void refreshDetailClips();
-});
-if (detailDownloadDayZipBtn) detailDownloadDayZipBtn.addEventListener('click', () => { void prepareDayZip(); });
-if (detailClipsReloadBtn) detailClipsReloadBtn.addEventListener('click', () => { void refreshDetailClips(); });
-if (detailClipsPrevBtn) detailClipsPrevBtn.addEventListener('click', () => {
-  detailClipOffset = Math.max(0, detailClipOffset - detailClipLimit);
-  void refreshDetailClips();
-});
-if (detailClipsNextBtn) detailClipsNextBtn.addEventListener('click', () => {
-  detailClipOffset += detailClipLimit;
-  void refreshDetailClips();
-});
-if (detailSelectAllClipsBtn) detailSelectAllClipsBtn.addEventListener('click', () => {
-  if (!(detailClipsRows instanceof HTMLElement)) return;
-  detailClipsRows.querySelectorAll('input[data-clip-id]').forEach((input) => { input.checked = true; });
-  updateDetailClipSelectionState();
-});
-if (detailClipSelectPageCheckbox) detailClipSelectPageCheckbox.addEventListener('change', () => {
-  const checked = !!detailClipSelectPageCheckbox.checked;
-  if (!(detailClipsRows instanceof HTMLElement)) return;
-  detailClipsRows.querySelectorAll('input[data-clip-id]').forEach((input) => { input.checked = checked; });
-  updateDetailClipSelectionState();
-});
-if (detailDownloadSelectedBtn) detailDownloadSelectedBtn.addEventListener('click', () => { void prepareDetailClipDownloads(); });
-if (detailExportPreset1h) detailExportPreset1h.addEventListener('click', () => { setDetailExportWindow(1); });
-if (detailExportPreset24h) detailExportPreset24h.addEventListener('click', () => { setDetailExportWindow(24); });
-if (detailExportPreset7d) detailExportPreset7d.addEventListener('click', () => { setDetailExportWindow(24 * 7); });
-if (detailExportManifest) detailExportManifest.addEventListener('click', () => {
-  if (!detailStreamID) return;
-  try {
-    const qs = detailExportQueryString();
-    setDetailExportStatus('opening manifest...');
-    window.open(`/api/v1/streams/${detailStreamID}/frame-manifest?${qs}`, '_blank', 'noopener');
-    setDetailExportStatus('manifest opened', 'ok');
-  } catch (err) {
-    setDetailExportStatus(String(err), 'err');
-  }
-});
-if (detailExportZip) detailExportZip.addEventListener('click', () => {
-  if (!detailStreamID) return;
-  void (async () => {
-    try {
-      const capturedFrom = toISO(detailExportFrom && detailExportFrom.value);
-      const capturedTo = toISO(detailExportTo && detailExportTo.value);
-      const captureStatus = String(detailExportStatusFilter && detailExportStatusFilter.value || 'success');
-      setDetailExportStatus('queueing zip...');
-      detailExportResult.textContent = 'Preparing archive...';
-      const payload = await fetchJSON(`/api/v1/streams/${detailStreamID}/frame-exports`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ captured_from: capturedFrom, captured_to: capturedTo, capture_status: captureStatus }),
-      });
-      const jobID = String(payload.id || '').trim();
-      if (!jobID) throw new Error('missing export job id');
-      await pollDetailFrameExportJob(jobID);
-    } catch (err) {
-      setDetailExportStatus(String(err), 'err');
-      detailExportResult.textContent = String(err);
-    }
-  })();
-});
-framesStatusFilter.addEventListener('change', () => { renderFramesRows(detailFramesData); });
-timelinePipelineFilter.addEventListener('change', async () => {
-  detailTimelinePipeline = String(timelinePipelineFilter.value || '').trim();
-  try { await loadDetailTimeline(); }
-  catch (err) { setTimelineStatus(String(err), 'err'); }
-});
-timelineDayInput.addEventListener('change', async () => {
-  detailTimelineDay = String(timelineDayInput.value || '').trim();
-  try { await loadDetailTimeline(); }
-  catch (err) { setTimelineStatus(String(err), 'err'); }
-});
-timelinePrevDay.addEventListener('click', async () => {
-  const base = String(timelineDayInput.value || detailTimelineDay || '').trim() || toUTCDateKey(new Date());
-  detailTimelineDay = shiftUTCDateKey(base, -1) || base;
-  timelineDayInput.value = detailTimelineDay;
-  try { await loadDetailTimeline(); }
-  catch (err) { setTimelineStatus(String(err), 'err'); }
-});
-timelineNextDay.addEventListener('click', async () => {
-  const base = String(timelineDayInput.value || detailTimelineDay || '').trim() || toUTCDateKey(new Date());
-  detailTimelineDay = shiftUTCDateKey(base, 1) || base;
-  timelineDayInput.value = detailTimelineDay;
-  try { await loadDetailTimeline(); }
-  catch (err) { setTimelineStatus(String(err), 'err'); }
-});
-detailTimelineReload.addEventListener('click', async () => {
-  try { await loadDetailTimeline(); }
-  catch (err) { setTimelineStatus(String(err), 'err'); }
-});
-detailCoverageReload.addEventListener('click', async () => {
-  try { await loadDetailCoverage(); }
-  catch (err) { setCoverageStatus(String(err), 'err'); }
-});
-coverageDays.addEventListener('change', async () => {
-  if (detailView !== 'coverage') return;
-  try { await loadDetailCoverage(); }
-  catch (err) { setCoverageStatus(String(err), 'err'); }
-});
-coverageSampleCount.addEventListener('change', async () => {
-  if (detailView !== 'coverage') return;
-  try { await loadDetailCoverage(); }
-  catch (err) { setCoverageStatus(String(err), 'err'); }
-});
-if (detailPipelineRows) detailPipelineRows.addEventListener('click', (e) => {
-  const btn = e.target instanceof HTMLElement && e.target.closest('[data-detail-action="pipeline-toggle"]');
-  if (!(btn instanceof HTMLElement) || !detailStreamID) return;
-  const pipelineID = String(btn.getAttribute('data-pipeline-id') || '').trim();
-  if (!pipelineID) return;
-  const enabled = btn.getAttribute('data-enabled') === '1';
-  setDetailWorkloadStatus('updating...');
-  void (async () => {
-    await fetchJSON(`/api/v1/streams/${detailStreamID}/pipelines/${encodeURIComponent(pipelineID)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: !enabled, updated_by: 'dashboard' }),
-    });
-    await Promise.all([loadDetailWorkload(), loadOverview()]);
-  })().catch((err) => setDetailWorkloadStatus(String(err), 'err'));
-});
-
 // Table image modal
 document.addEventListener('click', (e) => {
   const target = e.target instanceof HTMLElement ? e.target : null;
@@ -9810,7 +6621,6 @@ window.addEventListener('popstate', () => {
 
 (async function init() {
   try {
-    detailHealthHoursWindow = normalizeHealthHoursWindow(localStorage.getItem('detailHealthHours') || '72');
     applyKoreaPageMode();
     void resolveSessionState();
     await applyStreamsRouteState();

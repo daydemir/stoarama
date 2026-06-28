@@ -208,6 +208,15 @@
     .card-actions { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
     .card-actions button { width: auto; min-width: 96px; min-height: 36px; }
     .card-err { margin-top: 10px; color: var(--err); font-size: 12px; line-height: 1.45; }
+    .card-sub { margin-top: 3px; font-size: 13px; color: var(--muted); }
+    .group-title { margin: 18px 0 10px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .clip-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+    .clip-summary { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+    .clip-summary b { color: var(--text); }
+    .clip-list { display: grid; gap: 6px; }
+    .clip-row { display: flex; flex-wrap: wrap; gap: 4px 16px; font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 6px 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+    .clip-row .clip-when { color: var(--text); }
+    .clip-actions-note { margin-top: 12px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 10px; font-size: 12px; color: var(--muted); line-height: 1.45; }
     /* Segmented control */
     .seg { display: flex; flex-wrap: wrap; gap: 6px; }
     .seg button {
@@ -327,7 +336,18 @@
           <button id="composerClose" class="secondary" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Cancel</button>
         </div>
 
-        <div class="field">
+        <!-- Catalog-stream lock: shown when the composer is opened from a catalog
+             stream (?stream_id=). The source is fixed to the catalog reference and
+             the paste field is hidden; the server derives stream_url from stream_id. -->
+        <div id="catalogStreamBlock" class="field hidden">
+          <label>Catalog stream</label>
+          <div id="catalogStreamName" class="preview"></div>
+          <div id="catalogStreamLoc" class="preview muted"></div>
+          <img id="catalogFramePreview" class="video-preview hidden" alt="recent frame" />
+        </div>
+        <input type="hidden" id="recStreamID" value="" />
+
+        <div id="urlField" class="field">
           <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
           <input id="recURL" type="url" placeholder="https://example.com/live/stream.m3u8" />
           <div id="streamStatus" class="status" style="margin-top:8px;"></div>
@@ -506,6 +526,12 @@
       newRecBtn: document.getElementById('newRecBtn'),
       composer: document.getElementById('composer'),
       composerClose: document.getElementById('composerClose'),
+      catalogStreamBlock: document.getElementById('catalogStreamBlock'),
+      catalogStreamName: document.getElementById('catalogStreamName'),
+      catalogStreamLoc: document.getElementById('catalogStreamLoc'),
+      catalogFramePreview: document.getElementById('catalogFramePreview'),
+      recStreamID: document.getElementById('recStreamID'),
+      urlField: document.getElementById('urlField'),
       recURL: document.getElementById('recURL'),
       streamStatus: document.getElementById('streamStatus'),
       streamPreview: document.getElementById('streamPreview'),
@@ -586,6 +612,9 @@
       provisioningManaged: false,
       destinationsLoaded: false,
       starting: false,
+      // When set, the composer is locked to this catalog stream: the paste field is
+      // hidden and create posts stream_id (server derives stream_url).
+      catalogStreamId: 0,
       // Bucket connection gate (change 1): 'idle' | 'checking' | 'connected' | 'error'.
       bucketState: 'idle',
       // Stream probe gate (change 2): the authoritative server verdict. ok===true
@@ -1209,11 +1238,13 @@
     // step, so it is enabled as soon as the capture config is valid.
     function refreshStartEnabled() {
       const url = String(els.recURL.value || '').trim();
+      const catalog = state.catalogStreamId > 0;
       const schedOK = refreshScheduleUIQuiet();
       const dest = selectedDestId();
       const bucketOK = state.bucketState === 'connected' && dest > 0;
       const streamOK = state.streamProbe.ok === true;
-      const ready = !state.starting && !!url && schedOK && bucketOK && streamOK && windowValid();
+      const sourceOK = catalog || !!url;
+      const ready = !state.starting && sourceOK && schedOK && bucketOK && streamOK && windowValid();
       els.startBtn.disabled = !ready;
     }
 
@@ -1309,6 +1340,76 @@
       return { cls: 'paused', text: escapeHTML(status) };
     }
 
+    // Ongoing = not yet finished: active/paused with no end_at, or an end_at still
+    // in the future. Completed = the window has elapsed (end_at in the past, or the
+    // server flipped status to 'completed').
+    function isCompleted(rec) {
+      const status = String(rec.status || '');
+      if (status === 'completed') return true;
+      const end = rec.end_at ? new Date(rec.end_at).getTime() : 0;
+      return Number.isFinite(end) && end > 0 && end <= Date.now();
+    }
+
+    function cardHTML(rec) {
+      const id = Number(rec.id);
+      const st = statusLine(rec);
+      const status = String(rec.status || '');
+      const clip = Number(rec.clip_duration_sec || 0);
+      const last = relativeTime(rec.last_clip_at);
+      const health = String(rec.health || 'idle');
+      const metaParts = [];
+      metaParts.push(`<span class="meta-strong">${escapeHTML(scheduleLabel(rec))}</span>`);
+      metaParts.push(`${clip}s clips`);
+      if (last) {
+        let word = '';
+        if (status === 'active' && health !== 'idle') word = ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>`;
+        metaParts.push(`Last clip: ${escapeHTML(last)}${word}`);
+      } else {
+        metaParts.push('No clips yet');
+      }
+
+      let actions = '';
+      if (status === 'active') {
+        actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
+          + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+      } else if (status === 'paused') {
+        actions = `<button type="button" class="secondary" data-resume="${id}">Resume</button>`
+          + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+      } else {
+        actions = `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+      }
+      actions += `<button type="button" class="secondary" data-clips="${id}">View clips</button>`;
+
+      const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
+        ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
+
+      // Linked to a catalog stream: title = stream name, subtitle = location.
+      // Otherwise the source URL is the subtitle, as before.
+      const streamName = String(rec.stream_name || '').trim();
+      let headHTML;
+      if (streamName) {
+        const loc = String(rec.stream_location || '').trim();
+        headHTML = `<div class="card-name">${escapeHTML(streamName)}</div>`
+          + (loc ? `<div class="card-sub">${escapeHTML(loc)}</div>` : '')
+          + `<div class="card-sub">${escapeHTML(String(rec.name || ''))}</div>`;
+      } else {
+        headHTML = `<div class="card-name">${escapeHTML(String(rec.name || ''))}</div>`
+          + `<div class="card-url">${escapeHTML(String(rec.stream_url || ''))}</div>`;
+      }
+
+      return `
+        <div class="card" data-card="${id}">
+          <div class="card-head">
+            <div>${headHTML}</div>
+            <div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>
+          </div>
+          <div class="card-meta">${metaParts.join('')}</div>
+          ${errLine}
+          <div class="card-actions">${actions}</div>
+          <div class="clip-detail hidden" data-clipdetail="${id}"></div>
+        </div>`;
+    }
+
     function renderCards() {
       const items = state.recordings;
       const empty = items.length === 0;
@@ -1320,52 +1421,18 @@
         openComposer(true);
         return;
       }
-      els.cards.innerHTML = items.map((rec) => {
-        const id = Number(rec.id);
-        const st = statusLine(rec);
-        const status = String(rec.status || '');
-        const clip = Number(rec.clip_duration_sec || 0);
-        const last = relativeTime(rec.last_clip_at);
-        const health = String(rec.health || 'idle');
-        const metaParts = [];
-        metaParts.push(`<span class="meta-strong">${escapeHTML(scheduleLabel(rec))}</span>`);
-        metaParts.push(`${clip}s clips`);
-        if (last) {
-          let word = '';
-          if (status === 'active' && health !== 'idle') word = ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>`;
-          metaParts.push(`Last clip: ${escapeHTML(last)}${word}`);
-        } else {
-          metaParts.push('No clips yet');
-        }
-
-        let actions = '';
-        if (status === 'active') {
-          actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
-            + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
-        } else if (status === 'paused') {
-          actions = `<button type="button" class="secondary" data-resume="${id}">Resume</button>`
-            + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
-        } else {
-          actions = `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
-        }
-
-        const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
-          ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
-
-        return `
-          <div class="card">
-            <div class="card-head">
-              <div>
-                <div class="card-name">${escapeHTML(String(rec.name || ''))}</div>
-                <div class="card-url">${escapeHTML(String(rec.stream_url || ''))}</div>
-              </div>
-              <div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>
-            </div>
-            <div class="card-meta">${metaParts.join('')}</div>
-            ${errLine}
-            <div class="card-actions">${actions}</div>
-          </div>`;
-      }).join('');
+      const ongoing = items.filter((rec) => !isCompleted(rec));
+      const completed = items.filter((rec) => isCompleted(rec));
+      let html = '';
+      if (ongoing.length) {
+        html += `<div class="group-title">Ongoing</div>`;
+        html += ongoing.map(cardHTML).join('');
+      }
+      if (completed.length) {
+        html += `<div class="group-title">Completed</div>`;
+        html += completed.map(cardHTML).join('');
+      }
+      els.cards.innerHTML = html;
       wireCardActions();
     }
 
@@ -1376,6 +1443,84 @@
         b.addEventListener('click', () => mutateRecording(b.getAttribute('data-resume'), 'resume')));
       els.cards.querySelectorAll('button[data-delete]').forEach((b) =>
         b.addEventListener('click', () => deleteRecording(b)));
+      els.cards.querySelectorAll('button[data-clips]').forEach((b) =>
+        b.addEventListener('click', () => toggleClipDetail(b.getAttribute('data-clips'))));
+    }
+
+    // ---- Clip detail (per-recording clip periods) ----
+
+    function formatBytes(n) {
+      const b = Number(n || 0);
+      if (b < 1024) return `${b} B`;
+      if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+      if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+      return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    }
+
+    function formatDuration(ms) {
+      const s = Math.round(Number(ms || 0) / 1000);
+      if (s <= 0) return '0s';
+      if (s < 60) return `${s}s`;
+      const m = Math.floor(s / 60);
+      const rs = s % 60;
+      return rs ? `${m}m ${rs}s` : `${m}m`;
+    }
+
+    function clipClockRange(startISO, endISO) {
+      const fmt = (v) => {
+        const d = new Date(v);
+        return Number.isFinite(d.getTime()) ? d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+      };
+      const a = fmt(startISO);
+      const b = new Date(endISO);
+      const bt = Number.isFinite(b.getTime()) ? b.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+      return bt ? `${a} – ${bt}` : a;
+    }
+
+    // Expand/collapse a card's clip-periods panel, loading from the new endpoint on
+    // first open.
+    async function toggleClipDetail(idRaw) {
+      const id = String(idRaw || '').trim();
+      const panel = els.cards.querySelector(`[data-clipdetail="${id}"]`);
+      if (!panel) return;
+      if (!panel.classList.contains('hidden')) {
+        panel.classList.add('hidden');
+        return;
+      }
+      panel.classList.remove('hidden');
+      if (panel.getAttribute('data-loaded') === '1') return;
+      panel.innerHTML = `<div class="clip-summary">Loading clips...</div>`;
+      try {
+        const payload = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}/clips`);
+        renderClipDetail(panel, payload);
+        panel.setAttribute('data-loaded', '1');
+      } catch (err) {
+        panel.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+      }
+    }
+
+    function renderClipDetail(panel, payload) {
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      const total = Number(payload.total || items.length);
+      if (items.length === 0) {
+        panel.innerHTML = `<div class="clip-summary">No clips captured yet.</div>`;
+        return;
+      }
+      // items are fire_at DESC; first→last spans newest to oldest in the list.
+      const newest = items[0];
+      const oldest = items[items.length - 1];
+      const firstWhen = new Date(oldest.fire_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      const lastWhen = new Date(newest.fire_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      const shownNote = total > items.length ? ` (showing latest ${items.length})` : '';
+      const summary = `<div class="clip-summary"><b>${total}</b> clip${total === 1 ? '' : 's'}${shownNote} &middot; ${escapeHTML(firstWhen)} → ${escapeHTML(lastWhen)}</div>`;
+      const rows = items.map((c) => `
+        <div class="clip-row">
+          <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
+          <span>${escapeHTML(formatDuration(c.duration_ms))}</span>
+          <span>${escapeHTML(formatBytes(c.size_bytes))}</span>
+        </div>`).join('');
+      const placeholder = `<div class="clip-actions-note">Per-clip Download / Send to S3 / Delete actions are coming in a later phase.</div>`;
+      panel.innerHTML = summary + `<div class="clip-list">${rows}</div>` + placeholder;
     }
 
     async function mutateRecording(id, action) {
@@ -1431,12 +1576,94 @@
       refreshStartEnabled();
     }
 
+    // Trim a stream name to a reasonable composer field length.
+    function trimName(v, max) {
+      const s = String(v == null ? '' : v).trim();
+      const n = Number(max || 80);
+      return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+    }
+
+    // Lock the composer to a catalog stream: hide the URL paste field, show a
+    // read-only "Catalog stream: <name>" block + a recent frame, and treat the
+    // stream half of the Start gate as satisfied (the server validates on create).
+    function applyCatalogLock(stream, frameURL) {
+      const id = Number(stream.id || 0);
+      state.catalogStreamId = id;
+      els.recStreamID.value = String(id);
+      els.urlField.classList.add('hidden');
+      els.catalogStreamBlock.classList.remove('hidden');
+      els.catalogStreamName.textContent = `Catalog stream: ${String(stream.name || ('#' + id))}`;
+      const loc = String(stream.location_text || '').trim();
+      els.catalogStreamLoc.textContent = loc;
+      els.catalogStreamLoc.classList.toggle('hidden', !loc);
+      if (frameURL) {
+        els.catalogFramePreview.src = frameURL;
+        els.catalogFramePreview.classList.remove('hidden');
+      } else {
+        els.catalogFramePreview.removeAttribute('src');
+        els.catalogFramePreview.classList.add('hidden');
+      }
+      // The catalog reference is the source of truth; mark the stream gate ok so
+      // Start is reachable once a bucket is connected.
+      state.streamProbe = { token: state.streamProbe.token + 1, ok: true };
+      if (!els.recName.value) els.recName.value = trimName(stream.name, 60);
+      refreshStartEnabled();
+    }
+
+    // Clear any catalog lock so the next composer open is a normal paste flow.
+    function clearCatalogLock() {
+      state.catalogStreamId = 0;
+      els.recStreamID.value = '';
+      els.urlField.classList.remove('hidden');
+      els.catalogStreamBlock.classList.add('hidden');
+      els.catalogFramePreview.removeAttribute('src');
+      els.catalogFramePreview.classList.add('hidden');
+    }
+
+    // Land prefilled from a catalog stream (?stream_id=). Fetches the public detail
+    // payload, opens + locks the composer, and shows a recent frame if available.
+    async function loadFromCatalogStream(streamId) {
+      try {
+        const detail = await fetchJSON(`/api/v1/dashboard/streams/${encodeURIComponent(streamId)}`);
+        const stream = (detail && detail.stream) || {};
+        let frameURL = (detail && detail.latest_frame && detail.latest_frame.download_url) || '';
+        if (!frameURL) {
+          try {
+            const fr = await fetchJSON(`/api/v1/frames?stream_id=${encodeURIComponent(streamId)}&limit=1`);
+            const f0 = (fr && Array.isArray(fr.items) ? fr.items[0] : null) || null;
+            frameURL = (f0 && (f0.download_url || f0.url)) || '';
+          } catch (_) { /* frame preview is best-effort */ }
+        }
+        openComposer(false);
+        applyCatalogLock(stream, frameURL);
+      } catch (err) {
+        // Could not load the catalog stream; fall back to the normal paste flow.
+        window.alert(`Could not load catalog stream: ${String(err.message || err)}`);
+      }
+    }
+
+    // Read ?stream_id= from the URL; when present, land prefilled from that catalog
+    // stream and strip the param so a reload does not re-trigger the landing.
+    async function maybeLandFromCatalogStream() {
+      const raw = String(authParams.get('stream_id') || '').trim();
+      if (!raw) return;
+      const sid = Number(raw);
+      if (!Number.isFinite(sid) || sid <= 0) return;
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.delete('stream_id');
+        window.history.replaceState({}, '', u.pathname + (u.search || '') + u.hash);
+      } catch (_) { /* ignore */ }
+      await loadFromCatalogStream(sid);
+    }
+
     function closeComposer() {
       els.composer.classList.add('hidden');
       window.clearTimeout(streamDebounce);
       teardownPreview();
       state.streamProbe = { token: state.streamProbe.token + 1, ok: false };
       setStatus(els.streamStatus, '', '');
+      clearCatalogLock();
       // Reset the window so the next open re-defaults Start to now.
       els.startAt.value = '';
       els.endAt.value = '';
@@ -1480,20 +1707,20 @@
       }
 
       const url = String(els.recURL.value || '').trim();
+      const catalogId = state.catalogStreamId > 0 ? state.catalogStreamId : 0;
       const dest = selectedDestId();
       const sched = compiledSchedule();
       const clip = selectedClipSec();
-      if (!url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
+      if (!catalogId && !url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
       if (dest <= 0) { setStatus(els.startStatus, 'Connect or select a bucket first.', 'err'); return; }
       if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
       if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
       if (!windowValid()) { setStatus(els.startStatus, 'Stop must be after Start.', 'err'); return; }
 
-      const name = String(els.recName.value || '').trim() || deriveName(url);
+      const name = String(els.recName.value || '').trim() || (catalogId ? `Stream ${catalogId}` : deriveName(url));
       const win = compiledWindow();
       const body = {
         name,
-        stream_url: url,
         storage_destination_id: dest,
         cron_expr: sched.cron,
         cron_timezone: sched.tz,
@@ -1501,6 +1728,10 @@
         start_at: win.startISO,
         end_at: win.endISO,
       };
+      // Catalog stream: send stream_id and OMIT stream_url (server derives it).
+      // Paste flow: send stream_url as before.
+      if (catalogId) body.stream_id = catalogId;
+      else body.stream_url = url;
       state.starting = true;
       els.startBtn.disabled = true;
       setStatus(els.startStatus, 'Starting...', '');
@@ -1762,6 +1993,7 @@
         await loadBilling();
         await refreshDestinations();
         await handleBillingReturn();
+        await maybeLandFromCatalogStream();
       } catch (_) {
         els.accountChip.textContent = 'Sign in';
         els.accountChip.style.cursor = 'default';

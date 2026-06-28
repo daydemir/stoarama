@@ -31,9 +31,13 @@ type recordingProbeRequest struct {
 }
 
 type recordingCreateRequest struct {
-	Name                 string     `json:"name"`
-	StreamURL            string     `json:"stream_url"`
-	StorageDestinationID int64      `json:"storage_destination_id"`
+	Name      string `json:"name"`
+	StreamURL string `json:"stream_url"`
+	// StreamID, when set, links the recording to a catalog stream. The catalog's
+	// source_url is then used as the stored stream_url (the stable reference the
+	// worker re-resolves each fire); any client-sent stream_url is ignored.
+	StreamID             *int64 `json:"stream_id"`
+	StorageDestinationID int64  `json:"storage_destination_id"`
 	CronExpr             string     `json:"cron_expr"`
 	CronTimezone         string     `json:"cron_timezone"`
 	ClipDurationSec      int        `json:"clip_duration_sec"`
@@ -59,9 +63,11 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
-			rec.created_at, sd.managed
+			rec.created_at, sd.managed,
+			rec.stream_id, st.name, st.location_text
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
+		LEFT JOIN streams st ON st.id = rec.stream_id
 		WHERE rec.account_id=$1 AND rec.status <> 'canceled'
 		ORDER BY rec.created_at DESC, rec.id DESC
 	`, principal.AccountID)
@@ -102,7 +108,33 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+	// When linked to a catalog stream, the catalog's source_url is authoritative:
+	// we store the stable catalog reference (re-resolved fresh each fire) so tokens
+	// never expire mid-schedule. Any client-sent stream_url is ignored in this case.
+	var streamIDArg any
 	streamURL := strings.TrimSpace(req.StreamURL)
+	if req.StreamID != nil {
+		if *req.StreamID <= 0 {
+			util.WriteError(w, http.StatusBadRequest, "stream_id is invalid")
+			return
+		}
+		var catalogURL string
+		err := s.pool.QueryRow(r.Context(), `SELECT source_url FROM streams WHERE id=$1`, *req.StreamID).Scan(&catalogURL)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusNotFound, "catalog stream not found")
+				return
+			}
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load catalog stream: %v", err))
+			return
+		}
+		streamURL = strings.TrimSpace(catalogURL)
+		if streamURL == "" {
+			util.WriteError(w, http.StatusBadRequest, "catalog stream has no source_url")
+			return
+		}
+		streamIDArg = *req.StreamID
+	}
 	if streamURL == "" {
 		util.WriteError(w, http.StatusBadRequest, "stream_url is required")
 		return
@@ -228,10 +260,10 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	)
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, name, stream_url, source_kind, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at, start_at, end_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10,$11)
+			(account_id, storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at, start_at, end_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11,$12)
 		RETURNING id, created_at, start_at, end_at
-	`, principal.AccountID, req.StorageDestinationID, name, streamURL, sourceKind, cronExpr, cronTimezone, clipDuration, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
+	`, principal.AccountID, req.StorageDestinationID, name, streamURL, streamIDArg, sourceKind, cronExpr, cronTimezone, clipDuration, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -328,9 +360,11 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
-			rec.created_at, sd.managed
+			rec.created_at, sd.managed,
+			rec.stream_id, st.name, st.location_text
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
+		LEFT JOIN streams st ON st.id = rec.stream_id
 		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
 	`, id, principal.AccountID)
 	item, err := scanRecordingListRow(row, s.billing != nil)
@@ -343,6 +377,84 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, item)
+}
+
+// handleAccountRecordingClips returns the per-clip rows for one recording owned
+// by the session account, newest fire first. Ownership is enforced by a SELECT
+// scoped to account_id before any clips are read (404 when the recording is not
+// the caller's). The list is capped; total is the unbounded count.
+func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+
+	var ownerOK bool
+	err := s.pool.QueryRow(r.Context(), `
+		SELECT EXISTS(SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2 AND status <> 'canceled')
+	`, id, principal.AccountID).Scan(&ownerOK)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+	if !ownerOK {
+		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+
+	var total int64
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT count(*) FROM recording_clips WHERE recording_id=$1
+	`, id).Scan(&total); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count clips: %v", err))
+		return
+	}
+
+	rows, err := s.pool.Query(r.Context(), `
+		SELECT fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, object_key
+		FROM recording_clips
+		WHERE recording_id=$1
+		ORDER BY fire_at DESC
+		LIMIT 200
+	`, id)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list clips: %v", err))
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0, 16)
+	for rows.Next() {
+		var (
+			fireAt      time.Time
+			clipStartAt time.Time
+			clipEndAt   time.Time
+			sizeBytes   int64
+			durationMs  int64
+			objectKey   string
+		)
+		if err := rows.Scan(&fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &objectKey); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
+			return
+		}
+		items = append(items, map[string]any{
+			"fire_at":       fireAt.UTC(),
+			"clip_start_at": clipStartAt.UTC(),
+			"clip_end_at":   clipEndAt.UTC(),
+			"size_bytes":    sizeBytes,
+			"duration_ms":   durationMs,
+			"object_key":    objectKey,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate clips: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "total": total})
 }
 
 func (s *Server) handleAccountRecordingPause(w http.ResponseWriter, r *http.Request) {
@@ -588,6 +700,9 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		recentClipCount  int64
 		createdAt        time.Time
 		managed          bool
+		streamID         *int64
+		streamName       *string
+		streamLocation   *string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
@@ -595,6 +710,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&status, &startAt, &endAt, &nextFireAt, &lastClipAt,
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
+		&streamID, &streamName, &streamLocation,
 	); err != nil {
 		return nil, err
 	}
@@ -627,6 +743,9 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"consecutive_failures":     consecutiveFails,
 		"recent_clip_count":        recentClipCount,
 		"created_at":               createdAt.UTC(),
+		"stream_id":                streamID,
+		"stream_name":              streamName,
+		"stream_location":          streamLocation,
 	}, nil
 }
 
