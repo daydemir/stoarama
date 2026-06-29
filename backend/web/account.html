@@ -51,17 +51,7 @@
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
-    .metric-chip {
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      padding: 2px 7px;
-      white-space: nowrap;
-    }
-    .metric-chip b { color: var(--text); font-weight: 500; }
+    .acct-content { max-width: 880px; margin: 0 auto; }
     .panel {
       background: color-mix(in srgb, var(--panel) 94%, #000);
       border: 1px solid var(--border);
@@ -85,8 +75,8 @@
     }
     h1 {
       margin: 0 0 10px;
-      font-size: clamp(34px, 5vw, 48px);
-      line-height: 0.96;
+      font-size: clamp(28px, 4vw, 40px);
+      line-height: 0.98;
       letter-spacing: -0.03em;
     }
     h2 {
@@ -97,27 +87,6 @@
     p, .note, .muted {
       color: var(--muted);
       line-height: 1.55;
-    }
-    .hero-notes {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 14px;
-    }
-    .hero-note {
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 88%, transparent);
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-    }
-    .grid-2 {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-      margin-bottom: 16px;
     }
     .stack { display: grid; gap: 10px; }
     .section-title {
@@ -195,16 +164,12 @@
       letter-spacing: 0.04em;
       color: var(--muted);
     }
-    .mono, code, pre {
-      font-family: var(--mono);
-      font-size: 12px;
-    }
-    pre {
-      margin: 0;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      line-height: 1.55;
-      color: var(--text);
+    .mono, code { font-family: var(--mono); font-size: 12px; }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
     }
     .empty-state {
       padding: 16px;
@@ -214,30 +179,26 @@
       line-height: 1.5;
       text-align: center;
     }
-    .table-wrap {
-      overflow-x: auto;
-      border-radius: 14px;
+    /* Recording rows */
+    .rec-list { display: grid; gap: 10px; }
+    .rec-row {
       border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
       background: color-mix(in srgb, var(--panel2) 86%, transparent);
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 760px;
-    }
-    th, td {
-      padding: 11px 12px;
-      text-align: left;
-      border-bottom: 1px solid var(--border);
-      vertical-align: top;
-    }
-    th {
-      color: var(--muted);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      font-family: var(--mono);
-    }
+    .rec-row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .rec-name { font-size: 15px; font-weight: 600; color: var(--text); }
+    .rec-sub { margin-top: 3px; font-size: 13px; color: var(--muted); }
+    .rec-status { font-family: var(--mono); font-size: 12px; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+    .rec-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+    .rec-status.active { color: var(--ok); }
+    .rec-status.active .dot { background: var(--ok); }
+    .rec-status.paused { color: var(--muted); }
+    .rec-status.pending { color: var(--warn); }
+    .rec-status.pending .dot { background: var(--warn); }
+    .rec-meta { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+    .rec-meta .meta-strong { color: var(--text); }
     @media (max-width: 1100px) {
       .hero, .grid-2 { grid-template-columns: 1fr; }
     }
@@ -248,11 +209,12 @@
   <div class="shell">
     <!--SHELL_TOPBAR-->
 
+    <div class="acct-content">
     <div class="hero">
       <section class="panel">
         <div class="eyebrow">Account</div>
         <h1>Your STO-A-RAMA account.</h1>
-        <p>Manage your sign-in for this browser. Your recordings and clips live on the Recordings page.</p>
+        <p>See what you are recording, your billing method, and your estimated bill for this month. Manage your recordings on the Recordings page.</p>
       </section>
       <section class="panel">
         <div class="eyebrow">Session</div>
@@ -268,6 +230,19 @@
       </section>
     </div>
 
+    <section id="recordingsPanel" class="panel hidden" style="margin-bottom:16px;">
+      <div class="section-title">
+        <div>
+          <div class="eyebrow">Recordings</div>
+          <h2>Streams you are recording</h2>
+        </div>
+        <a href="/recordings">Manage recordings</a>
+      </div>
+      <div id="recordingsStatus" class="status">Loading recordings...</div>
+      <div id="recordingsEmpty" class="empty-state hidden">You are not recording any streams yet. Start one on the Recordings page.</div>
+      <div id="recordingsList" class="rec-list hidden"></div>
+    </section>
+
     <section id="billingPanel" class="panel hidden" style="margin-bottom:16px;">
       <div class="section-title">
         <div>
@@ -278,21 +253,21 @@
       </div>
       <div id="billingStatus" class="status">Loading billing...</div>
       <div id="billingBody" class="hidden">
+        <div id="paymentRow" class="session-meta" style="margin-bottom:14px;"></div>
         <div class="grid-2" style="margin-bottom:14px;">
           <div class="token-box">
-            <div class="token-box-title">Usage so far</div>
+            <div class="token-box-title">What is driving your bill</div>
             <div id="usageRecDays" class="session-meta"></div>
             <div id="usageStorage" class="session-meta"></div>
           </div>
           <div class="token-box">
-            <div class="token-box-title">Estimated upcoming bill</div>
+            <div class="token-box-title">Estimated bill for the month</div>
             <div id="estBreakdown" class="session-meta mono"></div>
           </div>
         </div>
-        <div id="paymentRow" class="session-meta" style="margin-bottom:6px;"></div>
         <div id="periodRow" class="muted" style="font-size:12px;"></div>
         <p class="muted" style="font-size:12px;margin:10px 0 0;">
-          Amounts are live estimates from your usage this month, not a final invoice. You are billed monthly in arrears:
+          This is a live estimate from the streams you are recording plus your storage usage this month, not a final invoice. You are billed monthly in arrears:
           $0.50 for each day a recording captured at least one clip, plus, for Stoarama-managed storage, $0.10 per GB stored for a month.
           Days when nothing recorded are never charged.
         </p>
@@ -314,94 +289,6 @@
       </div>
       <div id="requestStatus" class="status"></div>
     </section>
-
-    <div id="operatorTools" class="hidden">
-    <section class="panel" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">API Keys</div>
-          <h2>Automation credentials</h2>
-        </div>
-        <p>Create scoped account tokens for scripts, clip retrieval, and account-authenticated API use.</p>
-      </div>
-      <div id="keysEmpty" class="empty-state">Sign in first to create and manage API keys.</div>
-      <div id="keysBox" class="hidden">
-        <div class="grid-2" style="margin-bottom:12px;">
-          <div>
-            <label for="keyLabel">Key label</label>
-            <input id="keyLabel" type="text" placeholder="Laptop downloader" />
-          </div>
-          <div class="button-row" style="align-items:end;">
-            <button id="createKeyBtn" type="button">Create API Key</button>
-          </div>
-        </div>
-        <div id="createKeyStatus" class="status"></div>
-        <div id="newTokenBox" class="token-box hidden"></div>
-        <div class="table-wrap" style="margin-top:12px;">
-          <table>
-            <thead>
-              <tr><th>Prefix</th><th>Label</th><th>Created</th><th>Last Used</th><th></th></tr>
-            </thead>
-            <tbody id="keysRows"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <div class="grid-2">
-      <section class="panel">
-        <div class="section-title">
-          <div>
-            <div class="eyebrow">Node Enrollment</div>
-            <h2>Enroll local recorder nodes</h2>
-          </div>
-          <p>Create one-time enrollment tokens for local recorder infrastructure.</p>
-        </div>
-        <div id="enrollmentEmpty" class="empty-state">Sign in first to create node enrollment tokens.</div>
-        <div id="enrollmentBox" class="hidden">
-          <div class="grid-2" style="margin-bottom:12px;">
-            <div>
-              <label for="enrollmentLabel">Token label</label>
-              <input id="enrollmentLabel" type="text" placeholder="Mac mini recorder" />
-            </div>
-            <div class="button-row" style="align-items:end;">
-              <button id="createEnrollmentBtn" type="button">Create Recorder Enrollment Token</button>
-            </div>
-          </div>
-          <div id="createEnrollmentStatus" class="status"></div>
-          <div id="newEnrollmentTokenBox" class="token-box hidden"></div>
-          <div class="table-wrap" style="margin-top:12px;">
-            <table>
-              <thead>
-                <tr><th>Prefix</th><th>Label</th><th>Expires</th><th>Status</th><th></th></tr>
-              </thead>
-              <tbody id="enrollmentRows"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="section-title">
-          <div>
-            <div class="eyebrow">Nodes</div>
-            <h2>Enrolled infrastructure</h2>
-          </div>
-          <p>Nodes and recorder state stay bound to your account.</p>
-        </div>
-        <div id="nodesEmpty" class="empty-state">Sign in first to view enrolled nodes.</div>
-        <div id="nodesBox" class="hidden">
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr><th>Node</th><th>Heartbeat</th></tr>
-              </thead>
-              <tbody id="nodesRows"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-    </div>
     </div>
   </div>
 
@@ -412,20 +299,10 @@
     const accountMeta = document.getElementById('accountMeta');
     const accountChip = document.getElementById('topbarAccountStatus');
     const adminChip = document.getElementById('topbarAdminLink');
-    const operatorTools = document.getElementById('operatorTools');
-    const keysEmpty = document.getElementById('keysEmpty');
-    const keysBox = document.getElementById('keysBox');
-    const keysRows = document.getElementById('keysRows');
-    const createKeyStatus = document.getElementById('createKeyStatus');
-    const newTokenBox = document.getElementById('newTokenBox');
-    const enrollmentEmpty = document.getElementById('enrollmentEmpty');
-    const enrollmentBox = document.getElementById('enrollmentBox');
-    const enrollmentRows = document.getElementById('enrollmentRows');
-    const createEnrollmentStatus = document.getElementById('createEnrollmentStatus');
-    const newEnrollmentTokenBox = document.getElementById('newEnrollmentTokenBox');
-    const nodesEmpty = document.getElementById('nodesEmpty');
-    const nodesBox = document.getElementById('nodesBox');
-    const nodesRows = document.getElementById('nodesRows');
+    const recordingsPanel = document.getElementById('recordingsPanel');
+    const recordingsStatus = document.getElementById('recordingsStatus');
+    const recordingsEmpty = document.getElementById('recordingsEmpty');
+    const recordingsList = document.getElementById('recordingsList');
     const billingPanel = document.getElementById('billingPanel');
     const billingStatus = document.getElementById('billingStatus');
     const billingBody = document.getElementById('billingBody');
@@ -463,17 +340,119 @@
       el.className = `status${kind ? ` ${kind}` : ''}`;
     }
 
-    function formatDate(v) {
-      if (!v) return 'Never';
-      try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
-    }
-
     function usd(cents) { return `$${(Number(cents || 0) / 100).toFixed(2)}`; }
 
     function fmtDay(iso) {
       if (!iso) return '';
       try { return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); }
       catch (_) { return ''; }
+    }
+
+    function escapeHTML(v) {
+      return String(v == null ? '' : v)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => window.setTimeout(resolve, ms));
+    }
+
+    // Human-readable cadence from a 5-field cron expression for the common presets
+    // this app produces; falls back to showing the raw cron for anything custom.
+    function cadenceLabel(cron) {
+      const c = String(cron || '').trim().replace(/\s+/g, ' ');
+      const map = {
+        '*/15 * * * *': 'Every 15 min',
+        '*/30 * * * *': 'Every 30 min',
+        '0 * * * *': 'Hourly',
+        '0 */4 * * *': 'Every 4 hours',
+      };
+      if (map[c]) return map[c];
+      const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(c);
+      if (daily) {
+        const hh = String(daily[2]).padStart(2, '0');
+        const mm = String(daily[1]).padStart(2, '0');
+        return `Daily at ${hh}:${mm}`;
+      }
+      return c ? `Cron ${c}` : '';
+    }
+
+    function clipLabel(sec) {
+      const n = Number(sec || 0);
+      if (n <= 0) return '';
+      if (n % 60 === 0) { const m = n / 60; return `${m} min clip${m === 1 ? '' : 's'}`; }
+      return `${n}s clips`;
+    }
+
+    // Status badge: "live" reflects active + in-window + card on file (server-derived).
+    function recStatusInfo(rec) {
+      if (rec && rec.live === true) return { cls: 'active', label: 'Recording' };
+      const s = String((rec && rec.status) || '').trim().toLowerCase();
+      if (s === 'active') return { cls: 'pending', label: 'Active' };
+      if (s === 'paused') return { cls: 'paused', label: 'Paused' };
+      return { cls: 'pending', label: s || 'Pending' };
+    }
+
+    function recStorageLabel(rec) {
+      if (rec && rec.storage_managed === true) return 'Stoarama-managed storage';
+      const name = String((rec && rec.storage_destination_name) || '').trim();
+      return name ? `Your bucket: ${name}` : 'Your bucket';
+    }
+
+    // Render the user's recordings list (the streams they are recording). Pure given
+    // the items array + DOM nodes; reuses the same GET /recordings the Recordings page uses.
+    function renderRecordings(items) {
+      const list = Array.isArray(items) ? items : [];
+      if (list.length === 0) {
+        recordingsList.classList.add('hidden');
+        recordingsList.innerHTML = '';
+        recordingsEmpty.classList.remove('hidden');
+        return;
+      }
+      recordingsEmpty.classList.add('hidden');
+      recordingsList.classList.remove('hidden');
+      recordingsList.innerHTML = list.map((rec) => {
+        const info = recStatusInfo(rec);
+        const name = String(rec.name || rec.stream_name || 'Recording').trim();
+        const loc = String(rec.stream_location || '').trim();
+        const cadence = cadenceLabel(rec.cron_expr);
+        const clip = clipLabel(rec.clip_duration_sec);
+        const storage = recStorageLabel(rec);
+        const metaParts = [];
+        if (cadence) metaParts.push(`<span class="meta-strong">${escapeHTML(cadence)}</span>`);
+        if (clip) metaParts.push(`<span>${escapeHTML(clip)}</span>`);
+        metaParts.push(`<span>${escapeHTML(storage)}</span>`);
+        return `
+          <div class="rec-row">
+            <div class="rec-row-head">
+              <div>
+                <div class="rec-name">${escapeHTML(name)}</div>
+                ${loc ? `<div class="rec-sub">${escapeHTML(loc)}</div>` : ''}
+              </div>
+              <div class="rec-status ${info.cls}"><span class="dot"></span>${escapeHTML(info.label)}</div>
+            </div>
+            <div class="rec-meta">${metaParts.join('')}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function loadRecordings() {
+      try {
+        const payload = await fetchJSON('/api/v1/account/recordings');
+        recordingsPanel.classList.remove('hidden');
+        recordingsStatus.classList.add('hidden');
+        renderRecordings(payload.items);
+      } catch (err) {
+        recordingsPanel.classList.remove('hidden');
+        recordingsList.classList.add('hidden');
+        recordingsEmpty.classList.add('hidden');
+        recordingsStatus.classList.remove('hidden');
+        setStatus(recordingsStatus, `Could not load recordings: ${String(err.message || err)}`, 'err');
+      }
     }
 
     // Render the billing panel from a GET /billing payload. Pure given the payload
@@ -487,8 +466,16 @@
       const storeCents = Number(b.estimated_storage_amount_cents || 0);
       const totalCents = dayCents + storeCents;
 
+      if (b.has_payment_method === true) {
+        paymentRow.innerHTML = `<div style="color:var(--ok);">Billing method on file. You have a card on file.</div>`;
+        billingManageBtn.textContent = 'Manage payment method';
+      } else {
+        paymentRow.innerHTML = `<div style="color:var(--warn);">No billing method on file. Adding a card does not charge you.</div>`;
+        billingManageBtn.textContent = 'Add a card';
+      }
+
       usageRecDays.innerHTML =
-        `<div><b>${days}</b> recording-day${days === 1 ? '' : 's'} this month</div>`;
+        `<div><b>${days}</b> recording-day${days === 1 ? '' : 's'} from the streams you are recording</div>`;
       usageStorage.innerHTML = gb > 0
         ? `<div><b>${gb.toFixed(3)}</b> GB-month managed storage</div>`
         : `<div class="muted">No managed storage this month</div>`;
@@ -498,16 +485,8 @@
       lines.push(`<div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></div>`);
       estBreakdown.innerHTML = lines.join('');
 
-      if (b.has_payment_method === true) {
-        paymentRow.innerHTML = `<div class="ok" style="color:var(--ok);">Card on file.</div>`;
-        billingManageBtn.textContent = 'Manage payment method';
-      } else {
-        paymentRow.innerHTML = `<div class="muted">No card on file yet. Adding a card does not charge you.</div>`;
-        billingManageBtn.textContent = 'Add a card';
-      }
-
       if (b.period_end) {
-        const span = b.period_start ? `${fmtDay(b.period_start)} – ${fmtDay(b.period_end)}` : `through ${fmtDay(b.period_end)}`;
+        const span = b.period_start ? `${fmtDay(b.period_start)} to ${fmtDay(b.period_end)}` : `through ${fmtDay(b.period_end)}`;
         periodRow.textContent = `Current period: ${span}. Next invoice on or around ${fmtDay(b.period_end)}.`;
       } else {
         periodRow.textContent = 'Your billing period starts once you add a card.';
@@ -529,18 +508,6 @@
         billingStatus.classList.remove('hidden');
         setStatus(billingStatus, `Could not load billing: ${String(err.message || err)}`, 'err');
       }
-    }
-
-    function escapeHTML(v) {
-      return String(v || '')
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;');
-    }
-
-    function sleep(ms) {
-      return new Promise((resolve) => window.setTimeout(resolve, ms));
     }
 
     function accountContinueTarget() {
@@ -587,56 +554,6 @@
       }, 1600);
     }
 
-    async function copyText(text, statusEl, okText) {
-      try {
-        await navigator.clipboard.writeText(String(text || ''));
-        if (statusEl) setStatus(statusEl, okText || 'Copied.', 'ok');
-      } catch (err) {
-        if (statusEl) setStatus(statusEl, `Copy failed: ${String(err)}`, 'err');
-      }
-    }
-
-    function renderTokenBox(container, opts) {
-      const title = String((opts && opts.title) || '').trim();
-      const value = String((opts && opts.value) || '').trim();
-      const commands = Array.isArray(opts && opts.commands) ? opts.commands : [];
-      if (!value && commands.length === 0) {
-        container.classList.add('hidden');
-        container.innerHTML = '';
-        return;
-      }
-      container.classList.remove('hidden');
-      const parts = [];
-      if (title) parts.push(`<div class="token-box-title">${escapeHTML(title)}</div>`);
-      if (value) {
-        parts.push(`<pre>${escapeHTML(value)}</pre>`);
-        parts.push('<div class="button-row" style="margin-top:10px;"><button type="button" class="secondary" data-copy-value="1">Copy token</button></div>');
-      }
-      if (commands.length > 0) {
-        commands.forEach((cmd, idx) => {
-          parts.push(`
-            <div style="margin-top:10px;">
-              <div class="token-box-title">Step ${idx + 1}</div>
-              <pre>${escapeHTML(String(cmd || ''))}</pre>
-              <div class="button-row" style="margin-top:10px;"><button type="button" class="secondary" data-copy-command="${idx}">Copy command</button></div>
-            </div>
-          `);
-        });
-      }
-      container.innerHTML = parts.join('');
-      const statusTarget = opts && opts.statusEl;
-      const copyValueBtn = container.querySelector('[data-copy-value]');
-      if (copyValueBtn) {
-        copyValueBtn.addEventListener('click', () => copyText(value, statusTarget, 'Copied.'));
-      }
-      container.querySelectorAll('[data-copy-command]').forEach((btn) => {
-        btn.addEventListener('click', () => {
-          const idx = Number(btn.getAttribute('data-copy-command'));
-          copyText(commands[idx] || '', statusTarget, 'Copied.');
-        });
-      });
-    }
-
     function updateAccountChrome() {
       const accountHref = `/account?redirect_path=${encodeURIComponent(requestedRedirectPath)}`;
       if (!currentAccount) {
@@ -651,78 +568,9 @@
       if (adminChip instanceof HTMLElement) adminChip.style.display = role === 'admin' ? 'inline-flex' : 'none';
     }
 
-    async function refreshKeys() {
-      const payload = await fetchJSON('/api/v1/account/api-keys');
-      const items = Array.isArray(payload.items) ? payload.items : [];
-      keysRows.innerHTML = items.map((item) => `
-        <tr>
-          <td class="mono">${escapeHTML(String(item.key_prefix || ''))}</td>
-          <td>${escapeHTML(String(item.label || ''))}</td>
-          <td>${escapeHTML(formatDate(item.created_at))}</td>
-          <td>${escapeHTML(formatDate(item.last_used_at))}</td>
-          <td>${item.revoked_at ? '<span class="muted">revoked</span>' : `<button type="button" class="secondary" data-revoke="${Number(item.id)}">Revoke</button>`}</td>
-        </tr>
-      `).join('');
-      keysRows.querySelectorAll('button[data-revoke]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const id = String(btn.getAttribute('data-revoke') || '').trim();
-          try {
-            await fetchJSON(`/api/v1/account/api-keys/${encodeURIComponent(id)}/revoke`, { method: 'POST' });
-            await refreshKeys();
-          } catch (err) {
-            setStatus(createKeyStatus, String(err), 'err');
-          }
-        });
-      });
-    }
-
-    async function refreshEnrollmentTokens() {
-      const payload = await fetchJSON('/api/v1/account/node-enrollment-tokens');
-      const items = Array.isArray(payload.items) ? payload.items : [];
-      enrollmentRows.innerHTML = items.map((item) => {
-        const revoked = !!item.revoked_at;
-        const consumed = !!item.consumed_at;
-        const status = revoked ? 'revoked' : (consumed ? 'consumed' : 'active');
-        return `
-          <tr>
-            <td class="mono">${escapeHTML(String(item.token_prefix || ''))}</td>
-            <td>${escapeHTML(String(item.label || ''))}</td>
-            <td>${escapeHTML(formatDate(item.expires_at))}</td>
-            <td>${escapeHTML(status)}</td>
-            <td>${revoked || consumed ? '' : `<button type="button" class="secondary" data-revoke-enrollment="${Number(item.id)}">Revoke</button>`}</td>
-          </tr>
-        `;
-      }).join('');
-      enrollmentRows.querySelectorAll('button[data-revoke-enrollment]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const id = String(btn.getAttribute('data-revoke-enrollment') || '').trim();
-          try {
-            await fetchJSON(`/api/v1/account/node-enrollment-tokens/${encodeURIComponent(id)}/revoke`, { method: 'POST' });
-            await refreshEnrollmentTokens();
-          } catch (err) {
-            setStatus(createEnrollmentStatus, String(err), 'err');
-          }
-        });
-      });
-    }
-
-    async function refreshNodes() {
-      const payload = await fetchJSON('/api/v1/account/nodes');
-      const items = Array.isArray(payload.items) ? payload.items : [];
-      nodesRows.innerHTML = items.map((item) => `
-          <tr>
-            <td><b>${escapeHTML(String(item.display_name || ''))}</b><div class="muted">${escapeHTML(String(item.node_type || ''))} · ${escapeHTML(String(item.hostname || ''))}</div></td>
-            <td>${escapeHTML(formatDate(item.last_heartbeat_at))}</td>
-          </tr>
-        `).join('');
-    }
-
     async function refreshSession() {
       try {
         currentAccount = await fetchCurrentAccountWithRetry();
-        // Operator tooling (API keys / nodes) is admin-gated below; everyone else
-        // sees account state + sign out + a link to their recordings.
-        const isOperator = String(currentAccount.role || '').trim().toLowerCase() === 'admin';
         accountBox.classList.remove('hidden');
         const role = String(currentAccount.role || 'member');
         const authType = String(currentAccount.auth_type || 'session');
@@ -731,38 +579,18 @@
         accountMeta.innerHTML = `
           <div><b>${escapeHTML(email)}</b></div>
           <div class="muted">Role: ${escapeHTML(role)} · Auth: ${escapeHTML(authType)}</div>
-          <div class="muted">${authCompleted ? 'Verified in this browser.' : 'Use this session for account-scoped tools and downloads.'}</div>
+          <div class="muted">${authCompleted ? 'Verified in this browser.' : 'Signed in to this browser.'}</div>
           ${authCompleted && continueTarget ? `<div class="muted">Continuing to ${escapeHTML(continueTarget)}...</div>` : ''}
         `;
         setStatus(accountStatus, authCompleted ? `Signed in as ${email} in this browser.` : 'Signed in.', 'ok');
+        void loadRecordings();
         void loadBilling();
-        if (isOperator) {
-          operatorTools.classList.remove('hidden');
-          keysEmpty.classList.add('hidden');
-          keysBox.classList.remove('hidden');
-          enrollmentEmpty.classList.add('hidden');
-          enrollmentBox.classList.remove('hidden');
-          nodesEmpty.classList.add('hidden');
-          nodesBox.classList.remove('hidden');
-          await Promise.all([
-            refreshKeys(),
-            refreshEnrollmentTokens(),
-            refreshNodes(),
-          ]);
-        } else {
-          operatorTools.classList.add('hidden');
-        }
         if (authCompleted) scheduleAuthFlowContinue();
       } catch (_) {
         currentAccount = null;
         accountBox.classList.add('hidden');
+        recordingsPanel.classList.add('hidden');
         billingPanel.classList.add('hidden');
-        keysBox.classList.add('hidden');
-        keysEmpty.classList.remove('hidden');
-        enrollmentBox.classList.add('hidden');
-        enrollmentEmpty.classList.remove('hidden');
-        nodesBox.classList.add('hidden');
-        nodesEmpty.classList.remove('hidden');
         if (authCompleted) {
           setStatus(accountStatus, 'Magic link was opened, but this browser still has no active session. Open the link in the same browser you want to use.', 'err');
         } else {
@@ -799,50 +627,6 @@
         setStatus(billingStatus, String(err.message || err), 'err');
       } finally {
         billingManageBtn.disabled = false;
-      }
-    });
-
-    document.getElementById('createKeyBtn').addEventListener('click', async () => {
-      const label = String(document.getElementById('keyLabel').value || '').trim();
-      try {
-        const payload = await fetchJSON('/api/v1/account/api-keys', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ label }),
-        });
-        renderTokenBox(newTokenBox, {
-          title: 'Copy now. This API key is shown once.',
-          value: String(payload.token || '').trim(),
-          statusEl: createKeyStatus,
-        });
-        setStatus(createKeyStatus, 'API key created.', 'ok');
-        await refreshKeys();
-      } catch (err) {
-        setStatus(createKeyStatus, String(err), 'err');
-      }
-    });
-
-    document.getElementById('createEnrollmentBtn').addEventListener('click', async () => {
-      const label = String(document.getElementById('enrollmentLabel').value || '').trim();
-      try {
-        const payload = await fetchJSON('/api/v1/account/node-enrollment-tokens', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ node_type: 'local_recorder', label }),
-        });
-        const token = String(payload.token || '');
-        const enrollCmd = `stoarama node enroll --api-base-url ${window.location.origin} --token ${token} --node-type local_recorder --display-name "Mac mini recorder"`;
-        const runCmd = `stoarama recording youtube run --api-base-url ${window.location.origin} --stream-id <stream-id>`;
-        renderTokenBox(newEnrollmentTokenBox, {
-          title: 'Copy now. This enrollment token is shown once.',
-          value: token,
-          commands: [enrollCmd, runCmd],
-          statusEl: createEnrollmentStatus,
-        });
-        setStatus(createEnrollmentStatus, 'Enrollment token created.', 'ok');
-        await refreshEnrollmentTokens();
-      } catch (err) {
-        setStatus(createEnrollmentStatus, String(err), 'err');
       }
     });
 
