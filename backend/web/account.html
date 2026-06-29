@@ -197,7 +197,8 @@
     .rec-status.paused { color: var(--muted); }
     .rec-status.pending { color: var(--warn); }
     .rec-status.pending .dot { background: var(--warn); }
-    .rec-meta { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+    .rec-meta { margin-top: 10px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; font-size: 13px; color: var(--muted); }
+    .rec-meta .meta-sep { color: var(--muted); user-select: none; }
     .rec-meta .meta-strong { color: var(--text); }
     @media (max-width: 1100px) {
       .hero, .grid-2 { grid-template-columns: 1fr; }
@@ -447,7 +448,7 @@
               </div>
               <div class="rec-status ${info.cls}"><span class="dot"></span>${escapeHTML(info.label)}</div>
             </div>
-            <div class="rec-meta">${metaParts.join('')}</div>
+            <div class="rec-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
           </div>
         `;
       }).join('');
