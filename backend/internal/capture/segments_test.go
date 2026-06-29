@@ -107,12 +107,13 @@ func TestProbeReachableSanitizesCrash(t *testing.T) {
 	}
 }
 
-// TestCaptureSingleFrameUsesNetworkInputArgs asserts the survey video helper
-// invokes ffmpegBin() (FFMPEG_BIN override) with the recorder's network input
-// args (the fix for the bare-ffmpeg segfault), single-frame output, and that a
-// produced JPEG is decoded into a Frame. The fake ffmpeg records its args and
-// copies a fixture JPEG to the output path.
-func TestCaptureSingleFrameUsesNetworkInputArgs(t *testing.T) {
+// TestCaptureSingleFrameRecordsThenExtracts asserts the survey video helper runs
+// the recorder's two-step path on ffmpegBin() (FFMPEG_BIN override): step 1
+// records a -c copy segment with the network input args (the fix for the live
+// decode-to-jpeg segfault), step 2 decodes one frame from the LOCAL segment
+// file, and the produced JPEG is built into a Frame. The fake ffmpeg appends
+// every invocation's args to a log and writes a fixture to each output path.
+func TestCaptureSingleFrameRecordsThenExtracts(t *testing.T) {
 	// A 1x1 JPEG so buildFrame's DecodeConfig succeeds.
 	jpeg := []byte{
 		0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
@@ -132,9 +133,13 @@ func TestCaptureSingleFrameUsesNetworkInputArgs(t *testing.T) {
 	if err := os.WriteFile(fixture, jpeg, 0o644); err != nil {
 		t.Fatalf("write fixture jpeg: %v", err)
 	}
-	argsDump := filepath.Join(fixtureDir, "args.txt")
-	// Stub: dump all args, then copy the fixture to the last arg (output path).
-	script := `printf '%s\n' "$@" > ` + argsDump + `
+	argsLog := filepath.Join(fixtureDir, "args.log")
+	// Stub: append this invocation's args as one line to argsLog, then write the
+	// fixture to the last arg (output path) so both the segment and the frame
+	// outputs exist. The local-file extract step (-i <segment.mp4>) thus reads a
+	// real file and produces a decodable JPEG.
+	script := `printf '%s ' "$@" >> ` + argsLog + `
+printf '\n' >> ` + argsLog + `
 eval "out=\${$#}"
 cp ` + fixture + ` "$out"`
 	t.Setenv("FFMPEG_BIN", writeFakeFFmpeg(t, script))
@@ -150,24 +155,39 @@ cp ` + fixture + ` "$out"`
 		t.Fatalf("frame not built from jpeg: %+v", frame)
 	}
 
-	dumped, err := os.ReadFile(argsDump)
+	dumped, err := os.ReadFile(argsLog)
 	if err != nil {
-		t.Fatalf("read args dump: %v", err)
+		t.Fatalf("read args log: %v", err)
 	}
-	joined := strings.ReplaceAll(string(dumped), "\n", " ")
+	lines := strings.Split(strings.TrimSpace(string(dumped)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 ffmpeg invocations (record + extract), got %d: %q", len(lines), dumped)
+	}
+	// Step 1: record a -c copy segment from the live URL with the network args.
+	record := lines[0]
 	for _, want := range []string{
 		"-rw_timeout 15000000",
 		"-timeout 15000000",
 		"-protocol_whitelist https,tls,tcp,http,crypto,data",
-		"-reconnect 1",
 		"-fflags +discardcorrupt",
 		"-i https://example.com/live.m3u8",
 		"-map 0:v:0",
-		"-frames:v 1",
+		"-c copy",
+		"segment.mp4",
 	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("expected %q in ffmpeg args: %s", want, joined)
+		if !strings.Contains(record, want) {
+			t.Fatalf("expected %q in record args: %s", want, record)
 		}
+	}
+	// Step 2: extract one frame from the LOCAL segment file (not the live URL).
+	extract := lines[1]
+	for _, want := range []string{"segment.mp4", "-frames:v 1", "single-frame.jpg"} {
+		if !strings.Contains(extract, want) {
+			t.Fatalf("expected %q in extract args: %s", want, extract)
+		}
+	}
+	if strings.Contains(extract, "https://example.com/live.m3u8") {
+		t.Fatalf("extract step must read the local segment, not the live URL: %s", extract)
 	}
 }
 

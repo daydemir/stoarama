@@ -73,7 +73,7 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
 	args := buildFFmpegSegmentArgs(sourceURL, outPath, duration, pinHost)
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
@@ -170,15 +170,28 @@ func ProbeReachable(ctx context.Context, sourceURL string, pinHost string) error
 	return nil
 }
 
-// CaptureSingleFrame grabs ONE video frame from a resolved video sourceURL via
-// ffmpeg and returns it as a JPEG Frame. It exists so the survey's video path
-// reuses the recorder's proven network-input args (appendFFmpegHTTPInputArgs:
-// rw/timeout, -protocol_whitelist, optional Host pin) instead of the bare ffmpeg
-// in capture.CaptureFrame, which segfaults on these network inputs. pinHost,
-// when non-empty, is carried as the HTTP Host header; pass "" to let ffmpeg
-// derive Host/SNI from the URL. The caller is responsible for bounding ctx with
-// a short timeout so a dead stream fails fast. On failure it returns the ffmpeg
-// CombinedOutput in the error so the real stderr is visible to verification.
+// SingleFrameSegmentDuration is the short clip the survey records before pulling
+// one frame from it. It is the smallest window that reliably yields a keyframe
+// across these streams while keeping the per-stream grab bounded.
+const SingleFrameSegmentDuration = 2 * time.Second
+
+// CaptureSingleFrame grabs ONE video frame from a resolved video sourceURL and
+// returns it as a JPEG Frame, for the survey's video path.
+//
+// It does NOT decode the live network stream to a JPEG in one ffmpeg pass: the
+// Render static ffmpeg segfaults on that (proven by prod cron logs: "ffmpeg
+// single-frame capture failed: signal: segmentation fault" on every hls /
+// http_video stream). Instead it runs the recorder's two proven, non-crashing
+// steps on this exact ffmpeg/streams: first record a short clip with -c copy
+// (the buildFFmpegSegmentArgs path, no decode), then extract one frame from that
+// LOCAL file (decode of a local mp4, the operation the recorder runs millions of
+// times for thumbnails). This reuses buildFFmpegSegmentArgs and ffmpegBin() so
+// no new ffmpeg primitives are introduced.
+//
+// pinHost, when non-empty, is carried as the HTTP Host header; pass "" to let
+// ffmpeg derive Host/SNI from the URL. The caller bounds ctx so a dead stream
+// fails fast. On failure the underlying ffmpeg CombinedOutput is wrapped into
+// the error so the real stderr is visible to verification.
 func CaptureSingleFrame(ctx context.Context, sourceURL string, pinHost string) (Frame, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Frame{}, fmt.Errorf("source_url is empty")
@@ -188,26 +201,33 @@ func CaptureSingleFrame(ctx context.Context, sourceURL string, pinHost string) (
 		return Frame{}, fmt.Errorf("mktemp: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
-	outPath := filepath.Join(tmpDir, "frame.jpg")
 
-	args := []string{"-y", "-nostdin", "-loglevel", "error"}
-	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10, pinHost)
-	args = append(args,
-		"-fflags", "+discardcorrupt",
-		"-i", sourceURL,
-		"-map", "0:v:0",
+	// Step 1: record a short clip with -c copy (no decode -> no segfault).
+	segPath := filepath.Join(tmpDir, "segment.mp4")
+	segArgs := buildFFmpegSegmentArgs(sourceURL, segPath, SingleFrameSegmentDuration, pinHost)
+	segCmd := exec.CommandContext(ctx, ffmpegBin(), segArgs...)
+	if out, err := segCmd.CombinedOutput(); err != nil {
+		return Frame{}, fmt.Errorf("record single-frame segment: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	// Step 2: decode one frame from the LOCAL clip to a JPEG.
+	framePath := filepath.Join(tmpDir, "single-frame.jpg")
+	frameCmd := exec.CommandContext(ctx,
+		ffmpegBin(),
+		"-y",
+		"-nostdin",
+		"-loglevel", "error",
+		"-i", segPath,
 		"-frames:v", "1",
 		"-q:v", "2",
-		outPath,
+		framePath,
 	)
-	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return Frame{}, fmt.Errorf("ffmpeg single-frame capture failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	if out, err := frameCmd.CombinedOutput(); err != nil {
+		return Frame{}, fmt.Errorf("extract single frame from segment: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
-	b, err := os.ReadFile(outPath)
+	b, err := os.ReadFile(framePath)
 	if err != nil {
-		return Frame{}, fmt.Errorf("read captured frame: %w", err)
+		return Frame{}, fmt.Errorf("read single frame: %w", err)
 	}
 	return buildFrame(b, "image/jpeg", "live")
 }
@@ -263,7 +283,7 @@ func extractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentT
 	thumbCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(thumbCtx,
-		"ffmpeg",
+		ffmpegBin(),
 		"-y",
 		"-loglevel", "error",
 		"-ss", "1",
