@@ -188,102 +188,119 @@
       <aside class="sidebar">
         <div class="sidebar-title">Docs</div>
         <nav class="sidebar-nav" aria-label="Docs sections">
-          <a id="navGettingStarted" href="/docs/getting-started">Getting Started</a>
-          <a id="navAPI" href="/docs/api">API Reference</a>
-          <a id="navSelfServe" href="/docs/self-serve">Self-Serve Setup</a>
+          <a id="navGettingStarted" href="/docs/getting-started">Overview</a>
+          <a id="navAPI" href="/docs/api">Recording</a>
+          <a id="navSelfServe" href="/docs/self-serve">Catalog &amp; self-record</a>
         </nav>
       </aside>
 
       <main class="content">
         <section id="sectionGettingStarted" class="section panel">
-          <div class="eyebrow">Getting Started</div>
-          <h1>Browse first, authenticate when you act.</h1>
-          <p>Stoarama keeps stream discovery public so researchers can explore the catalog without setup. Sign in only when you need recording controls, clip downloads, API keys, or node management.</p>
+          <div class="eyebrow">Overview</div>
+          <h1>Browse the catalog, record on a schedule.</h1>
+          <p>Stoarama is two things: a public catalog of live public video streams you can browse without an account, and a paid recorder that captures a stream on a schedule and saves each capture as a clip you can download. Browsing is free and open. Recording needs a signed-in account and a card on file.</p>
           <p>Questions? Email <a href="mailto:deniz@aydemir.us">deniz@aydemir.us</a>.</p>
-          <p>All video streams are captured at 10 frames per second. Image-poll streams capture individual frames on a configurable polling interval.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
-              <div class="eyebrow">Core flow</div>
-              <h2>How researchers typically work</h2>
+              <div class="eyebrow">How it works</div>
+              <h2>From browse to clips</h2>
               <ul>
-                <li>Search the public stream catalog on <code>/streams</code>.</li>
-                <li>Open a stream detail page to inspect metadata and recorded clips.</li>
-                <li>Go to <code>/recording</code> when you want to start or monitor recording.</li>
-                <li>Use <code>/account</code> for session, API keys, and local recorder enrollment.</li>
+                <li>Browse the catalog on <a href="/streams">/streams</a>. No account needed.</li>
+                <li>Open a stream to see its metadata, a live preview where the source allows it, and a self-record command.</li>
+                <li>Sign in (emailed link, no password) and set up a recording on <a href="/recordings">/recordings</a>.</li>
+                <li>Watch, download, or delete your clips, and see your bill on <a href="/account">/account</a>.</li>
               </ul>
             </div>
             <div class="panel">
-              <div class="eyebrow">Auth model</div>
-              <h2>What needs a signed-in account</h2>
+              <div class="eyebrow">What recording costs</div>
+              <h2>Pay for what you record</h2>
               <ul>
-                <li>Preparing authenticated clip downloads.</li>
-                <li>Turning recording on or off from the browser.</li>
-                <li>Creating or revoking API keys.</li>
-                <li>Enrolling and managing local recorder nodes.</li>
+                <li><b>$0.50</b> for each day a recording captures at least one clip. Days with nothing recorded are free.</li>
+                <li><b>$0.10</b> per GB-month for clips you keep in Stoarama-managed storage. A clip kept a few days costs a small fraction of that.</li>
+                <li>Billed once a month in arrears with a card on file via Stripe. Adding a card does not charge you.</li>
+                <li>Bring your own S3 bucket instead and Stoarama charges only the record-day fee.</li>
               </ul>
             </div>
           </div>
         </section>
 
         <section id="sectionAPI" class="section panel">
-          <div class="eyebrow">API Reference</div>
-          <h1>Public reads plus account-scoped actions.</h1>
-          <p>The backend API stays unchanged. Use public dashboard endpoints for browsing and account-scoped endpoints when working with clips, keys, or browser-authenticated recording actions.</p>
+          <div class="eyebrow">Recording</div>
+          <h1>Record any public HLS or HTTPS stream.</h1>
+          <p>A recording captures one stream on a schedule and writes each capture as a clip. Set it up on <a href="/recordings">/recordings</a>. You point it at a stream, pick how often it fires and how long each clip is, and choose where the clips land.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
-              <div class="eyebrow">Public catalog</div>
-              <h2>Search streams</h2>
-              <pre><code>curl "https://stoarama.example/api/v1/dashboard/streams?limit=25&amp;q=seoul"
-
-curl "https://stoarama.example/api/v1/dashboard/streams/15944"
-
-curl "https://stoarama.example/api/v1/dashboard/recording/summary"</code></pre>
+              <div class="eyebrow">Sources</div>
+              <h2>What can be recorded</h2>
+              <ul>
+                <li>A public HLS stream (a <code>.m3u8</code> URL).</li>
+                <li>A direct HTTP(S) video stream.</li>
+                <li>YouTube is view-only and cannot be hosted-recorded. To capture a YouTube stream, use the <code>yt-dlp</code> command on its detail page from your own machine.</li>
+              </ul>
             </div>
             <div class="panel">
-              <div class="eyebrow">Authenticated clips</div>
-              <h2>List and prepare downloads</h2>
-              <pre><code>curl -H "Authorization: Bearer &lt;api-key&gt;" \
-  "https://stoarama.example/api/v1/account/streams/15944/clips?limit=25&amp;offset=0"
-
-curl -X POST "https://stoarama.example/api/v1/account/clips/download-prepare" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer &lt;api-key&gt;" \
-  -d '{"stream_id":15944,"segment_ids":[101,102,103]}'</code></pre>
+              <div class="eyebrow">Schedule &amp; clip length</div>
+              <h2>How often, how long</h2>
+              <ul>
+                <li>Presets: every 15 min, every 30 min, hourly, every 4 hours, daily at a time in your timezone, or a custom 5-field cron.</li>
+                <li>Fires are at least 10 minutes apart.</li>
+                <li>Clip length: 1, 5, or 15 minutes, or a custom 5 to 900 seconds. It must be shorter than the gap between fires.</li>
+              </ul>
+            </div>
+          </div>
+          <div class="grid" style="margin-top:16px;">
+            <div class="panel">
+              <div class="eyebrow">Storage</div>
+              <h2>Managed or your own bucket</h2>
+              <ul>
+                <li><b>Stoarama-managed</b> storage when available, billed at $0.10 per GB-month for the time each clip is kept.</li>
+                <li><b>Your own S3-compatible bucket</b>: Cloudflare R2, Amazon S3, Backblaze B2, Wasabi, DigitalOcean Spaces, or any S3-compatible endpoint. Credentials are connection-checked before a recording can use them.</li>
+              </ul>
+            </div>
+            <div class="panel">
+              <div class="eyebrow">Managing recordings</div>
+              <h2>Pause, resume, delete</h2>
+              <ul>
+                <li>The <a href="/recordings">/recordings</a> list shows each recording's status and health, a live cost ledger, and a per-recording monthly estimate.</li>
+                <li>Pause or resume a recording at any time, or delete it.</li>
+              </ul>
             </div>
           </div>
           <div class="panel" style="margin-top:16px;">
-            <div class="eyebrow">Browser session</div>
-            <h2>Recording actions from the UI</h2>
-            <pre><code>POST /api/v1/recording/streams/{id}/assign
-POST /api/v1/recording/streams/{id}/unassign
-GET  /api/v1/account/me
-GET  /api/v1/account/api-keys
-POST /api/v1/account/api-keys</code></pre>
+            <div class="eyebrow">Clips</div>
+            <h2>Working with captured clips</h2>
+            <ul>
+              <li>Each recording has its own clip page with a paginated list. View a clip inline or download it.</li>
+              <li>Download all clips on the page as a ZIP with an in-zip <code>manifest.csv</code> (id, filename, start, end, duration_ms, size_bytes, object_key, status).</li>
+              <li>Send any clip to another of your S3 buckets. The original is kept.</li>
+              <li>Delete a single clip or all clips for a recording.</li>
+            </ul>
           </div>
         </section>
 
         <section id="sectionSelfServe" class="section panel">
-          <div class="eyebrow">Self-Serve Setup</div>
-          <h1>Run local recording on your own machine.</h1>
-          <p>Self-serve is the right path when researchers need local browser credentials while still using Stoarama’s catalog and account model.</p>
+          <div class="eyebrow">Catalog &amp; self-record</div>
+          <h1>Browse the catalog, or capture it yourself.</h1>
+          <p>The catalog on <a href="/streams">/streams</a> is open to everyone. Each stream has a detail page with its metadata, a live preview where the source allows it, a <b>Record this stream</b> button that opens the recorder pre-filled, and a copy-paste command to capture it from your own machine.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
-              <div class="eyebrow">Account setup</div>
-              <h2>Start in account tools</h2>
+              <div class="eyebrow">Browsing</div>
+              <h2>Catalog segments</h2>
               <ul>
-                <li>Sign in with an emailed sign-in link.</li>
-                <li>Create or use an API key on <code>/account</code>.</li>
-                <li>Run <code>stoarama recording youtube run --stream-id N</code> from the machine with local credentials.</li>
+                <li><b>Recordable</b>: HLS and direct-video streams the hosted recorder accepts.</li>
+                <li><b>Still image</b>: snapshot sources that refresh on a poll.</li>
+                <li><b>YouTube</b>: view-only streams you can watch and self-record.</li>
+                <li><b>Korea</b>: streams from Korean public sources, on <a href="/korea">/korea</a>.</li>
               </ul>
             </div>
             <div class="panel">
-              <div class="eyebrow">Operational split</div>
-              <h2>What stays local vs remote</h2>
-              <ul>
-                <li>Cookies and local browser auth stay on your own machine.</li>
-                <li>Stoarama stores assignment state and recording metadata.</li>
-                <li>Researchers still browse streams and monitor recording in the main web UI.</li>
-              </ul>
+              <div class="eyebrow">Record this yourself</div>
+              <h2>Capture on your own machine</h2>
+              <p>Each detail page gives a command tailored to the stream type. For an HLS or direct-video stream:</p>
+              <pre><code>ffmpeg -i "&lt;resolved .m3u8 or HTTPS URL&gt;" -t 60 -c copy "stream.mp4"</code></pre>
+              <p>For a YouTube stream:</p>
+              <pre><code>yt-dlp "&lt;watch URL&gt;"</code></pre>
+              <p>Both need the named tool installed. <code>-t 60</code> records 60 seconds; remove it to record until you stop.</p>
             </div>
           </div>
         </section>
