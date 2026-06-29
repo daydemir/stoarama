@@ -36,7 +36,7 @@ func ObjectKey(streamID int64, day time.Time) string {
 }
 
 // SelectTargets returns all streams to survey, independent of recording_state.
-// Pruning is deferred, so no exclusion filter is applied yet.
+// The only exclusion is YouTube (see the query comment); pruning is deferred.
 func SelectTargets(ctx context.Context, pool *pgxpool.Pool) ([]Target, error) {
 	// YouTube streams are excluded: resolving them requires yt-dlp hitting
 	// YouTube from the survey host, which gets the server IP blocked. They are
