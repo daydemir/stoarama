@@ -268,6 +268,37 @@
       </section>
     </div>
 
+    <section id="billingPanel" class="panel hidden" style="margin-bottom:16px;">
+      <div class="section-title">
+        <div>
+          <div class="eyebrow">Billing &amp; costs</div>
+          <h2>This billing period</h2>
+        </div>
+        <button id="billingManageBtn" class="secondary" type="button" style="width:auto;min-width:160px;">Manage payment method</button>
+      </div>
+      <div id="billingStatus" class="status">Loading billing...</div>
+      <div id="billingBody" class="hidden">
+        <div class="grid-2" style="margin-bottom:14px;">
+          <div class="token-box">
+            <div class="token-box-title">Usage so far</div>
+            <div id="usageRecDays" class="session-meta"></div>
+            <div id="usageStorage" class="session-meta"></div>
+          </div>
+          <div class="token-box">
+            <div class="token-box-title">Estimated upcoming bill</div>
+            <div id="estBreakdown" class="session-meta mono"></div>
+          </div>
+        </div>
+        <div id="paymentRow" class="session-meta" style="margin-bottom:6px;"></div>
+        <div id="periodRow" class="muted" style="font-size:12px;"></div>
+        <p class="muted" style="font-size:12px;margin:10px 0 0;">
+          Amounts are live estimates from your usage this month, not a final invoice. You are billed monthly in arrears:
+          $0.50 for each day a recording captured at least one clip, plus, for Stoarama-managed storage, $0.10 per GB stored for a month.
+          Days when nothing recorded are never charged.
+        </p>
+      </div>
+    </section>
+
     <section class="panel" style="margin-bottom:16px;">
       <div class="section-title">
         <div>
@@ -395,6 +426,15 @@
     const nodesEmpty = document.getElementById('nodesEmpty');
     const nodesBox = document.getElementById('nodesBox');
     const nodesRows = document.getElementById('nodesRows');
+    const billingPanel = document.getElementById('billingPanel');
+    const billingStatus = document.getElementById('billingStatus');
+    const billingBody = document.getElementById('billingBody');
+    const billingManageBtn = document.getElementById('billingManageBtn');
+    const usageRecDays = document.getElementById('usageRecDays');
+    const usageStorage = document.getElementById('usageStorage');
+    const estBreakdown = document.getElementById('estBreakdown');
+    const paymentRow = document.getElementById('paymentRow');
+    const periodRow = document.getElementById('periodRow');
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const requestedRedirectPath = (() => {
@@ -426,6 +466,69 @@
     function formatDate(v) {
       if (!v) return 'Never';
       try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
+    }
+
+    function usd(cents) { return `$${(Number(cents || 0) / 100).toFixed(2)}`; }
+
+    function fmtDay(iso) {
+      if (!iso) return '';
+      try { return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); }
+      catch (_) { return ''; }
+    }
+
+    // Render the billing panel from a GET /billing payload. Pure given the payload
+    // + DOM nodes; all money is server-derived, labelled as an estimate.
+    function renderBilling(b) {
+      const dayRate = Number(b.recording_day_rate_cents || 50);
+      const gbRate = Number(b.gb_month_rate_cents || 10);
+      const days = Number(b.recording_days_this_month || 0);
+      const gb = Number(b.storage_gb_month_avg || 0);
+      const dayCents = Number(b.estimated_amount_cents || 0);
+      const storeCents = Number(b.estimated_storage_amount_cents || 0);
+      const totalCents = dayCents + storeCents;
+
+      usageRecDays.innerHTML =
+        `<div><b>${days}</b> recording-day${days === 1 ? '' : 's'} this month</div>`;
+      usageStorage.innerHTML = gb > 0
+        ? `<div><b>${gb.toFixed(3)}</b> GB-month managed storage</div>`
+        : `<div class="muted">No managed storage this month</div>`;
+
+      const lines = [`<div>${days} × ${usd(dayRate)} record-day = <b>${usd(dayCents)}</b></div>`];
+      if (gb > 0) lines.push(`<div>${gb.toFixed(3)} GB-mo × ${usd(gbRate)} = <b>${usd(storeCents)}</b></div>`);
+      lines.push(`<div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></div>`);
+      estBreakdown.innerHTML = lines.join('');
+
+      if (b.has_payment_method === true) {
+        paymentRow.innerHTML = `<div class="ok" style="color:var(--ok);">Card on file.</div>`;
+        billingManageBtn.textContent = 'Manage payment method';
+      } else {
+        paymentRow.innerHTML = `<div class="muted">No card on file yet. Adding a card does not charge you.</div>`;
+        billingManageBtn.textContent = 'Add a card';
+      }
+
+      if (b.period_end) {
+        const span = b.period_start ? `${fmtDay(b.period_start)} – ${fmtDay(b.period_end)}` : `through ${fmtDay(b.period_end)}`;
+        periodRow.textContent = `Current period: ${span}. Next invoice on or around ${fmtDay(b.period_end)}.`;
+      } else {
+        periodRow.textContent = 'Your billing period starts once you add a card.';
+      }
+    }
+
+    async function loadBilling() {
+      try {
+        const b = await fetchJSON('/api/v1/account/billing');
+        if (b && b.billing_enabled === false) { billingPanel.classList.add('hidden'); return; }
+        billingPanel.classList.remove('hidden');
+        renderBilling(b || {});
+        setStatus(billingStatus, '', '');
+        billingStatus.classList.add('hidden');
+        billingBody.classList.remove('hidden');
+      } catch (err) {
+        billingPanel.classList.remove('hidden');
+        billingBody.classList.add('hidden');
+        billingStatus.classList.remove('hidden');
+        setStatus(billingStatus, `Could not load billing: ${String(err.message || err)}`, 'err');
+      }
     }
 
     function escapeHTML(v) {
@@ -632,6 +735,7 @@
           ${authCompleted && continueTarget ? `<div class="muted">Continuing to ${escapeHTML(continueTarget)}...</div>` : ''}
         `;
         setStatus(accountStatus, authCompleted ? `Signed in as ${email} in this browser.` : 'Signed in.', 'ok');
+        void loadBilling();
         if (isOperator) {
           operatorTools.classList.remove('hidden');
           keysEmpty.classList.add('hidden');
@@ -652,6 +756,7 @@
       } catch (_) {
         currentAccount = null;
         accountBox.classList.add('hidden');
+        billingPanel.classList.add('hidden');
         keysBox.classList.add('hidden');
         keysEmpty.classList.remove('hidden');
         enrollmentBox.classList.add('hidden');
@@ -678,6 +783,22 @@
         setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
       } catch (err) {
         setStatus(requestStatus, String(err), 'err');
+      }
+    });
+
+    billingManageBtn.addEventListener('click', async () => {
+      billingManageBtn.disabled = true;
+      try {
+        const out = await fetchJSON('/api/v1/account/billing/card', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const url = (out && (out.checkout_url || out.portal_url)) || '';
+        if (url) { window.location.assign(url); return; }
+        setStatus(billingStatus, 'No billing URL returned.', 'err');
+      } catch (err) {
+        setStatus(billingStatus, String(err.message || err), 'err');
+      } finally {
+        billingManageBtn.disabled = false;
       }
     });
 

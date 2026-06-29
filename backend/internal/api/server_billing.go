@@ -83,6 +83,28 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		avgGB = float64(snapBytes) / float64(snapDays) / 1e9
 	}
 
+	// Best-effort billing-period context for the account view. Null when there is
+	// no subscription yet or Stripe is unreachable; never fails the response.
+	var periodStart, periodEnd *string
+	if s.billing != nil {
+		var subID *string
+		_ = s.pool.QueryRow(r.Context(), `
+			SELECT stripe_subscription_id FROM account_billing WHERE account_id=$1
+		`, principal.AccountID).Scan(&subID)
+		if subID != nil && strings.TrimSpace(*subID) != "" {
+			if start, end, err := s.billing.GetSubscriptionPeriod(r.Context(), strings.TrimSpace(*subID)); err == nil {
+				if !start.IsZero() {
+					v := start.Format(time.RFC3339)
+					periodStart = &v
+				}
+				if !end.IsZero() {
+					v := end.Format(time.RFC3339)
+					periodEnd = &v
+				}
+			}
+		}
+	}
+
 	// Managed storage is offered only when billing is on AND the operator R2 is
 	// configured; otherwise the UI shows BYO only and the provision endpoint 503s.
 	managedAvailable := s.billing != nil && s.r2 != nil && s.cfg.ValidateR2() == nil
@@ -96,6 +118,10 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		"managed_available":              managedAvailable,
 		"storage_gb_month_avg":           strconv.FormatFloat(avgGB, 'f', 3, 64),
 		"estimated_storage_amount_cents": int64(math.Round(avgGB * float64(gbMonthRateCents))),
+		"period_start":                   periodStart,
+		"period_end":                     periodEnd,
+		"recording_day_rate_cents":       recordingDayRateCents,
+		"gb_month_rate_cents":            gbMonthRateCents,
 	})
 }
 

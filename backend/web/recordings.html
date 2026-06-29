@@ -406,6 +406,13 @@
           </div>
         </div>
 
+        <!-- Projected monthly cost for this configuration (honest estimate) -->
+        <div class="field" id="estimateField" style="margin-bottom:0;">
+          <label>Estimated monthly cost</label>
+          <div id="costEstimate" class="preview"></div>
+          <div id="costEstimateNote" class="hint"></div>
+        </div>
+
         <!-- Where clips go -->
         <div class="field">
           <label>Where clips go</label>
@@ -528,6 +535,8 @@
       clipSeg: document.getElementById('clipSeg'),
       clipCustomWrap: document.getElementById('clipCustomWrap'),
       clipCustom: document.getElementById('clipCustom'),
+      costEstimate: document.getElementById('costEstimate'),
+      costEstimateNote: document.getElementById('costEstimateNote'),
       bucketState: document.getElementById('bucketState'),
       storageChooser: document.getElementById('storageChooser'),
       managedStatus: document.getElementById('managedStatus'),
@@ -555,6 +564,11 @@
     // Server invariants mirrored client-side (REC_SCHED_MIN_INTERVAL_SEC=600;
     // clip must be strictly shorter than the gap). Pre-flight only; server is truth.
     const MIN_GAP_SEC = 600;
+
+    // Assumed average video bitrate for the clip-size estimate (720p HLS ~2.5 Mbps).
+    // Shown in the UI so the projection reads as an estimate, not a quote. Real
+    // billing uses recording_clips.size_bytes; this only powers the live preview.
+    const EST_BITRATE_MBPS = 2.5;
 
     // Provider presets. Endpoint/region are auto-filled where the host is fixed;
     // R2 and "Other" leave the endpoint editable because the host is account-specific.
@@ -718,38 +732,161 @@
       return Number(state.clipSelected) || 0;
     }
 
-    // Compute the next fire time for a known preset, for the advisory preview.
-    function nextRunDate(now) {
-      const d = new Date(now.getTime());
-      d.setSeconds(0, 0);
+    // The wall-clock parts of an instant in a given IANA zone, as numbers.
+    function zoneParts(date, tz) {
+      const f = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+      });
+      const p = {};
+      for (const part of f.formatToParts(date)) p[part.type] = part.value;
+      if (p.hour === '24') p.hour = '00';
+      return { y: +p.year, mo: +p.month, d: +p.day, h: +p.hour, mi: +p.minute, s: +p.second };
+    }
+
+    // The UTC instant whose wall time in tz is (y,mo,d,h,mi). Solves the offset by
+    // fixed-point (2 passes covers all real zones incl. DST boundaries).
+    function instantForZoneWall(y, mo, d, h, mi, tz) {
+      let guess = Date.UTC(y, mo - 1, d, h, mi, 0);
+      for (let k = 0; k < 2; k++) {
+        const zp = zoneParts(new Date(guess), tz);
+        const asUTC = Date.UTC(zp.y, zp.mo - 1, zp.d, zp.h, zp.mi, zp.s);
+        guess += Date.UTC(y, mo - 1, d, h, mi, 0) - asUTC;
+      }
+      return new Date(guess);
+    }
+
+    // Compute the next fire INSTANT (a Date) for a known preset, interpreting the
+    // schedule in the SELECTED timezone. For interval presets the next boundary is
+    // zone-independent; daily lands on the selected zone's wall clock.
+    function nextRunDate(now, tz) {
       switch (state.schedPreset) {
-        case '15m': { const add = 15 - (d.getMinutes() % 15 || 15); d.setMinutes(d.getMinutes() + (d.getMinutes() % 15 === 0 ? 15 : add)); return d; }
-        case '30m': { const add = 30 - (d.getMinutes() % 30 || 30); d.setMinutes(d.getMinutes() + (d.getMinutes() % 30 === 0 ? 30 : add)); return d; }
-        case 'hourly': { d.setMinutes(0); d.setHours(d.getHours() + 1); return d; }
-        case '4h': { d.setMinutes(0); const h = d.getHours(); const next = (Math.floor(h / 4) + 1) * 4; d.setHours(next); return d; }
+        case '15m': case '30m': case 'hourly': case '4h': {
+          const stepMin = { '15m': 15, '30m': 30, 'hourly': 60, '4h': 240 }[state.schedPreset];
+          const stepMs = stepMin * 60000;
+          const next = Math.floor(now.getTime() / stepMs) * stepMs + stepMs;
+          return new Date(next);
+        }
         case 'daily': {
           const m = /^(\d{1,2}):(\d{2})$/.exec(String(els.dailyTime.value || ''));
           if (!m) return null;
-          const t = new Date(now.getTime());
-          t.setSeconds(0, 0); t.setHours(Number(m[1]), Number(m[2]), 0, 0);
-          if (t.getTime() <= now.getTime()) t.setDate(t.getDate() + 1);
-          return t;
+          const hh = Number(m[1]); const mm = Number(m[2]);
+          for (let i = 0; i < 2; i++) {
+            const base = new Date(now.getTime() + i * 86400000);
+            const bp = zoneParts(base, tz);
+            const cand = instantForZoneWall(bp.y, bp.mo, bp.d, hh, mm, tz);
+            if (cand.getTime() > now.getTime()) return cand;
+          }
+          return null;
         }
         default: return null;
       }
     }
 
-    function formatNextRun(d) {
+    // Format an instant as "today/tomorrow/<date> at <time>" computed in tz, so the
+    // today/tomorrow words and the clock both reflect the SELECTED zone.
+    function formatNextRun(d, tz) {
       if (!d) return '';
       const now = new Date();
-      const sameDay = d.toDateString() === now.toDateString();
-      const tomorrow = new Date(now.getTime() + 86400000);
-      const isTomorrow = d.toDateString() === tomorrow.toDateString();
-      const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-      let when = d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
-      if (sameDay) when = 'today';
-      else if (isTomorrow) when = 'tomorrow';
+      const dz = zoneParts(d, tz);
+      const nz = zoneParts(now, tz);
+      const tz1 = zoneParts(new Date(now.getTime() + 86400000), tz);
+      const time = new Intl.DateTimeFormat([], {
+        timeZone: tz, hour: 'numeric', minute: '2-digit',
+      }).format(d);
+      let when;
+      if (dz.y === nz.y && dz.mo === nz.mo && dz.d === nz.d) when = 'today';
+      else if (dz.y === tz1.y && dz.mo === tz1.mo && dz.d === tz1.d) when = 'tomorrow';
+      else when = new Intl.DateTimeFormat([], {
+        timeZone: tz, weekday: 'short', month: 'short', day: 'numeric',
+      }).format(d);
       return `${when} at ${time}`;
+    }
+
+    // Approximate fires-per-UTC-day for the active preset. Used for the cost
+    // estimate only; the server enforces the real schedule.
+    function estRunsPerDay() {
+      switch (state.schedPreset) {
+        case '15m': return 96;
+        case '30m': return 48;
+        case 'hourly': return 24;
+        case '4h': return 6;
+        case 'daily': return 1;
+        case 'custom': return null; // unknown cadence -> see estimate copy
+        default: return null;
+      }
+    }
+
+    // Number of UTC days in the CURRENT calendar month that this recording's
+    // window overlaps, clamped to [today, month end]. Open-ended -> through month
+    // end. This is the count of days that could each be a billable record-day.
+    function estActiveDaysThisMonth() {
+      const now = new Date();
+      const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      const w = compiledWindow();                       // existing helper, lines 1206-1210
+      const start = new Date(w.startISO);
+      const end = w.endISO ? new Date(w.endISO) : monthEnd;
+      const from = start.getTime() > now.getTime() ? start : now;
+      const to = end.getTime() < monthEnd.getTime() ? end : monthEnd;
+      if (to.getTime() < from.getTime()) return 0;
+      const dayMs = 86400000;
+      const d0 = Math.floor(from.getTime() / dayMs);
+      const d1 = Math.floor(to.getTime() / dayMs);
+      return Math.max(0, d1 - d0 + 1);
+    }
+
+    // Returns the cost-estimate model for the current composer config, or null
+    // when the schedule cadence is unknown (custom) so callers can show fallback
+    // copy. Rates come from /billing when present, else the published 50c/10c.
+    function estimateModel() {
+      const b = state.billing || {};
+      const dayRate = Number(b.recording_day_rate_cents || 50);
+      const gbRate = Number(b.gb_month_rate_cents || 10);
+      const runsPerDay = estRunsPerDay();
+      const clipSec = selectedClipSec();                // existing, lines 713-719
+      const activeDays = estActiveDaysThisMonth();
+      if (runsPerDay === null || clipSec <= 0) return null;
+
+      const recordDayCents = activeDays * dayRate;
+
+      // Clip bytes ~= bitrate(bits/s) * seconds / 8. Bytes per active day, total
+      // bytes this month, average GB held ~= half of the month's total.
+      const clipBytes = (EST_BITRATE_MBPS * 1e6 * clipSec) / 8;
+      const bytesPerDay = clipBytes * runsPerDay;
+      const monthTotalBytes = bytesPerDay * activeDays;
+      const managed = state.storageChoice === 'managed';
+      const avgGB = managed ? (monthTotalBytes / 2) / 1e9 : 0;
+      const storageCents = Math.round(avgGB * gbRate);
+
+      return {
+        activeDays, runsPerDay, clipSec, dayRate, gbRate, managed,
+        recordDayCents, avgGB, storageCents,
+        totalCents: recordDayCents + storageCents,
+      };
+    }
+
+    function renderCostEstimate() {
+      if (!state.billingEnabled) { els.costEstimate.textContent = ''; els.costEstimateNote.textContent = ''; return; }
+      const m = estimateModel();
+      if (!m) {
+        els.costEstimate.innerHTML = '<span class="muted">Set a schedule and clip length to estimate cost.</span>';
+        els.costEstimateNote.textContent = state.schedPreset === 'custom'
+          ? 'Custom schedules are estimated after you save.' : '';
+        return;
+      }
+      const usd = (c) => `$${(Number(c || 0) / 100).toFixed(2)}`;
+      const parts = [
+        `<span class="muted">~</span><b>${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
+        `<span class="muted"> &middot; ${m.activeDays} record-day${m.activeDays === 1 ? '' : 's'} × $${(m.dayRate / 100).toFixed(2)} = ${usd(m.recordDayCents)}</span>`,
+      ];
+      if (m.managed && m.storageCents > 0) {
+        parts.push(`<span class="muted"> + ~${m.avgGB.toFixed(2)} GB-mo × $${(m.gbRate / 100).toFixed(2)} = ${usd(m.storageCents)}</span>`);
+      }
+      els.costEstimate.innerHTML = parts.join('');
+      els.costEstimateNote.textContent = m.managed
+        ? `Estimate only. Storage assumes ~${EST_BITRATE_MBPS} Mbps video; actual clip sizes vary. Billed monthly in arrears.`
+        : `Estimate only. Your own bucket = no storage charge. Billed monthly in arrears.`;
     }
 
     // Updates the preview line + the inline gap/clip pre-flight warning, and
@@ -768,9 +905,10 @@
           els.schedPreview.innerHTML = `<span class="muted">Cron </span><span class="mono">${escapeHTML(c.cron)}</span><span class="muted"> &middot; validated on save</span>`;
         }
       } else {
-        const d = nextRunDate(new Date());
+        const tz = selectedTimezone();
+        const d = nextRunDate(new Date(), tz);
         els.schedPreview.innerHTML = d
-          ? `<span class="muted">Next run: </span>${escapeHTML(formatNextRun(d))} <span class="muted">(your time)</span>`
+          ? `<span class="muted">Next run: </span>${escapeHTML(formatNextRun(d, tz))} <span class="muted">${escapeHTML(tz)}</span>`
           : '';
       }
 
@@ -801,6 +939,7 @@
       els.dailyControls.classList.toggle('hidden', preset !== 'daily');
       els.customControls.classList.toggle('hidden', preset !== 'custom');
       refreshScheduleUI();
+      renderCostEstimate();
       refreshStartEnabled();
     }
 
@@ -811,6 +950,7 @@
       });
       els.clipCustomWrap.classList.toggle('hidden', clip !== 'custom');
       refreshScheduleUI();
+      renderCostEstimate();
       refreshStartEnabled();
     }
 
@@ -936,6 +1076,7 @@
       });
       els.destPicker.classList.add('hidden');
       els.connectForm.classList.add('hidden');
+      renderCostEstimate();
       const existing = managedDest();
       if (existing) { applyStorageChoiceUI(); return; }
       if (state.provisioningManaged) return;
@@ -966,6 +1107,7 @@
         btn.classList.toggle('on', btn.getAttribute('data-storage') === 'byo');
       });
       applyStorageChoiceUI();
+      renderCostEstimate();
     }
 
     // ---- Provider connect form ----
@@ -2111,6 +2253,7 @@
       renderCardBanner();
       renderStorageChooser();
       startButtonLabel();
+      renderCostEstimate();
     }
 
     function renderCardBanner() {
@@ -2138,13 +2281,13 @@
       const v = b.getAttribute('data-clip');
       b.addEventListener('click', () => setClip(v === 'custom' ? 'custom' : Number(v)));
     });
-    els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
-    els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
+    els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.schedTZCustom.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
-    els.clipCustom.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); });
-    els.startAt.addEventListener('input', refreshWindowUI);
-    els.endAt.addEventListener('input', refreshWindowUI);
+    els.clipCustom.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
+    els.startAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
+    els.endAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
     els.recURL.addEventListener('input', scheduleStreamProbe);
     els.recURL.addEventListener('blur', () => {
       window.clearTimeout(streamDebounce);
@@ -2196,6 +2339,7 @@
       fillProviderSelect();
       setSchedPreset('hourly');
       setClip(60);
+      renderCostEstimate();
       try {
         const account = await fetchAccountWithRetry();
         state.account = account;
