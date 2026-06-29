@@ -38,6 +38,11 @@ func ObjectKey(streamID int64, day time.Time) string {
 // SelectTargets returns all streams to survey, independent of recording_state.
 // Pruning is deferred, so no exclusion filter is applied yet.
 func SelectTargets(ctx context.Context, pool *pgxpool.Pool) ([]Target, error) {
+	// YouTube streams are excluded: resolving them requires yt-dlp hitting
+	// YouTube from the survey host, which gets the server IP blocked. They are
+	// also not recordable by the recorder, so the survey has no reason to fetch
+	// them. Excluded by provider, capture_type, and source host to be robust to
+	// any single field being unset.
 	rows, err := pool.Query(ctx, `
 		SELECT id,
 		       COALESCE(provider, ''),
@@ -47,6 +52,12 @@ func SelectTargets(ctx context.Context, pool *pgxpool.Pool) ([]Target, error) {
 		       COALESCE(source_family, ''),
 		       COALESCE(execution_class, '')
 		FROM streams
+		WHERE COALESCE(provider, '') NOT ILIKE 'youtube'
+		  AND COALESCE(capture_type, '') NOT IN ('youtube_watch', 'youtube_relay')
+		  AND lower(COALESCE(source_url, '')) NOT LIKE '%youtube.com%'
+		  AND lower(COALESCE(source_url, '')) NOT LIKE '%youtu.be%'
+		  AND lower(COALESCE(source_page_url, '')) NOT LIKE '%youtube.com%'
+		  AND lower(COALESCE(source_page_url, '')) NOT LIKE '%youtu.be%'
 		ORDER BY id
 	`)
 	if err != nil {
