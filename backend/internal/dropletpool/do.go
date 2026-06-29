@@ -382,24 +382,24 @@ runcmd:
       git -C /opt/stoarama reset --hard origin/{{.RepoRef}}
     fi
   - |
-    # Build the worker binary when the freshly-reset source has moved past the
-    # binary baked into the image, so pushed worker changes ship on the next
-    # droplet without a snapshot rebake. A rebaked image whose .sha matches HEAD
-    # skips the build for a fast (~1-2 min) boot; the build uses the image's warm
-    # Go module + build caches under /root. A build failure exits non-zero so
-    # provisioning fails fast rather than running a stale binary. cloud-init runcmd
-    # has no HOME/PATH for the Go 1.24 toolchain or its caches, so set them here.
+    # Always rebuild the worker binary from the freshly-reset source at first
+    # boot so the running binary can never lag HEAD. The previous BUILT_SHA
+    # fast-path could leave a stale baked-image binary in place while .sha falsely
+    # claimed it was current (sha written without the build producing a new
+    # binary), so an out-of-date worker ran under systemd Restart=always. A clean
+    # build with warm Go module + build caches under /root costs ~1-2 min, which
+    # is cheap insurance against shipping a stale binary. A build failure exits
+    # non-zero so provisioning fails fast rather than running stale. cloud-init
+    # runcmd has no HOME/PATH for the Go 1.24 toolchain or its caches, so set them
+    # here.
     set -e
     export HOME=/root
     export PATH=/usr/local/go/bin:$PATH
     export GOPATH=/root/go
     export GOCACHE=/root/.cache/go-build
     HEAD_SHA="$(git -C /opt/stoarama rev-parse HEAD)"
-    BUILT_SHA="$(cat /opt/stoarama/bin/.stoaramactl.sha 2>/dev/null || true)"
-    if [ ! -x /opt/stoarama/bin/stoaramactl ] || [ "$HEAD_SHA" != "$BUILT_SHA" ]; then
-      (cd /opt/stoarama/backend && go build -o bin/stoaramactl ./cmd/stoaramactl)
-      printf '%s' "$HEAD_SHA" > /opt/stoarama/bin/.stoaramactl.sha
-    fi
+    (cd /opt/stoarama/backend && go build -o bin/stoaramactl ./cmd/stoaramactl)
+    printf '%s' "$HEAD_SHA" > /opt/stoarama/bin/.stoaramactl.sha
   - chmod +x /opt/stoarama/backend/scripts/start-recording-worker.sh
   - systemctl daemon-reload
   - systemctl enable --now stoarama-egress-firewall.service

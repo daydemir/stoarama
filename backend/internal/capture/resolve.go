@@ -57,7 +57,23 @@ func ResolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL
 		}
 	}
 
+	// Fail closed: an indirect marker (e.g. "!hls") that survived resolution is
+	// not a playable URL. Handing it to ffmpeg yields "Invalid data found"
+	// (exit 183), so reject it here exactly as the survey path's
+	// hlsLiveAdapter.Resolve does, rather than silently passing the raw marker.
+	if hasIndirectMarker(streamURL) {
+		return "", false, fmt.Errorf("indirect stream reference did not resolve to a playable URL: %s", streamURL)
+	}
+
 	return streamURL, false, nil
+}
+
+// hasIndirectMarker reports whether a URL still carries an internal indirect
+// source marker that must be resolved before capture. "!hls" is the only such
+// marker the catalog uses today; keyed generically so any future marker is also
+// caught rather than passed through to ffmpeg.
+func hasIndirectMarker(streamURL string) bool {
+	return strings.Contains(strings.ToLower(streamURL), "!hls")
 }
 
 func resolveYouTubeStreamURL(ctx context.Context, watchURL string) (string, error) {
