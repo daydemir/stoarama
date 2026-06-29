@@ -280,13 +280,13 @@
           <div><div class="eyebrow">Card needed</div><h2>Add a card before your first recording</h2></div>
           <button id="cardBannerBtn" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Add a card</button>
         </div>
-        <p class="muted" style="margin:0;">Adding a card does not charge you. You are billed $0.50 for each day a recording captures something, totalled and charged once a month.</p>
+        <p class="muted" style="margin:0;">Adding a card does not charge you. You are billed $0.50 for each day a recording captures at least one clip, totalled and charged once a month.</p>
       </div>
 
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
       <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
         <h1>Record any public stream to your own storage.</h1>
-        <p class="empty-hero-sub">Set up a recording of any public HLS or HTTPS stream and choose how often it captures a clip. Each clip is saved to your own S3-compatible bucket, or to storage we manage for you. You can browse, download, or delete your clips anytime, and send any clip to your S3. Pricing is $0.50 for each day a recording captures something, billed once a month. You are never charged for a day nothing was recorded.</p>
+        <p class="empty-hero-sub">Set up a recording of any public HLS or HTTPS stream and choose how often it captures a clip. Each clip is saved to your own S3-compatible bucket, or to storage we manage for you. You can browse, download, or delete your clips anytime, and send any clip to your S3. Pricing is $0.50 for each day a recording captures at least one clip, billed once a month. You are never charged for a day nothing was recorded.</p>
       </div>
 
       <!-- Recording cards -->
@@ -323,7 +323,7 @@
         </div>
         <div class="field">
           <label for="recName">Name (optional)</label>
-          <input id="recName" type="text" placeholder="Front-door camera" />
+          <input id="recName" type="text" placeholder="A label for this recording" />
         </div>
 
         <!-- Schedule -->
@@ -940,7 +940,7 @@
       const usd = (c) => usdCents(c);
       const parts = [
         `<span class="muted">~</span><b>${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
-        `<span class="muted"> &middot; ${m.activeDays} record-day${m.activeDays === 1 ? '' : 's'} × $${(m.dayRate / 100).toFixed(2)} = ${usd(m.recordDayCents)}</span>`,
+        `<span class="muted"> &middot; ${m.activeDays} recording-day${m.activeDays === 1 ? '' : 's'} × $${(m.dayRate / 100).toFixed(2)} = ${usd(m.recordDayCents)}</span>`,
       ];
       if (m.managed && m.avgGB > 0) {
         parts.push(`<span class="muted"> + ~${m.avgGB.toFixed(3)} GB-mo × $${(m.gbRate / 100).toFixed(2)} = ${usdStorage(m.avgGB, m.gbRate, m.storageCents)}</span>`);
@@ -1706,7 +1706,7 @@
       const a = fmt(startISO);
       const b = new Date(endISO);
       const bt = Number.isFinite(b.getTime()) ? b.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
-      return bt ? `${a} – ${bt}` : a;
+      return bt ? `${a} to ${bt}` : a;
     }
 
     // Fetch + render a recording's clip panel; used on first open and after any
@@ -2292,7 +2292,7 @@
       els.returnBody.innerHTML = `
         <div class="eyebrow">One more step</div>
         <h2>Add a card</h2>
-        <p class="interstitial-body">Add a card to start recording. No charge now; you are billed $0.50 for each day a recording captures, monthly.</p>
+        <p class="interstitial-body">Add a card to start recording. No charge now; you are billed $0.50 for each day a recording captures at least one clip, monthly.</p>
         <p class="muted" style="margin:0;">Redirecting to secure checkout. We never see your card.</p>`;
       window.setTimeout(() => window.location.assign(url), 700);
     }
@@ -2370,7 +2370,7 @@
       const needsCard = state.billingEnabled && state.billing.has_payment_method !== true;
       const managed = state.storageChoice === 'managed';
       els.startBtn.textContent = needsCard ? 'Add a card to start recording' : 'Start recording';
-      const daysCharge = '$0.50 for each day a recording captures';
+      const daysCharge = '$0.50 for each day a recording captures at least one clip';
       const storageCharge = ', plus $0.10/GB-month for managed storage';
       els.composerFootnote.textContent = state.billingEnabled
         ? (needsCard
