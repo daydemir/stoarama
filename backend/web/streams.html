@@ -81,7 +81,7 @@
       gap: 10px;
       justify-content: flex-end;
     }
-    .site-title { font-size: 15px; font-weight: 600; letter-spacing: 0.05em; color: var(--accent); font-family: var(--mono); }
+    .site-title { font-size: 15px; font-weight: 600; letter-spacing: 0.05em; color: var(--accent); font-family: var(--mono); text-decoration: none; }
     .site-subtitle { display: none; }
     .metrics-row {
       display: flex;
@@ -136,6 +136,17 @@
       background: var(--accent);
       border-color: var(--accent);
     }
+    .topbar-docs-link {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+      white-space: nowrap;
+      padding: 0 4px;
+    }
+    .topbar-docs-link:hover { color: var(--text); text-decoration: none; }
     .account-chip {
       display: inline-flex;
       align-items: center;
@@ -841,6 +852,31 @@
       line-height: 1.5;
       max-width: 920px;
     }
+    .source-segmented {
+      display: inline-flex;
+      gap: 6px;
+      padding: 4px;
+      margin: 0 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel) 90%, #000);
+    }
+    .source-seg-btn {
+      appearance: none;
+      cursor: pointer;
+      padding: 6px 14px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      text-decoration: none;
+    }
+    .source-seg-btn:hover { color: var(--text); text-decoration: none; }
+    .source-seg-btn.active { color: #fff; background: var(--accent); border-color: var(--accent); }
     .operations-shell {
       display: grid;
       gap: 10px;
@@ -1051,6 +1087,25 @@
     /* Grid for detail images */
     .detail-images { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
     @media (max-width: 900px) { .detail-images { grid-template-columns: 1fr; } }
+    .detail-live-player { margin: 14px 0 18px; }
+    .detail-live-player-mount {
+      position: relative;
+      width: 100%;
+      max-width: 880px;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .detail-live-player-mount iframe,
+    .detail-live-player-mount video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
 
     .image-card {
       background: var(--panel);
@@ -1531,17 +1586,17 @@
 <div class="shell">
   <div class="topbar">
     <div class="topbar-left">
-      <span class="site-title">STO-A-RAMA</span>
+      <a href="/" class="site-title">STO-A-RAMA</a>
       <div class="metrics-row" id="metricsRow"></div>
     </div>
     <div class="topbar-center">
       <nav class="global-nav" aria-label="Global">
-        <a href="/streams" class="active">Streams</a>
-        <a href="/korea">Korea</a>
-        <a href="/docs/getting-started">Docs</a>
+        <a href="/" class="active">Streams</a>
+        <a href="/recordings">Recording</a>
       </nav>
     </div>
     <div class="topbar-right">
+      <a class="topbar-docs-link" href="/docs/getting-started">Docs</a>
       <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">⚙</a>
       <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
     </div>
@@ -1551,6 +1606,11 @@
     <div class="domain-intro">
       <div class="domain-intro-title">Streams</div>
       <div class="domain-intro-copy">Browse every stream, location, tag, and recording setting in one place.</div>
+    </div>
+    <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
+      <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable</button>
+      <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube</button>
+      <a class="source-seg-btn" href="/korea" role="tab">Korea</a>
     </div>
     <div class="filter-stack-card">
       <div class="filter-grid filter-grid-primary">
@@ -1620,22 +1680,9 @@
       </div>
     </div>
 
-    <!-- Latest images -->
-    <div class="detail-images">
-      <div class="image-card">
-        <div class="image-card-label" id="latestCaptureLabel">Latest frame</div>
-        <div id="latestRawCard"><span class="muted fs11">No image</span></div>
-      </div>
-    </div>
-
-    <!-- Frames section -->
-    <div id="detailFramesSection">
-      <div class="detail-section-head">
-        <div class="detail-section-title" id="detailFramesRecentTitle">Latest Frames</div>
-        <div class="detail-section-subtitle" id="detailFramesRecentSubtitle">Auto-refreshes every few seconds while this page is open.</div>
-      </div>
-      <div id="detailLiveFramesStatus" class="detail-note">Loading recent frames...</div>
-      <div id="detailLiveFramesGrid" class="detail-live-grid"></div>
+    <!-- Live player (honest: real embed/HLS or nothing) -->
+    <div id="detailLivePlayer" class="detail-live-player" style="display:none;">
+      <div id="detailLivePlayerMount" class="detail-live-player-mount"></div>
     </div>
 
   </div>
@@ -1682,6 +1729,7 @@
 </div>
 <datalist id="streamTagSuggestionsList"></datalist>
 
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <script>
 // ─── DOM refs ────────────────────────────────────────────────────────────────
 const missingDomCache = new Map();
@@ -1797,18 +1845,14 @@ const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
 const detailViewCTA = $('detailViewCTA');
 const detailRecordCTA = $('detailRecordCTA');
+const detailLivePlayer = $('detailLivePlayer');
+const detailLivePlayerMount = $('detailLivePlayerMount');
+let detailHlsInstance = null;
 const detailActions = $('detailActions');
 const detailSourcePanel = $('detailSourcePanel');
-const latestCaptureLabel = $('latestCaptureLabel');
-const latestRawCard = $('latestRawCard');
-const detailLiveFramesStatus = $('detailLiveFramesStatus');
-const detailLiveFramesGrid = $('detailLiveFramesGrid');
-const detailFramesRecentTitle = $('detailFramesRecentTitle');
-const detailFramesRecentSubtitle = $('detailFramesRecentSubtitle');
 const detailClipPreviewBlock = $('detailClipPreviewBlock');
 const detailClipPreviewStatus = $('detailClipPreviewStatus');
 const detailClipPreviewSlot = $('detailClipPreviewSlot');
-const detailFramesSection = $('detailFramesSection');
 const detailClipsAuth = $('detailClipsAuth');
 const detailSettingsAuth = $('detailSettingsAuth');
 const detailStatusEl = $('detailStatus');
@@ -1850,11 +1894,11 @@ let selectedPipelineID = '';
 let selectedPipelineExperimentID = 0;
 let streamTouchedPipelineID = '';
 let detailStreamID = null;
+let streamSourceSegment = 'recordable';
 let detailView = 'inference';
 let detailMainView = 'details';
 let detailData = null;
 let detailRecordingData = null;
-let detailRecentFramesData = [];
 let detailFramesData = [];
 let detailTimelineData = null;
 let detailHealthData = null;
@@ -1865,10 +1909,6 @@ let detailCoverageData = null;
 let detailCaptureSamplesData = null;
 let detailHealthHoursWindow = 72;
 let detailInferenceLoaded = false;
-let detailLivePollTimer = null;
-let detailLivePollInFlight = false;
-let detailFrameExportJobID = '';
-let detailFrameExportPollTimer = null;
 let detailDayZipPollTimer = null;
 let detailDayZipPollAttempts = 0;
 let streamRows = [];
@@ -2992,8 +3032,6 @@ function updateTimezoneLabels() {
 
 function setDetailMainView(which, opts = {}) {
   detailMainView = 'details';
-  if (detailFramesSection) detailFramesSection.style.display = '';
-  if (opts.livePolling === false) stopDetailLivePolling();
   if (detailStreamID && opts.syncURL !== false) {
     syncDetailURL({ replace: opts.replaceURL === true });
   }
@@ -3100,8 +3138,7 @@ function showPanel(which) {
   if (which === 'detail') currentStreamRoute = STREAM_ROUTE.DETAIL;
   if (which === 'streams') currentStreamRoute = STREAM_ROUTE.LIST;
   if (which !== 'detail') {
-    stopDetailLivePolling();
-    stopDetailFrameExportPolling();
+    teardownDetailLivePlayer();
   }
   const operationsVisible = which === 'discovery' || which === 'pipelines';
   if (overviewPanel) overviewPanel.style.display = which === 'overview' ? '' : 'none';
@@ -3465,115 +3502,6 @@ function moveImageModal(step) {
 
 function setDetailSubView(view, opts = {}) {
   detailView = 'frames';
-  if (detailFramesSection) detailFramesSection.style.display = '';
-  if (opts.livePolling !== false) startDetailLivePolling();
-  else stopDetailLivePolling();
-}
-
-function stopDetailLivePolling() {
-  if (detailLivePollTimer) {
-    clearTimeout(detailLivePollTimer);
-    detailLivePollTimer = null;
-  }
-}
-
-function startDetailLivePolling() {
-  stopDetailLivePolling();
-  if (!detailStreamID || detailView !== 'frames') return;
-  detailLivePollTimer = setTimeout(async () => {
-    if (!detailStreamID || detailPanel.style.display === 'none' || detailView !== 'frames') return;
-    if (detailLivePollInFlight) {
-      startDetailLivePolling();
-      return;
-    }
-    detailLivePollInFlight = true;
-    try {
-      await loadDetailLiveFrames({ quiet: true });
-    } catch (_) {
-      // Keep the previous state visible; explicit status is handled by section loaders.
-    } finally {
-      detailLivePollInFlight = false;
-      startDetailLivePolling();
-    }
-  }, 5000);
-}
-
-function stopDetailFrameExportPolling() {
-  if (detailFrameExportPollTimer) {
-    clearTimeout(detailFrameExportPollTimer);
-    detailFrameExportPollTimer = null;
-  }
-}
-
-
-function buildDetailLiveFrameCard(it) {
-  const captureMeta = detailCaptureMeta(detailRecordingData);
-  const streamIDRaw = Number(detailStreamID || 0);
-  const streamAttr = Number.isFinite(streamIDRaw) && streamIDRaw > 0 ? ` data-stream-id="${streamIDRaw}"` : '';
-  const statusTag = String(it.capture_status || '').trim() === 'success'
-    ? '<span class="tag tag-ok">success</span>'
-    : '<span class="tag tag-warn">error</span>';
-  const url = String(it.download_url || '').trim();
-  const card = document.createElement('div');
-  card.className = 'detail-live-frame';
-  card.setAttribute('data-frame-id', String(Number(it.id || 0)));
-  const mediaHTML = captureMeta.clipNative
-    ? renderClipActions(it)
-    : (url
-      ? `<a class="table-image-link" href="${esc(url)}" data-image-url="${esc(url)}" data-image-scope="frames"${streamAttr}><img class="thumb-sm" src="${esc(url)}" alt="frame" loading="lazy" decoding="async" /></a>`
-      : '<div class="img-slot"><span class="muted fs10">no image</span></div>');
-  card.innerHTML = `
-    ${mediaHTML}
-    <div class="detail-live-frame-meta">
-      ${statusTag}
-      <span class="mono fs10">${esc(captureWindowLabel(it))}</span>
-      <span class="mono fs10 muted">${esc(String(it.object_key || '-'))}</span>
-    </div>
-  `;
-  return card;
-}
-
-function renderDetailLiveFramesGrid(items) {
-  if (!(detailLiveFramesGrid instanceof HTMLElement) || !(detailLiveFramesStatus instanceof HTMLElement)) return;
-  const captureMeta = detailCaptureMeta(detailRecordingData);
-  if (!Array.isArray(items) || !items.length) {
-    detailLiveFramesStatus.textContent = `No recent ${captureMeta.plural} yet.`;
-    detailLiveFramesGrid.innerHTML = `<div class="muted fs11">No recent ${esc(captureMeta.plural)}</div>`;
-    return;
-  }
-  const latest = items[0];
-  detailLiveFramesStatus.textContent = `${items.length} recent ${captureMeta.plural} · latest ${formatDateTimeShort(captureTimestampValue(latest) || '')}`;
-  const previousIDs = Array.isArray(detailRecentFramesData) ? detailRecentFramesData.map((it) => Number(it.id || 0)) : [];
-  const nextIDs = items.map((it) => Number(it.id || 0));
-  const sameOrder = previousIDs.length === nextIDs.length && previousIDs.every((id, idx) => id === nextIDs[idx]);
-  if (sameOrder) {
-    return;
-  }
-  if (!previousIDs.length || !detailLiveFramesGrid.children.length) {
-    detailLiveFramesGrid.innerHTML = '';
-    for (const it of items) detailLiveFramesGrid.appendChild(buildDetailLiveFrameCard(it));
-    return;
-  }
-  const oldHead = previousIDs[0];
-  const oldHeadIndex = nextIDs.indexOf(oldHead);
-  if (oldHead > 0 && oldHeadIndex >= 0) {
-    const addedItems = items.slice(0, oldHeadIndex);
-    for (let i = addedItems.length - 1; i >= 0; i -= 1) {
-      detailLiveFramesGrid.prepend(buildDetailLiveFrameCard(addedItems[i]));
-    }
-    const nextSet = new Set(nextIDs);
-    const cards = Array.from(detailLiveFramesGrid.querySelectorAll('[data-frame-id]'));
-    for (const card of cards) {
-      const id = Number(card.getAttribute('data-frame-id') || '0');
-      if (!nextSet.has(id)) card.remove();
-    }
-    while (detailLiveFramesGrid.children.length > items.length) {
-      detailLiveFramesGrid.removeChild(detailLiveFramesGrid.lastElementChild);
-    }
-    return;
-  }
-  detailLiveFramesGrid.innerHTML = '';
-  for (const it of items) detailLiveFramesGrid.appendChild(buildDetailLiveFrameCard(it));
 }
 
 // ─── Image lazy loading ───────────────────────────────────────────────────────
@@ -4677,7 +4605,11 @@ function renderStreamRows() {
         </div>
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
-      <td><a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a></td>
+      <td>${
+        detailPlayerKind(s) === 'youtube' || String(s.provider || '').trim().toUpperCase() === 'YOUTUBE'
+          ? `<a class="overview-card-link" href="${esc(buildYouTubeWatchURL(s) || ('/streams/' + s.id))}" target="_blank" rel="noopener noreferrer">View</a>`
+          : `<a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a>`
+      }</td>
     `;
     streamRowsEl.appendChild(tr);
   }
@@ -4687,6 +4619,37 @@ function renderStreamRows() {
   updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
   setStreamStatus(`${streamRows.length} shown · ${streamCountLabel(streamTotal)}`);
 }
+
+function applySourceSegment(seg) {
+  streamSourceSegment = (seg === 'youtube') ? 'youtube' : 'recordable';
+  // Drive the existing filter state that buildStreamFilterParams reads.
+  if (streamSourceSegment === 'youtube') {
+    sourceFilter.value = 'youtube';
+    streamModeFilter.value = '';
+  } else {
+    sourceFilter.value = '';
+    streamModeFilter.value = 'hls';
+  }
+  const seg2 = document.getElementById('streamSourceSegment');
+  if (seg2) {
+    seg2.querySelectorAll('button[data-source-seg]').forEach((b) => {
+      const on = b.getAttribute('data-source-seg') === streamSourceSegment;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+  }
+}
+
+(function wireSourceSegment() {
+  const seg = document.getElementById('streamSourceSegment');
+  if (!seg) return;
+  seg.querySelectorAll('button[data-source-seg]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      applySourceSegment(btn.getAttribute('data-source-seg'));
+      void loadStreams({ resetPage: true }).catch((err) => setStreamStatus(String(err), 'err'));
+    });
+  });
+})();
 
 function updateStreamPageControls() {
   const pageCount = Math.max(1, Math.ceil(streamTotal / streamPageSize));
@@ -4838,67 +4801,69 @@ function handleClipPreviewClick(event) {
   return true;
 }
 
-function renderLatestCard(container, payload, latestCapture, previewImage) {
-  const meta = detailCaptureMeta(payload);
-  if (latestCaptureLabel) latestCaptureLabel.textContent = `${meta.clipNative ? 'Latest clip' : 'Latest frame'} (${localTimezoneLabel})`;
-  if (meta.clipNative) {
-    const objectKey = String((latestCapture && latestCapture.object_key) || '-');
-    const windowLabel = captureWindowLabel(latestCapture);
-    container.removeAttribute('data-frame-id');
-    container.innerHTML = latestCapture ? `
-      <div class="stack">
-        ${renderClipActions(latestCapture, true, 'thumb-lg', true)}
-        <span class="muted fs10 mono">${esc(windowLabel)}</span>
-        <span class="muted fs10 mono">${esc(objectKey)}</span>
-      </div>
-    ` : '<span class="muted fs11">No clip yet</span>';
-    return;
+function teardownDetailLivePlayer() {
+  if (detailHlsInstance) {
+    try { detailHlsInstance.destroy(); } catch (_) {}
+    detailHlsInstance = null;
   }
-  const imageURL = previewImage && previewImage.download_url ? String(previewImage.download_url) : '';
-  if (!imageURL) {
-    container.removeAttribute('data-frame-id');
-    container.innerHTML = '<span class="muted fs11">No image</span>';
-    return;
-  }
-  const frameID = Number(previewImage && previewImage.id || 0);
-  const nextID = Number(frameID || 0);
-  const currentID = Number(container.getAttribute('data-frame-id') || '0');
-  if (nextID > 0 && currentID === nextID) {
-    return;
-  }
-  if (nextID > 0) container.setAttribute('data-frame-id', String(nextID));
-  container.innerHTML = `
-    <div class="stack">
-      <a href="${esc(imageURL)}" target="_blank" rel="noopener noreferrer">
-        <img class="thumb-lg" src="${esc(imageURL)}" alt="preview" loading="lazy" decoding="async" />
-      </a>
-      <span class="muted fs10 mono">${esc(previewImage && previewImage.captured_at || '-')}</span>
-      <span class="muted fs10 mono">${esc(previewImage && previewImage.object_key || '-')}</span>
-    </div>
-  `;
+  if (detailLivePlayerMount) detailLivePlayerMount.innerHTML = '';
+  if (detailLivePlayer) detailLivePlayer.style.display = 'none';
 }
 
-async function fetchRecentFrames(limit = 60) {
-  const params = new URLSearchParams();
-  params.set('stream_id', String(detailStreamID));
-  params.set('limit', String(limit));
-  params.set('offset', '0');
-  params.set('sort_by', 'captured_at');
-  params.set('sort_dir', 'desc');
-  const payload = await fetchJSON(`/api/v1/frames?${params}`);
-  return Array.isArray(payload.items) ? payload.items : [];
+// Decide how to play a stream inline. Returns 'youtube' | 'hls' | 'none'.
+function detailPlayerKind(stream) {
+  const s = stream || {};
+  const provider = String(s.provider || '').trim().toUpperCase();
+  const externalID = String(s.external_id || '').trim();
+  if (provider === 'YOUTUBE' && externalID) return 'youtube';
+  const sourceURL = String(s.source_url || '').trim();
+  if (sourceURL && !isYouTubeSourceURL(sourceURL) && sourceURL.toLowerCase().includes('.m3u8')) return 'hls';
+  return 'none';
 }
 
-async function loadDetailLiveFrames(options = {}) {
-  const quiet = Boolean(options && options.quiet);
-  if (!detailStreamID) return [];
-  if (!quiet && detailLiveFramesStatus) {
-    detailLiveFramesStatus.textContent = 'Loading recent frames...';
+function mountDetailLivePlayer(stream) {
+  teardownDetailLivePlayer();
+  if (!(detailLivePlayer instanceof HTMLElement) || !(detailLivePlayerMount instanceof HTMLElement)) return;
+  const kind = detailPlayerKind(stream);
+  if (kind === 'none') {
+    // Honest fallback: no inline player. The external "View live stream" CTA
+    // (#detailViewCTA), managed by syncDetailMutationUI, is the only affordance.
+    return;
   }
-  const items = await fetchRecentFrames(60);
-  renderDetailLiveFramesGrid(items);
-  detailRecentFramesData = items;
-  return items;
+  if (kind === 'youtube') {
+    const id = encodeURIComponent(String(stream.external_id || '').trim());
+    const iframe = document.createElement('iframe');
+    iframe.src = `https://www.youtube.com/embed/${id}?autoplay=1&mute=1`;
+    iframe.allow = 'autoplay; encrypted-media; picture-in-picture';
+    iframe.setAttribute('allowfullscreen', '');
+    iframe.referrerPolicy = 'strict-origin-when-cross-origin';
+    detailLivePlayerMount.appendChild(iframe);
+    detailLivePlayer.style.display = '';
+    return;
+  }
+  // kind === 'hls'
+  const url = String(stream.source_url || '').trim();
+  const video = document.createElement('video');
+  video.controls = true;
+  video.muted = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  detailLivePlayerMount.appendChild(video);
+  detailLivePlayer.style.display = '';
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native HLS (Safari).
+    video.src = url;
+    video.play().catch(() => {});
+  } else if (window.Hls && window.Hls.isSupported()) {
+    detailHlsInstance = new window.Hls({ enableWorker: true });
+    detailHlsInstance.loadSource(url);
+    detailHlsInstance.attachMedia(video);
+    detailHlsInstance.on(window.Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+  } else {
+    // No HLS support and not native: do not fake playback; drop back to the
+    // external CTA by hiding the empty player.
+    teardownDetailLivePlayer();
+  }
 }
 
 async function loadDetail(options = {}) {
@@ -4919,20 +4884,7 @@ async function loadDetail(options = {}) {
 
   syncDetailMutationUI(s);
 
-  const latestFrame = payload.latest_frame || null;
-  if (detailFramesRecentTitle) detailFramesRecentTitle.textContent = 'Latest Frames';
-  if (detailFramesRecentSubtitle) detailFramesRecentSubtitle.textContent = 'Auto-refreshes every few seconds while this page is open.';
-  renderLatestCard(
-    latestRawCard,
-    payload,
-    latestFrame,
-    latestFrame
-  );
-
-  void loadDetailLiveFrames({ quiet }).catch((err) => {
-    if (detailLiveFramesStatus) detailLiveFramesStatus.textContent = String(err);
-  });
-  if (!quiet) startDetailLivePolling();
+  mountDetailLivePlayer(s);
 }
 
 // ─── Stream table actions ────────────────────────────────────────────────────
@@ -5261,16 +5213,6 @@ if (pipelineOverviewRows) {
     })();
   });
 }
-if (detailLiveFramesGrid) {
-  detailLiveFramesGrid.addEventListener('click', (e) => {
-    if (handleClipPreviewClick(e)) e.preventDefault();
-  });
-}
-if (latestRawCard) {
-  latestRawCard.addEventListener('click', (e) => {
-    if (handleClipPreviewClick(e)) e.preventDefault();
-  });
-}
 if (discoveryReload) {
   discoveryReload.addEventListener('click', async () => {
     try { await loadDiscoveryCandidates(); }
@@ -5505,7 +5447,8 @@ function applyKoreaPageMode() {
   if (!isKoreaPage) return;
   document.querySelectorAll('.global-nav a').forEach((link) => {
     const href = String(link.getAttribute('href') || '');
-    link.classList.toggle('active', href === '/korea');
+    // On /korea the primary tab that stays lit is Streams ("/").
+    link.classList.toggle('active', href === '/');
   });
   const title = document.querySelector('.domain-intro-title');
   if (title) title.textContent = 'Korea';
@@ -5549,6 +5492,7 @@ async function applyStreamsRouteState(opts = {}) {
   applyStreamListStateFromURL(params);
   showPanel('streams');
   setStreamsView(streamsView, { replaceURL: true });
+  applySourceSegment('recordable');
   await refreshAllStreamFilterOptions();
   await loadStreamsForActiveView({ replaceURL: true });
 }
