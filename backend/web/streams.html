@@ -4846,10 +4846,54 @@ async function mountDetailLivePlayer(stream) {
     // hls.js (Media Source Extensions). Preferred on Chrome/Firefox, which report
     // canPlayType('application/vnd.apple.mpegurl') === 'maybe' but cannot actually
     // decode HLS natively, so they must use hls.js to play the manifest.
-    detailHlsInstance = new window.Hls({ enableWorker: true });
-    detailHlsInstance.loadSource(url);
-    detailHlsInstance.attachMedia(video);
-    detailHlsInstance.on(window.Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+    //
+    // Live-edge tuning. Catalog sources are standard (non-LL) HLS with ~10s
+    // segments and a 3-segment window, so the hls.js default liveSyncDurationCount
+    // of 3 starts playback a full ~30s behind the live edge and rides the oldest
+    // segment, which drains and stalls as the window slides. liveSyncDuration:6
+    // pins the target to ~6s behind live; maxLiveSyncPlaybackRate:1.5 lets the
+    // player speed up slightly to catch the live edge after a stall; the small
+    // back buffer keeps memory bounded. lowLatencyMode is on so the same config
+    // also benefits any true LL-HLS source without hurting the standard ones.
+    const Hls = window.Hls;
+    detailHlsInstance = new Hls({
+      enableWorker: true,
+      lowLatencyMode: true,
+      liveSyncDuration: 6,
+      liveMaxLatencyDuration: 20,
+      maxLiveSyncPlaybackRate: 1.5,
+      backBufferLength: 30,
+    });
+    const hls = detailHlsInstance;
+    // Jump to the live edge on (re)start and after any recovery: liveSyncPosition
+    // is the manifest-derived live point; fall back to the buffered end if it is
+    // not yet known.
+    const seekToLiveEdge = () => {
+      let target = hls.liveSyncPosition;
+      if (!(typeof target === 'number' && isFinite(target))) {
+        if (video.buffered && video.buffered.length) target = video.buffered.end(video.buffered.length - 1);
+      }
+      if (typeof target === 'number' && isFinite(target) && target - video.currentTime > 1) {
+        video.currentTime = target;
+      }
+    };
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => { seekToLiveEdge(); video.play().catch(() => {}); });
+    hls.on(Hls.Events.LEVEL_LOADED, (_e, d) => { if (d && d.details && d.details.live) seekToLiveEdge(); });
+    // Recover from transient errors instead of letting the player die: network
+    // errors retry the load, media errors trigger the codec-level recovery, and
+    // both re-seek to the live edge so playback resumes live rather than stale.
+    // Only a fatal error we cannot recover tears the player down honestly.
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data || !data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        try { hls.startLoad(); seekToLiveEdge(); video.play().catch(() => {}); return; } catch (_) {}
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        try { hls.recoverMediaError(); seekToLiveEdge(); video.play().catch(() => {}); return; } catch (_) {}
+      }
+      showDetailNoInlineFallback(stream);
+    });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     // Native HLS (Safari/iOS), where hls.js is not supported.
     video.src = url;
