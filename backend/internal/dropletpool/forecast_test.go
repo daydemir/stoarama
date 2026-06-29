@@ -125,6 +125,35 @@ func TestForecastFromRecordings_BadCronSkipped(t *testing.T) {
 	}
 }
 
+// TestForecastWithCandidate_LiftsPeak proves the create-time cap's demand model:
+// adding the prospective recording to the existing capturing set lifts the
+// forecast peak by exactly the candidate's own concurrency, reusing the same
+// sweep-line the autoscaler uses (DRY). This is the pure composition
+// ForecastPeakWithCandidate performs after loading existing recordings from the DB.
+func TestForecastWithCandidate_LiftsPeak(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:30Z")
+	// One existing recording firing every minute with a 90s clip => peak 2 (two 90s
+	// clips alive at steady state). Adding an identical candidate must lift peak to 4.
+	existing := []forecastRecording{
+		{cronExpr: "* * * * *", cronTimezone: "UTC", clipDurationSec: 90},
+	}
+	basePeak := forecastFromRecordings(existing, now, 30*time.Minute).PeakConcurrent
+	if basePeak != 2 {
+		t.Fatalf("base peak=%d want 2", basePeak)
+	}
+	candidate := forecastRecording{cronExpr: "* * * * *", cronTimezone: "UTC", clipDurationSec: 90}
+	withCandidate := forecastFromRecordings(append(append([]forecastRecording{}, existing...), candidate), now, 30*time.Minute).PeakConcurrent
+	if withCandidate != 4 {
+		t.Fatalf("peak with candidate=%d want 4 (existing 2 + candidate 2)", withCandidate)
+	}
+	// A disjoint candidate (fires when nothing else does, short clip) does not stack.
+	disjoint := forecastRecording{cronExpr: "30 3 * * *", cronTimezone: "UTC", clipDurationSec: 10}
+	withDisjoint := forecastFromRecordings(append(append([]forecastRecording{}, existing...), disjoint), now, 30*time.Minute).PeakConcurrent
+	if withDisjoint != 2 {
+		t.Fatalf("peak with disjoint candidate=%d want 2 (no overlap in window)", withDisjoint)
+	}
+}
+
 func TestRequiredDroplets_CapacityCeilAndSpendCap(t *testing.T) {
 	tests := []struct {
 		name                           string

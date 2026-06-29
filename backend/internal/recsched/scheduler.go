@@ -138,6 +138,18 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 		return fmt.Errorf("reclaim expired recording leases: %w", err)
 	}
 
+	// (a2) schedule-integrity freshness deadline: mark any pending job that can no
+	// longer be captured on schedule as an HONEST miss (status='error') rather than
+	// letting it be leased and recorded as a silently-wrong late clip. The window is
+	// fire_at + clip_duration_sec + freshness grace, matching the lease gate's
+	// predicate exactly so a job the lease query refuses is the same job marked here.
+	// This only trips during a genuine transient overload / cold-boot (the autoscaler
+	// keeps the common case on time and the create-time cap keeps accepted schedules
+	// servable); each miss is user-visible on the recording and a signal to raise MAX.
+	if err := s.markStaleJobsMissed(ctx, tx); err != nil {
+		return err
+	}
+
 	// (b) select recordings whose window is open now and (when billing is enabled)
 	// whose account has a card on file. Usage billing: starting a recording does not
 	// charge, so the only capture gate is window + has_payment_method. A failed
@@ -186,6 +198,64 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 			continue
 		}
 		budget -= enqueued
+	}
+	return nil
+}
+
+// freshnessGraceSec is the slack added to a job's clip duration to form its
+// schedule-integrity freshness window. It MUST match the API lease gate's grace
+// (recordingFreshnessGraceSec) so the scheduler marks missed exactly the jobs the
+// lease query refuses to hand out, never a job the worker could still capture on
+// time.
+const freshnessGraceSec = 30
+
+// markStaleJobsMissed fails (status='error') every pending job past its freshness
+// window and bumps the owning recording's health counters so the miss is visible
+// in the recordings payload. The job moves to the terminal 'error' bucket (the
+// recording_jobs CHECK allows pending/leased/done/error/canceled), distinct from a
+// captured clip, so the schedule the user sees is truthful: on-time clip, or honest
+// miss, never a silently-wrong on-schedule-looking clip.
+func (s *Scheduler) markStaleJobsMissed(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, `
+		UPDATE recording_jobs
+		SET status='error',
+		    error_text='capacity: not captured on schedule (freshness deadline exceeded)',
+		    lease_owner=NULL,
+		    lease_expires_at=NULL,
+		    completed_at=now(),
+		    updated_at=now()
+		WHERE status='pending'
+		  AND fire_at + make_interval(secs => (clip_duration_sec + $1)) <= now()
+		RETURNING recording_id
+	`, freshnessGraceSec)
+	if err != nil {
+		return fmt.Errorf("mark stale recording jobs missed: %w", err)
+	}
+	missedByRecording := make(map[int64]int)
+	for rows.Next() {
+		var recordingID int64
+		if err := rows.Scan(&recordingID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan missed recording job: %w", err)
+		}
+		missedByRecording[recordingID]++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate missed recording jobs: %w", err)
+	}
+	rows.Close()
+	for recordingID, n := range missedByRecording {
+		if _, err := tx.Exec(ctx, `
+			UPDATE recordings
+			SET consecutive_failures = consecutive_failures + $2,
+			    last_error_text='capacity: not captured on schedule (freshness deadline exceeded)',
+			    last_error_at=now(),
+			    updated_at=now()
+			WHERE id=$1
+		`, recordingID, n); err != nil {
+			return fmt.Errorf("bump recording health for missed jobs: %w", err)
+		}
 	}
 	return nil
 }
@@ -256,18 +326,26 @@ func (s *Scheduler) enqueueRecordingFires(ctx context.Context, tx pgx.Tx, rec ac
 	cursor := catchupCursor(rec.lastEnqueuedFireAt, now, s.cfg.CatchupWindow)
 	instants := dueFireInstants(sched, loc, cursor, now, catchupInstantCap(s.cfg.CatchupWindow, s.cfg.MinIntervalSec))
 
+	jitter := fireJitter(rec.id, s.cfg.MinIntervalSec)
 	enqueued := 0
 	var lastFire time.Time
 	for _, fireUTC := range instants {
 		if enqueued >= budget {
 			break
 		}
+		// fire_at is the exact cron instant (minute-aligned): it keys the idempotency
+		// key (recjob:id:floor(epoch(fire_at))), the clip object key, and the freshness
+		// deadline, so it must NOT carry jitter. scheduled_for is the leasable-at
+		// instant: jittering it by a small deterministic per-recording offset breaks
+		// the :00/:30 thundering herd (many same-cadence recordings no longer become
+		// leasable on the same instant) without shifting the user-facing cadence.
 		idemKey := fmt.Sprintf("recjob:%d:%d", rec.id, fireUTC.Unix())
+		scheduledFor := fireUTC.Add(jitter)
 		ct, err := tx.Exec(ctx, `
 			INSERT INTO recording_jobs (recording_id, fire_at, scheduled_for, clip_duration_sec, status, idempotency_key)
-			VALUES ($1, $2, $2, $3, 'pending', $4)
+			VALUES ($1, $2, $3, $4, 'pending', $5)
 			ON CONFLICT (idempotency_key) DO NOTHING
-		`, rec.id, fireUTC, rec.clipDurationSec, idemKey)
+		`, rec.id, fireUTC, scheduledFor, rec.clipDurationSec, idemKey)
 		if err != nil {
 			return enqueued, lastFire, fmt.Errorf("insert recording job: %w", err)
 		}
@@ -277,6 +355,29 @@ func (s *Scheduler) enqueueRecordingFires(ctx context.Context, tx pgx.Tx, rec ac
 		lastFire = fireUTC
 	}
 	return enqueued, lastFire, nil
+}
+
+// fireJitter returns a deterministic per-recording leasable-at offset that spreads
+// same-cadence recordings off the exact cron boundary (the :00/:30 thundering
+// herd). The span is small and bounded relative to the fire gap (at most 30s, and
+// never more than minIntervalSec/20 so it stays cosmetically invisible on a fast
+// cadence), so jitter alone never pushes a capture meaningfully off its expected
+// time. It is a pure function of the recording id, so it is stable across restarts
+// and never drifts (no randomness): the same fire always lands at the same
+// scheduled_for, keeping reclaim/retry idempotent.
+func fireJitter(recordingID int64, minIntervalSec int) time.Duration {
+	span := 30
+	if minIntervalSec > 0 && minIntervalSec/20 < span {
+		span = minIntervalSec / 20
+	}
+	if span < 1 {
+		return 0
+	}
+	offset := recordingID % int64(span)
+	if offset < 0 {
+		offset = -offset
+	}
+	return time.Duration(offset) * time.Second
 }
 
 // catchupCursor returns the lower bound (exclusive) of the catch-up window for a

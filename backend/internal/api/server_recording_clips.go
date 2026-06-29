@@ -23,6 +23,14 @@ const (
 	// recordingMaxBitrateBytesPerSec bounds the presigned upload size (S-4): a
 	// generous 8 MB/s, so a 900s clip caps at ~7.2 GB.
 	recordingMaxBitrateBytesPerSec = 8 * 1024 * 1024
+	// recordingFreshnessGraceSec is the slack added to a job's clip duration to form
+	// its schedule-integrity freshness window: a job must be leasable within
+	// fire_at + clip_duration_sec + this grace, or it is an honest miss rather than a
+	// silently-wrong late capture (capture has no seek-to-fire, so a late clip is the
+	// wrong content). This is the single source of truth for the window; the
+	// scheduler's miss-marking sweep uses the same value. The grace covers normal
+	// lease/poll latency and a brief autoscaler cold-boot, never minutes.
+	recordingFreshnessGraceSec = 30
 )
 
 type recordingLeaseResponse struct {
@@ -64,6 +72,12 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		  FROM recording_jobs j
 		  JOIN recordings rec ON rec.id = j.recording_id
 		  WHERE j.status='pending' AND j.scheduled_for <= now()
+		    -- Schedule integrity: never hand out a job too late to be on-schedule.
+		    -- Capture has no seek-to-fire, so a job leased past its fire_at +
+		    -- clip_duration + grace would record the stream as-it-is-now (the wrong
+		    -- content) and store it as if it ran on schedule. Such a job is left for
+		    -- the scheduler's miss-marking sweep to fail honestly instead.
+		    AND j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now()
 		    AND rec.status='active'
 		    AND rec.start_at <= now()
 		    AND (rec.end_at IS NULL OR now() < rec.end_at)
@@ -88,7 +102,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		WHERE j.id = cte.id AND rec.id = j.recording_id
 		RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
 		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at
-	`, workerID, billingDisabled, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec).Scan(
+	`, workerID, billingDisabled, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec).Scan(
 		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
 		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
 	)

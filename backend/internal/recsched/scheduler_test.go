@@ -178,3 +178,36 @@ func TestIdempotencyKeyFormat(t *testing.T) {
 		t.Fatalf("fire instant is not minute-aligned: %s", fireAt)
 	}
 }
+
+// TestFireJitter pins the herd-spreader: a deterministic, bounded, per-recording
+// leasable-at offset that never exceeds the span and is stable across calls.
+func TestFireJitter(t *testing.T) {
+	// Default min interval 600s => span = min(30, 600/20) = 30s.
+	const minInterval = 600
+	for _, id := range []int64{0, 1, 29, 30, 31, 600, -7} {
+		j := fireJitter(id, minInterval)
+		if j < 0 {
+			t.Fatalf("jitter for id=%d is negative: %s", id, j)
+		}
+		if j >= 30*time.Second {
+			t.Fatalf("jitter for id=%d is %s, must be < span 30s", id, j)
+		}
+		// Determinism: same input, same output.
+		if fireJitter(id, minInterval) != j {
+			t.Fatalf("jitter for id=%d is not deterministic", id)
+		}
+	}
+	// Spread: distinct ids within the span land on distinct offsets, breaking the herd.
+	if fireJitter(1, minInterval) == fireJitter(2, minInterval) {
+		t.Fatalf("ids 1 and 2 must jitter to different offsets")
+	}
+	// fire_at math is unaffected: jitter applies to scheduled_for only. A 1s offset
+	// is cosmetically invisible against a 1800s (*/30) gap.
+	if fireJitter(31, minInterval) != 1*time.Second {
+		t.Fatalf("id 31 within span 30 must offset by 31%%30=1s, got %s", fireJitter(31, minInterval))
+	}
+	// A tiny min interval clamps the span to >=0 without panicking.
+	if fireJitter(5, 10) != 0 {
+		t.Fatalf("min interval 10 => span 0 => no jitter, got %s", fireJitter(5, 10))
+	}
+}

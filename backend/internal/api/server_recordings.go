@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -195,6 +196,18 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// Cron + timezone + min-interval + clip-vs-interval invariants.
 	if err := recsched.ValidateCronForCreate(cronExpr, cronTimezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Create-time concurrency cap (schedule integrity): reject a schedule whose
+	// forecast peak simultaneous clip count, combined with everything already
+	// capturing, would exceed what the droplet pool can ever serve on time
+	// (Max*Capacity). Reuse the autoscaler's exact sweep-line so the cap and the
+	// scaler agree on the demand model (DRY). Accepting only schedules that fit the
+	// ceiling keeps the freshness deadline (the on-schedule safety net) a rare
+	// transient event rather than a structural certainty.
+	if err := s.checkRecordingScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
 
@@ -762,6 +775,34 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"stream_name":              streamName,
 		"stream_location":          streamLocation,
 	}, nil
+}
+
+// checkRecordingScheduleCapacity rejects a prospective schedule whose forecast
+// peak simultaneous clip count (the existing capturing fleet plus this candidate)
+// would exceed the pool ceiling Max*Capacity, i.e. more concurrent clips than the
+// autoscaler could ever stand up. It reuses the dropletpool forecast sweep-line so
+// the cap and the scaler share one demand model. The lookahead matches the
+// autoscaler's so a schedule accepted here is one Decide can actually provision
+// for; the error is user-facing (no em dashes).
+func (s *Server) checkRecordingScheduleCapacity(ctx context.Context, cronExpr, cronTimezone string, clipDurationSec int) error {
+	ceiling := s.cfg.DropletPoolMax * s.cfg.DropletPoolCapacity
+	if ceiling <= 0 {
+		// Pool config not set on this service: no meaningful ceiling to enforce.
+		return nil
+	}
+	billingEnabled := s.billing != nil
+	lookahead := time.Duration(s.cfg.DropletPoolLookaheadSec) * time.Second
+	if lookahead <= 0 {
+		lookahead = 30 * time.Minute
+	}
+	peak, err := dropletpool.ForecastPeakWithCandidate(ctx, s.pool, billingEnabled, cronExpr, cronTimezone, clipDurationSec, time.Now().UTC(), lookahead)
+	if err != nil {
+		return fmt.Errorf("forecast schedule capacity: %v", err)
+	}
+	if peak > ceiling {
+		return fmt.Errorf("at capacity: this schedule would need %d clips recording at once, above the recorder limit of %d. Stagger the schedule or contact the operator to raise the cap.", peak, ceiling)
+	}
+	return nil
 }
 
 // recordingHealth derives a coarse health badge from the failure counter. It is

@@ -36,11 +36,12 @@ type jobInterval struct {
 	End   time.Time
 }
 
-// ForecastDemand loads every capturing recording (status='active', inside its
-// [start_at, end_at) window, and, when billing is enabled, whose account has a
-// card on file) and forecasts the peak concurrent clip count and the earliest
-// fire in [now, now+lookahead]. It reads, never writes, the queue.
-func ForecastDemand(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, now time.Time, lookahead time.Duration) (Forecast, error) {
+// loadCapturingRecordings reads every capturing recording (status='active',
+// inside its [start_at, end_at) window, and, when billing is enabled, whose
+// account has a card on file). It is the single SELECT both the autoscaler
+// forecast and the create-time cap share, so the demand model has one source of
+// truth (DRY). It reads, never writes, the queue.
+func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool) ([]forecastRecording, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec
 		FROM recordings rec
@@ -53,21 +54,53 @@ func ForecastDemand(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool
 		          AND b.has_payment_method))
 	`, !billingEnabled)
 	if err != nil {
-		return Forecast{}, fmt.Errorf("forecast: select capturing recordings: %w", err)
+		return nil, fmt.Errorf("forecast: select capturing recordings: %w", err)
 	}
 	defer rows.Close()
 	recs := make([]forecastRecording, 0, 64)
 	for rows.Next() {
 		var r forecastRecording
 		if err := rows.Scan(&r.cronExpr, &r.cronTimezone, &r.clipDurationSec); err != nil {
-			return Forecast{}, fmt.Errorf("forecast: scan recording: %w", err)
+			return nil, fmt.Errorf("forecast: scan recording: %w", err)
 		}
 		recs = append(recs, r)
 	}
 	if err := rows.Err(); err != nil {
-		return Forecast{}, fmt.Errorf("forecast: iterate recordings: %w", err)
+		return nil, fmt.Errorf("forecast: iterate recordings: %w", err)
+	}
+	return recs, nil
+}
+
+// ForecastDemand loads every capturing recording and forecasts the peak
+// concurrent clip count and the earliest fire in [now, now+lookahead]. It reads,
+// never writes, the queue.
+func ForecastDemand(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, now time.Time, lookahead time.Duration) (Forecast, error) {
+	recs, err := loadCapturingRecordings(ctx, pool, billingEnabled)
+	if err != nil {
+		return Forecast{}, err
 	}
 	return forecastFromRecordings(recs, now, lookahead), nil
+}
+
+// ForecastPeakWithCandidate loads the current capturing recordings and forecasts
+// the peak concurrent clip count over [now, now+lookahead] AS IF one more
+// recording (the candidate being created) were already capturing. The create-time
+// concurrency cap calls this and rejects a schedule whose prospective peak exceeds
+// what the pool can serve (Max*Capacity). It reuses the exact sweep-line the
+// autoscaler uses (forecastFromRecordings), so the cap and the scaler agree on the
+// demand model (DRY). A candidate whose cron is unparseable contributes nothing to
+// the peak (the create handler validates the cron separately and rejects first).
+func ForecastPeakWithCandidate(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, candidateCronExpr, candidateCronTimezone string, candidateClipDurationSec int, now time.Time, lookahead time.Duration) (int, error) {
+	recs, err := loadCapturingRecordings(ctx, pool, billingEnabled)
+	if err != nil {
+		return 0, err
+	}
+	recs = append(recs, forecastRecording{
+		cronExpr:        candidateCronExpr,
+		cronTimezone:    candidateCronTimezone,
+		clipDurationSec: candidateClipDurationSec,
+	})
+	return forecastFromRecordings(recs, now, lookahead).PeakConcurrent, nil
 }
 
 // forecastFromRecordings expands each recording's cron over the lookahead window
