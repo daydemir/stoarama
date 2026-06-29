@@ -4799,15 +4799,18 @@ function mountDetailLivePlayer(stream) {
   video.playsInline = true;
   detailLivePlayerMount.appendChild(video);
   detailLivePlayer.style.display = '';
-  if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    // Native HLS (Safari).
-    video.src = url;
-    video.play().catch(() => {});
-  } else if (window.Hls && window.Hls.isSupported()) {
+  if (window.Hls && window.Hls.isSupported()) {
+    // hls.js (Media Source Extensions). Preferred on Chrome/Firefox, which report
+    // canPlayType('application/vnd.apple.mpegurl') === 'maybe' but cannot actually
+    // decode HLS natively, so they must use hls.js to play the manifest.
     detailHlsInstance = new window.Hls({ enableWorker: true });
     detailHlsInstance.loadSource(url);
     detailHlsInstance.attachMedia(video);
     detailHlsInstance.on(window.Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native HLS (Safari/iOS), where hls.js is not supported.
+    video.src = url;
+    video.play().catch(() => {});
   } else {
     // No HLS support and not native: do not fake playback; drop back to the
     // external CTA by hiding the empty player.
