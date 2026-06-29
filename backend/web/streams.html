@@ -4740,10 +4740,22 @@ function isRecordableStream(stream) {
   return ct === 'hls' || ct === 'http_video';
 }
 
+// True when the source is an indirect "!hls" reference (KBS/Korea via loomex):
+// source_url is an internal marker, not a manifest, and the playable .m3u8 must be
+// resolved fresh because its Wowza token is short-lived. A stored resolved URL in
+// the detail payload is often already expired (403), so the player resolves on
+// demand against /resolve right before mounting hls.js.
+function isIndirectHlsSource(stream) {
+  const s = stream || {};
+  return String(s.source_url || '').toLowerCase().includes('!hls');
+}
+
 // Returns the .m3u8 URL to play for an HLS stream: the direct source_url when it
 // already points at a manifest, otherwise the runtime-resolved manifest from the
 // detail payload (indirect KBS/Korea: source_url ends in '!hls', resolved URL is a
 // real cross-origin .m3u8 with Access-Control-Allow-Origin:*). Empty string = none.
+// For indirect sources this stored URL may be stale; resolveDetailPlayURL() fetches
+// a fresh one when actually playing.
 function detailHlsURL(stream) {
   const s = stream || {};
   const sourceURL = String(s.source_url || '').trim();
@@ -4751,6 +4763,18 @@ function detailHlsURL(stream) {
   const resolved = String(s.capture_runtime_resolved_url || '').trim();
   if (resolved && resolved.toLowerCase().includes('.m3u8')) return resolved;
   return '';
+}
+
+// Resolves the live .m3u8 to feed hls.js. Direct manifests play as-is. Indirect
+// "!hls" sources are re-resolved server-side (mirrors the recorder) so the browser
+// always gets a currently-valid Wowza token instead of the possibly-expired one in
+// the detail payload. Throws if a fresh resolve fails (e.g. upstream genuinely
+// down), so the caller can fall back honestly rather than show a black box.
+async function resolveDetailPlayURL(stream) {
+  const s = stream || {};
+  if (!isIndirectHlsSource(s)) return detailHlsURL(s);
+  const payload = await fetchJSON(dashboardStreamURL(s.id, '/resolve'));
+  return String((payload && payload.resolved_url) || '').trim();
 }
 
 function detailPlayerKind(stream) {
@@ -4762,19 +4786,26 @@ function detailPlayerKind(stream) {
   return 'none';
 }
 
-function mountDetailLivePlayer(stream) {
+// Honest fallback: no inline player and no fake one. Offer an unobtrusive inline
+// link to the source, in the player area (not a prominent top button). Used when
+// there is no inline-playable source, and when a fresh resolve of an indirect
+// source fails (e.g. upstream genuinely down), so a black box is never shown.
+function showDetailNoInlineFallback(stream) {
+  teardownDetailLivePlayer();
+  const ext = buildPreferredViewURL(stream);
+  if (detailNoInlineNote instanceof HTMLElement && detailNoInlineLink instanceof HTMLAnchorElement) {
+    if (ext) { detailNoInlineLink.href = ext; detailNoInlineLink.style.display = ''; }
+    else { detailNoInlineLink.removeAttribute('href'); detailNoInlineLink.style.display = 'none'; }
+    detailNoInlineNote.style.display = '';
+  }
+}
+
+async function mountDetailLivePlayer(stream) {
   teardownDetailLivePlayer();
   if (!(detailLivePlayer instanceof HTMLElement) || !(detailLivePlayerMount instanceof HTMLElement)) return;
   const kind = detailPlayerKind(stream);
   if (kind === 'none') {
-    // Honest fallback: no inline player and no fake one. Offer an unobtrusive
-    // inline link to the source, in the player area (not a prominent top button).
-    const ext = buildPreferredViewURL(stream);
-    if (detailNoInlineNote instanceof HTMLElement && detailNoInlineLink instanceof HTMLAnchorElement) {
-      if (ext) { detailNoInlineLink.href = ext; detailNoInlineLink.style.display = ''; }
-      else { detailNoInlineLink.removeAttribute('href'); detailNoInlineLink.style.display = 'none'; }
-      detailNoInlineNote.style.display = '';
-    }
+    showDetailNoInlineFallback(stream);
     return;
   }
   if (kind === 'youtube') {
@@ -4789,9 +4820,21 @@ function mountDetailLivePlayer(stream) {
     return;
   }
   // kind === 'hls' — direct .m3u8 source_url, or the runtime-resolved manifest
-  // (indirect KBS/Korea). CORS on the resolved manifest is open, so hls.js plays
-  // it with no server proxy.
-  const url = detailHlsURL(stream);
+  // (indirect KBS/Korea). For indirect sources the manifest is resolved fresh now
+  // so the browser gets a currently-valid Wowza token (the stored one is often
+  // expired). CORS on the resolved manifest is open, so hls.js plays it with no
+  // server proxy. A failed fresh resolve means the upstream is genuinely
+  // unavailable: fall back honestly to the source link instead of a black box.
+  let url = '';
+  try {
+    url = await resolveDetailPlayURL(stream);
+  } catch (_) {
+    url = '';
+  }
+  if (!url) {
+    showDetailNoInlineFallback(stream);
+    return;
+  }
   const video = document.createElement('video');
   video.controls = true;
   video.muted = true;

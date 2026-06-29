@@ -301,6 +301,7 @@ func (s *Server) router() http.Handler {
 			public.Get("/dashboard/pipelines/{pipeline_id}/streams", s.handleDashboardPipelineStreams)
 			public.Get("/dashboard/queue-health", s.handleDashboardQueueHealth)
 			public.Get("/dashboard/streams/{id}", s.handleDashboardStreamDetail)
+			public.Get("/dashboard/streams/{id}/resolve", s.handleDashboardStreamResolve)
 			public.Get("/dashboard/streams/{id}/pipelines", s.handleDashboardStreamPipelinesList)
 			public.Get("/dashboard/streams/{id}/detections", s.handleDashboardStreamDetections)
 			public.Get("/dashboard/streams/{id}/frame-manifest", s.handleDashboardStreamFrameManifest)
@@ -6023,6 +6024,42 @@ func (s *Server) handleDashboardStreamDetail(w http.ResponseWriter, r *http.Requ
 		"inference":    items,
 		"limit":        limit,
 		"offset":       offset,
+	})
+}
+
+// handleDashboardStreamResolve resolves a stream's source reference to a live
+// playable manifest URL fresh, on demand, so the inline player always loads a
+// currently-valid token. Indirect "!hls" sources (KBS/Korea via loomex) carry a
+// short-lived Wowza token; a value stored in stream_capture_runtime.resolved_url
+// is often expired by the time a visitor opens the detail page, yielding HTTP 403
+// and a black box. This mirrors the recorder, which re-resolves fresh per capture
+// via capture.ResolveCaptureInput, and is called by the player right before it
+// mounts hls.js so the detail payload itself stays fast. Image sources are
+// rejected (there is nothing to play inline). Public, read-only.
+func (s *Server) handleDashboardStreamResolve(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	stream, err := s.getStreamByID(r.Context(), id)
+	if err != nil {
+		util.WriteError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	resolveCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, stream.Provider, stream.SourceURL, stream.SourcePageURL)
+	if err != nil {
+		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("resolve stream source: %v", err))
+		return
+	}
+	if isImage {
+		util.WriteError(w, http.StatusUnprocessableEntity, "image sources are not playable inline")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"stream_id":    stream.ID,
+		"resolved_url": resolved,
 	})
 }
 
