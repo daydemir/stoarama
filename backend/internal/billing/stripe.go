@@ -315,6 +315,66 @@ func (c *Client) GetSubscriptionPeriod(ctx context.Context, subID string) (start
 	return time.Time{}, time.Time{}, fmt.Errorf("subscription has no items")
 }
 
+// Invoice is the minimal, display-only view of a Stripe invoice the account
+// billing-history list needs. Amounts are in the invoice currency's minor unit
+// (cents for USD). HostedURL/PDFURL are Stripe-hosted links and may be empty.
+type Invoice struct {
+	Number    string    `json:"number"`
+	Status    string    `json:"status"`
+	AmountDue int64     `json:"amount_due_cents"`
+	Currency  string    `json:"currency"`
+	Created   time.Time `json:"created"`
+	HostedURL string    `json:"hosted_url"`
+	PDFURL    string    `json:"pdf_url"`
+}
+
+// ListInvoices returns the customer's most recent invoices (newest first),
+// display-only, for the account billing-history panel. limit is clamped to
+// [1,100]. A new account billing monthly in arrears legitimately has zero
+// invoices; this returns an empty slice in that case (never an error).
+func (c *Client) ListInvoices(ctx context.Context, customerID string, limit int) ([]Invoice, error) {
+	customerID = strings.TrimSpace(customerID)
+	if customerID == "" {
+		return nil, fmt.Errorf("customer id is required")
+	}
+	if limit <= 0 {
+		limit = 12
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	params := &stripe.InvoiceListParams{Customer: strPtr(customerID)}
+	params.Context = ctx
+	params.Limit = stripe.Int64(int64(limit))
+	iter := c.sc.Invoices.List(params)
+	out := make([]Invoice, 0, limit)
+	for iter.Next() {
+		inv := iter.Invoice()
+		if inv == nil {
+			continue
+		}
+		item := Invoice{
+			Number:    strings.TrimSpace(inv.Number),
+			Status:    strings.TrimSpace(string(inv.Status)),
+			AmountDue: inv.AmountDue,
+			Currency:  strings.ToUpper(string(inv.Currency)),
+			HostedURL: strings.TrimSpace(inv.HostedInvoiceURL),
+			PDFURL:    strings.TrimSpace(inv.InvoicePDF),
+		}
+		if inv.Created > 0 {
+			item.Created = time.Unix(inv.Created, 0).UTC()
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("list invoices: %w", err)
+	}
+	return out, nil
+}
+
 // ConstructEvent verifies the Stripe-Signature header (HMAC + the default 5-min
 // timestamp tolerance) and returns the parsed event, failing closed on any error.
 //

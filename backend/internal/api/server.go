@@ -38,22 +38,23 @@ import (
 )
 
 type Server struct {
-	cfg            config.Config
-	pool           *pgxpool.Pool
-	r2             *r2.Client
-	secrets        *secretbox.Cipher
-	mailer         email.Sender
-	streamsHTML    []byte
-	recordingsHTML []byte
-	accountHTML    []byte
-	docsHTML       []byte
-	adminHTML      []byte
-	billing        *billing.Client
-	exportMu       sync.Mutex
-	frameExports   map[string]*frameExportJob
-	dayZipMu       sync.Mutex
-	dayZips        map[string]*dayZipJob
-	dayZipSlot     chan struct{}
+	cfg             config.Config
+	pool            *pgxpool.Pool
+	r2              *r2.Client
+	secrets         *secretbox.Cipher
+	mailer          email.Sender
+	streamsHTML     []byte
+	recordingsHTML  []byte
+	accountHTML     []byte
+	docsHTML        []byte
+	adminHTML       []byte
+	billing         *billing.Client
+	exportMu        sync.Mutex
+	frameExports    map[string]*frameExportJob
+	dayZipMu        sync.Mutex
+	dayZips         map[string]*dayZipJob
+	dayZipSlot      chan struct{}
+	authLinkLimiter *authLinkLimiter
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -134,18 +135,19 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		return nil, err
 	}
 	s := &Server{
-		cfg:            cfg,
-		pool:           pool,
-		r2:             r2c,
-		mailer:         mailer,
-		streamsHTML:    injectShell(streamsHTML, "streams"),
-		recordingsHTML: injectShell(recordingsHTML, "recording"),
-		accountHTML:    injectShell(accountHTML, ""),
-		docsHTML:       injectShell(docsHTML, ""),
-		adminHTML:      injectShell(adminHTML, ""),
-		frameExports:   map[string]*frameExportJob{},
-		dayZips:        map[string]*dayZipJob{},
-		dayZipSlot:     make(chan struct{}, 1),
+		cfg:             cfg,
+		pool:            pool,
+		r2:              r2c,
+		mailer:          mailer,
+		streamsHTML:     injectShell(streamsHTML, "streams"),
+		recordingsHTML:  injectShell(recordingsHTML, "recording"),
+		accountHTML:     injectShell(accountHTML, ""),
+		docsHTML:        injectShell(docsHTML, ""),
+		adminHTML:       injectShell(adminHTML, ""),
+		frameExports:    map[string]*frameExportJob{},
+		dayZips:         map[string]*dayZipJob{},
+		dayZipSlot:      make(chan struct{}, 1),
+		authLinkLimiter: newAuthLinkLimiter(),
 	}
 	if key := strings.TrimSpace(cfg.StorageCredKey); key != "" {
 		cipher, err := secretbox.NewFromBase64Key(key)
@@ -221,6 +223,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
 			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)
 			account.Get("/billing", s.handleAccountBillingMe)
+			account.Get("/billing/invoices", s.handleAccountBillingInvoices)
 			account.Post("/billing/card", s.handleAccountBillingCard)
 			account.Post("/billing/portal", s.handleAccountBillingPortal)
 			account.Get("/nodes", s.handleAccountNodesList)

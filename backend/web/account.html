@@ -275,18 +275,36 @@
       </div>
     </section>
 
+    <section id="historyPanel" class="panel hidden" style="margin-bottom:16px;">
+      <div class="section-title">
+        <div>
+          <div class="eyebrow">Billing history</div>
+          <h2>Past charges</h2>
+        </div>
+      </div>
+      <div id="historyStatus" class="status">Loading billing history...</div>
+      <div id="historyEmpty" class="empty-state hidden">No charges yet. You are billed monthly for what you record.</div>
+      <div id="historyList" class="rec-list hidden"></div>
+    </section>
+
+    <section class="panel" style="margin-bottom:16px;">
+      <div class="eyebrow">Support</div>
+      <h2>Need help?</h2>
+      <p class="muted" style="margin:0;">Email <a href="mailto:deniz@aydemir.us">deniz@aydemir.us</a> with any question about your account, recordings, or billing.</p>
+    </section>
+
     <section class="panel" style="margin-bottom:16px;">
       <div class="section-title">
         <div>
           <div class="eyebrow">Sign in</div>
-          <h2>Email magic link</h2>
+          <h2>Email sign-in link</h2>
         </div>
-        <p>Enter your email to get a magic link for browser sign-in.</p>
+        <p>Enter your email and we will send you a secure link to sign in.</p>
       </div>
       <label for="email">Email</label>
       <input id="email" type="email" placeholder="you@example.org" />
       <div class="button-row" style="margin-top:12px;">
-        <button id="requestLink" type="button">Email Magic Link</button>
+        <button id="requestLink" type="button">Email me a sign-in link</button>
       </div>
       <div id="requestStatus" class="status"></div>
     </section>
@@ -311,6 +329,10 @@
     const estBreakdown = document.getElementById('estBreakdown');
     const paymentRow = document.getElementById('paymentRow');
     const periodRow = document.getElementById('periodRow');
+    const historyPanel = document.getElementById('historyPanel');
+    const historyStatus = document.getElementById('historyStatus');
+    const historyEmpty = document.getElementById('historyEmpty');
+    const historyList = document.getElementById('historyList');
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const requestedRedirectPath = (() => {
@@ -526,6 +548,67 @@
       }
     }
 
+    // Format a Stripe invoice amount (minor units, e.g. cents) in its currency.
+    function fmtInvoiceAmount(cents, currency) {
+      const c = Number(cents || 0);
+      const cur = String(currency || 'USD').toUpperCase();
+      try { return new Intl.NumberFormat([], { style: 'currency', currency: cur }).format(c / 100); }
+      catch (_) { return `${(c / 100).toFixed(2)} ${cur}`; }
+    }
+
+    // Render past charges from GET /billing/invoices. Real Stripe invoices only;
+    // a new account billing monthly in arrears legitimately has none, so an empty
+    // list shows the honest empty state rather than any placeholder row.
+    function renderHistory(items) {
+      const list = Array.isArray(items) ? items : [];
+      if (list.length === 0) {
+        historyList.classList.add('hidden');
+        historyList.innerHTML = '';
+        historyEmpty.classList.remove('hidden');
+        return;
+      }
+      historyEmpty.classList.add('hidden');
+      historyList.classList.remove('hidden');
+      historyList.innerHTML = list.map((inv) => {
+        const date = fmtDay(inv.created);
+        const amount = fmtInvoiceAmount(inv.amount_due_cents, inv.currency);
+        const status = String(inv.status || '').trim();
+        const number = String(inv.number || '').trim();
+        const link = String(inv.hosted_url || inv.pdf_url || '').trim();
+        const metaParts = [];
+        if (status) metaParts.push(`<span>${escapeHTML(status)}</span>`);
+        if (number) metaParts.push(`<span>${escapeHTML(number)}</span>`);
+        if (link) metaParts.push(`<a href="${escapeHTML(link)}" target="_blank" rel="noopener">View invoice</a>`);
+        return `
+          <div class="rec-row">
+            <div class="rec-row-head">
+              <div>
+                <div class="rec-name">${escapeHTML(amount)}</div>
+                ${date ? `<div class="rec-sub">${escapeHTML(date)}</div>` : ''}
+              </div>
+            </div>
+            <div class="rec-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function loadHistory() {
+      try {
+        const h = await fetchJSON('/api/v1/account/billing/invoices');
+        if (h && h.billing_enabled === false) { historyPanel.classList.add('hidden'); return; }
+        historyPanel.classList.remove('hidden');
+        historyStatus.classList.add('hidden');
+        renderHistory(h && h.items);
+      } catch (err) {
+        historyPanel.classList.remove('hidden');
+        historyList.classList.add('hidden');
+        historyEmpty.classList.add('hidden');
+        historyStatus.classList.remove('hidden');
+        setStatus(historyStatus, `Could not load billing history: ${String(err.message || err)}`, 'err');
+      }
+    }
+
     function accountContinueTarget() {
       return requestedRedirectPath !== '/account' ? requestedRedirectPath : '';
     }
@@ -590,16 +673,18 @@
         setStatus(accountStatus, authCompleted ? `Signed in as ${email} in this browser.` : 'Signed in.', 'ok');
         void loadRecordings();
         void loadBilling();
+        void loadHistory();
         if (authCompleted) scheduleAuthFlowContinue();
       } catch (_) {
         currentAccount = null;
         accountBox.classList.add('hidden');
         recordingsPanel.classList.add('hidden');
         billingPanel.classList.add('hidden');
+        historyPanel.classList.add('hidden');
         if (authCompleted) {
-          setStatus(accountStatus, 'Magic link was opened, but this browser still has no active session. Open the link in the same browser you want to use.', 'err');
+          setStatus(accountStatus, 'Sign-in link was opened, but this browser still has no active session. Open the link in the same browser you want to use.', 'err');
         } else {
-          setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
+          setStatus(accountStatus, 'No active session. Request a sign-in link to sign in.', '');
         }
       }
     }
@@ -612,7 +697,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, redirect_path: requestedRedirectPath }),
         });
-        setStatus(requestStatus, 'Magic link sent if the email is accepted.', 'ok');
+        setStatus(requestStatus, 'If that email is accepted, we sent a sign-in link.', 'ok');
       } catch (err) {
         setStatus(requestStatus, String(err), 'err');
       }

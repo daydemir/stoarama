@@ -125,6 +125,50 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// handleAccountBillingInvoices returns the account's past charges (Stripe
+// invoices, newest first) for the billing-history panel. The service bills
+// monthly in arrears and is new, so an account legitimately has zero invoices:
+// this returns an empty items array (never mock data) so the UI can render an
+// honest empty state. has_customer=false means no Stripe customer exists yet.
+func (s *Server) handleAccountBillingInvoices(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.billing == nil {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"billing_enabled": false, "has_customer": false, "items": []any{}})
+		return
+	}
+	var customerID *string
+	err := s.pool.QueryRow(r.Context(), `
+		SELECT stripe_customer_id FROM account_billing WHERE account_id=$1
+	`, principal.AccountID).Scan(&customerID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load billing: %v", err))
+		return
+	}
+	custID := ""
+	if customerID != nil {
+		custID = strings.TrimSpace(*customerID)
+	}
+	if custID == "" {
+		// No Stripe customer yet (no card ever added): honestly no charges.
+		util.WriteJSON(w, http.StatusOK, map[string]any{"billing_enabled": true, "has_customer": false, "items": []any{}})
+		return
+	}
+	invoices, err := s.billing.ListInvoices(r.Context(), custID, 12)
+	if err != nil {
+		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("list invoices: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"billing_enabled": true,
+		"has_customer":    true,
+		"items":           invoices,
+	})
+}
+
 // handleAccountBillingCard returns the URL the account should be sent to manage
 // its card on file, serializing per-account via a FOR UPDATE lock so concurrent
 // clicks cannot mint two Stripe customers. If a card is already on file it returns

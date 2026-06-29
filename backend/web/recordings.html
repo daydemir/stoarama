@@ -247,16 +247,16 @@
     <!--SHELL_TOPBAR-->
 
     <div class="rec-content">
-    <!-- Signed-out: single magic-link panel -->
+    <!-- Signed-out: single sign-in-link panel -->
     <div id="signedOut" class="panel hidden">
       <div class="eyebrow">Sign in</div>
-      <h2>Email magic link</h2>
+      <h2>Email sign-in link</h2>
       <p style="margin-top:0;">Record any public HLS or HTTPS stream to your own S3 bucket on a schedule, then browse and download your clips. Sign in to start.</p>
       <div class="field" style="margin-top:14px;">
         <label for="email">Email</label>
         <input id="email" type="email" placeholder="you@example.org" autocomplete="email" />
       </div>
-      <div class="button-row"><button id="requestLink" type="button">Email magic link</button></div>
+      <div class="button-row"><button id="requestLink" type="button">Email me a sign-in link</button></div>
       <div id="requestStatus" class="status"></div>
     </div>
 
@@ -1600,7 +1600,7 @@
       // held by the server gate. Make that unmistakable per card so a researcher
       // never assumes recording is happening when it is silently held.
       const blocked = rec.needs_card === true
-        ? `<div class="card-blocked"><span><b>Not recording</b> — add a card to start capturing.</span>`
+        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a card to start capturing.</span>`
           + `<button type="button" data-addcard="${id}">Add a card</button></div>`
         : '';
 
@@ -2536,7 +2536,7 @@
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, redirect_path: '/recordings' }),
         });
-        setStatus(els.requestStatus, 'Magic link sent if the email is accepted.', 'ok');
+        setStatus(els.requestStatus, 'If that email is accepted, we sent a sign-in link.', 'ok');
       } catch (err) {
         setStatus(els.requestStatus, String(err.message || err), 'err');
       }

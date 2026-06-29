@@ -221,6 +221,14 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, "valid email is required")
 		return
 	}
+	// Basic abuse protection: cap how many links a single requester IP or email
+	// can trigger in a short window. Over-limit requests return the SAME neutral
+	// OK as a normal request so this never reveals whether an email exists and
+	// cannot be used to spray sign-in emails.
+	if !s.authLinkLimiter.allow(requesterIP(r)) || !s.authLinkLimiter.allow("email:"+email) {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
 	redirectPath := sanitizeAccountRedirectPath(req.RedirectPath)
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {

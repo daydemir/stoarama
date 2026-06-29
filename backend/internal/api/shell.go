@@ -2,6 +2,11 @@ package api
 
 import "strings"
 
+// SupportEmail is the single source of truth for the address users contact for
+// help. Surfaced site-wide in the shared footer (below) and on the account/docs
+// pages. Do not hardcode the address anywhere else.
+const SupportEmail = "deniz@aydemir.us"
+
 // Canonical topbar CSS. Injected at <!--SHELL_HEAD--> (inside each page's <head>,
 // before </style> is fine — these are standalone rules). Single source of truth.
 const shellHeadCSS = `
@@ -24,6 +29,9 @@ const shellHeadCSS = `
 .admin-chip{display:none;align-items:center;justify-content:center;width:34px;height:34px;border-radius:999px;border:1px solid var(--border);background:color-mix(in srgb,var(--panel) 92%,#000);color:var(--text);font-family:var(--mono);font-size:13px;text-decoration:none;flex:0 0 auto;}
 .admin-chip:hover{text-decoration:none;border-color:color-mix(in srgb,var(--accent) 35%,var(--border));color:var(--accent);}
 @media (max-width:720px){.topbar{grid-template-columns:auto 1fr;grid-template-areas:"brand utils" "nav nav";row-gap:10px;column-gap:10px;align-items:center;}.topbar-left{grid-area:brand;}.topbar-right{grid-area:utils;justify-self:end;}.topbar-center{grid-area:nav;justify-self:stretch;}.global-nav{width:100%;justify-content:center;}}
+.site-footer{margin:40px auto 24px;max-width:1200px;padding:16px 4px 0;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11px;letter-spacing:0.03em;color:var(--muted);}
+.site-footer a{color:var(--muted);text-decoration:none;}
+.site-footer a:hover{color:var(--text);text-decoration:underline;}
 </style>`
 
 // Canonical topbar markup. Injected at <!--SHELL_TOPBAR--> (first child of <body>).
@@ -105,6 +113,18 @@ const shellTopbarJS = `
 })();
 </script>`
 
+// Canonical site-wide footer. Injected just before </body> on every page so the
+// support email and billing expectation are discoverable everywhere. The address
+// is the single SupportEmail constant; do not duplicate it.
+const shellFooterTmpl = `<footer class="site-footer">
+  <span>STO-A-RAMA &middot; Billed monthly for what you record.</span>
+  <span>Need help? <a href="mailto:%SUPPORT_EMAIL%">%SUPPORT_EMAIL%</a></span>
+</footer>`
+
+func shellFooter() string {
+	return strings.ReplaceAll(shellFooterTmpl, "%SUPPORT_EMAIL%", SupportEmail)
+}
+
 // active = "streams" | "recording" | "" (none).
 func injectShell(page []byte, active string) []byte {
 	topbar := shellTopbarTmpl
@@ -112,6 +132,7 @@ func injectShell(page []byte, active string) []byte {
 	topbar = strings.Replace(topbar, "%ACTIVE_RECORDING%", boolActive(active == "recording"), 1)
 	out := strings.Replace(string(page), "<!--SHELL_HEAD-->", shellHeadCSS, 1)
 	out = strings.Replace(out, "<!--SHELL_TOPBAR-->", topbar, 1)
+	out = strings.Replace(out, "</body>", shellFooter()+"\n</body>", 1)
 	return []byte(out)
 }
 
