@@ -1565,6 +1565,19 @@
       <a id="detailNoInlineLink" href="#" target="_blank" rel="noopener noreferrer">Open the source &#8599;</a>
     </p>
 
+    <!-- Record this yourself: copy-paste capture command tailored to the stream type. -->
+    <div id="detailSelfRecord" class="detail-section-card" style="display:none;">
+      <div class="detail-section-head">
+        <div class="detail-section-title">Record this yourself</div>
+        <div class="detail-section-subtitle">Run on your own machine to capture a 60-second clip.</div>
+      </div>
+      <pre class="command-snippet"><code id="detailSelfRecordCmd" class="mono fs11"></code></pre>
+      <div class="row" style="margin-top:8px;align-items:center;gap:10px;">
+        <button id="detailSelfRecordCopy" class="btn-sm" type="button">Copy command</button>
+        <span id="detailSelfRecordNote" class="muted fs10"></span>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -1634,8 +1647,6 @@ const operationsPanel = $('operationsPanel');
 const discoveryPanel = $('discoveryPanel');
 const inferencesPanel = $('inferencesPanel');
 const detailPanel = $('detailPanel');
-const topbarAccountStatus = $('topbarAccountStatus');
-const topbarAdminLink = $('topbarAdminLink');
 
 // top tabs
 const tabOverview = $('tabOverview');
@@ -1728,6 +1739,10 @@ const detailLivePlayer = $('detailLivePlayer');
 const detailLivePlayerMount = $('detailLivePlayerMount');
 const detailNoInlineNote = $('detailNoInlineNote');
 const detailNoInlineLink = $('detailNoInlineLink');
+const detailSelfRecord = $('detailSelfRecord');
+const detailSelfRecordCmd = $('detailSelfRecordCmd');
+const detailSelfRecordCopy = $('detailSelfRecordCopy');
+const detailSelfRecordNote = $('detailSelfRecordNote');
 let detailHlsInstance = null;
 const detailActions = $('detailActions');
 const detailSourcePanel = $('detailSourcePanel');
@@ -2717,32 +2732,11 @@ async function fetchJSONWithTimeout(path, opts = {}, timeoutMs = 0, timeoutMessa
   }
 }
 
-function renderTopbarAccountStatus() {
-  if (!(topbarAccountStatus instanceof HTMLElement)) return;
-  const signInURL = accountRedirectURL();
-  const account = currentAccount();
-  const role = String(account && account.role || '').trim().toLowerCase();
-  const authType = String(authState && authState.session && authState.session.auth_type || '').trim();
-  if (topbarAdminLink instanceof HTMLAnchorElement) {
-    topbarAdminLink.style.display = role === 'admin' ? 'inline-flex' : 'none';
-  }
-  if (authState && authState.status === 'checking') {
-    topbarAccountStatus.textContent = 'Checking session...';
-    return;
-  }
-  if (isAuthenticatedAccount() && account) {
-    topbarAccountStatus.innerHTML = `<a href="${signInURL}">${esc(account.email)}</a>${authType ? ` <span class="muted">· ${esc(authType)}</span>` : ''}`;
-    return;
-  }
-  if (authState && authState.status === 'degraded') {
-    topbarAccountStatus.innerHTML = `<a href="${signInURL}">Sign in for recording</a> <span class="muted">· session unavailable</span>`;
-    return;
-  }
-  topbarAccountStatus.innerHTML = `<a href="${signInURL}">Sign in for recording</a>`;
-}
+// The top-right account chip + admin gear are owned by the shared topbar shell
+// (backend/internal/api/shell.go). This page only syncs its own body UI to the
+// session state below.
 
 function syncAuthDependentUI() {
-  renderTopbarAccountStatus();
   syncDetailAuthState();
   if (streamRows.length) renderStreamRows();
   if (detailRecordingData && detailRecordingData.stream) {
@@ -4811,6 +4805,75 @@ function mountDetailLivePlayer(stream) {
   }
 }
 
+// Build the copy-paste command to self-record this stream from a local machine.
+// HLS/http_video -> ffmpeg against the REAL playable URL (the same resolved .m3u8
+// the inline player uses, never the raw '!hls' marker). YouTube -> yt-dlp against
+// the watch URL. Returns { command, note } or null when no honest command applies.
+function selfRecordCommand(stream) {
+  const s = stream || {};
+  const streamID = Number(s.id || 0);
+  const fileBase = streamID > 0 ? `stream-${streamID}` : 'clip';
+  const captureType = String(s.capture_type || '').trim().toLowerCase();
+  const provider = String(s.provider || '').trim().toLowerCase();
+  const sourceURL = String(s.source_url || '').trim();
+  const sourcePageURL = String(s.source_page_url || '').trim();
+
+  // YouTube: yt-dlp against the canonical watch URL.
+  const youtubeLike = captureType === 'youtube_watch' || provider === 'youtube'
+    || isYouTubeSourceURL(sourceURL) || isYouTubeSourceURL(sourcePageURL);
+  if (youtubeLike) {
+    const watchURL = buildYouTubeWatchURL(s) || sourcePageURL || sourceURL;
+    if (!watchURL) return null;
+    return {
+      command: `yt-dlp "${watchURL}"`,
+      note: 'Needs yt-dlp installed. Add --cookies-from-browser chrome for sign-in-restricted streams.',
+    };
+  }
+
+  // HLS / direct video: ffmpeg against the resolved playable manifest, not the
+  // '!hls' marker. detailHlsURL() returns source_url when it is a real .m3u8, else
+  // capture_runtime_resolved_url; fall back to a direct non-marker source_url for
+  // dash/rtsp/rtmp/http_video.
+  const directVideo = ['hls', 'dash', 'rtsp', 'rtmp', 'http_video'].includes(captureType);
+  let playURL = detailHlsURL(s);
+  if (!playURL && directVideo && sourceURL && !sourceURL.includes('!')) playURL = sourceURL;
+  if (playURL) {
+    return {
+      command: `ffmpeg -i "${playURL}" -t 60 -c copy "${fileBase}.mp4"`,
+      note: 'Needs ffmpeg installed. -t 60 records 60 seconds; remove it to record until you stop.',
+    };
+  }
+  return null;
+}
+
+function renderSelfRecord(stream) {
+  if (!(detailSelfRecord instanceof HTMLElement)) return;
+  const result = selfRecordCommand(stream);
+  if (!result || !result.command) {
+    detailSelfRecord.style.display = 'none';
+    if (detailSelfRecordCmd instanceof HTMLElement) detailSelfRecordCmd.textContent = '';
+    return;
+  }
+  detailSelfRecord.style.display = '';
+  if (detailSelfRecordCmd instanceof HTMLElement) detailSelfRecordCmd.textContent = result.command;
+  if (detailSelfRecordNote instanceof HTMLElement) detailSelfRecordNote.textContent = result.note || '';
+}
+
+if (detailSelfRecordCopy instanceof HTMLElement) {
+  detailSelfRecordCopy.addEventListener('click', async () => {
+    const command = detailSelfRecordCmd instanceof HTMLElement ? String(detailSelfRecordCmd.textContent || '') : '';
+    if (!command) return;
+    const original = detailSelfRecordCopy.textContent;
+    try {
+      await navigator.clipboard.writeText(command);
+      detailSelfRecordCopy.textContent = 'Copied';
+    } catch (_) {
+      detailSelfRecordCopy.textContent = 'Copy failed';
+    }
+    window.setTimeout(() => { detailSelfRecordCopy.textContent = original || 'Copy command'; }, 1200);
+  });
+}
+
 async function loadDetail(options = {}) {
   const quiet = Boolean(options && options.quiet);
   if (!detailStreamID) return;
@@ -4830,6 +4893,7 @@ async function loadDetail(options = {}) {
   syncDetailMutationUI(s);
 
   mountDetailLivePlayer(s);
+  renderSelfRecord(s);
 }
 
 // ─── Stream table actions ────────────────────────────────────────────────────

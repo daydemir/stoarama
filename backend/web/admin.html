@@ -1811,8 +1811,6 @@ const inferencesPanel = $('inferencesPanel');
 const serversPanel = $('serversPanel');
 const recordingPanel = $('recordingPanel');
 const detailPanel = $('detailPanel');
-const topbarAccountStatus = $('topbarAccountStatus');
-const topbarAdminLink = $('topbarAdminLink');
 const adminGate = $('adminGate');
 
 // top tabs
@@ -2837,22 +2835,16 @@ function formatAccountAuthError(err, prefix = 'signed-in account required') {
   return `${prefix}. Sign in at ${accountRedirectURL()}`;
 }
 
-async function refreshTopbarAccountStatus() {
-  if (!(topbarAccountStatus instanceof HTMLElement)) return;
+// The top-right account chip + admin gear are owned by the shared topbar shell
+// (backend/internal/api/shell.go). This only resolves the session for the
+// admin-only page gate below; it does not touch the topbar.
+async function refreshAdminGate() {
   const accountHref = accountRedirectURL();
   try {
     const payload = await fetchJSON('/api/v1/account/me');
     const account = payload && payload.account ? payload.account : {};
     currentAccount = account;
-    const email = String(account.email || '').trim();
-    const authType = String(account.auth_type || '').trim();
     const role = String(account.role || '').trim().toLowerCase();
-    if (topbarAdminLink instanceof HTMLAnchorElement) {
-      topbarAdminLink.style.display = role === 'admin' ? 'inline-flex' : 'none';
-    }
-    topbarAccountStatus.innerHTML = email
-      ? `<a href="${accountHref}">${esc(email)}</a>${authType ? ` <span class="muted">· ${esc(authType)}</span>` : ''}`
-      : `<a href="${accountHref}">Account</a>`;
     if (adminGate instanceof HTMLElement) {
       adminGate.innerHTML = role === 'admin'
         ? 'Admin tools are active. Imports, processing, and server management are shown below.'
@@ -2860,10 +2852,6 @@ async function refreshTopbarAccountStatus() {
     }
   } catch (_) {
     currentAccount = null;
-    if (topbarAdminLink instanceof HTMLAnchorElement) {
-      topbarAdminLink.style.display = 'none';
-    }
-    topbarAccountStatus.innerHTML = `<a href="${accountHref}">Sign in for recording</a>`;
     if (adminGate instanceof HTMLElement) {
       adminGate.innerHTML = `Admin tools require an admin account. <a href="${accountHref}">Sign in</a>.`;
     }
@@ -7428,7 +7416,7 @@ window.addEventListener('popstate', () => {
 
 (async function init() {
   try {
-    await refreshTopbarAccountStatus();
+    await refreshAdminGate();
     updateAdminSectionHrefs();
     setDetailSubView('coverage');
     if (!currentAccount || String(currentAccount.role || '').trim().toLowerCase() !== 'admin') {

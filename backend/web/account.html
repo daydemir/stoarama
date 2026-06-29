@@ -297,8 +297,6 @@
     const accountStatus = document.getElementById('accountStatus');
     const accountBox = document.getElementById('accountBox');
     const accountMeta = document.getElementById('accountMeta');
-    const accountChip = document.getElementById('topbarAccountStatus');
-    const adminChip = document.getElementById('topbarAdminLink');
     const recordingsPanel = document.getElementById('recordingsPanel');
     const recordingsStatus = document.getElementById('recordingsStatus');
     const recordingsEmpty = document.getElementById('recordingsEmpty');
@@ -570,19 +568,8 @@
       }, 1600);
     }
 
-    function updateAccountChrome() {
-      const accountHref = `/account?redirect_path=${encodeURIComponent(requestedRedirectPath)}`;
-      if (!currentAccount) {
-        accountChip.innerHTML = `<a href="${accountHref}">Account</a>`;
-        if (adminChip instanceof HTMLElement) adminChip.style.display = 'none';
-        return;
-      }
-      const email = String(currentAccount.email || '').trim();
-      const authType = String(currentAccount.auth_type || '').trim();
-      const role = String(currentAccount.role || '').trim().toLowerCase();
-      accountChip.textContent = authType ? `${email} · ${authType}` : email;
-      if (adminChip instanceof HTMLElement) adminChip.style.display = role === 'admin' ? 'inline-flex' : 'none';
-    }
+    // The top-right account chip + admin gear are owned by the shared topbar shell
+    // (backend/internal/api/shell.go). No per-page topbar wiring here.
 
     async function refreshSession() {
       try {
@@ -613,7 +600,6 @@
           setStatus(accountStatus, 'No active session. Request a magic link to sign in.', '');
         }
       }
-      updateAccountChrome();
     }
 
     document.getElementById('requestLink').addEventListener('click', async () => {

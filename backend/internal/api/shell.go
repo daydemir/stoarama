@@ -43,7 +43,67 @@ const shellTopbarTmpl = `<div class="topbar">
     <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">&#9881;</a>
     <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
   </div>
-</div>`
+</div>` + shellTopbarJS
+
+// Canonical topbar BEHAVIOR. One definition for every page: fetch the session,
+// render the account chip + admin gear identically, so the account control works
+// on every tab including Recording. Wrapped in an IIFE that runs from its own
+// script element, independent of any page-body script, so a page-body JS error
+// cannot break the topbar. References only the shared #topbar* ids from the markup
+// above. Do not duplicate this logic in any page.
+const shellTopbarJS = `
+<script>
+(function(){
+  function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
+  var chip=document.getElementById("topbarAccountStatus");
+  var gear=document.getElementById("topbarAdminLink");
+  if(gear){gear.style.display="none";}
+  function redirectPath(){
+    try{return location.pathname+(location.search||"");}catch(_){return "/";}
+  }
+  function signInHref(){
+    return "/account?redirect_path="+encodeURIComponent(redirectPath());
+  }
+  function renderAnon(label){
+    if(!chip)return;
+    chip.innerHTML='<a href="'+signInHref()+'">'+(label||"Sign in for recording")+'</a>';
+  }
+  function renderSignedIn(acct,authType){
+    if(!chip)return;
+    var email=String(acct&&acct.email||"").trim()||"Account";
+    chip.innerHTML='<a href="/account">'+esc(email)+'</a>'+(authType?' <span class="muted">&middot; '+esc(authType)+'</span>':'');
+    if(gear&&String(acct&&acct.role||"").trim().toLowerCase()==="admin"){gear.style.display="inline-flex";}
+  }
+  function load(){
+    if(chip){chip.textContent="Checking session...";}
+    var ctrl=new AbortController();
+    var to=setTimeout(function(){ctrl.abort();},8000);
+    fetch("/api/v1/account/me",{credentials:"same-origin",headers:{Accept:"application/json"},signal:ctrl.signal})
+      .then(function(res){
+        clearTimeout(to);
+        if(res.status===401){renderAnon("Sign in for recording");return null;}
+        if(!res.ok){throw new Error("status "+res.status);}
+        return res.json();
+      })
+      .then(function(payload){
+        if(!payload)return;
+        var acct=payload.account||{};
+        if(payload.authenticated&&acct&&acct.email){
+          var authType=String(payload.session&&payload.session.auth_type||acct.auth_type||"").trim();
+          renderSignedIn(acct,authType);
+        }else{
+          renderAnon("Sign in for recording");
+        }
+      })
+      .catch(function(){
+        clearTimeout(to);
+        if(!chip)return;
+        chip.innerHTML='<a href="'+signInHref()+'">Sign in for recording</a> <span class="muted">&middot; session unavailable</span>';
+      });
+  }
+  if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",load);}else{load();}
+})();
+</script>`
 
 // active = "streams" | "recording" | "" (none).
 func injectShell(page []byte, active string) []byte {

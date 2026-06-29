@@ -292,8 +292,6 @@ POST /api/v1/account/api-keys</code></pre>
 
   <script>
     const metricsRow = document.getElementById('metricsRow');
-    const accountChip = document.getElementById('topbarAccountStatus');
-    const topbarAdminLink = document.getElementById('topbarAdminLink');
     const routes = {
       '/docs/getting-started': ['navGettingStarted', 'sectionGettingStarted'],
       '/docs/api': ['navAPI', 'sectionAPI'],
@@ -371,35 +369,11 @@ POST /api/v1/account/api-keys</code></pre>
       });
     }
 
-    async function refreshChrome() {
-      const redirectPath = encodeURIComponent(`${window.location.pathname}${window.location.search}${window.location.hash}`);
-      try {
-        const payload = await fetchJSON('/api/v1/account/me');
-        const account = payload && payload.account ? payload.account : {};
-        const email = String(account.email || '').trim();
-        const authType = String(account.auth_type || '').trim();
-        const role = String(account.role || '').trim().toLowerCase();
-        if (accountChip) {
-          accountChip.innerHTML = email
-            ? `<a href="/account?redirect_path=${redirectPath}">${email}</a>${authType ? ` <span class="muted">· ${authType}</span>` : ''}`
-            : `<a href="/account?redirect_path=${redirectPath}">Account</a>`;
-        }
-        if (topbarAdminLink) {
-          topbarAdminLink.style.display = role === 'admin' ? 'inline-flex' : 'none';
-        }
-      } catch (_) {
-        if (accountChip) {
-          accountChip.innerHTML = `<a href="/account?redirect_path=${redirectPath}">Sign in for recording</a>`;
-        }
-        if (topbarAdminLink) {
-          topbarAdminLink.style.display = 'none';
-        }
-      }
-    }
+    // The top-right account chip + admin gear are owned by the shared topbar shell
+    // (backend/internal/api/shell.go). No per-page topbar wiring here.
 
     activateSection();
     installCopyButtons();
-    void refreshChrome();
     void refreshTopbarMetrics();
   </script>
 </body>

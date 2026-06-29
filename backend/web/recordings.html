@@ -53,32 +53,6 @@
     a:hover { text-decoration: underline; }
     .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
     .rec-content { max-width: 880px; margin: 0 auto; }
-    .account-menu {
-      position: absolute;
-      top: calc(100% + 8px);
-      right: 0;
-      min-width: 220px;
-      z-index: 30;
-      padding: 6px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 96%, #000);
-      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.35);
-    }
-    .account-menu button {
-      width: 100%;
-      text-align: left;
-      min-height: 38px;
-      padding: 9px 12px;
-      border-radius: 9px;
-      border: 1px solid transparent;
-      background: transparent;
-      color: var(--text);
-      font-weight: 500;
-      cursor: pointer;
-    }
-    .account-menu button:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); }
-    .account-menu .menu-sep { height: 1px; margin: 6px 4px; background: var(--border); }
     .panel {
       background: color-mix(in srgb, var(--panel) 94%, #000);
       border: 1px solid var(--border);
@@ -174,7 +148,8 @@
     .card-status.paused { color: var(--muted); }
     .card-status.pending { color: var(--warn); }
     .card-status.pending .dot { background: var(--warn); }
-    .card-meta { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+    .card-meta { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; font-size: 13px; color: var(--muted); }
+    .card-meta .meta-sep { color: var(--border); user-select: none; }
     .card-meta .meta-strong { color: var(--text); }
     .card-meta .health-healthy { color: var(--ok); }
     .card-meta .health-degraded { color: var(--warn); }
@@ -509,8 +484,6 @@
 
   <script>
     const els = {
-      accountArea: document.getElementById('accountArea'),
-      accountChip: document.getElementById('topbarAccountStatus'),
       signedOut: document.getElementById('signedOut'),
       signedIn: document.getElementById('signedIn'),
       requestStatus: document.getElementById('requestStatus'),
@@ -1597,13 +1570,13 @@
       const health = String(rec.health || 'idle');
       const metaParts = [];
       metaParts.push(`<span class="meta-strong">${escapeHTML(scheduleLabel(rec))}</span>`);
-      metaParts.push(`${clip}s clips`);
+      metaParts.push(`<span>${clip}s clips</span>`);
       if (last) {
         let word = '';
         if (status === 'active' && health !== 'idle') word = ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>`;
-        metaParts.push(`Last clip: ${escapeHTML(last)}${word}`);
+        metaParts.push(`<span>Last clip: ${escapeHTML(last)}${word}</span>`);
       } else {
-        metaParts.push('No clips yet');
+        metaParts.push('<span>No clips yet</span>');
       }
 
       let actions = '';
@@ -1649,7 +1622,7 @@
             <div>${headHTML}</div>
             <div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>
           </div>
-          <div class="card-meta">${metaParts.join('')}</div>
+          <div class="card-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
           ${errLine}
           ${blocked}
           <div class="card-actions">${actions}</div>
@@ -1780,8 +1753,7 @@
       return `
         <div class="clip-row${purged ? ' purged' : ''}" data-cliprow="${cid}">
           <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
-          <span>${escapeHTML(formatDuration(c.duration_ms))}</span>
-          <span>${escapeHTML(formatBytes(c.size_bytes))}</span>
+          <span class="clip-meta">${escapeHTML(formatDuration(c.duration_ms))} &middot; ${escapeHTML(formatBytes(c.size_bytes))}</span>
           ${actions}
         </div>
         <div class="clip-xfer hidden" data-clipxfer="${cid}"></div>`;
@@ -2409,62 +2381,10 @@
       els.composerFootnote.classList.toggle('hidden', !state.billingEnabled);
     }
 
-    // ---- Account chip dropdown ----
-
-    function buildAccountChip() {
-      const acct = state.account || {};
-      const email = String(acct.email || '').trim();
-      els.accountChip.innerHTML = `${escapeHTML(email || 'Account')} <span class="caret">v</span>`;
-      els.accountChip.onclick = (e) => { e.stopPropagation(); toggleAccountMenu(); };
-    }
-
-    function showOperatorLink() {
-      const acct = state.account || {};
-      return acct.role === 'admin' || acct.has_keys_or_nodes === true;
-    }
-
-    function toggleAccountMenu() {
-      const existing = document.getElementById('accountMenu');
-      if (existing) { existing.remove(); return; }
-      const menu = document.createElement('div');
-      menu.className = 'account-menu';
-      menu.id = 'accountMenu';
-      const op = showOperatorLink()
-        ? `<div class="menu-sep"></div><button type="button" data-act="operator">Developer / nodes</button>` : '';
-      const billing = state.billingEnabled
-        ? `<button type="button" data-act="portal">Billing &amp; card</button>` : '';
-      menu.innerHTML = `${billing}<button type="button" data-act="signout">Sign out</button>${op}`;
-      els.accountArea.appendChild(menu);
-      menu.querySelector('[data-act="portal"]')?.addEventListener('click', openPortal);
-      menu.querySelector('[data-act="signout"]')?.addEventListener('click', signOut);
-      menu.querySelector('[data-act="operator"]')?.addEventListener('click', () => window.location.assign('/account'));
-    }
-
-    document.addEventListener('click', () => {
-      const existing = document.getElementById('accountMenu');
-      if (existing) existing.remove();
-    });
-
-    async function openPortal() {
-      try {
-        const out = await fetchJSON('/api/v1/account/billing/portal', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-        });
-        if (out.url) { window.location.assign(out.url); return; }
-        window.alert('No billing portal URL returned.');
-      } catch (err) {
-        window.alert(String(err.message || err));
-      }
-    }
-
-    async function signOut() {
-      try {
-        await fetchJSON('/api/v1/account/logout', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-        });
-      } catch (_) { /* fall through to reload regardless */ }
-      window.location.assign('/recordings');
-    }
+    // The top-right account control (chip + admin gear) is owned by the shared
+    // topbar shell (backend/internal/api/shell.go), which fetches the session and
+    // renders identical, self-contained behavior on every page. No per-page topbar
+    // wiring here.
 
     // ---- Billing return (?billing=success | ?billing=cancel) ----
 
@@ -2632,7 +2552,6 @@
         state.account = account;
         els.signedOut.classList.add('hidden');
         els.signedIn.classList.remove('hidden');
-        buildAccountChip();
         await loadBilling();
         await refreshDestinations();
         const recId = clipPageRecId();
@@ -2653,9 +2572,6 @@
         await handleBillingReturn();
         await maybeLandFromCatalogStream();
       } catch (_) {
-        els.accountChip.textContent = 'Sign in';
-        els.accountChip.style.cursor = 'default';
-        els.accountChip.onclick = null;
         els.signedIn.classList.add('hidden');
         els.signedOut.classList.remove('hidden');
       }
