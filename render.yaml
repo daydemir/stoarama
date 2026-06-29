@@ -10,20 +10,25 @@ services:
     env: go
     rootDir: backend
     autoDeployTrigger: commit
-    # Vendor a static linux ffmpeg into bin/ during build. Render env:go has no
-    # ffmpeg on PATH, and capture.CaptureFrame shells to $FFMPEG_BIN for
-    # non-image streams (needed by the survey feature). The static build is
-    # downloaded fresh each build, extracted, and placed at bin/ffmpeg.
-    # FFMPEG_BIN below points the app at it. rootDir is backend, so bin/ and the
-    # ./bin/ffmpeg path both resolve relative to backend/.
+    # Vendor a linux ffmpeg into bin/ during build. Render env:go has no ffmpeg
+    # on PATH, and the recorder create-time reachability probe shells to
+    # $FFMPEG_BIN. We use the BtbN gpl build: the johnvansickle static build
+    # segfaults on any network input (TLS and plain http alike) on Render's
+    # kernel, which crashed every HTTPS probe; the BtbN build opens HTTPS HLS
+    # cleanly. It links only standard glibc, present in the go env. It reads the
+    # CA bundle from $SSL_CERT_FILE (set below) for TLS cert verification; we
+    # vendor the system bundle into bin/ at build time so the runtime path is
+    # self-contained. rootDir is backend, so bin/ and ./bin/ffmpeg resolve
+    # relative to backend/.
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoarama-api ./cmd/stoarama-api
-      curl -fsSL -o /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+      curl -fsSL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
       mkdir -p /tmp/ffmpeg-extract
       tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
-      cp /tmp/ffmpeg-extract/ffmpeg bin/ffmpeg
+      cp /tmp/ffmpeg-extract/bin/ffmpeg bin/ffmpeg
       chmod +x bin/ffmpeg
+      cp /etc/ssl/certs/ca-certificates.crt bin/ca-certificates.crt
       ./bin/ffmpeg -version
     startCommand: ./bin/stoarama-api
     envVars:
@@ -81,6 +86,11 @@ services:
         value: "300"
       - key: FFMPEG_BIN
         value: ./bin/ffmpeg
+      # The BtbN ffmpeg (OpenSSL) reads its CA bundle from SSL_CERT_FILE; point
+      # it at the bundle vendored into bin/ during build so HTTPS cert
+      # verification succeeds on the reachability probe.
+      - key: SSL_CERT_FILE
+        value: ./bin/ca-certificates.crt
       # Survey runs on the dedicated stoarama-survey cron service below, not on
       # this web dyno (keeps the public API stable). Leave embedded survey off.
       - key: SURVEY_ENABLED
