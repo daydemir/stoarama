@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Sto-A-Rama Streams</title>
+  <title>Stoarama Streams</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -1481,7 +1481,7 @@
   <div id="streamsPanel">
     <div class="domain-intro">
       <div class="domain-intro-title">Streams</div>
-      <div class="domain-intro-copy">Browse every stream, location, tag, and recording setting in one place.</div>
+      <div class="domain-intro-copy">Browse live public video streams by location, and set one up to record.</div>
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
@@ -1561,7 +1561,7 @@
       <div id="detailLivePlayerMount" class="detail-live-player-mount"></div>
     </div>
     <p id="detailNoInlineNote" class="detail-no-inline-note" style="display:none;">
-      This stream can't play inline here.
+      This stream cannot be played inline.
       <a id="detailNoInlineLink" href="#" target="_blank" rel="noopener noreferrer">Open the source &#8599;</a>
     </p>
 
@@ -2883,7 +2883,17 @@ async function copyStreamSourceURL(streamID) {
 function syncDetailMutationUI(stream) {
   const s = stream || {};
   if (detailRecordCTA instanceof HTMLAnchorElement) {
-    detailRecordCTA.href = `/recordings?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
+    // Only offer the managed recorder for streams it can actually capture (HLS or
+    // direct HTTP video), mirroring the browse-table row. YouTube and still-image
+    // streams cannot be hosted-recorded, so hide the CTA; the "Record this
+    // yourself" block below covers self-capture for those.
+    if (isRecordableStream(s)) {
+      detailRecordCTA.href = `/recordings?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
+      detailRecordCTA.style.display = '';
+    } else {
+      detailRecordCTA.removeAttribute('href');
+      detailRecordCTA.style.display = 'none';
+    }
   }
 }
 
@@ -2910,8 +2920,11 @@ function setStreamStatus(msg, cls = '') {
 function streamCountLabel(filteredCount) {
   const filtered = Number(filteredCount || 0);
   const all = Number(streamAllTotal);
-  if (!Number.isFinite(all) || all < 0) return `${filtered} match filters`;
-  return `${filtered} match filters · ${all} all streams`;
+  // Only show the total once it has actually loaded (admin overview). For public
+  // visitors streamAllTotal stays unset, so suppress the clause rather than
+  // printing a nonsensical "0 total".
+  if (!Number.isFinite(all) || all <= 0) return `${filtered.toLocaleString()} matching`;
+  return `${filtered.toLocaleString()} matching · ${all.toLocaleString()} total`;
 }
 function cityDisplayLabel(raw) {
   const parts = latinizedLabelParts(raw);
@@ -2937,18 +2950,15 @@ function renderLocationHierarchy(stream) {
   return parts.join('');
 }
 function updateStreamFilterSummary() {
-  const recordingState = normalizeRecordingStateFilter(streamRecordingStateFilter.value) || 'all';
-  const captureType = normalizeCaptureTypeFilter(streamModeFilter.value) || 'all';
-  const includeTag = String(streamTagFilter.value || '').trim() || 'any';
-  const excludeTag = String(streamTagExcludeFilter.value || '').trim() || 'none';
-  const sourceRaw = String(sourceFilter.value || '').trim();
-  const source = sourceRaw ? formatSourceLabel(sourceRaw) : 'all';
-  const touched = String(streamTouchedPipelineID || '').trim() || 'none';
+  // Public catalog only exposes Search, Country, and City filters. Summarize the
+  // active location filters in plain language; show nothing when none are set,
+  // never raw internal field names.
   const countryRaw = String(countryFilter.value || '').trim();
-  const country = countryRaw ? countryDisplayLabel(countryRaw) : 'all';
   const cityRaw = String(cityFilter.value || '').trim();
-  const city = cityRaw ? cityDisplayLabel(cityRaw) : 'all';
-  streamFilterSummary.textContent = `Filters: recording=${recordingState} · capture_type=${captureType} · source=${source} · include_tag=${includeTag} · exclude_tag=${excludeTag} · touched_pipeline=${touched} · country=${country} · city=${city}`;
+  const parts = [];
+  if (countryRaw) parts.push(`Country: ${countryDisplayLabel(countryRaw)}`);
+  if (cityRaw) parts.push(`City: ${cityDisplayLabel(cityRaw)}`);
+  streamFilterSummary.textContent = parts.join(' · ');
 }
 
 async function resetStreamFilters() {
