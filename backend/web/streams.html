@@ -53,35 +53,6 @@
     /* Layout */
     .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
 
-    /* Topbar */
-    .topbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 16px;
-      min-height: 40px;
-    }
-    .topbar-left {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      min-width: 0;
-      overflow: hidden;
-    }
-    .topbar-center {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 0;
-    }
-    .topbar-right {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      justify-content: flex-end;
-    }
-    .site-title { font-size: 15px; font-weight: 600; letter-spacing: 0.05em; color: var(--accent); font-family: var(--mono); text-decoration: none; }
     .site-subtitle { display: none; }
     .metrics-row {
       display: flex;
@@ -101,73 +72,6 @@
       white-space: nowrap;
     }
     .metric-chip b { color: var(--text); font-weight: 500; }
-    .global-nav {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: color-mix(in srgb, var(--panel) 90%, #000);
-    }
-    .global-nav a {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 7px 12px;
-      border-radius: 999px;
-      border: 1px solid transparent;
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      text-decoration: none;
-      transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
-    }
-    .global-nav a:hover {
-      color: var(--text);
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      background: color-mix(in srgb, var(--panel2) 78%, transparent);
-      text-decoration: none;
-    }
-    .global-nav a.active {
-      color: #fff;
-      background: var(--accent);
-      border-color: var(--accent);
-    }
-    .topbar-docs-link {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      text-decoration: none;
-      white-space: nowrap;
-      padding: 0 4px;
-    }
-    .topbar-docs-link:hover { color: var(--text); text-decoration: none; }
-    .account-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-height: 34px;
-      padding: 0 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 92%, #000);
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-    .account-chip a {
-      color: var(--text);
-      text-decoration: none;
-    }
-    .account-chip a:hover {
-      text-decoration: underline;
-    }
     .button-row {
       display: flex;
       gap: 10px;
@@ -211,26 +115,6 @@
       color: #001018;
       background: var(--accent);
       border-color: var(--accent);
-    }
-    .admin-chip {
-      display: none;
-      align-items: center;
-      justify-content: center;
-      width: 34px;
-      height: 34px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 92%, #000);
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 13px;
-      text-decoration: none;
-      flex: 0 0 auto;
-    }
-    .admin-chip:hover {
-      text-decoration: none;
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      color: var(--accent);
     }
     .tabbar { display: none !important; }
     .overview-card-grid {
@@ -1569,38 +1453,13 @@
       .image-modal-meta {
         max-height: 34vh;
       }
-      .topbar {
-        grid-template-columns: minmax(0, 1fr);
-        overflow-x: auto;
-      }
-      .topbar-center {
-        justify-content: flex-start;
-      }
-      .topbar-right {
-        justify-content: flex-start;
-      }
     }
+<!--SHELL_HEAD-->
   </style>
 </head>
 <body>
 <div class="shell">
-  <div class="topbar">
-    <div class="topbar-left">
-      <a href="/" class="site-title">STO-A-RAMA</a>
-      <div class="metrics-row" id="metricsRow"></div>
-    </div>
-    <div class="topbar-center">
-      <nav class="global-nav" aria-label="Global">
-        <a href="/" class="active">Streams</a>
-        <a href="/recordings">Recording</a>
-      </nav>
-    </div>
-    <div class="topbar-right">
-      <a class="topbar-docs-link" href="/docs/getting-started">Docs</a>
-      <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">⚙</a>
-      <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
-    </div>
-  </div>
+  <!--SHELL_TOPBAR-->
 
   <div id="streamsPanel">
     <div class="domain-intro">
@@ -4844,13 +4703,25 @@ function isRecordableStream(stream) {
   return ct === 'hls' || ct === 'http_video';
 }
 
+// Returns the .m3u8 URL to play for an HLS stream: the direct source_url when it
+// already points at a manifest, otherwise the runtime-resolved manifest from the
+// detail payload (indirect KBS/Korea: source_url ends in '!hls', resolved URL is a
+// real cross-origin .m3u8 with Access-Control-Allow-Origin:*). Empty string = none.
+function detailHlsURL(stream) {
+  const s = stream || {};
+  const sourceURL = String(s.source_url || '').trim();
+  if (sourceURL && !isYouTubeSourceURL(sourceURL) && sourceURL.toLowerCase().includes('.m3u8')) return sourceURL;
+  const resolved = String(s.capture_runtime_resolved_url || '').trim();
+  if (resolved && resolved.toLowerCase().includes('.m3u8')) return resolved;
+  return '';
+}
+
 function detailPlayerKind(stream) {
   const s = stream || {};
   const provider = String(s.provider || '').trim().toUpperCase();
   const externalID = String(s.external_id || '').trim();
   if (provider === 'YOUTUBE' && externalID) return 'youtube';
-  const sourceURL = String(s.source_url || '').trim();
-  if (sourceURL && !isYouTubeSourceURL(sourceURL) && sourceURL.toLowerCase().includes('.m3u8')) return 'hls';
+  if (detailHlsURL(s)) return 'hls';
   return 'none';
 }
 
@@ -4874,8 +4745,10 @@ function mountDetailLivePlayer(stream) {
     detailLivePlayer.style.display = '';
     return;
   }
-  // kind === 'hls'
-  const url = String(stream.source_url || '').trim();
+  // kind === 'hls' — direct .m3u8 source_url, or the runtime-resolved manifest
+  // (indirect KBS/Korea). CORS on the resolved manifest is open, so hls.js plays
+  // it with no server proxy.
+  const url = detailHlsURL(stream);
   const video = document.createElement('video');
   video.controls = true;
   video.muted = true;

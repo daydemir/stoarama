@@ -54,24 +54,6 @@
     /* Layout */
     .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
 
-    /* Topbar */
-    .topbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 16px;
-      min-height: 40px;
-    }
-    .topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; overflow: hidden; }
-    .topbar-center { display: flex; align-items: center; justify-content: center; min-width: 0; }
-    .topbar-right {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      justify-content: flex-end;
-    }
-    .site-title { font-size: 15px; font-weight: 600; letter-spacing: 0.05em; color: var(--accent); font-family: var(--mono); }
     .site-subtitle { display: none; }
     .metrics-row { display: flex; flex-wrap: nowrap; gap: 6px; min-width: 0; overflow: hidden; }
     .metric-chip {
@@ -85,77 +67,6 @@
       white-space: nowrap;
     }
     .metric-chip b { color: var(--text); font-weight: 500; }
-    .global-nav {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: color-mix(in srgb, var(--panel) 90%, #000);
-    }
-    .global-nav a {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 7px 12px;
-      border-radius: 999px;
-      border: 1px solid transparent;
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      text-decoration: none;
-      transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
-    }
-    .global-nav a:hover {
-      color: var(--text);
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      background: color-mix(in srgb, var(--panel2) 78%, transparent);
-      text-decoration: none;
-    }
-    .global-nav a.active {
-      color: #fff;
-      background: var(--accent);
-      border-color: var(--accent);
-    }
-    .account-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-height: 34px;
-      padding: 0 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 92%, #000);
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-    .account-chip a {
-      color: var(--text);
-      text-decoration: none;
-    }
-    .account-chip a:hover {
-      text-decoration: underline;
-    }
-    .admin-chip {
-      display: none;
-      align-items: center;
-      justify-content: center;
-      width: 34px;
-      height: 34px;
-      border-radius: 999px;
-      border: 1px solid var(--accent);
-      background: color-mix(in srgb, var(--accent) 20%, var(--panel));
-      color: #fff;
-      font-family: var(--mono);
-      font-size: 13px;
-      text-decoration: none;
-      flex: 0 0 auto;
-    }
     .tabbar { display: none !important; }
     .admin-gate {
       margin-bottom: 14px;
@@ -1476,38 +1387,13 @@
       .image-modal-meta {
         max-height: 34vh;
       }
-      .topbar {
-        grid-template-columns: minmax(0, 1fr);
-        overflow-x: auto;
-      }
-      .topbar-center,
-      .topbar-right {
-        justify-content: flex-start;
-      }
     }
+<!--SHELL_HEAD-->
   </style>
 </head>
 <body>
 <div class="shell">
-  <!-- Topbar -->
-  <div class="topbar">
-    <div class="topbar-left">
-      <span class="site-title">STO-A-RAMA</span>
-      <div class="metrics-row" id="metricsRow"></div>
-    </div>
-    <div class="topbar-center">
-      <nav class="global-nav" aria-label="Global">
-        <a href="/streams">Streams</a>
-        <a href="/korea">Korea</a>
-        <a href="/recording">Recording</a>
-        <a href="/docs/getting-started">Docs</a>
-      </nav>
-    </div>
-    <div class="topbar-right">
-      <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">⚙</a>
-      <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
-    </div>
-  </div>
+  <!--SHELL_TOPBAR-->
   <div id="adminGate" class="admin-gate">Checking admin session...</div>
 
   <!-- Tab bar -->

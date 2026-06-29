@@ -52,96 +52,6 @@
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .shell { max-width: 880px; margin: 0 auto; padding: 18px 20px 42px; }
-    .topbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 18px;
-      min-height: 40px;
-    }
-    .topbar-center {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 0;
-    }
-    .global-nav {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: color-mix(in srgb, var(--panel) 90%, #000);
-    }
-    .global-nav a {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 7px 12px;
-      border-radius: 999px;
-      border: 1px solid transparent;
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      text-decoration: none;
-      transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
-    }
-    .global-nav a:hover {
-      color: var(--text);
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      background: color-mix(in srgb, var(--panel2) 78%, transparent);
-      text-decoration: none;
-    }
-    .global-nav a.active {
-      color: #fff;
-      background: var(--accent);
-      border-color: var(--accent);
-    }
-    .topbar-docs-link {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      text-decoration: none;
-      white-space: nowrap;
-      padding: 0 4px;
-    }
-    .topbar-docs-link:hover { color: var(--text); text-decoration: none; }
-    .topbar-left, .topbar-right { display: flex; align-items: center; min-width: 0; }
-    .topbar-left { gap: 10px; overflow: hidden; }
-    .topbar-right { gap: 10px; justify-content: flex-end; position: relative; }
-    .site-title {
-      font-family: var(--mono);
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      color: var(--accent);
-      white-space: nowrap;
-    }
-    .account-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      min-height: 36px;
-      padding: 0 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 92%, #000);
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-      white-space: nowrap;
-      cursor: pointer;
-      width: auto;
-      min-width: 0;
-    }
-    .account-chip:hover { color: var(--text); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
-    .account-chip .caret { font-size: 9px; opacity: 0.8; }
     .account-menu {
       position: absolute;
       top: calc(100% + 8px);
@@ -340,25 +250,12 @@
       #storageChooser { flex-direction: column; }
       #storageChooser button { width: 100%; white-space: normal; }
     }
+<!--SHELL_HEAD-->
   </style>
 </head>
 <body>
   <div class="shell">
-    <div class="topbar">
-      <div class="topbar-left">
-        <a href="/" class="site-title">STO-A-RAMA</a>
-      </div>
-      <div class="topbar-center">
-        <nav class="global-nav" aria-label="Global">
-          <a href="/">Streams</a>
-          <a href="/recordings" class="active">Recording</a>
-        </nav>
-      </div>
-      <div class="topbar-right" id="accountArea">
-        <a class="topbar-docs-link" href="/docs/getting-started">Docs</a>
-        <div class="account-chip" id="accountChip">Checking session...</div>
-      </div>
-    </div>
+    <!--SHELL_TOPBAR-->
 
     <!-- Signed-out: single magic-link panel -->
     <div id="signedOut" class="panel hidden">
@@ -588,7 +485,7 @@
   <script>
     const els = {
       accountArea: document.getElementById('accountArea'),
-      accountChip: document.getElementById('accountChip'),
+      accountChip: document.getElementById('topbarAccountStatus'),
       signedOut: document.getElementById('signedOut'),
       signedIn: document.getElementById('signedIn'),
       requestStatus: document.getElementById('requestStatus'),

@@ -51,39 +51,6 @@
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
-    .topbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 16px;
-      min-height: 40px;
-    }
-    .topbar-left,
-    .topbar-center,
-    .topbar-right {
-      display: flex;
-      align-items: center;
-      min-width: 0;
-    }
-    .topbar-left { gap: 10px; overflow: hidden; }
-    .topbar-center { justify-content: center; }
-    .topbar-right { gap: 10px; justify-content: flex-end; }
-    .site-title {
-      font-family: var(--mono);
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      color: var(--accent);
-      white-space: nowrap;
-    }
-    .metrics-row {
-      display: flex;
-      flex-wrap: nowrap;
-      gap: 6px;
-      min-width: 0;
-      overflow: hidden;
-    }
     .metric-chip {
       font-family: var(--mono);
       font-size: 11px;
@@ -95,67 +62,6 @@
       white-space: nowrap;
     }
     .metric-chip b { color: var(--text); font-weight: 500; }
-    .global-nav {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: color-mix(in srgb, var(--panel) 90%, #000);
-    }
-    .global-nav a {
-      display: inline-flex;
-      align-items: center;
-      padding: 7px 12px;
-      border-radius: 999px;
-      border: 1px solid transparent;
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      text-decoration: none;
-      white-space: nowrap;
-    }
-    .global-nav a:hover {
-      color: var(--text);
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      background: color-mix(in srgb, var(--panel2) 82%, transparent);
-    }
-    .global-nav a.active {
-      color: #fff;
-      background: var(--accent);
-      border-color: var(--accent);
-    }
-    .account-chip {
-      display: inline-flex;
-      align-items: center;
-      min-height: 36px;
-      padding: 0 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 92%, #000);
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-      white-space: nowrap;
-    }
-    .account-chip a { color: var(--text); text-decoration: none; }
-    .admin-chip {
-      display: none;
-      align-items: center;
-      justify-content: center;
-      width: 34px;
-      height: 34px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 92%, #000);
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 13px;
-      text-decoration: none;
-    }
     .panel {
       background: color-mix(in srgb, var(--panel) 94%, #000);
       border: 1px solid var(--border);
@@ -334,43 +240,19 @@
     }
     @media (max-width: 1100px) {
       .hero, .grid-2 { grid-template-columns: 1fr; }
-      .topbar {
-        grid-template-columns: minmax(0, 1fr);
-        overflow-x: auto;
-      }
-      .topbar-center,
-      .topbar-right {
-        justify-content: flex-start;
-      }
     }
+<!--SHELL_HEAD-->
   </style>
 </head>
 <body>
   <div class="shell">
-    <div class="topbar">
-      <div class="topbar-left">
-        <span class="site-title">STO-A-RAMA</span>
-      </div>
-      <div class="topbar-center">
-        <nav class="global-nav" aria-label="Global">
-          <a href="/recordings">Recordings</a>
-        </nav>
-      </div>
-      <div class="topbar-right">
-        <a id="adminChip" class="admin-chip" href="/admin" aria-label="Admin">⚙</a>
-        <div class="account-chip" id="accountChip">Checking session...</div>
-      </div>
-    </div>
+    <!--SHELL_TOPBAR-->
 
     <div class="hero">
       <section class="panel">
-        <div class="eyebrow">Operator tools</div>
-        <h1>Manage API keys and enrolled nodes.</h1>
-        <p>Use this page for automation credentials and local recorder node enrollment. Recordings, billing, and clip access live on the Recordings page.</p>
-        <div class="hero-notes">
-          <span class="hero-note">API keys for scripts</span>
-          <span class="hero-note">Node enrollment</span>
-        </div>
+        <div class="eyebrow">Account</div>
+        <h1>Your STO-A-RAMA account.</h1>
+        <p>Manage your sign-in for this browser. Your recordings and clips live on the Recordings page.</p>
       </section>
       <section class="panel">
         <div class="eyebrow">Session</div>
@@ -379,6 +261,7 @@
         <div id="accountBox" class="stack hidden">
           <div id="accountMeta" class="session-meta"></div>
           <div class="button-row">
+            <a href="/recordings">My Recordings</a>
             <button id="logoutBtn" class="secondary" type="button">Log Out</button>
           </div>
         </div>
@@ -401,6 +284,7 @@
       <div id="requestStatus" class="status"></div>
     </section>
 
+    <div id="operatorTools" class="hidden">
     <section class="panel" style="margin-bottom:16px;">
       <div class="section-title">
         <div>
@@ -487,6 +371,7 @@
         </div>
       </section>
     </div>
+    </div>
   </div>
 
   <script>
@@ -494,8 +379,9 @@
     const accountStatus = document.getElementById('accountStatus');
     const accountBox = document.getElementById('accountBox');
     const accountMeta = document.getElementById('accountMeta');
-    const accountChip = document.getElementById('accountChip');
-    const adminChip = document.getElementById('adminChip');
+    const accountChip = document.getElementById('topbarAccountStatus');
+    const adminChip = document.getElementById('topbarAdminLink');
+    const operatorTools = document.getElementById('operatorTools');
     const keysEmpty = document.getElementById('keysEmpty');
     const keysBox = document.getElementById('keysBox');
     const keysRows = document.getElementById('keysRows');
@@ -731,14 +617,9 @@
     async function refreshSession() {
       try {
         currentAccount = await fetchCurrentAccountWithRetry();
-        // Operator-only guard: a non-admin account with no API keys or enrolled
-        // nodes has no business on this page; send it back to the app.
-        const guardRole = String(currentAccount.role || '').trim().toLowerCase();
-        const hasKeysOrNodes = currentAccount.has_keys_or_nodes === true;
-        if (guardRole !== 'admin' && !hasKeysOrNodes) {
-          window.location.replace('/recordings');
-          return;
-        }
+        // Operator tooling (API keys / nodes) is admin-gated below; everyone else
+        // sees account state + sign out + a link to their recordings.
+        const isOperator = String(currentAccount.role || '').trim().toLowerCase() === 'admin';
         accountBox.classList.remove('hidden');
         const role = String(currentAccount.role || 'member');
         const authType = String(currentAccount.auth_type || 'session');
@@ -751,17 +632,22 @@
           ${authCompleted && continueTarget ? `<div class="muted">Continuing to ${escapeHTML(continueTarget)}...</div>` : ''}
         `;
         setStatus(accountStatus, authCompleted ? `Signed in as ${email} in this browser.` : 'Signed in.', 'ok');
-        keysEmpty.classList.add('hidden');
-        keysBox.classList.remove('hidden');
-        enrollmentEmpty.classList.add('hidden');
-        enrollmentBox.classList.remove('hidden');
-        nodesEmpty.classList.add('hidden');
-        nodesBox.classList.remove('hidden');
-        await Promise.all([
-          refreshKeys(),
-          refreshEnrollmentTokens(),
-          refreshNodes(),
-        ]);
+        if (isOperator) {
+          operatorTools.classList.remove('hidden');
+          keysEmpty.classList.add('hidden');
+          keysBox.classList.remove('hidden');
+          enrollmentEmpty.classList.add('hidden');
+          enrollmentBox.classList.remove('hidden');
+          nodesEmpty.classList.add('hidden');
+          nodesBox.classList.remove('hidden');
+          await Promise.all([
+            refreshKeys(),
+            refreshEnrollmentTokens(),
+            refreshNodes(),
+          ]);
+        } else {
+          operatorTools.classList.add('hidden');
+        }
         if (authCompleted) scheduleAuthFlowContinue();
       } catch (_) {
         currentAccount = null;
