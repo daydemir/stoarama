@@ -415,8 +415,16 @@
           <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
             <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10/GB-month)</button>
             <button type="button" data-storage="byo">Connect your own S3 bucket</button>
+            <button type="button" data-storage="shared" class="hidden" id="sharedStorageBtn">Shared destination</button>
           </div>
           <div id="managedStatus" class="status hidden" style="margin-bottom:10px;"></div>
+          <!-- Shared destinations granted to this account (e.g. a lab NAS over WebDAV).
+               Admin-created and already verified; the account selects but never edits
+               or sees credentials. A WebDAV pick delivers via managed staging. -->
+          <div id="sharedPicker" class="hidden" style="margin-bottom:10px;">
+            <select id="recSharedDest"></select>
+            <div class="hint" id="sharedDestNote"></div>
+          </div>
           <!-- Dropdown of saved buckets (shown when at least one verified bucket exists) -->
           <div id="destPicker" class="hidden">
             <select id="recDest"></select>
@@ -530,6 +538,10 @@
       costEstimateNote: document.getElementById('costEstimateNote'),
       bucketState: document.getElementById('bucketState'),
       storageChooser: document.getElementById('storageChooser'),
+      sharedStorageBtn: document.getElementById('sharedStorageBtn'),
+      sharedPicker: document.getElementById('sharedPicker'),
+      recSharedDest: document.getElementById('recSharedDest'),
+      sharedDestNote: document.getElementById('sharedDestNote'),
       managedStatus: document.getElementById('managedStatus'),
       destPicker: document.getElementById('destPicker'),
       recDest: document.getElementById('recDest'),
@@ -1056,20 +1068,40 @@
       return (state.destinations || []).find((d) => d.managed === true) || null;
     }
 
+    // Shared destinations granted to this account (admin-owned, is_owner=false,
+    // shared=true). These are selectable but never editable; a webdav one delivers
+    // via managed staging. Credentials are blanked server-side.
+    function sharedDests() {
+      return (state.destinations || []).filter((d) => d.shared === true && d.is_owner === false && d.status === 'verified');
+    }
+
+    function selectedSharedDest() {
+      const id = Number(els.recSharedDest.value || 0);
+      return sharedDests().find((d) => Number(d.id) === id) || null;
+    }
+
     // Render the chooser and switch which sub-UI (managed confirmation vs BYO
-    // form/picker) is visible. Called whenever destinations or billing change.
+    // form/picker vs shared picker) is visible. Called whenever destinations or
+    // billing change.
     function renderStorageChooser() {
-      if (!managedAvailable()) {
+      const shared = sharedDests();
+      // Reveal the "Shared destination" option only when one was granted.
+      els.sharedStorageBtn.classList.toggle('hidden', shared.length === 0);
+      if (!managedAvailable() && shared.length === 0) {
         // BYO-only: hide the chooser, let the BYO picker/form drive as before.
         els.storageChooser.classList.add('hidden');
         els.managedStatus.classList.add('hidden');
+        els.sharedPicker.classList.add('hidden');
         state.storageChoice = 'byo';
         return;
       }
       els.storageChooser.classList.remove('hidden');
-      // Default to managed the first time, unless the user already connected a
-      // BYO bucket this session.
-      if (!state.storageChoice) state.storageChoice = managedDest() || state.destinations.length === 0 ? 'managed' : 'byo';
+      // Default to managed when available, otherwise the first granted shared dest,
+      // otherwise BYO. Keep an existing choice across re-renders.
+      if (!state.storageChoice) {
+        if (managedAvailable()) state.storageChoice = managedDest() || state.destinations.length === 0 ? 'managed' : 'byo';
+        else state.storageChoice = 'shared';
+      }
       els.storageChooser.querySelectorAll('button[data-storage]').forEach((btn) => {
         btn.classList.toggle('on', btn.getAttribute('data-storage') === state.storageChoice);
       });
@@ -1080,13 +1112,25 @@
       applyStorageChoiceUI();
     }
 
+    // Select the shared-destination path: hide the BYO/managed sub-UIs and render
+    // the granted shared destinations as a picker.
+    function chooseShared() {
+      state.storageChoice = 'shared';
+      els.storageChooser.querySelectorAll('button[data-storage]').forEach((btn) => {
+        btn.classList.toggle('on', btn.getAttribute('data-storage') === 'shared');
+      });
+      applyStorageChoiceUI();
+      renderCostEstimate();
+    }
+
     // Show/hide the managed confirmation vs the BYO picker+form for the current
     // choice, without re-provisioning.
     function applyStorageChoiceUI() {
       if (state.storageChoice === 'managed') {
-        // Managed: hide the BYO picker and connect form entirely.
+        // Managed: hide the BYO picker, connect form, and shared picker entirely.
         els.destPicker.classList.add('hidden');
         els.connectForm.classList.add('hidden');
+        els.sharedPicker.classList.add('hidden');
         const md = managedDest();
         if (md) {
           state.verifiedDestId = Number(md.id || 0);
@@ -1100,10 +1144,47 @@
         startButtonLabel();
         return;
       }
-      // BYO: hide the managed note and restore the BYO picker/form.
+      if (state.storageChoice === 'shared') {
+        // Shared destination: hide the BYO/managed sub-UIs and render the granted
+        // dests. A webdav pick delivers via managed staging (no GB-month fee).
+        els.destPicker.classList.add('hidden');
+        els.connectForm.classList.add('hidden');
+        els.managedStatus.classList.add('hidden');
+        renderSharedStorageUI();
+        startButtonLabel();
+        return;
+      }
+      // BYO: hide the managed note, shared picker, and restore the BYO picker/form.
       els.managedStatus.classList.add('hidden');
+      els.sharedPicker.classList.add('hidden');
       renderByoStorageUI();
       startButtonLabel();
+    }
+
+    // Render the granted shared destinations as a picker, with a reachability /
+    // billing note. A webdav destination delivers via managed staging: clips stage
+    // in managed storage briefly, then transfer to the destination and the staging
+    // copy is removed, so no managed GB-month fee applies (only $0.50/record-day).
+    function renderSharedStorageUI() {
+      const shared = sharedDests();
+      if (shared.length === 0) {
+        els.sharedPicker.classList.add('hidden');
+        setBucketState('idle');
+        return;
+      }
+      const prev = String(els.recSharedDest.value || '');
+      els.recSharedDest.innerHTML = shared.map((d) =>
+        `<option value="${Number(d.id)}">${escapeHTML(String(d.name || ''))} (${escapeHTML(String(d.provider || ''))})</option>`
+      ).join('');
+      if (prev && shared.some((d) => String(d.id) === prev)) els.recSharedDest.value = prev;
+      els.sharedPicker.classList.remove('hidden');
+      const sel = selectedSharedDest();
+      if (sel && sel.provider === 'webdav') {
+        els.sharedDestNote.textContent = 'Delivered to a shared destination (WebDAV/NAS). Clips stage in managed storage briefly, then transfer and the staging copy is removed. No managed GB-month fee, only the $0.50/record-day charge.';
+      } else {
+        els.sharedDestNote.textContent = 'Delivered to a shared destination granted to your account.';
+      }
+      setBucketState('connected');
     }
 
     // Restore the BYO destination picker or connect form (the pre-chooser default).
@@ -1270,8 +1351,24 @@
     function selectedDestId() {
       // Managed: the picker is hidden; the verified managed dest id is authoritative.
       if (state.storageChoice === 'managed') return Number(state.verifiedDestId || 0);
+      // Shared: the chosen destination is the delivery/capture target; for a webdav
+      // dest the server forces managed staging (see selectedDeliveryDestId), so a
+      // webdav pick contributes no storage_destination_id here.
+      if (state.storageChoice === 'shared') {
+        const sel = selectedSharedDest();
+        if (sel && sel.provider !== 'webdav') return Number(sel.id || 0);
+        return 0;
+      }
       if (!els.destPicker.classList.contains('hidden')) return Number(els.recDest.value || 0);
       return 0;
+    }
+
+    // The WebDAV delivery destination id (a granted shared webdav dest), or 0. When
+    // set, the server captures into managed staging and transfers to this dest.
+    function selectedDeliveryDestId() {
+      if (state.storageChoice !== 'shared') return 0;
+      const sel = selectedSharedDest();
+      return sel && sel.provider === 'webdav' ? Number(sel.id || 0) : 0;
     }
 
     // ---- Stream probe + inline preview (change 2) ----
@@ -1435,7 +1532,7 @@
       const url = String(els.recURL.value || '').trim();
       const catalog = state.catalogStreamId > 0;
       const schedOK = refreshScheduleUIQuiet();
-      const dest = selectedDestId();
+      const dest = selectedDestId() || selectedDeliveryDestId();
       const bucketOK = state.bucketState === 'connected' && dest > 0;
       const streamOK = state.streamProbe.ok === true;
       const sourceOK = catalog || !!url;
@@ -2322,10 +2419,11 @@
       const url = String(els.recURL.value || '').trim();
       const catalogId = state.catalogStreamId > 0 ? state.catalogStreamId : 0;
       const dest = selectedDestId();
+      const deliveryDest = selectedDeliveryDestId();
       const sched = compiledSchedule();
       const clip = selectedClipSec();
       if (!catalogId && !url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
-      if (dest <= 0) { setStatus(els.startStatus, 'Connect or select a bucket first.', 'err'); return; }
+      if (dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination first.', 'err'); return; }
       if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
       if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
       if (!windowValid()) { setStatus(els.startStatus, 'Stop must be after Start.', 'err'); return; }
@@ -2334,13 +2432,16 @@
       const win = compiledWindow();
       const body = {
         name,
-        storage_destination_id: dest,
         cron_expr: sched.cron,
         cron_timezone: sched.tz,
         clip_duration_sec: clip,
         start_at: win.startISO,
         end_at: win.endISO,
       };
+      // A webdav shared dest delivers via managed staging: send only
+      // delivery_storage_destination_id. Otherwise send the capture dest.
+      if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
+      else body.storage_destination_id = dest;
       // Catalog stream: send stream_id and OMIT stream_url (server derives it).
       // Paste flow: send stream_url as before.
       if (catalogId) body.stream_id = catalogId;
@@ -2511,10 +2612,13 @@
     });
     els.storageChooser.querySelectorAll('button[data-storage]').forEach((btn) => {
       btn.addEventListener('click', () => {
-        if (btn.getAttribute('data-storage') === 'managed') chooseManaged();
+        const choice = btn.getAttribute('data-storage');
+        if (choice === 'managed') chooseManaged();
+        else if (choice === 'shared') chooseShared();
         else chooseByo();
       });
     });
+    els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => openComposer(false));
     els.composerClose.addEventListener('click', closeComposer);

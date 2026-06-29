@@ -1405,6 +1405,7 @@
         <a class="subtab-btn" id="opsViewDiscovery" href="/admin?section=imports">Imports</a>
         <a class="subtab-btn active" id="opsViewPipelines" href="/admin?section=processing">Processing</a>
         <a class="subtab-btn" id="opsViewServers" href="/admin?section=servers">Servers</a>
+        <a class="subtab-btn" id="opsViewStorage" href="/admin?section=storage">Shared storage</a>
       </div>
     </div>
   </div>
@@ -1727,6 +1728,58 @@
     </details>
   </div>
 
+  <!-- Shared storage: admin-owned reusable destinations (WebDAV/NAS or
+       S3-compatible) with per-account grants. Credentials are sent on create,
+       verified server-side, and NEVER returned. -->
+  <div id="sharedStoragePanel">
+    <div class="domain-intro">
+      <div class="domain-intro-title">Shared storage</div>
+      <div class="domain-intro-copy">Create reusable storage destinations (e.g. a lab Synology NAS over WebDAV) and grant accounts access. Granted accounts can record to them but never see the credentials.</div>
+    </div>
+    <div class="rec-settings-panel" style="margin-bottom:10px;">
+      <div class="row" style="gap:10px; margin-bottom:8px;">
+        <span class="fw600 fs11">Create shared destination</span>
+        <span class="status-text" id="sharedStorageCreateStatus"></span>
+      </div>
+      <div class="toolbar" style="flex-wrap:wrap; gap:8px;">
+        <select id="sharedStorageProvider">
+          <option value="webdav">WebDAV (Synology QuickConnect / generic)</option>
+          <option value="s3_compatible">S3-compatible</option>
+        </select>
+        <input id="sharedStorageName" type="text" placeholder="name (e.g. mit-lab-nas)" style="width:180px;" />
+        <input id="sharedStorageEndpoint" type="text" placeholder="WebDAV base URL or Synology QuickConnect WebDAV URL" style="width:360px;" />
+        <input id="sharedStorageKeyPrefix" type="text" placeholder="base path / key prefix (optional)" style="width:200px;" />
+        <input id="sharedStorageUser" type="text" autocomplete="off" spellcheck="false" placeholder="username / access key id" style="width:200px;" />
+        <input id="sharedStoragePass" type="password" autocomplete="new-password" placeholder="password / secret access key" style="width:200px;" />
+        <input id="sharedStorageRegion" class="hidden" type="text" placeholder="region" style="width:120px;" />
+        <input id="sharedStorageBucket" class="hidden" type="text" placeholder="bucket" style="width:160px;" />
+        <button id="sharedStorageCreateBtn" class="primary" type="button">Create + verify</button>
+      </div>
+    </div>
+    <div class="rec-settings-panel">
+      <div class="row" style="gap:10px; margin-bottom:8px;">
+        <span class="fw600 fs11">Shared destinations</span>
+        <button id="sharedStorageReload" class="primary" type="button">Reload</button>
+        <span class="status-text" id="sharedStorageStatus"></span>
+      </div>
+      <div class="tbl-wrap">
+        <table id="sharedStorageTable">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Provider</th>
+              <th>Endpoint</th>
+              <th>Status</th>
+              <th>Grants</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="sharedStorageRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <div id="loadingOverlay" class="loading-overlay">
@@ -1810,6 +1863,7 @@ const discoveryPanel = $('discoveryPanel');
 const inferencesPanel = $('inferencesPanel');
 const serversPanel = $('serversPanel');
 const recordingPanel = $('recordingPanel');
+const sharedStoragePanel = $('sharedStoragePanel');
 const detailPanel = $('detailPanel');
 const adminGate = $('adminGate');
 
@@ -1821,6 +1875,7 @@ const tabOperations = $('tabOperations');
 const opsViewDiscovery = $('opsViewDiscovery');
 const opsViewPipelines = $('opsViewPipelines');
 const opsViewServers = $('opsViewServers');
+const opsViewStorage = $('opsViewStorage');
 
 // overview
 const overviewStatus = $('overviewStatus');
@@ -2979,6 +3034,7 @@ function normalizeAdminSection(raw) {
   const value = String(raw || '').trim().toLowerCase();
   if (value === 'imports' || value === 'discovery') return 'discovery';
   if (value === 'servers') return 'servers';
+  if (value === 'storage') return 'storage';
   return 'pipelines';
 }
 
@@ -2987,6 +3043,7 @@ function buildAdminURL(section = mainTab) {
   const normalized = normalizeAdminSection(section);
   if (normalized === 'discovery') params.set('section', 'imports');
   else if (normalized === 'servers') params.set('section', 'servers');
+  else if (normalized === 'storage') params.set('section', 'storage');
   else params.set('section', 'processing');
   if (normalized === 'pipelines' && selectedPipelineID) {
     params.set('pipeline_id', selectedPipelineID);
@@ -2999,6 +3056,7 @@ function updateAdminSectionHrefs() {
   if (opsViewDiscovery instanceof HTMLAnchorElement) opsViewDiscovery.href = buildAdminURL('discovery');
   if (opsViewPipelines instanceof HTMLAnchorElement) opsViewPipelines.href = buildAdminURL('pipelines');
   if (opsViewServers instanceof HTMLAnchorElement) opsViewServers.href = buildAdminURL('servers');
+  if (opsViewStorage instanceof HTMLAnchorElement) opsViewStorage.href = buildAdminURL('storage');
 }
 
 function syncAdminURL(opts = {}) {
@@ -3012,13 +3070,14 @@ function showPanel(which) {
     stopDetailLivePolling();
     stopDetailFrameExportPolling();
   }
-  const operationsVisible = which === 'discovery' || which === 'pipelines' || which === 'servers';
+  const operationsVisible = which === 'discovery' || which === 'pipelines' || which === 'servers' || which === 'storage';
   if (overviewPanel) overviewPanel.style.display = which === 'overview' ? '' : 'none';
   streamsPanel.style.display = which === 'streams' ? '' : 'none';
   if (operationsPanel) operationsPanel.style.display = operationsVisible ? '' : 'none';
   if (discoveryPanel) discoveryPanel.style.display = which === 'discovery' ? '' : 'none';
   inferencesPanel.style.display = which === 'pipelines' ? '' : 'none';
   if (serversPanel) serversPanel.style.display = which === 'servers' ? '' : 'none';
+  if (sharedStoragePanel) sharedStoragePanel.style.display = which === 'storage' ? '' : 'none';
   if (recordingPanel) recordingPanel.style.display = which === 'recording' ? '' : 'none';
   detailPanel.style.display = which === 'detail' ? '' : 'none';
 
@@ -3029,6 +3088,7 @@ function showPanel(which) {
   if (opsViewDiscovery) opsViewDiscovery.classList.toggle('active', which === 'discovery');
   if (opsViewPipelines) opsViewPipelines.classList.toggle('active', which === 'pipelines');
   if (opsViewServers) opsViewServers.classList.toggle('active', which === 'servers');
+  if (opsViewStorage) opsViewStorage.classList.toggle('active', which === 'storage');
 }
 
 function isStreamJSONModalOpen() {
@@ -6889,6 +6949,18 @@ if (opsViewServers) {
   });
 }
 
+if (opsViewStorage) {
+  opsViewStorage.addEventListener('click', (e) => {
+    if (shouldBypassClientRouting(e)) return;
+    e.preventDefault();
+    if (mainTab === 'storage') return;
+    mainTab = 'storage';
+    syncAdminURL();
+    showPanel('storage');
+    void loadSharedStorage();
+  });
+}
+
 if (tabRecording) {
   tabRecording.addEventListener('click', () => {
     if (mainTab === 'recording') return;
@@ -7414,6 +7486,130 @@ window.addEventListener('popstate', () => {
   });
 });
 
+// ─── Shared storage destinations (admin) ──────────────────────────────────────
+const sharedStorageProvider = $('sharedStorageProvider');
+const sharedStorageName = $('sharedStorageName');
+const sharedStorageEndpoint = $('sharedStorageEndpoint');
+const sharedStorageKeyPrefix = $('sharedStorageKeyPrefix');
+const sharedStorageUser = $('sharedStorageUser');
+const sharedStoragePass = $('sharedStoragePass');
+const sharedStorageRegion = $('sharedStorageRegion');
+const sharedStorageBucket = $('sharedStorageBucket');
+const sharedStorageCreateBtn = $('sharedStorageCreateBtn');
+const sharedStorageCreateStatus = $('sharedStorageCreateStatus');
+const sharedStorageReload = $('sharedStorageReload');
+const sharedStorageStatus = $('sharedStorageStatus');
+const sharedStorageRows = $('sharedStorageRows');
+
+// Show S3 region/bucket only for an S3 destination; WebDAV reuses
+// endpoint/user/pass/key_prefix and leaves region/bucket empty.
+function syncSharedStorageProviderFields() {
+  if (!sharedStorageProvider) return;
+  const isWebdav = sharedStorageProvider.value === 'webdav';
+  if (sharedStorageRegion) sharedStorageRegion.classList.toggle('hidden', isWebdav);
+  if (sharedStorageBucket) sharedStorageBucket.classList.toggle('hidden', isWebdav);
+  if (sharedStorageEndpoint) {
+    sharedStorageEndpoint.placeholder = isWebdav
+      ? 'WebDAV base URL or Synology QuickConnect WebDAV URL'
+      : 'S3 endpoint URL';
+  }
+}
+
+async function loadSharedStorage() {
+  if (!sharedStorageRows) return;
+  if (sharedStorageStatus) sharedStorageStatus.textContent = 'Loading...';
+  try {
+    const payload = await fetchJSON('/api/v1/admin/storage-destinations');
+    renderSharedStorageRows(payload.items || []);
+    if (sharedStorageStatus) sharedStorageStatus.textContent = '';
+  } catch (err) {
+    if (sharedStorageStatus) sharedStorageStatus.textContent = String(err.message || err);
+  }
+}
+
+function renderSharedStorageRows(items) {
+  if (!sharedStorageRows) return;
+  if (!items.length) {
+    sharedStorageRows.innerHTML = '<tr><td colspan="6" class="muted">No shared destinations yet.</td></tr>';
+    return;
+  }
+  sharedStorageRows.innerHTML = items.map((d) => {
+    const grants = Array.isArray(d.grants) ? d.grants : [];
+    const chips = grants.map((g) =>
+      `<span class="rec-toggle on" style="margin-right:4px;">${esc(g.email || ('#' + g.account_id))} <button class="btn-sm" data-shared-revoke="${Number(d.id)}" data-account="${Number(g.account_id)}">x</button></span>`
+    ).join('') || '<span class="muted">none</span>';
+    return `<tr>
+      <td>${esc(d.name)}</td>
+      <td>${esc(d.provider)}</td>
+      <td style="max-width:280px; overflow:hidden; text-overflow:ellipsis;">${esc(d.endpoint)}</td>
+      <td>${esc(d.status)}${d.last_verify_error ? ` <span class="muted">(${esc(d.last_verify_error)})</span>` : ''}</td>
+      <td>${chips}<div class="row" style="margin-top:4px;"><input type="text" placeholder="grant email" data-shared-grant-email="${Number(d.id)}" style="width:160px;" /><button class="btn-sm" data-shared-grant="${Number(d.id)}">Grant</button></div></td>
+      <td><button class="btn-sm" data-shared-delete="${Number(d.id)}">Delete</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function createSharedStorage() {
+  if (!sharedStorageCreateBtn) return;
+  const body = {
+    provider: sharedStorageProvider ? sharedStorageProvider.value : 'webdav',
+    name: (sharedStorageName && sharedStorageName.value || '').trim(),
+    endpoint: (sharedStorageEndpoint && sharedStorageEndpoint.value || '').trim(),
+    key_prefix: (sharedStorageKeyPrefix && sharedStorageKeyPrefix.value || '').trim(),
+    access_key_id: (sharedStorageUser && sharedStorageUser.value || '').trim(),
+    secret_access_key: (sharedStoragePass && sharedStoragePass.value || '').trim(),
+    region: (sharedStorageRegion && sharedStorageRegion.value || '').trim(),
+    bucket: (sharedStorageBucket && sharedStorageBucket.value || '').trim(),
+  };
+  if (sharedStorageCreateStatus) sharedStorageCreateStatus.textContent = 'Verifying and creating...';
+  sharedStorageCreateBtn.disabled = true;
+  try {
+    await fetchJSON('/api/v1/admin/storage-destinations', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (sharedStorageCreateStatus) sharedStorageCreateStatus.textContent = 'Created and verified.';
+    if (sharedStoragePass) sharedStoragePass.value = '';
+    await loadSharedStorage();
+  } catch (err) {
+    if (sharedStorageCreateStatus) sharedStorageCreateStatus.textContent = String(err.message || err);
+  } finally {
+    sharedStorageCreateBtn.disabled = false;
+  }
+}
+
+if (sharedStorageProvider) sharedStorageProvider.addEventListener('change', syncSharedStorageProviderFields);
+if (sharedStorageCreateBtn) sharedStorageCreateBtn.addEventListener('click', () => { void createSharedStorage(); });
+if (sharedStorageReload) sharedStorageReload.addEventListener('click', () => { void loadSharedStorage(); });
+if (sharedStorageRows) {
+  sharedStorageRows.addEventListener('click', async (e) => {
+    const t = e.target instanceof HTMLElement ? e.target : null;
+    if (!t) return;
+    const del = t.getAttribute('data-shared-delete');
+    const grant = t.getAttribute('data-shared-grant');
+    const revoke = t.getAttribute('data-shared-revoke');
+    try {
+      if (del) {
+        await fetchJSON(`/api/v1/admin/storage-destinations/${Number(del)}`, { method: 'DELETE' });
+        await loadSharedStorage();
+      } else if (grant) {
+        const input = sharedStorageRows.querySelector(`input[data-shared-grant-email="${Number(grant)}"]`);
+        const email = input instanceof HTMLInputElement ? input.value.trim() : '';
+        if (!email) return;
+        await fetchJSON(`/api/v1/admin/storage-destinations/${Number(grant)}/grants`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }),
+        });
+        await loadSharedStorage();
+      } else if (revoke) {
+        const account = Number(t.getAttribute('data-account') || 0);
+        await fetchJSON(`/api/v1/admin/storage-destinations/${Number(revoke)}/grants/${account}`, { method: 'DELETE' });
+        await loadSharedStorage();
+      }
+    } catch (err) {
+      if (sharedStorageStatus) sharedStorageStatus.textContent = String(err.message || err);
+    }
+  });
+}
+
 (async function init() {
   try {
     await refreshAdminGate();
@@ -7427,6 +7623,7 @@ window.addEventListener('popstate', () => {
       if (streamsPanel) streamsPanel.style.display = 'none';
       if (recordingPanel) recordingPanel.style.display = 'none';
       if (detailPanel) detailPanel.style.display = 'none';
+      if (sharedStoragePanel) sharedStoragePanel.style.display = 'none';
       return;
     }
     if (overviewPanel) overviewPanel.style.display = 'none';
@@ -7437,6 +7634,7 @@ window.addEventListener('popstate', () => {
     if (discoveryPanel) discoveryPanel.style.display = '';
     if (inferencesPanel) inferencesPanel.style.display = '';
     if (serversPanel) serversPanel.style.display = '';
+    syncSharedStorageProviderFields();
     populateCaptureTypeOptions(discoveryCaptureTypeFilter, 'capture type: all');
     await Promise.all([
       loadOverview(),
@@ -7447,6 +7645,7 @@ window.addEventListener('popstate', () => {
       loadServers(),
       loadRecordingCapacity(),
       loadServersAssignments(),
+      loadSharedStorage(),
     ]);
     await applyAdminRouteFromURL();
   } catch (err) {

@@ -402,6 +402,42 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Auto-enqueue a delivery transfer for a WebDAV recording. The clip was captured
+	// into the account's managed staging area; if the recording has a delivery
+	// destination, queue a clip_transfer_job to it (reusing the exact transfer
+	// machinery as the user-initiated copy) with auto_purge_source=true so the worker
+	// purges the managed staging copy after a confirmed delivery. ON CONFLICT DO
+	// NOTHING keeps a retried ingest idempotent (the idempotency_key dedups on
+	// clip+target). Only WebDAV recordings have a non-NULL delivery dest, so ordinary
+	// recordings skip this entirely (no transfer, no purge).
+	var (
+		deliveryDestID *int64
+		deliveryPrefix string
+	)
+	if err := tx.QueryRow(r.Context(), `
+		SELECT rec.delivery_storage_destination_id, COALESCE(sd.key_prefix, '')
+		FROM recordings rec
+		LEFT JOIN storage_destinations sd ON sd.id = rec.delivery_storage_destination_id
+		WHERE rec.id=$1
+	`, recordingID).Scan(&deliveryDestID, &deliveryPrefix); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load delivery destination: %v", err))
+		return
+	}
+	if deliveryDestID != nil {
+		targetObjectKey := buildClipTransferObjectKey(deliveryPrefix, recordingID, clipID, objectKey)
+		idempotencyKey := fmt.Sprintf("xfer:%d:%d", clipID, *deliveryDestID)
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO clip_transfer_jobs
+				(account_id, recording_clip_id, target_storage_destination_id, target_object_key, idempotency_key, auto_purge_source)
+			SELECT rec.account_id, $1, $2, $3, $4, true
+			FROM recordings rec WHERE rec.id=$5
+			ON CONFLICT (idempotency_key) DO NOTHING
+		`, clipID, *deliveryDestID, targetObjectKey, idempotencyKey, recordingID); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("enqueue delivery transfer: %v", err))
+			return
+		}
+	}
+
 	if _, err := tx.Exec(r.Context(), `
 		UPDATE recording_upload_intents SET status='consumed' WHERE id=$1
 	`, intentID); err != nil {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
+	"github.com/daydemir/stoarama/backend/internal/webdav"
 )
 
 // clipTransferTickInterval is the clip-transfer worker's poll cadence. Each
@@ -47,10 +48,12 @@ func clipTransferLeaseOwner() string {
 // and the target destination's location + credentials.
 type clipTransferJob struct {
 	id              int64
+	recordingClipID int64
 	targetObjectKey string
 	attemptCount    int
 	maxAttempts     int
 	mimeType        string
+	autoPurgeSource bool
 
 	srcEndpoint    string
 	srcRegion      string
@@ -59,9 +62,11 @@ type clipTransferJob struct {
 	srcAccessKeyID string
 	srcSecretEnc   []byte
 
+	dstProvider    string
 	dstEndpoint    string
 	dstRegion      string
 	dstBucket      string
+	dstKeyPrefix   string
 	dstAccessKeyID string
 	dstSecretEnc   []byte
 }
@@ -125,7 +130,7 @@ func transferOneClip(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.
 		return false, nil
 	}
 
-	n, copyErr := copyClip(ctx, cipher, job)
+	source, n, copyErr := copyClip(ctx, cipher, job)
 	if copyErr != nil {
 		if ctx.Err() != nil {
 			return true, nil
@@ -142,7 +147,34 @@ func transferOneClip(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.
 	`, job.id, n); err != nil {
 		return true, fmt.Errorf("mark clip transfer done (job %d): %w", job.id, err)
 	}
+
+	// Auto-purge the managed staging copy ONLY after a confirmed delivery. A WebDAV
+	// recording captures into managed R2, then this job copies it to the NAS; once
+	// delivered, the managed copy is just dead weight (and would accrue gb_month),
+	// so delete the source object and mark the clip purged. This runs only on the
+	// 'done' transition, so a failing/retrying transfer (NAS down) never purges and
+	// the data stays in managed staging until the retries succeed.
+	if job.autoPurgeSource {
+		purgeDeliveredStagingCopy(ctx, pool, source, job)
+	}
 	return true, nil
+}
+
+// purgeDeliveredStagingCopy deletes the managed staging object for a delivered
+// auto-transfer and marks the clip purged_at, so a delivered WebDAV recording's
+// bytes live only on the NAS and stop counting toward managed storage. Best
+// effort: a purge failure is logged, not fatal (the object lingers until a later
+// retry/purge, but the delivery itself already succeeded and is marked done).
+func purgeDeliveredStagingCopy(ctx context.Context, pool *pgxpool.Pool, source *r2.Client, job clipTransferJob) {
+	if err := source.DeleteObjects(ctx, []string{job.srcObjectKey}); err != nil {
+		log.Printf("clip transfer: job %d delivered but managed staging purge failed: %v", job.id, err)
+		return
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_clips SET purged_at=now() WHERE id=$1 AND purged_at IS NULL
+	`, job.recordingClipID); err != nil {
+		log.Printf("clip transfer: job %d staging object deleted but marking clip %d purged failed: %v", job.id, job.recordingClipID, err)
+	}
 }
 
 // leaseClipTransferJob atomically claims one job: a 'pending' row, or a 'leased'
@@ -169,9 +201,9 @@ func leaseClipTransferJob(ctx context.Context, pool *pgxpool.Pool) (clipTransfer
 		    updated_at = now()
 		FROM cte
 		WHERE j.id = cte.id
-		RETURNING j.id, j.target_object_key, j.attempt_count, j.max_attempts
+		RETURNING j.id, j.recording_clip_id, j.target_object_key, j.attempt_count, j.max_attempts, j.auto_purge_source
 	`, clipTransferLeaseOwner(), clipTransferLeaseSec).Scan(
-		&job.id, &job.targetObjectKey, &job.attemptCount, &job.maxAttempts,
+		&job.id, &job.recordingClipID, &job.targetObjectKey, &job.attemptCount, &job.maxAttempts, &job.autoPurgeSource,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return clipTransferJob{}, false, nil
@@ -185,7 +217,7 @@ func leaseClipTransferJob(ctx context.Context, pool *pgxpool.Pool) (clipTransfer
 	err = pool.QueryRow(ctx, `
 		SELECT c.endpoint, src.region, c.bucket, c.object_key, c.mime_type,
 		       src.access_key_id, src.secret_access_key_enc,
-		       dst.endpoint, dst.region, dst.bucket, dst.access_key_id, dst.secret_access_key_enc
+		       dst.provider, dst.endpoint, dst.region, dst.bucket, dst.key_prefix, dst.access_key_id, dst.secret_access_key_enc
 		FROM clip_transfer_jobs j
 		JOIN recording_clips c       ON c.id = j.recording_clip_id
 		JOIN storage_destinations src ON src.id = c.storage_destination_id
@@ -194,7 +226,7 @@ func leaseClipTransferJob(ctx context.Context, pool *pgxpool.Pool) (clipTransfer
 	`, job.id).Scan(
 		&job.srcEndpoint, &job.srcRegion, &job.srcBucket, &job.srcObjectKey, &job.mimeType,
 		&job.srcAccessKeyID, &job.srcSecretEnc,
-		&job.dstEndpoint, &job.dstRegion, &job.dstBucket, &job.dstAccessKeyID, &job.dstSecretEnc,
+		&job.dstProvider, &job.dstEndpoint, &job.dstRegion, &job.dstBucket, &job.dstKeyPrefix, &job.dstAccessKeyID, &job.dstSecretEnc,
 	)
 	if err != nil {
 		// The lease is held but we cannot load its inputs (e.g. a destination was
@@ -206,18 +238,16 @@ func leaseClipTransferJob(ctx context.Context, pool *pgxpool.Pool) (clipTransfer
 	return job, true, nil
 }
 
-// copyClip decrypts both secrets, builds the source + target r2 clients, and
-// streams the source object into the target via a bounded-memory multipart PUT.
-// Returns the number of bytes copied (the source clip size, re-headed so the
+// copyClip decrypts both secrets, builds the source r2 client and the target
+// store (R2/S3 or WebDAV, via the objectStore seam), and streams the source object
+// into the target via a bounded-memory PUT. Returns the source r2 client (so the
+// caller can purge the managed staging copy after a confirmed delivery without
+// re-decrypting) and the number of bytes copied (the target size, re-headed so the
 // recorded byte count is the object's real size, not a row estimate).
-func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob) (int64, error) {
+func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob) (*r2.Client, int64, error) {
 	srcSecret, err := cipher.Decrypt(job.srcSecretEnc)
 	if err != nil {
-		return 0, fmt.Errorf("decrypt source secret: %w", err)
-	}
-	dstSecret, err := cipher.Decrypt(job.dstSecretEnc)
-	if err != nil {
-		return 0, fmt.Errorf("decrypt target secret: %w", err)
+		return nil, 0, fmt.Errorf("decrypt source secret: %w", err)
 	}
 	source, err := r2.New(ctx, r2.Config{
 		AccessKey: job.srcAccessKeyID,
@@ -227,17 +257,12 @@ func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob
 		Endpoint:  job.srcEndpoint,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("build source client: %w", err)
+		return nil, 0, fmt.Errorf("build source client: %w", err)
 	}
-	target, err := r2.New(ctx, r2.Config{
-		AccessKey: job.dstAccessKeyID,
-		SecretKey: string(dstSecret),
-		Region:    job.dstRegion,
-		Bucket:    job.dstBucket,
-		Endpoint:  job.dstEndpoint,
-	})
+
+	target, err := buildTargetStore(ctx, cipher, job)
 	if err != nil {
-		return 0, fmt.Errorf("build target client: %w", err)
+		return nil, 0, err
 	}
 
 	mimeType := job.mimeType
@@ -247,19 +272,58 @@ func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob
 
 	rc, err := source.Open(ctx, job.srcObjectKey)
 	if err != nil {
-		return 0, fmt.Errorf("open source object: %w", err)
+		return nil, 0, fmt.Errorf("open source object: %w", err)
 	}
 	defer func() { _ = rc.Close() }()
 
 	if _, err := target.PutMultipart(ctx, job.targetObjectKey, mimeType, rc); err != nil {
-		return 0, fmt.Errorf("put target object: %w", err)
+		return nil, 0, fmt.Errorf("put target object: %w", err)
 	}
 
 	head, err := target.Head(ctx, job.targetObjectKey)
 	if err != nil {
-		return 0, fmt.Errorf("head target object: %w", err)
+		return nil, 0, fmt.Errorf("head target object: %w", err)
 	}
-	return head.SizeBytes, nil
+	return source, head.SizeBytes, nil
+}
+
+// buildTargetStore constructs the transfer target through the objectStore seam,
+// branching on the destination provider. 'webdav' builds a WebDAV client (creds =
+// access_key_id/decrypted secret, key_prefix is already baked into the target key
+// so the WebDAV base path is left empty here); every other provider
+// (s3_compatible/r2_managed) builds an r2 client exactly as before. This is the
+// only place the target transport forks; the rest of copyClip is provider-agnostic.
+func buildTargetStore(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob) (objectStore, error) {
+	dstSecret, err := cipher.Decrypt(job.dstSecretEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt target secret: %w", err)
+	}
+	if job.dstProvider == "webdav" {
+		c, err := webdav.New(webdav.Config{
+			Endpoint: job.dstEndpoint,
+			User:     job.dstAccessKeyID,
+			Pass:     string(dstSecret),
+			// key_prefix is already composed into target_object_key at enqueue
+			// (buildClipTransferObjectKey), so the WebDAV base path stays empty to
+			// avoid prefixing it twice.
+			BasePath: "",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("build webdav target client: %w", err)
+		}
+		return webdavStore{c: c}, nil
+	}
+	c, err := r2.New(ctx, r2.Config{
+		AccessKey: job.dstAccessKeyID,
+		SecretKey: string(dstSecret),
+		Region:    job.dstRegion,
+		Bucket:    job.dstBucket,
+		Endpoint:  job.dstEndpoint,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build target client: %w", err)
+	}
+	return c, nil
 }
 
 // finishClipTransferError records a per-job copy failure: it retries (back to

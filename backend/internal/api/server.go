@@ -267,6 +267,11 @@ func (s *Server) router() http.Handler {
 			admin.Post("/accounts/{id}/demote-admin", s.handleAdminAccountDemote)
 			admin.Get("/accounts/{id}/api-keys", s.handleAdminAccountAPIKeys)
 			admin.Post("/api-keys/{id}/revoke", s.handleAdminAPIKeyRevoke)
+			admin.Get("/storage-destinations", s.handleAdminStorageDestinationsList)
+			admin.Post("/storage-destinations", s.handleAdminStorageDestinationCreate)
+			admin.Delete("/storage-destinations/{id}", s.handleAdminStorageDestinationDelete)
+			admin.Post("/storage-destinations/{id}/grants", s.handleAdminStorageDestinationGrantCreate)
+			admin.Delete("/storage-destinations/{id}/grants/{accountId}", s.handleAdminStorageDestinationGrantDelete)
 		})
 
 		api.Group(func(public chi.Router) {

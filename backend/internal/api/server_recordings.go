@@ -39,9 +39,15 @@ type recordingCreateRequest struct {
 	// worker re-resolves each fire); any client-sent stream_url is ignored.
 	StreamID             *int64 `json:"stream_id"`
 	StorageDestinationID int64  `json:"storage_destination_id"`
-	CronExpr             string `json:"cron_expr"`
-	CronTimezone         string `json:"cron_timezone"`
-	ClipDurationSec      int    `json:"clip_duration_sec"`
+	// DeliveryStorageDestinationID, when set, selects a WebDAV destination (the
+	// account's own or a granted shared one) as the DELIVERY target. The clip is
+	// captured into the account's managed staging area, then transferred to this
+	// destination and the staging copy is purged. When set, any client-sent
+	// storage_destination_id is ignored: capture is forced to managed staging.
+	DeliveryStorageDestinationID int64  `json:"delivery_storage_destination_id"`
+	CronExpr                     string `json:"cron_expr"`
+	CronTimezone                 string `json:"cron_timezone"`
+	ClipDurationSec              int    `json:"clip_duration_sec"`
 	// Capture window. StartAt defaults to now() (start immediately); EndAt is
 	// open-ended when nil. When both are set, EndAt must be strictly after StartAt.
 	StartAt *time.Time `json:"start_at"`
@@ -140,8 +146,11 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, "stream_url is required")
 		return
 	}
-	if req.StorageDestinationID <= 0 {
-		util.WriteError(w, http.StatusBadRequest, "storage_destination_id is required")
+	// Exactly one destination selector is required: storage_destination_id for an
+	// S3/managed recording (captured straight there), or delivery_storage_destination_id
+	// for a WebDAV recording (captured to managed staging, then transferred to the NAS).
+	if req.DeliveryStorageDestinationID <= 0 && req.StorageDestinationID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "storage_destination_id or delivery_storage_destination_id is required")
 		return
 	}
 	cronExpr := strings.TrimSpace(req.CronExpr)
@@ -211,22 +220,74 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Verify the destination belongs to this account and is verified (S-IDOR).
-	var destStatus string
-	err = s.pool.QueryRow(r.Context(), `
-		SELECT status FROM storage_destinations WHERE id=$1 AND account_id=$2
-	`, req.StorageDestinationID, principal.AccountID).Scan(&destStatus)
-	if err != nil {
+	// Resolve the capture destination and (for a WebDAV target) the delivery
+	// destination. Authorization is the single owner-or-granted predicate; a granted
+	// shared destination is selectable exactly like an owned one.
+	//
+	//   captureDestID  = where clips are written at capture time (presign path).
+	//   deliveryDestArg = the WebDAV delivery target, or NULL for ordinary recordings.
+	//
+	// For a WebDAV recording the chosen destination is the DELIVERY target, so capture
+	// is forced into the account's managed staging area (the presign path is unchanged)
+	// and the delivery target is recorded for the ingest auto-enqueue + auto-purge.
+	captureDestID := req.StorageDestinationID
+	var deliveryDestArg any
+	if req.DeliveryStorageDestinationID > 0 {
+		var (
+			destStatus   string
+			destProvider string
+		)
+		err = s.pool.QueryRow(r.Context(), fmt.Sprintf(`
+			SELECT sd.status, sd.provider FROM storage_destinations sd WHERE sd.id=$1 AND %s
+		`, fmt.Sprintf(storageDestAccessPredicate, "$2")), req.DeliveryStorageDestinationID, principal.AccountID).Scan(&destStatus, &destProvider)
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "delivery storage destination not found")
+			return
+		}
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load delivery storage destination: %v", err))
+			return
+		}
+		if destProvider != "webdav" {
+			util.WriteError(w, http.StatusBadRequest, "delivery_storage_destination_id must reference a webdav destination")
+			return
+		}
+		if destStatus != "verified" {
+			util.WriteError(w, http.StatusBadRequest, "delivery storage destination is not verified")
+			return
+		}
+		// A WebDAV destination cannot be presigned, so stage the capture in the
+		// account's managed destination, then transfer to the NAS on ingest.
+		managedID, _, perr := s.provisionManagedDestination(r.Context(), principal.AccountID)
+		if perr != nil {
+			if errors.Is(perr, errManagedUnavailable) {
+				util.WriteError(w, http.StatusServiceUnavailable, "managed staging is required for WebDAV delivery but managed storage is not available")
+				return
+			}
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("provision managed staging: %v", perr))
+			return
+		}
+		captureDestID = managedID
+		deliveryDestArg = req.DeliveryStorageDestinationID
+	} else {
+		// Ordinary S3/managed recording: the selected destination is the capture dest.
+		// Owner-or-granted predicate + verified.
+		var destStatus string
+		err = s.pool.QueryRow(r.Context(), fmt.Sprintf(`
+			SELECT sd.status FROM storage_destinations sd WHERE sd.id=$1 AND %s
+		`, fmt.Sprintf(storageDestAccessPredicate, "$2")), req.StorageDestinationID, principal.AccountID).Scan(&destStatus)
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "storage destination not found")
 			return
 		}
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load storage destination: %v", err))
-		return
-	}
-	if destStatus != "verified" {
-		util.WriteError(w, http.StatusBadRequest, "storage destination is not verified")
-		return
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load storage destination: %v", err))
+			return
+		}
+		if destStatus != "verified" {
+			util.WriteError(w, http.StatusBadRequest, "storage destination is not verified")
+			return
+		}
 	}
 
 	// Reachability probe pinned to the validated IP, so the probe socket cannot
@@ -273,10 +334,10 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	)
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at, start_at, end_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11,$12)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at, start_at, end_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11,$12,$13)
 		RETURNING id, created_at, start_at, end_at
-	`, principal.AccountID, req.StorageDestinationID, name, streamURL, streamIDArg, sourceKind, cronExpr, cronTimezone, clipDuration, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
+	`, principal.AccountID, captureDestID, deliveryDestArg, name, streamURL, streamIDArg, sourceKind, cronExpr, cronTimezone, clipDuration, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -295,7 +356,8 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "recording_created", "account", principal.Email, map[string]any{
 		"recording_id":      id,
 		"name":              name,
-		"storage_dest_id":   req.StorageDestinationID,
+		"storage_dest_id":   captureDestID,
+		"delivery_dest_id":  deliveryDestArg,
 		"source_kind":       sourceKind,
 		"cron_expr":         cronExpr,
 		"clip_duration_sec": clipDuration,

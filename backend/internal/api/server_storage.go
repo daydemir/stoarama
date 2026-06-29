@@ -19,6 +19,19 @@ import (
 // storageVerifyTimeout bounds the live S3 connectivity probe on create.
 const storageVerifyTimeout = 20 * time.Second
 
+// storageDestAccessPredicate is the single owner-or-granted authorization
+// predicate for selecting a storage destination: the account owns it, OR it is a
+// shared (admin-owned) destination the account has been granted. It is the same
+// fragment used by the per-account list, recording-create binding, and the clip
+// transfer target check, so authorization is defined once. The bound parameter is
+// the account id; callers substitute the placeholder number (e.g. $1) to match
+// their query. A non-owner NEVER receives the destination's credentials (the list
+// handler blanks access_key_id for non-owner rows; the secret is never selected).
+const storageDestAccessPredicate = `(sd.account_id = %[1]s
+   OR (sd.shared AND EXISTS (
+         SELECT 1 FROM storage_destination_grants g
+         WHERE g.storage_destination_id = sd.id AND g.account_id = %[1]s)))`
+
 type storageDestinationCreateRequest struct {
 	Managed         bool   `json:"managed"`
 	Name            string `json:"name"`
@@ -37,12 +50,14 @@ func (s *Server) handleAccountStorageDestinationsList(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, name, provider, endpoint, region, bucket, key_prefix, access_key_id, status, last_verify_error, verified_at, created_at, managed
-		FROM storage_destinations
-		WHERE account_id=$1
-		ORDER BY created_at DESC, id DESC
-	`, principal.AccountID)
+	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
+		SELECT sd.id, sd.name, sd.provider, sd.endpoint, sd.region, sd.bucket, sd.key_prefix, sd.access_key_id,
+		       sd.status, sd.last_verify_error, sd.verified_at, sd.created_at, sd.managed, sd.shared,
+		       (sd.account_id = $1) AS is_owner
+		FROM storage_destinations sd
+		WHERE %s
+		ORDER BY sd.created_at DESC, sd.id DESC
+	`, fmt.Sprintf(storageDestAccessPredicate, "$1")), principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list storage destinations: %v", err))
 		return
@@ -64,8 +79,10 @@ func (s *Server) handleAccountStorageDestinationsList(w http.ResponseWriter, r *
 			verifiedAt      *time.Time
 			createdAt       time.Time
 			managed         bool
+			shared          bool
+			isOwner         bool
 		)
-		if err := rows.Scan(&id, &name, &provider, &endpoint, &region, &bucket, &keyPrefix, &accessKeyID, &status, &lastVerifyError, &verifiedAt, &createdAt, &managed); err != nil {
+		if err := rows.Scan(&id, &name, &provider, &endpoint, &region, &bucket, &keyPrefix, &accessKeyID, &status, &lastVerifyError, &verifiedAt, &createdAt, &managed, &shared, &isOwner); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan storage destination: %v", err))
 			return
 		}
@@ -74,6 +91,12 @@ func (s *Server) handleAccountStorageDestinationsList(w http.ResponseWriter, r *
 		if managed {
 			endpoint = ""
 			bucket = ""
+			accessKeyID = ""
+		}
+		// Shared destinations a non-owner was granted: the account may select it and
+		// see its name/host, but access_key_id (the username) is a credential, so
+		// blank it for non-owners (the secret is never selected). One blanking idiom.
+		if !isOwner {
 			accessKeyID = ""
 		}
 		items = append(items, map[string]any{
@@ -90,6 +113,8 @@ func (s *Server) handleAccountStorageDestinationsList(w http.ResponseWriter, r *
 			"verified_at":       verifiedAt,
 			"created_at":        createdAt.UTC(),
 			"managed":           managed,
+			"shared":            shared,
+			"is_owner":          isOwner,
 		})
 	}
 	if err := rows.Err(); err != nil {

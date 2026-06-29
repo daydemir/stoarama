@@ -711,11 +711,13 @@ func (s *Server) handleAccountRecordingClipTransfer(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// The target destination must be owned by the same account.
+	// The target destination must be owned by the same account, or be a shared
+	// destination the account was granted (same owner-or-granted predicate as
+	// recording-create selection).
 	var targetKeyPrefix string
-	err = s.pool.QueryRow(r.Context(), `
-		SELECT key_prefix FROM storage_destinations WHERE id=$1 AND account_id=$2
-	`, req.TargetStorageDestinationID, principal.AccountID).Scan(&targetKeyPrefix)
+	err = s.pool.QueryRow(r.Context(), fmt.Sprintf(`
+		SELECT sd.key_prefix FROM storage_destinations sd WHERE sd.id=$1 AND %s
+	`, fmt.Sprintf(storageDestAccessPredicate, "$2")), req.TargetStorageDestinationID, principal.AccountID).Scan(&targetKeyPrefix)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "target storage destination not found")
 		return
