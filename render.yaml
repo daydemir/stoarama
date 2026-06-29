@@ -108,11 +108,16 @@ services:
 
   # Daily stream survey: one JPEG per non-pruned stream per day, captured on an
   # isolated cron instance so the heavy ffmpeg/yt-dlp work never touches the
-  # public API dyno. The cron fires hourly; --daily-gate makes the full sweep
-  # actually run during one per-day randomized UTC hour (so capture time varies
-  # day to day), and the sweep is idempotent (skips streams already captured
-  # today). Billed only while running. starter plan + concurrency 3 keeps peak
-  # memory under 512MB.
+  # public API dyno. The cron fires hourly and the sweep is idempotent: each run
+  # re-selects all non-YouTube targets and skips any stream already captured
+  # today (HasFrameForDay). Billed only while running.
+  #
+  # BACKFILL MODE (in effect): --daily-gate is intentionally OFF and concurrency
+  # raised to 6 so EVERY hourly fire sweeps the catalog and captures whatever is
+  # still missing for the day, draining the ~7k-stream thumbnail backlog over a
+  # handful of runs without overlapping work (idempotent skips). Once coverage
+  # plateaus, restore the gated steady state by re-adding --daily-gate and
+  # lowering --concurrency back to 3 (keeps peak memory under 512MB on starter).
   - type: cron
     name: stoarama-survey
     env: go
@@ -132,7 +137,7 @@ services:
       curl -fsSL -o bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
       chmod +x bin/yt-dlp
       ./bin/yt-dlp --version
-    startCommand: ./bin/stoaramactl survey run-once --daily-gate --concurrency 3 --json
+    startCommand: ./bin/stoaramactl survey run-once --concurrency 6 --json
     envVars:
       - key: DATABASE_URL
         fromDatabase:
