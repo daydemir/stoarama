@@ -15,11 +15,10 @@ services:
     # $FFMPEG_BIN. We use the BtbN gpl build: the johnvansickle static build
     # segfaults on any network input (TLS and plain http alike) on Render's
     # kernel, which crashed every HTTPS probe; the BtbN build opens HTTPS HLS
-    # cleanly. It links only standard glibc, present in the go env. It reads the
-    # CA bundle from $SSL_CERT_FILE (set below) for TLS cert verification; we
-    # vendor the system bundle into bin/ at build time so the runtime path is
-    # self-contained. rootDir is backend, so bin/ and ./bin/ffmpeg resolve
-    # relative to backend/.
+    # cleanly. It links only standard glibc, present in the go env, and reads the
+    # CA bundle from $SSL_CERT_FILE (set below to the Ubuntu base bundle, present
+    # at both build and run time) for TLS cert verification. rootDir is backend,
+    # so bin/ and ./bin/ffmpeg resolve relative to backend/.
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoarama-api ./cmd/stoarama-api
@@ -28,7 +27,6 @@ services:
       tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
       cp /tmp/ffmpeg-extract/bin/ffmpeg bin/ffmpeg
       chmod +x bin/ffmpeg
-      cp /etc/ssl/certs/ca-certificates.crt bin/ca-certificates.crt
       ./bin/ffmpeg -version
     startCommand: ./bin/stoarama-api
     envVars:
@@ -87,10 +85,12 @@ services:
       - key: FFMPEG_BIN
         value: ./bin/ffmpeg
       # The BtbN ffmpeg (OpenSSL) reads its CA bundle from SSL_CERT_FILE; point
-      # it at the bundle vendored into bin/ during build so HTTPS cert
-      # verification succeeds on the reachability probe.
+      # it at the Ubuntu base image's system bundle (present at both build and
+      # run time) so HTTPS cert verification succeeds on the reachability probe.
+      # An absolute path avoids breaking the build-time curl, which inherits this
+      # var, before any relative bin/ path would exist.
       - key: SSL_CERT_FILE
-        value: ./bin/ca-certificates.crt
+        value: /etc/ssl/certs/ca-certificates.crt
       # Survey runs on the dedicated stoarama-survey cron service below, not on
       # this web dyno (keeps the public API stable). Leave embedded survey off.
       - key: SURVEY_ENABLED
