@@ -348,6 +348,15 @@
       return `$${(c / 100).toFixed(2)}`;
     }
 
+    // Storage cost from a GB-month figure. The server pre-rounds tiny storage
+    // charges to 0 cents, so render a real-but-sub-cent amount (gb > 0) as
+    // "<$0.01" rather than the broken-looking "$0.00".
+    function usdStorage(gb, rateCents, roundedCents) {
+      const c = Number(roundedCents || 0);
+      if (c === 0 && Number(gb || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
+      return usd(c);
+    }
+
     function fmtDay(iso) {
       if (!iso) return '';
       try { return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); }
@@ -488,7 +497,7 @@
         : `<div class="muted">No managed storage this month</div>`;
 
       const lines = [`<div>${days} × ${usd(dayRate)} record-day = <b>${usd(dayCents)}</b></div>`];
-      if (gb > 0) lines.push(`<div>${gb.toFixed(3)} GB-mo × ${usd(gbRate)} = <b>${usd(storeCents)}</b></div>`);
+      if (gb > 0) lines.push(`<div>${gb.toFixed(3)} GB-mo × ${usd(gbRate)} = <b>${usdStorage(gb, gbRate, storeCents)}</b></div>`);
       lines.push(`<div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></div>`);
       estBreakdown.innerHTML = lines.join('');
 

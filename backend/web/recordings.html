@@ -968,7 +968,7 @@
         `<span class="muted"> &middot; ${m.activeDays} record-day${m.activeDays === 1 ? '' : 's'} × $${(m.dayRate / 100).toFixed(2)} = ${usd(m.recordDayCents)}</span>`,
       ];
       if (m.managed && m.avgGB > 0) {
-        parts.push(`<span class="muted"> + ~${m.avgGB.toFixed(3)} GB-mo × $${(m.gbRate / 100).toFixed(2)} = ${usd(m.storageCents)}</span>`);
+        parts.push(`<span class="muted"> + ~${m.avgGB.toFixed(3)} GB-mo × $${(m.gbRate / 100).toFixed(2)} = ${usdStorage(m.avgGB, m.gbRate, m.storageCents)}</span>`);
       }
       els.costEstimate.innerHTML = parts.join('');
       els.costEstimateNote.textContent = m.managed
@@ -1494,6 +1494,15 @@
       return `$${(c / 100).toFixed(2)}`;
     }
 
+    // Storage cost from a GB-month figure. The server pre-rounds tiny storage
+    // charges to 0 cents, so render a real-but-sub-cent amount (gb > 0) as
+    // "<$0.01" rather than the broken-looking "$0.00".
+    function usdStorage(gb, rateCents, roundedCents) {
+      const c = Number(roundedCents || 0);
+      if (c === 0 && Number(gb || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
+      return usdCents(c);
+    }
+
     function renderLedger() {
       const b = state.billing || {};
       if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
@@ -1507,7 +1516,8 @@
       // when the account has no managed data (avg = 0).
       const gb = Number(b.storage_gb_month_avg || 0);
       if (gb > 0) {
-        lines.push(`<b>${gb.toFixed(3)} GB-month storage</b> &middot; est. ${usdCents(b.estimated_storage_amount_cents)}`);
+        const gbRate = Number(b.gb_month_rate_cents || 10);
+        lines.push(`<b>${gb.toFixed(3)} GB-month storage</b> &middot; est. ${usdStorage(gb, gbRate, b.estimated_storage_amount_cents)}`);
       }
       if (lines.length === 0) { els.ledger.classList.add('hidden'); return; }
       els.ledger.innerHTML = lines.join('<br/>');
@@ -1740,6 +1750,17 @@
     // S3 copies it into another of the account's buckets; Delete tombstones it.
     // Eligible transfer targets are the account's verified destinations other than
     // the clip's own source (a copy onto itself is rejected by the API anyway).
+    // Destinations the clips in `items` could be copied INTO: the account's
+    // destinations excluding each clip's own source (a self-copy is rejected by
+    // the API). Used to gate the Send-to-my-S3 note so the promise text only
+    // shows when at least one real target bucket exists, not when the sole
+    // destination is the managed bucket the clips already live in.
+    function eligibleTransferTargetCount(items) {
+      const sources = new Set((Array.isArray(items) ? items : [])
+        .map((c) => Number(c.storage_destination_id || 0)));
+      return (state.destinations || []).filter((d) => !sources.has(Number(d.id))).length;
+    }
+
     function clipRowHTML(c, recId) {
       const cid = Number(c.id);
       const purged = c.purged === true;
@@ -1785,7 +1806,7 @@
         ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
         : '';
       const rows = items.map((c) => clipRowHTML(c, recId)).join('');
-      const eligibleTargets = (state.destinations || []).length;
+      const eligibleTargets = eligibleTransferTargetCount(items);
       const note = eligibleTargets > 0
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="#" data-connectbucket="1">connect a bucket first</a>.</div>`;
@@ -1873,7 +1894,7 @@
         </div>`;
 
       const rows = items.map((c) => clipRowHTML(c, recId)).join('');
-      const eligibleTargets = (state.destinations || []).length;
+      const eligibleTargets = eligibleTransferTargetCount(items);
       const note = eligibleTargets > 0
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="/recordings">connect a bucket first</a> from the recordings page.</div>`;
