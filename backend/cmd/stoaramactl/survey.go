@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -46,6 +48,7 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 	resolveTimeoutSec := fs.Int("resolve-timeout-sec", 60, "per-stream resolve timeout seconds")
 	captureTimeoutSec := fs.Int("capture-timeout-sec", 60, "per-stream one-frame capture timeout seconds")
 	limit := fs.Int("limit", 0, "max streams to survey this run (0 = all non-pruned); useful for verifying a small sample")
+	streamIDs := fs.String("stream-ids", "", "comma-separated stream ids to survey (empty = all selected targets); useful for verifying specific streams")
 	dailyGate := fs.Bool("daily-gate", false, "for an hourly cron: only run during one per-day deterministic random UTC hour, skip otherwise (gives a different capture time each day)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
@@ -72,6 +75,15 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 	if err != nil {
 		log.Fatalf("select survey targets: %v", err)
 	}
+	if ids := parseStreamIDs(*streamIDs); len(ids) > 0 {
+		filtered := targets[:0:0]
+		for _, t := range targets {
+			if ids[t.ID] {
+				filtered = append(filtered, t)
+			}
+		}
+		targets = filtered
+	}
 	if *limit > 0 && len(targets) > *limit {
 		targets = targets[:*limit]
 	}
@@ -96,6 +108,29 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 	}
 	fmt.Printf("survey run-once day=%s total=%d success=%d skipped=%d failed=%d\n",
 		day.Format("2006-01-02"), res.Total, res.Success, res.Skipped, res.Failed)
+}
+
+// parseStreamIDs parses a comma-separated list of stream ids into a set,
+// skipping blanks and non-numeric entries. An empty/blank input yields nil so
+// the caller surveys all selected targets.
+func parseStreamIDs(raw string) map[int64]bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	ids := make(map[int64]bool)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			log.Fatalf("invalid --stream-ids entry %q: %v", part, err)
+		}
+		ids[id] = true
+	}
+	return ids
 }
 
 // runSurveyCoverage reports how many non-pruned streams have at least one survey

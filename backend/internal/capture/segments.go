@@ -170,6 +170,48 @@ func ProbeReachable(ctx context.Context, sourceURL string, pinHost string) error
 	return nil
 }
 
+// CaptureSingleFrame grabs ONE video frame from a resolved video sourceURL via
+// ffmpeg and returns it as a JPEG Frame. It exists so the survey's video path
+// reuses the recorder's proven network-input args (appendFFmpegHTTPInputArgs:
+// rw/timeout, -protocol_whitelist, optional Host pin) instead of the bare ffmpeg
+// in capture.CaptureFrame, which segfaults on these network inputs. pinHost,
+// when non-empty, is carried as the HTTP Host header; pass "" to let ffmpeg
+// derive Host/SNI from the URL. The caller is responsible for bounding ctx with
+// a short timeout so a dead stream fails fast. On failure it returns the ffmpeg
+// CombinedOutput in the error so the real stderr is visible to verification.
+func CaptureSingleFrame(ctx context.Context, sourceURL string, pinHost string) (Frame, error) {
+	if strings.TrimSpace(sourceURL) == "" {
+		return Frame{}, fmt.Errorf("source_url is empty")
+	}
+	tmpDir, err := os.MkdirTemp("", "capture-single-frame-*")
+	if err != nil {
+		return Frame{}, fmt.Errorf("mktemp: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	outPath := filepath.Join(tmpDir, "frame.jpg")
+
+	args := []string{"-y", "-nostdin", "-loglevel", "error"}
+	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10, pinHost)
+	args = append(args,
+		"-fflags", "+discardcorrupt",
+		"-i", sourceURL,
+		"-map", "0:v:0",
+		"-frames:v", "1",
+		"-q:v", "2",
+		outPath,
+	)
+	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return Frame{}, fmt.Errorf("ffmpeg single-frame capture failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	b, err := os.ReadFile(outPath)
+	if err != nil {
+		return Frame{}, fmt.Errorf("read captured frame: %w", err)
+	}
+	return buildFrame(b, "image/jpeg", "live")
+}
+
 // sanitizeProbeError maps any ffmpeg probe failure to a clean user-facing error.
 // It distinguishes a signal-killed child (segfault, or SIGKILL from a probe
 // timeout) from a normal non-zero exit, but in neither case does it interpolate

@@ -129,7 +129,17 @@ func CaptureFrame(ctx context.Context, registry *capture.Registry, t Target, res
 	}
 	capCtx, cancelCap := context.WithTimeout(ctx, captureTimeout)
 	defer cancelCap()
-	frame, err := capture.CaptureFrame(capCtx, resolved.URL)
+	// Image sources (image_poll) are a direct JPEG fetch. Video sources
+	// (hls_live / ffmpeg_direct, IsImage==false) must go through the recorder's
+	// ffmpeg network-input args via CaptureSingleFrame: the bare ffmpeg in
+	// capture.CaptureFrame segfaults on these network inputs, which is why every
+	// hls/http_video survey was failing and writing no row.
+	var frame capture.Frame
+	if resolved.IsImage {
+		frame, err = capture.CaptureFrame(capCtx, resolved.URL)
+	} else {
+		frame, err = capture.CaptureSingleFrame(capCtx, resolved.URL, "")
+	}
 	if err != nil {
 		return capture.Frame{}, fmt.Errorf("capture frame for stream %d: %w", t.ID, err)
 	}
