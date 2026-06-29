@@ -51,7 +51,8 @@
     }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .shell { max-width: 880px; margin: 0 auto; padding: 18px 20px 42px; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
+    .rec-content { max-width: 880px; margin: 0 auto; }
     .account-menu {
       position: absolute;
       top: calc(100% + 8px);
@@ -250,13 +251,14 @@
       #storageChooser { flex-direction: column; }
       #storageChooser button { width: 100%; white-space: normal; }
     }
-<!--SHELL_HEAD-->
   </style>
+<!--SHELL_HEAD-->
 </head>
 <body>
   <div class="shell">
     <!--SHELL_TOPBAR-->
 
+    <div class="rec-content">
     <!-- Signed-out: single magic-link panel -->
     <div id="signedOut" class="panel hidden">
       <div class="eyebrow">Sign in</div>
@@ -479,6 +481,7 @@
         <div class="button-row"><button id="startBtn" type="button" disabled>Start recording</button></div>
         <div id="startStatus" class="status"></div>
       </section>
+    </div>
     </div>
   </div>
 
