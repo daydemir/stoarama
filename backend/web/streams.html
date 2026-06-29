@@ -4625,6 +4625,18 @@ function renderStreamRows() {
 }
 
 function applySourceSegment(seg) {
+  if (isKoreaPage) {
+    streamSourceSegment = 'korea';
+    const seg2 = document.getElementById('streamSourceSegment');
+    if (seg2) {
+      seg2.querySelectorAll('.source-seg-btn').forEach((b) => {
+        const on = b.getAttribute('href') === '/korea';
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+    return;
+  }
   streamSourceSegment = (seg === 'youtube') ? 'youtube' : 'recordable';
   // Drive the existing filter state that buildStreamFilterParams reads. YouTube
   // is the exact youtube_watch capture type; Recordable clears capture_type and
@@ -4638,7 +4650,7 @@ function applySourceSegment(seg) {
   }
   const seg2 = document.getElementById('streamSourceSegment');
   if (seg2) {
-    seg2.querySelectorAll('button[data-source-seg]').forEach((b) => {
+    seg2.querySelectorAll('.source-seg-btn').forEach((b) => {
       const on = b.getAttribute('data-source-seg') === streamSourceSegment;
       b.classList.toggle('active', on);
       b.setAttribute('aria-selected', on ? 'true' : 'false');
@@ -4651,6 +4663,13 @@ function applySourceSegment(seg) {
   if (!seg) return;
   seg.querySelectorAll('button[data-source-seg]').forEach((btn) => {
     btn.addEventListener('click', () => {
+      if (isKoreaPage) {
+        const next = btn.getAttribute('data-source-seg') === 'youtube'
+          ? '/streams?capture_type=youtube_watch'
+          : '/streams?recordable=1';
+        window.location.assign(next);
+        return;
+      }
       applySourceSegment(btn.getAttribute('data-source-seg'));
       void loadStreams({ resetPage: true }).catch((err) => setStreamStatus(String(err), 'err'));
     });
@@ -5506,7 +5525,10 @@ async function applyStreamsRouteState(opts = {}) {
   applyStreamListStateFromURL(params);
   showPanel('streams');
   setStreamsView(streamsView, { replaceURL: true });
-  applySourceSegment('recordable');
+  const initialSourceSegment = isKoreaPage
+    ? 'korea'
+    : (normalizeCaptureTypeFilter(params.get('capture_type')) === 'youtube_watch' ? 'youtube' : 'recordable');
+  applySourceSegment(initialSourceSegment);
   await refreshAllStreamFilterOptions();
   await loadStreamsForActiveView({ replaceURL: true });
 }
