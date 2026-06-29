@@ -269,8 +269,8 @@
         <div id="periodRow" class="muted" style="font-size:12px;"></div>
         <p class="muted" style="font-size:12px;margin:10px 0 0;">
           This is a live estimate from the streams you are recording plus your storage usage this month, not a final invoice. You are billed monthly in arrears:
-          $0.50 for each day a recording captured at least one clip, plus, for Stoarama-managed storage, $0.10 per GB stored for a month.
-          Days when nothing recorded are never charged.
+          $0.50 for each day a recording captures at least one clip, plus, for Stoarama-managed storage, $0.10 per GB per month for the time each clip is kept.
+          Days when nothing was recorded are never charged.
         </p>
       </div>
     </section>
@@ -504,15 +504,15 @@
       const totalCents = dayCents + storeCents;
 
       if (b.has_payment_method === true) {
-        paymentRow.innerHTML = `<div style="color:var(--ok);">Billing method on file. You have a card on file.</div>`;
+        paymentRow.innerHTML = `<div style="color:var(--ok);">You have a card on file.</div>`;
         billingManageBtn.textContent = 'Manage payment method';
       } else {
-        paymentRow.innerHTML = `<div style="color:var(--warn);">No billing method on file. Adding a card does not charge you.</div>`;
+        paymentRow.innerHTML = `<div style="color:var(--warn);">No card on file yet. Adding a card does not charge you.</div>`;
         billingManageBtn.textContent = 'Add a card';
       }
 
       usageRecDays.innerHTML =
-        `<div><b>${days}</b> recording-day${days === 1 ? '' : 's'} from the streams you are recording</div>`;
+        `<div><b>${days}</b> record-day${days === 1 ? '' : 's'} from the streams you are recording</div>`;
       usageStorage.innerHTML = gb > 0
         ? `<div><b>${gb.toFixed(3)}</b> GB-month managed storage</div>`
           + `<div class="muted" style="font-size:12px;margin-top:4px;">Storage is ${usd(gbRate)} per GB per month, charged only for the time each clip is kept. A clip stored a few days costs a small fraction of that.</div>`
