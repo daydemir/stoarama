@@ -761,6 +761,21 @@
     }
     .source-seg-btn:hover { color: var(--text); text-decoration: none; }
     .source-seg-btn.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+    .seg-count {
+      display: inline-block;
+      margin-left: 7px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      letter-spacing: 0;
+      background: color-mix(in srgb, var(--muted) 22%, transparent);
+      color: var(--muted);
+    }
+    .seg-count:empty { display: none; }
+    .source-seg-btn.active .seg-count {
+      background: rgba(255,255,255,0.22);
+      color: #fff;
+    }
     .operations-shell {
       display: grid;
       gap: 10px;
@@ -1469,8 +1484,9 @@
       <div class="domain-intro-copy">Browse every stream, location, tag, and recording setting in one place.</div>
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
-      <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable</button>
-      <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube</button>
+      <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube<span class="seg-count" data-seg-count="youtube"></span></button>
       <a class="source-seg-btn" href="/korea" role="tab">Korea</a>
     </div>
     <div class="filter-stack-card">
@@ -4483,15 +4499,16 @@ function applySourceSegment(seg) {
     }
     return;
   }
-  streamSourceSegment = (seg === 'youtube') ? 'youtube' : 'recordable';
+  streamSourceSegment = (seg === 'youtube' || seg === 'still_image') ? seg : 'recordable';
   // Drive the existing filter state that buildStreamFilterParams reads. YouTube
-  // is the exact youtube_watch capture type; Recordable clears capture_type and
+  // and Still image are exact capture types; Recordable clears capture_type and
   // lets buildStreamFilterParams add recordable=1 (HLS + direct HTTP video).
+  sourceFilter.value = '';
   if (streamSourceSegment === 'youtube') {
-    sourceFilter.value = '';
     streamModeFilter.value = 'youtube_watch';
+  } else if (streamSourceSegment === 'still_image') {
+    streamModeFilter.value = 'still_image';
   } else {
-    sourceFilter.value = '';
     streamModeFilter.value = '';
   }
   const seg2 = document.getElementById('streamSourceSegment');
@@ -4521,6 +4538,34 @@ function applySourceSegment(seg) {
     });
   });
 })();
+
+// Fetch live per-type totals via the existing count API (limit=1 -> {total}) so the
+// segment labels don't imply the grand total is one browsable type. Korea is a region
+// subset (no count). Best-effort: failures leave the label bare, never block the list.
+let streamSegmentCountsLoaded = false;
+async function loadStreamSegmentCounts() {
+  if (streamSegmentCountsLoaded) return;
+  streamSegmentCountsLoaded = true;
+  const seg = document.getElementById('streamSourceSegment');
+  if (!seg) return;
+  const fmt = (n) => Number(n || 0).toLocaleString('en-US');
+  const set = (key, n) => {
+    const el = seg.querySelector(`.seg-count[data-seg-count="${key}"]`);
+    if (el) el.textContent = fmt(n);
+  };
+  const totalFor = async (qs) => {
+    const payload = await fetchJSON(`/api/v1/dashboard/streams?limit=1&${qs}`);
+    return Number(payload && payload.total) || 0;
+  };
+  const jobs = [
+    ['recordable', 'recordable=1'],
+    ['still_image', 'capture_type=still_image'],
+    ['youtube', 'capture_type=youtube_watch'],
+  ];
+  await Promise.all(jobs.map(async ([key, qs]) => {
+    try { set(key, await totalFor(qs)); } catch (_) { /* leave bare */ }
+  }));
+}
 
 function updateStreamPageControls() {
   const pageCount = Math.max(1, Math.ceil(streamTotal / streamPageSize));
@@ -5392,10 +5437,13 @@ async function applyStreamsRouteState(opts = {}) {
   applyStreamListStateFromURL(params);
   showPanel('streams');
   setStreamsView(streamsView, { replaceURL: true });
+  const initialCapture = normalizeCaptureTypeFilter(params.get('capture_type'));
   const initialSourceSegment = isKoreaPage
     ? 'korea'
-    : (normalizeCaptureTypeFilter(params.get('capture_type')) === 'youtube_watch' ? 'youtube' : 'recordable');
+    : (initialCapture === 'youtube_watch' ? 'youtube'
+      : (initialCapture === 'still_image' ? 'still_image' : 'recordable'));
   applySourceSegment(initialSourceSegment);
+  void loadStreamSegmentCounts();
   await refreshAllStreamFilterOptions();
   await loadStreamsForActiveView({ replaceURL: true });
 }
