@@ -54,37 +54,6 @@ func ValidatePublicURL(rawURL string) (net.IP, error) {
 	return ips[0], nil
 }
 
-// PinnedURL rewrites rawURL so its host is the literal validated IP, and returns
-// the original Host value (hostname plus any explicit port) separately. ffmpeg is
-// then given the IP-literal URL (so the TCP socket is pinned to the address that
-// was validated and cannot be redirected by a DNS rebind at connect time) while
-// the returned host string is passed back as the HTTP Host header / TLS SNI so
-// virtual-hosted and SNI-dependent origins still route correctly. ip must be the
-// address returned by ValidatePublicURL for rawURL.
-func PinnedURL(rawURL string, ip net.IP) (pinnedURL string, host string, err error) {
-	if ip == nil {
-		return "", "", fmt.Errorf("pin ip is nil")
-	}
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return "", "", fmt.Errorf("parse stream url: %w", err)
-	}
-	originalHost := u.Host
-	if originalHost == "" {
-		return "", "", fmt.Errorf("stream url has no host")
-	}
-	literal := ip.String()
-	if ip.To4() == nil {
-		literal = "[" + literal + "]"
-	}
-	if port := u.Port(); port != "" {
-		u.Host = literal + ":" + port
-	} else {
-		u.Host = literal
-	}
-	return u.String(), originalHost, nil
-}
-
 // cgnatNet is the RFC6598 carrier-grade NAT range 100.64.0.0/10.
 var cgnatNet = mustCIDR("100.64.0.0/10")
 

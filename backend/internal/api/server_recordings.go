@@ -654,18 +654,17 @@ func validateRecordingStreamURL(streamURL string) (net.IP, string, error) {
 }
 
 // probeRecordingStreamReachable is the shared probe half of the create/probe
-// path: it pins the (already SSRF-validated) URL to validatedIP so the probe
-// socket cannot be redirected by a DNS rebind between validation and connect
-// time, then runs a bounded ffmpeg open to confirm the source is live. pinHost
-// carries the original hostname for the Host header / SNI.
+// path: it runs a bounded ffmpeg open on the already SSRF-validated streamURL to
+// confirm the source is live. The original hostname URL is handed to ffmpeg
+// directly (no host->IP rewrite) so TLS SNI + Host routing work for SNI/Host-
+// routed CDNs; ValidatePublicURL has already rejected any host that resolves to a
+// private/metadata address. validatedIP is retained by the caller as the proof
+// the host resolved public.
 func probeRecordingStreamReachable(ctx context.Context, streamURL string, validatedIP net.IP) error {
-	pinnedProbeURL, probeHost, err := netguard.PinnedURL(streamURL, validatedIP)
-	if err != nil {
-		return err
-	}
+	_ = validatedIP
 	probeCtx, cancel := context.WithTimeout(ctx, recordingProbeTimeout)
 	defer cancel()
-	return capture.ProbeReachable(probeCtx, pinnedProbeURL, probeHost)
+	return capture.ProbeReachable(probeCtx, streamURL, "")
 }
 
 // resolveRecordingStreamURL resolves a pasted stream reference (e.g. a KBS '!hls'

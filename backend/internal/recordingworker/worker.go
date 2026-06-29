@@ -160,23 +160,21 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 		return
 	}
 
-	// S-1: re-check the resolved URL right before ffmpeg, then pin the connection
-	// to the validated IP so a DNS rebind cannot point ffmpeg's socket at a
-	// private/metadata address between this check and connect time.
-	validatedIP, err := netguard.ValidatePublicURL(sourceURL)
-	if err != nil {
+	// S-1: re-check the resolved URL right before ffmpeg (DNS-rebinding gate).
+	// ValidatePublicURL rejects any host that resolves to a private/metadata
+	// address. We then hand ffmpeg the original hostname URL (no host->IP
+	// rewrite) so TLS SNI + Host routing work for SNI/Host-routed CDNs. The
+	// TOCTOU window between this resolution and ffmpeg's own resolution is
+	// covered by the droplet egress firewall, which REJECTs all traffic to
+	// private/metadata ranges.
+	if _, err := netguard.ValidatePublicURL(sourceURL); err != nil {
 		w.fail(ctx, job.JobID, fmt.Errorf("ssrf guard rejected source url: %w", err))
-		return
-	}
-	pinnedURL, pinHost, err := netguard.PinnedURL(sourceURL, validatedIP)
-	if err != nil {
-		w.fail(ctx, job.JobID, fmt.Errorf("pin source url to validated ip: %w", err))
 		return
 	}
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 	captureCtx, captureCancel := context.WithTimeout(jobCtx, capture.SegmentCaptureTimeout(clipDuration))
-	seg, err := capture.CaptureSegment(captureCtx, pinnedURL, clipDuration, pinHost)
+	seg, err := capture.CaptureSegment(captureCtx, sourceURL, clipDuration, "")
 	captureCancel()
 	if err != nil {
 		if canceled() {

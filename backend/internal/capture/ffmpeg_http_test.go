@@ -26,8 +26,8 @@ func TestAppendFFmpegHTTPInputArgsHTTP(t *testing.T) {
 	if joined["-headers"] {
 		t.Fatalf("did not expect Host header args without a pin host: %#v", args)
 	}
-	if joined["-protocol_whitelist"] {
-		t.Fatalf("did not expect -protocol_whitelist without a pin host: %#v", args)
+	if !joined["-protocol_whitelist"] {
+		t.Fatalf("expected -protocol_whitelist on every http input: %#v", args)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/jpeg"
@@ -139,11 +140,16 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 // ProbeReachable verifies that sourceURL opens and yields at least one packet
 // within ctx's deadline, without writing a file. It is used by the recorder
 // create flow to fail fast on an unreachable/unsupported URL. The caller is
-// responsible for SSRF-validating sourceURL first; pinHost carries the original
-// hostname (as Host header / SNI) when sourceURL has been pinned to the
-// validated literal IP, so the probe connects to the same address ValidatePublicURL
-// approved. It uses the same ffmpeg binary resolution as capture so deployments
-// need only vendor ffmpeg.
+// responsible for SSRF-validating sourceURL first; pinHost is an optional HTTP
+// Host header override (empty for the hostname path, where ffmpeg derives Host
+// and TLS SNI from the URL). It uses the same ffmpeg binary resolution as capture
+// so deployments need only vendor ffmpeg.
+//
+// On failure it always returns a sanitized "stream not reachable" error: a child
+// killed by a signal (segfault / SIGKILL on timeout) never leaks the raw
+// "signal: segmentation fault (core dumped)" string to the caller, and a normal
+// non-zero exit returns the same clean message. The ffmpeg stderr is never
+// interpolated, so an IP-rewritten or low-level error can never surface to the UI.
 func ProbeReachable(ctx context.Context, sourceURL string, pinHost string) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
@@ -158,10 +164,29 @@ func ProbeReachable(ctx context.Context, sourceURL string, pinHost string) error
 		"-",
 	)
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("stream not reachable: %w (%s)", err, strings.TrimSpace(string(out)))
+	if err := cmd.Run(); err != nil {
+		return sanitizeProbeError(err)
 	}
 	return nil
+}
+
+// sanitizeProbeError maps any ffmpeg probe failure to a clean user-facing error.
+// It distinguishes a signal-killed child (segfault, or SIGKILL from a probe
+// timeout) from a normal non-zero exit, but in neither case does it interpolate
+// the raw exec error or ffmpeg stderr, so "signal: segmentation fault (core
+// dumped)" can never reach the UI.
+func sanitizeProbeError(err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if ps := exitErr.ProcessState; ps != nil && !ps.Exited() {
+			// Killed by a signal (crash or timeout-driven kill): report cleanly
+			// as not opening, without the raw signal string.
+			return fmt.Errorf("stream not reachable: stream did not open")
+		}
+		return fmt.Errorf("stream not reachable")
+	}
+	// ctx deadline/cancel or a binary-not-found style error: still clean.
+	return fmt.Errorf("stream not reachable")
 }
 
 func CleanupSegment(seg Segment) {

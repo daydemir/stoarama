@@ -46,48 +46,6 @@ func TestValidatePublicURL_AllowsPublicLiteral(t *testing.T) {
 	}
 }
 
-// TestPinnedURL_SubstitutesIPAndKeepsHost asserts the rebinding-pin contract:
-// the connection URL carries the validated literal IP (so the socket cannot be
-// redirected to a rebound private address), while the original host is returned
-// for the Host header / SNI. Port and path are preserved.
-func TestPinnedURL_SubstitutesIPAndKeepsHost(t *testing.T) {
-	cases := []struct {
-		name     string
-		rawURL   string
-		ip       string
-		wantURL  string
-		wantHost string
-	}{
-		{"v4-no-port", "https://example.com/live.m3u8", "203.0.113.10", "https://203.0.113.10/live.m3u8", "example.com"},
-		{"v4-port-query", "http://example.com:8080/live?x=1", "203.0.113.10", "http://203.0.113.10:8080/live?x=1", "example.com:8080"},
-		{"v6-brackets", "https://example.com/live.m3u8", "2606:4700::6810:1234", "https://[2606:4700::6810:1234]/live.m3u8", "example.com"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			ip := net.ParseIP(tc.ip)
-			if ip == nil {
-				t.Fatalf("bad test ip %q", tc.ip)
-			}
-			gotURL, gotHost, err := PinnedURL(tc.rawURL, ip)
-			if err != nil {
-				t.Fatalf("PinnedURL error: %v", err)
-			}
-			if gotURL != tc.wantURL {
-				t.Fatalf("url = %q, want %q", gotURL, tc.wantURL)
-			}
-			if gotHost != tc.wantHost {
-				t.Fatalf("host = %q, want %q", gotHost, tc.wantHost)
-			}
-		})
-	}
-}
-
-func TestPinnedURL_NilIP(t *testing.T) {
-	if _, _, err := PinnedURL("https://example.com/live.m3u8", nil); err == nil {
-		t.Fatalf("expected error for nil ip")
-	}
-}
-
 // TestIsPublicIP_RebindingContract asserts the predicate the fetch-time re-check
 // relies on: a host that (post-validation) flips an A record to a private IP is
 // rejected, because EVERY resolved address must be public. We exercise the
