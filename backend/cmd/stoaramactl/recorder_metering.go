@@ -58,7 +58,7 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 			log.Printf("managed storage snapshot error: %v", err)
 			return
 		}
-		if err := meterAllAccounts(ctx, pool, reporter); err != nil {
+		if err := meterAllAccounts(ctx, pool, reporter, time.Now().UTC()); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -81,7 +81,9 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 
 // meterAllAccounts processes every account that has a Stripe subscription on file,
 // metering each independently so one account's Stripe error cannot stall the rest.
-func meterAllAccounts(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe) error {
+// now is the sweep instant (UTC); it is threaded through so the closed-period guard
+// in meterAccount is deterministically testable.
+func meterAllAccounts(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, now time.Time) error {
 	rows, err := pool.Query(ctx, `
 		SELECT account_id, stripe_customer_id, stripe_subscription_id, last_metered_period_end
 		FROM account_billing
@@ -108,20 +110,35 @@ func meterAllAccounts(ctx context.Context, pool *pgxpool.Pool, reporter metering
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := meterAccount(ctx, pool, reporter, a); err != nil {
+		if err := meterAccount(ctx, pool, reporter, a, now); err != nil {
 			log.Printf("recording metering: account %d skipped: %v", a.accountID, err)
 		}
 	}
 	return nil
 }
 
-// meterAccount fetches the account's current Stripe period, skips it if already
-// metered (last_metered_period_end guard), counts the period's billable
-// recording-days from our own ledger, and on a non-empty period pushes one meter
-// event keyed by period so a re-run is a no-op. It then advances the cursor. A
-// zero-day period reports nothing (Stripe suppresses the empty invoice) but the
-// cursor still advances so the empty period is not re-examined.
-func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, a meterableAccount) error {
+// meterAccount fetches the account's current Stripe period and meters it exactly
+// once, on the period's final UTC day, while it is still open. The order of guards
+// is load-bearing for not-losing and not-double-billing real money:
+//
+//   - periodAlreadyMetered: skip a period (or a later one) already on the cursor.
+//   - periodReadyToMeter: skip a period whose end UTC date has NOT yet arrived. The
+//     billable-day count (rec_day < end-date) only becomes COMPLETE at 00:00 UTC of
+//     the period-end day, and a metered subscription bills usage in arrears by
+//     summing the meter events whose timestamp falls inside the closing period: an
+//     event reported BEFORE the period-end instant lands on that period's invoice,
+//     one reported after the period closes does not (it rolls to the next period).
+//     So the only correct moment to report is on the period-end UTC day, before the
+//     close instant, with the now-final day count. Crucially we therefore NEVER
+//     advance the cursor to a still-open period's end (the cursor-jump bug that
+//     silently $0-billed real usage): a future-dated period end is left untouched
+//     until its day arrives.
+//
+// On a non-empty period it pushes one meter event keyed by the period-end date, so
+// a same-day re-run is a Stripe-dedup no-op; it then advances the cursor. A zero-day
+// period reports nothing (Stripe suppresses the empty invoice) but the cursor still
+// advances so the closed empty period is not re-examined.
+func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, a meterableAccount, now time.Time) error {
 	start, end, err := reporter.GetSubscriptionPeriod(ctx, a.subscriptionID)
 	if err != nil {
 		return fmt.Errorf("get subscription period: %w", err)
@@ -131,6 +148,9 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 	}
 	if periodAlreadyMetered(end, a.lastMeteredPeriodEnd) {
 		return nil // idempotent skip: this period (or a later one) is already metered.
+	}
+	if !periodReadyToMeter(end, now) {
+		return nil // period still open and its day count not yet final; do not advance.
 	}
 
 	var days int
@@ -232,15 +252,32 @@ func periodAlreadyMetered(periodEnd time.Time, lastMeteredEnd *time.Time) bool {
 	return !end.After(last)
 }
 
+// periodReadyToMeter reports whether the period ending periodEnd has reached its
+// final UTC day as of now, i.e. its billable-day count (rec_day < end-date) is
+// complete and it is the period-end day on which the closing meter event must be
+// pushed (before the close instant). It is true exactly when now's UTC date is on
+// or after periodEnd's UTC date. A still-open period whose end date is in the
+// future is NOT ready: returning false here is what stops the cursor from ever
+// jumping past an open period (the bug that silently $0-billed real usage).
+func periodReadyToMeter(periodEnd, now time.Time) bool {
+	return !dateOnlyUTC(periodEnd).After(dateOnlyUTC(now))
+}
+
 // shouldReportDays gates the meter event on a non-empty period: zero billable
 // recording-days push nothing (Stripe suppresses the empty invoice).
 func shouldReportDays(days int) bool { return days > 0 }
 
 // meterPeriodKey is the per-period component of the meter-event identifier
 // ("<accountID>-<periodKey>" is built inside the Stripe client). It is the
-// period-end year-month, so re-sends within a period collapse to one meter event.
+// period-end UTC date (YYYY-MM-DD): a same-period re-send collapses to one meter
+// event (same end date), while two DISTINCT periods get distinct keys. Keying on
+// the full date, not just the year-month, is required because an out-of-cycle
+// re-anchor (e.g. a manual charge that resets billing_cycle_anchor) can produce two
+// separate closing periods inside the same calendar month; a month-only key would
+// collide their identifiers and Stripe would reject the second period's usage as a
+// duplicate, silently under-billing it.
 func meterPeriodKey(periodEnd time.Time) string {
-	return periodEnd.UTC().Format("2006-01")
+	return periodEnd.UTC().Format("2006-01-02")
 }
 
 // dateOnlyUTC truncates a timestamp to its UTC calendar date.

@@ -159,9 +159,9 @@ func (c *Client) CreatePortalSession(ctx context.Context, customerID, returnURL 
 // (a zero-day period reports nothing; Stripe suppresses the empty invoice).
 //
 // Identifier is "<accountID>-<periodKey>", a per-customer-per-period key, so the
-// monthly job is re-runnable without double-billing: Stripe enforces identifier
-// uniqueness within a rolling window of at least 24 hours, and the per-period
-// key keeps re-sends within a period a no-op. The customer is mapped via the
+// monthly job is re-runnable without double-billing: the meter-event identifier is
+// durably unique per event_name, so a re-send of the same period key is rejected
+// (handled as a no-op via isDuplicateMeterEvent), never summed. The customer is mapped via the
 // payload "stripe_customer_id" (the meter's customer_mapping) and the day count
 // via "value" (the meter's value_settings). Timestamp is omitted, so Stripe
 // stamps "now".
@@ -185,6 +185,9 @@ func (c *Client) ReportRecordingDays(ctx context.Context, customerID string, acc
 	}
 	ev.Context = ctx
 	if _, err := c.sc.BillingMeterEvents.New(ev); err != nil {
+		if isDuplicateMeterEvent(err) {
+			return nil // already reported for this period; idempotent no-op.
+		}
 		return fmt.Errorf("report recording days: %w", err)
 	}
 	return nil
@@ -219,9 +222,27 @@ func (c *Client) ReportGBMonth(ctx context.Context, customerID string, accountID
 	}
 	ev.Context = ctx
 	if _, err := c.sc.BillingMeterEvents.New(ev); err != nil {
+		if isDuplicateMeterEvent(err) {
+			return nil // already reported for this period; idempotent no-op.
+		}
 		return fmt.Errorf("report gb-month: %w", err)
 	}
 	return nil
+}
+
+// isDuplicateMeterEvent reports whether err is Stripe rejecting a meter event
+// because its identifier was already used. The meter-event identifier is durably
+// unique per event_name, so a re-send of the SAME period key (a same-day retry, or
+// usage that a prior out-of-cycle invoice already consumed) is rejected rather than
+// summed. Treating that rejection as a no-op is what makes the metering job safe to
+// re-run and is the guarantee that already-consumed usage is never billed twice.
+// Stripe returns this as a generic invalid_request_error with no machine code, so
+// we match the stable identifier-collision phrase in the message.
+func isDuplicateMeterEvent(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "already exists with identifier")
 }
 
 // EnsureGBMonthItem lazily adds the gb_month metered item to an EXISTING

@@ -40,19 +40,137 @@ func TestPeriodAlreadyMetered(t *testing.T) {
 	}
 }
 
+func TestPeriodReadyToMeter(t *testing.T) {
+	// A subscription whose current open period ends 2026-07-29 (close instant
+	// 06:28 UTC). The billable-day count (rec_day < 2026-07-29) is only complete
+	// once the period-end UTC day has arrived, and the closing meter event must be
+	// pushed on that day, before the close instant. periodReadyToMeter encodes that.
+	periodEnd := time.Date(2026, 7, 29, 6, 28, 33, 0, time.UTC)
+	cases := []struct {
+		name  string
+		now   time.Time
+		ready bool
+	}{
+		// Mid-period: end date is in the future, count not final -> NOT ready. This
+		// is the case the cursor-jump bug mis-handled by advancing anyway.
+		{name: "mid-period not ready", now: time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC), ready: false},
+		// Day before close: still not the period-end day -> NOT ready.
+		{name: "day before close not ready", now: time.Date(2026, 7, 28, 23, 59, 0, 0, time.UTC), ready: false},
+		// Period-end day, before the close instant: count is final, period still
+		// open -> READY. This is the only correct moment to report.
+		{name: "period-end day before close ready", now: time.Date(2026, 7, 29, 0, 30, 0, 0, time.UTC), ready: true},
+		// Period-end day, after the close instant (job ran late same day) -> still
+		// READY by date; the guard fires on the closed period exactly once.
+		{name: "period-end day after close ready", now: time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC), ready: true},
+	}
+	for _, c := range cases {
+		if got := periodReadyToMeter(periodEnd, c.now); got != c.ready {
+			t.Fatalf("%s: periodReadyToMeter=%v, want %v", c.name, got, c.ready)
+		}
+	}
+}
+
+// TestCursorDoesNotJumpOpenPeriod reproduces the cursor-jump billing bug and proves
+// the fix. It replicates meterAccount's guard sequence (periodAlreadyMetered ->
+// periodReadyToMeter -> day-count gate -> report -> advance cursor) against the fake
+// Stripe, stepping a single subscription through its first OPEN period and then its
+// close, asserting the closed period with real usage is metered EXACTLY ONCE.
+func TestCursorDoesNotJumpOpenPeriod(t *testing.T) {
+	ctx := context.Background()
+
+	// Subscription created 2026-06-29; first period [06-29, 07-29). The account
+	// records 5 billable recording-days during it. Stripe rolls current_period_end
+	// to 08-29 the instant the first period closes.
+	period1End := dateUTC(2026, 7, 29)
+	period2End := dateUTC(2026, 8, 29)
+
+	// cursor is the DB last_metered_period_end; nil = never metered (fresh sub).
+	var cursor *time.Time
+
+	// step models one daily sweep: it returns the open-period end Stripe reports as
+	// of `now`, runs the exact guard sequence, and returns whether a report fired and
+	// the period key it used. days is the billable count Stripe would sum for the
+	// reported period (our recording_billing_days count for [start,end)).
+	step := func(now, openPeriodEnd time.Time, days int) (reported bool, key string) {
+		f := &fakeMeteringStripe{periodStart: dateUTC(2026, 6, 29), periodEnd: openPeriodEnd}
+		if periodAlreadyMetered(f.periodEnd, cursor) {
+			return false, ""
+		}
+		if !periodReadyToMeter(f.periodEnd, now) {
+			return false, "" // open period: must NOT advance the cursor (the bug).
+		}
+		if shouldReportDays(days) {
+			_ = f.ReportRecordingDays(ctx, "cus_x", 1, meterPeriodKey(f.periodEnd), days)
+			reported = true
+			key = f.reports[0].periodKey
+		}
+		end := f.periodEnd
+		cursor = &end // advance cursor only after a ready (closed-day) period.
+		return reported, key
+	}
+
+	// Sweep 1: mid-period (2026-07-10), Stripe still reports the OPEN first period
+	// (end 07-29), 2 days accrued so far. The OLD code would report+advance here,
+	// sealing the period before close. The fix must NOT advance.
+	if rep, _ := step(dateUTC(2026, 7, 10), period1End, 2); rep {
+		t.Fatalf("mid-period sweep reported; want skip (period still open)")
+	}
+	if cursor != nil {
+		t.Fatalf("mid-period sweep advanced cursor to %v; want untouched (cursor-jump bug)", *cursor)
+	}
+
+	// Sweep 2: the period-end day (2026-07-29), before close. Stripe still reports
+	// the closing period (end 07-29); the full 5-day count is now final. The fix
+	// meters it here, exactly once, with the period-end month key.
+	rep, key := step(dateUTC(2026, 7, 29), period1End, 5)
+	if !rep {
+		t.Fatalf("period-end-day sweep did not report; the closed period would be silently $0-billed (the bug)")
+	}
+	if key != "2026-07-29" {
+		t.Fatalf("reported period key = %q, want 2026-07-29 (period-end date)", key)
+	}
+	if cursor == nil || !cursor.Equal(period1End) {
+		t.Fatalf("cursor = %v, want %v after metering the closed period", cursor, period1End)
+	}
+
+	// Sweep 3: after close Stripe reports the NEW open period (end 08-29). It is not
+	// yet its period-end day, so no report and no advance: the new period is billed
+	// only when ITS day arrives, never double-billing period 1.
+	if rep, _ := step(dateUTC(2026, 7, 30), period2End, 1); rep {
+		t.Fatalf("post-close sweep reported the new open period; want skip until its end day")
+	}
+	if !cursor.Equal(period1End) {
+		t.Fatalf("post-close sweep moved cursor to %v; want it to stay at period1 end", *cursor)
+	}
+
+	// Sweep 4: a same-day RE-RUN on the period-end day must be a no-op (cursor
+	// already at period1End => periodAlreadyMetered short-circuits before any report).
+	if rep, _ := step(dateUTC(2026, 7, 29), period1End, 5); rep {
+		t.Fatalf("same-period re-run reported again; want idempotent skip (double-bill risk)")
+	}
+}
+
 func TestMeterPeriodKey(t *testing.T) {
-	// Year-month of the period end, used as the per-period meter-event identifier
-	// component so re-sends within a period collapse to a single Stripe meter event.
+	// Period-end UTC date, the per-period meter-event identifier component, so
+	// re-sends within a period collapse to one Stripe meter event while two distinct
+	// periods (even two ending in the same month after a re-anchor) get distinct keys.
 	got := meterPeriodKey(time.Date(2026, 7, 24, 23, 59, 59, 0, time.UTC))
-	if got != "2026-07" {
-		t.Fatalf("meterPeriodKey = %q, want 2026-07", got)
+	if got != "2026-07-24" {
+		t.Fatalf("meterPeriodKey = %q, want 2026-07-24", got)
 	}
 	// Non-UTC input is normalized to UTC before formatting (period end just after
-	// UTC midnight, expressed in a -05:00 zone, still belongs to the UTC month).
+	// UTC midnight, expressed in a -05:00 zone, still belongs to the next UTC day).
 	loc := time.FixedZone("UTC-5", -5*3600)
 	gotTZ := meterPeriodKey(time.Date(2026, 7, 31, 20, 0, 0, 0, loc)) // == 2026-08-01T01:00Z
-	if gotTZ != "2026-08" {
-		t.Fatalf("meterPeriodKey(tz) = %q, want 2026-08", gotTZ)
+	if gotTZ != "2026-08-01" {
+		t.Fatalf("meterPeriodKey(tz) = %q, want 2026-08-01", gotTZ)
+	}
+	// Two distinct closing periods inside the SAME calendar month (an out-of-cycle
+	// re-anchor) must get DISTINCT keys so their identifiers cannot collide.
+	k1 := meterPeriodKey(time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC))
+	k2 := meterPeriodKey(time.Date(2026, 7, 29, 6, 28, 0, 0, time.UTC))
+	if k1 == k2 {
+		t.Fatalf("two July periods collapsed to one key %q; want distinct date keys", k1)
 	}
 }
 
@@ -126,8 +244,8 @@ func TestMeteringReportBranch(t *testing.T) {
 
 	// Fresh account, 7 billable days: one report with the period-end month key.
 	got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 7)
-	if len(got) != 1 || got[0] != (reportCall{"cus_x", 42, "2026-08", 7}) {
-		t.Fatalf("fresh 7-day report = %+v, want one {cus_x,42,2026-08,7}", got)
+	if len(got) != 1 || got[0] != (reportCall{"cus_x", 42, "2026-08-01", 7}) {
+		t.Fatalf("fresh 7-day report = %+v, want one {cus_x,42,2026-08-01,7}", got)
 	}
 
 	// Zero billable days: no report (empty invoice suppressed).
@@ -194,8 +312,8 @@ func TestGBMonthReportBranch(t *testing.T) {
 
 	// Fresh account, 31 snapshots => one report with the averaged decimal string.
 	got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 76_601_000_000, 31)
-	if len(got) != 1 || got[0] != (gbReportCall{"cus_x", 42, "2026-08", "2.471"}) {
-		t.Fatalf("fresh gb report = %+v, want one {cus_x,42,2026-08,2.471}", got)
+	if len(got) != 1 || got[0] != (gbReportCall{"cus_x", 42, "2026-08-01", "2.471"}) {
+		t.Fatalf("fresh gb report = %+v, want one {cus_x,42,2026-08-01,2.471}", got)
 	}
 
 	// No managed bytes (BYO / fully purged): no report.
