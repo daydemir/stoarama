@@ -1,12 +1,15 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -34,17 +37,7 @@ type clipDestination struct {
 // buildClipClient decrypts the destination secret and builds an r2 client for a
 // clip's bucket, mirroring handleRecordingUploadIntent.
 func (s *Server) buildClipClient(r *http.Request, d clipDestination) (*r2.Client, error) {
-	secret, err := s.secrets.Decrypt(d.secretEnc)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt destination secret: %w", err)
-	}
-	return r2.New(r.Context(), r2.Config{
-		AccessKey: d.accessKeyID,
-		SecretKey: string(secret),
-		Region:    d.region,
-		Bucket:    d.bucket,
-		Endpoint:  d.endpoint,
-	})
+	return s.buildClipClientCtx(r.Context(), d)
 }
 
 // handleAccountRecordingClipDownload presigns a GET against the clip's bucket so
@@ -70,12 +63,15 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 	}
 
 	var (
-		d        clipDestination
-		purgedAt *time.Time
+		d           clipDestination
+		purgedAt    *time.Time
+		recordingNm string
+		clipStartAt time.Time
 	)
 	err := s.pool.QueryRow(r.Context(), `
 		SELECT c.object_key, c.thumbnail_object_key, c.size_bytes, c.purged_at,
-		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc
+		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc,
+		       r.name, c.clip_start_at
 		FROM recording_clips c
 		JOIN recordings r ON r.id = c.recording_id
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
@@ -83,6 +79,7 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 	`, clipID, recordingID, principal.AccountID).Scan(
 		&d.objectKey, &d.thumbnailObjectKey, &d.sizeBytes, &purgedAt,
 		&d.region, &d.bucket, &d.endpoint, &d.accessKeyID, &d.secretEnc,
+		&recordingNm, &clipStartAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "clip not found")
@@ -102,7 +99,17 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("build destination client: %v", err))
 		return
 	}
-	url, err := client.PresignGet(r.Context(), d.objectKey, s.cfg.R2SignGetTTL)
+
+	// disposition=attachment (default) forces a real file download with a sensible
+	// name; disposition=inline presigns plain so the browser plays the clip in a
+	// new tab.
+	var url string
+	if strings.TrimSpace(r.URL.Query().Get("disposition")) == "inline" {
+		url, err = client.PresignGet(r.Context(), d.objectKey, s.cfg.R2SignGetTTL)
+	} else {
+		filename := buildClipDownloadFilename(recordingNm, recordingID, clipStartAt, d.objectKey)
+		url, err = client.PresignGetDownload(r.Context(), d.objectKey, filename, s.cfg.R2SignGetTTL)
+	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("presign download: %v", err))
 		return
@@ -113,6 +120,43 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		"size_bytes":     d.sizeBytes,
 		"expires_in_sec": int(s.cfg.R2SignGetTTL.Seconds()),
 	})
+}
+
+// buildClipDownloadFilename derives a stable, safe save-as name for a clip:
+// "<slug(recording-name)|recording-<id>>-<UTC ts>.<ext>". The extension is taken
+// from the object key (default .mp4). Used for the attachment Content-Disposition.
+func buildClipDownloadFilename(recordingName string, recordingID int64, clipStartAt time.Time, objectKey string) string {
+	slug := slugifyName(recordingName)
+	if slug == "" {
+		slug = fmt.Sprintf("recording-%d", recordingID)
+	}
+	ext := ".mp4"
+	if i := strings.LastIndex(objectKey, "."); i >= 0 {
+		if e := objectKey[i:]; len(e) <= 6 && !strings.ContainsAny(e, "/ ") {
+			ext = e
+		}
+	}
+	return fmt.Sprintf("%s-%s%s", slug, clipStartAt.UTC().Format("20060102T150405Z"), ext)
+}
+
+// slugifyName lowercases a name and keeps [a-z0-9-], collapsing other runs to a
+// single hyphen, so it is a safe filename component.
+func slugifyName(name string) string {
+	var b strings.Builder
+	prevHyphen := false
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevHyphen = false
+		default:
+			if !prevHyphen && b.Len() > 0 {
+				b.WriteByte('-')
+				prevHyphen = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // handleAccountRecordingClipDelete deletes one clip's object(s) from the user's
@@ -327,6 +371,268 @@ func (s *Server) handleAccountRecordingClipsDeleteAll(w http.ResponseWriter, r *
 		}
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+}
+
+// clipZipRequest selects the page of clips to archive. It mirrors the clips-list
+// pagination so "Download all" zips exactly the page the UI is showing.
+type clipZipRequest struct {
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+// clipZipRow carries one clip's location + metadata for the zip builder, grouped
+// later by storage destination so a single r2 client opens all of a destination's
+// objects.
+type clipZipRow struct {
+	row  dayZipSegmentRow
+	dest clipDestination
+}
+
+// handleAccountRecordingClipsZip archives one page (<=dayZipMaxItems) of a
+// recording's clips into a STORE zip with an in-zip manifest.csv
+// (id,start,end,duration,size,object_key), reusing the day-zip job machinery and
+// builder. The page is selected by limit/offset matching the clips list. The
+// assembled zip is streamed into the operator export bucket (s.r2) and delivered
+// via the same handleDayZipGet polling endpoint.
+func (s *Server) handleAccountRecordingClipsZip(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.secrets == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
+		return
+	}
+	if s.r2 == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "export storage is not configured")
+		return
+	}
+	recordingID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req clipZipRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	var recordingName string
+	err := s.pool.QueryRow(r.Context(), `
+		SELECT name FROM recordings WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, recordingID, principal.AccountID).Scan(&recordingName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+
+	// Load the page of non-purged clips with their destination snapshot, newest
+	// fire first (same order as the clips list).
+	rows, err := s.pool.Query(r.Context(), `
+		SELECT c.id, c.clip_start_at, c.clip_end_at, c.duration_ms, c.size_bytes, c.object_key,
+		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc
+		FROM recording_clips c
+		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
+		WHERE c.recording_id=$1 AND c.purged_at IS NULL
+		ORDER BY c.fire_at DESC
+		LIMIT $2 OFFSET $3
+	`, recordingID, limit, offset)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list clips: %v", err))
+		return
+	}
+	defer rows.Close()
+	var clips []clipZipRow
+	var totalBytes int64
+	for rows.Next() {
+		var (
+			z       clipZipRow
+			clipID  int64
+			startAt time.Time
+			endAt   time.Time
+		)
+		if err := rows.Scan(&clipID, &startAt, &endAt, &z.row.DurationMs, &z.row.SizeBytes, &z.row.ObjectKey,
+			&z.dest.region, &z.dest.bucket, &z.dest.endpoint, &z.dest.accessKeyID, &z.dest.secretEnc); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
+			return
+		}
+		end := endAt.UTC()
+		z.row.ID = clipID
+		z.row.SegmentStartAt = startAt.UTC()
+		z.row.ClipEndAt = &end
+		z.row.MIMEType = "video/mp4"
+		totalBytes += z.row.SizeBytes
+		clips = append(clips, z)
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate clips: %v", err))
+		return
+	}
+	if len(clips) == 0 {
+		util.WriteError(w, http.StatusNotFound, "no clips on this page")
+		return
+	}
+	if totalBytes > dayZipMaxBytes {
+		util.WriteError(w, http.StatusBadRequest, "page too large")
+		return
+	}
+
+	// 1-job lock: non-blocking try-acquire (shared with the public day-zip system).
+	select {
+	case s.dayZipSlot <- struct{}{}:
+	default:
+		util.WriteError(w, http.StatusConflict, "busy")
+		return
+	}
+
+	slug := slugifyName(recordingName)
+	if slug == "" {
+		slug = fmt.Sprintf("recording-%d", recordingID)
+	}
+	jobID := uuid.NewString()
+	zipKey := fmt.Sprintf("exports/account/%d/recording-%d-%s.zip", principal.AccountID, recordingID, jobID)
+	s.setDayZipJob(&dayZipJob{
+		ID:        jobID,
+		StreamID:  recordingID,
+		Status:    "pending",
+		ZipKey:    zipKey,
+		ItemCount: len(clips),
+		SizeBytes: totalBytes,
+	})
+	go s.runClipsZipJob(jobID, slug, recordingID, clips)
+
+	util.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": jobID,
+		"status": "pending",
+	})
+}
+
+// runClipsZipJob streams the page's clips (read from the user's destination
+// buckets) into a zip uploaded to the operator export bucket, reusing buildDayZip
+// and the dayZipJob status machinery. Clips are grouped by destination so each
+// group opens with its own r2 client; within a group buildDayZip handles the
+// streaming + manifest.
+func (s *Server) runClipsZipJob(jobID, slug string, recordingID int64, clips []clipZipRow) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	defer func() { <-s.dayZipSlot }()
+
+	startedAt := time.Now().UTC()
+	s.updateDayZipJob(jobID, func(job *dayZipJob) {
+		job.Status = "running"
+		job.StartedAt = &startedAt
+		job.ErrorText = ""
+	})
+	job, ok := s.getDayZipJob(jobID)
+	if !ok {
+		return
+	}
+
+	failJob := func(format string, args ...any) {
+		finishedAt := time.Now().UTC()
+		s.updateDayZipJob(jobID, func(j *dayZipJob) {
+			j.Status = "error"
+			j.ErrorText = fmt.Sprintf(format, args...)
+			j.FinishedAt = &finishedAt
+		})
+	}
+
+	// Group rows by destination snapshot so one client opens all of a group's
+	// objects; build a per-key->client map for the open func.
+	type destClient struct {
+		client *r2.Client
+		dest   clipDestination
+	}
+	clients := make(map[string]*destClient)
+	rows := make([]dayZipSegmentRow, 0, len(clips))
+	keyClient := make(map[string]*r2.Client, len(clips))
+	for _, c := range clips {
+		gk := c.dest.endpoint + "\x00" + c.dest.bucket + "\x00" + c.dest.accessKeyID
+		dc, present := clients[gk]
+		if !present {
+			client, err := s.buildClipClientCtx(ctx, c.dest)
+			if err != nil {
+				failJob("build destination client: %v", err)
+				return
+			}
+			dc = &destClient{client: client, dest: c.dest}
+			clients[gk] = dc
+		}
+		keyClient[c.row.ObjectKey] = dc.client
+		rows = append(rows, c.row)
+	}
+
+	open := func(ctx context.Context, key string) (io.ReadCloser, error) {
+		client, ok := keyClient[key]
+		if !ok {
+			return nil, fmt.Errorf("no client for object %s", key)
+		}
+		return client.Open(ctx, key)
+	}
+
+	// Stream zip directly from source reads -> pipe -> operator export bucket, so
+	// the whole archive is never materialized (mirrors runDayZipJob).
+	pr, pw := io.Pipe()
+	buildDone := make(chan error, 1)
+	go func() {
+		_, buildErr := buildDayZip(ctx, pw, rows, slug, recordingID, open, func(n int) {
+			s.updateDayZipJob(jobID, func(j *dayZipJob) { j.Processed = n })
+		})
+		_ = pw.CloseWithError(buildErr)
+		buildDone <- buildErr
+	}()
+
+	_, upErr := s.r2.PutMultipart(ctx, job.ZipKey, "application/zip", pr)
+	_ = pr.CloseWithError(upErr)
+	buildErr := <-buildDone
+
+	if buildErr != nil {
+		failJob("%v", buildErr)
+		return
+	}
+	if upErr != nil {
+		failJob("upload archive: %v", upErr)
+		return
+	}
+
+	finishedAt := time.Now().UTC()
+	s.updateDayZipJob(jobID, func(j *dayZipJob) {
+		j.Status = "complete"
+		j.FinishedAt = &finishedAt
+		j.ErrorText = ""
+	})
+}
+
+// buildClipClientCtx is buildClipClient without the *http.Request, for use from a
+// background job that owns its own context.
+func (s *Server) buildClipClientCtx(ctx context.Context, d clipDestination) (*r2.Client, error) {
+	secret, err := s.secrets.Decrypt(d.secretEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt destination secret: %w", err)
+	}
+	return r2.New(ctx, r2.Config{
+		AccessKey: d.accessKeyID,
+		SecretKey: string(secret),
+		Region:    d.region,
+		Bucket:    d.bucket,
+		Endpoint:  d.endpoint,
+	})
 }
 
 type clipTransferRequest struct {

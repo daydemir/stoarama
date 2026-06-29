@@ -415,13 +415,18 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Page the list so a recording with hundreds of clips is browsable a page at a
+	// time. limit defaults to 100 and is clamped to 1..500; offset defaults to 0.
+	limit := parseIntQuery(r, "limit", 100, 1, 500)
+	offset := parseIntQuery(r, "offset", 0, 0, 1<<30)
+
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, object_key, storage_destination_id, purged_at
 		FROM recording_clips
 		WHERE recording_id=$1
 		ORDER BY fire_at DESC
-		LIMIT 200
-	`, id)
+		LIMIT $2 OFFSET $3
+	`, id, limit, offset)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list clips: %v", err))
 		return
@@ -460,7 +465,12 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate clips: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "total": total})
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":  items,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (s *Server) handleAccountRecordingPause(w http.ResponseWriter, r *http.Request) {

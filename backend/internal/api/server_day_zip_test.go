@@ -90,6 +90,42 @@ func TestBuildDayZipManifestNonEmptyWithEntries(t *testing.T) {
 	}
 }
 
+func TestBuildDayZipClipManifestSchema(t *testing.T) {
+	start := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	end := start.Add(15 * time.Second)
+	rows := []dayZipSegmentRow{
+		{ID: 42, SegmentStartAt: start, ClipEndAt: &end, DurationMs: 15000, ObjectKey: "clips/42.mp4", MIMEType: "video/mp4", SizeBytes: 5},
+	}
+
+	var buf bytes.Buffer
+	processed, err := buildDayZip(context.Background(), &buf, rows, "seoul-crosswalk", 1, fakeOpener([]byte("hello")), nil)
+	if err != nil {
+		t.Fatalf("buildDayZip: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	manifest, ok := readZipEntry(t, buf.Bytes(), "manifest.csv")
+	if !ok {
+		t.Fatal("manifest.csv not present in archive")
+	}
+	text := string(manifest)
+	if !strings.Contains(text, "id,filename,start,end,duration_ms,size_bytes,object_key,status") {
+		t.Fatalf("clip manifest missing header row: %q", text)
+	}
+	if !strings.Contains(text, "clips/42.mp4") {
+		t.Fatalf("clip manifest missing object_key: %q", text)
+	}
+	if !strings.Contains(text, end.Format(time.RFC3339Nano)) {
+		t.Fatalf("clip manifest missing end time: %q", text)
+	}
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("clip manifest line count = %d, want 2; content=%q", len(lines), text)
+	}
+}
+
 func TestBuildDayZipEmptyDay(t *testing.T) {
 	var buf bytes.Buffer
 	processed, err := buildDayZip(context.Background(), &buf, nil, "teststream", 7, fakeOpener(nil), nil)

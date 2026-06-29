@@ -81,6 +81,23 @@ func (c *Client) PresignGet(ctx context.Context, key string, ttl time.Duration) 
 	return out.URL, nil
 }
 
+// PresignGetDownload presigns a GET that sets Content-Disposition: attachment so
+// the browser saves the object as filename instead of rendering it inline. The
+// filename is quoted into the response-content-disposition query param, honored
+// by R2/S3. filename should already be a sensible basename (no path separators).
+func (c *Client) PresignGetDownload(ctx context.Context, key, filename string, ttl time.Duration) (string, error) {
+	disposition := fmt.Sprintf("attachment; filename=%q", filename)
+	out, err := c.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket:                     aws.String(c.bucket),
+		Key:                        aws.String(key),
+		ResponseContentDisposition: aws.String(disposition),
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", fmt.Errorf("presign download %s: %w", key, err)
+	}
+	return out.URL, nil
+}
+
 func (c *Client) PresignPut(ctx context.Context, key, contentType string, ttl time.Duration) (string, error) {
 	in := &s3.PutObjectInput{
 		Bucket: aws.String(c.bucket),

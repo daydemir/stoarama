@@ -125,6 +125,17 @@
     button.secondary:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); }
     button.danger { background: transparent; color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
     button.danger:hover { background: color-mix(in srgb, var(--err) 12%, transparent); }
+    /* Anchor styled as a button, for "View clips" -> /recordings/{id}. */
+    a.btn-link { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border); font-weight: 600; text-decoration: none; cursor: pointer; }
+    a.btn-link.secondary { background: transparent; color: var(--text); }
+    a.btn-link.secondary:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); text-decoration: none; }
+    /* Dedicated clip-management page. */
+    .clip-page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .clip-pager { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0; }
+    .clip-pager button { width: auto; min-width: 0; min-height: 32px; padding: 6px 14px; }
+    .clip-pager .clip-pager-label { color: var(--muted); font-size: 13px; }
+    .clip-page-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 8px 0 16px; }
+    .clip-page-actions button { width: auto; min-width: 0; min-height: 32px; padding: 6px 14px; }
     .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
     .button-row > * { width: auto; min-width: 120px; }
     .field { margin-bottom: 14px; }
@@ -279,6 +290,10 @@
 
     <!-- Signed-in app -->
     <div id="signedIn" class="hidden">
+      <!-- Dedicated per-recording clip-management page (shown on /recordings/{id}).
+           When present, the list/composer below are hidden. -->
+      <div id="clipPage" class="hidden"></div>
+
       <!-- Cost ledger -->
       <div id="ledger" class="ledger hidden"></div>
 
@@ -407,7 +422,7 @@
         </div>
 
         <!-- Projected monthly cost for this configuration (honest estimate) -->
-        <div class="field" id="estimateField" style="margin-bottom:0;">
+        <div class="field" id="estimateField">
           <label>Estimated monthly cost</label>
           <div id="costEstimate" class="preview"></div>
           <div id="costEstimateNote" class="hint"></div>
@@ -505,6 +520,7 @@
       cardBanner: document.getElementById('cardBanner'),
       cardBannerBtn: document.getElementById('cardBannerBtn'),
       heroCopy: document.getElementById('heroCopy'),
+      clipPage: document.getElementById('clipPage'),
       cards: document.getElementById('cards'),
       newRecRow: document.getElementById('newRecRow'),
       newRecBtn: document.getElementById('newRecBtn'),
@@ -818,22 +834,93 @@
       }
     }
 
-    // Number of UTC days in the CURRENT calendar month that this recording's
-    // window overlaps, clamped to [today, month end]. Open-ended -> through month
-    // end. This is the count of days that could each be a billable record-day.
+    // Billable record-days for a representative FULL month at the chosen cadence:
+    // the number of distinct days, in a rolling 30-day window starting today (or at
+    // the recording's start, whichever is later), on which the schedule fires at
+    // least once. A daily or sub-daily cadence fires every day (~30 days/mo); a
+    // weekly cadence fires on ~4 days. Capped by the recording's own start->stop
+    // span when that span is shorter than the 30-day window, so a short recording is
+    // not over-forecast. This forecasts the cadence, not the remaining days of the
+    // current partial calendar month.
     function estActiveDaysThisMonth() {
       const now = new Date();
-      const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-      const w = compiledWindow();                       // existing helper, lines 1206-1210
+      const w = compiledWindow();                       // existing helper
       const start = new Date(w.startISO);
-      const end = w.endISO ? new Date(w.endISO) : monthEnd;
+      const end = w.endISO ? new Date(w.endISO) : null;
       const from = start.getTime() > now.getTime() ? start : now;
-      const to = end.getTime() < monthEnd.getTime() ? end : monthEnd;
-      if (to.getTime() < from.getTime()) return 0;
       const dayMs = 86400000;
-      const d0 = Math.floor(from.getTime() / dayMs);
-      const d1 = Math.floor(to.getTime() / dayMs);
-      return Math.max(0, d1 - d0 + 1);
+      // Window length in days: 30 by default, shortened to the start->stop span.
+      let windowDays = 30;
+      if (end) {
+        if (end.getTime() < from.getTime()) return 0;
+        const d0 = Math.floor(from.getTime() / dayMs);
+        const d1 = Math.floor(end.getTime() / dayMs);
+        windowDays = Math.min(30, Math.max(0, d1 - d0 + 1));
+      }
+      if (windowDays <= 0) return 0;
+      return estFireDaysInWindow(from, windowDays);
+    }
+
+    // Count distinct days, over `windowDays` consecutive days starting at `from`, on
+    // which the active schedule fires at least once. Preset cadences (daily and all
+    // sub-daily: 15m/30m/hourly/4h) fire every day; custom cron is evaluated from its
+    // day-of-week/day-of-month fields so a weekly cron yields ~4 days, etc.
+    function estFireDaysInWindow(from, windowDays) {
+      const runsPerDay = estRunsPerDay();
+      if (runsPerDay !== null) return windowDays; // daily + all sub-daily fire daily
+      const c = compiledSchedule();
+      if (!c.cron) return windowDays;              // unknown -> assume daily (safe upper bound)
+      // Cron is "minute hour day-of-month month day-of-week".
+      const fields = c.cron.split(' ');
+      if (fields.length !== 5) return windowDays;
+      const dom = fields[2];                       // day of month
+      const dow = fields[4];                       // day of week (0-6, Sun=0)
+      // Wildcard day fields => fires every day.
+      if ((dom === '*' || dom === '?') && (dow === '*' || dow === '?')) return windowDays;
+      const dayMs = 86400000;
+      let count = 0;
+      const base = Math.floor(from.getTime() / dayMs) * dayMs;
+      for (let i = 0; i < windowDays; i += 1) {
+        const d = new Date(base + i * dayMs);
+        if (cronDayMatches(dom, dow, d.getUTCDate(), d.getUTCDay())) count += 1;
+      }
+      return count;
+    }
+
+    // Whether a cron day-of-month/day-of-week pair admits the given date. Vixie cron
+    // rule: when BOTH dom and dow are restricted, a day matches if EITHER matches;
+    // when one is wildcard, only the other constrains.
+    function cronDayMatches(dom, dow, dayOfMonth, dayOfWeek) {
+      const domStar = dom === '*' || dom === '?';
+      const dowStar = dow === '*' || dow === '?';
+      const domHit = domStar || cronFieldMatches(dom, dayOfMonth, 1, 31);
+      const dowHit = dowStar || cronFieldMatches(dow, dayOfWeek % 7, 0, 7);
+      if (!domStar && !dowStar) return domHit || dowHit;
+      return domHit && dowHit;
+    }
+
+    // Match a single cron field value against a comma/range/step expression, e.g.
+    // "1,3,5", "0-4", "*/2". Returns false on anything it cannot parse.
+    function cronFieldMatches(field, value, lo, hi) {
+      for (const part of String(field).split(',')) {
+        const stepM = /^(.+)\/(\d+)$/.exec(part);
+        let base = part;
+        let step = 1;
+        if (stepM) { base = stepM[1]; step = Number(stepM[2]) || 1; }
+        let a = lo;
+        let b = hi;
+        if (base !== '*') {
+          const rangeM = /^(\d+)-(\d+)$/.exec(base);
+          if (rangeM) { a = Number(rangeM[1]); b = Number(rangeM[2]); }
+          else if (/^\d+$/.test(base)) { a = Number(base); b = a; }
+          else continue;
+        }
+        for (let v = a; v <= b; v += step) {
+          // dow 7 == 0 (Sunday); normalize comparison for the week field.
+          if (v === value || (hi === 7 && v % 7 === value % 7)) return true;
+        }
+      }
+      return false;
     }
 
     // Returns the cost-estimate model for the current composer config, or null
@@ -875,18 +962,18 @@
           ? 'Custom schedules are estimated after you save.' : '';
         return;
       }
-      const usd = (c) => `$${(Number(c || 0) / 100).toFixed(2)}`;
+      const usd = (c) => usdCents(c);
       const parts = [
         `<span class="muted">~</span><b>${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
         `<span class="muted"> &middot; ${m.activeDays} record-day${m.activeDays === 1 ? '' : 's'} × $${(m.dayRate / 100).toFixed(2)} = ${usd(m.recordDayCents)}</span>`,
       ];
-      if (m.managed && m.storageCents > 0) {
-        parts.push(`<span class="muted"> + ~${m.avgGB.toFixed(2)} GB-mo × $${(m.gbRate / 100).toFixed(2)} = ${usd(m.storageCents)}</span>`);
+      if (m.managed && m.avgGB > 0) {
+        parts.push(`<span class="muted"> + ~${m.avgGB.toFixed(3)} GB-mo × $${(m.gbRate / 100).toFixed(2)} = ${usd(m.storageCents)}</span>`);
       }
       els.costEstimate.innerHTML = parts.join('');
       els.costEstimateNote.textContent = m.managed
-        ? `Estimate only. Storage assumes ~${EST_BITRATE_MBPS} Mbps video; actual clip sizes vary. Billed monthly in arrears.`
-        : `Estimate only. Your own bucket = no storage charge. Billed monthly in arrears.`;
+        ? `Estimate only, assuming ~${EST_BITRATE_MBPS} Mbps video; actual clip sizes vary. Storage is $${(m.gbRate / 100).toFixed(2)} per GB per month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that. Billed monthly in arrears.`
+        : `Estimate only. With your own bucket there is no storage charge. Billed monthly in arrears.`;
     }
 
     // Updates the preview line + the inline gap/clip pre-flight warning, and
@@ -1399,6 +1486,14 @@
       return (Number(cents || 0) / 100).toFixed(2);
     }
 
+    // Money with a "$" prefix that never renders a real-but-tiny charge as the
+    // confusing "$0.00": a non-zero amount below one cent shows as "<$0.01".
+    function usdCents(cents) {
+      const c = Number(cents || 0);
+      if (c > 0 && c < 1) return '<$0.01';
+      return `$${(c / 100).toFixed(2)}`;
+    }
+
     function renderLedger() {
       const b = state.billing || {};
       if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
@@ -1406,13 +1501,13 @@
       const days = Number(b.recording_days_this_month || 0);
       if (days >= 1) {
         const noun = days === 1 ? 'recording-day' : 'recording-days';
-        lines.push(`<b>${days} ${noun} this month</b> &middot; est. $${formatUSD(b.estimated_amount_cents)}`);
+        lines.push(`<b>${days} ${noun} this month</b> &middot; est. ${usdCents(b.estimated_amount_cents)}`);
       }
       // Managed storage line: month-to-date average GB-month from /billing. Hidden
       // when the account has no managed data (avg = 0).
       const gb = Number(b.storage_gb_month_avg || 0);
       if (gb > 0) {
-        lines.push(`<b>${gb.toFixed(3)} GB-month storage</b> &middot; est. $${formatUSD(b.estimated_storage_amount_cents)}`);
+        lines.push(`<b>${gb.toFixed(3)} GB-month storage</b> &middot; est. ${usdCents(b.estimated_storage_amount_cents)}`);
       }
       if (lines.length === 0) { els.ledger.classList.add('hidden'); return; }
       els.ledger.innerHTML = lines.join('<br/>');
@@ -1511,7 +1606,7 @@
       } else {
         actions = `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
       }
-      actions += `<button type="button" class="secondary" data-clips="${id}">View clips</button>`;
+      actions += `<a class="btn-link secondary" href="/recordings/${id}">View clips</a>`;
 
       const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
         ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
@@ -1548,7 +1643,6 @@
           ${errLine}
           ${blocked}
           <div class="card-actions">${actions}</div>
-          <div class="clip-detail hidden" data-clipdetail="${id}"></div>
         </div>`;
     }
 
@@ -1585,8 +1679,6 @@
         b.addEventListener('click', () => mutateRecording(b.getAttribute('data-resume'), 'resume')));
       els.cards.querySelectorAll('button[data-delete]').forEach((b) =>
         b.addEventListener('click', () => deleteRecording(b)));
-      els.cards.querySelectorAll('button[data-clips]').forEach((b) =>
-        b.addEventListener('click', () => toggleClipDetail(b.getAttribute('data-clips'))));
       els.cards.querySelectorAll('button[data-addcard]').forEach((b) =>
         b.addEventListener('click', () => addCardFromCard(b)));
     }
@@ -1632,23 +1724,6 @@
       return bt ? `${a} – ${bt}` : a;
     }
 
-    // Expand/collapse a card's clip-periods panel, loading from the new endpoint on
-    // first open.
-    async function toggleClipDetail(idRaw) {
-      const id = String(idRaw || '').trim();
-      const panel = els.cards.querySelector(`[data-clipdetail="${id}"]`);
-      if (!panel) return;
-      if (!panel.classList.contains('hidden')) {
-        panel.classList.add('hidden');
-        return;
-      }
-      panel.classList.remove('hidden');
-      if (panel.getAttribute('data-loaded') === '1') return;
-      panel.innerHTML = `<div class="clip-summary">Loading clips...</div>`;
-      await reloadClipDetail(panel, id);
-      panel.setAttribute('data-loaded', '1');
-    }
-
     // Fetch + render a recording's clip panel; used on first open and after any
     // per-clip or bulk delete so the list reflects the new purged state.
     async function reloadClipDetail(panel, id) {
@@ -1658,6 +1733,37 @@
       } catch (err) {
         panel.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
       }
+    }
+
+    // Markup for one clip row, shared by the inline card panel and the dedicated
+    // clip page. View plays the clip inline; Download forces a file save; Send to my
+    // S3 copies it into another of the account's buckets; Delete tombstones it.
+    // Eligible transfer targets are the account's verified destinations other than
+    // the clip's own source (a copy onto itself is rejected by the API anyway).
+    function clipRowHTML(c, recId) {
+      const cid = Number(c.id);
+      const purged = c.purged === true;
+      const sourceDestId = Number(c.storage_destination_id || 0);
+      const targets = (state.destinations || []).filter((d) => Number(d.id) !== sourceDestId);
+      const transferBtn = (!purged && targets.length > 0)
+        ? `<button type="button" class="secondary" data-cliptransfer="${recId}:${cid}:${sourceDestId}">Send to my S3</button>`
+        : '';
+      const actions = purged
+        ? `<span>deleted</span>`
+        : `<div class="clip-row-actions">`
+          + `<button type="button" class="secondary" data-clipview="${recId}:${cid}">View</button>`
+          + `<button type="button" class="secondary" data-clipdownload="${recId}:${cid}">Download</button>`
+          + transferBtn
+          + `<button type="button" class="danger" data-clipdelete="${recId}:${cid}">Delete</button>`
+          + `</div>`;
+      return `
+        <div class="clip-row${purged ? ' purged' : ''}" data-cliprow="${cid}">
+          <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
+          <span>${escapeHTML(formatDuration(c.duration_ms))}</span>
+          <span>${escapeHTML(formatBytes(c.size_bytes))}</span>
+          ${actions}
+        </div>
+        <div class="clip-xfer hidden" data-clipxfer="${cid}"></div>`;
     }
 
     function renderClipDetail(panel, recId, payload) {
@@ -1678,33 +1784,7 @@
       const bulk = liveCount > 0
         ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
         : '';
-      // Eligible transfer targets are this account's verified destinations other
-      // than the clip's own source destination (a copy onto itself is rejected by
-      // the API anyway). state.destinations is loaded at init.
-      const rows = items.map((c) => {
-        const cid = Number(c.id);
-        const purged = c.purged === true;
-        const sourceDestId = Number(c.storage_destination_id || 0);
-        const targets = (state.destinations || []).filter((d) => Number(d.id) !== sourceDestId);
-        const transferBtn = (!purged && targets.length > 0)
-          ? `<button type="button" class="secondary" data-cliptransfer="${recId}:${cid}:${sourceDestId}">Send to my S3</button>`
-          : '';
-        const actions = purged
-          ? `<span>deleted</span>`
-          : `<div class="clip-row-actions">`
-            + `<button type="button" class="secondary" data-clipdownload="${recId}:${cid}">Download</button>`
-            + transferBtn
-            + `<button type="button" class="danger" data-clipdelete="${recId}:${cid}">Delete</button>`
-            + `</div>`;
-        return `
-        <div class="clip-row${purged ? ' purged' : ''}" data-cliprow="${cid}">
-          <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
-          <span>${escapeHTML(formatDuration(c.duration_ms))}</span>
-          <span>${escapeHTML(formatBytes(c.size_bytes))}</span>
-          ${actions}
-        </div>
-        <div class="clip-xfer hidden" data-clipxfer="${cid}"></div>`;
-      }).join('');
+      const rows = items.map((c) => clipRowHTML(c, recId)).join('');
       const eligibleTargets = (state.destinations || []).length;
       const note = eligibleTargets > 0
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
@@ -1714,7 +1794,162 @@
       void reloadTransfers(panel, recId);
     }
 
+    // ---- Dedicated clip-management page (/recordings/{id}) ----
+
+    const CLIP_PAGE_SIZE = 100;
+    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false };
+
+    // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
+    // switch the view into the dedicated clip page.
+    function clipPageRecId() {
+      const m = /^\/recordings\/(\d+)\/?$/.exec(window.location.pathname || '');
+      return m ? Number(m[1]) : 0;
+    }
+
+    // Render the full-page clip-management view for one recording. Loads the
+    // recording header (name) once, then the requested page of clips. Reuses
+    // clipRowHTML / wireClipActions / reloadTransfers so each row keeps View +
+    // Download + Send-to-S3 + Delete and live transfer status.
+    async function loadClipPage(page) {
+      const recId = clipPageState.recId;
+      const root = els.clipPage;
+      clipPageState.page = Math.max(0, Number(page) || 0);
+      clipPageState.loading = true;
+      if (!clipPageState.recName) {
+        try {
+          const rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}`);
+          clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
+        } catch (_) {
+          clipPageState.recName = `Recording #${recId}`;
+        }
+      }
+      root.innerHTML = `<div class="clip-summary">Loading clips...</div>`;
+      let payload;
+      try {
+        const offset = clipPageState.page * CLIP_PAGE_SIZE;
+        payload = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips?limit=${CLIP_PAGE_SIZE}&offset=${offset}`);
+      } catch (err) {
+        root.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+        clipPageState.loading = false;
+        return;
+      }
+      clipPageState.total = Number(payload.total || 0);
+      renderClipPage(payload);
+      clipPageState.loading = false;
+    }
+
+    function renderClipPage(payload) {
+      const root = els.clipPage;
+      const recId = clipPageState.recId;
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      const total = clipPageState.total;
+      const pageCount = Math.max(1, Math.ceil(total / CLIP_PAGE_SIZE));
+      const page = clipPageState.page;
+      const first = total === 0 ? 0 : page * CLIP_PAGE_SIZE + 1;
+      const last = page * CLIP_PAGE_SIZE + items.length;
+
+      const header = `
+        <div class="clip-page-head">
+          <div>
+            <div class="eyebrow">Clips</div>
+            <h2 style="margin:2px 0 4px;">${escapeHTML(clipPageState.recName)}</h2>
+            <div class="clip-summary" style="margin:0;"><b>${total}</b> clip${total === 1 ? '' : 's'} total${total > 0 ? ` &middot; showing ${first}-${last}` : ''}</div>
+          </div>
+          <a class="btn-link secondary" href="/recordings">Back to recordings</a>
+        </div>`;
+
+      if (items.length === 0) {
+        root.innerHTML = header + `<div class="clip-summary">No clips on this page.</div>`;
+        wireClipPageNav(root);
+        return;
+      }
+
+      const liveCount = items.filter((c) => c.purged !== true).length;
+      const pageActions = `
+        <div class="clip-page-actions">
+          ${liveCount > 0 ? `<button type="button" class="secondary" data-clipzip="${recId}">Download all (this page) as ZIP</button>` : ''}
+          ${liveCount > 0 ? `<button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button>` : ''}
+          <span class="clip-pager-label" data-zipstatus></span>
+        </div>`;
+
+      const rows = items.map((c) => clipRowHTML(c, recId)).join('');
+      const eligibleTargets = (state.destinations || []).length;
+      const note = eligibleTargets > 0
+        ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
+        : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="/recordings">connect a bucket first</a> from the recordings page.</div>`;
+
+      root.innerHTML = header + pageActions + `<div class="clip-list">${rows}</div>` + note + clipPagerHTML(page, pageCount);
+      wireClipActions(root);
+      wireClipPageNav(root);
+      void reloadTransfers(root, recId);
+    }
+
+    function clipPagerHTML(page, pageCount) {
+      if (pageCount <= 1) return '';
+      return `
+        <div class="clip-pager">
+          <button type="button" class="secondary" data-clippage="prev"${page <= 0 ? ' disabled' : ''}>Previous</button>
+          <span class="clip-pager-label">Page ${page + 1} of ${pageCount}</span>
+          <button type="button" class="secondary" data-clippage="next"${page >= pageCount - 1 ? ' disabled' : ''}>Next</button>
+        </div>`;
+    }
+
+    function wireClipPageNav(root) {
+      root.querySelectorAll('button[data-clippage]').forEach((b) =>
+        b.addEventListener('click', () => {
+          if (clipPageState.loading) return;
+          const dir = b.getAttribute('data-clippage');
+          loadClipPage(dir === 'prev' ? clipPageState.page - 1 : clipPageState.page + 1);
+        }));
+      root.querySelectorAll('button[data-clipzip]').forEach((b) =>
+        b.addEventListener('click', () => downloadClipPageZip(b)));
+    }
+
+    // POST the current page's clips to the zip endpoint, then poll the shared
+    // day-zip job until complete and navigate to the presigned zip URL. The in-zip
+    // manifest.csv (id,filename,start,end,duration_ms,size_bytes,object_key,status)
+    // is produced server-side.
+    async function downloadClipPageZip(btn) {
+      const recId = clipPageState.recId;
+      const statusEl = els.clipPage.querySelector('[data-zipstatus]');
+      const setMsg = (t) => { if (statusEl) statusEl.textContent = t; };
+      btn.disabled = true;
+      setMsg('Preparing ZIP...');
+      try {
+        const offset = clipPageState.page * CLIP_PAGE_SIZE;
+        const job = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/zip`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ limit: CLIP_PAGE_SIZE, offset }),
+        });
+        const jobId = job && job.job_id;
+        if (!jobId) throw new Error('No job id returned.');
+        for (let i = 0; i < 600; i += 1) {
+          await sleep(1500);
+          const st = await fetchJSON(`/api/v1/account/clips-zip/${encodeURIComponent(jobId)}`);
+          const status = String(st.status || '');
+          if (status === 'complete' && st.download_url) {
+            setMsg('ZIP ready.');
+            window.location.assign(st.download_url);
+            btn.disabled = false;
+            return;
+          }
+          if (status === 'error') throw new Error(st.error || 'ZIP failed.');
+          const n = Number(st.processed || 0);
+          const tot = Number(st.total || 0);
+          setMsg(tot > 0 ? `Packing ${n}/${tot}...` : 'Packing...');
+        }
+        throw new Error('ZIP timed out.');
+      } catch (err) {
+        setMsg('');
+        window.alert(String(err.message || err));
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     function wireClipActions(panel) {
+      panel.querySelectorAll('button[data-clipview]').forEach((b) =>
+        b.addEventListener('click', () => viewClip(b.getAttribute('data-clipview'))));
       panel.querySelectorAll('button[data-clipdownload]').forEach((b) =>
         b.addEventListener('click', () => downloadClip(b.getAttribute('data-clipdownload'))));
       panel.querySelectorAll('button[data-clipdelete]').forEach((b) =>
@@ -1826,17 +2061,48 @@
       window.setTimeout(tick, 3000);
     }
 
-    // Resolve a presigned URL for one clip and navigate to it to trigger the
-    // browser download.
+    // Resolve a presigned URL for one clip and force a real file download. The
+    // attachment disposition is set on the presigned URL itself (server side), so an
+    // anchor click saves the file with a sensible name instead of playing it inline.
     async function downloadClip(ref) {
       const [recId, clipId] = String(ref || '').split(':');
       try {
-        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download`);
-        if (out && out.url) { window.location.assign(out.url); return; }
+        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download?disposition=attachment`);
+        if (out && out.url) {
+          const a = document.createElement('a');
+          a.href = out.url;
+          a.rel = 'noopener';
+          a.download = '';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          return;
+        }
         window.alert('No download URL returned.');
       } catch (err) {
         window.alert(String(err.message || err));
       }
+    }
+
+    // Resolve a presigned URL for one clip and open it in a new tab so the browser
+    // plays it inline (the View action, distinct from the saving Download action).
+    async function viewClip(ref) {
+      const [recId, clipId] = String(ref || '').split(':');
+      try {
+        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download?disposition=inline`);
+        if (out && out.url) { window.open(out.url, '_blank', 'noopener'); return; }
+        window.alert('No view URL returned.');
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    // Reload the clip view after a mutation. The dedicated clip page (panel ===
+    // els.clipPage) re-renders its current page; the inline card panel reloads its
+    // detail.
+    async function reloadClipPanel(panel, recId) {
+      if (panel === els.clipPage) { await loadClipPage(clipPageState.page); return; }
+      await reloadClipDetail(panel, recId);
     }
 
     async function deleteClip(panel, ref) {
@@ -1844,7 +2110,7 @@
       if (!window.confirm('Delete this clip from your bucket? This cannot be undone.')) return;
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}`, { method: 'DELETE' });
-        await reloadClipDetail(panel, recId);
+        await reloadClipPanel(panel, recId);
       } catch (err) {
         window.alert(String(err.message || err));
       }
@@ -1854,7 +2120,7 @@
       if (!window.confirm('Delete ALL clips for this recording from your bucket? This cannot be undone.')) return;
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips`, { method: 'DELETE' });
-        await reloadClipDetail(panel, recId);
+        await reloadClipPanel(panel, recId);
       } catch (err) {
         window.alert(String(err.message || err));
       }
@@ -2348,6 +2614,21 @@
         buildAccountChip();
         await loadBilling();
         await refreshDestinations();
+        const recId = clipPageRecId();
+        if (recId) {
+          // Dedicated clip-management page: hide the list/composer chrome and render
+          // the paginated clip view for this recording.
+          clipPageState.recId = recId;
+          els.ledger.classList.add('hidden');
+          els.cardBanner.classList.add('hidden');
+          els.heroCopy.classList.add('hidden');
+          els.cards.classList.add('hidden');
+          els.newRecRow.classList.add('hidden');
+          els.composer.classList.add('hidden');
+          els.clipPage.classList.remove('hidden');
+          await loadClipPage(0);
+          return;
+        }
         await handleBillingReturn();
         await maybeLandFromCatalogStream();
       } catch (_) {

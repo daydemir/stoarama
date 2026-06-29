@@ -31,6 +31,11 @@ type dayZipSegmentRow struct {
 	ObjectKey      string
 	MIMEType       string
 	SizeBytes      int64
+	// ClipEndAt, when non-nil, marks this row as a recording clip rather than a
+	// stream segment. It switches buildDayZip's manifest to the clip schema
+	// (id,start,end,duration,size,object_key) so the in-zip CSV carries the
+	// fields the clips UI needs. nil keeps the legacy day-zip manifest.
+	ClipEndAt *time.Time
 }
 
 func dayZipKey(streamID int64, day string) string {
@@ -112,9 +117,17 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 func buildDayZip(ctx context.Context, w io.Writer, rows []dayZipSegmentRow, streamSlug string, streamID int64, open func(context.Context, string) (io.ReadCloser, error), onProgress func(int)) (int, error) {
 	zipWriter := zip.NewWriter(w)
 
+	// Clip rows (ClipEndAt set) get the clip-management manifest schema; stream
+	// segments keep the legacy day-zip schema. The kind is uniform per job.
+	clipManifest := len(rows) > 0 && rows[0].ClipEndAt != nil
+
 	var manifestBuf bytes.Buffer
 	csvWriter := csv.NewWriter(&manifestBuf)
-	if err := csvWriter.Write([]string{"filename", "segment_start_at", "duration_ms", "bytes", "status"}); err != nil {
+	header := []string{"filename", "segment_start_at", "duration_ms", "bytes", "status"}
+	if clipManifest {
+		header = []string{"id", "filename", "start", "end", "duration_ms", "size_bytes", "object_key", "status"}
+	}
+	if err := csvWriter.Write(header); err != nil {
 		_ = zipWriter.Close()
 		return 0, fmt.Errorf("write manifest header: %w", err)
 	}
@@ -156,13 +169,32 @@ func buildDayZip(ctx context.Context, w io.Writer, rows []dayZipSegmentRow, stre
 				}
 			}
 		}
-		if err := csvWriter.Write([]string{
-			name,
-			row.SegmentStartAt.UTC().Format(time.RFC3339Nano),
-			strconv.FormatInt(row.DurationMs, 10),
-			strconv.FormatInt(row.SizeBytes, 10),
-			status,
-		}); err != nil {
+		var record []string
+		if clipManifest {
+			endStr := ""
+			if row.ClipEndAt != nil {
+				endStr = row.ClipEndAt.UTC().Format(time.RFC3339Nano)
+			}
+			record = []string{
+				strconv.FormatInt(row.ID, 10),
+				name,
+				row.SegmentStartAt.UTC().Format(time.RFC3339Nano),
+				endStr,
+				strconv.FormatInt(row.DurationMs, 10),
+				strconv.FormatInt(row.SizeBytes, 10),
+				strings.TrimSpace(row.ObjectKey),
+				status,
+			}
+		} else {
+			record = []string{
+				name,
+				row.SegmentStartAt.UTC().Format(time.RFC3339Nano),
+				strconv.FormatInt(row.DurationMs, 10),
+				strconv.FormatInt(row.SizeBytes, 10),
+				status,
+			}
+		}
+		if err := csvWriter.Write(record); err != nil {
 			_ = zipWriter.Close()
 			return 0, fmt.Errorf("write manifest row: %w", err)
 		}

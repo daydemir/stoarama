@@ -340,7 +340,13 @@
       el.className = `status${kind ? ` ${kind}` : ''}`;
     }
 
-    function usd(cents) { return `$${(Number(cents || 0) / 100).toFixed(2)}`; }
+    // A non-zero amount below one cent shows as "<$0.01" so a real-but-tiny
+    // amortized storage charge does not read as the broken-looking "$0.00".
+    function usd(cents) {
+      const c = Number(cents || 0);
+      if (c > 0 && c < 1) return '<$0.01';
+      return `$${(c / 100).toFixed(2)}`;
+    }
 
     function fmtDay(iso) {
       if (!iso) return '';
@@ -478,6 +484,7 @@
         `<div><b>${days}</b> recording-day${days === 1 ? '' : 's'} from the streams you are recording</div>`;
       usageStorage.innerHTML = gb > 0
         ? `<div><b>${gb.toFixed(3)}</b> GB-month managed storage</div>`
+          + `<div class="muted" style="font-size:12px;margin-top:4px;">Storage is ${usd(gbRate)} per GB per month, charged only for the time each clip is kept. A clip stored a few days costs a small fraction of that.</div>`
         : `<div class="muted">No managed storage this month</div>`;
 
       const lines = [`<div>${days} × ${usd(dayRate)} record-day = <b>${usd(dayCents)}</b></div>`];
