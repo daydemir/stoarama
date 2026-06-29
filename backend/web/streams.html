@@ -847,17 +847,18 @@
     .detail-header {
       display: flex;
       flex-wrap: wrap;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
+      align-items: center;
+      gap: 10px 14px;
       margin-bottom: 14px;
     }
-    .detail-header-left { display: flex; flex-direction: column; gap: 6px; }
+    .detail-header-left { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 0 1 auto; }
     .detail-header-actions {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       gap: 8px;
+      flex: 0 0 auto;
+      margin-left: auto;
     }
     .detail-title { font-size: 16px; font-weight: 600; }
     .detail-meta { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -972,6 +973,8 @@
     .detail-images { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
     @media (max-width: 900px) { .detail-images { grid-template-columns: 1fr; } }
     .detail-live-player { margin: 14px 0 18px; }
+    .detail-no-inline-note { max-width: 880px; margin: 0 0 18px; color: var(--muted); font-size: 12px; }
+    .detail-no-inline-note a { color: var(--text); text-decoration: underline; }
     .detail-live-player-mount {
       position: relative;
       width: 100%;
@@ -1454,8 +1457,8 @@
         max-height: 34vh;
       }
     }
-<!--SHELL_HEAD-->
   </style>
+<!--SHELL_HEAD-->
 </head>
 <body>
 <div class="shell">
@@ -1534,8 +1537,7 @@
         <div class="detail-meta" id="detailMeta"></div>
       </div>
       <div class="detail-header-actions">
-        <a id="detailViewCTA" class="overview-card-link primary" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">View live stream</a>
-        <a id="detailRecordCTA" class="overview-card-link" href="/recordings">Record this stream</a>
+        <a id="detailRecordCTA" class="overview-card-link primary" href="/recordings">Record this stream</a>
       </div>
     </div>
 
@@ -1543,6 +1545,10 @@
     <div id="detailLivePlayer" class="detail-live-player" style="display:none;">
       <div id="detailLivePlayerMount" class="detail-live-player-mount"></div>
     </div>
+    <p id="detailNoInlineNote" class="detail-no-inline-note" style="display:none;">
+      This stream can't play inline here.
+      <a id="detailNoInlineLink" href="#" target="_blank" rel="noopener noreferrer">Open the source &#8599;</a>
+    </p>
 
   </div>
 </div>
@@ -1702,10 +1708,11 @@ const pipelineExperimentsRows = $('pipelineExperimentsRows');
 // detail
 const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
-const detailViewCTA = $('detailViewCTA');
 const detailRecordCTA = $('detailRecordCTA');
 const detailLivePlayer = $('detailLivePlayer');
 const detailLivePlayerMount = $('detailLivePlayerMount');
+const detailNoInlineNote = $('detailNoInlineNote');
+const detailNoInlineLink = $('detailNoInlineLink');
 let detailHlsInstance = null;
 const detailActions = $('detailActions');
 const detailSourcePanel = $('detailSourcePanel');
@@ -2866,18 +2873,8 @@ async function copyStreamSourceURL(streamID) {
 
 function syncDetailMutationUI(stream) {
   const s = stream || {};
-  const preferredViewURL = buildPreferredViewURL(s);
   if (detailRecordCTA instanceof HTMLAnchorElement) {
     detailRecordCTA.href = `/recordings?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
-  }
-  if (detailViewCTA instanceof HTMLAnchorElement) {
-    if (preferredViewURL) {
-      detailViewCTA.href = preferredViewURL;
-      detailViewCTA.style.display = '';
-    } else {
-      detailViewCTA.href = '#';
-      detailViewCTA.style.display = 'none';
-    }
   }
 }
 
@@ -3485,7 +3482,6 @@ async function loadOverview() {
   streamAllTotal = Number(ov.streams_total || 0);
   overviewStreamsTotal = Number(ov.streams_total || 0);
   overviewRecordingOn = Number(ov.recording_on || 0);
-  renderOverviewMetricChips();
   if (overviewSummaryChips) {
     overviewSummaryChips.innerHTML = [
       queueChip('streams', ov.streams_total),
@@ -3510,14 +3506,6 @@ async function loadOverview() {
   setOverviewStatus(`recording on ${Number(ov.recording_on || 0)} · backlog ${Number(qh.inference_backlog_frames || 0)}`, 'ok');
 }
 
-function renderOverviewMetricChips() {
-  metricsRow.innerHTML = [
-    ['streams', overviewStreamsTotal],
-    ['recording', overviewRecordingOn],
-  ].map(([label, val]) =>
-    `<span class="metric-chip">${esc(label)} <b>${esc(String(val ?? 0))}</b></span>`
-  ).join('');
-}
 
 function queueChip(label, value) {
   return `<span class="metric-chip">${esc(label)} <b>${esc(String(value ?? 0))}</b></span>`;
@@ -4692,6 +4680,7 @@ function teardownDetailLivePlayer() {
   }
   if (detailLivePlayerMount) detailLivePlayerMount.innerHTML = '';
   if (detailLivePlayer) detailLivePlayer.style.display = 'none';
+  if (detailNoInlineNote) detailNoInlineNote.style.display = 'none';
 }
 
 // Decide how to play a stream inline. Returns 'youtube' | 'hls' | 'none'.
@@ -4730,8 +4719,14 @@ function mountDetailLivePlayer(stream) {
   if (!(detailLivePlayer instanceof HTMLElement) || !(detailLivePlayerMount instanceof HTMLElement)) return;
   const kind = detailPlayerKind(stream);
   if (kind === 'none') {
-    // Honest fallback: no inline player. The external "View live stream" CTA
-    // (#detailViewCTA), managed by syncDetailMutationUI, is the only affordance.
+    // Honest fallback: no inline player and no fake one. Offer an unobtrusive
+    // inline link to the source, in the player area (not a prominent top button).
+    const ext = buildPreferredViewURL(stream);
+    if (detailNoInlineNote instanceof HTMLElement && detailNoInlineLink instanceof HTMLAnchorElement) {
+      if (ext) { detailNoInlineLink.href = ext; detailNoInlineLink.style.display = ''; }
+      else { detailNoInlineLink.removeAttribute('href'); detailNoInlineLink.style.display = 'none'; }
+      detailNoInlineNote.style.display = '';
+    }
     return;
   }
   if (kind === 'youtube') {

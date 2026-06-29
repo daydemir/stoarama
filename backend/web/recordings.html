@@ -569,6 +569,20 @@
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const billingReturn = String(authParams.get('billing') || '').trim().toLowerCase();
 
+    const CATALOG_STASH_KEY = 'recCatalogStreamId';
+    function stashCatalogStreamId(id) {
+      try { window.sessionStorage.setItem(CATALOG_STASH_KEY, String(id)); } catch (_) {}
+    }
+    function readStashedCatalogStreamId() {
+      try {
+        const n = Number(window.sessionStorage.getItem(CATALOG_STASH_KEY) || 0);
+        return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+      } catch (_) { return 0; }
+    }
+    function clearStashedCatalogStreamId() {
+      try { window.sessionStorage.removeItem(CATALOG_STASH_KEY); } catch (_) {}
+    }
+
     // Mutable view state.
     const state = {
       account: null,
@@ -1767,6 +1781,7 @@
     function applyCatalogLock(stream, frameURL) {
       const id = Number(stream.id || 0);
       state.catalogStreamId = id;
+      if (id > 0) stashCatalogStreamId(id);
       els.recStreamID.value = String(id);
       els.urlField.classList.add('hidden');
       els.catalogStreamBlock.classList.remove('hidden');
@@ -1824,9 +1839,15 @@
     // stream and strip the param so a reload does not re-trigger the landing.
     async function maybeLandFromCatalogStream() {
       const raw = String(authParams.get('stream_id') || '').trim();
-      if (!raw) return;
-      const sid = Number(raw);
-      if (!Number.isFinite(sid) || sid <= 0) return;
+      let sid = Number(raw);
+      if (!raw || !Number.isFinite(sid) || sid <= 0) {
+        // No ?stream_id (e.g. returning from Stripe add-card): re-land from the
+        // stashed selection so the chosen catalog stream stays selected.
+        sid = readStashedCatalogStreamId();
+        if (sid <= 0) return;
+        await loadFromCatalogStream(sid);
+        return;
+      }
       try {
         const u = new URL(window.location.href);
         u.searchParams.delete('stream_id');
@@ -1842,6 +1863,7 @@
       state.streamProbe = { token: state.streamProbe.token + 1, ok: false };
       setStatus(els.streamStatus, '', '');
       clearCatalogLock();
+      clearStashedCatalogStreamId();
       // Reset the window so the next open re-defaults Start to now.
       els.startAt.value = '';
       els.endAt.value = '';
@@ -1926,6 +1948,7 @@
         });
         els.recURL.value = '';
         els.recName.value = '';
+        clearStashedCatalogStreamId();
         closeComposer();
         await refreshRecordings();
         setStatus(els.startStatus, '', '');
