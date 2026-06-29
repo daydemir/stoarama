@@ -397,7 +397,8 @@
     function clipLabel(sec) {
       const n = Number(sec || 0);
       if (n <= 0) return '';
-      if (n % 60 === 0) { const m = n / 60; return `${m} min clip${m === 1 ? '' : 's'}`; }
+      // Match the Recordings page wording exactly (e.g. "60s clips") so the same
+      // recording is not labelled "1 min clip" here and "60s clips" there.
       return `${n}s clips`;
     }
 

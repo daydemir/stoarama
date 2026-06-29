@@ -5355,6 +5355,23 @@ infApply.addEventListener('click', async () => {
   });
 });
 
+// Graceful thumbnail fallback: a thumbnail whose object 404s (expired or never
+// captured) would otherwise render as the browser's broken-image glyph. Catch the
+// load error once at the document level (capture phase, since img error does not
+// bubble) and swap the failed image for the muted "no image" placeholder used
+// elsewhere. One definition covers every thumbnail, including lazy-hydrated rows.
+document.addEventListener('error', (e) => {
+  const img = e.target;
+  if (!(img instanceof HTMLImageElement)) return;
+  if (!img.classList.contains('thumb-sm') && !img.classList.contains('thumb-lg')) return;
+  const slotClass = img.classList.contains('thumb-lg') ? 'img-slot-lg' : 'img-slot';
+  const placeholder = document.createElement('div');
+  placeholder.className = slotClass;
+  placeholder.innerHTML = '<span class="muted fs10">no image</span>';
+  const replace = (img.closest('.table-image-link')) || img;
+  if (replace.parentNode) replace.parentNode.replaceChild(placeholder, replace);
+}, true);
+
 // Table image modal
 document.addEventListener('click', (e) => {
   const target = e.target instanceof HTMLElement ? e.target : null;
