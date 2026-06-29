@@ -121,8 +121,9 @@
     /* Cost ledger */
     .ledger {
       display: flex;
+      flex-wrap: wrap;
       align-items: baseline;
-      gap: 8px;
+      gap: 4px 10px;
       margin-bottom: 14px;
       padding: 2px 2px 0;
       font-family: var(--mono);
@@ -130,6 +131,7 @@
       color: var(--muted);
     }
     .ledger b { color: var(--text); font-weight: 600; }
+    .ledger .meta-sep { color: var(--border); user-select: none; }
     /* Recording cards */
     .cards { display: grid; gap: 12px; margin-bottom: 16px; }
     .card {
@@ -1483,17 +1485,17 @@
       const days = Number(b.recording_days_this_month || 0);
       if (days >= 1) {
         const noun = days === 1 ? 'recording-day' : 'recording-days';
-        lines.push(`<b>${days} ${noun} this month</b> &middot; est. ${usdCents(b.estimated_amount_cents)}`);
+        lines.push(`<span><b>${days} ${noun} this month</b> &middot; est. ${usdCents(b.estimated_amount_cents)}</span>`);
       }
       // Managed storage line: month-to-date average GB-month from /billing. Hidden
       // when the account has no managed data (avg = 0).
       const gb = Number(b.storage_gb_month_avg || 0);
       if (gb > 0) {
         const gbRate = Number(b.gb_month_rate_cents || 10);
-        lines.push(`<b>${gb.toFixed(3)} GB-month storage</b> &middot; est. ${usdStorage(gb, gbRate, b.estimated_storage_amount_cents)}`);
+        lines.push(`<span><b>${gb.toFixed(3)} GB-month storage</b> &middot; est. ${usdStorage(gb, gbRate, b.estimated_storage_amount_cents)}</span>`);
       }
       if (lines.length === 0) { els.ledger.classList.add('hidden'); return; }
-      els.ledger.innerHTML = lines.join('<br/>');
+      els.ledger.innerHTML = lines.join('<span class="meta-sep">&middot;</span>');
       els.ledger.classList.remove('hidden');
     }
 
