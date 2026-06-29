@@ -3296,6 +3296,13 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 		args = append(args, captureType)
 		where = append(where, fmt.Sprintf("s.capture_type=$%d", len(args)))
 	}
+	// recordable=1 restricts to the source kinds the recorder can actually
+	// capture (live HLS and direct HTTP(S) video). It is what the streams browse
+	// "Recordable" segment uses; the single-value capture_type filter cannot
+	// express the union, so it is a dedicated flag.
+	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("recordable"))); raw == "1" || raw == "true" {
+		where = append(where, "s.capture_type IN ('hls','http_video')")
+	}
 	if touchedPipelineID != "" {
 		args = append(args, touchedPipelineID)
 		where = append(where, fmt.Sprintf(`EXISTS (

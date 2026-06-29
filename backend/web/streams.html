@@ -4280,6 +4280,8 @@ function buildStreamFilterParams() {
   if (streamTagExcludeFilter.value.trim()) params.set('tags_not', streamTagExcludeFilter.value.trim());
   if (isKoreaPage) {
     params.set('korea_family', normalizeKoreaFamily(sourceFilter.value) || 'all');
+  } else if (streamSourceSegment === 'recordable') {
+    params.set('recordable', '1');
   } else if (sourceFilter.value.trim()) {
     params.set('source', sourceFilter.value.trim());
   }
@@ -4606,9 +4608,11 @@ function renderStreamRows() {
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
       <td>${
-        detailPlayerKind(s) === 'youtube' || String(s.provider || '').trim().toUpperCase() === 'YOUTUBE'
-          ? `<a class="overview-card-link" href="${esc(buildYouTubeWatchURL(s) || ('/streams/' + s.id))}" target="_blank" rel="noopener noreferrer">View</a>`
-          : `<a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a>`
+        isRecordableStream(s)
+          ? `<a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a>`
+          : (buildYouTubeWatchURL(s)
+              ? `<a class="overview-card-link" href="${esc(buildYouTubeWatchURL(s))}" target="_blank" rel="noopener noreferrer">View</a>`
+              : `<a class="overview-card-link" href="/streams/${s.id}">View</a>`)
       }</td>
     `;
     streamRowsEl.appendChild(tr);
@@ -4622,13 +4626,15 @@ function renderStreamRows() {
 
 function applySourceSegment(seg) {
   streamSourceSegment = (seg === 'youtube') ? 'youtube' : 'recordable';
-  // Drive the existing filter state that buildStreamFilterParams reads.
+  // Drive the existing filter state that buildStreamFilterParams reads. YouTube
+  // is the exact youtube_watch capture type; Recordable clears capture_type and
+  // lets buildStreamFilterParams add recordable=1 (HLS + direct HTTP video).
   if (streamSourceSegment === 'youtube') {
-    sourceFilter.value = 'youtube';
-    streamModeFilter.value = '';
+    sourceFilter.value = '';
+    streamModeFilter.value = 'youtube_watch';
   } else {
     sourceFilter.value = '';
-    streamModeFilter.value = 'hls';
+    streamModeFilter.value = '';
   }
   const seg2 = document.getElementById('streamSourceSegment');
   if (seg2) {
@@ -4811,6 +4817,14 @@ function teardownDetailLivePlayer() {
 }
 
 // Decide how to play a stream inline. Returns 'youtube' | 'hls' | 'none'.
+// isRecordableStream mirrors the recorder's accepted source kinds (live HLS and
+// direct HTTP(S) video). It drives both the browse "Recordable" segment and the
+// per-row Record-vs-View CTA so the two never disagree.
+function isRecordableStream(stream) {
+  const ct = String((stream && stream.capture_type) || '').trim().toLowerCase();
+  return ct === 'hls' || ct === 'http_video';
+}
+
 function detailPlayerKind(stream) {
   const s = stream || {};
   const provider = String(s.provider || '').trim().toUpperCase();
