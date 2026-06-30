@@ -16,6 +16,7 @@ func baseDecisionParams(now time.Time) DecisionParams {
 		Capacity:          1,
 		Min:               0,
 		Max:               5,
+		MaxScaleUpBatch:   4,
 		ProvisionLead:     10 * time.Minute,
 		IdleGrace:         10 * time.Minute,
 		ScaleUpCooldown:   1 * time.Minute,
@@ -29,8 +30,38 @@ func TestDecide_ScaleUpAheadOfImminentDemand(t *testing.T) {
 	p.Live = 0
 	p.Forecast = Forecast{PeakConcurrent: 1, NextFireAt: now.Add(5 * time.Minute)} // within lead
 	d := Decide(p)
-	if !d.ScaleUp || d.DrainCount != 0 {
-		t.Fatalf("expected scale up, got %+v", d)
+	if d.ScaleUpCount != 1 || d.DrainCount != 0 {
+		t.Fatalf("expected scale up by 1, got %+v", d)
+	}
+}
+
+func TestDecide_ScaleUpBatchesTheWholeGap(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+	p := baseDecisionParams(now)
+	p.Max = 20
+	p.MaxScaleUpBatch = 4
+	p.Live = 0
+	// A 100-clip bundle on one cron => required 100/1=100, clamped to Max 20; the
+	// batch cap means this tick provisions 4, not 1, and not all 20.
+	p.Forecast = Forecast{PeakConcurrent: 100, NextFireAt: now.Add(1 * time.Minute)}
+	d := Decide(p)
+	if d.ScaleUpCount != 4 {
+		t.Fatalf("expected batch of 4 (gap 20 capped to batch 4), got %+v", d)
+	}
+}
+
+func TestDecide_ScaleUpBatchNeverOvershootsGap(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+	p := baseDecisionParams(now)
+	p.Max = 20
+	p.MaxScaleUpBatch = 8
+	p.Live = 4
+	// Demand needs 6 droplets, 4 live => gap 2, below the batch cap of 8: provision
+	// exactly the gap, never overshoot.
+	p.Forecast = Forecast{PeakConcurrent: 6, NextFireAt: now.Add(1 * time.Minute)}
+	d := Decide(p)
+	if d.ScaleUpCount != 2 {
+		t.Fatalf("expected exactly the gap of 2, got %+v", d)
 	}
 }
 
@@ -41,7 +72,7 @@ func TestDecide_NoScaleUpWhenDemandBeyondLead(t *testing.T) {
 	// Demand exists but the earliest fire is 30m out, beyond the 10m lead.
 	p.Forecast = Forecast{PeakConcurrent: 1, NextFireAt: now.Add(30 * time.Minute)}
 	d := Decide(p)
-	if d.ScaleUp {
+	if d.ScaleUpCount != 0 {
 		t.Fatalf("expected NO scale up (demand beyond provision lead), got %+v", d)
 	}
 }
@@ -53,11 +84,15 @@ func TestDecide_ScaleUpBlockedByHardCap(t *testing.T) {
 	p.Live = 2 // already at cap
 	p.Forecast = Forecast{PeakConcurrent: 10, NextFireAt: now.Add(1 * time.Minute)}
 	d := Decide(p)
-	if d.ScaleUp {
+	if d.ScaleUpCount != 0 {
 		t.Fatalf("must not scale past hard cap, got %+v", d)
 	}
 	if !d.ScaleUpBlockedByCap {
 		t.Fatalf("expected ScaleUpBlockedByCap, got %+v", d)
+	}
+	// Cap shortfall = requiredUncapped(10) - Max(2) = 8.
+	if d.CapShortfall != 8 {
+		t.Fatalf("expected CapShortfall 8, got %+v", d)
 	}
 }
 
@@ -68,12 +103,12 @@ func TestDecide_ScaleUpRespectsCooldown(t *testing.T) {
 	p.Forecast = Forecast{PeakConcurrent: 3, NextFireAt: now.Add(1 * time.Minute)}
 	// Last scale up 30s ago, cooldown is 60s -> blocked.
 	p.PoolState = PoolState{LastScaleUpAt: ptrTime(now.Add(-30 * time.Second))}
-	if d := Decide(p); d.ScaleUp {
+	if d := Decide(p); d.ScaleUpCount != 0 {
 		t.Fatalf("scale up should be blocked by cooldown, got %+v", d)
 	}
 	// Last scale up 2m ago -> allowed.
 	p.PoolState = PoolState{LastScaleUpAt: ptrTime(now.Add(-2 * time.Minute))}
-	if d := Decide(p); !d.ScaleUp {
+	if d := Decide(p); d.ScaleUpCount == 0 {
 		t.Fatalf("scale up should be allowed after cooldown, got %+v", d)
 	}
 }

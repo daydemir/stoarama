@@ -6,13 +6,20 @@ import (
 
 // Decision is the pure scale decision for one tick, computed from the forecast,
 // the current live count, the cooldown ledger, and the config. The controller
-// applies exactly one of ScaleUp / drain candidates per tick.
+// applies either a scale-up batch OR drain candidates per tick (up wins).
 type Decision struct {
-	// ScaleUp is true when a new droplet should be provisioned this tick.
-	ScaleUp bool
+	// ScaleUpCount is how many droplets to provision this tick: the gap between
+	// required and live, bounded by MaxScaleUpBatch so a single tick can close a
+	// large demand jump without waiting one droplet per tick, yet never overshoots
+	// the gap or the hard cap.
+	ScaleUpCount int
 	// ScaleUpBlockedByCap is true when scale-up is wanted but the hard spend cap
-	// (DROPLET_POOL_MAX) prevents it; surfaced for observability.
+	// (DROPLET_POOL_MAX) prevents (fully) satisfying demand; surfaced for the
+	// cap-hit alert so the operator knows to raise DROPLET_POOL_MAX.
 	ScaleUpBlockedByCap bool
+	// CapShortfall is how many droplets demand wants ABOVE the hard cap (0 when the
+	// cap covers demand). It is the cap-hit alert's "how far over" figure.
+	CapShortfall int
 	// DrainCount is how many idle droplets should begin draining this tick.
 	DrainCount int
 }
@@ -28,6 +35,7 @@ type DecisionParams struct {
 	Capacity          int
 	Min               int
 	Max               int
+	MaxScaleUpBatch   int // most droplets to provision in one tick (0/neg => 1)
 	ProvisionLead     time.Duration
 	IdleGrace         time.Duration
 	ScaleUpCooldown   time.Duration
@@ -67,11 +75,21 @@ func Decide(p DecisionParams) Decision {
 	// MIN floor is always wanted regardless of imminence.
 	wantUp := required > p.Live && (imminent || required <= p.Min || p.Live < p.Min)
 
+	batch := p.MaxScaleUpBatch
+	if batch <= 0 {
+		batch = 1
+	}
+
 	var d Decision
-	// Surface a cap-block whenever demand wants more droplets than the cap allows
-	// and we are at the cap with that demand imminent (or a standing MIN over cap).
-	if requiredUncapped > p.Max && p.Live >= p.Max && (imminent || p.Min > p.Max) {
-		d.ScaleUpBlockedByCap = true
+	// Cap shortfall: how many droplets demand wants above the hard cap. Surface a
+	// cap-block whenever demand exceeds the cap and we are at the cap with that
+	// demand imminent (or a standing MIN over cap), so the operator is told to raise
+	// DROPLET_POOL_MAX rather than silently dropping clips to honest "missed" jobs.
+	if requiredUncapped > p.Max {
+		d.CapShortfall = requiredUncapped - p.Max
+		if p.Live >= p.Max && (imminent || p.Min > p.Max) {
+			d.ScaleUpBlockedByCap = true
+		}
 	}
 	if wantUp {
 		if p.Live >= p.Max {
@@ -79,7 +97,18 @@ func Decide(p DecisionParams) Decision {
 			return d
 		}
 		if cooldownElapsed(p.PoolState.LastScaleUpAt, p.Now, p.ScaleUpCooldown) {
-			d.ScaleUp = true
+			// Provision the whole demand gap this tick, bounded by the per-tick batch
+			// cap and never past the hard cap. This closes a large demand jump (e.g. a
+			// 100-stream bundle => 20 droplets) over a few ticks instead of one droplet
+			// per cooldown, while the batch cap keeps a single tick's DO API burst sane.
+			gap := required - p.Live
+			if gap > batch {
+				gap = batch
+			}
+			if gap < 0 {
+				gap = 0
+			}
+			d.ScaleUpCount = gap
 		}
 		// Wanted up but blocked (cooldown): never drain in the same tick.
 		return d

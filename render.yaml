@@ -259,8 +259,19 @@ services:
         value: "300"
       - key: DROPLET_POOL_MIN
         value: "0"
+      # Hard spend cap = ceiling Max*Capacity concurrent clips. Capacity=5 is baked
+      # into the droplet image, so the ceiling is Max*5. Max=20 => 100 concurrent,
+      # the largest value that fits under the DigitalOcean account droplet_limit
+      # (25, with headroom for orphan-reap churn). Reaching true 1000-concurrent
+      # (200+ droplets) requires a DO droplet-limit increase first. Override per
+      # environment via the Render env var (the live prod value wins over this).
       - key: DROPLET_POOL_MAX
-        value: "5"
+        value: "20"
+      # Most droplets to provision in one tick. Lets a large demand jump (e.g. a
+      # 100-stream bundle => 20 droplets) be met over a few ticks instead of one
+      # droplet per scale-up cooldown, bounded so a single tick's DO API burst is sane.
+      - key: DROPLET_POOL_MAX_SCALEUP_BATCH
+        value: "4"
       - key: DROPLET_POOL_REGION
         value: nyc1
       - key: DROPLET_POOL_SIZE

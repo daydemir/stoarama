@@ -27,6 +27,7 @@ type Config struct {
 	ScaleDownCooldown time.Duration
 	Min               int
 	Max               int
+	MaxScaleUpBatch   int
 
 	Region     string
 	Size       string
@@ -63,6 +64,9 @@ func NewController(pool *pgxpool.Pool, doClient DOClient, cfg Config) *Controlle
 	}
 	if cfg.Capacity <= 0 {
 		cfg.Capacity = 1
+	}
+	if cfg.MaxScaleUpBatch <= 0 {
+		cfg.MaxScaleUpBatch = 1
 	}
 	return &Controller{store: NewStore(pool), do: doClient, cfg: cfg}
 }
@@ -124,6 +128,13 @@ func (c *Controller) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Spend tripwire (S-cap): the live count must never exceed the hard cap. The
+	// write-ahead provisioning row + per-tick clamp make this impossible; if it ever
+	// trips it means a reconcile/counting bug is leaking billable droplets past the
+	// cap, so log it loudly. This is a pure invariant check, not a scale action.
+	if live > c.cfg.Max {
+		log.Printf("droplet pool: SPEND TRIPWIRE live=%d exceeds hard cap max=%d (reconcile/counting bug; investigate immediately)", live, c.cfg.Max)
+	}
 	active, err := c.store.ListByStates(ctx, "active")
 	if err != nil {
 		return err
@@ -143,18 +154,27 @@ func (c *Controller) tick(ctx context.Context) error {
 		Capacity:          c.cfg.Capacity,
 		Min:               c.cfg.Min,
 		Max:               c.cfg.Max,
+		MaxScaleUpBatch:   c.cfg.MaxScaleUpBatch,
 		ProvisionLead:     c.cfg.ProvisionLead,
 		IdleGrace:         c.cfg.IdleGrace,
 		ScaleUpCooldown:   c.cfg.ScaleUpCooldown,
 		ScaleDownCooldown: c.cfg.ScaleDownCooldown,
 	})
 
+	// Cap-hit alert: demand wants more droplets than DROPLET_POOL_MAX allows. The
+	// create-time capacity preflight already rejects an over-cap schedule up front,
+	// so this fires only if standing demand drifts past the cap; surface it as a
+	// loud persistent WARNING (the control worker's alerting surface; it has no
+	// email sender) with the shortfall so the operator raises DROPLET_POOL_MAX
+	// instead of clips silently missing their freshness deadline.
 	if decision.ScaleUpBlockedByCap {
-		log.Printf("droplet pool: scale-up wanted but at hard cap max=%d live=%d peak=%d", c.cfg.Max, live, forecast.PeakConcurrent)
+		log.Printf("droplet pool: CAP HIT scale-up wanted but at hard cap max=%d live=%d peak=%d need_droplets_over_cap=%d ceiling=%d; raise DROPLET_POOL_MAX",
+			c.cfg.Max, live, forecast.PeakConcurrent, decision.CapShortfall, c.cfg.Max*c.cfg.Capacity)
 	}
-	if decision.ScaleUp {
+	for i := 0; i < decision.ScaleUpCount; i++ {
 		if err := c.scaleUp(ctx, now); err != nil {
 			log.Printf("droplet pool: scale up: %v", err)
+			break // a failing DO create will likely fail again this tick; retry next tick
 		}
 	}
 	if decision.DrainCount > 0 {

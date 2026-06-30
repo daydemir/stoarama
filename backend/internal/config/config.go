@@ -95,6 +95,7 @@ type Config struct {
 	DropletPoolScaleDownCooldownSec int
 	DropletPoolMin                  int
 	DropletPoolMax                  int
+	DropletPoolMaxScaleUpBatch      int
 	DropletPoolRegion               string
 	DropletPoolSize                 string
 	DropletPoolImage                string
@@ -191,6 +192,7 @@ func Load() (Config, error) {
 		DropletPoolScaleDownCooldownSec: intEnv("DROPLET_POOL_SCALEDOWN_COOLDOWN_SEC", 300),
 		DropletPoolMin:                  intEnv("DROPLET_POOL_MIN", 0),
 		DropletPoolMax:                  intEnv("DROPLET_POOL_MAX", 5),
+		DropletPoolMaxScaleUpBatch:      intEnv("DROPLET_POOL_MAX_SCALEUP_BATCH", 4),
 		DropletPoolRegion:               strEnv("DROPLET_POOL_REGION", "nyc1"),
 		DropletPoolSize:                 strEnv("DROPLET_POOL_SIZE", "s-2vcpu-4gb"),
 		DropletPoolImage:                strEnv("DROPLET_POOL_IMAGE", "ubuntu-24-04-x64"),
@@ -286,6 +288,9 @@ func (c Config) ValidatePool() error {
 	}
 	if c.DropletPoolMin < 0 || c.DropletPoolMin > c.DropletPoolMax {
 		return fmt.Errorf("DROPLET_POOL_MIN must be between 0 and DROPLET_POOL_MAX")
+	}
+	if c.DropletPoolMaxScaleUpBatch <= 0 {
+		return fmt.Errorf("DROPLET_POOL_MAX_SCALEUP_BATCH must be > 0")
 	}
 	if strings.TrimSpace(c.DropletPoolRegion) == "" || strings.TrimSpace(c.DropletPoolSize) == "" || strings.TrimSpace(c.DropletPoolImage) == "" {
 		return fmt.Errorf("DROPLET_POOL_REGION, DROPLET_POOL_SIZE, and DROPLET_POOL_IMAGE are required")

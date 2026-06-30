@@ -188,6 +188,7 @@ func mustBuildDropletPool(ctx context.Context, cfg config.Config, pool *pgxpool.
 		ScaleDownCooldown: time.Duration(cfg.DropletPoolScaleDownCooldownSec) * time.Second,
 		Min:               cfg.DropletPoolMin,
 		Max:               cfg.DropletPoolMax,
+		MaxScaleUpBatch:   cfg.DropletPoolMaxScaleUpBatch,
 		Region:            cfg.DropletPoolRegion,
 		Size:              cfg.DropletPoolSize,
 		Image:             cfg.DropletPoolImage,
