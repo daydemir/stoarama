@@ -1519,6 +1519,7 @@
           </select>
           <button id="streamPrev">Prev</button>
           <button id="streamNext">Next</button>
+          <button id="streamCsvBtn">Download CSV</button>
           <span class="status-text" id="streamPageInfo">page 1/1</span>
         </div>
         <span class="status-text" id="streamStatus"></span>
@@ -1679,6 +1680,7 @@ const streamsMapStatus = $('streamsMapStatus');
 const streamPageSizeEl = $('streamPageSize');
 const streamPrevEl = $('streamPrev');
 const streamNextEl = $('streamNext');
+const streamCsvBtnEl = $('streamCsvBtn');
 const streamPageInfo = $('streamPageInfo');
 const streamStatus = $('streamStatus');
 const streamFilterSummary = $('streamFilterSummary');
@@ -5441,6 +5443,10 @@ streamNextEl.addEventListener('click', async () => {
   if (streamPage >= pageCount) return;
   streamPage += 1;
   try { await loadStreams(); } catch (err) { setStreamStatus(String(err), 'err'); }
+});
+streamCsvBtnEl.addEventListener('click', () => {
+  const params = buildStreamFilterParams();
+  window.location.assign('/api/v1/dashboard/streams.csv?' + params.toString());
 });
 
 // Inference filters

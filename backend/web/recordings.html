@@ -295,6 +295,7 @@
       <!-- + New recording trigger (hidden in empty state; composer is the hero there) -->
       <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
         <button id="newRecBtn" type="button">+ New recording</button>
+        <button id="recordingsCsvBtn" class="secondary" type="button" style="width:auto;min-width:0;">Download CSV</button>
       </div>
 
       <!-- Inline composer -->
@@ -507,6 +508,7 @@
       cards: document.getElementById('cards'),
       newRecRow: document.getElementById('newRecRow'),
       newRecBtn: document.getElementById('newRecBtn'),
+      recordingsCsvBtn: document.getElementById('recordingsCsvBtn'),
       composer: document.getElementById('composer'),
       composerClose: document.getElementById('composerClose'),
       catalogStreamBlock: document.getElementById('catalogStreamBlock'),
@@ -1960,6 +1962,7 @@
       const pageActions = `
         <div class="clip-page-actions">
           ${liveCount > 0 ? `<button type="button" class="secondary" data-clipzip="${recId}">Download all (this page) as ZIP</button>` : ''}
+          <button type="button" class="secondary" data-clipscsv="${recId}">Download CSV (all clips)</button>
           ${liveCount > 0 ? `<button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button>` : ''}
           <span class="clip-pager-label" data-zipstatus></span>
         </div>`;
@@ -1995,6 +1998,11 @@
         }));
       root.querySelectorAll('button[data-clipzip]').forEach((b) =>
         b.addEventListener('click', () => downloadClipPageZip(b)));
+      root.querySelectorAll('button[data-clipscsv]').forEach((b) =>
+        b.addEventListener('click', () => {
+          const recId = b.getAttribute('data-clipscsv');
+          window.location.assign(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips.csv`);
+        }));
     }
 
     // POST the current page's clips to the zip endpoint, then poll the shared
@@ -2621,6 +2629,7 @@
     els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => openComposer(false));
+    els.recordingsCsvBtn.addEventListener('click', () => window.location.assign('/api/v1/account/recordings.csv'));
     els.composerClose.addEventListener('click', closeComposer);
     els.startBtn.addEventListener('click', startRecording);
     els.cardBannerBtn.addEventListener('click', async () => {
