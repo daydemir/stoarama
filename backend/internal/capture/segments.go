@@ -203,6 +203,15 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 	go func() { waitErr <- cmd.Wait() }()
 
 	processed := make(map[string]bool)
+	// nextStart chains segment start instants along the CONTINUOUS media timeline:
+	// the first finalized segment anchors at its strftime open instant (the true
+	// wall-clock start of capture), and every later segment starts exactly where
+	// the previous one ended (prev.Start + prev media duration). This reflects the
+	// gapless reality of the single persistent muxer (it writes every decoded
+	// packet into exactly one back-to-back segment) and avoids a phantom gap from
+	// using each file's whole-second wall-clock strftime label as the anchor, which
+	// drifts when a live source delivers slightly off real-time.
+	var nextStart time.Time
 	ticker := time.NewTicker(ContinuousSegmentPollInterval)
 	defer ticker.Stop()
 
@@ -243,6 +252,18 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 			seg, err := finalizeSegment(ctx, path)
 			if err != nil {
 				return err
+			}
+			// Chain the start along the continuous media timeline so coverage is
+			// exactly back-to-back. The first segment anchors at its own strftime
+			// open instant; later segments start where the previous one ended.
+			if !nextStart.IsZero() {
+				seg.StartAt = nextStart
+				seg.EndAt = seg.StartAt.Add(time.Duration(seg.DurationMs) * time.Millisecond)
+			}
+			if seg.DurationMs > 0 {
+				nextStart = seg.EndAt
+			} else {
+				nextStart = seg.StartAt
 			}
 			processed[path] = true
 			if err := onSegment(seg); err != nil {
