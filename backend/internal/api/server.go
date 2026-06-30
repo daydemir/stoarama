@@ -3962,62 +3962,160 @@ type dashboardStreamImageURLsRequest struct {
 	StreamIDs []int64 `json:"stream_ids"`
 }
 
+type previewObjectCandidate struct {
+	StreamID   int64
+	Source     string
+	RowID      int64
+	ObjectKey  string
+	CapturedAt time.Time
+}
+
 func (s *Server) latestPreviewObjectKeys(ctx context.Context, streamIDs []int64) (map[int64]string, error) {
 	if len(streamIDs) == 0 {
 		return map[int64]string{}, nil
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT
-			ids.stream_id,
-			CASE
-				WHEN frame_media.captured_at IS NULL THEN segment_thumb.object_key
-				WHEN segment_thumb.captured_at IS NULL THEN frame_media.object_key
-				WHEN frame_media.captured_at >= segment_thumb.captured_at THEN frame_media.object_key
-				ELSE segment_thumb.object_key
-			END
+		SELECT ids.stream_id, c.source, c.row_id, c.object_key, c.captured_at
 		FROM UNNEST($1::bigint[]) AS ids(stream_id)
-		LEFT JOIN LATERAL (
-			SELECT m.object_key, f.captured_at
-			FROM frames f
-			JOIN media_objects m ON m.id = f.raw_media_object_id
-			WHERE f.stream_id = ids.stream_id
-			  AND f.capture_status = 'success'
-			  AND f.raw_media_object_id IS NOT NULL
-			  AND COALESCE(m.object_key, '') <> ''
-			ORDER BY f.captured_at DESC, f.id DESC
-			LIMIT 1
-		) frame_media ON true
-		LEFT JOIN LATERAL (
-			SELECT m.object_key, cs.segment_end_at AS captured_at
-			FROM capture_segments cs
-			JOIN media_objects m ON m.id = cs.thumbnail_media_object_id
-			WHERE cs.stream_id = ids.stream_id
-			  AND cs.capture_status = 'success'
-			  AND cs.thumbnail_media_object_id IS NOT NULL
-			  AND COALESCE(m.object_key, '') <> ''
-			ORDER BY cs.segment_end_at DESC, cs.id DESC
-			LIMIT 1
-		) segment_thumb ON true
-		WHERE COALESCE(frame_media.object_key, segment_thumb.object_key, '') <> ''
+		JOIN LATERAL (
+			SELECT source, row_id, object_key, captured_at
+			FROM (
+				SELECT *
+				FROM (
+					SELECT
+						'survey_frame' AS source,
+						f.id AS row_id,
+						m.object_key,
+						f.captured_at,
+						0 AS priority
+					FROM frames f
+					JOIN media_objects m ON m.id = f.raw_media_object_id
+					WHERE f.stream_id = ids.stream_id
+					  AND f.source_kind = 'survey'
+					  AND f.capture_status = 'success'
+					  AND f.raw_media_object_id IS NOT NULL
+					  AND COALESCE(m.object_key, '') <> ''
+					ORDER BY f.captured_at DESC, f.id DESC
+					LIMIT 4
+				) survey_candidates
+				UNION ALL
+				SELECT *
+				FROM (
+					SELECT
+						'frame' AS source,
+						f.id AS row_id,
+						m.object_key,
+						f.captured_at,
+						1 AS priority
+					FROM frames f
+					JOIN media_objects m ON m.id = f.raw_media_object_id
+					WHERE f.stream_id = ids.stream_id
+					  AND f.source_kind <> 'survey'
+					  AND f.capture_status = 'success'
+					  AND f.raw_media_object_id IS NOT NULL
+					  AND COALESCE(m.object_key, '') <> ''
+					ORDER BY f.captured_at DESC, f.id DESC
+					LIMIT 4
+				) frame_candidates
+				UNION ALL
+				SELECT *
+				FROM (
+					SELECT
+						'segment_thumb' AS source,
+						cs.id AS row_id,
+						m.object_key,
+						cs.segment_end_at AS captured_at,
+						2 AS priority
+					FROM capture_segments cs
+					JOIN media_objects m ON m.id = cs.thumbnail_media_object_id
+					WHERE cs.stream_id = ids.stream_id
+					  AND cs.capture_status = 'success'
+					  AND cs.thumbnail_media_object_id IS NOT NULL
+					  AND COALESCE(m.object_key, '') <> ''
+					ORDER BY cs.segment_end_at DESC, cs.id DESC
+					LIMIT 4
+				) segment_candidates
+			) all_candidates
+			ORDER BY priority ASC, captured_at DESC, row_id DESC
+			LIMIT 8
+		) c ON true
+		ORDER BY ids.stream_id ASC,
+		         CASE c.source WHEN 'survey_frame' THEN 0 WHEN 'frame' THEN 1 ELSE 2 END ASC,
+		         c.captured_at DESC,
+		         c.row_id DESC
 	`, streamIDs)
 	if err != nil {
-		return nil, fmt.Errorf("query latest preview keys: %w", err)
+		return nil, fmt.Errorf("query latest preview candidates: %w", err)
 	}
 	defer rows.Close()
 
-	out := make(map[int64]string, len(streamIDs))
+	candidates := make([]previewObjectCandidate, 0, len(streamIDs))
 	for rows.Next() {
-		var streamID int64
-		var objectKey string
-		if err := rows.Scan(&streamID, &objectKey); err != nil {
-			return nil, fmt.Errorf("scan latest preview key: %w", err)
+		var c previewObjectCandidate
+		if err := rows.Scan(&c.StreamID, &c.Source, &c.RowID, &c.ObjectKey, &c.CapturedAt); err != nil {
+			return nil, fmt.Errorf("scan latest preview candidate: %w", err)
 		}
-		out[streamID] = objectKey
+		candidates = append(candidates, c)
 	}
 	if rows.Err() != nil {
-		return nil, fmt.Errorf("iterate latest preview keys: %w", rows.Err())
+		return nil, fmt.Errorf("iterate latest preview candidates: %w", rows.Err())
+	}
+
+	out := make(map[int64]string, len(streamIDs))
+	for _, c := range candidates {
+		if _, ok := out[c.StreamID]; ok {
+			continue
+		}
+		if _, err := s.r2.Head(ctx, c.ObjectKey); err != nil {
+			if r2.IsNotFound(err) {
+				_ = s.cleanupStalePreviewObjectReference(ctx, c)
+				continue
+			}
+			return nil, fmt.Errorf("verify preview object %s: %w", c.ObjectKey, err)
+		}
+		out[c.StreamID] = c.ObjectKey
 	}
 	return out, nil
+}
+
+func (s *Server) cleanupStalePreviewObjectReference(ctx context.Context, c previewObjectCandidate) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin stale preview cleanup: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	switch c.Source {
+	case "survey_frame", "frame":
+		if _, err := tx.Exec(ctx, `DELETE FROM frames WHERE id=$1`, c.RowID); err != nil {
+			return fmt.Errorf("delete stale preview frame %d: %w", c.RowID, err)
+		}
+	case "segment_thumb":
+		if _, err := tx.Exec(ctx, `
+			UPDATE capture_segments
+			SET thumbnail_media_object_id = NULL
+			WHERE id = $1
+		`, c.RowID); err != nil {
+			return fmt.Errorf("clear stale segment thumbnail %d: %w", c.RowID, err)
+		}
+	default:
+		return fmt.Errorf("unknown preview source %q", c.Source)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM media_objects mo
+		WHERE mo.bucket = $1
+		  AND mo.object_key = $2
+		  AND NOT EXISTS (SELECT 1 FROM frames f WHERE f.raw_media_object_id = mo.id)
+		  AND NOT EXISTS (SELECT 1 FROM inference_results ir WHERE ir.raw_media_object_id = mo.id OR ir.boxed_media_object_id = mo.id)
+		  AND NOT EXISTS (SELECT 1 FROM capture_segments cs WHERE cs.media_object_id = mo.id OR cs.thumbnail_media_object_id = mo.id)
+	`, s.r2.Bucket(), c.ObjectKey); err != nil {
+		return fmt.Errorf("delete orphan stale preview media object %s: %w", c.ObjectKey, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit stale preview cleanup: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) handleDashboardStreamImageURLs(w http.ResponseWriter, r *http.Request) {

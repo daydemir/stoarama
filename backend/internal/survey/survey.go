@@ -17,6 +17,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const (
+	ErrorTag               = "error"
+	errorConfirmationDelay = 5 * time.Minute
+)
+
 // Target is a stream selected for survey capture.
 type Target struct {
 	ID            int64
@@ -188,6 +193,34 @@ func Persist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, streamID i
 	return nil
 }
 
+func markSurveyHealthy(ctx context.Context, pool *pgxpool.Pool, streamID int64) error {
+	if _, err := pool.Exec(ctx, `
+		UPDATE streams
+		SET tags = array_remove(COALESCE(tags, ARRAY[]::text[]), $2),
+		    updated_at = now()
+		WHERE id = $1
+		  AND $2 = ANY(COALESCE(tags, ARRAY[]::text[]))
+	`, streamID, ErrorTag); err != nil {
+		return fmt.Errorf("clear survey error tag for stream %d: %w", streamID, err)
+	}
+	return nil
+}
+
+func markSurveyError(ctx context.Context, pool *pgxpool.Pool, streamID int64) error {
+	if _, err := pool.Exec(ctx, `
+		UPDATE streams
+		SET tags = CASE
+		        WHEN $2 = ANY(COALESCE(tags, ARRAY[]::text[])) THEN tags
+		        ELSE array_append(COALESCE(tags, ARRAY[]::text[]), $2)
+		    END,
+		    updated_at = now()
+		WHERE id = $1
+	`, streamID, ErrorTag); err != nil {
+		return fmt.Errorf("set survey error tag for stream %d: %w", streamID, err)
+	}
+	return nil
+}
+
 // CaptureAndPersist captures and persists one survey frame for the stream on the
 // given UTC date. It is idempotent: if a survey frame already exists for the
 // stream for that date it skips and returns skipped=true.
@@ -201,10 +234,32 @@ func CaptureAndPersist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, 
 	}
 	frame, err := CaptureFrame(ctx, registry, t, resolveTimeout, captureTimeout)
 	if err != nil {
-		return false, err
+		timer := time.NewTimer(errorConfirmationDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+		confirmedFrame, confirmErr := CaptureFrame(ctx, registry, t, resolveTimeout, captureTimeout)
+		if confirmErr != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			if tagErr := markSurveyError(ctx, pool, t.ID); tagErr != nil {
+				return false, fmt.Errorf("%w; additionally failed to set survey error tag: %v", confirmErr, tagErr)
+			}
+			return false, fmt.Errorf("confirmed survey capture failure after %s: first=%v second=%w", errorConfirmationDelay, err, confirmErr)
+		}
+		frame = confirmedFrame
 	}
 	capturedAt := time.Now().UTC()
 	if err := Persist(ctx, pool, r2c, t.ID, day, capturedAt, frame); err != nil {
+		return false, err
+	}
+	if err := markSurveyHealthy(ctx, pool, t.ID); err != nil {
 		return false, err
 	}
 	return false, nil

@@ -500,6 +500,11 @@
       border-color: var(--accent);
       color: var(--accent);
     }
+    .tag-chip-btn.tag-err {
+      background: color-mix(in srgb, var(--err) 15%, var(--panel));
+      border-color: color-mix(in srgb, var(--err) 35%, transparent);
+      color: var(--err);
+    }
     .mono { font-family: var(--mono); }
     .muted { color: var(--muted); }
     .fs11 { font-size: 11px; }
@@ -2729,11 +2734,19 @@ async function loadKnownStreamTagsSafe(scope = 'all') {
   }
 }
 
+function tagClassForTag(tag) {
+  const value = String(tag || '').trim().toLowerCase();
+  if (value === 'error') return 'tag-err';
+  if (value === 'shortlist') return 'tag-ok';
+  if (value === 'archive') return 'tag-warn';
+  return 'tag-muted';
+}
+
 function renderTagEditor(stream, tableKey) {
   const streamID = Number(stream.id);
   const currentTags = normalizeTags(stream.tags || []);
   const current = currentTags.length
-    ? currentTags.map((tag) => `<button class="tag-chip-btn" data-action="tag-remove" data-id="${streamID}" data-table="${esc(tableKey)}" data-tag="${esc(tag)}">${esc(tag)} ×</button>`).join('')
+    ? currentTags.map((tag) => `<button class="tag-chip-btn ${tagClassForTag(tag)}" data-action="tag-remove" data-id="${streamID}" data-table="${esc(tableKey)}" data-tag="${esc(tag)}">${esc(tag)} ×</button>`).join('')
     : '<span class="muted fs10">no tags</span>';
   return `
     <div class="stack tag-editor" data-tag-editor="1" data-id="${streamID}" data-table="${esc(tableKey)}">
@@ -3273,7 +3286,7 @@ function renderImageModalMetadata(linkEl) {
   const shortlistOn = tags.includes('shortlist');
   const archiveOn = tags.includes('archive');
   const tagHTML = tags.length
-    ? tags.map((tag) => `<span class="tag ${tag === 'shortlist' ? 'tag-ok' : tag === 'archive' ? 'tag-warn' : 'tag-muted'}">${esc(tag)}</span>`).join('')
+    ? tags.map((tag) => `<span class="tag ${tagClassForTag(tag)}">${esc(tag)}</span>`).join('')
     : '<span class="muted fs11">no tags</span>';
   const shortcutHint = scope === 'streams'
     ? `<span class="muted fs11 mono">Shortcuts: <b>S</b> shortlist (${shortlistOn ? 'remove' : 'add'}), <b>A</b> archive (${archiveOn ? 'remove' : 'add'})</span>`

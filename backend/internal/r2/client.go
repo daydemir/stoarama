@@ -3,6 +3,7 @@ package r2
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 type Client struct {
@@ -178,6 +180,18 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
 	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength)}, nil
+}
+
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	code := strings.TrimSpace(apiErr.ErrorCode())
+	return code == "NotFound" || code == "NoSuchKey" || code == "404"
 }
 
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
