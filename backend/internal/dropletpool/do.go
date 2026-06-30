@@ -204,9 +204,11 @@ type UserDataConfig struct {
 
 // BuildUserData renders the recorder droplet cloud-init. It installs an outbound
 // egress firewall (iptables) that DROPS traffic to the metadata IP and every
-// private range BEFORE the worker starts, then boots the recording worker from a
-// prebuilt binary (falling back to a one-time build). RECORDER_SERVER_ID is
-// passed via env so the worker never needs the (now-blocked) metadata service.
+// private range BEFORE the worker starts, then boots the recording worker. It
+// reuses the baked binary when the image's recorded build sha matches the
+// freshly-reset HEAD (the fast path that keeps a cold MIN=0 boot inside
+// ProvisionLead) and rebuilds only when the image lags HEAD. RECORDER_SERVER_ID
+// is passed via env so the worker never needs the (now-blocked) metadata service.
 func BuildUserData(cfg UserDataConfig) (string, error) {
 	if strings.TrimSpace(cfg.ServerID) == "" {
 		return "", fmt.Errorf("user data: server id is required")
@@ -382,24 +384,51 @@ runcmd:
       git -C /opt/stoarama reset --hard origin/{{.RepoRef}}
     fi
   - |
-    # Always rebuild the worker binary from the freshly-reset source at first
-    # boot so the running binary can never lag HEAD. The previous BUILT_SHA
-    # fast-path could leave a stale baked-image binary in place while .sha falsely
-    # claimed it was current (sha written without the build producing a new
-    # binary), so an out-of-date worker ran under systemd Restart=always. A clean
-    # build with warm Go module + build caches under /root costs ~1-2 min, which
-    # is cheap insurance against shipping a stale binary. A build failure exits
-    # non-zero so provisioning fails fast rather than running stale. cloud-init
-    # runcmd has no HOME/PATH for the Go 1.24 toolchain or its caches, so set them
-    # here.
+    # Prepare the worker binary. With DROPLET_POOL_MIN=0 the pool is cold between
+    # fires, so the whole cold-start (snapshot boot + this step + worker register)
+    # must fit inside ProvisionLead. A from-scratch go build on the 2-vcpu size
+    # measured ~13-15 min, far past the 600s lead, so a cold fire missed its
+    # freshness deadline. The fix is a snapshot rebaked from HEAD whose binary is
+    # already current: when the baked binary's recorded HEAD sha matches the
+    # freshly-reset HEAD, skip the build and boot in snapshot time (~1-2 min).
+    #
+    # The previous .sha fast-path was removed because the sha could be written
+    # separately from the build, leaving a stale binary while .sha falsely claimed
+    # it was current. This restores the fast-path SAFELY: the sha is written ONLY
+    # by build_worker below, atomically, after go build produced a fresh binary
+    # at the final path, so .sha can never name a binary that step did not just
+    # build. On a sha MISS (image lags HEAD, e.g. a push since the last rebake) it
+    # rebuilds; that rebuild is the slow path and, with MIN=0, requires a rebaked
+    # snapshot to stay inside the lead (rebake the image after recorder pushes).
+    # A build failure exits non-zero so provisioning fails fast rather than running
+    # stale. cloud-init runcmd has no HOME/PATH for the Go 1.24 toolchain or its
+    # caches, so set them here.
     set -e
     export HOME=/root
     export PATH=/usr/local/go/bin:$PATH
     export GOPATH=/root/go
     export GOCACHE=/root/.cache/go-build
     HEAD_SHA="$(git -C /opt/stoarama rev-parse HEAD)"
-    (cd /opt/stoarama/backend && go build -o bin/stoaramactl ./cmd/stoaramactl)
-    printf '%s' "$HEAD_SHA" > /opt/stoarama/bin/.stoaramactl.sha
+    SHA_FILE=/opt/stoarama/bin/.stoaramactl.sha
+    BIN=/opt/stoarama/bin/stoaramactl
+    build_worker() {
+      # Build to a temp path, then atomically move it into place and record the
+      # source HEAD only on success, so .stoaramactl.sha never names a binary this
+      # function did not just produce (the staleness bug that removed the old
+      # fast-path).
+      tmp="$(mktemp /opt/stoarama/bin/.stoaramactl.XXXXXX)"
+      (cd /opt/stoarama/backend && go build -o "$tmp" ./cmd/stoaramactl)
+      chmod +x "$tmp"
+      mv -f "$tmp" "$BIN"
+      printf '%s' "$HEAD_SHA" > "$SHA_FILE"
+    }
+    BUILT_SHA="$(cat "$SHA_FILE" 2>/dev/null || true)"
+    if [ -x "$BIN" ] && [ "$HEAD_SHA" = "$BUILT_SHA" ]; then
+      echo "stoarama: baked worker binary is current ($HEAD_SHA); skipping build"
+    else
+      echo "stoarama: baked worker binary missing or stale (have '$BUILT_SHA' want '$HEAD_SHA'); rebuilding"
+      build_worker
+    fi
   - chmod +x /opt/stoarama/backend/scripts/start-recording-worker.sh
   - systemctl daemon-reload
   - systemctl enable --now stoarama-egress-firewall.service

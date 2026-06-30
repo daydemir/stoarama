@@ -77,6 +77,47 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 	}
 }
 
+func TestBuildUserData_SkipsBuildWhenBakedBinaryMatchesHEAD(t *testing.T) {
+	// With DROPLET_POOL_MIN=0 the pool is cold between fires, so the cold boot must
+	// fit inside ProvisionLead. A from-scratch go build measured ~13-15 min on the
+	// pool size, past the 600s lead, so a cold fire missed its freshness deadline.
+	// The cloud-init must therefore reuse the rebaked-snapshot binary when its
+	// recorded HEAD sha matches the freshly-reset HEAD, and rebuild only on a miss.
+	out, err := BuildUserData(UserDataConfig{
+		ServerID:      "stoarama-rec-cold",
+		NodeToken:     "sin_token",
+		BackendAPIURL: "https://stoarama-api.onrender.com",
+		RepoURL:       "https://github.com/daydemir/stoarama.git",
+		RepoRef:       "main",
+	})
+	if err != nil {
+		t.Fatalf("BuildUserData: %v", err)
+	}
+
+	// Fast path: a baked binary whose recorded sha equals HEAD must skip the build.
+	if !strings.Contains(out, `[ -x "$BIN" ] && [ "$HEAD_SHA" = "$BUILT_SHA" ]`) {
+		t.Fatalf("cloud-init must skip the build when the baked binary matches HEAD (cold-start lead safety)")
+	}
+	if !strings.Contains(out, "skipping build") {
+		t.Fatalf("cloud-init must log the skip-build fast path")
+	}
+	// Miss path: a missing/stale baked binary must still rebuild from source.
+	if !strings.Contains(out, "build_worker") {
+		t.Fatalf("cloud-init must rebuild from source on a sha miss")
+	}
+	// Atomicity: the recorded sha must be written only after a fresh build moves a
+	// new binary into place (the staleness bug that removed the old fast-path: the
+	// sha could be written without the build producing a new binary).
+	if !strings.Contains(out, `mv -f "$tmp" "$BIN"`) {
+		t.Fatalf("cloud-init must atomically move the freshly-built binary into place")
+	}
+	movIdx := strings.Index(out, `mv -f "$tmp" "$BIN"`)
+	shaIdx := strings.Index(out, `printf '%s' "$HEAD_SHA" > "$SHA_FILE"`)
+	if shaIdx < 0 || shaIdx < movIdx {
+		t.Fatalf("the build sha must be written only after the new binary is moved into place")
+	}
+}
+
 func TestBuildUserData_RequiresCoreFields(t *testing.T) {
 	cases := []UserDataConfig{
 		{NodeToken: "t", BackendAPIURL: "u"}, // missing ServerID
