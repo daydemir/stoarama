@@ -3887,15 +3887,25 @@ func (s *Server) handleDashboardTags(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	limit := parseIntQuery(r, "limit", 200, 1, 1000)
 
-	streamWhere := []string{"1=1"}
-	if scope == "recording" || scope == "recorded" {
-		streamWhere = append(streamWhere, "s.recording_state='on'")
-	} else if scope != "" && scope != "all" {
+	if scope != "" && scope != "all" && scope != "recording" && scope != "recorded" {
 		util.WriteError(w, http.StatusBadRequest, "invalid scope; expected all|recording")
 		return
 	}
+	streamWhere, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
+		IncludeSearch:         false,
+		IncludeProvider:       true,
+		IncludeSource:         true,
+		IncludeYouTubeChannel: true,
+		IncludeCaptureMode:    true,
+	})
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if scope == "recording" || scope == "recorded" {
+		streamWhere = append(streamWhere, "s.recording_state='on'")
+	}
 
-	args := make([]any, 0, 2)
 	tagWhere := []string{"BTRIM(tag) <> ''", "lower(BTRIM(tag)) NOT LIKE 'provider:%'", "lower(BTRIM(tag)) NOT LIKE 'capture_type:%'"}
 	if q != "" {
 		args = append(args, "%"+q+"%")

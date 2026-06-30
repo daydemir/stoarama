@@ -2522,20 +2522,22 @@ function collectKnownTagsFromRows() {
   refreshTagFilterSelectOptions();
 }
 
-async function loadKnownStreamTags(scope = 'all') {
-  const params = new URLSearchParams();
-  if (scope) params.set('scope', scope);
-  params.set('limit', '400');
-  const payload = await fetchJSON(`/api/v1/dashboard/tags?${params}`);
+async function loadKnownStreamTags(scope = 'all', params = null, requestToken = 0) {
+  const nextParams = params instanceof URLSearchParams ? new URLSearchParams(params.toString()) : new URLSearchParams();
+  if (scope) nextParams.set('scope', scope);
+  nextParams.set('limit', '400');
+  const payload = await fetchJSON(`/api/v1/dashboard/tags?${nextParams}`);
+  if (requestToken && requestToken !== streamFilterOptionsToken) return;
   knownStreamTags = normalizeTags(payload.items || []);
   refreshTagSuggestionList();
   refreshTagFilterSelectOptions();
 }
 
-async function loadKnownStreamTagsSafe(scope = 'all') {
+async function loadKnownStreamTagsSafe(scope = 'all', params = null, requestToken = 0) {
   try {
-    await loadKnownStreamTags(scope);
+    await loadKnownStreamTags(scope, params, requestToken);
   } catch (_) {
+    if (requestToken && requestToken !== streamFilterOptionsToken) return;
     collectKnownTagsFromRows();
   }
 }
@@ -4102,7 +4104,7 @@ async function loadDiscoveryCandidates() {
 }
 
 // ─── Location filters ─────────────────────────────────────────────────────────
-function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', provider = '', koreaFamily = '') {
+function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false) {
   const params = new URLSearchParams();
   const normalizedRecordingState = normalizeRecordingStateFilter(recordingState);
   const normalizedCaptureType = normalizeCaptureTypeFilter(captureType);
@@ -4118,7 +4120,19 @@ function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', ta
   if (String(source || '').trim()) {
     params.set('source', String(source).trim());
   }
+  if (recordable) params.set('recordable', '1');
   return params;
+}
+
+function streamOptionScope() {
+  const koreaFamily = streamSourceSegment === 'recordable' ? String(koreaRegionFilter.value || '').trim() : '';
+  return {
+    captureType: streamSourceSegment === 'youtube'
+      ? 'youtube_watch'
+      : (streamSourceSegment === 'still_image' ? 'still_image' : normalizeCaptureTypeFilter(streamModeFilter.value)),
+    koreaFamily,
+    recordable: streamSourceSegment === 'recordable',
+  };
 }
 
 function normalizeKoreaFamily(raw) {
@@ -4188,10 +4202,11 @@ function populateCaptureTypeOptions(selectEl, allLabel) {
   if (!prev) selectEl.value = '';
 }
 
-async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '') {
+async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily, recordable);
   const payload = await fetchJSON(`/api/v1/dashboard/countries?${params}`);
+  if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v))
     .filter((v) => v.trim().length > 0)
@@ -4201,10 +4216,11 @@ async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingSt
   if (!values.includes(prev)) targetSelect.value = '';
 }
 
-async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '') {
+async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily, recordable);
   const payload = await fetchJSON(`/api/v1/dashboard/cities?${params}`);
+  if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v))
     .filter((v) => v.trim().length > 0)
@@ -4226,11 +4242,12 @@ function populateKoreaRegionOptions() {
   else koreaRegionFilter.value = '';
 }
 
-async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '') {
+async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '', recordable = false, requestToken = 0) {
   if (!(targetSelect instanceof HTMLSelectElement)) return;
   const prev = String(targetSelect.value || '').trim();
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily, recordable);
   const payload = await fetchJSON(`/api/v1/dashboard/providers?${params}`);
+  if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v).trim())
     .filter((v) => v.length > 0)
@@ -4240,10 +4257,11 @@ async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingS
   if (!values.includes(prev)) targetSelect.value = '';
 }
 
-async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '') {
+async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
   const prev = String(targetSelect.value || '').trim().toLowerCase();
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily, recordable);
   const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`);
+  if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v).trim().toLowerCase())
     .filter((v) => v.length > 0)
@@ -4438,57 +4456,84 @@ function syncDetailURL(opts = {}) {
   updateHistoryURL(`/streams/${detailStreamID}`, opts.replace === true);
 }
 
+let streamFilterOptionsToken = 0;
 async function refreshAllStreamFilterOptions() {
+  const requestToken = ++streamFilterOptionsToken;
   populateCaptureTypeOptions(streamModeFilter, 'capture type: all');
   populateKoreaRegionOptions();
-  const koreaFamily = streamSourceSegment === 'recordable' ? String(koreaRegionFilter.value || '').trim() : '';
-  await loadSourceOptions(
-    sourceFilter,
+  const optionScope = streamOptionScope();
+  const tagParams = buildDashboardSelectParams(
     'all',
-    streamTagFilter.value,
+    '',
     streamRecordingStateFilter.value,
-    streamTagExcludeFilter.value,
-    countryFilter.value,
-    cityFilter.value,
-    streamModeFilter.value,
-    providerFilter.value,
-    koreaFamily,
-  );
-  await loadProviderOptions(
-    providerFilter,
-    'all',
-    streamTagFilter.value,
-    streamRecordingStateFilter.value,
-    streamTagExcludeFilter.value,
+    '',
     countryFilter.value,
     cityFilter.value,
     sourceFilter.value,
-    streamModeFilter.value,
-    koreaFamily,
-  );
-  await loadCountryOptions(
-    countryFilter,
-    'all',
-    streamTagFilter.value,
-    streamRecordingStateFilter.value,
-    streamTagExcludeFilter.value,
-    sourceFilter.value,
-    streamModeFilter.value,
+    optionScope.captureType,
     providerFilter.value,
-    koreaFamily,
+    optionScope.koreaFamily,
+    optionScope.recordable,
   );
-  await loadCityOptions(
-    cityFilter,
-    'all',
-    streamTagFilter.value,
-    streamRecordingStateFilter.value,
-    streamTagExcludeFilter.value,
-    countryFilter.value,
-    sourceFilter.value,
-    streamModeFilter.value,
-    providerFilter.value,
-    koreaFamily,
-  );
+  await Promise.all([
+    loadKnownStreamTagsSafe('all', tagParams, requestToken),
+    loadSourceOptions(
+      sourceFilter,
+      'all',
+      streamTagFilter.value,
+      streamRecordingStateFilter.value,
+      streamTagExcludeFilter.value,
+      countryFilter.value,
+      cityFilter.value,
+      optionScope.captureType,
+      providerFilter.value,
+      optionScope.koreaFamily,
+      optionScope.recordable,
+      requestToken,
+    ),
+    loadProviderOptions(
+      providerFilter,
+      'all',
+      streamTagFilter.value,
+      streamRecordingStateFilter.value,
+      streamTagExcludeFilter.value,
+      countryFilter.value,
+      cityFilter.value,
+      sourceFilter.value,
+      optionScope.captureType,
+      optionScope.koreaFamily,
+      optionScope.recordable,
+      requestToken,
+    ),
+    loadCountryOptions(
+      countryFilter,
+      'all',
+      streamTagFilter.value,
+      streamRecordingStateFilter.value,
+      streamTagExcludeFilter.value,
+      sourceFilter.value,
+      optionScope.captureType,
+      providerFilter.value,
+      optionScope.koreaFamily,
+      optionScope.recordable,
+      requestToken,
+    ),
+    loadCityOptions(
+      cityFilter,
+      'all',
+      streamTagFilter.value,
+      streamRecordingStateFilter.value,
+      streamTagExcludeFilter.value,
+      countryFilter.value,
+      sourceFilter.value,
+      optionScope.captureType,
+      providerFilter.value,
+      optionScope.koreaFamily,
+      optionScope.recordable,
+      requestToken,
+    ),
+  ]);
+  if (requestToken !== streamFilterOptionsToken) return;
   updateStreamFilterSummary();
 }
 
@@ -4771,7 +4816,7 @@ function applySourceSegment(seg) {
   seg.querySelectorAll('button[data-source-seg]').forEach((btn) => {
     btn.addEventListener('click', () => {
       applySourceSegment(btn.getAttribute('data-source-seg'));
-      void loadStreams({ resetPage: true }).catch((err) => setStreamStatus(String(err), 'err'));
+      void reloadStreamsForFilterChange({ reloadAllOptions: true });
     });
   });
 })();
@@ -5310,7 +5355,9 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
     } else {
       rerenderTagEditorsForStream(id);
     }
-    await loadKnownStreamTagsSafe('all');
+    if (currentStreamRoute === STREAM_ROUTE.LIST) {
+      await refreshAllStreamFilterOptions();
+    }
     return;
   }
 
@@ -5478,10 +5525,7 @@ tabStreams.addEventListener('click', () => {
   void (async () => {
     try {
       clearImageCache();
-      await Promise.all([
-        loadOverview(),
-        loadKnownStreamTagsSafe('all'),
-      ]);
+      await loadOverview();
       await refreshAllStreamFilterOptions();
       await loadStreamsForActiveView({ resetPage: true });
     } catch (err) { setStreamStatus(String(err), 'err'); }
@@ -5931,7 +5975,6 @@ window.addEventListener('popstate', () => {
   try {
     void resolveSessionState();
     await applyStreamsRouteState();
-    void loadKnownStreamTagsSafe('all').catch(() => {});
     void loadOverview().catch(() => {});
   } catch (err) {
     if (detailStreamID) setDetailStatus(String(err), 'err');

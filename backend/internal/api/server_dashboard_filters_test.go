@@ -51,6 +51,21 @@ func TestDashboardBuildStreamWhereCaptureTypeFilter(t *testing.T) {
 	}
 }
 
+func TestDashboardBuildStreamWhereRecordableFilter(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?recordable=1", nil)
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(args) != 0 {
+		t.Fatalf("args len=%d want=0", len(args))
+	}
+	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "s.capture_type IN ('hls','http_video')") {
+		t.Fatalf("where missing recordable predicate: %s", sqlWhere)
+	}
+}
+
 func TestDashboardBuildStreamWhereInvalidCaptureType(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?capture_type=bad_mode", nil)
 	_, _, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
