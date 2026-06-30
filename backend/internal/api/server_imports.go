@@ -133,7 +133,7 @@ func (s *Server) handleServiceStreamImport(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
 		return
 	}
-	stream, created, err := s.upsertImportedStream(r, req)
+	stream, created, err := s.upsertImportedStream(r, req, false, nil)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -857,7 +857,7 @@ func summarizeStreamCanonicalRepairItems(items []serviceStreamCanonicalCaptureRe
 	return out
 }
 
-func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRequest) (model.Stream, bool, error) {
+func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRequest, userCreated bool, createdByAccountID *int64) (model.Stream, bool, error) {
 	provider := strings.TrimSpace(req.Provider)
 	externalID := strings.TrimSpace(req.ExternalID)
 	name := strings.TrimSpace(req.Name)
@@ -922,12 +922,15 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 				expected_image_interval_sec=$20,
 				execution_config_jsonb=$21,
 				tags=$22,
+				user_created=CASE WHEN $23 THEN true ELSE user_created END,
+				created_by_account_id=CASE WHEN $23 THEN $24 ELSE created_by_account_id END,
 				updated_at=now()
 			WHERE id=$1
 		`, existingID, name, profile.SourceURL, profile.SourcePageURL,
 			req.Lat, req.Lon, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
 			strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource),
 			metaBytes, profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes, dedupeStrings(req.Tags),
+			userCreated, createdByAccountID,
 		); err != nil {
 			return model.Stream{}, false, fmt.Errorf("update imported stream: %w", err)
 		}
@@ -982,14 +985,16 @@ func (s *Server) upsertImportedStream(r *http.Request, req serviceStreamImportRe
 		INSERT INTO streams (
 			provider, external_id, name, slug, source_url, source_page_url,
 			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
-			recording_state, source_family, capture_type, execution_class, capture_family, expected_fps, expected_image_interval_sec, execution_config_jsonb, tags
+			recording_state, source_family, capture_type, execution_class, capture_family, expected_fps, expected_image_interval_sec, execution_config_jsonb, tags,
+			user_created, created_by_account_id
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
 		RETURNING id
 	`, provider, externalID, name, slug, profile.SourceURL, profile.SourcePageURL,
 		req.Lat, req.Lon, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
 		strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource), metaBytes,
 		string(model.RecordingStateOff), profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, cfgBytes, dedupeStrings(req.Tags),
+		userCreated, createdByAccountID,
 	).Scan(&id); err != nil {
 		return model.Stream{}, false, newAPIStatusError(http.StatusConflict, "create imported stream: %v", err)
 	}

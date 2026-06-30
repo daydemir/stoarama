@@ -1526,9 +1526,45 @@
           <button id="streamPrev">Prev</button>
           <button id="streamNext">Next</button>
           <button id="streamCsvBtn">Download CSV</button>
+          <button id="addStreamBtn" style="display:none;">Add stream</button>
           <span class="status-text" id="streamPageInfo">page 1/1</span>
         </div>
         <span class="status-text" id="streamStatus"></span>
+      </div>
+    </div>
+    <div class="filter-stack-card" id="addStreamCard" style="display:none;">
+      <div class="filter-field-label">Add a public stream to the shared catalog</div>
+      <div class="status-text fs11" style="color:var(--muted);">Paste a public HLS (.m3u8) URL or a YouTube live page. Enter the city and country yourself; we do not auto-detect location.</div>
+      <div class="filter-grid filter-grid-primary">
+        <div class="filter-field">
+          <div class="filter-field-label">Name</div>
+          <input id="addStreamName" placeholder="Stream name" />
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">City</div>
+          <input id="addStreamCity" placeholder="City" />
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Country</div>
+          <input id="addStreamCountry" placeholder="Country" />
+        </div>
+      </div>
+      <div class="filter-grid filter-grid-primary">
+        <div class="filter-field">
+          <div class="filter-field-label">Stream URL</div>
+          <input id="addStreamUrl" placeholder="https://example.com/stream.m3u8" />
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Tags (optional, comma separated)</div>
+          <input id="addStreamTags" placeholder="tag1, tag2" />
+        </div>
+      </div>
+      <div class="filter-footer">
+        <div class="row">
+          <button id="addStreamSubmit">Add to catalog</button>
+          <button id="addStreamCancel">Cancel</button>
+        </div>
+        <span class="status-text" id="addStreamStatus"></span>
       </div>
     </div>
     <div class="toolbar filter-status-row">
@@ -1687,6 +1723,16 @@ const streamPageSizeEl = $('streamPageSize');
 const streamPrevEl = $('streamPrev');
 const streamNextEl = $('streamNext');
 const streamCsvBtnEl = $('streamCsvBtn');
+const addStreamBtnEl = $('addStreamBtn');
+const addStreamCardEl = $('addStreamCard');
+const addStreamNameEl = $('addStreamName');
+const addStreamCityEl = $('addStreamCity');
+const addStreamCountryEl = $('addStreamCountry');
+const addStreamUrlEl = $('addStreamUrl');
+const addStreamTagsEl = $('addStreamTags');
+const addStreamSubmitEl = $('addStreamSubmit');
+const addStreamCancelEl = $('addStreamCancel');
+const addStreamStatusEl = $('addStreamStatus');
 const streamPageInfo = $('streamPageInfo');
 const streamStatus = $('streamStatus');
 const streamFilterSummary = $('streamFilterSummary');
@@ -2742,6 +2788,7 @@ async function fetchJSONWithTimeout(path, opts = {}, timeoutMs = 0, timeoutMessa
 
 function syncAuthDependentUI() {
   syncDetailAuthState();
+  syncAddStreamUI();
   if (streamRows.length) renderStreamRows();
   // The detail tag editor renders editable vs read-only based on can_edit_tags,
   // so re-render it once the session capabilities resolve after initial paint.
@@ -2790,6 +2837,78 @@ function syncDetailAuthState() {
       ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Stop/unassign actions use your browser session.`
       : `Start recording is available without sign-in. <a href="${signInURL}">Sign in</a> to stop/unassign recordings or edit tags.`;
   }
+}
+
+function syncAddStreamUI() {
+  const canAdd = hasAuthCapability('can_edit_tags');
+  if (addStreamBtnEl instanceof HTMLElement) {
+    addStreamBtnEl.style.display = canAdd ? '' : 'none';
+  }
+  if (!canAdd && addStreamCardEl instanceof HTMLElement) {
+    addStreamCardEl.style.display = 'none';
+  }
+}
+
+function setAddStreamStatus(message, kind = '') {
+  if (!(addStreamStatusEl instanceof HTMLElement)) return;
+  addStreamStatusEl.textContent = message || '';
+  addStreamStatusEl.className = kind ? `status-text ${kind}` : 'status-text';
+}
+
+function clearAddStreamForm() {
+  for (const el of [addStreamNameEl, addStreamCityEl, addStreamCountryEl, addStreamUrlEl, addStreamTagsEl]) {
+    if (el instanceof HTMLInputElement) el.value = '';
+  }
+}
+
+async function submitAddStream() {
+  if (!hasAuthCapability('can_edit_tags')) {
+    setAddStreamStatus('Sign in to add a stream.', 'err');
+    return;
+  }
+  const name = String(addStreamNameEl.value || '').trim();
+  const url = String(addStreamUrlEl.value || '').trim();
+  const city = String(addStreamCityEl.value || '').trim();
+  const country = String(addStreamCountryEl.value || '').trim();
+  if (!name) { setAddStreamStatus('Name is required.', 'err'); return; }
+  if (!url) { setAddStreamStatus('Stream URL is required.', 'err'); return; }
+  if (!city) { setAddStreamStatus('City is required.', 'err'); return; }
+  if (!country) { setAddStreamStatus('Country is required.', 'err'); return; }
+  const tags = normalizeTags(splitCSV(String(addStreamTagsEl.value || '')));
+  setAddStreamStatus('Checking the stream...', '');
+  addStreamSubmitEl.disabled = true;
+  try {
+    await fetchJSON('/api/v1/dashboard/streams', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, url, city, country, tags }),
+    });
+    setAddStreamStatus('Added.', 'ok');
+    clearAddStreamForm();
+    await reloadStreamsForFilterChange({ reloadAllOptions: true });
+  } catch (err) {
+    setAddStreamStatus(String(err && err.message ? err.message : err), 'err');
+  } finally {
+    addStreamSubmitEl.disabled = false;
+  }
+}
+
+if (addStreamBtnEl instanceof HTMLElement) {
+  addStreamBtnEl.addEventListener('click', () => {
+    if (!(addStreamCardEl instanceof HTMLElement)) return;
+    const open = addStreamCardEl.style.display !== 'none';
+    addStreamCardEl.style.display = open ? 'none' : '';
+    if (!open) { setAddStreamStatus(''); addStreamNameEl.focus(); }
+  });
+}
+if (addStreamCancelEl instanceof HTMLElement) {
+  addStreamCancelEl.addEventListener('click', () => {
+    if (addStreamCardEl instanceof HTMLElement) addStreamCardEl.style.display = 'none';
+    setAddStreamStatus('');
+  });
+}
+if (addStreamSubmitEl instanceof HTMLElement) {
+  addStreamSubmitEl.addEventListener('click', submitAddStream);
 }
 
 function renderDisabledButton(label, title = '') {

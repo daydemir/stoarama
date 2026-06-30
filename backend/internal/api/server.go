@@ -351,6 +351,7 @@ func (s *Server) router() http.Handler {
 		api.Group(func(memberSession chi.Router) {
 			memberSession.Use(s.requireAccountSessionAuth)
 
+			memberSession.Post("/dashboard/streams", s.handleDashboardStreamAdd)
 			memberSession.Post("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsAdd)
 			memberSession.Delete("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsRemove)
 		})

@@ -389,6 +389,13 @@ func ResolvedCaptureTypeFromURL(raw string) string {
 	}
 }
 
+// IsYouTubeWatchURL reports whether raw is a YouTube watch/live page URL. It is
+// the exported form of the internal detector used to classify capture types, so
+// callers (e.g. the add-stream form) can pick the right provider namespace.
+func IsYouTubeWatchURL(raw string) bool {
+	return isYouTubeWatchURL(raw)
+}
+
 func isYouTubeWatchURL(raw string) bool {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
