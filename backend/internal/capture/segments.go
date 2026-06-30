@@ -523,6 +523,18 @@ func CleanupSegment(seg Segment) {
 	_ = os.RemoveAll(filepath.Dir(seg.Path))
 }
 
+// RemoveSegmentFile deletes ONLY the single segment file, not its parent
+// directory. CaptureContinuous shares one output dir that the persistent ffmpeg
+// is still writing into, so the per-segment cleanup must remove the finalized
+// file alone; removing the dir (as CleanupSegment does for the per-clip path)
+// would make ffmpeg fail to open the next segment.
+func RemoveSegmentFile(seg Segment) {
+	if strings.TrimSpace(seg.Path) == "" {
+		return
+	}
+	_ = os.Remove(seg.Path)
+}
+
 func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Duration, pinHost string, targetFPS *int) []string {
 	seconds := strconv.FormatFloat(duration.Seconds(), 'f', -1, 64)
 	args := []string{

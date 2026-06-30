@@ -311,12 +311,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// re-capturing the same wall-clock second). Treat as already-done so a
 			// re-lease is idempotent rather than failing the whole window.
 			if isAlreadyIngested(err) {
-				capture.CleanupSegment(seg)
+				capture.RemoveSegmentFile(seg)
 				return nil
 			}
 			return fmt.Errorf("ingest segment: %w", err)
 		}
-		capture.CleanupSegment(seg)
+		capture.RemoveSegmentFile(seg)
 		log.Printf("recording worker job=%d recording=%d continuous segment ingested start=%s size=%d",
 			job.JobID, job.RecordingID, seg.StartAt.UTC().Format(time.RFC3339), seg.SizeBytes)
 		return nil
