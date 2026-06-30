@@ -399,6 +399,17 @@
           </div>
         </div>
 
+        <!-- Frame rate -->
+        <div class="field">
+          <label>Frame rate</label>
+          <div class="seg" id="fpsSeg">
+            <button type="button" data-fps="source" class="on">Source</button>
+            <button type="button" data-fps="30">30 fps</button>
+            <button type="button" data-fps="15">15 fps</button>
+          </div>
+          <div class="hint">Source keeps the stream's native frame rate with no re-encode, which is the cheapest option. 15 fps is common for computer-vision pedestrian detection, since it cuts storage and compute. Choosing 30 or 15 re-encodes each clip to that rate.</div>
+        </div>
+
         <!-- Projected monthly cost for this configuration (honest estimate) -->
         <div class="field" id="estimateField">
           <label>Estimated monthly cost</label>
@@ -536,6 +547,7 @@
       clipSeg: document.getElementById('clipSeg'),
       clipCustomWrap: document.getElementById('clipCustomWrap'),
       clipCustom: document.getElementById('clipCustom'),
+      fpsSeg: document.getElementById('fpsSeg'),
       costEstimate: document.getElementById('costEstimate'),
       costEstimateNote: document.getElementById('costEstimateNote'),
       bucketState: document.getElementById('bucketState'),
@@ -616,6 +628,8 @@
       destinations: [],
       schedPreset: 'hourly',
       clipSelected: 60,
+      // Frame rate choice: 'source' (native, no re-encode) | '30' | '15'.
+      targetFps: 'source',
       verifiedDestId: 0, // a bucket just verified inline this session
       // Storage choice when the chooser is shown: '' (none yet) | 'managed' | 'byo'.
       storageChoice: '',
@@ -1028,6 +1042,19 @@
       refreshScheduleUI();
       renderCostEstimate();
       refreshStartEnabled();
+    }
+
+    function setFps(fps) {
+      state.targetFps = fps;
+      els.fpsSeg.querySelectorAll('button[data-fps]').forEach((b) => {
+        b.classList.toggle('on', b.getAttribute('data-fps') === String(fps));
+      });
+    }
+
+    // Returns the chosen frame rate as a number (15 or 30), or null for the
+    // Source/native option (omitted from the create body so the server stores NULL).
+    function selectedTargetFps() {
+      return state.targetFps === 'source' ? null : Number(state.targetFps);
     }
 
     // ---- Bucket connection state (change 1) ----
@@ -1672,6 +1699,8 @@
       const metaParts = [];
       metaParts.push(`<span class="meta-strong">${escapeHTML(scheduleLabel(rec))}</span>`);
       metaParts.push(`<span>${clip}s clips</span>`);
+      const tfps = Number(rec.target_fps || 0);
+      metaParts.push(`<span>${tfps > 0 ? `${tfps} fps` : 'Source fps'}</span>`);
       if (last) {
         let word = '';
         if (status === 'active' && health !== 'idle') word = ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>`;
@@ -1788,6 +1817,15 @@
       return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
     }
 
+    // Shows the clip's probed frame rate compactly: a whole number when it rounds
+    // cleanly (29.97 -> "30"), otherwise one decimal.
+    function formatFps(v) {
+      const n = Number(v || 0);
+      if (!Number.isFinite(n) || n <= 0) return '';
+      const r = Math.round(n);
+      return Math.abs(n - r) < 0.1 ? String(r) : n.toFixed(1);
+    }
+
     function formatDuration(ms) {
       const s = Math.round(Number(ms || 0) / 1000);
       if (s <= 0) return '0s';
@@ -1851,10 +1889,12 @@
           + transferBtn
           + `<button type="button" class="danger" data-clipdelete="${recId}:${cid}">Delete</button>`
           + `</div>`;
+      const fpsPart = (c.actual_fps != null && Number(c.actual_fps) > 0)
+        ? ` &middot; ${escapeHTML(formatFps(c.actual_fps))} fps` : '';
       return `
         <div class="clip-row${purged ? ' purged' : ''}" data-cliprow="${cid}">
           <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
-          <span class="clip-meta">${escapeHTML(formatDuration(c.duration_ms))} &middot; ${escapeHTML(formatBytes(c.size_bytes))}</span>
+          <span class="clip-meta">${escapeHTML(formatDuration(c.duration_ms))} &middot; ${escapeHTML(formatBytes(c.size_bytes))}${fpsPart}</span>
           ${actions}
         </div>
         <div class="clip-xfer hidden" data-clipxfer="${cid}"></div>`;
@@ -2446,6 +2486,10 @@
         start_at: win.startISO,
         end_at: win.endISO,
       };
+      // Frame rate: omit for Source/native (server stores NULL, keeps -c copy),
+      // send the number for 30 or 15 (server re-encodes each clip to that rate).
+      const tfps = selectedTargetFps();
+      if (tfps) body.target_fps = tfps;
       // A webdav shared dest delivers via managed staging: send only
       // delivery_storage_destination_id. Otherwise send the capture dest.
       if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
@@ -2599,6 +2643,8 @@
       const v = b.getAttribute('data-clip');
       b.addEventListener('click', () => setClip(v === 'custom' ? 'custom' : Number(v)));
     });
+    els.fpsSeg.querySelectorAll('button[data-fps]').forEach((b) =>
+      b.addEventListener('click', () => setFps(b.getAttribute('data-fps'))));
     els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });

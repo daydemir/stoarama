@@ -42,6 +42,7 @@ type recordingLeaseResponse struct {
 	FireAt               time.Time `json:"fire_at"`
 	AttemptCount         int       `json:"attempt_count"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
+	TargetFPS            *int      `json:"target_fps"`
 }
 
 // handleRecordingJobsLease leases at most one due recording job for the calling
@@ -101,10 +102,12 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		FROM cte, recordings rec
 		WHERE j.id = cte.id AND rec.id = j.recording_id
 		RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
-		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at
+		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
+		          rec.target_fps
 	`, workerID, billingDisabled, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec).Scan(
 		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
 		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
+		&resp.TargetFPS,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"job": nil})

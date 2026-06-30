@@ -48,6 +48,10 @@ type recordingCreateRequest struct {
 	CronExpr                     string `json:"cron_expr"`
 	CronTimezone                 string `json:"cron_timezone"`
 	ClipDurationSec              int    `json:"clip_duration_sec"`
+	// TargetFPS normalizes each captured clip to that exact frame rate. nil =
+	// Source/native (stream-copy, preserve source fps, no re-encode, the cheap
+	// default). The composer offers 15 and 30; the server accepts only those.
+	TargetFPS *int `json:"target_fps"`
 	// Capture window. StartAt defaults to now() (start immediately); EndAt is
 	// open-ended when nil. When both are set, EndAt must be strictly after StartAt.
 	StartAt *time.Time `json:"start_at"`
@@ -63,7 +67,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT
 			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
-			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec,
+			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
 			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
 			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
 			COALESCE((SELECT b.has_payment_method FROM account_billing b
@@ -165,6 +169,18 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	if clipDuration < 5 || clipDuration > 900 {
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
+	}
+
+	// target_fps: NULL = Source/native (preserve source fps, no re-encode). The
+	// composer only offers 15 and 30, so reject any other value to keep the
+	// contract tight.
+	var targetFPSArg any
+	if req.TargetFPS != nil {
+		if *req.TargetFPS != 15 && *req.TargetFPS != 30 {
+			util.WriteError(w, http.StatusBadRequest, "target_fps must be 15 or 30 (omit for Source)")
+			return
+		}
+		targetFPSArg = *req.TargetFPS
 	}
 
 	// Capture window: start_at defaults to now() (start immediately), end_at is
@@ -334,10 +350,10 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	)
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at, start_at, end_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11,$12,$13)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, target_fps, status, next_fire_at, start_at, end_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13,$14)
 		RETURNING id, created_at, start_at, end_at
-	`, principal.AccountID, captureDestID, deliveryDestArg, name, streamURL, streamIDArg, sourceKind, cronExpr, cronTimezone, clipDuration, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
+	`, principal.AccountID, captureDestID, deliveryDestArg, name, streamURL, streamIDArg, sourceKind, cronExpr, cronTimezone, clipDuration, targetFPSArg, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -428,7 +444,7 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 	row := s.pool.QueryRow(r.Context(), `
 		SELECT
 			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
-			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec,
+			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
 			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
 			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
 			COALESCE((SELECT b.has_payment_method FROM account_billing b
@@ -496,7 +512,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	offset := parseIntQuery(r, "offset", 0, 0, 1<<30)
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, object_key, storage_destination_id, purged_at
+		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps, object_key, storage_destination_id, purged_at
 		FROM recording_clips
 		WHERE recording_id=$1
 		ORDER BY fire_at DESC
@@ -516,11 +532,12 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			clipEndAt    time.Time
 			sizeBytes    int64
 			durationMs   int64
+			actualFPS    *float64
 			objectKey    string
 			sourceDestID int64
 			purgedAt     *time.Time
 		)
-		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &objectKey, &sourceDestID, &purgedAt); err != nil {
+		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &actualFPS, &objectKey, &sourceDestID, &purgedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
 			return
 		}
@@ -531,6 +548,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			"clip_end_at":            clipEndAt.UTC(),
 			"size_bytes":             sizeBytes,
 			"duration_ms":            durationMs,
+			"actual_fps":             actualFPS,
 			"object_key":             objectKey,
 			"storage_destination_id": sourceDestID,
 			"purged":                 purgedAt != nil,
@@ -778,6 +796,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		cronExpr         string
 		cronTimezone     string
 		clipDurationSec  int
+		targetFPS        *int
 		status           string
 		startAt          time.Time
 		endAt            *time.Time
@@ -796,7 +815,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
-		&sourceKind, &cronExpr, &cronTimezone, &clipDurationSec,
+		&sourceKind, &cronExpr, &cronTimezone, &clipDurationSec, &targetFPS,
 		&status, &startAt, &endAt, &nextFireAt, &lastClipAt,
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
@@ -819,6 +838,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"cron_expr":                cronExpr,
 		"cron_timezone":            cronTimezone,
 		"clip_duration_sec":        clipDurationSec,
+		"target_fps":               targetFPS,
 		"status":                   status,
 		"start_at":                 startAt.UTC(),
 		"end_at":                   endAt,

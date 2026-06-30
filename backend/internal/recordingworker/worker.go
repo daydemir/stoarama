@@ -174,7 +174,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 	captureCtx, captureCancel := context.WithTimeout(jobCtx, capture.SegmentCaptureTimeout(clipDuration))
-	seg, err := capture.CaptureSegment(captureCtx, sourceURL, clipDuration, "")
+	seg, err := capture.CaptureSegment(captureCtx, sourceURL, clipDuration, "", job.TargetFPS)
 	captureCancel()
 	if err != nil {
 		if canceled() {

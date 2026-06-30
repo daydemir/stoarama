@@ -57,7 +57,12 @@ func SegmentCaptureTimeout(duration time.Duration) time.Duration {
 // original hostname carried as the HTTP Host header / TLS SNI while sourceURL
 // already points at the SSRF-validated literal IP, pinning the ffmpeg socket to
 // that address. Pass "" to leave DNS resolution to ffmpeg.
-func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duration, pinHost string) (Segment, error) {
+//
+// targetFPS, when non-nil and > 0, normalizes the captured clip to that exact
+// frame rate by re-encoding (you cannot change fps with -c copy). Pass nil for
+// the Source/native path, which stream-copies and preserves the source fps with
+// no re-encode (the cheap default).
+func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
 	}
@@ -72,7 +77,7 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
-	args := buildFFmpegSegmentArgs(sourceURL, outPath, duration, pinHost)
+	args := buildFFmpegSegmentArgs(sourceURL, outPath, duration, pinHost, targetFPS)
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -202,9 +207,10 @@ func CaptureSingleFrame(ctx context.Context, sourceURL string, pinHost string) (
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Step 1: record a short clip with -c copy (no decode -> no segfault).
+	// Step 1: record a short clip with -c copy (no decode -> no segfault). The
+	// survey path always uses Source/native (nil), so this stays a pure copy.
 	segPath := filepath.Join(tmpDir, "segment.mp4")
-	segArgs := buildFFmpegSegmentArgs(sourceURL, segPath, SingleFrameSegmentDuration, pinHost)
+	segArgs := buildFFmpegSegmentArgs(sourceURL, segPath, SingleFrameSegmentDuration, pinHost, nil)
 	segCmd := exec.CommandContext(ctx, ffmpegBin(), segArgs...)
 	if out, err := segCmd.CombinedOutput(); err != nil {
 		return Frame{}, fmt.Errorf("record single-frame segment: %w (%s)", err, strings.TrimSpace(string(out)))
@@ -258,7 +264,7 @@ func CleanupSegment(seg Segment) {
 	_ = os.RemoveAll(filepath.Dir(seg.Path))
 }
 
-func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Duration, pinHost string) []string {
+func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Duration, pinHost string, targetFPS *int) []string {
 	seconds := strconv.FormatFloat(duration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
@@ -272,6 +278,29 @@ func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Dura
 		"-t", seconds,
 		"-map", "0:v:0",
 		"-map", "0:a?",
+	)
+	if targetFPS != nil && *targetFPS > 0 {
+		// Fixed-fps path: normalize the clip to the chosen rate. Changing fps
+		// requires a re-encode (-c copy cannot), so transcode video with the
+		// canonical `fps` filter (it duplicates frames to upsample, e.g. 10->30,
+		// and drops frames to downsample, e.g. 60->15) and re-encode audio so the
+		// output container is consistent. `-map 0:a?` keeps audio optional, so a
+		// video-only stream still produces a valid file.
+		args = append(args,
+			"-vf", fmt.Sprintf("fps=%d", *targetFPS),
+			"-c:v", "libx264",
+			"-preset", "veryfast",
+			"-crf", "23",
+			"-pix_fmt", "yuv420p",
+			"-c:a", "aac",
+			"-b:a", "128k",
+			outPath,
+		)
+		return args
+	}
+	// Source/native path: stream-copy, preserving the source frame rate with no
+	// re-encode. This is the cheap default.
+	args = append(args,
 		"-c", "copy",
 		outPath,
 	)

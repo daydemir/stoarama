@@ -58,6 +58,9 @@ type RecordingJob struct {
 	FireAt               time.Time `json:"fire_at"`
 	AttemptCount         int       `json:"attempt_count"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
+	// TargetFPS, when non-nil, normalizes each captured clip to that exact frame
+	// rate (re-encode). nil = Source/native (stream-copy, preserve source fps).
+	TargetFPS *int `json:"target_fps"`
 }
 
 // ClipUploadIntent is a presigned PUT against the user's bucket.

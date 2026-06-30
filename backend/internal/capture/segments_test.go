@@ -10,7 +10,7 @@ import (
 )
 
 func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", DefaultSegmentDuration, "")
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", DefaultSegmentDuration, "", nil)
 	joined := strings.Join(args, " ")
 
 	for _, unwanted := range []string{
@@ -54,10 +54,37 @@ func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
 }
 
 func TestBuildFFmpegSegmentArgsUsesRequestedDuration(t *testing.T) {
-	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", 90*time.Second, "")
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", 90*time.Second, "", nil)
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "-t 90") {
 		t.Fatalf("expected 90s segment duration in args: %s", joined)
+	}
+}
+
+// TestBuildFFmpegSegmentArgsFixedFPS asserts that a non-nil targetFPS switches
+// the capture from stream-copy to a re-encode that normalizes the clip to the
+// chosen rate: the canonical `fps` filter, an H.264 video encode, and an AAC
+// audio encode, with NO `-c copy` (you cannot change fps while copying).
+func TestBuildFFmpegSegmentArgsFixedFPS(t *testing.T) {
+	fps := 15
+	args := buildFFmpegSegmentArgs("https://example.com/live.mp4", "/tmp/segment.mp4", DefaultSegmentDuration, "", &fps)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-vf fps=15",
+		"-c:v libx264",
+		"-preset veryfast",
+		"-crf 23",
+		"-pix_fmt yuv420p",
+		"-c:a aac",
+		"-b:a 128k",
+		"/tmp/segment.mp4",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected %q in fixed-fps args: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "-c copy") {
+		t.Fatalf("fixed-fps capture must re-encode, not -c copy, got args: %s", joined)
 	}
 }
 
