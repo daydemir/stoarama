@@ -23,10 +23,11 @@ import (
 // never double-lease.
 const clipTransferTickInterval = 10 * time.Second
 
-// clipTransferMaxPerTick bounds how many jobs one tick copies. Kept tiny because
+// clipTransferMaxPerTick bounds how many jobs one tick copies. Kept small because
 // each job streams an entire clip; SKIP LOCKED spreads remaining work across the
-// next ticks.
-const clipTransferMaxPerTick = 2
+// next ticks. Raised modestly from 2 so a bulk export's large backlog drains in
+// reasonable time without unbounded per-tick concurrency.
+const clipTransferMaxPerTick = 5
 
 // clipTransferLeaseSec is the lease window. It must outlast a single copy; a
 // stalled worker's lease expires after this and another tick re-leases the job.

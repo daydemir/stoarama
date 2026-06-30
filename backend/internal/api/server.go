@@ -223,6 +223,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/clips-zip/{jobId}", s.handleDayZipGet)
 			account.Post("/recordings/{id}/clips/{clipId}/transfer", s.handleAccountRecordingClipTransfer)
 			account.Get("/recordings/{id}/transfers", s.handleAccountRecordingTransfers)
+			account.Post("/exports", s.handleAccountExportCreate)
+			account.Get("/exports/progress", s.handleAccountExportProgress)
 			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
 			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)
@@ -6887,6 +6889,15 @@ func parseInt64QueryPtr(r *http.Request, key string) *int64 {
 		return nil
 	}
 	return &v
+}
+
+// parseInt64Query returns the int64 query value for key, or 0 when absent or
+// unparseable. Used by endpoints that treat a missing/invalid id as "not set".
+func parseInt64Query(r *http.Request, key string) int64 {
+	if v := parseInt64QueryPtr(r, key); v != nil {
+		return *v
+	}
+	return 0
 }
 
 func parseFloat64QueryPtr(r *http.Request, key string) *float64 {

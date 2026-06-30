@@ -186,6 +186,16 @@
     .clip-xfer-status { color: var(--muted); padding: 2px 0; }
     .clip-xfer-status.status-done b { color: var(--ok, #2e7d32); }
     .clip-xfer-status.status-error b { color: var(--err); }
+    /* Bulk export-all control */
+    .bulk-export { margin: 10px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; font-size: 12px; }
+    .bulk-export-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .bulk-export-row select { width: auto; min-width: 160px; min-height: 28px; padding: 4px 8px; font-size: 12px; }
+    .bulk-export-row button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
+    .bulk-export-row label { display: inline-flex; align-items: center; gap: 5px; color: var(--text); }
+    .bulk-export-row input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
+    .bulk-export-hint { margin-top: 6px; color: var(--muted); line-height: 1.45; }
+    .bulk-export-status { margin-top: 8px; color: var(--muted); }
+    .bulk-export-status.is-error { color: var(--err); }
     /* Per-card blocking "no card" state */
     .card-blocked { margin-top: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 13px; color: var(--text); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
     .card-blocked b { color: var(--warn); }
@@ -2006,8 +2016,11 @@
       const note = eligibleTargets > 0
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="#" data-connectbucket="1">connect a bucket first</a>.</div>`;
-      panel.innerHTML = summary + bulk + clipTableHTML(rows, false) + note;
+      const liveSources = [...new Set(items.filter((c) => c.purged !== true).map((c) => Number(c.storage_destination_id)))];
+      const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
+      panel.innerHTML = summary + bulk + exportCtl + clipTableHTML(rows, false) + note;
       wireClipActions(panel);
+      wireBulkExport(panel);
       void reloadTransfers(panel, recId);
     }
 
@@ -2095,9 +2108,13 @@
       const note = eligibleTargets > 0
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="/recordings">connect a bucket first</a> from the recordings page.</div>`;
+      // The export-all control acts over the WHOLE recording, not just this page.
+      const liveSources = [...new Set(items.filter((c) => c.purged !== true).map((c) => Number(c.storage_destination_id)))];
+      const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
 
-      root.innerHTML = header + pageActions + clipTableHTML(rows, false) + note + clipPagerHTML(page, pageCount);
+      root.innerHTML = header + pageActions + exportCtl + clipTableHTML(rows, false) + note + clipPagerHTML(page, pageCount);
       wireClipActions(root);
+      wireBulkExport(root);
       wireClipPageNav(root);
       void reloadTransfers(root, recId);
     }
@@ -2168,6 +2185,93 @@
       } finally {
         btn.disabled = false;
       }
+    }
+
+    // Bulk "export all clips to a destination" control. scopeRef is
+    // {scope, recording_id?, bundle_id?} identifying the clip set; sourceDestIds
+    // is the set of destination ids the in-scope clips already live in, so a
+    // self-copy target is filtered out of the picker. Returns the control HTML, or
+    // an empty string when there is no eligible target. wireBulkExport binds it.
+    function bulkExportHTML(scopeRef, sourceDestIds) {
+      const sources = new Set((sourceDestIds || []).map(Number));
+      const targets = (state.destinations || []).filter((d) => d.status === 'verified' && !sources.has(Number(d.id)));
+      if (targets.length === 0) return '';
+      const opts = targets.map((d) => `<option value="${Number(d.id)}">${escapeHTML(d.name || ('bucket #' + d.id))}</option>`).join('');
+      const ref = encodeURIComponent(JSON.stringify(scopeRef));
+      return `<div class="bulk-export" data-bulkexport="${ref}">
+        <div class="bulk-export-row">
+          <span>Export all clips to:</span>
+          <select data-bulkexporttarget>${opts}</select>
+          <label><input type="checkbox" data-bulkexportpurge> Delete from Stoarama after copy</label>
+          <button type="button" class="secondary" data-bulkexportgo>Export all</button>
+        </div>
+        <div class="bulk-export-hint">Copy every clip in this view to your own storage in one action. Check the box to remove the Stoarama copy after each clip is copied and stop storage charges for it.</div>
+        <div class="bulk-export-status" data-bulkexportstatus></div>
+      </div>`;
+    }
+
+    function wireBulkExport(panel) {
+      panel.querySelectorAll('[data-bulkexport]').forEach((box) => {
+        const btn = box.querySelector('button[data-bulkexportgo]');
+        if (btn) btn.addEventListener('click', () => startBulkExport(box));
+      });
+    }
+
+    // Build the /exports and /exports/progress query/body params from a scope ref.
+    function bulkExportScopeParams(scopeRef, targetId) {
+      const params = new URLSearchParams({ scope: scopeRef.scope, storage_destination_id: String(targetId) });
+      if (scopeRef.recording_id) params.set('recording_id', String(scopeRef.recording_id));
+      if (scopeRef.bundle_id) params.set('bundle_id', String(scopeRef.bundle_id));
+      return params;
+    }
+
+    async function startBulkExport(box) {
+      let scopeRef;
+      try { scopeRef = JSON.parse(decodeURIComponent(box.getAttribute('data-bulkexport'))); }
+      catch (_) { return; }
+      const sel = box.querySelector('select[data-bulkexporttarget]');
+      const targetId = Number(sel && sel.value);
+      if (!targetId) return;
+      const purge = !!(box.querySelector('input[data-bulkexportpurge]') || {}).checked;
+      const btn = box.querySelector('button[data-bulkexportgo]');
+      const statusEl = box.querySelector('[data-bulkexportstatus]');
+      const setStatus = (t, isErr) => { if (statusEl) { statusEl.textContent = t; statusEl.classList.toggle('is-error', !!isErr); } };
+      if (purge && !window.confirm('Copy every clip to your own storage and DELETE the Stoarama copy after each one is copied? This frees managed storage but the clip will only live in your destination afterward.')) return;
+      if (btn) { btn.disabled = true; btn.textContent = 'Exporting...'; }
+      setStatus('Enqueuing...', false);
+      try {
+        const res = await fetchJSON('/api/v1/account/exports', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scope: scopeRef.scope, recording_id: scopeRef.recording_id || 0, bundle_id: scopeRef.bundle_id || 0, storage_destination_id: targetId, purge_source: purge }),
+        });
+        const total = Number(res.total_clips || 0);
+        if (total === 0) { setStatus('Nothing to export (all clips already copied to this destination).', false); if (btn) { btn.disabled = false; btn.textContent = 'Export all'; } return; }
+        pollBulkExport(box, scopeRef, targetId, btn, setStatus);
+      } catch (err) {
+        setStatus(String(err.message || err), true);
+        if (btn) { btn.disabled = false; btn.textContent = 'Export all'; }
+      }
+    }
+
+    // Poll /exports/progress on the same scope+target until every job is done or
+    // failed, rendering live counts. Stops when in_progress reaches 0.
+    function pollBulkExport(box, scopeRef, targetId, btn, setStatus) {
+      let ticks = 0;
+      const tick = async () => {
+        ticks += 1;
+        if (!document.body.contains(box)) return;
+        let p;
+        try { p = await fetchJSON('/api/v1/account/exports/progress?' + bulkExportScopeParams(scopeRef, targetId).toString()); }
+        catch (_) { if (ticks < 200) window.setTimeout(tick, 3000); return; }
+        const total = Number(p.total || 0);
+        const done = Number(p.done || 0);
+        const inProgress = Number(p.in_progress || 0);
+        const failed = Number(p.error || 0);
+        setStatus(`Exporting: ${done}/${total} done, ${inProgress} in progress${failed > 0 ? `, ${failed} failed` : ''}`, failed > 0 && inProgress === 0);
+        if (inProgress > 0 && ticks < 200) { window.setTimeout(tick, 3000); return; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Export all'; }
+      };
+      window.setTimeout(tick, 1500);
     }
 
     function wireClipActions(panel) {
@@ -3179,10 +3283,14 @@
         <span class="clip-pager-label">Page ${page2 + 1} of ${pageCount}</span>
         <button type="button" class="secondary" data-bundleclippage="next"${page2 >= pageCount - 1 ? ' disabled' : ''}>Next</button>
       </div>`;
-      body.innerHTML = summary + pageActions + clipTableHTML(rows, true) + pager;
+      // The export-all control acts over the WHOLE bundle, not just this page.
+      const liveSources = [...new Set(items.filter((c) => c.purged !== true).map((c) => Number(c.storage_destination_id)))];
+      const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'bundle', bundle_id: bundleClipState.bundleId }, liveSources) : '';
+      body.innerHTML = summary + pageActions + exportCtl + clipTableHTML(rows, true) + pager;
       // Reuse the per-clip View/Download/Send/Delete wiring; each row carries its own
       // member recording_id so the actions hit the right per-recording endpoints.
       wireClipActions(body);
+      wireBulkExport(body);
       body.querySelectorAll('button[data-bundleclippage]').forEach((bn) =>
         bn.addEventListener('click', () => loadBundleClips(bn.getAttribute('data-bundleclippage') === 'prev' ? bundleClipState.page - 1 : bundleClipState.page + 1)));
       const zipBtn = body.querySelector('button[data-bundlezip]');

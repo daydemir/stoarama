@@ -757,6 +757,329 @@ func (s *Server) handleAccountRecordingClipTransfer(w http.ResponseWriter, r *ht
 	util.WriteJSON(w, http.StatusOK, resp)
 }
 
+// exportBatchSize bounds one multi-row clip_transfer_jobs insert during a bulk
+// export. The clip set is streamed from a server-side cursor and flushed in
+// batches of this size so an account with thousands of clips never materializes
+// the whole set in memory.
+const exportBatchSize = 500
+
+// exportCreateRequest is the bulk-export body. scope selects the clip set
+// (account: every clip; recording: one recording's clips; bundle: every member
+// recording's clips). One target storage_destination_id receives the copies; an
+// optional purge_source deletes each managed source object after a confirmed
+// copy so managed storage stops accruing gb_month.
+type exportCreateRequest struct {
+	Scope                      string `json:"scope"`
+	RecordingID                int64  `json:"recording_id"`
+	BundleID                   int64  `json:"bundle_id"`
+	StorageDestinationID       int64  `json:"storage_destination_id"`
+	TargetStorageDestinationID int64  `json:"target_storage_destination_id"`
+	PurgeSource                bool   `json:"purge_source"`
+}
+
+// exportClipRow is one streamed clip in scope: the minimum needed to build the
+// target key + idempotency key for its transfer job.
+type exportClipRow struct {
+	id          int64
+	recordingID int64
+	objectKey   string
+}
+
+// handleAccountExportCreate enqueues a clip_transfer_job for EVERY not-yet-
+// transferred clip in a scope to one storage destination, reusing the exact
+// per-clip enqueue contract of handleAccountRecordingClipTransfer (same
+// idempotency_key namespace and target_object_key builder) so a bulk-enqueued
+// row is indistinguishable from a single-clip transfer and the same worker
+// drains it. The clip set is streamed from a server-side cursor and inserted in
+// batches with ON CONFLICT (idempotency_key) DO NOTHING, so the operation is
+// idempotent and resumable: a clip already enqueued/in-flight/done to the target
+// is skipped, and a re-run only inserts the remainder. Clips already living in
+// the target destination, or already purged, are excluded by the scope query so
+// no self-copy is ever enqueued.
+func (s *Server) handleAccountExportCreate(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req exportCreateRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	targetDestID := req.StorageDestinationID
+	if targetDestID <= 0 {
+		targetDestID = req.TargetStorageDestinationID
+	}
+	if targetDestID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "storage_destination_id is required")
+		return
+	}
+	scope := strings.TrimSpace(req.Scope)
+	if scope == "" {
+		scope = "account"
+	}
+
+	// The target destination must be owned by the same account, or be a shared
+	// destination the account was granted (same predicate the single-clip
+	// transfer uses). Its key_prefix is needed to build each target object key.
+	var targetKeyPrefix string
+	err := s.pool.QueryRow(r.Context(), fmt.Sprintf(`
+		SELECT sd.key_prefix FROM storage_destinations sd WHERE sd.id=$1 AND %s
+	`, fmt.Sprintf(storageDestAccessPredicate, "$2")), targetDestID, principal.AccountID).Scan(&targetKeyPrefix)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "target storage destination not found")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load target destination: %v", err))
+		return
+	}
+
+	// Resolve the scope to a WHERE predicate over the shared
+	// recording_clips JOIN recordings pattern, account-scoped. recording and
+	// bundle scopes first verify the caller owns the parent (mirroring the
+	// per-recording / bundle owner checks).
+	var scopeSQL string
+	args := []any{principal.AccountID, targetDestID}
+	switch scope {
+	case "account":
+		scopeSQL = ""
+	case "recording":
+		if req.RecordingID <= 0 {
+			util.WriteError(w, http.StatusBadRequest, "recording_id is required for scope=recording")
+			return
+		}
+		var ownerOK bool
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT EXISTS(SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2)
+		`, req.RecordingID, principal.AccountID).Scan(&ownerOK); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+			return
+		}
+		if !ownerOK {
+			util.WriteError(w, http.StatusNotFound, "recording not found")
+			return
+		}
+		args = append(args, req.RecordingID)
+		scopeSQL = fmt.Sprintf("AND c.recording_id=$%d", len(args))
+	case "bundle":
+		if req.BundleID <= 0 {
+			util.WriteError(w, http.StatusBadRequest, "bundle_id is required for scope=bundle")
+			return
+		}
+		var ownerOK bool
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT EXISTS(SELECT 1 FROM recording_bundles WHERE id=$1 AND account_id=$2 AND status <> 'canceled')
+		`, req.BundleID, principal.AccountID).Scan(&ownerOK); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load bundle: %v", err))
+			return
+		}
+		if !ownerOK {
+			util.WriteError(w, http.StatusNotFound, "bundle not found")
+			return
+		}
+		args = append(args, req.BundleID)
+		scopeSQL = fmt.Sprintf("AND rec.bundle_id=$%d", len(args))
+	default:
+		util.WriteError(w, http.StatusBadRequest, "scope must be account, recording, or bundle")
+		return
+	}
+
+	// Stream the in-scope clip set: not purged, not already living in the target
+	// (so a self-copy is never enqueued), account-scoped, ordered by id so a
+	// resumed run is deterministic. The cursor is iterated WITHOUT materializing
+	// all rows; rows accumulate into a fixed-size batch buffer and flush.
+	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
+		SELECT c.id, c.recording_id, c.object_key
+		FROM recording_clips c
+		JOIN recordings rec ON rec.id = c.recording_id
+		WHERE rec.account_id=$1
+		  AND c.purged_at IS NULL
+		  AND c.storage_destination_id <> $2
+		  %s
+		ORDER BY c.id ASC
+	`, scopeSQL), args...)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list clips: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	var (
+		total    int64
+		enqueued int64
+		batch    []exportClipRow
+	)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		n, err := s.enqueueExportBatch(r.Context(), principal.AccountID, targetDestID, targetKeyPrefix, req.PurgeSource, batch)
+		if err != nil {
+			return err
+		}
+		enqueued += n
+		batch = batch[:0]
+		return nil
+	}
+	for rows.Next() {
+		var row exportClipRow
+		if err := rows.Scan(&row.id, &row.recordingID, &row.objectKey); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
+			return
+		}
+		total++
+		batch = append(batch, row)
+		if len(batch) >= exportBatchSize {
+			if err := flush(); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("enqueue clip transfers: %v", err))
+				return
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate clips: %v", err))
+		return
+	}
+	if err := flush(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("enqueue clip transfers: %v", err))
+		return
+	}
+
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"scope":                         scope,
+		"recording_id":                  req.RecordingID,
+		"bundle_id":                     req.BundleID,
+		"target_storage_destination_id": targetDestID,
+		"total_clips":                   total,
+		"enqueued":                      enqueued,
+		"already_present":               total - enqueued,
+		"purge_source":                  req.PurgeSource,
+	})
+}
+
+// enqueueExportBatch inserts one batch of clip_transfer_jobs in a single Exec
+// via parallel arrays (unnest), with ON CONFLICT (idempotency_key) DO NOTHING so
+// a clip already enqueued/in-flight/done to the target is skipped. The
+// target_object_key and idempotency_key are built exactly as the single-clip
+// transfer builds them, so bulk and single-clip rows share one job namespace.
+// Returns the number of rows actually inserted (newly enqueued).
+func (s *Server) enqueueExportBatch(ctx context.Context, accountID, targetDestID int64, targetKeyPrefix string, purge bool, batch []exportClipRow) (int64, error) {
+	clipIDs := make([]int64, len(batch))
+	targetKeys := make([]string, len(batch))
+	idemKeys := make([]string, len(batch))
+	for i, row := range batch {
+		clipIDs[i] = row.id
+		targetKeys[i] = buildClipTransferObjectKey(targetKeyPrefix, row.recordingID, row.id, row.objectKey)
+		idemKeys[i] = fmt.Sprintf("xfer:%d:%d", row.id, targetDestID)
+	}
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO clip_transfer_jobs
+			(account_id, recording_clip_id, target_storage_destination_id, target_object_key, idempotency_key, auto_purge_source)
+		SELECT $1, clip_id, $2, target_key, idem_key, $3
+		FROM unnest($4::bigint[], $5::text[], $6::text[]) AS t(clip_id, target_key, idem_key)
+		ON CONFLICT (idempotency_key) DO NOTHING
+	`, accountID, targetDestID, purge, clipIDs, targetKeys, idemKeys)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// handleAccountExportProgress aggregates clip_transfer_jobs by status for a
+// scope+target so the UI can show queued / in-progress / done / failed counts
+// for a bulk export. Progress is derived from the job rows themselves (no
+// separate export table): the same scope predicate + target destination that the
+// create endpoint enqueued is re-applied here. pending+leased = in-progress.
+func (s *Server) handleAccountExportProgress(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	targetDestID := parseInt64Query(r, "storage_destination_id")
+	if targetDestID <= 0 {
+		targetDestID = parseInt64Query(r, "target_storage_destination_id")
+	}
+	if targetDestID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "storage_destination_id is required")
+		return
+	}
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	if scope == "" {
+		scope = "account"
+	}
+
+	var scopeSQL string
+	args := []any{principal.AccountID, targetDestID}
+	switch scope {
+	case "account":
+		scopeSQL = ""
+	case "recording":
+		rid := parseInt64Query(r, "recording_id")
+		if rid <= 0 {
+			util.WriteError(w, http.StatusBadRequest, "recording_id is required for scope=recording")
+			return
+		}
+		args = append(args, rid)
+		scopeSQL = fmt.Sprintf("AND c.recording_id=$%d", len(args))
+	case "bundle":
+		bid := parseInt64Query(r, "bundle_id")
+		if bid <= 0 {
+			util.WriteError(w, http.StatusBadRequest, "bundle_id is required for scope=bundle")
+			return
+		}
+		args = append(args, bid)
+		scopeSQL = fmt.Sprintf("AND rec.bundle_id=$%d", len(args))
+	default:
+		util.WriteError(w, http.StatusBadRequest, "scope must be account, recording, or bundle")
+		return
+	}
+
+	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
+		SELECT j.status, count(*)
+		FROM clip_transfer_jobs j
+		JOIN recording_clips c ON c.id = j.recording_clip_id
+		JOIN recordings rec ON rec.id = c.recording_id
+		WHERE rec.account_id=$1 AND j.target_storage_destination_id=$2 %s
+		GROUP BY j.status
+	`, scopeSQL), args...)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("aggregate transfers: %v", err))
+		return
+	}
+	defer rows.Close()
+	counts := map[string]int64{}
+	var total int64
+	for rows.Next() {
+		var status string
+		var n int64
+		if err := rows.Scan(&status, &n); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan transfer count: %v", err))
+			return
+		}
+		counts[status] = n
+		total += n
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate transfer counts: %v", err))
+		return
+	}
+	inProgress := counts["pending"] + counts["leased"]
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"scope":                         scope,
+		"target_storage_destination_id": targetDestID,
+		"pending":                       counts["pending"],
+		"leased":                        counts["leased"],
+		"in_progress":                   inProgress,
+		"done":                          counts["done"],
+		"error":                         counts["error"],
+		"canceled":                      counts["canceled"],
+		"total":                         total,
+	})
+}
+
 // handleAccountRecordingTransfers lists the transfer jobs for a recording's
 // clips, account-scoped. The target destination name is joined in so the UI can
 // label each row.
