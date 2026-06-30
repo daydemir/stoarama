@@ -3952,28 +3952,30 @@ func (s *Server) latestPreviewObjectKeys(ctx context.Context, streamIDs []int64)
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 			ids.stream_id,
-			COALESCE(frame_media.object_key, segment_thumb.object_key)
+			preview.object_key
 		FROM UNNEST($1::bigint[]) AS ids(stream_id)
 		LEFT JOIN LATERAL (
-			SELECT m.object_key
-			FROM frames f
-			JOIN media_objects m ON m.id = f.raw_media_object_id
-			WHERE f.stream_id = ids.stream_id
-			  AND f.capture_status = 'success'
-			ORDER BY f.captured_at DESC, f.id DESC
+			SELECT object_key
+			FROM (
+				SELECT m.object_key, f.captured_at AS captured_at, f.id AS source_id
+				FROM frames f
+				JOIN media_objects m ON m.id = f.raw_media_object_id
+				WHERE f.stream_id = ids.stream_id
+				  AND f.capture_status = 'success'
+				  AND f.raw_media_object_id IS NOT NULL
+				UNION ALL
+				SELECT m.object_key, cs.segment_end_at AS captured_at, cs.id AS source_id
+				FROM capture_segments cs
+				JOIN media_objects m ON m.id = cs.thumbnail_media_object_id
+				WHERE cs.stream_id = ids.stream_id
+				  AND cs.capture_status = 'success'
+				  AND cs.thumbnail_media_object_id IS NOT NULL
+			) candidates
+			WHERE COALESCE(object_key, '') <> ''
+			ORDER BY captured_at DESC NULLS LAST, source_id DESC
 			LIMIT 1
-		) frame_media ON true
-		LEFT JOIN LATERAL (
-			SELECT m.object_key
-			FROM capture_segments cs
-			JOIN media_objects m ON m.id = cs.thumbnail_media_object_id
-			WHERE cs.stream_id = ids.stream_id
-			  AND cs.capture_status = 'success'
-			  AND cs.thumbnail_media_object_id IS NOT NULL
-			ORDER BY cs.segment_end_at DESC, cs.id DESC
-			LIMIT 1
-		) segment_thumb ON true
-		WHERE COALESCE(frame_media.object_key, segment_thumb.object_key, '') <> ''
+		) preview ON true
+		WHERE COALESCE(preview.object_key, '') <> ''
 	`, streamIDs)
 	if err != nil {
 		return nil, fmt.Errorf("query latest preview keys: %w", err)

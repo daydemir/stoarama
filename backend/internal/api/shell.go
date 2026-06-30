@@ -113,11 +113,9 @@ const shellTopbarJS = `
 })();
 </script>`
 
-// Canonical site-wide footer. Injected just before </body> on every page so the
-// support email and billing expectation are discoverable everywhere. The address
-// is the single SupportEmail constant; do not duplicate it.
+// Canonical site-wide footer. Injected just before </body> on every page. The
+// address is the single SupportEmail constant; do not duplicate it.
 const shellFooterTmpl = `<footer class="site-footer">
-  <span>STO-A-RAMA &middot; Billed monthly for what you record.</span>
   <span>Need help? <a href="mailto:%SUPPORT_EMAIL%">%SUPPORT_EMAIL%</a></span>
 </footer>`
 
