@@ -47,9 +47,9 @@ func TestDashboardStreamTagsRemoveRejectsEmptyTag(t *testing.T) {
 	}
 }
 
-func TestDedupeStringsDropsProviderTags(t *testing.T) {
+func TestDedupeStringsTrimsAndDedupe(t *testing.T) {
 	got := dedupeStrings([]string{"traffic", " provider:youtube ", "Provider:sdot", "capture_type:hls", "traffic", "source:camera"})
-	want := []string{"traffic", "source:camera"}
+	want := []string{"traffic", "provider:youtube", "Provider:sdot", "capture_type:hls", "source:camera"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("dedupeStrings()=%v want %v", got, want)
 	}

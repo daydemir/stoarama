@@ -7023,9 +7023,6 @@ func dedupeStrings(in []string) []string {
 		if v == "" {
 			continue
 		}
-		if isReservedStreamTag(v) {
-			continue
-		}
 		if _, ok := seen[v]; ok {
 			continue
 		}
@@ -7033,11 +7030,6 @@ func dedupeStrings(in []string) []string {
 		out = append(out, v)
 	}
 	return out
-}
-
-func isReservedStreamTag(tag string) bool {
-	v := strings.ToLower(strings.TrimSpace(tag))
-	return strings.HasPrefix(v, "provider:") || strings.HasPrefix(v, "capture_type:")
 }
 
 func slugify(raw string) string {
