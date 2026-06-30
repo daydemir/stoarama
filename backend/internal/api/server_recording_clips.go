@@ -698,3 +698,81 @@ func buildRecordingClipObjectKeyContinuous(keyPrefix string, recordingID int64, 
 	)
 	return strings.Join(parts, "/")
 }
+
+// accountClipsCursorSQL forward-cursors the calling account's unpurged clips by
+// the monotonic recording_clips.id (BIGSERIAL), so a NAS pull client can drain
+// every clip exactly once and resume from its last seen id. object_key is never
+// selected: the caller gets a download_path to the existing presign endpoint
+// instead. The unpurged working set stays small because the NAS purges each clip
+// right after it pulls it, so an ordered id>cursor scan over purged_at IS NULL
+// rows is cheap in practice.
+const accountClipsCursorSQL = `
+	SELECT c.id, c.recording_id, c.size_bytes, c.clip_start_at, c.clip_end_at
+	FROM recording_clips c
+	JOIN recordings r ON r.id = c.recording_id
+	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.id > $2
+	ORDER BY c.id ASC
+	LIMIT $3
+`
+
+// handleAccountClips returns one forward-cursored page of the calling account's
+// unpurged clips, ordered by the monotonic clip id, for the MIT NAS pull client.
+// It is mounted under requireAccountAuth so a Bearer sir_ account API key can
+// drain it. Each row carries a download_path to the existing per-recording clip
+// download endpoint; object_key is never exposed. next_after_id is the max clip
+// id in the page (the client's next cursor), or null when the page is empty.
+func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	afterID := int64(parseIntQuery(r, "after_id", 0, 0, 1<<62))
+	limit := parseIntQuery(r, "limit", 100, 1, 500)
+
+	rows, err := s.pool.Query(r.Context(), accountClipsCursorSQL, principal.AccountID, afterID, limit)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list account clips: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	clips := make([]map[string]any, 0, limit)
+	var nextAfterID *int64
+	for rows.Next() {
+		var (
+			clipID      int64
+			recordingID int64
+			sizeBytes   int64
+			clipStartAt time.Time
+			clipEndAt   *time.Time
+		)
+		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &clipStartAt, &clipEndAt); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan account clip: %v", err))
+			return
+		}
+		var endAt any
+		if clipEndAt != nil {
+			endAt = clipEndAt.UTC()
+		}
+		clips = append(clips, map[string]any{
+			"clip_id":       clipID,
+			"recording_id":  recordingID,
+			"size_bytes":    sizeBytes,
+			"clip_start_at": clipStartAt.UTC(),
+			"clip_end_at":   endAt,
+			"download_path": fmt.Sprintf("/api/v1/account/recordings/%d/clips/%d/download", recordingID, clipID),
+		})
+		id := clipID
+		nextAfterID = &id
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate account clips: %v", err))
+		return
+	}
+
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"clips":         clips,
+		"next_after_id": nextAfterID,
+	})
+}

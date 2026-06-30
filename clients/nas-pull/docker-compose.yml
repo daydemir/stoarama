@@ -1,0 +1,43 @@
+# Stoarama NAS pull client for the MIT Synology NAS.
+#
+# WHAT THIS DOES
+#   Stoarama records public streams to managed Cloudflare R2. The NAS is not
+#   inbound-reachable, so this container PULLS each clip down to local disk,
+#   verifies its byte count against the API, then asks Stoarama to purge the
+#   managed copy. A clip is purged only after a verified download
+#   (confirm-before-purge). The cursor (last drained clip id) is persisted so a
+#   restart resumes where it left off.
+#
+# ONE-TIME SETUP ON THE SYNOLOGY NAS
+#   1. Install "Container Manager" from the Synology Package Center.
+#   2. Create the clip + state folders on the NAS, e.g. via File Station or SSH:
+#        /volume1/stoarama-clips
+#        /volume1/stoarama-state
+#   3. Copy this folder (stoarama_pull.py, Dockerfile, docker-compose.yml) onto
+#      the NAS, e.g. /volume1/docker/stoarama-nas-pull/.
+#   4. Set STOARAMA_API_KEY below to your sir_ account API key (mint one in the
+#      Stoarama dashboard under API keys; it is shown only once).
+#   5. VALIDATE FIRST in read-only mode: set STOARAMA_DRY_RUN to "1", then in
+#      Container Manager open this project and Build + Run (or, over SSH:
+#        sudo docker compose up --build). Watch the logs: it should download and
+#      verify clips and log "would purge" without deleting anything. Confirm the
+#      clip files land under /volume1/stoarama-clips/<recording_id>/.
+#   6. GO LIVE: set STOARAMA_DRY_RUN back to "0" and restart the project. It now
+#      purges each managed copy after a verified download and persists the cursor.
+
+services:
+  stoarama-pull:
+    build: .
+    restart: always
+    environment:
+      STOARAMA_API_BASE: "https://stoarama.com/api/v1"
+      STOARAMA_API_KEY: "sir_REPLACE_ME"
+      STOARAMA_OUTPUT_DIR: "/clips"
+      STOARAMA_STATE_FILE: "/state/cursor.json"
+      STOARAMA_POLL_INTERVAL_SEC: "90"
+      # "1" = read-only validate (download + verify, never delete, cursor not
+      # persisted). "0" = live (purge after verified download).
+      STOARAMA_DRY_RUN: "0"
+    volumes:
+      - /volume1/stoarama-clips:/clips
+      - /volume1/stoarama-state:/state

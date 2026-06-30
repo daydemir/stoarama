@@ -213,6 +213,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings.csv", s.handleAccountRecordingsCSV)
 			account.Post("/recordings", s.handleAccountRecordingsCreate)
 			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
+			account.Get("/clips", s.handleAccountClips)
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
