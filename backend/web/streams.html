@@ -1507,6 +1507,12 @@
             <option value="">all cities</option>
           </select>
         </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Tag</div>
+          <select id="streamTagFilter">
+            <option value="">any tag</option>
+          </select>
+        </div>
       </div>
       <div class="filter-footer">
         <div class="row">
@@ -2471,50 +2477,46 @@ function extractTagInputValue(actionEl) {
   return input.value.trim();
 }
 
-async function patchStreamFields(streamID, body) {
-  const payload = await fetchJSON(`/api/v1/streams/${streamID}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  });
-  mergeCachedStreamPatch(streamID, payload);
-  const saved = normalizeTags(payload.tags || []);
+// Apply the {tags} returned by a shared-tag mutation to the local caches so the
+// list and detail views reflect the new shared state without a full reload.
+function applyTagMutationResult(streamID, payload) {
+  const saved = normalizeTags((payload && payload.tags) || []);
+  mergeCachedStreamPatch(streamID, { tags: saved });
   setCachedStreamTags(streamID, saved);
   knownStreamTags = normalizeTags(knownStreamTags.concat(saved));
   refreshTagSuggestionList();
-  return payload;
+  return saved;
 }
 
-async function patchStreamTags(streamID, tags) {
-  const payload = await patchStreamFields(streamID, { tags });
-  return normalizeTags(payload.tags || tags);
-}
-
+// handleTagMutation hits the shared, additive-safe catalog tag endpoints. Add
+// posts only the new tags (server dedups + appends); remove deletes one named
+// tag. The server computes the next array from the current row, so members
+// never send a replace-all that could clobber another labeler's tags.
 async function handleTagMutation(action, streamID, rawTagValue) {
   if (!hasAuthCapability('can_edit_tags')) {
     throw new Error('tag editing is unavailable in this public UI');
   }
-  const stream = findStreamByID(streamID);
-  if (!stream) throw new Error(`stream ${streamID} not found in current table view`);
-
-  const current = normalizeTags(stream.tags || []);
   const inputTags = normalizeTags(splitCSV(rawTagValue));
   if (inputTags.length === 0) {
     throw new Error('tag is required');
   }
-  let next = current;
   if (action === 'tag-add') {
-    next = normalizeTags(current.concat(inputTags));
-  } else if (action === 'tag-remove') {
-    const removeSet = new Set(inputTags);
-    next = current.filter((tag) => !removeSet.has(tag));
-  } else {
-    throw new Error(`unsupported tag action ${action}`);
+    const payload = await fetchJSON(`/api/v1/dashboard/streams/${streamID}/tags`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tags: inputTags }),
+    });
+    return applyTagMutationResult(streamID, payload);
   }
-  if (next.length === current.length && next.every((v, i) => v === current[i])) {
-    return current;
+  if (action === 'tag-remove') {
+    const payload = await fetchJSON(`/api/v1/dashboard/streams/${streamID}/tags`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag: inputTags[0] }),
+    });
+    return applyTagMutationResult(streamID, payload);
   }
-  return patchStreamTags(streamID, next);
+  throw new Error(`unsupported tag action ${action}`);
 }
 
 // ─── Loading overlay ─────────────────────────────────────────────────────────
@@ -4472,6 +4474,7 @@ function renderStreamRows() {
           <a href="/streams/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
           ${streamName.secondary ? `<span class="muted fs10">${esc(streamName.secondary)}</span>` : ''}
           <span class="muted fs10 mono">${esc(s.provider)} / ${esc(s.slug)}</span>
+          ${renderTagEditor(s, 'streams')}
         </div>
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
@@ -4983,6 +4986,7 @@ async function loadDetail(options = {}) {
   if (!detailStreamID) return;
   const payload = await fetchJSON(dashboardStreamURL(detailStreamID));
   const s = payload.stream || {};
+  detailData = payload;
   const detailName = latinizedLabelParts(s.name);
 
   detailTitle.textContent = detailName.primary || `${s.name || detailStreamID}`;
@@ -4992,7 +4996,10 @@ async function loadDetail(options = {}) {
     `<span class="tag tag-muted mono">${esc(s.slug)}</span>`,
     renderLocationHierarchy(s),
     description ? `<div class="muted fs11" style="margin-top:6px;">${esc(description)}</div>` : '',
+    `<div class="detail-tags-row" style="margin-top:8px;">${renderTagEditor(s, 'detail')}</div>`,
   ].filter(Boolean).join('');
+  knownStreamTags = normalizeTags(knownStreamTags.concat(normalizeTags(s.tags || [])));
+  refreshTagSuggestionList();
 
   syncDetailMutationUI(s);
 
@@ -5022,6 +5029,8 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
     await handleTagMutation(action, id, tagValue);
     if (tableKey === 'streams') {
       await loadStreams();
+    } else {
+      rerenderTagEditorsForStream(id);
     }
     await loadKnownStreamTagsSafe('all');
     return;
@@ -5104,6 +5113,11 @@ if (discoveryRows) {
 
 streamRowsEl.addEventListener('click', (e) => { void onStreamTableClick(e, 'streams'); });
 streamRowsEl.addEventListener('keydown', (e) => { void onStreamTableTagInputEnter(e, 'streams'); });
+
+if (detailMeta) {
+  detailMeta.addEventListener('click', (e) => { void onStreamTableClick(e, 'detail'); });
+  detailMeta.addEventListener('keydown', (e) => { void onStreamTableTagInputEnter(e, 'detail'); });
+}
 
 function sortHeaderKeyFromEvent(e) {
   const target = e.target instanceof HTMLElement ? e.target : null;

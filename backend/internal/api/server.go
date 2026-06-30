@@ -345,6 +345,16 @@ func (s *Server) router() http.Handler {
 			admin.Post("/dashboard/streams/{id}/frame-exports", s.handleDashboardStreamFrameExportCreate)
 		})
 
+		// Shared catalog tagging for any signed-in browser session (member or
+		// admin). Edits the shared streams.tags column; only single add/remove
+		// are exposed (no destructive replace-all).
+		api.Group(func(memberSession chi.Router) {
+			memberSession.Use(s.requireAccountSessionAuth)
+
+			memberSession.Post("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsAdd)
+			memberSession.Delete("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsRemove)
+		})
+
 		api.Group(func(rec chi.Router) {
 			rec.Use(s.requireRecorderNodeAuth)
 
