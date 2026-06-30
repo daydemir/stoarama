@@ -182,6 +182,8 @@ func (s *Server) router() http.Handler {
 	r.Get("/account", s.handleAccountApp)
 	r.Get("/recordings", s.handleRecordingsApp)
 	r.Get("/recordings/{id}", s.handleRecordingsApp)
+	r.Get("/bundles", s.handleRecordingsApp)
+	r.Get("/bundles/{id}", s.handleRecordingsApp)
 	r.Get("/admin", s.handleAdminApp)
 	r.Get("/dashboard", s.redirectDashboard)
 	r.Get("/dashboard/{tab}", s.redirectDashboard)
@@ -354,6 +356,25 @@ func (s *Server) router() http.Handler {
 			memberSession.Post("/dashboard/streams", s.handleDashboardStreamAdd)
 			memberSession.Post("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsAdd)
 			memberSession.Delete("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsRemove)
+		})
+
+		// Recording bundles: a thin grouping that fans out into N member recordings
+		// sharing ONE schedule. Session-auth only (browser-driven composer), account
+		// scoped. Reuses the recordings/jobs/worker/billing path unchanged. Routes are
+		// registered with explicit full paths (not a sub-Route with "/") so the
+		// collection endpoint matches /account/bundles with no trailing slash.
+		api.Group(func(bundles chi.Router) {
+			bundles.Use(s.requireAccountSessionAuth)
+
+			bundles.Get("/account/bundles", s.handleAccountBundlesList)
+			bundles.Post("/account/bundles", s.handleAccountBundlesCreate)
+			bundles.Get("/account/bundles/streams", s.handleAccountBundleStreams)
+			bundles.Get("/account/bundles/{id}", s.handleAccountBundleGet)
+			bundles.Get("/account/bundles/{id}/clips", s.handleAccountBundleClips)
+			bundles.Post("/account/bundles/{id}/export", s.handleAccountBundleExport)
+			bundles.Post("/account/bundles/{id}/pause", s.handleAccountBundlePause)
+			bundles.Post("/account/bundles/{id}/resume", s.handleAccountBundleResume)
+			bundles.Post("/account/bundles/{id}/cancel", s.handleAccountBundleCancel)
 		})
 
 		api.Group(func(rec chi.Router) {

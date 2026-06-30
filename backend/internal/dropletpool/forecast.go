@@ -91,15 +91,44 @@ func ForecastDemand(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool
 // demand model (DRY). A candidate whose cron is unparseable contributes nothing to
 // the peak (the create handler validates the cron separately and rejects first).
 func ForecastPeakWithCandidate(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, candidateCronExpr, candidateCronTimezone string, candidateClipDurationSec int, now time.Time, lookahead time.Duration) (int, error) {
+	return ForecastPeakWithCandidates(ctx, pool, billingEnabled, []ForecastCandidate{{
+		CronExpr:        candidateCronExpr,
+		CronTimezone:    candidateCronTimezone,
+		ClipDurationSec: candidateClipDurationSec,
+	}}, now, lookahead)
+}
+
+// ForecastCandidate is one prospective recording's schedule for the create-time
+// capacity preflight. A bundle's N members are N identical candidates (they share
+// one cron/tz/clip), so the sweep-line shows all N clips overlapping at each
+// shared fire and PeakConcurrent rises by exactly N at those instants.
+type ForecastCandidate struct {
+	CronExpr        string
+	CronTimezone    string
+	ClipDurationSec int
+}
+
+// ForecastPeakWithCandidates loads the current capturing recordings and forecasts
+// the peak concurrent clip count over [now, now+lookahead] AS IF every candidate
+// were already capturing. It is the bundle-aware generalization of
+// ForecastPeakWithCandidate: the whole bundle is added at once so the preflight
+// can accept or reject it as a unit against the current cap, rather than emitting
+// N separate decisions. It reuses the exact sweep-line the autoscaler uses
+// (forecastFromRecordings), so the cap and the scaler agree on the demand model
+// (DRY). A candidate whose cron is unparseable contributes nothing to the peak
+// (create validates the cron separately and rejects first).
+func ForecastPeakWithCandidates(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, candidates []ForecastCandidate, now time.Time, lookahead time.Duration) (int, error) {
 	recs, err := loadCapturingRecordings(ctx, pool, billingEnabled)
 	if err != nil {
 		return 0, err
 	}
-	recs = append(recs, forecastRecording{
-		cronExpr:        candidateCronExpr,
-		cronTimezone:    candidateCronTimezone,
-		clipDurationSec: candidateClipDurationSec,
-	})
+	for _, c := range candidates {
+		recs = append(recs, forecastRecording{
+			cronExpr:        c.CronExpr,
+			cronTimezone:    c.CronTimezone,
+			clipDurationSec: c.ClipDurationSec,
+		})
+	}
 	return forecastFromRecordings(recs, now, lookahead).PeakConcurrent, nil
 }
 

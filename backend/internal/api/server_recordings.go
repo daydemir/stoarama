@@ -342,18 +342,23 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	var (
-		id        int64
-		createdAt time.Time
-		startOut  time.Time
-		endOut    *time.Time
-	)
-	err = tx.QueryRow(r.Context(), `
-		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, target_fps, status, next_fire_at, start_at, end_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13,$14)
-		RETURNING id, created_at, start_at, end_at
-	`, principal.AccountID, captureDestID, deliveryDestArg, name, streamURL, streamIDArg, sourceKind, cronExpr, cronTimezone, clipDuration, targetFPSArg, nextFireArg, startAt, endAtArg).Scan(&id, &createdAt, &startOut, &endOut)
+	id, createdAt, startOut, endOut, err := s.insertRecordingTx(r.Context(), tx, recordingInsertParams{
+		accountID:       principal.AccountID,
+		captureDestID:   captureDestID,
+		deliveryDestArg: deliveryDestArg,
+		name:            name,
+		streamURL:       streamURL,
+		streamIDArg:     streamIDArg,
+		sourceKind:      sourceKind,
+		cronExpr:        cronExpr,
+		cronTimezone:    cronTimezone,
+		clipDuration:    clipDuration,
+		targetFPSArg:    targetFPSArg,
+		nextFireArg:     nextFireArg,
+		startAt:         startAt,
+		endAtArg:        endAtArg,
+		bundleIDArg:     nil,
+	})
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -389,6 +394,44 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		"start_at":   startOut.UTC(),
 		"end_at":     endOut,
 	})
+}
+
+// recordingInsertParams carries the fully-resolved column values for one
+// recordings row. It is the single contract shared by single-recording create
+// and bundle fan-out so the INSERT lives in exactly one place (DRY). Every *Arg
+// field is an `any` that is either a concrete value or nil for SQL NULL.
+type recordingInsertParams struct {
+	accountID       int64
+	captureDestID   int64
+	deliveryDestArg any
+	name            string
+	streamURL       string
+	streamIDArg     any
+	sourceKind      string
+	cronExpr        string
+	cronTimezone    string
+	clipDuration    int
+	targetFPSArg    any
+	nextFireArg     any
+	startAt         time.Time
+	endAtArg        any
+	bundleIDArg     any
+}
+
+// insertRecordingTx runs the one canonical recordings INSERT inside the caller's
+// transaction and returns the new row's id/created_at/start_at/end_at. It returns
+// the pgx error unwrapped so each caller maps 23505 (name collision) on its own
+// terms: single-create -> 409 "name exists"; bundle-create -> whole-bundle
+// failure. The 15 existing columns keep the exact values they had before; the
+// only addition is bundle_id (nil for a standalone recording).
+func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingInsertParams) (id int64, createdAt time.Time, startOut time.Time, endOut *time.Time, err error) {
+	err = tx.QueryRow(ctx, `
+		INSERT INTO recordings
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, target_fps, status, next_fire_at, start_at, end_at, bundle_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13,$14,$15)
+		RETURNING id, created_at, start_at, end_at
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, p.cronExpr, p.cronTimezone, p.clipDuration, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg).Scan(&id, &createdAt, &startOut, &endOut)
+	return id, createdAt, startOut, endOut, err
 }
 
 // handleAccountRecordingsProbe authoritatively validates a stream URL the same
@@ -883,6 +926,46 @@ func (s *Server) checkRecordingScheduleCapacity(ctx context.Context, cronExpr, c
 	}
 	if peak > ceiling {
 		return fmt.Errorf("at capacity: this schedule would need %d clips recording at once, above the recorder limit of %d. Stagger the schedule or contact the operator to raise the cap.", peak, ceiling)
+	}
+	return nil
+}
+
+// checkBundleScheduleCapacity rejects a prospective bundle whose forecast peak
+// simultaneous clip count, combined with the existing capturing fleet, would
+// exceed the pool ceiling Max*Capacity. Because every bundle member shares ONE
+// cron/tz/clip, the memberCount candidates are identical and all fire together,
+// so the honest peak rises by memberCount at the bundle's fire instants. It
+// reuses the same sweep-line as the single-recording cap (DRY) and rejects the
+// WHOLE bundle up front with one clear message, so an over-cap bundle leaves zero
+// rows behind. The error is user-facing (no em dashes).
+func (s *Server) checkBundleScheduleCapacity(ctx context.Context, cronExpr, cronTimezone string, clipDurationSec, memberCount int) error {
+	ceiling := s.cfg.DropletPoolMax * s.cfg.DropletPoolCapacity
+	if ceiling <= 0 {
+		// Pool config not set on this service: no meaningful ceiling to enforce.
+		return nil
+	}
+	if memberCount <= 0 {
+		return nil
+	}
+	billingEnabled := s.billing != nil
+	lookahead := time.Duration(s.cfg.DropletPoolLookaheadSec) * time.Second
+	if lookahead <= 0 {
+		lookahead = 30 * time.Minute
+	}
+	candidates := make([]dropletpool.ForecastCandidate, memberCount)
+	for i := range candidates {
+		candidates[i] = dropletpool.ForecastCandidate{
+			CronExpr:        cronExpr,
+			CronTimezone:    cronTimezone,
+			ClipDurationSec: clipDurationSec,
+		}
+	}
+	peak, err := dropletpool.ForecastPeakWithCandidates(ctx, s.pool, billingEnabled, candidates, time.Now().UTC(), lookahead)
+	if err != nil {
+		return fmt.Errorf("forecast bundle capacity: %v", err)
+	}
+	if peak > ceiling {
+		return fmt.Errorf("this bundle peaks at %d concurrent clips, above the recorder limit of %d. Reduce the number of streams, stagger the schedule, or contact the operator to raise the cap.", peak, ceiling)
 	}
 	return nil
 }

@@ -154,6 +154,35 @@ func TestForecastWithCandidate_LiftsPeak(t *testing.T) {
 	}
 }
 
+// TestForecastWithCandidates_BundleFanOutLiftsPeakByN proves the bundle preflight's
+// demand model: a bundle's N members all share ONE cron/tz/clip, so they all fire
+// at the same instants and the forecast peak rises by exactly N over the existing
+// fleet at those instants. This is the composition ForecastPeakWithCandidates
+// performs after loading existing recordings from the DB (DRY: same sweep-line).
+func TestForecastWithCandidates_BundleFanOutLiftsPeakByN(t *testing.T) {
+	now := mustTime(t, "2026-06-24T11:59:30Z")
+	// One existing hourly recording with a short clip => base peak 1 at the top of
+	// the hour (no self-overlap).
+	existing := []forecastRecording{
+		{cronExpr: "0 * * * *", cronTimezone: "UTC", clipDurationSec: 60},
+	}
+	basePeak := forecastFromRecordings(existing, now, 30*time.Minute).PeakConcurrent
+	if basePeak != 1 {
+		t.Fatalf("base peak=%d want 1", basePeak)
+	}
+	// A bundle of N identical members (same hourly cron/tz/clip) all fire at the
+	// same hourly instant, so the peak rises by exactly N.
+	const n = 8
+	recs := append([]forecastRecording{}, existing...)
+	for i := 0; i < n; i++ {
+		recs = append(recs, forecastRecording{cronExpr: "0 * * * *", cronTimezone: "UTC", clipDurationSec: 60})
+	}
+	peak := forecastFromRecordings(recs, now, 30*time.Minute).PeakConcurrent
+	if peak != basePeak+n {
+		t.Fatalf("peak with bundle of %d=%d want %d (base %d + N)", n, peak, basePeak+n, basePeak)
+	}
+}
+
 func TestRequiredDroplets_CapacityCeilAndSpendCap(t *testing.T) {
 	tests := []struct {
 		name                           string

@@ -164,12 +164,17 @@
     .clip-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
     .clip-summary { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
     .clip-summary b { color: var(--text); }
-    .clip-list { display: grid; gap: 6px; }
-    .clip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 6px 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
-    .clip-row .clip-when { color: var(--text); }
-    .clip-row.purged { opacity: 0.45; text-decoration: line-through; }
-    .clip-row-actions { margin-left: auto; display: flex; gap: 6px; }
-    .clip-row-actions button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
+    /* Dense clip table: tight, column-aligned rows so hundreds/thousands of clips
+       are scannable with minimal vertical space (not big cards). */
+    .clip-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+    .clip-table thead th { text-align: left; color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--bg); z-index: 1; }
+    .clip-table td, .clip-table th { padding: 4px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); white-space: nowrap; }
+    .clip-table td.num, .clip-table th.num { text-align: right; }
+    .clip-table td.clip-when { color: var(--text); }
+    .clip-table tr.purged { opacity: 0.45; text-decoration: line-through; }
+    .clip-row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+    .clip-row-actions button { width: auto; min-width: 0; min-height: 26px; padding: 3px 9px; font-size: 12px; }
+    .clip-xfer-cell { padding: 0 8px 6px !important; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
     .clip-bulk { margin: 12px 0 8px; }
     .clip-bulk button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
     .clip-actions-note { margin-top: 12px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 10px; font-size: 12px; color: var(--muted); line-height: 1.45; }
@@ -292,9 +297,17 @@
       <!-- Recording cards -->
       <div id="cards" class="cards"></div>
 
+      <!-- Bundle list + bundle detail views. Shown on /bundles and /bundles/{id};
+           hidden otherwise. A bundle is a thin grouping that fans out into N member
+           recordings sharing ONE schedule. -->
+      <div id="bundleList" class="hidden"></div>
+      <div id="bundleDetail" class="hidden"></div>
+
       <!-- + New recording trigger (hidden in empty state; composer is the hero there) -->
       <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
         <button id="newRecBtn" type="button">+ New recording</button>
+        <button id="newBundleBtn" class="secondary" type="button" style="width:auto;min-width:0;">+ New bundle</button>
+        <a class="btn-link secondary" href="/bundles" style="width:auto;min-width:0;align-self:center;">View bundles</a>
         <button id="recordingsCsvBtn" class="secondary" type="button" style="width:auto;min-width:0;">Download CSV</button>
       </div>
 
@@ -315,6 +328,28 @@
           <img id="catalogFramePreview" class="video-preview hidden" alt="recent frame" />
         </div>
         <input type="hidden" id="recStreamID" value="" />
+
+        <!-- Bundle source block: shown only in bundle mode. Streams are selected by
+             a tag filter and/or an explicit multi-select; the resolved set + count
+             is shown live. The schedule/window/clip/fps/storage controls below are
+             shared with the single-recording composer and apply uniformly to every
+             member, including the user-chosen timezone. -->
+        <div id="bundleSourceBlock" class="hidden">
+          <div class="field">
+            <label for="bundleName">Bundle name</label>
+            <input id="bundleName" type="text" placeholder="MIT study set 1" />
+          </div>
+          <div class="field">
+            <label for="bundleTag">Filter streams by tag (optional)</label>
+            <input id="bundleTag" type="text" placeholder="mit:study-1" />
+            <div class="hint">Every catalog stream carrying this tag is added to the bundle. You can also pick streams individually below.</div>
+          </div>
+          <div class="field">
+            <label>Select streams</label>
+            <div id="bundleStreamCount" class="status" style="margin-bottom:8px;">0 streams selected</div>
+            <div id="bundleStreamPicker" style="max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px;font-size:13px;"></div>
+          </div>
+        </div>
 
         <div id="urlField" class="field">
           <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
@@ -497,7 +532,11 @@
         </div>
 
         <div id="composerFootnote" class="composer-footnote"></div>
-        <div class="button-row"><button id="startBtn" type="button" disabled>Start recording</button></div>
+        <div id="bundlePreflight" class="status hidden" style="margin-bottom:10px;"></div>
+        <div class="button-row">
+          <button id="startBtn" type="button" disabled>Start recording</button>
+          <button id="startBundleBtn" class="hidden" type="button">Start bundle</button>
+        </div>
         <div id="startStatus" class="status"></div>
       </section>
     </div>
@@ -575,7 +614,17 @@
       cnStatus: document.getElementById('cnStatus'),
       composerFootnote: document.getElementById('composerFootnote'),
       startBtn: document.getElementById('startBtn'),
+      startBundleBtn: document.getElementById('startBundleBtn'),
       startStatus: document.getElementById('startStatus'),
+      bundleList: document.getElementById('bundleList'),
+      bundleDetail: document.getElementById('bundleDetail'),
+      newBundleBtn: document.getElementById('newBundleBtn'),
+      bundleSourceBlock: document.getElementById('bundleSourceBlock'),
+      bundleName: document.getElementById('bundleName'),
+      bundleTag: document.getElementById('bundleTag'),
+      bundleStreamCount: document.getElementById('bundleStreamCount'),
+      bundleStreamPicker: document.getElementById('bundleStreamPicker'),
+      bundlePreflight: document.getElementById('bundlePreflight'),
     };
 
     // Server invariants mirrored client-side (REC_SCHED_MIN_INTERVAL_SEC=600;
@@ -644,6 +693,14 @@
       // Stream probe gate (change 2): the authoritative server verdict. ok===true
       // is required for Start; the in-browser preview never gates on its own.
       streamProbe: { token: 0, ok: false },
+      // Composer mode: 'single' (one recording) or 'bundle' (fan-out into N member
+      // recordings sharing one schedule). Bundle mode swaps the source block and the
+      // submit path; the schedule/window/clip/fps/storage controls are shared.
+      composerMode: 'single',
+      // Catalog streams loaded for the bundle picker, and the set of selected ids.
+      bundleStreams: [],
+      bundleSelected: new Set(),
+      bundleSubmitting: false,
     };
 
     async function fetchJSON(path, opts = {}) {
@@ -1873,31 +1930,54 @@
       return (state.destinations || []).filter((d) => !sources.has(Number(d.id))).length;
     }
 
-    function clipRowHTML(c, recId) {
+    // One dense table row for a clip, plus a hidden full-width row that carries the
+    // inline transfer-status / target-picker (data-clipxfer wiring unchanged).
+    // recIdForClip resolves the owning recording: for a per-recording view it is the
+    // page's recId; for a bundle view each clip carries its own recording_id, and
+    // showSource adds a leading column with the member recording/stream name. The
+    // colspan keeps the transfer cell spanning the whole table.
+    function clipRowHTML(c, recId, opts) {
+      const showSource = opts && opts.showSource === true;
+      const clipRecId = showSource ? Number(c.recording_id || recId) : recId;
       const cid = Number(c.id);
       const purged = c.purged === true;
       const sourceDestId = Number(c.storage_destination_id || 0);
       const targets = (state.destinations || []).filter((d) => Number(d.id) !== sourceDestId);
       const transferBtn = (!purged && targets.length > 0)
-        ? `<button type="button" class="secondary" data-cliptransfer="${recId}:${cid}:${sourceDestId}">Send to my S3</button>`
+        ? `<button type="button" class="secondary" data-cliptransfer="${clipRecId}:${cid}:${sourceDestId}">Send to my S3</button>`
         : '';
       const actions = purged
         ? `<span>deleted</span>`
         : `<div class="clip-row-actions">`
-          + `<button type="button" class="secondary" data-clipview="${recId}:${cid}">View</button>`
-          + `<button type="button" class="secondary" data-clipdownload="${recId}:${cid}">Download</button>`
+          + `<button type="button" class="secondary" data-clipview="${clipRecId}:${cid}">View</button>`
+          + `<button type="button" class="secondary" data-clipdownload="${clipRecId}:${cid}">Download</button>`
           + transferBtn
-          + `<button type="button" class="danger" data-clipdelete="${recId}:${cid}">Delete</button>`
+          + `<button type="button" class="danger" data-clipdelete="${clipRecId}:${cid}">Delete</button>`
           + `</div>`;
-      const fpsPart = (c.actual_fps != null && Number(c.actual_fps) > 0)
-        ? ` &middot; ${escapeHTML(formatFps(c.actual_fps))} fps` : '';
+      const fps = (c.actual_fps != null && Number(c.actual_fps) > 0) ? escapeHTML(formatFps(c.actual_fps)) : '--';
+      const sourceCell = showSource
+        ? `<td class="clip-when">${escapeHTML(String(c.recording_name || ('#' + clipRecId)))}</td>` : '';
+      const colspan = showSource ? 7 : 6;
       return `
-        <div class="clip-row${purged ? ' purged' : ''}" data-cliprow="${cid}">
-          <span class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</span>
-          <span class="clip-meta">${escapeHTML(formatDuration(c.duration_ms))} &middot; ${escapeHTML(formatBytes(c.size_bytes))}${fpsPart}</span>
-          ${actions}
-        </div>
-        <div class="clip-xfer hidden" data-clipxfer="${cid}"></div>`;
+        <tr class="${purged ? 'purged' : ''}" data-cliprow="${cid}">
+          ${sourceCell}
+          <td class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</td>
+          <td class="num">${escapeHTML(formatDuration(c.duration_ms))}</td>
+          <td class="num">${fps}</td>
+          <td class="num">${escapeHTML(formatBytes(c.size_bytes))}</td>
+          <td>${purged ? 'deleted' : 'saved'}</td>
+          <td>${actions}</td>
+        </tr>
+        <tr class="clip-xfer-tr hidden" data-clipxfer="${cid}"><td class="clip-xfer-cell" colspan="${colspan}"></td></tr>`;
+    }
+
+    // Wrap clip rows in the dense table with the appropriate header. showSource adds
+    // a leading Source column (used by the bundle clip view).
+    function clipTableHTML(rowsHTML, showSource) {
+      const sourceTh = showSource ? `<th>Source</th>` : '';
+      return `<table class="clip-table"><thead><tr>${sourceTh}`
+        + `<th>Time</th><th class="num">Duration</th><th class="num">FPS</th><th class="num">Size</th><th>Status</th><th></th>`
+        + `</tr></thead><tbody>${rowsHTML}</tbody></table>`;
     }
 
     function renderClipDetail(panel, recId, payload) {
@@ -1923,7 +2003,7 @@
       const note = eligibleTargets > 0
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="#" data-connectbucket="1">connect a bucket first</a>.</div>`;
-      panel.innerHTML = summary + bulk + `<div class="clip-list">${rows}</div>` + note;
+      panel.innerHTML = summary + bulk + clipTableHTML(rows, false) + note;
       wireClipActions(panel);
       void reloadTransfers(panel, recId);
     }
@@ -2013,7 +2093,7 @@
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="/recordings">connect a bucket first</a> from the recordings page.</div>`;
 
-      root.innerHTML = header + pageActions + `<div class="clip-list">${rows}</div>` + note + clipPagerHTML(page, pageCount);
+      root.innerHTML = header + pageActions + clipTableHTML(rows, false) + note + clipPagerHTML(page, pageCount);
       wireClipActions(root);
       wireClipPageNav(root);
       void reloadTransfers(root, recId);
@@ -2102,29 +2182,36 @@
         a.addEventListener('click', (ev) => { ev.preventDefault(); openComposer(false); }));
     }
 
+    // The inner full-width cell of a transfer-status row (the dense table wraps the
+    // status in a <tr><td colspan>), so content writes target the cell, not the tr.
+    function clipXferCell(box) {
+      return box ? box.querySelector('.clip-xfer-cell') : null;
+    }
+
     // Open the inline "Send to my S3" target picker under a clip row. Targets are
     // the account's verified destinations other than the clip's own source.
     function openClipTransfer(panel, ref) {
       const [recId, clipId, sourceDestId] = String(ref || '').split(':');
       const cid = Number(clipId);
       const box = panel.querySelector(`[data-clipxfer="${cid}"]`);
-      if (!box) return;
+      const cell = clipXferCell(box);
+      if (!box || !cell) return;
       if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
       const targets = (state.destinations || []).filter((d) => Number(d.id) !== Number(sourceDestId));
       if (targets.length === 0) {
-        box.innerHTML = `<div class="clip-xfer-note">No other bucket to copy to. <a href="#" data-connectbucket="1">Connect a bucket first</a>.</div>`;
-        box.querySelectorAll('a[data-connectbucket]').forEach((a) =>
+        cell.innerHTML = `<div class="clip-xfer-note">No other bucket to copy to. <a href="#" data-connectbucket="1">Connect a bucket first</a>.</div>`;
+        cell.querySelectorAll('a[data-connectbucket]').forEach((a) =>
           a.addEventListener('click', (ev) => { ev.preventDefault(); openComposer(false); }));
         box.classList.remove('hidden');
         return;
       }
       const opts = targets.map((d) => `<option value="${Number(d.id)}">${escapeHTML(d.name || ('bucket #' + d.id))}</option>`).join('');
-      box.innerHTML = `
+      cell.innerHTML = `
         <div class="clip-xfer-row">
           <select data-xfertarget="${cid}">${opts}</select>
           <button type="button" class="secondary" data-xfersend="${recId}:${cid}">Send</button>
         </div>`;
-      box.querySelector(`button[data-xfersend]`).addEventListener('click', () => sendClipTransfer(panel, recId, cid));
+      cell.querySelector(`button[data-xfersend]`).addEventListener('click', () => sendClipTransfer(panel, recId, cid));
       box.classList.remove('hidden');
     }
 
@@ -2167,12 +2254,14 @@
       }
       panel.querySelectorAll('[data-clipxfer]').forEach((box) => {
         const cid = Number(box.getAttribute('data-clipxfer'));
+        const cell = clipXferCell(box);
+        if (!cell) return;
         const jobs = byClip.get(cid);
         // Don't clobber an open target picker (it has a select); only render status
         // when the box is either hidden or already showing status.
-        if (box.querySelector('select')) return;
-        if (!jobs || jobs.length === 0) { box.classList.add('hidden'); box.innerHTML = ''; return; }
-        box.innerHTML = jobs.map(transferStatusLine).join('');
+        if (cell.querySelector('select')) return;
+        if (!jobs || jobs.length === 0) { box.classList.add('hidden'); cell.innerHTML = ''; return; }
+        cell.innerHTML = jobs.map(transferStatusLine).join('');
         box.classList.remove('hidden');
       });
     }
@@ -2415,6 +2504,20 @@
       setStatus(els.streamStatus, '', '');
       clearCatalogLock();
       clearStashedCatalogStreamId();
+      // Reset bundle mode so the next open is the single-recording composer.
+      if (state.composerMode === 'bundle') {
+        state.composerMode = 'single';
+        els.bundleSourceBlock.classList.add('hidden');
+        els.urlField.classList.remove('hidden');
+        els.startBundleBtn.classList.add('hidden');
+        els.startBtn.classList.remove('hidden');
+        els.bundlePreflight.classList.add('hidden');
+        els.bundleName.value = '';
+        els.bundleTag.value = '';
+        state.bundleSelected = new Set();
+        const singleNameField = els.recName.closest('.field');
+        if (singleNameField) singleNameField.classList.remove('hidden');
+      }
       // Reset the window so the next open re-defaults Start to now.
       els.startAt.value = '';
       els.endAt.value = '';
@@ -2675,9 +2778,12 @@
     els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => openComposer(false));
+    els.newBundleBtn.addEventListener('click', () => openBundleComposer());
     els.recordingsCsvBtn.addEventListener('click', () => window.location.assign('/api/v1/account/recordings.csv'));
     els.composerClose.addEventListener('click', closeComposer);
     els.startBtn.addEventListener('click', startRecording);
+    els.startBundleBtn.addEventListener('click', startBundle);
+    els.bundleTag.addEventListener('input', () => scheduleBundleStreamReload());
     els.cardBannerBtn.addEventListener('click', async () => {
       els.cardBannerBtn.disabled = true;
       try {
@@ -2701,6 +2807,423 @@
       }
     });
 
+    // ============================ Bundles ============================
+    // A bundle is a thin grouping that fans out into N member recordings sharing
+    // ONE schedule. The composer reuses the single-recording schedule/window/clip/
+    // fps/storage controls (which read global state); bundle mode only swaps the
+    // source block (single stream -> tag filter + multi-select) and the submit path.
+
+    let bundleStreamDebounce = 0;
+
+    // Switch the shared composer into bundle mode and open it: hide the single-stream
+    // source UI + Start button, show the stream-selection block + Start-bundle button,
+    // and load the recordable catalog streams for the picker.
+    function openBundleComposer() {
+      state.composerMode = 'bundle';
+      clearCatalogLock();
+      els.composer.classList.remove('hidden');
+      els.composerClose.classList.remove('hidden');
+      // Source UI: single off, bundle on.
+      els.urlField.classList.add('hidden');
+      els.catalogStreamBlock.classList.add('hidden');
+      els.bundleSourceBlock.classList.remove('hidden');
+      // Hide the single Name field (the bundle has its own name field).
+      const singleNameField = els.recName.closest('.field');
+      if (singleNameField) singleNameField.classList.add('hidden');
+      // Submit buttons.
+      els.startBtn.classList.add('hidden');
+      els.startBundleBtn.classList.remove('hidden');
+      els.bundlePreflight.classList.add('hidden');
+      els.bundlePreflight.textContent = '';
+      // Default Start to now (open-ended Stop) each time.
+      if (!els.startAt.value) els.startAt.value = toLocalInputValue(new Date());
+      refreshWindowUI();
+      state.bundleSelected = new Set();
+      updateBundleCount();
+      void loadBundleStreams();
+      els.composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function scheduleBundleStreamReload() {
+      window.clearTimeout(bundleStreamDebounce);
+      bundleStreamDebounce = window.setTimeout(() => { void loadBundleStreams(); }, 350);
+    }
+
+    // Load the recordable catalog streams for the picker, narrowed by the tag filter
+    // when set. Preserves any current explicit selection across reloads.
+    async function loadBundleStreams() {
+      const tag = String(els.bundleTag.value || '').trim();
+      els.bundleStreamPicker.innerHTML = '<div class="muted">Loading streams...</div>';
+      try {
+        const qs = tag ? `?tag=${encodeURIComponent(tag)}` : '';
+        const payload = await fetchJSON(`/api/v1/account/bundles/streams${qs}`);
+        state.bundleStreams = Array.isArray(payload.items) ? payload.items : [];
+      } catch (err) {
+        els.bundleStreamPicker.innerHTML = `<div style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+        return;
+      }
+      renderBundleStreamPicker();
+    }
+
+    function renderBundleStreamPicker() {
+      const streams = state.bundleStreams || [];
+      if (streams.length === 0) {
+        els.bundleStreamPicker.innerHTML = '<div class="muted">No recordable streams match.</div>';
+        updateBundleCount();
+        return;
+      }
+      const rows = streams.map((s) => {
+        const id = Number(s.id);
+        const checked = state.bundleSelected.has(id) ? ' checked' : '';
+        const loc = String(s.location_text || '').trim();
+        const locHTML = loc ? ` <span class="muted">&middot; ${escapeHTML(loc)}</span>` : '';
+        return `<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;">
+          <input type="checkbox" data-bundlestream="${id}"${checked} style="width:auto;min-height:0;margin:0;" />
+          <span>${escapeHTML(String(s.name || ('#' + id)))}${locHTML}</span>
+        </label>`;
+      }).join('');
+      const tagNote = String(els.bundleTag.value || '').trim()
+        ? `<div class="muted" style="margin-bottom:6px;">All ${streams.length} streams tagged "${escapeHTML(els.bundleTag.value.trim())}" are listed. Tagged streams are included even if unchecked.</div>` : '';
+      els.bundleStreamPicker.innerHTML = tagNote + rows;
+      els.bundleStreamPicker.querySelectorAll('input[data-bundlestream]').forEach((cb) =>
+        cb.addEventListener('change', () => {
+          const id = Number(cb.getAttribute('data-bundlestream'));
+          if (cb.checked) state.bundleSelected.add(id); else state.bundleSelected.delete(id);
+          updateBundleCount();
+        }));
+      updateBundleCount();
+    }
+
+    // The resolved member set is the union of the explicit checkbox selection and,
+    // when a tag is set, every stream carrying that tag. Show the live count.
+    function resolvedBundleCount() {
+      const tag = String(els.bundleTag.value || '').trim();
+      const ids = new Set(state.bundleSelected);
+      if (tag) for (const s of (state.bundleStreams || [])) ids.add(Number(s.id));
+      return ids.size;
+    }
+
+    function updateBundleCount() {
+      const n = resolvedBundleCount();
+      const tag = String(els.bundleTag.value || '').trim();
+      els.bundleStreamCount.textContent = tag
+        ? `${n} stream${n === 1 ? '' : 's'} selected (tag "${tag}" + checked)`
+        : `${n} stream${n === 1 ? '' : 's'} selected`;
+    }
+
+    // Build + POST the bundle. The capacity preflight runs server-side; a 409 with
+    // the peak-vs-cap message is surfaced inline (no partial fan-out is created).
+    async function startBundle() {
+      if (state.bundleSubmitting) return;
+      if (state.billingEnabled && state.billing.has_payment_method !== true) {
+        setStatus(els.startStatus, 'Add a card before starting a bundle.', 'err');
+        els.cardBanner.classList.remove('hidden');
+        return;
+      }
+      const name = String(els.bundleName.value || '').trim();
+      const tag = String(els.bundleTag.value || '').trim();
+      const ids = Array.from(state.bundleSelected);
+      const sched = compiledSchedule();
+      const clip = selectedClipSec();
+      const dest = selectedDestId();
+      const deliveryDest = selectedDeliveryDestId();
+      if (!name) { setStatus(els.startStatus, 'Bundle name is required.', 'err'); return; }
+      if (ids.length === 0 && !tag) { setStatus(els.startStatus, 'Select at least one stream or a tag.', 'err'); return; }
+      if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
+      if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
+      if (!windowValid()) { setStatus(els.startStatus, 'Stop must be after Start.', 'err'); return; }
+      if (dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination first.', 'err'); return; }
+
+      const win = compiledWindow();
+      const body = {
+        name,
+        stream_ids: ids,
+        tag,
+        cron_expr: sched.cron,
+        cron_timezone: sched.tz,
+        clip_duration_sec: clip,
+        start_at: win.startISO,
+        end_at: win.endISO,
+      };
+      const tfps = selectedTargetFps();
+      if (tfps) body.target_fps = tfps;
+      if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
+      else body.storage_destination_id = dest;
+
+      state.bundleSubmitting = true;
+      els.startBundleBtn.disabled = true;
+      els.bundlePreflight.classList.add('hidden');
+      setStatus(els.startStatus, 'Creating bundle...', '');
+      try {
+        const out = await fetchJSON('/api/v1/account/bundles', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        setStatus(els.startStatus, '', '');
+        closeComposer();
+        // Navigate to the new bundle's detail page.
+        window.history.pushState({}, '', `/bundles/${Number(out.id)}`);
+        await renderBundleRoute();
+      } catch (err) {
+        const msg = String(err.message || err);
+        // Surface the capacity-preflight rejection inline (peaks at X vs cap Y).
+        els.bundlePreflight.textContent = msg;
+        els.bundlePreflight.className = 'status err';
+        els.bundlePreflight.classList.remove('hidden');
+        setStatus(els.startStatus, msg, 'err');
+      } finally {
+        state.bundleSubmitting = false;
+        els.startBundleBtn.disabled = false;
+      }
+    }
+
+    // ---- Bundle routing + views ----
+
+    function bundleListRoute() { return /^\/bundles\/?$/.test(window.location.pathname || ''); }
+    function bundleDetailId() {
+      const m = /^\/bundles\/(\d+)\/?$/.exec(window.location.pathname || '');
+      return m ? Number(m[1]) : 0;
+    }
+
+    // Hide every other signed-in view so a bundle view owns the screen.
+    function hideMainViews() {
+      els.ledger.classList.add('hidden');
+      els.cardBanner.classList.add('hidden');
+      els.heroCopy.classList.add('hidden');
+      els.cards.classList.add('hidden');
+      els.newRecRow.classList.add('hidden');
+      els.composer.classList.add('hidden');
+      els.clipPage.classList.add('hidden');
+    }
+
+    async function renderBundleRoute() {
+      hideMainViews();
+      const detailId = bundleDetailId();
+      if (detailId > 0) {
+        els.bundleList.classList.add('hidden');
+        els.bundleDetail.classList.remove('hidden');
+        await loadBundleDetail(detailId);
+      } else {
+        els.bundleDetail.classList.add('hidden');
+        els.bundleList.classList.remove('hidden');
+        await loadBundleList();
+      }
+    }
+
+    function scheduleSummary(b) {
+      const cron = escapeHTML(String(b.cron_expr || ''));
+      const tz = escapeHTML(String(b.cron_timezone || 'UTC'));
+      const clip = Number(b.clip_duration_sec || 0);
+      const fps = b.target_fps ? `${Number(b.target_fps)} fps` : 'Source fps';
+      return `<span class="mono">${cron}</span> <span class="muted">${tz} &middot; ${clip}s clips &middot; ${escapeHTML(fps)}</span>`;
+    }
+
+    async function loadBundleList() {
+      els.bundleList.innerHTML = '<div class="clip-summary">Loading bundles...</div>';
+      let payload;
+      try {
+        payload = await fetchJSON('/api/v1/account/bundles');
+      } catch (err) {
+        els.bundleList.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+        return;
+      }
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      const header = `<div class="clip-page-head">
+        <div><div class="eyebrow">Bundles</div><h2 style="margin:2px 0 4px;">Recording bundles</h2></div>
+        <a class="btn-link secondary" href="/recordings">Back to recordings</a>
+      </div>`;
+      if (items.length === 0) {
+        els.bundleList.innerHTML = header + '<div class="clip-summary">No bundles yet. Use "+ New bundle" on the recordings page to record many streams on one schedule.</div>';
+        return;
+      }
+      const rows = items.map((b) => {
+        const id = Number(b.id);
+        const cost = (Number(b.cost_cents || 0) / 100).toFixed(2);
+        return `<tr>
+          <td class="clip-when"><a href="/bundles/${id}" data-bundlelink="${id}">${escapeHTML(String(b.name || ('#' + id)))}</a></td>
+          <td class="num">${Number(b.member_count || 0)}</td>
+          <td>${scheduleSummary(b)}</td>
+          <td>${escapeHTML(String(b.status || ''))}</td>
+          <td class="num">${Number(b.record_days || 0)}</td>
+          <td class="num">$${cost}</td>
+        </tr>`;
+      }).join('');
+      const table = `<table class="clip-table"><thead><tr>
+        <th>Name</th><th class="num">Streams</th><th>Schedule</th><th>Status</th><th class="num">Record-days</th><th class="num">Cost</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+      els.bundleList.innerHTML = header + table;
+      els.bundleList.querySelectorAll('a[data-bundlelink]').forEach((a) =>
+        a.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          window.history.pushState({}, '', `/bundles/${a.getAttribute('data-bundlelink')}`);
+          void renderBundleRoute();
+        }));
+    }
+
+    const bundleClipState = { bundleId: 0, page: 0, total: 0 };
+
+    async function loadBundleDetail(id) {
+      els.bundleDetail.innerHTML = '<div class="clip-summary">Loading bundle...</div>';
+      let b;
+      try {
+        b = await fetchJSON(`/api/v1/account/bundles/${encodeURIComponent(id)}`);
+      } catch (err) {
+        els.bundleDetail.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+        return;
+      }
+      bundleClipState.bundleId = id;
+      bundleClipState.page = 0;
+      renderBundleDetail(b);
+      await loadBundleClips(0);
+    }
+
+    function renderBundleDetail(b) {
+      const id = Number(b.id);
+      const members = Array.isArray(b.members) ? b.members : [];
+      const status = String(b.status || '');
+      const canPause = status === 'active';
+      const canResume = status === 'paused';
+      const canManage = status !== 'canceled';
+      const actions = `<div class="clip-page-actions">
+        ${canPause ? `<button type="button" class="secondary" data-bundlepause="${id}">Pause</button>` : ''}
+        ${canResume ? `<button type="button" class="secondary" data-bundleresume="${id}">Resume</button>` : ''}
+        ${canManage ? `<button type="button" class="danger" data-bundlecancel="${id}">Cancel bundle</button>` : ''}
+        <span class="clip-pager-label" data-bundlemsg></span>
+      </div>`;
+      const header = `<div class="clip-page-head">
+        <div>
+          <div class="eyebrow">Bundle</div>
+          <h2 style="margin:2px 0 4px;">${escapeHTML(String(b.name || ('#' + id)))}</h2>
+          <div class="clip-summary" style="margin:0;">${scheduleSummary(b)} &middot; <b>${escapeHTML(status)}</b> &middot; ${members.length} member${members.length === 1 ? '' : 's'}</div>
+        </div>
+        <a class="btn-link secondary" href="/bundles">Back to bundles</a>
+      </div>`;
+      const memberRows = members.map((m) => {
+        const rid = Number(m.recording_id);
+        const sn = String(m.stream_name || m.name || ('#' + rid));
+        const last = m.last_clip_at ? new Date(m.last_clip_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '--';
+        return `<tr>
+          <td class="clip-when"><a href="/recordings/${rid}" data-memberlink="${rid}">${escapeHTML(sn)}</a></td>
+          <td>${escapeHTML(String(m.status || ''))}</td>
+          <td>${escapeHTML(String(m.health || ''))}</td>
+          <td>${escapeHTML(last)}</td>
+          <td class="num">${Number(m.clip_count || 0)}</td>
+        </tr>`;
+      }).join('');
+      const memberTable = `<h3 class="group-title">Members</h3><table class="clip-table"><thead><tr>
+        <th>Stream</th><th>Status</th><th>Health</th><th>Last clip</th><th class="num">Clips</th>
+      </tr></thead><tbody>${memberRows}</tbody></table>`;
+      els.bundleDetail.innerHTML = header + actions + memberTable + `<h3 class="group-title">Clips</h3><div id="bundleClipsBody"></div>`;
+      els.bundleDetail.querySelectorAll('a[data-memberlink]').forEach((a) =>
+        a.addEventListener('click', () => { /* normal navigation to the member clip page */ }));
+      const pauseBtn = els.bundleDetail.querySelector('button[data-bundlepause]');
+      if (pauseBtn) pauseBtn.addEventListener('click', () => bundleAction(id, 'pause'));
+      const resumeBtn = els.bundleDetail.querySelector('button[data-bundleresume]');
+      if (resumeBtn) resumeBtn.addEventListener('click', () => bundleAction(id, 'resume'));
+      const cancelBtn = els.bundleDetail.querySelector('button[data-bundlecancel]');
+      if (cancelBtn) cancelBtn.addEventListener('click', () => {
+        if (!window.confirm('Cancel the whole bundle? This stops and cancels all member recordings.')) return;
+        bundleAction(id, 'cancel');
+      });
+    }
+
+    async function bundleAction(id, action) {
+      const msg = els.bundleDetail.querySelector('[data-bundlemsg]');
+      if (msg) msg.textContent = `${action}...`;
+      try {
+        await fetchJSON(`/api/v1/account/bundles/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+        if (action === 'cancel') {
+          window.history.pushState({}, '', '/bundles');
+          await renderBundleRoute();
+          return;
+        }
+        await loadBundleDetail(id);
+      } catch (err) {
+        if (msg) msg.textContent = String(err.message || err);
+      }
+    }
+
+    async function loadBundleClips(page) {
+      const body = els.bundleDetail.querySelector('#bundleClipsBody');
+      if (!body) return;
+      bundleClipState.page = Math.max(0, Number(page) || 0);
+      body.innerHTML = '<div class="clip-summary">Loading clips...</div>';
+      let payload;
+      try {
+        const offset = bundleClipState.page * CLIP_PAGE_SIZE;
+        payload = await fetchJSON(`/api/v1/account/bundles/${encodeURIComponent(bundleClipState.bundleId)}/clips?limit=${CLIP_PAGE_SIZE}&offset=${offset}`);
+      } catch (err) {
+        body.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+        return;
+      }
+      bundleClipState.total = Number(payload.total || 0);
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      const total = bundleClipState.total;
+      const pageCount = Math.max(1, Math.ceil(total / CLIP_PAGE_SIZE));
+      const page2 = bundleClipState.page;
+      if (items.length === 0) {
+        body.innerHTML = `<div class="clip-summary"><b>${total}</b> clip${total === 1 ? '' : 's'} total</div><div class="clip-summary">No clips on this page yet.</div>`;
+        return;
+      }
+      const liveCount = items.filter((c) => c.purged !== true).length;
+      const pageActions = `<div class="clip-page-actions">
+        ${liveCount > 0 ? `<button type="button" class="secondary" data-bundlezip="${bundleClipState.bundleId}">Download all (this page) as ZIP</button>` : ''}
+        <span class="clip-pager-label" data-bundlezipstatus></span>
+      </div>`;
+      const rows = items.map((c) => clipRowHTML(c, Number(c.recording_id || 0), { showSource: true })).join('');
+      const summary = `<div class="clip-summary"><b>${total}</b> clip${total === 1 ? '' : 's'} total${total > 0 ? ` &middot; page ${page2 + 1} of ${pageCount}` : ''}</div>`;
+      const pager = pageCount <= 1 ? '' : `<div class="clip-pager">
+        <button type="button" class="secondary" data-bundleclippage="prev"${page2 <= 0 ? ' disabled' : ''}>Previous</button>
+        <span class="clip-pager-label">Page ${page2 + 1} of ${pageCount}</span>
+        <button type="button" class="secondary" data-bundleclippage="next"${page2 >= pageCount - 1 ? ' disabled' : ''}>Next</button>
+      </div>`;
+      body.innerHTML = summary + pageActions + clipTableHTML(rows, true) + pager;
+      // Reuse the per-clip View/Download/Send/Delete wiring; each row carries its own
+      // member recording_id so the actions hit the right per-recording endpoints.
+      wireClipActions(body);
+      body.querySelectorAll('button[data-bundleclippage]').forEach((bn) =>
+        bn.addEventListener('click', () => loadBundleClips(bn.getAttribute('data-bundleclippage') === 'prev' ? bundleClipState.page - 1 : bundleClipState.page + 1)));
+      const zipBtn = body.querySelector('button[data-bundlezip]');
+      if (zipBtn) zipBtn.addEventListener('click', () => downloadBundleZip(zipBtn));
+    }
+
+    async function downloadBundleZip(btn) {
+      const id = bundleClipState.bundleId;
+      const statusEl = els.bundleDetail.querySelector('[data-bundlezipstatus]');
+      const setMsg = (t) => { if (statusEl) statusEl.textContent = t; };
+      btn.disabled = true;
+      setMsg('Preparing ZIP...');
+      try {
+        const offset = bundleClipState.page * CLIP_PAGE_SIZE;
+        const job = await fetchJSON(`/api/v1/account/bundles/${encodeURIComponent(id)}/export`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ limit: CLIP_PAGE_SIZE, offset }),
+        });
+        const jobId = job && job.job_id;
+        if (!jobId) throw new Error('No job id returned.');
+        for (let i = 0; i < 600; i += 1) {
+          await sleep(1500);
+          const st = await fetchJSON(`/api/v1/account/clips-zip/${encodeURIComponent(jobId)}`);
+          const status = String(st.status || '');
+          if (status === 'complete' && st.download_url) { setMsg('ZIP ready.'); window.location.assign(st.download_url); btn.disabled = false; return; }
+          if (status === 'error') throw new Error(st.error || 'ZIP failed.');
+          const n = Number(st.processed || 0); const tot = Number(st.total || 0);
+          setMsg(tot > 0 ? `Packing ${n}/${tot}...` : 'Packing...');
+        }
+        throw new Error('ZIP timed out.');
+      } catch (err) {
+        setMsg('');
+        window.alert(String(err.message || err));
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // Re-render on back/forward between /bundles, /bundles/{id}, and /recordings.
+    window.addEventListener('popstate', () => {
+      if (bundleListRoute() || bundleDetailId() > 0) { void renderBundleRoute(); return; }
+      window.location.reload();
+    });
+
     async function boot() {
       fillTimezoneSelect(els.schedTZ);
       fillTimezoneSelect(els.schedTZCustom);
@@ -2715,6 +3238,11 @@
         els.signedIn.classList.remove('hidden');
         await loadBilling();
         await refreshDestinations();
+        // Bundle routes own the screen when present.
+        if (bundleListRoute() || bundleDetailId() > 0) {
+          await renderBundleRoute();
+          return;
+        }
         const recId = clipPageRecId();
         if (recId) {
           // Dedicated clip-management page: hide the list/composer chrome and render
