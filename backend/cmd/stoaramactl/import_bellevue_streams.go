@@ -337,7 +337,6 @@ func prepareBellevueStream(feature bellevueFeature, camQueryURL, sourcePageURL s
 	locationLocality := name
 	sourceURL := fmt.Sprintf(bellevueManifestURLFormat, externalID)
 	tags := []string{
-		"provider:bellevuewa.gov",
 		"source:traffic-camera",
 		"source:trafficmap.bellevuewa.gov",
 		"country:us",

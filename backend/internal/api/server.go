@@ -6959,6 +6959,9 @@ func dedupeStrings(in []string) []string {
 		if v == "" {
 			continue
 		}
+		if strings.HasPrefix(strings.ToLower(v), "provider:") {
+			continue
+		}
 		if _, ok := seen[v]; ok {
 			continue
 		}
