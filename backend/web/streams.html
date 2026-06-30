@@ -574,8 +574,28 @@
     .fw600 { font-weight: 600; }
 
     /* Back link */
-    .back-link { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
-    .back-link:hover { color: var(--accent); }
+    .back-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: fit-content;
+      min-height: 30px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 88%, #000);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      text-decoration: none;
+    }
+    .back-link:hover {
+      color: var(--accent);
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+      text-decoration: none;
+    }
 
     /* Stream name link */
     .stream-link { font-weight: 500; font-size: 13px; }
@@ -860,22 +880,31 @@
     }
     /* Detail header */
     .detail-header {
+      position: sticky;
+      top: 0;
+      z-index: 25;
       display: flex;
       flex-wrap: wrap;
       align-items: center;
+      justify-content: space-between;
       gap: 10px 14px;
+      padding: 10px 0;
       margin-bottom: 14px;
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(10px);
     }
-    .detail-header-left { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 0 1 auto; }
+    .detail-header-left { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1 1 360px; }
     .detail-header-actions {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       gap: 8px;
+      margin-left: auto;
       flex: 0 0 auto;
     }
     .detail-title { font-size: 16px; font-weight: 600; }
-    .detail-meta { display: flex; flex-wrap: wrap; gap: 5px; }
+    .detail-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+    .detail-tags-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 0; }
     .detail-section-card {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -998,6 +1027,21 @@
       border: 1px solid var(--border);
       border-radius: 8px;
       overflow: hidden;
+    }
+    .detail-live-player-mount::after {
+      content: "LIVE";
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 2;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--err) 86%, #000);
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      pointer-events: none;
     }
     .detail-live-player-mount iframe,
     .detail-live-player-mount video {
@@ -1481,7 +1525,6 @@
   <div id="streamsPanel">
     <div class="domain-intro">
       <div class="domain-intro-title">Streams</div>
-      <div class="domain-intro-copy">Browse live public video streams by location, and set one up to record.</div>
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
@@ -1601,7 +1644,7 @@
   <div id="detailPanel" style="display:none;">
     <div class="detail-header">
       <div class="detail-header-left">
-        <a href="/streams" class="back-link" id="backLink">&#8592; Streams</a>
+        <a href="/streams" class="back-link" id="backLink">Streams</a>
         <div class="detail-title" id="detailTitle"></div>
         <div class="detail-meta" id="detailMeta"></div>
       </div>
@@ -2523,6 +2566,23 @@ function renderTagEditor(stream, tableKey) {
       </div>
     </div>
   `;
+}
+
+function shouldShowDetailTag(tag) {
+  const value = String(tag || '').trim().toLowerCase();
+  if (!value) return false;
+  return !(
+    value.startsWith('imported:') ||
+    value.startsWith('provider:') ||
+    value.startsWith('capture_type:') ||
+    value.startsWith('source:')
+  );
+}
+
+function renderDetailTagChips(stream) {
+  const tags = normalizeTags((stream && stream.tags) || []).filter(shouldShowDetailTag);
+  if (!tags.length) return '';
+  return `<div class="detail-tags-row">${tags.map((tag) => `<span class="tag tag-muted">${esc(tag)}</span>`).join('')}</div>`;
 }
 
 function extractTagInputValue(actionEl) {
@@ -4904,7 +4964,7 @@ function teardownDetailLivePlayer() {
   if (detailNoInlineNote) detailNoInlineNote.style.display = 'none';
 }
 
-// Decide how to play a stream inline. Returns 'youtube' | 'hls' | 'none'.
+// Decide how to play a stream inline. Returns 'youtube' | 'hls' | 'direct' | 'none'.
 // isRecordableStream mirrors the recorder's accepted source kinds (live HLS and
 // direct HTTP(S) video). It drives both the browse "Recordable" segment and the
 // per-row Record-vs-View CTA so the two never disagree.
@@ -4950,13 +5010,50 @@ async function resolveDetailPlayURL(stream) {
   return String((payload && payload.resolved_url) || '').trim();
 }
 
+function detailDirectVideoURL(stream) {
+  const s = stream || {};
+  const captureType = String(s.capture_type || '').trim().toLowerCase();
+  const sourceURL = String(s.source_url || '').trim();
+  if (captureType !== 'http_video') return '';
+  if (!/^https?:\/\//i.test(sourceURL)) return '';
+  return sourceURL;
+}
+
 function detailPlayerKind(stream) {
   const s = stream || {};
   const provider = String(s.provider || '').trim().toUpperCase();
   const externalID = String(s.external_id || '').trim();
   if (provider === 'YOUTUBE' && externalID) return 'youtube';
   if (detailHlsURL(s)) return 'hls';
+  if (detailDirectVideoURL(s)) return 'direct';
   return 'none';
+}
+
+function makeLiveVideoElement() {
+  const video = document.createElement('video');
+  video.controls = false;
+  video.muted = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.setAttribute('aria-label', 'Live stream');
+  video.addEventListener('click', () => {
+    video.muted = !video.muted;
+    video.play().catch(() => {});
+  });
+  return video;
+}
+
+function seekNativeVideoToLiveEdge(video) {
+  try {
+    const ranges = video && video.seekable;
+    if (!ranges || ranges.length < 1) return;
+    const liveEdge = ranges.end(ranges.length - 1);
+    const target = Math.max(0, liveEdge - 2);
+    if (Number.isFinite(target) && Math.abs(target - video.currentTime) > 1) {
+      video.currentTime = target;
+    }
+  } catch (_) {}
 }
 
 // Honest fallback: no inline player and no fake one. Offer an unobtrusive inline
@@ -5008,13 +5105,18 @@ async function mountDetailLivePlayer(stream) {
     showDetailNoInlineFallback(stream);
     return;
   }
-  const video = document.createElement('video');
-  video.controls = true;
-  video.muted = true;
-  video.autoplay = true;
-  video.playsInline = true;
+  const video = makeLiveVideoElement();
   detailLivePlayerMount.appendChild(video);
   detailLivePlayer.style.display = '';
+  if (kind === 'direct') {
+    video.src = detailDirectVideoURL(stream);
+    video.addEventListener('loadedmetadata', () => {
+      seekNativeVideoToLiveEdge(video);
+      video.play().catch(() => {});
+    }, { once: true });
+    video.play().catch(() => {});
+    return;
+  }
   if (window.Hls && window.Hls.isSupported()) {
     // hls.js (Media Source Extensions). Preferred on Chrome/Firefox, which report
     // canPlayType('application/vnd.apple.mpegurl') === 'maybe' but cannot actually
@@ -5042,6 +5144,7 @@ async function mountDetailLivePlayer(stream) {
       liveMaxLatencyDuration: 30,
       maxLiveSyncPlaybackRate: 1.5,
       backBufferLength: 30,
+      liveDurationInfinity: true,
     });
     const hls = detailHlsInstance;
     // Re-sync toward the live point (liveSyncPosition already carries the
@@ -5055,7 +5158,10 @@ async function mountDetailLivePlayer(stream) {
     };
     hls.loadSource(url);
     hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      seekToLiveEdge();
+      video.play().catch(() => {});
+    });
     // Recover from transient errors instead of letting the player die: network
     // errors retry the load, media errors trigger the codec-level recovery, and
     // both re-sync to the live point so playback resumes live rather than stale.
@@ -5072,6 +5178,10 @@ async function mountDetailLivePlayer(stream) {
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     // Native HLS (Safari/iOS), where hls.js is not supported.
     video.src = url;
+    video.addEventListener('loadedmetadata', () => {
+      seekNativeVideoToLiveEdge(video);
+      video.play().catch(() => {});
+    }, { once: true });
     video.play().catch(() => {});
   } else {
     // No HLS support and not native: do not fake playback; drop back to the
@@ -5164,7 +5274,7 @@ async function loadDetail(options = {}) {
     `<span class="tag tag-muted mono">${esc(s.slug)}</span>`,
     renderLocationHierarchy(s),
     description ? `<div class="muted fs11" style="margin-top:6px;">${esc(description)}</div>` : '',
-    `<div class="detail-tags-row" style="margin-top:8px;">${renderTagEditor(s, 'detail')}</div>`,
+    renderDetailTagChips(s),
   ].filter(Boolean).join('');
   knownStreamTags = normalizeTags(knownStreamTags.concat(normalizeTags(s.tags || [])));
   refreshTagSuggestionList();
