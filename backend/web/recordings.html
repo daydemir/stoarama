@@ -372,8 +372,38 @@
           <input id="recName" type="text" placeholder="A label for this recording" />
         </div>
 
-        <!-- Schedule -->
+        <!-- Capture mode -->
         <div class="field">
+          <label>Capture mode</label>
+          <div class="seg" id="modeSeg">
+            <button type="button" data-mode="sampled" class="on">Sampled clips</button>
+            <button type="button" data-mode="continuous">Continuous gapless</button>
+          </div>
+          <div class="hint">Sampled records one clip per scheduled fire. Continuous records back-to-back segments with no gaps for a daily time window.</div>
+        </div>
+
+        <!-- Continuous daily window (shown only in continuous mode) -->
+        <div class="field hidden" id="continuousControls">
+          <label>Daily window</label>
+          <div class="grid-2">
+            <div>
+              <label for="dailyWindowStart">Start</label>
+              <input id="dailyWindowStart" type="time" value="09:00" />
+            </div>
+            <div>
+              <label for="dailyWindowEnd">End</label>
+              <input id="dailyWindowEnd" type="time" value="21:00" />
+            </div>
+          </div>
+          <div style="margin-top:12px;max-width:280px;">
+            <label for="schedTZContinuous">Timezone</label>
+            <select id="schedTZContinuous"></select>
+          </div>
+          <div id="continuousWarn" class="hint warn"></div>
+        </div>
+
+        <!-- Schedule -->
+        <div class="field" id="scheduleField">
           <label>Schedule</label>
           <div class="seg" id="schedSeg">
             <button type="button" data-preset="15m">Every 15 min</button>
@@ -581,6 +611,13 @@
       streamStatus: document.getElementById('streamStatus'),
       streamPreview: document.getElementById('streamPreview'),
       recName: document.getElementById('recName'),
+      modeSeg: document.getElementById('modeSeg'),
+      continuousControls: document.getElementById('continuousControls'),
+      dailyWindowStart: document.getElementById('dailyWindowStart'),
+      dailyWindowEnd: document.getElementById('dailyWindowEnd'),
+      schedTZContinuous: document.getElementById('schedTZContinuous'),
+      continuousWarn: document.getElementById('continuousWarn'),
+      scheduleField: document.getElementById('scheduleField'),
       schedSeg: document.getElementById('schedSeg'),
       dailyControls: document.getElementById('dailyControls'),
       dailyTime: document.getElementById('dailyTime'),
@@ -686,6 +723,9 @@
       recordings: [],
       destinations: [],
       schedPreset: 'hourly',
+      // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
+      // back-to-back segments for a daily window). Shared by single + bundle.
+      composerScheduleMode: 'sampled',
       clipSelected: 60,
       // Frame rate choice: 'source' (native, no re-encode) | '30' | '15'.
       targetFps: 'source',
@@ -762,6 +802,7 @@
     // ---- Schedule: preset -> cron + preview + pre-flight validation ----
 
     function activeTZSelect() {
+      if (state.composerScheduleMode === 'continuous') return els.schedTZContinuous;
       return state.schedPreset === 'custom' ? els.schedTZCustom : els.schedTZ;
     }
 
@@ -769,6 +810,41 @@
       const sel = activeTZSelect();
       const v = sel ? String(sel.value || '').trim() : '';
       return v || browserTimezone();
+    }
+
+    // ---- Capture mode toggle (sampled clips | continuous gapless) ----
+
+    // continuousWindowValid checks the daily window is well-formed: both times set
+    // and start strictly before end (no midnight crossing in scope). It mirrors the
+    // server's ValidateContinuousWindowForCreate.
+    function continuousWindowValid() {
+      const s = String(els.dailyWindowStart.value || '').trim();
+      const e = String(els.dailyWindowEnd.value || '').trim();
+      if (!s || !e) return false;
+      return s < e;
+    }
+
+    // setScheduleMode toggles the visible schedule controls and the relabel of the
+    // clip control. In continuous mode the per-fire cron block is hidden and the
+    // daily window is shown; the Clip length control is reused as the Segment length.
+    function setScheduleMode(m) {
+      state.composerScheduleMode = (m === 'continuous') ? 'continuous' : 'sampled';
+      const cont = state.composerScheduleMode === 'continuous';
+      els.modeSeg.querySelectorAll('button[data-mode]').forEach((b) => {
+        b.classList.toggle('on', b.dataset.mode === state.composerScheduleMode);
+      });
+      els.continuousControls.classList.toggle('hidden', !cont);
+      els.scheduleField.classList.toggle('hidden', cont);
+      const clipLabel = els.clipSeg.closest('.field')?.querySelector('label');
+      if (clipLabel) clipLabel.textContent = cont ? 'Segment length' : 'Clip length';
+      refreshContinuousWarn();
+      refreshStartEnabled();
+      renderCostEstimate();
+    }
+
+    function refreshContinuousWarn() {
+      if (state.composerScheduleMode !== 'continuous') { els.continuousWarn.textContent = ''; return; }
+      els.continuousWarn.textContent = continuousWindowValid() ? '' : 'End time must be after start time.';
     }
 
     // Returns { cron, tz } for the current schedule selection. cron is null when
@@ -1025,6 +1101,11 @@
 
     function renderCostEstimate() {
       if (!state.billingEnabled) { els.costEstimate.textContent = ''; els.costEstimateNote.textContent = ''; return; }
+      if (state.composerScheduleMode === 'continuous') {
+        els.costEstimate.innerHTML = '<span class="muted">Continuous records every day the window is active; storage scales with total footage.</span>';
+        els.costEstimateNote.textContent = 'Billed per recording-day plus managed storage per GB-month, monthly in arrears. Pricing is unchanged from sampled.';
+        return;
+      }
       const m = estimateModel();
       if (!m) {
         els.costEstimate.innerHTML = '<span class="muted">Set a schedule and clip length to estimate cost.</span>';
@@ -1630,7 +1711,9 @@
     function refreshStartEnabled() {
       const url = String(els.recURL.value || '').trim();
       const catalog = state.catalogStreamId > 0;
-      const schedOK = refreshScheduleUIQuiet();
+      const schedOK = state.composerScheduleMode === 'continuous'
+        ? (continuousWindowValid() && selectedClipSec() >= 5 && selectedClipSec() <= 900)
+        : refreshScheduleUIQuiet();
       const dest = selectedDestId() || selectedDeliveryDestId();
       const bucketOK = state.bucketState === 'connected' && dest > 0;
       const streamOK = state.streamProbe.ok === true;
@@ -2678,24 +2761,35 @@
       const catalogId = state.catalogStreamId > 0 ? state.catalogStreamId : 0;
       const dest = selectedDestId();
       const deliveryDest = selectedDeliveryDestId();
+      const continuous = state.composerScheduleMode === 'continuous';
       const sched = compiledSchedule();
       const clip = selectedClipSec();
       if (!catalogId && !url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
       if (dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination first.', 'err'); return; }
-      if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
-      if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
+      if (continuous) {
+        if (!continuousWindowValid()) { setStatus(els.startStatus, 'End time must be after start time.', 'err'); return; }
+      } else {
+        if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
+        if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
+      }
       if (!windowValid()) { setStatus(els.startStatus, 'Stop must be after Start.', 'err'); return; }
 
       const name = String(els.recName.value || '').trim() || (catalogId ? `Stream ${catalogId}` : deriveName(url));
       const win = compiledWindow();
       const body = {
         name,
-        cron_expr: sched.cron,
         cron_timezone: sched.tz,
         clip_duration_sec: clip,
         start_at: win.startISO,
         end_at: win.endISO,
       };
+      if (continuous) {
+        body.mode = 'continuous';
+        body.daily_window_start = String(els.dailyWindowStart.value || '').trim();
+        body.daily_window_end = String(els.dailyWindowEnd.value || '').trim();
+      } else {
+        body.cron_expr = sched.cron;
+      }
       // Frame rate: omit for Source/native (server stores NULL, keeps -c copy),
       // send the number for 30 or 15 (server re-encodes each clip to that rate).
       const tfps = selectedTargetFps();
@@ -2847,6 +2941,11 @@
 
     // ---- Wiring ----
 
+    els.modeSeg.querySelectorAll('button[data-mode]').forEach((b) =>
+      b.addEventListener('click', () => setScheduleMode(b.getAttribute('data-mode'))));
+    els.dailyWindowStart.addEventListener('input', () => { refreshContinuousWarn(); refreshStartEnabled(); renderCostEstimate(); });
+    els.dailyWindowEnd.addEventListener('input', () => { refreshContinuousWarn(); refreshStartEnabled(); renderCostEstimate(); });
+    els.schedTZContinuous.addEventListener('change', () => { refreshContinuousWarn(); refreshStartEnabled(); });
     els.schedSeg.querySelectorAll('button[data-preset]').forEach((b) =>
       b.addEventListener('click', () => setSchedPreset(b.getAttribute('data-preset'))));
     els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
@@ -3030,14 +3129,19 @@
       const name = String(els.bundleName.value || '').trim();
       const tag = String(els.bundleTag.value || '').trim();
       const ids = Array.from(state.bundleSelected);
+      const continuous = state.composerScheduleMode === 'continuous';
       const sched = compiledSchedule();
       const clip = selectedClipSec();
       const dest = selectedDestId();
       const deliveryDest = selectedDeliveryDestId();
       if (!name) { setStatus(els.startStatus, 'Bundle name is required.', 'err'); return; }
       if (ids.length === 0 && !tag) { setStatus(els.startStatus, 'Select at least one stream or a tag.', 'err'); return; }
-      if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
-      if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
+      if (continuous) {
+        if (!continuousWindowValid()) { setStatus(els.startStatus, 'End time must be after start time.', 'err'); return; }
+      } else {
+        if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
+        if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
+      }
       if (!windowValid()) { setStatus(els.startStatus, 'Stop must be after Start.', 'err'); return; }
       if (dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination first.', 'err'); return; }
 
@@ -3046,12 +3150,18 @@
         name,
         stream_ids: ids,
         tag,
-        cron_expr: sched.cron,
         cron_timezone: sched.tz,
         clip_duration_sec: clip,
         start_at: win.startISO,
         end_at: win.endISO,
       };
+      if (continuous) {
+        body.mode = 'continuous';
+        body.daily_window_start = String(els.dailyWindowStart.value || '').trim();
+        body.daily_window_end = String(els.dailyWindowEnd.value || '').trim();
+      } else {
+        body.cron_expr = sched.cron;
+      }
       const tfps = selectedTargetFps();
       if (tfps) body.target_fps = tfps;
       if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
@@ -3338,8 +3448,10 @@
     async function boot() {
       fillTimezoneSelect(els.schedTZ);
       fillTimezoneSelect(els.schedTZCustom);
+      fillTimezoneSelect(els.schedTZContinuous);
       fillProviderSelect();
       setSchedPreset('hourly');
+      setScheduleMode('sampled');
       setClip(60);
       renderCostEstimate();
       try {

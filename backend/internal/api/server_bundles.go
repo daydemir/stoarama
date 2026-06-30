@@ -29,9 +29,14 @@ type bundleCreateRequest struct {
 	Tag       string  `json:"tag"`
 	// Shared schedule, identical to a single recording's fields. cron_timezone is
 	// the user's uniform choice applied to all members.
-	CronExpr                     string     `json:"cron_expr"`
-	CronTimezone                 string     `json:"cron_timezone"`
-	ClipDurationSec              int        `json:"clip_duration_sec"`
+	CronExpr        string `json:"cron_expr"`
+	CronTimezone    string `json:"cron_timezone"`
+	ClipDurationSec int    `json:"clip_duration_sec"`
+	// Mode is 'sampled' (default) or 'continuous'. A continuous bundle fans out
+	// continuous members sharing the daily window; cron_expr is ignored.
+	Mode                         string     `json:"mode"`
+	DailyWindowStart             string     `json:"daily_window_start"`
+	DailyWindowEnd               string     `json:"daily_window_end"`
 	TargetFPS                    *int       `json:"target_fps"`
 	StartAt                      *time.Time `json:"start_at"`
 	EndAt                        *time.Time `json:"end_at"`
@@ -142,6 +147,14 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 	if cronTimezone == "" {
 		cronTimezone = "UTC"
 	}
+	mode := strings.TrimSpace(req.Mode)
+	if mode == "" {
+		mode = "sampled"
+	}
+	if mode != "sampled" && mode != "continuous" {
+		util.WriteError(w, http.StatusBadRequest, "mode must be sampled or continuous")
+		return
+	}
 	clipDuration := req.ClipDurationSec
 	if clipDuration == 0 {
 		clipDuration = 60
@@ -149,6 +162,32 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 	if clipDuration < 5 || clipDuration > 900 {
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
+	}
+
+	var (
+		dailyStart    recsched.TimeOfDay
+		dailyEnd      recsched.TimeOfDay
+		dailyStartArg any
+		dailyEndArg   any
+	)
+	if mode == "continuous" {
+		ds, derr := recsched.ParseTimeOfDay(strings.TrimSpace(req.DailyWindowStart))
+		if derr != nil {
+			util.WriteError(w, http.StatusBadRequest, "daily_window_start must be HH:MM")
+			return
+		}
+		de, derr := recsched.ParseTimeOfDay(strings.TrimSpace(req.DailyWindowEnd))
+		if derr != nil {
+			util.WriteError(w, http.StatusBadRequest, "daily_window_end must be HH:MM")
+			return
+		}
+		if verr := recsched.ValidateContinuousWindowForCreate(ds, de, clipDuration); verr != nil {
+			util.WriteError(w, http.StatusBadRequest, verr.Error())
+			return
+		}
+		dailyStart, dailyEnd = ds, de
+		dailyStartArg = strings.TrimSpace(req.DailyWindowStart)
+		dailyEndArg = strings.TrimSpace(req.DailyWindowEnd)
 	}
 
 	var targetFPSArg any
@@ -174,10 +213,13 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 		endAtArg = endAt
 	}
 
-	// Validate the shared schedule ONCE for the whole bundle.
-	if err := recsched.ValidateCronForCreate(cronExpr, cronTimezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
+	// Validate the shared schedule ONCE for the whole bundle. Continuous validated
+	// its window above; sampled validates the cron floor here.
+	if mode != "continuous" {
+		if err := recsched.ValidateCronForCreate(cronExpr, cronTimezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	// Resolve the member set: union of explicit ids and the tag filter, dedup by
@@ -197,10 +239,18 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 
 	// Capacity preflight over ALL N members at once BEFORE any insert: reject the
 	// whole bundle if its forecast peak exceeds the current cap, so an over-cap
-	// bundle leaves zero rows behind.
-	if err := s.checkBundleScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration, len(members)); err != nil {
-		util.WriteError(w, http.StatusConflict, err.Error())
-		return
+	// bundle leaves zero rows behind. A continuous bundle counts each member as a
+	// FULL constant slot for the shared window (so N members = +N at the window).
+	if mode == "continuous" {
+		if err := s.checkContinuousScheduleCapacity(r.Context(), cronTimezone, dailyStart, dailyEnd, clipDuration, startAt, endAtTime(endAtArg), len(members)); err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+	} else {
+		if err := s.checkBundleScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration, len(members)); err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
 	}
 
 	// Resolve the capture (and optional WebDAV delivery) destination exactly as
@@ -260,14 +310,25 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 	}
 
 	// One next_fire computed from the shared schedule, applied to every member.
-	nextFire, err := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
-	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	var nextFireArg any
-	if !nextFire.IsZero() {
-		nextFireArg = nextFire
+	if mode == "continuous" {
+		nextOpen, nerr := recsched.NextWindowOpenUTC(cronTimezone, dailyStart, startAt, endAtTime(endAtArg), time.Now().UTC())
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextOpen.IsZero() {
+			nextFireArg = nextOpen
+		}
+	} else {
+		nextFire, nerr := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextFire.IsZero() {
+			nextFireArg = nextFire
+		}
 	}
 
 	// Bundle name uniqueness (account_id, lower(name)).
@@ -294,12 +355,16 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 		bundleID  int64
 		createdAt time.Time
 	)
+	var bundleCronExprArg any
+	if mode != "continuous" {
+		bundleCronExprArg = cronExpr
+	}
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recording_bundles
-			(account_id, name, cron_expr, cron_timezone, clip_duration_sec, target_fps, start_at, end_at, storage_destination_id, delivery_storage_destination_id, status)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active')
+			(account_id, name, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, start_at, end_at, storage_destination_id, delivery_storage_destination_id, status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active')
 		RETURNING id, created_at
-	`, principal.AccountID, name, cronExpr, cronTimezone, clipDuration, targetFPSArg, startAt, endAtArg, captureDestID, deliveryDestArg).Scan(&bundleID, &createdAt)
+	`, principal.AccountID, name, mode, bundleCronExprArg, cronTimezone, clipDuration, dailyStartArg, dailyEndArg, targetFPSArg, startAt, endAtArg, captureDestID, deliveryDestArg).Scan(&bundleID, &createdAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -315,24 +380,31 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 	// member recording name is derived deterministically from the bundle name and
 	// the stream so it satisfies the per-account name uniqueness index. A name
 	// collision (23505) fails the WHOLE bundle (fail-fast, no silent rename).
+	var memberCronExprArg any
+	if mode != "continuous" {
+		memberCronExprArg = cronExpr
+	}
 	for _, m := range members {
 		memberName := bundleMemberRecordingName(name, m.streamName, m.streamID)
 		_, _, _, _, ierr := s.insertRecordingTx(r.Context(), tx, recordingInsertParams{
-			accountID:       principal.AccountID,
-			captureDestID:   captureDestID,
-			deliveryDestArg: deliveryDestArg,
-			name:            memberName,
-			streamURL:       m.sourceURL,
-			streamIDArg:     m.streamID,
-			sourceKind:      m.sourceKind,
-			cronExpr:        cronExpr,
-			cronTimezone:    cronTimezone,
-			clipDuration:    clipDuration,
-			targetFPSArg:    targetFPSArg,
-			nextFireArg:     nextFireArg,
-			startAt:         startAt,
-			endAtArg:        endAtArg,
-			bundleIDArg:     bundleID,
+			accountID:           principal.AccountID,
+			captureDestID:       captureDestID,
+			deliveryDestArg:     deliveryDestArg,
+			name:                memberName,
+			streamURL:           m.sourceURL,
+			streamIDArg:         m.streamID,
+			sourceKind:          m.sourceKind,
+			mode:                mode,
+			cronExprArg:         memberCronExprArg,
+			cronTimezone:        cronTimezone,
+			clipDuration:        clipDuration,
+			dailyWindowStartArg: dailyStartArg,
+			dailyWindowEndArg:   dailyEndArg,
+			targetFPSArg:        targetFPSArg,
+			nextFireArg:         nextFireArg,
+			startAt:             startAt,
+			endAtArg:            endAtArg,
+			bundleIDArg:         bundleID,
 		})
 		if ierr != nil {
 			var pgErr *pgconn.PgError
@@ -447,12 +519,13 @@ func (s *Server) handleAccountBundlesList(w http.ResponseWriter, r *http.Request
 	}
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT
-			b.id, b.name, b.cron_expr, b.cron_timezone, b.clip_duration_sec, b.target_fps,
+			b.id, b.name, COALESCE(b.cron_expr,''), b.cron_timezone, b.clip_duration_sec, b.target_fps,
 			b.start_at, b.end_at, b.status, b.created_at,
 			(SELECT count(*) FROM recordings rec WHERE rec.bundle_id=b.id AND rec.status <> 'canceled') AS member_count,
 			(SELECT count(*) FROM recording_billing_days d
 			   JOIN recordings rec ON rec.id = d.recording_id
-			   WHERE rec.bundle_id = b.id) AS record_days
+			   WHERE rec.bundle_id = b.id) AS record_days,
+			b.mode, COALESCE(to_char(b.daily_window_start,'HH24:MI'),''), COALESCE(to_char(b.daily_window_end,'HH24:MI'),'')
 		FROM recording_bundles b
 		WHERE b.account_id=$1 AND b.status <> 'canceled'
 		ORDER BY b.created_at DESC, b.id DESC
@@ -496,27 +569,34 @@ func scanBundleListRow(row pgx.Row) (map[string]any, error) {
 		createdAt       time.Time
 		memberCount     int64
 		recordDays      int64
+		mode            string
+		dwStart         string
+		dwEnd           string
 	)
 	if err := row.Scan(
 		&id, &name, &cronExpr, &cronTimezone, &clipDurationSec, &targetFPS,
 		&startAt, &endAt, &status, &createdAt, &memberCount, &recordDays,
+		&mode, &dwStart, &dwEnd,
 	); err != nil {
 		return nil, err
 	}
 	return map[string]any{
-		"id":                id,
-		"name":              name,
-		"cron_expr":         cronExpr,
-		"cron_timezone":     cronTimezone,
-		"clip_duration_sec": clipDurationSec,
-		"target_fps":        targetFPS,
-		"start_at":          startAt.UTC(),
-		"end_at":            endAt,
-		"status":            status,
-		"created_at":        createdAt.UTC(),
-		"member_count":      memberCount,
-		"record_days":       recordDays,
-		"cost_cents":        recordDays * recordDayCostCents,
+		"id":                 id,
+		"name":               name,
+		"mode":               mode,
+		"cron_expr":          cronExpr,
+		"cron_timezone":      cronTimezone,
+		"clip_duration_sec":  clipDurationSec,
+		"daily_window_start": dwStart,
+		"daily_window_end":   dwEnd,
+		"target_fps":         targetFPS,
+		"start_at":           startAt.UTC(),
+		"end_at":             endAt,
+		"status":             status,
+		"created_at":         createdAt.UTC(),
+		"member_count":       memberCount,
+		"record_days":        recordDays,
+		"cost_cents":         recordDays * recordDayCostCents,
 	}, nil
 }
 
@@ -546,12 +626,16 @@ func (s *Server) handleAccountBundleGet(w http.ResponseWriter, r *http.Request) 
 		createdAt       time.Time
 		storageDestID   int64
 		deliveryDestID  *int64
+		mode            string
+		dwStart         string
+		dwEnd           string
 	)
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT name, cron_expr, cron_timezone, clip_duration_sec, target_fps, start_at, end_at, status, created_at, storage_destination_id, delivery_storage_destination_id
+		SELECT name, COALESCE(cron_expr,''), cron_timezone, clip_duration_sec, target_fps, start_at, end_at, status, created_at, storage_destination_id, delivery_storage_destination_id,
+		       mode, COALESCE(to_char(daily_window_start,'HH24:MI'),''), COALESCE(to_char(daily_window_end,'HH24:MI'),'')
 		FROM recording_bundles
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&name, &cronExpr, &cronTimezone, &clipDurationSec, &targetFPS, &startAt, &endAt, &status, &createdAt, &storageDestID, &deliveryDestID)
+	`, id, principal.AccountID).Scan(&name, &cronExpr, &cronTimezone, &clipDurationSec, &targetFPS, &startAt, &endAt, &status, &createdAt, &storageDestID, &deliveryDestID, &mode, &dwStart, &dwEnd)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "bundle not found")
 		return
@@ -615,9 +699,12 @@ func (s *Server) handleAccountBundleGet(w http.ResponseWriter, r *http.Request) 
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"id":                              id,
 		"name":                            name,
+		"mode":                            mode,
 		"cron_expr":                       cronExpr,
 		"cron_timezone":                   cronTimezone,
 		"clip_duration_sec":               clipDurationSec,
+		"daily_window_start":              dwStart,
+		"daily_window_end":                dwEnd,
 		"target_fps":                      targetFPS,
 		"start_at":                        startAt.UTC(),
 		"end_at":                          endAt,
@@ -756,14 +843,20 @@ func (s *Server) setBundleStatus(w http.ResponseWriter, r *http.Request, fromSta
 
 	var (
 		curStatus    string
-		cronExpr     string
+		mode         string
+		cronExpr     *string
 		cronTimezone string
+		dwStart      *string
+		dwEnd        *string
+		startAt      time.Time
+		endAt        *time.Time
 	)
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT status, cron_expr, cron_timezone
+		SELECT status, mode, cron_expr, cron_timezone,
+		       to_char(daily_window_start, 'HH24:MI:SS'), to_char(daily_window_end, 'HH24:MI:SS'), start_at, end_at
 		FROM recording_bundles
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStatus, &cronExpr, &cronTimezone)
+	`, id, principal.AccountID).Scan(&curStatus, &mode, &cronExpr, &cronTimezone, &dwStart, &dwEnd, &startAt, &endAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "bundle not found")
 		return
@@ -783,7 +876,7 @@ func (s *Server) setBundleStatus(w http.ResponseWriter, r *http.Request, fromSta
 
 	var nextFireArg any
 	if toStatus == "active" {
-		nextFire, ferr := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
+		nextFire, ferr := nextFireForRecording(mode, cronExpr, cronTimezone, dwStart, dwEnd, startAt, endAt, time.Now().UTC())
 		if ferr != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute next fire: %v", ferr))
 			return

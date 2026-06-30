@@ -239,3 +239,91 @@ func TestParseFrameRate(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildFFmpegContinuousArgsSourceCopy asserts the continuous (segment-muxer)
+// args for the Source/native path: stream-copy (-c copy), the segment muxer tail
+// with the requested segment_time, strftime naming, and NO -t single-clip flag.
+func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
+	args := buildFFmpegContinuousArgs("https://example.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", nil)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-nostdin",
+		"-fflags +discardcorrupt",
+		"-i https://example.com/live.m3u8",
+		"-map 0:v:0",
+		"-map 0:a?",
+		"-c copy",
+		"-f segment",
+		"-segment_time 60",
+		"-reset_timestamps 1",
+		"-segment_format mp4",
+		"-strftime 1",
+		"/out/seg-%Y%m%d-%H%M%S.mp4",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected %q in continuous args: %s", want, joined)
+		}
+	}
+	// The persistent muxer must NOT carry the single-clip -t bound.
+	for _, field := range args {
+		if field == "-t" {
+			t.Fatalf("continuous args must not include -t: %s", joined)
+		}
+	}
+	for _, unwanted := range []string{"libx264", "fps="} {
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("source/native continuous capture should not transcode (%q): %s", unwanted, joined)
+		}
+	}
+}
+
+// TestBuildFFmpegContinuousArgsFixedFPS asserts the fixed-fps continuous path
+// re-encodes to the chosen rate AND keeps the same segment-muxer tail, still
+// without -t.
+func TestBuildFFmpegContinuousArgsFixedFPS(t *testing.T) {
+	fps := 15
+	args := buildFFmpegContinuousArgs("https://example.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", &fps)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-vf fps=15",
+		"-c:v libx264",
+		"-preset veryfast",
+		"-crf 23",
+		"-pix_fmt yuv420p",
+		"-c:a aac",
+		"-b:a 128k",
+		"-f segment",
+		"-segment_time 60",
+		"-reset_timestamps 1",
+		"-segment_format mp4",
+		"-strftime 1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected %q in fixed-fps continuous args: %s", want, joined)
+		}
+	}
+	for _, field := range args {
+		if field == "-t" {
+			t.Fatalf("continuous args must not include -t: %s", joined)
+		}
+	}
+	if strings.Contains(joined, "-c copy") {
+		t.Fatalf("fixed-fps continuous capture must not stream-copy: %s", joined)
+	}
+}
+
+// TestParseSegmentStart asserts the strftime filename parses to the correct UTC
+// instant, the authoritative segment start used for the per-segment object key.
+func TestParseSegmentStart(t *testing.T) {
+	got, err := parseSegmentStart("seg-20260630-091500.mp4")
+	if err != nil {
+		t.Fatalf("parseSegmentStart error: %v", err)
+	}
+	want := time.Date(2026, 6, 30, 9, 15, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("parseSegmentStart=%v want %v", got, want)
+	}
+	if _, err := parseSegmentStart("not-a-segment.mp4"); err == nil {
+		t.Fatalf("expected parse error for malformed segment name")
+	}
+}

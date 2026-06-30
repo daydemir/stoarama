@@ -206,3 +206,85 @@ func TestRequiredDroplets_CapacityCeilAndSpendCap(t *testing.T) {
 		})
 	}
 }
+
+// TestExpandContinuous_OneConstantSlot asserts a continuous recording whose daily
+// window overlaps the lookahead expands to EXACTLY ONE interval clamped to
+// [max(now,open), min(windowEnd,close)) with first == the window-open instant.
+func TestExpandContinuous_OneConstantSlot(t *testing.T) {
+	now := mustTime(t, "2026-06-30T10:00:00Z")
+	windowEnd := now.Add(30 * time.Minute)
+	r := forecastRecording{
+		mode:             "continuous",
+		cronTimezone:     "UTC",
+		clipDurationSec:  60,
+		dailyWindowStart: "09:00:00",
+		dailyWindowEnd:   "21:00:00",
+		envStart:         mustTime(t, "2026-06-30T00:00:00Z"),
+	}
+	ivals, first := expandRecording(r, now, windowEnd)
+	if len(ivals) != 1 {
+		t.Fatalf("continuous expansion produced %d intervals, want exactly 1", len(ivals))
+	}
+	// Window is open at now (09:00<=10:00<21:00), so the interval clamps to
+	// [now, windowEnd) and first is the 09:00 open instant.
+	if !ivals[0].Start.Equal(now) {
+		t.Fatalf("interval start=%s want now=%s", ivals[0].Start, now)
+	}
+	if !ivals[0].End.Equal(windowEnd) {
+		t.Fatalf("interval end=%s want windowEnd=%s", ivals[0].End, windowEnd)
+	}
+	wantOpen := mustTime(t, "2026-06-30T09:00:00Z")
+	if !first.Equal(wantOpen) {
+		t.Fatalf("first=%s want window open %s", first, wantOpen)
+	}
+}
+
+// TestForecastContinuous_NConstantSlots asserts N identical continuous recordings
+// produce peak concurrency == N (each a constant +1 slot for the shared window),
+// distinct from the sampled cron fan-out, and a sampled recording is unchanged.
+func TestForecastContinuous_NConstantSlots(t *testing.T) {
+	now := mustTime(t, "2026-06-30T10:00:00Z")
+	cont := func() forecastRecording {
+		return forecastRecording{
+			mode:             "continuous",
+			cronTimezone:     "UTC",
+			clipDurationSec:  60,
+			dailyWindowStart: "09:00:00",
+			dailyWindowEnd:   "21:00:00",
+			envStart:         mustTime(t, "2026-06-30T00:00:00Z"),
+		}
+	}
+	recs := []forecastRecording{cont(), cont(), cont()}
+	fc := forecastFromRecordings(recs, now, 30*time.Minute)
+	if fc.PeakConcurrent != 3 {
+		t.Fatalf("continuous peak=%d want 3 (3 constant slots)", fc.PeakConcurrent)
+	}
+	// A continuous stream is ONE slot for the whole window, never a per-clip blip:
+	// adding a 4th lifts the peak by exactly 1.
+	recs = append(recs, cont())
+	fc = forecastFromRecordings(recs, now, 30*time.Minute)
+	if fc.PeakConcurrent != 4 {
+		t.Fatalf("continuous peak=%d want 4", fc.PeakConcurrent)
+	}
+}
+
+// TestExpandContinuous_WindowBeforeNow asserts a continuous recording whose daily
+// window has already closed for the day (and the next opens past the lookahead)
+// contributes ZERO intervals now (correct for the autoscaler: nothing to provision
+// yet), while the sampled expansion is unaffected.
+func TestExpandContinuous_WindowClosedContributesZero(t *testing.T) {
+	now := mustTime(t, "2026-06-30T22:00:00Z") // after a 09:00-21:00 window
+	windowEnd := now.Add(30 * time.Minute)
+	r := forecastRecording{
+		mode:             "continuous",
+		cronTimezone:     "UTC",
+		clipDurationSec:  60,
+		dailyWindowStart: "09:00:00",
+		dailyWindowEnd:   "21:00:00",
+		envStart:         mustTime(t, "2026-06-30T00:00:00Z"),
+	}
+	ivals, _ := expandRecording(r, now, windowEnd)
+	if len(ivals) != 0 {
+		t.Fatalf("closed window produced %d intervals, want 0", len(ivals))
+	}
+}

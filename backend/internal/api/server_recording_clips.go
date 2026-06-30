@@ -43,6 +43,11 @@ type recordingLeaseResponse struct {
 	AttemptCount         int       `json:"attempt_count"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
 	TargetFPS            *int      `json:"target_fps"`
+	// Kind is 'clip' (default, per-cron-fire) or 'continuous_window' (one window-
+	// long lease driving back-to-back segment capture). WindowEndAt is the
+	// continuous window's close instant (zero for a clip job).
+	Kind        string     `json:"kind"`
+	WindowEndAt *time.Time `json:"window_end_at"`
 }
 
 // handleRecordingJobsLease leases at most one due recording job for the calling
@@ -73,12 +78,15 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		  FROM recording_jobs j
 		  JOIN recordings rec ON rec.id = j.recording_id
 		  WHERE j.status='pending' AND j.scheduled_for <= now()
-		    -- Schedule integrity: never hand out a job too late to be on-schedule.
-		    -- Capture has no seek-to-fire, so a job leased past its fire_at +
-		    -- clip_duration + grace would record the stream as-it-is-now (the wrong
-		    -- content) and store it as if it ran on schedule. Such a job is left for
-		    -- the scheduler's miss-marking sweep to fail honestly instead.
-		    AND j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now()
+		    -- Schedule integrity (SAMPLED clip jobs only): never hand out a clip job
+		    -- too late to be on-schedule. Capture has no seek-to-fire, so a clip job
+		    -- leased past its fire_at + clip_duration + grace would record the stream
+		    -- as-it-is-now (the wrong content) and store it as if it ran on schedule;
+		    -- such a job is left for the scheduler's miss-marking sweep instead. A
+		    -- continuous_window job's fire_at is the window-open instant (which may be
+		    -- many minutes ago by design), so the freshness deadline is bypassed for it.
+		    AND (j.kind='continuous_window'
+		         OR j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now())
 		    AND rec.status='active'
 		    AND rec.start_at <= now()
 		    AND (rec.end_at IS NULL OR now() < rec.end_at)
@@ -103,11 +111,11 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		WHERE j.id = cte.id AND rec.id = j.recording_id
 		RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
 		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
-		          rec.target_fps
+		          rec.target_fps, j.kind, j.window_end_at
 	`, workerID, billingDisabled, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec).Scan(
 		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
 		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
-		&resp.TargetFPS,
+		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"job": nil})
@@ -123,6 +131,12 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 type recordingUploadIntentRequest struct {
 	JobID    int64  `json:"job_id"`
 	MimeType string `json:"mime_type"`
+	// SegmentStartMs, when > 0, is the UTC start instant (Unix millis) of a
+	// continuous-capture segment. The per-segment object key is derived from it so
+	// each back-to-back segment of one window job gets a unique, ordered,
+	// idempotent key (a re-leased window overwrites the same per-second key). It is
+	// 0/ignored for an ordinary clip job, which keys off the job's fire_at.
+	SegmentStartMs int64 `json:"segment_start_ms"`
 }
 
 // handleRecordingUploadIntent presigns a PUT against the USER's bucket for a clip
@@ -156,11 +170,14 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		mimeType = "video/mp4"
 	}
 
-	// Load the job + recording + destination, asserting lease ownership (S-2).
+	// Load the job + recording + destination, asserting lease ownership (S-2). A
+	// continuous_window job is leased window-long by this worker, so the same
+	// ownership predicate covers each per-segment intent it raises.
 	var (
 		recordingID     int64
 		clipDurationSec int
 		fireAt          time.Time
+		jobKind         string
 		destID          int64
 		endpoint        string
 		region          string
@@ -170,7 +187,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		secretEnc       []byte
 	)
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT j.recording_id, j.clip_duration_sec, j.fire_at,
+		SELECT j.recording_id, j.clip_duration_sec, j.fire_at, j.kind,
 		       sd.id, sd.endpoint, sd.region, sd.bucket, sd.key_prefix, sd.access_key_id, sd.secret_access_key_enc
 		FROM recording_jobs j
 		JOIN recordings rec ON rec.id = j.recording_id
@@ -178,7 +195,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2 AND j.lease_expires_at > now()
 		  AND rec.status='active'
 	`, req.JobID, workerID).Scan(
-		&recordingID, &clipDurationSec, &fireAt,
+		&recordingID, &clipDurationSec, &fireAt, &jobKind,
 		&destID, &endpoint, &region, &bucket, &keyPrefix, &accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -207,7 +224,20 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	objectKey := buildRecordingClipObjectKey(keyPrefix, recordingID, req.JobID, fireAt)
+	// A continuous_window job raises many per-segment intents under one lease, so
+	// its object key is keyed on the SEGMENT START (unique, ordered, idempotent),
+	// not the single window-open fire_at. A clip job keys on fire_at as before.
+	var objectKey string
+	if jobKind == "continuous_window" {
+		if req.SegmentStartMs <= 0 {
+			util.WriteError(w, http.StatusBadRequest, "segment_start_ms is required for a continuous window job")
+			return
+		}
+		segStart := time.UnixMilli(req.SegmentStartMs).UTC()
+		objectKey = buildRecordingClipObjectKeyContinuous(keyPrefix, recordingID, segStart)
+	} else {
+		objectKey = buildRecordingClipObjectKey(keyPrefix, recordingID, req.JobID, fireAt)
+	}
 	maxSize := int64(clipDurationSec) * recordingMaxBitrateBytesPerSec
 	intentID := uuid.New()
 	expiresAt := time.Now().UTC().Add(s.cfg.R2SignPutTTL)
@@ -642,6 +672,29 @@ func buildRecordingClipObjectKey(keyPrefix string, recordingID, jobID int64, fir
 		fmt.Sprintf("%d", recordingID),
 		fmt.Sprintf("%d", jobID),
 		fmt.Sprintf("%d.mp4", fireAt.UTC().UnixMilli()),
+	)
+	return strings.Join(parts, "/")
+}
+
+// buildRecordingClipObjectKeyContinuous keys a continuous-capture segment on its
+// per-second start instant rather than a single fire+job, so every back-to-back
+// segment of one window gets a unique, ordered key and a re-leased window
+// overwrites the same key (idempotent re-capture; ON CONFLICT(bucket,object_key)
+// dedups). It deliberately omits the job id so a re-leased window job (a new job
+// id after reclaim) lands on the SAME key for the same wall-clock second.
+func buildRecordingClipObjectKeyContinuous(keyPrefix string, recordingID int64, segStart time.Time) string {
+	parts := make([]string, 0, 5)
+	for _, seg := range strings.Split(strings.Trim(strings.TrimSpace(keyPrefix), "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		parts = append(parts, seg)
+	}
+	parts = append(parts,
+		"recordings",
+		fmt.Sprintf("%d", recordingID),
+		"continuous",
+		fmt.Sprintf("%d.mp4", segStart.UTC().Unix()),
 	)
 	return strings.Join(parts, "/")
 }

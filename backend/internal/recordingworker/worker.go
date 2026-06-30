@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -129,6 +131,10 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 		go func(j recordingapi.RecordingJob) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if j.Kind == "continuous_window" {
+				w.processContinuousJob(ctx, j)
+				return
+			}
 			w.processJob(ctx, j)
 		}(*job)
 	}
@@ -191,7 +197,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 		return
 	}
 
-	intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType)
+	intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType, 0)
 	if err != nil {
 		w.fail(ctx, job.JobID, fmt.Errorf("reserve clip upload: %w", err))
 		return
@@ -223,6 +229,124 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 		return
 	}
 	log.Printf("recording worker job=%d recording=%d clip captured size=%d", job.JobID, job.RecordingID, seg.SizeBytes)
+}
+
+// processContinuousJob runs ONE window-long lease: it resolves+SSRF-checks the
+// URL once, holds one persistent ffmpeg open via CaptureContinuous for the whole
+// window, and runs the EXISTING per-clip ingest path unchanged for each finalized
+// segment. The same per-job heartbeat extends the lease for the whole window and
+// can cancel (SIGINT) ffmpeg at window close. Each segment becomes one ordinary
+// recording_clips row keyed on the segment start, so a re-leased window overwrites
+// the same per-second keys (idempotent).
+func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.RecordingJob) {
+	jobCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID)
+
+	// Resolve + SSRF-check ONCE for the whole window (identical to processJob).
+	resolveCtx, resolveCancel := context.WithTimeout(jobCtx, 30*time.Second)
+	sourceURL, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", job.SourceURL, "")
+	resolveCancel()
+	if err != nil {
+		w.fail(ctx, job.JobID, fmt.Errorf("resolve source url: %w", err))
+		return
+	}
+	if isImage {
+		w.fail(ctx, job.JobID, fmt.Errorf("image sources are not supported by the recorder"))
+		return
+	}
+	if _, err := netguard.ValidatePublicURL(sourceURL); err != nil {
+		w.fail(ctx, job.JobID, fmt.Errorf("ssrf guard rejected source url: %w", err))
+		return
+	}
+
+	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
+
+	// Bound ffmpeg to the window close. The heartbeat/cancel path (window auto-stop
+	// at end_at) also cancels jobCtx, which CaptureContinuous treats as a clean
+	// shutdown (SIGINT + final sweep).
+	windowCtx := jobCtx
+	if job.WindowEndAt != nil && !job.WindowEndAt.IsZero() {
+		var windowCancel context.CancelFunc
+		windowCtx, windowCancel = context.WithDeadline(jobCtx, job.WindowEndAt.UTC())
+		defer windowCancel()
+	}
+
+	outDir, err := os.MkdirTemp("", "capture-continuous-*")
+	if err != nil {
+		w.fail(ctx, job.JobID, fmt.Errorf("mktemp continuous outdir: %w", err))
+		return
+	}
+	defer os.RemoveAll(outDir)
+
+	onSegment := func(seg capture.Segment) error {
+		if canceled() {
+			return nil
+		}
+		segStartMs := seg.StartAt.UTC().UnixMilli()
+		intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType, segStartMs)
+		if err != nil {
+			return fmt.Errorf("reserve segment upload: %w", err)
+		}
+		if err := w.cfg.Client.UploadFile(jobCtx, intent.UploadURL, seg.Path, seg.MIMEType); err != nil {
+			return fmt.Errorf("upload segment: %w", err)
+		}
+		if _, err := w.cfg.Client.IngestClip(jobCtx, recordingapi.IngestClipRequest{
+			IntentID:     intent.IntentID,
+			JobID:        job.JobID,
+			SizeBytes:    seg.SizeBytes,
+			SHA256:       seg.SHA256,
+			DurationMs:   seg.DurationMs,
+			VideoCodec:   seg.VideoCodec,
+			AudioCodec:   seg.AudioCodec,
+			AudioPresent: seg.AudioPresent,
+			ActualFPS:    seg.ActualFPS,
+			Container:    seg.Container,
+			ResolvedURL:  sourceURL,
+			ClipStartAt:  seg.StartAt,
+			ClipEndAt:    seg.EndAt,
+		}); err != nil {
+			// A 409 means this exact segment key already ingested (a re-leased window
+			// re-capturing the same wall-clock second). Treat as already-done so a
+			// re-lease is idempotent rather than failing the whole window.
+			if isAlreadyIngested(err) {
+				capture.CleanupSegment(seg)
+				return nil
+			}
+			return fmt.Errorf("ingest segment: %w", err)
+		}
+		capture.CleanupSegment(seg)
+		log.Printf("recording worker job=%d recording=%d continuous segment ingested start=%s size=%d",
+			job.JobID, job.RecordingID, seg.StartAt.UTC().Format(time.RFC3339), seg.SizeBytes)
+		return nil
+	}
+
+	err = capture.CaptureContinuous(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment)
+	if canceled() {
+		log.Printf("recording worker job=%d continuous canceled", job.JobID)
+		return
+	}
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		w.fail(ctx, job.JobID, fmt.Errorf("continuous capture: %w", err))
+		return
+	}
+	if err := w.cfg.Client.CompleteRecordingJob(ctx, job.JobID); err != nil {
+		log.Printf("recording worker job=%d continuous complete failed: %v", job.JobID, err)
+		return
+	}
+	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
+}
+
+// isAlreadyIngested reports whether an ingest error is the server's 409 dedup
+// signal (a clip already exists for this object key), which for a re-leased
+// continuous window means the segment is already stored and must not fail the job.
+func isAlreadyIngested(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "status=409") || strings.Contains(msg, "already exists for this object key")
 }
 
 // startHeartbeat extends the lease on a ticker; on a cancel signal it cancels the

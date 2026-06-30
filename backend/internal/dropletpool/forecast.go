@@ -14,9 +14,17 @@ import (
 // forecastRecording is one capturing recording's schedule, loaded for the demand
 // forecast (status='active', window open now, card on file when billing is on).
 type forecastRecording struct {
+	mode            string
 	cronExpr        string
 	cronTimezone    string
 	clipDurationSec int
+	// dailyWindowStart/End are "HH:MM:SS" for a continuous recording, empty for a
+	// sampled one. envStart/envEnd are the capture-window envelope ([start_at,end_at),
+	// envEnd zero = open-ended) used to clamp continuous window occurrences.
+	dailyWindowStart string
+	dailyWindowEnd   string
+	envStart         time.Time
+	envEnd           time.Time
 }
 
 // Forecast is the demand-forecast result over a lookahead window.
@@ -43,7 +51,10 @@ type jobInterval struct {
 // truth (DRY). It reads, never writes, the queue.
 func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool) ([]forecastRecording, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec
+		SELECT rec.mode, COALESCE(rec.cron_expr, ''), rec.cron_timezone, rec.clip_duration_sec,
+		       COALESCE(to_char(rec.daily_window_start, 'HH24:MI:SS'), ''),
+		       COALESCE(to_char(rec.daily_window_end, 'HH24:MI:SS'), ''),
+		       rec.start_at, rec.end_at
 		FROM recordings rec
 		WHERE rec.status='active'
 		  AND rec.start_at <= now()
@@ -60,8 +71,13 @@ func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEna
 	recs := make([]forecastRecording, 0, 64)
 	for rows.Next() {
 		var r forecastRecording
-		if err := rows.Scan(&r.cronExpr, &r.cronTimezone, &r.clipDurationSec); err != nil {
+		var envEnd *time.Time
+		if err := rows.Scan(&r.mode, &r.cronExpr, &r.cronTimezone, &r.clipDurationSec,
+			&r.dailyWindowStart, &r.dailyWindowEnd, &r.envStart, &envEnd); err != nil {
 			return nil, fmt.Errorf("forecast: scan recording: %w", err)
+		}
+		if envEnd != nil {
+			r.envEnd = envEnd.UTC()
 		}
 		recs = append(recs, r)
 	}
@@ -106,6 +122,14 @@ type ForecastCandidate struct {
 	CronExpr        string
 	CronTimezone    string
 	ClipDurationSec int
+	// Mode is 'sampled' (default; empty also treated as sampled) or 'continuous'.
+	// A continuous candidate is a constant +1 slot for its daily window, so a
+	// continuous bundle of N members is N identical candidates that all overlap.
+	Mode             string
+	DailyWindowStart string
+	DailyWindowEnd   string
+	EnvStart         time.Time
+	EnvEnd           time.Time
 }
 
 // ForecastPeakWithCandidates loads the current capturing recordings and forecasts
@@ -123,10 +147,19 @@ func ForecastPeakWithCandidates(ctx context.Context, pool *pgxpool.Pool, billing
 		return 0, err
 	}
 	for _, c := range candidates {
+		mode := c.Mode
+		if mode == "" {
+			mode = "sampled"
+		}
 		recs = append(recs, forecastRecording{
-			cronExpr:        c.CronExpr,
-			cronTimezone:    c.CronTimezone,
-			clipDurationSec: c.ClipDurationSec,
+			mode:             mode,
+			cronExpr:         c.CronExpr,
+			cronTimezone:     c.CronTimezone,
+			clipDurationSec:  c.ClipDurationSec,
+			dailyWindowStart: c.DailyWindowStart,
+			dailyWindowEnd:   c.DailyWindowEnd,
+			envStart:         c.EnvStart,
+			envEnd:           c.EnvEnd,
 		})
 	}
 	return forecastFromRecordings(recs, now, lookahead).PeakConcurrent, nil
@@ -162,6 +195,9 @@ func forecastFromRecordings(recs []forecastRecording, now time.Time, lookahead t
 // (the slot is occupied at windowEnd). A bounded iteration cap protects against a
 // pathological schedule.
 func expandRecording(r forecastRecording, now, windowEnd time.Time) ([]jobInterval, time.Time) {
+	if r.mode == "continuous" {
+		return expandContinuousRecording(r, now, windowEnd)
+	}
 	clip := time.Duration(r.clipDurationSec) * time.Second
 	if clip <= 0 {
 		clip = time.Second
@@ -186,6 +222,65 @@ func expandRecording(r forecastRecording, now, windowEnd time.Time) ([]jobInterv
 		}
 		out = append(out, jobInterval{Start: fire, End: fire.Add(clip)})
 		cursor = fire
+	}
+	return out, first
+}
+
+// expandContinuousRecording emits ONE long interval per active daily-window
+// occurrence overlapping (now, windowEnd]: a continuous stream is a constant slot
+// for its whole window, not N per-clip blips. Each occurrence's [open, close) is
+// localized to the recording's tz and clamped to both the lookahead and the
+// capture envelope. first = the earliest window-open instant > now (drives the
+// provision lead). A bounded day loop guards against pathological data.
+func expandContinuousRecording(r forecastRecording, now, windowEnd time.Time) ([]jobInterval, time.Time) {
+	start, errS := recsched.ParseTimeOfDay(r.dailyWindowStart)
+	end, errE := recsched.ParseTimeOfDay(r.dailyWindowEnd)
+	loc, errL := recsched.LoadLocation(r.cronTimezone)
+	if errS != nil || errE != nil || errL != nil {
+		return nil, time.Time{}
+	}
+	out := make([]jobInterval, 0, 4)
+	var first time.Time
+	// Walk each local day from now's day to windowEnd's day (lookahead is short, so
+	// this is at most a couple of iterations; cap defends against bad data).
+	const maxDays = 9
+	day := now.In(loc)
+	for i := 0; i < maxDays; i++ {
+		y, mo, d := day.Date()
+		openUTC := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc).UTC()
+		closeUTC := time.Date(y, mo, d, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		if openUTC.After(windowEnd) {
+			break
+		}
+		// Clamp to the capture envelope.
+		occOpen := openUTC
+		occClose := closeUTC
+		if occOpen.Before(r.envStart) {
+			occOpen = r.envStart
+		}
+		if !r.envEnd.IsZero() && r.envEnd.Before(occClose) {
+			occClose = r.envEnd
+		}
+		// Intersect with (now, windowEnd].
+		ivStart := occOpen
+		if ivStart.Before(now) {
+			ivStart = now
+		}
+		ivEnd := occClose
+		if ivEnd.After(windowEnd) {
+			ivEnd = windowEnd
+		}
+		if ivStart.Before(ivEnd) {
+			out = append(out, jobInterval{Start: ivStart, End: ivEnd})
+			if openUTC.After(now) && (first.IsZero() || openUTC.Before(first)) {
+				first = openUTC
+			} else if first.IsZero() {
+				// Occurrence already open at now: its open instant is in the past, so
+				// the earliest forward fire is still this occurrence's open for lead.
+				first = openUTC
+			}
+		}
+		day = day.AddDate(0, 0, 1)
 	}
 	return out, first
 }

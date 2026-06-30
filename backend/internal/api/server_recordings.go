@@ -48,6 +48,13 @@ type recordingCreateRequest struct {
 	CronExpr                     string `json:"cron_expr"`
 	CronTimezone                 string `json:"cron_timezone"`
 	ClipDurationSec              int    `json:"clip_duration_sec"`
+	// Mode is 'sampled' (default; one clip per cron fire) or 'continuous' (gapless
+	// back-to-back segments for a daily window). For continuous, cron_expr is
+	// ignored and the daily window (HH:MM[:SS] in cron_timezone) is required;
+	// clip_duration_sec is the segment length.
+	Mode             string `json:"mode"`
+	DailyWindowStart string `json:"daily_window_start"`
+	DailyWindowEnd   string `json:"daily_window_end"`
 	// TargetFPS normalizes each captured clip to that exact frame rate. nil =
 	// Source/native (stream-copy, preserve source fps, no re-encode, the cheap
 	// default). The composer offers 15 and 30; the server accepts only those.
@@ -67,7 +74,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT
 			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
-			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
+			rec.source_kind, COALESCE(rec.cron_expr,''), rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
 			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
 			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
 			COALESCE((SELECT b.has_payment_method FROM account_billing b
@@ -75,7 +82,8 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 			rec.created_at, sd.managed,
-			rec.stream_id, st.name, st.location_text
+			rec.stream_id, st.name, st.location_text,
+			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),'')
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		LEFT JOIN streams st ON st.id = rec.stream_id
@@ -162,6 +170,14 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	if cronTimezone == "" {
 		cronTimezone = "UTC"
 	}
+	mode := strings.TrimSpace(req.Mode)
+	if mode == "" {
+		mode = "sampled"
+	}
+	if mode != "sampled" && mode != "continuous" {
+		util.WriteError(w, http.StatusBadRequest, "mode must be sampled or continuous")
+		return
+	}
 	clipDuration := req.ClipDurationSec
 	if clipDuration == 0 {
 		clipDuration = 60
@@ -169,6 +185,34 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	if clipDuration < 5 || clipDuration > 900 {
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
+	}
+
+	// Parse the continuous daily window up front (used for validation, preflight,
+	// next_fire, and the insert). Sampled recordings leave these empty.
+	var (
+		dailyStart    recsched.TimeOfDay
+		dailyEnd      recsched.TimeOfDay
+		dailyStartArg any
+		dailyEndArg   any
+	)
+	if mode == "continuous" {
+		ds, derr := recsched.ParseTimeOfDay(strings.TrimSpace(req.DailyWindowStart))
+		if derr != nil {
+			util.WriteError(w, http.StatusBadRequest, "daily_window_start must be HH:MM")
+			return
+		}
+		de, derr := recsched.ParseTimeOfDay(strings.TrimSpace(req.DailyWindowEnd))
+		if derr != nil {
+			util.WriteError(w, http.StatusBadRequest, "daily_window_end must be HH:MM")
+			return
+		}
+		if verr := recsched.ValidateContinuousWindowForCreate(ds, de, clipDuration); verr != nil {
+			util.WriteError(w, http.StatusBadRequest, verr.Error())
+			return
+		}
+		dailyStart, dailyEnd = ds, de
+		dailyStartArg = strings.TrimSpace(req.DailyWindowStart)
+		dailyEndArg = strings.TrimSpace(req.DailyWindowEnd)
 	}
 
 	// target_fps: NULL = Source/native (preserve source fps, no re-encode). The
@@ -218,22 +262,27 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Cron + timezone + min-interval + clip-vs-interval invariants.
-	if err := recsched.ValidateCronForCreate(cronExpr, cronTimezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	// Create-time concurrency cap (schedule integrity): reject a schedule whose
-	// forecast peak simultaneous clip count, combined with everything already
-	// capturing, would exceed what the droplet pool can ever serve on time
-	// (Max*Capacity). Reuse the autoscaler's exact sweep-line so the cap and the
-	// scaler agree on the demand model (DRY). Accepting only schedules that fit the
-	// ceiling keeps the freshness deadline (the on-schedule safety net) a rare
-	// transient event rather than a structural certainty.
-	if err := s.checkRecordingScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration); err != nil {
-		util.WriteError(w, http.StatusConflict, err.Error())
-		return
+	// Schedule invariants + create-time concurrency cap. Sampled validates the cron
+	// floor + clip-vs-interval and models each fire as a clip slot; continuous
+	// validates the window (already done above) and models the stream as ONE
+	// constant slot for the window. Both reject a schedule whose forecast peak,
+	// combined with everything already capturing, would exceed the pool ceiling
+	// (Max*Capacity), reusing the autoscaler's exact sweep-line (DRY). A continuous
+	// stream counts as a FULL slot for its whole window.
+	if mode == "continuous" {
+		if err := s.checkContinuousScheduleCapacity(r.Context(), cronTimezone, dailyStart, dailyEnd, clipDuration, startAt, endAtTime(endAtArg), 1); err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+	} else {
+		if err := recsched.ValidateCronForCreate(cronExpr, cronTimezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.checkRecordingScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration); err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
 	}
 
 	// Resolve the capture destination and (for a WebDAV target) the delivery
@@ -313,14 +362,25 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	nextFire, err := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
-	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	var nextFireArg any
-	if !nextFire.IsZero() {
-		nextFireArg = nextFire
+	if mode == "continuous" {
+		nextOpen, nerr := recsched.NextWindowOpenUTC(cronTimezone, dailyStart, startAt, endAtTime(endAtArg), time.Now().UTC())
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextOpen.IsZero() {
+			nextFireArg = nextOpen
+		}
+	} else {
+		nextFire, nerr := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextFire.IsZero() {
+			nextFireArg = nextFire
+		}
 	}
 
 	var nameExists bool
@@ -342,22 +402,29 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
+	var cronExprArg any
+	if mode != "continuous" {
+		cronExprArg = cronExpr
+	}
 	id, createdAt, startOut, endOut, err := s.insertRecordingTx(r.Context(), tx, recordingInsertParams{
-		accountID:       principal.AccountID,
-		captureDestID:   captureDestID,
-		deliveryDestArg: deliveryDestArg,
-		name:            name,
-		streamURL:       streamURL,
-		streamIDArg:     streamIDArg,
-		sourceKind:      sourceKind,
-		cronExpr:        cronExpr,
-		cronTimezone:    cronTimezone,
-		clipDuration:    clipDuration,
-		targetFPSArg:    targetFPSArg,
-		nextFireArg:     nextFireArg,
-		startAt:         startAt,
-		endAtArg:        endAtArg,
-		bundleIDArg:     nil,
+		accountID:           principal.AccountID,
+		captureDestID:       captureDestID,
+		deliveryDestArg:     deliveryDestArg,
+		name:                name,
+		streamURL:           streamURL,
+		streamIDArg:         streamIDArg,
+		sourceKind:          sourceKind,
+		mode:                mode,
+		cronExprArg:         cronExprArg,
+		cronTimezone:        cronTimezone,
+		clipDuration:        clipDuration,
+		dailyWindowStartArg: dailyStartArg,
+		dailyWindowEndArg:   dailyEndArg,
+		targetFPSArg:        targetFPSArg,
+		nextFireArg:         nextFireArg,
+		startAt:             startAt,
+		endAtArg:            endAtArg,
+		bundleIDArg:         nil,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -401,21 +468,24 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 // and bundle fan-out so the INSERT lives in exactly one place (DRY). Every *Arg
 // field is an `any` that is either a concrete value or nil for SQL NULL.
 type recordingInsertParams struct {
-	accountID       int64
-	captureDestID   int64
-	deliveryDestArg any
-	name            string
-	streamURL       string
-	streamIDArg     any
-	sourceKind      string
-	cronExpr        string
-	cronTimezone    string
-	clipDuration    int
-	targetFPSArg    any
-	nextFireArg     any
-	startAt         time.Time
-	endAtArg        any
-	bundleIDArg     any
+	accountID           int64
+	captureDestID       int64
+	deliveryDestArg     any
+	name                string
+	streamURL           string
+	streamIDArg         any
+	sourceKind          string
+	mode                string
+	cronExprArg         any
+	cronTimezone        string
+	clipDuration        int
+	dailyWindowStartArg any
+	dailyWindowEndArg   any
+	targetFPSArg        any
+	nextFireArg         any
+	startAt             time.Time
+	endAtArg            any
+	bundleIDArg         any
 }
 
 // insertRecordingTx runs the one canonical recordings INSERT inside the caller's
@@ -425,12 +495,16 @@ type recordingInsertParams struct {
 // failure. The 15 existing columns keep the exact values they had before; the
 // only addition is bundle_id (nil for a standalone recording).
 func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingInsertParams) (id int64, createdAt time.Time, startOut time.Time, endOut *time.Time, err error) {
+	mode := p.mode
+	if mode == "" {
+		mode = "sampled"
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, cron_expr, cron_timezone, clip_duration_sec, target_fps, status, next_fire_at, start_at, end_at, bundle_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13,$14,$15)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18)
 		RETURNING id, created_at, start_at, end_at
-	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, p.cronExpr, p.cronTimezone, p.clipDuration, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg).Scan(&id, &createdAt, &startOut, &endOut)
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg).Scan(&id, &createdAt, &startOut, &endOut)
 	return id, createdAt, startOut, endOut, err
 }
 
@@ -487,7 +561,7 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 	row := s.pool.QueryRow(r.Context(), `
 		SELECT
 			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
-			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
+			rec.source_kind, COALESCE(rec.cron_expr,''), rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
 			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
 			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
 			COALESCE((SELECT b.has_payment_method FROM account_billing b
@@ -495,7 +569,8 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 			(SELECT count(*) FROM recording_clips c
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 			rec.created_at, sd.managed,
-			rec.stream_id, st.name, st.location_text
+			rec.stream_id, st.name, st.location_text,
+			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),'')
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		LEFT JOIN streams st ON st.id = rec.stream_id
@@ -633,14 +708,20 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 
 	var (
 		curStatus    string
-		cronExpr     string
+		mode         string
+		cronExpr     *string
 		cronTimezone string
+		dwStart      *string
+		dwEnd        *string
+		startAt      time.Time
+		endAt        *time.Time
 	)
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT status, cron_expr, cron_timezone
+		SELECT status, mode, cron_expr, cron_timezone,
+		       to_char(daily_window_start, 'HH24:MI:SS'), to_char(daily_window_end, 'HH24:MI:SS'), start_at, end_at
 		FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStatus, &cronExpr, &cronTimezone)
+	`, id, principal.AccountID).Scan(&curStatus, &mode, &cronExpr, &cronTimezone, &dwStart, &dwEnd, &startAt, &endAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
@@ -660,9 +741,9 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 
 	var nextFireArg any
 	if toStatus == "active" {
-		nextFire, err := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute next fire: %v", err))
+		nextFire, nerr := nextFireForRecording(mode, cronExpr, cronTimezone, dwStart, dwEnd, startAt, endAt, time.Now().UTC())
+		if nerr != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute next fire: %v", nerr))
 			return
 		}
 		if !nextFire.IsZero() {
@@ -855,6 +936,9 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		streamID         *int64
 		streamName       *string
 		streamLocation   *string
+		mode             string
+		dailyWindowStart string
+		dailyWindowEnd   string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
@@ -863,6 +947,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
+		&mode, &dailyWindowStart, &dailyWindowEnd,
 	); err != nil {
 		return nil, err
 	}
@@ -878,9 +963,12 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"storage_destination_name": storageDestName,
 		"storage_managed":          managed,
 		"source_kind":              sourceKind,
+		"mode":                     mode,
 		"cron_expr":                cronExpr,
 		"cron_timezone":            cronTimezone,
 		"clip_duration_sec":        clipDurationSec,
+		"daily_window_start":       dailyWindowStart,
+		"daily_window_end":         dailyWindowEnd,
 		"target_fps":               targetFPS,
 		"status":                   status,
 		"start_at":                 startAt.UTC(),
@@ -928,6 +1016,104 @@ func (s *Server) checkRecordingScheduleCapacity(ctx context.Context, cronExpr, c
 		return fmt.Errorf("at capacity: this schedule would need %d clips recording at once, above the recorder limit of %d. Stagger the schedule or contact the operator to raise the cap.", peak, ceiling)
 	}
 	return nil
+}
+
+// nextFireForRecording computes the next_fire_at instant for a recording given
+// its mode: for sampled it is the next cron fire; for continuous it is the next
+// daily-window open instant. The daily window strings are "HH:MM:SS" (nil for a
+// sampled recording). It is the single mode-aware next-fire authority shared by
+// the create, resume, and (bundle) member-resume paths.
+func nextFireForRecording(mode string, cronExpr *string, cronTimezone string, dwStart, dwEnd *string, startAt time.Time, endAt *time.Time, now time.Time) (time.Time, error) {
+	if mode == "continuous" {
+		if dwStart == nil {
+			return time.Time{}, fmt.Errorf("continuous recording has no daily window")
+		}
+		start, err := recsched.ParseTimeOfDay(*dwStart)
+		if err != nil {
+			return time.Time{}, err
+		}
+		var env time.Time
+		if endAt != nil {
+			env = endAt.UTC()
+		}
+		return recsched.NextWindowOpenUTC(cronTimezone, start, startAt.UTC(), env, now)
+	}
+	if cronExpr == nil {
+		return time.Time{}, fmt.Errorf("sampled recording has no cron_expr")
+	}
+	return recsched.NextFireUTC(*cronExpr, cronTimezone, now)
+}
+
+// endAtTime extracts the time.Time from an end_at insert arg (an any that is
+// either a time.Time or nil for open-ended), returning the zero time for nil.
+func endAtTime(endAtArg any) time.Time {
+	if endAtArg == nil {
+		return time.Time{}
+	}
+	if t, ok := endAtArg.(time.Time); ok {
+		return t.UTC()
+	}
+	return time.Time{}
+}
+
+// checkContinuousScheduleCapacity rejects a prospective continuous schedule (or a
+// continuous bundle of memberCount identical streams) whose forecast peak, with
+// everything already capturing, would exceed the pool ceiling Max*Capacity. A
+// continuous stream is a constant +1 slot for its whole window, so memberCount
+// streams add +memberCount at the shared window. To count all members
+// simultaneously regardless of how far the window is from now, the forecast is
+// anchored just after the NEXT window-open occurrence (where every member's
+// constant slot overlaps), not at now. No ceiling/Capacity/Max change.
+func (s *Server) checkContinuousScheduleCapacity(ctx context.Context, cronTimezone string, start, end recsched.TimeOfDay, clipDurationSec int, envStart, envEnd time.Time, memberCount int) error {
+	ceiling := s.cfg.DropletPoolMax * s.cfg.DropletPoolCapacity
+	if ceiling <= 0 {
+		return nil
+	}
+	if memberCount <= 0 {
+		return nil
+	}
+	billingEnabled := s.billing != nil
+
+	// Anchor the evaluation just after the next window-open so all N members'
+	// constant slots overlap and the +N is fully counted vs the ceiling.
+	nextOpen, err := recsched.NextWindowOpenUTC(cronTimezone, start, envStart, envEnd, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("forecast continuous capacity: %v", err)
+	}
+	anchor := time.Now().UTC()
+	if !nextOpen.IsZero() {
+		anchor = nextOpen.Add(time.Second)
+	}
+	// A lookahead long enough to cover the window so the constant interval registers.
+	lookahead := time.Duration(end.Hour-start.Hour+1)*time.Hour + 5*time.Minute
+
+	dws := timeOfDayString(start)
+	dwe := timeOfDayString(end)
+	candidates := make([]dropletpool.ForecastCandidate, memberCount)
+	for i := range candidates {
+		candidates[i] = dropletpool.ForecastCandidate{
+			Mode:             "continuous",
+			CronTimezone:     cronTimezone,
+			ClipDurationSec:  clipDurationSec,
+			DailyWindowStart: dws,
+			DailyWindowEnd:   dwe,
+			EnvStart:         envStart,
+			EnvEnd:           envEnd,
+		}
+	}
+	peak, err := dropletpool.ForecastPeakWithCandidates(ctx, s.pool, billingEnabled, candidates, anchor, lookahead)
+	if err != nil {
+		return fmt.Errorf("forecast continuous capacity: %v", err)
+	}
+	if peak > ceiling {
+		return fmt.Errorf("this continuous selection peaks at %d concurrent streams, above the recorder limit of %d. Reduce the number of streams or contact the operator to raise the cap.", peak, ceiling)
+	}
+	return nil
+}
+
+// timeOfDayString renders a TimeOfDay as HH:MM:SS for the forecast candidate.
+func timeOfDayString(t recsched.TimeOfDay) string {
+	return fmt.Sprintf("%02d:%02d:%02d", t.Hour, t.Minute, t.Second)
 }
 
 // checkBundleScheduleCapacity rejects a prospective bundle whose forecast peak

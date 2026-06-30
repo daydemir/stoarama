@@ -117,9 +117,14 @@ func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) er
 
 type activeRecording struct {
 	id                 int64
-	cronExpr           string
+	mode               string
+	cronExpr           *string
 	cronTimezone       string
 	clipDurationSec    int
+	dailyWindowStart   *string
+	dailyWindowEnd     *string
+	startAt            time.Time
+	endAt              *time.Time
 	lastEnqueuedFireAt *time.Time
 }
 
@@ -156,7 +161,9 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 	// stream writes no clip row, so a down day is simply never billed (no gate
 	// change needed for "fails => free").
 	rows, err := tx.Query(ctx, `
-		SELECT rec.id, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec, rec.last_enqueued_fire_at
+		SELECT rec.id, rec.mode, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec,
+		       to_char(rec.daily_window_start, 'HH24:MI:SS'), to_char(rec.daily_window_end, 'HH24:MI:SS'),
+		       rec.start_at, rec.end_at, rec.last_enqueued_fire_at
 		FROM recordings rec
 		WHERE rec.status='active'
 		  AND rec.start_at <= now()
@@ -173,7 +180,8 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 	recs := make([]activeRecording, 0, 32)
 	for rows.Next() {
 		var rec activeRecording
-		if err := rows.Scan(&rec.id, &rec.cronExpr, &rec.cronTimezone, &rec.clipDurationSec, &rec.lastEnqueuedFireAt); err != nil {
+		if err := rows.Scan(&rec.id, &rec.mode, &rec.cronExpr, &rec.cronTimezone, &rec.clipDurationSec,
+			&rec.dailyWindowStart, &rec.dailyWindowEnd, &rec.startAt, &rec.endAt, &rec.lastEnqueuedFireAt); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan active recording: %w", err)
 		}
@@ -225,6 +233,7 @@ func (s *Scheduler) markStaleJobsMissed(ctx context.Context, tx pgx.Tx) error {
 		    completed_at=now(),
 		    updated_at=now()
 		WHERE status='pending'
+		  AND kind='clip'
 		  AND fire_at + make_interval(secs => (clip_duration_sec + $1)) <= now()
 		RETURNING recording_id
 	`, freshnessGraceSec)
@@ -260,11 +269,21 @@ func (s *Scheduler) markStaleJobsMissed(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
-// enqueueRecording materializes every missed fire for a single recording inside
-// its own savepoint, capped by the catch-up window and the remaining tick budget.
+// enqueueRecording materializes due work for a single recording. A continuous
+// recording materializes ONE window-long job per active daily-window occurrence;
+// a sampled recording materializes one job per missed cron fire (the existing
+// path). The 10-minute cron floor is the SAMPLED invariant and never applies to
+// continuous, which validates its window instead.
 func (s *Scheduler) enqueueRecording(ctx context.Context, tx pgx.Tx, rec activeRecording, now time.Time, budget int) (int, error) {
+	if rec.mode == "continuous" {
+		return s.enqueueContinuousRecording(ctx, tx, rec, now)
+	}
+
 	// Re-validate the clip-vs-interval invariant; skip+flag violators (S-DoS).
-	if err := ValidateCronForCreate(rec.cronExpr, rec.cronTimezone, s.cfg.MinIntervalSec, rec.clipDurationSec); err != nil {
+	if rec.cronExpr == nil {
+		return 0, fmt.Errorf("sampled recording has no cron_expr")
+	}
+	if err := ValidateCronForCreate(*rec.cronExpr, rec.cronTimezone, s.cfg.MinIntervalSec, rec.clipDurationSec); err != nil {
 		return 0, fmt.Errorf("cron invariant violated: %w", err)
 	}
 
@@ -284,7 +303,7 @@ func (s *Scheduler) enqueueRecording(ctx context.Context, tx pgx.Tx, rec activeR
 	}
 
 	// (c) advance the cursor and next_fire_at outside the per-fire loop.
-	nextFire, err := NextFireUTC(rec.cronExpr, rec.cronTimezone, now)
+	nextFire, err := NextFireUTC(*rec.cronExpr, rec.cronTimezone, now)
 	if err != nil {
 		return enqueued, fmt.Errorf("compute next fire: %w", err)
 	}
@@ -308,13 +327,85 @@ func (s *Scheduler) enqueueRecording(ctx context.Context, tx pgx.Tx, rec activeR
 	return enqueued, nil
 }
 
+// enqueueContinuousRecording materializes ONE continuous_window job for the
+// currently-open daily-window occurrence (if any) of a continuous recording. The
+// job is idempotent on the window-open instant (idem key reccont:<id>:<open_unix>),
+// so re-running the tick inside the same window is a no-op. When the window is not
+// open, nothing is enqueued. next_fire_at advances to the next window-open instant
+// for display. It does NOT call ValidateCronForCreate (no cron floor for continuous).
+func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, rec activeRecording, now time.Time) (int, error) {
+	if rec.dailyWindowStart == nil || rec.dailyWindowEnd == nil {
+		return 0, fmt.Errorf("continuous recording has no daily window")
+	}
+	start, err := ParseTimeOfDay(*rec.dailyWindowStart)
+	if err != nil {
+		return 0, err
+	}
+	end, err := ParseTimeOfDay(*rec.dailyWindowEnd)
+	if err != nil {
+		return 0, err
+	}
+	var envEnd time.Time
+	if rec.endAt != nil {
+		envEnd = rec.endAt.UTC()
+	}
+	open, windowOpenUTC, windowEndUTC, err := currentOpenContinuousWindow(rec.cronTimezone, start, end, rec.startAt.UTC(), envEnd, now)
+	if err != nil {
+		return 0, err
+	}
+
+	enqueued := 0
+	var lastEnqueuedArg any
+	if open {
+		// Clamp the window end to the capture envelope upper bound so a window
+		// straddling end_at stops the worker at end_at (autoStop also cancels it).
+		effectiveEnd := windowEndUTC
+		if !envEnd.IsZero() && envEnd.Before(effectiveEnd) {
+			effectiveEnd = envEnd
+		}
+		idemKey := fmt.Sprintf("reccont:%d:%d", rec.id, windowOpenUTC.Unix())
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO recording_jobs (recording_id, fire_at, scheduled_for, clip_duration_sec, status, idempotency_key, kind, window_end_at)
+			VALUES ($1, $2, $2, $3, 'pending', $4, 'continuous_window', $5)
+			ON CONFLICT (idempotency_key) DO NOTHING
+		`, rec.id, windowOpenUTC, rec.clipDurationSec, idemKey, effectiveEnd)
+		if err != nil {
+			return 0, fmt.Errorf("insert continuous window job: %w", err)
+		}
+		if ct.RowsAffected() == 1 {
+			enqueued = 1
+		}
+		lastEnqueuedArg = windowOpenUTC
+	}
+
+	// next_fire_at = the next window-open instant (display + provision hint).
+	nextOpen, err := NextWindowOpenUTC(rec.cronTimezone, start, rec.startAt.UTC(), envEnd, now)
+	if err != nil {
+		return enqueued, err
+	}
+	var nextFireArg any
+	if !nextOpen.IsZero() {
+		nextFireArg = nextOpen
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE recordings
+		SET last_enqueued_fire_at = GREATEST(COALESCE(last_enqueued_fire_at, 'epoch'::timestamptz), COALESCE($2::timestamptz, COALESCE(last_enqueued_fire_at, 'epoch'::timestamptz))),
+		    next_fire_at = $3,
+		    updated_at = now()
+		WHERE id=$1
+	`, rec.id, lastEnqueuedArg, nextFireArg); err != nil {
+		return enqueued, fmt.Errorf("advance continuous recording cursor: %w", err)
+	}
+	return enqueued, nil
+}
+
 // enqueueRecordingFires materializes one recording_jobs row per missed cron fire,
 // idempotently. cursor = last_enqueued_fire_at, floored to now-CatchupWindow when
 // the recording has been idle longer than the window. The set of fire instants is
 // computed by the pure dueFireInstants helper; this method only performs the
 // inserts and tracks how many new rows were written against the per-tick budget.
 func (s *Scheduler) enqueueRecordingFires(ctx context.Context, tx pgx.Tx, rec activeRecording, now time.Time, budget int) (int, time.Time, error) {
-	sched, err := ParseCron(rec.cronExpr)
+	sched, err := ParseCron(*rec.cronExpr)
 	if err != nil {
 		return 0, time.Time{}, err
 	}

@@ -61,6 +61,11 @@ type RecordingJob struct {
 	// TargetFPS, when non-nil, normalizes each captured clip to that exact frame
 	// rate (re-encode). nil = Source/native (stream-copy, preserve source fps).
 	TargetFPS *int `json:"target_fps"`
+	// Kind is 'clip' (default, per-cron-fire) or 'continuous_window' (one window-
+	// long lease driving back-to-back segment capture). WindowEndAt is the
+	// continuous window's close instant (zero/nil for a clip job).
+	Kind        string     `json:"kind"`
+	WindowEndAt *time.Time `json:"window_end_at"`
 }
 
 // ClipUploadIntent is a presigned PUT against the user's bucket.
@@ -104,10 +109,20 @@ func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
 	return out.Job, nil
 }
 
-// ReserveClipUpload presigns a PUT for the given leased job.
-func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, mimeType string) (ClipUploadIntent, error) {
+// ReserveClipUpload presigns a PUT for the given leased job. segmentStartMs is 0
+// for an ordinary clip job (the intent is keyed by the job alone), or the
+// segment's UTC start in Unix millis for a continuous_window job, where one lease
+// raises many per-segment intents: the discriminator both forwards the
+// per-segment object-key derivation to the server and makes each segment's
+// Idempotency-Key distinct so they are not deduped against each other.
+func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, mimeType string, segmentStartMs int64) (ClipUploadIntent, error) {
 	payload := map[string]any{"job_id": jobID, "mime_type": strings.TrimSpace(mimeType)}
-	headers := map[string]string{"Idempotency-Key": buildIdempotencyKey("recording-clip", jobID)}
+	idemKey := buildIdempotencyKey("recording-clip", jobID)
+	if segmentStartMs > 0 {
+		payload["segment_start_ms"] = segmentStartMs
+		idemKey = fmt.Sprintf("recording-seg-%d-%d", jobID, segmentStartMs)
+	}
+	headers := map[string]string{"Idempotency-Key": idemKey}
 	var out ClipUploadIntent
 	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/upload-intents", payload, headers, &out); err != nil {
 		return ClipUploadIntent{}, err

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,14 @@ import (
 const (
 	SegmentTargetFPS       = 30
 	DefaultSegmentDuration = 30 * time.Second
+	// ContinuousSegmentPollInterval is how often CaptureContinuous scans the
+	// output dir for newly finalized segments. ffmpeg's segment muxer has no
+	// per-segment callback, so a segment is detected as final once a strictly
+	// newer segment file has appeared (the muxer moved on and closed its trailer).
+	ContinuousSegmentPollInterval = 2 * time.Second
+	// continuousShutdownGrace bounds how long CaptureContinuous waits for ffmpeg
+	// to exit cleanly after a SIGINT (clean MP4 trailer on the last segment).
+	continuousShutdownGrace = 20 * time.Second
 )
 
 type Segment struct {
@@ -140,6 +149,256 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 		AudioPresent: audioPresent,
 		Thumbnail:    thumb,
 	}, nil
+}
+
+// CaptureContinuous records sourceURL gaplessly into back-to-back .mp4 segments
+// of clipDuration each, for as long as ctx is live, by holding ONE persistent
+// ffmpeg open with the segment muxer (NOT one ffmpeg connect per clip, which
+// leaves a reconnect gap at every clip boundary). It reuses the exact input and
+// encode forks of CaptureSegment: targetFPS==nil stream-copies (-c copy, cheap,
+// gapless, segments cut on input keyframes); a fixed targetFPS re-encodes to that
+// exact rate, producing exact clipDuration segments.
+//
+// Because ffmpeg has no per-segment callback, finalization is detected by polling
+// outDir: a segment file is FINAL once a strictly newer segment file has appeared
+// (the muxer has moved on and closed the prior trailer). Each finalized segment is
+// probed (reusing probeSegment on the OUTPUT file) and handed to onSegment exactly
+// once. The segment's StartAt is parsed from its strftime filename (authoritative,
+// idempotent, ordered) and EndAt is StartAt+duration.
+//
+// On ctx cancel (window close) ffmpeg is stopped with SIGINT (clean trailer rather
+// than Kill), then one final sweep finalizes the last in-progress segment so no
+// captured footage is dropped at the boundary. The caller's onSegment is expected
+// to delete the segment file (CleanupSegment) after a successful ingest so outDir
+// does not grow unbounded over a long window. onSegment returning an error aborts
+// the whole window (SIGINT ffmpeg, return the error).
+//
+// pinHost mirrors CaptureSegment (HTTP Host override for the IP-pinned path);
+// pass "" to let ffmpeg derive Host/SNI from the URL.
+func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error) error {
+	if strings.TrimSpace(sourceURL) == "" {
+		return fmt.Errorf("source_url is empty")
+	}
+	if clipDuration <= 0 {
+		return fmt.Errorf("segment duration must be > 0")
+	}
+	if strings.TrimSpace(outDir) == "" {
+		return fmt.Errorf("outDir is empty")
+	}
+	if onSegment == nil {
+		return fmt.Errorf("onSegment callback is required")
+	}
+
+	outPattern := filepath.Join(outDir, "seg-%Y%m%d-%H%M%S.mp4")
+	args := buildFFmpegContinuousArgs(sourceURL, outPattern, clipDuration, pinHost, targetFPS)
+	cmd := exec.Command(ffmpegBin(), args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start continuous ffmpeg: %w", err)
+	}
+
+	// waitErr is filled by the ffmpeg waiter goroutine.
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- cmd.Wait() }()
+
+	processed := make(map[string]bool)
+	ticker := time.NewTicker(ContinuousSegmentPollInterval)
+	defer ticker.Stop()
+
+	// stopFFmpeg sends SIGINT for a clean trailer, then waits a bounded grace for
+	// the process to exit (falling back to Kill so we never hang on a wedged child).
+	stopFFmpeg := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+		}
+		select {
+		case <-waitErr:
+		case <-time.After(continuousShutdownGrace):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-waitErr
+		}
+	}
+
+	// sweepFinal scans outDir and hands every newly-finalized segment to onSegment.
+	// finalizeAll=false treats a segment as final only when a strictly newer one
+	// exists (steady state); finalizeAll=true treats every unprocessed segment as
+	// final (post-SIGINT sweep, when ffmpeg has closed the last trailer).
+	sweepFinal := func(finalizeAll bool) error {
+		segs, err := sortedSegments(outDir)
+		if err != nil {
+			return err
+		}
+		for i, path := range segs {
+			if processed[path] {
+				continue
+			}
+			isLast := i == len(segs)-1
+			if isLast && !finalizeAll {
+				// The newest segment is still being written; leave it for a later poll.
+				continue
+			}
+			seg, err := finalizeSegment(ctx, path)
+			if err != nil {
+				return err
+			}
+			processed[path] = true
+			if err := onSegment(seg); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			stopFFmpeg()
+			// Final sweep: the last open segment now has a clean trailer.
+			if err := sweepFinal(true); err != nil {
+				return err
+			}
+			return nil
+		case err := <-waitErr:
+			// ffmpeg exited on its own (stream ended or a hard error). Sweep whatever
+			// finalized segments remain, then surface the error if it was non-clean.
+			if sweepErr := sweepFinal(true); sweepErr != nil {
+				return sweepErr
+			}
+			if err != nil {
+				return fmt.Errorf("continuous ffmpeg exited: %w (%s)", err, strings.TrimSpace(stderr.String()))
+			}
+			return nil
+		case <-ticker.C:
+			if err := sweepFinal(false); err != nil {
+				stopFFmpeg()
+				return err
+			}
+		}
+	}
+}
+
+// sortedSegments returns the seg-*.mp4 files in outDir sorted chronologically.
+// The strftime naming (seg-YYYYMMDD-HHMMSS.mp4) sorts lexically == chronologically.
+func sortedSegments(outDir string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(outDir, "seg-*.mp4"))
+	if err != nil {
+		return nil, fmt.Errorf("glob segments: %w", err)
+	}
+	sort.Strings(matches)
+	return matches, nil
+}
+
+// finalizeSegment probes a finalized segment file and builds its Segment. The
+// StartAt is parsed from the strftime filename (UTC), so the per-segment object
+// key the worker derives downstream is deterministic and ordered.
+func finalizeSegment(ctx context.Context, path string) (Segment, error) {
+	startAt, err := parseSegmentStart(filepath.Base(path))
+	if err != nil {
+		return Segment{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return Segment{}, fmt.Errorf("stat segment: %w", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return Segment{}, fmt.Errorf("read segment: %w", err)
+	}
+	sum := sha256.Sum256(body)
+
+	meta, metaErr := probeSegment(ctx, path)
+	durationMs := int64(0)
+	videoCodec := "h264"
+	audioCodec := ""
+	audioPresent := false
+	var actualFPS *float64
+	if metaErr == nil {
+		durationMs = meta.DurationMs
+		actualFPS = meta.ActualFPS
+		if meta.VideoCodec != "" {
+			videoCodec = meta.VideoCodec
+		}
+		audioCodec = meta.AudioCodec
+		audioPresent = meta.AudioPresent
+	}
+	endAt := startAt
+	if durationMs > 0 {
+		endAt = startAt.Add(time.Duration(durationMs) * time.Millisecond)
+	}
+	return Segment{
+		Path:         path,
+		MIMEType:     "video/mp4",
+		SizeBytes:    info.Size(),
+		SHA256:       hex.EncodeToString(sum[:]),
+		SourceKind:   "live",
+		StartAt:      startAt,
+		EndAt:        endAt,
+		DurationMs:   durationMs,
+		Container:    "mp4",
+		ActualFPS:    actualFPS,
+		VideoCodec:   videoCodec,
+		AudioCodec:   audioCodec,
+		AudioPresent: audioPresent,
+	}, nil
+}
+
+// parseSegmentStart parses the strftime segment filename seg-YYYYMMDD-HHMMSS.mp4
+// into its UTC start instant (the wall-clock the muxer opened it at).
+func parseSegmentStart(name string) (time.Time, error) {
+	trimmed := strings.TrimSuffix(strings.TrimPrefix(name, "seg-"), ".mp4")
+	t, err := time.ParseInLocation("20060102-150405", trimmed, time.UTC)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse segment start from %q: %w", name, err)
+	}
+	return t, nil
+}
+
+// buildFFmpegContinuousArgs mirrors buildFFmpegSegmentArgs (same input + encode
+// forks) but swaps the single-clip -t for the segment muxer, so one persistent
+// ffmpeg writes a finalized .mp4 every clipDuration with no reconnect gap.
+func buildFFmpegContinuousArgs(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int) []string {
+	seconds := strconv.FormatFloat(clipDuration.Seconds(), 'f', -1, 64)
+	args := []string{
+		"-y",
+		"-nostdin",
+		"-loglevel", "error",
+	}
+	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10, pinHost)
+	args = append(args,
+		"-fflags", "+discardcorrupt",
+		"-i", sourceURL,
+		"-map", "0:v:0",
+		"-map", "0:a?",
+	)
+	if targetFPS != nil && *targetFPS > 0 {
+		// Fixed-fps path: re-encode to the chosen rate so segments are exactly
+		// clipDuration. Identical to buildFFmpegSegmentArgs's re-encode fork.
+		args = append(args,
+			"-vf", fmt.Sprintf("fps=%d", *targetFPS),
+			"-c:v", "libx264",
+			"-preset", "veryfast",
+			"-crf", "23",
+			"-pix_fmt", "yuv420p",
+			"-c:a", "aac",
+			"-b:a", "128k",
+		)
+	} else {
+		// Source/native path: stream-copy. Segment cuts land on input keyframes, so
+		// each segment is ~clipDuration; this is the cheap, gapless default.
+		args = append(args, "-c", "copy")
+	}
+	args = append(args,
+		"-f", "segment",
+		"-segment_time", seconds,
+		"-reset_timestamps", "1",
+		"-segment_format", "mp4",
+		"-strftime", "1",
+		outPattern,
+	)
+	return args
 }
 
 // ProbeReachable verifies that sourceURL opens and yields at least one packet
