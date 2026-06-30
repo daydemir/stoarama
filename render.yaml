@@ -229,22 +229,27 @@ services:
       # the admin account that owns the per-droplet local_recorder node tokens.
       # The project + firewall ids reuse the existing DO project and the egress
       # firewall that blocks the metadata IP / RFC1918 (S-1). DROPLET_POOL_MAX is
-      # the hard spend cap. Leave DROPLET_POOL_ENABLED=false until the prebuilt
-      # image (DROPLET_POOL_IMAGE) and firewall are provisioned.
+      # the hard spend cap. These values are auto-synced by the Render Blueprint on
+      # every push, so they MUST match the live prod config: the pool is enabled and
+      # Capacity is baked into the prebuilt droplet image (DROPLET_POOL_IMAGE), so a
+      # mismatch here would clobber prod on deploy.
       - key: DO_API_TOKEN
         sync: false
       - key: BOOTSTRAP_ADMIN_EMAIL
         sync: false
       - key: DROPLET_POOL_ENABLED
-        value: "false"
+        value: "true"
       - key: DROPLET_POOL_TICK_SEC
         value: "30"
       - key: DROPLET_POOL_LOOKAHEAD_SEC
         value: "1800"
+      # Capacity is baked into the prebuilt droplet image; it MUST equal
+      # RECORDING_WORKER_CONCURRENCY (C-cap invariant) and changing it needs a
+      # droplet image rebuild, so keep both at 5 to match the live image.
       - key: DROPLET_POOL_CAPACITY
-        value: "1"
+        value: "5"
       - key: RECORDING_WORKER_CONCURRENCY
-        value: "1"
+        value: "5"
       - key: DROPLET_POOL_PROVISION_LEAD_SEC
         value: "600"
       - key: DROPLET_POOL_PROVISION_TIMEOUT_SEC
@@ -257,8 +262,11 @@ services:
         value: "60"
       - key: DROPLET_POOL_SCALEDOWN_COOLDOWN_SEC
         value: "300"
+      # Warm floor: keep one droplet alive at zero demand so the first fire after
+      # idle does not eat a cold-boot lead-miss. Set to 0 to let the pool drain
+      # fully to zero when there is no demand (cheapest, but first fire waits a boot).
       - key: DROPLET_POOL_MIN
-        value: "0"
+        value: "1"
       # Hard spend cap = ceiling Max*Capacity concurrent clips. Capacity=5 is baked
       # into the droplet image, so the ceiling is Max*5. Max=20 => 100 concurrent,
       # the largest value that fits under the DigitalOcean account droplet_limit
