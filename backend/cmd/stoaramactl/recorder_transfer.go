@@ -151,7 +151,7 @@ func transferOneClip(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.
 
 	// Auto-purge the managed staging copy ONLY after a confirmed delivery. A WebDAV
 	// recording captures into managed R2, then this job copies it to the NAS; once
-	// delivered, the managed copy is just dead weight (and would accrue gb_month),
+	// delivered, the managed copy is just dead weight (and would accrue stream_hour_month),
 	// so delete the source object and mark the clip purged. This runs only on the
 	// 'done' transition, so a failing/retrying transfer (NAS down) never purges and
 	// the data stays in managed staging until the retries succeed.

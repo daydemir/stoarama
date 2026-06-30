@@ -767,7 +767,7 @@ const exportBatchSize = 500
 // (account: every clip; recording: one recording's clips; bundle: every member
 // recording's clips). One target storage_destination_id receives the copies; an
 // optional purge_source deletes each managed source object after a confirmed
-// copy so managed storage stops accruing gb_month.
+// copy so managed storage stops accruing stream_hour_month.
 type exportCreateRequest struct {
 	Scope                      string `json:"scope"`
 	RecordingID                int64  `json:"recording_id"`

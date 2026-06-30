@@ -282,8 +282,8 @@ func (s *Server) handleAccountStorageDestinationDelete(w http.ResponseWriter, r 
 // coordinates + the encrypted operator secret, isolated by a per-account
 // key_prefix. It skips ALL BYO validation (name/endpoint/.../verify probe) because
 // the operator bucket is already trusted. After provisioning it lazily adds the
-// gb_month metered item to the account's existing subscription (Option A backfill),
-// then returns the masked payload (operator creds blanked).
+// stream_hour_month metered item to the account's existing subscription (Option A
+// backfill), then returns the masked payload (operator creds blanked).
 func (s *Server) handleAccountStorageManagedCreate(w http.ResponseWriter, r *http.Request, principal accountPrincipal) {
 	id, keyPrefix, err := s.provisionManagedDestination(r.Context(), principal.AccountID)
 	if err != nil {
@@ -295,9 +295,9 @@ func (s *Server) handleAccountStorageManagedCreate(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Lazily add the gb_month metered item to a pre-existing subscription that
-	// predates managed storage, so opting in starts accruing storage charges on the
-	// same subscription. New accounts already get both items at Checkout. Best
+	// Lazily add the stream_hour_month metered item to a pre-existing subscription
+	// that predates managed storage, so opting in starts accruing storage charges on
+	// the same subscription. New accounts already get both items at Checkout. Best
 	// effort: a Stripe hiccup must not fail provisioning (the nightly metering job
 	// reports nothing until the item exists, and a later opt-in retries this).
 	if s.billing != nil {
@@ -309,8 +309,8 @@ func (s *Server) handleAccountStorageManagedCreate(w http.ResponseWriter, r *htt
 				log.Printf("managed provision: read subscription for account %d: %v", principal.AccountID, err)
 			}
 		} else if subID != nil && strings.TrimSpace(*subID) != "" {
-			if err := s.billing.EnsureGBMonthItem(r.Context(), *subID); err != nil {
-				log.Printf("managed provision: ensure gb_month item for account %d: %v", principal.AccountID, err)
+			if err := s.billing.EnsureStreamHourMonthItem(r.Context(), *subID); err != nil {
+				log.Printf("managed provision: ensure stream_hour_month item for account %d: %v", principal.AccountID, err)
 			}
 		}
 	}

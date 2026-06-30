@@ -99,7 +99,10 @@ services:
         value: "4"
       # Standalone stream-recorder billing (Stripe). The API serves Checkout,
       # the customer portal, and the signature-verified webhook. Leaving these
-      # unset disables billing and runs recordings in free mode.
+      # unset disables billing and runs recordings in free mode. STRIPE_PRICE_ID +
+      # STRIPE_METER_ID hold the recording_hour metered price/meter ($0.05/record-hour);
+      # STRIPE_GB_MONTH_PRICE_ID + STRIPE_GB_MONTH_METER_ID hold the stream_hour_month
+      # price/meter ($0.10/stream-hour-month). All four are dashboard sync:false vars.
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
@@ -216,6 +219,9 @@ services:
         value: "600"
       - key: REC_SCHED_MAX_JOBS_PER_TICK
         value: "500"
+      # STRIPE_PRICE_ID/STRIPE_METER_ID hold the recording_hour objects
+      # ($0.05/record-hour); STRIPE_GB_MONTH_PRICE_ID/STRIPE_GB_MONTH_METER_ID hold the
+      # stream_hour_month objects ($0.10/stream-hour-month). All dashboard sync:false.
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
@@ -262,11 +268,15 @@ services:
         value: "60"
       - key: DROPLET_POOL_SCALEDOWN_COOLDOWN_SEC
         value: "300"
-      # Warm floor: keep one droplet alive at zero demand so the first fire after
-      # idle does not eat a cold-boot lead-miss. Set to 0 to let the pool drain
-      # fully to zero when there is no demand (cheapest, but first fire waits a boot).
+      # Drain-to-zero default: with MIN=0 the pool drains fully to zero when there is
+      # no near-term demand (cheapest), and the autoscaler provisions a droplet AHEAD
+      # of each upcoming fire / continuous-window open by DROPLET_POOL_PROVISION_LEAD_SEC.
+      # That 600s (10min) lead comfortably covers the real cold-start (~1-2min snapshot
+      # boot + ~1-2min binary rebuild from HEAD = ~2-4min), so no fire from a cold pool
+      # misses; the lead-miss WARNING + the 900s provision-timeout reap remain the
+      # backstops. Set to 1 to keep one warm droplet at zero demand instead.
       - key: DROPLET_POOL_MIN
-        value: "1"
+        value: "0"
       # Hard spend cap = ceiling Max*Capacity concurrent clips. Capacity=5 is baked
       # into the droplet image, so the ceiling is Max*5. Max=20 => 100 concurrent,
       # the largest value that fits under the DigitalOcean account droplet_limit

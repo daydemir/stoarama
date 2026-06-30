@@ -394,12 +394,12 @@
       return `$${(c / 100).toFixed(2)}`;
     }
 
-    // Storage cost from a GB-month figure. The server pre-rounds tiny storage
-    // charges to 0 cents, so render a real-but-sub-cent amount (gb > 0) as
+    // Storage cost from a stream-hour-month figure. The server pre-rounds tiny
+    // storage charges to 0 cents, so render a real-but-sub-cent amount (units > 0) as
     // "<$0.01" rather than the broken-looking "$0.00".
-    function usdStorage(gb, rateCents, roundedCents) {
+    function usdStorage(units, rateCents, roundedCents) {
       const c = Number(roundedCents || 0);
-      if (c === 0 && Number(gb || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
+      if (c === 0 && Number(units || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
       return usd(c);
     }
 
@@ -520,13 +520,13 @@
     // Render the billing panel from a GET /billing payload. Pure given the payload
     // + DOM nodes; all money is server-derived, labelled as an estimate.
     function renderBilling(b) {
-      const dayRate = Number(b.recording_day_rate_cents || 50);
-      const gbRate = Number(b.gb_month_rate_cents || 10);
-      const days = Number(b.recording_days_this_month || 0);
-      const gb = Number(b.storage_gb_month_avg || 0);
-      const dayCents = Number(b.estimated_amount_cents || 0);
+      const hourRate = Number(b.recording_hour_rate_cents || 5);
+      const shmRate = Number(b.stream_hour_month_rate_cents || 10);
+      const hours = Number(b.recording_hours_this_month || 0);
+      const shm = Number(b.storage_stream_hour_month_avg || 0);
+      const hourCents = Number(b.estimated_amount_cents || 0);
       const storeCents = Number(b.estimated_storage_amount_cents || 0);
-      const totalCents = dayCents + storeCents;
+      const totalCents = hourCents + storeCents;
 
       if (b.has_payment_method === true) {
         paymentRow.innerHTML = `<div style="color:var(--ok);">You have a card on file.</div>`;
@@ -537,14 +537,14 @@
       }
 
       usageRecDays.innerHTML =
-        `<div><b>${days}</b> record-day${days === 1 ? '' : 's'} from the streams you are recording</div>`;
-      usageStorage.innerHTML = gb > 0
-        ? `<div><b>${gb.toFixed(3)}</b> GB-month managed storage</div>`
-          + `<div class="muted" style="font-size:12px;margin-top:4px;">Storage is ${usd(gbRate)} per GB per month, charged only for the time each clip is kept. A clip stored a few days costs a small fraction of that.</div>`
+        `<div><b>${hours}</b> record-hour${hours === 1 ? '' : 's'} from the streams you are recording</div>`;
+      usageStorage.innerHTML = shm > 0
+        ? `<div><b>${shm.toFixed(3)}</b> stream-hour-month managed storage</div>`
+          + `<div class="muted" style="font-size:12px;margin-top:4px;">Storage is ${usd(shmRate)} per stream-hour-month, charged only for the time each clip is kept. A clip stored a few days costs a small fraction of that.</div>`
         : `<div class="muted">No managed storage this month</div>`;
 
-      const lines = [`<div>${days} × ${usd(dayRate)} record-day = <b>${usd(dayCents)}</b></div>`];
-      if (gb > 0) lines.push(`<div>${gb.toFixed(3)} GB-mo × ${usd(gbRate)} = <b>${usdStorage(gb, gbRate, storeCents)}</b></div>`);
+      const lines = [`<div>${hours} × ${usd(hourRate)} record-hour = <b>${usd(hourCents)}</b></div>`];
+      if (shm > 0) lines.push(`<div>${shm.toFixed(3)} stream-hr-mo × ${usd(shmRate)} = <b>${usdStorage(shm, shmRate, storeCents)}</b></div>`);
       lines.push(`<div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></div>`);
       estBreakdown.innerHTML = lines.join('');
 

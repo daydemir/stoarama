@@ -14,13 +14,13 @@ import (
 // than an error (which would retry forever and never re-bill the consumed usage).
 func TestIsDuplicateMeterEvent(t *testing.T) {
 	// The exact Stripe message observed for a duplicate identifier (verified live in
-	// test mode against the recording_day meter).
+	// test mode against the recording_hour meter).
 	dup := errors.New("An event already exists with identifier 1-2026-07.")
 	if !isDuplicateMeterEvent(dup) {
 		t.Fatalf("duplicate-identifier error not recognized: %v", dup)
 	}
 	// Wrapped the way the SDK/our code may surround it.
-	if !isDuplicateMeterEvent(fmt.Errorf("report recording days: %w", dup)) {
+	if !isDuplicateMeterEvent(fmt.Errorf("report recording hours: %w", dup)) {
 		t.Fatalf("wrapped duplicate-identifier error not recognized")
 	}
 

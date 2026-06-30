@@ -72,14 +72,14 @@ func TestPeriodReadyToMeter(t *testing.T) {
 
 // TestCursorDoesNotJumpOpenPeriod reproduces the cursor-jump billing bug and proves
 // the fix. It replicates meterAccount's guard sequence (periodAlreadyMetered ->
-// periodReadyToMeter -> day-count gate -> report -> advance cursor) against the fake
+// periodReadyToMeter -> hour-count gate -> report -> advance cursor) against the fake
 // Stripe, stepping a single subscription through its first OPEN period and then its
 // close, asserting the closed period with real usage is metered EXACTLY ONCE.
 func TestCursorDoesNotJumpOpenPeriod(t *testing.T) {
 	ctx := context.Background()
 
 	// Subscription created 2026-06-29; first period [06-29, 07-29). The account
-	// records 5 billable recording-days during it. Stripe rolls current_period_end
+	// records 5 billable recording-hours during it. Stripe rolls current_period_end
 	// to 08-29 the instant the first period closes.
 	period1End := dateUTC(2026, 7, 29)
 	period2End := dateUTC(2026, 8, 29)
@@ -89,9 +89,9 @@ func TestCursorDoesNotJumpOpenPeriod(t *testing.T) {
 
 	// step models one daily sweep: it returns the open-period end Stripe reports as
 	// of `now`, runs the exact guard sequence, and returns whether a report fired and
-	// the period key it used. days is the billable count Stripe would sum for the
-	// reported period (our recording_billing_days count for [start,end)).
-	step := func(now, openPeriodEnd time.Time, days int) (reported bool, key string) {
+	// the period key it used. hours is the billable count Stripe would sum for the
+	// reported period (our recording_billing_hours count for [start,end)).
+	step := func(now, openPeriodEnd time.Time, hours int) (reported bool, key string) {
 		f := &fakeMeteringStripe{periodStart: dateUTC(2026, 6, 29), periodEnd: openPeriodEnd}
 		if periodAlreadyMetered(f.periodEnd, cursor) {
 			return false, ""
@@ -99,8 +99,8 @@ func TestCursorDoesNotJumpOpenPeriod(t *testing.T) {
 		if !periodReadyToMeter(f.periodEnd, now) {
 			return false, "" // open period: must NOT advance the cursor (the bug).
 		}
-		if shouldReportDays(days) {
-			_ = f.ReportRecordingDays(ctx, "cus_x", 1, meterPeriodKey(f.periodEnd), days)
+		if shouldReportHours(hours) {
+			_ = f.ReportRecordingHours(ctx, "cus_x", 1, meterPeriodKey(f.periodEnd), hours)
 			reported = true
 			key = f.reports[0].periodKey
 		}
@@ -110,7 +110,7 @@ func TestCursorDoesNotJumpOpenPeriod(t *testing.T) {
 	}
 
 	// Sweep 1: mid-period (2026-07-10), Stripe still reports the OPEN first period
-	// (end 07-29), 2 days accrued so far. The OLD code would report+advance here,
+	// (end 07-29), 2 hours accrued so far. The OLD code would report+advance here,
 	// sealing the period before close. The fix must NOT advance.
 	if rep, _ := step(dateUTC(2026, 7, 10), period1End, 2); rep {
 		t.Fatalf("mid-period sweep reported; want skip (period still open)")
@@ -120,7 +120,7 @@ func TestCursorDoesNotJumpOpenPeriod(t *testing.T) {
 	}
 
 	// Sweep 2: the period-end day (2026-07-29), before close. Stripe still reports
-	// the closing period (end 07-29); the full 5-day count is now final. The fix
+	// the closing period (end 07-29); the full 5-hour count is now final. The fix
 	// meters it here, exactly once, with the period-end month key.
 	rep, key := step(dateUTC(2026, 7, 29), period1End, 5)
 	if !rep {
@@ -174,83 +174,83 @@ func TestMeterPeriodKey(t *testing.T) {
 	}
 }
 
-func TestShouldReportDays(t *testing.T) {
+func TestShouldReportHours(t *testing.T) {
 	for _, n := range []int{0, -1} {
-		if shouldReportDays(n) {
-			t.Fatalf("shouldReportDays(%d) = true, want false (empty period suppressed)", n)
+		if shouldReportHours(n) {
+			t.Fatalf("shouldReportHours(%d) = true, want false (empty period suppressed)", n)
 		}
 	}
-	for _, n := range []int{1, 7, 31} {
-		if !shouldReportDays(n) {
-			t.Fatalf("shouldReportDays(%d) = false, want true", n)
+	for _, n := range []int{1, 7, 744} {
+		if !shouldReportHours(n) {
+			t.Fatalf("shouldReportHours(%d) = false, want true", n)
 		}
 	}
 }
 
-// fakeMeteringStripe records ReportRecordingDays and ReportGBMonth calls so each
-// report branch's arguments (customer, account, period key, value) can be asserted
-// without Stripe.
+// fakeMeteringStripe records ReportRecordingHours and ReportStreamHourMonth calls so
+// each report branch's arguments (customer, account, period key, value) can be
+// asserted without Stripe.
 type fakeMeteringStripe struct {
 	periodStart time.Time
 	periodEnd   time.Time
 	reports     []reportCall
-	gbReports   []gbReportCall
+	shmReports  []shmReportCall
 }
 
 type reportCall struct {
 	customerID string
 	accountID  int64
 	periodKey  string
-	days       int
+	hours      int
 }
 
-type gbReportCall struct {
-	customerID string
-	accountID  int64
-	periodKey  string
-	gbDecimal  string
+type shmReportCall struct {
+	customerID   string
+	accountID    int64
+	periodKey    string
+	hoursDecimal string
 }
 
 func (f *fakeMeteringStripe) GetSubscriptionPeriod(_ context.Context, _ string) (time.Time, time.Time, error) {
 	return f.periodStart, f.periodEnd, nil
 }
 
-func (f *fakeMeteringStripe) ReportRecordingDays(_ context.Context, customerID string, accountID int64, periodKey string, days int) error {
-	f.reports = append(f.reports, reportCall{customerID, accountID, periodKey, days})
+func (f *fakeMeteringStripe) ReportRecordingHours(_ context.Context, customerID string, accountID int64, periodKey string, hours int) error {
+	f.reports = append(f.reports, reportCall{customerID, accountID, periodKey, hours})
 	return nil
 }
 
-func (f *fakeMeteringStripe) ReportGBMonth(_ context.Context, customerID string, accountID int64, periodKey, gbDecimal string) error {
-	f.gbReports = append(f.gbReports, gbReportCall{customerID, accountID, periodKey, gbDecimal})
+func (f *fakeMeteringStripe) ReportStreamHourMonth(_ context.Context, customerID string, accountID int64, periodKey, hoursDecimal string) error {
+	f.shmReports = append(f.shmReports, shmReportCall{customerID, accountID, periodKey, hoursDecimal})
 	return nil
 }
 
 // TestMeteringReportBranch exercises the report decision the same way meterAccount
-// does (guard -> day-count gate -> ReportRecordingDays with the period key) so the
-// idempotency-guard + day-count gating is covered end to end against a fake Stripe.
+// does (guard -> hour-count gate -> ReportRecordingHours with the period key) so the
+// idempotency-guard + hour-count gating is covered end to end against a fake Stripe.
 func TestMeteringReportBranch(t *testing.T) {
 	ctx := context.Background()
 	periodEnd := dateUTC(2026, 8, 1)
-	report := func(a meterableAccount, days int) []reportCall {
+	report := func(a meterableAccount, hours int) []reportCall {
 		f := &fakeMeteringStripe{periodStart: dateUTC(2026, 7, 1), periodEnd: periodEnd}
 		if periodAlreadyMetered(f.periodEnd, a.lastMeteredPeriodEnd) {
 			return nil // guard skip: never reports
 		}
-		if shouldReportDays(days) {
-			_ = f.ReportRecordingDays(ctx, a.customerID, a.accountID, meterPeriodKey(f.periodEnd), days)
+		if shouldReportHours(hours) {
+			_ = f.ReportRecordingHours(ctx, a.customerID, a.accountID, meterPeriodKey(f.periodEnd), hours)
 		}
 		return f.reports
 	}
 
-	// Fresh account, 7 billable days: one report with the period-end month key.
+	// Fresh account, 7 billable hours: one report with the period-end month key.
 	got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 7)
 	if len(got) != 1 || got[0] != (reportCall{"cus_x", 42, "2026-08-01", 7}) {
-		t.Fatalf("fresh 7-day report = %+v, want one {cus_x,42,2026-08-01,7}", got)
+		t.Fatalf("fresh 7-hour report = %+v, want one {cus_x,42,2026-08-01,7}", got)
 	}
 
-	// Zero billable days: no report (empty invoice suppressed).
+	// Zero billable hours: no report (empty invoice suppressed).
 	if got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 0); len(got) != 0 {
-		t.Fatalf("zero-day report = %+v, want none", got)
+		t.Fatalf("zero-hour report = %+v, want none", got)
 	}
 
 	// Already metered this period (cursor == period end): guard skips before report.
@@ -260,71 +260,97 @@ func TestMeteringReportBranch(t *testing.T) {
 	}
 }
 
-func TestGBMonthMeterValue(t *testing.T) {
+// TestRecordHourBillingMath locks the record-hour pricing math: hours x $0.05. The
+// authoritative charge is Stripe's meter sum (hours reported), but the cost a given
+// hour count maps to must match the published $0.05/record-hour rate so the UI/API
+// estimate and the meter agree on the unit price.
+func TestRecordHourBillingMath(t *testing.T) {
+	const rateCents = 5 // $0.05 per record-hour
 	cases := []struct {
-		name     string
-		sumBytes int64
-		snapDays int
-		want     string
-		report   bool
+		hours     int
+		wantCents int
 	}{
-		// 31 daily snapshots summing to 76.6 GB-days => avg 2.471 GB, 3 decimals.
-		{name: "averages to 3 decimals", sumBytes: 76_601_000_000, snapDays: 31, want: "2.471", report: true},
-		// Decimals are NOT rounded to whole GB: 1.5 GB over a single day stays 1.500.
-		{name: "no whole-GB rounding", sumBytes: 1_500_000_000, snapDays: 1, want: "1.500", report: true},
-		// Mid-period opt-in: only the days the data existed count toward the average
-		// (denominator is the snapshot-row count, not the period length).
-		{name: "averages over snapshot days only", sumBytes: 6_000_000_000, snapDays: 3, want: "2.000", report: true},
-		// No snapshots (BYO account): report nothing.
-		{name: "zero snapshot days", sumBytes: 0, snapDays: 0, report: false},
-		// Snapshots exist but every byte was purged: report nothing.
-		{name: "zero bytes", sumBytes: 0, snapDays: 5, report: false},
+		{hours: 0, wantCents: 0},
+		{hours: 1, wantCents: 5},
+		{hours: 24, wantCents: 120},   // a recording active in all 24 distinct UTC hours of a day
+		{hours: 744, wantCents: 3720}, // a 31-day month, every hour
 	}
 	for _, c := range cases {
-		got, ok := gbMonthMeterValue(c.sumBytes, c.snapDays)
-		if ok != c.report {
-			t.Fatalf("%s: report=%v, want %v", c.name, ok, c.report)
-		}
-		if ok && got != c.want {
-			t.Fatalf("%s: gbMonthMeterValue=%q, want %q", c.name, got, c.want)
+		if got := c.hours * rateCents; got != c.wantCents {
+			t.Fatalf("%d record-hours x %dc = %dc, want %dc", c.hours, rateCents, got, c.wantCents)
 		}
 	}
 }
 
-// TestGBMonthReportBranch exercises the gb_month report decision the same way
-// meterAccount does (guard -> snapshot-average gate -> ReportGBMonth with the
-// 3-decimal string) so the idempotency-guard + averaged-decimal value is covered
-// end to end against a fake Stripe. The (sumBytes, snapDays) pair stands in for the
-// account's seeded account_storage_snapshots rows over the closing period.
-func TestGBMonthReportBranch(t *testing.T) {
+func TestStreamHourMonthMeterValue(t *testing.T) {
+	cases := []struct {
+		name     string
+		sumHours float64
+		snapDays int
+		want     string
+		report   bool
+	}{
+		// 31 daily snapshots summing to 76.601 stream-hour-days => avg 2.471
+		// stream-hour-months, 3 decimals. NOTE the value is already in hours: there is
+		// NO /1e9 byte->GB conversion (the gb_month-copied bug would 1e-9 the charge).
+		{name: "averages to 3 decimals", sumHours: 76.601, snapDays: 31, want: "2.471", report: true},
+		// A single day storing 1.5 stream-hours stays 1.500 (no rounding to whole hours).
+		{name: "no whole-hour rounding", sumHours: 1.5, snapDays: 1, want: "1.500", report: true},
+		// Mid-period opt-in: only the days the data existed count toward the average
+		// (denominator is the snapshot-row count, not the period length).
+		{name: "averages over snapshot days only", sumHours: 6.0, snapDays: 3, want: "2.000", report: true},
+		// A clip stored a full month (744h) over 31 snapshot days averages 24.000.
+		{name: "month-long clip averages to its hours", sumHours: 744.0, snapDays: 31, want: "24.000", report: true},
+		// No snapshots (BYO account): report nothing.
+		{name: "zero snapshot days", sumHours: 0, snapDays: 0, report: false},
+		// Snapshots exist but every clip was purged: report nothing.
+		{name: "zero hours", sumHours: 0, snapDays: 5, report: false},
+	}
+	for _, c := range cases {
+		got, ok := streamHourMonthMeterValue(c.sumHours, c.snapDays)
+		if ok != c.report {
+			t.Fatalf("%s: report=%v, want %v", c.name, ok, c.report)
+		}
+		if ok && got != c.want {
+			t.Fatalf("%s: streamHourMonthMeterValue=%q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestStreamHourMonthReportBranch exercises the stream_hour_month report decision the
+// same way meterAccount does (guard -> snapshot-average gate -> ReportStreamHourMonth
+// with the 3-decimal string) so the idempotency-guard + averaged-decimal value is
+// covered end to end against a fake Stripe. The (sumHours, snapDays) pair stands in
+// for the account's seeded account_storage_snapshots rows over the closing period.
+func TestStreamHourMonthReportBranch(t *testing.T) {
 	ctx := context.Background()
 	periodEnd := dateUTC(2026, 8, 1)
-	report := func(a meterableAccount, sumBytes int64, snapDays int) []gbReportCall {
+	report := func(a meterableAccount, sumHours float64, snapDays int) []shmReportCall {
 		f := &fakeMeteringStripe{periodStart: dateUTC(2026, 7, 1), periodEnd: periodEnd}
 		if periodAlreadyMetered(f.periodEnd, a.lastMeteredPeriodEnd) {
 			return nil // guard skip: never reports
 		}
-		if gbDecimal, ok := gbMonthMeterValue(sumBytes, snapDays); ok {
-			_ = f.ReportGBMonth(ctx, a.customerID, a.accountID, meterPeriodKey(f.periodEnd), gbDecimal)
+		if hoursDecimal, ok := streamHourMonthMeterValue(sumHours, snapDays); ok {
+			_ = f.ReportStreamHourMonth(ctx, a.customerID, a.accountID, meterPeriodKey(f.periodEnd), hoursDecimal)
 		}
-		return f.gbReports
+		return f.shmReports
 	}
 
 	// Fresh account, 31 snapshots => one report with the averaged decimal string.
-	got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 76_601_000_000, 31)
-	if len(got) != 1 || got[0] != (gbReportCall{"cus_x", 42, "2026-08-01", "2.471"}) {
-		t.Fatalf("fresh gb report = %+v, want one {cus_x,42,2026-08-01,2.471}", got)
+	got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 76.601, 31)
+	if len(got) != 1 || got[0] != (shmReportCall{"cus_x", 42, "2026-08-01", "2.471"}) {
+		t.Fatalf("fresh stream-hour-month report = %+v, want one {cus_x,42,2026-08-01,2.471}", got)
 	}
 
-	// No managed bytes (BYO / fully purged): no report.
+	// No managed footage (BYO / fully purged): no report.
 	if got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 0, 0); len(got) != 0 {
-		t.Fatalf("zero-gb report = %+v, want none", got)
+		t.Fatalf("zero report = %+v, want none", got)
 	}
 
 	// Already metered this period (cursor == period end): guard skips before report,
-	// so a re-run is a no-op for the gb_month meter too (idempotency).
+	// so a re-run is a no-op for the stream_hour_month meter too (idempotency).
 	last := periodEnd
-	if got := report(meterableAccount{accountID: 42, customerID: "cus_x", lastMeteredPeriodEnd: &last}, 76_601_000_000, 31); len(got) != 0 {
-		t.Fatalf("already-metered gb report = %+v, want none (idempotent skip)", got)
+	if got := report(meterableAccount{accountID: 42, customerID: "cus_x", lastMeteredPeriodEnd: &last}, 76.601, 31); len(got) != 0 {
+		t.Fatalf("already-metered report = %+v, want none (idempotent skip)", got)
 	}
 }

@@ -36,6 +36,46 @@ func TestDecide_ScaleUpAheadOfImminentDemand(t *testing.T) {
 	}
 }
 
+// TestDecide_Min0ProvisionsAheadFromCold is the explicit MIN=0 contract guard for
+// render.yaml's DROPLET_POOL_MIN 1 -> 0 flip. With the pool fully drained (Live=0,
+// Min=0) and a fire just inside the provision lead, Decide must provision a droplet
+// ahead so a cold pool never misses the fire. A droplet started at the lead boundary
+// is worker-ready (~cold-start later, well under the 10min lead) before the fire.
+func TestDecide_Min0ProvisionsAheadFromCold(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+	p := baseDecisionParams(now)
+	if p.Min != 0 {
+		t.Fatalf("baseDecisionParams must model Min=0 (the render.yaml flip), got Min=%d", p.Min)
+	}
+	p.Live = 0
+	// A fire 9m out, just inside the 10m provision lead, from a cold (drained) pool.
+	p.Forecast = Forecast{PeakConcurrent: 1, NextFireAt: now.Add(9 * time.Minute)}
+	d := Decide(p)
+	if d.ScaleUpCount < 1 {
+		t.Fatalf("MIN=0 cold pool must provision ahead of an imminent fire, got %+v", d)
+	}
+	if d.DrainCount != 0 {
+		t.Fatalf("must not drain while provisioning ahead, got %+v", d)
+	}
+}
+
+// TestDecide_Min0DrainsToZero is the other half of the MIN=0 contract: with no
+// near-term demand the pool drains its LAST droplet to 0 (not held at a warm floor
+// of 1), which is the whole point of MIN=0. Mirrors the hysteresis drain test but
+// asserts the drain reaches zero from Live=1, Min=0.
+func TestDecide_Min0DrainsToZero(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+	p := baseDecisionParams(now)
+	p.Live = 1
+	p.IdleEligible = 1
+	// No demand anywhere in the horizon -> required 0, hysteresis holds, no fire.
+	p.Forecast = Forecast{PeakConcurrent: 0}
+	d := Decide(p)
+	if d.DrainCount != 1 {
+		t.Fatalf("MIN=0 with no demand must drain the last droplet to zero, got %+v", d)
+	}
+}
+
 func TestDecide_ScaleUpBatchesTheWholeGap(t *testing.T) {
 	now := mustTime(t, "2026-06-24T12:00:00Z")
 	p := baseDecisionParams(now)

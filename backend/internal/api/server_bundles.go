@@ -508,8 +508,8 @@ func bundleMemberRecordingName(bundleName, streamName string, streamID int64) st
 }
 
 // handleAccountBundlesList returns the caller's bundles with a schedule summary,
-// live member count (members not individually canceled), and record-day count +
-// cost-to-date aggregated from recording_billing_days across all members. The
+// live member count (members not individually canceled), and record-hour count +
+// cost-to-date aggregated from recording_billing_hours across all members. The
 // bundle's own status is the aggregate status. Newest first.
 func (s *Server) handleAccountBundlesList(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
@@ -522,9 +522,9 @@ func (s *Server) handleAccountBundlesList(w http.ResponseWriter, r *http.Request
 			b.id, b.name, COALESCE(b.cron_expr,''), b.cron_timezone, b.clip_duration_sec, b.target_fps,
 			b.start_at, b.end_at, b.status, b.created_at,
 			(SELECT count(*) FROM recordings rec WHERE rec.bundle_id=b.id AND rec.status <> 'canceled') AS member_count,
-			(SELECT count(*) FROM recording_billing_days d
+			(SELECT count(*) FROM recording_billing_hours d
 			   JOIN recordings rec ON rec.id = d.recording_id
-			   WHERE rec.bundle_id = b.id) AS record_days,
+			   WHERE rec.bundle_id = b.id) AS record_hours,
 			b.mode, COALESCE(to_char(b.daily_window_start,'HH24:MI'),''), COALESCE(to_char(b.daily_window_end,'HH24:MI'),'')
 		FROM recording_bundles b
 		WHERE b.account_id=$1 AND b.status <> 'canceled'
@@ -551,9 +551,9 @@ func (s *Server) handleAccountBundlesList(w http.ResponseWriter, r *http.Request
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
-// recordDayCost is the per-record-day rate in USD cents, mirroring the existing
-// usage-billing rate ($0.50/record-day). Cost-to-date = record_days * this.
-const recordDayCostCents = 50
+// recordHourCostCents is the per-record-hour rate in USD cents, mirroring the
+// existing usage-billing rate ($0.05/record-hour). Cost-to-date = record_hours * this.
+const recordHourCostCents = 5
 
 func scanBundleListRow(row pgx.Row) (map[string]any, error) {
 	var (
@@ -568,14 +568,14 @@ func scanBundleListRow(row pgx.Row) (map[string]any, error) {
 		status          string
 		createdAt       time.Time
 		memberCount     int64
-		recordDays      int64
+		recordHours     int64
 		mode            string
 		dwStart         string
 		dwEnd           string
 	)
 	if err := row.Scan(
 		&id, &name, &cronExpr, &cronTimezone, &clipDurationSec, &targetFPS,
-		&startAt, &endAt, &status, &createdAt, &memberCount, &recordDays,
+		&startAt, &endAt, &status, &createdAt, &memberCount, &recordHours,
 		&mode, &dwStart, &dwEnd,
 	); err != nil {
 		return nil, err
@@ -595,8 +595,8 @@ func scanBundleListRow(row pgx.Row) (map[string]any, error) {
 		"status":             status,
 		"created_at":         createdAt.UTC(),
 		"member_count":       memberCount,
-		"record_days":        recordDays,
-		"cost_cents":         recordDays * recordDayCostCents,
+		"record_hours":       recordHours,
+		"cost_cents":         recordHours * recordHourCostCents,
 	}, nil
 }
 

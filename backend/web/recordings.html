@@ -295,13 +295,13 @@
           <div><div class="eyebrow">Card needed</div><h2>Add a card before your first recording</h2></div>
           <button id="cardBannerBtn" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Add a card</button>
         </div>
-        <p class="muted" style="margin:0;">Adding a card does not charge you. Charges are $0.50 for each day a recording captures at least one clip.</p>
+        <p class="muted" style="margin:0;">Adding a card does not charge you. Charges are $0.05 for each hour a recording captures at least one clip.</p>
       </div>
 
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
       <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
         <h1>Record any public stream to your own storage.</h1>
-        <p class="empty-hero-sub">Set up a recording of any public HLS or HTTPS stream and choose how often it captures a clip. Each clip is saved to your own S3-compatible bucket, or to storage we manage for you. You can browse, download, or delete your clips anytime, and send any clip to your S3. Pricing is $0.50 for each day a recording captures at least one clip. You are never charged for a day nothing was recorded.</p>
+        <p class="empty-hero-sub">Set up a recording of any public HLS or HTTPS stream and choose how often it captures a clip. Each clip is saved to your own S3-compatible bucket, or to storage we manage for you. You can browse, download, or delete your clips anytime, and send any clip to your S3. Pricing is $0.05 for each hour a recording captures at least one clip. You are never charged for an hour nothing was recorded.</p>
       </div>
 
       <!-- Recording cards -->
@@ -500,7 +500,7 @@
           <!-- Storage chooser: managed (operator R2) vs BYO. Shown only when the
                managed option is available per GET /billing; otherwise BYO only. -->
           <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
-            <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10/GB-month)</button>
+            <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10/stream-hour-month)</button>
             <button type="button" data-storage="byo">Connect your own S3 bucket</button>
             <button type="button" data-storage="shared" class="hidden" id="sharedStorageBtn">Shared destination</button>
           </div>
@@ -678,11 +678,6 @@
     // clip must be strictly shorter than the gap). Pre-flight only; server is truth.
     const MIN_GAP_SEC = 600;
 
-    // Assumed average video bitrate for the clip-size estimate (720p HLS ~2.5 Mbps).
-    // Shown in the UI so the projection reads as an estimate, not a quote. Real
-    // billing uses recording_clips.size_bytes; this only powers the live preview.
-    const EST_BITRATE_MBPS = 2.5;
-
     // Provider presets. Endpoint/region are auto-filled where the host is fixed;
     // R2 and "Other" leave the endpoint editable because the host is account-specific.
     const PROVIDERS = [
@@ -719,7 +714,7 @@
       billingEnabled: true,
       // Latest GET /billing payload (usage model): has_payment_method gates Start
       // and the read-only arrears estimate.
-      billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_days_this_month: 0, estimated_amount_cents: 0, managed_available: false, storage_gb_month_avg: '0.000', estimated_storage_amount_cents: 0 },
+      billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_hours_this_month: 0, estimated_amount_cents: 0, managed_available: false, storage_stream_hour_month_avg: '0.000', estimated_storage_amount_cents: 0 },
       recordings: [],
       destinations: [],
       schedPreset: 'hourly',
@@ -980,14 +975,15 @@
       }
     }
 
-    // Billable record-days for a representative FULL month at the chosen cadence:
-    // the number of distinct days, in a rolling 30-day window starting today (or at
-    // the recording's start, whichever is later), on which the schedule fires at
-    // least once. A daily or sub-daily cadence fires every day (~30 days/mo); a
-    // weekly cadence fires on ~4 days. Capped by the recording's own start->stop
-    // span when that span is shorter than the 30-day window, so a short recording is
-    // not over-forecast. This forecasts the cadence, not the remaining days of the
-    // current partial calendar month.
+    // Active days for a representative FULL month at the chosen cadence: the number
+    // of distinct days, in a rolling 30-day window starting today (or at the
+    // recording's start, whichever is later), on which the schedule fires at least
+    // once. A daily or sub-daily cadence fires every day (~30 days/mo); a weekly
+    // cadence fires on ~4 days. Capped by the recording's own start->stop span when
+    // that span is shorter than the 30-day window, so a short recording is not
+    // over-forecast. estimateModel multiplies this by the distinct record-HOURS per
+    // active day to get billable record-hours. This forecasts the cadence, not the
+    // remaining days of the current partial calendar month.
     function estActiveDaysThisMonth() {
       const now = new Date();
       const w = compiledWindow();                       // existing helper
@@ -1071,39 +1067,46 @@
 
     // Returns the cost-estimate model for the current composer config, or null
     // when the schedule cadence is unknown (custom) so callers can show fallback
-    // copy. Rates come from /billing when present, else the published 50c/10c.
+    // copy. Rates come from /billing when present, else the published 5c/10c.
     function estimateModel() {
       const b = state.billing || {};
-      const dayRate = Number(b.recording_day_rate_cents || 50);
-      const gbRate = Number(b.gb_month_rate_cents || 10);
+      const hourRate = Number(b.recording_hour_rate_cents || 5);
+      const shmRate = Number(b.stream_hour_month_rate_cents || 10);
       const runsPerDay = estRunsPerDay();
       const clipSec = selectedClipSec();                // existing, lines 713-719
       const activeDays = estActiveDaysThisMonth();
       if (runsPerDay === null || clipSec <= 0) return null;
 
-      const recordDayCents = activeDays * dayRate;
+      // Billable record-HOURS: a recording bills each distinct UTC hour it captures a
+      // clip in. A schedule firing N times/day lands in at most min(N, 24) distinct
+      // hours per active day (sub-hourly cadences fill all 24; hourly = 24; every 4h =
+      // 6; daily = 1). Monthly record-hours ~= activeDays * distinct hours/day.
+      const hoursPerActiveDay = Math.min(runsPerDay, 24);
+      const recordHours = activeDays * hoursPerActiveDay;
+      const recordHourCents = recordHours * hourRate;
 
-      // Clip bytes ~= bitrate(bits/s) * seconds / 8. Bytes per active day, total
-      // bytes this month, average GB held ~= half of the month's total.
-      const clipBytes = (EST_BITRATE_MBPS * 1e6 * clipSec) / 8;
-      const bytesPerDay = clipBytes * runsPerDay;
-      const monthTotalBytes = bytesPerDay * activeDays;
+      // Managed storage as stream-hour-months: the period average of stored
+      // stream-hours. A clip of clipSec contributes clipSec/3600 stream-hours while
+      // kept. Stored stream-hours per active day ~= runsPerDay * clipSec/3600; the
+      // period average of stored footage ~= half the month's accumulated total.
+      const streamHrsPerDay = runsPerDay * (clipSec / 3600);
+      const monthTotalStreamHrs = streamHrsPerDay * activeDays;
       const managed = state.storageChoice === 'managed';
-      const avgGB = managed ? (monthTotalBytes / 2) / 1e9 : 0;
-      const storageCents = Math.round(avgGB * gbRate);
+      const avgStreamHrMo = managed ? (monthTotalStreamHrs / 2) : 0;
+      const storageCents = Math.round(avgStreamHrMo * shmRate);
 
       return {
-        activeDays, runsPerDay, clipSec, dayRate, gbRate, managed,
-        recordDayCents, avgGB, storageCents,
-        totalCents: recordDayCents + storageCents,
+        activeDays, runsPerDay, clipSec, hourRate, shmRate, managed,
+        recordHours, recordHourCents, avgStreamHrMo, storageCents,
+        totalCents: recordHourCents + storageCents,
       };
     }
 
     function renderCostEstimate() {
       if (!state.billingEnabled) { els.costEstimate.textContent = ''; els.costEstimateNote.textContent = ''; return; }
       if (state.composerScheduleMode === 'continuous') {
-        els.costEstimate.innerHTML = '<span class="muted">Continuous records every day the window is active; storage scales with total footage.</span>';
-        els.costEstimateNote.textContent = 'Billed per recording-day plus managed storage per GB-month, monthly in arrears. Pricing is unchanged from sampled.';
+        els.costEstimate.innerHTML = '<span class="muted">Continuous records every hour the window is active; storage scales with total footage.</span>';
+        els.costEstimateNote.textContent = 'Billed per recording-hour plus managed storage per stream-hour-month, monthly in arrears. Pricing is unchanged from sampled.';
         return;
       }
       const m = estimateModel();
@@ -1116,14 +1119,14 @@
       const usd = (c) => usdCents(c);
       const parts = [
         `<span class="muted">~</span><b>${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
-        `<span class="muted"> &middot; ${m.activeDays} recording-day${m.activeDays === 1 ? '' : 's'} × $${(m.dayRate / 100).toFixed(2)} = ${usd(m.recordDayCents)}</span>`,
+        `<span class="muted"> &middot; ${m.recordHours} recording-hour${m.recordHours === 1 ? '' : 's'} × $${(m.hourRate / 100).toFixed(2)} = ${usd(m.recordHourCents)}</span>`,
       ];
-      if (m.managed && m.avgGB > 0) {
-        parts.push(`<span class="muted"> + ~${m.avgGB.toFixed(3)} GB-mo × $${(m.gbRate / 100).toFixed(2)} = ${usdStorage(m.avgGB, m.gbRate, m.storageCents)}</span>`);
+      if (m.managed && m.avgStreamHrMo > 0) {
+        parts.push(`<span class="muted"> + ~${m.avgStreamHrMo.toFixed(3)} stream-hr-mo × $${(m.shmRate / 100).toFixed(2)} = ${usdStorage(m.avgStreamHrMo, m.shmRate, m.storageCents)}</span>`);
       }
       els.costEstimate.innerHTML = parts.join('');
       els.costEstimateNote.textContent = m.managed
-        ? `Estimate only, assuming ~${EST_BITRATE_MBPS} Mbps video; actual clip sizes vary. Storage is $${(m.gbRate / 100).toFixed(2)} per GB per month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that.`
+        ? `Estimate only. Storage is $${(m.shmRate / 100).toFixed(2)} per stream-hour-month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that.`
         : `Estimate only. With your own bucket there is no storage charge.`;
     }
 
@@ -1312,7 +1315,7 @@
         if (md) {
           state.verifiedDestId = Number(md.id || 0);
           els.managedStatus.classList.remove('hidden');
-          setStatus(els.managedStatus, 'Connected to Stoarama-managed storage. Clips are billed $0.10/GB-month.', 'ok');
+          setStatus(els.managedStatus, 'Connected to Stoarama-managed storage. Clips are billed $0.10/stream-hour-month.', 'ok');
           setBucketState('connected');
         } else {
           els.managedStatus.classList.add('hidden');
@@ -1323,7 +1326,7 @@
       }
       if (state.storageChoice === 'shared') {
         // Shared destination: hide the BYO/managed sub-UIs and render the granted
-        // dests. A webdav pick delivers via managed staging (no GB-month fee).
+        // dests. A webdav pick delivers via managed staging (no stream-hour-month fee).
         els.destPicker.classList.add('hidden');
         els.connectForm.classList.add('hidden');
         els.managedStatus.classList.add('hidden');
@@ -1341,7 +1344,7 @@
     // Render the granted shared destinations as a picker, with a reachability /
     // billing note. A webdav destination delivers via managed staging: clips stage
     // in managed storage briefly, then transfer to the destination and the staging
-    // copy is removed, so no managed GB-month fee applies (only $0.50/record-day).
+    // copy is removed, so no managed stream-hour-month fee applies (only $0.05/record-hour).
     function renderSharedStorageUI() {
       const shared = sharedDests();
       if (shared.length === 0) {
@@ -1357,7 +1360,7 @@
       els.sharedPicker.classList.remove('hidden');
       const sel = selectedSharedDest();
       if (sel && sel.provider === 'webdav') {
-        els.sharedDestNote.textContent = 'Delivered to a shared destination (WebDAV/NAS). Clips stage in managed storage briefly, then transfer and the staging copy is removed. No managed GB-month fee, only the $0.50/record-day charge.';
+        els.sharedDestNote.textContent = 'Delivered to a shared destination (WebDAV/NAS). Clips stage in managed storage briefly, then transfer and the staging copy is removed. No managed stream-hour-month fee, only the $0.05/record-hour charge.';
       } else {
         els.sharedDestNote.textContent = 'Delivered to a shared destination granted to your account.';
       }
@@ -1748,12 +1751,12 @@
       return `$${(c / 100).toFixed(2)}`;
     }
 
-    // Storage cost from a GB-month figure. The server pre-rounds tiny storage
-    // charges to 0 cents, so render a real-but-sub-cent amount (gb > 0) as
+    // Storage cost from a stream-hour-month figure. The server pre-rounds tiny
+    // storage charges to 0 cents, so render a real-but-sub-cent amount (units > 0) as
     // "<$0.01" rather than the broken-looking "$0.00".
-    function usdStorage(gb, rateCents, roundedCents) {
+    function usdStorage(units, rateCents, roundedCents) {
       const c = Number(roundedCents || 0);
-      if (c === 0 && Number(gb || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
+      if (c === 0 && Number(units || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
       return usdCents(c);
     }
 
@@ -1761,17 +1764,17 @@
       const b = state.billing || {};
       if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
       const lines = [];
-      const days = Number(b.recording_days_this_month || 0);
-      if (days >= 1) {
-        const noun = days === 1 ? 'recording-day' : 'recording-days';
-        lines.push(`<span><b>${days} ${noun} this month</b> &middot; est. ${usdCents(b.estimated_amount_cents)}</span>`);
+      const hours = Number(b.recording_hours_this_month || 0);
+      if (hours >= 1) {
+        const noun = hours === 1 ? 'recording-hour' : 'recording-hours';
+        lines.push(`<span><b>${hours} ${noun} this month</b> &middot; est. ${usdCents(b.estimated_amount_cents)}</span>`);
       }
-      // Managed storage line: month-to-date average GB-month from /billing. Hidden
-      // when the account has no managed data (avg = 0).
-      const gb = Number(b.storage_gb_month_avg || 0);
-      if (gb > 0) {
-        const gbRate = Number(b.gb_month_rate_cents || 10);
-        lines.push(`<span><b>${gb.toFixed(3)} GB-month storage</b> &middot; est. ${usdStorage(gb, gbRate, b.estimated_storage_amount_cents)}</span>`);
+      // Managed storage line: month-to-date average stream-hour-month from /billing.
+      // Hidden when the account has no managed data (avg = 0).
+      const shm = Number(b.storage_stream_hour_month_avg || 0);
+      if (shm > 0) {
+        const shmRate = Number(b.stream_hour_month_rate_cents || 10);
+        lines.push(`<span><b>${shm.toFixed(3)} stream-hour-month storage</b> &middot; est. ${usdStorage(shm, shmRate, b.estimated_storage_amount_cents)}</span>`);
       }
       if (lines.length === 0) { els.ledger.classList.add('hidden'); return; }
       els.ledger.innerHTML = lines.join('<span class="meta-sep">&middot;</span>');
@@ -2827,14 +2830,14 @@
       const needsCard = state.billingEnabled && state.billing.has_payment_method !== true;
       const managed = state.storageChoice === 'managed';
       els.startBtn.textContent = needsCard ? 'Add a card to start recording' : 'Start recording';
-      const daysCharge = '$0.50 for each day a recording captures at least one clip';
-      const storageCharge = ', plus $0.10/GB-month for managed storage';
+      const hoursCharge = '$0.05 for each hour a recording captures at least one clip';
+      const storageCharge = ', plus $0.10/stream-hour-month for managed storage';
       els.composerFootnote.textContent = state.billingEnabled
         ? (needsCard
-            ? `Nothing will be captured until you add a card. No charge now; charges are ${daysCharge}${managed ? storageCharge : ''}.`
+            ? `Nothing will be captured until you add a card. No charge now; charges are ${hoursCharge}${managed ? storageCharge : ''}.`
             : (managed
-                ? '$0.50/day for days you record, plus $0.10/GB-month for managed storage.'
-                : '$0.50/day for days you record.'))
+                ? '$0.05/hour for hours you record, plus $0.10/stream-hour-month for managed storage.'
+                : '$0.05/hour for hours you record.'))
         : '';
       els.composerFootnote.classList.toggle('warn', state.billingEnabled && needsCard);
       els.composerFootnote.classList.toggle('hidden', !state.billingEnabled);
@@ -2905,7 +2908,7 @@
     }
 
     // Pull the usage-model billing snapshot (billing_enabled, has_customer,
-    // has_payment_method, recording_days_this_month, estimated_amount_cents) and
+    // has_payment_method, recording_hours_this_month, estimated_amount_cents) and
     // refresh the ledger + card-needed banner + Start label off it.
     async function loadBilling() {
       try {
@@ -3260,12 +3263,12 @@
           <td class="num">${Number(b.member_count || 0)}</td>
           <td>${scheduleSummary(b)}</td>
           <td>${escapeHTML(String(b.status || ''))}</td>
-          <td class="num">${Number(b.record_days || 0)}</td>
+          <td class="num">${Number(b.record_hours || 0)}</td>
           <td class="num">$${cost}</td>
         </tr>`;
       }).join('');
       const table = `<table class="clip-table"><thead><tr>
-        <th>Name</th><th class="num">Streams</th><th>Schedule</th><th>Status</th><th class="num">Record-days</th><th class="num">Cost</th>
+        <th>Name</th><th class="num">Streams</th><th>Schedule</th><th>Status</th><th class="num">Record-hours</th><th class="num">Cost</th>
       </tr></thead><tbody>${rows}</tbody></table>`;
       els.bundleList.innerHTML = header + table;
       els.bundleList.querySelectorAll('a[data-bundlelink]').forEach((a) =>

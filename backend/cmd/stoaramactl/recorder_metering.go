@@ -18,11 +18,11 @@ const meteringTickInterval = time.Hour
 // meteringStripe is the thin seam over the Stripe client that the metering job
 // needs: read a subscription's current period bounds and push one meter event. The
 // production path passes the real *billing.Client; unit tests pass a fake so the
-// day-count + idempotency-guard MATH is exercised without Stripe.
+// hour-count + idempotency-guard MATH is exercised without Stripe.
 type meteringStripe interface {
 	GetSubscriptionPeriod(ctx context.Context, subID string) (start, end time.Time, err error)
-	ReportRecordingDays(ctx context.Context, customerID string, accountID int64, periodKey string, days int) error
-	ReportGBMonth(ctx context.Context, customerID string, accountID int64, periodKey, gbDecimal string) error
+	ReportRecordingHours(ctx context.Context, customerID string, accountID int64, periodKey string, hours int) error
+	ReportStreamHourMonth(ctx context.Context, customerID string, accountID int64, periodKey, hoursDecimal string) error
 }
 
 // meterableAccount is one account the metering job may bill: it has a Stripe
@@ -36,7 +36,7 @@ type meterableAccount struct {
 
 // runRecordingMetering is the nightly usage-reporting loop. It is the ONLY place
 // that charges: for each account whose Stripe billing period has advanced past the
-// last metered one, it counts that period's billable recording-days and pushes a
+// last metered one, it counts that period's billable recording-hours and pushes a
 // single idempotent meter event. It runs under runWithBackoff alongside the
 // scheduler, gated on billingEnabled. It acts at most once per UTC day.
 func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe) error {
@@ -49,8 +49,9 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 		if today == lastRunDay {
 			return
 		}
-		// Snapshot first: record today's managed-storage byte total per account so
-		// the gb_month period-average (computed in meterAccount) includes today.
+		// Snapshot first: record today's managed-storage byte + stream-hour totals per
+		// account so the stream_hour_month period-average (computed in meterAccount)
+		// includes today.
 		if err := snapshotManagedStorage(ctx, pool); err != nil {
 			if ctx.Err() != nil {
 				return
@@ -123,21 +124,21 @@ func meterAllAccounts(ctx context.Context, pool *pgxpool.Pool, reporter metering
 //
 //   - periodAlreadyMetered: skip a period (or a later one) already on the cursor.
 //   - periodReadyToMeter: skip a period whose end UTC date has NOT yet arrived. The
-//     billable-day count (rec_day < end-date) only becomes COMPLETE at 00:00 UTC of
+//     billable-hour count (rec_hour < end) only becomes COMPLETE at 00:00 UTC of
 //     the period-end day, and a metered subscription bills usage in arrears by
 //     summing the meter events whose timestamp falls inside the closing period: an
 //     event reported BEFORE the period-end instant lands on that period's invoice,
 //     one reported after the period closes does not (it rolls to the next period).
 //     So the only correct moment to report is on the period-end UTC day, before the
-//     close instant, with the now-final day count. Crucially we therefore NEVER
+//     close instant, with the now-final hour count. Crucially we therefore NEVER
 //     advance the cursor to a still-open period's end (the cursor-jump bug that
 //     silently $0-billed real usage): a future-dated period end is left untouched
 //     until its day arrives.
 //
 // On a non-empty period it pushes one meter event keyed by the period-end date, so
-// a same-day re-run is a Stripe-dedup no-op; it then advances the cursor. A zero-day
-// period reports nothing (Stripe suppresses the empty invoice) but the cursor still
-// advances so the closed empty period is not re-examined.
+// a same-day re-run is a Stripe-dedup no-op; it then advances the cursor. A
+// zero-hour period reports nothing (Stripe suppresses the empty invoice) but the
+// cursor still advances so the closed empty period is not re-examined.
 func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, a meterableAccount, now time.Time) error {
 	start, end, err := reporter.GetSubscriptionPeriod(ctx, a.subscriptionID)
 	if err != nil {
@@ -153,40 +154,41 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 		return nil // period still open and its day count not yet final; do not advance.
 	}
 
-	var days int
+	var hours int
 	if err := pool.QueryRow(ctx, `
-		SELECT count(*) FROM recording_billing_days
+		SELECT count(*) FROM recording_billing_hours
 		WHERE account_id=$1
-		  AND rec_day >= $2::date
-		  AND rec_day <  $3::date
-	`, a.accountID, start, end).Scan(&days); err != nil {
-		return fmt.Errorf("count recording days: %w", err)
+		  AND rec_hour >= $2
+		  AND rec_hour <  $3
+	`, a.accountID, start, end).Scan(&hours); err != nil {
+		return fmt.Errorf("count recording hours: %w", err)
 	}
 
-	// A zero-day period reports nothing (Stripe suppresses the empty invoice) but
+	// A zero-hour period reports nothing (Stripe suppresses the empty invoice) but
 	// the cursor still advances so the empty period is not re-examined.
-	if shouldReportDays(days) {
-		if err := reporter.ReportRecordingDays(ctx, a.customerID, a.accountID, meterPeriodKey(end), days); err != nil {
-			return fmt.Errorf("report recording days: %w", err)
+	if shouldReportHours(hours) {
+		if err := reporter.ReportRecordingHours(ctx, a.customerID, a.accountID, meterPeriodKey(end), hours); err != nil {
+			return fmt.Errorf("report recording hours: %w", err)
 		}
 	}
 
-	// gb_month: average GB of managed storage across the same closing period, from
-	// the daily snapshots in [start, end). BYO / zero-GB accounts have no snapshots
-	// and report nothing (mirrors the zero-day suppression). Reported BEFORE the
-	// cursor advance so a re-run is a no-op for both meters.
-	var sumBytes int64
+	// stream_hour_month: average stored stream-hours of managed footage across the
+	// same closing period, from the daily snapshots in [start, end). BYO / zero-hour
+	// accounts have no snapshots and report nothing (mirrors the zero-hour
+	// suppression). Reported BEFORE the cursor advance so a re-run is a no-op for both
+	// meters.
+	var sumHours float64
 	var snapDays int
 	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(bytes_stored), 0), COUNT(*)
+		SELECT COALESCE(SUM(stream_hours_stored), 0), COUNT(*)
 		FROM account_storage_snapshots
 		WHERE account_id=$1 AND snapshot_date >= $2::date AND snapshot_date < $3::date
-	`, a.accountID, start, end).Scan(&sumBytes, &snapDays); err != nil {
+	`, a.accountID, start, end).Scan(&sumHours, &snapDays); err != nil {
 		return fmt.Errorf("read storage snapshots: %w", err)
 	}
-	if gbDecimal, ok := gbMonthMeterValue(sumBytes, snapDays); ok {
-		if err := reporter.ReportGBMonth(ctx, a.customerID, a.accountID, meterPeriodKey(end), gbDecimal); err != nil {
-			return fmt.Errorf("report gb-month: %w", err)
+	if hoursDecimal, ok := streamHourMonthMeterValue(sumHours, snapDays); ok {
+		if err := reporter.ReportStreamHourMonth(ctx, a.customerID, a.accountID, meterPeriodKey(end), hoursDecimal); err != nil {
+			return fmt.Errorf("report stream-hour-month: %w", err)
 		}
 	}
 
@@ -199,44 +201,51 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 	return nil
 }
 
-// snapshotManagedStorage records today's managed-storage byte total per account:
-// SUM(recording_clips.size_bytes) over each managed account's non-purged clips,
-// keyed (account_id, CURRENT_DATE). Idempotent within a day via ON CONFLICT
-// (a same-day re-run overwrites). Only managed accounts get rows, so BYO accounts
-// never accrue snapshots and never report gb_month. Purged clips are excluded, so
-// once the purge job sets purged_at the bytes drop out of the next snapshot and
-// stop billing.
+// snapshotManagedStorage records today's managed-storage totals per account: the
+// byte total SUM(recording_clips.size_bytes) AND the stored stream-hours
+// SUM(clip_end_at - clip_start_at in hours), both over each managed account's
+// non-purged clips, keyed (account_id, CURRENT_DATE). Idempotent within a day via
+// ON CONFLICT (a same-day re-run overwrites both columns). Only managed accounts get
+// rows, so BYO accounts never accrue snapshots and never report stream_hour_month.
+// Purged clips are excluded, so once the purge job sets purged_at the clip drops out
+// of the next snapshot and stops billing. Clip duration uses the wall-clock span
+// (clip_end_at - clip_start_at), not duration_ms (unreliable / 0 on many rows).
 func snapshotManagedStorage(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored)
-		SELECT r.account_id, CURRENT_DATE, COALESCE(SUM(c.size_bytes), 0)
+		INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored, stream_hours_stored)
+		SELECT r.account_id, CURRENT_DATE,
+		       COALESCE(SUM(c.size_bytes), 0),
+		       COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0)
 		FROM recording_clips c
 		JOIN recordings r            ON r.id = c.recording_id
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
 		WHERE sd.managed AND c.purged_at IS NULL
 		GROUP BY r.account_id
 		ON CONFLICT (account_id, snapshot_date)
-		DO UPDATE SET bytes_stored = EXCLUDED.bytes_stored
+		DO UPDATE SET bytes_stored = EXCLUDED.bytes_stored,
+		              stream_hours_stored = EXCLUDED.stream_hours_stored
 	`); err != nil {
 		return fmt.Errorf("snapshot managed storage: %w", err)
 	}
 	return nil
 }
 
-// gbMonthMeterValue computes the gb_month meter value from a period's snapshot
-// rows: the average GB stored = SUM(bytes_stored) / numSnapshotDays / 1e9,
-// formatted to 3 decimals as a decimal string (the v1 Meter Events API accepts a
-// decimal value; the price is $0.10 per 1 GB unit so the value IS the billable GB,
-// no rounding to whole GB). It reports (value, true) only when there is at least
-// one snapshot day AND non-zero bytes; otherwise (",", false) so the caller sends
-// nothing (matching the zero-day suppression). The denominator is the snapshot-row
-// count, so a mid-period opt-in averages only over the days the data existed.
-func gbMonthMeterValue(sumBytes int64, snapDays int) (string, bool) {
-	if snapDays <= 0 || sumBytes <= 0 {
+// streamHourMonthMeterValue computes the stream_hour_month meter value from a
+// period's snapshot rows: the time-average of stored stream-hours =
+// SUM(stream_hours_stored) / numSnapshotDays, formatted to 3 decimals as a decimal
+// string (the v1 Meter Events API accepts a decimal value; the price is $0.10 per 1
+// stream-hour-month unit so the value IS the billable stream-hour-months). The
+// values are ALREADY in hours, so there is NO /1e9 byte->GB conversion here. It
+// reports (value, true) only when there is at least one snapshot day AND non-zero
+// stored hours; otherwise ("", false) so the caller sends nothing (matching the
+// zero-hour suppression). The denominator is the snapshot-row count, so a mid-period
+// opt-in averages only over the days the data existed.
+func streamHourMonthMeterValue(sumHours float64, snapDays int) (string, bool) {
+	if snapDays <= 0 || sumHours <= 0 {
 		return "", false
 	}
-	avgGB := float64(sumBytes) / float64(snapDays) / 1e9
-	return strconv.FormatFloat(avgGB, 'f', 3, 64), true
+	avgHours := sumHours / float64(snapDays)
+	return strconv.FormatFloat(avgHours, 'f', 3, 64), true
 }
 
 // periodAlreadyMetered is the idempotency guard: a period is skipped when its end
@@ -263,9 +272,9 @@ func periodReadyToMeter(periodEnd, now time.Time) bool {
 	return !dateOnlyUTC(periodEnd).After(dateOnlyUTC(now))
 }
 
-// shouldReportDays gates the meter event on a non-empty period: zero billable
-// recording-days push nothing (Stripe suppresses the empty invoice).
-func shouldReportDays(days int) bool { return days > 0 }
+// shouldReportHours gates the meter event on a non-empty period: zero billable
+// recording-hours push nothing (Stripe suppresses the empty invoice).
+func shouldReportHours(hours int) bool { return hours > 0 }
 
 // meterPeriodKey is the per-period component of the meter-event identifier
 // ("<accountID>-<periodKey>" is built inside the Stripe client). It is the

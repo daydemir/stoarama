@@ -75,7 +75,7 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 		log.Printf("recorder-control: DROPLET_POOL_ENABLED is false; autoscaler not started.")
 	}
 
-	// Monthly usage metering: the only place recording-days are reported to Stripe.
+	// Monthly usage metering: the only place recording-hours are reported to Stripe.
 	// Gated on billingEnabled (same secret+webhook+price gate as capture), so free
 	// mode never charges. Runs under the same restart-with-backoff loop.
 	if billingEnabled {

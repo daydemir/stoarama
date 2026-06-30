@@ -22,18 +22,19 @@ import (
 // are far smaller than this.
 const stripeWebhookMaxBody = 64 * 1024
 
-// recordingDayRateCents is the per-recording-day usage price (50 cents); the live
-// UI estimate is days * this. The authoritative charge is Stripe's meter sum.
-const recordingDayRateCents = 50
+// recordingHourRateCents is the per-recording-hour usage price (5 cents); the live
+// UI estimate is hours * this. The authoritative charge is Stripe's meter sum.
+const recordingHourRateCents = 5
 
-// gbMonthRateCents is the managed-storage price (10 cents per GB-month); the live
-// UI estimate is avg_gb * this. The authoritative charge is Stripe's gb_month meter.
-const gbMonthRateCents = 10
+// streamHourMonthRateCents is the managed-storage price (10 cents per
+// stream-hour-month); the live UI estimate is avg_stream_hours * this. The
+// authoritative charge is Stripe's stream_hour_month meter.
+const streamHourMonthRateCents = 10
 
 // handleAccountBillingMe returns the account's usage-billing summary: whether a
 // card is on file plus a live (DB-derived, never Stripe) estimate of this
-// calendar month's recording-days and dollar amount. Stripe meter aggregation is
-// async, so the UI estimate always reads our own recording_billing_days view.
+// calendar month's recording-hours and dollar amount. Stripe meter aggregation is
+// async, so the UI estimate always reads our own recording_billing_hours view.
 func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -55,32 +56,32 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Live month-to-date estimate from our own ledger (never Stripe summaries).
-	var days int
+	var hours int
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT count(*) FROM recording_billing_days
-		WHERE account_id=$1 AND rec_day >= date_trunc('month', now() AT TIME ZONE 'UTC')::date
-	`, principal.AccountID).Scan(&days); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count recording days: %v", err))
+		SELECT count(*) FROM recording_billing_hours
+		WHERE account_id=$1 AND rec_hour >= date_trunc('month', now() AT TIME ZONE 'UTC')
+	`, principal.AccountID).Scan(&hours); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count recording hours: %v", err))
 		return
 	}
 
-	// Month-to-date average GB of managed storage, from our own daily snapshots.
-	// avg_gb = SUM(bytes_stored)/count(snapshot days)/1e9 across the current UTC
-	// month; 0 when there are no snapshots. Mirrors the period-average the
-	// gb_month meter reports at period close.
-	var snapBytes int64
+	// Month-to-date average stored stream-hours of managed footage, from our own
+	// daily snapshots. avg = SUM(stream_hours_stored)/count(snapshot days) across the
+	// current UTC month; 0 when there are no snapshots. Mirrors the period-average the
+	// stream_hour_month meter reports at period close.
+	var snapHours float64
 	var snapDays int
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT COALESCE(SUM(bytes_stored),0), COUNT(*)
+		SELECT COALESCE(SUM(stream_hours_stored),0), COUNT(*)
 		FROM account_storage_snapshots
 		WHERE account_id=$1 AND snapshot_date >= date_trunc('month', now() AT TIME ZONE 'UTC')::date
-	`, principal.AccountID).Scan(&snapBytes, &snapDays); err != nil {
+	`, principal.AccountID).Scan(&snapHours, &snapDays); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load storage snapshots: %v", err))
 		return
 	}
-	avgGB := 0.0
+	avgStreamHours := 0.0
 	if snapDays > 0 {
-		avgGB = float64(snapBytes) / float64(snapDays) / 1e9
+		avgStreamHours = snapHours / float64(snapDays)
 	}
 
 	// Best-effort billing-period context for the account view. Null when there is
@@ -113,15 +114,15 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		"billing_enabled":                s.billing != nil,
 		"has_customer":                   customerID != nil && strings.TrimSpace(*customerID) != "",
 		"has_payment_method":             hasPaymentMethod,
-		"recording_days_this_month":      days,
-		"estimated_amount_cents":         days * recordingDayRateCents,
+		"recording_hours_this_month":     hours,
+		"estimated_amount_cents":         hours * recordingHourRateCents,
 		"managed_available":              managedAvailable,
-		"storage_gb_month_avg":           strconv.FormatFloat(avgGB, 'f', 3, 64),
-		"estimated_storage_amount_cents": int64(math.Round(avgGB * float64(gbMonthRateCents))),
+		"storage_stream_hour_month_avg":  strconv.FormatFloat(avgStreamHours, 'f', 3, 64),
+		"estimated_storage_amount_cents": int64(math.Round(avgStreamHours * float64(streamHourMonthRateCents))),
 		"period_start":                   periodStart,
 		"period_end":                     periodEnd,
-		"recording_day_rate_cents":       recordingDayRateCents,
-		"gb_month_rate_cents":            gbMonthRateCents,
+		"recording_hour_rate_cents":      recordingHourRateCents,
+		"stream_hour_month_rate_cents":   streamHourMonthRateCents,
 	})
 }
 

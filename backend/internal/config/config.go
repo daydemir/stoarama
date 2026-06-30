@@ -71,8 +71,8 @@ type Config struct {
 	StripeWebhookSecret  string
 	StripePriceID        string
 	StripeMeterID        string
-	StripeGBMonthPriceID string // env STRIPE_GB_MONTH_PRICE_ID
-	StripeGBMonthMeterID string // env STRIPE_GB_MONTH_METER_ID (parsed for symmetry; unused like StripeMeterID)
+	StripeGBMonthPriceID string // env STRIPE_GB_MONTH_PRICE_ID (now holds the stream_hour_month metered price id)
+	StripeGBMonthMeterID string // env STRIPE_GB_MONTH_METER_ID (now holds the stream_hour_month meter id; parsed for symmetry, unused like StripeMeterID)
 	StripeLivemode       bool
 
 	// Standalone stream recorder: worker (consumed on the recorder droplet/node).

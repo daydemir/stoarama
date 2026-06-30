@@ -43,7 +43,7 @@ type clipObject struct {
 
 // runManagedPurge is the daily retention job: it deletes the managed R2 objects of
 // accounts that have stopped paying past the grace period, then marks those clips
-// purged so they drop out of the gb_month snapshot. It runs under
+// purged so they drop out of the stream_hour_month snapshot. It runs under
 // runWithBackoff in recorder-control, gated on billingEnabled AND a valid operator
 // R2 config. It NEVER touches BYO objects (the queries are restricted to managed
 // destinations and the keys live under the managed/acct-<id>/ prefix).
