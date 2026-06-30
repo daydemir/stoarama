@@ -172,7 +172,7 @@ func (c *Controller) tick(ctx context.Context) error {
 			c.cfg.Max, live, forecast.PeakConcurrent, decision.CapShortfall, c.cfg.Max*c.cfg.Capacity)
 	}
 	for i := 0; i < decision.ScaleUpCount; i++ {
-		if err := c.scaleUp(ctx, now); err != nil {
+		if err := c.scaleUp(ctx, now, i); err != nil {
 			log.Printf("droplet pool: scale up: %v", err)
 			break // a failing DO create will likely fail again this tick; retry next tick
 		}
@@ -350,12 +350,23 @@ func (c *Controller) refreshIdle(ctx context.Context) error {
 	return nil
 }
 
+// dropletName builds a unique recorder-droplet name for one scale-up. The tick
+// timestamp (UnixNano) makes it unique across ticks; the batch index makes it
+// unique WITHIN a single tick's scale-up batch, where every iteration shares the
+// same `now`. Without the index every droplet in a batch would collide on the
+// recorder_droplets name UNIQUE index, so a batch of N could provision only 1.
+func dropletName(now time.Time, batchIndex int) string {
+	return fmt.Sprintf("%s%d-%d", NamePrefix, now.UnixNano(), batchIndex)
+}
+
 // scaleUp mints a per-droplet node token, writes the write-ahead provisioning row
 // BEFORE the DO create (SRE-cap), creates+assigns+firewalls the droplet, then
 // records its DO id. On any failure after the row is written it revokes the token
-// and marks the row failed so the cap is not leaked.
-func (c *Controller) scaleUp(ctx context.Context, now time.Time) error {
-	name := fmt.Sprintf("%s%d", NamePrefix, now.UnixNano())
+// and marks the row failed so the cap is not leaked. batchIndex is the droplet's
+// position within this tick's scale-up batch; it keeps names unique within a
+// single tick (where `now` is shared across the batch loop).
+func (c *Controller) scaleUp(ctx context.Context, now time.Time, batchIndex int) error {
+	name := dropletName(now, batchIndex)
 
 	token, nodeID, nodeTokenID, err := c.store.MintNodeToken(ctx, c.cfg.OperatorAccountID, name)
 	if err != nil {

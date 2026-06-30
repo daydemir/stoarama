@@ -2,6 +2,7 @@ package dropletpool
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -47,6 +48,56 @@ func TestDecide_ScaleUpBatchesTheWholeGap(t *testing.T) {
 	d := Decide(p)
 	if d.ScaleUpCount != 4 {
 		t.Fatalf("expected batch of 4 (gap 20 capped to batch 4), got %+v", d)
+	}
+}
+
+// TestDropletName_BatchProducesDistinctNames is the regression test for the
+// batched scale-up name-collision bug. The controller computes `now` ONCE per
+// tick, then loops i in [0, ScaleUpCount) calling scaleUp(ctx, now, i). The old
+// name was NamePrefix+now.UnixNano() with no per-droplet component, so every
+// droplet in a batch built the SAME name and the second InsertProvisioning hit
+// the recorder_droplets name UNIQUE index, aborting the batch after one droplet.
+// Threading the batch index into the name must make all N names in a single tick
+// distinct (and still distinct across ticks).
+func TestDropletName_BatchProducesDistinctNames(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+
+	// Decide the batch size the controller would provision this tick.
+	p := baseDecisionParams(now)
+	p.Max = 20
+	p.MaxScaleUpBatch = 4
+	p.Live = 0
+	p.Forecast = Forecast{PeakConcurrent: 100, NextFireAt: now.Add(1 * time.Minute)}
+	d := Decide(p)
+	if d.ScaleUpCount != 4 {
+		t.Fatalf("expected batch of 4, got %+v", d)
+	}
+
+	// The controller's tick loop fixes `now` once and varies only the batch index.
+	// Every name in the batch must be unique (the prior single-now name was not).
+	seen := make(map[string]int, d.ScaleUpCount)
+	for i := 0; i < d.ScaleUpCount; i++ {
+		name := dropletName(now, i)
+		seen[name]++
+	}
+	if len(seen) != d.ScaleUpCount {
+		t.Fatalf("batch of %d produced only %d distinct names (collision): %v", d.ScaleUpCount, len(seen), seen)
+	}
+
+	// Demonstrate the old bug explicitly: without the per-droplet index the same
+	// `now` collapsed every batch droplet to one name.
+	old := make(map[string]struct{})
+	for i := 0; i < d.ScaleUpCount; i++ {
+		old[fmt.Sprintf("%s%d", NamePrefix, now.UnixNano())] = struct{}{}
+	}
+	if len(old) != 1 {
+		t.Fatalf("sanity: pre-fix name was meant to collide to 1, got %d", len(old))
+	}
+
+	// Names must also stay distinct across ticks (different `now`).
+	later := now.Add(30 * time.Second)
+	if dropletName(now, 0) == dropletName(later, 0) {
+		t.Fatalf("names from different ticks must differ: %s == %s", dropletName(now, 0), dropletName(later, 0))
 	}
 }
 
