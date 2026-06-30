@@ -159,7 +159,7 @@ func (s *Store) SetDropletID(ctx context.Context, id, doDropletID int64, ip stri
 
 // MarkActive flips a provisioning droplet to active and clears idle tracking.
 func (s *Store) MarkActive(ctx context.Context, id int64) error {
-	return s.setState(ctx, id, "active", `idle_since=NULL`)
+	return s.setState(ctx, id, "active", `idle_since=NULL, activated_at=COALESCE(activated_at, now())`)
 }
 
 // MarkDraining flips an active droplet to draining and stamps drain_started_at.

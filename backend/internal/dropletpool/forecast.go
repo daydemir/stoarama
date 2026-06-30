@@ -44,6 +44,11 @@ type jobInterval struct {
 	End   time.Time
 }
 
+// sampledScheduleDelayMargin conservatively covers the scheduler's private
+// fireJitter max (30s) when modeling sampled jobs from cron fire times. The
+// forecast has no recording IDs, so it cannot reproduce per-recording jitter.
+const sampledScheduleDelayMargin = 30 * time.Second
+
 // loadCapturingRecordings reads every capturing recording (status='active',
 // inside its [start_at, end_at) window, and, when billing is enabled, whose
 // account has a card on file). It is the single SELECT both the autoscaler
@@ -189,11 +194,11 @@ func forecastFromRecordings(recs []forecastRecording, now time.Time, lookahead t
 	}
 }
 
-// expandRecording enumerates one recording's fires in (now, windowEnd], modeling
-// each as a [fire, fire+clip_duration) interval, and returns the earliest fire.
-// A fire that starts before windowEnd but whose clip extends past it still counts
-// (the slot is occupied at windowEnd). A bounded iteration cap protects against a
-// pathological schedule.
+// expandRecording enumerates one recording's fires whose modeled clip intervals
+// overlap [now, windowEnd], and returns the earliest future fire. Sampled clips
+// are extended by sampledScheduleDelayMargin so scheduler jitter / scheduled_for
+// delay cannot make close fires overlap in reality while the forecast undercounts
+// them. A bounded iteration cap protects against a pathological schedule.
 func expandRecording(r forecastRecording, now, windowEnd time.Time) ([]jobInterval, time.Time) {
 	if r.mode == "continuous" {
 		return expandContinuousRecording(r, now, windowEnd)
@@ -202,9 +207,10 @@ func expandRecording(r forecastRecording, now, windowEnd time.Time) ([]jobInterv
 	if clip <= 0 {
 		clip = time.Second
 	}
+	modeledClip := clip + sampledScheduleDelayMargin
 	out := make([]jobInterval, 0, 8)
 	var first time.Time
-	cursor := now
+	cursor := now.Add(-modeledClip).Add(-time.Nanosecond)
 	// Hard cap on fires per recording per window so a malformed schedule cannot
 	// blow up the sweep. A valid recording fires no more often than the configured
 	// min interval, so this is never hit in practice.
@@ -217,10 +223,15 @@ func expandRecording(r forecastRecording, now, windowEnd time.Time) ([]jobInterv
 		if fire.After(windowEnd) {
 			break
 		}
-		if first.IsZero() {
+		end := fire.Add(modeledClip)
+		if !end.After(now) {
+			cursor = fire
+			continue
+		}
+		if fire.After(now) && first.IsZero() {
 			first = fire
 		}
-		out = append(out, jobInterval{Start: fire, End: fire.Add(clip)})
+		out = append(out, jobInterval{Start: fire, End: end})
 		cursor = fire
 	}
 	return out, first

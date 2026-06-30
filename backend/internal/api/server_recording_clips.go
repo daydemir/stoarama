@@ -50,34 +50,28 @@ type recordingLeaseResponse struct {
 	WindowEndAt *time.Time `json:"window_end_at"`
 }
 
-// handleRecordingJobsLease leases at most one due recording job for the calling
-// droplet. It locks ONLY recording_jobs in the CTE (mirroring the capture lease)
-// and inlines the capture gate (status='active', window open, and, when billing is
-// enabled, account has a card on file), matching the scheduler/forecast gate.
-// Leasing is restricted to operator-managed pool droplets: recorder_droplets rows
-// are created only by the autoscaler under the operator account, so a self-enrolled
-// local_recorder node (which has no such row) can lease nothing and therefore
-// cannot observe another tenant's stream_url or deny their capture.
-func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request) {
-	principal, ok := nodePrincipalFromContext(r.Context())
-	if !ok {
-		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	workerID := strings.TrimSpace(principal.DisplayName)
-	if workerID == "" {
-		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
-		return
-	}
-	billingDisabled := s.billing == nil
-
-	var resp recordingLeaseResponse
-	err := s.pool.QueryRow(r.Context(), `
-		WITH cte AS (
+const recordingJobsLeaseSQL = `
+		WITH locked_droplet AS (
+		  SELECT d.name, d.capacity
+		  FROM recorder_droplets d
+		  WHERE d.name = $1
+		    AND d.node_id = $5
+		    AND d.state <> 'draining'
+		  FOR UPDATE
+		),
+		cte AS (
 		  SELECT j.id
-		  FROM recording_jobs j
+		  FROM locked_droplet d
+		  JOIN recording_jobs j ON true
 		  JOIN recordings rec ON rec.id = j.recording_id
-		  WHERE j.status='pending' AND j.scheduled_for <= now()
+		  WHERE (
+		          SELECT count(*)
+		          FROM recording_jobs live
+		          WHERE live.status='leased'
+		            AND live.lease_owner = d.name
+		            AND live.lease_expires_at > now()
+		        ) < d.capacity
+		    AND j.status='pending' AND j.scheduled_for <= now()
 		    -- Schedule integrity (SAMPLED clip jobs only): never hand out a clip job
 		    -- too late to be on-schedule. Capture has no seek-to-fire, so a clip job
 		    -- leased past its fire_at + clip_duration + grace would record the stream
@@ -94,12 +88,9 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		          SELECT 1 FROM account_billing b
 		          WHERE b.account_id = rec.account_id
 		            AND b.has_payment_method))
-		    AND EXISTS (
-		          SELECT 1 FROM recorder_droplets d
-		          WHERE d.name = $1 AND d.state <> 'draining')
 		  ORDER BY j.scheduled_for ASC, j.id ASC
 		  LIMIT 1
-		  FOR UPDATE SKIP LOCKED
+		  FOR UPDATE OF j SKIP LOCKED
 		)
 		UPDATE recording_jobs j
 		SET status='leased',
@@ -112,7 +103,40 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
 		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
 		          rec.target_fps, j.kind, j.window_end_at
-	`, workerID, billingDisabled, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec).Scan(
+	`
+
+// handleRecordingJobsLease leases at most one due recording job for the calling
+// droplet. The droplet row is locked before counting live leases, so concurrent
+// processes reusing the same recorder identity cannot exceed recorder capacity.
+// The recording gate remains inline (status='active', window open, and, when
+// billing is enabled, account has a card on file), matching the scheduler/forecast
+// gate. Leasing is restricted to operator-managed pool droplets: recorder_droplets
+// rows are created only by the autoscaler under the operator account, so a
+// self-enrolled local_recorder node (which has no such row) can lease nothing and
+// therefore cannot observe another tenant's stream_url or deny their capture.
+func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	workerID := strings.TrimSpace(principal.DisplayName)
+	if workerID == "" {
+		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
+		return
+	}
+	billingDisabled := s.billing == nil
+
+	var resp recordingLeaseResponse
+	err := s.pool.QueryRow(
+		r.Context(),
+		recordingJobsLeaseSQL,
+		workerID,
+		billingDisabled,
+		recordingCaptureTimeoutMarginSec+recordingUploadMarginSec,
+		recordingFreshnessGraceSec,
+		principal.NodeID,
+	).Scan(
 		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
 		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
 		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
@@ -525,7 +549,11 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// Touch the droplet liveness row if this worker is a managed droplet.
-	_, _ = s.pool.Exec(r.Context(), `UPDATE recorder_droplets SET last_seen_at=now() WHERE name=$1`, workerID)
+	_, _ = s.pool.Exec(r.Context(), `
+		UPDATE recorder_droplets
+		SET last_seen_at=now(), first_seen_at=COALESCE(first_seen_at, now())
+		WHERE name=$1
+	`, workerID)
 	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt})
 }
 
@@ -545,7 +573,11 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
 		return
 	}
-	if _, err := s.pool.Exec(r.Context(), `UPDATE recorder_droplets SET last_seen_at=now() WHERE name=$1`, workerID); err != nil {
+	if _, err := s.pool.Exec(r.Context(), `
+		UPDATE recorder_droplets
+		SET last_seen_at=now(), first_seen_at=COALESCE(first_seen_at, now())
+		WHERE name=$1
+	`, workerID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("touch droplet liveness: %v", err))
 		return
 	}
