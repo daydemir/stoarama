@@ -1274,8 +1274,11 @@
     }
 
     // Restore the BYO destination picker or connect form (the pre-chooser default).
+    // Only the account's own S3 buckets belong here: exclude managed (its own note)
+    // and shared destinations (granted dests have their own "Shared destination"
+    // picker), so a granted shared dest never leaks into the BYO list.
     function renderByoStorageUI() {
-      const byo = (state.destinations || []).filter((d) => d.managed !== true);
+      const byo = (state.destinations || []).filter((d) => d.managed !== true && d.shared !== true);
       if (byo.length === 0) {
         els.recDest.innerHTML = '';
         els.destPicker.classList.add('hidden');
