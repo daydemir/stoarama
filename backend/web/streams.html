@@ -2743,6 +2743,11 @@ async function fetchJSONWithTimeout(path, opts = {}, timeoutMs = 0, timeoutMessa
 function syncAuthDependentUI() {
   syncDetailAuthState();
   if (streamRows.length) renderStreamRows();
+  // The detail tag editor renders editable vs read-only based on can_edit_tags,
+  // so re-render it once the session capabilities resolve after initial paint.
+  if (detailData && detailData.stream) {
+    rerenderTagEditorsForStream(Number(detailData.stream.id));
+  }
   if (detailRecordingData && detailRecordingData.stream) {
     syncDetailMutationUI(detailRecordingData.stream);
   }
