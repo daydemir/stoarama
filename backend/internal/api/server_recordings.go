@@ -83,7 +83,8 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 			rec.created_at, sd.managed,
 			rec.stream_id, st.name, st.location_text,
-			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),'')
+			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
+			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		LEFT JOIN streams st ON st.id = rec.stream_id
@@ -570,7 +571,8 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 			rec.created_at, sd.managed,
 			rec.stream_id, st.name, st.location_text,
-			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),'')
+			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
+			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		LEFT JOIN streams st ON st.id = rec.stream_id
@@ -939,6 +941,8 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		mode             string
 		dailyWindowStart string
 		dailyWindowEnd   string
+		bundleID         *int64
+		bundleName       *string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
@@ -948,6 +952,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd,
+		&bundleID, &bundleName,
 	); err != nil {
 		return nil, err
 	}
@@ -987,6 +992,8 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"stream_id":                streamID,
 		"stream_name":              streamName,
 		"stream_location":          streamLocation,
+		"bundle_id":                bundleID,
+		"bundle_name":              bundleName,
 	}, nil
 }
 

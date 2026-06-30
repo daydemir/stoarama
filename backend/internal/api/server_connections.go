@@ -103,24 +103,16 @@ func connectionComposeSnippet(apiBase, token string, pollIntervalSec int) string
 `, apiBase, token, pollIntervalSec)
 }
 
-// connectionAPIBase derives the public /api/v1 base for the compose snippet from
-// the configured AppBaseURL, falling back to the request scheme+host (same logic as
-// buildAccountMagicLink, plus the /api/v1 suffix the client expects).
+// connectionPublicAPIBase is the public /api/v1 base the NAS pull client targets.
+// It is the user-facing host (stoarama.com), not the internal AppBaseURL
+// (stoarama-api.onrender.com); both reach the same API, but the public host is the
+// cleaner thing to hand an operator. Used only for the copyable compose snippet.
+const connectionPublicAPIBase = "https://stoarama.com/api/v1"
+
+// connectionAPIBase returns the public /api/v1 base for the compose snippet. Both
+// the create and rotate handlers call it so the snippet host stays consistent.
 func (s *Server) connectionAPIBase(r *http.Request) string {
-	base := strings.TrimRight(strings.TrimSpace(s.cfg.AppBaseURL), "/")
-	if base == "" && r != nil {
-		scheme := "http"
-		if requestIsHTTPS(r) {
-			scheme = "https"
-		}
-		if host := strings.TrimSpace(r.Host); host != "" {
-			base = scheme + "://" + host
-		}
-	}
-	if base == "" {
-		base = "http://localhost:8080"
-	}
-	return base + "/api/v1"
+	return connectionPublicAPIBase
 }
 
 type connectionCreateRequest struct {

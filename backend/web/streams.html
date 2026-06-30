@@ -863,6 +863,27 @@
     .filter-status-row {
       margin-bottom: 8px;
     }
+    /* Persistent multi-select action bar: appears only when streams are checked,
+       so recording 20 streams is one bundle, not 20 single-recording trips. */
+    .record-selected-bar {
+      position: sticky;
+      top: 8px;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      padding: 8px 12px;
+      border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--panel) 92%, #000);
+    }
+    .record-selected-bar.hidden { display: none; }
+    .record-selected-actions { display: inline-flex; gap: 8px; align-items: center; }
+    #recordSelectedClear { cursor: pointer; font-family: var(--mono); }
+    td.stream-select-cell { text-align: center; vertical-align: middle; }
+    td.stream-select-cell input[type="checkbox"] { cursor: pointer; }
     .secondary-card {
       margin-top: 10px;
       padding: 12px 14px;
@@ -1629,11 +1650,19 @@
     <div class="toolbar filter-status-row">
       <span class="status-text" id="streamFilterSummary"></span>
     </div>
+    <div id="recordSelectedBar" class="record-selected-bar hidden">
+      <span class="status-text"><b data-selcount>0</b> selected</span>
+      <span class="record-selected-actions">
+        <a id="recordSelectedBtn" class="overview-card-link primary" href="#">Record selected</a>
+        <button id="recordSelectedClear" type="button" class="overview-card-link">Clear</button>
+      </span>
+    </div>
 
 	    <div id="streamsTableWrap" class="tbl-wrap">
 	      <table id="streamsTable">
 	        <thead>
 	          <tr>
+	            <th style="width:34px;"><input type="checkbox" data-selectall aria-label="Select all" /></th>
 	            <th style="width:128px;">Thumb</th>
 	            <th data-sort-key="name">Stream</th>
 	            <th data-sort-key="location_city">Location</th>
@@ -1923,6 +1952,9 @@ let detailInferenceLoaded = false;
 let detailDayZipPollTimer = null;
 let detailDayZipPollAttempts = 0;
 let streamRows = [];
+// Multi-select for the bundle flow: ids checked on the browse table. Persists
+// across re-render/filter changes (rows re-apply checked state in renderStreamRows).
+const selectedStreamIds = new Set();
 let streamTotal = 0;
 let streamAllTotal = null;
 let streamPage = 1;
@@ -3011,6 +3043,33 @@ if (addStreamCancelEl instanceof HTMLElement) {
 }
 if (addStreamSubmitEl instanceof HTMLElement) {
   addStreamSubmitEl.addEventListener('click', submitAddStream);
+}
+
+// Multi-select action bar: "Record selected" opens the bundle composer prefilled
+// with the chosen ids; "Clear" drops the selection. The ids ride through the
+// magic-link round-trip when signed out (accountRedirectURL preserves the path).
+const recordSelectedBtnEl = $('recordSelectedBtn');
+const recordSelectedClearEl = $('recordSelectedClear');
+if (recordSelectedBtnEl instanceof HTMLElement) {
+  recordSelectedBtnEl.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    const ids = [...selectedStreamIds];
+    if (!ids.length) return;
+    const target = `/recordings?stream_ids=${ids.join(',')}&compose=bundle`;
+    if (isAuthenticatedAccount()) {
+      window.location.assign(target);
+    } else {
+      window.location.assign(`/account?redirect_path=${encodeURIComponent(target)}`);
+    }
+  });
+}
+if (recordSelectedClearEl instanceof HTMLElement) {
+  recordSelectedClearEl.addEventListener('click', () => {
+    selectedStreamIds.clear();
+    streamRowsEl.querySelectorAll('input[data-streamselect]').forEach((cb) => { cb.checked = false; });
+    updateRecordBar();
+    syncSelectAllBox();
+  });
 }
 
 function renderDisabledButton(label, title = '') {
@@ -4761,7 +4820,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="4" style="padding:20px;">
+        <td colspan="5" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -4784,8 +4843,14 @@ function renderStreamRows() {
     if (!s) continue;
     const streamName = latinizedLabelParts(s.name);
 
+    const recordable = isRecordableStream(s);
     const tr = document.createElement('tr');
     tr.innerHTML = `
+      <td class="stream-select-cell">${
+        recordable
+          ? `<input type="checkbox" data-streamselect="${s.id}" aria-label="Select stream"${selectedStreamIds.has(Number(s.id)) ? ' checked' : ''} />`
+          : ''
+      }</td>
       <td style="padding:6px 10px;">${renderImageSlot(s.id, 'streams')}</td>
       <td>
         <div class="stack">
@@ -4797,7 +4862,7 @@ function renderStreamRows() {
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
       <td>${
-        isRecordableStream(s)
+        recordable
           ? `<a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a>`
           : (buildYouTubeWatchURL(s)
               ? `<a class="overview-card-link" href="${esc(buildYouTubeWatchURL(s))}" target="_blank" rel="noopener noreferrer">View</a>`
@@ -4811,6 +4876,56 @@ function renderStreamRows() {
   observeImageSlots(streamRowsEl);
   updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
   setStreamStatus(`${streamRows.length} shown · ${streamCountLabel(streamTotal)}`);
+  wireStreamSelectRow();
+}
+
+// Wire the per-row select checkboxes + select-all-visible, then refresh the bar.
+// Called after every render so re-filtering keeps the selection and the header
+// box reflects whether all currently-shown recordable rows are checked.
+function wireStreamSelectRow() {
+  streamRowsEl.querySelectorAll('input[data-streamselect]').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const id = Number(cb.getAttribute('data-streamselect'));
+      if (cb.checked) selectedStreamIds.add(id); else selectedStreamIds.delete(id);
+      updateRecordBar();
+      syncSelectAllBox();
+    });
+  });
+  const selectAll = streamsTable.querySelector('input[data-selectall]');
+  if (selectAll) {
+    selectAll.onchange = () => {
+      const boxes = streamRowsEl.querySelectorAll('input[data-streamselect]');
+      boxes.forEach((cb) => {
+        const id = Number(cb.getAttribute('data-streamselect'));
+        cb.checked = selectAll.checked;
+        if (selectAll.checked) selectedStreamIds.add(id); else selectedStreamIds.delete(id);
+      });
+      updateRecordBar();
+    };
+  }
+  updateRecordBar();
+  syncSelectAllBox();
+}
+
+// The header box is checked only when every currently-shown recordable row is
+// selected (and there is at least one), indeterminate when some are.
+function syncSelectAllBox() {
+  const selectAll = streamsTable.querySelector('input[data-selectall]');
+  if (!selectAll) return;
+  const boxes = Array.from(streamRowsEl.querySelectorAll('input[data-streamselect]'));
+  const checked = boxes.filter((cb) => cb.checked).length;
+  selectAll.checked = boxes.length > 0 && checked === boxes.length;
+  selectAll.indeterminate = checked > 0 && checked < boxes.length;
+}
+
+// Show the persistent action bar only when something is selected; update count.
+function updateRecordBar() {
+  const bar = $('recordSelectedBar');
+  if (!bar) return;
+  const n = selectedStreamIds.size;
+  bar.classList.toggle('hidden', n === 0);
+  const count = bar.querySelector('[data-selcount]');
+  if (count) count.textContent = String(n);
 }
 
 function applySourceSegment(seg) {

@@ -200,6 +200,25 @@
     .card-blocked { margin-top: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 13px; color: var(--text); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
     .card-blocked b { color: var(--warn); }
     .card-blocked button { width: auto; min-width: 0; min-height: 30px; padding: 5px 12px; font-size: 13px; }
+    /* Bundle group: one collapsible card per bundle so 20+ members read as one
+       group with an opt-in compact member table, not a wall of identical cards. */
+    .bundle-toggle { display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; padding: 0; cursor: pointer; text-align: left; width: auto; min-width: 0; min-height: 0; }
+    .bundle-caret { display: inline-block; width: 0; height: 0; border-left: 6px solid var(--muted); border-top: 5px solid transparent; border-bottom: 5px solid transparent; transition: transform 0.12s ease; }
+    .bundle-toggle[aria-expanded="true"] .bundle-caret { transform: rotate(90deg); }
+    .bundle-members { margin-top: 14px; overflow-x: auto; }
+    .bundle-members.hidden { display: none; }
+    .bundle-members .clip-table td.b-stream a { color: var(--text); text-decoration: none; }
+    .bundle-members .clip-table td.b-stream a:hover { text-decoration: underline; }
+    .bundle-members .clip-table td.b-status .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; background: var(--muted); vertical-align: middle; }
+    .bundle-members .clip-table td.b-status.active .dot { background: var(--ok); }
+    .bundle-members .clip-table td.b-status.active { color: var(--ok); }
+    .bundle-members .clip-table td.b-status.pending { color: var(--warn); }
+    .bundle-members .clip-table td.b-status.pending .dot { background: var(--warn); }
+    .bundle-members .clip-table td.b-status.paused { color: var(--muted); }
+    .bundle-members .clip-table td.b-status .health-healthy { color: var(--ok); }
+    .bundle-members .clip-table td.b-status .health-degraded { color: var(--warn); }
+    .bundle-members .clip-table td.b-status .health-failing { color: var(--err); }
+    .bundle-members .clip-table td.b-needs { color: var(--warn); }
     /* Segmented control */
     .seg { display: flex; flex-wrap: wrap; gap: 6px; }
     .seg button {
@@ -356,8 +375,17 @@
           </div>
           <div class="field">
             <label>Select streams</label>
-            <div id="bundleStreamCount" class="status" style="margin-bottom:8px;">0 streams selected</div>
-            <div id="bundleStreamPicker" style="max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px;font-size:13px;"></div>
+            <input id="bundleStreamSearch" type="text" placeholder="Search streams by name or location" style="margin-bottom:8px;" />
+            <div id="bundleStreamPicker" style="max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px;font-size:13px;">
+              <div id="bundleStreamToolbar" style="position:sticky;top:-8px;background:var(--bg);margin:-8px -8px 8px;padding:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;z-index:1;">
+                <span id="bundleStreamCount" class="status" style="margin:0;">0 streams selected</span>
+                <span style="display:inline-flex;gap:8px;">
+                  <button type="button" id="bundleSelectAllBtn" class="secondary" style="width:auto;min-width:0;min-height:26px;padding:3px 9px;font-size:12px;">Select all shown</button>
+                  <button type="button" id="bundleClearSelBtn" class="secondary" style="width:auto;min-width:0;min-height:26px;padding:3px 9px;font-size:12px;">Clear</button>
+                </span>
+              </div>
+              <div id="bundleStreamList"></div>
+            </div>
           </div>
         </div>
 
@@ -671,6 +699,10 @@
       bundleTag: document.getElementById('bundleTag'),
       bundleStreamCount: document.getElementById('bundleStreamCount'),
       bundleStreamPicker: document.getElementById('bundleStreamPicker'),
+      bundleStreamSearch: document.getElementById('bundleStreamSearch'),
+      bundleStreamList: document.getElementById('bundleStreamList'),
+      bundleSelectAllBtn: document.getElementById('bundleSelectAllBtn'),
+      bundleClearSelBtn: document.getElementById('bundleClearSelBtn'),
       bundlePreflight: document.getElementById('bundlePreflight'),
     };
 
@@ -1915,6 +1947,108 @@
         </div>`;
     }
 
+    // A member belongs to a bundle when its bundle_id is set. The recordings list
+    // endpoint surfaces bundle_id + bundle_name so the overview can group members
+    // under one collapsible header instead of one full card each.
+    function bundleIdOf(rec) {
+      const v = rec.bundle_id;
+      if (v === null || v === undefined) return 0;
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    }
+
+    // One compact member row inside a bundle's table: stream name links to the
+    // member's clip page, status reuses the dot + health word, last clip + count.
+    function bundleMemberRowHTML(m) {
+      const id = Number(m.id);
+      const streamName = String(m.stream_name || '').trim() || String(m.name || ('#' + id));
+      const loc = String(m.stream_location || '').trim();
+      const status = String(m.status || '');
+      const health = String(m.health || 'idle');
+      let statusCell;
+      if (m.needs_card === true) {
+        statusCell = `<td class="b-status b-needs"><span class="dot"></span>needs card</td>`;
+      } else if (status === 'paused') {
+        statusCell = `<td class="b-status paused"><span class="dot"></span>paused</td>`;
+      } else if (status === 'active' && isScheduled(m)) {
+        statusCell = `<td class="b-status pending"><span class="dot"></span>scheduled</td>`;
+      } else if (status === 'active') {
+        const word = health !== 'idle' ? ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>` : '';
+        statusCell = `<td class="b-status active"><span class="dot"></span>active${word}</td>`;
+      } else {
+        statusCell = `<td class="b-status paused"><span class="dot"></span>${escapeHTML(status || 'idle')}</td>`;
+      }
+      const last = relativeTime(m.last_clip_at);
+      return `<tr>
+        <td class="b-stream"><a href="/recordings/${id}">${escapeHTML(streamName)}</a>${loc ? ` <span class="muted">&middot; ${escapeHTML(loc)}</span>` : ''}</td>
+        ${statusCell}
+        <td>${last ? escapeHTML(last) : '—'}</td>
+        <td class="num">${Number(m.recent_clip_count || 0)}</td>
+      </tr>`;
+    }
+
+    // Render one bundle as a single .card group header plus an opt-in compact
+    // member table. Status is derived across members (active if any member is
+    // actively capturing, paused if all paused, else pending). A group-level
+    // needs_card banner shows when any member is held by the no-card gate.
+    function bundleGroupHTML(bundleId, bundleName, members) {
+      const total = members.length;
+      let recording = 0, paused = 0, needCard = 0, anyActiveLive = 0;
+      for (const m of members) {
+        const status = String(m.status || '');
+        if (m.needs_card === true) needCard++;
+        if (status === 'paused') paused++;
+        else if (status === 'active') {
+          recording++;
+          if (!isScheduled(m) && m.needs_card !== true) anyActiveLive++;
+        }
+      }
+      let st;
+      if (anyActiveLive > 0) st = { cls: 'active', text: 'Recording' };
+      else if (recording > 0) st = { cls: 'pending', text: 'Scheduled' };
+      else if (paused === total && total > 0) st = { cls: 'paused', text: 'Paused' };
+      else st = { cls: 'pending', text: 'Pending' };
+
+      const metaParts = [];
+      metaParts.push(`<span class="meta-strong">${total} stream${total === 1 ? '' : 's'}</span>`);
+      if (members[0]) metaParts.push(`<span>${escapeHTML(scheduleLabel(members[0]))}</span>`);
+      metaParts.push(`<span>${recording} recording</span>`);
+      if (paused > 0) metaParts.push(`<span>${paused} paused</span>`);
+      if (needCard > 0) metaParts.push(`<span>${needCard} need card</span>`);
+
+      const blocked = needCard > 0
+        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a card to start capturing.</span>`
+          + `<button type="button" data-addcard="${Number(members[0] && members[0].id)}">Add a card</button></div>`
+        : '';
+
+      const collapsed = total > 6;
+      const rows = members.map(bundleMemberRowHTML).join('');
+      const table = `<div class="bundle-members${collapsed ? ' hidden' : ''}" data-bundlemembers="${bundleId}">
+        <table class="clip-table">
+          <thead><tr><th>Stream</th><th>Status</th><th>Last clip</th><th class="num">Clips</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>`;
+
+      return `
+        <div class="card" data-bundlecard="${bundleId}">
+          <div class="card-head">
+            <div>
+              <button type="button" class="bundle-toggle" data-bundletoggle="${bundleId}" aria-expanded="${collapsed ? 'false' : 'true'}">
+                <span class="bundle-caret"></span>
+                <span class="card-name">${escapeHTML(bundleName)}</span>
+              </button>
+            </div>
+            <div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>
+          </div>
+          <div class="card-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
+          ${blocked}
+          <div class="card-actions">
+            <a class="btn-link secondary" href="/bundles/${bundleId}">Open bundle</a>
+          </div>
+          ${table}
+        </div>`;
+    }
+
     function renderCards() {
       const items = state.recordings;
       const empty = items.length === 0;
@@ -1926,11 +2060,31 @@
         openComposer(true);
         return;
       }
-      const ongoing = items.filter((rec) => !isCompleted(rec));
-      const completed = items.filter((rec) => isCompleted(rec));
+      // Partition into bundle groups (keyed by bundle_id, order of first sight) and
+      // standalone recordings. Standalone keep the exact Ongoing/Completed split.
+      const byBundle = new Map();
+      const standalone = [];
+      for (const rec of items) {
+        const bid = bundleIdOf(rec);
+        if (bid > 0) {
+          if (!byBundle.has(bid)) byBundle.set(bid, { name: String(rec.bundle_name || 'Bundle').trim() || 'Bundle', members: [] });
+          byBundle.get(bid).members.push(rec);
+        } else {
+          standalone.push(rec);
+        }
+      }
       let html = '';
-      if (ongoing.length) {
+      // Bundle groups first (the list is already newest-first by created_at, so the
+      // first bundle seen is the newest). Each group is one collapsible card.
+      const bundleHTML = [];
+      for (const [bid, grp] of byBundle.entries()) {
+        bundleHTML.push(bundleGroupHTML(bid, grp.name, grp.members));
+      }
+      const ongoing = standalone.filter((rec) => !isCompleted(rec));
+      const completed = standalone.filter((rec) => isCompleted(rec));
+      if (bundleHTML.length || ongoing.length) {
         html += `<div class="group-title">Ongoing</div>`;
+        html += bundleHTML.join('');
         html += ongoing.map(cardHTML).join('');
       }
       if (completed.length) {
@@ -1950,6 +2104,14 @@
         b.addEventListener('click', () => deleteRecording(b)));
       els.cards.querySelectorAll('button[data-addcard]').forEach((b) =>
         b.addEventListener('click', () => addCardFromCard(b)));
+      els.cards.querySelectorAll('button[data-bundletoggle]').forEach((b) =>
+        b.addEventListener('click', () => {
+          const bid = b.getAttribute('data-bundletoggle');
+          const table = els.cards.querySelector(`.bundle-members[data-bundlemembers="${bid}"]`);
+          if (!table) return;
+          const open = table.classList.toggle('hidden');
+          b.setAttribute('aria-expanded', open ? 'false' : 'true');
+        }));
     }
 
     // Per-card "Add a card" action: same Checkout flow the top banner triggers.
@@ -2671,6 +2833,27 @@
     // Read ?stream_id= from the URL; when present, land prefilled from that catalog
     // stream and strip the param so a reload does not re-trigger the landing.
     async function maybeLandFromCatalogStream() {
+      // Multi-select from the catalog browse: ?stream_ids=1,2,3&compose=bundle lands
+      // straight in the bundle composer with the chosen streams preselected.
+      const rawIds = String(authParams.get('stream_ids') || '').trim();
+      if (rawIds) {
+        const ids = rawIds.split(',').map((v) => Number(v.trim())).filter((n) => Number.isFinite(n) && n > 0);
+        try {
+          const u = new URL(window.location.href);
+          u.searchParams.delete('stream_ids');
+          u.searchParams.delete('compose');
+          window.history.replaceState({}, '', u.pathname + (u.search || '') + u.hash);
+        } catch (_) { /* ignore */ }
+        if (ids.length) {
+          openBundleComposer();
+          state.bundleSelected = new Set(ids);
+          if (!String(els.bundleName.value || '').trim()) {
+            els.bundleName.value = 'Recording set ' + new Date().toLocaleDateString([], { month: 'short', day: 'numeric' });
+          }
+          await loadBundleStreams();
+          return;
+        }
+      }
       const raw = String(authParams.get('stream_id') || '').trim();
       let sid = Number(raw);
       if (!raw || !Number.isFinite(sid) || sid <= 0) {
@@ -2707,6 +2890,7 @@
         els.bundlePreflight.classList.add('hidden');
         els.bundleName.value = '';
         els.bundleTag.value = '';
+        els.bundleStreamSearch.value = '';
         state.bundleSelected = new Set();
         const singleNameField = els.recName.closest('.field');
         if (singleNameField) singleNameField.classList.remove('hidden');
@@ -2993,6 +3177,17 @@
     els.startBtn.addEventListener('click', startRecording);
     els.startBundleBtn.addEventListener('click', startBundle);
     els.bundleTag.addEventListener('input', () => scheduleBundleStreamReload());
+    els.bundleStreamSearch.addEventListener('input', () => scheduleBundleStreamReload());
+    els.bundleSelectAllBtn.addEventListener('click', () => {
+      for (const s of (state.bundleStreams || [])) state.bundleSelected.add(Number(s.id));
+      els.bundleStreamList.querySelectorAll('input[data-bundlestream]').forEach((cb) => { cb.checked = true; });
+      updateBundleCount();
+    });
+    els.bundleClearSelBtn.addEventListener('click', () => {
+      state.bundleSelected = new Set();
+      els.bundleStreamList.querySelectorAll('input[data-bundlestream]').forEach((cb) => { cb.checked = false; });
+      updateBundleCount();
+    });
     els.cardBannerBtn.addEventListener('click', async () => {
       els.cardBannerBtn.disabled = true;
       try {
@@ -3047,6 +3242,7 @@
       // Default Start to now (open-ended Stop) each time.
       if (!els.startAt.value) els.startAt.value = toLocalInputValue(new Date());
       refreshWindowUI();
+      els.bundleStreamSearch.value = '';
       state.bundleSelected = new Set();
       updateBundleCount();
       void loadBundleStreams();
@@ -3062,13 +3258,17 @@
     // when set. Preserves any current explicit selection across reloads.
     async function loadBundleStreams() {
       const tag = String(els.bundleTag.value || '').trim();
-      els.bundleStreamPicker.innerHTML = '<div class="muted">Loading streams...</div>';
+      const q = String(els.bundleStreamSearch.value || '').trim();
+      els.bundleStreamList.innerHTML = '<div class="muted">Loading streams...</div>';
       try {
-        const qs = tag ? `?tag=${encodeURIComponent(tag)}` : '';
+        const params = new URLSearchParams();
+        if (tag) params.set('tag', tag);
+        if (q) params.set('q', q);
+        const qs = params.toString() ? `?${params.toString()}` : '';
         const payload = await fetchJSON(`/api/v1/account/bundles/streams${qs}`);
         state.bundleStreams = Array.isArray(payload.items) ? payload.items : [];
       } catch (err) {
-        els.bundleStreamPicker.innerHTML = `<div style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+        els.bundleStreamList.innerHTML = `<div style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
         return;
       }
       renderBundleStreamPicker();
@@ -3077,7 +3277,7 @@
     function renderBundleStreamPicker() {
       const streams = state.bundleStreams || [];
       if (streams.length === 0) {
-        els.bundleStreamPicker.innerHTML = '<div class="muted">No recordable streams match.</div>';
+        els.bundleStreamList.innerHTML = '<div class="muted">No recordable streams match.</div>';
         updateBundleCount();
         return;
       }
@@ -3093,8 +3293,8 @@
       }).join('');
       const tagNote = String(els.bundleTag.value || '').trim()
         ? `<div class="muted" style="margin-bottom:6px;">All ${streams.length} streams tagged "${escapeHTML(els.bundleTag.value.trim())}" are listed. Tagged streams are included even if unchecked.</div>` : '';
-      els.bundleStreamPicker.innerHTML = tagNote + rows;
-      els.bundleStreamPicker.querySelectorAll('input[data-bundlestream]').forEach((cb) =>
+      els.bundleStreamList.innerHTML = tagNote + rows;
+      els.bundleStreamList.querySelectorAll('input[data-bundlestream]').forEach((cb) =>
         cb.addEventListener('change', () => {
           const id = Number(cb.getAttribute('data-bundlestream'));
           if (cb.checked) state.bundleSelected.add(id); else state.bundleSelected.delete(id);
