@@ -40,11 +40,16 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 LIST_PAGE_LIMIT = 200
 HTTP_TIMEOUT_SEC = 120
 ERROR_BACKOFF_SEC = 30
+# A named User-Agent is required: stoarama.com sits behind Cloudflare, which blocks
+# the stdlib default "Python-urllib/x" agent (HTTP 403, error code 1010). Every
+# request the client makes (API + presigned R2 GET) sets this so the loop works.
+USER_AGENT = "stoarama-nas-pull/1.0"
 
 
 def env_str(name, default):
@@ -78,6 +83,12 @@ class Config:
         self.state_file = Path(env_str("STOARAMA_STATE_FILE", "/state/cursor.json"))
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 90)
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
+        # The list response's download_path is a site-root-absolute path that already
+        # includes the /api/v1 prefix, so it is joined onto the ORIGIN (scheme+host),
+        # not onto api_base (which already ends in /api/v1). Joining it onto api_base
+        # would double the prefix to /api/v1/api/v1/... and 404.
+        parts = urllib.parse.urlsplit(self.api_base)
+        self.origin = "%s://%s" % (parts.scheme, parts.netloc) if parts.scheme else ""
 
     def validate(self):
         if not self.api_base:
@@ -86,16 +97,21 @@ class Config:
             raise SystemExit("STOARAMA_API_KEY is required (a sir_ account API key)")
 
 
-def request_json(cfg, method, path_or_url):
+def request_json(cfg, method, path_or_url, base=None):
     """GET/DELETE a Stoarama API endpoint with the Bearer key; return parsed JSON.
 
-    path_or_url may be a relative API path (joined onto api_base) or an absolute
-    URL. Raises urllib.error.HTTPError / URLError on transport failure so the
-    caller can back off rather than crash.
+    path_or_url may be an absolute URL or a path joined onto base (default
+    api_base). The download_path from the list response already carries the
+    /api/v1 prefix, so it is passed with base=cfg.origin to avoid doubling it.
+    Raises urllib.error.HTTPError / URLError on transport failure so the caller
+    can back off rather than crash.
     """
-    url = path_or_url if path_or_url.startswith("http") else cfg.api_base + path_or_url
+    if base is None:
+        base = cfg.api_base
+    url = path_or_url if path_or_url.startswith("http") else base + path_or_url
     req = urllib.request.Request(url, method=method)
     req.add_header("Authorization", "Bearer " + cfg.api_key)
+    req.add_header("User-Agent", USER_AGENT)
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
         body = resp.read()
     if not body:
@@ -140,6 +156,7 @@ def clip_filename(clip):
 def download_to_temp(presigned_url, temp_path):
     """Stream the presigned URL to temp_path; return the byte count written."""
     req = urllib.request.Request(presigned_url, method="GET")
+    req.add_header("User-Agent", USER_AGENT)
     written = 0
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp, open(temp_path, "wb") as out:
         while True:
@@ -164,8 +181,10 @@ def process_clip(cfg, clip):
     download_path = clip["download_path"]
 
     # 1. Presign the R2 GET via the existing download endpoint (returns JSON).
+    #    download_path is site-root-absolute (already includes /api/v1), so it is
+    #    joined onto the origin, not api_base, to avoid a doubled /api/v1 prefix.
     try:
-        presigned = request_json(cfg, "GET", download_path)
+        presigned = request_json(cfg, "GET", download_path, base=cfg.origin)
     except urllib.error.HTTPError as exc:
         if exc.code == 410:
             # Clip already purged upstream: nothing to pull, safe to advance.
