@@ -74,7 +74,7 @@ const shellTopbarJS = `
   }
   function renderAnon(label){
     if(!chip)return;
-    chip.innerHTML='<a href="'+signInHref()+'">'+(label||"Sign in for recording")+'</a>';
+    chip.innerHTML='<a href="'+signInHref()+'">'+(label||"Log in")+'</a>';
   }
   function renderSignedIn(acct,authType){
     if(!chip)return;
@@ -89,7 +89,7 @@ const shellTopbarJS = `
     fetch("/api/v1/account/me",{credentials:"same-origin",headers:{Accept:"application/json"},signal:ctrl.signal})
       .then(function(res){
         clearTimeout(to);
-        if(res.status===401){renderAnon("Sign in for recording");return null;}
+        if(res.status===401){renderAnon("Log in");return null;}
         if(!res.ok){throw new Error("status "+res.status);}
         return res.json();
       })
@@ -100,13 +100,13 @@ const shellTopbarJS = `
           var authType=String(payload.session&&payload.session.auth_type||acct.auth_type||"").trim();
           renderSignedIn(acct,authType);
         }else{
-          renderAnon("Sign in for recording");
+          renderAnon("Log in");
         }
       })
       .catch(function(){
         clearTimeout(to);
         if(!chip)return;
-        chip.innerHTML='<a href="'+signInHref()+'">Sign in for recording</a> <span class="muted">&middot; session unavailable</span>';
+        chip.innerHTML='<a href="'+signInHref()+'">Log in</a> <span class="muted">&middot; session unavailable</span>';
       });
   }
   if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",load);}else{load();}
