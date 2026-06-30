@@ -360,6 +360,12 @@ func (s *Server) router() http.Handler {
 			memberSession.Post("/dashboard/streams", s.handleDashboardStreamAdd)
 			memberSession.Post("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsAdd)
 			memberSession.Delete("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsRemove)
+
+			// Team members: browser-session UI actions (cookie-only). Owner-gated on
+			// MemberRole inside the handlers; list is visible to any member.
+			memberSession.Get("/account/members", s.handleAccountMembersList)
+			memberSession.Post("/account/members", s.handleAccountMembersInvite)
+			memberSession.Delete("/account/members/{email}", s.handleAccountMembersRemove)
 		})
 
 		// Recording bundles: a thin grouping that fans out into N member recordings

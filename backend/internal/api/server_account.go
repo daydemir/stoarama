@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -33,10 +34,24 @@ type accountPrincipal struct {
 	AccountID int64
 	Email     string
 	Name      string
-	Role      string
+	Role      string // operator/admin flag (accounts.role); NOT the team role
 	AuthType  string
 	SessionID *int64
 	APIKeyID  *int64
+	// MemberEmail is the email the magic link was issued for (the acting member's
+	// own email), which differs from the account owner email for invited members.
+	// Empty for legacy sessions and API-key callers.
+	MemberEmail string
+	// MemberRole is the team role (account_members.role: 'owner'|'member'),
+	// independent of Role. Defaults to 'owner' for legacy/no-row cases.
+	MemberRole string
+}
+
+// principalIsOwner gates owner-only team actions. It fails SAFE to owner for
+// legacy sessions and any no-row case (empty MemberRole), because every
+// pre-teams account is its own owner via the 0069 backfill.
+func principalIsOwner(p accountPrincipal) bool {
+	return p.MemberRole == "" || p.MemberRole == "owner"
 }
 
 type accountContextKey string
@@ -165,20 +180,25 @@ func (s *Server) lookupAccountSession(ctx context.Context, raw string) (accountP
 	hash := hashSecret(raw)
 	var p accountPrincipal
 	var sessionID int64
+	var memberEmail *string
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.id, a.email, a.name, a.role, rs.id
+		SELECT a.id, a.email, a.name, a.role, rs.id, rs.member_email, COALESCE(m.role, 'owner')
 		FROM account_sessions rs
 		JOIN accounts a ON a.id=rs.account_id
+		LEFT JOIN account_members m ON m.account_id=a.id AND m.member_email=rs.member_email
 		WHERE rs.session_hash=$1
 		  AND rs.revoked_at IS NULL
 		  AND rs.expires_at > now()
 		  AND a.status='active'
-	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &sessionID)
+	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &sessionID, &memberEmail, &p.MemberRole)
 	if err != nil {
 		return accountPrincipal{}, err
 	}
 	p.AuthType = "session"
 	p.SessionID = &sessionID
+	if memberEmail != nil {
+		p.MemberEmail = *memberEmail
+	}
 	_, _ = s.pool.Exec(ctx, `UPDATE account_sessions SET last_used_at=now() WHERE id=$1`, sessionID)
 	return p, nil
 }
@@ -201,6 +221,10 @@ func (s *Server) lookupAccountAPIKey(ctx context.Context, raw string) (accountPr
 	}
 	p.AuthType = "api_key"
 	p.APIKeyID = &keyID
+	// Account API keys are account-scoped full access; never treat them as a
+	// restricted team member. Set MemberRole explicitly to avoid empty-string
+	// ambiguity (team endpoints are session-only anyway).
+	p.MemberRole = "owner"
 	_, _ = s.pool.Exec(ctx, `UPDATE account_api_keys SET last_used_at=now() WHERE id=$1`, keyID)
 	return p, nil
 }
@@ -237,22 +261,57 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
+	// Resolve the requested email through account_members to an account_id. An
+	// invited member's email maps to THEIR team's account (accounts.email differs
+	// from member email there). An email with no membership row keeps today's
+	// self-signup behavior: find-or-create its own account AND seed an owner
+	// membership row so the model stays consistent going forward.
 	var accountID int64
-	var status string
+	var membershipFound bool
 	if err := tx.QueryRow(r.Context(), `
-		INSERT INTO accounts (email, name, role, status)
-		VALUES ($1, $2, $3, 'active')
-		ON CONFLICT (email)
-		DO UPDATE SET
-			name=CASE
-				WHEN EXCLUDED.name <> '' AND accounts.name = '' THEN EXCLUDED.name
-				ELSE accounts.name
-			END,
-			updated_at=now()
-		RETURNING id, status
-	`, email, "", accountRoleMember).Scan(&accountID, &status); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert account: %v", err))
-		return
+		SELECT account_id FROM account_members WHERE member_email=$1
+	`, email).Scan(&accountID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve member account: %v", err))
+			return
+		}
+	} else {
+		membershipFound = true
+	}
+
+	var status string
+	if membershipFound {
+		// The account already exists; confirm it is active before issuing a link.
+		if err := tx.QueryRow(r.Context(), `
+			SELECT status FROM accounts WHERE id=$1
+		`, accountID).Scan(&status); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load member account: %v", err))
+			return
+		}
+	} else {
+		if err := tx.QueryRow(r.Context(), `
+			INSERT INTO accounts (email, name, role, status)
+			VALUES ($1, $2, $3, 'active')
+			ON CONFLICT (email)
+			DO UPDATE SET
+				name=CASE
+					WHEN EXCLUDED.name <> '' AND accounts.name = '' THEN EXCLUDED.name
+					ELSE accounts.name
+				END,
+				updated_at=now()
+			RETURNING id, status
+		`, email, "", accountRoleMember).Scan(&accountID, &status); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert account: %v", err))
+			return
+		}
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO account_members (account_id, member_email, role, accepted_at)
+			VALUES ($1, $2, 'owner', now())
+			ON CONFLICT (member_email) DO NOTHING
+		`, accountID, email); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("seed owner membership: %v", err))
+			return
+		}
 	}
 	if status == "disabled" {
 		_ = tx.Commit(r.Context())
@@ -269,11 +328,11 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 	var linkID int64
 	if err := tx.QueryRow(r.Context(), `
 		INSERT INTO account_magic_links (
-			account_id, token_hash, purpose, redirect_path, requester_ip, user_agent, expires_at
+			account_id, token_hash, purpose, redirect_path, requester_ip, user_agent, expires_at, member_email
 		)
-		VALUES ($1, $2, 'login', $3, $4, $5, $6)
+		VALUES ($1, $2, 'login', $3, $4, $5, $6, $7)
 		RETURNING id
-	`, accountID, hash, redirectPath, requesterIP(r), requestUserAgent(r), expiresAt).Scan(&linkID); err != nil {
+	`, accountID, hash, redirectPath, requesterIP(r), requestUserAgent(r), expiresAt, email).Scan(&linkID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert magic link: %v", err))
 		return
 	}
@@ -326,14 +385,15 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		expiresAt    time.Time
 		consumedAt   *time.Time
 		redirectPath string
+		memberEmail  *string
 	)
 	err = tx.QueryRow(r.Context(), `
-		SELECT ml.id, a.id, a.email, a.name, a.role, a.status, ml.expires_at, ml.consumed_at, ml.redirect_path
+		SELECT ml.id, a.id, a.email, a.name, a.role, a.status, ml.expires_at, ml.consumed_at, ml.redirect_path, ml.member_email
 		FROM account_magic_links ml
 		JOIN accounts a ON a.id=ml.account_id
 		WHERE ml.token_hash=$1
 		FOR UPDATE
-	`, hash).Scan(&linkID, &accountID, &email, &name, &role, &status, &expiresAt, &consumedAt, &redirectPath)
+	`, hash).Scan(&linkID, &accountID, &email, &name, &role, &status, &expiresAt, &consumedAt, &redirectPath, &memberEmail)
 	if err != nil {
 		log.Printf("account auth complete invalid_token token=%s host=%s ip=%s ua=%q", maskedToken, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=invalid_token", http.StatusFound)
@@ -366,6 +426,18 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		log.Printf("account auth complete verify_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
+	}
+	// Mark the acting member's membership accepted on first sign-in completion.
+	if memberEmail != nil && strings.TrimSpace(*memberEmail) != "" {
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE account_members
+			SET accepted_at=COALESCE(accepted_at, now())
+			WHERE account_id=$1 AND member_email=$2
+		`, accountID, *memberEmail); err != nil {
+			log.Printf("account auth complete accept_membership_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
+			http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
+			return
+		}
 	}
 	if s.shouldBootstrapAdmin(email) {
 		var otherAdminExists bool
@@ -406,10 +478,10 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 	sessionExpiresAt := time.Now().UTC().Add(s.cfg.SessionTTL)
 	var sessionID int64
 	if err := tx.QueryRow(r.Context(), `
-		INSERT INTO account_sessions (account_id, session_hash, expires_at, last_used_at)
-		VALUES ($1, $2, $3, now())
+		INSERT INTO account_sessions (account_id, session_hash, expires_at, last_used_at, member_email)
+		VALUES ($1, $2, $3, now(), $4)
 		RETURNING id
-	`, accountID, sessionHash, sessionExpiresAt).Scan(&sessionID); err != nil {
+	`, accountID, sessionHash, sessionExpiresAt, memberEmail).Scan(&sessionID); err != nil {
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}

@@ -287,6 +287,25 @@
       <div id="historyList" class="rec-list hidden"></div>
     </section>
 
+    <section id="teamPanel" class="panel hidden" style="margin-bottom:16px;">
+      <div class="section-title">
+        <div>
+          <div class="eyebrow">Team</div>
+          <h2>Team members</h2>
+        </div>
+      </div>
+      <div id="teamStatus" class="status">Loading team...</div>
+      <div id="teamList" class="rec-list hidden"></div>
+      <div id="teamInvite" class="hidden" style="margin-top:14px;">
+        <label for="teamInviteEmail">Invite a teammate by email</label>
+        <input id="teamInviteEmail" type="email" placeholder="teammate@example.org" />
+        <div class="button-row" style="margin-top:12px;">
+          <button id="teamInviteBtn" type="button" style="width:auto;min-width:160px;">Send invite</button>
+        </div>
+        <p class="muted" style="font-size:12px;margin:10px 0 0;">Teammates sign in with their own email and share this account's recordings, clips, billing, and NAS connection.</p>
+      </div>
+    </section>
+
     <section class="panel" style="margin-bottom:16px;">
       <div class="eyebrow">Support</div>
       <h2>Need help?</h2>
@@ -333,6 +352,12 @@
     const historyStatus = document.getElementById('historyStatus');
     const historyEmpty = document.getElementById('historyEmpty');
     const historyList = document.getElementById('historyList');
+    const teamPanel = document.getElementById('teamPanel');
+    const teamStatus = document.getElementById('teamStatus');
+    const teamList = document.getElementById('teamList');
+    const teamInvite = document.getElementById('teamInvite');
+    const teamInviteEmail = document.getElementById('teamInviteEmail');
+    const teamInviteBtn = document.getElementById('teamInviteBtn');
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const requestedRedirectPath = (() => {
@@ -656,6 +681,73 @@
     // The top-right account chip + admin gear are owned by the shared topbar shell
     // (backend/internal/api/shell.go). No per-page topbar wiring here.
 
+    async function removeTeamMember(email) {
+      if (!email) return;
+      if (!window.confirm(`Remove ${email} from this team? They will lose access immediately.`)) return;
+      try {
+        await fetchJSON(`/api/v1/account/members/${encodeURIComponent(email)}`, { method: 'DELETE' });
+        await loadTeam();
+      } catch (err) {
+        setStatus(teamStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function loadTeam() {
+      teamPanel.classList.remove('hidden');
+      setStatus(teamStatus, 'Loading team...', '');
+      teamList.classList.add('hidden');
+      teamInvite.classList.add('hidden');
+      try {
+        const data = await fetchJSON('/api/v1/account/members');
+        const items = Array.isArray(data.items) ? data.items : [];
+        const canManage = Boolean(data.can_manage);
+        const selfEmail = String((currentAccount && currentAccount.email) || '').trim().toLowerCase();
+        teamList.innerHTML = items.map((m) => {
+          const email = String(m.email || '');
+          const role = String(m.role || 'member');
+          const status = m.accepted_at ? 'Active' : 'Invited';
+          const showRemove = canManage && !(role === 'owner' && items.filter((x) => String(x.role) === 'owner').length <= 1);
+          const removeBtn = showRemove
+            ? `<button class="secondary team-remove" type="button" data-email="${escapeHTML(email)}" style="width:auto;min-width:90px;">Remove</button>`
+            : '';
+          return `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+            <div>
+              <div><b>${escapeHTML(email)}</b></div>
+              <div class="muted" style="font-size:12px;">Role: ${escapeHTML(role)} · ${escapeHTML(status)}</div>
+            </div>
+            ${removeBtn}
+          </div>`;
+        }).join('');
+        teamList.classList.remove('hidden');
+        teamList.querySelectorAll('.team-remove').forEach((btn) => {
+          btn.addEventListener('click', () => removeTeamMember(btn.getAttribute('data-email') || ''));
+        });
+        if (canManage) teamInvite.classList.remove('hidden');
+        setStatus(teamStatus, `${items.length} member${items.length === 1 ? '' : 's'}.`, 'ok');
+      } catch (err) {
+        teamPanel.classList.add('hidden');
+      }
+    }
+
+    teamInviteBtn.addEventListener('click', async () => {
+      const email = String(teamInviteEmail.value || '').trim();
+      teamInviteBtn.disabled = true;
+      try {
+        await fetchJSON('/api/v1/account/members', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email }),
+        });
+        teamInviteEmail.value = '';
+        setStatus(teamStatus, `Invite sent to ${email}.`, 'ok');
+        await loadTeam();
+      } catch (err) {
+        setStatus(teamStatus, String(err.message || err), 'err');
+      } finally {
+        teamInviteBtn.disabled = false;
+      }
+    });
+
     async function refreshSession() {
       try {
         currentAccount = await fetchCurrentAccountWithRetry();
@@ -674,6 +766,7 @@
         void loadRecordings();
         void loadBilling();
         void loadHistory();
+        void loadTeam();
         if (authCompleted) scheduleAuthFlowContinue();
       } catch (_) {
         currentAccount = null;
@@ -681,6 +774,7 @@
         recordingsPanel.classList.add('hidden');
         billingPanel.classList.add('hidden');
         historyPanel.classList.add('hidden');
+        teamPanel.classList.add('hidden');
         if (authCompleted) {
           setStatus(accountStatus, 'Sign-in link was opened, but this browser still has no active session. Open the link in the same browser you want to use.', 'err');
         } else {
