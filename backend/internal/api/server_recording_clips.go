@@ -179,14 +179,59 @@ func lockRelayNodeAndGroup(ctx context.Context, tx pgx.Tx, principal nodePrincip
 	`, *groupID, principal.AccountID).Scan(&lockedID)
 }
 
+const cloudRecorderLockSQL = `
+	SELECT capacity
+	FROM recorder_droplets
+	WHERE name = $1 AND node_id = $2 AND state <> 'draining'
+	FOR UPDATE
+`
+
+const cloudRecordingJobsLeaseSQL = `
+	WITH cte AS (
+	  SELECT j.id
+	  FROM recording_jobs j
+	  JOIN recordings rec ON rec.id = j.recording_id
+	  WHERE (
+	          SELECT count(*)
+	          FROM recording_jobs live
+	          WHERE live.status = 'leased'
+	            AND live.lease_owner = $1
+	            AND live.lease_expires_at > now()
+	        ) < $5
+	    AND j.status = 'pending' AND j.scheduled_for <= now()
+	    AND (j.kind = 'continuous_window'
+	         OR j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now())
+	    AND rec.status = 'active'
+	    AND rec.start_at <= now()
+	    AND (rec.end_at IS NULL OR now() < rec.end_at)
+	    AND rec.capture_via = 'cloud'
+	    AND ($2 OR EXISTS (
+	          SELECT 1 FROM account_billing b
+	          WHERE b.account_id = rec.account_id
+	            AND b.has_payment_method))
+	  ORDER BY j.scheduled_for ASC, j.id ASC
+	  LIMIT 1
+	  FOR UPDATE OF j SKIP LOCKED
+	)
+	UPDATE recording_jobs j
+	SET status = 'leased',
+	    lease_owner = $1,
+	    lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)),
+	    attempt_count = attempt_count + 1,
+	    updated_at = now()
+	FROM cte, recordings rec
+	LEFT JOIN streams st ON st.id = rec.stream_id
+	WHERE j.id = cte.id AND rec.id = j.recording_id
+	RETURNING j.id, j.recording_id, rec.stream_url, COALESCE(rec.stream_id, 0),
+	          COALESCE(st.provider, ''), COALESCE(st.source_page_url, ''), j.clip_duration_sec,
+	          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
+	          rec.target_fps, j.kind, j.window_end_at
+`
+
 // handleRecordingJobsLease leases at most one due recording job for the calling
-// droplet. It locks ONLY recording_jobs in the CTE (mirroring the capture lease)
-// and inlines the capture gate (status='active', window open, and, when billing is
-// enabled, account has a card on file), matching the scheduler/forecast gate.
-// Leasing is restricted to operator-managed pool droplets: recorder_droplets rows
-// are created only by the autoscaler under the operator account, so a self-enrolled
-// local_recorder node (which has no such row) can lease nothing and therefore
-// cannot observe another tenant's stream_url or deny their capture.
+// recorder. Cloud leases lock the authenticated droplet row in a separate statement
+// before counting active leases, so concurrent requests see the preceding commit and
+// cannot exceed capacity. Relay leases keep their existing account-scoped path.
 func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request) {
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
@@ -211,57 +256,25 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		// $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
 		resp, err = s.leaseRelayRecordingJob(r.Context(), principal, billingDisabled, margin)
 	} else {
-		err = s.pool.QueryRow(r.Context(), `
-		WITH cte AS (
-		  SELECT j.id
-		  FROM recording_jobs j
-		  JOIN recordings rec ON rec.id = j.recording_id
-		  WHERE j.status='pending' AND j.scheduled_for <= now()
-		    -- Schedule integrity (SAMPLED clip jobs only): never hand out a clip job
-		    -- too late to be on-schedule. Capture has no seek-to-fire, so a clip job
-		    -- leased past its fire_at + clip_duration + grace would record the stream
-		    -- as-it-is-now (the wrong content) and store it as if it ran on schedule;
-		    -- such a job is left for the scheduler's miss-marking sweep instead. A
-		    -- continuous_window job's fire_at is the window-open instant (which may be
-		    -- many minutes ago by design), so the freshness deadline is bypassed for it.
-		    AND (j.kind='continuous_window'
-		         OR j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now())
-		    AND rec.status='active'
-		    AND rec.start_at <= now()
-		    AND (rec.end_at IS NULL OR now() < rec.end_at)
-		    -- Cloud droplets never lease relay recordings (they would fail at yt-dlp on a
-		    -- datacenter IP). capture_via is NOT NULL DEFAULT 'cloud', so every existing
-		    -- row matches and this predicate is dark until a relay recording exists.
-		    AND rec.capture_via = 'cloud'
-		    AND ($2 OR EXISTS (
-		          SELECT 1 FROM account_billing b
-		          WHERE b.account_id = rec.account_id
-		            AND b.has_payment_method))
-		    AND EXISTS (
-		          SELECT 1 FROM recorder_droplets d
-		          WHERE d.name = $1 AND d.state <> 'draining')
-		  ORDER BY j.scheduled_for ASC, j.id ASC
-		  LIMIT 1
-		  FOR UPDATE SKIP LOCKED
-		)
-		UPDATE recording_jobs j
-		SET status='leased',
-		    lease_owner=$1,
-		    lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)),
-		    attempt_count = attempt_count + 1,
-		    updated_at = now()
-		FROM cte, recordings rec
-		LEFT JOIN streams st ON st.id = rec.stream_id
-		WHERE j.id = cte.id AND rec.id = j.recording_id
-		RETURNING j.id, j.recording_id, rec.stream_url, COALESCE(rec.stream_id, 0),
-		          COALESCE(st.provider, ''), COALESCE(st.source_page_url, ''), j.clip_duration_sec,
-		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
-		          rec.target_fps, j.kind, j.window_end_at
-	`, workerID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
-			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
-			&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
-			&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
-		)
+		tx, beginErr := s.pool.Begin(r.Context())
+		if beginErr != nil {
+			err = fmt.Errorf("begin cloud lease: %w", beginErr)
+		} else {
+			defer func() { _ = tx.Rollback(r.Context()) }()
+			var capacity int
+			err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
+			if err == nil {
+				err = tx.QueryRow(r.Context(), cloudRecordingJobsLeaseSQL,
+					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity).Scan(
+					&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
+					&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
+					&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
+				)
+			}
+			if err == nil {
+				err = tx.Commit(r.Context())
+			}
+		}
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"job": nil})
@@ -767,7 +780,13 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// Touch the droplet liveness row if this worker is a managed droplet.
-	_, _ = s.pool.Exec(r.Context(), `UPDATE recorder_droplets SET last_seen_at=now() WHERE name=$1`, workerID)
+	_, _ = s.pool.Exec(r.Context(), `
+		UPDATE recorder_droplets
+		SET last_seen_at=now(),
+		    first_seen_at=COALESCE(first_seen_at, now()),
+		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
+		WHERE name=$1 AND node_id=$2
+	`, workerID, principal.NodeID)
 	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt})
 }
 
@@ -787,7 +806,13 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
 		return
 	}
-	if _, err := s.pool.Exec(r.Context(), `UPDATE recorder_droplets SET last_seen_at=now() WHERE name=$1`, workerID); err != nil {
+	if _, err := s.pool.Exec(r.Context(), `
+		UPDATE recorder_droplets
+		SET last_seen_at=now(),
+		    first_seen_at=COALESCE(first_seen_at, now()),
+		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
+		WHERE name=$1 AND node_id=$2
+	`, workerID, principal.NodeID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("touch droplet liveness: %v", err))
 		return
 	}
