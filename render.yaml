@@ -271,10 +271,14 @@ services:
       # Drain-to-zero default: with MIN=0 the pool drains fully to zero when there is
       # no near-term demand (cheapest), and the autoscaler provisions a droplet AHEAD
       # of each upcoming fire / continuous-window open by DROPLET_POOL_PROVISION_LEAD_SEC.
-      # That 600s (10min) lead comfortably covers the real cold-start (~1-2min snapshot
-      # boot + ~1-2min binary rebuild from HEAD = ~2-4min), so no fire from a cold pool
-      # misses; the lead-miss WARNING + the 900s provision-timeout reap remain the
-      # backstops. Set to 1 to keep one warm droplet at zero demand instead.
+      # Cold-start safety depends on DROPLET_POOL_IMAGE being rebaked from main HEAD: a
+      # snapshot whose baked binary matches HEAD makes a cold boot snapshot-time only
+      # (~1-2min), which fits inside the 600s (10min) lead, so no fire from a cold pool
+      # misses. A from-scratch go build on this size is ~13-15min and does NOT fit the
+      # lead, so the boot fast-path (do.go) must skip the build on a sha match: REBAKE
+      # the image after any recorder/cloud-init change so a cold MIN=0 boot stays fast.
+      # The lead-miss WARNING + the 900s provision-timeout reap remain the backstops.
+      # Set to 1 to keep one warm droplet at zero demand instead.
       - key: DROPLET_POOL_MIN
         value: "0"
       # Hard spend cap = ceiling Max*Capacity concurrent clips. Capacity=5 is baked
