@@ -161,6 +161,26 @@ func TestDashboardBuildStreamWhereSourceAndYouTubeChannel(t *testing.T) {
 	}
 }
 
+func TestDashboardBuildStreamWhereProviderFilter(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?provider=TOPIS", nil)
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
+		IncludeProvider: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := len(args), 1; got != want {
+		t.Fatalf("args len=%d want=%d", got, want)
+	}
+	if got, want := args[0], "topis"; got != want {
+		t.Fatalf("provider arg=%v want=%q", got, want)
+	}
+	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "LOWER(TRIM(COALESCE(s.provider, ''))) = $1") {
+		t.Fatalf("where missing provider placeholder: %s", sqlWhere)
+	}
+}
+
 func TestDashboardBuildStreamWhereIgnoresDisabledFilters(t *testing.T) {
 	req := httptest.NewRequest(
 		http.MethodGet,

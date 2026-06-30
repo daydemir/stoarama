@@ -214,6 +214,7 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 func (s *Server) handleDashboardStreamsCSV(w http.ResponseWriter, r *http.Request) {
 	where, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
 		IncludeSearch:         true,
+		IncludeProvider:       true,
 		IncludeSource:         true,
 		IncludeYouTubeChannel: true,
 		IncludeCaptureMode:    true,

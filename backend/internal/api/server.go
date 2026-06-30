@@ -302,6 +302,7 @@ func (s *Server) router() http.Handler {
 			public.Get("/dashboard/streams.csv", s.handleDashboardStreamsCSV)
 			public.Get("/dashboard/countries", s.handleDashboardCountries)
 			public.Get("/dashboard/cities", s.handleDashboardCities)
+			public.Get("/dashboard/providers", s.handleDashboardProviders)
 			public.Get("/dashboard/sources", s.handleDashboardSources)
 			public.Get("/dashboard/youtube-channels", s.handleDashboardYouTubeChannels)
 			public.Get("/dashboard/tags", s.handleDashboardTags)
@@ -3264,6 +3265,7 @@ func dashboardYouTubeChannelExprSQL() string {
 
 type dashboardStreamWhereConfig struct {
 	IncludeSearch         bool
+	IncludeProvider       bool
 	IncludeSource         bool
 	IncludeYouTubeChannel bool
 	IncludeCaptureMode    bool
@@ -3275,6 +3277,7 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	country := strings.TrimSpace(r.URL.Query().Get("country"))
 	city := strings.TrimSpace(r.URL.Query().Get("city"))
+	provider := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("provider")))
 	source := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("source")))
 	koreaFamily := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("korea_family")))
 	youtubeChannel := strings.TrimSpace(r.URL.Query().Get("youtube_channel"))
@@ -3327,6 +3330,10 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	if city != "" {
 		args = append(args, strings.ToLower(city))
 		where = append(where, fmt.Sprintf("LOWER(%s) = $%d", dashboardCityExprSQL(), len(args)))
+	}
+	if cfg.IncludeProvider && provider != "" {
+		args = append(args, provider)
+		where = append(where, fmt.Sprintf("LOWER(TRIM(COALESCE(s.provider, ''))) = $%d", len(args)))
 	}
 	if cfg.IncludeSource && source != "" {
 		args = append(args, source)
@@ -3399,6 +3406,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 	}
 	where, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
 		IncludeSearch:         true,
+		IncludeProvider:       true,
 		IncludeSource:         true,
 		IncludeYouTubeChannel: true,
 		IncludeCaptureMode:    true,
@@ -3633,6 +3641,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleDashboardCountries(w http.ResponseWriter, r *http.Request) {
 	where, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
 		IncludeSearch:         false,
+		IncludeProvider:       true,
 		IncludeSource:         true,
 		IncludeYouTubeChannel: true,
 		IncludeCaptureMode:    true,
@@ -3677,6 +3686,7 @@ func (s *Server) handleDashboardCountries(w http.ResponseWriter, r *http.Request
 func (s *Server) handleDashboardCities(w http.ResponseWriter, r *http.Request) {
 	where, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
 		IncludeSearch:         false,
+		IncludeProvider:       true,
 		IncludeSource:         true,
 		IncludeYouTubeChannel: true,
 		IncludeCaptureMode:    true,
@@ -3721,6 +3731,7 @@ func (s *Server) handleDashboardCities(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDashboardSources(w http.ResponseWriter, r *http.Request) {
 	where, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
 		IncludeSearch:         false,
+		IncludeProvider:       true,
 		IncludeSource:         false,
 		IncludeYouTubeChannel: true,
 		IncludeCaptureMode:    true,
@@ -3766,9 +3777,62 @@ func (s *Server) handleDashboardSources(w http.ResponseWriter, r *http.Request) 
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
+func (s *Server) handleDashboardProviders(w http.ResponseWriter, r *http.Request) {
+	where, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
+		IncludeSearch:         false,
+		IncludeProvider:       false,
+		IncludeSource:         true,
+		IncludeYouTubeChannel: true,
+		IncludeCaptureMode:    true,
+	})
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
+		SELECT provider
+		FROM (
+			SELECT TRIM(COALESCE(s.provider, '')) AS provider
+			FROM streams s
+			WHERE %s
+		) x
+		WHERE provider <> ''
+		GROUP BY provider
+		ORDER BY COUNT(*) DESC, provider ASC
+		LIMIT 500
+	`, strings.Join(where, " AND ")), args...)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("dashboard providers query: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	items := make([]string, 0, 128)
+	for rows.Next() {
+		var provider string
+		if err := rows.Scan(&provider); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan dashboard provider: %v", err))
+			return
+		}
+		provider = strings.TrimSpace(provider)
+		if provider == "" {
+			continue
+		}
+		items = append(items, provider)
+	}
+	if rows.Err() != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate dashboard providers: %v", rows.Err()))
+		return
+	}
+
+	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
 func (s *Server) handleDashboardYouTubeChannels(w http.ResponseWriter, r *http.Request) {
 	where, args, err := dashboardBuildStreamWhereFromRequest(r, dashboardStreamWhereConfig{
 		IncludeSearch:         false,
+		IncludeProvider:       true,
 		IncludeSource:         true,
 		IncludeYouTubeChannel: false,
 		IncludeCaptureMode:    true,
@@ -3832,7 +3896,7 @@ func (s *Server) handleDashboardTags(w http.ResponseWriter, r *http.Request) {
 	}
 
 	args := make([]any, 0, 2)
-	tagWhere := []string{"BTRIM(tag) <> ''"}
+	tagWhere := []string{"BTRIM(tag) <> ''", "lower(BTRIM(tag)) NOT LIKE 'provider:%'", "lower(BTRIM(tag)) NOT LIKE 'capture_type:%'"}
 	if q != "" {
 		args = append(args, "%"+q+"%")
 		tagWhere = append(tagWhere, fmt.Sprintf("tag ILIKE $%d", len(args)))
@@ -6959,7 +7023,7 @@ func dedupeStrings(in []string) []string {
 		if v == "" {
 			continue
 		}
-		if strings.HasPrefix(strings.ToLower(v), "provider:") {
+		if isReservedStreamTag(v) {
 			continue
 		}
 		if _, ok := seen[v]; ok {
@@ -6969,6 +7033,11 @@ func dedupeStrings(in []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+func isReservedStreamTag(tag string) bool {
+	v := strings.ToLower(strings.TrimSpace(tag))
+	return strings.HasPrefix(v, "provider:") || strings.HasPrefix(v, "capture_type:")
 }
 
 func slugify(raw string) string {

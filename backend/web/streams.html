@@ -1487,7 +1487,6 @@
       <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube<span class="seg-count" data-seg-count="youtube"></span></button>
-      <a class="source-seg-btn" href="/korea" role="tab">Korea</a>
     </div>
     <div class="filter-stack-card">
       <div class="filter-grid filter-grid-primary">
@@ -1511,6 +1510,18 @@
           <div class="filter-field-label">Tag</div>
           <select id="streamTagFilter">
             <option value="">any tag</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Provider</div>
+          <select id="providerFilter">
+            <option value="">all providers</option>
+          </select>
+        </div>
+        <div class="filter-field" id="koreaRegionField">
+          <div class="filter-field-label">Region</div>
+          <select id="koreaRegionFilter">
+            <option value="">all regions</option>
           </select>
         </div>
       </div>
@@ -1710,6 +1721,9 @@ const streamTagExcludeFilter = $('streamTagExcludeFilter');
 const streamRecordingStateFilter = $('streamRecordingState');
 const streamModeFilter = $('streamModeFilter');
 const sourceFilter = $('sourceFilter');
+const providerFilter = $('providerFilter');
+const koreaRegionField = $('koreaRegionField');
+const koreaRegionFilter = $('koreaRegionFilter');
 const countryFilter = $('countryFilter');
 const cityFilter = $('cityFilter');
 const streamViewTableBtn = $('streamViewTable');
@@ -1837,7 +1851,6 @@ const KOREA_FAMILIES = Object.freeze([
   { value: 'kbs', label: 'KBS' },
   { value: 'gigaeyes', label: 'GiGAeyes' },
 ]);
-const isKoreaPage = window.location.pathname === '/korea';
 let currentStreamRoute = STREAM_ROUTE.LIST;
 let inferenceScope = 'recorded';
 let selectedPipelineID = '';
@@ -3078,14 +3091,15 @@ function renderLocationHierarchy(stream) {
   return parts.join('');
 }
 function updateStreamFilterSummary() {
-  // Public catalog only exposes Search, Country, and City filters. Summarize the
-  // active location filters in plain language; show nothing when none are set,
-  // never raw internal field names.
   const countryRaw = String(countryFilter.value || '').trim();
   const cityRaw = String(cityFilter.value || '').trim();
+  const providerRaw = String(providerFilter.value || '').trim();
+  const koreaRaw = normalizeKoreaFamily(koreaRegionFilter.value);
   const parts = [];
   if (countryRaw) parts.push(`Country: ${countryDisplayLabel(countryRaw)}`);
   if (cityRaw) parts.push(`City: ${cityDisplayLabel(cityRaw)}`);
+  if (providerRaw) parts.push(`Provider: ${formatProviderLabel(providerRaw)}`);
+  if (koreaRaw || String(koreaRegionFilter.value || '').trim().toLowerCase() === 'all') parts.push(`Korea: ${formatKoreaFamilyLabel(koreaRaw)}`);
   streamFilterSummary.textContent = parts.join(' · ');
 }
 
@@ -3096,6 +3110,8 @@ async function resetStreamFilters() {
   streamRecordingStateFilter.value = '';
   streamModeFilter.value = '';
   sourceFilter.value = '';
+  providerFilter.value = '';
+  koreaRegionFilter.value = '';
   countryFilter.value = '';
   cityFilter.value = '';
   streamTouchedPipelineID = '';
@@ -4026,7 +4042,7 @@ async function loadDiscoveryCandidates() {
 }
 
 // ─── Location filters ─────────────────────────────────────────────────────────
-function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '') {
+function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', provider = '', koreaFamily = '') {
   const params = new URLSearchParams();
   const normalizedRecordingState = normalizeRecordingStateFilter(recordingState);
   const normalizedCaptureType = normalizeCaptureTypeFilter(captureType);
@@ -4037,9 +4053,9 @@ function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', ta
   if (String(tagsNotCSV || '').trim()) params.set('tags_not', String(tagsNotCSV).trim());
   if (String(country || '').trim()) params.set('country', String(country).trim());
   if (String(city || '').trim()) params.set('city', String(city).trim());
-  if (isKoreaPage) {
-    params.set('korea_family', normalizeKoreaFamily(source) || 'all');
-  } else if (String(source || '').trim()) {
+  if (String(provider || '').trim()) params.set('provider', String(provider).trim());
+  if (String(koreaFamily || '').trim()) params.set('korea_family', normalizeKoreaFamily(koreaFamily) || 'all');
+  if (String(source || '').trim()) {
     params.set('source', String(source).trim());
   }
   return params;
@@ -4063,6 +4079,12 @@ function formatSourceLabel(source) {
   if (KOREA_FAMILIES.some((item) => item.value === key)) return formatKoreaFamilyLabel(key);
   if (key === 'youtube') return 'YouTube';
   return key.toUpperCase();
+}
+
+function formatProviderLabel(provider) {
+  const raw = String(provider || '').trim();
+  if (!raw) return '-';
+  return raw.replace(/_/g, ' ');
 }
 
 function formatCaptureTypeLabel(captureType) {
@@ -4106,9 +4128,9 @@ function populateCaptureTypeOptions(selectEl, allLabel) {
   if (!prev) selectEl.value = '';
 }
 
-async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '') {
+async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '') {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily);
   const payload = await fetchJSON(`/api/v1/dashboard/countries?${params}`);
   const values = (payload.items || [])
     .map((v) => String(v))
@@ -4119,9 +4141,9 @@ async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingSt
   if (!values.includes(prev)) targetSelect.value = '';
 }
 
-async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '') {
+async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '') {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily);
   const payload = await fetchJSON(`/api/v1/dashboard/cities?${params}`);
   const values = (payload.items || [])
     .map((v) => String(v))
@@ -4133,17 +4155,34 @@ async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState
   if (targetSelect === cityFilter) updateStreamFilterSummary();
 }
 
-async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '') {
+function populateKoreaRegionOptions() {
+  if (!(koreaRegionFilter instanceof HTMLSelectElement)) return;
+  const prev = String(koreaRegionFilter.value || '').trim().toLowerCase();
+  const values = KOREA_FAMILIES.map((item) => item.value);
+  koreaRegionFilter.innerHTML = '<option value="">all regions</option>' +
+    '<option value="all">Korea: all known providers</option>' +
+    KOREA_FAMILIES.map((item) => `<option value="${esc(item.value)}">${esc(item.label)}</option>`).join('');
+  if (prev === 'all' || values.includes(prev)) koreaRegionFilter.value = prev;
+  else koreaRegionFilter.value = '';
+}
+
+async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '') {
+  if (!(targetSelect instanceof HTMLSelectElement)) return;
+  const prev = String(targetSelect.value || '').trim();
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily);
+  const payload = await fetchJSON(`/api/v1/dashboard/providers?${params}`);
+  const values = (payload.items || [])
+    .map((v) => String(v).trim())
+    .filter((v) => v.length > 0)
+    .sort((a, b) => compareOptionLabels(formatProviderLabel(a), formatProviderLabel(b)));
+  targetSelect.innerHTML = '<option value="">all providers</option>' +
+    values.map((v) => `<option value="${esc(v)}"${v === prev ? ' selected' : ''}>${esc(formatProviderLabel(v))}</option>`).join('');
+  if (!values.includes(prev)) targetSelect.value = '';
+}
+
+async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '') {
   const prev = String(targetSelect.value || '').trim().toLowerCase();
-  if (isKoreaPage && targetSelect === sourceFilter) {
-    const values = KOREA_FAMILIES.map((item) => item.value);
-    targetSelect.innerHTML = '<option value="">all sources</option>' +
-      KOREA_FAMILIES.map((item) => `<option value="${esc(item.value)}"${item.value === prev ? ' selected' : ''}>${esc(item.label)}</option>`).join('');
-    if (!values.includes(prev)) targetSelect.value = '';
-    updateStreamFilterSummary();
-    return;
-  }
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily);
   const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`);
   const values = (payload.items || [])
     .map((v) => String(v).trim().toLowerCase())
@@ -4267,18 +4306,19 @@ function buildStreamFilterParams() {
   updateStreamFilterSummary();
   const recordingState = normalizeRecordingStateFilter(streamRecordingStateFilter.value);
   const captureType = normalizeCaptureTypeFilter(streamModeFilter.value);
+  const koreaFamily = streamSourceSegment === 'recordable' ? String(koreaRegionFilter.value || '').trim() : '';
   if (recordingState) params.set('recording_state', recordingState);
   if (captureType) params.set('capture_type', captureType);
   if (streamSearch.value.trim()) params.set('q', streamSearch.value.trim());
   if (streamTagFilter.value.trim()) params.set('tags', streamTagFilter.value.trim());
   if (streamTagExcludeFilter.value.trim()) params.set('tags_not', streamTagExcludeFilter.value.trim());
-  if (isKoreaPage) {
-    params.set('korea_family', normalizeKoreaFamily(sourceFilter.value) || 'all');
-  } else if (streamSourceSegment === 'recordable') {
+  if (streamSourceSegment === 'recordable') {
     params.set('recordable', '1');
+    if (koreaFamily) params.set('korea_family', normalizeKoreaFamily(koreaFamily) || 'all');
   } else if (sourceFilter.value.trim()) {
     params.set('source', sourceFilter.value.trim());
   }
+  if (providerFilter.value.trim()) params.set('provider', providerFilter.value.trim());
   if (countryFilter.value.trim()) params.set('country', countryFilter.value.trim());
   if (cityFilter.value.trim()) params.set('city', cityFilter.value.trim());
   if (String(streamTouchedPipelineID || '').trim()) params.set('touched_pipeline_id', String(streamTouchedPipelineID).trim());
@@ -4290,12 +4330,13 @@ function applyStreamListStateFromURL(params) {
   streamSearch.value = String(params.get('q') || '').trim();
   streamTagFilter.value = String(params.get('tags') || '').trim();
   streamTagExcludeFilter.value = String(params.get('tags_not') || '').trim();
-  if (isKoreaPage && !params.has('tags_not')) streamTagExcludeFilter.value = '';
   streamRecordingStateFilter.value = normalizeRecordingStateFilter(params.get('recording_state'));
   streamModeFilter.value = normalizeCaptureTypeFilter(params.get('capture_type'));
-  sourceFilter.value = isKoreaPage
-    ? normalizeKoreaFamily(params.get('korea_family') || params.get('source'))
-    : String(params.get('source') || '').trim();
+  sourceFilter.value = String(params.get('source') || '').trim();
+  providerFilter.value = String(params.get('provider') || '').trim();
+  koreaRegionFilter.value = params.has('korea_family')
+    ? (normalizeKoreaFamily(params.get('korea_family')) || 'all')
+    : '';
   countryFilter.value = String(params.get('country') || '').trim();
   cityFilter.value = String(params.get('city') || '').trim();
   streamTouchedPipelineID = String(params.get('touched_pipeline_id') || '').trim();
@@ -4329,8 +4370,7 @@ function syncStreamListURL(opts = {}) {
     params.set('page_size', String(Math.max(1, Math.floor(Number(streamPageSize) || 100))));
   }
   const qs = params.toString();
-  const path = isKoreaPage ? '/korea' : '/streams';
-  updateHistoryURL(qs ? `${path}?${qs}` : path, opts.replace === true);
+  updateHistoryURL(qs ? `/streams?${qs}` : '/streams', opts.replace === true);
 }
 
 function syncDetailURL(opts = {}) {
@@ -4340,6 +4380,8 @@ function syncDetailURL(opts = {}) {
 
 async function refreshAllStreamFilterOptions() {
   populateCaptureTypeOptions(streamModeFilter, 'capture type: all');
+  populateKoreaRegionOptions();
+  const koreaFamily = streamSourceSegment === 'recordable' ? String(koreaRegionFilter.value || '').trim() : '';
   await loadSourceOptions(
     sourceFilter,
     'all',
@@ -4349,6 +4391,20 @@ async function refreshAllStreamFilterOptions() {
     countryFilter.value,
     cityFilter.value,
     streamModeFilter.value,
+    providerFilter.value,
+    koreaFamily,
+  );
+  await loadProviderOptions(
+    providerFilter,
+    'all',
+    streamTagFilter.value,
+    streamRecordingStateFilter.value,
+    streamTagExcludeFilter.value,
+    countryFilter.value,
+    cityFilter.value,
+    sourceFilter.value,
+    streamModeFilter.value,
+    koreaFamily,
   );
   await loadCountryOptions(
     countryFilter,
@@ -4358,6 +4414,8 @@ async function refreshAllStreamFilterOptions() {
     streamTagExcludeFilter.value,
     sourceFilter.value,
     streamModeFilter.value,
+    providerFilter.value,
+    koreaFamily,
   );
   await loadCityOptions(
     cityFilter,
@@ -4368,6 +4426,8 @@ async function refreshAllStreamFilterOptions() {
     countryFilter.value,
     sourceFilter.value,
     streamModeFilter.value,
+    providerFilter.value,
+    koreaFamily,
   );
   updateStreamFilterSummary();
 }
@@ -4620,18 +4680,6 @@ function renderStreamRows() {
 }
 
 function applySourceSegment(seg) {
-  if (isKoreaPage) {
-    streamSourceSegment = 'korea';
-    const seg2 = document.getElementById('streamSourceSegment');
-    if (seg2) {
-      seg2.querySelectorAll('.source-seg-btn').forEach((b) => {
-        const on = b.getAttribute('href') === '/korea';
-        b.classList.toggle('active', on);
-        b.setAttribute('aria-selected', on ? 'true' : 'false');
-      });
-    }
-    return;
-  }
   streamSourceSegment = (seg === 'youtube' || seg === 'still_image') ? seg : 'recordable';
   // Drive the existing filter state that buildStreamFilterParams reads. YouTube
   // and Still image are exact capture types; Recordable clears capture_type and
@@ -4639,11 +4687,14 @@ function applySourceSegment(seg) {
   sourceFilter.value = '';
   if (streamSourceSegment === 'youtube') {
     streamModeFilter.value = 'youtube_watch';
+    koreaRegionFilter.value = '';
   } else if (streamSourceSegment === 'still_image') {
     streamModeFilter.value = 'still_image';
+    koreaRegionFilter.value = '';
   } else {
     streamModeFilter.value = '';
   }
+  if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === 'recordable' ? '' : 'none';
   const seg2 = document.getElementById('streamSourceSegment');
   if (seg2) {
     seg2.querySelectorAll('.source-seg-btn').forEach((b) => {
@@ -4659,13 +4710,6 @@ function applySourceSegment(seg) {
   if (!seg) return;
   seg.querySelectorAll('button[data-source-seg]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      if (isKoreaPage) {
-        const next = btn.getAttribute('data-source-seg') === 'youtube'
-          ? '/streams?capture_type=youtube_watch'
-          : '/streams?recordable=1';
-        window.location.assign(next);
-        return;
-      }
       applySourceSegment(btn.getAttribute('data-source-seg'));
       void loadStreams({ resetPage: true }).catch((err) => setStreamStatus(String(err), 'err'));
     });
@@ -5554,6 +5598,12 @@ streamModeFilter.addEventListener('change', async () => {
 sourceFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: true });
 });
+providerFilter.addEventListener('change', async () => {
+  await reloadStreamsForFilterChange({ reloadAllOptions: true });
+});
+koreaRegionFilter.addEventListener('change', async () => {
+  await reloadStreamsForFilterChange({ reloadAllOptions: true });
+});
 countryFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: true });
 });
@@ -5715,19 +5765,6 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ─── Routing & init ───────────────────────────────────────────────────────────
-function applyKoreaPageMode() {
-  if (!isKoreaPage) return;
-  document.querySelectorAll('.global-nav a').forEach((link) => {
-    const href = String(link.getAttribute('href') || '');
-    // On /korea the primary tab that stays lit is Streams ("/").
-    link.classList.toggle('active', href === '/');
-  });
-  const title = document.querySelector('.domain-intro-title');
-  if (title) title.textContent = 'Korea';
-  const copy = document.querySelector('.domain-intro-copy');
-  if (copy) copy.textContent = 'Browse Korean public CCTV streams by upstream source family.';
-}
-
 function parseStreamsLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean);
   const params = new URLSearchParams(window.location.search);
@@ -5739,7 +5776,7 @@ function parseStreamsLocation() {
     const n = Number(parts[2]);
     if (Number.isFinite(n) && n > 0) streamID = n;
   }
-  return { params, streamID, isList: parts.length === 0 || (parts.length === 1 && (parts[0] === 'streams' || parts[0] === 'korea')) };
+  return { params, streamID, isList: parts.length === 0 || (parts.length === 1 && parts[0] === 'streams') };
 }
 
 async function applyStreamsRouteState(opts = {}) {
@@ -5765,10 +5802,8 @@ async function applyStreamsRouteState(opts = {}) {
   showPanel('streams');
   setStreamsView(streamsView, { replaceURL: true });
   const initialCapture = normalizeCaptureTypeFilter(params.get('capture_type'));
-  const initialSourceSegment = isKoreaPage
-    ? 'korea'
-    : (initialCapture === 'youtube_watch' ? 'youtube'
-      : (initialCapture === 'still_image' ? 'still_image' : 'recordable'));
+  const initialSourceSegment = initialCapture === 'youtube_watch' ? 'youtube'
+    : (initialCapture === 'still_image' ? 'still_image' : 'recordable');
   applySourceSegment(initialSourceSegment);
   void loadStreamSegmentCounts();
   await refreshAllStreamFilterOptions();
@@ -5784,7 +5819,6 @@ window.addEventListener('popstate', () => {
 
 (async function init() {
   try {
-    applyKoreaPageMode();
     void resolveSessionState();
     await applyStreamsRouteState();
     void loadKnownStreamTagsSafe('all').catch(() => {});

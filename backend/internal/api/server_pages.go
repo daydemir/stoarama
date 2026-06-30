@@ -70,8 +70,19 @@ func (s *Server) handleRecordingsApp(w http.ResponseWriter, _ *http.Request) {
 	writeHTML(w, s.recordingsHTML)
 }
 
-func (s *Server) handleKoreaApp(w http.ResponseWriter, _ *http.Request) {
-	writeHTML(w, s.streamsHTML)
+func (s *Server) handleKoreaApp(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if strings.TrimSpace(q.Get("korea_family")) == "" {
+		q.Set("korea_family", "all")
+	}
+	if strings.TrimSpace(q.Get("recordable")) == "" && strings.TrimSpace(q.Get("capture_type")) == "" {
+		q.Set("recordable", "1")
+	}
+	target := "/streams"
+	if encoded := q.Encode(); encoded != "" {
+		target += "?" + encoded
+	}
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 func (s *Server) handleDocsRoot(w http.ResponseWriter, r *http.Request) {
