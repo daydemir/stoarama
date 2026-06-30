@@ -3952,30 +3952,36 @@ func (s *Server) latestPreviewObjectKeys(ctx context.Context, streamIDs []int64)
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 			ids.stream_id,
-			preview.object_key
+			CASE
+				WHEN frame_media.captured_at IS NULL THEN segment_thumb.object_key
+				WHEN segment_thumb.captured_at IS NULL THEN frame_media.object_key
+				WHEN frame_media.captured_at >= segment_thumb.captured_at THEN frame_media.object_key
+				ELSE segment_thumb.object_key
+			END
 		FROM UNNEST($1::bigint[]) AS ids(stream_id)
 		LEFT JOIN LATERAL (
-			SELECT object_key
-			FROM (
-				SELECT m.object_key, f.captured_at AS captured_at, f.id AS source_id
-				FROM frames f
-				JOIN media_objects m ON m.id = f.raw_media_object_id
-				WHERE f.stream_id = ids.stream_id
-				  AND f.capture_status = 'success'
-				  AND f.raw_media_object_id IS NOT NULL
-				UNION ALL
-				SELECT m.object_key, cs.segment_end_at AS captured_at, cs.id AS source_id
-				FROM capture_segments cs
-				JOIN media_objects m ON m.id = cs.thumbnail_media_object_id
-				WHERE cs.stream_id = ids.stream_id
-				  AND cs.capture_status = 'success'
-				  AND cs.thumbnail_media_object_id IS NOT NULL
-			) candidates
-			WHERE COALESCE(object_key, '') <> ''
-			ORDER BY captured_at DESC NULLS LAST, source_id DESC
+			SELECT m.object_key, f.captured_at
+			FROM frames f
+			JOIN media_objects m ON m.id = f.raw_media_object_id
+			WHERE f.stream_id = ids.stream_id
+			  AND f.capture_status = 'success'
+			  AND f.raw_media_object_id IS NOT NULL
+			  AND COALESCE(m.object_key, '') <> ''
+			ORDER BY f.captured_at DESC, f.id DESC
 			LIMIT 1
-		) preview ON true
-		WHERE COALESCE(preview.object_key, '') <> ''
+		) frame_media ON true
+		LEFT JOIN LATERAL (
+			SELECT m.object_key, cs.segment_end_at AS captured_at
+			FROM capture_segments cs
+			JOIN media_objects m ON m.id = cs.thumbnail_media_object_id
+			WHERE cs.stream_id = ids.stream_id
+			  AND cs.capture_status = 'success'
+			  AND cs.thumbnail_media_object_id IS NOT NULL
+			  AND COALESCE(m.object_key, '') <> ''
+			ORDER BY cs.segment_end_at DESC, cs.id DESC
+			LIMIT 1
+		) segment_thumb ON true
+		WHERE COALESCE(frame_media.object_key, segment_thumb.object_key, '') <> ''
 	`, streamIDs)
 	if err != nil {
 		return nil, fmt.Errorf("query latest preview keys: %w", err)
