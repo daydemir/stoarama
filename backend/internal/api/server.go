@@ -197,6 +197,11 @@ func (s *Server) router() http.Handler {
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {
 			account.Use(s.requireAccountAuth)
+			// Confine a 'stoarama.pull'-scoped key to the 4 NAS pull endpoints; a
+			// session or full/read key is unaffected. Runs after requireAccountAuth
+			// so the principal is in context. Default-DENY: any non-pull account
+			// route 403s a pull key.
+			account.Use(s.confineAccountScope)
 			account.Get("/me", s.handleAccountMe)
 			account.Post("/logout", s.handleAccountLogout)
 			account.Get("/api-keys", s.handleAccountAPIKeysList)
@@ -214,6 +219,9 @@ func (s *Server) router() http.Handler {
 			account.Post("/recordings", s.handleAccountRecordingsCreate)
 			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
 			account.Get("/clips", s.handleAccountClips)
+			// Heartbeat is called by the pull client with its scoped key, so it lives
+			// in the key-OR-session group and is allowlisted in pullPathAllowed.
+			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
@@ -385,6 +393,15 @@ func (s *Server) router() http.Handler {
 			bundles.Post("/account/bundles/{id}/pause", s.handleAccountBundlePause)
 			bundles.Post("/account/bundles/{id}/resume", s.handleAccountBundleResume)
 			bundles.Post("/account/bundles/{id}/cancel", s.handleAccountBundleCancel)
+
+			// Self-serve NAS pull connections: any account member (cookie session)
+			// can mint a 'stoarama.pull'-scoped key + connection, list/rotate/remove
+			// them. NOT owner/admin-gated. Registered as full explicit paths so
+			// /account/connections (no trailing slash) matches.
+			bundles.Post("/account/connections", s.handleAccountConnectionsCreate)
+			bundles.Get("/account/connections", s.handleAccountConnectionsList)
+			bundles.Post("/account/connections/{id}/rotate", s.handleAccountConnectionRotate)
+			bundles.Delete("/account/connections/{id}", s.handleAccountConnectionDelete)
 		})
 
 		api.Group(func(rec chi.Router) {

@@ -15,7 +15,12 @@ The loop drains an account-wide, forward-cursored clips feed:
   GET  {BASE}/account/clips?after_id={cursor}&limit=200   (lists unpurged clips)
   GET  {BASE}{clip.download_path}                         (presigns the R2 GET)
   DELETE {BASE}/account/recordings/{rid}/clips/{cid}      (purges after pull)
+  POST {BASE}/account/connections/heartbeat              (status each tick)
 all with header `Authorization: Bearer {STOARAMA_API_KEY}` (a sir_ account key).
+
+Each tick the client posts a heartbeat {cursor_id, clips_pulled} so the Stoarama
+account UI can show this connection as healthy/stale and report progress. The
+heartbeat is best-effort: a failure is logged and never breaks the drain loop.
 
 The download endpoint returns JSON {"url": "<presigned>", "size_bytes": ...},
 not a 302 redirect, so we parse the body and fetch the `url` field.
@@ -97,26 +102,48 @@ class Config:
             raise SystemExit("STOARAMA_API_KEY is required (a sir_ account API key)")
 
 
-def request_json(cfg, method, path_or_url, base=None):
-    """GET/DELETE a Stoarama API endpoint with the Bearer key; return parsed JSON.
+def request_json(cfg, method, path_or_url, base=None, body=None):
+    """Call a Stoarama API endpoint with the Bearer key; return parsed JSON.
 
     path_or_url may be an absolute URL or a path joined onto base (default
     api_base). The download_path from the list response already carries the
     /api/v1 prefix, so it is passed with base=cfg.origin to avoid doubling it.
-    Raises urllib.error.HTTPError / URLError on transport failure so the caller
-    can back off rather than crash.
+    `body`, if given, is JSON-encoded and sent with Content-Type application/json
+    (used by the heartbeat POST). Raises urllib.error.HTTPError / URLError on
+    transport failure so the caller can back off rather than crash.
     """
     if base is None:
         base = cfg.api_base
     url = path_or_url if path_or_url.startswith("http") else base + path_or_url
-    req = urllib.request.Request(url, method=method)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, method=method, data=data)
     req.add_header("Authorization", "Bearer " + cfg.api_key)
     req.add_header("User-Agent", USER_AGENT)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
-        body = resp.read()
-    if not body:
+        body_bytes = resp.read()
+    if not body_bytes:
         return {}
-    return json.loads(body.decode("utf-8"))
+    return json.loads(body_bytes.decode("utf-8"))
+
+
+def send_heartbeat(cfg, cursor_id, clips_pulled):
+    """Best-effort POST of the connection heartbeat. Never raises: a heartbeat
+    failure must not interrupt the drain loop (logged + swallowed)."""
+    try:
+        request_json(
+            cfg,
+            "POST",
+            "/account/connections/heartbeat",
+            body={"cursor_id": int(cursor_id), "clips_pulled": int(clips_pulled)},
+        )
+    except urllib.error.HTTPError as exc:
+        log("WARN", "heartbeat failed: HTTP %s (continuing)" % exc.code)
+    except urllib.error.URLError as exc:
+        log("WARN", "heartbeat failed: %s (continuing)" % exc)
 
 
 def load_cursor(cfg):
@@ -262,17 +289,19 @@ def _safe_unlink(path):
         pass
 
 
-def run_tick(cfg, cursor):
-    """Drain one page of clips from `cursor`. Returns the new cursor.
+def run_tick(cfg, cursor, total_pulled):
+    """Drain one page of clips from `cursor`. Returns (new_cursor, total_pulled).
 
-    For each clip in order: process it; on success advance the cursor and (unless
-    dry-run) persist it; on failure stop the page so the failed clip is the next
-    one retried (strict in-order, drain-once).
+    For each clip in order: process it; on success advance the cursor, bump the
+    running total, and (unless dry-run) persist the cursor; on failure stop the
+    page so the failed clip is the next one retried (strict in-order, drain-once).
+    A heartbeat is posted after the page so the account UI tracks progress.
     """
     page = request_json(cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (cursor, LIST_PAGE_LIMIT))
     clips = page.get("clips", [])
     if not clips:
-        return cursor
+        send_heartbeat(cfg, cursor, total_pulled)
+        return cursor, total_pulled
 
     log("INFO", "fetched %d clip(s) after_id=%d" % (len(clips), cursor))
     for clip in clips:
@@ -281,9 +310,11 @@ def run_tick(cfg, cursor):
             # retried first next tick.
             break
         cursor = int(clip["clip_id"])
+        total_pulled += 1
         if not cfg.dry_run:
             persist_cursor(cfg, cursor)
-    return cursor
+    send_heartbeat(cfg, cursor, total_pulled)
+    return cursor, total_pulled
 
 
 def main():
@@ -293,12 +324,13 @@ def main():
 
     mode = "DRY-RUN (no deletes, cursor not persisted)" if cfg.dry_run else "LIVE"
     cursor = load_cursor(cfg)
+    total_pulled = 0
     log("INFO", "stoarama pull starting mode=%s api_base=%s output_dir=%s cursor=%d"
         % (mode, cfg.api_base, cfg.output_dir, cursor))
 
     while True:
         try:
-            new_cursor = run_tick(cfg, cursor)
+            new_cursor, total_pulled = run_tick(cfg, cursor, total_pulled)
             if new_cursor == cursor:
                 # Empty page (or first clip failed): idle before polling again.
                 time.sleep(cfg.poll_interval_sec)

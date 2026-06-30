@@ -306,6 +306,35 @@
       </div>
     </section>
 
+    <section id="connectionsPanel" class="panel hidden" style="margin-bottom:16px;">
+      <div class="section-title">
+        <div>
+          <div class="eyebrow">NAS connections</div>
+          <h2>Pull clips to your NAS</h2>
+        </div>
+      </div>
+      <p class="muted" style="font-size:13px;margin:0 0 14px;">A NAS connection runs the Stoarama pull client on your own storage. It downloads each recorded clip, verifies it, then purges the managed copy. Create a connection to get a token and a ready-to-paste docker-compose file.</p>
+      <div id="connectionsStatus" class="status">Loading connections...</div>
+      <div id="connectionsList" class="rec-list hidden"></div>
+      <div id="connectionsCreate" style="margin-top:14px;">
+        <label for="connLabel">Connection label</label>
+        <input id="connLabel" type="text" placeholder="MIT Synology NAS" />
+        <label for="connInterval" style="margin-top:12px;">Poll interval (seconds, 10-3600)</label>
+        <input id="connInterval" type="number" min="10" max="3600" value="90" />
+        <div class="button-row" style="margin-top:12px;">
+          <button id="connCreateBtn" type="button" style="width:auto;min-width:180px;">Create connection</button>
+        </div>
+      </div>
+      <div id="connTokenBox" class="hidden" style="margin-top:16px;padding:14px;border:1px solid var(--err);border-radius:8px;">
+        <div style="font-weight:600;margin-bottom:6px;">Save this now: you will not see this token again.</div>
+        <p class="muted" style="font-size:12px;margin:0 0 10px;">Paste the docker-compose below onto your NAS and run it. The token is embedded; keep it secret.</p>
+        <textarea id="connSnippet" readonly rows="14" style="width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;"></textarea>
+        <div class="button-row" style="margin-top:10px;">
+          <button id="connCopyBtn" type="button" style="width:auto;min-width:120px;">Copy</button>
+        </div>
+      </div>
+    </section>
+
     <section class="panel" style="margin-bottom:16px;">
       <div class="eyebrow">Support</div>
       <h2>Need help?</h2>
@@ -358,6 +387,15 @@
     const teamInvite = document.getElementById('teamInvite');
     const teamInviteEmail = document.getElementById('teamInviteEmail');
     const teamInviteBtn = document.getElementById('teamInviteBtn');
+    const connectionsPanel = document.getElementById('connectionsPanel');
+    const connectionsStatus = document.getElementById('connectionsStatus');
+    const connectionsList = document.getElementById('connectionsList');
+    const connLabel = document.getElementById('connLabel');
+    const connInterval = document.getElementById('connInterval');
+    const connCreateBtn = document.getElementById('connCreateBtn');
+    const connTokenBox = document.getElementById('connTokenBox');
+    const connSnippet = document.getElementById('connSnippet');
+    const connCopyBtn = document.getElementById('connCopyBtn');
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const requestedRedirectPath = (() => {
@@ -748,6 +786,113 @@
       }
     });
 
+    const connHealthColor = { healthy: '#22c55e', stale: '#f59e0b', never: '#9ca3af' };
+
+    function connStatusDot(health) {
+      const color = connHealthColor[health] || connHealthColor.never;
+      return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:8px;"></span>`;
+    }
+
+    function connLastSeenText(c) {
+      if (!c.last_seen_at) return 'never seen';
+      const d = new Date(c.last_seen_at);
+      return Number.isNaN(d.getTime()) ? String(c.last_seen_at) : `last seen ${d.toLocaleString()}`;
+    }
+
+    async function loadConnections() {
+      connectionsPanel.classList.remove('hidden');
+      setStatus(connectionsStatus, 'Loading connections...', '');
+      connectionsList.classList.add('hidden');
+      try {
+        const data = await fetchJSON('/api/v1/account/connections');
+        const items = Array.isArray(data.items) ? data.items : [];
+        connectionsList.innerHTML = items.map((c) => {
+          const id = Number(c.id);
+          const label = String(c.label || 'NAS');
+          const health = String(c.health || 'never');
+          const clips = Number(c.clips_pulled || 0);
+          const interval = Number(c.poll_interval_sec || 90);
+          return `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+            <div>
+              <div>${connStatusDot(health)}<b>${escapeHTML(label)}</b></div>
+              <div class="muted" style="font-size:12px;">${escapeHTML(health)} · ${clips} clip${clips === 1 ? '' : 's'} pulled · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <button class="secondary conn-rotate" type="button" data-id="${id}" style="width:auto;min-width:90px;">Rotate</button>
+              <button class="secondary conn-remove" type="button" data-id="${id}" style="width:auto;min-width:90px;">Remove</button>
+            </div>
+          </div>`;
+        }).join('');
+        connectionsList.classList.remove('hidden');
+        connectionsList.querySelectorAll('.conn-rotate').forEach((btn) => {
+          btn.addEventListener('click', () => rotateConnection(Number(btn.getAttribute('data-id'))));
+        });
+        connectionsList.querySelectorAll('.conn-remove').forEach((btn) => {
+          btn.addEventListener('click', () => removeConnection(Number(btn.getAttribute('data-id'))));
+        });
+        setStatus(connectionsStatus, `${items.length} connection${items.length === 1 ? '' : 's'}.`, 'ok');
+      } catch (err) {
+        connectionsPanel.classList.add('hidden');
+      }
+    }
+
+    function showConnToken(snippet) {
+      connSnippet.value = String(snippet || '');
+      connTokenBox.classList.remove('hidden');
+    }
+
+    connCreateBtn.addEventListener('click', async () => {
+      const label = String(connLabel.value || '').trim();
+      const pollIntervalSec = Number(connInterval.value || 90);
+      connCreateBtn.disabled = true;
+      try {
+        const data = await fetchJSON('/api/v1/account/connections', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label, poll_interval_sec: pollIntervalSec }),
+        });
+        showConnToken(data.compose_snippet);
+        connLabel.value = '';
+        setStatus(connectionsStatus, 'Connection created. Save the token below now.', 'ok');
+        await loadConnections();
+      } catch (err) {
+        setStatus(connectionsStatus, String(err.message || err), 'err');
+      } finally {
+        connCreateBtn.disabled = false;
+      }
+    });
+
+    async function rotateConnection(id) {
+      try {
+        const data = await fetchJSON(`/api/v1/account/connections/${id}/rotate`, { method: 'POST' });
+        showConnToken(data.compose_snippet);
+        setStatus(connectionsStatus, 'Key rotated. The old key is revoked; save the new token below.', 'ok');
+        await loadConnections();
+      } catch (err) {
+        setStatus(connectionsStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function removeConnection(id) {
+      try {
+        await fetchJSON(`/api/v1/account/connections/${id}`, { method: 'DELETE' });
+        setStatus(connectionsStatus, 'Connection removed and its key revoked.', 'ok');
+        await loadConnections();
+      } catch (err) {
+        setStatus(connectionsStatus, String(err.message || err), 'err');
+      }
+    }
+
+    connCopyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(connSnippet.value);
+        connCopyBtn.textContent = 'Copied';
+        setTimeout(() => { connCopyBtn.textContent = 'Copy'; }, 1500);
+      } catch (_) {
+        connSnippet.select();
+      }
+    });
+
     async function refreshSession() {
       try {
         currentAccount = await fetchCurrentAccountWithRetry();
@@ -767,6 +912,7 @@
         void loadBilling();
         void loadHistory();
         void loadTeam();
+        void loadConnections();
         if (authCompleted) scheduleAuthFlowContinue();
       } catch (_) {
         currentAccount = null;
@@ -775,6 +921,7 @@
         billingPanel.classList.add('hidden');
         historyPanel.classList.add('hidden');
         teamPanel.classList.add('hidden');
+        connectionsPanel.classList.add('hidden');
         if (authCompleted) {
           setStatus(accountStatus, 'Sign-in link was opened, but this browser still has no active session. Open the link in the same browser you want to use.', 'err');
         } else {

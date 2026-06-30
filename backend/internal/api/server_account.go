@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 
 const (
 	accountScopeRead  = "stoarama.read"
+	accountScopePull  = "stoarama.pull"
 	accountRoleMember = "member"
 	accountRoleAdmin  = "admin"
 )
@@ -45,6 +47,21 @@ type accountPrincipal struct {
 	// MemberRole is the team role (account_members.role: 'owner'|'member'),
 	// independent of Role. Defaults to 'owner' for legacy/no-row cases.
 	MemberRole string
+	// KeyScopes are the scopes of the calling API key (account_api_keys.scopes).
+	// Nil for browser-session principals. A key whose scopes contain
+	// accountScopePull is confined to the NAS pull endpoints by confineAccountScope.
+	KeyScopes []string
+}
+
+// isPullScopedPrincipal reports whether the caller is an API key limited to the
+// 'stoarama.pull' scope. Such a key may ONLY call the NAS pull endpoints; it is
+// 403d on every other /api/v1/account route by confineAccountScope. Sessions and
+// full/read keys are never pull-scoped, so they keep full access.
+func isPullScopedPrincipal(p accountPrincipal) bool {
+	if p.APIKeyID == nil {
+		return false
+	}
+	return slices.Contains(p.KeyScopes, accountScopePull)
 }
 
 // principalIsOwner gates owner-only team actions. It fails SAFE to owner for
@@ -208,14 +225,14 @@ func (s *Server) lookupAccountAPIKey(ctx context.Context, raw string) (accountPr
 	var p accountPrincipal
 	var keyID int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.id, a.email, a.name, a.role, k.id
+		SELECT a.id, a.email, a.name, a.role, k.id, k.scopes
 		FROM account_api_keys k
 		JOIN accounts a ON a.id=k.account_id
 		WHERE k.secret_hash=$1
 		  AND k.revoked_at IS NULL
 		  AND (k.expires_at IS NULL OR k.expires_at > now())
 		  AND a.status='active'
-	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &keyID)
+	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &keyID, &p.KeyScopes)
 	if err != nil {
 		return accountPrincipal{}, err
 	}
@@ -652,23 +669,8 @@ func (s *Server) handleAccountAPIKeysCreate(w http.ResponseWriter, r *http.Reque
 		v := tm.UTC()
 		expiresAt = &v
 	}
-	rawKey, err := generateSecret(36)
+	keyID, prefix, token, err := mintAccountAPIKey(r.Context(), s.pool, principal.AccountID, label, accountScopeRead, expiresAt)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("generate api key: %v", err))
-		return
-	}
-	token := "sir_" + rawKey
-	hash := hashSecret(token)
-	prefix := token
-	if len(prefix) > 16 {
-		prefix = prefix[:16]
-	}
-	var keyID int64
-	if err := s.pool.QueryRow(r.Context(), `
-		INSERT INTO account_api_keys (account_id, key_prefix, secret_hash, label, scopes, expires_at)
-		VALUES ($1, $2, $3, $4, ARRAY[$5]::text[], $6)
-		RETURNING id
-	`, principal.AccountID, prefix, hash, label, accountScopeRead, expiresAt).Scan(&keyID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create account api key: %v", err))
 		return
 	}
@@ -684,6 +686,37 @@ func (s *Server) handleAccountAPIKeysCreate(w http.ResponseWriter, r *http.Reque
 		"scopes":     []string{accountScopeRead},
 		"expires_at": expiresAt,
 	})
+}
+
+// accountAPIKeyMinter is the minimal querier mintAccountAPIKey needs, satisfied by
+// both *pgxpool.Pool and pgx.Tx, so connection-create can mint inside one tx.
+type accountAPIKeyMinter interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// mintAccountAPIKey generates a sir_ token, stores its hash under the given single
+// scope, and returns (keyID, key_prefix, token). The token is shown ONCE by the
+// caller and never persisted in cleartext. The caller writes the audit event.
+func mintAccountAPIKey(ctx context.Context, q accountAPIKeyMinter, accountID int64, label, scope string, expiresAt *time.Time) (int64, string, string, error) {
+	rawKey, err := generateSecret(36)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("generate api key: %w", err)
+	}
+	token := "sir_" + rawKey
+	hash := hashSecret(token)
+	prefix := token
+	if len(prefix) > 16 {
+		prefix = prefix[:16]
+	}
+	var keyID int64
+	if err := q.QueryRow(ctx, `
+		INSERT INTO account_api_keys (account_id, key_prefix, secret_hash, label, scopes, expires_at)
+		VALUES ($1, $2, $3, $4, ARRAY[$5]::text[], $6)
+		RETURNING id
+	`, accountID, prefix, hash, label, scope, expiresAt).Scan(&keyID); err != nil {
+		return 0, "", "", err
+	}
+	return keyID, prefix, token, nil
 }
 
 func (s *Server) handleAccountAPIKeyRevoke(w http.ResponseWriter, r *http.Request) {
