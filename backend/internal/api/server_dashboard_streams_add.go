@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -25,6 +27,17 @@ type dashboardStreamAddRequest struct {
 	Lat      *float64 `json:"lat"`
 	Lon      *float64 `json:"lon"`
 	Tags     []string `json:"tags"`
+}
+
+func validatePublicHLSStreamURL(raw string) error {
+	u, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || u == nil || !u.IsAbs() || !strings.EqualFold(u.Scheme, "https") || strings.TrimSpace(u.Host) == "" {
+		return errors.New("url must be an https HLS (.m3u8) URL")
+	}
+	if !strings.HasSuffix(strings.ToLower(u.Path), ".m3u8") {
+		return errors.New("url must be an https HLS (.m3u8) URL")
+	}
+	return nil
 }
 
 // handleDashboardStreamAdd lets a signed-in account add a public stream straight
@@ -65,17 +78,15 @@ func (s *Server) handleDashboardStreamAdd(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, http.StatusBadRequest, "country is required")
 		return
 	}
+	if err := validatePublicHLSStreamURL(streamURL); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	// Provider namespace: youtube watch/live pages get the "youtube" namespace so
-	// they resolve like admin youtube imports; everything else is "custom". The
-	// caller may pin a provider explicitly.
+	// Provider namespace defaults to "custom"; the caller may pin one explicitly.
 	provider := strings.TrimSpace(req.Provider)
 	if provider == "" {
-		if capture.IsYouTubeWatchURL(streamURL) {
-			provider = "youtube"
-		} else {
-			provider = "custom"
-		}
+		provider = "custom"
 	}
 
 	// Stable, deduplicating external_id: the same URL always collides on the

@@ -1588,7 +1588,7 @@
     </div>
     <div class="filter-stack-card" id="addStreamCard" style="display:none;">
       <div class="filter-field-label">Add a public stream to the shared catalog</div>
-      <div class="status-text fs11" style="color:var(--muted);">Paste a public HLS (.m3u8) URL or a YouTube live page. Enter the city and country yourself; we do not auto-detect location.</div>
+      <div class="status-text fs11" style="color:var(--muted);">Paste a public HTTPS HLS (.m3u8) URL. Enter the city and country yourself; we do not auto-detect location.</div>
       <div class="filter-grid filter-grid-primary">
         <div class="filter-field">
           <div class="filter-field-label">Name</div>
@@ -2494,6 +2494,23 @@ function refreshTagSuggestionList() {
     .join('');
 }
 
+function setSelectValuePreservingOption(selectEl, rawValue, formatOptionLabel = (value) => value) {
+  if (!(selectEl instanceof HTMLSelectElement)) return;
+  const value = String(rawValue || '').trim();
+  if (!value) {
+    selectEl.value = '';
+    return;
+  }
+  const exists = Array.from(selectEl.options).some((opt) => opt.value === value);
+  if (!exists) {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = String(formatOptionLabel(value) || value);
+    selectEl.appendChild(opt);
+  }
+  selectEl.value = value;
+}
+
 function refreshTagFilterSelectOptions() {
   const update = (sel, emptyLabel, formatOptionLabel = (tag) => tag) => {
     if (!sel) return;
@@ -2501,10 +2518,7 @@ function refreshTagFilterSelectOptions() {
     const sortedTags = knownStreamTags.slice().sort((a, b) => compareOptionLabels(formatOptionLabel(a), formatOptionLabel(b)));
     sel.innerHTML = `<option value="">${esc(emptyLabel)}</option>` +
       sortedTags.map((tag) => `<option value="${esc(tag)}"${tag === prev ? ' selected' : ''}>${esc(formatOptionLabel(tag))}</option>`).join('');
-    if (prev && !knownStreamTags.includes(prev)) {
-      sel.innerHTML += `<option value="${esc(prev)}" selected>${esc(formatOptionLabel(prev))}</option>`;
-      sel.value = prev;
-    }
+    if (prev && !knownStreamTags.includes(prev)) setSelectValuePreservingOption(sel, prev, formatOptionLabel);
   };
   update(streamTagFilter, 'any tag');
   update(streamTagExcludeFilter, 'exclude none');
@@ -4213,7 +4227,8 @@ async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingSt
     .sort((a, b) => compareOptionLabels(countryDisplayLabel(a), countryDisplayLabel(b)));
   targetSelect.innerHTML = '<option value="">all countries</option>' +
     values.map((c) => `<option value="${esc(c)}"${c === prev ? ' selected' : ''}>${esc(countryDisplayLabel(c))}</option>`).join('');
-  if (!values.includes(prev)) targetSelect.value = '';
+  if (prev && !values.includes(prev)) setSelectValuePreservingOption(targetSelect, prev, countryDisplayLabel);
+  else if (!prev) targetSelect.value = '';
 }
 
 async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
@@ -4227,7 +4242,8 @@ async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState
     .sort((a, b) => compareOptionLabels(cityDisplayLabel(a), cityDisplayLabel(b)));
   targetSelect.innerHTML = '<option value="">all cities</option>' +
     values.map((c) => `<option value="${esc(c)}"${c === prev ? ' selected' : ''}>${esc(cityDisplayLabel(c))}</option>`).join('');
-  if (!values.includes(prev)) targetSelect.value = '';
+  if (prev && !values.includes(prev)) setSelectValuePreservingOption(targetSelect, prev, cityDisplayLabel);
+  else if (!prev) targetSelect.value = '';
   if (targetSelect === cityFilter) updateStreamFilterSummary();
 }
 
@@ -4254,7 +4270,8 @@ async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingS
     .sort((a, b) => compareOptionLabels(formatProviderLabel(a), formatProviderLabel(b)));
   targetSelect.innerHTML = '<option value="">all providers</option>' +
     values.map((v) => `<option value="${esc(v)}"${v === prev ? ' selected' : ''}>${esc(formatProviderLabel(v))}</option>`).join('');
-  if (!values.includes(prev)) targetSelect.value = '';
+  if (prev && !values.includes(prev)) setSelectValuePreservingOption(targetSelect, prev, formatProviderLabel);
+  else if (!prev) targetSelect.value = '';
 }
 
 async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
@@ -4268,7 +4285,8 @@ async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingSta
     .sort((a, b) => compareOptionLabels(formatSourceLabel(a), formatSourceLabel(b)));
   targetSelect.innerHTML = '<option value="">all sources</option>' +
     values.map((v) => `<option value="${esc(v)}"${v === prev ? ' selected' : ''}>${esc(formatSourceLabel(v))}</option>`).join('');
-  if (!values.includes(prev)) targetSelect.value = '';
+  if (prev && !values.includes(prev)) setSelectValuePreservingOption(targetSelect, prev, formatSourceLabel);
+  else if (!prev) targetSelect.value = '';
 }
 
 // ─── Shared inference table renderer ─────────────────────────────────────────
@@ -4406,17 +4424,15 @@ function buildStreamFilterParams() {
 function applyStreamListStateFromURL(params) {
   if (!(params instanceof URLSearchParams)) return;
   streamSearch.value = String(params.get('q') || '').trim();
-  streamTagFilter.value = String(params.get('tags') || '').trim();
-  streamTagExcludeFilter.value = String(params.get('tags_not') || '').trim();
+  setSelectValuePreservingOption(streamTagFilter, params.get('tags'));
+  setSelectValuePreservingOption(streamTagExcludeFilter, params.get('tags_not'));
   streamRecordingStateFilter.value = normalizeRecordingStateFilter(params.get('recording_state'));
   streamModeFilter.value = normalizeCaptureTypeFilter(params.get('capture_type'));
-  sourceFilter.value = String(params.get('source') || '').trim();
-  providerFilter.value = String(params.get('provider') || '').trim();
-  koreaRegionFilter.value = params.has('korea_family')
-    ? (normalizeKoreaFamily(params.get('korea_family')) || 'all')
-    : '';
-  countryFilter.value = String(params.get('country') || '').trim();
-  cityFilter.value = String(params.get('city') || '').trim();
+  setSelectValuePreservingOption(sourceFilter, params.get('source'), formatSourceLabel);
+  setSelectValuePreservingOption(providerFilter, params.get('provider'), formatProviderLabel);
+  setSelectValuePreservingOption(koreaRegionFilter, params.has('korea_family') ? (normalizeKoreaFamily(params.get('korea_family')) || 'all') : '', formatKoreaFamilyLabel);
+  setSelectValuePreservingOption(countryFilter, params.get('country'), countryDisplayLabel);
+  setSelectValuePreservingOption(cityFilter, params.get('city'), cityDisplayLabel);
   streamTouchedPipelineID = String(params.get('touched_pipeline_id') || '').trim();
 
   const sortBy = String(params.get('sort_by') || '').trim();
