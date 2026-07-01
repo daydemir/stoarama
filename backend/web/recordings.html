@@ -528,7 +528,7 @@
           <!-- Storage chooser: managed (operator R2) vs BYO. Shown only when the
                managed option is available per GET /billing; otherwise BYO only. -->
           <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
-            <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10/stream-hour-month)</button>
+            <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10 per hour of footage stored per month)</button>
             <button type="button" data-storage="byo">Connect your own S3 bucket</button>
             <button type="button" data-storage="shared" class="hidden" id="sharedStorageBtn">Shared destination</button>
           </div>
@@ -1138,7 +1138,7 @@
       if (!state.billingEnabled) { els.costEstimate.textContent = ''; els.costEstimateNote.textContent = ''; return; }
       if (state.composerScheduleMode === 'continuous') {
         els.costEstimate.innerHTML = '<span class="muted">Continuous records every hour the window is active; storage scales with total footage.</span>';
-        els.costEstimateNote.textContent = 'Billed per recording-hour plus managed storage per stream-hour-month, monthly in arrears. Pricing is unchanged from sampled.';
+        els.costEstimateNote.textContent = 'Billed per hour of recording plus managed storage per hour of footage kept per month, monthly in arrears. Pricing is unchanged from sampled.';
         return;
       }
       const m = estimateModel();
@@ -1151,14 +1151,14 @@
       const usd = (c) => usdCents(c);
       const parts = [
         `<span class="muted">~</span><b>${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
-        `<span class="muted"> &middot; ${m.recordHours} recording-hour${m.recordHours === 1 ? '' : 's'} × $${(m.hourRate / 100).toFixed(2)} = ${usd(m.recordHourCents)}</span>`,
+        `<span class="muted"> &middot; ${m.recordHours} hour${m.recordHours === 1 ? '' : 's'} of recording × $${(m.hourRate / 100).toFixed(2)} = ${usd(m.recordHourCents)}</span>`,
       ];
       if (m.managed && m.avgStreamHrMo > 0) {
-        parts.push(`<span class="muted"> + ~${m.avgStreamHrMo.toFixed(3)} stream-hr-mo × $${(m.shmRate / 100).toFixed(2)} = ${usdStorage(m.avgStreamHrMo, m.shmRate, m.storageCents)}</span>`);
+        parts.push(`<span class="muted"> + ~${m.avgStreamHrMo.toFixed(3)} hr of footage stored/mo × $${(m.shmRate / 100).toFixed(2)} = ${usdStorage(m.avgStreamHrMo, m.shmRate, m.storageCents)}</span>`);
       }
       els.costEstimate.innerHTML = parts.join('');
       els.costEstimateNote.textContent = m.managed
-        ? `Estimate only. Storage is $${(m.shmRate / 100).toFixed(2)} per stream-hour-month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that.`
+        ? `Estimate only. Storage is $${(m.shmRate / 100).toFixed(2)} per hour of footage kept for a month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that.`
         : `Estimate only. With your own bucket there is no storage charge.`;
     }
 
@@ -1347,7 +1347,7 @@
         if (md) {
           state.verifiedDestId = Number(md.id || 0);
           els.managedStatus.classList.remove('hidden');
-          setStatus(els.managedStatus, 'Connected to Stoarama-managed storage. Clips are billed $0.10/stream-hour-month.', 'ok');
+          setStatus(els.managedStatus, 'Connected to Stoarama-managed storage. Clips are billed $0.10 per hour of footage stored per month.', 'ok');
           setBucketState('connected');
         } else {
           els.managedStatus.classList.add('hidden');
@@ -1392,7 +1392,7 @@
       els.sharedPicker.classList.remove('hidden');
       const sel = selectedSharedDest();
       if (sel && sel.provider === 'webdav') {
-        els.sharedDestNote.textContent = 'Delivered to a shared destination (WebDAV/NAS). Clips stage in managed storage briefly, then transfer and the staging copy is removed. No managed stream-hour-month fee, only the $0.05/record-hour charge.';
+        els.sharedDestNote.textContent = 'Delivered to a shared destination (WebDAV/NAS). Clips stage in managed storage briefly, then transfer and the staging copy is removed. No managed storage fee for footage kept, only the $0.05 per hour of recording charge.';
       } else {
         els.sharedDestNote.textContent = 'Delivered to a shared destination granted to your account.';
       }
@@ -1798,7 +1798,7 @@
       const lines = [];
       const hours = Number(b.recording_hours_this_month || 0);
       if (hours >= 1) {
-        const noun = hours === 1 ? 'recording-hour' : 'recording-hours';
+        const noun = hours === 1 ? 'hour of recording' : 'hours of recording';
         lines.push(`<span><b>${hours} ${noun} this month</b> &middot; est. ${usdCents(b.estimated_amount_cents)}</span>`);
       }
       // Managed storage line: month-to-date average stream-hour-month from /billing.
@@ -1806,7 +1806,7 @@
       const shm = Number(b.storage_stream_hour_month_avg || 0);
       if (shm > 0) {
         const shmRate = Number(b.stream_hour_month_rate_cents || 10);
-        lines.push(`<span><b>${shm.toFixed(3)} stream-hour-month storage</b> &middot; est. ${usdStorage(shm, shmRate, b.estimated_storage_amount_cents)}</span>`);
+        lines.push(`<span><b>${shm.toFixed(3)} hour-months of footage stored</b> &middot; est. ${usdStorage(shm, shmRate, b.estimated_storage_amount_cents)}</span>`);
       }
       if (lines.length === 0) { els.ledger.classList.add('hidden'); return; }
       els.ledger.innerHTML = lines.join('<span class="meta-sep">&middot;</span>');
@@ -3015,13 +3015,13 @@
       const managed = state.storageChoice === 'managed';
       els.startBtn.textContent = needsCard ? 'Add a card to start recording' : 'Start recording';
       const hoursCharge = '$0.05 for each hour a recording captures at least one clip';
-      const storageCharge = ', plus $0.10/stream-hour-month for managed storage';
+      const storageCharge = ', plus $0.10 per hour of footage stored per month for managed storage';
       els.composerFootnote.textContent = state.billingEnabled
         ? (needsCard
             ? `Nothing will be captured until you add a card. No charge now; charges are ${hoursCharge}${managed ? storageCharge : ''}.`
             : (managed
-                ? '$0.05/hour for hours you record, plus $0.10/stream-hour-month for managed storage.'
-                : '$0.05/hour for hours you record.'))
+                ? '$0.05 per hour of recording, plus $0.10 per hour of footage stored per month for managed storage.'
+                : '$0.05 per hour of recording.'))
         : '';
       els.composerFootnote.classList.toggle('warn', state.billingEnabled && needsCard);
       els.composerFootnote.classList.toggle('hidden', !state.billingEnabled);

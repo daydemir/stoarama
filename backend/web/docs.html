@@ -216,9 +216,9 @@
               <h2>Pay for what you record</h2>
               <ul>
                 <li><b>$0.05</b> for each hour a recording captures at least one clip. Hours with nothing recorded are free.</li>
-                <li><b>$0.10</b> per stream-hour-month for clips you keep in Stoarama-managed storage. A clip kept a few days costs a small fraction of that.</li>
+                <li><b>$0.10</b> per hour of footage stored per month for clips you keep in Stoarama-managed storage. A clip kept a few days costs a small fraction of that.</li>
                 <li>Billed once a month in arrears with a card on file via Stripe. Adding a card does not charge you.</li>
-                <li>Bring your own S3 bucket instead and Stoarama charges only the record-hour fee.</li>
+                <li>Bring your own S3 bucket instead and Stoarama charges only the per hour of recording fee.</li>
               </ul>
             </div>
           </div>
@@ -253,7 +253,7 @@
               <div class="eyebrow">Storage</div>
               <h2>Managed or your own bucket</h2>
               <ul>
-                <li><b>Stoarama-managed</b> storage when available, billed at $0.10 per stream-hour-month for the time each clip is kept.</li>
+                <li><b>Stoarama-managed</b> storage when available, billed at $0.10 per hour of footage kept for a month, for the time each clip is kept.</li>
                 <li><b>Your own S3-compatible bucket</b>: Cloudflare R2, Amazon S3, Backblaze B2, Wasabi, DigitalOcean Spaces, or any S3-compatible endpoint. Credentials are connection-checked before a recording can use them.</li>
               </ul>
             </div>

@@ -130,44 +130,44 @@
       <section class="panel">
         <div class="eyebrow">Pricing</div>
         <h1>Pay for what you record.</h1>
-        <p>Browsing the catalog is free. Recording is metered: you pay for the hours a recording actually captures something, plus whatever you choose for storage. There is no subscription and no minimum. Add a card, set up a recording, and you are billed once a month for what you used.</p>
+        <p>Browsing the catalog is free. You pay only for two things: the hours your recordings are actively capturing, and where those clips are stored. No subscription, no minimum, no setup fee. Add a card, set up a recording, and get one bill a month for what you used.</p>
         <div class="rate-line">
-          <span class="rate">$0.05</span> per record-hour, a clock-hour in which a recording captured at least one clip. An hour that captures nothing is free.
+          <span class="rate">$0.05</span> per hour of recording. This is each clock-hour in which a stream is actively capturing at least one clip. An hour that captures nothing is free.
         </div>
       </section>
 
       <section class="panel">
         <div class="eyebrow">Storage</div>
-        <h2>Choose where your clips live.</h2>
-        <p>Storage is a per-recording choice. Pick the option that fits when you set up the recording.</p>
+        <h2>Choose where your clips are kept.</h2>
+        <p>Storage is a per-recording choice you make when you set one up. Managed storage is priced by the hour of footage you keep. Everything below is billed monthly, in arrears, for exactly the time each clip was held.</p>
         <table class="price-table">
           <thead>
             <tr>
               <th>Option</th>
-              <th>Rate</th>
+              <th>Price</th>
               <th>What it means</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td class="option">Managed, monthly</td>
-              <td class="rate">$0.10 / stream-hour-month</td>
-              <td class="note">Stoarama holds your clips. Billed monthly in arrears for the time each clip is kept. Delete anytime and the charge stops.</td>
+              <td class="option">Managed storage, monthly</td>
+              <td class="rate">$0.10 per hour of footage stored, per month</td>
+              <td class="note">Stoarama keeps your clips. You pay $0.10 to keep one hour of footage for a month, charged only for the time each clip is actually held. Delete a clip and its charge stops.</td>
             </tr>
             <tr>
-              <td class="option">Managed, yearly</td>
-              <td class="rate">$0.05 / stream-hour-month</td>
-              <td class="note">Half the effective rate, but you commit and prepay 12 months with guaranteed 12-month retention and no early-delete refund. Available now; email us to set it up.</td>
+              <td class="option">Managed storage, yearly</td>
+              <td class="rate">$0.05 per hour of footage stored, per month (effective)</td>
+              <td class="note">Half the effective rate in exchange for a commitment: you prepay 12 months up front with guaranteed 12-month retention and no early-delete refund. Available now by email; there is no self-serve yearly picker yet.</td>
+            </tr>
+            <tr>
+              <td class="option">Record to your NAS</td>
+              <td class="rate">about $0.02 per stream, per month</td>
+              <td class="note">A small client on your NAS pulls each clip every 10 minutes and we then purge our copy, so we only ever hold about 10 minutes of footage per stream. That averages about 0.17 hours held, which at $0.10 per hour of footage per month is roughly 2 cents per stream per month. This price holds only while your NAS is up and pulling successfully. If it stalls, clips pile up in managed storage and bill at the normal $0.10 rate until it catches up.</td>
             </tr>
             <tr>
               <td class="option">Bring your own S3 bucket</td>
-              <td class="rate">$0 storage</td>
-              <td class="note">We record straight to your S3-compatible bucket. You pay your own S3 provider, we charge only the record-hour fee.</td>
-            </tr>
-            <tr>
-              <td class="option">Record to your NAS (pull)</td>
-              <td class="rate">about $0 storage</td>
-              <td class="note">We hold each clip briefly in managed storage, your NAS pulls it, and we purge it. As long as your NAS keeps up, managed storage stays near zero.</td>
+              <td class="rate">$0 storage from us</td>
+              <td class="note">We record straight into your own S3-compatible bucket (Cloudflare R2, Amazon S3, Backblaze B2, Wasabi, DigitalOcean Spaces, or any S3-compatible endpoint). You pay your storage provider directly and we charge only the $0.05 per hour of recording.</td>
             </tr>
           </tbody>
         </table>
@@ -175,12 +175,12 @@
 
       <section class="panel">
         <div class="eyebrow">How billing works</div>
-        <h2>Simple and in arrears.</h2>
+        <h2>One monthly bill, after the fact.</h2>
         <ul>
-          <li>You add a card on file via Stripe. Adding a card does not charge you.</li>
-          <li>Charges are metered as you record and settled once a month, in arrears, for the previous month.</li>
-          <li>If a recording captures nothing in a given hour, that hour is free. No capture, no charge.</li>
-          <li>See your running cost and your monthly estimate anytime on <a href="/account">/account</a>.</li>
+          <li>You add a card on file through Stripe. Adding a card does not charge you.</li>
+          <li>Charges are metered as you record and settled once a month, in arrears, for the month just ended.</li>
+          <li>An hour in which a recording captured nothing is free. No capture, no charge.</li>
+          <li>See your running cost and this month's estimate anytime on <a href="/account">/account</a>.</li>
         </ul>
         <p style="margin-top:12px;">Questions about pricing? Email <a href="mailto:deniz@aydemir.us">deniz@aydemir.us</a>.</p>
       </section>

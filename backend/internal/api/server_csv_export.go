@@ -229,12 +229,28 @@ func (s *Server) handleDashboardStreamsCSV(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	whereSQL := strings.Join(where, " AND ")
+	// One streamed pass over the filtered catalog. rt.resolved_url is the
+	// runtime-resolved playable manifest already persisted for the stream (same
+	// column the JSON dashboard exposes as capture_runtime_resolved_url); it is
+	// read from the row, never re-resolved per row, so the export stays O(1) memory
+	// and adds no network calls. For indirect '!hls' sources it can be a rolling
+	// tokenized URL that expires, so source_url (the durable reference) and the
+	// per-row refresh_url are always emitted alongside it. sis.* carry the
+	// survey/detection rollups present on the catalog row.
 	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
 		SELECT
 			s.id, s.name, s.provider, %s AS source_kind,
+			s.source_url, s.source_page_url, s.capture_type, s.execution_class,
+			(s.capture_type IN ('hls','http_video')) AS recordable,
+			rt.resolved_url,
 			%s AS city, %s AS country, s.location_text, s.lat, s.lon,
-			s.tags, s.capture_type, s.recording_state, s.created_at
+			s.tags, s.recording_state, s.created_at, s.updated_at,
+			COALESCE(sis.inferenced_captures, 0)::bigint,
+			COALESCE(sis.person_detections_total, 0)::bigint,
+			COALESCE(sis.avg_people_per_inferenced_capture, 0)::double precision
 		FROM streams s
+		LEFT JOIN stream_capture_runtime rt ON rt.stream_id = s.id
+		LEFT JOIN stream_inference_stats sis ON sis.stream_id = s.id
 		WHERE %s
 		ORDER BY s.id ASC
 	`, dashboardSourceExprSQL(), dashboardCityExprSQL(), dashboardCountryExprSQL(), whereSQL), args...)
@@ -247,27 +263,39 @@ func (s *Server) handleDashboardStreamsCSV(w http.ResponseWriter, r *http.Reques
 	writeCSVHeaders(w, fmt.Sprintf("stoarama-streams-%s.csv", time.Now().UTC().Format("2006-01-02")))
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{
-		"id", "name", "provider", "source", "city", "country", "location_text",
-		"lat", "lon", "tags", "capture_type", "recording_state", "created_at",
+		"id", "name", "provider", "source", "source_url", "source_page_url",
+		"capture_type", "execution_class", "recordable", "resolved_live_url",
+		"city", "country", "location_text", "lat", "lon", "tags",
+		"recording_state", "created_at", "updated_at",
+		"inferenced_captures", "person_detections_total", "avg_people_per_inferenced_capture",
 		"detail_url", "refresh_url",
 	})
 	for rows.Next() {
 		var (
-			id             int64
-			name           string
-			provider       string
-			source         *string
-			city           *string
-			country        *string
-			locationText   string
-			lat            *float64
-			lon            *float64
-			tags           []string
-			captureType    string
-			recordingState string
-			createdAt      time.Time
+			id                    int64
+			name                  string
+			provider              string
+			source                *string
+			sourceURL             string
+			sourcePageURL         string
+			captureType           string
+			executionClass        string
+			recordable            bool
+			resolvedURL           *string
+			city                  *string
+			country               *string
+			locationText          string
+			lat                   *float64
+			lon                   *float64
+			tags                  []string
+			recordingState        string
+			createdAt             time.Time
+			updatedAt             time.Time
+			inferencedCaptures    int64
+			personDetectionsTotal int64
+			avgPeoplePerCapture   float64
 		)
-		if err := rows.Scan(&id, &name, &provider, &source, &city, &country, &locationText, &lat, &lon, &tags, &captureType, &recordingState, &createdAt); err != nil {
+		if err := rows.Scan(&id, &name, &provider, &source, &sourceURL, &sourcePageURL, &captureType, &executionClass, &recordable, &resolvedURL, &city, &country, &locationText, &lat, &lon, &tags, &recordingState, &createdAt, &updatedAt, &inferencedCaptures, &personDetectionsTotal, &avgPeoplePerCapture); err != nil {
 			cw.Flush()
 			return
 		}
@@ -276,15 +304,24 @@ func (s *Server) handleDashboardStreamsCSV(w http.ResponseWriter, r *http.Reques
 			name,
 			provider,
 			derefString(source),
+			strings.TrimSpace(sourceURL),
+			strings.TrimSpace(sourcePageURL),
+			captureType,
+			executionClass,
+			strconv.FormatBool(recordable),
+			strings.TrimSpace(derefString(resolvedURL)),
 			derefString(city),
 			derefString(country),
 			strings.TrimSpace(locationText),
 			csvFloat(lat),
 			csvFloat(lon),
 			strings.Join(tags, ";"),
-			captureType,
 			recordingState,
 			createdAt.UTC().Format(time.RFC3339),
+			updatedAt.UTC().Format(time.RFC3339),
+			strconv.FormatInt(inferencedCaptures, 10),
+			strconv.FormatInt(personDetectionsTotal, 10),
+			strconv.FormatFloat(avgPeoplePerCapture, 'f', -1, 64),
 			fmt.Sprintf("%s/streams/%d", base, id),
 			fmt.Sprintf("%s/api/v1/dashboard/streams/%d/resolve", base, id),
 		})

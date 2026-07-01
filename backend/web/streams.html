@@ -1551,10 +1551,7 @@
   <div id="streamsPanel">
     <div class="domain-intro">
       <div class="domain-intro-title">Streams</div>
-      <div class="domain-intro-copy">Browse the catalog for free. Recording is metered: $0.05 per record-hour, plus your choice of storage.</div>
-      <div style="margin-top:4px;">
-        <a href="/pricing" class="overview-card-link primary">See pricing</a>
-      </div>
+      <div class="domain-intro-copy">Browse the catalog for free. Recording is metered: $0.05 per hour of recording, plus your choice of storage.</div>
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
@@ -1893,6 +1890,7 @@ const detailSelfRecordCmd = $('detailSelfRecordCmd');
 const detailSelfRecordCopy = $('detailSelfRecordCopy');
 const detailSelfRecordNote = $('detailSelfRecordNote');
 let detailHlsInstance = null;
+let detailStallWatchdog = null;
 const detailActions = $('detailActions');
 const detailSourcePanel = $('detailSourcePanel');
 const detailClipPreviewBlock = $('detailClipPreviewBlock');
@@ -5148,6 +5146,10 @@ function handleClipPreviewClick(event) {
 }
 
 function teardownDetailLivePlayer() {
+  if (detailStallWatchdog) {
+    try { clearInterval(detailStallWatchdog); } catch (_) {}
+    detailStallWatchdog = null;
+  }
   if (detailHlsInstance) {
     try { detailHlsInstance.destroy(); } catch (_) {}
     detailHlsInstance = null;
@@ -5263,6 +5265,43 @@ function showDetailNoInlineFallback(stream) {
   }
 }
 
+// Stall watchdog: the guaranteed honest fallback. Some origins (SPATIC *.spatic.go.kr,
+// likely TOPIS) serve segments at ~real-time with zero headroom, so hls.js catches the
+// live edge and the next segment slides out before it can be fetched, producing a
+// non-fatal bufferStalledError that the ERROR handler (fatal-only) never surfaces: the
+// player would sit on a frozen black box forever. This poll compares video.currentTime
+// now against its value ~15s earlier; if playback has not advanced more than ~1.5s after
+// a ~22s grace period (never started, or started then stalled), it falls back to the
+// honest "live preview not available" note and tears the player down. Working fast-origin
+// streams (Bellevue/KBS/Skyline/YouTube/http_video) advance normally and never trip it.
+function startDetailStallWatchdog(video, stream) {
+  if (detailStallWatchdog) { try { clearInterval(detailStallWatchdog); } catch (_) {} detailStallWatchdog = null; }
+  const startedAt = Date.now();
+  const graceMs = 22000;   // give slow origins time to build a lead before judging
+  const windowMs = 15000;  // how far back we compare currentTime against
+  const minAdvance = 1.5;  // seconds of progress required over the window
+  let prevTime = 0;
+  let prevAt = startedAt;
+  let baselineTime = 0;
+  let baselineAt = startedAt;
+  detailStallWatchdog = setInterval(() => {
+    if (!(video instanceof HTMLVideoElement) || !video.isConnected) {
+      clearInterval(detailStallWatchdog); detailStallWatchdog = null; return;
+    }
+    const now = Date.now();
+    const t = Number(video.currentTime) || 0;
+    // Slide the ~15s comparison baseline forward so we always measure the most
+    // recent window, not the absolute start.
+    if (now - baselineAt >= windowMs) { baselineTime = prevTime; baselineAt = prevAt; }
+    prevTime = t; prevAt = now;
+    if (now - startedAt < graceMs) return;
+    if (t - baselineTime <= minAdvance) {
+      clearInterval(detailStallWatchdog); detailStallWatchdog = null;
+      showDetailNoInlineFallback(stream);
+    }
+  }, 3000);
+}
+
 async function mountDetailLivePlayer(stream) {
   teardownDetailLivePlayer();
   if (!(detailLivePlayer instanceof HTMLElement) || !(detailLivePlayerMount instanceof HTMLElement)) return;
@@ -5308,6 +5347,7 @@ async function mountDetailLivePlayer(stream) {
       video.play().catch(() => {});
     }, { once: true });
     video.play().catch(() => {});
+    startDetailStallWatchdog(video, stream);
     return;
   }
   if (window.Hls && window.Hls.isSupported()) {
@@ -5316,27 +5356,27 @@ async function mountDetailLivePlayer(stream) {
     // decode HLS natively, so they must use hls.js to play the manifest.
     //
     // Live-edge tuning. Catalog sources are standard (non-LL) HLS with ~10s
-    // segments and a 3-segment window, so the hls.js default liveSyncDurationCount
-    // of 3 starts playback a full ~30s behind the live edge and rides the oldest
-    // segment, which drains and stalls as the window slides. liveSyncDuration:10
-    // targets ~one segment behind live, far ahead of the default ~30s while still
-    // leaving a one-segment cushion so jittery origins do not starve and stall.
-    // maxLiveSyncPlaybackRate:1.5 lets the player speed up slightly to drift back
-    // toward that target after a hiccup; the bounded back buffer caps memory.
-    // lowLatencyMode also benefits any true LL-HLS source without hurting the
-    // standard ones. We deliberately do NOT force currentTime to the absolute
-    // manifest edge on every refresh: that leaves zero buffer ahead on a
-    // 3-segment window and causes constant rebuffering on slow origins. hls.js
-    // positions playback at liveSyncDuration itself; we only re-sync when we have
-    // drifted well past the latency budget or are recovering from an error.
+    // segments and a ~3-segment (~30s) window. Chasing the live edge on a slow
+    // origin (SPATIC *.spatic.go.kr, TOPIS) is fatal: those origins publish each
+    // ~10s segment in ~10s of wall time, so a player sitting near the edge fetches
+    // a segment, plays it, and finds the next one has already slid out of the
+    // window before it can download it, stalling forever. The fix is headroom:
+    // lowLatencyMode:false and liveSyncDuration:24 sit the player ~2 segments behind
+    // live, giving a slow origin time to build a lead the player can drink from.
+    // liveMaxLatencyDuration:40 tolerates that lag without a hard resync, and the
+    // larger backBufferLength keeps a longer safety cushion. maxLiveSyncPlaybackRate
+    // still lets the player drift gently back toward target after a hiccup. Fast
+    // origins (Bellevue/KBS/Skyline) publish ahead of real time and are unaffected:
+    // they simply keep more buffer. We do NOT force currentTime to the absolute
+    // manifest edge on refresh; hls.js positions at liveSyncDuration itself.
     const Hls = window.Hls;
     detailHlsInstance = new Hls({
       enableWorker: true,
-      lowLatencyMode: true,
-      liveSyncDuration: 10,
-      liveMaxLatencyDuration: 30,
+      lowLatencyMode: false,
+      liveSyncDuration: 24,
+      liveMaxLatencyDuration: 40,
       maxLiveSyncPlaybackRate: 1.5,
-      backBufferLength: 30,
+      backBufferLength: 60,
       liveDurationInfinity: true,
     });
     const hls = detailHlsInstance;
@@ -5349,19 +5389,43 @@ async function mountDetailLivePlayer(stream) {
         video.currentTime = target;
       }
     };
+    // Bounded recovery: a slow origin can emit repeated NETWORK errors (fatal or
+    // non-fatal bufferStalledError) faster than a retry can succeed. Cap retries in
+    // a short window; once the cap is hit we give up to the honest fallback instead
+    // of looping forever on a frozen box.
+    const maxRecoveries = 4;
+    const recoveryWindowMs = 20000;
+    let recoveries = [];
+    const tooManyRecoveries = () => {
+      const cutoff = Date.now() - recoveryWindowMs;
+      recoveries = recoveries.filter((t) => t >= cutoff);
+      recoveries.push(Date.now());
+      return recoveries.length > maxRecoveries;
+    };
     hls.loadSource(url);
     hls.attachMedia(video);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       seekToLiveEdge();
       video.play().catch(() => {});
+      // Arm the stall watchdog once playback is being attempted; it is the honest
+      // catch-all for non-fatal buffer stalls that never reach the fatal branch below.
+      startDetailStallWatchdog(video, stream);
     });
-    // Recover from transient errors instead of letting the player die: network
-    // errors retry the load, media errors trigger the codec-level recovery, and
-    // both re-sync to the live point so playback resumes live rather than stale.
-    // Only a fatal error we cannot recover tears the player down honestly.
+    // Recover from transient errors instead of letting the player die, but not
+    // forever. Fatal network errors retry the load, fatal media errors trigger
+    // codec recovery, both re-syncing to the live point. A non-fatal buffer stall
+    // (bufferStalledError, the SPATIC/TOPIS failure mode) also triggers a bounded
+    // reload/resync. When recoveries exceed the cap within the window, fall back
+    // honestly to the source link rather than a stalled black box.
     hls.on(Hls.Events.ERROR, (_e, data) => {
-      if (!data || !data.fatal) return;
-      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      if (!data) return;
+      const isBufferStall = data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR;
+      if (!data.fatal && !isBufferStall) return;
+      if (tooManyRecoveries()) {
+        showDetailNoInlineFallback(stream);
+        return;
+      }
+      if (isBufferStall || data.type === Hls.ErrorTypes.NETWORK_ERROR) {
         try { hls.startLoad(); seekToLiveEdge(); video.play().catch(() => {}); return; } catch (_) {}
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         try { hls.recoverMediaError(); seekToLiveEdge(); video.play().catch(() => {}); return; } catch (_) {}
@@ -5376,6 +5440,7 @@ async function mountDetailLivePlayer(stream) {
       video.play().catch(() => {});
     }, { once: true });
     video.play().catch(() => {});
+    startDetailStallWatchdog(video, stream);
   } else {
     // No HLS support and not native: do not fake playback; drop back to the
     // external CTA by hiding the empty player.

@@ -30,7 +30,7 @@ Environment:
   STOARAMA_API_KEY          sir_... account API key            (required)
   STOARAMA_OUTPUT_DIR       clip destination dir (default /clips)
   STOARAMA_STATE_FILE       cursor file       (default /state/cursor.json)
-  STOARAMA_POLL_INTERVAL_SEC  idle sleep seconds (default 90)
+  STOARAMA_POLL_INTERVAL_SEC  idle sleep seconds (default 600, i.e. 10 minutes)
   STOARAMA_DRY_RUN          "1" = read-only validate (default "0")
 
 DRY-RUN ("1"): download + verify every clip and log "would purge", but never
@@ -86,7 +86,10 @@ class Config:
         self.api_key = env_str("STOARAMA_API_KEY", "")
         self.output_dir = Path(env_str("STOARAMA_OUTPUT_DIR", "/clips"))
         self.state_file = Path(env_str("STOARAMA_STATE_FILE", "/state/cursor.json"))
-        self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 90)
+        # 10-minute default cadence: we hold each clip only until the next pull, so
+        # this bounds managed footage to ~10 min per stream, which is what the NAS
+        # storage price (about 2 cents per stream per month) is computed from.
+        self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 600)
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
         # The list response's download_path is a site-root-absolute path that already
         # includes the /api/v1 prefix, so it is joined onto the ORIGIN (scheme+host),

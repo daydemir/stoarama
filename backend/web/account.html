@@ -270,7 +270,7 @@
         <div id="periodRow" class="muted" style="font-size:12px;"></div>
         <p class="muted" style="font-size:12px;margin:10px 0 0;">
           This is a live estimate from the streams you are recording plus your storage usage this month, not a final invoice:
-          $0.05 for each hour a recording captures at least one clip, plus, for Stoarama-managed storage, $0.10 per stream-hour-month for the time each clip is kept.
+          $0.05 for each hour a recording captures at least one clip, plus, for Stoarama-managed storage, $0.10 per hour of footage kept for a month, charged for the time each clip is kept.
           Hours when nothing was recorded are never charged.
         </p>
       </div>
@@ -589,14 +589,14 @@
       }
 
       usageRecDays.innerHTML =
-        `<div><b>${hours}</b> record-hour${hours === 1 ? '' : 's'} from the streams you are recording</div>`;
+        `<div><b>${hours}</b> hour${hours === 1 ? '' : 's'} of recording from the streams you are recording</div>`;
       usageStorage.innerHTML = shm > 0
-        ? `<div><b>${shm.toFixed(3)}</b> stream-hour-month managed storage</div>`
-          + `<div class="muted" style="font-size:12px;margin-top:4px;">Storage is ${usd(shmRate)} per stream-hour-month, charged only for the time each clip is kept. A clip stored a few days costs a small fraction of that.</div>`
+        ? `<div><b>${shm.toFixed(3)}</b> hour-months of footage in managed storage</div>`
+          + `<div class="muted" style="font-size:12px;margin-top:4px;">Storage is ${usd(shmRate)} per hour of footage kept for a month, charged only for the time each clip is kept. A clip stored a few days costs a small fraction of that.</div>`
         : `<div class="muted">No managed storage this month</div>`;
 
-      const lines = [`<div>${hours} × ${usd(hourRate)} record-hour = <b>${usd(hourCents)}</b></div>`];
-      if (shm > 0) lines.push(`<div>${shm.toFixed(3)} stream-hr-mo × ${usd(shmRate)} = <b>${usdStorage(shm, shmRate, storeCents)}</b></div>`);
+      const lines = [`<div>${hours} × ${usd(hourRate)} per hour of recording = <b>${usd(hourCents)}</b></div>`];
+      if (shm > 0) lines.push(`<div>${shm.toFixed(3)} hr of footage/mo × ${usd(shmRate)} = <b>${usdStorage(shm, shmRate, storeCents)}</b></div>`);
       lines.push(`<div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></div>`);
       estBreakdown.innerHTML = lines.join('');
 
