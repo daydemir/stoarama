@@ -308,13 +308,14 @@
       <!-- Cost ledger -->
       <div id="ledger" class="ledger hidden"></div>
 
-      <!-- Account-level card-needed banner (shown when billing on + no card on file) -->
+      <!-- Account-level card-needed banner (shown when billing on + no card on file).
+           The card-add flow lives only in Org settings; this banner POINTS there. -->
       <div id="cardBanner" class="panel hidden" style="margin-bottom:16px;border-color:color-mix(in srgb, var(--warn) 40%, var(--border));">
         <div class="section-title" style="margin-bottom:6px;">
-          <div><div class="eyebrow">Card needed</div><h2>Add a card to begin capturing</h2></div>
-          <button id="cardBannerBtn" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Add a card</button>
+          <div><div class="eyebrow">Card needed</div><h2>Add a payment method to begin capturing</h2></div>
+          <a id="cardBannerLink" class="btn-link" href="/org-settings" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Go to Org settings</a>
         </div>
-        <p class="muted" style="margin:0;">Adding a card does not charge you. Charges are $0.05 for each hour a recording captures at least one clip.</p>
+        <p class="muted" style="margin:0;">Add a payment method in Org settings to start recording. Adding a card does not charge you. Charges are $0.05 for each hour a recording captures at least one clip.</p>
       </div>
 
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
@@ -535,6 +536,14 @@
           </div>
           <!-- Shown when no green NAS connection exists, in place of the NAS option. -->
           <div id="nasHint" class="hint hidden" style="margin-bottom:10px;">Set up a NAS connection in <a href="/org-settings">Org settings</a> to record to your NAS.</div>
+          <!-- Managed retention sub-selector: monthly-metered vs yearly-prepaid. Shown
+               only when the managed (not NAS) option is active. yearly_prepaid needs a
+               card on file (enforced by the server); the hint points to Org settings. -->
+          <div id="retentionChooser" class="seg hidden" style="margin-bottom:10px;">
+            <button type="button" data-retention="monthly">Pay monthly ($0.10 per hour of footage stored per month, billed in arrears)</button>
+            <button type="button" data-retention="yearly_prepaid">Prepay yearly ($0.05 per hour of footage stored per month, prepaid 12 months up front)</button>
+          </div>
+          <div id="retentionHint" class="hint hidden" style="margin-bottom:10px;"></div>
           <div id="managedStatus" class="status hidden" style="margin-bottom:10px;"></div>
           <!-- Shared destinations granted to this account (e.g. a lab NAS over WebDAV).
                Admin-created and already verified; the account selects but never edits
@@ -623,7 +632,6 @@
       returnBody: document.getElementById('returnBody'),
       ledger: document.getElementById('ledger'),
       cardBanner: document.getElementById('cardBanner'),
-      cardBannerBtn: document.getElementById('cardBannerBtn'),
       heroCopy: document.getElementById('heroCopy'),
       clipPage: document.getElementById('clipPage'),
       cards: document.getElementById('cards'),
@@ -672,6 +680,8 @@
       sharedStorageBtn: document.getElementById('sharedStorageBtn'),
       nasStorageBtn: document.getElementById('nasStorageBtn'),
       nasHint: document.getElementById('nasHint'),
+      retentionChooser: document.getElementById('retentionChooser'),
+      retentionHint: document.getElementById('retentionHint'),
       sharedPicker: document.getElementById('sharedPicker'),
       recSharedDest: document.getElementById('recSharedDest'),
       sharedDestNote: document.getElementById('sharedDestNote'),
@@ -764,6 +774,10 @@
       verifiedDestId: 0, // a bucket just verified inline this session
       // Storage choice when the chooser is shown: '' (none yet) | 'managed' | 'nas' | 'byo'.
       storageChoice: '',
+      // Managed retention tier when storageChoice is 'managed': 'monthly' (metered
+      // $0.10/hr-mo, default) or 'yearly_prepaid' ($0.05/hr-mo prepaid 12mo). Only
+      // sent on create when the managed option is active.
+      managedRetention: 'monthly',
       // True when the org has at least one healthy (green) NAS connection. Gates the
       // "Record to my NAS" option, which resolves to the managed destination.
       nasConnected: false,
@@ -1133,15 +1147,20 @@
       const monthTotalStreamHrs = streamHrsPerDay * activeDays;
       const managed = state.storageChoice === 'managed';
       const nas = state.storageChoice === 'nas';
+      // Yearly-prepaid managed storage is billed at an effective $0.05/hr-mo (half the
+      // metered rate), prepaid up front. The estimate uses that effective rate so the
+      // shown storage line reflects the tier the user picked.
+      const yearlyPrepaid = managed && state.managedRetention === 'yearly_prepaid';
+      const effShmRate = yearlyPrepaid ? 5 : shmRate;
       const avgStreamHrMo = managed ? (monthTotalStreamHrs / 2) : 0;
-      const storageCents = Math.round(avgStreamHrMo * shmRate);
+      const storageCents = Math.round(avgStreamHrMo * effShmRate);
       // NAS is priced per recording-hour: $0.01/recording-hour transfer adder on
       // top of the $0.05/recording-hour rate. No per-month storage line.
       const nasTransferRate = 1;
       const nasTransferCents = nas ? recordHours * nasTransferRate : 0;
 
       return {
-        activeDays, runsPerDay, clipSec, hourRate, shmRate, managed, nas,
+        activeDays, runsPerDay, clipSec, hourRate, shmRate: effShmRate, managed, nas, yearlyPrepaid,
         recordHours, recordHourCents, avgStreamHrMo, storageCents,
         nasTransferRate, nasTransferCents,
         totalCents: recordHourCents + storageCents + nasTransferCents,
@@ -1176,6 +1195,8 @@
       els.costEstimate.innerHTML = parts.join('');
       if (m.nas) {
         els.costEstimateNote.textContent = 'Estimate only. NAS is $0.05 per hour of recording plus $0.01 per hour of recording for transfer, about $0.06 per recording-hour. The $0.01 covers managing the transfer and holding each clip about 60 seconds. If your NAS goes down while recording, unsent clips are kept safely in managed storage and bill at $0.10 per hour of footage per month until your NAS catches up.';
+      } else if (m.managed && m.yearlyPrepaid) {
+        els.costEstimateNote.textContent = `Estimate only. Yearly prepaid: storage is $0.05 per hour of footage kept for a month, prepaid 12 months up front. This month’s stored footage is charged to your card now; new footage is prepaid monthly.`;
       } else {
         els.costEstimateNote.textContent = m.managed
           ? `Estimate only. Storage is $${(m.shmRate / 100).toFixed(2)} per hour of footage kept for a month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that.`
@@ -1378,13 +1399,19 @@
         els.destPicker.classList.add('hidden');
         els.connectForm.classList.add('hidden');
         els.sharedPicker.classList.add('hidden');
+        // Retention tier selector applies only to pure managed (NAS footage lives on
+        // the NAS, so it is never prepaid).
+        renderRetentionChooser(!isNas);
         const md = managedDest();
         if (md) {
           state.verifiedDestId = Number(md.id || 0);
           els.managedStatus.classList.remove('hidden');
+          const managedNote = state.managedRetention === 'yearly_prepaid'
+            ? 'Connected to Stoarama-managed storage. Yearly prepaid: $0.05 per hour of footage stored per month, prepaid 12 months up front.'
+            : 'Connected to Stoarama-managed storage. Clips are billed $0.10 per hour of footage stored per month.';
           setStatus(els.managedStatus, isNas
             ? 'Recording to your NAS. Clips write to managed storage and your NAS pulls each one within about a minute.'
-            : 'Connected to Stoarama-managed storage. Clips are billed $0.10 per hour of footage stored per month.', 'ok');
+            : managedNote, 'ok');
           setBucketState('connected');
         } else {
           els.managedStatus.classList.add('hidden');
@@ -1393,6 +1420,7 @@
         startButtonLabel();
         return;
       }
+      renderRetentionChooser(false);
       if (state.storageChoice === 'shared') {
         // Shared destination: hide the BYO/managed sub-UIs and render the granted
         // dests. A webdav pick delivers via managed staging (no stream-hour-month fee).
@@ -1408,6 +1436,41 @@
       els.sharedPicker.classList.add('hidden');
       renderByoStorageUI();
       startButtonLabel();
+    }
+
+    // renderRetentionChooser shows or hides the managed monthly/yearly sub-selector.
+    // Shown only for pure managed storage. When the org has no card on file, the
+    // yearly button is still shown but selecting it points the user to Org settings
+    // (the server also rejects the create), keeping the card-add flow in one place.
+    function renderRetentionChooser(show) {
+      if (!show) {
+        els.retentionChooser.classList.add('hidden');
+        els.retentionHint.classList.add('hidden');
+        return;
+      }
+      els.retentionChooser.classList.remove('hidden');
+      els.retentionChooser.querySelectorAll('button[data-retention]').forEach((btn) => {
+        btn.classList.toggle('on', btn.getAttribute('data-retention') === state.managedRetention);
+      });
+      const hasCard = state.billing && state.billing.has_payment_method === true;
+      if (state.managedRetention === 'yearly_prepaid' && !hasCard) {
+        els.retentionHint.classList.remove('hidden');
+        els.retentionHint.innerHTML = 'Yearly prepaid needs a payment method. <a href="/org-settings">Add one in Org settings</a> to prepay.';
+      } else if (state.managedRetention === 'yearly_prepaid') {
+        els.retentionHint.classList.remove('hidden');
+        els.retentionHint.textContent = 'Yearly prepaid: this month’s stored footage is prepaid for 12 months at $0.05 per hour of footage per month; new footage is prepaid monthly.';
+      } else {
+        els.retentionHint.classList.add('hidden');
+      }
+    }
+
+    // chooseRetention sets the managed retention tier and re-renders. The server is
+    // the authority on eligibility (managed + card); this only reflects the pick.
+    function chooseRetention(tier) {
+      state.managedRetention = (tier === 'yearly_prepaid') ? 'yearly_prepaid' : 'monthly';
+      renderRetentionChooser(state.storageChoice === 'managed');
+      startButtonLabel();
+      renderCostEstimate();
     }
 
     // Render the granted shared destinations as a picker, with a reachability /
@@ -1938,6 +2001,18 @@
         metaParts.push('<span>No clips yet</span>');
       }
 
+      // Managed-storage retention tier: show the current tier and a switch control.
+      // Only managed recordings can be yearly-prepaid; the switch is owner/billing-admin
+      // only (the server enforces it and 403s otherwise).
+      const isManaged = rec.storage_managed === true;
+      const tier = String(rec.storage_retention_tier || 'monthly');
+      if (isManaged) {
+        const tierLabel = tier === 'yearly_prepaid'
+          ? 'Storage: yearly prepaid ($0.05/hr-mo)'
+          : 'Storage: monthly metered ($0.10/hr-mo)';
+        metaParts.push(`<span data-tierlabel="${id}">${escapeHTML(tierLabel)}</span>`);
+      }
+
       let actions = '';
       if (status === 'active') {
         actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
@@ -1948,6 +2023,11 @@
       } else {
         actions = `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
       }
+      if (isManaged) {
+        const switchTo = tier === 'yearly_prepaid' ? 'monthly' : 'yearly_prepaid';
+        const switchLabel = tier === 'yearly_prepaid' ? 'Switch to monthly' : 'Switch to yearly prepaid';
+        actions += `<button type="button" class="secondary" data-retention="${id}" data-tier="${switchTo}">${switchLabel}</button>`;
+      }
       actions += `<a class="btn-link secondary" href="/recordings/${id}">View clips</a>`;
 
       const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
@@ -1957,8 +2037,8 @@
       // held by the server gate. Make that unmistakable per card so a researcher
       // never assumes recording is happening when it is silently held.
       const blocked = rec.needs_card === true
-        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a card to start capturing.</span>`
-          + `<button type="button" data-addcard="${id}">Add a card</button></div>`
+        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
+          + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`
         : '';
 
       // Linked to a catalog stream: title = stream name, subtitle = location.
@@ -2058,8 +2138,8 @@
       if (needCard > 0) metaParts.push(`<span>${needCard} need card</span>`);
 
       const blocked = needCard > 0
-        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a card to start capturing.</span>`
-          + `<button type="button" data-addcard="${Number(members[0] && members[0].id)}">Add a card</button></div>`
+        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
+          + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`
         : '';
 
       const collapsed = total > 6;
@@ -2143,8 +2223,8 @@
         b.addEventListener('click', () => mutateRecording(b.getAttribute('data-resume'), 'resume')));
       els.cards.querySelectorAll('button[data-delete]').forEach((b) =>
         b.addEventListener('click', () => deleteRecording(b)));
-      els.cards.querySelectorAll('button[data-addcard]').forEach((b) =>
-        b.addEventListener('click', () => addCardFromCard(b)));
+      els.cards.querySelectorAll('button[data-retention]').forEach((b) =>
+        b.addEventListener('click', () => switchRetention(b)));
       els.cards.querySelectorAll('button[data-bundletoggle]').forEach((b) =>
         b.addEventListener('click', () => {
           const bid = b.getAttribute('data-bundletoggle');
@@ -2153,17 +2233,6 @@
           const open = table.classList.toggle('hidden');
           b.setAttribute('aria-expanded', open ? 'false' : 'true');
         }));
-    }
-
-    // Per-card "Add a card" action: same Checkout flow the top banner triggers.
-    async function addCardFromCard(btn) {
-      btn.disabled = true;
-      try {
-        await startCardCheckout();
-      } catch (err) {
-        window.alert(String(err.message || err));
-        btn.disabled = false;
-      }
     }
 
     // ---- Clip detail (per-recording clip periods) ----
@@ -2772,6 +2841,32 @@
       }
     }
 
+    // switchRetention flips one managed recording's storage tier via PATCH
+    // /recordings/{id}/retention. Monthly->yearly prepays the currently-stored footage
+    // immediately (a real charge) and requires a card; yearly->monthly reverts future
+    // footage with NO refund of already-prepaid credit. Both caveats are confirmed
+    // before the call. The server is the authority (owner/billing-admin, card, managed).
+    async function switchRetention(btn) {
+      const id = String(btn.getAttribute('data-retention') || '').trim();
+      const tier = String(btn.getAttribute('data-tier') || '').trim();
+      const msg = tier === 'yearly_prepaid'
+        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage per month, charged to your card now. New footage is prepaid monthly.'
+        : 'Switch to monthly metered? Future footage bills at $0.10 per hour of footage per month. Any prepaid credit already granted runs until it expires and is not refunded.';
+      if (!window.confirm(msg)) return;
+      btn.disabled = true;
+      try {
+        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}/retention`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tier }),
+        });
+        if (out && out.note) window.alert(String(out.note));
+        await refreshRecordings();
+      } catch (err) {
+        window.alert(String(err.message || err));
+        btn.disabled = false;
+      }
+    }
+
     async function refreshRecordings() {
       try {
         const payload = await fetchJSON('/api/v1/account/recordings');
@@ -2951,18 +3046,6 @@
 
     // ---- Start handler ----
 
-    function redirectToCheckout(url) {
-      // One-line "add a card" interstitial, then Stripe Checkout.
-      els.signedIn.classList.add('hidden');
-      els.returnPanel.classList.remove('hidden');
-      els.returnBody.innerHTML = `
-        <div class="eyebrow">One more step</div>
-        <h2>Add a card</h2>
-        <p class="interstitial-body">Add a card to start recording. No charge now.</p>
-        <p class="muted" style="margin:0;">Redirecting to secure checkout. We never see your card.</p>`;
-      window.setTimeout(() => window.location.assign(url), 700);
-    }
-
     function deriveName(url) {
       try { return new URL(url).hostname || 'Recording'; } catch (_) { return 'Recording'; }
     }
@@ -2971,17 +3054,12 @@
       if (state.starting) return;
 
       // One-time card-on-file step: when billing is on and no card is saved, the
-      // primary action is "add a card" -> Checkout, not a create. Capture is held
-      // by the server gate until the card lands.
+      // card-add flow lives only in Org settings. Point the user there instead of
+      // launching an inline checkout. Capture is held by the server gate until a card
+      // lands.
       if (state.billingEnabled && state.billing.has_payment_method !== true) {
-        els.startBtn.disabled = true;
-        setStatus(els.startStatus, 'Redirecting to add a card...', '');
-        try {
-          await startCardCheckout();
-        } catch (err) {
-          setStatus(els.startStatus, String(err.message || err), 'err');
-          refreshStartEnabled();
-        }
+        setStatus(els.startStatus, 'Add a payment method in Org settings to start recording.', 'err');
+        window.location.assign('/org-settings');
         return;
       }
 
@@ -3026,6 +3104,12 @@
       // delivery_storage_destination_id. Otherwise send the capture dest.
       if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
       else body.storage_destination_id = dest;
+      // Managed retention tier: only send yearly_prepaid on a pure managed pick (the
+      // server rejects it otherwise). Default monthly is the server default, so send
+      // it only when the user picked yearly to keep the payload lean.
+      if (state.storageChoice === 'managed' && state.managedRetention === 'yearly_prepaid') {
+        body.storage_retention_tier = 'yearly_prepaid';
+      }
       // Catalog stream: send stream_id and OMIT stream_url (server derives it).
       // Paste flow: send stream_url as before.
       if (catalogId) body.stream_id = catalogId;
@@ -3055,7 +3139,7 @@
       const needsCard = state.billingEnabled && state.billing.has_payment_method !== true;
       const managed = state.storageChoice === 'managed';
       const nas = state.storageChoice === 'nas';
-      els.startBtn.textContent = needsCard ? 'Add a card to start recording' : 'Start recording';
+      els.startBtn.textContent = needsCard ? 'Add a payment method in Org settings' : 'Start recording';
       const hoursCharge = '$0.05 for each hour a recording captures at least one clip';
       const storageCharge = ', plus $0.10 per hour of footage stored per month for managed storage';
       const nasCharge = ', plus $0.01 per hour of recording for NAS transfer';
@@ -3067,7 +3151,7 @@
             : '$0.05 per hour of recording.');
       els.composerFootnote.textContent = state.billingEnabled
         ? (needsCard
-            ? `Add a card to begin capturing. No charge now; charges are ${hoursCharge}${storedCharge}.`
+            ? `Add a payment method in Org settings to start recording. No charge now; charges are ${hoursCharge}${storedCharge}.`
             : paidLine)
         : '';
       els.composerFootnote.classList.toggle('warn', state.billingEnabled && needsCard);
@@ -3175,17 +3259,6 @@
       renderStorageChooser();
     }
 
-    // POST /billing/card -> {checkout_url} (no card yet) or {portal_url} (card on
-    // file). For the add-card flow we expect checkout_url and redirect to it.
-    async function startCardCheckout() {
-      const out = await fetchJSON('/api/v1/account/billing/card', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-      });
-      if (out && out.checkout_url) { redirectToCheckout(out.checkout_url); return; }
-      if (out && out.portal_url) { window.location.assign(out.portal_url); return; }
-      window.alert('No checkout URL returned.');
-    }
-
     // ---- Wiring ----
 
     els.modeSeg.querySelectorAll('button[data-mode]').forEach((b) =>
@@ -3229,6 +3302,9 @@
         else chooseByo();
       });
     });
+    els.retentionChooser.querySelectorAll('button[data-retention]').forEach((btn) => {
+      btn.addEventListener('click', () => chooseRetention(btn.getAttribute('data-retention')));
+    });
     els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => openComposer(false));
@@ -3248,15 +3324,6 @@
       state.bundleSelected = new Set();
       els.bundleStreamList.querySelectorAll('input[data-bundlestream]').forEach((cb) => { cb.checked = false; });
       updateBundleCount();
-    });
-    els.cardBannerBtn.addEventListener('click', async () => {
-      els.cardBannerBtn.disabled = true;
-      try {
-        await startCardCheckout();
-      } catch (err) {
-        window.alert(String(err.message || err));
-        els.cardBannerBtn.disabled = false;
-      }
     });
 
     document.getElementById('requestLink').addEventListener('click', async () => {

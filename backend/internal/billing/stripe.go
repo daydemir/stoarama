@@ -12,6 +12,7 @@ package billing
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -283,6 +284,175 @@ func (c *Client) EnsureStreamHourMonthItem(ctx context.Context, subscriptionID s
 		return fmt.Errorf("add stream-hour-month subscription item: %w", err)
 	}
 	return nil
+}
+
+// StreamHourMonthPriceID returns the managed-storage ($/stream-hour-month) metered
+// price id. The yearly-prepaid credit grant is scoped to THIS price ONLY (never the
+// recording-hour price), so the prepay pass and its tests read it from here.
+func (c *Client) StreamHourMonthPriceID() string { return c.streamHourMonthPriceID }
+
+// PrepaidStreamHourMonthRateCents is the effective managed-storage price for
+// yearly-prepaid footage: $0.05 per stream-hour-month (half the metered $0.10),
+// prepaid 12 months up front.
+const PrepaidStreamHourMonthRateCents = 5
+
+// PrepaidCreditMonths is how many months a prepay batch covers: the charge is
+// round(stream_hours * PrepaidCreditMonths * PrepaidStreamHourMonthRateCents) and
+// the credit grant expires PrepaidCreditMonths after the invoice is paid.
+const PrepaidCreditMonths = 12
+
+// PrepaidBatchCents is the prepay charge in cents for stream-hours of footage:
+// round(stream_hours * 12 * $0.05). It is the single cents-math authority shared by
+// the monthly per-account pass and the retroactive per-recording tier switch. A
+// batch that rounds to 0 cents returns 0 (the caller skips it, never charging $0).
+func PrepaidBatchCents(streamHours float64) int64 {
+	if streamHours <= 0 {
+		return 0
+	}
+	return int64(math.Round(streamHours * float64(PrepaidCreditMonths) * float64(PrepaidStreamHourMonthRateCents)))
+}
+
+// PrepaidBatch is the result of charging one yearly-prepaid storage batch: the ids
+// of the standalone invoice and its single invoice item, which the ledger stores so
+// the invoice.paid webhook can match the paid invoice back to its batch row.
+type PrepaidBatch struct {
+	InvoiceID     string
+	InvoiceItemID string
+}
+
+// ChargePrepaidBatch charges one aggregated yearly-prepaid storage batch as a
+// STANDALONE invoice billed to the customer's card, distinct from the metered
+// subscription's monthly cycle. It (1) creates a one-off invoice item for `cents`
+// USD carrying the batch_key in its metadata + description, then (2) creates an
+// invoice that PULLS that pending item (PendingInvoiceItemsBehavior=include, so the
+// prepay lands on THIS invoice and not the next metered cycle),
+// CollectionMethod=charge_automatically + AutoAdvance=true so Stripe finalizes and
+// charges the saved card immediately.
+//
+// batch_key is the idempotency anchor: SetIdempotencyKey(batchKey) on the invoice
+// item and SetIdempotencyKey("inv:"+batchKey) on the invoice mean a re-run of the
+// monthly pass under the same key returns Stripe's original objects instead of
+// double-charging. Combined with the ledger's UNIQUE batch_key, this is the
+// no-double-charge guarantee for real money.
+func (c *Client) ChargePrepaidBatch(ctx context.Context, customerID, batchKey string, cents int64, metadata map[string]string) (PrepaidBatch, error) {
+	customerID = strings.TrimSpace(customerID)
+	if customerID == "" {
+		return PrepaidBatch{}, fmt.Errorf("customer id is required")
+	}
+	if strings.TrimSpace(batchKey) == "" {
+		return PrepaidBatch{}, fmt.Errorf("batch key is required")
+	}
+	if cents <= 0 {
+		return PrepaidBatch{}, fmt.Errorf("charge cents must be positive, got %d", cents)
+	}
+
+	itemParams := &stripe.InvoiceItemParams{
+		Customer:    strPtr(customerID),
+		Amount:      stripe.Int64(cents),
+		Currency:    strPtr(string(stripe.CurrencyUSD)),
+		Description: strPtr("Prepaid managed storage (12 months)"),
+	}
+	itemParams.Context = ctx
+	for k, v := range metadata {
+		itemParams.AddMetadata(k, v)
+	}
+	itemParams.AddMetadata("batch_key", batchKey)
+	itemParams.SetIdempotencyKey(batchKey)
+	item, err := c.sc.InvoiceItems.New(itemParams)
+	if err != nil {
+		return PrepaidBatch{}, fmt.Errorf("create prepaid invoice item: %w", err)
+	}
+
+	invParams := &stripe.InvoiceParams{
+		Customer:                    strPtr(customerID),
+		CollectionMethod:            strPtr(string(stripe.InvoiceCollectionMethodChargeAutomatically)),
+		AutoAdvance:                 stripe.Bool(true),
+		PendingInvoiceItemsBehavior: strPtr("include"),
+		Description:                 strPtr("Prepaid managed storage (12 months)"),
+	}
+	invParams.Context = ctx
+	for k, v := range metadata {
+		invParams.AddMetadata(k, v)
+	}
+	invParams.AddMetadata("batch_key", batchKey)
+	invParams.SetIdempotencyKey("inv:" + batchKey)
+	inv, err := c.sc.Invoices.New(invParams)
+	if err != nil {
+		return PrepaidBatch{}, fmt.Errorf("create prepaid invoice: %w", err)
+	}
+	return PrepaidBatch{
+		InvoiceID:     strings.TrimSpace(inv.ID),
+		InvoiceItemID: strings.TrimSpace(item.ID),
+	}, nil
+}
+
+// CreatePrepaidCreditGrant issues a Stripe billing credit grant of `cents` USD that
+// applies ONLY to the managed-storage stream_hour_month price (streamHourMonthPriceID),
+// so a prepaid recording's monthly metered storage line is netted to $0 while it
+// NEVER touches the recording-hour price (which is always metered in arrears). This
+// is the load-bearing scope: applying the credit to the recording-hour price would
+// silently give away recording-hours for free.
+//
+// Category=paid (the customer paid for it via the prepay invoice), Amount.Monetary
+// in USD, ExpiresAt = the caller-supplied +12mo instant so the prepaid year runs out
+// exactly a year after payment. SetIdempotencyKey("grant:"+batchKey) makes the
+// webhook that creates it safe against Stripe redelivery: a second invoice.paid for
+// the same batch returns the original grant rather than a duplicate.
+func (c *Client) CreatePrepaidCreditGrant(ctx context.Context, customerID string, cents int64, expiresAt time.Time, batchKey string, metadata map[string]string) (string, error) {
+	customerID = strings.TrimSpace(customerID)
+	if customerID == "" {
+		return "", fmt.Errorf("customer id is required")
+	}
+	if cents <= 0 {
+		return "", fmt.Errorf("grant cents must be positive, got %d", cents)
+	}
+	if strings.TrimSpace(batchKey) == "" {
+		return "", fmt.Errorf("batch key is required")
+	}
+	if expiresAt.IsZero() {
+		return "", fmt.Errorf("credit grant expiry is required")
+	}
+	params := prepaidCreditGrantParams(customerID, cents, expiresAt, batchKey, c.streamHourMonthPriceID, metadata)
+	params.Context = ctx
+	grant, err := c.sc.BillingCreditGrants.New(params)
+	if err != nil {
+		return "", fmt.Errorf("create prepaid credit grant: %w", err)
+	}
+	return strings.TrimSpace(grant.ID), nil
+}
+
+// prepaidCreditGrantParams builds the credit-grant request. It is factored out (with
+// storagePriceID passed in) so a unit test can assert the load-bearing scope: the
+// grant applies to the storage price ONLY and NEVER to any other price (the
+// recording-hour price). It also sets category=paid, USD monetary amount, the +12mo
+// expiry, and the "grant:"+batchKey idempotency key.
+func prepaidCreditGrantParams(customerID string, cents int64, expiresAt time.Time, batchKey, storagePriceID string, metadata map[string]string) *stripe.BillingCreditGrantParams {
+	params := &stripe.BillingCreditGrantParams{
+		Customer: strPtr(customerID),
+		Category: strPtr(string(stripe.BillingCreditGrantCategoryPaid)),
+		Amount: &stripe.BillingCreditGrantAmountParams{
+			Type: strPtr(string(stripe.BillingCreditGrantAmountTypeMonetary)),
+			Monetary: &stripe.BillingCreditGrantAmountMonetaryParams{
+				Currency: strPtr(string(stripe.CurrencyUSD)),
+				Value:    stripe.Int64(cents),
+			},
+		},
+		ApplicabilityConfig: &stripe.BillingCreditGrantApplicabilityConfigParams{
+			Scope: &stripe.BillingCreditGrantApplicabilityConfigScopeParams{
+				// Storage price ONLY. NEVER the recording-hour price.
+				Prices: []*stripe.BillingCreditGrantApplicabilityConfigScopePriceParams{
+					{ID: strPtr(storagePriceID)},
+				},
+			},
+		},
+		ExpiresAt: stripe.Int64(expiresAt.UTC().Unix()),
+	}
+	for k, v := range metadata {
+		params.AddMetadata(k, v)
+	}
+	params.AddMetadata("batch_key", batchKey)
+	params.SetIdempotencyKey("grant:" + batchKey)
+	return params
 }
 
 // GetSubscriptionPeriod returns the current billing-period bounds for the

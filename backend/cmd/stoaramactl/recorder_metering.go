@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/daydemir/stoarama/backend/internal/billing"
 )
 
 // meteringTickInterval is the metering loop's wakeup cadence. The job acts at most
@@ -19,10 +21,16 @@ const meteringTickInterval = time.Hour
 // needs: read a subscription's current period bounds and push one meter event. The
 // production path passes the real *billing.Client; unit tests pass a fake so the
 // hour-count + idempotency-guard MATH is exercised without Stripe.
+//
+// ChargePrepaidBatch is the yearly-prepaid seam: it creates the standalone prepay
+// invoice for one aggregated per-account month batch. The credit grant is NOT made
+// here (it is made on the invoice.paid webhook once the card is actually charged);
+// this pass only creates the charge and records the batch as 'charged'.
 type meteringStripe interface {
 	GetSubscriptionPeriod(ctx context.Context, subID string) (start, end time.Time, err error)
 	ReportRecordingHours(ctx context.Context, customerID string, accountID int64, periodKey string, hours int) error
 	ReportStreamHourMonth(ctx context.Context, customerID string, accountID int64, periodKey, hoursDecimal string) error
+	ChargePrepaidBatch(ctx context.Context, customerID, batchKey string, cents int64, metadata map[string]string) (billing.PrepaidBatch, error)
 }
 
 // meterableAccount is one account the metering job may bill: it has a Stripe
@@ -65,6 +73,19 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 			}
 			log.Printf("recording metering sweep error: %v", err)
 			return
+		}
+		// Yearly-prepaid: after the snapshot + metered pass, charge each account with
+		// yearly_prepaid recordings once per calendar month for that month's new
+		// not-yet-charged managed footage. The metered stream_hour_month meter above
+		// is reported UNCHANGED; the credit grant (made on invoice.paid) nets the
+		// monthly line to $0 while it lasts. Log-and-continue: a prepay failure never
+		// stalls the metered path (which already advanced its cursor).
+		if err := prepayYearlyBatches(ctx, pool, reporter, time.Now().UTC()); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("yearly prepay sweep error: %v", err)
+			// Do not return: metering already succeeded; retry prepay next tick/day.
 		}
 		lastRunDay = today
 	}
@@ -299,4 +320,197 @@ func meterPeriodKey(periodEnd time.Time) string {
 func dateOnlyUTC(t time.Time) time.Time {
 	u := t.UTC()
 	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// prepayAccount is one account with at least one yearly_prepaid recording plus the
+// Stripe customer to bill. subscription id is not needed: a prepay is a STANDALONE
+// invoice, not a metered-cycle line.
+type prepayAccount struct {
+	accountID  int64
+	customerID string
+}
+
+// prepayYearlyBatches is the monthly per-account yearly-prepaid charge pass. For each
+// account that has yearly_prepaid recordings and a Stripe customer, it aggregates
+// that account's yearly-tier managed stream-hours of footage NOT yet covered by a
+// prepay batch, and (once per calendar month, keyed by batch_key
+// "prepay:acct-<id>:<YYYY-MM>") creates a standalone prepay invoice for
+// round(stream_hours * 12 * $0.05) and records the ledger batch as 'charged'. The
+// credit grant is created later, on invoice.paid.
+//
+// Idempotency is layered: the batch_key is UNIQUE in prepaid_storage_batches (a
+// second run in the same month no-ops on the INSERT), and ChargePrepaidBatch sets
+// the same key as the Stripe idempotency key on the invoice item + invoice, so even
+// a torn run (ledger insert committed, charge not yet made, then re-run) cannot
+// double-charge. 0-stream-hour accounts are skipped entirely (no ledger row, no
+// charge). Each account is isolated: one account's Stripe error is logged and the
+// sweep continues.
+func prepayYearlyBatches(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, now time.Time) error {
+	rows, err := pool.Query(ctx, `
+		SELECT DISTINCT ab.account_id, ab.stripe_customer_id
+		FROM account_billing ab
+		WHERE ab.stripe_customer_id IS NOT NULL
+		  AND EXISTS (
+		    SELECT 1 FROM recordings r
+		    WHERE r.account_id = ab.account_id
+		      AND r.storage_retention_tier = 'yearly_prepaid'
+		  )
+		ORDER BY ab.account_id ASC
+	`)
+	if err != nil {
+		return fmt.Errorf("prepay: select yearly accounts: %w", err)
+	}
+	defer rows.Close()
+	accts := make([]prepayAccount, 0, 8)
+	for rows.Next() {
+		var a prepayAccount
+		if err := rows.Scan(&a.accountID, &a.customerID); err != nil {
+			return fmt.Errorf("prepay: scan account: %w", err)
+		}
+		accts = append(accts, a)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("prepay: iterate accounts: %w", err)
+	}
+	for _, a := range accts {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := prepayAccountMonth(ctx, pool, reporter, a, now); err != nil {
+			log.Printf("yearly prepay: account %d skipped: %v", a.accountID, err)
+		}
+	}
+	return nil
+}
+
+// prepayAccountMonth runs one account's monthly prepay batch. batch_key is
+// "prepay:acct-<id>:<YYYY-MM>" so each account is charged at most once per calendar
+// month. stream-hours are the account's yearly-tier managed footage NOT already
+// covered by ANY prior prepay batch for this account, computed directly from
+// recording_clips (account_storage_snapshots has no recording_id). The
+// already-charged set is the SUM of stream_hours across this account's prior
+// non-failed batches, subtracted from the current yearly footage total, so each
+// clip's storage is prepaid exactly once across successive months.
+func prepayAccountMonth(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, a prepayAccount, now time.Time) error {
+	batchKey := fmt.Sprintf("prepay:acct-%d:%s", a.accountID, now.UTC().Format("2006-01"))
+
+	// Short-circuit: if this month's batch already exists, nothing to do (idempotent).
+	var exists bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM prepaid_storage_batches WHERE batch_key=$1)
+	`, batchKey).Scan(&exists); err != nil {
+		return fmt.Errorf("check batch exists: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	// Total yearly-tier managed stream-hours currently stored for this account
+	// (purged/released clips excluded, matching the snapshot's billing WHERE), minus
+	// what prior non-failed batches already prepaid. clip duration is the wall-clock
+	// span; identical to the snapshot's stream-hour math.
+	var newStreamHours float64
+	if err := pool.QueryRow(ctx, `
+		WITH current AS (
+			SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0) AS hours
+			FROM recording_clips c
+			JOIN recordings r            ON r.id = c.recording_id
+			JOIN storage_destinations sd ON sd.id = c.storage_destination_id
+			WHERE r.account_id = $1
+			  AND r.storage_retention_tier = 'yearly_prepaid'
+			  AND sd.managed
+			  AND c.purged_at IS NULL
+			  AND c.released_at IS NULL
+		), prepaid AS (
+			SELECT COALESCE(SUM(stream_hours), 0) AS hours
+			FROM prepaid_storage_batches
+			WHERE account_id = $1 AND status <> 'failed'
+		)
+		SELECT GREATEST(current.hours - prepaid.hours, 0) FROM current, prepaid
+	`, a.accountID).Scan(&newStreamHours); err != nil {
+		return fmt.Errorf("compute new yearly stream-hours: %w", err)
+	}
+	if newStreamHours <= 0 {
+		return nil // no new footage to prepay this month.
+	}
+
+	cents := billing.PrepaidBatchCents(newStreamHours)
+	if cents <= 0 {
+		return nil // rounds to $0 (a few seconds of footage); wait for more.
+	}
+
+	if err := chargeAndRecordBatch(ctx, pool, reporter, chargeBatch{
+		batchKey:    batchKey,
+		accountID:   a.accountID,
+		customerID:  a.customerID,
+		recordingID: nil,
+		streamHours: newStreamHours,
+		cents:       cents,
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// chargeBatch is the fully-resolved inputs for one prepay charge, shared by the
+// monthly per-account pass and the retroactive per-recording tier switch.
+type chargeBatch struct {
+	batchKey    string
+	accountID   int64
+	customerID  string
+	recordingID *int64
+	streamHours float64
+	cents       int64
+}
+
+// chargeAndRecordBatch inserts the pending ledger row, charges the standalone prepay
+// invoice, and transitions the row to 'charged'. The ledger insert is a
+// no-double-charge gate: batch_key is UNIQUE, so a concurrent/retried run that finds
+// the row already present returns without charging. On a Stripe error the row is
+// marked 'failed' (so the next pass does not silently re-attempt under a key that
+// already burned its Stripe idempotency key) and the error is returned.
+func chargeAndRecordBatch(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, b chargeBatch) error {
+	var recArg any
+	if b.recordingID != nil {
+		recArg = *b.recordingID
+	}
+	ct, err := pool.Exec(ctx, `
+		INSERT INTO prepaid_storage_batches
+			(batch_key, account_id, recording_id, stream_hours, charged_cents, status)
+		VALUES ($1,$2,$3,$4,$5,'pending')
+		ON CONFLICT (batch_key) DO NOTHING
+	`, b.batchKey, b.accountID, recArg, b.streamHours, b.cents)
+	if err != nil {
+		return fmt.Errorf("insert prepay batch: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		// Batch already exists (idempotent): do not charge again.
+		return nil
+	}
+
+	meta := map[string]string{
+		"account_id":   strconv.FormatInt(b.accountID, 10),
+		"stream_hours": strconv.FormatFloat(b.streamHours, 'f', 4, 64),
+		"kind":         "yearly_prepaid_storage",
+	}
+	if b.recordingID != nil {
+		meta["recording_id"] = strconv.FormatInt(*b.recordingID, 10)
+	}
+	res, err := reporter.ChargePrepaidBatch(ctx, b.customerID, b.batchKey, b.cents, meta)
+	if err != nil {
+		if _, uerr := pool.Exec(ctx, `
+			UPDATE prepaid_storage_batches SET status='failed', updated_at=now() WHERE batch_key=$1
+		`, b.batchKey); uerr != nil {
+			log.Printf("yearly prepay: mark batch %s failed: %v", b.batchKey, uerr)
+		}
+		return fmt.Errorf("charge prepay batch %s: %w", b.batchKey, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE prepaid_storage_batches
+		SET status='charged', stripe_invoice_id=$2, stripe_invoice_item_id=$3, charged_at=now(), updated_at=now()
+		WHERE batch_key=$1
+	`, b.batchKey, res.InvoiceID, res.InvoiceItemID); err != nil {
+		return fmt.Errorf("record charged batch %s: %w", b.batchKey, err)
+	}
+	return nil
 }

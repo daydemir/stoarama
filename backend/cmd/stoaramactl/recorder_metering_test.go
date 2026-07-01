@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/billing"
 )
 
 func dateUTC(y int, m time.Month, d int) time.Time {
@@ -223,6 +225,10 @@ func (f *fakeMeteringStripe) ReportRecordingHours(_ context.Context, customerID 
 func (f *fakeMeteringStripe) ReportStreamHourMonth(_ context.Context, customerID string, accountID int64, periodKey, hoursDecimal string) error {
 	f.shmReports = append(f.shmReports, shmReportCall{customerID, accountID, periodKey, hoursDecimal})
 	return nil
+}
+
+func (f *fakeMeteringStripe) ChargePrepaidBatch(_ context.Context, _ string, batchKey string, cents int64, _ map[string]string) (billing.PrepaidBatch, error) {
+	return billing.PrepaidBatch{InvoiceID: "in_" + batchKey, InvoiceItemID: "ii_" + batchKey}, nil
 }
 
 // TestMeteringReportBranch exercises the report decision the same way meterAccount

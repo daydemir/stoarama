@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
@@ -63,6 +65,12 @@ type recordingCreateRequest struct {
 	// open-ended when nil. When both are set, EndAt must be strictly after StartAt.
 	StartAt *time.Time `json:"start_at"`
 	EndAt   *time.Time `json:"end_at"`
+	// StorageRetentionTier is how the managed-storage footage is billed: 'monthly'
+	// (default; metered $0.10/stream-hour-month in arrears) or 'yearly_prepaid'
+	// ($0.05 effective, prepaid 12 months up front). yearly_prepaid is only allowed
+	// when the capture destination is the account's managed destination AND the org
+	// has a card on file; otherwise create 400s.
+	StorageRetentionTier string `json:"storage_retention_tier"`
 }
 
 func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Request) {
@@ -84,7 +92,8 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 			rec.created_at, sd.managed,
 			rec.stream_id, st.name, st.location_text,
 			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
-			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name
+			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
+			rec.storage_retention_tier
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		LEFT JOIN streams st ON st.id = rec.stream_id
@@ -356,6 +365,48 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// Storage retention tier. Default 'monthly' (existing metered model). 'yearly_prepaid'
+	// is only allowed when the capture destination is the account's MANAGED destination
+	// (never a BYO bucket or a WebDAV delivery) AND the org has a card on file, because
+	// the prepay charges that card. A WebDAV delivery (deliveryDestArg set) stages in
+	// managed but the footage lives on the NAS, so it is not prepay-eligible.
+	retentionTier := strings.TrimSpace(req.StorageRetentionTier)
+	if retentionTier == "" {
+		retentionTier = "monthly"
+	}
+	if retentionTier != "monthly" && retentionTier != "yearly_prepaid" {
+		util.WriteError(w, http.StatusBadRequest, "storage_retention_tier must be monthly or yearly_prepaid")
+		return
+	}
+	if retentionTier == "yearly_prepaid" {
+		if deliveryDestArg != nil {
+			util.WriteError(w, http.StatusBadRequest, "yearly_prepaid storage is only available for managed storage, not NAS delivery")
+			return
+		}
+		var destManaged bool
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT managed FROM storage_destinations WHERE id=$1
+		`, captureDestID).Scan(&destManaged); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load destination managed flag: %v", err))
+			return
+		}
+		if !destManaged {
+			util.WriteError(w, http.StatusBadRequest, "yearly_prepaid storage is only available for Stoarama-managed storage")
+			return
+		}
+		var hasCard bool
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT COALESCE(has_payment_method, false) FROM account_billing WHERE account_id=$1
+		`, principal.AccountID).Scan(&hasCard); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load payment method: %v", err))
+			return
+		}
+		if !hasCard {
+			util.WriteError(w, http.StatusBadRequest, "add a payment method in Org settings before choosing yearly_prepaid storage")
+			return
+		}
+	}
+
 	// Reachability probe pinned to the validated IP, so the probe socket cannot
 	// be redirected by a DNS rebind between validation above and connect time.
 	if err := probeRecordingStreamReachable(r.Context(), resolvedForProbe, validatedIP); err != nil {
@@ -426,6 +477,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		startAt:             startAt,
 		endAtArg:            endAtArg,
 		bundleIDArg:         nil,
+		retentionTier:       retentionTier,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -487,6 +539,9 @@ type recordingInsertParams struct {
 	startAt             time.Time
 	endAtArg            any
 	bundleIDArg         any
+	// retentionTier is 'monthly' (default) or 'yearly_prepaid'; empty is treated as
+	// 'monthly'. Bundle fan-out leaves it empty so bundled recordings are metered.
+	retentionTier string
 }
 
 // insertRecordingTx runs the one canonical recordings INSERT inside the caller's
@@ -500,12 +555,16 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	if mode == "" {
 		mode = "sampled"
 	}
+	retentionTier := p.retentionTier
+	if retentionTier == "" {
+		retentionTier = "monthly"
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19)
 		RETURNING id, created_at, start_at, end_at
-	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg).Scan(&id, &createdAt, &startOut, &endOut)
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier).Scan(&id, &createdAt, &startOut, &endOut)
 	return id, createdAt, startOut, endOut, err
 }
 
@@ -572,7 +631,8 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 			rec.created_at, sd.managed,
 			rec.stream_id, st.name, st.location_text,
 			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
-			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name
+			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
+			rec.storage_retention_tier
 		FROM recordings rec
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 		LEFT JOIN streams st ON st.id = rec.stream_id
@@ -588,6 +648,249 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, item)
+}
+
+// recordingRetentionRequest is the tier-change PATCH body.
+type recordingRetentionRequest struct {
+	Tier string `json:"tier"`
+}
+
+// handleAccountRecordingRetention switches one recording's storage_retention_tier
+// (retroactively). It is owner/billing_admin only (principalCanManageBilling).
+//
+//   - monthly -> yearly_prepaid: card required. It prepays the recording's
+//     CURRENTLY-STORED footage NOW as an immediate standalone batch
+//     (batch_key "prepay-switch:rec-<id>:<YYYY-MM-DD>"), sets the tier, and future
+//     footage prepays via the monthly pass. The credit grant is created later on the
+//     invoice.paid webhook (same path as the monthly pass), so the switch is not
+//     "done" billing-wise until Stripe confirms payment.
+//   - yearly_prepaid -> monthly: sets the tier so future footage reverts to metered.
+//     Any already-granted credit RUNS TO ITS EXPIRY and is NOT refunded (stated in the
+//     response and the UI copy).
+//
+// Only managed footage is prepay-eligible; a recording whose destination is not
+// managed cannot be set to yearly_prepaid.
+func (s *Server) handleAccountRecordingRetention(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if !principalCanManageBilling(principal) {
+		util.WriteError(w, http.StatusForbidden, "only an org owner or billing admin can change storage retention")
+		return
+	}
+	if s.billing == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "billing is not enabled")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req recordingRetentionRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	newTier := strings.TrimSpace(req.Tier)
+	if newTier != "monthly" && newTier != "yearly_prepaid" {
+		util.WriteError(w, http.StatusBadRequest, "tier must be monthly or yearly_prepaid")
+		return
+	}
+
+	// Load the recording (owned by this account), its current tier, and whether its
+	// capture destination is managed.
+	var (
+		curTier     string
+		destManaged bool
+	)
+	err := s.pool.QueryRow(r.Context(), `
+		SELECT rec.storage_retention_tier, sd.managed
+		FROM recordings rec
+		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
+		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
+	`, id, principal.AccountID).Scan(&curTier, &destManaged)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+
+	if newTier == curTier {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"id": id, "storage_retention_tier": curTier, "changed": false})
+		return
+	}
+
+	if newTier == "monthly" {
+		// yearly_prepaid -> monthly: future footage reverts to metered. Existing granted
+		// credit runs to expiry; NO refund.
+		if _, err := s.pool.Exec(r.Context(), `
+			UPDATE recordings SET storage_retention_tier='monthly', updated_at=now()
+			WHERE id=$1 AND account_id=$2
+		`, id, principal.AccountID); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("set monthly tier: %v", err))
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{
+			"id":                     id,
+			"storage_retention_tier": "monthly",
+			"changed":                true,
+			"note":                   "Future footage will be metered at $0.10 per stream-hour-month. Any prepaid credit already granted runs until it expires and is not refunded.",
+		})
+		return
+	}
+
+	// monthly -> yearly_prepaid: managed-only + card required + immediate retroactive
+	// prepay of currently-stored footage.
+	if !destManaged {
+		util.WriteError(w, http.StatusBadRequest, "yearly_prepaid storage is only available for Stoarama-managed storage")
+		return
+	}
+	var (
+		customerID *string
+		hasCard    bool
+	)
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT stripe_customer_id, COALESCE(has_payment_method, false)
+		FROM account_billing WHERE account_id=$1
+	`, principal.AccountID).Scan(&customerID, &hasCard); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load billing: %v", err))
+		return
+	}
+	if !hasCard || customerID == nil || strings.TrimSpace(*customerID) == "" {
+		util.WriteError(w, http.StatusBadRequest, "add a payment method in Org settings before switching to yearly_prepaid")
+		return
+	}
+
+	// Currently-stored managed stream-hours for THIS recording (purged/released
+	// excluded), computed directly from recording_clips.
+	var streamHours float64
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0)
+		FROM recording_clips c
+		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
+		WHERE c.recording_id=$1 AND sd.managed AND c.purged_at IS NULL AND c.released_at IS NULL
+	`, id).Scan(&streamHours); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute stored stream-hours: %v", err))
+		return
+	}
+
+	// Set the tier first so future footage prepays via the monthly pass regardless of
+	// whether there is any currently-stored footage to retroactively charge.
+	if _, err := s.pool.Exec(r.Context(), `
+		UPDATE recordings SET storage_retention_tier='yearly_prepaid', updated_at=now()
+		WHERE id=$1 AND account_id=$2
+	`, id, principal.AccountID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("set yearly tier: %v", err))
+		return
+	}
+
+	cents := billing.PrepaidBatchCents(streamHours)
+	if cents <= 0 {
+		// No stored footage yet (or rounds to $0): nothing to charge now; future
+		// footage prepays via the monthly pass.
+		util.WriteJSON(w, http.StatusOK, map[string]any{
+			"id":                     id,
+			"storage_retention_tier": "yearly_prepaid",
+			"changed":                true,
+			"prepaid_now":            false,
+			"note":                   "Future footage is prepaid at $0.05 per stream-hour-month. No stored footage to prepay right now.",
+		})
+		return
+	}
+
+	batchKey := fmt.Sprintf("prepay-switch:rec-%d:%s", id, time.Now().UTC().Format("2006-01-02"))
+	if err := s.chargeRetroactivePrepay(r.Context(), retroactivePrepay{
+		batchKey:    batchKey,
+		accountID:   principal.AccountID,
+		recordingID: id,
+		customerID:  strings.TrimSpace(*customerID),
+		streamHours: streamHours,
+		cents:       cents,
+	}); err != nil {
+		// The tier is already set (future footage is covered). Surface the charge
+		// failure so the caller can retry; the ledger row is marked 'failed' by the
+		// helper so a retry uses a fresh batch_key path only if the caller changes date.
+		util.WriteError(w, http.StatusBadGateway, fmt.Sprintf("prepay stored footage: %v", err))
+		return
+	}
+
+	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "recording_retention_changed", "account", principal.Email, map[string]any{
+		"recording_id": id,
+		"from":         curTier,
+		"to":           "yearly_prepaid",
+		"batch_key":    batchKey,
+		"cents":        cents,
+	})
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"id":                     id,
+		"storage_retention_tier": "yearly_prepaid",
+		"changed":                true,
+		"prepaid_now":            true,
+		"charged_cents":          cents,
+		"stream_hours":           strconv.FormatFloat(streamHours, 'f', 4, 64),
+		"note":                   "Currently-stored footage was prepaid for 12 months. A standalone invoice was charged to your card; the credit applies once payment confirms.",
+	})
+}
+
+// retroactivePrepay carries the resolved inputs for an immediate per-recording prepay
+// charge (the monthly->yearly switch). It mirrors the metering pass's chargeBatch but
+// lives in the api package because the switch runs in the request path.
+type retroactivePrepay struct {
+	batchKey    string
+	accountID   int64
+	recordingID int64
+	customerID  string
+	streamHours float64
+	cents       int64
+}
+
+// chargeRetroactivePrepay inserts the pending ledger row and charges the standalone
+// prepay invoice for a monthly->yearly switch. It is the same no-double-charge
+// discipline as the monthly pass: batch_key is UNIQUE (a re-submit on the same day
+// no-ops on the INSERT), and ChargePrepaidBatch sets the Stripe idempotency key.
+// On a Stripe error it marks the row 'failed' and returns the error. The credit grant
+// is created later on the invoice.paid webhook.
+func (s *Server) chargeRetroactivePrepay(ctx context.Context, p retroactivePrepay) error {
+	ct, err := s.pool.Exec(ctx, `
+		INSERT INTO prepaid_storage_batches
+			(batch_key, account_id, recording_id, stream_hours, charged_cents, status)
+		VALUES ($1,$2,$3,$4,$5,'pending')
+		ON CONFLICT (batch_key) DO NOTHING
+	`, p.batchKey, p.accountID, p.recordingID, p.streamHours, p.cents)
+	if err != nil {
+		return fmt.Errorf("insert prepay batch: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		// Already submitted today (idempotent): do not charge again.
+		return nil
+	}
+	res, err := s.billing.ChargePrepaidBatch(ctx, p.customerID, p.batchKey, p.cents, map[string]string{
+		"account_id":   strconv.FormatInt(p.accountID, 10),
+		"recording_id": strconv.FormatInt(p.recordingID, 10),
+		"stream_hours": strconv.FormatFloat(p.streamHours, 'f', 4, 64),
+		"kind":         "yearly_prepaid_storage_switch",
+	})
+	if err != nil {
+		if _, uerr := s.pool.Exec(ctx, `
+			UPDATE prepaid_storage_batches SET status='failed', updated_at=now() WHERE batch_key=$1
+		`, p.batchKey); uerr != nil {
+			return fmt.Errorf("charge prepay batch: %v; mark failed: %w", err, uerr)
+		}
+		return fmt.Errorf("charge prepay batch: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE prepaid_storage_batches
+		SET status='charged', stripe_invoice_id=$2, stripe_invoice_item_id=$3, charged_at=now(), updated_at=now()
+		WHERE batch_key=$1
+	`, p.batchKey, res.InvoiceID, res.InvoiceItemID); err != nil {
+		return fmt.Errorf("record charged batch: %w", err)
+	}
+	return nil
 }
 
 // handleAccountRecordingClips returns the per-clip rows for one recording owned
@@ -946,6 +1249,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		dailyWindowEnd   string
 		bundleID         *int64
 		bundleName       *string
+		retentionTier    string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
@@ -955,7 +1259,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd,
-		&bundleID, &bundleName,
+		&bundleID, &bundleName, &retentionTier,
 	); err != nil {
 		return nil, err
 	}
@@ -997,6 +1301,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"stream_location":          streamLocation,
 		"bundle_id":                bundleID,
 		"bundle_name":              bundleName,
+		"storage_retention_tier":   retentionTier,
 	}, nil
 }
 

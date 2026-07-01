@@ -249,6 +249,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/{id}/transfers", s.handleAccountRecordingTransfers)
 			account.Post("/exports", s.handleAccountExportCreate)
 			account.Get("/exports/progress", s.handleAccountExportProgress)
+			account.Patch("/recordings/{id}/retention", s.handleAccountRecordingRetention)
 			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
 			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)

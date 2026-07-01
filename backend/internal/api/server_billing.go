@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	stripe "github.com/stripe/stripe-go/v82"
 
+	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -443,6 +444,15 @@ func (s *Server) applyStripeEvent(ctx context.Context, tx pgx.Tx, event stripe.E
 		`, accountID, eventCreatedArg(event)); err != nil {
 			return fmt.Errorf("apply invoice event: %w", err)
 		}
+		// Yearly-prepaid: a paid standalone prepay invoice is the trigger to grant the
+		// prepaid storage credit. This is atomic with the webhook dedup: it runs inside
+		// the same tx, so either the credit grant is created AND the ledger row moves
+		// charged->granted, or the whole webhook rolls back and Stripe retries.
+		if event.Type == "invoice.paid" {
+			if err := s.grantPrepaidCreditForInvoice(ctx, tx, accountID, customerIDOf(inv.Customer), &inv); err != nil {
+				return fmt.Errorf("grant prepaid credit: %w", err)
+			}
+		}
 		return nil
 
 	case "payment_method.detached", "customer.subscription.deleted":
@@ -481,6 +491,96 @@ func (s *Server) applyStripeEvent(ctx context.Context, tx pgx.Tx, event stripe.E
 		// Unhandled event types are acknowledged (already deduped/stored).
 		return nil
 	}
+}
+
+// invoiceBatchKey pulls the prepay batch_key off a paid invoice, preferring the
+// invoice metadata (set by ChargePrepaidBatch) so a batch is resolvable even if the
+// invoice id was never persisted. Returns "" for a non-prepay invoice.
+func invoiceBatchKey(inv *stripe.Invoice) string {
+	if inv == nil {
+		return ""
+	}
+	if inv.Metadata != nil {
+		if bk := strings.TrimSpace(inv.Metadata["batch_key"]); bk != "" {
+			return bk
+		}
+	}
+	return ""
+}
+
+// grantPrepaidCreditForInvoice is the yearly-prepaid credit-grant step of the
+// invoice.paid webhook. It resolves the paid invoice to its prepaid_storage_batches
+// row (by stripe_invoice_id, else by the metadata batch_key), and ONLY when that row
+// is in status='charged' does it create the Stripe credit grant (scoped to the
+// managed-storage price only, +12mo) and transition the row charged->granted with
+// the grant id, granted_at, and expires_at. A non-prepay invoice (no matching row)
+// is a no-op. A redelivered invoice.paid whose batch is already 'granted' is a no-op
+// (the UPDATE ... WHERE status='charged' affects 0 rows and we return before calling
+// Stripe again); combined with the grant's idempotency key this is the no-double-
+// grant guarantee. The whole thing runs in the webhook tx.
+func (s *Server) grantPrepaidCreditForInvoice(ctx context.Context, tx pgx.Tx, accountID int64, customerID string, inv *stripe.Invoice) error {
+	if s.billing == nil {
+		return nil
+	}
+	invoiceID := ""
+	if inv != nil {
+		invoiceID = strings.TrimSpace(inv.ID)
+	}
+	batchKeyMeta := invoiceBatchKey(inv)
+	if invoiceID == "" && batchKeyMeta == "" {
+		return nil // nothing to match on.
+	}
+
+	// Resolve the charged batch for this account. Match on invoice id OR metadata
+	// batch_key; require the batch to belong to this account (defense in depth).
+	var (
+		batchKey     string
+		chargedCents int64
+		status       string
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT batch_key, charged_cents, status
+		FROM prepaid_storage_batches
+		WHERE account_id=$1
+		  AND ($2 <> '' AND stripe_invoice_id=$2 OR $3 <> '' AND batch_key=$3)
+		LIMIT 1
+	`, accountID, invoiceID, batchKeyMeta).Scan(&batchKey, &chargedCents, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // not a prepay invoice we track: leave it alone.
+	}
+	if err != nil {
+		return fmt.Errorf("resolve prepay batch: %w", err)
+	}
+	if status != "charged" {
+		// Already granted (redelivery) or failed/pending: no grant to make here.
+		return nil
+	}
+	if chargedCents <= 0 {
+		return fmt.Errorf("prepay batch %s has non-positive charged_cents %d", batchKey, chargedCents)
+	}
+
+	expiresAt := time.Now().UTC().AddDate(0, billing.PrepaidCreditMonths, 0)
+	grantID, err := s.billing.CreatePrepaidCreditGrant(ctx, customerID, chargedCents, expiresAt, batchKey, map[string]string{
+		"account_id": strconv.FormatInt(accountID, 10),
+		"kind":       "yearly_prepaid_storage",
+	})
+	if err != nil {
+		return fmt.Errorf("create credit grant for batch %s: %w", batchKey, err)
+	}
+	ct, err := tx.Exec(ctx, `
+		UPDATE prepaid_storage_batches
+		SET status='granted', stripe_credit_grant_id=$2, granted_at=now(), expires_at=$3, updated_at=now()
+		WHERE batch_key=$1 AND status='charged'
+	`, batchKey, grantID, expiresAt)
+	if err != nil {
+		return fmt.Errorf("record granted batch %s: %w", batchKey, err)
+	}
+	if ct.RowsAffected() == 0 {
+		// Lost a race to another delivery that already granted this batch. The grant
+		// idempotency key means Stripe returned the same grant, so this is safe.
+		return nil
+	}
+	return nil
 }
 
 // resolveBillingAccount maps a Stripe customer id to a local account id ONLY via
