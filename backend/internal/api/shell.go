@@ -22,10 +22,20 @@ const shellHeadCSS = `
 .global-nav a.active{color:#fff;background:var(--accent);border-color:var(--accent);}
 .topbar-docs-link{font-family:var(--mono);font-size:11px;letter-spacing:0.04em;text-transform:uppercase;color:var(--muted);text-decoration:none;white-space:nowrap;padding:0 4px;}
 .topbar-docs-link:hover{color:var(--text);text-decoration:none;}
-.account-chip{display:inline-flex;align-items:center;gap:7px;height:34px;padding:0 12px;border-radius:999px;border:1px solid var(--border);background:color-mix(in srgb,var(--panel) 92%,#000);color:var(--muted);font-family:var(--mono);font-size:11px;white-space:nowrap;}
+.account-chip{position:relative;display:inline-flex;align-items:center;gap:7px;height:34px;padding:0 12px;border-radius:999px;border:1px solid var(--border);background:color-mix(in srgb,var(--panel) 92%,#000);color:var(--muted);font-family:var(--mono);font-size:11px;white-space:nowrap;}
 .account-chip a{color:var(--text);text-decoration:none;}
 .account-chip a:hover{text-decoration:underline;}
-.account-chip .caret{font-size:9px;opacity:0.8;}
+.account-chip .caret{font-size:9px;opacity:0.8;cursor:pointer;}
+.org-switch{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--text);}
+.org-menu{position:absolute;top:40px;right:0;min-width:200px;padding:6px;border:1px solid var(--border);border-radius:10px;background:color-mix(in srgb,var(--panel) 96%,#000);box-shadow:0 8px 24px rgba(0,0,0,0.35);z-index:50;display:none;flex-direction:column;gap:2px;}
+.org-menu.open{display:flex;}
+.org-menu .org-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:7px;color:var(--text);cursor:pointer;font-size:11px;text-align:left;background:none;border:none;font-family:var(--mono);width:100%;}
+.org-menu .org-item:hover{background:color-mix(in srgb,var(--panel2) 80%,transparent);}
+.org-menu .org-item.current{color:var(--accent);}
+.org-menu .org-role{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:0.04em;}
+.org-menu .org-sep{height:1px;margin:4px 2px;background:var(--border);}
+.org-menu .org-create{color:var(--muted);}
+.org-menu .org-create:hover{color:var(--text);}
 .admin-chip{display:none;align-items:center;justify-content:center;width:34px;height:34px;border-radius:999px;border:1px solid var(--border);background:color-mix(in srgb,var(--panel) 92%,#000);color:var(--text);font-family:var(--mono);font-size:13px;text-decoration:none;flex:0 0 auto;}
 .admin-chip:hover{text-decoration:none;border-color:color-mix(in srgb,var(--accent) 35%,var(--border));color:var(--accent);}
 @media (max-width:720px){.topbar{grid-template-columns:auto 1fr;grid-template-areas:"brand utils" "nav nav";row-gap:10px;column-gap:10px;align-items:center;}.topbar-left{grid-area:brand;}.topbar-right{grid-area:utils;justify-self:end;}.topbar-center{grid-area:nav;justify-self:stretch;}.global-nav{width:100%;justify-content:center;}}
@@ -76,11 +86,62 @@ const shellTopbarJS = `
     if(!chip)return;
     chip.innerHTML='<a href="'+signInHref()+'">'+(label||"Log in")+'</a>';
   }
-  function renderSignedIn(acct,authType){
+  function switchOrg(id){
+    fetch("/api/v1/account/orgs/"+encodeURIComponent(id)+"/switch",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}})
+      .then(function(res){if(!res.ok){throw new Error("status "+res.status);}location.reload();})
+      .catch(function(){});
+  }
+  function createOrg(){
+    var name=window.prompt("Name your new org:");
+    if(name==null)return;
+    name=String(name).trim();
+    if(!name)return;
+    fetch("/api/v1/account/orgs",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify({name:name})})
+      .then(function(res){return res.json().then(function(d){if(!res.ok){throw new Error(d.error||("status "+res.status));}return d;});})
+      .then(function(d){switchOrg(d.id);})
+      .catch(function(){});
+  }
+  function renderSignedIn(payload){
     if(!chip)return;
-    var email=String(acct&&acct.email||"").trim()||"Account";
-    chip.innerHTML='<a href="/account">'+esc(email)+'</a>'+(authType?' <span class="muted">&middot; '+esc(authType)+'</span>':'');
-    if(gear&&String(acct&&acct.role||"").trim().toLowerCase()==="admin"){gear.style.display="inline-flex";}
+    var acct=payload.account||{};
+    var authType=String(payload.session&&payload.session.auth_type||acct.auth_type||"").trim();
+    var email=String(acct.email||"").trim()||"Account";
+    var currentOrg=payload.current_org||{};
+    var orgs=Array.isArray(payload.orgs)?payload.orgs:[];
+    var currentId=Number(currentOrg.id||acct.id||0);
+    var orgName=String(currentOrg.name||"").trim();
+    // The switcher shows only when the user actually belongs to >1 org, or when
+    // an org name is present (so a single-org user still sees which org they are in).
+    var hasSwitcher=orgs.length>0;
+    var label='<a href="/account">'+esc(email)+'</a>';
+    if(hasSwitcher){
+      var items=orgs.map(function(o){
+        var oid=Number(o.id);
+        var cur=oid===currentId?' current':'';
+        return '<button type="button" class="org-item'+cur+'" data-org="'+oid+'"><span>'+esc(o.name)+'</span><span class="org-role">'+esc(o.role||"")+'</span></button>';
+      }).join('');
+      label='<span class="org-switch" id="orgSwitch">'+esc(orgName||email)+' <span class="caret">&#9662;</span></span>'
+        +'<div class="org-menu" id="orgMenu">'+items
+        +'<div class="org-sep"></div>'
+        +'<button type="button" class="org-item org-create" id="orgCreate">+ New org</button>'
+        +'</div>';
+    }
+    chip.innerHTML=label+(authType?' <span class="muted">&middot; '+esc(authType)+'</span>':'');
+    if(hasSwitcher){
+      var sw=document.getElementById("orgSwitch");
+      var menu=document.getElementById("orgMenu");
+      if(sw&&menu){
+        sw.addEventListener("click",function(e){e.stopPropagation();menu.classList.toggle("open");});
+        document.addEventListener("click",function(){menu.classList.remove("open");});
+        menu.addEventListener("click",function(e){e.stopPropagation();});
+        menu.querySelectorAll(".org-item[data-org]").forEach(function(btn){
+          btn.addEventListener("click",function(){var id=Number(btn.getAttribute("data-org"));if(id&&id!==currentId){switchOrg(id);}else{menu.classList.remove("open");}});
+        });
+        var createBtn=document.getElementById("orgCreate");
+        if(createBtn){createBtn.addEventListener("click",createOrg);}
+      }
+    }
+    if(gear&&String(acct.role||"").trim().toLowerCase()==="admin"){gear.style.display="inline-flex";}
   }
   function load(){
     if(chip){chip.textContent="Checking session...";}
@@ -97,8 +158,7 @@ const shellTopbarJS = `
         if(!payload)return;
         var acct=payload.account||{};
         if(payload.authenticated&&acct&&acct.email){
-          var authType=String(payload.session&&payload.session.auth_type||acct.auth_type||"").trim();
-          renderSignedIn(acct,authType);
+          renderSignedIn(payload);
         }else{
           renderAnon("Log in");
         }

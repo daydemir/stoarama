@@ -374,6 +374,13 @@ func (s *Server) router() http.Handler {
 			memberSession.Get("/account/members", s.handleAccountMembersList)
 			memberSession.Post("/account/members", s.handleAccountMembersInvite)
 			memberSession.Delete("/account/members/{email}", s.handleAccountMembersRemove)
+
+			// Orgs: the multi-org switcher. List the caller's orgs, switch the
+			// session's current org (membership-verified), or create a team org.
+			// Browser-session only (needs principal.UserID).
+			memberSession.Get("/account/orgs", s.handleAccountOrgsList)
+			memberSession.Post("/account/orgs", s.handleAccountOrgCreate)
+			memberSession.Post("/account/orgs/{id}/switch", s.handleAccountOrgSwitch)
 		})
 
 		// Recording bundles: a thin grouping that fans out into N member recordings

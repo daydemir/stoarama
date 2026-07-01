@@ -10,16 +10,15 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-// Team members. A LEAN multi-user layer over the single-account model: a person
-// belongs to exactly one account (member_email is globally unique), so sign-in
-// stays unambiguous. These endpoints gate on the TEAM role (principal.MemberRole
-// via account_members.role), which is fully separate from the operator/admin
-// flag (principal.Role via accounts.role).
+// Org members. A user's role within an org is a memberships row; a person can now
+// belong to several orgs (multi-org). These endpoints operate on the CURRENT org
+// (principal.AccountID) and gate on the org role (principal.MemberRole via
+// memberships.role), which is fully separate from the platform operator flag
+// (principal.Role via users.is_operator).
 
 type accountMemberInviteRequest struct {
 	Email string `json:"email"`
@@ -32,8 +31,8 @@ type accountMemberItem struct {
 	AcceptedAt *time.Time `json:"accepted_at"`
 }
 
-// handleAccountMembersList lists the caller account's team members. Visible to
-// any member; can_manage tells the UI whether to show invite/remove controls.
+// handleAccountMembersList lists the current org's members. Visible to any member;
+// can_manage tells the UI whether to show invite/remove controls.
 func (s *Server) handleAccountMembersList(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -41,10 +40,11 @@ func (s *Server) handleAccountMembersList(w http.ResponseWriter, r *http.Request
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT member_email, role, invited_at, accepted_at
-		FROM account_members
-		WHERE account_id=$1
-		ORDER BY role DESC, invited_at
+		SELECT u.email, m.role, m.invited_at, m.accepted_at
+		FROM memberships m
+		JOIN users u ON u.id=m.user_id
+		WHERE m.org_id=$1
+		ORDER BY m.role DESC, m.invited_at
 	`, principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list members: %v", err))
@@ -70,9 +70,9 @@ func (s *Server) handleAccountMembersList(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// handleAccountMembersInvite invites an email to the caller's team. Owner only.
-// Global uniqueness is enforced: an email that already belongs to any account or
-// team is rejected with 409 (multi-team membership is out of scope for now).
+// handleAccountMembersInvite invites an email to the CURRENT org. Owner only.
+// Multi-org is allowed: an email already in another org is fine; it is only a 409
+// if that user is already a member of THIS org.
 func (s *Server) handleAccountMembersInvite(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -80,7 +80,7 @@ func (s *Server) handleAccountMembersInvite(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !principalIsOwner(principal) {
-		util.WriteError(w, http.StatusForbidden, "only a team owner can invite members")
+		util.WriteError(w, http.StatusForbidden, "only an org owner can invite members")
 		return
 	}
 	var req accountMemberInviteRequest
@@ -101,46 +101,48 @@ func (s *Server) handleAccountMembersInvite(w http.ResponseWriter, r *http.Reque
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	// Global-uniqueness pre-check: an email that is already any account or member
-	// cannot be invited (the DB UNIQUE(member_email) is the backstop below).
-	var taken bool
+	// Find-or-create the invited USER (they may already exist in other orgs).
+	var inviteeUserID int64
 	if err := tx.QueryRow(r.Context(), `
-		SELECT EXISTS(SELECT 1 FROM accounts WHERE email=$1)
-		    OR EXISTS(SELECT 1 FROM account_members WHERE member_email=$1)
-	`, email).Scan(&taken); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check email uniqueness: %v", err))
-		return
-	}
-	if taken {
-		util.WriteError(w, http.StatusConflict, "that email already belongs to an account or team (multi-team membership is not supported)")
+		INSERT INTO users (email, name)
+		VALUES ($1, '')
+		ON CONFLICT (email) DO UPDATE SET updated_at=now()
+		RETURNING id
+	`, email).Scan(&inviteeUserID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert invited user: %v", err))
 		return
 	}
 
+	// Insert the membership in the current org. ON CONFLICT DO NOTHING makes a
+	// re-invite of an existing member of THIS org a no-op we detect as a 409.
 	var it accountMemberItem
-	if err := tx.QueryRow(r.Context(), `
-		INSERT INTO account_members (account_id, member_email, role, invited_by)
+	err = tx.QueryRow(r.Context(), `
+		INSERT INTO memberships (user_id, org_id, role, invited_by)
 		VALUES ($1, $2, 'member', $3)
-		RETURNING member_email, role, invited_at, accepted_at
-	`, principal.AccountID, email, principal.AccountID).Scan(&it.Email, &it.Role, &it.InvitedAt, &it.AcceptedAt); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			util.WriteError(w, http.StatusConflict, "that email already belongs to an account or team (multi-team membership is not supported)")
-			return
-		}
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert member: %v", err))
+		ON CONFLICT (user_id, org_id) DO NOTHING
+		RETURNING role, invited_at, accepted_at
+	`, inviteeUserID, principal.AccountID, principal.UserID).Scan(&it.Role, &it.InvitedAt, &it.AcceptedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusConflict, "that user is already a member of this org")
 		return
 	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert membership: %v", err))
+		return
+	}
+	it.Email = email
 
-	// Issue a sign-in link bound to the caller's account, threading the invited
-	// email through member_email so the session resolves the member's identity.
-	rawToken, linkID, err := s.createAccountMagicLinkTx(r.Context(), tx, principal.AccountID, email, "/account", requesterIP(r), requestUserAgent(r))
+	// Issue a sign-in link bound to the current org, threading the invited email
+	// through member_email plus user_id/target_org_id so the session resolves the
+	// member's identity in this org.
+	rawToken, linkID, err := s.createAccountMagicLinkTx(r.Context(), tx, principal.AccountID, email, inviteeUserID, "/account", requesterIP(r), requestUserAgent(r))
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create invite link: %v", err))
 		return
 	}
 	if err := s.insertAccountAuthEventTx(r.Context(), tx, principal.AccountID, nil, "member_invited", "account", email, map[string]any{
 		"magic_link_id": linkID,
-		"invited_by":    principal.AccountID,
+		"invited_by":    principal.UserID,
 	}); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert invite event: %v", err))
 		return
@@ -158,9 +160,10 @@ func (s *Server) handleAccountMembersInvite(w http.ResponseWriter, r *http.Reque
 	util.WriteJSON(w, http.StatusCreated, it)
 }
 
-// handleAccountMembersRemove removes a member from the caller's team and revokes
-// their active sessions immediately. Owner only. Refuses to remove the last
-// remaining owner (which also blocks a sole owner removing themselves).
+// handleAccountMembersRemove removes a member from the CURRENT org and revokes
+// only that member's sessions IN THIS ORG (their sessions in other orgs survive).
+// Owner only. Refuses to remove the last remaining owner (which also blocks a sole
+// owner removing themselves).
 func (s *Server) handleAccountMembersRemove(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -168,7 +171,7 @@ func (s *Server) handleAccountMembersRemove(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !principalIsOwner(principal) {
-		util.WriteError(w, http.StatusForbidden, "only a team owner can remove members")
+		util.WriteError(w, http.StatusForbidden, "only an org owner can remove members")
 		return
 	}
 	email := normalizeAccountEmail(chi.URLParam(r, "email"))
@@ -184,10 +187,16 @@ func (s *Server) handleAccountMembersRemove(w http.ResponseWriter, r *http.Reque
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	var targetRole string
+	var (
+		targetUserID int64
+		targetRole   string
+	)
 	if err := tx.QueryRow(r.Context(), `
-		SELECT role FROM account_members WHERE account_id=$1 AND member_email=$2
-	`, principal.AccountID, email).Scan(&targetRole); err != nil {
+		SELECT m.user_id, m.role
+		FROM memberships m
+		JOIN users u ON u.id=m.user_id
+		WHERE m.org_id=$1 AND u.email=$2
+	`, principal.AccountID, email).Scan(&targetUserID, &targetRole); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "member not found")
 			return
@@ -198,7 +207,7 @@ func (s *Server) handleAccountMembersRemove(w http.ResponseWriter, r *http.Reque
 
 	var ownerCount int
 	if err := tx.QueryRow(r.Context(), `
-		SELECT count(*) FROM account_members WHERE account_id=$1 AND role='owner'
+		SELECT count(*) FROM memberships WHERE org_id=$1 AND role='owner'
 	`, principal.AccountID).Scan(&ownerCount); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count owners: %v", err))
 		return
@@ -209,23 +218,24 @@ func (s *Server) handleAccountMembersRemove(w http.ResponseWriter, r *http.Reque
 	}
 
 	if _, err := tx.Exec(r.Context(), `
-		DELETE FROM account_members WHERE account_id=$1 AND member_email=$2
-	`, principal.AccountID, email); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete member: %v", err))
+		DELETE FROM memberships WHERE org_id=$1 AND user_id=$2
+	`, principal.AccountID, targetUserID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete membership: %v", err))
 		return
 	}
-	// Revoke only the removed member's sessions (matched on account_id AND
-	// member_email), so legacy owner sessions (member_email NULL) are untouched.
+	// Revoke only the removed user's sessions IN THIS ORG (matched on
+	// current_org_id AND user_id), so their sessions in other orgs are untouched.
 	if _, err := tx.Exec(r.Context(), `
 		UPDATE account_sessions
 		SET revoked_at=now()
-		WHERE account_id=$1 AND member_email=$2 AND revoked_at IS NULL
-	`, principal.AccountID, email); err != nil {
+		WHERE current_org_id=$1 AND user_id=$2 AND revoked_at IS NULL
+	`, principal.AccountID, targetUserID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("revoke member sessions: %v", err))
 		return
 	}
 	if err := s.insertAccountAuthEventTx(r.Context(), tx, principal.AccountID, nil, "member_removed", "account", email, map[string]any{
-		"removed_by": principal.AccountID,
+		"removed_by":      principal.UserID,
+		"removed_user_id": targetUserID,
 	}); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert remove event: %v", err))
 		return
@@ -246,10 +256,10 @@ func canRemoveMember(targetRole string, ownerCount int) bool {
 	return true
 }
 
-// createAccountMagicLinkTx inserts a login magic link bound to accountID with the
-// given member_email threaded onto it, and returns the raw token + link id. This
-// is the shared link-issuing core used by both self-signup and member invites.
-func (s *Server) createAccountMagicLinkTx(ctx context.Context, tx pgx.Tx, accountID int64, memberEmail, redirectPath, requesterIP, userAgent string) (string, int64, error) {
+// createAccountMagicLinkTx inserts a login magic link bound to org orgID for user
+// userID, with the member_email threaded on (KEPT this phase), and returns the raw
+// token + link id. Shared by member invites.
+func (s *Server) createAccountMagicLinkTx(ctx context.Context, tx pgx.Tx, orgID int64, memberEmail string, userID int64, redirectPath, requesterIP, userAgent string) (string, int64, error) {
 	rawToken, err := generateSecret(32)
 	if err != nil {
 		return "", 0, err
@@ -259,11 +269,11 @@ func (s *Server) createAccountMagicLinkTx(ctx context.Context, tx pgx.Tx, accoun
 	var linkID int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO account_magic_links (
-			account_id, token_hash, purpose, redirect_path, requester_ip, user_agent, expires_at, member_email
+			account_id, token_hash, purpose, redirect_path, requester_ip, user_agent, expires_at, member_email, user_id, target_org_id
 		)
-		VALUES ($1, $2, 'login', $3, $4, $5, $6, $7)
+		VALUES ($1, $2, 'login', $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id
-	`, accountID, hash, sanitizeAccountRedirectPath(redirectPath), strings.TrimSpace(requesterIP), strings.TrimSpace(userAgent), expiresAt, memberEmail).Scan(&linkID); err != nil {
+	`, orgID, hash, sanitizeAccountRedirectPath(redirectPath), strings.TrimSpace(requesterIP), strings.TrimSpace(userAgent), expiresAt, memberEmail, userID, orgID).Scan(&linkID); err != nil {
 		return "", 0, err
 	}
 	return rawToken, linkID, nil

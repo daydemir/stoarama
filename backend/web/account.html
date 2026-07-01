@@ -290,19 +290,20 @@
     <section id="teamPanel" class="panel hidden" style="margin-bottom:16px;">
       <div class="section-title">
         <div>
-          <div class="eyebrow">Team</div>
-          <h2>Team members</h2>
+          <div class="eyebrow">Org</div>
+          <h2>Org members</h2>
         </div>
+        <button id="orgCreateBtn" type="button" class="secondary" style="width:auto;min-width:120px;">New org</button>
       </div>
-      <div id="teamStatus" class="status">Loading team...</div>
+      <div id="teamStatus" class="status">Loading org...</div>
       <div id="teamList" class="rec-list hidden"></div>
       <div id="teamInvite" class="hidden" style="margin-top:14px;">
-        <label for="teamInviteEmail">Invite a teammate by email</label>
+        <label for="teamInviteEmail">Invite a member by email</label>
         <input id="teamInviteEmail" type="email" placeholder="teammate@example.org" />
         <div class="button-row" style="margin-top:12px;">
           <button id="teamInviteBtn" type="button" style="width:auto;min-width:160px;">Send invite</button>
         </div>
-        <p class="muted" style="font-size:12px;margin:10px 0 0;">Teammates sign in with their own email and share this account's recordings, clips, billing, and NAS connection.</p>
+        <p class="muted" style="font-size:12px;margin:10px 0 0;">Members sign in with their own email and share this org's recordings, clips, billing, and NAS connection. A member can also belong to other orgs.</p>
       </div>
     </section>
 
@@ -387,6 +388,7 @@
     const teamInvite = document.getElementById('teamInvite');
     const teamInviteEmail = document.getElementById('teamInviteEmail');
     const teamInviteBtn = document.getElementById('teamInviteBtn');
+    const orgCreateBtn = document.getElementById('orgCreateBtn');
     const connectionsPanel = document.getElementById('connectionsPanel');
     const connectionsStatus = document.getElementById('connectionsStatus');
     const connectionsList = document.getElementById('connectionsList');
@@ -785,6 +787,26 @@
         teamInviteBtn.disabled = false;
       }
     });
+
+    if (orgCreateBtn) {
+      orgCreateBtn.addEventListener('click', async () => {
+        const name = String(window.prompt('Name your new org:') || '').trim();
+        if (!name) return;
+        orgCreateBtn.disabled = true;
+        try {
+          const org = await fetchJSON('/api/v1/account/orgs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+          });
+          await fetchJSON(`/api/v1/account/orgs/${org.id}/switch`, { method: 'POST' });
+          window.location.reload();
+        } catch (err) {
+          setStatus(teamStatus, String(err.message || err), 'err');
+          orgCreateBtn.disabled = false;
+        }
+      });
+    }
 
     const connHealthColor = { healthy: '#22c55e', stale: '#f59e0b', never: '#9ca3af' };
 

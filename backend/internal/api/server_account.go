@@ -33,10 +33,16 @@ const (
 )
 
 type accountPrincipal struct {
+	// AccountID is the CURRENT org id (account_sessions.current_org_id for a
+	// session; the key's account_id for an API key). Every account_id-scoped
+	// downstream query keys on this.
 	AccountID int64
-	Email     string
-	Name      string
-	Role      string // operator/admin flag (accounts.role); NOT the team role
+	// UserID is the acting user (users.id). Zero for API-key callers, which are
+	// org-scoped and not tied to a user row.
+	UserID int64
+	Email  string
+	Name   string
+	Role   string // operator/admin flag ('admin' when users.is_operator); NOT the team role
 	AuthType  string
 	SessionID *int64
 	APIKeyID  *int64
@@ -44,8 +50,8 @@ type accountPrincipal struct {
 	// own email), which differs from the account owner email for invited members.
 	// Empty for legacy sessions and API-key callers.
 	MemberEmail string
-	// MemberRole is the team role (account_members.role: 'owner'|'member'),
-	// independent of Role. Defaults to 'owner' for legacy/no-row cases.
+	// MemberRole is the team role (memberships.role: 'owner'|'billing_admin'|
+	// 'member'), independent of Role. Defaults to 'owner' for API-key callers.
 	MemberRole string
 	// KeyScopes are the scopes of the calling API key (account_api_keys.scopes).
 	// Nil for browser-session principals. A key whose scopes contain
@@ -64,9 +70,10 @@ func isPullScopedPrincipal(p accountPrincipal) bool {
 	return slices.Contains(p.KeyScopes, accountScopePull)
 }
 
-// principalIsOwner gates owner-only team actions. It fails SAFE to owner for
-// legacy sessions and any no-row case (empty MemberRole), because every
-// pre-teams account is its own owner via the 0069 backfill.
+// principalIsOwner gates owner-only org actions (member management). A session's
+// MemberRole comes from the memberships row for (user, current org); an API key
+// is set to "owner" explicitly. Empty is treated as owner only as a defensive
+// default (session resolution fails-fast before this on a missing membership).
 func principalIsOwner(p accountPrincipal) bool {
 	return p.MemberRole == "" || p.MemberRole == "owner"
 }
@@ -197,19 +204,33 @@ func (s *Server) lookupAccountSession(ctx context.Context, raw string) (accountP
 	hash := hashSecret(raw)
 	var p accountPrincipal
 	var sessionID int64
+	var isOperator bool
 	var memberEmail *string
+	// Resolve the session through user -> current org -> membership. The INNER
+	// JOIN on memberships is the fail-fast: if the acting user has no membership in
+	// their current org (revoked/removed), no row returns and requireAccountAuth
+	// 401s. This replaces the old COALESCE(role,'owner') fallback, which was only
+	// safe under one-team-per-email.
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.id, a.email, a.name, a.role, rs.id, rs.member_email, COALESCE(m.role, 'owner')
+		SELECT o.id, u.id, u.email, u.name, u.is_operator, m.role, rs.id, rs.member_email
 		FROM account_sessions rs
-		JOIN accounts a ON a.id=rs.account_id
-		LEFT JOIN account_members m ON m.account_id=a.id AND m.member_email=rs.member_email
+		JOIN users u ON u.id=rs.user_id
+		JOIN accounts o ON o.id=rs.current_org_id
+		JOIN memberships m ON m.user_id=rs.user_id AND m.org_id=rs.current_org_id
 		WHERE rs.session_hash=$1
 		  AND rs.revoked_at IS NULL
 		  AND rs.expires_at > now()
-		  AND a.status='active'
-	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &sessionID, &memberEmail, &p.MemberRole)
+		  AND o.status='active'
+	`, hash).Scan(&p.AccountID, &p.UserID, &p.Email, &p.Name, &isOperator, &p.MemberRole, &sessionID, &memberEmail)
 	if err != nil {
 		return accountPrincipal{}, err
+	}
+	// requireAdminAuth keys on Role=="admin"; drive it from the platform operator
+	// flag so operator access is preserved after the users move.
+	if isOperator {
+		p.Role = accountRoleAdmin
+	} else {
+		p.Role = accountRoleMember
 	}
 	p.AuthType = "session"
 	p.SessionID = &sessionID
@@ -278,57 +299,62 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
-	// Resolve the requested email through account_members to an account_id. An
-	// invited member's email maps to THEIR team's account (accounts.email differs
-	// from member email there). An email with no membership row keeps today's
-	// self-signup behavior: find-or-create its own account AND seed an owner
-	// membership row so the model stays consistent going forward.
-	var accountID int64
-	var membershipFound bool
+	// Find-or-create the USER for this email. A user with zero memberships is a
+	// brand-new sign-up: create a PERSONAL org (accounts row, is_personal=true,
+	// name=email localpart) and an owner membership so the standard shape holds
+	// from the first sign-in. The default org the link targets is the personal org
+	// if present, else the earliest membership.
+	var userID int64
 	if err := tx.QueryRow(r.Context(), `
-		SELECT account_id FROM account_members WHERE member_email=$1
-	`, email).Scan(&accountID); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve member account: %v", err))
-			return
-		}
-	} else {
-		membershipFound = true
+		INSERT INTO users (email, name)
+		VALUES ($1, '')
+		ON CONFLICT (email) DO UPDATE SET updated_at=now()
+		RETURNING id
+	`, email).Scan(&userID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert user: %v", err))
+		return
 	}
 
-	var status string
-	if membershipFound {
-		// The account already exists; confirm it is active before issuing a link.
-		if err := tx.QueryRow(r.Context(), `
-			SELECT status FROM accounts WHERE id=$1
-		`, accountID).Scan(&status); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load member account: %v", err))
+	var accountID int64
+	if err := tx.QueryRow(r.Context(), `
+		SELECT o.id
+		FROM memberships m
+		JOIN accounts o ON o.id=m.org_id
+		WHERE m.user_id=$1
+		ORDER BY o.is_personal DESC, m.invited_at, o.id
+		LIMIT 1
+	`, userID).Scan(&accountID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve default org: %v", err))
 			return
 		}
-	} else {
+		// Zero memberships: create the personal org + owner membership.
 		if err := tx.QueryRow(r.Context(), `
-			INSERT INTO accounts (email, name, role, status)
-			VALUES ($1, $2, $3, 'active')
+			INSERT INTO accounts (email, name, role, status, is_personal)
+			VALUES ($1, $2, $3, 'active', true)
 			ON CONFLICT (email)
-			DO UPDATE SET
-				name=CASE
-					WHEN EXCLUDED.name <> '' AND accounts.name = '' THEN EXCLUDED.name
-					ELSE accounts.name
-				END,
-				updated_at=now()
-			RETURNING id, status
-		`, email, "", accountRoleMember).Scan(&accountID, &status); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert account: %v", err))
+			DO UPDATE SET updated_at=now()
+			RETURNING id
+		`, email, emailLocalPart(email), accountRoleMember).Scan(&accountID); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create personal org: %v", err))
 			return
 		}
 		if _, err := tx.Exec(r.Context(), `
-			INSERT INTO account_members (account_id, member_email, role, accepted_at)
+			INSERT INTO memberships (user_id, org_id, role, accepted_at)
 			VALUES ($1, $2, 'owner', now())
-			ON CONFLICT (member_email) DO NOTHING
-		`, accountID, email); err != nil {
+			ON CONFLICT (user_id, org_id) DO NOTHING
+		`, userID, accountID); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("seed owner membership: %v", err))
 			return
 		}
+	}
+
+	var status string
+	if err := tx.QueryRow(r.Context(), `
+		SELECT status FROM accounts WHERE id=$1
+	`, accountID).Scan(&status); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load default org: %v", err))
+		return
 	}
 	if status == "disabled" {
 		_ = tx.Commit(r.Context())
@@ -343,13 +369,16 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 	hash := hashSecret(rawToken)
 	expiresAt := time.Now().UTC().Add(s.cfg.MagicLinkTTL)
 	var linkID int64
+	// member_email is kept populated (KEPT this phase) so a link minted now still
+	// resolves through the legacy complete path if needed; user_id + target_org_id
+	// are the forward-looking binding.
 	if err := tx.QueryRow(r.Context(), `
 		INSERT INTO account_magic_links (
-			account_id, token_hash, purpose, redirect_path, requester_ip, user_agent, expires_at, member_email
+			account_id, token_hash, purpose, redirect_path, requester_ip, user_agent, expires_at, member_email, user_id, target_org_id
 		)
-		VALUES ($1, $2, 'login', $3, $4, $5, $6, $7)
+		VALUES ($1, $2, 'login', $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id
-	`, accountID, hash, redirectPath, requesterIP(r), requestUserAgent(r), expiresAt, email).Scan(&linkID); err != nil {
+	`, accountID, hash, redirectPath, requesterIP(r), requestUserAgent(r), expiresAt, email, userID, accountID).Scan(&linkID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert magic link: %v", err))
 		return
 	}
@@ -394,23 +423,27 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 
 	var (
 		linkID       int64
-		accountID    int64
+		orgID        int64
+		userID       int64
 		email        string
-		name         string
-		role         string
+		isOperator   bool
 		status       string
 		expiresAt    time.Time
 		consumedAt   *time.Time
 		redirectPath string
 		memberEmail  *string
 	)
+	// Resolve the acting user + target org from the link. target_org_id/user_id are
+	// the forward-looking binding (backfilled for pre-cutover links). The user's
+	// email + operator flag drive verification and bootstrap.
 	err = tx.QueryRow(r.Context(), `
-		SELECT ml.id, a.id, a.email, a.name, a.role, a.status, ml.expires_at, ml.consumed_at, ml.redirect_path, ml.member_email
+		SELECT ml.id, o.id, u.id, u.email, u.is_operator, o.status, ml.expires_at, ml.consumed_at, ml.redirect_path, ml.member_email
 		FROM account_magic_links ml
-		JOIN accounts a ON a.id=ml.account_id
+		JOIN accounts o ON o.id=ml.target_org_id
+		JOIN users u ON u.id=ml.user_id
 		WHERE ml.token_hash=$1
-		FOR UPDATE
-	`, hash).Scan(&linkID, &accountID, &email, &name, &role, &status, &expiresAt, &consumedAt, &redirectPath, &memberEmail)
+		FOR UPDATE OF ml
+	`, hash).Scan(&linkID, &orgID, &userID, &email, &isOperator, &status, &expiresAt, &consumedAt, &redirectPath, &memberEmail)
 	if err != nil {
 		log.Printf("account auth complete invalid_token token=%s host=%s ip=%s ua=%q", maskedToken, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=invalid_token", http.StatusFound)
@@ -436,49 +469,47 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `
-		UPDATE accounts
-		SET email_verified_at=COALESCE(email_verified_at, now())
+		UPDATE users
+		SET email_verified_at=COALESCE(email_verified_at, now()), updated_at=now()
 		WHERE id=$1
-	`, accountID); err != nil {
+	`, userID); err != nil {
 		log.Printf("account auth complete verify_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
-	// Mark the acting member's membership accepted on first sign-in completion.
-	if memberEmail != nil && strings.TrimSpace(*memberEmail) != "" {
-		if _, err := tx.Exec(r.Context(), `
-			UPDATE account_members
-			SET accepted_at=COALESCE(accepted_at, now())
-			WHERE account_id=$1 AND member_email=$2
-		`, accountID, *memberEmail); err != nil {
-			log.Printf("account auth complete accept_membership_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
-			http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
-			return
-		}
+	// Mark the acting user's membership in the target org accepted on first sign-in.
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE memberships
+		SET accepted_at=COALESCE(accepted_at, now())
+		WHERE user_id=$1 AND org_id=$2
+	`, userID, orgID); err != nil {
+		log.Printf("account auth complete accept_membership_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
+		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
+		return
 	}
 	if s.shouldBootstrapAdmin(email) {
-		var otherAdminExists bool
+		var otherOperatorExists bool
 		if err := tx.QueryRow(r.Context(), `
 			SELECT EXISTS(
 				SELECT 1
-				FROM accounts
-				WHERE role=$1 AND id<>$2
+				FROM users
+				WHERE is_operator=true AND id<>$1
 			)
-		`, accountRoleAdmin, accountID).Scan(&otherAdminExists); err != nil {
+		`, userID).Scan(&otherOperatorExists); err != nil {
 			http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 			return
 		}
-		if !otherAdminExists && role != accountRoleAdmin {
+		if !otherOperatorExists && !isOperator {
 			if _, err := tx.Exec(r.Context(), `
-				UPDATE accounts
-				SET role=$2, updated_at=now()
+				UPDATE users
+				SET is_operator=true, updated_at=now()
 				WHERE id=$1
-			`, accountID, accountRoleAdmin); err != nil {
+			`, userID); err != nil {
 				http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 				return
 			}
-			role = accountRoleAdmin
-			if err := s.insertAccountAuthEventTx(r.Context(), tx, accountID, nil, "account_bootstrap_admin", "system", email, map[string]any{
+			isOperator = true
+			if err := s.insertAccountAuthEventTx(r.Context(), tx, orgID, nil, "account_bootstrap_admin", "system", email, map[string]any{
 				"bootstrap_admin_email": normalizeAccountEmail(s.cfg.BootstrapAdminEmail),
 			}); err != nil {
 				http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
@@ -494,22 +525,24 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 	sessionHash := hashSecret(rawSession)
 	sessionExpiresAt := time.Now().UTC().Add(s.cfg.SessionTTL)
 	var sessionID int64
+	// account_id is kept populated (NOT NULL FK) as the org; current_org_id + user_id
+	// are the authoritative binding session resolution keys on.
 	if err := tx.QueryRow(r.Context(), `
-		INSERT INTO account_sessions (account_id, session_hash, expires_at, last_used_at, member_email)
-		VALUES ($1, $2, $3, now(), $4)
+		INSERT INTO account_sessions (account_id, session_hash, expires_at, last_used_at, member_email, user_id, current_org_id)
+		VALUES ($1, $2, $3, now(), $4, $5, $6)
 		RETURNING id
-	`, accountID, sessionHash, sessionExpiresAt, memberEmail).Scan(&sessionID); err != nil {
+	`, orgID, sessionHash, sessionExpiresAt, memberEmail, userID, orgID).Scan(&sessionID); err != nil {
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
-	if err := s.insertAccountAuthEventTx(r.Context(), tx, accountID, nil, "session_created", "account", email, map[string]any{
+	if err := s.insertAccountAuthEventTx(r.Context(), tx, orgID, nil, "session_created", "account", email, map[string]any{
 		"session_id":    sessionID,
 		"magic_link_id": linkID,
 	}); err != nil {
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
-	if err := s.insertAccountAuthEventTx(r.Context(), tx, accountID, nil, "magic_link_consumed", "account", email, map[string]any{
+	if err := s.insertAccountAuthEventTx(r.Context(), tx, orgID, nil, "magic_link_consumed", "account", email, map[string]any{
 		"magic_link_id":  linkID,
 		"session_id":     sessionID,
 		"redirect_path":  sanitizeAccountRedirectPath(redirectPath),
@@ -550,6 +583,46 @@ func (s *Server) handleAccountMe(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load account flags: %v", err))
 		return
 	}
+	// current_org + orgs power the topbar org switcher. Only browser sessions carry
+	// a UserID; API-key callers get just the current org (no membership list).
+	currentOrgName := principal.Name
+	orgs := []map[string]any{}
+	if principal.UserID > 0 {
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT name FROM accounts WHERE id=$1
+		`, principal.AccountID).Scan(&currentOrgName); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load current org: %v", err))
+			return
+		}
+		rows, err := s.pool.Query(r.Context(), `
+			SELECT o.id, o.name, m.role
+			FROM memberships m
+			JOIN accounts o ON o.id=m.org_id
+			WHERE m.user_id=$1 AND o.status='active'
+			ORDER BY o.is_personal DESC, o.name, o.id
+		`, principal.UserID)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load orgs: %v", err))
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				id   int64
+				name string
+				role string
+			)
+			if err := rows.Scan(&id, &name, &role); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan org: %v", err))
+				return
+			}
+			orgs = append(orgs, map[string]any{"id": id, "name": name, "role": role})
+		}
+		if err := rows.Err(); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate orgs: %v", err))
+			return
+		}
+	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"account": map[string]any{
@@ -560,6 +633,11 @@ func (s *Server) handleAccountMe(w http.ResponseWriter, r *http.Request) {
 			"auth_type":         principal.AuthType,
 			"has_keys_or_nodes": hasKeysOrNodes,
 		},
+		"current_org": map[string]any{
+			"id":   principal.AccountID,
+			"name": currentOrgName,
+		},
+		"orgs":         orgs,
 		"capabilities": accountSessionCapabilities(principal),
 		"session": map[string]any{
 			"auth_type":       principal.AuthType,
@@ -953,6 +1031,16 @@ func clearAccountSessionCookie(w http.ResponseWriter, r *http.Request) {
 
 func normalizeAccountEmail(raw string) string {
 	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+// emailLocalPart returns the part before '@', used as the default name for an
+// auto-created personal org. Falls back to the whole (normalized) email if there
+// is no '@'.
+func emailLocalPart(email string) string {
+	if i := strings.IndexByte(email, '@'); i > 0 {
+		return email[:i]
+	}
+	return email
 }
 
 func (s *Server) shouldBootstrapAdmin(email string) bool {

@@ -39,8 +39,8 @@ func TestCanRemoveMemberLastOwnerGuard(t *testing.T) {
 }
 
 func TestMembershipEmailNormalizationParity(t *testing.T) {
-	// account_members.member_email must match accounts.email normalization
-	// (lowercased + trimmed) so email->account_id resolution does not silently miss.
+	// users.email must match accounts.email normalization (lowercased + trimmed)
+	// so the email->user->memberships resolution does not silently miss.
 	for _, in := range []string{"  Deniz@Example.COM ", "deniz@example.com", "\tDENIZ@EXAMPLE.COM\n"} {
 		if got := normalizeAccountEmail(in); got != "deniz@example.com" {
 			t.Fatalf("normalizeAccountEmail(%q)=%q want deniz@example.com", in, got)
