@@ -88,11 +88,15 @@ func clampPollIntervalSec(v int) int {
 
 // connectionComposeSnippet renders the ready-to-paste docker-compose stanza for the
 // NAS pull client, prefilled with the request-derived API base and the one-time
-// token. It mirrors clients/nas-pull/docker-compose.yml's env block.
+// token. It is SELF-CONTAINED: it runs the stock public python:3-slim image and the
+// container fetches the stdlib-only client (stoarama_pull.py) from the public repo
+// at start, so pasting this compose is the only step. No Dockerfile, no source
+// files, no build. It mirrors clients/nas-pull/docker-compose.yml exactly (minus the
+// real token). Keep the client URL in lockstep with that file.
 func connectionComposeSnippet(apiBase, token string, pollIntervalSec int) string {
 	return fmt.Sprintf(`services:
   stoarama-pull:
-    build: .
+    image: python:3-slim
     restart: always
     environment:
       STOARAMA_API_BASE: "%s"
@@ -101,6 +105,8 @@ func connectionComposeSnippet(apiBase, token string, pollIntervalSec int) string
       STOARAMA_STATE_FILE: "/state/cursor.json"
       STOARAMA_POLL_INTERVAL_SEC: "%d"
       STOARAMA_DRY_RUN: "0"
+      PYTHONUNBUFFERED: "1"
+    command: ["python3", "-c", "import urllib.request, runpy; urllib.request.urlretrieve('https://raw.githubusercontent.com/daydemir/stoarama/main/clients/nas-pull/stoarama_pull.py', '/tmp/stoarama_pull.py'); runpy.run_path('/tmp/stoarama_pull.py', run_name='__main__')"]
     volumes:
       - /volume1/stoarama-clips:/clips
       - /volume1/stoarama-state:/state

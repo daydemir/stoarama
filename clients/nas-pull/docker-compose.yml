@@ -1,33 +1,35 @@
-# Stoarama NAS pull client for the MIT Synology NAS.
+# Stoarama NAS pull client for a Synology NAS (or any Docker host).
 #
 # WHAT THIS DOES
 #   Stoarama records public streams to managed Cloudflare R2. The NAS is not
 #   inbound-reachable, so this container PULLS each clip down to local disk,
-#   verifies its byte count against the API, then asks Stoarama to purge the
-#   managed copy. A clip is purged only after a verified download
-#   (confirm-before-purge). The cursor (last drained clip id) is persisted so a
+#   verifies its byte count against the API, then asks Stoarama to release the
+#   managed copy. A clip is released only after a verified download
+#   (confirm-before-release). The cursor (last drained clip id) is persisted so a
 #   restart resumes where it left off.
 #
-# ONE-TIME SETUP ON THE SYNOLOGY NAS
+# SETUP IS PASTE-ONLY. There is nothing to build and no source files to copy.
+# This runs the stock public python:3-slim image; the container fetches the
+# dependency-free client (stoarama_pull.py, Python stdlib only) from the public
+# repo at start and runs it. All you provide is the two folders below and your key.
+#
 #   1. Install "Container Manager" from the Synology Package Center.
-#   2. Create the clip + state folders on the NAS, e.g. via File Station or SSH:
+#   2. Create two shared folders on the NAS:
 #        /volume1/stoarama-clips
 #        /volume1/stoarama-state
-#   3. Copy this folder (stoarama_pull.py, Dockerfile, docker-compose.yml) onto
-#      the NAS, e.g. /volume1/docker/stoarama-nas-pull/.
-#   4. Set STOARAMA_API_KEY below to your sir_ account API key (mint one in the
-#      Stoarama dashboard under API keys; it is shown only once).
-#   5. VALIDATE FIRST in read-only mode: set STOARAMA_DRY_RUN to "1", then in
-#      Container Manager open this project and Build + Run (or, over SSH:
-#        sudo docker compose up --build). Watch the logs: it should download and
-#      verify clips and log "would purge" without deleting anything. Confirm the
-#      clip files land under /volume1/stoarama-clips/<recording_id>/.
-#   6. GO LIVE: set STOARAMA_DRY_RUN back to "0" and restart the project. It now
-#      purges each managed copy after a verified download and persists the cursor.
+#   3. Container Manager > Project > Create. Set the path to any empty folder
+#      (e.g. /volume1/docker/stoarama). Paste this compose as the source. Nothing
+#      else goes in that folder.
+#   4. Set STOARAMA_API_KEY to your sir_ pull key (the Stoarama dashboard shows it
+#      once when you create the NAS connection; Rotate issues a fresh one).
+#   5. Start the project. "restart: always" keeps it running across reboots. Come
+#      back to the dashboard and Refresh; within a minute or two it turns GREEN.
+#      To validate read-only first, set STOARAMA_DRY_RUN to "1" (downloads and
+#      verifies, never releases, cursor not persisted), then set it back to "0".
 
 services:
   stoarama-pull:
-    build: .
+    image: python:3-slim
     restart: always
     environment:
       STOARAMA_API_BASE: "https://stoarama.com/api/v1"
@@ -35,9 +37,11 @@ services:
       STOARAMA_OUTPUT_DIR: "/clips"
       STOARAMA_STATE_FILE: "/state/cursor.json"
       STOARAMA_POLL_INTERVAL_SEC: "60"
-      # "1" = read-only validate (download + verify, never delete, cursor not
-      # persisted). "0" = live (purge after verified download).
+      # "1" = read-only validate (download + verify, never release, cursor not
+      # persisted). "0" = live (release the managed copy after a verified download).
       STOARAMA_DRY_RUN: "0"
+      PYTHONUNBUFFERED: "1"
+    command: ["python3", "-c", "import urllib.request, runpy; urllib.request.urlretrieve('https://raw.githubusercontent.com/daydemir/stoarama/main/clients/nas-pull/stoarama_pull.py', '/tmp/stoarama_pull.py'); runpy.run_path('/tmp/stoarama_pull.py', run_name='__main__')"]
     volumes:
       - /volume1/stoarama-clips:/clips
       - /volume1/stoarama-state:/state
