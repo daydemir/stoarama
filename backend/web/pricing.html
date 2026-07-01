@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stoarama Pricing</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0f1a;
+      --panel: #111827;
+      --panel2: #182233;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --border: #1e293b;
+      --accent: #06b6d4;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --mono: "IBM Plex Mono", monospace;
+      --sans: "IBM Plex Sans", system-ui, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f1f5f9;
+        --panel: #ffffff;
+        --panel2: #f8fafc;
+        --text: #0f172a;
+        --muted: #4b5563;
+        --border: #e2e8f0;
+        --accent: #0891b2;
+        --ok: #16a34a;
+        --warn: #d97706;
+        --err: #dc2626;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      font-family: var(--sans);
+      font-size: 13px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 10%, transparent) 0, transparent 28%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #000) 0%, var(--bg) 58%, color-mix(in srgb, var(--bg) 88%, #07101f) 100%);
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
+    .content { display: grid; gap: 16px; max-width: 900px; margin: 0 auto; }
+    .panel {
+      padding: 18px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.18);
+    }
+    .eyebrow {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin-bottom: 10px;
+      font-size: clamp(32px, 5vw, 44px);
+      line-height: 0.98;
+      letter-spacing: -0.03em;
+    }
+    h2 { margin-bottom: 10px; font-size: 20px; }
+    p, li { color: var(--muted); line-height: 1.6; }
+    ul { padding-left: 18px; }
+    b { color: var(--text); font-weight: 500; }
+    .rate-line {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+      background: color-mix(in srgb, var(--accent) 8%, var(--panel2));
+      font-family: var(--mono);
+      font-size: 14px;
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .rate-line .rate { font-size: 20px; font-weight: 500; color: var(--accent); }
+    .price-table {
+      width: 100%;
+      margin-top: 12px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .price-table th, .price-table td {
+      padding: 12px 12px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--border);
+    }
+    .price-table th {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-weight: 500;
+    }
+    .price-table td.option { color: var(--text); white-space: nowrap; }
+    .price-table td.rate { font-family: var(--mono); color: var(--accent); white-space: nowrap; }
+    .price-table td.note { color: var(--muted); }
+    .price-table tr:last-child td { border-bottom: none; }
+    @media (max-width: 760px) {
+      .price-table, .price-table thead, .price-table tbody, .price-table tr, .price-table th, .price-table td { display: block; }
+      .price-table thead { display: none; }
+      .price-table tr { border: 1px solid var(--border); border-radius: 12px; margin-bottom: 10px; padding: 4px 0; }
+      .price-table td { border-bottom: none; padding: 6px 14px; }
+      .price-table td.option { font-weight: 500; padding-top: 12px; }
+    }
+  </style>
+<!--SHELL_HEAD-->
+</head>
+<body>
+  <div class="shell">
+    <!--SHELL_TOPBAR-->
+
+    <main class="content">
+      <section class="panel">
+        <div class="eyebrow">Pricing</div>
+        <h1>Pay for what you record.</h1>
+        <p>Browsing the catalog is free. Recording is metered: you pay for the hours a recording actually captures something, plus whatever you choose for storage. There is no subscription and no minimum. Add a card, set up a recording, and you are billed once a month for what you used.</p>
+        <div class="rate-line">
+          <span class="rate">$0.05</span> per record-hour, a clock-hour in which a recording captured at least one clip. An hour that captures nothing is free.
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">Storage</div>
+        <h2>Choose where your clips live.</h2>
+        <p>Storage is a per-recording choice. Pick the option that fits when you set up the recording.</p>
+        <table class="price-table">
+          <thead>
+            <tr>
+              <th>Option</th>
+              <th>Rate</th>
+              <th>What it means</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="option">Managed, monthly</td>
+              <td class="rate">$0.10 / stream-hour-month</td>
+              <td class="note">Stoarama holds your clips. Billed monthly in arrears for the time each clip is kept. Delete anytime and the charge stops.</td>
+            </tr>
+            <tr>
+              <td class="option">Managed, yearly</td>
+              <td class="rate">$0.05 / stream-hour-month</td>
+              <td class="note">Half the effective rate, but you commit and prepay 12 months with guaranteed 12-month retention and no early-delete refund. Available now; email us to set it up.</td>
+            </tr>
+            <tr>
+              <td class="option">Bring your own S3 bucket</td>
+              <td class="rate">$0 storage</td>
+              <td class="note">We record straight to your S3-compatible bucket. You pay your own S3 provider, we charge only the record-hour fee.</td>
+            </tr>
+            <tr>
+              <td class="option">Record to your NAS (pull)</td>
+              <td class="rate">about $0 storage</td>
+              <td class="note">We hold each clip briefly in managed storage, your NAS pulls it, and we purge it. As long as your NAS keeps up, managed storage stays near zero.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">How billing works</div>
+        <h2>Simple and in arrears.</h2>
+        <ul>
+          <li>You add a card on file via Stripe. Adding a card does not charge you.</li>
+          <li>Charges are metered as you record and settled once a month, in arrears, for the previous month.</li>
+          <li>If a recording captures nothing in a given hour, that hour is free. No capture, no charge.</li>
+          <li>See your running cost and your monthly estimate anytime on <a href="/account">/account</a>.</li>
+        </ul>
+        <p style="margin-top:12px;">Questions about pricing? Email <a href="mailto:deniz@aydemir.us">deniz@aydemir.us</a>.</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

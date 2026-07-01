@@ -40,6 +40,10 @@ func loadDocsHTML() ([]byte, error) {
 	return loadHTMLPage("docs.html")
 }
 
+func loadPricingHTML() ([]byte, error) {
+	return loadHTMLPage("pricing.html")
+}
+
 func loadAdminHTML() ([]byte, error) {
 	return loadHTMLPage("admin.html")
 }
@@ -60,6 +64,10 @@ func (s *Server) handleStreamsApp(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleDocsApp(w http.ResponseWriter, _ *http.Request) {
 	writeHTML(w, s.docsHTML)
+}
+
+func (s *Server) handlePricingApp(w http.ResponseWriter, _ *http.Request) {
+	writeHTML(w, s.pricingHTML)
 }
 
 func (s *Server) handleAdminApp(w http.ResponseWriter, _ *http.Request) {

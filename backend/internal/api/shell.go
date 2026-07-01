@@ -57,6 +57,7 @@ const shellTopbarTmpl = `<div class="topbar">
     </nav>
   </div>
   <div class="topbar-right" id="accountArea">
+    <a class="topbar-docs-link" href="/pricing">Pricing</a>
     <a class="topbar-docs-link" href="/docs/getting-started">Docs</a>
     <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">&#9881;</a>
     <div class="account-chip" id="topbarAccountStatus">Checking session...</div>

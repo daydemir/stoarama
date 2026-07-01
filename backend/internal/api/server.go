@@ -47,6 +47,7 @@ type Server struct {
 	recordingsHTML  []byte
 	accountHTML     []byte
 	docsHTML        []byte
+	pricingHTML     []byte
 	adminHTML       []byte
 	billing         *billing.Client
 	exportMu        sync.Mutex
@@ -126,6 +127,10 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
+	pricingHTML, err := loadPricingHTML()
+	if err != nil {
+		return nil, err
+	}
 	adminHTML, err := loadAdminHTML()
 	if err != nil {
 		return nil, err
@@ -143,6 +148,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		recordingsHTML:  injectShell(recordingsHTML, "recording"),
 		accountHTML:     injectShell(accountHTML, ""),
 		docsHTML:        injectShell(docsHTML, ""),
+		pricingHTML:     injectShell(pricingHTML, ""),
 		adminHTML:       injectShell(adminHTML, ""),
 		frameExports:    map[string]*frameExportJob{},
 		dayZips:         map[string]*dayZipJob{},
@@ -179,6 +185,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/docs/api", s.handleDocsApp)
 	r.Get("/docs/relay-guide", s.redirectLegacyRelayGuide)
 	r.Get("/docs/self-serve", s.handleDocsApp)
+	r.Get("/pricing", s.handlePricingApp)
 	r.Get("/account", s.handleAccountApp)
 	r.Get("/recordings", s.handleRecordingsApp)
 	r.Get("/recordings/{id}", s.handleRecordingsApp)
