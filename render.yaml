@@ -51,7 +51,7 @@ services:
       - key: R2_SIGN_PUT_TTL
         value: 15m
       - key: APP_BASE_URL
-        value: https://stoarama-api.onrender.com
+        value: https://stoarama.com
       - key: BOOTSTRAP_ADMIN_EMAIL
         sync: false
       - key: SERVICE_TOKEN
@@ -212,7 +212,7 @@ services:
       - key: SERVICE_TOKEN
         sync: false
       - key: APP_BASE_URL
-        value: https://stoarama-api.onrender.com
+        value: https://stoarama.com
       - key: REC_SCHED_ENABLED
         value: "true"
       - key: REC_SCHED_TICK_SEC
@@ -310,6 +310,9 @@ services:
         sync: false
       - key: DROPLET_POOL_FIREWALL_ID
         sync: false
+      # Recorder droplets call the API at high volume; keep them on the direct
+      # Render origin, NOT the Cloudflare-proxied stoarama.com, to avoid edge
+      # bot-throttling. This is internal traffic, never shown to users.
       - key: DROPLET_POOL_BACKEND_API_URL
         value: https://stoarama-api.onrender.com
       - key: DROPLET_POOL_REPO_URL

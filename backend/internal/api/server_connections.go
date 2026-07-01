@@ -107,10 +107,8 @@ func connectionComposeSnippet(apiBase, token string, pollIntervalSec int) string
 `, apiBase, token, pollIntervalSec)
 }
 
-// connectionPublicAPIBase is the public /api/v1 base the NAS pull client targets.
-// It is the user-facing host (stoarama.com), not the internal AppBaseURL
-// (stoarama-api.onrender.com); both reach the same API, but the public host is the
-// cleaner thing to hand an operator. Used only for the copyable compose snippet.
+// connectionPublicAPIBase is the public /api/v1 base the NAS pull client targets:
+// the user-facing host stoarama.com. Used only for the copyable compose snippet.
 const connectionPublicAPIBase = "https://stoarama.com/api/v1"
 
 // connectionAPIBase returns the public /api/v1 base for the compose snippet. Both

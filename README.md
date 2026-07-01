@@ -31,7 +31,7 @@ Stoarama v1 is:
 
 ## Public Data API
 
-A hosted instance runs at `https://stoarama-api.onrender.com` (browse it in a
+A hosted instance runs at `https://stoarama.com` (browse it in a
 browser at `/streams`). Stream metadata, per-stream sample frames, and recorded
 clips are **public reads — no account or key required.** The endpoints below are
 the canonical contract; the server also self-documents at
@@ -41,7 +41,7 @@ Presigned download URLs (`download_url`, `thumbnail_download_url`) point straigh
 at object storage and expire after ~10 minutes, so fetch them, then download.
 
 ```bash
-BASE=https://stoarama-api.onrender.com
+BASE=https://stoarama.com
 ```
 
 ### Browse and filter the catalog
