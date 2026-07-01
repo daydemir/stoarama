@@ -122,15 +122,19 @@ services:
   # Daily stream survey: one JPEG per non-pruned stream per day, captured on an
   # isolated cron instance so the heavy ffmpeg/yt-dlp work never touches the
   # public API dyno. The cron fires hourly and the sweep is idempotent: each run
-  # re-selects all non-YouTube targets and skips any stream already captured
-  # today (HasFrameForDay). Billed only while running.
+  # re-selects all non-YouTube targets NOT yet captured today, prioritized so the
+  # streams that need attention (error-tagged / previously-failing / never
+  # surveyed) are reached first every fire (SelectTargets). Billed only while
+  # running.
   #
   # BACKFILL MODE (in effect): --daily-gate is intentionally OFF and concurrency
   # raised to 6 so EVERY hourly fire sweeps the catalog and captures whatever is
-  # still missing for the day, draining the ~7k-stream thumbnail backlog over a
-  # handful of runs without overlapping work (idempotent skips). Once coverage
-  # plateaus, restore the gated steady state by re-adding --daily-gate and
-  # lowering --concurrency back to 3 (keeps peak memory under 512MB on starter).
+  # still missing for the day. A failing stream no longer holds a worker for a
+  # confirmation delay (the second-strike confirmation moved to a later sweep),
+  # and chronically-failing streams back off, so each fire now gets through far
+  # more of the catalog. Once coverage plateaus, restore the gated steady state
+  # by re-adding --daily-gate and lowering --concurrency back to 3 (keeps peak
+  # memory under 512MB on starter).
   - type: cron
     name: stoarama-survey
     env: go
