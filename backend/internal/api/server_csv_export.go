@@ -40,21 +40,7 @@ func (s *Server) handleAccountRecordingsCSV(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	rows, err := s.pool.Query(r.Context(), `
-		SELECT
-			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
-			rec.source_kind, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec,
-			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
-			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
-			COALESCE((SELECT b.has_payment_method FROM account_billing b
-			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
-			(SELECT count(*) FROM recording_clips c
-			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
-			rec.created_at, sd.managed,
-			rec.stream_id, st.name, st.location_text
-		FROM recordings rec
-		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-		LEFT JOIN streams st ON st.id = rec.stream_id
+	rows, err := s.pool.Query(r.Context(), recordingListSelectSQL+`
 		WHERE rec.account_id=$1 AND rec.status <> 'canceled'
 		ORDER BY rec.created_at DESC, rec.id DESC
 	`, principal.AccountID)

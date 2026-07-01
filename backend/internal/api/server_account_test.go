@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/config"
 )
 
 func TestSanitizeAccountRedirectPath(t *testing.T) {
@@ -21,11 +23,20 @@ func TestSanitizeAccountRedirectPath(t *testing.T) {
 	}
 }
 
-func TestBuildAccountMagicLinkFallsBackToRequestHost(t *testing.T) {
+func TestBuildAccountMagicLinkErrorsOnEmptyAppBaseURL(t *testing.T) {
 	s := &Server{}
-	req := httptest.NewRequest("GET", "https://api.example.test/account", nil)
-	got := s.buildAccountMagicLink(req, "abc123")
-	want := "https://api.example.test/auth/complete?token=abc123"
+	if _, err := s.buildAccountMagicLink("abc123"); err == nil {
+		t.Fatalf("expected error when AppBaseURL is empty")
+	}
+}
+
+func TestBuildAccountMagicLinkUsesAppBaseURL(t *testing.T) {
+	s := &Server{cfg: config.Config{AppBaseURL: "https://app.example.test/"}}
+	got, err := s.buildAccountMagicLink("abc123")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "https://app.example.test/auth/complete?token=abc123"
 	if got != want {
 		t.Fatalf("magic link=%q want %q", got, want)
 	}

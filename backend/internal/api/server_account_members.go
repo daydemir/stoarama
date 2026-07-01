@@ -165,7 +165,11 @@ func (s *Server) handleAccountMembersInvite(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	linkURL := s.buildAccountMagicLink(r, rawToken)
+	linkURL, err := s.buildAccountMagicLink(rawToken)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("build invite link: %v", err))
+		return
+	}
 	if err := s.sendAccountMagicLink(r.Context(), email, linkURL); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("send invite email: %v", err))
 		return

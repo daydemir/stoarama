@@ -21,6 +21,55 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
+// deliveryMode is a recording's storage-delivery mode: 'managed' (footage lives in
+// managed/BYO/WebDAV storage and stays there) or 'nas_pull' (the account's NAS pull
+// client drains and releases each clip). It is the single strict type for the
+// recordings.delivery column; no loose string literal for the mode lives outside it.
+type deliveryMode string
+
+const (
+	deliveryManaged deliveryMode = "managed"
+	deliveryNASPull deliveryMode = "nas_pull"
+)
+
+// parseDeliveryMode fails fast on any value other than the two legal modes. An
+// empty input is NOT accepted here (callers that want a default resolve it before
+// calling), so a malformed client value can never silently fall through.
+func parseDeliveryMode(s string) (deliveryMode, error) {
+	switch deliveryMode(s) {
+	case deliveryManaged:
+		return deliveryManaged, nil
+	case deliveryNASPull:
+		return deliveryNASPull, nil
+	default:
+		return "", fmt.Errorf("delivery must be managed or nas_pull")
+	}
+}
+
+// recordingListSelectSQL is the single SELECT + FROM/JOIN that feeds
+// scanRecordingListRow. Its column list and order MUST stay exactly aligned with
+// scanRecordingListRow's row.Scan; every consumer (the account list, the single
+// get, and the CSV export) appends only its own WHERE/ORDER BY so the three can
+// never drift out of sync again.
+const recordingListSelectSQL = `
+	SELECT
+		rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
+		rec.source_kind, COALESCE(rec.cron_expr,''), rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
+		rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
+		rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
+		COALESCE((SELECT b.has_payment_method FROM account_billing b
+		   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
+		(SELECT count(*) FROM recording_clips c
+		   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
+		rec.created_at, sd.managed,
+		rec.stream_id, st.name, st.location_text,
+		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
+		rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
+		rec.storage_retention_tier, rec.delivery
+	FROM recordings rec
+	JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
+	LEFT JOIN streams st ON st.id = rec.stream_id`
+
 // recordingProbeTimeout bounds the create-time ffmpeg reachability probe.
 const recordingProbeTimeout = 8 * time.Second
 
@@ -71,6 +120,12 @@ type recordingCreateRequest struct {
 	// when the capture destination is the account's managed destination AND the org
 	// has a card on file; otherwise create 400s.
 	StorageRetentionTier string `json:"storage_retention_tier"`
+	// Delivery is the storage-delivery mode: 'managed' (default) or 'nas_pull'. A
+	// nas_pull recording still STAGES capture into managed storage (the capture path
+	// is unchanged); the flag only marks its clips as the account's NAS pull feed so
+	// the puller may release them and the UI labels the recording as NAS-bound. Empty
+	// is treated as 'managed'.
+	Delivery string `json:"delivery"`
 }
 
 func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Request) {
@@ -79,24 +134,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	rows, err := s.pool.Query(r.Context(), `
-		SELECT
-			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
-			rec.source_kind, COALESCE(rec.cron_expr,''), rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
-			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
-			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
-			COALESCE((SELECT b.has_payment_method FROM account_billing b
-			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
-			(SELECT count(*) FROM recording_clips c
-			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
-			rec.created_at, sd.managed,
-			rec.stream_id, st.name, st.location_text,
-			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
-			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
-			rec.storage_retention_tier
-		FROM recordings rec
-		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-		LEFT JOIN streams st ON st.id = rec.stream_id
+	rows, err := s.pool.Query(r.Context(), recordingListSelectSQL+`
 		WHERE rec.account_id=$1 AND rec.status <> 'canceled'
 		ORDER BY rec.created_at DESC, rec.id DESC
 	`, principal.AccountID)
@@ -186,6 +224,18 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 	if mode != "sampled" && mode != "continuous" {
 		util.WriteError(w, http.StatusBadRequest, "mode must be sampled or continuous")
+		return
+	}
+	// Delivery mode (default managed). nas_pull marks this recording's clips as the
+	// account's NAS pull feed; capture still stages into managed storage below. An
+	// invalid client value fails fast (no fallback to managed).
+	deliveryRaw := strings.TrimSpace(req.Delivery)
+	if deliveryRaw == "" {
+		deliveryRaw = string(deliveryManaged)
+	}
+	delivery, err := parseDeliveryMode(deliveryRaw)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	clipDuration := req.ClipDurationSec
@@ -479,6 +529,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		endAtArg:            endAtArg,
 		bundleIDArg:         nil,
 		retentionTier:       retentionTier,
+		delivery:            delivery,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -543,6 +594,9 @@ type recordingInsertParams struct {
 	// retentionTier is 'monthly' (default) or 'yearly_prepaid'; empty is treated as
 	// 'monthly'. Bundle fan-out leaves it empty so bundled recordings are metered.
 	retentionTier string
+	// delivery is the storage-delivery mode. Empty is treated as 'managed', so the
+	// bundle fan-out (which leaves it empty) always writes 'managed' deliberately.
+	delivery deliveryMode
 }
 
 // insertRecordingTx runs the one canonical recordings INSERT inside the caller's
@@ -560,12 +614,16 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	if retentionTier == "" {
 		retentionTier = "monthly"
 	}
+	delivery := p.delivery
+	if delivery == "" {
+		delivery = deliveryManaged
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20)
 		RETURNING id, created_at, start_at, end_at
-	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier).Scan(&id, &createdAt, &startOut, &endOut)
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery)).Scan(&id, &createdAt, &startOut, &endOut)
 	return id, createdAt, startOut, endOut, err
 }
 
@@ -619,24 +677,7 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	row := s.pool.QueryRow(r.Context(), `
-		SELECT
-			rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
-			rec.source_kind, COALESCE(rec.cron_expr,''), rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
-			rec.status, rec.start_at, rec.end_at, rec.next_fire_at, rec.last_clip_at,
-			rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
-			COALESCE((SELECT b.has_payment_method FROM account_billing b
-			   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
-			(SELECT count(*) FROM recording_clips c
-			   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
-			rec.created_at, sd.managed,
-			rec.stream_id, st.name, st.location_text,
-			rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
-			rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
-			rec.storage_retention_tier
-		FROM recordings rec
-		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-		LEFT JOIN streams st ON st.id = rec.stream_id
+	row := s.pool.QueryRow(r.Context(), recordingListSelectSQL+`
 		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
 	`, id, principal.AccountID)
 	item, err := scanRecordingListRow(row, s.billing != nil)
@@ -922,12 +963,13 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Released clips are off the org's books (detached after a NAS pull / delivery /
-	// retention release); the org considers them deleted, so they are excluded from
-	// both the count and the list. Purged clips still appear (flagged) as before.
+	// Released clips (sent to the NAS) and purged clips both stay in this per-recording
+	// listing, each flagged for the UI. The NAS pull FEED (accountClipsCursorSQL) is the
+	// only place that must exclude released clips; the researcher's own clip browser
+	// shows the full history so a "Sent to NAS" clip is visible, not silently gone.
 	var total int64
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT count(*) FROM recording_clips WHERE recording_id=$1 AND released_at IS NULL
+		SELECT count(*) FROM recording_clips WHERE recording_id=$1
 	`, id).Scan(&total); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count clips: %v", err))
 		return
@@ -939,9 +981,9 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	offset := parseIntQuery(r, "offset", 0, 0, 1<<30)
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps, object_key, storage_destination_id, purged_at
+		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps, object_key, storage_destination_id, purged_at, released_at
 		FROM recording_clips
-		WHERE recording_id=$1 AND released_at IS NULL
+		WHERE recording_id=$1
 		ORDER BY fire_at DESC
 		LIMIT $2 OFFSET $3
 	`, id, limit, offset)
@@ -963,8 +1005,9 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			objectKey    string
 			sourceDestID int64
 			purgedAt     *time.Time
+			releasedAt   *time.Time
 		)
-		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &actualFPS, &objectKey, &sourceDestID, &purgedAt); err != nil {
+		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &actualFPS, &objectKey, &sourceDestID, &purgedAt, &releasedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
 			return
 		}
@@ -979,6 +1022,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			"object_key":             objectKey,
 			"storage_destination_id": sourceDestID,
 			"purged":                 purgedAt != nil,
+			"released":               releasedAt != nil,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -1251,6 +1295,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		bundleID         *int64
 		bundleName       *string
 		retentionTier    string
+		delivery         string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
@@ -1260,7 +1305,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd,
-		&bundleID, &bundleName, &retentionTier,
+		&bundleID, &bundleName, &retentionTier, &delivery,
 	); err != nil {
 		return nil, err
 	}
@@ -1303,6 +1348,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"bundle_id":                bundleID,
 		"bundle_name":              bundleName,
 		"storage_retention_tier":   retentionTier,
+		"delivery":                 delivery,
 	}, nil
 }
 

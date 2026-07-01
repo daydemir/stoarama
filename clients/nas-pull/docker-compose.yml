@@ -15,8 +15,10 @@
 #
 #   1. Install "Container Manager" from the Synology Package Center.
 #   2. Create two shared folders on the NAS:
-#        /volume1/stoarama-clips
-#        /volume1/stoarama-state
+#        /volume1/stoarama-clips  holds the downloaded footage (one subfolder
+#                                 per recording).
+#        /volume1/stoarama-state  holds only cursor.json, which records the last
+#                                 drained clip id so a restart resumes in place.
 #   3. Container Manager > Project > Create. Set the path to any empty folder
 #      (e.g. /volume1/docker/stoarama). Paste this compose as the source. Nothing
 #      else goes in that folder.

@@ -167,14 +167,23 @@ func slugifyName(name string) string {
 // future cross-user download feature. The UPDATE is account-scoped via the
 // recordings join. Returns (found, alreadyReleased, err); an already-released or
 // already-purged clip is left as-is (idempotent). NO r2 delete is ever issued.
-func (s *Server) releaseClip(ctx context.Context, accountID, recordingID, clipID int64) (found, alreadyReleased bool, err error) {
+//
+// requireNASPull additionally confines the target to a delivery='nas_pull'
+// recording (mirroring the accountClipsCursorSQL feed): the pull key hands out ONLY
+// nas_pull clips, so its release must never touch a managed recording's clip even
+// if a leaked key enumerates the sequential clip id. A managed clip is reported
+// not-found (found=false), same as an out-of-scope id.
+func (s *Server) releaseClip(ctx context.Context, accountID, recordingID, clipID int64, requireNASPull bool) (found, alreadyReleased bool, err error) {
+	deliveryPredicate := ""
+	if requireNASPull {
+		deliveryPredicate = ` AND r.delivery = '` + string(deliveryNASPull) + `'`
+	}
 	var purgedAt, releasedAt *time.Time
 	err = s.pool.QueryRow(ctx, `
 		SELECT c.purged_at, c.released_at
 		FROM recording_clips c
 		JOIN recordings r ON r.id = c.recording_id
-		WHERE c.id=$1 AND c.recording_id=$2 AND r.account_id=$3
-	`, clipID, recordingID, accountID).Scan(&purgedAt, &releasedAt)
+		WHERE c.id=$1 AND c.recording_id=$2 AND r.account_id=$3`+deliveryPredicate, clipID, recordingID, accountID).Scan(&purgedAt, &releasedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, false, nil
 	}
@@ -212,7 +221,7 @@ func (s *Server) handleAccountRecordingClipDelete(w http.ResponseWriter, r *http
 		return
 	}
 
-	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID)
+	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID, false)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clip: %v", err))
 		return
@@ -230,6 +239,12 @@ func (s *Server) handleAccountRecordingClipDelete(w http.ResponseWriter, r *http
 // it) but the R2 object + row + association are KEPT. Same release-semantics as the
 // user-facing delete; exposed as an explicit POST .../release so the pull key's
 // allowlist grants release without granting hard-delete.
+//
+// The release is confined to delivery='nas_pull' recordings (requireNASPull=true),
+// matching the feed (accountClipsCursorSQL) that only ever hands out nas_pull clips.
+// A leaked/malicious pull key can POST .../release on ANY sequential clip id, so
+// without this guard it could detach a managed recording's footage that the feed
+// never offered. A managed (or out-of-scope) clip is 404 (found=false).
 func (s *Server) handleAccountRecordingClipRelease(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -245,7 +260,7 @@ func (s *Server) handleAccountRecordingClipRelease(w http.ResponseWriter, r *htt
 		return
 	}
 
-	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID)
+	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID, true)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clip: %v", err))
 		return
@@ -367,14 +382,16 @@ func (s *Server) handleAccountRecordingClipsZip(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Load the page of non-purged clips with their destination snapshot, newest
-	// fire first (same order as the clips list).
+	// Load the page of still-org-visible clips with their destination snapshot,
+	// newest fire first (same order as the clips list). Released clips (detached to
+	// NAS) are excluded alongside purged, so a released clip is never re-zipped
+	// (consistent with the individual-download 410 and the view-clips filter).
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT c.id, c.clip_start_at, c.clip_end_at, c.duration_ms, c.size_bytes, c.object_key,
 		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc
 		FROM recording_clips c
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
-		WHERE c.recording_id=$1 AND c.purged_at IS NULL
+		WHERE c.recording_id=$1 AND c.purged_at IS NULL AND c.released_at IS NULL
 		ORDER BY c.fire_at DESC
 		LIMIT $2 OFFSET $3
 	`, recordingID, limit, offset)
@@ -811,8 +828,9 @@ func (s *Server) handleAccountExportCreate(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Stream the in-scope clip set: not purged, not already living in the target
-	// (so a self-copy is never enqueued), account-scoped, ordered by id so a
+	// Stream the in-scope clip set: not purged, not released (a released clip is
+	// detached to NAS and must never be re-transferred), not already living in the
+	// target (so a self-copy is never enqueued), account-scoped, ordered by id so a
 	// resumed run is deterministic. The cursor is iterated WITHOUT materializing
 	// all rows; rows accumulate into a fixed-size batch buffer and flush.
 	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
@@ -821,6 +839,7 @@ func (s *Server) handleAccountExportCreate(w http.ResponseWriter, r *http.Reques
 		JOIN recordings rec ON rec.id = c.recording_id
 		WHERE rec.account_id=$1
 		  AND c.purged_at IS NULL
+		  AND c.released_at IS NULL
 		  AND c.storage_destination_id <> $2
 		  %s
 		ORDER BY c.id ASC

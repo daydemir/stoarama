@@ -23,6 +23,8 @@ func TestAccountClipsCursorSQLShape(t *testing.T) {
 		"r.account_id = $1",
 		"c.purged_at IS NULL",
 		"c.released_at IS NULL",
+		"r.delivery = 'nas_pull'",
+		"c.created_at < now() - ",
 		"c.id > $2",
 		"ORDER BY c.id ASC",
 		"LIMIT $3",
@@ -48,15 +50,16 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 		foreignAccountID = int64(99)
 	)
 
-	// One recording per account.
+	// One recording per account. Both are nas_pull: the pull feed only hands out
+	// nas_pull recordings' clips (a managed recording's clips are never released).
 	var ownerRecID, foreignRecID int64
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO recordings (account_id, name) VALUES ($1, 'owner-rec') RETURNING id
+		INSERT INTO recordings (account_id, name, delivery) VALUES ($1, 'owner-rec', 'nas_pull') RETURNING id
 	`, ownerAccountID).Scan(&ownerRecID); err != nil {
 		t.Fatalf("insert owner recording: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO recordings (account_id, name) VALUES ($1, 'foreign-rec') RETURNING id
+		INSERT INTO recordings (account_id, name, delivery) VALUES ($1, 'foreign-rec', 'nas_pull') RETURNING id
 	`, foreignAccountID).Scan(&foreignRecID); err != nil {
 		t.Fatalf("insert foreign recording: %v", err)
 	}
@@ -158,7 +161,7 @@ func TestReleaseClipKeepsRowAndDetaches(t *testing.T) {
 
 	var recID int64
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO recordings (account_id, name) VALUES ($1, 'owner-rec') RETURNING id
+		INSERT INTO recordings (account_id, name, delivery) VALUES ($1, 'owner-rec', 'nas_pull') RETURNING id
 	`, ownerAccountID).Scan(&recID); err != nil {
 		t.Fatalf("insert recording: %v", err)
 	}
@@ -174,12 +177,12 @@ func TestReleaseClipKeepsRowAndDetaches(t *testing.T) {
 	s := &Server{pool: pool}
 
 	// A foreign account cannot release the owner's clip (found=false, no mutation).
-	if found, _, err := s.releaseClip(ctx, foreignAccountID, recID, clipID); err != nil || found {
+	if found, _, err := s.releaseClip(ctx, foreignAccountID, recID, clipID, true); err != nil || found {
 		t.Fatalf("foreign release: found=%v err=%v, want found=false err=nil", found, err)
 	}
 
 	// Owner release: found, not-already-released, row kept, released_at set, purged_at NULL.
-	found, already, err := s.releaseClip(ctx, ownerAccountID, recID, clipID)
+	found, already, err := s.releaseClip(ctx, ownerAccountID, recID, clipID, true)
 	if err != nil || !found || already {
 		t.Fatalf("owner release: found=%v already=%v err=%v, want found=true already=false err=nil", found, already, err)
 	}
@@ -207,7 +210,7 @@ func TestReleaseClipKeepsRowAndDetaches(t *testing.T) {
 	}
 
 	// Idempotent: a second release reports already-released and does not error.
-	found2, already2, err := s.releaseClip(ctx, ownerAccountID, recID, clipID)
+	found2, already2, err := s.releaseClip(ctx, ownerAccountID, recID, clipID, true)
 	if err != nil || !found2 || !already2 {
 		t.Fatalf("second release: found=%v already=%v err=%v, want found=true already=true err=nil", found2, already2, err)
 	}
@@ -300,7 +303,8 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 		`CREATE TABLE recordings (
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
-			name TEXT NOT NULL
+			name TEXT NOT NULL,
+			delivery TEXT NOT NULL DEFAULT 'managed'
 		)`,
 		`CREATE TABLE recording_clips (
 			id BIGSERIAL PRIMARY KEY,
@@ -308,6 +312,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			size_bytes BIGINT NOT NULL,
 			clip_start_at TIMESTAMPTZ NOT NULL,
 			clip_end_at TIMESTAMPTZ NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now() - interval '10 minutes',
 			purged_at TIMESTAMPTZ,
 			released_at TIMESTAMPTZ
 		)`,

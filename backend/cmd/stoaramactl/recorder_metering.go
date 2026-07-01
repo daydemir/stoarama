@@ -17,6 +17,12 @@ import (
 // soon after a period close the meter event is pushed.
 const meteringTickInterval = time.Hour
 
+// nasStagingGrace is the free window a nas_pull clip may sit in managed staging
+// before it accrues managed-storage charges. Within the grace it is FREE (the NAS
+// is expected to pull it); only clips still staged past the grace count toward
+// stream_hour_month, i.e. only when the NAS is down or falling behind.
+const nasStagingGrace = 24 * time.Hour
+
 // meteringStripe is the thin seam over the Stripe client that the metering job
 // needs: read a subscription's current period bounds and push one meter event. The
 // production path passes the real *billing.Client; unit tests pass a fake so the
@@ -233,6 +239,11 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 // retention-released) or purged, it drops out of the next snapshot and the account
 // stops being billed for its storage. Clip duration uses the wall-clock span
 // (clip_end_at - clip_start_at), not duration_ms (unreliable / 0 on many rows).
+//
+// nas_pull clips only STAGE in managed storage while the NAS pulls them, so they get
+// a nasStagingGrace free window: a nas_pull clip is counted only once it is still
+// staged past the grace (NAS down or falling behind). Managed clips are counted from
+// creation, unchanged.
 const snapshotManagedStorageSQL = `
 	INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored, stream_hours_stored)
 	SELECT r.account_id, CURRENT_DATE,
@@ -242,6 +253,7 @@ const snapshotManagedStorageSQL = `
 	JOIN recordings r            ON r.id = c.recording_id
 	JOIN storage_destinations sd ON sd.id = c.storage_destination_id
 	WHERE sd.managed AND c.purged_at IS NULL AND c.released_at IS NULL
+	  AND (r.delivery <> 'nas_pull' OR c.created_at < now() - ($1::interval))
 	GROUP BY r.account_id
 	ON CONFLICT (account_id, snapshot_date)
 	DO UPDATE SET bytes_stored = EXCLUDED.bytes_stored,
@@ -251,7 +263,7 @@ const snapshotManagedStorageSQL = `
 // snapshotManagedStorage runs the nightly managed-storage rollup (see
 // snapshotManagedStorageSQL).
 func snapshotManagedStorage(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, snapshotManagedStorageSQL); err != nil {
+	if _, err := pool.Exec(ctx, snapshotManagedStorageSQL, nasStagingGrace); err != nil {
 		return fmt.Errorf("snapshot managed storage: %w", err)
 	}
 	return nil

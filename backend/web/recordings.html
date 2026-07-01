@@ -567,7 +567,7 @@
                managed option is available per GET /billing; otherwise BYO only. -->
           <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
             <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10 per hour of footage stored per month)</button>
-            <button type="button" data-storage="nas" class="hidden" id="nasStorageBtn">Record to my NAS ($0.05 + $0.01 transfer per hour of recording)</button>
+            <button type="button" data-storage="nas" class="hidden" id="nasStorageBtn">Record to my NAS ($0.05 per stream-hour recording; storage free while pulled; $0.10/hr-mo only for clips held past 24h if the NAS falls behind)</button>
             <button type="button" data-storage="byo">Connect your own S3 bucket</button>
             <button type="button" data-storage="shared" class="hidden" id="sharedStorageBtn">Shared destination</button>
           </div>
@@ -2151,12 +2151,17 @@
         metaParts.push('<span>No clips yet</span>');
       }
 
-      // Managed-storage retention tier: show the current tier and a switch control.
-      // Only managed recordings can be yearly-prepaid; the switch is owner/billing-admin
-      // only (the server enforces it and 403s otherwise).
-      const isManaged = rec.storage_managed === true;
+      // Storage label. A nas_pull recording only STAGES in managed storage and its
+      // footage lives on the account's NAS, so it is NOT metered monthly; label it as
+      // NAS with no dollar figure. A managed recording shows its retention tier and a
+      // switch control. Only managed (non-NAS) recordings can be yearly-prepaid; the
+      // switch is owner/billing-admin only (the server enforces it and 403s otherwise).
+      const isNasDelivery = rec.delivery === 'nas_pull';
+      const isManaged = rec.storage_managed === true && !isNasDelivery;
       const tier = String(rec.storage_retention_tier || 'monthly');
-      if (isManaged) {
+      if (isNasDelivery) {
+        metaParts.push(`<span>${escapeHTML('Storage: your NAS. Free while pulled; $0.10/hr-mo only for clips held past 24h if the NAS falls behind.')}</span>`);
+      } else if (isManaged) {
         const tierLabel = tier === 'yearly_prepaid'
           ? 'Storage: yearly prepaid ($0.05/hr-mo)'
           : 'Storage: monthly metered ($0.10/hr-mo)';
@@ -2447,8 +2452,15 @@
     // destination is the managed bucket the clips already live in.
     function eligibleTransferTargetCount(items) {
       const sources = new Set((Array.isArray(items) ? items : [])
+        .filter(clipIsLive)
         .map((c) => Number(c.storage_destination_id || 0)));
       return (state.destinations || []).filter((d) => !sources.has(Number(d.id))).length;
+    }
+
+    // A clip is "live" (eligible for bulk delete / export / transfer) only when it is
+    // neither purged (deleted) nor released (sent to the NAS, off the org's books).
+    function clipIsLive(c) {
+      return c.purged !== true && c.released !== true;
     }
 
     // One dense table row for a clip, plus a hidden full-width row that carries the
@@ -2462,13 +2474,19 @@
       const clipRecId = showSource ? Number(c.recording_id || recId) : recId;
       const cid = Number(c.id);
       const purged = c.purged === true;
+      const released = c.released === true;
+      // Three-state status: a purged clip is deleted, a released clip was sent to the
+      // NAS (row kept, off the org's books), otherwise it is saved. Released and purged
+      // rows both suppress all action buttons (nothing to view/download/copy/delete).
+      const inactive = purged || released;
+      const statusText = purged ? 'deleted' : (released ? 'Sent to NAS' : 'saved');
       const sourceDestId = Number(c.storage_destination_id || 0);
       const targets = (state.destinations || []).filter((d) => Number(d.id) !== sourceDestId);
-      const transferBtn = (!purged && targets.length > 0)
+      const transferBtn = (!inactive && targets.length > 0)
         ? `<button type="button" class="secondary" data-cliptransfer="${clipRecId}:${cid}:${sourceDestId}">Send to my S3</button>`
         : '';
-      const actions = purged
-        ? `<span>deleted</span>`
+      const actions = inactive
+        ? `<span>${escapeHTML(statusText)}</span>`
         : `<div class="clip-row-actions">`
           + `<button type="button" class="secondary" data-clipview="${clipRecId}:${cid}">View</button>`
           + `<button type="button" class="secondary" data-clipdownload="${clipRecId}:${cid}">Download</button>`
@@ -2480,13 +2498,13 @@
         ? `<td class="clip-when">${escapeHTML(String(c.recording_name || ('#' + clipRecId)))}</td>` : '';
       const colspan = showSource ? 7 : 6;
       return `
-        <tr class="${purged ? 'purged' : ''}" data-cliprow="${cid}">
+        <tr class="${inactive ? 'purged' : ''}" data-cliprow="${cid}">
           ${sourceCell}
           <td class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</td>
           <td class="num">${escapeHTML(formatDuration(c.duration_ms))}</td>
           <td class="num">${fps}</td>
           <td class="num">${escapeHTML(formatBytes(c.size_bytes))}</td>
-          <td>${purged ? 'deleted' : 'saved'}</td>
+          <td>${escapeHTML(statusText)}</td>
           <td>${actions}</td>
         </tr>
         <tr class="clip-xfer-tr hidden" data-clipxfer="${cid}"><td class="clip-xfer-cell" colspan="${colspan}"></td></tr>`;
@@ -2515,7 +2533,7 @@
       const lastWhen = new Date(newest.fire_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
       const shownNote = total > items.length ? ` (showing latest ${items.length})` : '';
       const summary = `<div class="clip-summary"><b>${total}</b> clip${total === 1 ? '' : 's'}${shownNote} &middot; ${escapeHTML(firstWhen)} → ${escapeHTML(lastWhen)}</div>`;
-      const liveCount = items.filter((c) => c.purged !== true).length;
+      const liveCount = items.filter(clipIsLive).length;
       const bulk = liveCount > 0
         ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
         : '';
@@ -2524,7 +2542,7 @@
       const note = eligibleTargets > 0
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="#" data-connectbucket="1">connect a bucket first</a>.</div>`;
-      const liveSources = [...new Set(items.filter((c) => c.purged !== true).map((c) => Number(c.storage_destination_id)))];
+      const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
       const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
       panel.innerHTML = summary + bulk + exportCtl + clipTableHTML(rows, false) + note;
       wireClipActions(panel);
@@ -2602,7 +2620,7 @@
         return;
       }
 
-      const liveCount = items.filter((c) => c.purged !== true).length;
+      const liveCount = items.filter(clipIsLive).length;
       const pageActions = `
         <div class="clip-page-actions">
           ${liveCount > 0 ? `<button type="button" class="secondary" data-clipzip="${recId}">Download all (this page) as ZIP</button>` : ''}
@@ -2617,7 +2635,7 @@
         ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
         : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="/recordings">connect a bucket first</a> from the recordings page.</div>`;
       // The export-all control acts over the WHOLE recording, not just this page.
-      const liveSources = [...new Set(items.filter((c) => c.purged !== true).map((c) => Number(c.storage_destination_id)))];
+      const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
       const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
 
       root.innerHTML = header + pageActions + exportCtl + clipTableHTML(rows, false) + note + clipPagerHTML(page, pageCount);
@@ -3254,6 +3272,11 @@
       // delivery_storage_destination_id. Otherwise send the capture dest.
       if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
       else body.storage_destination_id = dest;
+      // Storage-delivery mode: the NAS choice stages capture in managed storage
+      // (same capture dest as managed) but its footage is drained to the account's
+      // NAS, so mark it nas_pull; every other choice is managed. The server reads +
+      // validates this explicitly (no marker => managed default).
+      body.delivery = state.storageChoice === 'nas' ? 'nas_pull' : 'managed';
       // Managed retention tier: only send yearly_prepaid on a pure managed pick (the
       // server rejects it otherwise). Default monthly is the server default, so send
       // it only when the user picked yearly to keep the payload lean.

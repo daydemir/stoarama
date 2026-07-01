@@ -404,7 +404,11 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	linkURL := s.buildAccountMagicLink(r, rawToken)
+	linkURL, err := s.buildAccountMagicLink(rawToken)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("build magic link: %v", err))
+		return
+	}
 	if err := s.sendAccountMagicLink(r.Context(), email, linkURL); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("send magic link email: %v", err))
 		return
@@ -1094,22 +1098,13 @@ func maskSecretForLog(raw string) string {
 	return v[:6] + "..." + v[len(v)-4:]
 }
 
-func (s *Server) buildAccountMagicLink(r *http.Request, token string) string {
+func (s *Server) buildAccountMagicLink(token string) (string, error) {
 	base := strings.TrimRight(strings.TrimSpace(s.cfg.AppBaseURL), "/")
-	if base == "" && r != nil {
-		scheme := "http"
-		if requestIsHTTPS(r) {
-			scheme = "https"
-		}
-		host := strings.TrimSpace(r.Host)
-		if host != "" {
-			base = scheme + "://" + host
-		}
-	}
 	if base == "" {
-		base = "http://localhost:8080"
+		log.Printf("account magic link build failed: AppBaseURL is empty")
+		return "", fmt.Errorf("AppBaseURL is not configured")
 	}
-	return fmt.Sprintf("%s/auth/complete?token=%s", base, url.QueryEscape(token))
+	return fmt.Sprintf("%s/auth/complete?token=%s", base, url.QueryEscape(token)), nil
 }
 
 func buildAccountMagicLinkEmail(emailAddr, linkURL string) email.Message {

@@ -706,11 +706,28 @@ func buildRecordingClipObjectKeyContinuous(keyPrefix string, recordingID int64, 
 // instead. Released clips (already pulled/detached) and purged clips are both
 // excluded, so the working set stays small: the NAS releases each clip right after
 // it pulls it, and an ordered id>cursor scan over the active partial index is cheap.
+// ONLY nas_pull recordings' clips are ever handed out (r.delivery='nas_pull'), so a
+// managed recording's clips can never be released by the NAS client. A commit
+// watermark (accountClipsCommitWatermark) additionally hides very fresh clips until
+// no older-id ingest tx can still be uncommitted.
+//
+// The commit-watermark interval: clip ids are BIGSERIAL, allocated at INSERT but
+// only VISIBLE at COMMIT, so a raw id>cursor scan can skip a lower id whose ingest
+// tx committed AFTER a higher id it already handed out (the client would advance its
+// cursor past the lower id and never see it). Only offering clips whose created_at is
+// at least this far in the past guarantees no older-id ingest tx can still be
+// uncommitted. Clips are ~60s and the poll cadence is ~60s, so this latency is
+// negligible.
+const accountClipsCommitWatermark = `interval '90 seconds'`
+
 const accountClipsCursorSQL = `
 	SELECT c.id, c.recording_id, c.size_bytes, c.clip_start_at, c.clip_end_at
 	FROM recording_clips c
 	JOIN recordings r ON r.id = c.recording_id
-	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL AND c.id > $2
+	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
+	  AND r.delivery = 'nas_pull'
+	  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
+	  AND c.id > $2
 	ORDER BY c.id ASC
 	LIMIT $3
 `

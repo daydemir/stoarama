@@ -203,8 +203,9 @@
         <div class="sub" style="margin-top:10px; line-height:1.6;">
           <ol style="margin:0; padding-left:18px;">
             <li>In DSM open <b>Package Center</b> and install <b>Container Manager</b> (skip if already installed).</li>
-            <li>Create two shared folders: <span class="mono">/volume1/stoarama-clips</span> and <span class="mono">/volume1/stoarama-state</span>.</li>
-            <li>In <b>Container Manager &gt; Project &gt; Create</b>, set the path to any empty folder (e.g. <span class="mono">/volume1/docker/stoarama</span>) and paste the docker-compose shown above as the source. Nothing else goes in that folder, there is no file to upload and nothing to build. It is pre-filled with your API base, your token, and a 60s poll.</li>
+            <li>Create two shared folders: <span class="mono">/volume1/stoarama-clips</span> holds the downloaded footage (one subfolder per recording), and <span class="mono">/volume1/stoarama-state</span> holds only <span class="mono">cursor.json</span>, which records the last drained clip id so a restart resumes in place.</li>
+            <li>In <b>Container Manager &gt; Project &gt; Create</b>, set the path to any empty folder (e.g. <span class="mono">/volume1/docker/stoarama</span>) and paste the docker-compose shown above as the source. Nothing else goes in that folder, there is no file to upload and nothing to build. It is pre-filled with your API base, your token, and your chosen poll interval.</li>
+            <li>To validate read-only first, set <span class="mono">STOARAMA_DRY_RUN</span> to <span class="mono">"1"</span> (downloads and verifies clips, never releases them, cursor not persisted), then set it back to <span class="mono">"0"</span> for live operation.</li>
             <li>Start the project. <span class="mono">restart: always</span> keeps it running across reboots.</li>
             <li>Come back here and click <b>Refresh</b>. Within a minute or two the status turns <b style="color:var(--ok);">GREEN / Connected</b>.</li>
           </ol>
