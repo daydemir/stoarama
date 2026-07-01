@@ -15,24 +15,26 @@ func TestPullPathAllowed(t *testing.T) {
 		path   string
 		want   bool
 	}{
-		// The 4 pull endpoints.
+		// The 4 pull endpoints: list + heartbeat + download + release.
 		{http.MethodGet, "/api/v1/account/clips", true},
 		{http.MethodPost, "/api/v1/account/connections/heartbeat", true},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
-		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34", true},
+		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 
 		// Wrong method on a pull path.
 		{http.MethodPost, "/api/v1/account/clips", false},
 		{http.MethodGet, "/api/v1/account/connections/heartbeat", false},
 		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34/download", false},
-		{http.MethodGet, "/api/v1/account/recordings/12/clips/34", false},
+		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/release", false},
 
+		// Hard-delete is NO LONGER allowed for a pull key: it can release, not destroy.
+		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34", false},
 		// Bulk delete-all (no clipId) must NOT pass: a pull key cannot wipe a recording.
 		{http.MethodDelete, "/api/v1/account/recordings/12/clips", false},
 
 		// Non-numeric params must not slip through the anchored regexps.
 		{http.MethodGet, "/api/v1/account/recordings/x/clips/34/download", false},
-		{http.MethodDelete, "/api/v1/account/recordings/12/clips/abc", false},
+		{http.MethodPost, "/api/v1/account/recordings/12/clips/abc/release", false},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download/extra", false},
 
 		// A sampling of management/data routes that must be denied to a pull key.
@@ -81,7 +83,7 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 		{http.MethodGet, "/api/v1/account/clips"},
 		{http.MethodPost, "/api/v1/account/connections/heartbeat"},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download"},
-		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34"},
+		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release"},
 	}
 	for _, p := range pullPaths {
 		if code := runConfine(pull, p.method, p.path); code != http.StatusOK {
@@ -89,7 +91,7 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 		}
 	}
 
-	// 403 on a sampling of non-pull endpoints.
+	// 403 on a sampling of non-pull endpoints, incl. the removed hard-delete paths.
 	denyPaths := []struct {
 		method, path string
 	}{
@@ -97,6 +99,7 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 		{http.MethodGet, "/api/v1/account/billing"},
 		{http.MethodPost, "/api/v1/account/recordings"},
 		{http.MethodPost, "/api/v1/account/connections"},
+		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34"},
 		{http.MethodDelete, "/api/v1/account/recordings/5/clips"},
 		{http.MethodGet, "/api/v1/account/me"},
 	}

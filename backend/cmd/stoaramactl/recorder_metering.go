@@ -201,30 +201,36 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 	return nil
 }
 
-// snapshotManagedStorage records today's managed-storage totals per account: the
+// snapshotManagedStorageSQL records today's managed-storage totals per account: the
 // byte total SUM(recording_clips.size_bytes) AND the stored stream-hours
 // SUM(clip_end_at - clip_start_at in hours), both over each managed account's
-// non-purged clips, keyed (account_id, CURRENT_DATE). Idempotent within a day via
-// ON CONFLICT (a same-day re-run overwrites both columns). Only managed accounts get
-// rows, so BYO accounts never accrue snapshots and never report stream_hour_month.
-// Purged clips are excluded, so once the purge job sets purged_at the clip drops out
-// of the next snapshot and stops billing. Clip duration uses the wall-clock span
+// still-org-visible clips, keyed (account_id, CURRENT_DATE). Idempotent within a
+// day via ON CONFLICT (a same-day re-run overwrites both columns). Only managed
+// accounts get rows, so BYO accounts never accrue snapshots and never report
+// stream_hour_month. Both purged AND released clips are excluded (billing-critical
+// WHERE, pinned by a shape test): once a clip is released (NAS-pulled, delivered, or
+// retention-released) or purged, it drops out of the next snapshot and the account
+// stops being billed for its storage. Clip duration uses the wall-clock span
 // (clip_end_at - clip_start_at), not duration_ms (unreliable / 0 on many rows).
+const snapshotManagedStorageSQL = `
+	INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored, stream_hours_stored)
+	SELECT r.account_id, CURRENT_DATE,
+	       COALESCE(SUM(c.size_bytes), 0),
+	       COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0)
+	FROM recording_clips c
+	JOIN recordings r            ON r.id = c.recording_id
+	JOIN storage_destinations sd ON sd.id = c.storage_destination_id
+	WHERE sd.managed AND c.purged_at IS NULL AND c.released_at IS NULL
+	GROUP BY r.account_id
+	ON CONFLICT (account_id, snapshot_date)
+	DO UPDATE SET bytes_stored = EXCLUDED.bytes_stored,
+	              stream_hours_stored = EXCLUDED.stream_hours_stored
+`
+
+// snapshotManagedStorage runs the nightly managed-storage rollup (see
+// snapshotManagedStorageSQL).
 func snapshotManagedStorage(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored, stream_hours_stored)
-		SELECT r.account_id, CURRENT_DATE,
-		       COALESCE(SUM(c.size_bytes), 0),
-		       COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0)
-		FROM recording_clips c
-		JOIN recordings r            ON r.id = c.recording_id
-		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
-		WHERE sd.managed AND c.purged_at IS NULL
-		GROUP BY r.account_id
-		ON CONFLICT (account_id, snapshot_date)
-		DO UPDATE SET bytes_stored = EXCLUDED.bytes_stored,
-		              stream_hours_stored = EXCLUDED.stream_hours_stored
-	`); err != nil {
+	if _, err := pool.Exec(ctx, snapshotManagedStorageSQL); err != nil {
 		return fmt.Errorf("snapshot managed storage: %w", err)
 	}
 	return nil

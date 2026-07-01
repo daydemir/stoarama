@@ -3,18 +3,21 @@
 
 MIT's on-prem Synology NAS is not inbound-reachable, so Stoarama records public
 streams to managed Cloudflare R2 and this client (running ON the NAS) PULLS each
-clip down, verifies it byte-for-byte, then asks Stoarama to purge the managed
-copy. Confirm-before-purge is mandatory: a clip is purged only after it has been
-downloaded AND its byte count matches the API's recorded size_bytes.
+clip down, verifies it byte-for-byte, then asks Stoarama to RELEASE the managed
+copy. Confirm-before-release is mandatory: a clip is released only after it has
+been downloaded AND its byte count matches the API's recorded size_bytes. Release
+detaches the clip from the account (billing stops, it leaves the feed) but the
+Stoarama-side R2 object is KEPT; the client's local copy on the NAS is the working
+copy.
 
 Dependency-free by design: Python 3 standard library only (urllib, json, os,
 time, pathlib). No pip installs, so it runs unchanged in a python:3-slim
 container under Synology Container Manager.
 
 The loop drains an account-wide, forward-cursored clips feed:
-  GET  {BASE}/account/clips?after_id={cursor}&limit=200   (lists unpurged clips)
+  GET  {BASE}/account/clips?after_id={cursor}&limit=200   (lists active clips)
   GET  {BASE}{clip.download_path}                         (presigns the R2 GET)
-  DELETE {BASE}/account/recordings/{rid}/clips/{cid}      (purges after pull)
+  POST {BASE}/account/recordings/{rid}/clips/{cid}/release (releases after pull)
   POST {BASE}/account/connections/heartbeat              (status each tick)
 all with header `Authorization: Bearer {STOARAMA_API_KEY}` (a sir_ account key).
 
@@ -33,10 +36,10 @@ Environment:
   STOARAMA_POLL_INTERVAL_SEC  idle sleep seconds (default 60, i.e. 1 minute)
   STOARAMA_DRY_RUN          "1" = read-only validate (default "0")
 
-DRY-RUN ("1"): download + verify every clip and log "would purge", but never
-DELETE and never persist the cursor (it advances in memory only). This is the
-safe, repeatable connectivity/integrity check the operator runs first; it never
-deletes anything and never loses its place. Set to "0" for normal operation.
+DRY-RUN ("1"): download + verify every clip and log "would release", but never
+call release and never persist the cursor (it advances in memory only). This is
+the safe, repeatable connectivity/integrity check the operator runs first; it
+never releases anything and never loses its place. Set to "0" for normal operation.
 """
 
 import json
@@ -199,11 +202,11 @@ def download_to_temp(presigned_url, temp_path):
 
 
 def process_clip(cfg, clip):
-    """Download, verify, atomically place, and (unless dry-run) purge one clip.
+    """Download, verify, atomically place, and (unless dry-run) release one clip.
 
     Returns True on a clean (download + verify) so the caller may advance the
     cursor; False on any mismatch or error so the cursor stays put and the clip
-    is retried next tick. The purge step happens only after a verified download.
+    is retried next tick. The release step happens only after a verified download.
     """
     clip_id = int(clip["clip_id"])
     recording_id = int(clip["recording_id"])
@@ -217,8 +220,8 @@ def process_clip(cfg, clip):
         presigned = request_json(cfg, "GET", download_path, base=cfg.origin)
     except urllib.error.HTTPError as exc:
         if exc.code == 410:
-            # Clip already purged upstream: nothing to pull, safe to advance.
-            log("WARN", "clip %d already purged upstream (410); advancing cursor" % clip_id)
+            # Clip already released/purged upstream: nothing to pull, safe to advance.
+            log("WARN", "clip %d no longer available upstream (410); advancing cursor" % clip_id)
             return True
         log("ERROR", "presign clip %d failed: HTTP %s" % (clip_id, exc.code))
         return False
@@ -257,29 +260,30 @@ def process_clip(cfg, clip):
     if cfg.dry_run:
         log(
             "INFO",
-            "DRY-RUN clip_id=%d recording_id=%d bytes=%d saved=%s would purge (no delete, cursor not persisted)"
+            "DRY-RUN clip_id=%d recording_id=%d bytes=%d saved=%s would release (no release, cursor not persisted)"
             % (clip_id, recording_id, written, final_path),
         )
         return True
 
-    # 5. Purge the managed copy. Already-purged is also 200 (idempotent); a 410
-    #    here likewise means the upstream copy is gone, which is the goal.
-    purge_path = "/account/recordings/%d/clips/%d" % (recording_id, clip_id)
+    # 5. Release the managed copy (detach from the account; the upstream R2 object
+    #    is KEPT). Already-released is also 200 (idempotent); a 410 here likewise
+    #    means the upstream copy is no longer on the account, which is the goal.
+    release_path = "/account/recordings/%d/clips/%d/release" % (recording_id, clip_id)
     try:
-        request_json(cfg, "DELETE", purge_path)
+        request_json(cfg, "POST", release_path)
     except urllib.error.HTTPError as exc:
         if exc.code == 410:
-            log("INFO", "clip %d already purged upstream (410)" % clip_id)
+            log("INFO", "clip %d already released upstream (410)" % clip_id)
         else:
-            log("ERROR", "purge clip %d failed: HTTP %s; keeping local copy, will retry" % (clip_id, exc.code))
+            log("ERROR", "release clip %d failed: HTTP %s; keeping local copy, will retry" % (clip_id, exc.code))
             return False
     except urllib.error.URLError as exc:
-        log("ERROR", "purge clip %d failed: %s; keeping local copy, will retry" % (clip_id, exc))
+        log("ERROR", "release clip %d failed: %s; keeping local copy, will retry" % (clip_id, exc))
         return False
 
     log(
         "INFO",
-        "clip_id=%d recording_id=%d bytes=%d saved=%s purged"
+        "clip_id=%d recording_id=%d bytes=%d saved=%s released"
         % (clip_id, recording_id, written, final_path),
     )
     return True
@@ -325,7 +329,7 @@ def main():
     cfg.validate()
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    mode = "DRY-RUN (no deletes, cursor not persisted)" if cfg.dry_run else "LIVE"
+    mode = "DRY-RUN (no releases, cursor not persisted)" if cfg.dry_run else "LIVE"
     cursor = load_cursor(cfg)
     total_pulled = 0
     log("INFO", "stoarama pull starting mode=%s api_base=%s output_dir=%s cursor=%d"

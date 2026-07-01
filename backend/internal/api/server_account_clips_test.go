@@ -22,6 +22,7 @@ func TestAccountClipsCursorSQLShape(t *testing.T) {
 	for _, want := range []string{
 		"r.account_id = $1",
 		"c.purged_at IS NULL",
+		"c.released_at IS NULL",
 		"c.id > $2",
 		"ORDER BY c.id ASC",
 		"LIMIT $3",
@@ -61,38 +62,43 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 	}
 
 	start := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
-	insertClip := func(recordingID int64, sizeBytes int64, purged bool) int64 {
+	insertClip := func(recordingID int64, sizeBytes int64, purged, released bool) int64 {
 		t.Helper()
 		var id int64
-		var purgedAt any
+		var purgedAt, releasedAt any
 		if purged {
 			purgedAt = start
 		}
+		if released {
+			releasedAt = start
+		}
 		if err := pool.QueryRow(ctx, `
-			INSERT INTO recording_clips (recording_id, size_bytes, clip_start_at, clip_end_at, purged_at)
-			VALUES ($1, $2, $3, $4, $5)
+			INSERT INTO recording_clips (recording_id, size_bytes, clip_start_at, clip_end_at, purged_at, released_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			RETURNING id
-		`, recordingID, sizeBytes, start, start.Add(90*time.Second), purgedAt).Scan(&id); err != nil {
+		`, recordingID, sizeBytes, start, start.Add(90*time.Second), purgedAt, releasedAt).Scan(&id); err != nil {
 			t.Fatalf("insert clip: %v", err)
 		}
 		return id
 	}
 
-	// Owner: three live clips and one purged clip (ascending ids by insert order).
-	live1 := insertClip(ownerRecID, 111, false)
-	live2 := insertClip(ownerRecID, 222, false)
-	purged := insertClip(ownerRecID, 333, true)
-	live3 := insertClip(ownerRecID, 444, false)
+	// Owner: three live clips, one purged clip, and one released clip (ascending ids
+	// by insert order). Both purged and released must be excluded from the pull feed.
+	live1 := insertClip(ownerRecID, 111, false, false)
+	live2 := insertClip(ownerRecID, 222, false, false)
+	purged := insertClip(ownerRecID, 333, true, false)
+	released := insertClip(ownerRecID, 666, false, true)
+	live3 := insertClip(ownerRecID, 444, false, false)
 	// Foreign account clip (must never appear for the owner).
-	insertClip(foreignRecID, 555, false)
+	insertClip(foreignRecID, 555, false, false)
 
 	// (a)+(b) Owner draining from cursor 0 sees only its own live clips, ascending,
-	// purged excluded, foreign excluded.
+	// purged + released excluded, foreign excluded.
 	page := getAccountClips(t, pool, ownerAccountID, 0, 100)
 	gotIDs := clipIDs(page.Clips)
 	wantIDs := []int64{live1, live2, live3}
 	if !equalInt64(gotIDs, wantIDs) {
-		t.Fatalf("page1 clip ids = %v, want %v (purged %d and foreign account must be excluded)", gotIDs, wantIDs, purged)
+		t.Fatalf("page1 clip ids = %v, want %v (purged %d, released %d and foreign account must be excluded)", gotIDs, wantIDs, purged, released)
 	}
 	if page.NextAfterID == nil || *page.NextAfterID != live3 {
 		t.Fatalf("page1 next_after_id = %v, want %d", page.NextAfterID, live3)
@@ -132,6 +138,78 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 	}
 	if empty.NextAfterID != nil {
 		t.Fatalf("empty page next_after_id = %v, want null", *empty.NextAfterID)
+	}
+}
+
+// TestReleaseClipKeepsRowAndDetaches exercises releaseClip against Postgres: a
+// release stamps released_at, KEEPS the row (never deletes it), leaves purged_at
+// NULL (the R2 object is retained, not purged), and removes the clip from the org
+// pull feed. A second release is idempotent. A foreign account cannot release
+// another account's clip. No r2 client is constructed anywhere in the path.
+func TestReleaseClipKeepsRowAndDetaches(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const (
+		ownerAccountID   = int64(42)
+		foreignAccountID = int64(99)
+	)
+
+	var recID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recordings (account_id, name) VALUES ($1, 'owner-rec') RETURNING id
+	`, ownerAccountID).Scan(&recID); err != nil {
+		t.Fatalf("insert recording: %v", err)
+	}
+	start := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	var clipID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_clips (recording_id, size_bytes, clip_start_at, clip_end_at)
+		VALUES ($1, 999, $2, $3) RETURNING id
+	`, recID, start, start.Add(90*time.Second)).Scan(&clipID); err != nil {
+		t.Fatalf("insert clip: %v", err)
+	}
+
+	s := &Server{pool: pool}
+
+	// A foreign account cannot release the owner's clip (found=false, no mutation).
+	if found, _, err := s.releaseClip(ctx, foreignAccountID, recID, clipID); err != nil || found {
+		t.Fatalf("foreign release: found=%v err=%v, want found=false err=nil", found, err)
+	}
+
+	// Owner release: found, not-already-released, row kept, released_at set, purged_at NULL.
+	found, already, err := s.releaseClip(ctx, ownerAccountID, recID, clipID)
+	if err != nil || !found || already {
+		t.Fatalf("owner release: found=%v already=%v err=%v, want found=true already=false err=nil", found, already, err)
+	}
+	var (
+		exists     bool
+		releasedAt *time.Time
+		purgedAt   *time.Time
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT true, released_at, purged_at FROM recording_clips WHERE id=$1
+	`, clipID).Scan(&exists, &releasedAt, &purgedAt); err != nil {
+		t.Fatalf("row must still exist after release: %v", err)
+	}
+	if !exists || releasedAt == nil {
+		t.Fatalf("after release: exists=%v released_at=%v, want row kept with released_at set", exists, releasedAt)
+	}
+	if purgedAt != nil {
+		t.Fatalf("release must NOT purge: purged_at=%v, want NULL (R2 object retained)", purgedAt)
+	}
+
+	// The released clip disappears from the org pull feed.
+	page := getAccountClips(t, pool, ownerAccountID, 0, 100)
+	if len(page.Clips) != 0 {
+		t.Fatalf("released clip still in pull feed: %d clips, want 0", len(page.Clips))
+	}
+
+	// Idempotent: a second release reports already-released and does not error.
+	found2, already2, err := s.releaseClip(ctx, ownerAccountID, recID, clipID)
+	if err != nil || !found2 || !already2 {
+		t.Fatalf("second release: found=%v already=%v err=%v, want found=true already=true err=nil", found2, already2, err)
 	}
 }
 
@@ -230,7 +308,8 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			size_bytes BIGINT NOT NULL,
 			clip_start_at TIMESTAMPTZ NOT NULL,
 			clip_end_at TIMESTAMPTZ NOT NULL,
-			purged_at TIMESTAMPTZ
+			purged_at TIMESTAMPTZ,
+			released_at TIMESTAMPTZ
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

@@ -94,21 +94,21 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 		log.Printf("recorder-control: billing disabled; usage metering not started.")
 	}
 
-	// Managed-storage retention/purge: deletes stopped-payers' managed R2 objects
-	// after the grace period. Gated on billing AND a valid operator R2 config (the
-	// same creds managed-provision seals into each managed destination row). Runs
-	// under the same restart-with-backoff loop. Never touches BYO objects.
-	if billingEnabled && cfg.ValidateR2() == nil {
-		purgeR2 := mustOperatorR2Client(ctx, cfg)
+	// Managed-storage retention/release: after the grace period, stopped-payers'
+	// managed clips are RELEASED (billing stops + org no longer sees them) while
+	// their R2 objects are RETAINED (DENIZ policy: recorded content is never
+	// hard-deleted). Gated on billing. Runs under the same restart-with-backoff
+	// loop. Never touches BYO clips and never deletes any R2 object.
+	if billingEnabled {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWithBackoff(ctx, "managed storage purge", restartDelay, func(ctx context.Context) error {
-				return runManagedPurge(ctx, pool, purgeR2)
+			runWithBackoff(ctx, "managed storage release", restartDelay, func(ctx context.Context) error {
+				return runManagedRelease(ctx, pool)
 			})
 		}()
 	} else {
-		log.Printf("recorder-control: managed-storage purge not started (billing disabled or operator R2 unconfigured).")
+		log.Printf("recorder-control: managed-storage release not started (billing disabled).")
 	}
 
 	// Clip transfer: async "send my recorded clip to my own S3 bucket". A

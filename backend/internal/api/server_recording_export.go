@@ -16,10 +16,6 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-// r2DeleteBatchLimit bounds a single DeleteObjects call (S3/R2 cap is 1000
-// keys per request); the bulk-delete loop chunks beyond it.
-const r2DeleteBatchLimit = 1000
-
 // clipDestination is the decrypted location + credentials snapshot for one
 // clip, joined from recording_clips -> storage_destinations under the account
 // scope. It mirrors the decrypt->client->op pattern in handleRecordingUploadIntent.
@@ -65,11 +61,12 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 	var (
 		d           clipDestination
 		purgedAt    *time.Time
+		releasedAt  *time.Time
 		recordingNm string
 		clipStartAt time.Time
 	)
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT c.object_key, c.thumbnail_object_key, c.size_bytes, c.purged_at,
+		SELECT c.object_key, c.thumbnail_object_key, c.size_bytes, c.purged_at, c.released_at,
 		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc,
 		       r.name, c.clip_start_at
 		FROM recording_clips c
@@ -77,7 +74,7 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
 		WHERE c.id=$1 AND c.recording_id=$2 AND r.account_id=$3
 	`, clipID, recordingID, principal.AccountID).Scan(
-		&d.objectKey, &d.thumbnailObjectKey, &d.sizeBytes, &purgedAt,
+		&d.objectKey, &d.thumbnailObjectKey, &d.sizeBytes, &purgedAt, &releasedAt,
 		&d.region, &d.bucket, &d.endpoint, &d.accessKeyID, &d.secretEnc,
 		&recordingNm, &clipStartAt,
 	)
@@ -89,8 +86,11 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load clip: %v", err))
 		return
 	}
-	if purgedAt != nil {
-		util.WriteError(w, http.StatusGone, "clip was deleted")
+	// A released clip is off the org's books (a future feature serves the retained
+	// object via a different path); a purged clip's object is gone. Both are 410
+	// for the org's download endpoint.
+	if purgedAt != nil || releasedAt != nil {
+		util.WriteError(w, http.StatusGone, "clip is no longer available")
 		return
 	}
 
@@ -159,21 +159,48 @@ func slugifyName(name string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// handleAccountRecordingClipDelete deletes one clip's object(s) from the user's
-// bucket, then tombstones the row (purged_at=now()). The row is NEVER deleted:
-// the (bucket,object_key) unique key and the nightly billing snapshot's
-// purged_at IS NULL exclusion both depend on it. Order matters: the object is
-// removed first and purged_at is set only on a successful delete, so a failed
-// delete leaves a retryable (still-live) row. An already-purged clip returns 200
-// idempotently.
+// releaseClip marks one account-owned clip released_at=now() WITHOUT deleting its
+// R2 object: the recording_clips row + object_key + storage_destination_id +
+// recording association are all kept. Released is DISTINCT from purged (purged =
+// legacy R2-deleted). A released clip stops billing (excluded from the snapshot)
+// and disappears from the org clip surfaces, but the bytes are retained for a
+// future cross-user download feature. The UPDATE is account-scoped via the
+// recordings join. Returns (found, alreadyReleased, err); an already-released or
+// already-purged clip is left as-is (idempotent). NO r2 delete is ever issued.
+func (s *Server) releaseClip(ctx context.Context, accountID, recordingID, clipID int64) (found, alreadyReleased bool, err error) {
+	var purgedAt, releasedAt *time.Time
+	err = s.pool.QueryRow(ctx, `
+		SELECT c.purged_at, c.released_at
+		FROM recording_clips c
+		JOIN recordings r ON r.id = c.recording_id
+		WHERE c.id=$1 AND c.recording_id=$2 AND r.account_id=$3
+	`, clipID, recordingID, accountID).Scan(&purgedAt, &releasedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if purgedAt != nil || releasedAt != nil {
+		return true, true, nil
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE recording_clips SET released_at=now() WHERE id=$1 AND released_at IS NULL
+	`, clipID); err != nil {
+		return true, false, err
+	}
+	return true, false, nil
+}
+
+// handleAccountRecordingClipDelete RELEASES one clip: it marks the row
+// released_at=now() and KEEPS the R2 object + row + associations. No R2 delete is
+// issued (DENIZ policy: recorded content is never hard-deleted). The org stops
+// being billed for the clip and no longer sees it, but the bytes are retained. An
+// already-released or already-purged clip returns 200 idempotently.
 func (s *Server) handleAccountRecordingClipDelete(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	if s.secrets == nil {
-		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
 		return
 	}
 	recordingID, ok := parseInt64Path(w, r, "id")
@@ -185,70 +212,61 @@ func (s *Server) handleAccountRecordingClipDelete(w http.ResponseWriter, r *http
 		return
 	}
 
-	var (
-		d        clipDestination
-		purgedAt *time.Time
-	)
-	err := s.pool.QueryRow(r.Context(), `
-		SELECT c.object_key, c.thumbnail_object_key, c.purged_at,
-		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc
-		FROM recording_clips c
-		JOIN recordings r ON r.id = c.recording_id
-		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
-		WHERE c.id=$1 AND c.recording_id=$2 AND r.account_id=$3
-	`, clipID, recordingID, principal.AccountID).Scan(
-		&d.objectKey, &d.thumbnailObjectKey, &purgedAt,
-		&d.region, &d.bucket, &d.endpoint, &d.accessKeyID, &d.secretEnc,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clip: %v", err))
+		return
+	}
+	if !found {
 		util.WriteError(w, http.StatusNotFound, "clip not found")
 		return
 	}
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load clip: %v", err))
-		return
-	}
-	if purgedAt != nil {
-		util.WriteJSON(w, http.StatusOK, map[string]any{"id": clipID, "purged": true})
-		return
-	}
-
-	client, err := s.buildClipClient(r, d)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("build destination client: %v", err))
-		return
-	}
-	keys := []string{d.objectKey}
-	if d.thumbnailObjectKey != "" {
-		keys = append(keys, d.thumbnailObjectKey)
-	}
-	if err := client.DeleteObjects(r.Context(), keys); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete clip objects: %v", err))
-		return
-	}
-
-	// Only tombstone after the object delete succeeded, so a failure above is retryable.
-	if _, err := s.pool.Exec(r.Context(), `
-		UPDATE recording_clips SET purged_at=now() WHERE id=$1
-	`, clipID); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("tombstone clip: %v", err))
-		return
-	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"id": clipID, "purged": true})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"id": clipID, "released": true})
 }
 
-// handleAccountRecordingClipsDeleteAll deletes every non-purged clip of one
-// recording. Per destination it batches the object deletes (chunked at the
-// 1000-key R2 cap) and then tombstones only the clips whose objects were
-// removed, preserving the object-then-purged_at order per chunk.
-func (s *Server) handleAccountRecordingClipsDeleteAll(w http.ResponseWriter, r *http.Request) {
+// handleAccountRecordingClipRelease is the pull-key RELEASE endpoint. The NAS pull
+// client calls it after it has downloaded + byte-verified a clip: the managed copy
+// is DETACHED from the org (released_at=now(), billing stops, org can no longer see
+// it) but the R2 object + row + association are KEPT. Same release-semantics as the
+// user-facing delete; exposed as an explicit POST .../release so the pull key's
+// allowlist grants release without granting hard-delete.
+func (s *Server) handleAccountRecordingClipRelease(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if s.secrets == nil {
-		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
+	recordingID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	clipID, ok := parseInt64Path(w, r, "clipId")
+	if !ok {
+		return
+	}
+
+	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clip: %v", err))
+		return
+	}
+	if !found {
+		util.WriteError(w, http.StatusNotFound, "clip not found")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"id": clipID, "released": true})
+}
+
+// handleAccountRecordingClipsDeleteAll RELEASES every still-org-visible clip of
+// one recording in a single account-scoped UPDATE: released_at=now() on all rows
+// that are neither purged nor already released. No R2 delete is issued (DENIZ
+// policy) and the rows + objects + associations are all kept; the org stops being
+// billed and no longer sees them. Idempotent: a re-run releases only the remaining
+// active clips.
+func (s *Server) handleAccountRecordingClipsDeleteAll(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	recordingID, ok := parseInt64Path(w, r, "id")
@@ -268,109 +286,16 @@ func (s *Server) handleAccountRecordingClipsDeleteAll(w http.ResponseWriter, r *
 		return
 	}
 
-	rows, err := s.pool.Query(r.Context(), `
-		SELECT c.id, c.object_key, c.thumbnail_object_key,
-		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc
-		FROM recording_clips c
-		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
-		WHERE c.recording_id=$1 AND c.purged_at IS NULL
-		ORDER BY c.id ASC
+	ct, err := s.pool.Exec(r.Context(), `
+		UPDATE recording_clips
+		SET released_at=now()
+		WHERE recording_id=$1 AND purged_at IS NULL AND released_at IS NULL
 	`, recordingID)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list clips: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clips: %v", err))
 		return
 	}
-	defer rows.Close()
-
-	type clipDelete struct {
-		id   int64
-		keys []string
-	}
-	// Group by destination snapshot (region/bucket/endpoint/creds) so one client
-	// can batch-delete all of a destination's objects.
-	type destGroup struct {
-		dest  clipDestination
-		clips []clipDelete
-	}
-	groups := make(map[string]*destGroup)
-	order := make([]string, 0, 4)
-	for rows.Next() {
-		var (
-			clipID    int64
-			objectKey string
-			thumbKey  string
-			d         clipDestination
-		)
-		if err := rows.Scan(&clipID, &objectKey, &thumbKey,
-			&d.region, &d.bucket, &d.endpoint, &d.accessKeyID, &d.secretEnc); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
-			return
-		}
-		gk := d.endpoint + "\x00" + d.bucket + "\x00" + d.accessKeyID
-		g, present := groups[gk]
-		if !present {
-			g = &destGroup{dest: d}
-			groups[gk] = g
-			order = append(order, gk)
-		}
-		keys := []string{objectKey}
-		if thumbKey != "" {
-			keys = append(keys, thumbKey)
-		}
-		g.clips = append(g.clips, clipDelete{id: clipID, keys: keys})
-	}
-	if err := rows.Err(); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate clips: %v", err))
-		return
-	}
-
-	deleted := 0
-	for _, gk := range order {
-		g := groups[gk]
-		client, err := s.buildClipClient(r, g.dest)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("build destination client: %v", err))
-			return
-		}
-		// Chunk so neither the object keys nor the tombstone id list exceed the
-		// R2 1000-key cap, and so object-then-purged_at holds per chunk.
-		var (
-			chunkKeys []string
-			chunkIDs  []int64
-		)
-		flush := func() bool {
-			if len(chunkKeys) == 0 {
-				return true
-			}
-			if err := client.DeleteObjects(r.Context(), chunkKeys); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("delete clip objects: %v", err))
-				return false
-			}
-			if _, err := s.pool.Exec(r.Context(), `
-				UPDATE recording_clips SET purged_at=now() WHERE id = ANY($1) AND purged_at IS NULL
-			`, chunkIDs); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("tombstone clips: %v", err))
-				return false
-			}
-			deleted += len(chunkIDs)
-			chunkKeys = chunkKeys[:0]
-			chunkIDs = chunkIDs[:0]
-			return true
-		}
-		for _, c := range g.clips {
-			if len(chunkKeys)+len(c.keys) > r2DeleteBatchLimit {
-				if !flush() {
-					return
-				}
-			}
-			chunkKeys = append(chunkKeys, c.keys...)
-			chunkIDs = append(chunkIDs, c.id)
-		}
-		if !flush() {
-			return
-		}
-	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"released": ct.RowsAffected()})
 }
 
 // clipZipRequest selects the page of clips to archive. It mirrors the clips-list

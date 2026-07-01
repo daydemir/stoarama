@@ -618,9 +618,12 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Released clips are off the org's books (detached after a NAS pull / delivery /
+	// retention release); the org considers them deleted, so they are excluded from
+	// both the count and the list. Purged clips still appear (flagged) as before.
 	var total int64
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT count(*) FROM recording_clips WHERE recording_id=$1
+		SELECT count(*) FROM recording_clips WHERE recording_id=$1 AND released_at IS NULL
 	`, id).Scan(&total); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count clips: %v", err))
 		return
@@ -634,7 +637,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps, object_key, storage_destination_id, purged_at
 		FROM recording_clips
-		WHERE recording_id=$1
+		WHERE recording_id=$1 AND released_at IS NULL
 		ORDER BY fire_at DESC
 		LIMIT $2 OFFSET $3
 	`, id, limit, offset)

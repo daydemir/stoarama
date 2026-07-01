@@ -131,7 +131,7 @@ func transferOneClip(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.
 		return false, nil
 	}
 
-	source, n, copyErr := copyClip(ctx, cipher, job)
+	n, copyErr := copyClip(ctx, cipher, job)
 	if copyErr != nil {
 		if ctx.Err() != nil {
 			return true, nil
@@ -149,32 +149,30 @@ func transferOneClip(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.
 		return true, fmt.Errorf("mark clip transfer done (job %d): %w", job.id, err)
 	}
 
-	// Auto-purge the managed staging copy ONLY after a confirmed delivery. A WebDAV
+	// RELEASE the managed staging copy ONLY after a confirmed delivery. A WebDAV
 	// recording captures into managed R2, then this job copies it to the NAS; once
-	// delivered, the managed copy is just dead weight (and would accrue stream_hour_month),
-	// so delete the source object and mark the clip purged. This runs only on the
-	// 'done' transition, so a failing/retrying transfer (NAS down) never purges and
-	// the data stays in managed staging until the retries succeed.
+	// delivered, the managed copy stops accruing stream_hour_month, so we RELEASE the
+	// clip (billing stops + org no longer sees it) while KEEPING the R2 object + row
+	// + association (DENIZ policy: recorded content is never hard-deleted). This runs
+	// only on the 'done' transition, so a failing/retrying transfer (NAS down) never
+	// releases and the data stays org-visible until the retries succeed.
 	if job.autoPurgeSource {
-		purgeDeliveredStagingCopy(ctx, pool, source, job)
+		releaseDeliveredStagingCopy(ctx, pool, job)
 	}
 	return true, nil
 }
 
-// purgeDeliveredStagingCopy deletes the managed staging object for a delivered
-// auto-transfer and marks the clip purged_at, so a delivered WebDAV recording's
-// bytes live only on the NAS and stop counting toward managed storage. Best
-// effort: a purge failure is logged, not fatal (the object lingers until a later
-// retry/purge, but the delivery itself already succeeded and is marked done).
-func purgeDeliveredStagingCopy(ctx context.Context, pool *pgxpool.Pool, source *r2.Client, job clipTransferJob) {
-	if err := source.DeleteObjects(ctx, []string{job.srcObjectKey}); err != nil {
-		log.Printf("clip transfer: job %d delivered but managed staging purge failed: %v", job.id, err)
-		return
-	}
+// releaseDeliveredStagingCopy marks the delivered auto-transfer's source clip
+// released_at=now() WITHOUT deleting the managed R2 object, so a delivered WebDAV
+// recording stops counting toward managed storage yet its bytes are retained. Best
+// effort: a release failure is logged, not fatal (the delivery itself already
+// succeeded and is marked done; the next snapshot still bills the clip until a
+// later pass releases it).
+func releaseDeliveredStagingCopy(ctx context.Context, pool *pgxpool.Pool, job clipTransferJob) {
 	if _, err := pool.Exec(ctx, `
-		UPDATE recording_clips SET purged_at=now() WHERE id=$1 AND purged_at IS NULL
+		UPDATE recording_clips SET released_at=now() WHERE id=$1 AND released_at IS NULL
 	`, job.recordingClipID); err != nil {
-		log.Printf("clip transfer: job %d staging object deleted but marking clip %d purged failed: %v", job.id, job.recordingClipID, err)
+		log.Printf("clip transfer: job %d delivered but releasing clip %d failed: %v", job.id, job.recordingClipID, err)
 	}
 }
 
@@ -241,14 +239,15 @@ func leaseClipTransferJob(ctx context.Context, pool *pgxpool.Pool) (clipTransfer
 
 // copyClip decrypts both secrets, builds the source r2 client and the target
 // store (R2/S3 or WebDAV, via the objectStore seam), and streams the source object
-// into the target via a bounded-memory PUT. Returns the source r2 client (so the
-// caller can purge the managed staging copy after a confirmed delivery without
-// re-decrypting) and the number of bytes copied (the target size, re-headed so the
-// recorded byte count is the object's real size, not a row estimate).
-func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob) (*r2.Client, int64, error) {
+// into the target via a bounded-memory PUT. Returns the number of bytes copied
+// (the target size, re-headed so the recorded byte count is the object's real
+// size, not a row estimate). The source object is never deleted (release-only
+// policy): a delivered clip is released, not purged, and the caller does not touch
+// the source client.
+func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob) (int64, error) {
 	srcSecret, err := cipher.Decrypt(job.srcSecretEnc)
 	if err != nil {
-		return nil, 0, fmt.Errorf("decrypt source secret: %w", err)
+		return 0, fmt.Errorf("decrypt source secret: %w", err)
 	}
 	source, err := r2.New(ctx, r2.Config{
 		AccessKey: job.srcAccessKeyID,
@@ -258,12 +257,12 @@ func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob
 		Endpoint:  job.srcEndpoint,
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("build source client: %w", err)
+		return 0, fmt.Errorf("build source client: %w", err)
 	}
 
 	target, err := buildTargetStore(ctx, cipher, job)
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
 
 	mimeType := job.mimeType
@@ -273,19 +272,19 @@ func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob
 
 	rc, err := source.Open(ctx, job.srcObjectKey)
 	if err != nil {
-		return nil, 0, fmt.Errorf("open source object: %w", err)
+		return 0, fmt.Errorf("open source object: %w", err)
 	}
 	defer func() { _ = rc.Close() }()
 
 	if _, err := target.PutMultipart(ctx, job.targetObjectKey, mimeType, rc); err != nil {
-		return nil, 0, fmt.Errorf("put target object: %w", err)
+		return 0, fmt.Errorf("put target object: %w", err)
 	}
 
 	head, err := target.Head(ctx, job.targetObjectKey)
 	if err != nil {
-		return nil, 0, fmt.Errorf("head target object: %w", err)
+		return 0, fmt.Errorf("head target object: %w", err)
 	}
-	return source, head.SizeBytes, nil
+	return head.SizeBytes, nil
 }
 
 // buildTargetStore constructs the transfer target through the objectStore seam,

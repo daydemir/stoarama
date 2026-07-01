@@ -241,6 +241,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
 			account.Get("/recordings/{id}/clips/{clipId}/download", s.handleAccountRecordingClipDownload)
 			account.Delete("/recordings/{id}/clips/{clipId}", s.handleAccountRecordingClipDelete)
+			account.Post("/recordings/{id}/clips/{clipId}/release", s.handleAccountRecordingClipRelease)
 			account.Delete("/recordings/{id}/clips", s.handleAccountRecordingClipsDeleteAll)
 			account.Post("/recordings/{id}/clips/zip", s.handleAccountRecordingClipsZip)
 			account.Get("/clips-zip/{jobId}", s.handleDayZipGet)

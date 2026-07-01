@@ -20,16 +20,20 @@ import (
 // route not in this allowlist is 403d for a pull-scoped key automatically.
 var (
 	pullDownloadPathRe = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/download$`)
-	pullDeletePathRe   = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+$`)
+	pullReleasePathRe  = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/release$`)
 )
 
 // pullPathAllowed reports whether a pull-scoped key may call (method, path). It is
 // the single source of truth for pull confinement and is exercised directly by the
-// table tests. The 4 allowed shapes:
-//   - GET    /api/v1/account/clips                                   (cursor list)
-//   - POST   /api/v1/account/connections/heartbeat                  (heartbeat)
-//   - GET    /api/v1/account/recordings/{id}/clips/{clipId}/download (presign)
-//   - DELETE /api/v1/account/recordings/{id}/clips/{clipId}          (purge one clip)
+// table tests. The 4 allowed shapes (list + download + release + heartbeat):
+//   - GET  /api/v1/account/clips                                        (cursor list)
+//   - POST /api/v1/account/connections/heartbeat                       (heartbeat)
+//   - GET  /api/v1/account/recordings/{id}/clips/{clipId}/download      (presign)
+//   - POST /api/v1/account/recordings/{id}/clips/{clipId}/release       (release one clip)
+//
+// The pull key can RELEASE a clip (detach it from the org, keeping the R2 object)
+// but can NOT hard-delete: the old DELETE .../clips/{clipId} allowance is removed,
+// so a leaked NAS key can never destroy recorded content.
 func pullPathAllowed(method, path string) bool {
 	switch {
 	case method == http.MethodGet && path == "/api/v1/account/clips":
@@ -38,7 +42,7 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodGet && pullDownloadPathRe.MatchString(path):
 		return true
-	case method == http.MethodDelete && pullDeletePathRe.MatchString(path):
+	case method == http.MethodPost && pullReleasePathRe.MatchString(path):
 		return true
 	default:
 		return false

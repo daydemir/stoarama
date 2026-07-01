@@ -699,18 +699,18 @@ func buildRecordingClipObjectKeyContinuous(keyPrefix string, recordingID int64, 
 	return strings.Join(parts, "/")
 }
 
-// accountClipsCursorSQL forward-cursors the calling account's unpurged clips by
-// the monotonic recording_clips.id (BIGSERIAL), so a NAS pull client can drain
-// every clip exactly once and resume from its last seen id. object_key is never
-// selected: the caller gets a download_path to the existing presign endpoint
-// instead. The unpurged working set stays small because the NAS purges each clip
-// right after it pulls it, so an ordered id>cursor scan over purged_at IS NULL
-// rows is cheap in practice.
+// accountClipsCursorSQL forward-cursors the calling account's still-org-visible
+// clips by the monotonic recording_clips.id (BIGSERIAL), so a NAS pull client can
+// drain every clip exactly once and resume from its last seen id. object_key is
+// never selected: the caller gets a download_path to the existing presign endpoint
+// instead. Released clips (already pulled/detached) and purged clips are both
+// excluded, so the working set stays small: the NAS releases each clip right after
+// it pulls it, and an ordered id>cursor scan over the active partial index is cheap.
 const accountClipsCursorSQL = `
 	SELECT c.id, c.recording_id, c.size_bytes, c.clip_start_at, c.clip_end_at
 	FROM recording_clips c
 	JOIN recordings r ON r.id = c.recording_id
-	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.id > $2
+	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL AND c.id > $2
 	ORDER BY c.id ASC
 	LIMIT $3
 `
