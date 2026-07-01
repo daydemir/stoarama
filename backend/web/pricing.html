@@ -143,7 +143,7 @@
       color: var(--muted);
       line-height: 1.6;
     }
-    .examples { margin-top: 4px; display: grid; gap: 10px; }
+    .examples { margin-top: 4px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
     .example {
       padding: 12px 14px;
       border-radius: 12px;
@@ -162,6 +162,7 @@
       .price-table tr { border: 1px solid var(--border); border-radius: 12px; margin-bottom: 10px; padding: 4px 0; }
       .price-table td { border-bottom: none; padding: 6px 14px; }
       .price-table td.option { font-weight: 500; padding-top: 12px; }
+      .examples { grid-template-columns: 1fr; }
     }
   </style>
 <!--SHELL_HEAD-->
