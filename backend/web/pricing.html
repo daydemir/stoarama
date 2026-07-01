@@ -76,9 +76,30 @@
     p, li { color: var(--muted); line-height: 1.6; }
     ul { padding-left: 18px; }
     b { color: var(--text); font-weight: 500; }
+    .trust { margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .cta-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: 8px 18px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      background: transparent;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn:hover { text-decoration: none; border-color: var(--accent); color: var(--accent); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover { opacity: 0.88; color: #fff; }
     .rate-line {
       margin-top: 14px;
-      padding: 14px 16px;
+      padding: 16px 18px;
       border-radius: 14px;
       border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
       background: color-mix(in srgb, var(--accent) 8%, var(--panel2));
@@ -87,7 +108,7 @@
       color: var(--text);
       line-height: 1.5;
     }
-    .rate-line .rate { font-size: 20px; font-weight: 500; color: var(--accent); }
+    .rate-line .rate { display: block; margin-bottom: 6px; font-size: 26px; font-weight: 500; color: var(--accent); }
     .price-table {
       width: 100%;
       margin-top: 12px;
@@ -110,8 +131,31 @@
     }
     .price-table td.option { color: var(--text); white-space: nowrap; }
     .price-table td.rate { font-family: var(--mono); color: var(--accent); white-space: nowrap; }
+    .price-table td.rate .subnote { display: block; margin-top: 4px; font-family: var(--sans); font-size: 12px; color: var(--muted); white-space: normal; }
     .price-table td.note { color: var(--muted); }
     .price-table tr:last-child td { border-bottom: none; }
+    .nas-note {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel2);
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .examples { margin-top: 4px; display: grid; gap: 10px; }
+    .example {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel2);
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .example .label { display: block; margin-bottom: 2px; font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+    .faq { display: grid; gap: 14px; margin-top: 4px; }
+    .faq h3 { font-size: 14px; margin-bottom: 4px; color: var(--text); }
+    .faq p { color: var(--muted); }
     @media (max-width: 760px) {
       .price-table, .price-table thead, .price-table tbody, .price-table tr, .price-table th, .price-table td { display: block; }
       .price-table thead { display: none; }
@@ -130,59 +174,123 @@
       <section class="panel">
         <div class="eyebrow">Pricing</div>
         <h1>Pay for what you record.</h1>
-        <p>Browsing the catalog is free. You pay only for two things: the hours your recordings are actively capturing, and where those clips are stored. No subscription, no minimum, no setup fee. Add a card, set up a recording, and get one bill a month for what you used.</p>
+        <p>You pay for two things: the hours your recordings capture, and where those clips are stored. <b>$0.05 per recording-hour, plus your choice of storage.</b></p>
+        <p class="trust">Used by researchers at MIT Senseable City Lab.</p>
+        <div class="cta-row">
+          <a class="btn primary" href="/recordings">Start recording</a>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">Recording</div>
         <div class="rate-line">
-          <span class="rate">$0.05</span> per hour of recording. This is each clock-hour in which a stream is actively capturing at least one clip. An hour that captures nothing is free.
+          <span class="rate">$0.05 per recording-hour</span>
+          Each clock-hour a stream captures at least one clip. An hour that captures nothing is free.
         </div>
       </section>
 
       <section class="panel">
         <div class="eyebrow">Storage</div>
-        <h2>Choose where your clips are kept.</h2>
-        <p>Storage is a per-recording choice you make when you set one up. Managed storage is priced by the hour of footage you keep. Everything below is billed monthly, in arrears, for exactly the time each clip was held.</p>
+        <h2>Where your clips go</h2>
         <table class="price-table">
           <thead>
             <tr>
               <th>Option</th>
-              <th>Price</th>
-              <th>What it means</th>
+              <th>Rate</th>
+              <th>Best for</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td class="option">Managed storage, monthly</td>
-              <td class="rate">$0.10 per hour of footage stored, per month</td>
-              <td class="note">Stoarama keeps your clips. You pay $0.10 to keep one hour of footage for a month, charged only for the time each clip is actually held. Delete a clip and its charge stops.</td>
+              <td class="option"><b>Managed storage, monthly</b></td>
+              <td class="rate"><b>$0.10</b> per hour of footage, per month</td>
+              <td class="note">Hands-off storage, delete anytime, charge stops on delete.</td>
             </tr>
             <tr>
-              <td class="option">Managed storage, yearly</td>
-              <td class="rate">$0.05 per hour of footage stored, per month (effective)</td>
-              <td class="note">Half the effective rate in exchange for a commitment: you prepay 12 months up front with guaranteed 12-month retention and no early-delete refund. Available now by email; there is no self-serve yearly picker yet.</td>
+              <td class="option"><b>Managed storage, yearly</b></td>
+              <td class="rate"><b>$0.05</b> per hour of footage, per month<span class="subnote">Prepaid 12 months, 12-month retention. Email us to enable.</span></td>
+              <td class="note">Half the effective rate for footage you plan to keep a full year.</td>
             </tr>
             <tr>
-              <td class="option">Record to your NAS</td>
-              <td class="rate">$0.05 + $0.01 transfer per hour of recording</td>
-              <td class="note">A small client on your NAS pulls each clip about every 60 seconds and we then purge our copy, so we only ever hold about a minute of footage. You pay $0.05 per hour of recording plus $0.01 per hour of recording for NAS transfer, about $0.06 per recording-hour total; the $0.01 covers managing the transfer and holding each clip about 60 seconds. There is no per-month storage charge. If your NAS goes down while recording, unsent clips are kept safely in managed storage and bill at $0.10 per hour of footage per month until your NAS catches up.</td>
-            </tr>
-            <tr>
-              <td class="option">Bring your own S3 bucket</td>
-              <td class="rate">$0 storage from us</td>
-              <td class="note">We record straight into your own S3-compatible bucket (Cloudflare R2, Amazon S3, Backblaze B2, Wasabi, DigitalOcean Spaces, or any S3-compatible endpoint). You pay your storage provider directly and we charge only the $0.05 per hour of recording.</td>
+              <td class="option"><b>Record to your NAS</b></td>
+              <td class="rate"><b>Free</b> while your NAS keeps up</td>
+              <td class="note">Store on your own hardware, no per-month charge.</td>
             </tr>
           </tbody>
         </table>
+        <div class="nas-note">
+          NAS-pull storage is <b>Free</b> while the NAS keeps up. If it falls behind, clips left in managed storage over <b>24h</b> bill at <b>$0.10</b> per hour of footage per month until the NAS catches up. <a href="/docs/getting-started">How NAS pull works</a>.
+        </div>
       </section>
 
       <section class="panel">
-        <div class="eyebrow">How billing works</div>
-        <h2>One monthly bill, after the fact.</h2>
+        <div class="eyebrow">Examples</div>
+        <h2>What a month looks like</h2>
+        <div class="examples">
+          <div class="example">
+            <span class="label">Low</span>
+            1 stream, 8 hr/day, 30 days = 240 recording-hours (<b>$12</b>) + 240 hr in managed storage (<b>$24</b>) = <b>$36/mo</b>.
+          </div>
+          <div class="example">
+            <span class="label">Medium</span>
+            10 streams, 8 hr/day, 30 days = 2,400 recording-hours (<b>$120</b>) + 2,400 hr in managed storage held one month (<b>$240</b>) = <b>$360/mo</b>.
+          </div>
+          <div class="example">
+            <span class="label">High</span>
+            20 streams, 24 hr/day, 30 days, recorded to your NAS = 14,400 recording-hours (<b>$720</b>), storage <b>Free</b> = <b>$720/mo</b>.
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">Billing</div>
+        <h2>One bill, monthly, in arrears.</h2>
         <ul>
-          <li>You add a card on file through Stripe. Adding a card does not charge you.</li>
-          <li>Charges are metered as you record and settled once a month, in arrears, for the month just ended.</li>
-          <li>An hour in which a recording captured nothing is free. No capture, no charge.</li>
-          <li>See your running cost and this month's estimate anytime on <a href="/account">/account</a>.</li>
+          <li>Add a card on file via Stripe. Adding a card does not charge you.</li>
+          <li>Metered as you record, settled once a month for the month just ended.</li>
+          <li>Delete a clip to stop its storage charge.</li>
+          <li>See your running estimate on <a href="/account">your account</a>.</li>
         </ul>
-        <p style="margin-top:12px;">Questions about pricing? Email <a href="mailto:deniz@aydemir.us">deniz@aydemir.us</a>.</p>
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">FAQ</div>
+        <h2>Common questions</h2>
+        <div class="faq">
+          <div>
+            <h3>What triggers a recording charge?</h3>
+            <p>A clock-hour in which one of your streams captures at least one clip. Idle hours are not billed.</p>
+          </div>
+          <div>
+            <h3>What if I forget to stop a recording?</h3>
+            <p>It keeps recording on its schedule and billing at $0.05 per recording-hour. Pause or delete it on <a href="/recordings">your recordings</a> to stop the charge.</p>
+          </div>
+          <div>
+            <h3>What happens if my NAS goes offline?</h3>
+            <p>Clips wait in managed storage. Anything left over 24h bills at $0.10 per hour of footage per month until your NAS catches up, then the charge stops.</p>
+          </div>
+          <div>
+            <h3>Can I see a large bill coming?</h3>
+            <p>Your running estimate for the month is on <a href="/account">your account</a>, updated as you record.</p>
+          </div>
+          <div>
+            <h3>Is there a minimum or setup fee?</h3>
+            <p>No. There is no minimum, no subscription, and no setup fee. You pay for the hours you record and the storage you use.</p>
+          </div>
+          <div>
+            <h3>How do I get the yearly rate?</h3>
+            <p>Email us to enable prepaid yearly storage at $0.05 per hour of footage per month, with 12-month retention.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="eyebrow">Get started</div>
+        <h2>No minimum. No setup fee. Add a card and start recording.</h2>
+        <div class="cta-row">
+          <a class="btn primary" href="/recordings">Start recording</a>
+          <a class="btn" href="mailto:deniz@aydemir.us">Contact us</a>
+        </div>
       </section>
     </main>
   </div>
