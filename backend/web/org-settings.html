@@ -85,16 +85,20 @@
     }
     input { width: 100%; min-height: 38px; padding: 9px 12px; }
     input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
+    /* Base button is the secondary/ghost tier: bordered, dark text, clearly
+       clickable. The single primary per screen adds .primary and gets the solid
+       saturated accent fill from shell.go. */
     button {
       min-height: 38px; padding: 9px 12px; width: auto;
       cursor: pointer;
-      background: color-mix(in srgb, var(--accent) 18%, var(--panel2));
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      color: #f8fafc;
-      font-weight: 600;
+      background: transparent;
+      border: 1.5px solid var(--muted);
+      color: var(--text);
+      font-weight: 500;
     }
-    button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
-    button.secondary { background: transparent; color: var(--text); font-weight: 500; }
+    button:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    button.primary { font-weight: 600; }
+    button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
     button.small { min-height: 30px; padding: 5px 12px; font-size: 12px; }
     .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .kv-val { font-family: var(--mono); font-size: 13px; color: var(--text); word-break: break-all; }
@@ -146,7 +150,7 @@
       <h2>Members</h2>
       <div id="teamInvite" class="inline-form hidden" style="margin-bottom:12px;">
         <input id="teamInviteEmail" type="email" placeholder="teammate@example.org" />
-        <button id="teamInviteBtn" type="button">Invite</button>
+        <button id="teamInviteBtn" class="primary" type="button">Invite</button>
       </div>
       <div id="teamStatus" class="status">Loading members...</div>
       <div id="teamList" class="rec-list hidden"></div>
@@ -183,11 +187,11 @@
       <div id="connectionsCreate">
         <label for="connLabel">Label</label>
         <input id="connLabel" type="text" placeholder="MIT Synology NAS" />
-        <label for="connInterval" style="margin-top:12px;">Poll interval</label>
+        <label for="connInterval" style="margin-top:12px;">Poll interval (seconds)</label>
         <input id="connInterval" type="number" min="10" max="3600" value="60" />
-        <div class="sub" style="margin-top:4px;">Seconds, 10-3600.</div>
+        <div class="sub" style="margin-top:4px;">10 to 3600</div>
         <div style="margin-top:12px;">
-          <button id="connCreateBtn" type="button">Create</button>
+          <button id="connCreateBtn" class="primary" type="button">Add connection</button>
         </div>
       </div>
       <div id="connTokenBox" class="token-box hidden">
@@ -210,9 +214,8 @@
             <li>Come back here and click <b>Refresh</b>. Within a minute or two the status turns <b style="color:var(--ok);">GREEN / Connected</b>.</li>
           </ol>
           <p style="margin:12px 0 0;"><b>Any Docker host:</b> the same compose runs anywhere. Save it as <span class="mono">docker-compose.yml</span> and run <span class="mono">docker compose up -d</span>.</p>
-          <p style="margin:10px 0 0;">Green appears 1 to 2 minutes AFTER you start the container.</p>
-          <p style="margin:6px 0 0;">Copy the compose now. The token is shown once; use Rotate to get a new one.</p>
-          <p style="margin:6px 0 0;">If your NAS stalls, clips pile up in managed storage and bill at $0.10 per hour of footage per month until it catches up.</p>
+          <p style="margin:10px 0 0;">Copy the compose now. The token is shown once; use Rotate to get a new one.</p>
+          <p style="margin:6px 0 0;">If your NAS falls behind, clips left in managed storage over <b>24h</b> bill at <b>$0.10</b> per hour of footage per month until the NAS catches up.</p>
         </div>
       </details>
     </section>
@@ -464,7 +467,7 @@
           btn.addEventListener('click', () => removeTeamMember(btn.getAttribute('data-email') || ''));
         });
         if (canManage) teamInvite.classList.remove('hidden');
-        setStatus(teamStatus, `${items.length} member${items.length === 1 ? '' : 's'}.`, 'ok');
+        setStatus(teamStatus, `${items.length} member${items.length === 1 ? '' : 's'}`, 'ok');
       } catch (err) {
         teamPanel.classList.add('hidden');
       }
@@ -480,7 +483,7 @@
           body: JSON.stringify({ email }),
         });
         teamInviteEmail.value = '';
-        setStatus(teamStatus, `Invite sent to ${email}.`, 'ok');
+        setStatus(teamStatus, `Invite sent to ${email}`, 'ok');
         await loadTeam();
       } catch (err) {
         setStatus(teamStatus, String(err.message || err), 'err');
@@ -509,7 +512,9 @@
     function connLastSeenText(c) {
       if (!c.last_seen_at) return 'never seen';
       const d = new Date(c.last_seen_at);
-      return Number.isNaN(d.getTime()) ? String(c.last_seen_at) : `last seen ${d.toLocaleString()}`;
+      if (Number.isNaN(d.getTime())) return String(c.last_seen_at);
+      const stamp = d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      return `last seen ${stamp}`;
     }
 
     async function loadConnections() {
@@ -527,7 +532,7 @@
           const interval = Number(c.poll_interval_sec || 60);
           return `<div class="rec-row kv-row">
             <div style="min-width:0;">
-              <div>${connStatusDot(health)}${connStatusLabel(health)} <span class="mono">${escapeHTML(label)}</span></div>
+              <div>${connStatusDot(health)}${connStatusLabel(health)} <span class="mono" style="white-space:nowrap;">${escapeHTML(label)}</span></div>
               <div class="sub">${clips} clip${clips === 1 ? '' : 's'} pulled · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
             </div>
             <div style="display:flex;gap:8px;flex-shrink:0;">
@@ -543,7 +548,7 @@
         connectionsList.querySelectorAll('.conn-remove').forEach((btn) => {
           btn.addEventListener('click', () => removeConnection(Number(btn.getAttribute('data-id'))));
         });
-        setStatus(connectionsStatus, `${items.length} connection${items.length === 1 ? '' : 's'}.`, 'ok');
+        setStatus(connectionsStatus, `${items.length} connection${items.length === 1 ? '' : 's'}`, 'ok');
       } catch (err) {
         connectionsPanel.classList.add('hidden');
       }
@@ -589,7 +594,7 @@
     async function removeConnection(id) {
       try {
         await fetchJSON(`/api/v1/account/connections/${id}`, { method: 'DELETE' });
-        setStatus(connectionsStatus, 'Connection removed and its key revoked.', 'ok');
+        setStatus(connectionsStatus, 'Connection removed and its key revoked', 'ok');
         await loadConnections();
       } catch (err) {
         setStatus(connectionsStatus, String(err.message || err), 'err');
@@ -625,7 +630,7 @@
         });
         const url = (out && (out.checkout_url || out.portal_url)) || '';
         if (url) { window.location.assign(url); return; }
-        setStatus(billingStatus, 'No billing URL returned.', 'err');
+        setStatus(billingStatus, 'No billing URL returned', 'err');
       } catch (err) {
         setStatus(billingStatus, String(err.message || err), 'err');
       } finally {

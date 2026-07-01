@@ -128,6 +128,72 @@ type recordingCreateRequest struct {
 	Delivery string `json:"delivery"`
 }
 
+// optionalActingAccountID resolves the acting org from an optional browser session
+// on a PUBLIC request. It returns (0, false) when there is no session (an anonymous
+// visitor), so the public streams endpoints can scope recording_id to the acting org
+// without requiring auth. It never writes an error: a missing/invalid session is the
+// anonymous case, not a failure.
+func (s *Server) optionalActingAccountID(r *http.Request) (int64, bool) {
+	principal, err := s.authenticateAccountSessionRequest(r)
+	if err != nil || principal.AccountID <= 0 {
+		return 0, false
+	}
+	return principal.AccountID, true
+}
+
+// actingRecordingIDsForStreams returns, per stream id, the acting org's latest
+// non-canceled recording.id for that stream (NULL/absent when none). It is the batch
+// resolver behind the streams list's recording_id field, scoped to the acting org so
+// one org never sees another's recording. An empty input (or no acting org) yields an
+// empty map, which renders every stream's recording_id as null.
+func (s *Server) actingRecordingIDsForStreams(ctx context.Context, accountID int64, streamIDs []int64) (map[int64]int64, error) {
+	out := map[int64]int64{}
+	if accountID <= 0 || len(streamIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT rec.stream_id, MAX(rec.id)
+		FROM recordings rec
+		WHERE rec.account_id=$1 AND rec.status <> 'canceled' AND rec.stream_id = ANY($2::bigint[])
+		GROUP BY rec.stream_id
+	`, accountID, streamIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var streamID, recID int64
+		if err := rows.Scan(&streamID, &recID); err != nil {
+			return nil, err
+		}
+		out[streamID] = recID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// actingRecordingIDForStream returns the acting org's latest non-canceled
+// recording.id for one stream (nil when none or no acting org). It backs the stream
+// detail's recording_id field.
+func (s *Server) actingRecordingIDForStream(ctx context.Context, accountID, streamID int64) (*int64, error) {
+	if accountID <= 0 {
+		return nil, nil
+	}
+	// MAX over zero matching rows returns a single NULL row (not ErrNoRows), so scan
+	// into a nullable pointer and return it directly.
+	var recID *int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT MAX(rec.id)
+		FROM recordings rec
+		WHERE rec.account_id=$1 AND rec.status <> 'canceled' AND rec.stream_id=$2
+	`, accountID, streamID).Scan(&recID); err != nil {
+		return nil, err
+	}
+	return recID, nil
+}
+
 func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -236,6 +302,12 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	delivery, err := parseDeliveryMode(deliveryRaw)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A recording cannot both NAS-pull and deliver to an external (WebDAV) destination;
+	// both would drain the same managed staging clips.
+	if delivery == deliveryNASPull && req.DeliveryStorageDestinationID > 0 {
+		util.WriteError(w, http.StatusBadRequest, "a NAS-pull recording cannot also deliver to an external destination")
 		return
 	}
 	clipDuration := req.ClipDurationSec
@@ -690,6 +762,294 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, item)
+}
+
+// writeRecordingJSON re-reads one recording under the account scope and writes it
+// with the same shape as GET /recordings/{id}. It is the single place the PATCH
+// handlers return their updated row (DRY), so a schedule/delivery edit and the get
+// can never drift in shape.
+func (s *Server) writeRecordingJSON(w http.ResponseWriter, r *http.Request, id, accountID int64) {
+	row := s.pool.QueryRow(r.Context(), recordingListSelectSQL+`
+		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
+	`, id, accountID)
+	item, err := scanRecordingListRow(row, s.billing != nil)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "recording not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, item)
+}
+
+// recordingScheduleRequest is the schedule-edit PATCH body. Only the fields
+// relevant to the chosen mode are read: sampled uses cron_expr/cron_timezone;
+// continuous uses daily_window_start/daily_window_end. Both share
+// clip_duration_sec, target_fps, and the optional capture window (start_at/end_at).
+type recordingScheduleRequest struct {
+	Mode             string     `json:"mode"`
+	CronExpr         string     `json:"cron_expr"`
+	CronTimezone     string     `json:"cron_timezone"`
+	ClipDurationSec  int        `json:"clip_duration_sec"`
+	DailyWindowStart string     `json:"daily_window_start"`
+	DailyWindowEnd   string     `json:"daily_window_end"`
+	StartAt          *time.Time `json:"start_at"`
+	EndAt            *time.Time `json:"end_at"`
+	TargetFPS        *int       `json:"target_fps"`
+}
+
+// handleAccountRecordingSchedule edits one recording's schedule in place. It reuses
+// the exact create-time validation (ValidateCronForCreate + the capacity checks +
+// ValidateContinuousWindowForCreate) so an edit can never write a schedule create
+// would reject, recomputes next_fire_at via nextFireForRecording, and returns the
+// updated recording JSON. Only the owning account may edit; a canceled recording is
+// not found.
+func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req recordingScheduleRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	mode := strings.TrimSpace(req.Mode)
+	if mode != "sampled" && mode != "continuous" {
+		util.WriteError(w, http.StatusBadRequest, "mode must be sampled or continuous")
+		return
+	}
+	cronExpr := strings.TrimSpace(req.CronExpr)
+	cronTimezone := strings.TrimSpace(req.CronTimezone)
+	if cronTimezone == "" {
+		cronTimezone = "UTC"
+	}
+	clipDuration := req.ClipDurationSec
+	if clipDuration == 0 {
+		clipDuration = 60
+	}
+	if clipDuration < 5 || clipDuration > 900 {
+		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
+		return
+	}
+
+	// target_fps: NULL = Source/native; otherwise 1..60 (mirrors create). Validated up
+	// front with the other pure-input checks so a bad value fails fast before any DB work.
+	var targetFPSArg any
+	if req.TargetFPS != nil {
+		if *req.TargetFPS < 1 || *req.TargetFPS > 60 {
+			util.WriteError(w, http.StatusBadRequest, "target_fps must be between 1 and 60 (omit for Source)")
+			return
+		}
+		targetFPSArg = *req.TargetFPS
+	}
+
+	// Confirm ownership and load the current capture window so an omitted start_at/
+	// end_at keeps the recording's existing window (a schedule edit is not a window
+	// reset). A canceled recording is not found.
+	var (
+		curStartAt time.Time
+		curEndAt   *time.Time
+	)
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT start_at, end_at FROM recordings
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID).Scan(&curStartAt, &curEndAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "recording not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+
+	startAt := curStartAt.UTC()
+	if req.StartAt != nil {
+		startAt = req.StartAt.UTC()
+	}
+	endAtArg := any(nil)
+	if curEndAt != nil {
+		endAtArg = curEndAt.UTC()
+	}
+	if req.EndAt != nil {
+		endAt := req.EndAt.UTC()
+		if !endAt.After(startAt) {
+			util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+			return
+		}
+		endAtArg = endAt
+	}
+
+	// Parse + validate the schedule per mode, reusing the exact create-time helpers so
+	// an edit can never write a schedule create would reject. Sampled clears the daily
+	// window; continuous clears cron_expr. The nullable pointers feed both the UPDATE
+	// args and the shared next-fire authority, so the two never drift.
+	var (
+		cronExprForNext *string
+		dwStartForNext  *string
+		dwEndForNext    *string
+	)
+	if mode == "continuous" {
+		dwStart := strings.TrimSpace(req.DailyWindowStart)
+		dwEnd := strings.TrimSpace(req.DailyWindowEnd)
+		ds, derr := recsched.ParseTimeOfDay(dwStart)
+		if derr != nil {
+			util.WriteError(w, http.StatusBadRequest, "daily_window_start must be HH:MM")
+			return
+		}
+		de, derr := recsched.ParseTimeOfDay(dwEnd)
+		if derr != nil {
+			util.WriteError(w, http.StatusBadRequest, "daily_window_end must be HH:MM")
+			return
+		}
+		if verr := recsched.ValidateContinuousWindowForCreate(ds, de, clipDuration); verr != nil {
+			util.WriteError(w, http.StatusBadRequest, verr.Error())
+			return
+		}
+		if err := s.checkContinuousScheduleCapacity(r.Context(), cronTimezone, ds, de, clipDuration, startAt, endAtTime(endAtArg), 1); err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		dwStartForNext, dwEndForNext = &dwStart, &dwEnd
+	} else {
+		if err := recsched.ValidateCronForCreate(cronExpr, cronTimezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.checkRecordingScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration); err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		cronExprForNext = &cronExpr
+	}
+
+	// Recompute next_fire_at with the mode-aware authority (NULL when the schedule has
+	// no upcoming fire, e.g. a window that ends before now).
+	var nextFireArg any
+	var endAtForNext *time.Time
+	if t, ok := endAtArg.(time.Time); ok {
+		endAtForNext = &t
+	}
+	nextFire, nerr := nextFireForRecording(mode, cronExprForNext, cronTimezone, dwStartForNext, dwEndForNext, startAt, endAtForNext, time.Now().UTC())
+	if nerr != nil {
+		util.WriteError(w, http.StatusBadRequest, nerr.Error())
+		return
+	}
+	if !nextFire.IsZero() {
+		nextFireArg = nextFire
+	}
+
+	ct, err := s.pool.Exec(r.Context(), `
+		UPDATE recordings
+		SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6,
+		    daily_window_start=$7, daily_window_end=$8, target_fps=$9,
+		    start_at=$10, end_at=$11, next_fire_at=$12, updated_at=now()
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID, mode, cronExprForNext, cronTimezone, clipDuration,
+		dwStartForNext, dwEndForNext, targetFPSArg, startAt, endAtArg, nextFireArg)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update recording schedule: %v", err))
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+
+	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "recording_schedule_changed", "account", principal.Email, map[string]any{
+		"recording_id":      id,
+		"mode":              mode,
+		"cron_expr":         cronExpr,
+		"clip_duration_sec": clipDuration,
+	})
+	s.writeRecordingJSON(w, r, id, principal.AccountID)
+}
+
+// recordingDeliveryRequest is the delivery-mode PATCH body.
+type recordingDeliveryRequest struct {
+	Delivery string `json:"delivery"`
+}
+
+// handleAccountRecordingDelivery switches one recording's storage-delivery mode.
+// nas_pull is rejected when the account has no nas_pull connection (there would be
+// no puller to drain the clips). Capture already stages to managed for both modes,
+// so no capture-destination change is needed. Only the owning account may edit.
+func (s *Server) handleAccountRecordingDelivery(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req recordingDeliveryRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	delivery, err := parseDeliveryMode(strings.TrimSpace(req.Delivery))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// nas_pull requires an existing NAS pull connection on the account; without one
+	// there is no puller to drain the staged clips, so the switch is rejected.
+	if delivery == deliveryNASPull {
+		var hasConnection bool
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT EXISTS(SELECT 1 FROM connections WHERE account_id=$1 AND kind='nas_pull')
+		`, principal.AccountID).Scan(&hasConnection); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check nas pull connection: %v", err))
+			return
+		}
+		if !hasConnection {
+			util.WriteError(w, http.StatusBadRequest, "connect a NAS pull client before switching a recording to NAS delivery")
+			return
+		}
+		// A recording that already delivers to an external (WebDAV) destination must
+		// not also NAS-pull: both would drain the same managed staging clips.
+		var hasExternalDelivery bool
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT EXISTS(SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2 AND delivery_storage_destination_id IS NOT NULL)
+		`, id, principal.AccountID).Scan(&hasExternalDelivery); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check recording delivery target: %v", err))
+			return
+		}
+		if hasExternalDelivery {
+			util.WriteError(w, http.StatusBadRequest, "this recording already delivers to an external destination and cannot also pull to a NAS")
+			return
+		}
+	}
+
+	ct, err := s.pool.Exec(r.Context(), `
+		UPDATE recordings SET delivery=$3, updated_at=now()
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID, string(delivery))
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update recording delivery: %v", err))
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+
+	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "recording_delivery_changed", "account", principal.Email, map[string]any{
+		"recording_id": id,
+		"delivery":     string(delivery),
+	})
+	s.writeRecordingJSON(w, r, id, principal.AccountID)
 }
 
 // recordingRetentionRequest is the tier-change PATCH body.

@@ -51,12 +51,15 @@ func TestEligibleReleaseAccountsSQLShape(t *testing.T) {
 
 // TestSnapshotManagedStorageExcludesReleased pins that the nightly billing snapshot
 // excludes BOTH purged AND released clips, so an org stops being billed for a clip
-// the instant it is released (NAS-pulled / delivered / retention-released).
+// the instant it is released (NAS-pulled / delivered / retention-released). It also
+// pins the NAS grace clause so a nas_pull clip is only billed once it is still
+// staged past the grace window (NAS down or falling behind), never within it.
 func TestSnapshotManagedStorageExcludesReleased(t *testing.T) {
 	for _, want := range []string{
 		"sd.managed",
 		"c.purged_at IS NULL",
 		"c.released_at IS NULL",
+		"(r.delivery <> 'nas_pull' OR c.created_at < now() - ($1::interval))",
 	} {
 		if !strings.Contains(snapshotManagedStorageSQL, want) {
 			t.Fatalf("managed-storage snapshot SQL missing %q", want)

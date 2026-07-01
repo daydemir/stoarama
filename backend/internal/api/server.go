@@ -250,6 +250,8 @@ func (s *Server) router() http.Handler {
 			account.Post("/exports", s.handleAccountExportCreate)
 			account.Get("/exports/progress", s.handleAccountExportProgress)
 			account.Patch("/recordings/{id}/retention", s.handleAccountRecordingRetention)
+			account.Patch("/recordings/{id}/schedule", s.handleAccountRecordingSchedule)
+			account.Patch("/recordings/{id}/delivery", s.handleAccountRecordingDelivery)
 			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
 			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)
@@ -3494,6 +3496,10 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		FreshnessSec                  *int64       `json:"freshness_sec,omitempty"`
 		RecordingHealth               string       `json:"recording_health"`
 		CaptureUnit                   string       `json:"capture_unit"`
+		// RecordingID is the acting org's latest non-canceled recording.id for this
+		// stream, or null if none. It drives the streams "Record" -> "View/Edit
+		// recording" CTA flip. Scoped to the browser session's current org.
+		RecordingID *int64 `json:"recording_id"`
 	}
 	items := make([]item, 0, limit)
 	args = append(args, limit, offset)
@@ -3666,6 +3672,26 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
+	// recording_id: the acting org's latest non-canceled recording per stream. Scoped
+	// to the browser session's current org; anonymous visitors get null everywhere.
+	if actingAccountID, ok := s.optionalActingAccountID(r); ok && len(items) > 0 {
+		streamIDs := make([]int64, 0, len(items))
+		for _, it := range items {
+			streamIDs = append(streamIDs, it.Stream.ID)
+		}
+		recIDs, err := s.actingRecordingIDsForStreams(r.Context(), actingAccountID, streamIDs)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve acting recordings: %v", err))
+			return
+		}
+		for i := range items {
+			if recID, ok := recIDs[items[i].Stream.ID]; ok {
+				id := recID
+				items[i].RecordingID = &id
+			}
+		}
+	}
+
 	if includeImageURLs && len(items) > 0 {
 		streamIDs := make([]int64, 0, len(items))
 		for _, it := range items {
@@ -6288,10 +6314,22 @@ func (s *Server) handleDashboardStreamDetail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// recording_id: the acting org's latest non-canceled recording for this stream, or
+	// null. Scoped to the browser session's current org; null for anonymous visitors.
+	var recordingID *int64
+	if actingAccountID, ok := s.optionalActingAccountID(r); ok {
+		recordingID, err = s.actingRecordingIDForStream(r.Context(), actingAccountID, id)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve acting recording: %v", err))
+			return
+		}
+	}
+
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"stream":       stream,
 		"latest_frame": lfPtr,
 		"inference":    items,
+		"recording_id": recordingID,
 		"limit":        limit,
 		"offset":       offset,
 	})

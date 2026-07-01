@@ -84,16 +84,18 @@
     }
     input { width: 100%; }
     input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
+    /* Base button = clear ghost/outline: visible border, dark text, clickable.
+       The primary fill + disabled dim come from shell.go's authoritative rules. */
     button {
       cursor: pointer;
-      background: color-mix(in srgb, var(--accent) 18%, var(--panel2));
-      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-      color: #f8fafc;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
       font-weight: 600;
       width: auto;
     }
-    button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
-    button.secondary { background: transparent; color: var(--text); font-weight: 500; }
+    button:hover { background: color-mix(in srgb, var(--panel2) 70%, transparent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+    button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
     button.small { min-height: 30px; padding: 5px 12px; font-size: 12px; }
     /* Read-only value row + list rows */
     .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -112,6 +114,11 @@
     .row-item .row-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 8px; }
     .row-item .row-name { font-family: var(--mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .sub { color: var(--muted); font-size: 12px; }
+    /* Mobile: let the Profile email wrap and keep it off the card edge. */
+    @media (max-width: 480px) {
+      .kv-row { flex-wrap: wrap; }
+      .kv-val { min-width: 0; text-align: right; padding-right: 2px; }
+    }
   </style>
 <!--SHELL_HEAD-->
 </head>
@@ -138,7 +145,7 @@
             <span id="sessionEmail" class="kv-val"></span>
             <span id="sessionRole" class="role-badge"></span>
           </div>
-          <button id="logoutBtn" class="secondary small" type="button">Log out</button>
+          <button id="logoutBtn" class="small" type="button">Log out</button>
         </div>
         <div id="sessionMeta" class="sub" style="margin-top:8px;"></div>
       </section>
@@ -147,7 +154,7 @@
         <h2>Your orgs</h2>
         <div id="orgsList" class="row-list"></div>
         <div style="margin-top:12px;">
-          <button id="newOrgBtn" class="secondary small" type="button">New org</button>
+          <button id="newOrgBtn" class="primary small" type="button">New org</button>
         </div>
         <div id="orgsStatus" class="status" style="margin-top:8px;"></div>
       </section>
@@ -159,7 +166,7 @@
       <label for="email">Email</label>
       <input id="email" type="email" placeholder="you@example.org" />
       <div style="margin-top:12px;">
-        <button id="requestLink" type="button">Send sign-in link</button>
+        <button id="requestLink" class="primary" type="button">Send sign-in link</button>
       </div>
       <div id="requestStatus" class="status" style="margin-top:8px;"></div>
     </section>
@@ -278,7 +285,7 @@
         const isCur = oid === currentId;
         const action = isCur
           ? `<span class="sub">Current</span>`
-          : `<button class="secondary small org-switch" type="button" data-org="${oid}">Switch</button>`;
+          : `<button class="small org-switch" type="button" data-org="${oid}">Switch</button>`;
         return `<div class="row-item">
           <div class="row-main">
             <span class="row-name">${escapeHTML(name)}</span>
@@ -355,7 +362,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, redirect_path: requestedRedirectPath }),
         });
-        setStatus(requestStatus, 'Sign-in link sent.', 'ok');
+        setStatus(requestStatus, 'Sign-in link sent', 'ok');
       } catch (err) {
         setStatus(requestStatus, String(err), 'err');
       }

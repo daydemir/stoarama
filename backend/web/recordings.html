@@ -92,9 +92,15 @@
     }
     textarea { min-height: 44px; resize: vertical; }
     input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
-    button { cursor: pointer; background: color-mix(in srgb, var(--accent) 18%, var(--panel2)); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); color: #f8fafc; font-weight: 600; }
-    button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
+    /* Button system (shell.go owns .primary's solid fill). Default buttons are
+       bordered/ghost: transparent fill, dark text, visible border, clearly
+       clickable. Only .primary gets the solid saturated accent fill, so exactly one
+       primary per screen stands out; secondaries never read as disabled. */
+    button { cursor: pointer; background: transparent; border: 1.5px solid var(--muted); color: var(--text); font-weight: 600; }
+    button:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
     button.secondary { background: transparent; color: var(--text); }
     button.secondary:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); }
     button.danger { background: transparent; color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
@@ -105,6 +111,24 @@
     a.btn-link.secondary:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); text-decoration: none; }
     /* Dedicated clip-management page. */
     .clip-page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    /* Per-recording detail cards (schedule + storage), shown above the clips table. */
+    .detail-card {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 14px;
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+    }
+    .detail-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .detail-card-title { font-size: 15px; font-weight: 600; color: var(--text); }
+    .detail-rows { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 13px; }
+    .detail-rows dt { color: var(--muted); }
+    .detail-rows dd { margin: 0; color: var(--text); }
+    .detail-actions { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+    .detail-actions button, .detail-actions a.btn-link { width: auto; min-width: 96px; min-height: 36px; }
+    .detail-edit { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+    .detail-edit.hidden { display: none; }
+    .detail-status { margin-top: 8px; }
     .clip-pager { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0; }
     .clip-pager button { width: auto; min-width: 0; min-height: 32px; padding: 6px 14px; }
     .clip-pager .clip-pager-label { color: var(--muted); font-size: 13px; }
@@ -153,6 +177,7 @@
     .card-meta { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; font-size: 13px; color: var(--muted); }
     .card-meta .meta-sep { color: var(--muted); user-select: none; }
     .card-meta .meta-strong { color: var(--text); }
+    .card-meta b { color: var(--text); font-weight: 600; }
     .card-meta .health-healthy { color: var(--ok); }
     .card-meta .health-degraded { color: var(--warn); }
     .card-meta .health-failing { color: var(--err); }
@@ -171,9 +196,20 @@
     .clip-table td, .clip-table th { padding: 4px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); white-space: nowrap; }
     .clip-table td.num, .clip-table th.num { text-align: right; }
     .clip-table td.clip-when { color: var(--text); }
+    /* Strikethrough/grey is reserved for purged (deleted) rows ONLY. A released
+       clip was sent to the NAS, which is a success, so its row stays normal. */
     .clip-table tr.purged { opacity: 0.45; text-decoration: line-through; }
+    /* Small status pills: neutral for saved, green for sent-to-NAS. */
+    .clip-pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; line-height: 1.5; }
+    .clip-pill.neutral { color: var(--muted); background: color-mix(in srgb, var(--muted) 16%, transparent); }
+    .clip-pill.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
+    .clip-pill.gone { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); }
     .clip-row-actions { display: flex; gap: 6px; justify-content: flex-end; }
     .clip-row-actions button { width: auto; min-width: 0; min-height: 26px; padding: 3px 9px; font-size: 12px; }
+    /* Row actions (View/Download/Send) must read as clickable next to the styled
+       Delete button: accent border + accent text, not plain dark text. */
+    .clip-row-actions button.secondary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+    .clip-row-actions button.secondary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
     .clip-xfer-cell { padding: 0 8px 6px !important; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
     .clip-bulk { margin: 12px 0 8px; }
     .clip-bulk button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
@@ -262,34 +298,87 @@
     .inline-link { width: auto; min-width: 0; min-height: 0; padding: 0; border: 0; background: none; color: var(--accent); font-weight: 500; font-size: 13px; cursor: pointer; }
     .inline-link:hover { text-decoration: underline; background: none; }
     .empty-hero-sub { color: var(--muted); font-size: 15px; line-height: 1.5; margin: 0 0 18px; }
-    /* Composer sections: a labelled block per step (A What / B When / C Clip / D
-       Storage) so the form reads as an ordered hierarchy, not a flat stack. */
-    .form-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
-    .form-section:first-of-type { margin-top: 8px; padding-top: 0; border-top: 0; }
+    /* Composer sections: each step (A What / B When / C Clip / D Storage) is its
+       own elevated white card so the four blocks read as separate cards, not a flat
+       panel with hairline dividers. */
+    .form-section {
+      margin-top: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 24px;
+      background: var(--panel);
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+    }
+    .form-section:first-of-type { margin-top: 0; }
     .form-section-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; }
     .form-section-step { font-family: var(--mono); font-size: 11px; font-weight: 500; color: var(--accent); letter-spacing: 0.06em; }
     .form-section-title { font-size: 15px; font-weight: 600; color: var(--text); }
-    /* Live clip-count + cost summary: sticky one-liner that follows the config. */
+    /* Two-column composer: step cards on the left, the live price panel floating on
+       the right (sticky). Stacks to one column on narrow screens. */
+    .composer-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 24px; align-items: start; }
+    /* The composer itself is a plain container, not an elevated panel: its four
+       step cards + the price rail are the elevated surfaces. */
+    #composer.panel { background: none; border: 0; box-shadow: none; padding: 0; }
+    .composer-cards { min-width: 0; }
+    .composer-side { position: sticky; top: 24px; }
+    /* Live price panel: an elevated white card that LEADS with the bold rate line,
+       then the clip-volume estimate as muted supporting text below. */
     .composer-summary {
-      position: sticky; bottom: 0; z-index: 2;
-      margin: 18px -18px -18px; padding: 12px 18px;
-      border-top: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 92%, #000);
-      border-bottom-left-radius: 18px; border-bottom-right-radius: 18px;
-      font-family: var(--mono); font-size: 13px; line-height: 1.5; color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      background: var(--panel);
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+      font-size: 13px; line-height: 1.5; color: var(--muted);
     }
+    .composer-summary .cs-rate { color: var(--text); font-size: 14px; line-height: 1.45; margin-bottom: 12px; }
+    .composer-summary .cs-rate b { font-weight: 600; }
     .composer-summary b { color: var(--text); font-weight: 600; }
     .composer-summary .cs-cost { color: var(--accent); }
+    .composer-summary #composerCount { font-family: var(--mono); }
+    .composer-summary #costEstimate { font-family: var(--mono); }
+    /* In the floating price rail the primary action fills the panel width. */
+    .composer-side .composer-summary { margin-bottom: 14px; }
+    .composer-side .button-row > * { width: 100%; min-width: 0; }
+    /* Read-only bundle chips: one per selected stream, chosen on the streams page.
+       The composer is a summary only; edit the set back on the streams page. */
+    .bundle-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .bundle-chip { display: inline-flex; align-items: center; max-width: 100%; padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; background: color-mix(in srgb, var(--panel2) 80%, transparent); font-size: 13px; color: var(--text); }
+    .bundle-chip .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .composer-footnote { margin: 14px 0 12px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .composer-footnote.warn { color: var(--warn); font-weight: 500; }
     .interstitial-body { color: var(--muted); line-height: 1.6; margin: 0 0 16px; }
+    /* Stack the composer to a single column when there isn't room for the price
+       rail beside the step cards. The estimate then sits below the cards. */
+    @media (max-width: 860px) {
+      .composer-body { grid-template-columns: 1fr; }
+      .composer-side { position: static; top: auto; }
+    }
     @media (max-width: 640px) {
       .grid-2 { grid-template-columns: 1fr; }
       .card-head { flex-direction: column; }
+      /* Stack the detail/bundle header so the "Back to recordings" link (last in DOM)
+         renders on its own line ABOVE the title instead of colliding beside it. */
+      .clip-page-head { flex-direction: column-reverse; align-items: flex-start; }
       /* Long storage-chooser labels can't shrink (flex 0 0 auto); stack them full
          width with wrapping text so they don't force horizontal overflow. */
       #storageChooser { flex-direction: column; }
       #storageChooser button { width: 100%; white-space: normal; }
+      /* Clips table -> stacked cards (same table-to-card approach as pricing.html).
+         An 8-cell row can't fit at 414px, so each clip becomes a card: Time is a
+         heading line, Duration/FPS/Size/Status flow as one compact meta line, and the
+         row actions sit on their own button row. */
+      .clip-table-clips, .clip-table-clips tbody, .clip-table-clips tr, .clip-table-clips td { display: block; }
+      .clip-table-clips thead { display: none; }
+      .clip-table-clips tr:not(.clip-xfer-tr) { border: 1px solid var(--border); border-radius: 12px; margin-bottom: 10px; padding: 8px 4px; }
+      .clip-table-clips td { border-bottom: none; padding: 2px 12px; white-space: normal; text-align: left; }
+      .clip-table-clips td.clip-when { font-size: 13px; font-weight: 600; padding-bottom: 4px; }
+      /* Duration/FPS/Size/Status share one compact meta line: inline cells with a
+         middot separator between them. */
+      .clip-table-clips td.num, .clip-table-clips td.clip-status-cell { display: inline-block; width: auto; color: var(--muted); }
+      .clip-table-clips td.num::after { content: " \00b7"; color: var(--muted); }
+      .clip-table-clips .clip-row-actions { justify-content: flex-start; flex-wrap: wrap; margin-top: 6px; }
+      .clip-table-clips .clip-xfer-cell { padding-left: 12px !important; padding-right: 12px !important; }
     }
   </style>
 <!--SHELL_HEAD-->
@@ -308,7 +397,7 @@
         <label for="email">Email</label>
         <input id="email" type="email" placeholder="you@example.org" autocomplete="email" />
       </div>
-      <div class="button-row"><button id="requestLink" type="button">Email me a sign-in link</button></div>
+      <div class="button-row"><button id="requestLink" class="primary" type="button">Email sign-in link</button></div>
       <div id="requestStatus" class="status"></div>
     </div>
 
@@ -353,8 +442,8 @@
 
       <!-- + New recording trigger (hidden in empty state; composer is the hero there) -->
       <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
-        <button id="newRecBtn" type="button">+ New recording</button>
-        <button id="newBundleBtn" class="secondary" type="button" style="width:auto;min-width:0;">+ New bundle</button>
+        <button id="newRecBtn" class="primary" type="button">New recording</button>
+        <button id="newBundleBtn" class="secondary" type="button" style="width:auto;min-width:0;">New bundle</button>
         <a class="btn-link secondary" href="/bundles" style="width:auto;min-width:0;align-self:center;">View bundles</a>
         <button id="recordingsCsvBtn" class="secondary" type="button" style="width:auto;min-width:0;">Download CSV</button>
       </div>
@@ -365,6 +454,11 @@
           <div><div class="eyebrow">New recording</div><h2>Configure a capture</h2></div>
           <button id="composerClose" class="secondary" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Cancel</button>
         </div>
+
+        <!-- Two-column layout: the ordered step cards on the left, the live price
+             panel + Start action floating on the right (sticky). -->
+        <div class="composer-body">
+        <div class="composer-cards">
 
         <!-- SECTION A: What to record (source + name) -->
         <div class="form-section">
@@ -377,13 +471,16 @@
           <label>Catalog stream</label>
           <div id="catalogStreamName" class="preview"></div>
           <div id="catalogStreamLoc" class="preview muted"></div>
+          <div class="preview mono" style="margin-top:6px;">Stream ID: <span id="catalogStreamIdVal"></span></div>
+          <div class="hint">Clips land in the NAS folder named for this stream ID</div>
           <img id="catalogFramePreview" class="video-preview hidden" alt="recent frame" />
         </div>
         <input type="hidden" id="recStreamID" value="" />
 
-        <!-- Bundle source block: shown only in bundle mode. Streams are selected by
-             a tag filter and/or an explicit multi-select; the resolved set + count
-             is shown live. The schedule/window/clip/fps/storage controls below are
+        <!-- Bundle source block: shown only in bundle mode. Streams are chosen on the
+             streams page and arrive via ?stream_ids=; they render here as a read-only
+             summary (no in-composer picker or editing). Edit the set back on the
+             streams page. The schedule/window/clip/fps/storage controls below are
              shared with the single-recording composer and apply uniformly to every
              member, including the user-chosen timezone. -->
         <div id="bundleSourceBlock" class="hidden">
@@ -392,23 +489,10 @@
             <input id="bundleName" type="text" placeholder="MIT study set 1" />
           </div>
           <div class="field">
-            <label for="bundleTag">Filter streams by tag (optional)</label>
-            <input id="bundleTag" type="text" placeholder="mit:study-1" />
-            <div class="hint">Every catalog stream carrying this tag is added to the bundle. You can also pick streams individually below.</div>
-          </div>
-          <div class="field">
-            <label>Select streams</label>
-            <input id="bundleStreamSearch" type="text" placeholder="Search streams by name or location" style="margin-bottom:8px;" />
-            <div id="bundleStreamPicker" style="max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px;font-size:13px;">
-              <div id="bundleStreamToolbar" style="position:sticky;top:-8px;background:var(--bg);margin:-8px -8px 8px;padding:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;z-index:1;">
-                <span id="bundleStreamCount" class="status" style="margin:0;">0 streams selected</span>
-                <span style="display:inline-flex;gap:8px;">
-                  <button type="button" id="bundleSelectAllBtn" class="secondary" style="width:auto;min-width:0;min-height:26px;padding:3px 9px;font-size:12px;">Select all shown</button>
-                  <button type="button" id="bundleClearSelBtn" class="secondary" style="width:auto;min-width:0;min-height:26px;padding:3px 9px;font-size:12px;">Clear</button>
-                </span>
-              </div>
-              <div id="bundleStreamList"></div>
-            </div>
+            <label>Streams in this bundle</label>
+            <div id="bundleStreamCount" class="hint" style="margin-bottom:8px;">0 streams selected</div>
+            <div id="bundleStreamChips" class="bundle-chips"></div>
+            <div class="hint" style="margin-top:8px;"><a href="/streams">Edit selection</a></div>
           </div>
         </div>
 
@@ -551,7 +635,8 @@
             <label for="fpsCustom">Frame rate (fps)</label>
             <input id="fpsCustom" type="number" min="1" max="60" step="1" value="10" />
           </div>
-          <div class="hint">Source keeps the stream's native frame rate with no re-encode, which is the cheapest option. 15 fps is common for computer-vision pedestrian detection, since it cuts storage and compute. Choosing a fixed rate re-encodes each clip to that rate. Custom accepts 1 to 60 fps.</div>
+          <div class="hint">Source keeps the stream's native frame rate with no re-encode, the cheapest option. A fixed rate re-encodes each clip and cuts storage, with 15 fps common for pedestrian detection.</div>
+          <div class="hint">Custom accepts 1 to 60 fps</div>
         </div>
         </div><!-- /Section C -->
 
@@ -561,14 +646,17 @@
 
         <!-- Where clips go -->
         <div class="field">
-          <!-- Connection state for the selected/connected bucket (gates Start) -->
-          <div id="bucketState" class="status" style="margin-bottom:10px;">Not connected</div>
+          <!-- Connection state for the selected/connected bucket (gates Start).
+               Idle default names the fallback (managed storage) and offers a NAS,
+               so the card is a real state, not a bare "Not connected" label. -->
+          <div id="bucketState" class="status" style="margin-bottom:6px;">Clips go to managed storage until you connect a NAS.</div>
+          <div id="bucketStateCta" class="hint" style="margin-bottom:10px;"><a href="/org-settings">Connect a NAS</a></div>
           <!-- Storage chooser: managed (operator R2) vs BYO. Shown only when the
                managed option is available per GET /billing; otherwise BYO only. -->
           <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
             <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10 per hour of footage stored per month)</button>
             <button type="button" data-storage="nas" class="hidden" id="nasStorageBtn">Record to my NAS ($0.05 per stream-hour recording; storage free while pulled; $0.10/hr-mo only for clips held past 24h if the NAS falls behind)</button>
-            <button type="button" data-storage="byo">Connect your own S3 bucket</button>
+            <button type="button" data-storage="byo" class="hidden" id="byoStorageBtn">Connect your own S3 bucket</button>
             <button type="button" data-storage="shared" class="hidden" id="sharedStorageBtn">Shared destination</button>
           </div>
           <!-- Shown when no green NAS connection exists, in place of the NAS option. -->
@@ -647,7 +735,7 @@
               </div>
             </details>
             <div class="button-row" style="margin-top:14px;">
-              <button id="cnTestBtn" type="button">Check connection</button>
+              <button id="cnTestBtn" class="primary" type="button">Check connection</button>
               <button id="cnCancelBtn" type="button" class="secondary">Cancel</button>
             </div>
             <div id="cnStatus" class="status" style="margin-top:8px;"></div>
@@ -657,10 +745,14 @@
         </div>
         </div><!-- /Section D -->
 
+        </div><!-- /.composer-cards -->
+
+        <aside class="composer-side">
         <!-- Live clip-count + cost summary: updates on every change. Shows the
              concrete clip count for both sampled and continuous, plus the reused
              cost estimate. costEstimate/costEstimateNote keep the existing math. -->
         <div id="composerSummary" class="composer-summary">
+          <div class="cs-rate"><b>$0.05 per recording-hour</b>, plus your choice of storage</div>
           <div id="composerCount"></div>
           <div id="costEstimate" class="preview" style="margin-top:4px;"></div>
           <div id="costEstimateNote" class="hint" style="margin-top:2px;"></div>
@@ -669,10 +761,12 @@
         <div id="composerFootnote" class="composer-footnote"></div>
         <div id="bundlePreflight" class="status hidden" style="margin-bottom:10px;"></div>
         <div class="button-row">
-          <button id="startBtn" type="button" disabled>Start recording</button>
-          <button id="startBundleBtn" class="hidden" type="button">Start bundle</button>
+          <button id="startBtn" class="primary" type="button" disabled>Start recording</button>
+          <button id="startBundleBtn" class="primary hidden" type="button">Start bundle</button>
         </div>
         <div id="startStatus" class="status"></div>
+        </aside>
+        </div><!-- /.composer-body -->
       </section>
     </div>
     </div>
@@ -698,6 +792,7 @@
       catalogStreamBlock: document.getElementById('catalogStreamBlock'),
       catalogStreamName: document.getElementById('catalogStreamName'),
       catalogStreamLoc: document.getElementById('catalogStreamLoc'),
+      catalogStreamIdVal: document.getElementById('catalogStreamIdVal'),
       catalogFramePreview: document.getElementById('catalogFramePreview'),
       recStreamID: document.getElementById('recStreamID'),
       urlField: document.getElementById('urlField'),
@@ -770,13 +865,8 @@
       newBundleBtn: document.getElementById('newBundleBtn'),
       bundleSourceBlock: document.getElementById('bundleSourceBlock'),
       bundleName: document.getElementById('bundleName'),
-      bundleTag: document.getElementById('bundleTag'),
       bundleStreamCount: document.getElementById('bundleStreamCount'),
-      bundleStreamPicker: document.getElementById('bundleStreamPicker'),
-      bundleStreamSearch: document.getElementById('bundleStreamSearch'),
-      bundleStreamList: document.getElementById('bundleStreamList'),
-      bundleSelectAllBtn: document.getElementById('bundleSelectAllBtn'),
-      bundleClearSelBtn: document.getElementById('bundleClearSelBtn'),
+      bundleStreamChips: document.getElementById('bundleStreamChips'),
       bundlePreflight: document.getElementById('bundlePreflight'),
     };
 
@@ -1187,6 +1277,9 @@
       const runsPerDay = estRunsPerDay();
       const clipSec = selectedClipSec();                // existing, lines 713-719
       const activeDays = estActiveDaysThisMonth();
+      // A bundle fans out into one member recording per selected stream, so every
+      // record-hour and stored-footage figure scales by the stream count.
+      const streams = estStreamCount();
       if (runsPerDay === null || clipSec <= 0) return null;
 
       // Billable record-HOURS: a recording bills each distinct UTC hour it captures a
@@ -1194,14 +1287,14 @@
       // hours per active day (sub-hourly cadences fill all 24; hourly = 24; every 4h =
       // 6; daily = 1). Monthly record-hours ~= activeDays * distinct hours/day.
       const hoursPerActiveDay = Math.min(runsPerDay, 24);
-      const recordHours = activeDays * hoursPerActiveDay;
+      const recordHours = activeDays * hoursPerActiveDay * streams;
       const recordHourCents = recordHours * hourRate;
 
       // Managed storage as stream-hour-months: the period average of stored
       // stream-hours. A clip of clipSec contributes clipSec/3600 stream-hours while
       // kept. Stored stream-hours per active day ~= runsPerDay * clipSec/3600; the
       // period average of stored footage ~= half the month's accumulated total.
-      const streamHrsPerDay = runsPerDay * (clipSec / 3600);
+      const streamHrsPerDay = runsPerDay * (clipSec / 3600) * streams;
       const monthTotalStreamHrs = streamHrsPerDay * activeDays;
       const managed = state.storageChoice === 'managed';
       const nas = state.storageChoice === 'nas';
@@ -1212,10 +1305,11 @@
       const effShmRate = yearlyPrepaid ? 5 : shmRate;
       const avgStreamHrMo = managed ? (monthTotalStreamHrs / 2) : 0;
       const storageCents = Math.round(avgStreamHrMo * effShmRate);
-      // NAS is priced per recording-hour: $0.01/recording-hour transfer adder on
-      // top of the $0.05/recording-hour rate. No per-month storage line.
-      const nasTransferRate = 1;
-      const nasTransferCents = nas ? recordHours * nasTransferRate : 0;
+      // NAS delivery bills only the $0.05/recording-hour rate; storage on the NAS is
+      // free. Clips held in managed staging past 24h (NAS behind) bill at $0.10/hr-mo,
+      // which is not forecastable here, so there is no NAS line in the estimate.
+      const nasTransferRate = 0;
+      const nasTransferCents = 0;
 
       return {
         activeDays, runsPerDay, clipSec, hourRate, shmRate: effShmRate, managed, nas, yearlyPrepaid,
@@ -1267,12 +1361,20 @@
       return label;
     }
 
+    // Number of streams the estimate covers: N selected streams in bundle mode,
+    // 1 for a single-stream recording. Bundle clip counts, record-hours, and dollar
+    // figures all scale by this because a bundle fans out into one member per stream.
+    function estStreamCount() {
+      return state.composerMode === 'bundle' ? Math.max(1, state.bundleSelected.size) : 1;
+    }
+
     // Update the persistent clip-COUNT line for both modes. Reads the concrete
     // clips/day and multiplies by ~30 for the monthly figure (matching the cost
     // model's rolling 30-day window). Custom cadences show a count-after-save note.
     function renderComposerCount() {
       const noun = state.composerScheduleMode === 'continuous' ? 'segment' : 'clip';
       const clipSec = selectedClipSec();
+      const streams = estStreamCount();
       const perDay = estClipsPerDay();
       if (clipSec <= 0 || clipSec < 5 || clipSec > 900) {
         els.composerCount.innerHTML = '<span class="muted">Set a valid clip length to estimate the clip count.</span>';
@@ -1285,11 +1387,12 @@
         return;
       }
       const activeDays = estActiveDaysThisMonth();
-      const perMonth = perDay * activeDays;
+      const perDayTotal = perDay * streams;
+      const perMonth = perDayTotal * activeDays;
       const win = countWindowPhrase();
       els.composerCount.innerHTML =
-        `<b>${win}, ${clipSec}s ${noun}s</b> <span class="muted">= about</span> <b>${perDay.toLocaleString()} ${noun}${perDay === 1 ? '' : 's'}/day</b>`
-        + `<span class="muted"> &middot; ~${perMonth.toLocaleString()} ${noun}${perMonth === 1 ? '' : 's'}/mo</span>`;
+        `${win}, ${clipSec}s ${noun}s <span class="muted">=</span> <b>${perDayTotal.toLocaleString()}</b> ${noun}${perDayTotal === 1 ? '' : 's'}/day`
+        + `<span class="muted">, </span><b>${perMonth.toLocaleString()}</b> ${noun}${perMonth === 1 ? '' : 's'}/mo`;
     }
 
     function renderCostEstimate() {
@@ -1309,20 +1412,17 @@
       }
       const usd = (c) => usdCents(c);
       const parts = [
-        `<span class="muted">~</span><b class="cs-cost">${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
+        `<b class="cs-cost">${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
         `<span class="muted"> &middot; ${m.recordHours} hour${m.recordHours === 1 ? '' : 's'} of recording × $${(m.hourRate / 100).toFixed(2)} = ${usd(m.recordHourCents)}</span>`,
       ];
       if (m.managed && m.avgStreamHrMo > 0) {
-        parts.push(`<span class="muted"> + ~${m.avgStreamHrMo.toFixed(3)} hr of footage stored/mo × $${(m.shmRate / 100).toFixed(2)} = ${usdStorage(m.avgStreamHrMo, m.shmRate, m.storageCents)}</span>`);
-      }
-      if (m.nas) {
-        parts.push(`<span class="muted"> + ${m.recordHours} hour${m.recordHours === 1 ? '' : 's'} × $${(m.nasTransferRate / 100).toFixed(2)} NAS transfer = ${usdStorage(m.recordHours, m.nasTransferRate, m.nasTransferCents)}</span>`);
+        parts.push(`<span class="muted"> + ${m.avgStreamHrMo.toFixed(3)} hr of footage stored/mo × $${(m.shmRate / 100).toFixed(2)} = ${usdStorage(m.avgStreamHrMo, m.shmRate, m.storageCents)}</span>`);
       }
       els.costEstimate.innerHTML = parts.join('');
       if (m.nas) {
-        els.costEstimateNote.textContent = 'Estimate only. NAS is $0.05 per hour of recording plus $0.01 per hour of recording for transfer, about $0.06 per recording-hour. The $0.01 covers managing the transfer and holding each clip about 60 seconds. If your NAS goes down while recording, unsent clips are kept safely in managed storage and bill at $0.10 per hour of footage per month until your NAS catches up.';
+        els.costEstimateNote.textContent = 'Estimate only. NAS is $0.05 per hour of recording, and storage on your NAS is free. If your NAS falls behind, clips left in managed storage over 24h bill at $0.10 per hour of footage per month until it catches up.';
       } else if (m.managed && m.yearlyPrepaid) {
-        els.costEstimateNote.textContent = `Estimate only. Yearly prepaid: storage is $0.05 per hour of footage kept for a month, prepaid 12 months up front. This month’s stored footage is charged to your card now; new footage is prepaid monthly.`;
+        els.costEstimateNote.textContent = `Estimate only. Yearly prepaid: storage is $0.05 per hour of footage kept for a month, prepaid 12 months up front. This month's stored footage is charged to your card now; new footage is prepaid monthly.`;
       } else {
         els.costEstimateNote.textContent = m.managed
           ? `Estimate only. Storage is $${(m.shmRate / 100).toFixed(2)} per hour of footage kept for a month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that.`
@@ -1432,13 +1532,16 @@
     function setBucketState(s, text) {
       state.bucketState = s;
       const map = {
-        idle: { msg: 'Not connected', kind: '' },
+        idle: { msg: 'Clips go to managed storage until you connect a NAS.', kind: '' },
         checking: { msg: 'Checking...', kind: '' },
         connected: { msg: 'Connected', kind: 'ok' },
         error: { msg: 'Not connected', kind: 'err' },
       };
       const m = map[s] || map.idle;
       setStatus(els.bucketState, text || m.msg, m.kind);
+      // The "Connect a NAS" action belongs only to the empty/idle state.
+      const cta = document.getElementById('bucketStateCta');
+      if (cta) cta.classList.toggle('hidden', s !== 'idle');
       refreshStartEnabled();
     }
 
@@ -2087,6 +2190,10 @@
         const tz = String(rec.cron_timezone || 'UTC');
         return `Daily at ${t} ${tz}`;
       }
+      const everyMin = /^\*\/(\d+) \* \* \* \*$/.exec(expr);
+      if (everyMin) return `Every ${Number(everyMin[1])} min`;
+      const everyHour = /^0 \*\/(\d+) \* \* \*$/.exec(expr);
+      if (everyHour) return `Every ${Number(everyHour[1])} hours`;
       return `Cron ${expr}`;
     }
 
@@ -2139,10 +2246,12 @@
       const last = relativeTime(rec.last_clip_at);
       const health = String(rec.health || 'idle');
       const metaParts = [];
-      metaParts.push(`<span class="meta-strong">${escapeHTML(scheduleLabel(rec))}</span>`);
+      const rawCron = String(rec.cron_expr || '').trim().replace(/\s+/g, ' ');
+      const cronTitle = rawCron ? ` title="${escapeHTML(rawCron)}"` : '';
+      metaParts.push(`<span class="meta-strong"${cronTitle}>${escapeHTML(scheduleLabel(rec))}</span>`);
       metaParts.push(`<span>${clip}s clips</span>`);
       const tfps = Number(rec.target_fps || 0);
-      metaParts.push(`<span>${tfps > 0 ? `${tfps} fps` : 'Source fps'}</span>`);
+      if (tfps > 0) metaParts.push(`<span>${tfps} fps</span>`);
       if (last) {
         let word = '';
         if (status === 'active' && health !== 'idle') word = ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>`;
@@ -2160,12 +2269,12 @@
       const isManaged = rec.storage_managed === true && !isNasDelivery;
       const tier = String(rec.storage_retention_tier || 'monthly');
       if (isNasDelivery) {
-        metaParts.push(`<span>${escapeHTML('Storage: your NAS. Free while pulled; $0.10/hr-mo only for clips held past 24h if the NAS falls behind.')}</span>`);
+        metaParts.push(`<span>Storage: your NAS. <b>Free</b> while pulled. Clips held past 24h if the NAS falls behind bill at <b>$0.10</b> per hour of footage per month.</span>`);
       } else if (isManaged) {
         const tierLabel = tier === 'yearly_prepaid'
-          ? 'Storage: yearly prepaid ($0.05/hr-mo)'
-          : 'Storage: monthly metered ($0.10/hr-mo)';
-        metaParts.push(`<span data-tierlabel="${id}">${escapeHTML(tierLabel)}</span>`);
+          ? 'Storage: yearly prepaid (<b>$0.05</b> per hour of footage per month)'
+          : 'Storage: monthly metered (<b>$0.10</b> per hour of footage per month)';
+        metaParts.push(`<span data-tierlabel="${id}">${tierLabel}</span>`);
       }
 
       let actions = '';
@@ -2475,18 +2584,21 @@
       const cid = Number(c.id);
       const purged = c.purged === true;
       const released = c.released === true;
-      // Three-state status: a purged clip is deleted, a released clip was sent to the
-      // NAS (row kept, off the org's books), otherwise it is saved. Released and purged
-      // rows both suppress all action buttons (nothing to view/download/copy/delete).
+      // Three-state status shown as a pill: deleted (grey, strikethrough row), sent to
+      // NAS (green success, normal row), or saved (neutral). Released and purged rows
+      // both suppress all action buttons (nothing to view/download/copy/delete), and
+      // the status shows ONCE in the Status column, never in the actions cell.
       const inactive = purged || released;
-      const statusText = purged ? 'deleted' : (released ? 'Sent to NAS' : 'saved');
+      const statusPill = purged
+        ? `<span class="clip-pill gone">deleted</span>`
+        : (released ? `<span class="clip-pill ok">Sent to NAS</span>` : `<span class="clip-pill neutral">saved</span>`);
       const sourceDestId = Number(c.storage_destination_id || 0);
       const targets = (state.destinations || []).filter((d) => Number(d.id) !== sourceDestId);
       const transferBtn = (!inactive && targets.length > 0)
         ? `<button type="button" class="secondary" data-cliptransfer="${clipRecId}:${cid}:${sourceDestId}">Send to my S3</button>`
         : '';
       const actions = inactive
-        ? `<span>${escapeHTML(statusText)}</span>`
+        ? ''
         : `<div class="clip-row-actions">`
           + `<button type="button" class="secondary" data-clipview="${clipRecId}:${cid}">View</button>`
           + `<button type="button" class="secondary" data-clipdownload="${clipRecId}:${cid}">Download</button>`
@@ -2498,14 +2610,14 @@
         ? `<td class="clip-when">${escapeHTML(String(c.recording_name || ('#' + clipRecId)))}</td>` : '';
       const colspan = showSource ? 7 : 6;
       return `
-        <tr class="${inactive ? 'purged' : ''}" data-cliprow="${cid}">
+        <tr class="${purged ? 'purged' : ''}" data-cliprow="${cid}">
           ${sourceCell}
           <td class="clip-when">${escapeHTML(clipClockRange(c.clip_start_at, c.clip_end_at))}</td>
           <td class="num">${escapeHTML(formatDuration(c.duration_ms))}</td>
           <td class="num">${fps}</td>
           <td class="num">${escapeHTML(formatBytes(c.size_bytes))}</td>
-          <td>${escapeHTML(statusText)}</td>
-          <td>${actions}</td>
+          <td class="clip-status-cell">${statusPill}</td>
+          <td class="clip-actions-cell">${actions}</td>
         </tr>
         <tr class="clip-xfer-tr hidden" data-clipxfer="${cid}"><td class="clip-xfer-cell" colspan="${colspan}"></td></tr>`;
     }
@@ -2514,7 +2626,7 @@
     // a leading Source column (used by the bundle clip view).
     function clipTableHTML(rowsHTML, showSource) {
       const sourceTh = showSource ? `<th>Source</th>` : '';
-      return `<table class="clip-table"><thead><tr>${sourceTh}`
+      return `<table class="clip-table clip-table-clips"><thead><tr>${sourceTh}`
         + `<th>Time</th><th class="num">Duration</th><th class="num">FPS</th><th class="num">Size</th><th>Status</th><th></th>`
         + `</tr></thead><tbody>${rowsHTML}</tbody></table>`;
     }
@@ -2553,7 +2665,7 @@
     // ---- Dedicated clip-management page (/recordings/{id}) ----
 
     const CLIP_PAGE_SIZE = 100;
-    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false };
+    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null };
 
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
     // switch the view into the dedicated clip page.
@@ -2569,33 +2681,370 @@
     async function loadClipPage(page) {
       const recId = clipPageState.recId;
       const root = els.clipPage;
+      const firstLoad = !clipPageState.rec;
       clipPageState.page = Math.max(0, Number(page) || 0);
       clipPageState.loading = true;
-      if (!clipPageState.recName) {
+      // Load the full recording once (schedule + storage + stream id). It drives the
+      // detail cards and the pause/resume/delete actions; the clips list refetches per
+      // page but the recording does not.
+      if (firstLoad) {
+        root.innerHTML = `<div class="clip-summary">Loading recording...</div>`;
         try {
-          const rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}`);
-          clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
-        } catch (_) {
-          clipPageState.recName = `Recording #${recId}`;
+          clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}`);
+        } catch (err) {
+          root.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+          clipPageState.loading = false;
+          return;
         }
+        const rec = clipPageState.rec;
+        clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
+        renderClipPage();
       }
-      root.innerHTML = `<div class="clip-summary">Loading clips...</div>`;
+      const body = root.querySelector('#clipListBody');
+      if (body) body.innerHTML = `<div class="clip-summary">Loading clips...</div>`;
       let payload;
       try {
         const offset = clipPageState.page * CLIP_PAGE_SIZE;
         payload = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips?limit=${CLIP_PAGE_SIZE}&offset=${offset}`);
       } catch (err) {
-        root.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+        if (body) body.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
         clipPageState.loading = false;
         return;
       }
       clipPageState.total = Number(payload.total || 0);
-      renderClipPage(payload);
+      renderClipList(payload);
       clipPageState.loading = false;
     }
 
-    function renderClipPage(payload) {
+    // Reload the recording JSON after a schedule/storage/billing edit, then re-render
+    // the whole detail view (cards + current clip page). Keeps one source of truth.
+    async function reloadClipPageRecording() {
+      try {
+        clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}`);
+      } catch (err) {
+        window.alert(String(err.message || err));
+        return;
+      }
+      clipPageState.recName = String((clipPageState.rec.stream_name || clipPageState.rec.name) || `Recording #${clipPageState.recId}`);
+      renderClipPage();
+      await loadClipPage(clipPageState.page);
+    }
+
+    function scheduleLabelFull(rec) {
+      if (String(rec.mode || 'sampled') === 'continuous') {
+        const s = String(rec.daily_window_start || '').trim();
+        const e = String(rec.daily_window_end || '').trim();
+        const tz = String(rec.cron_timezone || 'UTC');
+        return s && e ? `Continuous, ${s} to ${e} ${escapeHTML(tz)}` : 'Continuous';
+      }
+      return `Sampled, ${scheduleLabel(rec)}`;
+    }
+
+    function fmtInstant(v) {
+      if (!v) return null;
+      const d = new Date(v);
+      return Number.isFinite(d.getTime()) ? d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : null;
+    }
+
+    // The schedule card: current mode, cron/window, clip length, fps, capture window,
+    // next fire. Edit reveals the shared composer schedule controls, populated from
+    // the recording and submitted via PATCH /recordings/{id}/schedule.
+    function scheduleCardHTML(rec) {
+      const tfps = Number(rec.target_fps || 0);
+      const rows = [
+        ['Schedule', escapeHTML(scheduleLabelFull(rec))],
+        ['Clip length', `${Number(rec.clip_duration_sec || 0)}s`],
+        ['Frame rate', tfps > 0 ? `${tfps} fps` : 'Source'],
+      ];
+      const startTxt = fmtInstant(rec.start_at);
+      const endTxt = fmtInstant(rec.end_at);
+      rows.push(['Capture window', `${startTxt || 'Now'} to ${endTxt || 'open-ended'}`]);
+      const nextTxt = fmtInstant(rec.next_fire_at);
+      if (nextTxt) rows.push(['Next fire', nextTxt]);
+      const editable = String(rec.status || '') !== 'canceled' && !isCompleted(rec);
+      return `
+        <div class="detail-card">
+          <div class="detail-card-head">
+            <span class="detail-card-title">Schedule</span>
+            ${editable ? `<button type="button" class="secondary" data-schededit style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Edit schedule</button>` : ''}
+          </div>
+          <dl class="detail-rows">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+          <div id="schedEditForm" class="detail-edit hidden"></div>
+        </div>`;
+    }
+
+    // The storage card: stream id (== the NAS folder), current delivery, retention
+    // tier. Offers Switch storage (managed<->NAS, gated by nasAvailable) and Switch
+    // billing type (monthly<->yearly, managed only) via the existing endpoints.
+    function storageCardHTML(rec) {
+      const isNas = rec.delivery === 'nas_pull';
+      const isManaged = rec.storage_managed === true && !isNas;
+      const tier = String(rec.storage_retention_tier || 'monthly');
+      const streamId = Number(rec.stream_id || 0);
+      const rows = [];
+      if (streamId > 0) rows.push(['Stream ID', `<span class="mono">${streamId}</span>`]);
+      if (isNas) {
+        rows.push(['Storage', 'Your NAS']);
+        rows.push(['NAS folder', `<span class="mono">${streamId > 0 ? streamId : '(stream id)'}</span>`]);
+      } else if (isManaged) {
+        rows.push(['Storage', 'Stoarama-managed']);
+        rows.push(['Billing type', tier === 'yearly_prepaid' ? 'Yearly, <b>$0.05</b> per hour of footage per month' : 'Monthly, <b>$0.10</b> per hour of footage per month']);
+      } else {
+        rows.push(['Storage', 'Your own S3']);
+      }
+
+      const actions = [];
+      // Switch storage managed<->NAS. Only offer nas_pull when a green NAS connection
+      // exists (mirror the composer gate); the server rejects nas_pull without one.
+      if (isNas) {
+        actions.push(`<button type="button" class="secondary" data-delivery="managed">Switch to managed</button>`);
+      } else if (isManaged && nasAvailable()) {
+        actions.push(`<button type="button" class="secondary" data-delivery="nas_pull">Switch to NAS</button>`);
+      }
+      // Switch billing type monthly<->yearly (managed only), reusing switchRetention.
+      if (isManaged) {
+        const switchTo = tier === 'yearly_prepaid' ? 'monthly' : 'yearly_prepaid';
+        const label = tier === 'yearly_prepaid' ? 'Switch to monthly' : 'Switch to yearly';
+        actions.push(`<button type="button" class="secondary" data-retention="${Number(rec.id)}" data-tier="${switchTo}">${label}</button>`);
+      }
+      const nasHint = (isManaged && !nasAvailable())
+        ? `<div class="hint" style="margin-top:10px;">Set up a NAS connection in <a href="/org-settings">Org settings</a> to record to your NAS.</div>`
+        : '';
+      return `
+        <div class="detail-card">
+          <div class="detail-card-head"><span class="detail-card-title">Storage</span></div>
+          <dl class="detail-rows">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+          ${actions.length ? `<div class="detail-actions">${actions.join('')}</div>` : ''}
+          ${nasHint}
+          <div id="deliveryStatus" class="status detail-status"></div>
+        </div>`;
+    }
+
+    // Recording-level actions card: pause/resume + delete, mirroring the list card.
+    function recActionsCardHTML(rec) {
+      const status = String(rec.status || '');
+      const id = Number(rec.id);
+      let actions = '';
+      if (status === 'active') {
+        actions = `<button type="button" class="primary" data-recpause="${id}">Pause</button>`;
+      } else if (status === 'paused') {
+        actions = `<button type="button" class="primary" data-recresume="${id}">Resume</button>`;
+      }
+      actions += `<button type="button" class="danger" data-recdelete="${id}">Delete recording</button>`;
+      const err = (status === 'active' && String(rec.health || '') === 'failing' && rec.last_error_text)
+        ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
+      return `<div class="detail-actions" style="margin:0 0 14px;">${actions}</div>${err}`;
+    }
+
+    // Render the whole detail view: header, schedule card, storage card, recording
+    // actions, and an empty #clipListBody the clip pages render into.
+    function renderClipPage() {
       const root = els.clipPage;
+      const rec = clipPageState.rec;
+      const st = statusLine(rec);
+      const header = `
+        <div class="clip-page-head">
+          <div>
+            <div class="eyebrow">Recording</div>
+            <h2 style="margin:2px 0 4px;">${escapeHTML(clipPageState.recName)}</h2>
+            <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
+          </div>
+          <a class="btn-link secondary" href="/recordings">Back to recordings</a>
+        </div>`;
+      const blocked = rec.needs_card === true
+        ? `<div class="card-blocked" style="margin:0 0 14px;"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
+          + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`
+        : '';
+      root.innerHTML = header + blocked + recActionsCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
+        + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
+      wireDetailActions(root);
+    }
+
+    function wireDetailActions(root) {
+      root.querySelectorAll('button[data-recpause]').forEach((b) =>
+        b.addEventListener('click', () => mutateRecordingDetail(b.getAttribute('data-recpause'), 'pause')));
+      root.querySelectorAll('button[data-recresume]').forEach((b) =>
+        b.addEventListener('click', () => mutateRecordingDetail(b.getAttribute('data-recresume'), 'resume')));
+      root.querySelectorAll('button[data-recdelete]').forEach((b) =>
+        b.addEventListener('click', () => deleteRecordingDetail(b.getAttribute('data-recdelete'))));
+      root.querySelectorAll('button[data-retention]').forEach((b) =>
+        b.addEventListener('click', () => switchRetentionDetail(b)));
+      root.querySelectorAll('button[data-delivery]').forEach((b) =>
+        b.addEventListener('click', () => switchDelivery(b.getAttribute('data-delivery'))));
+      const editBtn = root.querySelector('button[data-schededit]');
+      if (editBtn) editBtn.addEventListener('click', () => openScheduleEdit());
+    }
+
+    async function mutateRecordingDetail(id, action) {
+      try {
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(String(id))}/${action}`, { method: 'POST' });
+        await reloadClipPageRecording();
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    async function deleteRecordingDetail(id) {
+      if (!window.confirm('Delete this recording? This stops capture.')) return;
+      try {
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(String(id))}`, { method: 'DELETE' });
+        window.location.assign('/recordings');
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
+    }
+
+    // switchRetentionDetail reuses the same confirm + PATCH /retention flow as the
+    // list card, then reloads the detail recording instead of the list.
+    async function switchRetentionDetail(btn) {
+      const id = String(btn.getAttribute('data-retention') || '').trim();
+      const tier = String(btn.getAttribute('data-tier') || '').trim();
+      const msg = tier === 'yearly_prepaid'
+        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage per month, charged to your card now. New footage is prepaid monthly.'
+        : 'Switch to monthly metered? Future footage bills at $0.10 per hour of footage per month. Any prepaid credit already granted runs until it expires and is not refunded.';
+      if (!window.confirm(msg)) return;
+      btn.disabled = true;
+      try {
+        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}/retention`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tier }),
+        });
+        if (out && out.note) window.alert(String(out.note));
+        await reloadClipPageRecording();
+      } catch (err) {
+        window.alert(String(err.message || err));
+        btn.disabled = false;
+      }
+    }
+
+    // switchDelivery flips managed<->nas_pull via PATCH /recordings/{id}/delivery.
+    // The server rejects nas_pull without a NAS connection; the button is only shown
+    // when nasAvailable(), so this path is already gated.
+    async function switchDelivery(mode) {
+      const delivery = mode === 'nas_pull' ? 'nas_pull' : 'managed';
+      if (delivery === 'nas_pull' && !window.confirm('Switch this recording to your NAS? Clips already stored in Stoarama will be pulled to your NAS and removed from your Stoarama view. The footage stays on your NAS.')) return;
+      const statusEl = els.clipPage.querySelector('#deliveryStatus');
+      setStatus(statusEl, 'Saving...', '');
+      try {
+        clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}/delivery`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ delivery }),
+        });
+        renderClipPage();
+        await loadClipPage(clipPageState.page);
+      } catch (err) {
+        setStatus(statusEl, String(err.message || err), 'err');
+      }
+    }
+
+    // Build the schedule-edit form from the composer's own controls (cloned semantics,
+    // kept lean). It reuses the same field names the create composer sends and PATCHes
+    // /recordings/{id}/schedule. Mode toggles cron vs daily window; both share clip
+    // length, fps, and the optional capture window.
+    function openScheduleEdit() {
+      const rec = clipPageState.rec;
+      const form = els.clipPage.querySelector('#schedEditForm');
+      const editBtn = els.clipPage.querySelector('button[data-schededit]');
+      if (!form) return;
+      if (!form.classList.contains('hidden')) { form.classList.add('hidden'); form.innerHTML = ''; if (editBtn) editBtn.textContent = 'Edit schedule'; return; }
+      if (editBtn) editBtn.textContent = 'Close';
+      const mode = String(rec.mode || 'sampled') === 'continuous' ? 'continuous' : 'sampled';
+      const tz = String(rec.cron_timezone || browserTimezone());
+      const tzOpts = timezoneOptions().map((z) => `<option value="${escapeHTML(z)}"${z === tz ? ' selected' : ''}>${escapeHTML(z)}</option>`).join('');
+      const cron = escapeHTML(String(rec.cron_expr || ''));
+      const winStart = String(rec.daily_window_start || '09:00').slice(0, 5);
+      const winEnd = String(rec.daily_window_end || '21:00').slice(0, 5);
+      const clip = Number(rec.clip_duration_sec || 60);
+      const tfps = Number(rec.target_fps || 0);
+      const startVal = rec.start_at ? toLocalInputValue(new Date(rec.start_at)) : '';
+      const endVal = rec.end_at ? toLocalInputValue(new Date(rec.end_at)) : '';
+      form.innerHTML = `
+        <div class="field">
+          <label>Capture mode</label>
+          <div class="seg" data-editmode>
+            <button type="button" data-emode="sampled"${mode === 'sampled' ? ' class="on"' : ''}>Sample on a schedule</button>
+            <button type="button" data-emode="continuous"${mode === 'continuous' ? ' class="on"' : ''}>Record continuously</button>
+          </div>
+        </div>
+        <div class="field" data-editcron${mode === 'continuous' ? ' style="display:none;"' : ''}>
+          <label for="edCron">Cron (5 fields)</label>
+          <input id="edCron" type="text" value="${cron}" placeholder="0 * * * *" />
+        </div>
+        <div class="field" data-editwindow${mode === 'sampled' ? ' style="display:none;"' : ''}>
+          <label>Daily window</label>
+          <div class="grid-2">
+            <div><label for="edWinStart">Start</label><input id="edWinStart" type="time" value="${winStart}" /></div>
+            <div><label for="edWinEnd">End</label><input id="edWinEnd" type="time" value="${winEnd}" /></div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="edTz">Timezone</label>
+          <select id="edTz">${tzOpts}</select>
+        </div>
+        <div class="grid-2">
+          <div class="field"><label for="edClip">Clip length (seconds)</label><input id="edClip" type="number" min="5" max="900" value="${clip}" /></div>
+          <div class="field"><label for="edFps">Frame rate (fps, 0 = source)</label><input id="edFps" type="number" min="0" max="60" step="1" value="${tfps}" /></div>
+        </div>
+        <div class="grid-2">
+          <div class="field"><label for="edStart">Overall start (optional)</label><input id="edStart" type="datetime-local" value="${startVal}" /></div>
+          <div class="field"><label for="edEnd">Overall stop (optional)</label><input id="edEnd" type="datetime-local" value="${endVal}" /></div>
+        </div>
+        <div class="button-row">
+          <button type="button" class="primary" data-schedsave>Save schedule</button>
+          <button type="button" class="secondary" data-schedcancel style="width:auto;min-width:0;">Cancel</button>
+        </div>
+        <div id="schedEditStatus" class="status detail-status"></div>`;
+      form.classList.remove('hidden');
+      form.querySelectorAll('button[data-emode]').forEach((b) =>
+        b.addEventListener('click', () => {
+          const m = b.getAttribute('data-emode');
+          form.querySelectorAll('button[data-emode]').forEach((x) => x.classList.toggle('on', x === b));
+          form.querySelector('[data-editcron]').style.display = m === 'continuous' ? 'none' : '';
+          form.querySelector('[data-editwindow]').style.display = m === 'continuous' ? '' : 'none';
+        }));
+      form.querySelector('button[data-schedsave]').addEventListener('click', () => saveScheduleEdit());
+      form.querySelector('button[data-schedcancel]').addEventListener('click', () => openScheduleEdit());
+    }
+
+    async function saveScheduleEdit() {
+      const form = els.clipPage.querySelector('#schedEditForm');
+      const statusEl = form.querySelector('#schedEditStatus');
+      const mode = form.querySelector('button[data-emode].on').getAttribute('data-emode');
+      const tz = String(form.querySelector('#edTz').value || browserTimezone());
+      const clip = Math.trunc(Number(form.querySelector('#edClip').value || 0));
+      const fps = Math.trunc(Number(form.querySelector('#edFps').value || 0));
+      const startRaw = String(form.querySelector('#edStart').value || '').trim();
+      const endRaw = String(form.querySelector('#edEnd').value || '').trim();
+      const body = { mode, cron_timezone: tz, clip_duration_sec: clip };
+      if (mode === 'continuous') {
+        body.daily_window_start = String(form.querySelector('#edWinStart').value || '').trim();
+        body.daily_window_end = String(form.querySelector('#edWinEnd').value || '').trim();
+      } else {
+        body.cron_expr = String(form.querySelector('#edCron').value || '').trim().replace(/\s+/g, ' ');
+      }
+      if (fps > 0) body.target_fps = fps;
+      body.start_at = startRaw ? new Date(startRaw).toISOString() : null;
+      body.end_at = endRaw ? new Date(endRaw).toISOString() : null;
+      const saveBtn = form.querySelector('button[data-schedsave]');
+      saveBtn.disabled = true;
+      setStatus(statusEl, 'Saving...', '');
+      try {
+        clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}/schedule`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        renderClipPage();
+        await loadClipPage(clipPageState.page);
+      } catch (err) {
+        setStatus(statusEl, String(err.message || err), 'err');
+        saveBtn.disabled = false;
+      }
+    }
+
+    function renderClipList(payload) {
+      const root = els.clipPage;
+      const body = root.querySelector('#clipListBody');
+      if (!body) return;
       const recId = clipPageState.recId;
       const items = Array.isArray(payload.items) ? payload.items : [];
       const total = clipPageState.total;
@@ -2604,27 +3053,19 @@
       const first = total === 0 ? 0 : page * CLIP_PAGE_SIZE + 1;
       const last = page * CLIP_PAGE_SIZE + items.length;
 
-      const header = `
-        <div class="clip-page-head">
-          <div>
-            <div class="eyebrow">Clips</div>
-            <h2 style="margin:2px 0 4px;">${escapeHTML(clipPageState.recName)}</h2>
-            <div class="clip-summary" style="margin:0;"><b>${total}</b> clip${total === 1 ? '' : 's'} total${total > 0 ? ` &middot; showing ${first}-${last}` : ''}</div>
-          </div>
-          <a class="btn-link secondary" href="/recordings">Back to recordings</a>
-        </div>`;
+      const summary = `<div class="clip-summary" style="margin:0 0 10px;"><b>${total}</b> clip${total === 1 ? '' : 's'} total${total > 0 ? ` &middot; showing ${first}-${last}` : ''}</div>`;
 
       if (items.length === 0) {
-        root.innerHTML = header + `<div class="clip-summary">No clips on this page.</div>`;
-        wireClipPageNav(root);
+        body.innerHTML = summary + `<div class="clip-summary">No clips yet.</div>`;
+        wireClipPageNav(body);
         return;
       }
 
       const liveCount = items.filter(clipIsLive).length;
       const pageActions = `
         <div class="clip-page-actions">
-          ${liveCount > 0 ? `<button type="button" class="secondary" data-clipzip="${recId}">Download all (this page) as ZIP</button>` : ''}
-          <button type="button" class="secondary" data-clipscsv="${recId}">Download CSV (all clips)</button>
+          ${liveCount > 0 ? `<button type="button" class="secondary" data-clipzip="${recId}">Download ZIP</button>` : ''}
+          <button type="button" class="secondary" data-clipscsv="${recId}">Download CSV</button>
           ${liveCount > 0 ? `<button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button>` : ''}
           <span class="clip-pager-label" data-zipstatus></span>
         </div>`;
@@ -2638,11 +3079,11 @@
       const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
       const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
 
-      root.innerHTML = header + pageActions + exportCtl + clipTableHTML(rows, false) + note + clipPagerHTML(page, pageCount);
-      wireClipActions(root);
-      wireBulkExport(root);
-      wireClipPageNav(root);
-      void reloadTransfers(root, recId);
+      body.innerHTML = summary + pageActions + exportCtl + clipTableHTML(rows, false) + note + clipPagerHTML(page, pageCount);
+      wireClipActions(body);
+      wireBulkExport(body);
+      wireClipPageNav(body);
+      void reloadTransfers(body, recId);
     }
 
     function clipPagerHTML(page, pageCount) {
@@ -2959,11 +3400,11 @@
       }
     }
 
-    // Reload the clip view after a mutation. The dedicated clip page (panel ===
-    // els.clipPage) re-renders its current page; the inline card panel reloads its
-    // detail.
+    // Reload the clip view after a mutation. The dedicated clip page (the panel is
+    // els.clipPage or its inner #clipListBody) re-renders its current page; the inline
+    // card panel reloads its detail.
     async function reloadClipPanel(panel, recId) {
-      if (panel === els.clipPage) { await loadClipPage(clipPageState.page); return; }
+      if (panel === els.clipPage || els.clipPage.contains(panel)) { await loadClipPage(clipPageState.page); return; }
       await reloadClipDetail(panel, recId);
     }
 
@@ -3067,6 +3508,16 @@
       refreshStartEnabled();
     }
 
+    // Landing with a record intent (?stream_id / ?stream_ids): make the composer the
+    // primary view by hiding the existing-recordings list chrome, so the user does
+    // not have to scroll past the list to reach the composer. closeComposer restores
+    // the list.
+    function focusComposerView() {
+      els.heroCopy.classList.add('hidden');
+      els.cards.classList.add('hidden');
+      els.newRecRow.classList.add('hidden');
+    }
+
     // Trim a stream name to a reasonable composer field length.
     function trimName(v, max) {
       const s = String(v == null ? '' : v).trim();
@@ -3085,6 +3536,7 @@
       els.urlField.classList.add('hidden');
       els.catalogStreamBlock.classList.remove('hidden');
       els.catalogStreamName.textContent = `Catalog stream: ${String(stream.name || ('#' + id))}`;
+      els.catalogStreamIdVal.textContent = String(id);
       const loc = String(stream.location_text || '').trim();
       els.catalogStreamLoc.textContent = loc;
       els.catalogStreamLoc.classList.toggle('hidden', !loc);
@@ -3126,6 +3578,7 @@
             frameURL = (f0 && (f0.download_url || f0.url)) || '';
           } catch (_) { /* frame preview is best-effort */ }
         }
+        focusComposerView();
         openComposer(false);
         applyCatalogLock(stream, frameURL);
       } catch (err) {
@@ -3149,8 +3602,9 @@
           window.history.replaceState({}, '', u.pathname + (u.search || '') + u.hash);
         } catch (_) { /* ignore */ }
         if (ids.length) {
-          openBundleComposer();
+          focusComposerView();
           state.bundleSelected = new Set(ids);
+          openBundleComposer();
           if (!String(els.bundleName.value || '').trim()) {
             els.bundleName.value = 'Recording set ' + new Date().toLocaleDateString([], { month: 'short', day: 'numeric' });
           }
@@ -3193,8 +3647,6 @@
         els.startBtn.classList.remove('hidden');
         els.bundlePreflight.classList.add('hidden');
         els.bundleName.value = '';
-        els.bundleTag.value = '';
-        els.bundleStreamSearch.value = '';
         state.bundleSelected = new Set();
         const singleNameField = els.recName.closest('.field');
         if (singleNameField) singleNameField.classList.remove('hidden');
@@ -3487,18 +3939,6 @@
     els.composerClose.addEventListener('click', closeComposer);
     els.startBtn.addEventListener('click', startRecording);
     els.startBundleBtn.addEventListener('click', startBundle);
-    els.bundleTag.addEventListener('input', () => scheduleBundleStreamReload());
-    els.bundleStreamSearch.addEventListener('input', () => scheduleBundleStreamReload());
-    els.bundleSelectAllBtn.addEventListener('click', () => {
-      for (const s of (state.bundleStreams || [])) state.bundleSelected.add(Number(s.id));
-      els.bundleStreamList.querySelectorAll('input[data-bundlestream]').forEach((cb) => { cb.checked = true; });
-      updateBundleCount();
-    });
-    els.bundleClearSelBtn.addEventListener('click', () => {
-      state.bundleSelected = new Set();
-      els.bundleStreamList.querySelectorAll('input[data-bundlestream]').forEach((cb) => { cb.checked = false; });
-      updateBundleCount();
-    });
 
     document.getElementById('requestLink').addEventListener('click', async () => {
       const email = String(document.getElementById('email').value || '').trim();
@@ -3517,13 +3957,13 @@
     // A bundle is a thin grouping that fans out into N member recordings sharing
     // ONE schedule. The composer reuses the single-recording schedule/window/clip/
     // fps/storage controls (which read global state); bundle mode only swaps the
-    // source block (single stream -> tag filter + multi-select) and the submit path.
-
-    let bundleStreamDebounce = 0;
+    // source block (single stream -> read-only removable chips) and the submit path.
+    // Streams are chosen on the streams page and arrive via ?stream_ids=; there is
+    // no in-composer stream picker.
 
     // Switch the shared composer into bundle mode and open it: hide the single-stream
-    // source UI + Start button, show the stream-selection block + Start-bundle button,
-    // and load the recordable catalog streams for the picker.
+    // source UI + Start button, show the chip block + Start-bundle button. The caller
+    // populates state.bundleSelected (from ?stream_ids=) and calls loadBundleStreams.
     function openBundleComposer() {
       state.composerMode = 'bundle';
       clearCatalogLock();
@@ -3544,82 +3984,44 @@
       // Default Start to now (open-ended Stop) each time.
       if (!els.startAt.value) els.startAt.value = toLocalInputValue(new Date());
       refreshWindowUI();
-      els.bundleStreamSearch.value = '';
-      state.bundleSelected = new Set();
-      updateBundleCount();
-      void loadBundleStreams();
+      renderBundleChips();
       els.composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
-    function scheduleBundleStreamReload() {
-      window.clearTimeout(bundleStreamDebounce);
-      bundleStreamDebounce = window.setTimeout(() => { void loadBundleStreams(); }, 350);
-    }
-
-    // Load the recordable catalog streams for the picker, narrowed by the tag filter
-    // when set. Preserves any current explicit selection across reloads.
+    // Load stream metadata so the chips read as stream names, not bare ids. The
+    // recordable set is matched by id in renderBundleChips.
     async function loadBundleStreams() {
-      const tag = String(els.bundleTag.value || '').trim();
-      const q = String(els.bundleStreamSearch.value || '').trim();
-      els.bundleStreamList.innerHTML = '<div class="muted">Loading streams...</div>';
       try {
-        const params = new URLSearchParams();
-        if (tag) params.set('tag', tag);
-        if (q) params.set('q', q);
-        const qs = params.toString() ? `?${params.toString()}` : '';
-        const payload = await fetchJSON(`/api/v1/account/bundles/streams${qs}`);
+        const payload = await fetchJSON('/api/v1/account/bundles/streams');
         state.bundleStreams = Array.isArray(payload.items) ? payload.items : [];
-      } catch (err) {
-        els.bundleStreamList.innerHTML = `<div style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
-        return;
+      } catch (_) {
+        // Chip labels fall back to "#<id>" when metadata is unavailable.
+        state.bundleStreams = [];
       }
-      renderBundleStreamPicker();
+      renderBundleChips();
     }
 
-    function renderBundleStreamPicker() {
-      const streams = state.bundleStreams || [];
-      if (streams.length === 0) {
-        els.bundleStreamList.innerHTML = '<div class="muted">No recordable streams match.</div>';
+    // Render the selected streams as a read-only summary. Selection happens only on
+    // the streams page; the composer shows the chosen set and routes back there to edit.
+    function renderBundleChips() {
+      const ids = Array.from(state.bundleSelected);
+      if (ids.length === 0) {
+        els.bundleStreamChips.innerHTML = '<div class="muted">No streams selected. Pick streams on the streams page to record as a bundle.</div>';
         updateBundleCount();
         return;
       }
-      const rows = streams.map((s) => {
-        const id = Number(s.id);
-        const checked = state.bundleSelected.has(id) ? ' checked' : '';
-        const loc = String(s.location_text || '').trim();
-        const locHTML = loc ? ` <span class="muted">&middot; ${escapeHTML(loc)}</span>` : '';
-        return `<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;">
-          <input type="checkbox" data-bundlestream="${id}"${checked} style="width:auto;min-height:0;margin:0;" />
-          <span>${escapeHTML(String(s.name || ('#' + id)))}${locHTML}</span>
-        </label>`;
+      const byId = new Map((state.bundleStreams || []).map((s) => [Number(s.id), s]));
+      els.bundleStreamChips.innerHTML = ids.map((id) => {
+        const s = byId.get(id) || {};
+        const label = String(s.name || ('#' + id));
+        return `<span class="bundle-chip"><span class="chip-label">${escapeHTML(label)}</span></span>`;
       }).join('');
-      const tagNote = String(els.bundleTag.value || '').trim()
-        ? `<div class="muted" style="margin-bottom:6px;">All ${streams.length} streams tagged "${escapeHTML(els.bundleTag.value.trim())}" are listed. Tagged streams are included even if unchecked.</div>` : '';
-      els.bundleStreamList.innerHTML = tagNote + rows;
-      els.bundleStreamList.querySelectorAll('input[data-bundlestream]').forEach((cb) =>
-        cb.addEventListener('change', () => {
-          const id = Number(cb.getAttribute('data-bundlestream'));
-          if (cb.checked) state.bundleSelected.add(id); else state.bundleSelected.delete(id);
-          updateBundleCount();
-        }));
       updateBundleCount();
     }
 
-    // The resolved member set is the union of the explicit checkbox selection and,
-    // when a tag is set, every stream carrying that tag. Show the live count.
-    function resolvedBundleCount() {
-      const tag = String(els.bundleTag.value || '').trim();
-      const ids = new Set(state.bundleSelected);
-      if (tag) for (const s of (state.bundleStreams || [])) ids.add(Number(s.id));
-      return ids.size;
-    }
-
     function updateBundleCount() {
-      const n = resolvedBundleCount();
-      const tag = String(els.bundleTag.value || '').trim();
-      els.bundleStreamCount.textContent = tag
-        ? `${n} stream${n === 1 ? '' : 's'} selected (tag "${tag}" + checked)`
-        : `${n} stream${n === 1 ? '' : 's'} selected`;
+      const n = state.bundleSelected.size;
+      els.bundleStreamCount.textContent = `${n} stream${n === 1 ? '' : 's'} selected`;
     }
 
     // Build + POST the bundle. The capacity preflight runs server-side; a 409 with
@@ -3632,7 +4034,6 @@
         return;
       }
       const name = String(els.bundleName.value || '').trim();
-      const tag = String(els.bundleTag.value || '').trim();
       const ids = Array.from(state.bundleSelected);
       const continuous = state.composerScheduleMode === 'continuous';
       const sched = compiledSchedule();
@@ -3640,7 +4041,7 @@
       const dest = selectedDestId();
       const deliveryDest = selectedDeliveryDestId();
       if (!name) { setStatus(els.startStatus, 'Bundle name is required.', 'err'); return; }
-      if (ids.length === 0 && !tag) { setStatus(els.startStatus, 'Select at least one stream or a tag.', 'err'); return; }
+      if (ids.length === 0) { setStatus(els.startStatus, 'Select at least one stream on the streams page.', 'err'); return; }
       if (continuous) {
         if (!continuousWindowValid()) { setStatus(els.startStatus, 'End time must be after start time.', 'err'); return; }
       } else {
@@ -3654,7 +4055,7 @@
       const body = {
         name,
         stream_ids: ids,
-        tag,
+        tag: '',
         cron_timezone: sched.tz,
         clip_duration_sec: clip,
         start_at: win.startISO,

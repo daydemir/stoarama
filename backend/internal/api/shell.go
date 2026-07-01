@@ -69,6 +69,18 @@ const shellHeadCSS = `
 .site-footer{margin:40px auto 24px;max-width:1200px;padding:16px 4px 0;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11px;letter-spacing:0.03em;color:var(--muted);}
 .site-footer a{color:var(--muted);text-decoration:none;}
 .site-footer a:hover{color:var(--text);text-decoration:underline;}
+/* Authoritative button system, injected into every page head (after each page's
+   own <style>) so the whole app reads the same and these rules win over page-local
+   button styles. --accent-strong is the saturated brand teal the active nav tab and
+   active filter chips use; primary buttons must fill with it, never a washed tint. */
+:root{--accent-strong:#1288a8;}
+button.primary,button[type=submit].primary,.btn.primary{background:var(--accent-strong);border-color:var(--accent-strong);color:#fff;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,0.25);}
+button.primary:hover,button[type=submit].primary:hover,.btn.primary:hover{background:color-mix(in srgb,var(--accent-strong) 88%,#000);border-color:color-mix(in srgb,var(--accent-strong) 88%,#000);color:#fff;}
+/* Secondary/utility: clearly clickable outline, dark text, no faint accent-tint fill. */
+button.danger,.btn.danger{background:color-mix(in srgb,var(--err) 12%,transparent);border-color:color-mix(in srgb,var(--err) 45%,var(--border));color:var(--err);}
+button.danger:hover,.btn.danger:hover{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err);}
+/* Disabled is the ONLY faint/inert look: dimmed, not-allowed, no pointer events. */
+button:disabled,button[disabled],.btn:disabled,.btn[disabled]{opacity:0.45;cursor:not-allowed;pointer-events:none;}
 </style>`
 
 // Canonical topbar markup. Injected at <!--SHELL_TOPBAR--> (first child of <body>).
@@ -80,7 +92,7 @@ const shellTopbarTmpl = `<div class="topbar">
   <div class="topbar-center">
     <nav class="global-nav" aria-label="Global">
       <a href="/" class="%ACTIVE_STREAMS%">Streams</a>
-      <a href="/recordings" class="%ACTIVE_RECORDING%">Recording</a>
+      <a href="/recordings" class="%ACTIVE_RECORDING%">Recordings</a>
     </nav>
   </div>
   <div class="topbar-right" id="accountArea">
@@ -245,7 +257,7 @@ const shellTopbarJS = `
 // Canonical site-wide footer. Injected just before </body> on every page. The
 // address is the single SupportEmail constant; do not duplicate it.
 const shellFooterTmpl = `<footer class="site-footer">
-  <span>Need help? <a href="mailto:%SUPPORT_EMAIL%">%SUPPORT_EMAIL%</a></span>
+  <span>Need help? <a href="mailto:%SUPPORT_EMAIL%">Email support</a></span>
 </footer>`
 
 func shellFooter() string {

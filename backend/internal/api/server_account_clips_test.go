@@ -216,6 +216,52 @@ func TestReleaseClipKeepsRowAndDetaches(t *testing.T) {
 	}
 }
 
+// TestReleaseClipRequireNASPullSkipsManaged pins that releaseClip with
+// requireNASPull=true never touches a delivery='managed' clip: the delivery
+// predicate filters the row out so found=false and released_at stays NULL. Only a
+// nas_pull recording's clips are ever release-eligible via the NAS-pull path, so a
+// managed recording's clip can never be silently released through it.
+func TestReleaseClipRequireNASPullSkipsManaged(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const ownerAccountID = int64(42)
+
+	// A MANAGED recording (delivery defaults to 'managed'): its clip must never be
+	// release-eligible via the NAS-pull path.
+	var recID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recordings (account_id, name) VALUES ($1, 'managed-rec') RETURNING id
+	`, ownerAccountID).Scan(&recID); err != nil {
+		t.Fatalf("insert recording: %v", err)
+	}
+	start := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	var clipID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_clips (recording_id, size_bytes, clip_start_at, clip_end_at)
+		VALUES ($1, 999, $2, $3) RETURNING id
+	`, recID, start, start.Add(90*time.Second)).Scan(&clipID); err != nil {
+		t.Fatalf("insert clip: %v", err)
+	}
+
+	s := &Server{pool: pool}
+
+	// requireNASPull=true against a managed clip: the delivery predicate excludes the
+	// row, so found=false and nothing is mutated.
+	found, already, err := s.releaseClip(ctx, ownerAccountID, recID, clipID, true)
+	if err != nil || found || already {
+		t.Fatalf("nas-pull release of managed clip: found=%v already=%v err=%v, want found=false already=false err=nil", found, already, err)
+	}
+	var releasedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT released_at FROM recording_clips WHERE id=$1`, clipID).Scan(&releasedAt); err != nil {
+		t.Fatalf("read released_at: %v", err)
+	}
+	if releasedAt != nil {
+		t.Fatalf("managed clip released_at=%v after nas-pull release, want NULL (never released)", releasedAt)
+	}
+}
+
 type accountClipsPage struct {
 	Clips       []map[string]any `json:"clips"`
 	NextAfterID *int64           `json:"next_after_id"`

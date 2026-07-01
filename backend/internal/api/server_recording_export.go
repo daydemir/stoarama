@@ -623,8 +623,10 @@ func (s *Server) handleAccountRecordingClipTransfer(w http.ResponseWriter, r *ht
 	}
 
 	// Load the clip under the account scope: it must belong to a recording the
-	// caller owns and must not be purged. sourceDestID lets us reject a no-op
-	// copy onto the clip's own destination.
+	// caller owns, must not be purged, and must not be released (a released clip
+	// has been drained to the NAS and its managed copy is gone, so it can never be
+	// individually re-transferred). sourceDestID lets us reject a no-op copy onto
+	// the clip's own destination.
 	var (
 		sourceDestID int64
 		objectKey    string
@@ -634,7 +636,7 @@ func (s *Server) handleAccountRecordingClipTransfer(w http.ResponseWriter, r *ht
 		SELECT c.storage_destination_id, c.object_key, c.purged_at
 		FROM recording_clips c
 		JOIN recordings rec ON rec.id = c.recording_id
-		WHERE c.id=$1 AND c.recording_id=$2 AND rec.account_id=$3
+		WHERE c.id=$1 AND c.recording_id=$2 AND rec.account_id=$3 AND c.released_at IS NULL
 	`, clipID, recordingID, principal.AccountID).Scan(&sourceDestID, &objectKey, &purgedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "clip not found")

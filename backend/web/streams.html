@@ -168,8 +168,6 @@
       color: var(--text);
       font-family: var(--mono);
       font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
       text-decoration: none;
     }
     .overview-card-link:hover {
@@ -178,13 +176,25 @@
       color: var(--accent);
     }
     .overview-card-link.primary {
-      background: var(--accent);
-      border-color: var(--accent);
+      background: var(--accent-strong);
+      border-color: var(--accent-strong);
       color: #fff;
+      font-weight: 600;
     }
     .overview-card-link.primary:hover {
       color: #fff;
-      opacity: 0.88;
+      background: color-mix(in srgb, var(--accent-strong) 88%, #000);
+      border-color: color-mix(in srgb, var(--accent-strong) 88%, #000);
+    }
+    .overview-card-link.secondary {
+      background: var(--panel);
+      border-color: var(--accent);
+      color: var(--text);
+      font-weight: 500;
+    }
+    .overview-card-link.secondary:hover {
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 8%, var(--panel));
       border-color: var(--accent);
     }
     .table-view-cell {
@@ -773,6 +783,8 @@
     .source-seg-btn {
       appearance: none;
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
       padding: 6px 14px;
       border-radius: 999px;
       border: 1px solid transparent;
@@ -783,6 +795,7 @@
       letter-spacing: 0.04em;
       text-transform: uppercase;
       text-decoration: none;
+      white-space: nowrap;
     }
     .source-seg-btn:hover { color: var(--text); text-decoration: none; }
     .source-seg-btn.active { color: #fff; background: var(--accent); border-color: var(--accent); }
@@ -1541,6 +1554,47 @@
         max-height: 34vh;
       }
     }
+    /* Below 640px the 5-column streams table clips the Record CTA off-screen and
+       cuts Location mid-word. Collapse each row into a stacked card so name, slug,
+       tags, location and a full-width recording CTA all stay on screen. */
+    @media (max-width: 640px) {
+      .source-segmented {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      #streamsTableWrap { overflow: visible; }
+      #streamsTable thead { display: none; }
+      #streamsTable,
+      #streamsTable tbody,
+      #streamsTable tr,
+      #streamsTable td {
+        display: block;
+        width: 100%;
+      }
+      #streamsTable tr {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 10px;
+        background: var(--panel);
+      }
+      #streamsTable tr:hover td { background: transparent; }
+      #streamsTable td {
+        border-bottom: none;
+        padding: 4px 0;
+      }
+      #streamsTable td.stream-select-cell {
+        text-align: left;
+        padding: 0 0 6px;
+      }
+      #streamsTable td.stream-record-cell { padding-top: 8px; }
+      #streamsTable td.stream-record-cell .overview-card-link {
+        display: flex;
+        width: 100%;
+      }
+      .table-view-cell { width: auto; text-align: left; }
+    }
   </style>
 <!--SHELL_HEAD-->
 </head>
@@ -1551,7 +1605,7 @@
   <div id="streamsPanel">
     <div class="domain-intro">
       <div class="domain-intro-title">Streams</div>
-      <div class="domain-intro-copy">Browse the catalog for free. Recording is metered: $0.05 per hour of recording, plus your choice of storage.</div>
+      <div class="domain-intro-copy">Recording is <b>$0.05</b> per recording-hour, plus your choice of storage.</div>
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
@@ -1654,7 +1708,7 @@
     <div id="recordSelectedBar" class="record-selected-bar hidden">
       <span class="status-text"><b data-selcount>0</b> selected</span>
       <span class="record-selected-actions">
-        <a id="recordSelectedBtn" class="overview-card-link primary" href="#">Record selected</a>
+        <a id="recordSelectedBtn" class="overview-card-link primary" href="#">Record as bundle</a>
         <button id="recordSelectedClear" type="button" class="overview-card-link">Clear</button>
       </span>
     </div>
@@ -1684,7 +1738,7 @@
         <div class="detail-meta" id="detailMeta"></div>
       </div>
       <div class="detail-header-actions">
-        <a id="detailRecordCTA" class="overview-card-link primary" href="/recordings">Record this stream</a>
+        <a id="detailRecordCTA" class="overview-card-link primary" href="/recordings">Set up recording</a>
       </div>
     </div>
 
@@ -2935,7 +2989,7 @@ function syncAuthDependentUI() {
     rerenderTagEditorsForStream(Number(detailData.stream.id));
   }
   if (detailRecordingData && detailRecordingData.stream) {
-    syncDetailMutationUI(detailRecordingData.stream);
+    syncDetailMutationUI(detailRecordingData);
   }
 }
 
@@ -3050,9 +3104,10 @@ if (addStreamSubmitEl instanceof HTMLElement) {
   addStreamSubmitEl.addEventListener('click', submitAddStream);
 }
 
-// Multi-select action bar: "Record selected" opens the bundle composer prefilled
-// with the chosen ids; "Clear" drops the selection. The ids ride through the
-// magic-link round-trip when signed out (accountRedirectURL preserves the path).
+// Multi-select action bar: "Record as bundle" opens the bundle composer prefilled
+// with the chosen ids (carried read-only, no picker); "Clear" drops the selection.
+// The ids ride through the magic-link round-trip when signed out (accountRedirectURL
+// preserves the path).
 const recordSelectedBtnEl = $('recordSelectedBtn');
 const recordSelectedClearEl = $('recordSelectedClear');
 if (recordSelectedBtnEl instanceof HTMLElement) {
@@ -3060,7 +3115,7 @@ if (recordSelectedBtnEl instanceof HTMLElement) {
     ev.preventDefault();
     const ids = [...selectedStreamIds];
     if (!ids.length) return;
-    const target = `/recordings?stream_ids=${ids.join(',')}&compose=bundle`;
+    const target = `/recordings?stream_ids=${ids.join(',')}`;
     if (isAuthenticatedAccount()) {
       window.location.assign(target);
     } else {
@@ -3174,15 +3229,30 @@ async function copyStreamSourceURL(streamID) {
   await navigator.clipboard.writeText(sourceURL);
 }
 
-function syncDetailMutationUI(stream) {
-  const s = stream || {};
+// Accepts the detail payload ({ stream, recording_id }); tolerates a bare stream
+// object for callers that only have the stream. recording_id lives on the payload,
+// not the inner stream, so read it off the payload.
+function syncDetailMutationUI(payload) {
+  const p = payload || {};
+  const s = (p.stream && typeof p.stream === 'object') ? p.stream : p;
   if (detailRecordCTA instanceof HTMLAnchorElement) {
     // Only offer the managed recorder for streams it can actually capture (HLS or
     // direct HTTP video), mirroring the browse-table row. YouTube and still-image
     // streams cannot be hosted-recorded, so hide the CTA; the "Record this
     // yourself" block below covers self-capture for those.
     if (isRecordableStream(s)) {
-      detailRecordCTA.href = `/recordings?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
+      const recordingID = streamRecordingID(p);
+      if (recordingID > 0) {
+        detailRecordCTA.href = `/recordings/${recordingID}`;
+        detailRecordCTA.textContent = 'View/Edit recording';
+        detailRecordCTA.classList.remove('primary');
+        detailRecordCTA.classList.add('secondary');
+      } else {
+        detailRecordCTA.href = `/recordings?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
+        detailRecordCTA.textContent = 'Set up recording';
+        detailRecordCTA.classList.remove('secondary');
+        detailRecordCTA.classList.add('primary');
+      }
       detailRecordCTA.style.display = '';
     } else {
       detailRecordCTA.removeAttribute('href');
@@ -4866,9 +4936,11 @@ function renderStreamRows() {
         </div>
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
-      <td>${
+      <td class="stream-record-cell">${
         recordable
-          ? `<a class="overview-card-link" href="/recordings?stream_id=${s.id}">Record</a>`
+          ? (streamRecordingID(row) > 0
+              ? `<a class="overview-card-link secondary" href="/recordings/${streamRecordingID(row)}">View/Edit recording</a>`
+              : `<a class="overview-card-link primary" href="/recordings?stream_id=${s.id}">Set up recording</a>`)
           : (buildYouTubeWatchURL(s)
               ? `<a class="overview-card-link" href="${esc(buildYouTubeWatchURL(s))}" target="_blank" rel="noopener noreferrer">View</a>`
               : `<a class="overview-card-link" href="/streams/${s.id}">View</a>`)
@@ -5169,6 +5241,15 @@ function teardownDetailLivePlayer() {
 function isRecordableStream(stream) {
   const ct = String((stream && stream.capture_type) || '').trim().toLowerCase();
   return ct === 'hls' || ct === 'http_video';
+}
+
+// The acting org's latest non-canceled recording id for this stream, or 0 when
+// none. Drives the "Set up recording" vs "View/Edit recording" CTA flip. Pass the
+// list item (row) or the detail payload: the streams API puts "recording_id" at the
+// item level alongside "stream", and the detail endpoint puts it at the payload top
+// level. In both cases it sits on the object handed in, not on the inner stream.
+function streamRecordingID(item) {
+  return Number((item && item.recording_id) || 0) || 0;
 }
 
 // True when the source is an indirect "!hls" reference (KBS/Korea via loomex):
@@ -5540,7 +5621,7 @@ async function loadDetail(options = {}) {
   knownStreamTags = normalizeTags(knownStreamTags.concat(normalizeTags(s.tags || [])));
   refreshTagSuggestionList();
 
-  syncDetailMutationUI(s);
+  syncDetailMutationUI(detailData);
 
   mountDetailLivePlayer(s);
   renderSelfRecord(s);
