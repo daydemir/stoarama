@@ -38,6 +38,33 @@ func TestCanRemoveMemberLastOwnerGuard(t *testing.T) {
 	}
 }
 
+func TestValidateMemberRoleChange(t *testing.T) {
+	cases := []struct {
+		name       string
+		targetRole string
+		newRole    string
+		ownerCount int
+		wantOK     bool
+	}{
+		{"promote member to billing_admin", "member", "billing_admin", 1, true},
+		{"demote billing_admin to member", "billing_admin", "member", 1, true},
+		{"reject unknown role", "member", "admin", 1, false},
+		{"reject promoting to owner", "member", "owner", 2, false},
+		{"reject empty role", "member", "", 1, false},
+		{"reject demoting sole owner", "owner", "member", 1, false},
+		{"allow changing owner when others remain", "owner", "member", 2, true},
+	}
+	for _, c := range cases {
+		got, reason := validateMemberRoleChange(c.targetRole, c.newRole, c.ownerCount)
+		if got != c.wantOK {
+			t.Fatalf("%s: validateMemberRoleChange(%q,%q,%d)=%v (%q) want %v", c.name, c.targetRole, c.newRole, c.ownerCount, got, reason, c.wantOK)
+		}
+		if !got && reason == "" {
+			t.Fatalf("%s: rejection must carry a public reason", c.name)
+		}
+	}
+}
+
 func TestMembershipEmailNormalizationParity(t *testing.T) {
 	// users.email must match accounts.email normalization (lowercased + trimmed)
 	// so the email->user->memberships resolution does not silently miss.

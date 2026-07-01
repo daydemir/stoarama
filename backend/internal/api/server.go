@@ -380,6 +380,7 @@ func (s *Server) router() http.Handler {
 			// MemberRole inside the handlers; list is visible to any member.
 			memberSession.Get("/account/members", s.handleAccountMembersList)
 			memberSession.Post("/account/members", s.handleAccountMembersInvite)
+			memberSession.Patch("/account/members/{email}/role", s.handleAccountMemberRoleSet)
 			memberSession.Delete("/account/members/{email}", s.handleAccountMembersRemove)
 
 			// Orgs: the multi-org switcher. List the caller's orgs, switch the

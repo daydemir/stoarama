@@ -577,3 +577,120 @@ func TestLastOwnerGuardOnRemove(t *testing.T) {
 		t.Fatalf("remove sole owner status=%d want 409 body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// seedMemberSession adds a membership (given role) for a fresh user in orgID and
+// returns a resolved session principal for that member. Used to exercise the
+// billing/role gates from the perspective of a specific org role.
+func seedMemberSession(t *testing.T, s *Server, pool *pgxpool.Pool, orgID int64, email, role, rawToken string) accountPrincipal {
+	t.Helper()
+	ctx := context.Background()
+	var userID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id
+	`, email, emailLocalPart(email)).Scan(&userID); err != nil {
+		t.Fatalf("insert member user: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO memberships (user_id, org_id, role, accepted_at)
+		VALUES ($1, $2, $3, now())
+	`, userID, orgID, role); err != nil {
+		t.Fatalf("insert %s membership: %v", role, err)
+	}
+	insertSession(t, pool, orgID, userID, rawToken)
+	return sessionPrincipal(t, s, rawToken)
+}
+
+// TestBillingWriteGateByRole: a plain member is 403 on the billing write
+// endpoints (card + portal) and on the role-change endpoint, while an
+// owner/billing_admin clears the gate (billing is nil in tests, so a cleared gate
+// surfaces as 503, never 403). Billing READS stay open and are not gated here.
+func TestBillingWriteGateByRole(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	_, orgID := seedUserOrg(t, pool, "gate-owner@example.com", false)
+	memberP := seedMemberSession(t, s, pool, orgID, "gate-member@example.com", "member", "raw-gate-member")
+	adminP := seedMemberSession(t, s, pool, orgID, "gate-billing-admin@example.com", "billing_admin", "raw-gate-admin")
+
+	callCard := func(p accountPrincipal) int {
+		req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/billing/card", strings.NewReader("{}")), p, "")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.handleAccountBillingCard(rec, req)
+		return rec.Code
+	}
+	callPortal := func(p accountPrincipal) int {
+		req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/billing/portal", strings.NewReader("{}")), p, "")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.handleAccountBillingPortal(rec, req)
+		return rec.Code
+	}
+
+	// A plain member is forbidden on every billing write.
+	if code := callCard(memberP); code != http.StatusForbidden {
+		t.Fatalf("member POST card status=%d want 403", code)
+	}
+	if code := callPortal(memberP); code != http.StatusForbidden {
+		t.Fatalf("member POST portal status=%d want 403", code)
+	}
+	// A billing_admin clears the gate; with billing disabled in tests that is 503.
+	if code := callCard(adminP); code == http.StatusForbidden {
+		t.Fatalf("billing_admin POST card was 403; gate must let billing_admin through")
+	}
+	if code := callPortal(adminP); code == http.StatusForbidden {
+		t.Fatalf("billing_admin POST portal was 403; gate must let billing_admin through")
+	}
+}
+
+// TestMemberRoleChangeOwnerOnly: a plain member cannot change roles (403); an
+// owner can promote a member to billing_admin (persisted) and demote back.
+func TestMemberRoleChangeOwnerOnly(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	ownerID, orgID := seedUserOrg(t, pool, "role-owner@example.com", false)
+	ownerRaw := "raw-role-owner"
+	insertSession(t, pool, orgID, ownerID, ownerRaw)
+	ownerP := sessionPrincipal(t, s, ownerRaw)
+	memberP := seedMemberSession(t, s, pool, orgID, "role-member@example.com", "member", "raw-role-member")
+
+	setRole := func(p accountPrincipal, targetEmail, role string) (int, string) {
+		body := fmt.Sprintf(`{"role":%q}`, role)
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/account/members/"+targetEmail+"/role", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("email", targetEmail)
+		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), accountPrincipalContextKey, p), chi.RouteCtxKey, rctx))
+		rec := httptest.NewRecorder()
+		s.handleAccountMemberRoleSet(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+
+	// A plain member cannot change any role.
+	if code, body := setRole(memberP, "role-member@example.com", "billing_admin"); code != http.StatusForbidden {
+		t.Fatalf("member role change status=%d want 403 body=%s", code, body)
+	}
+	// The owner promotes the member to billing_admin, and it persists.
+	if code, body := setRole(ownerP, "role-member@example.com", "billing_admin"); code != http.StatusOK {
+		t.Fatalf("owner promote status=%d want 200 body=%s", code, body)
+	}
+	var role string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT m.role FROM memberships m JOIN users u ON u.id=m.user_id
+		WHERE m.org_id=$1 AND u.email='role-member@example.com'
+	`, orgID).Scan(&role); err != nil {
+		t.Fatalf("load role: %v", err)
+	}
+	if role != "billing_admin" {
+		t.Fatalf("role after promote=%q want billing_admin", role)
+	}
+	// An unknown role is rejected, and the owner role is not assignable here.
+	if code, _ := setRole(ownerP, "role-member@example.com", "owner"); code != http.StatusConflict {
+		t.Fatalf("promote to owner status=%d want 409 (owner not assignable here)", code)
+	}
+	// Demoting the sole owner is refused so the org keeps an owner.
+	if code, _ := setRole(ownerP, "role-owner@example.com", "member"); code != http.StatusConflict {
+		t.Fatalf("demote sole owner status=%d want 409", code)
+	}
+}

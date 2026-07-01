@@ -7,6 +7,25 @@ import (
 	stripe "github.com/stripe/stripe-go/v82"
 )
 
+func TestPrincipalCanManageBilling(t *testing.T) {
+	// Owner and billing_admin may manage billing writes; a plain member may not.
+	// Empty MemberRole (legacy session / API key) is treated as owner.
+	cases := []struct {
+		role string
+		want bool
+	}{
+		{"", true},              // legacy session / API key -> owner default
+		{"owner", true},         // owner
+		{"billing_admin", true}, // the billing-permission role
+		{"member", false},       // plain member cannot manage the card
+	}
+	for _, c := range cases {
+		if got := principalCanManageBilling(accountPrincipal{MemberRole: c.role}); got != c.want {
+			t.Fatalf("principalCanManageBilling(MemberRole=%q)=%v want %v", c.role, got, c.want)
+		}
+	}
+}
+
 func TestClientRefAccountID(t *testing.T) {
 	cases := map[string]int64{
 		"42":    42,

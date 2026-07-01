@@ -248,12 +248,13 @@
       <div class="section-title">
         <div>
           <div class="eyebrow">Billing &amp; costs</div>
-          <h2>This billing period</h2>
+          <h2 id="billingHeading">This billing period</h2>
         </div>
-        <button id="billingManageBtn" class="secondary" type="button" style="width:auto;min-width:160px;">Manage payment method</button>
+        <button id="billingManageBtn" class="secondary hidden" type="button" style="width:auto;min-width:160px;">Manage payment method</button>
       </div>
       <div id="billingStatus" class="status">Loading billing...</div>
       <div id="billingBody" class="hidden">
+        <div id="billingReadOnlyNote" class="muted hidden" style="font-size:12px;margin-bottom:12px;">Ask an org owner to manage billing.</div>
         <div id="paymentRow" class="session-meta" style="margin-bottom:14px;"></div>
         <div class="grid-2" style="margin-bottom:14px;">
           <div class="token-box">
@@ -373,6 +374,8 @@
     const billingStatus = document.getElementById('billingStatus');
     const billingBody = document.getElementById('billingBody');
     const billingManageBtn = document.getElementById('billingManageBtn');
+    const billingHeading = document.getElementById('billingHeading');
+    const billingReadOnlyNote = document.getElementById('billingReadOnlyNote');
     const usageRecDays = document.getElementById('usageRecDays');
     const usageStorage = document.getElementById('usageStorage');
     const estBreakdown = document.getElementById('estBreakdown');
@@ -406,6 +409,7 @@
     })();
 
     let currentAccount = null;
+    let currentOrg = null;
     let authFlowRedirectTimer = null;
 
     async function fetchJSON(path, opts = {}) {
@@ -558,7 +562,9 @@
     }
 
     // Render the billing panel from a GET /billing payload. Pure given the payload
-    // + DOM nodes; all money is server-derived, labelled as an estimate.
+    // + DOM nodes; all money is server-derived, labelled as an estimate. The bill is
+    // org-scoped: reads are shown to every member, but the manage-card control is
+    // shown only to an owner/billing_admin (current_org.can_manage_billing).
     function renderBilling(b) {
       const hourRate = Number(b.recording_hour_rate_cents || 5);
       const shmRate = Number(b.stream_hour_month_rate_cents || 10);
@@ -568,8 +574,14 @@
       const storeCents = Number(b.estimated_storage_amount_cents || 0);
       const totalCents = hourCents + storeCents;
 
+      const orgName = String((currentOrg && currentOrg.name) || '').trim();
+      billingHeading.textContent = orgName ? `${orgName} bill this period` : 'This billing period';
+      const canManageBilling = Boolean(currentOrg && currentOrg.can_manage_billing);
+      billingManageBtn.classList.toggle('hidden', !canManageBilling);
+      billingReadOnlyNote.classList.toggle('hidden', canManageBilling);
+
       if (b.has_payment_method === true) {
-        paymentRow.innerHTML = `<div style="color:var(--ok);">You have a card on file.</div>`;
+        paymentRow.innerHTML = `<div style="color:var(--ok);">This org has a card on file.</div>`;
         billingManageBtn.textContent = 'Manage payment method';
       } else {
         paymentRow.innerHTML = `<div style="color:var(--warn);">No card on file yet. Adding a card does not charge you.</div>`;
@@ -692,6 +704,7 @@
       for (let i = 0; i < attempts; i += 1) {
         try {
           const payload = await fetchJSON('/api/v1/account/me');
+          currentOrg = payload.current_org || null;
           return payload.account || {};
         } catch (err) {
           lastErr = err;
@@ -732,6 +745,20 @@
       }
     }
 
+    async function setMemberRole(email, role) {
+      if (!email || !role) return;
+      try {
+        await fetchJSON(`/api/v1/account/members/${encodeURIComponent(email)}/role`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role }),
+        });
+        await loadTeam();
+      } catch (err) {
+        setStatus(teamStatus, String(err.message || err), 'err');
+      }
+    }
+
     async function loadTeam() {
       teamPanel.classList.remove('hidden');
       setStatus(teamStatus, 'Loading team...', '');
@@ -750,15 +777,28 @@
           const removeBtn = showRemove
             ? `<button class="secondary team-remove" type="button" data-email="${escapeHTML(email)}" style="width:auto;min-width:90px;">Remove</button>`
             : '';
+          // An owner can toggle a non-owner between member and billing_admin. Owner
+          // rows are not toggled here (owner promotion/demotion stays owner-only).
+          const showRoleToggle = canManage && role !== 'owner';
+          const nextRole = role === 'billing_admin' ? 'member' : 'billing_admin';
+          const roleBtn = showRoleToggle
+            ? `<button class="secondary team-role" type="button" data-email="${escapeHTML(email)}" data-role="${escapeHTML(nextRole)}" style="width:auto;min-width:120px;">${nextRole === 'billing_admin' ? 'Make billing admin' : 'Make member'}</button>`
+            : '';
           return `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
             <div>
               <div><b>${escapeHTML(email)}</b></div>
               <div class="muted" style="font-size:12px;">Role: ${escapeHTML(role)} · ${escapeHTML(status)}</div>
             </div>
-            ${removeBtn}
+            <div style="display:flex;gap:8px;">
+              ${roleBtn}
+              ${removeBtn}
+            </div>
           </div>`;
         }).join('');
         teamList.classList.remove('hidden');
+        teamList.querySelectorAll('.team-role').forEach((btn) => {
+          btn.addEventListener('click', () => setMemberRole(btn.getAttribute('data-email') || '', btn.getAttribute('data-role') || ''));
+        });
         teamList.querySelectorAll('.team-remove').forEach((btn) => {
           btn.addEventListener('click', () => removeTeamMember(btn.getAttribute('data-email') || ''));
         });

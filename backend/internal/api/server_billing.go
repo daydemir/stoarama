@@ -182,6 +182,10 @@ func (s *Server) handleAccountBillingCard(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	if !principalCanManageBilling(principal) {
+		util.WriteError(w, http.StatusForbidden, "only an org owner or billing admin can manage billing")
+		return
+	}
 	if s.billing == nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "billing is not enabled")
 		return
@@ -263,6 +267,10 @@ func (s *Server) handleAccountBillingPortal(w http.ResponseWriter, r *http.Reque
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if !principalCanManageBilling(principal) {
+		util.WriteError(w, http.StatusForbidden, "only an org owner or billing admin can manage billing")
 		return
 	}
 	if s.billing == nil {

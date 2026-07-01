@@ -256,6 +256,110 @@ func canRemoveMember(targetRole string, ownerCount int) bool {
 	return true
 }
 
+type accountMemberRoleRequest struct {
+	Role string `json:"role"`
+}
+
+// validateMemberRoleChange decides whether an owner may set targetRole -> newRole.
+// It gates the assignable billing role (billing_admin|member) so this endpoint can
+// never mint or demote an owner: owner promotion/demotion stays owner-only and is
+// out of scope here, so demoting the sole owner (which would orphan the org) is
+// refused. Returns (ok, publicReason) where reason is empty on success.
+func validateMemberRoleChange(targetRole, newRole string, ownerCount int) (bool, string) {
+	if newRole != "member" && newRole != "billing_admin" {
+		return false, "role must be member or billing_admin"
+	}
+	if targetRole == "owner" && ownerCount <= 1 {
+		return false, "cannot change the role of the last owner"
+	}
+	return true, ""
+}
+
+// handleAccountMemberRoleSet sets a member's org role to member|billing_admin.
+// Owner only. It never touches the owner role (promotion/demotion stays out of
+// scope) and refuses to demote the last remaining owner, so an org always keeps an
+// owner. Revokes nothing: a role change does not sign the member out.
+func (s *Server) handleAccountMemberRoleSet(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if !principalIsOwner(principal) {
+		util.WriteError(w, http.StatusForbidden, "only an org owner can change member roles")
+		return
+	}
+	email := normalizeAccountEmail(chi.URLParam(r, "email"))
+	if !looksLikeEmail(email) {
+		util.WriteError(w, http.StatusBadRequest, "valid email is required")
+		return
+	}
+	var req accountMemberRoleRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	newRole := strings.TrimSpace(req.Role)
+
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin role tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	var (
+		targetUserID int64
+		targetRole   string
+	)
+	if err := tx.QueryRow(r.Context(), `
+		SELECT m.user_id, m.role
+		FROM memberships m
+		JOIN users u ON u.id=m.user_id
+		WHERE m.org_id=$1 AND u.email=$2
+	`, principal.AccountID, email).Scan(&targetUserID, &targetRole); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "member not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load member: %v", err))
+		return
+	}
+
+	var ownerCount int
+	if err := tx.QueryRow(r.Context(), `
+		SELECT count(*) FROM memberships WHERE org_id=$1 AND role='owner'
+	`, principal.AccountID).Scan(&ownerCount); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count owners: %v", err))
+		return
+	}
+	if ok, reason := validateMemberRoleChange(targetRole, newRole, ownerCount); !ok {
+		util.WriteError(w, http.StatusConflict, reason)
+		return
+	}
+
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE memberships SET role=$3 WHERE org_id=$1 AND user_id=$2
+	`, principal.AccountID, targetUserID, newRole); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update member role: %v", err))
+		return
+	}
+	if err := s.insertAccountAuthEventTx(r.Context(), tx, principal.AccountID, nil, "member_role_changed", "account", email, map[string]any{
+		"changed_by":      principal.UserID,
+		"changed_user_id": targetUserID,
+		"from_role":       targetRole,
+		"to_role":         newRole,
+	}); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert role event: %v", err))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit role tx: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"email": email, "role": newRole})
+}
+
 // createAccountMagicLinkTx inserts a login magic link bound to org orgID for user
 // userID, with the member_email threaded on (KEPT this phase), and returns the raw
 // token + link id. Shared by member invites.

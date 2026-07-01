@@ -39,10 +39,10 @@ type accountPrincipal struct {
 	AccountID int64
 	// UserID is the acting user (users.id). Zero for API-key callers, which are
 	// org-scoped and not tied to a user row.
-	UserID int64
-	Email  string
-	Name   string
-	Role   string // operator/admin flag ('admin' when users.is_operator); NOT the team role
+	UserID    int64
+	Email     string
+	Name      string
+	Role      string // operator/admin flag ('admin' when users.is_operator); NOT the team role
 	AuthType  string
 	SessionID *int64
 	APIKeyID  *int64
@@ -76,6 +76,14 @@ func isPullScopedPrincipal(p accountPrincipal) bool {
 // default (session resolution fails-fast before this on a missing membership).
 func principalIsOwner(p accountPrincipal) bool {
 	return p.MemberRole == "" || p.MemberRole == "owner"
+}
+
+// principalCanManageBilling gates billing WRITES (add/change card, open portal)
+// and the org role change. An owner or a billing_admin may manage billing; a
+// plain member may only READ the org bill. Empty MemberRole (legacy session /
+// API key) is treated as owner, matching principalIsOwner.
+func principalCanManageBilling(p accountPrincipal) bool {
+	return p.MemberRole == "" || p.MemberRole == "owner" || p.MemberRole == "billing_admin"
 }
 
 type accountContextKey string
@@ -634,8 +642,10 @@ func (s *Server) handleAccountMe(w http.ResponseWriter, r *http.Request) {
 			"has_keys_or_nodes": hasKeysOrNodes,
 		},
 		"current_org": map[string]any{
-			"id":   principal.AccountID,
-			"name": currentOrgName,
+			"id":                 principal.AccountID,
+			"name":               currentOrgName,
+			"member_role":        principal.MemberRole,
+			"can_manage_billing": principalCanManageBilling(principal),
 		},
 		"orgs":         orgs,
 		"capabilities": accountSessionCapabilities(principal),
