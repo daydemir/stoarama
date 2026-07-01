@@ -71,7 +71,7 @@ func (s *Server) confineAccountScope(next http.Handler) http.Handler {
 
 func clampPollIntervalSec(v int) int {
 	if v == 0 {
-		return 90
+		return 60
 	}
 	if v < 10 {
 		return 10

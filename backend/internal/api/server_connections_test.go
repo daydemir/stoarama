@@ -132,7 +132,7 @@ func TestConfineAccountScopeFullKeyAndSessionUnaffected(t *testing.T) {
 }
 
 func TestClampPollIntervalSec(t *testing.T) {
-	cases := map[int]int{0: 90, 5: 10, 10: 10, 90: 90, 3600: 3600, 9000: 3600, -1: 10}
+	cases := map[int]int{0: 60, 5: 10, 10: 10, 90: 90, 3600: 3600, 9000: 3600, -1: 10}
 	for in, want := range cases {
 		if got := clampPollIntervalSec(in); got != want {
 			t.Errorf("clampPollIntervalSec(%d)=%d want %d", in, got, want)

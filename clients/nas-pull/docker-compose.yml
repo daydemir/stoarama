@@ -34,7 +34,7 @@ services:
       STOARAMA_API_KEY: "sir_REPLACE_ME"
       STOARAMA_OUTPUT_DIR: "/clips"
       STOARAMA_STATE_FILE: "/state/cursor.json"
-      STOARAMA_POLL_INTERVAL_SEC: "600"
+      STOARAMA_POLL_INTERVAL_SEC: "60"
       # "1" = read-only validate (download + verify, never delete, cursor not
       # persisted). "0" = live (purge after verified download).
       STOARAMA_DRY_RUN: "0"

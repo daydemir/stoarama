@@ -176,7 +176,7 @@
     <section id="connectionsPanel" class="panel hidden">
       <div class="section-title">
         <h2>NAS connections</h2>
-        <a class="sub" href="/docs/self-serve">How this works</a>
+        <button id="connRefreshBtn" class="secondary small" type="button">Refresh</button>
       </div>
       <div id="connectionsStatus" class="status">Loading connections...</div>
       <div id="connectionsList" class="rec-list hidden" style="margin-bottom:12px;"></div>
@@ -184,7 +184,7 @@
         <label for="connLabel">Label</label>
         <input id="connLabel" type="text" placeholder="MIT Synology NAS" />
         <label for="connInterval" style="margin-top:12px;">Poll interval</label>
-        <input id="connInterval" type="number" min="10" max="3600" value="90" />
+        <input id="connInterval" type="number" min="10" max="3600" value="60" />
         <div class="sub" style="margin-top:4px;">Seconds, 10-3600.</div>
         <div style="margin-top:12px;">
           <button id="connCreateBtn" type="button">Create</button>
@@ -197,6 +197,23 @@
           <button id="connCopyBtn" class="secondary small" type="button">Copy</button>
         </div>
       </div>
+
+      <details class="collapsible" style="margin-top:16px;">
+        <summary>How to set up your NAS (Synology)</summary>
+        <div class="sub" style="margin-top:10px; line-height:1.6;">
+          <ol style="margin:0; padding-left:18px;">
+            <li>In DSM open <b>Package Center</b> and install <b>Container Manager</b> (skip if already installed).</li>
+            <li>Create two shared folders: <span class="mono">/volume1/stoarama-clips</span> and <span class="mono">/volume1/stoarama-state</span>.</li>
+            <li>In <b>Container Manager &gt; Project &gt; Create</b>, paste the docker-compose shown above (it is pre-filled with your API base, your token, and a 60s poll).</li>
+            <li>Start the project. <span class="mono">restart: always</span> keeps it running across reboots.</li>
+            <li>Come back here and click <b>Refresh</b>. Within a minute or two the status turns <b style="color:var(--ok);">GREEN / Connected</b>.</li>
+          </ol>
+          <p style="margin:12px 0 0;"><b>Any Docker host:</b> the same compose runs anywhere. Save it as <span class="mono">docker-compose.yml</span> next to the client Dockerfile and run <span class="mono">docker compose up -d</span>.</p>
+          <p style="margin:10px 0 0;">Green appears 1 to 2 minutes AFTER you start the container.</p>
+          <p style="margin:6px 0 0;">Copy the compose now. The token is shown once; use Rotate to get a new one.</p>
+          <p style="margin:6px 0 0;">If your NAS stalls, clips pile up in managed storage and bill at $0.10 per hour of footage per month until it catches up.</p>
+        </div>
+      </details>
     </section>
 
     <div id="orgStatus" class="status"></div>
@@ -235,6 +252,7 @@
     const connTokenBox = document.getElementById('connTokenBox');
     const connSnippet = document.getElementById('connSnippet');
     const connCopyBtn = document.getElementById('connCopyBtn');
+    const connRefreshBtn = document.getElementById('connRefreshBtn');
 
     let currentAccount = null;
     let currentOrg = null;
@@ -470,11 +488,21 @@
       }
     });
 
-    const connHealthColor = { healthy: '#22c55e', stale: '#f59e0b', never: '#9ca3af' };
+    // Connected only when the last heartbeat is recent (health==healthy). never/stale
+    // read as Not connected so the red/green state is unmistakable.
+    function connIsHealthy(health) {
+      return String(health) === 'healthy';
+    }
 
     function connStatusDot(health) {
-      const color = connHealthColor[health] || connHealthColor.never;
+      const color = connIsHealthy(health) ? '#22c55e' : '#ef4444';
       return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:8px;"></span>`;
+    }
+
+    function connStatusLabel(health) {
+      const healthy = connIsHealthy(health);
+      const color = healthy ? '#22c55e' : '#ef4444';
+      return `<b style="color:${color};">${healthy ? 'Connected' : 'Not connected'}</b>`;
     }
 
     function connLastSeenText(c) {
@@ -495,11 +523,11 @@
           const label = String(c.label || 'NAS');
           const health = String(c.health || 'never');
           const clips = Number(c.clips_pulled || 0);
-          const interval = Number(c.poll_interval_sec || 90);
+          const interval = Number(c.poll_interval_sec || 60);
           return `<div class="rec-row kv-row">
             <div style="min-width:0;">
-              <div>${connStatusDot(health)}<b class="mono">${escapeHTML(label)}</b></div>
-              <div class="sub">${escapeHTML(health)} · ${clips} clip${clips === 1 ? '' : 's'} · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
+              <div>${connStatusDot(health)}${connStatusLabel(health)} <span class="mono">${escapeHTML(label)}</span></div>
+              <div class="sub">${clips} clip${clips === 1 ? '' : 's'} pulled · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
             </div>
             <div style="display:flex;gap:8px;flex-shrink:0;">
               <button class="secondary small conn-rotate" type="button" data-id="${id}">Rotate</button>
@@ -527,7 +555,7 @@
 
     connCreateBtn.addEventListener('click', async () => {
       const label = String(connLabel.value || '').trim();
-      const pollIntervalSec = Number(connInterval.value || 90);
+      const pollIntervalSec = Number(connInterval.value || 60);
       connCreateBtn.disabled = true;
       try {
         const data = await fetchJSON('/api/v1/account/connections', {
@@ -574,6 +602,17 @@
         setTimeout(() => { connCopyBtn.textContent = 'Copy'; }, 1500);
       } catch (_) {
         connSnippet.select();
+      }
+    });
+
+    connRefreshBtn.addEventListener('click', async () => {
+      connRefreshBtn.disabled = true;
+      connRefreshBtn.textContent = 'Refreshing...';
+      try {
+        await loadConnections();
+      } finally {
+        connRefreshBtn.disabled = false;
+        connRefreshBtn.textContent = 'Refresh';
       }
     });
 
