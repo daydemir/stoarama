@@ -189,7 +189,7 @@
         <div class="sidebar-title">Docs</div>
         <nav class="sidebar-nav" aria-label="Docs sections">
           <a id="navGettingStarted" href="/docs/getting-started">Overview</a>
-          <a id="navAPI" href="/docs/api">Recording</a>
+          <a id="navAPI" href="/docs/api">Recorder</a>
           <a id="navSelfServe" href="/docs/self-serve">Catalog &amp; self-record</a>
         </nav>
       </aside>
@@ -198,17 +198,17 @@
         <section id="sectionGettingStarted" class="section panel">
           <div class="eyebrow">Overview</div>
           <h1>Browse the catalog, record on a schedule.</h1>
-          <p>Stoarama is two things: a public catalog of live video streams you can browse without an account, and a paid recorder that captures a stream on a schedule and saves each capture as a clip you can download. Browsing is free and open. Recording needs a signed-in account and a card on file.</p>
-          <p>Questions? Email <a href="mailto:deniz@aydemir.us">deniz@aydemir.us</a>.</p>
+          <p>Stoarama is a public catalog of live video streams you can browse without an account. It also runs a paid recorder that captures a stream on a schedule and saves each capture as a clip you can download.</p>
+          <p>Browsing is free. Recording needs a signed-in account and a card on file.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
               <div class="eyebrow">How it works</div>
               <h2>From browse to clips</h2>
               <ul>
-                <li>Browse the catalog on <a href="/streams">/streams</a>. No account needed.</li>
+                <li>Browse <a href="/streams">the catalog</a>. No account needed.</li>
                 <li>Open a stream to see its metadata, a live preview where the source allows it, and a self-record command.</li>
-                <li>Sign in (emailed link, no password) and set up a recording on <a href="/recordings">/recordings</a>.</li>
-                <li>Watch, download, or delete your clips, and see your bill on <a href="/account">/account</a>.</li>
+                <li>Sign in (emailed link, no password) and set up a recording on <a href="/recordings">your recordings</a>.</li>
+                <li>Watch, download, or delete your clips, and see your bill on <a href="/account">your account</a>.</li>
               </ul>
             </div>
             <div class="panel">
@@ -216,19 +216,20 @@
               <h2>Pay for what you record</h2>
               <p><b>$0.05 per recording-hour, plus your choice of storage.</b></p>
               <ul>
-                <li><b>$0.05</b> for each hour a recording captures at least one clip. Hours with nothing recorded are free.</li>
-                <li><b>$0.10</b> per hour of footage stored per month for clips you keep in Stoarama-managed storage. A clip kept a few days costs a small fraction of that.</li>
+                <li><b>$0.05</b> for each hour a recording captures at least one clip. An hour that captures nothing is <b>free</b>.</li>
+                <li><b>Managed storage</b> bills <b>$0.10</b> per hour of footage per month, for the time each clip is kept.</li>
+                <li>Record to your own NAS instead and storage is <b>free</b> while the NAS keeps up.</li>
                 <li>Billed once a month in arrears with a card on file via Stripe. Adding a card does not charge you.</li>
-                <li>Bring your own S3 bucket instead and Stoarama charges only the per hour of recording fee.</li>
               </ul>
             </div>
           </div>
         </section>
 
         <section id="sectionAPI" class="section panel">
-          <div class="eyebrow">Recording</div>
+          <div class="eyebrow">Recorder</div>
           <h1>Record any public HLS or HTTPS stream.</h1>
-          <p>A recording captures one stream on a schedule and writes each capture as a clip. Set it up on <a href="/recordings">/recordings</a>. You point it at a stream, pick how often it fires and how long each clip is, and choose where the clips land.</p>
+          <p>A recording captures one stream on a schedule and writes each capture as a clip. Set it up on <a href="/recordings">your recordings</a>.</p>
+          <p>You point it at a stream, pick how often it fires and how long each clip is, and choose where the clips land.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
               <div class="eyebrow">Sources</div>
@@ -252,17 +253,18 @@
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
               <div class="eyebrow">Storage</div>
-              <h2>Managed or your own bucket</h2>
+              <h2>Managed or your own NAS</h2>
               <ul>
-                <li><b>Stoarama-managed</b> storage when available, billed at $0.10 per hour of footage kept for a month, for the time each clip is kept.</li>
-                <li><b>Your own S3-compatible bucket</b>: Cloudflare R2, Amazon S3, Backblaze B2, Wasabi, DigitalOcean Spaces, or any S3-compatible endpoint. Credentials are connection-checked before a recording can use them.</li>
+                <li><b>Managed storage</b> bills <b>$0.10</b> per hour of footage per month, for the time each clip is kept. Delete a clip and its charge stops.</li>
+                <li><b>Your own NAS</b> keeps clips on your hardware. A small client pulls each clip on a poll, Stoarama verifies the download, then releases its managed copy. Storage is <b>free</b> while the NAS keeps up.</li>
+                <li>If the NAS falls behind, clips left in managed storage over <b>24h</b> bill at <b>$0.10</b> per hour of footage per month until the NAS catches up.</li>
               </ul>
             </div>
             <div class="panel">
               <div class="eyebrow">Managing recordings</div>
               <h2>Pause, resume, delete</h2>
               <ul>
-                <li>The <a href="/recordings">/recordings</a> list shows each recording's status and health, a live cost ledger, and a per-recording monthly estimate.</li>
+                <li>Your <a href="/recordings">recordings</a> list shows each recording's status and health, a live cost ledger, and a per-recording monthly estimate.</li>
                 <li>Pause or resume a recording at any time, or delete it.</li>
               </ul>
             </div>
@@ -273,7 +275,6 @@
             <ul>
               <li>Each recording has its own clip page with a paginated list. View a clip inline or download it.</li>
               <li>Download all clips on the page as a ZIP with an in-zip <code>manifest.csv</code> (id, filename, start, end, duration_ms, size_bytes, object_key, status).</li>
-              <li>Send any clip to another of your S3 buckets. The original is kept.</li>
               <li>Delete a single clip or all clips for a recording.</li>
             </ul>
           </div>
@@ -282,7 +283,7 @@
         <section id="sectionSelfServe" class="section panel">
           <div class="eyebrow">Catalog &amp; self-record</div>
           <h1>Browse the catalog, or capture it yourself.</h1>
-          <p>The catalog on <a href="/streams">/streams</a> is open to everyone. Each stream has a detail page with its metadata, a live preview where the source allows it, a <b>Record this stream</b> button that opens the recorder pre-filled, and a copy-paste command to capture it from your own machine.</p>
+          <p>The <a href="/streams">catalog</a> is open to everyone. Each stream has a detail page with its metadata, a live preview where the source allows it, a <b>Record this stream</b> button that opens the recorder pre-filled, and a copy-paste command to capture it from your own machine.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
               <div class="eyebrow">Browsing</div>
@@ -291,7 +292,7 @@
                 <li><b>Recordable</b>: HLS and direct-video streams the hosted recorder accepts.</li>
                 <li><b>Still image</b>: snapshot sources that refresh on a poll.</li>
                 <li><b>YouTube</b>: view-only streams you can watch and self-record.</li>
-                <li><b>Korea</b>: streams from Korean public sources, on <a href="/korea">/korea</a>.</li>
+                <li><b>Korea</b>: streams from <a href="/korea">Korean public sources</a>.</li>
               </ul>
             </div>
             <div class="panel">

@@ -125,6 +125,23 @@
     .token-box { margin-top: 14px; padding: 14px; border: 1px solid var(--warn); border-radius: 12px; }
     .token-box .warn-line { font-weight: 700; margin-bottom: 8px; color: var(--warn); }
     textarea { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 12px; padding: 10px; }
+    .bill-payment { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+    .bill-payment::before { content: '●'; font-size: 10px; line-height: 1; }
+    .bill-items { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 12px; align-items: baseline; }
+    .bill-items .bill-label { font-size: 13px; }
+    .bill-items .bill-detail { color: var(--muted); font-size: 12px; }
+    .bill-items .bill-amount { font-family: var(--mono); font-size: 13px; text-align: right; white-space: nowrap; }
+    .bill-items .bill-total { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 8px; font-weight: 700; }
+    .bill-items .bill-total-label { grid-column: 1 / span 2; }
+    .bill-items .bill-total.bill-amount { font-size: 14px; }
+    .bill-meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; margin: 0; font-size: 13px; }
+    .bill-meta dt { color: var(--muted); }
+    .bill-meta dd { margin: 0; }
+    @media (max-width: 420px) {
+      .bill-items { grid-template-columns: 1fr auto; }
+      .bill-items .bill-detail { grid-column: 1 / -1; margin-bottom: 4px; }
+      .bill-items .bill-total-label { grid-column: 1; }
+    }
   </style>
 <!--SHELL_HEAD-->
 </head>
@@ -163,11 +180,11 @@
       </div>
       <div id="billingStatus" class="status">Loading billing...</div>
       <div id="billingBody" class="hidden">
-        <div id="paymentRow" class="mono" style="margin-bottom:10px;"></div>
-        <div id="estBreakdown" class="mono" style="margin-bottom:8px;"></div>
-        <div id="periodRow" class="sub"></div>
+        <div id="paymentRow" style="margin-bottom:14px;"></div>
+        <div id="estBreakdown" class="bill-items" style="margin-bottom:14px;"></div>
+        <dl id="periodRow" class="bill-meta"></dl>
         <div id="billingReadOnlyNote" class="sub hidden" style="margin-top:8px;">Ask an org owner to manage billing.</div>
-        <p class="sub" style="margin:10px 0 0;">$0.05 per hour of recording + $0.10 per hour of footage stored per month. Live estimate, not a final invoice. See <a href="/pricing">pricing</a>.</p>
+        <p class="sub" style="margin:12px 0 0;">Live estimate, not a final invoice. See <a href="/pricing">pricing</a>.</p>
         <details class="collapsible" style="margin-top:12px;">
           <summary>Invoice history</summary>
           <div id="historyStatus" class="status" style="margin-top:8px;">Loading...</div>
@@ -285,6 +302,11 @@
       return `$${(c / 100).toFixed(2)}`;
     }
 
+    // Display "Free" instead of "$0.00" when an amount rounds to zero cents.
+    function freeOr(text, cents) {
+      return Number(cents || 0) === 0 ? 'Free' : text;
+    }
+
     function usdStorage(units, rateCents, roundedCents) {
       const c = Number(roundedCents || 0);
       if (c === 0 && Number(units || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
@@ -323,23 +345,38 @@
       billingReadOnlyNote.classList.toggle('hidden', canManageBilling);
 
       if (b.has_payment_method === true) {
-        paymentRow.innerHTML = `<span style="color:var(--ok);">Card on file.</span>`;
+        paymentRow.innerHTML = `<span class="bill-payment" style="color:var(--ok);">Card on file</span>`;
         billingManageBtn.textContent = 'Manage';
       } else {
-        paymentRow.innerHTML = `<span style="color:var(--warn);">No card on file. Adding a card does not charge you.</span>`;
+        paymentRow.innerHTML = `<span class="bill-payment" style="color:var(--warn);">No card on file. Adding a card does not charge you.</span>`;
         billingManageBtn.textContent = 'Add card';
       }
 
-      const lines = [`${hours} × ${usd(hourRate)}/hr recording = <b>${usd(hourCents)}</b>`];
-      if (shm > 0) lines.push(`${shm.toFixed(3)} hr-mo footage × ${usd(shmRate)} = <b>${usdStorage(shm, shmRate, storeCents)}</b>`);
-      lines.push(`<span style="display:inline-block;margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></span>`);
-      estBreakdown.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
+      // Line item: label + muted detail + right-aligned mono amount. Amounts that
+      // round to $0 read "Free", not "$0.00". Rate figures are bolded in the detail.
+      const item = (label, detail, amount) =>
+        `<div class="bill-label">${label}</div>` +
+        `<div class="bill-detail">${detail}</div>` +
+        `<div class="bill-amount">${amount}</div>`;
+      const recDetail = `<b>${hours}</b> recording-hour${hours === 1 ? '' : 's'} × <b>${usd(hourRate)}</b>`;
+      const rows = [item('Recording', recDetail, freeOr(usd(hourCents), hourCents))];
+      const storeDetail = `<b>${shm.toFixed(3)}</b> hours of footage stored × <b>${usd(shmRate)}</b>`;
+      rows.push(item('Storage', shm > 0 ? storeDetail : '0 hours of footage stored', freeOr(usdStorage(shm, shmRate, storeCents), storeCents)));
+      rows.push(
+        `<div class="bill-label bill-total bill-total-label">Estimated total</div>` +
+        `<div class="bill-amount bill-total">${freeOr(usd(totalCents), totalCents)}</div>`);
+      estBreakdown.innerHTML = rows.join('');
 
+      const meta = [];
       if (b.period_end) {
         const span = b.period_start ? `${fmtDay(b.period_start)} to ${fmtDay(b.period_end)}` : `through ${fmtDay(b.period_end)}`;
-        periodRow.textContent = `Period: ${span}. Next invoice on or around ${fmtDay(b.period_end)}.`;
+        meta.push(['Billing period', span]);
+        meta.push(['Next invoice', `~ ${fmtDay(b.period_end)}`]);
+        periodRow.innerHTML = meta.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+        periodRow.classList.remove('hidden');
       } else {
-        periodRow.textContent = 'Billing period starts once you add a card.';
+        periodRow.innerHTML = `<dt>Billing period</dt><dd>Starts once you add a card</dd>`;
+        periodRow.classList.remove('hidden');
       }
     }
 

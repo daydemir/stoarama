@@ -1781,7 +1781,7 @@
       <span id="imageModalCounter" class="image-modal-counter">0 / 0</span>
       <div class="image-modal-toolbar-right">
         <a id="imageModalOpenOriginal" class="image-modal-btn" href="#" target="_blank" rel="noopener noreferrer">Open</a>
-        <a id="imageModalOpenStream" class="image-modal-btn" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">Open Stream</a>
+        <a id="imageModalOpenStream" class="image-modal-btn" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">Open stream</a>
         <button id="imageModalClose" class="image-modal-btn" type="button" aria-label="Close image viewer">Close</button>
       </div>
     </div>
@@ -1790,7 +1790,7 @@
         <img id="imageModalImg" class="image-modal-image" alt="preview" />
       </div>
       <aside id="imageModalMeta" class="image-modal-meta">
-        <div class="image-modal-meta-title">Stream Metadata</div>
+        <div class="image-modal-meta-title">Stream metadata</div>
         <div class="muted fs11">No stream metadata</div>
       </aside>
     </div>
@@ -3023,12 +3023,12 @@ function syncDetailAuthState() {
   if (detailClipsAuth instanceof HTMLElement) {
     detailClipsAuth.innerHTML = signedIn
       ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Clip downloads are available for this stream.`
-      : `Clip browsing is public. <a href="${signInURL}">Sign in</a> for download history and account-specific actions.`;
+      : `Clip browsing is public. <a href="${signInURL}">Sign in</a> to record and manage your clips.`;
   }
   if (detailSettingsAuth instanceof HTMLElement) {
     detailSettingsAuth.innerHTML = signedIn
-      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Stop/unassign actions use your browser session.`
-      : `Start recording is available without sign-in. <a href="${signInURL}">Sign in</a> to stop/unassign recordings or edit tags.`;
+      ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. You can record and manage your clips.`
+      : `Start recording is available without sign-in. <a href="${signInURL}">Sign in</a> to manage your clips or edit tags.`;
   }
 }
 
@@ -3204,8 +3204,8 @@ function renderDetailSourcePanel(stream) {
   const sourcePageURL = streamSourcePageURL(s);
   return `
     <div class="detail-section-head">
-      <div class="detail-section-title">Original Source</div>
-      <div class="detail-section-subtitle">Canonical upstream stream and source page for this record.</div>
+      <div class="detail-section-title">Original source</div>
+      <div class="detail-section-subtitle">The original stream and source page for this record.</div>
     </div>
     <div class="source-panel-grid">
       ${renderSourcePanelRow('HLS stream URL', sourceURL, { href: sourceURL, copy: true, streamID: Number(s.id || 0) })}
@@ -3590,7 +3590,7 @@ function renderImageModalMetadata(linkEl) {
     ? '<span class="tag tag-ok">recording on</span>'
     : '<span class="tag tag-muted">recording off</span>';
   imageModalMeta.innerHTML = `
-    <div class="image-modal-meta-title">Stream Metadata</div>
+    <div class="image-modal-meta-title">Stream metadata</div>
     <div class="image-modal-meta-row">
       <span class="image-modal-meta-label">Table</span>
       <span class="image-modal-meta-value mono">${esc(scope)}</span>
@@ -3612,7 +3612,7 @@ function renderImageModalMetadata(linkEl) {
       <span class="image-modal-meta-value">${stream ? recordingTag : '<span class="muted fs11">-</span>'}</span>
     </div>
     <div class="image-modal-meta-row">
-      <span class="image-modal-meta-label">Capture Type</span>
+      <span class="image-modal-meta-label">Capture type</span>
       <span class="image-modal-meta-value mono">${modeText ? esc(modeText) : '<span class="muted fs11">-</span>'}</span>
     </div>
     <div class="image-modal-meta-row">
@@ -3730,7 +3730,7 @@ function closeImageModal() {
   imageModalOpenStream.href = '#';
   imageModalOpenStream.style.display = 'none';
   imageModalCounter.textContent = '0 / 0';
-  imageModalMeta.innerHTML = '<div class="image-modal-meta-title">Stream Metadata</div><div class="muted fs11">No stream metadata</div>';
+  imageModalMeta.innerHTML = '<div class="image-modal-meta-title">Stream metadata</div><div class="muted fs11">No stream metadata</div>';
   imageModalLinks = [];
   imageModalIndex = -1;
 }
@@ -4899,7 +4899,7 @@ function renderStreamRows() {
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
-            <div><button id="resetStreamsFiltersBtn" type="button">Reset Filters</button></div>
+            <div><button id="resetStreamsFiltersBtn" type="button">Reset filters</button></div>
           </div>
         </td>
       </tr>
