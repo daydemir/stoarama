@@ -25,17 +25,43 @@ const shellHeadCSS = `
 .account-chip{position:relative;display:inline-flex;align-items:center;gap:7px;height:34px;padding:0 12px;border-radius:999px;border:1px solid var(--border);background:color-mix(in srgb,var(--panel) 92%,#000);color:var(--muted);font-family:var(--mono);font-size:11px;white-space:nowrap;}
 .account-chip a{color:var(--text);text-decoration:none;}
 .account-chip a:hover{text-decoration:underline;}
-.account-chip .caret{font-size:9px;opacity:0.8;cursor:pointer;}
-.org-switch{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--text);}
-.org-menu{position:absolute;top:40px;right:0;min-width:200px;padding:6px;border:1px solid var(--border);border-radius:10px;background:color-mix(in srgb,var(--panel) 96%,#000);box-shadow:0 8px 24px rgba(0,0,0,0.35);z-index:50;display:none;flex-direction:column;gap:2px;}
+.account-chip .caret{font-size:9px;opacity:0.85;}
+/* Current-org indicator: a building glyph + the selected org name + a caret,
+   reading as "you are viewing: <Org>". Framed distinctly (accent-tinted border)
+   so it never reads like a personal user menu. Billing + clips are org-scoped, so
+   the org must always be unmistakable. */
+.org-switch{display:inline-flex;align-items:center;gap:7px;cursor:pointer;color:var(--text);height:28px;padding:0 4px;border-radius:999px;}
+.org-switch .org-glyph{font-size:12px;color:var(--accent);line-height:1;}
+.org-switch .org-name{font-weight:600;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.org-switch:hover .org-name{color:var(--accent);}
+.org-switch .org-label{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:0.05em;}
+.org-menu{position:absolute;top:40px;right:0;min-width:220px;padding:6px;border:1px solid var(--border);border-radius:10px;background:color-mix(in srgb,var(--panel) 96%,#000);box-shadow:0 8px 24px rgba(0,0,0,0.35);z-index:50;display:none;flex-direction:column;gap:2px;}
 .org-menu.open{display:flex;}
-.org-menu .org-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:7px;color:var(--text);cursor:pointer;font-size:11px;text-align:left;background:none;border:none;font-family:var(--mono);width:100%;}
-.org-menu .org-item:hover{background:color-mix(in srgb,var(--panel2) 80%,transparent);}
+.org-menu .org-menu-head{padding:4px 10px 6px;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:0.05em;}
+.org-menu .org-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:7px;color:var(--text);cursor:pointer;font-size:11px;text-align:left;background:none;border:none;font-family:var(--mono);width:100%;text-decoration:none;}
+.org-menu .org-item:hover{background:color-mix(in srgb,var(--panel2) 80%,transparent);text-decoration:none;color:var(--text);}
 .org-menu .org-item.current{color:var(--accent);}
+.org-menu .org-item.current::after{content:"\2713";color:var(--accent);font-size:10px;}
 .org-menu .org-role{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:0.04em;}
 .org-menu .org-sep{height:1px;margin:4px 2px;background:var(--border);}
-.org-menu .org-create{color:var(--muted);}
-.org-menu .org-create:hover{color:var(--text);}
+.org-menu .org-muted{color:var(--muted);}
+.org-menu .org-muted:hover{color:var(--text);}
+/* New-org modal: reuses the panel look; overlay dims the page, panel is centered. */
+.org-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.55);display:none;align-items:center;justify-content:center;z-index:100;}
+.org-modal-overlay.open{display:flex;}
+.org-modal{width:320px;max-width:calc(100vw - 32px);padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--panel);box-shadow:0 12px 40px rgba(0,0,0,0.5);font-family:var(--mono);}
+.org-modal h3{margin:0 0 4px;font-size:13px;letter-spacing:0.04em;color:var(--text);}
+.org-modal p{margin:0 0 14px;font-size:11px;color:var(--muted);line-height:1.4;}
+.org-modal label{display:block;font-size:9px;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:6px;}
+.org-modal input{width:100%;box-sizing:border-box;height:36px;padding:0 10px;border:1px solid var(--border);border-radius:8px;background:color-mix(in srgb,var(--panel2) 80%,#000);color:var(--text);font-family:var(--mono);font-size:12px;}
+.org-modal input:focus{outline:none;border-color:var(--accent);}
+.org-modal .org-modal-err{min-height:14px;margin:8px 0 0;font-size:10px;color:#e06b6b;}
+.org-modal .org-modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px;}
+.org-modal button{height:32px;padding:0 14px;border-radius:8px;font-family:var(--mono);font-size:11px;letter-spacing:0.04em;cursor:pointer;border:1px solid var(--border);}
+.org-modal button.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+.org-modal button.primary[disabled]{opacity:0.6;cursor:default;}
+.org-modal button.ghost{background:none;color:var(--muted);}
+.org-modal button.ghost:hover{color:var(--text);}
 .admin-chip{display:none;align-items:center;justify-content:center;width:34px;height:34px;border-radius:999px;border:1px solid var(--border);background:color-mix(in srgb,var(--panel) 92%,#000);color:var(--text);font-family:var(--mono);font-size:13px;text-decoration:none;flex:0 0 auto;}
 .admin-chip:hover{text-decoration:none;border-color:color-mix(in srgb,var(--accent) 35%,var(--border));color:var(--accent);}
 @media (max-width:720px){.topbar{grid-template-columns:auto 1fr;grid-template-areas:"brand utils" "nav nav";row-gap:10px;column-gap:10px;align-items:center;}.topbar-left{grid-area:brand;}.topbar-right{grid-area:utils;justify-self:end;}.topbar-center{grid-area:nav;justify-self:stretch;}.global-nav{width:100%;justify-content:center;}}
@@ -88,59 +114,99 @@ const shellTopbarJS = `
     chip.innerHTML='<a href="'+signInHref()+'">'+(label||"Log in")+'</a>';
   }
   function switchOrg(id){
-    fetch("/api/v1/account/orgs/"+encodeURIComponent(id)+"/switch",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}})
-      .then(function(res){if(!res.ok){throw new Error("status "+res.status);}location.reload();})
-      .catch(function(){});
+    return fetch("/api/v1/account/orgs/"+encodeURIComponent(id)+"/switch",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}})
+      .then(function(res){if(!res.ok){throw new Error("status "+res.status);}location.reload();});
   }
-  function createOrg(){
-    var name=window.prompt("Name your new org:");
-    if(name==null)return;
-    name=String(name).trim();
-    if(!name)return;
-    fetch("/api/v1/account/orgs",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify({name:name})})
-      .then(function(res){return res.json().then(function(d){if(!res.ok){throw new Error(d.error||("status "+res.status));}return d;});})
-      .then(function(d){switchOrg(d.id);})
-      .catch(function(){});
+  function logout(){
+    fetch("/api/v1/account/logout",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}})
+      .then(function(){location.href="/";})
+      .catch(function(){location.href="/";});
+  }
+  // In-page create-org modal (replaces window.prompt). Built once, reused; posts to
+  // POST /api/v1/account/orgs {name}, then switches to the new org and reloads.
+  function openCreateOrgModal(){
+    var overlay=document.getElementById("orgCreateModal");
+    if(!overlay){
+      overlay=document.createElement("div");
+      overlay.className="org-modal-overlay";
+      overlay.id="orgCreateModal";
+      overlay.innerHTML='<div class="org-modal" role="dialog" aria-modal="true" aria-labelledby="orgModalTitle">'
+        +'<h3 id="orgModalTitle">New org</h3>'
+        +'<p>Billing and recorded clips are scoped to the selected org.</p>'
+        +'<label for="orgModalName">Org name</label>'
+        +'<input id="orgModalName" type="text" autocomplete="off" placeholder="e.g. Acme Field Team" />'
+        +'<div class="org-modal-err" id="orgModalErr"></div>'
+        +'<div class="org-modal-actions">'
+        +'<button type="button" class="ghost" id="orgModalCancel">Cancel</button>'
+        +'<button type="button" class="primary" id="orgModalCreate">Create</button>'
+        +'</div></div>';
+      document.body.appendChild(overlay);
+      var input=overlay.querySelector("#orgModalName");
+      var errEl=overlay.querySelector("#orgModalErr");
+      var createBtn=overlay.querySelector("#orgModalCreate");
+      function close(){overlay.classList.remove("open");}
+      function submit(){
+        var name=String(input.value||"").trim();
+        errEl.textContent="";
+        if(!name){errEl.textContent="Enter an org name.";input.focus();return;}
+        createBtn.disabled=true;
+        fetch("/api/v1/account/orgs",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json","Content-Type":"application/json"},body:JSON.stringify({name:name})})
+          .then(function(res){return res.json().then(function(d){if(!res.ok){throw new Error((d&&d.error)||("status "+res.status));}return d;});})
+          .then(function(d){return switchOrg(d.id);})
+          .catch(function(err){createBtn.disabled=false;errEl.textContent=(err&&err.message)||"Could not create org.";});
+      }
+      overlay.addEventListener("click",function(e){if(e.target===overlay){close();}});
+      overlay.querySelector("#orgModalCancel").addEventListener("click",close);
+      createBtn.addEventListener("click",submit);
+      input.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();submit();}else if(e.key==="Escape"){close();}});
+    }
+    var nameInput=overlay.querySelector("#orgModalName");
+    var errBox=overlay.querySelector("#orgModalErr");
+    var createButton=overlay.querySelector("#orgModalCreate");
+    nameInput.value="";errBox.textContent="";createButton.disabled=false;
+    overlay.classList.add("open");
+    nameInput.focus();
   }
   function renderSignedIn(payload){
     if(!chip)return;
     var acct=payload.account||{};
-    var authType=String(payload.session&&payload.session.auth_type||acct.auth_type||"").trim();
     var email=String(acct.email||"").trim()||"Account";
     var currentOrg=payload.current_org||{};
     var orgs=Array.isArray(payload.orgs)?payload.orgs:[];
     var currentId=Number(currentOrg.id||acct.id||0);
-    var orgName=String(currentOrg.name||"").trim();
-    // The switcher shows only when the user actually belongs to >1 org, or when
-    // an org name is present (so a single-org user still sees which org they are in).
-    var hasSwitcher=orgs.length>0;
-    var label='<a href="/account">'+esc(email)+'</a>';
-    if(hasSwitcher){
-      var items=orgs.map(function(o){
-        var oid=Number(o.id);
-        var cur=oid===currentId?' current':'';
-        return '<button type="button" class="org-item'+cur+'" data-org="'+oid+'"><span>'+esc(o.name)+'</span><span class="org-role">'+esc(o.role||"")+'</span></button>';
-      }).join('');
-      label='<span class="org-switch" id="orgSwitch">'+esc(orgName||email)+' <span class="caret">&#9662;</span></span>'
-        +'<div class="org-menu" id="orgMenu">'+items
+    var orgName=String(currentOrg.name||"").trim()||email;
+    // Current-org indicator: a building glyph + the selected org name + a caret.
+    // Always shown for a signed-in user so the org (which scopes billing + clips) is
+    // never ambiguous. The dropdown carries the org list + Account + New org + Log out.
+    var orgItems=orgs.map(function(o){
+      var oid=Number(o.id);
+      var cur=oid===currentId?' current':'';
+      return '<button type="button" class="org-item'+cur+'" data-org="'+oid+'"><span>'+esc(o.name)+'</span><span class="org-role">'+esc(o.role||"")+'</span></button>';
+    }).join('');
+    chip.innerHTML='<span class="org-switch" id="orgSwitch" title="Current org">'
+        +'<span class="org-glyph" aria-hidden="true">&#127970;</span>'
+        +'<span class="org-name">'+esc(orgName)+'</span>'
+        +'<span class="caret" aria-hidden="true">&#9662;</span></span>'
+      +'<div class="org-menu" id="orgMenu">'
+        +(orgItems?'<div class="org-menu-head">Your orgs</div>'+orgItems+'<div class="org-sep"></div>':'')
+        +'<a class="org-item org-muted" id="orgAccount" href="/account">Account</a>'
+        +'<button type="button" class="org-item org-muted" id="orgCreate">New org</button>'
         +'<div class="org-sep"></div>'
-        +'<button type="button" class="org-item org-create" id="orgCreate">+ New org</button>'
-        +'</div>';
-    }
-    chip.innerHTML=label+(authType?' <span class="muted">&middot; '+esc(authType)+'</span>':'');
-    if(hasSwitcher){
-      var sw=document.getElementById("orgSwitch");
-      var menu=document.getElementById("orgMenu");
-      if(sw&&menu){
-        sw.addEventListener("click",function(e){e.stopPropagation();menu.classList.toggle("open");});
-        document.addEventListener("click",function(){menu.classList.remove("open");});
-        menu.addEventListener("click",function(e){e.stopPropagation();});
-        menu.querySelectorAll(".org-item[data-org]").forEach(function(btn){
-          btn.addEventListener("click",function(){var id=Number(btn.getAttribute("data-org"));if(id&&id!==currentId){switchOrg(id);}else{menu.classList.remove("open");}});
-        });
-        var createBtn=document.getElementById("orgCreate");
-        if(createBtn){createBtn.addEventListener("click",createOrg);}
-      }
+        +'<button type="button" class="org-item org-muted" id="orgLogout">Log out</button>'
+      +'</div>';
+    var sw=document.getElementById("orgSwitch");
+    var menu=document.getElementById("orgMenu");
+    if(sw&&menu){
+      sw.addEventListener("click",function(e){e.stopPropagation();menu.classList.toggle("open");});
+      document.addEventListener("click",function(){menu.classList.remove("open");});
+      menu.addEventListener("click",function(e){e.stopPropagation();});
+      menu.querySelectorAll(".org-item[data-org]").forEach(function(btn){
+        btn.addEventListener("click",function(){var id=Number(btn.getAttribute("data-org"));if(id&&id!==currentId){switchOrg(id).catch(function(){});}else{menu.classList.remove("open");}});
+      });
+      var createBtn=document.getElementById("orgCreate");
+      if(createBtn){createBtn.addEventListener("click",function(){menu.classList.remove("open");openCreateOrgModal();});}
+      var logoutBtn=document.getElementById("orgLogout");
+      if(logoutBtn){logoutBtn.addEventListener("click",function(){menu.classList.remove("open");logout();});}
     }
     if(gear&&String(acct.role||"").trim().toLowerCase()==="admin"){gear.style.display="inline-flex";}
   }
