@@ -139,6 +139,12 @@ export EMAIL_PROVIDER='log'
 # export SERVICE_TOKEN='runtime-service-token'
 ```
 
+Keep real credentials out of git. Copy any `local/*.env.example` to the same
+name without the `.example` suffix and fill in real values there; those files are
+gitignored. See [SECURITY.md](SECURITY.md) for the pre-commit setup
+(`pre-commit install`) and note that CI runs gitleaks and fails on any secret
+regardless.
+
 ### Run API
 
 ```bash

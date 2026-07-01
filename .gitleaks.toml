@@ -1,0 +1,27 @@
+# gitleaks config for stoarama.
+# Extends the built-in ruleset (do not redefine rules here) and only adds a
+# global allowlist so scrubbed placeholder templates don't trip the scanner.
+# CI (.github/workflows/gitleaks.yml) is the authoritative gate.
+
+title = "stoarama gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore scrubbed placeholder templates and known non-secrets"
+
+# Placeholder example/sample env + tfvars files (keys only, no real values).
+paths = [
+  '''.*\.env\.example$''',
+  '''.*\.env\.sample$''',
+  '''.*\.tfvars\.example$''',
+  '''\.env\.example$''',
+  '''\.env\.sample$''',
+]
+
+# Placeholder tokens used in examples and dev-compose fixtures.
+regexes = [
+  '''__set_me__''',
+  '''sir_REPLACE_ME''',
+]

@@ -1,0 +1,8 @@
+# Local secret-scanning gate. One-time setup: `pre-commit install`.
+# CI (.github/workflows/gitleaks.yml) enforces the same scan and cannot be
+# bypassed, so this hook is an early local catch, not the authority.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

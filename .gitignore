@@ -33,3 +33,34 @@ build/
 # local-only artifacts (never publish)
 tmp/
 docs/HANDOFF_R2_COST_CLEANUP_2026-05-26.md
+
+# ---------------------------------------------------------------------------
+# secrets: never commit real credentials. Add new secret files above their
+# matching pattern here rather than tracking them. Placeholder ".example"/
+# ".sample" files ARE allowed (negated below) so devs know what to provide.
+# CI (gitleaks) enforces this regardless of local setup.
+# ---------------------------------------------------------------------------
+local/render.env
+*.env
+.env*
+*.pem
+*.key
+*_rsa
+*_rsa.pub
+*.tfvars
+.npmrc
+*service-account*.json
+service-account*.json
+*-credentials.json
+credentials.json
+*.p12
+*.pfx
+
+# allow scrubbed placeholder templates (keys only, no real values)
+!*.env.example
+!*.env.sample
+!.env.example
+!.env.sample
+!local/*.env.example
+!local/*.env.sample
+!*.tfvars.example
