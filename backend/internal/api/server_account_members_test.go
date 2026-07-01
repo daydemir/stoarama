@@ -1,6 +1,33 @@
 package api
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// TestPathEmailParamDecodesEncodedEmail locks the fix for the member role/remove
+// routes: the browser sends the email via encodeURIComponent ("user%40host"), chi
+// routes on the raw path and hands URLParam back still-encoded, so pathEmailParam
+// must percent-decode it or looksLikeEmail sees zero '@' and rejects a valid email.
+// Routed through a real chi mux with the exact encoded form the browser produces.
+func TestPathEmailParamDecodesEncodedEmail(t *testing.T) {
+	var got string
+	r := chi.NewRouter()
+	r.Patch("/api/v1/account/members/{email}/role", func(w http.ResponseWriter, req *http.Request) {
+		got = pathEmailParam(req)
+	})
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/account/members/vifiamme%40mit.edu/role", nil)
+	r.ServeHTTP(httptest.NewRecorder(), req)
+	if got != "vifiamme@mit.edu" {
+		t.Fatalf("pathEmailParam=%q want vifiamme@mit.edu (must decode %%40)", got)
+	}
+	if !looksLikeEmail(normalizeAccountEmail(got)) {
+		t.Fatalf("decoded %q must pass looksLikeEmail after normalize", got)
+	}
+}
 
 func TestPrincipalIsOwnerDefaults(t *testing.T) {
 	// Legacy sessions (empty MemberRole) and explicit owner are owners; member is not.

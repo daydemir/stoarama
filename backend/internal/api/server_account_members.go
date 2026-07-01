@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,6 +20,18 @@ import (
 // (principal.AccountID) and gate on the org role (principal.MemberRole via
 // memberships.role), which is fully separate from the platform operator flag
 // (principal.Role via users.is_operator).
+
+// pathEmailParam reads the {email} path param and URL-decodes it. chi routes on
+// the raw (percent-encoded) path and returns URLParam values still encoded, so an
+// email arriving as "user%40host" must be unescaped to "user@host" before it can
+// pass looksLikeEmail. Applies to the member role and remove routes.
+func pathEmailParam(r *http.Request) string {
+	raw := chi.URLParam(r, "email")
+	if decoded, err := url.PathUnescape(raw); err == nil {
+		return decoded
+	}
+	return raw
+}
 
 type accountMemberInviteRequest struct {
 	Email string `json:"email"`
@@ -174,7 +187,7 @@ func (s *Server) handleAccountMembersRemove(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusForbidden, "only an org owner can remove members")
 		return
 	}
-	email := normalizeAccountEmail(chi.URLParam(r, "email"))
+	email := normalizeAccountEmail(pathEmailParam(r))
 	if !looksLikeEmail(email) {
 		util.WriteError(w, http.StatusBadRequest, "valid email is required")
 		return
@@ -289,7 +302,7 @@ func (s *Server) handleAccountMemberRoleSet(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusForbidden, "only an org owner can change member roles")
 		return
 	}
-	email := normalizeAccountEmail(chi.URLParam(r, "email"))
+	email := normalizeAccountEmail(pathEmailParam(r))
 	if !looksLikeEmail(email) {
 		util.WriteError(w, http.StatusBadRequest, "valid email is required")
 		return
