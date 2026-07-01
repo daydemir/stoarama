@@ -198,7 +198,7 @@
         <section id="sectionGettingStarted" class="section panel">
           <div class="eyebrow">Overview</div>
           <h1>Browse the catalog, record on a schedule.</h1>
-          <p>Stoarama is a public catalog of live video streams you can browse without an account. It also runs a paid recorder that captures a stream on a schedule and saves each capture as a clip you can download.</p>
+          <p>Stoarama is a public catalog of live video streams you can browse without an account. It also runs a paid recorder that captures a stream on a schedule and saves each clip you can download.</p>
           <p>Browsing is free. Recording needs a signed-in account and a card on file.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
@@ -217,9 +217,9 @@
               <p><b>$0.05 per recording-hour, plus your choice of storage.</b></p>
               <ul>
                 <li><b>$0.05</b> for each hour a recording captures at least one clip. An hour that captures nothing is <b>free</b>.</li>
-                <li><b>Managed storage</b> bills <b>$0.10</b> per hour of footage per month, for the time each clip is kept.</li>
-                <li>Record to your own NAS instead and storage is <b>free</b> while the NAS keeps up.</li>
-                <li>Billed once a month in arrears with a card on file via Stripe. Adding a card does not charge you.</li>
+                <li><b>Managed storage</b> bills <b>$0.10</b> per hour of footage, per month, for the time each clip is kept.</li>
+                <li>Record to your own NAS instead and storage is <b>free</b> (you keep clips on your own NAS).</li>
+                <li>Billed once a month, at the end of the month, to a card on file via Stripe. Adding a card does not charge you.</li>
               </ul>
             </div>
           </div>
@@ -228,7 +228,7 @@
         <section id="sectionAPI" class="section panel">
           <div class="eyebrow">Recorder</div>
           <h1>Record any public HLS or HTTPS stream.</h1>
-          <p>A recording captures one stream on a schedule and writes each capture as a clip. Set it up on <a href="/recordings">your recordings</a>.</p>
+          <p>A recording captures one stream on a schedule and writes each clip. Set it up on <a href="/recordings">your recordings</a>.</p>
           <p>You point it at a stream, pick how often it fires and how long each clip is, and choose where the clips land.</p>
           <div class="grid" style="margin-top:16px;">
             <div class="panel">
@@ -255,9 +255,8 @@
               <div class="eyebrow">Storage</div>
               <h2>Managed or your own NAS</h2>
               <ul>
-                <li><b>Managed storage</b> bills <b>$0.10</b> per hour of footage per month, for the time each clip is kept. Delete a clip and its charge stops.</li>
-                <li><b>Your own NAS</b> keeps clips on your hardware. A small client pulls each clip on a poll, Stoarama verifies the download, then releases its managed copy. Storage is <b>free</b> while the NAS keeps up.</li>
-                <li>If the NAS falls behind, clips left in managed storage over <b>24h</b> bill at <b>$0.10</b> per hour of footage per month until the NAS catches up.</li>
+                <li><b>Managed storage</b> bills <b>$0.10</b> per hour of footage, per month, for the time each clip is kept. Delete a clip and its charge stops.</li>
+                <li><b>Your own NAS</b> keeps clips on your hardware. A small client pulls each clip on a poll, Stoarama verifies the download, then releases its managed copy. Storage is free while your NAS is pulling clips. If it falls behind, clips we hold past 24 hours bill at $0.10 per hour of footage, per month, until it catches up.</li>
               </ul>
             </div>
             <div class="panel">

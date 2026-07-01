@@ -733,7 +733,7 @@ const accountClipsCursorSQL = `
 `
 
 // handleAccountClips returns one forward-cursored page of the calling account's
-// unpurged clips, ordered by the monotonic clip id, for the MIT NAS pull client.
+// unpurged clips, ordered by the monotonic clip id, for the NAS pull client.
 // It is mounted under requireAccountAuth so a Bearer sir_ account API key can
 // drain it. Each row carries a download_path to the existing per-recording clip
 // download endpoint; object_key is never exposed. next_after_id is the max clip

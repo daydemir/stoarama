@@ -354,6 +354,18 @@
       .composer-body { grid-template-columns: 1fr; }
       .composer-side { position: static; top: auto; }
     }
+    /* On wide screens the reading-width .rec-content cap (880px) is right for the
+       list/detail views but leaves the two-column composer (cards + price rail)
+       marooned in a narrow band with an awkward right-hand gutter. Break the composer
+       out of the 880px cap to a wider centered width so the price rail sits near the
+       shell edge and both sides stay balanced. The negative inline margins undo the
+       parent cap symmetrically; only applied where the parent is the full 880px. */
+    @media (min-width: 1040px) {
+      #composer:not(.hidden) {
+        width: 1120px;
+        margin-inline: calc((880px - 1120px) / 2);
+      }
+    }
     @media (max-width: 640px) {
       .grid-2 { grid-template-columns: 1fr; }
       .card-head { flex-direction: column; }
@@ -451,7 +463,7 @@
       <!-- Inline composer -->
       <section id="composer" class="panel hidden">
         <div class="section-title">
-          <div><div class="eyebrow">New recording</div><h2>Configure a capture</h2></div>
+          <div><div class="eyebrow">New recording</div><h2>Configure a recording</h2></div>
           <button id="composerClose" class="secondary" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Cancel</button>
         </div>
 
@@ -486,7 +498,7 @@
         <div id="bundleSourceBlock" class="hidden">
           <div class="field">
             <label for="bundleName">Bundle name</label>
-            <input id="bundleName" type="text" placeholder="MIT study set 1" />
+            <input id="bundleName" type="text" placeholder="Study set 1" />
           </div>
           <div class="field">
             <label>Streams in this bundle</label>
@@ -515,7 +527,7 @@
         <!-- Capture mode: the core choice that reveals only the relevant time
              controls below (sampled -> schedule; continuous -> daily window). -->
         <div class="field">
-          <label>Capture mode</label>
+          <label>Recording mode</label>
           <div class="seg" id="modeSeg">
             <button type="button" data-mode="sampled" class="on">Sample clips on a schedule</button>
             <button type="button" data-mode="continuous">Record continuously</button>
@@ -643,6 +655,7 @@
         <!-- SECTION D: Where clips go (storage) -->
         <div class="form-section">
         <div class="form-section-head"><span class="form-section-step">D</span><span class="form-section-title">Where clips go</span></div>
+        <p class="hint" style="margin:0 0 10px;">Keep clips in storage we manage for you, or record to your own NAS.</p>
 
         <!-- Where clips go -->
         <div class="field">
@@ -654,8 +667,8 @@
           <!-- Storage chooser: managed (operator R2) vs BYO. Shown only when the
                managed option is available per GET /billing; otherwise BYO only. -->
           <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
-            <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10 per hour of footage stored per month)</button>
-            <button type="button" data-storage="nas" class="hidden" id="nasStorageBtn">Record to my NAS ($0.05 per stream-hour recording; storage free while pulled; $0.10/hr-mo only for clips held past 24h if the NAS falls behind)</button>
+            <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10 per hour of footage, per month)</button>
+            <button type="button" data-storage="nas" class="hidden" id="nasStorageBtn">Record to my NAS - storage free</button>
             <button type="button" data-storage="byo" class="hidden" id="byoStorageBtn">Connect your own S3 bucket</button>
             <button type="button" data-storage="shared" class="hidden" id="sharedStorageBtn">Shared destination</button>
           </div>
@@ -665,8 +678,8 @@
                only when the managed (not NAS) option is active. yearly_prepaid needs a
                card on file (enforced by the server); the hint points to Org settings. -->
           <div id="retentionChooser" class="seg hidden" style="margin-bottom:10px;">
-            <button type="button" data-retention="monthly">Pay monthly ($0.10 per hour of footage stored per month, billed in arrears)</button>
-            <button type="button" data-retention="yearly_prepaid">Prepay yearly ($0.05 per hour of footage stored per month, prepaid 12 months up front)</button>
+            <button type="button" data-retention="monthly">Pay monthly - $0.10 per hour of footage, per month</button>
+            <button type="button" data-retention="yearly_prepaid">Prepay a year - $0.05 per hour of footage, per month (half price)</button>
           </div>
           <div id="retentionHint" class="hint hidden" style="margin-bottom:10px;"></div>
           <div id="managedStatus" class="status hidden" style="margin-bottom:10px;"></div>
@@ -978,6 +991,10 @@
     function browserTimezone() {
       try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) { return 'UTC'; }
     }
+
+    // Human-readable label for an IANA zone (e.g. "America/New_York" -> "New York").
+    // Display only; never use for <option> values or values sent to the API.
+    function tzLabel(z) { return String(z || 'UTC').split('/').pop().replace(/_/g, ' '); }
 
     // A small, valid IANA list with the browser zone and UTC always present.
     function timezoneOptions() {
@@ -1400,7 +1417,7 @@
       if (!state.billingEnabled) { els.costEstimate.textContent = ''; els.costEstimateNote.textContent = ''; return; }
       if (state.composerScheduleMode === 'continuous') {
         els.costEstimate.innerHTML = '<span class="muted"><span class="cs-cost">Continuous</span> records every hour the window is active; storage scales with total footage.</span>';
-        els.costEstimateNote.textContent = 'Billed per hour of recording plus managed storage per hour of footage kept per month, monthly in arrears. Pricing is unchanged from sampled.';
+        els.costEstimateNote.textContent = 'Billed at the end of each month: $0.05 per recording-hour plus managed storage at $0.10 per hour of footage, per month.';
         return;
       }
       const m = estimateModel();
@@ -1420,7 +1437,7 @@
       }
       els.costEstimate.innerHTML = parts.join('');
       if (m.nas) {
-        els.costEstimateNote.textContent = 'Estimate only. NAS is $0.05 per hour of recording, and storage on your NAS is free. If your NAS falls behind, clips left in managed storage over 24h bill at $0.10 per hour of footage per month until it catches up.';
+        els.costEstimateNote.textContent = 'Estimate only. NAS is $0.05 per hour of recording, and storage on your NAS is free. If your NAS falls behind, clips left in managed storage over 24h bill at $0.10 per hour of footage, per month until it catches up.';
       } else if (m.managed && m.yearlyPrepaid) {
         els.costEstimateNote.textContent = `Estimate only. Yearly prepaid: storage is $0.05 per hour of footage kept for a month, prepaid 12 months up front. This month's stored footage is charged to your card now; new footage is prepaid monthly.`;
       } else {
@@ -1449,7 +1466,7 @@
         const tz = selectedTimezone();
         const d = nextRunDate(new Date(), tz);
         els.schedPreview.innerHTML = d
-          ? `<span class="muted">Next run: </span>${escapeHTML(formatNextRun(d, tz))} <span class="muted">${escapeHTML(tz)}</span>`
+          ? `<span class="muted">Next run: </span>${escapeHTML(formatNextRun(d, tz))} <span class="muted">${escapeHTML(tzLabel(tz))}</span>`
           : '';
       }
 
@@ -1654,8 +1671,8 @@
           state.verifiedDestId = Number(md.id || 0);
           els.managedStatus.classList.remove('hidden');
           const managedNote = state.managedRetention === 'yearly_prepaid'
-            ? 'Connected to Stoarama-managed storage. Yearly prepaid: $0.05 per hour of footage stored per month, prepaid 12 months up front.'
-            : 'Connected to Stoarama-managed storage. Clips are billed $0.10 per hour of footage stored per month.';
+            ? 'Connected to Stoarama-managed storage. Yearly prepaid: $0.05 per hour of footage, per month, prepaid 12 months up front.'
+            : 'Connected to Stoarama-managed storage. Clips are billed $0.10 per hour of footage, per month.';
           setStatus(els.managedStatus, isNas
             ? 'Recording to your NAS. Clips write to managed storage and your NAS pulls each one within about a minute.'
             : managedNote, 'ok');
@@ -1706,7 +1723,7 @@
         els.retentionHint.innerHTML = 'Yearly prepaid needs a payment method. <a href="/org-settings">Add one in Org settings</a> to prepay.';
       } else if (state.managedRetention === 'yearly_prepaid') {
         els.retentionHint.classList.remove('hidden');
-        els.retentionHint.textContent = 'Yearly prepaid: this month’s stored footage is prepaid for 12 months at $0.05 per hour of footage per month; new footage is prepaid monthly.';
+        els.retentionHint.textContent = 'Yearly prepaid: this month’s stored footage is prepaid for 12 months at $0.05 per hour of footage, per month; new footage is prepaid monthly.';
       } else {
         els.retentionHint.classList.add('hidden');
       }
@@ -2188,7 +2205,7 @@
         const d = new Date(); d.setHours(hh, mm, 0, 0);
         const t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
         const tz = String(rec.cron_timezone || 'UTC');
-        return `Daily at ${t} ${tz}`;
+        return `Daily at ${t} ${tzLabel(tz)}`;
       }
       const everyMin = /^\*\/(\d+) \* \* \* \*$/.exec(expr);
       if (everyMin) return `Every ${Number(everyMin[1])} min`;
@@ -2269,11 +2286,11 @@
       const isManaged = rec.storage_managed === true && !isNasDelivery;
       const tier = String(rec.storage_retention_tier || 'monthly');
       if (isNasDelivery) {
-        metaParts.push(`<span>Storage: your NAS. <b>Free</b> while pulled. Clips held past 24h if the NAS falls behind bill at <b>$0.10</b> per hour of footage per month.</span>`);
+        metaParts.push(`<span>Storage: your NAS. <b>Free</b> while pulled. Clips held past 24h if the NAS falls behind bill at <b>$0.10</b> per hour of footage, per month.</span>`);
       } else if (isManaged) {
         const tierLabel = tier === 'yearly_prepaid'
-          ? 'Storage: yearly prepaid (<b>$0.05</b> per hour of footage per month)'
-          : 'Storage: monthly metered (<b>$0.10</b> per hour of footage per month)';
+          ? 'Storage: yearly prepaid (<b>$0.05</b> per hour of footage, per month)'
+          : 'Storage: monthly storage (<b>$0.10</b> per hour of footage, per month)';
         metaParts.push(`<span data-tierlabel="${id}">${tierLabel}</span>`);
       }
 
@@ -2735,7 +2752,7 @@
         const s = String(rec.daily_window_start || '').trim();
         const e = String(rec.daily_window_end || '').trim();
         const tz = String(rec.cron_timezone || 'UTC');
-        return s && e ? `Continuous, ${s} to ${e} ${escapeHTML(tz)}` : 'Continuous';
+        return s && e ? `Continuous, ${s} to ${e} ${escapeHTML(tzLabel(tz))}` : 'Continuous';
       }
       return `Sampled, ${scheduleLabel(rec)}`;
     }
@@ -2758,9 +2775,9 @@
       ];
       const startTxt = fmtInstant(rec.start_at);
       const endTxt = fmtInstant(rec.end_at);
-      rows.push(['Capture window', `${startTxt || 'Now'} to ${endTxt || 'open-ended'}`]);
+      rows.push(['Recording window', `${startTxt || 'Now'} to ${endTxt || 'open-ended'}`]);
       const nextTxt = fmtInstant(rec.next_fire_at);
-      if (nextTxt) rows.push(['Next fire', nextTxt]);
+      if (nextTxt) rows.push(['Next run', nextTxt]);
       const editable = String(rec.status || '') !== 'canceled' && !isCompleted(rec);
       return `
         <div class="detail-card">
@@ -2788,7 +2805,7 @@
         rows.push(['NAS folder', `<span class="mono">${streamId > 0 ? streamId : '(stream id)'}</span>`]);
       } else if (isManaged) {
         rows.push(['Storage', 'Stoarama-managed']);
-        rows.push(['Billing type', tier === 'yearly_prepaid' ? 'Yearly, <b>$0.05</b> per hour of footage per month' : 'Monthly, <b>$0.10</b> per hour of footage per month']);
+        rows.push(['Billing type', tier === 'yearly_prepaid' ? 'Yearly, <b>$0.05</b> per hour of footage, per month' : 'Monthly, <b>$0.10</b> per hour of footage, per month']);
       } else {
         rows.push(['Storage', 'Your own S3']);
       }
@@ -2885,7 +2902,7 @@
     }
 
     async function deleteRecordingDetail(id) {
-      if (!window.confirm('Delete this recording? This stops capture.')) return;
+      if (!window.confirm('Delete this recording? This stops it.')) return;
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(String(id))}`, { method: 'DELETE' });
         window.location.assign('/recordings');
@@ -2900,8 +2917,8 @@
       const id = String(btn.getAttribute('data-retention') || '').trim();
       const tier = String(btn.getAttribute('data-tier') || '').trim();
       const msg = tier === 'yearly_prepaid'
-        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage per month, charged to your card now. New footage is prepaid monthly.'
-        : 'Switch to monthly metered? Future footage bills at $0.10 per hour of footage per month. Any prepaid credit already granted runs until it expires and is not refunded.';
+        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage, per month, charged to your card now. New footage is prepaid monthly.'
+        : 'Switch to monthly storage? Future footage bills at $0.10 per hour of footage, per month. Any prepaid credit already granted runs until it expires and is not refunded.';
       if (!window.confirm(msg)) return;
       btn.disabled = true;
       try {
@@ -2960,7 +2977,7 @@
       const endVal = rec.end_at ? toLocalInputValue(new Date(rec.end_at)) : '';
       form.innerHTML = `
         <div class="field">
-          <label>Capture mode</label>
+          <label>Recording mode</label>
           <div class="seg" data-editmode>
             <button type="button" data-emode="sampled"${mode === 'sampled' ? ' class="on"' : ''}>Sample on a schedule</button>
             <button type="button" data-emode="continuous"${mode === 'continuous' ? ' class="on"' : ''}>Record continuously</button>
@@ -3440,7 +3457,7 @@
     }
 
     async function deleteRecording(btn) {
-      if (!window.confirm('Delete this recording? This stops capture.')) return;
+      if (!window.confirm('Delete this recording? This stops it.')) return;
       const id = String(btn.getAttribute('data-delete') || '').trim();
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' });
@@ -3459,8 +3476,8 @@
       const id = String(btn.getAttribute('data-retention') || '').trim();
       const tier = String(btn.getAttribute('data-tier') || '').trim();
       const msg = tier === 'yearly_prepaid'
-        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage per month, charged to your card now. New footage is prepaid monthly.'
-        : 'Switch to monthly metered? Future footage bills at $0.10 per hour of footage per month. Any prepaid credit already granted runs until it expires and is not refunded.';
+        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage, per month, charged to your card now. New footage is prepaid monthly.'
+        : 'Switch to monthly storage? Future footage bills at $0.10 per hour of footage, per month. Any prepaid credit already granted runs until it expires and is not refunded.';
       if (!window.confirm(msg)) return;
       btn.disabled = true;
       try {
@@ -3766,13 +3783,13 @@
       const nas = state.storageChoice === 'nas';
       els.startBtn.textContent = needsCard ? 'Add a payment method in Org settings' : 'Start recording';
       const hoursCharge = '$0.05 for each hour a recording captures at least one clip';
-      const storageCharge = ', plus $0.10 per hour of footage stored per month for managed storage';
+      const storageCharge = ', plus $0.10 per hour of footage, per month for managed storage';
       const nasCharge = ', plus $0.01 per hour of recording for NAS transfer';
       const storedCharge = nas ? nasCharge : (managed ? storageCharge : '');
       const paidLine = nas
-        ? '$0.05 per hour of recording, plus $0.01 per hour of recording for NAS transfer. If your NAS goes down while recording, unsent clips are kept safely in managed storage and bill at $0.10 per hour of footage per month until your NAS catches up.'
+        ? '$0.05 per hour of recording, plus $0.01 per hour of recording for NAS transfer. If your NAS goes down while recording, unsent clips are kept safely in managed storage and bill at $0.10 per hour of footage, per month until your NAS catches up.'
         : (managed
-            ? '$0.05 per hour of recording, plus $0.10 per hour of footage stored per month for managed storage.'
+            ? '$0.05 per hour of recording, plus $0.10 per hour of footage, per month for managed storage.'
             : '$0.05 per hour of recording.');
       els.composerFootnote.textContent = state.billingEnabled
         ? (needsCard
@@ -4134,7 +4151,7 @@
 
     function scheduleSummary(b) {
       const cron = escapeHTML(String(b.cron_expr || ''));
-      const tz = escapeHTML(String(b.cron_timezone || 'UTC'));
+      const tz = escapeHTML(tzLabel(String(b.cron_timezone || 'UTC')));
       const clip = Number(b.clip_duration_sec || 0);
       const fps = b.target_fps ? `${Number(b.target_fps)} fps` : 'Source fps';
       return `<span class="mono">${cron}</span> <span class="muted">${tz} &middot; ${clip}s clips &middot; ${escapeHTML(fps)}</span>`;
@@ -4171,7 +4188,7 @@
         </tr>`;
       }).join('');
       const table = `<table class="clip-table"><thead><tr>
-        <th>Name</th><th class="num">Streams</th><th>Schedule</th><th>Status</th><th class="num">Record-hours</th><th class="num">Cost</th>
+        <th>Name</th><th class="num">Streams</th><th>Schedule</th><th>Status</th><th class="num">Recording-hours</th><th class="num">Cost</th>
       </tr></thead><tbody>${rows}</tbody></table>`;
       els.bundleList.innerHTML = header + table;
       els.bundleList.querySelectorAll('a[data-bundlelink]').forEach((a) =>
