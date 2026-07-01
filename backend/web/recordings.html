@@ -262,6 +262,24 @@
     .inline-link { width: auto; min-width: 0; min-height: 0; padding: 0; border: 0; background: none; color: var(--accent); font-weight: 500; font-size: 13px; cursor: pointer; }
     .inline-link:hover { text-decoration: underline; background: none; }
     .empty-hero-sub { color: var(--muted); font-size: 15px; line-height: 1.5; margin: 0 0 18px; }
+    /* Composer sections: a labelled block per step (A What / B When / C Clip / D
+       Storage) so the form reads as an ordered hierarchy, not a flat stack. */
+    .form-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+    .form-section:first-of-type { margin-top: 8px; padding-top: 0; border-top: 0; }
+    .form-section-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; }
+    .form-section-step { font-family: var(--mono); font-size: 11px; font-weight: 500; color: var(--accent); letter-spacing: 0.06em; }
+    .form-section-title { font-size: 15px; font-weight: 600; color: var(--text); }
+    /* Live clip-count + cost summary: sticky one-liner that follows the config. */
+    .composer-summary {
+      position: sticky; bottom: 0; z-index: 2;
+      margin: 18px -18px -18px; padding: 12px 18px;
+      border-top: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 92%, #000);
+      border-bottom-left-radius: 18px; border-bottom-right-radius: 18px;
+      font-family: var(--mono); font-size: 13px; line-height: 1.5; color: var(--muted);
+    }
+    .composer-summary b { color: var(--text); font-weight: 600; }
+    .composer-summary .cs-cost { color: var(--accent); }
     .composer-footnote { margin: 14px 0 12px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .composer-footnote.warn { color: var(--warn); font-weight: 500; }
     .interstitial-body { color: var(--muted); line-height: 1.6; margin: 0 0 16px; }
@@ -348,6 +366,10 @@
           <button id="composerClose" class="secondary" type="button" style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Cancel</button>
         </div>
 
+        <!-- SECTION A: What to record (source + name) -->
+        <div class="form-section">
+        <div class="form-section-head"><span class="form-section-step">A</span><span class="form-section-title">What to record</span></div>
+
         <!-- Catalog-stream lock: shown when the composer is opened from a catalog
              stream (?stream_id=). The source is fixed to the catalog reference and
              the paste field is hidden; the server derives stream_url from stream_id. -->
@@ -400,15 +422,21 @@
           <label for="recName">Name (optional)</label>
           <input id="recName" type="text" placeholder="A label for this recording" />
         </div>
+        </div><!-- /Section A -->
 
-        <!-- Capture mode -->
+        <!-- SECTION B: When and how long (mode-led time flow) -->
+        <div class="form-section">
+        <div class="form-section-head"><span class="form-section-step">B</span><span class="form-section-title">When and how long</span></div>
+
+        <!-- Capture mode: the core choice that reveals only the relevant time
+             controls below (sampled -> schedule; continuous -> daily window). -->
         <div class="field">
           <label>Capture mode</label>
           <div class="seg" id="modeSeg">
-            <button type="button" data-mode="sampled" class="on">Sampled clips</button>
-            <button type="button" data-mode="continuous">Continuous gapless</button>
+            <button type="button" data-mode="sampled" class="on">Sample clips on a schedule</button>
+            <button type="button" data-mode="continuous">Record continuously</button>
           </div>
-          <div class="hint">Sampled records one clip per scheduled fire. Continuous records back-to-back segments with no gaps for a daily time window.</div>
+          <div class="hint">Sample records one clip per scheduled fire. Continuous records back-to-back segments with no gaps for a daily time window.</div>
         </div>
 
         <!-- Continuous daily window (shown only in continuous mode) -->
@@ -471,9 +499,10 @@
           <div id="schedWarn" class="hint warn"></div>
         </div>
 
-        <!-- Recording window (start/stop dates) -->
+        <!-- Overall recording window (start/stop dates): applies to both modes,
+             bounding the whole schedule/window run, not a single day. -->
         <div class="field">
-          <label>When to capture</label>
+          <label>Overall start and stop (optional)</label>
           <div class="grid-2">
             <div>
               <label for="startAt">Start</label>
@@ -484,9 +513,14 @@
               <input id="endAt" type="datetime-local" />
             </div>
           </div>
-          <div class="hint">Leave Stop empty to record open-ended until you pause or delete.</div>
+          <div class="hint">Bounds the whole recording. Leave Stop empty to record open-ended until you pause or delete.</div>
           <div id="windowWarn" class="hint warn"></div>
         </div>
+        </div><!-- /Section B -->
+
+        <!-- SECTION C: Clip settings -->
+        <div class="form-section">
+        <div class="form-section-head"><span class="form-section-step">C</span><span class="form-section-title">Clip settings</span></div>
 
         <!-- Clip length -->
         <div class="field">
@@ -503,27 +537,30 @@
           </div>
         </div>
 
-        <!-- Frame rate -->
+        <!-- Frame rate: Source/30/15 quick-picks plus an arbitrary custom rate
+             (1-60). Custom reveals the number input and drives target_fps. -->
         <div class="field">
           <label>Frame rate</label>
           <div class="seg" id="fpsSeg">
             <button type="button" data-fps="source" class="on">Source</button>
             <button type="button" data-fps="30">30 fps</button>
             <button type="button" data-fps="15">15 fps</button>
+            <button type="button" data-fps="custom">Custom</button>
           </div>
-          <div class="hint">Source keeps the stream's native frame rate with no re-encode, which is the cheapest option. 15 fps is common for computer-vision pedestrian detection, since it cuts storage and compute. Choosing 30 or 15 re-encodes each clip to that rate.</div>
+          <div id="fpsCustomWrap" class="field hidden" style="margin-top:12px;margin-bottom:0;max-width:240px;">
+            <label for="fpsCustom">Frame rate (fps)</label>
+            <input id="fpsCustom" type="number" min="1" max="60" step="1" value="10" />
+          </div>
+          <div class="hint">Source keeps the stream's native frame rate with no re-encode, which is the cheapest option. 15 fps is common for computer-vision pedestrian detection, since it cuts storage and compute. Choosing a fixed rate re-encodes each clip to that rate. Custom accepts 1 to 60 fps.</div>
         </div>
+        </div><!-- /Section C -->
 
-        <!-- Projected monthly cost for this configuration (honest estimate) -->
-        <div class="field" id="estimateField">
-          <label>Estimated monthly cost</label>
-          <div id="costEstimate" class="preview"></div>
-          <div id="costEstimateNote" class="hint"></div>
-        </div>
+        <!-- SECTION D: Where clips go (storage) -->
+        <div class="form-section">
+        <div class="form-section-head"><span class="form-section-step">D</span><span class="form-section-title">Where clips go</span></div>
 
         <!-- Where clips go -->
         <div class="field">
-          <label>Where clips go</label>
           <!-- Connection state for the selected/connected bucket (gates Start) -->
           <div id="bucketState" class="status" style="margin-bottom:10px;">Not connected</div>
           <!-- Storage chooser: managed (operator R2) vs BYO. Shown only when the
@@ -557,7 +594,13 @@
             <select id="recDest"></select>
             <div class="hint"><button type="button" class="inline-link" id="connectAnotherBtn">+ Connect another bucket</button></div>
           </div>
-          <!-- Inline connect form (shown when no verified bucket, or when "connect another" is clicked) -->
+          <!-- Inline connect form, tucked behind a disclosure so the credential
+               fields do not dominate the storage step. renderByoStorageUI /
+               openConnectForm reveal it (open the disclosure) only on the BYO path
+               when there is no saved bucket or "connect another" is clicked. -->
+          <details id="byoDisclosure" class="disclose hidden" style="margin-top:10px;">
+          <summary id="byoDisclosureSummary">Connect a new S3 bucket</summary>
+          <div>
           <div id="connectForm" class="subpanel hidden">
             <h3 id="connectFormTitle">Connect your S3 bucket</h3>
             <div class="field">
@@ -609,6 +652,18 @@
             </div>
             <div id="cnStatus" class="status" style="margin-top:8px;"></div>
           </div>
+          </div>
+          </details>
+        </div>
+        </div><!-- /Section D -->
+
+        <!-- Live clip-count + cost summary: updates on every change. Shows the
+             concrete clip count for both sampled and continuous, plus the reused
+             cost estimate. costEstimate/costEstimateNote keep the existing math. -->
+        <div id="composerSummary" class="composer-summary">
+          <div id="composerCount"></div>
+          <div id="costEstimate" class="preview" style="margin-top:4px;"></div>
+          <div id="costEstimateNote" class="hint" style="margin-top:2px;"></div>
         </div>
 
         <div id="composerFootnote" class="composer-footnote"></div>
@@ -673,6 +728,9 @@
       clipCustomWrap: document.getElementById('clipCustomWrap'),
       clipCustom: document.getElementById('clipCustom'),
       fpsSeg: document.getElementById('fpsSeg'),
+      fpsCustomWrap: document.getElementById('fpsCustomWrap'),
+      fpsCustom: document.getElementById('fpsCustom'),
+      composerCount: document.getElementById('composerCount'),
       costEstimate: document.getElementById('costEstimate'),
       costEstimateNote: document.getElementById('costEstimateNote'),
       bucketState: document.getElementById('bucketState'),
@@ -690,6 +748,7 @@
       recDest: document.getElementById('recDest'),
       connectAnotherBtn: document.getElementById('connectAnotherBtn'),
       connectForm: document.getElementById('connectForm'),
+      byoDisclosure: document.getElementById('byoDisclosure'),
       connectFormTitle: document.getElementById('connectFormTitle'),
       cnProvider: document.getElementById('cnProvider'),
       cnName: document.getElementById('cnName'),
@@ -873,9 +932,10 @@
       return s < e;
     }
 
-    // setScheduleMode toggles the visible schedule controls and the relabel of the
-    // clip control. In continuous mode the per-fire cron block is hidden and the
-    // daily window is shown; the Clip length control is reused as the Segment length.
+    // setScheduleMode toggles which time controls are visible. In continuous mode
+    // the per-fire cron block is hidden and the daily window is shown; the Clip
+    // length control in Section C stays labelled "Clip length" in both modes (no
+    // silent relabel). The live count line names segments vs clips per mode.
     function setScheduleMode(m) {
       state.composerScheduleMode = (m === 'continuous') ? 'continuous' : 'sampled';
       const cont = state.composerScheduleMode === 'continuous';
@@ -884,8 +944,6 @@
       });
       els.continuousControls.classList.toggle('hidden', !cont);
       els.scheduleField.classList.toggle('hidden', cont);
-      const clipLabel = els.clipSeg.closest('.field')?.querySelector('label');
-      if (clipLabel) clipLabel.textContent = cont ? 'Segment length' : 'Clip length';
       refreshContinuousWarn();
       refreshStartEnabled();
       renderCostEstimate();
@@ -1167,10 +1225,78 @@
       };
     }
 
+    // Concrete clips-per-day for the active mode, or null when it cannot be
+    // computed yet. Sampled = fires/day (known presets only); continuous =
+    // window seconds / clip length across the daily window.
+    function estClipsPerDay() {
+      const clipSec = selectedClipSec();
+      if (clipSec <= 0) return null;
+      if (state.composerScheduleMode === 'continuous') {
+        if (!continuousWindowValid()) return null;
+        const s = String(els.dailyWindowStart.value || '');
+        const e = String(els.dailyWindowEnd.value || '');
+        const ms = /^(\d{1,2}):(\d{2})$/.exec(s);
+        const me = /^(\d{1,2}):(\d{2})$/.exec(e);
+        if (!ms || !me) return null;
+        const windowSec = ((+me[1] * 60 + +me[2]) - (+ms[1] * 60 + +ms[2])) * 60;
+        if (windowSec <= 0) return null;
+        return Math.floor(windowSec / clipSec);
+      }
+      return estRunsPerDay(); // null for custom cron
+    }
+
+    // Human "window" phrase for the count line, e.g. "12h daily window" for
+    // continuous or the schedule cadence for sampled.
+    function countWindowPhrase() {
+      if (state.composerScheduleMode === 'continuous') {
+        const s = String(els.dailyWindowStart.value || '');
+        const e = String(els.dailyWindowEnd.value || '');
+        const ms = /^(\d{1,2}):(\d{2})$/.exec(s);
+        const me = /^(\d{1,2}):(\d{2})$/.exec(e);
+        if (ms && me) {
+          const mins = (+me[1] * 60 + +me[2]) - (+ms[1] * 60 + +ms[2]);
+          if (mins > 0) {
+            const h = Math.floor(mins / 60); const m = mins % 60;
+            const hp = h > 0 ? `${h}h` : ''; const mp = m > 0 ? `${m}m` : '';
+            return `${hp}${mp} daily window`.trim();
+          }
+        }
+        return 'daily window';
+      }
+      const label = { '15m': 'every 15 min', '30m': 'every 30 min', 'hourly': 'hourly', '4h': 'every 4 hours', 'daily': 'daily', 'custom': 'custom schedule' }[state.schedPreset] || 'schedule';
+      return label;
+    }
+
+    // Update the persistent clip-COUNT line for both modes. Reads the concrete
+    // clips/day and multiplies by ~30 for the monthly figure (matching the cost
+    // model's rolling 30-day window). Custom cadences show a count-after-save note.
+    function renderComposerCount() {
+      const noun = state.composerScheduleMode === 'continuous' ? 'segment' : 'clip';
+      const clipSec = selectedClipSec();
+      const perDay = estClipsPerDay();
+      if (clipSec <= 0 || clipSec < 5 || clipSec > 900) {
+        els.composerCount.innerHTML = '<span class="muted">Set a valid clip length to estimate the clip count.</span>';
+        return;
+      }
+      if (perDay === null) {
+        els.composerCount.innerHTML = state.schedPreset === 'custom'
+          ? `<span class="muted">Custom schedule: clip count is confirmed after you save.</span>`
+          : `<span class="muted">Set a schedule to estimate the clip count.</span>`;
+        return;
+      }
+      const activeDays = estActiveDaysThisMonth();
+      const perMonth = perDay * activeDays;
+      const win = countWindowPhrase();
+      els.composerCount.innerHTML =
+        `<b>${win}, ${clipSec}s ${noun}s</b> <span class="muted">= about</span> <b>${perDay.toLocaleString()} ${noun}${perDay === 1 ? '' : 's'}/day</b>`
+        + `<span class="muted"> &middot; ~${perMonth.toLocaleString()} ${noun}${perMonth === 1 ? '' : 's'}/mo</span>`;
+    }
+
     function renderCostEstimate() {
+      renderComposerCount();
       if (!state.billingEnabled) { els.costEstimate.textContent = ''; els.costEstimateNote.textContent = ''; return; }
       if (state.composerScheduleMode === 'continuous') {
-        els.costEstimate.innerHTML = '<span class="muted">Continuous records every hour the window is active; storage scales with total footage.</span>';
+        els.costEstimate.innerHTML = '<span class="muted"><span class="cs-cost">Continuous</span> records every hour the window is active; storage scales with total footage.</span>';
         els.costEstimateNote.textContent = 'Billed per hour of recording plus managed storage per hour of footage kept per month, monthly in arrears. Pricing is unchanged from sampled.';
         return;
       }
@@ -1183,7 +1309,7 @@
       }
       const usd = (c) => usdCents(c);
       const parts = [
-        `<span class="muted">~</span><b>${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
+        `<span class="muted">~</span><b class="cs-cost">${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
         `<span class="muted"> &middot; ${m.recordHours} hour${m.recordHours === 1 ? '' : 's'} of recording × $${(m.hourRate / 100).toFixed(2)} = ${usd(m.recordHourCents)}</span>`,
       ];
       if (m.managed && m.avgStreamHrMo > 0) {
@@ -1274,12 +1400,29 @@
       els.fpsSeg.querySelectorAll('button[data-fps]').forEach((b) => {
         b.classList.toggle('on', b.getAttribute('data-fps') === String(fps));
       });
+      els.fpsCustomWrap.classList.toggle('hidden', fps !== 'custom');
+      refreshStartEnabled();
     }
 
-    // Returns the chosen frame rate as a number (15 or 30), or null for the
-    // Source/native option (omitted from the create body so the server stores NULL).
+    // Returns the chosen frame rate as an integer, or null for the Source/native
+    // option (omitted from the create body so the server stores NULL). Quick-picks
+    // are 30/15; 'custom' reads the number input, clamped to the server's 1..60
+    // contract. Returns null when custom is empty/out of range (Start stays gated).
     function selectedTargetFps() {
-      return state.targetFps === 'source' ? null : Number(state.targetFps);
+      if (state.targetFps === 'source') return null;
+      if (state.targetFps === 'custom') {
+        const n = Math.trunc(Number(els.fpsCustom.value || 0));
+        return Number.isFinite(n) && n >= 1 && n <= 60 ? n : null;
+      }
+      return Number(state.targetFps);
+    }
+
+    // True when the frame-rate choice is well-formed: Source, a quick-pick, or a
+    // custom value in 1..60. A blank/invalid custom entry gates Start.
+    function fpsValid() {
+      if (state.targetFps !== 'custom') return true;
+      const n = Number(els.fpsCustom.value || 0);
+      return Number.isFinite(n) && Math.trunc(n) >= 1 && Math.trunc(n) <= 60;
     }
 
     // ---- Bucket connection state (change 1) ----
@@ -1398,6 +1541,7 @@
         const isNas = state.storageChoice === 'nas';
         els.destPicker.classList.add('hidden');
         els.connectForm.classList.add('hidden');
+        els.byoDisclosure.classList.add('hidden');
         els.sharedPicker.classList.add('hidden');
         // Retention tier selector applies only to pure managed (NAS footage lives on
         // the NAS, so it is never prepaid).
@@ -1426,6 +1570,7 @@
         // dests. A webdav pick delivers via managed staging (no stream-hour-month fee).
         els.destPicker.classList.add('hidden');
         els.connectForm.classList.add('hidden');
+        els.byoDisclosure.classList.add('hidden');
         els.managedStatus.classList.add('hidden');
         renderSharedStorageUI();
         startButtonLabel();
@@ -1520,6 +1665,7 @@
       ).join('');
       els.destPicker.classList.remove('hidden');
       els.connectForm.classList.add('hidden');
+      els.byoDisclosure.classList.add('hidden');
       const want = state.verifiedDestId > 0 ? String(state.verifiedDestId) : prev;
       if (want && byo.some((d) => String(d.id) === want)) els.recDest.value = want;
       syncBucketStateFromSelection();
@@ -1592,11 +1738,15 @@
     function openConnectForm(title) {
       els.connectFormTitle.textContent = title || 'Connect your S3 bucket';
       els.connectForm.classList.remove('hidden');
+      // Reveal + expand the disclosure so the just-requested form is visible.
+      els.byoDisclosure.classList.remove('hidden');
+      els.byoDisclosure.open = true;
       setStatus(els.cnStatus, '', '');
     }
 
     function closeConnectForm() {
       els.connectForm.classList.add('hidden');
+      els.byoDisclosure.open = false;
       els.cnSecret.value = '';
       setStatus(els.cnStatus, '', '');
     }
@@ -1857,7 +2007,7 @@
       const bucketOK = state.bucketState === 'connected' && dest > 0;
       const streamOK = state.streamProbe.ok === true;
       const sourceOK = catalog || !!url;
-      const ready = !state.starting && sourceOK && schedOK && bucketOK && streamOK && windowValid();
+      const ready = !state.starting && sourceOK && schedOK && bucketOK && streamOK && windowValid() && fpsValid();
       els.startBtn.disabled = !ready;
     }
 
@@ -3274,6 +3424,7 @@
     });
     els.fpsSeg.querySelectorAll('button[data-fps]').forEach((b) =>
       b.addEventListener('click', () => setFps(b.getAttribute('data-fps'))));
+    els.fpsCustom.addEventListener('input', () => { refreshStartEnabled(); });
     els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });

@@ -190,10 +190,12 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 		dailyEndArg = strings.TrimSpace(req.DailyWindowEnd)
 	}
 
+	// target_fps: NULL = Source/native. Match the single-recording contract:
+	// accept any integer in 1..60 (composer Source/30/15 quick-picks + custom).
 	var targetFPSArg any
 	if req.TargetFPS != nil {
-		if *req.TargetFPS != 15 && *req.TargetFPS != 30 {
-			util.WriteError(w, http.StatusBadRequest, "target_fps must be 15 or 30 (omit for Source)")
+		if *req.TargetFPS < 1 || *req.TargetFPS > 60 {
+			util.WriteError(w, http.StatusBadRequest, "target_fps must be between 1 and 60 (omit for Source)")
 			return
 		}
 		targetFPSArg = *req.TargetFPS

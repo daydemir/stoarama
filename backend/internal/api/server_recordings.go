@@ -226,12 +226,13 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 
 	// target_fps: NULL = Source/native (preserve source fps, no re-encode). The
-	// composer only offers 15 and 30, so reject any other value to keep the
-	// contract tight.
+	// composer offers Source/30/15 quick-picks plus a custom rate, so accept any
+	// integer in 1..60 (the DB CHECK allows up to 240; 60 is the sensible ceiling
+	// for a capture re-encode). Anything outside that range is rejected.
 	var targetFPSArg any
 	if req.TargetFPS != nil {
-		if *req.TargetFPS != 15 && *req.TargetFPS != 30 {
-			util.WriteError(w, http.StatusBadRequest, "target_fps must be 15 or 30 (omit for Source)")
+		if *req.TargetFPS < 1 || *req.TargetFPS > 60 {
+			util.WriteError(w, http.StatusBadRequest, "target_fps must be between 1 and 60 (omit for Source)")
 			return
 		}
 		targetFPSArg = *req.TargetFPS
