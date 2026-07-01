@@ -1962,8 +1962,8 @@ let streamAllTotal = null;
 let streamPage = 1;
 let streamsView = 'table';      // 'table' | 'map'
 let streamPageSize = Number(localStorage.getItem('streamPageSize') || '100');
-let streamSortBy = 'avg_people_per_inferenced_capture';
-let streamSortDir = 'desc';
+let streamSortBy = 'name';
+let streamSortDir = 'asc';
 let overviewStreamsTotal = 0;
 let overviewRecordingOn = 0;
 if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
@@ -2004,8 +2004,11 @@ let detailClipViewMode = CLIP_VIEW_MODE.RANGE;
 let detailClipAvailability = null;
 let pendingClipRangeFrom = '';
 let pendingClipRangeTo = '';
-const DEFAULT_STREAM_SORT_BY = 'avg_people_per_inferenced_capture';
-const DEFAULT_STREAM_SORT_DIR = 'desc';
+// Detection stats (avg_people_per_inferenced_capture) are de-wired, so the browse
+// defaults to the stream name (a live, visible sortable header) instead of the
+// empty inference column. Detection sort returns with the detection build (#47).
+const DEFAULT_STREAM_SORT_BY = 'name';
+const DEFAULT_STREAM_SORT_DIR = 'asc';
 
 function detectTimezoneLabel() {
   try {
@@ -4628,8 +4631,8 @@ async function refreshAllStreamFilterOptions() {
 }
 
 function applyStreamsSortParams(params, sortBy, sortDir) {
-  params.set('sort_by', String(sortBy || 'avg_people_per_inferenced_capture'));
-  params.set('sort_dir', normalizeSortDir(sortDir, 'desc'));
+  params.set('sort_by', String(sortBy || DEFAULT_STREAM_SORT_BY));
+  params.set('sort_dir', normalizeSortDir(sortDir, DEFAULT_STREAM_SORT_DIR));
 }
 
 function setStreamsView(view, opts = {}) {

@@ -46,6 +46,7 @@ type Server struct {
 	streamsHTML     []byte
 	recordingsHTML  []byte
 	accountHTML     []byte
+	orgSettingsHTML []byte
 	docsHTML        []byte
 	pricingHTML     []byte
 	adminHTML       []byte
@@ -123,6 +124,10 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
+	orgSettingsHTML, err := loadOrgSettingsHTML()
+	if err != nil {
+		return nil, err
+	}
 	docsHTML, err := loadDocsHTML()
 	if err != nil {
 		return nil, err
@@ -147,6 +152,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		streamsHTML:     injectShell(streamsHTML, "streams"),
 		recordingsHTML:  injectShell(recordingsHTML, "recording"),
 		accountHTML:     injectShell(accountHTML, ""),
+		orgSettingsHTML: injectShell(orgSettingsHTML, ""),
 		docsHTML:        injectShell(docsHTML, ""),
 		pricingHTML:     injectShell(pricingHTML, ""),
 		adminHTML:       injectShell(adminHTML, ""),
@@ -187,6 +193,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/docs/self-serve", s.handleDocsApp)
 	r.Get("/pricing", s.handlePricingApp)
 	r.Get("/account", s.handleAccountApp)
+	r.Get("/org-settings", s.handleOrgSettingsApp)
 	r.Get("/recordings", s.handleRecordingsApp)
 	r.Get("/recordings/{id}", s.handleRecordingsApp)
 	r.Get("/bundles", s.handleRecordingsApp)

@@ -51,7 +51,7 @@
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
-    .acct-content { max-width: 880px; margin: 0 auto; }
+    .acct-content { max-width: 720px; margin: 0 auto; display: grid; gap: 14px; }
     .panel {
       background: color-mix(in srgb, var(--panel) 94%, #000);
       border: 1px solid var(--border);
@@ -59,49 +59,9 @@
       padding: 18px;
       box-shadow: 0 22px 50px rgba(15, 23, 42, 0.18);
     }
-    .hero {
-      display: grid;
-      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.8fr);
-      gap: 16px;
-      margin-bottom: 16px;
-    }
-    .eyebrow {
-      margin-bottom: 10px;
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    h1 {
-      margin: 0 0 10px;
-      font-size: clamp(28px, 4vw, 40px);
-      line-height: 0.98;
-      letter-spacing: -0.03em;
-    }
-    h2 {
-      margin: 0 0 10px;
-      font-size: 18px;
-      line-height: 1.15;
-    }
-    p, .note, .muted {
-      color: var(--muted);
-      line-height: 1.55;
-    }
-    .stack { display: grid; gap: 10px; }
-    .section-title {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-    .status {
-      min-height: 18px;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-    }
+    h2 { margin: 0 0 12px; font-size: 15px; line-height: 1.15; }
+    p, .note, .muted { color: var(--muted); line-height: 1.5; }
+    .status { min-height: 18px; color: var(--muted); font-size: 13px; line-height: 1.45; }
     .status.ok { color: var(--ok); }
     .status.err { color: var(--err); }
     .hidden { display: none !important; }
@@ -114,15 +74,15 @@
       letter-spacing: 0.04em;
     }
     input, button {
-      width: 100%;
-      min-height: 40px;
+      min-height: 38px;
       border-radius: 10px;
       border: 1px solid var(--border);
       background: color-mix(in srgb, var(--panel2) 84%, transparent);
       color: var(--text);
       font: inherit;
-      padding: 10px 12px;
+      padding: 9px 12px;
     }
+    input { width: 100%; }
     input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
     button {
       cursor: pointer;
@@ -130,79 +90,28 @@
       border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
       color: #f8fafc;
       font-weight: 600;
+      width: auto;
     }
     button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
-    button.secondary {
-      background: transparent;
-      color: var(--text);
+    button.secondary { background: transparent; color: var(--text); font-weight: 500; }
+    button.small { min-height: 30px; padding: 5px 12px; font-size: 12px; }
+    /* Read-only value row + list rows */
+    .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .kv-val { font-family: var(--mono); font-size: 13px; color: var(--text); word-break: break-all; }
+    .role-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--border); background: color-mix(in srgb, var(--panel2) 80%, transparent);
+      font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
     }
-    .button-row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .button-row > * {
-      width: auto;
-      min-width: 140px;
-    }
-    .session-meta {
-      display: grid;
-      gap: 4px;
-      color: var(--muted);
-    }
-    .token-box {
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel2) 88%, transparent);
-      padding: 12px;
-    }
-    .token-box-title {
-      margin-bottom: 8px;
-      font-family: var(--mono);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--muted);
-    }
-    .mono, code { font-family: var(--mono); font-size: 12px; }
-    .grid-2 {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-      margin-bottom: 16px;
-    }
-    .empty-state {
-      padding: 16px;
-      border: 1px dashed var(--border);
-      border-radius: 14px;
-      color: var(--muted);
-      line-height: 1.5;
-      text-align: center;
-    }
-    /* Recording rows */
-    .rec-list { display: grid; gap: 10px; }
-    .rec-row {
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 14px;
+    .row-list { display: grid; gap: 8px; }
+    .row-item {
+      display: flex; align-items: center; gap: 10px;
+      border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px;
       background: color-mix(in srgb, var(--panel2) 86%, transparent);
     }
-    .rec-row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-    .rec-name { font-size: 15px; font-weight: 600; color: var(--text); }
-    .rec-sub { margin-top: 3px; font-size: 13px; color: var(--muted); }
-    .rec-status { font-family: var(--mono); font-size: 12px; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
-    .rec-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
-    .rec-status.active { color: var(--ok); }
-    .rec-status.active .dot { background: var(--ok); }
-    .rec-status.paused { color: var(--muted); }
-    .rec-status.pending { color: var(--warn); }
-    .rec-status.pending .dot { background: var(--warn); }
-    .rec-meta { margin-top: 10px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; font-size: 13px; color: var(--muted); }
-    .rec-meta .meta-sep { color: var(--muted); user-select: none; }
-    .rec-meta .meta-strong { color: var(--text); }
-    @media (max-width: 1100px) {
-      .hero, .grid-2 { grid-template-columns: 1fr; }
-    }
+    .row-item .row-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 8px; }
+    .row-item .row-name { font-family: var(--mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sub { color: var(--muted); font-size: 12px; }
   </style>
 <!--SHELL_HEAD-->
 </head>
@@ -211,196 +120,69 @@
     <!--SHELL_TOPBAR-->
 
     <div class="acct-content">
-    <div class="hero">
+
+    <!-- Signed-in content -->
+    <div id="authedBox" class="hidden" style="display:grid;gap:14px;">
       <section class="panel">
-        <div class="eyebrow">Account</div>
-        <h1>Your STO-A-RAMA account.</h1>
-        <p>See what you are recording, your billing method, and your estimated bill for this month. Manage your recordings on the Recordings page.</p>
-      </section>
-      <section class="panel">
-        <div class="eyebrow">Session</div>
-        <h2>Account state</h2>
-        <div id="accountStatus" class="status">Checking session...</div>
-        <div id="accountBox" class="stack hidden">
-          <div id="accountMeta" class="session-meta"></div>
-          <div class="button-row">
-            <a href="/recordings">My Recordings</a>
-            <button id="logoutBtn" class="secondary" type="button">Log Out</button>
-          </div>
+        <h2>Profile</h2>
+        <div class="kv-row">
+          <span class="sub">Email</span>
+          <span id="profileEmail" class="kv-val"></span>
         </div>
+      </section>
+
+      <section class="panel">
+        <h2>Session</h2>
+        <div class="kv-row">
+          <div class="row-main" style="display:flex;align-items:center;gap:8px;min-width:0;">
+            <span id="sessionEmail" class="kv-val"></span>
+            <span id="sessionRole" class="role-badge"></span>
+          </div>
+          <button id="logoutBtn" class="secondary small" type="button">Log out</button>
+        </div>
+        <div id="sessionMeta" class="sub" style="margin-top:8px;"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Your orgs</h2>
+        <div id="orgsList" class="row-list"></div>
+        <div style="margin-top:12px;">
+          <button id="newOrgBtn" class="secondary small" type="button">New org</button>
+        </div>
+        <div id="orgsStatus" class="status" style="margin-top:8px;"></div>
       </section>
     </div>
 
-    <section id="recordingsPanel" class="panel hidden" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">Recordings</div>
-          <h2>Streams you are recording</h2>
-        </div>
-        <a href="/recordings">Manage recordings</a>
-      </div>
-      <div id="recordingsStatus" class="status">Loading recordings...</div>
-      <div id="recordingsEmpty" class="empty-state hidden">You are not recording any streams yet. Start one on the Recordings page.</div>
-      <div id="recordingsList" class="rec-list hidden"></div>
-    </section>
-
-    <section id="billingPanel" class="panel hidden" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">Billing &amp; costs</div>
-          <h2 id="billingHeading">This billing period</h2>
-        </div>
-        <button id="billingManageBtn" class="secondary hidden" type="button" style="width:auto;min-width:160px;">Manage payment method</button>
-      </div>
-      <div id="billingStatus" class="status">Loading billing...</div>
-      <div id="billingBody" class="hidden">
-        <div id="billingReadOnlyNote" class="muted hidden" style="font-size:12px;margin-bottom:12px;">Ask an org owner to manage billing.</div>
-        <div id="paymentRow" class="session-meta" style="margin-bottom:14px;"></div>
-        <div class="grid-2" style="margin-bottom:14px;">
-          <div class="token-box">
-            <div class="token-box-title">What is driving your bill</div>
-            <div id="usageRecDays" class="session-meta"></div>
-            <div id="usageStorage" class="session-meta"></div>
-          </div>
-          <div class="token-box">
-            <div class="token-box-title">Estimated bill for the month</div>
-            <div id="estBreakdown" class="session-meta mono"></div>
-          </div>
-        </div>
-        <div id="periodRow" class="muted" style="font-size:12px;"></div>
-        <p class="muted" style="font-size:12px;margin:10px 0 0;">
-          This is a live estimate from the streams you are recording plus your storage usage this month, not a final invoice:
-          $0.05 for each hour a recording captures at least one clip, plus, for Stoarama-managed storage, $0.10 per hour of footage kept for a month, charged for the time each clip is kept.
-          Hours when nothing was recorded are never charged.
-        </p>
-      </div>
-    </section>
-
-    <section id="historyPanel" class="panel hidden" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">Billing history</div>
-          <h2>Past charges</h2>
-        </div>
-      </div>
-      <div id="historyStatus" class="status">Loading billing history...</div>
-      <div id="historyEmpty" class="empty-state hidden">No charges yet.</div>
-      <div id="historyList" class="rec-list hidden"></div>
-    </section>
-
-    <section id="teamPanel" class="panel hidden" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">Org</div>
-          <h2>Org members</h2>
-        </div>
-        <button id="orgCreateBtn" type="button" class="secondary" style="width:auto;min-width:120px;">New org</button>
-      </div>
-      <div id="teamStatus" class="status">Loading org...</div>
-      <div id="teamList" class="rec-list hidden"></div>
-      <div id="teamInvite" class="hidden" style="margin-top:14px;">
-        <label for="teamInviteEmail">Invite a member by email</label>
-        <input id="teamInviteEmail" type="email" placeholder="teammate@example.org" />
-        <div class="button-row" style="margin-top:12px;">
-          <button id="teamInviteBtn" type="button" style="width:auto;min-width:160px;">Send invite</button>
-        </div>
-        <p class="muted" style="font-size:12px;margin:10px 0 0;">Members sign in with their own email and share this org's recordings, clips, billing, and NAS connection. A member can also belong to other orgs.</p>
-      </div>
-    </section>
-
-    <section id="connectionsPanel" class="panel hidden" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">NAS connections</div>
-          <h2>Pull clips to your NAS</h2>
-        </div>
-      </div>
-      <p class="muted" style="font-size:13px;margin:0 0 14px;">A NAS connection runs the Stoarama pull client on your own storage. It downloads each recorded clip, verifies it, then purges the managed copy. Create a connection to get a token and a ready-to-paste docker-compose file.</p>
-      <div id="connectionsStatus" class="status">Loading connections...</div>
-      <div id="connectionsList" class="rec-list hidden"></div>
-      <div id="connectionsCreate" style="margin-top:14px;">
-        <label for="connLabel">Connection label</label>
-        <input id="connLabel" type="text" placeholder="MIT Synology NAS" />
-        <label for="connInterval" style="margin-top:12px;">Poll interval (seconds, 10-3600)</label>
-        <input id="connInterval" type="number" min="10" max="3600" value="90" />
-        <div class="button-row" style="margin-top:12px;">
-          <button id="connCreateBtn" type="button" style="width:auto;min-width:180px;">Create connection</button>
-        </div>
-      </div>
-      <div id="connTokenBox" class="hidden" style="margin-top:16px;padding:14px;border:1px solid var(--err);border-radius:8px;">
-        <div style="font-weight:600;margin-bottom:6px;">Save this now: you will not see this token again.</div>
-        <p class="muted" style="font-size:12px;margin:0 0 10px;">Paste the docker-compose below onto your NAS and run it. The token is embedded; keep it secret.</p>
-        <textarea id="connSnippet" readonly rows="14" style="width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;"></textarea>
-        <div class="button-row" style="margin-top:10px;">
-          <button id="connCopyBtn" type="button" style="width:auto;min-width:120px;">Copy</button>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel" style="margin-bottom:16px;">
-      <div class="eyebrow">Support</div>
-      <h2>Need help?</h2>
-      <p class="muted" style="margin:0;">Email <a href="mailto:deniz@aydemir.us">deniz@aydemir.us</a> with any question about your account, recordings, or billing.</p>
-    </section>
-
-    <section class="panel" style="margin-bottom:16px;">
-      <div class="section-title">
-        <div>
-          <div class="eyebrow">Sign in</div>
-          <h2>Email sign-in link</h2>
-        </div>
-        <p>Enter your email and we will send you a secure link to sign in.</p>
-      </div>
+    <!-- Logged-out content -->
+    <section id="signinPanel" class="panel hidden">
+      <h2>Sign in</h2>
       <label for="email">Email</label>
       <input id="email" type="email" placeholder="you@example.org" />
-      <div class="button-row" style="margin-top:12px;">
-        <button id="requestLink" type="button">Email me a sign-in link</button>
+      <div style="margin-top:12px;">
+        <button id="requestLink" type="button">Send sign-in link</button>
       </div>
-      <div id="requestStatus" class="status"></div>
+      <div id="requestStatus" class="status" style="margin-top:8px;"></div>
     </section>
+
+    <div id="accountStatus" class="status"></div>
+
     </div>
   </div>
 
   <script>
     const requestStatus = document.getElementById('requestStatus');
     const accountStatus = document.getElementById('accountStatus');
-    const accountBox = document.getElementById('accountBox');
-    const accountMeta = document.getElementById('accountMeta');
-    const recordingsPanel = document.getElementById('recordingsPanel');
-    const recordingsStatus = document.getElementById('recordingsStatus');
-    const recordingsEmpty = document.getElementById('recordingsEmpty');
-    const recordingsList = document.getElementById('recordingsList');
-    const billingPanel = document.getElementById('billingPanel');
-    const billingStatus = document.getElementById('billingStatus');
-    const billingBody = document.getElementById('billingBody');
-    const billingManageBtn = document.getElementById('billingManageBtn');
-    const billingHeading = document.getElementById('billingHeading');
-    const billingReadOnlyNote = document.getElementById('billingReadOnlyNote');
-    const usageRecDays = document.getElementById('usageRecDays');
-    const usageStorage = document.getElementById('usageStorage');
-    const estBreakdown = document.getElementById('estBreakdown');
-    const paymentRow = document.getElementById('paymentRow');
-    const periodRow = document.getElementById('periodRow');
-    const historyPanel = document.getElementById('historyPanel');
-    const historyStatus = document.getElementById('historyStatus');
-    const historyEmpty = document.getElementById('historyEmpty');
-    const historyList = document.getElementById('historyList');
-    const teamPanel = document.getElementById('teamPanel');
-    const teamStatus = document.getElementById('teamStatus');
-    const teamList = document.getElementById('teamList');
-    const teamInvite = document.getElementById('teamInvite');
-    const teamInviteEmail = document.getElementById('teamInviteEmail');
-    const teamInviteBtn = document.getElementById('teamInviteBtn');
-    const orgCreateBtn = document.getElementById('orgCreateBtn');
-    const connectionsPanel = document.getElementById('connectionsPanel');
-    const connectionsStatus = document.getElementById('connectionsStatus');
-    const connectionsList = document.getElementById('connectionsList');
-    const connLabel = document.getElementById('connLabel');
-    const connInterval = document.getElementById('connInterval');
-    const connCreateBtn = document.getElementById('connCreateBtn');
-    const connTokenBox = document.getElementById('connTokenBox');
-    const connSnippet = document.getElementById('connSnippet');
-    const connCopyBtn = document.getElementById('connCopyBtn');
+    const authedBox = document.getElementById('authedBox');
+    const signinPanel = document.getElementById('signinPanel');
+    const profileEmail = document.getElementById('profileEmail');
+    const sessionEmail = document.getElementById('sessionEmail');
+    const sessionRole = document.getElementById('sessionRole');
+    const sessionMeta = document.getElementById('sessionMeta');
+    const orgsList = document.getElementById('orgsList');
+    const orgsStatus = document.getElementById('orgsStatus');
+    const newOrgBtn = document.getElementById('newOrgBtn');
+    const logoutBtn = document.getElementById('logoutBtn');
+
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const requestedRedirectPath = (() => {
@@ -430,29 +212,6 @@
       el.className = `status${kind ? ` ${kind}` : ''}`;
     }
 
-    // A non-zero amount below one cent shows as "<$0.01" so a real-but-tiny
-    // amortized storage charge does not read as the broken-looking "$0.00".
-    function usd(cents) {
-      const c = Number(cents || 0);
-      if (c > 0 && c < 1) return '<$0.01';
-      return `$${(c / 100).toFixed(2)}`;
-    }
-
-    // Storage cost from a stream-hour-month figure. The server pre-rounds tiny
-    // storage charges to 0 cents, so render a real-but-sub-cent amount (units > 0) as
-    // "<$0.01" rather than the broken-looking "$0.00".
-    function usdStorage(units, rateCents, roundedCents) {
-      const c = Number(roundedCents || 0);
-      if (c === 0 && Number(units || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
-      return usd(c);
-    }
-
-    function fmtDay(iso) {
-      if (!iso) return '';
-      try { return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); }
-      catch (_) { return ''; }
-    }
-
     function escapeHTML(v) {
       return String(v == null ? '' : v)
         .replaceAll('&', '&amp;')
@@ -463,227 +222,6 @@
 
     function sleep(ms) {
       return new Promise((resolve) => window.setTimeout(resolve, ms));
-    }
-
-    // Human-readable cadence from a 5-field cron expression for the common presets
-    // this app produces; falls back to showing the raw cron for anything custom.
-    function cadenceLabel(cron) {
-      const c = String(cron || '').trim().replace(/\s+/g, ' ');
-      const map = {
-        '*/15 * * * *': 'Every 15 min',
-        '*/30 * * * *': 'Every 30 min',
-        '0 * * * *': 'Hourly',
-        '0 */4 * * *': 'Every 4 hours',
-      };
-      if (map[c]) return map[c];
-      const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(c);
-      if (daily) {
-        const hh = String(daily[2]).padStart(2, '0');
-        const mm = String(daily[1]).padStart(2, '0');
-        return `Daily at ${hh}:${mm}`;
-      }
-      return c ? `Cron ${c}` : '';
-    }
-
-    function clipLabel(sec) {
-      const n = Number(sec || 0);
-      if (n <= 0) return '';
-      // Match the Recordings page wording exactly (e.g. "60s clips") so the same
-      // recording is not labelled "1 min clip" here and "60s clips" there.
-      return `${n}s clips`;
-    }
-
-    // Status badge: "live" reflects active + in-window + card on file (server-derived).
-    function recStatusInfo(rec) {
-      if (rec && rec.live === true) return { cls: 'active', label: 'Recording' };
-      const s = String((rec && rec.status) || '').trim().toLowerCase();
-      if (s === 'active') return { cls: 'pending', label: 'Active' };
-      if (s === 'paused') return { cls: 'paused', label: 'Paused' };
-      return { cls: 'pending', label: s || 'Pending' };
-    }
-
-    function recStorageLabel(rec) {
-      if (rec && rec.storage_managed === true) return 'Stoarama-managed storage';
-      const name = String((rec && rec.storage_destination_name) || '').trim();
-      return name ? `Your bucket: ${name}` : 'Your bucket';
-    }
-
-    // Render the user's recordings list (the streams they are recording). Pure given
-    // the items array + DOM nodes; reuses the same GET /recordings the Recordings page uses.
-    function renderRecordings(items) {
-      const list = Array.isArray(items) ? items : [];
-      if (list.length === 0) {
-        recordingsList.classList.add('hidden');
-        recordingsList.innerHTML = '';
-        recordingsEmpty.classList.remove('hidden');
-        return;
-      }
-      recordingsEmpty.classList.add('hidden');
-      recordingsList.classList.remove('hidden');
-      recordingsList.innerHTML = list.map((rec) => {
-        const info = recStatusInfo(rec);
-        const name = String(rec.name || rec.stream_name || 'Recording').trim();
-        const loc = String(rec.stream_location || '').trim();
-        const cadence = cadenceLabel(rec.cron_expr);
-        const clip = clipLabel(rec.clip_duration_sec);
-        const storage = recStorageLabel(rec);
-        const metaParts = [];
-        if (cadence) metaParts.push(`<span class="meta-strong">${escapeHTML(cadence)}</span>`);
-        if (clip) metaParts.push(`<span>${escapeHTML(clip)}</span>`);
-        metaParts.push(`<span>${escapeHTML(storage)}</span>`);
-        return `
-          <div class="rec-row">
-            <div class="rec-row-head">
-              <div>
-                <div class="rec-name">${escapeHTML(name)}</div>
-                ${loc ? `<div class="rec-sub">${escapeHTML(loc)}</div>` : ''}
-              </div>
-              <div class="rec-status ${info.cls}"><span class="dot"></span>${escapeHTML(info.label)}</div>
-            </div>
-            <div class="rec-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
-          </div>
-        `;
-      }).join('');
-    }
-
-    async function loadRecordings() {
-      try {
-        const payload = await fetchJSON('/api/v1/account/recordings');
-        recordingsPanel.classList.remove('hidden');
-        recordingsStatus.classList.add('hidden');
-        renderRecordings(payload.items);
-      } catch (err) {
-        recordingsPanel.classList.remove('hidden');
-        recordingsList.classList.add('hidden');
-        recordingsEmpty.classList.add('hidden');
-        recordingsStatus.classList.remove('hidden');
-        setStatus(recordingsStatus, `Could not load recordings: ${String(err.message || err)}`, 'err');
-      }
-    }
-
-    // Render the billing panel from a GET /billing payload. Pure given the payload
-    // + DOM nodes; all money is server-derived, labelled as an estimate. The bill is
-    // org-scoped: reads are shown to every member, but the manage-card control is
-    // shown only to an owner/billing_admin (current_org.can_manage_billing).
-    function renderBilling(b) {
-      const hourRate = Number(b.recording_hour_rate_cents || 5);
-      const shmRate = Number(b.stream_hour_month_rate_cents || 10);
-      const hours = Number(b.recording_hours_this_month || 0);
-      const shm = Number(b.storage_stream_hour_month_avg || 0);
-      const hourCents = Number(b.estimated_amount_cents || 0);
-      const storeCents = Number(b.estimated_storage_amount_cents || 0);
-      const totalCents = hourCents + storeCents;
-
-      const orgName = String((currentOrg && currentOrg.name) || '').trim();
-      billingHeading.textContent = orgName ? `${orgName} bill this period` : 'This billing period';
-      const canManageBilling = Boolean(currentOrg && currentOrg.can_manage_billing);
-      billingManageBtn.classList.toggle('hidden', !canManageBilling);
-      billingReadOnlyNote.classList.toggle('hidden', canManageBilling);
-
-      if (b.has_payment_method === true) {
-        paymentRow.innerHTML = `<div style="color:var(--ok);">This org has a card on file.</div>`;
-        billingManageBtn.textContent = 'Manage payment method';
-      } else {
-        paymentRow.innerHTML = `<div style="color:var(--warn);">No card on file yet. Adding a card does not charge you.</div>`;
-        billingManageBtn.textContent = 'Add a card';
-      }
-
-      usageRecDays.innerHTML =
-        `<div><b>${hours}</b> hour${hours === 1 ? '' : 's'} of recording from the streams you are recording</div>`;
-      usageStorage.innerHTML = shm > 0
-        ? `<div><b>${shm.toFixed(3)}</b> hour-months of footage in managed storage</div>`
-          + `<div class="muted" style="font-size:12px;margin-top:4px;">Storage is ${usd(shmRate)} per hour of footage kept for a month, charged only for the time each clip is kept. A clip stored a few days costs a small fraction of that.</div>`
-        : `<div class="muted">No managed storage this month</div>`;
-
-      const lines = [`<div>${hours} × ${usd(hourRate)} per hour of recording = <b>${usd(hourCents)}</b></div>`];
-      if (shm > 0) lines.push(`<div>${shm.toFixed(3)} hr of footage/mo × ${usd(shmRate)} = <b>${usdStorage(shm, shmRate, storeCents)}</b></div>`);
-      lines.push(`<div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></div>`);
-      estBreakdown.innerHTML = lines.join('');
-
-      if (b.period_end) {
-        const span = b.period_start ? `${fmtDay(b.period_start)} to ${fmtDay(b.period_end)}` : `through ${fmtDay(b.period_end)}`;
-        periodRow.textContent = `Current period: ${span}. Next invoice on or around ${fmtDay(b.period_end)}.`;
-      } else {
-        periodRow.textContent = 'Your billing period starts once you add a card.';
-      }
-    }
-
-    async function loadBilling() {
-      try {
-        const b = await fetchJSON('/api/v1/account/billing');
-        if (b && b.billing_enabled === false) { billingPanel.classList.add('hidden'); return; }
-        billingPanel.classList.remove('hidden');
-        renderBilling(b || {});
-        setStatus(billingStatus, '', '');
-        billingStatus.classList.add('hidden');
-        billingBody.classList.remove('hidden');
-      } catch (err) {
-        billingPanel.classList.remove('hidden');
-        billingBody.classList.add('hidden');
-        billingStatus.classList.remove('hidden');
-        setStatus(billingStatus, `Could not load billing: ${String(err.message || err)}`, 'err');
-      }
-    }
-
-    // Format a Stripe invoice amount (minor units, e.g. cents) in its currency.
-    function fmtInvoiceAmount(cents, currency) {
-      const c = Number(cents || 0);
-      const cur = String(currency || 'USD').toUpperCase();
-      try { return new Intl.NumberFormat([], { style: 'currency', currency: cur }).format(c / 100); }
-      catch (_) { return `${(c / 100).toFixed(2)} ${cur}`; }
-    }
-
-    // Render past charges from GET /billing/invoices. Real Stripe invoices only;
-    // a new account billing monthly in arrears legitimately has none, so an empty
-    // list shows the honest empty state rather than any placeholder row.
-    function renderHistory(items) {
-      const list = Array.isArray(items) ? items : [];
-      if (list.length === 0) {
-        historyList.classList.add('hidden');
-        historyList.innerHTML = '';
-        historyEmpty.classList.remove('hidden');
-        return;
-      }
-      historyEmpty.classList.add('hidden');
-      historyList.classList.remove('hidden');
-      historyList.innerHTML = list.map((inv) => {
-        const date = fmtDay(inv.created);
-        const amount = fmtInvoiceAmount(inv.amount_due_cents, inv.currency);
-        const status = String(inv.status || '').trim();
-        const number = String(inv.number || '').trim();
-        const link = String(inv.hosted_url || inv.pdf_url || '').trim();
-        const metaParts = [];
-        if (status) metaParts.push(`<span>${escapeHTML(status)}</span>`);
-        if (number) metaParts.push(`<span>${escapeHTML(number)}</span>`);
-        if (link) metaParts.push(`<a href="${escapeHTML(link)}" target="_blank" rel="noopener">View invoice</a>`);
-        return `
-          <div class="rec-row">
-            <div class="rec-row-head">
-              <div>
-                <div class="rec-name">${escapeHTML(amount)}</div>
-                ${date ? `<div class="rec-sub">${escapeHTML(date)}</div>` : ''}
-              </div>
-            </div>
-            <div class="rec-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
-          </div>
-        `;
-      }).join('');
-    }
-
-    async function loadHistory() {
-      try {
-        const h = await fetchJSON('/api/v1/account/billing/invoices');
-        if (h && h.billing_enabled === false) { historyPanel.classList.add('hidden'); return; }
-        historyPanel.classList.remove('hidden');
-        historyStatus.classList.add('hidden');
-        renderHistory(h && h.items);
-      } catch (err) {
-        historyPanel.classList.remove('hidden');
-        historyList.classList.add('hidden');
-        historyEmpty.classList.add('hidden');
-        historyStatus.classList.remove('hidden');
-        setStatus(historyStatus, `Could not load billing history: ${String(err.message || err)}`, 'err');
-      }
     }
 
     function accountContinueTarget() {
@@ -698,19 +236,15 @@
       history.replaceState(null, '', `${next.pathname}${search ? `?${search}` : ''}${next.hash || ''}`);
     }
 
-    async function fetchCurrentAccountWithRetry() {
+    async function fetchCurrentPayloadWithRetry() {
       let lastErr = null;
       const attempts = authCompleted ? 6 : 1;
       for (let i = 0; i < attempts; i += 1) {
         try {
-          const payload = await fetchJSON('/api/v1/account/me');
-          currentOrg = payload.current_org || null;
-          return payload.account || {};
+          return await fetchJSON('/api/v1/account/me');
         } catch (err) {
           lastErr = err;
-          if (i < attempts - 1) {
-            await sleep(250);
-          }
+          if (i < attempts - 1) await sleep(250);
         }
       }
       throw lastErr || new Error('unauthorized');
@@ -722,272 +256,93 @@
         authFlowRedirectTimer = null;
       }
       const target = accountContinueTarget();
-      if (!target) {
-        clearAuthCompleteParam();
-        return;
-      }
-      authFlowRedirectTimer = window.setTimeout(() => {
-        window.location.assign(target);
-      }, 1600);
+      if (!target) { clearAuthCompleteParam(); return; }
+      authFlowRedirectTimer = window.setTimeout(() => { window.location.assign(target); }, 1600);
     }
 
-    // The top-right account chip + admin gear are owned by the shared topbar shell
+    // The top-right account chip + org switcher are owned by the shared topbar shell
     // (backend/internal/api/shell.go). No per-page topbar wiring here.
 
-    async function removeTeamMember(email) {
-      if (!email) return;
-      if (!window.confirm(`Remove ${email} from this team? They will lose access immediately.`)) return;
-      try {
-        await fetchJSON(`/api/v1/account/members/${encodeURIComponent(email)}`, { method: 'DELETE' });
-        await loadTeam();
-      } catch (err) {
-        setStatus(teamStatus, String(err.message || err), 'err');
-      }
+    async function switchOrg(id) {
+      await fetchJSON(`/api/v1/account/orgs/${encodeURIComponent(id)}/switch`, { method: 'POST' });
+      window.location.reload();
     }
 
-    async function setMemberRole(email, role) {
-      if (!email || !role) return;
-      try {
-        await fetchJSON(`/api/v1/account/members/${encodeURIComponent(email)}/role`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ role }),
-        });
-        await loadTeam();
-      } catch (err) {
-        setStatus(teamStatus, String(err.message || err), 'err');
-      }
-    }
-
-    async function loadTeam() {
-      teamPanel.classList.remove('hidden');
-      setStatus(teamStatus, 'Loading team...', '');
-      teamList.classList.add('hidden');
-      teamInvite.classList.add('hidden');
-      try {
-        const data = await fetchJSON('/api/v1/account/members');
-        const items = Array.isArray(data.items) ? data.items : [];
-        const canManage = Boolean(data.can_manage);
-        const selfEmail = String((currentAccount && currentAccount.email) || '').trim().toLowerCase();
-        teamList.innerHTML = items.map((m) => {
-          const email = String(m.email || '');
-          const role = String(m.role || 'member');
-          const status = m.accepted_at ? 'Active' : 'Invited';
-          const showRemove = canManage && !(role === 'owner' && items.filter((x) => String(x.role) === 'owner').length <= 1);
-          const removeBtn = showRemove
-            ? `<button class="secondary team-remove" type="button" data-email="${escapeHTML(email)}" style="width:auto;min-width:90px;">Remove</button>`
-            : '';
-          // An owner can toggle a non-owner between member and billing_admin. Owner
-          // rows are not toggled here (owner promotion/demotion stays owner-only).
-          const showRoleToggle = canManage && role !== 'owner';
-          const nextRole = role === 'billing_admin' ? 'member' : 'billing_admin';
-          const roleBtn = showRoleToggle
-            ? `<button class="secondary team-role" type="button" data-email="${escapeHTML(email)}" data-role="${escapeHTML(nextRole)}" style="width:auto;min-width:120px;">${nextRole === 'billing_admin' ? 'Make billing admin' : 'Make member'}</button>`
-            : '';
-          return `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-            <div>
-              <div><b>${escapeHTML(email)}</b></div>
-              <div class="muted" style="font-size:12px;">Role: ${escapeHTML(role)} · ${escapeHTML(status)}</div>
-            </div>
-            <div style="display:flex;gap:8px;">
-              ${roleBtn}
-              ${removeBtn}
-            </div>
-          </div>`;
-        }).join('');
-        teamList.classList.remove('hidden');
-        teamList.querySelectorAll('.team-role').forEach((btn) => {
-          btn.addEventListener('click', () => setMemberRole(btn.getAttribute('data-email') || '', btn.getAttribute('data-role') || ''));
-        });
-        teamList.querySelectorAll('.team-remove').forEach((btn) => {
-          btn.addEventListener('click', () => removeTeamMember(btn.getAttribute('data-email') || ''));
-        });
-        if (canManage) teamInvite.classList.remove('hidden');
-        setStatus(teamStatus, `${items.length} member${items.length === 1 ? '' : 's'}.`, 'ok');
-      } catch (err) {
-        teamPanel.classList.add('hidden');
-      }
-    }
-
-    teamInviteBtn.addEventListener('click', async () => {
-      const email = String(teamInviteEmail.value || '').trim();
-      teamInviteBtn.disabled = true;
-      try {
-        await fetchJSON('/api/v1/account/members', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email }),
-        });
-        teamInviteEmail.value = '';
-        setStatus(teamStatus, `Invite sent to ${email}.`, 'ok');
-        await loadTeam();
-      } catch (err) {
-        setStatus(teamStatus, String(err.message || err), 'err');
-      } finally {
-        teamInviteBtn.disabled = false;
-      }
-    });
-
-    if (orgCreateBtn) {
-      orgCreateBtn.addEventListener('click', async () => {
-        const name = String(window.prompt('Name your new org:') || '').trim();
-        if (!name) return;
-        orgCreateBtn.disabled = true;
-        try {
-          const org = await fetchJSON('/api/v1/account/orgs', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name }),
-          });
-          await fetchJSON(`/api/v1/account/orgs/${org.id}/switch`, { method: 'POST' });
-          window.location.reload();
-        } catch (err) {
-          setStatus(teamStatus, String(err.message || err), 'err');
-          orgCreateBtn.disabled = false;
-        }
+    function renderOrgs(orgs) {
+      const list = Array.isArray(orgs) ? orgs : [];
+      const currentId = Number((currentOrg && currentOrg.id) || 0);
+      orgsList.innerHTML = list.map((o) => {
+        const oid = Number(o.id);
+        const name = String(o.name || 'Org');
+        const role = String(o.role || 'member');
+        const isCur = oid === currentId;
+        const action = isCur
+          ? `<span class="sub">Current</span>`
+          : `<button class="secondary small org-switch" type="button" data-org="${oid}">Switch</button>`;
+        return `<div class="row-item">
+          <div class="row-main">
+            <span class="row-name">${escapeHTML(name)}</span>
+            <span class="role-badge">${escapeHTML(role)}</span>
+          </div>
+          ${action}
+        </div>`;
+      }).join('');
+      orgsList.querySelectorAll('.org-switch').forEach((btn) => {
+        btn.addEventListener('click', () => switchOrg(Number(btn.getAttribute('data-org'))).catch((err) => setStatus(orgsStatus, String(err.message || err), 'err')));
       });
     }
 
-    const connHealthColor = { healthy: '#22c55e', stale: '#f59e0b', never: '#9ca3af' };
-
-    function connStatusDot(health) {
-      const color = connHealthColor[health] || connHealthColor.never;
-      return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:8px;"></span>`;
-    }
-
-    function connLastSeenText(c) {
-      if (!c.last_seen_at) return 'never seen';
-      const d = new Date(c.last_seen_at);
-      return Number.isNaN(d.getTime()) ? String(c.last_seen_at) : `last seen ${d.toLocaleString()}`;
-    }
-
-    async function loadConnections() {
-      connectionsPanel.classList.remove('hidden');
-      setStatus(connectionsStatus, 'Loading connections...', '');
-      connectionsList.classList.add('hidden');
+    newOrgBtn.addEventListener('click', async () => {
+      const name = String(window.prompt('Name your new org:') || '').trim();
+      if (!name) return;
+      newOrgBtn.disabled = true;
       try {
-        const data = await fetchJSON('/api/v1/account/connections');
-        const items = Array.isArray(data.items) ? data.items : [];
-        connectionsList.innerHTML = items.map((c) => {
-          const id = Number(c.id);
-          const label = String(c.label || 'NAS');
-          const health = String(c.health || 'never');
-          const clips = Number(c.clips_pulled || 0);
-          const interval = Number(c.poll_interval_sec || 90);
-          return `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-            <div>
-              <div>${connStatusDot(health)}<b>${escapeHTML(label)}</b></div>
-              <div class="muted" style="font-size:12px;">${escapeHTML(health)} · ${clips} clip${clips === 1 ? '' : 's'} pulled · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
-            </div>
-            <div style="display:flex;gap:8px;">
-              <button class="secondary conn-rotate" type="button" data-id="${id}" style="width:auto;min-width:90px;">Rotate</button>
-              <button class="secondary conn-remove" type="button" data-id="${id}" style="width:auto;min-width:90px;">Remove</button>
-            </div>
-          </div>`;
-        }).join('');
-        connectionsList.classList.remove('hidden');
-        connectionsList.querySelectorAll('.conn-rotate').forEach((btn) => {
-          btn.addEventListener('click', () => rotateConnection(Number(btn.getAttribute('data-id'))));
-        });
-        connectionsList.querySelectorAll('.conn-remove').forEach((btn) => {
-          btn.addEventListener('click', () => removeConnection(Number(btn.getAttribute('data-id'))));
-        });
-        setStatus(connectionsStatus, `${items.length} connection${items.length === 1 ? '' : 's'}.`, 'ok');
-      } catch (err) {
-        connectionsPanel.classList.add('hidden');
-      }
-    }
-
-    function showConnToken(snippet) {
-      connSnippet.value = String(snippet || '');
-      connTokenBox.classList.remove('hidden');
-    }
-
-    connCreateBtn.addEventListener('click', async () => {
-      const label = String(connLabel.value || '').trim();
-      const pollIntervalSec = Number(connInterval.value || 90);
-      connCreateBtn.disabled = true;
-      try {
-        const data = await fetchJSON('/api/v1/account/connections', {
+        const org = await fetchJSON('/api/v1/account/orgs', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ label, poll_interval_sec: pollIntervalSec }),
+          body: JSON.stringify({ name }),
         });
-        showConnToken(data.compose_snippet);
-        connLabel.value = '';
-        setStatus(connectionsStatus, 'Connection created. Save the token below now.', 'ok');
-        await loadConnections();
+        await switchOrg(org.id);
       } catch (err) {
-        setStatus(connectionsStatus, String(err.message || err), 'err');
-      } finally {
-        connCreateBtn.disabled = false;
-      }
-    });
-
-    async function rotateConnection(id) {
-      try {
-        const data = await fetchJSON(`/api/v1/account/connections/${id}/rotate`, { method: 'POST' });
-        showConnToken(data.compose_snippet);
-        setStatus(connectionsStatus, 'Key rotated. The old key is revoked; save the new token below.', 'ok');
-        await loadConnections();
-      } catch (err) {
-        setStatus(connectionsStatus, String(err.message || err), 'err');
-      }
-    }
-
-    async function removeConnection(id) {
-      try {
-        await fetchJSON(`/api/v1/account/connections/${id}`, { method: 'DELETE' });
-        setStatus(connectionsStatus, 'Connection removed and its key revoked.', 'ok');
-        await loadConnections();
-      } catch (err) {
-        setStatus(connectionsStatus, String(err.message || err), 'err');
-      }
-    }
-
-    connCopyBtn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(connSnippet.value);
-        connCopyBtn.textContent = 'Copied';
-        setTimeout(() => { connCopyBtn.textContent = 'Copy'; }, 1500);
-      } catch (_) {
-        connSnippet.select();
+        setStatus(orgsStatus, String(err.message || err), 'err');
+        newOrgBtn.disabled = false;
       }
     });
 
     async function refreshSession() {
       try {
-        currentAccount = await fetchCurrentAccountWithRetry();
-        accountBox.classList.remove('hidden');
+        const payload = await fetchCurrentPayloadWithRetry();
+        currentAccount = payload.account || {};
+        currentOrg = payload.current_org || null;
+        const email = String(currentAccount.email || '').trim();
         const role = String(currentAccount.role || 'member');
         const authType = String(currentAccount.auth_type || 'session');
-        const email = String(currentAccount.email || '').trim();
+
+        authedBox.classList.remove('hidden');
+        signinPanel.classList.add('hidden');
+        profileEmail.textContent = email;
+        sessionEmail.textContent = email;
+        sessionRole.textContent = role;
+        sessionMeta.textContent = `${role} · ${authType}`;
+        renderOrgs(payload.orgs);
+
         const continueTarget = accountContinueTarget();
-        accountMeta.innerHTML = `
-          <div><b>${escapeHTML(email)}</b></div>
-          <div class="muted">Role: ${escapeHTML(role)} · Auth: ${escapeHTML(authType)}</div>
-          <div class="muted">${authCompleted ? 'Verified in this browser.' : 'Signed in to this browser.'}</div>
-          ${authCompleted && continueTarget ? `<div class="muted">Continuing to ${escapeHTML(continueTarget)}...</div>` : ''}
-        `;
-        setStatus(accountStatus, authCompleted ? `Signed in as ${email} in this browser.` : 'Signed in.', 'ok');
-        void loadRecordings();
-        void loadBilling();
-        void loadHistory();
-        void loadTeam();
-        void loadConnections();
-        if (authCompleted) scheduleAuthFlowContinue();
+        if (authCompleted && continueTarget) {
+          setStatus(accountStatus, `Signed in as ${email}. Continuing to ${continueTarget}...`, 'ok');
+          scheduleAuthFlowContinue();
+        } else {
+          setStatus(accountStatus, '', '');
+          if (authCompleted) clearAuthCompleteParam();
+        }
       } catch (_) {
         currentAccount = null;
-        accountBox.classList.add('hidden');
-        recordingsPanel.classList.add('hidden');
-        billingPanel.classList.add('hidden');
-        historyPanel.classList.add('hidden');
-        teamPanel.classList.add('hidden');
-        connectionsPanel.classList.add('hidden');
+        currentOrg = null;
+        authedBox.classList.add('hidden');
+        signinPanel.classList.remove('hidden');
         if (authCompleted) {
-          setStatus(accountStatus, 'Sign-in link was opened, but this browser still has no active session. Open the link in the same browser you want to use.', 'err');
+          setStatus(accountStatus, 'Sign-in link opened, but this browser has no active session. Open the link in the browser you want to use.', 'err');
         } else {
-          setStatus(accountStatus, 'No active session. Request a sign-in link to sign in.', '');
+          setStatus(accountStatus, '', '');
         }
       }
     }
@@ -1000,29 +355,13 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, redirect_path: requestedRedirectPath }),
         });
-        setStatus(requestStatus, 'If that email is accepted, we sent a sign-in link.', 'ok');
+        setStatus(requestStatus, 'Sign-in link sent.', 'ok');
       } catch (err) {
         setStatus(requestStatus, String(err), 'err');
       }
     });
 
-    billingManageBtn.addEventListener('click', async () => {
-      billingManageBtn.disabled = true;
-      try {
-        const out = await fetchJSON('/api/v1/account/billing/card', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-        });
-        const url = (out && (out.checkout_url || out.portal_url)) || '';
-        if (url) { window.location.assign(url); return; }
-        setStatus(billingStatus, 'No billing URL returned.', 'err');
-      } catch (err) {
-        setStatus(billingStatus, String(err.message || err), 'err');
-      } finally {
-        billingManageBtn.disabled = false;
-      }
-    });
-
-    document.getElementById('logoutBtn').addEventListener('click', async () => {
+    logoutBtn.addEventListener('click', async () => {
       try {
         await fetchJSON('/api/v1/account/logout', { method: 'POST' });
       } catch (_) {}

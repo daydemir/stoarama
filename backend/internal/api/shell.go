@@ -38,11 +38,14 @@ const shellHeadCSS = `
 .org-menu{position:absolute;top:40px;right:0;min-width:220px;padding:6px;border:1px solid var(--border);border-radius:10px;background:color-mix(in srgb,var(--panel) 96%,#000);box-shadow:0 8px 24px rgba(0,0,0,0.35);z-index:50;display:none;flex-direction:column;gap:2px;}
 .org-menu.open{display:flex;}
 .org-menu .org-menu-head{padding:4px 10px 6px;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:0.05em;}
-.org-menu .org-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:7px;color:var(--text);cursor:pointer;font-size:11px;text-align:left;background:none;border:none;font-family:var(--mono);width:100%;text-decoration:none;}
+.org-menu .org-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;color:var(--text);cursor:pointer;font-size:11px;text-align:left;background:none;border:none;font-family:var(--mono);width:100%;text-decoration:none;}
 .org-menu .org-item:hover{background:color-mix(in srgb,var(--panel2) 80%,transparent);text-decoration:none;color:var(--text);}
 .org-menu .org-item.current{color:var(--accent);}
-.org-menu .org-item.current::after{content:"\2713";color:var(--accent);font-size:10px;}
-.org-menu .org-role{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:0.04em;}
+/* Org row grid: [name (grows) | role (auto) | check slot (fixed)]. The check slot
+   is present-but-empty on non-current rows so the role label lines up across all rows. */
+.org-menu .org-item .org-item-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.org-menu .org-item .org-check{flex:0 0 12px;width:12px;text-align:right;color:var(--accent);font-size:10px;}
+.org-menu .org-role{flex:0 0 auto;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:0.04em;}
 .org-menu .org-sep{height:1px;margin:4px 2px;background:var(--border);}
 .org-menu .org-muted{color:var(--muted);}
 .org-menu .org-muted:hover{color:var(--text);}
@@ -62,8 +65,6 @@ const shellHeadCSS = `
 .org-modal button.primary[disabled]{opacity:0.6;cursor:default;}
 .org-modal button.ghost{background:none;color:var(--muted);}
 .org-modal button.ghost:hover{color:var(--text);}
-.admin-chip{display:none;align-items:center;justify-content:center;width:34px;height:34px;border-radius:999px;border:1px solid var(--border);background:color-mix(in srgb,var(--panel) 92%,#000);color:var(--text);font-family:var(--mono);font-size:13px;text-decoration:none;flex:0 0 auto;}
-.admin-chip:hover{text-decoration:none;border-color:color-mix(in srgb,var(--accent) 35%,var(--border));color:var(--accent);}
 @media (max-width:720px){.topbar{grid-template-columns:auto 1fr;grid-template-areas:"brand utils" "nav nav";row-gap:10px;column-gap:10px;align-items:center;}.topbar-left{grid-area:brand;}.topbar-right{grid-area:utils;justify-self:end;}.topbar-center{grid-area:nav;justify-self:stretch;}.global-nav{width:100%;justify-content:center;}}
 .site-footer{margin:40px auto 24px;max-width:1200px;padding:16px 4px 0;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11px;letter-spacing:0.03em;color:var(--muted);}
 .site-footer a{color:var(--muted);text-decoration:none;}
@@ -85,13 +86,12 @@ const shellTopbarTmpl = `<div class="topbar">
   <div class="topbar-right" id="accountArea">
     <a class="topbar-docs-link" href="/pricing">Pricing</a>
     <a class="topbar-docs-link" href="/docs/getting-started">Docs</a>
-    <a id="topbarAdminLink" class="admin-chip" href="/admin" aria-label="Admin">&#9881;</a>
     <div class="account-chip" id="topbarAccountStatus">Checking session...</div>
   </div>
 </div>` + shellTopbarJS
 
 // Canonical topbar BEHAVIOR. One definition for every page: fetch the session,
-// render the account chip + admin gear identically, so the account control works
+// render the account chip identically, so the account control works
 // on every tab including Recording. Wrapped in an IIFE that runs from its own
 // script element, independent of any page-body script, so a page-body JS error
 // cannot break the topbar. References only the shared #topbar* ids from the markup
@@ -101,8 +101,6 @@ const shellTopbarJS = `
 (function(){
   function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
   var chip=document.getElementById("topbarAccountStatus");
-  var gear=document.getElementById("topbarAdminLink");
-  if(gear){gear.style.display="none";}
   function redirectPath(){
     try{return location.pathname+(location.search||"");}catch(_){return "/";}
   }
@@ -180,8 +178,12 @@ const shellTopbarJS = `
     // never ambiguous. The dropdown carries the org list + Account + New org + Log out.
     var orgItems=orgs.map(function(o){
       var oid=Number(o.id);
-      var cur=oid===currentId?' current':'';
-      return '<button type="button" class="org-item'+cur+'" data-org="'+oid+'"><span>'+esc(o.name)+'</span><span class="org-role">'+esc(o.role||"")+'</span></button>';
+      var isCur=oid===currentId;
+      var cur=isCur?' current':'';
+      return '<button type="button" class="org-item'+cur+'" data-org="'+oid+'">'
+        +'<span class="org-item-name">'+esc(o.name)+'</span>'
+        +'<span class="org-role">'+esc(o.role||"")+'</span>'
+        +'<span class="org-check" aria-hidden="true">'+(isCur?'✓':'')+'</span></button>';
     }).join('');
     chip.innerHTML='<span class="org-switch" id="orgSwitch" title="Current org">'
         +'<span class="org-glyph" aria-hidden="true">&#127970;</span>'
@@ -190,6 +192,7 @@ const shellTopbarJS = `
       +'<div class="org-menu" id="orgMenu">'
         +(orgItems?'<div class="org-menu-head">Your orgs</div>'+orgItems+'<div class="org-sep"></div>':'')
         +'<a class="org-item org-muted" id="orgAccount" href="/account">Account</a>'
+        +'<a class="org-item org-muted" id="orgSettings" href="/org-settings">Org settings</a>'
         +'<button type="button" class="org-item org-muted" id="orgCreate">New org</button>'
         +'<div class="org-sep"></div>'
         +'<button type="button" class="org-item org-muted" id="orgLogout">Log out</button>'
@@ -208,7 +211,6 @@ const shellTopbarJS = `
       var logoutBtn=document.getElementById("orgLogout");
       if(logoutBtn){logoutBtn.addEventListener("click",function(){menu.classList.remove("open");logout();});}
     }
-    if(gear&&String(acct.role||"").trim().toLowerCase()==="admin"){gear.style.display="inline-flex";}
   }
   function load(){
     if(chip){chip.textContent="Checking session...";}

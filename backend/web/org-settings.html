@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stoarama Org Settings</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0f1a;
+      --panel: #111827;
+      --panel2: #182233;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --border: #1e293b;
+      --accent: #06b6d4;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --mono: "IBM Plex Mono", monospace;
+      --sans: "IBM Plex Sans", system-ui, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f1f5f9;
+        --panel: #ffffff;
+        --panel2: #f8fafc;
+        --text: #0f172a;
+        --muted: #4b5563;
+        --border: #e2e8f0;
+        --accent: #0891b2;
+        --ok: #16a34a;
+        --warn: #d97706;
+        --err: #dc2626;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--sans);
+      font-size: 14px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 10%, transparent) 0, transparent 28%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #000) 0%, var(--bg) 58%, color-mix(in srgb, var(--bg) 88%, #07101f) 100%);
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px 42px; }
+    .acct-content { max-width: 720px; margin: 0 auto; display: grid; gap: 14px; }
+    .org-head { display: flex; align-items: baseline; gap: 10px; margin: 2px 0 2px; }
+    .org-head .eyebrow { color: var(--muted); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .org-head .org-name { font-size: 18px; font-weight: 600; }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 94%, #000);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 22px 50px rgba(15, 23, 42, 0.18);
+    }
+    h2 { margin: 0 0 12px; font-size: 15px; line-height: 1.15; }
+    p, .note, .muted { color: var(--muted); line-height: 1.5; }
+    .status { min-height: 18px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .hidden { display: none !important; }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input, button, textarea {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel2) 84%, transparent);
+      color: var(--text);
+      font: inherit;
+    }
+    input { width: 100%; min-height: 38px; padding: 9px 12px; }
+    input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
+    button {
+      min-height: 38px; padding: 9px 12px; width: auto;
+      cursor: pointer;
+      background: color-mix(in srgb, var(--accent) 18%, var(--panel2));
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+      color: #f8fafc;
+      font-weight: 600;
+    }
+    button:hover { background: color-mix(in srgb, var(--accent) 28%, var(--panel2)); }
+    button.secondary { background: transparent; color: var(--text); font-weight: 500; }
+    button.small { min-height: 30px; padding: 5px 12px; font-size: 12px; }
+    .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .kv-val { font-family: var(--mono); font-size: 13px; color: var(--text); word-break: break-all; }
+    .sub { color: var(--muted); font-size: 12px; }
+    .mono { font-family: var(--mono); font-size: 12px; }
+    .role-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--border); background: color-mix(in srgb, var(--panel2) 80%, transparent);
+      font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+    }
+    .rec-list { display: grid; gap: 8px; }
+    .rec-row {
+      border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px;
+      background: color-mix(in srgb, var(--panel2) 86%, transparent);
+    }
+    .inline-form { display: flex; gap: 8px; align-items: flex-end; }
+    .inline-form input { flex: 1 1 auto; }
+    .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .section-title h2 { margin: 0; }
+    details.collapsible summary { cursor: pointer; color: var(--muted); font-size: 12px; list-style: none; }
+    details.collapsible summary::-webkit-details-marker { display: none; }
+    details.collapsible summary::before { content: '▸ '; }
+    details.collapsible[open] summary::before { content: '▾ '; }
+    .token-box { margin-top: 14px; padding: 14px; border: 1px solid var(--warn); border-radius: 12px; }
+    .token-box .warn-line { font-weight: 700; margin-bottom: 8px; color: var(--warn); }
+    textarea { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 12px; padding: 10px; }
+  </style>
+<!--SHELL_HEAD-->
+</head>
+<body>
+  <div class="shell">
+    <!--SHELL_TOPBAR-->
+
+    <div class="acct-content">
+    <div class="org-head">
+      <span class="eyebrow">Org settings</span>
+      <span id="orgHeadName" class="org-name">...</span>
+    </div>
+
+    <section id="generalPanel" class="panel">
+      <h2>General</h2>
+      <div class="kv-row">
+        <span class="sub">Org name</span>
+        <span id="generalOrgName" class="kv-val"></span>
+      </div>
+    </section>
+
+    <section id="teamPanel" class="panel hidden">
+      <h2>Members</h2>
+      <div id="teamInvite" class="inline-form hidden" style="margin-bottom:12px;">
+        <input id="teamInviteEmail" type="email" placeholder="teammate@example.org" />
+        <button id="teamInviteBtn" type="button">Invite</button>
+      </div>
+      <div id="teamStatus" class="status">Loading members...</div>
+      <div id="teamList" class="rec-list hidden"></div>
+    </section>
+
+    <section id="billingPanel" class="panel hidden">
+      <div class="section-title">
+        <h2 id="billingHeading">Billing</h2>
+        <button id="billingManageBtn" class="secondary small hidden" type="button">Manage</button>
+      </div>
+      <div id="billingStatus" class="status">Loading billing...</div>
+      <div id="billingBody" class="hidden">
+        <div id="paymentRow" class="mono" style="margin-bottom:10px;"></div>
+        <div id="estBreakdown" class="mono" style="margin-bottom:8px;"></div>
+        <div id="periodRow" class="sub"></div>
+        <div id="billingReadOnlyNote" class="sub hidden" style="margin-top:8px;">Ask an org owner to manage billing.</div>
+        <p class="sub" style="margin:10px 0 0;">$0.05 per hour of recording + $0.10 per hour of footage stored per month. Live estimate, not a final invoice. See <a href="/pricing">pricing</a>.</p>
+        <details class="collapsible" style="margin-top:12px;">
+          <summary>Invoice history</summary>
+          <div id="historyStatus" class="status" style="margin-top:8px;">Loading...</div>
+          <div id="historyEmpty" class="sub hidden" style="margin-top:8px;">No charges yet.</div>
+          <div id="historyList" class="rec-list hidden" style="margin-top:8px;"></div>
+        </details>
+      </div>
+    </section>
+
+    <section id="connectionsPanel" class="panel hidden">
+      <div class="section-title">
+        <h2>NAS connections</h2>
+        <a class="sub" href="/docs/self-serve">How this works</a>
+      </div>
+      <div id="connectionsStatus" class="status">Loading connections...</div>
+      <div id="connectionsList" class="rec-list hidden" style="margin-bottom:12px;"></div>
+      <div id="connectionsCreate">
+        <label for="connLabel">Label</label>
+        <input id="connLabel" type="text" placeholder="MIT Synology NAS" />
+        <label for="connInterval" style="margin-top:12px;">Poll interval</label>
+        <input id="connInterval" type="number" min="10" max="3600" value="90" />
+        <div class="sub" style="margin-top:4px;">Seconds, 10-3600.</div>
+        <div style="margin-top:12px;">
+          <button id="connCreateBtn" type="button">Create</button>
+        </div>
+      </div>
+      <div id="connTokenBox" class="token-box hidden">
+        <div class="warn-line">Save this now. You will not see it again.</div>
+        <textarea id="connSnippet" readonly rows="12"></textarea>
+        <div style="margin-top:10px;">
+          <button id="connCopyBtn" class="secondary small" type="button">Copy</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="orgStatus" class="status"></div>
+
+    </div>
+  </div>
+
+  <script>
+    const orgHeadName = document.getElementById('orgHeadName');
+    const generalOrgName = document.getElementById('generalOrgName');
+    const orgStatus = document.getElementById('orgStatus');
+    const billingPanel = document.getElementById('billingPanel');
+    const billingStatus = document.getElementById('billingStatus');
+    const billingBody = document.getElementById('billingBody');
+    const billingManageBtn = document.getElementById('billingManageBtn');
+    const billingHeading = document.getElementById('billingHeading');
+    const billingReadOnlyNote = document.getElementById('billingReadOnlyNote');
+    const estBreakdown = document.getElementById('estBreakdown');
+    const paymentRow = document.getElementById('paymentRow');
+    const periodRow = document.getElementById('periodRow');
+    const historyStatus = document.getElementById('historyStatus');
+    const historyEmpty = document.getElementById('historyEmpty');
+    const historyList = document.getElementById('historyList');
+    const teamPanel = document.getElementById('teamPanel');
+    const teamStatus = document.getElementById('teamStatus');
+    const teamList = document.getElementById('teamList');
+    const teamInvite = document.getElementById('teamInvite');
+    const teamInviteEmail = document.getElementById('teamInviteEmail');
+    const teamInviteBtn = document.getElementById('teamInviteBtn');
+    const connectionsPanel = document.getElementById('connectionsPanel');
+    const connectionsStatus = document.getElementById('connectionsStatus');
+    const connectionsList = document.getElementById('connectionsList');
+    const connLabel = document.getElementById('connLabel');
+    const connInterval = document.getElementById('connInterval');
+    const connCreateBtn = document.getElementById('connCreateBtn');
+    const connTokenBox = document.getElementById('connTokenBox');
+    const connSnippet = document.getElementById('connSnippet');
+    const connCopyBtn = document.getElementById('connCopyBtn');
+
+    let currentAccount = null;
+    let currentOrg = null;
+
+    async function fetchJSON(path, opts = {}) {
+      const method = String((opts && opts.method) || 'GET').toUpperCase();
+      const headers = { ...(opts.headers || {}) };
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && !headers['Idempotency-Key']) {
+        headers['Idempotency-Key'] = `${method}:${path}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+      }
+      const res = await fetch(path, { ...opts, credentials: 'include', headers });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+      return data;
+    }
+
+    function setStatus(el, text, kind) {
+      if (!(el instanceof HTMLElement)) return;
+      el.textContent = text || '';
+      el.className = `status${kind ? ` ${kind}` : ''}`;
+    }
+
+    function usd(cents) {
+      const c = Number(cents || 0);
+      if (c > 0 && c < 1) return '<$0.01';
+      return `$${(c / 100).toFixed(2)}`;
+    }
+
+    function usdStorage(units, rateCents, roundedCents) {
+      const c = Number(roundedCents || 0);
+      if (c === 0 && Number(units || 0) > 0 && Number(rateCents || 0) > 0) return '<$0.01';
+      return usd(c);
+    }
+
+    function fmtDay(iso) {
+      if (!iso) return '';
+      try { return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); }
+      catch (_) { return ''; }
+    }
+
+    function escapeHTML(v) {
+      return String(v == null ? '' : v)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    // Billing panel (org-scoped GET /billing). Reads shown to every member; the
+    // manage-card control is shown only when current_org.can_manage_billing.
+    function renderBilling(b) {
+      const hourRate = Number(b.recording_hour_rate_cents || 5);
+      const shmRate = Number(b.stream_hour_month_rate_cents || 10);
+      const hours = Number(b.recording_hours_this_month || 0);
+      const shm = Number(b.storage_stream_hour_month_avg || 0);
+      const hourCents = Number(b.estimated_amount_cents || 0);
+      const storeCents = Number(b.estimated_storage_amount_cents || 0);
+      const totalCents = hourCents + storeCents;
+
+      const orgName = String((currentOrg && currentOrg.name) || '').trim();
+      billingHeading.textContent = orgName ? `${orgName} bill` : 'Billing';
+      const canManageBilling = Boolean(currentOrg && currentOrg.can_manage_billing);
+      billingManageBtn.classList.toggle('hidden', !canManageBilling);
+      billingReadOnlyNote.classList.toggle('hidden', canManageBilling);
+
+      if (b.has_payment_method === true) {
+        paymentRow.innerHTML = `<span style="color:var(--ok);">Card on file.</span>`;
+        billingManageBtn.textContent = 'Manage';
+      } else {
+        paymentRow.innerHTML = `<span style="color:var(--warn);">No card on file. Adding a card does not charge you.</span>`;
+        billingManageBtn.textContent = 'Add card';
+      }
+
+      const lines = [`${hours} × ${usd(hourRate)}/hr recording = <b>${usd(hourCents)}</b>`];
+      if (shm > 0) lines.push(`${shm.toFixed(3)} hr-mo footage × ${usd(shmRate)} = <b>${usdStorage(shm, shmRate, storeCents)}</b>`);
+      lines.push(`<span style="display:inline-block;margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">Estimated total <b>${usd(totalCents)}</b></span>`);
+      estBreakdown.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
+
+      if (b.period_end) {
+        const span = b.period_start ? `${fmtDay(b.period_start)} to ${fmtDay(b.period_end)}` : `through ${fmtDay(b.period_end)}`;
+        periodRow.textContent = `Period: ${span}. Next invoice on or around ${fmtDay(b.period_end)}.`;
+      } else {
+        periodRow.textContent = 'Billing period starts once you add a card.';
+      }
+    }
+
+    async function loadBilling() {
+      try {
+        const b = await fetchJSON('/api/v1/account/billing');
+        if (b && b.billing_enabled === false) { billingPanel.classList.add('hidden'); return; }
+        billingPanel.classList.remove('hidden');
+        renderBilling(b || {});
+        billingStatus.classList.add('hidden');
+        billingBody.classList.remove('hidden');
+        void loadHistory();
+      } catch (err) {
+        billingPanel.classList.remove('hidden');
+        billingBody.classList.add('hidden');
+        billingStatus.classList.remove('hidden');
+        setStatus(billingStatus, `Could not load billing: ${String(err.message || err)}`, 'err');
+      }
+    }
+
+    function fmtInvoiceAmount(cents, currency) {
+      const c = Number(cents || 0);
+      const cur = String(currency || 'USD').toUpperCase();
+      try { return new Intl.NumberFormat([], { style: 'currency', currency: cur }).format(c / 100); }
+      catch (_) { return `${(c / 100).toFixed(2)} ${cur}`; }
+    }
+
+    function renderHistory(items) {
+      const list = Array.isArray(items) ? items : [];
+      if (list.length === 0) {
+        historyList.classList.add('hidden');
+        historyList.innerHTML = '';
+        historyEmpty.classList.remove('hidden');
+        return;
+      }
+      historyEmpty.classList.add('hidden');
+      historyList.classList.remove('hidden');
+      historyList.innerHTML = list.map((inv) => {
+        const date = fmtDay(inv.created);
+        const amount = fmtInvoiceAmount(inv.amount_due_cents, inv.currency);
+        const status = String(inv.status || '').trim();
+        const link = String(inv.hosted_url || inv.pdf_url || '').trim();
+        const parts = [];
+        if (date) parts.push(escapeHTML(date));
+        if (status) parts.push(escapeHTML(status));
+        if (link) parts.push(`<a href="${escapeHTML(link)}" target="_blank" rel="noopener">View</a>`);
+        return `<div class="rec-row kv-row"><span class="mono">${escapeHTML(amount)}</span><span class="sub">${parts.join(' · ')}</span></div>`;
+      }).join('');
+    }
+
+    async function loadHistory() {
+      try {
+        const h = await fetchJSON('/api/v1/account/billing/invoices');
+        if (h && h.billing_enabled === false) { return; }
+        historyStatus.classList.add('hidden');
+        renderHistory(h && h.items);
+      } catch (err) {
+        historyList.classList.add('hidden');
+        historyEmpty.classList.add('hidden');
+        historyStatus.classList.remove('hidden');
+        setStatus(historyStatus, `Could not load history: ${String(err.message || err)}`, 'err');
+      }
+    }
+
+    async function removeTeamMember(email) {
+      if (!email) return;
+      if (!window.confirm(`Remove ${email} from this org? They lose access immediately.`)) return;
+      try {
+        await fetchJSON(`/api/v1/account/members/${encodeURIComponent(email)}`, { method: 'DELETE' });
+        await loadTeam();
+      } catch (err) {
+        setStatus(teamStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function setMemberRole(email, role) {
+      if (!email || !role) return;
+      try {
+        await fetchJSON(`/api/v1/account/members/${encodeURIComponent(email)}/role`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role }),
+        });
+        await loadTeam();
+      } catch (err) {
+        setStatus(teamStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function loadTeam() {
+      teamPanel.classList.remove('hidden');
+      setStatus(teamStatus, 'Loading members...', '');
+      teamList.classList.add('hidden');
+      teamInvite.classList.add('hidden');
+      try {
+        const data = await fetchJSON('/api/v1/account/members');
+        const items = Array.isArray(data.items) ? data.items : [];
+        const canManage = Boolean(data.can_manage);
+        teamList.innerHTML = items.map((m) => {
+          const email = String(m.email || '');
+          const role = String(m.role || 'member');
+          const status = m.accepted_at ? 'Active' : 'Invited';
+          const showRemove = canManage && !(role === 'owner' && items.filter((x) => String(x.role) === 'owner').length <= 1);
+          const removeBtn = showRemove
+            ? `<button class="secondary small team-remove" type="button" data-email="${escapeHTML(email)}">Remove</button>`
+            : '';
+          const showRoleToggle = canManage && role !== 'owner';
+          const nextRole = role === 'billing_admin' ? 'member' : 'billing_admin';
+          const roleBtn = showRoleToggle
+            ? `<button class="secondary small team-role" type="button" data-email="${escapeHTML(email)}" data-role="${escapeHTML(nextRole)}">${nextRole === 'billing_admin' ? 'Make billing admin' : 'Make member'}</button>`
+            : '';
+          return `<div class="rec-row kv-row">
+            <div style="min-width:0;">
+              <div class="mono">${escapeHTML(email)}</div>
+              <div class="sub"><span class="role-badge">${escapeHTML(role)}</span> ${escapeHTML(status)}</div>
+            </div>
+            <div style="display:flex;gap:8px;flex-shrink:0;">${roleBtn}${removeBtn}</div>
+          </div>`;
+        }).join('');
+        teamList.classList.remove('hidden');
+        teamList.querySelectorAll('.team-role').forEach((btn) => {
+          btn.addEventListener('click', () => setMemberRole(btn.getAttribute('data-email') || '', btn.getAttribute('data-role') || ''));
+        });
+        teamList.querySelectorAll('.team-remove').forEach((btn) => {
+          btn.addEventListener('click', () => removeTeamMember(btn.getAttribute('data-email') || ''));
+        });
+        if (canManage) teamInvite.classList.remove('hidden');
+        setStatus(teamStatus, `${items.length} member${items.length === 1 ? '' : 's'}.`, 'ok');
+      } catch (err) {
+        teamPanel.classList.add('hidden');
+      }
+    }
+
+    teamInviteBtn.addEventListener('click', async () => {
+      const email = String(teamInviteEmail.value || '').trim();
+      teamInviteBtn.disabled = true;
+      try {
+        await fetchJSON('/api/v1/account/members', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email }),
+        });
+        teamInviteEmail.value = '';
+        setStatus(teamStatus, `Invite sent to ${email}.`, 'ok');
+        await loadTeam();
+      } catch (err) {
+        setStatus(teamStatus, String(err.message || err), 'err');
+      } finally {
+        teamInviteBtn.disabled = false;
+      }
+    });
+
+    const connHealthColor = { healthy: '#22c55e', stale: '#f59e0b', never: '#9ca3af' };
+
+    function connStatusDot(health) {
+      const color = connHealthColor[health] || connHealthColor.never;
+      return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:8px;"></span>`;
+    }
+
+    function connLastSeenText(c) {
+      if (!c.last_seen_at) return 'never seen';
+      const d = new Date(c.last_seen_at);
+      return Number.isNaN(d.getTime()) ? String(c.last_seen_at) : `last seen ${d.toLocaleString()}`;
+    }
+
+    async function loadConnections() {
+      connectionsPanel.classList.remove('hidden');
+      setStatus(connectionsStatus, 'Loading connections...', '');
+      connectionsList.classList.add('hidden');
+      try {
+        const data = await fetchJSON('/api/v1/account/connections');
+        const items = Array.isArray(data.items) ? data.items : [];
+        connectionsList.innerHTML = items.map((c) => {
+          const id = Number(c.id);
+          const label = String(c.label || 'NAS');
+          const health = String(c.health || 'never');
+          const clips = Number(c.clips_pulled || 0);
+          const interval = Number(c.poll_interval_sec || 90);
+          return `<div class="rec-row kv-row">
+            <div style="min-width:0;">
+              <div>${connStatusDot(health)}<b class="mono">${escapeHTML(label)}</b></div>
+              <div class="sub">${escapeHTML(health)} · ${clips} clip${clips === 1 ? '' : 's'} · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
+            </div>
+            <div style="display:flex;gap:8px;flex-shrink:0;">
+              <button class="secondary small conn-rotate" type="button" data-id="${id}">Rotate</button>
+              <button class="secondary small conn-remove" type="button" data-id="${id}">Remove</button>
+            </div>
+          </div>`;
+        }).join('');
+        connectionsList.classList.remove('hidden');
+        connectionsList.querySelectorAll('.conn-rotate').forEach((btn) => {
+          btn.addEventListener('click', () => rotateConnection(Number(btn.getAttribute('data-id'))));
+        });
+        connectionsList.querySelectorAll('.conn-remove').forEach((btn) => {
+          btn.addEventListener('click', () => removeConnection(Number(btn.getAttribute('data-id'))));
+        });
+        setStatus(connectionsStatus, `${items.length} connection${items.length === 1 ? '' : 's'}.`, 'ok');
+      } catch (err) {
+        connectionsPanel.classList.add('hidden');
+      }
+    }
+
+    function showConnToken(snippet) {
+      connSnippet.value = String(snippet || '');
+      connTokenBox.classList.remove('hidden');
+    }
+
+    connCreateBtn.addEventListener('click', async () => {
+      const label = String(connLabel.value || '').trim();
+      const pollIntervalSec = Number(connInterval.value || 90);
+      connCreateBtn.disabled = true;
+      try {
+        const data = await fetchJSON('/api/v1/account/connections', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label, poll_interval_sec: pollIntervalSec }),
+        });
+        showConnToken(data.compose_snippet);
+        connLabel.value = '';
+        setStatus(connectionsStatus, 'Connection created. Save the token below now.', 'ok');
+        await loadConnections();
+      } catch (err) {
+        setStatus(connectionsStatus, String(err.message || err), 'err');
+      } finally {
+        connCreateBtn.disabled = false;
+      }
+    });
+
+    async function rotateConnection(id) {
+      try {
+        const data = await fetchJSON(`/api/v1/account/connections/${id}/rotate`, { method: 'POST' });
+        showConnToken(data.compose_snippet);
+        setStatus(connectionsStatus, 'Key rotated. The old key is revoked; save the new token below.', 'ok');
+        await loadConnections();
+      } catch (err) {
+        setStatus(connectionsStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function removeConnection(id) {
+      try {
+        await fetchJSON(`/api/v1/account/connections/${id}`, { method: 'DELETE' });
+        setStatus(connectionsStatus, 'Connection removed and its key revoked.', 'ok');
+        await loadConnections();
+      } catch (err) {
+        setStatus(connectionsStatus, String(err.message || err), 'err');
+      }
+    }
+
+    connCopyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(connSnippet.value);
+        connCopyBtn.textContent = 'Copied';
+        setTimeout(() => { connCopyBtn.textContent = 'Copy'; }, 1500);
+      } catch (_) {
+        connSnippet.select();
+      }
+    });
+
+    billingManageBtn.addEventListener('click', async () => {
+      billingManageBtn.disabled = true;
+      try {
+        const out = await fetchJSON('/api/v1/account/billing/card', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const url = (out && (out.checkout_url || out.portal_url)) || '';
+        if (url) { window.location.assign(url); return; }
+        setStatus(billingStatus, 'No billing URL returned.', 'err');
+      } catch (err) {
+        setStatus(billingStatus, String(err.message || err), 'err');
+      } finally {
+        billingManageBtn.disabled = false;
+      }
+    });
+
+    async function refreshOrg() {
+      try {
+        const payload = await fetchJSON('/api/v1/account/me');
+        currentAccount = payload.account || {};
+        currentOrg = payload.current_org || null;
+        const orgName = String((currentOrg && currentOrg.name) || '').trim() || 'Current org';
+        orgHeadName.textContent = orgName;
+        generalOrgName.textContent = orgName;
+        setStatus(orgStatus, '', '');
+        void loadTeam();
+        void loadBilling();
+        void loadConnections();
+      } catch (_) {
+        currentAccount = null;
+        currentOrg = null;
+        orgHeadName.textContent = 'Not signed in';
+        generalOrgName.textContent = '';
+        teamPanel.classList.add('hidden');
+        billingPanel.classList.add('hidden');
+        connectionsPanel.classList.add('hidden');
+        setStatus(orgStatus, 'No active session. Sign in on the Account page to manage this org.', '');
+      }
+    }
+
+    void refreshOrg();
+  </script>
+</body>
+</html>
