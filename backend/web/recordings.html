@@ -3770,7 +3770,15 @@
         await refreshRecordings();
         setStatus(els.startStatus, '', '');
       } catch (err) {
-        setStatus(els.startStatus, String(err.message || err), 'err');
+        const msg = String(err.message || err);
+        // A name collision (409) means this account already has a live recording
+        // with this name. Point the user at their recordings to edit it instead
+        // of surfacing a raw server error.
+        setStatus(els.startStatus,
+          /already exists/i.test(msg)
+            ? `A recording named "${name}" already exists. Open it from your recordings to edit its schedule, or pick a different name.`
+            : msg,
+          'err');
       } finally {
         state.starting = false;
         refreshStartEnabled();
@@ -3784,10 +3792,10 @@
       els.startBtn.textContent = needsCard ? 'Add a payment method in Org settings' : 'Start recording';
       const hoursCharge = '$0.05 for each hour a recording captures at least one clip';
       const storageCharge = ', plus $0.10 per hour of footage, per month for managed storage';
-      const nasCharge = ', plus $0.01 per hour of recording for NAS transfer';
+      const nasCharge = '';
       const storedCharge = nas ? nasCharge : (managed ? storageCharge : '');
       const paidLine = nas
-        ? '$0.05 per hour of recording, plus $0.01 per hour of recording for NAS transfer. If your NAS goes down while recording, unsent clips are kept safely in managed storage and bill at $0.10 per hour of footage, per month until your NAS catches up.'
+        ? '$0.05 per hour of recording, and storage on your NAS is free. If your NAS falls behind, clips left in managed storage over 24h bill at $0.10 per hour of footage, per month until it catches up.'
         : (managed
             ? '$0.05 per hour of recording, plus $0.10 per hour of footage, per month for managed storage.'
             : '$0.05 per hour of recording.');
