@@ -558,15 +558,18 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	var nameExists bool
+	var existingID *int64
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT EXISTS(SELECT 1 FROM recordings WHERE account_id=$1 AND lower(name)=lower($2) AND status <> 'canceled')
-	`, principal.AccountID, name).Scan(&nameExists); err != nil {
+		SELECT id FROM recordings WHERE account_id=$1 AND lower(name)=lower($2) AND status <> 'canceled' LIMIT 1
+	`, principal.AccountID, name).Scan(&existingID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check recording name: %v", err))
 		return
 	}
-	if nameExists {
-		util.WriteError(w, http.StatusConflict, "a recording with that name already exists")
+	if existingID != nil {
+		util.WriteJSON(w, http.StatusConflict, map[string]any{
+			"error":        "a recording with that name already exists",
+			"recording_id": *existingID,
+		})
 		return
 	}
 
@@ -606,7 +609,14 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			util.WriteError(w, http.StatusConflict, "a recording with that name already exists")
+			body := map[string]any{"error": "a recording with that name already exists"}
+			var collidedID *int64
+			if serr := s.pool.QueryRow(r.Context(), `
+				SELECT id FROM recordings WHERE account_id=$1 AND lower(name)=lower($2) AND status <> 'canceled' LIMIT 1
+			`, principal.AccountID, name).Scan(&collidedID); serr == nil && collidedID != nil {
+				body["recording_id"] = *collidedID
+			}
+			util.WriteJSON(w, http.StatusConflict, body)
 			return
 		}
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create recording: %v", err))

@@ -105,7 +105,7 @@
     button.secondary:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); }
     button.danger { background: transparent; color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
     button.danger:hover { background: color-mix(in srgb, var(--err) 12%, transparent); }
-    /* Anchor styled as a button, for "View clips" -> /recordings/{id}. */
+    /* Anchor styled as a button, for "View recording" -> /recordings/{id}. */
     a.btn-link { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border); font-weight: 600; text-decoration: none; cursor: pointer; }
     a.btn-link.secondary { background: transparent; color: var(--text); }
     a.btn-link.secondary:hover { background: color-mix(in srgb, var(--panel2) 82%, transparent); text-decoration: none; }
@@ -440,7 +440,17 @@
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
       <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
         <h1>Record any public stream to your own storage.</h1>
-        <p class="empty-hero-sub">Set up a recording of any public HLS or HTTPS stream and choose how often it captures a clip. Each clip is saved to your own S3-compatible bucket, or to storage we manage for you. You can browse, download, or delete your clips anytime, and send any clip to your S3. Pricing is $0.05 for each hour a recording captures at least one clip. You are never charged for an hour nothing was recorded.</p>
+        <p class="empty-hero-sub">Set up a recording of any public HLS or HTTPS stream and choose how often it saves a clip. Clips are kept in storage we manage for you, or delivered to your own NAS. You can browse, download, or delete your clips anytime. Pricing is $0.05 for each hour a recording saves at least one clip. You are never charged for an hour nothing was recorded.</p>
+      </div>
+
+      <!-- Status filter (client-side over the loaded list; hidden in empty state).
+           Pagination is deferred, so this narrows the already-loaded recordings. -->
+      <div id="statusFilter" class="seg hidden" style="margin-bottom:14px;">
+        <button type="button" class="on" data-statusfilter="all">All</button>
+        <button type="button" data-statusfilter="active">Active</button>
+        <button type="button" data-statusfilter="scheduled">Scheduled</button>
+        <button type="button" data-statusfilter="paused">Paused</button>
+        <button type="button" data-statusfilter="completed">Completed</button>
       </div>
 
       <!-- Recording cards -->
@@ -797,6 +807,7 @@
       heroCopy: document.getElementById('heroCopy'),
       clipPage: document.getElementById('clipPage'),
       cards: document.getElementById('cards'),
+      statusFilter: document.getElementById('statusFilter'),
       newRecRow: document.getElementById('newRecRow'),
       newRecBtn: document.getElementById('newRecBtn'),
       recordingsCsvBtn: document.getElementById('recordingsCsvBtn'),
@@ -925,6 +936,9 @@
       // and the read-only arrears estimate.
       billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_hours_this_month: 0, estimated_amount_cents: 0, managed_available: false, storage_stream_hour_month_avg: '0.000', estimated_storage_amount_cents: 0 },
       recordings: [],
+      // Client-side status filter over the loaded recordings list: 'all' (default),
+      // 'active', 'scheduled', 'paused', or 'completed'.
+      statusFilter: 'all',
       destinations: [],
       schedPreset: 'hourly',
       // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
@@ -2255,6 +2269,24 @@
       return Number.isFinite(end) && end > 0 && end <= Date.now();
     }
 
+    // Bucket a recording into one status-filter key: 'completed' (elapsed window or
+    // server-flipped), 'paused' (its own chip), 'scheduled' (active but start_at is
+    // still upcoming), or 'active' (started, not ended, currently eligible). Completed
+    // wins over paused/status so a finished paused recording reads as completed.
+    // Canceled/deleted never reaches here (the list query excludes them).
+    function recordingFilterKey(rec) {
+      if (isCompleted(rec)) return 'completed';
+      if (String(rec.status || '') === 'paused') return 'paused';
+      if (isScheduled(rec)) return 'scheduled';
+      return 'active';
+    }
+
+    // True when a recording passes the active status filter ('all' passes everything).
+    function matchesStatusFilter(rec) {
+      const f = state.statusFilter || 'all';
+      return f === 'all' || recordingFilterKey(rec) === f;
+    }
+
     function cardHTML(rec) {
       const id = Number(rec.id);
       const st = statusLine(rec);
@@ -2309,7 +2341,7 @@
         const switchLabel = tier === 'yearly_prepaid' ? 'Switch to monthly' : 'Switch to yearly prepaid';
         actions += `<button type="button" class="secondary" data-retention="${id}" data-tier="${switchTo}">${switchLabel}</button>`;
       }
-      actions += `<a class="btn-link secondary" href="/recordings/${id}">View clips</a>`;
+      actions += `<a class="btn-link secondary" href="/recordings/${id}">View recording</a>`;
 
       const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
         ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
@@ -2451,15 +2483,38 @@
         </div>`;
     }
 
+    // Update the status-filter chips: keep each chip's label with a live count and
+    // toggle the active chip. Counts are over the whole loaded list so a chip always
+    // shows how many recordings it would reveal.
+    function renderStatusFilter() {
+      const all = state.recordings;
+      const counts = { all: all.length, active: 0, scheduled: 0, paused: 0, completed: 0 };
+      for (const rec of all) counts[recordingFilterKey(rec)]++;
+      const labels = { all: 'All', active: 'Active', scheduled: 'Scheduled', paused: 'Paused', completed: 'Completed' };
+      els.statusFilter.querySelectorAll('button[data-statusfilter]').forEach((b) => {
+        const key = b.getAttribute('data-statusfilter');
+        b.textContent = `${labels[key]} (${counts[key] || 0})`;
+        b.classList.toggle('on', (state.statusFilter || 'all') === key);
+      });
+    }
+
     function renderCards() {
-      const items = state.recordings;
-      const empty = items.length === 0;
+      const all = state.recordings;
+      const empty = all.length === 0;
       els.heroCopy.classList.toggle('hidden', !empty);
       els.newRecRow.classList.toggle('hidden', empty);
       els.cards.classList.toggle('hidden', empty);
+      els.statusFilter.classList.toggle('hidden', empty);
       if (empty) {
         els.cards.innerHTML = '';
         openComposer(true);
+        return;
+      }
+      renderStatusFilter();
+      // Client-side status filter over the loaded list (pagination deferred).
+      const items = all.filter(matchesStatusFilter);
+      if (items.length === 0) {
+        els.cards.innerHTML = `<div class="clip-summary">No recordings match this filter.</div>`;
         return;
       }
       // Partition into bundle groups (keyed by bundle_id, order of first sight) and
@@ -2667,13 +2722,9 @@
         ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
         : '';
       const rows = items.map((c) => clipRowHTML(c, recId)).join('');
-      const eligibleTargets = eligibleTransferTargetCount(items);
-      const note = eligibleTargets > 0
-        ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
-        : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="#" data-connectbucket="1">connect a bucket first</a>.</div>`;
       const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
       const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
-      panel.innerHTML = summary + bulk + exportCtl + clipTableHTML(rows, false) + note;
+      panel.innerHTML = summary + bulk + exportCtl + clipTableHTML(rows, false);
       wireClipActions(panel);
       wireBulkExport(panel);
       void reloadTransfers(panel, recId);
@@ -3088,15 +3139,11 @@
         </div>`;
 
       const rows = items.map((c) => clipRowHTML(c, recId)).join('');
-      const eligibleTargets = eligibleTransferTargetCount(items);
-      const note = eligibleTargets > 0
-        ? `<div class="clip-actions-note">Send to my S3 copies a clip into another of your buckets. The original is kept.</div>`
-        : `<div class="clip-actions-note">To copy clips into your own S3 bucket, <a href="/recordings">connect a bucket first</a> from the recordings page.</div>`;
       // The export-all control acts over the WHOLE recording, not just this page.
       const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
       const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
 
-      body.innerHTML = summary + pageActions + exportCtl + clipTableHTML(rows, false) + note + clipPagerHTML(page, pageCount);
+      body.innerHTML = summary + pageActions + exportCtl + clipTableHTML(rows, false) + clipPagerHTML(page, pageCount);
       wireClipActions(body);
       wireBulkExport(body);
       wireClipPageNav(body);
@@ -3532,6 +3579,7 @@
     function focusComposerView() {
       els.heroCopy.classList.add('hidden');
       els.cards.classList.add('hidden');
+      els.statusFilter.classList.add('hidden');
       els.newRecRow.classList.add('hidden');
     }
 
@@ -3679,6 +3727,7 @@
       els.heroCopy.classList.toggle('hidden', !empty);
       els.newRecRow.classList.remove('hidden');
       els.cards.classList.toggle('hidden', empty);
+      els.statusFilter.classList.toggle('hidden', empty);
     }
 
     // ---- Start handler ----
@@ -3760,9 +3809,25 @@
       els.startBtn.disabled = true;
       setStatus(els.startStatus, 'Starting...', '');
       try {
-        await fetchJSON('/api/v1/account/recordings', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        // Manual fetch (not fetchJSON) so the 409 name-collision body's recording_id
+        // is readable: a collision renders an "Edit recording" link to that existing
+        // recording, which fetchJSON would discard by throwing only the error string.
+        const res = await fetch('/api/v1/account/recordings', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': `POST:/api/v1/account/recordings:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+          },
+          body: JSON.stringify(body),
         });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const err = new Error(data.error || `request failed (${res.status})`);
+          err.status = res.status;
+          err.recordingId = Number(data.recording_id) || 0;
+          throw err;
+        }
         els.recURL.value = '';
         els.recName.value = '';
         clearStashedCatalogStreamId();
@@ -3772,13 +3837,16 @@
       } catch (err) {
         const msg = String(err.message || err);
         // A name collision (409) means this account already has a live recording
-        // with this name. Point the user at their recordings to edit it instead
-        // of surfacing a raw server error.
-        setStatus(els.startStatus,
-          /already exists/i.test(msg)
-            ? `A recording named "${name}" already exists. Open it from your recordings to edit its schedule, or pick a different name.`
-            : msg,
-          'err');
+        // with this name. Point the user at that recording with a real Edit link
+        // instead of surfacing a raw server error.
+        if (/already exists/i.test(msg) && err.recordingId > 0) {
+          els.startStatus.className = 'status err';
+          els.startStatus.innerHTML =
+            `<div>A recording named "${escapeHTML(name)}" already exists. Edit its schedule, or pick a different name.</div>`
+            + `<a class="btn-link secondary" href="/recordings/${err.recordingId}" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;margin-top:8px;">Edit recording</a>`;
+        } else {
+          setStatus(els.startStatus, msg, 'err');
+        }
       } finally {
         state.starting = false;
         refreshStartEnabled();
@@ -3959,6 +4027,16 @@
     els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => openComposer(false));
+    // Status filter: delegate clicks off the chips (static markup), set the active
+    // filter, and re-render the loaded list. Client-side only; no refetch.
+    els.statusFilter.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-statusfilter]');
+      if (!btn) return;
+      const key = btn.getAttribute('data-statusfilter');
+      if (!key || state.statusFilter === key) return;
+      state.statusFilter = key;
+      renderCards();
+    });
     els.newBundleBtn.addEventListener('click', () => openBundleComposer());
     els.recordingsCsvBtn.addEventListener('click', () => window.location.assign('/api/v1/account/recordings.csv'));
     els.composerClose.addEventListener('click', closeComposer);
@@ -4138,6 +4216,7 @@
       els.cardBanner.classList.add('hidden');
       els.heroCopy.classList.add('hidden');
       els.cards.classList.add('hidden');
+      els.statusFilter.classList.add('hidden');
       els.newRecRow.classList.add('hidden');
       els.composer.classList.add('hidden');
       els.clipPage.classList.add('hidden');
@@ -4407,6 +4486,7 @@
           els.cardBanner.classList.add('hidden');
           els.heroCopy.classList.add('hidden');
           els.cards.classList.add('hidden');
+          els.statusFilter.classList.add('hidden');
           els.newRecRow.classList.add('hidden');
           els.composer.classList.add('hidden');
           els.clipPage.classList.remove('hidden');
