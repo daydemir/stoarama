@@ -249,7 +249,7 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 				// The newest segment is still being written; leave it for a later poll.
 				continue
 			}
-			seg, err := finalizeSegment(ctx, path)
+			seg, err := finalizeSegment(ctx, path, clipDuration)
 			if err != nil {
 				return err
 			}
@@ -315,7 +315,7 @@ func sortedSegments(outDir string) ([]string, error) {
 // finalizeSegment probes a finalized segment file and builds its Segment. The
 // StartAt is parsed from the strftime filename (UTC), so the per-segment object
 // key the worker derives downstream is deterministic and ordered.
-func finalizeSegment(ctx context.Context, path string) (Segment, error) {
+func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duration) (Segment, error) {
 	startAt, err := parseSegmentStart(filepath.Base(path))
 	if err != nil {
 		return Segment{}, err
@@ -344,6 +344,12 @@ func finalizeSegment(ctx context.Context, path string) (Segment, error) {
 		}
 		audioCodec = meta.AudioCodec
 		audioPresent = meta.AudioPresent
+	}
+	// A probe miss (or a degenerate probe reporting <=0 duration) must not collapse
+	// the segment to zero width: fall back to the muxer's expected cut span so the
+	// clip carries a real duration/end and the continuous timeline stays gapless.
+	if durationMs <= 0 && fallbackSpan > 0 {
+		durationMs = fallbackSpan.Milliseconds()
 	}
 	endAt := startAt
 	if durationMs > 0 {

@@ -410,6 +410,18 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		container = "mp4"
 	}
 
+	// Fallback so a probe-miss clip (recorder sent duration_ms<=0) still records a
+	// real duration derived from the clip's own validated start/end span, mirroring
+	// the legacy capture path. Metering never reads duration_ms (it uses the
+	// timestamps), so this only corrects the stored/displayed duration.
+	durationMs := req.DurationMs
+	if durationMs <= 0 {
+		durationMs = clipEndAt.Sub(clipStartAt).Milliseconds()
+		if durationMs < 0 {
+			durationMs = 0
+		}
+	}
+
 	var clipID int64
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recording_clips
@@ -420,7 +432,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		ON CONFLICT (bucket, object_key) DO NOTHING
 		RETURNING id
 	`, recordingID, jobID, destID, endpoint, bucket, objectKey,
-		mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), req.DurationMs,
+		mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), durationMs,
 		strings.TrimSpace(req.VideoCodec), strings.TrimSpace(req.AudioCodec), req.AudioPresent, req.ActualFPS,
 		strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt).Scan(&clipID)
 	if errors.Is(err, pgx.ErrNoRows) {
