@@ -934,7 +934,7 @@
       billingEnabled: true,
       // Latest GET /billing payload (usage model): has_payment_method gates Start
       // and the read-only arrears estimate.
-      billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_hours_this_month: 0, estimated_amount_cents: 0, managed_available: false, storage_stream_hour_month_avg: '0.000', estimated_storage_amount_cents: 0 },
+      billing: { billing_enabled: true, has_customer: false, has_payment_method: false, recording_hours_this_month: 0, estimated_amount_cents: 0, managed_available: false, storage_stream_hour_month_avg: '0.000', estimated_storage_amount_cents: 0, projected_recording_hours: 0, projected_recording_amount_cents: 0, projected_total_amount_cents: 0, is_projection: true },
       recordings: [],
       // Client-side status filter over the loaded recordings list: 'all' (default),
       // 'active', 'scheduled', 'paused', or 'completed'.
@@ -2187,9 +2187,9 @@
       const hours = Number(b.recording_hours_this_month || 0);
       if (hours >= 1) {
         const noun = hours === 1 ? 'hour of recording' : 'hours of recording';
-        lines.push(`<span><b>${hours} ${noun} this month</b> &middot; est. ${usdCents(b.estimated_amount_cents)}</span>`);
+        lines.push(`<span><b>${hours} ${noun} this billing period</b> &middot; est. ${usdCents(b.estimated_amount_cents)}</span>`);
       }
-      // Managed storage line: month-to-date average stream-hour-month from /billing.
+      // Managed storage line: period-to-date average stream-hour-month from /billing.
       // Hidden when the account has no managed data (avg = 0).
       const shm = Number(b.storage_stream_hour_month_avg || 0);
       if (shm > 0) {

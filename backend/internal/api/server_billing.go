@@ -33,9 +33,12 @@ const recordingHourRateCents = 5
 const streamHourMonthRateCents = 10
 
 // handleAccountBillingMe returns the account's usage-billing summary: whether a
-// card is on file plus a live (DB-derived, never Stripe) estimate of this
-// calendar month's recording-hours and dollar amount. Stripe meter aggregation is
-// async, so the UI estimate always reads our own recording_billing_hours view.
+// card is on file, a live (DB-derived, never Stripe) measurement of the current
+// billing period's recording-hours and dollar amount TO DATE, and a forward
+// PROJECTION of the total through period end (measured recording-hours plus the
+// expected additional record-hours of active/scheduled recordings). Stripe meter
+// aggregation is async, so every figure reads our own ledger, never a Stripe
+// summary. The projection is display-only: it never changes what is charged.
 func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -56,37 +59,15 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Live month-to-date estimate from our own ledger (never Stripe summaries).
-	var hours int
-	if err := s.pool.QueryRow(r.Context(), `
-		SELECT count(*) FROM recording_billing_hours
-		WHERE account_id=$1 AND rec_hour >= date_trunc('month', now() AT TIME ZONE 'UTC')
-	`, principal.AccountID).Scan(&hours); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count recording hours: %v", err))
-		return
-	}
-
-	// Month-to-date average stored stream-hours of managed footage, from our own
-	// daily snapshots. avg = SUM(stream_hours_stored)/count(snapshot days) across the
-	// current UTC month; 0 when there are no snapshots. Mirrors the period-average the
-	// stream_hour_month meter reports at period close.
-	var snapHours float64
-	var snapDays int
-	if err := s.pool.QueryRow(r.Context(), `
-		SELECT COALESCE(SUM(stream_hours_stored),0), COUNT(*)
-		FROM account_storage_snapshots
-		WHERE account_id=$1 AND snapshot_date >= date_trunc('month', now() AT TIME ZONE 'UTC')::date
-	`, principal.AccountID).Scan(&snapHours, &snapDays); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load storage snapshots: %v", err))
-		return
-	}
-	avgStreamHours := 0.0
-	if snapDays > 0 {
-		avgStreamHours = snapHours / float64(snapDays)
-	}
-
-	// Best-effort billing-period context for the account view. Null when there is
-	// no subscription yet or Stripe is unreachable; never fails the response.
+	// Resolve the billing window ONCE: the Stripe subscription period when
+	// available (so to-date measurement and forward projection align with the real
+	// invoice), else the current UTC calendar month. A Stripe error never
+	// hard-fails the endpoint; it falls back to the calendar month, same as the
+	// best-effort period display always has.
+	now := time.Now().UTC()
+	winStart := now.Truncate(time.Hour)
+	winStart = time.Date(winStart.Year(), winStart.Month(), 1, 0, 0, 0, 0, time.UTC)
+	winEnd := winStart.AddDate(0, 1, 0)
 	var periodStart, periodEnd *string
 	if s.billing != nil {
 		var subID *string
@@ -95,36 +76,134 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		`, principal.AccountID).Scan(&subID)
 		if subID != nil && strings.TrimSpace(*subID) != "" {
 			if start, end, err := s.billing.GetSubscriptionPeriod(r.Context(), strings.TrimSpace(*subID)); err == nil {
+				if !start.IsZero() && !end.IsZero() && end.After(start) {
+					winStart = start.UTC()
+					winEnd = end.UTC()
+				}
 				if !start.IsZero() {
-					v := start.Format(time.RFC3339)
+					v := start.UTC().Format(time.RFC3339)
 					periodStart = &v
 				}
 				if !end.IsZero() {
-					v := end.Format(time.RFC3339)
+					v := end.UTC().Format(time.RFC3339)
 					periodEnd = &v
 				}
 			}
 		}
 	}
 
+	// Recording-hours measured TO DATE, over the resolved window [winStart, winEnd),
+	// from our own ledger (never Stripe summaries). Same [start,end) bind meterAccount
+	// uses when it reports the period.
+	var hours int
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT count(*) FROM recording_billing_hours
+		WHERE account_id=$1 AND rec_hour >= $2 AND rec_hour < $3
+	`, principal.AccountID, winStart, winEnd).Scan(&hours); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count recording hours: %v", err))
+		return
+	}
+
+	// Average stored stream-hours of managed footage over the window, from our own
+	// daily snapshots. avg = SUM(stream_hours_stored)/count(snapshot days) across
+	// the window; 0 when there are no snapshots. Mirrors the period-average the
+	// stream_hour_month meter reports at period close. Storage stays TO DATE
+	// measured (v1 does not forward-project storage).
+	var snapHours float64
+	var snapDays int
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT COALESCE(SUM(stream_hours_stored),0), COUNT(*)
+		FROM account_storage_snapshots
+		WHERE account_id=$1 AND snapshot_date >= $2::date AND snapshot_date < $3::date
+	`, principal.AccountID, winStart, winEnd).Scan(&snapHours, &snapDays); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load storage snapshots: %v", err))
+		return
+	}
+	avgStreamHours := 0.0
+	if snapDays > 0 {
+		avgStreamHours = snapHours / float64(snapDays)
+	}
+
+	// Forward-project the expected ADDITIONAL recording-hours of active recordings
+	// from now to winEnd, mirroring the composer's estimate math (v1: recording
+	// hours only; storage stays to-date). Only status='active' recordings project;
+	// paused/canceled/completed contribute nothing.
+	projectedHours, err := s.projectAccountRecordingHours(r.Context(), principal.AccountID, now, winEnd)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("project recording hours: %v", err))
+		return
+	}
+	projectedHoursInt := int(math.Round(projectedHours))
+	projectedRecordingCents := projectedHoursInt * recordingHourRateCents
+	toDateRecordingCents := hours * recordingHourRateCents
+	toDateStorageCents := int(math.Round(avgStreamHours * float64(streamHourMonthRateCents)))
+	projectedTotalCents := toDateRecordingCents + projectedRecordingCents + toDateStorageCents
+
 	// Managed storage is offered only when billing is on AND the operator R2 is
 	// configured; otherwise the UI shows BYO only and the provision endpoint 503s.
 	managedAvailable := s.billing != nil && s.r2 != nil && s.cfg.ValidateR2() == nil
 
 	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"billing_enabled":                s.billing != nil,
-		"has_customer":                   customerID != nil && strings.TrimSpace(*customerID) != "",
-		"has_payment_method":             hasPaymentMethod,
-		"recording_hours_this_month":     hours,
-		"estimated_amount_cents":         hours * recordingHourRateCents,
-		"managed_available":              managedAvailable,
-		"storage_stream_hour_month_avg":  strconv.FormatFloat(avgStreamHours, 'f', 3, 64),
-		"estimated_storage_amount_cents": int64(math.Round(avgStreamHours * float64(streamHourMonthRateCents))),
-		"period_start":                   periodStart,
-		"period_end":                     periodEnd,
-		"recording_hour_rate_cents":      recordingHourRateCents,
-		"stream_hour_month_rate_cents":   streamHourMonthRateCents,
+		"billing_enabled":                  s.billing != nil,
+		"has_customer":                     customerID != nil && strings.TrimSpace(*customerID) != "",
+		"has_payment_method":               hasPaymentMethod,
+		"recording_hours_this_month":       hours,
+		"estimated_amount_cents":           toDateRecordingCents,
+		"managed_available":                managedAvailable,
+		"storage_stream_hour_month_avg":    strconv.FormatFloat(avgStreamHours, 'f', 3, 64),
+		"estimated_storage_amount_cents":   int64(toDateStorageCents),
+		"projected_recording_hours":        projectedHoursInt,
+		"projected_recording_amount_cents": int64(projectedRecordingCents),
+		"projected_total_amount_cents":     int64(projectedTotalCents),
+		"is_projection":                    true,
+		"period_start":                     periodStart,
+		"period_end":                       periodEnd,
+		"recording_hour_rate_cents":        recordingHourRateCents,
+		"stream_hour_month_rate_cents":     streamHourMonthRateCents,
 	})
+}
+
+// projectAccountRecordingHours sums the forward-projected additional
+// record-hours across the account's status='active' recordings for the window
+// [now, winEnd). Each recording's projection uses its own stored schedule
+// (mode/cron/timezone/daily-window/start/stop) via projectRecordingHours;
+// paused/canceled/completed recordings are excluded by the WHERE clause. This is
+// a display-only forecast and never touches metering or Stripe.
+func (s *Server) projectAccountRecordingHours(ctx context.Context, accountID int64, now, winEnd time.Time) (float64, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT mode, COALESCE(cron_expr,''), COALESCE(cron_timezone,''),
+		       COALESCE(to_char(daily_window_start,'HH24:MI:SS'),''),
+		       COALESCE(to_char(daily_window_end,'HH24:MI:SS'),''),
+		       start_at, end_at
+		FROM recordings
+		WHERE account_id=$1 AND status='active'
+	`, accountID)
+	if err != nil {
+		return 0, fmt.Errorf("load active recordings: %w", err)
+	}
+	defer rows.Close()
+
+	var total float64
+	for rows.Next() {
+		var (
+			rec     projectedRecording
+			startAt time.Time
+			endAt   *time.Time
+		)
+		if err := rows.Scan(&rec.Mode, &rec.CronExpr, &rec.CronTimezone, &rec.DailyStart, &rec.DailyEnd, &startAt, &endAt); err != nil {
+			return 0, fmt.Errorf("scan active recording: %w", err)
+		}
+		rec.StartAt = startAt.UTC()
+		if endAt != nil {
+			e := endAt.UTC()
+			rec.EndAt = &e
+		}
+		total += projectRecordingHours(rec, now, winEnd)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate active recordings: %w", err)
+	}
+	return total, nil
 }
 
 // handleAccountBillingInvoices returns the account's past charges (Stripe
@@ -508,16 +587,16 @@ func invoiceBatchKey(inv *stripe.Invoice) string {
 	return ""
 }
 
-// grantPrepaidCreditForInvoice is the yearly-prepaid credit-grant step of the
+// grantPrepaidCreditForInvoice closes the yearly-prepaid ledger row on the
 // invoice.paid webhook. It resolves the paid invoice to its prepaid_storage_batches
 // row (by stripe_invoice_id, else by the metadata batch_key), and ONLY when that row
-// is in status='charged' does it create the Stripe credit grant (scoped to the
-// managed-storage price only, +12mo) and transition the row charged->granted with
-// the grant id, granted_at, and expires_at. A non-prepay invoice (no matching row)
-// is a no-op. A redelivered invoice.paid whose batch is already 'granted' is a no-op
-// (the UPDATE ... WHERE status='charged' affects 0 rows and we return before calling
-// Stripe again); combined with the grant's idempotency key this is the no-double-
-// grant guarantee. The whole thing runs in the webhook tx.
+// is in status='charged' transitions it charged->granted (granted_at, expires_at).
+// It does NOT mint a Stripe credit grant: yearly_prepaid footage is excluded from the
+// stream_hour_month meter (see snapshotManagedStorageSQL), so the prepay invoice is
+// the whole charge and there is no metered line to offset -- granting a credit would
+// double-benefit the customer. A non-prepay invoice (no matching row) is a no-op; a
+// redelivered invoice.paid whose batch is already 'granted' affects 0 rows and is a
+// no-op. The whole thing runs in the webhook tx.
 func (s *Server) grantPrepaidCreditForInvoice(ctx context.Context, tx pgx.Tx, accountID int64, customerID string, inv *stripe.Invoice) error {
 	if s.billing == nil {
 		return nil
@@ -559,26 +638,19 @@ func (s *Server) grantPrepaidCreditForInvoice(ctx context.Context, tx pgx.Tx, ac
 		return fmt.Errorf("prepay batch %s has non-positive charged_cents %d", batchKey, chargedCents)
 	}
 
+	// Yearly-prepaid footage is EXCLUDED from the stream_hour_month meter (see
+	// snapshotManagedStorageSQL), so there is no metered line to offset: the prepay
+	// invoice IS the whole charge. Close the ledger row charged->granted for
+	// idempotency (a redelivered invoice.paid then affects 0 rows) but create NO
+	// Stripe credit grant, which would hand the customer free money on top of the
+	// already-half-price prepay. expires_at still records when the prepaid year lapses.
 	expiresAt := time.Now().UTC().AddDate(0, billing.PrepaidCreditMonths, 0)
-	grantID, err := s.billing.CreatePrepaidCreditGrant(ctx, customerID, chargedCents, expiresAt, batchKey, map[string]string{
-		"account_id": strconv.FormatInt(accountID, 10),
-		"kind":       "yearly_prepaid_storage",
-	})
-	if err != nil {
-		return fmt.Errorf("create credit grant for batch %s: %w", batchKey, err)
-	}
-	ct, err := tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		UPDATE prepaid_storage_batches
-		SET status='granted', stripe_credit_grant_id=$2, granted_at=now(), expires_at=$3, updated_at=now()
+		SET status='granted', granted_at=now(), expires_at=$2, updated_at=now()
 		WHERE batch_key=$1 AND status='charged'
-	`, batchKey, grantID, expiresAt)
-	if err != nil {
+	`, batchKey, expiresAt); err != nil {
 		return fmt.Errorf("record granted batch %s: %w", batchKey, err)
-	}
-	if ct.RowsAffected() == 0 {
-		// Lost a race to another delivery that already granted this batch. The grant
-		// idempotency key means Stripe returned the same grant, so this is safe.
-		return nil
 	}
 	return nil
 }

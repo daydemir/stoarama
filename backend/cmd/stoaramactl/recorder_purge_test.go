@@ -54,11 +54,15 @@ func TestEligibleReleaseAccountsSQLShape(t *testing.T) {
 // the instant it is released (NAS-pulled / delivered / retention-released). It also
 // pins the NAS grace clause so a nas_pull clip is only billed once it is still
 // staged past the grace window (NAS down or falling behind), never within it.
+// It also pins that yearly_prepaid footage is excluded (prepaid up front, so metering
+// it again would double-charge); dropping that predicate silently re-introduces the
+// yearly double-charge bug.
 func TestSnapshotManagedStorageExcludesReleased(t *testing.T) {
 	for _, want := range []string{
 		"sd.managed",
 		"c.purged_at IS NULL",
 		"c.released_at IS NULL",
+		"r.storage_retention_tier <> 'yearly_prepaid'",
 		"(r.delivery <> 'nas_pull' OR c.created_at < now() - ($1::interval))",
 	} {
 		if !strings.Contains(snapshotManagedStorageSQL, want) {

@@ -336,7 +336,11 @@
       const shm = Number(b.storage_stream_hour_month_avg || 0);
       const hourCents = Number(b.estimated_amount_cents || 0);
       const storeCents = Number(b.estimated_storage_amount_cents || 0);
-      const totalCents = hourCents + storeCents;
+      // Total row projects forward to period end: measured recording + expected
+      // additional recording hours + measured storage. The Recording/Storage line
+      // items above stay TO DATE; only the total looks ahead.
+      const projHours = Number(b.projected_recording_hours || 0);
+      const projTotalCents = Number(b.projected_total_amount_cents || (hourCents + storeCents));
 
       const orgName = String((currentOrg && currentOrg.name) || '').trim();
       billingHeading.textContent = orgName ? `${orgName} bill` : 'Billing';
@@ -362,9 +366,15 @@
       const rows = [item('Recording', recDetail, freeOr(usd(hourCents), hourCents))];
       const storeDetail = `<b>${shm.toFixed(3)}</b> hours of footage stored × <b>${usd(shmRate)}</b>`;
       rows.push(item('Storage', shm > 0 ? storeDetail : '0 hours of footage stored', freeOr(usdStorage(shm, shmRate, storeCents), storeCents)));
+      const totalLabel = b.period_end ? `Projected total (through ${fmtDay(b.period_end)})` : 'Projected total';
       rows.push(
-        `<div class="bill-label bill-total bill-total-label">Estimated total</div>` +
-        `<div class="bill-amount bill-total">${freeOr(usd(totalCents), totalCents)}</div>`);
+        `<div class="bill-label bill-total bill-total-label">${totalLabel}</div>` +
+        `<div class="bill-amount bill-total">${freeOr(usd(projTotalCents), projTotalCents)}</div>`);
+      // Muted sub-line so the projected total does not read as an overbill: the
+      // total looks ahead to period end while the line items above are to date.
+      rows.push(
+        `<div class="bill-detail bill-total-note" style="grid-column:1 / -1;margin-top:2px;">` +
+        `Projected to end of billing period. Recording ${hours} hr${hours === 1 ? '' : 's'} so far + ~${projHours} hr${projHours === 1 ? '' : 's'} expected; storage shown is to date.</div>`);
       estBreakdown.innerHTML = rows.join('');
 
       const meta = [];

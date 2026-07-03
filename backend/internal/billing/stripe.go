@@ -386,7 +386,13 @@ func (c *Client) ChargePrepaidBatch(ctx context.Context, customerID, batchKey st
 	}, nil
 }
 
-// CreatePrepaidCreditGrant issues a Stripe billing credit grant of `cents` USD that
+// CreatePrepaidCreditGrant is RETIRED (no production callers). Yearly-prepaid footage
+// is now EXCLUDED from the stream_hour_month meter (snapshotManagedStorageSQL) rather
+// than metered-then-credited, so no grant is minted. Do NOT re-wire this into the
+// invoice.paid path: with the meter exclusion in place it would double-benefit the
+// customer (half-price prepay + a live credit). Kept for reference/history only.
+//
+// (original behavior) issues a Stripe billing credit grant of `cents` USD that
 // applies ONLY to the managed-storage stream_hour_month price (streamHourMonthPriceID),
 // so a prepaid recording's monthly metered storage line is netted to $0 while it
 // NEVER touches the recording-hour price (which is always metered in arrears). This

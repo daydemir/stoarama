@@ -240,6 +240,10 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 // stops being billed for its storage. Clip duration uses the wall-clock span
 // (clip_end_at - clip_start_at), not duration_ms (unreliable / 0 on many rows).
 //
+// yearly_prepaid recordings are EXCLUDED: their storage is prepaid up front (a
+// standalone half-rate batch), so metering them here too would double-charge. Only
+// monthly-tier managed footage is metered.
+//
 // nas_pull clips only STAGE in managed storage while the NAS pulls them, so they get
 // a nasStagingGrace free window: a nas_pull clip is counted only once it is still
 // staged past the grace (NAS down or falling behind). Managed clips are counted from
@@ -253,6 +257,7 @@ const snapshotManagedStorageSQL = `
 	JOIN recordings r            ON r.id = c.recording_id
 	JOIN storage_destinations sd ON sd.id = c.storage_destination_id
 	WHERE sd.managed AND c.purged_at IS NULL AND c.released_at IS NULL
+	  AND r.storage_retention_tier <> 'yearly_prepaid'
 	  AND (r.delivery <> 'nas_pull' OR c.created_at < now() - ($1::interval))
 	GROUP BY r.account_id
 	ON CONFLICT (account_id, snapshot_date)
