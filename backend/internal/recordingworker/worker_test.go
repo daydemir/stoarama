@@ -1,6 +1,9 @@
 package recordingworker
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestContinuousShouldStop locks the supervisor loop's stop-vs-reconnect decision.
 // The load-bearing case is (canceled=false, windowClosed=false): CaptureContinuous
@@ -46,6 +49,32 @@ func TestIsAlreadyIngested(t *testing.T) {
 				t.Fatalf("isAlreadyIngested(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestReconnectBackoff pins the exponential reconnect schedule: 30s doubling per
+// consecutive failure, capped at 5m. failures==0 (never happens in the loop but
+// guarded) and failures==1 both yield the 30s base, and every count past the cap
+// stays at 5m. A clip-bearing attempt resets failures to 0 elsewhere, restarting
+// this sequence at 30s.
+func TestReconnectBackoff(t *testing.T) {
+	cases := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{failures: 0, want: 30 * time.Second},
+		{failures: 1, want: 30 * time.Second},
+		{failures: 2, want: 60 * time.Second},
+		{failures: 3, want: 120 * time.Second},
+		{failures: 4, want: 240 * time.Second},
+		{failures: 5, want: 5 * time.Minute},
+		{failures: 6, want: 5 * time.Minute},
+		{failures: 100, want: 5 * time.Minute},
+	}
+	for _, tc := range cases {
+		if got := reconnectBackoff(tc.failures); got != tc.want {
+			t.Fatalf("reconnectBackoff(%d) = %s, want %s", tc.failures, got, tc.want)
+		}
 	}
 }
 

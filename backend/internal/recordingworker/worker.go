@@ -258,12 +258,17 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	}
 
 	// sourceURL is re-resolved every supervisor attempt; onSegment records the URL
-	// that produced the segment it is ingesting.
+	// that produced the segment it is ingesting. segmentIngested flips true when a
+	// segment is delivered in the current attempt, which the supervisor uses to reset
+	// the reconnect backoff (a healthy attempt that later drops must not inherit a
+	// grown delay).
 	var sourceURL string
+	var segmentIngested bool
 	onSegment := func(seg capture.Segment) error {
 		if canceled() {
 			return nil
 		}
+		segmentIngested = true
 		segStartMs := seg.StartAt.UTC().UnixMilli()
 		intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType, segStartMs)
 		if err != nil {
@@ -308,17 +313,23 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// resolve + capture in a loop and reconnect until the window closes. In-window
 	// restarts must NOT consume attempt_count, so fail() is never called for a
 	// resolve/capture drop here; the job only fails on a permanent misconfiguration.
-	const reconnectDelay = 30 * time.Second
-	backoff := func() {
+	// Exponential reconnect backoff: consecutive failed attempts grow the delay
+	// (30s, 60s, 120s, 240s, 300s cap) so a persistently dead source is not hammered,
+	// while an attempt that ingested at least one clip resets failures to zero. The
+	// sleep stays interruptible by windowCtx.Done() (window close / job cancel) just
+	// like a fixed delay.
+	failures := 0
+	backoff := func(delay time.Duration) {
 		select {
 		case <-windowCtx.Done():
-		case <-time.After(reconnectDelay):
+		case <-time.After(delay):
 		}
 	}
 	for attempt := 1; ; attempt++ {
 		if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
 			break
 		}
+		segmentIngested = false
 
 		// Re-resolve EVERY attempt so an expiring token (the KBS Wowza m3u8 token
 		// rolls every 24h) is refreshed on reconnect. A transient resolve error backs
@@ -330,9 +341,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
 				break
 			}
+			failures++
+			delay := reconnectBackoff(failures)
 			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
-				job.JobID, job.RecordingID, attempt, err, reconnectDelay)
-			backoff()
+				job.JobID, job.RecordingID, attempt, err, delay)
+			backoff(delay)
 			continue
 		}
 		if isImage {
@@ -345,9 +358,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
 				break
 			}
+			failures++
+			delay := reconnectBackoff(failures)
 			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
-				job.JobID, job.RecordingID, attempt, err, reconnectDelay)
-			backoff()
+				job.JobID, job.RecordingID, attempt, err, delay)
+			backoff(delay)
 			continue
 		}
 		sourceURL = resolved
@@ -370,10 +385,16 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			break
 		}
 		// Premature exit (clean end-of-stream or a hard ffmpeg error) with the window
-		// still open: back off and reconnect.
+		// still open: back off and reconnect. An attempt that ingested at least one
+		// clip was a healthy connection that later dropped, so reset the backoff.
+		if segmentIngested {
+			failures = 0
+		}
+		failures++
+		delay := reconnectBackoff(failures)
 		log.Printf("recording worker job=%d recording=%d continuous source dropped (attempt %d): %v; reconnecting in %s",
-			job.JobID, job.RecordingID, attempt, captureErr, reconnectDelay)
-		backoff()
+			job.JobID, job.RecordingID, attempt, captureErr, delay)
+		backoff(delay)
 	}
 
 	if canceled() {
@@ -394,6 +415,28 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 // It never signals "fail": in-window restarts must not consume attempt_count.
 func continuousShouldStop(canceled, windowClosed bool) bool {
 	return canceled || windowClosed
+}
+
+// reconnectBackoff returns the supervisor reconnect delay for a given count of
+// consecutive failed attempts (failures >= 1): 30s doubling per failure, capped at
+// 5m -> 30s, 60s, 120s, 240s, 300s. An attempt that ingested a clip resets failures
+// to 0, so the next failure restarts the sequence at 30s. Kept pure and small so the
+// schedule is unit-testable, mirroring continuousShouldStop.
+func reconnectBackoff(failures int) time.Duration {
+	const base = 30 * time.Second
+	const maxDelay = 5 * time.Minute
+	if failures < 1 {
+		failures = 1
+	}
+	// Clamp the shift before it can overflow; the cap dominates well before then.
+	if failures-1 >= 5 {
+		return maxDelay
+	}
+	d := base << (failures - 1)
+	if d > maxDelay {
+		return maxDelay
+	}
+	return d
 }
 
 // isAlreadyIngested reports whether an ingest error is the server's 409 dedup
