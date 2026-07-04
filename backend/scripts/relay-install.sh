@@ -146,8 +146,21 @@ if [[ ! -x "${BIN_DIR}/ffmpeg" ]]; then
     ln -sf "$(command -v ffmpeg)" "${BIN_DIR}/ffmpeg"
     ln -sf "$(command -v ffprobe)" "${BIN_DIR}/ffprobe"
   else
-    echo "error: ffmpeg not found. Install it (macOS: brew install ffmpeg) and re-run this installer." >&2
-    exit 1
+    FFMPEG_INSTALLED=0
+    if [[ "${OS}" == "darwin" ]] && command -v brew >/dev/null 2>&1; then
+      echo "No bundled ffmpeg for ${OS}/${ARCH} and none found on PATH. Installing via Homebrew..."
+      brew install ffmpeg || true
+      if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+        echo "Using Homebrew ffmpeg at $(command -v ffmpeg)."
+        ln -sf "$(command -v ffmpeg)" "${BIN_DIR}/ffmpeg"
+        ln -sf "$(command -v ffprobe)" "${BIN_DIR}/ffprobe"
+        FFMPEG_INSTALLED=1
+      fi
+    fi
+    if [[ "${FFMPEG_INSTALLED}" -eq 0 ]]; then
+      echo "error: ffmpeg not found. Install Homebrew (https://brew.sh) and run 'brew install ffmpeg', then re-run this installer." >&2
+      exit 1
+    fi
   fi
 fi
 
