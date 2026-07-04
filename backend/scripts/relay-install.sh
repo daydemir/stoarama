@@ -126,15 +126,29 @@ if [[ ! -x "${BIN_DIR}/yt-dlp" ]]; then
   unquarantine "${BIN_DIR}/yt-dlp"
 fi
 
+# ffmpeg is optional to bundle: some targets (notably darwin/arm64) have no
+# statically linkable build we can safely ship. Prefer a bundled+verified ffmpeg
+# when latest.json advertises one for this os/arch (has a sha256); otherwise fall
+# back to a system ffmpeg/ffprobe already on PATH. Never proceed without a working
+# ffmpeg.
 if [[ ! -x "${BIN_DIR}/ffmpeg" ]]; then
-  echo "Downloading ffmpeg..."
   FFMPEG_TARBALL="ffmpeg-${KEY}.tar.gz"
-  download "${FFMPEG_TARBALL}" "/tmp/stoarama-ffmpeg.tar.gz"
-  verify_sha "/tmp/stoarama-ffmpeg.tar.gz" "${FFMPEG_TARBALL}"
-  tar -xzf "/tmp/stoarama-ffmpeg.tar.gz" -C "${BIN_DIR}"
-  chmod +x "${BIN_DIR}/ffmpeg" "${BIN_DIR}/ffprobe" 2>/dev/null || true
-  unquarantine "${BIN_DIR}/ffmpeg"
-  unquarantine "${BIN_DIR}/ffprobe"
+  if [[ -n "$(sha_for_artifact "${FFMPEG_TARBALL}")" ]]; then
+    echo "Downloading ffmpeg..."
+    download "${FFMPEG_TARBALL}" "/tmp/stoarama-ffmpeg.tar.gz"
+    verify_sha "/tmp/stoarama-ffmpeg.tar.gz" "${FFMPEG_TARBALL}"
+    tar -xzf "/tmp/stoarama-ffmpeg.tar.gz" -C "${BIN_DIR}"
+    chmod +x "${BIN_DIR}/ffmpeg" "${BIN_DIR}/ffprobe" 2>/dev/null || true
+    unquarantine "${BIN_DIR}/ffmpeg"
+    unquarantine "${BIN_DIR}/ffprobe"
+  elif command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+    echo "No bundled ffmpeg for ${OS}/${ARCH}; using system ffmpeg at $(command -v ffmpeg)."
+    ln -sf "$(command -v ffmpeg)" "${BIN_DIR}/ffmpeg"
+    ln -sf "$(command -v ffprobe)" "${BIN_DIR}/ffprobe"
+  else
+    echo "error: ffmpeg not found. Install it (macOS: brew install ffmpeg) and re-run this installer." >&2
+    exit 1
+  fi
 fi
 
 echo "Enrolling this computer with Stoarama..."

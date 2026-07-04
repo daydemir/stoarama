@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -19,7 +20,8 @@ const relayReleasePrefix = "relay-releases/"
 
 // relayArtifactName restricts a downloadable artifact to a single path segment of
 // safe characters, so the {artifact} route can never traverse out of the release
-// prefix or reach an unrelated R2 key.
+// prefix or reach an unrelated R2 key. It excludes '/' entirely; the "." and ".."
+// traversal names are rejected separately in handleRelayDownload.
 var relayArtifactName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // handleRelayInstallScript streams the public relay installer from R2. This is the
@@ -32,7 +34,9 @@ func (s *Server) handleRelayInstallScript(w http.ResponseWriter, r *http.Request
 // dependency, or latest.json) from R2 by exact name.
 func (s *Server) handleRelayDownload(w http.ResponseWriter, r *http.Request) {
 	artifact := strings.TrimSpace(chi.URLParam(r, "artifact"))
-	if artifact == "" || !relayArtifactName.MatchString(artifact) {
+	if artifact == "" || artifact == "." || artifact == ".." ||
+		strings.Contains(artifact, "/") || strings.Contains(artifact, "..") ||
+		!relayArtifactName.MatchString(artifact) {
 		util.WriteError(w, http.StatusBadRequest, "invalid artifact name")
 		return
 	}
@@ -46,7 +50,10 @@ func (s *Server) streamRelayArtifact(w http.ResponseWriter, r *http.Request, nam
 			util.WriteError(w, http.StatusNotFound, "not found")
 			return
 		}
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("open relay artifact: %v", err))
+		// Do not echo the internal key prefix or raw S3 error to the client; log
+		// the detail server-side and return a generic 404.
+		log.Printf("relay artifact open failed key=%q: %v", relayReleasePrefix+name, err)
+		util.WriteError(w, http.StatusNotFound, "not found")
 		return
 	}
 	defer body.Close()

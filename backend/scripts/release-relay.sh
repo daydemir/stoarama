@@ -15,8 +15,13 @@ set -euo pipefail
 # Optional env:
 #   RELAY_VERSION        version stamped into the binary + latest.json (default: git describe)
 #   YTDLP_VERSION        pinned yt-dlp release tag (default: latest)
-#   FFMPEG_DEPS_DIR      dir holding pinned ffmpeg-{os}-{arch}.tar.gz to upload (each
-#                        tarball must contain ffmpeg + ffprobe at its root)
+#
+# ffmpeg: statically linkable builds are fetched and republished automatically for
+# linux-amd64, linux-arm64 (johnvansickle static) and darwin-amd64 (evermeet.cx).
+# darwin-arm64 has no static build we can safely ship, so it is intentionally
+# omitted from latest.json; the installer falls back to a system ffmpeg (brew) on
+# Apple Silicon. If an upstream source is unreachable at run time the target is
+# skipped with a warning rather than published with a bad digest.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # backend/
 BUILD_DIR="$(mktemp -d)"
@@ -65,6 +70,62 @@ ytdlp_base_url() {
   fi
 }
 
+# build_ffmpeg <target> <stage-dir> <tarball-name>: fetches an upstream static
+# ffmpeg build for the target, assembles a tarball containing ffmpeg AND ffprobe at
+# its root, uploads it to R2, and prints the latest.json fragment for it on stdout.
+# On any unreachable source or missing binary it warns to stderr and returns
+# non-zero so the caller skips the target instead of publishing a bad digest.
+build_ffmpeg() {
+  local target="$1" stage="$2" tarball="$3"
+  local key="${target/\//-}"
+  rm -rf "${stage}"; mkdir -p "${stage}"
+  case "${target}" in
+    linux/amd64|linux/arm64)
+      local arch="${target#*/}"
+      local url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-${arch}-static.tar.xz"
+      local xz="${stage}/src.tar.xz"
+      if ! curl -fsSL "${url}" -o "${xz}"; then
+        echo "WARN: ffmpeg download failed for ${target} (${url}); skipping" >&2
+        return 1
+      fi
+      local ex="${stage}/ex"; mkdir -p "${ex}"
+      tar -C "${ex}" -xJf "${xz}"
+      local ffdir="" d
+      for d in "${ex}"/*/; do
+        if [[ -f "${d}ffmpeg" && -f "${d}ffprobe" ]]; then ffdir="${d}"; break; fi
+      done
+      if [[ -z "${ffdir}" ]]; then
+        echo "WARN: ffmpeg/ffprobe not found in ${url}; skipping ${target}" >&2
+        return 1
+      fi
+      cp "${ffdir}ffmpeg" "${ffdir}ffprobe" "${stage}/"
+      ;;
+    darwin/amd64)
+      local ff_zip="${stage}/ffmpeg.zip" fp_zip="${stage}/ffprobe.zip"
+      if ! curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o "${ff_zip}" \
+         || ! curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o "${fp_zip}"; then
+        echo "WARN: ffmpeg download failed for ${target} (evermeet.cx); skipping" >&2
+        return 1
+      fi
+      unzip -o -q "${ff_zip}" -d "${stage}"
+      unzip -o -q "${fp_zip}" -d "${stage}"
+      if [[ ! -f "${stage}/ffmpeg" || ! -f "${stage}/ffprobe" ]]; then
+        echo "WARN: ffmpeg/ffprobe missing after unzip for ${target}; skipping" >&2
+        return 1
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  chmod +x "${stage}/ffmpeg" "${stage}/ffprobe"
+  tar -C "${stage}" -czf "${stage}/${tarball}" ffmpeg ffprobe
+  local sha; sha="$(sha256_of "${stage}/${tarball}")"
+  r2_put "${stage}/${tarball}" "${tarball}" "application/gzip" \
+    || { echo "WARN: ffmpeg upload failed for ${target}; skipping" >&2; return 1; }
+  printf '    "%s": {"artifact": "%s", "sha256": "%s"},\n' "${key}" "${tarball}" "${sha}"
+}
+
 echo "Building stoarama-relay ${RELAY_VERSION}"
 RELAY_JSON=""
 YTDLP_JSON=""
@@ -92,15 +153,18 @@ for t in "${TARGETS[@]}"; do
   r2_put "${BUILD_DIR}/${yt_name}" "${yt_name}" "application/octet-stream"
   YTDLP_JSON="${YTDLP_JSON}    \"${key}\": {\"artifact\": \"${yt_name}\", \"sha256\": \"${yt_sha}\"},\n"
 
-  # pinned ffmpeg (operator-provided; uploaded + checksummed if present so the
-  # installer can verify it exactly like the relay tarball and yt-dlp).
+  # pinned ffmpeg: fetched from upstream static builds and republished with sha256
+  # so the installer can verify it exactly like the relay tarball and yt-dlp.
+  # darwin/arm64 is intentionally not bundled (no static build); the installer's
+  # system-ffmpeg fallback handles Apple Silicon.
   ff_tarball="ffmpeg-${key}.tar.gz"
-  if [[ -n "${FFMPEG_DEPS_DIR:-}" && -f "${FFMPEG_DEPS_DIR}/${ff_tarball}" ]]; then
-    ff_sha="$(sha256_of "${FFMPEG_DEPS_DIR}/${ff_tarball}")"
-    r2_put "${FFMPEG_DEPS_DIR}/${ff_tarball}" "${ff_tarball}" "application/gzip"
-    FFMPEG_JSON="${FFMPEG_JSON}    \"${key}\": {\"artifact\": \"${ff_tarball}\", \"sha256\": \"${ff_sha}\"},\n"
-  else
-    echo "WARN: ${ff_tarball} not found in FFMPEG_DEPS_DIR; skipping (install will 404 on ffmpeg)" >&2
+  if [[ "${t}" == "darwin/arm64" ]]; then
+    echo "NOTE: not bundling ffmpeg for darwin/arm64; installer uses system ffmpeg (brew install ffmpeg) on Apple Silicon" >&2
+  elif ff_line="$(build_ffmpeg "${t}" "${BUILD_DIR}/ffstage-${key}" "${ff_tarball}")"; then
+    # command substitution strips the fragment's trailing newline, so re-append a
+    # literal \n (rendered by printf "%b" below) to keep each ffmpeg entry on its
+    # own JSON line, exactly like RELAY_JSON/YTDLP_JSON.
+    FFMPEG_JSON="${FFMPEG_JSON}${ff_line}\n"
   fi
 done
 
