@@ -1,0 +1,12 @@
+[Unit]
+Description=Stoarama Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={{.ExePath}} run
+Restart=on-failure
+RestartSec=15s
+
+[Install]
+WantedBy=default.target

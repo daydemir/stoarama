@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -24,6 +25,23 @@ type Config struct {
 	Concurrency  int
 	HeartbeatSec int
 	PollInterval time.Duration
+
+	// SkipDropletHeartbeat disables the recorder_droplets liveness touch loop.
+	// Relay workers have no recorder_droplets row and report liveness through the
+	// node heartbeat instead, so they set this true. The zero value (false) keeps
+	// the cloud droplet heartbeat loop byte-identical.
+	SkipDropletHeartbeat bool
+	// ClassifyYouTubeCookieErrors, when true, rewrites a job-fail error_text to the
+	// "youtube_cookie_expired" sentinel when the underlying failure is a genuine
+	// YouTube sign-in / cookie-expiry failure (never a cookie-DB lock or a stale
+	// extractor), so the relay UI can prompt a re-login. The zero value (false)
+	// leaves the reported error_text byte-identical for cloud droplet workers.
+	ClassifyYouTubeCookieErrors bool
+	// ActiveJobs, when non-nil, is incremented while a job goroutine is in flight
+	// and decremented when it returns, so the relay can report its live lease count
+	// in the node heartbeat. The zero value (nil) is a no-op for cloud droplet
+	// workers.
+	ActiveJobs *atomic.Int64
 }
 
 type Worker struct {
@@ -85,6 +103,9 @@ func (w *Worker) Run(ctx context.Context) error {
 // dropletHeartbeatLoop touches droplet liveness on a ticker until ctx is
 // canceled. It runs whether or not a job is held.
 func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
+	if w.cfg.SkipDropletHeartbeat {
+		return
+	}
 	ticker := time.NewTicker(w.heartbeatInt)
 	defer ticker.Stop()
 	if err := w.cfg.Client.TouchDroplet(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -128,9 +149,15 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			return
 		}
 		wg.Add(1)
+		if w.cfg.ActiveJobs != nil {
+			w.cfg.ActiveJobs.Add(1)
+		}
 		go func(j recordingapi.RecordingJob) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if w.cfg.ActiveJobs != nil {
+				defer w.cfg.ActiveJobs.Add(-1)
+			}
 			if j.Kind == "continuous_window" {
 				w.processContinuousJob(ctx, j)
 				return
@@ -496,6 +523,13 @@ func (w *Worker) fail(ctx context.Context, jobID int64, runErr error) {
 	errText := "recording capture failed"
 	if runErr != nil {
 		errText = runErr.Error()
+	}
+	// Map a genuine YouTube sign-in / cookie-expiry failure to a stable sentinel so
+	// the relay UI can distinguish "log into YouTube again" from a generic capture
+	// failure. Gated off by default (cloud droplet error_text is unchanged); a
+	// cookie-DB lock or a stale-extractor failure is never mapped here.
+	if w.cfg.ClassifyYouTubeCookieErrors && capture.IsYouTubeSignInError(errText) {
+		errText = "youtube_cookie_expired"
 	}
 	log.Printf("recording worker job=%d failed: %s", jobID, errText)
 	// Use a fresh short-lived context so a canceled parent does not block the

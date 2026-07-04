@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -433,13 +434,17 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		mimeType        string
 		maxSize         int64
 		fireAt          time.Time
+		jobKind         string
+		windowEndAt     *time.Time
+		clipDurationSec int
 		recordingStatus string
 		accessKeyID     string
 		secretEnc       []byte
 	)
 	err = tx.QueryRow(r.Context(), `
 		SELECT ui.recording_id, ui.recording_job_id, ui.storage_destination_id, ui.endpoint, sd.region,
-		       ui.bucket, ui.object_key, ui.mime_type, ui.max_size_bytes, j.fire_at, rec.status,
+		       ui.bucket, ui.object_key, ui.mime_type, ui.max_size_bytes, j.fire_at,
+		       j.kind, j.window_end_at, j.clip_duration_sec, rec.status,
 		       sd.access_key_id, sd.secret_access_key_enc
 		FROM recording_upload_intents ui
 		JOIN recording_jobs j ON j.id = ui.recording_job_id
@@ -450,7 +455,8 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		FOR UPDATE OF ui
 	`, intentID, workerID).Scan(
 		&recordingID, &jobID, &destID, &endpoint, &region,
-		&bucket, &objectKey, &mimeType, &maxSize, &fireAt, &recordingStatus,
+		&bucket, &objectKey, &mimeType, &maxSize, &fireAt,
+		&jobKind, &windowEndAt, &clipDurationSec, &recordingStatus,
 		&accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -464,6 +470,24 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	if recordingStatus == "canceled" {
 		util.WriteError(w, http.StatusGone, "recording was canceled")
 		return
+	}
+
+	// Ingest sanity check (log only, never reject): a clip whose start lands far outside
+	// its job's capture window signals a timezone bug on the recorder (e.g. a relay that
+	// wrote segment strftime names in local time instead of UTC), which would otherwise
+	// silently store misaligned clips. Window = [fire_at, window_end_at] for a
+	// continuous_window job, else [fire_at, fire_at+clip_duration_sec]. A 15-minute slop
+	// tolerates normal capture/upload latency while catching whole-hour UTC offsets.
+	windowStart := fireAt
+	windowEnd := fireAt.Add(time.Duration(clipDurationSec) * time.Second)
+	if jobKind == "continuous_window" && windowEndAt != nil {
+		windowEnd = *windowEndAt
+	}
+	const ingestWindowSlop = 15 * time.Minute
+	if clipStartAt.Before(windowStart.Add(-ingestWindowSlop)) || clipStartAt.After(windowEnd.Add(ingestWindowSlop)) {
+		log.Printf("WARNING clip ingest window sanity: clip_start_at=%s is outside job window [%s, %s] by >15m recording=%d job=%d worker=%q kind=%s (likely a recorder timezone bug)",
+			clipStartAt.UTC().Format(time.RFC3339), windowStart.UTC().Format(time.RFC3339), windowEnd.UTC().Format(time.RFC3339),
+			recordingID, jobID, workerID, jobKind)
 	}
 
 	// Enforce the presigned size cap by Head-ing the object in the user bucket (S-4).

@@ -203,6 +203,8 @@ func (s *Server) router() http.Handler {
 	r.Get("/dashboard/{tab}", s.redirectDashboard)
 	r.Get("/dashboard/stream/{id}", s.redirectDashboard)
 	r.Get("/auth/complete", s.handleAccountAuthComplete)
+	r.Get("/relay/install.sh", s.handleRelayInstallScript)
+	r.Get("/relay/download/{artifact}", s.handleRelayDownload)
 	r.Post("/webhooks/email/resend", s.handleResendWebhook)
 	r.Post("/webhooks/billing/stripe", s.handleStripeWebhook)
 

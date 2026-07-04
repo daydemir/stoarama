@@ -229,6 +229,14 @@ func (c *Client) TouchDroplet(ctx context.Context) error {
 	return c.postJSON(ctx, "/api/v1/recording/droplets/heartbeat", map[string]any{}, nil)
 }
 
+// NodeHeartbeat refreshes this node's last_heartbeat_at and merges the reported
+// capability keys into nodes.capabilities_jsonb via POST /api/v1/node/heartbeat.
+// The relay binary calls this on its own 30s ticker; cloud droplet workers use
+// TouchDroplet instead and never call this.
+func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any) error {
+	return c.postJSON(ctx, "/api/v1/node/heartbeat", map[string]any{"capabilities_json": capabilities}, nil)
+}
+
 func (c *Client) postJSON(ctx context.Context, path string, payload any, out any) error {
 	return c.postJSONWithHeaders(ctx, path, payload, nil, out)
 }
