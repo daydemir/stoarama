@@ -59,6 +59,10 @@ func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEna
 		WHERE rec.status='active'
 		  AND rec.start_at <= now()
 		  AND (rec.end_at IS NULL OR now() < rec.end_at)
+		  -- Relay recordings are served by account-owned relay nodes, not the droplet
+		  -- pool, so they must not inflate droplet demand. capture_via is NOT NULL
+		  -- DEFAULT 'cloud', so this is dark until a relay recording exists.
+		  AND rec.capture_via = 'cloud'
 		  AND ($1 OR EXISTS (
 		        SELECT 1 FROM account_billing b
 		        WHERE b.account_id = rec.account_id

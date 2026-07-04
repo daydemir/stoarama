@@ -33,6 +33,19 @@ const (
 	recordingFreshnessGraceSec = 30
 )
 
+// recorderWorkerID is the canonical lease_owner string for a recorder principal.
+// For a relay node (node_type='relay') it is the server-derived 'node:{id}', which
+// is spoof-proof (the id comes from the token lookup, never client input) and cannot
+// collide with a user-chosen display name across accounts. For a cloud droplet
+// (node_type='local_recorder') it is the operator-assigned display name, unchanged,
+// so droplet lease/complete/ingest/heartbeat ownership is byte-identical to before.
+func recorderWorkerID(principal nodePrincipal) string {
+	if principal.NodeType == nodeTypeRelay {
+		return fmt.Sprintf("node:%d", principal.NodeID)
+	}
+	return strings.TrimSpace(principal.DisplayName)
+}
+
 type recordingLeaseResponse struct {
 	JobID                int64     `json:"job_id"`
 	RecordingID          int64     `json:"recording_id"`
@@ -50,6 +63,65 @@ type recordingLeaseResponse struct {
 	WindowEndAt *time.Time `json:"window_end_at"`
 }
 
+// relayLeaseSQL is the relay branch of handleRecordingJobsLease, entered only for a
+// node_type='relay' principal. It mirrors the cloud branch's capture gate but swaps
+// the recorder_droplets liveness EXISTS for account-scoped relay-node liveness plus a
+// per-node capacity bound, and partitions to capture_via='relay' recordings only.
+//
+// Security: n.id=$1 is the authenticated node id from the token lookup (never request
+// input) and n.account_id=rec.account_id is the tenant wall, both enforced in SQL, so
+// a relay can only ever lease its own account's relay recordings.
+//
+// Capacity ($1's active leases < n.relay_max_streams) is BEST-EFFORT / soft: FOR
+// UPDATE SKIP LOCKED locks only the one candidate job row, while this COUNT(*) reads
+// unlocked rows, so two concurrent lease calls sharing one node id can both pass and
+// over-subscribe by a few. The AUTHORITATIVE bound is the relay worker's client-side
+// semaphore (Concurrency = relay_max_streams); this subquery is a soft guard, not a
+// race-proof cap. Params: $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
+const relayLeaseSQL = `
+	WITH cte AS (
+	  SELECT j.id
+	  FROM recording_jobs j
+	  JOIN recordings rec ON rec.id = j.recording_id
+	  JOIN nodes n ON n.id = $1
+	    AND n.account_id = rec.account_id
+	    AND n.node_type = 'relay'
+	    AND n.status = 'active'
+	    AND n.last_heartbeat_at >= now() - interval '120 seconds'
+	  WHERE j.status = 'pending'
+	    AND j.scheduled_for <= now()
+	    AND (j.kind = 'continuous_window'
+	         OR j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now())
+	    AND rec.status = 'active'
+	    AND rec.start_at <= now()
+	    AND (rec.end_at IS NULL OR now() < rec.end_at)
+	    AND rec.capture_via = 'relay'
+	    AND ($2 OR EXISTS (
+	          SELECT 1 FROM account_billing b
+	          WHERE b.account_id = rec.account_id
+	            AND b.has_payment_method))
+	    -- Best-effort capacity bound (soft): the client semaphore is authoritative.
+	    AND (SELECT COUNT(*) FROM recording_jobs aj
+	         WHERE aj.status = 'leased'
+	           AND aj.lease_owner = 'node:' || $1::text
+	           AND aj.lease_expires_at > now()) < n.relay_max_streams
+	  ORDER BY j.scheduled_for ASC, j.id ASC
+	  LIMIT 1
+	  FOR UPDATE SKIP LOCKED
+	)
+	UPDATE recording_jobs j
+	SET status = 'leased',
+	    lease_owner = 'node:' || $1::text,
+	    lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)),
+	    attempt_count = attempt_count + 1,
+	    updated_at = now()
+	FROM cte, recordings rec
+	WHERE j.id = cte.id AND rec.id = j.recording_id
+	RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
+	          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
+	          rec.target_fps, j.kind, j.window_end_at
+`
+
 // handleRecordingJobsLease leases at most one due recording job for the calling
 // droplet. It locks ONLY recording_jobs in the CTE (mirroring the capture lease)
 // and inlines the capture gate (status='active', window open, and, when billing is
@@ -64,15 +136,30 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	workerID := strings.TrimSpace(principal.DisplayName)
+	workerID := recorderWorkerID(principal)
 	if workerID == "" {
 		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
 		return
 	}
 	billingDisabled := s.billing == nil
+	margin := recordingCaptureTimeoutMarginSec + recordingUploadMarginSec
 
 	var resp recordingLeaseResponse
-	err := s.pool.QueryRow(r.Context(), `
+	var err error
+	if principal.NodeType == nodeTypeRelay {
+		// Relay branch (node_type='relay' only). The tenant wall (n.account_id =
+		// rec.account_id) and the capture_via='relay' partition live entirely in SQL;
+		// n.id is the authenticated principal's node id (token lookup), never request
+		// input, so a relay can never lease another account's or a cloud recording's job.
+		// $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
+		err = s.pool.QueryRow(r.Context(), relayLeaseSQL,
+			principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
+			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
+			&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
+			&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
+		)
+	} else {
+		err = s.pool.QueryRow(r.Context(), `
 		WITH cte AS (
 		  SELECT j.id
 		  FROM recording_jobs j
@@ -90,6 +177,10 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		    AND rec.status='active'
 		    AND rec.start_at <= now()
 		    AND (rec.end_at IS NULL OR now() < rec.end_at)
+		    -- Cloud droplets never lease relay recordings (they would fail at yt-dlp on a
+		    -- datacenter IP). capture_via is NOT NULL DEFAULT 'cloud', so every existing
+		    -- row matches and this predicate is dark until a relay recording exists.
+		    AND rec.capture_via = 'cloud'
 		    AND ($2 OR EXISTS (
 		          SELECT 1 FROM account_billing b
 		          WHERE b.account_id = rec.account_id
@@ -112,11 +203,12 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
 		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
 		          rec.target_fps, j.kind, j.window_end_at
-	`, workerID, billingDisabled, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec).Scan(
-		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
-		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
-		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
-	)
+	`, workerID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
+			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
+			&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
+			&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
+		)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"job": nil})
 		return
@@ -155,7 +247,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
 		return
 	}
-	workerID := strings.TrimSpace(principal.DisplayName)
+	workerID := recorderWorkerID(principal)
 	var req recordingUploadIntentRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -300,7 +392,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
 		return
 	}
-	workerID := strings.TrimSpace(principal.DisplayName)
+	workerID := recorderWorkerID(principal)
 	var req recordingClipIngestRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -518,7 +610,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	workerID := strings.TrimSpace(principal.DisplayName)
+	workerID := recorderWorkerID(principal)
 
 	var leaseExpiresAt time.Time
 	err := s.pool.QueryRow(r.Context(), `
@@ -552,7 +644,7 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	workerID := strings.TrimSpace(principal.DisplayName)
+	workerID := recorderWorkerID(principal)
 	if workerID == "" {
 		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
 		return
@@ -576,7 +668,7 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	workerID := strings.TrimSpace(principal.DisplayName)
+	workerID := recorderWorkerID(principal)
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE recording_jobs
 		SET status='done', completed_at=now(), lease_expires_at=NULL, updated_at=now()
@@ -609,7 +701,7 @@ func (s *Server) handleRecordingJobFail(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	workerID := strings.TrimSpace(principal.DisplayName)
+	workerID := recorderWorkerID(principal)
 	var req recordingJobFailRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())

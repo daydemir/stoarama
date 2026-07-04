@@ -17,6 +17,12 @@ import (
 const (
 	nodeTypeInferenceNode = "inference_node"
 	nodeTypeLocalRecorder = "local_recorder"
+	// nodeTypeRelay is an account-owned relay node running on a user machine. It is
+	// distinct from nodeTypeLocalRecorder (which cloud droplets also enroll as), so
+	// relay-vs-droplet branch selection keys off a real typed field, never a
+	// heuristic. Only relay principals take the node:{id} lease-owner canonical form
+	// and the relay lease branch; droplet principals are byte-identical to before.
+	nodeTypeRelay = "relay"
 )
 
 type nodePrincipal struct {
@@ -36,6 +42,8 @@ func normalizeNodeType(raw string) (string, bool) {
 		return nodeTypeInferenceNode, true
 	case nodeTypeLocalRecorder:
 		return nodeTypeLocalRecorder, true
+	case nodeTypeRelay:
+		return nodeTypeRelay, true
 	default:
 		return "", false
 	}
@@ -53,14 +61,18 @@ func (s *Server) requireNodeAuth(next http.Handler) http.Handler {
 	})
 }
 
-// requireRecorderNodeAuth authenticates a per-droplet local_recorder node token
-// and authorizes ONLY the recorder endpoints. It never accepts the shared
-// SERVICE_TOKEN and never grants the capture/inference/media worker surface, so
-// a recorder droplet's blast radius is limited to its own recording jobs.
+// requireRecorderNodeAuth authenticates a recorder node token and authorizes ONLY
+// the recorder endpoints. It never accepts the shared SERVICE_TOKEN and never
+// grants the capture/inference/media worker surface, so a recorder's blast radius
+// is limited to its own recording jobs. It accepts both node types that run the
+// recorder loop: 'local_recorder' (operator-owned cloud droplets, unchanged) and
+// 'relay' (account-owned relay nodes on user machines). The two are still fully
+// partitioned downstream by the typed node_type discriminator in every handler.
 func (s *Server) requireRecorderNodeAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, err := s.authenticateNodeRequest(r)
-		if err != nil || strings.TrimSpace(principal.NodeType) != nodeTypeLocalRecorder {
+		nodeType := strings.TrimSpace(principal.NodeType)
+		if err != nil || (nodeType != nodeTypeLocalRecorder && nodeType != nodeTypeRelay) {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -367,6 +379,13 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, "display_name is required")
 		return
 	}
+	// 'node:' is the reserved lease_owner namespace for relay nodes (workerID is the
+	// server-derived 'node:{id}'). Reject a display_name in that namespace so no node
+	// can present an identity that collides with the canonical lease-owner form.
+	if isReservedNodeDisplayName(displayName) {
+		util.WriteError(w, http.StatusBadRequest, "display_name must not start with 'node:'")
+		return
+	}
 	nodeType, ok := normalizeNodeType(req.NodeType)
 	if !ok {
 		util.WriteError(w, http.StatusBadRequest, "invalid node_type")
@@ -545,14 +564,18 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		metaArg = string(b)
 	}
+	// Merge (not replace) the reported capability keys into capabilities_jsonb so a
+	// relay heartbeat that reports only its relay keys (yt_cookies_ok, yt_cookie_error,
+	// chrome_present, active_jobs, relay_version, ...) preserves any pre-existing keys.
+	// A null capabilities payload leaves the column untouched (concat with '{}').
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE nodes
 		SET
 			last_heartbeat_at=now(),
-			capabilities_jsonb=COALESCE($2::jsonb, capabilities_jsonb),
-			metadata_jsonb=COALESCE($3::jsonb, metadata_jsonb),
+			capabilities_jsonb=COALESCE(nodes.capabilities_jsonb, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
+			metadata_jsonb=COALESCE($3::jsonb, nodes.metadata_jsonb),
 			updated_at=now()
-		WHERE id=$1 AND status='active'
+		WHERE nodes.id=$1 AND nodes.status='active'
 	`, principal.NodeID, capArg, metaArg)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update node heartbeat: %v", err))
@@ -639,6 +662,15 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		"created_at":        createdAt.UTC(),
 		"updated_at":        updatedAt.UTC(),
 	}, nil
+}
+
+// isReservedNodeDisplayName reports whether a node/droplet display name falls in the
+// reserved 'node:' lease_owner namespace. Relay principals derive their canonical
+// lease_owner as 'node:{id}', so any user- or operator-chosen name in that namespace
+// is rejected at enrollment / droplet registration to keep the namespace disjoint.
+// The typed node_type discriminator is the primary partition; this is defense in depth.
+func isReservedNodeDisplayName(name string) bool {
+	return strings.HasPrefix(strings.TrimSpace(name), "node:")
 }
 
 func minInt(a, b int) int {

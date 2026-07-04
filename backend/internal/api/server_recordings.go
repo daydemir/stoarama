@@ -65,7 +65,32 @@ const recordingListSelectSQL = `
 		rec.stream_id, st.name, st.location_text,
 		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
 		rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
-		rec.storage_retention_tier, rec.delivery
+		rec.storage_retention_tier, rec.delivery,
+		rec.capture_via,
+		-- Relay readiness (per-recording). Both expressions short-circuit to false/NULL
+		-- for a cloud recording (capture_via='cloud'), so they are cheap and dark until a
+		-- relay recording exists. has_relay_online: at least one online relay node in the
+		-- account has spare capacity right now.
+		(rec.capture_via = 'relay' AND EXISTS (
+		  SELECT 1 FROM nodes n
+		  WHERE n.account_id = rec.account_id
+		    AND n.node_type = 'relay' AND n.status = 'active'
+		    AND n.last_heartbeat_at >= now() - interval '120 seconds'
+		    AND (SELECT COUNT(*) FROM recording_jobs aj
+		         WHERE aj.status = 'leased'
+		           AND aj.lease_owner = 'node:' || n.id::text
+		           AND aj.lease_expires_at > now()) < n.relay_max_streams
+		)) AS has_relay_online,
+		-- relay_node_name: the relay currently holding an active lease on this recording,
+		-- if any (derived, replaces persisted pinning). NULL for cloud recordings.
+		CASE WHEN rec.capture_via = 'relay' THEN (
+		  SELECT n2.display_name
+		  FROM recording_jobs j2
+		  JOIN nodes n2 ON j2.lease_owner = 'node:' || n2.id::text
+		  WHERE j2.recording_id = rec.id AND j2.status = 'leased'
+		    AND j2.lease_expires_at > now()
+		  LIMIT 1
+		) ELSE NULL END AS relay_node_name
 	FROM recordings rec
 	JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
 	LEFT JOIN streams st ON st.id = rec.stream_id`
@@ -126,6 +151,11 @@ type recordingCreateRequest struct {
 	// the puller may release them and the UI labels the recording as NAS-bound. Empty
 	// is treated as 'managed'.
 	Delivery string `json:"delivery"`
+	// CaptureVia is which infrastructure runs the worker loop: 'cloud' (default; the
+	// operator droplet pool) or 'relay' (an account-owned relay node on a user
+	// machine). Empty is treated as 'cloud'. Orthogonal to delivery. P1 accepts and
+	// validates it but never forces it (no YouTube-to-relay routing yet).
+	CaptureVia string `json:"capture_via"`
 }
 
 // optionalActingAccountID resolves the acting org from an optional browser session
@@ -222,7 +252,27 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recordings: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+	// fleet_relay_warning is the honest, defensible signal (M4): the account has at
+	// least one active relay recording right now AND zero relay nodes online (heartbeat
+	// within 120s). No demand/supply arithmetic. It is dark for a cloud-only account:
+	// with no relay recording the first EXISTS is false and the warning is always false.
+	var fleetRelayWarning bool
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT EXISTS (
+		         SELECT 1 FROM recordings rec
+		         WHERE rec.account_id = $1 AND rec.status = 'active'
+		           AND rec.capture_via = 'relay'
+		           AND rec.start_at <= now()
+		           AND (rec.end_at IS NULL OR now() < rec.end_at))
+		   AND NOT EXISTS (
+		         SELECT 1 FROM nodes n
+		         WHERE n.account_id = $1 AND n.node_type = 'relay' AND n.status = 'active'
+		           AND n.last_heartbeat_at >= now() - interval '120 seconds')
+	`, principal.AccountID).Scan(&fleetRelayWarning); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute fleet relay warning: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "fleet_relay_warning": fleetRelayWarning})
 }
 
 func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Request) {
@@ -308,6 +358,14 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// both would drain the same managed staging clips.
 	if delivery == deliveryNASPull && req.DeliveryStorageDestinationID > 0 {
 		util.WriteError(w, http.StatusBadRequest, "a NAS-pull recording cannot also deliver to an external destination")
+		return
+	}
+	// Capture routing (default 'cloud'). 'relay' recordings are served by an
+	// account-owned relay node instead of the droplet pool. P1 accepts and validates
+	// the value but never forces it. An invalid value fails fast (no fallback).
+	captureVia, ok := normalizeCaptureVia(req.CaptureVia)
+	if !ok {
+		util.WriteError(w, http.StatusBadRequest, "capture_via must be cloud or relay")
 		return
 	}
 	clipDuration := req.ClipDurationSec
@@ -402,19 +460,28 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// combined with everything already capturing, would exceed the pool ceiling
 	// (Max*Capacity), reusing the autoscaler's exact sweep-line (DRY). A continuous
 	// stream counts as a FULL slot for its whole window.
+	// The create-time concurrency cap is a droplet-pool ceiling (Max*Capacity). Relay
+	// recordings never consume droplet slots (they are excluded from the demand
+	// forecast in loadCapturingRecordings), so the pool ceiling does not apply to them
+	// and the preflight is skipped. Continuous still validates its window above and
+	// sampled still validates its cron below regardless of capture_via.
 	if mode == "continuous" {
-		if err := s.checkContinuousScheduleCapacity(r.Context(), cronTimezone, dailyStart, dailyEnd, clipDuration, startAt, endAtTime(endAtArg), 1); err != nil {
-			util.WriteError(w, http.StatusConflict, err.Error())
-			return
+		if captureVia != "relay" {
+			if err := s.checkContinuousScheduleCapacity(r.Context(), cronTimezone, dailyStart, dailyEnd, clipDuration, startAt, endAtTime(endAtArg), 1); err != nil {
+				util.WriteError(w, http.StatusConflict, err.Error())
+				return
+			}
 		}
 	} else {
 		if err := recsched.ValidateCronForCreate(cronExpr, cronTimezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := s.checkRecordingScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration); err != nil {
-			util.WriteError(w, http.StatusConflict, err.Error())
-			return
+		if captureVia != "relay" {
+			if err := s.checkRecordingScheduleCapacity(r.Context(), cronExpr, cronTimezone, clipDuration); err != nil {
+				util.WriteError(w, http.StatusConflict, err.Error())
+				return
+			}
 		}
 	}
 
@@ -605,6 +672,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		bundleIDArg:         nil,
 		retentionTier:       retentionTier,
 		delivery:            delivery,
+		captureVia:          captureVia,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -650,6 +718,23 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	})
 }
 
+// normalizeCaptureVia validates and normalizes the create request's capture_via.
+// Empty defaults to 'cloud'; 'cloud' and 'relay' are the only accepted values (the
+// same set the recordings.capture_via CHECK constraint allows). ok=false on any other
+// value so the create handler can fail fast with no fallback.
+func normalizeCaptureVia(raw string) (string, bool) {
+	switch strings.TrimSpace(raw) {
+	case "":
+		return "cloud", true
+	case "cloud":
+		return "cloud", true
+	case "relay":
+		return "relay", true
+	default:
+		return "", false
+	}
+}
+
 // recordingInsertParams carries the fully-resolved column values for one
 // recordings row. It is the single contract shared by single-recording create
 // and bundle fan-out so the INSERT lives in exactly one place (DRY). Every *Arg
@@ -679,6 +764,9 @@ type recordingInsertParams struct {
 	// delivery is the storage-delivery mode. Empty is treated as 'managed', so the
 	// bundle fan-out (which leaves it empty) always writes 'managed' deliberately.
 	delivery deliveryMode
+	// captureVia is the capture-routing flag ('cloud' or 'relay'). Empty is treated as
+	// 'cloud', so the bundle fan-out (which leaves it empty) always writes 'cloud'.
+	captureVia string
 }
 
 // insertRecordingTx runs the one canonical recordings INSERT inside the caller's
@@ -700,12 +788,16 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	if delivery == "" {
 		delivery = deliveryManaged
 	}
+	captureVia := p.captureVia
+	if captureVia == "" {
+		captureVia = "cloud"
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery, capture_via)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20,$21)
 		RETURNING id, created_at, start_at, end_at
-	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery)).Scan(&id, &createdAt, &startOut, &endOut)
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery), captureVia).Scan(&id, &createdAt, &startOut, &endOut)
 	return id, createdAt, startOut, endOut, err
 }
 
@@ -1666,6 +1758,9 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		bundleName       *string
 		retentionTier    string
 		delivery         string
+		captureVia       string
+		hasRelayOnline   bool
+		relayNodeName    *string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
@@ -1676,6 +1771,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd,
 		&bundleID, &bundleName, &retentionTier, &delivery,
+		&captureVia, &hasRelayOnline, &relayNodeName,
 	); err != nil {
 		return nil, err
 	}
@@ -1719,6 +1815,12 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"bundle_name":              bundleName,
 		"storage_retention_tier":   retentionTier,
 		"delivery":                 delivery,
+		"capture_via":              captureVia,
+		// Derived relay readiness. has_relay_assigned = a relay currently holds the
+		// lease (relay_node_name is non-null). All false/null for cloud recordings.
+		"has_relay_online":   hasRelayOnline,
+		"has_relay_assigned": relayNodeName != nil,
+		"relay_node_name":    relayNodeName,
 	}, nil
 }
 

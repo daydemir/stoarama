@@ -74,6 +74,13 @@ func (s *Store) ResolveOperatorAccount(ctx context.Context, email string) (int64
 // autoscaler is trusted server-side) and returns the plaintext token (which is
 // injected only into cloud-init and never persisted) plus the node + token ids.
 func (s *Store) MintNodeToken(ctx context.Context, operatorAccountID int64, name string) (token string, nodeID int64, nodeTokenID int64, err error) {
+	// 'node:' is the reserved lease_owner namespace for relay nodes (their canonical
+	// workerID is 'node:{id}'). A droplet's display name must never fall in it, so its
+	// name can never collide with a relay's lease-owner form. Droplet names are
+	// operator-generated (dropletName) and never use this prefix; this is defense in depth.
+	if strings.HasPrefix(strings.TrimSpace(name), "node:") {
+		return "", 0, 0, fmt.Errorf("droplet name must not start with 'node:'")
+	}
 	rawToken, err := generateNodeSecret(36)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("generate node token: %w", err)
