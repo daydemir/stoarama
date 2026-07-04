@@ -446,6 +446,16 @@
         <p class="muted" style="margin:0;">Add a payment method in Org settings to start recording. Adding a card does not charge you. Charges are $0.05 for each hour a recording captures at least one clip.</p>
       </div>
 
+      <!-- Relay fleet warning: shown when the account has active relay recordings but
+           no relay computer is online right now (honest warn-and-miss signal). -->
+      <div id="relayBanner" class="panel hidden" style="margin-bottom:16px;border-color:color-mix(in srgb, var(--warn) 40%, var(--border));">
+        <div class="section-title" style="margin-bottom:6px;">
+          <div><div class="eyebrow">Relay fleet</div><h2 id="relayBannerTitle"></h2></div>
+          <a class="btn-link" href="/org-settings" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Org settings</a>
+        </div>
+        <p id="relayBannerBody" class="muted" style="margin:0;"></p>
+      </div>
+
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
       <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
         <h1>Record any public stream to your own storage.</h1>
@@ -531,6 +541,22 @@
           <label for="recURL">Stream URL (HLS .m3u8 or HTTPS)</label>
           <input id="recURL" type="url" placeholder="https://example.com/live/stream.m3u8" />
           <div id="streamStatus" class="status" style="margin-top:8px;"></div>
+          <!-- Relay gate: replaces the normal probe for YouTube URLs, which must record
+               through a user's computer (datacenter IPs are blocked by YouTube). -->
+          <div id="relayGate" class="hidden" style="margin-top:10px;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--panel2) 70%,transparent);">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+              <span id="relayGateDot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--muted);flex-shrink:0;"></span>
+              <span id="relayGateLabel" style="font-size:13px;font-weight:600;"></span>
+            </div>
+            <div id="relayGateDetail" style="font-size:12px;color:var(--muted);line-height:1.5;"></div>
+            <div id="relayGateCta" style="margin-top:8px;font-size:12px;"></div>
+          </div>
+          <!-- Non-YouTube relay opt-in: unobtrusive, shown only when the account has a
+               relay computer and the pasted URL is not YouTube. -->
+          <label id="relayOptInRow" class="hidden" style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--muted);cursor:pointer;">
+            <input id="relayOptIn" type="checkbox" style="width:auto;min-height:0;margin:0;" />
+            <span>Record via your computer instead of our servers</span>
+          </label>
           <video id="streamPreview" class="video-preview hidden" muted playsinline autoplay></video>
         </div>
         <div class="field">
@@ -831,6 +857,16 @@
       urlField: document.getElementById('urlField'),
       recURL: document.getElementById('recURL'),
       streamStatus: document.getElementById('streamStatus'),
+      relayGate: document.getElementById('relayGate'),
+      relayGateDot: document.getElementById('relayGateDot'),
+      relayGateLabel: document.getElementById('relayGateLabel'),
+      relayGateDetail: document.getElementById('relayGateDetail'),
+      relayGateCta: document.getElementById('relayGateCta'),
+      relayOptInRow: document.getElementById('relayOptInRow'),
+      relayOptIn: document.getElementById('relayOptIn'),
+      relayBanner: document.getElementById('relayBanner'),
+      relayBannerTitle: document.getElementById('relayBannerTitle'),
+      relayBannerBody: document.getElementById('relayBannerBody'),
       streamPreview: document.getElementById('streamPreview'),
       recName: document.getElementById('recName'),
       modeSeg: document.getElementById('modeSeg'),
@@ -977,6 +1013,11 @@
       // Stream probe gate (change 2): the authoritative server verdict. ok===true
       // is required for Start; the in-browser preview never gates on its own.
       streamProbe: { token: 0, ok: false },
+      // Relay fleet snapshot (GET /api/v1/account/nodes, relay nodes only) + the
+      // account-level fleet warning from the recordings list. Loaded alongside
+      // recordings; drives the composer YouTube gate and the list banner/cards.
+      relays: [],
+      fleetRelayWarning: false,
       // Composer mode: 'single' (one recording) or 'bundle' (fan-out into N member
       // recordings sharing one schedule). Bundle mode swaps the source block and the
       // submit path; the schedule/window/clip/fps/storage controls are shared.
@@ -2094,6 +2135,92 @@
       }
     }
 
+    // Client mirror of capture/resolve.go's isYouTubeURL host check. YouTube URLs
+    // never hit the server probe (Render cannot resolve YouTube); they record through
+    // a relay computer, so the composer swaps the probe for the relay gate below.
+    function isYouTubeURL(raw) {
+      try {
+        const h = new URL(String(raw || '').trim()).hostname.toLowerCase();
+        return h === 'youtube.com' || h === 'www.youtube.com' || h === 'm.youtube.com'
+          || h === 'youtu.be' || h.endsWith('.youtube.com');
+      } catch (_) { return false; }
+    }
+
+    // Normalize a relay node (GET /account/nodes item) into the gate's view model.
+    function relayView(n) {
+      const cap = (n.capabilities_json && typeof n.capabilities_json === 'object') ? n.capabilities_json : {};
+      return {
+        name: String(n.display_name || 'your computer'),
+        healthy: n.healthy === true,
+        ytOk: cap.yt_cookies_ok === true,
+        active: Number(cap.active_jobs || 0),
+        max: Number(n.relay_max_streams || 5),
+      };
+    }
+
+    // Render the YouTube relay gate and drive state.streamProbe.ok so the existing
+    // Start-enable logic (refreshStartEnabled) needs no change: fleet-ready => ok:true.
+    function renderRelayGate(url) {
+      const yt = isYouTubeURL(url);
+      els.relayGate.classList.toggle('hidden', !yt);
+      els.streamStatus.classList.toggle('hidden', yt);
+      els.relayOptInRow.classList.toggle('hidden', yt || (state.relays || []).length === 0);
+      if (!yt) return;
+      teardownPreview();
+
+      const relays = (state.relays || []).map(relayView);
+      const online = relays.filter((r) => r.healthy);
+      const ytReady = online.filter((r) => r.ytOk);
+      const hasCapacity = ytReady.some((r) => r.active < r.max);
+
+      let dot = 'var(--muted)', label = '', detail = '', cta = '', fleetOK = false;
+      if (relays.length === 0) {
+        dot = 'var(--warn)';
+        label = 'A relay computer is required for YouTube streams';
+        detail = 'YouTube blocks recording from datacenter IPs. Connect a computer in Org settings to record this stream.';
+        cta = '<a href="/org-settings">Connect a computer</a>';
+      } else if (online.length === 0) {
+        dot = 'var(--warn)';
+        label = 'No computers online';
+        detail = 'Turn on a connected computer to record this stream.';
+        cta = '<a href="/org-settings">Manage computers</a>';
+      } else if (ytReady.length === 0) {
+        dot = 'var(--warn)';
+        label = 'YouTube sign-in needed';
+        const names = online.map((r) => escapeHTML(r.name)).join(', ');
+        detail = `Log into YouTube in Chrome on ${names}. The relay reads your Chrome cookies locally to resolve the stream URL.`;
+        cta = '<a href="/org-settings">Manage computers</a>';
+      } else if (!hasCapacity) {
+        dot = 'var(--warn)';
+        label = 'Your computers are at capacity';
+        detail = 'Every YouTube-ready computer is at its stream limit. Connect another computer or raise a limit in Org settings.';
+        cta = '<a href="/org-settings">Manage computers</a>';
+      } else {
+        dot = 'var(--ok)';
+        label = 'Records via your computer';
+        detail = `This stream records through ${escapeHTML(ytReady[0].name)} using your Chrome cookies. Clips arrive in your account as usual, billed at the same $0.05 per recording-hour.`;
+        fleetOK = true;
+      }
+      els.relayGateDot.style.background = dot;
+      els.relayGateLabel.textContent = label;
+      els.relayGateDetail.innerHTML = detail;
+      els.relayGateCta.innerHTML = cta;
+
+      state.streamProbe = { token: state.streamProbe.token + 1, ok: fleetOK };
+      refreshStartEnabled();
+    }
+
+    // Load the relay fleet snapshot (relay nodes only). Best-effort: a failure leaves
+    // state.relays empty, so a cloud-only account sees zero relay UI.
+    async function loadRelays() {
+      try {
+        const data = await fetchJSON('/api/v1/account/nodes');
+        state.relays = (Array.isArray(data.items) ? data.items : []).filter((n) => String(n.node_type) === 'relay' && String(n.status) === 'active');
+      } catch (_) {
+        state.relays = [];
+      }
+    }
+
     function scheduleStreamProbe() {
       // URL changed: drop any prior verdict immediately so Start can't fire on a
       // stale ok while the new URL is still unvalidated.
@@ -2318,6 +2445,17 @@
         metaParts.push('<span>No clips yet</span>');
       }
 
+      // Relay capture indicator: which computer holds the active lease ("via NAME"),
+      // or amber "needs relay" when a computer is online and free but not yet leasing.
+      // The blocked "No relay online" state (neither) is surfaced below the meta row.
+      if (rec.capture_via === 'relay') {
+        if (rec.relay_node_name) {
+          metaParts.push(`<span class="meta-strong">via ${escapeHTML(String(rec.relay_node_name))}</span>`);
+        } else if (rec.has_relay_online === true) {
+          metaParts.push(`<span style="color:var(--warn);">needs relay</span>`);
+        }
+      }
+
       // Storage label. A nas_pull recording only STAGES in managed storage and its
       // footage lives on the account's NAS, so it is NOT metered monthly; label it as
       // NAS with no dollar figure. A managed recording shows its retention tier and a
@@ -2349,10 +2487,16 @@
       // Blocking no-card state: when the account has no card on file, capture is
       // held by the server gate. Make that unmistakable per card so a researcher
       // never assumes recording is happening when it is silently held.
-      const blocked = rec.needs_card === true
-        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
-          + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`
-        : '';
+      let blocked = '';
+      if (rec.needs_card === true) {
+        blocked = `<div class="card-blocked"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
+          + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`;
+      } else if (rec.capture_via === 'relay' && status === 'active' && !rec.relay_node_name && rec.has_relay_online !== true) {
+        // Relay recording with no online computer available: capture is stalled until a
+        // computer comes online (warn-and-miss; misses are never billed).
+        blocked = `<div class="card-blocked"><span><b>No relay online.</b> Turn on a connected computer to resume recording.</span>`
+          + `<a class="btn-link" href="/org-settings">Org settings</a></div>`;
+      }
 
       // Linked to a catalog stream: title = stream name, subtitle = location.
       // Otherwise the source URL is the subtitle, as before.
@@ -2500,7 +2644,21 @@
       });
     }
 
+    // Fleet warning banner: the account has active relay recordings but no relay
+    // computer is online right now (honest warn-and-miss; relay misses are never
+    // billed). Driven by the server's fleet_relay_warning flag.
+    function renderRelayBanner() {
+      if (!state.fleetRelayWarning) { els.relayBanner.classList.add('hidden'); return; }
+      const relayRecs = state.recordings.filter((r) => r.capture_via === 'relay' && String(r.status) === 'active').length;
+      els.relayBannerTitle.textContent = relayRecs === 1
+        ? '1 recording needs a computer online'
+        : `${relayRecs} recordings need a computer online`;
+      els.relayBannerBody.textContent = 'No connected computer is online right now, so these recordings are not capturing. Turn one on or connect a computer in Org settings. You are never billed for missed relay clips.';
+      els.relayBanner.classList.remove('hidden');
+    }
+
     function renderCards() {
+      renderRelayBanner();
       const all = state.recordings;
       const empty = all.length === 0;
       els.heroCopy.classList.toggle('hidden', !empty);
@@ -3553,6 +3711,10 @@
       try {
         const payload = await fetchJSON('/api/v1/account/recordings');
         state.recordings = Array.isArray(payload.items) ? payload.items : [];
+        state.fleetRelayWarning = payload.fleet_relay_warning === true;
+        // Refresh the relay snapshot alongside recordings so the banner + cards read a
+        // consistent fleet view. Best-effort; a cloud-only account gets an empty list.
+        await loadRelays();
         renderLedger();
         renderCards();
       } catch (err) {
@@ -3710,6 +3872,10 @@
       teardownPreview();
       state.streamProbe = { token: state.streamProbe.token + 1, ok: false };
       setStatus(els.streamStatus, '', '');
+      els.relayGate.classList.add('hidden');
+      els.streamStatus.classList.remove('hidden');
+      els.relayOptInRow.classList.add('hidden');
+      els.relayOptIn.checked = false;
       clearCatalogLock();
       clearStashedCatalogStreamId();
       // Reset bundle mode so the next open is the single-recording composer.
@@ -3814,6 +3980,12 @@
       // Paste flow: send stream_url as before.
       if (catalogId) body.stream_id = catalogId;
       else body.stream_url = url;
+      // Capture routing: YouTube URLs always record via a relay (the server forces
+      // this too); a non-YouTube paste can opt in via the checkbox. Cloud is the
+      // default, so send capture_via only when relay is requested.
+      if (!catalogId && (isYouTubeURL(url) || els.relayOptIn.checked)) {
+        body.capture_via = 'relay';
+      }
       state.starting = true;
       els.startBtn.disabled = true;
       setStatus(els.startStatus, 'Starting...', '');
@@ -4009,10 +4181,25 @@
     els.clipCustom.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.startAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
     els.endAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
-    els.recURL.addEventListener('input', scheduleStreamProbe);
+    // For YouTube URLs the composer skips the server probe entirely and lets the relay
+    // gate drive streamProbe.ok; every other URL keeps the existing debounced probe.
+    els.recURL.addEventListener('input', () => {
+      const url = String(els.recURL.value || '').trim();
+      if (isYouTubeURL(url)) {
+        window.clearTimeout(streamDebounce);
+        renderRelayGate(url);
+      } else {
+        els.relayGate.classList.add('hidden');
+        els.streamStatus.classList.remove('hidden');
+        els.relayOptInRow.classList.toggle('hidden', (state.relays || []).length === 0);
+        scheduleStreamProbe();
+      }
+    });
     els.recURL.addEventListener('blur', () => {
+      const url = String(els.recURL.value || '').trim();
+      if (isYouTubeURL(url)) { renderRelayGate(url); return; }
       window.clearTimeout(streamDebounce);
-      probeStream(String(els.recURL.value || '').trim());
+      probeStream(url);
     });
     els.recDest.addEventListener('change', syncBucketStateFromSelection);
     els.cnProvider.addEventListener('change', applyProviderDefaults);

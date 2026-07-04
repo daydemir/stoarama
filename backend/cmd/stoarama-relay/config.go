@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	defaultAPIURL      = "https://api.stoarama.com"
+	defaultAPIURL      = "https://stoarama.com"
 	defaultConcurrency = 5
 )
 

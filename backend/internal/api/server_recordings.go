@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -368,6 +369,14 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, "capture_via must be cloud or relay")
 		return
 	}
+	// YouTube cannot be recorded from datacenter IPs, so YouTube URLs are always
+	// captured via a relay regardless of what the client requested (Go mirror of
+	// capture/resolve.go's host check). The relay resolves the watch URL with yt-dlp
+	// and the user's local Chrome cookies at capture time. Non-YouTube URLs keep the
+	// client's choice ('cloud' default, or an explicit 'relay' opt-in).
+	if isYouTubeWatchURL(streamURL) {
+		captureVia = "relay"
+	}
 	clipDuration := req.ClipDurationSec
 	if clipDuration == 0 {
 		clipDuration = 60
@@ -435,22 +444,39 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		endAtArg = endAt
 	}
 
-	// Resolve the pasted reference (e.g. a KBS '!hls' indirect URL) to the live
-	// playable URL before validating/probing, so a reference ffmpeg cannot open
-	// directly can still be scheduled. The raw reference is what gets stored
-	// (below); the worker re-resolves it fresh on every capture.
-	resolvedForProbe, err := resolveRecordingStreamURL(r.Context(), streamURL)
-	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+	// Relay recordings are resolved by the relay on the user's machine at capture
+	// time (yt-dlp + local Chrome cookies for YouTube; a direct/HLS open otherwise).
+	// Render has no yt-dlp and cannot resolve or reach YouTube from a datacenter IP,
+	// so the server-side resolve + SSRF classify + ffmpeg reachability probe are all
+	// SKIPPED for capture_via='relay'. The raw reference is stored as-is and the relay
+	// re-resolves it fresh on every capture; source_kind='auto' lets the relay's
+	// capture layer classify the source at run time. Cloud recordings keep the exact
+	// resolve/validate/probe path they had before (byte-identical).
+	var (
+		resolvedForProbe string
+		validatedIP      net.IP
+		sourceKind       string
+	)
+	if captureVia == "relay" {
+		sourceKind = "auto"
+	} else {
+		// Resolve the pasted reference (e.g. a KBS '!hls' indirect URL) to the live
+		// playable URL before validating/probing, so a reference ffmpeg cannot open
+		// directly can still be scheduled. The raw reference is what gets stored
+		// (below); the worker re-resolves it fresh on every capture.
+		resolvedForProbe, err = resolveRecordingStreamURL(r.Context(), streamURL)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 
-	// S-1: SSRF guard + HLS/HTTPS classify on the resolved URL before it ever
-	// reaches ffmpeg. This is the validate half of the shared validate+probe path.
-	validatedIP, sourceKind, err := validateRecordingStreamURL(resolvedForProbe)
-	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
+		// S-1: SSRF guard + HLS/HTTPS classify on the resolved URL before it ever
+		// reaches ffmpeg. This is the validate half of the shared validate+probe path.
+		validatedIP, sourceKind, err = validateRecordingStreamURL(resolvedForProbe)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	// Schedule invariants + create-time concurrency cap. Sampled validates the cron
@@ -598,10 +624,13 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 
 	// Reachability probe pinned to the validated IP, so the probe socket cannot
-	// be redirected by a DNS rebind between validation above and connect time.
-	if err := probeRecordingStreamReachable(r.Context(), resolvedForProbe, validatedIP); err != nil {
-		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream not reachable: %v", err))
-		return
+	// be redirected by a DNS rebind between validation above and connect time. Skipped
+	// for relay recordings (the relay owns resolution + reachability at capture time).
+	if captureVia != "relay" {
+		if err := probeRecordingStreamReachable(r.Context(), resolvedForProbe, validatedIP); err != nil {
+			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream not reachable: %v", err))
+			return
+		}
 	}
 
 	var nextFireArg any
@@ -716,6 +745,20 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		"start_at":   startOut.UTC(),
 		"end_at":     endOut,
 	})
+}
+
+// isYouTubeWatchURL mirrors capture/resolve.go's isYouTubeURL host check. It is the
+// server-side gate that forces capture_via='relay' for YouTube URLs, because YouTube
+// blocks stream resolution from datacenter IPs (Render has no yt-dlp and no
+// residential IP). Kept as a small local mirror so the api package needs no export
+// from the capture package.
+func isYouTubeWatchURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	return host == "youtube.com" || host == "www.youtube.com" || host == "m.youtube.com" || host == "youtu.be" || strings.HasSuffix(host, ".youtube.com")
 }
 
 // normalizeCaptureVia validates and normalizes the create request's capture_via.

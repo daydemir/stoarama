@@ -237,6 +237,45 @@
       </details>
     </section>
 
+    <section id="relayPanel" class="panel hidden">
+      <div class="section-title">
+        <h2>Your computers</h2>
+        <button id="relayRefreshBtn" class="secondary small" type="button">Refresh</button>
+      </div>
+      <div id="relayStatus" class="status">Loading computers...</div>
+      <div id="relayList" class="rec-list hidden" style="margin-bottom:12px;"></div>
+      <div id="relayEmpty" class="sub hidden" style="margin-bottom:12px;">No computers connected yet. Connect one to record YouTube streams through your own machine.</div>
+
+      <div id="relayCreate">
+        <label for="relayLabel">Name this computer</label>
+        <input id="relayLabel" type="text" placeholder="My MacBook Pro" />
+        <div style="margin-top:12px;">
+          <button id="relayCreateBtn" class="primary" type="button">Connect a computer</button>
+        </div>
+      </div>
+
+      <div id="relayTokenBox" class="token-box hidden">
+        <div class="warn-line">Save this command now. The token is shown once.</div>
+        <textarea id="relaySnippet" readonly rows="4"></textarea>
+        <div style="margin-top:10px;">
+          <button id="relayCopyBtn" class="secondary small" type="button">Copy</button>
+        </div>
+      </div>
+
+      <details class="collapsible" style="margin-top:16px;">
+        <summary>How to connect a computer (Mac or Linux)</summary>
+        <div class="sub" style="margin-top:10px; line-height:1.6;">
+          <ol style="margin:0; padding-left:18px;">
+            <li>Enter a name above and click <b>Connect a computer</b>.</li>
+            <li>Copy the install command that appears and run it in <b>Terminal</b> (Mac) or a shell (Linux). It installs the relay as a background service (<span class="mono">launchd</span> on Mac, <span class="mono">systemd</span> on Linux) that starts automatically on login.</li>
+            <li>For YouTube streams, log into YouTube in <b>Chrome</b> on that computer. The relay reads your Chrome cookies locally to resolve the stream URL. Cookies never leave the machine.</li>
+            <li>Come back here and click <b>Refresh</b>. Within a few seconds the computer shows <b style="color:var(--ok);">Connected</b>.</li>
+          </ol>
+          <p style="margin:10px 0 0;">Windows support is coming. For now, Mac and Linux only.</p>
+        </div>
+      </details>
+    </section>
+
     <div id="orgStatus" class="status"></div>
 
     </div>
@@ -274,6 +313,16 @@
     const connSnippet = document.getElementById('connSnippet');
     const connCopyBtn = document.getElementById('connCopyBtn');
     const connRefreshBtn = document.getElementById('connRefreshBtn');
+    const relayPanel = document.getElementById('relayPanel');
+    const relayStatus = document.getElementById('relayStatus');
+    const relayList = document.getElementById('relayList');
+    const relayEmpty = document.getElementById('relayEmpty');
+    const relayLabel = document.getElementById('relayLabel');
+    const relayCreateBtn = document.getElementById('relayCreateBtn');
+    const relayTokenBox = document.getElementById('relayTokenBox');
+    const relaySnippet = document.getElementById('relaySnippet');
+    const relayCopyBtn = document.getElementById('relayCopyBtn');
+    const relayRefreshBtn = document.getElementById('relayRefreshBtn');
 
     let currentAccount = null;
     let currentOrg = null;
@@ -676,6 +725,159 @@
       }
     });
 
+    // ---- Your computers (relay fleet) ----
+
+    function relayPlatformLabel(p) {
+      const s = String(p || '').toLowerCase();
+      if (s.includes('darwin') || s.includes('mac')) return 'macOS';
+      if (s.includes('linux')) return 'Linux';
+      return String(p || '').trim() || 'Unknown platform';
+    }
+
+    // YouTube readiness per relay, from heartbeat capabilities. Green when cookies
+    // resolve; amber "log in" only when the relay classified sign_in_required; a
+    // neutral note when Chrome is running (cookie DB locked) so a running-Chrome
+    // machine never reads as "log into YouTube".
+    function relayYTBadge(cap) {
+      if (cap && cap.yt_cookies_ok === true) {
+        return `<span style="color:var(--ok);">YouTube ready</span>`;
+      }
+      const err = String((cap && cap.yt_cookie_error) || '');
+      if (err === 'sign_in_required') {
+        return `<span style="color:var(--warn);">Log into YouTube in Chrome</span>`;
+      }
+      if (err === 'chrome_cookie_db_locked') {
+        return `<span class="sub">YouTube check pending (Chrome is open)</span>`;
+      }
+      return `<span class="sub">YouTube not verified yet</span>`;
+    }
+
+    function relayRowHTML(n) {
+      const id = Number(n.id);
+      const name = String(n.display_name || 'Computer');
+      const healthy = n.healthy === true;
+      const health = healthy ? 'healthy' : 'never';
+      const cap = (n.capabilities_json && typeof n.capabilities_json === 'object') ? n.capabilities_json : {};
+      const platform = relayPlatformLabel(n.platform);
+      const active = Number(cap.active_jobs || 0);
+      const max = Number(n.relay_max_streams || 5);
+      const streamsLine = `${active} of ${max} stream${max === 1 ? '' : 's'}`;
+      return `<div class="rec-row kv-row">
+        <div style="min-width:0;">
+          <div>${connStatusDot(health)}${connStatusLabel(health)} <span class="mono" style="white-space:nowrap;">${escapeHTML(name)}</span></div>
+          <div class="sub">${escapeHTML(platform)} &middot; ${streamsLine} &middot; ${relayYTBadge(cap)}</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-shrink:0;">
+          <button class="secondary small relay-rename" type="button" data-id="${id}">Rename</button>
+          <button class="secondary small relay-remove" type="button" data-id="${id}">Remove</button>
+        </div>
+      </div>`;
+    }
+
+    async function loadRelays() {
+      relayPanel.classList.remove('hidden');
+      setStatus(relayStatus, 'Loading computers...', '');
+      relayList.classList.add('hidden');
+      relayEmpty.classList.add('hidden');
+      try {
+        const data = await fetchJSON('/api/v1/account/nodes');
+        const items = (Array.isArray(data.items) ? data.items : []).filter((n) => String(n.node_type) === 'relay' && String(n.status) === 'active');
+        if (items.length === 0) {
+          relayList.innerHTML = '';
+          relayEmpty.classList.remove('hidden');
+          setStatus(relayStatus, '', '');
+          return;
+        }
+        relayList.innerHTML = items.map(relayRowHTML).join('');
+        relayList.classList.remove('hidden');
+        relayList.querySelectorAll('.relay-rename').forEach((btn) => {
+          btn.addEventListener('click', () => renameRelay(Number(btn.getAttribute('data-id'))));
+        });
+        relayList.querySelectorAll('.relay-remove').forEach((btn) => {
+          btn.addEventListener('click', () => removeRelay(Number(btn.getAttribute('data-id'))));
+        });
+        setStatus(relayStatus, `${items.length} computer${items.length === 1 ? '' : 's'}`, 'ok');
+      } catch (err) {
+        relayPanel.classList.add('hidden');
+      }
+    }
+
+    function showRelayToken(command) {
+      relaySnippet.value = String(command || '');
+      relayTokenBox.classList.remove('hidden');
+    }
+
+    relayCreateBtn.addEventListener('click', async () => {
+      const label = String(relayLabel.value || '').trim();
+      if (!label) { setStatus(relayStatus, 'Name this computer first.', 'err'); return; }
+      relayCreateBtn.disabled = true;
+      try {
+        const data = await fetchJSON('/api/v1/account/node-enrollment-tokens', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ node_type: 'relay', label }),
+        });
+        showRelayToken(data.install_command);
+        relayLabel.value = '';
+        setStatus(relayStatus, 'Run the command below on your computer. The token is shown once.', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      } finally {
+        relayCreateBtn.disabled = false;
+      }
+    });
+
+    async function renameRelay(id) {
+      const name = window.prompt('New name for this computer');
+      if (name == null) return;
+      const trimmed = String(name).trim();
+      if (!trimmed) return;
+      try {
+        await fetchJSON(`/api/v1/account/nodes/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ display_name: trimmed }),
+        });
+        setStatus(relayStatus, 'Computer renamed', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function removeRelay(id) {
+      if (!window.confirm('Remove this computer? It stops recording and its token is revoked.')) return;
+      try {
+        await fetchJSON(`/api/v1/account/nodes/${id}`, { method: 'DELETE' });
+        setStatus(relayStatus, 'Computer removed and its token revoked', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      }
+    }
+
+    relayCopyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(relaySnippet.value);
+        relayCopyBtn.textContent = 'Copied';
+        setTimeout(() => { relayCopyBtn.textContent = 'Copy'; }, 1500);
+      } catch (_) {
+        relaySnippet.select();
+      }
+    });
+
+    relayRefreshBtn.addEventListener('click', async () => {
+      relayRefreshBtn.disabled = true;
+      relayRefreshBtn.textContent = 'Refreshing...';
+      try {
+        await loadRelays();
+      } finally {
+        relayRefreshBtn.disabled = false;
+        relayRefreshBtn.textContent = 'Refresh';
+      }
+    });
+
     billingManageBtn.addEventListener('click', async () => {
       billingManageBtn.disabled = true;
       try {
@@ -704,6 +906,7 @@
         void loadTeam();
         void loadBilling();
         void loadConnections();
+        void loadRelays();
       } catch (_) {
         currentAccount = null;
         currentOrg = null;
@@ -712,6 +915,7 @@
         teamPanel.classList.add('hidden');
         billingPanel.classList.add('hidden');
         connectionsPanel.classList.add('hidden');
+        relayPanel.classList.add('hidden');
         setStatus(orgStatus, 'No active session. Sign in on the Account page to manage this org.', '');
       }
     }

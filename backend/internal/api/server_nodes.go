@@ -186,7 +186,25 @@ func (s *Server) createNodeEnrollmentToken(ctx context.Context, accountID int64,
 		"node_type":    nodeType,
 		"label":        label,
 		"expires_at":   expiresAt.UTC(),
+		// install_command is the show-once, ready-to-paste line the org-settings
+		// "Connect a computer" flow surfaces: it fetches the public relay installer and
+		// runs it with the enrollment token. The token is only in this create response
+		// (never listed again), so this is the one place the full command exists.
+		"install_command": relayInstallCommand(token),
 	}, nil
+}
+
+// relayInstallPublicBase is the user-facing host that serves /relay/install.sh (the
+// installer registered at the router root). It mirrors the hardcoded public host
+// used by the NAS connection compose snippet (connectionPublicAPIBase) so the
+// copyable install command always points at the same host the docs reference.
+const relayInstallPublicBase = "https://stoarama.com"
+
+// relayInstallCommand builds the show-once curl|bash install line for an enrollment
+// token, matching the shipped installer's invocation contract (scripts/
+// relay-install.sh: `bash -s -- --token <sie_ token>`).
+func relayInstallCommand(token string) string {
+	return fmt.Sprintf("curl -fsSL %s/relay/install.sh | bash -s -- --token %s", relayInstallPublicBase, token)
 }
 
 func (s *Server) handleAccountNodeEnrollmentTokensList(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +345,7 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at
+		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at, relay_max_streams
 		FROM nodes
 		WHERE account_id=$1
 		ORDER BY created_at DESC, id DESC
@@ -351,6 +369,132 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+type nodePatchRequest struct {
+	DisplayName     *string `json:"display_name"`
+	RelayMaxStreams *int    `json:"relay_max_streams"`
+}
+
+// handleAccountNodePatch renames a relay node and/or adjusts its per-node stream cap.
+// Both fields are optional; only the ones present in the body are updated (COALESCE
+// against the current value). Scoped to node_type='relay' AND the caller's account, so
+// a user can never touch an operator droplet or another tenant's node. relay_max_streams
+// is bounded 1..20 (the relay mirrors it as its worker semaphore; the DB CHECK enforces
+// >= 1 as the floor).
+func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req nodePatchRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.DisplayName == nil && req.RelayMaxStreams == nil {
+		util.WriteError(w, http.StatusBadRequest, "display_name or relay_max_streams is required")
+		return
+	}
+	var displayNameArg any
+	if req.DisplayName != nil {
+		name := strings.TrimSpace(*req.DisplayName)
+		if name == "" {
+			util.WriteError(w, http.StatusBadRequest, "display_name must not be empty")
+			return
+		}
+		if isReservedNodeDisplayName(name) {
+			util.WriteError(w, http.StatusBadRequest, "display_name must not start with 'node:'")
+			return
+		}
+		displayNameArg = name
+	}
+	var relayMaxArg any
+	if req.RelayMaxStreams != nil {
+		if *req.RelayMaxStreams < 1 || *req.RelayMaxStreams > 20 {
+			util.WriteError(w, http.StatusBadRequest, "relay_max_streams must be between 1 and 20")
+			return
+		}
+		relayMaxArg = *req.RelayMaxStreams
+	}
+	ct, err := s.pool.Exec(r.Context(), `
+		UPDATE nodes
+		SET display_name=COALESCE($3, display_name),
+		    relay_max_streams=COALESCE($4, relay_max_streams),
+		    updated_at=now()
+		WHERE id=$1 AND account_id=$2 AND node_type='relay'
+	`, id, principal.AccountID, displayNameArg, relayMaxArg)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update node: %v", err))
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		util.WriteError(w, http.StatusNotFound, "node not found")
+		return
+	}
+	node, err := s.fetchNodeByID(r.Context(), id)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load node: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "node": node})
+}
+
+// handleAccountNodeDelete removes a relay node: it disables the node row and revokes
+// all of its tokens, so the very next lease attempt is gated out (SQL) and the very
+// next API call from that node 401s. In-flight leases bleed at most one
+// clip_duration + reclaim window before the expired-lease sweep recovers them
+// (DECISIONS #4, no immediate eviction in v1). Scoped to node_type='relay' AND the
+// caller's account.
+func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin node delete tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	ct, err := tx.Exec(r.Context(), `
+		UPDATE nodes SET status='disabled', updated_at=now()
+		WHERE id=$1 AND account_id=$2 AND node_type='relay'
+	`, id, principal.AccountID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("disable node: %v", err))
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		util.WriteError(w, http.StatusNotFound, "node not found")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE node_tokens SET revoked_at=COALESCE(revoked_at, now())
+		WHERE node_id=$1 AND revoked_at IS NULL
+	`, id); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("revoke node tokens: %v", err))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit node delete tx: %v", err))
+		return
+	}
+	_ = s.insertAccountAuthEvent(r.Context(), principal.AccountID, nil, "node_removed", "account", principal.Email, map[string]any{
+		"node_id": id,
+	})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 type nodeEnrollRequest struct {
@@ -595,7 +739,7 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) fetchNodeByID(ctx context.Context, id int64) (map[string]any, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at
+		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at, relay_max_streams
 		FROM nodes
 		WHERE id=$1
 	`, id)
@@ -621,6 +765,7 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		metadataRaw     []byte
 		createdAt       time.Time
 		updatedAt       time.Time
+		relayMaxStreams int
 	)
 	if err := row.Scan(
 		&id,
@@ -636,6 +781,7 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		&metadataRaw,
 		&createdAt,
 		&updatedAt,
+		&relayMaxStreams,
 	); err != nil {
 		return nil, err
 	}
@@ -647,6 +793,10 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 	if len(metadataRaw) > 0 {
 		_ = json.Unmarshal(metadataRaw, &metadata)
 	}
+	// healthy is server-derived from last_heartbeat_at with the same 120s liveness
+	// threshold the relay lease gate uses, so the fleet UX (green/red dot) never
+	// depends on client clock skew.
+	healthy := lastHeartbeatAt != nil && time.Since(*lastHeartbeatAt) < 120*time.Second
 	return map[string]any{
 		"id":                id,
 		"account_id":        accountID,
@@ -657,6 +807,8 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		"status":            status,
 		"enrolled_at":       enrolledAt,
 		"last_heartbeat_at": lastHeartbeatAt,
+		"healthy":           healthy,
+		"relay_max_streams": relayMaxStreams,
 		"capabilities_json": nonNilMap(capabilities),
 		"metadata_json":     nonNilMap(metadata),
 		"created_at":        createdAt.UTC(),

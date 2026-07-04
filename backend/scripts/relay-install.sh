@@ -18,9 +18,9 @@ set -euo pipefail
 # clears the macOS quarantine bit, enrolls with the supplied token, then installs
 # and starts the launchd user agent (macOS) or systemd user unit (Linux).
 #
-#   curl -fsSL https://api.stoarama.com/relay/install.sh | bash -s -- --token sie_xxxx
+#   curl -fsSL https://stoarama.com/relay/install.sh | bash -s -- --token sie_xxxx
 
-API_URL="https://api.stoarama.com"
+API_URL="https://stoarama.com"
 TOKEN=""
 NAME=""
 
