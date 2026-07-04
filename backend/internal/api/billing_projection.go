@@ -1,17 +1,20 @@
 package api
 
 import (
-	"math"
-	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 )
 
-// projectionMaxDays bounds the per-recording day scan so a pathological
-// window (or a bug) can never spin the forward projection unbounded. A Stripe
-// billing period is ~1 month, so 400 days is a generous ceiling.
+// projectionMaxDays bounds the forward scan so a pathological open-ended window
+// (or a bug) can never spin the projection unbounded. A Stripe billing period is
+// ~1 month, so 400 days is a generous ceiling.
 const projectionMaxDays = 400
+
+// projectionMaxFires bounds the sampled cron enumeration. A one-per-minute cron
+// over projectionMaxDays fires 400*1440 = 576,000 times, so 600,000 covers the
+// worst valid schedule; on hitting it we return the buckets counted so far.
+const projectionMaxFires = 600000
 
 // projectedRecording is the minimal per-recording input the forward projection
 // needs: the stored schedule fields as they live on the recordings row. Only
@@ -26,24 +29,27 @@ type projectedRecording struct {
 	EndAt        *time.Time // recording capture-window stop (UTC); nil = open-ended
 }
 
-// projectRecordingHours estimates the ADDITIONAL distinct record-hours a single
-// active recording is expected to bill between now and winEnd, mirroring the
-// client composer's estimate math (estRunsPerDay / estFireDaysInWindow /
-// continuous window hours) but driven by the recording's STORED schedule.
+// projectRecordingHours computes the EXACT additional distinct record-hours a
+// single active recording will bill between now and winEnd, driven by its stored
+// schedule. A record-hour is a distinct UTC hour in which at least one clip
+// starts (the unit recording_billing_hours counts as DISTINCT date_trunc('hour',
+// clip_start_at)). Because the schedule is deterministic, the upcoming hours are
+// enumerated exactly rather than approximated.
 //
-// A record-hour is a distinct UTC hour in which the recording captures at least
-// one clip (the same unit recording_billing_hours counts). Per active day a
-// sampled schedule firing N times lands in at most min(N,24) distinct hours; a
-// continuous daily window of H hours contributes ~H record-hours. The projection
-// counts, over the days in [max(now,start), min(end,winEnd)) on which the
-// schedule admits a fire, hours_per_active_day for each such day.
+// The projected span is [max(now, start), min(winEnd, stop)), with projStart
+// rounded UP to the next UTC hour boundary: the current in-progress hour is
+// billed on the to-date side as soon as a clip lands in it, so projecting it too
+// would double-count one hour. The span is then clamped to projStart +
+// projectionMaxDays as an overall bound.
 //
-// It is a pure forecast for display only. It never touches metering, Stripe, or
-// what is charged. An unparseable/custom cron mirrors the client's safe upper
-// bound (assume it fires and fills its admitted hours) rather than projecting 0.
+// Sampled: enumerate cron fires in the span (in the recording's timezone) and
+// count the distinct UTC hour buckets they land in — clustered fires within one
+// hour count once. Continuous: for each local day intersecting the span, localize
+// the daily window to UTC (mirroring the scheduler exactly) and count the distinct
+// UTC hour buckets with positive overlap. An unparseable cron or timezone falls
+// back to the safe upper bound (every hour of the span). It is a pure display-only
+// forecast: it never touches metering, Stripe, or what is charged.
 func projectRecordingHours(rec projectedRecording, now, winEnd time.Time) float64 {
-	// Project only the remaining part of the billing window: from the later of
-	// now / the recording's own start, to the earlier of winEnd / its own stop.
 	projStart := now
 	if rec.StartAt.After(projStart) {
 		projStart = rec.StartAt
@@ -55,163 +61,121 @@ func projectRecordingHours(rec projectedRecording, now, winEnd time.Time) float6
 	if !projStart.Before(projEnd) {
 		return 0
 	}
-
-	hoursPerActiveDay := hoursPerActiveDay(rec)
-	if hoursPerActiveDay <= 0 {
+	// Exclude the current in-progress hour: it is billed to-date as soon as a clip
+	// lands in it, so counting it here would double-count one hour.
+	projStart = ceilHour(projStart.UTC())
+	if maxEnd := projStart.AddDate(0, 0, projectionMaxDays); projEnd.After(maxEnd) {
+		projEnd = maxEnd
+	}
+	if !projStart.Before(projEnd) {
 		return 0
 	}
-	activeDays := remainingActiveDays(rec, projStart, projEnd)
-	if activeDays <= 0 {
-		return 0
-	}
-	return hoursPerActiveDay * float64(activeDays)
-}
-
-// hoursPerActiveDay is the distinct record-hours a recording bills on a day it
-// fires, mirroring the client: continuous -> the daily window length in hours;
-// sampled -> min(runsPerDay, 24), where runsPerDay is the true fires-per-day of
-// the stored cron (an unparseable cron falls back to the full 24, the client's
-// safe upper bound).
-func hoursPerActiveDay(rec projectedRecording) float64 {
 	if rec.Mode == "continuous" {
-		start, err1 := recsched.ParseTimeOfDay(rec.DailyStart)
-		end, err2 := recsched.ParseTimeOfDay(rec.DailyEnd)
-		if err1 != nil || err2 != nil {
-			return 0
-		}
-		secs := timeOfDaySeconds(end) - timeOfDaySeconds(start)
-		if secs <= 0 {
-			return 0
-		}
-		return float64(secs) / 3600.0
+		return float64(continuousRecordHours(rec, projStart, projEnd))
 	}
-	runs := cronRunsPerDay(rec.CronExpr, rec.CronTimezone)
-	if runs <= 0 {
-		// Unparseable/empty cron: the client treats an unknown cadence as firing,
-		// so fall back to the full-day upper bound rather than 0.
-		return 24
-	}
-	if runs > 24 {
-		runs = 24
-	}
-	return float64(runs)
+	return float64(sampledRecordHours(rec, projStart, projEnd))
 }
 
-// timeOfDaySeconds is the seconds-past-local-midnight of a parsed daily-window
-// time; the recsched field is unexported, so recompute it here (display only).
-func timeOfDaySeconds(t recsched.TimeOfDay) int {
-	return t.Hour*3600 + t.Minute*60 + t.Second
+// ceilHour rounds a UTC instant up to the next whole hour boundary (an instant
+// already on a boundary is unchanged). UTC hour boundaries coincide with absolute
+// hour boundaries, so Truncate is exact here.
+func ceilHour(t time.Time) time.Time {
+	trunc := t.Truncate(time.Hour)
+	if trunc.Equal(t) {
+		return trunc
+	}
+	return trunc.Add(time.Hour)
 }
 
-// cronRunsPerDay counts the fires the stored cron produces on a day it actually
-// fires, in its own timezone. It anchors on the cron's first fire (rather than a
-// fixed calendar day) so a restricted cron (weekly, monthly) is measured on a day
-// it runs, not a day it is dormant: a Mondays-only cron still yields its per-day
-// cadence (1), not 0. It uses the same ParseCron authority as the scheduler, so
-// presets match the client exactly (hourly -> 24, every 15m -> 96, every 4h -> 6,
-// daily -> 1). Returns 0 only for an unparseable/never-firing cron so the caller
-// can apply the safe upper bound.
-func cronRunsPerDay(expr, tz string) int {
-	sched, err := recsched.ParseCron(expr)
-	if err != nil {
-		return 0
-	}
-	loc, err := recsched.LoadLocation(tz)
-	if err != nil {
-		return 0
-	}
-	// Anchor on the first fire after a fixed reference instant, then count fires
-	// within the 24h starting at that fire's local midnight (a full firing day).
-	first := sched.Next(time.Date(2025, time.January, 1, 0, 0, 0, 0, loc))
-	if first.IsZero() {
-		return 0
-	}
-	lf := first.In(loc)
-	dayStart := time.Date(lf.Year(), lf.Month(), lf.Day(), 0, 0, 0, 0, loc)
-	dayEnd := dayStart.AddDate(0, 0, 1)
-	count := 0
-	cursor := dayStart.Add(-time.Second) // Next() is strictly after the cursor.
-	for {
-		next := sched.Next(cursor)
-		if next.IsZero() || !next.Before(dayEnd) {
-			break
-		}
-		count++
-		cursor = next
-		if count > 24*60 { // one-per-minute ceiling; guards a pathological schedule.
-			break
-		}
-	}
-	return count
-}
-
-// remainingActiveDays counts the days in [projStart, projEnd) on which the
-// recording's schedule admits at least one fire, over consecutive 24h steps from
-// projStart (the client's rolling-window semantics: estFireDaysInWindow counts a
-// fixed number of rolling days, not calendar-aligned dates). Continuous fires
-// every day the window opens; a sampled preset/wildcard cron fires every day; a
-// restricted cron (weekly, monthly) fires only on admitted days, evaluated with
-// the same ParseCron authority as the scheduler so day-of-week/day-of-month
-// Vixie OR-semantics match. An unparseable cron is treated as firing every day
-// (the client's safe upper bound).
-func remainingActiveDays(rec projectedRecording, projStart, projEnd time.Time) int {
-	windowDays := rollingDays(projStart, projEnd)
-	if windowDays <= 0 {
-		return 0
-	}
-	// Continuous, or a preset/wildcard/unparseable sampled cron, fires every day.
-	if rec.Mode == "continuous" || firesEveryDay(rec) {
-		return windowDays
-	}
+// sampledRecordHours counts the distinct UTC hour buckets the stored cron fires
+// into within [projStart, projEnd), evaluated in the recording's timezone using
+// the same ParseCron/LoadLocation authority as the scheduler. Fires clustered in
+// one hour (e.g. "0,30 9 * * *") collapse to a single record-hour. An unparseable
+// cron/timezone falls back to the safe upper bound (every hour of the span).
+func sampledRecordHours(rec projectedRecording, projStart, projEnd time.Time) int {
 	sched, err := recsched.ParseCron(rec.CronExpr)
 	if err != nil {
-		return windowDays // unparseable cron: safe upper bound, fires every day.
+		return hourBucketsInSpan(projStart, projEnd)
 	}
-	// Walk consecutive 24h slices from projStart and count the slices in which the
-	// schedule fires at least once. robfig's Next already implements the Vixie
-	// day-of-week/day-of-month OR-semantics the client's cronDayMatches ports.
-	const dayDur = 24 * time.Hour
-	count := 0
-	for i := 0; i < windowDays; i++ {
-		sliceStart := projStart.Add(time.Duration(i) * dayDur)
-		sliceEnd := sliceStart.Add(dayDur)
-		if sliceEnd.After(projEnd) {
-			sliceEnd = projEnd
-		}
-		next := sched.Next(sliceStart.Add(-time.Second))
-		if !next.IsZero() && next.Before(sliceEnd) {
-			count++
-		}
+	loc, err := recsched.LoadLocation(rec.CronTimezone)
+	if err != nil {
+		return hourBucketsInSpan(projStart, projEnd)
 	}
-	return count
+	buckets := make(map[int64]struct{})
+	// Crons are minute-aligned, so stepping back one second includes a fire landing
+	// exactly on projStart (an hour boundary) without pulling in an earlier one.
+	cursor := projStart.Add(-time.Second).In(loc)
+	for i := 0; i < projectionMaxFires; i++ {
+		next := sched.Next(cursor)
+		if next.IsZero() || !next.Before(projEnd) {
+			break
+		}
+		buckets[next.UTC().Truncate(time.Hour).Unix()] = struct{}{}
+		cursor = next
+	}
+	return len(buckets)
 }
 
-// firesEveryDay reports whether the sampled cron's day-of-month and day-of-week
-// fields are both wildcards (so it fires every day). It mirrors the client's
-// wildcard short-circuit in estFireDaysInWindow; a non-5-field or restricted
-// expression returns false so the caller walks day by day.
-func firesEveryDay(rec projectedRecording) bool {
-	fields := strings.Fields(rec.CronExpr)
-	if len(fields) != 5 {
-		return false
-	}
-	dom := fields[2]
-	dow := fields[4]
-	return (dom == "*" || dom == "?") && (dow == "*" || dow == "?")
-}
-
-// rollingDays is the number of consecutive 24h steps [projStart, projEnd) spans,
-// rounded up so a partial final day still counts as an active day (matching the
-// client, which counts each rolling day the schedule could fire in). Bounded by
-// projectionMaxDays.
-func rollingDays(projStart, projEnd time.Time) int {
-	span := projEnd.Sub(projStart)
-	if span <= 0 {
+// continuousRecordHours counts the distinct UTC hour buckets a continuous
+// recording's daily window covers within [projStart, projEnd). The daily window
+// is governed by cron_timezone and its open/close instants are computed exactly as
+// the scheduler does (time.Date in the recording's location, so DST is handled by
+// the location math). A window ending exactly on an hour boundary does not touch
+// the next bucket. An unparseable window/timezone projects 0.
+func continuousRecordHours(rec projectedRecording, projStart, projEnd time.Time) int {
+	start, err1 := recsched.ParseTimeOfDay(rec.DailyStart)
+	end, err2 := recsched.ParseTimeOfDay(rec.DailyEnd)
+	if err1 != nil || err2 != nil {
 		return 0
 	}
-	days := int(math.Ceil(span.Hours() / 24.0))
-	if days > projectionMaxDays {
-		days = projectionMaxDays
+	loc, err := recsched.LoadLocation(rec.CronTimezone)
+	if err != nil {
+		return 0
 	}
-	return days
+	buckets := make(map[int64]struct{})
+	y, mo, d := projStart.In(loc).Date()
+	// Windows never cross local midnight (enforced at create), so a window on an
+	// earlier local day closes before projStart's local day; iterating local days
+	// from projStart's date onward captures every occurrence in the span.
+	for i := 0; i < projectionMaxDays+2; i++ {
+		openUTC := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc).UTC()
+		if !openUTC.Before(projEnd) {
+			break
+		}
+		closeUTC := time.Date(y, mo, d, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		segStart := maxTime(openUTC, projStart)
+		segEnd := minTime(closeUTC, projEnd)
+		for b := segStart.Truncate(time.Hour); b.Before(segEnd); b = b.Add(time.Hour) {
+			buckets[b.Unix()] = struct{}{}
+		}
+		nd := time.Date(y, mo, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
+		y, mo, d = nd.Date()
+	}
+	return len(buckets)
+}
+
+// hourBucketsInSpan counts the distinct UTC hour buckets a [start, end) span
+// touches with positive overlap; start is assumed hour-aligned. It is the safe
+// upper bound for an unparseable sampled schedule: at most one distinct hour per
+// hour the window is open.
+func hourBucketsInSpan(start, end time.Time) int {
+	n := 0
+	for b := start.Truncate(time.Hour); b.Before(end); b = b.Add(time.Hour) {
+		n++
+	}
+	return n
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }

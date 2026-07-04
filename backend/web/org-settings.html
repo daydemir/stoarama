@@ -370,7 +370,7 @@
       // projected_recording_amount_cents directly so Recording + Scheduled + Storage
       // always sums to projected_total_amount_cents with no rounding drift.
       if (b.is_projection && schedCents > 0) {
-        const schedDetail = `~<b>${projHours}</b> recording-hour${projHours === 1 ? '' : 's'} × <b>${usd(hourRate)}</b> upcoming`;
+        const schedDetail = `<b>${projHours}</b> recording-hour${projHours === 1 ? '' : 's'} × <b>${usd(hourRate)}</b> upcoming`;
         rows.push(item('Scheduled', schedDetail, usd(schedCents)));
       }
       const storeDetail = `<b>${shm.toFixed(3)}</b> hours of footage stored × <b>${usd(shmRate)}</b>`;
