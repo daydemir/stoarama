@@ -85,6 +85,8 @@ func main() {
 		runRecorderControl(ctx, cfg, os.Args[2:])
 	case "recording-worker":
 		runRecordingWorker(ctx, cfg, os.Args[2:])
+	case "recording-health":
+		runRecordingHealth(ctx, cfg, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -152,6 +154,7 @@ func usage() {
 	  stoaramactl survey delete-stream-captures --id N --apply
 	  stoaramactl recorder-control run
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
+	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 `)
 }
 
