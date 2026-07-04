@@ -116,8 +116,28 @@
     .sub { color: var(--muted); font-size: 12px; }
     /* Mobile: let the Profile email wrap and keep it off the card edge. */
     @media (max-width: 480px) {
+      /* Allow grid/flex items to shrink below their content min-size so long
+         emails wrap instead of forcing horizontal overflow. */
+      .acct-content, #authedBox, .panel { min-width: 0; }
+      .acct-content > *, #authedBox > * { min-width: 0; }
       .kv-row { flex-wrap: wrap; }
-      .kv-val { min-width: 0; text-align: right; padding-right: 2px; }
+      .kv-row .row-main { flex: 1 1 100%; min-width: 0; flex-wrap: wrap; }
+      .row-list { grid-template-columns: minmax(0, 1fr); }
+      .row-item { min-width: 0; }
+      .row-item .row-name { min-width: 0; }
+      .kv-val {
+        min-width: 0; flex: 1 1 100%; text-align: right; padding-right: 2px;
+        overflow-wrap: anywhere; word-break: break-word; max-width: 100%;
+      }
+      #sessionEmail { text-align: left; }
+      /* Touch-friendly tap targets (>=44px). */
+      button.small { min-height: 44px; padding: 10px 14px; }
+      /* Prevent iOS Safari focus auto-zoom on the sign-in input. */
+      input { font-size: 16px; }
+      /* Keep small labels/pills legible (>=13px). */
+      .role-badge { font-size: 13px; }
+      .sub { font-size: 13px; }
+      .status { font-size: 13px; }
     }
   </style>
 <!--SHELL_HEAD-->

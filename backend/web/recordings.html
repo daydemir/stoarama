@@ -167,6 +167,11 @@
     .ledger .meta-sep { color: var(--muted); user-select: none; }
     /* Recording cards */
     .cards { display: grid; gap: 12px; margin-bottom: 16px; }
+    /* Grid items default to min-width:auto and cannot shrink below their content,
+       so a wide bundle member table would force page-level horizontal overflow and
+       defeat .bundle-members overflow-x:auto. min-width:0 lets the card shrink and
+       the member table scroll within it. Harmless on desktop (single-column grid). */
+    .cards > .card { min-width: 0; }
     .card {
       border: 1px solid var(--border);
       border-radius: 16px;
@@ -381,10 +386,19 @@
       /* Stack the detail/bundle header so the "Back to recordings" link (last in DOM)
          renders on its own line ABOVE the title instead of colliding beside it. */
       .clip-page-head { flex-direction: column-reverse; align-items: flex-start; }
-      /* Long storage-chooser labels can't shrink (flex 0 0 auto); stack them full
-         width with wrapping text so they don't force horizontal overflow. */
-      #storageChooser { flex-direction: column; }
-      #storageChooser button { width: 100%; white-space: normal; }
+      /* Long storage/retention-chooser labels can't shrink (flex 0 0 auto); stack
+         them full width with wrapping text so they don't force horizontal overflow. */
+      #storageChooser, #retentionChooser { flex-direction: column; }
+      #storageChooser button, #retentionChooser button { width: 100%; white-space: normal; }
+      /* iOS Safari auto-zooms the viewport when a focused field is under 16px. The
+         composer's form fields inherit 14px; bump them to 16px on mobile so focus
+         never triggers a zoom. Scoped to composer fields (desktop unchanged). */
+      #composer input, #composer select, #composer textarea { font-size: 16px; }
+      /* Bundle group card: give the collapse control and member-row stream links a
+         >=40px tap target so they are reachable on touch. */
+      .bundle-toggle { min-height: 40px; }
+      .bundle-members .clip-table td { padding-top: 9px; padding-bottom: 9px; }
+      .bundle-members .clip-table td.b-stream a { display: inline-block; padding: 8px 0; }
       /* Clips table -> stacked cards (same table-to-card approach as pricing.html).
          An 8-cell row can't fit at 414px, so each clip becomes a card: Time is a
          heading line, Duration/FPS/Size/Status flow as one compact meta line, and the

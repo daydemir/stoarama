@@ -1393,6 +1393,32 @@
         max-height: 34vh;
       }
     }
+    @media (max-width: 640px) {
+      .shell { padding: 14px 12px 32px; }
+      /* Horizontal scroll for wide tables instead of clipping */
+      .tbl-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .tbl-wrap table { min-width: max-content; }
+      /* Prevent iOS zoom-on-focus and enlarge tap targets */
+      input, select, textarea {
+        font-size: 16px;
+      }
+      input, select, button {
+        min-height: 40px;
+        height: auto;
+      }
+      button.btn-sm { min-height: 36px; height: auto; font-size: 13px; }
+      .tag-editor-input { min-height: 36px; height: auto; font-size: 16px; }
+      .subtabs { flex-wrap: wrap; gap: 6px; }
+      .subtab-btn { min-height: 40px; font-size: 13px; padding: 8px 14px; }
+      .overview-card-link { min-height: 40px; font-size: 12px; }
+      .rec-toggle { min-height: 34px; }
+      .tag-chip-btn { min-height: 28px; height: auto; }
+      /* Readability: lift the smallest text on the low-priority admin bar */
+      th { font-size: 12px; }
+      .metric-chip, .fs11, .fs10, .filter-field-label,
+      .tag, .detail-fact-label, .detail-kpi-label { font-size: 12px; }
+      .metrics-row { flex-wrap: wrap; overflow: visible; }
+    }
   </style>
 <!--SHELL_HEAD-->
 </head>

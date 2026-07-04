@@ -65,7 +65,7 @@ const shellHeadCSS = `
 .org-modal button.primary[disabled]{opacity:0.6;cursor:default;}
 .org-modal button.ghost{background:none;color:var(--muted);}
 .org-modal button.ghost:hover{color:var(--text);}
-@media (max-width:720px){.topbar{grid-template-columns:auto 1fr;grid-template-areas:"brand utils" "nav nav";row-gap:10px;column-gap:10px;align-items:center;}.topbar-left{grid-area:brand;}.topbar-right{grid-area:utils;justify-self:end;}.topbar-center{grid-area:nav;justify-self:stretch;}.global-nav{width:100%;justify-content:center;}}
+@media (max-width:720px){.topbar{grid-template-columns:auto minmax(0,1fr);grid-template-areas:"brand utils" "nav nav";row-gap:10px;column-gap:10px;align-items:center;}.topbar-left{grid-area:brand;}.topbar-right{grid-area:utils;justify-self:stretch;justify-content:flex-end;flex-wrap:wrap;row-gap:8px;}.topbar-center{grid-area:nav;justify-self:stretch;}.global-nav{width:100%;justify-content:center;}.topbar-docs-link{display:inline-flex;align-items:center;min-height:40px;padding:0 8px;}.org-switch{height:40px;}.org-switch .org-name{max-width:40vw;}}
 .site-footer{margin:40px auto 24px;max-width:1200px;padding:16px 4px 0;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11px;letter-spacing:0.03em;color:var(--muted);}
 .site-footer a{color:var(--muted);text-decoration:none;}
 .site-footer a:hover{color:var(--text);text-decoration:underline;}

@@ -142,6 +142,29 @@
       .bill-items .bill-detail { grid-column: 1 / -1; margin-bottom: 4px; }
       .bill-items .bill-total-label { grid-column: 1; }
     }
+    @media (max-width: 600px) {
+      /* Prevent iOS Safari from zooming when a field gains focus (needs >=16px). */
+      input, textarea { font-size: 16px; }
+      /* Legibility floor: lift sub-13px text used across the panels. */
+      label,
+      .sub,
+      .mono,
+      .kv-val,
+      .bill-items .bill-detail,
+      details.collapsible summary { font-size: 13px; }
+      .role-badge { font-size: 12px; }
+      .org-head .eyebrow { font-size: 13px; }
+      /* Comfortable tap targets. */
+      button { min-height: 44px; }
+      button.small { min-height: 40px; }
+      /* Let key/value rows wrap so the right-side action buttons never run off
+         the viewport, and let long labels/names/emails break instead of forcing
+         width. Inline white-space:nowrap needs !important to override. */
+      .rec-row.kv-row { flex-wrap: wrap; }
+      .rec-row.kv-row > div { min-width: 0; }
+      .rec-row.kv-row > div:last-child { flex-wrap: wrap; }
+      .rec-row .mono { white-space: normal !important; word-break: break-word; }
+    }
   </style>
 <!--SHELL_HEAD-->
 </head>

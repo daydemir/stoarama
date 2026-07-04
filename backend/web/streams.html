@@ -1594,6 +1594,51 @@
         width: 100%;
       }
       .table-view-cell { width: auto; text-align: left; }
+
+      /* iOS zooms the page when focusing an input under 16px, and the shared
+         30px control height is under the 40px tap-target floor. Lift both on
+         small screens only; desktop keeps the compact controls. */
+      input:not([type="checkbox"]):not([type="radio"]),
+      select,
+      button {
+        font-size: 16px;
+        height: auto;
+        min-height: 40px;
+      }
+      button.btn-sm { min-height: 36px; height: auto; font-size: 13px; }
+      .subtab-btn { min-height: 34px; }
+      .source-seg-btn {
+        min-height: 40px;
+        font-size: 13px;
+        padding: 8px 14px;
+      }
+      .overview-card-link,
+      .overview-card-link.primary,
+      .overview-card-link.secondary,
+      .table-view-link,
+      .back-link { min-height: 40px; font-size: 13px; }
+      td.stream-select-cell input[type="checkbox"] {
+        width: 24px;
+        height: 24px;
+      }
+      .stream-link {
+        font-size: 15px;
+        display: inline-flex;
+        align-items: center;
+        min-height: 40px;
+      }
+
+      /* Text under ~13px is hard to read at 390px; lift labels/meta/pills. */
+      th,
+      .filter-field-label,
+      .tag,
+      .seg-count,
+      .fs10 { font-size: 12px; }
+      .status-text,
+      .metric-chip,
+      .panel-intro-meta,
+      .panel-intro-kicker,
+      .fs11 { font-size: 12px; }
     }
   </style>
 <!--SHELL_HEAD-->
