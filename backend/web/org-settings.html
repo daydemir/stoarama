@@ -268,16 +268,10 @@
           <ol style="margin:0; padding-left:18px;">
             <li>Enter a name above and click <b>Connect a computer</b>.</li>
             <li>Copy the install command that appears and run it in <b>Terminal</b> (Mac) or a shell (Linux). It installs the relay as a background service (<span class="mono">launchd</span> on Mac, <span class="mono">systemd</span> on Linux) that starts automatically on login.</li>
-            <li><b>Public YouTube streams work right away, no setup needed.</b> The relay resolves them through your own connection.</li>
-            <li>To record <b>private, members-only, or age-restricted</b> YouTube, log into YouTube in <b>Chrome</b> on that computer, then run the command below in <b>Terminal</b> and click <b>Always Allow</b> when macOS asks for Keychain access. This exports <b>only your YouTube and Google sign-in cookies</b>, nothing else, and they never leave the machine. The installer offers this step automatically, and you can re-run it anytime.</li>
+            <li><b>Public YouTube (and other public) streams record right away. No login needed.</b> The relay resolves them through your own connection, without any cookies.</li>
             <li>Come back here and click <b>Refresh</b>. Within a few seconds the computer shows <b style="color:var(--ok);">Connected</b>.</li>
           </ol>
-          <div style="margin-top:12px;">
-            <textarea id="relayLinkYTSnippet" readonly rows="1">~/.stoarama/bin/stoarama-relay link-youtube</textarea>
-            <div style="margin-top:10px;">
-              <button id="relayLinkYTCopyBtn" class="secondary small" type="button">Copy</button>
-            </div>
-          </div>
+          <p style="margin:10px 0 0;">Recording <b>private, members-only, or age-restricted</b> YouTube through your own login is a planned future option, not available yet.</p>
           <p style="margin:10px 0 0;">Windows support is coming. For now, Mac and Linux only.</p>
         </div>
       </details>
@@ -343,8 +337,6 @@
     const relayCopyBtn = document.getElementById('relayCopyBtn');
     const relayUninstallSnippet = document.getElementById('relayUninstallSnippet');
     const relayUninstallCopyBtn = document.getElementById('relayUninstallCopyBtn');
-    const relayLinkYTSnippet = document.getElementById('relayLinkYTSnippet');
-    const relayLinkYTCopyBtn = document.getElementById('relayLinkYTCopyBtn');
     const relayRefreshBtn = document.getElementById('relayRefreshBtn');
 
     let currentAccount = null;
@@ -757,26 +749,22 @@
       return String(p || '').trim() || 'Unknown platform';
     }
 
-    // YouTube readiness per relay, from heartbeat capabilities. Public streams always
-    // work, so the absence of linked cookies (cookies_unavailable) is a neutral note,
-    // never a warning. Green when the exported cookie file resolves; amber "re-link"
-    // only when linked cookies went stale (sign_in_required); a neutral pending note
-    // when Chrome is momentarily locking its DB.
+    // YouTube readiness per relay, from heartbeat capabilities. This computer records
+    // public YouTube (and other) streams cookieless, no login needed. Green when yt-dlp
+    // resolves the public probe (youtube_ready); a neutral pending note before the first
+    // probe; a warning only if yt-dlp itself cannot resolve (e.g. needs an update).
     function relayYTBadge(cap) {
-      if (cap && cap.yt_cookies_ok === true) {
-        return `<span style="color:var(--ok);">YouTube ready (public + private)</span>`;
+      if (cap && cap.youtube_ready === true) {
+        return `<span style="color:var(--ok);">Records public YouTube (no login needed)</span>`;
       }
-      const err = String((cap && cap.yt_cookie_error) || '');
-      if (err === 'sign_in_required') {
-        return `<span style="color:var(--warn);">Private YouTube expired, re-run link-youtube</span>`;
+      const err = String((cap && cap.youtube_error) || '');
+      if (err === 'resolver_outdated') {
+        return `<span style="color:var(--warn);">YouTube resolver needs an update</span>`;
       }
-      if (err === 'chrome_cookie_db_locked') {
-        return `<span class="sub">YouTube check pending (Chrome is open)</span>`;
+      if (err === '') {
+        return `<span class="sub">Checking YouTube...</span>`;
       }
-      if (err === 'cookies_unavailable') {
-        return `<span class="sub">Public YouTube ready. Run link-youtube for private streams.</span>`;
-      }
-      return `<span class="sub">Public YouTube ready</span>`;
+      return `<span class="sub">YouTube check pending</span>`;
     }
 
     function relayRowHTML(n) {
@@ -900,16 +888,6 @@
         setTimeout(() => { relayUninstallCopyBtn.textContent = 'Copy'; }, 1500);
       } catch (_) {
         relayUninstallSnippet.select();
-      }
-    });
-
-    relayLinkYTCopyBtn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(relayLinkYTSnippet.value);
-        relayLinkYTCopyBtn.textContent = 'Copied';
-        setTimeout(() => { relayLinkYTCopyBtn.textContent = 'Copy'; }, 1500);
-      } catch (_) {
-        relayLinkYTSnippet.select();
       }
     });
 

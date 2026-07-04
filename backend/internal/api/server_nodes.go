@@ -808,8 +808,8 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		metaArg = string(b)
 	}
 	// Merge (not replace) the reported capability keys into capabilities_jsonb so a
-	// relay heartbeat that reports only its relay keys (yt_cookies_ok, yt_cookie_error,
-	// chrome_present, active_jobs, relay_version, ...) preserves any pre-existing keys.
+	// relay heartbeat that reports only its relay keys (youtube_mode, youtube_ready,
+	// youtube_error, active_jobs, relay_version, ...) preserves any pre-existing keys.
 	// A null capabilities payload leaves the column untouched (concat with '{}').
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE nodes

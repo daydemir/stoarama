@@ -4,8 +4,6 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +19,7 @@ const (
 	probeURL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 )
 
-// probe runs the YouTube cookie health check and holds its last classification.
+// probe runs the cookieless YouTube health check and holds its last classification.
 // All state access is mutex-guarded because the heartbeat goroutine reads it while
 // the same goroutine periodically refreshes it.
 type probe struct {
@@ -42,24 +40,23 @@ func newProbe(ytdlpBin string) *probe {
 	}
 }
 
-// runOnce runs the cookie probe under a hard timeout. It NEVER uses
-// --cookies-from-browser: in the background launchd/systemd agent the macOS Chrome
-// Safe Storage key is not granted to this process, so a browser read would extract
-// zero cookies and (worse) hang on a Keychain prompt. Instead it reads the file the
-// GUI-session `link-youtube` export wrote. When no cookie file exists the relay is
-// simply not linked to YouTube; that is reported honestly as cookies_unavailable,
-// not a failure (public lives still resolve cookie-less). The parent ctx cancels it
-// early on shutdown.
+// runOnce resolves the public probe URL under a hard timeout, COOKIELESS by default.
+// yt-dlp's android client resolves public YouTube from a residential IP with no
+// cookies at all, which is the default relay mode: youtube_ready=true means yt-dlp
+// itself resolves. A failure is classified honestly (resolver_outdated, network,
+// ...); there is no cookie source in the default path, so it can never be a cookie
+// error. When the experimental with-cookies path is opted in (see experimentalCookieMode)
+// and a cookie file exists, it is added so the probe reflects that mode. The parent
+// ctx cancels it early on shutdown.
 func (p *probe) runOnce(ctx context.Context) {
-	cookiePath, _ := cookiesFilePath()
-	if cookiePath == "" || !fileExists(cookiePath) {
-		p.set(capture.YTDLPClassCookiesUnavailable)
-		return
-	}
-
 	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	args := []string{"-g", "--no-warnings", "--no-playlist", "--cookies", cookiePath, probeURL}
+	args := []string{"-g", "--no-warnings", "--no-playlist", probeURL}
+	if experimentalCookieMode() {
+		if cp, _ := cookiesFilePath(); cp != "" && fileExists(cp) {
+			args = append([]string{"--cookies", cp}, args...)
+		}
+	}
 	out, err := exec.CommandContext(cctx, p.ytdlpBin, args...).CombinedOutput()
 
 	var class capture.YTDLPClass
@@ -67,8 +64,7 @@ func (p *probe) runOnce(ctx context.Context) {
 	case err == nil && hasHTTPURL(string(out)):
 		class = capture.YTDLPClassOK
 	case cctx.Err() == context.DeadlineExceeded:
-		// A --cookies FILE read never prompts Keychain, so a timeout here is a slow
-		// resolve/network stall, not a cookie problem.
+		// Cookieless resolve, so a timeout is a slow resolve / network stall.
 		class = capture.YTDLPClassOther
 	default:
 		class = capture.ClassifyYTDLPOutput(string(out))
@@ -126,23 +122,16 @@ func (p *probe) ytdlpVersion() string {
 	return p.ytdlpVer
 }
 
-// applyCookieEnv sets the cookie source the shared capture/resolve.go reads: point
-// yt-dlp at the exported cookie FILE only when the startup probe resolved with it;
-// otherwise resolve without cookies (a residential IP resolves public lives fine)
-// rather than failing. It never sets YT_DLP_COOKIES_FROM_BROWSER: the background
-// agent has no Keychain grant, so a browser read is guaranteed to fail.
-//
-// SANCTIONED-EXCEPTION (pending owner confirmation, DECISIONS 2026-07-04 §P2.3): the
-// cookie-less fallback deliberately relaxes Deniz's no-fallbacks rule, justified
-// because most relays never link YouTube cookies and public lives resolve fine
-// cookie-less from residential IPs. The fallback fires ONLY when the probe classifies
-// cookies as unusable, and it is visible via the yt_cookies_ok/yt_cookie_error
-// heartbeat capabilities. This is called exactly ONCE at startup (runRelay); the mode
-// never changes mid-flight, only across a restart, so there is no os.Setenv race with
-// an in-flight capture.
+// applyCookieEnv sets the cookie source the shared capture/resolve.go reads. In the
+// DEFAULT cookieless mode it clears YT_DLP_COOKIES_FILE so yt-dlp resolves with no
+// cookies (the android client resolves public lives fine from a residential IP). It
+// points yt-dlp at the exported cookie FILE only under the experimental with-cookies
+// opt-in, and only when the startup probe resolved with it. It never sets
+// YT_DLP_COOKIES_FROM_BROWSER: the background agent has no Keychain grant. Called
+// exactly ONCE at startup (runRelay); the mode never changes mid-flight.
 func (p *probe) applyCookieEnv() {
 	cookiePath, _ := cookiesFilePath()
-	if p.ok() && cookiePath != "" {
+	if experimentalCookieMode() && p.ok() && cookiePath != "" && fileExists(cookiePath) {
 		os.Setenv("YT_DLP_COOKIES_FILE", cookiePath)
 	} else {
 		os.Unsetenv("YT_DLP_COOKIES_FILE")
@@ -157,32 +146,6 @@ func hasHTTPURL(out string) bool {
 		}
 	}
 	return false
-}
-
-// chromeCookieDBPath returns the platform path to Chrome's default cookie SQLite
-// DB, or "" on an unsupported OS. Only stat'd, never opened, so no Keychain prompt.
-func chromeCookieDBPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Google", "Chrome", "Default", "Cookies")
-	case "linux":
-		return filepath.Join(home, ".config", "google-chrome", "Default", "Cookies")
-	default:
-		return ""
-	}
-}
-
-func chromeCookieDBPresent() bool {
-	p := chromeCookieDBPath()
-	if p == "" {
-		return false
-	}
-	_, err := os.Stat(p)
-	return err == nil
 }
 
 func readYtdlpVersion(bin string) string {

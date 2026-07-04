@@ -4,7 +4,7 @@ import "strings"
 
 // YTDLPClass classifies a yt-dlp resolve outcome for relay cookie diagnostics and
 // the worker's job-fail error mapping. The class strings are reported verbatim in
-// the relay node heartbeat as nodes.capabilities_jsonb.yt_cookie_error.
+// the relay node heartbeat as nodes.capabilities_jsonb.youtube_error.
 type YTDLPClass string
 
 const (

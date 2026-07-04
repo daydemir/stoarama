@@ -38,11 +38,11 @@ func runRelay(ctx context.Context) error {
 	os.Setenv("TZ", "UTC")
 	time.Local = time.UTC
 
-	// Point the shared capture path at the bundled binaries. The cookie source is set
-	// by the probe (applyCookieEnv) once the startup probe decides whether the exported
-	// cookie FILE resolves; both cookie env vars are cleared here so a stale value from
-	// the environment can never leak in. --cookies-from-browser is never used in this
-	// headless path (no Keychain grant).
+	// Point the shared capture path at the bundled binaries. YouTube resolves
+	// COOKIELESS by default (applyCookieEnv leaves the cookie env unset unless the
+	// experimental with-cookies opt-in is on); both cookie env vars are cleared here so
+	// a stale value from the environment (or a leftover ~/.stoarama/cookies.txt) can
+	// never leak in. --cookies-from-browser is never used in this headless path.
 	os.Setenv("YT_DLP_BIN", ytdlp)
 	os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
 	os.Unsetenv("YT_DLP_COOKIES_FILE")
@@ -72,19 +72,17 @@ func runRelay(ctx context.Context) error {
 		return fmt.Errorf("init relay worker: %w", err)
 	}
 
-	// Startup probe (hard-timeout bounded) so the cookie env reflects reality before
-	// the first job can be leased. The cookie mode (Chrome cookies vs cookie-less
-	// resolve) is decided HERE, ONCE, from this initial probe and set via applyCookieEnv
-	// before the worker starts. It is never mutated again for the process lifetime: the
-	// heartbeat goroutine keeps re-probing and reporting yt_cookies_ok/yt_cookie_error,
-	// but does NOT touch the cookie env, so there is no data race between a capture
-	// reading YT_DLP_COOKIES_FROM_BROWSER and the probe writing it. A cookie-mode change
-	// takes effect only across a process restart. See probe.applyCookieEnv for the
-	// sanctioned-fallback rationale.
+	// Startup probe (hard-timeout bounded) so the resolve env reflects reality before
+	// the first job can be leased. The mode (cookieless default vs experimental
+	// with-cookies) is decided HERE, ONCE, and set via applyCookieEnv before the worker
+	// starts. It is never mutated again for the process lifetime: the heartbeat
+	// goroutine keeps re-probing and reporting youtube_ready/youtube_error, but does NOT
+	// touch the resolve env, so there is no data race. A mode change takes effect only
+	// across a process restart.
 	pr := newProbe(ytdlp)
 	pr.runOnce(ctx)
 	pr.applyCookieEnv()
-	log.Printf("stoarama-relay run node=%d concurrency=%d api=%s cookies_ok=%t cookie_class=%q",
+	log.Printf("stoarama-relay run node=%d concurrency=%d api=%s youtube_ready=%t youtube_error=%q",
 		cfg.NodeID, cfg.Concurrency, cfg.APIURL, pr.ok(), pr.errorClass())
 
 	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg)

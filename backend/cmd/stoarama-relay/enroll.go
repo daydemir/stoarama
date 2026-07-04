@@ -52,8 +52,8 @@ func runEnroll(args []string) error {
 		"platform":     runtime.GOOS + "/" + runtime.GOARCH,
 		"capabilities_json": map[string]any{
 			"max_concurrent_streams": conc,
-			"chrome_present":         chromeCookieDBPresent(),
-			"yt_cookies_ok":          false,
+			"youtube_mode":           "cookieless",
+			"youtube_ready":          false,
 			"relay_version":          version,
 		},
 	}

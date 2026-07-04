@@ -2152,7 +2152,7 @@
       return {
         name: String(n.display_name || 'your computer'),
         healthy: n.healthy === true,
-        ytOk: cap.yt_cookies_ok === true,
+        ytOk: cap.youtube_ready === true,
         active: Number(cap.active_jobs || 0),
         max: Number(n.relay_max_streams || 5),
       };
@@ -2186,9 +2186,9 @@
         cta = '<a href="/org-settings">Manage computers</a>';
       } else if (ytReady.length === 0) {
         dot = 'var(--warn)';
-        label = 'YouTube sign-in needed';
+        label = 'YouTube resolver not ready';
         const names = online.map((r) => escapeHTML(r.name)).join(', ');
-        detail = `Log into YouTube in Chrome on ${names}. The relay reads your Chrome cookies locally to resolve the stream URL.`;
+        detail = `yt-dlp on ${names} could not resolve YouTube yet. This usually clears on its own; if it persists the relay may need an update.`;
         cta = '<a href="/org-settings">Manage computers</a>';
       } else if (!hasCapacity) {
         dot = 'var(--warn)';
@@ -2198,7 +2198,7 @@
       } else {
         dot = 'var(--ok)';
         label = 'Records via your computer';
-        detail = `This stream records through ${escapeHTML(ytReady[0].name)} using your Chrome cookies. Clips arrive in your account as usual, billed at the same $0.05 per recording-hour.`;
+        detail = `This stream records through ${escapeHTML(ytReady[0].name)} via your own connection, no login needed. Clips arrive in your account as usual, billed at the same $0.05 per recording-hour.`;
         fleetOK = true;
       }
       els.relayGateDot.style.background = dot;

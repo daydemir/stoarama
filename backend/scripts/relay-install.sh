@@ -170,25 +170,15 @@ ENROLL_ARGS=(enroll --token "${TOKEN}" --api-url "${API_URL}")
 "${BIN_DIR}/stoarama-relay" "${ENROLL_ARGS[@]}"
 
 echo ""
-# Interactive YouTube cookie export, BEFORE the background service is loaded. This
-# runs in the user's GUI Terminal session, which is the ONLY place the macOS "Always
-# Allow" Keychain prompt can appear and be clicked; the background launchd/systemd
-# agent can never decrypt Chrome cookies on its own. It must land cookies.txt before
-# the service starts, because the relay decides its cookie mode (cookie file vs
-# cookie-less) once at process startup: if the agent starts first it reads
-# cookies_unavailable and never re-reads the file until a restart. Best-effort and
-# non-fatal: link-youtube exports ONLY YouTube/Google sign-in cookies, prints an
-# honest note, and exits non-zero if Chrome is absent, the user is not logged into
-# YouTube, or the prompt is declined. Public streams record without any of this, so we
-# never abort the install. link-youtube's own 120s timeout bounds the Keychain wait.
-echo "Setting up YouTube access (optional, for private/members streams)..."
-"${BIN_DIR}/stoarama-relay" link-youtube || true
-
-echo ""
-# Load/start the background service AFTER cookies.txt exists so the relay reads the
-# cookie file on its first startup probe. install-launchd/install-systemd replace any
-# prior instance and kickstart it, so a re-run also restarts a service that was
-# already loaded, making it re-read a freshly written cookie file.
+# COOKIELESS install (decision 2026-07-04): the relay records generally PUBLIC streams
+# and resolves YouTube cookieless (yt-dlp's android client, no cookies, no JS runtime).
+# There is NO cookie-export step and NO macOS Keychain prompt during install. The
+# with-cookies path for private/members YouTube (stoarama-relay link-youtube) is
+# dormant and gated behind STOARAMA_RELAY_YT_COOKIES=1 plus a bundled JS runtime (Deno)
+# that we do not ship; enable it only if the cookieless bypass stops working.
+#
+# Load/start the background service. install-launchd/install-systemd replace any prior
+# instance and kickstart it, so a re-run also restarts an already-loaded service.
 if [[ "${OS}" == "darwin" ]]; then
   "${BIN_DIR}/stoarama-relay" install-launchd
 else

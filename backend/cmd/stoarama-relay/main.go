@@ -1,10 +1,17 @@
 // Command stoarama-relay is the account-owned relay agent: a small headless binary
-// a user installs on their own Mac or Linux machine so Stoarama can capture streams
-// (notably YouTube) through the user's residential IP and Chrome cookies. It enrolls
-// as a node_type='relay' node, runs the shared recordingworker loop against the prod
-// API, and reports liveness plus YouTube cookie health via the node heartbeat. It
-// ships no server credentials, and cookies never leave the machine: only resolved
-// CDN segments flow out via presigned uploads.
+// a user installs on their own Mac or Linux machine so Stoarama can capture generally
+// PUBLIC streams (notably YouTube) through the user's residential IP. It enrolls as a
+// node_type='relay' node, runs the shared recordingworker loop against the prod API,
+// and reports liveness plus youtube_ready via the node heartbeat. It ships no server
+// credentials; only resolved CDN segments flow out via presigned uploads.
+//
+// YouTube resolves COOKIELESS by default (decision 2026-07-04): yt-dlp's android
+// client resolves public YouTube from a residential IP with no cookies and no JS
+// runtime. The with-cookies path for private/members streams (link-youtube +
+// cookie-file resolve) is present but DORMANT behind the STOARAMA_RELAY_YT_COOKIES
+// opt-in, because a cookie'd resolve uses yt-dlp's web client and needs a bundled JS
+// runtime (Deno) we do not ship. Revisit + bundle Deno only if the cookieless
+// android-client bypass stops working. See config.go experimentalCookieMode.
 package main
 
 import (
@@ -72,7 +79,7 @@ func usage() {
 		"  install-launchd                                       write + load the macOS launchd user agent",
 		"  install-systemd                                       write + enable the systemd user unit",
 		"  uninstall                                             stop the service and remove the unit",
-		"  link-youtube                                          export Chrome YouTube cookies for private/members streams (run in Terminal)",
+		"  link-youtube                                          [experimental] export Chrome cookies for private/members YouTube; needs STOARAMA_RELAY_YT_COOKIES=1 + a bundled JS runtime",
 		"  self-update [--api-url URL]                           update the relay binary + yt-dlp from latest.json",
 		"  version                                               print the relay version",
 		"",

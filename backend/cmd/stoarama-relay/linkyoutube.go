@@ -1,3 +1,10 @@
+// FUTURE/EXPERIMENTAL: cookie-based auth for private/members YouTube. Requires
+// bundling a JS runtime (Deno) so yt-dlp can solve the n-challenge; without it the web
+// client returns "No video formats found". Deferred by decision 2026-07-04; enable +
+// bundle Deno if/when the cookieless android-client path stops working. Nothing in the
+// default install or run path invokes this file: link-youtube is a manual command and
+// the run loop only reads the exported cookie file under the STOARAMA_RELAY_YT_COOKIES
+// opt-in (see experimentalCookieMode).
 package main
 
 import (
