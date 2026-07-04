@@ -129,6 +129,15 @@
     .detail-edit { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
     .detail-edit.hidden { display: none; }
     .detail-status { margin-top: 8px; }
+    /* Storage-options panel: current mode summary + selectable alternatives, each a
+       label->value tile (title over cost), with an explicit confirm step. */
+    .storage-opts-label { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    .storage-opts { display: flex; flex-direction: column; gap: 8px; }
+    .storage-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 12px 14px; min-height: 0; }
+    .storage-opt.on { color: #fff; background: var(--accent); border-color: var(--accent); }
+    .storage-opt-title { font-weight: 600; }
+    .storage-opt-cost { font-size: 12px; font-weight: 400; color: var(--muted); }
+    .storage-opt.on .storage-opt-cost { color: color-mix(in srgb, #fff 82%, transparent); }
     .clip-pager { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0; }
     .clip-pager button { width: auto; min-width: 0; min-height: 32px; padding: 6px 14px; }
     .clip-pager .clip-pager-label { color: var(--muted); font-size: 13px; }
@@ -494,7 +503,7 @@
           <div id="catalogStreamName" class="preview"></div>
           <div id="catalogStreamLoc" class="preview muted"></div>
           <div class="preview mono" style="margin-top:6px;">Stream ID: <span id="catalogStreamIdVal"></span></div>
-          <div class="hint">Clips land in the NAS folder named for this stream ID</div>
+          <div class="hint">Clips land in a folder named for the recording's ID, visible once the recording is created.</div>
           <img id="catalogFramePreview" class="video-preview hidden" alt="recent frame" />
         </div>
         <input type="hidden" id="recStreamID" value="" />
@@ -2328,18 +2337,9 @@
 
       let actions = '';
       if (status === 'active') {
-        actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
-          + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
+        actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`;
       } else if (status === 'paused') {
-        actions = `<button type="button" class="secondary" data-resume="${id}">Resume</button>`
-          + `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
-      } else {
-        actions = `<button type="button" class="danger" data-delete="${id}">Delete</button>`;
-      }
-      if (isManaged) {
-        const switchTo = tier === 'yearly_prepaid' ? 'monthly' : 'yearly_prepaid';
-        const switchLabel = tier === 'yearly_prepaid' ? 'Switch to monthly' : 'Switch to yearly prepaid';
-        actions += `<button type="button" class="secondary" data-retention="${id}" data-tier="${switchTo}">${switchLabel}</button>`;
+        actions = `<button type="button" class="secondary" data-resume="${id}">Resume</button>`;
       }
       actions += `<a class="btn-link secondary" href="/recordings/${id}">View recording</a>`;
 
@@ -2357,14 +2357,16 @@
       // Linked to a catalog stream: title = stream name, subtitle = location.
       // Otherwise the source URL is the subtitle, as before.
       const streamName = String(rec.stream_name || '').trim();
+      const idBadge = `<span class="clip-pill neutral" style="font-family:var(--mono);margin-right:5px;vertical-align:middle;">#${id}</span>`;
       let headHTML;
       if (streamName) {
         const loc = String(rec.stream_location || '').trim();
-        headHTML = `<div class="card-name">${escapeHTML(streamName)}</div>`
+        headHTML = `<div class="card-name">${idBadge}${escapeHTML(streamName)}</div>`
           + (loc ? `<div class="card-sub">${escapeHTML(loc)}</div>` : '')
-          + `<div class="card-sub">${escapeHTML(String(rec.name || ''))}</div>`;
+          + `<div class="card-sub">${escapeHTML(String(rec.name || ''))}</div>`
+          + (Number(rec.stream_id) > 0 ? `<div class="card-sub">Stream ID: <span class="mono">${Number(rec.stream_id)}</span></div>` : '');
       } else {
-        headHTML = `<div class="card-name">${escapeHTML(String(rec.name || ''))}</div>`
+        headHTML = `<div class="card-name">${idBadge}${escapeHTML(String(rec.name || ''))}</div>`
           + `<div class="card-url">${escapeHTML(String(rec.stream_url || ''))}</div>`;
       }
 
@@ -2557,10 +2559,6 @@
         b.addEventListener('click', () => mutateRecording(b.getAttribute('data-pause'), 'pause')));
       els.cards.querySelectorAll('button[data-resume]').forEach((b) =>
         b.addEventListener('click', () => mutateRecording(b.getAttribute('data-resume'), 'resume')));
-      els.cards.querySelectorAll('button[data-delete]').forEach((b) =>
-        b.addEventListener('click', () => deleteRecording(b)));
-      els.cards.querySelectorAll('button[data-retention]').forEach((b) =>
-        b.addEventListener('click', () => switchRetention(b)));
       els.cards.querySelectorAll('button[data-bundletoggle]').forEach((b) =>
         b.addEventListener('click', () => {
           const bid = b.getAttribute('data-bundletoggle');
@@ -2841,9 +2839,9 @@
         </div>`;
     }
 
-    // The storage card: stream id (== the NAS folder), current delivery, retention
-    // tier. Offers Switch storage (managed<->NAS, gated by nasAvailable) and Switch
-    // billing type (monthly<->yearly, managed only) via the existing endpoints.
+    // The storage card: recording id (== the NAS folder name), stream id where
+    // applicable, current delivery, retention tier. Read-only; switching happens in
+    // the storage-options panel opened from the action row.
     function storageCardHTML(rec) {
       const isNas = rec.delivery === 'nas_pull';
       const isManaged = rec.storage_managed === true && !isNas;
@@ -2853,7 +2851,7 @@
       if (streamId > 0) rows.push(['Stream ID', `<span class="mono">${streamId}</span>`]);
       if (isNas) {
         rows.push(['Storage', 'Your NAS']);
-        rows.push(['NAS folder', `<span class="mono">${streamId > 0 ? streamId : '(stream id)'}</span>`]);
+        rows.push(['NAS folder', `<span class="mono">#${Number(rec.id)}</span>`]);
       } else if (isManaged) {
         rows.push(['Storage', 'Stoarama-managed']);
         rows.push(['Billing type', tier === 'yearly_prepaid' ? 'Yearly, <b>$0.05</b> per hour of footage, per month' : 'Monthly, <b>$0.10</b> per hour of footage, per month']);
@@ -2861,34 +2859,25 @@
         rows.push(['Storage', 'Your own S3']);
       }
 
-      const actions = [];
-      // Switch storage managed<->NAS. Only offer nas_pull when a green NAS connection
-      // exists (mirror the composer gate); the server rejects nas_pull without one.
-      if (isNas) {
-        actions.push(`<button type="button" class="secondary" data-delivery="managed">Switch to managed</button>`);
-      } else if (isManaged && nasAvailable()) {
-        actions.push(`<button type="button" class="secondary" data-delivery="nas_pull">Switch to NAS</button>`);
-      }
-      // Switch billing type monthly<->yearly (managed only), reusing switchRetention.
-      if (isManaged) {
-        const switchTo = tier === 'yearly_prepaid' ? 'monthly' : 'yearly_prepaid';
-        const label = tier === 'yearly_prepaid' ? 'Switch to monthly' : 'Switch to yearly';
-        actions.push(`<button type="button" class="secondary" data-retention="${Number(rec.id)}" data-tier="${switchTo}">${label}</button>`);
-      }
-      const nasHint = (isManaged && !nasAvailable())
-        ? `<div class="hint" style="margin-top:10px;">Set up a NAS connection in <a href="/org-settings">Org settings</a> to record to your NAS.</div>`
-        : '';
+      // This card is a read-only summary. Switching storage happens in the deliberate
+      // options panel below, opened by the "Storage options" button in the action row.
       return `
         <div class="detail-card">
           <div class="detail-card-head"><span class="detail-card-title">Storage</span></div>
           <dl class="detail-rows">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
-          ${actions.length ? `<div class="detail-actions">${actions.join('')}</div>` : ''}
-          ${nasHint}
-          <div id="deliveryStatus" class="status detail-status"></div>
+          <div id="storageOptionsForm" class="detail-edit hidden"></div>
         </div>`;
     }
 
-    // Recording-level actions card: pause/resume + delete, mirroring the list card.
+    // storageOptionsAvailable gates the "Storage options" entry point: only NAS and
+    // managed recordings have alternatives to switch to (BYO S3 has none here).
+    function storageOptionsAvailable(rec) {
+      const isNas = rec.delivery === 'nas_pull';
+      const isManaged = rec.storage_managed === true && !isNas;
+      return isNas || isManaged;
+    }
+
+    // Recording-level actions card: pause/resume + a settings entry to storage options.
     function recActionsCardHTML(rec) {
       const status = String(rec.status || '');
       const id = Number(rec.id);
@@ -2898,10 +2887,13 @@
       } else if (status === 'paused') {
         actions = `<button type="button" class="primary" data-recresume="${id}">Resume</button>`;
       }
-      actions += `<button type="button" class="danger" data-recdelete="${id}">Delete recording</button>`;
+      if (storageOptionsAvailable(rec)) {
+        actions += `<button type="button" class="secondary" data-storageopts="${id}">Storage options</button>`;
+      }
       const err = (status === 'active' && String(rec.health || '') === 'failing' && rec.last_error_text)
         ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
-      return `<div class="detail-actions" style="margin:0 0 14px;">${actions}</div>${err}`;
+      const row = actions ? `<div class="detail-actions" style="margin:0 0 14px;">${actions}</div>` : '';
+      return row + err;
     }
 
     // Render the whole detail view: header, schedule card, storage card, recording
@@ -2910,11 +2902,15 @@
       const root = els.clipPage;
       const rec = clipPageState.rec;
       const st = statusLine(rec);
+      const recId = clipPageState.recId;
+      const isNas = rec.delivery === 'nas_pull';
+      const idLabel = isNas ? 'NAS folder' : 'Recording ID';
       const header = `
         <div class="clip-page-head">
           <div>
             <div class="eyebrow">Recording</div>
             <h2 style="margin:2px 0 4px;">${escapeHTML(clipPageState.recName)}</h2>
+            <div style="margin:0 0 4px;font-size:12px;color:var(--muted);">${idLabel} <span class="clip-pill neutral" style="font-family:var(--mono);">#${recId}</span></div>
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
           <a class="btn-link secondary" href="/recordings">Back to recordings</a>
@@ -2933,12 +2929,8 @@
         b.addEventListener('click', () => mutateRecordingDetail(b.getAttribute('data-recpause'), 'pause')));
       root.querySelectorAll('button[data-recresume]').forEach((b) =>
         b.addEventListener('click', () => mutateRecordingDetail(b.getAttribute('data-recresume'), 'resume')));
-      root.querySelectorAll('button[data-recdelete]').forEach((b) =>
-        b.addEventListener('click', () => deleteRecordingDetail(b.getAttribute('data-recdelete'))));
-      root.querySelectorAll('button[data-retention]').forEach((b) =>
-        b.addEventListener('click', () => switchRetentionDetail(b)));
-      root.querySelectorAll('button[data-delivery]').forEach((b) =>
-        b.addEventListener('click', () => switchDelivery(b.getAttribute('data-delivery'))));
+      root.querySelectorAll('button[data-storageopts]').forEach((b) =>
+        b.addEventListener('click', () => openStorageOptions()));
       const editBtn = root.querySelector('button[data-schededit]');
       if (editBtn) editBtn.addEventListener('click', () => openScheduleEdit());
     }
@@ -2952,56 +2944,110 @@
       }
     }
 
-    async function deleteRecordingDetail(id) {
-      if (!window.confirm('Delete this recording? This stops it.')) return;
-      try {
-        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(String(id))}`, { method: 'DELETE' });
-        window.location.assign('/recordings');
-      } catch (err) {
-        window.alert(String(err.message || err));
+    // openStorageOptions reveals a deliberate storage-switch panel inside the storage
+    // card: the current mode, the alternative option(s) with their cost as a
+    // label->value tile, and a select-then-confirm step. It reuses the existing
+    // PATCH /delivery and PATCH /retention endpoints; there is no one-click switch.
+    function openStorageOptions() {
+      const rec = clipPageState.rec;
+      const form = els.clipPage.querySelector('#storageOptionsForm');
+      const btn = els.clipPage.querySelector('button[data-storageopts]');
+      if (!form) return;
+      if (!form.classList.contains('hidden')) {
+        form.classList.add('hidden');
+        form.innerHTML = '';
+        if (btn) btn.textContent = 'Storage options';
+        return;
       }
+      if (btn) btn.textContent = 'Close';
+
+      const isNas = rec.delivery === 'nas_pull';
+      const isManaged = rec.storage_managed === true && !isNas;
+      const tier = String(rec.storage_retention_tier || 'monthly');
+      const current = isNas
+        ? ['Your NAS', 'Free']
+        : (tier === 'yearly_prepaid'
+            ? ['Stoarama-managed, prepaid yearly', '$0.05 per hour of footage, per month']
+            : ['Stoarama-managed, billed monthly', '$0.10 per hour of footage, per month']);
+
+      // Alternatives for the current mode. NAS can move to managed; managed can move to
+      // NAS (when a connection exists) and can flip its billing tier.
+      const opts = [];
+      if (isNas) {
+        opts.push({ act: 'delivery', val: 'managed', title: 'Stoarama-managed storage', cost: '$0.10 per hour of footage, per month',
+          change: 'Stoarama keeps your clips and bills for storage each month. You can switch back to your NAS at any time.' });
+      } else if (isManaged) {
+        if (nasAvailable()) {
+          opts.push({ act: 'delivery', val: 'nas_pull', title: 'Your NAS', cost: 'Free',
+            change: 'Stoarama pulls your stored clips to your NAS and removes them from your Stoarama view. The footage stays on your NAS.' });
+        }
+        if (tier === 'yearly_prepaid') {
+          opts.push({ act: 'retention', val: 'monthly', title: 'Managed, billed monthly', cost: '$0.10 per hour of footage, per month',
+            change: 'Future footage bills monthly. Any prepaid credit already granted runs until it expires and is not refunded.' });
+        } else {
+          opts.push({ act: 'retention', val: 'yearly_prepaid', title: 'Managed, prepaid yearly', cost: '$0.05 per hour of footage, per month',
+            change: 'Your currently-stored footage is prepaid for 12 months at the yearly rate, charged to your card now. New footage is prepaid monthly.' });
+        }
+      }
+
+      const optHTML = opts.map((o, i) => `
+        <button type="button" class="storage-opt" data-opt="${i}">
+          <span class="storage-opt-title">${o.title}</span>
+          <span class="storage-opt-cost">${o.cost}</span>
+        </button>`).join('');
+      const nasHint = (isManaged && !nasAvailable())
+        ? `<div class="hint" style="margin-top:10px;">Set up a NAS connection in <a href="/org-settings">Org settings</a> to record to your NAS.</div>`
+        : '';
+
+      form.innerHTML = `
+        <dl class="detail-rows" style="margin-bottom:14px;">
+          <dt>Current storage</dt><dd>${current[0]}</dd>
+          <dt>Cost</dt><dd>${current[1]}</dd>
+        </dl>
+        <div class="storage-opts-label">Switch to</div>
+        <div class="storage-opts">${optHTML}</div>
+        ${nasHint}
+        <div id="storageOptChange" class="hint" style="display:none;"></div>
+        <div class="button-row" id="storageOptConfirm" style="display:none;margin-top:12px;">
+          <button type="button" class="primary" data-storageconfirm>Confirm change</button>
+        </div>
+        <div id="storageOptStatus" class="status detail-status"></div>`;
+      form.classList.remove('hidden');
+
+      let selected = -1;
+      const changeEl = form.querySelector('#storageOptChange');
+      const confirmRow = form.querySelector('#storageOptConfirm');
+      form.querySelectorAll('button[data-opt]').forEach((b) => b.addEventListener('click', () => {
+        selected = Number(b.getAttribute('data-opt'));
+        form.querySelectorAll('button[data-opt]').forEach((x) => x.classList.toggle('on', x === b));
+        changeEl.textContent = opts[selected].change;
+        changeEl.style.display = '';
+        confirmRow.style.display = '';
+      }));
+      form.querySelector('button[data-storageconfirm]').addEventListener('click', (e) => {
+        if (selected < 0) return;
+        confirmStorageSwitch(opts[selected], form.querySelector('#storageOptStatus'), e.currentTarget);
+      });
+      form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
-    // switchRetentionDetail reuses the same confirm + PATCH /retention flow as the
-    // list card, then reloads the detail recording instead of the list.
-    async function switchRetentionDetail(btn) {
-      const id = String(btn.getAttribute('data-retention') || '').trim();
-      const tier = String(btn.getAttribute('data-tier') || '').trim();
-      const msg = tier === 'yearly_prepaid'
-        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage, per month, charged to your card now. New footage is prepaid monthly.'
-        : 'Switch to monthly storage? Future footage bills at $0.10 per hour of footage, per month. Any prepaid credit already granted runs until it expires and is not refunded.';
-      if (!window.confirm(msg)) return;
+    // confirmStorageSwitch applies the selected option via the existing endpoints, then
+    // reloads the recording (which re-renders and closes the panel).
+    async function confirmStorageSwitch(opt, statusEl, btn) {
       btn.disabled = true;
+      setStatus(statusEl, 'Saving...', '');
+      const path = opt.act === 'delivery' ? 'delivery' : 'retention';
+      const body = opt.act === 'delivery' ? { delivery: opt.val } : { tier: opt.val };
       try {
-        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}/retention`, {
+        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}/${path}`, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tier }),
+          body: JSON.stringify(body),
         });
-        if (out && out.note) window.alert(String(out.note));
+        if (opt.act === 'retention' && out && out.note) window.alert(String(out.note));
         await reloadClipPageRecording();
       } catch (err) {
-        window.alert(String(err.message || err));
-        btn.disabled = false;
-      }
-    }
-
-    // switchDelivery flips managed<->nas_pull via PATCH /recordings/{id}/delivery.
-    // The server rejects nas_pull without a NAS connection; the button is only shown
-    // when nasAvailable(), so this path is already gated.
-    async function switchDelivery(mode) {
-      const delivery = mode === 'nas_pull' ? 'nas_pull' : 'managed';
-      if (delivery === 'nas_pull' && !window.confirm('Switch this recording to your NAS? Clips already stored in Stoarama will be pulled to your NAS and removed from your Stoarama view. The footage stays on your NAS.')) return;
-      const statusEl = els.clipPage.querySelector('#deliveryStatus');
-      setStatus(statusEl, 'Saving...', '');
-      try {
-        clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}/delivery`, {
-          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ delivery }),
-        });
-        renderClipPage();
-        await loadClipPage(clipPageState.page);
-      } catch (err) {
         setStatus(statusEl, String(err.message || err), 'err');
+        btn.disabled = false;
       }
     }
 
@@ -3500,43 +3546,6 @@
         await refreshRecordings();
       } catch (err) {
         window.alert(String(err.message || err));
-      }
-    }
-
-    async function deleteRecording(btn) {
-      if (!window.confirm('Delete this recording? This stops it.')) return;
-      const id = String(btn.getAttribute('data-delete') || '').trim();
-      try {
-        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' });
-        await refreshRecordings();
-      } catch (err) {
-        window.alert(String(err.message || err));
-      }
-    }
-
-    // switchRetention flips one managed recording's storage tier via PATCH
-    // /recordings/{id}/retention. Monthly->yearly prepays the currently-stored footage
-    // immediately (a real charge) and requires a card; yearly->monthly reverts future
-    // footage with NO refund of already-prepaid credit. Both caveats are confirmed
-    // before the call. The server is the authority (owner/billing-admin, card, managed).
-    async function switchRetention(btn) {
-      const id = String(btn.getAttribute('data-retention') || '').trim();
-      const tier = String(btn.getAttribute('data-tier') || '').trim();
-      const msg = tier === 'yearly_prepaid'
-        ? 'Switch to yearly prepaid? Your currently-stored footage for this recording is prepaid for 12 months at $0.05 per hour of footage, per month, charged to your card now. New footage is prepaid monthly.'
-        : 'Switch to monthly storage? Future footage bills at $0.10 per hour of footage, per month. Any prepaid credit already granted runs until it expires and is not refunded.';
-      if (!window.confirm(msg)) return;
-      btn.disabled = true;
-      try {
-        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}/retention`, {
-          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tier }),
-        });
-        if (out && out.note) window.alert(String(out.note));
-        await refreshRecordings();
-      } catch (err) {
-        window.alert(String(err.message || err));
-        btn.disabled = false;
       }
     }
 
