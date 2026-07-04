@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -46,42 +45,68 @@ func runLinkYouTube(_ []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(cookiePath), 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(cookiePath), err)
+	dir := filepath.Dir(cookiePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
 	}
 
-	fmt.Println("Linking YouTube: exporting your Chrome cookies for private/members streams.")
+	// Export the full jar to a private temp file (0600) in ~/.stoarama first, so the
+	// UNFILTERED jar (yt-dlp dumps EVERY Chrome cookie, all sites) never persists at
+	// cookies.txt. We filter it down to YouTube/Google sign-in domains and write only
+	// that to cookiePath, then securely shred the temp no matter how we exit.
+	rawFile, err := os.CreateTemp(dir, ".cookies-raw-*.txt")
+	if err != nil {
+		return fmt.Errorf("create temp cookie file: %w", err)
+	}
+	rawPath := rawFile.Name()
+	_ = rawFile.Close()
+	if err := os.Chmod(rawPath, 0o600); err != nil {
+		secureRemove(rawPath)
+		return fmt.Errorf("secure %s: %w", rawPath, err)
+	}
+	defer secureRemove(rawPath)
+
+	fmt.Println("Linking YouTube: exporting your YouTube and Google sign-in cookies for private/members streams.")
 	if runtime.GOOS == "darwin" {
 		fmt.Println("macOS will now ask to allow access to \"Chrome Safe Storage\" in your Keychain.")
 		fmt.Println("Click \"Always Allow\" so the background relay can keep using these cookies.")
 	}
-	fmt.Println("Nothing leaves your machine; cookies are written only to", cookiePath)
+	fmt.Println("Nothing leaves your machine; only YouTube and Google sign-in cookies are kept, at", cookiePath)
 	fmt.Println()
 
 	ctx, cancel := context.WithTimeout(context.Background(), linkExportTimeout)
 	defer cancel()
 	// Passing BOTH --cookies-from-browser and --cookies makes yt-dlp load the jar from
-	// Chrome and write it to the file. --skip-download keeps it to a lightweight
+	// Chrome and write it to the temp file. --skip-download keeps it to a lightweight
 	// info-extract against a stable public video. No --no-warnings: we want the
 	// "Extracted N cookies" / "could not be decrypted" lines for validation.
-	args := []string{"--cookies-from-browser", "chrome", "--cookies", cookiePath, "--skip-download", probeURL}
+	args := []string{"--cookies-from-browser", "chrome", "--cookies", rawPath, "--skip-download", probeURL}
 	out, runErr := exec.CommandContext(ctx, ytdlp, args...).CombinedOutput()
+
+	// Filter the exported jar down to ONLY YouTube/Google sign-in domains before it
+	// lands at the path the background relay reads. Everything else (banking, trackers,
+	// unrelated logins in the same Chrome profile) is dropped and never written to disk.
+	raw, readErr := os.ReadFile(rawPath)
+	if readErr != nil {
+		return linkFailure(ctx.Err(), runErr, string(out), 0)
+	}
+	filtered, kept := filterCookieLines(raw)
 
 	// Gate success on a genuine YouTube login cookie, not raw line count. On macOS the
 	// login cookies are v10-encrypted and only decrypt with the Keychain grant; the
 	// non-auth preference cookies (CONSENT, YSC, VISITOR_INFO1_LIVE, ...) decrypt with
 	// no grant at all. A jar with only those would let public streams resolve but
 	// silently fail every private/members stream, so it must NOT read as "linked".
-	total, hasAuth := inspectCookieJar(cookiePath)
+	total, hasAuth := inspectCookieBytes(filtered)
 	if !hasAuth {
 		// Do not leave a login-less jar behind for the run loop to trust.
 		_ = os.Remove(cookiePath)
 		return linkFailure(ctx.Err(), runErr, string(out), total)
 	}
-	if err := os.Chmod(cookiePath, 0o600); err != nil {
-		return fmt.Errorf("secure %s: %w", cookiePath, err)
+	if err := os.WriteFile(cookiePath, filtered, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", cookiePath, err)
 	}
-	fmt.Printf("YouTube linked: exported %d cookies (including your login) to %s\n", total, cookiePath)
+	fmt.Printf("YouTube linked: kept %d YouTube and Google sign-in cookies (only these; all other sites dropped) at %s\n", kept, cookiePath)
 	fmt.Println("The relay will use these for private/members YouTube. Public streams never needed them.")
 	return nil
 }
@@ -122,31 +147,6 @@ var youTubeAuthCookieNames = map[string]bool{
 	"__Secure-1PSID": true, "__Secure-3PSID": true,
 	"__Secure-1PAPISID": true, "__Secure-3PAPISID": true,
 	"LOGIN_INFO": true,
-}
-
-// inspectCookieJar parses a Netscape cookie jar and reports the total non-comment
-// entry count and whether it contains at least one YouTube login cookie. Netscape
-// format is tab-separated: domain, flag, path, secure, expiration, name, value.
-func inspectCookieJar(path string) (total int, hasAuth bool) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, false
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		total++
-		fields := strings.Split(sc.Text(), "\t")
-		if len(fields) >= 6 && youTubeAuthCookieNames[strings.TrimSpace(fields[5])] {
-			hasAuth = true
-		}
-	}
-	return total, hasAuth
 }
 
 func firstLine(s string) string {
