@@ -38,11 +38,14 @@ func runRelay(ctx context.Context) error {
 	os.Setenv("TZ", "UTC")
 	time.Local = time.UTC
 
-	// Point the shared capture path at the bundled binaries. YT_DLP_COOKIES_FROM_BROWSER
-	// is deliberately NOT set here: the probe toggles it, enabling Chrome cookies only
-	// when they are usable and resolving without cookies otherwise.
+	// Point the shared capture path at the bundled binaries. The cookie source is set
+	// by the probe (applyCookieEnv) once the startup probe decides whether the exported
+	// cookie FILE resolves; both cookie env vars are cleared here so a stale value from
+	// the environment can never leak in. --cookies-from-browser is never used in this
+	// headless path (no Keychain grant).
 	os.Setenv("YT_DLP_BIN", ytdlp)
 	os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
+	os.Unsetenv("YT_DLP_COOKIES_FILE")
 	os.Setenv("FFMPEG_BIN", filepath.Join(bd, "ffmpeg"))
 	prependPath(bd) // ffprobe is resolved from PATH by the capture path
 

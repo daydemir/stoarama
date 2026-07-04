@@ -47,6 +47,18 @@ func binDir() (string, error) {
 	return filepath.Join(h, "bin"), nil
 }
 
+// cookiesFilePath is the Netscape-format cookie jar the GUI-session `link-youtube`
+// export writes (0600) and the background run loop reads with `yt-dlp --cookies`.
+// It is the ONLY sanctioned YouTube cookie source in the headless service path: a
+// file needs no macOS Keychain grant, unlike `--cookies-from-browser chrome`.
+func cookiesFilePath() (string, error) {
+	h, err := stoaramaHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(h, "cookies.txt"), nil
+}
+
 func loadConfig() (relayConfig, error) {
 	var cfg relayConfig
 	p, err := configPath()

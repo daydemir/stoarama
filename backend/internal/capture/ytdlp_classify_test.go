@@ -13,7 +13,12 @@ func TestClassifyYTDLPOutput(t *testing.T) {
 		{"members only", "ERROR: [youtube] xyz: Join this channel to get access to members-only content", YTDLPClassSignInRequired},
 		{"cookie db locked chrome running", "ERROR: Could not copy Chrome cookie database. See https://... Chrome is running", YTDLPClassChromeCookieDBLocked},
 		{"cookie db sqlite locked", "ERROR: database is locked", YTDLPClassChromeCookieDBLocked},
-		{"keychain denied", "ERROR: Failed to decrypt with DPAPI... could not access Safe Storage in Keychain", YTDLPClassChromeCookieDBLocked},
+		{"keychain safe storage no key", "WARNING: Failed to decrypt cookie: cannot decrypt v10 cookies: no key found", YTDLPClassCookiesUnavailable},
+		// The proven macOS background/headless failure: reached the cookie store but the
+		// Safe Storage key is not granted, so zero cookies decrypt. yt-dlp then silently
+		// falls back to a cookie-less request that trips a bot check in the SAME output;
+		// cookies_unavailable must win over that resolver_outdated bot-check line.
+		{"extracted 0 cookies could not be decrypted", "WARNING: [Cookies] Extracted 0 cookies from chrome (530 could not be decrypted)\nERROR: [youtube] xyz: Sign in to confirm you're not a bot.", YTDLPClassCookiesUnavailable},
 		{"bot check is resolver not signin", "ERROR: [youtube] xyz: Sign in to confirm you're not a bot. This helps protect our community.", YTDLPClassResolverOutdated},
 		{"nsig extraction outdated", "WARNING: [youtube] Some formats may be missing; nsig extraction failed: Some players", YTDLPClassResolverOutdated},
 		{"unable to extract player", "ERROR: [youtube] xyz: Unable to extract yt initial data; please report this issue", YTDLPClassResolverOutdated},

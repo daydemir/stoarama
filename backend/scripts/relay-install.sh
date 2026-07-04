@@ -176,6 +176,15 @@ else
 fi
 
 echo ""
-echo "NOTE: Chrome will ask to allow cookie access the first time this runs."
-echo "When prompted, click \"Always Allow\" so Stoarama can read your YouTube login."
+# Interactive YouTube cookie export. This runs in the user's GUI Terminal session,
+# which is the ONLY place the macOS "Always Allow" Keychain prompt can appear and be
+# clicked; the background launchd/systemd agent can never decrypt Chrome cookies on
+# its own. Best-effort and non-fatal: link-youtube prints an honest note and exits
+# non-zero if Chrome is absent, the user is not logged into YouTube, or the prompt is
+# declined. Public streams record without any of this, so we never abort the install.
+# link-youtube's own 120s timeout bounds the wait on the Keychain prompt.
+echo "Setting up YouTube access (optional, for private/members streams)..."
+"${BIN_DIR}/stoarama-relay" link-youtube || true
+
+echo ""
 echo "Done. This computer will appear in the Stoarama relay computers panel shortly."

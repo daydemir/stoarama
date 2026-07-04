@@ -17,6 +17,15 @@ const (
 	// running / the SQLite cookie DB is busy / Keychain access was denied or timed
 	// out. This is NOT a login problem and must never present as sign-in required.
 	YTDLPClassChromeCookieDBLocked YTDLPClass = "chrome_cookie_db_locked"
+	// YTDLPClassCookiesUnavailable is a cookie-decrypt / keychain-grant failure: the
+	// Chrome "Safe Storage" key is not available to this process, so yt-dlp extracts
+	// zero usable cookies ("Extracted 0 cookies ... could not be decrypted"). On macOS
+	// the decrypt key is bound to the interactive GUI login session with a one-time
+	// "Always Allow" Keychain grant, so a background/headless process can never read
+	// it. The fix is to export cookies to a file from the GUI session (link-youtube),
+	// NOT a re-login and NOT a resolver self-update. Also used to report that no linked
+	// cookie file exists yet.
+	YTDLPClassCookiesUnavailable YTDLPClass = "cookies_unavailable"
 	// YTDLPClassResolverOutdated is a stale-extractor failure (bot check, nsig /
 	// player extraction breakage): the fix is a relay/yt-dlp self-update, not a
 	// re-login.
@@ -26,15 +35,18 @@ const (
 )
 
 // ClassifyYTDLPOutput maps yt-dlp's combined stdout+stderr for a FAILED resolve
-// into a diagnostic class. Precedence is deliberate: a locked/inaccessible Chrome
-// cookie database is checked FIRST so a transient cookie-DB lock (Chrome running,
-// SQLite busy, Keychain denied) never presents as "log into YouTube"; a stale
-// extractor / bot check is checked before the sign-in bucket so it is not mistaken
-// for a real login prompt. Callers classify only non-success output; a successful
-// resolve is YTDLPClassOK by construction.
+// into a diagnostic class. Precedence is deliberate: a cookie-decrypt / keychain
+// failure is checked FIRST, then a locked/inaccessible Chrome cookie database, so a
+// cookie-source problem (which yt-dlp masks by falling back to a cookie-less request
+// that then trips a bot check) never presents as "resolver outdated" or "log into
+// YouTube"; a stale extractor / bot check is checked before the sign-in bucket so it
+// is not mistaken for a real login prompt. Callers classify only non-success output;
+// a successful resolve is YTDLPClassOK by construction.
 func ClassifyYTDLPOutput(output string) YTDLPClass {
 	s := strings.ToLower(output)
 	switch {
+	case containsAny(s, cookiesUnavailableSignals):
+		return YTDLPClassCookiesUnavailable
 	case containsAny(s, cookieDBLockSignals):
 		return YTDLPClassChromeCookieDBLocked
 	case containsAny(s, resolverOutdatedSignals):
@@ -54,11 +66,21 @@ func IsYouTubeSignInError(errText string) bool {
 }
 
 var (
+	// cookiesUnavailableSignals identify a cookie-decrypt / keychain-grant failure:
+	// yt-dlp reached the cookie store but could not decrypt it, yielding zero usable
+	// cookies. On macOS this is the headless/background case where the Chrome Safe
+	// Storage key is not granted to this process. The fix is a file export from the
+	// GUI session (link-youtube), not a re-login or a self-update.
+	cookiesUnavailableSignals = []string{
+		"could not be decrypted",
+		"extracted 0 cookies",
+		"failed to decrypt",
+		"no key found",
+	}
 	cookieDBLockSignals = []string{
 		"could not copy",
 		"database is locked",
 		"unable to open database file",
-		"failed to decrypt",
 		"chrome is running",
 		"safe storage",
 		"keychain",

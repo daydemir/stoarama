@@ -48,6 +48,10 @@ func main() {
 		if err := uninstall(); err != nil {
 			fatal(err)
 		}
+	case "link-youtube":
+		if err := runLinkYouTube(args); err != nil {
+			fatal(err)
+		}
 	case "self-update":
 		if err := runSelfUpdate(args); err != nil {
 			fatal(err)
@@ -68,6 +72,7 @@ func usage() {
 		"  install-launchd                                       write + load the macOS launchd user agent",
 		"  install-systemd                                       write + enable the systemd user unit",
 		"  uninstall                                             stop the service and remove the unit",
+		"  link-youtube                                          export Chrome YouTube cookies for private/members streams (run in Terminal)",
 		"  self-update [--api-url URL]                           update the relay binary + yt-dlp from latest.json",
 		"  version                                               print the relay version",
 		"",

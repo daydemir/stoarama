@@ -42,14 +42,24 @@ func newProbe(ytdlpBin string) *probe {
 	}
 }
 
-// runOnce runs the cookie probe under a hard timeout. It NEVER blocks past the
-// timeout, so a macOS Keychain / TCC prompt (which would otherwise hang a headless
-// service) is treated as a chrome_cookie_db_locked classification, never a sign-in
-// prompt. The parent ctx still cancels it early on shutdown.
+// runOnce runs the cookie probe under a hard timeout. It NEVER uses
+// --cookies-from-browser: in the background launchd/systemd agent the macOS Chrome
+// Safe Storage key is not granted to this process, so a browser read would extract
+// zero cookies and (worse) hang on a Keychain prompt. Instead it reads the file the
+// GUI-session `link-youtube` export wrote. When no cookie file exists the relay is
+// simply not linked to YouTube; that is reported honestly as cookies_unavailable,
+// not a failure (public lives still resolve cookie-less). The parent ctx cancels it
+// early on shutdown.
 func (p *probe) runOnce(ctx context.Context) {
+	cookiePath, _ := cookiesFilePath()
+	if cookiePath == "" || !fileExists(cookiePath) {
+		p.set(capture.YTDLPClassCookiesUnavailable)
+		return
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	args := []string{"-g", "--no-warnings", "--no-playlist", "--cookies-from-browser", "chrome", probeURL}
+	args := []string{"-g", "--no-warnings", "--no-playlist", "--cookies", cookiePath, probeURL}
 	out, err := exec.CommandContext(cctx, p.ytdlpBin, args...).CombinedOutput()
 
 	var class capture.YTDLPClass
@@ -57,17 +67,27 @@ func (p *probe) runOnce(ctx context.Context) {
 	case err == nil && hasHTTPURL(string(out)):
 		class = capture.YTDLPClassOK
 	case cctx.Err() == context.DeadlineExceeded:
-		// Hung reading the cookie DB / on a Keychain prompt: a lock, never sign-in.
-		class = capture.YTDLPClassChromeCookieDBLocked
+		// A --cookies FILE read never prompts Keychain, so a timeout here is a slow
+		// resolve/network stall, not a cookie problem.
+		class = capture.YTDLPClassOther
 	default:
 		class = capture.ClassifyYTDLPOutput(string(out))
 	}
 
+	p.set(class)
+}
+
+func (p *probe) set(class capture.YTDLPClass) {
 	p.mu.Lock()
 	p.class = class
 	p.lastRun = time.Now()
 	p.ranOnce = true
 	p.mu.Unlock()
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func (p *probe) ok() bool {
@@ -106,23 +126,26 @@ func (p *probe) ytdlpVersion() string {
 	return p.ytdlpVer
 }
 
-// applyCookieEnv sets the cookie source the shared capture/resolve.go reads: use
-// Chrome cookies only when the startup probe says they are usable; otherwise resolve
-// without cookies (a residential IP resolves public lives fine) rather than failing.
+// applyCookieEnv sets the cookie source the shared capture/resolve.go reads: point
+// yt-dlp at the exported cookie FILE only when the startup probe resolved with it;
+// otherwise resolve without cookies (a residential IP resolves public lives fine)
+// rather than failing. It never sets YT_DLP_COOKIES_FROM_BROWSER: the background
+// agent has no Keychain grant, so a browser read is guaranteed to fail.
 //
 // SANCTIONED-EXCEPTION (pending owner confirmation, DECISIONS 2026-07-04 §P2.3): the
 // cookie-less fallback deliberately relaxes Deniz's no-fallbacks rule, justified
-// because Chrome-running (a locked cookie DB) is the common case on user machines and
-// public YouTube lives resolve fine cookie-less from residential IPs. The fallback
-// fires ONLY when the probe classifies cookies as unusable, and it is visible via the
-// yt_cookies_ok/yt_cookie_error heartbeat capabilities. This is called exactly ONCE at
-// startup (runRelay); the mode never changes mid-flight, only across a restart, so
-// there is no os.Setenv race with an in-flight capture.
+// because most relays never link YouTube cookies and public lives resolve fine
+// cookie-less from residential IPs. The fallback fires ONLY when the probe classifies
+// cookies as unusable, and it is visible via the yt_cookies_ok/yt_cookie_error
+// heartbeat capabilities. This is called exactly ONCE at startup (runRelay); the mode
+// never changes mid-flight, only across a restart, so there is no os.Setenv race with
+// an in-flight capture.
 func (p *probe) applyCookieEnv() {
-	if p.ok() {
-		os.Setenv("YT_DLP_COOKIES_FROM_BROWSER", "chrome")
+	cookiePath, _ := cookiesFilePath()
+	if p.ok() && cookiePath != "" {
+		os.Setenv("YT_DLP_COOKIES_FILE", cookiePath)
 	} else {
-		os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
+		os.Unsetenv("YT_DLP_COOKIES_FILE")
 	}
 }
 
