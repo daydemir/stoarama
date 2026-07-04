@@ -131,7 +131,7 @@
     }
     .price-table td.option { color: var(--text); white-space: nowrap; }
     .price-table td.rate { font-family: var(--mono); color: var(--accent); white-space: nowrap; }
-    .price-table td.rate .subnote { display: block; margin-top: 4px; font-family: var(--sans); font-size: 12px; color: var(--muted); white-space: normal; }
+    .price-table td.rate .subnote, .rate-line .subnote { display: block; margin-top: 4px; font-family: var(--sans); font-size: 12px; color: var(--muted); white-space: normal; }
     .price-table td.note { color: var(--muted); }
     .price-table tr:last-child td { border-bottom: none; }
     .nas-note {
@@ -186,6 +186,7 @@
         <div class="rate-line">
           <span class="rate">$0.05 per recording-hour</span>
           Each clock-hour a stream saves at least one clip. An hour with nothing saved is free.
+          <span class="subnote">The same $0.05 rate applies whether a stream is captured by our servers or relayed through your own computer.</span>
         </div>
       </section>
 
@@ -280,6 +281,14 @@
           <div>
             <h3>How do I get the yearly rate?</h3>
             <p>Email us to prepay a year of storage at $0.05 per hour of footage, per month. Clips kept 12 months.</p>
+          </div>
+          <div>
+            <h3>Can I record YouTube streams?</h3>
+            <p>Yes. YouTube blocks capture from datacenter servers, so recording runs through a small relay app installed on your own computer. It uses your YouTube login in Chrome to resolve the stream. Cookies never leave your machine. Set up a relay under <a href="/account/settings">Your computers</a> in organization settings.</p>
+          </div>
+          <div>
+            <h3>Does recording via my computer cost more?</h3>
+            <p>No. <b>Rate:</b> $0.05 per recording-hour, the same as cloud capture.</p>
           </div>
         </div>
       </section>
