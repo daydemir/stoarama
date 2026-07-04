@@ -364,7 +364,7 @@
         `<div class="bill-amount">${amount}</div>`;
       const schedCents = Number(b.projected_recording_amount_cents || 0);
       const recDetail = `<b>${hours}</b> recording-hour${hours === 1 ? '' : 's'} × <b>${usd(hourRate)}</b>`;
-      const rows = [item('Recording', recDetail, freeOr(usd(hourCents), hourCents))];
+      const rows = [item('Recorded', recDetail, freeOr(usd(hourCents), hourCents))];
       // Scheduled row: upcoming recording-hours projected to period end. Only shown
       // when is_projection is true and there are upcoming hours. Amount comes from
       // projected_recording_amount_cents directly so Recording + Scheduled + Storage
