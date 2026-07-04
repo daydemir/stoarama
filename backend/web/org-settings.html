@@ -767,11 +767,37 @@
       return `<span class="sub">YouTube check pending</span>`;
     }
 
+    // Short "X ago" magnitude from a server-computed seconds-since value, so the label
+    // is honest about staleness without trusting the browser clock.
+    function relSince(seconds) {
+      const s = Math.max(0, Math.floor(Number(seconds)));
+      if (s < 60) return `${s}s`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m} min`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}h`;
+      return `${Math.floor(h / 24)}d`;
+    }
+
+    // Tri-state liveness for a relay computer, driven by the server's healthy flag
+    // (heartbeat within 120s) and seconds_since_heartbeat. GREEN Connected only when
+    // healthy; AMBER "Last seen X ago" when it has heartbeat but gone stale; RED "Never
+    // connected" when it has never checked in. Never blindly green.
+    function relayLiveness(n) {
+      if (n.healthy === true) return { color: '#22c55e', label: 'Connected' };
+      const secs = Number(n.seconds_since_heartbeat);
+      if (n.last_heartbeat_at && Number.isFinite(secs)) {
+        return { color: '#f59e0b', label: `Last seen ${relSince(secs)} ago` };
+      }
+      return { color: '#ef4444', label: 'Never connected' };
+    }
+
     function relayRowHTML(n) {
       const id = Number(n.id);
       const name = String(n.display_name || 'Computer');
-      const healthy = n.healthy === true;
-      const health = healthy ? 'healthy' : 'never';
+      const live = relayLiveness(n);
+      const dot = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${live.color};margin-right:8px;"></span>`;
+      const label = `<b style="color:${live.color};">${live.label}</b>`;
       const cap = (n.capabilities_json && typeof n.capabilities_json === 'object') ? n.capabilities_json : {};
       const platform = relayPlatformLabel(n.platform);
       const active = Number(cap.active_jobs || 0);
@@ -779,7 +805,7 @@
       const streamsLine = `${active} of ${max} stream${max === 1 ? '' : 's'}`;
       return `<div class="rec-row kv-row">
         <div style="min-width:0;">
-          <div>${connStatusDot(health)}${connStatusLabel(health)} <span class="mono" style="white-space:nowrap;">${escapeHTML(name)}</span></div>
+          <div>${dot}${label} <span class="mono" style="white-space:nowrap;">${escapeHTML(name)}</span></div>
           <div class="sub">${escapeHTML(platform)} &middot; ${streamsLine} &middot; ${relayYTBadge(cap)}</div>
         </div>
         <div style="display:flex;gap:8px;flex-shrink:0;">

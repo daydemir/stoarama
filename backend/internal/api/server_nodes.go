@@ -896,22 +896,30 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 	// threshold the relay lease gate uses, so the fleet UX (green/red dot) never
 	// depends on client clock skew.
 	healthy := lastHeartbeatAt != nil && time.Since(*lastHeartbeatAt) < 120*time.Second
+	// seconds_since_heartbeat is the server-computed age of the last heartbeat, so the
+	// UI can render an honest "last seen X ago" label without trusting the client clock.
+	// Null when the node has never heartbeat.
+	var secondsSinceHeartbeat any
+	if lastHeartbeatAt != nil {
+		secondsSinceHeartbeat = int64(time.Since(*lastHeartbeatAt).Seconds())
+	}
 	return map[string]any{
-		"id":                id,
-		"account_id":        accountID,
-		"node_type":         nodeType,
-		"display_name":      displayName,
-		"hostname":          hostname,
-		"platform":          platform,
-		"status":            status,
-		"enrolled_at":       enrolledAt,
-		"last_heartbeat_at": lastHeartbeatAt,
-		"healthy":           healthy,
-		"relay_max_streams": relayMaxStreams,
-		"capabilities_json": nonNilMap(capabilities),
-		"metadata_json":     nonNilMap(metadata),
-		"created_at":        createdAt.UTC(),
-		"updated_at":        updatedAt.UTC(),
+		"id":                      id,
+		"account_id":              accountID,
+		"node_type":               nodeType,
+		"display_name":            displayName,
+		"hostname":                hostname,
+		"platform":                platform,
+		"status":                  status,
+		"enrolled_at":             enrolledAt,
+		"last_heartbeat_at":       lastHeartbeatAt,
+		"seconds_since_heartbeat": secondsSinceHeartbeat,
+		"healthy":                 healthy,
+		"relay_max_streams":       relayMaxStreams,
+		"capabilities_json":       nonNilMap(capabilities),
+		"metadata_json":           nonNilMap(metadata),
+		"created_at":              createdAt.UTC(),
+		"updated_at":              updatedAt.UTC(),
 	}, nil
 }
 

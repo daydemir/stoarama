@@ -2423,6 +2423,109 @@
       return f === 'all' || recordingFilterKey(rec) === f;
     }
 
+    // ---- Relay capture state (honest copy shared by list card + detail) ----
+    // The single source of truth for what a relay recording is actually doing. It
+    // NEVER implies "no computer connected" when has_relay_online is true; instead it
+    // names the real reason no clips are flowing (window not open, between windows,
+    // starting shortly, or leased). Returns null for cloud recordings.
+    function parseHM(v) {
+      const m = /^(\d{1,2}):(\d{2})/.exec(String(v || '').trim());
+      return m ? (+m[1]) * 60 + (+m[2]) : null;
+    }
+
+    // Current wall-clock minutes-since-midnight in an IANA timezone, server-tz-correct
+    // and independent of the browser's own zone. Null if the zone is unusable.
+    function tzNowMinutes(tz) {
+      try {
+        const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit' }).formatToParts(new Date());
+        let h = null, mi = null;
+        for (const p of parts) { if (p.type === 'hour') h = +p.value; if (p.type === 'minute') mi = +p.value; }
+        if (h == null || mi == null) return null;
+        if (h === 24) h = 0;
+        return h * 60 + mi;
+      } catch (_) { return null; }
+    }
+
+    function hmClockLabel(mins, tz) {
+      const h = Math.floor(mins / 60), m = mins % 60;
+      const d = new Date(); d.setHours(h, m, 0, 0);
+      const t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      return `${t} ${tzLabel(tz)}`;
+    }
+
+    function relayClockFromInstant(v, tz) {
+      const d = new Date(v);
+      if (!Number.isFinite(d.getTime())) return null;
+      try {
+        const t = d.toLocaleTimeString([], { timeZone: tz, hour: 'numeric', minute: '2-digit' });
+        return `${t} ${tzLabel(tz)}`;
+      } catch (_) { return fmtInstant(v); }
+    }
+
+    // Where 'now' sits relative to the recording's active capture window, in the
+    // recording's timezone: 'before' (upcoming, with nextLabel), 'open' (should be
+    // capturing now), or 'after' (today's window ended, nextLabel = next start).
+    function relayWindowPhase(rec) {
+      const now = Date.now();
+      const startAt = rec.start_at ? new Date(rec.start_at).getTime() : 0;
+      if (Number.isFinite(startAt) && startAt > now) {
+        return { phase: 'before', nextLabel: relayClockFromInstant(rec.start_at, String(rec.cron_timezone || 'UTC')) };
+      }
+      const tz = String(rec.cron_timezone || 'UTC');
+      if (String(rec.mode || 'sampled') === 'continuous') {
+        const s = parseHM(rec.daily_window_start);
+        const e = parseHM(rec.daily_window_end);
+        const nowMin = tzNowMinutes(tz);
+        if (s != null && e != null && nowMin != null) {
+          if (nowMin < s) return { phase: 'before', nextLabel: hmClockLabel(s, tz) };
+          if (nowMin < e) return { phase: 'open', nextLabel: null };
+          return { phase: 'after', nextLabel: hmClockLabel(s, tz) };
+        }
+      }
+      const nextTxt = fmtInstant(rec.next_fire_at);
+      if (nextTxt) return { phase: 'before', nextLabel: nextTxt };
+      return { phase: 'open', nextLabel: null };
+    }
+
+    // { tone: 'ok'|'wait'|'muted'|'offline', text (HTML), link? } or null for cloud.
+    function relayCaptureState(rec) {
+      if (rec.capture_via !== 'relay') return null;
+      const status = String(rec.status || '');
+      if (rec.relay_node_name) {
+        return { tone: 'ok', text: `Recording via <b>${escapeHTML(String(rec.relay_node_name))}</b>.` };
+      }
+      if (isCompleted(rec) || status === 'completed') {
+        return { tone: 'muted', text: 'Window ended.' };
+      }
+      if (status === 'paused') {
+        return { tone: 'muted', text: 'Paused. Records through a connected computer when resumed.' };
+      }
+      // HARD RULE: only this branch (no computer online) may mention connecting one.
+      if (rec.has_relay_online !== true) {
+        return { tone: 'offline', text: '<b>No computer connected.</b>', link: { href: '/org-settings#relayPanel', text: 'Connect one.' } };
+      }
+      const w = relayWindowPhase(rec);
+      if (w.phase === 'before') {
+        return { tone: 'wait', text: `Starts at <b>${escapeHTML(w.nextLabel || 'the next window')}</b>.` };
+      }
+      if (w.phase === 'after') {
+        return { tone: 'muted', text: w.nextLabel ? `Between windows. Next at <b>${escapeHTML(w.nextLabel)}</b>.` : 'Between windows.' };
+      }
+      return { tone: 'wait', text: 'Starting shortly on <b>your computer</b>.' };
+    }
+
+    // Renders a relay capture-state note. detail=true uses the detail-banner margin.
+    function relayStateHTML(rs, detail) {
+      if (!rs) return '';
+      const mb = detail ? 'margin:0 0 14px;' : 'margin-top:8px;';
+      const link = rs.link ? ` <a class="btn-link" href="${rs.link.href}">${escapeHTML(rs.link.text)}</a>` : '';
+      if (rs.tone === 'offline') {
+        return `<div class="card-blocked" style="${mb}"><span>${rs.text}</span>${link}</div>`;
+      }
+      const color = rs.tone === 'wait' ? 'var(--warn)' : (rs.tone === 'ok' ? 'var(--text)' : 'var(--muted)');
+      return `<div style="${mb}padding:10px 12px;border-radius:10px;border:1px solid var(--border);font-size:13px;color:${color};">${rs.text}${link}</div>`;
+    }
+
     function cardHTML(rec) {
       const id = Number(rec.id);
       const st = statusLine(rec);
@@ -2445,17 +2548,12 @@
         metaParts.push('<span>No clips yet</span>');
       }
 
-      // Relay capture indicator: which computer holds the active lease ("via NAME"),
-      // or amber "needs relay" when a computer is online and free but not yet leasing.
-      // The blocked "No relay online" state (neither) is surfaced below the meta row.
-      if (rec.capture_via === 'relay') {
-        if (rec.relay_node_name) {
-          metaParts.push(`<span class="meta-strong">via ${escapeHTML(String(rec.relay_node_name))}</span>`);
-        } else if (rec.has_relay_online === true) {
-          metaParts.push(`<span style="color:var(--warn);">needs relay</span>`);
-        } else if (status === 'paused') {
-          metaParts.push(`<span style="color:var(--muted);">via your computer</span>`);
-        }
+      // Relay capture indicator (inline): only the clean positive "via NAME" chip when
+      // a computer holds the active lease. Every other relay state (offline, before the
+      // window, between windows, starting) is rendered as an honest note below the meta
+      // row by relayStateHTML, so the card never implies a wrong reason for no clips.
+      if (rec.capture_via === 'relay' && rec.relay_node_name) {
+        metaParts.push(`<span class="meta-strong">via ${escapeHTML(String(rec.relay_node_name))}</span>`);
       }
 
       // Storage label. A nas_pull recording only STAGES in managed storage and its
@@ -2493,11 +2591,11 @@
       if (rec.needs_card === true) {
         blocked = `<div class="card-blocked"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
           + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`;
-      } else if (rec.capture_via === 'relay' && status === 'active' && !rec.relay_node_name && rec.has_relay_online !== true) {
-        // Relay recording with no online computer available: capture is stalled until a
-        // computer comes online (warn-and-miss; misses are never billed).
-        blocked = `<div class="card-blocked"><span><b>No relay online.</b> Turn on a connected computer to resume recording.</span>`
-          + `<a class="btn-link" href="/org-settings#relayPanel">Connect a computer</a></div>`;
+      } else if (rec.capture_via === 'relay') {
+        // Honest relay state: leased ('ok') is already shown as the inline "via NAME"
+        // chip, so only the non-leased states render a note here.
+        const rs = relayCaptureState(rec);
+        if (rs && rs.tone !== 'ok') blocked = relayStateHTML(rs, false);
       }
 
       // Linked to a catalog stream: title = stream name, subtitle = location.
@@ -3079,23 +3177,11 @@
         ? `<div class="card-blocked" style="margin:0 0 14px;"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
           + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`
         : '';
+      // Same honest relay state as the list card, rendered as the detail banner. Never
+      // says "waiting for a connected computer" when a computer is in fact connected.
       let relayBanner = '';
       if (rec.capture_via === 'relay' && rec.needs_card !== true) {
-        const rStatus = String(rec.status || '');
-        if (rStatus === 'active') {
-          if (rec.relay_node_name) {
-            relayBanner = `<div style="margin:0 0 14px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);font-size:13px;">Recording via <b>${escapeHTML(String(rec.relay_node_name))}</b>.</div>`;
-          } else if (rec.has_relay_online === true) {
-            relayBanner = `<div class="card-blocked" style="margin:0 0 14px;"><span><b>Waiting</b> for a connected computer to pick this up.</span></div>`;
-          } else {
-            relayBanner = `<div class="card-blocked" style="margin:0 0 14px;"><span><b>No relay online.</b> Turn on a connected computer to resume recording.</span>`
-              + `<a class="btn-link" href="/org-settings#relayPanel">Connect a computer</a></div>`;
-          }
-        } else if (rStatus === 'paused') {
-          const connectLink = rec.has_relay_online !== true
-            ? ` <a class="btn-link secondary" href="/org-settings#relayPanel" style="font-size:13px;min-height:0;padding:3px 10px;">Connect a computer</a>` : '';
-          relayBanner = `<div style="margin:0 0 14px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);font-size:13px;color:var(--muted);">Records through a connected computer.${connectLink}</div>`;
-        }
+        relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
