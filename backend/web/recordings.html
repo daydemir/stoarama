@@ -2453,6 +2453,8 @@
           metaParts.push(`<span class="meta-strong">via ${escapeHTML(String(rec.relay_node_name))}</span>`);
         } else if (rec.has_relay_online === true) {
           metaParts.push(`<span style="color:var(--warn);">needs relay</span>`);
+        } else if (status === 'paused') {
+          metaParts.push(`<span style="color:var(--muted);">via your computer</span>`);
         }
       }
 
@@ -3077,7 +3079,25 @@
         ? `<div class="card-blocked" style="margin:0 0 14px;"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
           + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`
         : '';
-      root.innerHTML = header + blocked + recActionsCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
+      let relayBanner = '';
+      if (rec.capture_via === 'relay' && rec.needs_card !== true) {
+        const rStatus = String(rec.status || '');
+        if (rStatus === 'active') {
+          if (rec.relay_node_name) {
+            relayBanner = `<div style="margin:0 0 14px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);font-size:13px;">Recording via <b>${escapeHTML(String(rec.relay_node_name))}</b>.</div>`;
+          } else if (rec.has_relay_online === true) {
+            relayBanner = `<div class="card-blocked" style="margin:0 0 14px;"><span><b>Waiting</b> for a connected computer to pick this up.</span></div>`;
+          } else {
+            relayBanner = `<div class="card-blocked" style="margin:0 0 14px;"><span><b>No relay online.</b> Turn on a connected computer to resume recording.</span>`
+              + `<a class="btn-link" href="/org-settings#relayPanel">Connect a computer</a></div>`;
+          }
+        } else if (rStatus === 'paused') {
+          const connectLink = rec.has_relay_online !== true
+            ? ` <a class="btn-link secondary" href="/org-settings#relayPanel" style="font-size:13px;min-height:0;padding:3px 10px;">Connect a computer</a>` : '';
+          relayBanner = `<div style="margin:0 0 14px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);font-size:13px;color:var(--muted);">Records through a connected computer.${connectLink}</div>`;
+        }
+      }
+      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
       wireDetailActions(root);
     }
