@@ -189,4 +189,7 @@ r2_put "${latest}" "latest.json" "application/json"
 # installer
 r2_put "${ROOT_DIR}/scripts/relay-install.sh" "install.sh" "text/x-shellscript"
 
+# uninstaller
+r2_put "${ROOT_DIR}/scripts/relay-uninstall.sh" "uninstall.sh" "text/x-shellscript"
+
 echo "Published relay ${RELAY_VERSION} to s3://${R2_BUCKET}/relay-releases/"

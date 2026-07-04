@@ -30,6 +30,12 @@ func (s *Server) handleRelayInstallScript(w http.ResponseWriter, r *http.Request
 	s.streamRelayArtifact(w, r, "install.sh", "text/x-shellscript; charset=utf-8", false)
 }
 
+// handleRelayUninstallScript streams the public relay uninstaller from R2. This is
+// the target of the shown uninstall command: curl -fsSL <api>/relay/uninstall.sh | bash.
+func (s *Server) handleRelayUninstallScript(w http.ResponseWriter, r *http.Request) {
+	s.streamRelayArtifact(w, r, "uninstall.sh", "text/x-shellscript; charset=utf-8", false)
+}
+
 // handleRelayDownload streams a named relay artifact (binary tarball, pinned
 // dependency, or latest.json) from R2 by exact name.
 func (s *Server) handleRelayDownload(w http.ResponseWriter, r *http.Request) {

@@ -274,6 +274,18 @@
           <p style="margin:10px 0 0;">Windows support is coming. For now, Mac and Linux only.</p>
         </div>
       </details>
+
+      <details class="collapsible" style="margin-top:16px;">
+        <summary>Remove a computer / uninstall</summary>
+        <div class="sub" style="margin-top:10px; line-height:1.6;">
+          <p style="margin:0 0 10px;">Run this in <b>Terminal</b> (Mac) or a shell (Linux) on that computer. It stops and removes the relay background service and its files (<span class="mono">~/.stoarama</span>).</p>
+          <textarea id="relayUninstallSnippet" readonly rows="2">curl -fsSL https://stoarama.com/relay/uninstall.sh | bash</textarea>
+          <div style="margin-top:10px;">
+            <button id="relayUninstallCopyBtn" class="secondary small" type="button">Copy</button>
+          </div>
+          <p style="margin:10px 0 0;">Also click <b>Remove</b> on the computer's row above to revoke its access here.</p>
+        </div>
+      </details>
     </section>
 
     <div id="orgStatus" class="status"></div>
@@ -322,6 +334,8 @@
     const relayTokenBox = document.getElementById('relayTokenBox');
     const relaySnippet = document.getElementById('relaySnippet');
     const relayCopyBtn = document.getElementById('relayCopyBtn');
+    const relayUninstallSnippet = document.getElementById('relayUninstallSnippet');
+    const relayUninstallCopyBtn = document.getElementById('relayUninstallCopyBtn');
     const relayRefreshBtn = document.getElementById('relayRefreshBtn');
 
     let currentAccount = null;
@@ -863,6 +877,16 @@
         setTimeout(() => { relayCopyBtn.textContent = 'Copy'; }, 1500);
       } catch (_) {
         relaySnippet.select();
+      }
+    });
+
+    relayUninstallCopyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(relayUninstallSnippet.value);
+        relayUninstallCopyBtn.textContent = 'Copied';
+        setTimeout(() => { relayUninstallCopyBtn.textContent = 'Copy'; }, 1500);
+      } catch (_) {
+        relayUninstallSnippet.select();
       }
     });
 
