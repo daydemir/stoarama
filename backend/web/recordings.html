@@ -597,6 +597,7 @@
             <label for="schedTZContinuous">Timezone</label>
             <select id="schedTZContinuous"></select>
           </div>
+          <div id="continuousSummary" class="hint" style="margin-top:6px;"></div>
           <div id="continuousWarn" class="hint warn"></div>
         </div>
 
@@ -875,6 +876,7 @@
       dailyWindowEnd: document.getElementById('dailyWindowEnd'),
       schedTZContinuous: document.getElementById('schedTZContinuous'),
       continuousWarn: document.getElementById('continuousWarn'),
+      continuousSummary: document.getElementById('continuousSummary'),
       scheduleField: document.getElementById('scheduleField'),
       schedSeg: document.getElementById('schedSeg'),
       dailyControls: document.getElementById('dailyControls'),
@@ -1093,14 +1095,62 @@
 
     // ---- Capture mode toggle (sampled clips | continuous gapless) ----
 
-    // continuousWindowValid checks the daily window is well-formed: both times set
-    // and start strictly before end (no midnight crossing in scope). It mirrors the
-    // server's ValidateContinuousWindowForCreate.
+    // continuousWindowValid checks the daily window is well-formed: both times are
+    // set and parseable. Any ordering is accepted, matching the server's
+    // ValidateContinuousWindowForCreate: start < end is a same-day daytime window;
+    // end <= start is an OVERNIGHT window that opens at start and closes at end the
+    // next calendar day (crosses local midnight); end == start is the 24h full-day
+    // window. The only real invariant (clip length 5..900s) is checked separately.
     function continuousWindowValid() {
       const s = String(els.dailyWindowStart.value || '').trim();
       const e = String(els.dailyWindowEnd.value || '').trim();
       if (!s || !e) return false;
-      return s < e;
+      return parseHM(s) != null && parseHM(e) != null;
+    }
+
+    // windowIsOvernight reports whether the daily window [start, end) crosses local
+    // midnight (end <= start), matching recsched.IsOvernightWindow. end == start is
+    // the 24h full-day window, which is overnight (always open).
+    function windowIsOvernight(s, e) {
+      const a = parseHM(s), b = parseHM(e);
+      if (a == null || b == null) return false;
+      return b <= a;
+    }
+
+    // windowDurationMin returns the window length in minutes. Same-day (end > start)
+    // is end - start; overnight (end <= start) wraps midnight, so add 24h; end ==
+    // start yields the full 1440 (24h). Null when either time is unparseable.
+    function windowDurationMin(s, e) {
+      const a = parseHM(s), b = parseHM(e);
+      if (a == null || b == null) return null;
+      let d = b - a;
+      if (d <= 0) d += 1440;
+      return d;
+    }
+
+    // fmtDurationMin renders minutes as "8h", "45m", or "8h 30m".
+    function fmtDurationMin(mins) {
+      const h = Math.floor(mins / 60), m = mins % 60;
+      const hp = h > 0 ? `${h}h` : '', mp = m > 0 ? `${m}m` : '';
+      return (hp && mp) ? `${hp} ${mp}` : (hp || mp || '0m');
+    }
+
+    // windowSummaryText is the live one-line summary of a daily window, e.g.
+    // "Records 22:00 -> 06:00 next day (8h, crosses midnight) in America/New_York".
+    // Empty when either time is unparseable. The "next day" clause and the explicit
+    // "crosses midnight" tag appear only for overnight windows; end == start is the
+    // 24h full-day window and is tagged "full day".
+    function windowSummaryText(s, e, tz) {
+      s = String(s || '').trim(); e = String(e || '').trim();
+      if (parseHM(s) == null || parseHM(e) == null) return '';
+      const mins = windowDurationMin(s, e);
+      const overnight = windowIsOvernight(s, e);
+      const endLabel = overnight ? `${e} next day` : e;
+      let tag = '';
+      if (mins === 1440) tag = ', full day';
+      else if (overnight) tag = ', crosses midnight';
+      const zone = String(tz || '').trim() || browserTimezone();
+      return `Records ${s} -> ${endLabel} (${fmtDurationMin(mins)}${tag}) in ${zone}`;
     }
 
     // setScheduleMode toggles which time controls are visible. In continuous mode
@@ -1121,8 +1171,18 @@
     }
 
     function refreshContinuousWarn() {
-      if (state.composerScheduleMode !== 'continuous') { els.continuousWarn.textContent = ''; return; }
-      els.continuousWarn.textContent = continuousWindowValid() ? '' : 'End time must be after start time.';
+      if (state.composerScheduleMode !== 'continuous') {
+        els.continuousWarn.textContent = '';
+        if (els.continuousSummary) els.continuousSummary.textContent = '';
+        return;
+      }
+      const s = String(els.dailyWindowStart.value || '').trim();
+      const e = String(els.dailyWindowEnd.value || '').trim();
+      const valid = continuousWindowValid();
+      els.continuousWarn.textContent = valid ? '' : 'Enter both a start and end time.';
+      if (els.continuousSummary) {
+        els.continuousSummary.textContent = valid ? windowSummaryText(s, e, selectedTimezone()) : '';
+      }
     }
 
     // Returns { cron, tz } for the current schedule selection. cron is null when
@@ -1408,14 +1468,9 @@
       if (clipSec <= 0) return null;
       if (state.composerScheduleMode === 'continuous') {
         if (!continuousWindowValid()) return null;
-        const s = String(els.dailyWindowStart.value || '');
-        const e = String(els.dailyWindowEnd.value || '');
-        const ms = /^(\d{1,2}):(\d{2})$/.exec(s);
-        const me = /^(\d{1,2}):(\d{2})$/.exec(e);
-        if (!ms || !me) return null;
-        const windowSec = ((+me[1] * 60 + +me[2]) - (+ms[1] * 60 + +ms[2])) * 60;
-        if (windowSec <= 0) return null;
-        return Math.floor(windowSec / clipSec);
+        const mins = windowDurationMin(els.dailyWindowStart.value, els.dailyWindowEnd.value);
+        if (mins == null || mins <= 0) return null;
+        return Math.floor((mins * 60) / clipSec);
       }
       return estRunsPerDay(); // null for custom cron
     }
@@ -1424,17 +1479,11 @@
     // continuous or the schedule cadence for sampled.
     function countWindowPhrase() {
       if (state.composerScheduleMode === 'continuous') {
-        const s = String(els.dailyWindowStart.value || '');
-        const e = String(els.dailyWindowEnd.value || '');
-        const ms = /^(\d{1,2}):(\d{2})$/.exec(s);
-        const me = /^(\d{1,2}):(\d{2})$/.exec(e);
-        if (ms && me) {
-          const mins = (+me[1] * 60 + +me[2]) - (+ms[1] * 60 + +ms[2]);
-          if (mins > 0) {
-            const h = Math.floor(mins / 60); const m = mins % 60;
-            const hp = h > 0 ? `${h}h` : ''; const mp = m > 0 ? `${m}m` : '';
-            return `${hp}${mp} daily window`.trim();
-          }
+        const mins = windowDurationMin(els.dailyWindowStart.value, els.dailyWindowEnd.value);
+        if (mins != null && mins > 0) {
+          const h = Math.floor(mins / 60); const m = mins % 60;
+          const hp = h > 0 ? `${h}h` : ''; const mp = m > 0 ? `${m}m` : '';
+          return `${hp}${mp} daily window`.trim();
         }
         return 'daily window';
       }
@@ -3354,6 +3403,7 @@
             <div><label for="edWinStart">Start</label><input id="edWinStart" type="time" value="${winStart}" /></div>
             <div><label for="edWinEnd">End</label><input id="edWinEnd" type="time" value="${winEnd}" /></div>
           </div>
+          <div id="edWinSummary" class="hint" style="margin-top:6px;"></div>
         </div>
         <div class="field">
           <label for="edTz">Timezone</label>
@@ -3380,6 +3430,18 @@
           form.querySelector('[data-editcron]').style.display = m === 'continuous' ? 'none' : '';
           form.querySelector('[data-editwindow]').style.display = m === 'continuous' ? '' : 'none';
         }));
+      const updateEdWinSummary = () => {
+        const out = form.querySelector('#edWinSummary');
+        if (!out) return;
+        out.textContent = windowSummaryText(
+          form.querySelector('#edWinStart').value,
+          form.querySelector('#edWinEnd').value,
+          form.querySelector('#edTz').value);
+      };
+      form.querySelector('#edWinStart').addEventListener('input', updateEdWinSummary);
+      form.querySelector('#edWinEnd').addEventListener('input', updateEdWinSummary);
+      form.querySelector('#edTz').addEventListener('change', updateEdWinSummary);
+      updateEdWinSummary();
       form.querySelector('button[data-schedsave]').addEventListener('click', () => saveScheduleEdit());
       form.querySelector('button[data-schedcancel]').addEventListener('click', () => openScheduleEdit());
     }
@@ -4040,7 +4102,7 @@
       if (!catalogId && !url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
       if (dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination first.', 'err'); return; }
       if (continuous) {
-        if (!continuousWindowValid()) { setStatus(els.startStatus, 'End time must be after start time.', 'err'); return; }
+        if (!continuousWindowValid()) { setStatus(els.startStatus, 'Enter both a start and end time for the daily window.', 'err'); return; }
       } else {
         if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
         if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
@@ -4448,7 +4510,7 @@
       if (!name) { setStatus(els.startStatus, 'Bundle name is required.', 'err'); return; }
       if (ids.length === 0) { setStatus(els.startStatus, 'Select at least one stream on the streams page.', 'err'); return; }
       if (continuous) {
-        if (!continuousWindowValid()) { setStatus(els.startStatus, 'End time must be after start time.', 'err'); return; }
+        if (!continuousWindowValid()) { setStatus(els.startStatus, 'Enter both a start and end time for the daily window.', 'err'); return; }
       } else {
         if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
         if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }

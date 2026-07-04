@@ -268,6 +268,54 @@ func TestForecastContinuous_NConstantSlots(t *testing.T) {
 	}
 }
 
+// TestExpandContinuous_OvernightOpenNow asserts an OVERNIGHT window (22:00 ->
+// 06:00) that opened yesterday is still counted as a constant slot at 02:00 the
+// next morning: the occurrence opened at 22:00 yesterday must not be missed just
+// because it began on a prior local day.
+func TestExpandContinuous_OvernightOpenNow(t *testing.T) {
+	now := mustTime(t, "2026-07-01T02:00:00Z") // inside [22:00 Jun30, 06:00 Jul1)
+	windowEnd := now.Add(30 * time.Minute)
+	r := forecastRecording{
+		mode:             "continuous",
+		cronTimezone:     "UTC",
+		clipDurationSec:  60,
+		dailyWindowStart: "22:00:00",
+		dailyWindowEnd:   "06:00:00",
+		envStart:         mustTime(t, "2026-06-01T00:00:00Z"),
+	}
+	ivals, first := expandRecording(r, now, windowEnd)
+	if len(ivals) != 1 {
+		t.Fatalf("overnight open-now produced %d intervals, want 1", len(ivals))
+	}
+	if !ivals[0].Start.Equal(now) || !ivals[0].End.Equal(windowEnd) {
+		t.Fatalf("interval=[%s,%s) want [%s,%s)", ivals[0].Start, ivals[0].End, now, windowEnd)
+	}
+	// The occurrence opened at 22:00 the previous local day.
+	if want := mustTime(t, "2026-06-30T22:00:00Z"); !first.Equal(want) {
+		t.Fatalf("first=%s want %s", first, want)
+	}
+}
+
+// TestExpandContinuous_OvernightBeforeOpen asserts that just before the overnight
+// window opens (21:00, window 22:00 -> 06:00) with a short lookahead ending before
+// 22:00, nothing is provisioned yet.
+func TestExpandContinuous_OvernightBeforeOpen(t *testing.T) {
+	now := mustTime(t, "2026-06-30T21:00:00Z")
+	windowEnd := now.Add(30 * time.Minute) // 21:30, before 22:00 open
+	r := forecastRecording{
+		mode:             "continuous",
+		cronTimezone:     "UTC",
+		clipDurationSec:  60,
+		dailyWindowStart: "22:00:00",
+		dailyWindowEnd:   "06:00:00",
+		envStart:         mustTime(t, "2026-06-01T00:00:00Z"),
+	}
+	ivals, _ := expandRecording(r, now, windowEnd)
+	if len(ivals) != 0 {
+		t.Fatalf("pre-open overnight produced %d intervals, want 0", len(ivals))
+	}
+}
+
 // TestExpandContinuous_WindowBeforeNow asserts a continuous recording whose daily
 // window has already closed for the day (and the next opens past the lookahead)
 // contributes ZERO intervals now (correct for the autoscaler: nothing to provision

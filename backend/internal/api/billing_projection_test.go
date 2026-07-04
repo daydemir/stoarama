@@ -151,12 +151,12 @@ func TestProjectRecordingHoursDistinctHoursPerDay(t *testing.T) {
 		expr string
 		want float64
 	}{
-		{"*/15 * * * *", 24},  // every 15 min => 24 distinct hours, NOT 96 fires.
-		{"*/30 * * * *", 24},  // every 30 min => 24 distinct hours, NOT 48 fires.
-		{"0 * * * *", 24},     // hourly.
-		{"0 */4 * * *", 6},    // every 4 hours.
-		{"0 9 * * *", 1},      // daily.
-		{"0,30 9 * * *", 1},   // clustered: 09:00 and 09:30 share one hour bucket.
+		{"*/15 * * * *", 24}, // every 15 min => 24 distinct hours, NOT 96 fires.
+		{"*/30 * * * *", 24}, // every 30 min => 24 distinct hours, NOT 48 fires.
+		{"0 * * * *", 24},    // hourly.
+		{"0 */4 * * *", 6},   // every 4 hours.
+		{"0 9 * * *", 1},     // daily.
+		{"0,30 9 * * *", 1},  // clustered: 09:00 and 09:30 share one hour bucket.
 	}
 	for _, tc := range cases {
 		rec := projectedRecording{
@@ -263,3 +263,116 @@ func TestProjectRecordingHoursDSTSpringForward(t *testing.T) {
 }
 
 func ptr(t time.Time) *time.Time { return &t }
+
+// TestProjectRecordingHoursOvernight checks an OVERNIGHT continuous window
+// (22:00 -> 06:00, crossing local midnight) bills the real 8 distinct UTC hours,
+// not 0 or a negative span. now is set before the occurrence opens so the whole
+// [22:00, 06:00 next day) falls inside the projection span, and winEnd stops
+// before the following night so exactly one occurrence is counted.
+func TestProjectRecordingHoursOvernight(t *testing.T) {
+	now := time.Date(2026, time.June, 30, 12, 0, 0, 0, time.UTC)
+	rec := projectedRecording{
+		Mode:         "continuous",
+		CronTimezone: "UTC",
+		DailyStart:   "22:00:00",
+		DailyEnd:     "06:00:00",
+		StartAt:      now.AddDate(0, 0, -5),
+	}
+	winEnd := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
+	if got := projectRecordingHours(rec, now, winEnd); got != 8 {
+		t.Fatalf("projectRecordingHours(overnight 22-06) = %v, want 8", got)
+	}
+}
+
+// TestProjectRecordingHoursOvernight24h checks the end==start 24h window bills 24
+// distinct hours over one clamped day.
+func TestProjectRecordingHoursOvernight24h(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load loc: %v", err)
+	}
+	// One full local day, clamped by the capture envelope to exactly [00:00, 24:00).
+	start := time.Date(2026, time.June, 15, 0, 0, 0, 0, loc).UTC()
+	end := time.Date(2026, time.June, 16, 0, 0, 0, 0, loc).UTC()
+	rec := projectedRecording{
+		Mode:         "continuous",
+		CronTimezone: "America/New_York",
+		DailyStart:   "00:00:00",
+		DailyEnd:     "00:00:00",
+		StartAt:      start,
+		EndAt:        ptr(end),
+	}
+	now := start.AddDate(0, 0, -1)
+	winEnd := end.AddDate(0, 0, 1)
+	if got := projectRecordingHours(rec, now, winEnd); got != 24 {
+		t.Fatalf("projectRecordingHours(24h window) = %v, want 24", got)
+	}
+}
+
+// TestProjectRecordingHoursOvernightDST checks an overnight 22:00 -> 06:00 window
+// across the 2026 US spring-forward night bills 7 real UTC hours (the skipped
+// local hour is not billed) and across the fall-back night bills 9 (the repeated
+// local hour is a second distinct UTC hour). The capture envelope pins the span to
+// exactly the one occurrence.
+func TestProjectRecordingHoursOvernightDST(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load loc: %v", err)
+	}
+	cases := []struct {
+		name       string
+		openLocal  time.Time
+		closeLocal time.Time
+		wantHrs    float64
+	}{
+		{
+			// Spring forward 2026-03-08 02:00->03:00: 22:00 Mar7 -> 06:00 Mar8 = 7h.
+			name:       "spring forward night",
+			openLocal:  time.Date(2026, time.March, 7, 22, 0, 0, 0, loc),
+			closeLocal: time.Date(2026, time.March, 8, 6, 0, 0, 0, loc),
+			wantHrs:    7,
+		},
+		{
+			// Fall back 2026-11-01 02:00->01:00: 22:00 Oct31 -> 06:00 Nov1 = 9h.
+			name:       "fall back night",
+			openLocal:  time.Date(2026, time.October, 31, 22, 0, 0, 0, loc),
+			closeLocal: time.Date(2026, time.November, 1, 6, 0, 0, 0, loc),
+			wantHrs:    9,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := projectedRecording{
+				Mode:         "continuous",
+				CronTimezone: "America/New_York",
+				DailyStart:   "22:00:00",
+				DailyEnd:     "06:00:00",
+				StartAt:      c.openLocal.UTC(),
+				EndAt:        ptr(c.closeLocal.UTC()),
+			}
+			now := c.openLocal.UTC().AddDate(0, 0, -1)
+			winEnd := c.closeLocal.UTC().AddDate(0, 0, 1)
+			if got := projectRecordingHours(rec, now, winEnd); got != c.wantHrs {
+				t.Fatalf("projectRecordingHours(%s) = %v, want %v", c.name, got, c.wantHrs)
+			}
+		})
+	}
+}
+
+// TestProjectRecordingHoursDaytimeRegression pins the same-day (start < end)
+// path: a 09:00 -> 17:00 window over 5 whole days bills 8 distinct hours/day = 40,
+// unchanged by the overnight support.
+func TestProjectRecordingHoursDaytimeRegression(t *testing.T) {
+	now := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	rec := projectedRecording{
+		Mode:         "continuous",
+		CronTimezone: "UTC",
+		DailyStart:   "09:00:00",
+		DailyEnd:     "17:00:00",
+		StartAt:      now.AddDate(0, 0, -2),
+	}
+	winEnd := now.AddDate(0, 0, 5)
+	if got := projectRecordingHours(rec, now, winEnd); got != 40 {
+		t.Fatalf("projectRecordingHours(daytime 09-17, 5d) = %v, want 40", got)
+	}
+}

@@ -245,14 +245,29 @@ func expandContinuousRecording(r forecastRecording, now, windowEnd time.Time) ([
 	}
 	out := make([]jobInterval, 0, 4)
 	var first time.Time
-	// Walk each local day from now's day to windowEnd's day (lookahead is short, so
-	// this is at most a couple of iterations; cap defends against bad data).
-	const maxDays = 9
+	// An overnight window (end <= start) opens at start on one local day and closes
+	// at end the NEXT local day. Such an occurrence may have opened yesterday and
+	// still be open now, so start the walk one day earlier for overnight; same-day
+	// windows walk from now's day exactly as before (byte-identical).
+	overnight := recsched.IsOvernightWindow(start, end)
+	// Walk each local day (lookahead is short, so this is at most a couple of
+	// iterations; cap defends against bad data).
+	const maxDays = 10
 	day := now.In(loc)
+	if overnight {
+		day = day.AddDate(0, 0, -1)
+	}
 	for i := 0; i < maxDays; i++ {
 		y, mo, d := day.Date()
 		openUTC := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc).UTC()
-		closeUTC := time.Date(y, mo, d, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		var closeUTC time.Time
+		if overnight {
+			cd := time.Date(y, mo, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
+			cy, cmo, cdd := cd.Date()
+			closeUTC = time.Date(cy, cmo, cdd, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		} else {
+			closeUTC = time.Date(y, mo, d, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		}
 		if openUTC.After(windowEnd) {
 			break
 		}

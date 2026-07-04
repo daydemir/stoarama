@@ -133,16 +133,30 @@ func continuousRecordHours(rec projectedRecording, projStart, projEnd time.Time)
 		return 0
 	}
 	buckets := make(map[int64]struct{})
+	// An overnight window (end <= start) opens at start on one local day and closes
+	// at end the NEXT local day (end == start is the 24h window); its occurrence can
+	// begin the day before projStart's local day yet overlap the span, so start one
+	// day earlier for overnight. Same-day windows iterate from projStart's date
+	// exactly as before.
+	overnight := recsched.IsOvernightWindow(start, end)
 	y, mo, d := projStart.In(loc).Date()
-	// Windows never cross local midnight (enforced at create), so a window on an
-	// earlier local day closes before projStart's local day; iterating local days
-	// from projStart's date onward captures every occurrence in the span.
+	if overnight {
+		pd := time.Date(y, mo, d, 0, 0, 0, 0, loc).AddDate(0, 0, -1)
+		y, mo, d = pd.Date()
+	}
 	for i := 0; i < projectionMaxDays+2; i++ {
 		openUTC := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc).UTC()
 		if !openUTC.Before(projEnd) {
 			break
 		}
-		closeUTC := time.Date(y, mo, d, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		var closeUTC time.Time
+		if overnight {
+			cd := time.Date(y, mo, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
+			cy, cmo, cdd := cd.Date()
+			closeUTC = time.Date(cy, cmo, cdd, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		} else {
+			closeUTC = time.Date(y, mo, d, end.Hour, end.Minute, end.Second, 0, loc).UTC()
+		}
 		segStart := maxTime(openUTC, projStart)
 		segEnd := minTime(closeUTC, projEnd)
 		for b := segStart.Truncate(time.Hour); b.Before(segEnd); b = b.Add(time.Hour) {
