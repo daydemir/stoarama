@@ -497,6 +497,50 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// nodeEnrollAction is the decision for how an enrollment maps onto the nodes table
+// given the existing rows in the same account that share lower(display_name).
+type nodeEnrollAction int
+
+const (
+	// nodeEnrollInsert: no matching non-disabled row, no disabled row of the same
+	// node_type -> insert a genuinely new node row.
+	nodeEnrollInsert nodeEnrollAction = iota
+	// nodeEnrollReactivate: a disabled row in the same account with the same
+	// lower(display_name) AND the same node_type exists -> reactivate that row.
+	nodeEnrollReactivate
+	// nodeEnrollConflict: an active (non-disabled) row already holds this name in the
+	// account -> a real conflict, reject.
+	nodeEnrollConflict
+)
+
+// nodeNameMatch is one existing node row in the enrolling account whose
+// lower(display_name) equals the requested name. account_id scoping is applied by the
+// caller's query, so every match here is already tenant-local.
+type nodeNameMatch struct {
+	ID       int64
+	NodeType string
+	Status   string
+}
+
+// decideNodeEnroll picks the enrollment action for a requested node_type against the
+// existing same-account, same-lower(name) rows. An active row (any type) holding the
+// name is a hard conflict; otherwise a disabled row of the same node_type is reactivated;
+// otherwise a new row is inserted. Droplet enrollment does not use this path (dropletpool
+// inserts nodes directly), so operator-assigned droplet names are unaffected.
+func decideNodeEnroll(matches []nodeNameMatch, nodeType string) (nodeEnrollAction, int64) {
+	for _, m := range matches {
+		if m.Status != "disabled" {
+			return nodeEnrollConflict, 0
+		}
+	}
+	for _, m := range matches {
+		if m.Status == "disabled" && m.NodeType == nodeType {
+			return nodeEnrollReactivate, m.ID
+		}
+	}
+	return nodeEnrollInsert, 0
+}
+
 type nodeEnrollRequest struct {
 	Token            string         `json:"token"`
 	NodeType         string         `json:"node_type"`
@@ -588,17 +632,71 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var nodeID int64
-	err = tx.QueryRow(r.Context(), `
-		INSERT INTO nodes (
-			account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb
-		)
-		VALUES ($1, $2, $3, $4, $5, 'active', now(), now(), $6::jsonb, $7::jsonb)
-		RETURNING id
-	`, accountID, nodeType, displayName, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes)).Scan(&nodeID)
+	// Removing a computer disables its node row (status='disabled') but keeps it. With the
+	// partial unique index (0080) a disabled row no longer reserves its name, so re-enrolling
+	// the same name must reactivate that disabled row rather than insert a duplicate. Scope
+	// strictly to this account + lower(display_name); FOR UPDATE serializes concurrent enrolls.
+	matchRows, err := tx.Query(r.Context(), `
+		SELECT id, node_type, status
+		FROM nodes
+		WHERE account_id=$1 AND lower(display_name)=lower($2)
+		FOR UPDATE
+	`, accountID, displayName)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create node: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lookup existing node: %v", err))
 		return
+	}
+	var matches []nodeNameMatch
+	for matchRows.Next() {
+		var m nodeNameMatch
+		if err := matchRows.Scan(&m.ID, &m.NodeType, &m.Status); err != nil {
+			matchRows.Close()
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan existing node: %v", err))
+			return
+		}
+		matches = append(matches, m)
+	}
+	matchRows.Close()
+	if err := matchRows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate existing node: %v", err))
+		return
+	}
+
+	action, reactivateID := decideNodeEnroll(matches, nodeType)
+	var nodeID int64
+	switch action {
+	case nodeEnrollConflict:
+		util.WriteError(w, http.StatusConflict, "a node with this name is already active")
+		return
+	case nodeEnrollReactivate:
+		nodeID = reactivateID
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE nodes
+			SET status='active',
+			    hostname=$2,
+			    platform=$3,
+			    capabilities_jsonb=$4::jsonb,
+			    metadata_jsonb=$5::jsonb,
+			    enrolled_at=now(),
+			    last_heartbeat_at=now(),
+			    updated_at=now()
+			WHERE id=$1
+		`, nodeID, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes)); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reactivate node: %v", err))
+			return
+		}
+	default:
+		err = tx.QueryRow(r.Context(), `
+			INSERT INTO nodes (
+				account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb
+			)
+			VALUES ($1, $2, $3, $4, $5, 'active', now(), now(), $6::jsonb, $7::jsonb)
+			RETURNING id
+		`, accountID, nodeType, displayName, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes)).Scan(&nodeID)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create node: %v", err))
+			return
+		}
 	}
 
 	if _, err := tx.Exec(r.Context(), `
@@ -640,6 +738,7 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 		"node_token_prefix":       nodeTokenPrefix,
 		"enrollment_token_id":     enrollmentID,
 		"enrollment_token_prefix": rawToken[:minInt(len(rawToken), 16)],
+		"reactivated":             action == nodeEnrollReactivate,
 	}); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert node enroll event: %v", err))
 		return
