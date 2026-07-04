@@ -818,8 +818,7 @@
           body: JSON.stringify({ node_type: 'relay', label }),
         });
         showRelayToken(data.install_command);
-        relayLabel.value = '';
-        setStatus(relayStatus, 'Run the command below on your computer. The token is shown once.', 'ok');
+        setStatus(relayStatus, 'Command for "' + label + '" generated. Run it on your computer. The token is shown once.', 'ok');
         await loadRelays();
       } catch (err) {
         setStatus(relayStatus, String(err.message || err), 'err');
