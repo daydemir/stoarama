@@ -244,28 +244,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 
 	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID)
 
-	// Resolve + SSRF-check ONCE for the whole window (identical to processJob).
-	resolveCtx, resolveCancel := context.WithTimeout(jobCtx, 30*time.Second)
-	sourceURL, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", job.SourceURL, "")
-	resolveCancel()
-	if err != nil {
-		w.fail(ctx, job.JobID, fmt.Errorf("resolve source url: %w", err))
-		return
-	}
-	if isImage {
-		w.fail(ctx, job.JobID, fmt.Errorf("image sources are not supported by the recorder"))
-		return
-	}
-	if _, err := netguard.ValidatePublicURL(sourceURL); err != nil {
-		w.fail(ctx, job.JobID, fmt.Errorf("ssrf guard rejected source url: %w", err))
-		return
-	}
-
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 
 	// Bound ffmpeg to the window close. The heartbeat/cancel path (window auto-stop
 	// at end_at) also cancels jobCtx, which CaptureContinuous treats as a clean
-	// shutdown (SIGINT + final sweep).
+	// shutdown (SIGINT + final sweep). Created ONCE for the whole window (a nil/zero
+	// WindowEndAt leaves windowCtx == jobCtx, so the job only ends on cancel).
 	windowCtx := jobCtx
 	if job.WindowEndAt != nil && !job.WindowEndAt.IsZero() {
 		var windowCancel context.CancelFunc
@@ -273,13 +257,9 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		defer windowCancel()
 	}
 
-	outDir, err := os.MkdirTemp("", "capture-continuous-*")
-	if err != nil {
-		w.fail(ctx, job.JobID, fmt.Errorf("mktemp continuous outdir: %w", err))
-		return
-	}
-	defer os.RemoveAll(outDir)
-
+	// sourceURL is re-resolved every supervisor attempt; onSegment records the URL
+	// that produced the segment it is ingesting.
+	var sourceURL string
 	onSegment := func(seg capture.Segment) error {
 		if canceled() {
 			return nil
@@ -322,13 +302,82 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		return nil
 	}
 
-	err = capture.CaptureContinuous(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment)
+	// Supervisor loop: a live source can drop mid-window (an HLS end-of-stream
+	// makes the persistent ffmpeg exit CLEANLY with hours left in the window). The
+	// scheduler cannot re-enqueue (idempotency key is per window open), so we
+	// resolve + capture in a loop and reconnect until the window closes. In-window
+	// restarts must NOT consume attempt_count, so fail() is never called for a
+	// resolve/capture drop here; the job only fails on a permanent misconfiguration.
+	const reconnectDelay = 30 * time.Second
+	backoff := func() {
+		select {
+		case <-windowCtx.Done():
+		case <-time.After(reconnectDelay):
+		}
+	}
+	for attempt := 1; ; attempt++ {
+		if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+			break
+		}
+
+		// Re-resolve EVERY attempt so an expiring token (the KBS Wowza m3u8 token
+		// rolls every 24h) is refreshed on reconnect. A transient resolve error backs
+		// off and retries rather than failing the job mid-window.
+		resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
+		resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", job.SourceURL, "")
+		resolveCancel()
+		if err != nil {
+			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+				break
+			}
+			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
+				job.JobID, job.RecordingID, attempt, err, reconnectDelay)
+			backoff()
+			continue
+		}
+		if isImage {
+			w.fail(ctx, job.JobID, fmt.Errorf("image sources are not supported by the recorder"))
+			return
+		}
+		// S-1: re-check the resolved URL right before ffmpeg (DNS-rebinding gate),
+		// same call and same transient treatment as a resolve error.
+		if _, err := netguard.ValidatePublicURL(resolved); err != nil {
+			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+				break
+			}
+			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
+				job.JobID, job.RecordingID, attempt, err, reconnectDelay)
+			backoff()
+			continue
+		}
+		sourceURL = resolved
+
+		// Fresh outDir per attempt, removed immediately after the attempt returns: a
+		// previous attempt's leftover seg-*.mp4 would otherwise be re-finalized and
+		// re-ingested by the next CaptureContinuous call.
+		outDir, err := os.MkdirTemp("", "capture-continuous-*")
+		if err != nil {
+			w.fail(ctx, job.JobID, fmt.Errorf("mktemp continuous outdir: %w", err))
+			return
+		}
+		captureErr := capture.CaptureContinuous(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment)
+		os.RemoveAll(outDir)
+
+		// Window close vs premature drop: CaptureContinuous returns nil on ctx.Done,
+		// so windowCtx.Err() (NOT captureErr) is what distinguishes a real window
+		// close/cancel from a premature clean ffmpeg exit (HLS end-of-stream).
+		if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+			break
+		}
+		// Premature exit (clean end-of-stream or a hard ffmpeg error) with the window
+		// still open: back off and reconnect.
+		log.Printf("recording worker job=%d recording=%d continuous source dropped (attempt %d): %v; reconnecting in %s",
+			job.JobID, job.RecordingID, attempt, captureErr, reconnectDelay)
+		backoff()
+	}
+
 	if canceled() {
 		log.Printf("recording worker job=%d continuous canceled", job.JobID)
-		return
-	}
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		w.fail(ctx, job.JobID, fmt.Errorf("continuous capture: %w", err))
 		return
 	}
 	if err := w.cfg.Client.CompleteRecordingJob(ctx, job.JobID); err != nil {
@@ -336,6 +385,15 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		return
 	}
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
+}
+
+// continuousShouldStop decides whether the continuous supervisor loop must stop
+// (versus reconnect) after an attempt or a mid-window resolve/SSRF failure. It
+// stops only when the job was canceled (window auto-stop at end_at) or the window
+// context has closed; every other outcome is a mid-window drop that reconnects.
+// It never signals "fail": in-window restarts must not consume attempt_count.
+func continuousShouldStop(canceled, windowClosed bool) bool {
+	return canceled || windowClosed
 }
 
 // isAlreadyIngested reports whether an ingest error is the server's 409 dedup

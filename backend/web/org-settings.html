@@ -362,19 +362,26 @@
         `<div class="bill-label">${label}</div>` +
         `<div class="bill-detail">${detail}</div>` +
         `<div class="bill-amount">${amount}</div>`;
+      const schedCents = Number(b.projected_recording_amount_cents || 0);
       const recDetail = `<b>${hours}</b> recording-hour${hours === 1 ? '' : 's'} × <b>${usd(hourRate)}</b>`;
       const rows = [item('Recording', recDetail, freeOr(usd(hourCents), hourCents))];
+      // Scheduled row: upcoming recording-hours projected to period end. Only shown
+      // when is_projection is true and there are upcoming hours. Amount comes from
+      // projected_recording_amount_cents directly so Recording + Scheduled + Storage
+      // always sums to projected_total_amount_cents with no rounding drift.
+      if (b.is_projection && schedCents > 0) {
+        const schedDetail = `~<b>${projHours}</b> recording-hour${projHours === 1 ? '' : 's'} × <b>${usd(hourRate)}</b> upcoming`;
+        rows.push(item('Scheduled', schedDetail, usd(schedCents)));
+      }
       const storeDetail = `<b>${shm.toFixed(3)}</b> hours of footage stored × <b>${usd(shmRate)}</b>`;
       rows.push(item('Storage', shm > 0 ? storeDetail : '0 hours of footage stored', freeOr(usdStorage(shm, shmRate, storeCents), storeCents)));
       const totalLabel = b.period_end ? `Projected total (through ${fmtDay(b.period_end)})` : 'Projected total';
       rows.push(
         `<div class="bill-label bill-total bill-total-label">${totalLabel}</div>` +
         `<div class="bill-amount bill-total">${freeOr(usd(projTotalCents), projTotalCents)}</div>`);
-      // Muted sub-line so the projected total does not read as an overbill: the
-      // total looks ahead to period end while the line items above are to date.
       rows.push(
         `<div class="bill-detail bill-total-note" style="grid-column:1 / -1;margin-top:2px;">` +
-        `Projected to end of billing period. Recording ${hours} hr${hours === 1 ? '' : 's'} so far + ~${projHours} hr${projHours === 1 ? '' : 's'} expected; storage shown is to date.</div>`);
+        `Storage shown is to date.</div>`);
       estBreakdown.innerHTML = rows.join('');
 
       const meta = [];

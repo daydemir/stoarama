@@ -1182,7 +1182,7 @@ func (s *Server) handleAccountRecordingRetention(w http.ResponseWriter, r *http.
 	// excluded), computed directly from recording_clips.
 	var streamHours float64
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0)
+		SELECT COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)), 0) / 3600.0), 0)
 		FROM recording_clips c
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
 		WHERE c.recording_id=$1 AND sd.managed AND c.purged_at IS NULL AND c.released_at IS NULL

@@ -64,6 +64,8 @@ func TestSnapshotManagedStorageExcludesReleased(t *testing.T) {
 		"c.released_at IS NULL",
 		"r.storage_retention_tier <> 'yearly_prepaid'",
 		"(r.delivery <> 'nas_pull' OR c.created_at < now() - ($1::interval))",
+		// reversed-clip floor: a clip with end < start must not subtract from the sum.
+		"GREATEST(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)), 0)",
 	} {
 		if !strings.Contains(snapshotManagedStorageSQL, want) {
 			t.Fatalf("managed-storage snapshot SQL missing %q", want)

@@ -11,6 +11,7 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -239,13 +240,24 @@ func (c *Client) ReportStreamHourMonth(ctx context.Context, customerID string, a
 // usage that a prior out-of-cycle invoice already consumed) is rejected rather than
 // summed. Treating that rejection as a no-op is what makes the metering job safe to
 // re-run and is the guarantee that already-consumed usage is never billed twice.
-// Stripe returns this as a generic invalid_request_error with no machine code, so
-// we match the stable identifier-collision phrase in the message.
+// Two checks run in OR:
+//  1. Substring match on the stable identifier-collision phrase (Stripe currently
+//     returns this as a generic invalid_request_error; empirically verified in test mode).
+//  2. Structured code check: stripe.ErrorCodeResourceAlreadyExists ("resource_already_exists"),
+//     the SDK-documented code for identifier collisions, in case Stripe rewrites the
+//     message text but keeps the machine code.
 func isDuplicateMeterEvent(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "already exists with identifier")
+	if strings.Contains(err.Error(), "already exists with identifier") {
+		return true
+	}
+	var se *stripe.Error
+	if errors.As(err, &se) && se.Code == stripe.ErrorCodeResourceAlreadyExists {
+		return true
+	}
+	return false
 }
 
 // EnsureStreamHourMonthItem lazily adds the stream_hour_month metered item to an

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	stripe "github.com/stripe/stripe-go/v82"
 )
 
 // TestIsDuplicateMeterEvent locks in the no-double-bill guarantee: a re-sent meter
@@ -22,6 +24,16 @@ func TestIsDuplicateMeterEvent(t *testing.T) {
 	// Wrapped the way the SDK/our code may surround it.
 	if !isDuplicateMeterEvent(fmt.Errorf("report recording hours: %w", dup)) {
 		t.Fatalf("wrapped duplicate-identifier error not recognized")
+	}
+
+	// Structured path: stripe.Error with Code=resource_already_exists is also a duplicate.
+	stripeAlreadyExists := &stripe.Error{Code: stripe.ErrorCodeResourceAlreadyExists}
+	if !isDuplicateMeterEvent(stripeAlreadyExists) {
+		t.Fatalf("stripe.Error resource_already_exists not recognized as duplicate")
+	}
+	// Wrapped structured error.
+	if !isDuplicateMeterEvent(fmt.Errorf("report recording hours: %w", stripeAlreadyExists)) {
+		t.Fatalf("wrapped stripe.Error resource_already_exists not recognized as duplicate")
 	}
 
 	// Unrelated Stripe/transport errors must NOT be swallowed; they have to surface

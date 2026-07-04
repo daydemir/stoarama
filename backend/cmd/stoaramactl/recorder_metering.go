@@ -252,7 +252,7 @@ const snapshotManagedStorageSQL = `
 	INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored, stream_hours_stored)
 	SELECT r.account_id, CURRENT_DATE,
 	       COALESCE(SUM(c.size_bytes), 0),
-	       COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0)
+	       COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)), 0) / 3600.0), 0)
 	FROM recording_clips c
 	JOIN recordings r            ON r.id = c.recording_id
 	JOIN storage_destinations sd ON sd.id = c.storage_destination_id
@@ -429,7 +429,7 @@ func prepayAccountMonth(ctx context.Context, pool *pgxpool.Pool, reporter meteri
 	var newStreamHours float64
 	if err := pool.QueryRow(ctx, `
 		WITH current AS (
-			SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)) / 3600.0), 0) AS hours
+			SELECT COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (c.clip_end_at - c.clip_start_at)), 0) / 3600.0), 0) AS hours
 			FROM recording_clips c
 			JOIN recordings r            ON r.id = c.recording_id
 			JOIN storage_destinations sd ON sd.id = c.storage_destination_id
