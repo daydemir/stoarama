@@ -417,7 +417,7 @@ write_files:
 
 runcmd:
   - set -e
-  - mkdir -p /opt /opt/stoarama/bin /usr/local/lib/onnxruntime
+  - mkdir -p /opt /usr/local/lib/onnxruntime
   - /usr/local/sbin/stoarama-egress-firewall.sh
   # ffmpeg (BtbN gpl) + yt-dlp, same rationale as the Render survey cron.
   - |
@@ -447,11 +447,13 @@ runcmd:
       clone_url="$(printf '%s' '{{.RepoURL}}' | sed 's#^https://#https://x-access-token:{{.RepoCloneToken}}@#')"
     fi
     if [ ! -d /opt/stoarama/.git ]; then
+      rm -rf /opt/stoarama
       git clone --depth 1 --branch {{.RepoRef}} "$clone_url" /opt/stoarama
     else
       git -C /opt/stoarama fetch --depth 1 origin {{.RepoRef}}
       git -C /opt/stoarama reset --hard origin/{{.RepoRef}}
     fi
+    mkdir -p /opt/stoarama/bin
     (cd /opt/stoarama/backend && CGO_ENABLED=1 go build -o /opt/stoarama/bin/stoaramactl ./cmd/stoaramactl)
   # fetch + sha256-verify the yolo11x model (fail-fast on mismatch, no start).
   - |
