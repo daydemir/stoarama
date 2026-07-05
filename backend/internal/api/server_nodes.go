@@ -345,10 +345,11 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at, relay_max_streams
-		FROM nodes
-		WHERE account_id=$1
-		ORDER BY created_at DESC, id DESC
+		SELECT n.id, n.account_id, n.node_type, n.display_name, n.hostname, n.platform, n.status, n.enrolled_at, n.last_heartbeat_at, n.capabilities_jsonb, n.metadata_jsonb, n.created_at, n.updated_at, n.relay_max_streams,
+		       (SELECT COUNT(*) FROM recording_jobs j WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases
+		FROM nodes n
+		WHERE n.account_id=$1
+		ORDER BY n.created_at DESC, n.id DESC
 	`, principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list nodes: %v", err))
@@ -838,9 +839,10 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) fetchNodeByID(ctx context.Context, id int64) (map[string]any, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, created_at, updated_at, relay_max_streams
-		FROM nodes
-		WHERE id=$1
+		SELECT n.id, n.account_id, n.node_type, n.display_name, n.hostname, n.platform, n.status, n.enrolled_at, n.last_heartbeat_at, n.capabilities_jsonb, n.metadata_jsonb, n.created_at, n.updated_at, n.relay_max_streams,
+		       (SELECT COUNT(*) FROM recording_jobs j WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases
+		FROM nodes n
+		WHERE n.id=$1
 	`, id)
 	return scanNodeRow(row)
 }
@@ -864,7 +866,8 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		metadataRaw     []byte
 		createdAt       time.Time
 		updatedAt       time.Time
-		relayMaxStreams int
+		relayMaxStreams  int
+		liveLeases      int
 	)
 	if err := row.Scan(
 		&id,
@@ -881,6 +884,7 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		&createdAt,
 		&updatedAt,
 		&relayMaxStreams,
+		&liveLeases,
 	); err != nil {
 		return nil, err
 	}
@@ -916,6 +920,7 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		"seconds_since_heartbeat": secondsSinceHeartbeat,
 		"healthy":                 healthy,
 		"relay_max_streams":       relayMaxStreams,
+		"live_leases":             liveLeases,
 		"capabilities_json":       nonNilMap(capabilities),
 		"metadata_json":           nonNilMap(metadata),
 		"created_at":              createdAt.UTC(),

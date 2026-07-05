@@ -460,15 +460,9 @@
         <p class="muted" style="margin:0;">Add a payment method in Org settings to start recording. Adding a card does not charge you. Charges are $0.05 for each hour a recording captures at least one clip.</p>
       </div>
 
-      <!-- Relay fleet warning: shown when the account has active relay recordings but
-           no relay computer is online right now (honest warn-and-miss signal). -->
-      <div id="relayBanner" class="panel hidden" style="margin-bottom:16px;border-color:color-mix(in srgb, var(--warn) 40%, var(--border));">
-        <div class="section-title" style="margin-bottom:6px;">
-          <div><div class="eyebrow">Relay fleet</div><h2 id="relayBannerTitle"></h2></div>
-          <a class="btn-link" href="/org-settings" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Org settings</a>
-        </div>
-        <p id="relayBannerBody" class="muted" style="margin:0;"></p>
-      </div>
+      <!-- Fleet summary: shown when the account has active relay recordings.
+           Content is injected by renderFleetSummary(); turns red when no computer online. -->
+      <div id="relayBanner" class="panel hidden" style="margin-bottom:16px;padding:14px 16px;"></div>
 
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
       <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
@@ -893,8 +887,6 @@
       relayRecommendDetail: document.getElementById('relayRecommendDetail'),
       relayRecommendOptIn: document.getElementById('relayRecommendOptIn'),
       relayBanner: document.getElementById('relayBanner'),
-      relayBannerTitle: document.getElementById('relayBannerTitle'),
-      relayBannerBody: document.getElementById('relayBannerBody'),
       streamPreview: document.getElementById('streamPreview'),
       recName: document.getElementById('recName'),
       modeSeg: document.getElementById('modeSeg'),
@@ -1051,6 +1043,10 @@
       // recordings; drives the composer YouTube gate and the list banner/cards.
       relays: [],
       fleetRelayWarning: false,
+      fleetRelayOnline: 0,
+      fleetRelayTotal: 0,
+      fleetRelayLiveLeases: 0,
+      fleetRelayAvailableSlots: 0,
       // Composer mode: 'single' (one recording) or 'bundle' (fan-out into N member
       // recordings sharing one schedule). Bundle mode swaps the source block and the
       // submit path; the schedule/window/clip/fps/storage controls are shared.
@@ -2567,31 +2563,62 @@
       return { phase: 'open', nextLabel: null };
     }
 
+    // Shared relay classification context, read from state fleet counters + rec fields.
+    function _relayCtx(rec) {
+      return {
+        name: rec.relay_node_name ? String(rec.relay_node_name) : null,
+        online: Number(state.fleetRelayOnline || 0),
+        total: Number(state.fleetRelayTotal || 0),
+        slots: Number(state.fleetRelayAvailableSlots || 0),
+        status: String(rec.status || ''),
+        w: relayWindowPhase(rec),
+      };
+    }
+
     // { tone: 'ok'|'wait'|'muted'|'offline', text (HTML), link? } or null for cloud.
+    // Canonical S1-S9 branch table, first match wins.
     function relayCaptureState(rec) {
       if (rec.capture_via !== 'relay') return null;
-      const status = String(rec.status || '');
-      if (rec.relay_node_name) {
-        return { tone: 'ok', text: `Recording via <b>${escapeHTML(String(rec.relay_node_name))}</b>.` };
+      const { name, online, total, slots, status, w } = _relayCtx(rec);
+      const t = w.nextLabel ? escapeHTML(w.nextLabel) : null;
+      const connectLink = { href: '/org-settings#relayPanel', text: 'Connect one.' };
+      // S1: live lease
+      if (name != null) return { tone: 'ok', text: `Recording via <b>${escapeHTML(name)}</b>.` };
+      // S2: paused
+      if (status === 'paused') return { tone: 'muted', text: 'Paused. Records through a connected computer when resumed.' };
+      // S3: ended / between windows
+      if (isCompleted(rec) || status === 'completed' || w.phase === 'after') {
+        return { tone: 'muted', text: t ? `Between windows. Next at <b>${t}</b>.` : 'Window ended.' };
       }
-      if (isCompleted(rec) || status === 'completed') {
-        return { tone: 'muted', text: 'Window ended.' };
-      }
-      if (status === 'paused') {
-        return { tone: 'muted', text: 'Paused. Records through a connected computer when resumed.' };
-      }
-      // HARD RULE: only this branch (no computer online) may mention connecting one.
-      if (rec.has_relay_online !== true) {
-        return { tone: 'offline', text: '<b>No computer connected.</b>', link: { href: '/org-settings#relayPanel', text: 'Connect one.' } };
-      }
-      const w = relayWindowPhase(rec);
-      if (w.phase === 'before') {
-        return { tone: 'wait', text: `Starts at <b>${escapeHTML(w.nextLabel || 'the next window')}</b>.` };
-      }
-      if (w.phase === 'after') {
-        return { tone: 'muted', text: w.nextLabel ? `Between windows. Next at <b>${escapeHTML(w.nextLabel)}</b>.` : 'Between windows.' };
-      }
+      // S4: no computer at all
+      if (total === 0) return { tone: 'offline', text: 'No computer connected. This recording needs one to record.', link: connectLink };
+      // S5: in window, computer online but not started
+      if (w.phase === 'open' && online > 0) return { tone: 'wait', text: 'A computer is online but has not started this recording yet. If this keeps up, check the relay app is running.' };
+      // S6: in window, no computer online
+      if (w.phase === 'open' && online === 0) return { tone: 'offline', text: 'No computer is online, so this recording is not capturing right now.', link: connectLink };
+      // S7: upcoming, free slots
+      if (w.phase === 'before' && online > 0 && slots > 0) return { tone: 'wait', text: `A computer is online with <b>${slots}</b> free slot(s) now. Slots are not reserved; capacity is claimed when the window opens at <b>${t || 'the next window'}</b>.` };
+      // S8: upcoming, full
+      if (w.phase === 'before' && online > 0 && slots === 0) return { tone: 'wait', text: `Computers are online but every slot is in use right now. This records at <b>${t || 'the next window'}</b> only if a slot frees first.` };
+      // S9: upcoming, offline
+      if (w.phase === 'before' && online === 0) return { tone: 'offline', text: `No computer is online. This will not record at <b>${t || 'the next window'}</b> unless one connects before then.`, link: connectLink };
       return { tone: 'wait', text: 'Starting shortly on <b>your computer</b>.' };
+    }
+
+    // Schedule-row label for relay recordings (the Capture row in the schedule card).
+    // Mirrors the S1-S9 ordering so both surfaces stay in sync via _relayCtx.
+    function relayScheduleRowText(rec) {
+      const { name, online, total, slots, status, w } = _relayCtx(rec);
+      if (name != null) return `Your computer &middot; <b>${escapeHTML(name)}</b> (recording now)`;
+      if (status === 'paused') return 'Your computer &middot; <b>paused</b>';
+      if (isCompleted(rec) || status === 'completed' || w.phase === 'after') return 'Your computer &middot; <b>between windows</b>';
+      if (total === 0) return 'Your computer &middot; <b>none connected</b>';
+      if (w.phase === 'open' && online > 0) return 'Your computer &middot; <b>online, not yet recording</b>';
+      if (w.phase === 'open' && online === 0) return 'Your computer &middot; <b>none online</b>';
+      if (w.phase === 'before' && online > 0 && slots > 0) return `Your computer &middot; <b>online, ${slots} free now</b>`;
+      if (w.phase === 'before' && online > 0 && slots === 0) return 'Your computer &middot; <b>online, no free slots now</b>';
+      if (w.phase === 'before' && online === 0) return 'Your computer &middot; <b>none online</b>';
+      return 'Your computer';
     }
 
     // Renders a relay capture-state note. detail=true uses the detail-banner margin.
@@ -2824,21 +2851,36 @@
       });
     }
 
-    // Fleet warning banner: the account has active relay recordings but no relay
-    // computer is online right now (honest warn-and-miss; relay misses are never
-    // billed). Driven by the server's fleet_relay_warning flag.
-    function renderRelayBanner() {
-      if (!state.fleetRelayWarning) { els.relayBanner.classList.add('hidden'); return; }
-      const relayRecs = state.recordings.filter((r) => r.capture_via === 'relay' && String(r.status) === 'active').length;
-      els.relayBannerTitle.textContent = relayRecs === 1
-        ? '1 recording needs a computer online'
-        : `${relayRecs} recordings need a computer online`;
-      els.relayBannerBody.textContent = 'No connected computer is online right now, so these recordings are not capturing. Turn one on or connect a computer in Org settings. You are never billed for missed relay clips.';
+    // Fleet summary block: shown when the account has active relay recordings.
+    // Replaces the old renderRelayBanner; turns red when no computer is online.
+    function renderFleetSummary() {
+      const hasRelayRecs = state.recordings.some((r) => r.capture_via === 'relay' && String(r.status) === 'active');
+      if (!hasRelayRecs) { els.relayBanner.classList.add('hidden'); return; }
+      const online = state.fleetRelayOnline;
+      const total = state.fleetRelayTotal;
+      const leases = state.fleetRelayLiveLeases;
+      const slots = state.fleetRelayAvailableSlots;
+      const offline = online === 0;
+      els.relayBanner.style.borderColor = offline
+        ? 'color-mix(in srgb, var(--err) 40%, var(--border))'
+        : 'color-mix(in srgb, var(--warn) 40%, var(--border))';
+      let inner = '';
+      if (offline) {
+        inner += `<div style="margin-bottom:8px;font-weight:600;color:var(--err);">No computer online. Active relay recordings are not capturing.</div>`;
+      }
+      inner += `<dl class="detail-rows" style="margin:0 0 6px;">
+        <dt>Computers online</dt><dd>${online} / ${total}</dd>
+        <dt>Recording now</dt><dd>${leases}</dd>
+        <dt>Free slots now</dt><dd>${slots}</dd>
+      </dl>
+      <p class="muted" style="margin:0 0 8px;font-size:12px;">Free slots are what is open right now, not a reservation. Assignment happens when a window opens.</p>
+      <a class="btn-link secondary" href="/org-settings#relayPanel" style="width:auto;min-width:0;min-height:32px;padding:6px 14px;">Manage computers</a>`;
+      els.relayBanner.innerHTML = inner;
       els.relayBanner.classList.remove('hidden');
     }
 
     function renderCards() {
-      renderRelayBanner();
+      renderFleetSummary();
       const all = state.recordings;
       const empty = all.length === 0;
       els.heroCopy.classList.toggle('hidden', !empty);
@@ -3160,19 +3202,9 @@
         ['Clip length', `${Number(rec.clip_duration_sec || 0)}s`],
         ['Frame rate', tfps > 0 ? `${tfps} fps` : 'Source'],
       ];
-      // Capture method: persistent row so a relay recording always shows it runs on the
-      // user's computer, independent of the timing banner. Name appears once a computer
-      // holds the lease; before that, has_relay_online answers connected-or-not.
+      // Capture method row: S1-S9 schedule-row text via shared helper.
       if (rec.capture_via === 'relay') {
-        let cap;
-        if (rec.relay_node_name) {
-          cap = `Your computer &middot; <b>${escapeHTML(String(rec.relay_node_name))}</b>`;
-        } else if (rec.has_relay_online === true) {
-          cap = 'Your computer &middot; <b>connected</b>';
-        } else {
-          cap = 'Your computer &middot; <b>none connected</b>';
-        }
-        rows.push(['Capture', cap]);
+        rows.push(['Capture', relayScheduleRowText(rec)]);
       } else {
         rows.push(['Capture', 'Stoarama cloud']);
       }
@@ -3927,6 +3959,10 @@
         const payload = await fetchJSON('/api/v1/account/recordings');
         state.recordings = Array.isArray(payload.items) ? payload.items : [];
         state.fleetRelayWarning = payload.fleet_relay_warning === true;
+        state.fleetRelayOnline = Number(payload.fleet_relay_online || 0);
+        state.fleetRelayTotal = Number(payload.fleet_relay_total || 0);
+        state.fleetRelayLiveLeases = Number(payload.fleet_relay_live_leases || 0);
+        state.fleetRelayAvailableSlots = Number(payload.fleet_relay_available_slots || 0);
         // Refresh the relay snapshot alongside recordings so the banner + cards read a
         // consistent fleet view. Best-effort; a cloud-only account gets an empty list.
         await loadRelays();
@@ -4944,6 +4980,15 @@
     }
 
     void boot();
+
+    // Auto-refresh the recordings list every 30s (well within 120s heartbeat / ~210s min
+    // lease TTL). Only fires on the recordings list view, not the clip-detail page.
+    // ponytail: skips clip-page refresh; add if detail page needs live fleet status too.
+    window.setInterval(() => {
+      if (!clipPageState.recId && !bundleListRoute() && !(bundleDetailId() > 0)) {
+        void refreshRecordings();
+      }
+    }, 30000);
   </script>
 </body>
 </html>

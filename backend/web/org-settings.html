@@ -266,6 +266,7 @@
         <button id="relayRefreshBtn" class="secondary small" type="button">Refresh</button>
       </div>
       <div id="relayStatus" class="status">Loading computers...</div>
+      <div id="relaySummary" class="hidden" style="margin-bottom:12px;"></div>
       <div id="relayList" class="rec-list hidden" style="margin-bottom:12px;"></div>
       <div id="relayEmpty" class="sub hidden" style="margin-bottom:12px;">No computers connected yet. Connect one to record YouTube streams through your own machine.</div>
 
@@ -351,6 +352,7 @@
     const connRefreshBtn = document.getElementById('connRefreshBtn');
     const relayPanel = document.getElementById('relayPanel');
     const relayStatus = document.getElementById('relayStatus');
+    const relaySummary = document.getElementById('relaySummary');
     const relayList = document.getElementById('relayList');
     const relayEmpty = document.getElementById('relayEmpty');
     const relayLabel = document.getElementById('relayLabel');
@@ -819,29 +821,50 @@
       const id = Number(n.id);
       const name = String(n.display_name || 'Computer');
       const live = relayLiveness(n);
-      const dot = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${live.color};margin-right:8px;"></span>`;
+      const dot = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${live.color};margin-right:8px;flex-shrink:0;"></span>`;
       const label = `<b style="color:${live.color};">${live.label}</b>`;
       const cap = (n.capabilities_json && typeof n.capabilities_json === 'object') ? n.capabilities_json : {};
       const platform = relayPlatformLabel(n.platform);
-      const active = Number(cap.active_jobs || 0);
       const max = Number(n.relay_max_streams || 5);
-      const streamsLine = `${active} of ${max} stream${max === 1 ? '' : 's'}`;
-      return `<div class="rec-row kv-row">
-        <div style="min-width:0;">
-          <div>${dot}${label} <span class="mono" style="white-space:nowrap;">${escapeHTML(name)}</span></div>
-          <div class="sub">${escapeHTML(platform)} &middot; ${streamsLine} &middot; ${relayYTBadge(cap)}</div>
+      const liveLeases = Number(n.live_leases || 0);
+      const isOnline = n.healthy === true;
+      const recNow = isOnline ? String(liveLeases) : 'n/a';
+      const freeNow = isOnline ? String(Math.max(0, max - liveLeases)) : 'n/a';
+      return `<div class="rec-row">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
+          <div style="min-width:0;">
+            <div style="display:flex;align-items:center;">${dot}${label} <span class="mono" style="white-space:nowrap;margin-left:6px;">${escapeHTML(name)}</span></div>
+            <div class="sub" style="margin-top:2px;">${escapeHTML(platform)} &middot; ${relayYTBadge(cap)}</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-shrink:0;">
+            <button class="secondary small relay-rename" type="button" data-id="${id}">Rename</button>
+            <button class="secondary small relay-remove" type="button" data-id="${id}">Remove</button>
+          </div>
         </div>
-        <div style="display:flex;gap:8px;flex-shrink:0;">
-          <button class="secondary small relay-rename" type="button" data-id="${id}">Rename</button>
-          <button class="secondary small relay-remove" type="button" data-id="${id}">Remove</button>
-        </div>
+        <dl class="bill-meta" style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
+          <dt>Capacity</dt><dd>${max}</dd>
+          <dt>Recording now</dt><dd>${recNow}</dd>
+          <dt>Free now</dt><dd>${freeNow}</dd>
+        </dl>
       </div>`;
+    }
+
+    function renderRelaySummary(items) {
+      const total = items.length;
+      const online = items.filter((n) => n.healthy === true).length;
+      const liveLeases = items.reduce((s, n) => s + Number(n.live_leases || 0), 0);
+      const availSlots = items.filter((n) => n.healthy === true).reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 5) - Number(n.live_leases || 0)), 0);
+      const red = online === 0 && total > 0;
+      const borderColor = red ? 'var(--err)' : 'var(--border)';
+      const headline = red ? `<div style="font-weight:600;color:var(--err);margin-bottom:8px;">No computer online. Active relay recordings are not capturing.</div>` : '';
+      return `<div style="border:1px solid ${borderColor};border-radius:12px;padding:10px 12px;background:color-mix(in srgb,var(--panel2) 86%,transparent);">${headline}<dl class="bill-meta"><dt>Computers online</dt><dd>${online} / ${total}</dd><dt>Recording now</dt><dd>${liveLeases}</dd><dt>Free slots now</dt><dd>${availSlots}</dd></dl><div class="sub" style="margin-top:8px;">Free slots are what is open right now, not a reservation. Assignment happens when a window opens.</div></div>`;
     }
 
     async function loadRelays() {
       relayPanel.classList.remove('hidden');
       setStatus(relayStatus, 'Loading computers...', '');
       relayList.classList.add('hidden');
+      relaySummary.classList.add('hidden');
       relayEmpty.classList.add('hidden');
       try {
         const data = await fetchJSON('/api/v1/account/nodes');
@@ -852,6 +875,8 @@
           setStatus(relayStatus, '', '');
           return;
         }
+        relaySummary.innerHTML = renderRelaySummary(items);
+        relaySummary.classList.remove('hidden');
         relayList.innerHTML = items.map(relayRowHTML).join('');
         relayList.classList.remove('hidden');
         relayList.querySelectorAll('.relay-rename').forEach((btn) => {
@@ -994,6 +1019,8 @@
     }
 
     void refreshOrg();
+    // ponytail: 30s relay refresh for live_leases/fleet capacity; well inside 120s heartbeat TTL
+    setInterval(() => { if (!relayPanel.classList.contains('hidden')) void loadRelays(); }, 30000);
   </script>
 </body>
 </html>

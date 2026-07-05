@@ -262,27 +262,54 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recordings: %v", err))
 		return
 	}
-	// fleet_relay_warning is the honest, defensible signal (M4): the account has at
-	// least one active relay recording right now AND zero relay nodes online (heartbeat
-	// within 120s). No demand/supply arithmetic. It is dark for a cloud-only account:
-	// with no relay recording the first EXISTS is false and the warning is always false.
-	var fleetRelayWarning bool
+	// Fleet relay aggregate: total nodes, online nodes (heartbeat within 120s), live
+	// leases across all relay nodes, available slots across ONLINE relays, and the
+	// existing fleet_relay_warning (kept for rollout compatibility).
+	var (
+		fleetRelayTotal          int
+		fleetRelayOnline         int
+		fleetRelayLiveLeases     int
+		fleetRelayAvailableSlots int
+		fleetRelayWarning        bool
+	)
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT EXISTS (
-		         SELECT 1 FROM recordings rec
-		         WHERE rec.account_id = $1 AND rec.status = 'active'
-		           AND rec.capture_via = 'relay'
-		           AND rec.start_at <= now()
-		           AND (rec.end_at IS NULL OR now() < rec.end_at))
-		   AND NOT EXISTS (
-		         SELECT 1 FROM nodes n
-		         WHERE n.account_id = $1 AND n.node_type = 'relay' AND n.status = 'active'
-		           AND n.last_heartbeat_at >= now() - interval '120 seconds')
-	`, principal.AccountID).Scan(&fleetRelayWarning); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute fleet relay warning: %v", err))
+		WITH relay_nodes AS (
+		  SELECT n.id, n.status, n.relay_max_streams, n.last_heartbeat_at,
+		    (SELECT COUNT(*) FROM recording_jobs j
+		     WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now()) AS live_leases
+		  FROM nodes n
+		  WHERE n.account_id=$1 AND n.node_type='relay'
+		),
+		fleet AS (
+		  SELECT
+		    COUNT(*)::int                                                                                                                               AS total,
+		    COUNT(*) FILTER (WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds')::int                                         AS online,
+		    COALESCE(SUM(live_leases), 0)::int                                                                                                         AS live_leases,
+		    COALESCE(SUM(GREATEST(relay_max_streams - live_leases, 0)) FILTER (WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds'), 0)::int AS available_slots
+		  FROM relay_nodes
+		),
+		has_active_relay_rec AS (
+		  SELECT EXISTS (
+		    SELECT 1 FROM recordings rec
+		    WHERE rec.account_id=$1 AND rec.status='active' AND rec.capture_via='relay'
+		      AND rec.start_at <= now() AND (rec.end_at IS NULL OR now() < rec.end_at)
+		  ) AS val
+		)
+		SELECT f.total, f.online, f.live_leases, f.available_slots,
+		       (f.online = 0 AND h.val) AS fleet_relay_warning
+		FROM fleet f, has_active_relay_rec h
+	`, principal.AccountID).Scan(&fleetRelayTotal, &fleetRelayOnline, &fleetRelayLiveLeases, &fleetRelayAvailableSlots, &fleetRelayWarning); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute fleet relay stats: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "fleet_relay_warning": fleetRelayWarning})
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":                       items,
+		"fleet_relay_warning":         fleetRelayWarning,
+		"fleet_relay_total":           fleetRelayTotal,
+		"fleet_relay_online":          fleetRelayOnline,
+		"fleet_relay_live_leases":     fleetRelayLiveLeases,
+		"fleet_relay_available_slots": fleetRelayAvailableSlots,
+	})
 }
 
 func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Request) {
