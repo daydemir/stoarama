@@ -291,27 +291,27 @@ write_files:
     permissions: "0600"
     owner: root:root
     content: |
-      export DATABASE_URL='{{.DatabaseURL}}'
-      export R2_ACCOUNT_ID='{{.R2AccountID}}'
-      export R2_ACCESS_KEY_ID='{{.R2AccessKeyID}}'
-      export R2_SECRET_ACCESS_KEY='{{.R2SecretKey}}'
-      export R2_BUCKET='{{.R2Bucket}}'
-      export R2_REGION='{{.R2Region}}'
-      export R2_ENDPOINT='{{.R2Endpoint}}'
-      export FFMPEG_BIN=/usr/local/bin/ffmpeg
-      export YT_DLP_BIN=/usr/local/bin/yt-dlp
-      export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-      export STREAM_RECORDABILITY_PROBE_ENABLED=true
-      export ONNXRUNTIME_LIB_PATH=/usr/local/lib/onnxruntime/libonnxruntime.so
-      export SURVEY_MODEL_PATH='{{.ModelPath}}'
-      export SURVEY_MODEL_KEY='{{.ModelKey}}'
-      export SURVEY_MODEL_SHA256='{{.ModelSHA256}}'
-      export SURVEY_DETECT_CONF='{{.Conf}}'
-      export SURVEY_DETECT_IOU='{{.IoU}}'
-      export SURVEY_DETECT_IMGSZ='{{.Imgsz}}'
-      export SURVEY_DETECT_INTRA_OP_THREADS='{{.IntraOpThreads}}'
-      export SURVEY_DETECT_SAMPLE_RATE='{{.SampleRate}}'
-      export SURVEY_DETECT_PIPELINE_VERSION='{{.PipelineVersion}}'
+      DATABASE_URL='{{.DatabaseURL}}'
+      R2_ACCOUNT_ID='{{.R2AccountID}}'
+      R2_ACCESS_KEY_ID='{{.R2AccessKeyID}}'
+      R2_SECRET_ACCESS_KEY='{{.R2SecretKey}}'
+      R2_BUCKET='{{.R2Bucket}}'
+      R2_REGION='{{.R2Region}}'
+      R2_ENDPOINT='{{.R2Endpoint}}'
+      FFMPEG_BIN=/usr/local/bin/ffmpeg
+      YT_DLP_BIN=/usr/local/bin/yt-dlp
+      SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      STREAM_RECORDABILITY_PROBE_ENABLED=true
+      ONNXRUNTIME_LIB_PATH=/usr/local/lib/onnxruntime/libonnxruntime.so
+      SURVEY_MODEL_PATH='{{.ModelPath}}'
+      SURVEY_MODEL_KEY='{{.ModelKey}}'
+      SURVEY_MODEL_SHA256='{{.ModelSHA256}}'
+      SURVEY_DETECT_CONF='{{.Conf}}'
+      SURVEY_DETECT_IOU='{{.IoU}}'
+      SURVEY_DETECT_IMGSZ='{{.Imgsz}}'
+      SURVEY_DETECT_INTRA_OP_THREADS='{{.IntraOpThreads}}'
+      SURVEY_DETECT_SAMPLE_RATE='{{.SampleRate}}'
+      SURVEY_DETECT_PIPELINE_VERSION='{{.PipelineVersion}}'
 
   - path: /usr/local/sbin/stoarama-egress-firewall.sh
     permissions: "0755"
