@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -224,10 +225,46 @@ func CaptureFrame(ctx context.Context, registry *capture.Registry, t Target, res
 	return frame, nil
 }
 
+// DetectionCounts is the metrics-only per-class survivor counts for one surveyed
+// frame (person + all vehicle classes; train excluded). No boxes are retained.
+type DetectionCounts struct {
+	Person     int
+	Bicycle    int
+	Car        int
+	Motorcycle int
+	Bus        int
+	Truck      int
+}
+
+// Detector runs yolo11x detection on a survey JPEG and returns per-class counts.
+// It is an interface so the survey package stays free of the ONNX/cgo dependency
+// (its unit tests run without the model); the concrete detector is injected by the
+// stoaramactl command. It is loaded ONCE and reused across the whole sweep.
+type Detector interface {
+	// Detect returns per-class counts and the inference wall-clock in ms.
+	Detect(jpegBytes []byte) (DetectionCounts, int, error)
+	PipelineVersion() string
+	ConfThreshold() float64
+	Imgsz() int
+}
+
+// DetectionResult is the fully-formed survey_detections row to insert alongside a
+// frame. A nil *DetectionResult means the frame was not sampled for detection.
+type DetectionResult struct {
+	PipelineVersion string
+	ConfThreshold   float64
+	Imgsz           int
+	Counts          DetectionCounts
+	DetectMs        int
+}
+
 // Persist uploads the frame to R2 and inserts a survey frame row. It mirrors
 // persistCaptureSuccess but uses the survey object key and source_kind='survey',
-// and does NOT touch stream_health, stream_capture_runtime, or capture_jobs.
-func Persist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, streamID int64, day time.Time, capturedAt time.Time, frame capture.Frame) error {
+// and does NOT touch stream_health, stream_capture_runtime, or capture_jobs. When
+// det is non-nil, the survey_detections row is inserted in the SAME transaction as
+// the frame (keyed by the returned frame id), so a detection insert failure rolls
+// the frame back cleanly (fail-fast, no partial).
+func Persist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, streamID int64, day time.Time, capturedAt time.Time, frame capture.Frame, det *DetectionResult) error {
 	objectKey := ObjectKey(streamID, day)
 	etag, err := r2c.PutBytes(ctx, objectKey, frame.MIMEType, frame.Bytes)
 	if err != nil {
@@ -254,11 +291,25 @@ func Persist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, streamID i
 	if err != nil {
 		return fmt.Errorf("upsert survey media object: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
+	var frameID int64
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO frames (stream_id, capture_job_id, captured_at, raw_media_object_id, capture_status, capture_error, source_kind)
 		VALUES ($1, NULL, $2, $3, 'success', NULL, 'survey')
-	`, streamID, capturedAt, mediaID); err != nil {
+		RETURNING id
+	`, streamID, capturedAt, mediaID).Scan(&frameID); err != nil {
 		return fmt.Errorf("insert survey frame: %w", err)
+	}
+	if det != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO survey_detections (
+				frame_id, stream_id, captured_at, pipeline_version, conf_threshold, imgsz,
+				person_count, bicycle_count, car_count, motorcycle_count, bus_count, truck_count, detect_ms
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			ON CONFLICT (frame_id, pipeline_version) DO NOTHING
+		`, frameID, streamID, capturedAt, det.PipelineVersion, det.ConfThreshold, det.Imgsz,
+			det.Counts.Person, det.Counts.Bicycle, det.Counts.Car, det.Counts.Motorcycle, det.Counts.Bus, det.Counts.Truck, det.DetectMs); err != nil {
+			return fmt.Errorf("insert survey detection for stream %d frame %d: %w", streamID, frameID, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit survey tx: %w", err)
@@ -396,7 +447,7 @@ func markSurveyHealthy(ctx context.Context, pool *pgxpool.Pool, streamID int64) 
 // records/advances the stream's survey_stream_state (first failure = marker
 // only; a confirmed second failure on a later sweep tags 'error') and returns
 // immediately: a failure never holds a worker for a confirmation delay.
-func CaptureAndPersist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, registry *capture.Registry, t Target, day time.Time, resolveTimeout, captureTimeout time.Duration) (skipped bool, _ error) {
+func CaptureAndPersist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, registry *capture.Registry, t Target, day time.Time, resolveTimeout, captureTimeout time.Duration, det Detector, sampleRate float64) (skipped bool, _ error) {
 	exists, err := HasFrameForDay(ctx, pool, t.ID, day)
 	if err != nil {
 		return false, err
@@ -420,8 +471,29 @@ func CaptureAndPersist(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, 
 		}
 		return false, fmt.Errorf("survey capture failure for stream %d (confirmed=%t): %w", t.ID, confirm, err)
 	}
+	// Per-stream randomized coverage gate: when a detector is configured, run
+	// detection on this frame with probability sampleRate. The decision is per
+	// capture, seeded by the process-global rand, so coverage is randomized across
+	// streams and over time rather than always the same streams. A frame not
+	// sampled still gets captured+persisted; only detection is skipped. Detection
+	// runs BEFORE the persist tx (multi-second CPU inference must not hold a tx
+	// open); a detect error fails the whole persist (fail-fast, no partial row).
+	var detResult *DetectionResult
+	if det != nil && rand.Float64() < sampleRate {
+		counts, ms, derr := det.Detect(frame.Bytes)
+		if derr != nil {
+			return false, fmt.Errorf("survey detection failed for stream %d: %w", t.ID, derr)
+		}
+		detResult = &DetectionResult{
+			PipelineVersion: det.PipelineVersion(),
+			ConfThreshold:   det.ConfThreshold(),
+			Imgsz:           det.Imgsz(),
+			Counts:          counts,
+			DetectMs:        ms,
+		}
+	}
 	capturedAt := time.Now().UTC()
-	if err := Persist(ctx, pool, r2c, t.ID, day, capturedAt, frame); err != nil {
+	if err := Persist(ctx, pool, r2c, t.ID, day, capturedAt, frame, detResult); err != nil {
 		return false, err
 	}
 	if err := markSurveyHealthy(ctx, pool, t.ID); err != nil {
@@ -441,7 +513,9 @@ type RunResult struct {
 // RunOnce sweeps the given targets once with bounded concurrency, capturing and
 // persisting a survey frame for each on the given UTC date. onError, if set, is
 // called for each per-stream failure (capture failures do not abort the sweep).
-func RunOnce(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, registry *capture.Registry, targets []Target, day time.Time, concurrency int, resolveTimeout, captureTimeout time.Duration, onError func(streamID int64, err error)) RunResult {
+// det (nil = detection off) and sampleRate configure the per-stream randomized
+// detection coverage gate applied inside CaptureAndPersist.
+func RunOnce(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, registry *capture.Registry, targets []Target, day time.Time, concurrency int, resolveTimeout, captureTimeout time.Duration, det Detector, sampleRate float64, onError func(streamID int64, err error)) RunResult {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -460,7 +534,7 @@ func RunOnce(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, registry *
 		}
 		go func(t Target) {
 			defer func() { <-sem }()
-			skipped, err := CaptureAndPersist(ctx, pool, r2c, registry, t, day, resolveTimeout, captureTimeout)
+			skipped, err := CaptureAndPersist(ctx, pool, r2c, registry, t, day, resolveTimeout, captureTimeout, det, sampleRate)
 			if err != nil && onError != nil {
 				onError(t.ID, err)
 			}

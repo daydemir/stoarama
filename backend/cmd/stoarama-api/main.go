@@ -143,7 +143,10 @@ func main() {
 					log.Printf("survey scheduler: select targets failed: %v", err)
 					continue
 				}
-				res := survey.RunOnce(ctx, pool, r2c, registry, targets, day, cfg.SurveyConcurrency, resolveTimeout, captureTimeout, func(streamID int64, err error) {
+				// Detection is disabled on the embedded API scheduler (nil detector):
+				// yolo11x detection runs only on the dedicated survey+detection droplet
+				// via `stoaramactl survey run-once --detect`. Here it is capture-only.
+				res := survey.RunOnce(ctx, pool, r2c, registry, targets, day, cfg.SurveyConcurrency, resolveTimeout, captureTimeout, nil, 0, func(streamID int64, err error) {
 					log.Printf("survey scheduler: stream %d capture failed: %v", streamID, err)
 				})
 				log.Printf("survey scheduler: day=%s total=%d success=%d skipped=%d failed=%d",

@@ -34,6 +34,10 @@ func runSurvey(ctx context.Context, cfg config.Config, args []string) {
 		runSurveyCoverage(ctx, cfg, args[1:])
 	case "delete-stream-captures":
 		runSurveyDeleteStreamCaptures(ctx, cfg, args[1:])
+	case "detect-image":
+		runSurveyDetectImage(ctx, cfg, args[1:])
+	case "download-model":
+		runSurveyDownloadModel(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown survey subcommand: %s", args[0])
 	}
@@ -50,10 +54,15 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 	limit := fs.Int("limit", 0, "max streams to survey this run (0 = all non-pruned); useful for verifying a small sample")
 	streamIDs := fs.String("stream-ids", "", "comma-separated stream ids to survey (empty = all selected targets); useful for verifying specific streams")
 	dailyGate := fs.Bool("daily-gate", false, "for an hourly cron: only run during one per-day deterministic random UTC hour, skip otherwise (gives a different capture time each day)")
+	detect := fs.Bool("detect", false, "run inline yolo11x detection on a randomized per-stream sample of captured frames, writing survey_detections rows")
+	detectSampleRate := fs.Float64("detect-sample-rate", cfg.SurveyDetectSampleRate, "probability [0,1] a captured frame is sampled for detection (only with --detect)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
 	if *concurrency <= 0 || *resolveTimeoutSec <= 0 || *captureTimeoutSec <= 0 {
 		log.Fatalf("--concurrency, --resolve-timeout-sec, --capture-timeout-sec must all be > 0")
+	}
+	if *detect && (*detectSampleRate <= 0 || *detectSampleRate > 1) {
+		log.Fatalf("--detect-sample-rate must be in (0,1] when --detect is set")
 	}
 	if *dailyGate {
 		now := time.Now().UTC()
@@ -70,6 +79,21 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
 	r2c := mustArchiveR2Client(ctx, cfg)
+
+	// Load the yolo11x ONNX detector ONCE and reuse it across the whole sweep.
+	// Fail-fast: with --detect set, a missing model or onnxruntime library aborts
+	// the run rather than silently capturing without detection.
+	var det survey.Detector
+	if *detect {
+		d, derr := newSurveyDetector(cfg)
+		if derr != nil {
+			log.Fatalf("init survey detector: %v", derr)
+		}
+		defer d.Close()
+		det = surveyDetectorAdapter{d: d}
+		log.Printf("survey run-once: detection ON (pipeline=%s conf=%.2f imgsz=%d sample_rate=%.3f)",
+			d.PipelineVersion(), d.ConfThreshold(), d.Imgsz(), *detectSampleRate)
+	}
 
 	targets, err := survey.SelectTargets(ctx, pool)
 	if err != nil {
@@ -88,10 +112,15 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 		targets = targets[:*limit]
 	}
 	day := time.Now().UTC()
+	sampleRate := 0.0
+	if *detect {
+		sampleRate = *detectSampleRate
+	}
 	res := survey.RunOnce(ctx, pool, r2c, registry, targets, day,
 		*concurrency,
 		time.Duration(*resolveTimeoutSec)*time.Second,
 		time.Duration(*captureTimeoutSec)*time.Second,
+		det, sampleRate,
 		func(streamID int64, err error) {
 			log.Printf("survey run-once: stream %d failed: %v", streamID, err)
 		},

@@ -42,11 +42,12 @@ type CreateDropletInput struct {
 	Name       string
 	Region     string
 	Size       string
-	Image      string // snapshot id (numeric) or image slug
-	SSHKey     string // optional fingerprint or numeric id
+	Image      string   // snapshot id (numeric) or image slug
+	SSHKey     string   // optional fingerprint or numeric id; comma-separated adds multiple keys
 	UserData   string
 	ProjectID  string
 	FirewallID string
+	Tags       []string // optional; when empty the default recorder-pool dropletTags are applied
 }
 
 // DODroplet is the minimal view of a DigitalOcean droplet the controller needs.
@@ -87,21 +88,33 @@ func NewGodoClient(token string) (DOClient, error) {
 }
 
 func (g *godoClient) CreateDroplet(ctx context.Context, in CreateDropletInput) (DODroplet, error) {
+	// Default to the recorder-pool tags; a standalone caller (e.g. the survey
+	// droplet) supplies its own so it is never audited or matched as a recorder.
+	tags := append([]string(nil), dropletTags...)
+	if len(in.Tags) > 0 {
+		tags = append([]string(nil), in.Tags...)
+	}
 	req := &godo.DropletCreateRequest{
 		Name:       in.Name,
 		Region:     in.Region,
 		Size:       in.Size,
 		Image:      parseImage(in.Image),
 		UserData:   in.UserData,
-		Tags:       append([]string(nil), dropletTags...),
+		Tags:       tags,
 		Monitoring: true,
 		IPv6:       false,
 	}
-	if key := strings.TrimSpace(in.SSHKey); key != "" {
+	// SSHKey may be a comma-separated list (numeric id or fingerprint each), so the
+	// survey droplet can add the operator's macbook key alongside the pool key.
+	for _, key := range strings.Split(in.SSHKey, ",") {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
 		if id, err := strconv.Atoi(key); err == nil {
-			req.SSHKeys = []godo.DropletCreateSSHKey{{ID: id}}
+			req.SSHKeys = append(req.SSHKeys, godo.DropletCreateSSHKey{ID: id})
 		} else {
-			req.SSHKeys = []godo.DropletCreateSSHKey{{Fingerprint: key}}
+			req.SSHKeys = append(req.SSHKeys, godo.DropletCreateSSHKey{Fingerprint: key})
 		}
 	}
 	droplet, _, err := g.c.Droplets.Create(ctx, req)

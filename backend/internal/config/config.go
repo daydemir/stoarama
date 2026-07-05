@@ -59,6 +59,21 @@ type Config struct {
 	SurveyResolveTimeoutSec     int
 	SurveyCaptureTimeoutSec     int
 
+	// Survey inline yolo11x detection (#47). Consumed only by
+	// `stoaramactl survey run-once --detect` on the unified survey+detection
+	// droplet. SurveyModelKey/SurveyModelSHA256 are used by cloud-init to fetch +
+	// verify the model; SurveyModelPath is the local path the binary loads. The
+	// onnxruntime shared library path is read directly from ONNXRUNTIME_LIB_PATH.
+	SurveyModelPath             string
+	SurveyModelKey              string
+	SurveyModelSHA256           string
+	SurveyDetectConf            float64
+	SurveyDetectIoU             float64
+	SurveyDetectImgsz           int
+	SurveyDetectIntraOpThreads  int
+	SurveyDetectSampleRate      float64
+	SurveyDetectPipelineVersion string
+
 	// Cloud-recordability probe. Default OFF (ship-dark): with this false the probe
 	// never runs, so no droplet, no ffmpeg, zero spend, and the recordability tables
 	// stay empty. The auto-route wiring reads those (empty) tables regardless and is
@@ -166,6 +181,16 @@ func Load() (Config, error) {
 		SurveyConcurrency:           intEnv("SURVEY_CONCURRENCY", 4),
 		SurveyResolveTimeoutSec:     intEnv("SURVEY_RESOLVE_TIMEOUT_SEC", 60),
 		SurveyCaptureTimeoutSec:     intEnv("SURVEY_CAPTURE_TIMEOUT_SEC", 60),
+
+		SurveyModelPath:             strEnv("SURVEY_MODEL_PATH", "/opt/stoarama/models/yolo11x-1600.onnx"),
+		SurveyModelKey:              strEnv("SURVEY_MODEL_KEY", "survey/models/yolo11x-1600-74c2734984aa83a832cf377efbf8c2169a5f0d0f0b31b0123a852af3ad89c83f.onnx"),
+		SurveyModelSHA256:           strEnv("SURVEY_MODEL_SHA256", "74c2734984aa83a832cf377efbf8c2169a5f0d0f0b31b0123a852af3ad89c83f"),
+		SurveyDetectConf:            floatEnv("SURVEY_DETECT_CONF", 0.10),
+		SurveyDetectIoU:             floatEnv("SURVEY_DETECT_IOU", 0.45),
+		SurveyDetectImgsz:           intEnv("SURVEY_DETECT_IMGSZ", 1600),
+		SurveyDetectIntraOpThreads:  intEnv("SURVEY_DETECT_INTRA_OP_THREADS", 2),
+		SurveyDetectSampleRate:      floatEnv("SURVEY_DETECT_SAMPLE_RATE", 0.15),
+		SurveyDetectPipelineVersion: strEnv("SURVEY_DETECT_PIPELINE_VERSION", "yolo11x-img1600-conf010-notile-v1"),
 
 		StreamRecordabilityProbeEnabled: boolEnv("STREAM_RECORDABILITY_PROBE_ENABLED", false),
 
@@ -316,6 +341,18 @@ func intEnv(key string, def int) int {
 		panic(fmt.Sprintf("invalid int env %s=%q: %v", key, v, err))
 	}
 	return n
+}
+
+func floatEnv(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		panic(fmt.Sprintf("invalid float env %s=%q: %v", key, v, err))
+	}
+	return f
 }
 
 func durEnv(key string, def time.Duration) time.Duration {

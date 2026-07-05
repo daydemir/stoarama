@@ -81,6 +81,8 @@ func main() {
 		runNodes(ctx, cfg, os.Args[2:])
 	case "survey":
 		runSurvey(ctx, cfg, os.Args[2:])
+	case "survey-droplet":
+		runSurveyDroplet(ctx, cfg, os.Args[2:])
 	case "recordability":
 		runRecordability(ctx, cfg, os.Args[2:])
 	case "recorder-control":
