@@ -3160,6 +3160,22 @@
         ['Clip length', `${Number(rec.clip_duration_sec || 0)}s`],
         ['Frame rate', tfps > 0 ? `${tfps} fps` : 'Source'],
       ];
+      // Capture method: persistent row so a relay recording always shows it runs on the
+      // user's computer, independent of the timing banner. Name appears once a computer
+      // holds the lease; before that, has_relay_online answers connected-or-not.
+      if (rec.capture_via === 'relay') {
+        let cap;
+        if (rec.relay_node_name) {
+          cap = `Your computer &middot; <b>${escapeHTML(String(rec.relay_node_name))}</b>`;
+        } else if (rec.has_relay_online === true) {
+          cap = 'Your computer &middot; <b>connected</b>';
+        } else {
+          cap = 'Your computer &middot; <b>none connected</b>';
+        }
+        rows.push(['Capture', cap]);
+      } else {
+        rows.push(['Capture', 'Stoarama cloud']);
+      }
       const startTxt = fmtInstant(rec.start_at);
       const endTxt = fmtInstant(rec.end_at);
       rows.push(['Recording window', `${startTxt || 'Now'} to ${endTxt || 'open-ended'}`]);
