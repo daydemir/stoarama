@@ -59,6 +59,12 @@ type Config struct {
 	SurveyResolveTimeoutSec     int
 	SurveyCaptureTimeoutSec     int
 
+	// Cloud-recordability probe. Default OFF (ship-dark): with this false the probe
+	// never runs, so no droplet, no ffmpeg, zero spend, and the recordability tables
+	// stay empty. The auto-route wiring reads those (empty) tables regardless and is
+	// inert until a probe writes a row.
+	StreamRecordabilityProbeEnabled bool
+
 	// Standalone stream recorder: cron scheduler (runs on the dedicated control service).
 	RecSchedEnabled        bool
 	RecSchedTickSec        int
@@ -160,6 +166,8 @@ func Load() (Config, error) {
 		SurveyConcurrency:           intEnv("SURVEY_CONCURRENCY", 4),
 		SurveyResolveTimeoutSec:     intEnv("SURVEY_RESOLVE_TIMEOUT_SEC", 60),
 		SurveyCaptureTimeoutSec:     intEnv("SURVEY_CAPTURE_TIMEOUT_SEC", 60),
+
+		StreamRecordabilityProbeEnabled: boolEnv("STREAM_RECORDABILITY_PROBE_ENABLED", false),
 
 		RecSchedEnabled:        boolEnv("REC_SCHED_ENABLED", false),
 		RecSchedTickSec:        intEnv("REC_SCHED_TICK_SEC", 15),

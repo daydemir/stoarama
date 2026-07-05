@@ -81,6 +81,8 @@ func main() {
 		runNodes(ctx, cfg, os.Args[2:])
 	case "survey":
 		runSurvey(ctx, cfg, os.Args[2:])
+	case "recordability":
+		runRecordability(ctx, cfg, os.Args[2:])
 	case "recorder-control":
 		runRecorderControl(ctx, cfg, os.Args[2:])
 	case "recording-worker":
@@ -152,6 +154,7 @@ func usage() {
 	  stoaramactl survey run-once [--limit 0 --daily-gate --concurrency 4 --resolve-timeout-sec 60 --capture-timeout-sec 60 --json]
 	  stoaramactl survey coverage [--json]
 	  stoaramactl survey delete-stream-captures --id N --apply
+	  stoaramactl recordability run-once [--batch 1 --window-sec 600 --segment-sec 60 --probe-host LABEL --json] (gated by STREAM_RECORDABILITY_PROBE_ENABLED)
 	  stoaramactl recorder-control run
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]

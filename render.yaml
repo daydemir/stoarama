@@ -97,6 +97,12 @@ services:
         value: "false"
       - key: SURVEY_CONCURRENCY
         value: "4"
+      # Cloud-recordability probe: SHIP-DARK, default off. The probe never runs on
+      # this web dyno (it runs via `stoaramactl recordability run-once` on a DO
+      # egress host). This declares the dark default so the auto-route wiring stays
+      # inert until the flag is flipped on a confirmed DO-egress probe host.
+      - key: STREAM_RECORDABILITY_PROBE_ENABLED
+        value: "false"
       # Standalone stream-recorder billing (Stripe). The API serves Checkout,
       # the customer portal, and the signature-verified webhook. Leaving these
       # unset disables billing and runs recordings in free mode. STRIPE_PRICE_ID +

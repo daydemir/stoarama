@@ -571,6 +571,16 @@
             <input id="relayOptIn" type="checkbox" style="width:auto;min-height:0;margin:0;" />
             <span>Record via your computer instead of our servers</span>
           </label>
+          <!-- Recordability auto-route note (catalog streams the probe flagged as
+               needing relay). Overridable: unchecking switches back to our servers. -->
+          <div id="relayRecommend" class="hidden" style="margin-top:10px;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--panel2) 70%,transparent);">
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px;">This stream needs a connected computer</div>
+            <div id="relayRecommendDetail" style="font-size:12px;color:var(--muted);line-height:1.5;">We could not record it from our servers, so it defaults to recording via your computer. You can switch back if you want.</div>
+            <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;cursor:pointer;">
+              <input id="relayRecommendOptIn" type="checkbox" checked style="width:auto;min-height:0;margin:0;" />
+              <span>Record via your computer (recommended)</span>
+            </label>
+          </div>
           <video id="streamPreview" class="video-preview hidden" muted playsinline autoplay></video>
         </div>
         <div class="field">
@@ -879,6 +889,9 @@
       relayGateCta: document.getElementById('relayGateCta'),
       relayOptInRow: document.getElementById('relayOptInRow'),
       relayOptIn: document.getElementById('relayOptIn'),
+      relayRecommend: document.getElementById('relayRecommend'),
+      relayRecommendDetail: document.getElementById('relayRecommendDetail'),
+      relayRecommendOptIn: document.getElementById('relayRecommendOptIn'),
       relayBanner: document.getElementById('relayBanner'),
       relayBannerTitle: document.getElementById('relayBannerTitle'),
       relayBannerBody: document.getElementById('relayBannerBody'),
@@ -1024,6 +1037,10 @@
       // When set, the composer is locked to this catalog stream: the paste field is
       // hidden and create posts stream_id (server derives stream_url).
       catalogStreamId: 0,
+      // True when the recordability probe flagged this catalog stream (or its
+      // provider) as needing relay: the composer shows an overridable note and
+      // defaults capture to relay unless the user unchecks it.
+      relayRecommended: false,
       // Bucket connection gate (change 1): 'idle' | 'checking' | 'connected' | 'error'.
       bucketState: 'idle',
       // Stream probe gate (change 2): the authoritative server verdict. ok===true
@@ -3970,16 +3987,42 @@
       state.streamProbe = { token: state.streamProbe.token + 1, ok: true };
       if (!els.recName.value) els.recName.value = trimName(stream.name, 60);
       refreshStartEnabled();
+      loadRelayRecommendation(id);
+    }
+
+    // Fetch the recordability recommendation for a catalog stream (pure DB read,
+    // no server ffmpeg) and show the overridable note when the stream/provider was
+    // flagged as needing relay. Best-effort: any failure leaves the note hidden.
+    async function loadRelayRecommendation(streamId) {
+      state.relayRecommended = false;
+      els.relayRecommend.classList.add('hidden');
+      els.relayRecommendOptIn.checked = true;
+      if (!(Number(streamId) > 0)) return;
+      try {
+        const out = await fetchJSON('/api/v1/account/recordings/probe', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stream_id: Number(streamId), recommend_only: true }),
+        });
+        if (Number(state.catalogStreamId) !== Number(streamId)) return; // superseded
+        if (out && out.relay_recommended === true) {
+          state.relayRecommended = true;
+          if (out.relay_reason) els.relayRecommendDetail.textContent = `${String(out.relay_reason)} You can switch back if you want.`;
+          els.relayRecommend.classList.remove('hidden');
+        }
+      } catch (_) { /* recommendation is best-effort */ }
     }
 
     // Clear any catalog lock so the next composer open is a normal paste flow.
     function clearCatalogLock() {
       state.catalogStreamId = 0;
+      state.relayRecommended = false;
       els.recStreamID.value = '';
       els.urlField.classList.remove('hidden');
       els.catalogStreamBlock.classList.add('hidden');
       els.catalogFramePreview.removeAttribute('src');
       els.catalogFramePreview.classList.add('hidden');
+      els.relayRecommend.classList.add('hidden');
+      els.relayRecommendOptIn.checked = true;
     }
 
     // Land prefilled from a catalog stream (?stream_id=). Fetches the public detail
@@ -4165,8 +4208,13 @@
       // Capture routing: YouTube URLs always record via a relay (the server forces
       // this too); a non-YouTube paste can opt in via the checkbox. Cloud is the
       // default, so send capture_via only when relay is requested.
-      if (!catalogId && (isYouTubeURL(url) || els.relayOptIn.checked)) {
-        body.capture_via = 'relay';
+      if (!catalogId) {
+        if (isYouTubeURL(url) || els.relayOptIn.checked) body.capture_via = 'relay';
+      } else if (state.relayRecommended) {
+        // Flagged catalog stream: the note defaults to relay but is overridable.
+        // Checked => relay; unchecked => send explicit 'cloud' so the server honors
+        // the override instead of re-applying the auto-route default.
+        body.capture_via = els.relayRecommendOptIn.checked ? 'relay' : 'cloud';
       }
       state.starting = true;
       els.startBtn.disabled = true;
