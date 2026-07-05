@@ -3505,6 +3505,10 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		// stream, or null if none. It drives the streams "Record" -> "View/Edit
 		// recording" CTA flip. Scoped to the browser session's current org.
 		RecordingID *int64 `json:"recording_id"`
+		// Survey detection snapshot (latest sampled frame, null if no data yet).
+		SurveyLastPersonCount  *int64     `json:"survey_last_person_count,omitempty"`
+		SurveyLastVehicleCount *int64     `json:"survey_last_vehicle_count,omitempty"`
+		SurveyLastSampledAt    *time.Time `json:"survey_last_sampled_at,omitempty"`
 	}
 	items := make([]item, 0, limit)
 	args = append(args, limit, offset)
@@ -3528,11 +3532,24 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			rt.last_error_text,
 			COALESCE(sis.inferenced_captures, 0)::bigint,
 			COALESCE(sis.person_detections_total, 0)::bigint,
-			COALESCE(sis.avg_people_per_inferenced_capture, 0)::double precision
+			COALESCE(sis.avg_people_per_inferenced_capture, 0)::double precision,
+			det.survey_last_person,
+			det.survey_last_vehicle,
+			det.survey_last_sampled_at
 		FROM streams s
 		LEFT JOIN stream_health sh ON sh.stream_id = s.id
 		LEFT JOIN stream_capture_runtime rt ON rt.stream_id = s.id
 		LEFT JOIN stream_inference_stats sis ON sis.stream_id = s.id
+		LEFT JOIN LATERAL (
+			SELECT
+				person_count                                           AS survey_last_person,
+				(car_count + motorcycle_count + bus_count + truck_count) AS survey_last_vehicle,
+				captured_at                                            AS survey_last_sampled_at
+			FROM survey_detections sd
+			WHERE sd.stream_id = s.id
+			ORDER BY sd.captured_at DESC
+			LIMIT 1
+		) det ON true
 		WHERE %s
 			ORDER BY %s %s NULLS LAST, s.id ASC
 			LIMIT $%d OFFSET $%d
@@ -3554,6 +3571,8 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		var runtimeStatus, runtimeMode, runtimeResolved, runtimeError *string
 		var runtimeLastFrame *time.Time
 		var runtimeErrors *int
+		var surveyLastPerson, surveyLastVehicle *int64
+		var surveyLastSampledAt *time.Time
 		if err := rows.Scan(
 			&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
 			&stream.SourceFamily,
@@ -3565,6 +3584,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			&capturesTotal, &capturesSuccess, &capturesError,
 			&runtimeStatus, &runtimeMode, &runtimeResolved, &runtimeLastFrame, &runtimeErrors, &runtimeError,
 			&inferencedCaptures, &personDetectionsTotal, &avgPeoplePerInferencedCapture,
+			&surveyLastPerson, &surveyLastVehicle, &surveyLastSampledAt,
 		); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan dashboard stream: %v", err))
 			return
@@ -3590,6 +3610,9 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			PersonDetectionsTotal:         personDetectionsTotal,
 			AvgPeoplePerInferencedCapture: avgPeoplePerInferencedCapture,
 			CaptureUnit:                   captureUnitLabelForExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))),
+			SurveyLastPersonCount:         surveyLastPerson,
+			SurveyLastVehicleCount:        surveyLastVehicle,
+			SurveyLastSampledAt:           surveyLastSampledAt,
 		}
 		if isClipNativeExecutionClass(firstNonEmpty(string(stream.ExecutionClass), derefString(runtimeMode))) {
 			it.TargetFPS = capture.SegmentTargetFPS
@@ -6153,6 +6176,29 @@ func (s *Server) handleDashboardStreamDetail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	type surveySnapshot struct {
+		LastPersonCount  int64     `json:"last_person_count"`
+		LastVehicleCount int64     `json:"last_vehicle_count"`
+		LastSampledAt    time.Time `json:"last_sampled_at"`
+	}
+	var snap *surveySnapshot
+	var sp surveySnapshot
+	snapErr := s.pool.QueryRow(r.Context(), `
+		SELECT person_count,
+		       car_count + motorcycle_count + bus_count + truck_count,
+		       captured_at
+		FROM survey_detections
+		WHERE stream_id = $1
+		ORDER BY captured_at DESC
+		LIMIT 1
+	`, id).Scan(&sp.LastPersonCount, &sp.LastVehicleCount, &sp.LastSampledAt)
+	if snapErr == nil {
+		snap = &sp
+	} else if !errors.Is(snapErr, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query survey snapshot: %v", snapErr))
+		return
+	}
+
 	where := []string{"f.stream_id=$1"}
 	args := make([]any, 0, 18)
 	args = append(args, id)
@@ -6331,12 +6377,13 @@ func (s *Server) handleDashboardStreamDetail(w http.ResponseWriter, r *http.Requ
 	}
 
 	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"stream":       stream,
-		"latest_frame": lfPtr,
-		"inference":    items,
-		"recording_id": recordingID,
-		"limit":        limit,
-		"offset":       offset,
+		"stream":          stream,
+		"latest_frame":    lfPtr,
+		"inference":       items,
+		"recording_id":    recordingID,
+		"survey_snapshot": snap,
+		"limit":           limit,
+		"offset":          offset,
 	})
 }
 

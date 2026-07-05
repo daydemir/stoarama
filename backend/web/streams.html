@@ -1766,6 +1766,7 @@
 	            <th style="width:128px;">Thumb</th>
 	            <th data-sort-key="name">Stream</th>
 	            <th data-sort-key="location_city">Location</th>
+	            <th>Seen</th>
 	            <th>Record</th>
 	          </tr>
 	        </thead>
@@ -1781,6 +1782,7 @@
         <a href="/streams" class="back-link" id="backLink">Streams</a>
         <div class="detail-title" id="detailTitle"></div>
         <div class="detail-meta" id="detailMeta"></div>
+        <div id="detailSurveySnap" style="margin-top:6px;"></div>
       </div>
       <div class="detail-header-actions">
         <a id="detailRecordCTA" class="overview-card-link primary" href="/recordings">Set up recording</a>
@@ -2332,6 +2334,13 @@ function compareSortValues(a, b) {
 function fmtPct(num, den) {
   if (!den) return '-';
   return `${((num / den) * 100).toFixed(1)}%`;
+}
+
+function renderSurveySnapshotTerse(row) {
+  const p = row && row.survey_last_person_count;
+  const v = row && row.survey_last_vehicle_count;
+  if (p == null && v == null) return '<span class="muted fs11">no data yet</span>';
+  return esc(`${Number(p || 0)}p / ${Number(v || 0)}v`);
 }
 
 function peoplePerInferenceMetric(row) {
@@ -4940,7 +4949,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="5" style="padding:20px;">
+        <td colspan="6" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -4981,6 +4990,7 @@ function renderStreamRows() {
         </div>
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
+      <td class="muted fs11 mono">${renderSurveySnapshotTerse(row)}</td>
       <td class="stream-record-cell">${
         recordable
           ? (streamRecordingID(row) > 0
@@ -5663,6 +5673,18 @@ async function loadDetail(options = {}) {
     description ? `<div class="muted fs11" style="margin-top:6px;">${esc(description)}</div>` : '',
     renderDetailTagChips(s),
   ].filter(Boolean).join('');
+  const surveyEl = $('detailSurveySnap');
+  if (surveyEl) {
+    const p = payload.survey_snapshot && payload.survey_snapshot.last_person_count;
+    const v = payload.survey_snapshot && payload.survey_snapshot.last_vehicle_count;
+    const t = payload.survey_snapshot && payload.survey_snapshot.last_sampled_at;
+    if (p == null) {
+      surveyEl.innerHTML = '<span class="muted fs11">Seen: no data yet</span>';
+    } else {
+      const dateLabel = t ? formatDateTimeShort(t) : 'n/a';
+      surveyEl.innerHTML = `<span class="muted fs11">Seen: <strong>${Number(p || 0)} people, ${Number(v || 0)} vehicles</strong> (sampled ${esc(dateLabel)})</span>`;
+    }
+  }
   knownStreamTags = normalizeTags(knownStreamTags.concat(normalizeTags(s.tags || [])));
   refreshTagSuggestionList();
 
