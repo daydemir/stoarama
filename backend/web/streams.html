@@ -1693,6 +1693,11 @@
             <option value="">all regions</option>
           </select>
         </div>
+        <div class="filter-field">
+          <div class="filter-field-label">Seen</div>
+          <label class="check-label"><input type="checkbox" id="seenPeopleFilter" /> Has people</label>
+          <label class="check-label"><input type="checkbox" id="seenVehiclesFilter" /> Has vehicles</label>
+        </div>
       </div>
       <div class="filter-footer">
         <div class="row">
@@ -1766,7 +1771,7 @@
 	            <th style="width:128px;">Thumb</th>
 	            <th data-sort-key="name">Stream</th>
 	            <th data-sort-key="location_city">Location</th>
-	            <th>Seen</th>
+	            <th data-sort-key="survey_last_person_count">Seen</th>
 	            <th>Record</th>
 	          </tr>
 	        </thead>
@@ -3392,6 +3397,8 @@ async function resetStreamFilters() {
   countryFilter.value = '';
   cityFilter.value = '';
   streamTouchedPipelineID = '';
+  seenPeopleFilter.checked = false;
+  seenVehiclesFilter.checked = false;
   streamSortBy = DEFAULT_STREAM_SORT_BY;
   streamSortDir = DEFAULT_STREAM_SORT_DIR;
   streamPage = 1;
@@ -4619,6 +4626,8 @@ function buildStreamFilterParams() {
   if (countryFilter.value.trim()) params.set('country', countryFilter.value.trim());
   if (cityFilter.value.trim()) params.set('city', cityFilter.value.trim());
   if (String(streamTouchedPipelineID || '').trim()) params.set('touched_pipeline_id', String(streamTouchedPipelineID).trim());
+  if (seenPeopleFilter.checked) params.set('seen_people', '1');
+  if (seenVehiclesFilter.checked) params.set('seen_vehicles', '1');
   return params;
 }
 
@@ -4635,6 +4644,8 @@ function applyStreamListStateFromURL(params) {
   setSelectValuePreservingOption(countryFilter, params.get('country'), countryDisplayLabel);
   setSelectValuePreservingOption(cityFilter, params.get('city'), cityDisplayLabel);
   streamTouchedPipelineID = String(params.get('touched_pipeline_id') || '').trim();
+  seenPeopleFilter.checked = params.get('seen_people') === '1' || params.get('seen_people') === 'true';
+  seenVehiclesFilter.checked = params.get('seen_vehicles') === '1' || params.get('seen_vehicles') === 'true';
 
   const sortBy = String(params.get('sort_by') || '').trim();
   streamSortBy = sortBy || DEFAULT_STREAM_SORT_BY;

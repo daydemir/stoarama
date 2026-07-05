@@ -3423,6 +3423,28 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 			WHERE f_touch.stream_id=s.id AND ir_touch.pipeline_id=$%d
 		)`, len(args)))
 	}
+	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("seen_people"))); raw == "1" || raw == "true" {
+		where = append(where, `EXISTS (
+			SELECT 1 FROM (
+				SELECT person_count
+				FROM survey_detections
+				WHERE stream_id = s.id
+				ORDER BY captured_at DESC
+				LIMIT 1
+			) _sp WHERE _sp.person_count > 0
+		)`)
+	}
+	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("seen_vehicles"))); raw == "1" || raw == "true" {
+		where = append(where, `EXISTS (
+			SELECT 1 FROM (
+				SELECT car_count + motorcycle_count + bus_count + truck_count AS vc
+				FROM survey_detections
+				WHERE stream_id = s.id
+				ORDER BY captured_at DESC
+				LIMIT 1
+			) _sv WHERE _sv.vc > 0
+		)`)
+	}
 	return where, args, nil
 }
 
@@ -3454,6 +3476,8 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		"runtime_status":                    "COALESCE(rt.status, '')",
 		"tags_count":                        "COALESCE(array_length(s.tags, 1), 0)",
 		"id":                                "s.id",
+		"survey_last_person_count":          "det.survey_last_person",
+		"survey_last_vehicle_count":         "det.survey_last_vehicle",
 	}
 	orderExpr, _, sortDir, ok := parseSortQuery(w, r, orderColumns, "avg_people_per_inferenced_capture", "desc")
 	if !ok {
