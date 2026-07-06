@@ -115,8 +115,6 @@ func TestBuildGSSTagsUsesBoundedColumnTags(t *testing.T) {
 	tags := buildGSSTags(row)
 	want := []string{
 		"list-vittorio",
-		"gss:country:south-korea",
-		"gss:collector:donghwan-don",
 		"gss:valid:no",
 	}
 	for _, tag := range want {
@@ -125,8 +123,8 @@ func TestBuildGSSTagsUsesBoundedColumnTags(t *testing.T) {
 		}
 	}
 	for _, tag := range tags {
-		if len(tag) > len("gss:comments:")+80 {
-			t.Fatalf("tag too long: %q", tag)
+		if tag != "list-vittorio" && tag != "gss:valid:no" {
+			t.Fatalf("unexpected high-cardinality tag: %q", tag)
 		}
 	}
 }
@@ -240,6 +238,119 @@ func TestLoadApprovedGSSApplyReportRejectsUnsafeReports(t *testing.T) {
 			}
 			if _, err := loadApprovedGSSApplyReport(path, gssOptions{TargetAPIURL: gssProductionAPIURL}); err == nil {
 				t.Fatalf("expected unsafe report rejection")
+			}
+		})
+	}
+}
+
+func TestBuildGSSTagCleanupReportRemovesOnlyNonSemanticGSSTags(t *testing.T) {
+	source := gssTestVerifyReport()
+	source.Apply = true
+	source.Results[0].Applied = true
+	source.Results[0].AppliedStreamID = 123
+	source.Results[0].Tags = []string{
+		"list-nils",
+		"gss:valid:no",
+		"gss:country:italy",
+		"gss:location:town-square",
+		"legacy-tag",
+	}
+	source.Results[1].Applied = true
+	source.Results[1].AppliedStreamID = 456
+	source.Results[1].Tags = []string{
+		"list-vittorio",
+		"gss:valid:yes",
+		"gss:source:https-example-com-live",
+	}
+
+	report := buildGSSTagCleanupReport(gssOptions{
+		TargetAPIURL:      gssProductionAPIURL,
+		CleanupTagsReport: "import.json",
+	}, source)
+	if report.StreamsToChange != 2 {
+		t.Fatalf("streams_to_change=%d want 2", report.StreamsToChange)
+	}
+	if report.TagsToRemove != 3 {
+		t.Fatalf("tags_to_remove=%d want 3", report.TagsToRemove)
+	}
+	first := report.Items[0]
+	if first.StreamID != 123 {
+		t.Fatalf("first stream id=%d want 123", first.StreamID)
+	}
+	for _, removed := range []string{"gss:country:italy", "gss:location:town-square"} {
+		if !gssContainsString(first.RemoveTags, removed) {
+			t.Fatalf("missing removed tag %q in %#v", removed, first.RemoveTags)
+		}
+	}
+	if !gssContainsString(first.KeepTags, "gss:valid:no") {
+		t.Fatalf("valid tag should be kept: %#v", first.KeepTags)
+	}
+	if gssContainsString(first.RemoveTags, "legacy-tag") {
+		t.Fatalf("non-GSS tag must not be removed")
+	}
+}
+
+func TestLoadApprovedGSSTagCleanupSourceReportRejectsUnsafeReports(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*gssReport)
+	}{
+		{
+			name: "not apply report",
+			mutate: func(report *gssReport) {
+				report.Apply = false
+			},
+		},
+		{
+			name: "not reviewed",
+			mutate: func(report *gssReport) {
+				report.ReviewApproved = false
+			},
+		},
+		{
+			name: "wrong target",
+			mutate: func(report *gssReport) {
+				report.TargetAPIURL = "https://stoarama-api.onrender.com"
+			},
+		},
+		{
+			name: "apply errors",
+			mutate: func(report *gssReport) {
+				report.ApplyErrors = 1
+			},
+		},
+		{
+			name: "bad apply counts",
+			mutate: func(report *gssReport) {
+				report.CountsByApplyAction[gssApplyTaggedExisting] = 99
+			},
+		},
+		{
+			name: "applied non-applyable status",
+			mutate: func(report *gssReport) {
+				report.Results[2].Applied = true
+				report.Results[2].AppliedStreamID = 777
+				report.Results[2].ApplyAction = gssApplyTaggedExisting
+				report.CountsByApplyAction = gssCountsByApplyAction(report.Results)
+			},
+		},
+		{
+			name: "missing applied stream id",
+			mutate: func(report *gssReport) {
+				report.Results[0].AppliedStreamID = 0
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "apply.json")
+			report := gssTestApplyReport()
+			tt.mutate(&report)
+			if err := writeGSSReport(path, report); err != nil {
+				t.Fatalf("write report: %v", err)
+			}
+			if _, err := loadApprovedGSSTagCleanupSourceReport(path, gssOptions{TargetAPIURL: gssProductionAPIURL}); err == nil {
+				t.Fatalf("expected unsafe cleanup report rejection")
 			}
 		})
 	}
@@ -392,4 +503,19 @@ func gssTestVerifyReport() gssReport {
 		CountsByApplyAction: map[gssApplyAction]int{},
 		Results:             results,
 	}
+}
+
+func gssTestApplyReport() gssReport {
+	report := gssTestVerifyReport()
+	report.Apply = true
+	report.ReviewApproved = true
+	report.Results[0].Applied = true
+	report.Results[0].AppliedStreamID = 123
+	report.Results[0].ApplyAction = gssApplyTaggedExisting
+	report.Results[1].Applied = true
+	report.Results[1].AppliedStreamID = 456
+	report.Results[1].ApplyAction = gssApplyCreatedAndTagged
+	report.Results[1].Created = true
+	report.CountsByApplyAction = gssCountsByApplyAction(report.Results)
+	return report
 }

@@ -486,6 +486,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/imports/streams/repair-canonical-capture", s.handleServiceStreamCanonicalCaptureRepair)
 			service.Post("/imports/streams/repair-image-capture", s.handleServiceStreamImageCaptureRepair)
 			service.Post("/service/streams/{id}/tags", s.handleServiceStreamTagsAdd)
+			service.Delete("/service/streams/{id}/tags", s.handleServiceStreamTagsRemove)
 			service.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
 			service.Post("/processing/worker-heartbeat", s.handleProcessingWorkerHeartbeat)
 			service.Post("/processing/worker-stopped", s.handleProcessingWorkerStopped)

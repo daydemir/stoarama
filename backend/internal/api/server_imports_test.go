@@ -37,3 +37,17 @@ func TestServiceStreamByExternalIDRejectsMissingParams(t *testing.T) {
 		t.Fatalf("unexpected body: %s", rec.Body.String())
 	}
 }
+
+func TestServiceStreamTagsRemoveRejectsEmptyTags(t *testing.T) {
+	s := &Server{}
+	rec := httptest.NewRecorder()
+
+	s.handleServiceStreamTagsRemove(rec, requestWithID(http.MethodDelete, "7", `{"tags":[]}`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "tags must contain at least one tag") {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}

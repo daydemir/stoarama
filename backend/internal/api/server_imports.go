@@ -483,6 +483,10 @@ type serviceStreamTagsAddRequest struct {
 	Tags []string `json:"tags"`
 }
 
+type serviceStreamTagsRemoveRequest struct {
+	Tags []string `json:"tags"`
+}
+
 func (s *Server) handleServiceStreamTagsAdd(w http.ResponseWriter, r *http.Request) {
 	streamID, ok := parseInt64Path(w, r, "id")
 	if !ok {
@@ -516,6 +520,69 @@ func (s *Server) handleServiceStreamTagsAdd(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	updatedTags := dedupeStrings(append(current.Tags, tagsToAdd...))
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE streams
+		SET tags=$2, updated_at=now()
+		WHERE id=$1
+	`, streamID, updatedTags); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update stream tags: %v", err))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit tag update tx: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"stream_id": streamID,
+		"tags":      updatedTags,
+	})
+}
+
+func (s *Server) handleServiceStreamTagsRemove(w http.ResponseWriter, r *http.Request) {
+	streamID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req serviceStreamTagsRemoveRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	tagsToRemove := dedupeStrings(req.Tags)
+	if len(tagsToRemove) == 0 {
+		util.WriteError(w, http.StatusBadRequest, "tags must contain at least one tag")
+		return
+	}
+
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin tag update tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	current, err := s.loadStreamForAssignmentTx(r.Context(), tx, streamID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "stream not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load stream: %v", err))
+		return
+	}
+	removeSet := map[string]struct{}{}
+	for _, tag := range tagsToRemove {
+		removeSet[tag] = struct{}{}
+	}
+	kept := make([]string, 0, len(current.Tags))
+	for _, tag := range current.Tags {
+		if _, drop := removeSet[tag]; drop {
+			continue
+		}
+		kept = append(kept, tag)
+	}
+	updatedTags := dedupeStrings(kept)
 	if _, err := tx.Exec(r.Context(), `
 		UPDATE streams
 		SET tags=$2, updated_at=now()

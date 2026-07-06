@@ -185,20 +185,46 @@ type gssReport struct {
 	Results             []gssResult            `json:"results"`
 }
 
+type gssTagCleanupItem struct {
+	StreamID   int64    `json:"stream_id"`
+	ListTags   []string `json:"list_tags"`
+	RemoveTags []string `json:"remove_tags"`
+	KeepTags   []string `json:"keep_tags"`
+	RowRefs    []string `json:"row_refs"`
+	Applied    bool     `json:"applied"`
+	Error      string   `json:"error,omitempty"`
+}
+
+type gssTagCleanupReport struct {
+	TargetAPIURL    string              `json:"target_api_url"`
+	Apply           bool                `json:"apply"`
+	ReviewApproved  bool                `json:"review_approved"`
+	GeneratedAt     time.Time           `json:"generated_at"`
+	SourceReport    string              `json:"source_report"`
+	Policy          string              `json:"policy"`
+	StreamsToChange int                 `json:"streams_to_change"`
+	TagsToRemove    int                 `json:"tags_to_remove"`
+	TagsToKeep      int                 `json:"tags_to_keep"`
+	AppliedStreams  int                 `json:"applied_streams"`
+	Errors          int                 `json:"errors"`
+	Items           []gssTagCleanupItem `json:"items"`
+}
+
 type gssOptions struct {
-	TargetAPIURL   string
-	ServiceToken   string
-	NilsCSV        string
-	VittorioCSV    string
-	Limit          int
-	Concurrency    int
-	ProbeTimeout   time.Duration
-	ImportTimeout  time.Duration
-	Apply          bool
-	ReviewApproved bool
-	ReportJSON     string
-	ApplyReport    string
-	AsJSON         bool
+	TargetAPIURL      string
+	ServiceToken      string
+	NilsCSV           string
+	VittorioCSV       string
+	Limit             int
+	Concurrency       int
+	ProbeTimeout      time.Duration
+	ImportTimeout     time.Duration
+	Apply             bool
+	ReviewApproved    bool
+	ReportJSON        string
+	ApplyReport       string
+	CleanupTagsReport string
+	AsJSON            bool
 }
 
 func runImportGlobalStreetScores(ctx context.Context, cfg config.Config, args []string) {
@@ -215,23 +241,25 @@ func runImportGlobalStreetScores(ctx context.Context, cfg config.Config, args []
 	reviewApproved := fs.Bool("review-approved", false, "required with --apply after review-agent approval")
 	reportJSON := fs.String("report-json", "local/reports/global-street-scores-import-report.json", "report JSON path")
 	applyReport := fs.String("apply-report", "", "apply from a previously approved verify-only report instead of re-probing rows")
+	cleanupTagsReport := fs.String("cleanup-tags-report", "", "remove non-useful GSS tags from streams in a completed import report")
 	asJSON := fs.Bool("json", false, "print JSON report")
 	_ = fs.Parse(args)
 
 	opts := gssOptions{
-		TargetAPIURL:   strings.TrimRight(strings.TrimSpace(*targetAPIURL), "/"),
-		ServiceToken:   strings.TrimSpace(*serviceToken),
-		NilsCSV:        strings.TrimSpace(*nilsCSV),
-		VittorioCSV:    strings.TrimSpace(*vittorioCSV),
-		Limit:          *limit,
-		Concurrency:    *concurrency,
-		ProbeTimeout:   time.Duration(*probeTimeoutSec) * time.Second,
-		ImportTimeout:  time.Duration(*importTimeoutSec) * time.Second,
-		Apply:          *apply,
-		ReviewApproved: *reviewApproved,
-		ReportJSON:     strings.TrimSpace(*reportJSON),
-		ApplyReport:    strings.TrimSpace(*applyReport),
-		AsJSON:         *asJSON,
+		TargetAPIURL:      strings.TrimRight(strings.TrimSpace(*targetAPIURL), "/"),
+		ServiceToken:      strings.TrimSpace(*serviceToken),
+		NilsCSV:           strings.TrimSpace(*nilsCSV),
+		VittorioCSV:       strings.TrimSpace(*vittorioCSV),
+		Limit:             *limit,
+		Concurrency:       *concurrency,
+		ProbeTimeout:      time.Duration(*probeTimeoutSec) * time.Second,
+		ImportTimeout:     time.Duration(*importTimeoutSec) * time.Second,
+		Apply:             *apply,
+		ReviewApproved:    *reviewApproved,
+		ReportJSON:        strings.TrimSpace(*reportJSON),
+		ApplyReport:       strings.TrimSpace(*applyReport),
+		CleanupTagsReport: strings.TrimSpace(*cleanupTagsReport),
+		AsJSON:            *asJSON,
 	}
 	if err := validateGSSOptions(opts); err != nil {
 		log.Fatalf("global-street-scores: %v", err)
@@ -239,6 +267,12 @@ func runImportGlobalStreetScores(ctx context.Context, cfg config.Config, args []
 	if opts.ApplyReport != "" {
 		if err := applyGSSReport(ctx, opts); err != nil {
 			log.Fatalf("global-street-scores apply report: %v", err)
+		}
+		return
+	}
+	if opts.CleanupTagsReport != "" {
+		if err := cleanupGSSTags(ctx, opts); err != nil {
+			log.Fatalf("global-street-scores cleanup tags: %v", err)
 		}
 		return
 	}
@@ -324,6 +358,9 @@ func validateGSSOptions(opts gssOptions) error {
 	}
 	if opts.ApplyReport != "" && !opts.Apply {
 		return fmt.Errorf("--apply-report requires --apply")
+	}
+	if opts.ApplyReport != "" && opts.CleanupTagsReport != "" {
+		return fmt.Errorf("--apply-report and --cleanup-tags-report cannot be combined")
 	}
 	return nil
 }
@@ -419,6 +456,211 @@ func loadApprovedGSSApplyReport(path string, opts gssOptions) (gssReport, error)
 	return report, nil
 }
 
+func cleanupGSSTags(ctx context.Context, opts gssOptions) error {
+	source, err := loadApprovedGSSTagCleanupSourceReport(opts.CleanupTagsReport, opts)
+	if err != nil {
+		return err
+	}
+	report := buildGSSTagCleanupReport(opts, source)
+	if opts.ReportJSON != "" {
+		if err := preflightGSSReportPath(opts.ReportJSON); err != nil {
+			return fmt.Errorf("preflight Global Street Scores cleanup report path: %w", err)
+		}
+		if err := writeGSSTagCleanupReport(opts.ReportJSON, report); err != nil {
+			return fmt.Errorf("write Global Street Scores cleanup pre-apply report: %w", err)
+		}
+	}
+	if opts.Apply {
+		for i := range report.Items {
+			if len(report.Items[i].RemoveTags) == 0 {
+				continue
+			}
+			if err := removeGSSStreamTags(ctx, opts, report.Items[i].StreamID, report.Items[i].RemoveTags); err != nil {
+				report.Items[i].Error = err.Error()
+				report.Errors++
+				_ = writeGSSTagCleanupReport(opts.ReportJSON, report)
+				return fmt.Errorf("remove tags from stream %d: %w", report.Items[i].StreamID, err)
+			}
+			report.Items[i].Applied = true
+			report.AppliedStreams++
+			if opts.ReportJSON != "" {
+				if err := writeGSSTagCleanupReport(opts.ReportJSON, report); err != nil {
+					return fmt.Errorf("write Global Street Scores cleanup report after stream %d: %w", report.Items[i].StreamID, err)
+				}
+			}
+		}
+	}
+	report.GeneratedAt = time.Now().UTC()
+	if opts.ReportJSON != "" {
+		if err := writeGSSTagCleanupReport(opts.ReportJSON, report); err != nil {
+			return fmt.Errorf("write Global Street Scores cleanup report: %w", err)
+		}
+	}
+	if opts.AsJSON {
+		printJSON(report)
+		return nil
+	}
+	fmt.Printf("Global Street Scores tag cleanup: streams_to_change=%d tags_to_remove=%d tags_to_keep=%d applied_streams=%d errors=%d report=%s\n",
+		report.StreamsToChange,
+		report.TagsToRemove,
+		report.TagsToKeep,
+		report.AppliedStreams,
+		report.Errors,
+		opts.ReportJSON,
+	)
+	return nil
+}
+
+func loadGSSReport(path string) (gssReport, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return gssReport{}, err
+	}
+	var report gssReport
+	if err := json.Unmarshal(b, &report); err != nil {
+		return gssReport{}, err
+	}
+	return report, nil
+}
+
+func loadApprovedGSSTagCleanupSourceReport(path string, opts gssOptions) (gssReport, error) {
+	report, err := loadGSSReport(path)
+	if err != nil {
+		return gssReport{}, err
+	}
+	report.TargetAPIURL = strings.TrimRight(strings.TrimSpace(report.TargetAPIURL), "/")
+	if !report.Apply {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report must point to an apply report")
+	}
+	if !report.ReviewApproved {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report must be review approved")
+	}
+	if report.TargetAPIURL != opts.TargetAPIURL {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report target_api_url=%q does not match --target-api-url=%q", report.TargetAPIURL, opts.TargetAPIURL)
+	}
+	if report.TargetAPIURL != gssProductionAPIURL {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report target_api_url must be %s", gssProductionAPIURL)
+	}
+	if report.ApplyErrors != 0 {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report has apply_errors=%d", report.ApplyErrors)
+	}
+	if report.RowsTotal <= 0 {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report rows_total must be > 0")
+	}
+	if report.RowsProcessed != len(report.Results) {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report rows_processed=%d but results=%d", report.RowsProcessed, len(report.Results))
+	}
+	if report.RowsProcessed > report.RowsTotal {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report rows_processed cannot exceed rows_total")
+	}
+	expectedStatusCounts := gssCountsByStatus(report.Results)
+	if !gssStatusCountsEqual(report.CountsByStatus, expectedStatusCounts) {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report status counts do not match results")
+	}
+	expectedApplyCounts := gssCountsByApplyAction(report.Results)
+	if !gssApplyActionCountsEqual(report.CountsByApplyAction, expectedApplyCounts) {
+		return gssReport{}, fmt.Errorf("--cleanup-tags-report apply action counts do not match results")
+	}
+	for i := range report.Results {
+		if err := validateGSSTagCleanupSourceResult(report.Results[i]); err != nil {
+			return gssReport{}, fmt.Errorf("--cleanup-tags-report result %d row %d: %w", i, report.Results[i].RowNumber, err)
+		}
+	}
+	return report, nil
+}
+
+func validateGSSTagCleanupSourceResult(result gssResult) error {
+	if result.ApplyError != "" {
+		return fmt.Errorf("contains apply_error")
+	}
+	if !result.Applied {
+		if result.ApplyAction != gssApplyNone || result.AppliedStreamID != 0 || result.Created {
+			return fmt.Errorf("unapplied result contains apply metadata")
+		}
+		return nil
+	}
+	if !result.Status.AllowApply() {
+		return fmt.Errorf("applied result has non-applyable status %q", result.Status)
+	}
+	if result.AppliedStreamID <= 0 {
+		return fmt.Errorf("applied result has no applied_stream_id")
+	}
+	switch result.ApplyAction {
+	case gssApplyTaggedExisting, gssApplyTaggedExistingSource, gssApplyCreatedAndTagged:
+	default:
+		return fmt.Errorf("applied result has invalid apply_action %q", result.ApplyAction)
+	}
+	if !gssContainsString(result.Tags, result.List.Tag()) {
+		return fmt.Errorf("missing list tag %q", result.List.Tag())
+	}
+	return nil
+}
+
+func buildGSSTagCleanupReport(opts gssOptions, source gssReport) gssTagCleanupReport {
+	itemsByStream := map[int64]*gssTagCleanupItem{}
+	for _, result := range source.Results {
+		if !result.Applied {
+			continue
+		}
+		streamID := result.AppliedStreamID
+		if streamID <= 0 {
+			streamID = result.StreamID
+		}
+		if streamID <= 0 {
+			continue
+		}
+		item := itemsByStream[streamID]
+		if item == nil {
+			item = &gssTagCleanupItem{StreamID: streamID}
+			itemsByStream[streamID] = item
+		}
+		item.RowRefs = append(item.RowRefs, fmt.Sprintf("%s:%d", result.List.String(), result.RowNumber))
+		for _, tag := range result.Tags {
+			switch {
+			case tag == gssListNils.Tag() || tag == gssListVittorio.Tag():
+				item.ListTags = append(item.ListTags, tag)
+			case strings.HasPrefix(tag, "gss:") && keepGSSSemanticTag(tag):
+				item.KeepTags = append(item.KeepTags, tag)
+			case strings.HasPrefix(tag, "gss:"):
+				item.RemoveTags = append(item.RemoveTags, tag)
+			}
+		}
+	}
+	items := make([]gssTagCleanupItem, 0, len(itemsByStream))
+	for _, item := range itemsByStream {
+		item.ListTags = normalizeTags(item.ListTags)
+		item.KeepTags = normalizeTags(item.KeepTags)
+		item.RemoveTags = normalizeTags(item.RemoveTags)
+		item.RowRefs = normalizeTags(item.RowRefs)
+		if len(item.RemoveTags) == 0 {
+			continue
+		}
+		items = append(items, *item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].StreamID < items[j].StreamID
+	})
+	report := gssTagCleanupReport{
+		TargetAPIURL:   opts.TargetAPIURL,
+		Apply:          opts.Apply,
+		ReviewApproved: opts.ReviewApproved,
+		GeneratedAt:    time.Now().UTC(),
+		SourceReport:   opts.CleanupTagsReport,
+		Policy:         "remove imported gss:* tags except gss:valid:yes and gss:valid:no; preserve list tags and non-GSS tags",
+		Items:          items,
+	}
+	report.StreamsToChange = len(items)
+	for _, item := range items {
+		report.TagsToRemove += len(item.RemoveTags)
+		report.TagsToKeep += len(item.KeepTags)
+	}
+	return report
+}
+
+func keepGSSSemanticTag(tag string) bool {
+	return tag == "gss:valid:yes" || tag == "gss:valid:no"
+}
+
 func validateGSSApplyReportResult(result gssResult) error {
 	if result.ApplyAction != gssApplyNone || result.Applied || result.AppliedStreamID != 0 || result.Created || result.ApplyError != "" {
 		return fmt.Errorf("contains prior apply metadata")
@@ -457,6 +699,38 @@ func gssCountsByStatus(results []gssResult) map[gssStatus]int {
 		out[result.Status]++
 	}
 	return out
+}
+
+func gssCountsByApplyAction(results []gssResult) map[gssApplyAction]int {
+	out := map[gssApplyAction]int{}
+	for _, result := range results {
+		if result.ApplyAction != gssApplyNone {
+			out[result.ApplyAction]++
+		}
+	}
+	return out
+}
+
+func gssApplyActionCountsEqual(a map[gssApplyAction]int, b map[gssApplyAction]int) bool {
+	for _, action := range []gssApplyAction{
+		gssApplyTaggedExisting,
+		gssApplyTaggedExistingSource,
+		gssApplyCreatedAndTagged,
+	} {
+		if a[action] != b[action] {
+			return false
+		}
+	}
+	for action, count := range a {
+		if count != 0 {
+			switch action {
+			case gssApplyTaggedExisting, gssApplyTaggedExistingSource, gssApplyCreatedAndTagged:
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func gssStatusCountsEqual(a map[gssStatus]int, b map[gssStatus]int) bool {
@@ -857,6 +1131,30 @@ func getGSSJSONWithToken(ctx context.Context, baseURL string, token string, path
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+func deleteJSONWithToken(ctx context.Context, baseURL string, token string, path string, payload any, out any) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, strings.TrimRight(baseURL, "/")+path, strings.NewReader(string(b)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var errPayload map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&errPayload)
+		return fmt.Errorf("DELETE %s: status=%d body=%v", path, resp.StatusCode, errPayload)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
 func probeGSSResolvedURL(ctx context.Context, resolvedURL string) (*gssProbe, error) {
 	frame, err := capture.CaptureFrame(ctx, resolvedURL)
 	if err != nil {
@@ -979,6 +1277,23 @@ func tagGSSStream(ctx context.Context, opts gssOptions, streamID int64, tags []s
 	}
 	if !response.OK {
 		return fmt.Errorf("tag stream %d returned ok=false", streamID)
+	}
+	return nil
+}
+
+func removeGSSStreamTags(ctx context.Context, opts gssOptions, streamID int64, tags []string) error {
+	reqCtx, cancel := context.WithTimeout(ctx, opts.ImportTimeout)
+	defer cancel()
+	var response struct {
+		OK bool `json:"ok"`
+	}
+	if err := deleteJSONWithToken(reqCtx, opts.TargetAPIURL, opts.ServiceToken, fmt.Sprintf("/api/v1/service/streams/%d/tags", streamID), map[string]any{
+		"tags": tags,
+	}, &response); err != nil {
+		return err
+	}
+	if !response.OK {
+		return fmt.Errorf("remove tags from stream %d returned ok=false", streamID)
 	}
 	return nil
 }
@@ -1125,6 +1440,20 @@ func writeGSSReport(path string, report gssReport) error {
 	return os.WriteFile(path, b, 0o644)
 }
 
+func writeGSSTagCleanupReport(path string, report gssTagCleanupReport) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
+}
+
 func preflightGSSReportPath(path string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1145,10 +1474,8 @@ func preflightGSSReportPath(path string) error {
 
 func buildGSSTags(row gssRow) []string {
 	tags := []string{row.List.Tag()}
-	for _, col := range gssColumns {
-		if tag := gssColumnTag(col.Key, row.value(col.Key)); tag != "" {
-			tags = append(tags, tag)
-		}
+	if tag := gssColumnTag("valid", row.value("valid")); keepGSSSemanticTag(tag) {
+		tags = append(tags, tag)
 	}
 	return normalizeTags(tags)
 }
