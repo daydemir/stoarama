@@ -27,6 +27,7 @@ import (
 
 const (
 	gssProvider           = "global-street-scores"
+	gssProductionAPIURL   = "https://stoarama.com"
 	gssDefaultNilsCSV     = "/Users/deniz/Build/Global Street Scores - List_Nils.csv"
 	gssDefaultVittorioCSV = "/Users/deniz/Build/Global Street Scores - List_Vittorio.csv"
 )
@@ -72,6 +73,15 @@ const (
 	gssStatusManualReview       gssStatus = "manual_review"
 	gssStatusAPIError           gssStatus = "api_error"
 )
+
+var gssStatuses = []gssStatus{
+	gssStatusVerifiedExisting,
+	gssStatusVerifiedImportable,
+	gssStatusResolverMissing,
+	gssStatusProbeFailed,
+	gssStatusManualReview,
+	gssStatusAPIError,
+}
 
 func (s gssStatus) AllowApply() bool {
 	return s == gssStatusVerifiedExisting || s == gssStatusVerifiedImportable
@@ -166,6 +176,7 @@ type gssReport struct {
 	Limit               int                    `json:"limit"`
 	Concurrency         int                    `json:"concurrency"`
 	ProbeTimeout        string                 `json:"probe_timeout"`
+	ApplySourceReport   string                 `json:"apply_source_report,omitempty"`
 	RowsTotal           int                    `json:"rows_total"`
 	RowsProcessed       int                    `json:"rows_processed"`
 	CountsByStatus      map[gssStatus]int      `json:"counts_by_status"`
@@ -186,6 +197,7 @@ type gssOptions struct {
 	Apply          bool
 	ReviewApproved bool
 	ReportJSON     string
+	ApplyReport    string
 	AsJSON         bool
 }
 
@@ -202,6 +214,7 @@ func runImportGlobalStreetScores(ctx context.Context, cfg config.Config, args []
 	apply := fs.Bool("apply", false, "apply verified imports/tags to the target Stoarama API")
 	reviewApproved := fs.Bool("review-approved", false, "required with --apply after review-agent approval")
 	reportJSON := fs.String("report-json", "local/reports/global-street-scores-import-report.json", "report JSON path")
+	applyReport := fs.String("apply-report", "", "apply from a previously approved verify-only report instead of re-probing rows")
 	asJSON := fs.Bool("json", false, "print JSON report")
 	_ = fs.Parse(args)
 
@@ -217,10 +230,17 @@ func runImportGlobalStreetScores(ctx context.Context, cfg config.Config, args []
 		Apply:          *apply,
 		ReviewApproved: *reviewApproved,
 		ReportJSON:     strings.TrimSpace(*reportJSON),
+		ApplyReport:    strings.TrimSpace(*applyReport),
 		AsJSON:         *asJSON,
 	}
 	if err := validateGSSOptions(opts); err != nil {
 		log.Fatalf("global-street-scores: %v", err)
+	}
+	if opts.ApplyReport != "" {
+		if err := applyGSSReport(ctx, opts); err != nil {
+			log.Fatalf("global-street-scores apply report: %v", err)
+		}
+		return
 	}
 
 	rows, err := loadGSSRows(opts.NilsCSV, opts.VittorioCSV)
@@ -299,7 +319,176 @@ func validateGSSOptions(opts gssOptions) error {
 	if opts.Apply && !opts.ReviewApproved {
 		return fmt.Errorf("--review-approved is required with --apply")
 	}
+	if opts.Apply && opts.TargetAPIURL != gssProductionAPIURL {
+		return fmt.Errorf("--target-api-url must be %s with --apply", gssProductionAPIURL)
+	}
+	if opts.ApplyReport != "" && !opts.Apply {
+		return fmt.Errorf("--apply-report requires --apply")
+	}
 	return nil
+}
+
+func applyGSSReport(ctx context.Context, opts gssOptions) error {
+	if opts.ReportJSON != "" {
+		if err := preflightGSSReportPath(opts.ReportJSON); err != nil {
+			return fmt.Errorf("preflight Global Street Scores report path: %w", err)
+		}
+	}
+	source, err := loadApprovedGSSApplyReport(opts.ApplyReport, opts)
+	if err != nil {
+		return err
+	}
+	results := append([]gssResult(nil), source.Results...)
+	if opts.ReportJSON != "" {
+		if err := writeGSSReport(opts.ReportJSON, buildGSSReport(opts, source.RowsTotal, results)); err != nil {
+			return fmt.Errorf("write Global Street Scores pre-apply report: %w", err)
+		}
+	}
+	applyErr := applyGSSResults(ctx, opts, source.RowsTotal, results)
+	report := buildGSSReport(opts, source.RowsTotal, results)
+	if opts.ReportJSON != "" {
+		if err := writeGSSReport(opts.ReportJSON, report); err != nil {
+			return fmt.Errorf("write Global Street Scores report: %w", err)
+		}
+	}
+	if applyErr != nil {
+		return fmt.Errorf("%w; report=%s", applyErr, opts.ReportJSON)
+	}
+	if opts.AsJSON {
+		printJSON(report)
+		return nil
+	}
+	fmt.Printf("Global Street Scores: rows=%d verified_existing=%d verified_importable=%d resolver_missing=%d probe_failed=%d manual_review=%d api_error=%d applied=%d apply_errors=%d report=%s\n",
+		report.RowsProcessed,
+		report.CountsByStatus[gssStatusVerifiedExisting],
+		report.CountsByStatus[gssStatusVerifiedImportable],
+		report.CountsByStatus[gssStatusResolverMissing],
+		report.CountsByStatus[gssStatusProbeFailed],
+		report.CountsByStatus[gssStatusManualReview],
+		report.CountsByStatus[gssStatusAPIError],
+		report.CountsByApplyAction[gssApplyTaggedExisting]+report.CountsByApplyAction[gssApplyTaggedExistingSource]+report.CountsByApplyAction[gssApplyCreatedAndTagged],
+		report.ApplyErrors,
+		opts.ReportJSON,
+	)
+	return nil
+}
+
+func loadApprovedGSSApplyReport(path string, opts gssOptions) (gssReport, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return gssReport{}, err
+	}
+	var report gssReport
+	if err := json.Unmarshal(b, &report); err != nil {
+		return gssReport{}, err
+	}
+	report.TargetAPIURL = strings.TrimRight(strings.TrimSpace(report.TargetAPIURL), "/")
+	if report.Apply {
+		return gssReport{}, fmt.Errorf("--apply-report must point to a verify-only report")
+	}
+	if report.ReviewApproved {
+		return gssReport{}, fmt.Errorf("--apply-report must not be a prior reviewed apply report")
+	}
+	if report.ApplyErrors != 0 {
+		return gssReport{}, fmt.Errorf("--apply-report has apply_errors=%d", report.ApplyErrors)
+	}
+	if report.TargetAPIURL != opts.TargetAPIURL {
+		return gssReport{}, fmt.Errorf("--apply-report target_api_url=%q does not match --target-api-url=%q", report.TargetAPIURL, opts.TargetAPIURL)
+	}
+	if report.RowsTotal <= 0 {
+		return gssReport{}, fmt.Errorf("--apply-report rows_total must be > 0")
+	}
+	if report.RowsProcessed != len(report.Results) {
+		return gssReport{}, fmt.Errorf("--apply-report rows_processed=%d but results=%d", report.RowsProcessed, len(report.Results))
+	}
+	if report.RowsProcessed > report.RowsTotal {
+		return gssReport{}, fmt.Errorf("--apply-report rows_processed cannot exceed rows_total")
+	}
+	if report.CountsByStatus[gssStatusAPIError] != 0 {
+		return gssReport{}, fmt.Errorf("--apply-report contains api_error rows")
+	}
+	expectedCounts := gssCountsByStatus(report.Results)
+	if !gssStatusCountsEqual(report.CountsByStatus, expectedCounts) {
+		return gssReport{}, fmt.Errorf("--apply-report status counts do not match results")
+	}
+	for i := range report.Results {
+		if err := validateGSSApplyReportResult(report.Results[i]); err != nil {
+			return gssReport{}, fmt.Errorf("--apply-report result %d row %d: %w", i, report.Results[i].RowNumber, err)
+		}
+	}
+	return report, nil
+}
+
+func validateGSSApplyReportResult(result gssResult) error {
+	if result.ApplyAction != gssApplyNone || result.Applied || result.AppliedStreamID != 0 || result.Created || result.ApplyError != "" {
+		return fmt.Errorf("contains prior apply metadata")
+	}
+	if !result.Status.AllowApply() {
+		return nil
+	}
+	if !gssContainsString(result.Tags, result.List.Tag()) {
+		return fmt.Errorf("missing list tag %q", result.List.Tag())
+	}
+	switch result.Status {
+	case gssStatusVerifiedExisting:
+		if result.StreamID <= 0 {
+			return fmt.Errorf("verified existing stream has no stream_id")
+		}
+		if result.Candidate.Host != "" && !gssStreamHostAccepted(result.Candidate.Host, gssProductionAPIURL) {
+			return fmt.Errorf("verified existing stream host %q is not production", result.Candidate.Host)
+		}
+	case gssStatusVerifiedImportable:
+		if strings.TrimSpace(result.SourceURL) == "" {
+			return fmt.Errorf("verified importable stream has no source_url")
+		}
+		if strings.TrimSpace(result.ResolvedURL) == "" {
+			return fmt.Errorf("verified importable stream has no resolved_url")
+		}
+		if result.Probe == nil || result.Probe.Width <= 0 || result.Probe.Height <= 0 || result.Probe.SizeBytes <= 0 || strings.TrimSpace(result.Probe.SHA256) == "" {
+			return fmt.Errorf("verified importable stream has no usable probe")
+		}
+	}
+	return nil
+}
+
+func gssCountsByStatus(results []gssResult) map[gssStatus]int {
+	out := map[gssStatus]int{}
+	for _, result := range results {
+		out[result.Status]++
+	}
+	return out
+}
+
+func gssStatusCountsEqual(a map[gssStatus]int, b map[gssStatus]int) bool {
+	for _, status := range gssStatuses {
+		if a[status] != b[status] {
+			return false
+		}
+	}
+	for status, count := range a {
+		if count != 0 {
+			known := false
+			for _, want := range gssStatuses {
+				if status == want {
+					known = true
+					break
+				}
+			}
+			if !known {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func gssContainsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func loadGSSRows(nilsPath string, vittorioPath string) ([]gssRow, error) {
@@ -906,6 +1095,7 @@ func buildGSSReport(opts gssOptions, rowsTotal int, results []gssResult) gssRepo
 		Limit:               opts.Limit,
 		Concurrency:         opts.Concurrency,
 		ProbeTimeout:        opts.ProbeTimeout.String(),
+		ApplySourceReport:   opts.ApplyReport,
 		RowsTotal:           rowsTotal,
 		RowsProcessed:       len(results),
 		CountsByStatus:      map[gssStatus]int{},

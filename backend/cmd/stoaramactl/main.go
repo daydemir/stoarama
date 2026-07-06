@@ -134,7 +134,7 @@ func usage() {
 	  stoaramactl alerts send-test-email [--to email@example.com] [--stream-id N --stream-name NAME --reason capture_runtime_stopped]
 	  stoaramactl alerts history [--limit 50 --status accepted|delivered|opened|bounced|failed --stream-id N]
 	  stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]
-	  stoaramactl import global-street-scores [--nils-csv PATH --vittorio-csv PATH --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 60 --apply --review-approved --report-json out.json --json]
+	  stoaramactl import global-street-scores [--nils-csv PATH --vittorio-csv PATH --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 60 --apply --review-approved --apply-report verify.json --report-json out.json --json]
 	  stoaramactl overview summary [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl overview queue-health [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines list
@@ -185,7 +185,7 @@ func runImport(ctx context.Context, cfg config.Config, args []string) {
 func printImportUsage() {
 	fmt.Print(`stoaramactl import commands:
   stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]
-  stoaramactl import global-street-scores [--nils-csv PATH --vittorio-csv PATH --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 60 --apply --review-approved --report-json out.json --json]
+  stoaramactl import global-street-scores [--nils-csv PATH --vittorio-csv PATH --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 60 --apply --review-approved --apply-report verify.json --report-json out.json --json]
 `)
 }
 

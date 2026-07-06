@@ -120,7 +120,7 @@ func TestBuildGSSTagsUsesBoundedColumnTags(t *testing.T) {
 		"gss:valid:no",
 	}
 	for _, tag := range want {
-		if !containsString(tags, tag) {
+		if !gssContainsString(tags, tag) {
 			t.Fatalf("tags missing %q in %#v", tag, tags)
 		}
 	}
@@ -176,6 +176,72 @@ func TestPreflightGSSReportPathCreatesDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(path)); err != nil {
 		t.Fatalf("expected report dir: %v", err)
+	}
+}
+
+func TestLoadApprovedGSSApplyReportAcceptsCleanVerifyReport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verify.json")
+	report := gssTestVerifyReport()
+	if err := writeGSSReport(path, report); err != nil {
+		t.Fatalf("write report: %v", err)
+	}
+	got, err := loadApprovedGSSApplyReport(path, gssOptions{TargetAPIURL: gssProductionAPIURL})
+	if err != nil {
+		t.Fatalf("load approved report: %v", err)
+	}
+	if got.RowsProcessed != 3 {
+		t.Fatalf("rows_processed=%d want 3", got.RowsProcessed)
+	}
+}
+
+func TestLoadApprovedGSSApplyReportRejectsUnsafeReports(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*gssReport)
+	}{
+		{
+			name: "already applied",
+			mutate: func(report *gssReport) {
+				report.Apply = true
+			},
+		},
+		{
+			name: "target mismatch",
+			mutate: func(report *gssReport) {
+				report.TargetAPIURL = "https://stoarama-api.onrender.com"
+			},
+		},
+		{
+			name: "status count mismatch",
+			mutate: func(report *gssReport) {
+				report.CountsByStatus[gssStatusVerifiedExisting] = 99
+			},
+		},
+		{
+			name: "missing importable probe",
+			mutate: func(report *gssReport) {
+				report.Results[1].Probe = nil
+			},
+		},
+		{
+			name: "prior apply metadata",
+			mutate: func(report *gssReport) {
+				report.Results[0].Applied = true
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "verify.json")
+			report := gssTestVerifyReport()
+			tt.mutate(&report)
+			if err := writeGSSReport(path, report); err != nil {
+				t.Fatalf("write report: %v", err)
+			}
+			if _, err := loadApprovedGSSApplyReport(path, gssOptions{TargetAPIURL: gssProductionAPIURL}); err == nil {
+				t.Fatalf("expected unsafe report rejection")
+			}
+		})
 	}
 }
 
@@ -279,11 +345,51 @@ func writeTestJSON(t *testing.T, w http.ResponseWriter, payload any) {
 	}
 }
 
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
+func gssTestVerifyReport() gssReport {
+	results := []gssResult{
+		{
+			Seq:       1,
+			List:      gssListNils,
+			RowNumber: 2,
+			Candidate: gssCandidate{
+				Kind:     gssCandidateExistingStream,
+				StreamID: 123,
+				Host:     "stoarama.com",
+				URL:      "https://stoarama.com/streams/123",
+			},
+			Status:   gssStatusVerifiedExisting,
+			StreamID: 123,
+			Tags:     []string{"list-nils"},
+			Values:   map[string]string{"country": "Italy"},
+		},
+		{
+			Seq:         2,
+			List:        gssListVittorio,
+			RowNumber:   2,
+			Candidate:   gssCandidate{Kind: gssCandidatePlayableURL, URL: "https://example.com/live.m3u8"},
+			Status:      gssStatusVerifiedImportable,
+			SourceURL:   "https://example.com/live.m3u8",
+			ResolvedURL: "https://example.com/live.m3u8",
+			Probe:       &gssProbe{ResolvedURL: "https://example.com/live.m3u8", Width: 640, Height: 480, SizeBytes: 1024, SHA256: "abc123"},
+			Tags:        []string{"list-vittorio"},
+			Values:      map[string]string{"country": "Italy"},
+		},
+		{
+			Seq:       3,
+			List:      gssListVittorio,
+			RowNumber: 3,
+			Candidate: gssCandidate{Kind: gssCandidateManual},
+			Status:    gssStatusManualReview,
+			Tags:      []string{"list-vittorio"},
+			Values:    map[string]string{"country": "Italy"},
+		},
 	}
-	return false
+	return gssReport{
+		TargetAPIURL:        gssProductionAPIURL,
+		RowsTotal:           3,
+		RowsProcessed:       len(results),
+		CountsByStatus:      gssCountsByStatus(results),
+		CountsByApplyAction: map[gssApplyAction]int{},
+		Results:             results,
+	}
 }
