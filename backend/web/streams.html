@@ -6139,6 +6139,12 @@ countryFilter.addEventListener('change', async () => {
 cityFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: false });
 });
+seenPeopleFilter.addEventListener('change', async () => {
+  await reloadStreamsForFilterChange({ reloadAllOptions: false });
+});
+seenVehiclesFilter.addEventListener('change', async () => {
+  await reloadStreamsForFilterChange({ reloadAllOptions: false });
+});
 
 // Pagination
 streamPageSizeEl.addEventListener('change', async () => {
