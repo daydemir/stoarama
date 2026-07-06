@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -159,7 +160,7 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 	if clipDuration == 0 {
 		clipDuration = 60
 	}
-	if clipDuration < 5 || clipDuration > 900 {
+	if !recordingnaming.IsAllowedClipDuration(clipDuration) {
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
 	}

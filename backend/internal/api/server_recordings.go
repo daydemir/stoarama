@@ -19,6 +19,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
 	"github.com/daydemir/stoarama/backend/internal/recordability"
+	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -69,6 +70,7 @@ const recordingListSelectSQL = `
 		rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
 		rec.storage_retention_tier, rec.delivery,
 		rec.capture_via,
+		rec.naming_profile, rec.folder_name, rec.naming_metadata_jsonb,
 		-- Relay readiness (per-recording). Both expressions short-circuit to false/NULL
 		-- for a cloud recording (capture_via='cloud'), so they are cheap and dark until a
 		-- relay recording exists. has_relay_online: at least one online relay node in the
@@ -165,7 +167,52 @@ type recordingCreateRequest struct {
 	// operator droplet pool) or 'relay' (an account-owned relay node on a user
 	// machine). Empty is treated as 'cloud'. Orthogonal to delivery. P1 accepts and
 	// validates it but never forces it (no YouTube-to-relay routing yet).
-	CaptureVia string `json:"capture_via"`
+	CaptureVia string                  `json:"capture_via"`
+	Naming     *recordingNamingRequest `json:"naming"`
+}
+
+type recordingNamingRequest struct {
+	Profile    string                   `json:"profile"`
+	FolderName string                   `json:"folder_name"`
+	Metadata   recordingnaming.Metadata `json:"metadata"`
+}
+
+func resolveRecordingNaming(req *recordingNamingRequest, recordingID int64) (recordingnaming.Profile, string, []byte, error) {
+	profile := recordingnaming.ProfileStoaramaV1
+	metadata := recordingnaming.Metadata{}
+	folderRaw := ""
+	if req != nil {
+		if strings.TrimSpace(req.Profile) != "" {
+			parsed, err := recordingnaming.ParseProfile(req.Profile)
+			if err != nil {
+				return "", "", nil, err
+			}
+			profile = parsed
+		}
+		metadata = req.Metadata
+		folderRaw = req.FolderName
+	}
+	folderName, err := recordingnaming.BuildFolderName(profile, recordingID, metadata, folderRaw)
+	if err != nil {
+		return "", "", nil, err
+	}
+	metadataBytes, err := recordingnaming.MarshalMetadata(metadata)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return profile, folderName, metadataBytes, nil
+}
+
+func namingPayload(profile string, folderName string, metadataBytes []byte) (map[string]any, error) {
+	metadata, err := recordingnaming.ParseMetadata(metadataBytes)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"profile":     profile,
+		"folder_name": folderName,
+		"metadata":    metadata,
+	}, nil
 }
 
 // optionalActingAccountID resolves the acting org from an optional browser session
@@ -440,8 +487,17 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	if clipDuration == 0 {
 		clipDuration = 60
 	}
-	if clipDuration < 5 || clipDuration > 900 {
+	if !recordingnaming.IsAllowedClipDuration(clipDuration) {
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
+		return
+	}
+	namingProfile, folderName, namingMetadata, err := resolveRecordingNaming(req.Naming, 0)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := recordingnaming.ValidateSchedule(namingProfile, mode, cronExpr); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -761,6 +817,9 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		retentionTier:       retentionTier,
 		delivery:            delivery,
 		captureVia:          captureVia,
+		namingProfile:       namingProfile,
+		folderName:          folderName,
+		namingMetadata:      namingMetadata,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -792,6 +851,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		"source_kind":       sourceKind,
 		"cron_expr":         cronExpr,
 		"clip_duration_sec": clipDuration,
+		"naming_profile":    namingProfile.String(),
 	})
 
 	// Create just inserts: capture is held by the scheduler gate until a card is on
@@ -868,7 +928,10 @@ type recordingInsertParams struct {
 	delivery deliveryMode
 	// captureVia is the capture-routing flag ('cloud' or 'relay'). Empty is treated as
 	// 'cloud', so the bundle fan-out (which leaves it empty) always writes 'cloud'.
-	captureVia string
+	captureVia     string
+	namingProfile  recordingnaming.Profile
+	folderName     string
+	namingMetadata []byte
 }
 
 // insertRecordingTx runs the one canonical recordings INSERT inside the caller's
@@ -894,12 +957,24 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	if captureVia == "" {
 		captureVia = "cloud"
 	}
+	namingProfile := p.namingProfile
+	if namingProfile == "" {
+		namingProfile = recordingnaming.ProfileStoaramaV1
+	}
+	folderName := strings.TrimSpace(p.folderName)
+	if folderName == "" {
+		folderName = "recordings"
+	}
+	namingMetadata := p.namingMetadata
+	if len(namingMetadata) == 0 {
+		namingMetadata = []byte(`{}`)
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery, capture_via)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20,$21)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery, capture_via, naming_profile, folder_name, naming_metadata_jsonb)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 		RETURNING id, created_at, start_at, end_at
-	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery), captureVia).Scan(&id, &createdAt, &startOut, &endOut)
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery), captureVia, namingProfile.String(), folderName, namingMetadata).Scan(&id, &createdAt, &startOut, &endOut)
 	return id, createdAt, startOut, endOut, err
 }
 
@@ -1074,7 +1149,7 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	if clipDuration == 0 {
 		clipDuration = 60
 	}
-	if clipDuration < 5 || clipDuration > 900 {
+	if !recordingnaming.IsAllowedClipDuration(clipDuration) {
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
 	}
@@ -1094,18 +1169,24 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	// end_at keeps the recording's existing window (a schedule edit is not a window
 	// reset). A canceled recording is not found.
 	var (
-		curStartAt time.Time
-		curEndAt   *time.Time
+		curStartAt       time.Time
+		curEndAt         *time.Time
+		namingProfileRaw string
 	)
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT start_at, end_at FROM recordings
+		SELECT start_at, end_at, naming_profile FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStartAt, &curEndAt); err != nil {
+	`, id, principal.AccountID).Scan(&curStartAt, &curEndAt, &namingProfileRaw); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
 		}
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+	namingProfile, err := recordingnaming.ParseProfile(namingProfileRaw)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1168,6 +1249,10 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		}
 		cronExprForNext = &cronExpr
 	}
+	if err := recordingnaming.ValidateSchedule(namingProfile, mode, cronExpr); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Recompute next_fire_at with the mode-aware authority (NULL when the schedule has
 	// no upcoming fire, e.g. a window that ends before now).
@@ -1208,6 +1293,58 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		"cron_expr":         cronExpr,
 		"clip_duration_sec": clipDuration,
 	})
+	s.writeRecordingJSON(w, r, id, principal.AccountID)
+}
+
+func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req recordingNamingRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	profile, folderName, metadataBytes, err := resolveRecordingNaming(&req, id)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var mode, cronExpr string
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT mode, COALESCE(cron_expr, '') FROM recordings
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID).Scan(&mode, &cronExpr); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "recording not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+	if err := recordingnaming.ValidateSchedule(profile, mode, cronExpr); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ct, err := s.pool.Exec(r.Context(), `
+		UPDATE recordings
+		SET naming_profile=$3, folder_name=$4, naming_metadata_jsonb=$5, updated_at=now()
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID, profile.String(), folderName, metadataBytes)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update recording naming: %v", err))
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
 	s.writeRecordingJSON(w, r, id, principal.AccountID)
 }
 
@@ -1579,7 +1716,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	offset := parseIntQuery(r, "offset", 0, 0, 1<<30)
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps, object_key, storage_destination_id, purged_at, released_at
+		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps, object_key, display_path, storage_destination_id, purged_at, released_at
 		FROM recording_clips
 		WHERE recording_id=$1
 		ORDER BY fire_at DESC
@@ -1601,11 +1738,12 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			durationMs   int64
 			actualFPS    *float64
 			objectKey    string
+			displayPath  string
 			sourceDestID int64
 			purgedAt     *time.Time
 			releasedAt   *time.Time
 		)
-		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &actualFPS, &objectKey, &sourceDestID, &purgedAt, &releasedAt); err != nil {
+		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &actualFPS, &objectKey, &displayPath, &sourceDestID, &purgedAt, &releasedAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
 			return
 		}
@@ -1618,6 +1756,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			"duration_ms":            durationMs,
 			"actual_fps":             actualFPS,
 			"object_key":             objectKey,
+			"display_path":           displayPath,
 			"storage_destination_id": sourceDestID,
 			"purged":                 purgedAt != nil,
 			"released":               releasedAt != nil,
@@ -1895,6 +2034,9 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		retentionTier    string
 		delivery         string
 		captureVia       string
+		namingProfile    string
+		folderName       string
+		namingMetadata   []byte
 		hasRelayOnline   bool
 		relayNodeName    *string
 	)
@@ -1907,7 +2049,8 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd,
 		&bundleID, &bundleName, &retentionTier, &delivery,
-		&captureVia, &hasRelayOnline, &relayNodeName,
+		&captureVia, &namingProfile, &folderName, &namingMetadata,
+		&hasRelayOnline, &relayNodeName,
 	); err != nil {
 		return nil, err
 	}
@@ -1915,6 +2058,10 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 	inWindow := !startAt.After(now) && (endAt == nil || now.Before(*endAt))
 	live := status == "active" && inWindow && hasPaymentMethod
 	needsCard := billingEnabled && !hasPaymentMethod
+	naming, err := namingPayload(namingProfile, folderName, namingMetadata)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"id":                       id,
 		"name":                     name,
@@ -1952,6 +2099,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"storage_retention_tier":   retentionTier,
 		"delivery":                 delivery,
 		"capture_via":              captureVia,
+		"naming":                   naming,
 		// Derived relay readiness. has_relay_assigned = a relay currently holds the
 		// lease (relay_node_name is non-null). All false/null for cloud recordings.
 		"has_relay_online":   hasRelayOnline,

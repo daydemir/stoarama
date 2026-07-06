@@ -358,6 +358,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			size_bytes BIGINT NOT NULL,
 			clip_start_at TIMESTAMPTZ NOT NULL,
 			clip_end_at TIMESTAMPTZ NOT NULL,
+			display_path TEXT NOT NULL DEFAULT 'clips/test.mp4',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now() - interval '10 minutes',
 			purged_at TIMESTAMPTZ,
 			released_at TIMESTAMPTZ

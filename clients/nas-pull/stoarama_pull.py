@@ -173,12 +173,18 @@ def persist_cursor(cfg, after_id):
     os.replace(str(tmp), str(cfg.state_file))
 
 
-def clip_filename(clip):
-    """Derive a stable, filesystem-safe .mp4 name from the clip start instant.
+def clip_relative_path(clip):
+    rel = str(clip.get("relative_path", "")).strip().strip("/")
+    if not rel:
+        return Path(str(int(clip["recording_id"]))) / clip_filename(clip)
+    parts = rel.split("/")
+    for part in parts:
+        if part in ("", ".", "..") or "\\" in part:
+            raise ValueError("clip %d invalid relative_path segment %r" % (int(clip["clip_id"]), part))
+    return Path(*parts)
 
-    clip_start_at is RFC3339 (e.g. 2026-06-30T12:00:00Z); we strip separators so
-    the name sorts chronologically and is safe on the NAS filesystem.
-    """
+
+def clip_filename(clip):
     start = str(clip.get("clip_start_at", "")).strip()
     safe = "".join(ch if ch.isalnum() else "-" for ch in start).strip("-")
     if not safe:
@@ -230,10 +236,9 @@ def process_clip(cfg, clip):
         log("ERROR", "presign clip %d returned no url" % clip_id)
         return False
 
-    rec_dir = cfg.output_dir / str(recording_id)
-    rec_dir.mkdir(parents=True, exist_ok=True)
-    final_path = rec_dir / clip_filename(clip)
-    temp_path = rec_dir / (final_path.name + ".part")
+    final_path = cfg.output_dir / clip_relative_path(clip)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = final_path.parent / (final_path.name + ".part")
 
     # 2. Download the bytes to a temp file under OUTPUT_DIR.
     try:

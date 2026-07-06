@@ -163,7 +163,7 @@ func TestRecordingScheduleUpdate(t *testing.T) {
 		"mode":              "sampled",
 		"cron_expr":         "*/10 * * * *",
 		"cron_timezone":     "UTC",
-		"clip_duration_sec": 30,
+		"clip_duration_sec": 300,
 	}
 	rec := httptest.NewRecorder()
 	s.handleAccountRecordingSchedule(rec, schedulePatchReq(recID, ownerAccountID, body))
@@ -174,7 +174,7 @@ func TestRecordingScheduleUpdate(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp["cron_expr"] != "*/10 * * * *" || int(resp["clip_duration_sec"].(float64)) != 30 {
+	if resp["cron_expr"] != "*/10 * * * *" || int(resp["clip_duration_sec"].(float64)) != 300 {
 		t.Fatalf("response did not reflect the edit: %v", resp)
 	}
 	if resp["next_fire_at"] == nil {
@@ -326,6 +326,10 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			bundle_id BIGINT,
 			storage_retention_tier TEXT NOT NULL DEFAULT 'monthly',
 			delivery TEXT NOT NULL DEFAULT 'managed',
+			capture_via TEXT NOT NULL DEFAULT 'cloud',
+			naming_profile TEXT NOT NULL DEFAULT 'stoarama_v1',
+			folder_name TEXT NOT NULL DEFAULT 'recordings',
+			naming_metadata_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,

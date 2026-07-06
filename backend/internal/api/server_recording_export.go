@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -62,13 +63,16 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		d           clipDestination
 		purgedAt    *time.Time
 		releasedAt  *time.Time
+		displayPath string
 		recordingNm string
 		clipStartAt time.Time
+		namingProf  string
+		folderName  string
 	)
 	err := s.pool.QueryRow(r.Context(), `
 		SELECT c.object_key, c.thumbnail_object_key, c.size_bytes, c.purged_at, c.released_at,
 		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc,
-		       r.name, c.clip_start_at
+		       c.display_path, r.name, c.clip_start_at, r.naming_profile, r.folder_name
 		FROM recording_clips c
 		JOIN recordings r ON r.id = c.recording_id
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
@@ -76,7 +80,7 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 	`, clipID, recordingID, principal.AccountID).Scan(
 		&d.objectKey, &d.thumbnailObjectKey, &d.sizeBytes, &purgedAt, &releasedAt,
 		&d.region, &d.bucket, &d.endpoint, &d.accessKeyID, &d.secretEnc,
-		&recordingNm, &clipStartAt,
+		&displayPath, &recordingNm, &clipStartAt, &namingProf, &folderName,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "clip not found")
@@ -107,7 +111,11 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 	if strings.TrimSpace(r.URL.Query().Get("disposition")) == "inline" {
 		url, err = client.PresignGet(r.Context(), d.objectKey, s.cfg.R2SignGetTTL)
 	} else {
-		filename := buildClipDownloadFilename(recordingNm, recordingID, clipStartAt, d.objectKey)
+		filename := clipDownloadFilename(recordingNm, recordingID, clipStartAt, d.objectKey, displayPath, namingProf, folderName)
+		if filename == "" {
+			util.WriteError(w, http.StatusInternalServerError, "clip download filename is empty")
+			return
+		}
 		url, err = client.PresignGetDownload(r.Context(), d.objectKey, filename, s.cfg.R2SignGetTTL)
 	}
 	if err != nil {
@@ -120,6 +128,24 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		"size_bytes":     d.sizeBytes,
 		"expires_in_sec": int(s.cfg.R2SignGetTTL.Seconds()),
 	})
+}
+
+func clipDownloadFilename(recordingName string, recordingID int64, clipStartAt time.Time, objectKey, displayPath, namingProfile, folderName string) string {
+	if namingProfile == recordingnaming.ProfileStoaramaV1.String() && strings.TrimSpace(folderName) == "recordings" {
+		return buildClipDownloadFilename(recordingName, recordingID, clipStartAt, objectKey)
+	}
+	return displayPathFilename(displayPath)
+}
+
+func displayPathFilename(displayPath string) string {
+	displayPath = strings.Trim(strings.TrimSpace(displayPath), "/")
+	if displayPath == "" {
+		return ""
+	}
+	if i := strings.LastIndex(displayPath, "/"); i >= 0 {
+		return displayPath[i+1:]
+	}
+	return displayPath
 }
 
 // buildClipDownloadFilename derives a stable, safe save-as name for a clip:

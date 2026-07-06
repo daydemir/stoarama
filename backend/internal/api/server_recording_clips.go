@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -276,12 +277,18 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		region          string
 		bucket          string
 		keyPrefix       string
+		cronTimezone    string
+		namingProfile   string
+		folderName      string
+		namingMetadata  []byte
 		accessKeyID     string
 		secretEnc       []byte
 	)
 	err := s.pool.QueryRow(r.Context(), `
 		SELECT j.recording_id, j.clip_duration_sec, j.fire_at, j.kind,
-		       sd.id, sd.endpoint, sd.region, sd.bucket, sd.key_prefix, sd.access_key_id, sd.secret_access_key_enc
+		       sd.id, sd.endpoint, sd.region, sd.bucket, sd.key_prefix,
+		       rec.cron_timezone, rec.naming_profile, rec.folder_name, rec.naming_metadata_jsonb,
+		       sd.access_key_id, sd.secret_access_key_enc
 		FROM recording_jobs j
 		JOIN recordings rec ON rec.id = j.recording_id
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
@@ -289,7 +296,9 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		  AND rec.status='active'
 	`, req.JobID, workerID).Scan(
 		&recordingID, &clipDurationSec, &fireAt, &jobKind,
-		&destID, &endpoint, &region, &bucket, &keyPrefix, &accessKeyID, &secretEnc,
+		&destID, &endpoint, &region, &bucket, &keyPrefix,
+		&cronTimezone, &namingProfile, &folderName, &namingMetadata,
+		&accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker or recording is not active")
@@ -317,29 +326,51 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// A continuous_window job raises many per-segment intents under one lease, so
-	// its object key is keyed on the SEGMENT START (unique, ordered, idempotent),
-	// not the single window-open fire_at. A clip job keys on fire_at as before.
-	var objectKey string
+	// A continuous_window job raises many per-segment intents under one lease. The
+	// display path is keyed by the actual segment start, so every segment remains
+	// unique while all delivery surfaces reuse one path.
+	clipStartedAt := fireAt
 	if jobKind == "continuous_window" {
 		if req.SegmentStartMs <= 0 {
 			util.WriteError(w, http.StatusBadRequest, "segment_start_ms is required for a continuous window job")
 			return
 		}
-		segStart := time.UnixMilli(req.SegmentStartMs).UTC()
-		objectKey = buildRecordingClipObjectKeyContinuous(keyPrefix, recordingID, segStart)
-	} else {
-		objectKey = buildRecordingClipObjectKey(keyPrefix, recordingID, req.JobID, fireAt)
+		clipStartedAt = time.UnixMilli(req.SegmentStartMs).UTC()
 	}
+	profile, err := recordingnaming.ParseProfile(namingProfile)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	metadata, err := recordingnaming.ParseMetadata(namingMetadata)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	displayPath, err := recordingnaming.BuildDisplayPath(recordingnaming.Policy{
+		Profile:       profile,
+		JobKind:       recordingnaming.JobKind(jobKind),
+		FolderName:    folderName,
+		Metadata:      metadata,
+		RecordingID:   recordingID,
+		JobID:         req.JobID,
+		CronTimezone:  cronTimezone,
+		ClipStartedAt: clipStartedAt,
+	})
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	objectKey := storageObjectKey(keyPrefix, displayPath)
 	maxSize := int64(clipDurationSec) * recordingMaxBitrateBytesPerSec
 	intentID := uuid.New()
 	expiresAt := time.Now().UTC().Add(s.cfg.R2SignPutTTL)
 
 	if _, err := s.pool.Exec(r.Context(), `
 		INSERT INTO recording_upload_intents
-			(id, recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, mime_type, max_size_bytes, status, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10)
-	`, intentID, recordingID, req.JobID, destID, endpoint, bucket, objectKey, mimeType, maxSize, expiresAt); err != nil {
+			(id, recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path, mime_type, max_size_bytes, status, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11)
+	`, intentID, recordingID, req.JobID, destID, endpoint, bucket, objectKey, displayPath, mimeType, maxSize, expiresAt); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("record upload intent: %v", err))
 		return
 	}
@@ -431,6 +462,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		region          string
 		bucket          string
 		objectKey       string
+		displayPath     string
 		mimeType        string
 		maxSize         int64
 		fireAt          time.Time
@@ -438,13 +470,15 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		windowEndAt     *time.Time
 		clipDurationSec int
 		recordingStatus string
+		clipNaming      string
+		clipFolderName  string
 		accessKeyID     string
 		secretEnc       []byte
 	)
 	err = tx.QueryRow(r.Context(), `
 		SELECT ui.recording_id, ui.recording_job_id, ui.storage_destination_id, ui.endpoint, sd.region,
-		       ui.bucket, ui.object_key, ui.mime_type, ui.max_size_bytes, j.fire_at,
-		       j.kind, j.window_end_at, j.clip_duration_sec, rec.status,
+		       ui.bucket, ui.object_key, ui.display_path, ui.mime_type, ui.max_size_bytes, j.fire_at,
+		       j.kind, j.window_end_at, j.clip_duration_sec, rec.status, rec.naming_profile, rec.folder_name,
 		       sd.access_key_id, sd.secret_access_key_enc
 		FROM recording_upload_intents ui
 		JOIN recording_jobs j ON j.id = ui.recording_job_id
@@ -455,8 +489,9 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		FOR UPDATE OF ui
 	`, intentID, workerID).Scan(
 		&recordingID, &jobID, &destID, &endpoint, &region,
-		&bucket, &objectKey, &mimeType, &maxSize, &fireAt,
+		&bucket, &objectKey, &displayPath, &mimeType, &maxSize, &fireAt,
 		&jobKind, &windowEndAt, &clipDurationSec, &recordingStatus,
+		&clipNaming, &clipFolderName,
 		&accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -541,14 +576,14 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	var clipID int64
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recording_clips
-			(recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key,
+			(recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path,
 			 mime_type, container, size_bytes, etag, sha256, duration_ms, video_codec, audio_codec,
 			 audio_present, actual_fps, resolved_url, fire_at, clip_start_at, clip_end_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 		ON CONFLICT (bucket, object_key) DO NOTHING
 		RETURNING id
 	`, recordingID, jobID, destID, endpoint, bucket, objectKey,
-		mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), durationMs,
+		displayPath, mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), durationMs,
 		strings.TrimSpace(req.VideoCodec), strings.TrimSpace(req.AudioCodec), req.AudioPresent, req.ActualFPS,
 		strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt).Scan(&clipID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -585,7 +620,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if deliveryDestID != nil {
-		targetObjectKey := buildClipTransferObjectKey(deliveryPrefix, recordingID, clipID, objectKey)
+		targetObjectKey := deliveryObjectKey(deliveryPrefix, recordingID, clipID, objectKey, displayPath, clipNaming, clipFolderName)
 		idempotencyKey := fmt.Sprintf("xfer:%d:%d", clipID, *deliveryDestID)
 		if _, err := tx.Exec(r.Context(), `
 			INSERT INTO clip_transfer_jobs
@@ -827,6 +862,30 @@ func buildRecordingClipObjectKeyContinuous(keyPrefix string, recordingID int64, 
 	return strings.Join(parts, "/")
 }
 
+func storageObjectKey(keyPrefix, displayPath string) string {
+	parts := make([]string, 0, 4)
+	for _, seg := range strings.Split(strings.Trim(strings.TrimSpace(keyPrefix), "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		parts = append(parts, seg)
+	}
+	for _, seg := range strings.Split(strings.Trim(strings.TrimSpace(displayPath), "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		parts = append(parts, seg)
+	}
+	return strings.Join(parts, "/")
+}
+
+func deliveryObjectKey(keyPrefix string, recordingID, clipID int64, sourceObjectKey, displayPath, namingProfile, folderName string) string {
+	if namingProfile == recordingnaming.ProfileStoaramaV1.String() && strings.TrimSpace(folderName) == "recordings" {
+		return buildClipTransferObjectKey(keyPrefix, recordingID, clipID, sourceObjectKey)
+	}
+	return storageObjectKey(keyPrefix, displayPath)
+}
+
 // accountClipsCursorSQL forward-cursors the calling account's still-org-visible
 // clips by the monotonic recording_clips.id (BIGSERIAL), so a NAS pull client can
 // drain every clip exactly once and resume from its last seen id. object_key is
@@ -849,7 +908,7 @@ func buildRecordingClipObjectKeyContinuous(keyPrefix string, recordingID int64, 
 const accountClipsCommitWatermark = `interval '90 seconds'`
 
 const accountClipsCursorSQL = `
-	SELECT c.id, c.recording_id, c.size_bytes, c.clip_start_at, c.clip_end_at
+	SELECT c.id, c.recording_id, c.size_bytes, c.clip_start_at, c.clip_end_at, c.display_path
 	FROM recording_clips c
 	JOIN recordings r ON r.id = c.recording_id
 	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
@@ -891,8 +950,9 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 			sizeBytes   int64
 			clipStartAt time.Time
 			clipEndAt   *time.Time
+			displayPath string
 		)
-		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &clipStartAt, &clipEndAt); err != nil {
+		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &clipStartAt, &clipEndAt, &displayPath); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan account clip: %v", err))
 			return
 		}
@@ -906,6 +966,7 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 			"size_bytes":    sizeBytes,
 			"clip_start_at": clipStartAt.UTC(),
 			"clip_end_at":   endAt,
+			"relative_path": displayPath,
 			"download_path": fmt.Sprintf("/api/v1/account/recordings/%d/clips/%d/download", recordingID, clipID),
 		})
 		id := clipID

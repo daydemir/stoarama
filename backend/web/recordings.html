@@ -521,7 +521,7 @@
           <div id="catalogStreamName" class="preview"></div>
           <div id="catalogStreamLoc" class="preview muted"></div>
           <div class="preview mono" style="margin-top:6px;">Stream ID: <span id="catalogStreamIdVal"></span></div>
-          <div class="hint">Clips land in a folder named for the recording's ID, visible once the recording is created.</div>
+          <div class="hint">Clip paths follow the File naming section below and are visible once the recording is created.</div>
           <img id="catalogFramePreview" class="video-preview hidden" alt="recent frame" />
         </div>
         <input type="hidden" id="recStreamID" value="" />
@@ -688,12 +688,7 @@
           <div class="seg" id="clipSeg">
             <button type="button" data-clip="60">1 min</button>
             <button type="button" data-clip="300">5 min</button>
-            <button type="button" data-clip="900">15 min</button>
-            <button type="button" data-clip="custom">Custom</button>
-          </div>
-          <div id="clipCustomWrap" class="field hidden" style="margin-top:12px;margin-bottom:0;max-width:240px;">
-            <label for="clipCustom">Clip length (seconds)</label>
-            <input id="clipCustom" type="number" min="5" max="900" value="60" />
+            <button type="button" data-clip="600">10 min</button>
           </div>
         </div>
 
@@ -716,9 +711,39 @@
         </div>
         </div><!-- /Section C -->
 
-        <!-- SECTION D: Where clips go (storage) -->
+        <!-- SECTION D: File naming -->
+        <div id="namingSection" class="form-section">
+        <div class="form-section-head"><span class="form-section-step">D</span><span class="form-section-title">File naming</span></div>
+        <p class="hint" style="margin:0 0 10px;">Choose this per recording. Bundles use the Stoarama default for now.</p>
+        <div class="field">
+          <label>Naming format</label>
+          <div class="seg" id="namingSeg">
+            <button type="button" data-naming="stoarama_v1" class="on">Stoarama default</button>
+            <button type="button" data-naming="plaza_hourly_v1">Plaza hourly format</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="namingFolder">Folder name</label>
+          <input id="namingFolder" type="text" placeholder="recordings" />
+          <div id="namingFolderHint" class="hint">Leave blank for <span class="mono">recordings</span>.</div>
+        </div>
+        <div id="plazaHourlyNamingFields" class="hidden">
+          <div class="hint" style="margin-bottom:10px;">Plaza hourly records sampled clips hourly from 08:00 through 19:00 in the selected timezone. Choose Custom schedule and enter <span class="mono">0 8-19 * * *</span>.</div>
+          <div class="grid-2">
+            <div class="field"><label for="namingPlazaID">Plaza ID required, numeric</label><input id="namingPlazaID" type="text" placeholder="08" /></div>
+            <div class="field"><label for="namingContinent">Continent required</label><input id="namingContinent" type="text" placeholder="Europe" /></div>
+            <div class="field"><label for="namingCountry">Country required</label><input id="namingCountry" type="text" placeholder="Finland" /></div>
+            <div class="field"><label for="namingCity">City required</label><input id="namingCity" type="text" placeholder="Kuopio" /></div>
+          </div>
+          <div class="field"><label for="namingPlazaName">Custom plaza name required</label><input id="namingPlazaName" type="text" placeholder="Market Square" /></div>
+        </div>
+        <div class="hint">Example path: <span id="namingPreview" class="mono"></span></div>
+        <div id="namingWarn" class="hint warn"></div>
+        </div><!-- /Section D -->
+
+        <!-- SECTION E: Where clips go (storage) -->
         <div class="form-section">
-        <div class="form-section-head"><span class="form-section-step">D</span><span class="form-section-title">Where clips go</span></div>
+        <div class="form-section-head"><span class="form-section-step">E</span><span class="form-section-title">Where clips go</span></div>
         <p class="hint" style="margin:0 0 10px;">Keep clips in storage we manage for you, or record to your own NAS.</p>
 
         <!-- Where clips go -->
@@ -910,8 +935,18 @@
       endAt: document.getElementById('endAt'),
       windowWarn: document.getElementById('windowWarn'),
       clipSeg: document.getElementById('clipSeg'),
-      clipCustomWrap: document.getElementById('clipCustomWrap'),
-      clipCustom: document.getElementById('clipCustom'),
+      namingSection: document.getElementById('namingSection'),
+      namingSeg: document.getElementById('namingSeg'),
+      namingFolder: document.getElementById('namingFolder'),
+      namingFolderHint: document.getElementById('namingFolderHint'),
+      plazaHourlyNamingFields: document.getElementById('plazaHourlyNamingFields'),
+      namingPlazaID: document.getElementById('namingPlazaID'),
+      namingContinent: document.getElementById('namingContinent'),
+      namingCountry: document.getElementById('namingCountry'),
+      namingCity: document.getElementById('namingCity'),
+      namingPlazaName: document.getElementById('namingPlazaName'),
+      namingPreview: document.getElementById('namingPreview'),
+      namingWarn: document.getElementById('namingWarn'),
       fpsSeg: document.getElementById('fpsSeg'),
       fpsCustomWrap: document.getElementById('fpsCustomWrap'),
       fpsCustom: document.getElementById('fpsCustom'),
@@ -1011,6 +1046,7 @@
       // back-to-back segments for a daily window). Shared by single + bundle.
       composerScheduleMode: 'sampled',
       clipSelected: 60,
+      namingProfile: 'stoarama_v1',
       // Frame rate choice: 'source' (native, no re-encode) | '30' | '15'.
       targetFps: 'source',
       verifiedDestId: 0, // a bucket just verified inline this session
@@ -1127,7 +1163,7 @@
     // ValidateContinuousWindowForCreate: start < end is a same-day daytime window;
     // end <= start is an OVERNIGHT window that opens at start and closes at end the
     // next calendar day (crosses local midnight); end == start is the 24h full-day
-    // window. The only real invariant (clip length 5..900s) is checked separately.
+    // window. Clip length is checked separately against the fixed product choices.
     function continuousWindowValid() {
       const s = String(els.dailyWindowStart.value || '').trim();
       const e = String(els.dailyWindowEnd.value || '').trim();
@@ -1160,6 +1196,11 @@
       const h = Math.floor(mins / 60), m = mins % 60;
       const hp = h > 0 ? `${h}h` : '', mp = m > 0 ? `${m}m` : '';
       return (hp && mp) ? `${hp} ${mp}` : (hp || mp || '0m');
+    }
+
+    function fmtClipLength(sec) {
+      const n = Number(sec || 0);
+      return n > 0 && n % 60 === 0 ? fmtDurationMin(n / 60) : `${n}s`;
     }
 
     // windowSummaryText is the live one-line summary of a daily window, e.g.
@@ -1252,11 +1293,93 @@
     }
 
     function selectedClipSec() {
-      if (state.clipSelected === 'custom') {
-        const n = Number(els.clipCustom.value || 0);
-        return Number.isFinite(n) ? Math.trunc(n) : 0;
-      }
       return Number(state.clipSelected) || 0;
+    }
+
+    function buildNamingPayload() {
+      const profile = String(state.namingProfile || 'stoarama_v1');
+      const body = {
+        profile,
+        folder_name: String(els.namingFolder.value || '').trim(),
+        metadata: {
+          plaza_id: String(els.namingPlazaID.value || '').trim(),
+          continent: String(els.namingContinent.value || '').trim(),
+          country: String(els.namingCountry.value || '').trim(),
+          city: String(els.namingCity.value || '').trim(),
+          plaza_name: String(els.namingPlazaName.value || '').trim(),
+        },
+      };
+      return body;
+    }
+
+    function namingToken(v, fallback) {
+      const raw = String(v || fallback || '').trim();
+      const out = raw.replace(/\s+/g, '_').replace(/[^A-Za-z0-9_.-]/g, '').replace(/_+/g, '_').replace(/^[_.]+|[_.]+$/g, '');
+      return out || String(fallback || 'value');
+    }
+
+    function namingFolderPreview(v, fallback) {
+      return String(v || fallback || '')
+        .split('/')
+        .map((part) => namingToken(part, 'folder'))
+        .filter(Boolean)
+        .join('/') || String(fallback || 'recordings');
+    }
+
+    function twoDigitID(v) {
+      const n = Number(String(v || '').trim());
+      return Number.isFinite(n) ? String(Math.trunc(n)).padStart(2, '0') : '08';
+    }
+
+    function renderNamingPreview() {
+      const n = buildNamingPayload();
+      if (n.profile === 'plaza_hourly_v1') {
+        const m = n.metadata;
+        const id = twoDigitID(m.plaza_id);
+        const plaza = namingToken(m.plaza_name, 'Market Square');
+        const folder = n.folder_name
+          ? namingFolderPreview(n.folder_name, 'custom_folder')
+          : [id, namingToken(m.continent, 'Europe'), namingToken(m.country, 'Finland'), namingToken(m.city, 'Kuopio'), plaza].join('_');
+        els.namingFolderHint.innerHTML = 'Leave blank to derive <span class="mono">{ID}_{Continent}_{Country}_{City}_{PlazaName}</span>. Custom text replaces that root folder.';
+        els.namingPreview.textContent = `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_03.mp4`;
+        return;
+      }
+      const folder = n.folder_name ? namingFolderPreview(n.folder_name, 'recordings') : 'recordings';
+      els.namingFolderHint.innerHTML = 'Leave blank for <span class="mono">recordings</span>.';
+      els.namingPreview.textContent = state.composerScheduleMode === 'continuous'
+        ? `${folder}/123/continuous/1783341296.mp4`
+        : `${folder}/123/456/1783341296789.mp4`;
+    }
+
+    function namingValid() {
+      renderNamingPreview();
+      if (state.composerMode === 'bundle') {
+        els.namingWarn.textContent = '';
+        return true;
+      }
+      if (state.namingProfile !== 'plaza_hourly_v1') {
+        els.namingWarn.textContent = '';
+        return true;
+      }
+      const n = buildNamingPayload().metadata;
+      const fieldsOK = n.plaza_id && n.continent && n.country && n.city && n.plaza_name;
+      const idOK = /^\d+$/.test(n.plaza_id);
+      const sched = compiledSchedule();
+      const scheduleOK = state.composerScheduleMode === 'sampled' && sched.cron === '0 8-19 * * *';
+      if (!fieldsOK) {
+        els.namingWarn.textContent = 'Plaza hourly format requires plaza ID, continent, country, city, and plaza name.';
+        return false;
+      }
+      if (!idOK) {
+        els.namingWarn.textContent = 'Plaza ID must be numeric, for example 08.';
+        return false;
+      }
+      if (!scheduleOK) {
+        els.namingWarn.textContent = 'Plaza hourly requires Sample clips with Custom schedule 0 8-19 * * *.';
+        return false;
+      }
+      els.namingWarn.textContent = '';
+      return true;
     }
 
     // The wall-clock parts of an instant in a given IANA zone, as numbers.
@@ -1533,7 +1656,7 @@
       const clipSec = selectedClipSec();
       const streams = estStreamCount();
       const perDay = estClipsPerDay();
-      if (clipSec <= 0 || clipSec < 5 || clipSec > 900) {
+      if (![60, 300, 600].includes(clipSec)) {
         els.composerCount.innerHTML = '<span class="muted">Set a valid clip length to estimate the clip count.</span>';
         return;
       }
@@ -1612,8 +1735,8 @@
 
       // Pre-flight: gap >= 600s and clip strictly shorter than the gap.
       els.schedWarn.textContent = '';
-      if (clip <= 0 || clip < 5 || clip > 900) {
-        els.schedWarn.textContent = 'Clip length must be between 5 and 900 seconds.';
+      if (![60, 300, 600].includes(clip)) {
+        els.schedWarn.textContent = 'Clip length must be 1, 5, or 10 minutes.';
         ok = false;
       } else if (gap !== null) {
         if (gap < MIN_GAP_SEC) {
@@ -1646,9 +1769,18 @@
       els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
         b.classList.toggle('on', b.getAttribute('data-clip') === String(clip));
       });
-      els.clipCustomWrap.classList.toggle('hidden', clip !== 'custom');
       refreshScheduleUI();
       renderCostEstimate();
+      refreshStartEnabled();
+    }
+
+    function setNamingProfile(profile) {
+      state.namingProfile = profile === 'plaza_hourly_v1' ? 'plaza_hourly_v1' : 'stoarama_v1';
+      els.namingSeg.querySelectorAll('button[data-naming]').forEach((b) => {
+        b.classList.toggle('on', b.getAttribute('data-naming') === state.namingProfile);
+      });
+      els.plazaHourlyNamingFields.classList.toggle('hidden', state.namingProfile !== 'plaza_hourly_v1');
+      namingValid();
       refreshStartEnabled();
     }
 
@@ -2347,13 +2479,13 @@
       const url = String(els.recURL.value || '').trim();
       const catalog = state.catalogStreamId > 0;
       const schedOK = state.composerScheduleMode === 'continuous'
-        ? (continuousWindowValid() && selectedClipSec() >= 5 && selectedClipSec() <= 900)
+        ? (continuousWindowValid() && [60, 300, 600].includes(selectedClipSec()))
         : refreshScheduleUIQuiet();
       const dest = selectedDestId() || selectedDeliveryDestId();
       const bucketOK = state.bucketState === 'connected' && dest > 0;
       const streamOK = state.streamProbe.ok === true;
       const sourceOK = catalog || !!url;
-      const ready = !state.starting && sourceOK && schedOK && bucketOK && streamOK && windowValid() && fpsValid();
+      const ready = !state.starting && sourceOK && schedOK && bucketOK && streamOK && windowValid() && fpsValid() && namingValid();
       els.startBtn.disabled = !ready;
     }
 
@@ -2364,7 +2496,7 @@
       const c = compiledSchedule();
       if (state.schedPreset === 'custom' && !c.cron) return false;
       if (state.schedPreset === 'daily' && !c.cron) return false;
-      if (clip <= 0 || clip < 5 || clip > 900) return false;
+      if (![60, 300, 600].includes(clip)) return false;
       if (gap !== null && (gap < MIN_GAP_SEC || clip >= gap)) return false;
       return true;
     }
@@ -3199,7 +3331,7 @@
       const tfps = Number(rec.target_fps || 0);
       const rows = [
         ['Schedule', escapeHTML(scheduleLabelFull(rec))],
-        ['Clip length', `${Number(rec.clip_duration_sec || 0)}s`],
+        ['Clip length', fmtClipLength(rec.clip_duration_sec)],
         ['Frame rate', tfps > 0 ? `${tfps} fps` : 'Source'],
       ];
       // Capture method row: S1-S9 schedule-row text via shared helper.
@@ -3225,9 +3357,8 @@
         </div>`;
     }
 
-    // The storage card: recording id (== the NAS folder name), stream id where
-    // applicable, current delivery, retention tier. Read-only; switching happens in
-    // the storage-options panel opened from the action row.
+    // The storage card: stream id where applicable, current delivery, retention tier.
+    // NAS delivery preserves each clip's recording file naming path.
     function storageCardHTML(rec) {
       const isNas = rec.delivery === 'nas_pull';
       const isManaged = rec.storage_managed === true && !isNas;
@@ -3237,7 +3368,7 @@
       if (streamId > 0) rows.push(['Stream ID', `<span class="mono">${streamId}</span>`]);
       if (isNas) {
         rows.push(['Storage', 'Your NAS']);
-        rows.push(['NAS folder', `<span class="mono">#${Number(rec.id)}</span>`]);
+        rows.push(['NAS path', "Uses this recording's file naming path"]);
       } else if (isManaged) {
         rows.push(['Storage', 'Stoarama-managed']);
         rows.push(['Billing type', tier === 'yearly_prepaid' ? 'Yearly, <b>$0.05</b> per hour of footage, per month' : 'Monthly, <b>$0.10</b> per hour of footage, per month']);
@@ -3289,14 +3420,12 @@
       const rec = clipPageState.rec;
       const st = statusLine(rec);
       const recId = clipPageState.recId;
-      const isNas = rec.delivery === 'nas_pull';
-      const idLabel = isNas ? 'NAS folder' : 'Recording ID';
       const header = `
         <div class="clip-page-head">
           <div>
             <div class="eyebrow">Recording</div>
             <h2 style="margin:2px 0 4px;">${escapeHTML(clipPageState.recName)}</h2>
-            <div style="margin:0 0 4px;font-size:12px;color:var(--muted);">${idLabel} <span class="clip-pill neutral" style="font-family:var(--mono);">#${recId}</span></div>
+            <div style="margin:0 0 4px;font-size:12px;color:var(--muted);">Recording ID <span class="clip-pill neutral" style="font-family:var(--mono);">#${recId}</span></div>
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
           <a class="btn-link secondary" href="/recordings">Back to recordings</a>
@@ -3489,7 +3618,11 @@
           <select id="edTz">${tzOpts}</select>
         </div>
         <div class="grid-2">
-          <div class="field"><label for="edClip">Clip length (seconds)</label><input id="edClip" type="number" min="5" max="900" value="${clip}" /></div>
+          <div class="field"><label for="edClip">Clip length</label><select id="edClip">
+            <option value="60"${clip === 60 ? ' selected' : ''}>1 min</option>
+            <option value="300"${clip === 300 ? ' selected' : ''}>5 min</option>
+            <option value="600"${clip === 600 ? ' selected' : ''}>10 min</option>
+          </select></div>
           <div class="field"><label for="edFps">Frame rate (fps, 0 = source)</label><input id="edFps" type="number" min="0" max="60" step="1" value="${tfps}" /></div>
         </div>
         <div class="grid-2">
@@ -3985,6 +4118,8 @@
     }
 
     function openComposer(asHero) {
+      state.composerMode = 'single';
+      els.namingSection.classList.remove('hidden');
       els.composer.classList.remove('hidden');
       els.composerClose.classList.toggle('hidden', !!asHero);
       // Default Start to now (open-ended Stop) each time the composer opens empty.
@@ -4172,6 +4307,14 @@
       els.startAt.value = '';
       els.endAt.value = '';
       els.windowWarn.textContent = '';
+      els.namingFolder.value = '';
+      els.namingPlazaID.value = '';
+      els.namingContinent.value = '';
+      els.namingCountry.value = '';
+      els.namingCity.value = '';
+      els.namingPlazaName.value = '';
+      setNamingProfile('stoarama_v1');
+      els.namingSection.classList.remove('hidden');
       // Never leave a blank screen: restore the default view for the current state.
       // Empty account -> show the hero + "Start a recording" CTA; otherwise the
       // recordings list + "+ New recording" row are already visible.
@@ -4226,6 +4369,7 @@
         clip_duration_sec: clip,
         start_at: win.startISO,
         end_at: win.endISO,
+        naming: buildNamingPayload(),
       };
       if (continuous) {
         body.mode = 'continuous';
@@ -4451,8 +4595,12 @@
       b.addEventListener('click', () => setSchedPreset(b.getAttribute('data-preset'))));
     els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
       const v = b.getAttribute('data-clip');
-      b.addEventListener('click', () => setClip(v === 'custom' ? 'custom' : Number(v)));
+      b.addEventListener('click', () => setClip(Number(v)));
     });
+    els.namingSeg.querySelectorAll('button[data-naming]').forEach((b) =>
+      b.addEventListener('click', () => setNamingProfile(b.getAttribute('data-naming'))));
+    [els.namingFolder, els.namingPlazaID, els.namingContinent, els.namingCountry, els.namingCity, els.namingPlazaName].forEach((el) =>
+      el.addEventListener('input', () => { namingValid(); refreshStartEnabled(); }));
     els.fpsSeg.querySelectorAll('button[data-fps]').forEach((b) =>
       b.addEventListener('click', () => setFps(b.getAttribute('data-fps'))));
     els.fpsCustom.addEventListener('input', () => { refreshStartEnabled(); });
@@ -4460,7 +4608,6 @@
     els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.schedTZCustom.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
-    els.clipCustom.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
     els.startAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
     els.endAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
     // For YouTube URLs the composer skips the server probe entirely and lets the relay
@@ -4547,6 +4694,7 @@
     // populates state.bundleSelected (from ?stream_ids=) and calls loadBundleStreams.
     function openBundleComposer() {
       state.composerMode = 'bundle';
+      setNamingProfile('stoarama_v1');
       clearCatalogLock();
       els.composer.classList.remove('hidden');
       els.composerClose.classList.remove('hidden');
@@ -4554,6 +4702,7 @@
       els.urlField.classList.add('hidden');
       els.catalogStreamBlock.classList.add('hidden');
       els.bundleSourceBlock.classList.remove('hidden');
+      els.namingSection.classList.add('hidden');
       // Hide the single Name field (the bundle has its own name field).
       const singleNameField = els.recName.closest('.field');
       if (singleNameField) singleNameField.classList.add('hidden');
@@ -4941,6 +5090,7 @@
       setSchedPreset('hourly');
       setScheduleMode('sampled');
       setClip(60);
+      setNamingProfile('stoarama_v1');
       renderCostEstimate();
       try {
         const account = await fetchAccountWithRetry();

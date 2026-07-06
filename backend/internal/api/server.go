@@ -254,6 +254,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/exports/progress", s.handleAccountExportProgress)
 			account.Patch("/recordings/{id}/retention", s.handleAccountRecordingRetention)
 			account.Patch("/recordings/{id}/schedule", s.handleAccountRecordingSchedule)
+			account.Patch("/recordings/{id}/naming", s.handleAccountRecordingNaming)
 			account.Patch("/recordings/{id}/delivery", s.handleAccountRecordingDelivery)
 			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
