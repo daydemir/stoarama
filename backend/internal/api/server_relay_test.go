@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // A relay principal's canonical lease_owner is the server-derived 'node:{id}', never
 // the display name, so relay ownership can neither collide with a user-chosen name nor
@@ -69,5 +72,28 @@ func TestIsReservedNodeDisplayName(t *testing.T) {
 	}
 	if isReservedNodeDisplayName("stoarama-rec-1-0") {
 		t.Fatalf("isReservedNodeDisplayName(droplet name)=true want false")
+	}
+}
+
+func TestRelayInstallCommandIncludesNameAndConcurrency(t *testing.T) {
+	cmd := relayInstallCommand("sie_test", "deniz-mini-r")
+	for _, want := range []string{
+		"curl -fsSL https://stoarama.com/relay/install.sh | bash -s --",
+		"--token 'sie_test'",
+		"--name 'deniz-mini-r'",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("relayInstallCommand missing %q in %q", want, cmd)
+		}
+	}
+	if strings.Contains(cmd, "--concurrency") {
+		t.Fatalf("relayInstallCommand must stay compatible with the currently served installer during API-first deploy: %q", cmd)
+	}
+}
+
+func TestShellQuoteEscapesSingleQuotes(t *testing.T) {
+	got := shellQuote("a'b")
+	if got != "'a'\\''b'" {
+		t.Fatalf("shellQuote=%q", got)
 	}
 }

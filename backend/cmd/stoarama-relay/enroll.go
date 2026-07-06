@@ -45,11 +45,12 @@ func runEnroll(args []string) error {
 	}
 
 	payload := map[string]any{
-		"token":        tok,
-		"node_type":    "relay",
-		"display_name": display,
-		"hostname":     hostname(),
-		"platform":     runtime.GOOS + "/" + runtime.GOARCH,
+		"token":             tok,
+		"node_type":         "relay",
+		"display_name":      display,
+		"hostname":          hostname(),
+		"platform":          runtime.GOOS + "/" + runtime.GOARCH,
+		"relay_max_streams": conc,
 		"capabilities_json": map[string]any{
 			"max_concurrent_streams": conc,
 			"youtube_mode":           "cookieless",

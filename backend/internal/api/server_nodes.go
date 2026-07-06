@@ -23,6 +23,10 @@ const (
 	// heuristic. Only relay principals take the node:{id} lease-owner canonical form
 	// and the relay lease branch; droplet principals are byte-identical to before.
 	nodeTypeRelay = "relay"
+
+	relayDefaultMaxStreams = 6
+	relayMinMaxStreams     = 1
+	relayMaxMaxStreams     = 20
 )
 
 type nodePrincipal struct {
@@ -190,7 +194,7 @@ func (s *Server) createNodeEnrollmentToken(ctx context.Context, accountID int64,
 		// "Connect a computer" flow surfaces: it fetches the public relay installer and
 		// runs it with the enrollment token. The token is only in this create response
 		// (never listed again), so this is the one place the full command exists.
-		"install_command": relayInstallCommand(token),
+		"install_command": relayInstallCommand(token, label),
 	}, nil
 }
 
@@ -201,10 +205,18 @@ func (s *Server) createNodeEnrollmentToken(ctx context.Context, accountID int64,
 const relayInstallPublicBase = "https://stoarama.com"
 
 // relayInstallCommand builds the show-once curl|bash install line for an enrollment
-// token, matching the shipped installer's invocation contract (scripts/
-// relay-install.sh: `bash -s -- --token <sie_ token>`).
-func relayInstallCommand(token string) string {
-	return fmt.Sprintf("curl -fsSL %s/relay/install.sh | bash -s -- --token %s", relayInstallPublicBase, token)
+// token, matching the shipped installer's invocation contract.
+func relayInstallCommand(token, label string) string {
+	cmd := fmt.Sprintf("curl -fsSL %s/relay/install.sh | bash -s -- --token %s",
+		relayInstallPublicBase, shellQuote(token))
+	if strings.TrimSpace(label) != "" {
+		cmd += " --name " + shellQuote(strings.TrimSpace(label))
+	}
+	return cmd
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 func (s *Server) handleAccountNodeEnrollmentTokensList(w http.ResponseWriter, r *http.Request) {
@@ -417,7 +429,7 @@ func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) 
 	}
 	var relayMaxArg any
 	if req.RelayMaxStreams != nil {
-		if *req.RelayMaxStreams < 1 || *req.RelayMaxStreams > 20 {
+		if *req.RelayMaxStreams < relayMinMaxStreams || *req.RelayMaxStreams > relayMaxMaxStreams {
 			util.WriteError(w, http.StatusBadRequest, "relay_max_streams must be between 1 and 20")
 			return
 		}
@@ -548,6 +560,7 @@ type nodeEnrollRequest struct {
 	DisplayName      string         `json:"display_name"`
 	Hostname         string         `json:"hostname"`
 	Platform         string         `json:"platform"`
+	RelayMaxStreams  *int           `json:"relay_max_streams"`
 	CapabilitiesJSON map[string]any `json:"capabilities_json"`
 	MetadataJSON     map[string]any `json:"metadata_json"`
 }
@@ -579,6 +592,18 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		util.WriteError(w, http.StatusBadRequest, "invalid node_type")
 		return
+	}
+	relayMaxStreams := relayDefaultMaxStreams
+	if req.RelayMaxStreams != nil {
+		if nodeType != nodeTypeRelay {
+			util.WriteError(w, http.StatusBadRequest, "relay_max_streams is only valid for relay nodes")
+			return
+		}
+		if *req.RelayMaxStreams < relayMinMaxStreams || *req.RelayMaxStreams > relayMaxMaxStreams {
+			util.WriteError(w, http.StatusBadRequest, "relay_max_streams must be between 1 and 20")
+			return
+		}
+		relayMaxStreams = *req.RelayMaxStreams
 	}
 	tokenHash := hashSecret(rawToken)
 	capBytes, err := json.Marshal(nonNilMap(req.CapabilitiesJSON))
@@ -678,22 +703,23 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 			    platform=$3,
 			    capabilities_jsonb=$4::jsonb,
 			    metadata_jsonb=$5::jsonb,
+			    relay_max_streams=$6,
 			    enrolled_at=now(),
 			    last_heartbeat_at=now(),
 			    updated_at=now()
 			WHERE id=$1
-		`, nodeID, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes)); err != nil {
+		`, nodeID, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes), relayMaxStreams); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("reactivate node: %v", err))
 			return
 		}
 	default:
 		err = tx.QueryRow(r.Context(), `
 			INSERT INTO nodes (
-				account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb
+				account_id, node_type, display_name, hostname, platform, status, enrolled_at, last_heartbeat_at, capabilities_jsonb, metadata_jsonb, relay_max_streams
 			)
-			VALUES ($1, $2, $3, $4, $5, 'active', now(), now(), $6::jsonb, $7::jsonb)
+			VALUES ($1, $2, $3, $4, $5, 'active', now(), now(), $6::jsonb, $7::jsonb, $8)
 			RETURNING id
-		`, accountID, nodeType, displayName, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes)).Scan(&nodeID)
+		`, accountID, nodeType, displayName, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes), relayMaxStreams).Scan(&nodeID)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create node: %v", err))
 			return
@@ -866,7 +892,7 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		metadataRaw     []byte
 		createdAt       time.Time
 		updatedAt       time.Time
-		relayMaxStreams  int
+		relayMaxStreams int
 		liveLeases      int
 	)
 	if err := row.Scan(

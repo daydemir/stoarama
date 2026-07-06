@@ -23,18 +23,26 @@ set -euo pipefail
 API_URL="https://stoarama.com"
 TOKEN=""
 NAME=""
+CONCURRENCY="6"
+
+PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --token)   TOKEN="${2:-}"; shift 2 ;;
-    --api-url) API_URL="${2:-}"; shift 2 ;;
-    --name)    NAME="${2:-}"; shift 2 ;;
+    --token)       TOKEN="${2:-}"; shift 2 ;;
+    --api-url)     API_URL="${2:-}"; shift 2 ;;
+    --name)        NAME="${2:-}"; shift 2 ;;
+    --concurrency) CONCURRENCY="${2:-}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
 if [[ -z "${TOKEN}" ]]; then
   echo "error: --token is required" >&2
+  exit 1
+fi
+if ! [[ "${CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || (( CONCURRENCY > 20 )); then
+  echo "error: --concurrency must be between 1 and 20" >&2
   exit 1
 fi
 API_URL="${API_URL%/}"
@@ -165,7 +173,7 @@ if [[ ! -x "${BIN_DIR}/ffmpeg" ]]; then
 fi
 
 echo "Enrolling this computer with Stoarama..."
-ENROLL_ARGS=(enroll --token "${TOKEN}" --api-url "${API_URL}")
+ENROLL_ARGS=(enroll --token "${TOKEN}" --api-url "${API_URL}" --concurrency "${CONCURRENCY}")
 [[ -n "${NAME}" ]] && ENROLL_ARGS+=(--name "${NAME}")
 "${BIN_DIR}/stoarama-relay" "${ENROLL_ARGS[@]}"
 

@@ -825,7 +825,7 @@
       const label = `<b style="color:${live.color};">${live.label}</b>`;
       const cap = (n.capabilities_json && typeof n.capabilities_json === 'object') ? n.capabilities_json : {};
       const platform = relayPlatformLabel(n.platform);
-      const max = Number(n.relay_max_streams || 5);
+      const max = Number(n.relay_max_streams || 6);
       const liveLeases = Number(n.live_leases || 0);
       const isOnline = n.healthy === true;
       const recNow = isOnline ? String(liveLeases) : 'n/a';
@@ -853,7 +853,7 @@
       const total = items.length;
       const online = items.filter((n) => n.healthy === true).length;
       const liveLeases = items.reduce((s, n) => s + Number(n.live_leases || 0), 0);
-      const availSlots = items.filter((n) => n.healthy === true).reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 5) - Number(n.live_leases || 0)), 0);
+      const availSlots = items.filter((n) => n.healthy === true).reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 6) - Number(n.live_leases || 0)), 0);
       const red = online === 0 && total > 0;
       const borderColor = red ? 'var(--err)' : 'var(--border)';
       const headline = red ? `<div style="font-weight:600;color:var(--err);margin-bottom:8px;">No computer online. Active relay recordings are not capturing.</div>` : '';

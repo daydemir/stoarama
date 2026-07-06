@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	defaultAPIURL      = "https://stoarama.com"
-	defaultConcurrency = 5
+	defaultAPIURL            = "https://stoarama.com"
+	defaultConcurrency       = 6
+	legacyDefaultConcurrency = 5
 )
 
 // relayConfig is the persisted enrollment state at ~/.stoarama/config.json (0600).
@@ -96,7 +97,7 @@ func loadConfig() (relayConfig, error) {
 	if cfg.APIURL == "" {
 		cfg.APIURL = defaultAPIURL
 	}
-	if cfg.Concurrency <= 0 {
+	if cfg.Concurrency <= 0 || cfg.Concurrency == legacyDefaultConcurrency {
 		cfg.Concurrency = defaultConcurrency
 	}
 	if strings.TrimSpace(cfg.NodeToken) == "" {
