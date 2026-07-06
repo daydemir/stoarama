@@ -1771,7 +1771,8 @@
 	            <th style="width:128px;">Thumb</th>
 	            <th data-sort-key="name">Stream</th>
 	            <th data-sort-key="location_city">Location</th>
-	            <th data-sort-key="survey_last_person_count">Seen</th>
+	            <th data-sort-key="survey_last_person_count">People</th>
+	            <th data-sort-key="survey_last_vehicle_count">Vehicles</th>
 	            <th>Record</th>
 	          </tr>
 	        </thead>
@@ -2341,11 +2342,10 @@ function fmtPct(num, den) {
   return `${((num / den) * 100).toFixed(1)}%`;
 }
 
-function renderSurveySnapshotTerse(row) {
-  const p = row && row.survey_last_person_count;
-  const v = row && row.survey_last_vehicle_count;
-  if (p == null && v == null) return '<span class="muted fs11">no data yet</span>';
-  return esc(`${Number(p || 0)}p / ${Number(v || 0)}v`);
+function renderSurveySnapshotCount(row, kind) {
+  const v = row && (kind === 'person' ? row.survey_last_person_count : row.survey_last_vehicle_count);
+  if (v == null) return '<span class="muted fs11">-</span>';
+  return esc(String(Number(v || 0)));
 }
 
 function peoplePerInferenceMetric(row) {
@@ -4960,7 +4960,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="6" style="padding:20px;">
+        <td colspan="7" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -5001,7 +5001,8 @@ function renderStreamRows() {
         </div>
       </td>
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
-      <td class="muted fs11 mono">${renderSurveySnapshotTerse(row)}</td>
+      <td class="muted fs11 mono">${renderSurveySnapshotCount(row, 'person')}</td>
+      <td class="muted fs11 mono">${renderSurveySnapshotCount(row, 'vehicle')}</td>
       <td class="stream-record-cell">${
         recordable
           ? (streamRecordingID(row) > 0
