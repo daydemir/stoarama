@@ -12,14 +12,25 @@ import (
 )
 
 func TestSanitizeAccountRedirectPath(t *testing.T) {
-	if got := sanitizeAccountRedirectPath(""); got != "/account" {
-		t.Fatalf("blank redirect=%q want /account", got)
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "blank", raw: "", want: "/account"},
+		{name: "absolute", raw: "https://example.com", want: "/account"},
+		{name: "scheme relative", raw: "//example.com/account", want: "/account"},
+		{name: "path", raw: "/account/console", want: "/account/console"},
+		{name: "strip stale account error", raw: "/account?error=expired_token", want: "/account"},
+		{name: "strip auth flow keys", raw: "/account?auth=complete&redirect_path=%2Fstreams&token=abc&error=expired_token", want: "/account"},
+		{name: "preserve stream filters", raw: "/streams?recordable=1&sort_by=name&sort_dir=desc&page=1&page_size=100", want: "/streams?page=1&page_size=100&recordable=1&sort_by=name&sort_dir=desc"},
 	}
-	if got := sanitizeAccountRedirectPath("https://example.com"); got != "/account" {
-		t.Fatalf("absolute redirect=%q want /account", got)
-	}
-	if got := sanitizeAccountRedirectPath("/account/console"); got != "/account/console" {
-		t.Fatalf("path redirect=%q want /account/console", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeAccountRedirectPath(tt.raw); got != tt.want {
+				t.Fatalf("redirect=%q want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -44,9 +55,67 @@ func TestBuildAccountMagicLinkUsesAppBaseURL(t *testing.T) {
 
 func TestBuildAccountPostAuthRedirectPath(t *testing.T) {
 	got := buildAccountPostAuthRedirectPath("/streams/1?tab=details")
-	want := "/account?auth=complete&redirect_path=%2Fstreams%2F1%3Ftab%3Ddetails"
+	want := "/streams/1?auth=complete&tab=details"
 	if got != want {
 		t.Fatalf("post auth redirect=%q want %q", got, want)
+	}
+}
+
+func TestBuildAccountPostAuthRedirectPathStripsStaleErrors(t *testing.T) {
+	got := buildAccountPostAuthRedirectPath("/account?error=expired_token")
+	want := "/account?auth=complete"
+	if got != want {
+		t.Fatalf("post auth redirect=%q want %q", got, want)
+	}
+}
+
+func TestCanonicalAccountAuthCompleteURL(t *testing.T) {
+	s := &Server{cfg: config.Config{AppBaseURL: "https://stoarama.com"}}
+	req := httptest.NewRequest(http.MethodGet, "https://stoarama-api.onrender.com/auth/complete?token=abc123", nil)
+	got, ok := s.canonicalAccountAuthCompleteURL(req)
+	if !ok {
+		t.Fatalf("expected canonical redirect")
+	}
+	want := "https://stoarama.com/auth/complete?token=abc123"
+	if got != want {
+		t.Fatalf("canonical redirect=%q want %q", got, want)
+	}
+}
+
+func TestCanonicalAccountAuthCompleteURLSameHost(t *testing.T) {
+	s := &Server{cfg: config.Config{AppBaseURL: "https://stoarama.com"}}
+	req := httptest.NewRequest(http.MethodGet, "https://stoarama.com/auth/complete?token=abc123", nil)
+	if got, ok := s.canonicalAccountAuthCompleteURL(req); ok {
+		t.Fatalf("unexpected canonical redirect %q", got)
+	}
+}
+
+func TestCanonicalAccountAuthCompleteURLUpgradesSameHostToHTTPS(t *testing.T) {
+	s := &Server{cfg: config.Config{AppBaseURL: "https://stoarama.com"}}
+	req := httptest.NewRequest(http.MethodGet, "http://stoarama.com/auth/complete?token=abc123", nil)
+	got, ok := s.canonicalAccountAuthCompleteURL(req)
+	if !ok {
+		t.Fatalf("expected canonical redirect")
+	}
+	want := "https://stoarama.com/auth/complete?token=abc123"
+	if got != want {
+		t.Fatalf("canonical redirect=%q want %q", got, want)
+	}
+}
+
+func TestHandleAccountAuthCompleteCanonicalizesBeforeTokenUse(t *testing.T) {
+	s := &Server{cfg: config.Config{AppBaseURL: "https://stoarama.com"}}
+	req := httptest.NewRequest(http.MethodGet, "https://stoarama-api.onrender.com/auth/complete?token=abc123", nil)
+	rr := httptest.NewRecorder()
+
+	s.handleAccountAuthComplete(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status=%d want %d", rr.Code, http.StatusFound)
+	}
+	want := "https://stoarama.com/auth/complete?token=abc123"
+	if got := rr.Header().Get("Location"); got != want {
+		t.Fatalf("location=%q want %q", got, want)
 	}
 }
 

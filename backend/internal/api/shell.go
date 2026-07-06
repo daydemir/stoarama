@@ -116,6 +116,17 @@ const shellTopbarJS = `
   function redirectPath(){
     try{return location.pathname+(location.search||"");}catch(_){return "/";}
   }
+  function authCompleted(){
+    try{return String(new URLSearchParams(location.search).get("auth")||"").toLowerCase()==="complete";}catch(_){return false;}
+  }
+  function clearAuthCompleteParam(){
+    try{
+      var next=new URL(location.href);
+      next.searchParams.delete("auth");
+      history.replaceState(null,"",next.pathname+(next.searchParams.toString()?("?"+next.searchParams.toString()):"")+(next.hash||""));
+    }catch(_){}
+  }
+  function sleep(ms){return new Promise(function(resolve){setTimeout(resolve,ms);});}
   function signInHref(){
     return "/account?redirect_path="+encodeURIComponent(redirectPath());
   }
@@ -224,31 +235,40 @@ const shellTopbarJS = `
       if(logoutBtn){logoutBtn.addEventListener("click",function(){menu.classList.remove("open");logout();});}
     }
   }
-  function load(){
-    if(chip){chip.textContent="Checking session...";}
+  function fetchAccountMe(){
     var ctrl=new AbortController();
     var to=setTimeout(function(){ctrl.abort();},8000);
-    fetch("/api/v1/account/me",{credentials:"same-origin",headers:{Accept:"application/json"},signal:ctrl.signal})
+    return fetch("/api/v1/account/me",{credentials:"same-origin",headers:{Accept:"application/json"},signal:ctrl.signal})
       .then(function(res){
         clearTimeout(to);
-        if(res.status===401){renderAnon("Log in");return null;}
+        if(res.status===401){return null;}
         if(!res.ok){throw new Error("status "+res.status);}
         return res.json();
       })
-      .then(function(payload){
-        if(!payload)return;
-        var acct=payload.account||{};
-        if(payload.authenticated&&acct&&acct.email){
-          renderSignedIn(payload);
-        }else{
-          renderAnon("Log in");
-        }
-      })
-      .catch(function(){
-        clearTimeout(to);
-        if(!chip)return;
-        chip.innerHTML='<a href="'+signInHref()+'">Log in</a> <span class="muted">&middot; session unavailable</span>';
-      });
+      .catch(function(err){clearTimeout(to);throw err;});
+  }
+  async function load(){
+    if(chip){chip.textContent="Checking session...";}
+    var attempts=authCompleted()?6:1;
+    try{
+      var payload=null;
+      for(var i=0;i<attempts;i++){
+        payload=await fetchAccountMe();
+        if(payload){break;}
+        if(i<attempts-1){await sleep(250);}
+      }
+      if(!payload){renderAnon("Log in");return;}
+      var acct=payload.account||{};
+      if(payload.authenticated&&acct&&acct.email){
+        renderSignedIn(payload);
+        if(authCompleted()){clearAuthCompleteParam();}
+      }else{
+        renderAnon("Log in");
+      }
+    }catch(_){
+      if(!chip)return;
+      chip.innerHTML='<a href="'+signInHref()+'">Log in</a> <span class="muted">&middot; session unavailable</span>';
+    }
   }
   if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",load);}else{load();}
 })();

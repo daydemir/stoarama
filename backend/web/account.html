@@ -212,9 +212,21 @@
 
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
+    function cleanRedirectPath(raw) {
+      const v = String(raw || '').trim();
+      if (!v.startsWith('/') || v.startsWith('//')) return '/account';
+      try {
+        const url = new URL(v, window.location.origin);
+        if (url.origin !== window.location.origin) return '/account';
+        ['auth', 'error', 'redirect_path', 'token'].forEach((key) => url.searchParams.delete(key));
+        url.hash = '';
+        return `${url.pathname}${url.search}${url.hash}`;
+      } catch (_) {
+        return '/account';
+      }
+    }
     const requestedRedirectPath = (() => {
-      const raw = String(authParams.get('redirect_path') || '').trim();
-      return raw.startsWith('/') ? raw : '/account';
+      return cleanRedirectPath(authParams.get('redirect_path'));
     })();
 
     let currentAccount = null;

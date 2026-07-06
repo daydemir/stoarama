@@ -417,6 +417,10 @@ func (s *Server) handleAccountAuthRequestLink(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Request) {
+	if redirectURL, ok := s.canonicalAccountAuthCompleteURL(r); ok {
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+		return
+	}
 	rawToken := strings.TrimSpace(r.URL.Query().Get("token"))
 	if rawToken == "" {
 		log.Printf("account auth complete missing_token host=%s ip=%s ua=%q", strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
@@ -1077,14 +1081,65 @@ func sanitizeAccountRedirectPath(raw string) string {
 	if !strings.HasPrefix(v, "/") || strings.HasPrefix(v, "//") {
 		return "/account"
 	}
-	return v
+	u, err := url.Parse(v)
+	if err != nil || u.IsAbs() || u.Host != "" || u.Path == "" {
+		return "/account"
+	}
+	params := u.Query()
+	for _, key := range []string{"auth", "error", "redirect_path", "token"} {
+		params.Del(key)
+	}
+	u.RawQuery = params.Encode()
+	u.Fragment = ""
+	return u.String()
 }
 
 func buildAccountPostAuthRedirectPath(redirectPath string) string {
-	params := url.Values{}
+	u, err := url.Parse(sanitizeAccountRedirectPath(redirectPath))
+	if err != nil {
+		return "/account?auth=complete"
+	}
+	params := u.Query()
 	params.Set("auth", "complete")
-	params.Set("redirect_path", sanitizeAccountRedirectPath(redirectPath))
-	return "/account?" + params.Encode()
+	u.RawQuery = params.Encode()
+	return u.String()
+}
+
+func (s *Server) canonicalAccountAuthCompleteURL(r *http.Request) (string, bool) {
+	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(s.cfg.AppBaseURL), "/"))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return "", false
+	}
+	if sameHost(strings.TrimSpace(r.Host), base.Host) && accountAuthCompleteSchemeMatches(r, base.Scheme) {
+		return "", false
+	}
+	u := *r.URL
+	u.Scheme = base.Scheme
+	u.Host = base.Host
+	return u.String(), true
+}
+
+func sameHost(a, b string) bool {
+	ahost, _, err := net.SplitHostPort(a)
+	if err == nil {
+		a = ahost
+	}
+	bhost, _, err := net.SplitHostPort(b)
+	if err == nil {
+		b = bhost
+	}
+	return strings.EqualFold(a, b)
+}
+
+func accountAuthCompleteSchemeMatches(r *http.Request, scheme string) bool {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "https":
+		return requestIsHTTPS(r)
+	case "http":
+		return !requestIsHTTPS(r)
+	default:
+		return false
+	}
 }
 
 func maskSecretForLog(raw string) string {
