@@ -134,6 +134,7 @@ func usage() {
 	  stoaramactl alerts send-test-email [--to email@example.com] [--stream-id N --stream-name NAME --reason capture_runtime_stopped]
 	  stoaramactl alerts history [--limit 50 --status accepted|delivered|opened|bounced|failed --stream-id N]
 	  stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]
+	  stoaramactl import global-street-scores [--nils-csv PATH --vittorio-csv PATH --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 60 --apply --review-approved --report-json out.json --json]
 	  stoaramactl overview summary [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl overview queue-health [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines list
@@ -174,13 +175,18 @@ func runImport(ctx context.Context, cfg config.Config, args []string) {
 	switch args[0] {
 	case "bellevue-streams":
 		runImportBellevueStreams(ctx, cfg, args[1:])
+	case "global-street-scores":
+		runImportGlobalStreetScores(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown import subcommand: %s", args[0])
 	}
 }
 
 func printImportUsage() {
-	fmt.Print("stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]\n")
+	fmt.Print(`stoaramactl import commands:
+  stoaramactl import bellevue-streams [--cam-query-url URL --source-page-url URL --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 15 --apply --report-json out.json --json]
+  stoaramactl import global-street-scores [--nils-csv PATH --vittorio-csv PATH --target-api-url URL --service-token TOKEN --limit 0 --concurrency 8 --probe-timeout-sec 60 --apply --review-approved --report-json out.json --json]
+`)
 }
 
 func postJSONWithToken(ctx context.Context, baseURL, token, path string, payload, out any) error {

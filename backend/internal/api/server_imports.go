@@ -145,6 +145,60 @@ func (s *Server) handleServiceStreamImport(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *Server) handleServiceStreamCreate(w http.ResponseWriter, r *http.Request) {
+	var req streamCreateRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	stream, err := s.createStreamRecord(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	util.WriteJSON(w, http.StatusCreated, map[string]any{
+		"ok":      true,
+		"created": true,
+		"stream":  stream,
+	})
+}
+
+func (s *Server) handleServiceStreamByExternalID(w http.ResponseWriter, r *http.Request) {
+	provider := strings.TrimSpace(r.URL.Query().Get("provider"))
+	externalID := strings.TrimSpace(r.URL.Query().Get("external_id"))
+	if provider == "" || externalID == "" {
+		util.WriteError(w, http.StatusBadRequest, "provider and external_id are required")
+		return
+	}
+	var id int64
+	err := s.pool.QueryRow(r.Context(), `
+		SELECT id
+		FROM streams
+		WHERE provider=$1 AND external_id=$2
+	`, provider, externalID).Scan(&id)
+	if err == pgx.ErrNoRows {
+		util.WriteJSON(w, http.StatusOK, map[string]any{
+			"ok":    true,
+			"found": false,
+		})
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("query stream by external id: %v", err))
+		return
+	}
+	stream, err := s.getStreamByID(r.Context(), id)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load stream: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"found":  true,
+		"stream": stream,
+	})
+}
+
 func (s *Server) handleServiceFrameImport(w http.ResponseWriter, r *http.Request) {
 	var req serviceFrameImportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

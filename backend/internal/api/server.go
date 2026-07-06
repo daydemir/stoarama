@@ -479,6 +479,8 @@ func (s *Server) router() http.Handler {
 			service.Get("/pipeline-experiments", s.handlePipelineExperimentsList)
 			service.Get("/pipeline-experiments/{id}", s.handlePipelineExperimentGet)
 			service.Post("/pipeline-experiment-iterations/sync", s.handlePipelineExperimentIterationsSync)
+			service.Post("/service/streams", s.handleServiceStreamCreate)
+			service.Get("/service/streams/by-external-id", s.handleServiceStreamByExternalID)
 			service.Post("/imports/streams", s.handleServiceStreamImport)
 			service.Post("/imports/frames", s.handleServiceFrameImport)
 			service.Post("/imports/streams/repair-canonical-capture", s.handleServiceStreamCanonicalCaptureRepair)
