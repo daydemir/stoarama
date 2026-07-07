@@ -52,6 +52,9 @@ type recordingLeaseResponse struct {
 	JobID                int64     `json:"job_id"`
 	RecordingID          int64     `json:"recording_id"`
 	SourceURL            string    `json:"source_url"`
+	StreamID             int64     `json:"stream_id,omitempty"`
+	StreamProvider       string    `json:"stream_provider,omitempty"`
+	SourcePageURL        string    `json:"source_page_url,omitempty"`
 	ClipDurationSec      int       `json:"clip_duration_sec"`
 	StorageDestinationID int64     `json:"storage_destination_id"`
 	FireAt               time.Time `json:"fire_at"`
@@ -118,8 +121,10 @@ const relayLeaseSQL = `
 	    attempt_count = attempt_count + 1,
 	    updated_at = now()
 	FROM cte, recordings rec
+	LEFT JOIN streams st ON st.id = rec.stream_id
 	WHERE j.id = cte.id AND rec.id = j.recording_id
-	RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
+	RETURNING j.id, j.recording_id, rec.stream_url, COALESCE(rec.stream_id, 0),
+	          COALESCE(st.provider, ''), COALESCE(st.source_page_url, ''), j.clip_duration_sec,
 	          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
 	          rec.target_fps, j.kind, j.window_end_at
 `
@@ -156,7 +161,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		// $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
 		err = s.pool.QueryRow(r.Context(), relayLeaseSQL,
 			principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
-			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
+			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
 			&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
 			&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
 		)
@@ -201,12 +206,14 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		    attempt_count = attempt_count + 1,
 		    updated_at = now()
 		FROM cte, recordings rec
+		LEFT JOIN streams st ON st.id = rec.stream_id
 		WHERE j.id = cte.id AND rec.id = j.recording_id
-		RETURNING j.id, j.recording_id, rec.stream_url, j.clip_duration_sec,
+		RETURNING j.id, j.recording_id, rec.stream_url, COALESCE(rec.stream_id, 0),
+		          COALESCE(st.provider, ''), COALESCE(st.source_page_url, ''), j.clip_duration_sec,
 		          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
 		          rec.target_fps, j.kind, j.window_end_at
 	`, workerID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
-			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.ClipDurationSec,
+			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
 			&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
 			&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
 		)

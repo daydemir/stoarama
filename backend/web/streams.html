@@ -5329,6 +5329,12 @@ function isIndirectHlsSource(stream) {
   return String(s.source_url || '').toLowerCase().includes('!hls');
 }
 
+function isRefreshableHlsSource(stream) {
+  const s = stream || {};
+  const provider = String(s.provider || '').trim().toUpperCase();
+  return isIndirectHlsSource(s) || provider === 'SKYLINEWEBCAMS';
+}
+
 // Returns the .m3u8 URL to play for an HLS stream: the direct source_url when it
 // already points at a manifest, otherwise the runtime-resolved manifest from the
 // detail payload (indirect KBS/Korea: source_url ends in '!hls', resolved URL is a
@@ -5351,7 +5357,7 @@ function detailHlsURL(stream) {
 // down), so the caller can fall back honestly rather than show a black box.
 async function resolveDetailPlayURL(stream) {
   const s = stream || {};
-  if (!isIndirectHlsSource(s)) return detailHlsURL(s);
+  if (!isRefreshableHlsSource(s)) return detailHlsURL(s);
   const payload = await fetchJSON(dashboardStreamURL(s.id, '/resolve'));
   return String((payload && payload.resolved_url) || '').trim();
 }

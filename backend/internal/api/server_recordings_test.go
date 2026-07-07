@@ -25,13 +25,13 @@ func TestSanitizeStorageKeyPrefix(t *testing.T) {
 	}
 
 	bad := []string{
-		"a/../b",         // parent traversal
-		"../etc",         // leading parent after trim
-		"a/./b",          // current-dir segment
-		"a//b",           // empty interior segment
-		"a\\b",           // backslash
-		"a\x00b",         // null byte
-		"a\tb",           // control char
+		"a/../b",          // parent traversal
+		"../etc",          // leading parent after trim
+		"a/./b",           // current-dir segment
+		"a//b",            // empty interior segment
+		"a\\b",            // backslash
+		"a\x00b",          // null byte
+		"a\tb",            // control char
 		"//double//slash", // empty interior segments
 	}
 	for _, in := range bad {
@@ -102,6 +102,28 @@ func TestClassifyRecordingSource(t *testing.T) {
 	for _, u := range reject {
 		if _, err := classifyRecordingSource(u); err == nil {
 			t.Fatalf("classifyRecordingSource(%q) expected rejection", u)
+		}
+	}
+}
+
+func TestRecordingLeaseIncludesCatalogResolveContextWithoutWeakeningTenantWall(t *testing.T) {
+	for _, want := range []string{
+		"n.account_id = rec.account_id",
+		"LEFT JOIN streams st ON st.id = rec.stream_id",
+		"COALESCE(st.provider, '')",
+		"COALESCE(st.source_page_url, '')",
+	} {
+		if !strings.Contains(relayLeaseSQL, want) {
+			t.Fatalf("relay lease SQL missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"st.account_id",
+		"source_page_url=$",
+		"provider=$",
+	} {
+		if strings.Contains(relayLeaseSQL, forbidden) {
+			t.Fatalf("relay lease SQL must not contain request-scoped catalog predicate %q", forbidden)
 		}
 	}
 }

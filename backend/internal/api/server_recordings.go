@@ -384,14 +384,15 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// has neither, so it is never auto-routed (we have no probe verdict for it).
 	var catalogStreamID int64
 	var catalogProvider string
+	var catalogSourcePageURL string
 	streamURL := strings.TrimSpace(req.StreamURL)
 	if req.StreamID != nil {
 		if *req.StreamID <= 0 {
 			util.WriteError(w, http.StatusBadRequest, "stream_id is invalid")
 			return
 		}
-		var catalogURL, provider string
-		err := s.pool.QueryRow(r.Context(), `SELECT source_url, COALESCE(provider,'') FROM streams WHERE id=$1`, *req.StreamID).Scan(&catalogURL, &provider)
+		var catalogURL, provider, sourcePageURL string
+		err := s.pool.QueryRow(r.Context(), `SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1`, *req.StreamID).Scan(&catalogURL, &provider, &sourcePageURL)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				util.WriteError(w, http.StatusNotFound, "catalog stream not found")
@@ -408,6 +409,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		streamIDArg = *req.StreamID
 		catalogStreamID = *req.StreamID
 		catalogProvider = provider
+		catalogSourcePageURL = sourcePageURL
 	}
 	if streamURL == "" {
 		util.WriteError(w, http.StatusBadRequest, "stream_url is required")
@@ -579,7 +581,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		// playable URL before validating/probing, so a reference ffmpeg cannot open
 		// directly can still be scheduled. The raw reference is what gets stored
 		// (below); the worker re-resolves it fresh on every capture.
-		resolvedForProbe, err = resolveRecordingStreamURL(r.Context(), streamURL)
+		resolvedForProbe, err = resolveRecordingStreamURL(r.Context(), catalogProvider, streamURL, catalogSourcePageURL)
 		if err != nil {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
@@ -1022,7 +1024,11 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	resolved, err := resolveRecordingStreamURL(r.Context(), streamURL)
+	provider, sourcePageURL := "", ""
+	if req.StreamID > 0 {
+		_ = s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1`, req.StreamID).Scan(&provider, &sourcePageURL)
+	}
+	resolved, err := resolveRecordingStreamURL(r.Context(), provider, streamURL, sourcePageURL)
 	if err != nil {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -1981,10 +1987,10 @@ func probeRecordingStreamReachable(ctx context.Context, streamURL string, valida
 // capture.ResolveCaptureInput. Image sources are rejected (the recorder is
 // video-only). The stored reference is left untouched; the worker re-resolves it
 // fresh on every capture so expiring tokens never break a schedule.
-func resolveRecordingStreamURL(ctx context.Context, streamURL string) (string, error) {
+func resolveRecordingStreamURL(ctx context.Context, provider, streamURL, sourcePageURL string) (string, error) {
 	resolveCtx, cancel := context.WithTimeout(ctx, recordingResolveTimeout)
 	defer cancel()
-	resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", streamURL, "")
+	resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, provider, streamURL, sourcePageURL)
 	if err != nil {
 		return "", fmt.Errorf("could not resolve stream reference: %w", err)
 	}

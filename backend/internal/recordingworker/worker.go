@@ -179,10 +179,11 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 
 	// Resolve the stored reference (e.g. a KBS '!hls' indirect URL) to a live
 	// playable URL fresh on every capture, so an expiring token (the KBS Wowza
-	// m3u8 token rolls every 24h) never breaks a schedule. A direct .m3u8 passes
-	// through unchanged. The resolve fetch is SSRF-guarded inside ResolveCaptureInput.
+	// m3u8 token rolls every 24h, and Skyline page tokens roll frequently) never
+	// breaks a schedule. A direct .m3u8 passes through unchanged. The resolve fetch
+	// is SSRF-guarded inside ResolveCaptureInput.
 	resolveCtx, resolveCancel := context.WithTimeout(jobCtx, 30*time.Second)
-	sourceURL, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", job.SourceURL, "")
+	sourceURL, isImage, err := capture.ResolveCaptureInput(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
 	resolveCancel()
 	if err != nil {
 		w.fail(ctx, job.JobID, fmt.Errorf("resolve source url: %w", err))
@@ -358,11 +359,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}
 		segmentIngested = false
 
-		// Re-resolve EVERY attempt so an expiring token (the KBS Wowza m3u8 token
-		// rolls every 24h) is refreshed on reconnect. A transient resolve error backs
-		// off and retries rather than failing the job mid-window.
+		// Re-resolve EVERY attempt so expiring tokens are refreshed on reconnect.
+		// A transient resolve error backs off and retries rather than failing the
+		// job mid-window.
 		resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
-		resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, "", job.SourceURL, "")
+		resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
 		resolveCancel()
 		if err != nil {
 			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {

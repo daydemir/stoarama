@@ -73,3 +73,79 @@ func TestResolveCaptureInputFailsClosedOnUnresolvedHLS(t *testing.T) {
 		t.Fatalf("error should name the unresolved marker, got %q", err.Error())
 	}
 }
+
+func TestSkylineManifestFromHTMLBuildsAuthManifestURL(t *testing.T) {
+	html := `<script>var player=new Clappr.Player({source:'livee.m3u8?a=6utedl4nm3v07ossuoijphlve1'});</script>`
+	got := skylineManifestFromHTML(html)
+	want := "https://hd-auth.skylinewebcams.com/live.m3u8?a=6utedl4nm3v07ossuoijphlve1"
+	if got != want {
+		t.Fatalf("skylineManifestFromHTML()=%q want %q", got, want)
+	}
+}
+
+func TestResolveCaptureInputRefreshesSkylineManifestFromSourcePage(t *testing.T) {
+	// Not parallel: overrides the package SSRF guards so the loopback httptest
+	// server is reachable, then restores them via t.Cleanup.
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"livee.m3u8?a=fresh-token"});</script>`))
+	}))
+	defer server.Close()
+
+	got, isImage, err := ResolveCaptureInput(
+		context.Background(),
+		"SKYLINEWEBCAMS",
+		"https://hd-auth.skylinewebcams.com/live.m3u8?a=stale-token",
+		server.URL+"/webcam.html",
+	)
+	if err != nil {
+		t.Fatalf("ResolveCaptureInput() error=%v", err)
+	}
+	if isImage {
+		t.Fatalf("ResolveCaptureInput() isImage=true, want false")
+	}
+	want := "https://hd-auth.skylinewebcams.com/live.m3u8?a=fresh-token"
+	if got != want {
+		t.Fatalf("ResolveCaptureInput()=%q want %q", got, want)
+	}
+}
+
+func TestResolveCaptureInputFailsClosedWhenSkylinePageHasNoManifest(t *testing.T) {
+	// Not parallel: overrides the package SSRF guards so the loopback httptest
+	// server is reachable, then restores them via t.Cleanup.
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body>no player source</body></html>`))
+	}))
+	defer server.Close()
+
+	got, isImage, err := ResolveCaptureInput(
+		context.Background(),
+		"SKYLINEWEBCAMS",
+		"https://hd-auth.skylinewebcams.com/live.m3u8?a=stale-token",
+		server.URL+"/webcam.html",
+	)
+	if err == nil {
+		t.Fatalf("expected fail-closed error, got url=%q isImage=%v", got, isImage)
+	}
+	if got != "" {
+		t.Fatalf("expected empty url on failure, got %q", got)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "skyline") {
+		t.Fatalf("error should name skyline resolution, got %q", err.Error())
+	}
+}

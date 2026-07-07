@@ -3,12 +3,14 @@ package capture
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,6 +29,17 @@ func ResolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL
 			return "", false, fmt.Errorf("stream has no capture URL")
 		}
 		streamURL = sourcePageURL
+	}
+
+	if isSkylineStream(provider, streamURL, sourcePageURL) && sourcePageURL != "" {
+		u, err := resolveSkylineManifestURL(ctx, sourcePageURL, 20*time.Second)
+		if err != nil {
+			return "", false, err
+		}
+		if u == "" {
+			return "", false, fmt.Errorf("skyline source page did not contain a playable manifest")
+		}
+		return u, false, nil
 	}
 
 	if provider == "KBS" && strings.Contains(streamURL, "!hls") {
@@ -66,6 +79,106 @@ func ResolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL
 	}
 
 	return streamURL, false, nil
+}
+
+func isSkylineStream(provider, streamURL, sourcePageURL string) bool {
+	if strings.EqualFold(strings.TrimSpace(provider), "SKYLINEWEBCAMS") {
+		return true
+	}
+	for _, raw := range []string{streamURL, sourcePageURL} {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+		if host == "skylinewebcams.com" || strings.HasSuffix(host, ".skylinewebcams.com") {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveSkylineManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	if _, err := resolveValidateURL(pageURL); err != nil {
+		return "", fmt.Errorf("skyline page rejected: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build skyline request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; stoarama-capture/1.0)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control:   resolveDialControl,
+			}).DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects resolving skyline page")
+			}
+			if _, err := resolveValidateURL(req.URL.String()); err != nil {
+				return fmt.Errorf("redirect target rejected: %w", err)
+			}
+			return nil
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("skyline request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("skyline request status=%d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "", fmt.Errorf("read skyline page: %w", err)
+	}
+	u := skylineManifestFromHTML(string(b))
+	if u == "" {
+		return "", fmt.Errorf("skyline page did not contain player source")
+	}
+	return u, nil
+}
+
+var skylinePlayerSourceRE = regexp.MustCompile(`(?i)\bsource\s*:\s*["']([^"']+?\.m3u8[^"']*)["']`)
+
+func skylineManifestFromHTML(pageHTML string) string {
+	m := skylinePlayerSourceRE.FindStringSubmatch(pageHTML)
+	if len(m) < 2 {
+		return ""
+	}
+	raw := strings.TrimSpace(html.UnescapeString(m[1]))
+	if raw == "" {
+		return ""
+	}
+	if u, err := url.Parse(raw); err == nil && u.IsAbs() {
+		if strings.EqualFold(u.Hostname(), "hd-auth.skylinewebcams.com") {
+			return u.String()
+		}
+		if strings.EqualFold(u.Hostname(), "www.skylinewebcams.com") {
+			u.Scheme = "https"
+			u.Host = "hd-auth.skylinewebcams.com"
+			u.Path = "/live.m3u8"
+			return u.String()
+		}
+		return u.String()
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	base := &url.URL{Scheme: "https", Host: "hd-auth.skylinewebcams.com", Path: "/live.m3u8"}
+	base.RawQuery = u.RawQuery
+	return base.String()
 }
 
 // hasIndirectMarker reports whether a URL still carries an internal indirect

@@ -53,6 +53,9 @@ type RecordingJob struct {
 	JobID                int64     `json:"job_id"`
 	RecordingID          int64     `json:"recording_id"`
 	SourceURL            string    `json:"source_url"`
+	StreamID             int64     `json:"stream_id,omitempty"`
+	StreamProvider       string    `json:"stream_provider,omitempty"`
+	SourcePageURL        string    `json:"source_page_url,omitempty"`
 	ClipDurationSec      int       `json:"clip_duration_sec"`
 	StorageDestinationID int64     `json:"storage_destination_id"`
 	FireAt               time.Time `json:"fire_at"`
