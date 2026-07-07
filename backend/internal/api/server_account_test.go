@@ -130,6 +130,24 @@ func TestAccountHTMLShowsExpiredLinkMessage(t *testing.T) {
 	}
 }
 
+func TestAccountHTMLSignInUsesSubmitForm(t *testing.T) {
+	htmlBytes, err := os.ReadFile("../../web/account.html")
+	if err != nil {
+		t.Fatalf("read account html: %v", err)
+	}
+	html := string(htmlBytes)
+	for _, want := range []string{
+		`<form id="signinForm">`,
+		`type="submit">Send sign-in link</button>`,
+		`signinForm.addEventListener('submit'`,
+		`event.preventDefault();`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("account html missing %q", want)
+		}
+	}
+}
+
 func TestMaskSecretForLog(t *testing.T) {
 	if got := maskSecretForLog(""); got != "" {
 		t.Fatalf("blank mask=%q want empty", got)

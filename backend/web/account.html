@@ -183,12 +183,14 @@
     <!-- Logged-out content -->
     <section id="signinPanel" class="panel hidden">
       <h2>Sign in</h2>
-      <label for="email">Email</label>
-      <input id="email" type="email" placeholder="you@example.org" />
-      <div style="margin-top:12px;">
-        <button id="requestLink" class="primary" type="button">Send sign-in link</button>
-      </div>
-      <div id="requestStatus" class="status" style="margin-top:8px;"></div>
+      <form id="signinForm">
+        <label for="email">Email</label>
+        <input id="email" type="email" placeholder="you@example.org" />
+        <div style="margin-top:12px;">
+          <button id="requestLink" class="primary" type="submit">Send sign-in link</button>
+        </div>
+        <div id="requestStatus" class="status" style="margin-top:8px;"></div>
+      </form>
     </section>
 
     <div id="accountStatus" class="status"></div>
@@ -198,6 +200,7 @@
 
   <script>
     const requestStatus = document.getElementById('requestStatus');
+    const signinForm = document.getElementById('signinForm');
     const accountStatus = document.getElementById('accountStatus');
     const authedBox = document.getElementById('authedBox');
     const signinPanel = document.getElementById('signinPanel');
@@ -401,7 +404,8 @@
       }
     }
 
-    document.getElementById('requestLink').addEventListener('click', async () => {
+    signinForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
       const email = String(document.getElementById('email').value || '').trim();
       try {
         await fetchJSON('/api/v1/auth/request-link', {
