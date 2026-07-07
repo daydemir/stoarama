@@ -20,6 +20,15 @@
       --ok: #22c55e;
       --warn: #f59e0b;
       --err: #ef4444;
+      --badge-video-text: #86efac;
+      --badge-video-bg: color-mix(in srgb, #16a34a 18%, var(--panel));
+      --badge-video-border: color-mix(in srgb, #16a34a 55%, var(--border));
+      --badge-youtube-text: #fca5a5;
+      --badge-youtube-bg: color-mix(in srgb, #ef4444 16%, var(--panel));
+      --badge-youtube-border: color-mix(in srgb, #ef4444 55%, var(--border));
+      --badge-still-text: #7dd3fc;
+      --badge-still-bg: color-mix(in srgb, #0ea5e9 16%, var(--panel));
+      --badge-still-border: color-mix(in srgb, #0ea5e9 55%, var(--border));
       --mono: "IBM Plex Mono", monospace;
       --sans: "IBM Plex Sans", system-ui, sans-serif;
     }
@@ -35,6 +44,15 @@
         --ok: #16a34a;
         --warn: #d97706;
         --err: #dc2626;
+        --badge-video-text: #166534;
+        --badge-video-bg: #dcfce7;
+        --badge-video-border: #86efac;
+        --badge-youtube-text: #991b1b;
+        --badge-youtube-bg: #fee2e2;
+        --badge-youtube-border: #fca5a5;
+        --badge-still-text: #075985;
+        --badge-still-bg: #e0f2fe;
+        --badge-still-border: #7dd3fc;
       }
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -829,9 +847,9 @@
       line-height: 1.25;
       white-space: nowrap;
     }
-    .source-kind-badge.video { border-color: color-mix(in srgb, #16a34a 55%, var(--border)); color: #86efac; }
-    .source-kind-badge.youtube { border-color: color-mix(in srgb, #ef4444 55%, var(--border)); color: #fca5a5; }
-    .source-kind-badge.still { border-color: color-mix(in srgb, #0ea5e9 55%, var(--border)); color: #7dd3fc; }
+    .source-kind-badge.video { border-color: var(--badge-video-border); background: var(--badge-video-bg); color: var(--badge-video-text); }
+    .source-kind-badge.youtube { border-color: var(--badge-youtube-border); background: var(--badge-youtube-bg); color: var(--badge-youtube-text); }
+    .source-kind-badge.still { border-color: var(--badge-still-border); background: var(--badge-still-bg); color: var(--badge-still-text); }
     .operations-shell {
       display: grid;
       gap: 10px;
@@ -1672,7 +1690,7 @@
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="all" role="tab" aria-selected="true">All<span class="seg-count" data-seg-count="all"></span></button>
-      <button type="button" class="source-seg-btn" data-source-seg="hls" role="tab" aria-selected="false">HLS<span class="seg-count" data-seg-count="hls"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="hls" role="tab" aria-selected="false">Live Video<span class="seg-count" data-seg-count="hls"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube<span class="seg-count" data-seg-count="youtube"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
     </div>
