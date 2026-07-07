@@ -1672,7 +1672,7 @@
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="all" role="tab" aria-selected="true">All<span class="seg-count" data-seg-count="all"></span></button>
-      <button type="button" class="source-seg-btn" data-source-seg="video" role="tab" aria-selected="false">Video<span class="seg-count" data-seg-count="video"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="hls" role="tab" aria-selected="false">HLS<span class="seg-count" data-seg-count="hls"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube<span class="seg-count" data-seg-count="youtube"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
     </div>
@@ -2130,7 +2130,7 @@ let detailClipOffset = 0;
 const detailClipLimit = 25;
 const CLIP_VIEW_MODE = Object.freeze({ RANGE: 'range', LINEAR: 'linear' });
 const CLIP_RANGE_MAX_MS = 4 * 60 * 60 * 1000;
-const SOURCE_SEGMENT = Object.freeze({ ALL: 'all', VIDEO: 'video', YOUTUBE: 'youtube', STILL: 'still_image' });
+const SOURCE_SEGMENT = Object.freeze({ ALL: 'all', HLS: 'hls', YOUTUBE: 'youtube', STILL: 'still_image' });
 let detailClipViewMode = CLIP_VIEW_MODE.RANGE;
 let detailClipAvailability = null;
 let pendingClipRangeFrom = '';
@@ -4412,13 +4412,13 @@ function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', ta
 }
 
 function streamOptionScope() {
-  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? String(koreaRegionFilter.value || '').trim() : '';
+  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.HLS ? String(koreaRegionFilter.value || '').trim() : '';
   return {
     captureType: streamSourceSegment === SOURCE_SEGMENT.YOUTUBE
       ? 'youtube_watch'
-      : (streamSourceSegment === SOURCE_SEGMENT.STILL ? 'still_image' : normalizeCaptureTypeFilter(streamModeFilter.value)),
+      : (streamSourceSegment === SOURCE_SEGMENT.STILL ? 'still_image' : (streamSourceSegment === SOURCE_SEGMENT.HLS ? 'hls' : normalizeCaptureTypeFilter(streamModeFilter.value))),
     koreaFamily,
-    recordable: streamSourceSegment === SOURCE_SEGMENT.VIDEO,
+    recordable: false,
   };
 }
 
@@ -4675,14 +4675,14 @@ function buildStreamFilterParams() {
   updateStreamFilterSummary();
   const recordingState = normalizeRecordingStateFilter(streamRecordingStateFilter.value);
   const captureType = normalizeCaptureTypeFilter(streamModeFilter.value);
-  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? String(koreaRegionFilter.value || '').trim() : '';
+  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.HLS ? String(koreaRegionFilter.value || '').trim() : '';
   if (recordingState) params.set('recording_state', recordingState);
   if (captureType) params.set('capture_type', captureType);
   if (streamSearch.value.trim()) params.set('q', streamSearch.value.trim());
   if (streamTagFilter.value.trim()) params.set('tags', streamTagFilter.value.trim());
   if (streamTagExcludeFilter.value.trim()) params.set('tags_not', streamTagExcludeFilter.value.trim());
-  if (streamSourceSegment === SOURCE_SEGMENT.VIDEO) {
-    params.set('recordable', '1');
+  if (streamSourceSegment === SOURCE_SEGMENT.HLS) {
+    params.set('capture_type', 'hls');
     if (koreaFamily) params.set('korea_family', normalizeKoreaFamily(koreaFamily) || 'all');
   } else if (sourceFilter.value.trim()) {
     params.set('source', sourceFilter.value.trim());
@@ -5154,8 +5154,9 @@ function updateRecordBar() {
 }
 
 function applySourceSegment(seg, opts = {}) {
-  const normalizedSeg = seg === 'recordable' ? SOURCE_SEGMENT.VIDEO : String(seg || '').trim();
-  streamSourceSegment = (normalizedSeg === SOURCE_SEGMENT.VIDEO || normalizedSeg === SOURCE_SEGMENT.YOUTUBE || normalizedSeg === SOURCE_SEGMENT.STILL) ? normalizedSeg : SOURCE_SEGMENT.ALL;
+  const rawSeg = String(seg || '').trim();
+  const normalizedSeg = rawSeg === 'recordable' || rawSeg === 'video' ? SOURCE_SEGMENT.HLS : rawSeg;
+  streamSourceSegment = (normalizedSeg === SOURCE_SEGMENT.HLS || normalizedSeg === SOURCE_SEGMENT.YOUTUBE || normalizedSeg === SOURCE_SEGMENT.STILL) ? normalizedSeg : SOURCE_SEGMENT.ALL;
   const preserveFilters = Boolean(opts && opts.preserveFilters);
   if (!preserveFilters) sourceFilter.value = '';
   if (streamSourceSegment === SOURCE_SEGMENT.YOUTUBE) {
@@ -5172,7 +5173,7 @@ function applySourceSegment(seg, opts = {}) {
     const includeStillLabel = includeStillImageFilter.closest('label');
     if (includeStillLabel) includeStillLabel.style.display = streamSourceSegment === SOURCE_SEGMENT.ALL ? '' : 'none';
   }
-  if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? '' : 'none';
+  if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === SOURCE_SEGMENT.HLS ? '' : 'none';
   const seg2 = document.getElementById('streamSourceSegment');
   if (seg2) {
     seg2.querySelectorAll('.source-seg-btn').forEach((b) => {
@@ -5215,7 +5216,7 @@ async function loadStreamSegmentCounts() {
   };
   const jobs = [
     ['all', 'hide_still_image=1'],
-    ['video', 'recordable=1'],
+    ['hls', 'capture_type=hls'],
     ['still_image', 'capture_type=still_image'],
     ['youtube', 'capture_type=youtube_watch'],
   ];
@@ -6484,7 +6485,7 @@ async function applyStreamsRouteState(opts = {}) {
   setStreamsView(streamsView, { replaceURL: true });
   const initialCapture = normalizeCaptureTypeFilter(params.get('capture_type'));
   const initialRecordable = params.get('recordable') === '1' || String(params.get('recordable') || '').toLowerCase() === 'true';
-  const initialSourceSegment = initialRecordable ? SOURCE_SEGMENT.VIDEO
+  const initialSourceSegment = initialRecordable || initialCapture === 'hls' ? SOURCE_SEGMENT.HLS
     : (initialCapture === 'youtube_watch' ? SOURCE_SEGMENT.YOUTUBE
       : (initialCapture === 'still_image' ? SOURCE_SEGMENT.STILL : SOURCE_SEGMENT.ALL));
   applySourceSegment(initialSourceSegment, { preserveFilters: true });
