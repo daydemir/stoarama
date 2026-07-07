@@ -6339,6 +6339,20 @@ function parseStreamsLocation() {
   return { params, streamID, isList: parts.length === 0 || (parts.length === 1 && parts[0] === 'streams') };
 }
 
+function isLegacyStreamsDefaultQuery(params) {
+  if (!(params instanceof URLSearchParams)) return false;
+  const keys = Array.from(params.keys()).filter((k) => String(k || '').trim());
+  const allowed = new Set(['recordable', 'sort_by', 'sort_dir', 'page', 'page_size']);
+  if (!keys.length || keys.some((k) => !allowed.has(k))) return false;
+  const recordable = String(params.get('recordable') || '').trim().toLowerCase();
+  if (recordable !== '1' && recordable !== 'true') return false;
+  const sortBy = String(params.get('sort_by') || DEFAULT_STREAM_SORT_BY).trim();
+  const sortDir = normalizeSortDir(params.get('sort_dir'), DEFAULT_STREAM_SORT_DIR);
+  const page = String(params.get('page') || '1').trim();
+  const pageSize = String(params.get('page_size') || '100').trim();
+  return sortBy === DEFAULT_STREAM_SORT_BY && sortDir === DEFAULT_STREAM_SORT_DIR && page === '1' && pageSize === '100';
+}
+
 async function applyStreamsRouteState(opts = {}) {
   const { params, streamID, isList } = parseStreamsLocation();
   updateTimezoneLabels();
@@ -6355,6 +6369,13 @@ async function applyStreamsRouteState(opts = {}) {
     return;
   }
   if (!isList) return;
+  if (isLegacyStreamsDefaultQuery(params)) {
+    params.delete('recordable');
+    params.delete('sort_by');
+    params.delete('sort_dir');
+    params.delete('page');
+    params.delete('page_size');
+  }
   currentStreamRoute = STREAM_ROUTE.LIST;
   mainTab = 'streams';
   detailStreamID = null;
