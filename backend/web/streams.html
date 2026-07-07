@@ -5335,6 +5335,10 @@ function isRefreshableHlsSource(stream) {
   return isIndirectHlsSource(s) || provider === 'SKYLINEWEBCAMS';
 }
 
+function isSkylineStream(stream) {
+  return String((stream && stream.provider) || '').trim().toUpperCase() === 'SKYLINEWEBCAMS';
+}
+
 // Returns the .m3u8 URL to play for an HLS stream: the direct source_url when it
 // already points at a manifest, otherwise the runtime-resolved manifest from the
 // detail payload (indirect KBS/Korea: source_url ends in '!hls', resolved URL is a
@@ -5357,6 +5361,7 @@ function detailHlsURL(stream) {
 // down), so the caller can fall back honestly rather than show a black box.
 async function resolveDetailPlayURL(stream) {
   const s = stream || {};
+  if (isSkylineStream(s)) return dashboardStreamURL(s.id, '/skyline.m3u8');
   if (!isRefreshableHlsSource(s)) return detailHlsURL(s);
   const payload = await fetchJSON(dashboardStreamURL(s.id, '/resolve'));
   return String((payload && payload.resolved_url) || '').trim();
@@ -5635,6 +5640,12 @@ function selfRecordCommand(stream) {
   // capture_runtime_resolved_url; fall back to a direct non-marker source_url for
   // dash/rtsp/rtmp/http_video.
   const directVideo = ['hls', 'dash', 'rtsp', 'rtmp', 'http_video'].includes(captureType);
+  if (isSkylineStream(s) && sourcePageURL) {
+    return {
+      command: `yt-dlp "${sourcePageURL}"`,
+      note: 'Skyline tokens are short-lived and browser-protected. Use the source page with yt-dlp for local captures.',
+    };
+  }
   let playURL = detailHlsURL(s);
   if (!playURL && directVideo && sourceURL && !sourceURL.includes('!')) playURL = sourceURL;
   if (playURL) {

@@ -348,6 +348,8 @@ func (s *Server) router() http.Handler {
 			public.Get("/dashboard/queue-health", s.handleDashboardQueueHealth)
 			public.Get("/dashboard/streams/{id}", s.handleDashboardStreamDetail)
 			public.Get("/dashboard/streams/{id}/resolve", s.handleDashboardStreamResolve)
+			public.Get("/dashboard/streams/{id}/skyline.m3u8", s.handleDashboardStreamSkylineManifest)
+			public.Get("/dashboard/streams/{id}/skyline-segment", s.handleDashboardStreamSkylineSegment)
 			public.Get("/dashboard/streams/{id}/pipelines", s.handleDashboardStreamPipelinesList)
 			public.Get("/dashboard/streams/{id}/detections", s.handleDashboardStreamDetections)
 			public.Get("/dashboard/streams/{id}/frame-manifest", s.handleDashboardStreamFrameManifest)
