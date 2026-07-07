@@ -923,7 +923,13 @@ func (s *Server) handleAdminAccountRole(w http.ResponseWriter, r *http.Request, 
 	if !ok {
 		return
 	}
-	ct, err := s.pool.Exec(r.Context(), `
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin account role update: %v", err))
+		return
+	}
+	defer tx.Rollback(r.Context())
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE accounts
 		SET role=$2, updated_at=now()
 		WHERE id=$1
@@ -934,6 +940,21 @@ func (s *Server) handleAdminAccountRole(w http.ResponseWriter, r *http.Request, 
 	}
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusNotFound, "account not found")
+		return
+	}
+	_, err = tx.Exec(r.Context(), `
+		UPDATE users
+		SET is_operator = $2, updated_at = now()
+		WHERE email = (
+			SELECT lower(trim(email)) FROM accounts WHERE id=$1
+		)
+	`, id, role == accountRoleAdmin)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update operator role: %v", err))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit account role update: %v", err))
 		return
 	}
 	_ = s.insertAccountAuthEvent(r.Context(), id, nil, "account_role_updated", "operator", "dashboard", map[string]any{"role": role})

@@ -57,13 +57,13 @@ func TestShouldConfirmError(t *testing.T) {
 func TestSelectTargetsQueryShape(t *testing.T) {
 	q := selectTargetsQuery
 	musts := []string{
-		"survey_stream_state",                   // joins failure state
-		"source_kind = 'survey'",                // survey frames only
-		"consecutive_failures",                  // backoff uses the counter
-		"last_attempt_at + LEAST",               // bounded backoff window
-		"'error' = ANY(COALESCE(s.tags",         // needs-attention (error tag) first
-		"st.stream_id IS NOT NULL) DESC",        // previously-failing first
-		"ORDER BY",                              // prioritized ordering
+		"survey_stream_state",            // joins failure state
+		"source_kind = 'survey'",         // survey frames only
+		"consecutive_failures",           // backoff uses the counter
+		"last_attempt_at + LEAST",        // bounded backoff window
+		"'error' = ANY(COALESCE(s.tags",  // needs-attention (error tag) first
+		"st.stream_id IS NOT NULL) DESC", // previously-failing first
+		"ORDER BY",                       // prioritized ordering
 	}
 	for _, m := range musts {
 		if !strings.Contains(q, m) {
@@ -121,6 +121,7 @@ func surveyTestPool(t *testing.T) *pgxpool.Pool {
 			capture_type TEXT,
 			source_family TEXT,
 			execution_class TEXT,
+			deleted_at TIMESTAMPTZ,
 			tags TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
@@ -204,9 +205,9 @@ func TestSelectTargetsPrioritizesErroredAndNeverSurveyed(t *testing.T) {
 	ctx := context.Background()
 	yesterday := time.Now().UTC().AddDate(0, 0, -1)
 
-	errored := insertStream(t, pool, []string{"error"})     // needs attention: tagged
-	neverSurveyed := insertStream(t, pool, nil)             // needs attention: no frame ever
-	surveyedEarlier := insertStream(t, pool, nil)           // lower priority
+	errored := insertStream(t, pool, []string{"error"}) // needs attention: tagged
+	neverSurveyed := insertStream(t, pool, nil)         // needs attention: no frame ever
+	surveyedEarlier := insertStream(t, pool, nil)       // lower priority
 	insertSurveyFrameOn(t, pool, surveyedEarlier, yesterday)
 	doneToday := insertStream(t, pool, nil) // must be excluded
 	insertSurveyFrameOn(t, pool, doneToday, time.Now().UTC())

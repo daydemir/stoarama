@@ -61,6 +61,8 @@ func main() {
 		runCapture(ctx, cfg, os.Args[2:])
 	case "streams":
 		runStreams(ctx, cfg, os.Args[2:])
+	case "accounts":
+		runAccounts(ctx, cfg, os.Args[2:])
 	case "discovery":
 		runDiscovery(ctx, cfg, os.Args[2:])
 	case "media":
@@ -117,6 +119,7 @@ func usage() {
 	  stoaramactl streams image-urls --stream-ids 1,2,3
 	  stoaramactl streams add --source-url URL --name N [--provider P --external-id E --slug S --source-page-url URL --capture-type TYPE --execution-config-json JSON --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC --tags a,b]
 	  stoaramactl streams update --id N [--name N --slug S --source-url URL --recording-state off|on --tags a,b --capture-type TYPE --execution-config-json JSON --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC]
+	  stoaramactl streams soft-delete --id N --reason TEXT [--dry-run]
 	  stoaramactl streams tags-add (--id N | --slug S) --tags a,b
 	  stoaramactl streams tags-remove (--id N | --slug S) --tags a,b
 	  stoaramactl streams cleanup-location-tags [--recording-state off|on --limit 0 --apply --json]
@@ -128,6 +131,7 @@ func usage() {
 	  stoaramactl discovery candidates list [--id N --review-status pending|accepted|rejected|invalid --provider P --capture-type TYPE --limit 200 --offset 0]
 	  stoaramactl discovery candidates review --id N --status accepted|rejected|invalid [--reviewer TEXT --reason TEXT --metadata-json JSON]
 	  stoaramactl discovery candidates import --id N [--provider P --external-id E --name N --slug S --source-url URL --source-page-url URL --source-family FAMILY --capture-type TYPE --execution-class CLASS --execution-config-json JSON --tags a,b --location-country C --location-country-code CC --location-region R --location-city CITY --location-locality L --location-source SRC --metadata-json JSON]
+	  stoaramactl accounts promote-admin --email EMAIL [--backend-api-url URL --api-token TOKEN]
   stoaramactl media backfill --snapshot-root local/snapshots [--concurrency 8 --dry-run]
   stoaramactl inference list [--stream-id N --pipeline-id P --status queued_boxed|success|error --class-name person --search TEXT --min-confidence 0.5 --sort-by created_at --sort-dir desc --limit 200 --offset 0]
   stoaramactl inference cleanup-unboxed [--pipeline-id P --mode requeue|delete --dry-run]
@@ -157,6 +161,7 @@ func usage() {
 	  stoaramactl korea utic ingest [--api-url URL --service-key KEY --backend-api-url URL --api-token TOKEN --auto-import=true --dry-run --limit 0 --report-json out.json --json]
 	  stoaramactl korea utic refresh-frames [--backend-api-url URL --api-token TOKEN --concurrency 4 --timeout-sec 90 --limit 0 --dry-run --allow-failures --report-json out.json --json]
 	  stoaramactl survey run-once [--limit 0 --daily-gate --concurrency 4 --resolve-timeout-sec 60 --capture-timeout-sec 60 --json]
+	  stoaramactl survey relay-worker [--backend-api-url URL --node-token TOKEN --concurrency 1 --poll-sec 30 --duration 0 --detect]
 	  stoaramactl survey coverage [--json]
 	  stoaramactl survey delete-stream-captures --id N --apply
 	  stoaramactl recordability run-once [--batch 1 --window-sec 600 --segment-sec 60 --probe-host LABEL --json] (gated by STREAM_RECORDABILITY_PROBE_ENABLED)
@@ -1420,6 +1425,41 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 			return
 		}
 		fmt.Printf("stream updated id=%d slug=%s\n", int64FromAny(out["id"]), fmt.Sprint(out["slug"]))
+	case "soft-delete":
+		fs := flag.NewFlagSet("streams soft-delete", flag.ExitOnError)
+		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+		apiToken := fs.String("api-token", cfg.APIToken, "backend API token")
+		id := fs.Int64("id", 0, "stream id")
+		reason := fs.String("reason", "", "required delete reason")
+		dryRun := fs.Bool("dry-run", false, "validate inputs and show target without deleting")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if *id <= 0 {
+			log.Fatalf("--id is required")
+		}
+		reasonValue := strings.TrimSpace(*reason)
+		if reasonValue == "" {
+			log.Fatalf("--reason is required")
+		}
+		detail := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/dashboard/streams/%d?limit=1", *id))
+		if *dryRun {
+			stream := asMap(detail["stream"])
+			out := map[string]any{"dry_run": true, "stream": stream, "reason": reasonValue}
+			if *asJSON {
+				printJSON(out)
+				return
+			}
+			fmt.Printf("would soft-delete stream id=%d slug=%s name=%q reason=%q\n", *id, fmt.Sprint(stream["slug"]), fmt.Sprint(stream["name"]), reasonValue)
+			return
+		}
+		out := mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/admin/streams/%d/delete", *id), map[string]any{
+			"reason": reasonValue,
+		})
+		if *asJSON {
+			printJSON(out)
+			return
+		}
+		fmt.Printf("stream soft-deleted id=%d\n", *id)
 	case "tags-add":
 		fs := flag.NewFlagSet("streams tags-add", flag.ExitOnError)
 		backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")

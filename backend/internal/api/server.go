@@ -296,6 +296,9 @@ func (s *Server) router() http.Handler {
 			node.Post("/processing/worker-stopped", s.handleProcessingWorkerStopped)
 			node.Post("/inference/commit", s.handleInferenceCommit)
 			node.Post("/inference/fail", s.handleInferenceFail)
+			node.Post("/survey/lease", s.handleNodeSurveyLease)
+			node.Post("/survey/complete", s.handleNodeSurveyComplete)
+			node.Post("/survey/fail", s.handleNodeSurveyFail)
 		})
 		api.Route("/admin", func(admin chi.Router) {
 			admin.Use(s.requireAdminAuth)
@@ -361,6 +364,7 @@ func (s *Server) router() http.Handler {
 
 			admin.Post("/streams", s.handleStreamsCreate)
 			admin.Patch("/streams/{id}", s.handleStreamsPatch)
+			admin.Post("/streams/{id}/delete", s.handleAdminStreamSoftDelete)
 			admin.Get("/streams/{id}/source-revisions", s.handleStreamSourceRevisionsList)
 			admin.Get("/streams", s.handleStreamsList)
 			admin.Post("/source-candidates/{id}/review", s.handleSourceCandidateReview)
@@ -936,7 +940,7 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 	offset := parseIntQuery(r, "offset", 0, 0, 1000000)
 	includeLatest := parseBoolQueryPtr(r, "include_latest")
 
-	where := []string{"1=1"}
+	where := []string{"s.deleted_at IS NULL"}
 	args := []any{}
 	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("recording_state"))); raw != "" {
 		state, ok := parseRecordingState(raw)
@@ -3364,7 +3368,7 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 		}
 	}
 
-	where := []string{"1=1"}
+	where := []string{"s.deleted_at IS NULL"}
 	args := []any{}
 	if recordingState != nil {
 		args = append(args, string(*recordingState))
@@ -3419,6 +3423,9 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	// express the union, so it is a dedicated flag.
 	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("recordable"))); raw == "1" || raw == "true" {
 		where = append(where, "s.capture_type IN ('hls','http_video')")
+	}
+	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("hide_still_image"))); raw == "1" || raw == "true" {
+		where = append(where, "COALESCE(s.capture_type, '') <> 'still_image'")
 	}
 	if touchedPipelineID != "" {
 		args = append(args, touchedPipelineID)
@@ -6709,7 +6716,7 @@ func (s *Server) getStreamByID(ctx context.Context, id int64) (model.Stream, err
 			recording_state, recording_failed_reason, recording_failed_at, capture_type, execution_class, execution_config_jsonb, tags,
 			created_at, updated_at
 		FROM streams
-		WHERE id=$1
+		WHERE id=$1 AND deleted_at IS NULL
 	`, id)
 	if err != nil {
 		return model.Stream{}, fmt.Errorf("query stream: %w", err)

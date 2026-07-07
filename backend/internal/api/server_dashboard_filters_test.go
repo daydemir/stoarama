@@ -46,6 +46,9 @@ func TestDashboardBuildStreamWhereCaptureTypeFilter(t *testing.T) {
 		t.Fatalf("capture_type arg=%v want=%q", got, want)
 	}
 	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "s.deleted_at IS NULL") {
+		t.Fatalf("where missing deleted-stream predicate: %s", sqlWhere)
+	}
 	if !strings.Contains(sqlWhere, "s.capture_type=$1") {
 		t.Fatalf("where missing capture_type placeholder: %s", sqlWhere)
 	}
@@ -63,6 +66,21 @@ func TestDashboardBuildStreamWhereRecordableFilter(t *testing.T) {
 	sqlWhere := strings.Join(where, " AND ")
 	if !strings.Contains(sqlWhere, "s.capture_type IN ('hls','http_video')") {
 		t.Fatalf("where missing recordable predicate: %s", sqlWhere)
+	}
+}
+
+func TestDashboardBuildStreamWhereHideStillImageFilter(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?hide_still_image=1", nil)
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(args) != 0 {
+		t.Fatalf("args len=%d want=0", len(args))
+	}
+	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "COALESCE(s.capture_type, '') <> 'still_image'") {
+		t.Fatalf("where missing hide still image predicate: %s", sqlWhere)
 	}
 }
 
@@ -210,12 +228,12 @@ func TestDashboardBuildStreamWhereIgnoresDisabledFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Baseline is just "1=1". Disabled optional filters (search/source/
-	// youtube_channel) add nothing beyond that.
+	// Baseline excludes soft-deleted streams. Disabled optional filters
+	// (search/source/youtube_channel) add nothing beyond that.
 	if got, want := len(where), 1; got != want {
 		t.Fatalf("where len=%d want=%d", got, want)
 	}
-	if got, want := where[0], "1=1"; got != want {
+	if got, want := where[0], "s.deleted_at IS NULL"; got != want {
 		t.Fatalf("where[0]=%q want=%q", got, want)
 	}
 	if len(args) != 0 {

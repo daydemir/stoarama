@@ -74,6 +74,7 @@ func (s *Server) handleAccountBundleStreams(w http.ResponseWriter, r *http.Reque
 		SELECT id, name, location_text, source_url, tags
 		FROM streams
 		WHERE source_url <> ''
+		  AND deleted_at IS NULL
 		  AND ($1 = '' OR name ILIKE '%'||$1||'%' OR location_text ILIKE '%'||$1||'%')
 		  AND ($2 = '' OR tags && ARRAY[$2]::text[])
 		ORDER BY name ASC, id ASC
@@ -453,7 +454,8 @@ func (s *Server) resolveBundleMembers(ctx context.Context, streamIDs []int64, ta
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, source_url
 		FROM streams
-		WHERE (id = ANY($1) OR ($2 <> '' AND tags && ARRAY[$2]::text[]))
+		WHERE deleted_at IS NULL
+		  AND (id = ANY($1) OR ($2 <> '' AND tags && ARRAY[$2]::text[]))
 		ORDER BY id ASC
 	`, streamIDs, tag)
 	if err != nil {

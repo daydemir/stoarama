@@ -392,7 +392,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			return
 		}
 		var catalogURL, provider, sourcePageURL string
-		err := s.pool.QueryRow(r.Context(), `SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1`, *req.StreamID).Scan(&catalogURL, &provider, &sourcePageURL)
+		err := s.pool.QueryRow(r.Context(), `SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, *req.StreamID).Scan(&catalogURL, &provider, &sourcePageURL)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				util.WriteError(w, http.StatusNotFound, "catalog stream not found")
@@ -1009,7 +1009,7 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		}
 		resp := map[string]any{"ok": true}
 		var provider string
-		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1`, req.StreamID).Scan(&provider); err == nil {
+		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider); err == nil {
 			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider); rerr == nil && needsRelay {
 				resp["relay_recommended"] = true
 				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
@@ -1026,7 +1026,7 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 
 	provider, sourcePageURL := "", ""
 	if req.StreamID > 0 {
-		_ = s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1`, req.StreamID).Scan(&provider, &sourcePageURL)
+		_ = s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &sourcePageURL)
 	}
 	resolved, err := resolveRecordingStreamURL(r.Context(), provider, streamURL, sourcePageURL)
 	if err != nil {
@@ -1048,7 +1048,7 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 	resp := map[string]any{"ok": true, "source_kind": sourceKind, "resolved_url": resolved}
 	if req.StreamID > 0 {
 		var provider string
-		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1`, req.StreamID).Scan(&provider); err == nil {
+		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider); err == nil {
 			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider); rerr == nil && needsRelay {
 				resp["relay_recommended"] = true
 				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."

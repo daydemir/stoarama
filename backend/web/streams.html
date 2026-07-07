@@ -814,6 +814,24 @@
       background: rgba(255,255,255,0.22);
       color: #fff;
     }
+    .source-kind-badge {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--text);
+      background: color-mix(in srgb, var(--panel) 84%, #000);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0;
+      line-height: 1.25;
+      white-space: nowrap;
+    }
+    .source-kind-badge.video { border-color: color-mix(in srgb, #16a34a 55%, var(--border)); color: #86efac; }
+    .source-kind-badge.youtube { border-color: color-mix(in srgb, #ef4444 55%, var(--border)); color: #fca5a5; }
+    .source-kind-badge.still { border-color: color-mix(in srgb, #0ea5e9 55%, var(--border)); color: #7dd3fc; }
     .operations-shell {
       display: grid;
       gap: 10px;
@@ -1654,9 +1672,9 @@
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="all" role="tab" aria-selected="true">All<span class="seg-count" data-seg-count="all"></span></button>
-      <button type="button" class="source-seg-btn" data-source-seg="recordable" role="tab" aria-selected="false">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
-      <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="video" role="tab" aria-selected="false">Video<span class="seg-count" data-seg-count="video"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube<span class="seg-count" data-seg-count="youtube"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
     </div>
     <div class="filter-stack-card">
       <div class="filter-grid filter-grid-primary">
@@ -1698,6 +1716,7 @@
           <div class="filter-field-label">Seen</div>
           <label class="check-label"><input type="checkbox" id="seenPeopleFilter" /> Has people</label>
           <label class="check-label"><input type="checkbox" id="seenVehiclesFilter" /> Has vehicles</label>
+          <label class="check-label"><input type="checkbox" id="includeStillImageFilter" /> Include still image</label>
         </div>
       </div>
       <div class="filter-footer">
@@ -1793,6 +1812,7 @@
       </div>
       <div class="detail-header-actions">
         <a id="detailRecordCTA" class="overview-card-link primary" href="/recordings">Set up recording</a>
+        <button id="detailDeleteStreamBtn" class="overview-card-link" type="button" style="display:none;">Delete stream</button>
       </div>
     </div>
 
@@ -1908,6 +1928,7 @@ const streamRecordingStateFilter = $('streamRecordingState');
 const streamModeFilter = $('streamModeFilter');
 const sourceFilter = $('sourceFilter');
 const providerFilter = $('providerFilter');
+const includeStillImageFilter = $('includeStillImageFilter');
 const koreaRegionField = $('koreaRegionField');
 const koreaRegionFilter = $('koreaRegionFilter');
 const countryFilter = $('countryFilter');
@@ -1989,6 +2010,7 @@ const pipelineExperimentsRows = $('pipelineExperimentsRows');
 const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
 const detailRecordCTA = $('detailRecordCTA');
+const detailDeleteStreamBtn = $('detailDeleteStreamBtn');
 const detailLivePlayer = $('detailLivePlayer');
 const detailLivePlayerMount = $('detailLivePlayerMount');
 const detailNoInlineNote = $('detailNoInlineNote');
@@ -2108,6 +2130,7 @@ let detailClipOffset = 0;
 const detailClipLimit = 25;
 const CLIP_VIEW_MODE = Object.freeze({ RANGE: 'range', LINEAR: 'linear' });
 const CLIP_RANGE_MAX_MS = 4 * 60 * 60 * 1000;
+const SOURCE_SEGMENT = Object.freeze({ ALL: 'all', VIDEO: 'video', YOUTUBE: 'youtube', STILL: 'still_image' });
 let detailClipViewMode = CLIP_VIEW_MODE.RANGE;
 let detailClipAvailability = null;
 let pendingClipRangeFrom = '';
@@ -3008,6 +3031,11 @@ function hasAuthCapability(capability) {
   return Boolean(isAuthenticatedAccount() && authState && authState.capabilities && authState.capabilities[capability]);
 }
 
+function isAdminAccount() {
+  const account = currentAccount();
+  return Boolean(isAuthenticatedAccount() && account && account.role === 'admin');
+}
+
 function authStatusMessage(actionText) {
   const action = String(actionText || 'continue').trim() || 'continue';
   if (authState && authState.status === 'checking') return 'Checking session...';
@@ -3211,6 +3239,20 @@ function buildPreferredViewURL(stream) {
   return String(s.source_page_url || '').trim();
 }
 
+function streamSourceKind(stream) {
+  const ct = String((stream && stream.capture_type) || '').trim().toLowerCase();
+  if (ct === 'youtube_watch' || ct === 'youtube_relay') return { key: 'youtube', label: 'YouTube', cls: 'youtube' };
+  if (ct === 'still_image') return { key: 'still_image', label: 'Still Image', cls: 'still' };
+  if (ct === 'hls') return { key: 'hls', label: 'HLS', cls: 'video' };
+  if (ct === 'http_video') return { key: 'http_video', label: 'Direct Video', cls: 'video' };
+  return { key: 'other', label: ct || 'Unknown', cls: '' };
+}
+
+function renderStreamSourceBadge(stream) {
+  const kind = streamSourceKind(stream);
+  return `<span class="source-kind-badge ${esc(kind.cls)}">${esc(kind.label)}</span>`;
+}
+
 function streamSourceURL(stream) {
   return String((stream || {}).source_url || '').trim();
 }
@@ -3292,6 +3334,9 @@ async function copyStreamSourceURL(streamID) {
 function syncDetailMutationUI(payload) {
   const p = payload || {};
   const s = (p.stream && typeof p.stream === 'object') ? p.stream : p;
+  if (detailDeleteStreamBtn instanceof HTMLElement) {
+    detailDeleteStreamBtn.style.display = isAdminAccount() ? '' : 'none';
+  }
   if (detailRecordCTA instanceof HTMLAnchorElement) {
     // Only offer the managed recorder for streams it can actually capture (HLS or
     // direct HTTP video), mirroring the browse-table row. YouTube and still-image
@@ -3316,6 +3361,26 @@ function syncDetailMutationUI(payload) {
       detailRecordCTA.style.display = 'none';
     }
   }
+}
+
+async function softDeleteDetailStream() {
+  const stream = detailData && detailData.stream ? detailData.stream : null;
+  const id = Number(stream && stream.id || detailStreamID || 0);
+  if (!Number.isFinite(id) || id <= 0) throw new Error('stream id is missing');
+  if (!isAdminAccount()) throw new Error('admin account required');
+  const label = String((stream && (stream.slug || stream.name)) || id).trim();
+  const reason = window.prompt(`Delete stream ${label} from the catalog? Enter a reason.`);
+  const reasonText = String(reason || '').trim();
+  if (!reasonText) return;
+  await fetchJSON(`/api/v1/admin/streams/${Math.floor(id)}/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: reasonText }),
+  });
+  detailData = null;
+  streamRows = streamRows.filter((row) => Number((getRowStream(row) || {}).id || 0) !== id);
+  history.replaceState(null, '', '/streams');
+  await applyStreamsRouteState({ quiet: true });
 }
 
 function updateDetailTabHrefs() {
@@ -3397,10 +3462,11 @@ async function resetStreamFilters() {
   streamTouchedPipelineID = '';
   seenPeopleFilter.checked = false;
   seenVehiclesFilter.checked = false;
+  if (includeStillImageFilter) includeStillImageFilter.checked = false;
   streamSortBy = DEFAULT_STREAM_SORT_BY;
   streamSortDir = DEFAULT_STREAM_SORT_DIR;
   streamPage = 1;
-  applySourceSegment('all');
+  applySourceSegment(SOURCE_SEGMENT.ALL);
   setStreamsView('table');
   await reloadStreamsForFilterChange({ reloadAllOptions: true });
 }
@@ -4346,13 +4412,13 @@ function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', ta
 }
 
 function streamOptionScope() {
-  const koreaFamily = streamSourceSegment === 'recordable' ? String(koreaRegionFilter.value || '').trim() : '';
+  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? String(koreaRegionFilter.value || '').trim() : '';
   return {
-    captureType: streamSourceSegment === 'youtube'
+    captureType: streamSourceSegment === SOURCE_SEGMENT.YOUTUBE
       ? 'youtube_watch'
-      : (streamSourceSegment === 'still_image' ? 'still_image' : normalizeCaptureTypeFilter(streamModeFilter.value)),
+      : (streamSourceSegment === SOURCE_SEGMENT.STILL ? 'still_image' : normalizeCaptureTypeFilter(streamModeFilter.value)),
     koreaFamily,
-    recordable: streamSourceSegment === 'recordable',
+    recordable: streamSourceSegment === SOURCE_SEGMENT.VIDEO,
   };
 }
 
@@ -4609,13 +4675,13 @@ function buildStreamFilterParams() {
   updateStreamFilterSummary();
   const recordingState = normalizeRecordingStateFilter(streamRecordingStateFilter.value);
   const captureType = normalizeCaptureTypeFilter(streamModeFilter.value);
-  const koreaFamily = streamSourceSegment === 'recordable' ? String(koreaRegionFilter.value || '').trim() : '';
+  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? String(koreaRegionFilter.value || '').trim() : '';
   if (recordingState) params.set('recording_state', recordingState);
   if (captureType) params.set('capture_type', captureType);
   if (streamSearch.value.trim()) params.set('q', streamSearch.value.trim());
   if (streamTagFilter.value.trim()) params.set('tags', streamTagFilter.value.trim());
   if (streamTagExcludeFilter.value.trim()) params.set('tags_not', streamTagExcludeFilter.value.trim());
-  if (streamSourceSegment === 'recordable') {
+  if (streamSourceSegment === SOURCE_SEGMENT.VIDEO) {
     params.set('recordable', '1');
     if (koreaFamily) params.set('korea_family', normalizeKoreaFamily(koreaFamily) || 'all');
   } else if (sourceFilter.value.trim()) {
@@ -4627,6 +4693,12 @@ function buildStreamFilterParams() {
   if (String(streamTouchedPipelineID || '').trim()) params.set('touched_pipeline_id', String(streamTouchedPipelineID).trim());
   if (seenPeopleFilter.checked) params.set('seen_people', '1');
   if (seenVehiclesFilter.checked) params.set('seen_vehicles', '1');
+  if (streamSourceSegment === SOURCE_SEGMENT.ALL && !(includeStillImageFilter && includeStillImageFilter.checked)) {
+    params.set('hide_still_image', '1');
+  }
+  if (streamSourceSegment === SOURCE_SEGMENT.ALL && includeStillImageFilter && includeStillImageFilter.checked) {
+    params.set('include_still_image', '1');
+  }
   return params;
 }
 
@@ -4645,6 +4717,7 @@ function applyStreamListStateFromURL(params) {
   streamTouchedPipelineID = String(params.get('touched_pipeline_id') || '').trim();
   seenPeopleFilter.checked = params.get('seen_people') === '1' || params.get('seen_people') === 'true';
   seenVehiclesFilter.checked = params.get('seen_vehicles') === '1' || params.get('seen_vehicles') === 'true';
+  if (includeStillImageFilter) includeStillImageFilter.checked = params.get('include_still_image') === '1' || params.get('include_still_image') === 'true';
 
   const sortBy = String(params.get('sort_by') || '').trim();
   streamSortBy = sortBy || DEFAULT_STREAM_SORT_BY;
@@ -4668,6 +4741,8 @@ function applyDetailRouteStateFromURL() {
 function syncStreamListURL(opts = {}) {
   if (currentStreamRoute !== STREAM_ROUTE.LIST) return;
   const params = buildStreamFilterParams();
+  params.delete('hide_still_image');
+  if (streamSourceSegment !== SOURCE_SEGMENT.ALL) params.delete('include_still_image');
   const sortBy = String(streamSortBy || DEFAULT_STREAM_SORT_BY);
   const sortDir = normalizeSortDir(streamSortDir, DEFAULT_STREAM_SORT_DIR);
   if (sortBy !== DEFAULT_STREAM_SORT_BY) params.set('sort_by', sortBy);
@@ -4997,7 +5072,10 @@ function renderStreamRows() {
       <td style="padding:6px 10px;">${renderImageSlot(s.id, 'streams')}</td>
       <td>
         <div class="stack">
-          <a href="/streams/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
+          <div class="row" style="gap:6px;align-items:center;flex-wrap:wrap;">
+            <a href="/streams/${s.id}" class="stream-link">${esc(streamName.primary || String(s.id))}</a>
+            ${renderStreamSourceBadge(s)}
+          </div>
           ${streamName.secondary ? `<span class="muted fs10">${esc(streamName.secondary)}</span>` : ''}
           <span class="muted fs10 mono">${esc(s.provider)} / ${esc(s.slug)}</span>
           ${renderTagEditor(s, 'streams')}
@@ -5076,23 +5154,25 @@ function updateRecordBar() {
 }
 
 function applySourceSegment(seg, opts = {}) {
-  streamSourceSegment = (seg === 'recordable' || seg === 'youtube' || seg === 'still_image') ? seg : 'all';
+  const normalizedSeg = seg === 'recordable' ? SOURCE_SEGMENT.VIDEO : String(seg || '').trim();
+  streamSourceSegment = (normalizedSeg === SOURCE_SEGMENT.VIDEO || normalizedSeg === SOURCE_SEGMENT.YOUTUBE || normalizedSeg === SOURCE_SEGMENT.STILL) ? normalizedSeg : SOURCE_SEGMENT.ALL;
   const preserveFilters = Boolean(opts && opts.preserveFilters);
-  // Drive the existing filter state that buildStreamFilterParams reads. YouTube
-  // and Still image are exact capture types; Recordable clears capture_type and
-  // lets buildStreamFilterParams add recordable=1 (HLS + direct HTTP video).
   if (!preserveFilters) sourceFilter.value = '';
-  if (streamSourceSegment === 'youtube') {
+  if (streamSourceSegment === SOURCE_SEGMENT.YOUTUBE) {
     streamModeFilter.value = 'youtube_watch';
     koreaRegionFilter.value = '';
-  } else if (streamSourceSegment === 'still_image') {
+  } else if (streamSourceSegment === SOURCE_SEGMENT.STILL) {
     streamModeFilter.value = 'still_image';
     koreaRegionFilter.value = '';
   } else if (!preserveFilters) {
     streamModeFilter.value = '';
-    if (streamSourceSegment === 'all') koreaRegionFilter.value = '';
+    if (streamSourceSegment === SOURCE_SEGMENT.ALL) koreaRegionFilter.value = '';
   }
-  if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === 'recordable' ? '' : 'none';
+  if (includeStillImageFilter) {
+    const includeStillLabel = includeStillImageFilter.closest('label');
+    if (includeStillLabel) includeStillLabel.style.display = streamSourceSegment === SOURCE_SEGMENT.ALL ? '' : 'none';
+  }
+  if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? '' : 'none';
   const seg2 = document.getElementById('streamSourceSegment');
   if (seg2) {
     seg2.querySelectorAll('.source-seg-btn').forEach((b) => {
@@ -5134,8 +5214,8 @@ async function loadStreamSegmentCounts() {
     return Number(payload && payload.total) || 0;
   };
   const jobs = [
-    ['all', ''],
-    ['recordable', 'recordable=1'],
+    ['all', 'hide_still_image=1'],
+    ['video', 'recordable=1'],
     ['still_image', 'capture_type=still_image'],
     ['youtube', 'capture_type=youtube_watch'],
   ];
@@ -5678,7 +5758,7 @@ function renderSelfRecord(stream) {
 }
 
 if (detailSelfRecordCopy instanceof HTMLElement) {
-  detailSelfRecordCopy.addEventListener('click', async () => {
+detailSelfRecordCopy.addEventListener('click', async () => {
     const command = detailSelfRecordCmd instanceof HTMLElement ? String(detailSelfRecordCmd.textContent || '') : '';
     if (!command) return;
     const original = detailSelfRecordCopy.textContent;
@@ -5689,6 +5769,20 @@ if (detailSelfRecordCopy instanceof HTMLElement) {
       detailSelfRecordCopy.textContent = 'Copy failed';
     }
     window.setTimeout(() => { detailSelfRecordCopy.textContent = original || 'Copy command'; }, 1200);
+  });
+}
+
+if (detailDeleteStreamBtn instanceof HTMLElement) {
+  detailDeleteStreamBtn.addEventListener('click', async () => {
+    try {
+      detailDeleteStreamBtn.disabled = true;
+      await softDeleteDetailStream();
+      setStreamStatus('stream deleted', 'ok');
+    } catch (err) {
+      setDetailStatus(String(err), 'err');
+    } finally {
+      detailDeleteStreamBtn.disabled = false;
+    }
   });
 }
 
@@ -5703,6 +5797,7 @@ async function loadDetail(options = {}) {
   detailTitle.textContent = detailName.primary || `${s.name || detailStreamID}`;
   const description = String(s.description || '').trim();
   detailMeta.innerHTML = [
+    renderStreamSourceBadge(s),
     `<span class="tag tag-muted">${esc(s.provider)}</span>`,
     `<span class="tag tag-muted mono">${esc(s.slug)}</span>`,
     renderLocationHierarchy(s),
@@ -6170,6 +6265,11 @@ seenPeopleFilter.addEventListener('change', async () => {
 seenVehiclesFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: false });
 });
+if (includeStillImageFilter) {
+  includeStillImageFilter.addEventListener('change', async () => {
+    await reloadStreamsForFilterChange({ reloadAllOptions: true });
+  });
+}
 
 // Pagination
 streamPageSizeEl.addEventListener('change', async () => {
@@ -6384,9 +6484,9 @@ async function applyStreamsRouteState(opts = {}) {
   setStreamsView(streamsView, { replaceURL: true });
   const initialCapture = normalizeCaptureTypeFilter(params.get('capture_type'));
   const initialRecordable = params.get('recordable') === '1' || String(params.get('recordable') || '').toLowerCase() === 'true';
-  const initialSourceSegment = initialRecordable ? 'recordable'
-    : (initialCapture === 'youtube_watch' ? 'youtube'
-      : (initialCapture === 'still_image' ? 'still_image' : 'all'));
+  const initialSourceSegment = initialRecordable ? SOURCE_SEGMENT.VIDEO
+    : (initialCapture === 'youtube_watch' ? SOURCE_SEGMENT.YOUTUBE
+      : (initialCapture === 'still_image' ? SOURCE_SEGMENT.STILL : SOURCE_SEGMENT.ALL));
   applySourceSegment(initialSourceSegment, { preserveFilters: true });
   void loadStreamSegmentCounts();
   await refreshAllStreamFilterOptions();

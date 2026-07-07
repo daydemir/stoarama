@@ -12,6 +12,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/survey"
 )
 
@@ -30,6 +31,8 @@ func runSurvey(ctx context.Context, cfg config.Config, args []string) {
 	switch args[0] {
 	case "run-once":
 		runSurveyRunOnce(ctx, cfg, args[1:])
+	case "relay-worker":
+		runSurveyRelayWorker(ctx, cfg, args[1:])
 	case "coverage":
 		runSurveyCoverage(ctx, cfg, args[1:])
 	case "delete-stream-captures":
@@ -40,6 +43,134 @@ func runSurvey(ctx context.Context, cfg config.Config, args []string) {
 		runSurveyDownloadModel(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown survey subcommand: %s", args[0])
+	}
+}
+
+func runSurveyRelayWorker(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("survey relay-worker", flag.ExitOnError)
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	nodeToken := fs.String("node-token", "", "relay node token")
+	concurrency := fs.Int("concurrency", 1, "targets to lease per poll")
+	pollSec := fs.Int("poll-sec", 30, "sleep seconds when no target is available")
+	durationSec := fs.Int("duration", 0, "stop after this many seconds (0 = run until interrupted)")
+	resolveTimeoutSec := fs.Int("resolve-timeout-sec", 60, "per-stream resolve timeout seconds")
+	captureTimeoutSec := fs.Int("capture-timeout-sec", 60, "per-stream one-frame capture timeout seconds")
+	detect := fs.Bool("detect", false, "run yolo11x detection locally and submit counts")
+	detectSampleRate := fs.Float64("detect-sample-rate", cfg.SurveyDetectSampleRate, "probability [0,1] a captured frame is sampled for detection")
+	_ = fs.Parse(args)
+	if strings.TrimSpace(*nodeToken) == "" {
+		log.Fatalf("--node-token is required")
+	}
+	if *concurrency <= 0 || *pollSec <= 0 || *resolveTimeoutSec <= 0 || *captureTimeoutSec <= 0 {
+		log.Fatalf("--concurrency, --poll-sec, --resolve-timeout-sec, and --capture-timeout-sec must be > 0")
+	}
+	if *detect && (*detectSampleRate <= 0 || *detectSampleRate > 1) {
+		log.Fatalf("--detect-sample-rate must be in (0,1] when --detect is set")
+	}
+	if *durationSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(*durationSec)*time.Second)
+		defer cancel()
+	}
+	registry, err := capture.NewDefaultRegistry()
+	if err != nil {
+		log.Fatalf("init capture registry: %v", err)
+	}
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: *backendAPIURL, NodeToken: *nodeToken})
+	if err != nil {
+		log.Fatalf("init relay survey client: %v", err)
+	}
+	var det survey.Detector
+	if *detect {
+		d, derr := newSurveyDetector(cfg)
+		if derr != nil {
+			log.Fatalf("init survey detector: %v", derr)
+		}
+		defer d.Close()
+		det = surveyDetectorAdapter{d: d}
+	}
+	caps := map[string]any{
+		"survey_enabled":        true,
+		"survey_detect_enabled": *detect,
+		"survey_max_active":     *concurrency,
+	}
+	if err := startSurveyRelayHeartbeat(ctx, client, caps, 30*time.Second); err != nil {
+		log.Fatalf("survey relay heartbeat: %v", err)
+	}
+	poll := time.Duration(*pollSec) * time.Second
+	for ctx.Err() == nil {
+		lease, err := client.LeaseSurveyTargets(ctx, *concurrency)
+		if err != nil {
+			log.Printf("survey relay lease failed: %v", err)
+			sleepContext(ctx, poll)
+			continue
+		}
+		if len(lease.Targets) == 0 {
+			sleepContext(ctx, poll)
+			continue
+		}
+		for _, target := range lease.Targets {
+			if err := runSurveyRelayTarget(ctx, client, registry, target, lease.Day, time.Duration(*resolveTimeoutSec)*time.Second, time.Duration(*captureTimeoutSec)*time.Second, det, *detectSampleRate); err != nil {
+				log.Printf("survey relay target stream=%d failed: %v", target.ID, err)
+			}
+		}
+	}
+}
+
+func startSurveyRelayHeartbeat(ctx context.Context, client *recordingapi.Client, caps map[string]any, every time.Duration) error {
+	if err := client.NodeHeartbeat(ctx, caps); err != nil {
+		return err
+	}
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := client.NodeHeartbeat(ctx, caps); err != nil {
+					log.Printf("survey relay heartbeat failed: %v", err)
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+func runSurveyRelayTarget(ctx context.Context, client *recordingapi.Client, registry *capture.Registry, target survey.Target, day string, resolveTimeout, captureTimeout time.Duration, det survey.Detector, sampleRate float64) error {
+	frame, err := survey.CaptureFrame(ctx, registry, target, resolveTimeout, captureTimeout)
+	if err != nil {
+		_ = client.FailSurveyTarget(ctx, target, err)
+		return err
+	}
+	var result *survey.DetectionResult
+	if det != nil && rand.Float64() < sampleRate {
+		counts, ms, derr := det.Detect(frame.Bytes)
+		if derr != nil {
+			_ = client.FailSurveyTarget(ctx, target, derr)
+			return derr
+		}
+		result = &survey.DetectionResult{
+			PipelineVersion: det.PipelineVersion(),
+			ConfThreshold:   det.ConfThreshold(),
+			Imgsz:           det.Imgsz(),
+			Counts:          counts,
+			DetectMs:        ms,
+		}
+	}
+	if err := client.CompleteSurveyTarget(ctx, target, day, frame, result); err != nil {
+		return err
+	}
+	return nil
+}
+
+func sleepContext(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
 	}
 }
 

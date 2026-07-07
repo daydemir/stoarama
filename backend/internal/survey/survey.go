@@ -95,7 +95,8 @@ const selectTargetsQuery = `
 	       COALESCE(s.execution_class, '')
 	FROM streams s
 	LEFT JOIN survey_stream_state st ON st.stream_id = s.id
-	WHERE COALESCE(s.provider, '') NOT ILIKE 'youtube'
+	WHERE s.deleted_at IS NULL
+	  AND COALESCE(s.provider, '') NOT ILIKE 'youtube'
 	  AND COALESCE(s.capture_type, '') NOT IN ('youtube_watch', 'youtube_relay')
 	  AND lower(COALESCE(s.source_url, '')) NOT LIKE '%youtube.com%'
 	  AND lower(COALESCE(s.source_url, '')) NOT LIKE '%youtu.be%'
@@ -441,6 +442,19 @@ func markSurveyHealthy(ctx context.Context, pool *pgxpool.Pool, streamID int64) 
 	return nil
 }
 
+func RecordFailure(ctx context.Context, pool *pgxpool.Pool, streamID int64) error {
+	prev, found, err := loadSurveyState(ctx, pool, streamID)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	return recordSurveyFailure(ctx, pool, streamID, shouldConfirmError(prev, found, now), now)
+}
+
+func MarkHealthy(ctx context.Context, pool *pgxpool.Pool, streamID int64) error {
+	return markSurveyHealthy(ctx, pool, streamID)
+}
+
 // CaptureAndPersist captures and persists one survey frame for the stream on the
 // given UTC date. It is idempotent: if a survey frame already exists for the
 // stream for that date it skips and returns skipped=true. A capture failure
@@ -570,11 +584,13 @@ func ComputeCoverage(ctx context.Context, pool *pgxpool.Pool, day time.Time) (Co
 	var c Coverage
 	if err := pool.QueryRow(ctx, `
 		SELECT
-			(SELECT COUNT(*) FROM streams),
+			(SELECT COUNT(*) FROM streams WHERE deleted_at IS NULL),
 			(SELECT COUNT(*) FROM streams s
-			   WHERE EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey')),
+			   WHERE s.deleted_at IS NULL
+			     AND EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey')),
 			(SELECT COUNT(*) FROM streams s
-			   WHERE EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey'
+			   WHERE s.deleted_at IS NULL
+			     AND EXISTS (SELECT 1 FROM frames f WHERE f.stream_id = s.id AND f.source_kind = 'survey'
 			                   AND (f.captured_at AT TIME ZONE 'UTC')::date = $1::date))
 	`, dateStr).Scan(&c.NonPrunedTotal, &c.WithAnySurvey, &c.WithTodaySurvey); err != nil {
 		return Coverage{}, fmt.Errorf("compute survey coverage: %w", err)

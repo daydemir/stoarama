@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/survey"
 )
 
 type ClientConfig struct {
@@ -99,6 +103,11 @@ type IngestClipRequest struct {
 	ResolvedURL  string
 	ClipStartAt  time.Time
 	ClipEndAt    time.Time
+}
+
+type SurveyLease struct {
+	Targets []survey.Target `json:"targets"`
+	Day     string          `json:"day"`
 }
 
 // LeaseRecordingJob leases one due job, or returns (nil, nil) when none is due.
@@ -238,6 +247,53 @@ func (c *Client) TouchDroplet(ctx context.Context) error {
 // TouchDroplet instead and never call this.
 func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any) error {
 	return c.postJSON(ctx, "/api/v1/node/heartbeat", map[string]any{"capabilities_json": capabilities}, nil)
+}
+
+func (c *Client) LeaseSurveyTargets(ctx context.Context, limit int) (SurveyLease, error) {
+	var out SurveyLease
+	if err := c.postJSON(ctx, "/api/v1/node/survey/lease", map[string]any{"limit": limit}, &out); err != nil {
+		return SurveyLease{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) CompleteSurveyTarget(ctx context.Context, target survey.Target, day string, frame capture.Frame, det *survey.DetectionResult) error {
+	payload := map[string]any{
+		"stream_id":    target.ID,
+		"day":          day,
+		"frame_base64": base64.StdEncoding.EncodeToString(frame.Bytes),
+		"mime_type":    frame.MIMEType,
+		"width":        frame.Width,
+		"height":       frame.Height,
+		"sha256":       frame.SHA256,
+		"size_bytes":   frame.SizeBytes,
+	}
+	if det != nil {
+		payload["detection"] = map[string]any{
+			"pipeline_version": det.PipelineVersion,
+			"conf_threshold":   det.ConfThreshold,
+			"imgsz":            det.Imgsz,
+			"detect_ms":        det.DetectMs,
+			"person":           det.Counts.Person,
+			"bicycle":          det.Counts.Bicycle,
+			"car":              det.Counts.Car,
+			"motorcycle":       det.Counts.Motorcycle,
+			"bus":              det.Counts.Bus,
+			"truck":            det.Counts.Truck,
+		}
+	}
+	return c.postJSON(ctx, "/api/v1/node/survey/complete", payload, nil)
+}
+
+func (c *Client) FailSurveyTarget(ctx context.Context, target survey.Target, captureErr error) error {
+	msg := ""
+	if captureErr != nil {
+		msg = captureErr.Error()
+	}
+	return c.postJSON(ctx, "/api/v1/node/survey/fail", map[string]any{
+		"stream_id": target.ID,
+		"error":     msg,
+	}, nil)
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, out any) error {
