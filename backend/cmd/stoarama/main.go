@@ -518,6 +518,7 @@ func loadCLIConfig() (cliConfig, error) {
 			cfg.Nodes[nodeType] = &cp
 		}
 	}
+	cfg.Node = nil
 	return cfg, nil
 }
 
@@ -529,21 +530,7 @@ func saveCLIConfig(cfg cliConfig) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if len(cfg.Nodes) == 0 && cfg.Node != nil && strings.TrimSpace(cfg.Node.NodeType) != "" {
-		cp := *cfg.Node
-		cfg.Nodes = map[string]*cliNodeConfig{strings.TrimSpace(cp.NodeType): &cp}
-	}
-	switch len(cfg.Nodes) {
-	case 0:
-		cfg.Node = nil
-	default:
-		for _, node := range cfg.Nodes {
-			if node != nil {
-				cp := *node
-				cfg.Node = &cp
-			}
-		}
-	}
+	cfg.Node = nil
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -667,13 +654,7 @@ func nodeConfigForType(cfg cliConfig, requestedType string) *cliNodeConfig {
 				return node
 			}
 		}
-		if cfg.Node != nil && strings.TrimSpace(cfg.Node.NodeType) == want {
-			return cfg.Node
-		}
 		return nil
-	}
-	if cfg.Node != nil && strings.TrimSpace(cfg.Node.NodeType) != "" {
-		return cfg.Node
 	}
 	if len(cfg.Nodes) == 1 {
 		for _, node := range cfg.Nodes {
@@ -694,9 +675,7 @@ func setNodeConfig(cfg *cliConfig, node *cliNodeConfig) {
 	}
 	cp := *node
 	cfg.Nodes[strings.TrimSpace(cp.NodeType)] = &cp
-	if len(cfg.Nodes) == 1 {
-		cfg.Node = &cp
-	}
+	cfg.Node = nil
 }
 
 func fatalf(format string, args ...any) {

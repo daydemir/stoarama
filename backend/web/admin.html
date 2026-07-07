@@ -1869,7 +1869,20 @@
 <datalist id="streamTagSuggestionsList"></datalist>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="/static/dashboard.js"></script>
 <script>
+const {
+  CAPTURE_TYPES,
+  captureTypeLabel: formatCaptureTypeLabel,
+  debounce,
+  esc,
+  fetchJSON,
+  normalizeCaptureType: normalizeCaptureTypeFilter,
+  normalizeSortDir,
+  normalizeTags,
+  sanitizeLimit,
+  splitCSV,
+} = window.StoaramaDashboard;
 // ─── DOM refs ────────────────────────────────────────────────────────────────
 const missingDomCache = new Map();
 function createMissingNode(id) {
@@ -2224,11 +2237,6 @@ streamRecordingStateFilter.value = '';
 if (coverageDays) coverageDays.value = '30';
 if (coverageSampleCount) coverageSampleCount.value = '42';
 
-// ─── Utilities ───────────────────────────────────────────────────────────────
-function esc(v) {
-  return String(v ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-}
-
 function serverDashboardURL(serverID) {
   const id = String(serverID || '').trim();
   if (!id || id === '-') return '/admin';
@@ -2361,18 +2369,6 @@ function buildYouTubeWatchURL(stream) {
   return '';
 }
 
-function sanitizeLimit(raw, fallback, min, max) {
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return fallback;
-  return String(Math.max(min, Math.min(max, Math.floor(n))));
-}
-
-function normalizeSortDir(raw, fallback = 'desc') {
-  const v = String(raw || '').trim().toLowerCase();
-  if (v === 'asc' || v === 'desc') return v;
-  return fallback === 'asc' ? 'asc' : 'desc';
-}
-
 function nextSortDir(activeBy, activeDir, clickedBy, defaultDir = 'desc') {
   if (String(clickedBy || '') !== String(activeBy || '')) {
     return normalizeSortDir(defaultDir, 'desc');
@@ -2440,42 +2436,10 @@ function peoplePerInferenceMetric(row) {
   };
 }
 
-function debounce(fn, ms) {
-  let t = null;
-  return (...args) => {
-    if (t !== null) clearTimeout(t);
-    t = window.setTimeout(() => { t = null; fn(...args); }, ms);
-  };
-}
-
-function splitCSV(raw) {
-  return String(raw || '').split(',').map((s) => s.trim()).filter((s) => s.length > 0);
-}
-
-const CAPTURE_TYPES = ['youtube_watch', 'hls', 'dash', 'rtsp', 'rtmp', 'http_video', 'still_image', 'webrtc', 'unknown'];
-
 function normalizeRecordingStateFilter(raw) {
   const v = String(raw || '').trim().toLowerCase();
   if (v === 'on' || v === 'off') return v;
   return '';
-}
-
-function normalizeCaptureTypeFilter(raw) {
-  const v = String(raw || '').trim().toLowerCase();
-  if (CAPTURE_TYPES.includes(v)) return v;
-  return '';
-}
-
-function normalizeTags(tags) {
-  const seen = new Set();
-  const out = [];
-  for (const t of (tags || [])) {
-    const clean = String(t || '').trim();
-    if (!clean || seen.has(clean)) continue;
-    seen.add(clean);
-    out.push(clean);
-  }
-  return out;
 }
 
 const HANGUL_BASE = 0xAC00;
@@ -2892,19 +2856,6 @@ function setTableStateRow(tbodyEl, colspan, message, cls = 'muted fs11') {
 
 function setTableLoadingRow(tbodyEl, colspan, message = 'Loading...') {
   setTableStateRow(tbodyEl, colspan, message, 'muted fs11');
-}
-
-// ─── Fetch ───────────────────────────────────────────────────────────────────
-async function fetchJSON(path, opts = {}) {
-  const method = String((opts && opts.method) || 'GET').toUpperCase();
-  const headers = { ...(opts.headers || {}) };
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && !headers['Idempotency-Key']) {
-    headers['Idempotency-Key'] = `${method}:${path}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  }
-  const res = await fetch(path, { ...opts, credentials: 'same-origin', headers });
-  const payload = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(payload.error || `http ${res.status}`);
-  return payload;
 }
 
 function dashboardRedirectPath() {
@@ -4626,12 +4577,6 @@ function formatSourceLabel(source) {
   if (!key) return '-';
   if (key === 'youtube') return 'YouTube';
   return key.toUpperCase();
-}
-
-function formatCaptureTypeLabel(captureType) {
-  const key = normalizeCaptureTypeFilter(captureType);
-  if (!key) return '-';
-  return key;
 }
 
 function formatCaptureFamilyLabel(captureFamily) {

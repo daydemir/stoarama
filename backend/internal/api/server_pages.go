@@ -3,33 +3,17 @@ package api
 import (
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
+
+	webassets "github.com/daydemir/stoarama/backend/web"
 )
 
 func loadHTMLPage(name string) ([]byte, error) {
-	candidates := []string{
-		filepath.Join("backend/web", name),
-		filepath.Join("web", name),
-		filepath.Join("../backend/web", name),
-		filepath.Join("../web", name),
+	data, err := webassets.ReadHTML(name)
+	if err != nil {
+		return nil, fmt.Errorf("%s html not found: %w", name, err)
 	}
-	for _, path := range candidates {
-		if data, err := os.ReadFile(path); err == nil {
-			return data, nil
-		}
-	}
-	cwd, _ := os.Getwd()
-	if cwd != "" {
-		for _, rel := range candidates {
-			path := filepath.Join(cwd, rel)
-			if data, err := os.ReadFile(path); err == nil {
-				return data, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("%s html not found", name)
+	return data, nil
 }
 
 func loadStreamsHTML() ([]byte, error) {
@@ -91,14 +75,30 @@ func (s *Server) handleKoreaApp(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(q.Get("korea_family")) == "" {
 		q.Set("korea_family", "all")
 	}
-	if strings.TrimSpace(q.Get("recordable")) == "" && strings.TrimSpace(q.Get("capture_type")) == "" {
-		q.Set("recordable", "1")
+	if strings.TrimSpace(q.Get("capture_types")) == "" && strings.TrimSpace(q.Get("capture_type")) == "" {
+		q.Set("capture_types", "hls,http_video")
 	}
 	target := "/streams"
 	if encoded := q.Encode(); encoded != "" {
 		target += "?" + encoded
 	}
 	http.Redirect(w, r, target, http.StatusFound)
+}
+
+func (s *Server) handleDashboardStatic(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(strings.TrimSpace(r.URL.Path), "/static/")
+	if name != "dashboard.js" {
+		http.NotFound(w, r)
+		return
+	}
+	body, err := webassets.ReadStatic(name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) handleDocsRoot(w http.ResponseWriter, r *http.Request) {

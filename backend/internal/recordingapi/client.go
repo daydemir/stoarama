@@ -5,18 +5,14 @@
 package recordingapi
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/survey"
 )
@@ -31,6 +27,7 @@ type Client struct {
 	baseURL   string
 	nodeToken string
 	httpc     *http.Client
+	api       *apihttp.Client
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -45,10 +42,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if httpc == nil {
 		httpc = &http.Client{Timeout: 60 * time.Second}
 	}
+	api, err := apihttp.New(baseURL, cfg.NodeToken, httpc, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		baseURL:   baseURL,
 		nodeToken: strings.TrimSpace(cfg.NodeToken),
 		httpc:     httpc,
+		api:       api,
 	}, nil
 }
 
@@ -145,36 +147,7 @@ func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, mimeType st
 // UploadFile streams a local file to a presigned PUT URL with an explicit
 // ContentLength and Content-Type (matching the captureapi upload shape).
 func (c *Client) UploadFile(ctx context.Context, uploadURL, path, mimeType string) error {
-	if strings.TrimSpace(uploadURL) == "" {
-		return fmt.Errorf("upload_url is required")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open upload file: %w", err)
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat upload file: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, f)
-	if err != nil {
-		return fmt.Errorf("build upload request: %w", err)
-	}
-	req.ContentLength = st.Size()
-	if strings.TrimSpace(mimeType) != "" {
-		req.Header.Set("Content-Type", strings.TrimSpace(mimeType))
-	}
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return fmt.Errorf("upload file failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return fmt.Errorf("upload file status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	return nil
+	return c.api.PutFile(ctx, uploadURL, path, mimeType)
 }
 
 // IngestClip records the uploaded clip and returns the new clip id.
@@ -297,76 +270,22 @@ func (c *Client) FailSurveyTarget(ctx context.Context, target survey.Target, cap
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, out any) error {
-	return c.postJSONWithHeaders(ctx, path, payload, nil, out)
+	return c.api.PostJSON(ctx, path, payload, out)
 }
 
 func (c *Client) postJSONWithHeaders(ctx context.Context, path string, payload any, headers map[string]string, out any) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal request payload: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
-	if err != nil {
-		return fmt.Errorf("build request %s: %w", path, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.nodeToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	for k, v := range headers {
-		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return fmt.Errorf("request %s failed: %w", path, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return fmt.Errorf("request %s status=%d body=%s", path, resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	if out == nil {
-		return nil
-	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
-		return fmt.Errorf("decode %s response: %w", path, err)
-	}
-	return nil
+	return c.api.PostJSONWithHeaders(ctx, path, payload, headers, out)
 }
 
 // postRaw posts and returns the raw status + body so callers can branch on a
 // non-2xx (e.g. the 409 cancel signal) without treating it as a hard error.
 func (c *Client) postRaw(ctx context.Context, path string, payload any) (int, []byte, error) {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return 0, nil, fmt.Errorf("marshal request payload: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
-	if err != nil {
-		return 0, nil, fmt.Errorf("build request %s: %w", path, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.nodeToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return 0, nil, fmt.Errorf("request %s failed: %w", path, err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-	return resp.StatusCode, body, nil
+	return c.api.PostRaw(ctx, path, payload)
 }
 
 func buildIdempotencyKey(prefix string, jobID int64) string {
-	p := strings.TrimSpace(prefix)
-	if p == "" {
-		p = "recording-clip"
+	if strings.TrimSpace(prefix) == "" {
+		prefix = "recording-clip"
 	}
-	var buf [8]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return fmt.Sprintf("%s-%d-%d", p, jobID, time.Now().UTC().UnixNano())
-	}
-	return fmt.Sprintf("%s-%d-%x", p, jobID, buf[:])
+	return apihttp.IdempotencyKey(prefix, jobID)
 }

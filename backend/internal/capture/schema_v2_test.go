@@ -148,3 +148,42 @@ func TestDeriveCaptureProfileSeattleImageDefaults(t *testing.T) {
 		t.Fatalf("expected_image_interval_sec=%v want 300", profile.ExpectedImageIntervalSec)
 	}
 }
+
+func TestCaptureTypeMetadata(t *testing.T) {
+	types := CaptureTypes()
+	if len(types) == 0 {
+		t.Fatalf("expected capture type metadata")
+	}
+
+	byValue := make(map[string]CaptureTypeInfo, len(types))
+	for _, typ := range types {
+		if typ.Value == "" {
+			t.Fatalf("capture type value must not be empty: %#v", typ)
+		}
+		if typ.Label == "" {
+			t.Fatalf("capture type label must not be empty: %#v", typ)
+		}
+		if _, exists := byValue[typ.Value]; exists {
+			t.Fatalf("duplicate capture type metadata for %q", typ.Value)
+		}
+		byValue[typ.Value] = typ
+	}
+
+	for _, value := range []string{CaptureTypeYouTubeWatch, CaptureTypeHLS, CaptureTypeHTTPVideo} {
+		typ, ok := byValue[value]
+		if !ok {
+			t.Fatalf("missing metadata for %q", value)
+		}
+		if !typ.Recordable || !typ.Video {
+			t.Fatalf("%q metadata recordable/video = %v/%v, want true/true", value, typ.Recordable, typ.Video)
+		}
+		if label, ok := CaptureTypeLabel(value); !ok || label != typ.Label {
+			t.Fatalf("label(%q) = %q/%v, want %q/true", value, label, ok, typ.Label)
+		}
+	}
+
+	still := byValue[CaptureTypeStillImage]
+	if still.Recordable || still.Video {
+		t.Fatalf("still image metadata recordable/video = %v/%v, want false/false", still.Recordable, still.Video)
+	}
+}

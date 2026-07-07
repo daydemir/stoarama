@@ -1,19 +1,16 @@
 package captureapi
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 )
 
@@ -27,6 +24,7 @@ type Client struct {
 	baseURL  string
 	apiToken string
 	httpc    *http.Client
+	api      *apihttp.Client
 }
 
 type IngestSuccessRequest struct {
@@ -108,10 +106,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if httpc == nil {
 		httpc = &http.Client{Timeout: 20 * time.Second}
 	}
+	api, err := apihttp.New(baseURL, cfg.APIToken, httpc, 20*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		baseURL:  baseURL,
 		apiToken: strings.TrimSpace(cfg.APIToken),
 		httpc:    httpc,
+		api:      api,
 	}, nil
 }
 
@@ -210,56 +213,11 @@ func (c *Client) reserveSegmentUpload(ctx context.Context, kind string, idempote
 }
 
 func (c *Client) UploadFile(ctx context.Context, uploadURL string, path string, mimeType string) error {
-	if strings.TrimSpace(uploadURL) == "" {
-		return fmt.Errorf("upload_url is required")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open upload file: %w", err)
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat upload file: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, f)
-	if err != nil {
-		return fmt.Errorf("build upload request: %w", err)
-	}
-	req.ContentLength = st.Size()
-	if strings.TrimSpace(mimeType) != "" {
-		req.Header.Set("Content-Type", strings.TrimSpace(mimeType))
-	}
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return fmt.Errorf("upload file failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return fmt.Errorf("upload file status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	return nil
+	return c.api.PutFile(ctx, uploadURL, path, mimeType)
 }
 
 func (c *Client) UploadSegment(ctx context.Context, uploadURL string, body []byte, mimeType string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build segment upload request: %w", err)
-	}
-	if strings.TrimSpace(mimeType) != "" {
-		req.Header.Set("Content-Type", strings.TrimSpace(mimeType))
-	}
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return fmt.Errorf("upload segment failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return fmt.Errorf("upload segment status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	return nil
+	return c.api.PutBytes(ctx, uploadURL, body, mimeType)
 }
 
 func (c *Client) IngestSegmentSuccess(ctx context.Context, req IngestSegmentSuccessRequest) error {
@@ -364,57 +322,18 @@ func (c *Client) MarkUnsupported(ctx context.Context, streamID int64, effective 
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, out any) error {
-	return c.postJSONWithHeaders(ctx, path, payload, nil, out)
+	return c.api.PostJSON(ctx, path, payload, out)
 }
 
 func (c *Client) postJSONWithHeaders(ctx context.Context, path string, payload any, headers map[string]string, out any) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal request payload: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
-	if err != nil {
-		return fmt.Errorf("build request %s: %w", path, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	for k, v := range headers {
-		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return fmt.Errorf("request %s failed: %w", path, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return fmt.Errorf("request %s status=%d body=%s", path, resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	if out == nil {
-		return nil
-	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && !errorsIsEOF(err) {
-		return fmt.Errorf("decode %s response: %w", path, err)
-	}
-	return nil
+	return c.api.PostJSONWithHeaders(ctx, path, payload, headers, out)
 }
 
 func buildIdempotencyKey(prefix string, streamID int64) string {
-	const fallback = "capture-segment"
-	p := strings.TrimSpace(prefix)
-	if p == "" {
-		p = fallback
+	if strings.TrimSpace(prefix) == "" {
+		prefix = "capture-segment"
 	}
-	var buf [8]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return fmt.Sprintf("%s-%d-%d", p, streamID, time.Now().UTC().UnixNano())
-	}
-	return fmt.Sprintf("%s-%d-%x", p, streamID, buf[:])
+	return apihttp.IdempotencyKey(prefix, streamID)
 }
 
 func (c *Client) postJSONWithRetry(ctx context.Context, path string, payload any, out any, attempts int) error {
@@ -482,8 +401,4 @@ func isRetryablePostError(err error) bool {
 		return true
 	}
 	return false
-}
-
-func errorsIsEOF(err error) bool {
-	return err == io.EOF
 }

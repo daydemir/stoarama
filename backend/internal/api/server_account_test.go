@@ -24,7 +24,7 @@ func TestSanitizeAccountRedirectPath(t *testing.T) {
 		{name: "path", raw: "/account/console", want: "/account/console"},
 		{name: "strip stale account error", raw: "/account?error=expired_token", want: "/account"},
 		{name: "strip auth flow keys", raw: "/account?auth=complete&redirect_path=%2Fstreams&token=abc&error=expired_token", want: "/account"},
-		{name: "preserve stream filters", raw: "/streams?recordable=1&sort_by=name&sort_dir=desc&page=1&page_size=100", want: "/streams?page=1&page_size=100&recordable=1&sort_by=name&sort_dir=desc"},
+		{name: "preserve stream filters", raw: "/streams?capture_types=hls,http_video&sort_by=name&sort_dir=desc&page=1&page_size=100", want: "/streams?capture_types=hls%2Chttp_video&page=1&page_size=100&sort_by=name&sort_dir=desc"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

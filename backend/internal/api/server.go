@@ -182,6 +182,7 @@ func (s *Server) router() http.Handler {
 	r := chi.NewRouter()
 
 	r.Get("/healthz", s.handleHealth)
+	r.Get("/static/{asset}", s.handleDashboardStatic)
 	r.Get("/", s.handleStreamsApp)
 	r.Get("/streams", s.handleStreamsApp)
 	r.Get("/streams/{id}", s.handleStreamsApp)
@@ -3337,6 +3338,7 @@ type dashboardStreamWhereConfig struct {
 }
 
 func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWhereConfig) ([]string, []any, error) {
+	query := r.URL.Query()
 	recordingStateRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("recording_state")))
 	tab := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("tab")))
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -3348,6 +3350,8 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	youtubeChannel := strings.TrimSpace(r.URL.Query().Get("youtube_channel"))
 	captureModeRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("capture_type")))
 	captureModesRaw := dedupeStrings(strings.Split(strings.ToLower(r.URL.Query().Get("capture_types")), ","))
+	legacyRecordable := query.Get("recordable") == "1" || strings.EqualFold(query.Get("recordable"), "true")
+	legacyHideStillImage := query.Get("hide_still_image") == "1" || strings.EqualFold(query.Get("hide_still_image"), "true")
 	touchedPipelineID := strings.TrimSpace(r.URL.Query().Get("touched_pipeline_id"))
 	tags := dedupeStrings(strings.Split(r.URL.Query().Get("tags"), ","))
 	tagsNot := dedupeStrings(strings.Split(r.URL.Query().Get("tags_not"), ","))
@@ -3430,15 +3434,13 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 		args = append(args, captureTypes)
 		where = append(where, fmt.Sprintf("s.capture_type = ANY($%d::text[])", len(args)))
 	}
-	// recordable=1 restricts to the source kinds the recorder can actually
-	// capture (live HLS and direct HTTP(S) video). It is what the streams browse
-	// "Recordable" segment uses; the single-value capture_type filter cannot
-	// express the union, so it is a dedicated flag.
-	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("recordable"))); raw == "1" || raw == "true" {
-		where = append(where, "s.capture_type IN ('hls','http_video')")
+	if cfg.IncludeCaptureMode && legacyRecordable {
+		args = append(args, []string{capture.CaptureTypeHLS, capture.CaptureTypeHTTPVideo})
+		where = append(where, fmt.Sprintf("s.capture_type = ANY($%d::text[])", len(args)))
 	}
-	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("hide_still_image"))); raw == "1" || raw == "true" {
-		where = append(where, "COALESCE(s.capture_type, '') <> 'still_image'")
+	if cfg.IncludeCaptureMode && legacyHideStillImage {
+		args = append(args, capture.CaptureTypeStillImage)
+		where = append(where, fmt.Sprintf("COALESCE(s.capture_type, '')<>$%d", len(args)))
 	}
 	if touchedPipelineID != "" {
 		args = append(args, touchedPipelineID)

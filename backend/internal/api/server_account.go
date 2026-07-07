@@ -13,8 +13,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -97,27 +95,7 @@ func (s *Server) handleAccountApp(w http.ResponseWriter, r *http.Request) {
 }
 
 func loadAccountHTML() ([]byte, error) {
-	candidates := []string{
-		"backend/web/account.html",
-		"web/account.html",
-		"../backend/web/account.html",
-		"../web/account.html",
-	}
-	for _, c := range candidates {
-		if b, err := os.ReadFile(c); err == nil {
-			return b, nil
-		}
-	}
-	cwd, _ := os.Getwd()
-	if cwd != "" {
-		for _, rel := range candidates {
-			p := filepath.Join(cwd, rel)
-			if b, err := os.ReadFile(p); err == nil {
-				return b, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("account html not found")
+	return loadHTMLPage("account.html")
 }
 
 func (s *Server) requireAccountAuth(next http.Handler) http.Handler {

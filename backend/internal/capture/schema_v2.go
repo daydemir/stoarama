@@ -41,6 +41,44 @@ type CanonicalStreamFields struct {
 	ExecutionClass string
 }
 
+type CaptureTypeInfo struct {
+	Value      string
+	Label      string
+	Recordable bool
+	Video      bool
+}
+
+var captureTypeInfos = []CaptureTypeInfo{
+	{Value: CaptureTypeYouTubeWatch, Label: "YouTube", Recordable: true, Video: true},
+	{Value: CaptureTypeHLS, Label: "HLS", Recordable: true, Video: true},
+	{Value: CaptureTypeDASH, Label: "DASH", Video: true},
+	{Value: CaptureTypeRTSP, Label: "RTSP", Video: true},
+	{Value: CaptureTypeRTMP, Label: "RTMP", Video: true},
+	{Value: CaptureTypeHTTPVideo, Label: "Direct Video", Recordable: true, Video: true},
+	{Value: CaptureTypeStillImage, Label: "Still Image"},
+	{Value: CaptureTypeWebRTC, Label: "WebRTC", Video: true},
+	{Value: CaptureTypeUnknown, Label: "Unknown"},
+}
+
+func CaptureTypes() []CaptureTypeInfo {
+	out := make([]CaptureTypeInfo, len(captureTypeInfos))
+	copy(out, captureTypeInfos)
+	return out
+}
+
+func CaptureTypeLabel(raw string) (string, bool) {
+	v, ok := NormalizeCaptureType(raw)
+	if !ok {
+		return "", false
+	}
+	for _, info := range captureTypeInfos {
+		if info.Value == v {
+			return info.Label, true
+		}
+	}
+	return "", false
+}
+
 type CaptureProfile struct {
 	CanonicalStreamFields
 	CaptureFamily            string

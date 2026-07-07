@@ -54,18 +54,56 @@ func TestDashboardBuildStreamWhereCaptureTypeFilter(t *testing.T) {
 	}
 }
 
-func TestDashboardBuildStreamWhereRecordableFilter(t *testing.T) {
+func TestDashboardBuildStreamWhereLegacyRecordableFilter(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?recordable=1", nil)
-	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
+		IncludeCaptureMode: true,
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(args) != 0 {
-		t.Fatalf("args len=%d want=0", len(args))
+	if got, want := len(args), 1; got != want {
+		t.Fatalf("args len=%d want=%d", got, want)
+	}
+	got, ok := args[0].([]string)
+	if !ok {
+		t.Fatalf("arg type=%T want []string", args[0])
+	}
+	want := []string{"hls", "http_video"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("capture_types=%v want %v", got, want)
 	}
 	sqlWhere := strings.Join(where, " AND ")
-	if !strings.Contains(sqlWhere, "s.capture_type IN ('hls','http_video')") {
-		t.Fatalf("where missing recordable predicate: %s", sqlWhere)
+	if !strings.Contains(sqlWhere, "s.capture_type = ANY($1::text[])") {
+		t.Fatalf("where missing legacy recordable predicate: %s", sqlWhere)
+	}
+}
+
+func TestDashboardBuildStreamWhereLegacyRecordableComposesWithCaptureType(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?recordable=1&capture_type=still_image", nil)
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
+		IncludeCaptureMode: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := len(args), 2; got != want {
+		t.Fatalf("args len=%d want=%d", got, want)
+	}
+	if got, want := args[0], "still_image"; got != want {
+		t.Fatalf("capture_type arg=%v want=%q", got, want)
+	}
+	got, ok := args[1].([]string)
+	if !ok {
+		t.Fatalf("arg type=%T want []string", args[1])
+	}
+	want := []string{"hls", "http_video"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("legacy recordable types=%v want %v", got, want)
+	}
+	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "s.capture_type=$1") || !strings.Contains(sqlWhere, "s.capture_type = ANY($2::text[])") {
+		t.Fatalf("where missing composed predicates: %s", sqlWhere)
 	}
 }
 
@@ -94,6 +132,29 @@ func TestDashboardBuildStreamWhereCaptureTypesFilter(t *testing.T) {
 	}
 }
 
+func TestDashboardBuildStreamWhereLegacyHideStillImageComposesWithCaptureType(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?hide_still_image=1&capture_type=still_image", nil)
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
+		IncludeCaptureMode: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := len(args), 2; got != want {
+		t.Fatalf("args len=%d want=%d", got, want)
+	}
+	if got, want := args[0], "still_image"; got != want {
+		t.Fatalf("capture_type arg=%v want=%q", got, want)
+	}
+	if got, want := args[1], "still_image"; got != want {
+		t.Fatalf("hidden capture_type=%v want=%q", got, want)
+	}
+	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "s.capture_type=$1") || !strings.Contains(sqlWhere, "COALESCE(s.capture_type, '')<>$2") {
+		t.Fatalf("where missing composed predicates: %s", sqlWhere)
+	}
+}
+
 func TestDashboardBuildStreamWhereInvalidCaptureTypes(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?capture_types=hls,bad_mode", nil)
 	_, _, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
@@ -107,18 +168,23 @@ func TestDashboardBuildStreamWhereInvalidCaptureTypes(t *testing.T) {
 	}
 }
 
-func TestDashboardBuildStreamWhereHideStillImageFilter(t *testing.T) {
+func TestDashboardBuildStreamWhereLegacyHideStillImageFilter(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?hide_still_image=1", nil)
-	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
+		IncludeCaptureMode: true,
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(args) != 0 {
-		t.Fatalf("args len=%d want=0", len(args))
+	if got, want := len(args), 1; got != want {
+		t.Fatalf("args len=%d want=%d", got, want)
+	}
+	if got, want := args[0], "still_image"; got != want {
+		t.Fatalf("hidden capture_type=%v want=%q", got, want)
 	}
 	sqlWhere := strings.Join(where, " AND ")
-	if !strings.Contains(sqlWhere, "COALESCE(s.capture_type, '') <> 'still_image'") {
-		t.Fatalf("where missing hide still image predicate: %s", sqlWhere)
+	if !strings.Contains(sqlWhere, "COALESCE(s.capture_type, '')<>$1") {
+		t.Fatalf("where missing legacy hide_still_image predicate: %s", sqlWhere)
 	}
 }
 

@@ -1907,7 +1907,21 @@
 <datalist id="streamTagSuggestionsList"></datalist>
 
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script src="/static/dashboard.js"></script>
 <script>
+const {
+  CAPTURE_TYPES,
+  captureTypeLabel: formatCaptureTypeLabel,
+  debounce,
+  esc,
+  fetchJSON,
+  formatBytes,
+  normalizeCaptureType: normalizeCaptureTypeFilter,
+  normalizeSortDir,
+  normalizeTags,
+  sanitizeLimit,
+  splitCSV,
+} = window.StoaramaDashboard;
 // ─── DOM refs ────────────────────────────────────────────────────────────────
 const missingDomCache = new Map();
 function createMissingNode(id) {
@@ -2194,6 +2208,31 @@ function sourceTypeListsEqual(a, b) {
   return normalizeSourceTypes(a).join(',') === normalizeSourceTypes(b).join(',');
 }
 
+function sourceSegmentForTypes(types) {
+  if (sourceTypeListsEqual(types, SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.VIDEO])) return SOURCE_SEGMENT.VIDEO;
+  if (sourceTypeListsEqual(types, SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.YOUTUBE])) return SOURCE_SEGMENT.YOUTUBE;
+  if (sourceTypeListsEqual(types, SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.STILL])) return SOURCE_SEGMENT.STILL;
+  return SOURCE_SEGMENT.ALL;
+}
+
+function legacyRecordableParam(params) {
+  if (!(params instanceof URLSearchParams)) return false;
+  const raw = String(params.get('recordable') || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true';
+}
+
+function legacyHideStillImageParam(params) {
+  if (!(params instanceof URLSearchParams)) return false;
+  const raw = String(params.get('hide_still_image') || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true';
+}
+
+function legacySourceTypes(params) {
+  if (legacyRecordableParam(params)) return SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.VIDEO];
+  if (legacyHideStillImageParam(params)) return SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL];
+  return [];
+}
+
 function setSelectedSourceTypes(types) {
   const normalized = normalizeSourceTypes(types);
   selectedSourceTypes = new Set(normalized.length ? normalized : SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL]);
@@ -2230,11 +2269,6 @@ const queuedImageStreamIDs = new Set();
 const inFlightImageStreamIDs = new Set();
 let imageQueueTimer = null;
 let streamImageObserver = null;
-
-// ─── Utilities ───────────────────────────────────────────────────────────────
-function esc(v) {
-  return String(v ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-}
 
 function updateHistoryURL(targetURL, replace = false) {
   const currentURL = `${window.location.pathname}${window.location.search}`;
@@ -2309,16 +2343,6 @@ function formatDateTimeShort(raw) {
   });
 }
 
-function formatBytes(value) {
-  const bytes = Number(value);
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-  const exp = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const amount = bytes / (1024 ** exp);
-  const digits = amount >= 100 || exp === 0 ? 0 : amount >= 10 ? 1 : 2;
-  return `${amount.toFixed(digits)} ${units[exp]}`;
-}
-
 function formatAgo(raw) {
   const d = new Date(raw);
   if (!Number.isFinite(d.getTime())) return '-';
@@ -2376,18 +2400,6 @@ function isYouTubeSourceURL(rawURL) {
   } catch (_) {
     return false;
   }
-}
-
-function sanitizeLimit(raw, fallback, min, max) {
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return fallback;
-  return String(Math.max(min, Math.min(max, Math.floor(n))));
-}
-
-function normalizeSortDir(raw, fallback = 'desc') {
-  const v = String(raw || '').trim().toLowerCase();
-  if (v === 'asc' || v === 'desc') return v;
-  return fallback === 'asc' ? 'asc' : 'desc';
 }
 
 function nextSortDir(activeBy, activeDir, clickedBy, defaultDir = 'desc') {
@@ -2463,42 +2475,10 @@ function peoplePerInferenceMetric(row) {
   };
 }
 
-function debounce(fn, ms) {
-  let t = null;
-  return (...args) => {
-    if (t !== null) clearTimeout(t);
-    t = window.setTimeout(() => { t = null; fn(...args); }, ms);
-  };
-}
-
-function splitCSV(raw) {
-  return String(raw || '').split(',').map((s) => s.trim()).filter((s) => s.length > 0);
-}
-
-const CAPTURE_TYPES = ['youtube_watch', 'hls', 'dash', 'rtsp', 'rtmp', 'http_video', 'still_image', 'webrtc', 'unknown'];
-
 function normalizeRecordingStateFilter(raw) {
   const v = String(raw || '').trim().toLowerCase();
   if (v === 'on' || v === 'off') return v;
   return '';
-}
-
-function normalizeCaptureTypeFilter(raw) {
-  const v = String(raw || '').trim().toLowerCase();
-  if (CAPTURE_TYPES.includes(v)) return v;
-  return '';
-}
-
-function normalizeTags(tags) {
-  const seen = new Set();
-  const out = [];
-  for (const t of (tags || [])) {
-    const clean = String(t || '').trim();
-    if (!clean || seen.has(clean)) continue;
-    seen.add(clean);
-    out.push(clean);
-  }
-  return out;
 }
 
 const HANGUL_BASE = 0xAC00;
@@ -2940,19 +2920,6 @@ function setTableStateRow(tbodyEl, colspan, message, cls = 'muted fs11') {
 
 function setTableLoadingRow(tbodyEl, colspan, message = 'Loading...') {
   setTableStateRow(tbodyEl, colspan, message, 'muted fs11');
-}
-
-// ─── Fetch ───────────────────────────────────────────────────────────────────
-async function fetchJSON(path, opts = {}) {
-  const method = String((opts && opts.method) || 'GET').toUpperCase();
-  const headers = { ...(opts.headers || {}) };
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && !headers['Idempotency-Key']) {
-    headers['Idempotency-Key'] = `${method}:${path}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  }
-  const res = await fetch(path, { ...opts, credentials: 'same-origin', headers });
-  const payload = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(payload.error || `http ${res.status}`);
-  return payload;
 }
 
 function dashboardStreamsCollectionURL(params) {
@@ -4465,7 +4432,7 @@ async function loadDiscoveryCandidates() {
 }
 
 // ─── Location filters ─────────────────────────────────────────────────────────
-function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, captureTypes = []) {
+function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', provider = '', koreaFamily = '', captureTypes = []) {
   const params = new URLSearchParams();
   const normalizedRecordingState = normalizeRecordingStateFilter(recordingState);
   const normalizedCaptureType = normalizeCaptureTypeFilter(captureType);
@@ -4483,8 +4450,7 @@ function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', ta
   if (String(source || '').trim()) {
     params.set('source', String(source).trim());
   }
-  if (recordable) params.set('recordable', '1');
-  return params;
+ return params;
 }
 
 function streamOptionScope() {
@@ -4493,7 +4459,6 @@ function streamOptionScope() {
     captureType: '',
     captureTypes: selectedSourceTypeList(),
     koreaFamily,
-    recordable: false,
   };
 }
 
@@ -4521,12 +4486,6 @@ function formatProviderLabel(provider) {
   const raw = String(provider || '').trim();
   if (!raw) return '-';
   return raw.replace(/_/g, ' ');
-}
-
-function formatCaptureTypeLabel(captureType) {
-  const key = normalizeCaptureTypeFilter(captureType);
-  if (!key) return '-';
-  return key;
 }
 
 function formatCaptureFamilyLabel(captureFamily) {
@@ -4564,9 +4523,9 @@ function populateCaptureTypeOptions(selectEl, allLabel) {
   if (!prev) selectEl.value = '';
 }
 
-async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
+async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily, recordable, captureTypes);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/countries?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4579,9 +4538,9 @@ async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingSt
   else if (!prev) targetSelect.value = '';
 }
 
-async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
+async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily, recordable, captureTypes);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/cities?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4606,10 +4565,10 @@ function populateKoreaRegionOptions() {
   else koreaRegionFilter.value = '';
 }
 
-async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
+async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
   if (!(targetSelect instanceof HTMLSelectElement)) return;
   const prev = String(targetSelect.value || '').trim();
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily, recordable, captureTypes);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/providers?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4622,9 +4581,9 @@ async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingS
   else if (!prev) targetSelect.value = '';
 }
 
-async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
+async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
   const prev = String(targetSelect.value || '').trim().toLowerCase();
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily, recordable, captureTypes);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4789,6 +4748,9 @@ function applyStreamListStateFromURL(params) {
   seenVehiclesFilter.checked = params.get('seen_vehicles') === '1' || params.get('seen_vehicles') === 'true';
   if (params.has('capture_types')) {
     setSelectedSourceTypes(params.get('capture_types'));
+  } else {
+    const legacyTypes = legacySourceTypes(params);
+    if (legacyTypes.length) setSelectedSourceTypes(legacyTypes);
   }
 
   const sortBy = String(params.get('sort_by') || '').trim();
@@ -4813,7 +4775,7 @@ function applyDetailRouteStateFromURL() {
 function syncStreamListURL(opts = {}) {
   if (currentStreamRoute !== STREAM_ROUTE.LIST) return;
   const params = buildStreamFilterParams();
-  if (sourceTypeListsEqual(selectedSourceTypeList(), SOURCE_SEGMENT_TYPES[streamSourceSegment] || SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL])) {
+  if (streamSourceSegment === SOURCE_SEGMENT.ALL && sourceTypeListsEqual(selectedSourceTypeList(), SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL])) {
     params.delete('capture_types');
   }
   const sortBy = String(streamSortBy || DEFAULT_STREAM_SORT_BY);
@@ -4852,7 +4814,6 @@ async function refreshAllStreamFilterOptions() {
     optionScope.captureType,
     providerFilter.value,
     optionScope.koreaFamily,
-    optionScope.recordable,
     optionScope.captureTypes,
   );
   await Promise.all([
@@ -4868,7 +4829,6 @@ async function refreshAllStreamFilterOptions() {
       optionScope.captureType,
       providerFilter.value,
       optionScope.koreaFamily,
-      optionScope.recordable,
       requestToken,
       optionScope.captureTypes,
     ),
@@ -4883,7 +4843,6 @@ async function refreshAllStreamFilterOptions() {
       sourceFilter.value,
       optionScope.captureType,
       optionScope.koreaFamily,
-      optionScope.recordable,
       requestToken,
       optionScope.captureTypes,
     ),
@@ -4897,7 +4856,6 @@ async function refreshAllStreamFilterOptions() {
       optionScope.captureType,
       providerFilter.value,
       optionScope.koreaFamily,
-      optionScope.recordable,
       requestToken,
       optionScope.captureTypes,
     ),
@@ -4912,7 +4870,6 @@ async function refreshAllStreamFilterOptions() {
       optionScope.captureType,
       providerFilter.value,
       optionScope.koreaFamily,
-      optionScope.recordable,
       requestToken,
       optionScope.captureTypes,
     ),
@@ -5233,7 +5190,7 @@ function updateRecordBar() {
 
 function applySourceSegment(seg, opts = {}) {
   const rawSeg = String(seg || '').trim();
-  const normalizedSeg = rawSeg === 'recordable' || rawSeg === 'hls' ? SOURCE_SEGMENT.VIDEO : rawSeg;
+  const normalizedSeg = rawSeg === 'hls' ? SOURCE_SEGMENT.VIDEO : rawSeg;
   streamSourceSegment = (normalizedSeg === SOURCE_SEGMENT.VIDEO || normalizedSeg === SOURCE_SEGMENT.YOUTUBE || normalizedSeg === SOURCE_SEGMENT.STILL) ? normalizedSeg : SOURCE_SEGMENT.ALL;
   const preserveFilters = Boolean(opts && opts.preserveFilters);
   if (!(opts && opts.preserveSourceTypes)) {
@@ -6518,20 +6475,6 @@ function parseStreamsLocation() {
   return { params, streamID, isList: parts.length === 0 || (parts.length === 1 && parts[0] === 'streams') };
 }
 
-function isLegacyStreamsDefaultQuery(params) {
-  if (!(params instanceof URLSearchParams)) return false;
-  const keys = Array.from(params.keys()).filter((k) => String(k || '').trim());
-  const allowed = new Set(['recordable', 'sort_by', 'sort_dir', 'page', 'page_size']);
-  if (!keys.length || keys.some((k) => !allowed.has(k))) return false;
-  const recordable = String(params.get('recordable') || '').trim().toLowerCase();
-  if (recordable !== '1' && recordable !== 'true') return false;
-  const sortBy = String(params.get('sort_by') || DEFAULT_STREAM_SORT_BY).trim();
-  const sortDir = normalizeSortDir(params.get('sort_dir'), DEFAULT_STREAM_SORT_DIR);
-  const page = String(params.get('page') || '1').trim();
-  const pageSize = String(params.get('page_size') || '100').trim();
-  return sortBy === DEFAULT_STREAM_SORT_BY && sortDir === DEFAULT_STREAM_SORT_DIR && page === '1' && pageSize === '100';
-}
-
 async function applyStreamsRouteState(opts = {}) {
   const { params, streamID, isList } = parseStreamsLocation();
   updateTimezoneLabels();
@@ -6548,25 +6491,22 @@ async function applyStreamsRouteState(opts = {}) {
     return;
   }
   if (!isList) return;
-  if (isLegacyStreamsDefaultQuery(params)) {
-    params.delete('recordable');
-    params.delete('sort_by');
-    params.delete('sort_dir');
-    params.delete('page');
-    params.delete('page_size');
-  }
   currentStreamRoute = STREAM_ROUTE.LIST;
   mainTab = 'streams';
   detailStreamID = null;
   applyStreamListStateFromURL(params);
   showPanel('streams');
-  setStreamsView(streamsView, { replaceURL: true });
   const initialCapture = normalizeCaptureTypeFilter(params.get('capture_type'));
-  const initialRecordable = params.get('recordable') === '1' || String(params.get('recordable') || '').toLowerCase() === 'true';
-  const initialSourceSegment = initialRecordable || initialCapture === 'hls' || initialCapture === 'http_video' ? SOURCE_SEGMENT.VIDEO
+  const initialSourceTypes = normalizeSourceTypes(params.get('capture_types'));
+  const legacyTypes = legacySourceTypes(params);
+  const typedSourceSegment = sourceSegmentForTypes(initialSourceTypes.length ? initialSourceTypes : legacyTypes);
+  const initialSourceSegment = params.has('korea_family') ? SOURCE_SEGMENT.VIDEO
+    : initialCapture === 'hls' || initialCapture === 'http_video' ? SOURCE_SEGMENT.VIDEO
     : (initialCapture === 'youtube_watch' ? SOURCE_SEGMENT.YOUTUBE
-      : (initialCapture === 'still_image' ? SOURCE_SEGMENT.STILL : SOURCE_SEGMENT.ALL));
-  applySourceSegment(initialSourceSegment, { preserveFilters: true, preserveSourceTypes: params.has('capture_types') });
+      : (initialCapture === 'still_image' ? SOURCE_SEGMENT.STILL
+        : typedSourceSegment));
+  applySourceSegment(initialSourceSegment, { preserveFilters: true, preserveSourceTypes: params.has('capture_types') || legacyTypes.length > 0 });
+  setStreamsView(streamsView, { replaceURL: true });
   void loadStreamSegmentCounts();
   await refreshAllStreamFilterOptions();
   await loadStreamsForActiveView({ replaceURL: true });
