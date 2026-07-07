@@ -445,7 +445,6 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		isOperator   bool
 		status       string
 		expiresAt    time.Time
-		consumedAt   *time.Time
 		redirectPath string
 		memberEmail  *string
 	)
@@ -453,13 +452,12 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 	// the forward-looking binding (backfilled for pre-cutover links). The user's
 	// email + operator flag drive verification and bootstrap.
 	err = tx.QueryRow(r.Context(), `
-		SELECT ml.id, o.id, u.id, u.email, u.is_operator, o.status, ml.expires_at, ml.consumed_at, ml.redirect_path, ml.member_email
+		SELECT ml.id, o.id, u.id, u.email, u.is_operator, o.status, ml.expires_at, ml.redirect_path, ml.member_email
 		FROM account_magic_links ml
 		JOIN accounts o ON o.id=ml.target_org_id
 		JOIN users u ON u.id=ml.user_id
 		WHERE ml.token_hash=$1
-		FOR UPDATE OF ml
-	`, hash).Scan(&linkID, &orgID, &userID, &email, &isOperator, &status, &expiresAt, &consumedAt, &redirectPath, &memberEmail)
+	`, hash).Scan(&linkID, &orgID, &userID, &email, &isOperator, &status, &expiresAt, &redirectPath, &memberEmail)
 	if err != nil {
 		log.Printf("account auth complete invalid_token token=%s host=%s ip=%s ua=%q", maskedToken, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=invalid_token", http.StatusFound)
@@ -470,18 +468,9 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		http.Redirect(w, r, "/account?error=account_disabled", http.StatusFound)
 		return
 	}
-	if consumedAt != nil || !expiresAt.After(time.Now().UTC()) {
-		log.Printf("account auth complete expired_or_consumed token=%s link_id=%d email=%s consumed_at=%v expires_at=%s host=%s ip=%s ua=%q", maskedToken, linkID, email, consumedAt, expiresAt.UTC().Format(time.RFC3339), strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
+	if !expiresAt.After(time.Now().UTC()) {
+		log.Printf("account auth complete expired_token token=%s link_id=%d email=%s expires_at=%s host=%s ip=%s ua=%q", maskedToken, linkID, email, expiresAt.UTC().Format(time.RFC3339), strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r))
 		http.Redirect(w, r, "/account?error=expired_token", http.StatusFound)
-		return
-	}
-	if _, err := tx.Exec(r.Context(), `
-		UPDATE account_magic_links
-		SET consumed_at=now()
-		WHERE id=$1
-	`, linkID); err != nil {
-		log.Printf("account auth complete consume_failed token=%s link_id=%d email=%s host=%s ip=%s ua=%q err=%v", maskedToken, linkID, email, strings.TrimSpace(r.Host), requesterIP(r), requestUserAgent(r), err)
-		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `
@@ -558,7 +547,7 @@ func (s *Server) handleAccountAuthComplete(w http.ResponseWriter, r *http.Reques
 		http.Redirect(w, r, "/account?error=server_error", http.StatusFound)
 		return
 	}
-	if err := s.insertAccountAuthEventTx(r.Context(), tx, orgID, nil, "magic_link_consumed", "account", email, map[string]any{
+	if err := s.insertAccountAuthEventTx(r.Context(), tx, orgID, nil, "magic_link_used", "account", email, map[string]any{
 		"magic_link_id":  linkID,
 		"session_id":     sessionID,
 		"redirect_path":  sanitizeAccountRedirectPath(redirectPath),

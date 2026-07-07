@@ -557,6 +557,90 @@ func TestSelfSignupCreatesPersonalOrg(t *testing.T) {
 	}
 }
 
+func TestAccountMagicLinkReusableUntilExpiry(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	s.cfg.SessionTTL = time.Hour
+
+	userID, orgID := seedUserOrg(t, pool, "reusable-link@example.com", false)
+	rawToken := "reusable-magic-link-token"
+	consumedAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	var linkID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO account_magic_links (
+			account_id, token_hash, redirect_path, requester_ip, user_agent,
+			expires_at, consumed_at, user_id, target_org_id
+		)
+		VALUES ($1, $2, '/account', '', '', now() + interval '1 hour', $3, $4, $1)
+		RETURNING id
+	`, orgID, hashSecret(rawToken), consumedAt, userID).Scan(&linkID); err != nil {
+		t.Fatalf("insert magic link: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/auth/complete?token="+rawToken, nil)
+		rec := httptest.NewRecorder()
+		s.handleAccountAuthComplete(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("click %d status=%d want 302 body=%s", i+1, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Location"); got != "/account?auth=complete" {
+			t.Fatalf("click %d location=%q want /account?auth=complete", i+1, got)
+		}
+		if cookies := rec.Result().Cookies(); len(cookies) == 0 {
+			t.Fatalf("click %d set no session cookie", i+1)
+		}
+	}
+
+	var sessions int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM account_sessions WHERE user_id=$1 AND current_org_id=$2
+	`, userID, orgID).Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions != 2 {
+		t.Fatalf("sessions=%d want 2", sessions)
+	}
+
+	var gotConsumedAt time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT consumed_at FROM account_magic_links WHERE id=$1
+	`, linkID).Scan(&gotConsumedAt); err != nil {
+		t.Fatalf("load consumed_at: %v", err)
+	}
+	if !gotConsumedAt.UTC().Equal(consumedAt) {
+		t.Fatalf("consumed_at=%s want unchanged %s", gotConsumedAt.UTC(), consumedAt)
+	}
+}
+
+func TestAccountMagicLinkExpiredRedirect(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	s.cfg.SessionTTL = time.Hour
+
+	userID, orgID := seedUserOrg(t, pool, "expired-link@example.com", false)
+	rawToken := "expired-magic-link-token"
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO account_magic_links (
+			account_id, token_hash, redirect_path, requester_ip, user_agent,
+			expires_at, user_id, target_org_id
+		)
+		VALUES ($1, $2, '/account', '', '', now() - interval '1 second', $3, $1)
+	`, orgID, hashSecret(rawToken), userID); err != nil {
+		t.Fatalf("insert magic link: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/complete?token="+rawToken, nil)
+	rec := httptest.NewRecorder()
+	s.handleAccountAuthComplete(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status=%d want 302 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "/account?error=expired_token" {
+		t.Fatalf("location=%q want /account?error=expired_token", got)
+	}
+}
+
 // TestLastOwnerGuardOnRemove: an org owner cannot remove the sole remaining owner.
 func TestLastOwnerGuardOnRemove(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)

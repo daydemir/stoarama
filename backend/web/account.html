@@ -212,6 +212,17 @@
 
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
+    const authErrorMessages = Object.freeze({
+      expired_token: 'That sign-in link expired. Request a new link.',
+      invalid_token: 'That sign-in link is invalid. Request a new link.',
+      missing_token: 'That sign-in link is missing its token. Request a new link.',
+      account_disabled: 'This account is disabled.',
+      server_error: 'We could not complete sign-in. Request a new link.',
+    });
+    const authError = String(authParams.get('error') || '').trim().toLowerCase();
+    function authErrorMessage() {
+      return authErrorMessages[authError] || '';
+    }
     function cleanRedirectPath(raw) {
       const v = String(raw || '').trim();
       if (!v.startsWith('/') || v.startsWith('//')) return '/account';
@@ -369,6 +380,8 @@
         if (authCompleted && continueTarget) {
           setStatus(accountStatus, `Signed in as ${email}. Continuing to ${continueTarget}...`, 'ok');
           scheduleAuthFlowContinue();
+        } else if (authErrorMessage()) {
+          setStatus(accountStatus, authErrorMessage(), 'err');
         } else {
           setStatus(accountStatus, '', '');
           if (authCompleted) clearAuthCompleteParam();
@@ -380,6 +393,8 @@
         signinPanel.classList.remove('hidden');
         if (authCompleted) {
           setStatus(accountStatus, 'Sign-in link opened, but this browser has no active session. Open the link in the browser you want to use.', 'err');
+        } else if (authErrorMessage()) {
+          setStatus(accountStatus, authErrorMessage(), 'err');
         } else {
           setStatus(accountStatus, '', '');
         }

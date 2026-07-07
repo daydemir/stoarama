@@ -149,7 +149,7 @@ func Load() (Config, error) {
 		R2SignPutTTL:                durEnv("R2_SIGN_PUT_TTL", 15*time.Minute),
 		StorageCredKey:              strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),
 		AppBaseURL:                  strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
-		MagicLinkTTL:                durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 20*time.Minute)),
+		MagicLinkTTL:                durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 60*time.Minute)),
 		SessionTTL:                  durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),
 		EmailProvider:               strEnv("EMAIL_PROVIDER", strEnv("RESEARCH_EMAIL_PROVIDER", "log")),
 		EmailFrom:                   firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),

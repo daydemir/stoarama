@@ -59,7 +59,7 @@ services:
       - key: EMAIL_PROVIDER
         value: resend
       - key: MAGIC_LINK_TTL
-        value: 20m
+        value: 60m
       - key: SESSION_TTL
         value: 720h
       - key: EMAIL_FROM

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -116,6 +117,16 @@ func TestHandleAccountAuthCompleteCanonicalizesBeforeTokenUse(t *testing.T) {
 	want := "https://stoarama.com/auth/complete?token=abc123"
 	if got := rr.Header().Get("Location"); got != want {
 		t.Fatalf("location=%q want %q", got, want)
+	}
+}
+
+func TestAccountHTMLShowsExpiredLinkMessage(t *testing.T) {
+	html, err := os.ReadFile("../../web/account.html")
+	if err != nil {
+		t.Fatalf("read account html: %v", err)
+	}
+	if !strings.Contains(string(html), "That sign-in link expired. Request a new link.") {
+		t.Fatalf("account html missing expired-link message")
 	}
 }
 
