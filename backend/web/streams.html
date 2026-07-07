@@ -1653,7 +1653,8 @@
       <div class="domain-intro-copy">Recording is <b>$0.05</b> per recording-hour, plus your choice of storage.</div>
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
-      <button type="button" class="source-seg-btn active" data-source-seg="recordable" role="tab" aria-selected="true">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
+      <button type="button" class="source-seg-btn active" data-source-seg="all" role="tab" aria-selected="true">All<span class="seg-count" data-seg-count="all"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="recordable" role="tab" aria-selected="false">Recordable<span class="seg-count" data-seg-count="recordable"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube<span class="seg-count" data-seg-count="youtube"></span></button>
     </div>
@@ -2043,7 +2044,7 @@ let selectedPipelineID = '';
 let selectedPipelineExperimentID = 0;
 let streamTouchedPipelineID = '';
 let detailStreamID = null;
-let streamSourceSegment = 'recordable';
+let streamSourceSegment = 'all';
 let detailView = 'inference';
 let detailMainView = 'details';
 let detailData = null;
@@ -2069,8 +2070,8 @@ let streamAllTotal = null;
 let streamPage = 1;
 let streamsView = 'table';      // 'table' | 'map'
 let streamPageSize = Number(localStorage.getItem('streamPageSize') || '100');
-let streamSortBy = 'name';
-let streamSortDir = 'asc';
+let streamSortBy = 'survey_last_person_count';
+let streamSortDir = 'desc';
 let overviewStreamsTotal = 0;
 let overviewRecordingOn = 0;
 if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
@@ -2111,11 +2112,8 @@ let detailClipViewMode = CLIP_VIEW_MODE.RANGE;
 let detailClipAvailability = null;
 let pendingClipRangeFrom = '';
 let pendingClipRangeTo = '';
-// Detection stats (avg_people_per_inferenced_capture) are de-wired, so the browse
-// defaults to the stream name (a live, visible sortable header) instead of the
-// empty inference column. Detection sort returns with the detection build (#47).
-const DEFAULT_STREAM_SORT_BY = 'name';
-const DEFAULT_STREAM_SORT_DIR = 'asc';
+const DEFAULT_STREAM_SORT_BY = 'survey_last_person_count';
+const DEFAULT_STREAM_SORT_DIR = 'desc';
 
 function detectTimezoneLabel() {
   try {
@@ -3402,6 +3400,7 @@ async function resetStreamFilters() {
   streamSortBy = DEFAULT_STREAM_SORT_BY;
   streamSortDir = DEFAULT_STREAM_SORT_DIR;
   streamPage = 1;
+  applySourceSegment('all');
   setStreamsView('table');
   await reloadStreamsForFilterChange({ reloadAllOptions: true });
 }
@@ -4669,11 +4668,15 @@ function applyDetailRouteStateFromURL() {
 function syncStreamListURL(opts = {}) {
   if (currentStreamRoute !== STREAM_ROUTE.LIST) return;
   const params = buildStreamFilterParams();
-  if (streamSortBy) params.set('sort_by', String(streamSortBy));
-  if (streamSortDir) params.set('sort_dir', normalizeSortDir(streamSortDir, 'desc'));
+  const sortBy = String(streamSortBy || DEFAULT_STREAM_SORT_BY);
+  const sortDir = normalizeSortDir(streamSortDir, DEFAULT_STREAM_SORT_DIR);
+  if (sortBy !== DEFAULT_STREAM_SORT_BY) params.set('sort_by', sortBy);
+  if (sortDir !== DEFAULT_STREAM_SORT_DIR) params.set('sort_dir', sortDir);
   if (streamsView === 'table') {
-    params.set('page', String(Math.max(1, Math.floor(Number(streamPage) || 1))));
-    params.set('page_size', String(Math.max(1, Math.floor(Number(streamPageSize) || 100))));
+    const page = Math.max(1, Math.floor(Number(streamPage) || 1));
+    const pageSize = Math.max(1, Math.floor(Number(streamPageSize) || 100));
+    if (page !== 1) params.set('page', String(page));
+    if (pageSize !== 100) params.set('page_size', String(pageSize));
   }
   const qs = params.toString();
   updateHistoryURL(qs ? `/streams?${qs}` : '/streams', opts.replace === true);
@@ -5072,20 +5075,22 @@ function updateRecordBar() {
   if (count) count.textContent = String(n);
 }
 
-function applySourceSegment(seg) {
-  streamSourceSegment = (seg === 'youtube' || seg === 'still_image') ? seg : 'recordable';
+function applySourceSegment(seg, opts = {}) {
+  streamSourceSegment = (seg === 'recordable' || seg === 'youtube' || seg === 'still_image') ? seg : 'all';
+  const preserveFilters = Boolean(opts && opts.preserveFilters);
   // Drive the existing filter state that buildStreamFilterParams reads. YouTube
   // and Still image are exact capture types; Recordable clears capture_type and
   // lets buildStreamFilterParams add recordable=1 (HLS + direct HTTP video).
-  sourceFilter.value = '';
+  if (!preserveFilters) sourceFilter.value = '';
   if (streamSourceSegment === 'youtube') {
     streamModeFilter.value = 'youtube_watch';
     koreaRegionFilter.value = '';
   } else if (streamSourceSegment === 'still_image') {
     streamModeFilter.value = 'still_image';
     koreaRegionFilter.value = '';
-  } else {
+  } else if (!preserveFilters) {
     streamModeFilter.value = '';
+    if (streamSourceSegment === 'all') koreaRegionFilter.value = '';
   }
   if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === 'recordable' ? '' : 'none';
   const seg2 = document.getElementById('streamSourceSegment');
@@ -5124,10 +5129,12 @@ async function loadStreamSegmentCounts() {
     if (el) el.textContent = fmt(n);
   };
   const totalFor = async (qs) => {
-    const payload = await fetchJSON(`/api/v1/dashboard/streams?limit=1&${qs}`);
+    const suffix = qs ? `&${qs}` : '';
+    const payload = await fetchJSON(`/api/v1/dashboard/streams?limit=1${suffix}`);
     return Number(payload && payload.total) || 0;
   };
   const jobs = [
+    ['all', ''],
     ['recordable', 'recordable=1'],
     ['still_image', 'capture_type=still_image'],
     ['youtube', 'capture_type=youtube_watch'],
@@ -6355,9 +6362,11 @@ async function applyStreamsRouteState(opts = {}) {
   showPanel('streams');
   setStreamsView(streamsView, { replaceURL: true });
   const initialCapture = normalizeCaptureTypeFilter(params.get('capture_type'));
-  const initialSourceSegment = initialCapture === 'youtube_watch' ? 'youtube'
-    : (initialCapture === 'still_image' ? 'still_image' : 'recordable');
-  applySourceSegment(initialSourceSegment);
+  const initialRecordable = params.get('recordable') === '1' || String(params.get('recordable') || '').toLowerCase() === 'true';
+  const initialSourceSegment = initialRecordable ? 'recordable'
+    : (initialCapture === 'youtube_watch' ? 'youtube'
+      : (initialCapture === 'still_image' ? 'still_image' : 'all'));
+  applySourceSegment(initialSourceSegment, { preserveFilters: true });
   void loadStreamSegmentCounts();
   await refreshAllStreamFilterOptions();
   await loadStreamsForActiveView({ replaceURL: true });

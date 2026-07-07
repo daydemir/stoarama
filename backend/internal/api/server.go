@@ -3485,7 +3485,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		"survey_last_person_count":          "det.survey_last_person",
 		"survey_last_vehicle_count":         "det.survey_last_vehicle",
 	}
-	orderExpr, _, sortDir, ok := parseSortQuery(w, r, orderColumns, "avg_people_per_inferenced_capture", "desc")
+	orderExpr, _, sortDir, ok := parseSortQuery(w, r, orderColumns, "survey_last_person_count", "desc")
 	if !ok {
 		return
 	}
