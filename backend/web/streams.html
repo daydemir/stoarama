@@ -1690,7 +1690,7 @@
     </div>
     <div class="source-segmented" id="streamSourceSegment" role="tablist" aria-label="Stream source">
       <button type="button" class="source-seg-btn active" data-source-seg="all" role="tab" aria-selected="true">All<span class="seg-count" data-seg-count="all"></span></button>
-      <button type="button" class="source-seg-btn" data-source-seg="hls" role="tab" aria-selected="false">HLS<span class="seg-count" data-seg-count="hls"></span></button>
+      <button type="button" class="source-seg-btn" data-source-seg="video" role="tab" aria-selected="false">Video<span class="seg-count" data-seg-count="video"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="youtube" role="tab" aria-selected="false">YouTube<span class="seg-count" data-seg-count="youtube"></span></button>
       <button type="button" class="source-seg-btn" data-source-seg="still_image" role="tab" aria-selected="false">Still image<span class="seg-count" data-seg-count="still_image"></span></button>
     </div>
@@ -1731,10 +1731,16 @@
           </select>
         </div>
         <div class="filter-field">
+          <div class="filter-field-label">Source type</div>
+          <label class="check-label"><input type="checkbox" data-source-type-filter="hls" /> HLS</label>
+          <label class="check-label"><input type="checkbox" data-source-type-filter="http_video" /> Direct Video</label>
+          <label class="check-label"><input type="checkbox" data-source-type-filter="youtube_watch" /> YouTube</label>
+          <label class="check-label"><input type="checkbox" data-source-type-filter="still_image" /> Still Image</label>
+        </div>
+        <div class="filter-field">
           <div class="filter-field-label">Seen</div>
           <label class="check-label"><input type="checkbox" id="seenPeopleFilter" /> Has people</label>
           <label class="check-label"><input type="checkbox" id="seenVehiclesFilter" /> Has vehicles</label>
-          <label class="check-label"><input type="checkbox" id="includeStillImageFilter" /> Include still image</label>
         </div>
       </div>
       <div class="filter-footer">
@@ -1946,7 +1952,7 @@ const streamRecordingStateFilter = $('streamRecordingState');
 const streamModeFilter = $('streamModeFilter');
 const sourceFilter = $('sourceFilter');
 const providerFilter = $('providerFilter');
-const includeStillImageFilter = $('includeStillImageFilter');
+const sourceTypeFilterInputs = Array.from(document.querySelectorAll('input[data-source-type-filter]'));
 const koreaRegionField = $('koreaRegionField');
 const koreaRegionFilter = $('koreaRegionFilter');
 const countryFilter = $('countryFilter');
@@ -2148,7 +2154,58 @@ let detailClipOffset = 0;
 const detailClipLimit = 25;
 const CLIP_VIEW_MODE = Object.freeze({ RANGE: 'range', LINEAR: 'linear' });
 const CLIP_RANGE_MAX_MS = 4 * 60 * 60 * 1000;
-const SOURCE_SEGMENT = Object.freeze({ ALL: 'all', HLS: 'hls', YOUTUBE: 'youtube', STILL: 'still_image' });
+const SOURCE_SEGMENT = Object.freeze({ ALL: 'all', VIDEO: 'video', YOUTUBE: 'youtube', STILL: 'still_image' });
+const SOURCE_TYPE = Object.freeze({
+  HLS: 'hls',
+  DIRECT_VIDEO: 'http_video',
+  YOUTUBE: 'youtube_watch',
+  STILL_IMAGE: 'still_image',
+});
+const SOURCE_TYPE_ORDER = Object.freeze([
+  SOURCE_TYPE.HLS,
+  SOURCE_TYPE.DIRECT_VIDEO,
+  SOURCE_TYPE.YOUTUBE,
+  SOURCE_TYPE.STILL_IMAGE,
+]);
+const SOURCE_SEGMENT_TYPES = Object.freeze({
+  [SOURCE_SEGMENT.ALL]: Object.freeze([SOURCE_TYPE.HLS, SOURCE_TYPE.DIRECT_VIDEO, SOURCE_TYPE.YOUTUBE]),
+  [SOURCE_SEGMENT.VIDEO]: Object.freeze([SOURCE_TYPE.HLS, SOURCE_TYPE.DIRECT_VIDEO]),
+  [SOURCE_SEGMENT.YOUTUBE]: Object.freeze([SOURCE_TYPE.YOUTUBE]),
+  [SOURCE_SEGMENT.STILL]: Object.freeze([SOURCE_TYPE.STILL_IMAGE]),
+});
+let selectedSourceTypes = new Set(SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL]);
+
+function normalizeSourceTypes(rawTypes) {
+  const raw = Array.isArray(rawTypes) ? rawTypes : String(rawTypes || '').split(',');
+  const allowed = new Set(SOURCE_TYPE_ORDER);
+  const out = [];
+  for (const item of raw) {
+    const value = String(item || '').trim().toLowerCase();
+    if (allowed.has(value) && !out.includes(value)) out.push(value);
+  }
+  return out;
+}
+
+function selectedSourceTypeList() {
+  return SOURCE_TYPE_ORDER.filter((type) => selectedSourceTypes.has(type));
+}
+
+function sourceTypeListsEqual(a, b) {
+  return normalizeSourceTypes(a).join(',') === normalizeSourceTypes(b).join(',');
+}
+
+function setSelectedSourceTypes(types) {
+  const normalized = normalizeSourceTypes(types);
+  selectedSourceTypes = new Set(normalized.length ? normalized : SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL]);
+  syncSourceTypeFilters();
+}
+
+function syncSourceTypeFilters() {
+  sourceTypeFilterInputs.forEach((input) => {
+    const type = String(input.getAttribute('data-source-type-filter') || '').trim();
+    input.checked = selectedSourceTypes.has(type);
+  });
+}
 let detailClipViewMode = CLIP_VIEW_MODE.RANGE;
 let detailClipAvailability = null;
 let pendingClipRangeFrom = '';
@@ -3480,7 +3537,6 @@ async function resetStreamFilters() {
   streamTouchedPipelineID = '';
   seenPeopleFilter.checked = false;
   seenVehiclesFilter.checked = false;
-  if (includeStillImageFilter) includeStillImageFilter.checked = false;
   streamSortBy = DEFAULT_STREAM_SORT_BY;
   streamSortDir = DEFAULT_STREAM_SORT_DIR;
   streamPage = 1;
@@ -4409,13 +4465,15 @@ async function loadDiscoveryCandidates() {
 }
 
 // ─── Location filters ─────────────────────────────────────────────────────────
-function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false) {
+function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, captureTypes = []) {
   const params = new URLSearchParams();
   const normalizedRecordingState = normalizeRecordingStateFilter(recordingState);
   const normalizedCaptureType = normalizeCaptureTypeFilter(captureType);
+  const normalizedCaptureTypes = normalizeSourceTypes(captureTypes);
   if (normalizedRecordingState) params.set('recording_state', normalizedRecordingState);
   else if (scope === 'recorded' || scope === 'recording') params.set('recording_state', 'on');
   if (normalizedCaptureType) params.set('capture_type', normalizedCaptureType);
+  if (normalizedCaptureTypes.length) params.set('capture_types', normalizedCaptureTypes.join(','));
   if (String(tagsCSV || '').trim()) params.set('tags', String(tagsCSV).trim());
   if (String(tagsNotCSV || '').trim()) params.set('tags_not', String(tagsNotCSV).trim());
   if (String(country || '').trim()) params.set('country', String(country).trim());
@@ -4430,11 +4488,10 @@ function buildDashboardSelectParams(scope, tagsCSV = '', recordingState = '', ta
 }
 
 function streamOptionScope() {
-  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.HLS ? String(koreaRegionFilter.value || '').trim() : '';
+  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? String(koreaRegionFilter.value || '').trim() : '';
   return {
-    captureType: streamSourceSegment === SOURCE_SEGMENT.YOUTUBE
-      ? 'youtube_watch'
-      : (streamSourceSegment === SOURCE_SEGMENT.STILL ? 'still_image' : (streamSourceSegment === SOURCE_SEGMENT.HLS ? 'hls' : normalizeCaptureTypeFilter(streamModeFilter.value))),
+    captureType: '',
+    captureTypes: selectedSourceTypeList(),
     koreaFamily,
     recordable: false,
   };
@@ -4507,9 +4564,9 @@ function populateCaptureTypeOptions(selectEl, allLabel) {
   if (!prev) selectEl.value = '';
 }
 
-async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
+async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily, recordable);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily, recordable, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/countries?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4522,9 +4579,9 @@ async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingSt
   else if (!prev) targetSelect.value = '';
 }
 
-async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
+async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
   const prev = targetSelect.value || '';
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily, recordable);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily, recordable, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/cities?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4549,10 +4606,10 @@ function populateKoreaRegionOptions() {
   else koreaRegionFilter.value = '';
 }
 
-async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '', recordable = false, requestToken = 0) {
+async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
   if (!(targetSelect instanceof HTMLSelectElement)) return;
   const prev = String(targetSelect.value || '').trim();
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily, recordable);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily, recordable, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/providers?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4565,9 +4622,9 @@ async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingS
   else if (!prev) targetSelect.value = '';
 }
 
-async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0) {
+async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', recordable = false, requestToken = 0, captureTypes = []) {
   const prev = String(targetSelect.value || '').trim().toLowerCase();
-  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily, recordable);
+  const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily, recordable, captureTypes);
   const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`);
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
@@ -4693,14 +4750,15 @@ function buildStreamFilterParams() {
   updateStreamFilterSummary();
   const recordingState = normalizeRecordingStateFilter(streamRecordingStateFilter.value);
   const captureType = normalizeCaptureTypeFilter(streamModeFilter.value);
-  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.HLS ? String(koreaRegionFilter.value || '').trim() : '';
+  const sourceTypes = selectedSourceTypeList();
+  const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? String(koreaRegionFilter.value || '').trim() : '';
   if (recordingState) params.set('recording_state', recordingState);
   if (captureType) params.set('capture_type', captureType);
+  if (sourceTypes.length) params.set('capture_types', sourceTypes.join(','));
   if (streamSearch.value.trim()) params.set('q', streamSearch.value.trim());
   if (streamTagFilter.value.trim()) params.set('tags', streamTagFilter.value.trim());
   if (streamTagExcludeFilter.value.trim()) params.set('tags_not', streamTagExcludeFilter.value.trim());
-  if (streamSourceSegment === SOURCE_SEGMENT.HLS) {
-    params.set('capture_type', 'hls');
+  if (streamSourceSegment === SOURCE_SEGMENT.VIDEO) {
     if (koreaFamily) params.set('korea_family', normalizeKoreaFamily(koreaFamily) || 'all');
   } else if (sourceFilter.value.trim()) {
     params.set('source', sourceFilter.value.trim());
@@ -4711,12 +4769,6 @@ function buildStreamFilterParams() {
   if (String(streamTouchedPipelineID || '').trim()) params.set('touched_pipeline_id', String(streamTouchedPipelineID).trim());
   if (seenPeopleFilter.checked) params.set('seen_people', '1');
   if (seenVehiclesFilter.checked) params.set('seen_vehicles', '1');
-  if (streamSourceSegment === SOURCE_SEGMENT.ALL && !(includeStillImageFilter && includeStillImageFilter.checked)) {
-    params.set('hide_still_image', '1');
-  }
-  if (streamSourceSegment === SOURCE_SEGMENT.ALL && includeStillImageFilter && includeStillImageFilter.checked) {
-    params.set('include_still_image', '1');
-  }
   return params;
 }
 
@@ -4735,7 +4787,9 @@ function applyStreamListStateFromURL(params) {
   streamTouchedPipelineID = String(params.get('touched_pipeline_id') || '').trim();
   seenPeopleFilter.checked = params.get('seen_people') === '1' || params.get('seen_people') === 'true';
   seenVehiclesFilter.checked = params.get('seen_vehicles') === '1' || params.get('seen_vehicles') === 'true';
-  if (includeStillImageFilter) includeStillImageFilter.checked = params.get('include_still_image') === '1' || params.get('include_still_image') === 'true';
+  if (params.has('capture_types')) {
+    setSelectedSourceTypes(params.get('capture_types'));
+  }
 
   const sortBy = String(params.get('sort_by') || '').trim();
   streamSortBy = sortBy || DEFAULT_STREAM_SORT_BY;
@@ -4759,8 +4813,9 @@ function applyDetailRouteStateFromURL() {
 function syncStreamListURL(opts = {}) {
   if (currentStreamRoute !== STREAM_ROUTE.LIST) return;
   const params = buildStreamFilterParams();
-  params.delete('hide_still_image');
-  if (streamSourceSegment !== SOURCE_SEGMENT.ALL) params.delete('include_still_image');
+  if (sourceTypeListsEqual(selectedSourceTypeList(), SOURCE_SEGMENT_TYPES[streamSourceSegment] || SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL])) {
+    params.delete('capture_types');
+  }
   const sortBy = String(streamSortBy || DEFAULT_STREAM_SORT_BY);
   const sortDir = normalizeSortDir(streamSortDir, DEFAULT_STREAM_SORT_DIR);
   if (sortBy !== DEFAULT_STREAM_SORT_BY) params.set('sort_by', sortBy);
@@ -4798,6 +4853,7 @@ async function refreshAllStreamFilterOptions() {
     providerFilter.value,
     optionScope.koreaFamily,
     optionScope.recordable,
+    optionScope.captureTypes,
   );
   await Promise.all([
     loadKnownStreamTagsSafe('all', tagParams, requestToken),
@@ -4814,6 +4870,7 @@ async function refreshAllStreamFilterOptions() {
       optionScope.koreaFamily,
       optionScope.recordable,
       requestToken,
+      optionScope.captureTypes,
     ),
     loadProviderOptions(
       providerFilter,
@@ -4828,6 +4885,7 @@ async function refreshAllStreamFilterOptions() {
       optionScope.koreaFamily,
       optionScope.recordable,
       requestToken,
+      optionScope.captureTypes,
     ),
     loadCountryOptions(
       countryFilter,
@@ -4841,6 +4899,7 @@ async function refreshAllStreamFilterOptions() {
       optionScope.koreaFamily,
       optionScope.recordable,
       requestToken,
+      optionScope.captureTypes,
     ),
     loadCityOptions(
       cityFilter,
@@ -4855,6 +4914,7 @@ async function refreshAllStreamFilterOptions() {
       optionScope.koreaFamily,
       optionScope.recordable,
       requestToken,
+      optionScope.captureTypes,
     ),
   ]);
   if (requestToken !== streamFilterOptionsToken) return;
@@ -5173,25 +5233,20 @@ function updateRecordBar() {
 
 function applySourceSegment(seg, opts = {}) {
   const rawSeg = String(seg || '').trim();
-  const normalizedSeg = rawSeg === 'recordable' || rawSeg === 'video' ? SOURCE_SEGMENT.HLS : rawSeg;
-  streamSourceSegment = (normalizedSeg === SOURCE_SEGMENT.HLS || normalizedSeg === SOURCE_SEGMENT.YOUTUBE || normalizedSeg === SOURCE_SEGMENT.STILL) ? normalizedSeg : SOURCE_SEGMENT.ALL;
+  const normalizedSeg = rawSeg === 'recordable' || rawSeg === 'hls' ? SOURCE_SEGMENT.VIDEO : rawSeg;
+  streamSourceSegment = (normalizedSeg === SOURCE_SEGMENT.VIDEO || normalizedSeg === SOURCE_SEGMENT.YOUTUBE || normalizedSeg === SOURCE_SEGMENT.STILL) ? normalizedSeg : SOURCE_SEGMENT.ALL;
   const preserveFilters = Boolean(opts && opts.preserveFilters);
+  if (!(opts && opts.preserveSourceTypes)) {
+    setSelectedSourceTypes(SOURCE_SEGMENT_TYPES[streamSourceSegment] || SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL]);
+  } else {
+    syncSourceTypeFilters();
+  }
   if (!preserveFilters) sourceFilter.value = '';
-  if (streamSourceSegment === SOURCE_SEGMENT.YOUTUBE) {
-    streamModeFilter.value = 'youtube_watch';
-    koreaRegionFilter.value = '';
-  } else if (streamSourceSegment === SOURCE_SEGMENT.STILL) {
-    streamModeFilter.value = 'still_image';
-    koreaRegionFilter.value = '';
-  } else if (!preserveFilters) {
+  if (!preserveFilters) {
     streamModeFilter.value = '';
-    if (streamSourceSegment === SOURCE_SEGMENT.ALL) koreaRegionFilter.value = '';
+    if (streamSourceSegment !== SOURCE_SEGMENT.VIDEO) koreaRegionFilter.value = '';
   }
-  if (includeStillImageFilter) {
-    const includeStillLabel = includeStillImageFilter.closest('label');
-    if (includeStillLabel) includeStillLabel.style.display = streamSourceSegment === SOURCE_SEGMENT.ALL ? '' : 'none';
-  }
-  if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === SOURCE_SEGMENT.HLS ? '' : 'none';
+  if (koreaRegionField) koreaRegionField.style.display = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? '' : 'none';
   const seg2 = document.getElementById('streamSourceSegment');
   if (seg2) {
     seg2.querySelectorAll('.source-seg-btn').forEach((b) => {
@@ -5233,8 +5288,8 @@ async function loadStreamSegmentCounts() {
     return Number(payload && payload.total) || 0;
   };
   const jobs = [
-    ['all', 'hide_still_image=1'],
-    ['hls', 'capture_type=hls'],
+    ['all', 'capture_types=hls,http_video,youtube_watch'],
+    ['video', 'capture_types=hls,http_video'],
     ['still_image', 'capture_type=still_image'],
     ['youtube', 'capture_type=youtube_watch'],
   ];
@@ -6284,11 +6339,16 @@ seenPeopleFilter.addEventListener('change', async () => {
 seenVehiclesFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: false });
 });
-if (includeStillImageFilter) {
-  includeStillImageFilter.addEventListener('change', async () => {
+sourceTypeFilterInputs.forEach((input) => {
+  input.addEventListener('change', async () => {
+    selectedSourceTypes = new Set(sourceTypeFilterInputs
+      .filter((it) => it.checked)
+      .map((it) => String(it.getAttribute('data-source-type-filter') || '').trim())
+      .filter(Boolean));
+    if (selectedSourceTypes.size === 0) setSelectedSourceTypes(SOURCE_SEGMENT_TYPES[SOURCE_SEGMENT.ALL]);
     await reloadStreamsForFilterChange({ reloadAllOptions: true });
   });
-}
+});
 
 // Pagination
 streamPageSizeEl.addEventListener('change', async () => {
@@ -6503,10 +6563,10 @@ async function applyStreamsRouteState(opts = {}) {
   setStreamsView(streamsView, { replaceURL: true });
   const initialCapture = normalizeCaptureTypeFilter(params.get('capture_type'));
   const initialRecordable = params.get('recordable') === '1' || String(params.get('recordable') || '').toLowerCase() === 'true';
-  const initialSourceSegment = initialRecordable || initialCapture === 'hls' ? SOURCE_SEGMENT.HLS
+  const initialSourceSegment = initialRecordable || initialCapture === 'hls' || initialCapture === 'http_video' ? SOURCE_SEGMENT.VIDEO
     : (initialCapture === 'youtube_watch' ? SOURCE_SEGMENT.YOUTUBE
       : (initialCapture === 'still_image' ? SOURCE_SEGMENT.STILL : SOURCE_SEGMENT.ALL));
-  applySourceSegment(initialSourceSegment, { preserveFilters: true });
+  applySourceSegment(initialSourceSegment, { preserveFilters: true, preserveSourceTypes: params.has('capture_types') });
   void loadStreamSegmentCounts();
   await refreshAllStreamFilterOptions();
   await loadStreamsForActiveView({ replaceURL: true });

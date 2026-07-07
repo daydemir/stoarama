@@ -69,6 +69,44 @@ func TestDashboardBuildStreamWhereRecordableFilter(t *testing.T) {
 	}
 }
 
+func TestDashboardBuildStreamWhereCaptureTypesFilter(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?capture_types=hls,http_video,youtube_watch", nil)
+	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
+		IncludeCaptureMode: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := len(args), 1; got != want {
+		t.Fatalf("args len=%d want=%d", got, want)
+	}
+	got, ok := args[0].([]string)
+	if !ok {
+		t.Fatalf("arg type=%T want []string", args[0])
+	}
+	want := []string{"hls", "http_video", "youtube_watch"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("capture_types=%v want %v", got, want)
+	}
+	sqlWhere := strings.Join(where, " AND ")
+	if !strings.Contains(sqlWhere, "s.capture_type = ANY($1::text[])") {
+		t.Fatalf("where missing capture_types predicate: %s", sqlWhere)
+	}
+}
+
+func TestDashboardBuildStreamWhereInvalidCaptureTypes(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?capture_types=hls,bad_mode", nil)
+	_, _, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{
+		IncludeCaptureMode: true,
+	})
+	if err == nil {
+		t.Fatalf("expected error for invalid capture_types")
+	}
+	if !strings.Contains(err.Error(), "invalid capture_type") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestDashboardBuildStreamWhereHideStillImageFilter(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?hide_still_image=1", nil)
 	where, args, err := dashboardBuildStreamWhereFromRequest(req, dashboardStreamWhereConfig{})

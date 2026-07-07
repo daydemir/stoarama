@@ -3347,6 +3347,7 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	koreaFamily := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("korea_family")))
 	youtubeChannel := strings.TrimSpace(r.URL.Query().Get("youtube_channel"))
 	captureModeRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("capture_type")))
+	captureModesRaw := dedupeStrings(strings.Split(strings.ToLower(r.URL.Query().Get("capture_types")), ","))
 	touchedPipelineID := strings.TrimSpace(r.URL.Query().Get("touched_pipeline_id"))
 	tags := dedupeStrings(strings.Split(r.URL.Query().Get("tags"), ","))
 	tagsNot := dedupeStrings(strings.Split(r.URL.Query().Get("tags_not"), ","))
@@ -3416,6 +3417,18 @@ func dashboardBuildStreamWhereFromRequest(r *http.Request, cfg dashboardStreamWh
 	if cfg.IncludeCaptureMode && captureModeRaw != "" {
 		args = append(args, captureType)
 		where = append(where, fmt.Sprintf("s.capture_type=$%d", len(args)))
+	}
+	if cfg.IncludeCaptureMode && len(captureModesRaw) > 0 {
+		captureTypes := make([]string, 0, len(captureModesRaw))
+		for _, raw := range captureModesRaw {
+			captureType, err := normalizeCaptureTypeInput(raw)
+			if err != nil {
+				return nil, nil, err
+			}
+			captureTypes = append(captureTypes, captureType)
+		}
+		args = append(args, captureTypes)
+		where = append(where, fmt.Sprintf("s.capture_type = ANY($%d::text[])", len(args)))
 	}
 	// recordable=1 restricts to the source kinds the recorder can actually
 	// capture (live HLS and direct HTTP(S) video). It is what the streams browse
