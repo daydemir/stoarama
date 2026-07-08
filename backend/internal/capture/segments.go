@@ -72,6 +72,10 @@ func SegmentCaptureTimeout(duration time.Duration) time.Duration {
 // the Source/native path, which stream-copies and preserves the source fps with
 // no re-encode (the cheap default).
 func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int) (Segment, error) {
+	return CaptureSegmentWithHeaders(ctx, sourceURL, duration, pinHost, targetFPS, "")
+}
+
+func CaptureSegmentWithHeaders(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int, inputHeaders string) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
 	}
@@ -86,7 +90,7 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
-	args := buildFFmpegSegmentArgs(sourceURL, outPath, duration, pinHost, targetFPS)
+	args := buildFFmpegSegmentArgsWithHeaders(sourceURL, outPath, duration, pinHost, targetFPS, inputHeaders)
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -176,6 +180,10 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 // pinHost mirrors CaptureSegment (HTTP Host override for the IP-pinned path);
 // pass "" to let ffmpeg derive Host/SNI from the URL.
 func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error) error {
+	return CaptureContinuousWithHeaders(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, "")
+}
+
+func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
@@ -190,7 +198,7 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 	}
 
 	outPattern := filepath.Join(outDir, "seg-%Y%m%d-%H%M%S.mp4")
-	args := buildFFmpegContinuousArgs(sourceURL, outPattern, clipDuration, pinHost, targetFPS)
+	args := buildFFmpegContinuousArgsWithHeaders(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders)
 	cmd := exec.Command(ffmpegBin(), args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -387,13 +395,17 @@ func parseSegmentStart(name string) (time.Time, error) {
 // forks) but swaps the single-clip -t for the segment muxer, so one persistent
 // ffmpeg writes a finalized .mp4 every clipDuration with no reconnect gap.
 func buildFFmpegContinuousArgs(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int) []string {
+	return buildFFmpegContinuousArgsWithHeaders(sourceURL, outPattern, clipDuration, pinHost, targetFPS, "")
+}
+
+func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int, inputHeaders string) []string {
 	seconds := strconv.FormatFloat(clipDuration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
 		"-nostdin",
 		"-loglevel", "error",
 	}
-	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10, pinHost)
+	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, true, 10, pinHost, inputHeaders)
 	args = append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", sourceURL,
@@ -442,11 +454,15 @@ func buildFFmpegContinuousArgs(sourceURL string, outPattern string, clipDuration
 // non-zero exit returns the same clean message. The ffmpeg stderr is never
 // interpolated, so an IP-rewritten or low-level error can never surface to the UI.
 func ProbeReachable(ctx context.Context, sourceURL string, pinHost string) error {
+	return ProbeReachableWithHeaders(ctx, sourceURL, pinHost, "")
+}
+
+func ProbeReachableWithHeaders(ctx context.Context, sourceURL string, pinHost string, inputHeaders string) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
 	args := []string{"-nostdin", "-loglevel", "error"}
-	args = appendFFmpegHTTPInputArgs(args, sourceURL, false, 0, pinHost)
+	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, false, 0, pinHost, inputHeaders)
 	args = append(args,
 		"-i", sourceURL,
 		"-map", "0:v:0",
@@ -484,6 +500,10 @@ const SingleFrameSegmentDuration = 2 * time.Second
 // fails fast. On failure the underlying ffmpeg CombinedOutput is wrapped into
 // the error so the real stderr is visible to verification.
 func CaptureSingleFrame(ctx context.Context, sourceURL string, pinHost string) (Frame, error) {
+	return CaptureSingleFrameWithHeaders(ctx, sourceURL, pinHost, "")
+}
+
+func CaptureSingleFrameWithHeaders(ctx context.Context, sourceURL string, pinHost string, inputHeaders string) (Frame, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Frame{}, fmt.Errorf("source_url is empty")
 	}
@@ -496,7 +516,7 @@ func CaptureSingleFrame(ctx context.Context, sourceURL string, pinHost string) (
 	// Step 1: record a short clip with -c copy (no decode -> no segfault). The
 	// survey path always uses Source/native (nil), so this stays a pure copy.
 	segPath := filepath.Join(tmpDir, "segment.mp4")
-	segArgs := buildFFmpegSegmentArgs(sourceURL, segPath, SingleFrameSegmentDuration, pinHost, nil)
+	segArgs := buildFFmpegSegmentArgsWithHeaders(sourceURL, segPath, SingleFrameSegmentDuration, pinHost, nil, inputHeaders)
 	segCmd := exec.CommandContext(ctx, ffmpegBin(), segArgs...)
 	if out, err := segCmd.CombinedOutput(); err != nil {
 		return Frame{}, fmt.Errorf("record single-frame segment: %w (%s)", err, strings.TrimSpace(string(out)))
@@ -563,13 +583,17 @@ func RemoveSegmentFile(seg Segment) {
 }
 
 func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Duration, pinHost string, targetFPS *int) []string {
+	return buildFFmpegSegmentArgsWithHeaders(sourceURL, outPath, duration, pinHost, targetFPS, "")
+}
+
+func buildFFmpegSegmentArgsWithHeaders(sourceURL string, outPath string, duration time.Duration, pinHost string, targetFPS *int, inputHeaders string) []string {
 	seconds := strconv.FormatFloat(duration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
 		"-nostdin",
 		"-loglevel", "error",
 	}
-	args = appendFFmpegHTTPInputArgs(args, sourceURL, true, 10, pinHost)
+	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, true, 10, pinHost, inputHeaders)
 	args = append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", sourceURL,

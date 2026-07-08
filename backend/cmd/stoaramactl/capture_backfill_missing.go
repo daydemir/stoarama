@@ -219,7 +219,12 @@ func processCaptureBackfillMissingTarget(
 
 	capCtx, cancelCap := context.WithTimeout(ctx, timeout)
 	defer cancelCap()
-	frame, err := capture.CaptureFrame(capCtx, resolved.URL)
+	var frame capture.Frame
+	if resolved.IsImage {
+		frame, err = capture.CaptureFrame(capCtx, resolved.URL)
+	} else {
+		frame, err = capture.CaptureSingleFrameWithHeaders(capCtx, resolved.URL, "", resolved.InputHeaders)
+	}
 	if err != nil {
 		result.Status = "error"
 		result.Reason = fmt.Sprintf("capture frame: %v", err)

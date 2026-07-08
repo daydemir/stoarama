@@ -47,6 +47,7 @@ type ResolvedSource struct {
 	IsImage      bool
 	RefreshAfter time.Duration
 	Mode         Mode
+	InputHeaders string
 }
 
 type EmitFrameFunc func(ctx context.Context, frame Frame, capturedAt time.Time) error

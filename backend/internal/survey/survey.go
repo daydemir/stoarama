@@ -218,7 +218,7 @@ func CaptureFrame(ctx context.Context, registry *capture.Registry, t Target, res
 	if resolved.IsImage {
 		frame, err = capture.CaptureFrame(capCtx, resolved.URL)
 	} else {
-		frame, err = capture.CaptureSingleFrame(capCtx, resolved.URL, "")
+		frame, err = capture.CaptureSingleFrameWithHeaders(capCtx, resolved.URL, "", resolved.InputHeaders)
 	}
 	if err != nil {
 		return capture.Frame{}, fmt.Errorf("capture frame for stream %d: %w", t.ID, err)

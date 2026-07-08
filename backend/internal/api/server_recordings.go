@@ -567,10 +567,11 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// so the server-side resolve + SSRF classify + ffmpeg reachability probe are all
 	// SKIPPED for capture_via='relay'. The raw reference is stored as-is and the relay
 	// re-resolves it fresh on every capture; source_kind='auto' lets the relay's
-	// capture layer classify the source at run time. Cloud recordings keep the exact
-	// resolve/validate/probe path they had before (byte-identical).
+	// capture layer classify the source at run time. Cloud recordings keep the same
+	// resolve/validate/probe flow, with provider headers carried when required.
 	var (
 		resolvedForProbe string
+		inputHeaders     string
 		validatedIP      net.IP
 		sourceKind       string
 	)
@@ -581,7 +582,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		// playable URL before validating/probing, so a reference ffmpeg cannot open
 		// directly can still be scheduled. The raw reference is what gets stored
 		// (below); the worker re-resolves it fresh on every capture.
-		resolvedForProbe, err = resolveRecordingStreamURL(r.Context(), catalogProvider, streamURL, catalogSourcePageURL)
+		resolvedForProbe, inputHeaders, err = resolveRecordingStreamURL(r.Context(), catalogProvider, streamURL, catalogSourcePageURL)
 		if err != nil {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
@@ -744,7 +745,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// be redirected by a DNS rebind between validation above and connect time. Skipped
 	// for relay recordings (the relay owns resolution + reachability at capture time).
 	if captureVia != "relay" {
-		if err := probeRecordingStreamReachable(r.Context(), resolvedForProbe, validatedIP); err != nil {
+		if err := probeRecordingStreamReachable(r.Context(), resolvedForProbe, validatedIP, inputHeaders); err != nil {
 			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream not reachable: %v", err))
 			return
 		}
@@ -1028,7 +1029,7 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 	if req.StreamID > 0 {
 		_ = s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &sourcePageURL)
 	}
-	resolved, err := resolveRecordingStreamURL(r.Context(), provider, streamURL, sourcePageURL)
+	resolved, inputHeaders, err := resolveRecordingStreamURL(r.Context(), provider, streamURL, sourcePageURL)
 	if err != nil {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -1038,7 +1039,7 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	if err := probeRecordingStreamReachable(r.Context(), resolved, validatedIP); err != nil {
+	if err := probeRecordingStreamReachable(r.Context(), resolved, validatedIP, inputHeaders); err != nil {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf("stream not reachable: %v", err)})
 		return
 	}
@@ -1973,11 +1974,11 @@ func validateRecordingStreamURL(streamURL string) (net.IP, string, error) {
 // routed CDNs; ValidatePublicURL has already rejected any host that resolves to a
 // private/metadata address. validatedIP is retained by the caller as the proof
 // the host resolved public.
-func probeRecordingStreamReachable(ctx context.Context, streamURL string, validatedIP net.IP) error {
+func probeRecordingStreamReachable(ctx context.Context, streamURL string, validatedIP net.IP, inputHeaders string) error {
 	_ = validatedIP
 	probeCtx, cancel := context.WithTimeout(ctx, recordingProbeTimeout)
 	defer cancel()
-	return capture.ProbeReachable(probeCtx, streamURL, "")
+	return capture.ProbeReachableWithHeaders(probeCtx, streamURL, "", inputHeaders)
 }
 
 // resolveRecordingStreamURL resolves a pasted stream reference (e.g. a KBS '!hls'
@@ -1987,17 +1988,17 @@ func probeRecordingStreamReachable(ctx context.Context, streamURL string, valida
 // capture.ResolveCaptureInput. Image sources are rejected (the recorder is
 // video-only). The stored reference is left untouched; the worker re-resolves it
 // fresh on every capture so expiring tokens never break a schedule.
-func resolveRecordingStreamURL(ctx context.Context, provider, streamURL, sourcePageURL string) (string, error) {
+func resolveRecordingStreamURL(ctx context.Context, provider, streamURL, sourcePageURL string) (string, string, error) {
 	resolveCtx, cancel := context.WithTimeout(ctx, recordingResolveTimeout)
 	defer cancel()
-	resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, provider, streamURL, sourcePageURL)
+	resolved, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, provider, streamURL, sourcePageURL)
 	if err != nil {
-		return "", fmt.Errorf("could not resolve stream reference: %w", err)
+		return "", "", fmt.Errorf("could not resolve stream reference: %w", err)
 	}
 	if isImage {
-		return "", fmt.Errorf("image sources are not supported for recording")
+		return "", "", fmt.Errorf("image sources are not supported for recording")
 	}
-	return resolved, nil
+	return resolved, inputHeaders, nil
 }
 
 // scanRecordingListRow scans one row of the list/get SELECT into the API payload.

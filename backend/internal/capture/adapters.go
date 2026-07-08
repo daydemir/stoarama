@@ -68,6 +68,19 @@ func (a *hlsLiveAdapter) Resolve(ctx context.Context, spec StreamSpec) (Resolved
 	if u == "" {
 		return ResolvedSource{}, fmt.Errorf("hls_live requires source_url or source_page_url")
 	}
+	if shouldResolveEarthCamPage(spec.Provider, spec.StreamURL, spec.SourcePageURL) {
+		resolved, err := resolveEarthCamManifestURL(ctx, spec.SourcePageURL, 20*time.Second)
+		if err != nil {
+			return ResolvedSource{}, err
+		}
+		return ResolvedSource{
+			URL:          resolved,
+			IsImage:      false,
+			RefreshAfter: 10 * time.Minute,
+			Mode:         ModeHLSLive,
+			InputHeaders: earthCamInputHeaders(spec.SourcePageURL),
+		}, nil
+	}
 	for range 3 {
 		lower := strings.ToLower(u)
 		if strings.Contains(lower, ".m3u8") {
@@ -196,7 +209,7 @@ func startFFmpegSession(ctx context.Context, spec StreamSpec, src ResolvedSource
 	pacer := newFramePacer(time.Duration(captureIntervalSec) * time.Second)
 	sessionCtx, cancelSession := context.WithCancel(ctx)
 	defer cancelSession()
-	cmdArgs := buildFFmpegSessionArgs(spec, src.URL, targetFPS)
+	cmdArgs := buildFFmpegSessionArgsWithHeaders(spec, src.URL, targetFPS, src.InputHeaders)
 	cmd := exec.CommandContext(sessionCtx, "ffmpeg", cmdArgs...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -315,6 +328,10 @@ func startFFmpegSession(ctx context.Context, spec StreamSpec, src ResolvedSource
 }
 
 func buildFFmpegSessionArgs(spec StreamSpec, srcURL string, targetFPS int) []string {
+	return buildFFmpegSessionArgsWithHeaders(spec, srcURL, targetFPS, "")
+}
+
+func buildFFmpegSessionArgsWithHeaders(spec StreamSpec, srcURL string, targetFPS int, inputHeaders string) []string {
 	cfg := spec.CaptureConfig
 	threads := GetConfigInt(cfg, "ffmpeg_threads", envInt("CAPTURE_FFMPEG_THREADS", 1))
 	if threads < 1 {
@@ -356,7 +373,7 @@ func buildFFmpegSessionArgs(spec StreamSpec, srcURL string, targetFPS int) []str
 	if hwaccel != "" {
 		args = append(args, "-hwaccel", hwaccel)
 	}
-	args = appendFFmpegHTTPInputArgs(args, srcURL, useReconnect, reconnectDelayMax, "")
+	args = appendFFmpegHTTPInputArgsWithHeaders(args, srcURL, useReconnect, reconnectDelayMax, "", inputHeaders)
 
 	args = append(args,
 		"-i", srcURL,

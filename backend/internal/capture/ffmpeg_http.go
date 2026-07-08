@@ -6,6 +6,10 @@ import (
 )
 
 func appendFFmpegHTTPInputArgs(args []string, sourceURL string, reconnect bool, reconnectDelayMax int, pinHost string) []string {
+	return appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, reconnect, reconnectDelayMax, pinHost, "")
+}
+
+func appendFFmpegHTTPInputArgsWithHeaders(args []string, sourceURL string, reconnect bool, reconnectDelayMax int, pinHost string, inputHeaders string) []string {
 	if !strings.HasPrefix(sourceURL, "http://") && !strings.HasPrefix(sourceURL, "https://") {
 		return args
 	}
@@ -26,8 +30,15 @@ func appendFFmpegHTTPInputArgs(args []string, sourceURL string, reconnect bool, 
 	// When a host override is supplied, carry it as the HTTP Host header so a
 	// virtual-hosted origin still routes correctly. Empty for the hostname path
 	// (ffmpeg derives Host and TLS SNI from the URL itself).
+	headers := strings.TrimRight(inputHeaders, "\r\n")
 	if pinHost != "" {
-		args = append(args, "-headers", "Host: "+pinHost+"\r\n")
+		headers = strings.TrimRight("Host: "+pinHost+"\r\n"+headers, "\r\n")
+	}
+	if strings.Contains(strings.ToLower(headers), "user-agent:") {
+		args = append(args, "-user_agent", earthCamUserAgent)
+	}
+	if headers != "" {
+		args = append(args, "-headers", headers+"\r\n")
 	}
 	if reconnect {
 		if reconnectDelayMax < 1 {

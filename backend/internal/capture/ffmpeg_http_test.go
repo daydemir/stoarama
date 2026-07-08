@@ -57,6 +57,21 @@ func TestAppendFFmpegHTTPInputArgsPinHost(t *testing.T) {
 	}
 }
 
+func TestAppendFFmpegHTTPInputArgsInputHeaders(t *testing.T) {
+	headers := "Referer: https://earthcam.com/example/\r\nUser-Agent: " + earthCamUserAgent + "\r\n"
+	args := appendFFmpegHTTPInputArgsWithHeaders(nil, "https://videos-3.earthcam.com/live.m3u8", false, 0, "", headers)
+	joined := make(map[string]string, len(args))
+	for i := 0; i+1 < len(args); i++ {
+		joined[args[i]] = args[i+1]
+	}
+	if joined["-user_agent"] != earthCamUserAgent {
+		t.Fatalf("expected user agent arg in %#v", args)
+	}
+	if joined["-headers"] != headers {
+		t.Fatalf("expected input headers, got %#v", args)
+	}
+}
+
 func TestAppendFFmpegHTTPInputArgsNonHTTP(t *testing.T) {
 	args := appendFFmpegHTTPInputArgs(nil, "rtsp://example.com/live", true, 10, "example.com")
 	if len(args) != 0 {

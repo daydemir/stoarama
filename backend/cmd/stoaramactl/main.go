@@ -340,7 +340,12 @@ func runCapture(ctx context.Context, cfg config.Config, args []string) {
 		capCtx, cancelCap := context.WithTimeout(ctx, time.Duration(*captureTimeoutSec)*time.Second)
 		defer cancelCap()
 		start := time.Now()
-		frame, err := capture.CaptureFrame(capCtx, resolved.URL)
+		var frame capture.Frame
+		if resolved.IsImage {
+			frame, err = capture.CaptureFrame(capCtx, resolved.URL)
+		} else {
+			frame, err = capture.CaptureSingleFrameWithHeaders(capCtx, resolved.URL, "", resolved.InputHeaders)
+		}
 		if err != nil {
 			log.Fatalf("capture frame: %v", err)
 		}
@@ -474,7 +479,12 @@ func runCapture(ctx context.Context, cfg config.Config, args []string) {
 						continue
 					}
 					item.ResolvedURL = resolved.URL
-					frame, err := capture.CaptureFrame(probeCtx, resolved.URL)
+					var frame capture.Frame
+					if resolved.IsImage {
+						frame, err = capture.CaptureFrame(probeCtx, resolved.URL)
+					} else {
+						frame, err = capture.CaptureSingleFrameWithHeaders(probeCtx, resolved.URL, "", resolved.InputHeaders)
+					}
 					cancel()
 					if err != nil {
 						item.Reason = err.Error()

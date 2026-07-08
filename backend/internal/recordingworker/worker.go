@@ -183,7 +183,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	// breaks a schedule. A direct .m3u8 passes through unchanged. The resolve fetch
 	// is SSRF-guarded inside ResolveCaptureInput.
 	resolveCtx, resolveCancel := context.WithTimeout(jobCtx, 30*time.Second)
-	sourceURL, isImage, err := capture.ResolveCaptureInput(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
+	sourceURL, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
 	resolveCancel()
 	if err != nil {
 		w.fail(ctx, job.JobID, fmt.Errorf("resolve source url: %w", err))
@@ -208,7 +208,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 	captureCtx, captureCancel := context.WithTimeout(jobCtx, capture.SegmentCaptureTimeout(clipDuration))
-	seg, err := capture.CaptureSegment(captureCtx, sourceURL, clipDuration, "", job.TargetFPS)
+	seg, err := capture.CaptureSegmentWithHeaders(captureCtx, sourceURL, clipDuration, "", job.TargetFPS, inputHeaders)
 	captureCancel()
 	if err != nil {
 		if canceled() {
@@ -363,7 +363,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// A transient resolve error backs off and retries rather than failing the
 		// job mid-window.
 		resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
-		resolved, isImage, err := capture.ResolveCaptureInput(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
+		resolved, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
 		resolveCancel()
 		if err != nil {
 			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
@@ -403,7 +403,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			w.fail(ctx, job.JobID, fmt.Errorf("mktemp continuous outdir: %w", err))
 			return
 		}
-		captureErr := capture.CaptureContinuous(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment)
+		captureErr := capture.CaptureContinuousWithHeaders(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment, inputHeaders)
 		os.RemoveAll(outDir)
 
 		// Window close vs premature drop: CaptureContinuous returns nil on ctx.Done,

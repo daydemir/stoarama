@@ -99,7 +99,7 @@ func ProbeStream(ctx context.Context, t Target, window, segment time.Duration) (
 	}
 
 	resolveCtx, cancelResolve := context.WithTimeout(ctx, 30*time.Second)
-	resolvedURL, isImage, err := capture.ResolveCaptureInput(resolveCtx, t.Provider, t.SourceURL, t.SourcePageURL)
+	resolvedURL, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, t.Provider, t.SourceURL, t.SourcePageURL)
 	cancelResolve()
 	if err != nil {
 		return Classify(Observation{OurErr: err.Error()}), fmt.Sprintf("resolve error: %v", err)
@@ -136,7 +136,7 @@ func ProbeStream(ctx context.Context, t Target, window, segment time.Duration) (
 		return nil
 	}
 
-	capErr := capture.CaptureContinuous(captureCtx, resolvedURL, segment, "", nil, tmpDir, onSegment)
+	capErr := capture.CaptureContinuousWithHeaders(captureCtx, resolvedURL, segment, "", nil, tmpDir, onSegment, inputHeaders)
 
 	// Distinguish OUR cancellation (parent ctx cancelled = process shutdown) from the
 	// window deadline (our own captureCtx timeout is expected and clean).

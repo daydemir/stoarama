@@ -17,16 +17,21 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/netguard"
 )
 
-// ResolveCaptureInput converts provider/page URLs into a direct capture input URL.
-// It mirrors legacy local behavior for providers like YouTube and KBS.
 func ResolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL string) (resolvedURL string, isImage bool, err error) {
+	resolvedURL, isImage, _, err = ResolveCaptureInputWithHeaders(ctx, provider, streamURL, sourcePageURL)
+	return resolvedURL, isImage, err
+}
+
+// ResolveCaptureInputWithHeaders converts provider/page URLs into a direct
+// capture input URL plus any HTTP headers ffmpeg needs to open it.
+func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, sourcePageURL string) (resolvedURL string, isImage bool, inputHeaders string, err error) {
 	provider = strings.ToUpper(strings.TrimSpace(provider))
 	streamURL = strings.TrimSpace(streamURL)
 	sourcePageURL = strings.TrimSpace(sourcePageURL)
 
 	if streamURL == "" {
 		if sourcePageURL == "" {
-			return "", false, fmt.Errorf("stream has no capture URL")
+			return "", false, "", fmt.Errorf("stream has no capture URL")
 		}
 		streamURL = sourcePageURL
 	}
@@ -34,39 +39,50 @@ func ResolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL
 	if isSkylineStream(provider, streamURL, sourcePageURL) && sourcePageURL != "" {
 		u, err := resolveSkylineManifestURL(ctx, sourcePageURL, 20*time.Second)
 		if err != nil {
-			return "", false, err
+			return "", false, "", err
 		}
 		if u == "" {
-			return "", false, fmt.Errorf("skyline source page did not contain a playable manifest")
+			return "", false, "", fmt.Errorf("skyline source page did not contain a playable manifest")
 		}
-		return u, false, nil
+		return u, false, "", nil
+	}
+
+	if shouldResolveEarthCamPage(provider, streamURL, sourcePageURL) {
+		u, err := resolveEarthCamManifestURL(ctx, sourcePageURL, 20*time.Second)
+		if err != nil {
+			return "", false, "", err
+		}
+		if u == "" {
+			return "", false, "", fmt.Errorf("earthcam source page did not contain a playable manifest")
+		}
+		return u, false, earthCamInputHeaders(sourcePageURL), nil
 	}
 
 	if provider == "KBS" && strings.Contains(streamURL, "!hls") {
 		if u, ok, err := resolveIndirectURL(ctx, streamURL, 20*time.Second); err != nil {
-			return "", false, err
+			return "", false, "", err
 		} else if ok {
-			return u, false, nil
+			return u, false, "", nil
 		}
 	}
 
 	if isYouTubeURL(streamURL) {
 		u, err := resolveYouTubeStreamURL(ctx, streamURL)
 		if err != nil {
-			return "", false, err
+			return "", false, "", err
 		}
-		return u, false, nil
+		return u, false, "", nil
 	}
 
 	if looksLikeImageURL(streamURL) {
-		return streamURL, true, nil
+		return streamURL, true, "", nil
 	}
 
 	if strings.Contains(streamURL, "!hls") {
 		if u, ok, err := resolveIndirectURL(ctx, streamURL, 20*time.Second); err != nil {
-			return "", false, err
+			return "", false, "", err
 		} else if ok {
-			return u, false, nil
+			return u, false, "", nil
 		}
 	}
 
@@ -75,10 +91,10 @@ func ResolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL
 	// (exit 183), so reject it here exactly as the survey path's
 	// hlsLiveAdapter.Resolve does, rather than silently passing the raw marker.
 	if hasIndirectMarker(streamURL) {
-		return "", false, fmt.Errorf("indirect stream reference did not resolve to a playable URL: %s", streamURL)
+		return "", false, "", fmt.Errorf("indirect stream reference did not resolve to a playable URL: %s", streamURL)
 	}
 
-	return streamURL, false, nil
+	return streamURL, false, "", nil
 }
 
 func isSkylineStream(provider, streamURL, sourcePageURL string) bool {
@@ -96,6 +112,30 @@ func isSkylineStream(provider, streamURL, sourcePageURL string) bool {
 		}
 	}
 	return false
+}
+
+func isEarthCamStream(provider, streamURL, sourcePageURL string) bool {
+	if strings.EqualFold(strings.TrimSpace(provider), "EARTHCAM") {
+		return true
+	}
+	for _, raw := range []string{streamURL, sourcePageURL} {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+		if host == "earthcam.com" || strings.HasSuffix(host, ".earthcam.com") || host == "myearthcam.com" || strings.HasSuffix(host, ".myearthcam.com") {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldResolveEarthCamPage(provider, streamURL, sourcePageURL string) bool {
+	return strings.TrimSpace(sourcePageURL) != "" &&
+		isEarthCamStream(provider, streamURL, sourcePageURL) &&
+		!isYouTubeURL(streamURL) &&
+		!isYouTubeURL(sourcePageURL)
 }
 
 func resolveSkylineManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
@@ -149,7 +189,10 @@ func resolveSkylineManifestURL(ctx context.Context, pageURL string, timeout time
 	return u, nil
 }
 
+const earthCamUserAgent = "Mozilla/5.0 (compatible; stoarama-capture/1.0)"
+
 var skylinePlayerSourceRE = regexp.MustCompile(`(?i)\bsource\s*:\s*["']([^"']+?\.m3u8[^"']*)["']`)
+var earthCamStreamRE = regexp.MustCompile(`(?i)"stream"\s*:\s*"((?:https?:)?\\?/\\?/[^"]+?\.m3u8[^"]*)"`)
 
 func skylineManifestFromHTML(pageHTML string) string {
 	m := skylinePlayerSourceRE.FindStringSubmatch(pageHTML)
@@ -179,6 +222,120 @@ func skylineManifestFromHTML(pageHTML string) string {
 	base := &url.URL{Scheme: "https", Host: "hd-auth.skylinewebcams.com", Path: "/live.m3u8"}
 	base.RawQuery = u.RawQuery
 	return base.String()
+}
+
+func resolveEarthCamManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	if _, err := resolveValidateURL(pageURL); err != nil {
+		return "", fmt.Errorf("earthcam page rejected: %w", err)
+	}
+	client := resolveHTTPClient(timeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build earthcam request: %w", err)
+	}
+	req.Header.Set("User-Agent", earthCamUserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("earthcam request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("earthcam request status=%d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("read earthcam page: %w", err)
+	}
+	for _, manifestURL := range earthCamManifestCandidatesFromHTML(string(b)) {
+		if _, err := resolveValidateURL(manifestURL); err != nil {
+			continue
+		}
+		if earthCamManifestPlayable(ctx, client, pageURL, manifestURL) {
+			return manifestURL, nil
+		}
+	}
+	return "", fmt.Errorf("earthcam page did not contain a playable manifest")
+}
+
+func earthCamManifestCandidatesFromHTML(pageHTML string) []string {
+	matches := earthCamStreamRE.FindAllStringSubmatch(pageHTML, -1)
+	out := make([]string, 0, len(matches))
+	seen := map[string]struct{}{}
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		raw := strings.TrimSpace(html.UnescapeString(m[1]))
+		raw = strings.ReplaceAll(raw, `\/`, `/`)
+		if strings.HasPrefix(raw, "//") {
+			raw = "https:" + raw
+		}
+		u, err := url.Parse(raw)
+		if err != nil || !u.IsAbs() {
+			continue
+		}
+		s := u.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+func earthCamManifestPlayable(ctx context.Context, client *http.Client, pageURL, manifestURL string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", earthCamUserAgent)
+	req.Header.Set("Accept", "application/vnd.apple.mpegurl,application/x-mpegURL,*/*")
+	req.Header.Set("Referer", pageURL)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return err == nil && strings.Contains(string(b), "#EXTM3U")
+}
+
+func earthCamInputHeaders(pageURL string) string {
+	pageURL = strings.TrimSpace(pageURL)
+	if pageURL == "" {
+		return ""
+	}
+	return "Referer: " + pageURL + "\r\nUser-Agent: " + earthCamUserAgent + "\r\n"
+}
+
+func resolveHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control:   resolveDialControl,
+			}).DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			if _, err := resolveValidateURL(req.URL.String()); err != nil {
+				return fmt.Errorf("redirect target rejected: %w", err)
+			}
+			return nil
+		},
+	}
 }
 
 // hasIndirectMarker reports whether a URL still carries an internal indirect
