@@ -464,6 +464,13 @@
            Content is injected by renderFleetSummary(); turns red when no computer online. -->
       <div id="relayBanner" class="panel hidden" style="margin-bottom:16px;padding:14px 16px;"></div>
 
+      <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
+        <button id="newRecBtn" class="primary" type="button">New recording</button>
+        <button id="newBundleBtn" class="secondary" type="button" style="width:auto;min-width:0;">New bundle</button>
+        <a class="btn-link secondary" href="/bundles" style="width:auto;min-width:0;align-self:center;">View bundles</a>
+        <button id="recordingsCsvBtn" class="secondary" type="button" style="width:auto;min-width:0;">Download CSV</button>
+      </div>
+
       <!-- Empty-state hero copy (shown only when there are no recordings) -->
       <div id="heroCopy" class="hidden" style="margin-bottom:18px;">
         <h1>Record any public stream to your own storage.</h1>
@@ -488,14 +495,6 @@
            recordings sharing ONE schedule. -->
       <div id="bundleList" class="hidden"></div>
       <div id="bundleDetail" class="hidden"></div>
-
-      <!-- + New recording trigger (hidden in empty state; composer is the hero there) -->
-      <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
-        <button id="newRecBtn" class="primary" type="button">New recording</button>
-        <button id="newBundleBtn" class="secondary" type="button" style="width:auto;min-width:0;">New bundle</button>
-        <a class="btn-link secondary" href="/bundles" style="width:auto;min-width:0;align-self:center;">View bundles</a>
-        <button id="recordingsCsvBtn" class="secondary" type="button" style="width:auto;min-width:0;">Download CSV</button>
-      </div>
 
       <!-- Inline composer -->
       <section id="composer" class="panel hidden">

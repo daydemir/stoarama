@@ -862,19 +862,20 @@
     }
     .filter-stack-card {
       display: grid;
-      gap: 12px;
+      gap: 10px;
       margin-bottom: 10px;
-      padding: 14px;
+      padding: 12px 14px;
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 8px;
       background: color-mix(in srgb, var(--panel) 92%, #000);
     }
     .filter-grid {
       display: grid;
-      gap: 10px 12px;
+      gap: 10px;
+      align-items: end;
     }
     .filter-grid-primary {
-      grid-template-columns: minmax(0, 2.1fr) repeat(2, minmax(0, 1fr));
+      grid-template-columns: minmax(220px, 2fr) minmax(150px, 1fr) minmax(150px, 1fr) minmax(150px, 1fr);
     }
     .filter-grid-secondary {
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -885,6 +886,9 @@
       display: grid;
       gap: 6px;
       min-width: 0;
+    }
+    .filter-field-wide {
+      grid-column: span 2;
     }
     .filter-field > input,
     .filter-field > select {
@@ -898,6 +902,27 @@
       letter-spacing: 0.05em;
       text-transform: uppercase;
       color: var(--muted);
+    }
+    .filter-choice-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-height: 30px;
+      align-items: center;
+    }
+    .filter-choice-row label.check-label {
+      height: 30px;
+      padding: 0 9px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel2) 72%, transparent);
+      color: var(--text);
+      font-size: 12px;
+    }
+    .filter-choice-row input[type="checkbox"] {
+      width: 13px;
+      height: 13px;
+      accent-color: var(--accent);
     }
     .filter-footer {
       display: flex;
@@ -1574,7 +1599,10 @@
     @media (max-width: 1100px) {
       .filter-grid-primary,
       .filter-grid-secondary {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .filter-field-wide {
+        grid-column: span 2;
       }
       .panel-intro {
         align-items: flex-start;
@@ -1594,6 +1622,12 @@
        cuts Location mid-word. Collapse each row into a stacked card so name, slug,
        tags, location and a full-width recording CTA all stay on screen. */
     @media (max-width: 640px) {
+      .filter-grid-primary,
+      .filter-grid-secondary,
+      .filter-field-wide {
+        grid-template-columns: 1fr;
+        grid-column: auto;
+      }
       .source-segmented {
         display: flex;
         flex-wrap: wrap;
@@ -1696,7 +1730,7 @@
     </div>
     <div class="filter-stack-card">
       <div class="filter-grid filter-grid-primary">
-        <div class="filter-field">
+        <div class="filter-field filter-field-wide">
           <div class="filter-field-label">Search</div>
           <input id="streamSearch" placeholder="Search stream / location" />
         </div>
@@ -1712,7 +1746,7 @@
             <option value="">all cities</option>
           </select>
         </div>
-        <div class="filter-field">
+        <div class="filter-field filter-field-wide">
           <div class="filter-field-label">Tag</div>
           <select id="streamTagFilter">
             <option value="">any tag</option>
@@ -1730,17 +1764,21 @@
             <option value="">all regions</option>
           </select>
         </div>
-        <div class="filter-field">
+        <div class="filter-field filter-field-wide">
           <div class="filter-field-label">Source type</div>
-          <label class="check-label"><input type="checkbox" data-source-type-filter="hls" /> HLS</label>
-          <label class="check-label"><input type="checkbox" data-source-type-filter="http_video" /> Direct Video</label>
-          <label class="check-label"><input type="checkbox" data-source-type-filter="youtube_watch" /> YouTube</label>
-          <label class="check-label"><input type="checkbox" data-source-type-filter="still_image" /> Still Image</label>
+          <div class="filter-choice-row">
+            <label class="check-label"><input type="checkbox" data-source-type-filter="hls" /> HLS</label>
+            <label class="check-label"><input type="checkbox" data-source-type-filter="http_video" /> Direct Video</label>
+            <label class="check-label"><input type="checkbox" data-source-type-filter="youtube_watch" /> YouTube</label>
+            <label class="check-label"><input type="checkbox" data-source-type-filter="still_image" /> Still Image</label>
+          </div>
         </div>
         <div class="filter-field">
           <div class="filter-field-label">Seen</div>
-          <label class="check-label"><input type="checkbox" id="seenPeopleFilter" /> Has people</label>
-          <label class="check-label"><input type="checkbox" id="seenVehiclesFilter" /> Has vehicles</label>
+          <div class="filter-choice-row">
+            <label class="check-label"><input type="checkbox" id="seenPeopleFilter" /> People</label>
+            <label class="check-label"><input type="checkbox" id="seenVehiclesFilter" /> Vehicles</label>
+          </div>
         </div>
       </div>
       <div class="filter-footer">
