@@ -733,7 +733,7 @@
           <div id="namingFolderHint" class="hint">Leave blank for <span class="mono">recordings</span>.</div>
         </div>
         <div id="plazaHourlyNamingFields" class="hidden">
-          <div class="hint" style="margin-bottom:10px;">Plaza hourly supports sampled clips with Custom schedule <span class="mono">0 8-19 * * *</span>, or continuous recording from 08:00 to 20:00 with 1 min clips.</div>
+          <div class="hint" style="margin-bottom:10px;">Plaza hourly supports sampled clips with Custom schedule <span class="mono">0 8-19 * * *</span>, or continuous recording with any daily window and 1, 5, or 10 min clips.</div>
           <div class="grid-2">
             <div class="field"><label for="namingPlazaID">Plaza ID required, numeric</label><input id="namingPlazaID" type="text" placeholder="08" /></div>
             <div class="field"><label for="namingContinent">Continent required</label><input id="namingContinent" type="text" placeholder="Europe" /></div>
@@ -1243,7 +1243,6 @@
       });
       els.continuousControls.classList.toggle('hidden', !cont);
       els.scheduleField.classList.toggle('hidden', cont);
-      applyPlazaHourlyContinuousDefaults();
       refreshContinuousWarn();
       namingValid();
       refreshStartEnabled();
@@ -1354,7 +1353,7 @@
           : [id, namingToken(m.continent, 'Europe'), namingToken(m.country, 'Finland'), namingToken(m.city, 'Kuopio'), plaza].join('_');
         els.namingFolderHint.innerHTML = 'Leave blank to derive <span class="mono">{ID}_{Continent}_{Country}_{City}_{PlazaName}</span>. Custom text replaces that root folder.';
         els.namingPreview.textContent = state.composerScheduleMode === 'continuous'
-          ? `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_030401.mp4`
+          ? `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_100401.mp4`
           : `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_03.mp4`;
         return;
       }
@@ -1380,9 +1379,8 @@
       const idOK = /^\d+$/.test(n.plaza_id);
       const sched = compiledSchedule();
       const continuousOK = state.composerScheduleMode === 'continuous'
-        && selectedClipSec() === 60
-        && String(els.dailyWindowStart.value || '').trim() === '08:00'
-        && String(els.dailyWindowEnd.value || '').trim() === '20:00';
+        && [60, 300, 600].includes(selectedClipSec())
+        && continuousWindowValid();
       const scheduleOK = (state.composerScheduleMode === 'sampled' && sched.cron === '0 8-19 * * *') || continuousOK;
       if (!fieldsOK) {
         els.namingWarn.textContent = 'Plaza hourly format requires plaza ID, continent, country, city, and plaza name.';
@@ -1393,7 +1391,7 @@
         return false;
       }
       if (!scheduleOK) {
-        els.namingWarn.textContent = 'Plaza hourly requires sampled Custom schedule 0 8-19 * * *, or continuous 08:00-20:00 with 1 min clips.';
+        els.namingWarn.textContent = 'Plaza hourly requires sampled Custom schedule 0 8-19 * * *, or continuous recording with 1, 5, or 10 min clips.';
         return false;
       }
       els.namingWarn.textContent = '';
@@ -1807,23 +1805,12 @@
       refreshStartEnabled();
     }
 
-    function applyPlazaHourlyContinuousDefaults() {
-      if (state.namingProfile !== 'plaza_hourly_v1' || state.composerScheduleMode !== 'continuous') return;
-      state.clipSelected = 60;
-      els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
-        b.classList.toggle('on', b.getAttribute('data-clip') === '60');
-      });
-      els.dailyWindowStart.value = '08:00';
-      els.dailyWindowEnd.value = '20:00';
-    }
-
     function setNamingProfile(profile) {
       state.namingProfile = profile === 'plaza_hourly_v1' ? 'plaza_hourly_v1' : 'stoarama_v1';
       els.namingSeg.querySelectorAll('button[data-naming]').forEach((b) => {
         b.classList.toggle('on', b.getAttribute('data-naming') === state.namingProfile);
       });
       els.plazaHourlyNamingFields.classList.toggle('hidden', state.namingProfile !== 'plaza_hourly_v1');
-      applyPlazaHourlyContinuousDefaults();
       namingValid();
       refreshStartEnabled();
       refreshContinuousWarn();

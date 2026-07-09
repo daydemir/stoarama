@@ -60,21 +60,23 @@ func TestBuildPlazaHourlyContinuousPathIncludesMinuteSecond(t *testing.T) {
 	if err != nil {
 		t.Fatalf("path: %v", err)
 	}
-	want := "01_na_usa_losangeles_venicebeach/May/Monday/01_Venice_Beach_2025_May_W2_Monday_hour_030401.mp4"
+	want := "01_na_usa_losangeles_venicebeach/May/Monday/01_Venice_Beach_2025_May_W2_Monday_hour_100401.mp4"
 	if got != want {
 		t.Fatalf("path=%q want %q", got, want)
 	}
 }
 
-func TestValidatePlazaHourlyScheduleAllowsContinuousOneMinuteWindow(t *testing.T) {
-	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 60, "08:00", "20:00:00"); err != nil {
-		t.Fatalf("continuous plaza hourly should be valid: %v", err)
+func TestValidatePlazaHourlyScheduleAllowsContinuousAnyWindow(t *testing.T) {
+	for _, sec := range []int{60, 300, 600} {
+		if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", sec, "06:30", "23:45:00"); err != nil {
+			t.Fatalf("continuous plaza hourly should allow %ds clips in any valid window: %v", sec, err)
+		}
 	}
-	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 300, "08:00", "20:00"); err == nil {
-		t.Fatal("expected continuous plaza hourly to require 60 second clips")
+	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 120, "08:00", "20:00"); err == nil {
+		t.Fatal("expected continuous plaza hourly to require 60, 300, or 600 second clips")
 	}
-	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 60, "09:00", "21:00"); err == nil {
-		t.Fatal("expected continuous plaza hourly to require 08:00-20:00")
+	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 60, "", "21:00"); err == nil {
+		t.Fatal("expected continuous plaza hourly to require a valid daily window")
 	}
 	if err := ValidateSchedule(ProfilePlazaHourlyV1, "sampled", "0 8-19 * * *", 300, "", ""); err != nil {
 		t.Fatalf("sampled plaza hourly should still be valid: %v", err)

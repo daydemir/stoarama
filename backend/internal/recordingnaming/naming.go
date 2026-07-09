@@ -148,22 +148,19 @@ func ValidateSchedule(profile Profile, mode, cronExpr string, clipDurationSec in
 			return fmt.Errorf("plaza_hourly_v1 sampled naming requires cron_expr 0 8-19 * * *")
 		}
 	case "continuous":
-		if clipDurationSec != 60 {
-			return fmt.Errorf("plaza_hourly_v1 continuous naming requires 60 second clips")
+		if clipDurationSec != 60 && clipDurationSec != 300 && clipDurationSec != 600 {
+			return fmt.Errorf("plaza_hourly_v1 continuous naming requires 60, 300, or 600 second clips")
 		}
-		if !sameClock(dailyWindowStart, "08:00") || !sameClock(dailyWindowEnd, "20:00") {
-			return fmt.Errorf("plaza_hourly_v1 continuous naming requires daily window 08:00-20:00")
+		if _, _, _, ok := parseClock(dailyWindowStart); !ok {
+			return fmt.Errorf("plaza_hourly_v1 continuous naming requires a valid daily_window_start")
+		}
+		if _, _, _, ok := parseClock(dailyWindowEnd); !ok {
+			return fmt.Errorf("plaza_hourly_v1 continuous naming requires a valid daily_window_end")
 		}
 	default:
 		return fmt.Errorf("mode must be sampled or continuous")
 	}
 	return nil
-}
-
-func sameClock(a, b string) bool {
-	ah, am, as, aok := parseClock(a)
-	bh, bm, bs, bok := parseClock(b)
-	return aok && bok && ah == bh && am == bm && as == bs
 }
 
 func parseClock(raw string) (int, int, int, bool) {
@@ -216,14 +213,14 @@ func buildPlazaHourlyPath(p Policy) (string, error) {
 	}
 	local := p.ClipStartedAt.In(loc)
 	hour := plazaHourlyHour(local)
-	if hour < 1 || hour > 12 {
+	if p.JobKind != JobKindContinuousWindow && (hour < 1 || hour > 12) {
 		return "", fmt.Errorf("plaza_hourly_v1 clip hour must be between 08:00 and 19:00 local time")
 	}
 	plazaID := twoDigitID(p.Metadata.PlazaID, p.RecordingID)
 	plazaName := sanitizeToken(p.Metadata.PlazaName)
 	hourToken := fmt.Sprintf("%02d", hour)
 	if p.JobKind == JobKindContinuousWindow {
-		hourToken = fmt.Sprintf("%02d%02d%02d", hour, local.Minute(), local.Second())
+		hourToken = fmt.Sprintf("%02d%02d%02d", local.Hour(), local.Minute(), local.Second())
 	}
 	file := fmt.Sprintf(
 		"%s_%s_%04d_%s_W%d_%s_hour_%s.mp4",
