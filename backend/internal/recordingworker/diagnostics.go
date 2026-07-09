@@ -1,6 +1,8 @@
 package recordingworker
 
 import (
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -175,11 +177,32 @@ func sanitizeDiagnosticError(err error) string {
 	if s == "" {
 		return ""
 	}
-	s = diagnosticURLRe.ReplaceAllString(s, "[url]")
+	s = diagnosticURLRe.ReplaceAllStringFunc(s, sanitizeDiagnosticURL)
 	s = diagnosticBearerRe.ReplaceAllString(s, "${1}[redacted]")
 	s = diagnosticTokenFieldRe.ReplaceAllString(s, "${1}=[redacted]")
 	if len(s) > 500 {
 		s = s[:500] + "..."
 	}
 	return s
+}
+
+func sanitizeDiagnosticURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "[url]"
+	}
+	p := u.EscapedPath()
+	if len(p) > 120 || strings.Contains(u.Host, "googlevideo.com") {
+		base := path.Base(u.Path)
+		if base == "." || base == "/" || base == "" {
+			p = "/..."
+		} else {
+			p = "/.../" + base
+		}
+	}
+	out := u.Scheme + "://" + u.Host + p
+	if u.RawQuery != "" {
+		out += "?[query]"
+	}
+	return out
 }

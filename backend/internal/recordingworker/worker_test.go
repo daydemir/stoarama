@@ -95,8 +95,8 @@ func TestRelayDiagnosticsSnapshotRedactsURLs(t *testing.T) {
 	if current["stage"] != "capture_retry" {
 		t.Fatalf("stage=%v want capture_retry", current["stage"])
 	}
-	if got := current["last_error"]; got != "ffmpeg failed [url]" {
-		t.Fatalf("last_error=%q want redacted url", got)
+	if got := current["last_error"]; got != "ffmpeg failed https://example.com/live.m3u8?[query]" {
+		t.Fatalf("last_error=%q want url with redacted query", got)
 	}
 
 	segAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
@@ -112,6 +112,14 @@ func TestRelayDiagnosticsSnapshotRedactsURLs(t *testing.T) {
 	}
 	if last["last_segment_at"] != segAt.Format(time.RFC3339Nano) {
 		t.Fatalf("last_segment_at=%v want %s", last["last_segment_at"], segAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestSanitizeDiagnosticURLCollapsesSignedGoogleVideoPath(t *testing.T) {
+	got := sanitizeDiagnosticError(errString("open https://rr4---sn.example.googlevideo.com/api/manifest/hls_playlist/expire/123/sig/secret/playlist/index.m3u8?token=abc"))
+	want := "open https://rr4---sn.example.googlevideo.com/.../index.m3u8?[query]"
+	if got != want {
+		t.Fatalf("sanitized=%q want %q", got, want)
 	}
 }
 
