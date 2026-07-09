@@ -40,6 +40,47 @@ func TestBuildPlazaHourlyPath(t *testing.T) {
 	}
 }
 
+func TestBuildPlazaHourlyContinuousPathIncludesMinuteSecond(t *testing.T) {
+	start := time.Date(2025, time.May, 12, 10, 4, 1, 0, time.UTC)
+	got, err := BuildDisplayPath(Policy{
+		Profile:       ProfilePlazaHourlyV1,
+		JobKind:       JobKindContinuousWindow,
+		FolderName:    "01_na_usa_losangeles_venicebeach",
+		RecordingID:   1,
+		CronTimezone:  "UTC",
+		ClipStartedAt: start,
+		Metadata: Metadata{
+			PlazaID:   "1",
+			Continent: "NA",
+			Country:   "USA",
+			City:      "Los Angeles",
+			PlazaName: "Venice Beach",
+		},
+	})
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	want := "01_na_usa_losangeles_venicebeach/May/Monday/01_Venice_Beach_2025_May_W2_Monday_hour_030401.mp4"
+	if got != want {
+		t.Fatalf("path=%q want %q", got, want)
+	}
+}
+
+func TestValidatePlazaHourlyScheduleAllowsContinuousOneMinuteWindow(t *testing.T) {
+	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 60, "08:00", "20:00:00"); err != nil {
+		t.Fatalf("continuous plaza hourly should be valid: %v", err)
+	}
+	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 300, "08:00", "20:00"); err == nil {
+		t.Fatal("expected continuous plaza hourly to require 60 second clips")
+	}
+	if err := ValidateSchedule(ProfilePlazaHourlyV1, "continuous", "", 60, "09:00", "21:00"); err == nil {
+		t.Fatal("expected continuous plaza hourly to require 08:00-20:00")
+	}
+	if err := ValidateSchedule(ProfilePlazaHourlyV1, "sampled", "0 8-19 * * *", 300, "", ""); err != nil {
+		t.Fatalf("sampled plaza hourly should still be valid: %v", err)
+	}
+}
+
 func TestBuildDisplayPathRejectsBadFolder(t *testing.T) {
 	_, err := BuildDisplayPath(Policy{
 		Profile:       ProfileStoaramaV1,

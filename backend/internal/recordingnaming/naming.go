@@ -138,17 +138,55 @@ func IsAllowedClipDuration(sec int) bool {
 	return sec >= 5 && sec <= 900
 }
 
-func ValidateSchedule(profile Profile, mode, cronExpr string) error {
+func ValidateSchedule(profile Profile, mode, cronExpr string, clipDurationSec int, dailyWindowStart, dailyWindowEnd string) error {
 	if profile != ProfilePlazaHourlyV1 {
 		return nil
 	}
-	if strings.TrimSpace(mode) != "sampled" {
-		return fmt.Errorf("plaza_hourly_v1 naming requires sampled recording mode")
-	}
-	if strings.TrimSpace(cronExpr) != "0 8-19 * * *" {
-		return fmt.Errorf("plaza_hourly_v1 naming requires cron_expr 0 8-19 * * *")
+	switch strings.TrimSpace(mode) {
+	case "sampled":
+		if strings.TrimSpace(cronExpr) != "0 8-19 * * *" {
+			return fmt.Errorf("plaza_hourly_v1 sampled naming requires cron_expr 0 8-19 * * *")
+		}
+	case "continuous":
+		if clipDurationSec != 60 {
+			return fmt.Errorf("plaza_hourly_v1 continuous naming requires 60 second clips")
+		}
+		if !sameClock(dailyWindowStart, "08:00") || !sameClock(dailyWindowEnd, "20:00") {
+			return fmt.Errorf("plaza_hourly_v1 continuous naming requires daily window 08:00-20:00")
+		}
+	default:
+		return fmt.Errorf("mode must be sampled or continuous")
 	}
 	return nil
+}
+
+func sameClock(a, b string) bool {
+	ah, am, as, aok := parseClock(a)
+	bh, bm, bs, bok := parseClock(b)
+	return aok && bok && ah == bh && am == bm && as == bs
+}
+
+func parseClock(raw string) (int, int, int, bool) {
+	parts := strings.Split(strings.TrimSpace(raw), ":")
+	if len(parts) != 2 && len(parts) != 3 {
+		return 0, 0, 0, false
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	s := 0
+	if len(parts) == 3 {
+		s, err = strconv.Atoi(parts[2])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+	}
+	return h, m, s, h >= 0 && h <= 23 && m >= 0 && m <= 59 && s >= 0 && s <= 59
 }
 
 func buildStoaramaPath(p Policy) (string, error) {
@@ -183,15 +221,19 @@ func buildPlazaHourlyPath(p Policy) (string, error) {
 	}
 	plazaID := twoDigitID(p.Metadata.PlazaID, p.RecordingID)
 	plazaName := sanitizeToken(p.Metadata.PlazaName)
+	hourToken := fmt.Sprintf("%02d", hour)
+	if p.JobKind == JobKindContinuousWindow {
+		hourToken = fmt.Sprintf("%02d%02d%02d", hour, local.Minute(), local.Second())
+	}
 	file := fmt.Sprintf(
-		"%s_%s_%04d_%s_W%d_%s_hour_%02d.mp4",
+		"%s_%s_%04d_%s_W%d_%s_hour_%s.mp4",
 		plazaID,
 		plazaName,
 		local.Year(),
 		local.Month().String(),
 		((local.Day()-1)/7)+1,
 		local.Weekday().String(),
-		hour,
+		hourToken,
 	)
 	return path.Join(folder, local.Month().String(), local.Weekday().String(), file), nil
 }

@@ -196,6 +196,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/account", s.handleAccountApp)
 	r.Get("/org-settings", s.handleOrgSettingsApp)
 	r.Get("/recordings", s.handleRecordingsApp)
+	r.Get("/recordings/new", s.handleRecordingsApp)
 	r.Get("/recordings/{id}", s.handleRecordingsApp)
 	r.Get("/bundles", s.handleRecordingsApp)
 	r.Get("/bundles/{id}", s.handleRecordingsApp)

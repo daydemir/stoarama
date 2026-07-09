@@ -335,8 +335,7 @@
     #composer.panel { background: none; border: 0; box-shadow: none; padding: 0; }
     .composer-cards { min-width: 0; }
     .composer-side { position: sticky; top: 24px; }
-    /* Live price panel: an elevated white card that LEADS with the bold rate line,
-       then the clip-volume estimate as muted supporting text below. */
+    /* Live price panel: one compact estimate card. */
     .composer-summary {
       border: 1px solid var(--border);
       border-radius: 12px;
@@ -345,12 +344,19 @@
       box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
       font-size: 13px; line-height: 1.5; color: var(--muted);
     }
-    .composer-summary .cs-rate { color: var(--text); font-size: 14px; line-height: 1.45; margin-bottom: 12px; }
+    .composer-summary .cs-rate { color: var(--text); font-size: 14px; line-height: 1.45; margin-bottom: 10px; }
     .composer-summary .cs-rate b { font-weight: 600; }
     .composer-summary b { color: var(--text); font-weight: 600; }
     .composer-summary .cs-cost { color: var(--accent); }
-    .composer-summary #composerCount { font-family: var(--mono); }
-    .composer-summary #costEstimate { font-family: var(--mono); }
+    .cost-total { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; padding: 12px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .cost-total span { color: var(--muted); }
+    .cost-total strong { color: var(--accent); font-size: 18px; font-weight: 700; white-space: nowrap; }
+    .cost-rows { display: grid; gap: 8px; margin-top: 12px; }
+    .cost-row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+    .cost-row span { color: var(--muted); }
+    .cost-row b { text-align: right; white-space: nowrap; }
+    .composer-summary #composerCount { margin-bottom: 12px; }
+    .composer-summary #costEstimateNote { margin-top: 12px; }
     /* In the floating price rail the primary action fills the panel width. */
     .composer-side .composer-summary { margin-bottom: 14px; }
     .composer-side .button-row > * { width: 100%; min-width: 0; }
@@ -591,14 +597,14 @@
         <div class="field">
           <label>Recording mode</label>
           <div class="seg" id="modeSeg">
-            <button type="button" data-mode="sampled" class="on">Sample clips on a schedule</button>
-            <button type="button" data-mode="continuous">Record continuously</button>
+            <button type="button" data-mode="sampled">Sample clips on a schedule</button>
+            <button type="button" data-mode="continuous" class="on">Record continuously</button>
           </div>
           <div class="hint">Sample records one clip per scheduled fire. Continuous records back-to-back segments with no gaps for a daily time window.</div>
         </div>
 
         <!-- Continuous daily window (shown only in continuous mode) -->
-        <div class="field hidden" id="continuousControls">
+        <div class="field" id="continuousControls">
           <label>Daily window</label>
           <div class="grid-2">
             <div>
@@ -619,7 +625,7 @@
         </div>
 
         <!-- Schedule -->
-        <div class="field" id="scheduleField">
+        <div class="field hidden" id="scheduleField">
           <label>Schedule</label>
           <div class="seg" id="schedSeg">
             <button type="button" data-preset="15m">Every 15 min</button>
@@ -727,7 +733,7 @@
           <div id="namingFolderHint" class="hint">Leave blank for <span class="mono">recordings</span>.</div>
         </div>
         <div id="plazaHourlyNamingFields" class="hidden">
-          <div class="hint" style="margin-bottom:10px;">Plaza hourly records sampled clips hourly from 08:00 through 19:00 in the selected timezone. Choose Custom schedule and enter <span class="mono">0 8-19 * * *</span>.</div>
+          <div class="hint" style="margin-bottom:10px;">Plaza hourly supports sampled clips with Custom schedule <span class="mono">0 8-19 * * *</span>, or continuous recording from 08:00 to 20:00 with 1 min clips.</div>
           <div class="grid-2">
             <div class="field"><label for="namingPlazaID">Plaza ID required, numeric</label><input id="namingPlazaID" type="text" placeholder="08" /></div>
             <div class="field"><label for="namingContinent">Continent required</label><input id="namingContinent" type="text" placeholder="Europe" /></div>
@@ -849,11 +855,8 @@
         </div><!-- /.composer-cards -->
 
         <aside class="composer-side">
-        <!-- Live clip-count + cost summary: updates on every change. Shows the
-             concrete clip count for both sampled and continuous, plus the reused
-             cost estimate. costEstimate/costEstimateNote keep the existing math. -->
         <div id="composerSummary" class="composer-summary">
-          <div class="cs-rate"><b>$0.05 per recording-hour</b>, plus your choice of storage</div>
+          <div class="cs-rate"><b>Estimated monthly cost</b></div>
           <div id="composerCount"></div>
           <div id="costEstimate" class="preview" style="margin-top:4px;"></div>
           <div id="costEstimateNote" class="hint" style="margin-top:2px;"></div>
@@ -1043,7 +1046,7 @@
       schedPreset: 'hourly',
       // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
       // back-to-back segments for a daily window). Shared by single + bundle.
-      composerScheduleMode: 'sampled',
+      composerScheduleMode: 'continuous',
       clipSelected: 60,
       namingProfile: 'stoarama_v1',
       // Frame rate choice: 'source' (native, no re-encode) | '30' | '15'.
@@ -1190,6 +1193,14 @@
       return d;
     }
 
+    function continuousRecordHoursPerDay(s, e) {
+      const a = parseHM(s), b0 = parseHM(e);
+      if (a == null || b0 == null) return null;
+      let b = b0;
+      if (b <= a) b += 1440;
+      return Math.floor((b - 1) / 60) - Math.floor(a / 60) + 1;
+    }
+
     // fmtDurationMin renders minutes as "8h", "45m", or "8h 30m".
     function fmtDurationMin(mins) {
       const h = Math.floor(mins / 60), m = mins % 60;
@@ -1233,6 +1244,7 @@
       els.continuousControls.classList.toggle('hidden', !cont);
       els.scheduleField.classList.toggle('hidden', cont);
       refreshContinuousWarn();
+      namingValid();
       refreshStartEnabled();
       renderCostEstimate();
     }
@@ -1340,7 +1352,9 @@
           ? namingFolderPreview(n.folder_name, 'custom_folder')
           : [id, namingToken(m.continent, 'Europe'), namingToken(m.country, 'Finland'), namingToken(m.city, 'Kuopio'), plaza].join('_');
         els.namingFolderHint.innerHTML = 'Leave blank to derive <span class="mono">{ID}_{Continent}_{Country}_{City}_{PlazaName}</span>. Custom text replaces that root folder.';
-        els.namingPreview.textContent = `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_03.mp4`;
+        els.namingPreview.textContent = state.composerScheduleMode === 'continuous'
+          ? `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_030401.mp4`
+          : `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_03.mp4`;
         return;
       }
       const folder = n.folder_name ? namingFolderPreview(n.folder_name, 'recordings') : 'recordings';
@@ -1364,7 +1378,11 @@
       const fieldsOK = n.plaza_id && n.continent && n.country && n.city && n.plaza_name;
       const idOK = /^\d+$/.test(n.plaza_id);
       const sched = compiledSchedule();
-      const scheduleOK = state.composerScheduleMode === 'sampled' && sched.cron === '0 8-19 * * *';
+      const continuousOK = state.composerScheduleMode === 'continuous'
+        && selectedClipSec() === 60
+        && String(els.dailyWindowStart.value || '').trim() === '08:00'
+        && String(els.dailyWindowEnd.value || '').trim() === '20:00';
+      const scheduleOK = (state.composerScheduleMode === 'sampled' && sched.cron === '0 8-19 * * *') || continuousOK;
       if (!fieldsOK) {
         els.namingWarn.textContent = 'Plaza hourly format requires plaza ID, continent, country, city, and plaza name.';
         return false;
@@ -1374,7 +1392,7 @@
         return false;
       }
       if (!scheduleOK) {
-        els.namingWarn.textContent = 'Plaza hourly requires Sample clips with Custom schedule 0 8-19 * * *.';
+        els.namingWarn.textContent = 'Plaza hourly requires sampled Custom schedule 0 8-19 * * *, or continuous 08:00-20:00 with 1 min clips.';
         return false;
       }
       els.namingWarn.textContent = '';
@@ -1564,27 +1582,40 @@
       const b = state.billing || {};
       const hourRate = Number(b.recording_hour_rate_cents || 5);
       const shmRate = Number(b.stream_hour_month_rate_cents || 10);
-      const runsPerDay = estRunsPerDay();
       const clipSec = selectedClipSec();                // existing, lines 713-719
       const activeDays = estActiveDaysThisMonth();
       // A bundle fans out into one member recording per selected stream, so every
       // record-hour and stored-footage figure scales by the stream count.
       const streams = estStreamCount();
-      if (runsPerDay === null || clipSec <= 0) return null;
+      if (clipSec <= 0) return null;
 
-      // Billable record-HOURS: a recording bills each distinct UTC hour it captures a
-      // clip in. A schedule firing N times/day lands in at most min(N, 24) distinct
-      // hours per active day (sub-hourly cadences fill all 24; hourly = 24; every 4h =
-      // 6; daily = 1). Monthly record-hours ~= activeDays * distinct hours/day.
-      const hoursPerActiveDay = Math.min(runsPerDay, 24);
-      const recordHours = activeDays * hoursPerActiveDay * streams;
+      let recordHoursPerActiveDay;
+      let streamHrsPerDay;
+      if (state.composerScheduleMode === 'continuous') {
+        if (!continuousWindowValid()) return null;
+        const mins = windowDurationMin(els.dailyWindowStart.value, els.dailyWindowEnd.value);
+        if (mins == null || mins <= 0) return null;
+        recordHoursPerActiveDay = continuousRecordHoursPerDay(els.dailyWindowStart.value, els.dailyWindowEnd.value);
+        if (recordHoursPerActiveDay == null) return null;
+        streamHrsPerDay = (mins / 60) * streams;
+      } else {
+        const runsPerDay = estRunsPerDay();
+        if (runsPerDay === null) return null;
+        // Billable record-HOURS: a recording bills each distinct UTC hour it captures a
+        // clip in. A schedule firing N times/day lands in at most min(N, 24) distinct
+        // hours per active day (sub-hourly cadences fill all 24; hourly = 24; every 4h =
+        // 6; daily = 1). Monthly record-hours ~= activeDays * distinct hours/day.
+        recordHoursPerActiveDay = Math.min(runsPerDay, 24);
+        // Managed storage as stream-hour-months: the period average of stored
+        // stream-hours. A clip of clipSec contributes clipSec/3600 stream-hours while
+        // kept. Stored stream-hours per active day ~= runsPerDay * clipSec/3600; the
+        // period average of stored footage ~= half the month's accumulated total.
+        streamHrsPerDay = runsPerDay * (clipSec / 3600) * streams;
+      }
+
+      const recordHours = activeDays * recordHoursPerActiveDay * streams;
       const recordHourCents = recordHours * hourRate;
 
-      // Managed storage as stream-hour-months: the period average of stored
-      // stream-hours. A clip of clipSec contributes clipSec/3600 stream-hours while
-      // kept. Stored stream-hours per active day ~= runsPerDay * clipSec/3600; the
-      // period average of stored footage ~= half the month's accumulated total.
-      const streamHrsPerDay = runsPerDay * (clipSec / 3600) * streams;
       const monthTotalStreamHrs = streamHrsPerDay * activeDays;
       const managed = state.storageChoice === 'managed';
       const nas = state.storageChoice === 'nas';
@@ -1602,7 +1633,7 @@
       const nasTransferCents = 0;
 
       return {
-        activeDays, runsPerDay, clipSec, hourRate, shmRate: effShmRate, managed, nas, yearlyPrepaid,
+        activeDays, clipSec, hourRate, shmRate: effShmRate, managed, nas, yearlyPrepaid,
         recordHours, recordHourCents, avgStreamHrMo, storageCents,
         nasTransferRate, nasTransferCents,
         totalCents: recordHourCents + storageCents + nasTransferCents,
@@ -1670,18 +1701,14 @@
       const perMonth = perDayTotal * activeDays;
       const win = countWindowPhrase();
       els.composerCount.innerHTML =
-        `${win}, ${clipSec}s ${noun}s <span class="muted">=</span> <b>${perDayTotal.toLocaleString()}</b> ${noun}${perDayTotal === 1 ? '' : 's'}/day`
-        + `<span class="muted">, </span><b>${perMonth.toLocaleString()}</b> ${noun}${perMonth === 1 ? '' : 's'}/mo`;
+        `<span class="muted">${win} · ${clipSec}s ${noun}s · </span>`
+        + `<b>${perDayTotal.toLocaleString()}</b> ${noun}${perDayTotal === 1 ? '' : 's'}/day`
+        + `<span class="muted"> · </span><b>${perMonth.toLocaleString()}</b>/mo`;
     }
 
     function renderCostEstimate() {
       renderComposerCount();
       if (!state.billingEnabled) { els.costEstimate.textContent = ''; els.costEstimateNote.textContent = ''; return; }
-      if (state.composerScheduleMode === 'continuous') {
-        els.costEstimate.innerHTML = '<span class="muted"><span class="cs-cost">Continuous</span> records every hour the window is active; storage scales with total footage.</span>';
-        els.costEstimateNote.textContent = 'Billed at the end of each month: $0.05 per recording-hour plus managed storage at $0.10 per hour of footage, per month.';
-        return;
-      }
       const m = estimateModel();
       if (!m) {
         els.costEstimate.innerHTML = '<span class="muted">Set a schedule and clip length to estimate cost.</span>';
@@ -1690,22 +1717,26 @@
         return;
       }
       const usd = (c) => usdCents(c);
-      const parts = [
-        `<b class="cs-cost">${usd(m.totalCents)}</b><span class="muted">/mo est.</span>`,
-        `<span class="muted"> &middot; ${m.recordHours} hour${m.recordHours === 1 ? '' : 's'} of recording × $${(m.hourRate / 100).toFixed(2)} = ${usd(m.recordHourCents)}</span>`,
+      const hours = (n) => Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 1 });
+      const rows = [
+        `<div class="cost-row"><span>Capture</span><b>${hours(m.recordHours)} hr × $${(m.hourRate / 100).toFixed(2)} = ${usd(m.recordHourCents)}</b></div>`,
       ];
       if (m.managed && m.avgStreamHrMo > 0) {
-        parts.push(`<span class="muted"> + ${m.avgStreamHrMo.toFixed(3)} hr of footage stored/mo × $${(m.shmRate / 100).toFixed(2)} = ${usdStorage(m.avgStreamHrMo, m.shmRate, m.storageCents)}</span>`);
+        rows.push(`<div class="cost-row"><span>Storage</span><b>${hours(m.avgStreamHrMo)} hr-mo × $${(m.shmRate / 100).toFixed(2)} = ${usdStorage(m.avgStreamHrMo, m.shmRate, m.storageCents)}</b></div>`);
+      } else {
+        rows.push(`<div class="cost-row"><span>Storage</span><b>No Stoarama charge</b></div>`);
       }
-      els.costEstimate.innerHTML = parts.join('');
+      els.costEstimate.innerHTML = `
+        <div class="cost-total"><span>Total estimate</span><strong>${usd(m.totalCents)}/mo</strong></div>
+        <div class="cost-rows">${rows.join('')}</div>`;
       if (m.nas) {
-        els.costEstimateNote.textContent = 'Estimate only. NAS is $0.05 per hour of recording, and storage on your NAS is free. If your NAS falls behind, clips left in managed storage over 24h bill at $0.10 per hour of footage, per month until it catches up.';
+        els.costEstimateNote.textContent = 'Estimate only. Your NAS storage is free; delayed NAS pulls can create small managed-storage charges.';
       } else if (m.managed && m.yearlyPrepaid) {
-        els.costEstimateNote.textContent = `Estimate only. Yearly prepaid: storage is $0.05 per hour of footage kept for a month, prepaid 12 months up front. This month's stored footage is charged to your card now; new footage is prepaid monthly.`;
+        els.costEstimateNote.textContent = 'Estimate only. Yearly prepaid storage is charged at the lower hourly-month rate.';
       } else {
         els.costEstimateNote.textContent = m.managed
-          ? `Estimate only. Storage is $${(m.shmRate / 100).toFixed(2)} per hour of footage kept for a month, charged only for the time each clip is kept, so a clip stored a few days costs a small fraction of that.`
-          : `Estimate only. With your own bucket there is no storage charge.`;
+          ? 'Estimate only. Billed monthly from actual capture time and stored footage.'
+          : 'Estimate only. Own-bucket storage is billed by your storage provider.';
       }
     }
 
@@ -1759,6 +1790,7 @@
       els.dailyControls.classList.toggle('hidden', preset !== 'daily');
       els.customControls.classList.toggle('hidden', preset !== 'custom');
       refreshScheduleUI();
+      namingValid();
       renderCostEstimate();
       refreshStartEnabled();
     }
@@ -3015,12 +3047,11 @@
       const all = state.recordings;
       const empty = all.length === 0;
       els.heroCopy.classList.toggle('hidden', !empty);
-      els.newRecRow.classList.toggle('hidden', empty);
+      els.newRecRow.classList.remove('hidden');
       els.cards.classList.toggle('hidden', empty);
       els.statusFilter.classList.toggle('hidden', empty);
       if (empty) {
         els.cards.innerHTML = '';
-        openComposer(true);
         return;
       }
       renderStatusFilter();
@@ -4128,6 +4159,10 @@
       refreshStartEnabled();
     }
 
+    function newRecordingRoute() {
+      return /^\/recordings\/new\/?$/.test(window.location.pathname || '');
+    }
+
     // Landing with a record intent (?stream_id / ?stream_ids): make the composer the
     // primary view by hiding the existing-recordings list chrome, so the user does
     // not have to scroll past the list to reach the composer. closeComposer restores
@@ -4137,6 +4172,15 @@
       els.cards.classList.add('hidden');
       els.statusFilter.classList.add('hidden');
       els.newRecRow.classList.add('hidden');
+    }
+
+    async function renderNewRecordingRoute() {
+      els.ledger.classList.add('hidden');
+      els.cardBanner.classList.add('hidden');
+      els.relayBanner.classList.add('hidden');
+      focusComposerView();
+      await maybeLandFromCatalogStream();
+      if (els.composer.classList.contains('hidden')) openComposer(false);
     }
 
     // Trim a stream name to a reasonable composer field length.
@@ -4278,6 +4322,10 @@
     }
 
     function closeComposer() {
+      if (newRecordingRoute()) {
+        window.location.assign('/recordings');
+        return;
+      }
       els.composer.classList.add('hidden');
       window.clearTimeout(streamDebounce);
       teardownPreview();
@@ -4587,8 +4635,8 @@
 
     els.modeSeg.querySelectorAll('button[data-mode]').forEach((b) =>
       b.addEventListener('click', () => setScheduleMode(b.getAttribute('data-mode'))));
-    els.dailyWindowStart.addEventListener('input', () => { refreshContinuousWarn(); refreshStartEnabled(); renderCostEstimate(); });
-    els.dailyWindowEnd.addEventListener('input', () => { refreshContinuousWarn(); refreshStartEnabled(); renderCostEstimate(); });
+    els.dailyWindowStart.addEventListener('input', () => { refreshContinuousWarn(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
+    els.dailyWindowEnd.addEventListener('input', () => { refreshContinuousWarn(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
     els.schedTZContinuous.addEventListener('change', () => { refreshContinuousWarn(); refreshStartEnabled(); });
     els.schedSeg.querySelectorAll('button[data-preset]').forEach((b) =>
       b.addEventListener('click', () => setSchedPreset(b.getAttribute('data-preset'))));
@@ -4603,8 +4651,8 @@
     els.fpsSeg.querySelectorAll('button[data-fps]').forEach((b) =>
       b.addEventListener('click', () => setFps(b.getAttribute('data-fps'))));
     els.fpsCustom.addEventListener('input', () => { refreshStartEnabled(); });
-    els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
-    els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); refreshStartEnabled(); renderCostEstimate(); });
+    els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
+    els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
     els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.schedTZCustom.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
     els.startAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
@@ -4650,7 +4698,7 @@
     });
     els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
-    els.newRecBtn.addEventListener('click', () => openComposer(false));
+    els.newRecBtn.addEventListener('click', () => window.location.assign('/recordings/new'));
     // Status filter: delegate clicks off the chips (static markup), set the active
     // filter, and re-render the loaded list. Client-side only; no refetch.
     els.statusFilter.addEventListener('click', (ev) => {
@@ -5087,7 +5135,7 @@
       fillTimezoneSelect(els.schedTZContinuous);
       fillProviderSelect();
       setSchedPreset('hourly');
-      setScheduleMode('sampled');
+      setScheduleMode('continuous');
       setClip(60);
       setNamingProfile('stoarama_v1');
       renderCostEstimate();
@@ -5121,6 +5169,10 @@
           return;
         }
         await handleBillingReturn();
+        if (newRecordingRoute()) {
+          await renderNewRecordingRoute();
+          return;
+        }
         await maybeLandFromCatalogStream();
       } catch (_) {
         els.signedIn.classList.add('hidden');
@@ -5134,7 +5186,7 @@
     // lease TTL). Only fires on the recordings list view, not the clip-detail page.
     // ponytail: skips clip-page refresh; add if detail page needs live fleet status too.
     window.setInterval(() => {
-      if (!clipPageState.recId && !bundleListRoute() && !(bundleDetailId() > 0)) {
+      if (!clipPageState.recId && !newRecordingRoute() && !bundleListRoute() && !(bundleDetailId() > 0)) {
         void refreshRecordings();
       }
     }, 30000);

@@ -105,13 +105,17 @@ func runRecordingNamingSet(ctx context.Context, cfg config.Config, args []string
 	profile, folderName, metadataBytes := mustNamingInputs(*profileRaw, *folderNameRaw, *id, metadata)
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
-	var mode, cronExpr string
+	var mode, cronExpr, dailyWindowStart, dailyWindowEnd string
+	var clipDuration int
 	if err := pool.QueryRow(ctx, `
-		SELECT mode, COALESCE(cron_expr, '') FROM recordings WHERE id=$1
-	`, *id).Scan(&mode, &cronExpr); err != nil {
+		SELECT mode, COALESCE(cron_expr, ''), clip_duration_sec,
+		       COALESCE(to_char(daily_window_start, 'HH24:MI:SS'), ''),
+		       COALESCE(to_char(daily_window_end, 'HH24:MI:SS'), '')
+		FROM recordings WHERE id=$1
+	`, *id).Scan(&mode, &cronExpr, &clipDuration, &dailyWindowStart, &dailyWindowEnd); err != nil {
 		log.Fatalf("load recording schedule: %v", err)
 	}
-	if err := recordingnaming.ValidateSchedule(profile, mode, cronExpr); err != nil {
+	if err := recordingnaming.ValidateSchedule(profile, mode, cronExpr, clipDuration, dailyWindowStart, dailyWindowEnd); err != nil {
 		log.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `

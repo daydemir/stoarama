@@ -3279,7 +3279,7 @@ if (recordSelectedBtnEl instanceof HTMLElement) {
     ev.preventDefault();
     const ids = [...selectedStreamIds];
     if (!ids.length) return;
-    const target = `/recordings?stream_ids=${ids.join(',')}`;
+    const target = `/recordings/new?stream_ids=${ids.join(',')}`;
     if (isAuthenticatedAccount()) {
       window.location.assign(target);
     } else {
@@ -3428,7 +3428,7 @@ function syncDetailMutationUI(payload) {
         detailRecordCTA.classList.remove('primary');
         detailRecordCTA.classList.add('secondary');
       } else {
-        detailRecordCTA.href = `/recordings?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
+        detailRecordCTA.href = `/recordings/new?stream_id=${encodeURIComponent(String(s.id || detailStreamID || ''))}`;
         detailRecordCTA.textContent = 'Set up recording';
         detailRecordCTA.classList.remove('secondary');
         detailRecordCTA.classList.add('primary');
@@ -5159,7 +5159,7 @@ function renderStreamRows() {
         recordable
           ? (streamRecordingID(row) > 0
               ? `<a class="overview-card-link secondary" href="/recordings/${streamRecordingID(row)}">View/Edit recording</a>`
-              : `<a class="overview-card-link primary" href="/recordings?stream_id=${s.id}">Set up recording</a>`)
+              : `<a class="overview-card-link primary" href="/recordings/new?stream_id=${s.id}">Set up recording</a>`)
           : (buildYouTubeWatchURL(s)
               ? `<a class="overview-card-link" href="${esc(buildYouTubeWatchURL(s))}" target="_blank" rel="noopener noreferrer">View</a>`
               : `<a class="overview-card-link" href="/streams/${s.id}">View</a>`)

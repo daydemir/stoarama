@@ -498,10 +498,6 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := recordingnaming.ValidateSchedule(namingProfile, mode, cronExpr); err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 
 	// Parse the continuous daily window up front (used for validation, preflight,
 	// next_fire, and the insert). Sampled recordings leave these empty.
@@ -529,6 +525,10 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		dailyStart, dailyEnd = ds, de
 		dailyStartArg = strings.TrimSpace(req.DailyWindowStart)
 		dailyEndArg = strings.TrimSpace(req.DailyWindowEnd)
+	}
+	if err := recordingnaming.ValidateSchedule(namingProfile, mode, cronExpr, clipDuration, strings.TrimSpace(req.DailyWindowStart), strings.TrimSpace(req.DailyWindowEnd)); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	// target_fps: NULL = Source/native (preserve source fps, no re-encode). The
@@ -1256,7 +1256,7 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		}
 		cronExprForNext = &cronExpr
 	}
-	if err := recordingnaming.ValidateSchedule(namingProfile, mode, cronExpr); err != nil {
+	if err := recordingnaming.ValidateSchedule(namingProfile, mode, cronExpr, clipDuration, strings.TrimSpace(req.DailyWindowStart), strings.TrimSpace(req.DailyWindowEnd)); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1323,11 +1323,15 @@ func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	var mode, cronExpr string
+	var mode, cronExpr, dailyWindowStart, dailyWindowEnd string
+	var clipDuration int
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT mode, COALESCE(cron_expr, '') FROM recordings
+		SELECT mode, COALESCE(cron_expr, ''), clip_duration_sec,
+		       COALESCE(to_char(daily_window_start, 'HH24:MI:SS'), ''),
+		       COALESCE(to_char(daily_window_end, 'HH24:MI:SS'), '')
+		FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&mode, &cronExpr); err != nil {
+	`, id, principal.AccountID).Scan(&mode, &cronExpr, &clipDuration, &dailyWindowStart, &dailyWindowEnd); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
@@ -1335,7 +1339,7 @@ func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
-	if err := recordingnaming.ValidateSchedule(profile, mode, cronExpr); err != nil {
+	if err := recordingnaming.ValidateSchedule(profile, mode, cronExpr, clipDuration, dailyWindowStart, dailyWindowEnd); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
