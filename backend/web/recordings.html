@@ -1243,6 +1243,7 @@
       });
       els.continuousControls.classList.toggle('hidden', !cont);
       els.scheduleField.classList.toggle('hidden', cont);
+      applyPlazaHourlyContinuousDefaults();
       refreshContinuousWarn();
       namingValid();
       refreshStartEnabled();
@@ -1801,8 +1802,19 @@
         b.classList.toggle('on', b.getAttribute('data-clip') === String(clip));
       });
       refreshScheduleUI();
+      namingValid();
       renderCostEstimate();
       refreshStartEnabled();
+    }
+
+    function applyPlazaHourlyContinuousDefaults() {
+      if (state.namingProfile !== 'plaza_hourly_v1' || state.composerScheduleMode !== 'continuous') return;
+      state.clipSelected = 60;
+      els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
+        b.classList.toggle('on', b.getAttribute('data-clip') === '60');
+      });
+      els.dailyWindowStart.value = '08:00';
+      els.dailyWindowEnd.value = '20:00';
     }
 
     function setNamingProfile(profile) {
@@ -1811,8 +1823,11 @@
         b.classList.toggle('on', b.getAttribute('data-naming') === state.namingProfile);
       });
       els.plazaHourlyNamingFields.classList.toggle('hidden', state.namingProfile !== 'plaza_hourly_v1');
+      applyPlazaHourlyContinuousDefaults();
       namingValid();
       refreshStartEnabled();
+      refreshContinuousWarn();
+      renderCostEstimate();
     }
 
     function setFps(fps) {
