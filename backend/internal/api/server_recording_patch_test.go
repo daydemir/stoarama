@@ -189,6 +189,54 @@ func TestRecordingScheduleUpdate(t *testing.T) {
 	}
 }
 
+func TestRecordingJobCompleteRejectsZeroClipContinuous(t *testing.T) {
+	pool, cleanup := testRecordingPatchPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const accountID = int64(42)
+	destID := insertPatchDestination(t, pool, accountID)
+	recID := insertPatchRecording(t, pool, accountID, destID, "managed")
+	var jobID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_jobs
+			(recording_id, fire_at, scheduled_for, clip_duration_sec, status, lease_owner, attempt_count, idempotency_key, kind, window_end_at)
+		VALUES ($1, now(), now(), 60, 'leased', 'node:7', 1, 'reccont-test', 'continuous_window', now()+interval '1 hour')
+		RETURNING id
+	`, recID).Scan(&jobID); err != nil {
+		t.Fatalf("insert job: %v", err)
+	}
+
+	s := &Server{pool: pool}
+	rec := httptest.NewRecorder()
+	s.handleRecordingJobComplete(rec, recordingJobReq(jobID, nodePrincipal{NodeID: 7, AccountID: accountID, NodeType: nodeTypeRelay}))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("complete zero-clip continuous: status=%d body=%s, want 409", rec.Code, rec.Body.String())
+	}
+
+	var status, errText, lastErr string
+	var failures int
+	if err := pool.QueryRow(ctx, `
+		SELECT j.status, j.error_text, r.last_error_text, r.consecutive_failures
+		FROM recording_jobs j JOIN recordings r ON r.id=j.recording_id
+		WHERE j.id=$1
+	`, jobID).Scan(&status, &errText, &lastErr, &failures); err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if status != "error" || errText == "" || lastErr == "" || failures != 1 {
+		t.Fatalf("state = job %q/%q rec %q failures %d, want error with health bump", status, errText, lastErr, failures)
+	}
+}
+
+func recordingJobReq(id int64, principal nodePrincipal) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/recording/jobs/%d/complete", id), nil)
+	rc := chi.NewRouteContext()
+	rc.URLParams.Add("id", fmt.Sprintf("%d", id))
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, rc)
+	ctx = context.WithValue(ctx, nodePrincipalContextKey, principal)
+	return req.WithContext(ctx)
+}
+
 func deliveryPatchReq(id, accountID int64, delivery string) *http.Request {
 	req := patchRequest(id, accountID, map[string]any{"delivery": delivery})
 	return req
@@ -336,8 +384,26 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 		`CREATE TABLE recording_clips (
 			id BIGSERIAL PRIMARY KEY,
 			recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+			recording_job_id BIGINT,
 			storage_destination_id BIGINT,
 			clip_start_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE recording_jobs (
+			id BIGSERIAL PRIMARY KEY,
+			recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+			fire_at TIMESTAMPTZ NOT NULL,
+			scheduled_for TIMESTAMPTZ NOT NULL,
+			clip_duration_sec INT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			lease_owner TEXT,
+			lease_expires_at TIMESTAMPTZ,
+			attempt_count INT NOT NULL DEFAULT 0,
+			error_text TEXT NOT NULL DEFAULT '',
+			idempotency_key TEXT NOT NULL UNIQUE,
+			kind TEXT NOT NULL DEFAULT 'clip',
+			window_end_at TIMESTAMPTZ,
+			completed_at TIMESTAMPTZ,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

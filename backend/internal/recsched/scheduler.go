@@ -365,6 +365,30 @@ func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, r
 		}
 		idemKey := fmt.Sprintf("reccont:%d:%d", rec.id, windowOpenUTC.Unix())
 		ct, err := tx.Exec(ctx, `
+			UPDATE recording_jobs j
+			SET status='pending',
+			    scheduled_for=now(),
+			    clip_duration_sec=$2,
+			    lease_owner=NULL,
+			    lease_expires_at=NULL,
+			    attempt_count=0,
+			    error_text='',
+			    completed_at=NULL,
+			    window_end_at=$3,
+			    updated_at=now()
+			WHERE j.recording_id=$1
+			  AND j.idempotency_key=$4
+			  AND j.kind='continuous_window'
+			  AND j.status='done'
+			  AND NOT EXISTS (SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id)
+		`, rec.id, rec.clipDurationSec, effectiveEnd, idemKey)
+		if err != nil {
+			return 0, fmt.Errorf("revive zero-clip continuous window job: %w", err)
+		}
+		if ct.RowsAffected() == 1 {
+			enqueued = 1
+		}
+		ct, err = tx.Exec(ctx, `
 			INSERT INTO recording_jobs (recording_id, fire_at, scheduled_for, clip_duration_sec, status, idempotency_key, kind, window_end_at)
 			VALUES ($1, $2, $2, $3, 'pending', $4, 'continuous_window', $5)
 			ON CONFLICT (idempotency_key) DO NOTHING

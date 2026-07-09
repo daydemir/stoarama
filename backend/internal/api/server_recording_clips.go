@@ -722,8 +722,8 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleRecordingJobComplete marks the job done. There is no self-reschedule;
-// the scheduler owns the next fire.
+// handleRecordingJobComplete marks the job done. A continuous window that produced
+// no clips is a failed capture, not a successful recording.
 func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Request) {
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
@@ -735,6 +735,58 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	workerID := recorderWorkerID(principal)
+
+	var (
+		recordingID int64
+		kind        string
+		clipCount   int64
+	)
+	err := s.pool.QueryRow(r.Context(), `
+		SELECT j.recording_id, j.kind, COUNT(c.id)
+		FROM recording_jobs j
+		LEFT JOIN recording_clips c ON c.recording_job_id=j.id
+		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+		GROUP BY j.id
+	`, id, workerID).Scan(&recordingID, &kind, &clipCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording job: %v", err))
+		return
+	}
+	if kind == "continuous_window" && clipCount == 0 {
+		errText := "continuous recording produced no clips"
+		tx, err := s.pool.Begin(r.Context())
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin complete tx: %v", err))
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE recording_jobs
+			SET status='error', completed_at=now(), lease_expires_at=NULL, error_text=$3, updated_at=now()
+			WHERE id=$1 AND status='leased' AND lease_owner=$2
+		`, id, workerID, errText); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("mark empty continuous job failed: %v", err))
+			return
+		}
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE recordings
+			SET consecutive_failures = consecutive_failures + 1, last_error_text=$2, last_error_at=now(), updated_at=now()
+			WHERE id=$1
+		`, recordingID, errText); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("bump recording health: %v", err))
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit complete tx: %v", err))
+			return
+		}
+		util.WriteError(w, http.StatusConflict, errText)
+		return
+	}
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE recording_jobs
 		SET status='done', completed_at=now(), lease_expires_at=NULL, updated_at=now()
