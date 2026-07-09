@@ -2718,6 +2718,11 @@
         const e = parseHM(rec.daily_window_end);
         const nowMin = tzNowMinutes(tz);
         if (s != null && e != null && nowMin != null) {
+          if (s === e) return { phase: 'open', nextLabel: null };
+          if (e < s) {
+            if (nowMin >= s || nowMin < e) return { phase: 'open', nextLabel: null };
+            return { phase: 'after', nextLabel: hmClockLabel(s, tz) };
+          }
           if (nowMin < s) return { phase: 'before', nextLabel: hmClockLabel(s, tz) };
           if (nowMin < e) return { phase: 'open', nextLabel: null };
           return { phase: 'after', nextLabel: hmClockLabel(s, tz) };
@@ -2755,18 +2760,18 @@
       if (isCompleted(rec) || status === 'completed' || w.phase === 'after') {
         return { tone: 'muted', text: t ? `Between windows. Next at <b>${t}</b>.` : 'Window ended.' };
       }
-      // S4: no computer at all
-      if (total === 0) return { tone: 'offline', text: 'No computer connected. This recording needs one to record.', link: connectLink };
-      // S5: in window, computer online but not started
-      if (w.phase === 'open' && online > 0) return { tone: 'wait', text: 'A computer is online but has not started this recording yet. If this keeps up, check the relay app is running.' };
-      // S6: in window, no computer online
-      if (w.phase === 'open' && online === 0) return { tone: 'offline', text: 'No computer is online, so this recording is not capturing right now.', link: connectLink };
       // S7: upcoming, free slots
       if (w.phase === 'before' && online > 0 && slots > 0) return { tone: 'wait', text: `A computer is online with <b>${slots}</b> free slot(s) now. Slots are not reserved; capacity is claimed when the window opens at <b>${t || 'the next window'}</b>.` };
       // S8: upcoming, full
       if (w.phase === 'before' && online > 0 && slots === 0) return { tone: 'wait', text: `Computers are online but every slot is in use right now. This records at <b>${t || 'the next window'}</b> only if a slot frees first.` };
       // S9: upcoming, offline
-      if (w.phase === 'before' && online === 0) return { tone: 'offline', text: `No computer is online. This will not record at <b>${t || 'the next window'}</b> unless one connects before then.`, link: connectLink };
+      if (w.phase === 'before' && online === 0) return { tone: 'muted', text: `Between windows. Next at <b>${t || 'the next window'}</b>.` };
+      // S4: no computer at all, only relevant once the window is open
+      if (total === 0) return { tone: 'offline', text: 'No computer connected. This recording needs one to record.', link: connectLink };
+      // S5: in window, computer online but not started
+      if (w.phase === 'open' && online > 0) return { tone: 'wait', text: 'A computer is online but has not started this recording yet. If this keeps up, check the relay app is running.' };
+      // S6: in window, no computer online
+      if (w.phase === 'open' && online === 0) return { tone: 'offline', text: 'No computer is online, so this recording is not capturing right now.', link: connectLink };
       return { tone: 'wait', text: 'Starting shortly on <b>your computer</b>.' };
     }
 
@@ -2777,12 +2782,12 @@
       if (name != null) return `Your computer &middot; <b>${escapeHTML(name)}</b> (recording now)`;
       if (status === 'paused') return 'Your computer &middot; <b>paused</b>';
       if (isCompleted(rec) || status === 'completed' || w.phase === 'after') return 'Your computer &middot; <b>between windows</b>';
+      if (w.phase === 'before' && online > 0 && slots > 0) return `Your computer &middot; <b>online, ${slots} free now</b>`;
+      if (w.phase === 'before' && online > 0 && slots === 0) return 'Your computer &middot; <b>online, no free slots now</b>';
+      if (w.phase === 'before' && online === 0) return 'Your computer &middot; <b>between windows</b>';
       if (total === 0) return 'Your computer &middot; <b>none connected</b>';
       if (w.phase === 'open' && online > 0) return 'Your computer &middot; <b>online, not yet recording</b>';
       if (w.phase === 'open' && online === 0) return 'Your computer &middot; <b>none online</b>';
-      if (w.phase === 'before' && online > 0 && slots > 0) return `Your computer &middot; <b>online, ${slots} free now</b>`;
-      if (w.phase === 'before' && online > 0 && slots === 0) return 'Your computer &middot; <b>online, no free slots now</b>';
-      if (w.phase === 'before' && online === 0) return 'Your computer &middot; <b>none online</b>';
       return 'Your computer';
     }
 
