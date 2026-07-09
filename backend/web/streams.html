@@ -2402,13 +2402,6 @@ function parseBool(v) {
 
 function buildYouTubeWatchURL(stream) {
   if (!stream || typeof stream !== 'object') return '';
-  const mode = String(stream.capture_type || '').trim().toLowerCase();
-  const provider = String(stream.provider || '').trim().toLowerCase();
-  const externalID = String(stream.external_id || '').trim();
-  if (externalID && (mode === 'youtube_watch' || provider === 'youtube')) {
-    return `https://www.youtube.com/watch?v=${encodeURIComponent(externalID)}`;
-  }
-
   const candidates = [stream.source_url, stream.source_page_url].map((v) => String(v || '').trim()).filter(Boolean);
   for (const raw of candidates) {
     try {
@@ -2424,6 +2417,12 @@ function buildYouTubeWatchURL(stream) {
         return raw;
       }
     } catch (_) {}
+  }
+  const mode = String(stream.capture_type || '').trim().toLowerCase();
+  const provider = String(stream.provider || '').trim().toLowerCase();
+  const externalID = String(stream.external_id || '').trim();
+  if (externalID && /^[A-Za-z0-9_-]{11}$/.test(externalID) && (mode === 'youtube_watch' || provider === 'youtube')) {
+    return `https://www.youtube.com/watch?v=${encodeURIComponent(externalID)}`;
   }
   return '';
 }
@@ -3418,10 +3417,9 @@ function syncDetailMutationUI(payload) {
     detailDeleteStreamBtn.style.display = isAdminAccount() ? '' : 'none';
   }
   if (detailRecordCTA instanceof HTMLAnchorElement) {
-    // Only offer the managed recorder for streams it can actually capture (HLS or
-    // direct HTTP video), mirroring the browse-table row. YouTube and still-image
-    // streams cannot be hosted-recorded, so hide the CTA; the "Record this
-    // yourself" block below covers self-capture for those.
+    // Only offer the managed recorder for streams it can actually capture,
+    // mirroring the browse-table row. Still-image streams cannot be hosted-recorded,
+    // so hide the CTA; the "Record this yourself" block below covers self-capture.
     if (isRecordableStream(s)) {
       const recordingID = streamRecordingID(p);
       if (recordingID > 0) {
@@ -5458,12 +5456,11 @@ function teardownDetailLivePlayer() {
 }
 
 // Decide how to play a stream inline. Returns 'youtube' | 'hls' | 'direct' | 'none'.
-// isRecordableStream mirrors the recorder's accepted source kinds (live HLS and
-// direct HTTP(S) video). It drives both the browse "Recordable" segment and the
-// per-row Record-vs-View CTA so the two never disagree.
+// isRecordableStream mirrors the recorder's accepted source kinds. It drives both
+// the browse "Recordable" segment and the per-row Record-vs-View CTA.
 function isRecordableStream(stream) {
   const ct = String((stream && stream.capture_type) || '').trim().toLowerCase();
-  return ct === 'hls' || ct === 'http_video';
+  return ct === 'hls' || ct === 'http_video' || Boolean(buildYouTubeWatchURL(stream));
 }
 
 // The acting org's latest non-canceled recording id for this stream, or 0 when
@@ -5488,7 +5485,7 @@ function isIndirectHlsSource(stream) {
 function isRefreshableHlsSource(stream) {
   const s = stream || {};
   const provider = String(s.provider || '').trim().toUpperCase();
-  return isIndirectHlsSource(s) || provider === 'SKYLINEWEBCAMS';
+  return isIndirectHlsSource(s) || provider === 'SKYLINEWEBCAMS' || provider === 'EARTHCAM';
 }
 
 function isSkylineStream(stream) {
@@ -5534,9 +5531,8 @@ function detailDirectVideoURL(stream) {
 
 function detailPlayerKind(stream) {
   const s = stream || {};
-  const provider = String(s.provider || '').trim().toUpperCase();
-  const externalID = String(s.external_id || '').trim();
-  if (provider === 'YOUTUBE' && externalID) return 'youtube';
+  if (buildYouTubeWatchURL(s)) return 'youtube';
+  if (isRefreshableHlsSource(s)) return 'hls';
   if (detailHlsURL(s)) return 'hls';
   if (detailDirectVideoURL(s)) return 'direct';
   return 'none';
@@ -5575,7 +5571,7 @@ function seekNativeVideoToLiveEdge(video) {
 // source fails (e.g. upstream genuinely down), so a black box is never shown.
 function showDetailNoInlineFallback(stream) {
   teardownDetailLivePlayer();
-  const ext = buildPreferredViewURL(stream);
+  const ext = streamSourcePageURL(stream) || streamSourceURL(stream) || buildPreferredViewURL(stream);
   if (detailNoInlineNote instanceof HTMLElement && detailNoInlineLink instanceof HTMLAnchorElement) {
     if (ext) { detailNoInlineLink.href = ext; detailNoInlineLink.style.display = ''; }
     else { detailNoInlineLink.removeAttribute('href'); detailNoInlineLink.style.display = 'none'; }
@@ -5629,7 +5625,7 @@ async function mountDetailLivePlayer(stream) {
     return;
   }
   if (kind === 'youtube') {
-    const id = encodeURIComponent(String(stream.external_id || '').trim());
+    const id = encodeURIComponent(new URL(buildYouTubeWatchURL(stream)).searchParams.get('v') || '');
     const iframe = document.createElement('iframe');
     iframe.src = `https://www.youtube.com/embed/${id}?autoplay=1&mute=1`;
     iframe.allow = 'autoplay; encrypted-media; picture-in-picture';

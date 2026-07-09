@@ -2343,13 +2343,6 @@ function parseBool(v) {
 
 function buildYouTubeWatchURL(stream) {
   if (!stream || typeof stream !== 'object') return '';
-  const mode = String(stream.capture_type || '').trim().toLowerCase();
-  const provider = String(stream.provider || '').trim().toLowerCase();
-  const externalID = String(stream.external_id || '').trim();
-  if (externalID && (mode === 'youtube_watch' || provider === 'youtube')) {
-    return `https://www.youtube.com/watch?v=${encodeURIComponent(externalID)}`;
-  }
-
   const candidates = [stream.source_url, stream.source_page_url].map((v) => String(v || '').trim()).filter(Boolean);
   for (const raw of candidates) {
     try {
@@ -2365,6 +2358,12 @@ function buildYouTubeWatchURL(stream) {
         return raw;
       }
     } catch (_) {}
+  }
+  const mode = String(stream.capture_type || '').trim().toLowerCase();
+  const provider = String(stream.provider || '').trim().toLowerCase();
+  const externalID = String(stream.external_id || '').trim();
+  if (externalID && /^[A-Za-z0-9_-]{11}$/.test(externalID) && (mode === 'youtube_watch' || provider === 'youtube')) {
+    return `https://www.youtube.com/watch?v=${encodeURIComponent(externalID)}`;
   }
   return '';
 }
