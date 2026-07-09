@@ -809,6 +809,7 @@
     // healthy; AMBER "Last seen X ago" when it has heartbeat but gone stale; RED "Never
     // connected" when it has never checked in. Never blindly green.
     function relayLiveness(n) {
+      if (String(n.status) === 'disabled') return { color: '#94a3b8', label: 'Disabled' };
       if (n.healthy === true) return { color: '#22c55e', label: 'Connected' };
       const secs = Number(n.seconds_since_heartbeat);
       if (n.last_heartbeat_at && Number.isFinite(secs)) {
@@ -827,9 +828,11 @@
       const platform = relayPlatformLabel(n.platform);
       const max = Number(n.relay_max_streams || 6);
       const liveLeases = Number(n.live_leases || 0);
-      const isOnline = n.healthy === true;
+      const disabled = String(n.status) === 'disabled';
+      const isOnline = !disabled && n.healthy === true;
       const recNow = isOnline ? String(liveLeases) : 'n/a';
       const freeNow = isOnline ? String(Math.max(0, max - liveLeases)) : 'n/a';
+      const toggleLabel = disabled ? 'Enable' : 'Disable';
       return `<div class="rec-row">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
           <div style="min-width:0;">
@@ -838,6 +841,7 @@
           </div>
           <div style="display:flex;gap:8px;flex-shrink:0;">
             <button class="secondary small relay-rename" type="button" data-id="${id}">Rename</button>
+            <button class="secondary small relay-toggle" type="button" data-id="${id}" data-status="${disabled ? 'active' : 'disabled'}">${toggleLabel}</button>
             <button class="secondary small relay-remove" type="button" data-id="${id}">Remove</button>
           </div>
         </div>
@@ -851,13 +855,14 @@
 
     function renderRelaySummary(items) {
       const total = items.length;
-      const online = items.filter((n) => n.healthy === true).length;
-      const liveLeases = items.reduce((s, n) => s + Number(n.live_leases || 0), 0);
-      const availSlots = items.filter((n) => n.healthy === true).reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 6) - Number(n.live_leases || 0)), 0);
+      const enabled = items.filter((n) => String(n.status) !== 'disabled');
+      const online = enabled.filter((n) => n.healthy === true).length;
+      const liveLeases = enabled.reduce((s, n) => s + Number(n.live_leases || 0), 0);
+      const availSlots = enabled.filter((n) => n.healthy === true).reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 6) - Number(n.live_leases || 0)), 0);
       const red = online === 0 && total > 0;
       const borderColor = red ? 'var(--err)' : 'var(--border)';
       const headline = red ? `<div style="font-weight:600;color:var(--err);margin-bottom:8px;">No computer online. Active relay recordings are not capturing.</div>` : '';
-      return `<div style="border:1px solid ${borderColor};border-radius:12px;padding:10px 12px;background:color-mix(in srgb,var(--panel2) 86%,transparent);">${headline}<dl class="bill-meta"><dt>Computers online</dt><dd>${online} / ${total}</dd><dt>Recording now</dt><dd>${liveLeases}</dd><dt>Free slots now</dt><dd>${availSlots}</dd></dl><div class="sub" style="margin-top:8px;">Free slots are what is open right now, not a reservation. Assignment happens when a window opens.</div></div>`;
+      return `<div style="border:1px solid ${borderColor};border-radius:12px;padding:10px 12px;background:color-mix(in srgb,var(--panel2) 86%,transparent);">${headline}<dl class="bill-meta"><dt>Computers online</dt><dd>${online} / ${enabled.length}</dd><dt>Disabled</dt><dd>${total - enabled.length}</dd><dt>Recording now</dt><dd>${liveLeases}</dd><dt>Free slots now</dt><dd>${availSlots}</dd></dl><div class="sub" style="margin-top:8px;">Disabled computers stay connected but will not receive new recording jobs.</div></div>`;
     }
 
     async function loadRelays() {
@@ -868,7 +873,7 @@
       relayEmpty.classList.add('hidden');
       try {
         const data = await fetchJSON('/api/v1/account/nodes');
-        const items = (Array.isArray(data.items) ? data.items : []).filter((n) => String(n.node_type) === 'relay' && String(n.status) === 'active');
+        const items = (Array.isArray(data.items) ? data.items : []).filter((n) => String(n.node_type) === 'relay');
         if (items.length === 0) {
           relayList.innerHTML = '';
           relayEmpty.classList.remove('hidden');
@@ -881,6 +886,9 @@
         relayList.classList.remove('hidden');
         relayList.querySelectorAll('.relay-rename').forEach((btn) => {
           btn.addEventListener('click', () => renameRelay(Number(btn.getAttribute('data-id'))));
+        });
+        relayList.querySelectorAll('.relay-toggle').forEach((btn) => {
+          btn.addEventListener('click', () => toggleRelay(Number(btn.getAttribute('data-id')), btn.getAttribute('data-status')));
         });
         relayList.querySelectorAll('.relay-remove').forEach((btn) => {
           btn.addEventListener('click', () => removeRelay(Number(btn.getAttribute('data-id'))));
@@ -939,6 +947,21 @@
       try {
         await fetchJSON(`/api/v1/account/nodes/${id}`, { method: 'DELETE' });
         setStatus(relayStatus, 'Computer removed and its token revoked', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function toggleRelay(id, status) {
+      const next = status === 'active' ? 'active' : 'disabled';
+      try {
+        await fetchJSON(`/api/v1/account/nodes/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: next }),
+        });
+        setStatus(relayStatus, next === 'active' ? 'Computer enabled' : 'Computer disabled', 'ok');
         await loadRelays();
       } catch (err) {
         setStatus(relayStatus, String(err.message || err), 'err');

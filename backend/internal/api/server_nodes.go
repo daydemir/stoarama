@@ -387,14 +387,16 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 type nodePatchRequest struct {
 	DisplayName     *string `json:"display_name"`
 	RelayMaxStreams *int    `json:"relay_max_streams"`
+	Status          *string `json:"status"`
 }
 
-// handleAccountNodePatch renames a relay node and/or adjusts its per-node stream cap.
-// Both fields are optional; only the ones present in the body are updated (COALESCE
-// against the current value). Scoped to node_type='relay' AND the caller's account, so
-// a user can never touch an operator droplet or another tenant's node. relay_max_streams
-// is bounded 1..20 (the relay mirrors it as its worker semaphore; the DB CHECK enforces
-// >= 1 as the floor).
+// handleAccountNodePatch renames a relay node, adjusts its stream cap, and/or
+// toggles whether it can lease new jobs.
+// Only fields present in the body are updated (COALESCE against the current
+// value). Scoped to node_type='relay' AND the caller's account, so a user can never
+// touch an operator droplet or another tenant's node. relay_max_streams is bounded
+// 1..20 (the relay mirrors it as its worker semaphore; the DB CHECK enforces >= 1
+// as the floor).
 func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -410,8 +412,8 @@ func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.DisplayName == nil && req.RelayMaxStreams == nil {
-		util.WriteError(w, http.StatusBadRequest, "display_name or relay_max_streams is required")
+	if req.DisplayName == nil && req.RelayMaxStreams == nil && req.Status == nil {
+		util.WriteError(w, http.StatusBadRequest, "display_name, relay_max_streams, or status is required")
 		return
 	}
 	var displayNameArg any
@@ -435,13 +437,23 @@ func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) 
 		}
 		relayMaxArg = *req.RelayMaxStreams
 	}
+	var statusArg any
+	if req.Status != nil {
+		status := strings.TrimSpace(*req.Status)
+		if status != "active" && status != "disabled" {
+			util.WriteError(w, http.StatusBadRequest, "status must be active or disabled")
+			return
+		}
+		statusArg = status
+	}
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE nodes
 		SET display_name=COALESCE($3, display_name),
 		    relay_max_streams=COALESCE($4, relay_max_streams),
+		    status=COALESCE($5, status),
 		    updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND node_type='relay'
-	`, id, principal.AccountID, displayNameArg, relayMaxArg)
+	`, id, principal.AccountID, displayNameArg, relayMaxArg, statusArg)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update node: %v", err))
 		return
