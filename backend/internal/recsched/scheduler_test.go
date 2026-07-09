@@ -281,6 +281,9 @@ func TestContinuousDoesNotReviveDoneJobWithClips(t *testing.T) {
 	`, recID, jobID, windowOpen); err != nil {
 		t.Fatalf("insert clip: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET window_end_at=$2 WHERE id=$1`, jobID, time.Date(2026, 7, 9, 11, 30, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("set window end: %v", err)
+	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -314,6 +317,58 @@ func TestContinuousDoesNotReviveDoneJobWithClips(t *testing.T) {
 	}
 	if status != "done" {
 		t.Fatalf("status=%q want done", status)
+	}
+}
+
+func TestContinuousRevivesDoneJobWithClipsWhenWindowExtended(t *testing.T) {
+	pool, cleanup := testSchedulerPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	recID := insertSchedulerContinuousRecording(t, pool)
+	now := time.Date(2026, 7, 9, 10, 53, 0, 0, time.UTC)
+	windowOpen := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
+	jobID := insertSchedulerContinuousJob(t, pool, recID, windowOpen, "done")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at)
+		VALUES ($1, $2, $3)
+	`, recID, jobID, windowOpen); err != nil {
+		t.Fatalf("insert clip: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	rec := activeRecording{
+		id:               recID,
+		mode:             "continuous",
+		cronTimezone:     "UTC",
+		clipDurationSec:  60,
+		dailyWindowStart: strPtr("09:00:00"),
+		dailyWindowEnd:   strPtr("11:30:00"),
+		startAt:          time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+	}
+	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("enqueue continuous: %v", err)
+	}
+	if got != 1 {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("enqueued=%d want 1", got)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	var status string
+	var windowEnd time.Time
+	if err := pool.QueryRow(ctx, `SELECT status, window_end_at FROM recording_jobs WHERE id=$1`, jobID).Scan(&status, &windowEnd); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "pending" || !windowEnd.Equal(time.Date(2026, 7, 9, 11, 30, 0, 0, time.UTC)) {
+		t.Fatalf("state=%q end=%s want pending extended to 11:30", status, windowEnd)
 	}
 }
 

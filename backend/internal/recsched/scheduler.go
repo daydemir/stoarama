@@ -382,6 +382,7 @@ func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, r
 			  AND j.status IN ('done', 'canceled')
 			  AND (
 			    j.status='canceled'
+			    OR j.window_end_at < $3
 			    OR NOT EXISTS (SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id)
 			  )
 		`, rec.id, rec.clipDurationSec, effectiveEnd, idemKey)
