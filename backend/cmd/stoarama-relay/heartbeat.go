@@ -12,6 +12,10 @@ import (
 
 const heartbeatInterval = 30 * time.Second
 
+type relayDiagnostics interface {
+	Snapshot() map[string]any
+}
+
 // relayHeartbeatLoop reports this relay's liveness and capabilities every 30s. It
 // refreshes the cookieless YouTube probe when due (5 min while failing, 1 hour while
 // healthy) and posts the capabilities to POST /api/v1/node/heartbeat, which sets
@@ -20,7 +24,7 @@ const heartbeatInterval = 30 * time.Second
 // (see runRelay) and stays stable for the process lifetime, so re-probing here only
 // updates the reported youtube_ready/youtube_error visibility, never the live capture
 // env (no race).
-func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, cfg relayConfig) {
+func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, cfg relayConfig, diag relayDiagnostics) {
 	bd, _ := binDir()
 	ffmpegVer := ffmpegVersion(filepath.Join(bd, "ffmpeg"))
 
@@ -41,6 +45,9 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			"ytdlp_version":          pr.ytdlpVersion(),
 			"ffmpeg_version":         ffmpegVer,
 			"max_concurrent_streams": cfg.Concurrency,
+		}
+		if diag != nil {
+			caps["recording_job"] = diag.Snapshot()
 		}
 		hctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		err := client.NodeHeartbeat(hctx, caps)

@@ -58,6 +58,7 @@ func runRelay(ctx context.Context) error {
 	}
 
 	var activeJobs atomic.Int64
+	relayDiag := &recordingworker.RelayDiagnostics{}
 	worker, err := recordingworker.NewWorker(recordingworker.Config{
 		Client:                      client,
 		WorkerID:                    fmt.Sprintf("node:%d", cfg.NodeID),
@@ -67,6 +68,7 @@ func runRelay(ctx context.Context) error {
 		SkipDropletHeartbeat:        true,
 		ClassifyYouTubeCookieErrors: true,
 		ActiveJobs:                  &activeJobs,
+		RelayDiagnostics:            relayDiag,
 	})
 	if err != nil {
 		return fmt.Errorf("init relay worker: %w", err)
@@ -85,7 +87,7 @@ func runRelay(ctx context.Context) error {
 	log.Printf("stoarama-relay run node=%d concurrency=%d api=%s youtube_ready=%t youtube_error=%q",
 		cfg.NodeID, cfg.Concurrency, cfg.APIURL, pr.ok(), pr.errorClass())
 
-	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg)
+	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag)
 	go selfUpdateLoop(ctx, cfg.APIURL)
 
 	return worker.Run(ctx)

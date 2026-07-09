@@ -3,6 +3,8 @@ package recordingworker
 import (
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
 // TestContinuousShouldStop locks the supervisor loop's stop-vs-reconnect decision.
@@ -75,6 +77,41 @@ func TestReconnectBackoff(t *testing.T) {
 		if got := reconnectBackoff(tc.failures); got != tc.want {
 			t.Fatalf("reconnectBackoff(%d) = %s, want %s", tc.failures, got, tc.want)
 		}
+	}
+}
+
+func TestRelayDiagnosticsSnapshotRedactsURLs(t *testing.T) {
+	d := &RelayDiagnostics{}
+	job := recordingapi.RecordingJob{JobID: 123, RecordingID: 456}
+	d.Start(job)
+	d.Stage(job.JobID, "capturing")
+	d.Error(job.JobID, "capture_retry", errString("ffmpeg failed https://example.com/live.m3u8?token=secret"))
+
+	snap := d.Snapshot()
+	current := snap["current"].(map[string]any)
+	if current["job_id"] != int64(123) || current["recording_id"] != int64(456) {
+		t.Fatalf("current ids = (%v,%v), want (123,456)", current["job_id"], current["recording_id"])
+	}
+	if current["stage"] != "capture_retry" {
+		t.Fatalf("stage=%v want capture_retry", current["stage"])
+	}
+	if got := current["last_error"]; got != "ffmpeg failed [url]" {
+		t.Fatalf("last_error=%q want redacted url", got)
+	}
+
+	segAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	d.Segment(job.JobID, segAt)
+	d.Finish(job.JobID, "done", nil)
+	snap = d.Snapshot()
+	if snap["current"] != nil {
+		t.Fatalf("current=%v want nil after finish", snap["current"])
+	}
+	last := snap["last"].(map[string]any)
+	if last["segment_count"] != 1 {
+		t.Fatalf("last segment_count=%v want 1", last["segment_count"])
+	}
+	if last["last_segment_at"] != segAt.Format(time.RFC3339Nano) {
+		t.Fatalf("last_segment_at=%v want %s", last["last_segment_at"], segAt.Format(time.RFC3339Nano))
 	}
 }
 
