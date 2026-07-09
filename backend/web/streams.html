@@ -5798,6 +5798,7 @@ function selfRecordCommand(stream) {
       note: 'Skyline tokens are short-lived and browser-protected. Use the source page with yt-dlp for local captures.',
     };
   }
+  if (String(s.provider || '').trim().toUpperCase() === 'EARTHCAM' && captureType === 'hls') return null;
   let playURL = detailHlsURL(s);
   if (!playURL && directVideo && sourceURL && !sourceURL.includes('!')) playURL = sourceURL;
   if (playURL) {
