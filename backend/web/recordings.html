@@ -2735,11 +2735,15 @@
 
     // Shared relay classification context, read from state fleet counters + rec fields.
     function _relayCtx(rec) {
+      const recHasRelay = rec.has_relay_online === true;
+      const online = Number(state.fleetRelayOnline || 0);
+      const total = Number(state.fleetRelayTotal || 0);
+      const slots = Number(state.fleetRelayAvailableSlots || 0);
       return {
         name: rec.relay_node_name ? String(rec.relay_node_name) : null,
-        online: Number(state.fleetRelayOnline || 0),
-        total: Number(state.fleetRelayTotal || 0),
-        slots: Number(state.fleetRelayAvailableSlots || 0),
+        online: online || (recHasRelay ? 1 : 0),
+        total: total || (recHasRelay ? 1 : 0),
+        slots: slots || (recHasRelay ? 1 : 0),
         status: String(rec.status || ''),
         w: relayWindowPhase(rec),
       };
