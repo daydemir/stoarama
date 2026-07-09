@@ -446,7 +446,14 @@ func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) 
 		}
 		statusArg = status
 	}
-	ct, err := s.pool.Exec(r.Context(), `
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin node update tx: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE nodes
 		SET display_name=COALESCE($3, display_name),
 		    relay_max_streams=COALESCE($4, relay_max_streams),
@@ -460,6 +467,20 @@ func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) 
 	}
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusNotFound, "node not found")
+		return
+	}
+	if statusArg == "disabled" {
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE recording_jobs
+			SET status='canceled', lease_owner=NULL, lease_expires_at=NULL, updated_at=now()
+			WHERE lease_owner=$1 AND status IN ('pending','leased')
+		`, fmt.Sprintf("node:%d", id)); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("cancel node jobs: %v", err))
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit node update tx: %v", err))
 		return
 	}
 	node, err := s.fetchNodeByID(r.Context(), id)

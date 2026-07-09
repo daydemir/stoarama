@@ -228,6 +228,41 @@ func TestRecordingJobCompleteRejectsZeroClipContinuous(t *testing.T) {
 	}
 }
 
+func TestRecordingPauseCancelsActiveJobs(t *testing.T) {
+	pool, cleanup := testRecordingPatchPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const accountID = int64(42)
+	destID := insertPatchDestination(t, pool, accountID)
+	recID := insertPatchRecording(t, pool, accountID, destID, "managed")
+	var jobID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_jobs
+			(recording_id, fire_at, scheduled_for, clip_duration_sec, status, lease_owner, attempt_count, idempotency_key, kind, window_end_at)
+		VALUES ($1, now(), now(), 60, 'leased', 'node:7', 1, 'recpause-test', 'continuous_window', now()+interval '1 hour')
+		RETURNING id
+	`, recID).Scan(&jobID); err != nil {
+		t.Fatalf("insert job: %v", err)
+	}
+
+	s := &Server{pool: pool}
+	rec := httptest.NewRecorder()
+	s.handleAccountRecordingPause(rec, patchRequest(recID, accountID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pause: status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	var status string
+	var leaseOwner *string
+	if err := pool.QueryRow(ctx, `SELECT status, lease_owner FROM recording_jobs WHERE id=$1`, jobID).Scan(&status, &leaseOwner); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "canceled" || leaseOwner != nil {
+		t.Fatalf("job state = %q owner %v, want canceled with nil owner", status, leaseOwner)
+	}
+}
+
 func recordingJobReq(id int64, principal nodePrincipal) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/recording/jobs/%d/complete", id), nil)
 	rc := chi.NewRouteContext()

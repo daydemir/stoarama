@@ -1872,6 +1872,16 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 		util.WriteError(w, http.StatusConflict, "recording status changed concurrently")
 		return
 	}
+	if toStatus == "paused" {
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE recording_jobs
+			SET status='canceled', lease_owner=NULL, lease_expires_at=NULL, updated_at=now()
+			WHERE recording_id=$1 AND status IN ('pending','leased')
+		`, id); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("cancel recording jobs: %v", err))
+			return
+		}
+	}
 
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit status tx: %v", err))

@@ -317,6 +317,57 @@ func TestContinuousDoesNotReviveDoneJobWithClips(t *testing.T) {
 	}
 }
 
+func TestContinuousRevivesCanceledJobWithClips(t *testing.T) {
+	pool, cleanup := testSchedulerPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	recID := insertSchedulerContinuousRecording(t, pool)
+	now := time.Date(2026, 7, 9, 10, 53, 0, 0, time.UTC)
+	windowOpen := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
+	jobID := insertSchedulerContinuousJob(t, pool, recID, windowOpen, "canceled")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at)
+		VALUES ($1, $2, $3)
+	`, recID, jobID, windowOpen); err != nil {
+		t.Fatalf("insert clip: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	rec := activeRecording{
+		id:               recID,
+		mode:             "continuous",
+		cronTimezone:     "UTC",
+		clipDurationSec:  60,
+		dailyWindowStart: strPtr("09:00:00"),
+		dailyWindowEnd:   strPtr("11:30:00"),
+		startAt:          time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+	}
+	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("enqueue continuous: %v", err)
+	}
+	if got != 1 {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("enqueued=%d want 1", got)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM recording_jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("status=%q want pending", status)
+	}
+}
+
 func strPtr(s string) *string { return &s }
 
 func insertSchedulerContinuousRecording(t *testing.T, pool *pgxpool.Pool) int64 {

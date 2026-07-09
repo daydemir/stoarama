@@ -379,8 +379,11 @@ func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, r
 			WHERE j.recording_id=$1
 			  AND j.idempotency_key=$4
 			  AND j.kind='continuous_window'
-			  AND j.status='done'
-			  AND NOT EXISTS (SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id)
+			  AND j.status IN ('done', 'canceled')
+			  AND (
+			    j.status='canceled'
+			    OR NOT EXISTS (SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id)
+			  )
 		`, rec.id, rec.clipDurationSec, effectiveEnd, idemKey)
 		if err != nil {
 			return 0, fmt.Errorf("revive zero-clip continuous window job: %w", err)
