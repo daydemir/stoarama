@@ -1281,7 +1281,12 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		UPDATE recordings
 		SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6,
 		    daily_window_start=$7, daily_window_end=$8, target_fps=$9,
-		    start_at=$10, end_at=$11, next_fire_at=$12, updated_at=now()
+		    start_at=$10, end_at=$11, next_fire_at=$12,
+		    status=CASE WHEN status='completed' THEN 'active' ELSE status END,
+		    consecutive_failures=CASE WHEN status='completed' THEN 0 ELSE consecutive_failures END,
+		    last_error_text=CASE WHEN status='completed' THEN '' ELSE last_error_text END,
+		    last_error_at=CASE WHEN status='completed' THEN NULL ELSE last_error_at END,
+		    updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
 	`, id, principal.AccountID, mode, cronExprForNext, cronTimezone, clipDuration,
 		dwStartForNext, dwEndForNext, targetFPSArg, startAt, endAtArg, nextFireArg)

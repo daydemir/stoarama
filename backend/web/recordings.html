@@ -3511,12 +3511,13 @@
       rows.push(['Recording window', `${startTxt || 'Now'} to ${endTxt || 'open-ended'}`]);
       const nextTxt = fmtInstant(rec.next_fire_at);
       if (nextTxt) rows.push(['Next run', nextTxt]);
-      const editable = String(rec.status || '') !== 'canceled' && !isCompleted(rec);
+      const editable = String(rec.status || '') !== 'canceled';
+      const editLabel = isCompleted(rec) ? 'Record again' : 'Edit schedule';
       return `
         <div class="detail-card">
           <div class="detail-card-head">
             <span class="detail-card-title">Schedule</span>
-            ${editable ? `<button type="button" class="secondary" data-schededit style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Edit schedule</button>` : ''}
+            ${editable ? `<button type="button" class="secondary" data-schededit style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">${editLabel}</button>` : ''}
           </div>
           <dl class="detail-rows">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
           <div id="schedEditForm" class="detail-edit hidden"></div>
@@ -3765,7 +3766,7 @@
       const form = els.clipPage.querySelector('#schedEditForm');
       const editBtn = els.clipPage.querySelector('button[data-schededit]');
       if (!form) return;
-      if (!form.classList.contains('hidden')) { form.classList.add('hidden'); form.innerHTML = ''; if (editBtn) editBtn.textContent = 'Edit schedule'; return; }
+      if (!form.classList.contains('hidden')) { form.classList.add('hidden'); form.innerHTML = ''; if (editBtn) editBtn.textContent = isCompleted(rec) ? 'Record again' : 'Edit schedule'; return; }
       if (editBtn) editBtn.textContent = 'Close';
       const mode = String(rec.mode || 'sampled') === 'continuous' ? 'continuous' : 'sampled';
       const tz = String(rec.cron_timezone || browserTimezone());
@@ -3775,8 +3776,9 @@
       const winEnd = String(rec.daily_window_end || '21:00').slice(0, 5);
       const clip = Number(rec.clip_duration_sec || 60);
       const tfps = Number(rec.target_fps || 0);
-      const startVal = rec.start_at ? toLocalInputValue(new Date(rec.start_at)) : '';
-      const endVal = rec.end_at ? toLocalInputValue(new Date(rec.end_at)) : '';
+      const completed = isCompleted(rec);
+      const startVal = completed ? toLocalInputValue(new Date()) : (rec.start_at ? toLocalInputValue(new Date(rec.start_at)) : '');
+      const endVal = completed ? '' : (rec.end_at ? toLocalInputValue(new Date(rec.end_at)) : '');
       form.innerHTML = `
         <div class="field">
           <label>Recording mode</label>
@@ -3814,7 +3816,7 @@
           <div class="field"><label for="edEnd">Overall stop (optional)</label><input id="edEnd" type="datetime-local" value="${endVal}" /></div>
         </div>
         <div class="button-row">
-          <button type="button" class="primary" data-schedsave>Save schedule</button>
+          <button type="button" class="primary" data-schedsave>${completed ? 'Start recording' : 'Save schedule'}</button>
           <button type="button" class="secondary" data-schedcancel style="width:auto;min-width:0;">Cancel</button>
         </div>
         <div id="schedEditStatus" class="status detail-status"></div>`;
