@@ -129,6 +129,38 @@
     .detail-edit { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
     .detail-edit.hidden { display: none; }
     .detail-status { margin-top: 8px; }
+    .recording-live-player {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .recording-live-player::after {
+      content: "LIVE";
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 2;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--err) 86%, #000);
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      pointer-events: none;
+    }
+    .recording-live-player iframe,
+    .recording-live-player video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
     /* Storage-options panel: current mode summary + selectable alternatives, each a
        label->value tile (title over cost), with an explicit confirm step. */
     .storage-opts-label { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
@@ -2269,6 +2301,8 @@
 
     let streamDebounce = 0;          // setTimeout handle for the debounce
     let activeHls = null;            // live hls.js instance, if any
+    let detailHls = null;
+    let detailPlayerToken = 0;
 
     function isHLSURL(url) {
       const u = String(url || '').toLowerCase();
@@ -2283,6 +2317,95 @@
       v.removeAttribute('src');
       try { v.load(); } catch (_) { /* ignore */ }
       v.classList.add('hidden');
+    }
+
+    function teardownDetailPlayer() {
+      detailPlayerToken += 1;
+      if (detailHls) { try { detailHls.destroy(); } catch (_) { /* ignore */ } detailHls = null; }
+      const mount = document.getElementById('recordingLiveMount');
+      if (mount) mount.innerHTML = '';
+      const status = document.getElementById('recordingLiveStatus');
+      if (status) status.textContent = '';
+    }
+
+    function recordingStreamURL(id, suffix = '') {
+      return `/api/v1/dashboard/streams/${encodeURIComponent(String(id))}${suffix}`;
+    }
+
+    function youtubeWatchURL(stream) {
+      const candidates = [stream && stream.source_url, stream && stream.source_page_url].map((v) => String(v || '').trim()).filter(Boolean);
+      for (const raw of candidates) {
+        try {
+          const u = new URL(raw);
+          const host = String(u.hostname || '').toLowerCase();
+          if (host === 'youtu.be') {
+            const id = u.pathname.replace(/^\/+/, '').split('/')[0];
+            return id ? `https://www.youtube.com/watch?v=${encodeURIComponent(id)}` : '';
+          }
+          if (host === 'youtube.com' || host === 'www.youtube.com' || host.endsWith('.youtube.com')) {
+            const id = u.searchParams.get('v');
+            return id ? `https://www.youtube.com/watch?v=${encodeURIComponent(id)}` : raw;
+          }
+        } catch (_) {}
+      }
+      return '';
+    }
+
+    async function recordingPlayURL(stream) {
+      const s = stream || {};
+      const provider = String(s.provider || '').trim().toUpperCase();
+      const ct = String(s.capture_type || '').trim().toLowerCase();
+      const src = String(s.source_url || '').trim();
+      if (provider === 'SKYLINEWEBCAMS') return recordingStreamURL(s.id, '/skyline.m3u8');
+      if (ct === 'hls' || src.toLowerCase().includes('!hls')) {
+        const res = await fetchJSON(recordingStreamURL(s.id, '/resolve'));
+        return String((res && res.resolved_url) || '').trim();
+      }
+      if (ct === 'http_video' && /^https?:\/\//i.test(src)) return src;
+      return '';
+    }
+
+    async function mountRecordingLivePlayer(rec) {
+      teardownDetailPlayer();
+      const streamID = Number(rec && rec.stream_id || 0);
+      const mount = document.getElementById('recordingLiveMount');
+      const status = document.getElementById('recordingLiveStatus');
+      if (!(mount instanceof HTMLElement) || streamID <= 0) return;
+      const token = detailPlayerToken;
+      try {
+        const detail = await fetchJSON(recordingStreamURL(streamID));
+        if (token !== detailPlayerToken) return;
+        const stream = (detail && detail.stream) || {};
+        const watch = youtubeWatchURL(stream);
+        if (watch) {
+          const id = new URL(watch).searchParams.get('v') || '';
+          mount.innerHTML = `<iframe src="https://www.youtube.com/embed/${encodeURIComponent(id)}?autoplay=1&mute=1" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>`;
+          return;
+        }
+        const url = await recordingPlayURL(stream);
+        if (token !== detailPlayerToken) return;
+        if (!url) throw new Error('No inline player available for this stream.');
+        const video = document.createElement('video');
+        video.muted = true;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        mount.appendChild(video);
+        if (url.toLowerCase().includes('.m3u8') && window.Hls && window.Hls.isSupported()) {
+          detailHls = new window.Hls({ enableWorker: true, lowLatencyMode: false, liveSyncDuration: 24, liveMaxLatencyDuration: 40, backBufferLength: 60 });
+          detailHls.loadSource(url);
+          detailHls.attachMedia(video);
+          detailHls.on(window.Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+          detailHls.on(window.Hls.Events.ERROR, (_e, data) => {
+            if (data && data.fatal && status) status.textContent = 'Live preview is not loading here. Open the stream page for source links.';
+          });
+        } else {
+          video.src = url;
+          video.play().catch(() => {});
+        }
+      } catch (err) {
+        if (token === detailPlayerToken && status) status.textContent = String((err && err.message) || err || 'Live preview is not loading.');
+      }
     }
 
     // Mount an in-browser player for a probe-confirmed source. Browser playback is
@@ -3427,6 +3550,22 @@
         </div>`;
     }
 
+    function streamCardHTML(rec) {
+      const streamId = Number(rec.stream_id || 0);
+      if (streamId <= 0) return '';
+      const name = String(rec.stream_name || rec.stream_location || `Stream #${streamId}`);
+      return `
+        <div class="detail-card">
+          <div class="detail-card-head">
+            <span class="detail-card-title">Live stream</span>
+            <a class="btn-link secondary" href="/streams/${streamId}" style="min-height:32px;padding:6px 12px;">Open stream</a>
+          </div>
+          <div style="margin:0 0 10px;font-size:13px;color:var(--muted);">${escapeHTML(name)}</div>
+          <div id="recordingLiveMount" class="recording-live-player"></div>
+          <div id="recordingLiveStatus" class="hint"></div>
+        </div>`;
+    }
+
     // storageOptionsAvailable gates the "Storage options" entry point: only NAS and
     // managed recordings have alternatives to switch to (BYO S3 has none here).
     function storageOptionsAvailable(rec) {
@@ -3481,9 +3620,11 @@
       if (rec.capture_via === 'relay' && rec.needs_card !== true) {
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
-      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
+      teardownDetailPlayer();
+      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + streamCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
       wireDetailActions(root);
+      mountRecordingLivePlayer(rec);
     }
 
     function wireDetailActions(root) {
