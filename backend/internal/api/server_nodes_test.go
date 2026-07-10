@@ -12,6 +12,23 @@ func TestNormalizeNodeTypeLocalRecorder(t *testing.T) {
 	}
 }
 
+func TestNodeTokenAllowedStatusesIncludesDisabled(t *testing.T) {
+	got := nodeTokenAllowedStatuses()
+	want := map[string]bool{"active": true, "disabled": true}
+	if len(got) != len(want) {
+		t.Fatalf("allowed statuses=%v want active+disabled", got)
+	}
+	for _, status := range got {
+		if !want[status] {
+			t.Fatalf("unexpected allowed status %q in %v", status, got)
+		}
+		delete(want, status)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing allowed statuses: %v", want)
+	}
+}
+
 func TestDecideNodeEnroll(t *testing.T) {
 	tests := []struct {
 		name       string

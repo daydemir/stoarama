@@ -120,14 +120,18 @@ func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal
 		JOIN accounts a ON a.id=n.account_id
 		WHERE t.secret_hash=$1
 		  AND t.revoked_at IS NULL
-		  AND n.status='active'
+		  AND n.status = ANY($2::text[])
 		  AND a.status='active'
-	`, hash).Scan(&principal.NodeID, &principal.AccountID, &principal.NodeType, &principal.DisplayName, &tokenID)
+	`, hash, nodeTokenAllowedStatuses()).Scan(&principal.NodeID, &principal.AccountID, &principal.NodeType, &principal.DisplayName, &tokenID)
 	if err != nil {
 		return nodePrincipal{}, err
 	}
 	_, _ = s.pool.Exec(ctx, `UPDATE node_tokens SET last_used_at=now() WHERE id=$1`, tokenID)
 	return principal, nil
+}
+
+func nodeTokenAllowedStatuses() []string {
+	return []string{"active", "disabled"}
 }
 
 type nodeEnrollmentCreateRequest struct {
@@ -878,8 +882,8 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 			capabilities_jsonb=COALESCE(nodes.capabilities_jsonb, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
 			metadata_jsonb=COALESCE($3::jsonb, nodes.metadata_jsonb),
 			updated_at=now()
-		WHERE nodes.id=$1 AND nodes.status='active'
-	`, principal.NodeID, capArg, metaArg)
+		WHERE nodes.id=$1 AND nodes.status = ANY($4::text[])
+	`, principal.NodeID, capArg, metaArg, nodeTokenAllowedStatuses())
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update node heartbeat: %v", err))
 		return
