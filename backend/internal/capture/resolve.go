@@ -368,13 +368,10 @@ func resolveYouTubeStreamURL(ctx context.Context, watchURL string) (string, erro
 	for attempt := 1; attempt <= 2; attempt++ {
 		cmd := exec.CommandContext(resolveCtx, bin, args...)
 		out, err := cmd.CombinedOutput()
+		if streamURL := firstHTTPURL(string(out)); streamURL != "" {
+			return streamURL, nil
+		}
 		if err == nil {
-			for _, line := range strings.Split(string(out), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
-					return line, nil
-				}
-			}
 			lastErr = fmt.Errorf("yt-dlp returned no stream URL for %s", watchURL)
 		} else {
 			lastErr = fmt.Errorf("yt-dlp failed for %s: %w (%s)", watchURL, err, strings.TrimSpace(string(out)))
@@ -389,6 +386,16 @@ func resolveYouTubeStreamURL(ctx context.Context, watchURL string) (string, erro
 		}
 	}
 	return "", lastErr
+}
+
+func firstHTTPURL(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			return line
+		}
+	}
+	return ""
 }
 
 func ytDLPResolveArgs(watchURL string) []string {

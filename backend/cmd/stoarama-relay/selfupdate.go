@@ -21,8 +21,8 @@ import (
 )
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
-// binary + yt-dlp. Hourly keeps remote diagnostics/security fixes from waiting a day.
-const selfUpdateInterval = time.Hour
+// binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
+const selfUpdateInterval = 10 * time.Minute
 
 // latestArtifact is one downloadable file entry in latest.json, keyed by the
 // "{os}-{arch}" target, with the sha256 the client must verify before installing.

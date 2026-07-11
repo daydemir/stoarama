@@ -40,6 +40,13 @@ func TestYTDLPResolveArgs(t *testing.T) {
 	})
 }
 
+func TestFirstHTTPURLFromTimedOutYTDLPOutput(t *testing.T) {
+	got := firstHTTPURL("signal: killed\nhttps://manifest.googlevideo.com/live/index.m3u8\n")
+	if want := "https://manifest.googlevideo.com/live/index.m3u8"; got != want {
+		t.Fatalf("firstHTTPURL()=%q want=%q", got, want)
+	}
+}
+
 // TestResolveCaptureInputFailsClosedOnUnresolvedHLS proves the recorder capture
 // path never hands a raw '!hls' marker to ffmpeg: when the indirect endpoint
 // returns a body that yields no http(s) URL, the marker survives resolution and
