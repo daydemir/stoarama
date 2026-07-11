@@ -26,7 +26,11 @@ type relayDiagnostics interface {
 // env (no race).
 func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, cfg relayConfig, diag relayDiagnostics) {
 	bd, _ := binDir()
-	ffmpegVer := ffmpegVersion(filepath.Join(bd, "ffmpeg"))
+	bundledFFmpeg := filepath.Join(bd, "ffmpeg")
+	ffmpegVer := ffmpegVersion(bundledFFmpeg)
+	ffmpegProbe := ffmpegNetworkProbe(bundledFFmpeg)
+	systemFFmpegVer := ffmpegVersion("/usr/bin/ffmpeg")
+	systemFFmpegProbe := ffmpegNetworkProbe("/usr/bin/ffmpeg")
 
 	send := func() {
 		if pr.due() {
@@ -44,6 +48,9 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			"relay_version":          version,
 			"ytdlp_version":          pr.ytdlpVersion(),
 			"ffmpeg_version":         ffmpegVer,
+			"ffmpeg_network_probe":   ffmpegProbe,
+			"system_ffmpeg_version":  systemFFmpegVer,
+			"system_ffmpeg_probe":    systemFFmpegProbe,
 			"max_concurrent_streams": cfg.Concurrency,
 		}
 		if diag != nil {

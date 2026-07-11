@@ -173,3 +173,24 @@ func ffmpegVersion(bin string) string {
 	}
 	return strings.TrimSpace(first)
 }
+
+func ffmpegNetworkProbe(bin string) string {
+	if ffmpegVersion(bin) == "" {
+		return "unavailable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, bin, "-v", "error", "-i", "https://manifest.googlevideo.com/", "-f", "null", "-").CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "timeout"
+	}
+	return classifyFFmpegNetworkProbe(string(out))
+}
+
+func classifyFFmpegNetworkProbe(out string) string {
+	lower := strings.ToLower(out)
+	if strings.Contains(lower, "failed to resolve hostname") || strings.Contains(lower, "temporary failure in name resolution") {
+		return "dns_failed"
+	}
+	return "host_reached"
+}
