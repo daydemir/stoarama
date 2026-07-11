@@ -5338,11 +5338,17 @@
 
     void boot();
 
-    // Auto-refresh the recordings list every 30s (well within 120s heartbeat / ~210s min
-    // lease TTL). Only fires on the recordings list view, not the clip-detail page.
-    // ponytail: skips clip-page refresh; add if detail page needs live fleet status too.
+    function detailEditorOpen() {
+      return Boolean(els.clipPage.querySelector('.detail-edit:not(.hidden)'));
+    }
+
+    // Auto-refresh every 30s (well within 120s heartbeat / ~210s min lease TTL).
+    // List view refreshes the cards; relay detail view refreshes the lease/status
+    // banner so it does not keep a stale "not started yet" message after a node leases.
     window.setInterval(() => {
-      if (!clipPageState.recId && !newRecordingRoute() && !bundleListRoute() && !(bundleDetailId() > 0)) {
+      if (clipPageState.recId && clipPageState.rec && clipPageState.rec.capture_via === 'relay' && !detailEditorOpen()) {
+        void loadClipPage(clipPageState.page);
+      } else if (!clipPageState.recId && !newRecordingRoute() && !bundleListRoute() && !(bundleDetailId() > 0)) {
         void refreshRecordings();
       }
     }, 30000);
