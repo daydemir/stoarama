@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -46,7 +47,7 @@ func runRelay(ctx context.Context) error {
 	os.Setenv("YT_DLP_BIN", ytdlp)
 	os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
 	os.Unsetenv("YT_DLP_COOKIES_FILE")
-	os.Setenv("FFMPEG_BIN", filepath.Join(bd, "ffmpeg"))
+	os.Setenv("FFMPEG_BIN", relayFFmpegBin(bd))
 	prependPath(bd) // ffprobe is resolved from PATH by the capture path
 
 	client, err := recordingapi.NewClient(recordingapi.ClientConfig{
@@ -91,6 +92,20 @@ func runRelay(ctx context.Context) error {
 	go selfUpdateLoop(ctx, cfg.APIURL)
 
 	return worker.Run(ctx)
+}
+
+func relayFFmpegBin(binDir string) string {
+	bundled := filepath.Join(binDir, "ffmpeg")
+	system := "/usr/bin/ffmpeg"
+	if runtime.GOOS == "linux" && runtime.GOARCH == "arm64" && executable(system) {
+		return system
+	}
+	return bundled
+}
+
+func executable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode()&0111 != 0
 }
 
 // prependPath puts dir at the front of PATH so the bundled ffprobe (and any other
