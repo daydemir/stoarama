@@ -199,22 +199,7 @@
     }
     .ledger b { color: var(--text); font-weight: 600; }
     .ledger .meta-sep { color: var(--muted); user-select: none; }
-    /* Recording cards */
     .cards { display: grid; gap: 12px; margin-bottom: 16px; }
-    /* Grid items default to min-width:auto and cannot shrink below their content,
-       so a wide bundle member table would force page-level horizontal overflow and
-       defeat .bundle-members overflow-x:auto. min-width:0 lets the card shrink and
-       the member table scroll within it. Harmless on desktop (single-column grid). */
-    .cards > .card { min-width: 0; }
-    .card {
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 16px;
-      background: color-mix(in srgb, var(--panel) 94%, #000);
-    }
-    .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-    .card-name { font-size: 15px; font-weight: 600; color: var(--text); }
-    .card-url { margin-top: 3px; font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
     .card-status { font-family: var(--mono); font-size: 12px; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
     .card-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
     .card-status.active { color: var(--ok); }
@@ -222,17 +207,7 @@
     .card-status.paused { color: var(--muted); }
     .card-status.pending { color: var(--warn); }
     .card-status.pending .dot { background: var(--warn); }
-    .card-meta { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; font-size: 13px; color: var(--muted); }
-    .card-meta .meta-sep { color: var(--muted); user-select: none; }
-    .card-meta .meta-strong { color: var(--text); }
-    .card-meta b { color: var(--text); font-weight: 600; }
-    .card-meta .health-healthy { color: var(--ok); }
-    .card-meta .health-degraded { color: var(--warn); }
-    .card-meta .health-failing { color: var(--err); }
-    .card-actions { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
-    .card-actions button { width: auto; min-width: 96px; min-height: 36px; }
     .card-err { margin-top: 10px; color: var(--err); font-size: 12px; line-height: 1.45; }
-    .card-sub { margin-top: 3px; font-size: 13px; color: var(--muted); }
     .group-title { margin: 18px 0 10px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
     .clip-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
     .clip-summary { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
@@ -289,20 +264,7 @@
     .bundle-toggle { display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; padding: 0; cursor: pointer; text-align: left; width: auto; min-width: 0; min-height: 0; }
     .bundle-caret { display: inline-block; width: 0; height: 0; border-left: 6px solid var(--muted); border-top: 5px solid transparent; border-bottom: 5px solid transparent; transition: transform 0.12s ease; }
     .bundle-toggle[aria-expanded="true"] .bundle-caret { transform: rotate(90deg); }
-    .bundle-members { margin-top: 14px; overflow-x: auto; }
     .bundle-members.hidden { display: none; }
-    .bundle-members .clip-table td.b-stream a { color: var(--text); text-decoration: none; }
-    .bundle-members .clip-table td.b-stream a:hover { text-decoration: underline; }
-    .bundle-members .clip-table td.b-status .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; background: var(--muted); vertical-align: middle; }
-    .bundle-members .clip-table td.b-status.active .dot { background: var(--ok); }
-    .bundle-members .clip-table td.b-status.active { color: var(--ok); }
-    .bundle-members .clip-table td.b-status.pending { color: var(--warn); }
-    .bundle-members .clip-table td.b-status.pending .dot { background: var(--warn); }
-    .bundle-members .clip-table td.b-status.paused { color: var(--muted); }
-    .bundle-members .clip-table td.b-status .health-healthy { color: var(--ok); }
-    .bundle-members .clip-table td.b-status .health-degraded { color: var(--warn); }
-    .bundle-members .clip-table td.b-status .health-failing { color: var(--err); }
-    .bundle-members .clip-table td.b-needs { color: var(--warn); }
     /* Segmented control */
     .seg { display: flex; flex-wrap: wrap; gap: 6px; }
     .seg button {
@@ -449,7 +411,6 @@
       .recordings-table td:nth-child(5)::before { content: "Storage / Activity"; }
       .recordings-table td:nth-child(6)::before { content: "Actions"; }
       .batch-stream-table { min-width: 620px; }
-      .card-head { flex-direction: column; }
       /* Stack the detail/bundle header so the "Back to recordings" link (last in DOM)
          renders on its own line ABOVE the title instead of colliding beside it. */
       .clip-page-head { flex-direction: column-reverse; align-items: flex-start; }
@@ -461,11 +422,8 @@
          composer's form fields inherit 14px; bump them to 16px on mobile so focus
          never triggers a zoom. Scoped to composer fields (desktop unchanged). */
       #composer input, #composer select, #composer textarea { font-size: 16px; }
-      /* Bundle group card: give the collapse control and member-row stream links a
-         >=40px tap target so they are reachable on touch. */
+      /* Keep the bundle collapse control reachable on touch. */
       .bundle-toggle { min-height: 40px; }
-      .bundle-members .clip-table td { padding-top: 9px; padding-bottom: 9px; }
-      .bundle-members .clip-table td.b-stream a { display: inline-block; padding: 8px 0; }
       /* Clips table -> stacked cards (same table-to-card approach as pricing.html).
          An 8-cell row can't fit at 414px, so each clip becomes a card: Time is a
          heading line, Duration/FPS/Size/Status flow as one compact meta line, and the
@@ -2963,107 +2921,6 @@
       return `<div style="${mb}padding:10px 12px;border-radius:10px;border:1px solid var(--border);font-size:13px;color:${color};">${rs.text}${link}</div>`;
     }
 
-    function cardHTML(rec) {
-      const id = Number(rec.id);
-      const st = statusLine(rec);
-      const status = String(rec.status || '');
-      const clip = Number(rec.clip_duration_sec || 0);
-      const last = relativeTime(rec.last_clip_at);
-      const health = String(rec.health || 'idle');
-      const metaParts = [];
-      const rawCron = String(rec.cron_expr || '').trim().replace(/\s+/g, ' ');
-      const cronTitle = rawCron ? ` title="${escapeHTML(rawCron)}"` : '';
-      metaParts.push(`<span class="meta-strong"${cronTitle}>${escapeHTML(scheduleLabel(rec))}</span>`);
-      metaParts.push(`<span>${clip}s clips</span>`);
-      const tfps = Number(rec.target_fps || 0);
-      if (tfps > 0) metaParts.push(`<span>${tfps} fps</span>`);
-      if (last) {
-        let word = '';
-        if (status === 'active' && health !== 'idle') word = ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>`;
-        metaParts.push(`<span>Last clip: ${escapeHTML(last)}${word}</span>`);
-      } else {
-        metaParts.push('<span>No clips yet</span>');
-      }
-
-      // Relay capture indicator (inline): only the clean positive "via NAME" chip when
-      // a computer holds the active lease. Every other relay state (offline, before the
-      // window, between windows, starting) is rendered as an honest note below the meta
-      // row by relayStateHTML, so the card never implies a wrong reason for no clips.
-      if (rec.capture_via === 'relay' && rec.relay_node_name) {
-        metaParts.push(`<span class="meta-strong">via ${escapeHTML(String(rec.relay_node_name))}</span>`);
-      }
-
-      // Storage label. A nas_pull recording only STAGES in managed storage and its
-      // footage lives on the account's NAS, so it is NOT metered monthly; label it as
-      // NAS with no dollar figure. A managed recording shows its retention tier and a
-      // switch control. Only managed (non-NAS) recordings can be yearly-prepaid; the
-      // switch is owner/billing-admin only (the server enforces it and 403s otherwise).
-      const isNasDelivery = rec.delivery === 'nas_pull';
-      const isManaged = rec.storage_managed === true && !isNasDelivery;
-      const tier = String(rec.storage_retention_tier || 'monthly');
-      if (isNasDelivery) {
-        metaParts.push(`<span>Storage: your NAS. <b>Free</b> while pulled. Clips held past 24h if the NAS falls behind bill at <b>$0.10</b> per hour of footage, per month.</span>`);
-      } else if (isManaged) {
-        const tierLabel = tier === 'yearly_prepaid'
-          ? 'Storage: yearly prepaid (<b>$0.05</b> per hour of footage, per month)'
-          : 'Storage: monthly storage (<b>$0.10</b> per hour of footage, per month)';
-        metaParts.push(`<span data-tierlabel="${id}">${tierLabel}</span>`);
-      }
-
-      let actions = '';
-      if (status === 'active') {
-        actions = `<button type="button" class="secondary" data-pause="${id}">Pause</button>`;
-      } else if (status === 'paused') {
-        actions = `<button type="button" class="secondary" data-resume="${id}">Resume</button>`;
-      }
-      actions += `<a class="btn-link secondary" href="/recordings/${id}">View recording</a>`;
-
-      const errLine = (status === 'active' && health === 'failing' && rec.last_error_text)
-        ? `<div class="card-err">${escapeHTML(String(rec.last_error_text))}</div>` : '';
-
-      // Blocking no-card state: when the account has no card on file, capture is
-      // held by the server gate. Make that unmistakable per card so a researcher
-      // never assumes recording is happening when it is silently held.
-      let blocked = '';
-      if (rec.needs_card === true) {
-        blocked = `<div class="card-blocked"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
-          + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`;
-      } else if (rec.capture_via === 'relay') {
-        // Honest relay state: leased ('ok') is already shown as the inline "via NAME"
-        // chip, so only the non-leased states render a note here.
-        const rs = relayCaptureState(rec);
-        if (rs && rs.tone !== 'ok') blocked = relayStateHTML(rs, false);
-      }
-
-      // Linked to a catalog stream: title = stream name, subtitle = location.
-      // Otherwise the source URL is the subtitle, as before.
-      const streamName = String(rec.stream_name || '').trim();
-      const idBadge = `<span class="clip-pill neutral" style="font-family:var(--mono);margin-right:5px;vertical-align:middle;">#${id}</span>`;
-      let headHTML;
-      if (streamName) {
-        const loc = String(rec.stream_location || '').trim();
-        headHTML = `<div class="card-name">${idBadge}${escapeHTML(streamName)}</div>`
-          + (loc ? `<div class="card-sub">${escapeHTML(loc)}</div>` : '')
-          + `<div class="card-sub">${escapeHTML(String(rec.name || ''))}</div>`
-          + (Number(rec.stream_id) > 0 ? `<div class="card-sub">Stream ID: <span class="mono">${Number(rec.stream_id)}</span></div>` : '');
-      } else {
-        headHTML = `<div class="card-name">${idBadge}${escapeHTML(String(rec.name || ''))}</div>`
-          + `<div class="card-url">${escapeHTML(String(rec.stream_url || ''))}</div>`;
-      }
-
-      return `
-        <div class="card" data-card="${id}">
-          <div class="card-head">
-            <div>${headHTML}</div>
-            <div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>
-          </div>
-          <div class="card-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
-          ${errLine}
-          ${blocked}
-          <div class="card-actions">${actions}</div>
-        </div>`;
-    }
-
     function recordingRowHTML(rec, extraClass = '') {
       const id = Number(rec.id);
       const st = statusLine(rec);
@@ -3113,98 +2970,6 @@
       if (v === null || v === undefined) return 0;
       const n = Number(v);
       return Number.isFinite(n) && n > 0 ? n : 0;
-    }
-
-    // One compact member row inside a bundle's table: stream name links to the
-    // member's clip page, status reuses the dot + health word, last clip + count.
-    function bundleMemberRowHTML(m) {
-      const id = Number(m.id);
-      const streamName = String(m.stream_name || '').trim() || String(m.name || ('#' + id));
-      const loc = String(m.stream_location || '').trim();
-      const status = String(m.status || '');
-      const health = String(m.health || 'idle');
-      let statusCell;
-      if (m.needs_card === true) {
-        statusCell = `<td class="b-status b-needs"><span class="dot"></span>needs card</td>`;
-      } else if (status === 'paused') {
-        statusCell = `<td class="b-status paused"><span class="dot"></span>paused</td>`;
-      } else if (status === 'active' && isScheduled(m)) {
-        statusCell = `<td class="b-status pending"><span class="dot"></span>scheduled</td>`;
-      } else if (status === 'active') {
-        const word = health !== 'idle' ? ` &middot; <span class="health-${escapeHTML(health)}">${escapeHTML(health)}</span>` : '';
-        statusCell = `<td class="b-status active"><span class="dot"></span>active${word}</td>`;
-      } else {
-        statusCell = `<td class="b-status paused"><span class="dot"></span>${escapeHTML(status || 'idle')}</td>`;
-      }
-      const last = relativeTime(m.last_clip_at);
-      return `<tr>
-        <td class="b-stream"><a href="/recordings/${id}">${escapeHTML(streamName)}</a>${loc ? ` <span class="muted">&middot; ${escapeHTML(loc)}</span>` : ''}</td>
-        ${statusCell}
-        <td>${last ? escapeHTML(last) : '—'}</td>
-        <td class="num">${Number(m.recent_clip_count || 0)}</td>
-      </tr>`;
-    }
-
-    // Render one bundle as a single .card group header plus an opt-in compact
-    // member table. Status is derived across members (active if any member is
-    // actively capturing, paused if all paused, else pending). A group-level
-    // needs_card banner shows when any member is held by the no-card gate.
-    function bundleGroupHTML(bundleId, bundleName, members) {
-      const total = members.length;
-      let recording = 0, paused = 0, needCard = 0, anyActiveLive = 0;
-      for (const m of members) {
-        const status = String(m.status || '');
-        if (m.needs_card === true) needCard++;
-        if (status === 'paused') paused++;
-        else if (status === 'active') {
-          recording++;
-          if (!isScheduled(m) && m.needs_card !== true) anyActiveLive++;
-        }
-      }
-      let st;
-      if (anyActiveLive > 0) st = { cls: 'active', text: 'Recording' };
-      else if (recording > 0) st = { cls: 'pending', text: 'Scheduled' };
-      else if (paused === total && total > 0) st = { cls: 'paused', text: 'Paused' };
-      else st = { cls: 'pending', text: 'Pending' };
-
-      const metaParts = [];
-      metaParts.push(`<span class="meta-strong">${total} stream${total === 1 ? '' : 's'}</span>`);
-      if (members[0]) metaParts.push(`<span>${escapeHTML(scheduleLabel(members[0]))}</span>`);
-      metaParts.push(`<span>${recording} recording</span>`);
-      if (paused > 0) metaParts.push(`<span>${paused} paused</span>`);
-      if (needCard > 0) metaParts.push(`<span>${needCard} need card</span>`);
-
-      const blocked = needCard > 0
-        ? `<div class="card-blocked"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
-          + `<a class="btn-link" href="/org-settings">Go to Org settings</a></div>`
-        : '';
-
-      const collapsed = total > 6;
-      const rows = members.map(bundleMemberRowHTML).join('');
-      const table = `<div class="bundle-members${collapsed ? ' hidden' : ''}" data-bundlemembers="${bundleId}">
-        <table class="clip-table">
-          <thead><tr><th>Stream</th><th>Status</th><th>Last clip</th><th class="num">Clips</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table></div>`;
-
-      return `
-        <div class="card" data-bundlecard="${bundleId}">
-          <div class="card-head">
-            <div>
-              <button type="button" class="bundle-toggle" data-bundletoggle="${bundleId}" aria-expanded="${collapsed ? 'false' : 'true'}">
-                <span class="bundle-caret"></span>
-                <span class="card-name">${escapeHTML(bundleName)}</span>
-              </button>
-            </div>
-            <div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>
-          </div>
-          <div class="card-meta">${metaParts.join('<span class="meta-sep">&middot;</span>')}</div>
-          ${blocked}
-          <div class="card-actions">
-            <a class="btn-link secondary" href="/bundles/${bundleId}">Open bundle</a>
-          </div>
-          ${table}
-        </div>`;
     }
 
     // Update the status-filter chips: keep each chip's label with a live count and
