@@ -126,6 +126,7 @@ type activeRecording struct {
 	startAt            time.Time
 	endAt              *time.Time
 	lastEnqueuedFireAt *time.Time
+	activeWeekdays     WeekdaySet
 }
 
 // EnqueueDueRecordingJobs is the core sweep: (a) reclaim expired leases,
@@ -163,7 +164,7 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 	rows, err := tx.Query(ctx, `
 		SELECT rec.id, rec.mode, rec.cron_expr, rec.cron_timezone, rec.clip_duration_sec,
 		       to_char(rec.daily_window_start, 'HH24:MI:SS'), to_char(rec.daily_window_end, 'HH24:MI:SS'),
-		       rec.start_at, rec.end_at, rec.last_enqueued_fire_at
+		       rec.start_at, rec.end_at, rec.last_enqueued_fire_at, rec.active_weekdays
 		FROM recordings rec
 		WHERE rec.status='active'
 		  AND rec.start_at <= now()
@@ -181,7 +182,7 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 	for rows.Next() {
 		var rec activeRecording
 		if err := rows.Scan(&rec.id, &rec.mode, &rec.cronExpr, &rec.cronTimezone, &rec.clipDurationSec,
-			&rec.dailyWindowStart, &rec.dailyWindowEnd, &rec.startAt, &rec.endAt, &rec.lastEnqueuedFireAt); err != nil {
+			&rec.dailyWindowStart, &rec.dailyWindowEnd, &rec.startAt, &rec.endAt, &rec.lastEnqueuedFireAt, &rec.activeWeekdays); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan active recording: %w", err)
 		}
@@ -349,7 +350,7 @@ func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, r
 	if rec.endAt != nil {
 		envEnd = rec.endAt.UTC()
 	}
-	open, windowOpenUTC, windowEndUTC, err := currentOpenContinuousWindow(rec.cronTimezone, start, end, rec.startAt.UTC(), envEnd, now)
+	open, windowOpenUTC, windowEndUTC, err := currentOpenContinuousWindowOn(rec.cronTimezone, start, end, rec.activeWeekdays, rec.startAt.UTC(), envEnd, now)
 	if err != nil {
 		return 0, err
 	}
@@ -407,7 +408,7 @@ func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, r
 	}
 
 	// next_fire_at = the next window-open instant (display + provision hint).
-	nextOpen, err := NextWindowOpenUTC(rec.cronTimezone, start, rec.startAt.UTC(), envEnd, now)
+	nextOpen, err := NextWindowOpenUTCOn(rec.cronTimezone, start, rec.activeWeekdays, rec.startAt.UTC(), envEnd, now)
 	if err != nil {
 		return enqueued, err
 	}

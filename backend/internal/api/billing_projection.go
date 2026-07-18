@@ -20,13 +20,14 @@ const projectionMaxFires = 600000
 // needs: the stored schedule fields as they live on the recordings row. Only
 // status='active' recordings are projected; the caller filters status.
 type projectedRecording struct {
-	Mode         string     // "sampled" | "continuous"
-	CronExpr     string     // 5-field cron (sampled); "" for continuous
-	CronTimezone string     // IANA zone; "" defaults to UTC
-	DailyStart   string     // "HH:MM[:SS]" (continuous); "" for sampled
-	DailyEnd     string     // "HH:MM[:SS]" (continuous); "" for sampled
-	StartAt      time.Time  // recording capture-window start (UTC)
-	EndAt        *time.Time // recording capture-window stop (UTC); nil = open-ended
+	Mode           string     // "sampled" | "continuous"
+	CronExpr       string     // 5-field cron (sampled); "" for continuous
+	CronTimezone   string     // IANA zone; "" defaults to UTC
+	DailyStart     string     // "HH:MM[:SS]" (continuous); "" for sampled
+	DailyEnd       string     // "HH:MM[:SS]" (continuous); "" for sampled
+	StartAt        time.Time  // recording capture-window start (UTC)
+	EndAt          *time.Time // recording capture-window stop (UTC); nil = open-ended
+	ActiveWeekdays recsched.WeekdaySet
 }
 
 // projectRecordingHours computes the EXACT additional distinct record-hours a
@@ -148,6 +149,15 @@ func continuousRecordHours(rec projectedRecording, projStart, projEnd time.Time)
 		openUTC := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc).UTC()
 		if !openUTC.Before(projEnd) {
 			break
+		}
+		weekdays := rec.ActiveWeekdays
+		if weekdays == 0 {
+			weekdays = recsched.AllWeekdays
+		}
+		if !weekdays.Contains(openUTC.In(loc).Weekday()) {
+			nd := time.Date(y, mo, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
+			y, mo, d = nd.Date()
+			continue
 		}
 		var closeUTC time.Time
 		if overnight {

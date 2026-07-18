@@ -397,6 +397,21 @@
     /* Read-only bundle chips: one per selected stream, chosen on the streams page.
        The composer is a summary only; edit the set back on the streams page. */
     .bundle-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .recordings-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; }
+    .recordings-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .recordings-table th { position: sticky; top: 0; z-index: 1; background: var(--panel2); color: var(--muted); text-align: left; font-weight: 500; }
+    .recordings-table th, .recordings-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .recordings-table tbody:last-child tr:last-child td { border-bottom: 0; }
+    .recordings-table .cell-main { color: var(--text); font-weight: 600; }
+    .recordings-table .cell-sub { color: var(--muted); margin-top: 2px; line-height: 1.35; }
+    .recordings-table .row-actions { display: flex; gap: 6px; white-space: nowrap; }
+    .recordings-table .row-actions button, .recordings-table .row-actions a { min-height: 28px; width: auto; padding: 4px 8px; font-size: 12px; }
+    .batch-stream-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .batch-stream-table th, .batch-stream-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
+    .batch-stream-table input { min-height: 32px; padding: 6px 8px; min-width: 210px; }
+    .weekday-grid { display: flex; gap: 6px; flex-wrap: wrap; }
+    .weekday-grid label { display: inline-flex; gap: 5px; align-items: center; margin: 0; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; text-transform: none; }
+    .weekday-grid input, .full-day-row input { width: auto; min-height: 0; margin: 0; }
     .bundle-chip { display: inline-flex; align-items: center; max-width: 100%; padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; background: color-mix(in srgb, var(--panel2) 80%, transparent); font-size: 13px; color: var(--text); }
     .bundle-chip .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .composer-footnote { margin: 14px 0 12px; font-size: 13px; color: var(--muted); line-height: 1.5; }
@@ -422,6 +437,18 @@
     }
     @media (max-width: 640px) {
       .grid-2 { grid-template-columns: 1fr; }
+      .recordings-table thead { display: none; }
+      .recordings-table, .recordings-table tbody, .recordings-table tr, .recordings-table td { display: block; width: 100%; }
+      .recordings-table tr { padding: 8px; border-bottom: 1px solid var(--border); }
+      .recordings-table td { border: 0; padding: 4px 8px; }
+      .recordings-table td::before { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+      .recordings-table td:nth-child(1)::before { content: "Recording"; }
+      .recordings-table td:nth-child(2)::before { content: "Status"; }
+      .recordings-table td:nth-child(3)::before { content: "Schedule"; }
+      .recordings-table td:nth-child(4)::before { content: "Clip / Capture"; }
+      .recordings-table td:nth-child(5)::before { content: "Storage / Activity"; }
+      .recordings-table td:nth-child(6)::before { content: "Actions"; }
+      .batch-stream-table { min-width: 620px; }
       .card-head { flex-direction: column; }
       /* Stack the detail/bundle header so the "Back to recordings" link (last in DOM)
          renders on its own line ABOVE the title instead of colliding beside it. */
@@ -506,7 +533,7 @@
 
       <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
         <button id="newRecBtn" class="primary" type="button">New recording</button>
-        <button id="newBundleBtn" class="secondary" type="button" style="width:auto;min-width:0;">New bundle</button>
+        <button id="newBundleBtn" class="secondary" type="button" style="width:auto;min-width:0;">Select streams</button>
         <a class="btn-link secondary" href="/bundles" style="width:auto;min-width:0;align-self:center;">View bundles</a>
         <button id="recordingsCsvBtn" class="secondary" type="button" style="width:auto;min-width:0;">Download CSV</button>
       </div>
@@ -565,7 +592,7 @@
         </div>
         <input type="hidden" id="recStreamID" value="" />
 
-        <!-- Bundle source block: shown only in bundle mode. Streams are chosen on the
+        <!-- Batch source block. Streams are chosen on the
              streams page and arrive via ?stream_ids=; they render here as a read-only
              summary (no in-composer picker or editing). Edit the set back on the
              streams page. The schedule/window/clip/fps/storage controls below are
@@ -573,13 +600,9 @@
              member, including the user-chosen timezone. -->
         <div id="bundleSourceBlock" class="hidden">
           <div class="field">
-            <label for="bundleName">Bundle name</label>
-            <input id="bundleName" type="text" placeholder="Study set 1" />
-          </div>
-          <div class="field">
-            <label>Streams in this bundle</label>
+            <label>Selected streams</label>
             <div id="bundleStreamCount" class="hint" style="margin-bottom:8px;">0 streams selected</div>
-            <div id="bundleStreamChips" class="bundle-chips"></div>
+            <div class="recordings-table-wrap"><table class="batch-stream-table"><thead><tr><th>Stream</th><th>Location</th><th>Timezone</th><th>Action</th></tr></thead><tbody id="bundleStreamChips"></tbody></table></div>
             <div class="hint" style="margin-top:8px;"><a href="/streams">Edit selection</a></div>
           </div>
         </div>
@@ -654,6 +677,13 @@
             <label for="schedTZContinuous">Timezone</label>
             <select id="schedTZContinuous"></select>
           </div>
+          <div class="field" style="margin-top:12px;">
+            <label>Active weekdays</label>
+            <div id="batchWeekdays" class="weekday-grid">
+              <label><input type="checkbox" value="1" checked />Mon</label><label><input type="checkbox" value="2" checked />Tue</label><label><input type="checkbox" value="3" checked />Wed</label><label><input type="checkbox" value="4" checked />Thu</label><label><input type="checkbox" value="5" checked />Fri</label><label><input type="checkbox" value="6" checked />Sat</label><label><input type="checkbox" value="7" checked />Sun</label>
+            </div>
+          </div>
+          <label class="full-day-row" style="display:flex;gap:8px;align-items:center;text-transform:none;"><input id="batchFullDay" type="checkbox" /> Record continuously for 24 hours</label>
           <div id="continuousSummary" class="hint" style="margin-top:6px;"></div>
           <div id="continuousWarn" class="hint warn"></div>
         </div>
@@ -900,7 +930,7 @@
         <div id="bundlePreflight" class="status hidden" style="margin-bottom:10px;"></div>
         <div class="button-row">
           <button id="startBtn" class="primary" type="button" disabled>Start recording</button>
-          <button id="startBundleBtn" class="primary hidden" type="button">Start bundle</button>
+          <button id="startBundleBtn" class="primary hidden" type="button">Set schedule</button>
         </div>
         <div id="startStatus" class="status"></div>
         </aside>
@@ -954,6 +984,8 @@
       continuousControls: document.getElementById('continuousControls'),
       dailyWindowStart: document.getElementById('dailyWindowStart'),
       dailyWindowEnd: document.getElementById('dailyWindowEnd'),
+      batchWeekdays: document.getElementById('batchWeekdays'),
+      batchFullDay: document.getElementById('batchFullDay'),
       schedTZContinuous: document.getElementById('schedTZContinuous'),
       continuousWarn: document.getElementById('continuousWarn'),
       continuousSummary: document.getElementById('continuousSummary'),
@@ -1025,7 +1057,6 @@
       bundleDetail: document.getElementById('bundleDetail'),
       newBundleBtn: document.getElementById('newBundleBtn'),
       bundleSourceBlock: document.getElementById('bundleSourceBlock'),
-      bundleName: document.getElementById('bundleName'),
       bundleStreamCount: document.getElementById('bundleStreamCount'),
       bundleStreamChips: document.getElementById('bundleStreamChips'),
       bundlePreflight: document.getElementById('bundlePreflight'),
@@ -1400,7 +1431,7 @@
 
     function namingValid() {
       renderNamingPreview();
-      if (state.composerMode === 'bundle') {
+      if (state.composerMode === 'batch') {
         els.namingWarn.textContent = '';
         return true;
       }
@@ -1708,7 +1739,7 @@
     // 1 for a single-stream recording. Bundle clip counts, record-hours, and dollar
     // figures all scale by this because a bundle fans out into one member per stream.
     function estStreamCount() {
-      return state.composerMode === 'bundle' ? Math.max(1, state.bundleSelected.size) : 1;
+      return state.composerMode === 'batch' ? Math.max(1, state.bundleSelected.size) : 1;
     }
 
     // Update the persistent clip-COUNT line for both modes. Reads the concrete
@@ -3033,6 +3064,47 @@
         </div>`;
     }
 
+    function recordingRowHTML(rec, extraClass = '') {
+      const id = Number(rec.id);
+      const st = statusLine(rec);
+      const status = String(rec.status || '');
+      const health = String(rec.health || 'idle');
+      const streamName = String(rec.stream_name || '').trim();
+      const title = streamName || String(rec.name || `Recording #${id}`);
+      const recordingName = String(rec.name || '').trim();
+      const location = String(rec.stream_location || rec.stream_url || '').trim();
+      const last = relativeTime(rec.last_clip_at);
+      const clip = Number(rec.clip_duration_sec || 0);
+      const fps = Number(rec.target_fps || 0);
+      const capture = rec.capture_via === 'relay'
+        ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}` : 'Cloud';
+      let storage = rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage');
+      if (rec.storage_managed === true && rec.delivery !== 'nas_pull') storage += rec.storage_retention_tier === 'yearly_prepaid' ? ' · yearly $0.05/hr-mo' : ' · monthly $0.10/hr-mo';
+      let warning = '';
+      if (rec.needs_card === true) warning = '<div class="cell-sub" style="color:var(--warn)">Not recording · payment method required</div>';
+      else if (status === 'active' && health === 'failing' && rec.last_error_text) warning = `<div class="cell-sub" style="color:var(--err)">${escapeHTML(String(rec.last_error_text))}</div>`;
+      else if (rec.capture_via === 'relay') {
+        const rs = relayCaptureState(rec);
+        if (rs && rs.tone !== 'ok') warning = `<div class="cell-sub">${rs.text}</div>`;
+      }
+      let action = status === 'active'
+        ? `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
+        : (status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}">Resume</button>` : '');
+      action += `<a class="btn-link secondary" href="/recordings/${id}">View</a>`;
+      return `<tr class="${extraClass}" data-card="${id}">
+        <td><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
+        <td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div><div class="cell-sub health-${escapeHTML(health)}">${escapeHTML(health)}</div>${warning}</td>
+        <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(String(rec.cron_timezone || 'UTC'))}</div></td>
+        <td><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
+        <td><div class="cell-main">${storage}</div><div class="cell-sub">${last ? `Last clip ${escapeHTML(last)}` : 'No clips yet'} · ${Number(rec.recent_clip_count || 0)} recent</div></td>
+        <td><div class="row-actions">${action}</div></td>
+      </tr>`;
+    }
+
+    function recordingsTableHTML(rows) {
+      return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th>Recording</th><th>Status</th><th>Schedule</th><th>Clip / Capture</th><th>Storage / Activity</th><th>Actions</th></tr></thead>${rows}</table></div>`;
+    }
+
     // A member belongs to a bundle when its bundle_id is set. The recordings list
     // endpoint surfaces bundle_id + bundle_name so the overview can group members
     // under one collapsible header instead of one full card each.
@@ -3211,22 +3283,21 @@
         }
       }
       let html = '';
-      // Bundle groups first (the list is already newest-first by created_at, so the
-      // first bundle seen is the newest). Each group is one collapsible card.
-      const bundleHTML = [];
+      const bundleRows = [];
       for (const [bid, grp] of byBundle.entries()) {
-        bundleHTML.push(bundleGroupHTML(bid, grp.name, grp.members));
+        const hidden = grp.members.length > 6;
+        bundleRows.push(`<tbody><tr><td colspan="6"><button type="button" class="bundle-toggle" data-bundletoggle="${bid}" aria-expanded="${hidden ? 'false' : 'true'}"><span class="bundle-caret"></span><span class="cell-main">${escapeHTML(grp.name)}</span> <span class="muted">${grp.members.length} recordings</span></button></td></tr></tbody>`);
+        bundleRows.push(`<tbody class="bundle-members${hidden ? ' hidden' : ''}" data-bundlemembers="${bid}">${grp.members.map((rec) => recordingRowHTML(rec)).join('')}</tbody>`);
       }
       const ongoing = standalone.filter((rec) => !isCompleted(rec));
       const completed = standalone.filter((rec) => isCompleted(rec));
-      if (bundleHTML.length || ongoing.length) {
+      if (bundleRows.length || ongoing.length) {
         html += `<div class="group-title">Ongoing</div>`;
-        html += bundleHTML.join('');
-        html += ongoing.map(cardHTML).join('');
+        html += recordingsTableHTML(bundleRows.join('') + `<tbody>${ongoing.map((rec) => recordingRowHTML(rec)).join('')}</tbody>`);
       }
       if (completed.length) {
         html += `<div class="group-title">Completed</div>`;
-        html += completed.map(cardHTML).join('');
+        html += recordingsTableHTML(`<tbody>${completed.map((rec) => recordingRowHTML(rec)).join('')}</tbody>`);
       }
       els.cards.innerHTML = html;
       wireCardActions();
@@ -4437,24 +4508,25 @@
     // Read ?stream_id= from the URL; when present, land prefilled from that catalog
     // stream and strip the param so a reload does not re-trigger the landing.
     async function maybeLandFromCatalogStream() {
-      // Multi-select from the catalog browse: ?stream_ids=1,2,3&compose=bundle lands
-      // straight in the bundle composer with the chosen streams preselected.
+      // Multi-select from the catalog browse lands in the batch composer.
       const rawIds = String(authParams.get('stream_ids') || '').trim();
       if (rawIds) {
-        const ids = rawIds.split(',').map((v) => Number(v.trim())).filter((n) => Number.isFinite(n) && n > 0);
+        const ids = Array.from(new Set(rawIds.split(',').map((v) => Number(v.trim())).filter((n) => Number.isFinite(n) && n > 0)));
         try {
           const u = new URL(window.location.href);
           u.searchParams.delete('stream_ids');
           u.searchParams.delete('compose');
           window.history.replaceState({}, '', u.pathname + (u.search || '') + u.hash);
         } catch (_) { /* ignore */ }
+        if (ids.length > 50) {
+          window.alert('Select no more than 50 streams.');
+          window.location.assign('/streams');
+          return;
+        }
         if (ids.length) {
           focusComposerView();
           state.bundleSelected = new Set(ids);
           openBundleComposer();
-          if (!String(els.bundleName.value || '').trim()) {
-            els.bundleName.value = 'Recording set ' + new Date().toLocaleDateString([], { month: 'short', day: 'numeric' });
-          }
           await loadBundleStreams();
           return;
         }
@@ -4494,15 +4566,17 @@
       clearCatalogLock();
       clearStashedCatalogStreamId();
       // Reset bundle mode so the next open is the single-recording composer.
-      if (state.composerMode === 'bundle') {
+      if (state.composerMode === 'batch') {
         state.composerMode = 'single';
         els.bundleSourceBlock.classList.add('hidden');
         els.urlField.classList.remove('hidden');
         els.startBundleBtn.classList.add('hidden');
         els.startBtn.classList.remove('hidden');
         els.bundlePreflight.classList.add('hidden');
-        els.bundleName.value = '';
         state.bundleSelected = new Set();
+        els.batchFullDay.checked = false;
+        els.dailyWindowEnd.disabled = false;
+        [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((el) => { if (el && el.parentElement) el.parentElement.classList.remove('hidden'); });
         const singleNameField = els.recName.closest('.field');
         if (singleNameField) singleNameField.classList.remove('hidden');
       }
@@ -4555,7 +4629,8 @@
       const sched = compiledSchedule();
       const clip = selectedClipSec();
       if (!catalogId && !url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
-      if (dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination first.', 'err'); return; }
+      const needsCreate = (state.bundleStreams || []).some((stream) => Number(stream.recording_id || 0) <= 0);
+      if (needsCreate && dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination for new recordings.', 'err'); return; }
       if (continuous) {
         if (!continuousWindowValid()) { setStatus(els.startStatus, 'Enter both a start and end time for the daily window.', 'err'); return; }
       } else {
@@ -4588,7 +4663,7 @@
       // A webdav shared dest delivers via managed staging: send only
       // delivery_storage_destination_id. Otherwise send the capture dest.
       if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
-      else body.storage_destination_id = dest;
+      else if (dest > 0) body.storage_destination_id = dest;
       // Storage-delivery mode: the NAS choice stages capture in managed storage
       // (same capture dest as managed) but its footage is drained to the account's
       // NAS, so mark it nas_pull; every other choice is managed. The server reads +
@@ -4852,6 +4927,10 @@
     els.retentionChooser.querySelectorAll('button[data-retention]').forEach((btn) => {
       btn.addEventListener('click', () => chooseRetention(btn.getAttribute('data-retention')));
     });
+    els.batchFullDay.addEventListener('change', () => {
+      els.dailyWindowEnd.disabled = els.batchFullDay.checked;
+      refreshContinuousUI();
+    });
     els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => window.location.assign('/recordings/new'));
@@ -4865,7 +4944,7 @@
       state.statusFilter = key;
       renderCards();
     });
-    els.newBundleBtn.addEventListener('click', () => openBundleComposer());
+    els.newBundleBtn.addEventListener('click', () => window.location.assign('/streams'));
     els.recordingsCsvBtn.addEventListener('click', () => window.location.assign('/api/v1/account/recordings.csv'));
     els.composerClose.addEventListener('click', closeComposer);
     els.startBtn.addEventListener('click', startRecording);
@@ -4884,19 +4963,13 @@
       }
     });
 
-    // ============================ Bundles ============================
-    // A bundle is a thin grouping that fans out into N member recordings sharing
-    // ONE schedule. The composer reuses the single-recording schedule/window/clip/
-    // fps/storage controls (which read global state); bundle mode only swaps the
-    // source block (single stream -> read-only removable chips) and the submit path.
-    // Streams are chosen on the streams page and arrive via ?stream_ids=; there is
-    // no in-composer stream picker.
+    // ============================ Batch scheduling ============================
 
     // Switch the shared composer into bundle mode and open it: hide the single-stream
     // source UI + Start button, show the chip block + Start-bundle button. The caller
     // populates state.bundleSelected (from ?stream_ids=) and calls loadBundleStreams.
     function openBundleComposer() {
-      state.composerMode = 'bundle';
+      state.composerMode = 'batch';
       setNamingProfile('stoarama_v1');
       clearCatalogLock();
       els.composer.classList.remove('hidden');
@@ -4914,6 +4987,7 @@
       els.startBundleBtn.classList.remove('hidden');
       els.bundlePreflight.classList.add('hidden');
       els.bundlePreflight.textContent = '';
+      [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((el) => { if (el && el.parentElement) el.parentElement.classList.add('hidden'); });
       // Default Start to now (open-ended Stop) each time.
       if (!els.startAt.value) els.startAt.value = toLocalInputValue(new Date());
       refreshWindowUI();
@@ -4924,13 +4998,10 @@
     // Load stream metadata so the chips read as stream names, not bare ids. The
     // recordable set is matched by id in renderBundleChips.
     async function loadBundleStreams() {
-      try {
-        const payload = await fetchJSON('/api/v1/account/bundles/streams');
-        state.bundleStreams = Array.isArray(payload.items) ? payload.items : [];
-      } catch (_) {
-        // Chip labels fall back to "#<id>" when metadata is unavailable.
-        state.bundleStreams = [];
-      }
+      const ids = Array.from(state.bundleSelected);
+      const payload = await fetchJSON(`/api/v1/account/bundles/streams?ids=${ids.join(',')}`);
+      state.bundleStreams = Array.isArray(payload.items) ? payload.items : [];
+      if (state.bundleStreams.length !== ids.length) throw new Error('One or more selected streams are unavailable.');
       renderBundleChips();
     }
 
@@ -4939,7 +5010,7 @@
     function renderBundleChips() {
       const ids = Array.from(state.bundleSelected);
       if (ids.length === 0) {
-        els.bundleStreamChips.innerHTML = '<div class="muted">No streams selected. Pick streams on the streams page to record as a bundle.</div>';
+        els.bundleStreamChips.innerHTML = '<tr><td colspan="4" class="muted">No streams selected.</td></tr>';
         updateBundleCount();
         return;
       }
@@ -4947,8 +5018,20 @@
       els.bundleStreamChips.innerHTML = ids.map((id) => {
         const s = byId.get(id) || {};
         const label = String(s.name || ('#' + id));
-        return `<span class="bundle-chip"><span class="chip-label">${escapeHTML(label)}</span></span>`;
+        const zone = String(s.local_timezone || '').trim();
+        const action = Number(s.recording_id || 0) > 0 ? 'Update' : 'Create';
+        return `<tr><td><span class="cell-main">${escapeHTML(label)}</span><div class="cell-sub mono">#${id}</div></td>`
+          + `<td>${escapeHTML(String(s.location_text || '—'))}</td>`
+          + `<td>${zone ? escapeHTML(zone) : `<input data-batch-tz="${id}" list="ianaTimezones" placeholder="IANA timezone" aria-label="Timezone for ${escapeHTML(label)}" required />`}</td>`
+          + `<td>${action}</td></tr>`;
       }).join('');
+      if (!document.getElementById('ianaTimezones')) {
+        if (typeof Intl.supportedValuesOf !== 'function') throw new Error('This browser cannot list IANA timezones.');
+        const list = document.createElement('datalist');
+        list.id = 'ianaTimezones';
+        list.innerHTML = Intl.supportedValuesOf('timeZone').map((z) => `<option value="${escapeHTML(z)}"></option>`).join('');
+        document.body.appendChild(list);
+      }
       updateBundleCount();
     }
 
@@ -4957,26 +5040,38 @@
       els.bundleStreamCount.textContent = `${n} stream${n === 1 ? '' : 's'} selected`;
     }
 
-    // Build + POST the bundle. The capacity preflight runs server-side; a 409 with
-    // the peak-vs-cap message is surfaced inline (no partial fan-out is created).
+    function selectedBatchWeekdays() {
+      return Array.from(els.batchWeekdays.querySelectorAll('input:checked')).map((el) => Number(el.value));
+    }
+
+    function validIANATimezone(zone) {
+      try { new Intl.DateTimeFormat('en', { timeZone: zone }).format(); return true; } catch (_) { return false; }
+    }
+
     async function startBundle() {
       if (state.bundleSubmitting) return;
       if (state.billingEnabled && state.billing.has_payment_method !== true) {
-        setStatus(els.startStatus, 'Add a card before starting a bundle.', 'err');
+        setStatus(els.startStatus, 'Add a card before setting schedules.', 'err');
         els.cardBanner.classList.remove('hidden');
         return;
       }
-      const name = String(els.bundleName.value || '').trim();
       const ids = Array.from(state.bundleSelected);
       const continuous = state.composerScheduleMode === 'continuous';
       const sched = compiledSchedule();
       const clip = selectedClipSec();
       const dest = selectedDestId();
       const deliveryDest = selectedDeliveryDestId();
-      if (!name) { setStatus(els.startStatus, 'Bundle name is required.', 'err'); return; }
       if (ids.length === 0) { setStatus(els.startStatus, 'Select at least one stream on the streams page.', 'err'); return; }
+      if (ids.length > 50) { setStatus(els.startStatus, 'Select no more than 50 streams.', 'err'); return; }
+      const streamTimezones = Array.from(els.bundleStreamChips.querySelectorAll('input[data-batch-tz]')).map((input) => ({
+        stream_id: Number(input.getAttribute('data-batch-tz')), timezone: String(input.value || '').trim(),
+      }));
+      const invalidTimezone = streamTimezones.find((item) => !validIANATimezone(item.timezone));
+      if (invalidTimezone) { setStatus(els.startStatus, `Set a valid IANA timezone for stream #${invalidTimezone.stream_id}.`, 'err'); return; }
+      const weekdays = selectedBatchWeekdays();
+      if (continuous && weekdays.length === 0) { setStatus(els.startStatus, 'Choose at least one active weekday.', 'err'); return; }
       if (continuous) {
-        if (!continuousWindowValid()) { setStatus(els.startStatus, 'Enter both a start and end time for the daily window.', 'err'); return; }
+        if (!els.batchFullDay.checked && !continuousWindowValid()) { setStatus(els.startStatus, 'Enter both a start and end time for the daily window.', 'err'); return; }
       } else {
         if (!sched.cron) { setStatus(els.startStatus, 'Choose a valid schedule.', 'err'); return; }
         if (!refreshScheduleUIQuiet()) { setStatus(els.startStatus, 'Fix the schedule or clip length first.', 'err'); return; }
@@ -4986,10 +5081,8 @@
 
       const win = compiledWindow();
       const body = {
-        name,
         stream_ids: ids,
-        tag: '',
-        cron_timezone: sched.tz,
+        stream_timezones: streamTimezones,
         clip_duration_sec: clip,
         start_at: win.startISO,
         end_at: win.endISO,
@@ -4997,8 +5090,10 @@
       if (continuous) {
         body.mode = 'continuous';
         body.daily_window_start = String(els.dailyWindowStart.value || '').trim();
-        body.daily_window_end = String(els.dailyWindowEnd.value || '').trim();
+        body.daily_window_end = els.batchFullDay.checked ? body.daily_window_start : String(els.dailyWindowEnd.value || '').trim();
+        body.active_weekdays = weekdays;
       } else {
+        body.mode = 'sampled';
         body.cron_expr = sched.cron;
       }
       const tfps = selectedTargetFps();
@@ -5009,16 +5104,12 @@
       state.bundleSubmitting = true;
       els.startBundleBtn.disabled = true;
       els.bundlePreflight.classList.add('hidden');
-      setStatus(els.startStatus, 'Creating bundle...', '');
+      setStatus(els.startStatus, 'Setting schedules...', '');
       try {
-        const out = await fetchJSON('/api/v1/account/bundles', {
+        const out = await fetchJSON('/api/v1/account/recordings/batch-schedule', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         });
-        setStatus(els.startStatus, '', '');
-        closeComposer();
-        // Navigate to the new bundle's detail page.
-        window.history.pushState({}, '', `/bundles/${Number(out.id)}`);
-        await renderBundleRoute();
+        window.location.assign(`/recordings?batch_created=${Number(out.created || 0)}&batch_updated=${Number(out.updated || 0)}`);
       } catch (err) {
         const msg = String(err.message || err);
         // Surface the capacity-preflight rejection inline (peaks at X vs cap Y).
@@ -5089,7 +5180,7 @@
         <a class="btn-link secondary" href="/recordings">Back to recordings</a>
       </div>`;
       if (items.length === 0) {
-        els.bundleList.innerHTML = header + '<div class="clip-summary">No bundles yet. Use "+ New bundle" on the recordings page to record many streams on one schedule.</div>';
+        els.bundleList.innerHTML = header + '<div class="clip-summary">No historical bundles.</div>';
         return;
       }
       const rows = items.map((b) => {

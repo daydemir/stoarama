@@ -1838,9 +1838,9 @@
       <span class="status-text" id="streamFilterSummary"></span>
     </div>
     <div id="recordSelectedBar" class="record-selected-bar hidden">
-      <span class="status-text"><b data-selcount>0</b> selected</span>
+      <span class="status-text"><b data-selcount>0</b> of 50 selected</span>
       <span class="record-selected-actions">
-        <a id="recordSelectedBtn" class="overview-card-link primary" href="#">Record as bundle</a>
+        <a id="recordSelectedBtn" class="overview-card-link primary" href="#">Set recording schedule</a>
         <button id="recordSelectedClear" type="button" class="overview-card-link">Clear</button>
       </span>
     </div>
@@ -3279,7 +3279,7 @@ if (addStreamSubmitEl instanceof HTMLElement) {
   addStreamSubmitEl.addEventListener('click', submitAddStream);
 }
 
-// Multi-select action bar: "Record as bundle" opens the bundle composer prefilled
+// Multi-select action bar opens the batch schedule composer prefilled
 // with the chosen ids (carried read-only, no picker); "Clear" drops the selection.
 // The ids ride through the magic-link round-trip when signed out (accountRedirectURL
 // preserves the path).
@@ -3290,7 +3290,7 @@ if (recordSelectedBtnEl instanceof HTMLElement) {
     ev.preventDefault();
     const ids = [...selectedStreamIds];
     if (!ids.length) return;
-    const target = `/recordings/new?stream_ids=${ids.join(',')}`;
+    const target = `/recordings/new?stream_ids=${ids.join(',')}&compose=batch`;
     if (isAuthenticatedAccount()) {
       window.location.assign(target);
     } else {
@@ -5153,7 +5153,7 @@ function renderStreamRows() {
     tr.innerHTML = `
       <td class="stream-select-cell">${
         recordable
-          ? `<input type="checkbox" data-streamselect="${s.id}" aria-label="Select stream"${selectedStreamIds.has(Number(s.id)) ? ' checked' : ''} />`
+          ? `<input type="checkbox" data-streamselect="${s.id}" aria-label="Select ${streamRecordingID(row) > 0 ? 'recording to update' : 'stream to record'}"${selectedStreamIds.has(Number(s.id)) ? ' checked' : ''} />`
           : ''
       }</td>
       <td style="padding:6px 10px;">${renderImageSlot(s.id, 'streams')}</td>
@@ -5198,7 +5198,9 @@ function wireStreamSelectRow() {
   streamRowsEl.querySelectorAll('input[data-streamselect]').forEach((cb) => {
     cb.addEventListener('change', () => {
       const id = Number(cb.getAttribute('data-streamselect'));
-      if (cb.checked) selectedStreamIds.add(id); else selectedStreamIds.delete(id);
+      if (cb.checked && selectedStreamIds.size >= 50) cb.checked = false;
+      else if (cb.checked) selectedStreamIds.add(id);
+      else selectedStreamIds.delete(id);
       updateRecordBar();
       syncSelectAllBox();
     });
@@ -5209,8 +5211,13 @@ function wireStreamSelectRow() {
       const boxes = streamRowsEl.querySelectorAll('input[data-streamselect]');
       boxes.forEach((cb) => {
         const id = Number(cb.getAttribute('data-streamselect'));
-        cb.checked = selectAll.checked;
-        if (selectAll.checked) selectedStreamIds.add(id); else selectedStreamIds.delete(id);
+        if (selectAll.checked && selectedStreamIds.size < 50) {
+          cb.checked = true;
+          selectedStreamIds.add(id);
+        } else if (!selectAll.checked) {
+          cb.checked = false;
+          selectedStreamIds.delete(id);
+        }
       });
       updateRecordBar();
     };
@@ -5238,6 +5245,9 @@ function updateRecordBar() {
   bar.classList.toggle('hidden', n === 0);
   const count = bar.querySelector('[data-selcount]');
   if (count) count.textContent = String(n);
+  streamRowsEl.querySelectorAll('input[data-streamselect]').forEach((cb) => {
+    cb.disabled = n >= 50 && !cb.checked;
+  });
 }
 
 function applySourceSegment(seg, opts = {}) {

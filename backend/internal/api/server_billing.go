@@ -174,7 +174,7 @@ func (s *Server) projectAccountRecordingHours(ctx context.Context, accountID int
 		SELECT mode, COALESCE(cron_expr,''), COALESCE(cron_timezone,''),
 		       COALESCE(to_char(daily_window_start,'HH24:MI:SS'),''),
 		       COALESCE(to_char(daily_window_end,'HH24:MI:SS'),''),
-		       start_at, end_at
+		       start_at, end_at, active_weekdays
 		FROM recordings
 		WHERE account_id=$1 AND status='active'
 	`, accountID)
@@ -190,7 +190,7 @@ func (s *Server) projectAccountRecordingHours(ctx context.Context, accountID int
 			startAt time.Time
 			endAt   *time.Time
 		)
-		if err := rows.Scan(&rec.Mode, &rec.CronExpr, &rec.CronTimezone, &rec.DailyStart, &rec.DailyEnd, &startAt, &endAt); err != nil {
+		if err := rows.Scan(&rec.Mode, &rec.CronExpr, &rec.CronTimezone, &rec.DailyStart, &rec.DailyEnd, &startAt, &endAt, &rec.ActiveWeekdays); err != nil {
 			return 0, fmt.Errorf("scan active recording: %w", err)
 		}
 		rec.StartAt = startAt.UTC()
