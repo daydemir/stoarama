@@ -1838,7 +1838,7 @@
       <span class="status-text" id="streamFilterSummary"></span>
     </div>
     <div id="recordSelectedBar" class="record-selected-bar hidden">
-      <span class="status-text"><b data-selcount>0</b> of 50 selected</span>
+      <span class="status-text"><b data-selcount>0</b> of 200 selected</span>
       <span class="record-selected-actions">
         <a id="recordSelectedBtn" class="overview-card-link primary" href="#">Set recording schedule</a>
         <button id="recordSelectedClear" type="button" class="overview-card-link">Clear</button>
@@ -5198,7 +5198,7 @@ function wireStreamSelectRow() {
   streamRowsEl.querySelectorAll('input[data-streamselect]').forEach((cb) => {
     cb.addEventListener('change', () => {
       const id = Number(cb.getAttribute('data-streamselect'));
-      if (cb.checked && selectedStreamIds.size >= 50) cb.checked = false;
+      if (cb.checked && selectedStreamIds.size >= 200) cb.checked = false;
       else if (cb.checked) selectedStreamIds.add(id);
       else selectedStreamIds.delete(id);
       updateRecordBar();
@@ -5211,7 +5211,7 @@ function wireStreamSelectRow() {
       const boxes = streamRowsEl.querySelectorAll('input[data-streamselect]');
       boxes.forEach((cb) => {
         const id = Number(cb.getAttribute('data-streamselect'));
-        if (selectAll.checked && selectedStreamIds.size < 50) {
+        if (selectAll.checked && selectedStreamIds.size < 200) {
           cb.checked = true;
           selectedStreamIds.add(id);
         } else if (!selectAll.checked) {
@@ -5246,7 +5246,7 @@ function updateRecordBar() {
   const count = bar.querySelector('[data-selcount]');
   if (count) count.textContent = String(n);
   streamRowsEl.querySelectorAll('input[data-streamselect]').forEach((cb) => {
-    cb.disabled = n >= 50 && !cb.checked;
+    cb.disabled = n >= 200 && !cb.checked;
   });
 }
 

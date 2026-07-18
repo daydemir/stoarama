@@ -104,8 +104,8 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 		}
 		return spec, err
 	}
-	if len(spec.StreamIDs) == 0 || len(spec.StreamIDs) > 50 {
-		return spec, fmt.Errorf("stream_ids must contain 1 to 50 ids")
+	if len(spec.StreamIDs) == 0 || len(spec.StreamIDs) > 200 {
+		return spec, fmt.Errorf("stream_ids must contain 1 to 200 ids")
 	}
 	if spec.Mode != recordingScheduleSampled && spec.Mode != recordingScheduleContinuous {
 		return spec, fmt.Errorf("mode is required")

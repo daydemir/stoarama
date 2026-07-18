@@ -4267,8 +4267,8 @@
           u.searchParams.delete('compose');
           window.history.replaceState({}, '', u.pathname + (u.search || '') + u.hash);
         } catch (_) { /* ignore */ }
-        if (ids.length > 50) {
-          window.alert('Select no more than 50 streams.');
+        if (ids.length > 200) {
+          window.alert('Select no more than 200 streams.');
           window.location.assign('/streams');
           return;
         }
@@ -4826,7 +4826,7 @@
       const dest = selectedDestId();
       const deliveryDest = selectedDeliveryDestId();
       if (ids.length === 0) { setStatus(els.startStatus, 'Select at least one stream on the streams page.', 'err'); return; }
-      if (ids.length > 50) { setStatus(els.startStatus, 'Select no more than 50 streams.', 'err'); return; }
+      if (ids.length > 200) { setStatus(els.startStatus, 'Select no more than 200 streams.', 'err'); return; }
       const streamTimezones = Array.from(els.batchStreamRows.querySelectorAll('input[data-batch-tz]')).map((input) => ({
         stream_id: Number(input.getAttribute('data-batch-tz')), timezone: String(input.value || '').trim(),
       }));

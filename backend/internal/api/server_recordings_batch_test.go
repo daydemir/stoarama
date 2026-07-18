@@ -12,11 +12,18 @@ func TestUniqueBatchStreamIDs(t *testing.T) {
 			t.Fatalf("accepted %v", bad)
 		}
 	}
-	tooMany := make([]int64, 51)
+	maximum := make([]int64, 200)
+	for i := range maximum {
+		maximum[i] = int64(i + 1)
+	}
+	if _, err := uniqueBatchStreamIDs(maximum); err != nil {
+		t.Fatalf("rejected 200 streams: %v", err)
+	}
+	tooMany := make([]int64, 201)
 	for i := range tooMany {
 		tooMany[i] = int64(i + 1)
 	}
 	if _, err := uniqueBatchStreamIDs(tooMany); err == nil {
-		t.Fatal("accepted 51 streams")
+		t.Fatal("accepted 201 streams")
 	}
 }
