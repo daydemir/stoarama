@@ -734,14 +734,13 @@ func (s *Server) handleAccountRecordingClipTransfer(w http.ResponseWriter, r *ht
 const exportBatchSize = 500
 
 // exportCreateRequest is the bulk-export body. scope selects the clip set
-// (account: every clip; recording: one recording's clips; bundle: every member
-// recording's clips). One target storage_destination_id receives the copies; an
+// (account: every clip; recording: one recording's clips). One target
+// storage_destination_id receives the copies; an
 // optional purge_source deletes each managed source object after a confirmed
 // copy so managed storage stops accruing stream_hour_month.
 type exportCreateRequest struct {
 	Scope                      string `json:"scope"`
 	RecordingID                int64  `json:"recording_id"`
-	BundleID                   int64  `json:"bundle_id"`
 	StorageDestinationID       int64  `json:"storage_destination_id"`
 	TargetStorageDestinationID int64  `json:"target_storage_destination_id"`
 	PurgeSource                bool   `json:"purge_source"`
@@ -808,8 +807,7 @@ func (s *Server) handleAccountExportCreate(w http.ResponseWriter, r *http.Reques
 
 	// Resolve the scope to a WHERE predicate over the shared
 	// recording_clips JOIN recordings pattern, account-scoped. recording and
-	// bundle scopes first verify the caller owns the parent (mirroring the
-	// per-recording / bundle owner checks).
+	// recording scope first verifies the caller owns the parent.
 	var scopeSQL string
 	args := []any{principal.AccountID, targetDestID}
 	switch scope {
@@ -833,26 +831,8 @@ func (s *Server) handleAccountExportCreate(w http.ResponseWriter, r *http.Reques
 		}
 		args = append(args, req.RecordingID)
 		scopeSQL = fmt.Sprintf("AND c.recording_id=$%d", len(args))
-	case "bundle":
-		if req.BundleID <= 0 {
-			util.WriteError(w, http.StatusBadRequest, "bundle_id is required for scope=bundle")
-			return
-		}
-		var ownerOK bool
-		if err := s.pool.QueryRow(r.Context(), `
-			SELECT EXISTS(SELECT 1 FROM recording_bundles WHERE id=$1 AND account_id=$2 AND status <> 'canceled')
-		`, req.BundleID, principal.AccountID).Scan(&ownerOK); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load bundle: %v", err))
-			return
-		}
-		if !ownerOK {
-			util.WriteError(w, http.StatusNotFound, "bundle not found")
-			return
-		}
-		args = append(args, req.BundleID)
-		scopeSQL = fmt.Sprintf("AND rec.bundle_id=$%d", len(args))
 	default:
-		util.WriteError(w, http.StatusBadRequest, "scope must be account, recording, or bundle")
+		util.WriteError(w, http.StatusBadRequest, "scope must be account or recording")
 		return
 	}
 
@@ -922,7 +902,6 @@ func (s *Server) handleAccountExportCreate(w http.ResponseWriter, r *http.Reques
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"scope":                         scope,
 		"recording_id":                  req.RecordingID,
-		"bundle_id":                     req.BundleID,
 		"target_storage_destination_id": targetDestID,
 		"total_clips":                   total,
 		"enqueued":                      enqueued,
@@ -996,16 +975,8 @@ func (s *Server) handleAccountExportProgress(w http.ResponseWriter, r *http.Requ
 		}
 		args = append(args, rid)
 		scopeSQL = fmt.Sprintf("AND c.recording_id=$%d", len(args))
-	case "bundle":
-		bid := parseInt64Query(r, "bundle_id")
-		if bid <= 0 {
-			util.WriteError(w, http.StatusBadRequest, "bundle_id is required for scope=bundle")
-			return
-		}
-		args = append(args, bid)
-		scopeSQL = fmt.Sprintf("AND rec.bundle_id=$%d", len(args))
 	default:
-		util.WriteError(w, http.StatusBadRequest, "scope must be account, recording, or bundle")
+		util.WriteError(w, http.StatusBadRequest, "scope must be account or recording")
 		return
 	}
 

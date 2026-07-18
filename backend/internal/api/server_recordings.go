@@ -67,7 +67,6 @@ const recordingListSelectSQL = `
 		rec.created_at, sd.managed,
 		rec.stream_id, st.name, st.location_text,
 		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
-		rec.bundle_id, (SELECT b.name FROM recording_bundles b WHERE b.id = rec.bundle_id) AS bundle_name,
 		rec.storage_retention_tier, rec.delivery,
 		rec.capture_via,
 		rec.naming_profile, rec.folder_name, rec.naming_metadata_jsonb,
@@ -833,7 +832,6 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		nextFireArg:         nextFireArg,
 		startAt:             startAt,
 		endAtArg:            endAtArg,
-		bundleIDArg:         nil,
 		retentionTier:       retentionTier,
 		delivery:            delivery,
 		captureVia:          captureVia,
@@ -923,7 +921,7 @@ func normalizeCaptureVia(raw string) (string, bool) {
 
 // recordingInsertParams carries the fully-resolved column values for one
 // recordings row. It is the single contract shared by single-recording create
-// and bundle fan-out so the INSERT lives in exactly one place (DRY). Every *Arg
+// and batch scheduling so the INSERT lives in exactly one place (DRY). Every *Arg
 // field is an `any` that is either a concrete value or nil for SQL NULL.
 type recordingInsertParams struct {
 	accountID           int64
@@ -944,15 +942,14 @@ type recordingInsertParams struct {
 	nextFireArg         any
 	startAt             time.Time
 	endAtArg            any
-	bundleIDArg         any
 	// retentionTier is 'monthly' (default) or 'yearly_prepaid'; empty is treated as
-	// 'monthly'. Bundle fan-out leaves it empty so bundled recordings are metered.
+	// 'monthly'.
 	retentionTier string
 	// delivery is the storage-delivery mode. Empty is treated as 'managed', so the
-	// bundle fan-out (which leaves it empty) always writes 'managed' deliberately.
+	// batch scheduling (which leaves it empty) always writes 'managed' deliberately.
 	delivery deliveryMode
 	// captureVia is the capture-routing flag ('cloud' or 'relay'). Empty is treated as
-	// 'cloud', so the bundle fan-out (which leaves it empty) always writes 'cloud'.
+	// 'cloud', so batch scheduling (which leaves it empty) always writes 'cloud'.
 	captureVia     string
 	namingProfile  recordingnaming.Profile
 	folderName     string
@@ -961,10 +958,7 @@ type recordingInsertParams struct {
 
 // insertRecordingTx runs the one canonical recordings INSERT inside the caller's
 // transaction and returns the new row's id/created_at/start_at/end_at. It returns
-// the pgx error unwrapped so each caller maps 23505 (name collision) on its own
-// terms: single-create -> 409 "name exists"; bundle-create -> whole-bundle
-// failure. The 15 existing columns keep the exact values they had before; the
-// only addition is bundle_id (nil for a standalone recording).
+// the pgx error unwrapped so callers can map name collisions to HTTP 409.
 func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingInsertParams) (id int64, createdAt time.Time, startOut time.Time, endOut *time.Time, err error) {
 	mode := p.mode
 	if mode == "" {
@@ -1000,10 +994,10 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery, capture_via, naming_profile, folder_name, naming_metadata_jsonb, active_weekdays)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, storage_retention_tier, delivery, capture_via, naming_profile, folder_name, naming_metadata_jsonb, active_weekdays)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 		RETURNING id, created_at, start_at, end_at
-	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery), captureVia, namingProfile.String(), folderName, namingMetadata, activeWeekdays).Scan(&id, &createdAt, &startOut, &endOut)
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, retentionTier, string(delivery), captureVia, namingProfile.String(), folderName, namingMetadata, activeWeekdays).Scan(&id, &createdAt, &startOut, &endOut)
 	return id, createdAt, startOut, endOut, err
 }
 
@@ -1941,39 +1935,7 @@ func (s *Server) handleAccountRecordingDelete(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	tx, err := s.pool.Begin(r.Context())
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin delete tx: %v", err))
-		return
-	}
-	defer func() { _ = tx.Rollback(r.Context()) }()
-
-	ct, err := tx.Exec(r.Context(), `
-		UPDATE recordings
-		SET status='canceled', next_fire_at=NULL, updated_at=now()
-		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("cancel recording: %v", err))
-		return
-	}
-	if ct.RowsAffected() == 0 {
-		util.WriteError(w, http.StatusNotFound, "recording not found")
-		return
-	}
-
-	// Cancel any in-flight jobs so the worker stops capturing this recording.
-	if _, err := tx.Exec(r.Context(), `
-		UPDATE recording_jobs
-		SET status='canceled', updated_at=now()
-		WHERE recording_id=$1 AND status IN ('pending','leased')
-	`, id); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("cancel recording jobs: %v", err))
-		return
-	}
-
-	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit delete tx: %v", err))
+	if !s.cancelRecordings(w, r, principal.AccountID, []int64{id}) {
 		return
 	}
 
@@ -2083,8 +2045,6 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		mode             string
 		dailyWindowStart string
 		dailyWindowEnd   string
-		bundleID         *int64
-		bundleName       *string
 		retentionTier    string
 		delivery         string
 		captureVia       string
@@ -2102,7 +2062,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd,
-		&bundleID, &bundleName, &retentionTier, &delivery,
+		&retentionTier, &delivery,
 		&captureVia, &namingProfile, &folderName, &namingMetadata,
 		&hasRelayOnline, &relayNodeName,
 	); err != nil {
@@ -2148,8 +2108,6 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"stream_id":                streamID,
 		"stream_name":              streamName,
 		"stream_location":          streamLocation,
-		"bundle_id":                bundleID,
-		"bundle_name":              bundleName,
 		"storage_retention_tier":   retentionTier,
 		"delivery":                 delivery,
 		"capture_via":              captureVia,
@@ -2194,7 +2152,7 @@ func (s *Server) checkRecordingScheduleCapacity(ctx context.Context, cronExpr, c
 // its mode: for sampled it is the next cron fire; for continuous it is the next
 // daily-window open instant. The daily window strings are "HH:MM:SS" (nil for a
 // sampled recording). It is the single mode-aware next-fire authority shared by
-// the create, resume, and (bundle) member-resume paths.
+// the create and resume paths.
 func nextFireForRecording(mode string, cronExpr *string, cronTimezone string, dwStart, dwEnd *string, weekdays recsched.WeekdaySet, startAt time.Time, endAt *time.Time, now time.Time) (time.Time, error) {
 	if mode == "continuous" {
 		if dwStart == nil {
@@ -2231,8 +2189,8 @@ func endAtTime(endAtArg any) time.Time {
 	return time.Time{}
 }
 
-// checkContinuousScheduleCapacity rejects a prospective continuous schedule (or a
-// continuous bundle of memberCount identical streams) whose forecast peak, with
+// checkContinuousScheduleCapacity rejects a prospective continuous schedule for
+// memberCount streams whose forecast peak, with
 // everything already capturing, would exceed the pool ceiling Max*Capacity. A
 // continuous stream is a constant +1 slot for its whole window, so memberCount
 // streams add +memberCount at the shared window. To count all members
@@ -2289,46 +2247,6 @@ func (s *Server) checkContinuousScheduleCapacity(ctx context.Context, cronTimezo
 // timeOfDayString renders a TimeOfDay as HH:MM:SS for the forecast candidate.
 func timeOfDayString(t recsched.TimeOfDay) string {
 	return fmt.Sprintf("%02d:%02d:%02d", t.Hour, t.Minute, t.Second)
-}
-
-// checkBundleScheduleCapacity rejects a prospective bundle whose forecast peak
-// simultaneous clip count, combined with the existing capturing fleet, would
-// exceed the pool ceiling Max*Capacity. Because every bundle member shares ONE
-// cron/tz/clip, the memberCount candidates are identical and all fire together,
-// so the honest peak rises by memberCount at the bundle's fire instants. It
-// reuses the same sweep-line as the single-recording cap (DRY) and rejects the
-// WHOLE bundle up front with one clear message, so an over-cap bundle leaves zero
-// rows behind. The error is user-facing (no em dashes).
-func (s *Server) checkBundleScheduleCapacity(ctx context.Context, cronExpr, cronTimezone string, clipDurationSec, memberCount int) error {
-	ceiling := s.cfg.DropletPoolMax * s.cfg.DropletPoolCapacity
-	if ceiling <= 0 {
-		// Pool config not set on this service: no meaningful ceiling to enforce.
-		return nil
-	}
-	if memberCount <= 0 {
-		return nil
-	}
-	billingEnabled := s.billing != nil
-	lookahead := time.Duration(s.cfg.DropletPoolLookaheadSec) * time.Second
-	if lookahead <= 0 {
-		lookahead = 30 * time.Minute
-	}
-	candidates := make([]dropletpool.ForecastCandidate, memberCount)
-	for i := range candidates {
-		candidates[i] = dropletpool.ForecastCandidate{
-			CronExpr:        cronExpr,
-			CronTimezone:    cronTimezone,
-			ClipDurationSec: clipDurationSec,
-		}
-	}
-	peak, err := dropletpool.ForecastPeakWithCandidates(ctx, s.pool, billingEnabled, candidates, time.Now().UTC(), lookahead)
-	if err != nil {
-		return fmt.Errorf("forecast bundle capacity: %v", err)
-	}
-	if peak > ceiling {
-		return fmt.Errorf("this bundle peaks at %d concurrent clips, above the recorder limit of %d. Reduce the number of streams, stagger the schedule, or contact the operator to raise the cap.", peak, ceiling)
-	}
-	return nil
 }
 
 // recordingHealth derives a coarse health badge from the failure counter. It is

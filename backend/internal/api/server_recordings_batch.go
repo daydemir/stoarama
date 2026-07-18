@@ -56,8 +56,8 @@ type batchScheduleRequest struct {
 }
 
 type batchStream struct {
-	id, recordingID, bundleID, recordingCount int64
-	name, sourceURL, timezone, captureVia     string
+	id, recordingID, recordingCount       int64
+	name, sourceURL, timezone, captureVia string
 }
 
 type batchScheduleItem struct {
@@ -177,7 +177,6 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		SELECT st.id, st.name, st.source_url, st.local_timezone,
 		       COALESCE((SELECT rec.id FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),0),
 		       COALESCE((SELECT rec.capture_via FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),''),
-		       COALESCE((SELECT rec.bundle_id FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),0),
 		       (SELECT count(*) FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled')
 		FROM streams st WHERE st.id=ANY($1::bigint[]) AND st.deleted_at IS NULL
 		ORDER BY st.id FOR UPDATE
@@ -189,7 +188,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	streams := make([]batchStream, 0, len(ids))
 	for rows.Next() {
 		var st batchStream
-		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.timezone, &st.recordingID, &st.captureVia, &st.bundleID, &st.recordingCount); err != nil {
+		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.timezone, &st.recordingID, &st.captureVia, &st.recordingCount); err != nil {
 			rows.Close()
 			util.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -205,10 +204,6 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		st := &streams[i]
 		if st.recordingCount > 1 {
 			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d has multiple active recordings; resolve them before batch scheduling", st.id))
-			return
-		}
-		if st.bundleID != 0 {
-			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d belongs to a legacy recording bundle and cannot be batch scheduled", st.id))
 			return
 		}
 		if st.timezone == "" {

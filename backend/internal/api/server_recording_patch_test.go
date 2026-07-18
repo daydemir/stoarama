@@ -317,7 +317,7 @@ func insertPatchRecording(t *testing.T, pool *pgxpool.Pool, accountID, destID in
 
 // testRecordingPatchPool spins up a throwaway schema with the minimal table set the
 // PATCH handlers read: recordings + its list-SELECT joins (storage_destinations,
-// streams, account_billing, recording_clips, recording_bundles) and connections. The
+// streams, account_billing, recording_clips) and connections. The
 // account_auth_events insert is error-ignored in the handlers, so it is omitted here.
 func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 	t.Helper()
@@ -373,10 +373,6 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			account_id BIGINT PRIMARY KEY,
 			has_payment_method BOOLEAN NOT NULL DEFAULT false
 		)`,
-		`CREATE TABLE recording_bundles (
-			id BIGSERIAL PRIMARY KEY,
-			name TEXT
-		)`,
 		`CREATE TABLE connections (
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
@@ -406,7 +402,6 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			consecutive_failures INT NOT NULL DEFAULT 0,
 			start_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			end_at TIMESTAMPTZ,
-			bundle_id BIGINT,
 			storage_retention_tier TEXT NOT NULL DEFAULT 'monthly',
 			delivery TEXT NOT NULL DEFAULT 'managed',
 			capture_via TEXT NOT NULL DEFAULT 'cloud',
