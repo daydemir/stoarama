@@ -846,14 +846,11 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			body := map[string]any{"error": "a recording with that name already exists"}
 			var collidedID *int64
-			if pgErr.ConstraintName == "idx_recordings_account_stream_active" && catalogStreamID > 0 {
-				body["error"] = "this stream already has a recording; edit its schedule instead"
-				_ = s.pool.QueryRow(r.Context(), `
-					SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status <> 'canceled' LIMIT 1
-				`, principal.AccountID, catalogStreamID).Scan(&collidedID)
-			} else if serr := s.pool.QueryRow(r.Context(), `
+			if serr := s.pool.QueryRow(r.Context(), `
 				SELECT id FROM recordings WHERE account_id=$1 AND lower(name)=lower($2) AND status <> 'canceled' LIMIT 1
-			`, principal.AccountID, name).Scan(&collidedID); serr == nil && collidedID != nil {
+			`, principal.AccountID, name).Scan(&collidedID); serr != nil && !errors.Is(serr, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("find conflicting recording: %v", serr))
+				return
 			}
 			if collidedID != nil {
 				body["recording_id"] = *collidedID

@@ -56,7 +56,7 @@ type batchScheduleRequest struct {
 }
 
 type batchStream struct {
-	id, recordingID                       int64
+	id, recordingID, bundleID             int64
 	name, sourceURL, timezone, captureVia string
 }
 
@@ -176,7 +176,8 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	rows, err := tx.Query(r.Context(), `
 		SELECT st.id, st.name, st.source_url, st.local_timezone,
 		       COALESCE((SELECT rec.id FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),0),
-		       COALESCE((SELECT rec.capture_via FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),'')
+		       COALESCE((SELECT rec.capture_via FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),''),
+		       COALESCE((SELECT rec.bundle_id FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),0)
 		FROM streams st WHERE st.id=ANY($1::bigint[]) AND st.deleted_at IS NULL
 		ORDER BY st.id FOR UPDATE
 	`, ids, principal.AccountID)
@@ -187,7 +188,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	streams := make([]batchStream, 0, len(ids))
 	for rows.Next() {
 		var st batchStream
-		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.timezone, &st.recordingID, &st.captureVia); err != nil {
+		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.timezone, &st.recordingID, &st.captureVia, &st.bundleID); err != nil {
 			rows.Close()
 			util.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -201,6 +202,10 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	for i := range streams {
 		st := &streams[i]
+		if st.bundleID != 0 {
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d belongs to a legacy recording bundle and cannot be batch scheduled", st.id))
+			return
+		}
 		if st.timezone == "" {
 			st.timezone = timezoneByID[st.id]
 			if st.timezone == "" {
@@ -327,7 +332,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		if recordingID != 0 {
 			_, err = tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, last_enqueued_fire_at=NULL, status=CASE WHEN status='completed' THEN 'active' ELSE status END, consecutive_failures=CASE WHEN status='completed' THEN 0 ELSE consecutive_failures END, last_error_text=CASE WHEN status='completed' THEN '' ELSE last_error_text END, last_error_at=CASE WHEN status='completed' THEN NULL ELSE last_error_at END, updated_at=now() WHERE id=$1 AND account_id=$2`, recordingID, principal.AccountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg)
 			if err == nil {
-				_, err = tx.Exec(r.Context(), `UPDATE recording_jobs SET status='canceled', updated_at=now() WHERE recording_id=$1 AND status='pending'`, recordingID)
+				_, err = tx.Exec(r.Context(), `
+					UPDATE recording_jobs
+					SET status='canceled', lease_owner=NULL, lease_expires_at=NULL, updated_at=now()
+					WHERE recording_id=$1 AND status IN ('pending','leased')
+				`, recordingID)
 			}
 			updated++
 		} else {
