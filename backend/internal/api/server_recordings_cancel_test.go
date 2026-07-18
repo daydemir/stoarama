@@ -50,13 +50,16 @@ func TestCancelRecordingsIsAtomic(t *testing.T) {
 		t.Fatal("mixed-account batch unexpectedly succeeded")
 	}
 	var status string
+	var owner *string
 	if err := pool.QueryRow(ctx, `SELECT status FROM recordings WHERE id=$1`, ownedID).Scan(&status); err != nil || status != "active" {
 		t.Fatalf("partial cancellation was not rolled back: status=%q err=%v", status, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,lease_owner FROM recording_jobs WHERE recording_id=$1`, ownedID).Scan(&status, &owner); err != nil || status != "leased" || owner == nil || *owner != "worker" {
+		t.Fatalf("job cancellation was not rolled back: status=%q owner=%v err=%v", status, owner, err)
 	}
 	if !s.cancelRecordings(httptest.NewRecorder(), req, 1, []int64{ownedID}) {
 		t.Fatal("owned cancellation failed")
 	}
-	var owner *string
 	if err := pool.QueryRow(ctx, `SELECT status,lease_owner FROM recording_jobs WHERE recording_id=$1`, ownedID).Scan(&status, &owner); err != nil || status != "canceled" || owner != nil {
 		t.Fatalf("job not canceled cleanly: status=%q owner=%v err=%v", status, owner, err)
 	}
