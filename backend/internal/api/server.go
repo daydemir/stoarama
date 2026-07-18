@@ -427,6 +427,7 @@ func (s *Server) router() http.Handler {
 		api.Group(func(bundles chi.Router) {
 			bundles.Use(s.requireAccountSessionAuth)
 
+			bundles.Post("/account/bundles", s.handleAccountBundlesCreate)
 			bundles.Get("/account/bundles", s.handleAccountBundlesList)
 			bundles.Get("/account/bundles/streams", s.handleAccountBundleStreams)
 			bundles.Get("/account/bundles/{id}", s.handleAccountBundleGet)
