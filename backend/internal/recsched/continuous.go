@@ -5,6 +5,35 @@ import (
 	"time"
 )
 
+// WeekdaySet is a compact ISO-weekday mask (Monday=bit 0, Sunday=bit 6).
+// Zero is invalid at the API boundary; AllWeekdays preserves pre-existing daily
+// schedules and is the database default.
+type WeekdaySet uint8
+
+const AllWeekdays WeekdaySet = 0x7f
+
+func NewWeekdaySet(days []int) (WeekdaySet, error) {
+	var set WeekdaySet
+	for _, day := range days {
+		if day < 1 || day > 7 {
+			return 0, fmt.Errorf("active_weekdays must contain ISO weekdays 1 through 7")
+		}
+		set |= 1 << (day - 1)
+	}
+	if set == 0 {
+		return 0, fmt.Errorf("active_weekdays must not be empty")
+	}
+	return set, nil
+}
+
+func (s WeekdaySet) Contains(day time.Weekday) bool {
+	iso := int(day)
+	if iso == 0 {
+		iso = 7
+	}
+	return s&(1<<(iso-1)) != 0
+}
+
 // TimeOfDay is a wall-clock time-of-day (hour/minute/second) with no date, the
 // shape of a recording's daily_window_start / daily_window_end. It is localized to
 // a recording's timezone on a specific calendar day to produce a UTC instant.
@@ -74,6 +103,10 @@ func ValidateContinuousWindowForCreate(start, end TimeOfDay, clipDurationSec int
 // envelope (envEnd zero = open-ended). It is pure so the scheduler's enqueue gate
 // is unit-testable.
 func currentOpenContinuousWindow(tz string, start, end TimeOfDay, envStart, envEnd, now time.Time) (open bool, windowOpenUTC, windowEndUTC time.Time, err error) {
+	return currentOpenContinuousWindowOn(tz, start, end, AllWeekdays, envStart, envEnd, now)
+}
+
+func currentOpenContinuousWindowOn(tz string, start, end TimeOfDay, weekdays WeekdaySet, envStart, envEnd, now time.Time) (open bool, windowOpenUTC, windowEndUTC time.Time, err error) {
 	loc, err := LoadLocation(tz)
 	if err != nil {
 		return false, time.Time{}, time.Time{}, err
@@ -84,7 +117,7 @@ func currentOpenContinuousWindow(tz string, start, end TimeOfDay, envStart, envE
 		// Same-day daytime window [start, end) on today's local date.
 		openUTC := start.onDay(y, mo, d, loc)
 		closeUTC := end.onDay(y, mo, d, loc)
-		if !now.Before(openUTC) && now.Before(closeUTC) {
+		if weekdays.Contains(localNow.Weekday()) && !now.Before(openUTC) && now.Before(closeUTC) {
 			return clampToEnvelope(openUTC, closeUTC, envStart, envEnd, now)
 		}
 		return false, time.Time{}, time.Time{}, nil
@@ -99,7 +132,10 @@ func currentOpenContinuousWindow(tz string, start, end TimeOfDay, envStart, envE
 		// Opened today at start; closes at end tomorrow.
 		ny, nmo, nd := nextLocalDate(y, mo, d, loc)
 		closeUTC := end.onDay(ny, nmo, nd, loc)
-		return clampToEnvelope(openToday, closeUTC, envStart, envEnd, now)
+		if weekdays.Contains(localNow.Weekday()) {
+			return clampToEnvelope(openToday, closeUTC, envStart, envEnd, now)
+		}
+		return false, time.Time{}, time.Time{}, nil
 	}
 	// now is before today's open: the occurrence that opened yesterday may still be
 	// open until end today.
@@ -107,7 +143,9 @@ func currentOpenContinuousWindow(tz string, start, end TimeOfDay, envStart, envE
 	if now.Before(closeToday) {
 		py, pmo, pd := prevLocalDate(y, mo, d, loc)
 		openYesterday := start.onDay(py, pmo, pd, loc)
-		return clampToEnvelope(openYesterday, closeToday, envStart, envEnd, now)
+		if weekdays.Contains(openYesterday.In(loc).Weekday()) {
+			return clampToEnvelope(openYesterday, closeToday, envStart, envEnd, now)
+		}
 	}
 	return false, time.Time{}, time.Time{}, nil
 }
@@ -145,6 +183,10 @@ func prevLocalDate(y int, mo time.Month, d int, loc *time.Location) (int, time.M
 // bounded number of days. A zero return means no further window opens within the
 // envelope. Used for next_fire_at display and the create-time anchored preflight.
 func NextWindowOpenUTC(tz string, start TimeOfDay, envStart, envEnd, after time.Time) (time.Time, error) {
+	return NextWindowOpenUTCOn(tz, start, AllWeekdays, envStart, envEnd, after)
+}
+
+func NextWindowOpenUTCOn(tz string, start TimeOfDay, weekdays WeekdaySet, envStart, envEnd, after time.Time) (time.Time, error) {
 	loc, err := LoadLocation(tz)
 	if err != nil {
 		return time.Time{}, err
@@ -160,7 +202,7 @@ func NextWindowOpenUTC(tz string, start TimeOfDay, envStart, envEnd, after time.
 	const maxDays = 372
 	for i := 0; i < maxDays; i++ {
 		dayOpen := start.onDay(y, mo, d, loc)
-		if dayOpen.After(after) && !dayOpen.Before(envStart) {
+		if weekdays.Contains(dayOpen.In(loc).Weekday()) && dayOpen.After(after) && !dayOpen.Before(envStart) {
 			if !envEnd.IsZero() && !dayOpen.Before(envEnd) {
 				return time.Time{}, nil
 			}

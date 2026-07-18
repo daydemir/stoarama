@@ -25,6 +25,7 @@ type forecastRecording struct {
 	dailyWindowEnd   string
 	envStart         time.Time
 	envEnd           time.Time
+	activeWeekdays   recsched.WeekdaySet
 }
 
 // Forecast is the demand-forecast result over a lookahead window.
@@ -49,12 +50,12 @@ type jobInterval struct {
 // account has a card on file). It is the single SELECT both the autoscaler
 // forecast and the create-time cap share, so the demand model has one source of
 // truth (DRY). It reads, never writes, the queue.
-func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool) ([]forecastRecording, error) {
+func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, excludeRecordingIDs []int64) ([]forecastRecording, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT rec.mode, COALESCE(rec.cron_expr, ''), rec.cron_timezone, rec.clip_duration_sec,
 		       COALESCE(to_char(rec.daily_window_start, 'HH24:MI:SS'), ''),
 		       COALESCE(to_char(rec.daily_window_end, 'HH24:MI:SS'), ''),
-		       rec.start_at, rec.end_at
+		       rec.start_at, rec.end_at, rec.active_weekdays
 		FROM recordings rec
 		WHERE rec.status='active'
 		  AND rec.start_at <= now()
@@ -63,11 +64,12 @@ func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEna
 		  -- pool, so they must not inflate droplet demand. capture_via is NOT NULL
 		  -- DEFAULT 'cloud', so this is dark until a relay recording exists.
 		  AND rec.capture_via = 'cloud'
+		  AND ($2::bigint[] IS NULL OR NOT (rec.id = ANY($2::bigint[])))
 		  AND ($1 OR EXISTS (
 		        SELECT 1 FROM account_billing b
 		        WHERE b.account_id = rec.account_id
 		          AND b.has_payment_method))
-	`, !billingEnabled)
+	`, !billingEnabled, excludeRecordingIDs)
 	if err != nil {
 		return nil, fmt.Errorf("forecast: select capturing recordings: %w", err)
 	}
@@ -77,7 +79,7 @@ func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEna
 		var r forecastRecording
 		var envEnd *time.Time
 		if err := rows.Scan(&r.mode, &r.cronExpr, &r.cronTimezone, &r.clipDurationSec,
-			&r.dailyWindowStart, &r.dailyWindowEnd, &r.envStart, &envEnd); err != nil {
+			&r.dailyWindowStart, &r.dailyWindowEnd, &r.envStart, &envEnd, &r.activeWeekdays); err != nil {
 			return nil, fmt.Errorf("forecast: scan recording: %w", err)
 		}
 		if envEnd != nil {
@@ -95,7 +97,7 @@ func loadCapturingRecordings(ctx context.Context, pool *pgxpool.Pool, billingEna
 // concurrent clip count and the earliest fire in [now, now+lookahead]. It reads,
 // never writes, the queue.
 func ForecastDemand(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, now time.Time, lookahead time.Duration) (Forecast, error) {
-	recs, err := loadCapturingRecordings(ctx, pool, billingEnabled)
+	recs, err := loadCapturingRecordings(ctx, pool, billingEnabled, nil)
 	if err != nil {
 		return Forecast{}, err
 	}
@@ -134,6 +136,7 @@ type ForecastCandidate struct {
 	DailyWindowEnd   string
 	EnvStart         time.Time
 	EnvEnd           time.Time
+	ActiveWeekdays   recsched.WeekdaySet
 }
 
 // ForecastPeakWithCandidates loads the current capturing recordings and forecasts
@@ -146,7 +149,13 @@ type ForecastCandidate struct {
 // (DRY). A candidate whose cron is unparseable contributes nothing to the peak
 // (create validates the cron separately and rejects first).
 func ForecastPeakWithCandidates(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, candidates []ForecastCandidate, now time.Time, lookahead time.Duration) (int, error) {
-	recs, err := loadCapturingRecordings(ctx, pool, billingEnabled)
+	return ForecastPeakWithCandidatesExcluding(ctx, pool, billingEnabled, candidates, nil, now, lookahead)
+}
+
+// ForecastPeakWithCandidatesExcluding replaces existing schedules atomically in
+// capacity forecasts: excluded recordings are removed before candidates are added.
+func ForecastPeakWithCandidatesExcluding(ctx context.Context, pool *pgxpool.Pool, billingEnabled bool, candidates []ForecastCandidate, excludeRecordingIDs []int64, now time.Time, lookahead time.Duration) (int, error) {
+	recs, err := loadCapturingRecordings(ctx, pool, billingEnabled, excludeRecordingIDs)
 	if err != nil {
 		return 0, err
 	}
@@ -164,6 +173,7 @@ func ForecastPeakWithCandidates(ctx context.Context, pool *pgxpool.Pool, billing
 			dailyWindowEnd:   c.DailyWindowEnd,
 			envStart:         c.EnvStart,
 			envEnd:           c.EnvEnd,
+			activeWeekdays:   c.ActiveWeekdays,
 		})
 	}
 	return forecastFromRecordings(recs, now, lookahead).PeakConcurrent, nil
@@ -260,6 +270,14 @@ func expandContinuousRecording(r forecastRecording, now, windowEnd time.Time) ([
 	for i := 0; i < maxDays; i++ {
 		y, mo, d := day.Date()
 		openUTC := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc).UTC()
+		weekdays := r.activeWeekdays
+		if weekdays == 0 {
+			weekdays = recsched.AllWeekdays
+		}
+		if !weekdays.Contains(openUTC.In(loc).Weekday()) {
+			day = day.AddDate(0, 0, 1)
+			continue
+		}
 		var closeUTC time.Time
 		if overnight {
 			cd := time.Date(y, mo, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)

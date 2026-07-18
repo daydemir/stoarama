@@ -169,6 +169,7 @@ func usage() {
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl recordings naming get|set|preview
+	  stoaramactl recordings schedule-batch --spec FILE [--backend-api-url URL --api-token TOKEN]
 `)
 }
 

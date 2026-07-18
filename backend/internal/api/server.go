@@ -236,6 +236,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings", s.handleAccountRecordingsList)
 			account.Get("/recordings.csv", s.handleAccountRecordingsCSV)
 			account.Post("/recordings", s.handleAccountRecordingsCreate)
+			account.Post("/recordings/batch-schedule", s.handleAccountRecordingsBatchSchedule)
 			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
 			account.Get("/clips", s.handleAccountClips)
 			// Heartbeat is called by the pull client with its scoped key, so it lives
@@ -427,7 +428,6 @@ func (s *Server) router() http.Handler {
 			bundles.Use(s.requireAccountSessionAuth)
 
 			bundles.Get("/account/bundles", s.handleAccountBundlesList)
-			bundles.Post("/account/bundles", s.handleAccountBundlesCreate)
 			bundles.Get("/account/bundles/streams", s.handleAccountBundleStreams)
 			bundles.Get("/account/bundles/{id}", s.handleAccountBundleGet)
 			bundles.Get("/account/bundles/{id}/clips", s.handleAccountBundleClips)

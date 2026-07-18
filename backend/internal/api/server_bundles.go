@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,24 +63,47 @@ type bundleMember struct {
 // the fan-out applies), so the picker never offers a stream the create would
 // reject. Capped so the picker stays light.
 func (s *Server) handleAccountBundleStreams(w http.ResponseWriter, r *http.Request) {
-	if _, ok := accountPrincipalFromContext(r.Context()); !ok {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
 	limit := parseIntQuery(r, "limit", 500, 1, 2000)
+	ids := make([]int64, 0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("ids")); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+			if err != nil || id <= 0 {
+				util.WriteError(w, http.StatusBadRequest, "ids must be comma-separated positive integers")
+				return
+			}
+			ids = append(ids, id)
+		}
+		var err error
+		ids, err = uniqueBatchStreamIDs(ids)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, name, location_text, source_url, tags
-		FROM streams
-		WHERE source_url <> ''
-		  AND deleted_at IS NULL
+		SELECT st.id, st.name, st.location_text, st.source_url, st.tags,
+		       st.local_timezone,
+		       (SELECT rec.id FROM recordings rec
+		        WHERE rec.account_id=$4 AND rec.stream_id=st.id AND rec.status <> 'canceled'
+		        ORDER BY rec.id DESC LIMIT 1)
+		FROM streams st
+		WHERE st.source_url <> ''
+		  AND st.deleted_at IS NULL
+		  AND (cardinality($5::bigint[]) = 0 OR st.id = ANY($5::bigint[]))
 		  AND ($1 = '' OR name ILIKE '%'||$1||'%' OR location_text ILIKE '%'||$1||'%')
 		  AND ($2 = '' OR tags && ARRAY[$2]::text[])
 		ORDER BY name ASC, id ASC
 		LIMIT $3
-	`, q, tag, limit)
+	`, q, tag, limit, principal.AccountID, ids)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list bundle streams: %v", err))
 		return
@@ -88,25 +112,30 @@ func (s *Server) handleAccountBundleStreams(w http.ResponseWriter, r *http.Reque
 	items := make([]map[string]any, 0, 64)
 	for rows.Next() {
 		var (
-			id        int64
-			nm        string
-			loc       string
-			sourceURL string
-			tags      []string
+			id          int64
+			nm          string
+			loc         string
+			sourceURL   string
+			tags        []string
+			timezone    string
+			recordingID *int64
 		)
-		if err := rows.Scan(&id, &nm, &loc, &sourceURL, &tags); err != nil {
+		if err := rows.Scan(&id, &nm, &loc, &sourceURL, &tags, &timezone, &recordingID); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan stream: %v", err))
 			return
 		}
-		// Only surface streams the fan-out would accept (HLS/HTTPS).
-		if _, kerr := classifyRecordingSource(strings.TrimSpace(sourceURL)); kerr != nil {
+		// Batch scheduling supports the same sources as single-recording create:
+		// ordinary HLS/HTTPS sources plus YouTube through the relay path.
+		if _, kerr := classifyRecordingSource(strings.TrimSpace(sourceURL)); kerr != nil && !isYouTubeWatchURL(sourceURL) {
 			continue
 		}
 		items = append(items, map[string]any{
-			"id":            id,
-			"name":          nm,
-			"location_text": loc,
-			"tags":          tags,
+			"id":             id,
+			"name":           nm,
+			"location_text":  loc,
+			"tags":           tags,
+			"local_timezone": timezone,
+			"recording_id":   recordingID,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -238,6 +267,10 @@ func (s *Server) handleAccountBundlesCreate(w http.ResponseWriter, r *http.Reque
 	}
 	if len(members) == 0 {
 		util.WriteError(w, http.StatusBadRequest, "no recordable streams matched the selection")
+		return
+	}
+	if len(members) > 50 {
+		util.WriteError(w, http.StatusBadRequest, "a recording selection may contain at most 50 streams")
 		return
 	}
 
@@ -833,8 +866,8 @@ func (s *Server) handleAccountBundleResume(w http.ResponseWriter, r *http.Reques
 // setBundleStatus flips the bundle between active and paused and cascades the same
 // flip to every member recording in ONE tx, mirroring setRecordingStatus. Pause
 // stops scheduling (status='paused', next_fire_at=NULL); resume re-enables
-// (status='active', next_fire_at recomputed once from the shared cron/tz and
-// applied to all resumed members). Members individually canceled stay canceled.
+// (status='active', next_fire_at recomputed from each member's own schedule).
+// Members individually canceled stay canceled.
 func (s *Server) setBundleStatus(w http.ResponseWriter, r *http.Request, fromStatus, toStatus, eventType string) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -846,22 +879,12 @@ func (s *Server) setBundleStatus(w http.ResponseWriter, r *http.Request, fromSta
 		return
 	}
 
-	var (
-		curStatus    string
-		mode         string
-		cronExpr     *string
-		cronTimezone string
-		dwStart      *string
-		dwEnd        *string
-		startAt      time.Time
-		endAt        *time.Time
-	)
+	var curStatus string
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT status, mode, cron_expr, cron_timezone,
-		       to_char(daily_window_start, 'HH24:MI:SS'), to_char(daily_window_end, 'HH24:MI:SS'), start_at, end_at
+		SELECT status
 		FROM recording_bundles
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStatus, &mode, &cronExpr, &cronTimezone, &dwStart, &dwEnd, &startAt, &endAt)
+	`, id, principal.AccountID).Scan(&curStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "bundle not found")
 		return
@@ -877,18 +900,6 @@ func (s *Server) setBundleStatus(w http.ResponseWriter, r *http.Request, fromSta
 	if curStatus != fromStatus {
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("cannot %s a bundle in status %q", eventType, curStatus))
 		return
-	}
-
-	var nextFireArg any
-	if toStatus == "active" {
-		nextFire, ferr := nextFireForRecording(mode, cronExpr, cronTimezone, dwStart, dwEnd, startAt, endAt, time.Now().UTC())
-		if ferr != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute next fire: %v", ferr))
-			return
-		}
-		if !nextFire.IsZero() {
-			nextFireArg = nextFire
-		}
 	}
 
 	tx, err := s.pool.Begin(r.Context())
@@ -911,13 +922,67 @@ func (s *Server) setBundleStatus(w http.ResponseWriter, r *http.Request, fromSta
 		return
 	}
 
-	// Cascade the same flip to members that are themselves in the from-status.
-	if _, err := tx.Exec(r.Context(), `
-		UPDATE recordings SET status=$3, next_fire_at=$4, updated_at=now()
-		WHERE bundle_id=$1 AND account_id=$2 AND status=$5
-	`, id, principal.AccountID, toStatus, nextFireArg, fromStatus); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("cascade member status: %v", err))
-		return
+	if toStatus == "paused" {
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE recordings SET status='paused', next_fire_at=NULL, updated_at=now()
+			WHERE bundle_id=$1 AND account_id=$2 AND status=$3
+		`, id, principal.AccountID, fromStatus); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("pause bundle members: %v", err))
+			return
+		}
+	} else {
+		rows, err := tx.Query(r.Context(), `
+			SELECT id, mode, cron_expr, cron_timezone,
+			       to_char(daily_window_start, 'HH24:MI:SS'), to_char(daily_window_end, 'HH24:MI:SS'),
+			       active_weekdays, start_at, end_at
+			FROM recordings
+			WHERE bundle_id=$1 AND account_id=$2 AND status=$3
+			FOR UPDATE
+		`, id, principal.AccountID, fromStatus)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load bundle members: %v", err))
+			return
+		}
+		type memberSchedule struct {
+			id                   int64
+			mode, timezone       string
+			cronExpr, start, end *string
+			weekdays             recsched.WeekdaySet
+			windowStart          time.Time
+			windowEnd            *time.Time
+		}
+		members := make([]memberSchedule, 0)
+		for rows.Next() {
+			var member memberSchedule
+			if err := rows.Scan(&member.id, &member.mode, &member.cronExpr, &member.timezone, &member.start, &member.end, &member.weekdays, &member.windowStart, &member.windowEnd); err != nil {
+				rows.Close()
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan bundle member: %v", err))
+				return
+			}
+			members = append(members, member)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate bundle members: %v", err))
+			return
+		}
+		rows.Close()
+		now := time.Now().UTC()
+		for _, member := range members {
+			next, err := nextFireForRecording(member.mode, member.cronExpr, member.timezone, member.start, member.end, member.weekdays, member.windowStart, member.windowEnd, now)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute member %d next fire: %v", member.id, err))
+				return
+			}
+			var nextArg any
+			if !next.IsZero() {
+				nextArg = next
+			}
+			if _, err := tx.Exec(r.Context(), `UPDATE recordings SET status='active', next_fire_at=$2, updated_at=now() WHERE id=$1`, member.id, nextArg); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resume bundle member %d: %v", member.id, err))
+				return
+			}
+		}
 	}
 
 	if err := tx.Commit(r.Context()); err != nil {

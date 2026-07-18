@@ -773,6 +773,23 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 
 	var existingID *int64
+	if catalogStreamID > 0 {
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT id FROM recordings
+			WHERE account_id=$1 AND stream_id=$2 AND status <> 'canceled'
+			LIMIT 1
+		`, principal.AccountID, catalogStreamID).Scan(&existingID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check existing stream recording: %v", err))
+			return
+		}
+		if existingID != nil {
+			util.WriteJSON(w, http.StatusConflict, map[string]any{
+				"error":        "this stream already has a recording; edit its schedule instead",
+				"recording_id": *existingID,
+			})
+			return
+		}
+	}
 	if err := s.pool.QueryRow(r.Context(), `
 		SELECT id FROM recordings WHERE account_id=$1 AND lower(name)=lower($2) AND status <> 'canceled' LIMIT 1
 	`, principal.AccountID, name).Scan(&existingID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -829,9 +846,16 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			body := map[string]any{"error": "a recording with that name already exists"}
 			var collidedID *int64
-			if serr := s.pool.QueryRow(r.Context(), `
+			if pgErr.ConstraintName == "idx_recordings_account_stream_active" && catalogStreamID > 0 {
+				body["error"] = "this stream already has a recording; edit its schedule instead"
+				_ = s.pool.QueryRow(r.Context(), `
+					SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status <> 'canceled' LIMIT 1
+				`, principal.AccountID, catalogStreamID).Scan(&collidedID)
+			} else if serr := s.pool.QueryRow(r.Context(), `
 				SELECT id FROM recordings WHERE account_id=$1 AND lower(name)=lower($2) AND status <> 'canceled' LIMIT 1
 			`, principal.AccountID, name).Scan(&collidedID); serr == nil && collidedID != nil {
+			}
+			if collidedID != nil {
 				body["recording_id"] = *collidedID
 			}
 			util.WriteJSON(w, http.StatusConflict, body)
@@ -918,6 +942,7 @@ type recordingInsertParams struct {
 	clipDuration        int
 	dailyWindowStartArg any
 	dailyWindowEndArg   any
+	activeWeekdays      recsched.WeekdaySet
 	targetFPSArg        any
 	nextFireArg         any
 	startAt             time.Time
@@ -960,6 +985,10 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	if captureVia == "" {
 		captureVia = "cloud"
 	}
+	activeWeekdays := p.activeWeekdays
+	if activeWeekdays == 0 {
+		activeWeekdays = recsched.AllWeekdays
+	}
 	namingProfile := p.namingProfile
 	if namingProfile == "" {
 		namingProfile = recordingnaming.ProfileStoaramaV1
@@ -974,10 +1003,10 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recordings
-			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery, capture_via, naming_profile, folder_name, naming_metadata_jsonb)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+			(account_id, storage_destination_id, delivery_storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, daily_window_start, daily_window_end, target_fps, status, next_fire_at, start_at, end_at, bundle_id, storage_retention_tier, delivery, capture_via, naming_profile, folder_name, naming_metadata_jsonb, active_weekdays)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		RETURNING id, created_at, start_at, end_at
-	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery), captureVia, namingProfile.String(), folderName, namingMetadata).Scan(&id, &createdAt, &startOut, &endOut)
+	`, p.accountID, p.captureDestID, p.deliveryDestArg, p.name, p.streamURL, p.streamIDArg, p.sourceKind, mode, p.cronExprArg, p.cronTimezone, p.clipDuration, p.dailyWindowStartArg, p.dailyWindowEndArg, p.targetFPSArg, p.nextFireArg, p.startAt, p.endAtArg, p.bundleIDArg, retentionTier, string(delivery), captureVia, namingProfile.String(), folderName, namingMetadata, activeWeekdays).Scan(&id, &createdAt, &startOut, &endOut)
 	return id, createdAt, startOut, endOut, err
 }
 
@@ -1179,11 +1208,12 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		curStartAt       time.Time
 		curEndAt         *time.Time
 		namingProfileRaw string
+		activeWeekdays   recsched.WeekdaySet
 	)
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT start_at, end_at, naming_profile FROM recordings
+		SELECT start_at, end_at, naming_profile, active_weekdays FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStartAt, &curEndAt, &namingProfileRaw); err != nil {
+	`, id, principal.AccountID).Scan(&curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
@@ -1268,7 +1298,7 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	if t, ok := endAtArg.(time.Time); ok {
 		endAtForNext = &t
 	}
-	nextFire, nerr := nextFireForRecording(mode, cronExprForNext, cronTimezone, dwStartForNext, dwEndForNext, startAt, endAtForNext, time.Now().UTC())
+	nextFire, nerr := nextFireForRecording(mode, cronExprForNext, cronTimezone, dwStartForNext, dwEndForNext, activeWeekdays, startAt, endAtForNext, time.Now().UTC())
 	if nerr != nil {
 		util.WriteError(w, http.StatusBadRequest, nerr.Error())
 		return
@@ -1819,15 +1849,16 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 		cronTimezone string
 		dwStart      *string
 		dwEnd        *string
+		weekdays     recsched.WeekdaySet
 		startAt      time.Time
 		endAt        *time.Time
 	)
 	err := s.pool.QueryRow(r.Context(), `
 		SELECT status, mode, cron_expr, cron_timezone,
-		       to_char(daily_window_start, 'HH24:MI:SS'), to_char(daily_window_end, 'HH24:MI:SS'), start_at, end_at
+		       to_char(daily_window_start, 'HH24:MI:SS'), to_char(daily_window_end, 'HH24:MI:SS'), active_weekdays, start_at, end_at
 		FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStatus, &mode, &cronExpr, &cronTimezone, &dwStart, &dwEnd, &startAt, &endAt)
+	`, id, principal.AccountID).Scan(&curStatus, &mode, &cronExpr, &cronTimezone, &dwStart, &dwEnd, &weekdays, &startAt, &endAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
@@ -1847,7 +1878,7 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 
 	var nextFireArg any
 	if toStatus == "active" {
-		nextFire, nerr := nextFireForRecording(mode, cronExpr, cronTimezone, dwStart, dwEnd, startAt, endAt, time.Now().UTC())
+		nextFire, nerr := nextFireForRecording(mode, cronExpr, cronTimezone, dwStart, dwEnd, weekdays, startAt, endAt, time.Now().UTC())
 		if nerr != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute next fire: %v", nerr))
 			return
@@ -2167,7 +2198,7 @@ func (s *Server) checkRecordingScheduleCapacity(ctx context.Context, cronExpr, c
 // daily-window open instant. The daily window strings are "HH:MM:SS" (nil for a
 // sampled recording). It is the single mode-aware next-fire authority shared by
 // the create, resume, and (bundle) member-resume paths.
-func nextFireForRecording(mode string, cronExpr *string, cronTimezone string, dwStart, dwEnd *string, startAt time.Time, endAt *time.Time, now time.Time) (time.Time, error) {
+func nextFireForRecording(mode string, cronExpr *string, cronTimezone string, dwStart, dwEnd *string, weekdays recsched.WeekdaySet, startAt time.Time, endAt *time.Time, now time.Time) (time.Time, error) {
 	if mode == "continuous" {
 		if dwStart == nil {
 			return time.Time{}, fmt.Errorf("continuous recording has no daily window")
@@ -2180,7 +2211,10 @@ func nextFireForRecording(mode string, cronExpr *string, cronTimezone string, dw
 		if endAt != nil {
 			env = endAt.UTC()
 		}
-		return recsched.NextWindowOpenUTC(cronTimezone, start, startAt.UTC(), env, now)
+		if weekdays == 0 {
+			weekdays = recsched.AllWeekdays
+		}
+		return recsched.NextWindowOpenUTCOn(cronTimezone, start, weekdays, startAt.UTC(), env, now)
 	}
 	if cronExpr == nil {
 		return time.Time{}, fmt.Errorf("sampled recording has no cron_expr")
