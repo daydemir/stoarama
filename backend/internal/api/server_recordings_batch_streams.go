@@ -46,6 +46,7 @@ func (s *Server) handleAccountRecordingBatchStreams(w http.ResponseWriter, r *ht
 	}
 	defer rows.Close()
 	items := make([]map[string]any, 0, len(ids))
+	found := 0
 	for rows.Next() {
 		var id int64
 		var name, location, sourceURL, timezone string
@@ -55,13 +56,19 @@ func (s *Server) handleAccountRecordingBatchStreams(w http.ResponseWriter, r *ht
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan batch stream: %v", err))
 			return
 		}
+		found++
 		if _, err := classifyRecordingSource(strings.TrimSpace(sourceURL)); err != nil && !isYouTubeWatchURL(sourceURL) {
-			continue
+			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream %d is not recordable", id))
+			return
 		}
 		items = append(items, map[string]any{"id": id, "name": name, "location_text": location, "tags": tags, "local_timezone": timezone, "recording_id": recordingID})
 	}
 	if err := rows.Err(); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate batch streams: %v", err))
+		return
+	}
+	if found != len(ids) {
+		util.WriteError(w, http.StatusNotFound, "one or more catalog streams were not found or have no source URL")
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})

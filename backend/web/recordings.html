@@ -3057,6 +3057,12 @@
       const count = state.selectedRecordings.size;
       els.bulkCancelBtn.textContent = `Cancel selected (${count})`;
       els.bulkCancelBtn.classList.toggle('hidden', count === 0);
+      const visible = Array.from(els.cards.querySelectorAll('input[data-recordingselect]'));
+      const checked = visible.filter((box) => box.checked).length;
+      els.cards.querySelectorAll('input[data-selectvisible]').forEach((box) => {
+        box.checked = visible.length > 0 && checked === visible.length;
+        box.indeterminate = checked > 0 && checked < visible.length;
+      });
     }
 
     // ---- Clip detail (per-recording clip periods) ----
@@ -4372,8 +4378,7 @@
       const sched = compiledSchedule();
       const clip = selectedClipSec();
       if (!catalogId && !url) { setStatus(els.startStatus, 'Stream URL is required.', 'err'); return; }
-      const needsCreate = (state.batchStreams || []).some((stream) => Number(stream.recording_id || 0) <= 0);
-      if (needsCreate && dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination for new recordings.', 'err'); return; }
+      if (dest <= 0 && deliveryDest <= 0) { setStatus(els.startStatus, 'Connect or select a destination for the recording.', 'err'); return; }
       if (continuous) {
         if (!continuousWindowValid()) { setStatus(els.startStatus, 'Enter both a start and end time for the daily window.', 'err'); return; }
       } else {
