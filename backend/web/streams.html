@@ -1871,6 +1871,11 @@
         <div class="detail-title" id="detailTitle"></div>
         <div class="detail-meta" id="detailMeta"></div>
         <div id="detailSurveySnap" style="margin-top:6px;"></div>
+		<div id="detailOrgNote" class="detail-section-card" style="display:none;margin-top:12px;">
+		  <div class="detail-section-title">Organization note</div>
+		  <textarea id="detailOrgNoteInput" rows="3" maxlength="10000" placeholder="Visible only to your organization" style="width:100%;margin-top:8px;"></textarea>
+		  <div class="row" style="margin-top:8px;"><button id="detailOrgNoteSave" class="btn-sm" type="button">Save note</button><span id="detailOrgNoteStatus" class="status-text"></span></div>
+		</div>
       </div>
       <div class="detail-header-actions">
         <a id="detailRecordCTA" class="overview-card-link primary" href="/recordings">Set up recording</a>
@@ -2095,6 +2100,10 @@ const detailSelfRecord = $('detailSelfRecord');
 const detailSelfRecordCmd = $('detailSelfRecordCmd');
 const detailSelfRecordCopy = $('detailSelfRecordCopy');
 const detailSelfRecordNote = $('detailSelfRecordNote');
+const detailOrgNote = $('detailOrgNote');
+const detailOrgNoteInput = $('detailOrgNoteInput');
+const detailOrgNoteSave = $('detailOrgNoteSave');
+const detailOrgNoteStatus = $('detailOrgNoteStatus');
 let detailHlsInstance = null;
 let detailStallWatchdog = null;
 const detailActions = $('detailActions');
@@ -3017,6 +3026,7 @@ const DEFAULT_AUTH_CAPABILITIES = Object.freeze({
   can_manage_api_keys: false,
   can_download_clips: false,
   can_edit_tags: false,
+  can_edit_notes: false,
 });
 let authResolveToken = 0;
 
@@ -5858,6 +5868,8 @@ async function loadDetail(options = {}) {
   const payload = await fetchJSON(dashboardStreamURL(detailStreamID));
   const s = payload.stream || {};
   detailData = payload;
+  if (detailOrgNote instanceof HTMLElement) detailOrgNote.style.display = hasAuthCapability('can_edit_notes') ? '' : 'none';
+  if (detailOrgNoteInput instanceof HTMLTextAreaElement) detailOrgNoteInput.value = String(payload.note || '');
   const detailName = latinizedLabelParts(s.name);
 
   detailTitle.textContent = detailName.primary || `${s.name || detailStreamID}`;
@@ -5889,6 +5901,25 @@ async function loadDetail(options = {}) {
 
   mountDetailLivePlayer(s);
   renderSelfRecord(s);
+}
+
+if (detailOrgNoteSave instanceof HTMLButtonElement) {
+  detailOrgNoteSave.addEventListener('click', async () => {
+    const note = String(detailOrgNoteInput.value || '').trim();
+    detailOrgNoteSave.disabled = true;
+    detailOrgNoteStatus.textContent = 'saving...';
+    try {
+      const payload = await fetchJSON(`/api/v1/dashboard/streams/${detailStreamID}/note`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note }),
+      });
+      detailOrgNoteInput.value = String(payload.note || '');
+      detailOrgNoteStatus.textContent = 'saved';
+    } catch (err) {
+      detailOrgNoteStatus.textContent = String(err);
+    } finally {
+      detailOrgNoteSave.disabled = false;
+    }
+  });
 }
 
 // ─── Stream table actions ────────────────────────────────────────────────────

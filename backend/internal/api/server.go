@@ -400,6 +400,8 @@ func (s *Server) router() http.Handler {
 			memberSession.Post("/dashboard/streams", s.handleDashboardStreamAdd)
 			memberSession.Post("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsAdd)
 			memberSession.Delete("/dashboard/streams/{id}/tags", s.handleDashboardStreamTagsRemove)
+			memberSession.Put("/dashboard/streams/{id}/note", s.handleDashboardStreamNotePut)
+			memberSession.Delete("/dashboard/streams/{id}/note", s.handleDashboardStreamNoteDelete)
 
 			// Team members: browser-session UI actions (cookie-only). Owner-gated on
 			// MemberRole inside the handlers; list is visible to any member.
@@ -6421,10 +6423,16 @@ func (s *Server) handleDashboardStreamDetail(w http.ResponseWriter, r *http.Requ
 	// recording_id: the acting org's latest non-canceled recording for this stream, or
 	// null. Scoped to the browser session's current org; null for anonymous visitors.
 	var recordingID *int64
+	var accountNote string
 	if actingAccountID, ok := s.optionalActingAccountID(r); ok {
 		recordingID, err = s.actingRecordingIDForStream(r.Context(), actingAccountID, id)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve acting recording: %v", err))
+			return
+		}
+		err = s.pool.QueryRow(r.Context(), `SELECT note FROM account_stream_notes WHERE account_id=$1 AND stream_id=$2`, actingAccountID, id).Scan(&accountNote)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve stream note: %v", err))
 			return
 		}
 	}
@@ -6434,6 +6442,7 @@ func (s *Server) handleDashboardStreamDetail(w http.ResponseWriter, r *http.Requ
 		"latest_frame":    lfPtr,
 		"inference":       items,
 		"recording_id":    recordingID,
+		"note":            accountNote,
 		"survey_snapshot": snap,
 		"limit":           limit,
 		"offset":          offset,
