@@ -122,19 +122,23 @@ func (s *Server) createStreamRecord(ctx context.Context, req streamCreateRequest
 	if err != nil {
 		return nil, newAPIStatusError(http.StatusBadRequest, "invalid execution_config_json: %v", err)
 	}
+	localTimezone, err := normalizeLocalTimezone(req.LocalTimezone)
+	if err != nil {
+		return nil, newAPIStatusError(http.StatusBadRequest, "%s", err.Error())
+	}
 	var id int64
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO streams (
 			provider, external_id, name, slug, source_url, source_page_url,
-			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
+			lat, lon, location_text, location_country, location_country_code, location_region, location_city, local_timezone, location_locality, location_source, metadata_jsonb,
 			recording_state, source_family, capture_type, execution_class, capture_family, expected_fps, expected_image_interval_sec, execution_config_jsonb, tags
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
 		RETURNING id
 	`, strings.TrimSpace(req.Provider), strings.TrimSpace(req.ExternalID), strings.TrimSpace(req.Name), slug,
 		profile.SourceURL, profile.SourcePageURL,
 		req.Lat, req.Lon, strings.TrimSpace(req.LocationText), strings.TrimSpace(req.LocationCountry), strings.ToUpper(strings.TrimSpace(req.LocationCountryCode)),
-		strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource), metaBytes,
+		strings.TrimSpace(req.LocationRegion), strings.TrimSpace(req.LocationCity), localTimezone, strings.TrimSpace(req.LocationLocality), strings.TrimSpace(req.LocationSource), metaBytes,
 		string(model.RecordingStateOff), profile.SourceFamily, profile.CaptureType, profile.ExecutionClass, profile.CaptureFamily, profile.ExpectedFPS, profile.ExpectedImageIntervalSec, captureCfgBytes, dedupeStrings(req.Tags),
 	).Scan(&id)
 	if err != nil {

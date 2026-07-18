@@ -731,6 +731,7 @@ type streamCreateCLIOptions struct {
 	LocationCountryCode string
 	LocationRegion      string
 	LocationCity        string
+	LocalTimezone       string
 	LocationLocality    string
 	LocationSource      string
 }
@@ -774,6 +775,7 @@ func createStreamFromCLI(ctx context.Context, opts streamCreateCLIOptions) (map[
 		"location_country_code": strings.ToUpper(strings.TrimSpace(opts.LocationCountryCode)),
 		"location_region":       strings.TrimSpace(opts.LocationRegion),
 		"location_city":         strings.TrimSpace(opts.LocationCity),
+		"local_timezone":        strings.TrimSpace(opts.LocalTimezone),
 		"location_locality":     strings.TrimSpace(opts.LocationLocality),
 		"location_source":       strings.TrimSpace(opts.LocationSource),
 	})
@@ -1277,6 +1279,7 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		locationCountryCode := fs.String("location-country-code", "", "hierarchy ISO country code")
 		locationRegion := fs.String("location-region", "", "hierarchy region/state")
 		locationCity := fs.String("location-city", "", "hierarchy city")
+		localTimezone := fs.String("local-timezone", "", "IANA timezone, e.g. Europe/London")
 		locationLocality := fs.String("location-locality", "", "hierarchy locality/district")
 		locationSource := fs.String("location-source", "manual", "hierarchy source label")
 		asJSON := fs.Bool("json", false, "print JSON")
@@ -1310,6 +1313,7 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 			LocationCountryCode: *locationCountryCode,
 			LocationRegion:      *locationRegion,
 			LocationCity:        *locationCity,
+			LocalTimezone:       *localTimezone,
 			LocationLocality:    *locationLocality,
 			LocationSource:      *locationSource,
 		})
@@ -1340,6 +1344,7 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		locationCountryCode := optionalStringFlag(fs, "location-country-code", "")
 		locationRegion := optionalStringFlag(fs, "location-region", "")
 		locationCity := optionalStringFlag(fs, "location-city", "")
+		localTimezone := optionalStringFlag(fs, "local-timezone", "")
 		locationLocality := optionalStringFlag(fs, "location-locality", "")
 		locationSource := optionalStringFlag(fs, "location-source", "")
 		excluded := optionalBoolFlag(fs, "excluded")
@@ -1416,6 +1421,9 @@ func runStreams(ctx context.Context, cfg config.Config, args []string) {
 		}
 		if locationCity.set {
 			payload["location_city"] = strings.TrimSpace(locationCity.value)
+		}
+		if localTimezone.set {
+			payload["local_timezone"] = strings.TrimSpace(localTimezone.value)
 		}
 		if locationLocality.set {
 			payload["location_locality"] = strings.TrimSpace(locationLocality.value)

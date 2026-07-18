@@ -114,6 +114,7 @@ type Stream struct {
 	LocationCountry        string         `json:"location_country"`
 	LocationRegion         string         `json:"location_region"`
 	LocationCity           string         `json:"location_city"`
+	LocalTimezone          string         `json:"local_timezone"`
 	LocationLocality       string         `json:"location_locality"`
 	LocationSource         string         `json:"location_source"`
 	MetadataJSON           map[string]any `json:"metadata_json"`

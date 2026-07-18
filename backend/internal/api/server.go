@@ -599,6 +599,17 @@ func normalizeSourceFamilyInput(raw string) (string, error) {
 	return sourceFamily, nil
 }
 
+func normalizeLocalTimezone(raw string) (string, error) {
+	zone := strings.TrimSpace(raw)
+	if zone == "" {
+		return "", nil
+	}
+	if _, err := time.LoadLocation(zone); err != nil {
+		return "", fmt.Errorf("invalid local_timezone; expected an IANA timezone such as Europe/London")
+	}
+	return zone, nil
+}
+
 type streamCreateRequest struct {
 	Provider                 string         `json:"provider"`
 	ExternalID               string         `json:"external_id"`
@@ -614,6 +625,7 @@ type streamCreateRequest struct {
 	LocationCountryCode      string         `json:"location_country_code"`
 	LocationRegion           string         `json:"location_region"`
 	LocationCity             string         `json:"location_city"`
+	LocalTimezone            string         `json:"local_timezone"`
 	LocationLocality         string         `json:"location_locality"`
 	LocationSource           string         `json:"location_source"`
 	MetadataJSON             map[string]any `json:"metadata_json"`
@@ -657,6 +669,7 @@ type streamPatchRequest struct {
 	LocationCountryCode      *string         `json:"location_country_code"`
 	LocationRegion           *string         `json:"location_region"`
 	LocationCity             *string         `json:"location_city"`
+	LocalTimezone            *string         `json:"local_timezone"`
 	LocationLocality         *string         `json:"location_locality"`
 	LocationSource           *string         `json:"location_source"`
 	MetadataJSON             *map[string]any `json:"metadata_json"`
@@ -720,6 +733,14 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LocationCity != nil {
 		add("location_city", strings.TrimSpace(*req.LocationCity))
+	}
+	if req.LocalTimezone != nil {
+		zone, err := normalizeLocalTimezone(*req.LocalTimezone)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		add("local_timezone", zone)
 	}
 	if req.LocationLocality != nil {
 		add("location_locality", strings.TrimSpace(*req.LocationLocality))
@@ -976,7 +997,7 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 				s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
 				s.source_family,
 				s.capture_family, s.expected_fps, s.expected_image_interval_sec,
-				s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
+				s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.local_timezone, s.location_locality, s.location_source, s.metadata_jsonb,
 				s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
 				s.created_at, s.updated_at,
 				lf.frame_id,
@@ -1023,7 +1044,7 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 				&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
 				&stream.SourceFamily,
 				&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
-				&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
+				&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocalTimezone, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
 				&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
 				&stream.CreatedAt, &stream.UpdatedAt,
 				&frameID, &capturedAt, &captureStatus, &objectKey,
@@ -1069,7 +1090,7 @@ func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
 			s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
 			s.source_family,
 			s.capture_family, s.expected_fps, s.expected_image_interval_sec,
-			s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
+			s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.local_timezone, s.location_locality, s.location_source, s.metadata_jsonb,
 			s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
 			s.created_at, s.updated_at
 		FROM streams s
@@ -3572,7 +3593,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			s.id, s.provider, s.external_id, s.name, s.slug, s.source_url, s.source_page_url,
 			s.source_family,
 			s.capture_family, s.expected_fps, s.expected_image_interval_sec,
-			s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.location_locality, s.location_source, s.metadata_jsonb,
+			s.lat, s.lon, s.location_text, s.location_country, s.location_country_code, s.location_region, s.location_city, s.local_timezone, s.location_locality, s.location_source, s.metadata_jsonb,
 			s.recording_state, s.recording_failed_reason, s.recording_failed_at, s.capture_type, s.execution_class, s.execution_config_jsonb, s.tags,
 			s.created_at, s.updated_at,
 			sh.last_capture_at,
@@ -3632,7 +3653,7 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 			&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &stream.SourceURL, &stream.SourcePageURL,
 			&stream.SourceFamily,
 			&stream.CaptureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
-			&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
+			&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocalTimezone, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
 			&state, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &stream.CaptureType, &stream.ExecutionClass, &cfgBytes, &stream.Tags,
 			&stream.CreatedAt, &stream.UpdatedAt,
 			&capturedAt,
@@ -6737,7 +6758,7 @@ func (s *Server) getStreamByID(ctx context.Context, id int64) (model.Stream, err
 			id, provider, external_id, name, slug, source_url, source_page_url,
 			source_family,
 			capture_family, expected_fps, expected_image_interval_sec,
-			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
+			lat, lon, location_text, location_country, location_country_code, location_region, location_city, local_timezone, location_locality, location_source, metadata_jsonb,
 			recording_state, recording_failed_reason, recording_failed_at, capture_type, execution_class, execution_config_jsonb, tags,
 			created_at, updated_at
 		FROM streams
@@ -6777,7 +6798,7 @@ func scanStream(rows pgx.Rows) (model.Stream, []byte, []byte, error) {
 		&s.ID, &s.Provider, &s.ExternalID, &s.Name, &s.Slug, &sourceURL, &s.SourcePageURL,
 		&sourceFamily,
 		&captureFamily, &s.ExpectedFPS, &s.ExpectedImageInterval,
-		&s.Lat, &s.Lon, &s.LocationText, &s.LocationCountry, &s.LocationCountryCode, &s.LocationRegion, &s.LocationCity, &s.LocationLocality, &s.LocationSource, &meta,
+		&s.Lat, &s.Lon, &s.LocationText, &s.LocationCountry, &s.LocationCountryCode, &s.LocationRegion, &s.LocationCity, &s.LocalTimezone, &s.LocationLocality, &s.LocationSource, &meta,
 		&recordingState, &s.RecordingFailedReason, &s.RecordingFailedAt, &captureType, &executionClass, &cfg, &s.Tags,
 		&s.CreatedAt, &s.UpdatedAt,
 	); err != nil {

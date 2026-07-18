@@ -3523,6 +3523,11 @@ function renderLocationHierarchy(stream) {
   if (!parts.length) return `<span class="muted fs11">-</span>`;
   return parts.join('');
 }
+
+function renderLocalTimezone(stream) {
+  const zone = String(stream && stream.local_timezone || '').trim();
+  return zone ? `<span class="tag tag-muted mono">${esc(zone)}</span>` : '';
+}
 function updateStreamFilterSummary() {
   const countryRaw = String(countryFilter.value || '').trim();
   const cityRaw = String(cityFilter.value || '').trim();
@@ -5162,7 +5167,7 @@ function renderStreamRows() {
           ${renderTagEditor(s, 'streams')}
         </div>
       </td>
-      <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}</div></td>
+      <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}${renderLocalTimezone(s)}</div></td>
       <td class="muted fs11 mono">${renderSurveySnapshotCount(row, 'person')}</td>
       <td class="muted fs11 mono">${renderSurveySnapshotCount(row, 'vehicle')}</td>
       <td class="stream-record-cell">${
@@ -5879,6 +5884,7 @@ async function loadDetail(options = {}) {
     `<span class="tag tag-muted">${esc(s.provider)}</span>`,
     `<span class="tag tag-muted mono">${esc(s.slug)}</span>`,
     renderLocationHierarchy(s),
+    renderLocalTimezone(s),
     description ? `<div class="muted fs11" style="margin-top:6px;">${esc(description)}</div>` : '',
     renderDetailTagChips(s),
   ].filter(Boolean).join('');

@@ -900,7 +900,7 @@ func (s *Server) loadStreamForAssignmentTx(ctx context.Context, tx pgx.Tx, strea
 		SELECT
 			id, provider, external_id, name, slug, source_url, source_page_url,
 			source_family, capture_family, expected_fps, expected_image_interval_sec,
-			lat, lon, location_text, location_country, location_country_code, location_region, location_city, location_locality, location_source, metadata_jsonb,
+			lat, lon, location_text, location_country, location_country_code, location_region, location_city, local_timezone, location_locality, location_source, metadata_jsonb,
 			recording_state, recording_failed_reason, recording_failed_at, capture_type, execution_class, execution_config_jsonb, tags,
 			created_at, updated_at
 		FROM streams
@@ -909,7 +909,7 @@ func (s *Server) loadStreamForAssignmentTx(ctx context.Context, tx pgx.Tx, strea
 	`, streamID).Scan(
 		&stream.ID, &stream.Provider, &stream.ExternalID, &stream.Name, &stream.Slug, &sourceURL, &stream.SourcePageURL,
 		&sourceFamily, &captureFamily, &stream.ExpectedFPS, &stream.ExpectedImageInterval,
-		&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
+		&stream.Lat, &stream.Lon, &stream.LocationText, &stream.LocationCountry, &stream.LocationCountryCode, &stream.LocationRegion, &stream.LocationCity, &stream.LocalTimezone, &stream.LocationLocality, &stream.LocationSource, &metaBytes,
 		&recordingState, &stream.RecordingFailedReason, &stream.RecordingFailedAt, &captureType, &executionClass, &cfgBytes, &stream.Tags,
 		&stream.CreatedAt, &stream.UpdatedAt,
 	); err != nil {
