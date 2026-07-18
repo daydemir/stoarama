@@ -3194,6 +3194,7 @@ function syncDetailAuthState() {
   const signedIn = isAuthenticatedAccount();
   const account = currentAccount();
   const signInURL = accountRedirectURL();
+  if (detailOrgNote instanceof HTMLElement) detailOrgNote.style.display = hasAuthCapability('can_edit_notes') ? '' : 'none';
   if (detailClipsAuth instanceof HTMLElement) {
     detailClipsAuth.innerHTML = signedIn
       ? `Signed in as <b>${esc(String(account && account.email || ''))}</b>. Clip downloads are available for this stream.`
