@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,23 @@ func TestDecodeRecordingBatchSpecStrict(t *testing.T) {
 	} {
 		if _, err := decodeRecordingBatchSpec(strings.NewReader(raw)); err == nil {
 			t.Fatalf("expected strict decode failure for %s", raw)
+		}
+	}
+}
+
+func TestDecodeRecordingBatchSpecLimit(t *testing.T) {
+	for count, wantErr := range map[int]bool{200: false, 201: true} {
+		streamIDs := make([]int64, count)
+		for i := range streamIDs {
+			streamIDs[i] = int64(i + 1)
+		}
+		raw, err := json.Marshal(recordingBatchSpec{StreamIDs: streamIDs, Mode: recordingScheduleSampled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = decodeRecordingBatchSpec(strings.NewReader(string(raw)))
+		if (err != nil) != wantErr {
+			t.Fatalf("count=%d err=%v", count, err)
 		}
 	}
 }

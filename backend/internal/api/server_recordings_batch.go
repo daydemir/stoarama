@@ -366,8 +366,8 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 }
 
 func uniqueBatchStreamIDs(input []int64) ([]int64, error) {
-	if len(input) == 0 || len(input) > 50 {
-		return nil, fmt.Errorf("stream_ids must contain between 1 and 50 items")
+	if len(input) == 0 || len(input) > 200 {
+		return nil, fmt.Errorf("stream_ids must contain between 1 and 200 items")
 	}
 	seen := make(map[int64]struct{}, len(input))
 	ids := append([]int64(nil), input...)
