@@ -938,7 +938,7 @@
       margin-bottom: 8px;
     }
     /* Persistent multi-select action bar: appears only when streams are checked,
-       so recording 20 streams is one bundle, not 20 single-recording trips. */
+       so scheduling 20 streams is one batch, not 20 single-recording trips. */
     .record-selected-bar {
       position: sticky;
       top: 8px;
@@ -2169,7 +2169,7 @@ let detailInferenceLoaded = false;
 let detailDayZipPollTimer = null;
 let detailDayZipPollAttempts = 0;
 let streamRows = [];
-// Multi-select for the bundle flow: ids checked on the browse table. Persists
+// Multi-select for batch scheduling: ids checked on the browse table. Persists
 // across re-render/filter changes (rows re-apply checked state in renderStreamRows).
 const selectedStreamIds = new Set();
 let streamTotal = 0;

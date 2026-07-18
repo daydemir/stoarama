@@ -198,8 +198,6 @@ func (s *Server) router() http.Handler {
 	r.Get("/recordings", s.handleRecordingsApp)
 	r.Get("/recordings/new", s.handleRecordingsApp)
 	r.Get("/recordings/{id}", s.handleRecordingsApp)
-	r.Get("/bundles", s.handleRecordingsApp)
-	r.Get("/bundles/{id}", s.handleRecordingsApp)
 	r.Get("/admin", s.handleAdminApp)
 	r.Get("/dashboard", s.redirectDashboard)
 	r.Get("/dashboard/{tab}", s.redirectDashboard)
@@ -237,6 +235,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings.csv", s.handleAccountRecordingsCSV)
 			account.Post("/recordings", s.handleAccountRecordingsCreate)
 			account.Post("/recordings/batch-schedule", s.handleAccountRecordingsBatchSchedule)
+			account.Post("/recordings/batch-cancel", s.handleAccountRecordingsBatchCancel)
+			account.Get("/recordings/batch-streams", s.handleAccountRecordingBatchStreams)
 			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
 			account.Get("/clips", s.handleAccountClips)
 			// Heartbeat is called by the pull client with its scoped key, so it lives
@@ -419,32 +419,17 @@ func (s *Server) router() http.Handler {
 			memberSession.Post("/account/orgs/{id}/switch", s.handleAccountOrgSwitch)
 		})
 
-		// Recording bundles: a thin grouping that fans out into N member recordings
-		// sharing ONE schedule. Session-auth only (browser-driven composer), account
-		// scoped. Reuses the recordings/jobs/worker/billing path unchanged. Routes are
-		// registered with explicit full paths (not a sub-Route with "/") so the
-		// collection endpoint matches /account/bundles with no trailing slash.
-		api.Group(func(bundles chi.Router) {
-			bundles.Use(s.requireAccountSessionAuth)
-
-			bundles.Post("/account/bundles", s.handleAccountBundlesCreate)
-			bundles.Get("/account/bundles", s.handleAccountBundlesList)
-			bundles.Get("/account/bundles/streams", s.handleAccountBundleStreams)
-			bundles.Get("/account/bundles/{id}", s.handleAccountBundleGet)
-			bundles.Get("/account/bundles/{id}/clips", s.handleAccountBundleClips)
-			bundles.Post("/account/bundles/{id}/export", s.handleAccountBundleExport)
-			bundles.Post("/account/bundles/{id}/pause", s.handleAccountBundlePause)
-			bundles.Post("/account/bundles/{id}/resume", s.handleAccountBundleResume)
-			bundles.Post("/account/bundles/{id}/cancel", s.handleAccountBundleCancel)
+		api.Group(func(connections chi.Router) {
+			connections.Use(s.requireAccountSessionAuth)
 
 			// Self-serve NAS pull connections: any account member (cookie session)
 			// can mint a 'stoarama.pull'-scoped key + connection, list/rotate/remove
 			// them. NOT owner/admin-gated. Registered as full explicit paths so
 			// /account/connections (no trailing slash) matches.
-			bundles.Post("/account/connections", s.handleAccountConnectionsCreate)
-			bundles.Get("/account/connections", s.handleAccountConnectionsList)
-			bundles.Post("/account/connections/{id}/rotate", s.handleAccountConnectionRotate)
-			bundles.Delete("/account/connections/{id}", s.handleAccountConnectionDelete)
+			connections.Post("/account/connections", s.handleAccountConnectionsCreate)
+			connections.Get("/account/connections", s.handleAccountConnectionsList)
+			connections.Post("/account/connections/{id}/rotate", s.handleAccountConnectionRotate)
+			connections.Delete("/account/connections/{id}", s.handleAccountConnectionDelete)
 		})
 
 		api.Group(func(rec chi.Router) {
