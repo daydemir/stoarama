@@ -21,6 +21,9 @@ type batchScheduleMode string
 const (
 	batchSampled    batchScheduleMode = "sampled"
 	batchContinuous batchScheduleMode = "continuous"
+
+	batchEffectiveTimezoneSQL = `COALESCE(NULLIF(st.local_timezone,''), (SELECT rec.cron_timezone FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1), '')`
+	batchTimezoneMissingSQL   = `st.local_timezone=''`
 )
 
 func parseBatchScheduleMode(raw string) (batchScheduleMode, error) {
@@ -188,16 +191,16 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	rows, err := tx.Query(r.Context(), `
+	rows, err := tx.Query(r.Context(), fmt.Sprintf(`
 		SELECT st.id, st.name, st.source_url,
-		       COALESCE(NULLIF(st.local_timezone,''), (SELECT rec.cron_timezone FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1), ''),
-		       st.local_timezone='',
+		       %s,
+		       %s,
 		       COALESCE((SELECT rec.id FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),0),
 		       COALESCE((SELECT rec.capture_via FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),''),
 		       (SELECT count(*) FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled')
 		FROM streams st WHERE st.id=ANY($1::bigint[]) AND st.deleted_at IS NULL
 		ORDER BY st.id FOR UPDATE
-	`, ids, principal.AccountID)
+	`, batchEffectiveTimezoneSQL, batchTimezoneMissingSQL), ids, principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load batch streams: %v", err))
 		return
@@ -310,7 +313,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusBadRequest, "a verified WebDAV delivery_storage_destination_id is required")
 			return
 		}
-		managedID, _, err := s.provisionManagedDestination(r.Context(), principal.AccountID)
+		managedID, _, err := s.provisionManagedDestination(r.Context(), tx, principal.AccountID)
 		if err != nil {
 			util.WriteError(w, http.StatusServiceUnavailable, fmt.Sprintf("provision managed staging: %v", err))
 			return
