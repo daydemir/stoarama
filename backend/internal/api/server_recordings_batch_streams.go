@@ -31,15 +31,16 @@ func (s *Server) handleAccountRecordingBatchStreams(w http.ResponseWriter, r *ht
 		return
 	}
 
-	rows, err := s.pool.Query(r.Context(), `
-		SELECT st.id, st.name, st.location_text, st.source_url, st.tags, st.local_timezone,
+	rows, err := s.pool.Query(r.Context(), fmt.Sprintf(`
+		SELECT st.id, st.name, st.location_text, st.source_url, st.tags,
+		       %s,
 		       (SELECT rec.id FROM recordings rec
 		        WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled'
 		        ORDER BY rec.id DESC LIMIT 1)
 		FROM streams st
 		WHERE st.source_url <> '' AND st.deleted_at IS NULL AND st.id = ANY($1::bigint[])
 		ORDER BY st.id
-	`, ids, principal.AccountID)
+	`, batchEffectiveTimezoneSQL), ids, principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list batch streams: %v", err))
 		return

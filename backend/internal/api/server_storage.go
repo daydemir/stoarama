@@ -285,7 +285,7 @@ func (s *Server) handleAccountStorageDestinationDelete(w http.ResponseWriter, r 
 // stream_hour_month metered item to the account's existing subscription (Option A
 // backfill), then returns the masked payload (operator creds blanked).
 func (s *Server) handleAccountStorageManagedCreate(w http.ResponseWriter, r *http.Request, principal accountPrincipal) {
-	id, keyPrefix, err := s.provisionManagedDestination(r.Context(), principal.AccountID)
+	id, keyPrefix, err := s.provisionManagedDestination(r.Context(), s.pool, principal.AccountID)
 	if err != nil {
 		if errors.Is(err, errManagedUnavailable) {
 			util.WriteError(w, http.StatusServiceUnavailable, "managed storage is not available (operator R2 or billing is not configured)")
@@ -354,7 +354,12 @@ const (
 // presign IDENTICALLY for managed and BYO (no fork). The unique partial index
 // on (account_id) WHERE managed makes the INSERT ... ON CONFLICT DO NOTHING a
 // no-op on re-provision; the follow-up SELECT always returns the existing id.
-func (s *Server) provisionManagedDestination(ctx context.Context, accountID int64) (destID int64, keyPrefix string, err error) {
+type managedDestinationStore interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func (s *Server) provisionManagedDestination(ctx context.Context, store managedDestinationStore, accountID int64) (destID int64, keyPrefix string, err error) {
 	if s.r2 == nil || s.secrets == nil || s.cfg.ValidateR2() != nil {
 		return 0, "", errManagedUnavailable
 	}
@@ -363,7 +368,7 @@ func (s *Server) provisionManagedDestination(ctx context.Context, accountID int6
 	if err != nil {
 		return 0, "", fmt.Errorf("encrypt operator secret: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := store.Exec(ctx, `
 		INSERT INTO storage_destinations
 			(account_id, name, provider, endpoint, region, bucket, key_prefix, access_key_id, secret_access_key_enc, status, managed, verified_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'verified',true,now())
@@ -374,7 +379,7 @@ func (s *Server) provisionManagedDestination(ctx context.Context, accountID int6
 	); err != nil {
 		return 0, "", fmt.Errorf("insert managed destination: %w", err)
 	}
-	if err := s.pool.QueryRow(ctx, `
+	if err := store.QueryRow(ctx, `
 		SELECT id FROM storage_destinations WHERE account_id=$1 AND managed
 	`, accountID).Scan(&destID); err != nil {
 		return 0, "", fmt.Errorf("read managed destination: %w", err)

@@ -1,6 +1,13 @@
 package api
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestUniqueBatchStreamIDs(t *testing.T) {
 	ids, err := uniqueBatchStreamIDs([]int64{9, 2, 5})
@@ -25,5 +32,121 @@ func TestUniqueBatchStreamIDs(t *testing.T) {
 	}
 	if _, err := uniqueBatchStreamIDs(tooMany); err == nil {
 		t.Fatal("accepted 201 streams")
+	}
+}
+
+func TestBatchScheduleMixedRecordingStates(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	userID, accountID := seedUserOrg(t, pool, "batch@example.com", false)
+	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
+	var destID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
+		VALUES ($1, 'batch', 's3_compatible', 'https://s3.example.com', 'auto', 'batch', 'key', decode('00','hex'), 'verified', true)
+		RETURNING id
+	`, accountID).Scan(&destID); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := []string{"new", "active", "paused", "completed", "canceled", "missing"}
+	streamIDs := make(map[string]int64, len(statuses))
+	for _, status := range statuses {
+		zone := "America/New_York"
+		if status == "completed" || status == "missing" {
+			zone = ""
+		}
+		var streamID int64
+		if err := pool.QueryRow(context.Background(), `
+			INSERT INTO streams (provider, external_id, name, slug, stream_url, capture_type, source_family, execution_class, local_timezone)
+			VALUES ('test', $1, $1, $1, 'https://www.youtube.com/watch?v=' || $1, 'youtube_watch', 'watch_page', 'youtube_direct', $2)
+			RETURNING id
+		`, status, zone).Scan(&streamID); err != nil {
+			t.Fatal(err)
+		}
+		streamIDs[status] = streamID
+		if status == "new" || status == "missing" {
+			continue
+		}
+		recordingZone := "America/New_York"
+		if status == "completed" {
+			recordingZone = "Asia/Tokyo"
+		}
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, status, start_at, capture_via)
+			VALUES ($1, $2, $3, 'https://www.youtube.com/watch?v=' || $3, $4, 'auto', 'sampled', '0 * * * *', $5, 60, $3, now(), 'relay')
+		`, accountID, destID, status, streamIDs[status], recordingZone); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ids := make([]int64, 0, len(statuses))
+	for _, status := range statuses {
+		ids = append(ids, streamIDs[status])
+	}
+	request := batchScheduleRequest{StreamIDs: ids, Mode: "sampled", CronExpr: "30 * * * *", ClipDurationSec: 60, StorageDestinationID: destID, Delivery: "managed"}
+	post := func() *httptest.ResponseRecorder {
+		body, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(body)), principal, "")
+		rec := httptest.NewRecorder()
+		s.handleAccountRecordingsBatchSchedule(rec, req)
+		return rec
+	}
+
+	if rec := post(); rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing timezone status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, status := range []string{"active", "paused", "completed"} {
+		var got string
+		if err := pool.QueryRow(context.Background(), `SELECT status FROM recordings WHERE account_id=$1 AND stream_id=$2`, accountID, streamIDs[status]).Scan(&got); err != nil || got != status {
+			t.Fatalf("atomic rollback %s: status=%q err=%v", status, got, err)
+		}
+	}
+
+	var keyID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO account_api_keys (account_id, key_prefix, secret_hash, scopes)
+		VALUES ($1, 'batch', 'batch-nas-secret', ARRAY['stoarama.pull']) RETURNING id
+	`, accountID).Scan(&keyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `INSERT INTO connections (account_id, kind, api_key_id) VALUES ($1, 'nas_pull', $2)`, accountID, keyID); err != nil {
+		t.Fatal(err)
+	}
+	request.StreamTimezones = []streamTimezoneInput{{StreamID: streamIDs["missing"], Timezone: "Europe/London"}}
+	request.Delivery = "nas_pull"
+	rec := post()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("schedule status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response batchScheduleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Created != 3 || response.Updated != 3 {
+		t.Fatalf("created=%d updated=%d", response.Created, response.Updated)
+	}
+	for _, status := range []string{"active", "paused", "completed"} {
+		var gotStatus, gotDelivery string
+		var gotDestID int64
+		if err := pool.QueryRow(context.Background(), `SELECT status, delivery, storage_destination_id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status <> 'canceled'`, accountID, streamIDs[status]).Scan(&gotStatus, &gotDelivery, &gotDestID); err != nil || gotStatus != "active" || gotDelivery != "nas_pull" || gotDestID != destID {
+			t.Fatalf("rescheduled %s: status=%q delivery=%q dest=%d err=%v", status, gotStatus, gotDelivery, gotDestID, err)
+		}
+	}
+	for _, item := range response.Items {
+		var got string
+		if err := pool.QueryRow(context.Background(), `SELECT delivery FROM recordings WHERE id=$1`, item.RecordingID).Scan(&got); err != nil || got != "nas_pull" {
+			t.Fatalf("recording %d delivery=%q err=%v", item.RecordingID, got, err)
+		}
+	}
+	for stream, want := range map[string]string{"completed": "Asia/Tokyo", "missing": "Europe/London"} {
+		var got string
+		if err := pool.QueryRow(context.Background(), `SELECT local_timezone FROM streams WHERE id=$1`, streamIDs[stream]).Scan(&got); err != nil || got != want {
+			t.Fatalf("%s timezone=%q want %q err=%v", stream, got, want, err)
+		}
 	}
 }

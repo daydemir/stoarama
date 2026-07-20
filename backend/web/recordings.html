@@ -766,7 +766,7 @@
                managed option is available per GET /billing; otherwise BYO only. -->
           <div id="storageChooser" class="seg hidden" style="margin-bottom:12px;">
             <button type="button" data-storage="managed">Stoarama-managed storage (recommended, $0.10 per hour of footage, per month)</button>
-            <button type="button" data-storage="nas" class="hidden" id="nasStorageBtn">Record to my NAS - storage free</button>
+            <button type="button" data-storage="nas" class="hidden" id="nasStorageBtn">Use my NAS — storage free</button>
             <button type="button" data-storage="byo" class="hidden" id="byoStorageBtn">Connect your own S3 bucket</button>
             <button type="button" data-storage="shared" class="hidden" id="sharedStorageBtn">Shared destination</button>
           </div>
@@ -4276,7 +4276,15 @@
           focusComposerView();
           state.batchSelected = new Set(ids);
           openBatchComposer();
-          await loadBatchStreams();
+          try {
+            await loadBatchStreams();
+          } catch (err) {
+            const msg = `Could not load selected streams: ${String(err.message || err)}`;
+            setStatus(els.batchPreflight, msg, 'err');
+            els.batchPreflight.classList.remove('hidden');
+            setStatus(els.startStatus, msg, 'err');
+            els.startBatchBtn.disabled = true;
+          }
           return;
         }
       }
@@ -4786,16 +4794,28 @@
         const action = Number(s.recording_id || 0) > 0 ? 'Update' : 'Create';
         return `<tr><td><span class="cell-main">${escapeHTML(label)}</span><div class="cell-sub mono">#${id}</div></td>`
           + `<td>${escapeHTML(String(s.location_text || '—'))}</td>`
-          + `<td>${zone ? escapeHTML(zone) : `<input data-batch-tz="${id}" list="ianaTimezones" placeholder="IANA timezone" aria-label="Timezone for ${escapeHTML(label)}" required />`}</td>`
+          + `<td>${zone ? escapeHTML(zone) : `<input data-batch-tz="${id}" data-batch-name="${escapeHTML(label)}" list="ianaTimezones" placeholder="Choose timezone (required)" aria-label="Timezone for ${escapeHTML(label)}" required />`}</td>`
           + `<td>${action}</td></tr>`;
       }).join('');
-      if (!document.getElementById('ianaTimezones')) {
-        if (typeof Intl.supportedValuesOf !== 'function') throw new Error('This browser cannot list IANA timezones.');
+      const missing = Array.from(els.batchStreamRows.querySelectorAll('input[data-batch-tz]'));
+      if (missing.length && !document.getElementById('ianaTimezones')) {
         const list = document.createElement('datalist');
         list.id = 'ianaTimezones';
-        list.innerHTML = Intl.supportedValuesOf('timeZone').map((z) => `<option value="${escapeHTML(z)}"></option>`).join('');
+        const zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : timezoneOptions();
+        list.innerHTML = zones.map((z) => `<option value="${escapeHTML(z)}"></option>`).join('');
         document.body.appendChild(list);
       }
+      if (state.batchStreams.length === ids.length && missing.length) {
+        setStatus(els.batchPreflight, `${missing.length} selected stream${missing.length === 1 ? '' : 's'} need a timezone before scheduling.`, 'err');
+        els.batchPreflight.classList.remove('hidden');
+      }
+      missing.forEach((input) => input.addEventListener('input', () => {
+        input.setCustomValidity('');
+        if (missing.every((el) => validIANATimezone(String(el.value || '').trim()))) {
+          els.batchPreflight.classList.add('hidden');
+          setStatus(els.startStatus, '', '');
+        }
+      }));
       updateBatchCount();
     }
 
@@ -4827,11 +4847,24 @@
       const deliveryDest = selectedDeliveryDestId();
       if (ids.length === 0) { setStatus(els.startStatus, 'Select at least one stream on the streams page.', 'err'); return; }
       if (ids.length > 200) { setStatus(els.startStatus, 'Select no more than 200 streams.', 'err'); return; }
-      const streamTimezones = Array.from(els.batchStreamRows.querySelectorAll('input[data-batch-tz]')).map((input) => ({
+      const timezoneInputs = Array.from(els.batchStreamRows.querySelectorAll('input[data-batch-tz]'));
+      const streamTimezones = timezoneInputs.map((input) => ({
         stream_id: Number(input.getAttribute('data-batch-tz')), timezone: String(input.value || '').trim(),
       }));
       const invalidTimezone = streamTimezones.find((item) => !validIANATimezone(item.timezone));
-      if (invalidTimezone) { setStatus(els.startStatus, `Set a valid IANA timezone for stream #${invalidTimezone.stream_id}.`, 'err'); return; }
+      if (invalidTimezone) {
+        const input = timezoneInputs.find((el) => Number(el.getAttribute('data-batch-tz')) === invalidTimezone.stream_id);
+        const name = String(input.getAttribute('data-batch-name') || `stream #${invalidTimezone.stream_id}`);
+        const msg = `Choose a valid IANA timezone for ${name}.`;
+        input.setCustomValidity(msg);
+        setStatus(els.batchPreflight, msg, 'err');
+        els.batchPreflight.classList.remove('hidden');
+        setStatus(els.startStatus, msg, 'err');
+        input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        input.focus();
+        input.reportValidity();
+        return;
+      }
       const weekdays = selectedBatchWeekdays();
       if (continuous && weekdays.length === 0) { setStatus(els.startStatus, 'Choose at least one active weekday.', 'err'); return; }
       if (continuous) {
@@ -4850,6 +4883,7 @@
         clip_duration_sec: clip,
         start_at: win.startISO,
         end_at: win.endISO,
+        delivery: state.storageChoice === 'nas' ? 'nas_pull' : 'managed',
       };
       if (continuous) {
         body.mode = 'continuous';

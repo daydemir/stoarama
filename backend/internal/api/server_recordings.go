@@ -666,7 +666,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		}
 		// A WebDAV destination cannot be presigned, so stage the capture in the
 		// account's managed destination, then transfer to the NAS on ingest.
-		managedID, _, perr := s.provisionManagedDestination(r.Context(), principal.AccountID)
+		managedID, _, perr := s.provisionManagedDestination(r.Context(), s.pool, principal.AccountID)
 		if perr != nil {
 			if errors.Is(perr, errManagedUnavailable) {
 				util.WriteError(w, http.StatusServiceUnavailable, "managed staging is required for WebDAV delivery but managed storage is not available")

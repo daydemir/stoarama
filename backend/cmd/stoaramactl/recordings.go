@@ -59,6 +59,27 @@ func (m *recordingScheduleMode) UnmarshalJSON(data []byte) error {
 	}
 }
 
+type recordingDeliveryMode string
+
+const (
+	recordingDeliveryManaged recordingDeliveryMode = "managed"
+	recordingDeliveryNASPull recordingDeliveryMode = "nas_pull"
+)
+
+func (m *recordingDeliveryMode) UnmarshalJSON(data []byte) error {
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	switch recordingDeliveryMode(raw) {
+	case recordingDeliveryManaged, recordingDeliveryNASPull:
+		*m = recordingDeliveryMode(raw)
+		return nil
+	default:
+		return fmt.Errorf("delivery must be %q or %q", recordingDeliveryManaged, recordingDeliveryNASPull)
+	}
+}
+
 type recordingBatchTimezone struct {
 	StreamID int64  `json:"stream_id"`
 	Timezone string `json:"timezone"`
@@ -78,6 +99,7 @@ type recordingBatchSpec struct {
 	EndAt                        *time.Time               `json:"end_at"`
 	StorageDestinationID         int64                    `json:"storage_destination_id"`
 	DeliveryStorageDestinationID int64                    `json:"delivery_storage_destination_id"`
+	Delivery                     recordingDeliveryMode    `json:"delivery"`
 }
 
 type recordingBatchResult struct {
@@ -109,6 +131,15 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 	}
 	if spec.Mode != recordingScheduleSampled && spec.Mode != recordingScheduleContinuous {
 		return spec, fmt.Errorf("mode is required")
+	}
+	if spec.Delivery != recordingDeliveryManaged && spec.Delivery != recordingDeliveryNASPull {
+		return spec, fmt.Errorf("delivery is required")
+	}
+	if (spec.StorageDestinationID > 0) == (spec.DeliveryStorageDestinationID > 0) {
+		return spec, fmt.Errorf("exactly one storage destination is required")
+	}
+	if spec.Delivery == recordingDeliveryNASPull && spec.DeliveryStorageDestinationID > 0 {
+		return spec, fmt.Errorf("nas_pull cannot use delivery_storage_destination_id")
 	}
 	selected := make(map[int64]struct{}, len(spec.StreamIDs))
 	for _, id := range spec.StreamIDs {
