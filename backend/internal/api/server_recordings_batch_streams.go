@@ -32,7 +32,8 @@ func (s *Server) handleAccountRecordingBatchStreams(w http.ResponseWriter, r *ht
 	}
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT st.id, st.name, st.location_text, st.source_url, st.tags, st.local_timezone,
+		SELECT st.id, st.name, st.location_text, st.source_url, st.tags,
+		       COALESCE(NULLIF(st.local_timezone,''), (SELECT rec.cron_timezone FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1), ''),
 		       (SELECT rec.id FROM recordings rec
 		        WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled'
 		        ORDER BY rec.id DESC LIMIT 1)
