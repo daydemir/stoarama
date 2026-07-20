@@ -17,6 +17,24 @@ func TestLoadHTMLPageUsesEmbeddedAssets(t *testing.T) {
 	}
 }
 
+func TestStreamsPageIgnoresStaleFilterResponses(t *testing.T) {
+	body, err := loadHTMLPage("streams.html")
+	if err != nil {
+		t.Fatalf("load streams html: %v", err)
+	}
+	page := string(body)
+	for _, guard := range []string{
+		"streamLoadController.abort();",
+		"streamFilterOptionsController.abort();",
+		"if (requestToken !== streamLoadToken) return;",
+		"if (requestToken !== streamFilterChangeToken) return;",
+	} {
+		if !strings.Contains(page, guard) {
+			t.Fatalf("streams html missing stale response guard %q", guard)
+		}
+	}
+}
+
 func TestHandleDashboardStaticServesDashboardJS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/static/dashboard.js", nil)
 	rec := httptest.NewRecorder()

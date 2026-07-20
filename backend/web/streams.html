@@ -2191,7 +2191,21 @@ let streamMap = null;
 let streamMapLayer = null;
 let streamMapRows = [];
 let streamMapFilterKey = '';
-let streamMapLoadToken = 0;
+let streamLoadToken = 0;
+let streamFilterChangeToken = 0;
+let streamLoadController = null;
+
+function beginStreamLoad() {
+  cancelStreamLoad();
+  streamLoadController = new AbortController();
+  return { requestToken: streamLoadToken, signal: streamLoadController.signal };
+}
+
+function cancelStreamLoad() {
+  if (streamLoadController) streamLoadController.abort();
+  streamLoadController = null;
+  streamLoadToken += 1;
+}
 let imageModalLinks = [];
 let imageModalIndex = -1;
 let pageOverflowBeforeImageModal = '';
@@ -2821,21 +2835,22 @@ function collectKnownTagsFromRows() {
   refreshTagFilterSelectOptions();
 }
 
-async function loadKnownStreamTags(scope = 'all', params = null, requestToken = 0) {
+async function loadKnownStreamTags(scope = 'all', params = null, requestToken = 0, signal = null) {
   const nextParams = params instanceof URLSearchParams ? new URLSearchParams(params.toString()) : new URLSearchParams();
   if (scope) nextParams.set('scope', scope);
   nextParams.set('limit', '400');
-  const payload = await fetchJSON(`/api/v1/dashboard/tags?${nextParams}`);
+  const payload = await fetchJSON(`/api/v1/dashboard/tags?${nextParams}`, signal ? { signal } : {});
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   knownStreamTags = normalizeTags(payload.items || []);
   refreshTagSuggestionList();
   refreshTagFilterSelectOptions();
 }
 
-async function loadKnownStreamTagsSafe(scope = 'all', params = null, requestToken = 0) {
+async function loadKnownStreamTagsSafe(scope = 'all', params = null, requestToken = 0, signal = null) {
   try {
-    await loadKnownStreamTags(scope, params, requestToken);
-  } catch (_) {
+    await loadKnownStreamTags(scope, params, requestToken, signal);
+  } catch (err) {
+    if (err && err.name === 'AbortError') throw err;
     if (requestToken && requestToken !== streamFilterOptionsToken) return;
     collectKnownTagsFromRows();
   }
@@ -4575,10 +4590,10 @@ function populateCaptureTypeOptions(selectEl, allLabel) {
   if (!prev) selectEl.value = '';
 }
 
-async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
+async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', source = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = [], signal = null) {
   const prev = targetSelect.value || '';
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, '', '', source, captureType, provider, koreaFamily, captureTypes);
-  const payload = await fetchJSON(`/api/v1/dashboard/countries?${params}`);
+  const payload = await fetchJSON(`/api/v1/dashboard/countries?${params}`, signal ? { signal } : {});
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v))
@@ -4590,10 +4605,10 @@ async function loadCountryOptions(targetSelect, scope, tagsCSV = '', recordingSt
   else if (!prev) targetSelect.value = '';
 }
 
-async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
+async function loadCityOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', source = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = [], signal = null) {
   const prev = targetSelect.value || '';
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, '', source, captureType, provider, koreaFamily, captureTypes);
-  const payload = await fetchJSON(`/api/v1/dashboard/cities?${params}`);
+  const payload = await fetchJSON(`/api/v1/dashboard/cities?${params}`, signal ? { signal } : {});
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v))
@@ -4617,11 +4632,11 @@ function populateKoreaRegionOptions() {
   else koreaRegionFilter.value = '';
 }
 
-async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
+async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', source = '', captureType = '', koreaFamily = '', requestToken = 0, captureTypes = [], signal = null) {
   if (!(targetSelect instanceof HTMLSelectElement)) return;
   const prev = String(targetSelect.value || '').trim();
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, source, captureType, '', koreaFamily, captureTypes);
-  const payload = await fetchJSON(`/api/v1/dashboard/providers?${params}`);
+  const payload = await fetchJSON(`/api/v1/dashboard/providers?${params}`, signal ? { signal } : {});
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v).trim())
@@ -4633,10 +4648,10 @@ async function loadProviderOptions(targetSelect, scope, tagsCSV = '', recordingS
   else if (!prev) targetSelect.value = '';
 }
 
-async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = []) {
+async function loadSourceOptions(targetSelect, scope, tagsCSV = '', recordingState = '', tagsNotCSV = '', country = '', city = '', captureType = '', provider = '', koreaFamily = '', requestToken = 0, captureTypes = [], signal = null) {
   const prev = String(targetSelect.value || '').trim().toLowerCase();
   const params = buildDashboardSelectParams(scope, tagsCSV, recordingState, tagsNotCSV, country, city, '', captureType, provider, koreaFamily, captureTypes);
-  const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`);
+  const payload = await fetchJSON(`/api/v1/dashboard/sources?${params}`, signal ? { signal } : {});
   if (requestToken && requestToken !== streamFilterOptionsToken) return;
   const values = (payload.items || [])
     .map((v) => String(v).trim().toLowerCase())
@@ -4850,8 +4865,12 @@ function syncDetailURL(opts = {}) {
 }
 
 let streamFilterOptionsToken = 0;
+let streamFilterOptionsController = null;
 async function refreshAllStreamFilterOptions() {
-  const requestToken = ++streamFilterOptionsToken;
+  cancelStreamFilterOptions();
+  streamFilterOptionsController = new AbortController();
+  const requestToken = streamFilterOptionsToken;
+  const { signal } = streamFilterOptionsController;
   populateCaptureTypeOptions(streamModeFilter, 'capture type: all');
   populateKoreaRegionOptions();
   const optionScope = streamOptionScope();
@@ -4868,66 +4887,46 @@ async function refreshAllStreamFilterOptions() {
     optionScope.koreaFamily,
     optionScope.captureTypes,
   );
-  await Promise.all([
-    loadKnownStreamTagsSafe('all', tagParams, requestToken),
-    loadSourceOptions(
-      sourceFilter,
-      'all',
-      streamTagFilter.value,
-      streamRecordingStateFilter.value,
-      streamTagExcludeFilter.value,
-      countryFilter.value,
-      cityFilter.value,
-      optionScope.captureType,
-      providerFilter.value,
-      optionScope.koreaFamily,
-      requestToken,
-      optionScope.captureTypes,
-    ),
-    loadProviderOptions(
-      providerFilter,
-      'all',
-      streamTagFilter.value,
-      streamRecordingStateFilter.value,
-      streamTagExcludeFilter.value,
-      countryFilter.value,
-      cityFilter.value,
-      sourceFilter.value,
-      optionScope.captureType,
-      optionScope.koreaFamily,
-      requestToken,
-      optionScope.captureTypes,
-    ),
-    loadCountryOptions(
-      countryFilter,
-      'all',
-      streamTagFilter.value,
-      streamRecordingStateFilter.value,
-      streamTagExcludeFilter.value,
-      sourceFilter.value,
-      optionScope.captureType,
-      providerFilter.value,
-      optionScope.koreaFamily,
-      requestToken,
-      optionScope.captureTypes,
-    ),
-    loadCityOptions(
-      cityFilter,
-      'all',
-      streamTagFilter.value,
-      streamRecordingStateFilter.value,
-      streamTagExcludeFilter.value,
-      countryFilter.value,
-      sourceFilter.value,
-      optionScope.captureType,
-      providerFilter.value,
-      optionScope.koreaFamily,
-      requestToken,
-      optionScope.captureTypes,
-    ),
-  ]);
+  try {
+    await Promise.all([
+      loadKnownStreamTagsSafe('all', tagParams, requestToken, signal),
+      loadSourceOptions(
+        sourceFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        streamTagExcludeFilter.value, countryFilter.value, cityFilter.value,
+        optionScope.captureType, providerFilter.value, optionScope.koreaFamily,
+        requestToken, optionScope.captureTypes, signal,
+      ),
+      loadProviderOptions(
+        providerFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        streamTagExcludeFilter.value, countryFilter.value, cityFilter.value,
+        sourceFilter.value, optionScope.captureType, optionScope.koreaFamily,
+        requestToken, optionScope.captureTypes, signal,
+      ),
+      loadCountryOptions(
+        countryFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        streamTagExcludeFilter.value, sourceFilter.value, optionScope.captureType,
+        providerFilter.value, optionScope.koreaFamily, requestToken,
+        optionScope.captureTypes, signal,
+      ),
+      loadCityOptions(
+        cityFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        streamTagExcludeFilter.value, countryFilter.value, sourceFilter.value,
+        optionScope.captureType, providerFilter.value, optionScope.koreaFamily,
+        requestToken, optionScope.captureTypes, signal,
+      ),
+    ]);
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    throw err;
+  }
   if (requestToken !== streamFilterOptionsToken) return;
   updateStreamFilterSummary();
+}
+
+function cancelStreamFilterOptions() {
+  if (streamFilterOptionsController) streamFilterOptionsController.abort();
+  streamFilterOptionsController = null;
+  streamFilterOptionsToken += 1;
 }
 
 function applyStreamsSortParams(params, sortBy, sortDir) {
@@ -5079,7 +5078,7 @@ async function loadStreamsMap(opts = {}) {
     return;
   }
 
-  const requestToken = ++streamMapLoadToken;
+  const { requestToken, signal } = beginStreamLoad();
   const pageSize = 500;
   let offset = 0;
   let total = 0;
@@ -5091,8 +5090,14 @@ async function loadStreamsMap(opts = {}) {
     params.set('limit', String(pageSize));
     params.set('offset', String(offset));
     params.set('include_image_urls', 'false');
-    const payload = await fetchJSON(dashboardStreamsCollectionURL(params));
-    if (requestToken !== streamMapLoadToken) return;
+    let payload;
+    try {
+      payload = await fetchJSON(dashboardStreamsCollectionURL(params), { signal });
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      throw err;
+    }
+    if (requestToken !== streamLoadToken) return;
 
     const batch = payload.items || [];
     total = Number(payload.total || 0);
@@ -5102,7 +5107,7 @@ async function loadStreamsMap(opts = {}) {
     if (!batch.length || items.length >= total) break;
   }
 
-  if (requestToken !== streamMapLoadToken) return;
+  if (requestToken !== streamLoadToken) return;
   streamMapRows = items;
   streamMapFilterKey = filterKey;
   streamTotal = total || items.length;
@@ -5281,7 +5286,9 @@ function applySourceSegment(seg, opts = {}) {
   if (!seg) return;
   seg.querySelectorAll('button[data-source-seg]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      applySourceSegment(btn.getAttribute('data-source-seg'));
+      const next = String(btn.getAttribute('data-source-seg') || '');
+      if (next === streamSourceSegment) return;
+      applySourceSegment(next);
       void reloadStreamsForFilterChange({ reloadAllOptions: true });
     });
   });
@@ -5326,6 +5333,7 @@ function updateStreamPageControls() {
 }
 
 async function loadStreams(opts = {}) {
+  const { requestToken, signal } = beginStreamLoad();
   if (opts.resetPage) streamPage = 1;
   streamPageSize = Number(streamPageSizeEl.value || streamPageSize);
   if (!Number.isFinite(streamPageSize) || streamPageSize <= 0) streamPageSize = 100;
@@ -5337,7 +5345,14 @@ async function loadStreams(opts = {}) {
   params.set('offset', String((streamPage - 1) * streamPageSize));
   params.set('include_image_urls', 'false');
   applyStreamsSortParams(params, streamSortBy, streamSortDir);
-  const payload = await fetchJSON(dashboardStreamsCollectionURL(params));
+  let payload;
+  try {
+    payload = await fetchJSON(dashboardStreamsCollectionURL(params), { signal });
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    throw err;
+  }
+  if (requestToken !== streamLoadToken) return;
   streamRows = payload.items || [];
   streamTotal = Number(payload.total || 0);
   streamMapFilterKey = '';
@@ -6321,16 +6336,24 @@ streamViewMapBtn.addEventListener('click', () => {
   })();
 });
 
-const reloadStreamsDebounced = debounce(async () => {
-  try {
-    await loadStreamsForActiveView({ resetPage: true });
-  } catch (err) {
-    if (streamsView === 'map') setStreamsMapStatus(String(err), 'err');
-    else setStreamStatus(String(err), 'err');
-  }
-}, 250);
+let streamSearchTimer = null;
+function reloadStreamsDebounced() {
+  cancelStreamLoad();
+  window.clearTimeout(streamSearchTimer);
+  streamSearchTimer = window.setTimeout(() => {
+    streamSearchTimer = null;
+    void reloadStreamsForFilterChange({ reloadAllOptions: false, fromSearch: true });
+  }, 250);
+}
 
 async function reloadStreamsForFilterChange(opts = {}) {
+  if (!opts.fromSearch) {
+    window.clearTimeout(streamSearchTimer);
+    streamSearchTimer = null;
+  }
+  const requestToken = ++streamFilterChangeToken;
+  cancelStreamLoad();
+  cancelStreamFilterOptions();
   const reloadAllOptions = opts.reloadAllOptions !== false;
   try {
     if (reloadAllOptions) {
@@ -6338,8 +6361,10 @@ async function reloadStreamsForFilterChange(opts = {}) {
     } else {
       updateStreamFilterSummary();
     }
+    if (requestToken !== streamFilterChangeToken) return;
     await loadStreamsForActiveView({ resetPage: true });
   } catch (err) {
+    if (requestToken !== streamFilterChangeToken || (err && err.name === 'AbortError')) return;
     if (streamsView === 'map') setStreamsMapStatus(String(err), 'err');
     else setStreamStatus(String(err), 'err');
   }
