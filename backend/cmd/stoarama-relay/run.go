@@ -17,9 +17,10 @@ import (
 // runRelay is the launchd/systemd service entrypoint. It runs the shared
 // recordingworker loop with the relay-specific config (node:{id} lease owner,
 // droplet heartbeat skipped, cookie-error classification on), points the shared
-// capture/resolve.go at the bundled yt-dlp/ffmpeg, and runs the node heartbeat +
-// cookie probe on its own goroutine.
+// capture/resolve.go at the installed yt-dlp/platform ffmpeg, and runs the node
+// heartbeat and YouTube probe on separate goroutines.
 func runRelay(ctx context.Context) error {
+	startedAt := time.Now().UTC()
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -39,8 +40,8 @@ func runRelay(ctx context.Context) error {
 	os.Setenv("TZ", "UTC")
 	time.Local = time.UTC
 
-	// Point the shared capture path at the bundled binaries. YouTube resolves
-	// COOKIELESS by default (applyCookieEnv leaves the cookie env unset unless the
+	// Point the shared capture path at the installed yt-dlp and platform ffmpeg.
+	// YouTube resolves COOKIELESS by default (applyCookieEnv leaves the cookie env unset unless the
 	// experimental with-cookies opt-in is on); both cookie env vars are cleared here so
 	// a stale value from the environment (or a leftover ~/.stoarama/cookies.txt) can
 	// never leak in. --cookies-from-browser is never used in this headless path.
@@ -78,17 +79,23 @@ func runRelay(ctx context.Context) error {
 	// Startup probe (hard-timeout bounded) so the resolve env reflects reality before
 	// the first job can be leased. The mode (cookieless default vs experimental
 	// with-cookies) is decided HERE, ONCE, and set via applyCookieEnv before the worker
-	// starts. It is never mutated again for the process lifetime: the heartbeat
-	// goroutine keeps re-probing and reporting youtube_ready/youtube_error, but does NOT
-	// touch the resolve env, so there is no data race. A mode change takes effect only
-	// across a process restart.
+	// starts. It is never mutated again for the process lifetime: later probes only
+	// update heartbeat visibility and do not touch the resolve env. A mode change takes
+	// effect only across a process restart.
 	pr := newProbe(ytdlp)
+	firstHeartbeat := make(chan struct{})
+	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag, startedAt, firstHeartbeat)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-firstHeartbeat:
+	}
 	pr.runOnce(ctx)
 	pr.applyCookieEnv()
 	log.Printf("stoarama-relay run node=%d concurrency=%d api=%s youtube_ready=%t youtube_error=%q",
 		cfg.NodeID, cfg.Concurrency, cfg.APIURL, pr.ok(), pr.errorClass())
 
-	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag)
+	go pr.runLoop(ctx)
 	go selfUpdateLoop(ctx, cfg.APIURL)
 
 	return worker.Run(ctx)

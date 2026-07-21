@@ -20,8 +20,8 @@ const (
 )
 
 // probe runs the cookieless YouTube health check and holds its last classification.
-// All state access is mutex-guarded because the heartbeat goroutine reads it while
-// the same goroutine periodically refreshes it.
+// All state access is mutex-guarded because the heartbeat and probe goroutines share
+// it.
 type probe struct {
 	ytdlpBin string
 
@@ -32,11 +32,33 @@ type probe struct {
 	ytdlpVer string
 }
 
+type probeSnapshot struct {
+	ranOnce bool
+	ready   bool
+	err     string
+	version string
+}
+
 func newProbe(ytdlpBin string) *probe {
 	return &probe{
 		ytdlpBin: ytdlpBin,
 		class:    capture.YTDLPClassOther,
-		ytdlpVer: readYtdlpVersion(ytdlpBin),
+	}
+}
+
+func (p *probe) runLoop(ctx context.Context) {
+	p.setYtdlpVersion(readYtdlpVersion(p.ytdlpBin))
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if p.due() {
+				p.runOnce(ctx)
+			}
+		}
 	}
 }
 
@@ -116,10 +138,20 @@ func (p *probe) due() bool {
 	return time.Since(p.lastRun) >= interval
 }
 
-func (p *probe) ytdlpVersion() string {
+func (p *probe) snapshot() probeSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.ytdlpVer
+	result := probeSnapshot{ranOnce: p.ranOnce, ready: p.class == capture.YTDLPClassOK, version: p.ytdlpVer}
+	if p.ranOnce && p.class != capture.YTDLPClassOK {
+		result.err = string(p.class)
+	}
+	return result
+}
+
+func (p *probe) setYtdlpVersion(version string) {
+	p.mu.Lock()
+	p.ytdlpVer = version
+	p.mu.Unlock()
 }
 
 // applyCookieEnv sets the cookie source the shared capture/resolve.go reads. In the
