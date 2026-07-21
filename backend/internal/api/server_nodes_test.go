@@ -1,6 +1,10 @@
 package api
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestNormalizeNodeTypeLocalRecorder(t *testing.T) {
 	got, ok := normalizeNodeType("local_recorder")
@@ -26,6 +30,59 @@ func TestNodeTokenAllowedStatusesIncludesDisabled(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing allowed statuses: %v", want)
+	}
+}
+
+func TestValidateOfflineDiagnostics(t *testing.T) {
+	now := time.Now().UTC()
+	valid := map[string]any{
+		offlineDiagnosticsKey: []map[string]any{{
+			"kind":           "heartbeat_outage",
+			"error_class":    "dns_failed",
+			"started_at":     now.Add(-time.Minute).Format(time.RFC3339Nano),
+			"last_failed_at": now.Add(-30 * time.Second).Format(time.RFC3339Nano),
+			"recovered_at":   now.Format(time.RFC3339Nano),
+			"failure_count":  2,
+		}},
+	}
+	if err := validateOfflineDiagnostics(valid); err != nil {
+		t.Fatalf("valid diagnostics: %v", err)
+	}
+	if err := validateOfflineDiagnostics(map[string]any{}); err != nil {
+		t.Fatalf("omitted diagnostics: %v", err)
+	}
+
+	tooMany := make([]map[string]any, offlineDiagnosticsMaxEvents+1)
+	for i := range tooMany {
+		tooMany[i] = valid[offlineDiagnosticsKey].([]map[string]any)[0]
+	}
+	if err := validateOfflineDiagnostics(map[string]any{offlineDiagnosticsKey: tooMany}); err == nil {
+		t.Fatal("too many diagnostics accepted")
+	}
+
+	invalid := valid[offlineDiagnosticsKey].([]map[string]any)[0]
+	invalid["error_class"] = "raw_error"
+	if err := validateOfflineDiagnostics(map[string]any{offlineDiagnosticsKey: []map[string]any{invalid}}); err == nil {
+		t.Fatal("invalid error class accepted")
+	}
+	invalid["error_class"] = "dns_failed"
+	invalid["raw_error"] = "must never be stored"
+	if err := validateOfflineDiagnostics(map[string]any{offlineDiagnosticsKey: []map[string]any{invalid}}); err == nil {
+		t.Fatal("unknown diagnostic field accepted")
+	}
+
+	oversize := strings.Repeat("x", offlineDiagnosticsMaxBytes)
+	if err := validateOfflineDiagnostics(map[string]any{offlineDiagnosticsKey: oversize}); err == nil {
+		t.Fatal("oversize diagnostics accepted")
+	}
+
+	capabilities := map[string]any{offlineDiagnosticsKey: oversize, "active_jobs": 6}
+	dropInvalidOfflineDiagnostics(capabilities)
+	if _, ok := capabilities[offlineDiagnosticsKey]; ok {
+		t.Fatal("invalid optional diagnostics retained")
+	}
+	if capabilities["active_jobs"] != 6 {
+		t.Fatal("unrelated heartbeat capability changed")
 	}
 }
 

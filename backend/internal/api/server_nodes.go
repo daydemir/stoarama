@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -849,6 +850,87 @@ type nodeHeartbeatRequest struct {
 	MetadataJSON     map[string]any `json:"metadata_json"`
 }
 
+const (
+	offlineDiagnosticsKey       = "offline_diagnostics"
+	offlineDiagnosticsMaxEvents = 8
+	offlineDiagnosticsMaxBytes  = 8 << 10
+)
+
+type offlineDiagnosticEvent struct {
+	Kind         offlineDiagnosticKind `json:"kind"`
+	ErrorClass   offlineErrorClass     `json:"error_class"`
+	StartedAt    time.Time             `json:"started_at"`
+	LastFailedAt time.Time             `json:"last_failed_at"`
+	RecoveredAt  *time.Time            `json:"recovered_at"`
+	FailureCount int                   `json:"failure_count"`
+}
+
+type offlineDiagnosticKind string
+
+const offlineHeartbeatOutage offlineDiagnosticKind = "heartbeat_outage"
+
+type offlineErrorClass string
+
+const (
+	offlineErrorDNS        offlineErrorClass = "dns_failed"
+	offlineErrorTimeout    offlineErrorClass = "timeout"
+	offlineErrorConnection offlineErrorClass = "connection_failed"
+	offlineErrorHTTP       offlineErrorClass = "http_failed"
+	offlineErrorOther      offlineErrorClass = "other"
+)
+
+func validateOfflineDiagnostics(capabilities map[string]any) error {
+	raw, ok := capabilities[offlineDiagnosticsKey]
+	if !ok {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", offlineDiagnosticsKey, err)
+	}
+	if len(b) > offlineDiagnosticsMaxBytes {
+		return fmt.Errorf("%s exceeds %d bytes", offlineDiagnosticsKey, offlineDiagnosticsMaxBytes)
+	}
+	var events []offlineDiagnosticEvent
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&events); err != nil {
+		return fmt.Errorf("decode %s: %w", offlineDiagnosticsKey, err)
+	}
+	if len(events) < 1 || len(events) > offlineDiagnosticsMaxEvents {
+		return fmt.Errorf("%s must contain 1-%d events", offlineDiagnosticsKey, offlineDiagnosticsMaxEvents)
+	}
+	for i, event := range events {
+		if event.Kind != offlineHeartbeatOutage {
+			return fmt.Errorf("%s[%d].kind is invalid", offlineDiagnosticsKey, i)
+		}
+		switch event.ErrorClass {
+		case offlineErrorDNS, offlineErrorTimeout, offlineErrorConnection, offlineErrorHTTP, offlineErrorOther:
+		default:
+			return fmt.Errorf("%s[%d].error_class is invalid", offlineDiagnosticsKey, i)
+		}
+		if event.StartedAt.IsZero() {
+			return fmt.Errorf("%s[%d].started_at is invalid", offlineDiagnosticsKey, i)
+		}
+		if event.LastFailedAt.Before(event.StartedAt) {
+			return fmt.Errorf("%s[%d].last_failed_at is invalid", offlineDiagnosticsKey, i)
+		}
+		if event.RecoveredAt != nil && event.RecoveredAt.Before(event.LastFailedAt) {
+			return fmt.Errorf("%s[%d].recovered_at is invalid", offlineDiagnosticsKey, i)
+		}
+		if event.FailureCount < 1 {
+			return fmt.Errorf("%s[%d].failure_count is invalid", offlineDiagnosticsKey, i)
+		}
+	}
+	return nil
+}
+
+func dropInvalidOfflineDiagnostics(capabilities map[string]any) {
+	if validateOfflineDiagnostics(capabilities) != nil {
+		delete(capabilities, offlineDiagnosticsKey)
+	}
+}
+
 func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
@@ -860,6 +942,7 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	dropInvalidOfflineDiagnostics(req.CapabilitiesJSON)
 	var capArg any
 	if req.CapabilitiesJSON != nil {
 		b, err := json.Marshal(nonNilMap(req.CapabilitiesJSON))
