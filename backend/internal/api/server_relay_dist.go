@@ -64,12 +64,21 @@ func (s *Server) streamRelayArtifact(w http.ResponseWriter, r *http.Request, nam
 	}
 	defer body.Close()
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.Header().Set("Cache-Control", relayArtifactCacheControl(name))
 	if asAttachment {
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, body)
+}
+
+func relayArtifactCacheControl(name string) string {
+	switch name {
+	case "latest.json", "install.sh", "uninstall.sh":
+		return "no-store"
+	default:
+		return "public, max-age=31536000, immutable"
+	}
 }
 
 func contentTypeForRelayArtifact(name string) string {

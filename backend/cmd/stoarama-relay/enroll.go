@@ -23,6 +23,7 @@ func runEnroll(args []string) error {
 	apiURL := fs.String("api-url", defaultAPIURL, "Stoarama API base URL")
 	name := fs.String("name", "", "display name for this computer (default: hostname)")
 	concurrency := fs.Int("concurrency", defaultConcurrency, "max concurrent recordings on this computer")
+	manifestName := fs.String("update-manifest", "", "immutable release manifest for a canary")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -42,6 +43,12 @@ func runEnroll(args []string) error {
 	conc := *concurrency
 	if conc <= 0 {
 		conc = defaultConcurrency
+	}
+	manifest := releaseManifest(strings.TrimSpace(*manifestName))
+	if manifest != "" {
+		if _, ok := manifest.version(); !ok {
+			return fmt.Errorf("--update-manifest must be latest-VERSION.json")
+		}
 	}
 
 	payload := map[string]any{
@@ -94,11 +101,12 @@ func runEnroll(args []string) error {
 	}
 
 	cfg := relayConfig{
-		NodeID:      out.Node.ID,
-		NodeToken:   strings.TrimSpace(out.NodeToken),
-		APIURL:      base,
-		Concurrency: conc,
-		InstalledAt: time.Now().UTC(),
+		NodeID:         out.Node.ID,
+		NodeToken:      strings.TrimSpace(out.NodeToken),
+		APIURL:         base,
+		Concurrency:    conc,
+		InstalledAt:    time.Now().UTC(),
+		UpdateManifest: manifest,
 	}
 	if err := saveConfig(cfg); err != nil {
 		return err

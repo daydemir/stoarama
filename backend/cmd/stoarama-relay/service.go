@@ -126,14 +126,21 @@ func uninstall() error {
 }
 
 // restartService kicks the platform service so a self-updated binary is picked up.
-func restartService() {
+func restartService() error {
 	switch runtime.GOOS {
 	case "darwin":
 		domain := fmt.Sprintf("gui/%d", os.Getuid())
-		_ = exec.Command("launchctl", "kickstart", "-k", domain+"/"+launchdLabel).Run()
+		if err := exec.Command("launchctl", "kickstart", "-k", domain+"/"+launchdLabel).Run(); err != nil {
+			return fmt.Errorf("restart launchd service: %w", err)
+		}
 	case "linux":
-		_ = exec.Command("systemctl", "--user", "restart", systemdUnit).Run()
+		if err := exec.Command("systemctl", "--user", "restart", systemdUnit).Run(); err != nil {
+			return fmt.Errorf("restart systemd service: %w", err)
+		}
+	default:
+		return fmt.Errorf("restart is only supported on macOS and Linux")
 	}
+	return nil
 }
 
 func renderTemplate(name, dest string, mode os.FileMode, data any) error {

@@ -83,6 +83,9 @@ func runRelay(ctx context.Context) error {
 	// update heartbeat visibility and do not touch the resolve env. A mode change takes
 	// effect only across a process restart.
 	pr := newProbe(ytdlp)
+	if err := ensureRollbackBaseline(cfg); err != nil {
+		return fmt.Errorf("establish rollback baseline: %w", err)
+	}
 	firstHeartbeat := make(chan struct{})
 	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag, startedAt, firstHeartbeat)
 	select {
@@ -96,7 +99,7 @@ func runRelay(ctx context.Context) error {
 		cfg.NodeID, cfg.Concurrency, cfg.APIURL, pr.ok(), pr.errorClass())
 
 	go pr.runLoop(ctx)
-	go selfUpdateLoop(ctx, cfg.APIURL)
+	go selfUpdateLoop(ctx, cfg)
 
 	return worker.Run(ctx)
 }

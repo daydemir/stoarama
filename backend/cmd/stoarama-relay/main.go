@@ -74,13 +74,14 @@ func main() {
 func usage() {
 	fmt.Fprintf(os.Stderr, "stoarama-relay %s\n\nusage: stoarama-relay <command>\n\n", version)
 	fmt.Fprint(os.Stderr, strings.Join([]string{
-		"  enroll --token sie_... [--api-url URL] [--name NAME]  enroll this computer as a relay",
+		"  enroll --token sie_... [--api-url URL] [--name NAME] [--update-manifest NAME]",
 		"  run                                                   run the relay worker + heartbeat (service entrypoint)",
 		"  install-launchd                                       write + load the macOS launchd user agent",
 		"  install-systemd                                       write + enable the systemd user unit",
 		"  uninstall                                             stop the service and remove the unit",
 		"  link-youtube                                          [experimental] export Chrome cookies for private/members YouTube; needs STOARAMA_RELAY_YT_COOKIES=1 + a bundled JS runtime",
-		"  self-update [--api-url URL]                           update the relay binary + yt-dlp from latest.json",
+		"  self-update [--api-url URL] [--manifest NAME]          update from a release manifest",
+		"  self-update --rollback                                 restore the previous relay binary",
 		"  version                                               print the relay version",
 		"",
 	}, "\n"))
