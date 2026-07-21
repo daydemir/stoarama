@@ -72,10 +72,36 @@ func TestForecastFromRecordings_EveryMinutePeakIsClipFanout(t *testing.T) {
 	if fc.PeakConcurrent != 4 {
 		t.Fatalf("peak=%d want 4 (2 recordings x 2 overlapping 90s clips)", fc.PeakConcurrent)
 	}
-	// Earliest fire after 12:00:30 is 12:01:00.
-	wantNext := mustTime(t, "2026-06-24T12:01:00Z")
+	// The 12:00 fire still overlaps now, so demand is immediate.
+	wantNext := now
 	if !fc.NextFireAt.Equal(wantNext) {
 		t.Fatalf("next fire=%s want %s", fc.NextFireAt, wantNext)
+	}
+}
+
+func TestForecastFromRecordings_IncludesPreviousSampledFireOverlap(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:30Z")
+	recs := []forecastRecording{
+		{cronExpr: "* * * * *", cronTimezone: "UTC", clipDurationSec: 45},
+	}
+	fc := forecastFromRecordings(recs, now, 10*time.Second)
+	if fc.PeakConcurrent != 1 {
+		t.Fatalf("peak=%d want 1 (12:00 fire still overlaps now)", fc.PeakConcurrent)
+	}
+	if !fc.NextFireAt.Equal(now) {
+		t.Fatalf("next fire=%s want %s (overlapping prior fire is immediate demand)", fc.NextFireAt, now)
+	}
+}
+
+func TestForecastFromRecordings_SampledDelayMarginStacksCloseFires(t *testing.T) {
+	now := mustTime(t, "2026-06-24T11:59:50Z")
+	recs := []forecastRecording{
+		{cronExpr: "0 * * * *", cronTimezone: "UTC", clipDurationSec: 60},
+		{cronExpr: "1 * * * *", cronTimezone: "UTC", clipDurationSec: 60},
+	}
+	fc := forecastFromRecordings(recs, now, 2*time.Minute)
+	if fc.PeakConcurrent != 2 {
+		t.Fatalf("peak=%d want 2 (scheduler delay margin makes close fires overlap)", fc.PeakConcurrent)
 	}
 }
 

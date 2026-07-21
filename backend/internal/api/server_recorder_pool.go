@@ -31,7 +31,8 @@ func (s *Server) handleAdminRecorderPool(w http.ResponseWriter, r *http.Request)
 
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT id, name, do_droplet_id, region, size, capacity, state, ip_address,
-		       last_seen_at, idle_since, drain_started_at, provision_error, created_at
+		       last_seen_at, first_seen_at, activated_at, idle_since, drain_started_at,
+		       provision_error, created_at
 		FROM recorder_droplets
 		WHERE state IN ('provisioning','active','draining','destroying')
 		ORDER BY created_at ASC, id ASC
@@ -53,13 +54,15 @@ func (s *Server) handleAdminRecorderPool(w http.ResponseWriter, r *http.Request)
 			state          string
 			ip             string
 			lastSeenAt     *time.Time
+			firstSeenAt    *time.Time
+			activatedAt    *time.Time
 			idleSince      *time.Time
 			drainStartedAt *time.Time
 			provisionError string
 			createdAt      time.Time
 		)
 		if err := rows.Scan(&id, &name, &doDropletID, &region, &size, &capacity, &state, &ip,
-			&lastSeenAt, &idleSince, &drainStartedAt, &provisionError, &createdAt); err != nil {
+			&lastSeenAt, &firstSeenAt, &activatedAt, &idleSince, &drainStartedAt, &provisionError, &createdAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan recorder droplet: %v", err))
 			return
 		}
@@ -73,6 +76,8 @@ func (s *Server) handleAdminRecorderPool(w http.ResponseWriter, r *http.Request)
 			"state":            state,
 			"ip_address":       ip,
 			"last_seen_at":     lastSeenAt,
+			"first_seen_at":    firstSeenAt,
+			"activated_at":     activatedAt,
 			"idle_since":       idleSince,
 			"drain_started_at": drainStartedAt,
 			"provision_error":  provisionError,

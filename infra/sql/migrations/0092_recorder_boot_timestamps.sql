@@ -1,0 +1,3 @@
+ALTER TABLE recorder_droplets
+  ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ;

@@ -16,6 +16,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/db"
+	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/email"
 	"github.com/daydemir/stoarama/backend/internal/inferencebox"
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -42,6 +43,13 @@ func main() {
 		if err := db.MigrateUp(ctx, pool, cfg.MigrationDir); err != nil {
 			log.Fatalf("migrate up: %v", err)
 		}
+	}
+	if len(os.Args) == 2 && os.Args[1] == "validate-recorder-bindings" {
+		if err := dropletpool.NewStore(pool).ValidateLiveBindings(ctx); err != nil {
+			log.Fatalf("recorder deployment safety check: %v", err)
+		}
+		log.Print("recorder deployment safety check passed")
+		return
 	}
 
 	r2c, err := r2.New(ctx, r2.Config{
