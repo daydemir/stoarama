@@ -365,6 +365,9 @@
     .recordings-table .cell-main { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
     .recordings-table .cell-sub { color: var(--muted); margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; }
     .recordings-table .cell-warning { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+    .last-clip-fresh { color: var(--ok); font-weight: 600; }
+    .last-clip-warning { color: var(--warn); font-weight: 600; }
+    .last-clip-stale { color: var(--err); font-weight: 600; }
     .recordings-table .select-visible-label { display: none; }
     .recordings-table .row-actions { display: flex; gap: 6px; white-space: nowrap; }
     .recordings-table .row-actions button, .recordings-table .row-actions a { min-height: 28px; width: auto; padding: 4px 8px; font-size: 12px; }
@@ -2754,6 +2757,18 @@
       return `${day}d ago`;
     }
 
+    function lastClipFreshnessClass(rec) {
+      if (String(rec.status || '') !== 'active' || String(rec.mode || '') !== 'continuous' || rec.needs_card === true || isScheduled(rec) || isCompleted(rec)) return '';
+      const windowAge = continuousWindowAgeMs(rec);
+      if (windowAge == null) return '';
+      if (!rec.last_clip_at) return windowAge >= 10 * 60000 ? 'last-clip-stale' : '';
+      const age = Date.now() - new Date(rec.last_clip_at).getTime();
+      if (!Number.isFinite(age) || age < 0) return '';
+      if (age < 5 * 60000) return 'last-clip-fresh';
+      if (age < 10 * 60000) return 'last-clip-warning';
+      return 'last-clip-stale';
+    }
+
     // A recording whose start_at is still in the future is Scheduled, not yet
     // capturing. end_at in the past is reflected by the server flipping to
     // 'completed', but we also treat an elapsed window defensively.
@@ -2819,6 +2834,35 @@
         if (h == null || mi == null) return null;
         if (h === 24) h = 0;
         return h * 60 + mi;
+      } catch (_) { return null; }
+    }
+
+    function continuousWindowAgeMs(rec) {
+      const tz = String(rec.cron_timezone || 'UTC');
+      const start = parseHM(rec.daily_window_start);
+      const end = parseHM(rec.daily_window_end);
+      const nowMin = tzNowMinutes(tz);
+      if (start == null || end == null || nowMin == null) return null;
+      let isoDay;
+      try {
+        const short = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(new Date());
+        isoDay = ({ Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 })[short];
+      } catch (_) { return null; }
+      if (!isoDay) return null;
+      const previousDay = end <= start && nowMin < end;
+      let ownerDay = isoDay;
+      if (previousDay) ownerDay = isoDay === 1 ? 7 : isoDay - 1;
+      const inside = end <= start ? (nowMin >= start || nowMin < end) : (nowMin >= start && nowMin < end);
+      if (!inside) return null;
+      const weekdays = Number(rec.active_weekdays || 127);
+      if ((weekdays & (1 << (ownerDay - 1))) === 0) return null;
+      try {
+        const p = zoneParts(new Date(), tz);
+        const ownerDate = new Date(Date.UTC(p.y, p.mo - 1, p.d));
+        if (previousDay) ownerDate.setUTCDate(ownerDate.getUTCDate() - 1);
+        const openedAt = instantForZoneWall(ownerDate.getUTCFullYear(), ownerDate.getUTCMonth() + 1, ownerDate.getUTCDate(), Math.floor(start / 60), start % 60, tz).getTime();
+        const startsAt = new Date(rec.start_at).getTime();
+        return Date.now() - Math.max(openedAt, Number.isFinite(startsAt) ? startsAt : openedAt);
       } catch (_) { return null; }
     }
 
@@ -2952,6 +2996,8 @@
       const recordingName = String(rec.name || '').trim();
       const location = String(rec.stream_location || rec.stream_url || '').trim();
       const last = relativeTime(rec.last_clip_at);
+      const lastClass = lastClipFreshnessClass(rec);
+      const lastHTML = `<span${lastClass ? ` class="${lastClass}"` : ''}>${last ? `Last clip ${escapeHTML(last)}` : 'No clips yet'}</span>`;
       const clip = Number(rec.clip_duration_sec || 0);
       const fps = Number(rec.target_fps || 0);
       const capture = rec.capture_via === 'relay'
@@ -2975,7 +3021,7 @@
         <td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div><div class="cell-sub health-${escapeHTML(health)}">${escapeHTML(health)}</div>${warning}</td>
         <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(String(rec.cron_timezone || 'UTC'))}</div></td>
         <td><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
-        <td><div class="cell-main">${storage}</div><div class="cell-sub">${last ? `Last clip ${escapeHTML(last)}` : 'No clips yet'} · ${Number(rec.recent_clip_count || 0)} recent</div></td>
+        <td><div class="cell-main">${storage}</div><div class="cell-sub">${lastHTML} · ${Number(rec.recent_clip_count || 0)} recent</div></td>
         <td><div class="row-actions">${action}</div></td>
       </tr>`;
     }

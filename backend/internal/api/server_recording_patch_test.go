@@ -177,6 +177,9 @@ func TestRecordingScheduleUpdate(t *testing.T) {
 	if resp["cron_expr"] != "*/10 * * * *" || int(resp["clip_duration_sec"].(float64)) != 300 {
 		t.Fatalf("response did not reflect the edit: %v", resp)
 	}
+	if int(resp["active_weekdays"].(float64)) != 127 {
+		t.Fatalf("active_weekdays = %v, want default all-days mask 127", resp["active_weekdays"])
+	}
 	if resp["next_fire_at"] == nil {
 		t.Fatalf("next_fire_at not recomputed: %v", resp["next_fire_at"])
 	}
@@ -393,6 +396,7 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			clip_duration_sec INT NOT NULL DEFAULT 60,
 			daily_window_start TIME,
 			daily_window_end TIME,
+			active_weekdays SMALLINT NOT NULL DEFAULT 127,
 			target_fps INT,
 			status TEXT NOT NULL DEFAULT 'active',
 			next_fire_at TIMESTAMPTZ,

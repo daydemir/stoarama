@@ -67,7 +67,7 @@ const recordingListSelectSQL = `
 		   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 		rec.created_at, sd.managed,
 		rec.stream_id, st.name, st.location_text,
-		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''),
+		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''), rec.active_weekdays,
 		rec.storage_retention_tier, rec.delivery,
 		rec.capture_via,
 		rec.naming_profile, rec.folder_name, rec.naming_metadata_jsonb,
@@ -2044,6 +2044,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		mode             string
 		dailyWindowStart string
 		dailyWindowEnd   string
+		activeWeekdays   recsched.WeekdaySet
 		retentionTier    string
 		delivery         string
 		captureVia       string
@@ -2060,7 +2061,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
 		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
-		&mode, &dailyWindowStart, &dailyWindowEnd,
+		&mode, &dailyWindowStart, &dailyWindowEnd, &activeWeekdays,
 		&retentionTier, &delivery,
 		&captureVia, &namingProfile, &folderName, &namingMetadata,
 		&hasRelayOnline, &relayNodeName,
@@ -2089,6 +2090,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"clip_duration_sec":        clipDurationSec,
 		"daily_window_start":       dailyWindowStart,
 		"daily_window_end":         dailyWindowEnd,
+		"active_weekdays":          uint8(activeWeekdays),
 		"target_fps":               targetFPS,
 		"status":                   status,
 		"start_at":                 startAt.UTC(),
