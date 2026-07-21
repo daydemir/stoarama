@@ -15,6 +15,9 @@ ALTER TABLE nodes
     FOREIGN KEY (account_id, relay_group_id)
     REFERENCES relay_groups (account_id, id);
 
+-- MigrateUp wraps each migration in one transaction, where PostgreSQL forbids
+-- CREATE INDEX CONCURRENTLY. nodes is tiny and this partial index builds during
+-- the same atomic migration as the nullable column.
 CREATE INDEX nodes_relay_group_id_idx
   ON nodes (relay_group_id)
   WHERE relay_group_id IS NOT NULL;

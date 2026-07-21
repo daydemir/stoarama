@@ -211,9 +211,14 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO nodes VALUES (5, 47, 'relay', 'active', now(), 1, 1);
+		INSERT INTO nodes VALUES
+		  (5, 47, 'relay', 'active', now(), 1, 1),
+		  (6, 47, 'relay', 'active', now(), 1, 1);
+		INSERT INTO recordings VALUES
+		  (6, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/6.m3u8', NULL, 1, NULL);
 		INSERT INTO recording_jobs VALUES
-		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), NULL);
+		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), NULL),
+		  (6, 6, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -253,6 +258,16 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(600 * time.Millisecond)
+	leaseDone := make(chan error, 1)
+	go func() {
+		_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 6, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec)
+		leaseDone <- err
+	}()
+	select {
+	case <-leaseDone:
+		t.Fatal("second grouped lease did not wait for in-flight heartbeat")
+	case <-time.After(100 * time.Millisecond):
+	}
 	transitionDone := make(chan bool, 1)
 	go func() {
 		tx, err := pool.Begin(ctx)
@@ -274,6 +289,9 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 	if err := <-heartbeatDone; err != nil {
 		t.Fatalf("heartbeat: %v", err)
+	}
+	if err := <-leaseDone; !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second grouped lease err=%v, want pgx.ErrNoRows", err)
 	}
 	if allowed := <-transitionDone; allowed {
 		t.Fatal("busy grouped node became removable after in-flight heartbeat")

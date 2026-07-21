@@ -166,12 +166,8 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 }
 
 func lockRelayNodeAndGroup(ctx context.Context, tx pgx.Tx, principal nodePrincipal) error {
-	var groupID *int64
-	if err := tx.QueryRow(ctx, `
-		SELECT relay_group_id FROM nodes
-		WHERE id=$1 AND account_id=$2 AND node_type='relay'
-		FOR UPDATE
-	`, principal.NodeID, principal.AccountID).Scan(&groupID); err != nil {
+	groupID, err := lockRelayNodeRow(ctx, tx, principal.NodeID, principal.AccountID)
+	if err != nil {
 		return err
 	}
 	if groupID == nil {

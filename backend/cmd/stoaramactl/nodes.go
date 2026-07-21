@@ -32,7 +32,7 @@ func runNodes(ctx context.Context, cfg config.Config, args []string) {
 }
 
 func runNodesRelayGroups(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) < 1 {
+	if len(args) < 1 || args[0] == "-h" || args[0] == "--help" {
 		fmt.Print("stoaramactl nodes relay-groups list|create|update|assign|unassign|delete [options]\n")
 		return
 	}

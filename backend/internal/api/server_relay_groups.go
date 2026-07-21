@@ -20,7 +20,7 @@ const (
 	relayGroupMaxMaxStreams     = 200
 )
 
-func lockRelayNode(ctx context.Context, tx pgx.Tx, nodeID, accountID int64) (*int64, int, error) {
+func lockRelayNodeRow(ctx context.Context, tx pgx.Tx, nodeID, accountID int64) (*int64, error) {
 	var groupID *int64
 	if err := tx.QueryRow(ctx, `
 		SELECT n.relay_group_id
@@ -28,6 +28,14 @@ func lockRelayNode(ctx context.Context, tx pgx.Tx, nodeID, accountID int64) (*in
 		WHERE n.id=$1 AND n.account_id=$2 AND n.node_type='relay'
 		FOR UPDATE
 	`, nodeID, accountID).Scan(&groupID); err != nil {
+		return nil, err
+	}
+	return groupID, nil
+}
+
+func lockRelayNode(ctx context.Context, tx pgx.Tx, nodeID, accountID int64) (*int64, int, error) {
+	groupID, err := lockRelayNodeRow(ctx, tx, nodeID, accountID)
+	if err != nil {
 		return nil, 0, err
 	}
 	var liveLeases int
