@@ -7,6 +7,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/daydemir/stoarama/backend/internal/model"
 )
 
 // RouteNeedsRelay decides whether a stream should DEFAULT to relay, given its own
@@ -34,13 +36,16 @@ func RouteNeedsRelay(streamResult string, streamHasRow bool, providerNeedsRelay 
 	return providerNeedsRelay
 }
 
-// NeedsRelay reads the two recordability tables for one catalog stream and applies
-// RouteNeedsRelay. A stream with no id (raw pasted URL, streamID<=0) is never
+// NeedsRelay applies hard routing, then reads the two recordability tables and
+// applies RouteNeedsRelay. A stream with no id (raw pasted URL, streamID<=0) is never
 // downgraded here (we have no provider/verdict for it). Never returns an error for
 // a missing stream row; only a real query failure is surfaced.
-func NeedsRelay(ctx context.Context, pool *pgxpool.Pool, streamID int64, provider string) (bool, error) {
+func NeedsRelay(ctx context.Context, pool *pgxpool.Pool, streamID int64, provider, sourceURL string) (bool, error) {
 	if pool == nil || streamID <= 0 {
 		return false, nil
+	}
+	if model.StreamRequiresRelay(provider, sourceURL) {
+		return true, nil
 	}
 	var (
 		result   *string

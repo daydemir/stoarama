@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
+	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -60,9 +61,19 @@ type batchScheduleRequest struct {
 }
 
 type batchStream struct {
-	id, recordingID, recordingCount       int64
-	name, sourceURL, timezone, captureVia string
-	timezoneMissing                       bool
+	id, recordingID, recordingCount                 int64
+	name, sourceURL, provider, timezone, captureVia string
+	timezoneMissing                                 bool
+}
+
+func batchCaptureVia(sourceURL, provider, existing string) string {
+	if isYouTubeWatchURL(sourceURL) || model.StreamRequiresRelay(provider, sourceURL) {
+		return "relay"
+	}
+	if existing != "" {
+		return existing
+	}
+	return "cloud"
 }
 
 type batchScheduleItem struct {
@@ -192,7 +203,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	rows, err := tx.Query(r.Context(), fmt.Sprintf(`
-		SELECT st.id, st.name, st.source_url,
+		SELECT st.id, st.name, st.source_url, st.provider,
 		       %s,
 		       %s,
 		       COALESCE((SELECT rec.id FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),0),
@@ -208,7 +219,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	streams := make([]batchStream, 0, len(ids))
 	for rows.Next() {
 		var st batchStream
-		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.timezone, &st.timezoneMissing, &st.recordingID, &st.captureVia, &st.recordingCount); err != nil {
+		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.provider, &st.timezone, &st.timezoneMissing, &st.recordingID, &st.captureVia, &st.recordingCount); err != nil {
 			rows.Close()
 			util.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -258,14 +269,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		candidates := make([]dropletpool.ForecastCandidate, 0, len(streams))
 		excluded := make([]int64, 0, len(streams))
 		for _, st := range streams {
-			captureVia := st.captureVia
-			if captureVia == "" {
-				if isYouTubeWatchURL(st.sourceURL) {
-					captureVia = "relay"
-				} else {
-					captureVia = "cloud"
-				}
-			}
+			captureVia := batchCaptureVia(st.sourceURL, st.provider, st.captureVia)
 			if st.recordingID > 0 {
 				excluded = append(excluded, st.recordingID)
 			}
@@ -344,6 +348,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	created, updated := 0, 0
 	now := time.Now().UTC()
 	for _, st := range streams {
+		captureVia := batchCaptureVia(st.sourceURL, st.provider, st.captureVia)
 		var cronArg, dailyStartArg, dailyEndArg, nextArg any
 		if mode == batchSampled {
 			cronArg = cronExpr
@@ -369,7 +374,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		action := "updated"
 		recordingID := st.recordingID
 		if recordingID != 0 {
-			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, last_enqueued_fire_at=NULL, status='active', consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, principal.AccountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery)
+			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, capture_via=$17, last_enqueued_fire_at=NULL, status='active', consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, principal.AccountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery, captureVia)
 			err = updateErr
 			if err == nil && updatedRecording.RowsAffected() != 1 {
 				err = fmt.Errorf("recording was canceled while scheduling")
@@ -384,9 +389,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			updated++
 		} else {
 			sourceKind := "auto"
-			captureVia := "relay"
-			if !isYouTubeWatchURL(st.sourceURL) {
-				captureVia = "cloud"
+			if captureVia == "cloud" {
 				sourceKind, err = classifyRecordingSource(strings.TrimSpace(st.sourceURL))
 			}
 			if err == nil {

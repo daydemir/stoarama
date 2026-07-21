@@ -1,6 +1,7 @@
 package model
 
 import (
+	"net/url"
 	"strings"
 	"time"
 )
@@ -17,6 +18,7 @@ type StreamProvider string
 const (
 	StreamProviderGigaeyes StreamProvider = "GIGAEYES"
 	StreamProviderKBS      StreamProvider = "KBS"
+	StreamProviderSDOT     StreamProvider = "SDOT"
 	StreamProviderSPATIC   StreamProvider = "SPATIC"
 	StreamProviderTOPIS    StreamProvider = "TOPIS"
 )
@@ -28,6 +30,14 @@ func IsKoreaRecordingProvider(provider string) bool {
 	default:
 		return false
 	}
+}
+
+func StreamRequiresRelay(provider, sourceURL string) bool {
+	if StreamProvider(strings.ToUpper(strings.TrimSpace(provider))) == StreamProviderSDOT {
+		return true
+	}
+	u, err := url.Parse(strings.TrimSpace(sourceURL))
+	return err == nil && strings.EqualFold(u.Hostname(), "61e0c5d388c2e.streamlock.net")
 }
 
 type ArchiveProvider string

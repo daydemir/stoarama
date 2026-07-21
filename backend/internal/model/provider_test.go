@@ -15,6 +15,18 @@ func TestIsKoreaRecordingProvider(t *testing.T) {
 	}
 }
 
+func TestStreamRequiresRelay(t *testing.T) {
+	if !StreamRequiresRelay(" sdot ", "") {
+		t.Fatal("SDOT should require relay")
+	}
+	if !StreamRequiresRelay("global-street-scores", "https://61e0c5d388c2e.streamlock.net/live/2_James_EW.stream/playlist.m3u8") {
+		t.Fatal("Seattle stream host should require relay")
+	}
+	if StreamRequiresRelay("SPATIC", "https://example.com/live.m3u8") {
+		t.Fatal("SPATIC should not require relay")
+	}
+}
+
 func TestParseArchiveProvider(t *testing.T) {
 	got, ok := ParseArchiveProvider(" AWS_S3 ")
 	if !ok || got != ArchiveProviderAWSS3 {

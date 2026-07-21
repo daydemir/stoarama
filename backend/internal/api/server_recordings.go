@@ -17,6 +17,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
+	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
 	"github.com/daydemir/stoarama/backend/internal/recordability"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
@@ -464,8 +465,8 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// captured via a relay regardless of what the client requested (Go mirror of
 	// capture/resolve.go's host check). The relay resolves the watch URL with yt-dlp
 	// and the user's local Chrome cookies at capture time. Non-YouTube URLs keep the
-	// client's choice ('cloud' default, or an explicit 'relay' opt-in).
-	if isYouTubeWatchURL(streamURL) {
+	// client's choice unless their provider has a hard relay requirement.
+	if isYouTubeWatchURL(streamURL) || model.StreamRequiresRelay(catalogProvider, streamURL) {
 		captureVia = "relay"
 	}
 	// Recordability auto-route: a catalog stream (or its provider) that the probe
@@ -475,7 +476,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// explicit "cloud" (an explicit choice is always honored). Inert until a probe
 	// writes a row: with both recordability tables empty, NeedsRelay returns false.
 	if strings.TrimSpace(req.CaptureVia) == "" && captureVia != "relay" && catalogStreamID > 0 {
-		needsRelay, err := recordability.NeedsRelay(r.Context(), s.pool, catalogStreamID, catalogProvider)
+		needsRelay, err := recordability.NeedsRelay(r.Context(), s.pool, catalogStreamID, catalogProvider, streamURL)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("recordability route: %v", err))
 			return
@@ -1001,11 +1002,10 @@ func (s *Server) insertRecordingTx(ctx context.Context, tx pgx.Tx, p recordingIn
 	return id, createdAt, startOut, endOut, err
 }
 
-// handleAccountRecordingsProbe authoritatively validates a stream URL the same
-// way create does (SSRF guard -> HLS/HTTPS classify -> IP-pinned ffmpeg
-// reachability probe) so the frontend can verify a source before/while creating
-// a recording. Because it shells ffmpeg on our dyno against a user-supplied URL,
-// the SSRF guard is mandatory. A guard/classify/probe failure returns 200 with
+// handleAccountRecordingsProbe returns relay recommendations before network work;
+// otherwise it validates a stream URL the same way create does (SSRF guard ->
+// classify -> IP-pinned ffmpeg reachability probe). A guard/classify/probe
+// failure returns 200 with
 // {"ok":false,"error":...} so the UI can show the reason inline; 4xx is reserved
 // for malformed requests / a missing stream_url.
 func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Request) {
@@ -1018,23 +1018,38 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Recommend-only mode: a catalog stream asks ONLY for the recordability
-	// recommendation (a pure DB read), so the composer can show the overridable
-	// "this stream needs a connected computer" note without shelling ffmpeg. A
-	// needs-relay stream is resolved on the user's machine, so a server ffmpeg probe
-	// would be pointless (and would fail from our datacenter IP, which is the point).
-	if req.RecommendOnly {
-		if req.StreamID <= 0 {
-			util.WriteError(w, http.StatusBadRequest, "stream_id is required for recommend_only")
+	if req.RecommendOnly && req.StreamID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "stream_id is required for recommend_only")
+		return
+	}
+	provider, catalogURL, sourcePageURL := "", "", ""
+	if req.StreamID > 0 {
+		err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), source_url, COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &catalogURL, &sourcePageURL)
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "catalog stream not found")
 			return
 		}
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load catalog stream: %v", err))
+			return
+		}
+	}
+	needsRelay := false
+	if req.StreamID > 0 {
+		var err error
+		needsRelay, err = recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider, catalogURL)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("recordability route: %v", err))
+			return
+		}
+	}
+	// A relay stream is resolved and probed by the user's computer. Return its
+	// recommendation before any server-side network work.
+	if req.RecommendOnly || needsRelay {
 		resp := map[string]any{"ok": true}
-		var provider string
-		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider); err == nil {
-			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider); rerr == nil && needsRelay {
-				resp["relay_recommended"] = true
-				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
-			}
+		if needsRelay {
+			resp["relay_recommended"] = true
+			resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
 		}
 		util.WriteJSON(w, http.StatusOK, resp)
 		return
@@ -1045,10 +1060,6 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	provider, sourcePageURL := "", ""
-	if req.StreamID > 0 {
-		_ = s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &sourcePageURL)
-	}
 	resolved, inputHeaders, err := resolveRecordingStreamURL(r.Context(), provider, streamURL, sourcePageURL)
 	if err != nil {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
@@ -1063,20 +1074,7 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf("stream not reachable: %v", err)})
 		return
 	}
-	// Recordability recommendation for a linked catalog stream: when the probe (or its
-	// provider) says this stream needs relay, the composer shows an overridable note.
-	// Inert until a probe writes a row (empty tables => relay_recommended=false).
-	resp := map[string]any{"ok": true, "source_kind": sourceKind, "resolved_url": resolved}
-	if req.StreamID > 0 {
-		var provider string
-		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider); err == nil {
-			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider); rerr == nil && needsRelay {
-				resp["relay_recommended"] = true
-				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
-			}
-		}
-	}
-	util.WriteJSON(w, http.StatusOK, resp)
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "source_kind": sourceKind, "resolved_url": resolved})
 }
 
 func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Request) {

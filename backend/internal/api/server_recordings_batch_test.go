@@ -35,6 +35,25 @@ func TestUniqueBatchStreamIDs(t *testing.T) {
 	}
 }
 
+func TestBatchCaptureVia(t *testing.T) {
+	cases := []struct {
+		name, sourceURL, provider, existing, want string
+	}{
+		{"new SDOT", "https://example.com/live.m3u8", "SDOT", "", "relay"},
+		{"existing SDOT cloud", "https://example.com/live.m3u8", "sdot", "cloud", "relay"},
+		{"existing relay", "https://example.com/live.m3u8", "OTHER", "relay", "relay"},
+		{"new direct stream", "https://example.com/live.m3u8", "OTHER", "", "cloud"},
+		{"YouTube", "https://youtube.com/watch?v=test", "OTHER", "", "relay"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := batchCaptureVia(tc.sourceURL, tc.provider, tc.existing); got != tc.want {
+				t.Fatalf("capture via = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
@@ -75,7 +94,7 @@ func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 		}
 		if _, err := pool.Exec(context.Background(), `
 			INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, status, start_at, capture_via)
-			VALUES ($1, $2, $3, 'https://www.youtube.com/watch?v=' || $3, $4, 'auto', 'sampled', '0 * * * *', $5, 60, $3, now(), 'relay')
+			VALUES ($1, $2, $3, 'https://www.youtube.com/watch?v=' || $3, $4, 'auto', 'sampled', '0 * * * *', $5, 60, $3, now(), 'cloud')
 		`, accountID, destID, status, streamIDs[status], recordingZone); err != nil {
 			t.Fatal(err)
 		}
@@ -138,9 +157,9 @@ func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 		}
 	}
 	for _, item := range response.Items {
-		var got string
-		if err := pool.QueryRow(context.Background(), `SELECT delivery FROM recordings WHERE id=$1`, item.RecordingID).Scan(&got); err != nil || got != "nas_pull" {
-			t.Fatalf("recording %d delivery=%q err=%v", item.RecordingID, got, err)
+		var gotDelivery, gotCaptureVia string
+		if err := pool.QueryRow(context.Background(), `SELECT delivery, capture_via FROM recordings WHERE id=$1`, item.RecordingID).Scan(&gotDelivery, &gotCaptureVia); err != nil || gotDelivery != "nas_pull" || gotCaptureVia != "relay" {
+			t.Fatalf("recording %d delivery=%q capture_via=%q err=%v", item.RecordingID, gotDelivery, gotCaptureVia, err)
 		}
 	}
 	for stream, want := range map[string]string{"completed": "Asia/Tokyo", "missing": "Europe/London"} {
