@@ -17,6 +17,8 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/survey"
 )
 
+const uploadTimeout = 5 * time.Minute
+
 type ClientConfig struct {
 	BaseURL    string
 	NodeToken  string
@@ -28,6 +30,7 @@ type Client struct {
 	nodeToken string
 	httpc     *http.Client
 	api       *apihttp.Client
+	uploads   *apihttp.Client
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -46,11 +49,18 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	uploadHTTP := *httpc
+	uploadHTTP.Timeout = uploadTimeout
+	uploads, err := apihttp.New(baseURL, cfg.NodeToken, &uploadHTTP, uploadTimeout)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		baseURL:   baseURL,
 		nodeToken: strings.TrimSpace(cfg.NodeToken),
 		httpc:     httpc,
 		api:       api,
+		uploads:   uploads,
 	}, nil
 }
 
@@ -147,7 +157,7 @@ func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, mimeType st
 // UploadFile streams a local file to a presigned PUT URL with an explicit
 // ContentLength and Content-Type (matching the captureapi upload shape).
 func (c *Client) UploadFile(ctx context.Context, uploadURL, path, mimeType string) error {
-	return c.api.PutFile(ctx, uploadURL, path, mimeType)
+	return c.uploads.PutFile(ctx, uploadURL, path, mimeType)
 }
 
 // IngestClip records the uploaded clip and returns the new clip id.
