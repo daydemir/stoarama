@@ -186,6 +186,9 @@ const cloudRecorderLockSQL = `
 	FOR UPDATE
 `
 
+// Managed cloud recorders are operator-owned shared infrastructure and
+// intentionally lease jobs across customer accounts. Storage credentials stay
+// server-side and are derived from each recording's account during upload.
 const cloudRecordingJobsLeaseSQL = `
 	WITH cte AS (
 	  SELECT j.id
@@ -256,6 +259,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		// $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
 		resp, err = s.leaseRelayRecordingJob(r.Context(), principal, billingDisabled, margin)
 	} else {
+		// The operator-owned cloud pool intentionally serves every account.
 		// $1=workerID, $2=billingDisabled, $3=margin, $4=freshnessGrace, $5=capacity.
 		tx, beginErr := s.pool.Begin(r.Context())
 		if beginErr != nil {

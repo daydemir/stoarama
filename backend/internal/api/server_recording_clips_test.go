@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,12 +69,34 @@ func TestRecordingJobsLeaseRespectsDropletCapacityOne(t *testing.T) {
 	if got := leaseRecordingJobForTest(t, pool, wrongNode); got != nil {
 		t.Fatalf("mismatched node leased job %d", got.JobID)
 	}
-	first := leaseRecordingJobForTest(t, pool, principal)
-	if first == nil {
-		t.Fatalf("first lease returned nil, want a job")
+	start := make(chan struct{})
+	jobs := make([]*recordingLeaseResponse, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < len(jobs); i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			jobs[index], errs[index] = leaseRecordingJob(pool, principal)
+		}(i)
 	}
-	if second := leaseRecordingJobForTest(t, pool, principal); second != nil {
-		t.Fatalf("second lease returned job %d, want nil while capacity is full", second.JobID)
+	close(start)
+	wg.Wait()
+
+	var first *recordingLeaseResponse
+	leased := 0
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent lease %d: %v", i, err)
+		}
+		if jobs[i] != nil {
+			leased++
+			first = jobs[i]
+		}
+	}
+	if leased != 1 {
+		t.Fatalf("concurrent leases returned %d jobs, want exactly 1", leased)
 	}
 
 	if _, err := pool.Exec(ctx, `
@@ -94,7 +117,14 @@ func TestRecordingJobsLeaseRespectsDropletCapacityOne(t *testing.T) {
 
 func leaseRecordingJobForTest(t *testing.T, pool *pgxpool.Pool, principal nodePrincipal) *recordingLeaseResponse {
 	t.Helper()
+	job, err := leaseRecordingJob(pool, principal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return job
+}
 
+func leaseRecordingJob(pool *pgxpool.Pool, principal nodePrincipal) (*recordingLeaseResponse, error) {
 	s := &Server{pool: pool}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/jobs/lease", nil)
 	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, principal))
@@ -102,15 +132,15 @@ func leaseRecordingJobForTest(t *testing.T, pool *pgxpool.Pool, principal nodePr
 
 	s.handleRecordingJobsLease(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("lease status=%d body=%s", rec.Code, rec.Body.String())
+		return nil, fmt.Errorf("lease status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var payload struct {
 		Job *recordingLeaseResponse `json:"job"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode lease response: %v", err)
+		return nil, fmt.Errorf("decode lease response: %w", err)
 	}
-	return payload.Job
+	return payload.Job, nil
 }
 
 func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
