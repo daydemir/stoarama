@@ -255,9 +255,9 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		heartbeatDiag = &heartbeatDiagnostics{path: diagnosticsPath}
 	}
 	bd, _ := binDir()
-	bundledFFmpeg := filepath.Join(bd, "ffmpeg")
-	ffmpegVer := ffmpegVersion(bundledFFmpeg)
-	ffmpegProbe := ffmpegNetworkProbe(bundledFFmpeg)
+	activeFFmpeg := relayFFmpegBin(bd)
+	ffmpegVer := ffmpegVersion(activeFFmpeg)
+	ffmpegProbe := ffmpegNetworkProbe(activeFFmpeg)
 	systemFFmpegVer := ffmpegVersion("/usr/bin/ffmpeg")
 	systemFFmpegProbe := ffmpegNetworkProbe("/usr/bin/ffmpeg")
 
