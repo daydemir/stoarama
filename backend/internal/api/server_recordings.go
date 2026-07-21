@@ -17,6 +17,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
+	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
 	"github.com/daydemir/stoarama/backend/internal/recordability"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
@@ -464,8 +465,8 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// captured via a relay regardless of what the client requested (Go mirror of
 	// capture/resolve.go's host check). The relay resolves the watch URL with yt-dlp
 	// and the user's local Chrome cookies at capture time. Non-YouTube URLs keep the
-	// client's choice ('cloud' default, or an explicit 'relay' opt-in).
-	if isYouTubeWatchURL(streamURL) {
+	// client's choice unless their provider has a hard relay requirement.
+	if isYouTubeWatchURL(streamURL) || model.StreamRequiresRelay(catalogProvider, streamURL) {
 		captureVia = "relay"
 	}
 	// Recordability auto-route: a catalog stream (or its provider) that the probe
@@ -475,7 +476,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// explicit "cloud" (an explicit choice is always honored). Inert until a probe
 	// writes a row: with both recordability tables empty, NeedsRelay returns false.
 	if strings.TrimSpace(req.CaptureVia) == "" && captureVia != "relay" && catalogStreamID > 0 {
-		needsRelay, err := recordability.NeedsRelay(r.Context(), s.pool, catalogStreamID, catalogProvider)
+		needsRelay, err := recordability.NeedsRelay(r.Context(), s.pool, catalogStreamID, catalogProvider, streamURL)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("recordability route: %v", err))
 			return
@@ -1029,9 +1030,9 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 			return
 		}
 		resp := map[string]any{"ok": true}
-		var provider string
-		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider); err == nil {
-			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider); rerr == nil && needsRelay {
+		var provider, sourceURL string
+		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), source_url FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &sourceURL); err == nil {
+			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider, sourceURL); rerr == nil && needsRelay {
 				resp["relay_recommended"] = true
 				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
 			}
@@ -1068,9 +1069,9 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 	// Inert until a probe writes a row (empty tables => relay_recommended=false).
 	resp := map[string]any{"ok": true, "source_kind": sourceKind, "resolved_url": resolved}
 	if req.StreamID > 0 {
-		var provider string
-		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider); err == nil {
-			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider); rerr == nil && needsRelay {
+		var provider, catalogURL string
+		if err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), source_url FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &catalogURL); err == nil {
+			if needsRelay, rerr := recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider, catalogURL); rerr == nil && needsRelay {
 				resp["relay_recommended"] = true
 				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
 			}
