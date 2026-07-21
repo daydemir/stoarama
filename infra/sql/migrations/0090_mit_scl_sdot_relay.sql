@@ -15,7 +15,7 @@ WITH routed AS (
   RETURNING rec.id
 )
 UPDATE recording_jobs job
-SET status = 'canceled',
+SET status = 'pending',
     lease_owner = NULL,
     lease_expires_at = NULL,
     updated_at = now()
