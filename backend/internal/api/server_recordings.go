@@ -1024,11 +1024,24 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 	}
 	provider, catalogURL, sourcePageURL := "", "", ""
 	if req.StreamID > 0 {
-		_ = s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), source_url, COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &catalogURL, &sourcePageURL)
+		err := s.pool.QueryRow(r.Context(), `SELECT COALESCE(provider,''), source_url, COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, req.StreamID).Scan(&provider, &catalogURL, &sourcePageURL)
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "catalog stream not found")
+			return
+		}
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load catalog stream: %v", err))
+			return
+		}
 	}
 	needsRelay := false
 	if req.StreamID > 0 {
-		needsRelay, _ = recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider, catalogURL)
+		var err error
+		needsRelay, err = recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider, catalogURL)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("recordability route: %v", err))
+			return
+		}
 	}
 	// A relay stream is resolved and probed by the user's computer. Return its
 	// recommendation before any server-side network work.
