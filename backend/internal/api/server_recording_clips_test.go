@@ -115,6 +115,29 @@ func TestRecordingJobsLeaseRespectsDropletCapacityOne(t *testing.T) {
 	}
 }
 
+func TestManagedCloudRecorderBindsAuthenticatedNodeID(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO recorder_droplets (name, node_id, capacity, state)
+		VALUES ('recorder-a', 1001, 1, 'active')
+	`); err != nil {
+		t.Fatalf("insert droplet: %v", err)
+	}
+	s := &Server{pool: pool}
+	principal := nodePrincipal{NodeID: 1001, NodeType: nodeTypeLocalRecorder, DisplayName: "recorder-a"}
+	managed, err := s.isManagedCloudRecorder(context.Background(), principal)
+	if err != nil || !managed {
+		t.Fatalf("matching principal managed=%v err=%v, want true", managed, err)
+	}
+	principal.NodeID++
+	managed, err = s.isManagedCloudRecorder(context.Background(), principal)
+	if err != nil || managed {
+		t.Fatalf("mismatched principal managed=%v err=%v, want false", managed, err)
+	}
+}
+
 func leaseRecordingJobForTest(t *testing.T, pool *pgxpool.Pool, principal nodePrincipal) *recordingLeaseResponse {
 	t.Helper()
 	job, err := leaseRecordingJob(pool, principal)

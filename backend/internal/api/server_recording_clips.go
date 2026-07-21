@@ -804,7 +804,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 // held job. An idle managed worker (no leased job) still calls this on its own
 // ticker so the autoscaler can tell the worker is alive, not merely powered on:
 // promotion to active and failed-node detection both key off last_seen_at. For a
-// manual node with no recorder_droplets row this is a harmless no-op update.
+// unknown local recorders are rejected by requireRecorderNodeAuth.
 func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.Request) {
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {

@@ -76,9 +76,10 @@ func (s *Server) requireNodeAuth(next http.Handler) http.Handler {
 // the recorder endpoints. It never accepts the shared SERVICE_TOKEN and never
 // grants the capture/inference/media worker surface, so a recorder's blast radius
 // is limited to its own recording jobs. It accepts both node types that run the
-// recorder loop: 'local_recorder' (operator-owned cloud droplets, unchanged) and
-// 'relay' (account-owned relay nodes on user machines). The two are still fully
-// partitioned downstream by the typed node_type discriminator in every handler.
+// recorder loop: 'local_recorder' (operator-owned cloud droplets) and 'relay'
+// (account-owned relay nodes on user machines). Cloud tokens must also match the
+// managed droplet row by name and authenticated node id; this prevents a
+// same-named node from acting on another recorder's leased job.
 func (s *Server) requireRecorderNodeAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, err := s.authenticateNodeRequest(r)
@@ -87,9 +88,27 @@ func (s *Server) requireRecorderNodeAuth(next http.Handler) http.Handler {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		if nodeType == nodeTypeLocalRecorder {
+			managed, err := s.isManagedCloudRecorder(r.Context(), principal)
+			if err != nil || !managed {
+				util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+		}
 		ctx := context.WithValue(r.Context(), nodePrincipalContextKey, principal)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (s *Server) isManagedCloudRecorder(ctx context.Context, principal nodePrincipal) (bool, error) {
+	var managed bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM recorder_droplets
+			WHERE name=$1 AND node_id=$2
+		)
+	`, strings.TrimSpace(principal.DisplayName), principal.NodeID).Scan(&managed)
+	return managed, err
 }
 
 func nodePrincipalFromContext(ctx context.Context) (nodePrincipal, bool) {
