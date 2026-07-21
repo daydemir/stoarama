@@ -236,15 +236,35 @@ type relayDiagnostics interface {
 	Snapshot() map[string]any
 }
 
-// relayHeartbeatLoop reports this relay's liveness and capabilities every 30s. It
-// refreshes the cookieless YouTube probe when due (5 min while failing, 1 hour while
-// healthy) and posts the capabilities to POST /api/v1/node/heartbeat, which sets
-// last_heartbeat_at and merges the reported keys into nodes.capabilities_jsonb. It
-// deliberately does NOT call applyCookieEnv: the resolve env is set once at startup
-// (see runRelay) and stays stable for the process lifetime, so re-probing here only
-// updates the reported youtube_ready/youtube_error visibility, never the live capture
-// env (no race).
+type ffmpegTelemetry struct {
+	version       string
+	networkProbe  string
+	systemVersion string
+	systemProbe   string
+}
+
+func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
+	active := relayFFmpegBin(binDir)
+	result := &ffmpegTelemetry{
+		version:      ffmpegVersion(active),
+		networkProbe: ffmpegNetworkProbe(active),
+	}
+	if active == "/usr/bin/ffmpeg" {
+		result.systemVersion = result.version
+		result.systemProbe = result.networkProbe
+		return result
+	}
+	result.systemVersion = ffmpegVersion("/usr/bin/ffmpeg")
+	result.systemProbe = ffmpegNetworkProbe("/usr/bin/ffmpeg")
+	return result
+}
+
+// relayHeartbeatLoop reports this relay's liveness and current in-memory state every
+// 30s. External probes run independently so a slow resolver cannot block liveness.
+// POST /api/v1/node/heartbeat sets last_heartbeat_at and merges the reported keys into
+// nodes.capabilities_jsonb.
 func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, cfg relayConfig, diag relayDiagnostics) {
+	startedAt := time.Now().UTC()
 	diagnosticsPath := ""
 	if home, err := stoaramaHome(); err == nil {
 		diagnosticsPath = filepath.Join(home, "offline-diagnostics.json")
@@ -255,32 +275,34 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		heartbeatDiag = &heartbeatDiagnostics{path: diagnosticsPath}
 	}
 	bd, _ := binDir()
-	activeFFmpeg := relayFFmpegBin(bd)
-	ffmpegVer := ffmpegVersion(activeFFmpeg)
-	ffmpegProbe := ffmpegNetworkProbe(activeFFmpeg)
-	systemFFmpegVer := ffmpegVersion("/usr/bin/ffmpeg")
-	systemFFmpegProbe := ffmpegNetworkProbe("/usr/bin/ffmpeg")
+	var ffmpegInfo atomic.Pointer[ffmpegTelemetry]
+	go func() { ffmpegInfo.Store(loadFFmpegTelemetry(bd)) }()
 
 	send := func() {
-		if pr.due() {
-			pr.runOnce(ctx)
-		}
+		probe := pr.snapshot()
 		mode := "cookieless"
 		if experimentalCookieMode() {
 			mode = "with_cookies"
 		}
 		caps := map[string]any{
 			"youtube_mode":           mode,
-			"youtube_ready":          pr.ok(),
-			"youtube_error":          pr.errorClass(),
 			"active_jobs":            active.Load(),
 			"relay_version":          version,
-			"ytdlp_version":          pr.ytdlpVersion(),
-			"ffmpeg_version":         ffmpegVer,
-			"ffmpeg_network_probe":   ffmpegProbe,
-			"system_ffmpeg_version":  systemFFmpegVer,
-			"system_ffmpeg_probe":    systemFFmpegProbe,
+			"relay_started_at":       startedAt,
 			"max_concurrent_streams": cfg.Concurrency,
+		}
+		if probe.ranOnce {
+			caps["youtube_ready"] = probe.ready
+			caps["youtube_error"] = probe.err
+		}
+		if probe.version != "" {
+			caps["ytdlp_version"] = probe.version
+		}
+		if info := ffmpegInfo.Load(); info != nil {
+			caps["ffmpeg_version"] = info.version
+			caps["ffmpeg_network_probe"] = info.networkProbe
+			caps["system_ffmpeg_version"] = info.systemVersion
+			caps["system_ffmpeg_probe"] = info.systemProbe
 		}
 		if diag != nil {
 			caps["recording_job"] = diag.Snapshot()

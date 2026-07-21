@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
 func TestExecutable(t *testing.T) {
@@ -21,6 +28,51 @@ func TestExecutable(t *testing.T) {
 	}
 	if !executable(path) {
 		t.Fatal("executable file rejected")
+	}
+}
+
+func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	received := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/node/heartbeat" {
+			var request struct {
+				Capabilities map[string]any `json:"capabilities_json"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			received <- request.Capabilities
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{
+		BaseURL:   server.URL,
+		NodeToken: "test-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go relayHeartbeatLoop(ctx, client, newProbe("missing-yt-dlp"), &atomic.Int64{}, relayConfig{Concurrency: 1}, nil)
+
+	select {
+	case capabilities := <-received:
+		if _, ok := capabilities["youtube_ready"]; ok {
+			t.Fatal("unprobed YouTube readiness was reported")
+		}
+		if _, ok := capabilities["youtube_error"]; ok {
+			t.Fatal("unprobed YouTube error was reported")
+		}
+		if _, ok := capabilities["ytdlp_version"]; ok {
+			t.Fatal("unread yt-dlp version was reported")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first heartbeat waited for an external probe")
 	}
 }
 
