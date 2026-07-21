@@ -4,12 +4,15 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
+
+const relayDiagnosticActiveLimit = 20
 
 var (
 	diagnosticURLRe        = regexp.MustCompile(`https?://\S+`)
@@ -125,24 +128,31 @@ func (d *RelayDiagnostics) Snapshot() map[string]any {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	var cur *jobDiagnostic
+	jobs := make([]*jobDiagnostic, 0, len(d.current))
 	for _, j := range d.current {
-		if cur == nil || j.StageAt.After(cur.StageAt) {
-			cur = j
-		}
+		jobs = append(jobs, j)
 	}
-	var curOut any
-	if cur != nil {
-		curOut = diagnosticMap(cur)
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].JobID < jobs[j].JobID })
+	total := len(jobs)
+	if total > relayDiagnosticActiveLimit {
+		jobs = jobs[:relayDiagnosticActiveLimit]
+	}
+	active := make([]map[string]any, len(jobs))
+	for i, job := range jobs {
+		active[i] = diagnosticMap(job)
 	}
 	var lastOut any
 	if d.last != nil {
 		lastOut = diagnosticMap(d.last)
 	}
-	return map[string]any{
-		"current": curOut,
-		"last":    lastOut,
+	out := map[string]any{
+		"active": active,
+		"last":   lastOut,
 	}
+	if total > relayDiagnosticActiveLimit {
+		out["active_total"] = total
+	}
+	return out
 }
 
 func diagnosticMap(j *jobDiagnostic) map[string]any {
