@@ -31,14 +31,14 @@ func TestShouldNotifyHealthIncident(t *testing.T) {
 func sampleIncidents() []healthIncident {
 	return []healthIncident{
 		{
-			RecordingID: 101, OrgName: "MIT", OrgEmail: "ops@mit.edu",
+			RecordingID: 101, StreamID: 11, OrgName: "MIT", OrgEmail: "ops@mit.edu",
 			RecName: "Kresge Plaza", StreamURL: "https://cam/1.m3u8",
 			Signal: signalContinuousSilentDeath, Severity: "CRITICAL",
 			SinceText: "window opened 2026-07-04T13:00:00Z, last clip never",
 			Diag:      "last_error=ffmpeg exited",
 		},
 		{
-			RecordingID: 202, OrgName: "Lab", OrgEmail: "lab@stoarama.com",
+			RecordingID: 202, StreamID: 22, OrgName: "Lab", OrgEmail: "lab@stoarama.com",
 			RecName: "Corner", StreamURL: "https://cam/2.m3u8",
 			Signal: signalJobRetriesExhausted, Severity: "HIGH",
 			SinceText: "2026-07-04T13:20:00Z",
@@ -58,12 +58,14 @@ func TestComposeHealthEmailSubject(t *testing.T) {
 }
 
 func TestComposeHealthEmailBody(t *testing.T) {
-	body := composeHealthEmailBody(sampleIncidents())
+	body := composeHealthEmailBody("https://stoarama.test/", sampleIncidents())
 	for _, want := range []string{
 		"2 recording health issue(s)",
 		"Recording #101 \"Kresge Plaza\"",
 		"MIT <ops@mit.edu>",
 		"https://cam/1.m3u8",
+		"Stoarama: https://stoarama.test/streams/11",
+		"Recording: https://stoarama.test/recordings/101",
 		healthSignalLabels[signalContinuousSilentDeath] + " [CRITICAL]",
 		"last_error=ffmpeg exited",
 		"Recording #202 \"Corner\"",

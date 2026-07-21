@@ -45,6 +45,7 @@ var healthSignalSeverity = map[string]string{
 // owning org so an operator can act without a lookup.
 type healthIncident struct {
 	RecordingID int64
+	StreamID    int64
 	AccountID   int64
 	OrgName     string
 	OrgEmail    string
@@ -203,7 +204,7 @@ func deliverRecordingHealthEmail(ctx context.Context, pool *pgxpool.Pool, cfg co
 	}
 
 	subject := composeHealthEmailSubject(incidents)
-	body := composeHealthEmailBody(incidents)
+	body := composeHealthEmailBody(cfg.AppBaseURL, incidents)
 	sent := 0
 	for _, addr := range recipients {
 		if _, err := mailer.Send(ctx, email.Message{
@@ -249,7 +250,8 @@ func composeHealthEmailSubject(incidents []healthIncident) string {
 	return fmt.Sprintf("[Stoarama] %d recording health alert(s)", len(incidents))
 }
 
-func composeHealthEmailBody(incidents []healthIncident) string {
+func composeHealthEmailBody(baseURL string, incidents []healthIncident) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	var b strings.Builder
 	fmt.Fprintf(&b, "Stoarama detected %d recording health issue(s) this hour.\n\n", len(incidents))
 	for i, inc := range incidents {
@@ -260,6 +262,12 @@ func composeHealthEmailBody(incidents []healthIncident) string {
 		fmt.Fprintf(&b, "  Org:      %s <%s>\n", inc.OrgName, inc.OrgEmail)
 		if inc.StreamURL != "" {
 			fmt.Fprintf(&b, "  Stream:   %s\n", inc.StreamURL)
+		}
+		if baseURL != "" && inc.StreamID > 0 {
+			fmt.Fprintf(&b, "  Stoarama: %s/streams/%d\n", baseURL, inc.StreamID)
+		}
+		if baseURL != "" {
+			fmt.Fprintf(&b, "  Recording: %s/recordings/%d\n", baseURL, inc.RecordingID)
 		}
 		fmt.Fprintf(&b, "  Signal:   %s [%s]\n", healthSignalLabels[inc.Signal], inc.Severity)
 		if inc.SinceText != "" {
@@ -303,13 +311,13 @@ func humanSince(t *time.Time) string {
 func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) []healthIncident {
 	rows, err := pool.Query(ctx, `
 		WITH cont AS (
-		  SELECT r.id, r.account_id, r.name, r.stream_url, r.cron_timezone, r.last_clip_at, r.last_error_text,
+		  SELECT r.id, COALESCE(r.stream_id,0) AS stream_id, r.account_id, r.name, r.stream_url, r.cron_timezone, r.last_clip_at, r.last_error_text,
 		    ((now() AT TIME ZONE r.cron_timezone)::date + r.daily_window_start) AT TIME ZONE r.cron_timezone AS win_open,
 		    ((now() AT TIME ZONE r.cron_timezone)::date + r.daily_window_end)   AT TIME ZONE r.cron_timezone AS win_close
 		  FROM recordings r JOIN account_billing b ON b.account_id=r.account_id
 		  WHERE r.status='active' AND r.mode='continuous' AND b.has_payment_method=true
 		    AND now()>=r.start_at AND now()<COALESCE(r.end_at,'infinity'::timestamptz))
-		SELECT c.id,c.account_id,c.name,c.stream_url,c.win_open,c.win_close,c.last_clip_at,c.last_error_text,
+		SELECT c.id,c.stream_id,c.account_id,c.name,c.stream_url,c.win_open,c.win_close,c.last_clip_at,c.last_error_text,
 		       acc.name, acc.email
 		FROM cont c JOIN accounts acc ON acc.id=c.account_id
 		WHERE now() >= c.win_open + make_interval(mins=>$1) AND now() < c.win_close
@@ -322,17 +330,17 @@ func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshn
 	out := []healthIncident{}
 	for rows.Next() {
 		var (
-			id, accountID            int64
+			id, streamID, accountID  int64
 			name, streamURL, orgName string
 			orgEmail, lastErr        string
 			winOpen, winClose        time.Time
 			lastClipAt               *time.Time
 		)
-		if err := rows.Scan(&id, &accountID, &name, &streamURL, &winOpen, &winClose, &lastClipAt, &lastErr, &orgName, &orgEmail); err != nil {
+		if err := rows.Scan(&id, &streamID, &accountID, &name, &streamURL, &winOpen, &winClose, &lastClipAt, &lastErr, &orgName, &orgEmail); err != nil {
 			log.Fatalf("scan continuous_silent_death: %v", err)
 		}
 		out = append(out, healthIncident{
-			RecordingID: id, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
+			RecordingID: id, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,
 			Signal: signalContinuousSilentDeath, Severity: healthSignalSeverity[signalContinuousSilentDeath],
 			SinceText: fmt.Sprintf("window opened %s, last clip %s", winOpen.UTC().Format(time.RFC3339), humanSince(lastClipAt)),
@@ -347,7 +355,7 @@ func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshn
 
 func detectContinuousWindowEndedEarly(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
 	rows, err := pool.Query(ctx, `
-		SELECT j.recording_id,r.account_id,r.name,r.stream_url,j.id,j.fire_at,j.window_end_at,j.status,j.error_text,
+		SELECT j.recording_id,COALESCE(r.stream_id,0),r.account_id,r.name,r.stream_url,j.id,j.fire_at,j.window_end_at,j.status,j.error_text,
 		       acc.name, acc.email
 		FROM recording_jobs j JOIN recordings r ON r.id=j.recording_id JOIN account_billing b ON b.account_id=r.account_id
 		JOIN accounts acc ON acc.id=r.account_id
@@ -362,18 +370,18 @@ func detectContinuousWindowEndedEarly(ctx context.Context, pool *pgxpool.Pool) [
 	out := []healthIncident{}
 	for rows.Next() {
 		var (
-			recID, accountID    int64
-			jobID               int64
-			name, streamURL     string
-			orgName, orgEmail   string
-			status, errText     string
-			fireAt, windowEndAt time.Time
+			recID, streamID, accountID int64
+			jobID                      int64
+			name, streamURL            string
+			orgName, orgEmail          string
+			status, errText            string
+			fireAt, windowEndAt        time.Time
 		)
-		if err := rows.Scan(&recID, &accountID, &name, &streamURL, &jobID, &fireAt, &windowEndAt, &status, &errText, &orgName, &orgEmail); err != nil {
+		if err := rows.Scan(&recID, &streamID, &accountID, &name, &streamURL, &jobID, &fireAt, &windowEndAt, &status, &errText, &orgName, &orgEmail); err != nil {
 			log.Fatalf("scan continuous_window_ended_early: %v", err)
 		}
 		out = append(out, healthIncident{
-			RecordingID: recID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
+			RecordingID: recID, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,
 			Signal: signalContinuousWindowEndedEarly, Severity: healthSignalSeverity[signalContinuousWindowEndedEarly],
 			SinceText: fmt.Sprintf("job fired %s, window ends %s", fireAt.UTC().Format(time.RFC3339), windowEndAt.UTC().Format(time.RFC3339)),
@@ -388,7 +396,7 @@ func detectContinuousWindowEndedEarly(ctx context.Context, pool *pgxpool.Pool) [
 
 func detectJobRetriesExhausted(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
 	rows, err := pool.Query(ctx, `
-		SELECT j.recording_id,r.account_id,r.name,j.id,j.kind,j.attempt_count,j.max_attempts,j.error_text,COALESCE(j.completed_at,j.updated_at),
+		SELECT j.recording_id,COALESCE(r.stream_id,0),r.account_id,r.name,j.id,j.kind,j.attempt_count,j.max_attempts,j.error_text,COALESCE(j.completed_at,j.updated_at),
 		       acc.name, acc.email, r.stream_url
 		FROM recording_jobs j JOIN recordings r ON r.id=j.recording_id JOIN account_billing b ON b.account_id=r.account_id
 		JOIN accounts acc ON acc.id=r.account_id
@@ -402,18 +410,18 @@ func detectJobRetriesExhausted(ctx context.Context, pool *pgxpool.Pool) []health
 	out := []healthIncident{}
 	for rows.Next() {
 		var (
-			recID, accountID             int64
+			recID, streamID, accountID   int64
 			jobID                        int64
 			name, kind, errText          string
 			orgName, orgEmail, streamURL string
 			attemptCount, maxAttempts    int
 			failedAt                     time.Time
 		)
-		if err := rows.Scan(&recID, &accountID, &name, &jobID, &kind, &attemptCount, &maxAttempts, &errText, &failedAt, &orgName, &orgEmail, &streamURL); err != nil {
+		if err := rows.Scan(&recID, &streamID, &accountID, &name, &jobID, &kind, &attemptCount, &maxAttempts, &errText, &failedAt, &orgName, &orgEmail, &streamURL); err != nil {
 			log.Fatalf("scan job_retries_exhausted: %v", err)
 		}
 		out = append(out, healthIncident{
-			RecordingID: recID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
+			RecordingID: recID, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,
 			Signal: signalJobRetriesExhausted, Severity: healthSignalSeverity[signalJobRetriesExhausted],
 			SinceText: failedAt.UTC().Format(time.RFC3339),
@@ -428,7 +436,7 @@ func detectJobRetriesExhausted(ctx context.Context, pool *pgxpool.Pool) []health
 
 func detectStuckLease(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
 	rows, err := pool.Query(ctx, `
-		SELECT j.recording_id,r.account_id,r.name,j.id,j.kind,j.lease_owner,j.lease_expires_at,
+		SELECT j.recording_id,COALESCE(r.stream_id,0),r.account_id,r.name,j.id,j.kind,j.lease_owner,j.lease_expires_at,
 		       acc.name, acc.email, r.stream_url
 		FROM recording_jobs j JOIN recordings r ON r.id=j.recording_id
 		JOIN accounts acc ON acc.id=r.account_id
@@ -441,14 +449,14 @@ func detectStuckLease(ctx context.Context, pool *pgxpool.Pool) []healthIncident 
 	out := []healthIncident{}
 	for rows.Next() {
 		var (
-			recID, accountID             int64
+			recID, streamID, accountID   int64
 			jobID                        int64
 			name, kind                   string
 			orgName, orgEmail, streamURL string
 			leaseOwner                   *string
 			leaseExpiresAt               *time.Time
 		)
-		if err := rows.Scan(&recID, &accountID, &name, &jobID, &kind, &leaseOwner, &leaseExpiresAt, &orgName, &orgEmail, &streamURL); err != nil {
+		if err := rows.Scan(&recID, &streamID, &accountID, &name, &jobID, &kind, &leaseOwner, &leaseExpiresAt, &orgName, &orgEmail, &streamURL); err != nil {
 			log.Fatalf("scan stuck_lease: %v", err)
 		}
 		owner := ""
@@ -456,7 +464,7 @@ func detectStuckLease(ctx context.Context, pool *pgxpool.Pool) []healthIncident 
 			owner = *leaseOwner
 		}
 		out = append(out, healthIncident{
-			RecordingID: recID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
+			RecordingID: recID, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,
 			Signal: signalStuckLease, Severity: healthSignalSeverity[signalStuckLease],
 			SinceText: fmt.Sprintf("lease expired %s", humanSince(leaseExpiresAt)),
@@ -471,7 +479,7 @@ func detectStuckLease(ctx context.Context, pool *pgxpool.Pool) []healthIncident 
 
 func detectSampledOverdue(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
 	rows, err := pool.Query(ctx, `
-		SELECT r.id,r.account_id,r.name,r.stream_url,r.next_fire_at,r.last_clip_at,r.consecutive_failures,r.last_error_text,
+		SELECT r.id,COALESCE(r.stream_id,0),r.account_id,r.name,r.stream_url,r.next_fire_at,r.last_clip_at,r.consecutive_failures,r.last_error_text,
 		       acc.name, acc.email
 		FROM recordings r JOIN account_billing b ON b.account_id=r.account_id
 		JOIN accounts acc ON acc.id=r.account_id
@@ -486,17 +494,17 @@ func detectSampledOverdue(ctx context.Context, pool *pgxpool.Pool) []healthIncid
 	out := []healthIncident{}
 	for rows.Next() {
 		var (
-			id, accountID              int64
+			id, streamID, accountID    int64
 			name, streamURL            string
 			orgName, orgEmail, lastErr string
 			consecutiveFailures        int
 			nextFireAt, lastClipAt     *time.Time
 		)
-		if err := rows.Scan(&id, &accountID, &name, &streamURL, &nextFireAt, &lastClipAt, &consecutiveFailures, &lastErr, &orgName, &orgEmail); err != nil {
+		if err := rows.Scan(&id, &streamID, &accountID, &name, &streamURL, &nextFireAt, &lastClipAt, &consecutiveFailures, &lastErr, &orgName, &orgEmail); err != nil {
 			log.Fatalf("scan sampled_overdue: %v", err)
 		}
 		out = append(out, healthIncident{
-			RecordingID: id, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
+			RecordingID: id, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,
 			Signal: signalSampledOverdue, Severity: healthSignalSeverity[signalSampledOverdue],
 			SinceText: fmt.Sprintf("next fire due %s, last clip %s", humanSince(nextFireAt), humanSince(lastClipAt)),
