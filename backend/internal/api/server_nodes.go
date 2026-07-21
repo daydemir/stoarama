@@ -365,6 +365,9 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 		       (SELECT COUNT(*) FROM recording_jobs j WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases
 		FROM nodes n
 		WHERE n.account_id=$1
+		  AND (n.status <> 'disabled' OR EXISTS (
+		    SELECT 1 FROM node_tokens t WHERE t.node_id=n.id AND t.revoked_at IS NULL
+		  ))
 		ORDER BY n.created_at DESC, n.id DESC
 	`, principal.AccountID)
 	if err != nil {

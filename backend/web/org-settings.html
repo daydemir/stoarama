@@ -865,21 +865,24 @@
       return `<div style="border:1px solid ${borderColor};border-radius:12px;padding:10px 12px;background:color-mix(in srgb,var(--panel2) 86%,transparent);">${headline}<dl class="bill-meta"><dt>Computers online</dt><dd>${online} / ${enabled.length}</dd><dt>Disabled</dt><dd>${total - enabled.length}</dd><dt>Recording now</dt><dd>${liveLeases}</dd><dt>Free slots now</dt><dd>${availSlots}</dd></dl><div class="sub" style="margin-top:8px;">Disabled computers stay connected but will not receive new recording jobs.</div></div>`;
     }
 
+    let relayLoadToken = 0;
     async function loadRelays() {
+      const loadToken = ++relayLoadToken;
       relayPanel.classList.remove('hidden');
-      setStatus(relayStatus, 'Loading computers...', '');
-      relayList.classList.add('hidden');
-      relaySummary.classList.add('hidden');
-      relayEmpty.classList.add('hidden');
+      if (!relayList.innerHTML && !relaySummary.innerHTML) setStatus(relayStatus, 'Loading computers...', '');
       try {
         const data = await fetchJSON('/api/v1/account/nodes');
+        if (loadToken !== relayLoadToken) return;
         const items = (Array.isArray(data.items) ? data.items : []).filter((n) => String(n.node_type) === 'relay');
         if (items.length === 0) {
           relayList.innerHTML = '';
+          relayList.classList.add('hidden');
+          relaySummary.classList.add('hidden');
           relayEmpty.classList.remove('hidden');
           setStatus(relayStatus, '', '');
           return;
         }
+        relayEmpty.classList.add('hidden');
         relaySummary.innerHTML = renderRelaySummary(items);
         relaySummary.classList.remove('hidden');
         relayList.innerHTML = items.map(relayRowHTML).join('');
@@ -895,7 +898,8 @@
         });
         setStatus(relayStatus, `${items.length} computer${items.length === 1 ? '' : 's'}`, 'ok');
       } catch (err) {
-        relayPanel.classList.add('hidden');
+        if (loadToken !== relayLoadToken) return;
+        setStatus(relayStatus, String(err.message || err), 'err');
       }
     }
 
