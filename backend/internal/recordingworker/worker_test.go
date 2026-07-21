@@ -82,36 +82,59 @@ func TestReconnectBackoff(t *testing.T) {
 
 func TestRelayDiagnosticsSnapshotRedactsURLs(t *testing.T) {
 	d := &RelayDiagnostics{}
-	job := recordingapi.RecordingJob{JobID: 123, RecordingID: 456}
-	d.Start(job)
-	d.Stage(job.JobID, "capturing")
-	d.Error(job.JobID, "capture_retry", errString("ffmpeg failed https://example.com/live.m3u8?token=secret"))
+	for i := int64(6); i > 0; i-- {
+		d.Start(recordingapi.RecordingJob{JobID: i, RecordingID: i + 100})
+	}
+	d.Stage(3, "capturing")
+	d.Error(3, "resolve_retry", errString("HTTP 404 https://example.com/live.m3u8?token=secret"))
 
 	snap := d.Snapshot()
-	current := snap["current"].(map[string]any)
-	if current["job_id"] != int64(123) || current["recording_id"] != int64(456) {
-		t.Fatalf("current ids = (%v,%v), want (123,456)", current["job_id"], current["recording_id"])
+	active := snap["active"].([]map[string]any)
+	if len(active) != 6 {
+		t.Fatalf("active count=%d want 6", len(active))
 	}
-	if current["stage"] != "capture_retry" {
-		t.Fatalf("stage=%v want capture_retry", current["stage"])
+	for i, job := range active {
+		if job["job_id"] != int64(i+1) {
+			t.Fatalf("active[%d] job_id=%v want %d", i, job["job_id"], i+1)
+		}
 	}
-	if got := current["last_error"]; got != "ffmpeg failed https://example.com/live.m3u8?[query]" {
+	if got := active[2]["last_error"]; got != "HTTP 404 https://example.com/live.m3u8?[query]" {
 		t.Fatalf("last_error=%q want url with redacted query", got)
 	}
 
 	segAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	d.Segment(job.JobID, segAt)
-	d.Finish(job.JobID, "done", nil)
+	d.Segment(3, segAt)
+	d.Finish(3, "done", nil)
 	snap = d.Snapshot()
-	if snap["current"] != nil {
-		t.Fatalf("current=%v want nil after finish", snap["current"])
+	active = snap["active"].([]map[string]any)
+	if len(active) != 5 {
+		t.Fatalf("active count=%d want 5 after finish", len(active))
 	}
 	last := snap["last"].(map[string]any)
+	if last["job_id"] != int64(3) {
+		t.Fatalf("last job_id=%v want 3", last["job_id"])
+	}
 	if last["segment_count"] != 1 {
 		t.Fatalf("last segment_count=%v want 1", last["segment_count"])
 	}
 	if last["last_segment_at"] != segAt.Format(time.RFC3339Nano) {
 		t.Fatalf("last_segment_at=%v want %s", last["last_segment_at"], segAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestRelayDiagnosticsSnapshotBoundsActiveJobs(t *testing.T) {
+	d := &RelayDiagnostics{}
+	for i := int64(1); i <= relayDiagnosticActiveLimit+1; i++ {
+		d.Start(recordingapi.RecordingJob{JobID: i, RecordingID: i})
+	}
+
+	snap := d.Snapshot()
+	active := snap["active"].([]map[string]any)
+	if len(active) != relayDiagnosticActiveLimit {
+		t.Fatalf("active count=%d want %d", len(active), relayDiagnosticActiveLimit)
+	}
+	if snap["active_total"] != relayDiagnosticActiveLimit+1 {
+		t.Fatalf("active_total=%v want %d", snap["active_total"], relayDiagnosticActiveLimit+1)
 	}
 }
 
