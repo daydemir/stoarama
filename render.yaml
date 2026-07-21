@@ -29,6 +29,10 @@ services:
       chmod +x bin/ffmpeg
       ./bin/ffmpeg -version
     startCommand: ./bin/stoarama-api
+    # Fail a new release before cutover if legacy/stale recorder identity data
+    # would make a live cloud recorder unable to authenticate. The currently
+    # healthy API instance remains serving if this check fails.
+    preDeployCommand: ./bin/stoarama-api validate-recorder-bindings
     envVars:
       - key: DATABASE_URL
         fromDatabase:

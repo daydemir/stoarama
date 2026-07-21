@@ -34,6 +34,50 @@ func TestForecastDemandExcludesRelayRecordings(t *testing.T) {
 	}
 }
 
+func TestValidateLiveBindings(t *testing.T) {
+	pool, cleanup := testDropletPoolDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	accountID := insertForecastAccount(t, pool)
+	var nodeID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO nodes (account_id, node_type, display_name, status)
+		VALUES ($1, 'local_recorder', 'recorder-a', 'active') RETURNING id
+	`, accountID).Scan(&nodeID); err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_tokens (node_id, key_prefix, secret_hash)
+		VALUES ($1, 'prefix', 'hash')
+	`, nodeID); err != nil {
+		t.Fatalf("insert node token: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recorder_droplets (name, node_id, region, size, capacity, state)
+		VALUES ('recorder-a', $1, 'nyc3', 's-1vcpu-1gb', 1, 'active')
+	`, nodeID); err != nil {
+		t.Fatalf("insert droplet: %v", err)
+	}
+
+	store := NewStore(pool)
+	if err := store.ValidateLiveBindings(ctx); err != nil {
+		t.Fatalf("valid binding rejected: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE node_tokens SET revoked_at=now() WHERE node_id=$1`, nodeID); err != nil {
+		t.Fatalf("revoke node token: %v", err)
+	}
+	if err := store.ValidateLiveBindings(ctx); err == nil {
+		t.Fatal("revoked live binding accepted")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET state='destroyed' WHERE node_id=$1`, nodeID); err != nil {
+		t.Fatalf("destroy droplet: %v", err)
+	}
+	if err := store.ValidateLiveBindings(ctx); err != nil {
+		t.Fatalf("destroyed binding blocked startup: %v", err)
+	}
+}
+
 func testDropletPoolDB(t *testing.T) (*pgxpool.Pool, func()) {
 	t.Helper()
 

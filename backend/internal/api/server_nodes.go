@@ -106,6 +106,7 @@ func (s *Server) isManagedCloudRecorder(ctx context.Context, principal nodePrinc
 		SELECT EXISTS (
 			SELECT 1 FROM recorder_droplets
 			WHERE name=$1 AND node_id=$2
+			  AND state IN ('provisioning', 'active', 'draining')
 		)
 	`, strings.TrimSpace(principal.DisplayName), principal.NodeID).Scan(&managed)
 	return managed, err

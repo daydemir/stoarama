@@ -131,6 +131,16 @@ func TestManagedCloudRecorderBindsAuthenticatedNodeID(t *testing.T) {
 	if err != nil || !managed {
 		t.Fatalf("matching principal managed=%v err=%v, want true", managed, err)
 	}
+	if _, err := pool.Exec(context.Background(), `UPDATE recorder_droplets SET state='destroyed' WHERE name='recorder-a'`); err != nil {
+		t.Fatalf("destroy droplet: %v", err)
+	}
+	managed, err = s.isManagedCloudRecorder(context.Background(), principal)
+	if err != nil || managed {
+		t.Fatalf("destroyed principal managed=%v err=%v, want false", managed, err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE recorder_droplets SET state='active' WHERE name='recorder-a'`); err != nil {
+		t.Fatalf("reactivate droplet: %v", err)
+	}
 	principal.NodeID++
 	managed, err = s.isManagedCloudRecorder(context.Background(), principal)
 	if err != nil || managed {

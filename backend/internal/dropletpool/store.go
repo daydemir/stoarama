@@ -40,6 +40,39 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+// ValidateLiveBindings fails closed when a live managed recorder could not
+// authenticate after deployment. This catches stale production data before a
+// new API instance begins serving recorder traffic.
+func (s *Store) ValidateLiveBindings(ctx context.Context) error {
+	var name string
+	err := s.pool.QueryRow(ctx, `
+		SELECT d.name
+		FROM recorder_droplets d
+		LEFT JOIN nodes n ON n.id=d.node_id
+		WHERE d.state IN ('provisioning', 'active', 'draining')
+		  AND (
+			d.node_id IS NULL
+			OR n.id IS NULL
+			OR n.node_type <> 'local_recorder'
+			OR n.status <> 'active'
+			OR trim(n.display_name) <> d.name
+			OR NOT EXISTS (
+				SELECT 1 FROM node_tokens t
+				WHERE t.node_id=d.node_id AND t.revoked_at IS NULL
+			)
+		  )
+		ORDER BY d.id
+		LIMIT 1
+	`).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("validate live recorder bindings: %w", err)
+	}
+	return fmt.Errorf("live recorder %q has an invalid node binding", name)
+}
+
 // ResolveOperatorAccount returns the id of the active admin account that owns the
 // per-droplet recorder node tokens, looked up by email. The recorder nodes are
 // operator infrastructure, so they are owned by the operator's account; the
