@@ -110,6 +110,11 @@ func TestRelayDiagnosticsSnapshotRedactsURLs(t *testing.T) {
 	if len(active) != 5 {
 		t.Fatalf("active count=%d want 5 after finish", len(active))
 	}
+	for _, job := range active {
+		if job["job_id"] == int64(3) {
+			t.Fatal("finished job 3 remained active")
+		}
+	}
 	last := snap["last"].(map[string]any)
 	if last["job_id"] != int64(3) {
 		t.Fatalf("last job_id=%v want 3", last["job_id"])
@@ -132,6 +137,11 @@ func TestRelayDiagnosticsSnapshotBoundsActiveJobs(t *testing.T) {
 	active := snap["active"].([]map[string]any)
 	if len(active) != relayDiagnosticActiveLimit {
 		t.Fatalf("active count=%d want %d", len(active), relayDiagnosticActiveLimit)
+	}
+	for i, job := range active {
+		if job["job_id"] != int64(i+1) {
+			t.Fatalf("active[%d] job_id=%v want %d", i, job["job_id"], i+1)
+		}
 	}
 	if snap["active_total"] != relayDiagnosticActiveLimit+1 {
 		t.Fatalf("active_total=%v want %d", snap["active_total"], relayDiagnosticActiveLimit+1)
