@@ -20,6 +20,7 @@ import (
 // capture/resolve.go at the installed yt-dlp/platform ffmpeg, and runs the node
 // heartbeat and YouTube probe on separate goroutines.
 func runRelay(ctx context.Context) error {
+	startedAt := time.Now().UTC()
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -83,7 +84,7 @@ func runRelay(ctx context.Context) error {
 	// effect only across a process restart.
 	pr := newProbe(ytdlp)
 	firstHeartbeat := make(chan struct{})
-	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag, firstHeartbeat)
+	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag, startedAt, firstHeartbeat)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
