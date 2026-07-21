@@ -82,7 +82,13 @@ func runRelay(ctx context.Context) error {
 	// update heartbeat visibility and do not touch the resolve env. A mode change takes
 	// effect only across a process restart.
 	pr := newProbe(ytdlp)
-	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag)
+	firstHeartbeat := make(chan struct{})
+	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag, firstHeartbeat)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-firstHeartbeat:
+	}
 	pr.runOnce(ctx)
 	pr.applyCookieEnv()
 	log.Printf("stoarama-relay run node=%d concurrency=%d api=%s youtube_ready=%t youtube_error=%q",

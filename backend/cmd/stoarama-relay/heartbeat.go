@@ -263,7 +263,7 @@ func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
 // 30s. External probes run independently so a slow resolver cannot block liveness.
 // POST /api/v1/node/heartbeat sets last_heartbeat_at and merges the reported keys into
 // nodes.capabilities_jsonb.
-func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, cfg relayConfig, diag relayDiagnostics) {
+func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, cfg relayConfig, diag relayDiagnostics, firstSent chan<- struct{}) {
 	startedAt := time.Now().UTC()
 	diagnosticsPath := ""
 	if home, err := stoaramaHome(); err == nil {
@@ -330,6 +330,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 	}
 
 	send()
+	close(firstSent)
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {

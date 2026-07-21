@@ -58,7 +58,8 @@ func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go relayHeartbeatLoop(ctx, client, newProbe("missing-yt-dlp"), &atomic.Int64{}, relayConfig{Concurrency: 1}, nil)
+	firstSent := make(chan struct{})
+	go relayHeartbeatLoop(ctx, client, newProbe("missing-yt-dlp"), &atomic.Int64{}, relayConfig{Concurrency: 1}, nil, firstSent)
 
 	select {
 	case capabilities := <-received:
@@ -70,6 +71,11 @@ func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
 		}
 		if _, ok := capabilities["ytdlp_version"]; ok {
 			t.Fatal("unread yt-dlp version was reported")
+		}
+		select {
+		case <-firstSent:
+		case <-time.After(time.Second):
+			t.Fatal("first heartbeat completion was not signaled")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("first heartbeat waited for an external probe")
