@@ -326,6 +326,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		     WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now()) AS live_leases
 		  FROM nodes n
 		  WHERE n.account_id=$1 AND n.node_type='relay'
+		    AND `+visibleNodeSQL+`
 		),
 		fleet AS (
 		  SELECT

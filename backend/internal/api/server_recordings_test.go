@@ -128,6 +128,17 @@ func TestRecordingLeaseIncludesCatalogResolveContextWithoutWeakeningTenantWall(t
 	}
 }
 
+func TestFleetRelayStatsExcludeRemovedNodes(t *testing.T) {
+	for _, want := range []string{
+		"n.status <> 'disabled' OR EXISTS",
+		"t.node_id=n.id AND t.revoked_at IS NULL",
+	} {
+		if !strings.Contains(visibleNodeSQL, want) {
+			t.Fatalf("visible node predicate must preserve disabled nodes with active tokens and exclude removed nodes; missing %q", want)
+		}
+	}
+}
+
 func itoa(v int64) string {
 	// small local helper to avoid importing strconv in the test for one call
 	neg := v < 0
