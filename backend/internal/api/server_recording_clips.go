@@ -256,6 +256,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		// $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
 		resp, err = s.leaseRelayRecordingJob(r.Context(), principal, billingDisabled, margin)
 	} else {
+		// $1=workerID, $2=billingDisabled, $3=margin, $4=freshnessGrace, $5=capacity.
 		tx, beginErr := s.pool.Begin(r.Context())
 		if beginErr != nil {
 			err = fmt.Errorf("begin cloud lease: %w", beginErr)
@@ -285,6 +286,17 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"job": resp})
+}
+
+func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, nodeID int64) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE recorder_droplets
+		SET last_seen_at=now(),
+		    first_seen_at=COALESCE(first_seen_at, now()),
+		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
+		WHERE name=$1 AND node_id=$2
+	`, workerID, nodeID)
+	return err
 }
 
 type recordingUploadIntentRequest struct {
@@ -780,13 +792,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// Touch the droplet liveness row if this worker is a managed droplet.
-	_, _ = s.pool.Exec(r.Context(), `
-		UPDATE recorder_droplets
-		SET last_seen_at=now(),
-		    first_seen_at=COALESCE(first_seen_at, now()),
-		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
-		WHERE name=$1 AND node_id=$2
-	`, workerID, principal.NodeID)
+	_ = s.touchDropletLiveness(r.Context(), workerID, principal.NodeID)
 	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt})
 }
 
@@ -806,13 +812,7 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
 		return
 	}
-	if _, err := s.pool.Exec(r.Context(), `
-		UPDATE recorder_droplets
-		SET last_seen_at=now(),
-		    first_seen_at=COALESCE(first_seen_at, now()),
-		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
-		WHERE name=$1 AND node_id=$2
-	`, workerID, principal.NodeID); err != nil {
+	if err := s.touchDropletLiveness(r.Context(), workerID, principal.NodeID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("touch droplet liveness: %v", err))
 		return
 	}
