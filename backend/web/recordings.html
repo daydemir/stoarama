@@ -2658,9 +2658,14 @@
       if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
       const lines = [];
       const hours = Number(b.recording_hours_this_month || 0);
-      if (hours >= 1) {
-        const noun = hours === 1 ? 'hour of recording' : 'hours of recording';
-        lines.push(`<span><b>${hours} ${noun} this billing period</b> &middot; est. ${usdCents(b.estimated_amount_cents)}</span>`);
+      const scheduledHours = Number(b.projected_recording_hours || 0);
+      const scheduledCents = Number(b.projected_recording_amount_cents || 0);
+      const hasScheduled = Boolean(b.is_projection) && scheduledCents > 0;
+      if (hours >= 1 || hasScheduled) {
+        lines.push(`<span><b>Recorded: ${hours} recording-hour${hours === 1 ? '' : 's'}</b> &middot; ${usdCents(b.estimated_amount_cents)}</span>`);
+      }
+      if (hasScheduled) {
+        lines.push(`<span><b>Scheduled: ${scheduledHours} recording-hour${scheduledHours === 1 ? '' : 's'} upcoming</b> &middot; est. ${usdCents(scheduledCents)}</span>`);
       }
       // Managed storage line: period-to-date average stream-hour-month from /billing.
       // Hidden when the account has no managed data (avg = 0).
