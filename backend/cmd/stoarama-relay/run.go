@@ -90,13 +90,16 @@ func runRelay(ctx context.Context) error {
 		return ctx.Err()
 	case <-firstHeartbeat:
 	}
+	if err := ensureRollbackBaseline(cfg); err != nil {
+		return fmt.Errorf("establish rollback baseline: %w", err)
+	}
 	pr.runOnce(ctx)
 	pr.applyCookieEnv()
 	log.Printf("stoarama-relay run node=%d concurrency=%d api=%s youtube_ready=%t youtube_error=%q",
 		cfg.NodeID, cfg.Concurrency, cfg.APIURL, pr.ok(), pr.errorClass())
 
 	go pr.runLoop(ctx)
-	go selfUpdateLoop(ctx, cfg.APIURL)
+	go selfUpdateLoop(ctx, cfg)
 
 	return worker.Run(ctx)
 }

@@ -17,11 +17,12 @@ const (
 
 // relayConfig is the persisted enrollment state at ~/.stoarama/config.json (0600).
 type relayConfig struct {
-	NodeID      int64     `json:"node_id"`
-	NodeToken   string    `json:"node_token"`
-	APIURL      string    `json:"api_url"`
-	Concurrency int       `json:"concurrency"`
-	InstalledAt time.Time `json:"installed_at"`
+	NodeID         int64           `json:"node_id"`
+	NodeToken      string          `json:"node_token"`
+	APIURL         string          `json:"api_url"`
+	Concurrency    int             `json:"concurrency"`
+	InstalledAt    time.Time       `json:"installed_at"`
+	UpdateManifest releaseManifest `json:"update_manifest,omitempty"`
 }
 
 func stoaramaHome() (string, error) {
@@ -103,6 +104,9 @@ func loadConfig() (relayConfig, error) {
 	if strings.TrimSpace(cfg.NodeToken) == "" {
 		return cfg, fmt.Errorf("relay config %s has no node_token; re-run enroll", p)
 	}
+	if cfg.UpdateManifest != "" && !cfg.UpdateManifest.valid() {
+		return cfg, fmt.Errorf("relay config %s has invalid update_manifest", p)
+	}
 	return cfg, nil
 }
 
@@ -119,8 +123,5 @@ func saveConfig(cfg relayConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshal relay config: %w", err)
 	}
-	if err := os.WriteFile(p, b, 0o600); err != nil {
-		return fmt.Errorf("write relay config %s: %w", p, err)
-	}
-	return nil
+	return atomicWriteFile(p, b, 0o600)
 }

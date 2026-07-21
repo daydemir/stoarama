@@ -19,11 +19,14 @@ set -euo pipefail
 # and starts the launchd user agent (macOS) or systemd user unit (Linux).
 #
 #   curl -fsSL https://stoarama.com/relay/install.sh | bash -s -- --token sie_xxxx
+#   curl -fsSL https://stoarama.com/relay/download/install-VERSION.sh \
+#     | bash -s -- --token sie_xxxx --manifest latest-VERSION.json
 
 API_URL="https://stoarama.com"
 TOKEN=""
 NAME=""
 CONCURRENCY="6"
+MANIFEST_NAME="latest.json"
 
 PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 
@@ -33,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --api-url)     API_URL="${2:-}"; shift 2 ;;
     --name)        NAME="${2:-}"; shift 2 ;;
     --concurrency) CONCURRENCY="${2:-}"; shift 2 ;;
+    --manifest)    MANIFEST_NAME="${2:-}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -43,6 +47,10 @@ if [[ -z "${TOKEN}" ]]; then
 fi
 if ! [[ "${CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || (( CONCURRENCY > 20 )); then
   echo "error: --concurrency must be between 1 and 20" >&2
+  exit 1
+fi
+if ! [[ "${MANIFEST_NAME}" =~ ^latest(-[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)?\.json$ ]] || [[ "${MANIFEST_NAME}" == *..* ]]; then
+  echo "error: --manifest must be latest.json or latest-VERSION.json" >&2
   exit 1
 fi
 API_URL="${API_URL%/}"
@@ -87,11 +95,13 @@ sha256_of() {
   fi
 }
 
-# sha_for_artifact <artifact-name>: prints the sha256 recorded for that artifact in
-# latest.json, or nothing if absent. release-relay.sh emits each artifact on its own
-# JSON line, so the only 64-hex token on the matching line is that artifact's digest.
+# sha_for_artifact <artifact-name>: prints the sha256 recorded for that artifact.
 sha_for_artifact() {
-  grep -F "\"artifact\": \"$1\"" "${LATEST_JSON}" | grep -oE '[0-9a-fA-F]{64}' | head -n1
+  printf '%s\n' "${MANIFEST_ENTRIES}" \
+    | grep -F "\"artifact\": \"$1\"" \
+    | grep -oE '[0-9a-fA-F]{64}' \
+    | head -n1 \
+    || true
 }
 
 verify_sha() {
@@ -114,11 +124,36 @@ verify_sha() {
 # relay tarball and yt-dlp) is checksum-verified before anything is executed.
 LATEST_JSON="$(mktemp)"
 trap 'rm -f "${LATEST_JSON}"' EXIT
-echo "Fetching release manifest..."
-download "latest.json" "${LATEST_JSON}"
+echo "Fetching release manifest ${MANIFEST_NAME}..."
+download "${MANIFEST_NAME}" "${LATEST_JSON}"
+MANIFEST="$(tr '\n' ' ' < "${LATEST_JSON}" | sed -E 's/[[:space:]]+/ /g')"
+RELEASE_VERSION="$(
+  printf '%s\n' "${MANIFEST}" \
+    | grep -oE '"version"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]+"' \
+    | head -n1 \
+    | sed -E 's/.*"([A-Za-z0-9._-]+)"$/\1/'
+)"
+if [[ -z "${RELEASE_VERSION}" ]]; then
+  echo "error: invalid release version in ${MANIFEST_NAME}" >&2
+  exit 1
+fi
+if [[ "${MANIFEST_NAME}" != "latest.json" && \
+      "${MANIFEST_NAME}" != "latest-${RELEASE_VERSION}.json" ]]; then
+  echo "error: ${MANIFEST_NAME} contains release ${RELEASE_VERSION}" >&2
+  exit 1
+fi
+MANIFEST_ENTRIES="$(
+  printf '%s\n' "${MANIFEST}" \
+    | grep -oE '\{[[:space:]]*"artifact"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,[[:space:]]*"sha256"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{64}"[[:space:]]*\}' \
+    | sed -E 's/[[:space:]]+/ /g; s/^\{ /\{/'
+)"
 
 echo "Downloading stoarama-relay (${OS}/${ARCH})..."
-RELAY_TARBALL="stoarama-relay-${KEY}.tar.gz"
+RELAY_TARBALL="stoarama-relay-${RELEASE_VERSION}-${KEY}.tar.gz"
+if [[ -z "$(sha_for_artifact "${RELAY_TARBALL}")" ]]; then
+  echo "error: no relay artifact for ${KEY} in ${MANIFEST_NAME}" >&2
+  exit 1
+fi
 download "${RELAY_TARBALL}" "/tmp/stoarama-relay.tar.gz"
 verify_sha "/tmp/stoarama-relay.tar.gz" "${RELAY_TARBALL}"
 tar -xzf "/tmp/stoarama-relay.tar.gz" -C "${BIN_DIR}"
@@ -127,7 +162,14 @@ unquarantine "${BIN_DIR}/stoarama-relay"
 
 if [[ ! -x "${BIN_DIR}/yt-dlp" ]]; then
   echo "Downloading yt-dlp..."
-  YTDLP_ARTIFACT="yt-dlp-${KEY}"
+  YTDLP_ARTIFACT="yt-dlp-${RELEASE_VERSION}-${KEY}"
+  if [[ -z "$(sha_for_artifact "${YTDLP_ARTIFACT}")" ]]; then
+    YTDLP_ARTIFACT="yt-dlp-${KEY}"
+  fi
+  if [[ -z "$(sha_for_artifact "${YTDLP_ARTIFACT}")" ]]; then
+    echo "error: no yt-dlp artifact for ${KEY} in ${MANIFEST_NAME}" >&2
+    exit 1
+  fi
   download "${YTDLP_ARTIFACT}" "${BIN_DIR}/yt-dlp"
   verify_sha "${BIN_DIR}/yt-dlp" "${YTDLP_ARTIFACT}"
   chmod +x "${BIN_DIR}/yt-dlp"
@@ -140,7 +182,10 @@ fi
 # back to a system ffmpeg/ffprobe already on PATH. Never proceed without a working
 # ffmpeg.
 if [[ ! -x "${BIN_DIR}/ffmpeg" ]]; then
-  FFMPEG_TARBALL="ffmpeg-${KEY}.tar.gz"
+  FFMPEG_TARBALL="ffmpeg-${RELEASE_VERSION}-${KEY}.tar.gz"
+  if [[ -z "$(sha_for_artifact "${FFMPEG_TARBALL}")" ]]; then
+    FFMPEG_TARBALL="ffmpeg-${KEY}.tar.gz"
+  fi
   if [[ -n "$(sha_for_artifact "${FFMPEG_TARBALL}")" ]]; then
     echo "Downloading ffmpeg..."
     download "${FFMPEG_TARBALL}" "/tmp/stoarama-ffmpeg.tar.gz"
@@ -175,6 +220,7 @@ fi
 echo "Enrolling this computer with Stoarama..."
 ENROLL_ARGS=(enroll --token "${TOKEN}" --api-url "${API_URL}" --concurrency "${CONCURRENCY}")
 [[ -n "${NAME}" ]] && ENROLL_ARGS+=(--name "${NAME}")
+[[ "${MANIFEST_NAME}" != "latest.json" ]] && ENROLL_ARGS+=(--update-manifest "${MANIFEST_NAME}")
 "${BIN_DIR}/stoarama-relay" "${ENROLL_ARGS[@]}"
 
 echo ""

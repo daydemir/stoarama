@@ -97,3 +97,14 @@ func TestShellQuoteEscapesSingleQuotes(t *testing.T) {
 		t.Fatalf("shellQuote=%q", got)
 	}
 }
+
+func TestRelayArtifactCacheControl(t *testing.T) {
+	for _, name := range []string{"latest.json", "install.sh", "uninstall.sh"} {
+		if got := relayArtifactCacheControl(name); got != "no-store" {
+			t.Fatalf("relayArtifactCacheControl(%q)=%q", name, got)
+		}
+	}
+	if got := relayArtifactCacheControl("latest-abcdef12.json"); got != "public, max-age=31536000, immutable" {
+		t.Fatalf("immutable manifest cache control=%q", got)
+	}
+}
