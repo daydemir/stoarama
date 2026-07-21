@@ -2527,8 +2527,11 @@
         name: String(n.display_name || 'your computer'),
         healthy: n.healthy === true,
         ytOk: cap.youtube_ready === true,
-        active: Number(cap.active_jobs || 0),
+        active: Number(n.live_leases || 0),
         max: Number(n.relay_max_streams || 6),
+        groupID: Number(n.relay_group_id || 0),
+        groupActive: Number(n.relay_group_live_leases || 0),
+        groupMax: Number(n.relay_group_max_streams || 0),
       };
     }
 
@@ -2545,7 +2548,7 @@
       const relays = (state.relays || []).map(relayView);
       const online = relays.filter((r) => r.healthy);
       const ytReady = online.filter((r) => r.ytOk);
-      const hasCapacity = ytReady.some((r) => r.active < r.max);
+      const availableRelay = ytReady.find((r) => r.active < r.max && (!r.groupID || r.groupActive < r.groupMax));
 
       let dot = 'var(--muted)', label = '', detail = '', cta = '', fleetOK = false;
       if (relays.length === 0) {
@@ -2564,15 +2567,15 @@
         const names = online.map((r) => escapeHTML(r.name)).join(', ');
         detail = `yt-dlp on ${names} could not resolve YouTube yet. This usually clears on its own; if it persists the relay may need an update.`;
         cta = '<a href="/org-settings">Manage computers</a>';
-      } else if (!hasCapacity) {
+      } else if (!availableRelay) {
         dot = 'var(--warn)';
         label = 'Your computers are at capacity';
-        detail = 'Every YouTube-ready computer is at its stream limit. Connect another computer or raise a limit in Org settings.';
+        detail = 'Every YouTube-ready computer or internet group is at its stream limit. Connect another computer or raise a limit in Org settings.';
         cta = '<a href="/org-settings">Manage computers</a>';
       } else {
         dot = 'var(--ok)';
         label = 'Records via your computer';
-        detail = `This stream records through ${escapeHTML(ytReady[0].name)} via your own connection, no login needed. Clips arrive in your account as usual, billed at the same $0.05 per recording-hour.`;
+        detail = `This stream records through ${escapeHTML(availableRelay.name)} via your own connection, no login needed. Clips arrive in your account as usual, billed at the same $0.05 per recording-hour.`;
         fleetOK = true;
       }
       els.relayGateDot.style.background = dot;

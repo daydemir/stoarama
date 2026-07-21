@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -77,12 +78,11 @@ type recordingLeaseResponse struct {
 // input) and n.account_id=rec.account_id is the tenant wall, both enforced in SQL, so
 // a relay can only ever lease its own account's relay recordings.
 //
-// Capacity ($1's active leases < n.relay_max_streams) is BEST-EFFORT / soft: FOR
-// UPDATE SKIP LOCKED locks only the one candidate job row, while this COUNT(*) reads
-// unlocked rows, so two concurrent lease calls sharing one node id can both pass and
-// over-subscribe by a few. The AUTHORITATIVE bound is the relay worker's client-side
-// semaphore (Concurrency = relay_max_streams); this subquery is a soft guard, not a
-// race-proof cap. Params: $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
+// Capacity is authoritative because leaseRelayRecordingJob locks the authenticated
+// node and then its optional group before running this statement. Concurrent calls
+// for one computer serialize on the node; calls from computers sharing an internet
+// group serialize on the group. Params: $1=NodeID, $2=billingDisabled, $3=margin,
+// $4=freshnessGrace.
 const relayLeaseSQL = `
 	WITH cte AS (
 	  SELECT j.id
@@ -105,11 +105,22 @@ const relayLeaseSQL = `
 	          SELECT 1 FROM account_billing b
 	          WHERE b.account_id = rec.account_id
 	            AND b.has_payment_method))
-	    -- Best-effort capacity bound (soft): the client semaphore is authoritative.
+	    -- The surrounding node/group row locks make these capacity bounds authoritative.
 	    AND (SELECT COUNT(*) FROM recording_jobs aj
 	         WHERE aj.status = 'leased'
 	           AND aj.lease_owner = 'node:' || $1::text
 	           AND aj.lease_expires_at > now()) < n.relay_max_streams
+	    AND (n.relay_group_id IS NULL OR (
+	         SELECT COUNT(*)
+	         FROM recording_jobs gj
+	         JOIN nodes gn ON gj.lease_owner='node:'||gn.id::text
+	         WHERE gn.account_id=n.account_id
+	           AND gn.relay_group_id=n.relay_group_id
+	           AND gj.status='leased'
+	           AND gj.lease_expires_at > now()) < (
+	         SELECT g.max_streams
+	         FROM relay_groups g
+	         WHERE g.id=n.relay_group_id AND g.account_id=n.account_id))
 	  ORDER BY j.scheduled_for ASC, j.id ASC
 	  LIMIT 1
 	  FOR UPDATE SKIP LOCKED
@@ -128,6 +139,49 @@ const relayLeaseSQL = `
 	          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
 	          rec.target_fps, j.kind, j.window_end_at
 `
+
+func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrincipal, billingDisabled bool, margin int) (recordingLeaseResponse, error) {
+	var resp recordingLeaseResponse
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return resp, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockRelayNodeAndGroup(ctx, tx, principal); err != nil {
+		return resp, err
+	}
+	err = tx.QueryRow(ctx, relayLeaseSQL,
+		principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
+		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
+		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
+		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
+	)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return resp, err
+	}
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		return resp, commitErr
+	}
+	return resp, err
+}
+
+func lockRelayNodeAndGroup(ctx context.Context, tx pgx.Tx, principal nodePrincipal) error {
+	var groupID *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT relay_group_id FROM nodes
+		WHERE id=$1 AND account_id=$2 AND node_type='relay'
+		FOR UPDATE
+	`, principal.NodeID, principal.AccountID).Scan(&groupID); err != nil {
+		return err
+	}
+	if groupID == nil {
+		return nil
+	}
+	var lockedID int64
+	return tx.QueryRow(ctx, `
+		SELECT id FROM relay_groups WHERE id=$1 AND account_id=$2 FOR UPDATE
+	`, *groupID, principal.AccountID).Scan(&lockedID)
+}
 
 // handleRecordingJobsLease leases at most one due recording job for the calling
 // droplet. It locks ONLY recording_jobs in the CTE (mirroring the capture lease)
@@ -159,12 +213,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		// n.id is the authenticated principal's node id (token lookup), never request
 		// input, so a relay can never lease another account's or a cloud recording's job.
 		// $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
-		err = s.pool.QueryRow(r.Context(), relayLeaseSQL,
-			principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
-			&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
-			&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
-			&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
-		)
+		resp, err = s.leaseRelayRecordingJob(r.Context(), principal, billingDisabled, margin)
 	} else {
 		err = s.pool.QueryRow(r.Context(), `
 		WITH cte AS (
@@ -663,9 +712,42 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	util.WriteJSON(w, http.StatusOK, map[string]any{"clip_id": clipID})
 }
 
+const recordingJobHeartbeatSQL = `
+	UPDATE recording_jobs j
+	SET lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)), updated_at = now()
+	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2 AND j.lease_expires_at > now()
+	RETURNING j.lease_expires_at
+`
+
+func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrincipal, jobID int64, workerID string) (time.Time, error) {
+	var leaseExpiresAt time.Time
+	if principal.NodeType != nodeTypeRelay {
+		err := s.pool.QueryRow(ctx, recordingJobHeartbeatSQL,
+			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec).Scan(&leaseExpiresAt)
+		return leaseExpiresAt, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return leaseExpiresAt, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockRelayNodeAndGroup(ctx, tx, principal); err != nil {
+		return leaseExpiresAt, err
+	}
+	if err := tx.QueryRow(ctx, recordingJobHeartbeatSQL,
+		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec).Scan(&leaseExpiresAt); err != nil {
+		return leaseExpiresAt, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return leaseExpiresAt, err
+	}
+	return leaseExpiresAt, nil
+}
+
 // handleRecordingJobHeartbeat extends the lease (and touches the droplet
 // liveness row). It returns 409 + a cancel signal if the job was canceled or is
-// no longer owned, so the worker aborts ffmpeg and skips ingest (D-inflight).
+// expired or no longer owned, so the worker aborts ffmpeg and skips ingest
+// (D-inflight). An expired lease never revives after replacement work was leased.
 func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Request) {
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
@@ -678,13 +760,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 	}
 	workerID := recorderWorkerID(principal)
 
-	var leaseExpiresAt time.Time
-	err := s.pool.QueryRow(r.Context(), `
-		UPDATE recording_jobs j
-		SET lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)), updated_at = now()
-		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
-		RETURNING j.lease_expires_at
-	`, id, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec).Scan(&leaseExpiresAt)
+	leaseExpiresAt, err := s.heartbeatRecordingJob(r.Context(), principal, id, workerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Not owned / not leased anymore (canceled, reclaimed, or completed).
 		util.WriteJSON(w, http.StatusConflict, map[string]any{"cancel": true})

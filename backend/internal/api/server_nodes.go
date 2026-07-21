@@ -369,8 +369,12 @@ func (s *Server) handleAccountNodesList(w http.ResponseWriter, r *http.Request) 
 	}
 	rows, err := s.pool.Query(r.Context(), `
 		SELECT n.id, n.account_id, n.node_type, n.display_name, n.hostname, n.platform, n.status, n.enrolled_at, n.last_heartbeat_at, n.capabilities_jsonb, n.metadata_jsonb, n.created_at, n.updated_at, n.relay_max_streams, n.survey_enabled,
-		       (SELECT COUNT(*) FROM recording_jobs j WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases
+		       (SELECT COUNT(*) FROM recording_jobs j WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases,
+		       n.relay_group_id, g.name, g.max_streams,
+		       (SELECT COUNT(*) FROM recording_jobs j JOIN nodes gn ON j.lease_owner='node:'||gn.id::text
+		        WHERE gn.relay_group_id=n.relay_group_id AND j.status='leased' AND j.lease_expires_at > now())::int AS relay_group_live_leases
 		FROM nodes n
+		LEFT JOIN relay_groups g ON g.id=n.relay_group_id AND g.account_id=n.account_id
 		WHERE n.account_id=$1
 		  AND `+visibleNodeSQL+`
 		ORDER BY n.created_at DESC, n.id DESC
@@ -526,8 +530,20 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
+	relayGroupID, liveLeases, err := lockRelayNode(r.Context(), tx, id, principal.AccountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "node not found")
+		return
+	} else if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock node: %v", err))
+		return
+	}
+	if !relayGroupChangeAllowed(relayGroupID, nil, liveLeases) {
+		util.WriteError(w, http.StatusConflict, "disable this computer before removing it")
+		return
+	}
 	ct, err := tx.Exec(r.Context(), `
-		UPDATE nodes SET status='disabled', updated_at=now()
+		UPDATE nodes SET status='disabled', relay_group_id=NULL, updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND node_type='relay'
 	`, id, principal.AccountID)
 	if err != nil {
@@ -993,8 +1009,12 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 func (s *Server) fetchNodeByID(ctx context.Context, id int64) (map[string]any, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT n.id, n.account_id, n.node_type, n.display_name, n.hostname, n.platform, n.status, n.enrolled_at, n.last_heartbeat_at, n.capabilities_jsonb, n.metadata_jsonb, n.created_at, n.updated_at, n.relay_max_streams, n.survey_enabled,
-		       (SELECT COUNT(*) FROM recording_jobs j WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases
+		       (SELECT COUNT(*) FROM recording_jobs j WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases,
+		       n.relay_group_id, g.name, g.max_streams,
+		       (SELECT COUNT(*) FROM recording_jobs j JOIN nodes gn ON j.lease_owner='node:'||gn.id::text
+		        WHERE gn.relay_group_id=n.relay_group_id AND j.status='leased' AND j.lease_expires_at > now())::int AS relay_group_live_leases
 		FROM nodes n
+		LEFT JOIN relay_groups g ON g.id=n.relay_group_id AND g.account_id=n.account_id
 		WHERE n.id=$1
 	`, id)
 	return scanNodeRow(row)
@@ -1022,6 +1042,10 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		relayMaxStreams int
 		surveyEnabled   bool
 		liveLeases      int
+		relayGroupID    *int64
+		relayGroupName  *string
+		relayGroupMax   *int
+		relayGroupLive  int
 	)
 	if err := row.Scan(
 		&id,
@@ -1040,6 +1064,10 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		&relayMaxStreams,
 		&surveyEnabled,
 		&liveLeases,
+		&relayGroupID,
+		&relayGroupName,
+		&relayGroupMax,
+		&relayGroupLive,
 	); err != nil {
 		return nil, err
 	}
@@ -1077,6 +1105,10 @@ func scanNodeRow(row nodeScanner) (map[string]any, error) {
 		"relay_max_streams":       relayMaxStreams,
 		"survey_enabled":          surveyEnabled,
 		"live_leases":             liveLeases,
+		"relay_group_id":          relayGroupID,
+		"relay_group_name":        relayGroupName,
+		"relay_group_max_streams": relayGroupMax,
+		"relay_group_live_leases": relayGroupLive,
 		"capabilities_json":       nonNilMap(capabilities),
 		"metadata_json":           nonNilMap(metadata),
 		"created_at":              createdAt.UTC(),

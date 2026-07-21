@@ -267,6 +267,14 @@
       </div>
       <div id="relayStatus" class="status">Loading computers...</div>
       <div id="relaySummary" class="hidden" style="margin-bottom:12px;"></div>
+      <div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:12px;">
+        <div class="section-title">
+          <h3 style="margin:0;">Internet groups</h3>
+          <button id="relayGroupCreateBtn" class="secondary small" type="button">Add group</button>
+        </div>
+        <div class="sub" style="margin:4px 0 8px;">Group computers that share one internet connection. Computer and group limits both apply.</div>
+        <div id="relayGroupList" class="rec-list"></div>
+      </div>
       <div id="relayList" class="rec-list hidden" style="margin-bottom:12px;"></div>
       <div id="relayEmpty" class="sub hidden" style="margin-bottom:12px;">No computers connected yet. Connect one to record YouTube streams through your own machine.</div>
 
@@ -353,6 +361,8 @@
     const relayPanel = document.getElementById('relayPanel');
     const relayStatus = document.getElementById('relayStatus');
     const relaySummary = document.getElementById('relaySummary');
+    const relayGroupList = document.getElementById('relayGroupList');
+    const relayGroupCreateBtn = document.getElementById('relayGroupCreateBtn');
     const relayList = document.getElementById('relayList');
     const relayEmpty = document.getElementById('relayEmpty');
     const relayLabel = document.getElementById('relayLabel');
@@ -366,6 +376,7 @@
 
     let currentAccount = null;
     let currentOrg = null;
+    let relayGroups = [];
 
     async function fetchJSON(path, opts = {}) {
       const method = String((opts && opts.method) || 'GET').toUpperCase();
@@ -818,7 +829,7 @@
       return { color: '#ef4444', label: 'Never connected' };
     }
 
-    function relayRowHTML(n) {
+    function relayRowHTML(n, groups) {
       const id = Number(n.id);
       const name = String(n.display_name || 'Computer');
       const live = relayLiveness(n);
@@ -833,6 +844,10 @@
       const recNow = isOnline ? String(liveLeases) : 'n/a';
       const freeNow = isOnline ? String(Math.max(0, max - liveLeases)) : 'n/a';
       const toggleLabel = disabled ? 'Enable' : 'Disable';
+      const groupID = Number(n.relay_group_id || 0);
+      const groupOptions = [`<option value="">No internet group</option>`]
+        .concat(groups.map((g) => `<option value="${Number(g.id)}"${Number(g.id) === groupID ? ' selected' : ''}>${escapeHTML(g.name)} (${Number(g.live_leases || 0)}/${Number(g.max_streams)})</option>`))
+        .join('');
       return `<div class="rec-row">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
           <div style="min-width:0;">
@@ -840,29 +855,52 @@
             <div class="sub" style="margin-top:2px;">${escapeHTML(platform)} &middot; ${relayYTBadge(cap)}</div>
           </div>
           <div style="display:flex;gap:8px;flex-shrink:0;">
+            <button class="secondary small relay-limit" type="button" data-id="${id}" data-max="${max}">Limit</button>
             <button class="secondary small relay-rename" type="button" data-id="${id}">Rename</button>
             <button class="secondary small relay-toggle" type="button" data-id="${id}" data-status="${disabled ? 'active' : 'disabled'}">${toggleLabel}</button>
             <button class="secondary small relay-remove" type="button" data-id="${id}">Remove</button>
           </div>
         </div>
         <dl class="bill-meta" style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
-          <dt>Capacity</dt><dd>${max}</dd>
+          <dt>Computer limit</dt><dd>${max}</dd>
           <dt>Recording now</dt><dd>${recNow}</dd>
-          <dt>Free now</dt><dd>${freeNow}</dd>
+          <dt>Computer free</dt><dd>${freeNow}</dd>
+          <dt>Internet group</dt><dd><select class="relay-group-select" data-id="${id}" aria-label="Internet group for ${escapeHTML(name)}" style="max-width:260px;">${groupOptions}</select></dd>
         </dl>
       </div>`;
     }
 
-    function renderRelaySummary(items) {
+    function renderRelaySummary(items, groups) {
       const total = items.length;
       const enabled = items.filter((n) => String(n.status) !== 'disabled');
       const online = enabled.filter((n) => n.healthy === true).length;
       const liveLeases = enabled.reduce((s, n) => s + Number(n.live_leases || 0), 0);
-      const availSlots = enabled.filter((n) => n.healthy === true).reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 6) - Number(n.live_leases || 0)), 0);
+      const ungroupedSlots = enabled.filter((n) => n.healthy === true && !Number(n.relay_group_id || 0))
+        .reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 6) - Number(n.live_leases || 0)), 0);
+      const groupedSlots = groups.reduce((sum, group) => {
+        const members = enabled.filter((n) => n.healthy === true && Number(n.relay_group_id) === Number(group.id));
+        const computerSlots = members.reduce((s, n) => s + Math.max(0, Number(n.relay_max_streams || 6) - Number(n.live_leases || 0)), 0);
+        const groupSlots = Math.max(0, Number(group.max_streams || 0) - Number(group.live_leases || 0));
+        return sum + Math.min(computerSlots, groupSlots);
+      }, 0);
+      const availSlots = ungroupedSlots + groupedSlots;
       const red = online === 0 && total > 0;
       const borderColor = red ? 'var(--err)' : 'var(--border)';
       const headline = red ? `<div style="font-weight:600;color:var(--err);margin-bottom:8px;">No computer online. Active relay recordings are not capturing.</div>` : '';
       return `<div style="border:1px solid ${borderColor};border-radius:12px;padding:10px 12px;background:color-mix(in srgb,var(--panel2) 86%,transparent);">${headline}<dl class="bill-meta"><dt>Computers online</dt><dd>${online} / ${enabled.length}</dd><dt>Disabled</dt><dd>${total - enabled.length}</dd><dt>Recording now</dt><dd>${liveLeases}</dd><dt>Free slots now</dt><dd>${availSlots}</dd></dl><div class="sub" style="margin-top:8px;">Disabled computers stay connected but will not receive new recording jobs.</div></div>`;
+    }
+
+    function renderRelayGroups(groups) {
+      if (!groups.length) {
+        relayGroupList.innerHTML = '<div class="sub">No internet groups yet.</div>';
+        return;
+      }
+      relayGroupList.innerHTML = groups.map((g) => `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <div><b>${escapeHTML(g.name)}</b><div class="sub">${Number(g.live_leases || 0)} recording now / ${Number(g.max_streams)} group limit &middot; ${Array.isArray(g.node_ids) ? g.node_ids.length : 0} computer${Array.isArray(g.node_ids) && g.node_ids.length === 1 ? '' : 's'}</div></div>
+        <div style="display:flex;gap:8px;"><button class="secondary small relay-group-edit" type="button" data-id="${Number(g.id)}">Edit</button><button class="secondary small relay-group-remove" type="button" data-id="${Number(g.id)}">Remove</button></div>
+      </div>`).join('');
+      relayGroupList.querySelectorAll('.relay-group-edit').forEach((btn) => btn.addEventListener('click', () => editRelayGroup(Number(btn.getAttribute('data-id')))));
+      relayGroupList.querySelectorAll('.relay-group-remove').forEach((btn) => btn.addEventListener('click', () => removeRelayGroup(Number(btn.getAttribute('data-id')))));
     }
 
     let relayLoadToken = 0;
@@ -871,9 +909,14 @@
       relayPanel.classList.remove('hidden');
       if (!relayList.innerHTML && !relaySummary.innerHTML) setStatus(relayStatus, 'Loading computers...', '');
       try {
-        const data = await fetchJSON('/api/v1/account/nodes');
+        const [data, groupData] = await Promise.all([
+          fetchJSON('/api/v1/account/nodes'),
+          fetchJSON('/api/v1/account/relay-groups'),
+        ]);
         if (loadToken !== relayLoadToken) return;
         const items = (Array.isArray(data.items) ? data.items : []).filter((n) => String(n.node_type) === 'relay');
+        relayGroups = Array.isArray(groupData.items) ? groupData.items : [];
+        renderRelayGroups(relayGroups);
         if (items.length === 0) {
           relayList.innerHTML = '';
           relayList.classList.add('hidden');
@@ -883,12 +926,18 @@
           return;
         }
         relayEmpty.classList.add('hidden');
-        relaySummary.innerHTML = renderRelaySummary(items);
+        relaySummary.innerHTML = renderRelaySummary(items, relayGroups);
         relaySummary.classList.remove('hidden');
-        relayList.innerHTML = items.map(relayRowHTML).join('');
+        relayList.innerHTML = items.map((item) => relayRowHTML(item, relayGroups)).join('');
         relayList.classList.remove('hidden');
         relayList.querySelectorAll('.relay-rename').forEach((btn) => {
           btn.addEventListener('click', () => renameRelay(Number(btn.getAttribute('data-id'))));
+        });
+        relayList.querySelectorAll('.relay-limit').forEach((btn) => {
+          btn.addEventListener('click', () => setRelayLimit(Number(btn.getAttribute('data-id')), Number(btn.getAttribute('data-max'))));
+        });
+        relayList.querySelectorAll('.relay-group-select').forEach((select) => {
+          select.addEventListener('change', () => setRelayGroup(Number(select.getAttribute('data-id')), Number(select.value || 0)));
         });
         relayList.querySelectorAll('.relay-toggle').forEach((btn) => {
           btn.addEventListener('click', () => toggleRelay(Number(btn.getAttribute('data-id')), btn.getAttribute('data-status')));
@@ -927,6 +976,96 @@
         relayCreateBtn.disabled = false;
       }
     });
+
+    function promptRelayGroup(group) {
+      const name = window.prompt('Internet group name', String((group && group.name) || 'Shared internet'));
+      if (name == null || !String(name).trim()) return;
+      const maxInput = window.prompt('Maximum recordings across this internet connection', String((group && group.max_streams) || 8));
+      if (maxInput == null) return;
+      const max = Number(maxInput);
+      if (!Number.isInteger(max) || max < 1 || max > 200) {
+        setStatus(relayStatus, 'Group limit must be between 1 and 200.', 'err');
+        return;
+      }
+      return { name: String(name).trim(), max_streams: max };
+    }
+
+    relayGroupCreateBtn.addEventListener('click', async () => {
+      const group = promptRelayGroup();
+      if (!group) return;
+      try {
+        await fetchJSON('/api/v1/account/relay-groups', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(group),
+        });
+        setStatus(relayStatus, 'Internet group created', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      }
+    });
+
+    async function editRelayGroup(id) {
+      const group = relayGroups.find((g) => Number(g.id) === Number(id));
+      if (!group) return;
+      const update = promptRelayGroup(group);
+      if (!update) return;
+      try {
+        await fetchJSON(`/api/v1/account/relay-groups/${id}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(update),
+        });
+        setStatus(relayStatus, 'Internet group updated', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function removeRelayGroup(id) {
+      if (!window.confirm('Remove this empty internet group?')) return;
+      try {
+        await fetchJSON(`/api/v1/account/relay-groups/${id}`, { method: 'DELETE' });
+        setStatus(relayStatus, 'Internet group removed', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function setRelayGroup(nodeID, groupID) {
+      try {
+        const path = groupID > 0
+          ? `/api/v1/account/nodes/${nodeID}/relay-group/${groupID}`
+          : `/api/v1/account/nodes/${nodeID}/relay-group`;
+        await fetchJSON(path, { method: groupID > 0 ? 'PUT' : 'DELETE' });
+        setStatus(relayStatus, groupID > 0 ? 'Internet group assigned' : 'Internet group cleared', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+        await loadRelays();
+      }
+    }
+
+    async function setRelayLimit(id, current) {
+      const maxInput = window.prompt('Maximum recordings on this computer', String(current || 6));
+      if (maxInput == null) return;
+      const max = Number(maxInput);
+      if (!Number.isInteger(max) || max < 1 || max > 20) {
+        setStatus(relayStatus, 'Computer limit must be between 1 and 20.', 'err');
+        return;
+      }
+      try {
+        await fetchJSON(`/api/v1/account/nodes/${id}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ relay_max_streams: max }),
+        });
+        setStatus(relayStatus, 'Computer limit updated', 'ok');
+        await loadRelays();
+      } catch (err) {
+        setStatus(relayStatus, String(err.message || err), 'err');
+      }
+    }
 
     async function renameRelay(id) {
       const name = window.prompt('New name for this computer');

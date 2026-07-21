@@ -84,6 +84,13 @@ const recordingListSelectSQL = `
 		         WHERE aj.status = 'leased'
 		           AND aj.lease_owner = 'node:' || n.id::text
 		           AND aj.lease_expires_at > now()) < n.relay_max_streams
+		    AND (n.relay_group_id IS NULL OR (
+		         SELECT COUNT(*) FROM recording_jobs gj
+		         JOIN nodes gn ON gj.lease_owner='node:'||gn.id::text
+		         WHERE gn.account_id=n.account_id AND gn.relay_group_id=n.relay_group_id
+		           AND gj.status='leased' AND gj.lease_expires_at > now()) < (
+		         SELECT g.max_streams FROM relay_groups g
+		         WHERE g.id=n.relay_group_id AND g.account_id=n.account_id))
 		)) AS has_relay_online,
 		-- relay_node_name: the relay currently holding an active lease on this recording,
 		-- if any (derived, replaces persisted pinning). NULL for cloud recordings.
@@ -322,18 +329,33 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	if err := s.pool.QueryRow(r.Context(), `
 		WITH relay_nodes AS (
 		  SELECT n.id, n.status, n.relay_max_streams, n.last_heartbeat_at,
+		    n.relay_group_id, g.max_streams AS relay_group_max_streams,
 		    (SELECT COUNT(*) FROM recording_jobs j
 		     WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now()) AS live_leases
 		  FROM nodes n
+		  LEFT JOIN relay_groups g ON g.id=n.relay_group_id AND g.account_id=n.account_id
 		  WHERE n.account_id=$1 AND n.node_type='relay'
 		    AND `+visibleNodeSQL+`
 		),
+		group_slots AS (
+		  SELECT relay_group_id,
+		    GREATEST(LEAST(
+		      MAX(relay_group_max_streams) - SUM(live_leases),
+		      COALESCE(SUM(GREATEST(relay_max_streams-live_leases, 0)) FILTER (
+		        WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds'), 0)
+		    ), 0)::int AS available_slots
+		  FROM relay_nodes
+		  WHERE relay_group_id IS NOT NULL
+		  GROUP BY relay_group_id
+		),
 		fleet AS (
 		  SELECT
-		    COUNT(*)::int                                                                                                                               AS total,
-		    COUNT(*) FILTER (WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds')::int                                         AS online,
-		    COALESCE(SUM(live_leases), 0)::int                                                                                                         AS live_leases,
-		    COALESCE(SUM(GREATEST(relay_max_streams - live_leases, 0)) FILTER (WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds'), 0)::int AS available_slots
+		    COUNT(*)::int AS total,
+		    COUNT(*) FILTER (WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds')::int AS online,
+		    COALESCE(SUM(live_leases), 0)::int AS live_leases,
+		    (COALESCE(SUM(GREATEST(relay_max_streams-live_leases, 0)) FILTER (
+		       WHERE relay_group_id IS NULL AND status='active' AND last_heartbeat_at >= now()-interval '120 seconds'), 0)
+		     + COALESCE((SELECT SUM(available_slots) FROM group_slots), 0))::int AS available_slots
 		  FROM relay_nodes
 		),
 		has_active_relay_rec AS (
