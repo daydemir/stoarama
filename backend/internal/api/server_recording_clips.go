@@ -182,7 +182,7 @@ func lockRelayNodeAndGroup(ctx context.Context, tx pgx.Tx, principal nodePrincip
 const cloudRecorderLockSQL = `
 	SELECT capacity
 	FROM recorder_droplets
-	WHERE name = $1 AND node_id = $2 AND state <> 'draining'
+	WHERE name = $1 AND node_id = $2 AND state IN ('provisioning', 'active')
 	FOR UPDATE
 `
 

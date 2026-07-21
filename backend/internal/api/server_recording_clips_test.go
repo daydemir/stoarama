@@ -15,7 +15,7 @@ import (
 )
 
 func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
-	for _, want := range []string{"node_id = $2", "FOR UPDATE"} {
+	for _, want := range []string{"node_id = $2", "state IN ('provisioning', 'active')", "FOR UPDATE"} {
 		if !strings.Contains(cloudRecorderLockSQL, want) {
 			t.Fatalf("droplet lock SQL missing %q", want)
 		}
