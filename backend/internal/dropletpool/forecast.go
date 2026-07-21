@@ -209,7 +209,8 @@ func forecastFromRecordings(recs []forecastRecording, now time.Time, lookahead t
 }
 
 // expandRecording enumerates one recording's fires whose modeled clip intervals
-// overlap [now, windowEnd], and returns the earliest future fire. Sampled clips
+// overlap [now, windowEnd], and returns the earliest demand instant (now when a
+// prior fire still overlaps, otherwise the earliest future fire). Sampled clips
 // are extended by sampledScheduleDelayMargin so scheduler jitter / scheduled_for
 // delay cannot make close fires overlap in reality while the forecast undercounts
 // them. A bounded iteration cap protects against a pathological schedule.
@@ -242,8 +243,11 @@ func expandRecording(r forecastRecording, now, windowEnd time.Time) ([]jobInterv
 			cursor = fire
 			continue
 		}
-		if fire.After(now) && first.IsZero() {
+		if first.IsZero() {
 			first = fire
+			if first.Before(now) {
+				first = now
+			}
 		}
 		out = append(out, jobInterval{Start: fire, End: end})
 		cursor = fire

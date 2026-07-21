@@ -72,8 +72,8 @@ func TestForecastFromRecordings_EveryMinutePeakIsClipFanout(t *testing.T) {
 	if fc.PeakConcurrent != 4 {
 		t.Fatalf("peak=%d want 4 (2 recordings x 2 overlapping 90s clips)", fc.PeakConcurrent)
 	}
-	// Earliest fire after 12:00:30 is 12:01:00.
-	wantNext := mustTime(t, "2026-06-24T12:01:00Z")
+	// The 12:00 fire still overlaps now, so demand is immediate.
+	wantNext := now
 	if !fc.NextFireAt.Equal(wantNext) {
 		t.Fatalf("next fire=%s want %s", fc.NextFireAt, wantNext)
 	}
@@ -88,8 +88,8 @@ func TestForecastFromRecordings_IncludesPreviousSampledFireOverlap(t *testing.T)
 	if fc.PeakConcurrent != 1 {
 		t.Fatalf("peak=%d want 1 (12:00 fire still overlaps now)", fc.PeakConcurrent)
 	}
-	if !fc.NextFireAt.IsZero() {
-		t.Fatalf("next fire=%s want zero (next future fire is outside lookahead)", fc.NextFireAt)
+	if !fc.NextFireAt.Equal(now) {
+		t.Fatalf("next fire=%s want %s (overlapping prior fire is immediate demand)", fc.NextFireAt, now)
 	}
 }
 
