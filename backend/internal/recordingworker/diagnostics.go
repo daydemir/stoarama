@@ -24,6 +24,9 @@ type RelayDiagnostics struct {
 	mu      sync.Mutex
 	current map[int64]*jobDiagnostic
 	last    *jobDiagnostic
+	lastCaptureAt time.Time
+	lastUploadAt time.Time
+	errorTail []string
 }
 
 type jobDiagnostic struct {
@@ -66,6 +69,8 @@ func (d *RelayDiagnostics) Stage(jobID int64, stage string) {
 	if j := d.current[jobID]; j != nil {
 		j.Stage = strings.TrimSpace(stage)
 		j.StageAt = time.Now().UTC()
+		if strings.Contains(stage, "captur") { d.lastCaptureAt = j.StageAt }
+		if strings.Contains(stage, "upload") || strings.Contains(stage, "ingest") { d.lastUploadAt = j.StageAt }
 	}
 }
 
@@ -79,6 +84,8 @@ func (d *RelayDiagnostics) Error(jobID int64, stage string, err error) {
 		j.Stage = strings.TrimSpace(stage)
 		j.LastError = sanitizeDiagnosticError(err)
 		j.StageAt = time.Now().UTC()
+		d.errorTail = append(d.errorTail, j.LastError)
+		if len(d.errorTail) > 8 { d.errorTail = d.errorTail[len(d.errorTail)-8:] }
 	}
 }
 
@@ -149,6 +156,9 @@ func (d *RelayDiagnostics) Snapshot() map[string]any {
 		"active": active,
 		"last":   lastOut,
 	}
+	if !d.lastCaptureAt.IsZero() { out["last_capture_at"] = d.lastCaptureAt.UTC().Format(time.RFC3339Nano) }
+	if !d.lastUploadAt.IsZero() { out["last_upload_at"] = d.lastUploadAt.UTC().Format(time.RFC3339Nano) }
+	if len(d.errorTail) > 0 { out["error_tail"] = append([]string(nil), d.errorTail...) }
 	if total > relayDiagnosticActiveLimit {
 		out["active_total"] = total
 	}

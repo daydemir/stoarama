@@ -18,8 +18,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+var lastUpdaterUnix atomic.Int64
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
 // binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
@@ -206,6 +209,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 // binary actually changed. Errors are logged and swallowed so a bad manifest or a
 // transient network failure never takes the relay down.
 func checkAndApplyUpdate(base string, manifest releaseManifest) {
+	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
 	lj, err := fetchLatest(base, manifest)
 	if err != nil {
 		log.Printf("relay self-update: fetch latest.json: %v", err)

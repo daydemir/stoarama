@@ -113,10 +113,30 @@ func (s *relayRecoveryState) persist(path string) error {
 		return err
 	}
 	tmp := path + ".new"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func bootID() string {
@@ -383,7 +403,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		recovery = &relayRecoveryState{}
 	}
 	previousRecovery := *recovery
-	recoveryPending := !previousRecovery.StartedAt.IsZero()
+	recoveryPending := previousRecovery.PreviousExit != "" && previousRecovery.PreviousExit != "clean"
 	recovery.BootID = bootID()
 	recovery.StartedAt = startedAt
 	if previousRecovery.StartedAt.IsZero() {
@@ -436,7 +456,27 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			caps["system_ffmpeg_probe"] = info.systemProbe
 		}
 		if diag != nil {
-			caps["recording_job"] = diag.Snapshot()
+			recording := diag.Snapshot()
+			caps["recording_job"] = recording
+			if value, ok := recording["last_capture_at"].(string); ok {
+				if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+					recovery.LastCaptureAt = parsed
+				}
+			}
+			if value, ok := recording["last_upload_at"].(string); ok {
+				if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+					recovery.LastUploadAt = parsed
+				}
+			}
+			if errors, ok := recording["error_tail"].([]string); ok {
+				recovery.ErrorTail = append(recovery.ErrorTail, errors...)
+				if len(recovery.ErrorTail) > 8 {
+					recovery.ErrorTail = recovery.ErrorTail[len(recovery.ErrorTail)-8:]
+				}
+			}
+		}
+		if updater := lastUpdaterUnix.Load(); updater > 0 {
+			recovery.LastUpdaterAt = time.Unix(0, updater).UTC()
 		}
 		offline, hasOffline := heartbeatDiag.Snapshot()
 		if hasOffline {
