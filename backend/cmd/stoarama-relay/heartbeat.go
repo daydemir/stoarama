@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
+	"github.com/daydemir/stoarama/backend/internal/recordingworker"
 )
 
 const heartbeatInterval = 30 * time.Second
@@ -486,7 +487,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 				}
 			}
 			if errors, ok := recording["error_tail"].([]string); ok {
-				recovery.ErrorTail = append(recovery.ErrorTail, errors...)
+				recovery.ErrorTail = append([]string(nil), errors...)
 				if len(recovery.ErrorTail) > 8 {
 					recovery.ErrorTail = recovery.ErrorTail[len(recovery.ErrorTail)-8:]
 				}
@@ -504,18 +505,22 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		err := client.NodeHeartbeat(hctx, caps)
 		cancel()
 		if err != nil && ctx.Err() == nil {
-			recovery.LastError = err.Error()
-			recovery.ErrorTail = append(recovery.ErrorTail, err.Error())
+			sanitized := recordingworker.SanitizeDiagnosticError(err)
+			recovery.LastError = sanitized
+			recovery.ErrorTail = append(recovery.ErrorTail, sanitized)
 			_ = recovery.persist(recoveryPath)
 			if persistErr := heartbeatDiag.Failed(err); persistErr != nil {
 				log.Printf("relay diagnostics persist error: %v", persistErr)
 			}
 			log.Printf("relay heartbeat error: %v", err)
 		} else if err == nil {
-			recoveryPending = false
 			recovery.LastHeartbeatAt = time.Now().UTC()
 			recovery.LastError = ""
-			_ = recovery.persist(recoveryPath)
+			if persistErr := recovery.persist(recoveryPath); persistErr != nil {
+				log.Printf("relay recovery state persist error: %v", persistErr)
+				return
+			}
+			recoveryPending = false
 			if persistErr := heartbeatDiag.SucceededAt(recoveredAt); persistErr != nil {
 				log.Printf("relay diagnostics persist error: %v", persistErr)
 			} else if hasOffline {
