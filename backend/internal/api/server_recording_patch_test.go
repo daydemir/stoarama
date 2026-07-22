@@ -156,13 +156,27 @@ func TestRecordingScheduleUpdate(t *testing.T) {
 	)
 	destID := insertPatchDestination(t, pool, ownerAccountID)
 	recID := insertPatchRecording(t, pool, ownerAccountID, destID, "managed")
+	var streamID int64
+	if err := pool.QueryRow(context.Background(), `INSERT INTO streams (name, local_timezone) VALUES ('Rome stream', 'Europe/Rome') RETURNING id`).Scan(&streamID); err != nil {
+		t.Fatalf("insert catalog stream: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE recordings SET stream_id=$2 WHERE id=$1`, recID, streamID); err != nil {
+		t.Fatalf("link catalog stream: %v", err)
+	}
+	var jobID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO recording_jobs (recording_id, fire_at, scheduled_for, clip_duration_sec, status, lease_owner, lease_expires_at, idempotency_key)
+		VALUES ($1, now(), now(), 60, 'leased', 'worker', now()+interval '5 minutes', 'old-schedule') RETURNING id
+	`, recID).Scan(&jobID); err != nil {
+		t.Fatalf("insert old schedule job: %v", err)
+	}
 
 	s := &Server{pool: pool}
 
 	body := map[string]any{
 		"mode":              "sampled",
 		"cron_expr":         "*/10 * * * *",
-		"cron_timezone":     "UTC",
+		"cron_timezone":     "America/New_York",
 		"clip_duration_sec": 300,
 	}
 	rec := httptest.NewRecorder()
@@ -182,6 +196,66 @@ func TestRecordingScheduleUpdate(t *testing.T) {
 	}
 	if resp["next_fire_at"] == nil {
 		t.Fatalf("next_fire_at not recomputed: %v", resp["next_fire_at"])
+	}
+	if resp["cron_timezone"] != "Europe/Rome" {
+		t.Fatalf("cron_timezone = %v, want catalog timezone Europe/Rome", resp["cron_timezone"])
+	}
+	var jobStatus string
+	var leaseOwner *string
+	if err := pool.QueryRow(context.Background(), `SELECT status, lease_owner FROM recording_jobs WHERE id=$1`, jobID).Scan(&jobStatus, &leaseOwner); err != nil {
+		t.Fatalf("read old schedule job: %v", err)
+	}
+	if jobStatus != "canceled" || leaseOwner != nil {
+		t.Fatalf("old schedule job status=%q lease_owner=%v, want canceled and unleased", jobStatus, leaseOwner)
+	}
+	var cursor *time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT last_enqueued_fire_at FROM recordings WHERE id=$1`, recID).Scan(&cursor); err != nil {
+		t.Fatalf("read schedule cursor: %v", err)
+	}
+	if cursor == nil {
+		t.Fatal("schedule edit left last_enqueued_fire_at null; old fires could replay")
+	}
+
+	missingRecID := insertPatchRecording(t, pool, ownerAccountID, destID, "managed")
+	var missingStreamID int64
+	if err := pool.QueryRow(context.Background(), `INSERT INTO streams (name) VALUES ('Missing timezone') RETURNING id`).Scan(&missingStreamID); err != nil {
+		t.Fatalf("insert stream missing timezone: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE recordings SET stream_id=$2, name='missing-zone-rec' WHERE id=$1`, missingRecID, missingStreamID); err != nil {
+		t.Fatalf("link stream missing timezone: %v", err)
+	}
+	missingBody := map[string]any{"mode": "sampled", "cron_expr": "*/10 * * * *", "clip_duration_sec": 300}
+	rec = httptest.NewRecorder()
+	s.handleAccountRecordingSchedule(rec, schedulePatchReq(missingRecID, ownerAccountID, missingBody))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing catalog timezone: status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	missingBody["cron_timezone"] = "Europe/London"
+	rec = httptest.NewRecorder()
+	s.handleAccountRecordingSchedule(rec, schedulePatchReq(missingRecID, ownerAccountID, missingBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit catalog timezone: status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var persistedTimezone string
+	if err := pool.QueryRow(context.Background(), `SELECT local_timezone FROM streams WHERE id=$1`, missingStreamID).Scan(&persistedTimezone); err != nil {
+		t.Fatalf("read persisted stream timezone: %v", err)
+	}
+	if persistedTimezone != "Europe/London" {
+		t.Fatalf("persisted stream timezone=%q, want Europe/London", persistedTimezone)
+	}
+
+	unlinkedRecID := insertPatchRecording(t, pool, ownerAccountID, destID, "managed")
+	unlinkedBody := map[string]any{"mode": "sampled", "cron_expr": "*/10 * * * *", "clip_duration_sec": 300}
+	rec = httptest.NewRecorder()
+	s.handleAccountRecordingSchedule(rec, schedulePatchReq(unlinkedRecID, ownerAccountID, unlinkedBody))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unlinked omitted timezone: status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	unlinkedBody["cron_timezone"] = "UTC"
+	rec = httptest.NewRecorder()
+	s.handleAccountRecordingSchedule(rec, schedulePatchReq(unlinkedRecID, ownerAccountID, unlinkedBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlinked explicit UTC: status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 
 	// Foreign account cannot edit -> 404.
@@ -370,7 +444,9 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 		`CREATE TABLE streams (
 			id BIGSERIAL PRIMARY KEY,
 			name TEXT,
-			location_text TEXT
+			location_text TEXT,
+			local_timezone TEXT NOT NULL DEFAULT '',
+			deleted_at TIMESTAMPTZ
 		)`,
 		`CREATE TABLE account_billing (
 			account_id BIGINT PRIMARY KEY,
@@ -400,6 +476,7 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			target_fps INT,
 			status TEXT NOT NULL DEFAULT 'active',
 			next_fire_at TIMESTAMPTZ,
+			last_enqueued_fire_at TIMESTAMPTZ,
 			last_clip_at TIMESTAMPTZ,
 			last_error_text TEXT NOT NULL DEFAULT '',
 			last_error_at TIMESTAMPTZ,

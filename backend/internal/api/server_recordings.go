@@ -498,6 +498,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	var catalogStreamID int64
 	var catalogProvider string
 	var catalogSourcePageURL string
+	var catalogTimezone string
 	streamURL := strings.TrimSpace(req.StreamURL)
 	if req.StreamID != nil {
 		if *req.StreamID <= 0 {
@@ -505,7 +506,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			return
 		}
 		var catalogURL, provider, sourcePageURL string
-		err := s.pool.QueryRow(r.Context(), `SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,'') FROM streams WHERE id=$1 AND deleted_at IS NULL`, *req.StreamID).Scan(&catalogURL, &provider, &sourcePageURL)
+		err := s.pool.QueryRow(r.Context(), `SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,''), local_timezone FROM streams WHERE id=$1 AND deleted_at IS NULL`, *req.StreamID).Scan(&catalogURL, &provider, &sourcePageURL, &catalogTimezone)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				util.WriteError(w, http.StatusNotFound, "catalog stream not found")
@@ -537,8 +538,16 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	}
 	cronExpr := strings.TrimSpace(req.CronExpr)
 	cronTimezone := strings.TrimSpace(req.CronTimezone)
+	if catalogStreamID > 0 && strings.TrimSpace(catalogTimezone) == "" && cronTimezone == "" {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream %d requires a local timezone", catalogStreamID))
+		return
+	}
+	if timezone := strings.TrimSpace(catalogTimezone); timezone != "" {
+		cronTimezone = timezone
+	}
 	if cronTimezone == "" {
-		cronTimezone = "UTC"
+		util.WriteError(w, http.StatusBadRequest, "cron_timezone is required when no catalog timezone is available")
+		return
 	}
 	mode := strings.TrimSpace(req.Mode)
 	if mode == "" {
@@ -899,6 +908,32 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if catalogStreamID > 0 {
+		var currentTimezone string
+		if err := tx.QueryRow(r.Context(), `SELECT local_timezone FROM streams WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, catalogStreamID).Scan(&currentTimezone); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d changed; retry", catalogStreamID))
+				return
+			}
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock stream timezone: %v", err))
+			return
+		}
+		if strings.TrimSpace(catalogTimezone) != "" && strings.TrimSpace(currentTimezone) != cronTimezone {
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d timezone changed; retry", catalogStreamID))
+			return
+		}
+	}
+	if catalogStreamID > 0 && strings.TrimSpace(catalogTimezone) == "" {
+		actualTimezone, persistErr := persistMissingCatalogTimezone(r.Context(), tx, catalogStreamID, cronTimezone)
+		if persistErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("set stream timezone: %v", persistErr))
+			return
+		}
+		if actualTimezone != cronTimezone {
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d already has timezone %s", catalogStreamID, actualTimezone))
+			return
+		}
+	}
 	persistNow := time.Now().UTC()
 	startAt = effectiveRecordingStart(req.StartAt, persistNow)
 	if endAt, ok := endAtArg.(time.Time); ok && !endAt.After(startAt) {
@@ -1009,6 +1044,24 @@ func effectiveRecordingStart(requested *time.Time, now time.Time) time.Time {
 		return requested.UTC()
 	}
 	return now.UTC()
+}
+
+func persistMissingCatalogTimezone(ctx context.Context, tx pgx.Tx, streamID int64, timezone string) (string, error) {
+	ct, err := tx.Exec(ctx, `
+		UPDATE streams SET local_timezone=$2, updated_at=now()
+		WHERE id=$1 AND local_timezone=''
+	`, streamID, timezone)
+	if err != nil {
+		return "", err
+	}
+	if ct.RowsAffected() == 1 {
+		return timezone, nil
+	}
+	var actual string
+	if err := tx.QueryRow(ctx, `SELECT local_timezone FROM streams WHERE id=$1`, streamID).Scan(&actual); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(actual), nil
 }
 
 // isYouTubeWatchURL mirrors capture/resolve.go's isYouTubeURL host check. It is the
@@ -1303,10 +1356,8 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		return
 	}
 	cronExpr := strings.TrimSpace(req.CronExpr)
-	cronTimezone := strings.TrimSpace(req.CronTimezone)
-	if cronTimezone == "" {
-		cronTimezone = "UTC"
-	}
+	requestedCronTimezone := strings.TrimSpace(req.CronTimezone)
+	cronTimezone := requestedCronTimezone
 	clipDuration := req.ClipDurationSec
 	if clipDuration == 0 {
 		clipDuration = 60
@@ -1315,7 +1366,6 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
 	}
-
 	// target_fps: NULL = Source/native; otherwise 1..60 (mirrors create). Validated up
 	// front with the other pure-input checks so a bad value fails fast before any DB work.
 	var targetFPSArg any
@@ -1325,6 +1375,41 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 			return
 		}
 		targetFPSArg = *req.TargetFPS
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin schedule update: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	// Lock catalog metadata before the recording. Batch scheduling uses the same
+	// stream -> recording -> jobs order, so concurrent single and batch edits
+	// cannot deadlock. The recording is re-read under lock below.
+	var linkedStreamID int64
+	if err := tx.QueryRow(r.Context(), `
+		SELECT COALESCE(stream_id, 0)
+		FROM recordings
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID).Scan(&linkedStreamID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "recording not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording stream: %v", err))
+		return
+	}
+	var (
+		lockedCatalogTimezone string
+		lockedCatalogStream   bool
+	)
+	if linkedStreamID > 0 {
+		err := tx.QueryRow(r.Context(), `SELECT local_timezone FROM streams WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, linkedStreamID).Scan(&lockedCatalogTimezone)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock stream timezone: %v", err))
+			return
+		}
+		lockedCatalogStream = err == nil
 	}
 
 	// Confirm ownership and load the current capture window so an omitted start_at/
@@ -1336,16 +1421,49 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		curEndAt         *time.Time
 		namingProfileRaw string
 		activeWeekdays   recsched.WeekdaySet
+		catalogStreamID  int64
 	)
-	if err := s.pool.QueryRow(r.Context(), `
-		SELECT status, start_at, end_at, naming_profile, active_weekdays FROM recordings
-		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStatus, &curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays); err != nil {
+	if err := tx.QueryRow(r.Context(), `
+		SELECT rec.status, rec.start_at, rec.end_at, rec.naming_profile, rec.active_weekdays,
+		       COALESCE(rec.stream_id, 0)
+		FROM recordings rec
+		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
+		FOR UPDATE OF rec
+	`, id, principal.AccountID).Scan(&curStatus, &curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays, &catalogStreamID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
 		}
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
+		return
+	}
+	if catalogStreamID != linkedStreamID {
+		util.WriteError(w, http.StatusConflict, "recording stream changed; retry")
+		return
+	}
+	if catalogStreamID > 0 && !lockedCatalogStream {
+		catalogStreamID = 0
+	}
+	if timezone := strings.TrimSpace(lockedCatalogTimezone); timezone != "" {
+		cronTimezone = timezone
+	} else if catalogStreamID > 0 {
+		if requestedCronTimezone == "" {
+			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream %d requires a local timezone", catalogStreamID))
+			return
+		}
+		actualTimezone, persistErr := persistMissingCatalogTimezone(r.Context(), tx, catalogStreamID, requestedCronTimezone)
+		if persistErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("set stream timezone: %v", persistErr))
+			return
+		}
+		if actualTimezone != requestedCronTimezone {
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d already has timezone %s", catalogStreamID, actualTimezone))
+			return
+		}
+		cronTimezone = requestedCronTimezone
+	}
+	if cronTimezone == "" {
+		util.WriteError(w, http.StatusBadRequest, "cron_timezone is required when no catalog timezone is available")
 		return
 	}
 	namingProfile, err := recordingnaming.ParseProfile(namingProfileRaw)
@@ -1444,11 +1562,12 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		nextFireArg = nextFire
 	}
 
-	ct, err := s.pool.Exec(r.Context(), `
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE recordings
 		SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6,
 		    daily_window_start=$7, daily_window_end=$8, target_fps=$9,
 		    start_at=$10, end_at=$11, next_fire_at=$12,
+		    last_enqueued_fire_at=now(),
 		    status=CASE WHEN status='completed' THEN 'active' ELSE status END,
 		    consecutive_failures=CASE WHEN status='completed' THEN 0 ELSE consecutive_failures END,
 		    last_error_text=CASE WHEN status='completed' THEN '' ELSE last_error_text END,
@@ -1463,6 +1582,18 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	}
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusConflict, "recording status changed; refresh and try again")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE recording_jobs
+		SET status='canceled', lease_owner=NULL, lease_expires_at=NULL, updated_at=now()
+		WHERE recording_id=$1 AND status IN ('pending','leased')
+	`, id); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("cancel old schedule jobs: %v", err))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit schedule update: %v", err))
 		return
 	}
 
