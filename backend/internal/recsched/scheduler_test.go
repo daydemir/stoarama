@@ -498,6 +498,9 @@ func testSchedulerPool(t *testing.T) (*pgxpool.Pool, func()) {
 			status TEXT NOT NULL DEFAULT 'active',
 			start_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			end_at TIMESTAMPTZ,
+			active_weekdays SMALLINT NOT NULL DEFAULT 127,
+			completed_captured_clip_count BIGINT,
+			completed_expected_clip_count BIGINT,
 			last_enqueued_fire_at TIMESTAMPTZ,
 			next_fire_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

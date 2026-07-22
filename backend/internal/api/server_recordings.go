@@ -78,6 +78,7 @@ const recordingListSelectSQL = `
 		       WHEN rec.status='paused' THEN rec.paused_at
 		       ELSE LEAST(now(), COALESCE(rec.end_at, now()))
 		     END) AS captured_clip_count,
+		rec.completed_captured_clip_count, rec.completed_expected_clip_count,
 		rec.created_at, sd.managed,
 		rec.stream_id, st.name, st.location_text,
 		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''), rec.active_weekdays,
@@ -2053,52 +2054,54 @@ func resolveRecordingStreamURL(ctx context.Context, provider, streamURL, sourceP
 // "add a card to capture" state.
 func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, error) {
 	var (
-		id               int64
-		name             string
-		streamURL        string
-		storageDestID    int64
-		storageDestName  string
-		sourceKind       string
-		cronExpr         string
-		cronTimezone     string
-		clipDurationSec  int
-		targetFPS        *int
-		status           string
-		startAt          time.Time
-		endAt            *time.Time
-		nextFireAt       *time.Time
-		lastClipAt       *time.Time
-		lastErrorText    string
-		lastErrorAt      *time.Time
-		consecutiveFails int
-		hasPaymentMethod bool
-		recentClipCount  int64
-		pausedAt         *time.Time
-		capturedClips    int64
-		createdAt        time.Time
-		managed          bool
-		streamID         *int64
-		streamName       *string
-		streamLocation   *string
-		mode             string
-		dailyWindowStart string
-		dailyWindowEnd   string
-		activeWeekdays   recsched.WeekdaySet
-		retentionTier    string
-		delivery         string
-		captureVia       string
-		namingProfile    string
-		folderName       string
-		namingMetadata   []byte
-		hasRelayOnline   bool
-		relayNodeName    *string
+		id                int64
+		name              string
+		streamURL         string
+		storageDestID     int64
+		storageDestName   string
+		sourceKind        string
+		cronExpr          string
+		cronTimezone      string
+		clipDurationSec   int
+		targetFPS         *int
+		status            string
+		startAt           time.Time
+		endAt             *time.Time
+		nextFireAt        *time.Time
+		lastClipAt        *time.Time
+		lastErrorText     string
+		lastErrorAt       *time.Time
+		consecutiveFails  int
+		hasPaymentMethod  bool
+		recentClipCount   int64
+		pausedAt          *time.Time
+		capturedClips     int64
+		completedCaptured *int64
+		completedExpected *int64
+		createdAt         time.Time
+		managed           bool
+		streamID          *int64
+		streamName        *string
+		streamLocation    *string
+		mode              string
+		dailyWindowStart  string
+		dailyWindowEnd    string
+		activeWeekdays    recsched.WeekdaySet
+		retentionTier     string
+		delivery          string
+		captureVia        string
+		namingProfile     string
+		folderName        string
+		namingMetadata    []byte
+		hasRelayOnline    bool
+		relayNodeName     *string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
 		&sourceKind, &cronExpr, &cronTimezone, &clipDurationSec, &targetFPS,
 		&status, &startAt, &endAt, &nextFireAt, &lastClipAt,
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
-		&hasPaymentMethod, &recentClipCount, &pausedAt, &capturedClips, &createdAt, &managed,
+		&hasPaymentMethod, &recentClipCount, &pausedAt, &capturedClips, &completedCaptured, &completedExpected, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd, &activeWeekdays,
 		&retentionTier, &delivery,
@@ -2109,7 +2112,14 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 	}
 	now := time.Now().UTC()
 	coverageStart, coverageEnd := recordingCoverageWindow(status, startAt, endAt, pausedAt, now)
-	expectedClips, err := expectedRecordingClips(mode, cronExpr, cronTimezone, dailyWindowStart, dailyWindowEnd, activeWeekdays, clipDurationSec, startAt, coverageStart, coverageEnd)
+	expectedClips := int64(0)
+	var err error
+	if status == "completed" && completedCaptured != nil && completedExpected != nil {
+		capturedClips = *completedCaptured
+		expectedClips = *completedExpected
+	} else {
+		expectedClips, err = expectedRecordingClips(mode, cronExpr, cronTimezone, dailyWindowStart, dailyWindowEnd, activeWeekdays, clipDurationSec, startAt, coverageStart, coverageEnd)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("compute recording %d capture health: %w", id, err)
 	}

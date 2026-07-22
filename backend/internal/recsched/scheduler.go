@@ -97,12 +97,71 @@ func (s *Scheduler) tick(ctx context.Context) error {
 // state distinct from 'canceled' = user deleted) with next_fire_at cleared, and
 // its still-pending/leased jobs are canceled so the worker stops capturing it.
 func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) error {
-	if _, err := tx.Exec(ctx, `
-		UPDATE recordings
-		SET status='completed', next_fire_at=NULL, updated_at=now()
-		WHERE status='active' AND end_at IS NOT NULL AND end_at <= now()
-	`); err != nil {
-		return fmt.Errorf("auto-stop expired recordings: %w", err)
+	rows, err := tx.Query(ctx, `
+		SELECT rec.id, rec.mode, COALESCE(rec.cron_expr,''), rec.cron_timezone,
+		       rec.clip_duration_sec, to_char(rec.daily_window_start,'HH24:MI:SS'),
+		       to_char(rec.daily_window_end,'HH24:MI:SS'), rec.active_weekdays,
+		       rec.start_at, rec.end_at,
+		       (SELECT count(*) FROM recording_clips c
+		        WHERE c.recording_id=rec.id AND c.clip_start_at >= rec.start_at AND c.clip_start_at < rec.end_at)
+		FROM recordings rec
+		WHERE rec.status='active' AND rec.end_at IS NOT NULL AND rec.end_at <= now()
+		FOR UPDATE
+	`)
+	if err != nil {
+		return fmt.Errorf("load expired recordings: %w", err)
+	}
+	type expiredRecording struct {
+		id, captured             int64
+		mode, cronExpr, timezone string
+		clipDuration             int
+		dailyStart, dailyEnd     *string
+		weekdays                 WeekdaySet
+		startAt, endAt           time.Time
+	}
+	var expired []expiredRecording
+	for rows.Next() {
+		var rec expiredRecording
+		if err := rows.Scan(&rec.id, &rec.mode, &rec.cronExpr, &rec.timezone, &rec.clipDuration, &rec.dailyStart, &rec.dailyEnd, &rec.weekdays, &rec.startAt, &rec.endAt, &rec.captured); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan expired recording: %w", err)
+		}
+		expired = append(expired, rec)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate expired recordings: %w", err)
+	}
+	rows.Close()
+	for _, rec := range expired {
+		var startTOD, endTOD *TimeOfDay
+		if rec.mode == "continuous" {
+			if rec.dailyStart == nil || rec.dailyEnd == nil {
+				return fmt.Errorf("complete recording %d: continuous window missing", rec.id)
+			}
+			start, err := ParseTimeOfDay(*rec.dailyStart)
+			if err != nil {
+				return fmt.Errorf("complete recording %d: %w", rec.id, err)
+			}
+			end, err := ParseTimeOfDay(*rec.dailyEnd)
+			if err != nil {
+				return fmt.Errorf("complete recording %d: %w", rec.id, err)
+			}
+			startTOD, endTOD = &start, &end
+		}
+		expected, err := ExpectedClipCount(rec.mode, rec.cronExpr, rec.timezone, startTOD, endTOD, rec.weekdays, rec.clipDuration, rec.startAt, rec.startAt, rec.endAt)
+		if err != nil {
+			return fmt.Errorf("complete recording %d: %w", rec.id, err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE recordings
+			SET status='completed', next_fire_at=NULL,
+			    completed_captured_clip_count=$2, completed_expected_clip_count=$3,
+			    updated_at=now()
+			WHERE id=$1 AND status='active'
+		`, rec.id, rec.captured, expected); err != nil {
+			return fmt.Errorf("auto-stop recording %d: %w", rec.id, err)
+		}
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE recording_jobs
