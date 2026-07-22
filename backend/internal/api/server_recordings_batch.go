@@ -144,7 +144,6 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		return
 	}
 	requestNow := time.Now().UTC()
-	immediateStart := req.StartAt == nil || !req.StartAt.After(requestNow)
 	startAt := effectiveRecordingStart(req.StartAt, requestNow)
 	var endAt *time.Time
 	if req.EndAt != nil {
@@ -346,12 +345,10 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	items := make([]batchScheduleItem, 0, len(streams))
 	created, updated := 0, 0
 	now := time.Now().UTC()
-	if immediateStart {
-		startAt = now
-		if endAt != nil && !endAt.After(startAt) {
-			util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
-			return
-		}
+	startAt = effectiveRecordingStart(req.StartAt, now)
+	if endAt != nil && !endAt.After(startAt) {
+		util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+		return
 	}
 	for _, st := range streams {
 		captureVia := batchCaptureVia(st.sourceURL, st.provider, st.captureVia)

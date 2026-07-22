@@ -588,7 +588,6 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// open-ended when nil. When both are present, end_at must be strictly after
 	// start_at (mirrors the recordings_window_chk DB constraint).
 	requestNow := time.Now().UTC()
-	immediateStart := req.StartAt == nil || !req.StartAt.After(requestNow)
 	startAt := effectiveRecordingStart(req.StartAt, requestNow)
 	var endAtArg any
 	if req.EndAt != nil {
@@ -789,35 +788,6 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
-	if immediateStart {
-		startAt = time.Now().UTC()
-		if endAt, ok := endAtArg.(time.Time); ok && !endAt.After(startAt) {
-			util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
-			return
-		}
-	}
-
-	var nextFireArg any
-	if mode == "continuous" {
-		nextOpen, nerr := recsched.NextWindowOpenUTC(cronTimezone, dailyStart, startAt, endAtTime(endAtArg), time.Now().UTC())
-		if nerr != nil {
-			util.WriteError(w, http.StatusBadRequest, nerr.Error())
-			return
-		}
-		if !nextOpen.IsZero() {
-			nextFireArg = nextOpen
-		}
-	} else {
-		nextFire, nerr := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
-		if nerr != nil {
-			util.WriteError(w, http.StatusBadRequest, nerr.Error())
-			return
-		}
-		if !nextFire.IsZero() {
-			nextFireArg = nextFire
-		}
-	}
-
 	var existingID *int64
 	if catalogStreamID > 0 {
 		if err := s.pool.QueryRow(r.Context(), `
@@ -856,6 +826,32 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	persistNow := time.Now().UTC()
+	startAt = effectiveRecordingStart(req.StartAt, persistNow)
+	if endAt, ok := endAtArg.(time.Time); ok && !endAt.After(startAt) {
+		util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+		return
+	}
+	var nextFireArg any
+	if mode == "continuous" {
+		nextOpen, nerr := recsched.NextWindowOpenUTC(cronTimezone, dailyStart, startAt, endAtTime(endAtArg), persistNow)
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextOpen.IsZero() {
+			nextFireArg = nextOpen
+		}
+	} else {
+		nextFire, nerr := recsched.NextFireUTC(cronExpr, cronTimezone, persistNow)
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextFire.IsZero() {
+			nextFireArg = nextFire
+		}
+	}
 
 	var cronExprArg any
 	if mode != "continuous" {
@@ -1339,11 +1335,19 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	// Recompute next_fire_at with the mode-aware authority (NULL when the schedule has
 	// no upcoming fire, e.g. a window that ends before now).
 	var nextFireArg any
+	nextFireNow := time.Now().UTC()
+	if curStatus == "completed" {
+		startAt = effectiveRecordingStart(req.StartAt, nextFireNow)
+		if endAt, ok := endAtArg.(time.Time); ok && !endAt.After(startAt) {
+			util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+			return
+		}
+	}
 	var endAtForNext *time.Time
 	if t, ok := endAtArg.(time.Time); ok {
 		endAtForNext = &t
 	}
-	nextFire, nerr := nextFireForRecording(mode, cronExprForNext, cronTimezone, dwStartForNext, dwEndForNext, activeWeekdays, startAt, endAtForNext, time.Now().UTC())
+	nextFire, nerr := nextFireForRecording(mode, cronExprForNext, cronTimezone, dwStartForNext, dwEndForNext, activeWeekdays, startAt, endAtForNext, nextFireNow)
 	if nerr != nil {
 		util.WriteError(w, http.StatusBadRequest, nerr.Error())
 		return
