@@ -1,86 +1,117 @@
 #!/usr/bin/env python3
-"""Stoarama NAS pull client.
+"""Stoarama NAS pull client. Python standard library only."""
 
-MIT's on-prem Synology NAS is not inbound-reachable, so Stoarama records public
-streams to managed Cloudflare R2 and this client (running ON the NAS) PULLS each
-clip down, verifies it byte-for-byte, then asks Stoarama to RELEASE the managed
-copy. Confirm-before-release is mandatory: a clip is released only after it has
-been downloaded AND its byte count matches the API's recorded size_bytes. Release
-detaches the clip from the account (billing stops, it leaves the feed) but the
-Stoarama-side R2 object is KEPT; the client's local copy on the NAS is the working
-copy.
-
-Dependency-free by design: Python 3 standard library only (urllib, json, os,
-time, pathlib). No pip installs, so it runs unchanged in a python:3-slim
-container under Synology Container Manager.
-
-The loop drains an account-wide, forward-cursored clips feed:
-  GET  {BASE}/account/clips?after_id={cursor}&limit=200   (lists active clips)
-  GET  {BASE}{clip.download_path}                         (presigns the R2 GET)
-  POST {BASE}/account/recordings/{rid}/clips/{cid}/release (releases after pull)
-  POST {BASE}/account/connections/heartbeat              (status each tick)
-all with header `Authorization: Bearer {STOARAMA_API_KEY}` (a sir_ account key).
-
-Each tick the client posts a heartbeat {cursor_id, clips_pulled} so the Stoarama
-account UI can show this connection as healthy/stale and report progress. The
-heartbeat is best-effort: a failure is logged and never breaks the drain loop.
-
-The download endpoint returns JSON {"url": "<presigned>", "size_bytes": ...},
-not a 302 redirect, so we parse the body and fetch the `url` field.
-
-Environment:
-  STOARAMA_API_BASE         e.g. https://stoarama.com/api/v1   (required)
-  STOARAMA_API_KEY          sir_... account API key            (required)
-  STOARAMA_OUTPUT_DIR       clip destination dir (default /clips)
-  STOARAMA_STATE_FILE       cursor file       (default /state/cursor.json)
-  STOARAMA_POLL_INTERVAL_SEC  idle sleep seconds (default 60, i.e. 1 minute)
-  STOARAMA_DRY_RUN          "1" = read-only validate (default "0")
-
-DRY-RUN ("1"): download + verify every clip and log "would release", but never
-call release and never persist the cursor (it advances in memory only). This is
-the safe, repeatable connectivity/integrity check the operator runs first; it
-never releases anything and never loses its place. Set to "0" for normal operation.
-"""
-
+import argparse
+import concurrent.futures
+import fcntl
+import hashlib
 import json
 import os
+import shutil
+import signal
+import socket
 import sys
+import threading
 import time
 import urllib.error
-import urllib.request
 import urllib.parse
+import urllib.request
+from enum import Enum
 from pathlib import Path
 
+CLIENT_VERSION = "development"
 LIST_PAGE_LIMIT = 200
+DOWNLOAD_WORKERS = 4
 HTTP_TIMEOUT_SEC = 120
+HEARTBEAT_TIMEOUT_SEC = 20
+HEARTBEAT_INTERVAL_SEC = 30
+UPDATE_INTERVAL_SEC = 600
 ERROR_BACKOFF_SEC = 30
-# A named User-Agent is required: stoarama.com sits behind Cloudflare, which blocks
-# the stdlib default "Python-urllib/x" agent (HTTP 403, error code 1010). Every
-# request the client makes (API + presigned R2 GET) sets this so the loop works.
-USER_AGENT = "stoarama-nas-pull/1.0"
+USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 
 
-def env_str(name, default):
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    return value.strip()
+class Phase(str, Enum):
+    STARTING = "starting"
+    IDLE = "idle"
+    DRAINING = "draining"
+    UPDATING = "updating"
+    BLOCKED = "blocked"
+    DEGRADED = "degraded"
 
 
-def env_int(name, default):
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError:
-        log("WARN", "invalid int for %s=%r, using default %d" % (name, raw, default))
-        return default
+class PreviousExit(str, Enum):
+    UNKNOWN = "unknown"
+    CLEAN = "clean"
+    SELF_UPDATE = "self_update"
+    UNCLEAN_PROCESS = "unclean_process"
+    UNCLEAN_REBOOT = "unclean_reboot"
+
+
+class OutageClass(str, Enum):
+    DNS = "dns_failed"
+    TIMEOUT = "timeout"
+    CONNECTION = "connection"
+    HTTP = "http"
+    OTHER = "other"
+
+
+def utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def log(level, message):
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print("%s %s %s" % (stamp, level, message), flush=True)
+    print("%s %s %s" % (utc_now(), level, message), flush=True)
+
+
+def env_str(name, default):
+    value = os.environ.get(name, "").strip()
+    return value or default
+
+
+def env_int(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit("%s must be an integer" % name) from exc
+
+
+def fsync_dir(path):
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(str(temp), str(path))
+        fsync_dir(path.parent)
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("invalid state file %s: %s" % (path, exc)) from exc
 
 
 class Config:
@@ -88,277 +119,490 @@ class Config:
         self.api_base = env_str("STOARAMA_API_BASE", "").rstrip("/")
         self.api_key = env_str("STOARAMA_API_KEY", "")
         self.output_dir = Path(env_str("STOARAMA_OUTPUT_DIR", "/clips"))
-        self.state_file = Path(env_str("STOARAMA_STATE_FILE", "/state/cursor.json"))
-        # 60-second default cadence: we hold each clip only until the next pull, so
-        # this bounds managed footage to ~1 min per stream. At that hold time managed
-        # storage is effectively free, which is what the NAS storage price is based on.
+        self.state_dir = Path(env_str("STOARAMA_STATE_DIR", "/state"))
+        self.progress_file = self.state_dir / "progress.json"
+        self.legacy_progress_file = self.state_dir / "cursor.json"
+        self.runtime_file = self.state_dir / "runtime.json"
+        self.outage_file = self.state_dir / "outage.json"
+        self.current_file = self.state_dir / "stoarama_pull.py"
+        self.candidate_file = self.state_dir / "stoarama_pull.candidate.py"
+        self.previous_file = self.state_dir / "stoarama_pull.previous.py"
+        self.lock_file = self.state_dir / "client.lock"
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 60)
+        self.update_manifest_url = env_str(
+            "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
+        )
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
-        # The list response's download_path is a site-root-absolute path that already
-        # includes the /api/v1 prefix, so it is joined onto the ORIGIN (scheme+host),
-        # not onto api_base (which already ends in /api/v1). Joining it onto api_base
-        # would double the prefix to /api/v1/api/v1/... and 404.
-        parts = urllib.parse.urlsplit(self.api_base)
-        self.origin = "%s://%s" % (parts.scheme, parts.netloc) if parts.scheme else ""
+        self.is_candidate = env_str("STOARAMA_CANDIDATE", "0") == "1"
+        parsed = urllib.parse.urlsplit(self.api_base)
+        self.origin = "%s://%s" % (parsed.scheme, parsed.netloc) if parsed.scheme else ""
 
     def validate(self):
-        if not self.api_base:
-            raise SystemExit("STOARAMA_API_BASE is required (e.g. https://stoarama.com/api/v1)")
+        if not self.api_base or not self.origin:
+            raise SystemExit("STOARAMA_API_BASE must be an absolute URL")
         if not self.api_key:
-            raise SystemExit("STOARAMA_API_KEY is required (a sir_ account API key)")
+            raise SystemExit("STOARAMA_API_KEY is required")
+        if self.poll_interval_sec < 10 or self.poll_interval_sec > 3600:
+            raise SystemExit("STOARAMA_POLL_INTERVAL_SEC must be between 10 and 3600")
 
 
-def request_json(cfg, method, path_or_url, base=None, body=None):
-    """Call a Stoarama API endpoint with the Bearer key; return parsed JSON.
+def boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
 
-    path_or_url may be an absolute URL or a path joined onto base (default
-    api_base). The download_path from the list response already carries the
-    /api/v1 prefix, so it is passed with base=cfg.origin to avoid doubling it.
-    `body`, if given, is JSON-encoded and sent with Content-Type application/json
-    (used by the heartbeat POST). Raises urllib.error.HTTPError / URLError on
-    transport failure so the caller can back off rather than crash.
-    """
-    if base is None:
-        base = cfg.api_base
+
+def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TIMEOUT_SEC, authenticate=True):
+    base = cfg.api_base if base is None else base
     url = path_or_url if path_or_url.startswith("http") else base + path_or_url
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, method=method, data=data)
-    req.add_header("Authorization", "Bearer " + cfg.api_key)
     req.add_header("User-Agent", USER_AGENT)
+    if authenticate:
+        req.add_header("Authorization", "Bearer " + cfg.api_key)
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
-        body_bytes = resp.read()
-    if not body_bytes:
-        return {}
-    return json.loads(body_bytes.decode("utf-8"))
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read()
+    return json.loads(raw.decode("utf-8")) if raw else {}
 
 
-def send_heartbeat(cfg, cursor_id, clips_pulled):
-    """Best-effort POST of the connection heartbeat. Never raises: a heartbeat
-    failure must not interrupt the drain loop (logged + swallowed)."""
+def classify_transport_error(exc):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, socket.gaierror):
+        return OutageClass.DNS
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return OutageClass.TIMEOUT
+    if isinstance(reason, (ConnectionError, ConnectionRefusedError, ConnectionResetError)):
+        return OutageClass.CONNECTION
+    if isinstance(exc, urllib.error.HTTPError):
+        return OutageClass.HTTP
+    return OutageClass.OTHER
+
+
+class Runtime:
+    def __init__(self, cfg):
+        progress = read_json(cfg.progress_file, {})
+        if not progress and cfg.legacy_progress_file.exists():
+            progress = read_json(cfg.legacy_progress_file, {})
+        self.lock = threading.Lock()
+        self.cursor_id = max(0, int(progress.get("after_id", 0)))
+        self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
+        self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
+        self.phase = Phase.STARTING
+        self.last_success_at = progress.get("last_success_at")
+        self.last_error = ""
+        self.last_error_at = None
+        self.started_at = utc_now()
+        self.boot_id = boot_id()
+        self.previous_exit = self._previous_exit(cfg)
+        self.heartbeat_succeeded = False
+        self.list_succeeded = False
+
+    def _previous_exit(self, cfg):
+        prior = read_json(cfg.runtime_file, {})
+        status = prior.get("exit")
+        if status == PreviousExit.CLEAN.value:
+            return PreviousExit.CLEAN
+        if status == PreviousExit.SELF_UPDATE.value:
+            return PreviousExit.SELF_UPDATE
+        if not prior:
+            return PreviousExit.UNKNOWN
+        if prior.get("boot_id") == self.boot_id:
+            return PreviousExit.UNCLEAN_PROCESS
+        return PreviousExit.UNCLEAN_REBOOT
+
+    def set_phase(self, phase):
+        with self.lock:
+            self.phase = phase
+
+    def set_error(self, message):
+        with self.lock:
+            self.last_error = str(message)[:1000]
+            self.last_error_at = utc_now()
+            self.phase = Phase.DEGRADED
+
+    def add_successes(self, cfg, cursor_id, successes):
+        with self.lock:
+            self.cursor_id = max(self.cursor_id, cursor_id)
+            self.clips_pulled += len(successes)
+            self.bytes_pulled += sum(item[1] for item in successes)
+            self.last_success_at = utc_now()
+            self.last_error = ""
+            self.last_error_at = None
+            snapshot = self.progress_payload()
+        if not cfg.dry_run:
+            atomic_write(cfg.progress_file, json.dumps(snapshot, separators=(",", ":")).encode("utf-8"))
+
+    def progress_payload(self):
+        return {
+            "after_id": self.cursor_id,
+            "clips_pulled": self.clips_pulled,
+            "bytes_pulled": self.bytes_pulled,
+            "last_success_at": self.last_success_at,
+        }
+
+    def heartbeat_payload(self, outage):
+        with self.lock:
+            payload = {
+                "cursor_id": self.cursor_id,
+                "clips_pulled": self.clips_pulled,
+                "bytes_pulled": self.bytes_pulled,
+                "client_version": CLIENT_VERSION,
+                "client_started_at": self.started_at,
+                "client_boot_id": self.boot_id,
+                "client_phase": self.phase.value,
+                "client_previous_exit": self.previous_exit.value,
+                "client_last_success_at": self.last_success_at,
+                "client_last_error": self.last_error,
+                "client_last_error_at": self.last_error_at,
+            }
+        if outage:
+            payload["last_outage"] = outage
+        return payload
+
+
+def mark_runtime(cfg, runtime, exit_status="running"):
+    atomic_write(
+        cfg.runtime_file,
+        json.dumps({"boot_id": runtime.boot_id, "started_at": runtime.started_at, "exit": exit_status}).encode("utf-8"),
+    )
+
+
+def check_storage(cfg):
+    for path in (cfg.output_dir, cfg.state_dir):
+        if not path.exists() or not path.is_dir():
+            raise RuntimeError("required storage directory is missing: %s" % path)
+        if not os.path.ismount(str(path)):
+            raise RuntimeError("required storage directory is not mounted: %s" % path)
+        probe = path / (".stoarama-write-check-%d" % os.getpid())
+        atomic_write(probe, b"ok")
+        probe.unlink()
+        fsync_dir(path)
+    if cfg.output_dir.resolve() == cfg.state_dir.resolve():
+        raise RuntimeError("clip and state mounts must be different")
+
+
+def acquire_lock(cfg):
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    handle = open(cfg.lock_file, "a+", encoding="utf-8")
     try:
-        request_json(
-            cfg,
-            "POST",
-            "/account/connections/heartbeat",
-            body={"cursor_id": int(cursor_id), "clips_pulled": int(clips_pulled)},
-        )
-    except urllib.error.HTTPError as exc:
-        log("WARN", "heartbeat failed: HTTP %s (continuing)" % exc.code)
-    except urllib.error.URLError as exc:
-        log("WARN", "heartbeat failed: %s (continuing)" % exc)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise RuntimeError("another NAS pull client already holds %s" % cfg.lock_file) from exc
+    return handle
 
 
-def load_cursor(cfg):
-    try:
-        data = json.loads(cfg.state_file.read_text())
-        after_id = int(data.get("after_id", 0))
-        if after_id < 0:
-            return 0
-        return after_id
-    except FileNotFoundError:
-        return 0
-    except (ValueError, OSError) as exc:
-        log("WARN", "could not read state file %s (%s); starting from 0" % (cfg.state_file, exc))
-        return 0
-
-
-def persist_cursor(cfg, after_id):
-    cfg.state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cfg.state_file.with_suffix(cfg.state_file.suffix + ".tmp")
-    tmp.write_text(json.dumps({"after_id": after_id}))
-    os.replace(str(tmp), str(cfg.state_file))
-
-
-def clip_relative_path(clip):
-    rel = str(clip.get("relative_path", "")).strip().strip("/")
-    if not rel:
-        return Path(str(int(clip["recording_id"]))) / clip_filename(clip)
-    parts = rel.split("/")
-    for part in parts:
-        if part in ("", ".", "..") or "\\" in part:
-            raise ValueError("clip %d invalid relative_path segment %r" % (int(clip["clip_id"]), part))
+def valid_relative_path(clip):
+    raw = str(clip.get("relative_path", "")).strip().strip("/")
+    if not raw:
+        raise ValueError("clip %d has no relative_path" % int(clip["clip_id"]))
+    parts = raw.split("/")
+    if any(part in ("", ".", "..") or "\\" in part for part in parts):
+        raise ValueError("clip %d has invalid relative_path" % int(clip["clip_id"]))
     return Path(*parts)
 
 
-def clip_filename(clip):
-    start = str(clip.get("clip_start_at", "")).strip()
-    safe = "".join(ch if ch.isalnum() else "-" for ch in start).strip("-")
-    if not safe:
-        safe = "clip-%d" % int(clip["clip_id"])
-    return safe + ".mp4"
-
-
-def download_to_temp(presigned_url, temp_path):
-    """Stream the presigned URL to temp_path; return the byte count written."""
-    req = urllib.request.Request(presigned_url, method="GET")
-    req.add_header("User-Agent", USER_AGENT)
-    written = 0
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp, open(temp_path, "wb") as out:
+def sha256_file(path):
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as source:
         while True:
-            chunk = resp.read(1024 * 1024)
+            chunk = source.read(1024 * 1024)
             if not chunk:
                 break
-            out.write(chunk)
-            written += len(chunk)
-    return written
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
 
 
-def process_clip(cfg, clip):
-    """Download, verify, atomically place, and (unless dry-run) release one clip.
-
-    Returns True on a clean (download + verify) so the caller may advance the
-    cursor; False on any mismatch or error so the cursor stays put and the clip
-    is retried next tick. The release step happens only after a verified download.
-    """
-    clip_id = int(clip["clip_id"])
-    recording_id = int(clip["recording_id"])
-    expected_bytes = int(clip["size_bytes"])
-    download_path = clip["download_path"]
-
-    # 1. Presign the R2 GET via the existing download endpoint (returns JSON).
-    #    download_path is site-root-absolute (already includes /api/v1), so it is
-    #    joined onto the origin, not api_base, to avoid a doubled /api/v1 prefix.
-    try:
-        presigned = request_json(cfg, "GET", download_path, base=cfg.origin)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 410:
-            # Clip already released/purged upstream: nothing to pull, safe to advance.
-            log("WARN", "clip %d no longer available upstream (410); advancing cursor" % clip_id)
-            return True
-        log("ERROR", "presign clip %d failed: HTTP %s" % (clip_id, exc.code))
+def verified_file(path, expected_bytes, expected_sha):
+    if not path.exists():
         return False
-    presigned_url = presigned.get("url")
-    if not presigned_url:
-        log("ERROR", "presign clip %d returned no url" % clip_id)
-        return False
-
-    final_path = cfg.output_dir / clip_relative_path(clip)
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = final_path.parent / (final_path.name + ".part")
-
-    # 2. Download the bytes to a temp file under OUTPUT_DIR.
-    try:
-        written = download_to_temp(presigned_url, str(temp_path))
-    except (urllib.error.URLError, OSError) as exc:
-        log("ERROR", "download clip %d failed: %s" % (clip_id, exc))
-        _safe_unlink(temp_path)
-        return False
-
-    # 3. Verify byte count == size_bytes (confirm-before-purge). On mismatch:
-    #    log, do NOT purge, do NOT advance; retry next tick.
-    if written != expected_bytes:
-        log(
-            "ERROR",
-            "clip %d size mismatch: got %d bytes, expected %d; not purging, will retry"
-            % (clip_id, written, expected_bytes),
-        )
-        _safe_unlink(temp_path)
-        return False
-
-    # 4. Atomically move temp -> final.
-    os.replace(str(temp_path), str(final_path))
-
-    if cfg.dry_run:
-        log(
-            "INFO",
-            "DRY-RUN clip_id=%d recording_id=%d bytes=%d saved=%s would release (no release, cursor not persisted)"
-            % (clip_id, recording_id, written, final_path),
-        )
-        return True
-
-    # 5. Release the managed copy (detach from the account; the upstream R2 object
-    #    is KEPT). Already-released is also 200 (idempotent); a 410 here likewise
-    #    means the upstream copy is no longer on the account, which is the goal.
-    release_path = "/account/recordings/%d/clips/%d/release" % (recording_id, clip_id)
-    try:
-        request_json(cfg, "POST", release_path)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 410:
-            log("INFO", "clip %d already released upstream (410)" % clip_id)
-        else:
-            log("ERROR", "release clip %d failed: HTTP %s; keeping local copy, will retry" % (clip_id, exc.code))
-            return False
-    except urllib.error.URLError as exc:
-        log("ERROR", "release clip %d failed: %s; keeping local copy, will retry" % (clip_id, exc))
-        return False
-
-    log(
-        "INFO",
-        "clip_id=%d recording_id=%d bytes=%d saved=%s released"
-        % (clip_id, recording_id, written, final_path),
-    )
+    size, digest = sha256_file(path)
+    if size != expected_bytes or digest != expected_sha:
+        raise RuntimeError("existing file does not match API checksum: %s" % path)
     return True
 
 
-def _safe_unlink(path):
+def download_verified(url, temp_path, expected_bytes, expected_sha):
+    digest = hashlib.sha256()
+    written = 0
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
     try:
-        os.unlink(str(path))
-    except OSError:
-        pass
-
-
-def run_tick(cfg, cursor, total_pulled):
-    """Drain one page of clips from `cursor`. Returns (new_cursor, total_pulled).
-
-    For each clip in order: process it; on success advance the cursor, bump the
-    running total, and (unless dry-run) persist the cursor; on failure stop the
-    page so the failed clip is the next one retried (strict in-order, drain-once).
-    A heartbeat is posted after the page so the account UI tracks progress.
-    """
-    page = request_json(cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (cursor, LIST_PAGE_LIMIT))
-    clips = page.get("clips", [])
-    if not clips:
-        send_heartbeat(cfg, cursor, total_pulled)
-        return cursor, total_pulled
-
-    log("INFO", "fetched %d clip(s) after_id=%d" % (len(clips), cursor))
-    for clip in clips:
-        if not process_clip(cfg, clip):
-            # Stop here; cursor stays at the last successful clip so this one is
-            # retried first next tick.
-            break
-        cursor = int(clip["clip_id"])
-        total_pulled += 1
-        if not cfg.dry_run:
-            persist_cursor(cfg, cursor)
-    send_heartbeat(cfg, cursor, total_pulled)
-    return cursor, total_pulled
-
-
-def main():
-    cfg = Config()
-    cfg.validate()
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-
-    mode = "DRY-RUN (no releases, cursor not persisted)" if cfg.dry_run else "LIVE"
-    cursor = load_cursor(cfg)
-    total_pulled = 0
-    log("INFO", "stoarama pull starting mode=%s api_base=%s output_dir=%s cursor=%d"
-        % (mode, cfg.api_base, cfg.output_dir, cursor))
-
-    while True:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response, open(temp_path, "wb") as out:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                digest.update(chunk)
+                written += len(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+    except BaseException:
         try:
-            new_cursor, total_pulled = run_tick(cfg, cursor, total_pulled)
-            if new_cursor == cursor:
-                # Empty page (or first clip failed): idle before polling again.
-                time.sleep(cfg.poll_interval_sec)
-            cursor = new_cursor
-        except urllib.error.HTTPError as exc:
-            log("ERROR", "list page failed: HTTP %s; backing off %ds" % (exc.code, ERROR_BACKOFF_SEC))
-            time.sleep(ERROR_BACKOFF_SEC)
-        except urllib.error.URLError as exc:
-            log("ERROR", "list page failed: %s; backing off %ds" % (exc, ERROR_BACKOFF_SEC))
-            time.sleep(ERROR_BACKOFF_SEC)
-        except KeyboardInterrupt:
-            log("INFO", "interrupted; exiting")
-            return
-        except Exception as exc:  # noqa: BLE001 - never crash-loop the daemon
-            log("ERROR", "unexpected error: %s; backing off %ds" % (exc, ERROR_BACKOFF_SEC))
-            time.sleep(ERROR_BACKOFF_SEC)
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    if written != expected_bytes or digest.hexdigest() != expected_sha:
+        temp_path.unlink()
+        raise RuntimeError("download checksum mismatch")
+
+
+def release_clip(cfg, recording_id, clip_id):
+    path = "/account/recordings/%d/clips/%d/release" % (recording_id, clip_id)
+    try:
+        request_json(cfg, "POST", path)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404, 410):
+            raise
+
+
+def process_clip(cfg, clip, release=True):
+    clip_id = int(clip["clip_id"])
+    recording_id = int(clip["recording_id"])
+    expected_bytes = int(clip["size_bytes"])
+    expected_sha = str(clip.get("sha256", "")).lower()
+    if expected_bytes < 0 or len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
+        raise ValueError("clip %d has invalid integrity metadata" % clip_id)
+    final_path = cfg.output_dir / valid_relative_path(clip)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    if not verified_file(final_path, expected_bytes, expected_sha):
+        presigned = request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
+        url = str(presigned.get("url", ""))
+        if not url:
+            raise RuntimeError("clip %d presign returned no URL" % clip_id)
+        temp_path = final_path.with_name(final_path.name + ".part-%d" % clip_id)
+        download_verified(url, temp_path, expected_bytes, expected_sha)
+        os.replace(str(temp_path), str(final_path))
+        fsync_dir(final_path.parent)
+    if release and not cfg.dry_run:
+        release_clip(cfg, recording_id, clip_id)
+    suffix = " dry-run" if cfg.dry_run else (" released" if release else " ready")
+    log("INFO", "clip_id=%d bytes=%d saved=%s%s" % (clip_id, expected_bytes, final_path, suffix))
+    return clip_id, expected_bytes
+
+
+def drain_page(cfg, runtime):
+    page = request_json(
+        cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
+    )
+    clips = page.get("clips", [])
+    if not isinstance(clips, list):
+        raise RuntimeError("clips response is not a list")
+    runtime.list_succeeded = True
+    if not clips:
+        return False
+    runtime.set_phase(Phase.DRAINING)
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+        futures = [executor.submit(process_clip, cfg, clip, False) for clip in clips]
+        for clip, future in zip(clips, futures):
+            try:
+                results.append((int(clip["clip_id"]), future.result(), None))
+            except Exception as exc:
+                results.append((int(clip.get("clip_id", 0)), None, exc))
+                log("ERROR", "clip_id=%s failed: %s" % (clip.get("clip_id", "?"), exc))
+    cursor = runtime.cursor_id
+    successes = []
+    recording_by_clip = {int(clip["clip_id"]): int(clip["recording_id"]) for clip in clips}
+    for clip_id, result, error in results:
+        if error is not None:
+            break
+        try:
+            if not cfg.dry_run:
+                release_clip(cfg, recording_by_clip[clip_id], clip_id)
+        except Exception as exc:
+            log("ERROR", "clip_id=%d release failed: %s" % (clip_id, exc))
+            break
+        successes.append(result)
+        cursor = clip_id
+    if successes:
+        runtime.add_successes(cfg, cursor, successes)
+    if any(error for _, _, error in results):
+        runtime.set_error("%d of %d clips failed; see client logs" % (sum(error is not None for _, _, error in results), len(results)))
+    return bool(successes)
+
+
+def load_outage(cfg):
+    return read_json(cfg.outage_file, None)
+
+
+def heartbeat_loop(cfg, runtime, stop_event):
+    outage = load_outage(cfg)
+    while not stop_event.is_set():
+        try:
+            request_json(
+                cfg,
+                "POST",
+                "/account/connections/heartbeat",
+                body=runtime.heartbeat_payload(outage),
+                timeout=HEARTBEAT_TIMEOUT_SEC,
+            )
+            runtime.heartbeat_succeeded = True
+            if outage:
+                outage["recovered_at"] = utc_now()
+                request_json(
+                    cfg,
+                    "POST",
+                    "/account/connections/heartbeat",
+                    body=runtime.heartbeat_payload(outage),
+                    timeout=HEARTBEAT_TIMEOUT_SEC,
+                )
+                outage = None
+                try:
+                    cfg.outage_file.unlink()
+                except FileNotFoundError:
+                    pass
+                log("INFO", "heartbeat recovered")
+        except Exception as exc:
+            classification = classify_transport_error(exc).value
+            now = utc_now()
+            if not outage:
+                outage = {"class": classification, "started_at": now, "failure_count": 0}
+            outage["class"] = classification
+            outage["failure_count"] = int(outage.get("failure_count", 0)) + 1
+            atomic_write(cfg.outage_file, json.dumps(outage).encode("utf-8"))
+            log("WARN", "heartbeat failed class=%s count=%d: %s" % (classification, outage["failure_count"], exc))
+        stop_event.wait(HEARTBEAT_INTERVAL_SEC)
+
+
+def validate_manifest(manifest):
+    version = str(manifest.get("version", ""))
+    artifact = str(manifest.get("artifact", ""))
+    sha256 = str(manifest.get("sha256", "")).lower()
+    if not version or len(version) > 64 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for ch in version):
+        raise RuntimeError("invalid update version")
+    if not artifact or "/" in artifact or "\\" in artifact or artifact in (".", ".."):
+        raise RuntimeError("invalid update artifact")
+    if len(sha256) != 64 or any(ch not in "0123456789abcdef" for ch in sha256):
+        raise RuntimeError("invalid update sha256")
+    return version, artifact, sha256
+
+
+def stage_update(cfg):
+    manifest = request_json(cfg, "GET", cfg.update_manifest_url, authenticate=False, timeout=30)
+    version, artifact, expected_sha = validate_manifest(manifest)
+    if version == CLIENT_VERSION:
+        return None
+    artifact_url = cfg.update_manifest_url.rsplit("/", 1)[0] + "/" + artifact
+    req = urllib.request.Request(artifact_url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        source = response.read()
+    if hashlib.sha256(source).hexdigest() != expected_sha:
+        raise RuntimeError("update artifact checksum mismatch")
+    compile(source, artifact, "exec")
+    atomic_write(cfg.candidate_file, source, mode=0o700)
+    log("INFO", "staged NAS pull client version=%s" % version)
+    return version
+
+
+def update_loop(cfg, runtime, stop_event, update_ready):
+    while not stop_event.wait(UPDATE_INTERVAL_SEC):
+        try:
+            if stage_update(cfg):
+                runtime.set_phase(Phase.UPDATING)
+                update_ready.set()
+                return
+        except Exception as exc:
+            log("WARN", "self-update check failed: %s" % exc)
+
+
+def promote_candidate(cfg):
+    if not cfg.is_candidate:
+        return
+    if cfg.current_file.exists():
+        atomic_write(cfg.previous_file, cfg.current_file.read_bytes(), mode=0o700)
+    os.replace(str(cfg.candidate_file), str(cfg.current_file))
+    fsync_dir(cfg.state_dir)
+    cfg.is_candidate = False
+    log("INFO", "promoted candidate version=%s" % CLIENT_VERSION)
+
+
+def exec_candidate(cfg, runtime):
+    mark_runtime(cfg, runtime, PreviousExit.SELF_UPDATE.value)
+    env = os.environ.copy()
+    env["STOARAMA_CANDIDATE"] = "1"
+    os.execve(sys.executable, [sys.executable, str(cfg.candidate_file), "run"], env)
+
+
+def run(cfg):
+    cfg.validate()
+    lock_handle = acquire_lock(cfg)
+    runtime = Runtime(cfg)
+    mark_runtime(cfg, runtime)
+    stop_event = threading.Event()
+    update_ready = threading.Event()
+
+    def stop(_signum, _frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    heartbeat = threading.Thread(target=heartbeat_loop, args=(cfg, runtime, stop_event), daemon=True)
+    heartbeat.start()
+    updater = threading.Thread(target=update_loop, args=(cfg, runtime, stop_event, update_ready), daemon=True)
+    updater.start()
+    try:
+        while not stop_event.is_set():
+            try:
+                check_storage(cfg)
+            except RuntimeError as exc:
+                runtime.set_phase(Phase.BLOCKED)
+                runtime.set_error(str(exc))
+                log("ERROR", "storage blocked: %s" % exc)
+                stop_event.wait(cfg.poll_interval_sec)
+                continue
+            try:
+                progress = drain_page(cfg, runtime)
+                if cfg.is_candidate and runtime.heartbeat_succeeded and runtime.list_succeeded:
+                    promote_candidate(cfg)
+                if update_ready.is_set():
+                    exec_candidate(cfg, runtime)
+                runtime.set_phase(Phase.IDLE)
+                if not progress:
+                    stop_event.wait(cfg.poll_interval_sec)
+            except Exception as exc:
+                runtime.set_error(str(exc))
+                log("ERROR", "drain failed: %s" % exc)
+                stop_event.wait(ERROR_BACKOFF_SEC)
+    finally:
+        stop_event.set()
+        heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
+        mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
+        lock_handle.close()
+    return 0
+
+
+def check(cfg):
+    cfg.validate()
+    check_storage(cfg)
+    page = request_json(cfg, "GET", "/account/clips?after_id=0&limit=1")
+    if not isinstance(page.get("clips", []), list):
+        raise RuntimeError("invalid clips response")
+    print("NAS storage mounts and API access are healthy")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Stoarama NAS pull client")
+    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update"), default="run")
+    args = parser.parse_args(argv)
+    if args.command == "version":
+        print(CLIENT_VERSION)
+        return 0
+    cfg = Config()
+    if args.command == "check":
+        return check(cfg)
+    if args.command == "self-update":
+        cfg.validate()
+        print(stage_update(cfg) or "already-current")
+        return 0
+    return run(cfg)
 
 
 if __name__ == "__main__":

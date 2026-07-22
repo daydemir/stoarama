@@ -56,3 +56,12 @@ Once Render, domain, and email are live:
 - enroll first local recorder and inference nodes
 - move active workloads from the old stack
 - refine the web IA so it mirrors `stoaramactl`
+
+## Operational TODOs
+
+- [ ] Make relay outage diagnosis deterministic: persist and report Linux boot
+  ID, process start/clean-shutdown markers, systemd exit result/code/signal,
+  last successful heartbeat/capture/upload/update timestamps, and a bounded
+  relay error tail on recovery. This must distinguish DNS/timeout loss,
+  process crash, OOM/signal, service restart, and host reboot without copying
+  credentials or requiring inbound SSH.

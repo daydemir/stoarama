@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -86,42 +87,104 @@ func clampPollIntervalSec(v int) int {
 	return v
 }
 
-// connectionComposeSnippet renders the ready-to-paste docker-compose stanza for the
-// NAS pull client, prefilled with the request-derived API base and the one-time
-// token. It is SELF-CONTAINED: it runs the stock public python:3-slim image and the
-// container fetches the stdlib-only client (stoarama_pull.py) from the public repo
-// at start, so pasting this compose is the only step. No Dockerfile, no source
-// files, no build. It mirrors clients/nas-pull/docker-compose.yml exactly (minus the
-// real token). Keep the client URL in lockstep with that file.
-func connectionComposeSnippet(apiBase, token string, pollIntervalSec int) string {
+const nasPythonImage = "python:3.13-slim-bookworm@sha256:9d7f287598e1a5a978c015ee176d8216435aaf335ed69ac3c38dd1bbb10e8d64"
+
+// This bootstrap is intentionally tiny and frozen in the compose file. It refreshes
+// the durable client from the checksum-verified release channel when possible, but always falls
+// back to the last valid local client if the release endpoint is unavailable.
+const nasClientBootstrap = `import hashlib,json,os,sys,urllib.request
+state='/state'
+current='/state/stoarama_pull.py'
+previous='/state/stoarama_pull.previous.py'
+runtime='/state/runtime.json'
+candidate='/state/stoarama_pull.py.candidate'
+base='https://stoarama.com/nas/download/'
+
+def atomic(path, data):
+    temp=path+'.new'
+    with open(temp,'wb') as output:
+        output.write(data); output.flush(); os.fsync(output.fileno())
+    os.replace(temp,path)
+
+def fetch_latest():
+    with urllib.request.urlopen(base+'latest.json',timeout=30) as response:
+        manifest=json.load(response)
+    artifact=str(manifest.get('artifact',''))
+    expected=str(manifest.get('sha256','')).lower()
+    if not artifact or '/' in artifact or '\\' in artifact or len(expected)!=64:
+        raise RuntimeError('invalid NAS release manifest')
+    with urllib.request.urlopen(base+artifact,timeout=30) as response:
+        source=response.read()
+    if hashlib.sha256(source).hexdigest()!=expected:
+        raise RuntimeError('NAS client checksum mismatch')
+    compile(source,artifact,'exec')
+    return source
+
+os.makedirs(state,exist_ok=True)
+recovered=False
+try:
+    with open(runtime,'r') as status_file:
+        status=json.load(status_file)
+    if os.path.exists(previous) and status.get('exit') in ('running','self_update'):
+        with open(previous,'rb') as old_file:
+            source=old_file.read()
+        compile(source,previous,'exec')
+        atomic(current,source)
+        if os.path.exists(candidate): os.unlink(candidate)
+        recovered=True
+        print('NAS bootstrap restored previous client after unclean run',file=sys.stderr,flush=True)
+except (FileNotFoundError,ValueError,TypeError):
+    pass
+if not recovered:
+  try:
+    source=fetch_latest()
+  except Exception as exc:
+    if not os.path.exists(current):
+        raise
+    with open(current,'rb') as existing:
+        compile(existing.read(),current,'exec')
+    print('NAS bootstrap update skipped: %s' % exc,file=sys.stderr,flush=True)
+  else:
+    old=None
+    if os.path.exists(current):
+        with open(current,'rb') as existing:
+            old=existing.read()
+    if old != source:
+        if old is not None:
+            atomic(previous,old)
+        atomic(current,source)
+os.execv(sys.executable,[sys.executable,current,'run'])`
+
+func connectionComposeSnippet(apiBase, token string, connectionID int64, pollIntervalSec int) string {
+	bootstrap := "      " + strings.ReplaceAll(nasClientBootstrap, "\n", "\n      ")
 	return fmt.Sprintf(`services:
   stoarama-pull:
-    image: python:3-slim
+    image: %s
     restart: always
     environment:
       STOARAMA_API_BASE: "%s"
       STOARAMA_API_KEY: "%s"
+      STOARAMA_CONNECTION_ID: "%d"
       STOARAMA_OUTPUT_DIR: "/clips"
-      STOARAMA_STATE_FILE: "/state/cursor.json"
+      STOARAMA_STATE_DIR: "/state"
       STOARAMA_POLL_INTERVAL_SEC: "%d"
+      STOARAMA_UPDATE_MANIFEST_URL: "https://stoarama.com/nas/download/latest.json"
       STOARAMA_DRY_RUN: "0"
       PYTHONUNBUFFERED: "1"
-    command: ["python3", "-c", "import urllib.request, runpy; urllib.request.urlretrieve('https://raw.githubusercontent.com/daydemir/stoarama/main/clients/nas-pull/stoarama_pull.py', '/tmp/stoarama_pull.py'); runpy.run_path('/tmp/stoarama_pull.py', run_name='__main__')"]
+    command:
+      - python3
+      - -c
+      - |
+%s
     volumes:
       - /volume1/stoarama-clips:/clips
       - /volume1/stoarama-state:/state
-`, apiBase, token, pollIntervalSec)
+`, nasPythonImage, apiBase, token, connectionID, pollIntervalSec, bootstrap)
 }
 
 // connectionPublicAPIBase is the public /api/v1 base the NAS pull client targets:
 // the user-facing host stoarama.com. Used only for the copyable compose snippet.
 const connectionPublicAPIBase = "https://stoarama.com/api/v1"
-
-// connectionAPIBase returns the public /api/v1 base for the compose snippet. Both
-// the create and rotate handlers call it so the snippet host stays consistent.
-func (s *Server) connectionAPIBase(r *http.Request) string {
-	return connectionPublicAPIBase
-}
 
 type connectionCreateRequest struct {
 	Label           string `json:"label"`
@@ -155,6 +218,15 @@ func (s *Server) handleAccountConnectionsCreate(w http.ResponseWriter, r *http.R
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	var exists bool
+	if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM connections WHERE account_id=$1 AND kind='nas_pull')`, principal.AccountID).Scan(&exists); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check connection: %v", err))
+		return
+	}
+	if exists {
+		util.WriteError(w, http.StatusConflict, "this account already has a NAS connection")
+		return
+	}
 
 	keyID, prefix, token, err := mintAccountAPIKey(r.Context(), tx, principal.AccountID, label, accountScopePull, nil)
 	if err != nil {
@@ -167,6 +239,11 @@ func (s *Server) handleAccountConnectionsCreate(w http.ResponseWriter, r *http.R
 		VALUES ($1, 'nas_pull', $2, $3, $4, $5)
 		RETURNING id
 	`, principal.AccountID, label, keyID, pollInterval, principal.AccountID).Scan(&connID); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			util.WriteError(w, http.StatusConflict, "this account already has a NAS connection")
+			return
+		}
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create connection: %v", err))
 		return
 	}
@@ -183,13 +260,12 @@ func (s *Server) handleAccountConnectionsCreate(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	apiBase := s.connectionAPIBase(r)
 	util.WriteJSON(w, http.StatusCreated, map[string]any{
 		"id":                connID,
 		"label":             label,
 		"poll_interval_sec": pollInterval,
 		"token":             token,
-		"compose_snippet":   connectionComposeSnippet(apiBase, token, pollInterval),
+		"compose_snippet":   connectionComposeSnippet(connectionPublicAPIBase, token, connID, pollInterval),
 	})
 }
 
@@ -203,7 +279,12 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, label, last_seen_at, clips_pulled, last_cursor_id, poll_interval_sec, created_at
+		SELECT id, label, last_seen_at, clips_pulled, bytes_pulled, last_cursor_id,
+		       poll_interval_sec, client_version, client_started_at, client_boot_id,
+		       client_phase, client_previous_exit, client_last_success_at,
+		       client_last_error, client_last_error_at, last_outage_class,
+		       last_outage_started_at, last_outage_recovered_at,
+		       last_outage_failure_count, created_at
 		FROM connections
 		WHERE account_id=$1
 		ORDER BY created_at DESC, id DESC
@@ -221,11 +302,27 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			label           string
 			lastSeenAt      *time.Time
 			clipsPulled     int64
+			bytesPulled     int64
 			lastCursorID    int64
 			pollIntervalSec int
+			clientVersion   string
+			clientStartedAt *time.Time
+			clientBootID    string
+			clientPhase     string
+			previousExit    string
+			lastSuccessAt   *time.Time
+			lastError       string
+			lastErrorAt     *time.Time
+			outageClass     string
+			outageStartedAt *time.Time
+			outageRecovered *time.Time
+			outageFailures  int
 			createdAt       time.Time
 		)
-		if err := rows.Scan(&id, &label, &lastSeenAt, &clipsPulled, &lastCursorID, &pollIntervalSec, &createdAt); err != nil {
+		if err := rows.Scan(&id, &label, &lastSeenAt, &clipsPulled, &bytesPulled, &lastCursorID,
+			&pollIntervalSec, &clientVersion, &clientStartedAt, &clientBootID, &clientPhase,
+			&previousExit, &lastSuccessAt, &lastError, &lastErrorAt, &outageClass,
+			&outageStartedAt, &outageRecovered, &outageFailures, &createdAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan connection: %v", err))
 			return
 		}
@@ -241,14 +338,27 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			}
 		}
 		items = append(items, map[string]any{
-			"id":                id,
-			"label":             label,
-			"last_seen_at":      lastSeen,
-			"clips_pulled":      clipsPulled,
-			"last_cursor_id":    lastCursorID,
-			"poll_interval_sec": pollIntervalSec,
-			"health":            health,
-			"created_at":        createdAt.UTC(),
+			"id":                        id,
+			"label":                     label,
+			"last_seen_at":              lastSeen,
+			"clips_pulled":              clipsPulled,
+			"bytes_pulled":              bytesPulled,
+			"last_cursor_id":            lastCursorID,
+			"poll_interval_sec":         pollIntervalSec,
+			"health":                    health,
+			"created_at":                createdAt.UTC(),
+			"client_version":            clientVersion,
+			"client_started_at":         clientStartedAt,
+			"client_boot_id":            clientBootID,
+			"client_phase":              clientPhase,
+			"client_previous_exit":      previousExit,
+			"client_last_success_at":    lastSuccessAt,
+			"client_last_error":         lastError,
+			"client_last_error_at":      lastErrorAt,
+			"last_outage_class":         outageClass,
+			"last_outage_started_at":    outageStartedAt,
+			"last_outage_recovered_at":  outageRecovered,
+			"last_outage_failure_count": outageFailures,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -327,13 +437,12 @@ func (s *Server) handleAccountConnectionRotate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	apiBase := s.connectionAPIBase(r)
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"id":                id,
 		"label":             label,
 		"poll_interval_sec": pollInterval,
 		"token":             token,
-		"compose_snippet":   connectionComposeSnippet(apiBase, token, pollInterval),
+		"compose_snippet":   connectionComposeSnippet(connectionPublicAPIBase, token, id, pollInterval),
 	})
 }
 
@@ -389,8 +498,53 @@ func (s *Server) handleAccountConnectionDelete(w http.ResponseWriter, r *http.Re
 }
 
 type connectionHeartbeatRequest struct {
-	CursorID    int64 `json:"cursor_id"`
-	ClipsPulled int64 `json:"clips_pulled"`
+	CursorID           int64                      `json:"cursor_id"`
+	ClipsPulled        int64                      `json:"clips_pulled"`
+	BytesPulled        int64                      `json:"bytes_pulled"`
+	ClientVersion      string                     `json:"client_version"`
+	ClientStartedAt    *time.Time                 `json:"client_started_at"`
+	ClientBootID       string                     `json:"client_boot_id"`
+	ClientPhase        string                     `json:"client_phase"`
+	ClientPreviousExit string                     `json:"client_previous_exit"`
+	ClientLastSuccess  *time.Time                 `json:"client_last_success_at"`
+	ClientLastError    string                     `json:"client_last_error"`
+	ClientLastErrorAt  *time.Time                 `json:"client_last_error_at"`
+	LastOutage         *connectionHeartbeatOutage `json:"last_outage"`
+}
+
+type connectionHeartbeatOutage struct {
+	Class        string     `json:"class"`
+	StartedAt    *time.Time `json:"started_at"`
+	RecoveredAt  *time.Time `json:"recovered_at"`
+	FailureCount int        `json:"failure_count"`
+}
+
+var connectionPhases = map[string]bool{"starting": true, "idle": true, "draining": true, "updating": true, "blocked": true, "degraded": true}
+var connectionPreviousExits = map[string]bool{"unknown": true, "clean": true, "self_update": true, "unclean_process": true, "unclean_reboot": true}
+var connectionOutageClasses = map[string]bool{"dns_failed": true, "timeout": true, "connection": true, "http": true, "other": true}
+
+func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
+	if req.CursorID < 0 || req.ClipsPulled < 0 || req.BytesPulled < 0 {
+		return errors.New("cursor_id, clips_pulled, and bytes_pulled must be non-negative")
+	}
+	if req.ClientVersion == "" {
+		return nil // Backward compatibility for the old NAS client during rollout.
+	}
+	if len(req.ClientVersion) > 64 || !relayArtifactName.MatchString(req.ClientVersion) {
+		return errors.New("invalid client_version")
+	}
+	if len(req.ClientBootID) > 128 || !connectionPhases[req.ClientPhase] || !connectionPreviousExits[req.ClientPreviousExit] {
+		return errors.New("invalid NAS client telemetry")
+	}
+	if len(req.ClientLastError) > 1000 {
+		return errors.New("client_last_error is too long")
+	}
+	if req.LastOutage != nil {
+		if !connectionOutageClasses[req.LastOutage.Class] || req.LastOutage.FailureCount < 1 || req.LastOutage.StartedAt == nil {
+			return errors.New("invalid last_outage")
+		}
+	}
+	return nil
 }
 
 // handleAccountConnectionHeartbeat is called by the pull client with its scoped
@@ -413,18 +567,44 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.CursorID < 0 || req.ClipsPulled < 0 {
-		util.WriteError(w, http.StatusBadRequest, "cursor_id and clips_pulled must be non-negative")
+	if err := validateConnectionHeartbeat(req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	var outageClass string
+	var outageStartedAt, outageRecoveredAt *time.Time
+	var outageFailureCount int
+	if req.LastOutage != nil {
+		outageClass = req.LastOutage.Class
+		outageStartedAt = req.LastOutage.StartedAt
+		outageRecoveredAt = req.LastOutage.RecoveredAt
+		outageFailureCount = req.LastOutage.FailureCount
 	}
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE connections
 		SET last_seen_at=now(),
 		    last_cursor_id=GREATEST(last_cursor_id, $1),
 		    clips_pulled=GREATEST(clips_pulled, $2),
+		    bytes_pulled=GREATEST(bytes_pulled, $3),
+		    client_version=CASE WHEN $4 <> '' THEN $4 ELSE client_version END,
+		    client_started_at=CASE WHEN $4 <> '' THEN $5 ELSE client_started_at END,
+		    client_boot_id=CASE WHEN $4 <> '' THEN $6 ELSE client_boot_id END,
+		    client_phase=CASE WHEN $4 <> '' THEN $7 ELSE client_phase END,
+		    client_previous_exit=CASE WHEN $4 <> '' THEN $8 ELSE client_previous_exit END,
+		    client_last_success_at=CASE WHEN $4 <> '' THEN $9 ELSE client_last_success_at END,
+		    client_last_error=CASE WHEN $4 <> '' THEN $10 ELSE client_last_error END,
+		    client_last_error_at=CASE WHEN $4 <> '' THEN $11 ELSE client_last_error_at END,
+		    last_outage_class=CASE WHEN $12 <> '' THEN $12 ELSE last_outage_class END,
+		    last_outage_started_at=CASE WHEN $12 <> '' THEN $13 ELSE last_outage_started_at END,
+		    last_outage_recovered_at=CASE WHEN $12 <> '' THEN $14 ELSE last_outage_recovered_at END,
+		    last_outage_failure_count=CASE WHEN $12 <> '' THEN $15 ELSE last_outage_failure_count END,
 		    updated_at=now()
-		WHERE api_key_id=$3 AND account_id=$4
-	`, req.CursorID, req.ClipsPulled, *principal.APIKeyID, principal.AccountID)
+		WHERE api_key_id=$16 AND account_id=$17
+	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
+		req.ClientStartedAt, req.ClientBootID, req.ClientPhase, req.ClientPreviousExit,
+		req.ClientLastSuccess, req.ClientLastError, req.ClientLastErrorAt,
+		outageClass, outageStartedAt, outageRecoveredAt, outageFailureCount,
+		*principal.APIKeyID, principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
