@@ -556,7 +556,7 @@ func retryableUploadError(ctx context.Context, err error) bool {
 		return statusErr.Code == 408 || statusErr.Code == 425 || statusErr.Code == 429 || statusErr.Code >= 500
 	}
 	var networkErr net.Error
-	return errors.As(err, &networkErr) || errors.Is(err, context.DeadlineExceeded)
+	return (errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // isAlreadyIngested reports whether an ingest error is the server's 409 dedup

@@ -97,6 +97,7 @@ func TestRetryableUploadError(t *testing.T) {
 		{err: &apihttp.StatusError{Code: 429}, want: true},
 		{err: &apihttp.StatusError{Code: 403}, want: false},
 		{err: &net.DNSError{Err: "temporary", IsTemporary: true}, want: true},
+		{err: &net.DNSError{Err: "permanent"}, want: false},
 		{err: context.DeadlineExceeded, want: true},
 	}
 	for _, tc := range tests {
