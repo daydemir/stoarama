@@ -2,8 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -158,24 +163,45 @@ func TestIsPullScopedPrincipal(t *testing.T) {
 	}
 }
 
-func TestConnectionComposeUsesDurablePinnedBootstrap(t *testing.T) {
+func TestConnectionComposeUsesDurableClientLauncher(t *testing.T) {
 	compose := connectionComposeSnippet(connectionPublicAPIBase, "sir_test", 27, 60)
 	for _, want := range []string{
 		nasPythonImage,
 		`STOARAMA_CONNECTION_ID: "27"`,
 		`STOARAMA_STATE_DIR: "/state"`,
 		`https://stoarama.com/nas/download/latest.json`,
-		`current='/state/stoarama_pull.py'`,
-		`os.execv(sys.executable`,
+		nasBootstrapURL,
+		nasBootstrapSHA256,
+		`NAS bootstrap checksum mismatch`,
+		`cached NAS bootstrap checksum mismatch`,
+		`os.replace(temporary,p)`,
+		`exec(compile(source`,
 	} {
 		if !strings.Contains(compose, want) {
 			t.Errorf("compose missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"raw.githubusercontent.com", "python:3-slim\n"} {
+	for _, forbidden := range []string{"raw.githubusercontent.com", "python:3-slim\n", "command: |"} {
 		if strings.Contains(compose, forbidden) {
 			t.Errorf("compose contains unsafe mutable dependency %q", forbidden)
 		}
+	}
+}
+
+func TestNASLauncherUsesVerifiedCacheWhenDownloadIsUnavailable(t *testing.T) {
+	state := t.TempDir()
+	bootstrap := []byte("pass\n")
+	sum := sha256.Sum256(bootstrap)
+	command := strings.NewReplacer(
+		"/state", filepath.ToSlash(state),
+		nasBootstrapURL, "http://127.0.0.1:1/unavailable",
+		nasBootstrapSHA256, hex.EncodeToString(sum[:]),
+	).Replace(nasLaunchCommand)
+	if err := os.WriteFile(filepath.Join(state, "stoarama-bootstrap-v1.py"), bootstrap, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("python3", "-c", command).CombinedOutput(); err != nil {
+		t.Fatalf("offline cached bootstrap failed: %v (%s)", err, output)
 	}
 }
 
