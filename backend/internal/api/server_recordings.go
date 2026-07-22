@@ -546,7 +546,8 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		cronTimezone = timezone
 	}
 	if cronTimezone == "" {
-		cronTimezone = "UTC"
+		util.WriteError(w, http.StatusBadRequest, "cron_timezone is required when no catalog timezone is available")
+		return
 	}
 	mode := strings.TrimSpace(req.Mode)
 	if mode == "" {
@@ -1342,9 +1343,6 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	cronExpr := strings.TrimSpace(req.CronExpr)
 	requestedCronTimezone := strings.TrimSpace(req.CronTimezone)
 	cronTimezone := requestedCronTimezone
-	if cronTimezone == "" {
-		cronTimezone = "UTC"
-	}
 	clipDuration := req.ClipDurationSec
 	if clipDuration == 0 {
 		clipDuration = 60
@@ -1414,6 +1412,10 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 			return
 		}
 		cronTimezone = requestedCronTimezone
+	}
+	if cronTimezone == "" {
+		util.WriteError(w, http.StatusBadRequest, "cron_timezone is required when no catalog timezone is available")
+		return
 	}
 	namingProfile, err := recordingnaming.ParseProfile(namingProfileRaw)
 	if err != nil {

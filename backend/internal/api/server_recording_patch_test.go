@@ -244,6 +244,20 @@ func TestRecordingScheduleUpdate(t *testing.T) {
 		t.Fatalf("persisted stream timezone=%q, want Europe/London", persistedTimezone)
 	}
 
+	unlinkedRecID := insertPatchRecording(t, pool, ownerAccountID, destID, "managed")
+	unlinkedBody := map[string]any{"mode": "sampled", "cron_expr": "*/10 * * * *", "clip_duration_sec": 300}
+	rec = httptest.NewRecorder()
+	s.handleAccountRecordingSchedule(rec, schedulePatchReq(unlinkedRecID, ownerAccountID, unlinkedBody))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unlinked omitted timezone: status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	unlinkedBody["cron_timezone"] = "UTC"
+	rec = httptest.NewRecorder()
+	s.handleAccountRecordingSchedule(rec, schedulePatchReq(unlinkedRecID, ownerAccountID, unlinkedBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlinked explicit UTC: status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
 	// Foreign account cannot edit -> 404.
 	rec = httptest.NewRecorder()
 	s.handleAccountRecordingSchedule(rec, schedulePatchReq(recID, foreignAccountID, body))
