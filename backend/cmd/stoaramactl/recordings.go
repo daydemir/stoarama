@@ -17,16 +17,18 @@ import (
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recordings naming get|set|preview | schedule-batch --spec FILE")
+		log.Fatalf("usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE")
 	}
 	if args[0] == "schedule-batch" {
 		runRecordingScheduleBatch(ctx, cfg, args[1:])
 		return
 	}
 	if len(args) < 2 || args[0] != "naming" {
-		log.Fatalf("usage: stoaramactl recordings naming get|set|preview | schedule-batch --spec FILE")
+		log.Fatalf("usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE")
 	}
 	switch args[1] {
+	case "allocate":
+		runRecordingNamingAllocate(ctx, cfg, args[2:])
 	case "preview":
 		runRecordingNamingPreview(args[2:])
 	case "get":
@@ -36,6 +38,39 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingNamingAllocate(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordings naming allocate", flag.ExitOnError)
+	accountID := fs.Int64("account-id", 0, "organization account id")
+	streamID := fs.Int64("stream-id", 0, "catalog stream id")
+	_ = fs.Parse(args)
+	if *accountID <= 0 || *streamID <= 0 {
+		log.Fatalf("--account-id and --stream-id are required")
+	}
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Fatalf("begin plaza id allocation: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM streams
+		WHERE id=$1 AND deleted_at IS NULL
+		FOR UPDATE
+	`, *streamID).Scan(streamID); err != nil {
+		log.Fatalf("lock catalog stream: %v", err)
+	}
+	plazaID, err := recordingnaming.EnsureStreamPlazaID(ctx, tx, *accountID, *streamID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatalf("commit plaza id allocation: %v", err)
+	}
+	fmt.Printf("account_id=%d stream_id=%d plaza_id=%s\n", *accountID, *streamID, plazaID)
 }
 
 type recordingScheduleMode string
@@ -222,7 +257,8 @@ func runRecordingNamingPreview(args []string) {
 	metadata := namingMetadataFlags(fs)
 	_ = fs.Parse(args)
 
-	profile, folderName, metadataBytes := mustNamingInputs(*profileRaw, *folderNameRaw, *recordingID, metadata)
+	profile := mustNamingProfile(*profileRaw)
+	folderName, metadataBytes := mustBuildNaming(profile, *folderNameRaw, *recordingID, metadata)
 	clipStart, err := time.Parse(time.RFC3339, strings.TrimSpace(*clipStartRaw))
 	if err != nil {
 		log.Fatalf("parse --clip-start: %v", err)
@@ -284,27 +320,61 @@ func runRecordingNamingSet(ctx context.Context, cfg config.Config, args []string
 	if *id <= 0 {
 		log.Fatalf("--id is required")
 	}
-	profile, folderName, metadataBytes := mustNamingInputs(*profileRaw, *folderNameRaw, *id, metadata)
+	profile := mustNamingProfile(*profileRaw)
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Fatalf("begin naming update: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var accountID, streamID int64
+	if err := tx.QueryRow(ctx, `SELECT account_id, COALESCE(stream_id, 0) FROM recordings WHERE id=$1`, *id).Scan(&accountID, &streamID); err != nil {
+		log.Fatalf("load recording owner: %v", err)
+	}
+	if streamID > 0 {
+		if err := tx.QueryRow(ctx, `SELECT id FROM streams WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, streamID).Scan(&streamID); err != nil {
+			log.Fatalf("lock catalog stream: %v", err)
+		}
+	}
 	var mode, cronExpr, dailyWindowStart, dailyWindowEnd string
 	var clipDuration int
-	if err := pool.QueryRow(ctx, `
-		SELECT mode, COALESCE(cron_expr, ''), clip_duration_sec,
+	var lockedAccountID, lockedStreamID int64
+	if err := tx.QueryRow(ctx, `
+		SELECT account_id, COALESCE(stream_id, 0), mode, COALESCE(cron_expr, ''), clip_duration_sec,
 		       COALESCE(to_char(daily_window_start, 'HH24:MI:SS'), ''),
 		       COALESCE(to_char(daily_window_end, 'HH24:MI:SS'), '')
 		FROM recordings WHERE id=$1
-	`, *id).Scan(&mode, &cronExpr, &clipDuration, &dailyWindowStart, &dailyWindowEnd); err != nil {
+		FOR UPDATE
+	`, *id).Scan(&lockedAccountID, &lockedStreamID, &mode, &cronExpr, &clipDuration, &dailyWindowStart, &dailyWindowEnd); err != nil {
 		log.Fatalf("load recording schedule: %v", err)
 	}
+	if lockedAccountID != accountID || lockedStreamID != streamID {
+		log.Fatalf("recording owner or stream changed; retry")
+	}
+	if profile == recordingnaming.ProfilePlazaHourlyV1 {
+		if streamID > 0 {
+			plazaID, err := recordingnaming.EnsureStreamPlazaID(ctx, tx, accountID, streamID)
+			if err != nil {
+				log.Fatal(err)
+			}
+			metadata.PlazaID = plazaID
+		} else if err := recordingnaming.ValidateManualPlazaID(ctx, tx, accountID, *id, metadata.PlazaID); err != nil {
+			log.Fatal(err)
+		}
+	}
+	folderName, metadataBytes := mustBuildNaming(profile, *folderNameRaw, *id, metadata)
 	if err := recordingnaming.ValidateSchedule(profile, mode, cronExpr, clipDuration, dailyWindowStart, dailyWindowEnd); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		UPDATE recordings SET naming_profile=$2, folder_name=$3, naming_metadata_jsonb=$4, updated_at=now()
 		WHERE id=$1
 	`, *id, profile.String(), folderName, metadataBytes); err != nil {
 		log.Fatalf("update recording naming: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatalf("commit naming update: %v", err)
 	}
 	fmt.Printf("recording_id=%d naming_profile=%s folder_name=%s\n", *id, profile.String(), folderName)
 }
@@ -319,15 +389,7 @@ func namingMetadataFlags(fs *flag.FlagSet) *recordingnaming.Metadata {
 	return out
 }
 
-func mustNamingInputs(profileRaw, folderNameRaw string, recordingID int64, metadata *recordingnaming.Metadata) (recordingnaming.Profile, string, []byte) {
-	profile := recordingnaming.ProfileStoaramaV1
-	if strings.TrimSpace(profileRaw) != "" {
-		parsed, err := recordingnaming.ParseProfile(profileRaw)
-		if err != nil {
-			log.Fatalf("parse --profile: %v", err)
-		}
-		profile = parsed
-	}
+func mustBuildNaming(profile recordingnaming.Profile, folderNameRaw string, recordingID int64, metadata *recordingnaming.Metadata) (string, []byte) {
 	folderName, err := recordingnaming.BuildFolderName(profile, recordingID, *metadata, folderNameRaw)
 	if err != nil {
 		log.Fatalf("build folder name: %v", err)
@@ -336,5 +398,16 @@ func mustNamingInputs(profileRaw, folderNameRaw string, recordingID int64, metad
 	if err != nil {
 		log.Fatalf("marshal metadata: %v", err)
 	}
-	return profile, folderName, metadataBytes
+	return folderName, metadataBytes
+}
+
+func mustNamingProfile(raw string) recordingnaming.Profile {
+	if strings.TrimSpace(raw) == "" {
+		return recordingnaming.ProfileStoaramaV1
+	}
+	profile, err := recordingnaming.ParseProfile(raw)
+	if err != nil {
+		log.Fatalf("parse --profile: %v", err)
+	}
+	return profile
 }

@@ -73,6 +73,26 @@ func TestRecordingsComposerUsesCatalogTimezone(t *testing.T) {
 	}
 }
 
+func TestRecordingsComposerAutofillsCatalogNaming(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"Assigned automatically for this organization",
+		"csv.continent",
+		"fill(els.namingCountry, stream.location_country || csv.country);",
+		"fill(els.namingCity, stream.location_city || csv.city);",
+		"els.namingPlazaID.readOnly = false;",
+		"els.namingPlazaID.placeholder = '08';",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing catalog naming marker %q", marker)
+		}
+	}
+}
+
 func TestRecordingAndStreamPagesShowLocalScheduleTime(t *testing.T) {
 	recordings, err := loadHTMLPage("recordings.html")
 	if err != nil {
