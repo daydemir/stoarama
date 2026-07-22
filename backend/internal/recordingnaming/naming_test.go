@@ -103,6 +103,13 @@ func TestBuildFolderNameValidatesPlazaMetadataWithCustomFolder(t *testing.T) {
 	}
 }
 
+func TestPlazaIDMustBePositive(t *testing.T) {
+	metadata := Metadata{PlazaID: "0", Continent: "Europe", Country: "Italy", City: "Assisi", PlazaName: "Town Square"}
+	if err := metadata.ValidatePlazaHourly(); err == nil {
+		t.Fatal("expected zero plaza ID to be rejected")
+	}
+}
+
 func TestAllowedClipDuration(t *testing.T) {
 	for _, sec := range []int{5, 60, 300, 600, 900} {
 		if !IsAllowedClipDuration(sec) {

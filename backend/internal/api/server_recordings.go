@@ -227,6 +227,82 @@ func resolveRecordingNaming(req *recordingNamingRequest, recordingID int64) (rec
 	return profile, folderName, metadataBytes, nil
 }
 
+type catalogNamingDefaults struct {
+	Continent string
+	Country   string
+	City      string
+	PlazaName string
+}
+
+type catalogRecordingDefaults struct {
+	URL           string
+	Provider      string
+	SourcePageURL string
+	Timezone      string
+	Naming        catalogNamingDefaults
+}
+
+type recordingQueryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func loadCatalogRecordingDefaults(ctx context.Context, q recordingQueryRower, streamID int64, forUpdate bool) (catalogRecordingDefaults, error) {
+	lock := ""
+	if forUpdate {
+		lock = " FOR UPDATE"
+	}
+	var defaults catalogRecordingDefaults
+	err := q.QueryRow(ctx, `
+		SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,''), local_timezone,
+		       COALESCE(NULLIF(metadata_jsonb->>'continent',''), NULLIF(metadata_jsonb#>>'{csv_values,continent}',''), ''),
+		       COALESCE(location_country,''), COALESCE(location_city,''), name
+		FROM streams
+		WHERE id=$1 AND deleted_at IS NULL`+lock,
+		streamID,
+	).Scan(
+		&defaults.URL,
+		&defaults.Provider,
+		&defaults.SourcePageURL,
+		&defaults.Timezone,
+		&defaults.Naming.Continent,
+		&defaults.Naming.Country,
+		&defaults.Naming.City,
+		&defaults.Naming.PlazaName,
+	)
+	return defaults, err
+}
+
+func applyCatalogNamingDefaults(req *recordingNamingRequest, defaults catalogNamingDefaults) {
+	if req == nil {
+		return
+	}
+	if strings.TrimSpace(req.Metadata.Continent) == "" {
+		req.Metadata.Continent = strings.TrimSpace(defaults.Continent)
+	}
+	if strings.TrimSpace(req.Metadata.Country) == "" {
+		req.Metadata.Country = strings.TrimSpace(defaults.Country)
+	}
+	if strings.TrimSpace(req.Metadata.City) == "" {
+		req.Metadata.City = strings.TrimSpace(defaults.City)
+	}
+	if strings.TrimSpace(req.Metadata.PlazaName) == "" {
+		req.Metadata.PlazaName = strings.TrimSpace(defaults.PlazaName)
+	}
+}
+
+func requestsAutomaticPlazaID(req *recordingNamingRequest, streamID int64) bool {
+	return streamID > 0 && req != nil && strings.TrimSpace(req.Profile) == recordingnaming.ProfilePlazaHourlyV1.String()
+}
+
+func resolveRecordingNamingForValidation(req *recordingNamingRequest, streamID int64) (recordingnaming.Profile, string, []byte, error) {
+	if !requestsAutomaticPlazaID(req, streamID) {
+		return resolveRecordingNaming(req, 0)
+	}
+	copy := *req
+	copy.Metadata.PlazaID = "1"
+	return resolveRecordingNaming(&copy, 0)
+}
+
 func namingPayload(profile string, folderName string, metadataBytes []byte) (map[string]any, error) {
 	metadata, err := recordingnaming.ParseMetadata(metadataBytes)
 	if err != nil {
@@ -499,14 +575,14 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	var catalogProvider string
 	var catalogSourcePageURL string
 	var catalogTimezone string
+	var namingDefaults catalogNamingDefaults
 	streamURL := strings.TrimSpace(req.StreamURL)
 	if req.StreamID != nil {
 		if *req.StreamID <= 0 {
 			util.WriteError(w, http.StatusBadRequest, "stream_id is invalid")
 			return
 		}
-		var catalogURL, provider, sourcePageURL string
-		err := s.pool.QueryRow(r.Context(), `SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,''), local_timezone FROM streams WHERE id=$1 AND deleted_at IS NULL`, *req.StreamID).Scan(&catalogURL, &provider, &sourcePageURL, &catalogTimezone)
+		catalog, err := loadCatalogRecordingDefaults(r.Context(), s.pool, *req.StreamID, false)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				util.WriteError(w, http.StatusNotFound, "catalog stream not found")
@@ -515,16 +591,19 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load catalog stream: %v", err))
 			return
 		}
-		streamURL = strings.TrimSpace(catalogURL)
+		streamURL = strings.TrimSpace(catalog.URL)
 		if streamURL == "" {
 			util.WriteError(w, http.StatusBadRequest, "catalog stream has no source_url")
 			return
 		}
 		streamIDArg = *req.StreamID
 		catalogStreamID = *req.StreamID
-		catalogProvider = provider
-		catalogSourcePageURL = sourcePageURL
+		catalogProvider = catalog.Provider
+		catalogSourcePageURL = catalog.SourcePageURL
+		catalogTimezone = catalog.Timezone
+		namingDefaults = catalog.Naming
 	}
+	applyCatalogNamingDefaults(req.Naming, namingDefaults)
 	if streamURL == "" {
 		util.WriteError(w, http.StatusBadRequest, "stream_url is required")
 		return
@@ -615,7 +694,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
 	}
-	namingProfile, folderName, namingMetadata, err := resolveRecordingNaming(req.Naming, 0)
+	namingProfile, folderName, namingMetadata, err := resolveRecordingNamingForValidation(req.Naming, catalogStreamID)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -931,6 +1010,24 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		}
 		if actualTimezone != cronTimezone {
 			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d already has timezone %s", catalogStreamID, actualTimezone))
+			return
+		}
+	}
+	if requestsAutomaticPlazaID(req.Naming, catalogStreamID) {
+		plazaID, plazaErr := recordingnaming.EnsureStreamPlazaID(r.Context(), tx, principal.AccountID, catalogStreamID)
+		if plazaErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, plazaErr.Error())
+			return
+		}
+		req.Naming.Metadata.PlazaID = plazaID
+		namingProfile, folderName, namingMetadata, err = resolveRecordingNaming(req.Naming, 0)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else if namingProfile == recordingnaming.ProfilePlazaHourlyV1 {
+		if validateErr := recordingnaming.ValidateManualPlazaID(r.Context(), tx, principal.AccountID, 0, req.Naming.Metadata.PlazaID); validateErr != nil {
+			util.WriteError(w, http.StatusConflict, validateErr.Error())
 			return
 		}
 	}
@@ -1621,20 +1718,49 @@ func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	profile, folderName, metadataBytes, err := resolveRecordingNaming(&req, id)
+	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin naming update: %v", err))
 		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	var linkedStreamID int64
+	if err := tx.QueryRow(r.Context(), `
+		SELECT COALESCE(stream_id, 0)
+		FROM recordings
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID).Scan(&linkedStreamID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "recording not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording stream: %v", err))
+		return
+	}
+	if linkedStreamID > 0 {
+		catalog, err := loadCatalogRecordingDefaults(r.Context(), tx, linkedStreamID, true)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusConflict, "catalog stream changed; retry")
+				return
+			}
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load catalog naming metadata: %v", err))
+			return
+		}
+		applyCatalogNamingDefaults(&req, catalog.Naming)
 	}
 	var mode, cronExpr, dailyWindowStart, dailyWindowEnd string
 	var clipDuration int
-	if err := s.pool.QueryRow(r.Context(), `
+	var lockedStreamID int64
+	if err := tx.QueryRow(r.Context(), `
 		SELECT mode, COALESCE(cron_expr, ''), clip_duration_sec,
 		       COALESCE(to_char(daily_window_start, 'HH24:MI:SS'), ''),
-		       COALESCE(to_char(daily_window_end, 'HH24:MI:SS'), '')
+		       COALESCE(to_char(daily_window_end, 'HH24:MI:SS'), ''),
+		       COALESCE(stream_id, 0)
 		FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&mode, &cronExpr, &clipDuration, &dailyWindowStart, &dailyWindowEnd); err != nil {
+		FOR UPDATE
+	`, id, principal.AccountID).Scan(&mode, &cronExpr, &clipDuration, &dailyWindowStart, &dailyWindowEnd, &lockedStreamID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
@@ -1642,11 +1768,34 @@ func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
+	if lockedStreamID != linkedStreamID {
+		util.WriteError(w, http.StatusConflict, "recording stream changed; retry")
+		return
+	}
+	if requestsAutomaticPlazaID(&req, linkedStreamID) {
+		plazaID, plazaErr := recordingnaming.EnsureStreamPlazaID(r.Context(), tx, principal.AccountID, linkedStreamID)
+		if plazaErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, plazaErr.Error())
+			return
+		}
+		req.Metadata.PlazaID = plazaID
+	}
+	profile, folderName, metadataBytes, err := resolveRecordingNaming(&req, id)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if linkedStreamID == 0 && profile == recordingnaming.ProfilePlazaHourlyV1 {
+		if validateErr := recordingnaming.ValidateManualPlazaID(r.Context(), tx, principal.AccountID, id, req.Metadata.PlazaID); validateErr != nil {
+			util.WriteError(w, http.StatusConflict, validateErr.Error())
+			return
+		}
+	}
 	if err := recordingnaming.ValidateSchedule(profile, mode, cronExpr, clipDuration, dailyWindowStart, dailyWindowEnd); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ct, err := s.pool.Exec(r.Context(), `
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE recordings
 		SET naming_profile=$3, folder_name=$4, naming_metadata_jsonb=$5, updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
@@ -1657,6 +1806,10 @@ func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Req
 	}
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit naming update: %v", err))
 		return
 	}
 	s.writeRecordingJSON(w, r, id, principal.AccountID)

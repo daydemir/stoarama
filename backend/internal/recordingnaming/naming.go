@@ -128,8 +128,9 @@ func (m Metadata) ValidatePlazaHourly() error {
 			return fmt.Errorf("naming.%s is required for plaza_hourly_v1", field.name)
 		}
 	}
-	if _, err := strconv.Atoi(m.PlazaID); err != nil {
-		return fmt.Errorf("naming.plaza_id must be numeric")
+	plazaID, err := strconv.Atoi(m.PlazaID)
+	if err != nil || plazaID <= 0 || strings.Trim(m.PlazaID, "0123456789") != "" {
+		return fmt.Errorf("naming.plaza_id must be a positive integer")
 	}
 	return nil
 }

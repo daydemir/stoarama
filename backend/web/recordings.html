@@ -793,7 +793,7 @@
         <div id="plazaHourlyNamingFields" class="hidden">
           <div class="hint" style="margin-bottom:10px;">Plaza hourly supports sampled clips with Custom schedule <span class="mono">0 8-19 * * *</span>, or continuous recording with any daily window and 1, 5, or 10 min clips.</div>
           <div class="grid-2">
-            <div class="field"><label for="namingPlazaID">Plaza ID required, numeric</label><input id="namingPlazaID" type="text" placeholder="08" /></div>
+            <div class="field"><label for="namingPlazaID">Plaza ID</label><input id="namingPlazaID" type="text" placeholder="08" /></div>
             <div class="field"><label for="namingContinent">Continent required</label><input id="namingContinent" type="text" placeholder="Europe" /></div>
             <div class="field"><label for="namingCountry">Country required</label><input id="namingCountry" type="text" placeholder="Finland" /></div>
             <div class="field"><label for="namingCity">City required</label><input id="namingCity" type="text" placeholder="Kuopio" /></div>
@@ -1417,7 +1417,7 @@
 
     function twoDigitID(v) {
       const n = Number(String(v || '').trim());
-      return Number.isFinite(n) ? String(Math.trunc(n)).padStart(2, '0') : '08';
+      return String(v || '').trim() && Number.isFinite(n) ? String(Math.trunc(n)).padStart(2, '0') : 'ID';
     }
 
     function renderNamingPreview() {
@@ -1453,19 +1453,20 @@
         return true;
       }
       const n = buildNamingPayload().metadata;
-      const fieldsOK = n.plaza_id && n.continent && n.country && n.city && n.plaza_name;
-      const idOK = /^\d+$/.test(n.plaza_id);
+      const automaticPlazaID = Number(state.catalogStreamId) > 0;
+      const fieldsOK = n.continent && n.country && n.city && n.plaza_name;
+      const idOK = automaticPlazaID || (/^\d+$/.test(n.plaza_id) && Number(n.plaza_id) > 0);
       const sched = compiledSchedule();
       const continuousOK = state.composerScheduleMode === 'continuous'
         && [60, 300, 600].includes(selectedClipSec())
         && continuousWindowValid();
       const scheduleOK = (state.composerScheduleMode === 'sampled' && sched.cron === '0 8-19 * * *') || continuousOK;
       if (!fieldsOK) {
-        els.namingWarn.textContent = 'Plaza hourly format requires plaza ID, continent, country, city, and plaza name.';
+        els.namingWarn.textContent = 'Plaza hourly format requires continent, country, city, and plaza name.';
         return false;
       }
       if (!idOK) {
-        els.namingWarn.textContent = 'Plaza ID must be numeric, for example 08.';
+        els.namingWarn.textContent = 'Plaza ID must be a positive integer, for example 08.';
         return false;
       }
       if (!scheduleOK) {
@@ -4411,6 +4412,15 @@
       state.streamProbe = { token: state.streamProbe.token + 1, ok: true };
       if (!els.recName.value) els.recName.value = trimName(stream.name, 60);
       const timezone = String(stream.local_timezone || '').trim();
+      const csv = stream.metadata_json && stream.metadata_json.csv_values ? stream.metadata_json.csv_values : {};
+      const fill = (input, value) => { if (!String(input.value || '').trim() && String(value || '').trim()) input.value = String(value).trim(); };
+      els.namingPlazaID.value = '';
+      els.namingPlazaID.readOnly = true;
+      els.namingPlazaID.placeholder = 'Assigned automatically for this organization';
+      fill(els.namingContinent, stream.metadata_json && stream.metadata_json.continent ? stream.metadata_json.continent : csv.continent);
+      fill(els.namingCountry, stream.location_country || csv.country);
+      fill(els.namingCity, stream.location_city || csv.city);
+      fill(els.namingPlazaName, stream.name);
       state.catalogTimezoneMissing = timezone === '';
       state.catalogTimezoneValid = !state.catalogTimezoneMissing && selectScheduleTimezone(timezone);
       [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((select) => { select.disabled = !state.catalogTimezoneMissing; });
@@ -4459,6 +4469,8 @@
       [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((select) => { select.disabled = false; });
       state.relayRecommended = false;
       els.recStreamID.value = '';
+      els.namingPlazaID.readOnly = false;
+      els.namingPlazaID.placeholder = '08';
       els.urlField.classList.remove('hidden');
       els.catalogStreamBlock.classList.add('hidden');
       els.catalogFramePreview.removeAttribute('src');
