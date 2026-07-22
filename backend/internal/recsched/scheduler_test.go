@@ -276,9 +276,9 @@ func TestContinuousDoesNotReviveDoneJobWithClips(t *testing.T) {
 	windowOpen := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
 	jobID := insertSchedulerContinuousJob(t, pool, recID, windowOpen, "done")
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at)
-		VALUES ($1, $2, $3)
-	`, recID, jobID, windowOpen); err != nil {
+		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at, clip_end_at)
+		VALUES ($1, $2, $3, $4)
+	`, recID, jobID, windowOpen, windowOpen.Add(time.Minute)); err != nil {
 		t.Fatalf("insert clip: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET window_end_at=$2 WHERE id=$1`, jobID, time.Date(2026, 7, 9, 11, 30, 0, 0, time.UTC)); err != nil {
@@ -330,9 +330,9 @@ func TestContinuousRevivesDoneJobWithClipsWhenWindowExtended(t *testing.T) {
 	windowOpen := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
 	jobID := insertSchedulerContinuousJob(t, pool, recID, windowOpen, "done")
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at)
-		VALUES ($1, $2, $3)
-	`, recID, jobID, windowOpen); err != nil {
+		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at, clip_end_at)
+		VALUES ($1, $2, $3, $4)
+	`, recID, jobID, windowOpen, windowOpen.Add(time.Minute)); err != nil {
 		t.Fatalf("insert clip: %v", err)
 	}
 
@@ -382,9 +382,9 @@ func TestContinuousRevivesCanceledJobWithClips(t *testing.T) {
 	windowOpen := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
 	jobID := insertSchedulerContinuousJob(t, pool, recID, windowOpen, "canceled")
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at)
-		VALUES ($1, $2, $3)
-	`, recID, jobID, windowOpen); err != nil {
+		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at, clip_end_at)
+		VALUES ($1, $2, $3, $4)
+	`, recID, jobID, windowOpen, windowOpen.Add(time.Minute)); err != nil {
 		t.Fatalf("insert clip: %v", err)
 	}
 
@@ -528,7 +528,7 @@ func testSchedulerPool(t *testing.T) (*pgxpool.Pool, func()) {
 			recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
 			recording_job_id BIGINT REFERENCES recording_jobs(id) ON DELETE SET NULL,
 			clip_start_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			clip_end_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			clip_end_at TIMESTAMPTZ NOT NULL
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
