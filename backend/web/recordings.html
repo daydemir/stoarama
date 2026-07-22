@@ -1125,6 +1125,8 @@
       // When set, the composer is locked to this catalog stream: the paste field is
       // hidden and create posts stream_id (server derives stream_url).
       catalogStreamId: 0,
+      catalogTimezoneValid: true,
+      catalogTimezoneMissing: false,
       // True when the recordability probe flagged this catalog stream (or its
       // provider) as needing relay: the composer shows an overridable note and
       // defaults capture to relay unless the user unchecks it.
@@ -1186,22 +1188,39 @@
     // Display only; never use for <option> values or values sent to the API.
     function tzLabel(z) { return String(z || 'UTC').split('/').pop().replace(/_/g, ' '); }
 
-    // A small, valid IANA list with the browser zone and UTC always present.
+    // Every IANA zone supported by this browser, with its local zone first.
     function timezoneOptions() {
-      const base = [
-        'UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
-        'America/Sao_Paulo', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Istanbul',
-        'Asia/Dubai', 'Asia/Kolkata', 'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Seoul', 'Australia/Sydney',
-      ];
       const tz = browserTimezone();
-      const set = [tz, ...base.filter((z) => z !== tz)];
-      return [...new Set(set)];
+      const supported = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+      return [...new Set([tz, 'UTC', ...supported])];
     }
 
     function fillTimezoneSelect(sel) {
       if (!sel) return;
       const tz = browserTimezone();
       sel.innerHTML = timezoneOptions().map((z) => `<option value="${escapeHTML(z)}"${z === tz ? ' selected' : ''}>${escapeHTML(z)}</option>`).join('');
+    }
+
+    function validIANATimezone(zone) {
+      try { new Intl.DateTimeFormat('en', { timeZone: zone }).format(); return true; } catch (_) { return false; }
+    }
+
+    function selectScheduleTimezone(zone) {
+      const timezone = String(zone || '').trim();
+      if (!validIANATimezone(timezone)) return false;
+      [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((select) => {
+        if (!Array.from(select.options).some((option) => option.value === timezone)) {
+          select.add(new Option(timezone, timezone));
+        }
+        select.value = timezone;
+      });
+      return true;
+    }
+
+    function catalogTimezoneChanged(select) {
+      if (!state.catalogTimezoneMissing) return;
+      state.catalogTimezoneValid = selectScheduleTimezone(select.value);
+      setStatus(els.startStatus, state.catalogTimezoneValid ? '' : 'Choose the stream timezone before recording.', state.catalogTimezoneValid ? '' : 'err');
     }
 
     // ---- Schedule: preset -> cron + preview + pre-flight validation ----
@@ -2671,7 +2690,7 @@
       const bucketOK = state.bucketState === 'connected' && dest > 0;
       const streamOK = state.streamProbe.ok === true;
       const sourceOK = catalog || !!url;
-      const ready = !state.starting && sourceOK && schedOK && bucketOK && streamOK && windowValid() && fpsValid() && namingValid();
+      const ready = !state.starting && sourceOK && schedOK && bucketOK && streamOK && state.catalogTimezoneValid && windowValid() && fpsValid() && namingValid();
       els.startBtn.disabled = !ready;
     }
 
@@ -4391,6 +4410,21 @@
       // Start is reachable once a bucket is connected.
       state.streamProbe = { token: state.streamProbe.token + 1, ok: true };
       if (!els.recName.value) els.recName.value = trimName(stream.name, 60);
+      const timezone = String(stream.local_timezone || '').trim();
+      state.catalogTimezoneMissing = timezone === '';
+      state.catalogTimezoneValid = !state.catalogTimezoneMissing && selectScheduleTimezone(timezone);
+      [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((select) => { select.disabled = !state.catalogTimezoneMissing; });
+      if (state.catalogTimezoneMissing) {
+        [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((select) => {
+          select.add(new Option('Choose timezone', '', true, true), 0);
+        });
+      }
+      refreshContinuousWarn();
+      refreshScheduleUI();
+      renderCostEstimate();
+      if (!state.catalogTimezoneValid) {
+        setStatus(els.startStatus, `Choose the timezone for stream #${id} before recording.`, 'err');
+      }
       refreshStartEnabled();
       loadRelayRecommendation(id);
     }
@@ -4420,6 +4454,9 @@
     // Clear any catalog lock so the next composer open is a normal paste flow.
     function clearCatalogLock() {
       state.catalogStreamId = 0;
+      state.catalogTimezoneValid = true;
+      state.catalogTimezoneMissing = false;
+      [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((select) => { select.disabled = false; });
       state.relayRecommended = false;
       els.recStreamID.value = '';
       els.urlField.classList.remove('hidden');
@@ -4772,7 +4809,7 @@
       b.addEventListener('click', () => setScheduleMode(b.getAttribute('data-mode'))));
     els.dailyWindowStart.addEventListener('input', () => { refreshContinuousWarn(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
     els.dailyWindowEnd.addEventListener('input', () => { refreshContinuousWarn(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
-    els.schedTZContinuous.addEventListener('change', () => { refreshContinuousWarn(); refreshStartEnabled(); });
+    els.schedTZContinuous.addEventListener('change', () => { catalogTimezoneChanged(els.schedTZContinuous); refreshContinuousWarn(); refreshStartEnabled(); });
     els.schedSeg.querySelectorAll('button[data-preset]').forEach((b) =>
       b.addEventListener('click', () => setSchedPreset(b.getAttribute('data-preset'))));
     els.clipSeg.querySelectorAll('button[data-clip]').forEach((b) => {
@@ -4788,8 +4825,8 @@
     els.fpsCustom.addEventListener('input', () => { refreshStartEnabled(); });
     els.dailyTime.addEventListener('input', () => { refreshScheduleUI(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
     els.cronExpr.addEventListener('input', () => { refreshScheduleUI(); namingValid(); refreshStartEnabled(); renderCostEstimate(); });
-    els.schedTZ.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
-    els.schedTZCustom.addEventListener('change', () => { refreshScheduleUI(); refreshStartEnabled(); });
+    els.schedTZ.addEventListener('change', () => { catalogTimezoneChanged(els.schedTZ); refreshScheduleUI(); refreshStartEnabled(); });
+    els.schedTZCustom.addEventListener('change', () => { catalogTimezoneChanged(els.schedTZCustom); refreshScheduleUI(); refreshStartEnabled(); });
     els.startAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
     els.endAt.addEventListener('input', () => { refreshWindowUI(); renderCostEstimate(); });
     // For YouTube URLs the composer skips the server probe entirely and lets the relay
@@ -4972,10 +5009,6 @@
 
     function selectedBatchWeekdays() {
       return Array.from(els.batchWeekdays.querySelectorAll('input:checked')).map((el) => Number(el.value));
-    }
-
-    function validIANATimezone(zone) {
-      try { new Intl.DateTimeFormat('en', { timeZone: zone }).format(); return true; } catch (_) { return false; }
     }
 
     async function startBatch() {

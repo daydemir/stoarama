@@ -107,6 +107,7 @@ func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) er
 		          AND c.clip_start_at < rec.end_at AND c.clip_end_at <= rec.end_at)
 		FROM recordings rec
 		WHERE rec.status='active' AND rec.end_at IS NOT NULL AND rec.end_at <= now()
+		ORDER BY rec.id
 		FOR UPDATE
 	`)
 	if err != nil {
@@ -202,6 +203,22 @@ type activeRecording struct {
 // Each recording's enqueue runs in its own savepoint so one bad recording cannot
 // abort the whole tick.
 func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) error {
+	// Recording updates always precede job updates across the API and migrations.
+	// Preserve that lock order here so a schedule cutover cannot deadlock a tick.
+	if _, err := tx.Exec(ctx, `
+		SELECT rec.id
+		FROM recordings rec
+		WHERE rec.status='active'
+		   OR EXISTS (
+		     SELECT 1 FROM recording_jobs job
+		     WHERE job.recording_id=rec.id AND job.status IN ('pending','leased')
+		   )
+		ORDER BY rec.id
+		FOR UPDATE OF rec
+	`); err != nil {
+		return fmt.Errorf("lock scheduler recordings: %w", err)
+	}
+
 	// (a) reclaim expired leases.
 	if _, err := tx.Exec(ctx, `
 		UPDATE recording_jobs
@@ -241,6 +258,7 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 		        WHERE b.account_id = rec.account_id
 		          AND b.has_payment_method))
 		ORDER BY rec.id ASC
+		FOR UPDATE OF rec
 	`, !s.cfg.BillingEnabled)
 	if err != nil {
 		return fmt.Errorf("select active recordings: %w", err)

@@ -55,6 +55,24 @@ func TestRecordingsComposerIsOnlyLoadedByNewRecordingRoute(t *testing.T) {
 	}
 }
 
+func TestRecordingsComposerUsesCatalogTimezone(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"Intl.supportedValuesOf('timeZone')",
+		"state.catalogTimezoneMissing = timezone === '';",
+		"select.add(new Option('Choose timezone', '', true, true), 0);",
+		"select.value = timezone;",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing catalog timezone marker %q", marker)
+		}
+	}
+}
+
 func TestRecordingAndStreamPagesShowLocalScheduleTime(t *testing.T) {
 	recordings, err := loadHTMLPage("recordings.html")
 	if err != nil {
