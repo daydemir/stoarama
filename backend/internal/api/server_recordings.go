@@ -383,6 +383,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	}
 	defer rows.Close()
 	items := make([]map[string]any, 0, 8)
+	recordingIDs := make([]int64, 0, 8)
 	for rows.Next() {
 		item, err := scanRecordingListRow(rows, s.billing != nil)
 		if err != nil {
@@ -390,10 +391,20 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		items = append(items, item)
+		recordingIDs = append(recordingIDs, item["id"].(int64))
 	}
 	if err := rows.Err(); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recordings: %v", err))
 		return
+	}
+	rows.Close()
+	healthBins, err := s.recordingHealthBinsForAccount(r.Context(), principal.AccountID, recordingIDs, false)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
+		return
+	}
+	for _, item := range items {
+		item["capture_health_bins"] = healthBins[item["id"].(int64)]
 	}
 	// Fleet relay aggregate: total nodes, online nodes (heartbeat within 120s), live
 	// leases across all relay nodes, available slots across ONLINE relays, and the
@@ -1210,6 +1221,12 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
+	healthBins, err := s.recordingHealthBinsForAccount(r.Context(), principal.AccountID, []int64{id}, true)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
+		return
+	}
+	item["capture_health_bins"] = healthBins[id]
 	util.WriteJSON(w, http.StatusOK, item)
 }
 
@@ -1230,6 +1247,12 @@ func (s *Server) writeRecordingJSON(w http.ResponseWriter, r *http.Request, id, 
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
+	healthBins, err := s.recordingHealthBinsForAccount(r.Context(), accountID, []int64{id}, true)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
+		return
+	}
+	item["capture_health_bins"] = healthBins[id]
 	util.WriteJSON(w, http.StatusOK, item)
 }
 
