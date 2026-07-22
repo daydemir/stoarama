@@ -35,6 +35,26 @@ func TestStreamsPageIgnoresStaleFilterResponses(t *testing.T) {
 	}
 }
 
+func TestRecordingsComposerIsOnlyLoadedByNewRecordingRoute(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	if got := strings.Count(page, "await maybeLandFromCatalogStream();"); got != 1 {
+		t.Fatalf("catalog landing calls=%d, want 1 creation-route call", got)
+	}
+	if strings.Contains(page, "openComposer(false)") {
+		t.Fatal("recordings page still has an inline composer entry point")
+	}
+	if !strings.Contains(page, "function closeComposer() {\n      clearStashedCatalogStreamId();\n      window.location.assign('/recordings');") {
+		t.Fatal("composer cancel must clear the stashed catalog stream before returning to the list")
+	}
+	if !strings.Contains(page, "if (ids.length) {\n          clearStashedCatalogStreamId();\n          state.batchSelected = new Set(ids);") {
+		t.Fatal("batch setup must supersede a stashed single-stream intent")
+	}
+}
+
 func TestHandleDashboardStaticServesDashboardJS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/static/dashboard.js", nil)
 	rec := httptest.NewRecorder()
