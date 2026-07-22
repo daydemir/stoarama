@@ -527,7 +527,8 @@ func testSchedulerPool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
 			recording_job_id BIGINT REFERENCES recording_jobs(id) ON DELETE SET NULL,
-			clip_start_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			clip_start_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			clip_end_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

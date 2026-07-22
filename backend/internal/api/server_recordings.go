@@ -76,6 +76,10 @@ const recordingListSelectSQL = `
 		     AND c.clip_start_at < CASE
 		       WHEN rec.status='paused' THEN rec.paused_at
 		       ELSE LEAST(now(), COALESCE(rec.end_at, now()))
+		     END
+		     AND c.clip_end_at <= CASE
+		       WHEN rec.status='paused' THEN rec.paused_at
+		       ELSE LEAST(now(), COALESCE(rec.end_at, now()))
 		     END) END AS captured_clip_count,
 		rec.completed_captured_clip_count, rec.completed_expected_clip_count,
 		rec.created_at, sd.managed,

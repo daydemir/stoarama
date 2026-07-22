@@ -103,7 +103,8 @@ func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) er
 		       to_char(rec.daily_window_end,'HH24:MI:SS'), rec.active_weekdays,
 		       rec.start_at, rec.end_at,
 		       (SELECT count(*) FROM recording_clips c
-		        WHERE c.recording_id=rec.id AND c.clip_start_at >= rec.start_at AND c.clip_start_at < rec.end_at)
+		        WHERE c.recording_id=rec.id AND c.clip_start_at >= rec.start_at
+		          AND c.clip_start_at < rec.end_at AND c.clip_end_at <= rec.end_at)
 		FROM recordings rec
 		WHERE rec.status='active' AND rec.end_at IS NOT NULL AND rec.end_at <= now()
 		FOR UPDATE
