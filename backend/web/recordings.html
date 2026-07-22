@@ -2623,12 +2623,12 @@
       return Number.isFinite(d.getTime()) ? d : null;
     }
 
-    // Returns { startISO, endISO } for the create body. start defaults to now when
-    // the input is empty; end stays null (open-ended) when empty.
+    // Returns { startISO, endISO } for the create body. An empty start stays null
+    // so the server anchors "now" at submission; end null remains open-ended.
     function compiledWindow() {
-      const start = parseLocalDateTime(els.startAt.value) || new Date();
+      const start = parseLocalDateTime(els.startAt.value);
       const end = parseLocalDateTime(els.endAt.value);
-      return { startISO: start.toISOString(), endISO: end ? end.toISOString() : null };
+      return { startISO: start ? start.toISOString() : null, endISO: end ? end.toISOString() : null };
     }
 
     // The window is valid unless a Stop is set that is not strictly after Start.
@@ -3697,7 +3697,7 @@
       const clip = Number(rec.clip_duration_sec || 60);
       const tfps = Number(rec.target_fps || 0);
       const completed = isCompleted(rec);
-      const startVal = completed ? toLocalInputValue(new Date()) : (rec.start_at ? toLocalInputValue(new Date(rec.start_at)) : '');
+      const startVal = completed ? '' : (rec.start_at ? toLocalInputValue(new Date(rec.start_at)) : '');
       const endVal = completed ? '' : (rec.end_at ? toLocalInputValue(new Date(rec.end_at)) : '');
       form.innerHTML = `
         <div class="field">
@@ -4230,8 +4230,8 @@
       els.namingSection.classList.remove('hidden');
       els.composer.classList.remove('hidden');
       els.composerClose.classList.toggle('hidden', !!asHero);
-      // Default Start to now (open-ended Stop) each time the composer opens empty.
-      if (!els.startAt.value) els.startAt.value = toLocalInputValue(new Date());
+      // Leave Start empty for "now" so submission time, not composer-open time,
+      // anchors capture health and scheduling.
       refreshWindowUI();
       if (!asHero) els.composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
       refreshStartEnabled();
@@ -4862,8 +4862,7 @@
       els.batchPreflight.classList.add('hidden');
       els.batchPreflight.textContent = '';
       [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((el) => { if (el && el.parentElement) el.parentElement.classList.add('hidden'); });
-      // Default Start to now (open-ended Stop) each time.
-      if (!els.startAt.value) els.startAt.value = toLocalInputValue(new Date());
+      // An empty Start means "now" and is resolved when the user submits.
       refreshWindowUI();
       renderBatchRows();
       els.composer.scrollIntoView({ behavior: 'smooth', block: 'start' });

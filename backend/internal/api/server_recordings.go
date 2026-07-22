@@ -587,10 +587,9 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// Capture window: start_at defaults to now() (start immediately), end_at is
 	// open-ended when nil. When both are present, end_at must be strictly after
 	// start_at (mirrors the recordings_window_chk DB constraint).
-	startAt := time.Now().UTC()
-	if req.StartAt != nil {
-		startAt = req.StartAt.UTC()
-	}
+	requestNow := time.Now().UTC()
+	immediateStart := req.StartAt == nil || !req.StartAt.After(requestNow)
+	startAt := effectiveRecordingStart(req.StartAt, requestNow)
 	var endAtArg any
 	if req.EndAt != nil {
 		endAt := req.EndAt.UTC()
@@ -790,6 +789,13 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
+	if immediateStart {
+		startAt = time.Now().UTC()
+		if endAt, ok := endAtArg.(time.Time); ok && !endAt.After(startAt) {
+			util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+			return
+		}
+	}
 
 	var nextFireArg any
 	if mode == "continuous" {
@@ -927,6 +933,13 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		"start_at":   startOut.UTC(),
 		"end_at":     endOut,
 	})
+}
+
+func effectiveRecordingStart(requested *time.Time, now time.Time) time.Time {
+	if requested != nil && requested.After(now) {
+		return requested.UTC()
+	}
+	return now.UTC()
 }
 
 // isYouTubeWatchURL mirrors capture/resolve.go's isYouTubeURL host check. It is the
@@ -1234,15 +1247,16 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	// end_at keeps the recording's existing window (a schedule edit is not a window
 	// reset). A canceled recording is not found.
 	var (
+		curStatus        string
 		curStartAt       time.Time
 		curEndAt         *time.Time
 		namingProfileRaw string
 		activeWeekdays   recsched.WeekdaySet
 	)
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT start_at, end_at, naming_profile, active_weekdays FROM recordings
+		SELECT status, start_at, end_at, naming_profile, active_weekdays FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays); err != nil {
+	`, id, principal.AccountID).Scan(&curStatus, &curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
@@ -1257,11 +1271,13 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	}
 
 	startAt := curStartAt.UTC()
-	if req.StartAt != nil {
+	if curStatus == "completed" {
+		startAt = effectiveRecordingStart(req.StartAt, time.Now().UTC())
+	} else if req.StartAt != nil {
 		startAt = req.StartAt.UTC()
 	}
 	endAtArg := any(nil)
-	if curEndAt != nil {
+	if curStatus != "completed" && curEndAt != nil {
 		endAtArg = curEndAt.UTC()
 	}
 	if req.EndAt != nil {
