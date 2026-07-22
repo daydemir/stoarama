@@ -57,3 +57,13 @@ The public `stoarama` CLI is narrower and is for account/node workflows, not ope
 - keep secrets out of git
 - prefer small checkpoints
 - do not mix thesis experiments into this repo
+
+## Local Credentials
+
+Runtime secrets live in `local/*.env` (gitignored; committed `.example` files show the shape). Check there before asking for credentials or reaching for Render:
+
+- `render.env` — production env mirror, incl. R2: `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_REGION`, and `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` (map to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for AWS-style tooling)
+- `recording-supervisor.env`, `youtube-relay-source.env` — Stoarama operator API keys
+- `do-capture.env` — DigitalOcean capture box
+
+Load with: `set -a; . local/render.env; set +a`. Never print values; never copy between machines without Deniz approval.
