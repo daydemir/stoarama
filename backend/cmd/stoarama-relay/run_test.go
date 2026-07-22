@@ -205,6 +205,7 @@ func TestAppendDiagnosticErrorsMergesSanitizesAndBounds(t *testing.T) {
 
 func TestMarkRelayExitPersistsSelfUpdate(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(func() { plannedSelfUpdate.Store(false) })
 	markRelayExit(relayExitSelfUpdate)
 	state, err := loadRecoveryState(recoveryStatePath())
 	if err != nil {
@@ -212,6 +213,16 @@ func TestMarkRelayExitPersistsSelfUpdate(t *testing.T) {
 	}
 	if state.PreviousExit != relayExitSelfUpdate {
 		t.Fatalf("previous_exit=%q want %q", state.PreviousExit, relayExitSelfUpdate)
+	}
+	if err := (&relayRecoveryState{PreviousExit: relayExitUncleanProcess}).persist(recoveryStatePath()); err != nil {
+		t.Fatal(err)
+	}
+	state, err = loadRecoveryState(recoveryStatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.PreviousExit != relayExitSelfUpdate {
+		t.Fatalf("stale write changed previous_exit to %q", state.PreviousExit)
 	}
 }
 

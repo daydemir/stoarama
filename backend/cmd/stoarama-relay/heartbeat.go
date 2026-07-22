@@ -28,8 +28,9 @@ const offlineDiagnosticMaxBytes = 8 << 10
 const recoveryStateMaxBytes = 16 << 10
 
 const (
-	relayExitClean      = "clean"
-	relayExitSelfUpdate = "self_update"
+	relayExitClean          = "clean"
+	relayExitSelfUpdate     = "self_update"
+	relayExitUncleanProcess = "unclean_process"
 )
 
 type offlineDiagnosticKind string
@@ -75,6 +76,7 @@ type relayRecoveryState struct {
 }
 
 var recoveryStateMu sync.Mutex
+var plannedSelfUpdate atomic.Bool
 
 func recoveryStatePath() string {
 	home, err := stoaramaHome()
@@ -111,10 +113,14 @@ func (s *relayRecoveryState) persist(path string) error {
 	}
 	recoveryStateMu.Lock()
 	defer recoveryStateMu.Unlock()
-	if len(s.ErrorTail) > 8 {
-		s.ErrorTail = s.ErrorTail[len(s.ErrorTail)-8:]
+	state := *s
+	if plannedSelfUpdate.Load() {
+		state.PreviousExit = relayExitSelfUpdate
 	}
-	b, err := json.Marshal(s)
+	if len(state.ErrorTail) > 8 {
+		state.ErrorTail = state.ErrorTail[len(state.ErrorTail)-8:]
+	}
+	b, err := json.Marshal(&state)
 	if err != nil {
 		return err
 	}
@@ -217,6 +223,9 @@ func appendDiagnosticErrors(existing, incoming []string) []string {
 }
 
 func markRelayExit(reason string) {
+	if reason == relayExitSelfUpdate {
+		plannedSelfUpdate.Store(true)
+	}
 	path := recoveryStatePath()
 	if path == "" {
 		return
@@ -230,6 +239,16 @@ func markRelayExit(reason string) {
 	if err := state.persist(path); err != nil {
 		log.Printf("relay recovery state persist error: %v", err)
 	}
+}
+
+func restartAfterSelfUpdate() error {
+	markRelayExit(relayExitSelfUpdate)
+	if err := restartService(); err != nil {
+		plannedSelfUpdate.Store(false)
+		markRelayExit(relayExitUncleanProcess)
+		return err
+	}
+	return nil
 }
 
 func loadHeartbeatDiagnostics(path string) (*heartbeatDiagnostics, error) {
@@ -484,7 +503,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 	} else if previousRecovery.BootID != "" && previousRecovery.BootID != recovery.BootID {
 		recovery.PreviousExit = "unclean_reboot"
 	} else {
-		recovery.PreviousExit = "unclean_process"
+		recovery.PreviousExit = relayExitUncleanProcess
 	}
 	if err := recovery.persist(recoveryPath); err != nil {
 		log.Printf("relay recovery state persist error: %v", err)
