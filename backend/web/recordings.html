@@ -212,6 +212,17 @@
     .capture-health.warning { color: var(--warn); }
     .capture-health.critical { color: var(--err); }
     .capture-health.not_expected, .capture-health.unavailable { color: var(--muted); }
+    .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
+    .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
+    .health-strip-bar { width: 100%; min-height: 2px; border-radius: 2px; background: var(--muted); }
+    .health-strip-bar.healthy { background: var(--ok); }
+    .health-strip-bar.warning { background: var(--warn); }
+    .health-strip-bar.critical { background: var(--err); }
+    .health-history { display: flex; align-items: end; gap: 3px; height: 84px; overflow-x: auto; padding: 8px 0 4px; border-bottom: 1px solid var(--border); }
+    .health-history .health-strip-cell { flex: 1 0 9px; max-width: 18px; }
+    .health-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 11px; }
+    .health-legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .health-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
     .card-err { margin-top: 10px; color: var(--err); font-size: 12px; line-height: 1.45; }
     .group-title { margin: 18px 0 10px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
     .clip-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -3011,10 +3022,13 @@
 	  const captured = Number(rec.captured_clip_count || 0);
 	  const captureHealth = String(rec.capture_health || 'not_expected');
 	  const capturePercent = expected > 0 ? Math.min(100, Math.round(captured / expected * 1000) / 10) : null;
+	  const healthBins = Array.isArray(rec.capture_health_bins) ? rec.capture_health_bins : [];
 	  const captureHealthHTML = captureHealth === 'unavailable'
 	    ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
-	    : expected > 0
-	      ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
+	    : healthBins.length
+	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, false)}<div class="cell-sub">${lastHTML}</div>`
+	      : expected > 0
+	        ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
 	      : `<div class="capture-health not_expected">No clips expected yet</div><div class="cell-sub">${lastHTML}</div>`;
       const clip = Number(rec.clip_duration_sec || 0);
       const fps = Number(rec.target_fps || 0);
@@ -3450,6 +3464,46 @@
         </div>`;
     }
 
+    function captureHealthGraph(rawBins, detailed) {
+      const bins = Array.isArray(rawBins) ? rawBins : [];
+      if (!bins.length) return '';
+      const cells = [];
+      if (!detailed) {
+        for (let i = bins.length; i < 12; i++) cells.push('<span class="health-strip-cell"></span>');
+      }
+      for (const bin of bins) {
+        const captured = Number(bin.captured || 0);
+        const expected = Number(bin.expected || 0);
+        const percent = expected > 0 ? captured / expected * 100 : 0;
+        const health = String(bin.health || '');
+        const start = fmtInstant(bin.start) || '';
+        const end = fmtInstant(bin.end) || '';
+        const title = `${start} to ${end}: ${Math.round(percent * 10) / 10}% (${captured}/${expected} clips)`;
+        cells.push(`<span class="health-strip-cell" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
+      }
+      return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time">${cells.join('')}</div>`;
+    }
+
+    function captureHealthCardHTML(rec) {
+      const bins = Array.isArray(rec.capture_health_bins) ? rec.capture_health_bins : [];
+      if (!bins.length) return '';
+      const totals = bins.reduce((sum, bin) => ({ captured: sum.captured + Number(bin.captured || 0), expected: sum.expected + Number(bin.expected || 0) }), { captured: 0, expected: 0 });
+      const percent = totals.expected > 0 ? Math.round(totals.captured / totals.expected * 1000) / 10 : 0;
+      const hours = Math.max(1, Math.round(Math.max(...bins.map((bin) => new Date(bin.end).getTime() - new Date(bin.start).getTime())) / 3600000));
+      return `
+        <div class="detail-card">
+          <div class="detail-card-head"><span class="detail-card-title">Capture health</span></div>
+          <div class="cell-main">${percent}% · ${totals.captured}/${totals.expected} clips</div>
+          <div class="hint">${hours}-hour bins across the full scheduled recording period. Hover a bar for captured and expected clips.</div>
+          ${captureHealthGraph(bins, true)}
+          <div class="health-legend">
+            <span><i style="background:var(--ok)"></i>98% or better</span>
+            <span><i style="background:var(--warn)"></i>90% to 97.9%</span>
+            <span><i style="background:var(--err)"></i>Below 90%</span>
+          </div>
+        </div>`;
+    }
+
     // The storage card: stream id where applicable, current delivery, retention tier.
     // NAS delivery preserves each clip's recording file naming path.
     function storageCardHTML(rec) {
@@ -3550,7 +3604,7 @@
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       teardownDetailPlayer();
-      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + streamCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
+      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + streamCardHTML(rec) + captureHealthCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
       wireDetailActions(root);
       mountRecordingLivePlayer(rec);
