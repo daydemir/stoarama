@@ -55,6 +55,34 @@ func TestRecordingsComposerIsOnlyLoadedByNewRecordingRoute(t *testing.T) {
 	}
 }
 
+func TestRecordingAndStreamPagesShowLocalScheduleTime(t *testing.T) {
+	recordings, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	for _, marker := range []string{
+		"return `${weekdayLabel(rec.active_weekdays)} · ${window}`;",
+		"Ends ${escapeHTML(ends)}",
+		"['Local time',",
+		"timeZone: String(timezone || 'UTC')",
+	} {
+		if !strings.Contains(string(recordings), marker) {
+			t.Fatalf("recordings html missing local schedule marker %q", marker)
+		}
+	}
+	if strings.Contains(string(recordings), "fmtInstant(") {
+		t.Fatal("recordings html still references the removed generic instant formatter")
+	}
+
+	streams, err := loadHTMLPage("streams.html")
+	if err != nil {
+		t.Fatalf("load streams html: %v", err)
+	}
+	if !strings.Contains(string(streams), "Local time ${esc(local)}") {
+		t.Fatal("streams html missing local time indicator")
+	}
+}
+
 func TestHandleDashboardStaticServesDashboardJS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/static/dashboard.js", nil)
 	rec := httptest.NewRecorder()
