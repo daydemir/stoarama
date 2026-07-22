@@ -3563,7 +3563,17 @@ function renderLocationHierarchy(stream) {
 
 function renderLocalTimezone(stream) {
   const zone = String(stream && stream.local_timezone || '').trim();
-  return zone ? `<span class="tag tag-muted mono">${esc(zone)}</span>` : '';
+  if (!zone) return '';
+  const timezoneTag = `<span class="tag tag-muted mono">${esc(zone)}</span>`;
+  let local = '';
+  try {
+    local = new Intl.DateTimeFormat([], {
+      timeZone: zone, weekday: 'short', hour: 'numeric', minute: '2-digit',
+    }).format(new Date());
+  } catch (_) {
+    return timezoneTag;
+  }
+  return `${timezoneTag}<span class="muted fs10">Local time ${esc(local)}</span>`;
 }
 function updateStreamFilterSummary() {
   const countryRaw = String(countryFilter.value || '').trim();

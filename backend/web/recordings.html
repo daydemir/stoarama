@@ -2745,7 +2745,57 @@
       '0 */4 * * *': 'Every 4 hours',
     };
 
+    function wallTimeLabel(value) {
+      const match = /^(\d{1,2}):(\d{2})/.exec(String(value || '').trim());
+      if (!match) return '';
+      const date = new Date(Date.UTC(2000, 0, 1, Number(match[1]), Number(match[2])));
+      return date.toLocaleTimeString([], { timeZone: 'UTC', hour: 'numeric', minute: '2-digit' });
+    }
+
+    function weekdayLabel(maskValue) {
+      const mask = Number(maskValue || 127);
+      if (mask === 127) return 'Daily';
+      if (mask === 31) return 'Mon–Fri';
+      if (mask === 96) return 'Sat–Sun';
+      const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      const active = days.filter((_, index) => (mask & (1 << index)) !== 0);
+      return active.join(', ') || 'No active days';
+    }
+
+    function localTimeLabel(timezone, instant) {
+      const zone = String(timezone || '').trim();
+      if (!zone) return '';
+      try {
+        return new Intl.DateTimeFormat([], {
+          timeZone: zone, weekday: 'short', hour: 'numeric', minute: '2-digit',
+        }).format(instant || new Date());
+      } catch (_) {
+        return '';
+      }
+    }
+
+    function instantInTimezone(value, timezone) {
+      if (!value) return '';
+      const date = new Date(value);
+      if (!Number.isFinite(date.getTime())) return '';
+      try {
+        return new Intl.DateTimeFormat([], {
+          timeZone: String(timezone || 'UTC'), month: 'short', day: 'numeric',
+          year: 'numeric', hour: 'numeric', minute: '2-digit',
+        }).format(date);
+      } catch (_) {
+        return '';
+      }
+    }
+
     function scheduleLabel(rec) {
+      if (String(rec.mode || 'sampled') === 'continuous') {
+        const start = wallTimeLabel(rec.daily_window_start);
+        const end = wallTimeLabel(rec.daily_window_end);
+        if (!start || !end) return 'Continuous';
+        const window = start === end ? '24 hours' : `${start}–${end}`;
+        return `${weekdayLabel(rec.active_weekdays)} · ${window}`;
+      }
       const expr = String(rec.cron_expr || '').trim().replace(/\s+/g, ' ');
       if (CRON_PRESET_LABEL[expr]) return CRON_PRESET_LABEL[expr];
       const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(expr);
@@ -2760,7 +2810,7 @@
       if (everyMin) return `Every ${Number(everyMin[1])} min`;
       const everyHour = /^0 \*\/(\d+) \* \* \*$/.exec(expr);
       if (everyHour) return `Every ${Number(everyHour[1])} hours`;
-      return `Cron ${expr}`;
+      return expr ? `Cron ${expr}` : 'Schedule unavailable';
     }
 
     function relativeTime(v) {
@@ -2899,7 +2949,7 @@
       try {
         const t = d.toLocaleTimeString([], { timeZone: tz, hour: 'numeric', minute: '2-digit' });
         return `${t} ${tzLabel(tz)}`;
-      } catch (_) { return fmtInstant(v); }
+      } catch (_) { return instantInTimezone(v, tz); }
     }
 
     // Where 'now' sits relative to the recording's active capture window, in the
@@ -2927,7 +2977,7 @@
           return { phase: 'after', nextLabel: hmClockLabel(s, tz) };
         }
       }
-      const nextTxt = fmtInstant(rec.next_fire_at);
+      const nextTxt = instantInTimezone(rec.next_fire_at, tz);
       if (nextTxt) return { phase: 'before', nextLabel: nextTxt };
       return { phase: 'open', nextLabel: null };
     }
@@ -3015,6 +3065,7 @@
       const title = streamName || String(rec.name || `Recording #${id}`);
       const recordingName = String(rec.name || '').trim();
       const location = String(rec.stream_location || rec.stream_url || '').trim();
+      const timezone = String(rec.cron_timezone || 'UTC');
       const last = relativeTime(rec.last_clip_at);
       const lastClass = lastClipFreshnessClass(rec);
       const lastHTML = `<span${lastClass ? ` class="${lastClass}"` : ''}>${last ? `Last clip ${escapeHTML(last)}` : 'No clips yet'}</span>`;
@@ -3026,7 +3077,7 @@
 	  const captureHealthHTML = captureHealth === 'unavailable'
 	    ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
 	    : healthBins.length
-	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, false)}<div class="cell-sub">${lastHTML}</div>`
+	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, false, timezone)}<div class="cell-sub">${lastHTML}</div>`
 	      : expected > 0
 	        ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
 	      : `<div class="capture-health not_expected">No clips expected yet</div><div class="cell-sub">${lastHTML}</div>`;
@@ -3047,11 +3098,13 @@
         ? `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
         : (status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}">Resume</button>` : '');
       action += `<a class="btn-link secondary" href="/recordings/${id}">View</a>`;
+      const localTime = localTimeLabel(timezone);
+      const ends = instantInTimezone(rec.end_at, timezone);
       return `<tr class="${extraClass}" data-card="${id}">
         <td><input type="checkbox" data-recordingselect="${id}" aria-label="Select recording #${id}"${state.selectedRecordings.has(id) ? ' checked' : ''}></td>
         <td><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
 		<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
-        <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(String(rec.cron_timezone || 'UTC'))}</div></td>
+        <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(timezone)}${localTime ? ` · Local time ${escapeHTML(localTime)}` : ''}</div>${ends ? `<div class="cell-sub">Ends ${escapeHTML(ends)}</div>` : '<div class="cell-sub">No scheduled end</div>'}</td>
         <td><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
 		<td><div class="cell-main">${storage}</div></td>
         <td><div class="row-actions">${action}</div></td>
@@ -3416,18 +3469,9 @@
 
     function scheduleLabelFull(rec) {
       if (String(rec.mode || 'sampled') === 'continuous') {
-        const s = String(rec.daily_window_start || '').trim();
-        const e = String(rec.daily_window_end || '').trim();
-        const tz = String(rec.cron_timezone || 'UTC');
-        return s && e ? `Continuous, ${s} to ${e} ${escapeHTML(tzLabel(tz))}` : 'Continuous';
+        return scheduleLabel(rec);
       }
       return `Sampled, ${scheduleLabel(rec)}`;
-    }
-
-    function fmtInstant(v) {
-      if (!v) return null;
-      const d = new Date(v);
-      return Number.isFinite(d.getTime()) ? d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : null;
     }
 
     // The schedule card: current mode, cron/window, clip length, fps, capture window,
@@ -3435,8 +3479,10 @@
     // the recording and submitted via PATCH /recordings/{id}/schedule.
     function scheduleCardHTML(rec) {
       const tfps = Number(rec.target_fps || 0);
+      const timezone = String(rec.cron_timezone || 'UTC');
       const rows = [
         ['Schedule', escapeHTML(scheduleLabelFull(rec))],
+        ['Local time', `${escapeHTML(localTimeLabel(timezone) || 'Unavailable')} · ${escapeHTML(timezone)}`],
         ['Clip length', fmtClipLength(rec.clip_duration_sec)],
         ['Frame rate', tfps > 0 ? `${tfps} fps` : 'Source'],
       ];
@@ -3446,10 +3492,10 @@
       } else {
         rows.push(['Capture', 'Stoarama cloud']);
       }
-      const startTxt = fmtInstant(rec.start_at);
-      const endTxt = fmtInstant(rec.end_at);
+      const startTxt = instantInTimezone(rec.start_at, timezone);
+      const endTxt = instantInTimezone(rec.end_at, timezone);
       rows.push(['Recording window', `${startTxt || 'Now'} to ${endTxt || 'open-ended'}`]);
-      const nextTxt = fmtInstant(rec.next_fire_at);
+      const nextTxt = instantInTimezone(rec.next_fire_at, timezone);
       if (nextTxt) rows.push(['Next run', nextTxt]);
       const editable = String(rec.status || '') !== 'canceled';
       const editLabel = isCompleted(rec) ? 'Record again' : 'Edit schedule';
@@ -3464,7 +3510,7 @@
         </div>`;
     }
 
-    function captureHealthGraph(rawBins, detailed) {
+    function captureHealthGraph(rawBins, detailed, timezone) {
       const bins = Array.isArray(rawBins) ? rawBins : [];
       if (!bins.length) return '';
       const cells = [];
@@ -3476,8 +3522,8 @@
         const expected = Number(bin.expected || 0);
         const percent = expected > 0 ? captured / expected * 100 : 0;
         const health = String(bin.health || '');
-        const start = fmtInstant(bin.start) || '';
-        const end = fmtInstant(bin.end) || '';
+        const start = instantInTimezone(bin.start, timezone) || '';
+        const end = instantInTimezone(bin.end, timezone) || '';
         const title = `${start} to ${end}: ${Math.round(percent * 10) / 10}% (${captured}/${expected} clips)`;
         cells.push(`<span class="health-strip-cell" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
       }
@@ -3495,7 +3541,7 @@
           <div class="detail-card-head"><span class="detail-card-title">Capture health</span></div>
           <div class="cell-main">${percent}% · ${totals.captured}/${totals.expected} clips</div>
           <div class="hint">${hours}-hour bins across the full scheduled recording period. Hover a bar for captured and expected clips.</div>
-          ${captureHealthGraph(bins, true)}
+          ${captureHealthGraph(bins, true, String(rec.cron_timezone || 'UTC'))}
           <div class="health-legend">
             <span><i style="background:var(--ok)"></i>98% or better</span>
             <span><i style="background:var(--warn)"></i>90% to 97.9%</span>
