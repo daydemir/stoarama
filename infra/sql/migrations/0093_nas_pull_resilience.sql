@@ -1,5 +1,3 @@
-BEGIN;
-
 ALTER TABLE connections
   ADD COLUMN IF NOT EXISTS bytes_pulled BIGINT NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS client_version TEXT NOT NULL DEFAULT '',
@@ -38,5 +36,3 @@ ALTER TABLE connections
 CREATE UNIQUE INDEX IF NOT EXISTS idx_connections_one_nas_pull_per_account
   ON connections (account_id)
   WHERE kind = 'nas_pull';
-
-COMMIT;

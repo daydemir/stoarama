@@ -551,7 +551,7 @@ def run(cfg):
         while not stop_event.is_set():
             try:
                 check_storage(cfg)
-            except RuntimeError as exc:
+            except (RuntimeError, OSError) as exc:
                 runtime.set_phase(Phase.BLOCKED)
                 runtime.set_error(str(exc))
                 log("ERROR", "storage blocked: %s" % exc)

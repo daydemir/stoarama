@@ -67,14 +67,10 @@ Once Render, domain, and email are live:
 - [ ] Complete relay recovery observability before changing load limits or
   network assumptions: persist boot ID, process start/clean-shutdown markers,
   systemd service result/exit code/signal, last successful heartbeat/capture/
-  upload/update timestamps, bounded relay error tail, and backend heartbeat
-  receipt/rejection/latency metrics keyed by node (never credentials). Upload
-  recovery state on the first successful heartbeat, and test process crash,
-  reboot, OOM/signal, DNS failure, timeout, API rejection, and clean restart in
-  an emulator or disposable relay before fleet rollout.
-- [ ] Make relay outage diagnosis deterministic: persist and report Linux boot
-  ID, process start/clean-shutdown markers, systemd exit result/code/signal,
-  last successful heartbeat/capture/upload/update timestamps, and a bounded
-  relay error tail on recovery. This must distinguish DNS/timeout loss,
-  process crash, OOM/signal, service restart, and host reboot without copying
-  credentials or requiring inbound SSH.
+  upload/update timestamps, and a bounded relay error tail. The first
+  successful heartbeat after recovery must atomically include the recovery
+  metadata (`recovered_at`, outage class/duration, and bounded error tail),
+  alongside backend receipt/rejection/latency metrics keyed by node (never
+  credentials). Test process crash, reboot, OOM/signal, DNS failure, timeout,
+  API rejection, and clean restart in an emulator or disposable relay before
+  fleet rollout; it must not require inbound SSH.
