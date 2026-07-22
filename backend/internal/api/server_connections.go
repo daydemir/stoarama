@@ -88,75 +88,29 @@ func clampPollIntervalSec(v int) int {
 }
 
 const nasPythonImage = "python:3.13-slim-bookworm@sha256:9d7f287598e1a5a978c015ee176d8216435aaf335ed69ac3c38dd1bbb10e8d64"
+const nasBootstrapURL = "https://stoarama.com/nas/download/stoarama-bootstrap-v1.py"
+const nasBootstrapSHA256 = "1b160e541e22c563712343163d2bd072ccf39b1d39da793d5e4b5f74dd839d73"
 
-// This bootstrap is intentionally tiny and frozen in the compose file. It refreshes
-// the durable client from the checksum-verified release channel when possible, but always falls
-// back to the last valid local client if the release endpoint is unavailable.
-const nasClientBootstrap = `import hashlib,json,os,sys,urllib.request
-state='/state'
-current='/state/stoarama_pull.py'
-previous='/state/stoarama_pull.previous.py'
-runtime='/state/runtime.json'
-candidate='/state/stoarama_pull.py.candidate'
-base='https://stoarama.com/nas/download/'
-
-def atomic(path, data):
-    temp=path+'.new'
-    with open(temp,'wb') as output:
-        output.write(data); output.flush(); os.fsync(output.fileno())
-    os.replace(temp,path)
-
-def fetch_latest():
-    with urllib.request.urlopen(base+'latest.json',timeout=30) as response:
-        manifest=json.load(response)
-    artifact=str(manifest.get('artifact',''))
-    expected=str(manifest.get('sha256','')).lower()
-    if not artifact or '/' in artifact or '\\' in artifact or len(expected)!=64:
-        raise RuntimeError('invalid NAS release manifest')
-    with urllib.request.urlopen(base+artifact,timeout=30) as response:
-        source=response.read()
-    if hashlib.sha256(source).hexdigest()!=expected:
-        raise RuntimeError('NAS client checksum mismatch')
-    compile(source,artifact,'exec')
-    return source
-
-os.makedirs(state,exist_ok=True)
-recovered=False
+// nasLaunchCommand verifies and runs the immutable recovery bootstrap. The
+// durable client owns all subsequent checksum-verified updates.
+const nasLaunchCommand = `import hashlib,os,sys,urllib.request
+p='/state/stoarama-bootstrap-v1.py'
+expected='` + nasBootstrapSHA256 + `'
+os.makedirs('/state',exist_ok=True)
 try:
-    with open(runtime,'r') as status_file:
-        status=json.load(status_file)
-    if os.path.exists(previous) and status.get('exit') in ('running','self_update'):
-        with open(previous,'rb') as old_file:
-            source=old_file.read()
-        compile(source,previous,'exec')
-        atomic(current,source)
-        if os.path.exists(candidate): os.unlink(candidate)
-        recovered=True
-        print('NAS bootstrap restored previous client after unclean run',file=sys.stderr,flush=True)
-except (FileNotFoundError,ValueError,TypeError):
-    pass
-if not recovered:
-  try:
-    source=fetch_latest()
-  except Exception as exc:
-    if not os.path.exists(current):
-        raise
-    with open(current,'rb') as existing:
-        compile(existing.read(),current,'exec')
-    print('NAS bootstrap update skipped: %s' % exc,file=sys.stderr,flush=True)
-  else:
-    old=None
-    if os.path.exists(current):
-        with open(current,'rb') as existing:
-            old=existing.read()
-    if old != source:
-        if old is not None:
-            atomic(previous,old)
-        atomic(current,source)
-os.execv(sys.executable,[sys.executable,current,'run'])`
+    source=urllib.request.urlopen('` + nasBootstrapURL + `',timeout=30).read()
+    if hashlib.sha256(source).hexdigest()!=expected: raise RuntimeError('NAS bootstrap checksum mismatch')
+    temporary=p+'.new'
+    with open(temporary,'wb') as output:
+        output.write(source); output.flush(); os.fsync(output.fileno())
+    os.replace(temporary,p)
+except Exception as exc:
+    print('NAS bootstrap download failed; using verified cache: %s'%exc,file=sys.stderr,flush=True)
+    with open(p,'rb') as cached: source=cached.read()
+if hashlib.sha256(source).hexdigest()!=expected: raise RuntimeError('cached NAS bootstrap checksum mismatch')
+exec(compile(source,'stoarama-bootstrap-v1.py','exec'))`
 
 func connectionComposeSnippet(apiBase, token string, connectionID int64, pollIntervalSec int) string {
-	bootstrap := "      " + strings.ReplaceAll(nasClientBootstrap, "\n", "\n      ")
 	return fmt.Sprintf(`services:
   stoarama-pull:
     image: %s
@@ -171,15 +125,11 @@ func connectionComposeSnippet(apiBase, token string, connectionID int64, pollInt
       STOARAMA_UPDATE_MANIFEST_URL: "https://stoarama.com/nas/download/latest.json"
       STOARAMA_DRY_RUN: "0"
       PYTHONUNBUFFERED: "1"
-    command:
-      - python3
-      - -c
-      - |
-%s
+    command: ["python3", "-c", %q]
     volumes:
       - /volume1/stoarama-clips:/clips
       - /volume1/stoarama-state:/state
-`, nasPythonImage, apiBase, token, connectionID, pollIntervalSec, bootstrap)
+`, nasPythonImage, apiBase, token, connectionID, pollIntervalSec, nasLaunchCommand)
 }
 
 // connectionPublicAPIBase is the public /api/v1 base the NAS pull client targets:

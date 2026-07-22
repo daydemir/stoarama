@@ -23,8 +23,30 @@ command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
 
 endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 prefix="nas-releases"
+bootstrap="stoarama-bootstrap-v1.py"
+bootstrap_sha256="1b160e541e22c563712343163d2bd072ccf39b1d39da793d5e4b5f74dd839d73"
 artifact="stoarama-pull-${NAS_VERSION}.py"
 manifest="latest-${NAS_VERSION}.json"
+
+bootstrap_source="${ROOT_DIR}/clients/nas-pull/bootstrap.py"
+actual_bootstrap_sha256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${bootstrap_source}")"
+if [[ "${actual_bootstrap_sha256}" != "${bootstrap_sha256}" ]]; then
+  echo "error: NAS bootstrap changed; publish a new versioned bootstrap" >&2
+  exit 1
+fi
+if aws s3api head-object --bucket "${R2_BUCKET}" --key "${prefix}/${bootstrap}" \
+  --endpoint-url "${endpoint}" >/dev/null 2>&1; then
+  aws s3 cp "s3://${R2_BUCKET}/${prefix}/${bootstrap}" "${STAGE}/${bootstrap}" \
+    --endpoint-url "${endpoint}" --only-show-errors
+  published_bootstrap_sha256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${STAGE}/${bootstrap}")"
+  if [[ "${published_bootstrap_sha256}" != "${bootstrap_sha256}" ]]; then
+    echo "error: published NAS bootstrap checksum does not match" >&2
+    exit 1
+  fi
+else
+  aws s3 cp "${bootstrap_source}" "s3://${R2_BUCKET}/${prefix}/${bootstrap}" \
+    --endpoint-url "${endpoint}" --content-type text/x-python --only-show-errors
+fi
 
 if aws s3api head-object --bucket "${R2_BUCKET}" --key "${prefix}/${manifest}" \
   --endpoint-url "${endpoint}" >/dev/null 2>&1; then
