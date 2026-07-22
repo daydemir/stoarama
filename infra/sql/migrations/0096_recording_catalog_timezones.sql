@@ -4,7 +4,10 @@ JOIN streams st ON st.id = rec.stream_id
 WHERE rec.status IN ('active', 'paused')
   AND st.deleted_at IS NULL
   AND BTRIM(st.local_timezone) <> ''
-  AND EXISTS (SELECT 1 FROM pg_timezone_names zone WHERE zone.name = BTRIM(st.local_timezone))
+  AND EXISTS (
+    SELECT 1 FROM pg_timezone_names zone
+    WHERE zone.name = BTRIM(st.local_timezone)
+  )
   AND rec.cron_timezone <> BTRIM(st.local_timezone)
 ORDER BY rec.id
 FOR UPDATE OF rec;
@@ -16,7 +19,10 @@ WITH affected AS (
   WHERE rec.status IN ('active', 'paused')
     AND st.deleted_at IS NULL
     AND BTRIM(st.local_timezone) <> ''
-    AND EXISTS (SELECT 1 FROM pg_timezone_names zone WHERE zone.name = BTRIM(st.local_timezone))
+    AND EXISTS (
+      SELECT 1 FROM pg_timezone_names zone
+      WHERE zone.name = BTRIM(st.local_timezone)
+    )
     AND rec.cron_timezone <> BTRIM(st.local_timezone)
 )
 UPDATE recording_jobs job
@@ -37,5 +43,8 @@ WHERE rec.stream_id = st.id
   AND rec.status IN ('active', 'paused')
   AND st.deleted_at IS NULL
   AND BTRIM(st.local_timezone) <> ''
-  AND EXISTS (SELECT 1 FROM pg_timezone_names zone WHERE zone.name = BTRIM(st.local_timezone))
+  AND EXISTS (
+    SELECT 1 FROM pg_timezone_names zone
+    WHERE zone.name = BTRIM(st.local_timezone)
+  )
   AND rec.cron_timezone <> BTRIM(st.local_timezone);
