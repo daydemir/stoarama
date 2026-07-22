@@ -1366,15 +1366,15 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		    last_error_text=CASE WHEN status='completed' THEN '' ELSE last_error_text END,
 		    last_error_at=CASE WHEN status='completed' THEN NULL ELSE last_error_at END,
 		    updated_at=now()
-		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+		WHERE id=$1 AND account_id=$2 AND status=$13
 	`, id, principal.AccountID, mode, cronExprForNext, cronTimezone, clipDuration,
-		dwStartForNext, dwEndForNext, targetFPSArg, startAt, endAtArg, nextFireArg)
+		dwStartForNext, dwEndForNext, targetFPSArg, startAt, endAtArg, nextFireArg, curStatus)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update recording schedule: %v", err))
 		return
 	}
 	if ct.RowsAffected() == 0 {
-		util.WriteError(w, http.StatusNotFound, "recording not found")
+		util.WriteError(w, http.StatusConflict, "recording status changed; refresh and try again")
 		return
 	}
 
