@@ -19,6 +19,16 @@ type Client struct {
 	httpc   *http.Client
 }
 
+type StatusError struct {
+	Label string
+	Code  int
+	Body  string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("%s status=%d body=%s", e.Label, e.Code, e.Body)
+}
+
 func New(baseURL, token string, httpc *http.Client, timeout time.Duration) (*Client, error) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
@@ -121,7 +131,7 @@ func (c *Client) put(ctx context.Context, uploadURL string, body io.Reader, leng
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		return fmt.Errorf("%s status=%d body=%s", label, resp.StatusCode, strings.TrimSpace(string(body)))
+		return &StatusError{Label: label, Code: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return nil
 }

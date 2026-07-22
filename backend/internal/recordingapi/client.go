@@ -17,7 +17,8 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/survey"
 )
 
-const uploadTimeout = 5 * time.Minute
+// UploadTimeout bounds the complete upload of one finalized recording segment.
+const UploadTimeout = 5 * time.Minute
 
 type ClientConfig struct {
 	BaseURL    string
@@ -50,8 +51,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, err
 	}
 	uploadHTTP := *httpc
-	uploadHTTP.Timeout = uploadTimeout
-	uploads, err := apihttp.New(baseURL, cfg.NodeToken, &uploadHTTP, uploadTimeout)
+	uploadHTTP.Timeout = UploadTimeout
+	uploads, err := apihttp.New(baseURL, cfg.NodeToken, &uploadHTTP, UploadTimeout)
 	if err != nil {
 		return nil, err
 	}
