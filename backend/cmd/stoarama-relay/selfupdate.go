@@ -18,8 +18,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+var lastUpdaterUnix atomic.Int64
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
 // binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
@@ -108,7 +111,7 @@ func runSelfUpdate(args []string) error {
 		if err := atomicWriteExecutable(target, previous); err != nil {
 			return err
 		}
-		return restartService()
+		return restartAfterSelfUpdate()
 	}
 	manifest := releaseManifest(*manifestName)
 	base := strings.TrimRight(strings.TrimSpace(*apiURL), "/")
@@ -163,7 +166,7 @@ func runSelfUpdate(args []string) error {
 		}
 	}
 	if relayUpdated {
-		return restartService()
+		return restartAfterSelfUpdate()
 	}
 	return nil
 }
@@ -206,6 +209,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 // binary actually changed. Errors are logged and swallowed so a bad manifest or a
 // transient network failure never takes the relay down.
 func checkAndApplyUpdate(base string, manifest releaseManifest) {
+	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
 	lj, err := fetchLatest(base, manifest)
 	if err != nil {
 		log.Printf("relay self-update: fetch latest.json: %v", err)
@@ -238,7 +242,7 @@ func checkAndApplyUpdate(base string, manifest releaseManifest) {
 
 	if relayUpdated {
 		log.Printf("relay self-update: restarting service to load new binary")
-		if err := restartService(); err != nil {
+		if err := restartAfterSelfUpdate(); err != nil {
 			log.Printf("relay self-update: restart failed: %v", err)
 		}
 	}

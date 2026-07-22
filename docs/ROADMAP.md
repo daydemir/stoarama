@@ -59,18 +59,18 @@ Once Render, domain, and email are live:
 
 ## Operational TODOs
 
-- [ ] Diagnose the prolonged `streetscore-2` outage after the relay rollout:
-  correlate relay heartbeat attempts and recording load with backend heartbeat
-  receipts and freshness/status calculations, and compare Streetscore 1/3. Keep
-  this read-only until we distinguish relay/network loss from backend ingestion
-  or display errors.
+- [ ] Correlate relay heartbeat attempts and recording load with backend
+  heartbeat receipts and freshness/status calculations. Keep diagnosis
+  read-only until relay/network loss is distinguished from backend ingestion
+  or display errors; track individual outages in the incident runbook.
 - [ ] Complete relay recovery observability before changing load limits or
   network assumptions: persist boot ID, process start/clean-shutdown markers,
-  systemd service result/exit code/signal, last successful heartbeat/capture/
-  upload/update timestamps, and a bounded relay error tail. The first
-  successful heartbeat after recovery must atomically include the recovery
-  metadata (`recovered_at`, outage class/duration, and bounded error tail),
-  alongside backend receipt/rejection/latency metrics keyed by node (never
-  credentials). Test process crash, reboot, OOM/signal, DNS failure, timeout,
+  last successful heartbeat/capture/upload/update timestamps, and a bounded
+  relay error tail. The first successful heartbeat after recovery must
+  atomically include the recovery metadata (`recovered_at`, `previous_exit`, and
+  bounded error tail), with no credentials. Follow up separately with outage
+  class/duration, systemd exit result/signal, and
+  backend receipt/rejection/latency metrics. Test process crash, reboot,
+  OOM/signal, DNS failure, timeout,
   API rejection, and clean restart in an emulator or disposable relay before
   fleet rollout; it must not require inbound SSH.

@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -168,6 +171,87 @@ func TestHeartbeatDiagnosticsRejectsOversizedState(t *testing.T) {
 	}
 	if _, err := loadHeartbeatDiagnostics(path); err == nil {
 		t.Fatal("oversized diagnostics state accepted")
+	}
+}
+
+func TestRelayHealthSnapshotUsesDataDirectory(t *testing.T) {
+	health := relayHealthSnapshot(t.TempDir())
+	if free, ok := health["disk_free_bytes"].(uint64); !ok || free == 0 {
+		t.Fatalf("disk_free_bytes=%v want positive uint64", health["disk_free_bytes"])
+	}
+}
+
+func TestAppendDiagnosticErrorsMergesSanitizesAndBounds(t *testing.T) {
+	existing := []string{"capture old"}
+	incoming := []string{
+		"capture old",
+		"fetch https://example.com/path?token=secret failed",
+		"capture 2", "capture 3", "capture 4", "capture 5",
+		"capture 6", "capture 7", "capture 8", "capture 9",
+	}
+	got := appendDiagnosticErrors(existing, incoming)
+	if len(got) != 8 {
+		t.Fatalf("len=%d want 8: %v", len(got), got)
+	}
+	for _, value := range got {
+		if strings.Contains(value, "secret") {
+			t.Fatalf("unsanitized diagnostic: %q", value)
+		}
+	}
+	if got[len(got)-1] != "capture 9" {
+		t.Fatalf("newest=%q want capture 9", got[len(got)-1])
+	}
+}
+
+func TestMarkRelayExitPersistsSelfUpdate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(func() { plannedSelfUpdate.Store(false) })
+	markRelayExit(relayExitSelfUpdate)
+	state, err := loadRecoveryState(recoveryStatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.PreviousExit != relayExitSelfUpdate {
+		t.Fatalf("previous_exit=%q want %q", state.PreviousExit, relayExitSelfUpdate)
+	}
+	if err := (&relayRecoveryState{PreviousExit: relayExitUncleanProcess}).persist(recoveryStatePath()); err != nil {
+		t.Fatal(err)
+	}
+	state, err = loadRecoveryState(recoveryStatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.PreviousExit != relayExitSelfUpdate {
+		t.Fatalf("stale write changed previous_exit to %q", state.PreviousExit)
+	}
+}
+
+func TestRecoveryStateConcurrentWritesRemainAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay-recovery.json")
+	var writes sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		writes.Add(1)
+		go func(exit string) {
+			defer writes.Done()
+			if err := (&relayRecoveryState{PreviousExit: exit}).persist(path); err != nil {
+				t.Errorf("persist: %v", err)
+			}
+		}(fmt.Sprintf("exit-%d", i))
+	}
+	writes.Wait()
+	state, err := loadRecoveryState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(state.PreviousExit, "exit-") {
+		t.Fatalf("previous_exit=%q", state.PreviousExit)
+	}
+	leftovers, err := filepath.Glob(path + ".new-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temporary files remain: %v", leftovers)
 	}
 }
 

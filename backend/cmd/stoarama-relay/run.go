@@ -87,9 +87,16 @@ func runRelay(ctx context.Context) error {
 		return fmt.Errorf("establish rollback baseline: %w", err)
 	}
 	firstHeartbeat := make(chan struct{})
-	go relayHeartbeatLoop(ctx, client, pr, &activeJobs, cfg, relayDiag, startedAt, firstHeartbeat)
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		relayHeartbeatLoop(heartbeatCtx, client, pr, &activeJobs, cfg, relayDiag, startedAt, firstHeartbeat)
+	}()
 	select {
 	case <-ctx.Done():
+		stopHeartbeat()
+		<-heartbeatDone
 		return ctx.Err()
 	case <-firstHeartbeat:
 	}
@@ -101,7 +108,15 @@ func runRelay(ctx context.Context) error {
 	go pr.runLoop(ctx)
 	go selfUpdateLoop(ctx, cfg)
 
-	return worker.Run(ctx)
+	err = worker.Run(ctx)
+	stopHeartbeat()
+	<-heartbeatDone
+	if err == nil || ctx.Err() != nil {
+		if path := recoveryStatePath(); path != "" {
+			markRelayExit(relayExitClean)
+		}
+	}
+	return err
 }
 
 func relayFFmpegBin(binDir string) string {
