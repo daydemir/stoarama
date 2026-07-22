@@ -520,11 +520,11 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 				log.Printf("relay recovery state persist error: %v", persistErr)
 			} else {
 				recoveryPending = false
-				if persistErr := heartbeatDiag.SucceededAt(recoveredAt); persistErr != nil {
-					log.Printf("relay diagnostics persist error: %v", persistErr)
-				} else if hasOffline {
-					heartbeatDiag.Sent()
-				}
+			}
+			if persistErr := heartbeatDiag.SucceededAt(recoveredAt); persistErr != nil {
+				log.Printf("relay diagnostics persist error: %v", persistErr)
+			} else if hasOffline {
+				heartbeatDiag.Sent()
 			}
 		}
 	}
