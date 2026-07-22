@@ -793,7 +793,7 @@
         <div id="plazaHourlyNamingFields" class="hidden">
           <div class="hint" style="margin-bottom:10px;">Plaza hourly supports sampled clips with Custom schedule <span class="mono">0 8-19 * * *</span>, or continuous recording with any daily window and 1, 5, or 10 min clips.</div>
           <div class="grid-2">
-            <div class="field"><label for="namingPlazaID">Plaza ID</label><input id="namingPlazaID" type="text" placeholder="Assigned automatically" /></div>
+            <div class="field"><label for="namingPlazaID">Plaza ID</label><input id="namingPlazaID" type="text" placeholder="08" /></div>
             <div class="field"><label for="namingContinent">Continent required</label><input id="namingContinent" type="text" placeholder="Europe" /></div>
             <div class="field"><label for="namingCountry">Country required</label><input id="namingCountry" type="text" placeholder="Finland" /></div>
             <div class="field"><label for="namingCity">City required</label><input id="namingCity" type="text" placeholder="Kuopio" /></div>
@@ -1454,7 +1454,7 @@
       }
       const n = buildNamingPayload().metadata;
       const automaticPlazaID = Number(state.catalogStreamId) > 0;
-      const fieldsOK = (automaticPlazaID || n.plaza_id) && n.continent && n.country && n.city && n.plaza_name;
+      const fieldsOK = n.continent && n.country && n.city && n.plaza_name;
       const idOK = automaticPlazaID || (/^\d+$/.test(n.plaza_id) && Number(n.plaza_id) > 0);
       const sched = compiledSchedule();
       const continuousOK = state.composerScheduleMode === 'continuous'

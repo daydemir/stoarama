@@ -12,4 +12,7 @@ CREATE TABLE account_stream_plaza_ids (
   UNIQUE (account_id, plaza_id)
 );
 
+CREATE INDEX account_stream_plaza_ids_stream_id_idx
+  ON account_stream_plaza_ids (stream_id);
+
 COMMIT;

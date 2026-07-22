@@ -234,6 +234,44 @@ type catalogNamingDefaults struct {
 	PlazaName string
 }
 
+type catalogRecordingDefaults struct {
+	URL           string
+	Provider      string
+	SourcePageURL string
+	Timezone      string
+	Naming        catalogNamingDefaults
+}
+
+type recordingQueryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func loadCatalogRecordingDefaults(ctx context.Context, q recordingQueryRower, streamID int64, forUpdate bool) (catalogRecordingDefaults, error) {
+	lock := ""
+	if forUpdate {
+		lock = " FOR UPDATE"
+	}
+	var defaults catalogRecordingDefaults
+	err := q.QueryRow(ctx, `
+		SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,''), local_timezone,
+		       COALESCE(NULLIF(metadata_jsonb->>'continent',''), NULLIF(metadata_jsonb#>>'{csv_values,continent}',''), ''),
+		       COALESCE(location_country,''), COALESCE(location_city,''), name
+		FROM streams
+		WHERE id=$1 AND deleted_at IS NULL`+lock,
+		streamID,
+	).Scan(
+		&defaults.URL,
+		&defaults.Provider,
+		&defaults.SourcePageURL,
+		&defaults.Timezone,
+		&defaults.Naming.Continent,
+		&defaults.Naming.Country,
+		&defaults.Naming.City,
+		&defaults.Naming.PlazaName,
+	)
+	return defaults, err
+}
+
 func applyCatalogNamingDefaults(req *recordingNamingRequest, defaults catalogNamingDefaults) {
 	if req == nil {
 		return
@@ -544,14 +582,7 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			util.WriteError(w, http.StatusBadRequest, "stream_id is invalid")
 			return
 		}
-		var catalogURL, provider, sourcePageURL string
-		err := s.pool.QueryRow(r.Context(), `
-			SELECT source_url, COALESCE(provider,''), COALESCE(source_page_url,''), local_timezone,
-			       COALESCE(NULLIF(metadata_jsonb->>'continent',''), NULLIF(metadata_jsonb#>>'{csv_values,continent}',''), ''),
-			       COALESCE(location_country,''), COALESCE(location_city,''), name
-			FROM streams
-			WHERE id=$1 AND deleted_at IS NULL
-		`, *req.StreamID).Scan(&catalogURL, &provider, &sourcePageURL, &catalogTimezone, &namingDefaults.Continent, &namingDefaults.Country, &namingDefaults.City, &namingDefaults.PlazaName)
+		catalog, err := loadCatalogRecordingDefaults(r.Context(), s.pool, *req.StreamID, false)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				util.WriteError(w, http.StatusNotFound, "catalog stream not found")
@@ -560,15 +591,17 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load catalog stream: %v", err))
 			return
 		}
-		streamURL = strings.TrimSpace(catalogURL)
+		streamURL = strings.TrimSpace(catalog.URL)
 		if streamURL == "" {
 			util.WriteError(w, http.StatusBadRequest, "catalog stream has no source_url")
 			return
 		}
 		streamIDArg = *req.StreamID
 		catalogStreamID = *req.StreamID
-		catalogProvider = provider
-		catalogSourcePageURL = sourcePageURL
+		catalogProvider = catalog.Provider
+		catalogSourcePageURL = catalog.SourcePageURL
+		catalogTimezone = catalog.Timezone
+		namingDefaults = catalog.Naming
 	}
 	applyCatalogNamingDefaults(req.Naming, namingDefaults)
 	if streamURL == "" {
@@ -1705,14 +1738,8 @@ func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if linkedStreamID > 0 {
-		var defaults catalogNamingDefaults
-		if err := tx.QueryRow(r.Context(), `
-			SELECT COALESCE(NULLIF(metadata_jsonb->>'continent',''), NULLIF(metadata_jsonb#>>'{csv_values,continent}',''), ''),
-			       COALESCE(location_country,''), COALESCE(location_city,''), name
-			FROM streams
-			WHERE id=$1 AND deleted_at IS NULL
-			FOR UPDATE
-		`, linkedStreamID).Scan(&defaults.Continent, &defaults.Country, &defaults.City, &defaults.PlazaName); err != nil {
+		catalog, err := loadCatalogRecordingDefaults(r.Context(), tx, linkedStreamID, true)
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				util.WriteError(w, http.StatusConflict, "catalog stream changed; retry")
 				return
@@ -1720,7 +1747,7 @@ func (s *Server) handleAccountRecordingNaming(w http.ResponseWriter, r *http.Req
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load catalog naming metadata: %v", err))
 			return
 		}
-		applyCatalogNamingDefaults(&req, defaults)
+		applyCatalogNamingDefaults(&req, catalog.Naming)
 	}
 	var mode, cronExpr, dailyWindowStart, dailyWindowEnd string
 	var clipDuration int
