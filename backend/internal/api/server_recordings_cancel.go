@@ -39,7 +39,7 @@ func (s *Server) cancelRecordings(w http.ResponseWriter, r *http.Request, accoun
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
 	rows, err := tx.Query(r.Context(), `
-		UPDATE recordings SET status='canceled', next_fire_at=NULL, updated_at=now()
+		UPDATE recordings SET status='canceled', next_fire_at=NULL, paused_at=NULL, updated_at=now()
 		WHERE account_id=$1 AND id=ANY($2::bigint[])
 		RETURNING id
 	`, accountID, ids)

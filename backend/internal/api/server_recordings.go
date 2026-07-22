@@ -65,6 +65,23 @@ const recordingListSelectSQL = `
 		   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
 		(SELECT count(*) FROM recording_clips c
 		   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
+		rec.paused_at,
+		CASE WHEN rec.status='completed' THEN COALESCE(rec.completed_captured_clip_count,0)
+		ELSE (SELECT count(*) FROM recording_clips c
+		   WHERE c.recording_id = rec.id
+		     AND c.clip_start_at >= CASE
+		       WHEN rec.status='paused' THEN GREATEST(rec.start_at, rec.paused_at - interval '24 hours')
+		       ELSE GREATEST(rec.start_at, now() - interval '24 hours')
+		     END
+		     AND c.clip_start_at < CASE
+		       WHEN rec.status='paused' THEN rec.paused_at
+		       ELSE LEAST(now(), COALESCE(rec.end_at, now()))
+		     END
+		     AND c.clip_end_at <= CASE
+		       WHEN rec.status='paused' THEN rec.paused_at
+		       ELSE LEAST(now(), COALESCE(rec.end_at, now()))
+		     END) END AS captured_clip_count,
+		rec.completed_captured_clip_count, rec.completed_expected_clip_count,
 		rec.created_at, sd.managed,
 		rec.stream_id, st.name, st.location_text,
 		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''), rec.active_weekdays,
@@ -1909,7 +1926,9 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 
 	ct, err := tx.Exec(r.Context(), `
 		UPDATE recordings
-		SET status=$3, next_fire_at=$4, updated_at=now()
+		SET status=$3, next_fire_at=$4,
+		    paused_at=CASE WHEN $3='paused' THEN now() ELSE NULL END,
+		    updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND status=$5
 	`, id, principal.AccountID, toStatus, nextFireArg, fromStatus)
 	if err != nil {
@@ -2038,50 +2057,54 @@ func resolveRecordingStreamURL(ctx context.Context, provider, streamURL, sourceP
 // "add a card to capture" state.
 func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, error) {
 	var (
-		id               int64
-		name             string
-		streamURL        string
-		storageDestID    int64
-		storageDestName  string
-		sourceKind       string
-		cronExpr         string
-		cronTimezone     string
-		clipDurationSec  int
-		targetFPS        *int
-		status           string
-		startAt          time.Time
-		endAt            *time.Time
-		nextFireAt       *time.Time
-		lastClipAt       *time.Time
-		lastErrorText    string
-		lastErrorAt      *time.Time
-		consecutiveFails int
-		hasPaymentMethod bool
-		recentClipCount  int64
-		createdAt        time.Time
-		managed          bool
-		streamID         *int64
-		streamName       *string
-		streamLocation   *string
-		mode             string
-		dailyWindowStart string
-		dailyWindowEnd   string
-		activeWeekdays   recsched.WeekdaySet
-		retentionTier    string
-		delivery         string
-		captureVia       string
-		namingProfile    string
-		folderName       string
-		namingMetadata   []byte
-		hasRelayOnline   bool
-		relayNodeName    *string
+		id                int64
+		name              string
+		streamURL         string
+		storageDestID     int64
+		storageDestName   string
+		sourceKind        string
+		cronExpr          string
+		cronTimezone      string
+		clipDurationSec   int
+		targetFPS         *int
+		status            string
+		startAt           time.Time
+		endAt             *time.Time
+		nextFireAt        *time.Time
+		lastClipAt        *time.Time
+		lastErrorText     string
+		lastErrorAt       *time.Time
+		consecutiveFails  int
+		hasPaymentMethod  bool
+		recentClipCount   int64
+		pausedAt          *time.Time
+		capturedClips     int64
+		completedCaptured *int64
+		completedExpected *int64
+		createdAt         time.Time
+		managed           bool
+		streamID          *int64
+		streamName        *string
+		streamLocation    *string
+		mode              string
+		dailyWindowStart  string
+		dailyWindowEnd    string
+		activeWeekdays    recsched.WeekdaySet
+		retentionTier     string
+		delivery          string
+		captureVia        string
+		namingProfile     string
+		folderName        string
+		namingMetadata    []byte
+		hasRelayOnline    bool
+		relayNodeName     *string
 	)
 	if err := row.Scan(
 		&id, &name, &streamURL, &storageDestID, &storageDestName,
 		&sourceKind, &cronExpr, &cronTimezone, &clipDurationSec, &targetFPS,
 		&status, &startAt, &endAt, &nextFireAt, &lastClipAt,
 		&lastErrorText, &lastErrorAt, &consecutiveFails,
-		&hasPaymentMethod, &recentClipCount, &createdAt, &managed,
+		&hasPaymentMethod, &recentClipCount, &pausedAt, &capturedClips, &completedCaptured, &completedExpected, &createdAt, &managed,
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd, &activeWeekdays,
 		&retentionTier, &delivery,
@@ -2091,6 +2114,21 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		return nil, err
 	}
 	now := time.Now().UTC()
+	coverageStart, coverageEnd := recordingCoverageWindow(status, startAt, endAt, pausedAt, now)
+	expectedClips := int64(0)
+	captureHealth := recordingCaptureHealthUnavailable
+	var err error
+	if status == "completed" && completedCaptured != nil && completedExpected != nil {
+		capturedClips = *completedCaptured
+		expectedClips = *completedExpected
+		captureHealth = recordingCaptureHealth(status, capturedClips, expectedClips)
+	} else if status != "completed" {
+		expectedClips, err = expectedRecordingClips(mode, cronExpr, cronTimezone, dailyWindowStart, dailyWindowEnd, activeWeekdays, clipDurationSec, startAt, coverageStart, coverageEnd)
+		captureHealth = recordingCaptureHealth(status, capturedClips, expectedClips)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("compute recording %d capture health: %w", id, err)
+	}
 	inWindow := !startAt.After(now) && (endAt == nil || now.Before(*endAt))
 	live := status == "active" && inWindow && hasPaymentMethod
 	needsCard := billingEnabled && !hasPaymentMethod
@@ -2127,6 +2165,9 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"last_error_at":            lastErrorAt,
 		"consecutive_failures":     consecutiveFails,
 		"recent_clip_count":        recentClipCount,
+		"captured_clip_count":      capturedClips,
+		"expected_clip_count":      expectedClips,
+		"capture_health":           captureHealth,
 		"created_at":               createdAt.UTC(),
 		"stream_id":                streamID,
 		"stream_name":              streamName,
@@ -2285,5 +2326,74 @@ func recordingHealth(status string, consecutiveFailures int) string {
 		return "degraded"
 	default:
 		return "failing"
+	}
+}
+
+type recordingCaptureHealthState string
+
+const (
+	recordingCaptureHealthNotExpected recordingCaptureHealthState = "not_expected"
+	recordingCaptureHealthHealthy     recordingCaptureHealthState = "healthy"
+	recordingCaptureHealthWarning     recordingCaptureHealthState = "warning"
+	recordingCaptureHealthCritical    recordingCaptureHealthState = "critical"
+	recordingCaptureHealthUnavailable recordingCaptureHealthState = "unavailable"
+)
+
+func recordingCoverageWindow(status string, startAt time.Time, endAt, pausedAt *time.Time, now time.Time) (time.Time, time.Time) {
+	end := now
+	switch status {
+	case "paused":
+		if pausedAt != nil {
+			end = pausedAt.UTC()
+		}
+	case "completed":
+		if endAt != nil {
+			end = endAt.UTC()
+		}
+	}
+	start := startAt.UTC()
+	if status != "completed" {
+		start = end.Add(-24 * time.Hour)
+		if start.Before(startAt) {
+			start = startAt.UTC()
+		}
+	}
+	if endAt != nil && end.After(*endAt) {
+		end = endAt.UTC()
+	}
+	if end.Before(start) {
+		return start, start
+	}
+	return start, end
+}
+
+func expectedRecordingClips(mode, cronExpr, timezone, dailyStart, dailyEnd string, weekdays recsched.WeekdaySet, clipDurationSec int, scheduleStart, start, end time.Time) (int64, error) {
+	var startTOD, endTOD *recsched.TimeOfDay
+	if mode == "continuous" {
+		parsedStart, err := recsched.ParseTimeOfDay(dailyStart)
+		if err != nil {
+			return 0, err
+		}
+		parsedEnd, err := recsched.ParseTimeOfDay(dailyEnd)
+		if err != nil {
+			return 0, err
+		}
+		startTOD, endTOD = &parsedStart, &parsedEnd
+	}
+	return recsched.ExpectedClipCount(mode, cronExpr, timezone, startTOD, endTOD, weekdays, clipDurationSec, scheduleStart, start, end)
+}
+
+func recordingCaptureHealth(status string, captured, expected int64) recordingCaptureHealthState {
+	if status == "canceled" || expected == 0 {
+		return recordingCaptureHealthNotExpected
+	}
+	percent := float64(captured) / float64(expected) * 100
+	switch {
+	case percent >= 98:
+		return recordingCaptureHealthHealthy
+	case percent >= 90:
+		return recordingCaptureHealthWarning
+	default:
+		return recordingCaptureHealthCritical
 	}
 }
