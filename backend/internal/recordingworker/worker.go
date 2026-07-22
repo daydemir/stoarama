@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
@@ -321,7 +323,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if canceled() {
 			return nil
 		}
-		segmentIngested = true
 		segStartMs := seg.StartAt.UTC().UnixMilli()
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
 		intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType, segStartMs)
@@ -330,7 +331,16 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return fmt.Errorf("reserve segment upload: %w", err)
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
-		if err := w.cfg.Client.UploadFile(jobCtx, intent.UploadURL, seg.Path, seg.MIMEType); err != nil {
+		uploadCtx, uploadCancel := context.WithTimeout(jobCtx, recordingapi.UploadTimeout)
+		err = uploadWithRetry(uploadCtx, job.JobID, func(attemptCtx context.Context) error {
+			return w.cfg.Client.UploadFile(attemptCtx, intent.UploadURL, seg.Path, seg.MIMEType)
+		}, func(err error, delay time.Duration) {
+			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_retry", err)
+			log.Printf("recording worker job=%d recording=%d segment upload failed: %v; retrying in %s",
+				job.JobID, job.RecordingID, err, delay)
+		})
+		uploadCancel()
+		if err != nil {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_failed", err)
 			return fmt.Errorf("upload segment: %w", err)
 		}
@@ -354,6 +364,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// re-capturing the same wall-clock second). Treat as already-done so a
 			// re-lease is idempotent rather than failing the whole window.
 			if isAlreadyIngested(err) {
+				segmentIngested = true
 				capture.RemoveSegmentFile(seg)
 				w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
 				return nil
@@ -361,6 +372,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
 			return fmt.Errorf("ingest segment: %w", err)
 		}
+		segmentIngested = true
 		capture.RemoveSegmentFile(seg)
 		w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
 		log.Printf("recording worker job=%d recording=%d continuous segment ingested start=%s size=%d",
@@ -374,8 +386,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// resolve + capture in a loop and reconnect until the window closes. In-window
 	// restarts must NOT consume attempt_count, so fail() is never called for a
 	// resolve/capture drop here; the job only fails on a permanent misconfiguration.
-	// Exponential reconnect backoff: consecutive failed attempts grow the delay
-	// (30s, 60s, 120s, 240s, 300s cap) so a persistently dead source is not hammered,
+	// Jittered exponential reconnect backoff gives transient drops a fast retry and
+	// grows to a five-minute cap so a persistently dead source is not hammered,
 	// while an attempt that ingested at least one clip resets failures to zero. The
 	// sleep stays interruptible by windowCtx.Done() (window close / job cancel) just
 	// like a fixed delay.
@@ -405,7 +417,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "resolve_retry", err)
 			failures++
-			delay := reconnectBackoff(failures)
+			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			backoff(delay)
@@ -426,7 +438,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "ssrf_retry", err)
 			failures++
-			delay := reconnectBackoff(failures)
+			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			backoff(delay)
@@ -460,7 +472,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			failures = 0
 		}
 		failures++
-		delay := reconnectBackoff(failures)
+		delay := reconnectBackoff(job.JobID, failures)
 		if captureErr != nil {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "capture_retry", captureErr)
 		} else {
@@ -495,26 +507,56 @@ func continuousShouldStop(canceled, windowClosed bool) bool {
 	return canceled || windowClosed
 }
 
-// reconnectBackoff returns the supervisor reconnect delay for a given count of
-// consecutive failed attempts (failures >= 1): 30s doubling per failure, capped at
-// 5m -> 30s, 60s, 120s, 240s, 300s. An attempt that ingested a clip resets failures
-// to 0, so the next failure restarts the sequence at 30s. Kept pure and small so the
-// schedule is unit-testable, mirroring continuousShouldStop.
-func reconnectBackoff(failures int) time.Duration {
-	const base = 30 * time.Second
+// reconnectBackoff returns a deterministic per-job jittered delay. It starts at
+// 1-2s for fast recovery after a healthy source drop and grows to 2.5-5m for a
+// persistently dead source without synchronizing every job against one origin.
+func reconnectBackoff(jobID int64, failures int) time.Duration {
+	const base = 2 * time.Second
 	const maxDelay = 5 * time.Minute
-	if failures < 1 {
-		failures = 1
+	nominal := maxDelay
+	if failures-1 < 8 {
+		nominal = base << (failures - 1)
 	}
-	// Clamp the shift before it can overflow; the cap dominates well before then.
-	if failures-1 >= 5 {
-		return maxDelay
+	return jitteredDelay(jobID, failures, nominal)
+}
+
+func jitteredDelay(jobID int64, attempt int, nominal time.Duration) time.Duration {
+	hash := uint64(jobID)*0x9e3779b97f4a7c15 ^ uint64(attempt)*0xbf58476d1ce4e5b9
+	return nominal * time.Duration(50+hash%51) / 100
+}
+
+func uploadWithRetry(ctx context.Context, jobID int64, upload func(context.Context) error, onRetry func(error, time.Duration)) error {
+	const attempts = 3
+	const attemptTimeout = 90 * time.Second
+	for attempt := 1; ; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		err := upload(attemptCtx)
+		cancel()
+		if err == nil || attempt == attempts || !retryableUploadError(ctx, err) {
+			return err
+		}
+		delay := jitteredDelay(jobID, attempt, time.Duration(1<<(attempt-1))*time.Second)
+		onRetry(err, delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	d := base << (failures - 1)
-	if d > maxDelay {
-		return maxDelay
+}
+
+func retryableUploadError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return false
 	}
-	return d
+	var statusErr *apihttp.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Code == 408 || statusErr.Code == 425 || statusErr.Code == 429 || statusErr.Code >= 500
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // isAlreadyIngested reports whether an ingest error is the server's 409 dedup

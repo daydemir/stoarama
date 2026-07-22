@@ -1,9 +1,14 @@
 package recordingworker
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
@@ -54,29 +59,88 @@ func TestIsAlreadyIngested(t *testing.T) {
 	}
 }
 
-// TestReconnectBackoff pins the exponential reconnect schedule: 30s doubling per
-// consecutive failure, capped at 5m. failures==0 (never happens in the loop but
-// guarded) and failures==1 both yield the 30s base, and every count past the cap
-// stays at 5m. A clip-bearing attempt resets failures to 0 elsewhere, restarting
-// this sequence at 30s.
+// TestReconnectBackoff pins the bounded, deterministic, per-job jitter used to
+// avoid synchronized reconnects against a shared origin.
 func TestReconnectBackoff(t *testing.T) {
 	cases := []struct {
 		failures int
-		want     time.Duration
+		min      time.Duration
+		max      time.Duration
 	}{
-		{failures: 0, want: 30 * time.Second},
-		{failures: 1, want: 30 * time.Second},
-		{failures: 2, want: 60 * time.Second},
-		{failures: 3, want: 120 * time.Second},
-		{failures: 4, want: 240 * time.Second},
-		{failures: 5, want: 5 * time.Minute},
-		{failures: 6, want: 5 * time.Minute},
-		{failures: 100, want: 5 * time.Minute},
+		{failures: 1, min: time.Second, max: 2 * time.Second},
+		{failures: 2, min: 2 * time.Second, max: 4 * time.Second},
+		{failures: 3, min: 4 * time.Second, max: 8 * time.Second},
+		{failures: 6, min: 32 * time.Second, max: 64 * time.Second},
+		{failures: 9, min: 150 * time.Second, max: 5 * time.Minute},
+		{failures: 100, min: 150 * time.Second, max: 5 * time.Minute},
 	}
 	for _, tc := range cases {
-		if got := reconnectBackoff(tc.failures); got != tc.want {
-			t.Fatalf("reconnectBackoff(%d) = %s, want %s", tc.failures, got, tc.want)
+		got := reconnectBackoff(145539, tc.failures)
+		if got < tc.min || got > tc.max {
+			t.Fatalf("reconnectBackoff(%d) = %s, want %s..%s", tc.failures, got, tc.min, tc.max)
 		}
+		if again := reconnectBackoff(145539, tc.failures); again != got {
+			t.Fatalf("reconnectBackoff is not deterministic: %s then %s", got, again)
+		}
+	}
+	if reconnectBackoff(145539, 1) == reconnectBackoff(145540, 1) {
+		t.Fatal("different jobs received identical first reconnect delay")
+	}
+}
+
+func TestRetryableUploadError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{err: &apihttp.StatusError{Code: 502}, want: true},
+		{err: &apihttp.StatusError{Code: 429}, want: true},
+		{err: &apihttp.StatusError{Code: 403}, want: false},
+		{err: &net.DNSError{Err: "temporary", IsTemporary: true}, want: true},
+		{err: context.DeadlineExceeded, want: true},
+	}
+	for _, tc := range tests {
+		if got := retryableUploadError(context.Background(), tc.err); got != tc.want {
+			t.Errorf("retryableUploadError(%v)=%v want %v", tc.err, got, tc.want)
+		}
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if retryableUploadError(canceled, &apihttp.StatusError{Code: 502}) {
+		t.Fatal("canceled upload is retryable")
+	}
+}
+
+func TestUploadWithRetry(t *testing.T) {
+	attempts := 0
+	err := uploadWithRetry(context.Background(), 1, func(context.Context) error {
+		attempts++
+		if attempts < 3 {
+			return &apihttp.StatusError{Code: 502}
+		}
+		return nil
+	}, func(error, time.Duration) {})
+	if err != nil || attempts != 3 {
+		t.Fatalf("err=%v attempts=%d", err, attempts)
+	}
+
+	attempts = 0
+	err = uploadWithRetry(context.Background(), 1, func(context.Context) error {
+		attempts++
+		return fmt.Errorf("permanent")
+	}, func(error, time.Duration) {})
+	if err == nil || attempts != 1 {
+		t.Fatalf("permanent err=%v attempts=%d", err, attempts)
+	}
+
+	attempts = 0
+	canceled, cancel := context.WithCancel(context.Background())
+	err = uploadWithRetry(canceled, 1, func(context.Context) error {
+		attempts++
+		return &apihttp.StatusError{Code: 502}
+	}, func(error, time.Duration) { cancel() })
+	if !errors.Is(err, context.Canceled) || attempts != 1 {
+		t.Fatalf("canceled err=%v attempts=%d", err, attempts)
 	}
 }
 
