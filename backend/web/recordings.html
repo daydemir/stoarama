@@ -3110,11 +3110,16 @@
         return;
       }
       let html = '';
-      const ongoing = items.filter((rec) => !isCompleted(rec));
-      const completed = items.filter((rec) => isCompleted(rec));
-      if (ongoing.length) {
-        html += `<div class="group-title">Ongoing</div>`;
-        html += recordingsTableHTML(`<tbody>${ongoing.map((rec) => recordingRowHTML(rec)).join('')}</tbody>`);
+      const active = items.filter((rec) => ['active', 'scheduled'].includes(recordingFilterKey(rec)));
+      const paused = items.filter((rec) => recordingFilterKey(rec) === 'paused');
+      const completed = items.filter((rec) => recordingFilterKey(rec) === 'completed');
+      if (active.length) {
+        html += `<div class="group-title">Active</div>`;
+        html += recordingsTableHTML(`<tbody>${active.map((rec) => recordingRowHTML(rec)).join('')}</tbody>`);
+      }
+      if (paused.length) {
+        html += `<div class="group-title">Paused</div>`;
+        html += recordingsTableHTML(`<tbody>${paused.map((rec) => recordingRowHTML(rec)).join('')}</tbody>`);
       }
       if (completed.length) {
         html += `<div class="group-title">Completed</div>`;
