@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -188,15 +190,50 @@ func TestConnectionComposeUsesDurableClientLauncher(t *testing.T) {
 	}
 }
 
+func TestCheckedInNASComposeUsesGeneratedLauncher(t *testing.T) {
+	compose, err := os.ReadFile("../../../clients/nas-pull/docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(`command: ["python3", "-c", %q]`, nasLaunchCommand)
+	if !strings.Contains(string(compose), want) {
+		t.Fatal("checked-in NAS compose launcher differs from generated launcher")
+	}
+}
+
+func testNASLauncherCommand(state, url string, bootstrap []byte) string {
+	sum := sha256.Sum256(bootstrap)
+	return strings.NewReplacer(
+		"/state", filepath.ToSlash(state),
+		nasBootstrapURL, url,
+		nasBootstrapSHA256, hex.EncodeToString(sum[:]),
+	).Replace(nasLaunchCommand)
+}
+
+func TestNASLauncherDownloadsAndCachesVerifiedBootstrap(t *testing.T) {
+	state := t.TempDir()
+	bootstrap := []byte("pass\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(bootstrap)
+	}))
+	defer server.Close()
+	command := testNASLauncherCommand(state, server.URL, bootstrap)
+	if output, err := exec.Command("python3", "-c", command).CombinedOutput(); err != nil {
+		t.Fatalf("online bootstrap failed: %v (%s)", err, output)
+	}
+	got, err := os.ReadFile(filepath.Join(state, "stoarama-bootstrap-v1.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, bootstrap) {
+		t.Fatalf("cached bootstrap = %q, want %q", got, bootstrap)
+	}
+}
+
 func TestNASLauncherUsesVerifiedCacheWhenDownloadIsUnavailable(t *testing.T) {
 	state := t.TempDir()
 	bootstrap := []byte("pass\n")
-	sum := sha256.Sum256(bootstrap)
-	command := strings.NewReplacer(
-		"/state", filepath.ToSlash(state),
-		nasBootstrapURL, "http://127.0.0.1:1/unavailable",
-		nasBootstrapSHA256, hex.EncodeToString(sum[:]),
-	).Replace(nasLaunchCommand)
+	command := testNASLauncherCommand(state, "http://127.0.0.1:1/unavailable", bootstrap)
 	if err := os.WriteFile(filepath.Join(state, "stoarama-bootstrap-v1.py"), bootstrap, 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -48,6 +48,30 @@ class BootstrapRecoveryTests(unittest.TestCase):
             self.assertFalse(bootstrap.recover_previous())
             self.assertEqual(Path(bootstrap.CURRENT).read_text(encoding="utf-8"), "CLIENT_VERSION = 'current'\n")
 
+    def test_non_object_runtime_is_ignored(self):
+        bootstrap = load_bootstrap()
+        with tempfile.TemporaryDirectory() as state:
+            root = Path(state)
+            bootstrap.RUNTIME = str(root / "runtime.json")
+            Path(bootstrap.RUNTIME).write_text("null\n", encoding="utf-8")
+
+            self.assertFalse(bootstrap.recover_previous())
+
+    def test_verified_update_replaces_corrupt_current_client(self):
+        bootstrap = load_bootstrap()
+        with tempfile.TemporaryDirectory() as state:
+            root = Path(state)
+            bootstrap.CURRENT = str(root / "stoarama_pull.py")
+            bootstrap.PREVIOUS = str(root / "stoarama_pull.previous.py")
+            verified = b"CLIENT_VERSION = 'verified'\n"
+            Path(bootstrap.CURRENT).write_text("not valid python !!!\n", encoding="utf-8")
+            bootstrap.fetch_latest = lambda: verified
+
+            bootstrap.install_latest()
+
+            self.assertEqual(Path(bootstrap.CURRENT).read_bytes(), verified)
+            self.assertFalse(Path(bootstrap.PREVIOUS).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

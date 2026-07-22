@@ -50,6 +50,8 @@ def recover_previous():
             status = json.load(status_file)
     except (FileNotFoundError, ValueError, TypeError):
         return False
+    if not isinstance(status, dict):
+        return False
     if not os.path.exists(PREVIOUS) or status.get("exit") not in ("running", "self_update"):
         return False
     atomic(CURRENT, valid_source(PREVIOUS))
@@ -70,7 +72,10 @@ def install_latest():
         valid_source(CURRENT)
         print("NAS bootstrap update skipped: %s" % exc, file=sys.stderr, flush=True)
         return
-    previous = valid_source(CURRENT) if os.path.exists(CURRENT) else None
+    try:
+        previous = valid_source(CURRENT) if os.path.exists(CURRENT) else None
+    except Exception:
+        previous = None
     if previous == source:
         return
     if previous is not None:

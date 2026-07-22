@@ -24,7 +24,7 @@ command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
 endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 prefix="nas-releases"
 bootstrap="stoarama-bootstrap-v1.py"
-bootstrap_sha256="d5090901745beed24c3aedd5638ca745e1e9317d0706dc51e84c7759878f7683"
+bootstrap_sha256="1b160e541e22c563712343163d2bd072ccf39b1d39da793d5e4b5f74dd839d73"
 artifact="stoarama-pull-${NAS_VERSION}.py"
 manifest="latest-${NAS_VERSION}.json"
 

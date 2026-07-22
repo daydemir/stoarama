@@ -89,11 +89,11 @@ func clampPollIntervalSec(v int) int {
 
 const nasPythonImage = "python:3.13-slim-bookworm@sha256:9d7f287598e1a5a978c015ee176d8216435aaf335ed69ac3c38dd1bbb10e8d64"
 const nasBootstrapURL = "https://stoarama.com/nas/download/stoarama-bootstrap-v1.py"
-const nasBootstrapSHA256 = "d5090901745beed24c3aedd5638ca745e1e9317d0706dc51e84c7759878f7683"
+const nasBootstrapSHA256 = "1b160e541e22c563712343163d2bd072ccf39b1d39da793d5e4b5f74dd839d73"
 
 // nasLaunchCommand verifies and runs the immutable recovery bootstrap. The
 // durable client owns all subsequent checksum-verified updates.
-const nasLaunchCommand = `import hashlib,os,urllib.request
+const nasLaunchCommand = `import hashlib,os,sys,urllib.request
 p='/state/stoarama-bootstrap-v1.py'
 expected='` + nasBootstrapSHA256 + `'
 os.makedirs('/state',exist_ok=True)
@@ -104,7 +104,8 @@ try:
     with open(temporary,'wb') as output:
         output.write(source); output.flush(); os.fsync(output.fileno())
     os.replace(temporary,p)
-except Exception:
+except Exception as exc:
+    print('NAS bootstrap download failed; using verified cache: %s'%exc,file=sys.stderr,flush=True)
     with open(p,'rb') as cached: source=cached.read()
 if hashlib.sha256(source).hexdigest()!=expected: raise RuntimeError('cached NAS bootstrap checksum mismatch')
 exec(compile(source,'stoarama-bootstrap-v1.py','exec'))`
