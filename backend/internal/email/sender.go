@@ -13,13 +13,14 @@ import (
 )
 
 type Message struct {
-	To          string
-	From        string
-	ReplyTo     string
-	Subject     string
-	PlainText   string
-	HTML        string
-	MessageType string
+	To             string
+	From           string
+	ReplyTo        string
+	Subject        string
+	PlainText      string
+	HTML           string
+	MessageType    string
+	IdempotencyKey string
 }
 
 type DeliveryReceipt struct {
@@ -126,6 +127,9 @@ func (s *resendSender) Send(ctx context.Context, msg Message) (DeliveryReceipt, 
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	if key := strings.TrimSpace(msg.IdempotencyKey); key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return DeliveryReceipt{}, fmt.Errorf("send resend request: %w", err)

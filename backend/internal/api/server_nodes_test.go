@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/relaylimits"
 )
 
 func TestNormalizeNodeTypeLocalRecorder(t *testing.T) {
@@ -136,5 +138,15 @@ func TestDecideNodeEnroll(t *testing.T) {
 				t.Fatalf("decideNodeEnroll id=%d want %d", gotID, tc.wantID)
 			}
 		})
+	}
+}
+
+func TestDefaultRelayMaxStreams(t *testing.T) {
+	configured := 2
+	if got := defaultRelayMaxStreams(&configured); got != configured {
+		t.Fatalf("configured relay max=%d want %d", got, configured)
+	}
+	if got := defaultRelayMaxStreams(nil); got != relaylimits.DefaultStreams {
+		t.Fatalf("default relay max=%d want %d", got, relaylimits.DefaultStreams)
 	}
 }

@@ -25,7 +25,6 @@ set -euo pipefail
 API_URL="https://stoarama.com"
 TOKEN=""
 NAME=""
-CONCURRENCY="6"
 MANIFEST_NAME="latest.json"
 
 PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
@@ -35,7 +34,6 @@ while [[ $# -gt 0 ]]; do
     --token)       TOKEN="${2:-}"; shift 2 ;;
     --api-url)     API_URL="${2:-}"; shift 2 ;;
     --name)        NAME="${2:-}"; shift 2 ;;
-    --concurrency) CONCURRENCY="${2:-}"; shift 2 ;;
     --manifest)    MANIFEST_NAME="${2:-}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -43,10 +41,6 @@ done
 
 if [[ -z "${TOKEN}" ]]; then
   echo "error: --token is required" >&2
-  exit 1
-fi
-if ! [[ "${CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || (( CONCURRENCY > 20 )); then
-  echo "error: --concurrency must be between 1 and 20" >&2
   exit 1
 fi
 if ! [[ "${MANIFEST_NAME}" =~ ^latest(-[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)?\.json$ ]] || [[ "${MANIFEST_NAME}" == *..* ]]; then
@@ -218,7 +212,7 @@ if [[ ! -x "${BIN_DIR}/ffmpeg" ]]; then
 fi
 
 echo "Enrolling this computer with Stoarama..."
-ENROLL_ARGS=(enroll --token "${TOKEN}" --api-url "${API_URL}" --concurrency "${CONCURRENCY}")
+ENROLL_ARGS=(enroll --token "${TOKEN}" --api-url "${API_URL}")
 [[ -n "${NAME}" ]] && ENROLL_ARGS+=(--name "${NAME}")
 [[ "${MANIFEST_NAME}" != "latest.json" ]] && ENROLL_ARGS+=(--update-manifest "${MANIFEST_NAME}")
 "${BIN_DIR}/stoarama-relay" "${ENROLL_ARGS[@]}"
