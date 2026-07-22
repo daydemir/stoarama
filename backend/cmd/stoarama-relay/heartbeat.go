@@ -9,8 +9,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
@@ -19,6 +22,7 @@ import (
 const heartbeatInterval = 30 * time.Second
 const offlineDiagnosticLimit = 8
 const offlineDiagnosticMaxBytes = 8 << 10
+const recoveryStateMaxBytes = 16 << 10
 
 type offlineDiagnosticKind string
 
@@ -48,6 +52,110 @@ type heartbeatDiagnostics struct {
 	current *offlineDiagnostic
 	recent  []offlineDiagnostic
 	dirty   bool
+}
+
+type relayRecoveryState struct {
+	BootID          string    `json:"boot_id"`
+	StartedAt       time.Time `json:"started_at"`
+	PreviousExit    string    `json:"previous_exit"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at,omitempty"`
+	LastCaptureAt   time.Time `json:"last_capture_at,omitempty"`
+	LastUploadAt    time.Time `json:"last_upload_at,omitempty"`
+	LastUpdaterAt   time.Time `json:"last_updater_at,omitempty"`
+	LastError       string    `json:"last_error,omitempty"`
+	ErrorTail       []string  `json:"error_tail,omitempty"`
+}
+
+func recoveryStatePath() string {
+	home, err := stoaramaHome()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "relay-recovery.json")
+}
+
+func loadRecoveryState(path string) (*relayRecoveryState, error) {
+	state := &relayRecoveryState{}
+	if path == "" {
+		return state, nil
+	}
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return state, nil
+	}
+	if err != nil {
+		return state, err
+	}
+	if len(b) > recoveryStateMaxBytes {
+		return state, fmt.Errorf("recovery state exceeds %d bytes", recoveryStateMaxBytes)
+	}
+	if err := json.Unmarshal(b, state); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+func (s *relayRecoveryState) persist(path string) error {
+	if path == "" {
+		return nil
+	}
+	if len(s.ErrorTail) > 8 {
+		s.ErrorTail = s.ErrorTail[len(s.ErrorTail)-8:]
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	if len(b) > recoveryStateMaxBytes {
+		return fmt.Errorf("recovery state exceeds %d bytes", recoveryStateMaxBytes)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func bootID() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func relayHealthSnapshot() map[string]any {
+	health := map[string]any{"runtime_goos": runtime.GOOS, "runtime_goarch": runtime.GOARCH}
+	if id := bootID(); id != "" {
+		health["boot_id"] = id
+	}
+	if load, err := os.ReadFile("/proc/loadavg"); err == nil {
+		fields := strings.Fields(string(load))
+		if len(fields) > 0 {
+			health["load_1m"] = fields[0]
+		}
+	}
+	if mem, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(mem), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 3 && (fields[0] == "MemAvailable:" || fields[0] == "MemTotal:") {
+				if value, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					health[strings.TrimSuffix(fields[0], ":")+"_kb"] = value
+				}
+			}
+		}
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(".", &stat); err == nil && stat.Blocks > 0 {
+		health["disk_free_bytes"] = stat.Bavail * uint64(stat.Bsize)
+	}
+	return health
 }
 
 func loadHeartbeatDiagnostics(path string) (*heartbeatDiagnostics, error) {
@@ -268,6 +376,26 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 	if home, err := stoaramaHome(); err == nil {
 		diagnosticsPath = filepath.Join(home, "offline-diagnostics.json")
 	}
+	recoveryPath := recoveryStatePath()
+	recovery, recoveryErr := loadRecoveryState(recoveryPath)
+	if recoveryErr != nil {
+		log.Printf("relay recovery state load error: %v", recoveryErr)
+		recovery = &relayRecoveryState{}
+	}
+	previousRecovery := *recovery
+	recoveryPending := !previousRecovery.StartedAt.IsZero()
+	recovery.BootID = bootID()
+	recovery.StartedAt = startedAt
+	if previousRecovery.StartedAt.IsZero() {
+		recovery.PreviousExit = "unknown"
+	} else if previousRecovery.BootID != "" && previousRecovery.BootID != recovery.BootID {
+		recovery.PreviousExit = "unclean_reboot"
+	} else {
+		recovery.PreviousExit = "unclean_process"
+	}
+	if err := recovery.persist(recoveryPath); err != nil {
+		log.Printf("relay recovery state persist error: %v", err)
+	}
 	heartbeatDiag, err := loadHeartbeatDiagnostics(diagnosticsPath)
 	if err != nil {
 		log.Printf("relay diagnostics load error: %v", err)
@@ -289,6 +417,10 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			"relay_version":          version,
 			"relay_started_at":       startedAt,
 			"max_concurrent_streams": cfg.Concurrency,
+			"health":                 relayHealthSnapshot(),
+		}
+		if recoveryPending {
+			caps["recovery"] = map[string]any{"recovered_at": time.Now().UTC(), "previous_exit": recovery.PreviousExit, "boot_id": previousRecovery.BootID, "started_at": previousRecovery.StartedAt, "last_heartbeat_at": previousRecovery.LastHeartbeatAt, "last_capture_at": previousRecovery.LastCaptureAt, "last_upload_at": previousRecovery.LastUploadAt, "last_updater_at": previousRecovery.LastUpdaterAt, "error_tail": previousRecovery.ErrorTail}
 		}
 		if probe.ranOnce {
 			caps["youtube_ready"] = probe.ready
@@ -314,11 +446,18 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		err := client.NodeHeartbeat(hctx, caps)
 		cancel()
 		if err != nil && ctx.Err() == nil {
+			recovery.LastError = err.Error()
+			recovery.ErrorTail = append(recovery.ErrorTail, err.Error())
+			_ = recovery.persist(recoveryPath)
 			if persistErr := heartbeatDiag.Failed(err); persistErr != nil {
 				log.Printf("relay diagnostics persist error: %v", persistErr)
 			}
 			log.Printf("relay heartbeat error: %v", err)
 		} else if err == nil {
+			recoveryPending = false
+			recovery.LastHeartbeatAt = time.Now().UTC()
+			recovery.LastError = ""
+			_ = recovery.persist(recoveryPath)
 			if hasOffline {
 				heartbeatDiag.Sent()
 			}

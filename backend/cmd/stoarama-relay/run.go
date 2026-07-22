@@ -101,7 +101,16 @@ func runRelay(ctx context.Context) error {
 	go pr.runLoop(ctx)
 	go selfUpdateLoop(ctx, cfg)
 
-	return worker.Run(ctx)
+	err = worker.Run(ctx)
+	if err == nil || ctx.Err() != nil {
+		if path := recoveryStatePath(); path != "" {
+			if state, loadErr := loadRecoveryState(path); loadErr == nil {
+				state.PreviousExit = "clean"
+				_ = state.persist(path)
+			}
+		}
+	}
+	return err
 }
 
 func relayFFmpegBin(binDir string) string {
