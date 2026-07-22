@@ -267,14 +267,14 @@ func (d *heartbeatDiagnostics) Failed(err error) error {
 	return nil
 }
 
-func (d *heartbeatDiagnostics) Succeeded() error {
+func (d *heartbeatDiagnostics) SucceededAt(now time.Time) error {
 	if d == nil {
 		return nil
 	}
 	if d.current == nil {
 		return nil
 	}
-	now := time.Now().UTC()
+	now = now.UTC()
 	if now.Before(d.current.LastFailedAt) {
 		now = d.current.LastFailedAt
 	}
@@ -286,6 +286,23 @@ func (d *heartbeatDiagnostics) Succeeded() error {
 	d.current = nil
 	d.dirty = true
 	return d.persist()
+}
+
+func (d *heartbeatDiagnostics) Succeeded() error {
+	return d.SucceededAt(time.Now().UTC())
+}
+
+func (d *heartbeatDiagnostics) SnapshotForAttempt(recoveredAt time.Time) ([]offlineDiagnostic, bool) {
+	events, ok := d.Snapshot()
+	if !ok || d.current == nil || len(events) == 0 {
+		return events, ok
+	}
+	recoveredAt = recoveredAt.UTC()
+	if recoveredAt.Before(d.current.LastFailedAt) {
+		recoveredAt = d.current.LastFailedAt
+	}
+	events[len(events)-1].RecoveredAt = &recoveredAt
+	return events, true
 }
 
 func (d *heartbeatDiagnostics) Snapshot() ([]offlineDiagnostic, bool) {
@@ -478,7 +495,8 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		if updater := lastUpdaterUnix.Load(); updater > 0 {
 			recovery.LastUpdaterAt = time.Unix(0, updater).UTC()
 		}
-		offline, hasOffline := heartbeatDiag.Snapshot()
+		recoveredAt := time.Now().UTC()
+		offline, hasOffline := heartbeatDiag.SnapshotForAttempt(recoveredAt)
 		if hasOffline {
 			caps["offline_diagnostics"] = offline
 		}
@@ -498,11 +516,10 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			recovery.LastHeartbeatAt = time.Now().UTC()
 			recovery.LastError = ""
 			_ = recovery.persist(recoveryPath)
-			if hasOffline {
-				heartbeatDiag.Sent()
-			}
-			if persistErr := heartbeatDiag.Succeeded(); persistErr != nil {
+			if persistErr := heartbeatDiag.SucceededAt(recoveredAt); persistErr != nil {
 				log.Printf("relay diagnostics persist error: %v", persistErr)
+			} else if hasOffline {
+				heartbeatDiag.Sent()
 			}
 		}
 	}
