@@ -64,6 +64,14 @@ Once Render, domain, and email are live:
   receipts and freshness/status calculations, and compare Streetscore 1/3. Keep
   this read-only until we distinguish relay/network loss from backend ingestion
   or display errors.
+- [ ] Complete relay recovery observability before changing load limits or
+  network assumptions: persist boot ID, process start/clean-shutdown markers,
+  systemd service result/exit code/signal, last successful heartbeat/capture/
+  upload/update timestamps, bounded relay error tail, and backend heartbeat
+  receipt/rejection/latency metrics keyed by node (never credentials). Upload
+  recovery state on the first successful heartbeat, and test process crash,
+  reboot, OOM/signal, DNS failure, timeout, API rejection, and clean restart in
+  an emulator or disposable relay before fleet rollout.
 - [ ] Make relay outage diagnosis deterministic: persist and report Linux boot
   ID, process start/clean-shutdown markers, systemd exit result/code/signal,
   last successful heartbeat/capture/upload/update timestamps, and a bounded
