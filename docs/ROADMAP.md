@@ -59,6 +59,11 @@ Once Render, domain, and email are live:
 
 ## Operational TODOs
 
+- [ ] Diagnose the prolonged `streetscore-2` outage after the relay rollout:
+  correlate relay heartbeat attempts and recording load with backend heartbeat
+  receipts and freshness/status calculations, and compare Streetscore 1/3. Keep
+  this read-only until we distinguish relay/network loss from backend ingestion
+  or display errors.
 - [ ] Make relay outage diagnosis deterministic: persist and report Linux boot
   ID, process start/clean-shutdown markers, systemd exit result/code/signal,
   last successful heartbeat/capture/upload/update timestamps, and a bounded
