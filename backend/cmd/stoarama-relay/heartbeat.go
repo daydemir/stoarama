@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -73,6 +74,8 @@ type relayRecoveryState struct {
 	ErrorTail       []string  `json:"error_tail,omitempty"`
 }
 
+var recoveryStateMu sync.Mutex
+
 func recoveryStatePath() string {
 	home, err := stoaramaHome()
 	if err != nil {
@@ -106,6 +109,8 @@ func (s *relayRecoveryState) persist(path string) error {
 	if path == "" {
 		return nil
 	}
+	recoveryStateMu.Lock()
+	defer recoveryStateMu.Unlock()
 	if len(s.ErrorTail) > 8 {
 		s.ErrorTail = s.ErrorTail[len(s.ErrorTail)-8:]
 	}
@@ -119,9 +124,14 @@ func (s *relayRecoveryState) persist(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".new"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".new-")
 	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
 		return err
 	}
 	if _, err := f.Write(b); err != nil {

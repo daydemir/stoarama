@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,6 +212,35 @@ func TestMarkRelayExitPersistsSelfUpdate(t *testing.T) {
 	}
 	if state.PreviousExit != relayExitSelfUpdate {
 		t.Fatalf("previous_exit=%q want %q", state.PreviousExit, relayExitSelfUpdate)
+	}
+}
+
+func TestRecoveryStateConcurrentWritesRemainAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay-recovery.json")
+	var writes sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		writes.Add(1)
+		go func(exit string) {
+			defer writes.Done()
+			if err := (&relayRecoveryState{PreviousExit: exit}).persist(path); err != nil {
+				t.Errorf("persist: %v", err)
+			}
+		}(fmt.Sprintf("exit-%d", i))
+	}
+	writes.Wait()
+	state, err := loadRecoveryState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(state.PreviousExit, "exit-") {
+		t.Fatalf("previous_exit=%q", state.PreviousExit)
+	}
+	leftovers, err := filepath.Glob(path + ".new-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temporary files remain: %v", leftovers)
 	}
 }
 
