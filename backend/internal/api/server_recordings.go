@@ -66,18 +66,17 @@ const recordingListSelectSQL = `
 		(SELECT count(*) FROM recording_clips c
 		   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 		rec.paused_at,
-		(SELECT count(*) FROM recording_clips c
+		CASE WHEN rec.status='completed' THEN COALESCE(rec.completed_captured_clip_count,0)
+		ELSE (SELECT count(*) FROM recording_clips c
 		   WHERE c.recording_id = rec.id
 		     AND c.clip_start_at >= CASE
-		       WHEN rec.status='completed' THEN rec.start_at
 		       WHEN rec.status='paused' THEN GREATEST(rec.start_at, rec.paused_at - interval '24 hours')
 		       ELSE GREATEST(rec.start_at, now() - interval '24 hours')
 		     END
 		     AND c.clip_start_at < CASE
-		       WHEN rec.status='completed' THEN COALESCE(rec.end_at, now())
 		       WHEN rec.status='paused' THEN rec.paused_at
 		       ELSE LEAST(now(), COALESCE(rec.end_at, now()))
-		     END) AS captured_clip_count,
+		     END) END AS captured_clip_count,
 		rec.completed_captured_clip_count, rec.completed_expected_clip_count,
 		rec.created_at, sd.managed,
 		rec.stream_id, st.name, st.location_text,
@@ -2113,12 +2112,15 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 	now := time.Now().UTC()
 	coverageStart, coverageEnd := recordingCoverageWindow(status, startAt, endAt, pausedAt, now)
 	expectedClips := int64(0)
+	captureHealth := recordingCaptureHealthUnavailable
 	var err error
 	if status == "completed" && completedCaptured != nil && completedExpected != nil {
 		capturedClips = *completedCaptured
 		expectedClips = *completedExpected
-	} else {
+		captureHealth = recordingCaptureHealth(status, capturedClips, expectedClips)
+	} else if status != "completed" {
 		expectedClips, err = expectedRecordingClips(mode, cronExpr, cronTimezone, dailyWindowStart, dailyWindowEnd, activeWeekdays, clipDurationSec, startAt, coverageStart, coverageEnd)
+		captureHealth = recordingCaptureHealth(status, capturedClips, expectedClips)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("compute recording %d capture health: %w", id, err)
@@ -2161,7 +2163,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"recent_clip_count":        recentClipCount,
 		"captured_clip_count":      capturedClips,
 		"expected_clip_count":      expectedClips,
-		"capture_health":           recordingCaptureHealth(status, capturedClips, expectedClips),
+		"capture_health":           captureHealth,
 		"created_at":               createdAt.UTC(),
 		"stream_id":                streamID,
 		"stream_name":              streamName,
@@ -2330,6 +2332,7 @@ const (
 	recordingCaptureHealthHealthy     recordingCaptureHealthState = "healthy"
 	recordingCaptureHealthWarning     recordingCaptureHealthState = "warning"
 	recordingCaptureHealthCritical    recordingCaptureHealthState = "critical"
+	recordingCaptureHealthUnavailable recordingCaptureHealthState = "unavailable"
 )
 
 func recordingCoverageWindow(status string, startAt time.Time, endAt, pausedAt *time.Time, now time.Time) (time.Time, time.Time) {

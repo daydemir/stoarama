@@ -1,9 +1,12 @@
 package recsched
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrCoverageTooLarge = errors.New("capture health range too large")
 
 const (
 	maxCoverageDays = 36600
@@ -46,7 +49,7 @@ func expectedSampledClips(expr, timezone string, clipDurationSec int, start, end
 	for fire := schedule.Next(start.Add(-time.Nanosecond).In(loc)); !fire.IsZero() && !fire.After(latestFire); fire = schedule.Next(fire) {
 		count++
 		if count > maxSampledClips {
-			return 0, fmt.Errorf("capture health range exceeds %d sampled clips", maxSampledClips)
+			return 0, fmt.Errorf("%w: exceeds %d sampled clips", ErrCoverageTooLarge, maxSampledClips)
 		}
 	}
 	return count, nil
@@ -88,7 +91,7 @@ func expectedContinuousClips(timezone string, windowStart, windowEnd TimeOfDay, 
 		next := time.Date(year, month, day, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
 		year, month, day = next.Date()
 	}
-	return 0, fmt.Errorf("capture health range exceeds %d days", maxCoverageDays)
+	return 0, fmt.Errorf("%w: exceeds %d days", ErrCoverageTooLarge, maxCoverageDays)
 }
 
 func minTime(a, b time.Time) time.Time {

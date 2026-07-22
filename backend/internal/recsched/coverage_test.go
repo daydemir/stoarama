@@ -1,6 +1,7 @@
 package recsched
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +10,7 @@ import (
 func TestExpectedSampledClipCountCap(t *testing.T) {
 	start := time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)
 	_, err := ExpectedClipCount("sampled", "*/10 * * * *", "UTC", nil, nil, AllWeekdays, 60, start, start, start.Add(time.Duration(maxSampledClips+1)*10*time.Minute))
-	if err == nil || !strings.Contains(err.Error(), "exceeds 500000 sampled clips") {
+	if !errors.Is(err, ErrCoverageTooLarge) || !strings.Contains(err.Error(), "exceeds 500000 sampled clips") {
 		t.Fatalf("got %v, want sampled clip cap error", err)
 	}
 }

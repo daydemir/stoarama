@@ -211,7 +211,7 @@
     .capture-health.healthy { color: var(--ok); }
     .capture-health.warning { color: var(--warn); }
     .capture-health.critical { color: var(--err); }
-    .capture-health.not_expected { color: var(--muted); }
+    .capture-health.not_expected, .capture-health.unavailable { color: var(--muted); }
     .card-err { margin-top: 10px; color: var(--err); font-size: 12px; line-height: 1.45; }
     .group-title { margin: 18px 0 10px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
     .clip-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -3010,9 +3010,11 @@
 	  const captured = Number(rec.captured_clip_count || 0);
 	  const captureHealth = String(rec.capture_health || 'not_expected');
 	  const capturePercent = expected > 0 ? Math.min(100, Math.round(captured / expected * 1000) / 10) : null;
-	  const captureHealthHTML = expected > 0
-	    ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
-	    : `<div class="capture-health not_expected">No clips expected yet</div><div class="cell-sub">${lastHTML}</div>`;
+	  const captureHealthHTML = captureHealth === 'unavailable'
+	    ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
+	    : expected > 0
+	      ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
+	      : `<div class="capture-health not_expected">No clips expected yet</div><div class="cell-sub">${lastHTML}</div>`;
       const clip = Number(rec.clip_duration_sec || 0);
       const fps = Number(rec.target_fps || 0);
       const capture = rec.capture_via === 'relay'

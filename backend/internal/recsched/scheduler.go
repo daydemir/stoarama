@@ -150,8 +150,15 @@ func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) er
 			startTOD, endTOD = &start, &end
 		}
 		expected, err := ExpectedClipCount(rec.mode, rec.cronExpr, rec.timezone, startTOD, endTOD, rec.weekdays, rec.clipDuration, rec.startAt, rec.startAt, rec.endAt)
-		if err != nil {
+		var expectedArg any = expected
+		if errors.Is(err, ErrCoverageTooLarge) {
+			expectedArg = nil
+		} else if err != nil {
 			return fmt.Errorf("complete recording %d: %w", rec.id, err)
+		}
+		var capturedArg any = rec.captured
+		if expectedArg == nil {
+			capturedArg = nil
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE recordings
@@ -159,7 +166,7 @@ func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) er
 			    completed_captured_clip_count=$2, completed_expected_clip_count=$3,
 			    updated_at=now()
 			WHERE id=$1 AND status='active'
-		`, rec.id, rec.captured, expected); err != nil {
+		`, rec.id, capturedArg, expectedArg); err != nil {
 			return fmt.Errorf("auto-stop recording %d: %w", rec.id, err)
 		}
 	}
