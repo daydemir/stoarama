@@ -3,9 +3,43 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestParseStreamRecordingStates(t *testing.T) {
+	got, err := parseStreamRecordingStates("active,paused,active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []streamRecordingState{streamRecordingActive, streamRecordingPaused}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("states=%v want=%v", got, want)
+	}
+	if _, err := parseStreamRecordingStates("pending"); err == nil {
+		t.Fatal("expected invalid status error")
+	}
+}
+
+func TestAppendStreamRecordingStatusWhere(t *testing.T) {
+	where, args := appendStreamRecordingStatusWhere([]string{"s.deleted_at IS NULL"}, nil, []streamRecordingState{streamRecordingActive, streamRecordingCompleted}, 42, true)
+	if got := strings.Join(where, " AND "); !strings.Contains(got, "rec.account_id=$1") || !strings.Contains(got, "ANY($2::text[])") {
+		t.Fatalf("where=%s", got)
+	}
+	if !reflect.DeepEqual(args, []any{int64(42), []string{"active", "completed"}}) {
+		t.Fatalf("args=%v", args)
+	}
+
+	where, _ = appendStreamRecordingStatusWhere([]string{"base"}, nil, []streamRecordingState{streamRecordingActive}, 0, false)
+	if !reflect.DeepEqual(where, []string{"base", "FALSE"}) {
+		t.Fatalf("anonymous active where=%v", where)
+	}
+	where, _ = appendStreamRecordingStatusWhere([]string{"base"}, nil, []streamRecordingState{streamRecordingNotRecording, streamRecordingActive}, 0, false)
+	if !reflect.DeepEqual(where, []string{"base"}) {
+		t.Fatalf("anonymous not-recording where=%v", where)
+	}
+}
 
 func TestDashboardBuildStreamWhereInvalidRecordingState(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/streams?recording_state=bad", nil)

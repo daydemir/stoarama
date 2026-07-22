@@ -212,6 +212,13 @@ func (s *Server) handleDashboardStreamsCSV(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	recordingStates, err := parseStreamRecordingStates(r.URL.Query().Get("recording_statuses"))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actingAccountID, hasActingAccount := s.optionalActingAccountID(r)
+	where, args = appendStreamRecordingStatusWhere(where, args, recordingStates, actingAccountID, hasActingAccount)
 	base := strings.TrimRight(strings.TrimSpace(s.cfg.AppBaseURL), "/")
 	if base == "" {
 		util.WriteError(w, http.StatusServiceUnavailable, "app base url is not configured")
