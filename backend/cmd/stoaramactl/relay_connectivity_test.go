@@ -114,10 +114,17 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	if recipients, err := pendingRelayConnectivityRecipients(ctx, pool, 1); err != nil || len(recipients) != 1 || recipients[0] != "deniz@aydemir.us" {
 		t.Fatalf("snapshotted recipients=%v err=%v", recipients, err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE users SET is_operator=true`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
+	if _, err := recordRelayConnectivity(ctx, pool, now.Add(time.Second)); err == nil || !strings.Contains(err.Error(), "no operator recipients") {
+		t.Fatalf("missing-recipient error=%v", err)
+	}
+	var observed relayConnectivityState
+	if err := pool.QueryRow(ctx, `SELECT observed_state FROM relay_connectivity_alert_states WHERE node_id=7`).Scan(&observed); err != nil || observed != relayOffline {
+		t.Fatalf("state after rejected transition=%s err=%v", observed, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET is_operator=true`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := recordRelayConnectivity(ctx, pool, now.Add(time.Second))

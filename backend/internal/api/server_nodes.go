@@ -1009,7 +1009,8 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		UPDATE nodes
 		SET
 			last_heartbeat_at=now(),
-			capabilities_jsonb=COALESCE(nodes.capabilities_jsonb, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
+			capabilities_jsonb=(COALESCE(nodes.capabilities_jsonb, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb))
+				- CASE WHEN nodes.node_type='relay' THEN ARRAY['max_concurrent_streams']::text[] ELSE ARRAY[]::text[] END,
 			metadata_jsonb=COALESCE($3::jsonb, nodes.metadata_jsonb),
 			updated_at=now()
 		WHERE nodes.id=$1 AND nodes.status = ANY($4::text[])

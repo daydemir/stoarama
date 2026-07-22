@@ -24,6 +24,9 @@ CREATE INDEX relay_connectivity_alert_events_pending_idx
   ON relay_connectivity_alert_events (id)
   WHERE notified_at IS NULL;
 
+CREATE INDEX relay_connectivity_alert_events_node_id_idx
+  ON relay_connectivity_alert_events (node_id);
+
 CREATE TABLE relay_connectivity_alert_deliveries (
   event_id    BIGINT NOT NULL REFERENCES relay_connectivity_alert_events(id) ON DELETE CASCADE,
   recipient   TEXT NOT NULL,

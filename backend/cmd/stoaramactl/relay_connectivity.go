@@ -127,6 +127,13 @@ func recordRelayConnectivity(ctx context.Context, pool *pgxpool.Pool, now time.T
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var recipientCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM users WHERE is_operator=true AND btrim(email)<>''`).Scan(&recipientCount); err != nil {
+		return nil, err
+	}
+	if recipientCount == 0 {
+		return nil, fmt.Errorf("no operator recipients configured")
+	}
 	states, err := currentRelayConnectivity(ctx, tx, now)
 	if err != nil {
 		return nil, err
