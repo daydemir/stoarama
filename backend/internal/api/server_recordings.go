@@ -908,6 +908,21 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if catalogStreamID > 0 {
+		var currentTimezone string
+		if err := tx.QueryRow(r.Context(), `SELECT local_timezone FROM streams WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, catalogStreamID).Scan(&currentTimezone); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d changed; retry", catalogStreamID))
+				return
+			}
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock stream timezone: %v", err))
+			return
+		}
+		if strings.TrimSpace(catalogTimezone) != "" && strings.TrimSpace(currentTimezone) != cronTimezone {
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d timezone changed; retry", catalogStreamID))
+			return
+		}
+	}
 	if catalogStreamID > 0 && strings.TrimSpace(catalogTimezone) == "" {
 		actualTimezone, persistErr := persistMissingCatalogTimezone(r.Context(), tx, catalogStreamID, cronTimezone)
 		if persistErr != nil {
@@ -1368,6 +1383,35 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
+	// Lock catalog metadata before the recording. Batch scheduling uses the same
+	// stream -> recording -> jobs order, so concurrent single and batch edits
+	// cannot deadlock. The recording is re-read under lock below.
+	var linkedStreamID int64
+	if err := tx.QueryRow(r.Context(), `
+		SELECT COALESCE(stream_id, 0)
+		FROM recordings
+		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+	`, id, principal.AccountID).Scan(&linkedStreamID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "recording not found")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording stream: %v", err))
+		return
+	}
+	var (
+		lockedCatalogTimezone string
+		lockedCatalogStream   bool
+	)
+	if linkedStreamID > 0 {
+		err := tx.QueryRow(r.Context(), `SELECT local_timezone FROM streams WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, linkedStreamID).Scan(&lockedCatalogTimezone)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock stream timezone: %v", err))
+			return
+		}
+		lockedCatalogStream = err == nil
+	}
+
 	// Confirm ownership and load the current capture window so an omitted start_at/
 	// end_at keeps the recording's existing window (a schedule edit is not a window
 	// reset). A canceled recording is not found.
@@ -1377,17 +1421,15 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		curEndAt         *time.Time
 		namingProfileRaw string
 		activeWeekdays   recsched.WeekdaySet
-		catalogTimezone  string
 		catalogStreamID  int64
 	)
 	if err := tx.QueryRow(r.Context(), `
 		SELECT rec.status, rec.start_at, rec.end_at, rec.naming_profile, rec.active_weekdays,
-		       COALESCE(st.local_timezone, ''), COALESCE(st.id, 0)
+		       COALESCE(rec.stream_id, 0)
 		FROM recordings rec
-		LEFT JOIN streams st ON st.id=rec.stream_id AND st.deleted_at IS NULL
 		WHERE rec.id=$1 AND rec.account_id=$2 AND rec.status <> 'canceled'
 		FOR UPDATE OF rec
-	`, id, principal.AccountID).Scan(&curStatus, &curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays, &catalogTimezone, &catalogStreamID); err != nil {
+	`, id, principal.AccountID).Scan(&curStatus, &curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays, &catalogStreamID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
@@ -1395,7 +1437,14 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
-	if timezone := strings.TrimSpace(catalogTimezone); timezone != "" {
+	if catalogStreamID != linkedStreamID {
+		util.WriteError(w, http.StatusConflict, "recording stream changed; retry")
+		return
+	}
+	if catalogStreamID > 0 && !lockedCatalogStream {
+		catalogStreamID = 0
+	}
+	if timezone := strings.TrimSpace(lockedCatalogTimezone); timezone != "" {
 		cronTimezone = timezone
 	} else if catalogStreamID > 0 {
 		if requestedCronTimezone == "" {
