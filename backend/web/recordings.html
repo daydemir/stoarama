@@ -2753,7 +2753,7 @@
     }
 
     function weekdayLabel(maskValue) {
-      const mask = Number(maskValue || 127);
+      const mask = Number(maskValue === undefined || maskValue === null || maskValue === '' ? 127 : maskValue);
       if (mask === 127) return 'Daily';
       if (mask === 31) return 'Mon–Fri';
       if (mask === 96) return 'Sat–Sun';
