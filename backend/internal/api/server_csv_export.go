@@ -56,7 +56,7 @@ func (s *Server) handleAccountRecordingsCSV(w http.ResponseWriter, r *http.Reque
 		"id", "name", "stream_name", "stream_url", "source_kind",
 		"cron_expr", "cron_timezone", "clip_duration_sec", "status", "health",
 		"start_at", "end_at", "next_fire_at", "last_clip_at", "created_at",
-		"recent_clip_count_24h", "storage_destination_id", "storage_destination_name",
+		"recent_clip_count_24h", "captured_clip_count", "expected_clip_count", "capture_health", "storage_destination_id", "storage_destination_name",
 		"storage_managed", "stream_id", "stream_location",
 	})
 	for rows.Next() {
@@ -84,6 +84,9 @@ func (s *Server) handleAccountRecordingsCSV(w http.ResponseWriter, r *http.Reque
 			csvAnyTime(item["last_clip_at"]),
 			csvAnyTime(item["created_at"]),
 			csvAny(item["recent_clip_count"]),
+			csvAny(item["captured_clip_count"]),
+			csvAny(item["expected_clip_count"]),
+			csvAny(item["capture_health"]),
 			csvAny(item["storage_destination_id"]),
 			csvAny(item["storage_destination_name"]),
 			csvAny(item["storage_managed"]),

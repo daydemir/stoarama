@@ -207,6 +207,11 @@
     .card-status.paused { color: var(--muted); }
     .card-status.pending { color: var(--warn); }
     .card-status.pending .dot { background: var(--warn); }
+    .capture-health { margin-top: 3px; font-family: var(--mono); font-size: 11px; line-height: 1.35; }
+    .capture-health.healthy { color: var(--ok); }
+    .capture-health.warning { color: var(--warn); }
+    .capture-health.critical { color: var(--err); }
+    .capture-health.not_expected { color: var(--muted); }
     .card-err { margin-top: 10px; color: var(--err); font-size: 12px; line-height: 1.45; }
     .group-title { margin: 18px 0 10px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
     .clip-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -428,7 +433,7 @@
       .recordings-table td:nth-child(3)::before { content: "Status"; }
       .recordings-table td:nth-child(4)::before { content: "Schedule"; }
       .recordings-table td:nth-child(5)::before { content: "Clip / Capture"; }
-      .recordings-table td:nth-child(6)::before { content: "Storage / Activity"; }
+	  .recordings-table td:nth-child(6)::before { content: "Storage"; }
       .recordings-table td:nth-child(7)::before { content: "Actions"; }
       .recordings-table .row-actions { flex-wrap: wrap; }
     }
@@ -3001,6 +3006,13 @@
       const last = relativeTime(rec.last_clip_at);
       const lastClass = lastClipFreshnessClass(rec);
       const lastHTML = `<span${lastClass ? ` class="${lastClass}"` : ''}>${last ? `Last clip ${escapeHTML(last)}` : 'No clips yet'}</span>`;
+	  const expected = Number(rec.expected_clip_count || 0);
+	  const captured = Number(rec.captured_clip_count || 0);
+	  const captureHealth = String(rec.capture_health || 'not_expected');
+	  const capturePercent = expected > 0 ? Math.min(100, Math.round(captured / expected * 1000) / 10) : null;
+	  const captureHealthHTML = expected > 0
+	    ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
+	    : `<div class="capture-health not_expected">No clips expected yet</div><div class="cell-sub">${lastHTML}</div>`;
       const clip = Number(rec.clip_duration_sec || 0);
       const fps = Number(rec.target_fps || 0);
       const capture = rec.capture_via === 'relay'
@@ -3021,16 +3033,16 @@
       return `<tr class="${extraClass}" data-card="${id}">
         <td><input type="checkbox" data-recordingselect="${id}" aria-label="Select recording #${id}"${state.selectedRecordings.has(id) ? ' checked' : ''}></td>
         <td><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
-        <td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div><div class="cell-sub health-${escapeHTML(health)}">${escapeHTML(health)}</div>${warning}</td>
+		<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
         <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(String(rec.cron_timezone || 'UTC'))}</div></td>
         <td><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
-        <td><div class="cell-main">${storage}</div><div class="cell-sub">${lastHTML} · ${Number(rec.recent_clip_count || 0)} recent</div></td>
+		<td><div class="cell-main">${storage}</div></td>
         <td><div class="row-actions">${action}</div></td>
       </tr>`;
     }
 
     function recordingsTableHTML(rows) {
-      return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th><input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span></th><th>Recording</th><th>Status</th><th>Schedule</th><th>Clip / Capture</th><th>Storage / Activity</th><th>Actions</th></tr></thead>${rows}</table></div>`;
+	  return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th><input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span></th><th>Recording</th><th>Status / Capture health</th><th>Schedule</th><th>Clip / Capture</th><th>Storage</th><th>Actions</th></tr></thead>${rows}</table></div>`;
     }
 
     // Update the status-filter chips: keep each chip's label with a live count and

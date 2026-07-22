@@ -6599,6 +6599,10 @@ async function applyStreamsRouteState(opts = {}) {
     return;
   }
   if (!isList) return;
+	if (!params.has('tags') && !params.has('tags_not')) {
+	  params.set('tags', 'FD');
+	  history.replaceState(null, '', `${window.location.pathname}?${params.toString()}`);
+	}
   currentStreamRoute = STREAM_ROUTE.LIST;
   mainTab = 'streams';
   detailStreamID = null;
