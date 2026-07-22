@@ -557,7 +557,7 @@
       <!-- Recording cards -->
       <div id="cards" class="cards"></div>
 
-      <!-- Inline composer -->
+      <!-- Creation-route composer -->
       <section id="composer" class="panel hidden">
         <div class="section-title">
           <div><div class="eyebrow">New recording</div><h2>Configure a recording</h2></div>
@@ -4065,8 +4065,6 @@
         b.addEventListener('click', () => deleteAllClips(panel, b.getAttribute('data-clipsdeleteall'))));
       panel.querySelectorAll('button[data-cliptransfer]').forEach((b) =>
         b.addEventListener('click', () => openClipTransfer(panel, b.getAttribute('data-cliptransfer'))));
-      panel.querySelectorAll('a[data-connectbucket]').forEach((a) =>
-        a.addEventListener('click', (ev) => { ev.preventDefault(); openComposer(false); }));
     }
 
     // The inner full-width cell of a transfer-status row (the dense table wraps the
@@ -4086,9 +4084,7 @@
       if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
       const targets = (state.destinations || []).filter((d) => Number(d.id) !== Number(sourceDestId));
       if (targets.length === 0) {
-        cell.innerHTML = `<div class="clip-xfer-note">No other bucket to copy to. <a href="#" data-connectbucket="1">Connect a bucket first</a>.</div>`;
-        cell.querySelectorAll('a[data-connectbucket]').forEach((a) =>
-          a.addEventListener('click', (ev) => { ev.preventDefault(); openComposer(false); }));
+        cell.innerHTML = `<div class="clip-xfer-note">No other bucket to copy to. <a href="/recordings/new">Connect a bucket first</a>.</div>`;
         box.classList.remove('hidden');
         return;
       }
@@ -4285,15 +4281,13 @@
       return new Date(d.getTime() - off).toISOString().slice(0, 16);
     }
 
-    function openComposer(asHero) {
+    function openComposer() {
       state.composerMode = 'single';
       els.namingSection.classList.remove('hidden');
       els.composer.classList.remove('hidden');
-      els.composerClose.classList.toggle('hidden', !!asHero);
       // Leave Start empty for "now" so submission time, not composer-open time,
       // anchors capture health and scheduling.
       refreshWindowUI();
-      if (!asHero) els.composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
       refreshStartEnabled();
     }
 
@@ -4301,10 +4295,7 @@
       return /^\/recordings\/new\/?$/.test(window.location.pathname || '');
     }
 
-    // Landing with a record intent (?stream_id / ?stream_ids): make the composer the
-    // primary view by hiding the existing-recordings list chrome, so the user does
-    // not have to scroll past the list to reach the composer. closeComposer restores
-    // the list.
+    // The creation route owns the composer; the recordings list never opens it.
     function focusComposerView() {
       els.heroCopy.classList.add('hidden');
       els.cards.classList.add('hidden');
@@ -4318,7 +4309,7 @@
       els.relayBanner.classList.add('hidden');
       focusComposerView();
       await maybeLandFromCatalogStream();
-      if (els.composer.classList.contains('hidden')) openComposer(false);
+      if (els.composer.classList.contains('hidden')) openComposer();
     }
 
     // Trim a stream name to a reasonable composer field length.
@@ -4407,8 +4398,7 @@
             frameURL = (f0 && (f0.download_url || f0.url)) || '';
           } catch (_) { /* frame preview is best-effort */ }
         }
-        focusComposerView();
-        openComposer(false);
+        openComposer();
         applyCatalogLock(stream, frameURL);
       } catch (err) {
         // Could not load the catalog stream; fall back to the normal paste flow.
@@ -4435,7 +4425,7 @@
           return;
         }
         if (ids.length) {
-          focusComposerView();
+          clearStashedCatalogStreamId();
           state.batchSelected = new Set(ids);
           openBatchComposer();
           try {
@@ -4469,56 +4459,8 @@
     }
 
     function closeComposer() {
-      if (newRecordingRoute()) {
-        window.location.assign('/recordings');
-        return;
-      }
-      els.composer.classList.add('hidden');
-      window.clearTimeout(streamDebounce);
-      teardownPreview();
-      state.streamProbe = { token: state.streamProbe.token + 1, ok: false };
-      setStatus(els.streamStatus, '', '');
-      els.relayGate.classList.add('hidden');
-      els.streamStatus.classList.remove('hidden');
-      els.relayOptInRow.classList.add('hidden');
-      els.relayOptIn.checked = false;
-      clearCatalogLock();
       clearStashedCatalogStreamId();
-      // Reset batch mode so the next open is the single-recording composer.
-      if (state.composerMode === 'batch') {
-        state.composerMode = 'single';
-        els.batchSourceBlock.classList.add('hidden');
-        els.urlField.classList.remove('hidden');
-        els.startBatchBtn.classList.add('hidden');
-        els.startBtn.classList.remove('hidden');
-        els.batchPreflight.classList.add('hidden');
-        state.batchSelected = new Set();
-        els.batchFullDay.checked = false;
-        els.dailyWindowEnd.disabled = false;
-        [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((el) => { if (el && el.parentElement) el.parentElement.classList.remove('hidden'); });
-        const singleNameField = els.recName.closest('.field');
-        if (singleNameField) singleNameField.classList.remove('hidden');
-      }
-      // Reset the window so the next open re-defaults Start to now.
-      els.startAt.value = '';
-      els.endAt.value = '';
-      els.windowWarn.textContent = '';
-      els.namingFolder.value = '';
-      els.namingPlazaID.value = '';
-      els.namingContinent.value = '';
-      els.namingCountry.value = '';
-      els.namingCity.value = '';
-      els.namingPlazaName.value = '';
-      setNamingProfile('stoarama_v1');
-      els.namingSection.classList.remove('hidden');
-      // Never leave a blank screen: restore the default view for the current state.
-      // Empty account -> show the hero + "Start a recording" CTA; otherwise the
-      // recordings list + "+ New recording" row are already visible.
-      const empty = !Array.isArray(state.recordings) || state.recordings.length === 0;
-      els.heroCopy.classList.toggle('hidden', !empty);
-      els.newRecRow.classList.remove('hidden');
-      els.cards.classList.toggle('hidden', empty);
-      els.statusFilter.classList.toggle('hidden', empty);
+      window.location.assign('/recordings');
     }
 
     // ---- Start handler ----
@@ -4634,9 +4576,7 @@
         els.recURL.value = '';
         els.recName.value = '';
         clearStashedCatalogStreamId();
-        closeComposer();
-        await refreshRecordings();
-        setStatus(els.startStatus, '', '');
+        window.location.assign('/recordings');
       } catch (err) {
         const msg = String(err.message || err);
         // A name collision (409) means this account already has a live recording
@@ -4907,7 +4847,6 @@
       setNamingProfile('stoarama_v1');
       clearCatalogLock();
       els.composer.classList.remove('hidden');
-      els.composerClose.classList.remove('hidden');
       // Source UI: single off, batch on.
       els.urlField.classList.add('hidden');
       els.catalogStreamBlock.classList.add('hidden');
@@ -5121,7 +5060,6 @@
           await renderNewRecordingRoute();
           return;
         }
-        await maybeLandFromCatalogStream();
       } catch (_) {
         els.signedIn.classList.add('hidden');
         els.signedOut.classList.remove('hidden');
