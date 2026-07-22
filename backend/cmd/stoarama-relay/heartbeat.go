@@ -481,7 +481,7 @@ func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
 // 30s. External probes run independently so a slow resolver cannot block liveness.
 // POST /api/v1/node/heartbeat sets last_heartbeat_at and merges the reported keys into
 // nodes.capabilities_jsonb.
-func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, cfg relayConfig, diag relayDiagnostics, startedAt time.Time, firstSent chan<- struct{}) {
+func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, diag relayDiagnostics, startedAt time.Time, firstSent chan<- struct{}) {
 	diagnosticsPath := ""
 	relayDataDir := ""
 	if home, err := stoaramaHome(); err == nil {
@@ -524,12 +524,11 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			mode = "with_cookies"
 		}
 		caps := map[string]any{
-			"youtube_mode":           mode,
-			"active_jobs":            active.Load(),
-			"relay_version":          version,
-			"relay_started_at":       startedAt,
-			"max_concurrent_streams": cfg.Concurrency,
-			"health":                 relayHealthSnapshot(relayDataDir),
+			"youtube_mode":     mode,
+			"active_jobs":      active.Load(),
+			"relay_version":    version,
+			"relay_started_at": startedAt,
+			"health":           relayHealthSnapshot(relayDataDir),
 		}
 		if recoveryPending {
 			caps["recovery"] = map[string]any{"recovered_at": time.Now().UTC(), "previous_exit": recovery.PreviousExit, "boot_id": previousRecovery.BootID, "started_at": previousRecovery.StartedAt, "last_heartbeat_at": previousRecovery.LastHeartbeatAt, "last_capture_at": previousRecovery.LastCaptureAt, "last_upload_at": previousRecovery.LastUploadAt, "last_updater_at": previousRecovery.LastUpdaterAt, "error_tail": previousRecovery.ErrorTail}

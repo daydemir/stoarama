@@ -22,7 +22,6 @@ func runEnroll(args []string) error {
 	token := fs.String("token", "", "enrollment token (sie_...)")
 	apiURL := fs.String("api-url", defaultAPIURL, "Stoarama API base URL")
 	name := fs.String("name", "", "display name for this computer (default: hostname)")
-	concurrency := fs.Int("concurrency", defaultConcurrency, "max concurrent recordings on this computer")
 	manifestName := fs.String("update-manifest", "", "immutable release manifest for a canary")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -40,10 +39,6 @@ func runEnroll(args []string) error {
 	if display == "" {
 		display = defaultDisplayName()
 	}
-	conc := *concurrency
-	if conc <= 0 {
-		conc = defaultConcurrency
-	}
 	manifest := releaseManifest(strings.TrimSpace(*manifestName))
 	if manifest != "" {
 		if _, ok := manifest.version(); !ok {
@@ -52,17 +47,15 @@ func runEnroll(args []string) error {
 	}
 
 	payload := map[string]any{
-		"token":             tok,
-		"node_type":         "relay",
-		"display_name":      display,
-		"hostname":          hostname(),
-		"platform":          runtime.GOOS + "/" + runtime.GOARCH,
-		"relay_max_streams": conc,
+		"token":        tok,
+		"node_type":    "relay",
+		"display_name": display,
+		"hostname":     hostname(),
+		"platform":     runtime.GOOS + "/" + runtime.GOARCH,
 		"capabilities_json": map[string]any{
-			"max_concurrent_streams": conc,
-			"youtube_mode":           "cookieless",
-			"youtube_ready":          false,
-			"relay_version":          version,
+			"youtube_mode":  "cookieless",
+			"youtube_ready": false,
+			"relay_version": version,
 		},
 	}
 	b, err := json.Marshal(payload)
@@ -104,7 +97,6 @@ func runEnroll(args []string) error {
 		NodeID:         out.Node.ID,
 		NodeToken:      strings.TrimSpace(out.NodeToken),
 		APIURL:         base,
-		Concurrency:    conc,
 		InstalledAt:    time.Now().UTC(),
 		UpdateManifest: manifest,
 	}

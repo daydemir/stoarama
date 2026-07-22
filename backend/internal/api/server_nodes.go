@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/daydemir/stoarama/backend/internal/relaylimits"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -30,10 +31,6 @@ const (
 	// heuristic. Only relay principals take the node:{id} lease-owner canonical form
 	// and the relay lease branch; droplet principals are byte-identical to before.
 	nodeTypeRelay = "relay"
-
-	relayDefaultMaxStreams = 6
-	relayMinMaxStreams     = 1
-	relayMaxMaxStreams     = 20
 )
 
 type nodePrincipal struct {
@@ -467,7 +464,7 @@ func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) 
 	}
 	var relayMaxArg any
 	if req.RelayMaxStreams != nil {
-		if *req.RelayMaxStreams < relayMinMaxStreams || *req.RelayMaxStreams > relayMaxMaxStreams {
+		if *req.RelayMaxStreams < relaylimits.MinStreams || *req.RelayMaxStreams > relaylimits.MaxStreams {
 			util.WriteError(w, http.StatusBadRequest, "relay_max_streams must be between 1 and 20")
 			return
 		}
@@ -646,6 +643,13 @@ type nodeEnrollRequest struct {
 	MetadataJSON     map[string]any `json:"metadata_json"`
 }
 
+func defaultRelayMaxStreams(value *int) int {
+	if value == nil {
+		return relaylimits.DefaultStreams
+	}
+	return *value
+}
+
 func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 	var req nodeEnrollRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
@@ -674,17 +678,17 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, "invalid node_type")
 		return
 	}
-	relayMaxStreams := relayDefaultMaxStreams
+	var relayMaxStreams *int
 	if req.RelayMaxStreams != nil {
 		if nodeType != nodeTypeRelay {
 			util.WriteError(w, http.StatusBadRequest, "relay_max_streams is only valid for relay nodes")
 			return
 		}
-		if *req.RelayMaxStreams < relayMinMaxStreams || *req.RelayMaxStreams > relayMaxMaxStreams {
+		if *req.RelayMaxStreams < relaylimits.MinStreams || *req.RelayMaxStreams > relaylimits.MaxStreams {
 			util.WriteError(w, http.StatusBadRequest, "relay_max_streams must be between 1 and 20")
 			return
 		}
-		relayMaxStreams = *req.RelayMaxStreams
+		relayMaxStreams = req.RelayMaxStreams
 	}
 	tokenHash := hashSecret(rawToken)
 	capBytes, err := json.Marshal(nonNilMap(req.CapabilitiesJSON))
@@ -784,7 +788,7 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 			    platform=$3,
 			    capabilities_jsonb=$4::jsonb,
 			    metadata_jsonb=$5::jsonb,
-			    relay_max_streams=$6,
+			    relay_max_streams=COALESCE($6, relay_max_streams),
 			    enrolled_at=now(),
 			    last_heartbeat_at=now(),
 			    updated_at=now()
@@ -800,7 +804,7 @@ func (s *Server) handleNodeEnroll(w http.ResponseWriter, r *http.Request) {
 			)
 			VALUES ($1, $2, $3, $4, $5, 'active', now(), now(), $6::jsonb, $7::jsonb, $8)
 			RETURNING id
-		`, accountID, nodeType, displayName, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes), relayMaxStreams).Scan(&nodeID)
+		`, accountID, nodeType, displayName, strings.TrimSpace(req.Hostname), strings.TrimSpace(req.Platform), string(capBytes), string(metaBytes), defaultRelayMaxStreams(relayMaxStreams)).Scan(&nodeID)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("create node: %v", err))
 			return
@@ -1005,7 +1009,8 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		UPDATE nodes
 		SET
 			last_heartbeat_at=now(),
-			capabilities_jsonb=COALESCE(nodes.capabilities_jsonb, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
+			capabilities_jsonb=(COALESCE(nodes.capabilities_jsonb, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb))
+				- CASE WHEN nodes.node_type='relay' THEN ARRAY['max_concurrent_streams']::text[] ELSE ARRAY[]::text[] END,
 			metadata_jsonb=COALESCE($3::jsonb, nodes.metadata_jsonb),
 			updated_at=now()
 		WHERE nodes.id=$1 AND nodes.status = ANY($4::text[])

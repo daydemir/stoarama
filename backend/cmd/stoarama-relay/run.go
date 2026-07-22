@@ -64,7 +64,7 @@ func runRelay(ctx context.Context) error {
 	worker, err := recordingworker.NewWorker(recordingworker.Config{
 		Client:                      client,
 		WorkerID:                    fmt.Sprintf("node:%d", cfg.NodeID),
-		Concurrency:                 cfg.Concurrency,
+		Concurrency:                 relayWorkerCeiling,
 		HeartbeatSec:                15,
 		PollInterval:                5 * time.Second,
 		SkipDropletHeartbeat:        true,
@@ -91,7 +91,7 @@ func runRelay(ctx context.Context) error {
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		relayHeartbeatLoop(heartbeatCtx, client, pr, &activeJobs, cfg, relayDiag, startedAt, firstHeartbeat)
+		relayHeartbeatLoop(heartbeatCtx, client, pr, &activeJobs, relayDiag, startedAt, firstHeartbeat)
 	}()
 	select {
 	case <-ctx.Done():
@@ -102,8 +102,8 @@ func runRelay(ctx context.Context) error {
 	}
 	pr.runOnce(ctx)
 	pr.applyCookieEnv()
-	log.Printf("stoarama-relay run node=%d concurrency=%d api=%s youtube_ready=%t youtube_error=%q",
-		cfg.NodeID, cfg.Concurrency, cfg.APIURL, pr.ok(), pr.errorClass())
+	log.Printf("stoarama-relay run node=%d worker_ceiling=%d api=%s youtube_ready=%t youtube_error=%q",
+		cfg.NodeID, relayWorkerCeiling, cfg.APIURL, pr.ok(), pr.errorClass())
 
 	go pr.runLoop(ctx)
 	go selfUpdateLoop(ctx, cfg)

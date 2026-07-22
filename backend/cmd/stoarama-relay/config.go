@@ -7,20 +7,23 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/relaylimits"
 )
 
-const (
-	defaultAPIURL            = "https://stoarama.com"
-	defaultConcurrency       = 6
-	legacyDefaultConcurrency = 5
-)
+const defaultAPIURL = "https://stoarama.com"
+
+// relayWorkerCeiling is not a capacity setting. It only bounds local goroutines;
+// the authenticated lease endpoint enforces the org-configured node and group
+// limits before returning work. Sharing the API's accepted maximum means no
+// client-side setting can silently reduce server-authorized capacity.
+const relayWorkerCeiling = relaylimits.MaxStreams
 
 // relayConfig is the persisted enrollment state at ~/.stoarama/config.json (0600).
 type relayConfig struct {
 	NodeID         int64           `json:"node_id"`
 	NodeToken      string          `json:"node_token"`
 	APIURL         string          `json:"api_url"`
-	Concurrency    int             `json:"concurrency"`
 	InstalledAt    time.Time       `json:"installed_at"`
 	UpdateManifest releaseManifest `json:"update_manifest,omitempty"`
 }
@@ -97,9 +100,6 @@ func loadConfig() (relayConfig, error) {
 	cfg.APIURL = strings.TrimRight(strings.TrimSpace(cfg.APIURL), "/")
 	if cfg.APIURL == "" {
 		cfg.APIURL = defaultAPIURL
-	}
-	if cfg.Concurrency <= 0 || cfg.Concurrency == legacyDefaultConcurrency {
-		cfg.Concurrency = defaultConcurrency
 	}
 	if strings.TrimSpace(cfg.NodeToken) == "" {
 		return cfg, fmt.Errorf("relay config %s has no node_token; re-run enroll", p)
