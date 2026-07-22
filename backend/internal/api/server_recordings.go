@@ -1221,20 +1221,20 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
-	if !s.attachCaptureHealthBins(w, r, principal.AccountID, id, item) {
+	if err := s.attachCaptureHealthBins(r.Context(), principal.AccountID, id, item); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, item)
 }
 
-func (s *Server) attachCaptureHealthBins(w http.ResponseWriter, r *http.Request, accountID, id int64, item map[string]any) bool {
-	healthBins, err := s.recordingHealthBinsForAccount(r.Context(), accountID, []int64{id}, true)
+func (s *Server) attachCaptureHealthBins(ctx context.Context, accountID, id int64, item map[string]any) error {
+	healthBins, err := s.recordingHealthBinsForAccount(ctx, accountID, []int64{id}, true)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
-		return false
+		return err
 	}
 	item["capture_health_bins"] = healthBins[id]
-	return true
+	return nil
 }
 
 // writeRecordingJSON re-reads one recording under the account scope and writes it
@@ -1254,9 +1254,8 @@ func (s *Server) writeRecordingJSON(w http.ResponseWriter, r *http.Request, id, 
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
-	if !s.attachCaptureHealthBins(w, r, accountID, id, item) {
-		return
-	}
+	// The mutation has already committed; health history is optional response enrichment.
+	_ = s.attachCaptureHealthBins(r.Context(), accountID, id, item)
 	util.WriteJSON(w, http.StatusOK, item)
 }
 
