@@ -114,6 +114,9 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 		if c["download_path"] != fmt.Sprintf("/api/v1/account/recordings/%v/clips/%v/download", c["recording_id"], c["clip_id"]) {
 			t.Fatalf("unexpected download_path: %v", c["download_path"])
 		}
+		if c["sha256"] != strings.Repeat("a", 64) {
+			t.Fatalf("unexpected sha256: %v", c["sha256"])
+		}
 	}
 
 	// (c) Cursor monotonic: after_id=live1 filters to id>live1 (drops live1, keeps
@@ -356,6 +359,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
 			size_bytes BIGINT NOT NULL,
+			sha256 TEXT NOT NULL DEFAULT '` + strings.Repeat("a", 64) + `',
 			clip_start_at TIMESTAMPTZ NOT NULL,
 			clip_end_at TIMESTAMPTZ NOT NULL,
 			display_path TEXT NOT NULL DEFAULT 'clips/test.mp4',

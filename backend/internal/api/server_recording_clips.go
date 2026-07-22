@@ -1068,7 +1068,7 @@ func deliveryObjectKey(keyPrefix string, recordingID, clipID int64, sourceObject
 const accountClipsCommitWatermark = `interval '90 seconds'`
 
 const accountClipsCursorSQL = `
-	SELECT c.id, c.recording_id, c.size_bytes, c.clip_start_at, c.clip_end_at, c.display_path
+	SELECT c.id, c.recording_id, c.size_bytes, c.sha256, c.clip_start_at, c.clip_end_at, c.display_path
 	FROM recording_clips c
 	JOIN recordings r ON r.id = c.recording_id
 	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
@@ -1108,11 +1108,12 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 			clipID      int64
 			recordingID int64
 			sizeBytes   int64
+			sha256      string
 			clipStartAt time.Time
 			clipEndAt   *time.Time
 			displayPath string
 		)
-		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &clipStartAt, &clipEndAt, &displayPath); err != nil {
+		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &sha256, &clipStartAt, &clipEndAt, &displayPath); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan account clip: %v", err))
 			return
 		}
@@ -1124,6 +1125,7 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 			"clip_id":       clipID,
 			"recording_id":  recordingID,
 			"size_bytes":    sizeBytes,
+			"sha256":        sha256,
 			"clip_start_at": clipStartAt.UTC(),
 			"clip_end_at":   endAt,
 			"relative_path": displayPath,

@@ -17,6 +17,7 @@ import (
 // versioned relay binaries, the pinned yt-dlp/ffmpeg deps, and latest.json are
 // published by scripts/release-relay.sh.
 const relayReleasePrefix = "relay-releases/"
+const nasReleasePrefix = "nas-releases/"
 
 // relayArtifactName restricts a downloadable artifact to a single path segment of
 // safe characters, so the {artifact} route can never traverse out of the release
@@ -39,6 +40,17 @@ func (s *Server) handleRelayUninstallScript(w http.ResponseWriter, r *http.Reque
 // handleRelayDownload streams a named relay artifact (binary tarball, pinned
 // dependency, or latest.json) from R2 by exact name.
 func (s *Server) handleRelayDownload(w http.ResponseWriter, r *http.Request) {
+	s.handleReleaseDownload(w, r, relayReleasePrefix)
+}
+
+// handleNASDownload streams the public, versioned NAS client manifest or Python
+// artifact. NAS pull keys are not required: the bootstrap must be able to install
+// the client before it can authenticate.
+func (s *Server) handleNASDownload(w http.ResponseWriter, r *http.Request) {
+	s.handleReleaseDownload(w, r, nasReleasePrefix)
+}
+
+func (s *Server) handleReleaseDownload(w http.ResponseWriter, r *http.Request, prefix string) {
 	artifact := strings.TrimSpace(chi.URLParam(r, "artifact"))
 	if artifact == "" || artifact == "." || artifact == ".." ||
 		strings.Contains(artifact, "/") || strings.Contains(artifact, "..") ||
@@ -46,11 +58,15 @@ func (s *Server) handleRelayDownload(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, "invalid artifact name")
 		return
 	}
-	s.streamRelayArtifact(w, r, artifact, contentTypeForRelayArtifact(artifact), true)
+	s.streamReleaseArtifact(w, r, prefix, artifact, contentTypeForRelayArtifact(artifact), true)
 }
 
 func (s *Server) streamRelayArtifact(w http.ResponseWriter, r *http.Request, name, contentType string, asAttachment bool) {
-	body, err := s.r2.Open(r.Context(), relayReleasePrefix+name)
+	s.streamReleaseArtifact(w, r, relayReleasePrefix, name, contentType, asAttachment)
+}
+
+func (s *Server) streamReleaseArtifact(w http.ResponseWriter, r *http.Request, prefix, name, contentType string, asAttachment bool) {
+	body, err := s.r2.Open(r.Context(), prefix+name)
 	if err != nil {
 		if r2.IsNotFound(err) {
 			util.WriteError(w, http.StatusNotFound, "not found")
@@ -58,7 +74,7 @@ func (s *Server) streamRelayArtifact(w http.ResponseWriter, r *http.Request, nam
 		}
 		// Do not echo the internal key prefix or raw S3 error to the client; log
 		// the detail server-side and return a generic 404.
-		log.Printf("relay artifact open failed key=%q: %v", relayReleasePrefix+name, err)
+		log.Printf("release artifact open failed key=%q: %v", prefix+name, err)
 		util.WriteError(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -89,6 +105,8 @@ func contentTypeForRelayArtifact(name string) string {
 		return "application/json"
 	case strings.HasSuffix(name, ".sh"):
 		return "text/x-shellscript; charset=utf-8"
+	case strings.HasSuffix(name, ".py"):
+		return "text/x-python; charset=utf-8"
 	default:
 		return "application/octet-stream"
 	}

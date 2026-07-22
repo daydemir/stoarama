@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestPullPathAllowed asserts the pure allowlist that confines a NAS pull key.
@@ -153,5 +155,64 @@ func TestIsPullScopedPrincipal(t *testing.T) {
 	}
 	if !isPullScopedPrincipal(accountPrincipal{APIKeyID: &keyID, KeyScopes: []string{accountScopePull}}) {
 		t.Error("pull key must be pull-scoped")
+	}
+}
+
+func TestConnectionComposeUsesDurablePinnedBootstrap(t *testing.T) {
+	compose := connectionComposeSnippet(connectionPublicAPIBase, "sir_test", 27, 60)
+	for _, want := range []string{
+		nasPythonImage,
+		`STOARAMA_CONNECTION_ID: "27"`,
+		`STOARAMA_STATE_DIR: "/state"`,
+		`https://stoarama.com/nas/download/latest.json`,
+		`current='/state/stoarama_pull.py'`,
+		`os.execv(sys.executable`,
+	} {
+		if !strings.Contains(compose, want) {
+			t.Errorf("compose missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"raw.githubusercontent.com", "python:3-slim\n"} {
+		if strings.Contains(compose, forbidden) {
+			t.Errorf("compose contains unsafe mutable dependency %q", forbidden)
+		}
+	}
+}
+
+func TestValidateConnectionHeartbeat(t *testing.T) {
+	now := time.Now().UTC()
+	valid := connectionHeartbeatRequest{
+		CursorID:           8,
+		ClipsPulled:        5,
+		BytesPulled:        1024,
+		ClientVersion:      "2026.07.22-abc12345",
+		ClientStartedAt:    &now,
+		ClientBootID:       "boot-id",
+		ClientPhase:        "draining",
+		ClientPreviousExit: "clean",
+		LastOutage: &connectionHeartbeatOutage{
+			Class:        "dns_failed",
+			StartedAt:    &now,
+			FailureCount: 3,
+		},
+	}
+	if err := validateConnectionHeartbeat(valid); err != nil {
+		t.Fatalf("valid heartbeat rejected: %v", err)
+	}
+	legacy := connectionHeartbeatRequest{CursorID: 1, ClipsPulled: 1}
+	if err := validateConnectionHeartbeat(legacy); err != nil {
+		t.Fatalf("legacy heartbeat rejected during rollout: %v", err)
+	}
+	invalid := []connectionHeartbeatRequest{
+		{CursorID: -1},
+		{ClientVersion: "bad/version"},
+		{ClientVersion: "v1", ClientPhase: "running", ClientPreviousExit: "clean"},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "panic"},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastOutage: &connectionHeartbeatOutage{Class: "dns_failed"}},
+	}
+	for i, request := range invalid {
+		if err := validateConnectionHeartbeat(request); err == nil {
+			t.Errorf("invalid heartbeat %d accepted: %+v", i, request)
+		}
 	}
 }
