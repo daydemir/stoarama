@@ -190,7 +190,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 				live, err := fetchLatest(cfg.APIURL, liveReleaseManifest)
 				if err != nil {
 					log.Printf("relay self-update: check live promotion: %v", err)
-				} else if next := updateManifestAfterPromotion(manifest, live.Version, version); next != manifest {
+				} else if next := updateManifestAfterPromotion(manifest, live.Version, live.PreviousVersion, version); next != manifest {
 					if err := setUpdateManifest(liveReleaseManifest); err != nil {
 						log.Printf("relay self-update: clear candidate pin: %v", err)
 					} else {
@@ -280,8 +280,9 @@ func (cfg relayConfig) updateManifest() releaseManifest {
 	return liveReleaseManifest
 }
 
-func updateManifestAfterPromotion(current releaseManifest, liveVersion, runningVersion string) releaseManifest {
-	if current != liveReleaseManifest && liveVersion == runningVersion {
+func updateManifestAfterPromotion(current releaseManifest, liveVersion, livePreviousVersion, runningVersion string) releaseManifest {
+	pinnedVersion, pinned := current.version()
+	if pinned && pinnedVersion == runningVersion && (liveVersion == runningVersion || livePreviousVersion == runningVersion) {
 		return liveReleaseManifest
 	}
 	return current

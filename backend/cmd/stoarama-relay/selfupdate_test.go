@@ -217,11 +217,17 @@ func TestValidManifestName(t *testing.T) {
 
 func TestCandidateManifestStaysPinnedUntilPromotion(t *testing.T) {
 	candidate := releaseManifest("latest-new12345.json")
-	if got := updateManifestAfterPromotion(candidate, "old12345", "new12345"); got != candidate {
+	if got := updateManifestAfterPromotion(candidate, "old12345", "older1234", "new12345"); got != candidate {
 		t.Fatalf("candidate changed before promotion: %q", got)
 	}
-	if got := updateManifestAfterPromotion(candidate, "new12345", "new12345"); got != liveReleaseManifest {
+	if got := updateManifestAfterPromotion(candidate, "new12345", "old12345", "new12345"); got != liveReleaseManifest {
 		t.Fatalf("candidate remained pinned after promotion: %q", got)
+	}
+	if got := updateManifestAfterPromotion(candidate, "newer1234", "new12345", "new12345"); got != liveReleaseManifest {
+		t.Fatalf("late candidate remained pinned after next promotion: %q", got)
+	}
+	if got := updateManifestAfterPromotion(candidate, "newer1234", "new12345", "other1234"); got != candidate {
+		t.Fatalf("non-running candidate changed: %q", got)
 	}
 }
 
