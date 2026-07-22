@@ -143,10 +143,8 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusBadRequest, "target_fps must be between 1 and 60 (omit for Source)")
 		return
 	}
-	startAt := time.Now().UTC()
-	if req.StartAt != nil {
-		startAt = req.StartAt.UTC()
-	}
+	requestNow := time.Now().UTC()
+	startAt := effectiveRecordingStart(req.StartAt, requestNow)
 	var endAt *time.Time
 	if req.EndAt != nil {
 		t := req.EndAt.UTC()
@@ -347,6 +345,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	items := make([]batchScheduleItem, 0, len(streams))
 	created, updated := 0, 0
 	now := time.Now().UTC()
+	startAt = effectiveRecordingStart(req.StartAt, now)
+	if endAt != nil && !endAt.After(startAt) {
+		util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+		return
+	}
 	for _, st := range streams {
 		captureVia := batchCaptureVia(st.sourceURL, st.provider, st.captureVia)
 		var cronArg, dailyStartArg, dailyEndArg, nextArg any

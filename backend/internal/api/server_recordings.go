@@ -587,10 +587,8 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 	// Capture window: start_at defaults to now() (start immediately), end_at is
 	// open-ended when nil. When both are present, end_at must be strictly after
 	// start_at (mirrors the recordings_window_chk DB constraint).
-	startAt := time.Now().UTC()
-	if req.StartAt != nil {
-		startAt = req.StartAt.UTC()
-	}
+	requestNow := time.Now().UTC()
+	startAt := effectiveRecordingStart(req.StartAt, requestNow)
 	var endAtArg any
 	if req.EndAt != nil {
 		endAt := req.EndAt.UTC()
@@ -790,28 +788,6 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
-
-	var nextFireArg any
-	if mode == "continuous" {
-		nextOpen, nerr := recsched.NextWindowOpenUTC(cronTimezone, dailyStart, startAt, endAtTime(endAtArg), time.Now().UTC())
-		if nerr != nil {
-			util.WriteError(w, http.StatusBadRequest, nerr.Error())
-			return
-		}
-		if !nextOpen.IsZero() {
-			nextFireArg = nextOpen
-		}
-	} else {
-		nextFire, nerr := recsched.NextFireUTC(cronExpr, cronTimezone, time.Now().UTC())
-		if nerr != nil {
-			util.WriteError(w, http.StatusBadRequest, nerr.Error())
-			return
-		}
-		if !nextFire.IsZero() {
-			nextFireArg = nextFire
-		}
-	}
-
 	var existingID *int64
 	if catalogStreamID > 0 {
 		if err := s.pool.QueryRow(r.Context(), `
@@ -850,6 +826,32 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	persistNow := time.Now().UTC()
+	startAt = effectiveRecordingStart(req.StartAt, persistNow)
+	if endAt, ok := endAtArg.(time.Time); ok && !endAt.After(startAt) {
+		util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+		return
+	}
+	var nextFireArg any
+	if mode == "continuous" {
+		nextOpen, nerr := recsched.NextWindowOpenUTC(cronTimezone, dailyStart, startAt, endAtTime(endAtArg), persistNow)
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextOpen.IsZero() {
+			nextFireArg = nextOpen
+		}
+	} else {
+		nextFire, nerr := recsched.NextFireUTC(cronExpr, cronTimezone, persistNow)
+		if nerr != nil {
+			util.WriteError(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+		if !nextFire.IsZero() {
+			nextFireArg = nextFire
+		}
+	}
 
 	var cronExprArg any
 	if mode != "continuous" {
@@ -927,6 +929,13 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		"start_at":   startOut.UTC(),
 		"end_at":     endOut,
 	})
+}
+
+func effectiveRecordingStart(requested *time.Time, now time.Time) time.Time {
+	if requested != nil && requested.After(now) {
+		return requested.UTC()
+	}
+	return now.UTC()
 }
 
 // isYouTubeWatchURL mirrors capture/resolve.go's isYouTubeURL host check. It is the
@@ -1234,15 +1243,16 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	// end_at keeps the recording's existing window (a schedule edit is not a window
 	// reset). A canceled recording is not found.
 	var (
+		curStatus        string
 		curStartAt       time.Time
 		curEndAt         *time.Time
 		namingProfileRaw string
 		activeWeekdays   recsched.WeekdaySet
 	)
 	if err := s.pool.QueryRow(r.Context(), `
-		SELECT start_at, end_at, naming_profile, active_weekdays FROM recordings
+		SELECT status, start_at, end_at, naming_profile, active_weekdays FROM recordings
 		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
-	`, id, principal.AccountID).Scan(&curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays); err != nil {
+	`, id, principal.AccountID).Scan(&curStatus, &curStartAt, &curEndAt, &namingProfileRaw, &activeWeekdays); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 			return
@@ -1257,11 +1267,13 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	}
 
 	startAt := curStartAt.UTC()
-	if req.StartAt != nil {
+	if curStatus == "completed" {
+		startAt = effectiveRecordingStart(req.StartAt, time.Now().UTC())
+	} else if req.StartAt != nil {
 		startAt = req.StartAt.UTC()
 	}
 	endAtArg := any(nil)
-	if curEndAt != nil {
+	if curStatus != "completed" && curEndAt != nil {
 		endAtArg = curEndAt.UTC()
 	}
 	if req.EndAt != nil {
@@ -1323,11 +1335,19 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 	// Recompute next_fire_at with the mode-aware authority (NULL when the schedule has
 	// no upcoming fire, e.g. a window that ends before now).
 	var nextFireArg any
+	nextFireNow := time.Now().UTC()
+	if curStatus == "completed" {
+		startAt = effectiveRecordingStart(req.StartAt, nextFireNow)
+		if endAt, ok := endAtArg.(time.Time); ok && !endAt.After(startAt) {
+			util.WriteError(w, http.StatusBadRequest, "end_at must be after start_at")
+			return
+		}
+	}
 	var endAtForNext *time.Time
 	if t, ok := endAtArg.(time.Time); ok {
 		endAtForNext = &t
 	}
-	nextFire, nerr := nextFireForRecording(mode, cronExprForNext, cronTimezone, dwStartForNext, dwEndForNext, activeWeekdays, startAt, endAtForNext, time.Now().UTC())
+	nextFire, nerr := nextFireForRecording(mode, cronExprForNext, cronTimezone, dwStartForNext, dwEndForNext, activeWeekdays, startAt, endAtForNext, nextFireNow)
 	if nerr != nil {
 		util.WriteError(w, http.StatusBadRequest, nerr.Error())
 		return
@@ -1346,15 +1366,15 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		    last_error_text=CASE WHEN status='completed' THEN '' ELSE last_error_text END,
 		    last_error_at=CASE WHEN status='completed' THEN NULL ELSE last_error_at END,
 		    updated_at=now()
-		WHERE id=$1 AND account_id=$2 AND status <> 'canceled'
+		WHERE id=$1 AND account_id=$2 AND status=$13
 	`, id, principal.AccountID, mode, cronExprForNext, cronTimezone, clipDuration,
-		dwStartForNext, dwEndForNext, targetFPSArg, startAt, endAtArg, nextFireArg)
+		dwStartForNext, dwEndForNext, targetFPSArg, startAt, endAtArg, nextFireArg, curStatus)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update recording schedule: %v", err))
 		return
 	}
 	if ct.RowsAffected() == 0 {
-		util.WriteError(w, http.StatusNotFound, "recording not found")
+		util.WriteError(w, http.StatusConflict, "recording status changed; refresh and try again")
 		return
 	}
 
