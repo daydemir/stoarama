@@ -215,6 +215,11 @@
       background: color-mix(in srgb, var(--accent) 8%, var(--panel));
       border-color: var(--accent);
     }
+    .recording-status { font-family: var(--mono); font-size: 11px; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+    .recording-status::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .recording-status.active { color: var(--ok); }
+    .recording-status.active::before { background: var(--ok); }
+    .recording-status.completed { color: var(--text); }
     .table-view-cell {
       width: 116px;
       text-align: right;
@@ -1780,6 +1785,15 @@
             <label class="check-label"><input type="checkbox" id="seenVehiclesFilter" /> Vehicles</label>
           </div>
         </div>
+        <div class="filter-field filter-field-wide">
+          <div class="filter-field-label">Recording status</div>
+          <div class="filter-choice-row">
+            <label class="check-label"><input type="checkbox" data-recording-status-filter="not_recording" /> Not recording</label>
+            <label class="check-label"><input type="checkbox" data-recording-status-filter="active" /> Active</label>
+            <label class="check-label"><input type="checkbox" data-recording-status-filter="paused" /> Paused</label>
+            <label class="check-label"><input type="checkbox" data-recording-status-filter="completed" /> Completed</label>
+          </div>
+        </div>
       </div>
       <div class="filter-footer">
         <div class="row">
@@ -1855,6 +1869,7 @@
 	            <th data-sort-key="location_city">Location</th>
 	            <th data-sort-key="survey_last_person_count">People</th>
 	            <th data-sort-key="survey_last_vehicle_count">Vehicles</th>
+	            <th>Status</th>
 	            <th>Record</th>
 	          </tr>
 	        </thead>
@@ -2005,11 +2020,11 @@ const overviewQueueChips = $('overviewQueueChips');
 const streamSearch = $('streamSearch');
 const streamTagFilter = $('streamTagFilter');
 const streamTagExcludeFilter = $('streamTagExcludeFilter');
-const streamRecordingStateFilter = $('streamRecordingState');
 const streamModeFilter = $('streamModeFilter');
 const sourceFilter = $('sourceFilter');
 const providerFilter = $('providerFilter');
 const sourceTypeFilterInputs = Array.from(document.querySelectorAll('input[data-source-type-filter]'));
+const recordingStatusFilterInputs = Array.from(document.querySelectorAll('input[data-recording-status-filter]'));
 const koreaRegionField = $('koreaRegionField');
 const koreaRegionFilter = $('koreaRegionFilter');
 const countryFilter = $('countryFilter');
@@ -2172,6 +2187,12 @@ let streamRows = [];
 // Multi-select for batch scheduling: ids checked on the browse table. Persists
 // across re-render/filter changes (rows re-apply checked state in renderStreamRows).
 const selectedStreamIds = new Set();
+const RECORDING_STATUS = Object.freeze({
+  NOT_RECORDING: 'not_recording',
+  ACTIVE: 'active',
+  PAUSED: 'paused',
+  COMPLETED: 'completed',
+});
 let streamTotal = 0;
 let streamAllTotal = null;
 let streamPage = 1;
@@ -3561,7 +3582,7 @@ async function resetStreamFilters() {
   streamSearch.value = '';
   streamTagFilter.value = '';
   streamTagExcludeFilter.value = '';
-  streamRecordingStateFilter.value = '';
+  recordingStatusFilterInputs.forEach((input) => { input.checked = false; });
   streamModeFilter.value = '';
   sourceFilter.value = '';
   providerFilter.value = '';
@@ -4774,11 +4795,11 @@ function setStreamsMapStatus(msg, cls = '') {
 function buildStreamFilterParams() {
   const params = new URLSearchParams();
   updateStreamFilterSummary();
-  const recordingState = normalizeRecordingStateFilter(streamRecordingStateFilter.value);
+  const recordingStatuses = recordingStatusFilterInputs.filter((input) => input.checked).map((input) => input.dataset.recordingStatusFilter);
   const captureType = normalizeCaptureTypeFilter(streamModeFilter.value);
   const sourceTypes = selectedSourceTypeList();
   const koreaFamily = streamSourceSegment === SOURCE_SEGMENT.VIDEO ? String(koreaRegionFilter.value || '').trim() : '';
-  if (recordingState) params.set('recording_state', recordingState);
+  if (recordingStatuses.length) params.set('recording_statuses', recordingStatuses.join(','));
   if (captureType) params.set('capture_type', captureType);
   if (sourceTypes.length) params.set('capture_types', sourceTypes.join(','));
   if (streamSearch.value.trim()) params.set('q', streamSearch.value.trim());
@@ -4803,7 +4824,8 @@ function applyStreamListStateFromURL(params) {
   streamSearch.value = String(params.get('q') || '').trim();
   setSelectValuePreservingOption(streamTagFilter, params.get('tags'));
   setSelectValuePreservingOption(streamTagExcludeFilter, params.get('tags_not'));
-  streamRecordingStateFilter.value = normalizeRecordingStateFilter(params.get('recording_state'));
+  const recordingStatuses = new Set(splitCSV(params.get('recording_statuses')));
+  recordingStatusFilterInputs.forEach((input) => { input.checked = recordingStatuses.has(input.dataset.recordingStatusFilter); });
   streamModeFilter.value = normalizeCaptureTypeFilter(params.get('capture_type'));
   setSelectValuePreservingOption(sourceFilter, params.get('source'), formatSourceLabel);
   setSelectValuePreservingOption(providerFilter, params.get('provider'), formatProviderLabel);
@@ -4877,7 +4899,7 @@ async function refreshAllStreamFilterOptions() {
   const tagParams = buildDashboardSelectParams(
     'all',
     '',
-    streamRecordingStateFilter.value,
+    '',
     '',
     countryFilter.value,
     cityFilter.value,
@@ -4891,25 +4913,25 @@ async function refreshAllStreamFilterOptions() {
     await Promise.all([
       loadKnownStreamTagsSafe('all', tagParams, requestToken, signal),
       loadSourceOptions(
-        sourceFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        sourceFilter, 'all', streamTagFilter.value, '',
         streamTagExcludeFilter.value, countryFilter.value, cityFilter.value,
         optionScope.captureType, providerFilter.value, optionScope.koreaFamily,
         requestToken, optionScope.captureTypes, signal,
       ),
       loadProviderOptions(
-        providerFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        providerFilter, 'all', streamTagFilter.value, '',
         streamTagExcludeFilter.value, countryFilter.value, cityFilter.value,
         sourceFilter.value, optionScope.captureType, optionScope.koreaFamily,
         requestToken, optionScope.captureTypes, signal,
       ),
       loadCountryOptions(
-        countryFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        countryFilter, 'all', streamTagFilter.value, '',
         streamTagExcludeFilter.value, sourceFilter.value, optionScope.captureType,
         providerFilter.value, optionScope.koreaFamily, requestToken,
         optionScope.captureTypes, signal,
       ),
       loadCityOptions(
-        cityFilter, 'all', streamTagFilter.value, streamRecordingStateFilter.value,
+        cityFilter, 'all', streamTagFilter.value, '',
         streamTagExcludeFilter.value, countryFilter.value, sourceFilter.value,
         optionScope.captureType, providerFilter.value, optionScope.koreaFamily,
         requestToken, optionScope.captureTypes, signal,
@@ -5130,7 +5152,7 @@ function renderStreamRows() {
     updateSortableHeaders(streamsTable, streamSortBy, streamSortDir);
     streamRowsEl.innerHTML = `
       <tr>
-        <td colspan="7" style="padding:20px;">
+        <td colspan="8" style="padding:20px;">
           <div class="stack">
             <strong>No streams match your current filters.</strong>
             <span class="muted fs11">Try broadening your search or removing some filters.</span>
@@ -5176,6 +5198,7 @@ function renderStreamRows() {
       <td class="muted fs11"><div class="stack">${renderLocationHierarchy(s)}${renderLocalTimezone(s)}</div></td>
       <td class="muted fs11 mono">${renderSurveySnapshotCount(row, 'person')}</td>
       <td class="muted fs11 mono">${renderSurveySnapshotCount(row, 'vehicle')}</td>
+      <td>${renderStreamRecordingStatus(row)}</td>
       <td class="stream-record-cell">${
         recordable
           ? (streamRecordingID(row) > 0
@@ -5511,6 +5534,17 @@ function isRecordableStream(stream) {
 // level. In both cases it sits on the object handed in, not on the inner stream.
 function streamRecordingID(item) {
   return Number((item && item.recording_id) || 0) || 0;
+}
+
+function renderStreamRecordingStatus(item) {
+  const status = String((item && item.recording_status) || RECORDING_STATUS.NOT_RECORDING);
+  const labels = {
+    [RECORDING_STATUS.NOT_RECORDING]: 'Not recording',
+    [RECORDING_STATUS.ACTIVE]: 'Active',
+    [RECORDING_STATUS.PAUSED]: 'Paused',
+    [RECORDING_STATUS.COMPLETED]: 'Completed',
+  };
+  return `<span class="recording-status ${esc(status)}">${esc(labels[status] || labels[RECORDING_STATUS.NOT_RECORDING])}</span>`;
 }
 
 // True when the source is an indirect "!hls" reference (KBS/Korea via loomex):
@@ -6377,9 +6411,9 @@ streamTagFilter.addEventListener('change', async () => {
 streamTagExcludeFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: true });
 });
-streamRecordingStateFilter.addEventListener('change', async () => {
-  await reloadStreamsForFilterChange({ reloadAllOptions: true });
-});
+recordingStatusFilterInputs.forEach((input) => input.addEventListener('change', async () => {
+  await reloadStreamsForFilterChange({ reloadAllOptions: false });
+}));
 streamModeFilter.addEventListener('change', async () => {
   await reloadStreamsForFilterChange({ reloadAllOptions: true });
 });

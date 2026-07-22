@@ -3539,6 +3539,13 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	recordingStates, err := parseStreamRecordingStates(r.URL.Query().Get("recording_statuses"))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actingAccountID, hasActingAccount := s.optionalActingAccountID(r)
+	where, args = appendStreamRecordingStatusWhere(where, args, recordingStates, actingAccountID, hasActingAccount)
 	whereSQL := strings.Join(where, " AND ")
 	var total int64
 	if err := s.pool.QueryRow(r.Context(), fmt.Sprintf(`
@@ -3573,7 +3580,8 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 		// RecordingID is the acting org's latest non-canceled recording.id for this
 		// stream, or null if none. It drives the streams "Record" -> "View/Edit
 		// recording" CTA flip. Scoped to the browser session's current org.
-		RecordingID *int64 `json:"recording_id"`
+		RecordingID     *int64               `json:"recording_id"`
+		RecordingStatus streamRecordingState `json:"recording_status"`
 		// Survey detection snapshot (latest sampled frame, null if no data yet).
 		SurveyLastPersonCount  *int64     `json:"survey_last_person_count,omitempty"`
 		SurveyLastVehicleCount *int64     `json:"survey_last_vehicle_count,omitempty"`
@@ -3771,21 +3779,27 @@ func (s *Server) handleDashboardStreams(w http.ResponseWriter, r *http.Request) 
 	}
 	// recording_id: the acting org's latest non-canceled recording per stream. Scoped
 	// to the browser session's current org; anonymous visitors get null everywhere.
-	if actingAccountID, ok := s.optionalActingAccountID(r); ok && len(items) > 0 {
+	if hasActingAccount && len(items) > 0 {
 		streamIDs := make([]int64, 0, len(items))
 		for _, it := range items {
 			streamIDs = append(streamIDs, it.Stream.ID)
 		}
-		recIDs, err := s.actingRecordingIDsForStreams(r.Context(), actingAccountID, streamIDs)
+		recordings, err := s.actingRecordingsForStreams(r.Context(), actingAccountID, streamIDs)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("resolve acting recordings: %v", err))
 			return
 		}
 		for i := range items {
-			if recID, ok := recIDs[items[i].Stream.ID]; ok {
-				id := recID
+			items[i].RecordingStatus = streamRecordingNotRecording
+			if recording, ok := recordings[items[i].Stream.ID]; ok {
+				id := recording.ID
 				items[i].RecordingID = &id
+				items[i].RecordingStatus = recording.State
 			}
+		}
+	} else {
+		for i := range items {
+			items[i].RecordingStatus = streamRecordingNotRecording
 		}
 	}
 

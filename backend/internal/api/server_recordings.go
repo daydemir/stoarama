@@ -252,32 +252,94 @@ func (s *Server) optionalActingAccountID(r *http.Request) (int64, bool) {
 	return principal.AccountID, true
 }
 
-// actingRecordingIDsForStreams returns, per stream id, the acting org's latest
-// non-canceled recording.id for that stream (NULL/absent when none). It is the batch
-// resolver behind the streams list's recording_id field, scoped to the acting org so
-// one org never sees another's recording. An empty input (or no acting org) yields an
-// empty map, which renders every stream's recording_id as null.
-func (s *Server) actingRecordingIDsForStreams(ctx context.Context, accountID int64, streamIDs []int64) (map[int64]int64, error) {
-	out := map[int64]int64{}
+type streamRecordingState string
+
+const (
+	streamRecordingNotRecording streamRecordingState = "not_recording"
+	streamRecordingActive       streamRecordingState = "active"
+	streamRecordingPaused       streamRecordingState = "paused"
+	streamRecordingCompleted    streamRecordingState = "completed"
+)
+
+type streamRecording struct {
+	ID    int64
+	State streamRecordingState
+}
+
+func parseStreamRecordingStates(raw string) ([]streamRecordingState, error) {
+	values := dedupeStrings(strings.Split(strings.ToLower(raw), ","))
+	states := make([]streamRecordingState, 0, len(values))
+	for _, value := range values {
+		state := streamRecordingState(value)
+		switch state {
+		case streamRecordingNotRecording, streamRecordingActive, streamRecordingPaused, streamRecordingCompleted:
+			states = append(states, state)
+		default:
+			return nil, fmt.Errorf("invalid recording_statuses; expected not_recording,active,paused,completed")
+		}
+	}
+	return states, nil
+}
+
+func appendStreamRecordingStatusWhere(where []string, args []any, states []streamRecordingState, accountID int64, authenticated bool) ([]string, []any) {
+	if len(states) == 0 {
+		return where, args
+	}
+	if !authenticated {
+		for _, state := range states {
+			if state == streamRecordingNotRecording {
+				return where, args
+			}
+		}
+		return append(where, "FALSE"), args
+	}
+	stateValues := make([]string, len(states))
+	for i, state := range states {
+		stateValues[i] = string(state)
+	}
+	args = append(args, accountID, stateValues)
+	where = append(where, fmt.Sprintf(`COALESCE((
+		SELECT %s
+		FROM recordings rec
+		WHERE rec.account_id=$%d AND rec.stream_id=s.id AND rec.status <> 'canceled'
+		ORDER BY rec.id DESC LIMIT 1
+	), 'not_recording') = ANY($%d::text[])`, streamRecordingStateSQL, len(args)-1, len(args)))
+	return where, args
+}
+
+const streamRecordingStateSQL = `CASE
+	WHEN rec.status='completed' OR (rec.end_at IS NOT NULL AND rec.end_at <= now()) THEN 'completed'
+	WHEN rec.status='paused' THEN 'paused'
+	ELSE 'active'
+END`
+
+// actingRecordingsForStreams returns the acting org's latest non-canceled recording
+// and its effective state for each stream. An empty input or no acting org yields an
+// empty map.
+func (s *Server) actingRecordingsForStreams(ctx context.Context, accountID int64, streamIDs []int64) (map[int64]streamRecording, error) {
+	out := map[int64]streamRecording{}
 	if accountID <= 0 || len(streamIDs) == 0 {
 		return out, nil
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT rec.stream_id, MAX(rec.id)
+		SELECT DISTINCT ON (rec.stream_id) rec.stream_id, rec.id, `+streamRecordingStateSQL+`
 		FROM recordings rec
 		WHERE rec.account_id=$1 AND rec.status <> 'canceled' AND rec.stream_id = ANY($2::bigint[])
-		GROUP BY rec.stream_id
+		ORDER BY rec.stream_id, rec.id DESC
 	`, accountID, streamIDs)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var streamID, recID int64
-		if err := rows.Scan(&streamID, &recID); err != nil {
+		var streamID int64
+		var recording streamRecording
+		var state string
+		if err := rows.Scan(&streamID, &recording.ID, &state); err != nil {
 			return nil, err
 		}
-		out[streamID] = recID
+		recording.State = streamRecordingState(state)
+		out[streamID] = recording
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
