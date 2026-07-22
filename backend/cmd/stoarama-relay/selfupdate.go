@@ -111,6 +111,7 @@ func runSelfUpdate(args []string) error {
 		if err := atomicWriteExecutable(target, previous); err != nil {
 			return err
 		}
+		markRelayExit(relayExitSelfUpdate)
 		return restartService()
 	}
 	manifest := releaseManifest(*manifestName)
@@ -166,6 +167,7 @@ func runSelfUpdate(args []string) error {
 		}
 	}
 	if relayUpdated {
+		markRelayExit(relayExitSelfUpdate)
 		return restartService()
 	}
 	return nil
@@ -242,6 +244,7 @@ func checkAndApplyUpdate(base string, manifest releaseManifest) {
 
 	if relayUpdated {
 		log.Printf("relay self-update: restarting service to load new binary")
+		markRelayExit(relayExitSelfUpdate)
 		if err := restartService(); err != nil {
 			log.Printf("relay self-update: restart failed: %v", err)
 		}

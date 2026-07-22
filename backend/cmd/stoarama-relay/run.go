@@ -95,6 +95,8 @@ func runRelay(ctx context.Context) error {
 	}()
 	select {
 	case <-ctx.Done():
+		stopHeartbeat()
+		<-heartbeatDone
 		return ctx.Err()
 	case <-firstHeartbeat:
 	}
@@ -111,10 +113,7 @@ func runRelay(ctx context.Context) error {
 	<-heartbeatDone
 	if err == nil || ctx.Err() != nil {
 		if path := recoveryStatePath(); path != "" {
-			if state, loadErr := loadRecoveryState(path); loadErr == nil {
-				state.PreviousExit = "clean"
-				_ = state.persist(path)
-			}
+			markRelayExit(relayExitClean)
 		}
 	}
 	return err

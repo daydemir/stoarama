@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -168,6 +169,47 @@ func TestHeartbeatDiagnosticsRejectsOversizedState(t *testing.T) {
 	}
 	if _, err := loadHeartbeatDiagnostics(path); err == nil {
 		t.Fatal("oversized diagnostics state accepted")
+	}
+}
+
+func TestRelayHealthSnapshotUsesDataDirectory(t *testing.T) {
+	health := relayHealthSnapshot(t.TempDir())
+	if free, ok := health["disk_free_bytes"].(uint64); !ok || free == 0 {
+		t.Fatalf("disk_free_bytes=%v want positive uint64", health["disk_free_bytes"])
+	}
+}
+
+func TestAppendDiagnosticErrorsMergesSanitizesAndBounds(t *testing.T) {
+	existing := []string{"capture old"}
+	incoming := []string{
+		"capture old",
+		"fetch https://example.com/path?token=secret failed",
+		"capture 2", "capture 3", "capture 4", "capture 5",
+		"capture 6", "capture 7", "capture 8", "capture 9",
+	}
+	got := appendDiagnosticErrors(existing, incoming)
+	if len(got) != 8 {
+		t.Fatalf("len=%d want 8: %v", len(got), got)
+	}
+	for _, value := range got {
+		if strings.Contains(value, "secret") {
+			t.Fatalf("unsanitized diagnostic: %q", value)
+		}
+	}
+	if got[len(got)-1] != "capture 9" {
+		t.Fatalf("newest=%q want capture 9", got[len(got)-1])
+	}
+}
+
+func TestMarkRelayExitPersistsSelfUpdate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	markRelayExit(relayExitSelfUpdate)
+	state, err := loadRecoveryState(recoveryStatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.PreviousExit != relayExitSelfUpdate {
+		t.Fatalf("previous_exit=%q want %q", state.PreviousExit, relayExitSelfUpdate)
 	}
 }
 

@@ -66,10 +66,10 @@ Once Render, domain, and email are live:
 - [ ] Complete relay recovery observability before changing load limits or
   network assumptions: persist boot ID, process start/clean-shutdown markers,
   last successful heartbeat/capture/upload/update timestamps, and a bounded
-  relay error tail. The first
-  successful heartbeat after recovery must atomically include the recovery
-  metadata (`recovered_at`, outage class/duration, and bounded error tail),
-  with no credentials. Follow up separately with systemd exit result/signal and
+  relay error tail. The first successful heartbeat after recovery must
+  atomically include the recovery metadata (`recovered_at`, `previous_exit`, and
+  bounded error tail), with no credentials. Follow up separately with outage
+  class/duration, systemd exit result/signal, and
   backend receipt/rejection/latency metrics. Test process crash, reboot,
   OOM/signal, DNS failure, timeout,
   API rejection, and clean restart in an emulator or disposable relay before
