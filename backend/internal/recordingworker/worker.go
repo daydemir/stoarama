@@ -530,7 +530,7 @@ func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.Canc
 	}
 	err := fmt.Errorf("continuous relay made no progress for %s", w.cfg.ContinuousNoProgressTimeout)
 	cancel()
-	surrenderCtx, surrenderCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	surrenderCtx, surrenderCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer surrenderCancel()
 	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, recordingapi.SurrenderNoProgress); surrenderErr != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "surrender_failed", surrenderErr)
