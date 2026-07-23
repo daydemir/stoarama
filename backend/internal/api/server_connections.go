@@ -571,6 +571,14 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 	if req.CursorID < 0 || req.ClipsPulled < 0 || req.BytesPulled < 0 {
 		return errors.New("cursor_id, clips_pulled, and bytes_pulled must be non-negative")
 	}
+	batch := req.LastBatch
+	if batch.Clips < 0 || batch.Bytes < 0 || batch.DurationMS < 0 ||
+		batch.Workers < 0 || batch.Workers > 32 || batch.Retries < 0 || batch.Failures < 0 {
+		return errors.New("invalid NAS batch telemetry")
+	}
+	if batch.CompletedAt != nil && (batch.DurationMS < 1 || batch.Workers < 1) {
+		return errors.New("completed NAS batch telemetry requires duration and workers")
+	}
 	if req.ClientVersion == "" {
 		return nil // Backward compatibility for the old NAS client during rollout.
 	}
@@ -582,14 +590,6 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 	}
 	if len(req.ClientLastError) > 1000 {
 		return errors.New("client_last_error is too long")
-	}
-	batch := req.LastBatch
-	if batch.Clips < 0 || batch.Bytes < 0 || batch.DurationMS < 0 ||
-		batch.Workers < 0 || batch.Workers > 32 || batch.Retries < 0 || batch.Failures < 0 {
-		return errors.New("invalid NAS batch telemetry")
-	}
-	if batch.CompletedAt != nil && (batch.DurationMS < 1 || batch.Workers < 1) {
-		return errors.New("completed NAS batch telemetry requires duration and workers")
 	}
 	if req.LastOutage != nil {
 		if !connectionOutageClasses[req.LastOutage.Class] || req.LastOutage.FailureCount < 1 || req.LastOutage.StartedAt == nil {
@@ -650,13 +650,13 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    last_outage_started_at=CASE WHEN $12 <> '' THEN $13 ELSE last_outage_started_at END,
 		    last_outage_recovered_at=CASE WHEN $12 <> '' THEN $14 ELSE last_outage_recovered_at END,
 		    last_outage_failure_count=CASE WHEN $12 <> '' THEN $15 ELSE last_outage_failure_count END,
-		    nas_batch_completed_at=CASE WHEN $16 IS NOT NULL THEN $16 ELSE nas_batch_completed_at END,
-		    nas_batch_clips=CASE WHEN $16 IS NOT NULL THEN $17 ELSE nas_batch_clips END,
-		    nas_batch_bytes=CASE WHEN $16 IS NOT NULL THEN $18 ELSE nas_batch_bytes END,
-		    nas_batch_duration_ms=CASE WHEN $16 IS NOT NULL THEN $19 ELSE nas_batch_duration_ms END,
+		    nas_batch_completed_at=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $16 ELSE nas_batch_completed_at END,
+		    nas_batch_clips=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $17 ELSE nas_batch_clips END,
+		    nas_batch_bytes=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $18 ELSE nas_batch_bytes END,
+		    nas_batch_duration_ms=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $19 ELSE nas_batch_duration_ms END,
 		    nas_download_workers=CASE WHEN $20 > 0 THEN $20 ELSE nas_download_workers END,
-		    nas_batch_retries=CASE WHEN $16 IS NOT NULL THEN $21 ELSE nas_batch_retries END,
-		    nas_batch_failures=CASE WHEN $16 IS NOT NULL THEN $22 ELSE nas_batch_failures END,
+		    nas_batch_retries=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $21 ELSE nas_batch_retries END,
+		    nas_batch_failures=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $22 ELSE nas_batch_failures END,
 		    updated_at=now()
 		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,

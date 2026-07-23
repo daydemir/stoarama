@@ -414,6 +414,7 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	}
 	invalid := []connectionHeartbeatRequest{
 		{CursorID: -1},
+		{LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
 		{ClientVersion: "bad/version"},
 		{ClientVersion: "v1", ClientPhase: "running", ClientPreviousExit: "clean"},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "panic"},

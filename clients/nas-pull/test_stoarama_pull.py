@@ -165,8 +165,14 @@ class NASPullTests(unittest.TestCase):
             clips = [{"clip_id": value, "recording_id": 3} for value in (1, 2)]
             download_error = pull.RetryExhausted(RuntimeError("download failed"), 2)
             release_error = pull.RetryExhausted(RuntimeError("release failed"), 2)
+
+            def process(_cfg, clip, release=True):
+                if clip["clip_id"] == 2:
+                    raise download_error
+                return 1, 10, 10, 0
+
             with mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
-                pull, "process_clip", side_effect=[(1, 10, 10, 0), download_error]
+                pull, "process_clip", side_effect=process
             ), mock.patch.object(pull, "retry_transient", side_effect=release_error):
                 self.assertFalse(pull.drain_page(cfg, runtime))
             self.assertEqual(runtime.batch["retries"], 4)
