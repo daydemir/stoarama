@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -149,6 +150,132 @@ func TestClampPollIntervalSec(t *testing.T) {
 		if got := clampPollIntervalSec(in); got != want {
 			t.Errorf("clampPollIntervalSec(%d)=%d want %d", in, got, want)
 		}
+	}
+}
+
+func TestConnectionListItemJSONContract(t *testing.T) {
+	item := connectionListItem{
+		ID:            13,
+		Health:        connectionHealthHealthy,
+		ClientPhase:   "draining",
+		PendingClips:  42,
+		PendingBytes:  1024,
+		LastCursorID:  99,
+		ClientVersion: "release",
+	}
+	body, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"health":"healthy"`,
+		`"client_phase":"draining"`,
+		`"pending_clips":42`,
+		`"pending_bytes":1024`,
+		`"last_cursor_id":99`,
+		`"client_version":"release"`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("connection JSON missing %s: %s", want, body)
+		}
+	}
+}
+
+func TestConnectionPendingClipsEligibility(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const (
+		accountID        = int64(47)
+		foreignAccountID = int64(48)
+	)
+
+	insertRecording := func(accountID int64, delivery string) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO recordings (account_id, name, delivery)
+			VALUES ($1, 'queue-test', $2)
+			RETURNING id
+		`, accountID, delivery).Scan(&id); err != nil {
+			t.Fatalf("insert recording: %v", err)
+		}
+		return id
+	}
+	ownerNAS := insertRecording(accountID, "nas_pull")
+	ownerManaged := insertRecording(accountID, "managed")
+	foreignNAS := insertRecording(foreignAccountID, "nas_pull")
+
+	insertClip := func(recordingID, size int64, createdAt time.Time, purged, released bool) int64 {
+		t.Helper()
+		var id int64
+		var purgedAt, releasedAt any
+		if purged {
+			purgedAt = createdAt
+		}
+		if released {
+			releasedAt = createdAt
+		}
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO recording_clips
+				(recording_id, size_bytes, clip_start_at, clip_end_at, created_at, purged_at, released_at)
+			VALUES ($1, $2, $3, $3, $3, $4, $5)
+			RETURNING id
+		`, recordingID, size, createdAt, purgedAt, releasedAt).Scan(&id); err != nil {
+			t.Fatalf("insert clip: %v", err)
+		}
+		return id
+	}
+	old := time.Now().UTC().Add(-10 * time.Minute)
+	belowCursor := insertClip(ownerNAS, 1, old, false, false)
+	wanted := insertClip(ownerNAS, 2, old, false, false)
+	insertClip(ownerNAS, 4, old, true, false)
+	insertClip(ownerNAS, 8, old, false, true)
+	insertClip(ownerNAS, 16, time.Now().UTC(), false, false)
+	insertClip(ownerManaged, 32, old, false, false)
+	insertClip(foreignNAS, 64, old, false, false)
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO connections (account_id, kind, last_cursor_id)
+		VALUES ($1, 'nas_pull', $2), ($1, 'nas_pull', $3), ($4, 'nas_pull', 0)
+	`, accountID, belowCursor, wanted, foreignAccountID); err != nil {
+		t.Fatalf("insert connections: %v", err)
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT conn.last_cursor_id, pending.clips, pending.bytes, pending.oldest_at
+		FROM connections conn
+		`+connectionPendingLateralSQL+`
+		WHERE conn.account_id=$1
+		ORDER BY conn.last_cursor_id
+	`, accountID)
+	if err != nil {
+		t.Fatalf("summarize pending clips: %v", err)
+	}
+	defer rows.Close()
+	type summary struct {
+		cursor, clips, bytes int64
+		oldest               *time.Time
+	}
+	var got []summary
+	for rows.Next() {
+		var item summary
+		if err := rows.Scan(&item.cursor, &item.clips, &item.bytes, &item.oldest); err != nil {
+			t.Fatalf("scan pending summary: %v", err)
+		}
+		got = append(got, item)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("pending summaries = %v, want two connections", got)
+	}
+	if got[0].cursor != belowCursor || got[0].clips != 1 || got[0].bytes != 2 || got[0].oldest == nil {
+		t.Fatalf("first pending summary = %+v, want cursor %d with one 2-byte clip", got[0], belowCursor)
+	}
+	if got[1].cursor != wanted || got[1].clips != 0 || got[1].bytes != 0 || got[1].oldest != nil {
+		t.Fatalf("second pending summary = %+v, want cursor %d with no clips", got[1], wanted)
 	}
 }
 

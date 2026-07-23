@@ -39,6 +39,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/recordingnaming -run TestLockOrganizationPlazaIDsAcceptsIntegerAccountID -count=1
+      - name: Test NAS backlog eligibility
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run TestConnectionPendingClipsEligibility -count=1
       - name: Test
         run: go test ./...
       - name: Vet
