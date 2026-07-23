@@ -123,6 +123,7 @@ type recordingBatchTimezone struct {
 type recordingBatchSpec struct {
 	StreamIDs                    []int64                  `json:"stream_ids"`
 	StreamTimezones              []recordingBatchTimezone `json:"stream_timezones"`
+	NamingProfile                recordingnaming.Profile  `json:"naming_profile"`
 	Mode                         recordingScheduleMode    `json:"mode"`
 	CronExpr                     string                   `json:"cron_expr"`
 	ClipDurationSec              int                      `json:"clip_duration_sec"`
@@ -166,6 +167,9 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 	}
 	if spec.Mode != recordingScheduleSampled && spec.Mode != recordingScheduleContinuous {
 		return spec, fmt.Errorf("mode is required")
+	}
+	if spec.NamingProfile != recordingnaming.ProfileStoaramaV1 && spec.NamingProfile != recordingnaming.ProfilePlazaHourlyV1 {
+		return spec, fmt.Errorf("naming_profile is required")
 	}
 	if spec.Delivery != recordingDeliveryManaged && spec.Delivery != recordingDeliveryNASPull {
 		return spec, fmt.Errorf("delivery is required")

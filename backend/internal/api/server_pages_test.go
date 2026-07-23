@@ -93,6 +93,33 @@ func TestRecordingsComposerAutofillsCatalogNaming(t *testing.T) {
 	}
 }
 
+func TestRecordingsComposerDefaultsToPlazaHourlyDaytimeWindow(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`id="dailyWindowStart" type="time" value="08:00"`,
+		`id="dailyWindowEnd" type="time" value="20:00"`,
+		`data-naming="plaza_hourly_v1" class="on"`,
+		`namingProfile: 'plaza_hourly_v1'`,
+		`naming_profile: state.namingProfile`,
+		`async function boot()`,
+		`setNamingProfile('plaza_hourly_v1');`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing default %q", marker)
+		}
+	}
+	if strings.Contains(page, `id="plazaHourlyNamingFields" class="hidden"`) {
+		t.Fatal("default Plaza hourly fields must not start hidden")
+	}
+	if strings.Contains(page, `setNamingProfile('stoarama_v1');`) {
+		t.Fatal("composer boot must not override the Plaza hourly default")
+	}
+}
+
 func TestRecordingAndStreamPagesShowLocalScheduleTime(t *testing.T) {
 	recordings, err := loadHTMLPage("recordings.html")
 	if err != nil {

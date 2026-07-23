@@ -7,7 +7,7 @@ import (
 )
 
 func TestDecodeRecordingBatchSpecStrict(t *testing.T) {
-	valid := `{"stream_ids":[1],"mode":"continuous","delivery":"managed","storage_destination_id":1,"active_weekdays":[1,2,3,4,5]}`
+	valid := `{"stream_ids":[1],"naming_profile":"plaza_hourly_v1","mode":"continuous","delivery":"managed","storage_destination_id":1,"active_weekdays":[1,2,3,4,5]}`
 	spec, err := decodeRecordingBatchSpec(strings.NewReader(valid))
 	if err != nil || spec.Mode != recordingScheduleContinuous {
 		t.Fatalf("decode valid spec: mode=%q err=%v", spec.Mode, err)
@@ -22,7 +22,7 @@ func TestDecodeRecordingBatchSpecStrict(t *testing.T) {
 		`{"stream_ids":[1],"mode":"sampled","unknown":true}`,
 		`{"stream_ids":[],"mode":"sampled"}`,
 		`{"stream_ids":[1,1],"mode":"sampled"}`,
-		`{"stream_ids":[1],"mode":"continuous","active_weekdays":[8]}`,
+		`{"stream_ids":[1],"naming_profile":"plaza_hourly_v1","mode":"continuous","active_weekdays":[8]}`,
 		`{"stream_ids":[1],"stream_timezones":[{"stream_id":2,"timezone":"UTC"}],"mode":"sampled"}`,
 		valid + `{}`,
 	} {
@@ -38,7 +38,7 @@ func TestDecodeRecordingBatchSpecLimit(t *testing.T) {
 		for i := range streamIDs {
 			streamIDs[i] = int64(i + 1)
 		}
-		raw, err := json.Marshal(recordingBatchSpec{StreamIDs: streamIDs, Mode: recordingScheduleSampled, Delivery: recordingDeliveryManaged, StorageDestinationID: 1})
+		raw, err := json.Marshal(recordingBatchSpec{StreamIDs: streamIDs, NamingProfile: "stoarama_v1", Mode: recordingScheduleSampled, Delivery: recordingDeliveryManaged, StorageDestinationID: 1})
 		if err != nil {
 			t.Fatal(err)
 		}

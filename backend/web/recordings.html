@@ -660,11 +660,11 @@
           <div class="grid-2">
             <div>
               <label for="dailyWindowStart">Start</label>
-              <input id="dailyWindowStart" type="time" value="09:00" />
+              <input id="dailyWindowStart" type="time" value="08:00" />
             </div>
             <div>
               <label for="dailyWindowEnd">End</label>
-              <input id="dailyWindowEnd" type="time" value="21:00" />
+              <input id="dailyWindowEnd" type="time" value="20:00" />
             </div>
           </div>
           <div style="margin-top:12px;max-width:280px;">
@@ -781,8 +781,8 @@
         <div class="field">
           <label>Naming format</label>
           <div class="seg" id="namingSeg">
-            <button type="button" data-naming="stoarama_v1" class="on">Stoarama default</button>
-            <button type="button" data-naming="plaza_hourly_v1">Plaza hourly format</button>
+            <button type="button" data-naming="stoarama_v1">Stoarama default</button>
+            <button type="button" data-naming="plaza_hourly_v1" class="on">Plaza hourly format</button>
           </div>
         </div>
         <div class="field">
@@ -790,7 +790,7 @@
           <input id="namingFolder" type="text" placeholder="recordings" />
           <div id="namingFolderHint" class="hint">Leave blank for <span class="mono">recordings</span>.</div>
         </div>
-        <div id="plazaHourlyNamingFields" class="hidden">
+        <div id="plazaHourlyNamingFields">
           <div class="hint" style="margin-bottom:10px;">Plaza hourly supports sampled clips with Custom schedule <span class="mono">0 8-19 * * *</span>, or continuous recording with any daily window and 1, 5, or 10 min clips.</div>
           <div class="grid-2">
             <div class="field"><label for="namingPlazaID">Plaza ID</label><input id="namingPlazaID" type="text" placeholder="08" /></div>
@@ -1106,7 +1106,7 @@
       // back-to-back segments for a daily window). Shared by single + batch.
       composerScheduleMode: 'continuous',
       clipSelected: 60,
-      namingProfile: 'stoarama_v1',
+      namingProfile: 'plaza_hourly_v1',
       // Frame rate choice: 'source' (native, no re-encode) | '30' | '15'.
       targetFps: 'source',
       verifiedDestId: 0, // a bucket just verified inline this session
@@ -4939,7 +4939,7 @@
     // populates state.batchSelected (from ?stream_ids=) and calls loadBatchStreams.
     function openBatchComposer() {
       state.composerMode = 'batch';
-      setNamingProfile('stoarama_v1');
+      setNamingProfile('plaza_hourly_v1');
       clearCatalogLock();
       els.composer.classList.remove('hidden');
       // Source UI: single off, batch on.
@@ -5071,6 +5071,7 @@
       const body = {
         stream_ids: ids,
         stream_timezones: streamTimezones,
+        naming_profile: state.namingProfile,
         clip_duration_sec: clip,
         start_at: win.startISO,
         end_at: win.endISO,
@@ -5120,7 +5121,7 @@
       setSchedPreset('hourly');
       setScheduleMode('continuous');
       setClip(60);
-      setNamingProfile('stoarama_v1');
+      setNamingProfile('plaza_hourly_v1');
       renderCostEstimate();
       try {
         const account = await fetchAccountWithRetry();
