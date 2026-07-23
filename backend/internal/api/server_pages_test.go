@@ -182,6 +182,27 @@ func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) 
 	}
 }
 
+func TestOrganizationNASConnectionUsesStructuredHealthCard(t *testing.T) {
+	body, err := loadHTMLPage("org-settings.html")
+	if err != nil {
+		t.Fatalf("load org settings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`<dl class="conn-stats">`,
+		`<dt>Last batch</dt>`,
+		`<dt>Downloaded</dt>`,
+		`<dt>Waiting</dt>`,
+		`<dt>Oldest waiting</dt>`,
+		`Latest download error`,
+		`Last connection interruption`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("org settings html missing NAS health marker %q", marker)
+		}
+	}
+}
+
 func TestHandleDashboardStaticServesDashboardJS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/static/dashboard.js", nil)
 	rec := httptest.NewRecorder()

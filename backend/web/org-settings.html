@@ -114,6 +114,20 @@
       border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px;
       background: color-mix(in srgb, var(--panel2) 86%, transparent);
     }
+    .conn-card { display: grid; gap: 12px; }
+    .conn-head, .conn-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .conn-meta { margin-top: -6px; }
+    .conn-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 0; }
+    .conn-stats > div { padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--panel) 55%, transparent); }
+    .conn-stats dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .conn-stats dd { margin: 3px 0 0; font-family: var(--mono); font-size: 13px; }
+    .conn-stat-detail { display: block; margin-top: 2px; color: var(--muted); font-family: var(--sans); font-size: 12px; }
+    .conn-alert { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--panel2) 70%, transparent); }
+    .conn-alert.error { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: color-mix(in srgb, var(--err) 7%, var(--panel2)); }
+    .conn-alert-title { font-size: 12px; font-weight: 600; }
+    .conn-alert.error .conn-alert-title { color: var(--err); }
+    .conn-alert-body { margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+    .conn-actions { justify-content: flex-end; padding-top: 2px; }
     .inline-form { display: flex; gap: 8px; align-items: flex-end; }
     .inline-form input { flex: 1 1 auto; }
     .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -141,6 +155,7 @@
       .bill-items { grid-template-columns: 1fr auto; }
       .bill-items .bill-detail { grid-column: 1 / -1; margin-bottom: 4px; }
       .bill-items .bill-total-label { grid-column: 1; }
+      .conn-stats { grid-template-columns: 1fr; }
     }
     @media (max-width: 600px) {
       /* Prevent iOS Safari from zooming when a field gains focus (needs >=16px). */
@@ -164,6 +179,8 @@
       .rec-row.kv-row > div { min-width: 0; }
       .rec-row.kv-row > div:last-child { flex-wrap: wrap; }
       .rec-row .mono { white-space: normal !important; word-break: break-word; }
+      .conn-head { flex-wrap: wrap; }
+      .conn-actions button { flex: 1; }
     }
   </style>
 <!--SHELL_HEAD-->
@@ -719,22 +736,32 @@
           const outageFailures = Number(c.last_outage_failure_count || 0);
           const outageRecovered = Boolean(c.last_outage_recovered_at);
           const outage = outageClass
-            ? `<div class="sub">Last connection issue: ${escapeHTML(outageClass)} · ${outageFailures} failed heartbeat${outageFailures === 1 ? '' : 's'} · ${outageRecovered ? `recovered ${escapeHTML(connectionTimestamp(c.last_outage_recovered_at))}` : 'ongoing'}</div>`
+            ? `<div class="conn-alert">
+                <div class="conn-alert-title">Last connection interruption</div>
+                <div class="conn-alert-body">${escapeHTML(outageClass)} · ${outageFailures} missed check-in${outageFailures === 1 ? '' : 's'} · ${outageRecovered ? `Recovered ${escapeHTML(connectionTimestamp(c.last_outage_recovered_at))}` : 'Ongoing'}</div>
+              </div>`
             : '';
           const latestError = error
-            ? `<div class="sub" style="color:var(--err);">Latest error (${escapeHTML(connectionTimestamp(c.client_last_error_at))}): ${escapeHTML(error)}</div>`
+            ? `<div class="conn-alert error">
+                <div class="conn-alert-title">Latest download error · ${escapeHTML(connectionTimestamp(c.client_last_error_at))}</div>
+                <div class="conn-alert-body mono">${escapeHTML(error)}</div>
+              </div>`
             : '';
-          return `<div class="rec-row kv-row">
-            <div style="min-width:0;">
+          return `<div class="rec-row conn-card">
+            <div class="conn-head">
               <div>${connStatusDot(health)}${connStatusLabel(health)} <span class="mono" style="white-space:nowrap;">${escapeHTML(label)}</span></div>
-              <div class="sub">${escapeHTML(connectionPhaseLabels[String(c.client_phase)] || 'Unknown')} · client <span class="mono">${escapeHTML(version)}</span> · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
-              <div class="sub">Last successful batch ${escapeHTML(connectionTimestamp(c.client_last_success_at))} · cursor ${cursor.toLocaleString()}</div>
-              <div class="sub">Lifetime: ${clips.toLocaleString()} clips · ${escapeHTML(connectionBytes(bytes))}</div>
-              <div class="sub">Waiting: ${pendingClips.toLocaleString()} clips · ${escapeHTML(connectionBytes(pendingBytes))}${c.oldest_pending_at ? ` · oldest ${escapeHTML(connectionTimestamp(c.oldest_pending_at))}` : ''}</div>
-              ${latestError}
-              ${outage}
+              <div class="sub">${escapeHTML(connectionPhaseLabels[String(c.client_phase)] || 'Unknown')}</div>
             </div>
-            <div style="display:flex;gap:8px;flex-shrink:0;">
+            <div class="sub conn-meta">Client <span class="mono">${escapeHTML(version)}</span> · checks every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
+            <dl class="conn-stats">
+              <div><dt>Last batch</dt><dd>${escapeHTML(connectionTimestamp(c.client_last_success_at))}<span class="conn-stat-detail">Cursor ${cursor.toLocaleString()}</span></dd></div>
+              <div><dt>Downloaded</dt><dd>${clips.toLocaleString()} clips<span class="conn-stat-detail">${escapeHTML(connectionBytes(bytes))} total</span></dd></div>
+              <div><dt>Waiting</dt><dd>${pendingClips.toLocaleString()} clips<span class="conn-stat-detail">${escapeHTML(connectionBytes(pendingBytes))}</span></dd></div>
+              <div><dt>Oldest waiting</dt><dd>${escapeHTML(c.oldest_pending_at ? connectionTimestamp(c.oldest_pending_at) : 'None')}</dd></div>
+            </dl>
+            ${latestError}
+            ${outage}
+            <div class="conn-actions">
               <button class="secondary small conn-rotate" type="button" data-id="${id}">Rotate</button>
               <button class="secondary small conn-remove" type="button" data-id="${id}">Remove</button>
             </div>
