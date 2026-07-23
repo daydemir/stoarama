@@ -93,6 +93,36 @@ class NASPullTests(unittest.TestCase):
                 self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
                 release.assert_called_once_with(cfg, 3, 7)
 
+    def test_checksum_mismatch_is_quarantined_and_redownloaded(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            final = cfg.output_dir / "recordings" / "clip.mp4"
+            final.parent.mkdir()
+            final.write_bytes(b"wrong")
+            clip = {
+                "clip_id": 7,
+                "recording_id": 3,
+                "size_bytes": 3,
+                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "relative_path": "recordings/clip.mp4",
+                "download_path": "/account/recordings/3/clips/7/download",
+            }
+            with mock.patch.object(pull, "request_json", return_value={"url": "https://example.test/clip"}), mock.patch.object(
+                pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(b"abc")
+            ), mock.patch.object(pull, "release_clip"):
+                self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
+            self.assertEqual(final.read_bytes(), b"abc")
+            quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
+            self.assertEqual([path.read_bytes() for path in quarantines], [b"wrong"])
+            final.write_bytes(b"wrong again")
+            with mock.patch.object(pull, "request_json", return_value={"url": "https://example.test/clip"}), mock.patch.object(
+                pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(b"abc")
+            ), mock.patch.object(pull, "release_clip"):
+                self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
+            self.assertEqual(final.read_bytes(), b"abc")
+            quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
+            self.assertEqual(sorted(path.read_bytes() for path in quarantines), [b"wrong", b"wrong again"])
+
     def test_failed_clip_does_not_block_later_downloads_or_advance_past_it(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -111,8 +141,21 @@ class NASPullTests(unittest.TestCase):
             self.assertEqual(runtime.cursor_id, 1)
             self.assertEqual(runtime.clips_pulled, 1)
             self.assertEqual(runtime.bytes_pulled, 10)
+            self.assertEqual(runtime.last_error, "1 of 3 clips failed; first clip 2: poison")
             persisted = json.loads(cfg.progress_file.read_text())
             self.assertEqual(persisted["after_id"], 1)
+
+    def test_release_failure_is_reported_to_heartbeat(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            clip = {"clip_id": 1, "recording_id": 3}
+            with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
+                pull, "process_clip", return_value=(1, 10)
+            ), mock.patch.object(pull, "release_clip", side_effect=RuntimeError("release denied")):
+                self.assertFalse(pull.drain_page(cfg, runtime))
+            self.assertEqual(runtime.cursor_id, 0)
+            self.assertEqual(runtime.last_error, "1 of 1 clips failed; first clip 1: release denied")
 
     def test_manifest_validation_and_transport_classification(self):
         self.assertEqual(
