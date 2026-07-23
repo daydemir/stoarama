@@ -80,7 +80,7 @@ func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 		}
 		var streamID int64
 		if err := pool.QueryRow(context.Background(), `
-			INSERT INTO streams (provider, external_id, name, slug, stream_url, capture_type, source_family, execution_class, local_timezone)
+			INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, local_timezone)
 			VALUES ('test', $1, $1, $1, 'https://www.youtube.com/watch?v=' || $1, 'youtube_watch', 'watch_page', 'youtube_direct', $2)
 			RETURNING id
 		`, status, zone).Scan(&streamID); err != nil {
@@ -189,7 +189,7 @@ func TestBatchSchedulePersistsPlazaHourlyNamingAndDaytimeWindow(t *testing.T) {
 	var streamID int64
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO streams (
-			provider, external_id, name, slug, stream_url, capture_type, source_family,
+			provider, external_id, name, slug, source_url, capture_type, source_family,
 			execution_class, local_timezone, location_country, location_city, metadata_jsonb
 		)
 		VALUES (
