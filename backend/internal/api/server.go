@@ -448,6 +448,7 @@ func (s *Server) router() http.Handler {
 			rec.Post("/recording/droplets/heartbeat", s.handleRecordingDropletHeartbeat)
 			rec.Post("/recording/jobs/{id}/heartbeat", s.handleRecordingJobHeartbeat)
 			rec.Post("/recording/jobs/{id}/complete", s.handleRecordingJobComplete)
+			rec.Post("/recording/jobs/{id}/surrender", s.handleRecordingJobSurrender)
 			rec.Post("/recording/jobs/{id}/fail", s.handleRecordingJobFail)
 		})
 

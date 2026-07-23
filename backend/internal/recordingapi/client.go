@@ -7,6 +7,7 @@ package recordingapi
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -87,6 +88,10 @@ type RecordingJob struct {
 	Kind        string     `json:"kind"`
 	WindowEndAt *time.Time `json:"window_end_at"`
 }
+
+type SurrenderReason string
+
+const SurrenderNoProgress SurrenderReason = "no_progress"
 
 // ClipUploadIntent is a presigned PUT against the user's bucket.
 type ClipUploadIntent struct {
@@ -190,19 +195,28 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 
 // HeartbeatRecordingJob extends the lease. It returns cancel=true when the
 // server signals (409) that the job was canceled or is no longer owned.
-func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64) (cancel bool, err error) {
+func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64) (cancel bool, leaseExpiresAt time.Time, err error) {
 	path := fmt.Sprintf("/api/v1/recording/jobs/%d/heartbeat", jobID)
 	status, body, err := c.postRaw(ctx, path, map[string]any{})
 	if err != nil {
-		return false, err
+		return false, time.Time{}, err
 	}
 	if status == http.StatusConflict {
-		return true, nil
+		return true, time.Time{}, nil
 	}
 	if status < 200 || status >= 300 {
-		return false, fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
+		return false, time.Time{}, fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
 	}
-	return false, nil
+	var out struct {
+		LeaseExpiresAt time.Time `json:"lease_expires_at"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return false, time.Time{}, fmt.Errorf("decode heartbeat: %w", err)
+	}
+	if out.LeaseExpiresAt.IsZero() {
+		return false, time.Time{}, fmt.Errorf("heartbeat response missing lease_expires_at")
+	}
+	return false, out.LeaseExpiresAt, nil
 }
 
 // CompleteRecordingJob marks the job done (no reschedule).
@@ -213,6 +227,10 @@ func (c *Client) CompleteRecordingJob(ctx context.Context, jobID int64) error {
 // FailRecordingJob requeues or fails the job and records the error.
 func (c *Client) FailRecordingJob(ctx context.Context, jobID int64, errText string) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/fail", jobID), map[string]any{"error_text": strings.TrimSpace(errText)}, nil)
+}
+
+func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, reason SurrenderReason) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{"reason": reason}, nil)
 }
 
 // TouchDroplet records droplet liveness independent of any held job by touching

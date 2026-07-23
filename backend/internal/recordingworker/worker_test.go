@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -34,6 +36,86 @@ func TestContinuousShouldStop(t *testing.T) {
 				t.Fatalf("continuousShouldStop(%v, %v) = %v, want %v", tc.canceled, tc.windowClosed, got, tc.wantStop)
 			}
 		})
+	}
+}
+
+func TestContinuousNoProgressExpired(t *testing.T) {
+	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	timeout := 5 * time.Minute
+	if continuousNoProgressExpired(started, started.Add(timeout-time.Nanosecond), timeout) {
+		t.Fatal("no-progress window expired early")
+	}
+	if !continuousNoProgressExpired(started, started.Add(timeout), timeout) {
+		t.Fatal("no-progress window did not expire at boundary")
+	}
+	if continuousNoProgressExpired(started, started.Add(time.Hour), 0) {
+		t.Fatal("zero timeout must keep cloud retry behavior")
+	}
+	if got := continuousReconnectDelay(started, started.Add(4*time.Minute), timeout, 5*time.Minute); got != time.Minute {
+		t.Fatalf("bounded reconnect delay=%s want 1m", got)
+	}
+	if got := continuousReconnectDelay(started, started.Add(time.Hour), 0, 5*time.Minute); got != 5*time.Minute {
+		t.Fatalf("cloud reconnect delay=%s want 5m", got)
+	}
+}
+
+func TestHeartbeatStopsAtConfirmedLeaseBoundary(t *testing.T) {
+	t.Run("errors cannot extend lease", func(t *testing.T) {
+		worker, closeServer := heartbeatTestWorker(t, http.StatusInternalServerError, time.Time{})
+		defer closeServer()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		canceled := worker.startHeartbeat(ctx, cancel, 1, time.Now().Add(80*time.Millisecond))
+		waitCanceled(t, canceled)
+	})
+
+	t.Run("renewal resets boundary", func(t *testing.T) {
+		worker, closeServer := heartbeatTestWorker(t, http.StatusOK, time.Now().Add(time.Second))
+		defer closeServer()
+		ctx, cancel := context.WithCancel(context.Background())
+		canceled := worker.startHeartbeat(ctx, cancel, 2, time.Now().Add(50*time.Millisecond))
+		time.Sleep(100 * time.Millisecond)
+		if canceled() {
+			t.Fatal("worker canceled despite confirmed renewal")
+		}
+		cancel()
+	})
+
+	t.Run("conflict cancels immediately", func(t *testing.T) {
+		worker, closeServer := heartbeatTestWorker(t, http.StatusConflict, time.Time{})
+		defer closeServer()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		canceled := worker.startHeartbeat(ctx, cancel, 3, time.Now().Add(time.Second))
+		waitCanceled(t, canceled)
+	})
+}
+
+func heartbeatTestWorker(t *testing.T, status int, leaseExpiresAt time.Time) (*Worker, func()) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			_, _ = fmt.Fprintf(w, `{"cancel":false,"lease_expires_at":%q}`, leaseExpiresAt.Format(time.RFC3339Nano))
+		}
+	}))
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "test"})
+	if err != nil {
+		server.Close()
+		t.Fatalf("new client: %v", err)
+	}
+	return &Worker{cfg: Config{Client: client}, heartbeatInt: 10 * time.Millisecond}, server.Close
+}
+
+func waitCanceled(t *testing.T, canceled func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !canceled() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !canceled() {
+		t.Fatal("worker did not cancel")
 	}
 }
 
