@@ -46,6 +46,7 @@ type streamTimezoneInput struct {
 type batchScheduleRequest struct {
 	StreamIDs                    []int64               `json:"stream_ids"`
 	StreamTimezones              []streamTimezoneInput `json:"stream_timezones"`
+	NamingProfile                string                `json:"naming_profile"`
 	Mode                         string                `json:"mode"`
 	CronExpr                     string                `json:"cron_expr"`
 	ClipDurationSec              int                   `json:"clip_duration_sec"`
@@ -64,6 +65,7 @@ type batchStream struct {
 	id, recordingID, recordingCount                 int64
 	name, sourceURL, provider, timezone, captureVia string
 	timezoneMissing                                 bool
+	namingDefaults                                  catalogNamingDefaults
 }
 
 func batchCaptureVia(sourceURL, provider, existing string) string {
@@ -106,6 +108,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		return
 	}
 	mode, err := parseBatchScheduleMode(req.Mode)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	namingProfile, err := recordingnaming.ParseProfile(req.NamingProfile)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -171,6 +178,10 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			return
 		}
 	}
+	if err := recordingnaming.ValidateSchedule(namingProfile, string(mode), cronExpr, clipDuration, dailyStartRaw, dailyEndRaw); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	timezoneByID := make(map[int64]string, len(req.StreamTimezones))
 	selected := make(map[int64]struct{}, len(ids))
@@ -204,6 +215,8 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		SELECT st.id, st.name, st.source_url, st.provider,
 		       %s,
 		       %s,
+		       COALESCE(NULLIF(st.metadata_jsonb->>'continent',''), NULLIF(st.metadata_jsonb#>>'{csv_values,continent}',''), ''),
+		       COALESCE(st.location_country,''), COALESCE(st.location_city,''), st.name,
 		       COALESCE((SELECT rec.id FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),0),
 		       COALESCE((SELECT rec.capture_via FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled' ORDER BY rec.id DESC LIMIT 1),''),
 		       (SELECT count(*) FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled')
@@ -217,7 +230,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	streams := make([]batchStream, 0, len(ids))
 	for rows.Next() {
 		var st batchStream
-		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.provider, &st.timezone, &st.timezoneMissing, &st.recordingID, &st.captureVia, &st.recordingCount); err != nil {
+		if err := rows.Scan(&st.id, &st.name, &st.sourceURL, &st.provider, &st.timezone, &st.timezoneMissing, &st.namingDefaults.Continent, &st.namingDefaults.Country, &st.namingDefaults.City, &st.namingDefaults.PlazaName, &st.recordingID, &st.captureVia, &st.recordingCount); err != nil {
 			rows.Close()
 			util.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -352,6 +365,24 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	for _, st := range streams {
 		captureVia := batchCaptureVia(st.sourceURL, st.provider, st.captureVia)
+		namingRequest := &recordingNamingRequest{Profile: namingProfile.String(), Metadata: recordingnaming.Metadata{
+			Continent: st.namingDefaults.Continent,
+			Country:   st.namingDefaults.Country,
+			City:      st.namingDefaults.City,
+			PlazaName: st.namingDefaults.PlazaName,
+		}}
+		if namingProfile == recordingnaming.ProfilePlazaHourlyV1 {
+			namingRequest.Metadata.PlazaID, err = recordingnaming.EnsureStreamPlazaID(r.Context(), tx, principal.AccountID, st.id)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("allocate plaza id for stream %d: %v", st.id, err))
+				return
+			}
+		}
+		resolvedProfile, folderName, namingMetadata, namingErr := resolveRecordingNaming(namingRequest, 0)
+		if namingErr != nil {
+			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream %d: %v", st.id, namingErr))
+			return
+		}
 		var cronArg, dailyStartArg, dailyEndArg, nextArg any
 		if mode == batchSampled {
 			cronArg = cronExpr
@@ -377,7 +408,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		action := "updated"
 		recordingID := st.recordingID
 		if recordingID != 0 {
-			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, capture_via=$17, last_enqueued_fire_at=NULL, status='active', paused_at=NULL, completed_captured_clip_count=NULL, completed_expected_clip_count=NULL, consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, principal.AccountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery, captureVia)
+			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, capture_via=$17, naming_profile=$18, folder_name=$19, naming_metadata_jsonb=$20, last_enqueued_fire_at=NULL, status='active', paused_at=NULL, completed_captured_clip_count=NULL, completed_expected_clip_count=NULL, consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, principal.AccountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery, captureVia, resolvedProfile.String(), folderName, namingMetadata)
 			err = updateErr
 			if err == nil && updatedRecording.RowsAffected() != 1 {
 				err = fmt.Errorf("recording was canceled while scheduling")
@@ -396,7 +427,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 				sourceKind, err = classifyRecordingSource(strings.TrimSpace(st.sourceURL))
 			}
 			if err == nil {
-				recordingID, _, _, _, err = s.insertRecordingTx(r.Context(), tx, recordingInsertParams{accountID: principal.AccountID, captureDestID: captureDestID, deliveryDestArg: deliveryDestArg, name: fmt.Sprintf("%s [%d]", st.name, st.id), streamURL: st.sourceURL, streamIDArg: st.id, sourceKind: sourceKind, mode: string(mode), cronExprArg: cronArg, cronTimezone: st.timezone, clipDuration: clipDuration, dailyWindowStartArg: dailyStartArg, dailyWindowEndArg: dailyEndArg, activeWeekdays: weekdays, targetFPSArg: req.TargetFPS, nextFireArg: nextArg, startAt: startAt, endAtArg: endAt, delivery: delivery, captureVia: captureVia})
+				recordingID, _, _, _, err = s.insertRecordingTx(r.Context(), tx, recordingInsertParams{accountID: principal.AccountID, captureDestID: captureDestID, deliveryDestArg: deliveryDestArg, name: fmt.Sprintf("%s [%d]", st.name, st.id), streamURL: st.sourceURL, streamIDArg: st.id, sourceKind: sourceKind, mode: string(mode), cronExprArg: cronArg, cronTimezone: st.timezone, clipDuration: clipDuration, dailyWindowStartArg: dailyStartArg, dailyWindowEndArg: dailyEndArg, activeWeekdays: weekdays, targetFPSArg: req.TargetFPS, nextFireArg: nextArg, startAt: startAt, endAtArg: endAt, delivery: delivery, captureVia: captureVia, namingProfile: resolvedProfile, folderName: folderName, namingMetadata: namingMetadata})
 			}
 			action = "created"
 			created++
