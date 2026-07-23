@@ -349,6 +349,12 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 	}
 
 	for _, stmt := range []string{
+		`CREATE TABLE connections (
+			id BIGSERIAL PRIMARY KEY,
+			account_id BIGINT NOT NULL,
+			kind TEXT NOT NULL,
+			last_cursor_id BIGINT NOT NULL DEFAULT 0
+		)`,
 		`CREATE TABLE recordings (
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,

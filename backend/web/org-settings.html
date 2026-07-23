@@ -671,6 +671,31 @@
       return `last seen ${stamp}`;
     }
 
+    const connectionPhaseLabels = Object.freeze({
+      starting: 'Starting',
+      idle: 'Caught up',
+      draining: 'Downloading',
+      updating: 'Updating',
+      blocked: 'Blocked',
+      degraded: 'Degraded',
+    });
+
+    function connectionBytes(value) {
+      const bytes = Number(value);
+      if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+      const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+      const amount = bytes / (1024 ** exponent);
+      return `${amount.toFixed(amount >= 100 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+    }
+
+    function connectionTimestamp(value) {
+      if (!value) return 'never';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return 'unknown';
+      return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    }
+
     async function loadConnections() {
       connectionsPanel.classList.remove('hidden');
       setStatus(connectionsStatus, 'Loading connections...', '');
@@ -683,11 +708,31 @@
           const label = String(c.label || 'NAS');
           const health = String(c.health || 'never');
           const clips = Number(c.clips_pulled || 0);
+          const bytes = Number(c.bytes_pulled || 0);
+          const cursor = Number(c.last_cursor_id || 0);
           const interval = Number(c.poll_interval_sec || 60);
+          const pendingClips = Number(c.pending_clips || 0);
+          const pendingBytes = Number(c.pending_bytes || 0);
+          const version = String(c.client_version || 'unknown');
+          const error = String(c.client_last_error || '');
+          const outageClass = String(c.last_outage_class || '');
+          const outageFailures = Number(c.last_outage_failure_count || 0);
+          const outageRecovered = Boolean(c.last_outage_recovered_at);
+          const outage = outageClass
+            ? `<div class="sub">Last connection issue: ${escapeHTML(outageClass)} · ${outageFailures} failed heartbeat${outageFailures === 1 ? '' : 's'} · ${outageRecovered ? `recovered ${escapeHTML(connectionTimestamp(c.last_outage_recovered_at))}` : 'ongoing'}</div>`
+            : '';
+          const latestError = error
+            ? `<div class="sub" style="color:var(--err);">Latest error (${escapeHTML(connectionTimestamp(c.client_last_error_at))}): ${escapeHTML(error)}</div>`
+            : '';
           return `<div class="rec-row kv-row">
             <div style="min-width:0;">
               <div>${connStatusDot(health)}${connStatusLabel(health)} <span class="mono" style="white-space:nowrap;">${escapeHTML(label)}</span></div>
-              <div class="sub">${clips} clip${clips === 1 ? '' : 's'} pulled · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
+              <div class="sub">${escapeHTML(connectionPhaseLabels[String(c.client_phase)] || 'Unknown')} · client <span class="mono">${escapeHTML(version)}</span> · every ${interval}s · ${escapeHTML(connLastSeenText(c))}</div>
+              <div class="sub">Last successful batch ${escapeHTML(connectionTimestamp(c.client_last_success_at))} · cursor ${cursor.toLocaleString()}</div>
+              <div class="sub">Lifetime: ${clips.toLocaleString()} clips · ${escapeHTML(connectionBytes(bytes))}</div>
+              <div class="sub">Waiting: ${pendingClips.toLocaleString()} clips · ${escapeHTML(connectionBytes(pendingBytes))}${c.oldest_pending_at ? ` · oldest ${escapeHTML(connectionTimestamp(c.oldest_pending_at))}` : ''}</div>
+              ${latestError}
+              ${outage}
             </div>
             <div style="display:flex;gap:8px;flex-shrink:0;">
               <button class="secondary small conn-rotate" type="button" data-id="${id}">Rotate</button>

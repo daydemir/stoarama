@@ -91,6 +91,53 @@ const nasPythonImage = "python:3.13-slim-bookworm@sha256:9d7f287598e1a5a978c015e
 const nasBootstrapURL = "https://stoarama.com/nas/download/stoarama-bootstrap-v1.py"
 const nasBootstrapSHA256 = "1b160e541e22c563712343163d2bd072ccf39b1d39da793d5e4b5f74dd839d73"
 
+type connectionHealth string
+
+const (
+	connectionHealthNever   connectionHealth = "never"
+	connectionHealthHealthy connectionHealth = "healthy"
+	connectionHealthStale   connectionHealth = "stale"
+)
+
+type connectionListItem struct {
+	ID                     int64            `json:"id"`
+	Label                  string           `json:"label"`
+	LastSeenAt             *time.Time       `json:"last_seen_at"`
+	ClipsPulled            int64            `json:"clips_pulled"`
+	BytesPulled            int64            `json:"bytes_pulled"`
+	LastCursorID           int64            `json:"last_cursor_id"`
+	PollIntervalSec        int              `json:"poll_interval_sec"`
+	Health                 connectionHealth `json:"health"`
+	CreatedAt              time.Time        `json:"created_at"`
+	ClientVersion          string           `json:"client_version"`
+	ClientStartedAt        *time.Time       `json:"client_started_at"`
+	ClientBootID           string           `json:"client_boot_id"`
+	ClientPhase            string           `json:"client_phase"`
+	ClientPreviousExit     string           `json:"client_previous_exit"`
+	ClientLastSuccessAt    *time.Time       `json:"client_last_success_at"`
+	ClientLastError        string           `json:"client_last_error"`
+	ClientLastErrorAt      *time.Time       `json:"client_last_error_at"`
+	LastOutageClass        string           `json:"last_outage_class"`
+	LastOutageStartedAt    *time.Time       `json:"last_outage_started_at"`
+	LastOutageRecoveredAt  *time.Time       `json:"last_outage_recovered_at"`
+	LastOutageFailureCount int              `json:"last_outage_failure_count"`
+	PendingClips           int64            `json:"pending_clips"`
+	PendingBytes           int64            `json:"pending_bytes"`
+	OldestPendingAt        *time.Time       `json:"oldest_pending_at"`
+}
+
+const connectionPendingLateralSQL = `
+	LEFT JOIN LATERAL (
+		SELECT COUNT(*) AS clips, COALESCE(SUM(c.size_bytes), 0) AS bytes, MIN(c.created_at) AS oldest_at
+		FROM recording_clips c
+		JOIN recordings rec ON rec.id = c.recording_id
+		WHERE conn.kind='nas_pull' AND rec.account_id=conn.account_id AND rec.delivery='nas_pull'
+		  AND c.purged_at IS NULL AND c.released_at IS NULL
+		  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
+		  AND c.id > conn.last_cursor_id
+	) pending ON true
+`
+
 // nasLaunchCommand verifies and runs the immutable recovery bootstrap. The
 // durable client owns all subsequent checksum-verified updates.
 const nasLaunchCommand = `import hashlib,os,sys,urllib.request
@@ -229,15 +276,17 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, label, last_seen_at, clips_pulled, bytes_pulled, last_cursor_id,
+		SELECT conn.id, conn.label, conn.last_seen_at, conn.clips_pulled, conn.bytes_pulled, conn.last_cursor_id,
 		       poll_interval_sec, client_version, client_started_at, client_boot_id,
 		       client_phase, client_previous_exit, client_last_success_at,
 		       client_last_error, client_last_error_at, last_outage_class,
 		       last_outage_started_at, last_outage_recovered_at,
-		       last_outage_failure_count, created_at
-		FROM connections
-		WHERE account_id=$1
-		ORDER BY created_at DESC, id DESC
+		       last_outage_failure_count, conn.created_at,
+		       pending.clips, pending.bytes, pending.oldest_at
+		FROM connections conn
+		`+connectionPendingLateralSQL+`
+		WHERE conn.account_id=$1
+		ORDER BY conn.created_at DESC, conn.id DESC
 	`, principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list connections: %v", err))
@@ -245,7 +294,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 	}
 	defer rows.Close()
 	now := time.Now().UTC()
-	items := make([]map[string]any, 0, 8)
+	items := make([]connectionListItem, 0, 8)
 	for rows.Next() {
 		var (
 			id              int64
@@ -268,47 +317,55 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			outageRecovered *time.Time
 			outageFailures  int
 			createdAt       time.Time
+			pendingClips    int64
+			pendingBytes    int64
+			oldestPendingAt *time.Time
 		)
 		if err := rows.Scan(&id, &label, &lastSeenAt, &clipsPulled, &bytesPulled, &lastCursorID,
 			&pollIntervalSec, &clientVersion, &clientStartedAt, &clientBootID, &clientPhase,
 			&previousExit, &lastSuccessAt, &lastError, &lastErrorAt, &outageClass,
-			&outageStartedAt, &outageRecovered, &outageFailures, &createdAt); err != nil {
+			&outageStartedAt, &outageRecovered, &outageFailures, &createdAt,
+			&pendingClips, &pendingBytes, &oldestPendingAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan connection: %v", err))
 			return
 		}
-		health := "never"
-		var lastSeen any
+		health := connectionHealthNever
+		lastSeenUTC := lastSeenAt
 		if lastSeenAt != nil {
-			lastSeen = lastSeenAt.UTC()
+			value := lastSeenAt.UTC()
+			lastSeenUTC = &value
 			staleAfter := time.Duration(pollIntervalSec) * 3 * time.Second
 			if now.Sub(*lastSeenAt) <= staleAfter {
-				health = "healthy"
+				health = connectionHealthHealthy
 			} else {
-				health = "stale"
+				health = connectionHealthStale
 			}
 		}
-		items = append(items, map[string]any{
-			"id":                        id,
-			"label":                     label,
-			"last_seen_at":              lastSeen,
-			"clips_pulled":              clipsPulled,
-			"bytes_pulled":              bytesPulled,
-			"last_cursor_id":            lastCursorID,
-			"poll_interval_sec":         pollIntervalSec,
-			"health":                    health,
-			"created_at":                createdAt.UTC(),
-			"client_version":            clientVersion,
-			"client_started_at":         clientStartedAt,
-			"client_boot_id":            clientBootID,
-			"client_phase":              clientPhase,
-			"client_previous_exit":      previousExit,
-			"client_last_success_at":    lastSuccessAt,
-			"client_last_error":         lastError,
-			"client_last_error_at":      lastErrorAt,
-			"last_outage_class":         outageClass,
-			"last_outage_started_at":    outageStartedAt,
-			"last_outage_recovered_at":  outageRecovered,
-			"last_outage_failure_count": outageFailures,
+		items = append(items, connectionListItem{
+			ID:                     id,
+			Label:                  label,
+			LastSeenAt:             lastSeenUTC,
+			ClipsPulled:            clipsPulled,
+			BytesPulled:            bytesPulled,
+			LastCursorID:           lastCursorID,
+			PollIntervalSec:        pollIntervalSec,
+			Health:                 health,
+			CreatedAt:              createdAt.UTC(),
+			ClientVersion:          clientVersion,
+			ClientStartedAt:        clientStartedAt,
+			ClientBootID:           clientBootID,
+			ClientPhase:            clientPhase,
+			ClientPreviousExit:     previousExit,
+			ClientLastSuccessAt:    lastSuccessAt,
+			ClientLastError:        lastError,
+			ClientLastErrorAt:      lastErrorAt,
+			LastOutageClass:        outageClass,
+			LastOutageStartedAt:    outageStartedAt,
+			LastOutageRecoveredAt:  outageRecovered,
+			LastOutageFailureCount: outageFailures,
+			PendingClips:           pendingClips,
+			PendingBytes:           pendingBytes,
+			OldestPendingAt:        oldestPendingAt,
 		})
 	}
 	if err := rows.Err(); err != nil {
