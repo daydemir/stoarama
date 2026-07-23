@@ -214,7 +214,7 @@
     .capture-health.not_expected, .capture-health.unavailable { color: var(--muted); }
     .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
     .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
-    .health-strip-cell[title], .health-strip-bar[title] { cursor: help; }
+    .health-strip-cell[data-health-tooltip] { cursor: help; }
     .health-strip-bar { width: 100%; min-height: 2px; border-radius: 2px; background: var(--muted); }
     .health-strip-bar.healthy { background: var(--ok); }
     .health-strip-bar.warning { background: var(--warn); }
@@ -224,6 +224,19 @@
     .health-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 11px; }
     .health-legend span { display: inline-flex; align-items: center; gap: 5px; }
     .health-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+    .health-tooltip {
+      position: fixed;
+      z-index: 1000;
+      max-width: min(360px, calc(100vw - 16px));
+      padding: 7px 9px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel2);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+      color: var(--text);
+      font: 11px/1.4 var(--mono);
+      pointer-events: none;
+    }
     .card-err { margin-top: 10px; color: var(--err); font-size: 12px; line-height: 1.45; }
     .group-title { margin: 18px 0 10px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
     .clip-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -3182,6 +3195,7 @@
     }
 
     function renderCards() {
+      hideHealthTooltip();
       renderFleetSummary();
       const all = state.recordings;
       const empty = all.length === 0;
@@ -3537,6 +3551,7 @@
       const bins = Array.isArray(rawBins) ? rawBins : [];
       if (!bins.length) return '';
       const cells = [];
+      let latestTitle = '';
       if (!detailed) {
         for (let i = bins.length; i < 12; i++) cells.push('<span class="health-strip-cell"></span>');
       }
@@ -3548,10 +3563,54 @@
         const start = instantInTimezone(bin.start, timezone) || '';
         const end = instantInTimezone(bin.end, timezone) || '';
         const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;
-        cells.push(`<span class="health-strip-cell" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" title="${escapeHTML(title)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
+        latestTitle = title;
+        cells.push(`<span class="health-strip-cell" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
       }
-      return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time">${cells.join('')}</div>`;
+      return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time" data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0">${cells.join('')}</div>`;
     }
+
+    let healthTooltip = null;
+
+    function hideHealthTooltip() {
+      if (healthTooltip) healthTooltip.classList.add('hidden');
+    }
+
+    function showHealthTooltip(target) {
+      const text = String(target.dataset.healthTooltip || '');
+      if (!text) return;
+      if (!healthTooltip) {
+        healthTooltip = document.createElement('div');
+        healthTooltip.className = 'health-tooltip hidden';
+        healthTooltip.setAttribute('role', 'tooltip');
+        document.body.appendChild(healthTooltip);
+      }
+      healthTooltip.textContent = text;
+      healthTooltip.classList.remove('hidden');
+      const targetRect = target.getBoundingClientRect();
+      const tooltipRect = healthTooltip.getBoundingClientRect();
+      const left = Math.max(8, Math.min(window.innerWidth - tooltipRect.width - 8, targetRect.left + targetRect.width / 2 - tooltipRect.width / 2));
+      const above = targetRect.top - tooltipRect.height - 8;
+      healthTooltip.style.left = `${left}px`;
+      healthTooltip.style.top = `${above >= 8 ? above : targetRect.bottom + 8}px`;
+    }
+
+    document.addEventListener('pointerover', (event) => {
+      const target = event.target.closest('[data-health-tooltip]');
+      if (target) showHealthTooltip(target);
+    });
+    document.addEventListener('pointerout', (event) => {
+      const target = event.target.closest('[data-health-tooltip]');
+      if (target && !target.contains(event.relatedTarget)) hideHealthTooltip();
+    });
+    document.addEventListener('focusin', (event) => {
+      const target = event.target.closest('[data-health-tooltip]');
+      if (target) showHealthTooltip(target);
+    });
+    document.addEventListener('focusout', (event) => {
+      if (event.target.closest('[data-health-tooltip]')) hideHealthTooltip();
+    });
+    window.addEventListener('scroll', hideHealthTooltip, true);
+    window.addEventListener('resize', hideHealthTooltip);
 
     function captureHealthCardHTML(rec) {
       const bins = Array.isArray(rec.capture_health_bins) ? rec.capture_health_bins : [];
@@ -3648,6 +3707,7 @@
     // Render the whole detail view: header, schedule card, storage card, recording
     // actions, and an empty #clipListBody the clip pages render into.
     function renderClipPage() {
+      hideHealthTooltip();
       const root = els.clipPage;
       const rec = clipPageState.rec;
       const st = statusLine(rec);
