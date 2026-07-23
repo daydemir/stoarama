@@ -128,7 +128,7 @@ func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) 
 	}
 	page := string(body)
 	for _, marker := range []string{
-		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured",
+		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;",
 		`title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"`,
 	} {
 		if !strings.Contains(page, marker) {
