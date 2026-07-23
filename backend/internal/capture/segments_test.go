@@ -240,6 +240,86 @@ func TestParseFrameRate(t *testing.T) {
 	}
 }
 
+func TestContinuousWatchdogStartupAndProgressTimeouts(t *testing.T) {
+	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	lastProgress := started.Add(62 * time.Second)
+	if err := continuousWatchdogError(started.Add(29*time.Second), started, started, false, 30*time.Second, 75*time.Second); err != nil {
+		t.Fatalf("watchdog expired before startup timeout: %v", err)
+	}
+	if err := continuousWatchdogError(started.Add(30*time.Second), started, started, false, 30*time.Second, 75*time.Second); err == nil || !strings.Contains(err.Error(), "startup stalled") {
+		t.Fatalf("startup timeout error=%v", err)
+	}
+	if err := continuousWatchdogError(started.Add(136*time.Second), started, lastProgress, true, 30*time.Second, 75*time.Second); err != nil {
+		t.Fatalf("watchdog expired before progress timeout: %v", err)
+	}
+	if err := continuousWatchdogError(started.Add(137*time.Second), started, lastProgress, true, 30*time.Second, 75*time.Second); err == nil || !strings.Contains(err.Error(), "progress stalled") {
+		t.Fatalf("progress timeout error=%v", err)
+	}
+}
+
+func TestContinuousOutputAdvancedIgnoresDeletionAndDetectsEqualTotalReplacement(t *testing.T) {
+	if continuousOutputAdvanced(map[string]int64{"a.mp4": 100}, map[string]int64{}) {
+		t.Fatalf("file deletion must not count as capture progress")
+	}
+	if !continuousOutputAdvanced(
+		map[string]int64{"a.mp4": 100},
+		map[string]int64{"b.mp4": 100},
+	) {
+		t.Fatalf("new segment must count as progress even when aggregate bytes are unchanged")
+	}
+	if continuousOutputAdvanced(
+		map[string]int64{"a.mp4": 100},
+		map[string]int64{"a.mp4": 100},
+	) {
+		t.Fatalf("unchanged segment must not count as progress")
+	}
+}
+
+func TestCaptureContinuousStopsAliveStalledChild(t *testing.T) {
+	tests := []struct {
+		name           string
+		script         string
+		startupTimeout time.Duration
+		want           string
+	}{
+		{
+			name:           "no startup output",
+			script:         "#!/bin/sh\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.1; done\n",
+			startupTimeout: 50 * time.Millisecond,
+			want:           "startup stalled",
+		},
+		{
+			name:           "output stops growing",
+			script:         "#!/bin/sh\nfor last do :; done\nout=${last%/*}/seg-20260723-120000.mp4\nprintf x > \"$out\"\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.1; done\n",
+			startupTimeout: time.Second,
+			want:           "progress stalled",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			temp := t.TempDir()
+			ffmpeg := filepath.Join(temp, "ffmpeg")
+			if err := os.WriteFile(ffmpeg, []byte(test.script), 0o755); err != nil {
+				t.Fatalf("write fake ffmpeg: %v", err)
+			}
+			t.Setenv("FFMPEG_BIN", ffmpeg)
+			output := filepath.Join(temp, "output")
+			if err := os.Mkdir(output, 0o755); err != nil {
+				t.Fatalf("create output dir: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+			defer cancel()
+			err := captureContinuousWithHeaders(
+				ctx, "https://example.com/live.m3u8", time.Second, "", nil, output,
+				func(Segment) error { return nil }, "", test.startupTimeout, 50*time.Millisecond,
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("capture error=%v want %s", err, test.want)
+			}
+		})
+	}
+}
+
 // TestBuildFFmpegContinuousArgsSourceCopy asserts the continuous (segment-muxer)
 // args for the Source/native path: stream-copy (-c copy), the segment muxer tail
 // with the requested segment_time, strftime naming, and NO -t single-clip flag.
