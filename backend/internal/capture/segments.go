@@ -354,6 +354,9 @@ func continuousOutputSizes(outDir string) (map[string]int64, error) {
 		}
 		info, err := entry.Info()
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			return nil, fmt.Errorf("stat continuous output %s: %w", entry.Name(), err)
 		}
 		sizes[entry.Name()] = info.Size()
