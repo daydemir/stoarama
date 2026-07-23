@@ -47,16 +47,26 @@ type Config struct {
 	// RelayDiagnostics, when non-nil, is updated with non-secret job progress for
 	// relay node heartbeats. Cloud droplet workers leave it nil.
 	RelayDiagnostics *RelayDiagnostics
+	// ContinuousNoProgressTimeout makes a relay surrender a continuous job after
+	// this long without a successfully ingested segment. Zero keeps cloud workers
+	// on their existing window-long retry behavior.
+	ContinuousNoProgressTimeout time.Duration
 }
 
 type Worker struct {
-	cfg          Config
-	heartbeatInt time.Duration
+	cfg               Config
+	heartbeatInt      time.Duration
+	leaseSafetyMargin time.Duration
 }
+
+var errSegmentDelivery = errors.New("segment delivery failed")
 
 func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("client is required")
+	}
+	if cfg.ContinuousNoProgressTimeout > 0 && cfg.RelayDiagnostics == nil {
+		return nil, fmt.Errorf("continuous no-progress timeout requires relay diagnostics")
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 1
@@ -67,7 +77,11 @@ func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 5 * time.Second
 	}
-	return &Worker{cfg: cfg, heartbeatInt: time.Duration(cfg.HeartbeatSec) * time.Second}, nil
+	return &Worker{
+		cfg:               cfg,
+		heartbeatInt:      time.Duration(cfg.HeartbeatSec) * time.Second,
+		leaseSafetyMargin: 5 * time.Second,
+	}, nil
 }
 
 // Run polls for due jobs and processes up to Concurrency at a time until ctx is
@@ -181,7 +195,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID)
+	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseExpiresAt)
 
 	// Resolve the stored reference (e.g. a KBS '!hls' indirect URL) to a live
 	// playable URL fresh on every capture, so an expiring token (the KBS Wowza
@@ -297,7 +311,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID)
+	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseExpiresAt)
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 
@@ -319,6 +333,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// grown delay).
 	var sourceURL string
 	var segmentIngested bool
+	lastProgressAt := time.Now()
 	onSegment := func(seg capture.Segment) error {
 		if canceled() {
 			return nil
@@ -328,7 +343,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType, segStartMs)
 		if err != nil {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_reserve_upload_failed", err)
-			return fmt.Errorf("reserve segment upload: %w", err)
+			return fmt.Errorf("%w: reserve segment upload: %v", errSegmentDelivery, err)
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
 		uploadCtx, uploadCancel := context.WithTimeout(jobCtx, recordingapi.UploadTimeout)
@@ -342,7 +357,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		uploadCancel()
 		if err != nil {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_failed", err)
-			return fmt.Errorf("upload segment: %w", err)
+			return fmt.Errorf("%w: upload segment: %v", errSegmentDelivery, err)
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
 		if _, err := w.cfg.Client.IngestClip(jobCtx, recordingapi.IngestClipRequest{
@@ -365,14 +380,16 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// re-lease is idempotent rather than failing the whole window.
 			if isAlreadyIngested(err) {
 				segmentIngested = true
+				lastProgressAt = time.Now()
 				capture.RemoveSegmentFile(seg)
 				w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
 				return nil
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
-			return fmt.Errorf("ingest segment: %w", err)
+			return fmt.Errorf("%w: ingest segment: %v", errSegmentDelivery, err)
 		}
 		segmentIngested = true
+		lastProgressAt = time.Now()
 		capture.RemoveSegmentFile(seg)
 		w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
 		log.Printf("recording worker job=%d recording=%d continuous segment ingested start=%s size=%d",
@@ -420,7 +437,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			backoff(delay)
+			if w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+				return
+			}
+			backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
 			continue
 		}
 		if isImage {
@@ -441,7 +461,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			backoff(delay)
+			if w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+				return
+			}
+			backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
 			continue
 		}
 		sourceURL = resolved
@@ -480,7 +503,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}
 		log.Printf("recording worker job=%d recording=%d continuous source dropped (attempt %d): %v; reconnecting in %s",
 			job.JobID, job.RecordingID, attempt, captureErr, delay)
-		backoff(delay)
+		if !errors.Is(captureErr, errSegmentDelivery) && w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+			return
+		}
+		backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
 	}
 
 	if canceled() {
@@ -496,6 +522,34 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	}
 	w.cfg.RelayDiagnostics.Finish(job.JobID, "done", nil)
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
+}
+
+func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, lastProgressAt time.Time) bool {
+	if !continuousNoProgressExpired(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout) {
+		return false
+	}
+	err := fmt.Errorf("continuous relay made no progress for %s", w.cfg.ContinuousNoProgressTimeout)
+	cancel()
+	surrenderCtx, surrenderCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer surrenderCancel()
+	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, recordingapi.SurrenderNoProgress); surrenderErr != nil {
+		w.cfg.RelayDiagnostics.Finish(job.JobID, "surrender_failed", surrenderErr)
+		log.Printf("recording worker job=%d surrender failed: %v", job.JobID, surrenderErr)
+		return true
+	}
+	w.cfg.RelayDiagnostics.Finish(job.JobID, "surrendered", err)
+	return true
+}
+
+func continuousNoProgressExpired(lastProgressAt, now time.Time, timeout time.Duration) bool {
+	return timeout > 0 && !now.Before(lastProgressAt.Add(timeout))
+}
+
+func continuousReconnectDelay(lastProgressAt, now time.Time, timeout, delay time.Duration) time.Duration {
+	if timeout <= 0 {
+		return delay
+	}
+	return min(delay, max(0, lastProgressAt.Add(timeout).Sub(now)))
 }
 
 // continuousShouldStop decides whether the continuous supervisor loop must stop
@@ -573,7 +627,7 @@ func isAlreadyIngested(err error) bool {
 // startHeartbeat extends the lease on a ticker; on a cancel signal it cancels the
 // job context (aborting ffmpeg). The returned func reports whether a cancel was
 // observed, so the caller skips ingest for a canceled job.
-func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, jobID int64) func() bool {
+func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseExpiresAt time.Time) func() bool {
 	var mu sync.Mutex
 	wasCanceled := false
 	markCanceled := func() {
@@ -585,12 +639,20 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 	go func() {
 		ticker := time.NewTicker(w.heartbeatInt)
 		defer ticker.Stop()
+		leaseTimer := time.NewTimer(time.Until(leaseExpiresAt.Add(-w.leaseSafetyMargin)))
+		defer leaseTimer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-leaseTimer.C:
+				log.Printf("recording worker job=%d lease expired without confirmed renewal; stopping", jobID)
+				markCanceled()
+				return
 			case <-ticker.C:
-				cancelSignal, err := w.cfg.Client.HeartbeatRecordingJob(ctx, jobID)
+				heartbeatCtx, heartbeatCancel := context.WithDeadline(ctx, leaseExpiresAt)
+				cancelSignal, renewedUntil, err := w.cfg.Client.HeartbeatRecordingJob(heartbeatCtx, jobID)
+				heartbeatCancel()
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
 						log.Printf("recording worker job=%d heartbeat error: %v", jobID, err)
@@ -602,6 +664,14 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 					markCanceled()
 					return
 				}
+				leaseExpiresAt = renewedUntil
+				if !leaseTimer.Stop() {
+					select {
+					case <-leaseTimer.C:
+					default:
+					}
+				}
+				leaseTimer.Reset(time.Until(leaseExpiresAt.Add(-w.leaseSafetyMargin)))
 			}
 		}
 	}()

@@ -71,6 +71,7 @@ func runRelay(ctx context.Context) error {
 		ClassifyYouTubeCookieErrors: true,
 		ActiveJobs:                  &activeJobs,
 		RelayDiagnostics:            relayDiag,
+		ContinuousNoProgressTimeout: 5 * time.Minute,
 	})
 	if err != nil {
 		return fmt.Errorf("init relay worker: %w", err)

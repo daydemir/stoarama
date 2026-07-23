@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -25,6 +27,96 @@ func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
 		if !strings.Contains(cloudRecordingJobsLeaseSQL, want) {
 			t.Fatalf("lease SQL missing %q", want)
 		}
+	}
+}
+
+func TestRecordingJobSurrenderReason(t *testing.T) {
+	if !recordingJobSurrenderNoProgress.valid() {
+		t.Fatal("no_progress surrender reason rejected")
+	}
+	if recordingJobSurrenderReason("capture_error").valid() {
+		t.Fatal("unknown surrender reason accepted")
+	}
+}
+
+func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES (1, 42, 'relay', 'active', now(), 1),
+		       (2, 42, 'relay', 'active', now(), 1);
+		INSERT INTO recordings
+			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
+		VALUES (1, 42, 7, 'continuous', 'https://example.test/live.m3u8', 'active', now()-interval '1 hour', 'relay');
+		INSERT INTO recording_jobs
+			(id, recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+			 lease_owner, lease_expires_at, attempt_count, idempotency_key, kind, window_end_at)
+		VALUES (1, 1, now(), now(), 60, 'leased',
+		        'node:1', now()+interval '3 minutes', 1, 'handoff', 'continuous_window', now()+interval '1 hour')
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	var handoffUntil time.Time
+	if err := pool.QueryRow(ctx, recordingJobSurrenderSQL, 1, "node:1", string(recordingJobSurrenderNoProgress)).Scan(&handoffUntil); err != nil {
+		t.Fatal(err)
+	}
+	if !handoffUntil.After(time.Now()) {
+		t.Fatalf("handoff_until=%s is not in the future", handoffUntil)
+	}
+
+	s := &Server{pool: pool}
+	if _, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("surrendering owner lease err=%v, want pgx.ErrNoRows", err)
+	}
+	job, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 2, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.JobID != 1 {
+		t.Fatalf("different owner leased job=%d want 1", job.JobID)
+	}
+	var handoffOwner *string
+	var persistedUntil *time.Time
+	if err := pool.QueryRow(ctx, `SELECT handoff_owner, handoff_until FROM recording_jobs WHERE id=1`).Scan(&handoffOwner, &persistedUntil); err != nil {
+		t.Fatal(err)
+	}
+	if handoffOwner != nil || persistedUntil != nil {
+		t.Fatalf("handoff was not cleared on lease: owner=%v until=%v", handoffOwner, persistedUntil)
+	}
+}
+
+func TestGenericFailRetainsMaxAttemptSemantics(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings
+			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
+		VALUES (1, 42, 7, 'continuous', 'https://example.test/live.m3u8', 'active', now()-interval '1 hour', 'relay');
+		INSERT INTO recording_jobs
+			(id, recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+			 lease_owner, lease_expires_at, attempt_count, max_attempts, idempotency_key, kind, window_end_at)
+		VALUES (1, 1, now(), now(), 60, 'leased',
+		        'node:1', now()+interval '3 minutes', 3, 3, 'generic-fail', 'continuous_window', now()+interval '1 hour')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var recordingID int64
+	if err := pool.QueryRow(ctx, recordingJobFailSQL, 1, "node:1", "capture failed").Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var completedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT status, completed_at FROM recording_jobs WHERE id=1`).Scan(&status, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "error" || completedAt == nil {
+		t.Fatalf("status=%q completed_at=%v, want error with completion", status, completedAt)
 	}
 }
 
@@ -225,6 +317,20 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			account_id BIGINT NOT NULL,
 			has_payment_method BOOLEAN NOT NULL
 		)`,
+		`CREATE TABLE relay_groups (
+			id BIGINT PRIMARY KEY,
+			account_id BIGINT NOT NULL,
+			max_streams INTEGER NOT NULL
+		)`,
+		`CREATE TABLE nodes (
+			id BIGINT PRIMARY KEY,
+			account_id BIGINT NOT NULL,
+			node_type TEXT NOT NULL,
+			status TEXT NOT NULL,
+			last_heartbeat_at TIMESTAMPTZ,
+			relay_max_streams INTEGER NOT NULL,
+			relay_group_id BIGINT
+		)`,
 		`CREATE TABLE streams (
 			id BIGSERIAL PRIMARY KEY,
 			provider TEXT NOT NULL DEFAULT '',
@@ -257,6 +363,10 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			idempotency_key TEXT NOT NULL UNIQUE,
 			kind TEXT NOT NULL DEFAULT 'clip',
 			window_end_at TIMESTAMPTZ,
+			handoff_owner TEXT,
+			handoff_until TIMESTAMPTZ,
+			error_text TEXT,
+			completed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 	} {

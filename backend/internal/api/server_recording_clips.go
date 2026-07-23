@@ -101,6 +101,9 @@ const relayLeaseSQL = `
 	    AND rec.start_at <= now()
 	    AND (rec.end_at IS NULL OR now() < rec.end_at)
 	    AND rec.capture_via = 'relay'
+	    AND (j.handoff_owner IS NULL
+	         OR j.handoff_owner <> 'node:' || $1::text
+	         OR j.handoff_until <= now())
 	    AND ($2 OR EXISTS (
 	          SELECT 1 FROM account_billing b
 	          WHERE b.account_id = rec.account_id
@@ -129,6 +132,8 @@ const relayLeaseSQL = `
 	SET status = 'leased',
 	    lease_owner = 'node:' || $1::text,
 	    lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)),
+	    handoff_owner = NULL,
+	    handoff_until = NULL,
 	    attempt_count = attempt_count + 1,
 	    updated_at = now()
 	FROM cte, recordings rec
@@ -908,6 +913,95 @@ type recordingJobFailRequest struct {
 	ErrorText string `json:"error_text"`
 }
 
+type recordingJobSurrenderReason string
+
+const (
+	recordingJobSurrenderNoProgress recordingJobSurrenderReason = "no_progress"
+)
+
+func (r recordingJobSurrenderReason) valid() bool {
+	return r == recordingJobSurrenderNoProgress
+}
+
+type recordingJobSurrenderRequest struct {
+	Reason recordingJobSurrenderReason `json:"reason"`
+}
+
+const recordingJobSurrenderSQL = `
+	UPDATE recording_jobs j
+	SET status = 'pending',
+	    scheduled_for = now(),
+	    lease_owner = NULL,
+	    lease_expires_at = NULL,
+	    handoff_owner = $2,
+	    handoff_until = now() + interval '5 minutes',
+	    error_text = $3,
+	    completed_at = NULL,
+	    updated_at = now()
+	WHERE j.id=$1
+	  AND j.kind='continuous_window'
+	  AND j.status='leased'
+	  AND j.lease_owner=$2
+	  AND j.lease_expires_at > now()
+	RETURNING j.handoff_until
+`
+
+func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if principal.NodeType != nodeTypeRelay {
+		util.WriteError(w, http.StatusForbidden, "only relay nodes can surrender recording jobs")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req recordingJobSurrenderRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !req.Reason.valid() {
+		util.WriteError(w, http.StatusBadRequest, "invalid surrender reason")
+		return
+	}
+
+	var handoffUntil time.Time
+	err := s.pool.QueryRow(
+		r.Context(),
+		recordingJobSurrenderSQL,
+		id,
+		recorderWorkerID(principal),
+		string(req.Reason),
+	).Scan(&handoffUntil)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusConflict, "job is not an unexpired continuous lease owned by this relay")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("surrender recording job: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"handoff_until": handoffUntil})
+}
+
+const recordingJobFailSQL = `
+	UPDATE recording_jobs j
+	SET status = CASE WHEN j.attempt_count < j.max_attempts THEN 'pending' ELSE 'error' END,
+	    scheduled_for = CASE WHEN j.attempt_count < j.max_attempts THEN now() + interval '60 seconds' ELSE j.scheduled_for END,
+	    lease_owner = NULL,
+	    lease_expires_at = NULL,
+	    error_text = $3,
+	    completed_at = CASE WHEN j.attempt_count < j.max_attempts THEN NULL ELSE now() END,
+	    updated_at = now()
+	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+	RETURNING j.recording_id
+`
+
 // handleRecordingJobFail requeues the job (status=pending, scheduled now+60s) if
 // attempts remain, else marks it error, and bumps recording health fields (B-6).
 func (s *Server) handleRecordingJobFail(w http.ResponseWriter, r *http.Request) {
@@ -939,18 +1033,7 @@ func (s *Server) handleRecordingJobFail(w http.ResponseWriter, r *http.Request) 
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
 	var recordingID int64
-	err = tx.QueryRow(r.Context(), `
-		UPDATE recording_jobs j
-		SET status = CASE WHEN j.attempt_count < j.max_attempts THEN 'pending' ELSE 'error' END,
-		    scheduled_for = CASE WHEN j.attempt_count < j.max_attempts THEN now() + interval '60 seconds' ELSE j.scheduled_for END,
-		    lease_owner = NULL,
-		    lease_expires_at = NULL,
-		    error_text = $3,
-		    completed_at = CASE WHEN j.attempt_count < j.max_attempts THEN NULL ELSE now() END,
-		    updated_at = now()
-		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
-		RETURNING j.recording_id
-	`, id, workerID, errText).Scan(&recordingID)
+	err = tx.QueryRow(r.Context(), recordingJobFailSQL, id, workerID, errText).Scan(&recordingID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
 		return
