@@ -626,7 +626,7 @@
           <div id="relayRecommend" class="hidden" style="margin-top:10px;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--panel2) 70%,transparent);">
             <div style="font-size:13px;font-weight:600;margin-bottom:4px;">This stream needs a connected computer</div>
             <div id="relayRecommendDetail" style="font-size:12px;color:var(--muted);line-height:1.5;">We could not record it from our servers, so it defaults to recording via your computer. You can switch back if you want.</div>
-            <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;cursor:pointer;">
+            <label id="relayRecommendChoice" style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;cursor:pointer;">
               <input id="relayRecommendOptIn" type="checkbox" checked style="width:auto;min-height:0;margin:0;" />
               <span>Record via your computer (recommended)</span>
             </label>
@@ -970,6 +970,7 @@
       relayOptIn: document.getElementById('relayOptIn'),
       relayRecommend: document.getElementById('relayRecommend'),
       relayRecommendDetail: document.getElementById('relayRecommendDetail'),
+      relayRecommendChoice: document.getElementById('relayRecommendChoice'),
       relayRecommendOptIn: document.getElementById('relayRecommendOptIn'),
       relayBanner: document.getElementById('relayBanner'),
       streamPreview: document.getElementById('streamPreview'),
@@ -1131,6 +1132,7 @@
       // provider) as needing relay: the composer shows an overridable note and
       // defaults capture to relay unless the user unchecks it.
       relayRecommended: false,
+      relayRequired: false,
       // Bucket connection gate (change 1): 'idle' | 'checking' | 'connected' | 'error'.
       bucketState: 'idle',
       // Stream probe gate (change 2): the authoritative server verdict. ok===true
@@ -4444,7 +4446,9 @@
     // flagged as needing relay. Best-effort: any failure leaves the note hidden.
     async function loadRelayRecommendation(streamId) {
       state.relayRecommended = false;
+      state.relayRequired = false;
       els.relayRecommend.classList.add('hidden');
+      els.relayRecommendChoice.classList.remove('hidden');
       els.relayRecommendOptIn.checked = true;
       if (!(Number(streamId) > 0)) return;
       try {
@@ -4455,7 +4459,13 @@
         if (Number(state.catalogStreamId) !== Number(streamId)) return; // superseded
         if (out && out.relay_recommended === true) {
           state.relayRecommended = true;
-          if (out.relay_reason) els.relayRecommendDetail.textContent = `${String(out.relay_reason)} You can switch back if you want.`;
+          state.relayRequired = out.relay_required === true;
+          if (out.relay_reason) {
+            els.relayRecommendDetail.textContent = state.relayRequired
+              ? String(out.relay_reason)
+              : `${String(out.relay_reason)} You can switch back if you want.`;
+          }
+          els.relayRecommendChoice.classList.toggle('hidden', state.relayRequired);
           els.relayRecommend.classList.remove('hidden');
         }
       } catch (_) { /* recommendation is best-effort */ }
@@ -4468,6 +4478,7 @@
       state.catalogTimezoneMissing = false;
       [els.schedTZContinuous, els.schedTZ, els.schedTZCustom].forEach((select) => { select.disabled = false; });
       state.relayRecommended = false;
+      state.relayRequired = false;
       els.recStreamID.value = '';
       els.namingPlazaID.readOnly = false;
       els.namingPlazaID.placeholder = '08';
@@ -4476,6 +4487,7 @@
       els.catalogFramePreview.removeAttribute('src');
       els.catalogFramePreview.classList.add('hidden');
       els.relayRecommend.classList.add('hidden');
+      els.relayRecommendChoice.classList.remove('hidden');
       els.relayRecommendOptIn.checked = true;
     }
 
@@ -4643,7 +4655,7 @@
         // Flagged catalog stream: the note defaults to relay but is overridable.
         // Checked => relay; unchecked => send explicit 'cloud' so the server honors
         // the override instead of re-applying the auto-route default.
-        body.capture_via = els.relayRecommendOptIn.checked ? 'relay' : 'cloud';
+        body.capture_via = state.relayRequired || els.relayRecommendOptIn.checked ? 'relay' : 'cloud';
       }
       state.starting = true;
       els.startBtn.disabled = true;

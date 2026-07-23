@@ -1306,13 +1306,16 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	needsRelay := false
+	relayRequired := isYouTubeWatchURL(catalogURL) || model.StreamRequiresRelay(provider, catalogURL)
+	needsRelay := relayRequired
 	if req.StreamID > 0 {
-		var err error
-		needsRelay, err = recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider, catalogURL)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("recordability route: %v", err))
-			return
+		if !needsRelay {
+			var err error
+			needsRelay, err = recordability.NeedsRelay(r.Context(), s.pool, req.StreamID, provider, catalogURL)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("recordability route: %v", err))
+				return
+			}
 		}
 	}
 	// A relay stream is resolved and probed by the user's computer. Return its
@@ -1321,7 +1324,12 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 		resp := map[string]any{"ok": true}
 		if needsRelay {
 			resp["relay_recommended"] = true
-			resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
+			resp["relay_required"] = relayRequired
+			if relayRequired {
+				resp["relay_reason"] = "This provider must record through a connected computer."
+			} else {
+				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
+			}
 		}
 		util.WriteJSON(w, http.StatusOK, resp)
 		return

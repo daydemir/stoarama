@@ -120,6 +120,23 @@ func TestRecordingsComposerDefaultsToPlazaHourlyDaytimeWindow(t *testing.T) {
 	}
 }
 
+func TestRecordingsComposerCannotOverrideRequiredRelay(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`state.relayRequired = out.relay_required === true;`,
+		`els.relayRecommendChoice.classList.toggle('hidden', state.relayRequired);`,
+		`body.capture_via = state.relayRequired || els.relayRecommendOptIn.checked ? 'relay' : 'cloud';`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing required relay marker %q", marker)
+		}
+	}
+}
+
 func TestRecordingAndStreamPagesShowLocalScheduleTime(t *testing.T) {
 	recordings, err := loadHTMLPage("recordings.html")
 	if err != nil {
