@@ -80,8 +80,8 @@ func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 		}
 		var streamID int64
 		if err := pool.QueryRow(context.Background(), `
-			INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, local_timezone)
-			VALUES ('test', $1, $1, $1, 'https://www.youtube.com/watch?v=' || $1, 'youtube_watch', 'watch_page', 'youtube_direct', $2)
+			INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps, local_timezone)
+			VALUES ('test', $1, $1, $1, 'https://www.youtube.com/watch?v=' || $1, 'youtube_watch', 'watch_page', 'youtube_direct', 'continuous_video', 30, $2)
 			RETURNING id
 		`, status, zone).Scan(&streamID); err != nil {
 			t.Fatal(err)
@@ -190,12 +190,13 @@ func TestBatchSchedulePersistsPlazaHourlyNamingAndDaytimeWindow(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO streams (
 			provider, external_id, name, slug, source_url, capture_type, source_family,
-			execution_class, local_timezone, location_country, location_city, metadata_jsonb
+			execution_class, capture_family, expected_fps, local_timezone,
+			location_country, location_city, metadata_jsonb
 		)
 		VALUES (
 			'test', 'batch-plaza', 'Market Square', 'batch-plaza',
 			'https://www.youtube.com/watch?v=batch-plaza', 'youtube_watch', 'watch_page',
-			'youtube_direct', 'America/Los_Angeles', 'United States', 'Seattle',
+			'youtube_direct', 'continuous_video', 30, 'America/Los_Angeles', 'United States', 'Seattle',
 			'{"continent":"North America"}'::jsonb
 		)
 		RETURNING id
