@@ -1330,7 +1330,7 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 			resp["relay_recommended"] = true
 			resp["relay_required"] = relayRequired
 			if relayRequired {
-				resp["relay_reason"] = "This provider must record through a connected computer."
+				resp["relay_reason"] = "This stream must record through a connected computer."
 			} else {
 				resp["relay_reason"] = "We could not record this stream from our servers, so it defaults to recording via your computer."
 			}
