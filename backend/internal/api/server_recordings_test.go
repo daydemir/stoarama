@@ -1,10 +1,39 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestRecordingProbeRequiresRelayForManualRelayURL(t *testing.T) {
+	body := bytes.NewBufferString(`{"stream_url":"https://61e0c5d388c2e.streamlock.net/live/test/playlist.m3u8"}`)
+	req := withPrincipal(
+		httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/probe", body),
+		accountPrincipal{AccountID: 1, UserID: 1},
+		"",
+	)
+	rec := httptest.NewRecorder()
+	(&Server{}).handleAccountRecordingsProbe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		OK               bool `json:"ok"`
+		RelayRecommended bool `json:"relay_recommended"`
+		RelayRequired    bool `json:"relay_required"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK || !response.RelayRecommended || !response.RelayRequired {
+		t.Fatalf("response=%+v", response)
+	}
+}
 
 func TestSanitizeStorageKeyPrefix(t *testing.T) {
 	ok := map[string]string{

@@ -1306,7 +1306,11 @@ func (s *Server) handleAccountRecordingsProbe(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	relayRequired := isYouTubeWatchURL(catalogURL) || model.StreamRequiresRelay(provider, catalogURL)
+	relayURL := catalogURL
+	if req.StreamID <= 0 {
+		relayURL = req.StreamURL
+	}
+	relayRequired := isYouTubeWatchURL(relayURL) || model.StreamRequiresRelay(provider, relayURL)
 	needsRelay := relayRequired
 	if req.StreamID > 0 {
 		if !needsRelay {
