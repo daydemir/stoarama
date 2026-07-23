@@ -27,6 +27,10 @@ const (
 	// per-segment callback, so a segment is detected as final once a strictly
 	// newer segment file has appeared (the muxer moved on and closed its trailer).
 	ContinuousSegmentPollInterval = 2 * time.Second
+	// continuousStartupTimeout bounds how long a live ffmpeg child may produce no
+	// output bytes. A process can remain alive after its source has stalled, so
+	// process liveness alone is not capture progress.
+	continuousStartupTimeout = 30 * time.Second
 	// continuousShutdownGrace bounds how long CaptureContinuous waits for ffmpeg
 	// to exit cleanly after a SIGINT (clean MP4 trailer on the last segment).
 	continuousShutdownGrace = 20 * time.Second
@@ -184,6 +188,10 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 }
 
 func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
+	return captureContinuousWithHeaders(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, clipDuration+15*time.Second)
+}
+
+func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
@@ -195,6 +203,9 @@ func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	}
 	if onSegment == nil {
 		return fmt.Errorf("onSegment callback is required")
+	}
+	if startupTimeout <= 0 || progressTimeout <= 0 {
+		return fmt.Errorf("continuous watchdog timeouts must be > 0")
 	}
 
 	outPattern := filepath.Join(outDir, "seg-%Y%m%d-%H%M%S.mp4")
@@ -220,6 +231,10 @@ func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	// using each file's whole-second wall-clock strftime label as the anchor, which
 	// drifts when a live source delivers slightly off real-time.
 	var nextStart time.Time
+	startedAt := time.Now()
+	lastProgressAt := startedAt
+	lastOutputSizes := map[string]int64{}
+	var sawProgress bool
 	ticker := time.NewTicker(ContinuousSegmentPollInterval)
 	defer ticker.Stop()
 
@@ -301,12 +316,74 @@ func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 			}
 			return nil
 		case <-ticker.C:
+			outputSizes, err := continuousOutputSizes(outDir)
+			if err != nil {
+				stopFFmpeg()
+				return err
+			}
+			now := time.Now()
+			if continuousOutputAdvanced(lastOutputSizes, outputSizes) {
+				lastProgressAt = now
+				sawProgress = true
+			}
+			lastOutputSizes = outputSizes
+			if err := continuousWatchdogError(now, startedAt, lastProgressAt, sawProgress, startupTimeout, progressTimeout); err != nil {
+				stopFFmpeg()
+				if sweepErr := sweepFinal(true); sweepErr != nil {
+					return fmt.Errorf("%w; finalize stalled output: %v", err, sweepErr)
+				}
+				return err
+			}
 			if err := sweepFinal(false); err != nil {
 				stopFFmpeg()
 				return err
 			}
 		}
 	}
+}
+
+func continuousOutputSizes(outDir string) (map[string]int64, error) {
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		return nil, fmt.Errorf("read continuous output: %w", err)
+	}
+	sizes := make(map[string]int64, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "seg-") || filepath.Ext(entry.Name()) != ".mp4" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("stat continuous output %s: %w", entry.Name(), err)
+		}
+		sizes[entry.Name()] = info.Size()
+	}
+	return sizes, nil
+}
+
+func continuousOutputAdvanced(previous, current map[string]int64) bool {
+	for path, size := range current {
+		if prior, ok := previous[path]; size > 0 && (!ok || size > prior) {
+			return true
+		}
+	}
+	return false
+}
+
+func continuousWatchdogError(now, startedAt, lastProgressAt time.Time, sawProgress bool, startupTimeout, progressTimeout time.Duration) error {
+	if !sawProgress {
+		if now.Sub(startedAt) >= startupTimeout {
+			return fmt.Errorf("continuous ffmpeg startup stalled: no output for %s", startupTimeout)
+		}
+		return nil
+	}
+	if now.Sub(lastProgressAt) >= progressTimeout {
+		return fmt.Errorf("continuous ffmpeg progress stalled: no output growth for %s", progressTimeout)
+	}
+	return nil
 }
 
 // sortedSegments returns the seg-*.mp4 files in outDir sorted chronologically.
