@@ -18,7 +18,7 @@ import (
 
 const relayOnlineThreshold = 120 * time.Second
 const relayConnectivityLockID int64 = 821754932
-const relayConnectivityAlertOrg = "MIT SCL"
+const relayConnectivityAlertAccountID int64 = 47
 
 type relayConnectivityState string
 
@@ -96,9 +96,9 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 		SELECT n.id, n.display_name, n.hostname, a.name, a.email, n.last_heartbeat_at
 		FROM nodes n
 		JOIN accounts a ON a.id=n.account_id
-		WHERE n.node_type='relay' AND n.status='active' AND a.name=$1
+		WHERE n.node_type='relay' AND n.status='active' AND n.account_id=$1
 		ORDER BY n.id
-	`, relayConnectivityAlertOrg)
+	`, relayConnectivityAlertAccountID)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +158,7 @@ func recordRelayConnectivity(ctx context.Context, pool *pgxpool.Pool, now time.T
 			return nil, err
 		}
 		var eventID int64
-		if err := tx.QueryRow(ctx, `INSERT INTO relay_connectivity_alert_events (node_id, state, observed_at, last_heartbeat_at) VALUES ($1,$2,$3,$4) RETURNING id`, state.NodeID, state.State, now, state.LastHeartbeatAt).Scan(&eventID); err != nil {
+		if err := tx.QueryRow(ctx, `INSERT INTO relay_connectivity_alert_events (account_id, node_id, state, observed_at, last_heartbeat_at) VALUES ($1,$2,$3,$4,$5) RETURNING id`, relayConnectivityAlertAccountID, state.NodeID, state.State, now, state.LastHeartbeatAt).Scan(&eventID); err != nil {
 			return nil, err
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO relay_connectivity_alert_deliveries (event_id, recipient) SELECT $1, email FROM users WHERE is_operator=true AND btrim(email)<>''`, eventID)
@@ -186,10 +186,10 @@ func pendingRelayConnectivity(ctx context.Context, q interface {
 		SELECT e.id, n.id, n.display_name, n.hostname, a.name, a.email, e.state, e.observed_at, e.last_heartbeat_at
 		FROM relay_connectivity_alert_events e
 		JOIN nodes n ON n.id=e.node_id
-		JOIN accounts a ON a.id=n.account_id
-		WHERE e.notified_at IS NULL AND a.name=$1
+		JOIN accounts a ON a.id=e.account_id
+		WHERE e.notified_at IS NULL AND e.account_id=$1
 		ORDER BY e.id
-	`, relayConnectivityAlertOrg)
+	`, relayConnectivityAlertAccountID)
 	if err != nil {
 		return nil, err
 	}

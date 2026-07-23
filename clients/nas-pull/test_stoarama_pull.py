@@ -136,6 +136,18 @@ class NASPullTests(unittest.TestCase):
             persisted = json.loads(cfg.progress_file.read_text())
             self.assertEqual(persisted["after_id"], 1)
 
+    def test_release_failure_is_reported_to_heartbeat(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            clip = {"clip_id": 1, "recording_id": 3}
+            with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
+                pull, "process_clip", return_value=(1, 10)
+            ), mock.patch.object(pull, "release_clip", side_effect=RuntimeError("release denied")):
+                self.assertFalse(pull.drain_page(cfg, runtime))
+            self.assertEqual(runtime.cursor_id, 0)
+            self.assertEqual(runtime.last_error, "1 of 1 clips failed; first clip 1: release denied")
+
     def test_manifest_validation_and_transport_classification(self):
         self.assertEqual(
             pull.validate_manifest({"version": "v1", "artifact": "client-v1.py", "sha256": "a" * 64}),

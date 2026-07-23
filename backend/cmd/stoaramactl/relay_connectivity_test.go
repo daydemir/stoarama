@@ -89,7 +89,7 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		CREATE TABLE users (email TEXT PRIMARY KEY, is_operator BOOLEAN NOT NULL);
 		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, display_name TEXT NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_states (node_id BIGINT PRIMARY KEY, observed_state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL);
-		CREATE TABLE relay_connectivity_alert_events (id BIGSERIAL PRIMARY KEY, node_id BIGINT NOT NULL, state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, last_heartbeat_at TIMESTAMPTZ, notified_at TIMESTAMPTZ);
+		CREATE TABLE relay_connectivity_alert_events (id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL, node_id BIGINT NOT NULL, state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, last_heartbeat_at TIMESTAMPTZ, notified_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_deliveries (event_id BIGINT NOT NULL, recipient TEXT NOT NULL, delivered_at TIMESTAMPTZ, PRIMARY KEY (event_id, recipient));
 		INSERT INTO accounts VALUES (1, 'MIT SCL', 'scl@example.edu'), (2, 'Other Org', 'other@example.edu');
 		INSERT INTO users VALUES ('deniz@aydemir.us', true);
@@ -102,11 +102,29 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 
 	now := time.Date(2026, 7, 22, 12, 0, 30, 0, time.UTC)
 	states, err := currentRelayConnectivity(ctx, pool, now)
-	if err != nil || len(states) != 1 || states[0].OrgName != relayConnectivityAlertOrg {
+	if err != nil || len(states) != 1 || states[0].OrgName != "MIT SCL" {
 		t.Fatalf("alert-scoped relay states=%v err=%v", states, err)
 	}
 	if got, err := recordRelayConnectivity(ctx, pool, now); err != nil || len(got) != 0 {
 		t.Fatalf("baseline transitions=%v err=%v, want none", got, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_connectivity_alert_events (account_id, node_id, state, observed_at)
+		VALUES (1, 7, 'offline', $1), (2, 8, 'offline', $1);
+		UPDATE nodes SET account_id=2 WHERE id=7;
+	`, now); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := pendingRelayConnectivity(ctx, pool)
+	if err != nil || len(pending) != 1 || pending[0].EventID != 1 || pending[0].OrgName != "MIT SCL" {
+		t.Fatalf("account-snapshotted pending transitions=%v err=%v", pending, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE nodes SET account_id=1 WHERE id=7;
+		DELETE FROM relay_connectivity_alert_events;
+		ALTER SEQUENCE relay_connectivity_alert_events_id_seq RESTART WITH 1;
+	`); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now.Add(-relayOnlineThreshold)); err != nil {
 		t.Fatal(err)

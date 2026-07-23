@@ -327,7 +327,7 @@ def verified_file(path, expected_bytes, expected_sha):
         return False
     size, digest = sha256_file(path)
     if size != expected_bytes or digest != expected_sha:
-        raise ExistingFileMismatch("existing file does not match API checksum: %s" % path)
+        raise ExistingFileMismatch(f"existing file does not match API checksum: {path}")
     return True
 
 
@@ -377,13 +377,13 @@ def process_clip(cfg, clip, release=True):
     final_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         exists = verified_file(final_path, expected_bytes, expected_sha)
-    except ExistingFileMismatch:
-        quarantine = final_path.with_name(".%s.invalid-%d" % (final_path.name, clip_id))
+    except ExistingFileMismatch as exc:
+        quarantine = final_path.with_name(f".{final_path.name}.invalid-{clip_id}")
         if quarantine.exists():
-            raise RuntimeError("clip %d has both invalid final and quarantine files" % clip_id)
+            raise RuntimeError(f"clip {clip_id} has both invalid final and quarantine files") from exc
         os.replace(str(final_path), str(quarantine))
         fsync_dir(final_path.parent)
-        log("WARN", "clip_id=%d quarantined checksum-mismatched file=%s" % (clip_id, quarantine))
+        log("WARN", f"clip_id={clip_id} quarantined checksum-mismatched file={quarantine}")
         exists = False
     if not exists:
         presigned = request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
@@ -424,7 +424,7 @@ def drain_page(cfg, runtime):
     cursor = runtime.cursor_id
     successes = []
     recording_by_clip = {int(clip["clip_id"]): int(clip["recording_id"]) for clip in clips}
-    for clip_id, result, error in results:
+    for index, (clip_id, result, error) in enumerate(results):
         if error is not None:
             break
         try:
@@ -432,6 +432,7 @@ def drain_page(cfg, runtime):
                 release_clip(cfg, recording_by_clip[clip_id], clip_id)
         except Exception as exc:
             log("ERROR", "clip_id=%d release failed: %s" % (clip_id, exc))
+            results[index] = (clip_id, None, exc)
             break
         successes.append(result)
         cursor = clip_id
@@ -441,7 +442,7 @@ def drain_page(cfg, runtime):
     if failures:
         first_id, first_error = failures[0]
         runtime.set_error(
-            ("%d of %d clips failed; first clip %d: %s" % (len(failures), len(results), first_id, first_error))[:1000]
+            f"{len(failures)} of {len(results)} clips failed; first clip {first_id}: {first_error}"[:1000]
         )
     return bool(successes)
 
