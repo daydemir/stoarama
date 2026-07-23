@@ -121,13 +121,19 @@ func TestRecordingAndStreamPagesShowLocalScheduleTime(t *testing.T) {
 	}
 }
 
-func TestRecordingHealthBinsDescribeCapturedPercentage(t *testing.T) {
+func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
 		t.Fatalf("load recordings html: %v", err)
 	}
-	if !strings.Contains(string(body), "% of expected clips captured") {
-		t.Fatal("recording health bins must expose captured percentage on hover")
+	page := string(body)
+	for _, marker := range []string{
+		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured",
+		`title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recording health-bin tooltip source missing %q", marker)
+		}
 	}
 }
 
