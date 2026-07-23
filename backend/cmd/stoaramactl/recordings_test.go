@@ -12,6 +12,11 @@ func TestDecodeRecordingBatchSpecStrict(t *testing.T) {
 	if err != nil || spec.Mode != recordingScheduleContinuous {
 		t.Fatalf("decode valid spec: mode=%q err=%v", spec.Mode, err)
 	}
+	spaced := strings.Replace(valid, `"plaza_hourly_v1"`, `" plaza_hourly_v1 "`, 1)
+	spec, err = decodeRecordingBatchSpec(strings.NewReader(spaced))
+	if err != nil || spec.NamingProfile != "plaza_hourly_v1" {
+		t.Fatalf("normalize naming profile: profile=%q err=%v", spec.NamingProfile, err)
+	}
 	for _, raw := range []string{
 		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sometimes"}`,
 		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"elsewhere"}`,
