@@ -36,6 +36,7 @@ class NASPullTests(unittest.TestCase):
             previous_file=state / "stoarama_pull.previous.py",
             lock_file=state / "client.lock",
             update_manifest_url="https://stoarama.test/nas/download/latest.json",
+            download_workers=12,
             dry_run=dry_run,
             is_candidate=False,
         )
@@ -83,15 +84,15 @@ class NASPullTests(unittest.TestCase):
             final.write_bytes(b"abc")
             clip = {
                 "clip_id": 7,
-                "recording_id": 3,
+                "recording_id": 13,
                 "size_bytes": 3,
                 "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 "relative_path": "recordings/clip.mp4",
                 "download_path": "/unused",
             }
             with mock.patch.object(pull, "release_clip") as release:
-                self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
-                release.assert_called_once_with(cfg, 3, 7)
+                self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 0, 0))
+                release.assert_called_once_with(cfg, 13, 7)
 
     def test_checksum_mismatch_is_quarantined_and_redownloaded(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -101,7 +102,7 @@ class NASPullTests(unittest.TestCase):
             final.write_bytes(b"wrong")
             clip = {
                 "clip_id": 7,
-                "recording_id": 3,
+                "recording_id": 13,
                 "size_bytes": 3,
                 "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 "relative_path": "recordings/clip.mp4",
@@ -110,7 +111,7 @@ class NASPullTests(unittest.TestCase):
             with mock.patch.object(pull, "request_json", return_value={"url": "https://example.test/clip"}), mock.patch.object(
                 pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(b"abc")
             ), mock.patch.object(pull, "release_clip"):
-                self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
+                self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 3, 0))
             self.assertEqual(final.read_bytes(), b"abc")
             quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
             self.assertEqual([path.read_bytes() for path in quarantines], [b"wrong"])
@@ -118,7 +119,7 @@ class NASPullTests(unittest.TestCase):
             with mock.patch.object(pull, "request_json", return_value={"url": "https://example.test/clip"}), mock.patch.object(
                 pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(b"abc")
             ), mock.patch.object(pull, "release_clip"):
-                self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
+                self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 3, 0))
             self.assertEqual(final.read_bytes(), b"abc")
             quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
             self.assertEqual(sorted(path.read_bytes() for path in quarantines), [b"wrong", b"wrong again"])
@@ -132,7 +133,7 @@ class NASPullTests(unittest.TestCase):
             def process(_cfg, clip, release=True):
                 if clip["clip_id"] == 2:
                     raise RuntimeError("poison")
-                return clip["clip_id"], 10
+                return clip["clip_id"], 10, 10, 0
 
             with mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
                 pull, "process_clip", side_effect=process
@@ -151,11 +152,45 @@ class NASPullTests(unittest.TestCase):
             runtime = pull.Runtime(cfg)
             clip = {"clip_id": 1, "recording_id": 3}
             with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
-                pull, "process_clip", return_value=(1, 10)
+                pull, "process_clip", return_value=(1, 10, 10, 0)
             ), mock.patch.object(pull, "release_clip", side_effect=RuntimeError("release denied")):
                 self.assertFalse(pull.drain_page(cfg, runtime))
             self.assertEqual(runtime.cursor_id, 0)
             self.assertEqual(runtime.last_error, "1 of 1 clips failed; first clip 1: release denied")
+
+    def test_exhausted_retries_are_reported_for_download_and_release(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            clips = [{"clip_id": value, "recording_id": 3} for value in (1, 2)]
+            download_error = pull.RetryExhausted(RuntimeError("download failed"), 2)
+            release_error = pull.RetryExhausted(RuntimeError("release failed"), 2)
+
+            def process(_cfg, clip, release=True):
+                if clip["clip_id"] == 2:
+                    raise download_error
+                return 1, 10, 10, 0
+
+            with mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
+                pull, "process_clip", side_effect=process
+            ), mock.patch.object(pull, "retry_transient", side_effect=release_error):
+                self.assertFalse(pull.drain_page(cfg, runtime))
+            self.assertEqual(runtime.batch["retries"], 4)
+            self.assertEqual(runtime.batch["failures"], 2)
+
+    def test_retry_transient_retries_dns_and_rejects_permanent_errors(self):
+        transient = urllib.error.URLError(socket.gaierror(-2, "name resolution failed"))
+        operation = mock.Mock(side_effect=[transient, "ok"])
+        with mock.patch.object(pull.time, "sleep"):
+            self.assertEqual(pull.retry_transient(operation, 7, "download"), ("ok", 1))
+        permanent = mock.Mock(side_effect=ValueError("invalid"))
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            pull.retry_transient(permanent, 7, "download")
+        self.assertEqual(permanent.call_count, 1)
+        exhausted = mock.Mock(side_effect=transient)
+        with mock.patch.object(pull.time, "sleep"), self.assertRaises(pull.RetryExhausted) as caught:
+            pull.retry_transient(exhausted, 7, "download")
+        self.assertEqual(caught.exception.retries, 2)
 
     def test_manifest_validation_and_transport_classification(self):
         self.assertEqual(

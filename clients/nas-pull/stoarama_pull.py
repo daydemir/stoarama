@@ -21,7 +21,9 @@ from pathlib import Path
 
 CLIENT_VERSION = "development"
 LIST_PAGE_LIMIT = 200
-DOWNLOAD_WORKERS = 8
+DEFAULT_DOWNLOAD_WORKERS = 12
+MAX_DOWNLOAD_WORKERS = 32
+DOWNLOAD_ATTEMPTS = 3
 HTTP_TIMEOUT_SEC = 120
 HEARTBEAT_TIMEOUT_SEC = 20
 HEARTBEAT_INTERVAL_SEC = 30
@@ -32,6 +34,12 @@ USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 
 class ExistingFileMismatch(RuntimeError):
     pass
+
+
+class RetryExhausted(RuntimeError):
+    def __init__(self, cause, retries):
+        super().__init__(str(cause))
+        self.retries = retries
 
 
 class Phase(str, Enum):
@@ -133,6 +141,7 @@ class Config:
         self.previous_file = self.state_dir / "stoarama_pull.previous.py"
         self.lock_file = self.state_dir / "client.lock"
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 60)
+        self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
         self.update_manifest_url = env_str(
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
@@ -148,6 +157,8 @@ class Config:
             raise SystemExit("STOARAMA_API_KEY is required")
         if self.poll_interval_sec < 10 or self.poll_interval_sec > 3600:
             raise SystemExit("STOARAMA_POLL_INTERVAL_SEC must be between 10 and 3600")
+        if self.download_workers < 1 or self.download_workers > MAX_DOWNLOAD_WORKERS:
+            raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
 
 
 def boot_id():
@@ -185,6 +196,29 @@ def classify_transport_error(exc):
     return OutageClass.OTHER
 
 
+def transient_error(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code < 600
+    return classify_transport_error(exc) in (OutageClass.DNS, OutageClass.TIMEOUT, OutageClass.CONNECTION)
+
+
+def retry_transient(operation, clip_id, phase):
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            return operation(), attempt - 1
+        except Exception as exc:
+            if not transient_error(exc):
+                raise
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise RetryExhausted(exc, attempt - 1) from exc
+            log(
+                "WARN",
+                "clip_id=%d %s retry=%d/%d class=%s"
+                % (clip_id, phase, attempt, DOWNLOAD_ATTEMPTS - 1, classify_transport_error(exc).value),
+            )
+            time.sleep(attempt)
+
+
 class Runtime:
     def __init__(self, cfg):
         progress = read_json(cfg.progress_file, {})
@@ -203,6 +237,15 @@ class Runtime:
         self.previous_exit = self._previous_exit(cfg)
         self.heartbeat_succeeded = False
         self.list_succeeded = False
+        self.batch = {
+            "completed_at": None,
+            "clips": 0,
+            "bytes": 0,
+            "duration_ms": 0,
+            "workers": cfg.download_workers,
+            "retries": 0,
+            "failures": 0,
+        }
 
     def _previous_exit(self, cfg):
         prior = read_json(cfg.runtime_file, {})
@@ -247,6 +290,19 @@ class Runtime:
             "last_success_at": self.last_success_at,
         }
 
+    def set_batch(self, clips, downloaded_bytes, duration_sec, retries, failures):
+        duration_ms = max(1, round(duration_sec * 1000))
+        with self.lock:
+            self.batch = {
+                "completed_at": utc_now(),
+                "clips": clips,
+                "bytes": downloaded_bytes,
+                "duration_ms": duration_ms,
+                "workers": self.batch["workers"],
+                "retries": retries,
+                "failures": failures,
+            }
+
     def heartbeat_payload(self, outage):
         with self.lock:
             payload = {
@@ -261,6 +317,7 @@ class Runtime:
                 "client_last_success_at": self.last_success_at,
                 "client_last_error": self.last_error,
                 "client_last_error_at": self.last_error_at,
+                "last_batch": self.batch.copy(),
             }
         if outage:
             payload["last_outage"] = outage
@@ -385,20 +442,30 @@ def process_clip(cfg, clip, release=True):
         fsync_dir(final_path.parent)
         log("WARN", f"clip_id={clip_id} quarantined checksum-mismatched file={quarantine}")
         exists = False
+    retries = 0
+    downloaded_bytes = 0
     if not exists:
-        presigned = request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
-        url = str(presigned.get("url", ""))
-        if not url:
-            raise RuntimeError("clip %d presign returned no URL" % clip_id)
         temp_path = final_path.with_name(final_path.name + ".part-%d" % clip_id)
-        download_verified(url, temp_path, expected_bytes, expected_sha)
+
+        def download():
+            presigned = request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
+            url = str(presigned.get("url", ""))
+            if not url:
+                raise RuntimeError("clip %d presign returned no URL" % clip_id)
+            download_verified(url, temp_path, expected_bytes, expected_sha)
+
+        _, retries = retry_transient(download, clip_id, "download")
         os.replace(str(temp_path), str(final_path))
         fsync_dir(final_path.parent)
+        downloaded_bytes = expected_bytes
     if release and not cfg.dry_run:
-        release_clip(cfg, recording_id, clip_id)
+        _, release_retries = retry_transient(
+            lambda: release_clip(cfg, recording_id, clip_id), clip_id, "release"
+        )
+        retries += release_retries
     suffix = " dry-run" if cfg.dry_run else (" released" if release else " ready")
     log("INFO", "clip_id=%d bytes=%d saved=%s%s" % (clip_id, expected_bytes, final_path, suffix))
-    return clip_id, expected_bytes
+    return clip_id, expected_bytes, downloaded_bytes, retries
 
 
 def drain_page(cfg, runtime):
@@ -412,8 +479,9 @@ def drain_page(cfg, runtime):
     if not clips:
         return False
     runtime.set_phase(Phase.DRAINING)
+    started = time.monotonic()
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.download_workers) as executor:
         futures = [executor.submit(process_clip, cfg, clip, False) for clip in clips]
         for clip, future in zip(clips, futures):
             try:
@@ -423,14 +491,26 @@ def drain_page(cfg, runtime):
                 log("ERROR", "clip_id=%s failed: %s" % (clip.get("clip_id", "?"), exc))
     cursor = runtime.cursor_id
     successes = []
+    prepared = [result for _, result, error in results if error is None]
+    downloaded_bytes = sum(result[2] for result in prepared)
+    retries = sum(result[3] for result in prepared) + sum(
+        error.retries for _, _, error in results if isinstance(error, RetryExhausted)
+    )
     recording_by_clip = {int(clip["clip_id"]): int(clip["recording_id"]) for clip in clips}
     for index, (clip_id, result, error) in enumerate(results):
         if error is not None:
             break
         try:
             if not cfg.dry_run:
-                release_clip(cfg, recording_by_clip[clip_id], clip_id)
+                _, release_retries = retry_transient(
+                    lambda: release_clip(cfg, recording_by_clip[clip_id], clip_id),
+                    clip_id,
+                    "release",
+                )
+                retries += release_retries
         except Exception as exc:
+            if isinstance(exc, RetryExhausted):
+                retries += exc.retries
             log("ERROR", "clip_id=%d release failed: %s" % (clip_id, exc))
             results[index] = (clip_id, None, exc)
             break
@@ -439,6 +519,7 @@ def drain_page(cfg, runtime):
     if successes:
         runtime.add_successes(cfg, cursor, successes)
     failures = [(clip_id, error) for clip_id, _, error in results if error is not None]
+    runtime.set_batch(len(prepared), downloaded_bytes, time.monotonic() - started, retries, len(failures))
     if failures:
         first_id, first_error = failures[0]
         runtime.set_error(

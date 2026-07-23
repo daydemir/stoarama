@@ -121,6 +121,13 @@ type connectionListItem struct {
 	LastOutageStartedAt    *time.Time       `json:"last_outage_started_at"`
 	LastOutageRecoveredAt  *time.Time       `json:"last_outage_recovered_at"`
 	LastOutageFailureCount int              `json:"last_outage_failure_count"`
+	NASBatchCompletedAt    *time.Time       `json:"nas_batch_completed_at"`
+	NASBatchClips          int              `json:"nas_batch_clips"`
+	NASBatchBytes          int64            `json:"nas_batch_bytes"`
+	NASBatchDurationMS     int64            `json:"nas_batch_duration_ms"`
+	NASDownloadWorkers     int              `json:"nas_download_workers"`
+	NASBatchRetries        int              `json:"nas_batch_retries"`
+	NASBatchFailures       int              `json:"nas_batch_failures"`
 	PendingClips           int64            `json:"pending_clips"`
 	PendingBytes           int64            `json:"pending_bytes"`
 	OldestPendingAt        *time.Time       `json:"oldest_pending_at"`
@@ -169,6 +176,7 @@ func connectionComposeSnippet(apiBase, token string, connectionID int64, pollInt
       STOARAMA_OUTPUT_DIR: "/clips"
       STOARAMA_STATE_DIR: "/state"
       STOARAMA_POLL_INTERVAL_SEC: "%d"
+      STOARAMA_DOWNLOAD_WORKERS: "12"
       STOARAMA_UPDATE_MANIFEST_URL: "https://stoarama.com/nas/download/latest.json"
       STOARAMA_DRY_RUN: "0"
       PYTHONUNBUFFERED: "1"
@@ -281,7 +289,9 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		       client_phase, client_previous_exit, client_last_success_at,
 		       client_last_error, client_last_error_at, last_outage_class,
 		       last_outage_started_at, last_outage_recovered_at,
-		       last_outage_failure_count, conn.created_at,
+		       last_outage_failure_count, nas_batch_completed_at, nas_batch_clips,
+		       nas_batch_bytes, nas_batch_duration_ms, nas_download_workers,
+		       nas_batch_retries, nas_batch_failures, conn.created_at,
 		       pending.clips, pending.bytes, pending.oldest_at
 		FROM connections conn
 		`+connectionPendingLateralSQL+`
@@ -316,6 +326,13 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			outageStartedAt *time.Time
 			outageRecovered *time.Time
 			outageFailures  int
+			batchCompleted  *time.Time
+			batchClips      int
+			batchBytes      int64
+			batchDurationMS int64
+			downloadWorkers int
+			batchRetries    int
+			batchFailures   int
 			createdAt       time.Time
 			pendingClips    int64
 			pendingBytes    int64
@@ -324,7 +341,9 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		if err := rows.Scan(&id, &label, &lastSeenAt, &clipsPulled, &bytesPulled, &lastCursorID,
 			&pollIntervalSec, &clientVersion, &clientStartedAt, &clientBootID, &clientPhase,
 			&previousExit, &lastSuccessAt, &lastError, &lastErrorAt, &outageClass,
-			&outageStartedAt, &outageRecovered, &outageFailures, &createdAt,
+			&outageStartedAt, &outageRecovered, &outageFailures, &batchCompleted,
+			&batchClips, &batchBytes, &batchDurationMS, &downloadWorkers,
+			&batchRetries, &batchFailures, &createdAt,
 			&pendingClips, &pendingBytes, &oldestPendingAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan connection: %v", err))
 			return
@@ -363,6 +382,13 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			LastOutageStartedAt:    outageStartedAt,
 			LastOutageRecoveredAt:  outageRecovered,
 			LastOutageFailureCount: outageFailures,
+			NASBatchCompletedAt:    batchCompleted,
+			NASBatchClips:          batchClips,
+			NASBatchBytes:          batchBytes,
+			NASBatchDurationMS:     batchDurationMS,
+			NASDownloadWorkers:     downloadWorkers,
+			NASBatchRetries:        batchRetries,
+			NASBatchFailures:       batchFailures,
 			PendingClips:           pendingClips,
 			PendingBytes:           pendingBytes,
 			OldestPendingAt:        oldestPendingAt,
@@ -517,6 +543,17 @@ type connectionHeartbeatRequest struct {
 	ClientLastError    string                     `json:"client_last_error"`
 	ClientLastErrorAt  *time.Time                 `json:"client_last_error_at"`
 	LastOutage         *connectionHeartbeatOutage `json:"last_outage"`
+	LastBatch          connectionHeartbeatBatch   `json:"last_batch"`
+}
+
+type connectionHeartbeatBatch struct {
+	CompletedAt *time.Time `json:"completed_at"`
+	Clips       int        `json:"clips"`
+	Bytes       int64      `json:"bytes"`
+	DurationMS  int64      `json:"duration_ms"`
+	Workers     int        `json:"workers"`
+	Retries     int        `json:"retries"`
+	Failures    int        `json:"failures"`
 }
 
 type connectionHeartbeatOutage struct {
@@ -530,9 +567,22 @@ var connectionPhases = map[string]bool{"starting": true, "idle": true, "draining
 var connectionPreviousExits = map[string]bool{"unknown": true, "clean": true, "self_update": true, "unclean_process": true, "unclean_reboot": true}
 var connectionOutageClasses = map[string]bool{"dns_failed": true, "timeout": true, "connection": true, "http": true, "other": true}
 
+const connectionHeartbeatFutureSkew = 5 * time.Minute
+
 func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 	if req.CursorID < 0 || req.ClipsPulled < 0 || req.BytesPulled < 0 {
 		return errors.New("cursor_id, clips_pulled, and bytes_pulled must be non-negative")
+	}
+	batch := req.LastBatch
+	if batch.Clips < 0 || batch.Bytes < 0 || batch.DurationMS < 0 ||
+		batch.Workers < 0 || batch.Workers > 32 || batch.Retries < 0 || batch.Failures < 0 {
+		return errors.New("invalid NAS batch telemetry")
+	}
+	if batch.CompletedAt != nil && (batch.DurationMS < 1 || batch.Workers < 1) {
+		return errors.New("completed NAS batch telemetry requires duration and workers")
+	}
+	if batch.CompletedAt != nil && batch.CompletedAt.After(time.Now().Add(connectionHeartbeatFutureSkew)) {
+		return errors.New("completed NAS batch telemetry is too far in the future")
 	}
 	if req.ClientVersion == "" {
 		return nil // Backward compatibility for the old NAS client during rollout.
@@ -605,12 +655,22 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    last_outage_started_at=CASE WHEN $12 <> '' THEN $13 ELSE last_outage_started_at END,
 		    last_outage_recovered_at=CASE WHEN $12 <> '' THEN $14 ELSE last_outage_recovered_at END,
 		    last_outage_failure_count=CASE WHEN $12 <> '' THEN $15 ELSE last_outage_failure_count END,
+		    nas_batch_completed_at=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $16 ELSE nas_batch_completed_at END,
+		    nas_batch_clips=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $17 ELSE nas_batch_clips END,
+		    nas_batch_bytes=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $18 ELSE nas_batch_bytes END,
+		    nas_batch_duration_ms=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $19 ELSE nas_batch_duration_ms END,
+		    nas_download_workers=CASE WHEN $20 > 0 THEN $20 ELSE nas_download_workers END,
+		    nas_batch_retries=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $21 ELSE nas_batch_retries END,
+		    nas_batch_failures=CASE WHEN $16 IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16 > nas_batch_completed_at) THEN $22 ELSE nas_batch_failures END,
 		    updated_at=now()
-		WHERE api_key_id=$16 AND account_id=$17
+		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
 		req.ClientStartedAt, req.ClientBootID, req.ClientPhase, req.ClientPreviousExit,
 		req.ClientLastSuccess, req.ClientLastError, req.ClientLastErrorAt,
 		outageClass, outageStartedAt, outageRecoveredAt, outageFailureCount,
+		req.LastBatch.CompletedAt, req.LastBatch.Clips, req.LastBatch.Bytes,
+		req.LastBatch.DurationMS, req.LastBatch.Workers, req.LastBatch.Retries,
+		req.LastBatch.Failures,
 		*principal.APIKeyID, principal.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))

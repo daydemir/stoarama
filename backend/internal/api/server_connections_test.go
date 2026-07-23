@@ -155,13 +155,14 @@ func TestClampPollIntervalSec(t *testing.T) {
 
 func TestConnectionListItemJSONContract(t *testing.T) {
 	item := connectionListItem{
-		ID:            13,
-		Health:        connectionHealthHealthy,
-		ClientPhase:   "draining",
-		PendingClips:  42,
-		PendingBytes:  1024,
-		LastCursorID:  99,
-		ClientVersion: "release",
+		ID:                 13,
+		Health:             connectionHealthHealthy,
+		ClientPhase:        "draining",
+		PendingClips:       42,
+		PendingBytes:       1024,
+		LastCursorID:       99,
+		ClientVersion:      "release",
+		NASDownloadWorkers: 12,
 	}
 	body, err := json.Marshal(item)
 	if err != nil {
@@ -174,6 +175,7 @@ func TestConnectionListItemJSONContract(t *testing.T) {
 		`"pending_bytes":1024`,
 		`"last_cursor_id":99`,
 		`"client_version":"release"`,
+		`"nas_download_workers":12`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("connection JSON missing %s: %s", want, body)
@@ -371,6 +373,7 @@ func TestNASLauncherUsesVerifiedCacheWhenDownloadIsUnavailable(t *testing.T) {
 
 func TestValidateConnectionHeartbeat(t *testing.T) {
 	now := time.Now().UTC()
+	future := now.Add(connectionHeartbeatFutureSkew + time.Minute)
 	valid := connectionHeartbeatRequest{
 		CursorID:           8,
 		ClipsPulled:        5,
@@ -380,6 +383,14 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		ClientBootID:       "boot-id",
 		ClientPhase:        "draining",
 		ClientPreviousExit: "clean",
+		LastBatch: connectionHeartbeatBatch{
+			CompletedAt: &now,
+			Clips:       200,
+			Bytes:       1024,
+			DurationMS:  5000,
+			Workers:     12,
+			Retries:     1,
+		},
 		LastOutage: &connectionHeartbeatOutage{
 			Class:        "dns_failed",
 			StartedAt:    &now,
@@ -389,16 +400,29 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	if err := validateConnectionHeartbeat(valid); err != nil {
 		t.Fatalf("valid heartbeat rejected: %v", err)
 	}
+	starting := connectionHeartbeatRequest{
+		ClientVersion:      "v1",
+		ClientPhase:        "starting",
+		ClientPreviousExit: "clean",
+		LastBatch:          connectionHeartbeatBatch{Workers: 12},
+	}
+	if err := validateConnectionHeartbeat(starting); err != nil {
+		t.Fatalf("pre-batch worker telemetry rejected: %v", err)
+	}
 	legacy := connectionHeartbeatRequest{CursorID: 1, ClipsPulled: 1}
 	if err := validateConnectionHeartbeat(legacy); err != nil {
 		t.Fatalf("legacy heartbeat rejected during rollout: %v", err)
 	}
 	invalid := []connectionHeartbeatRequest{
 		{CursorID: -1},
+		{LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
 		{ClientVersion: "bad/version"},
 		{ClientVersion: "v1", ClientPhase: "running", ClientPreviousExit: "clean"},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "panic"},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastOutage: &connectionHeartbeatOutage{Class: "dns_failed"}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{Workers: 33}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &future, DurationMS: 1, Workers: 1}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {

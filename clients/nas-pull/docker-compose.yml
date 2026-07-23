@@ -16,6 +16,7 @@ services:
       STOARAMA_OUTPUT_DIR: "/clips"
       STOARAMA_STATE_DIR: "/state"
       STOARAMA_POLL_INTERVAL_SEC: "60"
+      STOARAMA_DOWNLOAD_WORKERS: "12"
       STOARAMA_UPDATE_MANIFEST_URL: "https://stoarama.com/nas/download/latest.json"
       STOARAMA_DRY_RUN: "0"
       PYTHONUNBUFFERED: "1"
