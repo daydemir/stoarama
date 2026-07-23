@@ -19,6 +19,9 @@ func TestStreamRequiresRelay(t *testing.T) {
 	if !StreamRequiresRelay(" sdot ", "") {
 		t.Fatal("SDOT should require relay")
 	}
+	if !StreamRequiresRelay(" topis ", "") {
+		t.Fatal("TOPIS should require relay")
+	}
 	if !StreamRequiresRelay("global-street-scores", "https://61e0c5d388c2e.streamlock.net/live/2_James_EW.stream/playlist.m3u8") {
 		t.Fatal("Seattle stream host should require relay")
 	}

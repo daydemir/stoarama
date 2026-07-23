@@ -33,7 +33,8 @@ func IsKoreaRecordingProvider(provider string) bool {
 }
 
 func StreamRequiresRelay(provider, sourceURL string) bool {
-	if StreamProvider(strings.ToUpper(strings.TrimSpace(provider))) == StreamProviderSDOT {
+	switch StreamProvider(strings.ToUpper(strings.TrimSpace(provider))) {
+	case StreamProviderSDOT, StreamProviderTOPIS:
 		return true
 	}
 	u, err := url.Parse(strings.TrimSpace(sourceURL))
