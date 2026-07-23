@@ -3544,7 +3544,7 @@
         const health = String(bin.health || '');
         const start = instantInTimezone(bin.start, timezone) || '';
         const end = instantInTimezone(bin.end, timezone) || '';
-        const title = `${start} to ${end}: ${Math.round(percent * 10) / 10}% (${captured}/${expected} clips)`;
+        const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;
         cells.push(`<span class="health-strip-cell" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
       }
       return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time">${cells.join('')}</div>`;

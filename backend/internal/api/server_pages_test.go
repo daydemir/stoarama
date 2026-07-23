@@ -121,6 +121,16 @@ func TestRecordingAndStreamPagesShowLocalScheduleTime(t *testing.T) {
 	}
 }
 
+func TestRecordingHealthBinsDescribeCapturedPercentage(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	if !strings.Contains(string(body), "% of expected clips captured") {
+		t.Fatal("recording health bins must expose captured percentage on hover")
+	}
+}
+
 func TestHandleDashboardStaticServesDashboardJS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/static/dashboard.js", nil)
 	rec := httptest.NewRecorder()
