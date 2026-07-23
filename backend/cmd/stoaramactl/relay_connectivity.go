@@ -18,6 +18,7 @@ import (
 
 const relayOnlineThreshold = 120 * time.Second
 const relayConnectivityLockID int64 = 821754932
+const relayConnectivityAlertOrg = "MIT SCL"
 
 type relayConnectivityState string
 
@@ -95,9 +96,9 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 		SELECT n.id, n.display_name, n.hostname, a.name, a.email, n.last_heartbeat_at
 		FROM nodes n
 		JOIN accounts a ON a.id=n.account_id
-		WHERE n.node_type='relay' AND n.status='active'
+		WHERE n.node_type='relay' AND n.status='active' AND a.name=$1
 		ORDER BY n.id
-	`)
+	`, relayConnectivityAlertOrg)
 	if err != nil {
 		return nil, err
 	}
@@ -186,9 +187,9 @@ func pendingRelayConnectivity(ctx context.Context, q interface {
 		FROM relay_connectivity_alert_events e
 		JOIN nodes n ON n.id=e.node_id
 		JOIN accounts a ON a.id=n.account_id
-		WHERE e.notified_at IS NULL
+		WHERE e.notified_at IS NULL AND a.name=$1
 		ORDER BY e.id
-	`)
+	`, relayConnectivityAlertOrg)
 	if err != nil {
 		return nil, err
 	}

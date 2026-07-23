@@ -91,14 +91,20 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		CREATE TABLE relay_connectivity_alert_states (node_id BIGINT PRIMARY KEY, observed_state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL);
 		CREATE TABLE relay_connectivity_alert_events (id BIGSERIAL PRIMARY KEY, node_id BIGINT NOT NULL, state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, last_heartbeat_at TIMESTAMPTZ, notified_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_deliveries (event_id BIGINT NOT NULL, recipient TEXT NOT NULL, delivered_at TIMESTAMPTZ, PRIMARY KEY (event_id, recipient));
-		INSERT INTO accounts VALUES (1, 'MIT SCL', 'scl@example.edu');
+		INSERT INTO accounts VALUES (1, 'MIT SCL', 'scl@example.edu'), (2, 'Other Org', 'other@example.edu');
 		INSERT INTO users VALUES ('deniz@aydemir.us', true);
-		INSERT INTO nodes VALUES (7, 1, 'relay', 'MIT-MAC-1', 'mit-mac-1', 'active', '2026-07-22T12:00:00Z');
+		INSERT INTO nodes VALUES
+		  (7, 1, 'relay', 'MIT-MAC-1', 'mit-mac-1', 'active', '2026-07-22T12:00:00Z'),
+		  (8, 2, 'relay', 'OTHER-RELAY', 'other-relay', 'active', '2026-07-22T12:00:00Z');
 	`); err != nil {
 		t.Fatal(err)
 	}
 
 	now := time.Date(2026, 7, 22, 12, 0, 30, 0, time.UTC)
+	states, err := currentRelayConnectivity(ctx, pool, now)
+	if err != nil || len(states) != 1 || states[0].OrgName != relayConnectivityAlertOrg {
+		t.Fatalf("alert-scoped relay states=%v err=%v", states, err)
+	}
 	if got, err := recordRelayConnectivity(ctx, pool, now); err != nil || len(got) != 0 {
 		t.Fatalf("baseline transitions=%v err=%v, want none", got, err)
 	}
