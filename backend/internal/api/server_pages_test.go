@@ -174,6 +174,7 @@ func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) 
 	for _, marker := range []string{
 		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;",
 		`title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"`,
+		`health-strip-bar ${escapeHTML(health)}" title="${escapeHTML(title)}"`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recording health-bin tooltip source missing %q", marker)

@@ -214,6 +214,7 @@
     .capture-health.not_expected, .capture-health.unavailable { color: var(--muted); }
     .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
     .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
+    .health-strip-cell[title], .health-strip-bar[title] { cursor: help; }
     .health-strip-bar { width: 100%; min-height: 2px; border-radius: 2px; background: var(--muted); }
     .health-strip-bar.healthy { background: var(--ok); }
     .health-strip-bar.warning { background: var(--warn); }
@@ -3547,7 +3548,7 @@
         const start = instantInTimezone(bin.start, timezone) || '';
         const end = instantInTimezone(bin.end, timezone) || '';
         const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;
-        cells.push(`<span class="health-strip-cell" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
+        cells.push(`<span class="health-strip-cell" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" title="${escapeHTML(title)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
       }
       return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time">${cells.join('')}</div>`;
     }
