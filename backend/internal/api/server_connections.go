@@ -567,6 +567,8 @@ var connectionPhases = map[string]bool{"starting": true, "idle": true, "draining
 var connectionPreviousExits = map[string]bool{"unknown": true, "clean": true, "self_update": true, "unclean_process": true, "unclean_reboot": true}
 var connectionOutageClasses = map[string]bool{"dns_failed": true, "timeout": true, "connection": true, "http": true, "other": true}
 
+const connectionHeartbeatFutureSkew = 5 * time.Minute
+
 func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 	if req.CursorID < 0 || req.ClipsPulled < 0 || req.BytesPulled < 0 {
 		return errors.New("cursor_id, clips_pulled, and bytes_pulled must be non-negative")
@@ -578,6 +580,9 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 	}
 	if batch.CompletedAt != nil && (batch.DurationMS < 1 || batch.Workers < 1) {
 		return errors.New("completed NAS batch telemetry requires duration and workers")
+	}
+	if batch.CompletedAt != nil && batch.CompletedAt.After(time.Now().Add(connectionHeartbeatFutureSkew)) {
+		return errors.New("completed NAS batch telemetry is too far in the future")
 	}
 	if req.ClientVersion == "" {
 		return nil // Backward compatibility for the old NAS client during rollout.

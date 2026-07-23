@@ -373,6 +373,7 @@ func TestNASLauncherUsesVerifiedCacheWhenDownloadIsUnavailable(t *testing.T) {
 
 func TestValidateConnectionHeartbeat(t *testing.T) {
 	now := time.Now().UTC()
+	future := now.Add(connectionHeartbeatFutureSkew + time.Minute)
 	valid := connectionHeartbeatRequest{
 		CursorID:           8,
 		ClipsPulled:        5,
@@ -421,6 +422,7 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastOutage: &connectionHeartbeatOutage{Class: "dns_failed"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{Workers: 33}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &future, DurationMS: 1, Workers: 1}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {
