@@ -233,7 +233,8 @@ func buildPlazaHourlyPath(p Policy) (string, error) {
 		local.Weekday().String(),
 		hourToken,
 	)
-	return path.Join(folder, local.Month().String(), local.Weekday().String(), file), nil
+	dayFolder := fmt.Sprintf("%02d-%s", local.Day(), local.Weekday())
+	return path.Join(folder, local.Month().String(), dayFolder, file), nil
 }
 
 func plazaHourlyHour(t time.Time) int {

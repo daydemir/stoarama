@@ -34,7 +34,7 @@ func TestBuildPlazaHourlyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("path: %v", err)
 	}
-	want := "08_Europe_Finland_Kuopio_Market_Square/May/Monday/08_Kuopio_Market_Square_2025_May_W2_Monday_hour_03.mp4"
+	want := "08_Europe_Finland_Kuopio_Market_Square/May/12-Monday/08_Kuopio_Market_Square_2025_May_W2_Monday_hour_03.mp4"
 	if got != want {
 		t.Fatalf("path=%q want %q", got, want)
 	}
@@ -60,7 +60,32 @@ func TestBuildPlazaHourlyContinuousPathIncludesMinuteSecond(t *testing.T) {
 	if err != nil {
 		t.Fatalf("path: %v", err)
 	}
-	want := "01_na_usa_losangeles_venicebeach/May/Monday/01_Venice_Beach_2025_May_W2_Monday_hour_100401.mp4"
+	want := "01_na_usa_losangeles_venicebeach/May/12-Monday/01_Venice_Beach_2025_May_W2_Monday_hour_100401.mp4"
+	if got != want {
+		t.Fatalf("path=%q want %q", got, want)
+	}
+}
+
+func TestBuildPlazaHourlyPathUsesLocalCalendarDate(t *testing.T) {
+	got, err := BuildDisplayPath(Policy{
+		Profile:       ProfilePlazaHourlyV1,
+		JobKind:       JobKindContinuousWindow,
+		FolderName:    "01_North_America_US_Seattle_Test_Plaza",
+		RecordingID:   1,
+		CronTimezone:  "America/Los_Angeles",
+		ClipStartedAt: time.Date(2025, time.May, 13, 6, 30, 0, 0, time.UTC),
+		Metadata: Metadata{
+			PlazaID:   "1",
+			Continent: "North America",
+			Country:   "US",
+			City:      "Seattle",
+			PlazaName: "Test Plaza",
+		},
+	})
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	want := "01_North_America_US_Seattle_Test_Plaza/May/12-Monday/01_Test_Plaza_2025_May_W2_Monday_hour_233000.mp4"
 	if got != want {
 		t.Fatalf("path=%q want %q", got, want)
 	}
