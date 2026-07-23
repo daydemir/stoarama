@@ -112,7 +112,16 @@ class NASPullTests(unittest.TestCase):
             ), mock.patch.object(pull, "release_clip"):
                 self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
             self.assertEqual(final.read_bytes(), b"abc")
-            self.assertEqual(final.with_name(".clip.mp4.invalid-7").read_bytes(), b"wrong")
+            quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
+            self.assertEqual([path.read_bytes() for path in quarantines], [b"wrong"])
+            final.write_bytes(b"wrong again")
+            with mock.patch.object(pull, "request_json", return_value={"url": "https://example.test/clip"}), mock.patch.object(
+                pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(b"abc")
+            ), mock.patch.object(pull, "release_clip"):
+                self.assertEqual(pull.process_clip(cfg, clip), (7, 3))
+            self.assertEqual(final.read_bytes(), b"abc")
+            quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
+            self.assertEqual(sorted(path.read_bytes() for path in quarantines), [b"wrong", b"wrong again"])
 
     def test_failed_clip_does_not_block_later_downloads_or_advance_past_it(self):
         with tempfile.TemporaryDirectory() as raw:

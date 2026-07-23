@@ -378,9 +378,9 @@ def process_clip(cfg, clip, release=True):
     try:
         exists = verified_file(final_path, expected_bytes, expected_sha)
     except ExistingFileMismatch as exc:
-        quarantine = final_path.with_name(f".{final_path.name}.invalid-{clip_id}")
+        quarantine = final_path.with_name(f".{final_path.name}.invalid-{clip_id}-{time.time_ns()}")
         if quarantine.exists():
-            raise RuntimeError(f"clip {clip_id} has both invalid final and quarantine files") from exc
+            raise ExistingFileMismatch(quarantine) from exc
         os.replace(str(final_path), str(quarantine))
         fsync_dir(final_path.parent)
         log("WARN", f"clip_id={clip_id} quarantined checksum-mismatched file={quarantine}")
