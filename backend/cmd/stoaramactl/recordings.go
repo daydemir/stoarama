@@ -168,9 +168,11 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 	if spec.Mode != recordingScheduleSampled && spec.Mode != recordingScheduleContinuous {
 		return spec, fmt.Errorf("mode is required")
 	}
-	if spec.NamingProfile != recordingnaming.ProfileStoaramaV1 && spec.NamingProfile != recordingnaming.ProfilePlazaHourlyV1 {
-		return spec, fmt.Errorf("naming_profile is required")
+	namingProfile, err := recordingnaming.ParseProfile(spec.NamingProfile.String())
+	if err != nil {
+		return spec, err
 	}
+	spec.NamingProfile = namingProfile
 	if spec.Delivery != recordingDeliveryManaged && spec.Delivery != recordingDeliveryNASPull {
 		return spec, fmt.Errorf("delivery is required")
 	}

@@ -13,17 +13,19 @@ func TestDecodeRecordingBatchSpecStrict(t *testing.T) {
 		t.Fatalf("decode valid spec: mode=%q err=%v", spec.Mode, err)
 	}
 	for _, raw := range []string{
-		`{"stream_ids":[1],"mode":"sometimes"}`,
-		`{"stream_ids":[1],"mode":"sampled","delivery":"elsewhere"}`,
-		`{"stream_ids":[1],"mode":"sampled"}`,
-		`{"stream_ids":[1],"mode":"sampled","delivery":"managed"}`,
-		`{"stream_ids":[1],"mode":"sampled","delivery":"managed","storage_destination_id":1,"delivery_storage_destination_id":2}`,
-		`{"stream_ids":[1],"mode":"sampled","delivery":"nas_pull","delivery_storage_destination_id":2}`,
-		`{"stream_ids":[1],"mode":"sampled","unknown":true}`,
-		`{"stream_ids":[],"mode":"sampled"}`,
-		`{"stream_ids":[1,1],"mode":"sampled"}`,
-		`{"stream_ids":[1],"naming_profile":"plaza_hourly_v1","mode":"continuous","active_weekdays":[8]}`,
-		`{"stream_ids":[1],"stream_timezones":[{"stream_id":2,"timezone":"UTC"}],"mode":"sampled"}`,
+		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sometimes"}`,
+		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"elsewhere"}`,
+		`{"stream_ids":[1],"mode":"sampled","delivery":"managed","storage_destination_id":1}`,
+		`{"stream_ids":[1],"naming_profile":"unsupported","mode":"sampled","delivery":"managed","storage_destination_id":1}`,
+		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled"}`,
+		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"managed"}`,
+		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"managed","storage_destination_id":1,"delivery_storage_destination_id":2}`,
+		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"nas_pull","delivery_storage_destination_id":2}`,
+		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","unknown":true}`,
+		`{"stream_ids":[],"naming_profile":"stoarama_v1","mode":"sampled"}`,
+		`{"stream_ids":[1,1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"managed","storage_destination_id":1}`,
+		`{"stream_ids":[1],"naming_profile":"plaza_hourly_v1","mode":"continuous","active_weekdays":[8],"delivery":"managed","storage_destination_id":1}`,
+		`{"stream_ids":[1],"stream_timezones":[{"stream_id":2,"timezone":"UTC"}],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"managed","storage_destination_id":1}`,
 		valid + `{}`,
 	} {
 		if _, err := decodeRecordingBatchSpec(strings.NewReader(raw)); err == nil {
