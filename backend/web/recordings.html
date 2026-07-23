@@ -228,6 +228,8 @@
       position: fixed;
       z-index: 1000;
       max-width: min(360px, calc(100vw - 16px));
+      max-height: calc(100vh - 16px);
+      overflow: hidden;
       padding: 7px 9px;
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -947,6 +949,8 @@
     </div>
     </div>
   </div>
+
+  <div id="healthTooltip" class="health-tooltip hidden" role="tooltip"></div>
 
   <script>
     const els = {
@@ -3566,32 +3570,28 @@
         latestTitle = title;
         cells.push(`<span class="health-strip-cell" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
       }
-      return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time" data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0">${cells.join('')}</div>`;
+      return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time" aria-describedby="healthTooltip" data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0">${cells.join('')}</div>`;
     }
 
-    let healthTooltip = null;
+    const healthTooltip = document.getElementById('healthTooltip');
 
     function hideHealthTooltip() {
-      if (healthTooltip) healthTooltip.classList.add('hidden');
+      healthTooltip.classList.add('hidden');
     }
 
     function showHealthTooltip(target) {
       const text = String(target.dataset.healthTooltip || '');
       if (!text) return;
-      if (!healthTooltip) {
-        healthTooltip = document.createElement('div');
-        healthTooltip.className = 'health-tooltip hidden';
-        healthTooltip.setAttribute('role', 'tooltip');
-        document.body.appendChild(healthTooltip);
-      }
       healthTooltip.textContent = text;
       healthTooltip.classList.remove('hidden');
       const targetRect = target.getBoundingClientRect();
       const tooltipRect = healthTooltip.getBoundingClientRect();
       const left = Math.max(8, Math.min(window.innerWidth - tooltipRect.width - 8, targetRect.left + targetRect.width / 2 - tooltipRect.width / 2));
       const above = targetRect.top - tooltipRect.height - 8;
+      const preferredTop = above >= 8 ? above : targetRect.bottom + 8;
+      const top = Math.max(8, Math.min(window.innerHeight - tooltipRect.height - 8, preferredTop));
       healthTooltip.style.left = `${left}px`;
-      healthTooltip.style.top = `${above >= 8 ? above : targetRect.bottom + 8}px`;
+      healthTooltip.style.top = `${top}px`;
     }
 
     document.addEventListener('pointerover', (event) => {
