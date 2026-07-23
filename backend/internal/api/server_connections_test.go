@@ -155,13 +155,14 @@ func TestClampPollIntervalSec(t *testing.T) {
 
 func TestConnectionListItemJSONContract(t *testing.T) {
 	item := connectionListItem{
-		ID:            13,
-		Health:        connectionHealthHealthy,
-		ClientPhase:   "draining",
-		PendingClips:  42,
-		PendingBytes:  1024,
-		LastCursorID:  99,
-		ClientVersion: "release",
+		ID:                 13,
+		Health:             connectionHealthHealthy,
+		ClientPhase:        "draining",
+		PendingClips:       42,
+		PendingBytes:       1024,
+		LastCursorID:       99,
+		ClientVersion:      "release",
+		NASDownloadWorkers: 12,
 	}
 	body, err := json.Marshal(item)
 	if err != nil {
@@ -174,6 +175,7 @@ func TestConnectionListItemJSONContract(t *testing.T) {
 		`"pending_bytes":1024`,
 		`"last_cursor_id":99`,
 		`"client_version":"release"`,
+		`"nas_download_workers":12`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("connection JSON missing %s: %s", want, body)
@@ -380,6 +382,14 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		ClientBootID:       "boot-id",
 		ClientPhase:        "draining",
 		ClientPreviousExit: "clean",
+		LastBatch: connectionHeartbeatBatch{
+			CompletedAt: &now,
+			Clips:       200,
+			Bytes:       1024,
+			DurationMS:  5000,
+			Workers:     12,
+			Retries:     1,
+		},
 		LastOutage: &connectionHeartbeatOutage{
 			Class:        "dns_failed",
 			StartedAt:    &now,
@@ -399,6 +409,8 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "running", ClientPreviousExit: "clean"},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "panic"},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastOutage: &connectionHeartbeatOutage{Class: "dns_failed"}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{Workers: 33}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {

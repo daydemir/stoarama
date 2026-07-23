@@ -205,6 +205,8 @@ func TestOrganizationNASConnectionUsesStructuredHealthCard(t *testing.T) {
 		`<dt>Downloaded</dt>`,
 		`<dt>Waiting</dt>`,
 		`<dt>Oldest waiting</dt>`,
+		`<dt>Transfer rate</dt>`,
+		`<dt>Last transfer batch</dt>`,
 		`Latest download error`,
 		`Last connection interruption`,
 	} {

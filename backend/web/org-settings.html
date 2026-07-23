@@ -734,6 +734,13 @@
           const error = String(c.client_last_error || '');
           const outageClass = String(c.last_outage_class || '');
           const outageFailures = Number(c.last_outage_failure_count || 0);
+          const batchClips = Number(c.nas_batch_clips || 0);
+          const batchBytes = Number(c.nas_batch_bytes || 0);
+          const batchDurationMS = Number(c.nas_batch_duration_ms || 0);
+          const payloadMbps = batchDurationMS > 0 ? batchBytes * 8 / batchDurationMS / 1000 : 0;
+          const batchRetries = Number(c.nas_batch_retries || 0);
+          const batchFailures = Number(c.nas_batch_failures || 0);
+          const downloadWorkers = Number(c.nas_download_workers || 0);
           const outageRecovered = Boolean(c.last_outage_recovered_at);
           const outage = outageClass
             ? `<div class="conn-alert">
@@ -758,6 +765,8 @@
               <div><dt>Downloaded</dt><dd>${clips.toLocaleString()} clips<span class="conn-stat-detail">${escapeHTML(connectionBytes(bytes))} total</span></dd></div>
               <div><dt>Waiting</dt><dd>${pendingClips.toLocaleString()} clips<span class="conn-stat-detail">${escapeHTML(connectionBytes(pendingBytes))}</span></dd></div>
               <div><dt>Oldest waiting</dt><dd>${escapeHTML(c.oldest_pending_at ? connectionTimestamp(c.oldest_pending_at) : 'None')}</dd></div>
+              <div><dt>Transfer rate</dt><dd>${payloadMbps > 0 ? `${payloadMbps.toFixed(1)} Mbps` : 'Measuring'}<span class="conn-stat-detail">${downloadWorkers || '—'} parallel downloads</span></dd></div>
+              <div><dt>Last transfer batch</dt><dd>${batchClips.toLocaleString()} clips<span class="conn-stat-detail">${batchDurationMS > 0 ? `${Math.round(batchDurationMS / 1000)}s` : '—'} · ${batchRetries} retries · ${batchFailures} failed</span></dd></div>
             </dl>
             ${latestError}
             ${outage}
