@@ -80,7 +80,7 @@ func EnsureStreamPlazaID(ctx context.Context, tx pgx.Tx, accountID, streamID int
 }
 
 func LockOrganizationPlazaIDs(ctx context.Context, tx pgx.Tx, accountID int64) error {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('account_stream_plaza_ids:' || $1::text, 0))`, accountID); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('account_stream_plaza_ids', $1))`, accountID); err != nil {
 		return fmt.Errorf("lock plaza id sequence: %w", err)
 	}
 	return nil

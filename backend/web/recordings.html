@@ -1431,8 +1431,8 @@
           : [id, namingToken(m.continent, 'Europe'), namingToken(m.country, 'Finland'), namingToken(m.city, 'Kuopio'), plaza].join('_');
         els.namingFolderHint.innerHTML = 'Leave blank to derive <span class="mono">{ID}_{Continent}_{Country}_{City}_{PlazaName}</span>. Custom text replaces that root folder.';
         els.namingPreview.textContent = state.composerScheduleMode === 'continuous'
-          ? `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_100401.mp4`
-          : `${folder}/May/Monday/${id}_${plaza}_2025_May_W2_Monday_hour_03.mp4`;
+          ? `${folder}/May/12-Monday/${id}_${plaza}_2025_May_W2_Monday_hour_100401.mp4`
+          : `${folder}/May/12-Monday/${id}_${plaza}_2025_May_W2_Monday_hour_03.mp4`;
         return;
       }
       const folder = n.folder_name ? namingFolderPreview(n.folder_name, 'recordings') : 'recordings';

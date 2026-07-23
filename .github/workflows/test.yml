@@ -1,0 +1,43 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: stoarama_test
+          POSTGRES_USER: stoarama
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stoarama -d stoarama_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Test PostgreSQL type boundaries
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/recordingnaming -run TestLockOrganizationPlazaIDsAcceptsIntegerAccountID -count=1
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
