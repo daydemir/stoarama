@@ -399,6 +399,15 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	if err := validateConnectionHeartbeat(valid); err != nil {
 		t.Fatalf("valid heartbeat rejected: %v", err)
 	}
+	starting := connectionHeartbeatRequest{
+		ClientVersion:      "v1",
+		ClientPhase:        "starting",
+		ClientPreviousExit: "clean",
+		LastBatch:          connectionHeartbeatBatch{Workers: 12},
+	}
+	if err := validateConnectionHeartbeat(starting); err != nil {
+		t.Fatalf("pre-batch worker telemetry rejected: %v", err)
+	}
 	legacy := connectionHeartbeatRequest{CursorID: 1, ClipsPulled: 1}
 	if err := validateConnectionHeartbeat(legacy); err != nil {
 		t.Fatalf("legacy heartbeat rejected during rollout: %v", err)

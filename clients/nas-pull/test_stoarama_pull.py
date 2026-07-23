@@ -84,7 +84,7 @@ class NASPullTests(unittest.TestCase):
             final.write_bytes(b"abc")
             clip = {
                 "clip_id": 7,
-                "recording_id": 3,
+                "recording_id": 13,
                 "size_bytes": 3,
                 "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 "relative_path": "recordings/clip.mp4",
@@ -92,7 +92,7 @@ class NASPullTests(unittest.TestCase):
             }
             with mock.patch.object(pull, "release_clip") as release:
                 self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 0, 0))
-                release.assert_called_once_with(cfg, 3, 7)
+                release.assert_called_once_with(cfg, 13, 7)
 
     def test_checksum_mismatch_is_quarantined_and_redownloaded(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -102,7 +102,7 @@ class NASPullTests(unittest.TestCase):
             final.write_bytes(b"wrong")
             clip = {
                 "clip_id": 7,
-                "recording_id": 3,
+                "recording_id": 13,
                 "size_bytes": 3,
                 "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 "relative_path": "recordings/clip.mp4",

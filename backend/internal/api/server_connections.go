@@ -654,7 +654,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    nas_batch_clips=CASE WHEN $16 IS NOT NULL THEN $17 ELSE nas_batch_clips END,
 		    nas_batch_bytes=CASE WHEN $16 IS NOT NULL THEN $18 ELSE nas_batch_bytes END,
 		    nas_batch_duration_ms=CASE WHEN $16 IS NOT NULL THEN $19 ELSE nas_batch_duration_ms END,
-		    nas_download_workers=CASE WHEN $16 IS NOT NULL THEN $20 ELSE nas_download_workers END,
+		    nas_download_workers=CASE WHEN $20 > 0 THEN $20 ELSE nas_download_workers END,
 		    nas_batch_retries=CASE WHEN $16 IS NOT NULL THEN $21 ELSE nas_batch_retries END,
 		    nas_batch_failures=CASE WHEN $16 IS NOT NULL THEN $22 ELSE nas_batch_failures END,
 		    updated_at=now()
