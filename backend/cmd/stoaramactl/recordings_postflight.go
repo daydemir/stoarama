@@ -334,15 +334,16 @@ func evaluateCampaignPostflight(
 	}
 	if len(report.NAS) == 0 {
 		report.Issues = append(report.Issues, "no NAS connection exists")
+	} else {
+		nasHealthy := slices.ContainsFunc(report.NAS, func(item campaignNASCheck) bool { return item.Healthy })
+		if !nasHealthy {
+			report.Issues = append(report.Issues, "no healthy NAS connection is ready")
+		}
 	}
 	for _, recording := range report.Recordings {
 		if !recording.Healthy {
 			report.Healthy = false
 		}
-	}
-	nasHealthy := slices.ContainsFunc(report.NAS, func(item campaignNASCheck) bool { return item.Healthy })
-	if !nasHealthy {
-		report.Issues = append(report.Issues, "no healthy NAS connection is ready")
 	}
 	if recordings.FleetRelayWarning {
 		report.Issues = append(report.Issues, "relay fleet warning is active")

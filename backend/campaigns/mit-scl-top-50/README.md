@@ -24,7 +24,9 @@ After scheduling, verify the combined recording IDs with:
 ```text
 stoaramactl recordings campaign-postflight \
   --recording-ids ID,ID,... \
-  --session-cookie-file /secure/path/stoarama-session-cookie
+  --session-cookie-file /secure/path/stoarama-session-cookie \
+  --backend-api-url https://stoarama.com/api/v1 \
+  --api-token "$API_TOKEN"
 ```
 
 Pass all 50 recording IDs returned by the live cohort runs. Run postflight
