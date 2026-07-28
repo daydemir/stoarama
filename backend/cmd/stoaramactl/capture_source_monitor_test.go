@@ -166,7 +166,7 @@ func TestMonitorSourceReturnsOutputError(t *testing.T) {
 func TestMonitorSourceCancellationReturnsPromptlyAndEmitsFailed(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-ffmpeg")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 30\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -198,7 +198,7 @@ func TestMonitorSourceCancellationReturnsPromptlyAndEmitsFailed(t *testing.T) {
 func TestMonitorSourceCancellationAfterCaptureEmitsCompleted(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-ffmpeg")
-	source := "#!/bin/sh\nfor output_path do :; done\nprintf video > \"$output_path\"\nsleep 30\n"
+	source := "#!/bin/sh\nfor output_path do :; done\nprintf video > \"$output_path\"\nexec sleep 30\n"
 	if err := os.WriteFile(script, []byte(source), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestMonitorSourceCancellationAfterCaptureEmitsCompleted(t *testing.T) {
 func TestMonitorSourceCancellationDiscardsEmptyNewestSegment(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-ffmpeg")
-	source := "#!/bin/sh\nfor output_path do :; done\nfirst=${output_path%-%09d.ts}-000000000.ts\nsecond=${output_path%-%09d.ts}-000000001.ts\nprintf video > \"$first\"\n: > \"$second\"\nsleep 30\n"
+	source := "#!/bin/sh\nfor output_path do :; done\nfirst=${output_path%-%09d.ts}-000000000.ts\nsecond=${output_path%-%09d.ts}-000000001.ts\nprintf video > \"$first\"\n: > \"$second\"\nexec sleep 30\n"
 	if err := os.WriteFile(script, []byte(source), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +283,7 @@ func TestMonitorSourceFailedEventIncludesSegmentsConsumedBeforeScanError(t *test
 		t.Fatal(err)
 	}
 	script := filepath.Join(dir, "fake-ffmpeg")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 30\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
