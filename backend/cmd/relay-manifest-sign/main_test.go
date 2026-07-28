@@ -26,6 +26,8 @@ func TestSignerRoundTripRejectsTamperingAndWrongKey(t *testing.T) {
 	}
 	signer := buildSigner(t, dir)
 	publicKey := strings.TrimSpace(runSigner(t, signer, "public", "--private-key-file", keyPath))
+	runSigner(t, signer, "validate-public", "--public-key", publicKey)
+	assertSignerFails(t, signer, "validate-public", "--public-key", "invalid")
 	runSigner(t, signer, "sign", "--private-key-file", keyPath, "--input", manifestPath, "--output", signaturePath)
 	runSigner(t, signer, "verify", "--public-key", publicKey, "--input", manifestPath, "--signature", signaturePath)
 

@@ -4789,6 +4789,10 @@ func (o *optionalBool) String() string {
 	return "false"
 }
 
+func (*optionalBool) IsBoolFlag() bool {
+	return true
+}
+
 func optionalBoolFlag(fs *flag.FlagSet, name string) *optionalBool {
 	o := &optionalBool{}
 	fs.Var(o, name, "")

@@ -331,6 +331,33 @@ func TestBoundedSourceMonitorOutputKeepsNewestBytes(t *testing.T) {
 	}
 }
 
+func TestPrepareSourceMonitorOutputDirCleansOnlyTemporaryDirectory(t *testing.T) {
+	temporary, cleanup, err := prepareSourceMonitorOutputDir("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(temporary); err != nil {
+		t.Fatalf("temporary output directory: %v", err)
+	}
+	cleanup()
+	if _, err := os.Stat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary output directory still exists: %v", err)
+	}
+
+	explicit := filepath.Join(t.TempDir(), "monitor")
+	got, cleanup, err := prepareSourceMonitorOutputDir(explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != explicit {
+		t.Fatalf("output directory=%q want %q", got, explicit)
+	}
+	cleanup()
+	if _, err := os.Stat(explicit); err != nil {
+		t.Fatalf("explicit output directory was removed: %v", err)
+	}
+}
+
 func decodeSourceMonitorEvents(t *testing.T, body []byte) []sourceMonitorEvent {
 	t.Helper()
 	decoder := json.NewDecoder(bytes.NewReader(body))

@@ -17,6 +17,8 @@ set -euo pipefail
 # Optional env:
 #   RELAY_VERSION        immutable version stamped into artifacts + latest.json
 #                        (default: the current eight-character Git revision)
+#   RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY base64 Ed25519 public key trusted beside
+#                        the signing key for one overlapping rotation release
 #   RELAY_SIGNING_BOOTSTRAP=1 permits the one-time migration of the current
 #                        byte-identical live/immutable unsigned manifest.
 #
@@ -41,6 +43,12 @@ RELAY_SIGNING_PUBLIC_KEY="$(
   go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign public \
     --private-key-file "${RELAY_SIGNING_PRIVATE_KEY_FILE}"
 )"
+RELAY_TRUSTED_PUBLIC_KEYS="${RELAY_SIGNING_PUBLIC_KEY}"
+if [[ -n "${RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY:-}" ]]; then
+  go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign validate-public \
+    --public-key "${RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY}"
+  RELAY_TRUSTED_PUBLIC_KEYS+=",${RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY}"
+fi
 
 if [[ ! "${RELAY_VERSION}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ || "${RELAY_VERSION}" == *..* ]]; then
   echo "error: RELAY_VERSION must start and end with a letter or number and contain no consecutive dots" >&2
@@ -209,7 +217,7 @@ for t in "${TARGETS[@]}"; do
   bin="${BUILD_DIR}/stoarama-relay"
   GOOS="${GOOS}" GOARCH="${GOARCH}" CGO_ENABLED=0 \
     go build -C "${ROOT_DIR}" \
-    -ldflags "-X main.version=${RELAY_VERSION} -X main.releasePublicKeyBase64=${RELAY_SIGNING_PUBLIC_KEY}" \
+    -ldflags "-X main.version=${RELAY_VERSION} -X main.releasePublicKeyBase64=${RELAY_TRUSTED_PUBLIC_KEYS}" \
     -o "${bin}" ./cmd/stoarama-relay
   tarball="stoarama-relay-${RELAY_VERSION}-${key}.tar.gz"
   tar -C "${BUILD_DIR}" -czf "${BUILD_DIR}/${tarball}" stoarama-relay

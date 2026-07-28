@@ -348,6 +348,29 @@ func TestFinalizedSegmentRetryWithExistingTimelineDoesNotAdvanceUntilAck(t *test
 	}
 }
 
+func TestZeroDurationFinalizedSegmentsUseDistinctTimelineKeys(t *testing.T) {
+	processed := map[string]bool{}
+	nextStart := time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC)
+	starts := make([]time.Time, 0, 2)
+	deliver := func(segment Segment) error {
+		starts = append(starts, segment.StartAt)
+		return nil
+	}
+	segment := Segment{DurationMs: 0}
+	if err := deliverContinuousSegment(processed, "first.mp4", segment, &nextStart, deliver); err != nil {
+		t.Fatal(err)
+	}
+	if err := deliverContinuousSegment(processed, "second.mp4", segment, &nextStart, deliver); err != nil {
+		t.Fatal(err)
+	}
+	if len(starts) != 2 || starts[0].Equal(starts[1]) {
+		t.Fatalf("zero-duration starts=%v want distinct idempotency keys", starts)
+	}
+	if want := starts[0].Add(time.Millisecond); !starts[1].Equal(want) {
+		t.Fatalf("second start=%s want %s", starts[1], want)
+	}
+}
+
 func TestCaptureContinuousStopsAliveStalledChild(t *testing.T) {
 	tests := []struct {
 		name           string

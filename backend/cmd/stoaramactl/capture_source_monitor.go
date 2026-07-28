@@ -94,30 +94,33 @@ func runCaptureSourceMonitor(ctx context.Context, args []string) {
 	if err := validateSourceMonitorConfig(cfg); err != nil {
 		log.Fatal(err)
 	}
-	if cfg.OutputDir == "" {
-		dir, err := os.MkdirTemp("", "stoarama-source-monitor-*")
-		if err != nil {
-			log.Fatalf("create monitor directory: %v", err)
-		}
-		cfg.OutputDir = dir
-		err = func() error {
-			defer os.RemoveAll(dir)
-			if err := os.MkdirAll(cfg.OutputDir, 0o700); err != nil {
-				return fmt.Errorf("create --output-dir: %w", err)
-			}
-			return monitorSource(ctx, cfg, os.Stdout)
-		}()
-		if err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-	if err := os.MkdirAll(cfg.OutputDir, 0o700); err != nil {
-		log.Fatalf("create --output-dir: %v", err)
-	}
-	if err := monitorSource(ctx, cfg, os.Stdout); err != nil {
+	if err := executeSourceMonitor(ctx, cfg, os.Stdout); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func executeSourceMonitor(ctx context.Context, cfg sourceMonitorConfig, output io.Writer) error {
+	dir, cleanup, err := prepareSourceMonitorOutputDir(cfg.OutputDir)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	cfg.OutputDir = dir
+	return monitorSource(ctx, cfg, output)
+}
+
+func prepareSourceMonitorOutputDir(path string) (string, func(), error) {
+	if path == "" {
+		dir, err := os.MkdirTemp("", "stoarama-source-monitor-*")
+		if err != nil {
+			return "", func() {}, fmt.Errorf("create monitor directory: %w", err)
+		}
+		return dir, func() { _ = os.RemoveAll(dir) }, nil
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return "", func() {}, fmt.Errorf("create --output-dir: %w", err)
+	}
+	return path, func() {}, nil
 }
 
 func validateSourceMonitorConfig(cfg sourceMonitorConfig) error {

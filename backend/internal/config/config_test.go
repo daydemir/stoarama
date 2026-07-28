@@ -61,7 +61,7 @@ func TestMITSharedRecordingsTrustedProxyCIDRsMustBeValid(t *testing.T) {
 
 func TestMITSharedRecordingsPasswordMustContainEightCharacters(t *testing.T) {
 	t.Setenv("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID", "47")
-	t.Setenv("MIT_SCL_RECORDINGS_READ_PASSWORD", "short7")
+	t.Setenv("MIT_SCL_RECORDINGS_READ_PASSWORD", "seven77")
 	t.Setenv("MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY", testCookieSigningKey())
 	t.Setenv("MIT_SCL_RECORDINGS_TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
 	if _, err := Load(); err == nil {

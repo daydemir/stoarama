@@ -63,6 +63,12 @@ func TestBatchScheduleDryRunIsReadOnly(t *testing.T) {
 
 	userID, accountID := seedUserOrg(t, pool, "batch-dry-run@example.com", false)
 	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO nodes (account_id, display_name, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES ($1, 'dry-run-relay', 'relay', 'active', now(), 3)
+	`, accountID); err != nil {
+		t.Fatal(err)
+	}
 	var destID, streamID int64
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
@@ -106,6 +112,9 @@ func TestBatchScheduleDryRunIsReadOnly(t *testing.T) {
 	}
 	if !response.DryRun || response.Created != 1 || response.Updated != 0 || response.Items[0].Action != "created" {
 		t.Fatalf("response=%+v", response)
+	}
+	if response.RelayStreams != 0 || response.RequiredRelaySlots != 0 || response.OnlineRelaySlots != 3 {
+		t.Fatalf("relay capacity response=%+v", response)
 	}
 	if response.Items[0].RecordingID != 0 {
 		t.Fatalf("dry run returned nonexistent recording id %d", response.Items[0].RecordingID)

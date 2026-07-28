@@ -2,9 +2,29 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"strings"
 	"testing"
 )
+
+func TestScheduleBatchDryRunFlagSupportsExplicitFalse(t *testing.T) {
+	for _, tc := range []struct {
+		args      []string
+		wantValue bool
+	}{
+		{args: []string{"--dry-run"}, wantValue: true},
+		{args: []string{"--dry-run=false"}, wantValue: false},
+	} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		dryRun := optionalBoolFlag(fs, "dry-run")
+		if err := fs.Parse(tc.args); err != nil {
+			t.Fatalf("parse %v: %v", tc.args, err)
+		}
+		if !dryRun.set || dryRun.value != tc.wantValue {
+			t.Fatalf("parse %v = (set=%t value=%t), want value=%t", tc.args, dryRun.set, dryRun.value, tc.wantValue)
+		}
+	}
+}
 
 func TestDecodeRecordingBatchSpecStrict(t *testing.T) {
 	valid := `{"stream_ids":[1],"naming_profile":"plaza_hourly_v1","mode":"continuous","delivery":"managed","storage_destination_id":1,"active_weekdays":[1,2,3,4,5]}`

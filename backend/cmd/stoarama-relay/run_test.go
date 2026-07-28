@@ -518,6 +518,13 @@ func TestCleanupLegacyCaptureTempRequiresAgeAndExactPrefix(t *testing.T) {
 	}
 }
 
+func TestCleanupLegacyCaptureTempBestEffortIgnoresUnavailableRoot(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if removed := cleanupLegacyCaptureTempBestEffort(missing, time.Now(), 15*time.Minute); removed != 0 {
+		t.Fatalf("removed=%d want 0", removed)
+	}
+}
+
 func TestAcquireRelayRunLockPreservesContentionCause(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	first, err := acquireRelayRunLock()

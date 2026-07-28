@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -276,6 +277,50 @@ func TestFetchLatestRequiresValidManifestSignature(t *testing.T) {
 				t.Fatalf("version=%q", got.Version)
 			}
 		})
+	}
+}
+
+func TestFetchLatestAcceptsOverlappingRotationKey(t *testing.T) {
+	manifest := []byte(`{"version":"rotated1","relay":{},"ytdlp":{},"previous_version":"old1","previous_relay":{}}`)
+	oldSeed := sha256.Sum256([]byte("old relay signing key"))
+	newSeed := sha256.Sum256([]byte("new relay signing key"))
+	oldKey := ed25519.NewKeyFromSeed(oldSeed[:])
+	newKey := ed25519.NewKeyFromSeed(newSeed[:])
+	oldPublicKey := releasePublicKeyBase64
+	releasePublicKeyBase64 = strings.Join([]string{
+		base64.StdEncoding.EncodeToString(oldKey.Public().(ed25519.PublicKey)),
+		base64.StdEncoding.EncodeToString(newKey.Public().(ed25519.PublicKey)),
+	}, ",")
+	t.Cleanup(func() { releasePublicKeyBase64 = oldPublicKey })
+
+	signature := ed25519.Sign(newKey, manifest)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/relay/download/latest.json":
+			_, _ = w.Write(manifest)
+		case "/relay/download/latest.json.sig":
+			_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(signature)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	got, err := fetchLatest(server.URL, liveReleaseManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != "rotated1" {
+		t.Fatalf("version=%q", got.Version)
+	}
+}
+
+func TestReleasePublicKeysRejectsMalformedRotationSet(t *testing.T) {
+	oldPublicKey := releasePublicKeyBase64
+	releasePublicKeyBase64 = base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)) + ",invalid"
+	t.Cleanup(func() { releasePublicKeyBase64 = oldPublicKey })
+	if _, err := releasePublicKeys(); err == nil {
+		t.Fatal("malformed overlapping key set accepted")
 	}
 }
 

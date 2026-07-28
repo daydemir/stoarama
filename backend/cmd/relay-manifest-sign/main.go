@@ -11,7 +11,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage: relay-manifest-sign public|sign|verify")
+		fail("usage: relay-manifest-sign public|validate-public|sign|verify")
 	}
 	switch os.Args[1] {
 	case "public":
@@ -20,6 +20,11 @@ func main() {
 		_ = fs.Parse(os.Args[2:])
 		privateKey := loadPrivateKey(*keyFile)
 		fmt.Println(base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey)))
+	case "validate-public":
+		fs := flag.NewFlagSet("validate-public", flag.ExitOnError)
+		publicKey := fs.String("public-key", "", "base64 Ed25519 public key")
+		_ = fs.Parse(os.Args[2:])
+		_ = decodeKey("public key", *publicKey, ed25519.PublicKeySize)
 	case "sign":
 		fs := flag.NewFlagSet("sign", flag.ExitOnError)
 		keyFile := fs.String("private-key-file", "", "base64 Ed25519 private key file")

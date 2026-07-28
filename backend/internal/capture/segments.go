@@ -353,7 +353,9 @@ func deliverContinuousSegment(processed map[string]bool, path string, segment Se
 	if segment.DurationMs > 0 {
 		*nextStart = segment.EndAt
 	} else {
-		*nextStart = segment.StartAt
+		// Keep the next clip's millisecond idempotency key distinct even when
+		// ffprobe cannot determine this finalized segment's duration.
+		*nextStart = segment.StartAt.Add(time.Millisecond)
 	}
 	return nil
 }

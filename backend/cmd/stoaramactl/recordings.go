@@ -274,7 +274,7 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("recordings schedule-batch", flag.ExitOnError)
 	specPath := fs.String("spec", "", "strict JSON batch schedule spec")
-	dryRun := fs.Bool("dry-run", false, "validate the complete batch without scheduling")
+	dryRun := optionalBoolFlag(fs, "dry-run")
 	jsonOutput := fs.Bool("json", false, "print the complete JSON response for campaign postflight")
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
@@ -297,8 +297,8 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 	if err != nil {
 		log.Fatalf("decode --spec: %v", err)
 	}
-	if *dryRun {
-		spec.DryRun = true
+	if dryRun.set {
+		spec.DryRun = dryRun.value
 	}
 	var result recordingBatchResult
 	if err := postJSONWithToken(ctx, *backendAPIURL, *apiToken, "/api/v1/account/recordings/batch-schedule", spec, &result); err != nil {

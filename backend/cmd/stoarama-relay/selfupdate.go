@@ -256,9 +256,9 @@ func fetchLatest(base string, manifest releaseManifest) (latestJSON, error) {
 	if !manifest.valid() {
 		return lj, fmt.Errorf("invalid release manifest %q", manifest)
 	}
-	publicKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(releasePublicKeyBase64))
-	if err != nil || len(publicKey) != ed25519.PublicKeySize {
-		return lj, fmt.Errorf("relay release public key is invalid")
+	publicKeys, err := releasePublicKeys()
+	if err != nil {
+		return lj, err
 	}
 	manifestBytes, err := fetchReleaseFile(base, string(manifest), 1<<20)
 	if err != nil {
@@ -272,13 +272,33 @@ func fetchLatest(base string, manifest releaseManifest) (latestJSON, error) {
 	if err != nil || len(signature) != ed25519.SignatureSize {
 		return lj, fmt.Errorf("decode %s signature", manifest)
 	}
-	if !ed25519.Verify(ed25519.PublicKey(publicKey), manifestBytes, signature) {
+	verified := false
+	for _, publicKey := range publicKeys {
+		if ed25519.Verify(publicKey, manifestBytes, signature) {
+			verified = true
+			break
+		}
+	}
+	if !verified {
 		return lj, fmt.Errorf("verify %s signature", manifest)
 	}
 	if err := json.Unmarshal(manifestBytes, &lj); err != nil {
 		return lj, fmt.Errorf("decode latest.json: %w", err)
 	}
 	return lj, nil
+}
+
+func releasePublicKeys() ([]ed25519.PublicKey, error) {
+	encodedKeys := strings.Split(strings.TrimSpace(releasePublicKeyBase64), ",")
+	keys := make([]ed25519.PublicKey, 0, len(encodedKeys))
+	for _, encoded := range encodedKeys {
+		publicKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
+		if err != nil || len(publicKey) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("relay release public key is invalid")
+		}
+		keys = append(keys, ed25519.PublicKey(publicKey))
+	}
+	return keys, nil
 }
 
 func fetchReleaseFile(base, name string, maxBytes int64) ([]byte, error) {

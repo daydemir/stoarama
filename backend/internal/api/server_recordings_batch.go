@@ -306,19 +306,16 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	if requiredRelaySlots < relayStreams {
 		requiredRelaySlots = relayStreams
 	}
-	onlineRelaySlots := 0
-	if requiredRelaySlots > 0 {
-		// This is a preflight snapshot, not a reservation. The recording worker's
-		// lease limits remain the enforcement backstop if capacity changes.
-		onlineRelaySlots, err = availableRelayCapacity(r.Context(), tx, principal.AccountID, ids)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, "load relay capacity")
-			return
-		}
-		if requiredRelaySlots > onlineRelaySlots {
-			util.WriteError(w, http.StatusConflict, fmt.Sprintf("campaign requires %d relay slots, but only %d are available", requiredRelaySlots, onlineRelaySlots))
-			return
-		}
+	// This is a preflight snapshot, not a reservation. The recording worker's
+	// lease limits remain the enforcement backstop if capacity changes.
+	onlineRelaySlots, err := availableRelayCapacity(r.Context(), tx, principal.AccountID, ids)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load relay capacity")
+		return
+	}
+	if requiredRelaySlots > onlineRelaySlots {
+		util.WriteError(w, http.StatusConflict, fmt.Sprintf("campaign requires %d relay slots, but only %d are available", requiredRelaySlots, onlineRelaySlots))
+		return
 	}
 	ceiling := s.cfg.DropletPoolMax * s.cfg.DropletPoolCapacity
 	if ceiling > 0 {

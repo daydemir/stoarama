@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recsched"
@@ -129,25 +130,32 @@ func expectedHealthBins(spec recordingHealthSpec, now time.Time) ([]recordingHea
 	if boundedStart := coverageEnd.Add(-lookback); coverageStart.Before(boundedStart) {
 		coverageStart = boundedStart
 	}
-	ranges := make([]captureHealthRange, 0, int(lookback/recentHealthBinSize)+1)
-	for cursor := alignedHealthBinStart(coverageStart, recentHealthBinSize); cursor.Before(coverageEnd); cursor = cursor.Add(recentHealthBinSize) {
-		binStart, binEnd := cursor, cursor.Add(recentHealthBinSize)
-		if binStart.Before(coverageStart) {
-			binStart = coverageStart
+	cursor := alignedHealthBinStart(coverageEnd.Add(-time.Nanosecond), recentHealthBinSize)
+	newest := make([]recordingHealthBin, 0, recentHealthBinCount)
+	for cursor.Add(recentHealthBinSize).After(coverageStart) && len(newest) < recentHealthBinCount {
+		ranges := make([]captureHealthRange, 0, recentHealthBinCount)
+		for len(ranges) < recentHealthBinCount && cursor.Add(recentHealthBinSize).After(coverageStart) {
+			binStart, binEnd := cursor, cursor.Add(recentHealthBinSize)
+			if binStart.Before(coverageStart) {
+				binStart = coverageStart
+			}
+			if binEnd.After(coverageEnd) {
+				binEnd = coverageEnd
+			}
+			ranges = append(ranges, captureHealthRange{start: binStart, end: binEnd})
+			cursor = cursor.Add(-recentHealthBinSize)
 		}
-		if binEnd.After(coverageEnd) {
-			binEnd = coverageEnd
+		slices.Reverse(ranges)
+		bins, err := expectedHealthBinsInRanges(spec, ranges, coverageEnd)
+		if err != nil {
+			return nil, err
 		}
-		ranges = append(ranges, captureHealthRange{start: binStart, end: binEnd})
+		for i := len(bins) - 1; i >= 0 && len(newest) < recentHealthBinCount; i-- {
+			newest = append(newest, bins[i])
+		}
 	}
-	bins, err := expectedHealthBinsInRanges(spec, ranges, coverageEnd)
-	if err != nil {
-		return nil, err
-	}
-	if len(bins) > recentHealthBinCount {
-		bins = bins[len(bins)-recentHealthBinCount:]
-	}
-	return bins, nil
+	slices.Reverse(newest)
+	return newest, nil
 }
 
 func (s *Server) recordingHealthBinsForAccount(ctx context.Context, accountID int64, recordingIDs []int64) (map[int64][]recordingHealthBin, error) {

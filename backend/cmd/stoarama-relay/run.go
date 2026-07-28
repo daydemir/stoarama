@@ -69,11 +69,7 @@ func runRelay(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("clean relay capture temp root: %w", err)
 	}
-	legacyRemoved, err := cleanupLegacyCaptureTemp(os.TempDir(), time.Now(), 15*time.Minute)
-	if err != nil {
-		return fmt.Errorf("clean legacy relay capture temp: %w", err)
-	}
-	removed += legacyRemoved
+	removed += cleanupLegacyCaptureTempBestEffort(os.TempDir(), time.Now(), 15*time.Minute)
 	if removed > 0 {
 		log.Printf("stoarama-relay removed %d stale capture directories", removed)
 	}
@@ -345,6 +341,15 @@ func cleanupLegacyCaptureTemp(root string, now time.Time, staleAfter time.Durati
 		removed++
 	}
 	return removed, nil
+}
+
+func cleanupLegacyCaptureTempBestEffort(root string, now time.Time, staleAfter time.Duration) int {
+	removed, err := cleanupLegacyCaptureTemp(root, now, staleAfter)
+	if err != nil {
+		log.Printf("relay legacy temp cleanup skipped: %v", err)
+		return 0
+	}
+	return removed
 }
 
 func acquireRelayRunLock() (*os.File, error) {
