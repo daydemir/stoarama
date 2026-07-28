@@ -30,13 +30,15 @@ func TestSignerRoundTripRejectsTamperingAndWrongKey(t *testing.T) {
 	assertSignerFails(t, signer, "validate-public", "--public-key", "invalid")
 	runSigner(t, signer, "sign", "--private-key-file", keyPath, "--input", manifestPath, "--output", signaturePath)
 	runSigner(t, signer, "verify", "--public-key", publicKey, "--input", manifestPath, "--signature", signaturePath)
+	wrongSeed := sha256.Sum256([]byte("wrong release signer test"))
+	wrongPublic := ed25519.NewKeyFromSeed(wrongSeed[:]).Public().(ed25519.PublicKey)
+	runSigner(t, signer, "verify", "--public-key", base64.StdEncoding.EncodeToString(wrongPublic)+","+publicKey, "--input", manifestPath, "--signature", signaturePath)
+	assertSignerFails(t, signer, "verify", "--public-key", publicKey+",invalid", "--input", manifestPath, "--signature", signaturePath)
 
 	if err := os.WriteFile(manifestPath, []byte(`{"version":"tampered"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	assertSignerFails(t, signer, "verify", "--public-key", publicKey, "--input", manifestPath, "--signature", signaturePath)
-	wrongSeed := sha256.Sum256([]byte("wrong release signer test"))
-	wrongPublic := ed25519.NewKeyFromSeed(wrongSeed[:]).Public().(ed25519.PublicKey)
 	assertSignerFails(t, signer, "verify", "--public-key", base64.StdEncoding.EncodeToString(wrongPublic), "--input", manifestPath, "--signature", signaturePath)
 }
 

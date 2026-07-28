@@ -116,7 +116,7 @@ if ! aws s3 cp "s3://${R2_BUCKET}/relay-releases/latest.json.sig" "${previous_la
     --endpoint-url "${R2_ENDPOINT}" --content-type application/octet-stream --only-show-errors
 fi
 go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign verify \
-  --public-key "${RELAY_SIGNING_PUBLIC_KEY}" \
+  --public-key "${RELAY_TRUSTED_PUBLIC_KEYS}" \
   --input "${previous_latest}" \
   --signature "${previous_latest_signature}"
 PREVIOUS_VERSION="$(jq -er '.version' "${previous_latest}")"

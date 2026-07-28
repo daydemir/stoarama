@@ -41,21 +41,37 @@ func main() {
 		}
 	case "verify":
 		fs := flag.NewFlagSet("verify", flag.ExitOnError)
-		publicKey := fs.String("public-key", "", "base64 Ed25519 public key")
+		publicKeys := fs.String("public-key", "", "comma-separated base64 Ed25519 public keys")
 		input := fs.String("input", "", "manifest path")
 		signatureFile := fs.String("signature", "", "signature path")
 		_ = fs.Parse(os.Args[2:])
 		if *input == "" || *signatureFile == "" {
 			fail("--input and --signature are required")
 		}
-		public := decodeKey("public key", *publicKey, ed25519.PublicKeySize)
 		signature := decodeKey("signature", string(readFile(*signatureFile)), ed25519.SignatureSize)
-		if !ed25519.Verify(ed25519.PublicKey(public), readFile(*input), signature) {
+		manifest := readFile(*input)
+		verified := false
+		for _, public := range decodePublicKeys(*publicKeys) {
+			if ed25519.Verify(public, manifest, signature) {
+				verified = true
+				break
+			}
+		}
+		if !verified {
 			fail("manifest signature verification failed")
 		}
 	default:
 		fail("unknown command %q", os.Args[1])
 	}
+}
+
+func decodePublicKeys(encoded string) []ed25519.PublicKey {
+	parts := strings.Split(strings.TrimSpace(encoded), ",")
+	keys := make([]ed25519.PublicKey, 0, len(parts))
+	for _, part := range parts {
+		keys = append(keys, ed25519.PublicKey(decodeKey("public key", part, ed25519.PublicKeySize)))
+	}
+	return keys
 }
 
 func loadPrivateKey(path string) ed25519.PrivateKey {
