@@ -4,7 +4,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -153,10 +155,17 @@ func TestEnsureRollbackBaselineBootstrapsOldUpdater(t *testing.T) {
 			},
 		},
 	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature := setTestReleaseSigningKey(t, manifestBytes)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/relay/download/latest-candidate1.json":
-			_ = json.NewEncoder(w).Encode(manifest)
+			_, _ = w.Write(manifestBytes)
+		case "/relay/download/latest-candidate1.json.sig":
+			_, _ = w.Write([]byte(signature))
 		case "/relay/download/stable.tar.gz":
 			_, _ = w.Write(artifact)
 		default:
@@ -180,6 +189,104 @@ func TestEnsureRollbackBaselineBootstrapsOldUpdater(t *testing.T) {
 	if !bytes.Equal(previous, previousBinary) || previousManifest != "latest-stable1.json" {
 		t.Fatalf("rollback baseline=(%q,%q)", previous, previousManifest)
 	}
+}
+
+func TestPrepareSelfUpdatesToleratesUnconfiguredBuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldVersion := version
+	oldPublicKey := releasePublicKeyBase64
+	version = "dev"
+	releasePublicKeyBase64 = ""
+	t.Cleanup(func() {
+		version = oldVersion
+		releasePublicKeyBase64 = oldPublicKey
+	})
+	enabled, err := prepareSelfUpdates(relayConfig{APIURL: "https://stoarama.invalid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled {
+		t.Fatal("self-updates enabled without a signed rollback baseline")
+	}
+}
+
+func TestPrepareSelfUpdatesFailsClosedForConfiguredBuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldVersion := version
+	oldPublicKey := releasePublicKeyBase64
+	version = "signed1"
+	releasePublicKeyBase64 = base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
+	t.Cleanup(func() {
+		version = oldVersion
+		releasePublicKeyBase64 = oldPublicKey
+	})
+	enabled, err := prepareSelfUpdates(relayConfig{APIURL: "://invalid"})
+	if err == nil || enabled {
+		t.Fatalf("prepareSelfUpdates=(%v,%v) want disabled error", enabled, err)
+	}
+}
+
+func TestFetchLatestRequiresValidManifestSignature(t *testing.T) {
+	manifest := []byte(`{"version":"signed1","relay":{},"ytdlp":{},"previous_version":"old1","previous_relay":{}}`)
+	seed := sha256.Sum256([]byte("stoarama relay manifest test key"))
+	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	oldPublicKey := releasePublicKeyBase64
+	releasePublicKeyBase64 = base64.StdEncoding.EncodeToString(publicKey)
+	t.Cleanup(func() { releasePublicKeyBase64 = oldPublicKey })
+
+	for _, test := range []struct {
+		name      string
+		manifest  []byte
+		signature []byte
+		wantError bool
+	}{
+		{name: "valid", manifest: manifest, signature: ed25519.Sign(privateKey, manifest)},
+		{name: "tampered", manifest: append(append([]byte(nil), manifest...), ' '), signature: ed25519.Sign(privateKey, manifest), wantError: true},
+		{name: "wrong key", manifest: manifest, signature: ed25519.Sign(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)), manifest), wantError: true},
+		{name: "unsigned", manifest: manifest, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/relay/download/latest.json":
+					_, _ = w.Write(test.manifest)
+				case "/relay/download/latest.json.sig":
+					if len(test.signature) == 0 {
+						http.NotFound(w, r)
+						return
+					}
+					_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(test.signature)))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			got, err := fetchLatest(server.URL, liveReleaseManifest)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("unsigned or invalid manifest accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Version != "signed1" {
+				t.Fatalf("version=%q", got.Version)
+			}
+		})
+	}
+}
+
+func setTestReleaseSigningKey(t *testing.T, manifest []byte) string {
+	t.Helper()
+	seed := sha256.Sum256([]byte(t.Name()))
+	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	oldPublicKey := releasePublicKeyBase64
+	releasePublicKeyBase64 = base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
+	t.Cleanup(func() { releasePublicKeyBase64 = oldPublicKey })
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, manifest))
 }
 
 func testRelayTarball(t *testing.T, binary []byte) []byte {

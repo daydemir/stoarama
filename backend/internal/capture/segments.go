@@ -80,6 +80,14 @@ func CaptureSegment(ctx context.Context, sourceURL string, duration time.Duratio
 }
 
 func CaptureSegmentWithHeaders(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int, inputHeaders string) (Segment, error) {
+	return CaptureSegmentInDirWithHeaders(ctx, sourceURL, duration, pinHost, targetFPS, "", inputHeaders)
+}
+
+// CaptureSegmentInDirWithHeaders is CaptureSegmentWithHeaders with an explicit
+// parent directory. Relays use their persistent app-owned temp root so a crash
+// can be scavenged on restart; an empty parent preserves the cloud worker's
+// OS-temporary behavior.
+func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int, tempDir, inputHeaders string) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
 	}
@@ -87,7 +95,7 @@ func CaptureSegmentWithHeaders(ctx context.Context, sourceURL string, duration t
 		return Segment{}, fmt.Errorf("segment duration must be > 0")
 	}
 
-	tmpDir, err := os.MkdirTemp("", "capture-segment-*")
+	tmpDir, err := os.MkdirTemp(tempDir, "capture-segment-*")
 	if err != nil {
 		return Segment{}, fmt.Errorf("mktemp: %w", err)
 	}
@@ -276,20 +284,7 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 			if err != nil {
 				return err
 			}
-			// Chain the start along the continuous media timeline so coverage is
-			// exactly back-to-back. The first segment anchors at its own strftime
-			// open instant; later segments start where the previous one ended.
-			if !nextStart.IsZero() {
-				seg.StartAt = nextStart
-				seg.EndAt = seg.StartAt.Add(time.Duration(seg.DurationMs) * time.Millisecond)
-			}
-			if seg.DurationMs > 0 {
-				nextStart = seg.EndAt
-			} else {
-				nextStart = seg.StartAt
-			}
-			processed[path] = true
-			if err := onSegment(seg); err != nil {
+			if err := deliverContinuousSegment(processed, path, seg, &nextStart, onSegment); err != nil {
 				return err
 			}
 		}
@@ -308,13 +303,14 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 		case err := <-waitErr:
 			// ffmpeg exited on its own (stream ended or a hard error). Sweep whatever
 			// finalized segments remain, then surface the error if it was non-clean.
-			if sweepErr := sweepFinal(true); sweepErr != nil {
-				return sweepErr
-			}
+			sweepErr := sweepFinal(true)
 			if err != nil {
-				return fmt.Errorf("continuous ffmpeg exited: %w (%s)", err, strings.TrimSpace(stderr.String()))
+				return errors.Join(
+					fmt.Errorf("continuous ffmpeg exited: %w (%s)", err, strings.TrimSpace(stderr.String())),
+					sweepErr,
+				)
 			}
-			return nil
+			return sweepErr
 		case <-ticker.C:
 			outputSizes, err := continuousOutputSizes(outDir)
 			if err != nil {
@@ -330,16 +326,36 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 			if err := continuousWatchdogError(now, startedAt, lastProgressAt, sawProgress, startupTimeout, progressTimeout); err != nil {
 				stopFFmpeg()
 				if sweepErr := sweepFinal(true); sweepErr != nil {
-					return fmt.Errorf("%w; finalize stalled output: %v", err, sweepErr)
+					return errors.Join(err, fmt.Errorf("finalize stalled output: %w", sweepErr))
 				}
 				return err
 			}
 			if err := sweepFinal(false); err != nil {
 				stopFFmpeg()
+				if finalErr := sweepFinal(true); finalErr != nil {
+					return errors.Join(err, fmt.Errorf("finalize after delivery failure: %w", finalErr))
+				}
 				return err
 			}
 		}
 	}
+}
+
+func deliverContinuousSegment(processed map[string]bool, path string, segment Segment, nextStart *time.Time, deliver func(Segment) error) error {
+	if !nextStart.IsZero() {
+		segment.StartAt = *nextStart
+		segment.EndAt = segment.StartAt.Add(time.Duration(segment.DurationMs) * time.Millisecond)
+	}
+	if err := deliver(segment); err != nil {
+		return err
+	}
+	processed[path] = true
+	if segment.DurationMs > 0 {
+		*nextStart = segment.EndAt
+	} else {
+		*nextStart = segment.StartAt
+	}
+	return nil
 }
 
 func continuousOutputSizes(outDir string) (map[string]int64, error) {

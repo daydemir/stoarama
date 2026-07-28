@@ -1,0 +1,19 @@
+{
+  "stream_ids": [94, 178, 179, 182, 293, 295, 469, 487, 2666, 2667, 2681, 2693, 2713, 2717, 2718, 2720, 2726, 2963, 2997, 3001, 3002, 3006, 3007, 3018, 3021, 3022, 3023, 3025, 3027, 3039, 3040, 3049, 17238, 17241, 17242, 17244, 17245, 17248, 17249],
+  "stream_timezones": [],
+  "naming_profile": "plaza_hourly_v1",
+  "mode": "continuous",
+  "cron_expr": "",
+  "clip_duration_sec": 60,
+  "daily_window_start": "08:00",
+  "daily_window_end": "20:00",
+  "active_weekdays": [1, 2, 3, 4, 5, 6, 7],
+  "target_fps": null,
+  "start_at": "2026-08-01T07:00:00Z",
+  "end_at": "2026-08-19T07:00:00Z",
+  "storage_destination_id": 9223372036854775807,
+  "delivery_storage_destination_id": 0,
+  "delivery": "nas_pull",
+  "dry_run": true,
+  "required_relay_slots": 0
+}

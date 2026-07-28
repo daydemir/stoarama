@@ -474,7 +474,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	rows.Close()
-	healthBins, err := s.recordingHealthBinsForAccount(r.Context(), principal.AccountID, recordingIDs, false)
+	healthBins, err := s.recordingHealthBinsForAccount(r.Context(), principal.AccountID, recordingIDs)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
 		return
@@ -492,50 +492,23 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		fleetRelayAvailableSlots int
 		fleetRelayWarning        bool
 	)
-	if err := s.pool.QueryRow(r.Context(), `
-		WITH relay_nodes AS (
-		  SELECT n.id, n.status, n.relay_max_streams, n.last_heartbeat_at,
-		    n.relay_group_id, g.max_streams AS relay_group_max_streams,
-		    (SELECT COUNT(*) FROM recording_jobs j
-		     WHERE j.lease_owner='node:'||n.id::text AND j.status='leased' AND j.lease_expires_at > now()) AS live_leases
-		  FROM nodes n
-		  LEFT JOIN relay_groups g ON g.id=n.relay_group_id AND g.account_id=n.account_id
-		  WHERE n.account_id=$1 AND n.node_type='relay'
-		    AND `+visibleNodeSQL+`
-		),
-		group_slots AS (
-		  SELECT relay_group_id,
-		    GREATEST(LEAST(
-		      MAX(relay_group_max_streams) - SUM(live_leases),
-		      COALESCE(SUM(GREATEST(relay_max_streams-live_leases, 0)) FILTER (
-		        WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds'), 0)
-		    ), 0)::int AS available_slots
-		  FROM relay_nodes
-		  WHERE relay_group_id IS NOT NULL
-		  GROUP BY relay_group_id
-		),
-		fleet AS (
-		  SELECT
-		    COUNT(*)::int AS total,
-		    COUNT(*) FILTER (WHERE status='active' AND last_heartbeat_at >= now()-interval '120 seconds')::int AS online,
-		    COALESCE(SUM(live_leases), 0)::int AS live_leases,
-		    (COALESCE(SUM(GREATEST(relay_max_streams-live_leases, 0)) FILTER (
-		       WHERE relay_group_id IS NULL AND status='active' AND last_heartbeat_at >= now()-interval '120 seconds'), 0)
-		     + COALESCE((SELECT SUM(available_slots) FROM group_slots), 0))::int AS available_slots
-		  FROM relay_nodes
-		),
-		has_active_relay_rec AS (
-		  SELECT EXISTS (
-		    SELECT 1 FROM recordings rec
-		    WHERE rec.account_id=$1 AND rec.status='active' AND rec.capture_via='relay'
-		      AND rec.start_at <= now() AND (rec.end_at IS NULL OR now() < rec.end_at)
-		  ) AS val
-		)
-		SELECT f.total, f.online, f.live_leases, f.available_slots,
-		       (f.online = 0 AND h.val) AS fleet_relay_warning
-		FROM fleet f, has_active_relay_rec h
-	`, principal.AccountID).Scan(&fleetRelayTotal, &fleetRelayOnline, &fleetRelayLiveLeases, &fleetRelayAvailableSlots, &fleetRelayWarning); err != nil {
+	availability, err := loadRelayAvailability(r.Context(), s.pool, principal.AccountID, []int64{})
+	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute fleet relay stats: %v", err))
+		return
+	}
+	fleetRelayTotal = availability.total
+	fleetRelayOnline = availability.online
+	fleetRelayLiveLeases = availability.live
+	fleetRelayAvailableSlots = availability.available
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT EXISTS (
+		  SELECT 1 FROM recordings rec
+		  WHERE rec.account_id=$1 AND rec.status='active' AND rec.capture_via='relay'
+		    AND rec.start_at <= now() AND (rec.end_at IS NULL OR now() < rec.end_at)
+		) AND $2=0
+	`, principal.AccountID, fleetRelayOnline).Scan(&fleetRelayWarning); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute fleet relay warning: %v", err))
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
@@ -1383,20 +1356,7 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
-	if err := s.attachCaptureHealthBins(r.Context(), principal.AccountID, id, item); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
-		return
-	}
 	util.WriteJSON(w, http.StatusOK, item)
-}
-
-func (s *Server) attachCaptureHealthBins(ctx context.Context, accountID, id int64, item map[string]any) error {
-	healthBins, err := s.recordingHealthBinsForAccount(ctx, accountID, []int64{id}, true)
-	if err != nil {
-		return err
-	}
-	item["capture_health_bins"] = healthBins[id]
-	return nil
 }
 
 // writeRecordingJSON re-reads one recording under the account scope and writes it
@@ -1416,8 +1376,6 @@ func (s *Server) writeRecordingJSON(w http.ResponseWriter, r *http.Request, id, 
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
-	// The mutation has already committed; health history is optional response enrichment.
-	_ = s.attachCaptureHealthBins(r.Context(), accountID, id, item)
 	util.WriteJSON(w, http.StatusOK, item)
 }
 

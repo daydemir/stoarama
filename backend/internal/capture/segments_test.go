@@ -2,6 +2,7 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,6 +273,78 @@ func TestContinuousOutputAdvancedIgnoresDeletionAndDetectsEqualTotalReplacement(
 		map[string]int64{"a.mp4": 100},
 	) {
 		t.Fatalf("unchanged segment must not count as progress")
+	}
+}
+
+func TestFinalizedSegmentRetryKeepsTimelineIdentity(t *testing.T) {
+	processed := map[string]bool{}
+	nextStart := time.Time{}
+	attempts := 0
+	delivered := make([]Segment, 0, 2)
+	segment := Segment{
+		StartAt:    time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		EndAt:      time.Date(2026, 7, 28, 12, 1, 0, 0, time.UTC),
+		DurationMs: 60_000,
+	}
+	deliver := func(got Segment) error {
+		attempts++
+		delivered = append(delivered, got)
+		if attempts == 1 {
+			return errors.New("temporary delivery failure")
+		}
+		return nil
+	}
+	if err := deliverContinuousSegment(processed, "segment.mp4", segment, &nextStart, deliver); err == nil {
+		t.Fatal("first delivery unexpectedly succeeded")
+	}
+	if processed["segment.mp4"] {
+		t.Fatal("failed delivery marked segment processed")
+	}
+	if !nextStart.IsZero() {
+		t.Fatalf("failed delivery advanced timeline to %s", nextStart)
+	}
+	if err := deliverContinuousSegment(processed, "segment.mp4", segment, &nextStart, deliver); err != nil {
+		t.Fatal(err)
+	}
+	if !processed["segment.mp4"] || attempts != 2 {
+		t.Fatalf("processed=%v attempts=%d", processed["segment.mp4"], attempts)
+	}
+	if !delivered[0].StartAt.Equal(delivered[1].StartAt) || !delivered[0].EndAt.Equal(delivered[1].EndAt) {
+		t.Fatalf("retry changed segment identity: first=%+v second=%+v", delivered[0], delivered[1])
+	}
+}
+
+func TestFinalizedSegmentRetryWithExistingTimelineDoesNotAdvanceUntilAck(t *testing.T) {
+	processed := map[string]bool{}
+	initialNext := time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC)
+	nextStart := initialNext
+	segment := Segment{
+		StartAt:    time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		EndAt:      time.Date(2026, 7, 28, 12, 1, 0, 0, time.UTC),
+		DurationMs: 60_000,
+	}
+	var delivered []Segment
+	deliver := func(got Segment) error {
+		delivered = append(delivered, got)
+		if len(delivered) == 1 {
+			return errors.New("temporary delivery failure")
+		}
+		return nil
+	}
+	if err := deliverContinuousSegment(processed, "segment.mp4", segment, &nextStart, deliver); err == nil {
+		t.Fatal("first delivery unexpectedly succeeded")
+	}
+	if !nextStart.Equal(initialNext) {
+		t.Fatalf("failed delivery advanced timeline to %s", nextStart)
+	}
+	if err := deliverContinuousSegment(processed, "segment.mp4", segment, &nextStart, deliver); err != nil {
+		t.Fatal(err)
+	}
+	if len(delivered) != 2 || !delivered[0].StartAt.Equal(initialNext) || !delivered[1].StartAt.Equal(initialNext) {
+		t.Fatalf("retry changed existing timeline identity: %+v", delivered)
+	}
+	if want := initialNext.Add(time.Minute); !nextStart.Equal(want) {
+		t.Fatalf("acknowledged timeline=%s want %s", nextStart, want)
 	}
 }
 

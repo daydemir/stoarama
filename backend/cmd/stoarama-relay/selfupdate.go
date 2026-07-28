@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -23,6 +25,7 @@ import (
 )
 
 var lastUpdaterUnix atomic.Int64
+var releasePublicKeyBase64 string
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
 // binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
@@ -253,24 +256,54 @@ func fetchLatest(base string, manifest releaseManifest) (latestJSON, error) {
 	if !manifest.valid() {
 		return lj, fmt.Errorf("invalid release manifest %q", manifest)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/relay/download/"+string(manifest), nil)
+	publicKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(releasePublicKeyBase64))
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		return lj, fmt.Errorf("relay release public key is invalid")
+	}
+	manifestBytes, err := fetchReleaseFile(base, string(manifest), 1<<20)
 	if err != nil {
-		return lj, fmt.Errorf("build latest.json request: %w", err)
+		return lj, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	signatureBytes, err := fetchReleaseFile(base, string(manifest)+".sig", 1<<10)
 	if err != nil {
-		return lj, fmt.Errorf("fetch latest.json: %w", err)
+		return lj, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return lj, fmt.Errorf("fetch latest.json: status=%d", resp.StatusCode)
+	signature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(signatureBytes)))
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return lj, fmt.Errorf("decode %s signature", manifest)
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&lj); err != nil {
+	if !ed25519.Verify(ed25519.PublicKey(publicKey), manifestBytes, signature) {
+		return lj, fmt.Errorf("verify %s signature", manifest)
+	}
+	if err := json.Unmarshal(manifestBytes, &lj); err != nil {
 		return lj, fmt.Errorf("decode latest.json: %w", err)
 	}
 	return lj, nil
+}
+
+func fetchReleaseFile(base, name string, maxBytes int64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/relay/download/"+name, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build %s request: %w", name, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: status=%d", name, resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d bytes", name, maxBytes)
+	}
+	return data, nil
 }
 
 func (cfg relayConfig) updateManifest() releaseManifest {

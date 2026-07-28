@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -18,19 +21,26 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingworker"
 )
 
 const heartbeatInterval = 30 * time.Second
+const dnsProbeInterval = 5 * time.Minute
+const dnsProbeTimeout = 2 * time.Second
 const offlineDiagnosticLimit = 8
 const offlineDiagnosticMaxBytes = 8 << 10
 const recoveryStateMaxBytes = 16 << 10
+const captureTempScanEntryLimit = 512
+
+var errCaptureTempScanTruncated = errors.New("capture temp scan truncated")
 
 const (
 	relayExitClean          = "clean"
 	relayExitSelfUpdate     = "self_update"
 	relayExitUncleanProcess = "unclean_process"
+	relayExitProcessError   = "process_error"
 )
 
 type offlineDiagnosticKind string
@@ -73,6 +83,24 @@ type relayRecoveryState struct {
 	LastUpdaterAt   time.Time `json:"last_updater_at,omitempty"`
 	LastError       string    `json:"last_error,omitempty"`
 	ErrorTail       []string  `json:"error_tail,omitempty"`
+}
+
+type networkCounters struct {
+	RXBytes   uint64 `json:"rx_bytes"`
+	RXPackets uint64 `json:"rx_packets"`
+	RXDrops   uint64 `json:"rx_drops"`
+	RXErrors  uint64 `json:"rx_errors"`
+	TXBytes   uint64 `json:"tx_bytes"`
+	TXPackets uint64 `json:"tx_packets"`
+	TXDrops   uint64 `json:"tx_drops"`
+	TXErrors  uint64 `json:"tx_errors"`
+}
+
+type dnsProbeTelemetry struct {
+	CheckedAt time.Time         `json:"checked_at"`
+	LatencyMS int64             `json:"latency_ms"`
+	OK        bool              `json:"ok"`
+	Error     offlineErrorClass `json:"error_class,omitempty"`
 }
 
 var recoveryStateMu sync.Mutex
@@ -173,7 +201,200 @@ func bootID() string {
 	return strings.TrimSpace(string(b))
 }
 
-func relayHealthSnapshot(dataDir string) map[string]any {
+func networkCounterSnapshot() (networkCounters, bool) {
+	switch runtime.GOOS {
+	case "linux":
+		return linuxNetworkCounters()
+	case "darwin":
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, "/usr/sbin/netstat", "-ibn").Output()
+		if err != nil {
+			return networkCounters{}, false
+		}
+		counters, err := parseDarwinNetworkCounters(bytes.NewReader(output))
+		return counters, err == nil
+	default:
+		return networkCounters{}, false
+	}
+}
+
+func linuxNetworkCounters() (networkCounters, bool) {
+	file, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return networkCounters{}, false
+	}
+	defer file.Close()
+	counters, err := parseNetworkCounters(io.LimitReader(file, 64<<10))
+	return counters, err == nil
+}
+
+func parseNetworkCounters(reader io.Reader) (networkCounters, error) {
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return networkCounters{}, err
+	}
+	var total networkCounters
+	interfaces := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		name, fieldsRaw, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(name) == "lo" {
+			continue
+		}
+		fields := strings.Fields(fieldsRaw)
+		if len(fields) < 16 {
+			continue
+		}
+		values := make([]uint64, 16)
+		valid := true
+		for i := range values {
+			values[i], err = strconv.ParseUint(fields[i], 10, 64)
+			if err != nil {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		total.RXBytes += values[0]
+		total.RXPackets += values[1]
+		total.RXErrors += values[2]
+		total.RXDrops += values[3]
+		total.TXBytes += values[8]
+		total.TXPackets += values[9]
+		total.TXErrors += values[10]
+		total.TXDrops += values[11]
+		interfaces++
+	}
+	if interfaces == 0 {
+		return networkCounters{}, fmt.Errorf("no network interfaces")
+	}
+	return total, nil
+}
+
+func parseDarwinNetworkCounters(reader io.Reader) (networkCounters, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, 256<<10))
+	if err != nil {
+		return networkCounters{}, err
+	}
+	indexes := map[string]int{}
+	perInterface := map[string]networkCounters{}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "Name" {
+			clear(indexes)
+			for index, name := range fields {
+				indexes[name] = index
+			}
+			continue
+		}
+		if len(indexes) == 0 || strings.HasPrefix(fields[0], "lo") {
+			continue
+		}
+		required := []string{"Ipkts", "Ierrs", "Ibytes", "Opkts", "Oerrs", "Obytes"}
+		valid := true
+		values := map[string]uint64{}
+		for _, name := range required {
+			index, ok := indexes[name]
+			if !ok || index >= len(fields) {
+				valid = false
+				break
+			}
+			values[name], err = strconv.ParseUint(fields[index], 10, 64)
+			if err != nil {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		current := perInterface[fields[0]]
+		current.RXPackets = max(current.RXPackets, values["Ipkts"])
+		current.RXErrors = max(current.RXErrors, values["Ierrs"])
+		current.RXBytes = max(current.RXBytes, values["Ibytes"])
+		current.TXPackets = max(current.TXPackets, values["Opkts"])
+		current.TXErrors = max(current.TXErrors, values["Oerrs"])
+		current.TXBytes = max(current.TXBytes, values["Obytes"])
+		if index, ok := indexes["Drop"]; ok && index < len(fields) {
+			if drops, parseErr := strconv.ParseUint(fields[index], 10, 64); parseErr == nil {
+				current.TXDrops = max(current.TXDrops, drops)
+			}
+		}
+		perInterface[fields[0]] = current
+	}
+	if len(perInterface) == 0 {
+		return networkCounters{}, fmt.Errorf("no network interfaces")
+	}
+	var total networkCounters
+	for _, counters := range perInterface {
+		total.RXBytes += counters.RXBytes
+		total.RXPackets += counters.RXPackets
+		total.RXErrors += counters.RXErrors
+		total.RXDrops += counters.RXDrops
+		total.TXBytes += counters.TXBytes
+		total.TXPackets += counters.TXPackets
+		total.TXErrors += counters.TXErrors
+		total.TXDrops += counters.TXDrops
+	}
+	return total, nil
+}
+
+func dnsProbeHost(apiURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(apiURL))
+	if err != nil {
+		return "", err
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("API URL has no hostname")
+	}
+	return host, nil
+}
+
+func dnsProbe(ctx context.Context, host string) dnsProbeTelemetry {
+	started := time.Now()
+	probeCtx, cancel := context.WithTimeout(ctx, dnsProbeTimeout)
+	defer cancel()
+	_, err := net.DefaultResolver.LookupHost(probeCtx, host)
+	return newDNSProbeTelemetry(started, time.Now(), err)
+}
+
+func newDNSProbeTelemetry(started, finished time.Time, err error) dnsProbeTelemetry {
+	result := dnsProbeTelemetry{
+		CheckedAt: finished.UTC(),
+		LatencyMS: finished.Sub(started).Milliseconds(),
+		OK:        err == nil,
+	}
+	if err != nil {
+		result.Error = classifyOfflineError(err)
+	}
+	return result
+}
+
+func dnsProbeLoop(ctx context.Context, host string, latest *atomic.Pointer[dnsProbeTelemetry]) {
+	run := func() {
+		result := dnsProbe(ctx, host)
+		latest.Store(&result)
+	}
+	run()
+	ticker := time.NewTicker(dnsProbeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+func relayHealthSnapshot(dataDir, tempDir string) map[string]any {
 	health := map[string]any{"runtime_goos": runtime.GOOS, "runtime_goarch": runtime.GOARCH}
 	if id := bootID(); id != "" {
 		health["boot_id"] = id
@@ -194,13 +415,78 @@ func relayHealthSnapshot(dataDir string) map[string]any {
 			}
 		}
 	}
+	if network, ok := networkCounterSnapshot(); ok {
+		health["network"] = network
+	}
 	var stat syscall.Statfs_t
 	if dataDir != "" {
 		if err := syscall.Statfs(dataDir, &stat); err == nil && stat.Blocks > 0 {
-			health["disk_free_bytes"] = stat.Bavail * uint64(stat.Bsize)
+			free := stat.Bavail * uint64(stat.Bsize)
+			health["disk_free_bytes"] = free
+			if reason := relayCapacityBlock(free); reason != "" {
+				health["capacity_blocked"] = reason
+			}
+		}
+	}
+	if tempDir != "" {
+		if bytes, dirs, truncated, err := directoryUsage(tempDir); err == nil {
+			health["capture_temp_bytes"] = bytes
+			health["capture_temp_directories"] = dirs
+			if truncated {
+				health["capture_temp_scan_truncated"] = true
+			}
 		}
 	}
 	return health
+}
+
+func relayCapacityBlock(free uint64) string {
+	if free < relayMinLeaseFreeBytes {
+		return "disk_pressure"
+	}
+	return ""
+}
+
+func directoryUsage(root string) (uint64, int, bool, error) {
+	var bytes uint64
+	dirs := 0
+	entries := 0
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			if removedDuringDirectoryScan(root, path, err) {
+				return nil
+			}
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		entries++
+		if entries > captureTempScanEntryLimit {
+			return errCaptureTempScanTruncated
+		}
+		if entry.IsDir() {
+			dirs++
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		bytes += uint64(info.Size())
+		return nil
+	})
+	if errors.Is(err, errCaptureTempScanTruncated) {
+		return bytes, dirs, true, nil
+	}
+	return bytes, dirs, false, err
+}
+
+func removedDuringDirectoryScan(root, path string, err error) bool {
+	return path != root && errors.Is(err, os.ErrNotExist)
 }
 
 func appendDiagnosticErrors(existing, incoming []string) []string {
@@ -239,6 +525,66 @@ func markRelayExit(reason string) {
 	if err := state.persist(path); err != nil {
 		log.Printf("relay recovery state persist error: %v", err)
 	}
+}
+
+func recordSystemdExit(args []string) error {
+	values := map[string]string{}
+	for _, arg := range args {
+		name, value, ok := strings.Cut(arg, "=")
+		if !ok {
+			continue
+		}
+		switch name {
+		case "--service-result", "--exit-code", "--exit-status":
+			value = strings.TrimSpace(value)
+			if !safeExitFact(value) {
+				continue
+			}
+			values[name] = value
+		}
+	}
+	result := values["--service-result"]
+	if result == "" {
+		return nil
+	}
+	reason := relayExitClean
+	if result != "success" {
+		reason = "systemd_" + result
+		if value := values["--exit-code"]; value != "" {
+			reason += "_" + value
+		}
+		if value := values["--exit-status"]; value != "" {
+			reason += "_" + value
+		}
+	}
+	path := recoveryStatePath()
+	if path == "" {
+		return nil
+	}
+	state, err := loadRecoveryState(path)
+	if err != nil {
+		state = &relayRecoveryState{}
+	}
+	if state.PreviousExit == relayExitSelfUpdate {
+		return nil
+	}
+	state.PreviousExit = reason
+	return state.persist(path)
+}
+
+func safeExitFact(value string) bool {
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') &&
+			(char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') &&
+			char != '_' && char != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func restartAfterSelfUpdate() error {
@@ -481,7 +827,7 @@ func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
 // 30s. External probes run independently so a slow resolver cannot block liveness.
 // POST /api/v1/node/heartbeat sets last_heartbeat_at and merges the reported keys into
 // nodes.capabilities_jsonb.
-func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, diag relayDiagnostics, startedAt time.Time, firstSent chan<- struct{}) {
+func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, diag relayDiagnostics, startedAt time.Time, tempDir, apiURL string, firstSent chan<- struct{}) {
 	diagnosticsPath := ""
 	relayDataDir := ""
 	if home, err := stoaramaHome(); err == nil {
@@ -495,16 +841,10 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		recovery = &relayRecoveryState{}
 	}
 	previousRecovery := *recovery
-	recoveryPending := previousRecovery.PreviousExit != "" && previousRecovery.PreviousExit != relayExitClean && previousRecovery.PreviousExit != relayExitSelfUpdate
 	recovery.BootID = bootID()
 	recovery.StartedAt = startedAt
-	if previousRecovery.StartedAt.IsZero() {
-		recovery.PreviousExit = "unknown"
-	} else if previousRecovery.BootID != "" && previousRecovery.BootID != recovery.BootID {
-		recovery.PreviousExit = "unclean_reboot"
-	} else {
-		recovery.PreviousExit = relayExitUncleanProcess
-	}
+	recoveryPending, reportedPreviousExit := classifyPreviousRelayExit(previousRecovery, recovery.BootID)
+	recovery.PreviousExit = relayExitUncleanProcess
 	if err := recovery.persist(recoveryPath); err != nil {
 		log.Printf("relay recovery state persist error: %v", err)
 	}
@@ -515,7 +855,13 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 	}
 	bd, _ := binDir()
 	var ffmpegInfo atomic.Pointer[ffmpegTelemetry]
+	var dnsInfo atomic.Pointer[dnsProbeTelemetry]
 	go func() { ffmpegInfo.Store(loadFFmpegTelemetry(bd)) }()
+	if host, err := dnsProbeHost(apiURL); err != nil {
+		log.Printf("relay DNS probe disabled: %v", err)
+	} else {
+		go dnsProbeLoop(ctx, host, &dnsInfo)
+	}
 
 	send := func() {
 		probe := pr.snapshot()
@@ -523,15 +869,19 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		if experimentalCookieMode() {
 			mode = "with_cookies"
 		}
+		health := relayHealthSnapshot(relayDataDir, tempDir)
+		if info := dnsInfo.Load(); info != nil {
+			health["dns_probe"] = info
+		}
 		caps := map[string]any{
 			"youtube_mode":     mode,
 			"active_jobs":      active.Load(),
 			"relay_version":    version,
 			"relay_started_at": startedAt,
-			"health":           relayHealthSnapshot(relayDataDir),
+			"health":           health,
 		}
 		if recoveryPending {
-			caps["recovery"] = map[string]any{"recovered_at": time.Now().UTC(), "previous_exit": recovery.PreviousExit, "boot_id": previousRecovery.BootID, "started_at": previousRecovery.StartedAt, "last_heartbeat_at": previousRecovery.LastHeartbeatAt, "last_capture_at": previousRecovery.LastCaptureAt, "last_upload_at": previousRecovery.LastUploadAt, "last_updater_at": previousRecovery.LastUpdaterAt, "error_tail": previousRecovery.ErrorTail}
+			caps["recovery"] = map[string]any{"recovered_at": time.Now().UTC(), "previous_exit": reportedPreviousExit, "boot_id": previousRecovery.BootID, "started_at": previousRecovery.StartedAt, "last_heartbeat_at": previousRecovery.LastHeartbeatAt, "last_capture_at": previousRecovery.LastCaptureAt, "last_upload_at": previousRecovery.LastUploadAt, "last_updater_at": previousRecovery.LastUpdaterAt, "error_tail": previousRecovery.ErrorTail, "log_tail": relayLogTail(relayLogPath(relayDataDir))}
 		}
 		if probe.ranOnce {
 			caps["youtube_ready"] = probe.ready
@@ -571,9 +921,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		if hasOffline {
 			caps["offline_diagnostics"] = offline
 		}
-		hctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		err := client.NodeHeartbeat(hctx, caps)
-		cancel()
+		err := sendNodeHeartbeat(ctx, client, caps)
 		if err != nil && ctx.Err() == nil {
 			sanitized := recordingworker.SanitizeDiagnosticError(err)
 			recovery.LastError = sanitized
@@ -613,4 +961,140 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			send()
 		}
 	}
+}
+
+func classifyPreviousRelayExit(previous relayRecoveryState, currentBootID string) (bool, string) {
+	if previous.PreviousExit == relayExitClean || previous.PreviousExit == relayExitSelfUpdate {
+		return false, ""
+	}
+	if previous.StartedAt.IsZero() {
+		if previous.PreviousExit == "" {
+			return false, ""
+		}
+		return true, "unknown"
+	}
+	if previous.BootID != "" && currentBootID != "" && previous.BootID != currentBootID {
+		return true, "unclean_reboot"
+	}
+	if previous.PreviousExit == "" {
+		return true, relayExitUncleanProcess
+	}
+	return true, previous.PreviousExit
+}
+
+func relayLogTail(path string) []string {
+	if path == "" {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	const maxTailBytes = 64 << 10
+	info, err := file.Stat()
+	if err != nil {
+		return nil
+	}
+	offset := max(int64(0), info.Size()-maxTailBytes)
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxTailBytes))
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(data), "\n")
+	tail := make([]string, 0, 8)
+	for _, line := range lines {
+		if category := relayLogCategory(line); category != "" {
+			tail = append(tail, category)
+		}
+	}
+	if len(tail) > 8 {
+		tail = tail[len(tail)-8:]
+	}
+	return tail
+}
+
+func relayLogCategory(line string) string {
+	line = strings.ToLower(line)
+	relayCategories := [...]struct {
+		needle string
+		label  string
+	}{
+		{"relay heartbeat error", "relay.heartbeat_error"},
+		{"relay recovery state", "relay.recovery_state_error"},
+		{"relay diagnostics", "relay.diagnostics_error"},
+		{"relay self-update", "relay.self_update"},
+		{"stoarama-relay removed", "relay.temp_cleanup"},
+		{"stoarama-relay run", "relay.started"},
+	}
+	for _, category := range relayCategories {
+		if strings.Contains(line, category.needle) {
+			return category.label
+		}
+	}
+	if !strings.Contains(line, "recording worker") {
+		return ""
+	}
+	categories := [...]struct {
+		needle string
+		label  string
+	}{
+		{"segment delivery failed", "recording_worker.segment_delivery_failed"},
+		{"continuous resolve failed", "recording_worker.resolve_failed"},
+		{"continuous source dropped", "recording_worker.source_dropped"},
+		{"continuous ssrf guard rejected", "recording_worker.ssrf_rejected"},
+		{"lease paused", "recording_worker.lease_paused"},
+		{"lease expired", "recording_worker.lease_expired"},
+		{"lease error", "recording_worker.lease_error"},
+		{"heartbeat error", "recording_worker.heartbeat_error"},
+		{"disk check failed", "recording_worker.disk_check_failed"},
+		{"surrender failed", "recording_worker.surrender_failed"},
+		{"complete failed", "recording_worker.complete_failed"},
+		{"recording worker", "recording_worker.event"},
+	}
+	for _, category := range categories {
+		if strings.Contains(line, category.needle) {
+			return category.label
+		}
+	}
+	return ""
+}
+
+func sendNodeHeartbeat(ctx context.Context, client *recordingapi.Client, caps map[string]any) error {
+	const attempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		hctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		lastErr = client.NodeHeartbeat(hctx, caps)
+		cancel()
+		if lastErr == nil || ctx.Err() != nil || !retryableNodeHeartbeatError(lastErr) {
+			return lastErr
+		}
+		if attempt < attempts {
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return lastErr
+}
+
+func retryableNodeHeartbeatError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *apihttp.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Code == 408 || statusErr.Code == 425 || statusErr.Code == 429 || statusErr.Code >= 500
+	}
+	var networkErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) ||
+		(errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()))
 }

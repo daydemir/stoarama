@@ -51,15 +51,36 @@ type Config struct {
 	// this long without a successfully ingested segment. Zero keeps cloud workers
 	// on their existing window-long retry behavior.
 	ContinuousNoProgressTimeout time.Duration
+	// CaptureTempDir owns relay capture attempts outside the OS-wide temporary
+	// directory. Empty preserves the cloud worker's existing behavior.
+	CaptureTempDir string
+	// DiskFreeBytes and the thresholds are relay-only safety gates. The server
+	// remains authoritative for stream capacity; these prevent a full local disk
+	// from making the relay or host unhealthy.
+	DiskFreeBytes      func() (uint64, error)
+	MinLeaseFreeBytes  uint64
+	MinActiveFreeBytes uint64
 }
 
 type Worker struct {
 	cfg               Config
 	heartbeatInt      time.Duration
 	leaseSafetyMargin time.Duration
+	lastDiskPauseLog  time.Time
+	lastDiskErrorLog  atomic.Int64
 }
 
-var errSegmentDelivery = errors.New("segment delivery failed")
+var (
+	errSegmentDelivery          = errors.New("segment delivery failed")
+	errPermanentSegmentDelivery = errors.New("permanent segment delivery failure")
+	errSegmentDeliveryExhausted = errors.New("segment delivery retry budget exhausted")
+)
+
+const segmentDeliveryRetryDelay = 5 * time.Second
+const segmentDeliveryRetryBudget = 2 * time.Minute
+const postWindowDeliveryGrace = 2 * time.Minute
+const diskPauseLogInterval = 5 * time.Minute
+const diskErrorLogInterval = 5 * time.Minute
 
 func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.Client == nil {
@@ -146,6 +167,10 @@ func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
 // at capacity.
 func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGroup) {
 	for {
+		if !w.diskHasSpace(w.cfg.MinLeaseFreeBytes) {
+			w.logDiskPause(time.Now())
+			return
+		}
 		select {
 		case sem <- struct{}{}:
 		default:
@@ -186,12 +211,25 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 	}
 }
 
+func (w *Worker) logDiskPause(now time.Time) {
+	if !w.lastDiskPauseLog.IsZero() && now.Sub(w.lastDiskPauseLog) < diskPauseLogInterval {
+		return
+	}
+	w.lastDiskPauseLog = now
+	log.Printf("recording worker lease paused: disk free space is below %d bytes", w.cfg.MinLeaseFreeBytes)
+}
+
 // processJob runs the full capture pipeline for one job. It re-validates the URL
 // against the SSRF guard immediately before ffmpeg (defeating DNS rebinding),
 // runs a per-job heartbeat that can cancel the capture, and fails the job on any
 // error so it is retried or surfaced.
 func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) {
 	w.cfg.RelayDiagnostics.Start(job)
+	if err := w.ensureCaptureTempDir(); err != nil {
+		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
+		w.fail(ctx, job.JobID, err)
+		return
+	}
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -235,7 +273,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "capturing")
 	captureCtx, captureCancel := context.WithTimeout(jobCtx, capture.SegmentCaptureTimeout(clipDuration))
-	seg, err := capture.CaptureSegmentWithHeaders(captureCtx, sourceURL, clipDuration, "", job.TargetFPS, inputHeaders)
+	seg, err := capture.CaptureSegmentInDirWithHeaders(captureCtx, sourceURL, clipDuration, "", job.TargetFPS, w.cfg.CaptureTempDir, inputHeaders)
 	captureCancel()
 	if err != nil {
 		if canceled() {
@@ -308,6 +346,11 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 // the same per-second keys (idempotent).
 func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.RecordingJob) {
 	w.cfg.RelayDiagnostics.Start(job)
+	if err := w.ensureCaptureTempDir(); err != nil {
+		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
+		w.fail(ctx, job.JobID, err)
+		return
+	}
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -330,65 +373,83 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// that produced the segment it is ingesting. segmentIngested flips true when a
 	// segment is delivered in the current attempt, which the supervisor uses to reset
 	// the reconnect backoff (a healthy attempt that later drops must not inherit a
-	// grown delay).
+	// grown delay). CaptureContinuous invokes onSegment synchronously, so these
+	// delivery fields are owned by this job goroutine and require no locking.
 	var sourceURL string
 	var segmentIngested bool
+	var segmentDeliveryPending bool
 	lastProgressAt := time.Now()
 	onSegment := func(seg capture.Segment) error {
+		segmentDeliveryPending = true
+		if !w.diskHasSpace(w.cfg.MinActiveFreeBytes) {
+			return errDiskPressure
+		}
 		if canceled() {
-			return nil
+			return context.Canceled
 		}
 		segStartMs := seg.StartAt.UTC().UnixMilli()
-		w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
-		intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType, segStartMs)
-		if err != nil {
-			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_reserve_upload_failed", err)
-			return fmt.Errorf("%w: reserve segment upload: %v", errSegmentDelivery, err)
-		}
-		w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
-		uploadCtx, uploadCancel := context.WithTimeout(jobCtx, recordingapi.UploadTimeout)
-		err = uploadWithRetry(uploadCtx, job.JobID, func(attemptCtx context.Context) error {
-			return w.cfg.Client.UploadFile(attemptCtx, intent.UploadURL, seg.Path, seg.MIMEType)
-		}, func(err error, delay time.Duration) {
-			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_retry", err)
-			log.Printf("recording worker job=%d recording=%d segment upload failed: %v; retrying in %s",
-				job.JobID, job.RecordingID, err, delay)
-		})
-		uploadCancel()
-		if err != nil {
-			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_failed", err)
-			return fmt.Errorf("%w: upload segment: %v", errSegmentDelivery, err)
-		}
-		w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
-		if _, err := w.cfg.Client.IngestClip(jobCtx, recordingapi.IngestClipRequest{
-			IntentID:     intent.IntentID,
-			JobID:        job.JobID,
-			SizeBytes:    seg.SizeBytes,
-			SHA256:       seg.SHA256,
-			DurationMs:   seg.DurationMs,
-			VideoCodec:   seg.VideoCodec,
-			AudioCodec:   seg.AudioCodec,
-			AudioPresent: seg.AudioPresent,
-			ActualFPS:    seg.ActualFPS,
-			Container:    seg.Container,
-			ResolvedURL:  sourceURL,
-			ClipStartAt:  seg.StartAt,
-			ClipEndAt:    seg.EndAt,
-		}); err != nil {
-			// A 409 means this exact segment key already ingested (a re-leased window
-			// re-capturing the same wall-clock second). Treat as already-done so a
-			// re-lease is idempotent rather than failing the whole window.
-			if isAlreadyIngested(err) {
-				segmentIngested = true
-				lastProgressAt = time.Now()
-				capture.RemoveSegmentFile(seg)
-				w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
-				return nil
+		segmentCtx, segmentCancel := continuousSegmentDeliveryContext(jobCtx, job.WindowEndAt, time.Now())
+		defer segmentCancel()
+		var intent *recordingapi.ClipUploadIntent
+		uploaded := false
+		err := retrySegmentDelivery(segmentCtx, segmentDeliveryRetryDelay, func() bool {
+			return w.diskHasSpace(w.cfg.MinActiveFreeBytes)
+		}, func() error {
+			if intent == nil {
+				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
+				reserved, err := w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, seg.MIMEType, segStartMs)
+				if err != nil {
+					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_reserve_upload_failed", err)
+					return fmt.Errorf("%w: reserve segment upload: %w", errSegmentDelivery, err)
+				}
+				intent = &reserved
 			}
-			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
-			return fmt.Errorf("%w: ingest segment: %v", errSegmentDelivery, err)
+			if !uploaded {
+				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
+				uploadCtx, uploadCancel := context.WithTimeout(segmentCtx, recordingapi.UploadTimeout)
+				err := w.cfg.Client.UploadFile(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType)
+				uploadCancel()
+				if err != nil {
+					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_failed", err)
+					intent = nil
+					return fmt.Errorf("%w: upload segment: %w", errSegmentDelivery, err)
+				}
+				uploaded = true
+			}
+			w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
+			_, err := w.cfg.Client.IngestClip(segmentCtx, recordingapi.IngestClipRequest{
+				IntentID:     intent.IntentID,
+				JobID:        job.JobID,
+				SizeBytes:    seg.SizeBytes,
+				SHA256:       seg.SHA256,
+				DurationMs:   seg.DurationMs,
+				VideoCodec:   seg.VideoCodec,
+				AudioCodec:   seg.AudioCodec,
+				AudioPresent: seg.AudioPresent,
+				ActualFPS:    seg.ActualFPS,
+				Container:    seg.Container,
+				ResolvedURL:  sourceURL,
+				ClipStartAt:  seg.StartAt,
+				ClipEndAt:    seg.EndAt,
+			})
+			if err != nil && !isAlreadyIngested(err) {
+				w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
+				return fmt.Errorf("%w: ingest segment: %w", errSegmentDelivery, err)
+			}
+			return nil
+		}, func(err error) {
+			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_delivery_retry", err)
+			log.Printf("recording worker job=%d recording=%d segment delivery failed: %v; retrying in %s",
+				job.JobID, job.RecordingID, err, segmentDeliveryRetryDelay)
+		})
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && jobCtx.Err() == nil {
+				return fmt.Errorf("%w: %v", errSegmentDeliveryExhausted, err)
+			}
+			return err
 		}
 		segmentIngested = true
+		segmentDeliveryPending = false
 		lastProgressAt = time.Now()
 		capture.RemoveSegmentFile(seg)
 		w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
@@ -472,7 +533,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// Fresh outDir per attempt, removed immediately after the attempt returns: a
 		// previous attempt's leftover seg-*.mp4 would otherwise be re-finalized and
 		// re-ingested by the next CaptureContinuous call.
-		outDir, err := os.MkdirTemp("", "capture-continuous-*")
+		outDir, err := os.MkdirTemp(w.cfg.CaptureTempDir, "capture-continuous-*")
 		if err != nil {
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("mktemp continuous outdir: %w", err))
 			w.fail(ctx, job.JobID, fmt.Errorf("mktemp continuous outdir: %w", err))
@@ -480,12 +541,32 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_capturing")
 		captureErr := capture.CaptureContinuousWithHeaders(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment, inputHeaders)
-		os.RemoveAll(outDir)
+		if shouldCleanupContinuousAttempt(segmentDeliveryPending, captureErr) {
+			if removeErr := os.RemoveAll(outDir); removeErr != nil {
+				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
+			}
+		}
 
+		if errors.Is(captureErr, errDiskPressure) {
+			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderDiskPressure, errDiskPressure)
+			return
+		}
+		windowClosed := continuousShouldStop(canceled(), windowCtx.Err() != nil)
+		if continuousDeliveryFailureShouldFail(captureErr, windowClosed) {
+			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", captureErr)
+			w.fail(ctx, job.JobID, captureErr)
+			return
+		}
 		// Window close vs premature drop: CaptureContinuous returns nil on ctx.Done,
 		// so windowCtx.Err() (NOT captureErr) is what distinguishes a real window
 		// close/cancel from a premature clean ffmpeg exit (HLS end-of-stream).
-		if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+		if windowClosed {
+			if segmentDeliveryPending {
+				err := fmt.Errorf("continuous window closed with an unacknowledged segment")
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "delivery_incomplete", err)
+				log.Printf("recording worker job=%d recording=%d %v", job.JobID, job.RecordingID, err)
+				return
+			}
 			break
 		}
 		// Premature exit (clean end-of-stream or a hard ffmpeg error) with the window
@@ -524,20 +605,54 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
 }
 
+var errDiskPressure = errors.New("relay disk pressure")
+
+func (w *Worker) diskHasSpace(min uint64) bool {
+	if min == 0 || w.cfg.DiskFreeBytes == nil {
+		return true
+	}
+	free, err := w.cfg.DiskFreeBytes()
+	if err != nil {
+		if w.shouldLogDiskError(time.Now()) {
+			log.Printf("recording worker disk check failed: %v", err)
+		}
+		return false
+	}
+	w.lastDiskErrorLog.Store(0)
+	return free >= min
+}
+
+func (w *Worker) shouldLogDiskError(now time.Time) bool {
+	current := now.UnixNano()
+	for {
+		previous := w.lastDiskErrorLog.Load()
+		if previous != 0 && now.Sub(time.Unix(0, previous)) < diskErrorLogInterval {
+			return false
+		}
+		if w.lastDiskErrorLog.CompareAndSwap(previous, current) {
+			return true
+		}
+	}
+}
+
 func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, lastProgressAt time.Time) bool {
 	if !continuousNoProgressExpired(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout) {
 		return false
 	}
 	err := fmt.Errorf("continuous relay made no progress for %s", w.cfg.ContinuousNoProgressTimeout)
+	return w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
+}
+
+func (w *Worker) surrenderContinuousJobForReason(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, reason recordingapi.SurrenderReason, cause error) bool {
 	cancel()
 	surrenderCtx, surrenderCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer surrenderCancel()
-	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, recordingapi.SurrenderNoProgress); surrenderErr != nil {
+	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, reason); surrenderErr != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "surrender_failed", surrenderErr)
 		log.Printf("recording worker job=%d surrender failed: %v", job.JobID, surrenderErr)
 		return true
 	}
-	w.cfg.RelayDiagnostics.Finish(job.JobID, "surrendered", err)
+	w.cfg.RelayDiagnostics.Finish(job.JobID, "surrendered", cause)
 	return true
 }
 
@@ -561,6 +676,11 @@ func continuousShouldStop(canceled, windowClosed bool) bool {
 	return canceled || windowClosed
 }
 
+func continuousDeliveryFailureShouldFail(captureErr error, windowClosed bool) bool {
+	return errors.Is(captureErr, errPermanentSegmentDelivery) ||
+		(!windowClosed && errors.Is(captureErr, errSegmentDeliveryExhausted))
+}
+
 // reconnectBackoff returns a deterministic per-job jittered delay. It starts at
 // 1-2s for fast recovery after a healthy source drop and grows to 2.5-5m for a
 // persistently dead source without synchronizing every job against one origin.
@@ -579,18 +699,25 @@ func jitteredDelay(jobID int64, attempt int, nominal time.Duration) time.Duratio
 	return nominal * time.Duration(50+hash%51) / 100
 }
 
-func uploadWithRetry(ctx context.Context, jobID int64, upload func(context.Context) error, onRetry func(error, time.Duration)) error {
-	const attempts = 3
-	const attemptTimeout = 90 * time.Second
-	for attempt := 1; ; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		err := upload(attemptCtx)
-		cancel()
-		if err == nil || attempt == attempts || !retryableUploadError(ctx, err) {
+func retrySegmentDelivery(ctx context.Context, delay time.Duration, hasSpace func() bool, deliver func() error, onRetry func(error)) error {
+	for {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		delay := jitteredDelay(jobID, attempt, time.Duration(1<<(attempt-1))*time.Second)
-		onRetry(err, delay)
+		if !hasSpace() {
+			return errDiskPressure
+		}
+		err := deliver()
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !retryableTransportError(ctx, err) {
+			return fmt.Errorf("%w: %v", errPermanentSegmentDelivery, err)
+		}
+		onRetry(err)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -601,7 +728,36 @@ func uploadWithRetry(ctx context.Context, jobID int64, upload func(context.Conte
 	}
 }
 
-func retryableUploadError(ctx context.Context, err error) bool {
+func continuousSegmentDeliveryContext(jobCtx context.Context, windowEnd *time.Time, now time.Time) (context.Context, context.CancelFunc) {
+	deadline := now.Add(segmentDeliveryRetryBudget)
+	if windowEnd != nil && !windowEnd.IsZero() {
+		postWindowDeadline := windowEnd.UTC().Add(postWindowDeliveryGrace)
+		if postWindowDeadline.Before(deadline) {
+			deadline = postWindowDeadline
+		}
+	}
+	return context.WithDeadline(jobCtx, deadline)
+}
+
+func shouldCleanupContinuousAttempt(deliveryPending bool, captureErr error) bool {
+	return !deliveryPending ||
+		errors.Is(captureErr, context.Canceled) ||
+		errors.Is(captureErr, errDiskPressure) ||
+		errors.Is(captureErr, errPermanentSegmentDelivery) ||
+		errors.Is(captureErr, errSegmentDeliveryExhausted)
+}
+
+func (w *Worker) ensureCaptureTempDir() error {
+	if strings.TrimSpace(w.cfg.CaptureTempDir) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(w.cfg.CaptureTempDir, 0o700); err != nil {
+		return fmt.Errorf("create capture temp directory: %w", err)
+	}
+	return nil
+}
+
+func retryableTransportError(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
 	}

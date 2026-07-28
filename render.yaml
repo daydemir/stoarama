@@ -66,6 +66,18 @@ services:
         value: 60m
       - key: SESSION_TTL
         value: 720h
+      - key: MIT_SCL_RECORDINGS_READ_ACCOUNT_ID
+        sync: false
+      - key: MIT_SCL_RECORDINGS_READ_SLUG
+        value: mit-scl
+      - key: MIT_SCL_RECORDINGS_READ_PASSWORD
+        sync: false
+      - key: MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY
+        generateValue: true
+      - key: MIT_SCL_RECORDINGS_TRUSTED_PROXY_CIDRS
+        # Optional. Unset safely rate-limits by direct peer and ignores forwarded
+        # headers. Configure only verified immediate proxy CIDRs.
+        sync: false
       - key: EMAIL_FROM
         sync: false
       - key: EMAIL_REPLY_TO

@@ -14,6 +14,7 @@ VERSION="$4"
 : "${R2_BUCKET:?R2_BUCKET is required}"
 : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
 : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
+: "${RELAY_SIGNING_PUBLIC_KEY:?RELAY_SIGNING_PUBLIC_KEY is required}"
 command -v aws >/dev/null || { echo "error: aws CLI is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
 
@@ -21,7 +22,9 @@ endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 stage="$(mktemp -d)"
 trap 'rm -rf "${stage}"' EXIT
 candidate="${stage}/candidate.json"
+candidate_signature="${stage}/candidate.json.sig"
 live="${stage}/live.json"
+live_signature="${stage}/live.json.sig"
 
 download() {
   aws s3 cp "s3://${R2_BUCKET}/relay-releases/$1" "$2" \
@@ -33,6 +36,12 @@ require_object() {
 }
 
 download "latest-${VERSION}.json" "${candidate}"
+download "latest-${VERSION}.json.sig" "${candidate_signature}"
+go run -C "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
+  ./cmd/relay-manifest-sign verify \
+  --public-key "${RELAY_SIGNING_PUBLIC_KEY}" \
+  --input "${candidate}" \
+  --signature "${candidate_signature}"
 jq -e --arg version "${VERSION}" '
   .version == $version and
   ([.relay, .ytdlp] | all(type == "object" and length == 4)) and
@@ -46,6 +55,12 @@ require_object "install-${VERSION}.sh"
 require_object "uninstall-${VERSION}.sh"
 
 download "latest.json" "${live}"
+download "latest.json.sig" "${live_signature}"
+go run -C "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
+  ./cmd/relay-manifest-sign verify \
+  --public-key "${RELAY_SIGNING_PUBLIC_KEY}" \
+  --input "${live}" \
+  --signature "${live_signature}"
 live_version="$(jq -er '.version' "${live}")"
 require_object "latest-${live_version}.json"
 if [[ "${MODE}" == "promote" ]]; then
@@ -69,6 +84,8 @@ aws s3 cp "s3://${R2_BUCKET}/relay-releases/install-${VERSION}.sh" \
 aws s3 cp "s3://${R2_BUCKET}/relay-releases/uninstall-${VERSION}.sh" \
   "s3://${R2_BUCKET}/relay-releases/uninstall.sh" --endpoint-url "${endpoint}" \
   --content-type text/x-shellscript --only-show-errors
+aws s3 cp "${candidate_signature}" "s3://${R2_BUCKET}/relay-releases/latest.json.sig" \
+  --endpoint-url "${endpoint}" --content-type application/octet-stream --only-show-errors
 aws s3 cp "${candidate}" "s3://${R2_BUCKET}/relay-releases/latest.json" \
   --endpoint-url "${endpoint}" --content-type application/json --only-show-errors
 
