@@ -74,6 +74,7 @@ var (
 	errSegmentDelivery          = errors.New("segment delivery failed")
 	errPermanentSegmentDelivery = errors.New("permanent segment delivery failure")
 	errSegmentDeliveryExhausted = errors.New("segment delivery retry budget exhausted")
+	errReplaySegmentDelivery    = errors.New("segment delivery must reserve again")
 )
 
 const segmentDeliveryRetryDelay = 5 * time.Second
@@ -300,30 +301,33 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 		w.fail(ctx, job.JobID, fmt.Errorf("reserve clip upload: %w", err))
 		return
 	}
-	w.cfg.RelayDiagnostics.Stage(job.JobID, "uploading")
-	if err := w.cfg.Client.UploadFile(jobCtx, intent.UploadURL, seg.Path, seg.MIMEType); err != nil {
-		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("upload clip: %w", err))
-		w.fail(ctx, job.JobID, fmt.Errorf("upload clip: %w", err))
-		return
-	}
-	w.cfg.RelayDiagnostics.Stage(job.JobID, "ingesting")
-	if _, err := w.cfg.Client.IngestClip(jobCtx, recordingapi.IngestClipRequest{
-		IntentID:     intent.IntentID,
-		JobID:        job.JobID,
-		SizeBytes:    seg.SizeBytes,
-		SHA256:       seg.SHA256,
-		DurationMs:   seg.DurationMs,
-		VideoCodec:   seg.VideoCodec,
-		AudioCodec:   seg.AudioCodec,
-		AudioPresent: seg.AudioPresent,
-		ActualFPS:    seg.ActualFPS,
-		Container:    seg.Container,
-		ResolvedURL:  sourceURL,
-		ClipStartAt:  seg.StartAt,
-		ClipEndAt:    seg.EndAt,
-	}); err != nil {
-		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("ingest clip: %w", err))
-		w.fail(ctx, job.JobID, fmt.Errorf("ingest clip: %w", err))
+	if err := deliverReservedClip(intent,
+		func() error {
+			w.cfg.RelayDiagnostics.Stage(job.JobID, "uploading")
+			return w.cfg.Client.UploadFile(jobCtx, intent.UploadURL, seg.Path, seg.MIMEType)
+		},
+		func() error {
+			w.cfg.RelayDiagnostics.Stage(job.JobID, "ingesting")
+			_, err := w.cfg.Client.IngestClip(jobCtx, recordingapi.IngestClipRequest{
+				IntentID:     intent.IntentID,
+				JobID:        job.JobID,
+				SizeBytes:    seg.SizeBytes,
+				SHA256:       seg.SHA256,
+				DurationMs:   seg.DurationMs,
+				VideoCodec:   seg.VideoCodec,
+				AudioCodec:   seg.AudioCodec,
+				AudioPresent: seg.AudioPresent,
+				ActualFPS:    seg.ActualFPS,
+				Container:    seg.Container,
+				ResolvedURL:  sourceURL,
+				ClipStartAt:  seg.StartAt,
+				ClipEndAt:    seg.EndAt,
+			})
+			return err
+		},
+	); err != nil {
+		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
+		w.fail(ctx, job.JobID, err)
 		return
 	}
 	w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
@@ -390,53 +394,50 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		segStartMs := seg.StartAt.UTC().UnixMilli()
 		segmentCtx, segmentCancel := continuousSegmentDeliveryContext(jobCtx, job.WindowEndAt, time.Now())
 		defer segmentCancel()
-		var intent *recordingapi.ClipUploadIntent
-		uploaded := false
-		err := retrySegmentDelivery(segmentCtx, segmentDeliveryRetryDelay, func() bool {
+		err := deliverSegmentWithRetry(segmentCtx, segmentDeliveryRetryDelay, func() bool {
 			return w.diskHasSpace(w.cfg.MinActiveFreeBytes)
-		}, func() error {
-			if intent == nil {
+		}, segmentDeliveryOps{
+			Reserve: func() (recordingapi.ClipUploadIntent, error) {
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
 				reserved, err := w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, seg.MIMEType, segStartMs)
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_reserve_upload_failed", err)
-					return fmt.Errorf("%w: reserve segment upload: %w", errSegmentDelivery, err)
 				}
-				intent = &reserved
-			}
-			if !uploaded {
+				return reserved, err
+			},
+			Upload: func(intent recordingapi.ClipUploadIntent) error {
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
 				uploadCtx, uploadCancel := context.WithTimeout(segmentCtx, recordingapi.UploadTimeout)
 				err := w.cfg.Client.UploadFile(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType)
 				uploadCancel()
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_failed", err)
-					intent = nil
-					return fmt.Errorf("%w: upload segment: %w", errSegmentDelivery, err)
 				}
-				uploaded = true
-			}
-			w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
-			_, err := w.cfg.Client.IngestClip(segmentCtx, recordingapi.IngestClipRequest{
-				IntentID:     intent.IntentID,
-				JobID:        job.JobID,
-				SizeBytes:    seg.SizeBytes,
-				SHA256:       seg.SHA256,
-				DurationMs:   seg.DurationMs,
-				VideoCodec:   seg.VideoCodec,
-				AudioCodec:   seg.AudioCodec,
-				AudioPresent: seg.AudioPresent,
-				ActualFPS:    seg.ActualFPS,
-				Container:    seg.Container,
-				ResolvedURL:  sourceURL,
-				ClipStartAt:  seg.StartAt,
-				ClipEndAt:    seg.EndAt,
-			})
-			if err != nil && !isAlreadyIngested(err) {
-				w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
-				return fmt.Errorf("%w: ingest segment: %w", errSegmentDelivery, err)
-			}
-			return nil
+				return err
+			},
+			Ingest: func(intent recordingapi.ClipUploadIntent) error {
+				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
+				_, err := w.cfg.Client.IngestClip(segmentCtx, recordingapi.IngestClipRequest{
+					IntentID:     intent.IntentID,
+					JobID:        job.JobID,
+					SizeBytes:    seg.SizeBytes,
+					SHA256:       seg.SHA256,
+					DurationMs:   seg.DurationMs,
+					VideoCodec:   seg.VideoCodec,
+					AudioCodec:   seg.AudioCodec,
+					AudioPresent: seg.AudioPresent,
+					ActualFPS:    seg.ActualFPS,
+					Container:    seg.Container,
+					ResolvedURL:  sourceURL,
+					ClipStartAt:  seg.StartAt,
+					ClipEndAt:    seg.EndAt,
+				})
+				if err != nil {
+					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
+					return err
+				}
+				return nil
+			},
 		}, func(err error) {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_delivery_retry", err)
 			log.Printf("recording worker job=%d recording=%d segment delivery failed: %v; retrying in %s",
@@ -605,6 +606,62 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
 }
 
+type segmentDeliveryOps struct {
+	Reserve func() (recordingapi.ClipUploadIntent, error)
+	Upload  func(recordingapi.ClipUploadIntent) error
+	Ingest  func(recordingapi.ClipUploadIntent) error
+}
+
+func deliverReservedClip(intent recordingapi.ClipUploadIntent, upload, ingest func() error) error {
+	if intent.AlreadyIngested {
+		return nil
+	}
+	if err := upload(); err != nil {
+		return fmt.Errorf("upload clip: %w", err)
+	}
+	if err := ingest(); err != nil {
+		return fmt.Errorf("ingest clip: %w", err)
+	}
+	return nil
+}
+
+func deliverSegmentWithRetry(ctx context.Context, retryDelay time.Duration, diskOK func() bool, ops segmentDeliveryOps, onRetry func(error)) error {
+	var intent *recordingapi.ClipUploadIntent
+	uploaded := false
+	return retrySegmentDelivery(ctx, retryDelay, diskOK, func() error {
+		if intent == nil {
+			reserved, err := ops.Reserve()
+			if err != nil {
+				return fmt.Errorf("%w: reserve segment upload: %w", errSegmentDelivery, err)
+			}
+			intent = &reserved
+		}
+		if intent.AlreadyIngested {
+			return nil
+		}
+		if !uploaded {
+			if err := ops.Upload(*intent); err != nil {
+				return fmt.Errorf("%w: upload segment: %w", errSegmentDelivery, err)
+			}
+			uploaded = true
+		}
+		if err := ops.Ingest(*intent); err != nil {
+			if isAlreadyIngested(err) {
+				return nil
+			}
+			if retryableTransportError(ctx, err) || isUploadIntentStateConflict(err) {
+				intent = nil
+				uploaded = false
+				if isUploadIntentStateConflict(err) {
+					return fmt.Errorf("%w: %v", errReplaySegmentDelivery, err)
+				}
+			}
+			return fmt.Errorf("%w: ingest segment: %w", errSegmentDelivery, err)
+		}
+		return nil
+	}, onRetry)
+}
+
 var errDiskPressure = errors.New("relay disk pressure")
 
 func (w *Worker) diskHasSpace(min uint64) bool {
@@ -761,6 +818,9 @@ func retryableTransportError(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
 	}
+	if errors.Is(err, errReplaySegmentDelivery) {
+		return true
+	}
 	var statusErr *apihttp.StatusError
 	if errors.As(err, &statusErr) {
 		return statusErr.Code == 408 || statusErr.Code == 425 || statusErr.Code == 429 || statusErr.Code >= 500
@@ -773,11 +833,11 @@ func retryableTransportError(ctx context.Context, err error) bool {
 // signal (a clip already exists for this object key), which for a re-leased
 // continuous window means the segment is already stored and must not fail the job.
 func isAlreadyIngested(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "status=409") || strings.Contains(msg, "already exists for this object key")
+	return recordingapi.ErrorCodeFrom(err) == recordingapi.ErrorCodeClipAlreadyIngested
+}
+
+func isUploadIntentStateConflict(err error) bool {
+	return recordingapi.ErrorCodeFrom(err) == recordingapi.ErrorCodeUploadIntentUnavailable
 }
 
 // startHeartbeat extends the lease on a ticker; on a cancel signal it cancels the

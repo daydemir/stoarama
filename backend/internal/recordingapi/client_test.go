@@ -2,6 +2,7 @@ package recordingapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,49 @@ import (
 	"testing"
 	"time"
 )
+
+func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
+	type receivedRequest struct {
+		idempotencyKey string
+		payload        map[string]any
+		err            error
+	}
+	received := make(chan receivedRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		err := json.NewDecoder(r.Body).Decode(&payload)
+		received <- receivedRequest{
+			idempotencyKey: r.Header.Get("Idempotency-Key"),
+			payload:        payload,
+			err:            err,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"intent_id":"intent-1"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := client.ReserveClipUpload(context.Background(), 42, "video/mp4", 1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.IntentID != "intent-1" {
+		t.Fatalf("intent=%q", intent.IntentID)
+	}
+	request := <-received
+	if request.err != nil {
+		t.Fatal(request.err)
+	}
+	if request.idempotencyKey != "recording-seg-42-1234" {
+		t.Fatalf("Idempotency-Key=%q", request.idempotencyKey)
+	}
+	if request.payload["job_id"] != float64(42) || request.payload["segment_start_ms"] != float64(1234) {
+		t.Fatalf("payload=%v", request.payload)
+	}
+}
 
 func TestUploadUsesLongerTimeoutThanAPIRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

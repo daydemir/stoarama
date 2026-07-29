@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+var errContinuousSegmentDelivery = errors.New("continuous segment delivery failed")
+
 const (
 	SegmentTargetFPS       = 30
 	DefaultSegmentDuration = 30 * time.Second
@@ -332,8 +334,10 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 			}
 			if err := sweepFinal(false); err != nil {
 				stopFFmpeg()
-				if finalErr := sweepFinal(true); finalErr != nil {
-					return errors.Join(err, fmt.Errorf("finalize after delivery failure: %w", finalErr))
+				if !errors.Is(err, errContinuousSegmentDelivery) {
+					if finalErr := sweepFinal(true); finalErr != nil {
+						return errors.Join(err, fmt.Errorf("finalize after sweep failure: %w", finalErr))
+					}
 				}
 				return err
 			}
@@ -347,7 +351,7 @@ func deliverContinuousSegment(processed map[string]bool, path string, segment Se
 		segment.EndAt = segment.StartAt.Add(time.Duration(segment.DurationMs) * time.Millisecond)
 	}
 	if err := deliver(segment); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errContinuousSegmentDelivery, err)
 	}
 	processed[path] = true
 	if segment.DurationMs > 0 {

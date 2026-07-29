@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -319,6 +320,14 @@ type recordingUploadIntentRequest struct {
 	SegmentStartMs int64 `json:"segment_start_ms"`
 }
 
+type recordingUploadIntentStatus string
+
+const (
+	recordingUploadIntentPending  recordingUploadIntentStatus = "pending"
+	recordingUploadIntentConsumed recordingUploadIntentStatus = "consumed"
+	recordingUploadIntentExpired  recordingUploadIntentStatus = "expired"
+)
+
 // handleRecordingUploadIntent presigns a PUT against the USER's bucket for a clip
 // belonging to a job the caller currently holds the lease on (S-2). User S3
 // credentials never leave the API; the worker only receives a presigned URL.
@@ -326,9 +335,6 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 	principal, ok := nodePrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	if !s.requireIdempotency(w, r, "POST:/api/v1/recording/upload-intents") {
 		return
 	}
 	if s.secrets == nil {
@@ -449,15 +455,75 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 	}
 	objectKey := storageObjectKey(keyPrefix, displayPath)
 	maxSize := int64(clipDurationSec) * recordingMaxBitrateBytesPerSec
-	intentID := uuid.New()
 	expiresAt := time.Now().UTC().Add(s.cfg.R2SignPutTTL)
 
-	if _, err := s.pool.Exec(r.Context(), `
-		INSERT INTO recording_upload_intents
-			(id, recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path, mime_type, max_size_bytes, status, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11)
-	`, intentID, recordingID, req.JobID, destID, endpoint, bucket, objectKey, displayPath, mimeType, maxSize, expiresAt); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("record upload intent: %v", err))
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin upload intent reservation: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	lockKey := fmt.Sprintf("%d:%d:%s:%s:%s", req.JobID, destID, endpoint, bucket, objectKey)
+	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, lockKey); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock upload intent reservation: %v", err))
+		return
+	}
+
+	intentID := uuid.New()
+	responseStatus := http.StatusCreated
+	var status recordingUploadIntentStatus
+	err = tx.QueryRow(r.Context(), `
+			SELECT id, status
+			FROM recording_upload_intents
+			WHERE recording_job_id=$1 AND storage_destination_id=$2
+			  AND endpoint=$3 AND bucket=$4 AND object_key=$5
+			ORDER BY CASE status WHEN 'consumed' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+			         created_at DESC, id DESC
+			LIMIT 1
+			FOR UPDATE
+		`, req.JobID, destID, endpoint, bucket, objectKey).Scan(&intentID, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		intentID = uuid.New()
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO recording_upload_intents
+				(id, recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path, mime_type, max_size_bytes, status, expires_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11)
+		`, intentID, recordingID, req.JobID, destID, endpoint, bucket, objectKey, displayPath, mimeType, maxSize, expiresAt); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("record upload intent: %v", err))
+			return
+		}
+	} else if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load replayed upload intent: %v", err))
+		return
+	} else {
+		if status == recordingUploadIntentConsumed {
+			if err := tx.Commit(r.Context()); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit replayed upload intent: %v", err))
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, map[string]any{
+				"intent_id":        intentID.String(),
+				"object_key":       objectKey,
+				"already_ingested": true,
+			})
+			return
+		}
+		if status != recordingUploadIntentPending && status != recordingUploadIntentExpired {
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("upload intent cannot be replayed from status %q", status))
+			return
+		}
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE recording_upload_intents
+			SET status='pending', mime_type=$2, max_size_bytes=$3, expires_at=$4
+			WHERE id=$1
+		`, intentID, mimeType, maxSize, expiresAt); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("refresh replayed upload intent: %v", err))
+			return
+		}
+		responseStatus = http.StatusOK
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit upload intent reservation: %v", err))
 		return
 	}
 
@@ -467,7 +533,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	util.WriteJSON(w, http.StatusCreated, map[string]any{
+	util.WriteJSON(w, responseStatus, map[string]any{
 		"intent_id":      intentID.String(),
 		"upload_url":     uploadURL,
 		"object_key":     objectKey,
@@ -581,7 +647,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		&accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusConflict, "upload intent not found, already consumed, or job not owned")
+		util.WriteJSON(w, http.StatusConflict, map[string]any{
+			"code":  recordingapi.ErrorCodeUploadIntentUnavailable,
+			"error": "upload intent not found, already consumed, or job not owned",
+		})
 		return
 	}
 	if err != nil {
@@ -676,7 +745,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		// 0-row insert means a clip already exists for this (bucket,object_key).
 		// Treat as an error so the job is NOT marked done and the dropped clip
 		// is never silently lost (S-3).
-		util.WriteError(w, http.StatusConflict, "a clip already exists for this object key")
+		util.WriteJSON(w, http.StatusConflict, map[string]any{
+			"code":  recordingapi.ErrorCodeClipAlreadyIngested,
+			"error": "a clip already exists for this object key",
+		})
 		return
 	}
 	if err != nil {
