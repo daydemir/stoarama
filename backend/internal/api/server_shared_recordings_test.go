@@ -81,10 +81,27 @@ func TestSharedRecordingsLimiterBoundsTrackedClients(t *testing.T) {
 	if _, exists := limiter.failures[overflow]; exists {
 		t.Fatal("overflow client was tracked")
 	}
+	if want := now.Add(sharedRecordingsRateWindow); !limiter.nextExpiry.Equal(want) {
+		t.Fatalf("next expiry=%s want %s", limiter.nextExpiry, want)
+	}
 
 	afterWindow := now.Add(sharedRecordingsRateWindow + time.Second)
 	if !limiter.allow(overflow, afterWindow) {
 		t.Fatal("expired entries were not pruned")
+	}
+	if !limiter.nextExpiry.IsZero() {
+		t.Fatalf("next expiry=%s want zero", limiter.nextExpiry)
+	}
+}
+
+func TestSharedRecordingsLimiterRecomputesExpiryAfterClear(t *testing.T) {
+	limiter := newSharedRecordingsLimiter()
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter.fail("first", now)
+	limiter.fail("second", now.Add(time.Minute))
+	limiter.clear("first")
+	if want := now.Add(time.Minute + sharedRecordingsRateWindow); !limiter.nextExpiry.Equal(want) {
+		t.Fatalf("next expiry=%s want %s", limiter.nextExpiry, want)
 	}
 }
 
