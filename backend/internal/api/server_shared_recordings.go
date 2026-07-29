@@ -69,22 +69,24 @@ func (l *sharedRecordingsLimiter) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	failures := l.recent(key, now)
-	if failures == nil {
+	if failures != nil {
+		return len(failures) < sharedRecordingsMaxFailures
+	}
+	if len(l.failures) < sharedRecordingsMaxClients {
 		return true
 	}
-	return len(failures) < sharedRecordingsMaxFailures
+	l.pruneExpired(now)
+	return len(l.failures) < sharedRecordingsMaxClients
 }
 
 func (l *sharedRecordingsLimiter) fail(key string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	failures := l.recent(key, now)
-	if failures == nil {
+	if failures == nil && len(l.failures) >= sharedRecordingsMaxClients {
+		l.pruneExpired(now)
 		if len(l.failures) >= sharedRecordingsMaxClients {
-			for existing := range l.failures {
-				delete(l.failures, existing)
-				break
-			}
+			return
 		}
 	}
 	if len(failures) >= sharedRecordingsMaxFailures {
@@ -111,6 +113,18 @@ func (l *sharedRecordingsLimiter) recent(key string, now time.Time) []time.Time 
 	}
 	l.failures[key] = failures
 	return failures
+}
+
+func (l *sharedRecordingsLimiter) pruneExpired(now time.Time) {
+	cutoff := now.Add(-sharedRecordingsRateWindow)
+	for key, failures := range l.failures {
+		failures = recentSharedRecordingFailures(failures, cutoff)
+		if len(failures) == 0 {
+			delete(l.failures, key)
+			continue
+		}
+		l.failures[key] = failures
+	}
 }
 
 func recentSharedRecordingFailures(failures []time.Time, cutoff time.Time) []time.Time {

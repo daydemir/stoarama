@@ -71,8 +71,20 @@ func TestSharedRecordingsLimiterBoundsTrackedClients(t *testing.T) {
 	if got := len(limiter.failures); got != sharedRecordingsMaxClients {
 		t.Fatalf("tracked clients=%d want=%d", got, sharedRecordingsMaxClients)
 	}
-	if _, exists := limiter.failures[strconv.Itoa(sharedRecordingsMaxClients+9)]; !exists {
-		t.Fatal("newest client was not retained")
+	if _, exists := limiter.failures["0"]; !exists {
+		t.Fatal("active failure history was evicted")
+	}
+	overflow := strconv.Itoa(sharedRecordingsMaxClients)
+	if limiter.allow(overflow, now) {
+		t.Fatal("unknown client was allowed after limiter reached capacity")
+	}
+	if _, exists := limiter.failures[overflow]; exists {
+		t.Fatal("overflow client was tracked")
+	}
+
+	afterWindow := now.Add(sharedRecordingsRateWindow + time.Second)
+	if !limiter.allow(overflow, afterWindow) {
+		t.Fatal("expired entries were not pruned")
 	}
 }
 

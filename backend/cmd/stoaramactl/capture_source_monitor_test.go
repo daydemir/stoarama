@@ -348,6 +348,9 @@ func TestPrepareSourceMonitorOutputDirCleansOnlyTemporaryDirectory(t *testing.T)
 	if err := os.Mkdir(explicit, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(explicit, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	got, cleanup, err := prepareSourceMonitorOutputDir(explicit)
 	if err != nil {
 		t.Fatal(err)
