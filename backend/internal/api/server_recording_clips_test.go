@@ -34,6 +34,9 @@ func TestRecordingJobSurrenderReason(t *testing.T) {
 	if !recordingJobSurrenderNoProgress.valid() {
 		t.Fatal("no_progress surrender reason rejected")
 	}
+	if !recordingJobSurrenderDiskPressure.valid() {
+		t.Fatal("disk_pressure surrender reason rejected")
+	}
 	if recordingJobSurrenderReason("capture_error").valid() {
 		t.Fatal("unknown surrender reason accepted")
 	}

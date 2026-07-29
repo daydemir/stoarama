@@ -7,6 +7,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +43,26 @@ func TestContinuousShouldStop(t *testing.T) {
 	}
 }
 
+func TestContinuousDeliveryExhaustionAfterWindowCloseDoesNotFailJob(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		windowClosed bool
+		wantFail     bool
+	}{
+		{name: "exhausted while open fails", err: errSegmentDeliveryExhausted, wantFail: true},
+		{name: "exhausted after close is delivery incomplete", err: errSegmentDeliveryExhausted, windowClosed: true, wantFail: false},
+		{name: "permanent after close still fails", err: errPermanentSegmentDelivery, windowClosed: true, wantFail: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := continuousDeliveryFailureShouldFail(test.err, test.windowClosed); got != test.wantFail {
+				t.Fatalf("continuousDeliveryFailureShouldFail(%v, %v)=%v want %v", test.err, test.windowClosed, got, test.wantFail)
+			}
+		})
+	}
+}
+
 func TestContinuousNoProgressExpired(t *testing.T) {
 	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	timeout := 5 * time.Minute
@@ -56,6 +80,67 @@ func TestContinuousNoProgressExpired(t *testing.T) {
 	}
 	if got := continuousReconnectDelay(started, started.Add(time.Hour), 0, 5*time.Minute); got != 5*time.Minute {
 		t.Fatalf("cloud reconnect delay=%s want 5m", got)
+	}
+}
+
+func TestDiskHasSpaceFailsClosed(t *testing.T) {
+	worker := &Worker{cfg: Config{
+		DiskFreeBytes: func() (uint64, error) { return 9, nil },
+	}}
+	if worker.diskHasSpace(10) {
+		t.Fatal("insufficient disk accepted")
+	}
+	worker.cfg.DiskFreeBytes = func() (uint64, error) { return 10, nil }
+	if !worker.diskHasSpace(10) {
+		t.Fatal("boundary disk rejected")
+	}
+	worker.cfg.DiskFreeBytes = func() (uint64, error) { return 0, errors.New("stat failed") }
+	if worker.diskHasSpace(10) {
+		t.Fatal("failed disk check accepted")
+	}
+}
+
+func TestDiskPauseDiagnosticIsRateLimited(t *testing.T) {
+	worker := &Worker{cfg: Config{MinLeaseFreeBytes: 10}}
+	started := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	worker.logDiskPause(started)
+	if !worker.lastDiskPauseLog.Equal(started) {
+		t.Fatalf("first disk pause log time=%s", worker.lastDiskPauseLog)
+	}
+	worker.logDiskPause(started.Add(diskPauseLogInterval - time.Second))
+	if !worker.lastDiskPauseLog.Equal(started) {
+		t.Fatalf("rate-limited disk pause advanced log time=%s", worker.lastDiskPauseLog)
+	}
+	next := started.Add(diskPauseLogInterval)
+	worker.logDiskPause(next)
+	if !worker.lastDiskPauseLog.Equal(next) {
+		t.Fatalf("disk pause did not log at interval: %s", worker.lastDiskPauseLog)
+	}
+}
+
+func TestDiskCheckErrorDiagnosticIsConcurrentAndRateLimited(t *testing.T) {
+	worker := &Worker{}
+	started := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	var logged atomic.Int64
+	var calls sync.WaitGroup
+	for range 20 {
+		calls.Add(1)
+		go func() {
+			defer calls.Done()
+			if worker.shouldLogDiskError(started) {
+				logged.Add(1)
+			}
+		}()
+	}
+	calls.Wait()
+	if logged.Load() != 1 {
+		t.Fatalf("concurrent disk error logs=%d want 1", logged.Load())
+	}
+	if worker.shouldLogDiskError(started.Add(diskErrorLogInterval - time.Second)) {
+		t.Fatal("disk error logged before interval")
+	}
+	if !worker.shouldLogDiskError(started.Add(diskErrorLogInterval)) {
+		t.Fatal("disk error did not log at interval")
 	}
 }
 
@@ -170,7 +255,7 @@ func TestReconnectBackoff(t *testing.T) {
 	}
 }
 
-func TestRetryableUploadError(t *testing.T) {
+func TestRetryableTransportError(t *testing.T) {
 	tests := []struct {
 		err  error
 		want bool
@@ -183,47 +268,221 @@ func TestRetryableUploadError(t *testing.T) {
 		{err: context.DeadlineExceeded, want: true},
 	}
 	for _, tc := range tests {
-		if got := retryableUploadError(context.Background(), tc.err); got != tc.want {
-			t.Errorf("retryableUploadError(%v)=%v want %v", tc.err, got, tc.want)
+		if got := retryableTransportError(context.Background(), tc.err); got != tc.want {
+			t.Errorf("retryableTransportError(%v)=%v want %v", tc.err, got, tc.want)
 		}
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if retryableUploadError(canceled, &apihttp.StatusError{Code: 502}) {
+	if retryableTransportError(canceled, &apihttp.StatusError{Code: 502}) {
 		t.Fatal("canceled upload is retryable")
 	}
 }
 
-func TestUploadWithRetry(t *testing.T) {
+func TestRetrySegmentDeliveryKeepsExactFileUntilAcknowledged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "segment.mp4")
+	if err := os.WriteFile(path, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	attempts := 0
-	err := uploadWithRetry(context.Background(), 1, func(context.Context) error {
+	err := retrySegmentDelivery(context.Background(), time.Millisecond, func() bool { return true }, func() error {
 		attempts++
-		if attempts < 3 {
-			return &apihttp.StatusError{Code: 502}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("attempt %d lost segment: %v", attempts, err)
 		}
-		return nil
-	}, func(error, time.Duration) {})
-	if err != nil || attempts != 3 {
-		t.Fatalf("err=%v attempts=%d", err, attempts)
+		if attempts < 3 {
+			return &apihttp.StatusError{Code: 503}
+		}
+		return os.Remove(path)
+	}, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d want 3", attempts)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("acknowledged segment still exists: %v", err)
+	}
+}
+
+func TestRetrySegmentDeliveryStopsOnCancelOrPermanentFailure(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ctx  func() context.Context
+		err  error
+		want error
+	}{
+		{
+			name: "canceled",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			err:  &apihttp.StatusError{Code: 503},
+			want: context.Canceled,
+		},
+		{
+			name: "permanent",
+			ctx:  context.Background,
+			err:  &apihttp.StatusError{Code: 403},
+			want: errPermanentSegmentDelivery,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "segment.mp4")
+			if err := os.WriteFile(path, []byte("video"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			attempts := 0
+			err := retrySegmentDelivery(test.ctx(), time.Millisecond, func() bool { return true }, func() error {
+				attempts++
+				return test.err
+			}, func(error) {})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error=%v want %v", err, test.want)
+			}
+			if test.name == "permanent" && attempts != 1 {
+				t.Fatalf("attempts=%d want 1", attempts)
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("retry helper deleted segment: %v", err)
+			}
+		})
+	}
+}
+
+func TestRetrySegmentDeliveryCancellationDuringAttemptIsNotPermanent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	err := retrySegmentDelivery(ctx, time.Hour, func() bool { return true }, func() error {
+		attempts++
+		cancel()
+		return context.Canceled
+	}, func(error) {})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v want canceled", err)
+	}
+	if errors.Is(err, errPermanentSegmentDelivery) {
+		t.Fatalf("cancellation classified permanent: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want 1", attempts)
+	}
+}
+
+func TestRetrySegmentDeliveryStopsAtWindowDeadline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "segment.mp4")
+	if err := os.WriteFile(path, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := retrySegmentDelivery(ctx, time.Hour, func() bool { return true }, func() error {
+		return &apihttp.StatusError{Code: 503}
+	}, func(error) {})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("delivery ignored window deadline for %s", elapsed)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("deadline deleted pending segment: %v", err)
+	}
+}
+
+func TestFinalizedSegmentStartingBeforeWindowEndGetsDeliveryBudget(t *testing.T) {
+	now := time.Now()
+	windowEnd := now.Add(time.Millisecond)
+	segmentCtx, cancel := continuousSegmentDeliveryContext(context.Background(), &windowEnd, now)
+	defer cancel()
+	deadline, ok := segmentCtx.Deadline()
+	if !ok || deadline.Sub(now) < segmentDeliveryRetryBudget-time.Second {
+		t.Fatalf("delivery deadline=%s want approximately %s", deadline.Sub(now), segmentDeliveryRetryBudget)
+	}
+	attempts := 0
+	err := retrySegmentDelivery(
+		segmentCtx,
+		time.Millisecond,
+		func() bool { return true },
+		func() error {
+			attempts++
+			return nil
+		},
+		func(error) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want 1", attempts)
+	}
+}
+
+func TestSegmentDeliveryBudgetIsBoundedEarlyAndAfterWindow(t *testing.T) {
+	now := time.Now()
+	longWindowEnd := now.Add(12 * time.Hour)
+	earlyCtx, earlyCancel := continuousSegmentDeliveryContext(context.Background(), &longWindowEnd, now)
+	defer earlyCancel()
+	earlyDeadline, _ := earlyCtx.Deadline()
+	if got := earlyDeadline.Sub(now); got != segmentDeliveryRetryBudget {
+		t.Fatalf("early delivery budget=%s want %s", got, segmentDeliveryRetryBudget)
 	}
 
-	attempts = 0
-	err = uploadWithRetry(context.Background(), 1, func(context.Context) error {
-		attempts++
-		return fmt.Errorf("permanent")
-	}, func(error, time.Duration) {})
-	if err == nil || attempts != 1 {
-		t.Fatalf("permanent err=%v attempts=%d", err, attempts)
+	closedWindowEnd := now.Add(-time.Minute)
+	finalCtx, finalCancel := continuousSegmentDeliveryContext(context.Background(), &closedWindowEnd, now)
+	defer finalCancel()
+	finalDeadline, _ := finalCtx.Deadline()
+	if got := finalDeadline.Sub(now); got != postWindowDeliveryGrace-time.Minute {
+		t.Fatalf("post-window delivery budget=%s want %s", got, postWindowDeliveryGrace-time.Minute)
 	}
+}
 
-	attempts = 0
-	canceled, cancel := context.WithCancel(context.Background())
-	err = uploadWithRetry(canceled, 1, func(context.Context) error {
-		attempts++
-		return &apihttp.StatusError{Code: 502}
-	}, func(error, time.Duration) { cancel() })
-	if !errors.Is(err, context.Canceled) || attempts != 1 {
-		t.Fatalf("canceled err=%v attempts=%d", err, attempts)
+func TestContinuousAttemptCleanupDecision(t *testing.T) {
+	tests := []struct {
+		name    string
+		pending bool
+		err     error
+		want    bool
+	}{
+		{name: "acknowledged", pending: false, want: true},
+		{name: "source drop after acknowledgements", pending: false, err: errors.New("ffmpeg failed"), want: true},
+		{name: "canceled with pending bytes", pending: true, err: context.Canceled, want: true},
+		{name: "disk pressure", pending: true, err: errDiskPressure, want: true},
+		{name: "permanent delivery failure", pending: true, err: errPermanentSegmentDelivery, want: true},
+		{name: "delivery budget exhausted", pending: true, err: errSegmentDeliveryExhausted, want: true},
+		{name: "transient unclean failure", pending: true, err: errors.New("connection reset"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldCleanupContinuousAttempt(test.pending, test.err); got != test.want {
+				t.Fatalf("cleanup=%v want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEnsureCaptureTempDirRecreatesMissingRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "capture")
+	worker := &Worker{cfg: Config{CaptureTempDir: root}}
+	if err := worker.ensureCaptureTempDir(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", root)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.ensureCaptureTempDir(); err != nil {
+		t.Fatalf("recreate: %v", err)
 	}
 }
 

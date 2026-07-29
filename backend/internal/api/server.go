@@ -38,25 +38,27 @@ import (
 )
 
 type Server struct {
-	cfg             config.Config
-	pool            *pgxpool.Pool
-	r2              *r2.Client
-	secrets         *secretbox.Cipher
-	mailer          email.Sender
-	streamsHTML     []byte
-	recordingsHTML  []byte
-	accountHTML     []byte
-	orgSettingsHTML []byte
-	docsHTML        []byte
-	pricingHTML     []byte
-	adminHTML       []byte
-	billing         *billing.Client
-	exportMu        sync.Mutex
-	frameExports    map[string]*frameExportJob
-	dayZipMu        sync.Mutex
-	dayZips         map[string]*dayZipJob
-	dayZipSlot      chan struct{}
-	authLinkLimiter *authLinkLimiter
+	cfg                     config.Config
+	pool                    *pgxpool.Pool
+	r2                      *r2.Client
+	secrets                 *secretbox.Cipher
+	mailer                  email.Sender
+	streamsHTML             []byte
+	recordingsHTML          []byte
+	sharedRecordingsHTML    []byte
+	accountHTML             []byte
+	orgSettingsHTML         []byte
+	docsHTML                []byte
+	pricingHTML             []byte
+	adminHTML               []byte
+	billing                 *billing.Client
+	exportMu                sync.Mutex
+	frameExports            map[string]*frameExportJob
+	dayZipMu                sync.Mutex
+	dayZips                 map[string]*dayZipJob
+	dayZipSlot              chan struct{}
+	authLinkLimiter         *authLinkLimiter
+	sharedRecordingsLimiter *sharedRecordingsLimiter
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -144,22 +146,29 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
+	sharedRecordingsTemplate, err := loadSharedRecordingsHTML()
+	if err != nil {
+		return nil, err
+	}
+	sharedRecordingsHTML := []byte(strings.ReplaceAll(string(sharedRecordingsTemplate), "__SHARED_RECORDINGS_SLUG__", cfg.SharedRecordingsSlug))
 	s := &Server{
-		cfg:             cfg,
-		pool:            pool,
-		r2:              r2c,
-		mailer:          mailer,
-		streamsHTML:     injectShell(streamsHTML, "streams"),
-		recordingsHTML:  injectShell(recordingsHTML, "recording"),
-		accountHTML:     injectShell(accountHTML, ""),
-		orgSettingsHTML: injectShell(orgSettingsHTML, ""),
-		docsHTML:        injectShell(docsHTML, ""),
-		pricingHTML:     injectShell(pricingHTML, ""),
-		adminHTML:       injectShell(adminHTML, ""),
-		frameExports:    map[string]*frameExportJob{},
-		dayZips:         map[string]*dayZipJob{},
-		dayZipSlot:      make(chan struct{}, 1),
-		authLinkLimiter: newAuthLinkLimiter(),
+		cfg:                     cfg,
+		pool:                    pool,
+		r2:                      r2c,
+		mailer:                  mailer,
+		streamsHTML:             injectShell(streamsHTML, "streams"),
+		recordingsHTML:          injectShell(recordingsHTML, "recording"),
+		sharedRecordingsHTML:    sharedRecordingsHTML,
+		accountHTML:             injectShell(accountHTML, ""),
+		orgSettingsHTML:         injectShell(orgSettingsHTML, ""),
+		docsHTML:                injectShell(docsHTML, ""),
+		pricingHTML:             injectShell(pricingHTML, ""),
+		adminHTML:               injectShell(adminHTML, ""),
+		frameExports:            map[string]*frameExportJob{},
+		dayZips:                 map[string]*dayZipJob{},
+		dayZipSlot:              make(chan struct{}, 1),
+		authLinkLimiter:         newAuthLinkLimiter(),
+		sharedRecordingsLimiter: newSharedRecordingsLimiter(),
 	}
 	if key := strings.TrimSpace(cfg.StorageCredKey); key != "" {
 		cipher, err := secretbox.NewFromBase64Key(key)
@@ -198,6 +207,9 @@ func (s *Server) router() http.Handler {
 	r.Get("/recordings", s.handleRecordingsApp)
 	r.Get("/recordings/new", s.handleRecordingsApp)
 	r.Get("/recordings/{id}", s.handleRecordingsApp)
+	sharedPagePath := "/shared/" + s.cfg.SharedRecordingsSlug + "/recordings"
+	r.Get(sharedPagePath, s.handleSharedRecordingsApp)
+	r.Get(sharedPagePath+"/{id}", s.handleSharedRecordingsApp)
 	r.Get("/admin", s.handleAdminApp)
 	r.Get("/dashboard", s.redirectDashboard)
 	r.Get("/dashboard/{tab}", s.redirectDashboard)
@@ -211,6 +223,16 @@ func (s *Server) router() http.Handler {
 	r.Post("/webhooks/billing/stripe", s.handleStripeWebhook)
 
 	r.Route("/api/v1", func(api chi.Router) {
+		api.Route("/shared/"+s.cfg.SharedRecordingsSlug, func(shared chi.Router) {
+			shared.Post("/unlock", s.handleSharedRecordingsUnlock)
+			shared.Post("/logout", s.handleSharedRecordingsLogout)
+			shared.Group(func(read chi.Router) {
+				read.Use(s.requireSharedRecordingsAuth)
+				read.Get("/recordings", s.handleSharedRecordingsList)
+				read.Get("/recordings/{id}", s.handleSharedRecordingGet)
+				read.Get("/recordings/{id}/capture-health", s.handleSharedRecordingCaptureHealth)
+			})
+		})
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {
@@ -244,6 +266,7 @@ func (s *Server) router() http.Handler {
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
+			account.Get("/recordings/{id}/capture-health", s.handleAccountRecordingCaptureHealth)
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
 			account.Get("/recordings/{id}/clips/{clipId}/download", s.handleAccountRecordingClipDownload)

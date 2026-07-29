@@ -59,3 +59,36 @@ func TestExpectedContinuousClipCountHonorsWeekdays(t *testing.T) {
 		t.Fatalf("got %d expected 0", got)
 	}
 }
+
+func TestVisitExpectedClipStartsMatchesContinuousCount(t *testing.T) {
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	windowStart, windowEnd := TimeOfDay{Hour: 0}, TimeOfDay{Hour: 23}
+	count, err := ExpectedClipCount("continuous", "", "America/New_York", &windowStart, &windowEnd, AllWeekdays, 60, start, start, start.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var visited int64
+	err = VisitExpectedClipStarts("continuous", "", "America/New_York", &windowStart, &windowEnd, AllWeekdays, 60, start, start, start.Add(48*time.Hour), func(time.Time) {
+		visited++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visited != count {
+		t.Fatalf("visited=%d count=%d", visited, count)
+	}
+}
+
+func TestExpectedContinuousClipCountIsNotLimitedByStartEnumerationCap(t *testing.T) {
+	window := TimeOfDay{}
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 0, 400)
+	got, err := ExpectedClipCount("continuous", "", "UTC", &window, &window, AllWeekdays, 60, start, start, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = int64(400 * 24 * 60)
+	if got != want {
+		t.Fatalf("got %d expected %d", got, want)
+	}
+}

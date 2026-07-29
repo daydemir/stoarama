@@ -2,11 +2,13 @@
 Description=Stoarama Relay
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart={{.ExePath}} run
-Restart=on-failure
-RestartSec=15s
+ExecStopPost={{.ExePath}} record-exit --service-result=${SERVICE_RESULT} --exit-code=${EXIT_CODE} --exit-status=${EXIT_STATUS}
+Restart=always
+RestartSec=30s
 
 [Install]
 WantedBy=default.target

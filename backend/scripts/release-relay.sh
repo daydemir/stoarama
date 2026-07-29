@@ -13,9 +13,14 @@ set -euo pipefail
 #   AWS_ACCESS_KEY_ID    R2 access key id
 #   AWS_SECRET_ACCESS_KEY R2 secret access key
 #   YTDLP_VERSION        pinned yt-dlp release tag
+#   RELAY_SIGNING_PRIVATE_KEY_FILE file containing a base64 Ed25519 private key
 # Optional env:
 #   RELAY_VERSION        immutable version stamped into artifacts + latest.json
 #                        (default: the current eight-character Git revision)
+#   RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY base64 Ed25519 public key trusted beside
+#                        the signing key for one overlapping rotation release
+#   RELAY_SIGNING_BOOTSTRAP=1 permits the one-time migration of the current
+#                        byte-identical live/immutable unsigned manifest.
 #
 # ffmpeg: statically linkable builds are fetched and republished automatically for
 # linux-amd64, linux-arm64 (johnvansickle static) and darwin-amd64 (evermeet.cx).
@@ -29,6 +34,21 @@ trap 'rm -rf "${BUILD_DIR}"' EXIT
 
 RELAY_VERSION="${RELAY_VERSION:-$(git -C "${ROOT_DIR}" rev-parse --short=8 HEAD)}"
 : "${YTDLP_VERSION:?YTDLP_VERSION must be an explicit release tag}"
+: "${RELAY_SIGNING_PRIVATE_KEY_FILE:?RELAY_SIGNING_PRIVATE_KEY_FILE is required}"
+[[ -f "${RELAY_SIGNING_PRIVATE_KEY_FILE}" ]] || {
+  echo "error: RELAY_SIGNING_PRIVATE_KEY_FILE does not exist" >&2
+  exit 1
+}
+RELAY_SIGNING_PUBLIC_KEY="$(
+  go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign public \
+    --private-key-file "${RELAY_SIGNING_PRIVATE_KEY_FILE}"
+)"
+RELAY_TRUSTED_PUBLIC_KEYS="${RELAY_SIGNING_PUBLIC_KEY}"
+if [[ -n "${RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY:-}" ]]; then
+  go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign validate-public \
+    --public-key "${RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY}"
+  RELAY_TRUSTED_PUBLIC_KEYS+=",${RELAY_SIGNING_ADDITIONAL_PUBLIC_KEY}"
+fi
 
 if [[ ! "${RELAY_VERSION}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ || "${RELAY_VERSION}" == *..* ]]; then
   echo "error: RELAY_VERSION must start and end with a letter or number and contain no consecutive dots" >&2
@@ -63,8 +83,42 @@ fi
 TARGETS=("darwin/arm64" "darwin/amd64" "linux/amd64" "linux/arm64")
 
 previous_latest="${BUILD_DIR}/previous-latest.json"
+previous_latest_signature="${BUILD_DIR}/previous-latest.json.sig"
 aws s3 cp "s3://${R2_BUCKET}/relay-releases/latest.json" "${previous_latest}" \
   --endpoint-url "${R2_ENDPOINT}" --only-show-errors
+if ! aws s3 cp "s3://${R2_BUCKET}/relay-releases/latest.json.sig" "${previous_latest_signature}" \
+  --endpoint-url "${R2_ENDPOINT}" --only-show-errors; then
+  if [[ "${RELAY_SIGNING_BOOTSTRAP:-}" != "1" ]]; then
+    echo "error: live relay manifest is unsigned; set RELAY_SIGNING_BOOTSTRAP=1 once after verifying the current live release" >&2
+    exit 1
+  fi
+  bootstrap_version="$(jq -er '.version' "${previous_latest}")"
+  if [[ ! "${bootstrap_version}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ || "${bootstrap_version}" == *..* ]]; then
+    echo "error: unsigned bootstrap manifest has an invalid version" >&2
+    exit 1
+  fi
+  bootstrap_immutable="${BUILD_DIR}/bootstrap-immutable.json"
+  aws s3 cp "s3://${R2_BUCKET}/relay-releases/latest-${bootstrap_version}.json" "${bootstrap_immutable}" \
+    --endpoint-url "${R2_ENDPOINT}" --only-show-errors
+  cmp -s "${previous_latest}" "${bootstrap_immutable}" || {
+    echo "error: live and immutable bootstrap manifests differ" >&2
+    exit 1
+  }
+  go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign sign \
+    --private-key-file "${RELAY_SIGNING_PRIVATE_KEY_FILE}" \
+    --input "${previous_latest}" \
+    --output "${previous_latest_signature}"
+  aws s3 cp "${previous_latest_signature}" \
+    "s3://${R2_BUCKET}/relay-releases/latest-${bootstrap_version}.json.sig" \
+    --endpoint-url "${R2_ENDPOINT}" --content-type application/octet-stream --only-show-errors
+  aws s3 cp "${previous_latest_signature}" \
+    "s3://${R2_BUCKET}/relay-releases/latest.json.sig" \
+    --endpoint-url "${R2_ENDPOINT}" --content-type application/octet-stream --only-show-errors
+fi
+go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign verify \
+  --public-key "${RELAY_TRUSTED_PUBLIC_KEYS}" \
+  --input "${previous_latest}" \
+  --signature "${previous_latest_signature}"
 PREVIOUS_VERSION="$(jq -er '.version' "${previous_latest}")"
 if [[ ! "${PREVIOUS_VERSION}" =~ ^[A-Za-z0-9._-]+$ || "${PREVIOUS_VERSION}" == "${RELAY_VERSION}" ]]; then
   echo "error: live relay version is invalid or already ${RELAY_VERSION}" >&2
@@ -162,7 +216,8 @@ for t in "${TARGETS[@]}"; do
   # relay binary + tarball
   bin="${BUILD_DIR}/stoarama-relay"
   GOOS="${GOOS}" GOARCH="${GOARCH}" CGO_ENABLED=0 \
-    go build -C "${ROOT_DIR}" -ldflags "-X main.version=${RELAY_VERSION}" \
+    go build -C "${ROOT_DIR}" \
+    -ldflags "-X main.version=${RELAY_VERSION} -X main.releasePublicKeyBase64=${RELAY_TRUSTED_PUBLIC_KEYS}" \
     -o "${bin}" ./cmd/stoarama-relay
   tarball="stoarama-relay-${RELAY_VERSION}-${key}.tar.gz"
   tar -C "${BUILD_DIR}" -czf "${BUILD_DIR}/${tarball}" stoarama-relay
@@ -212,6 +267,12 @@ latest="${BUILD_DIR}/latest.json"
   echo "  }"
   echo "}"
 } > "${latest}"
+latest_signature="${BUILD_DIR}/latest-${RELAY_VERSION}.json.sig"
+go run -C "${ROOT_DIR}" ./cmd/relay-manifest-sign sign \
+  --private-key-file "${RELAY_SIGNING_PRIVATE_KEY_FILE}" \
+  --input "${latest}" \
+  --output "${latest_signature}"
+r2_put "${latest_signature}" "latest-${RELAY_VERSION}.json.sig" "application/octet-stream"
 r2_put "${latest}" "latest-${RELAY_VERSION}.json" "application/json"
 
 # Stage versioned scripts beside the immutable artifacts. Activation is a separate,

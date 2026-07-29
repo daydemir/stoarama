@@ -219,8 +219,15 @@
     .health-strip-bar.healthy { background: var(--ok); }
     .health-strip-bar.warning { background: var(--warn); }
     .health-strip-bar.critical { background: var(--err); }
-    .health-history { display: flex; align-items: end; gap: 3px; height: 84px; overflow-x: auto; padding: 8px 0 4px; border-bottom: 1px solid var(--border); }
-    .health-history .health-strip-cell { flex: 1 0 9px; max-width: 18px; }
+    .health-heatmap { display: grid; gap: 4px; overflow-x: auto; padding: 4px 0; }
+    .health-heatmap-row { display: grid; gap: 3px; min-width: 720px; align-items: center; }
+    .health-heatmap-date { color: var(--muted); font: 11px/1.2 var(--mono); }
+    .health-heatmap-cell { width: 100%; min-width: 17px; aspect-ratio: 1; padding: 0; border: 0; border-radius: 3px; background: color-mix(in srgb, var(--muted) 12%, transparent); }
+    .health-heatmap-cell.healthy { background: var(--ok); }
+    .health-heatmap-cell.warning { background: var(--warn); }
+    .health-heatmap-cell.critical { background: var(--err); }
+    .health-heatmap-cell:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+    .health-page-actions { display: flex; gap: 8px; margin-left: auto; }
     .health-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 11px; }
     .health-legend span { display: inline-flex; align-items: center; gap: 5px; }
     .health-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
@@ -3117,7 +3124,7 @@
 	  const captureHealthHTML = captureHealth === 'unavailable'
 	    ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
 	    : healthBins.length
-	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, false, timezone)}<div class="cell-sub">${lastHTML}</div>`
+	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, timezone)}<div class="cell-sub">${lastHTML}</div>`
 	      : expected > 0
 	        ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
 	      : `<div class="capture-health not_expected">No clips expected yet</div><div class="cell-sub">${lastHTML}</div>`;
@@ -3443,7 +3450,7 @@
     // ---- Dedicated clip-management page (/recordings/{id}) ----
 
     const CLIP_PAGE_SIZE = 100;
-    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null };
+    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null, captureHealth: null };
 
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
     // switch the view into the dedicated clip page.
@@ -3476,6 +3483,11 @@
         }
         const rec = clipPageState.rec;
         clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
+        try {
+          clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');
+        } catch (err) {
+          clipPageState.captureHealth = { error: String(err.message || err) };
+        }
         renderClipPage();
       }
       const body = root.querySelector('#clipListBody');
@@ -3504,6 +3516,11 @@
         return;
       }
       clipPageState.recName = String((clipPageState.rec.stream_name || clipPageState.rec.name) || `Recording #${clipPageState.recId}`);
+      try {
+        clipPageState.captureHealth = await fetchRecordingCaptureHealth(clipPageState.recId, '');
+      } catch (err) {
+        clipPageState.captureHealth = { error: String(err.message || err) };
+      }
       renderClipPage();
       await loadClipPage(clipPageState.page);
     }
@@ -3551,14 +3568,12 @@
         </div>`;
     }
 
-    function captureHealthGraph(rawBins, detailed, timezone) {
+    function captureHealthGraph(rawBins, timezone) {
       const bins = Array.isArray(rawBins) ? rawBins : [];
       if (!bins.length) return '';
       const cells = [];
       let latestTitle = '';
-      if (!detailed) {
-        for (let i = bins.length; i < 12; i++) cells.push('<span class="health-strip-cell"></span>');
-      }
+      for (let i = bins.length; i < 12; i++) cells.push('<span class="health-strip-cell"></span>');
       for (const bin of bins) {
         const captured = Number(bin.captured || 0);
         const expected = Number(bin.expected || 0);
@@ -3570,7 +3585,7 @@
         latestTitle = title;
         cells.push(`<span class="health-strip-cell" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
       }
-      return `<div class="${detailed ? 'health-history' : 'health-strip'}" role="img" aria-label="Capture health over recording time" aria-describedby="healthTooltip" data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0">${cells.join('')}</div>`;
+      return `<div class="health-strip" role="img" aria-label="Capture health over recording time" aria-describedby="healthTooltip" data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0">${cells.join('')}</div>`;
     }
 
     const healthTooltip = document.getElementById('healthTooltip');
@@ -3612,24 +3627,123 @@
     window.addEventListener('scroll', hideHealthTooltip, true);
     window.addEventListener('resize', hideHealthTooltip);
 
-    function captureHealthCardHTML(rec) {
-      const bins = Array.isArray(rec.capture_health_bins) ? rec.capture_health_bins : [];
-      if (!bins.length) return '';
-      const totals = bins.reduce((sum, bin) => ({ captured: sum.captured + Number(bin.captured || 0), expected: sum.expected + Number(bin.expected || 0) }), { captured: 0, expected: 0 });
+    async function fetchRecordingCaptureHealth(recordingID, toDate) {
+      const query = toDate ? `?to=${encodeURIComponent(toDate)}` : '';
+      return fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recordingID)}/capture-health${query}`);
+    }
+
+    function captureHealthLocalParts(value, timezone) {
+      const parts = {};
+      const formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', hourCycle: 'h23', timeZoneName: 'short',
+      });
+      formatter.formatToParts(new Date(value)).forEach((part) => { parts[part.type] = part.value; });
+      return { date: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour), zone: parts.timeZoneName || '' };
+    }
+
+    function captureHealthDateRange(from, to) {
+      const dates = [];
+      const end = new Date(`${to}T12:00:00Z`);
+      for (let day = new Date(`${from}T12:00:00Z`); day <= end; day = new Date(day.getTime() + 86400000)) {
+        dates.push(day.toISOString().slice(0, 10));
+      }
+      return dates;
+    }
+
+    function captureHealthHeatmap(page) {
+      const timezone = String(page.timezone || 'UTC');
+      const days = new Map(captureHealthDateRange(page.from, page.to)
+        .map((date) => [date, Array.from({ length: 24 }, () => [])]));
+      (Array.isArray(page.bins) ? page.bins : []).forEach((bin) => {
+        const local = captureHealthLocalParts(bin.start, timezone);
+        if (!days.has(local.date)) days.set(local.date, Array.from({ length: 24 }, () => []));
+        days.get(local.date)[local.hour].push({ ...bin, localZone: local.zone });
+      });
+      return [...days.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([date, hours]) => {
+        const slots = hours.map((bins, hour) => ({ bin: captureHealthDisplayBin(bins), hour }));
+        return `
+        <div class="health-heatmap-row" style="grid-template-columns:92px repeat(${slots.length},minmax(19px,1fr))">
+          <div class="health-heatmap-date">${escapeHTML(date)}</div>
+          ${slots.map(({ bin, hour }) => {
+            if (!bin) return '<span class="health-heatmap-cell" aria-hidden="true"></span>';
+            const captured = Number(bin.captured || 0);
+            const expected = Number(bin.expected || 0);
+            const percent = expected > 0 ? Math.round(captured / expected * 1000) / 10 : 0;
+            const health = String(bin.health || '');
+            const zone = bin.localZone ? ` ${bin.localZone}` : '';
+            const title = `${date} ${String(hour).padStart(2, '0')}:00${zone} · ${percent}% of expected clips captured (${captured}/${expected})`;
+            return `<button type="button" class="health-heatmap-cell ${health}" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"></button>`;
+          }).join('')}
+        </div>`;
+      }).join('');
+    }
+
+    function captureHealthDisplayBin(bins) {
+      if (!bins.length) return null;
+      if (bins.length === 1) return bins[0];
+      const totals = bins.reduce((sum, bin) => ({
+        captured: sum.captured + Number(bin.captured || 0),
+        expected: sum.expected + Number(bin.expected || 0),
+      }), { captured: 0, expected: 0 });
+      const percent = totals.expected > 0 ? totals.captured / totals.expected * 100 : 0;
+      return {
+        ...totals,
+        health: totals.expected === 0 ? 'not_expected' : (percent >= 98 ? 'healthy' : (percent >= 90 ? 'warning' : 'critical')),
+        localZone: [...new Set(bins.map((bin) => bin.localZone).filter(Boolean))].join('/'),
+      };
+    }
+
+    function captureHealthCardHTML() {
+      const page = clipPageState.captureHealth;
+      if (!page) return '';
+      if (page.error) {
+        return `<div class="detail-card"><div class="detail-card-head"><span class="detail-card-title">Capture health</span></div><div class="hint" style="color:var(--err)">${escapeHTML(page.error)}</div></div>`;
+      }
+      const bins = Array.isArray(page.bins) ? page.bins : [];
+      const totals = bins.reduce((sum, bin) => ({
+        captured: sum.captured + Number(bin.captured || 0),
+        expected: sum.expected + Number(bin.expected || 0),
+      }), { captured: 0, expected: 0 });
       const percent = totals.expected > 0 ? Math.round(totals.captured / totals.expected * 1000) / 10 : 0;
-      const hours = Math.max(1, Math.round(Math.max(...bins.map((bin) => new Date(bin.end).getTime() - new Date(bin.start).getTime())) / 3600000));
       return `
         <div class="detail-card">
-          <div class="detail-card-head"><span class="detail-card-title">Capture health</span></div>
+          <div class="detail-card-head">
+            <span class="detail-card-title">Hourly capture health</span>
+            <div class="health-page-actions">
+              <button type="button" class="secondary" data-health-page="older" ${page.has_older ? '' : 'disabled'}>Older</button>
+              <button type="button" class="secondary" data-health-page="newer" ${page.has_newer ? '' : 'disabled'}>Newer</button>
+            </div>
+          </div>
           <div class="cell-main">${percent}% · ${totals.captured}/${totals.expected} clips</div>
-          <div class="hint">${hours}-hour bins across the full scheduled recording period. Hover a bar for captured and expected clips.</div>
-          ${captureHealthGraph(bins, true, String(rec.cron_timezone || 'UTC'))}
+          <div class="hint">${escapeHTML(page.from)} through ${escapeHTML(page.to)} in ${escapeHTML(page.timezone)}. Hover or focus an hour for details.</div>
+          <div class="health-heatmap" aria-label="Hourly capture health by local date">${captureHealthHeatmap(page)}</div>
           <div class="health-legend">
             <span><i style="background:var(--ok)"></i>98% or better</span>
             <span><i style="background:var(--warn)"></i>90% to 97.9%</span>
             <span><i style="background:var(--err)"></i>Below 90%</span>
+            <span><i style="background:color-mix(in srgb, var(--muted) 12%, transparent)"></i>Not scheduled</span>
           </div>
         </div>`;
+    }
+
+    async function loadRecordingCaptureHealthPage(direction) {
+      const page = clipPageState.captureHealth;
+      if (!page || page.error) return;
+      const pageDuration = new Date(`${page.to}T12:00:00Z`) - new Date(`${page.from}T12:00:00Z`) + 86400000;
+      const candidate = direction === 'older'
+        ? new Date(new Date(`${page.from}T12:00:00Z`).getTime() - 86400000)
+        : new Date(new Date(`${page.to}T12:00:00Z`).getTime() + pageDuration);
+      const candidateDate = candidate.toISOString().slice(0, 10);
+      const localToday = captureHealthLocalParts(new Date().toISOString(), page.timezone).date;
+      const anchorDate = direction === 'newer' && candidateDate > localToday ? localToday : candidateDate;
+      try {
+        clipPageState.captureHealth = await fetchRecordingCaptureHealth(clipPageState.recId, anchorDate);
+        renderClipPage();
+        await loadClipPage(clipPageState.page);
+      } catch (err) {
+        window.alert(String(err.message || err));
+      }
     }
 
     // The storage card: stream id where applicable, current delivery, retention tier.
@@ -3733,7 +3847,7 @@
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       teardownDetailPlayer();
-      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + streamCardHTML(rec) + captureHealthCardHTML(rec) + scheduleCardHTML(rec) + storageCardHTML(rec)
+      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + streamCardHTML(rec) + captureHealthCardHTML() + scheduleCardHTML(rec) + storageCardHTML(rec)
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
       wireDetailActions(root);
       mountRecordingLivePlayer(rec);
@@ -3748,6 +3862,8 @@
         b.addEventListener('click', () => openStorageOptions()));
       const editBtn = root.querySelector('button[data-schededit]');
       if (editBtn) editBtn.addEventListener('click', () => openScheduleEdit());
+      root.querySelectorAll('button[data-health-page]').forEach((button) =>
+        button.addEventListener('click', () => loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))));
     }
 
     async function mutateRecordingDetail(id, action) {
@@ -3976,12 +4092,11 @@
       saveBtn.disabled = true;
       setStatus(statusEl, 'Saving...', '');
       try {
-        clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}/schedule`, {
+        await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}/schedule`, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        renderClipPage();
-        await loadClipPage(clipPageState.page);
+        await reloadClipPageRecording();
       } catch (err) {
         setStatus(statusEl, String(err.message || err), 'err');
         saveBtn.disabled = false;

@@ -193,6 +193,34 @@ func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) 
 	}
 }
 
+func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`/capture-health${query}`,
+		`class="health-heatmap-cell ${health}" data-health-tooltip="${escapeHTML(title)}"`,
+		`aria-label="Hourly capture health by local date"`,
+		`data-health-page="older"`,
+		`data-health-page="newer"`,
+		`loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))`,
+		`clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');`,
+		`Array.from({ length: 24 }, () => [])`,
+		`hours.map((bins, hour) => ({ bin: captureHealthDisplayBin(bins), hour }))`,
+		`if (bins.length === 1) return bins[0];`,
+		`captured: sum.captured + Number(bin.captured || 0)`,
+		`const health = String(bin.health || '');`,
+		`repeat(${slots.length},minmax(19px,1fr))`,
+		`timeZoneName: 'short'`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recording detail heatmap source missing %q", marker)
+		}
+	}
+}
+
 func TestOrganizationNASConnectionUsesStructuredHealthCard(t *testing.T) {
 	body, err := loadHTMLPage("org-settings.html")
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -15,16 +16,26 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE | campaign-postflight | capture-health --id ID"
+
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE")
+		log.Fatal(recordingsUsage)
 	}
 	if args[0] == "schedule-batch" {
 		runRecordingScheduleBatch(ctx, cfg, args[1:])
 		return
 	}
+	if args[0] == "campaign-postflight" {
+		runRecordingCampaignPostflight(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] == "capture-health" {
+		runRecordingCaptureHealth(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) < 2 || args[0] != "naming" {
-		log.Fatalf("usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE")
+		log.Fatal(recordingsUsage)
 	}
 	switch args[1] {
 	case "allocate":
@@ -38,6 +49,39 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingCaptureHealth(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordings capture-health", flag.ExitOnError)
+	id := fs.Int64("id", 0, "recording id")
+	from := fs.String("from", "", "first local date, YYYY-MM-DD")
+	to := fs.String("to", "", "last local date, YYYY-MM-DD")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
+	_ = fs.Parse(args)
+	if *id <= 0 {
+		log.Fatal("--id is required")
+	}
+	if strings.TrimSpace(*backendAPIURL) == "" || strings.TrimSpace(*apiToken) == "" {
+		log.Fatal("--backend-api-url and --api-token are required")
+	}
+	query := url.Values{}
+	if strings.TrimSpace(*from) != "" {
+		query.Set("from", strings.TrimSpace(*from))
+	}
+	if strings.TrimSpace(*to) != "" {
+		query.Set("to", strings.TrimSpace(*to))
+	}
+	path := fmt.Sprintf("/api/v1/account/recordings/%d/capture-health", *id)
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), path)
+	encoded, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		log.Fatalf("encode capture health: %v", err)
+	}
+	fmt.Println(string(encoded))
 }
 
 func runRecordingNamingAllocate(ctx context.Context, cfg config.Config, args []string) {
@@ -136,6 +180,8 @@ type recordingBatchSpec struct {
 	StorageDestinationID         int64                    `json:"storage_destination_id"`
 	DeliveryStorageDestinationID int64                    `json:"delivery_storage_destination_id"`
 	Delivery                     recordingDeliveryMode    `json:"delivery"`
+	DryRun                       bool                     `json:"dry_run"`
+	RequiredRelaySlots           int                      `json:"required_relay_slots"`
 }
 
 type recordingBatchResult struct {
@@ -145,8 +191,12 @@ type recordingBatchResult struct {
 		Action      string `json:"action"`
 		Timezone    string `json:"timezone"`
 	} `json:"items"`
-	Created int `json:"created"`
-	Updated int `json:"updated"`
+	Created            int  `json:"created"`
+	Updated            int  `json:"updated"`
+	DryRun             bool `json:"dry_run"`
+	RelayStreams       int  `json:"relay_streams"`
+	OnlineRelaySlots   int  `json:"online_relay_slots"`
+	RequiredRelaySlots int  `json:"required_relay_slots"`
 }
 
 func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
@@ -181,6 +231,9 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 	}
 	if spec.Delivery == recordingDeliveryNASPull && spec.DeliveryStorageDestinationID > 0 {
 		return spec, fmt.Errorf("nas_pull cannot use delivery_storage_destination_id")
+	}
+	if spec.RequiredRelaySlots < 0 {
+		return spec, fmt.Errorf("required_relay_slots cannot be negative")
 	}
 	selected := make(map[int64]struct{}, len(spec.StreamIDs))
 	for _, id := range spec.StreamIDs {
@@ -221,6 +274,8 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("recordings schedule-batch", flag.ExitOnError)
 	specPath := fs.String("spec", "", "strict JSON batch schedule spec")
+	dryRun := optionalBoolFlag(fs, "dry-run")
+	jsonOutput := fs.Bool("json", false, "print the complete JSON response for campaign postflight")
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
 	_ = fs.Parse(args)
@@ -242,11 +297,23 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 	if err != nil {
 		log.Fatalf("decode --spec: %v", err)
 	}
+	if dryRun.set {
+		spec.DryRun = dryRun.value
+	}
 	var result recordingBatchResult
 	if err := postJSONWithToken(ctx, *backendAPIURL, *apiToken, "/api/v1/account/recordings/batch-schedule", spec, &result); err != nil {
 		log.Fatalf("schedule recordings: %v", err)
 	}
-	fmt.Printf("created=%d updated=%d\n", result.Created, result.Updated)
+	if *jsonOutput {
+		out, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			log.Fatalf("encode schedule response: %v", err)
+		}
+		fmt.Println(string(out))
+		return
+	}
+	fmt.Printf("dry_run=%t created=%d updated=%d relay_streams=%d online_relay_slots=%d required_relay_slots=%d\n",
+		result.DryRun, result.Created, result.Updated, result.RelayStreams, result.OnlineRelaySlots, result.RequiredRelaySlots)
 	for _, item := range result.Items {
 		fmt.Printf("stream_id=%d recording_id=%d action=%s timezone=%s\n", item.StreamID, item.RecordingID, item.Action, item.Timezone)
 	}

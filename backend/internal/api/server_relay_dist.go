@@ -90,7 +90,7 @@ func (s *Server) streamReleaseArtifact(w http.ResponseWriter, r *http.Request, p
 
 func relayArtifactCacheControl(name string) string {
 	switch name {
-	case "latest.json", "install.sh", "uninstall.sh":
+	case "latest.json", "latest.json.sig", "install.sh", "uninstall.sh":
 		return "no-store"
 	default:
 		return "public, max-age=31536000, immutable"

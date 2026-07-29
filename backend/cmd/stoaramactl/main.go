@@ -108,6 +108,7 @@ func usage() {
 	  stoaramactl migrate up [--dir infra/sql/migrations]
 	  stoaramactl capture backfill-missing [--backend-api-url URL --api-token TOKEN --limit 0 --concurrency 4 --timeout-sec 90 --dry-run --json]
 	  stoaramactl capture probe (--id N | --provider P --source-url URL) [--source-page-url URL --capture-type TYPE --capture-timeout-sec 60]
+	  stoaramactl capture source-monitor --source-url URL [--duration 4h --clip 1m --output-dir DIR]
 	  stoaramactl capture audit --all [--concurrency 16 --timeout-sec 20 --json]
 	  stoaramactl capture runtime list [--status running|unsupported|error] [--limit 200] [--json]
 	  stoaramactl capture runtime show --id N [--json]
@@ -178,7 +179,9 @@ func usage() {
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl recordings naming allocate|get|set|preview
-	  stoaramactl recordings schedule-batch --spec FILE [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl recordings schedule-batch --spec FILE [--dry-run --json --backend-api-url URL --api-token TOKEN]
+	  stoaramactl recordings campaign-postflight (--recording-ids IDS | --batch-response FILE | --spec FILE) --session-cookie-file FILE [--max-nas-pending-clips N --backend-api-url URL --api-token TOKEN]
+	  stoaramactl recordings capture-health --id ID [--from YYYY-MM-DD --to YYYY-MM-DD --backend-api-url URL --api-token TOKEN]
 `)
 }
 
@@ -266,7 +269,11 @@ func runMigrate(ctx context.Context, cfg config.Config, args []string) {
 
 func runCapture(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl capture <backfill-missing|probe|classify|audit|runtime> ...")
+		log.Fatalf("usage: stoaramactl capture <backfill-missing|probe|source-monitor|audit|runtime> ...")
+	}
+	if args[0] == "source-monitor" {
+		runCaptureSourceMonitor(ctx, args[1:])
+		return
 	}
 	registry, err := capture.NewDefaultRegistry()
 	if err != nil {
@@ -4780,6 +4787,10 @@ func (o *optionalBool) String() string {
 		return "true"
 	}
 	return "false"
+}
+
+func (*optionalBool) IsBoolFlag() bool {
+	return true
 }
 
 func optionalBoolFlag(fs *flag.FlagSet, name string) *optionalBool {

@@ -3,17 +3,17 @@ package api
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 )
 
 const (
-	recentHealthBinSize  = 2 * time.Hour
-	recentHealthBinCount = 12
-	recentHealthLookback = 366 * 24 * time.Hour
-	maxDetailHealthBins  = 160
+	recentHealthBinSize      = 2 * time.Hour
+	recentHealthBinCount     = 12
+	recentHealthLookback     = 366 * 24 * time.Hour
+	recentContinuousLookback = 90 * 24 * time.Hour
 )
 
 type recordingHealthBin struct {
@@ -39,142 +39,126 @@ type recordingHealthSpec struct {
 	PausedAt         *time.Time
 }
 
-func recordingHealthBinSize(start, end time.Time, detailed bool) time.Duration {
-	if !detailed {
-		return recentHealthBinSize
-	}
-	span := end.Sub(start)
-	for _, size := range []time.Duration{2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour} {
-		if span <= time.Duration(maxDetailHealthBins)*size {
-			return size
-		}
-	}
-	days := int64(span/(24*time.Hour))/maxDetailHealthBins + 1
-	return time.Duration(days) * 24 * time.Hour
-}
-
 func alignedHealthBinStart(at time.Time, size time.Duration) time.Time {
 	return time.Unix(0, at.UTC().UnixNano()/int64(size)*int64(size)).UTC()
 }
 
-func expectedClipsStartingInBin(spec recordingHealthSpec, binStart, binEnd, coverageEnd time.Time) (int64, error) {
-	expectedEnd := binEnd.Add(time.Duration(spec.ClipDurationSec)*time.Second - time.Nanosecond)
+func expectedHealthBinsInRanges(spec recordingHealthSpec, ranges []captureHealthRange, coverageEnd time.Time) ([]recordingHealthBin, error) {
+	if len(ranges) == 0 {
+		return []recordingHealthBin{}, nil
+	}
+	expectedEnd := ranges[len(ranges)-1].end.Add(time.Duration(spec.ClipDurationSec)*time.Second - time.Nanosecond)
 	if expectedEnd.After(coverageEnd) {
 		expectedEnd = coverageEnd
 	}
-	return expectedRecordingClips(spec.Mode, spec.CronExpr, spec.Timezone, spec.DailyWindowStart, spec.DailyWindowEnd, spec.ActiveWeekdays, spec.ClipDurationSec, spec.StartAt, binStart, expectedEnd)
-}
-
-func expectedRecentSampledHealthBins(spec recordingHealthSpec, coverageEnd time.Time) ([]recordingHealthBin, error) {
-	schedule, err := recsched.ParseCron(spec.CronExpr)
+	startTOD, endTOD, err := recordingHealthWindow(spec)
 	if err != nil {
 		return nil, err
 	}
-	location, err := recsched.LoadLocation(spec.Timezone)
+	bins := make([]recordingHealthBin, len(ranges))
+	for i, hour := range ranges {
+		bins[i] = recordingHealthBin{Start: hour.start, End: hour.end}
+	}
+	if spec.Mode == "continuous" {
+		for i, hour := range ranges {
+			binEnd := hour.end.Add(time.Duration(spec.ClipDurationSec)*time.Second - time.Nanosecond)
+			if binEnd.After(coverageEnd) {
+				binEnd = coverageEnd
+			}
+			bins[i].Expected, err = recsched.ExpectedClipCount(spec.Mode, spec.CronExpr, spec.Timezone, startTOD, endTOD, spec.ActiveWeekdays, spec.ClipDurationSec, spec.StartAt, hour.start, binEnd)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return populatedHealthBins(bins), nil
+	}
+	index := 0
+	err = recsched.VisitExpectedClipStarts(spec.Mode, spec.CronExpr, spec.Timezone, startTOD, endTOD, spec.ActiveWeekdays, spec.ClipDurationSec, spec.StartAt, ranges[0].start, expectedEnd, func(start time.Time) {
+		for index < len(ranges) && !start.Before(ranges[index].end) {
+			index++
+		}
+		if index == len(ranges) {
+			return
+		}
+		if !start.Before(ranges[index].start) {
+			bins[index].Expected++
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
-	lookback := 24 * time.Hour
-	for {
-		rangeStart := coverageEnd.Add(-lookback)
-		if rangeStart.Before(spec.StartAt) {
-			rangeStart = spec.StartAt.UTC()
-		}
-		latestFire := coverageEnd.Add(-time.Duration(spec.ClipDurationSec) * time.Second)
-		counts := map[int64]int64{}
-		for fire := schedule.Next(rangeStart.Add(-time.Nanosecond).In(location)); !fire.IsZero() && !fire.After(latestFire); fire = schedule.Next(fire) {
-			counts[alignedHealthBinStart(fire, recentHealthBinSize).Unix()]++
-		}
-		starts := make([]int64, 0, len(counts))
-		for start := range counts {
-			starts = append(starts, start)
-		}
-		sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
-		if len(starts) >= recentHealthBinCount || rangeStart.Equal(spec.StartAt.UTC()) || lookback >= recentHealthLookback {
-			if len(starts) > recentHealthBinCount {
-				starts = starts[len(starts)-recentHealthBinCount:]
-			}
-			bins := make([]recordingHealthBin, 0, len(starts))
-			for _, unixStart := range starts {
-				start := time.Unix(unixStart, 0).UTC()
-				end := start.Add(recentHealthBinSize)
-				if start.Before(spec.StartAt) {
-					start = spec.StartAt.UTC()
-				}
-				if end.After(coverageEnd) {
-					end = coverageEnd
-				}
-				bins = append(bins, recordingHealthBin{Start: start, End: end, Expected: counts[unixStart]})
-			}
-			return bins, nil
-		}
-		lookback *= 2
-		if lookback > recentHealthLookback {
-			lookback = recentHealthLookback
-		}
-	}
+	return populatedHealthBins(bins), nil
 }
 
-func expectedHealthBins(spec recordingHealthSpec, now time.Time, detailed bool) ([]recordingHealthBin, error) {
+func populatedHealthBins(bins []recordingHealthBin) []recordingHealthBin {
+	expected := bins[:0]
+	for _, bin := range bins {
+		if bin.Expected > 0 {
+			expected = append(expected, bin)
+		}
+	}
+	return expected
+}
+
+func recordingHealthWindow(spec recordingHealthSpec) (*recsched.TimeOfDay, *recsched.TimeOfDay, error) {
+	if spec.Mode != "continuous" {
+		return nil, nil, nil
+	}
+	start, err := recsched.ParseTimeOfDay(spec.DailyWindowStart)
+	if err != nil {
+		return nil, nil, err
+	}
+	end, err := recsched.ParseTimeOfDay(spec.DailyWindowEnd)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &start, &end, nil
+}
+
+func expectedHealthBins(spec recordingHealthSpec, now time.Time) ([]recordingHealthBin, error) {
 	_, coverageEnd := recordingCoverageWindow(spec.Status, spec.StartAt, spec.EndAt, spec.PausedAt, now)
 	coverageStart := spec.StartAt.UTC()
 	if !coverageStart.Before(coverageEnd) {
 		return []recordingHealthBin{}, nil
 	}
-	size := recordingHealthBinSize(coverageStart, coverageEnd, detailed)
-	if !detailed {
-		if spec.Mode == "sampled" {
-			return expectedRecentSampledHealthBins(spec, coverageEnd)
-		}
-		if boundedStart := coverageEnd.Add(-recentHealthLookback); coverageStart.Before(boundedStart) {
-			coverageStart = boundedStart
-		}
-		bins := make([]recordingHealthBin, 0, recentHealthBinCount)
-		for cursor := alignedHealthBinStart(coverageEnd.Add(-time.Nanosecond), size); !cursor.Add(size).Before(coverageStart) && len(bins) < recentHealthBinCount; cursor = cursor.Add(-size) {
-			binStart, binEnd := cursor, cursor.Add(size)
+	lookback := recentHealthLookback
+	if spec.Mode == "continuous" {
+		// A continuous schedule repeats weekly at its sparsest, so 90 days
+		// contains at least twelve eligible weekday windows.
+		lookback = recentContinuousLookback
+	}
+	if boundedStart := coverageEnd.Add(-lookback); coverageStart.Before(boundedStart) {
+		coverageStart = boundedStart
+	}
+	cursor := alignedHealthBinStart(coverageEnd.Add(-time.Nanosecond), recentHealthBinSize)
+	newest := make([]recordingHealthBin, 0, recentHealthBinCount)
+	for cursor.Add(recentHealthBinSize).After(coverageStart) && len(newest) < recentHealthBinCount {
+		ranges := make([]captureHealthRange, 0, recentHealthBinCount)
+		for len(ranges) < recentHealthBinCount && cursor.Add(recentHealthBinSize).After(coverageStart) {
+			binStart, binEnd := cursor, cursor.Add(recentHealthBinSize)
 			if binStart.Before(coverageStart) {
 				binStart = coverageStart
 			}
 			if binEnd.After(coverageEnd) {
 				binEnd = coverageEnd
 			}
-			expected, err := expectedClipsStartingInBin(spec, binStart, binEnd, coverageEnd)
-			if err != nil {
-				return nil, err
-			}
-			if expected > 0 {
-				bins = append(bins, recordingHealthBin{Start: binStart, End: binEnd, Expected: expected})
-			}
+			ranges = append(ranges, captureHealthRange{start: binStart, end: binEnd})
+			cursor = cursor.Add(-recentHealthBinSize)
 		}
-		for left, right := 0, len(bins)-1; left < right; left, right = left+1, right-1 {
-			bins[left], bins[right] = bins[right], bins[left]
-		}
-		return bins, nil
-	}
-	start := alignedHealthBinStart(coverageStart, size)
-	bins := make([]recordingHealthBin, 0, recentHealthBinCount)
-	for cursor := start; cursor.Before(coverageEnd); cursor = cursor.Add(size) {
-		binStart := cursor
-		if binStart.Before(coverageStart) {
-			binStart = coverageStart
-		}
-		binEnd := cursor.Add(size)
-		if binEnd.After(coverageEnd) {
-			binEnd = coverageEnd
-		}
-		expected, err := expectedClipsStartingInBin(spec, binStart, binEnd, coverageEnd)
+		slices.Reverse(ranges)
+		bins, err := expectedHealthBinsInRanges(spec, ranges, coverageEnd)
 		if err != nil {
 			return nil, err
 		}
-		if expected == 0 {
-			continue
+		for i := len(bins) - 1; i >= 0 && len(newest) < recentHealthBinCount; i-- {
+			newest = append(newest, bins[i])
 		}
-		bins = append(bins, recordingHealthBin{Start: binStart, End: binEnd, Expected: expected})
 	}
-	return bins, nil
+	slices.Reverse(newest)
+	return newest, nil
 }
 
-func (s *Server) recordingHealthBinsForAccount(ctx context.Context, accountID int64, recordingIDs []int64, detailed bool) (map[int64][]recordingHealthBin, error) {
+func (s *Server) recordingHealthBinsForAccount(ctx context.Context, accountID int64, recordingIDs []int64) (map[int64][]recordingHealthBin, error) {
 	out := make(map[int64][]recordingHealthBin, len(recordingIDs))
 	if accountID <= 0 || len(recordingIDs) == 0 {
 		return out, nil
@@ -196,7 +180,7 @@ func (s *Server) recordingHealthBinsForAccount(ctx context.Context, accountID in
 			rows.Close()
 			return nil, err
 		}
-		bins, err := expectedHealthBins(spec, now, detailed)
+		bins, err := expectedHealthBins(spec, now)
 		if err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("compute recording %d health bins: %w", spec.ID, err)

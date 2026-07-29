@@ -2,16 +2,28 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingworker"
+)
+
+const (
+	relayMinLeaseFreeBytes  = 2 << 30
+	relayMinActiveFreeBytes = 512 << 20
+	relayLogMaxBytes        = 8 << 20
+	relayLogTailBytes       = 64 << 10
 )
 
 // runRelay is the launchd/systemd service entrypoint. It runs the shared
@@ -25,11 +37,42 @@ func runRelay(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	lock, err := acquireRelayRunLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := refreshSystemdUnit(); err != nil {
+		log.Printf("relay systemd unit refresh error: %v", err)
+	}
+	relayLog, err := openBoundedRelayLog()
+	if err != nil {
+		return err
+	}
+	previousLogWriter := log.Writer()
+	defer relayLog.Close()
+	defer log.SetOutput(previousLogWriter)
+	log.SetOutput(relayLogOutput(previousLogWriter, relayLog))
 	bd, err := binDir()
 	if err != nil {
 		return err
 	}
 	ytdlp := filepath.Join(bd, "yt-dlp")
+	tempRoot, err := relayCaptureTempRoot()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+		return fmt.Errorf("create relay capture temp root: %w", err)
+	}
+	removed, err := cleanupRelayCaptureTemp(tempRoot)
+	if err != nil {
+		log.Printf("clean relay capture temp root error: %v", err)
+	}
+	removed += cleanupLegacyCaptureTempBestEffort(os.TempDir(), time.Now(), 15*time.Minute)
+	if removed > 0 {
+		log.Printf("stoarama-relay removed %d stale capture directories", removed)
+	}
 
 	// Force UTC for this process AND every ffmpeg child it spawns. The capture path
 	// names segments with a strftime pattern that ffmpeg expands in the local zone,
@@ -72,6 +115,12 @@ func runRelay(ctx context.Context) error {
 		ActiveJobs:                  &activeJobs,
 		RelayDiagnostics:            relayDiag,
 		ContinuousNoProgressTimeout: 5 * time.Minute,
+		CaptureTempDir:              tempRoot,
+		DiskFreeBytes: func() (uint64, error) {
+			return diskFreeBytes(tempRoot)
+		},
+		MinLeaseFreeBytes:  relayMinLeaseFreeBytes,
+		MinActiveFreeBytes: relayMinActiveFreeBytes,
 	})
 	if err != nil {
 		return fmt.Errorf("init relay worker: %w", err)
@@ -84,7 +133,8 @@ func runRelay(ctx context.Context) error {
 	// update heartbeat visibility and do not touch the resolve env. A mode change takes
 	// effect only across a process restart.
 	pr := newProbe(ytdlp)
-	if err := ensureRollbackBaseline(cfg); err != nil {
+	selfUpdatesEnabled, err := prepareSelfUpdates(cfg)
+	if err != nil {
 		return fmt.Errorf("establish rollback baseline: %w", err)
 	}
 	firstHeartbeat := make(chan struct{})
@@ -92,7 +142,7 @@ func runRelay(ctx context.Context) error {
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		relayHeartbeatLoop(heartbeatCtx, client, pr, &activeJobs, relayDiag, startedAt, firstHeartbeat)
+		relayHeartbeatLoop(heartbeatCtx, client, pr, &activeJobs, relayDiag, startedAt, tempRoot, cfg.APIURL, firstHeartbeat)
 	}()
 	select {
 	case <-ctx.Done():
@@ -107,7 +157,9 @@ func runRelay(ctx context.Context) error {
 		cfg.NodeID, relayWorkerCeiling, cfg.APIURL, pr.ok(), pr.errorClass())
 
 	go pr.runLoop(ctx)
-	go selfUpdateLoop(ctx, cfg)
+	if selfUpdatesEnabled {
+		go selfUpdateLoop(ctx, cfg)
+	}
 
 	err = worker.Run(ctx)
 	stopHeartbeat()
@@ -116,8 +168,214 @@ func runRelay(ctx context.Context) error {
 		if path := recoveryStatePath(); path != "" {
 			markRelayExit(relayExitClean)
 		}
+	} else {
+		markRelayExit(relayExitProcessError)
 	}
 	return err
+}
+
+func prepareSelfUpdates(cfg relayConfig) (bool, error) {
+	if strings.TrimSpace(releasePublicKeyBase64) == "" {
+		log.Printf("relay self-update disabled: release public key unavailable")
+		return false, nil
+	}
+	if err := ensureRollbackBaseline(cfg); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+type boundedRelayLog struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+type dualRelayLogWriter struct {
+	primary  io.Writer
+	recovery io.Writer
+}
+
+func relayLogOutput(primary io.Writer, recovery *boundedRelayLog) io.Writer {
+	primaryFile, ok := primary.(*os.File)
+	if ok {
+		primaryInfo, primaryErr := primaryFile.Stat()
+		recoveryInfo, recoveryErr := recovery.file.Stat()
+		if primaryErr == nil && recoveryErr == nil && os.SameFile(primaryInfo, recoveryInfo) {
+			return recovery
+		}
+	}
+	return dualRelayLogWriter{primary: primary, recovery: recovery}
+}
+
+func (w dualRelayLogWriter) Write(p []byte) (int, error) {
+	_, primaryErr := w.primary.Write(p)
+	_, recoveryErr := w.recovery.Write(p)
+	if err := errors.Join(primaryErr, recoveryErr); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func openBoundedRelayLog() (*boundedRelayLog, error) {
+	home, err := stoaramaHome()
+	if err != nil {
+		return nil, err
+	}
+	path := relayLogPath(home)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create relay log directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open relay log: %w", err)
+	}
+	return &boundedRelayLog{file: file}, nil
+}
+
+func relayLogPath(home string) string {
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, "logs", "relay.log")
+}
+
+func (w *boundedRelayLog) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	info, err := w.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if info.Size()+int64(len(p)) > relayLogMaxBytes {
+		if len(p) >= relayLogMaxBytes {
+			if err := w.file.Truncate(0); err != nil {
+				return 0, err
+			}
+			if _, err := w.file.Write(p[len(p)-relayLogMaxBytes:]); err != nil {
+				return 0, err
+			}
+			return len(p), nil
+		}
+		tailBytes := min(int64(relayLogTailBytes), info.Size(), int64(relayLogMaxBytes-len(p)))
+		tail := make([]byte, tailBytes)
+		if tailBytes > 0 {
+			if _, err := w.file.ReadAt(tail, info.Size()-tailBytes); err != nil {
+				return 0, err
+			}
+		}
+		if err := w.file.Truncate(0); err != nil {
+			return 0, err
+		}
+		if _, err := w.file.Seek(0, 0); err != nil {
+			return 0, err
+		}
+		if _, err := w.file.Write(tail); err != nil {
+			return 0, err
+		}
+	}
+	return w.file.Write(p)
+}
+
+func (w *boundedRelayLog) Close() error {
+	return w.file.Close()
+}
+
+func relayCaptureTempRoot() (string, error) {
+	home, err := stoaramaHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "tmp"), nil
+}
+
+func diskFreeBytes(path string) (uint64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	return stat.Bavail * uint64(stat.Bsize), nil
+}
+
+func cleanupRelayCaptureTemp(root string) (int, error) {
+	return cleanupRelayCaptureTempWith(root, os.RemoveAll)
+}
+
+func cleanupRelayCaptureTempWith(root string, remove func(string) error) (int, error) {
+	// runRelay acquires the single-process lock before calling this function, so
+	// every capture directory in the app-owned temp root belongs to an exited run.
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	var errs []error
+	for _, entry := range entries {
+		if !entry.IsDir() || (!strings.HasPrefix(entry.Name(), "capture-continuous-") && !strings.HasPrefix(entry.Name(), "capture-segment-")) {
+			continue
+		}
+		if err := remove(filepath.Join(root, entry.Name())); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", entry.Name(), err))
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(errs...)
+}
+
+func cleanupLegacyCaptureTemp(root string, now time.Time, staleAfter time.Duration) (int, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || (!strings.HasPrefix(entry.Name(), "capture-continuous-") && !strings.HasPrefix(entry.Name(), "capture-segment-")) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return removed, err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != uint32(os.Getuid()) || now.Sub(info.ModTime()) < staleAfter {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func cleanupLegacyCaptureTempBestEffort(root string, now time.Time, staleAfter time.Duration) int {
+	removed, err := cleanupLegacyCaptureTemp(root, now, staleAfter)
+	if err != nil {
+		log.Printf("relay legacy temp cleanup skipped: %v", err)
+		return 0
+	}
+	return removed
+}
+
+func acquireRelayRunLock() (*os.File, error) {
+	home, err := stoaramaHome()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(home, "relay.lock")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("acquire relay process lock: %w", err)
+	}
+	return file, nil
 }
 
 func relayFFmpegBin(binDir string) string {

@@ -91,7 +91,10 @@ type RecordingJob struct {
 
 type SurrenderReason string
 
-const SurrenderNoProgress SurrenderReason = "no_progress"
+const (
+	SurrenderNoProgress   SurrenderReason = "no_progress"
+	SurrenderDiskPressure SurrenderReason = "disk_pressure"
+)
 
 // ClipUploadIntent is a presigned PUT against the user's bucket.
 type ClipUploadIntent struct {
@@ -248,7 +251,14 @@ func (c *Client) TouchDroplet(ctx context.Context) error {
 // The relay binary calls this on its own 30s ticker; cloud droplet workers use
 // TouchDroplet instead and never call this.
 func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any) error {
-	return c.postJSON(ctx, "/api/v1/node/heartbeat", map[string]any{"capabilities_json": capabilities}, nil)
+	status, body, err := c.postRaw(ctx, "/api/v1/node/heartbeat", map[string]any{"capabilities_json": capabilities})
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return &apihttp.StatusError{Label: "node heartbeat", Code: status, Body: strings.TrimSpace(string(body))}
+	}
+	return nil
 }
 
 func (c *Client) LeaseSurveyTargets(ctx context.Context, limit int) (SurveyLease, error) {

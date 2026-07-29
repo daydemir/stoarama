@@ -63,6 +63,10 @@ func main() {
 		if err := runSelfUpdate(args); err != nil {
 			fatal(err)
 		}
+	case "record-exit":
+		if err := recordSystemdExit(args); err != nil {
+			fatal(err)
+		}
 	case "version", "--version", "-v":
 		fmt.Printf("stoarama-relay %s\n", version)
 	default:
@@ -82,6 +86,7 @@ func usage() {
 		"  link-youtube                                          [experimental] export Chrome cookies for private/members YouTube; needs STOARAMA_RELAY_YT_COOKIES=1 + a bundled JS runtime",
 		"  self-update [--api-url URL] [--manifest NAME]          update from a release manifest",
 		"  self-update --rollback                                 restore the previous relay binary",
+		"  record-exit                                            persist systemd stop result (service helper)",
 		"  version                                               print the relay version",
 		"",
 	}, "\n"))

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -9,55 +10,60 @@ import (
 )
 
 type Config struct {
-	Port                        int
-	DatabaseURL                 string
-	APIToken                    string
-	ServiceToken                string
-	BootstrapAdminEmail         string
-	MigrationDir                string
-	AutoMigrate                 bool
-	R2AccountID                 string
-	R2AccessKeyID               string
-	R2SecretAccessKey           string
-	R2Bucket                    string
-	R2Region                    string
-	R2Endpoint                  string
-	R2SignGetTTL                time.Duration
-	R2SignPutTTL                time.Duration
-	StorageCredKey              string
-	AppBaseURL                  string
-	MagicLinkTTL                time.Duration
-	SessionTTL                  time.Duration
-	EmailProvider               string
-	EmailFrom                   string
-	EmailReplyTo                string
-	EmailResendAPIKey           string
-	StreamAlertsRecipients      string
-	StreamAlertsEnabled         bool
-	StreamAlertsPollSec         int
-	StreamAlertsProblemDelaySec int
-	StreamAlertsRepeatSec       int
-	StreamAlertsResolutionEmail bool
-	CaptureTickSec              int
-	CaptureConcurrency          int
-	CaptureModeAllowlist        string
-	CaptureLeaseSec             int
-	CaptureUnsupportedThreshold int
-	CaptureFrameQueueSize       int
-	CaptureFrameEnqueueTimeout  int
-	CaptureFrameWriters         int
-	InferenceBoxPollSec         int
-	InferenceBoxConcurrency     int
-	InferenceBoxLeaseSec        int
-	InferenceBoxMaxAttempts     int
-	InferenceBoxRetryBaseSec    int
-	InferenceBoxRetryMaxSec     int
-	BoxWorkerEmbedded           bool
-	WorkerID                    string
-	SurveyEnabled               bool
-	SurveyConcurrency           int
-	SurveyResolveTimeoutSec     int
-	SurveyCaptureTimeoutSec     int
+	Port                             int
+	DatabaseURL                      string
+	APIToken                         string
+	ServiceToken                     string
+	BootstrapAdminEmail              string
+	MigrationDir                     string
+	AutoMigrate                      bool
+	R2AccountID                      string
+	R2AccessKeyID                    string
+	R2SecretAccessKey                string
+	R2Bucket                         string
+	R2Region                         string
+	R2Endpoint                       string
+	R2SignGetTTL                     time.Duration
+	R2SignPutTTL                     time.Duration
+	StorageCredKey                   string
+	AppBaseURL                       string
+	MagicLinkTTL                     time.Duration
+	SessionTTL                       time.Duration
+	SharedRecordingsAccountID        int64
+	SharedRecordingsSlug             string
+	SharedRecordingsPassword         string
+	SharedRecordingsCookieSigningKey string
+	SharedRecordingsProxyCIDRs       []netip.Prefix
+	EmailProvider                    string
+	EmailFrom                        string
+	EmailReplyTo                     string
+	EmailResendAPIKey                string
+	StreamAlertsRecipients           string
+	StreamAlertsEnabled              bool
+	StreamAlertsPollSec              int
+	StreamAlertsProblemDelaySec      int
+	StreamAlertsRepeatSec            int
+	StreamAlertsResolutionEmail      bool
+	CaptureTickSec                   int
+	CaptureConcurrency               int
+	CaptureModeAllowlist             string
+	CaptureLeaseSec                  int
+	CaptureUnsupportedThreshold      int
+	CaptureFrameQueueSize            int
+	CaptureFrameEnqueueTimeout       int
+	CaptureFrameWriters              int
+	InferenceBoxPollSec              int
+	InferenceBoxConcurrency          int
+	InferenceBoxLeaseSec             int
+	InferenceBoxMaxAttempts          int
+	InferenceBoxRetryBaseSec         int
+	InferenceBoxRetryMaxSec          int
+	BoxWorkerEmbedded                bool
+	WorkerID                         string
+	SurveyEnabled                    bool
+	SurveyConcurrency                int
+	SurveyResolveTimeoutSec          int
+	SurveyCaptureTimeoutSec          int
 
 	// Survey inline yolo11x detection (#47). Consumed only by
 	// `stoaramactl survey run-once --detect` on the unified survey+detection
@@ -132,55 +138,59 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		Port:                        intEnv("PORT", 8080),
-		DatabaseURL:                 os.Getenv("DATABASE_URL"),
-		APIToken:                    firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
-		ServiceToken:                firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
-		BootstrapAdminEmail:         strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
-		MigrationDir:                strEnv("MIGRATION_DIR", ""),
-		AutoMigrate:                 boolEnv("AUTO_MIGRATE", false),
-		R2AccountID:                 os.Getenv("R2_ACCOUNT_ID"),
-		R2AccessKeyID:               os.Getenv("R2_ACCESS_KEY_ID"),
-		R2SecretAccessKey:           os.Getenv("R2_SECRET_ACCESS_KEY"),
-		R2Bucket:                    os.Getenv("R2_BUCKET"),
-		R2Region:                    strEnv("R2_REGION", "auto"),
-		R2Endpoint:                  os.Getenv("R2_ENDPOINT"),
-		R2SignGetTTL:                durEnv("R2_SIGN_GET_TTL", 10*time.Minute),
-		R2SignPutTTL:                durEnv("R2_SIGN_PUT_TTL", 15*time.Minute),
-		StorageCredKey:              strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),
-		AppBaseURL:                  strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
-		MagicLinkTTL:                durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 60*time.Minute)),
-		SessionTTL:                  durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),
-		EmailProvider:               strEnv("EMAIL_PROVIDER", strEnv("RESEARCH_EMAIL_PROVIDER", "log")),
-		EmailFrom:                   firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
-		EmailReplyTo:                firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
-		EmailResendAPIKey:           firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
-		StreamAlertsRecipients:      firstNonEmpty(os.Getenv("STREAM_ALERTS_RECIPIENTS"), os.Getenv("RESEARCH_STREAM_ALERTS_RECIPIENTS")),
-		StreamAlertsEnabled:         boolEnv("STREAM_ALERTS_ENABLED", false),
-		StreamAlertsPollSec:         intEnv("STREAM_ALERTS_POLL_SEC", 60),
-		StreamAlertsProblemDelaySec: intEnv("STREAM_ALERTS_PROBLEM_DELAY_SEC", 300),
-		StreamAlertsRepeatSec:       intEnv("STREAM_ALERTS_REPEAT_SEC", 43200),
-		StreamAlertsResolutionEmail: boolEnv("STREAM_ALERTS_RESOLUTION_EMAIL", true),
-		CaptureTickSec:              intEnv("CAPTURE_TICK_SEC", 1),
-		CaptureConcurrency:          intEnv("CAPTURE_CONCURRENCY", 8),
-		CaptureModeAllowlist:        strEnv("CAPTURE_MODE_ALLOWLIST", ""),
-		CaptureLeaseSec:             intEnv("CAPTURE_LEASE_SEC", 30),
-		CaptureUnsupportedThreshold: intEnv("CAPTURE_UNSUPPORTED_THRESHOLD", 8),
-		CaptureFrameQueueSize:       intEnv("CAPTURE_FRAME_QUEUE_SIZE", 16),
-		CaptureFrameEnqueueTimeout:  intEnv("CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC", 3),
-		CaptureFrameWriters:         intEnv("CAPTURE_FRAME_WRITERS", 1),
-		InferenceBoxPollSec:         intEnv("BOX_WORKER_POLL_SEC", 2),
-		InferenceBoxConcurrency:     intEnv("BOX_WORKER_CONCURRENCY", 2),
-		InferenceBoxLeaseSec:        intEnv("BOX_WORKER_LEASE_SEC", 300),
-		InferenceBoxMaxAttempts:     intEnv("BOX_WORKER_MAX_ATTEMPTS", 8),
-		InferenceBoxRetryBaseSec:    intEnv("BOX_WORKER_RETRY_BASE_SEC", 5),
-		InferenceBoxRetryMaxSec:     intEnv("BOX_WORKER_RETRY_MAX_SEC", 300),
-		BoxWorkerEmbedded:           boolEnv("BOX_WORKER_EMBEDDED", false),
-		WorkerID:                    strEnv("WORKER_ID", "capture-worker-1"),
-		SurveyEnabled:               boolEnv("SURVEY_ENABLED", false),
-		SurveyConcurrency:           intEnv("SURVEY_CONCURRENCY", 4),
-		SurveyResolveTimeoutSec:     intEnv("SURVEY_RESOLVE_TIMEOUT_SEC", 60),
-		SurveyCaptureTimeoutSec:     intEnv("SURVEY_CAPTURE_TIMEOUT_SEC", 60),
+		Port:                             intEnv("PORT", 8080),
+		DatabaseURL:                      os.Getenv("DATABASE_URL"),
+		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
+		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
+		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
+		MigrationDir:                     strEnv("MIGRATION_DIR", ""),
+		AutoMigrate:                      boolEnv("AUTO_MIGRATE", false),
+		R2AccountID:                      os.Getenv("R2_ACCOUNT_ID"),
+		R2AccessKeyID:                    os.Getenv("R2_ACCESS_KEY_ID"),
+		R2SecretAccessKey:                os.Getenv("R2_SECRET_ACCESS_KEY"),
+		R2Bucket:                         os.Getenv("R2_BUCKET"),
+		R2Region:                         strEnv("R2_REGION", "auto"),
+		R2Endpoint:                       os.Getenv("R2_ENDPOINT"),
+		R2SignGetTTL:                     durEnv("R2_SIGN_GET_TTL", 10*time.Minute),
+		R2SignPutTTL:                     durEnv("R2_SIGN_PUT_TTL", 15*time.Minute),
+		StorageCredKey:                   strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),
+		AppBaseURL:                       strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
+		MagicLinkTTL:                     durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 60*time.Minute)),
+		SessionTTL:                       durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),
+		SharedRecordingsAccountID:        int64(intEnv("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID", 0)),
+		SharedRecordingsSlug:             strEnv("MIT_SCL_RECORDINGS_READ_SLUG", "mit-scl"),
+		SharedRecordingsPassword:         strings.TrimSpace(os.Getenv("MIT_SCL_RECORDINGS_READ_PASSWORD")),
+		SharedRecordingsCookieSigningKey: strings.TrimSpace(os.Getenv("MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY")),
+		EmailProvider:                    strEnv("EMAIL_PROVIDER", strEnv("RESEARCH_EMAIL_PROVIDER", "log")),
+		EmailFrom:                        firstNonEmpty(os.Getenv("EMAIL_FROM"), os.Getenv("RESEARCH_EMAIL_FROM")),
+		EmailReplyTo:                     firstNonEmpty(os.Getenv("EMAIL_REPLY_TO"), os.Getenv("RESEARCH_EMAIL_REPLY_TO")),
+		EmailResendAPIKey:                firstNonEmpty(os.Getenv("EMAIL_RESEND_API_KEY"), os.Getenv("RESEARCH_EMAIL_RESEND_API_KEY")),
+		StreamAlertsRecipients:           firstNonEmpty(os.Getenv("STREAM_ALERTS_RECIPIENTS"), os.Getenv("RESEARCH_STREAM_ALERTS_RECIPIENTS")),
+		StreamAlertsEnabled:              boolEnv("STREAM_ALERTS_ENABLED", false),
+		StreamAlertsPollSec:              intEnv("STREAM_ALERTS_POLL_SEC", 60),
+		StreamAlertsProblemDelaySec:      intEnv("STREAM_ALERTS_PROBLEM_DELAY_SEC", 300),
+		StreamAlertsRepeatSec:            intEnv("STREAM_ALERTS_REPEAT_SEC", 43200),
+		StreamAlertsResolutionEmail:      boolEnv("STREAM_ALERTS_RESOLUTION_EMAIL", true),
+		CaptureTickSec:                   intEnv("CAPTURE_TICK_SEC", 1),
+		CaptureConcurrency:               intEnv("CAPTURE_CONCURRENCY", 8),
+		CaptureModeAllowlist:             strEnv("CAPTURE_MODE_ALLOWLIST", ""),
+		CaptureLeaseSec:                  intEnv("CAPTURE_LEASE_SEC", 30),
+		CaptureUnsupportedThreshold:      intEnv("CAPTURE_UNSUPPORTED_THRESHOLD", 8),
+		CaptureFrameQueueSize:            intEnv("CAPTURE_FRAME_QUEUE_SIZE", 16),
+		CaptureFrameEnqueueTimeout:       intEnv("CAPTURE_FRAME_ENQUEUE_TIMEOUT_SEC", 3),
+		CaptureFrameWriters:              intEnv("CAPTURE_FRAME_WRITERS", 1),
+		InferenceBoxPollSec:              intEnv("BOX_WORKER_POLL_SEC", 2),
+		InferenceBoxConcurrency:          intEnv("BOX_WORKER_CONCURRENCY", 2),
+		InferenceBoxLeaseSec:             intEnv("BOX_WORKER_LEASE_SEC", 300),
+		InferenceBoxMaxAttempts:          intEnv("BOX_WORKER_MAX_ATTEMPTS", 8),
+		InferenceBoxRetryBaseSec:         intEnv("BOX_WORKER_RETRY_BASE_SEC", 5),
+		InferenceBoxRetryMaxSec:          intEnv("BOX_WORKER_RETRY_MAX_SEC", 300),
+		BoxWorkerEmbedded:                boolEnv("BOX_WORKER_EMBEDDED", false),
+		WorkerID:                         strEnv("WORKER_ID", "capture-worker-1"),
+		SurveyEnabled:                    boolEnv("SURVEY_ENABLED", false),
+		SurveyConcurrency:                intEnv("SURVEY_CONCURRENCY", 4),
+		SurveyResolveTimeoutSec:          intEnv("SURVEY_RESOLVE_TIMEOUT_SEC", 60),
+		SurveyCaptureTimeoutSec:          intEnv("SURVEY_CAPTURE_TIMEOUT_SEC", 60),
 
 		SurveyModelPath:             strEnv("SURVEY_MODEL_PATH", "/opt/stoarama/models/yolo11x-1600.onnx"),
 		SurveyModelKey:              strEnv("SURVEY_MODEL_KEY", "survey/models/yolo11x-1600-74c2734984aa83a832cf377efbf8c2169a5f0d0f0b31b0123a852af3ad89c83f.onnx"),
@@ -238,6 +248,11 @@ func Load() (Config, error) {
 		DropletPoolRepoCloneToken:       strings.TrimSpace(os.Getenv("DROPLET_POOL_REPO_CLONE_TOKEN")),
 		DropletPoolBackendAPIURL:        strings.TrimRight(strings.TrimSpace(firstNonEmpty(os.Getenv("DROPLET_POOL_BACKEND_API_URL"), os.Getenv("BACKEND_API_URL"))), "/"),
 	}
+	var err error
+	cfg.SharedRecordingsProxyCIDRs, err = prefixesEnv("MIT_SCL_RECORDINGS_TRUSTED_PROXY_CIDRS")
+	if err != nil {
+		return Config{}, err
+	}
 	if cfg.R2Endpoint == "" && cfg.R2AccountID != "" {
 		cfg.R2Endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)
 	}
@@ -247,7 +262,40 @@ func Load() (Config, error) {
 	if cfg.SessionTTL <= 0 {
 		return Config{}, fmt.Errorf("invalid SESSION_TTL")
 	}
+	if cfg.SharedRecordingsAccountID < 0 {
+		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID must be positive")
+	}
+	if (cfg.SharedRecordingsAccountID > 0) != (cfg.SharedRecordingsPassword != "") {
+		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID and MIT_SCL_RECORDINGS_READ_PASSWORD must be set together")
+	}
+	if !validSharedRecordingsSlug(cfg.SharedRecordingsSlug) {
+		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_SLUG must contain only lowercase letters, numbers, and single hyphens")
+	}
+	if cfg.SharedRecordingsAccountID > 0 && len(cfg.SharedRecordingsCookieSigningKey) < 32 {
+		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY must contain at least 32 characters when shared recordings are enabled")
+	}
+	if cfg.SharedRecordingsPassword != "" && len(cfg.SharedRecordingsPassword) < 8 {
+		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_PASSWORD must contain at least 8 characters")
+	}
 	return cfg, nil
+}
+
+func validSharedRecordingsSlug(slug string) bool {
+	if slug == "" || slug[0] == '-' || slug[len(slug)-1] == '-' {
+		return false
+	}
+	previousHyphen := false
+	for _, char := range slug {
+		hyphen := char == '-'
+		if !hyphen && (char < 'a' || char > 'z') && (char < '0' || char > '9') {
+			return false
+		}
+		if hyphen && previousHyphen {
+			return false
+		}
+		previousHyphen = hyphen
+	}
+	return true
 }
 
 func (c Config) ValidateAPI() error {
@@ -341,6 +389,23 @@ func intEnv(key string, def int) int {
 		panic(fmt.Sprintf("invalid int env %s=%q: %v", key, v, err))
 	}
 	return n
+}
+
+func prefixesEnv(key string) ([]netip.Prefix, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	for _, part := range parts {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR in %s: %w", key, err)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
 }
 
 func floatEnv(key string, def float64) float64 {

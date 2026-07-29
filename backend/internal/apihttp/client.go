@@ -54,7 +54,7 @@ func (c *Client) PostJSONWithHeaders(ctx context.Context, path string, payload a
 		return err
 	}
 	if status < 200 || status >= 300 {
-		return fmt.Errorf("request %s status=%d body=%s", path, status, strings.TrimSpace(string(body)))
+		return &StatusError{Label: "request " + path, Code: status, Body: strings.TrimSpace(string(body))}
 	}
 	if out == nil || len(bytes.TrimSpace(body)) == 0 {
 		return nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -56,12 +57,278 @@ func TestBatchCaptureVia(t *testing.T) {
 	}
 }
 
+func TestBatchScheduleDryRunIsReadOnly(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	userID, accountID := seedUserOrg(t, pool, "batch-dry-run@example.com", false)
+	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO nodes (account_id, display_name, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES ($1, 'dry-run-relay', 'relay', 'active', now(), 3)
+	`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	var destID, streamID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
+		VALUES ($1, 'dry-run', 's3_compatible', 'https://s3.example.com', 'auto', 'dry-run', 'key', decode('00','hex'), 'verified', true)
+		RETURNING id
+	`, accountID).Scan(&destID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps)
+		VALUES ('test', 'dry-run', 'Dry Run', 'dry-run', 'https://example.com/live.m3u8', 'hls', 'direct_stream', 'video_live', 'continuous_video', 30)
+		RETURNING id
+	`).Scan(&streamID); err != nil {
+		t.Fatal(err)
+	}
+	request := batchScheduleRequest{
+		StreamIDs:            []int64{streamID},
+		StreamTimezones:      []streamTimezoneInput{{StreamID: streamID, Timezone: "Europe/Warsaw"}},
+		NamingProfile:        recordingnaming.ProfilePlazaHourlyV1.String(),
+		Mode:                 "continuous",
+		ClipDurationSec:      60,
+		DailyWindowStart:     "08:00",
+		DailyWindowEnd:       "20:00",
+		StorageDestinationID: destID,
+		Delivery:             "managed",
+		DryRun:               true,
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(body)), principal, "")
+	rec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dry run status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response batchScheduleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.DryRun || response.Created != 1 || response.Updated != 0 || response.Items[0].Action != "created" {
+		t.Fatalf("response=%+v", response)
+	}
+	if response.RelayStreams != 0 || response.RequiredRelaySlots != 0 || response.OnlineRelaySlots != 3 {
+		t.Fatalf("relay capacity response=%+v", response)
+	}
+	if response.Items[0].RecordingID != 0 {
+		t.Fatalf("dry run returned nonexistent recording id %d", response.Items[0].RecordingID)
+	}
+	var recordings int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND stream_id=$2`, accountID, streamID).Scan(&recordings); err != nil {
+		t.Fatal(err)
+	}
+	if recordings != 0 {
+		t.Fatalf("dry run created %d recordings", recordings)
+	}
+	var timezone string
+	if err := pool.QueryRow(context.Background(), `SELECT local_timezone FROM streams WHERE id=$1`, streamID).Scan(&timezone); err != nil {
+		t.Fatal(err)
+	}
+	if timezone != "" {
+		t.Fatalf("dry run persisted timezone %q", timezone)
+	}
+}
+
+func TestBatchScheduleRejectsInsufficientRelayCapacity(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	userID, accountID := seedUserOrg(t, pool, "batch-no-relay-capacity@example.com", false)
+	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
+	var destinationID, streamID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
+		VALUES ($1, 'capacity-check', 's3_compatible', 'https://s3.example.com', 'auto', 'capacity-check', 'key', decode('00','hex'), 'verified', true)
+		RETURNING id
+	`, accountID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps, local_timezone)
+		VALUES ('SDOT', 'no-capacity', 'No Capacity', 'no-capacity', 'https://example.com/live.m3u8', 'hls', 'direct_stream', 'video_live', 'continuous_video', 30, 'America/Los_Angeles')
+		RETURNING id
+	`).Scan(&streamID); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(batchScheduleRequest{
+		StreamIDs:            []int64{streamID},
+		NamingProfile:        recordingnaming.ProfileStoaramaV1.String(),
+		Mode:                 "continuous",
+		ClipDurationSec:      60,
+		DailyWindowStart:     "08:00",
+		DailyWindowEnd:       "20:00",
+		StorageDestinationID: destinationID,
+		Delivery:             "managed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(body)), principal, "")
+	rec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("campaign requires 1 relay slots, but only 0 are available")) {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+	var recordings int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND stream_id=$2`, accountID, streamID).Scan(&recordings); err != nil {
+		t.Fatal(err)
+	}
+	if recordings != 0 {
+		t.Fatalf("capacity rejection created %d recordings", recordings)
+	}
+}
+
+func TestAvailableRelayCapacitySubtractsOnlyOutsideLeases(t *testing.T) {
+	_, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	_, accountID := seedUserOrg(t, pool, "relay-capacity@example.com", false)
+	ctx := context.Background()
+	var destinationID, nodeID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
+		VALUES ($1, 'capacity', 's3_compatible', 'https://s3.example.com', 'auto', 'capacity', 'key', decode('00','hex'), 'verified', true)
+		RETURNING id
+	`, accountID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO nodes (account_id, display_name, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES ($1, 'capacity-relay', 'relay', 'active', now(), 4)
+		RETURNING id
+	`, accountID).Scan(&nodeID); err != nil {
+		t.Fatal(err)
+	}
+	streamIDs := make([]int64, 2)
+	recordingIDs := make([]int64, 2)
+	for i := range streamIDs {
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type)
+			VALUES ('test', $1, $1, $1, 'https://example.com/'||$1||'.m3u8', 'hls')
+			RETURNING id
+		`, fmt.Sprintf("capacity-%d", i)).Scan(&streamIDs[i]); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, status, start_at, capture_via)
+			VALUES ($1, $2, $3, 'https://example.com/live.m3u8', $4, 'active', now(), 'relay')
+			RETURNING id
+		`, accountID, destinationID, fmt.Sprintf("capacity-%d", i), streamIDs[i]).Scan(&recordingIDs[i]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO recording_jobs (
+				recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+				lease_owner, lease_expires_at, attempt_count, idempotency_key
+			) VALUES ($1, now(), now(), 60, 'leased', $2, now()+interval '5 minutes', 1, $3)
+		`, recordingIDs[i], fmt.Sprintf("node:%d", nodeID), fmt.Sprintf("capacity-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	available, err := availableRelayCapacity(ctx, pool, accountID, []int64{streamIDs[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available != 3 {
+		t.Fatalf("available relay slots=%d want 3", available)
+	}
+}
+
+func TestAvailableRelayCapacityCountsOfflineGroupLeases(t *testing.T) {
+	_, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	_, accountID := seedUserOrg(t, pool, "relay-group-capacity@example.com", false)
+	ctx := context.Background()
+	var groupID, onlineNodeID, offlineNodeID, destinationID, streamID, recordingID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO relay_groups (account_id, name, max_streams)
+		VALUES ($1, 'shared uplink', 8)
+		RETURNING id
+	`, accountID).Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO nodes (account_id, display_name, node_type, status, last_heartbeat_at, relay_max_streams, relay_group_id)
+		VALUES ($1, 'online-group-relay', 'relay', 'active', now(), 4, $2)
+		RETURNING id
+	`, accountID, groupID).Scan(&onlineNodeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO nodes (account_id, display_name, node_type, status, last_heartbeat_at, relay_max_streams, relay_group_id)
+		VALUES ($1, 'offline-group-relay', 'relay', 'active', now()-interval '10 minutes', 4, $2)
+		RETURNING id
+	`, accountID, groupID).Scan(&offlineNodeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
+		VALUES ($1, 'capacity', 's3_compatible', 'https://s3.example.com', 'auto', 'capacity', 'key', decode('00','hex'), 'verified', true)
+		RETURNING id
+	`, accountID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type)
+		VALUES ('test', 'offline-group', 'offline-group', 'offline-group', 'https://example.com/offline-group.m3u8', 'hls')
+		RETURNING id
+	`).Scan(&streamID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, status, start_at, capture_via)
+			VALUES ($1, $2, $3, 'https://example.com/live.m3u8', $4, 'active', now(), 'relay')
+			RETURNING id
+		`, accountID, destinationID, fmt.Sprintf("offline-group-%d", i), streamID).Scan(&recordingID); err != nil {
+			t.Fatal(err)
+		}
+		nodeID := offlineNodeID
+		if i < 2 {
+			nodeID = onlineNodeID
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO recording_jobs (
+				recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+				lease_owner, lease_expires_at, attempt_count, idempotency_key
+			) VALUES ($1, now(), now(), 60, 'leased', $2, now()+interval '5 minutes', 1, $3)
+		`, recordingID, fmt.Sprintf("node:%d", nodeID), fmt.Sprintf("offline-group-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	available, err := availableRelayCapacity(ctx, pool, accountID, []int64{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available != 2 {
+		t.Fatalf("available relay slots=%d want 2", available)
+	}
+}
+
 func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
 
 	userID, accountID := seedUserOrg(t, pool, "batch@example.com", false)
 	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO nodes (account_id, display_name, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES ($1, 'batch-relay', 'relay', 'active', now(), 6)
+	`, accountID); err != nil {
+		t.Fatal(err)
+	}
 	var destID int64
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
@@ -178,6 +445,12 @@ func TestBatchSchedulePersistsPlazaHourlyNamingAndDaytimeWindow(t *testing.T) {
 
 	userID, accountID := seedUserOrg(t, pool, "batch-plaza@example.com", false)
 	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO nodes (account_id, display_name, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES ($1, 'batch-plaza-relay', 'relay', 'active', now(), 1)
+	`, accountID); err != nil {
+		t.Fatal(err)
+	}
 	var destID int64
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
