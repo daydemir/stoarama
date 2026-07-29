@@ -71,9 +71,6 @@ func TestSharedRecordingsLimiterBoundsTrackedClients(t *testing.T) {
 	if got := len(limiter.failures); got != sharedRecordingsMaxClients {
 		t.Fatalf("tracked clients=%d want=%d", got, sharedRecordingsMaxClients)
 	}
-	if _, exists := limiter.failures["0"]; exists {
-		t.Fatal("oldest client was not evicted")
-	}
 	if _, exists := limiter.failures[strconv.Itoa(sharedRecordingsMaxClients+9)]; !exists {
 		t.Fatal("newest client was not retained")
 	}

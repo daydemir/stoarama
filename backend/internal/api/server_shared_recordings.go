@@ -1,7 +1,6 @@
 package api
 
 import (
-	"container/list"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -59,20 +58,11 @@ type sharedRecording struct {
 
 type sharedRecordingsLimiter struct {
 	mu       sync.Mutex
-	failures map[string]*sharedRecordingFailures
-	order    *list.List
-}
-
-type sharedRecordingFailures struct {
-	times   []time.Time
-	element *list.Element
+	failures map[string][]time.Time
 }
 
 func newSharedRecordingsLimiter() *sharedRecordingsLimiter {
-	return &sharedRecordingsLimiter{
-		failures: map[string]*sharedRecordingFailures{},
-		order:    list.New(),
-	}
+	return &sharedRecordingsLimiter{failures: map[string][]time.Time{}}
 }
 
 func (l *sharedRecordingsLimiter) allow(key string, now time.Time) bool {
@@ -82,8 +72,7 @@ func (l *sharedRecordingsLimiter) allow(key string, now time.Time) bool {
 	if failures == nil {
 		return true
 	}
-	l.order.MoveToBack(failures.element)
-	return len(failures.times) < sharedRecordingsMaxFailures
+	return len(failures) < sharedRecordingsMaxFailures
 }
 
 func (l *sharedRecordingsLimiter) fail(key string, now time.Time) {
@@ -91,55 +80,37 @@ func (l *sharedRecordingsLimiter) fail(key string, now time.Time) {
 	defer l.mu.Unlock()
 	failures := l.recent(key, now)
 	if failures == nil {
-		l.evictOldestIfFull()
-		failures = &sharedRecordingFailures{}
-		failures.element = l.order.PushBack(key)
-		l.failures[key] = failures
-	} else {
-		l.order.MoveToBack(failures.element)
+		if len(l.failures) >= sharedRecordingsMaxClients {
+			for existing := range l.failures {
+				delete(l.failures, existing)
+				break
+			}
+		}
 	}
-	if len(failures.times) >= sharedRecordingsMaxFailures {
+	if len(failures) >= sharedRecordingsMaxFailures {
 		return
 	}
-	failures.times = append(failures.times, now)
+	l.failures[key] = append(failures, now)
 }
 
 func (l *sharedRecordingsLimiter) clear(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.remove(key)
-}
-
-func (l *sharedRecordingsLimiter) recent(key string, now time.Time) *sharedRecordingFailures {
-	failures := l.failures[key]
-	if failures == nil {
-		return nil
-	}
-	failures.times = recentSharedRecordingFailures(failures.times, now.Add(-sharedRecordingsRateWindow))
-	if len(failures.times) == 0 {
-		l.remove(key)
-		return nil
-	}
-	return failures
-}
-
-func (l *sharedRecordingsLimiter) evictOldestIfFull() {
-	if len(l.failures) < sharedRecordingsMaxClients {
-		return
-	}
-	oldest := l.order.Front()
-	if oldest != nil {
-		l.remove(oldest.Value.(string))
-	}
-}
-
-func (l *sharedRecordingsLimiter) remove(key string) {
-	failures := l.failures[key]
-	if failures == nil {
-		return
-	}
-	l.order.Remove(failures.element)
 	delete(l.failures, key)
+}
+
+func (l *sharedRecordingsLimiter) recent(key string, now time.Time) []time.Time {
+	failures := l.failures[key]
+	if failures == nil {
+		return nil
+	}
+	failures = recentSharedRecordingFailures(failures, now.Add(-sharedRecordingsRateWindow))
+	if len(failures) == 0 {
+		delete(l.failures, key)
+		return nil
+	}
+	l.failures[key] = failures
+	return failures
 }
 
 func recentSharedRecordingFailures(failures []time.Time, cutoff time.Time) []time.Time {
