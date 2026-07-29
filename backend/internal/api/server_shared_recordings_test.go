@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -58,6 +59,23 @@ func TestSharedRecordingsLimiterDoesNotBlockOtherClients(t *testing.T) {
 	}
 	if !limiter.allow("different-client", now) {
 		t.Fatal("one client blocked a different client")
+	}
+}
+
+func TestSharedRecordingsLimiterBoundsTrackedClients(t *testing.T) {
+	limiter := newSharedRecordingsLimiter()
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < sharedRecordingsMaxClients+10; i++ {
+		limiter.fail(strconv.Itoa(i), now)
+	}
+	if got := len(limiter.failures); got != sharedRecordingsMaxClients {
+		t.Fatalf("tracked clients=%d want=%d", got, sharedRecordingsMaxClients)
+	}
+	if _, exists := limiter.failures["0"]; exists {
+		t.Fatal("oldest client was not evicted")
+	}
+	if _, exists := limiter.failures[strconv.Itoa(sharedRecordingsMaxClients+9)]; !exists {
+		t.Fatal("newest client was not retained")
 	}
 }
 

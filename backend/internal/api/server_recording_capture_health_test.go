@@ -312,3 +312,24 @@ func TestCaptureHealthLastDayTreatsHistoryEndAsExclusive(t *testing.T) {
 		t.Fatalf("last history day=%s want %s", got, start.AddDate(0, 0, 1))
 	}
 }
+
+func TestCaptureHealthRangeMustOverlapRecordingCoverage(t *testing.T) {
+	coverageStart := time.Date(2026, 8, 1, 8, 0, 0, 0, time.UTC)
+	coverageEnd := time.Date(2026, 8, 18, 20, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name       string
+		start, end time.Time
+		want       bool
+	}{
+		{name: "before", start: coverageStart.Add(-48 * time.Hour), end: coverageStart, want: false},
+		{name: "after", start: coverageEnd, end: coverageEnd.Add(48 * time.Hour), want: false},
+		{name: "overlap start", start: coverageStart.Add(-time.Hour), end: coverageStart.Add(time.Hour), want: true},
+		{name: "inside", start: coverageStart, end: coverageEnd, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := captureHealthRangeOverlaps(tc.start, tc.end, coverageStart, coverageEnd); got != tc.want {
+				t.Fatalf("overlap=%t want=%t", got, tc.want)
+			}
+		})
+	}
+}

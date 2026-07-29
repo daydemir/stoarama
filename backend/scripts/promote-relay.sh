@@ -55,13 +55,29 @@ require_object "install-${VERSION}.sh"
 require_object "uninstall-${VERSION}.sh"
 
 download "latest.json" "${live}"
-download "latest.json.sig" "${live_signature}"
-go run -C "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
-  ./cmd/relay-manifest-sign verify \
-  --public-key "${RELAY_SIGNING_PUBLIC_KEY}" \
-  --input "${live}" \
-  --signature "${live_signature}"
 live_version="$(jq -er '.version' "${live}")"
+if download "latest.json.sig" "${live_signature}"; then
+  go run -C "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
+    ./cmd/relay-manifest-sign verify \
+    --public-key "${RELAY_SIGNING_PUBLIC_KEY}" \
+    --input "${live}" \
+    --signature "${live_signature}"
+else
+  if [[ "${MODE}" != "promote" || "${RELAY_SIGNING_BOOTSTRAP:-}" != "1" ]]; then
+    echo "error: live relay manifest is unsigned; set RELAY_SIGNING_BOOTSTRAP=1 only for the initial signed promotion" >&2
+    exit 1
+  fi
+  if [[ ! "${live_version}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ || "${live_version}" == *..* ]]; then
+    echo "error: unsigned live relay manifest has an invalid version" >&2
+    exit 1
+  fi
+  unsigned_immutable="${stage}/unsigned-immutable.json"
+  download "latest-${live_version}.json" "${unsigned_immutable}"
+  cmp -s "${live}" "${unsigned_immutable}" || {
+    echo "error: unsigned live and immutable relay manifests differ" >&2
+    exit 1
+  }
+fi
 require_object "latest-${live_version}.json"
 if [[ "${MODE}" == "promote" ]]; then
   jq -e --slurpfile live "${live}" '

@@ -147,6 +147,9 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 	if from.Before(toDate.AddDate(0, 0, -(captureHealthPageDays - 1))) {
 		return recordingCaptureHealthPage{}, captureHealthRequestError{message: fmt.Sprintf("capture health range cannot exceed %d local days", captureHealthPageDays)}
 	}
+	if !captureHealthRangeOverlaps(from.UTC(), to.UTC(), coverageStart, coverageEnd) {
+		return recordingCaptureHealthPage{}, captureHealthRequestError{message: "requested range does not overlap recording coverage"}
+	}
 	rangeStart := from.UTC()
 	if rangeStart.Before(coverageStart) {
 		rangeStart = coverageStart
@@ -202,6 +205,10 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 		HasNewer:    to.Before(lastHistoryDay.AddDate(0, 0, 1)),
 		Bins:        bins,
 	}, nil
+}
+
+func captureHealthRangeOverlaps(start, end, coverageStart, coverageEnd time.Time) bool {
+	return start.Before(coverageEnd) && end.After(coverageStart)
 }
 
 func captureHealthLastDay(start, end time.Time, location *time.Location) time.Time {

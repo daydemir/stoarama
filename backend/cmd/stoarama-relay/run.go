@@ -67,7 +67,7 @@ func runRelay(ctx context.Context) error {
 	}
 	removed, err := cleanupRelayCaptureTemp(tempRoot)
 	if err != nil {
-		return fmt.Errorf("clean relay capture temp root: %w", err)
+		log.Printf("clean relay capture temp root error: %v", err)
 	}
 	removed += cleanupLegacyCaptureTempBestEffort(os.TempDir(), time.Now(), 15*time.Minute)
 	if removed > 0 {
@@ -298,6 +298,10 @@ func diskFreeBytes(path string) (uint64, error) {
 }
 
 func cleanupRelayCaptureTemp(root string) (int, error) {
+	return cleanupRelayCaptureTempWith(root, os.RemoveAll)
+}
+
+func cleanupRelayCaptureTempWith(root string, remove func(string) error) (int, error) {
 	// runRelay acquires the single-process lock before calling this function, so
 	// every capture directory in the app-owned temp root belongs to an exited run.
 	entries, err := os.ReadDir(root)
@@ -305,16 +309,18 @@ func cleanupRelayCaptureTemp(root string) (int, error) {
 		return 0, err
 	}
 	removed := 0
+	var errs []error
 	for _, entry := range entries {
 		if !entry.IsDir() || (!strings.HasPrefix(entry.Name(), "capture-continuous-") && !strings.HasPrefix(entry.Name(), "capture-segment-")) {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
-			return removed, err
+		if err := remove(filepath.Join(root, entry.Name())); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", entry.Name(), err))
+			continue
 		}
 		removed++
 	}
-	return removed, nil
+	return removed, errors.Join(errs...)
 }
 
 func cleanupLegacyCaptureTemp(root string, now time.Time, staleAfter time.Duration) (int, error) {

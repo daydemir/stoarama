@@ -127,31 +127,12 @@ func refreshSystemdUnit() error {
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(current, updated) {
-		temp, err := os.CreateTemp(filepath.Dir(unitPath), systemdUnit+".new-")
-		if err != nil {
-			return err
-		}
-		tempPath := temp.Name()
-		defer os.Remove(tempPath)
-		if err := temp.Chmod(0o644); err != nil {
-			_ = temp.Close()
-			return err
-		}
-		if _, err := temp.Write(updated); err != nil {
-			_ = temp.Close()
-			return err
-		}
-		if err := temp.Sync(); err != nil {
-			_ = temp.Close()
-			return err
-		}
-		if err := temp.Close(); err != nil {
-			return err
-		}
-		if err := os.Rename(tempPath, unitPath); err != nil {
-			return err
-		}
+	changed, err := writeSystemdUnitIfChanged(unitPath, current, updated)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -159,6 +140,37 @@ func refreshSystemdUnit() error {
 		return fmt.Errorf("systemctl daemon-reload: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func writeSystemdUnitIfChanged(unitPath string, current, updated []byte) (bool, error) {
+	if bytes.Equal(current, updated) {
+		return false, nil
+	}
+	temp, err := os.CreateTemp(filepath.Dir(unitPath), systemdUnit+".new-")
+	if err != nil {
+		return false, err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o644); err != nil {
+		_ = temp.Close()
+		return false, err
+	}
+	if _, err := temp.Write(updated); err != nil {
+		_ = temp.Close()
+		return false, err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return false, err
+	}
+	if err := temp.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tempPath, unitPath); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // uninstall stops the running service and removes the unit file for the current OS.

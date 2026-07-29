@@ -120,6 +120,9 @@ func prepareSourceMonitorOutputDir(path string) (string, func(), error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return "", func() {}, fmt.Errorf("create --output-dir: %w", err)
 	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return "", func() {}, fmt.Errorf("secure --output-dir: %w", err)
+	}
 	return path, func() {}, nil
 }
 

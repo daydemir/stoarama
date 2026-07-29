@@ -501,15 +501,17 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	fleetRelayOnline = availability.online
 	fleetRelayLiveLeases = availability.live
 	fleetRelayAvailableSlots = availability.available
-	if err := s.pool.QueryRow(r.Context(), `
-		SELECT EXISTS (
-		  SELECT 1 FROM recordings rec
-		  WHERE rec.account_id=$1 AND rec.status='active' AND rec.capture_via='relay'
-		    AND rec.start_at <= now() AND (rec.end_at IS NULL OR now() < rec.end_at)
-		) AND $2=0
-	`, principal.AccountID, fleetRelayOnline).Scan(&fleetRelayWarning); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute fleet relay warning: %v", err))
-		return
+	if fleetRelayOnline == 0 {
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT EXISTS (
+			  SELECT 1 FROM recordings rec
+			  WHERE rec.account_id=$1 AND rec.status='active' AND rec.capture_via='relay'
+			    AND rec.start_at <= now() AND (rec.end_at IS NULL OR now() < rec.end_at)
+			)
+		`, principal.AccountID).Scan(&fleetRelayWarning); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute fleet relay warning: %v", err))
+			return
+		}
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"items":                       items,

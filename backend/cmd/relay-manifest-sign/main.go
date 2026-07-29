@@ -22,9 +22,9 @@ func main() {
 		fmt.Println(base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey)))
 	case "validate-public":
 		fs := flag.NewFlagSet("validate-public", flag.ExitOnError)
-		publicKey := fs.String("public-key", "", "base64 Ed25519 public key")
+		publicKeys := fs.String("public-key", "", "comma-separated base64 Ed25519 public keys")
 		_ = fs.Parse(os.Args[2:])
-		_ = decodeKey("public key", *publicKey, ed25519.PublicKeySize)
+		_ = decodePublicKeys(*publicKeys)
 	case "sign":
 		fs := flag.NewFlagSet("sign", flag.ExitOnError)
 		keyFile := fs.String("private-key-file", "", "base64 Ed25519 private key file")

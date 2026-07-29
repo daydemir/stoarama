@@ -345,6 +345,9 @@ func TestPrepareSourceMonitorOutputDirCleansOnlyTemporaryDirectory(t *testing.T)
 	}
 
 	explicit := filepath.Join(t.TempDir(), "monitor")
+	if err := os.Mkdir(explicit, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	got, cleanup, err := prepareSourceMonitorOutputDir(explicit)
 	if err != nil {
 		t.Fatal(err)
@@ -355,6 +358,13 @@ func TestPrepareSourceMonitorOutputDirCleansOnlyTemporaryDirectory(t *testing.T)
 	cleanup()
 	if _, err := os.Stat(explicit); err != nil {
 		t.Fatalf("explicit output directory was removed: %v", err)
+	}
+	info, err := os.Stat(explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("explicit output directory mode=%#o want 0700", got)
 	}
 }
 

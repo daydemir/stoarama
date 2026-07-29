@@ -356,6 +356,33 @@ func TestCleanupRelayCaptureTempOnlyRemovesOwnedDirectories(t *testing.T) {
 	}
 }
 
+func TestCleanupRelayCaptureTempContinuesAfterRemovalError(t *testing.T) {
+	root := t.TempDir()
+	failed := filepath.Join(root, "capture-continuous-first")
+	removedPath := filepath.Join(root, "capture-segment-second")
+	for _, path := range []string{failed, removedPath} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	denied := errors.New("remove denied")
+	removed, err := cleanupRelayCaptureTempWith(root, func(path string) error {
+		if path == failed {
+			return denied
+		}
+		return os.RemoveAll(path)
+	})
+	if removed != 1 || !errors.Is(err, denied) {
+		t.Fatalf("removed=%d err=%v", removed, err)
+	}
+	if _, statErr := os.Stat(removedPath); !os.IsNotExist(statErr) {
+		t.Fatalf("later capture directory was not swept: %v", statErr)
+	}
+	if _, statErr := os.Stat(failed); statErr != nil {
+		t.Fatalf("failed capture directory should remain for startup failure: %v", statErr)
+	}
+}
+
 func TestBoundedRelayLogRetainsTailAtLimit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	writer, err := openBoundedRelayLog()
@@ -552,6 +579,30 @@ func TestSystemdServiceUsesBoundedRestartRateWithoutLockout(t *testing.T) {
 		if !strings.Contains(service, setting) {
 			t.Fatalf("systemd service missing %q", setting)
 		}
+	}
+}
+
+func TestWriteSystemdUnitOnlyReportsContentChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), systemdUnit)
+	current := []byte("current\n")
+	if err := os.WriteFile(path, current, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := writeSystemdUnitIfChanged(path, current, append([]byte(nil), current...))
+	if err != nil || changed {
+		t.Fatalf("unchanged unit result=(%t,%v)", changed, err)
+	}
+	updated := []byte("updated\n")
+	changed, err = writeSystemdUnitIfChanged(path, current, updated)
+	if err != nil || !changed {
+		t.Fatalf("updated unit result=(%t,%v)", changed, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, updated) {
+		t.Fatalf("unit=%q want %q", got, updated)
 	}
 }
 
