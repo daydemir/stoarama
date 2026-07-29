@@ -98,14 +98,15 @@ const (
 
 // ClipUploadIntent is a presigned PUT against the user's bucket.
 type ClipUploadIntent struct {
-	IntentID     string    `json:"intent_id"`
-	UploadURL    string    `json:"upload_url"`
-	ObjectKey    string    `json:"object_key"`
-	Bucket       string    `json:"bucket"`
-	Endpoint     string    `json:"endpoint"`
-	ContentType  string    `json:"content_type"`
-	MaxSizeBytes int64     `json:"max_size_bytes"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	IntentID        string    `json:"intent_id"`
+	UploadURL       string    `json:"upload_url"`
+	ObjectKey       string    `json:"object_key"`
+	Bucket          string    `json:"bucket"`
+	Endpoint        string    `json:"endpoint"`
+	ContentType     string    `json:"content_type"`
+	MaxSizeBytes    int64     `json:"max_size_bytes"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	AlreadyIngested bool      `json:"already_ingested"`
 }
 
 // IngestClipRequest carries the captured clip's metadata to the ingest endpoint.
@@ -145,9 +146,9 @@ func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
 // ReserveClipUpload presigns a PUT for the given leased job. segmentStartMs is 0
 // for an ordinary clip job (the intent is keyed by the job alone), or the
 // segment's UTC start in Unix millis for a continuous_window job, where one lease
-// raises many per-segment intents: the discriminator both forwards the
-// per-segment object-key derivation to the server and makes each segment's
-// Idempotency-Key distinct so they are not deduped against each other.
+// raises many per-segment intents. The discriminator forwards the per-segment
+// object-key derivation to the server and keeps the request compatible with an
+// older API during a rollback.
 func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, mimeType string, segmentStartMs int64) (ClipUploadIntent, error) {
 	payload := map[string]any{"job_id": jobID, "mime_type": strings.TrimSpace(mimeType)}
 	idemKey := buildIdempotencyKey("recording-clip", jobID)

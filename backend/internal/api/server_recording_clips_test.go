@@ -15,6 +15,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
 func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
@@ -120,6 +123,117 @@ func TestGenericFailRetainsMaxAttemptSemantics(t *testing.T) {
 	}
 	if status != "error" || completedAt == nil {
 		t.Fatalf("status=%q completed_at=%v, want error with completion", status, completedAt)
+	}
+}
+
+func TestRecordingUploadIntentReplaysPendingAndConsumedSegment(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	secrets, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := secrets.Encrypt([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO storage_destinations
+			(id, account_id, endpoint, region, bucket, key_prefix, access_key_id, secret_access_key_enc)
+		VALUES (7, 42, 'https://example.r2.cloudflarestorage.com', 'auto', 'bucket', 'prefix', 'access', $1)
+	`, sealed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings
+			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via,
+			 cron_timezone, naming_profile, folder_name, naming_metadata_jsonb)
+		VALUES (1, 42, 7, 'continuous', 'https://example.test/live.m3u8', 'active', now()-interval '1 hour', 'relay',
+		        'UTC', 'stoarama_v1', 'recordings', '{}'::jsonb)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_jobs
+			(id, recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+			 lease_owner, lease_expires_at, attempt_count, idempotency_key, kind, window_end_at)
+		VALUES (1, 1, now(), now(), 60, 'leased',
+		        'node:1', now()+interval '3 minutes', 1, 'intent-replay', 'continuous_window', now()+interval '1 hour')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		cfg:     config.Config{R2SignPutTTL: 15 * time.Minute},
+		pool:    pool,
+		secrets: secrets,
+	}
+	reserve := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/api/v1/recording/upload-intents",
+			strings.NewReader(`{"job_id":1,"mime_type":"video/mp4","segment_start_ms":1785240000000}`),
+		)
+		req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{
+			NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay,
+		}))
+		response := httptest.NewRecorder()
+		server.handleRecordingUploadIntent(response, req)
+		return response
+	}
+
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() {
+			<-start
+			responses <- reserve()
+		}()
+	}
+	close(start)
+	first, second := <-responses, <-responses
+	if !((first.Code == http.StatusCreated && second.Code == http.StatusOK) ||
+		(first.Code == http.StatusOK && second.Code == http.StatusCreated)) {
+		t.Fatalf("concurrent reserve statuses=%d/%d bodies=%s / %s",
+			first.Code, second.Code, first.Body.String(), second.Body.String())
+	}
+	var firstPayload, secondPayload map[string]any
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPayload); err != nil {
+		t.Fatal(err)
+	}
+	if firstPayload["intent_id"] != secondPayload["intent_id"] {
+		t.Fatalf("replay intent=%v want %v", secondPayload["intent_id"], firstPayload["intent_id"])
+	}
+	replayed := reserve()
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("pending replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	var intentCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_upload_intents`).Scan(&intentCount); err != nil {
+		t.Fatal(err)
+	}
+	if intentCount != 1 {
+		t.Fatalf("intent rows=%d want 1", intentCount)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_upload_intents SET status='consumed'`); err != nil {
+		t.Fatal(err)
+	}
+	consumed := reserve()
+	if consumed.Code != http.StatusOK {
+		t.Fatalf("consumed replay status=%d body=%s", consumed.Code, consumed.Body.String())
+	}
+	var consumedPayload struct {
+		AlreadyIngested bool `json:"already_ingested"`
+	}
+	if err := json.Unmarshal(consumed.Body.Bytes(), &consumedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !consumedPayload.AlreadyIngested {
+		t.Fatalf("consumed replay body=%s", consumed.Body.String())
 	}
 }
 
@@ -350,7 +464,11 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			start_at TIMESTAMPTZ NOT NULL,
 			end_at TIMESTAMPTZ,
 			target_fps INTEGER,
-			capture_via TEXT NOT NULL DEFAULT 'cloud'
+			capture_via TEXT NOT NULL DEFAULT 'cloud',
+			cron_timezone TEXT NOT NULL DEFAULT 'UTC',
+			naming_profile TEXT NOT NULL DEFAULT 'stoarama_v1',
+			folder_name TEXT NOT NULL DEFAULT 'recordings',
+			naming_metadata_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb
 		)`,
 		`CREATE TABLE recording_jobs (
 			id BIGSERIAL PRIMARY KEY,
@@ -371,6 +489,31 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			error_text TEXT,
 			completed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE storage_destinations (
+			id BIGINT PRIMARY KEY,
+			account_id BIGINT NOT NULL,
+			endpoint TEXT NOT NULL,
+			region TEXT NOT NULL,
+			bucket TEXT NOT NULL,
+			key_prefix TEXT NOT NULL,
+			access_key_id TEXT NOT NULL,
+			secret_access_key_enc BYTEA NOT NULL
+		)`,
+		`CREATE TABLE recording_upload_intents (
+			id UUID PRIMARY KEY,
+			recording_id BIGINT NOT NULL,
+			recording_job_id BIGINT NOT NULL,
+			storage_destination_id BIGINT NOT NULL,
+			endpoint TEXT NOT NULL,
+			bucket TEXT NOT NULL,
+			object_key TEXT NOT NULL,
+			display_path TEXT NOT NULL,
+			mime_type TEXT NOT NULL,
+			max_size_bytes BIGINT NOT NULL,
+			status TEXT NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

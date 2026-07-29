@@ -416,6 +416,38 @@ func TestCaptureContinuousStopsAliveStalledChild(t *testing.T) {
 	}
 }
 
+func TestCaptureContinuousDoesNotRedeliverAfterCallbackFailure(t *testing.T) {
+	temp := t.TempDir()
+	ffmpeg := filepath.Join(temp, "ffmpeg")
+	script := "#!/bin/sh\nfor last do :; done\nout=${last%/*}\nprintf first > \"$out/seg-20260728-120000.mp4\"\nprintf second > \"$out/seg-20260728-120001.mp4\"\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.1; done\n"
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	t.Setenv("FFMPEG_BIN", ffmpeg)
+	output := filepath.Join(temp, "output")
+	if err := os.Mkdir(output, 0o755); err != nil {
+		t.Fatalf("create output dir: %v", err)
+	}
+
+	deliveryErr := errors.New("delivery failed")
+	deliveries := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	err := captureContinuousWithHeaders(
+		ctx, "https://example.com/live.m3u8", time.Second, "", nil, output,
+		func(Segment) error {
+			deliveries++
+			return deliveryErr
+		}, "", time.Second, 5*time.Second,
+	)
+	if !errors.Is(err, deliveryErr) {
+		t.Fatalf("capture error=%v want delivery failure", err)
+	}
+	if deliveries != 1 {
+		t.Fatalf("delivery callback called %d times, want once", deliveries)
+	}
+}
+
 // TestBuildFFmpegContinuousArgsSourceCopy asserts the continuous (segment-muxer)
 // args for the Source/native path: stream-copy (-c copy), the segment muxer tail
 // with the requested segment_time, strftime naming, and NO -t single-clip flag.

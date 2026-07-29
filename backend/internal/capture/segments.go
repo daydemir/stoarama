@@ -332,9 +332,9 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 			}
 			if err := sweepFinal(false); err != nil {
 				stopFFmpeg()
-				if finalErr := sweepFinal(true); finalErr != nil {
-					return errors.Join(err, fmt.Errorf("finalize after delivery failure: %w", finalErr))
-				}
+				// onSegment already owns its bounded retries. Sweeping again here
+				// would redeliver the same unacknowledged file before returning the
+				// original failure.
 				return err
 			}
 		}

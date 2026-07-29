@@ -63,6 +63,115 @@ func TestContinuousDeliveryExhaustionAfterWindowCloseDoesNotFailJob(t *testing.T
 	}
 }
 
+func TestSegmentDeliveryReusesReservedIntentAcrossUploadRetry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	var reserveCalls, uploadCalls, ingestCalls, retryCalls int
+	var uploadIntentIDs []string
+	err := deliverSegmentWithRetry(ctx, time.Millisecond, func() bool { return true }, segmentDeliveryOps{
+		Reserve: func() (recordingapi.ClipUploadIntent, error) {
+			reserveCalls++
+			return recordingapi.ClipUploadIntent{IntentID: "intent-1", UploadURL: "https://upload.test"}, nil
+		},
+		Upload: func(intent recordingapi.ClipUploadIntent) error {
+			uploadCalls++
+			uploadIntentIDs = append(uploadIntentIDs, intent.IntentID)
+			if uploadCalls == 1 {
+				return &apihttp.StatusError{Label: "upload", Code: http.StatusServiceUnavailable}
+			}
+			return nil
+		},
+		Ingest: func(intent recordingapi.ClipUploadIntent) error {
+			ingestCalls++
+			if intent.IntentID != "intent-1" {
+				t.Fatalf("ingest intent=%q want intent-1", intent.IntentID)
+			}
+			return nil
+		},
+	}, func(error) {
+		retryCalls++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserveCalls != 1 || uploadCalls != 2 || ingestCalls != 1 || retryCalls != 1 {
+		t.Fatalf("reserve=%d upload=%d ingest=%d retries=%d", reserveCalls, uploadCalls, ingestCalls, retryCalls)
+	}
+	if len(uploadIntentIDs) != 2 || uploadIntentIDs[0] != uploadIntentIDs[1] {
+		t.Fatalf("upload intent ids=%v want one stable intent", uploadIntentIDs)
+	}
+}
+
+func TestSegmentDeliverySkipsConsumedReplay(t *testing.T) {
+	var uploadCalls, ingestCalls int
+	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{
+		Reserve: func() (recordingapi.ClipUploadIntent, error) {
+			return recordingapi.ClipUploadIntent{IntentID: "intent-1", AlreadyIngested: true}, nil
+		},
+		Upload: func(recordingapi.ClipUploadIntent) error {
+			uploadCalls++
+			return nil
+		},
+		Ingest: func(recordingapi.ClipUploadIntent) error {
+			ingestCalls++
+			return nil
+		},
+	}, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploadCalls != 0 || ingestCalls != 0 {
+		t.Fatalf("consumed replay uploaded=%d ingested=%d", uploadCalls, ingestCalls)
+	}
+}
+
+func TestClipDeliverySkipsConsumedReplay(t *testing.T) {
+	var uploadCalls, ingestCalls int
+	err := deliverReservedClip(
+		recordingapi.ClipUploadIntent{IntentID: "intent-1", AlreadyIngested: true},
+		func() error { uploadCalls++; return nil },
+		func() error { ingestCalls++; return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploadCalls != 0 || ingestCalls != 0 {
+		t.Fatalf("consumed replay uploaded=%d ingested=%d", uploadCalls, ingestCalls)
+	}
+}
+
+func TestSegmentDeliveryRereservesAfterCommittedIngestResponseLoss(t *testing.T) {
+	var reserveCalls, uploadCalls, ingestCalls int
+	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{
+		Reserve: func() (recordingapi.ClipUploadIntent, error) {
+			reserveCalls++
+			if reserveCalls == 2 {
+				return recordingapi.ClipUploadIntent{IntentID: "intent-1", AlreadyIngested: true}, nil
+			}
+			return recordingapi.ClipUploadIntent{IntentID: "intent-1", UploadURL: "https://upload.test"}, nil
+		},
+		Upload: func(recordingapi.ClipUploadIntent) error {
+			uploadCalls++
+			return nil
+		},
+		Ingest: func(recordingapi.ClipUploadIntent) error {
+			ingestCalls++
+			return &apihttp.StatusError{
+				Label: "ingest",
+				Code:  http.StatusConflict,
+				Body:  "upload intent not found, already consumed, or job not owned",
+			}
+		},
+	}, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserveCalls != 2 || uploadCalls != 1 || ingestCalls != 1 {
+		t.Fatalf("reserve=%d upload=%d ingest=%d", reserveCalls, uploadCalls, ingestCalls)
+	}
+}
+
 func TestContinuousNoProgressExpired(t *testing.T) {
 	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	timeout := 5 * time.Minute
@@ -213,7 +322,8 @@ func TestIsAlreadyIngested(t *testing.T) {
 		want bool
 	}{
 		{name: "nil", err: nil, want: false},
-		{name: "status 409", err: errString("ingest failed status=409"), want: true},
+		{name: "unrelated status 409", err: errString("ingest failed status=409"), want: false},
+		{name: "job not owned", err: errString("status=409 upload intent not found, already consumed, or job not owned"), want: false},
 		{name: "object key message", err: errString("a clip already exists for this object key"), want: true},
 		{name: "other error", err: errString("status=500 internal"), want: false},
 	}

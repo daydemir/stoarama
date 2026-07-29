@@ -47,6 +47,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run TestBatchSchedulePersistsPlazaHourlyNamingAndDaytimeWindow -count=1
+      - name: Test recording upload intent replay
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run TestRecordingUploadIntentReplaysPendingAndConsumedSegment -count=1
       - name: Test
         run: go test ./...
       - name: Vet
