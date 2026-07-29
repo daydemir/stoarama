@@ -833,14 +833,11 @@ func retryableTransportError(ctx context.Context, err error) bool {
 // signal (a clip already exists for this object key), which for a re-leased
 // continuous window means the segment is already stored and must not fail the job.
 func isAlreadyIngested(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "a clip already exists for this object key")
+	return recordingapi.ErrorCodeFrom(err) == recordingapi.ErrorCodeClipAlreadyIngested
 }
 
 func isUploadIntentStateConflict(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "upload intent not found, already consumed, or job not owned")
+	return recordingapi.ErrorCodeFrom(err) == recordingapi.ErrorCodeUploadIntentUnavailable
 }
 
 // startHeartbeat extends the lease on a ticker; on a cancel signal it cancels the

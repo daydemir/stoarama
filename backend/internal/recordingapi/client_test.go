@@ -12,16 +12,19 @@ import (
 )
 
 func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
+	type receivedRequest struct {
+		idempotencyKey string
+		payload        map[string]any
+		err            error
+	}
+	received := make(chan receivedRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Idempotency-Key"); got != "recording-seg-42-1234" {
-			t.Fatalf("Idempotency-Key=%q", got)
-		}
 		var payload map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatal(err)
-		}
-		if payload["job_id"] != float64(42) || payload["segment_start_ms"] != float64(1234) {
-			t.Fatalf("payload=%v", payload)
+		err := json.NewDecoder(r.Body).Decode(&payload)
+		received <- receivedRequest{
+			idempotencyKey: r.Header.Get("Idempotency-Key"),
+			payload:        payload,
+			err:            err,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"intent_id":"intent-1"}`))
@@ -38,6 +41,16 @@ func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
 	}
 	if intent.IntentID != "intent-1" {
 		t.Fatalf("intent=%q", intent.IntentID)
+	}
+	request := <-received
+	if request.err != nil {
+		t.Fatal(request.err)
+	}
+	if request.idempotencyKey != "recording-seg-42-1234" {
+		t.Fatalf("Idempotency-Key=%q", request.idempotencyKey)
+	}
+	if request.payload["job_id"] != float64(42) || request.payload["segment_start_ms"] != float64(1234) {
+		t.Fatalf("payload=%v", request.payload)
 	}
 }
 

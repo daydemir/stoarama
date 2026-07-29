@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -463,7 +464,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	lockKey := fmt.Sprintf("%d:%d:%s:%s:%s", req.JobID, destID, endpoint, bucket, objectKey)
-	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, lockKey); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock upload intent reservation: %v", err))
 		return
 	}
@@ -646,7 +647,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		&accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusConflict, "upload intent not found, already consumed, or job not owned")
+		util.WriteJSON(w, http.StatusConflict, map[string]any{
+			"code":  recordingapi.ErrorCodeUploadIntentUnavailable,
+			"error": "upload intent not found, already consumed, or job not owned",
+		})
 		return
 	}
 	if err != nil {
@@ -741,7 +745,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		// 0-row insert means a clip already exists for this (bucket,object_key).
 		// Treat as an error so the job is NOT marked done and the dropped clip
 		// is never silently lost (S-3).
-		util.WriteError(w, http.StatusConflict, "a clip already exists for this object key")
+		util.WriteJSON(w, http.StatusConflict, map[string]any{
+			"code":  recordingapi.ErrorCodeClipAlreadyIngested,
+			"error": "a clip already exists for this object key",
+		})
 		return
 	}
 	if err != nil {

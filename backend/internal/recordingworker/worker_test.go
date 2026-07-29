@@ -160,7 +160,7 @@ func TestSegmentDeliveryRereservesAfterCommittedIngestResponseLoss(t *testing.T)
 			return &apihttp.StatusError{
 				Label: "ingest",
 				Code:  http.StatusConflict,
-				Body:  "upload intent not found, already consumed, or job not owned",
+				Body:  `{"code":"recording_upload_intent_unavailable","error":"upload intent not found, already consumed, or job not owned"}`,
 			}
 		},
 	}, func(error) {})
@@ -324,7 +324,11 @@ func TestIsAlreadyIngested(t *testing.T) {
 		{name: "nil", err: nil, want: false},
 		{name: "unrelated status 409", err: errString("ingest failed status=409"), want: false},
 		{name: "job not owned", err: errString("status=409 upload intent not found, already consumed, or job not owned"), want: false},
-		{name: "object key message", err: errString("a clip already exists for this object key"), want: true},
+		{name: "object key message only", err: errString("a clip already exists for this object key"), want: false},
+		{name: "typed already ingested", err: &apihttp.StatusError{
+			Label: "ingest", Code: http.StatusConflict,
+			Body: `{"code":"recording_clip_already_ingested","error":"a clip already exists for this object key"}`,
+		}, want: true},
 		{name: "other error", err: errString("status=500 internal"), want: false},
 	}
 	for _, tc := range cases {

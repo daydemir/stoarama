@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -20,6 +21,29 @@ import (
 
 // UploadTimeout bounds the complete upload of one finalized recording segment.
 const UploadTimeout = 5 * time.Minute
+
+// ErrorCode identifies a stable recording API failure independent of its message.
+type ErrorCode string
+
+const (
+	ErrorCodeClipAlreadyIngested     ErrorCode = "recording_clip_already_ingested"
+	ErrorCodeUploadIntentUnavailable ErrorCode = "recording_upload_intent_unavailable"
+)
+
+// ErrorCodeFrom returns a structured recording API error code, when present.
+func ErrorCodeFrom(err error) ErrorCode {
+	var statusErr *apihttp.StatusError
+	if !errors.As(err, &statusErr) {
+		return ""
+	}
+	var response struct {
+		Code ErrorCode `json:"code"`
+	}
+	if json.Unmarshal([]byte(statusErr.Body), &response) != nil {
+		return ""
+	}
+	return response.Code
+}
 
 type ClientConfig struct {
 	BaseURL    string
