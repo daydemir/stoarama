@@ -88,6 +88,9 @@ func (l *sharedRecordingsLimiter) fail(key string, now time.Time) {
 	defer l.mu.Unlock()
 	failures := l.recent(key, now)
 	if failures == nil && len(l.failures) >= sharedRecordingsMaxClients {
+		if now.Before(l.nextExpiry) {
+			return
+		}
 		l.pruneExpired(now)
 		if len(l.failures) >= sharedRecordingsMaxClients {
 			return
@@ -106,11 +109,7 @@ func (l *sharedRecordingsLimiter) fail(key string, now time.Time) {
 func (l *sharedRecordingsLimiter) clear(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	expiry := sharedRecordingFailuresExpiry(l.failures[key])
 	delete(l.failures, key)
-	if expiry.Equal(l.nextExpiry) {
-		l.recomputeNextExpiry()
-	}
 }
 
 func (l *sharedRecordingsLimiter) recent(key string, now time.Time) []time.Time {
@@ -118,19 +117,12 @@ func (l *sharedRecordingsLimiter) recent(key string, now time.Time) []time.Time 
 	if failures == nil {
 		return nil
 	}
-	previousExpiry := sharedRecordingFailuresExpiry(failures)
 	failures = recentSharedRecordingFailures(failures, now.Add(-sharedRecordingsRateWindow))
 	if len(failures) == 0 {
 		delete(l.failures, key)
-		if previousExpiry.Equal(l.nextExpiry) {
-			l.recomputeNextExpiry()
-		}
 		return nil
 	}
 	l.failures[key] = failures
-	if previousExpiry.Equal(l.nextExpiry) && !sharedRecordingFailuresExpiry(failures).Equal(previousExpiry) {
-		l.recomputeNextExpiry()
-	}
 	return failures
 }
 
@@ -150,18 +142,11 @@ func (l *sharedRecordingsLimiter) pruneExpired(now time.Time) {
 func (l *sharedRecordingsLimiter) recomputeNextExpiry() {
 	l.nextExpiry = time.Time{}
 	for _, failures := range l.failures {
-		expiry := sharedRecordingFailuresExpiry(failures)
-		if !expiry.IsZero() && (l.nextExpiry.IsZero() || expiry.Before(l.nextExpiry)) {
+		expiry := failures[0].Add(sharedRecordingsRateWindow)
+		if l.nextExpiry.IsZero() || expiry.Before(l.nextExpiry) {
 			l.nextExpiry = expiry
 		}
 	}
-}
-
-func sharedRecordingFailuresExpiry(failures []time.Time) time.Time {
-	if len(failures) == 0 {
-		return time.Time{}
-	}
-	return failures[0].Add(sharedRecordingsRateWindow)
 }
 
 func recentSharedRecordingFailures(failures []time.Time, cutoff time.Time) []time.Time {
