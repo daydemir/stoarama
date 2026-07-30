@@ -7,6 +7,18 @@
 - fresh Stoarama R2 bucket wired via env vars
 - email left in `log` mode until domain and Resend are connected
 
+## render.yaml is not a mirror of live env
+
+`render.yaml` is per-service and is NOT a complete picture of what a given service reads. All 20 `DROPLET_POOL_*` keys are declared only in the `stoarama-recorder-control` block; the `stoarama-api` block declares none, even though the API enforces the droplet admission ceiling from `DROPLET_POOL_MAX`/`DROPLET_POOL_CAPACITY`. Before reasoning about production behavior, read the live env vars from the REST API (recipe in `AGENTS.md`, "Render Operator Access") rather than inferring them from the blueprint.
+
+Live services:
+
+- `stoarama-api` — `srv-d6usqn94tr6s73d94cd0`, web, admission ceiling
+- `stoarama-recorder-control` — `srv-d8vcdspo3t8c73far4e0`, worker, droplet pool scaler
+- crons `stoarama-recording-health`, `stoarama-relay-connectivity`
+
+Relay recordings (`capture_via != 'cloud'`) are excluded from the droplet forecast (`backend/internal/dropletpool/forecast.go:71`), so the cloud ceiling never blocks relay-only streams. Do not report relay work as pool-blocked.
+
 ## Required env vars
 
 - `R2_ACCOUNT_ID`
@@ -17,6 +29,9 @@
 - optionally `R2_ENDPOINT`
 - optionally `SERVICE_TOKEN` for machine-to-machine runtime paths before node/service enrollment is expanded
 - optionally `APP_BASE_URL` if the Render hostname differs from the blueprint default
+- `DROPLET_POOL_MAX` and `DROPLET_POOL_CAPACITY` — must be set **identically on both** `stoarama-api` (`srv-d6usqn94tr6s73d94cd0`) and `stoarama-recorder-control` (`srv-d8vcdspo3t8c73far4e0`). recorder-control scales the pool; the API enforces the admission ceiling as `DROPLET_POOL_MAX * DROPLET_POOL_CAPACITY` (`backend/internal/api/server_recordings_batch.go:320`, `server_recordings.go:2559,2629`). If absent on either service, that service silently falls back to `config.go` defaults MAX=5 x CAPACITY=1 = 5, so the API rejects batch schedules against a phantom ceiling of 5 while the pool can really run 100. Current live value on both: 20 x 5 = 100.
+  - The C-cap guard requiring `DROPLET_POOL_CAPACITY == RECORDING_WORKER_CONCURRENCY` (`config.go:364`) is gated behind `DROPLET_POOL_ENABLED`, which is unset on `stoarama-api` — so setting CAPACITY there does not require also setting `RECORDING_WORKER_CONCURRENCY` or enabling the pool on the API service.
+  - Set via the REST API (see `AGENTS.md`, "Render Operator Access"); the Render CLI cannot do it.
 
 ## Recommended initial values
 

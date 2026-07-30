@@ -64,3 +64,6 @@ credentials.json
 !local/*.env.example
 !local/*.env.sample
 !*.tfvars.example
+
+# local build output (render.yaml builds ./bin/stoarama-api)
+/bin/

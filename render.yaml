@@ -140,6 +140,14 @@ services:
       # CRUD and clip upload-intents return 503 and no clip can ever be stored.
       - key: STORAGE_CRED_KEY
         sync: false
+      # Visible omission: DROPLET_POOL_MAX and DROPLET_POOL_CAPACITY are not declared
+      # here, but this service reads them to compute the droplet admission ceiling
+      # MAX*CAPACITY (server_recordings_batch.go, server_recordings.go), so they MUST
+      # stay in sync with stoarama-recorder-control. They are set on the live service
+      # by hand; with nothing declared here a fresh service silently takes the
+      # config.go defaults 5 x 1 = 5 and rejects batch schedules against a phantom
+      # ceiling. Read the live values before trusting this file (AGENTS.md, "Render
+      # Operator Access").
 
   # Hourly recording-health check: sweeps active paid recordings for silent
   # death (a continuous recording marked done/idle mid-window producing zero
@@ -251,10 +259,17 @@ services:
       # the admin account that owns the per-droplet local_recorder node tokens.
       # The project + firewall ids reuse the existing DO project and the egress
       # firewall that blocks the metadata IP / RFC1918 (S-1). DROPLET_POOL_MAX is
-      # the hard spend cap. These values are auto-synced by the Render Blueprint on
-      # every push, so they MUST match the live prod config: the pool is enabled and
-      # Capacity is baked into the prebuilt droplet image (DROPLET_POOL_IMAGE), so a
-      # mismatch here would clobber prod on deploy.
+      # the hard spend cap.
+      #
+      # The live dashboard/API value is what the service actually runs. Treat the
+      # values below as bootstrap defaults and read the live service before trusting
+      # them (curl recipe in AGENTS.md, "Render Operator Access"; the render CLI has
+      # no env-var subcommand). This holds for DROPLET_POOL_MAX and
+      # DROPLET_POOL_CAPACITY in particular.
+      #
+      # Separately, and always true: DROPLET_POOL_CAPACITY is baked into the prebuilt
+      # droplet image (DROPLET_POOL_IMAGE) and MUST equal RECORDING_WORKER_CONCURRENCY
+      # (C-cap invariant), so changing it needs a droplet image rebuild.
       - key: DO_API_TOKEN
         sync: false
       - key: BOOTSTRAP_ADMIN_EMAIL
@@ -265,9 +280,7 @@ services:
         value: "30"
       - key: DROPLET_POOL_LOOKAHEAD_SEC
         value: "1800"
-      # Capacity is baked into the prebuilt droplet image; it MUST equal
-      # RECORDING_WORKER_CONCURRENCY (C-cap invariant) and changing it needs a
-      # droplet image rebuild, so keep both at 5 to match the live image.
+      # Keep both at 5 to match the live droplet image (C-cap invariant above).
       - key: DROPLET_POOL_CAPACITY
         value: "5"
       - key: RECORDING_WORKER_CONCURRENCY
@@ -302,7 +315,9 @@ services:
       # the largest value that fits under the DigitalOcean account droplet_limit
       # (25, with headroom for orphan-reap churn). Reaching true 1000-concurrent
       # (200+ droplets) requires a DO droplet-limit increase first. Override per
-      # environment via the Render env var (the live prod value wins over this).
+      # environment via the Render env var; see the bootstrap-default note above.
+      # NOTE: stoarama-api reads DROPLET_POOL_MAX * DROPLET_POOL_CAPACITY as its
+      # admission ceiling and must carry the same two values as this service.
       - key: DROPLET_POOL_MAX
         value: "20"
       # Most droplets to provision in one tick. Lets a large demand jump (e.g. a

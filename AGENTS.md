@@ -62,8 +62,32 @@ The public `stoarama` CLI is narrower and is for account/node workflows, not ope
 
 Runtime secrets live in `local/*.env` (gitignored; committed `.example` files show the shape). Check there before asking for credentials or reaching for Render:
 
-- `render.env` — production env mirror, incl. R2: `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_REGION`, and `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` (map to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for AWS-style tooling)
-- `recording-supervisor.env`, `youtube-relay-source.env` — Stoarama operator API keys
-- `do-capture.env` — DigitalOcean capture box
+- `render.env` — production env mirror: `SERVICE_TOKEN` plus R2 (`R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_REGION`, and `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`, which map to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for AWS-style tooling)
+- `recording-supervisor.env` — operator API key AND the production Postgres `DATABASE_URL` (the only local source of prod DB access)
+- `youtube-relay-source.env` — operator API key + relay topology config
+- `mitscl.env` — account-47 API token (`BACKEND_API_URL` + `MITSCL_API_TOKEN`)
+- `do-capture.env` — `DIGITALOCEAN_TOKEN` + `TF_VAR_*` for the DigitalOcean capture boxes
+- `relay-signing-private.key` — relay payload signing key
 
 Load with: `set -a; . local/render.env; set +a`. Never print values; never copy between machines without Deniz approval.
+
+## Render Operator Access
+
+The Render CLI is installed at `~/.local/bin/render` and is already authenticated (workspace `ay` / `tea-d1g1uevfte5s7384s1q0`, deniz@denizay.org). Its config is `~/.render/cli.yaml`; the bearer token is at YAML path `.api.key` (NOT `.profiles.default.apiKey` — that path does not exist, and `yq` is not installed on this machine).
+
+The CLI has **no** `env-var` subcommand. Read/write service env vars through the REST API:
+
+    KEY=$(awk '/^ *key:/{print $2}' ~/.render/cli.yaml)
+    curl -s -H "Authorization: Bearer $KEY" \
+      https://api.render.com/v1/services/$SERVICE_ID/env-vars?limit=100
+
+Service IDs: `stoarama-api` = `srv-d6usqn94tr6s73d94cd0`, `stoarama-recorder-control` = `srv-d8vcdspo3t8c73far4e0`.
+
+Writing an env var (`PUT .../env-vars/KEY`) does **not** trigger a deploy, and `POST .../restart` does **not** reload env — the process keeps the values it booted with. To make an env change take effect, trigger a deploy of the same commit:
+
+    curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+      -d '{"clearCache":"do_not_clear"}' https://api.render.com/v1/services/$SERVICE_ID/deploys
+
+`AUTO_MIGRATE=true` on `stoarama-api`, so a deploy runs migrations on boot. Before deploying, confirm `origin/main` matches the live commit and that no migration is unapplied, or you will ship more than the env change.
+
+`.api.key` is short-lived (`expires_at` sits in the same file, currently 2026-08-03). Re-read it from the file on each use rather than caching it; on a 401 refresh it with the CLI instead of asking Deniz for a dashboard value.
