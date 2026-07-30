@@ -567,10 +567,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous mktemp failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			if w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
 				return
 			}
-			backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
+			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
 			continue
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_capturing")
