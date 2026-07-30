@@ -528,7 +528,9 @@ func (s *Server) router() http.Handler {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// RENDER_GIT_COMMIT is set by Render; empty elsewhere. Without it there is no
+	// way to tell which commit is actually serving prod.
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "commit": os.Getenv("RENDER_GIT_COMMIT")})
 }
 
 func sampleEvenly(values []string, count int) []string {
