@@ -85,7 +85,7 @@ var (
 // defaultUploadWorkers is the per-job segment upload concurrency used when
 // Config.UploadWorkers is unset. Keep in sync with the RELAY_UPLOAD_WORKERS
 // default in internal/config.
-const defaultUploadWorkers = 4
+const defaultUploadWorkers = 2
 
 const segmentDeliveryRetryDelay = 5 * time.Second
 const segmentDeliveryRetryBudget = 2 * time.Minute

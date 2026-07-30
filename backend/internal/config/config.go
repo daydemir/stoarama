@@ -397,7 +397,21 @@ func (c Config) ValidatePool() error {
 // DefaultRelayUploadWorkers is the per-job segment upload concurrency used when
 // RELAY_UPLOAD_WORKERS is unset. Kept deliberately small: the point is to stop a
 // single job from being capped at one round trip, not to saturate the uplink.
-const DefaultRelayUploadWorkers = 4
+//
+// In practice this constant IS the fleet-wide value: neither service template
+// sets any environment (cmd/stoarama-relay/templates/{systemd.service,launchd.plist}.tmpl),
+// and refreshSystemdUnit rewrites the Pi unit from the embedded template on every
+// start, so a hand-added Environment= line does not survive a self-update. Changing
+// per-node upload concurrency therefore means changing this default and cutting a
+// release -- treat it as a code constant, not an ops knob.
+//
+// 2 is chosen from measurement, not taste. Fixed per-segment overhead is 30-67s
+// against a 60s clip, so one flow needs 63-97s per clip and backlogs without bound;
+// two flows bring that to 31-49s, draining with 20-48% headroom on the affected
+// streams (3.87-4.12 Mbit/s). Raising it costs concurrent TLS PUTs on 2-core
+// Raspberry Pi nodes that are also running ffmpeg for every active stream, for
+// headroom nothing has measured a need for.
+const DefaultRelayUploadWorkers = 2
 
 // RelayUploadWorkersFromEnv reads RELAY_UPLOAD_WORKERS for binaries that never
 // build a full Config (the relay reads only its enrollment file).
