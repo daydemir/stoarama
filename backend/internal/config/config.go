@@ -106,6 +106,20 @@ type Config struct {
 	RecordingWorkerConcurrency  int
 	RecordingWorkerHeartbeatSec int
 	RecordingWorkerPollSec      int
+	// RelayUploadWorkers bounds how many segment uploads ONE continuous recording
+	// job keeps in flight. Segment delivery used to be strictly serial per job, so
+	// a single job could not exceed one reserve+upload+ingest round trip at a time
+	// and a high-bitrate stream built a delivery backlog that never drained.
+	//
+	// This is PER JOB, so a node's total simultaneous uploads is
+	// RecordingWorkerConcurrency * RelayUploadWorkers (a relay running 8 streams at
+	// the default 4 workers opens up to 32 concurrent uploads). Size the two
+	// together against the node's uplink and CPU -- TLS for many parallel PUTs is
+	// not free on a Raspberry Pi. Raise RELAY_UPLOAD_WORKERS only while a node's
+	// aggregate throughput still scales with concurrency; once per-flow throughput
+	// starts falling as flows are added, the link is saturated and more workers
+	// only add contention.
+	RelayUploadWorkers int
 
 	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
 	// control service alongside the scheduler). Empty/disabled by default.
@@ -221,6 +235,7 @@ func Load() (Config, error) {
 		RecordingWorkerConcurrency:  intEnv("RECORDING_WORKER_CONCURRENCY", 1),
 		RecordingWorkerHeartbeatSec: intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),
 		RecordingWorkerPollSec:      intEnv("RECORDING_WORKER_POLL_SEC", 5),
+		RelayUploadWorkers:          RelayUploadWorkersFromEnv(),
 
 		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
@@ -377,6 +392,31 @@ func (c Config) ValidatePool() error {
 		return fmt.Errorf("DROPLET_POOL_REGION, DROPLET_POOL_SIZE, and DROPLET_POOL_IMAGE are required")
 	}
 	return nil
+}
+
+// DefaultRelayUploadWorkers is the per-job segment upload concurrency used when
+// RELAY_UPLOAD_WORKERS is unset. Kept deliberately small: the point is to stop a
+// single job from being capped at one round trip, not to saturate the uplink.
+//
+// In practice this constant IS the fleet-wide value: neither service template
+// sets any environment (cmd/stoarama-relay/templates/{systemd.service,launchd.plist}.tmpl),
+// and refreshSystemdUnit rewrites the Pi unit from the embedded template on every
+// start, so a hand-added Environment= line does not survive a self-update. Changing
+// per-node upload concurrency therefore means changing this default and cutting a
+// release -- treat it as a code constant, not an ops knob.
+//
+// 2 is chosen from measurement, not taste. Fixed per-segment overhead is 30-67s
+// against a 60s clip, so one flow needs 63-97s per clip and backlogs without bound;
+// two flows bring that to 31-49s, draining with 20-48% headroom on the affected
+// streams (3.87-4.12 Mbit/s). Raising it costs concurrent TLS PUTs on 2-core
+// Raspberry Pi nodes that are also running ffmpeg for every active stream, for
+// headroom nothing has measured a need for.
+const DefaultRelayUploadWorkers = 2
+
+// RelayUploadWorkersFromEnv reads RELAY_UPLOAD_WORKERS for binaries that never
+// build a full Config (the relay reads only its enrollment file).
+func RelayUploadWorkersFromEnv() int {
+	return intEnv("RELAY_UPLOAD_WORKERS", DefaultRelayUploadWorkers)
 }
 
 func intEnv(key string, def int) int {

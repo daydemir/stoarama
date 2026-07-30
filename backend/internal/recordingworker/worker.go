@@ -54,6 +54,11 @@ type Config struct {
 	// CaptureTempDir owns relay capture attempts outside the OS-wide temporary
 	// directory. Empty preserves the cloud worker's existing behavior.
 	CaptureTempDir string
+	// UploadWorkers bounds how many segment uploads ONE continuous job keeps in
+	// flight. Delivery used to be strictly serial per job, which capped a single
+	// job at one reserve+upload+ingest round trip at a time. Zero or negative
+	// uses defaultUploadWorkers.
+	UploadWorkers int
 	// DiskFreeBytes and the thresholds are relay-only safety gates. The server
 	// remains authoritative for stream capacity; these prevent a full local disk
 	// from making the relay or host unhealthy.
@@ -77,6 +82,11 @@ var (
 	errReplaySegmentDelivery    = errors.New("segment delivery must reserve again")
 )
 
+// defaultUploadWorkers is the per-job segment upload concurrency used when
+// Config.UploadWorkers is unset. Keep in sync with the RELAY_UPLOAD_WORKERS
+// default in internal/config.
+const defaultUploadWorkers = 2
+
 const segmentDeliveryRetryDelay = 5 * time.Second
 const segmentDeliveryRetryBudget = 2 * time.Minute
 const postWindowDeliveryGrace = 2 * time.Minute
@@ -98,6 +108,9 @@ func NewWorker(cfg Config) (*Worker, error) {
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 5 * time.Second
+	}
+	if cfg.UploadWorkers <= 0 {
+		cfg.UploadWorkers = defaultUploadWorkers
 	}
 	return &Worker{
 		cfg:               cfg,
@@ -373,18 +386,28 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		defer windowCancel()
 	}
 
-	// sourceURL is re-resolved every supervisor attempt; onSegment records the URL
-	// that produced the segment it is ingesting. segmentIngested flips true when a
-	// segment is delivered in the current attempt, which the supervisor uses to reset
-	// the reconnect backoff (a healthy attempt that later drops must not inherit a
-	// grown delay). CaptureContinuous invokes onSegment synchronously, so these
-	// delivery fields are owned by this job goroutine and require no locking.
-	var sourceURL string
-	var segmentIngested bool
-	var segmentDeliveryPending bool
-	lastProgressAt := time.Now()
-	onSegment := func(seg capture.Segment) error {
-		segmentDeliveryPending = true
+	// The source URL is re-resolved every supervisor attempt; deliverSegment records
+	// the URL that produced the segment it is ingesting, and takes it as a parameter
+	// so each attempt's delivery pool closes over an immutable copy rather than a
+	// variable the job goroutine rewrites on reconnect.
+	//
+	// CONCURRENCY: CaptureContinuous no longer performs delivery inline. It still
+	// calls the pool's Submit synchronously and in order, but reserve -> PUT ->
+	// ingest runs on UploadWorkers goroutines, so the delivery state this loop reads
+	// is NOT owned by the job goroutine any more:
+	//   - progress (the old lastProgressAt) is mutex-guarded in continuousProgress;
+	//   - the per-attempt first error, in-flight count and "ingested anything" flag
+	//     (the old segmentDeliveryPending / segmentIngested) live inside
+	//     segmentDeliveryPool behind its own mutex, and this loop reads them only
+	//     from the segmentDeliveryResult that pool.close() returns after joining
+	//     every worker;
+	//   - RelayDiagnostics and the canceled() probe were already mutex-guarded, and
+	//     the disk gate is atomic.
+	// segmentDeliveryPending stays job-scoped (an attempt that delivers nothing
+	// leaves the previous attempt's value untouched, as the inline path did).
+	segmentDeliveryPending := false
+	progress := newContinuousProgress(time.Now())
+	deliverSegment := func(sourceURL string, seg capture.Segment) error {
 		if !w.diskHasSpace(w.cfg.MinActiveFreeBytes) {
 			return errDiskPressure
 		}
@@ -449,9 +472,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			return err
 		}
-		segmentIngested = true
-		segmentDeliveryPending = false
-		lastProgressAt = time.Now()
+		progress.mark(time.Now())
 		capture.RemoveSegmentFile(seg)
 		w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
 		log.Printf("recording worker job=%d recording=%d continuous segment ingested start=%s size=%d",
@@ -481,7 +502,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
 			break
 		}
-		segmentIngested = false
 
 		// Re-resolve EVERY attempt so expiring tokens are refreshed on reconnect.
 		// A transient resolve error backs off and retries rather than failing the
@@ -499,10 +519,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			if w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
 				return
 			}
-			backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
+			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
 			continue
 		}
 		if isImage {
@@ -523,13 +543,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			if w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
 				return
 			}
-			backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
+			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
 			continue
 		}
-		sourceURL = resolved
 
 		// Fresh outDir per attempt, removed immediately after the attempt returns: a
 		// previous attempt's leftover seg-*.mp4 would otherwise be re-finalized and
@@ -555,7 +574,25 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			continue
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_capturing")
-		captureErr := capture.CaptureContinuousWithHeaders(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment, inputHeaders)
+		// One delivery pool per attempt. attemptCtx lets the first delivery failure
+		// stop ffmpeg as promptly as the old inline upload did; it is a child of
+		// windowCtx, so aborting an attempt never looks like a window close (the
+		// supervisor still reconnects). The per-segment delivery budget stays on
+		// jobCtx, so uploads already in flight keep their full retry budget (and the
+		// post-window grace) while the pool is drained.
+		attemptCtx, abortAttempt := context.WithCancel(windowCtx)
+		pool := startSegmentDeliveryPool(w.cfg.UploadWorkers, abortAttempt, func(seg capture.Segment) error {
+			return deliverSegment(resolved, seg)
+		})
+		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", job.TargetFPS, outDir, pool.Submit, inputHeaders)
+		// Join every outstanding upload BEFORE the attempt is judged, so the window
+		// never closes (and outDir is never removed) with an upload still running.
+		delivery := pool.close()
+		abortAttempt()
+		captureErr = joinSegmentDeliveryError(captureErr, delivery.err)
+		if delivery.submitted > 0 {
+			segmentDeliveryPending = delivery.pending > 0
+		}
 		if shouldCleanupContinuousAttempt(segmentDeliveryPending, captureErr) {
 			if removeErr := os.RemoveAll(outDir); removeErr != nil {
 				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
@@ -587,7 +624,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// Premature exit (clean end-of-stream or a hard ffmpeg error) with the window
 		// still open: back off and reconnect. An attempt that ingested at least one
 		// clip was a healthy connection that later dropped, so reset the backoff.
-		if segmentIngested {
+		if delivery.ingested {
 			failures = 0
 		}
 		failures++
@@ -599,10 +636,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}
 		log.Printf("recording worker job=%d recording=%d continuous source dropped (attempt %d): %v; reconnecting in %s",
 			job.JobID, job.RecordingID, attempt, captureErr, delay)
-		if !errors.Is(captureErr, errSegmentDelivery) && w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+		if !errors.Is(captureErr, errSegmentDelivery) && w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
 			return
 		}
-		backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
+		backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
 	}
 
 	if canceled() {
@@ -745,6 +782,22 @@ func continuousReconnectDelay(lastProgressAt, now time.Time, timeout, delay time
 // It never signals "fail": in-window restarts must not consume attempt_count.
 func continuousShouldStop(canceled, windowClosed bool) bool {
 	return canceled || windowClosed
+}
+
+// joinSegmentDeliveryError folds an asynchronous delivery failure into the
+// attempt's capture error so it is classified by the same path an inline delivery
+// failure was. A failure seen while ffmpeg is still running normally also surfaces
+// through the next Submit (and therefore through captureErr, which is why the
+// already-carried case is dropped rather than duplicated); a failure that lands
+// after the last sweep would otherwise be invisible to the supervisor.
+func joinSegmentDeliveryError(captureErr, deliveryErr error) error {
+	if deliveryErr == nil || errors.Is(captureErr, deliveryErr) {
+		return captureErr
+	}
+	if captureErr == nil {
+		return deliveryErr
+	}
+	return errors.Join(captureErr, deliveryErr)
 }
 
 func continuousDeliveryFailureShouldFail(captureErr error, windowClosed bool) bool {

@@ -191,6 +191,14 @@ func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, durat
 // does not grow unbounded over a long window. onSegment returning an error aborts
 // the whole window (SIGINT ffmpeg, return the error).
 //
+// ORDERING CONTRACT: onSegment is called from this one goroutine, serially and in
+// media-timeline order, and the StartAt/EndAt chaining (nextStart) is completed
+// before each call. A caller MAY therefore hand the segment to its own upload pool
+// and return before delivery finishes: concurrent, out-of-order completion cannot
+// affect the timeline. Such a caller must report a deferred delivery failure on a
+// LATER onSegment call (this loop only learns about failures through the return
+// value) and must join its outstanding deliveries after CaptureContinuous returns.
+//
 // pinHost mirrors CaptureSegment (HTTP Host override for the IP-pinned path);
 // pass "" to let ffmpeg derive Host/SNI from the URL.
 func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error) error {
