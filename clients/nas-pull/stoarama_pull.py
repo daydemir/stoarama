@@ -560,14 +560,20 @@ def heartbeat_loop(cfg, runtime, stop_event):
                     pass
                 log("INFO", "heartbeat recovered")
         except Exception as exc:
-            classification = classify_transport_error(exc).value
-            now = utc_now()
-            if not outage:
-                outage = {"class": classification, "started_at": now, "failure_count": 0}
-            outage["class"] = classification
-            outage["failure_count"] = int(outage.get("failure_count", 0)) + 1
-            atomic_write(cfg.outage_file, json.dumps(outage).encode("utf-8"))
-            log("WARN", "heartbeat failed class=%s count=%d: %s" % (classification, outage["failure_count"], exc))
+            try:
+                classification = classify_transport_error(exc).value
+                now = utc_now()
+                if not outage:
+                    outage = {"class": classification, "started_at": now, "failure_count": 0}
+                outage["class"] = classification
+                outage["failure_count"] = int(outage.get("failure_count", 0)) + 1
+                atomic_write(cfg.outage_file, json.dumps(outage).encode("utf-8"))
+                log("WARN", "heartbeat failed class=%s count=%d: %s" % (classification, outage["failure_count"], exc))
+            except Exception as record_exc:
+                # Outage bookkeeping must never kill this thread. If it dies the
+                # server's view of the client freezes while the drain loop keeps
+                # running, and the NAS is remote and cannot be restarted by hand.
+                log("WARN", "heartbeat bookkeeping failed: %s" % record_exc)
         stop_event.wait(HEARTBEAT_INTERVAL_SEC)
 
 
@@ -649,6 +655,10 @@ def run(cfg):
     updater.start()
     try:
         while not stop_event.is_set():
+            if not heartbeat.is_alive():
+                log("WARN", "heartbeat thread dead; restarting")
+                heartbeat = threading.Thread(target=heartbeat_loop, args=(cfg, runtime, stop_event), daemon=True)
+                heartbeat.start()
             try:
                 check_storage(cfg)
             except (RuntimeError, OSError) as exc:

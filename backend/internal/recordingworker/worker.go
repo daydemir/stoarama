@@ -536,9 +536,23 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// re-ingested by the next CaptureContinuous call.
 		outDir, err := os.MkdirTemp(w.cfg.CaptureTempDir, "capture-continuous-*")
 		if err != nil {
-			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("mktemp continuous outdir: %w", err))
-			w.fail(ctx, job.JobID, fmt.Errorf("mktemp continuous outdir: %w", err))
-			return
+			// Disk pressure is transient, so treat it like a resolve/ssrf failure and
+			// reconnect rather than failing the job. Failing here burned an attempt in
+			// microseconds and immediately re-leased the next job, so a single full
+			// host poisoned every job it touched (15 jobs in 134s on 2026-07-24).
+			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+				break
+			}
+			w.cfg.RelayDiagnostics.Error(job.JobID, "mktemp_retry", err)
+			failures++
+			delay := reconnectBackoff(job.JobID, failures)
+			log.Printf("recording worker job=%d recording=%d continuous mktemp failed (attempt %d): %v; retrying in %s",
+				job.JobID, job.RecordingID, attempt, err, delay)
+			if w.surrenderContinuousJob(ctx, cancel, job, lastProgressAt) {
+				return
+			}
+			backoff(continuousReconnectDelay(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
+			continue
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_capturing")
 		captureErr := capture.CaptureContinuousWithHeaders(windowCtx, sourceURL, clipDuration, "", job.TargetFPS, outDir, onSegment, inputHeaders)

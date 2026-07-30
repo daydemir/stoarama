@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import tempfile
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -157,6 +158,30 @@ class NASPullTests(unittest.TestCase):
                 self.assertFalse(pull.drain_page(cfg, runtime))
             self.assertEqual(runtime.cursor_id, 0)
             self.assertEqual(runtime.last_error, "1 of 1 clips failed; first clip 1: release denied")
+
+    def test_heartbeat_survives_outage_bookkeeping_failure(self):
+        # A throw inside the failure handler used to escape and kill the heartbeat
+        # thread, freezing the server's view of a client that kept draining.
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            stop_event = threading.Event()
+            beats = []
+
+            def flaky_post(*_args, **_kwargs):
+                beats.append(1)
+                if len(beats) >= 3:
+                    stop_event.set()
+                raise urllib.error.URLError(socket.gaierror("name resolution"))
+
+            with mock.patch.object(pull, "request_json", side_effect=flaky_post), mock.patch.object(
+                pull, "atomic_write", side_effect=OSError("no space left on device")
+            ), mock.patch.object(pull, "HEARTBEAT_INTERVAL_SEC", 0):
+                pull.heartbeat_loop(cfg, runtime, stop_event)
+
+            # Loop kept beating through both the transport error and the failed
+            # bookkeeping write, instead of dying on the first one.
+            self.assertGreaterEqual(len(beats), 3)
 
     def test_exhausted_retries_are_reported_for_download_and_release(self):
         with tempfile.TemporaryDirectory() as raw:
