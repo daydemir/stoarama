@@ -59,11 +59,12 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatalf("init recording api client: %v", err)
 	}
 	worker, err := recordingworker.NewWorker(recordingworker.Config{
-		Client:       client,
-		WorkerID:     strings.TrimSpace(*workerID),
-		Concurrency:  *concurrency,
-		HeartbeatSec: *heartbeatSec,
-		PollInterval: time.Duration(*pollSec) * time.Second,
+		Client:        client,
+		WorkerID:      strings.TrimSpace(*workerID),
+		Concurrency:   *concurrency,
+		HeartbeatSec:  *heartbeatSec,
+		PollInterval:  time.Duration(*pollSec) * time.Second,
+		UploadWorkers: cfg.RelayUploadWorkers,
 	})
 	if err != nil {
 		log.Fatalf("init recording worker: %v", err)

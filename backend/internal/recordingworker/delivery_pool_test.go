@@ -1,0 +1,238 @@
+package recordingworker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
+)
+
+// TestSegmentDeliveryPoolKeepsSeveralUploadsInFlight is the regression this whole
+// change exists for: one continuous job used to deliver segments strictly one at a
+// time, so its sustained throughput was capped at a single reserve+PUT+ingest round
+// trip. The pool must have all UploadWorkers uploads in flight simultaneously for
+// one job.
+func TestSegmentDeliveryPoolKeepsSeveralUploadsInFlight(t *testing.T) {
+	const workers = 4
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	release := make(chan struct{})
+
+	pool := startSegmentDeliveryPool(workers, func() {}, func(capture.Segment) error {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		mu.Unlock()
+		<-release
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return nil
+	})
+
+	for i := range workers {
+		if err := pool.Submit(capture.Segment{Path: fmt.Sprintf("seg-%d.mp4", i)}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	waitFor(t, "all uploads in flight", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return inFlight == workers
+	})
+	close(release)
+
+	result := pool.close()
+	if result.err != nil {
+		t.Fatalf("delivery error: %v", result.err)
+	}
+	mu.Lock()
+	peak := maxInFlight
+	mu.Unlock()
+	if peak != workers {
+		t.Fatalf("peak concurrent uploads=%d want %d (serial delivery is the bug)", peak, workers)
+	}
+	if result.submitted != workers || result.pending != 0 || !result.ingested {
+		t.Fatalf("result=%+v want submitted=%d pending=0 ingested=true", result, workers)
+	}
+}
+
+// TestSegmentDeliveryPoolCloseDrainsOutstandingUploads pins the window-close
+// contract: close() joins every accepted segment, so making delivery concurrent
+// does not simply move clip loss to the window boundary.
+func TestSegmentDeliveryPoolCloseDrainsOutstandingUploads(t *testing.T) {
+	const workers = 3
+	const segments = 9
+	var delivered atomic.Int64
+	started := make(chan struct{}, segments)
+
+	pool := startSegmentDeliveryPool(workers, func() {}, func(capture.Segment) error {
+		started <- struct{}{}
+		time.Sleep(10 * time.Millisecond)
+		delivered.Add(1)
+		return nil
+	})
+
+	for i := range segments {
+		if err := pool.Submit(capture.Segment{Path: fmt.Sprintf("seg-%d.mp4", i)}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	// At least one upload is still running when the window closes.
+	<-started
+
+	result := pool.close()
+	if got := delivered.Load(); got != segments {
+		t.Fatalf("delivered=%d want %d: window close dropped outstanding uploads", got, segments)
+	}
+	if result.err != nil || result.pending != 0 || result.submitted != segments || !result.ingested {
+		t.Fatalf("result=%+v want no error, pending=0, submitted=%d", result, segments)
+	}
+}
+
+// TestSegmentDeliveryPoolQueueIsBounded proves Submit backpressures instead of
+// buffering without bound: with every worker parked, only the queue's depth of
+// extra segments can be accepted before Submit blocks.
+func TestSegmentDeliveryPoolQueueIsBounded(t *testing.T) {
+	const workers = 2
+	release := make(chan struct{})
+	defer close(release)
+	var accepted atomic.Int64
+
+	pool := startSegmentDeliveryPool(workers, func() {}, func(capture.Segment) error {
+		<-release
+		return nil
+	})
+
+	go func() {
+		for range 4 * workers {
+			if err := pool.Submit(capture.Segment{Path: "seg.mp4"}); err != nil {
+				return
+			}
+			accepted.Add(1)
+		}
+	}()
+	// workers in flight + workers queued is the ceiling; the next Submit blocks.
+	waitFor(t, "queue full", func() bool { return accepted.Load() == 2*workers })
+	time.Sleep(50 * time.Millisecond)
+	if got := accepted.Load(); got != 2*workers {
+		t.Fatalf("accepted=%d want %d: submit did not backpressure", got, 2*workers)
+	}
+}
+
+// TestSegmentDeliveryPoolSurfacesFailureAndAbortsAttempt locks the error
+// semantics: a worker goroutine must not swallow a delivery failure. It aborts the
+// capture attempt, is returned by the next Submit (so CaptureContinuous still
+// surfaces it to the supervisor's reconnect/backoff path), and is reported by
+// close() with the failed segment still counted as unacknowledged.
+func TestSegmentDeliveryPoolSurfacesFailureAndAbortsAttempt(t *testing.T) {
+	ctx, abort := context.WithCancel(context.Background())
+	defer abort()
+	boom := fmt.Errorf("%w: upload segment: connection reset", errSegmentDelivery)
+
+	pool := startSegmentDeliveryPool(1, abort, func(capture.Segment) error { return boom })
+	if err := pool.Submit(capture.Segment{Path: "seg-0.mp4"}); err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+	// fail() records the error before it aborts, so once the attempt context is
+	// canceled the next Submit is guaranteed to report the failure.
+	waitFor(t, "attempt aborted", func() bool { return ctx.Err() != nil })
+
+	submitErr := pool.Submit(capture.Segment{Path: "seg-1.mp4"})
+	if !errors.Is(submitErr, errSegmentDelivery) {
+		t.Fatalf("submit error=%v want %v", submitErr, errSegmentDelivery)
+	}
+
+	result := pool.close()
+	if !errors.Is(result.err, errSegmentDelivery) {
+		t.Fatalf("result error=%v want %v", result.err, errSegmentDelivery)
+	}
+	if result.pending == 0 || result.ingested {
+		t.Fatalf("result=%+v want an unacknowledged segment and no ingest", result)
+	}
+}
+
+// TestJoinSegmentDeliveryError checks that an async delivery failure reaches the
+// supervisor's classifier exactly once, whether or not CaptureContinuous already
+// carried it out through Submit.
+func TestJoinSegmentDeliveryError(t *testing.T) {
+	delivery := fmt.Errorf("%w: ingest segment: boom", errSegmentDeliveryExhausted)
+	carried := fmt.Errorf("continuous segment delivery failed: %w", delivery)
+
+	if got := joinSegmentDeliveryError(nil, nil); got != nil {
+		t.Fatalf("clean attempt error=%v want nil", got)
+	}
+	if got := joinSegmentDeliveryError(nil, delivery); !errors.Is(got, errSegmentDeliveryExhausted) {
+		t.Fatalf("late delivery failure lost: %v", got)
+	}
+	if got := joinSegmentDeliveryError(carried, delivery); got.Error() != carried.Error() {
+		t.Fatalf("already-carried failure duplicated: %v", got)
+	}
+	captureErr := errors.New("continuous ffmpeg exited: signal: interrupt")
+	got := joinSegmentDeliveryError(captureErr, delivery)
+	if !errors.Is(got, errSegmentDeliveryExhausted) || !errors.Is(got, captureErr) {
+		t.Fatalf("joined error=%v want both causes", got)
+	}
+}
+
+func TestContinuousProgressIsConcurrentAndMonotonic(t *testing.T) {
+	base := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	progress := newContinuousProgress(base)
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			progress.mark(base.Add(time.Duration(i) * time.Second))
+			_ = progress.last()
+		}()
+	}
+	wg.Wait()
+	if got := progress.last(); !got.Equal(base.Add(15 * time.Second)) {
+		t.Fatalf("last progress=%s want %s", got, base.Add(15*time.Second))
+	}
+	progress.mark(base.Add(-time.Hour))
+	if got := progress.last(); !got.Equal(base.Add(15 * time.Second)) {
+		t.Fatalf("progress moved backwards: %s", got)
+	}
+}
+
+func TestUploadWorkersDefaultsToBoundedConcurrency(t *testing.T) {
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: "https://api.test", NodeToken: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.cfg.UploadWorkers != defaultUploadWorkers {
+		t.Fatalf("upload workers=%d want %d", worker.cfg.UploadWorkers, defaultUploadWorkers)
+	}
+	worker, err = NewWorker(Config{Client: client, UploadWorkers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.cfg.UploadWorkers != 2 {
+		t.Fatalf("configured upload workers=%d want 2", worker.cfg.UploadWorkers)
+	}
+}
+
+func waitFor(t *testing.T, what string, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !done() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}

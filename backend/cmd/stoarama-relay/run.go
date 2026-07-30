@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingworker"
 )
@@ -116,6 +117,7 @@ func runRelay(ctx context.Context) error {
 		RelayDiagnostics:            relayDiag,
 		ContinuousNoProgressTimeout: 5 * time.Minute,
 		CaptureTempDir:              tempRoot,
+		UploadWorkers:               config.RelayUploadWorkersFromEnv(),
 		DiskFreeBytes: func() (uint64, error) {
 			return diskFreeBytes(tempRoot)
 		},

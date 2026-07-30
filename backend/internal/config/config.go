@@ -106,6 +106,11 @@ type Config struct {
 	RecordingWorkerConcurrency  int
 	RecordingWorkerHeartbeatSec int
 	RecordingWorkerPollSec      int
+	// RelayUploadWorkers bounds how many segment uploads ONE continuous recording
+	// job keeps in flight. Segment delivery used to be strictly serial per job, so
+	// a single job could not exceed one reserve+upload+ingest round trip at a time
+	// and a high-bitrate stream built a delivery backlog that never drained.
+	RelayUploadWorkers int
 
 	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
 	// control service alongside the scheduler). Empty/disabled by default.
@@ -221,6 +226,7 @@ func Load() (Config, error) {
 		RecordingWorkerConcurrency:  intEnv("RECORDING_WORKER_CONCURRENCY", 1),
 		RecordingWorkerHeartbeatSec: intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),
 		RecordingWorkerPollSec:      intEnv("RECORDING_WORKER_POLL_SEC", 5),
+		RelayUploadWorkers:          RelayUploadWorkersFromEnv(),
 
 		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
@@ -377,6 +383,17 @@ func (c Config) ValidatePool() error {
 		return fmt.Errorf("DROPLET_POOL_REGION, DROPLET_POOL_SIZE, and DROPLET_POOL_IMAGE are required")
 	}
 	return nil
+}
+
+// DefaultRelayUploadWorkers is the per-job segment upload concurrency used when
+// RELAY_UPLOAD_WORKERS is unset. Kept deliberately small: the point is to stop a
+// single job from being capped at one round trip, not to saturate the uplink.
+const DefaultRelayUploadWorkers = 4
+
+// RelayUploadWorkersFromEnv reads RELAY_UPLOAD_WORKERS for binaries that never
+// build a full Config (the relay reads only its enrollment file).
+func RelayUploadWorkersFromEnv() int {
+	return intEnv("RELAY_UPLOAD_WORKERS", DefaultRelayUploadWorkers)
 }
 
 func intEnv(key string, def int) int {
