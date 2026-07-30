@@ -58,7 +58,7 @@ func TestMigrateUpAbortsWhenLockIsHeld(t *testing.T) {
 	if !strings.Contains(err.Error(), "lock timeout") && !strings.Contains(err.Error(), "canceling statement") {
 		t.Fatalf("expected a lock timeout error, got: %v", err)
 	}
-	if elapsed > 30*time.Second {
+	if elapsed > 10*time.Second {
 		t.Fatalf("migration took %s; lock_timeout did not apply", elapsed)
 	}
 }

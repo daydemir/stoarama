@@ -78,16 +78,26 @@ The Render CLI is installed at `~/.local/bin/render` and is already authenticate
 The CLI has **no** `env-var` subcommand. Read/write service env vars through the REST API:
 
     KEY=$(awk '/^ *key:/{print $2}' ~/.render/cli.yaml)
-    curl -s -H "Authorization: Bearer $KEY" \
-      https://api.render.com/v1/services/$SERVICE_ID/env-vars?limit=100
+    curl -fsS -H "Authorization: Bearer $KEY" \
+      "https://api.render.com/v1/services/$SERVICE_ID/env-vars?limit=100" \
+      | python3 -c 'import json,sys; [print(e.get("envVar",e)["key"]) for e in json.load(sys.stdin)]'
+
+Print KEYS ONLY, as above. The raw response contains every production secret
+value, so piping it to stdout leaks the lot into a transcript. If you need one
+value, select that single key and use it without echoing it.
 
 Service IDs: `stoarama-api` = `srv-d6usqn94tr6s73d94cd0`, `stoarama-recorder-control` = `srv-d8vcdspo3t8c73far4e0`.
 
 Writing an env var (`PUT .../env-vars/KEY`) does **not** trigger a deploy, and `POST .../restart` does **not** reload env — the process keeps the values it booted with. To make an env change take effect, trigger a deploy of the same commit:
 
-    curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-      -d '{"clearCache":"do_not_clear"}' https://api.render.com/v1/services/$SERVICE_ID/deploys
+    curl -fsS --show-error -X POST -H "Authorization: Bearer $KEY" \
+      -H 'Content-Type: application/json' -d '{"clearCache":"do_not_clear"}' \
+      "https://api.render.com/v1/services/$SERVICE_ID/deploys"
+
+`curl -s` alone exits 0 on an HTTP 400+, so a bad service id or an expired token
+looks like a successful deploy trigger. Use `-f` and check the returned deploy
+id and status before believing it started.
 
 `AUTO_MIGRATE=true` on `stoarama-api`, so a deploy runs migrations on boot. Before deploying, confirm `origin/main` matches the live commit and that no migration is unapplied, or you will ship more than the env change.
 
-`.api.key` is short-lived (`expires_at` sits in the same file, currently 2026-08-03). Re-read it from the file on each use rather than caching it; on a 401 refresh it with the CLI instead of asking Deniz for a dashboard value.
+`.api.key` is short-lived; `expires_at` sits beside it in the same file, so check there rather than trusting a date written down here. Re-read it from the file on each use rather than caching it; on a 401 refresh it with the CLI instead of asking Deniz for a dashboard value.

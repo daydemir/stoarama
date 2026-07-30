@@ -65,5 +65,7 @@ credentials.json
 !local/*.env.sample
 !*.tfvars.example
 
-# local build output (render.yaml builds ./bin/stoarama-api)
+# local build output (render.yaml sets rootDir: backend, so artifacts land in
+# backend/bin/; /bin/ covers ad-hoc builds at the repo root)
 /bin/
+/backend/bin/
