@@ -110,6 +110,15 @@ type Config struct {
 	// job keeps in flight. Segment delivery used to be strictly serial per job, so
 	// a single job could not exceed one reserve+upload+ingest round trip at a time
 	// and a high-bitrate stream built a delivery backlog that never drained.
+	//
+	// This is PER JOB, so a node's total simultaneous uploads is
+	// RecordingWorkerConcurrency * RelayUploadWorkers (a relay running 8 streams at
+	// the default 4 workers opens up to 32 concurrent uploads). Size the two
+	// together against the node's uplink and CPU -- TLS for many parallel PUTs is
+	// not free on a Raspberry Pi. Raise RELAY_UPLOAD_WORKERS only while a node's
+	// aggregate throughput still scales with concurrency; once per-flow throughput
+	// starts falling as flows are added, the link is saturated and more workers
+	// only add contention.
 	RelayUploadWorkers int
 
 	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
