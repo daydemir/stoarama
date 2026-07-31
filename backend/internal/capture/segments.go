@@ -353,8 +353,23 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	}
 }
 
+// continuousChainDriftLimit bounds how far the chained media timeline may run
+// AHEAD of a segment's own strftime open instant before the chain re-anchors to
+// that instant. The chain exists to close whole-second rounding gaps between
+// back-to-back segments, which is sub-second jitter; it silently assumed a live
+// source hands ffmpeg no more media than wall-clock time. A DVR-backed playlist
+// breaks that assumption -- SkylineWebcams let ffmpeg outrun real time on stream
+// 14478, and over one window its chained starts reached 26 minutes into the
+// future, so clips were stored under filenames and clip_start_at values for
+// instants that had not happened yet (and its coverage read 128%).
+//
+// Only forward drift is clamped. A chain that falls BEHIND the label is the
+// normal catch-up case: the media really is older than now, and re-anchoring
+// there would reintroduce the phantom gap the chain removes.
+const continuousChainDriftLimit = 90 * time.Second
+
 func deliverContinuousSegment(processed map[string]bool, path string, segment Segment, nextStart *time.Time, deliver func(Segment) error) error {
-	if !nextStart.IsZero() {
+	if !nextStart.IsZero() && nextStart.Sub(segment.StartAt) <= continuousChainDriftLimit {
 		segment.StartAt = *nextStart
 		segment.EndAt = segment.StartAt.Add(time.Duration(segment.DurationMs) * time.Millisecond)
 	}

@@ -318,9 +318,12 @@ func TestFinalizedSegmentRetryWithExistingTimelineDoesNotAdvanceUntilAck(t *test
 	processed := map[string]bool{}
 	initialNext := time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC)
 	nextStart := initialNext
+	// The chain leads this segment's strftime label, but by less than
+	// continuousChainDriftLimit, so chaining still wins and the assertions below
+	// are about retry identity rather than about how far the chain may drift.
 	segment := Segment{
-		StartAt:    time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
-		EndAt:      time.Date(2026, 7, 28, 12, 1, 0, 0, time.UTC),
+		StartAt:    time.Date(2026, 7, 28, 12, 59, 30, 0, time.UTC),
+		EndAt:      time.Date(2026, 7, 28, 13, 0, 30, 0, time.UTC),
 		DurationMs: 60_000,
 	}
 	var delivered []Segment
@@ -368,6 +371,53 @@ func TestZeroDurationFinalizedSegmentsUseDistinctTimelineKeys(t *testing.T) {
 	}
 	if want := starts[0].Add(time.Millisecond); !starts[1].Equal(want) {
 		t.Fatalf("second start=%s want %s", starts[1], want)
+	}
+}
+
+func TestContinuousChainReanchorsWhenMediaOutrunsWallClock(t *testing.T) {
+	// A DVR-backed playlist hands ffmpeg more media than wall-clock time, so the
+	// chained timeline walks into the future. Once it is further ahead of the
+	// segment's own strftime open instant than the drift limit, the chain must
+	// re-anchor to that instant instead of compounding (stream 14478 reached 26
+	// minutes ahead).
+	label := time.Date(2026, 7, 31, 19, 30, 0, 0, time.UTC)
+	drifted := label.Add(continuousChainDriftLimit + time.Second)
+	nextStart := drifted
+	var got Segment
+	deliver := func(segment Segment) error {
+		got = segment
+		return nil
+	}
+	segment := Segment{StartAt: label, EndAt: label.Add(time.Minute), DurationMs: 60000}
+	if err := deliverContinuousSegment(map[string]bool{}, "drifted.mp4", segment, &nextStart, deliver); err != nil {
+		t.Fatal(err)
+	}
+	if !got.StartAt.Equal(label) {
+		t.Fatalf("drifted start=%s want re-anchor to %s", got.StartAt, label)
+	}
+	if want := label.Add(time.Minute); !nextStart.Equal(want) {
+		t.Fatalf("timeline=%s want %s (chain must continue from the re-anchor)", nextStart, want)
+	}
+
+	// Within the limit the chain still wins, so ordinary sub-second jitter does
+	// not reintroduce a per-segment gap.
+	nextStart = label.Add(500 * time.Millisecond)
+	chained := nextStart
+	if err := deliverContinuousSegment(map[string]bool{}, "jitter.mp4", segment, &nextStart, deliver); err != nil {
+		t.Fatal(err)
+	}
+	if !got.StartAt.Equal(chained) {
+		t.Fatalf("jittered start=%s want chained %s", got.StartAt, chained)
+	}
+
+	// A chain that lags the label is the catch-up case and must keep chaining.
+	nextStart = label.Add(-2 * time.Hour)
+	lagging := nextStart
+	if err := deliverContinuousSegment(map[string]bool{}, "lagging.mp4", segment, &nextStart, deliver); err != nil {
+		t.Fatal(err)
+	}
+	if !got.StartAt.Equal(lagging) {
+		t.Fatalf("lagging start=%s want chained %s", got.StartAt, lagging)
 	}
 }
 
