@@ -90,13 +90,20 @@ Service IDs: `stoarama-api` = `srv-d6usqn94tr6s73d94cd0`, `stoarama-recorder-con
 
 Writing an env var (`PUT .../env-vars/KEY`) does **not** trigger a deploy, and `POST .../restart` does **not** reload env — the process keeps the values it booted with. To make an env change take effect, trigger a deploy of the same commit:
 
+    LIVE=$(curl -fsS -H "Authorization: Bearer $KEY" \
+      "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=1" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin)[0]; print(d.get("deploy",d)["commit"]["id"])')
     curl -fsS --show-error -X POST -H "Authorization: Bearer $KEY" \
-      -H 'Content-Type: application/json' -d '{"clearCache":"do_not_clear"}' \
-      "https://api.render.com/v1/services/$SERVICE_ID/deploys"
+      -H 'Content-Type: application/json' \
+      -d "{\"clearCache\":\"do_not_clear\",\"commitId\":\"$LIVE\"}" \
+      "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("id") and d.get("status"), d; print(d["id"], d["status"], d["commit"]["id"][:8])'
 
-`curl -s` alone exits 0 on an HTTP 400+, so a bad service id or an expired token
-looks like a successful deploy trigger. Use `-f` and check the returned deploy
-id and status before believing it started.
+Two traps here. `curl -s` alone exits 0 on an HTTP 400+, so a bad service id or
+an expired token looks like a successful deploy trigger — hence `-f` and the
+assertion on the response rather than eyeballing it. And a deploy POSTed without
+`commitId` takes whatever is newest on the connected branch, so anything pushed
+between your check and the POST ships too; pin it to the commit you verified.
 
 `AUTO_MIGRATE=true` on `stoarama-api`, so a deploy runs migrations on boot. Before deploying, confirm `origin/main` matches the live commit and that no migration is unapplied, or you will ship more than the env change.
 
