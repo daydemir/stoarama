@@ -17,6 +17,27 @@ Live services:
 - `stoarama-recorder-control` — `srv-d8vcdspo3t8c73far4e0`, worker, droplet pool scaler
 - crons `stoarama-recording-health`, `stoarama-relay-connectivity`
 
+## Merging capture code does not deploy it
+
+A Render deploy ships the API and the control worker. It does NOT ship the code
+that actually records, which runs in two places that update on their own terms:
+
+- **Cloud recorders.** Each droplet clones `DROPLET_POOL_REPO_REF` (live value:
+  `main`) and builds at provision time, so a droplet runs whatever `main` was
+  when it was created and never updates in place. `DROPLET_POOL_MIN=0` and a
+  600s idle grace mean a droplet holding zero leased jobs is drained and
+  destroyed, and the next one builds current `main` — so a capture fix reaches
+  cloud only after every existing droplet has recycled. Check `recorder_droplets`
+  `created_at` against the merge you care about before claiming a fix is live.
+- **Relays.** Enrolled Macs and Pis self-update from the signed manifest at
+  `https://stoarama.com/relay/download/latest.json`, so a capture fix reaches
+  them only when a new relay release is published and promoted.
+
+Both cost a capture interruption when they roll: a droplet forced past
+`DROPLET_POOL_DRAIN_TIMEOUT_SEC` (600s) drops its live windows, and a relay
+restart cost 5-9 minutes on nine streams during the `6c25bbb` rollout on
+2026-07-31. Never force either while chasing a cosmetic fix.
+
 ## Relay fleet gotchas learned the hard way
 
 - **Relay temp cleanup is not crash-safe.** A reboot, kill, or updater exit leaves whole
