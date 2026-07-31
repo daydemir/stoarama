@@ -17,6 +17,41 @@ Live services:
 - `stoarama-recorder-control` — `srv-d8vcdspo3t8c73far4e0`, worker, droplet pool scaler
 - crons `stoarama-recording-health`, `stoarama-relay-connectivity`
 
+## Merging capture code does not deploy it
+
+A Render deploy ships the API and the control worker. It does NOT ship the code
+that actually records, which runs in two places that update on their own terms:
+
+- **Cloud recorders.** Each droplet clones `DROPLET_POOL_REPO_REF` (live value:
+  `main`) and builds at provision time, so a droplet runs whatever `main` was
+  when it was created and never updates in place. A scale-up provisions from
+  current `main`, so a new droplet can carry a fix while older ones do not; the
+  cloud fleet is fully on that fix only once every older droplet has been
+  replaced. Check `recorder_droplets.created_at` against the merge you care
+  about before claiming a fix is live.
+- **Relays.** Enrolled Macs and Pis self-update from the signed manifest at
+  `https://stoarama.com/relay/download/latest.json`, so a capture fix reaches
+  them only when a new relay release is published and promoted.
+
+**A busy droplet may never recycle on its own.** Scale-down is not "idle for
+`DROPLET_POOL_IDLE_GRACE_SEC`, therefore drained". `Decide` (in
+`internal/dropletpool/state.go`) additionally requires the droplet to be SURPLUS
+to forecast demand (`live > required`), hysteresis to hold, no fire inside
+`idle_grace + provision_lead`, and `DROPLET_POOL_SCALEDOWN_COOLDOWN_SEC` to have
+elapsed. `DROPLET_POOL_MIN=0` permits scale-to-zero but does not by itself drain
+anything. Standing demand that keeps `required == live` -- e.g. ten cloud
+recordings against two capacity-5 droplets -- pins the existing droplets
+indefinitely, old binary and all. Waiting for a natural roll is then waiting for
+something that will not happen; either demand has to fall or the roll has to be
+forced.
+
+Forcing one costs capture. A draining droplet takes no new jobs and is destroyed
+once it holds no live lease, so it exits cleanly if its windows close inside
+`DROPLET_POOL_DRAIN_TIMEOUT_SEC` (600s) -- past that it is destroyed anyway and
+its live windows drop. Relay restarts are the same trade: the `6c25bbb` rollout
+on 2026-07-31 cost 5-9 minutes on nine streams. Weigh that against what the fix
+buys before forcing either.
+
 ## Relay fleet gotchas learned the hard way
 
 - **Relay temp cleanup is not crash-safe.** A reboot, kill, or updater exit leaves whole
