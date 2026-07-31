@@ -49,6 +49,16 @@ func MigrateUp(ctx context.Context, pool *pgxpool.Pool, migrationDir string) err
 		if err != nil {
 			return fmt.Errorf("begin migration tx: %w", err)
 		}
+		// An ALTER that waits on ACCESS EXCLUSIVE queues every later query behind
+		// it, so a slow lock takes prod down. Fail the migration (and the deploy)
+		// instead. SET LOCAL reverts with the tx.
+		// ponytail: lock acquisition only; a migration that takes its lock fast and
+		// then rewrites a huge table still holds it. Add statement_timeout if a
+		// rewrite ever bites, but that would also kill legitimate backfills.
+		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("set lock_timeout for %s: %w", name, err)
+		}
 		if _, err := tx.Exec(ctx, string(body)); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("apply migration %s: %w", name, err)
