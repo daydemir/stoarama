@@ -77,10 +77,12 @@ The Render CLI is installed at `~/.local/bin/render` and is already authenticate
 
 The CLI has **no** `env-var` subcommand. Read/write service env vars through the REST API:
 
-    rkey() { awk '/^ *key:/{print $2}' ~/.render/cli.yaml; }   # re-read per call
-    curl -fsS -H "Authorization: Bearer $(rkey)" \
-      "https://api.render.com/v1/services/$SERVICE_ID/env-vars?limit=100" \
-      | python3 -c 'import json,sys; [print(e.get("envVar",e)["key"]) for e in json.load(sys.stdin)]'
+```sh
+rkey() { awk '/^ *key:/{print $2}' ~/.render/cli.yaml; }   # re-read per call
+curl -fsS -H "Authorization: Bearer $(rkey)" \
+  "https://api.render.com/v1/services/$SERVICE_ID/env-vars?limit=100" \
+  | python3 -c 'import json,sys; [print(e.get("envVar",e)["key"]) for e in json.load(sys.stdin)]'
+```
 
 Print KEYS ONLY, as above. The raw response contains every production secret
 value, so piping it to stdout leaks the lot into a transcript. If you need one
@@ -88,27 +90,44 @@ value, select that single key and use it without echoing it.
 
 Service IDs: `stoarama-api` = `srv-d6usqn94tr6s73d94cd0`, `stoarama-recorder-control` = `srv-d8vcdspo3t8c73far4e0`.
 
+**Change env vars ONE KEY AT A TIME (`PUT .../env-vars/KEY`). Never replace the whole env set.**
+A bulk env replacement on `stoarama-api` on 2026-07-29 dropped `STORAGE_CRED_KEY` and stopped
+all MIT clip capture for 33 minutes (01:33-02:06 UTC). It surfaced as misleading 409s, not as an
+auth error: upload-intent reserved an idempotency key, then returned 503 because the key was
+gone, and retries looked like duplicates. Recovery needed a Render deploy rollback (a rollback
+restores that deploy's env snapshot) plus a relay fleet rollback. The structural cause is that
+Blueprint sync preserves the service but does NOT materialize `sync: false` variables, so
+anything set only in the dashboard silently disappears from a replacement.
+
+**Never invent a replacement `STORAGE_CRED_KEY`** — every encrypted storage destination becomes
+unreadable. Rotating it means re-encrypting the destination ciphertexts in the same transaction.
+
+After any env edit, confirm the sensitive keys are still present before walking away:
+`STORAGE_CRED_KEY`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ACCOUNT_ID`, `DATABASE_URL`.
+
 Writing an env var (`PUT .../env-vars/KEY`) does **not** trigger a deploy, and `POST .../restart` does **not** reload env — the process keeps the values it booted with. To make an env change take effect, trigger a deploy of the same commit:
 
-    rkey() { awk '/^ *key:/{print $2}' ~/.render/cli.yaml; }   # short-lived, re-read per call
+```sh
+rkey() { awk '/^ *key:/{print $2}' ~/.render/cli.yaml; }   # short-lived, re-read per call
 
-    LIVE=$(curl -fsS -H "Authorization: Bearer $(rkey)" \
-      "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=100" \
-      | python3 -c 'import json,sys
+LIVE=$(curl -fsS -H "Authorization: Bearer $(rkey)" \
+  "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=100" \
+  | python3 -c 'import json,sys
 live=[d for d in (e.get("deploy",e) for e in json.load(sys.stdin)) if d.get("status")=="live"]
 assert live, "no live deploy in this page; page further with ?cursor="
 print(live[0]["commit"]["id"])')
 
-    curl -fsS --show-error -X POST -H "Authorization: Bearer $(rkey)" \
-      -H 'Content-Type: application/json' \
-      -d "{\"clearCache\":\"do_not_clear\",\"commitId\":\"$LIVE\"}" \
-      "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
-      | LIVE="$LIVE" python3 -c 'import json,os,sys
+curl -fsS --show-error -X POST -H "Authorization: Bearer $(rkey)" \
+  -H 'Content-Type: application/json' \
+  -d "{\"clearCache\":\"do_not_clear\",\"commitId\":\"$LIVE\"}" \
+  "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
+  | LIVE="$LIVE" python3 -c 'import json,os,sys
 d=json.load(sys.stdin)
 assert d.get("id") and d.get("status"), d
 got=d.get("commit",{}).get("id")
 assert got==os.environ["LIVE"], "deployed %s, asked for %s" % (got, os.environ["LIVE"])
 print(d["id"], d["status"], got[:8])'
+```
 
 Three traps here. `curl -s` alone exits 0 on an HTTP 400+, so a bad service id or
 an expired token looks like a successful deploy trigger — hence `-f` and the

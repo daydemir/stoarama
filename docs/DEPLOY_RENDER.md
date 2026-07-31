@@ -17,6 +17,26 @@ Live services:
 - `stoarama-recorder-control` — `srv-d8vcdspo3t8c73far4e0`, worker, droplet pool scaler
 - crons `stoarama-recording-health`, `stoarama-relay-connectivity`
 
+## Relay fleet gotchas learned the hard way
+
+- **Relay temp cleanup is not crash-safe.** A reboot, kill, or updater exit leaves whole
+  `capture-continuous-*` directories behind, and the startup scavenger is the only thing that
+  removes them. `deniz-mini-r` was driven to ~1 GB free this way. Note `capture_temp_bytes` in
+  node health counts only recognized live dirs, so it can read 0 while orphans fill the disk —
+  do not conclude from it that Stoarama is not the cause. Any scavenger must delete only
+  recognized Stoarama capture dirs, never arbitrary temp files.
+- **Never delete a segment until ingestion is acknowledged**, and retry only explicitly
+  retryable errors. Treating "any 409" as success loses segments.
+- **Do not count machines behind the same uplink as independent relay-group capacity.** Two
+  ungrouped MIT machines once let the backend schedule up to 9 concurrent streams onto a single
+  uplink.
+- **Capture percentage is not a footage measure.** It is clips received / clips expected, so a
+  2-second clip counts as a whole clip and overlapping clips can exceed 100%. Use it as a
+  liveness signal, not as "how much video do we have".
+- **Some relay binaries cannot self-update.** Builds predating the embedded signing key (e.g.
+  `85c91b6e`) deliberately disable self-update and cannot pull signed releases on their own.
+  Avoid shipping service-unit directives that older Pis cannot parse — that strands them.
+
 Relay recordings (`capture_via != 'cloud'`) are excluded from the droplet forecast (`backend/internal/dropletpool/forecast.go:71`), so the cloud ceiling never blocks relay-only streams. Do not report relay work as pool-blocked.
 
 ## Required env vars
