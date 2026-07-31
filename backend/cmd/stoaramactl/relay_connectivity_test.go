@@ -12,6 +12,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// The threshold is a deliberate, measured value rather than a knob: laptops in
+// the fleet sleep for up to ~30 min and must not page. Assert it directly so a
+// well-meaning revert to a "more responsive" value is caught here.
+func TestRelayOnlineThresholdIsFleetSleepTolerant(t *testing.T) {
+	if relayOnlineThreshold != 45*time.Minute {
+		t.Fatalf("relayOnlineThreshold = %v, want 45m: shorter values page on laptop sleep (measured max gap 30.5m)", relayOnlineThreshold)
+	}
+}
+
 func TestRelayStateAtUsesFleetThreshold(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
@@ -22,6 +31,11 @@ func TestRelayStateAtUsesFleetThreshold(t *testing.T) {
 		{name: "never seen", want: relayOffline},
 		{name: "fresh", last: timePtr(now.Add(-119 * time.Second)), want: relayOnline},
 		{name: "threshold is offline", last: timePtr(now.Add(-relayOnlineThreshold)), want: relayOffline},
+		// Pinned to absolute durations, not to relayOnlineThreshold, so a revert
+		// to a short threshold fails here instead of passing silently. A sleeping
+		// laptop's longest measured gap was 30.5 min; 44m must still read online.
+		{name: "sleeping laptop gap stays online", last: timePtr(now.Add(-44 * time.Minute)), want: relayOnline},
+		{name: "genuinely down past 45m is offline", last: timePtr(now.Add(-46 * time.Minute)), want: relayOffline},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

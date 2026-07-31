@@ -24,7 +24,10 @@ import (
 // process never restarted, it was frozen with the host. Over 42 measured cycles
 // the longest real gap was 30.5 min (median 13.9 min), so 45 min clears the
 // observed maximum with margin and suppresses all of them. The Mac minis, which
-// do not sleep, produced 2 events in 30 days and are unaffected.
+// do not sleep, produced 2 events in 30 days -- they were not implicated in the
+// false alerts, but the threshold is fleet-wide, so a mini that genuinely dies
+// now also takes up to 45 minutes to page instead of 2. That is the accepted
+// cost; see below for why it is not a rate limit.
 //
 // Duration hysteresis rather than a rate limit or a mute: a genuinely dead node
 // still pages within the hour, which is what this alert exists for. A per-node
