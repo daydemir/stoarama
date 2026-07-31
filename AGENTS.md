@@ -93,18 +93,22 @@ Writing an env var (`PUT .../env-vars/KEY`) does **not** trigger a deploy, and `
     rkey() { awk '/^ *key:/{print $2}' ~/.render/cli.yaml; }   # short-lived, re-read per call
 
     LIVE=$(curl -fsS -H "Authorization: Bearer $(rkey)" \
-      "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=20" \
+      "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=100" \
       | python3 -c 'import json,sys
-ds=[e.get("deploy",e) for e in json.load(sys.stdin)]
-live=[d for d in ds if d.get("status")=="live"]
-assert live, "no live deploy found"
+live=[d for d in (e.get("deploy",e) for e in json.load(sys.stdin)) if d.get("status")=="live"]
+assert live, "no live deploy in this page; page further with ?cursor="
 print(live[0]["commit"]["id"])')
 
     curl -fsS --show-error -X POST -H "Authorization: Bearer $(rkey)" \
       -H 'Content-Type: application/json' \
       -d "{\"clearCache\":\"do_not_clear\",\"commitId\":\"$LIVE\"}" \
       "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
-      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("id") and d.get("status"), d; print(d["id"], d["status"], d["commit"]["id"][:8])'
+      | LIVE="$LIVE" python3 -c 'import json,os,sys
+d=json.load(sys.stdin)
+assert d.get("id") and d.get("status"), d
+got=d.get("commit",{}).get("id")
+assert got==os.environ["LIVE"], "deployed %s, asked for %s" % (got, os.environ["LIVE"])
+print(d["id"], d["status"], got[:8])'
 
 Three traps here. `curl -s` alone exits 0 on an HTTP 400+, so a bad service id or
 an expired token looks like a successful deploy trigger — hence `-f` and the
