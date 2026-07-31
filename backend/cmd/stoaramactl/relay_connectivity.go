@@ -16,7 +16,20 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/email"
 )
 
-const relayOnlineThreshold = 120 * time.Second
+// relayOnlineThreshold is deliberately long. Laptops in the fleet sleep and
+// dark-wake, which is indistinguishable from a short outage at the heartbeat
+// level, so a short threshold pages on healthy hardware. MIT-MAC-1 (a MacBook
+// Air) produced 86 alert events in 7 days -- 66% of all relay alerts -- while
+// holding zero jobs, with relay_started_at unchanged across every cycle: the
+// process never restarted, it was frozen with the host. Over 42 measured cycles
+// the longest real gap was 30.5 min (median 13.9 min), so 45 min clears the
+// observed maximum with margin and suppresses all of them. The Mac minis, which
+// do not sleep, produced 2 events in 30 days and are unaffected.
+//
+// Duration hysteresis rather than a rate limit or a mute: a genuinely dead node
+// still pages within the hour, which is what this alert exists for. A per-node
+// cap would drop the one message that matters -- the outage that does not end.
+const relayOnlineThreshold = 45 * time.Minute
 const relayConnectivityLockID int64 = 821754932
 const relayConnectivityAlertAccountID int64 = 47
 
