@@ -385,7 +385,7 @@ func detectClipTimestampDrift(ctx context.Context, pool *pgxpool.Pool) []healthI
 			RecordingID: id, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,
 			Signal: signalClipTimestampDrift, Severity: healthSignalSeverity[signalClipTimestampDrift],
-			SinceText: fmt.Sprintf("newest clip is stamped %s but was ingested %s",
+			SinceText: fmt.Sprintf("worst clip in the last hour is stamped %s but was ingested %s",
 				clipStartAt.UTC().Format(time.RFC3339), createdAt.UTC().Format(time.RFC3339)),
 			Diag: diagText("ahead_of_real_time", fmt.Sprintf("%ds", leadSec)),
 		})
