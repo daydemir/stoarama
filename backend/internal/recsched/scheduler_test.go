@@ -238,6 +238,7 @@ func TestContinuousRevivesDoneZeroClipWindow(t *testing.T) {
 		dailyWindowStart:   strPtr("09:00:00"),
 		dailyWindowEnd:     strPtr("11:30:00"),
 		startAt:            time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+		activeWeekdays:     AllWeekdays,
 		lastEnqueuedFireAt: &windowOpen,
 	}
 	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
@@ -297,6 +298,7 @@ func TestContinuousDoesNotReviveDoneJobWithClips(t *testing.T) {
 		dailyWindowStart: strPtr("09:00:00"),
 		dailyWindowEnd:   strPtr("11:30:00"),
 		startAt:          time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+		activeWeekdays:   AllWeekdays,
 	}
 	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
 	if err != nil {
@@ -348,6 +350,7 @@ func TestContinuousRevivesDoneJobWithClipsWhenWindowExtended(t *testing.T) {
 		dailyWindowStart: strPtr("09:00:00"),
 		dailyWindowEnd:   strPtr("11:30:00"),
 		startAt:          time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+		activeWeekdays:   AllWeekdays,
 	}
 	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
 	if err != nil {
@@ -400,6 +403,7 @@ func TestContinuousRevivesCanceledJobWithClips(t *testing.T) {
 		dailyWindowStart: strPtr("09:00:00"),
 		dailyWindowEnd:   strPtr("11:30:00"),
 		startAt:          time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+		activeWeekdays:   AllWeekdays,
 	}
 	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
 	if err != nil {
@@ -517,6 +521,7 @@ func runEnqueueContinuous(t *testing.T, pool *pgxpool.Pool, recID int64, now tim
 		dailyWindowStart: strPtr("09:00:00"),
 		dailyWindowEnd:   strPtr("11:30:00"),
 		startAt:          time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+		activeWeekdays:   AllWeekdays,
 	}
 	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
 	if err != nil {
