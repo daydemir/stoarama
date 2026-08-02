@@ -142,7 +142,8 @@ func TestDetectClipTimestampDriftFindsWorstClipNotNewest(t *testing.T) {
 		  (10, 100, 1, 'healthy',    'https://e.test/a', 'active', 'continuous'),
 		  (11, 101, 1, 'marginal',   'https://e.test/b', 'active', 'continuous'),
 		  (12, 102, 1, 'reanchored', 'https://e.test/c', 'active', 'continuous'),
-		  (13, 103, 1, 'stale',      'https://e.test/d', 'active', 'continuous');
+		  (13, 103, 1, 'stale',      'https://e.test/d', 'active', 'continuous'),
+		  (14, 104, 1, 'exactly90',  'https://e.test/e', 'active', 'continuous');
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +161,10 @@ func TestDetectClipTimestampDriftFindsWorstClipNotNewest(t *testing.T) {
 		  (12, now() - interval '1 minute'  - interval '60 seconds', now() - interval '1 minute'),
 		  -- stale: badly drifted but outside the one-hour window, so it is history,
 		  -- not a live incident
-		  (13, now() - interval '5 hours' + interval '4 hours', now() - interval '5 hours');
+		  (13, now() - interval '5 hours' + interval '4 hours', now() - interval '5 hours'),
+		  -- exactly at the limit: the comparison is strictly greater-than, so the
+		  -- threshold itself is still healthy and must not page anyone
+		  (14, now() - interval '5 minutes' + interval '90 seconds', now() - interval '5 minutes');
 	`); err != nil {
 		t.Fatal(err)
 	}
