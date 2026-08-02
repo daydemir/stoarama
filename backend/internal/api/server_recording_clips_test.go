@@ -324,6 +324,69 @@ func TestRecordingJobsLeaseRespectsDropletCapacityOne(t *testing.T) {
 	}
 }
 
+// TestRecordingJobsLeaseRefusesDrainingDroplet pins the invariant that makes a
+// forced roll actually roll: `stoaramactl recorder-control drain` only flips the
+// droplet to draining, and everything after that depends on the droplet then
+// taking no further work. If a draining droplet could still lease, the drain
+// would look like it succeeded while the old capture binary kept picking up new
+// windows until the drain timeout destroyed it mid-capture.
+func TestRecordingJobsLeaseRefusesDrainingDroplet(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recorder_droplets (name, node_id, capacity, state)
+		VALUES ('recorder-a', 1001, 5, 'active')
+	`); err != nil {
+		t.Fatalf("insert droplet: %v", err)
+	}
+
+	var recordingID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, status, start_at)
+		VALUES (42, 7, 'rec', 'https://example.test/live.m3u8', 'active', now() - interval '1 hour')
+		RETURNING id
+	`).Scan(&recordingID); err != nil {
+		t.Fatalf("insert recording: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_jobs
+			(recording_id, fire_at, scheduled_for, clip_duration_sec, status, idempotency_key)
+		VALUES ($1, now() - interval '1 second', now() - interval '1 second', 60, 'pending', 'drain-gate-0')
+	`, recordingID); err != nil {
+		t.Fatalf("insert job: %v", err)
+	}
+
+	principal := nodePrincipal{
+		NodeID:      1001,
+		AccountID:   42,
+		NodeType:    nodeTypeLocalRecorder,
+		DisplayName: "recorder-a",
+	}
+
+	// The job is leasable while the droplet is active, so a nil lease after draining
+	// is attributable to the state and not to some unrelated gate in the same query.
+	active := leaseRecordingJobForTest(t, pool, principal)
+	if active == nil {
+		t.Fatalf("active droplet leased nothing, want the pending job")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs SET status='pending', lease_owner=NULL, lease_expires_at=NULL WHERE id=$1
+	`, active.JobID); err != nil {
+		t.Fatalf("return job to pending: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE recorder_droplets SET state='draining' WHERE name='recorder-a'
+	`); err != nil {
+		t.Fatalf("mark draining: %v", err)
+	}
+	if got := leaseRecordingJobForTest(t, pool, principal); got != nil {
+		t.Fatalf("draining droplet leased job %d, want no lease", got.JobID)
+	}
+}
+
 func TestManagedCloudRecorderBindsAuthenticatedNodeID(t *testing.T) {
 	pool, cleanup := testRecordingLeasePool(t)
 	defer cleanup()

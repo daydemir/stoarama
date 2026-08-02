@@ -24,8 +24,17 @@ import (
 // under restart-with-backoff loops in the same process. There is no leader
 // election because this service runs exactly one replica.
 func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) < 1 || args[0] != "run" {
-		log.Fatalf("usage: stoaramactl recorder-control run")
+	if len(args) < 1 {
+		log.Fatalf("usage: stoaramactl recorder-control run|drain")
+	}
+	switch args[0] {
+	case "run":
+		// Falls through to the shared flag parsing and service startup below.
+	case "drain":
+		runRecorderControlDrain(ctx, cfg, args[1:])
+		return
+	default:
+		log.Fatalf("unknown recorder-control subcommand: %s (want run|drain)", args[0])
 	}
 	fs := flag.NewFlagSet("recorder-control run", flag.ExitOnError)
 	_ = fs.Parse(args[1:])
@@ -146,6 +155,123 @@ func mustBuildStorageCipher(cfg config.Config) *secretbox.Cipher {
 		log.Fatalf("init storage credential cipher: %v", err)
 	}
 	return cipher
+}
+
+// runRecorderControlDrain flips one active droplet to draining so the running
+// control service destroys it and the autoscaler replaces it from current main.
+//
+// This verb exists because a busy droplet may never recycle on its own. Scale-down
+// is not "idle past the grace, therefore drained": Decide additionally requires the
+// droplet to be SURPLUS to forecast demand, so standing demand that keeps
+// required == live pins the existing droplets indefinitely. That matters because
+// droplets clone DROPLET_POOL_REPO_REF and build at provision time and never update
+// in place, so a merged capture fix reaches cloud ONLY as droplets recycle. Without
+// a way to force a roll the operator is left waiting for something that will not
+// happen, and the alternative -- hand-editing recorder_droplets.state -- puts a
+// second writer on state the pool controller owns.
+//
+// So this deliberately destroys nothing itself. It only flips the one state
+// transition the controller already acts on: the cloud lease query refuses new jobs
+// to a draining droplet (it locks on state IN ('provisioning','active')),
+// progressDrains destroys the droplet once it holds no live lease or once
+// DROPLET_POOL_DRAIN_TIMEOUT_SEC elapses, and Decide provisions the replacement.
+// The control service stays the only writer that talks to DigitalOcean.
+func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recorder-control drain", flag.ExitOnError)
+	force := fs.Bool("force", false, "drain even while the droplet holds live leases, interrupting those capture windows")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		log.Fatalf("usage: stoaramactl recorder-control drain [-force] <droplet-id>")
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(fs.Arg(0)), 10, 64)
+	if err != nil {
+		log.Fatalf("droplet id must be an integer: %v", err)
+	}
+
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+
+	// Read the droplet, count its leases, and flip the state in ONE transaction,
+	// holding a row lock on the droplet throughout. Otherwise a worker can lease a
+	// job in the gap between "does it hold live leases?" and the state flip, and a
+	// drain the operator was told was free would interrupt that window once the
+	// drain timeout expired. The cloud lease path takes the same row lock and
+	// re-reads state IN ('provisioning','active') under it, so a lease racing this
+	// transaction blocks here and then correctly finds the droplet draining.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Fatalf("begin drain tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		name      string
+		state     string
+		createdAt time.Time
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT name, state, created_at FROM recorder_droplets WHERE id=$1 FOR UPDATE
+	`, id).Scan(&name, &state, &createdAt); err != nil {
+		log.Fatalf("load droplet %d: %v", id, err)
+	}
+	// Only an active droplet has a drain to begin. Re-draining one that is already
+	// draining would restamp drain_started_at and push its forced-destroy deadline
+	// out, which is the opposite of what an operator forcing a roll wants.
+	if state != "active" {
+		log.Fatalf("droplet %d (%s) is %s, not active; only an active droplet can be drained", id, name, state)
+	}
+
+	// Report the cost before paying it. A draining droplet that still holds live
+	// leases is destroyed anyway once the drain timeout elapses, dropping those
+	// windows, so that has to be an explicit choice rather than a surprise.
+	rows, err := tx.Query(ctx, `
+		SELECT recording_id FROM recording_jobs
+		WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now()
+		ORDER BY recording_id
+	`, name)
+	if err != nil {
+		log.Fatalf("list live leases for %s: %v", name, err)
+	}
+	var live []int64
+	for rows.Next() {
+		var recordingID int64
+		if err := rows.Scan(&recordingID); err != nil {
+			rows.Close()
+			log.Fatalf("scan live lease: %v", err)
+		}
+		live = append(live, recordingID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Fatalf("list live leases for %s: %v", name, err)
+	}
+
+	if len(live) > 0 && !*force {
+		log.Fatalf("droplet %d (%s) still holds %d live lease(s) for recordings %v; they are interrupted when the drain times out after %ds. Re-run with -force to accept that, or wait for those windows to close.",
+			id, name, len(live), live, cfg.DropletPoolDrainTimeoutSec)
+	}
+
+	// This mirrors dropletpool.Store.MarkDraining, which cannot be reused here
+	// because the store is constructed over a *pgxpool.Pool and so cannot join
+	// this transaction -- and the row lock is the whole point of the transaction.
+	if _, err := tx.Exec(ctx, `
+		UPDATE recorder_droplets SET state='draining', drain_started_at=now(), updated_at=now() WHERE id=$1
+	`, id); err != nil {
+		log.Fatalf("mark droplet %d draining: %v", id, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatalf("commit drain for droplet %d: %v", id, err)
+	}
+
+	log.Printf("droplet %d (%s, provisioned %s) marked draining; it takes no new jobs from now on.",
+		id, name, createdAt.UTC().Format(time.RFC3339))
+	if len(live) > 0 {
+		log.Printf("it still holds %d live lease(s) for recordings %v; the control service destroys it once they finish, or forcibly after %ds.",
+			len(live), live, cfg.DropletPoolDrainTimeoutSec)
+	} else {
+		log.Printf("it holds no live lease, so the control service destroys it on its next tick.")
+	}
+	log.Printf("the replacement provisions from DROPLET_POOL_REPO_REF at that point; confirm the new row's created_at is after the merge you are rolling out.")
 }
 
 // mustBuildDropletPool validates the pool config, resolves the operator account
