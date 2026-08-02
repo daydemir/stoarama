@@ -413,6 +413,27 @@ func (s *Scheduler) enqueueRecording(ctx context.Context, tx pgx.Tx, rec activeR
 	return enqueued, nil
 }
 
+// continuousErrorReviveBackoff spaces out how often a continuous window that
+// exhausted its delivery retries is put back to pending.
+//
+// A continuous window is a 12-hour promise of contiguous footage, but the job
+// carrying it used to be forfeited whole the moment three delivery attempts
+// failed in a row: 'error' was terminal, so nothing re-opened it until the next
+// day's window. On 2026-08-02 a ~20-minute stretch of slow uploads did exactly
+// that to three relay recordings at 02:10-02:15 UTC and cost the remaining ~29
+// stream-hours of their windows, even though the uploads were healthy again by
+// 02:20. Losing the rest of a window to a blip that has already passed is never
+// the right trade when the footage has to stitch end to end.
+//
+// Reviving on error needs a bound, though, which is what 'error' being terminal
+// was crudely providing: a source that is genuinely gone fails every attempt, so
+// an unbounded revive would spin lease -> fail x3 -> error -> revive as fast as
+// the tick allows. attempt_count cannot supply that bound because it counts
+// leases rather than failures. Spacing revival on completed_at instead bounds a
+// dead source to a dozen retries an hour while capping what a transient failure
+// can cost at roughly this interval rather than the whole remaining window.
+const continuousErrorReviveBackoff = 5 * time.Minute
+
 // enqueueContinuousRecording materializes ONE continuous_window job for the
 // currently-open daily-window occurrence (if any) of a continuous recording. The
 // job is idempotent on the window-open instant (idem key reccont:<id>:<open_unix>),
@@ -465,13 +486,17 @@ func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, r
 			WHERE j.recording_id=$1
 			  AND j.idempotency_key=$4
 			  AND j.kind='continuous_window'
-			  AND j.status IN ('done', 'canceled')
+			  AND j.status IN ('done', 'canceled', 'error')
 			  AND (
-			    j.status='canceled'
-			    OR j.window_end_at < $3
-			    OR NOT EXISTS (SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id)
+			    CASE j.status
+			      WHEN 'canceled' THEN true
+			      WHEN 'error' THEN j.completed_at IS NULL
+			                     OR j.completed_at < now() - make_interval(secs => $5)
+			      ELSE j.window_end_at < $3
+			           OR NOT EXISTS (SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id)
+			    END
 			  )
-		`, rec.id, rec.clipDurationSec, effectiveEnd, idemKey)
+		`, rec.id, rec.clipDurationSec, effectiveEnd, idemKey, continuousErrorReviveBackoff.Seconds())
 		if err != nil {
 			return 0, fmt.Errorf("revive zero-clip continuous window job: %w", err)
 		}
