@@ -423,6 +423,112 @@ func TestContinuousRevivesCanceledJobWithClips(t *testing.T) {
 	}
 }
 
+// TestContinuousRevivesErroredJobWithClipsAfterBackoff covers the case that cost
+// three recordings the rest of their windows: a job that captured for hours, hit a
+// transient stretch of failed deliveries, exhausted its attempts, and was left in
+// 'error' with most of its 12-hour window still ahead of it. Having produced clips
+// must not disqualify it the way it does for a 'done' job -- that check exists to
+// avoid re-opening a window that already finished its work, which is exactly what
+// an errored window did NOT do.
+func TestContinuousRevivesErroredJobWithClipsAfterBackoff(t *testing.T) {
+	pool, cleanup := testSchedulerPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	recID := insertSchedulerContinuousRecording(t, pool)
+	now := time.Date(2026, 7, 9, 10, 53, 0, 0, time.UTC)
+	windowOpen := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
+	jobID := insertSchedulerContinuousJob(t, pool, recID, windowOpen, "error")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips (recording_id, recording_job_id, clip_start_at, clip_end_at)
+		VALUES ($1, $2, $3, $4)
+	`, recID, jobID, windowOpen, windowOpen.Add(time.Minute)); err != nil {
+		t.Fatalf("insert clip: %v", err)
+	}
+	// The helper stamps completed_at=now(), which is inside the backoff; age it out
+	// so this test is about eligibility rather than about the spacing.
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs SET completed_at = now() - make_interval(secs => $2) WHERE id=$1
+	`, jobID, 2*continuousErrorReviveBackoff.Seconds()); err != nil {
+		t.Fatalf("age completed_at: %v", err)
+	}
+
+	if got := runEnqueueContinuous(t, pool, recID, now); got != 1 {
+		t.Fatalf("enqueued=%d want 1", got)
+	}
+
+	var status string
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status, attempt_count FROM recording_jobs WHERE id=$1`, jobID).Scan(&status, &attempts); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("status=%q want pending", status)
+	}
+	// The revive clears attempt_count, so the window gets a full retry budget again
+	// rather than dying on the first failure after coming back.
+	if attempts != 0 {
+		t.Fatalf("attempt_count=%d want 0", attempts)
+	}
+}
+
+// TestContinuousDoesNotReviveErroredJobInsideBackoff pins the bound that keeps a
+// genuinely dead source from hot-looping. Terminal 'error' used to supply that
+// bound for free; once errored windows revive, the spacing is the only thing
+// stopping lease -> fail -> error -> revive from spinning every tick.
+func TestContinuousDoesNotReviveErroredJobInsideBackoff(t *testing.T) {
+	pool, cleanup := testSchedulerPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	recID := insertSchedulerContinuousRecording(t, pool)
+	now := time.Date(2026, 7, 9, 10, 53, 0, 0, time.UTC)
+	windowOpen := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
+	// No clips: a dead source never produces any, so this also proves the
+	// zero-clip escape hatch for 'done' jobs does not leak into the error path
+	// and bypass the spacing.
+	jobID := insertSchedulerContinuousJob(t, pool, recID, windowOpen, "error")
+
+	if got := runEnqueueContinuous(t, pool, recID, now); got != 0 {
+		t.Fatalf("enqueued=%d want 0 while inside the revive backoff", got)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM recording_jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "error" {
+		t.Fatalf("status=%q want error", status)
+	}
+}
+
+func runEnqueueContinuous(t *testing.T, pool *pgxpool.Pool, recID int64, now time.Time) int {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	rec := activeRecording{
+		id:               recID,
+		mode:             "continuous",
+		cronTimezone:     "UTC",
+		clipDurationSec:  60,
+		dailyWindowStart: strPtr("09:00:00"),
+		dailyWindowEnd:   strPtr("11:30:00"),
+		startAt:          time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC),
+	}
+	got, err := New(pool, Config{}).enqueueContinuousRecording(ctx, tx, rec, now)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("enqueue continuous: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return got
+}
+
 func strPtr(s string) *string { return &s }
 
 func insertSchedulerContinuousRecording(t *testing.T, pool *pgxpool.Pool) int64 {
