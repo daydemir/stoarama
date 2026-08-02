@@ -23,7 +23,14 @@ const (
 	signalJobRetriesExhausted        = "job_retries_exhausted"
 	signalStuckLease                 = "stuck_lease"
 	signalSampledOverdue             = "sampled_overdue"
+	signalClipTimestampDrift         = "clip_timestamp_drift"
 )
+
+// clipTimestampDriftLimitSec is how far a clip's start may lead its own ingest
+// before the timestamp is treated as fiction rather than jitter. It matches
+// capture's continuousChainDriftLimit, so the alert and the recorder agree on
+// what "drifted" means.
+const clipTimestampDriftLimitSec = 90
 
 var healthSignalLabels = map[string]string{
 	signalContinuousSilentDeath:      "Continuous recording stopped producing clips mid-window",
@@ -31,6 +38,7 @@ var healthSignalLabels = map[string]string{
 	signalJobRetriesExhausted:        "Recording jobs failed after exhausting retries",
 	signalStuckLease:                 "Recording job lease stuck (scheduler reclaim may be stalled)",
 	signalSampledOverdue:             "Sampled recording is overdue to fire",
+	signalClipTimestampDrift:         "Clip timestamps are running ahead of real time (capture chain has lost its epoch)",
 }
 
 var healthSignalSeverity = map[string]string{
@@ -39,6 +47,7 @@ var healthSignalSeverity = map[string]string{
 	signalJobRetriesExhausted:        "HIGH",
 	signalStuckLease:                 "HIGH",
 	signalSampledOverdue:             "HIGH",
+	signalClipTimestampDrift:         "CRITICAL",
 }
 
 // healthIncident is one detected recording-health problem, enriched with the
@@ -280,7 +289,7 @@ func composeHealthEmailBody(baseURL string, incidents []healthIncident) string {
 	return b.String()
 }
 
-// detectRecordingHealthIncidents runs the five read-only signal queries and
+// detectRecordingHealthIncidents runs the read-only signal queries and
 // returns the union of detected incidents, ordered by severity then recording.
 func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) []healthIncident {
 	incidents := make([]healthIncident, 0, 16)
@@ -289,6 +298,7 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	incidents = append(incidents, detectJobRetriesExhausted(ctx, pool)...)
 	incidents = append(incidents, detectStuckLease(ctx, pool)...)
 	incidents = append(incidents, detectSampledOverdue(ctx, pool)...)
+	incidents = append(incidents, detectClipTimestampDrift(ctx, pool)...)
 
 	severityRank := map[string]int{"CRITICAL": 0, "HIGH": 1}
 	sort.SliceStable(incidents, func(i, j int) bool {
@@ -306,6 +316,84 @@ func humanSince(t *time.Time) string {
 		return "never"
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// detectClipTimestampDrift finds recordings whose newest clip is stamped for an
+// instant that had not happened yet when the clip was ingested.
+//
+// Continuous capture chains each segment's start from the previous segment's end
+// along the media timeline, which assumes a live source never hands ffmpeg more
+// media than wall-clock time. DVR-backed playlists break that assumption and the
+// chain compounds without bound. Nothing about this looks like a failure: clips
+// keep arriving, coverage reads at or above 100%, and every existing signal here
+// stays quiet, because the recording is producing footage -- just labelled for
+// the future.
+//
+// It is silent AND destructive. The Plaza naming profile derives each clip's
+// stored path from clip_start_at, so drifted clips are filed under the wrong day,
+// and no stitch can place them on a real timeline afterwards. On 2026-08-01 stream
+// 14782 (Zanzibar) drifted roughly five hours ahead and filed 84 clips under the
+// following day before anyone noticed, because nothing was watching for it.
+//
+// A healthy clip is always stamped BEFORE it is ingested (capture, then upload),
+// so leading at all is already wrong; the limit only tolerates end-of-window clips
+// truncated to a few seconds, which routinely lead by a handful.
+//
+// It reports the WORST clip of the last hour rather than the newest one. A drifted
+// chain re-anchors whenever its ffmpeg restarts, so the most recent clip is often
+// healthy again while the hour behind it is full of clips filed into the future --
+// checking only the newest clip would have called Zanzibar fine at exactly the
+// moment its footage was being misfiled.
+func detectClipTimestampDrift(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
+	rows, err := pool.Query(ctx, `
+		SELECT r.id, COALESCE(r.stream_id,0), r.account_id, r.name, r.stream_url,
+		       acc.name, acc.email,
+		       worst.clip_start_at, worst.created_at,
+		       EXTRACT(EPOCH FROM (worst.clip_start_at - worst.created_at))::bigint AS lead_sec
+		FROM recordings r
+		JOIN accounts acc ON acc.id = r.account_id
+		JOIN LATERAL (
+		  SELECT c.clip_start_at, c.created_at
+		  FROM recording_clips c
+		  WHERE c.recording_id = r.id
+		    AND c.created_at > now() - interval '1 hour'
+		  ORDER BY (c.clip_start_at - c.created_at) DESC
+		  LIMIT 1
+		) worst ON true
+		WHERE r.status='active' AND r.mode='continuous'
+		  AND worst.clip_start_at > worst.created_at + make_interval(secs => $1)
+		ORDER BY lead_sec DESC
+	`, clipTimestampDriftLimitSec)
+	if err != nil {
+		log.Fatalf("signal clip_timestamp_drift: %v", err)
+	}
+	defer rows.Close()
+	out := []healthIncident{}
+	for rows.Next() {
+		var (
+			id, streamID, accountID  int64
+			leadSec                  int64
+			name, streamURL, orgName string
+			orgEmail                 string
+			clipStartAt, createdAt   time.Time
+		)
+		if err := rows.Scan(&id, &streamID, &accountID, &name, &streamURL, &orgName, &orgEmail,
+			&clipStartAt, &createdAt, &leadSec); err != nil {
+			log.Fatalf("scan clip_timestamp_drift: %v", err)
+		}
+		out = append(out, healthIncident{
+			RecordingID: id, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
+			RecName: name, StreamURL: streamURL,
+			Signal: signalClipTimestampDrift, Severity: healthSignalSeverity[signalClipTimestampDrift],
+			SinceText: fmt.Sprintf("worst clip in the last hour is stamped %s but was ingested %s",
+				clipStartAt.UTC().Format(time.RFC3339), createdAt.UTC().Format(time.RFC3339)),
+			Diag: diagText("ahead_of_real_time", fmt.Sprintf("%ds", leadSec)),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("iterate clip_timestamp_drift: %v", err)
+	}
+	return out
 }
 
 func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) []healthIncident {

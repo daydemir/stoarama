@@ -69,6 +69,12 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run 'TestRecordingJobsLease(RespectsDropletCapacityOne|RefusesDrainingDroplet)' -count=1
+      # Backtested against the Zanzibar drift; DB-backed, so it needs naming here
+      # or it silently skips like the rest of this suite did.
+      - name: Test clip timestamp drift signal
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./cmd/stoaramactl -run TestDetectClipTimestampDrift -count=1
       - name: Test
         run: go test ./...
       - name: Vet
