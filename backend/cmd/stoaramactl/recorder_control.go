@@ -29,6 +29,7 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	}
 	switch args[0] {
 	case "run":
+		// Falls through to the shared flag parsing and service startup below.
 	case "drain":
 		runRecorderControlDrain(ctx, cfg, args[1:])
 		return
@@ -190,13 +191,26 @@ func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []stri
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
 
+	// Read the droplet, count its leases, and flip the state in ONE transaction,
+	// holding a row lock on the droplet throughout. Otherwise a worker can lease a
+	// job in the gap between "does it hold live leases?" and the state flip, and a
+	// drain the operator was told was free would interrupt that window once the
+	// drain timeout expired. The cloud lease path takes the same row lock and
+	// re-reads state IN ('provisioning','active') under it, so a lease racing this
+	// transaction blocks here and then correctly finds the droplet draining.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Fatalf("begin drain tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var (
 		name      string
 		state     string
 		createdAt time.Time
 	)
-	if err := pool.QueryRow(ctx, `
-		SELECT name, state, created_at FROM recorder_droplets WHERE id=$1
+	if err := tx.QueryRow(ctx, `
+		SELECT name, state, created_at FROM recorder_droplets WHERE id=$1 FOR UPDATE
 	`, id).Scan(&name, &state, &createdAt); err != nil {
 		log.Fatalf("load droplet %d: %v", id, err)
 	}
@@ -210,7 +224,7 @@ func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []stri
 	// Report the cost before paying it. A draining droplet that still holds live
 	// leases is destroyed anyway once the drain timeout elapses, dropping those
 	// windows, so that has to be an explicit choice rather than a surprise.
-	rows, err := pool.Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT recording_id FROM recording_jobs
 		WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now()
 		ORDER BY recording_id
@@ -237,8 +251,16 @@ func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []stri
 			id, name, len(live), live, cfg.DropletPoolDrainTimeoutSec)
 	}
 
-	if err := dropletpool.NewStore(pool).MarkDraining(ctx, id); err != nil {
+	// This mirrors dropletpool.Store.MarkDraining, which cannot be reused here
+	// because the store is constructed over a *pgxpool.Pool and so cannot join
+	// this transaction -- and the row lock is the whole point of the transaction.
+	if _, err := tx.Exec(ctx, `
+		UPDATE recorder_droplets SET state='draining', drain_started_at=now(), updated_at=now() WHERE id=$1
+	`, id); err != nil {
 		log.Fatalf("mark droplet %d draining: %v", id, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatalf("commit drain for droplet %d: %v", id, err)
 	}
 
 	log.Printf("droplet %d (%s, provisioned %s) marked draining; it takes no new jobs from now on.",
