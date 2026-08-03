@@ -57,6 +57,7 @@ type Controller struct {
 
 	fleetReadFailureSince time.Time
 	fleetReadLastFailure  time.Time
+	fleetReadSuccessSince time.Time
 	fleetReadFailures     int
 	fleetReadAlerted      bool
 }
@@ -226,6 +227,7 @@ func (c *Controller) noteFleetReadFailure(now time.Time) bool {
 		c.fleetReadFailureSince = now
 	}
 	c.fleetReadLastFailure = now
+	c.fleetReadSuccessSince = time.Time{}
 	c.fleetReadFailures++
 	if c.fleetReadAlerted || now.Sub(c.fleetReadFailureSince) < fleetReadSustainedFailureThreshold {
 		return false
@@ -244,9 +246,13 @@ func (c *Controller) noteFleetReadSuccess(now time.Time) (alert bool, duration t
 	}
 	duration = now.Sub(c.fleetReadFailureSince)
 	failures = c.fleetReadFailures
-	if now.Sub(c.fleetReadLastFailure) >= fleetReadRecoveryDwell {
+	if c.fleetReadSuccessSince.IsZero() {
+		c.fleetReadSuccessSince = now
+	}
+	if now.Sub(c.fleetReadSuccessSince) >= fleetReadRecoveryDwell {
 		c.fleetReadFailureSince = time.Time{}
 		c.fleetReadLastFailure = time.Time{}
+		c.fleetReadSuccessSince = time.Time{}
 		c.fleetReadFailures = 0
 		c.fleetReadAlerted = false
 		return false, duration, failures, true

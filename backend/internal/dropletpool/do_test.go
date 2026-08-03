@@ -148,15 +148,34 @@ func TestFleetReadIncidentLatchesOnceAndRecovers(t *testing.T) {
 	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(8 * time.Minute)); alert || recovered {
 		t.Fatal("incident duplicated alert or recovered before healthy dwell")
 	}
-	alert, duration, failures, recovered = controller.noteFleetReadSuccess(started.Add(9 * time.Minute))
-	if alert || !recovered || duration != 9*time.Minute || failures != 3 {
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(9 * time.Minute)); alert || recovered {
+		t.Fatal("incident recovered before five continuous healthy minutes")
+	}
+	alert, duration, failures, recovered = controller.noteFleetReadSuccess(started.Add(10 * time.Minute))
+	if alert || !recovered || duration != 10*time.Minute || failures != 3 {
 		t.Fatalf("recovery alert=%t duration=%s failures=%d recovered=%t", alert, duration, failures, recovered)
 	}
-	if _, _, _, recovered := controller.noteFleetReadSuccess(started.Add(10 * time.Minute)); recovered {
+	if _, _, _, recovered := controller.noteFleetReadSuccess(started.Add(11 * time.Minute)); recovered {
 		t.Fatal("fleet-read recovery emitted twice")
 	}
-	if controller.noteFleetReadFailure(started.Add(11 * time.Minute)) {
+	if controller.noteFleetReadFailure(started.Add(12 * time.Minute)) {
 		t.Fatal("fresh incident inherited prior alert state")
+	}
+}
+
+func TestFleetReadIncidentRequiresContinuousSuccessfulDwell(t *testing.T) {
+	controller := &Controller{}
+	started := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
+	controller.noteFleetReadFailure(started)
+
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(10 * time.Minute)); alert || recovered {
+		t.Fatal("a single delayed success recovered the incident")
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(14*time.Minute + 59*time.Second)); alert || recovered {
+		t.Fatal("incident recovered before five continuous healthy minutes")
+	}
+	if alert, _, failures, recovered := controller.noteFleetReadSuccess(started.Add(15 * time.Minute)); alert || !recovered || failures != 1 {
+		t.Fatalf("recovery alert=%t failures=%d recovered=%t", alert, failures, recovered)
 	}
 }
 
