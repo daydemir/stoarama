@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -272,11 +273,9 @@ func evaluatedHealthSignals(verifyMedia bool) []string {
 	return signals
 }
 
-// deliverRecordingHealthEmail sends one summary email per operator recipient. If
-// email is not configured (provider != resend) it loudly logs that N incidents
-// went un-emailed rather than silently succeeding. Returns the number of Send
-// calls made. Any zero-delivery condition is an error so the caller leaves
-// last_alerted_at untouched and the next cron retries.
+// deliverRecordingHealthEmail sends one summary email per operator recipient.
+// Misconfiguration or zero delivery returns an error; the caller exits nonzero
+// without advancing last_alerted_at, so the next cron retries.
 func deliverRecordingHealthEmail(ctx context.Context, pool *pgxpool.Pool, cfg config.Config, incidents []healthIncident) (int, error) {
 	if strings.ToLower(strings.TrimSpace(cfg.EmailProvider)) != "resend" {
 		return 0, fmt.Errorf("EMAIL_PROVIDER=%q is not resend; %d incident(s) not delivered", cfg.EmailProvider, len(incidents))
@@ -823,7 +822,11 @@ func boundedHealthDiagnostic(value string) string {
 	if len(value) <= mediaHealthDiagnosticLimit {
 		return value
 	}
-	return value[:mediaHealthDiagnosticLimit] + "…[truncated]"
+	cut := mediaHealthDiagnosticLimit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "…[truncated]"
 }
 
 // detectClipTimestampDrift finds recordings whose newest clip is stamped for an

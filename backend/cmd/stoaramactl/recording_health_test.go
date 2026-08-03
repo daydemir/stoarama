@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -146,7 +147,9 @@ func TestRecordingHealthRunLockSerializesSweeps(t *testing.T) {
 		t.Fatal("second concurrent health sweep acquired advisory lock")
 	}
 	release()
-	thirdRelease, err := acquireRecordingHealthRunLock(context.Background(), pool)
+	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer recoverCancel()
+	thirdRelease, err := acquireRecordingHealthRunLock(recoverCtx, pool)
 	if err != nil {
 		t.Fatalf("lock did not recover after release: %v", err)
 	}
@@ -307,6 +310,13 @@ func TestVerifyStoredClipSHA(t *testing.T) {
 	if err := verifyStoredClipSHA(sum[:], "not-a-sha"); err == nil {
 		t.Fatal("invalid sha metadata accepted")
 	}
+	matching := fmt.Sprintf("%x", sum[:])
+	if err := verifyStoredClipSHA(sum[:], "  "+strings.ToUpper(matching)+"  "); err != nil {
+		t.Fatalf("normalized sha rejected: %v", err)
+	}
+	if err := verifyStoredClipSHA(sum[:], strings.Repeat("ab", 16)); err == nil {
+		t.Fatal("short valid-hex sha accepted")
+	}
 }
 
 func TestBoundedHealthDiagnostic(t *testing.T) {
@@ -317,6 +327,10 @@ func TestBoundedHealthDiagnostic(t *testing.T) {
 	got := boundedHealthDiagnostic(strings.Repeat("x", mediaHealthDiagnosticLimit+100))
 	if len(got) <= mediaHealthDiagnosticLimit || !strings.HasSuffix(got, "…[truncated]") {
 		t.Fatalf("diagnostic not bounded/marked: len=%d suffix=%q", len(got), got[len(got)-20:])
+	}
+	unicodeValue := strings.Repeat("x", mediaHealthDiagnosticLimit-1) + "é trailing"
+	if got := boundedHealthDiagnostic(unicodeValue); !utf8.ValidString(got) {
+		t.Fatalf("diagnostic split UTF-8 rune: %q", got[len(got)-20:])
 	}
 }
 
