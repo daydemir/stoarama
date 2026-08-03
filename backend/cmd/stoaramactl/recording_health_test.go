@@ -115,6 +115,31 @@ func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
 	}
 }
 
+func TestMeasureStitchWindowEdgeCases(t *testing.T) {
+	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	close := open.Add(10 * time.Minute)
+	if m := measureStitchWindow(open, close, nil); m.coveragePct != 0 || m.gapClips != 0 {
+		t.Fatalf("empty window: %+v", m)
+	}
+	if m := measureStitchWindow(open, open, nil); m.coveragePct != 0 {
+		t.Fatalf("zero-length window: %+v", m)
+	}
+	contained := [][2]time.Time{
+		{open, open.Add(5 * time.Minute)},
+		{open.Add(time.Minute), open.Add(2 * time.Minute)},
+	}
+	if m := measureStitchWindow(open, close, contained); m.overlapClips != 1 || m.overlapSeconds != 60 || m.maxGap != 5*time.Minute {
+		t.Fatalf("contained clip: %+v", m)
+	}
+	adjacent := [][2]time.Time{
+		{open, open.Add(time.Minute)},
+		{open.Add(time.Minute + 500*time.Millisecond), close},
+	}
+	if m := measureStitchWindow(open, close, adjacent); m.gapClips != 0 || m.overlapClips != 0 || m.maxGap != 0 {
+		t.Fatalf("sub-tolerance join: %+v", m)
+	}
+}
+
 // TestDetectClipTimestampDriftFindsWorstClipNotNewest pins the two decisions that
 // make this signal useful rather than decorative: it fires only past the drift
 // limit, and it judges the WORST clip of the last hour rather than the newest one.

@@ -106,7 +106,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	fs := flag.NewFlagSet("recording-health run", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "detect + print incidents only; do not email or write dedup rows")
 	freshnessMin := fs.Int("freshness-min", 10, "continuous silent-death freshness window in minutes")
-	verifyMedia := fs.Bool("verify-media", false, "download and ffprobe the latest clip for every active recording")
+	verifyMedia := fs.Bool("verify-media", false, "download and ffprobe the newest adjacent clip pair for every active recording, then decode-verify their concatenation")
 	_ = fs.Parse(args)
 	if *freshnessMin <= 0 {
 		log.Fatalf("--freshness-min must be > 0")
@@ -472,6 +472,9 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 	m := stitchWindowMetrics{}
 	var covered time.Duration
 	var runStart, runEnd time.Time
+	if len(intervals) > 0 {
+		m.maxGap = intervals[0][0].Sub(open)
+	}
 	for _, iv := range intervals {
 		if runEnd.IsZero() {
 			runStart, runEnd = iv[0], iv[1]
@@ -507,6 +510,9 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 		covered += run
 		if run > m.longestRun {
 			m.longestRun = run
+		}
+		if trail := close.Sub(runEnd); trail > m.maxGap {
+			m.maxGap = trail
 		}
 	}
 	if expected := close.Sub(open); expected > 0 {

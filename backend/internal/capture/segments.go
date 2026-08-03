@@ -877,7 +877,7 @@ func ValidateConcatFiles(ctx context.Context, paths []string) error {
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, ffmpegBin(),
 		"-v", "error", "-xerror", "-f", "concat", "-safe", "0", "-i", manifestPath,
-		"-map", "0:v:0", "-f", "null", "-")
+		"-map", "0:v:0", "-map", "0:a?", "-f", "null", "-")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg concat decode: %w (%s)", err, strings.TrimSpace(string(out)))
 	}

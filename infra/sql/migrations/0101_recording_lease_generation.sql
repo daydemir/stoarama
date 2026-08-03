@@ -1,5 +1,3 @@
-BEGIN;
-
 -- A lease owner identifies a machine, not a particular worker process. During a
 -- restart, an expired lease can be reassigned to a new process on the same
 -- machine while the old process is still alive. A generation token makes every
@@ -36,5 +34,3 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_recording_clips_capture_sha256
 CREATE INDEX IF NOT EXISTS idx_recording_clips_capture_lease_token
   ON recording_clips (capture_lease_token)
   WHERE capture_lease_token IS NOT NULL;
-
-COMMIT;
