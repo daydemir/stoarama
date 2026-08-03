@@ -98,13 +98,13 @@ func TestSegmentDeliveryPoolCloseDrainsOutstandingUploads(t *testing.T) {
 	}
 }
 
-// TestSegmentDeliveryPoolQueueIsBounded proves Submit backpressures instead of
-// buffering without bound: with every worker parked, only the queue's depth of
-// extra segments can be accepted before Submit blocks.
-func TestSegmentDeliveryPoolQueueIsBounded(t *testing.T) {
+// TestSegmentDeliveryPoolSubmitDoesNotBlockDuringOutage proves a stalled object
+// store cannot pin the capture sweep past window cancellation. Only descriptors
+// are queued here; the independent disk monitor bounds their media files.
+func TestSegmentDeliveryPoolSubmitDoesNotBlockDuringOutage(t *testing.T) {
 	const workers = 2
+	const segments = 10_000
 	release := make(chan struct{})
-	defer close(release)
 	var accepted atomic.Int64
 
 	pool := startSegmentDeliveryPool(workers, func() {}, func(capture.Segment) error {
@@ -112,19 +112,19 @@ func TestSegmentDeliveryPoolQueueIsBounded(t *testing.T) {
 		return nil
 	})
 
-	go func() {
-		for range 4 * workers {
-			if err := pool.Submit(capture.Segment{Path: "seg.mp4"}); err != nil {
-				return
-			}
-			accepted.Add(1)
+	for range segments {
+		if err := pool.Submit(capture.Segment{Path: "seg.mp4"}); err != nil {
+			t.Fatalf("submit during outage: %v", err)
 		}
-	}()
-	// workers in flight + workers queued is the ceiling; the next Submit blocks.
-	waitFor(t, "queue full", func() bool { return accepted.Load() == 2*workers })
-	time.Sleep(50 * time.Millisecond)
-	if got := accepted.Load(); got != 2*workers {
-		t.Fatalf("accepted=%d want %d: submit did not backpressure", got, 2*workers)
+		accepted.Add(1)
+	}
+	if got := accepted.Load(); got != segments {
+		t.Fatalf("accepted=%d want %d: storage outage blocked capture", got, segments)
+	}
+	close(release)
+	result := pool.close()
+	if result.err != nil || result.pending != 0 || result.submitted != segments {
+		t.Fatalf("result=%+v want all queued descriptors drained", result)
 	}
 }
 
@@ -157,6 +157,46 @@ func TestSegmentDeliveryPoolSurfacesFailureAndAbortsAttempt(t *testing.T) {
 	}
 	if result.pending == 0 || result.ingested {
 		t.Fatalf("result=%+v want an unacknowledged segment and no ingest", result)
+	}
+}
+
+func TestSegmentDeliveryPoolTerminalFailureDrainsQueuedDescriptors(t *testing.T) {
+	const segments = 10_000
+	ctx, abort := context.WithCancel(context.Background())
+	defer abort()
+	started := make(chan struct{})
+	releaseFailure := make(chan struct{})
+	var deliveryCalls atomic.Int64
+
+	pool := startSegmentDeliveryPool(1, abort, func(capture.Segment) error {
+		if deliveryCalls.Add(1) == 1 {
+			close(started)
+			<-releaseFailure
+			return fmt.Errorf("%w: object store unavailable", errSegmentDeliveryExhausted)
+		}
+		return nil
+	})
+	if err := pool.Submit(capture.Segment{Path: "seg-0.mp4"}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	for i := 1; i < segments; i++ {
+		if err := pool.Submit(capture.Segment{Path: fmt.Sprintf("seg-%d.mp4", i)}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	close(releaseFailure)
+	waitFor(t, "terminal failure abort", func() bool { return ctx.Err() != nil })
+
+	result := pool.close()
+	if !errors.Is(result.err, errSegmentDeliveryExhausted) {
+		t.Fatalf("result error=%v want delivery exhaustion", result.err)
+	}
+	if got := deliveryCalls.Load(); got != 1 {
+		t.Fatalf("delivery calls=%d want 1: queued descriptors delivered after terminal failure", got)
+	}
+	if result.submitted != segments || result.pending != segments || result.ingested {
+		t.Fatalf("result=%+v want every unacknowledged descriptor preserved as pending", result)
 	}
 }
 

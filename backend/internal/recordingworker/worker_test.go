@@ -72,7 +72,7 @@ func TestSegmentDeliveryReusesReservedIntentAcrossUploadRetry(t *testing.T) {
 	err := deliverSegmentWithRetry(ctx, time.Millisecond, func() bool { return true }, segmentDeliveryOps{
 		Reserve: func() (recordingapi.ClipUploadIntent, error) {
 			reserveCalls++
-			return recordingapi.ClipUploadIntent{IntentID: "intent-1", UploadURL: "https://upload.test"}, nil
+			return recordingapi.ClipUploadIntent{IntentID: "intent-1", UploadURL: "https://upload.test", ExpiresAt: time.Now().Add(time.Hour)}, nil
 		},
 		Upload: func(intent recordingapi.ClipUploadIntent) error {
 			uploadCalls++
@@ -100,6 +100,36 @@ func TestSegmentDeliveryReusesReservedIntentAcrossUploadRetry(t *testing.T) {
 	}
 	if len(uploadIntentIDs) != 2 || uploadIntentIDs[0] != uploadIntentIDs[1] {
 		t.Fatalf("upload intent ids=%v want one stable intent", uploadIntentIDs)
+	}
+}
+
+func TestSegmentDeliveryRefreshesExpiringUploadIntent(t *testing.T) {
+	var reserveCalls, uploadCalls, ingestCalls, retryCalls int
+	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{
+		Reserve: func() (recordingapi.ClipUploadIntent, error) {
+			reserveCalls++
+			if reserveCalls == 1 {
+				return recordingapi.ClipUploadIntent{IntentID: "intent-1", UploadURL: "https://expired.test", ExpiresAt: time.Now().Add(30 * time.Second)}, nil
+			}
+			return recordingapi.ClipUploadIntent{IntentID: "intent-1", UploadURL: "https://fresh.test", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		},
+		Upload: func(intent recordingapi.ClipUploadIntent) error {
+			uploadCalls++
+			if intent.UploadURL != "https://fresh.test" {
+				t.Fatalf("uploaded with stale URL %q", intent.UploadURL)
+			}
+			return nil
+		},
+		Ingest: func(recordingapi.ClipUploadIntent) error {
+			ingestCalls++
+			return nil
+		},
+	}, func(error) { retryCalls++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserveCalls != 2 || uploadCalls != 1 || ingestCalls != 1 || retryCalls != 1 {
+		t.Fatalf("reserve=%d upload=%d ingest=%d retries=%d", reserveCalls, uploadCalls, ingestCalls, retryCalls)
 	}
 }
 
@@ -283,6 +313,33 @@ func TestHeartbeatStopsAtConfirmedLeaseBoundary(t *testing.T) {
 		canceled := worker.startHeartbeat(ctx, cancel, 3, "", time.Now().Add(time.Second))
 		waitCanceled(t, canceled)
 	})
+}
+
+func TestHeartbeatContinuesAfterCaptureWindowCloses(t *testing.T) {
+	var heartbeats atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		heartbeats.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"cancel":false,"lease_expires_at":%q}`, time.Now().Add(time.Second).Format(time.RFC3339Nano))
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := &Worker{cfg: Config{Client: client}, heartbeatInt: 5 * time.Millisecond, leaseSafetyMargin: time.Millisecond}
+	jobCtx, cancelJob := context.WithCancel(context.Background())
+	defer cancelJob()
+	canceled := worker.startHeartbeat(jobCtx, cancelJob, 4, "", time.Now().Add(time.Second))
+	windowCtx, closeWindow := context.WithCancel(jobCtx)
+	closeWindow()
+	if windowCtx.Err() == nil {
+		t.Fatal("capture window did not close")
+	}
+	waitFor(t, "post-window lease renewals", func() bool { return heartbeats.Load() >= 3 })
+	if canceled() || jobCtx.Err() != nil {
+		t.Fatal("window close canceled job heartbeat during delivery drain")
+	}
 }
 
 func heartbeatTestWorker(t *testing.T, status int, leaseExpiresAt time.Time) (*Worker, func()) {
@@ -508,14 +565,14 @@ func TestRetrySegmentDeliveryStopsAtWindowDeadline(t *testing.T) {
 	}
 }
 
-func TestFinalizedSegmentStartingBeforeWindowEndGetsDeliveryBudget(t *testing.T) {
+func TestFinalizedSegmentStartingBeforeWindowEndGetsPostWindowGrace(t *testing.T) {
 	now := time.Now()
 	windowEnd := now.Add(time.Millisecond)
 	segmentCtx, cancel := continuousSegmentDeliveryContext(context.Background(), &windowEnd, now)
 	defer cancel()
 	deadline, ok := segmentCtx.Deadline()
-	if !ok || deadline.Sub(now) < segmentDeliveryRetryBudget-time.Second {
-		t.Fatalf("delivery deadline=%s want approximately %s", deadline.Sub(now), segmentDeliveryRetryBudget)
+	if !ok || deadline.Sub(now) < postWindowDeliveryGrace-time.Second || deadline.Sub(now) > postWindowDeliveryGrace+time.Second {
+		t.Fatalf("delivery deadline=%s want approximately %s", deadline.Sub(now), postWindowDeliveryGrace)
 	}
 	attempts := 0
 	err := retrySegmentDelivery(
@@ -537,6 +594,9 @@ func TestFinalizedSegmentStartingBeforeWindowEndGetsDeliveryBudget(t *testing.T)
 }
 
 func TestSegmentDeliveryBudgetIsBoundedEarlyAndAfterWindow(t *testing.T) {
+	if segmentDeliveryRetryBudget < 30*time.Minute || segmentDeliveryRetryBudget > time.Hour {
+		t.Fatalf("delivery budget=%s must cover the observed 30m outage without becoming unbounded", segmentDeliveryRetryBudget)
+	}
 	now := time.Now()
 	longWindowEnd := now.Add(12 * time.Hour)
 	earlyCtx, earlyCancel := continuousSegmentDeliveryContext(context.Background(), &longWindowEnd, now)
@@ -552,6 +612,25 @@ func TestSegmentDeliveryBudgetIsBoundedEarlyAndAfterWindow(t *testing.T) {
 	finalDeadline, _ := finalCtx.Deadline()
 	if got := finalDeadline.Sub(now); got != postWindowDeliveryGrace-time.Minute {
 		t.Fatalf("post-window delivery budget=%s want %s", got, postWindowDeliveryGrace-time.Minute)
+	}
+}
+
+func TestContinuousDiskMonitorAbortsAtFence(t *testing.T) {
+	worker := &Worker{cfg: Config{
+		MinActiveFreeBytes: 100,
+		DiskFreeBytes:      func() (uint64, error) { return 99, nil },
+	}}
+	stop := make(chan struct{})
+	var pressured atomic.Bool
+	aborted := make(chan struct{})
+	go worker.monitorContinuousDiskAtInterval(stop, &pressured, func() { close(aborted) }, time.Millisecond)
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("disk monitor did not abort capture")
+	}
+	if !pressured.Load() {
+		t.Fatal("disk monitor aborted without recording pressure")
 	}
 }
 
