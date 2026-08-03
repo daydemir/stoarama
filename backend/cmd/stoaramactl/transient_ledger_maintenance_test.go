@@ -92,6 +92,34 @@ func TestMaintainTransientLedgersDeletesOnlyExpiredBookkeeping(t *testing.T) {
 	if got.UploadIntentsDeleted != 2 || got.IdempotencyKeysDeleted != 1 {
 		t.Fatalf("maintenance=%+v, want upload=2 idempotency=1", got)
 	}
+	for id, want := range map[string]bool{
+		"old-consumed":        false,
+		"old-pending-expired": false,
+		"old-pending-live":    true,
+		"recent-consumed":     true,
+	} {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM upload_intents WHERE id=$1)`, id).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != want {
+			t.Fatalf("upload_intents id=%q exists=%t want %t", id, exists, want)
+		}
+	}
+	for key, want := range map[string]bool{"old": false, "recent": true} {
+		var exists bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM api_idempotency
+				WHERE endpoint='endpoint' AND idempotency_key=$1
+			)
+		`, key).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != want {
+			t.Fatalf("api_idempotency endpoint=%q key=%q exists=%t want %t", "endpoint", key, exists, want)
+		}
+	}
 	for table, want := range map[string]int{
 		"upload_intents": 2, "api_idempotency": 1, "capture_segments": 1,
 		"recording_clips": 1, "media_objects": 1, "recording_upload_intents": 1,
