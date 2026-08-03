@@ -150,7 +150,7 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 	_ = cw.Write([]string{
 		"id", "filename", "fire_at", "start", "end", "duration_ms",
 		"actual_fps", "size_bytes", "object_key", "status",
-		"capture_lease_token", "capture_sequence",
+		"capture_generation", "capture_sequence",
 	})
 	for rows.Next() {
 		var (
@@ -175,9 +175,9 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 		if purgedAt != nil {
 			status = "purged"
 		}
-		leaseToken := ""
-		if captureLeaseToken != nil {
-			leaseToken = captureLeaseToken.String()
+		generation := ""
+		if fingerprint := captureGenerationFingerprint(captureLeaseToken); fingerprint != nil {
+			generation = *fingerprint
 		}
 		sequence := ""
 		if captureSequence != nil {
@@ -198,7 +198,7 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 			strconv.FormatInt(sizeBytes, 10),
 			strings.TrimSpace(objectKey),
 			status,
-			leaseToken,
+			generation,
 			sequence,
 		})
 		// Flush periodically so rows reach the client incrementally and peak

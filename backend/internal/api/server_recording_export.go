@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -462,8 +461,7 @@ func (s *Server) handleAccountRecordingClipsZip(w http.ResponseWriter, r *http.R
 		z.row.ClipEndAt = &end
 		z.row.MIMEType = "video/mp4"
 		if captureLease != nil {
-			sum := sha256.Sum256([]byte(captureLease.String()))
-			z.row.CaptureGeneration = fmt.Sprintf("sha256:%x", sum[:])
+			z.row.CaptureGeneration = *captureGenerationFingerprint(captureLease)
 		}
 		totalBytes += z.row.SizeBytes
 		clips = append(clips, z)
