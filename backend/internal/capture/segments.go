@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"image"
 	_ "image/jpeg"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -528,6 +529,7 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 		"-loglevel", "error",
 	}
 	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, true, 10, pinHost, inputHeaders)
+	args = appendHLSLiveEdgeInputArgs(args, sourceURL)
 	args = append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", sourceURL,
@@ -560,6 +562,23 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 		outPattern,
 	)
 	return args
+}
+
+// appendHLSLiveEdgeInputArgs keeps a restarted continuous recorder at the live
+// edge instead of FFmpeg's default three-segment DVR offset. That default lets
+// an HLS source's already-published tail drain faster than wall time after each
+// restart. The recorder then chains those media durations onto wall-clock file
+// labels and eventually has to jump backward, creating overlapping clip times.
+//
+// This is an HLS demuxer input option, so it must appear before -i and must not
+// be sent to ordinary HTTP video inputs. A resolved manifest's URL path is the
+// reliable discriminator; query strings do not affect the .m3u8 suffix.
+func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
+	u, err := url.Parse(strings.TrimSpace(sourceURL))
+	if err != nil || !strings.EqualFold(filepath.Ext(u.Path), ".m3u8") {
+		return args
+	}
+	return append(args, "-live_start_index", "-1")
 }
 
 // ProbeReachable verifies that sourceURL opens and yields at least one packet
