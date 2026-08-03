@@ -56,15 +56,25 @@ func TestMaintainTransientLedgersDeletesOnlyExpiredBookkeeping(t *testing.T) {
 		  PRIMARY KEY(endpoint,idempotency_key)
 		);
 		CREATE TABLE capture_segments (id BIGINT PRIMARY KEY);
-		INSERT INTO capture_segments VALUES (1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO capture_segments VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO upload_intents VALUES
 		  ('old-consumed','consumed',$1,$1),
 		  ('old-pending-expired','pending',$1,$1),
 		  ('old-pending-live','pending',$2,$1),
-		  ('recent-consumed','consumed',$2,$3);
-		INSERT INTO api_idempotency VALUES
-		  ('endpoint','old',$1), ('endpoint','recent',$3);
+		  ('recent-consumed','consumed',$2,$3)
 	`, old, now.Add(time.Hour), recent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO api_idempotency VALUES
+		  ('endpoint','old',$1), ('endpoint','recent',$2)
+	`, old, recent); err != nil {
 		t.Fatal(err)
 	}
 
