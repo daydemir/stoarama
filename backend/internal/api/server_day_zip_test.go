@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -93,8 +94,10 @@ func TestBuildDayZipManifestNonEmptyWithEntries(t *testing.T) {
 func TestBuildDayZipClipManifestSchema(t *testing.T) {
 	start := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	end := start.Add(15 * time.Second)
+	jobID, sequence := int64(99), int64(7)
 	rows := []dayZipSegmentRow{
-		{ID: 42, SegmentStartAt: start, ClipEndAt: &end, DurationMs: 15000, ObjectKey: "clips/42.mp4", MIMEType: "video/mp4", SizeBytes: 5},
+		{ID: 42, SegmentStartAt: start, ClipEndAt: &end, DurationMs: 15000, ObjectKey: "clips/42.mp4", MIMEType: "video/mp4", SizeBytes: 5,
+			RecordingJobID: &jobID, CaptureSequence: &sequence, CaptureGeneration: "sha256:generation", SHA256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"},
 	}
 
 	var buf bytes.Buffer
@@ -111,7 +114,7 @@ func TestBuildDayZipClipManifestSchema(t *testing.T) {
 		t.Fatal("manifest.csv not present in archive")
 	}
 	text := string(manifest)
-	if !strings.Contains(text, "id,filename,start,end,duration_ms,size_bytes,object_key,status") {
+	if !strings.Contains(text, "id,filename,start,end,duration_ms,size_bytes,object_key,status,recording_job_id,capture_generation,capture_sequence,sha256") {
 		t.Fatalf("clip manifest missing header row: %q", text)
 	}
 	if !strings.Contains(text, "clips/42.mp4") {
@@ -120,9 +123,75 @@ func TestBuildDayZipClipManifestSchema(t *testing.T) {
 	if !strings.Contains(text, end.Format(time.RFC3339Nano)) {
 		t.Fatalf("clip manifest missing end time: %q", text)
 	}
+	if !strings.Contains(text, ",ok,99,sha256:generation,7,2cf24dba") {
+		t.Fatalf("clip manifest missing stitch provenance: %q", text)
+	}
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("clip manifest line count = %d, want 2; content=%q", len(lines), text)
+	}
+	concatManifest, ok := readZipEntry(t, buf.Bytes(), "concat.txt")
+	if !ok || !strings.Contains(string(concatManifest), "file 'seoul-crosswalk-20260610T120000Z-42.mp4'") {
+		t.Fatalf("concat.txt missing ordered clip: %q", string(concatManifest))
+	}
+	instructions, ok := readZipEntry(t, buf.Bytes(), "STITCHING.txt")
+	if !ok || !strings.Contains(string(instructions), "-c copy") {
+		t.Fatalf("STITCHING.txt missing quality-preserving command: %q", string(instructions))
+	}
+}
+
+func TestBuildDayZipConcatExcludesIntegrityMismatch(t *testing.T) {
+	start := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	end := start.Add(time.Minute)
+	rows := []dayZipSegmentRow{
+		{ID: 1, SegmentStartAt: start, ClipEndAt: &end, DurationMs: 60000, ObjectKey: "clips/1.mp4", MIMEType: "video/mp4", SizeBytes: 6},
+		{ID: 2, SegmentStartAt: start.Add(time.Minute), ClipEndAt: &end, DurationMs: 60000, ObjectKey: "clips/2.mp4", MIMEType: "video/mp4", SizeBytes: 5, SHA256: strings.Repeat("0", 64)},
+	}
+	var buf bytes.Buffer
+	if _, err := buildDayZip(context.Background(), &buf, rows, "teststream", 7, fakeOpener([]byte("hello")), nil); err != nil {
+		t.Fatalf("buildDayZip: %v", err)
+	}
+	concatManifest, _ := readZipEntry(t, buf.Bytes(), "concat.txt")
+	if got := string(concatManifest); got != "" {
+		t.Fatalf("concat.txt includes integrity failures: %q", got)
+	}
+	manifest, _ := readZipEntry(t, buf.Bytes(), "manifest.csv")
+	text := string(manifest)
+	if !strings.Contains(text, "size mismatch: copied 5, expected 6") || !strings.Contains(text, "sha256 mismatch") {
+		t.Fatalf("manifest missing integrity failures: %q", text)
+	}
+}
+
+func TestBuildDayZipConcatPreservesRowOrderAndSkipsFailedObjects(t *testing.T) {
+	start := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	end1, end2, end3 := start.Add(time.Minute), start.Add(2*time.Minute), start.Add(3*time.Minute)
+	rows := []dayZipSegmentRow{
+		{ID: 1, SegmentStartAt: start, ClipEndAt: &end1, DurationMs: 60000, ObjectKey: "clips/1.mp4", MIMEType: "video/mp4", SizeBytes: 5},
+		{ID: 2, SegmentStartAt: start.Add(time.Minute), ClipEndAt: &end2, DurationMs: 60000, ObjectKey: "clips/missing.mp4", MIMEType: "video/mp4", SizeBytes: 5},
+		{ID: 3, SegmentStartAt: start.Add(2 * time.Minute), ClipEndAt: &end3, DurationMs: 60000, ObjectKey: "clips/3.mp4", MIMEType: "video/mp4", SizeBytes: 5},
+	}
+	opener := func(_ context.Context, key string) (io.ReadCloser, error) {
+		if key == "clips/missing.mp4" {
+			return nil, errors.New("not found")
+		}
+		return io.NopCloser(strings.NewReader("hello")), nil
+	}
+
+	var buf bytes.Buffer
+	if _, err := buildDayZip(context.Background(), &buf, rows, "teststream", 7, opener, nil); err != nil {
+		t.Fatalf("buildDayZip: %v", err)
+	}
+	concatManifest, ok := readZipEntry(t, buf.Bytes(), "concat.txt")
+	if !ok {
+		t.Fatal("concat.txt not present in archive")
+	}
+	want := "file 'teststream-20260610T120000Z-1.mp4'\nfile 'teststream-20260610T120200Z-3.mp4'\n"
+	if got := string(concatManifest); got != want {
+		t.Fatalf("concat.txt = %q, want %q", got, want)
+	}
+	manifest, _ := readZipEntry(t, buf.Bytes(), "manifest.csv")
+	if !strings.Contains(string(manifest), "open error: not found") {
+		t.Fatalf("manifest missing failed-object status: %q", string(manifest))
 	}
 }
 

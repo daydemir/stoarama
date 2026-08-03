@@ -4172,8 +4172,8 @@
 
     // POST the current page's clips to the zip endpoint, then poll the shared
     // day-zip job until complete and navigate to the presigned zip URL. The in-zip
-    // manifest.csv (id,filename,start,end,duration_ms,size_bytes,object_key,status)
-    // is produced server-side.
+    // manifest.csv with capture provenance, ordered concat.txt, and STITCHING.txt
+    // are produced server-side.
     async function downloadClipPageZip(btn) {
       const recId = clipPageState.recId;
       const statusEl = els.clipPage.querySelector('[data-zipstatus]');
