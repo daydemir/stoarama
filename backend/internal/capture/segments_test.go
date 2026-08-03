@@ -580,6 +580,29 @@ func TestBuildFFmpegContinuousArgsDoesNotSendHLSOptionToHTTPVideo(t *testing.T) 
 	}
 }
 
+func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		sourceURL string
+		wantHLS   bool
+	}{
+		{name: "signed HLS URL", sourceURL: "https://example.com/live.m3u8?token=test", wantHLS: true},
+		{name: "malformed URL", sourceURL: "https://example.com/live%ZZ.m3u8", wantHLS: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := []string{"-nostdin"}
+			args := appendHLSLiveEdgeInputArgs(slices.Clone(base), tt.sourceURL)
+			if got := slices.Contains(args, "-live_start_index"); got != tt.wantHLS {
+				t.Fatalf("HLS option presence=%t want=%t: %v", got, tt.wantHLS, args)
+			}
+			if !tt.wantHLS && !slices.Equal(args, base) {
+				t.Fatalf("non-HLS args changed: got=%v want=%v", args, base)
+			}
+		})
+	}
+}
+
 // TestBuildFFmpegContinuousArgsFixedFPS asserts the fixed-fps continuous path
 // re-encodes to the chosen rate AND keeps the same segment-muxer tail, still
 // without -t.
