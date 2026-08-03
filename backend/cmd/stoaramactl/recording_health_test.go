@@ -92,6 +92,10 @@ func TestDiagTextDropsBlanks(t *testing.T) {
 func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
 	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
 	close := open.Add(10 * time.Minute)
+	leading := [][2]time.Time{{open.Add(2 * time.Minute), close}}
+	if m := measureStitchWindow(open, close, leading); m.maxGap != 2*time.Minute {
+		t.Fatalf("leading gap: %+v", m)
+	}
 	clips := [][2]time.Time{
 		{open.Add(-time.Minute), open.Add(2 * time.Minute)},     // clipped at window edge
 		{open.Add(90 * time.Second), open.Add(3 * time.Minute)}, // 30s overlap

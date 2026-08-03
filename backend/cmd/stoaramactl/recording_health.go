@@ -106,7 +106,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	fs := flag.NewFlagSet("recording-health run", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "detect + print incidents only; do not email or write dedup rows")
 	freshnessMin := fs.Int("freshness-min", 10, "continuous silent-death freshness window in minutes")
-	verifyMedia := fs.Bool("verify-media", false, "download and ffprobe the newest adjacent clip pair for every active recording, then decode-verify their concatenation")
+	verifyMedia := fs.Bool("verify-media", false, "download and ffprobe the newest adjacent clip pair for each paid active recording with recent retained clips, then decode-verify their concatenation")
 	_ = fs.Parse(args)
 	if *freshnessMin <= 0 {
 		log.Fatalf("--freshness-min must be > 0")
@@ -440,13 +440,13 @@ func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) 
 		if m.maxGap > 5*time.Minute {
 			inc := win.incidentBase
 			inc.Signal, inc.Severity, inc.SinceText = signalContinuousLongGap, healthSignalSeverity[signalContinuousLongGap], since
-			inc.Diag = diagText("largest_internal_gap", m.maxGap.Round(time.Second).String(), "longest_run", m.longestRun.Round(time.Second).String())
+			inc.Diag = diagText("largest_gap", m.maxGap.Round(time.Second).String(), "longest_run", m.longestRun.Round(time.Second).String())
 			out = append(out, inc)
 		}
 		if m.gapClips > 10 {
 			inc := win.incidentBase
 			inc.Signal, inc.Severity, inc.SinceText = signalContinuousFragmented, healthSignalSeverity[signalContinuousFragmented], since
-			inc.Diag = diagText("reconnect_gaps", fmt.Sprint(m.gapClips), "largest_internal_gap", m.maxGap.Round(time.Second).String())
+			inc.Diag = diagText("reconnect_gaps", fmt.Sprint(m.gapClips), "largest_gap", m.maxGap.Round(time.Second).String())
 			out = append(out, inc)
 		}
 	}
