@@ -4,7 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,13 +31,23 @@ type dayZipSegmentRow struct {
 	SegmentStartAt time.Time
 	DurationMs     int64
 	ObjectKey      string
-	MIMEType       string
-	SizeBytes      int64
+	// OpenKey is an internal lookup key used to bind an object to its exact
+	// storage destination. It is never exposed in the archive manifest.
+	OpenKey   string
+	MIMEType  string
+	SizeBytes int64
 	// ClipEndAt, when non-nil, marks this row as a recording clip rather than a
 	// stream segment. It switches buildDayZip's manifest to the clip schema
 	// (id,start,end,duration,size,object_key) so the in-zip CSV carries the
 	// fields the clips UI needs. nil keeps the legacy day-zip manifest.
 	ClipEndAt *time.Time
+	// Recording-only stitch provenance. CaptureSequence records authoritative
+	// capture order within one lease generation; exports retain every available
+	// clip and order the selected UI page by its stored clip timestamp.
+	RecordingJobID    *int64
+	CaptureSequence   *int64
+	CaptureGeneration string
+	SHA256            string
 }
 
 func dayZipKey(streamID int64, day string) string {
@@ -122,10 +134,11 @@ func buildDayZip(ctx context.Context, w io.Writer, rows []dayZipSegmentRow, stre
 	clipManifest := len(rows) > 0 && rows[0].ClipEndAt != nil
 
 	var manifestBuf bytes.Buffer
+	var concatBuf bytes.Buffer
 	csvWriter := csv.NewWriter(&manifestBuf)
 	header := []string{"filename", "segment_start_at", "duration_ms", "bytes", "status"}
 	if clipManifest {
-		header = []string{"id", "filename", "start", "end", "duration_ms", "size_bytes", "object_key", "status"}
+		header = []string{"id", "filename", "start", "end", "duration_ms", "size_bytes", "object_key", "status", "recording_job_id", "capture_generation", "capture_sequence", "sha256"}
 	}
 	if err := csvWriter.Write(header); err != nil {
 		_ = zipWriter.Close()
@@ -136,27 +149,32 @@ func buildDayZip(ctx context.Context, w io.Writer, rows []dayZipSegmentRow, stre
 	processed := 0
 	for _, row := range rows {
 		objectKey := strings.TrimSpace(row.ObjectKey)
+		openKey := strings.TrimSpace(row.OpenKey)
+		if openKey == "" {
+			openKey = objectKey
+		}
 		name := dayZipItemName(streamSlug, streamID, row.SegmentStartAt, row.ID, row.MIMEType)
 		status := "ok"
 		if objectKey == "" {
 			status = "missing object_key"
 		} else {
-			entry, err := zipWriter.CreateHeader(&zip.FileHeader{
-				Name:     name,
-				Modified: row.SegmentStartAt.UTC(),
-				Method:   zip.Store,
-			})
-			if err != nil {
-				// A zip-structure failure is fatal: the archive is unusable.
-				_ = zipWriter.Close()
-				return 0, fmt.Errorf("create archive entry %s: %w", name, err)
-			}
-			body, err := open(ctx, objectKey)
+			body, err := open(ctx, openKey)
 			if err != nil {
 				// Per-object failure: skip and record, do not fail the whole job.
 				status = fmt.Sprintf("open error: %v", err)
 			} else {
-				cw := &countingWriter{w: entry}
+				entry, err := zipWriter.CreateHeader(&zip.FileHeader{
+					Name:     name,
+					Modified: row.SegmentStartAt.UTC(),
+					Method:   zip.Store,
+				})
+				if err != nil {
+					_ = body.Close()
+					_ = zipWriter.Close()
+					return 0, fmt.Errorf("create archive entry %s: %w", name, err)
+				}
+				hasher := sha256.New()
+				cw := &countingWriter{w: io.MultiWriter(entry, hasher)}
 				_, copyErr := io.Copy(cw, body)
 				_ = body.Close()
 				totalWritten += cw.n
@@ -166,6 +184,10 @@ func buildDayZip(ctx context.Context, w io.Writer, rows []dayZipSegmentRow, stre
 				}
 				if copyErr != nil {
 					status = fmt.Sprintf("copy error: %v", copyErr)
+				} else if cw.n != row.SizeBytes {
+					status = fmt.Sprintf("size mismatch: copied %d, expected %d", cw.n, row.SizeBytes)
+				} else if expected := strings.ToLower(strings.TrimSpace(row.SHA256)); expected != "" && hex.EncodeToString(hasher.Sum(nil)) != expected {
+					status = "sha256 mismatch"
 				}
 			}
 		}
@@ -184,6 +206,13 @@ func buildDayZip(ctx context.Context, w io.Writer, rows []dayZipSegmentRow, stre
 				strconv.FormatInt(row.SizeBytes, 10),
 				strings.TrimSpace(row.ObjectKey),
 				status,
+				optionalInt64String(row.RecordingJobID),
+				strings.TrimSpace(row.CaptureGeneration),
+				optionalInt64String(row.CaptureSequence),
+				strings.TrimSpace(row.SHA256),
+			}
+			if status == "ok" {
+				fmt.Fprintf(&concatBuf, "file '%s'\n", strings.ReplaceAll(name, "'", "'\\''"))
 			}
 		} else {
 			record = []string{
@@ -221,11 +250,38 @@ func buildDayZip(ctx context.Context, w io.Writer, rows []dayZipSegmentRow, stre
 		_ = zipWriter.Close()
 		return 0, fmt.Errorf("write manifest: %w", err)
 	}
+	if clipManifest {
+		concatWriter, err := zipWriter.Create("concat.txt")
+		if err != nil {
+			_ = zipWriter.Close()
+			return 0, fmt.Errorf("create concat manifest: %w", err)
+		}
+		if _, err := io.Copy(concatWriter, &concatBuf); err != nil {
+			_ = zipWriter.Close()
+			return 0, fmt.Errorf("write concat manifest: %w", err)
+		}
+		instructions, err := zipWriter.Create("STITCHING.txt")
+		if err != nil {
+			_ = zipWriter.Close()
+			return 0, fmt.Errorf("create stitching instructions: %w", err)
+		}
+		if _, err := io.WriteString(instructions, "concat.txt contains only clips whose downloaded size and available SHA-256 matched stored metadata. It preserves lossless capture inclusion order; overlapping retry generations are retained rather than silently discarding footage.\n\nQuality-preserving MP4 stitch (no transcoding):\nffmpeg -f concat -safe 0 -i concat.txt -map 0:v:0 -map '0:a?' -c copy -avoid_negative_ts make_zero -movflags +faststart stitched.mp4\n\nStream copy requires compatible MP4 stream layouts and cannot repair damaged source frames. The source clips remain unchanged; if verification fails, retain the originals and use a repair encode only for the derived stitched video.\n"); err != nil {
+			_ = zipWriter.Close()
+			return 0, fmt.Errorf("write stitching instructions: %w", err)
+		}
+	}
 
 	if err := zipWriter.Close(); err != nil {
 		return 0, fmt.Errorf("close archive: %w", err)
 	}
 	return processed, nil
+}
+
+func optionalInt64String(v *int64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatInt(*v, 10)
 }
 
 // dayZipJobMaxEntries caps how many job records are retained in memory as a hard

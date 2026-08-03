@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -408,18 +409,31 @@ func (s *Server) handleAccountRecordingClipsZip(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Load the page of still-org-visible clips with their destination snapshot,
-	// newest fire first (same order as the clips list). Released clips (detached to
+	// Select the same newest-first page as the clips list, then emit its available
+	// clips in deterministic stored-timestamp order for concat.txt. Released clips (detached to
 	// NAS) are excluded alongside purged, so a released clip is never re-zipped
 	// (consistent with the individual-download 410 and the view-clips filter).
 	rows, err := s.pool.Query(r.Context(), `
+		WITH selected AS (
+		  SELECT c.*
+		  FROM recording_clips c
+		  WHERE c.recording_id=$1
+		  ORDER BY c.clip_start_at DESC, c.id DESC
+		  LIMIT $2 OFFSET $3
+		), page AS (
+		  SELECT selected.*,
+		         min(clip_start_at) OVER (PARTITION BY recording_job_id,capture_lease_token) AS generation_start_at
+		  FROM selected
+		  WHERE purged_at IS NULL AND released_at IS NULL
+		)
 		SELECT c.id, c.clip_start_at, c.clip_end_at, c.duration_ms, c.size_bytes, c.object_key,
+		       c.recording_job_id,c.capture_lease_token,c.capture_sequence,c.sha256,
 		       sd.region, sd.bucket, sd.endpoint, sd.access_key_id, sd.secret_access_key_enc
-		FROM recording_clips c
+		FROM page c
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
-		WHERE c.recording_id=$1 AND c.purged_at IS NULL AND c.released_at IS NULL
-		ORDER BY c.fire_at DESC
-		LIMIT $2 OFFSET $3
+		ORDER BY c.generation_start_at ASC, c.recording_job_id ASC NULLS LAST,
+		         c.capture_lease_token ASC NULLS LAST, c.capture_sequence ASC NULLS LAST,
+		         c.clip_start_at ASC, c.id ASC
 	`, recordingID, limit, offset)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list clips: %v", err))
@@ -435,7 +449,9 @@ func (s *Server) handleAccountRecordingClipsZip(w http.ResponseWriter, r *http.R
 			startAt time.Time
 			endAt   time.Time
 		)
+		var captureLease *uuid.UUID
 		if err := rows.Scan(&clipID, &startAt, &endAt, &z.row.DurationMs, &z.row.SizeBytes, &z.row.ObjectKey,
+			&z.row.RecordingJobID, &captureLease, &z.row.CaptureSequence, &z.row.SHA256,
 			&z.dest.region, &z.dest.bucket, &z.dest.endpoint, &z.dest.accessKeyID, &z.dest.secretEnc); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
 			return
@@ -445,6 +461,10 @@ func (s *Server) handleAccountRecordingClipsZip(w http.ResponseWriter, r *http.R
 		z.row.SegmentStartAt = startAt.UTC()
 		z.row.ClipEndAt = &end
 		z.row.MIMEType = "video/mp4"
+		if captureLease != nil {
+			sum := sha256.Sum256([]byte(captureLease.String()))
+			z.row.CaptureGeneration = fmt.Sprintf("sha256:%x", sum[:])
+		}
 		totalBytes += z.row.SizeBytes
 		clips = append(clips, z)
 	}
@@ -529,9 +549,13 @@ func (s *Server) runClipsZipJob(jobID, slug string, recordingID int64, clips []c
 	}
 	clients := make(map[string]*destClient)
 	rows := make([]dayZipSegmentRow, 0, len(clips))
-	keyClient := make(map[string]*r2.Client, len(clips))
+	type objectSource struct {
+		client    *r2.Client
+		objectKey string
+	}
+	keySource := make(map[string]objectSource, len(clips))
 	for _, c := range clips {
-		gk := c.dest.endpoint + "\x00" + c.dest.bucket + "\x00" + c.dest.accessKeyID
+		gk := c.dest.endpoint + "\x00" + c.dest.region + "\x00" + c.dest.bucket + "\x00" + c.dest.accessKeyID
 		dc, present := clients[gk]
 		if !present {
 			client, err := s.buildClipClientCtx(ctx, c.dest)
@@ -542,16 +566,20 @@ func (s *Server) runClipsZipJob(jobID, slug string, recordingID int64, clips []c
 			dc = &destClient{client: client, dest: c.dest}
 			clients[gk] = dc
 		}
-		keyClient[c.row.ObjectKey] = dc.client
+		openKey := gk + "\x00" + c.row.ObjectKey
+		keySource[openKey] = objectSource{client: dc.client, objectKey: c.row.ObjectKey}
+		c.row.OpenKey = openKey
 		rows = append(rows, c.row)
 	}
 
 	open := func(ctx context.Context, key string) (io.ReadCloser, error) {
-		client, ok := keyClient[key]
+		source, ok := keySource[key]
 		if !ok {
-			return nil, fmt.Errorf("no client for object %s", key)
+			// Do not expose the internal destination-qualified lookup key through
+			// manifest.csv; it contains storage endpoint and credential metadata.
+			return nil, errors.New("no source client for clip")
 		}
-		return client.Open(ctx, key)
+		return source.client.Open(ctx, source.objectKey)
 	}
 
 	// Stream zip directly from source reads -> pipe -> operator export bucket, so
