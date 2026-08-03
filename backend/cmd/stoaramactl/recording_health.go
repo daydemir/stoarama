@@ -177,12 +177,24 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		}
 	}
 
+	maintenance := transientLedgerMaintenanceResult{}
+	if !*verifyMedia {
+		maintenance, err = maintainTransientLedgers(ctx, pool, time.Now())
+		if err != nil {
+			// Alert detection and delivery have already completed. Fail the cron now so
+			// Render exposes the maintenance error without suppressing health email.
+			log.Fatalf("maintain transient database ledgers: %v", err)
+		}
+	}
+
 	printJSON(map[string]any{
-		"dry_run":   false,
-		"detected":  len(incidents),
-		"by_signal": bySignal,
-		"notified":  len(toNotify),
-		"emailed":   emailed,
+		"dry_run":                  false,
+		"detected":                 len(incidents),
+		"by_signal":                bySignal,
+		"notified":                 len(toNotify),
+		"emailed":                  emailed,
+		"upload_intents_deleted":   maintenance.UploadIntentsDeleted,
+		"idempotency_keys_deleted": maintenance.IdempotencyKeysDeleted,
 	})
 }
 
