@@ -171,11 +171,30 @@ func TestFleetReadIncidentRequiresContinuousSuccessfulDwell(t *testing.T) {
 	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(10 * time.Minute)); alert || recovered {
 		t.Fatal("a single delayed success recovered the incident")
 	}
-	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(14*time.Minute + 59*time.Second)); alert || recovered {
-		t.Fatal("incident recovered before five continuous healthy minutes")
+	if !controller.noteFleetReadFailure(started.Add(12 * time.Minute)) {
+		t.Fatal("sustained interrupted incident did not alert")
 	}
-	if alert, _, failures, recovered := controller.noteFleetReadSuccess(started.Add(15 * time.Minute)); alert || !recovered || failures != 1 {
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(17 * time.Minute)); alert || recovered {
+		t.Fatal("first success after interruption recovered immediately or duplicated alert")
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(21*time.Minute + 59*time.Second)); alert || recovered {
+		t.Fatal("incident recovered before restarted healthy dwell completed")
+	}
+	if alert, _, failures, recovered := controller.noteFleetReadSuccess(started.Add(22 * time.Minute)); alert || !recovered || failures != 2 {
 		t.Fatalf("recovery alert=%t failures=%d recovered=%t", alert, failures, recovered)
+	}
+}
+
+func TestFleetReadIncidentAlertsBeforeSameTickRecovery(t *testing.T) {
+	controller := &Controller{}
+	started := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
+	controller.noteFleetReadFailure(started)
+	controller.noteFleetReadFailure(started.Add(time.Minute))
+	controller.noteFleetReadSuccess(started.Add(2 * time.Minute))
+
+	alert, duration, failures, recovered := controller.noteFleetReadSuccess(started.Add(7 * time.Minute))
+	if !alert || !recovered || duration != 7*time.Minute || failures != 2 {
+		t.Fatalf("alert=%t duration=%s failures=%d recovered=%t", alert, duration, failures, recovered)
 	}
 }
 
@@ -192,6 +211,19 @@ func (f *failingFleetDO) ListDropletsByName(context.Context, string, string) ([]
 		return nil, f.listErr
 	}
 	return nil, errors.New("provider fleet unavailable")
+}
+
+func TestReconcileClassifiesOnlyProviderFleetReadFailure(t *testing.T) {
+	providerErr := errors.New("provider fleet unavailable")
+	controller := &Controller{do: &failingFleetDO{listErr: providerErr}}
+	err := controller.reconcile(context.Background(), time.Now())
+	if !errors.Is(err, errFleetRead) || !errors.Is(err, providerErr) {
+		t.Fatalf("reconcile error=%v want fleet-read marker and provider cause", err)
+	}
+	storeErr := errors.New("store unavailable")
+	if errors.Is(storeErr, errFleetRead) {
+		t.Fatal("unmarked store error classified as fleet-read failure")
+	}
 }
 
 func TestControllerTickPropagatesCancellationWithoutDegradationLatch(t *testing.T) {

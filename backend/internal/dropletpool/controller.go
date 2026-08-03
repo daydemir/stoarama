@@ -65,6 +65,8 @@ type Controller struct {
 const fleetReadSustainedFailureThreshold = 5 * time.Minute
 const fleetReadRecoveryDwell = 5 * time.Minute
 
+var errFleetRead = errors.New("fleet read failed")
+
 // NewController builds the autoscaler. doClient is the real godo client in
 // production (or a fake in tests).
 func NewController(pool *pgxpool.Pool, doClient DOClient, cfg Config) *Controller {
@@ -123,6 +125,9 @@ func (c *Controller) tick(ctx context.Context) error {
 	// next ordinary tick retries from the read boundary.
 	if err := c.reconcile(ctx, now); err != nil {
 		if errors.Is(err, context.Canceled) {
+			return err
+		}
+		if !errors.Is(err, errFleetRead) {
 			return err
 		}
 		if c.noteFleetReadFailure(now) {
@@ -249,17 +254,17 @@ func (c *Controller) noteFleetReadSuccess(now time.Time) (alert bool, duration t
 	if c.fleetReadSuccessSince.IsZero() {
 		c.fleetReadSuccessSince = now
 	}
+	if !c.fleetReadAlerted && duration >= fleetReadSustainedFailureThreshold && failures >= 2 {
+		c.fleetReadAlerted = true
+		alert = true
+	}
 	if now.Sub(c.fleetReadSuccessSince) >= fleetReadRecoveryDwell {
 		c.fleetReadFailureSince = time.Time{}
 		c.fleetReadLastFailure = time.Time{}
 		c.fleetReadSuccessSince = time.Time{}
 		c.fleetReadFailures = 0
 		c.fleetReadAlerted = false
-		return false, duration, failures, true
-	}
-	if !c.fleetReadAlerted && duration >= fleetReadSustainedFailureThreshold && failures >= 2 {
-		c.fleetReadAlerted = true
-		alert = true
+		return alert, duration, failures, true
 	}
 	return alert, duration, failures, false
 }
@@ -274,7 +279,7 @@ func (c *Controller) poolPool() *pgxpool.Pool {
 func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 	fleet, err := c.do.ListDropletsByName(ctx, c.cfg.ProjectID, NamePrefix)
 	if err != nil {
-		return fmt.Errorf("list DO fleet: %w", err)
+		return fmt.Errorf("%w: list DO fleet: %w", errFleetRead, err)
 	}
 	liveRows, err := c.store.ListByStates(ctx, "provisioning", "active", "draining", "destroying")
 	if err != nil {
