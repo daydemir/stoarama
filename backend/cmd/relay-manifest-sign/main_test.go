@@ -97,6 +97,9 @@ func TestRelayPublisherUsesConditionalImmutableWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(string(release), `. "${ROOT_DIR}/scripts/relay-release-immutable.sh"`) {
+		t.Fatal("release publisher does not source immutable-write helper")
+	}
 	body := string(script) + string(release)
 	for _, required := range []string{
 		`aws s3api put-object`,
