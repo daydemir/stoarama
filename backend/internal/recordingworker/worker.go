@@ -717,7 +717,13 @@ func clampContinuousSegmentTimeline(seg capture.Segment, timelineEnd time.Time) 
 		return seg
 	}
 	seg.StartAt = timelineEnd
-	seg.EndAt = seg.StartAt.Add(time.Duration(seg.DurationMs) * time.Millisecond)
+	if seg.DurationMs > 0 {
+		seg.EndAt = seg.StartAt.Add(time.Duration(seg.DurationMs) * time.Millisecond)
+	} else {
+		// Match CaptureContinuous's unknown-duration fallback so two clamped
+		// segments cannot reuse the same millisecond idempotency key.
+		seg.EndAt = seg.StartAt.Add(time.Millisecond)
+	}
 	return seg
 }
 

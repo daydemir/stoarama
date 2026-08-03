@@ -229,6 +229,15 @@ func TestClampContinuousSegmentTimelineAcrossReconnects(t *testing.T) {
 	if !got.StartAt.Equal(afterGap.StartAt) || !got.EndAt.Equal(afterGap.EndAt) {
 		t.Fatalf("real reconnect gap changed: got=%+v want=%+v", got, afterGap)
 	}
+
+	unknownDuration := capture.Segment{
+		StartAt: priorEnd.Add(-time.Minute),
+		EndAt:   priorEnd.Add(-time.Minute),
+	}
+	got = clampContinuousSegmentTimeline(unknownDuration, priorEnd)
+	if !got.StartAt.Equal(priorEnd) || !got.EndAt.Equal(priorEnd.Add(time.Millisecond)) {
+		t.Fatalf("unknown-duration segment=%+v want distinct 1ms timeline key", got)
+	}
 }
 
 func TestUploadWorkersDefaultsToBoundedConcurrency(t *testing.T) {
