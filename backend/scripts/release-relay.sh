@@ -66,6 +66,7 @@ fi
 R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 command -v aws >/dev/null || { echo "error: aws CLI is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
+. "${ROOT_DIR}/scripts/relay-release-immutable.sh"
 
 head_error="${BUILD_DIR}/head-object.error"
 if aws s3api head-object \
@@ -108,9 +109,8 @@ if ! aws s3 cp "s3://${R2_BUCKET}/relay-releases/latest.json.sig" "${previous_la
     --private-key-file "${RELAY_SIGNING_PRIVATE_KEY_FILE}" \
     --input "${previous_latest}" \
     --output "${previous_latest_signature}"
-  aws s3 cp "${previous_latest_signature}" \
-    "s3://${R2_BUCKET}/relay-releases/latest-${bootstrap_version}.json.sig" \
-    --endpoint-url "${R2_ENDPOINT}" --content-type application/octet-stream --only-show-errors
+  r2_put "${previous_latest_signature}" \
+    "latest-${bootstrap_version}.json.sig" "application/octet-stream"
   aws s3 cp "${previous_latest_signature}" \
     "s3://${R2_BUCKET}/relay-releases/latest.json.sig" \
     --endpoint-url "${R2_ENDPOINT}" --content-type application/octet-stream --only-show-errors
@@ -133,14 +133,6 @@ sha256_of() {
   else
     shasum -a 256 "$1" | awk '{print $1}'
   fi
-}
-
-r2_put() {
-  # r2_put <local-file> <key-name> <content-type>
-  aws s3 cp "$1" "s3://${R2_BUCKET}/relay-releases/$2" \
-    --endpoint-url "${R2_ENDPOINT}" \
-    --content-type "$3" \
-    --only-show-errors
 }
 
 # yt-dlp pinned asset names by target (stable yt-dlp release asset names).
