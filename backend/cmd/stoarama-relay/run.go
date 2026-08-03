@@ -160,7 +160,7 @@ func runRelay(ctx context.Context) error {
 
 	go pr.runLoop(ctx)
 	if selfUpdatesEnabled {
-		go selfUpdateLoop(ctx, cfg)
+		go selfUpdateLoop(ctx, cfg, &activeJobs)
 	}
 
 	err = worker.Run(ctx)

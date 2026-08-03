@@ -180,7 +180,7 @@ func runSelfUpdate(args []string) error {
 // after start (not immediately) so a fresh install does not restart itself on boot.
 // When the relay binary itself changes it kickstarts the service so the new binary is
 // exec'd; a yt-dlp-only refresh is picked up by the next capture without a restart.
-func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
+func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int64) {
 	ticker := time.NewTicker(selfUpdateInterval)
 	defer ticker.Stop()
 	manifest := cfg.updateManifest()
@@ -189,6 +189,10 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if deferUpdate, count := relaySelfUpdateDeferred(activeJobs); deferUpdate {
+				log.Printf("relay self-update: deferred while %d recording job(s) are active", count)
+				continue
+			}
 			if manifest != liveReleaseManifest {
 				live, err := fetchLatest(cfg.APIURL, liveReleaseManifest)
 				if err != nil {
@@ -202,7 +206,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 					}
 				}
 			}
-			checkAndApplyUpdate(cfg.APIURL, manifest)
+			checkAndApplyUpdate(cfg.APIURL, manifest, activeJobs)
 		}
 	}
 }
@@ -211,7 +215,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 // relay binary and refresh yt-dlp (both sha256-verified), and restart only if the relay
 // binary actually changed. Errors are logged and swallowed so a bad manifest or a
 // transient network failure never takes the relay down.
-func checkAndApplyUpdate(base string, manifest releaseManifest) {
+func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atomic.Int64) {
 	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
 	lj, err := fetchLatest(base, manifest)
 	if err != nil {
@@ -244,11 +248,27 @@ func checkAndApplyUpdate(base string, manifest releaseManifest) {
 	}
 
 	if relayUpdated {
+		// A recording can be leased while the update downloads. Recheck after the
+		// atomic binary replacement and leave the old process running until every
+		// active capture finishes. The next idle tick sees version != manifest and
+		// restarts into the already-verified binary without losing an open segment.
+		if deferUpdate, count := relaySelfUpdateDeferred(activeJobs); deferUpdate {
+			log.Printf("relay self-update: restart deferred while %d recording job(s) are active", count)
+			return
+		}
 		log.Printf("relay self-update: restarting service to load new binary")
 		if err := restartAfterSelfUpdate(); err != nil {
 			log.Printf("relay self-update: restart failed: %v", err)
 		}
 	}
+}
+
+func relaySelfUpdateDeferred(activeJobs *atomic.Int64) (bool, int64) {
+	if activeJobs == nil {
+		return false, 0
+	}
+	count := activeJobs.Load()
+	return count > 0, count
 }
 
 func fetchLatest(base string, manifest releaseManifest) (latestJSON, error) {

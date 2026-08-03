@@ -15,8 +15,23 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+func TestRelaySelfUpdateDefersForActiveCapture(t *testing.T) {
+	if deferUpdate, count := relaySelfUpdateDeferred(nil); deferUpdate || count != 0 {
+		t.Fatalf("nil active counter deferred=%t count=%d", deferUpdate, count)
+	}
+	var active atomic.Int64
+	if deferUpdate, count := relaySelfUpdateDeferred(&active); deferUpdate || count != 0 {
+		t.Fatalf("idle relay deferred=%t count=%d", deferUpdate, count)
+	}
+	active.Store(3)
+	if deferUpdate, count := relaySelfUpdateDeferred(&active); !deferUpdate || count != 3 {
+		t.Fatalf("active relay deferred=%t count=%d, want true/3", deferUpdate, count)
+	}
+}
 
 func TestUpdateExecutableIfChangedSkipsMatchingFile(t *testing.T) {
 	data := []byte("already installed")
