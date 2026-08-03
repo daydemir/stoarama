@@ -89,6 +89,32 @@ func TestDiagTextDropsBlanks(t *testing.T) {
 	}
 }
 
+func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
+	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	close := open.Add(10 * time.Minute)
+	clips := [][2]time.Time{
+		{open.Add(-time.Minute), open.Add(2 * time.Minute)},     // clipped at window edge
+		{open.Add(90 * time.Second), open.Add(3 * time.Minute)}, // 30s overlap
+		{open.Add(9 * time.Minute), close.Add(time.Minute)},     // clipped at close; 6m gap
+	}
+	m := measureStitchWindow(open, close, clips)
+	if m.coveragePct != 40 {
+		t.Fatalf("coverage=%.2f want 40", m.coveragePct)
+	}
+	if m.overlapClips != 1 || m.overlapSeconds != 30 {
+		t.Fatalf("overlap clips=%d seconds=%.1f want 1/30", m.overlapClips, m.overlapSeconds)
+	}
+	if m.maxGap != 6*time.Minute {
+		t.Fatalf("max gap=%s want 6m", m.maxGap)
+	}
+	if m.gapClips != 1 {
+		t.Fatalf("gap clips=%d want 1", m.gapClips)
+	}
+	if m.longestRun != 3*time.Minute {
+		t.Fatalf("longest run=%s want 3m", m.longestRun)
+	}
+}
+
 // TestDetectClipTimestampDriftFindsWorstClipNotNewest pins the two decisions that
 // make this signal useful rather than decorative: it fires only past the drift
 // limit, and it judges the WORST clip of the last hour rather than the newest one.

@@ -67,7 +67,7 @@ func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 	}
 
 	var handoffUntil time.Time
-	if err := pool.QueryRow(ctx, recordingJobSurrenderSQL, 1, "node:1", string(recordingJobSurrenderNoProgress)).Scan(&handoffUntil); err != nil {
+	if err := pool.QueryRow(ctx, recordingJobSurrenderSQL, 1, "node:1", string(recordingJobSurrenderNoProgress), nil).Scan(&handoffUntil); err != nil {
 		t.Fatal(err)
 	}
 	if !handoffUntil.After(time.Now()) {
@@ -75,10 +75,10 @@ func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 	}
 
 	s := &Server{pool: pool}
-	if _, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("surrendering owner lease err=%v, want pgx.ErrNoRows", err)
 	}
-	job, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 2, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec)
+	job, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 2, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,6 +92,42 @@ func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 	}
 	if handoffOwner != nil || persistedUntil != nil {
 		t.Fatalf("handoff was not cleared on lease: owner=%v until=%v", handoffOwner, persistedUntil)
+	}
+}
+
+func TestLeaseGenerationRejectsPreviousProcessOnSameNode(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES (1, 42, 'relay', 'active', now(), 1);
+		INSERT INTO recordings
+			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
+		VALUES (1, 42, 7, 'continuous', 'https://example.test/live.m3u8', 'active', now()-interval '1 hour', 'relay');
+		INSERT INTO recording_jobs
+			(id, recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+			 attempt_count, idempotency_key, kind, window_end_at)
+		VALUES (1, 1, now(), now(), 60, 'pending', 0, 'generation', 'continuous_window', now()+interval '1 hour')
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	principal := nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}
+	s := &Server{pool: pool}
+	job, err := s.leaseRelayRecordingJob(ctx, principal, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.LeaseToken == nil {
+		t.Fatal("generation-aware lease returned no token")
+	}
+	if _, err := s.heartbeatRecordingJob(ctx, principal, job.JobID, "node:1", nil); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("tokenless previous process renewed replacement lease: err=%v", err)
+	}
+	if _, err := s.heartbeatRecordingJob(ctx, principal, job.JobID, "node:1", job.LeaseToken); err != nil {
+		t.Fatalf("current lease generation could not renew: %v", err)
 	}
 }
 
@@ -113,7 +149,7 @@ func TestGenericFailRetainsMaxAttemptSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	var recordingID int64
-	if err := pool.QueryRow(ctx, recordingJobFailSQL, 1, "node:1", "capture failed").Scan(&recordingID); err != nil {
+	if err := pool.QueryRow(ctx, recordingJobFailSQL, 1, "node:1", "capture failed", nil).Scan(&recordingID); err != nil {
 		t.Fatal(err)
 	}
 	var status string
@@ -542,6 +578,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			status TEXT NOT NULL DEFAULT 'pending',
 			lease_owner TEXT,
 			lease_expires_at TIMESTAMPTZ,
+			lease_token UUID,
 			attempt_count INTEGER NOT NULL DEFAULT 0,
 			max_attempts INTEGER NOT NULL DEFAULT 3,
 			idempotency_key TEXT NOT NULL UNIQUE,

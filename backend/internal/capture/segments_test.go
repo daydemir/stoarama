@@ -653,3 +653,31 @@ func TestParseSegmentStart(t *testing.T) {
 		t.Fatalf("expected parse error for malformed segment name")
 	}
 }
+
+func TestValidateConcatFiles(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("ARGS_FILE", argsFile)
+	t.Setenv("FFMPEG_BIN", writeFakeFFmpeg(t, `printf '%s\n' "$@" > "$ARGS_FILE"`))
+
+	first := filepath.Join(t.TempDir(), "first clip.mp4")
+	second := filepath.Join(t.TempDir(), "second clip.mp4")
+	if err := ValidateConcatFiles(context.Background(), []string{first, second}); err != nil {
+		t.Fatalf("ValidateConcatFiles: %v", err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read fake ffmpeg args: %v", err)
+	}
+	joined := string(args)
+	for _, want := range []string{"-xerror\n", "-f\nconcat\n", "-safe\n0\n", "-map\n0:v:0\n", "-f\nnull\n"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected %q in ffmpeg args:\n%s", want, joined)
+		}
+	}
+}
+
+func TestValidateConcatFilesRejectsTooFewClips(t *testing.T) {
+	if err := ValidateConcatFiles(context.Background(), []string{"one.mp4"}); err == nil {
+		t.Fatal("expected fewer than two clips to be rejected")
+	}
+}

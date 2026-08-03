@@ -241,13 +241,13 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	w.cfg.RelayDiagnostics.Start(job)
 	if err := w.ensureCaptureTempDir(); err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
-		w.fail(ctx, job.JobID, err)
+		w.fail(ctx, job.JobID, job.LeaseToken, err)
 		return
 	}
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseExpiresAt)
+	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
 
 	// Resolve the stored reference (e.g. a KBS '!hls' indirect URL) to a live
 	// playable URL fresh on every capture, so an expiring token (the KBS Wowza
@@ -260,13 +260,13 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	resolveCancel()
 	if err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("resolve source url: %w", err))
-		w.fail(ctx, job.JobID, fmt.Errorf("resolve source url: %w", err))
+		w.fail(ctx, job.JobID, job.LeaseToken, fmt.Errorf("resolve source url: %w", err))
 		return
 	}
 	if isImage {
 		err := fmt.Errorf("image sources are not supported by the recorder")
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
-		w.fail(ctx, job.JobID, err)
+		w.fail(ctx, job.JobID, job.LeaseToken, err)
 		return
 	}
 
@@ -280,7 +280,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "ssrf_check")
 	if _, err := netguard.ValidatePublicURL(sourceURL); err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("ssrf guard rejected source url: %w", err))
-		w.fail(ctx, job.JobID, fmt.Errorf("ssrf guard rejected source url: %w", err))
+		w.fail(ctx, job.JobID, job.LeaseToken, fmt.Errorf("ssrf guard rejected source url: %w", err))
 		return
 	}
 
@@ -296,7 +296,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 			return
 		}
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("capture clip: %w", err))
-		w.fail(ctx, job.JobID, fmt.Errorf("capture clip: %w", err))
+		w.fail(ctx, job.JobID, job.LeaseToken, fmt.Errorf("capture clip: %w", err))
 		return
 	}
 	defer capture.CleanupSegment(seg)
@@ -308,10 +308,10 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	}
 
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "reserve_upload")
-	intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, seg.MIMEType, 0)
+	intent, err := w.cfg.Client.ReserveClipUpload(jobCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, 0)
 	if err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("reserve clip upload: %w", err))
-		w.fail(ctx, job.JobID, fmt.Errorf("reserve clip upload: %w", err))
+		w.fail(ctx, job.JobID, job.LeaseToken, fmt.Errorf("reserve clip upload: %w", err))
 		return
 	}
 	if err := deliverReservedClip(intent,
@@ -322,30 +322,32 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 		func() error {
 			w.cfg.RelayDiagnostics.Stage(job.JobID, "ingesting")
 			_, err := w.cfg.Client.IngestClip(jobCtx, recordingapi.IngestClipRequest{
-				IntentID:     intent.IntentID,
-				JobID:        job.JobID,
-				SizeBytes:    seg.SizeBytes,
-				SHA256:       seg.SHA256,
-				DurationMs:   seg.DurationMs,
-				VideoCodec:   seg.VideoCodec,
-				AudioCodec:   seg.AudioCodec,
-				AudioPresent: seg.AudioPresent,
-				ActualFPS:    seg.ActualFPS,
-				Container:    seg.Container,
-				ResolvedURL:  sourceURL,
-				ClipStartAt:  seg.StartAt,
-				ClipEndAt:    seg.EndAt,
+				IntentID:        intent.IntentID,
+				JobID:           job.JobID,
+				SizeBytes:       seg.SizeBytes,
+				SHA256:          seg.SHA256,
+				DurationMs:      seg.DurationMs,
+				VideoCodec:      seg.VideoCodec,
+				AudioCodec:      seg.AudioCodec,
+				AudioPresent:    seg.AudioPresent,
+				ActualFPS:       seg.ActualFPS,
+				Container:       seg.Container,
+				ResolvedURL:     sourceURL,
+				ClipStartAt:     seg.StartAt,
+				ClipEndAt:       seg.EndAt,
+				LeaseToken:      job.LeaseToken,
+				CaptureSequence: seg.CaptureSequence,
 			})
 			return err
 		},
 	); err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
-		w.fail(ctx, job.JobID, err)
+		w.fail(ctx, job.JobID, job.LeaseToken, err)
 		return
 	}
 	w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "completing")
-	if err := w.cfg.Client.CompleteRecordingJob(ctx, job.JobID); err != nil {
+	if err := w.cfg.Client.CompleteRecordingJob(ctx, job.JobID, job.LeaseToken); err != nil {
 		log.Printf("recording worker job=%d complete failed: %v", job.JobID, err)
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "complete_failed", err)
 		return
@@ -365,13 +367,13 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	w.cfg.RelayDiagnostics.Start(job)
 	if err := w.ensureCaptureTempDir(); err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
-		w.fail(ctx, job.JobID, err)
+		w.fail(ctx, job.JobID, job.LeaseToken, err)
 		return
 	}
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseExpiresAt)
+	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 
@@ -406,6 +408,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// segmentDeliveryPending stays job-scoped (an attempt that delivers nothing
 	// leaves the previous attempt's value untouched, as the inline path did).
 	segmentDeliveryPending := false
+	var captureSequence int64
 	progress := newContinuousProgress(time.Now())
 	deliverSegment := func(sourceURL string, seg capture.Segment) error {
 		if !w.diskHasSpace(w.cfg.MinActiveFreeBytes) {
@@ -422,7 +425,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}, segmentDeliveryOps{
 			Reserve: func() (recordingapi.ClipUploadIntent, error) {
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
-				reserved, err := w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, seg.MIMEType, segStartMs)
+				reserved, err := w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, segStartMs)
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_reserve_upload_failed", err)
 				}
@@ -441,19 +444,21 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			Ingest: func(intent recordingapi.ClipUploadIntent) error {
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
 				_, err := w.cfg.Client.IngestClip(segmentCtx, recordingapi.IngestClipRequest{
-					IntentID:     intent.IntentID,
-					JobID:        job.JobID,
-					SizeBytes:    seg.SizeBytes,
-					SHA256:       seg.SHA256,
-					DurationMs:   seg.DurationMs,
-					VideoCodec:   seg.VideoCodec,
-					AudioCodec:   seg.AudioCodec,
-					AudioPresent: seg.AudioPresent,
-					ActualFPS:    seg.ActualFPS,
-					Container:    seg.Container,
-					ResolvedURL:  sourceURL,
-					ClipStartAt:  seg.StartAt,
-					ClipEndAt:    seg.EndAt,
+					IntentID:        intent.IntentID,
+					JobID:           job.JobID,
+					SizeBytes:       seg.SizeBytes,
+					SHA256:          seg.SHA256,
+					DurationMs:      seg.DurationMs,
+					VideoCodec:      seg.VideoCodec,
+					AudioCodec:      seg.AudioCodec,
+					AudioPresent:    seg.AudioPresent,
+					ActualFPS:       seg.ActualFPS,
+					Container:       seg.Container,
+					ResolvedURL:     sourceURL,
+					ClipStartAt:     seg.StartAt,
+					ClipEndAt:       seg.EndAt,
+					LeaseToken:      job.LeaseToken,
+					CaptureSequence: seg.CaptureSequence,
 				})
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
@@ -528,7 +533,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if isImage {
 			err := fmt.Errorf("image sources are not supported by the recorder")
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
-			w.fail(ctx, job.JobID, err)
+			w.fail(ctx, job.JobID, job.LeaseToken, err)
 			return
 		}
 		// S-1: re-check the resolved URL right before ffmpeg (DNS-rebinding gate),
@@ -584,7 +589,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		pool := startSegmentDeliveryPool(w.cfg.UploadWorkers, abortAttempt, func(seg capture.Segment) error {
 			return deliverSegment(resolved, seg)
 		})
-		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", job.TargetFPS, outDir, pool.Submit, inputHeaders)
+		submitInCaptureOrder := func(seg capture.Segment) error {
+			captureSequence++
+			seg.CaptureSequence = captureSequence
+			return pool.Submit(seg)
+		}
+		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", job.TargetFPS, outDir, submitInCaptureOrder, inputHeaders)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
 		// never closes (and outDir is never removed) with an upload still running.
 		delivery := pool.close()
@@ -606,7 +616,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		windowClosed := continuousShouldStop(canceled(), windowCtx.Err() != nil)
 		if continuousDeliveryFailureShouldFail(captureErr, windowClosed) {
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", captureErr)
-			w.fail(ctx, job.JobID, captureErr)
+			w.fail(ctx, job.JobID, job.LeaseToken, captureErr)
 			return
 		}
 		// Window close vs premature drop: CaptureContinuous returns nil on ctx.Done,
@@ -648,7 +658,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		return
 	}
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "completing")
-	if err := w.cfg.Client.CompleteRecordingJob(ctx, job.JobID); err != nil {
+	if err := w.cfg.Client.CompleteRecordingJob(ctx, job.JobID, job.LeaseToken); err != nil {
 		log.Printf("recording worker job=%d continuous complete failed: %v", job.JobID, err)
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "complete_failed", err)
 		return
@@ -755,7 +765,7 @@ func (w *Worker) surrenderContinuousJobForReason(ctx context.Context, cancel con
 	cancel()
 	surrenderCtx, surrenderCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer surrenderCancel()
-	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, reason); surrenderErr != nil {
+	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, job.LeaseToken, reason); surrenderErr != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "surrender_failed", surrenderErr)
 		log.Printf("recording worker job=%d surrender failed: %v", job.JobID, surrenderErr)
 		return true
@@ -910,7 +920,7 @@ func isUploadIntentStateConflict(err error) bool {
 // startHeartbeat extends the lease on a ticker; on a cancel signal it cancels the
 // job context (aborting ffmpeg). The returned func reports whether a cancel was
 // observed, so the caller skips ingest for a canceled job.
-func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseExpiresAt time.Time) func() bool {
+func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseToken string, leaseExpiresAt time.Time) func() bool {
 	var mu sync.Mutex
 	wasCanceled := false
 	markCanceled := func() {
@@ -934,7 +944,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 				return
 			case <-ticker.C:
 				heartbeatCtx, heartbeatCancel := context.WithDeadline(ctx, leaseExpiresAt)
-				cancelSignal, renewedUntil, err := w.cfg.Client.HeartbeatRecordingJob(heartbeatCtx, jobID)
+				cancelSignal, renewedUntil, err := w.cfg.Client.HeartbeatRecordingJob(heartbeatCtx, jobID, leaseToken)
 				heartbeatCancel()
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
@@ -965,7 +975,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 	}
 }
 
-func (w *Worker) fail(ctx context.Context, jobID int64, runErr error) {
+func (w *Worker) fail(ctx context.Context, jobID int64, leaseToken string, runErr error) {
 	errText := "recording capture failed"
 	if runErr != nil {
 		errText = runErr.Error()
@@ -983,7 +993,7 @@ func (w *Worker) fail(ctx context.Context, jobID int64, runErr error) {
 	failCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = ctx
-	if err := w.cfg.Client.FailRecordingJob(failCtx, jobID, errText); err != nil {
+	if err := w.cfg.Client.FailRecordingJob(failCtx, jobID, leaseToken, errText); err != nil {
 		log.Printf("recording worker job=%d fail report failed: %v", jobID, err)
 	}
 }

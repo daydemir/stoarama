@@ -106,7 +106,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		CREATE TABLE storage_destinations (id BIGINT PRIMARY KEY);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT);
-		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ);
 		INSERT INTO relay_groups VALUES (1, 47, 1);
 		INSERT INTO nodes VALUES (1, 47, 'relay', 'active', now(), 6, 1), (2, 47, 'relay', 'active', now(), 6, 1);
 		INSERT INTO storage_destinations VALUES (1);
@@ -127,7 +127,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: nodeID, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec)
+			_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: nodeID, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
 			results <- err
 		}()
 	}
@@ -156,7 +156,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var renewedAt time.Time
-	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
+	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, nil).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expired heartbeat err=%v, want pgx.ErrNoRows", err)
 	}
 
@@ -176,7 +176,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 3, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec)
+			_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 3, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
 			results <- err
 		}()
 	}
@@ -233,7 +233,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 	heartbeatDone := make(chan error, 1)
 	go func() {
-		_, err := s.heartbeatRecordingJob(ctx, nodePrincipal{NodeID: 5, AccountID: 47, NodeType: nodeTypeRelay}, 5, "node:5")
+		_, err := s.heartbeatRecordingJob(ctx, nodePrincipal{NodeID: 5, AccountID: 47, NodeType: nodeTypeRelay}, 5, "node:5", nil)
 		heartbeatDone <- err
 	}()
 	deadline := time.Now().Add(2 * time.Second)
@@ -260,7 +260,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	leaseDone := make(chan error, 1)
 	go func() {
-		_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 6, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec)
+		_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 6, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
 		leaseDone <- err
 	}()
 	select {

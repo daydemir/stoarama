@@ -22,6 +22,11 @@ import (
 // UploadTimeout bounds the complete upload of one finalized recording segment.
 const UploadTimeout = 5 * time.Minute
 
+const (
+	leaseTokenHeader          = "X-Stoarama-Recording-Lease-Token"
+	leaseTokenSupportedHeader = "X-Stoarama-Recording-Lease-Token-Supported"
+)
+
 // ErrorCode identifies a stable recording API failure independent of its message.
 type ErrorCode string
 
@@ -103,6 +108,7 @@ type RecordingJob struct {
 	FireAt               time.Time `json:"fire_at"`
 	AttemptCount         int       `json:"attempt_count"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
+	LeaseToken           string    `json:"lease_token,omitempty"`
 	// TargetFPS, when non-nil, normalizes each captured clip to that exact frame
 	// rate (re-encode). nil = Source/native (stream-copy, preserve source fps).
 	TargetFPS *int `json:"target_fps"`
@@ -135,20 +141,22 @@ type ClipUploadIntent struct {
 
 // IngestClipRequest carries the captured clip's metadata to the ingest endpoint.
 type IngestClipRequest struct {
-	IntentID     string
-	JobID        int64
-	SizeBytes    int64
-	ETag         string
-	SHA256       string
-	DurationMs   int64
-	VideoCodec   string
-	AudioCodec   string
-	AudioPresent bool
-	ActualFPS    *float64
-	Container    string
-	ResolvedURL  string
-	ClipStartAt  time.Time
-	ClipEndAt    time.Time
+	IntentID        string
+	JobID           int64
+	SizeBytes       int64
+	ETag            string
+	SHA256          string
+	DurationMs      int64
+	VideoCodec      string
+	AudioCodec      string
+	AudioPresent    bool
+	ActualFPS       *float64
+	Container       string
+	ResolvedURL     string
+	ClipStartAt     time.Time
+	ClipEndAt       time.Time
+	LeaseToken      string
+	CaptureSequence int64
 }
 
 type SurveyLease struct {
@@ -161,7 +169,9 @@ func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
 	var out struct {
 		Job *RecordingJob `json:"job"`
 	}
-	if err := c.postJSON(ctx, "/api/v1/recording/jobs/lease", map[string]any{}, &out); err != nil {
+	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/jobs/lease", map[string]any{}, map[string]string{
+		leaseTokenSupportedHeader: "true",
+	}, &out); err != nil {
 		return nil, err
 	}
 	return out.Job, nil
@@ -173,14 +183,21 @@ func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
 // raises many per-segment intents. The discriminator forwards the per-segment
 // object-key derivation to the server and keeps the request compatible with an
 // older API during a rollback.
-func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, mimeType string, segmentStartMs int64) (ClipUploadIntent, error) {
+func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, leaseToken, mimeType, sha256 string, segmentStartMs int64) (ClipUploadIntent, error) {
 	payload := map[string]any{"job_id": jobID, "mime_type": strings.TrimSpace(mimeType)}
+	// Only generation-aware servers understand the hash preflight field. If a
+	// freshly rolled worker briefly reaches the previous API during deployment,
+	// its lease response has no token and the request remains byte-compatible.
+	if sha256 = strings.TrimSpace(sha256); strings.TrimSpace(leaseToken) != "" && sha256 != "" {
+		payload["sha256"] = sha256
+	}
 	idemKey := buildIdempotencyKey("recording-clip", jobID)
 	if segmentStartMs > 0 {
 		payload["segment_start_ms"] = segmentStartMs
 		idemKey = fmt.Sprintf("recording-seg-%d-%d", jobID, segmentStartMs)
 	}
-	headers := map[string]string{"Idempotency-Key": idemKey}
+	headers := leaseTokenHeaders(leaseToken)
+	headers["Idempotency-Key"] = idemKey
 	var out ClipUploadIntent
 	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/upload-intents", payload, headers, &out); err != nil {
 		return ClipUploadIntent{}, err
@@ -212,10 +229,13 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 		"clip_start_at": req.ClipStartAt.UTC().Format(time.RFC3339Nano),
 		"clip_end_at":   req.ClipEndAt.UTC().Format(time.RFC3339Nano),
 	}
+	if strings.TrimSpace(req.LeaseToken) != "" && req.CaptureSequence > 0 {
+		payload["capture_sequence"] = req.CaptureSequence
+	}
 	var out struct {
 		ClipID int64 `json:"clip_id"`
 	}
-	if err := c.postJSON(ctx, "/api/v1/recording/clips/ingest", payload, &out); err != nil {
+	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/clips/ingest", payload, leaseTokenHeaders(req.LeaseToken), &out); err != nil {
 		return 0, err
 	}
 	return out.ClipID, nil
@@ -223,9 +243,9 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 
 // HeartbeatRecordingJob extends the lease. It returns cancel=true when the
 // server signals (409) that the job was canceled or is no longer owned.
-func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64) (cancel bool, leaseExpiresAt time.Time, err error) {
+func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64, leaseToken string) (cancel bool, leaseExpiresAt time.Time, err error) {
 	path := fmt.Sprintf("/api/v1/recording/jobs/%d/heartbeat", jobID)
-	status, body, err := c.postRaw(ctx, path, map[string]any{})
+	status, body, err := c.postRawWithHeaders(ctx, path, map[string]any{}, leaseTokenHeaders(leaseToken))
 	if err != nil {
 		return false, time.Time{}, err
 	}
@@ -248,17 +268,25 @@ func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64) (cancel
 }
 
 // CompleteRecordingJob marks the job done (no reschedule).
-func (c *Client) CompleteRecordingJob(ctx context.Context, jobID int64) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/complete", jobID), map[string]any{}, nil)
+func (c *Client) CompleteRecordingJob(ctx context.Context, jobID int64, leaseToken string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/complete", jobID), map[string]any{}, leaseTokenHeaders(leaseToken), nil)
 }
 
 // FailRecordingJob requeues or fails the job and records the error.
-func (c *Client) FailRecordingJob(ctx context.Context, jobID int64, errText string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/fail", jobID), map[string]any{"error_text": strings.TrimSpace(errText)}, nil)
+func (c *Client) FailRecordingJob(ctx context.Context, jobID int64, leaseToken, errText string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/fail", jobID), map[string]any{"error_text": strings.TrimSpace(errText)}, leaseTokenHeaders(leaseToken), nil)
 }
 
-func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, reason SurrenderReason) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{"reason": reason}, nil)
+func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, leaseToken string, reason SurrenderReason) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{"reason": reason}, leaseTokenHeaders(leaseToken), nil)
+}
+
+func leaseTokenHeaders(token string) map[string]string {
+	headers := map[string]string{}
+	if token = strings.TrimSpace(token); token != "" {
+		headers[leaseTokenHeader] = token
+	}
+	return headers
 }
 
 // TouchDroplet records droplet liveness independent of any held job by touching
@@ -345,6 +373,10 @@ func (c *Client) postJSONWithHeaders(ctx context.Context, path string, payload a
 // non-2xx (e.g. the 409 cancel signal) without treating it as a hard error.
 func (c *Client) postRaw(ctx context.Context, path string, payload any) (int, []byte, error) {
 	return c.api.PostRaw(ctx, path, payload)
+}
+
+func (c *Client) postRawWithHeaders(ctx context.Context, path string, payload any, headers map[string]string) (int, []byte, error) {
+	return c.api.PostRawWithHeaders(ctx, path, payload, headers)
 }
 
 func buildIdempotencyKey(prefix string, jobID int64) string {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -2155,10 +2156,12 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	offset := parseIntQuery(r, "offset", 0, 0, 1<<30)
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps, object_key, display_path, storage_destination_id, purged_at, released_at
+		SELECT id, fire_at, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps,
+		       object_key, display_path, storage_destination_id, purged_at, released_at,
+		       capture_lease_token, capture_sequence
 		FROM recording_clips
 		WHERE recording_id=$1
-		ORDER BY fire_at DESC
+		ORDER BY clip_start_at DESC, id DESC
 		LIMIT $2 OFFSET $3
 	`, id, limit, offset)
 	if err != nil {
@@ -2169,20 +2172,22 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 	items := make([]map[string]any, 0, 16)
 	for rows.Next() {
 		var (
-			clipID       int64
-			fireAt       time.Time
-			clipStartAt  time.Time
-			clipEndAt    time.Time
-			sizeBytes    int64
-			durationMs   int64
-			actualFPS    *float64
-			objectKey    string
-			displayPath  string
-			sourceDestID int64
-			purgedAt     *time.Time
-			releasedAt   *time.Time
+			clipID            int64
+			fireAt            time.Time
+			clipStartAt       time.Time
+			clipEndAt         time.Time
+			sizeBytes         int64
+			durationMs        int64
+			actualFPS         *float64
+			objectKey         string
+			displayPath       string
+			sourceDestID      int64
+			purgedAt          *time.Time
+			releasedAt        *time.Time
+			captureLeaseToken *uuid.UUID
+			captureSequence   *int64
 		)
-		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &actualFPS, &objectKey, &displayPath, &sourceDestID, &purgedAt, &releasedAt); err != nil {
+		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &sizeBytes, &durationMs, &actualFPS, &objectKey, &displayPath, &sourceDestID, &purgedAt, &releasedAt, &captureLeaseToken, &captureSequence); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan clip: %v", err))
 			return
 		}
@@ -2199,6 +2204,8 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			"storage_destination_id": sourceDestID,
 			"purged":                 purgedAt != nil,
 			"released":               releasedAt != nil,
+			"capture_lease_token":    captureLeaseToken,
+			"capture_sequence":       captureSequence,
 		})
 	}
 	if err := rows.Err(); err != nil {
