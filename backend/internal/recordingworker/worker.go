@@ -64,9 +64,9 @@ type Config struct {
 	// job at one reserve+upload+ingest round trip at a time. Zero or negative
 	// uses defaultUploadWorkers.
 	UploadWorkers int
-	// DiskFreeBytes and the thresholds are relay-only safety gates. The server
+	// DiskFreeBytes and the thresholds are recorder safety gates. The server
 	// remains authoritative for stream capacity; these prevent a full local disk
-	// from making the relay or host unhealthy.
+	// from making a relay, cloud recorder, or host unhealthy.
 	DiskFreeBytes      func() (uint64, error)
 	MinLeaseFreeBytes  uint64
 	MinActiveFreeBytes uint64
@@ -93,8 +93,17 @@ var (
 const defaultUploadWorkers = 2
 
 const segmentDeliveryRetryDelay = 5 * time.Second
-const segmentDeliveryRetryBudget = 2 * time.Minute
-const postWindowDeliveryGrace = 2 * time.Minute
+
+// Keep finalized source-quality segments on the recorder long enough to ride
+// through a shared object-storage incident. On 2026-07-29 R2 PUT/HEAD failures
+// lasted about 30 minutes across many streams; the former two-minute budget
+// canceled ffmpeg and guaranteed a hole even though the recorder still had
+// healthy source access and ample local disk. The delivery pool remains bounded
+// by the recorder's minimum-free-space fence and the delivery deadline.
+const segmentDeliveryRetryBudget = 45 * time.Minute
+const postWindowDeliveryGrace = segmentDeliveryRetryBudget
+const uploadIntentRefreshMargin = recordingapi.UploadTimeout + 30*time.Second
+const continuousDiskMonitorInterval = 5 * time.Second
 const diskPauseLogInterval = 5 * time.Minute
 const diskErrorLogInterval = 5 * time.Minute
 
@@ -616,6 +625,9 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		pool := startSegmentDeliveryPool(w.cfg.UploadWorkers, abortAttempt, func(seg capture.Segment) error {
 			return deliverSegment(resolved, seg)
 		})
+		var diskPressure atomic.Bool
+		stopDiskMonitor := make(chan struct{})
+		go w.monitorContinuousDisk(stopDiskMonitor, &diskPressure, abortAttempt)
 		submitInCaptureOrder := func(seg capture.Segment) error {
 			if _, duplicate := seenSegmentSHA[seg.SHA256]; seg.SHA256 != "" && duplicate {
 				// A reconnect may replay the tail of an HLS playlist. Do not enqueue,
@@ -637,11 +649,15 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return nil
 		}
 		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", job.TargetFPS, outDir, submitInCaptureOrder, inputHeaders)
+		close(stopDiskMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
 		// never closes (and outDir is never removed) with an upload still running.
 		delivery := pool.close()
 		abortAttempt()
 		captureErr = joinSegmentDeliveryError(captureErr, delivery.err)
+		if diskPressure.Load() {
+			captureErr = errors.Join(captureErr, errDiskPressure)
+		}
 		if delivery.submitted > 0 {
 			segmentDeliveryPending = delivery.pending > 0
 		}
@@ -709,6 +725,30 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
 }
 
+func (w *Worker) monitorContinuousDisk(stop <-chan struct{}, pressured *atomic.Bool, abort context.CancelFunc) {
+	w.monitorContinuousDiskAtInterval(stop, pressured, abort, continuousDiskMonitorInterval)
+}
+
+func (w *Worker) monitorContinuousDiskAtInterval(stop <-chan struct{}, pressured *atomic.Bool, abort context.CancelFunc, interval time.Duration) {
+	if w.cfg.MinActiveFreeBytes == 0 || w.cfg.DiskFreeBytes == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if !w.diskHasSpace(w.cfg.MinActiveFreeBytes) {
+				pressured.Store(true)
+				abort()
+				return
+			}
+		}
+	}
+}
+
 // clampContinuousSegmentTimeline preserves a real reconnect gap when the new
 // attempt starts after prior media, but forbids a backward seam when it starts
 // behind the job's accepted capture sequence.
@@ -759,6 +799,15 @@ func deliverSegmentWithRetry(ctx context.Context, retryDelay time.Duration, disk
 		}
 		if intent.AlreadyIngested {
 			return nil
+		}
+		// Presigned PUT URLs are shorter-lived than the storage-outage retry
+		// budget. Refresh before starting an upload that could outlive its URL;
+		// reserving the same idempotent segment renews the existing intent and
+		// never changes the object key or media bytes.
+		if !intent.ExpiresAt.IsZero() && !time.Now().Add(uploadIntentRefreshMargin).Before(intent.ExpiresAt) {
+			intent = nil
+			uploaded = false
+			return fmt.Errorf("%w: upload intent expires too soon", errReplaySegmentDelivery)
 		}
 		if !uploaded {
 			if err := ops.Upload(*intent); err != nil {

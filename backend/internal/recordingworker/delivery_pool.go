@@ -69,10 +69,12 @@ type segmentDeliveryResult struct {
 // goroutine and cannot be reordered. Only the reserve -> PUT -> ingest flow moves
 // off that goroutine, onto a fixed set of workers.
 //
-// Submit blocks once the queue is full, so a stalled uplink applies backpressure to
-// the sweep loop instead of buffering segments without bound.
+// Finalized media stays in the attempt directory until delivery is acknowledged.
+// Submit therefore queues only small descriptors and never blocks the capture
+// sweep on a stalled object store. The worker's independent free-space monitor is
+// the authoritative spool bound: it stops ffmpeg before local media can consume
+// the recorder's reserve, while close drains every descriptor already accepted.
 type segmentDeliveryPool struct {
-	queue   chan capture.Segment
 	wg      sync.WaitGroup
 	deliver func(capture.Segment) error
 	// abort cancels the capture attempt on the first delivery failure, so a dead
@@ -81,6 +83,8 @@ type segmentDeliveryPool struct {
 	abort context.CancelFunc
 
 	mu        sync.Mutex
+	ready     *sync.Cond
+	queue     []capture.Segment
 	err       error
 	submitted int
 	inFlight  int
@@ -88,18 +92,18 @@ type segmentDeliveryPool struct {
 	closed    bool
 }
 
-// startSegmentDeliveryPool starts workers goroutines draining a queue of the same
-// depth. deliver performs one segment's reserve -> PUT -> ingest and must be safe
-// to call from several goroutines at once.
+// startSegmentDeliveryPool starts worker goroutines draining the on-disk spool's
+// descriptor queue. deliver performs one segment's reserve -> PUT -> ingest and
+// must be safe to call from several goroutines at once.
 func startSegmentDeliveryPool(workers int, abort context.CancelFunc, deliver func(capture.Segment) error) *segmentDeliveryPool {
 	if workers <= 0 {
 		workers = 1
 	}
 	p := &segmentDeliveryPool{
-		queue:   make(chan capture.Segment, workers),
 		deliver: deliver,
 		abort:   abort,
 	}
+	p.ready = sync.NewCond(&p.mu)
 	p.wg.Add(workers)
 	for range workers {
 		go p.run()
@@ -109,12 +113,15 @@ func startSegmentDeliveryPool(workers int, abort context.CancelFunc, deliver fun
 
 func (p *segmentDeliveryPool) run() {
 	defer p.wg.Done()
-	for seg := range p.queue {
+	for {
+		seg, ok := p.take()
+		if !ok {
+			return
+		}
 		if p.failed() {
-			// A previous delivery already failed this attempt. Drain without
-			// uploading so Submit can never block on a pool that will not make
-			// progress; these segments stay counted as in flight, which preserves
-			// the "unacknowledged segment" signal the caller keys cleanup on.
+			// A previous delivery already failed this attempt. Drain descriptors
+			// without uploading; their media remains on disk and they stay counted
+			// as pending for the supervisor's cleanup/retry decision.
 			continue
 		}
 		if err := p.deliver(seg); err != nil {
@@ -125,24 +132,42 @@ func (p *segmentDeliveryPool) run() {
 	}
 }
 
+func (p *segmentDeliveryPool) take() (capture.Segment, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for len(p.queue) == 0 && !p.closed {
+		p.ready.Wait()
+	}
+	if len(p.queue) == 0 {
+		return capture.Segment{}, false
+	}
+	seg := p.queue[0]
+	p.queue[0] = capture.Segment{}
+	p.queue = p.queue[1:]
+	return seg, true
+}
+
 // Submit is the onSegment callback handed to CaptureContinuous. It returns the
 // first delivery error seen by any worker, so an upload failure still surfaces
 // through CaptureContinuous and still drives the supervisor's reconnect/backoff
 // path rather than being swallowed by a worker goroutine.
 //
-// It is called only from the capture goroutine, and only before close(), which is
-// what makes the unsynchronized send on p.queue safe.
+// It is called only from the capture goroutine and queues no media bytes. Keeping
+// it non-blocking is what lets window cancellation reach ffmpeg during a storage
+// outage; local media growth is bounded independently by the disk monitor.
 func (p *segmentDeliveryPool) Submit(seg capture.Segment) error {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.err != nil {
-		err := p.err
-		p.mu.Unlock()
-		return err
+		return p.err
+	}
+	if p.closed {
+		return context.Canceled
 	}
 	p.submitted++
 	p.inFlight++
-	p.mu.Unlock()
-	p.queue <- seg
+	p.queue = append(p.queue, seg)
+	p.ready.Signal()
 	return nil
 }
 
@@ -179,7 +204,7 @@ func (p *segmentDeliveryPool) close() segmentDeliveryResult {
 	p.mu.Lock()
 	if !p.closed {
 		p.closed = true
-		close(p.queue)
+		p.ready.Broadcast()
 	}
 	p.mu.Unlock()
 	p.wg.Wait()

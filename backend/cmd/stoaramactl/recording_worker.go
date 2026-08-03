@@ -7,11 +7,17 @@ import (
 	"log"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingworker"
+)
+
+const (
+	cloudRecorderMinLeaseFreeBytes  = 2 << 30
+	cloudRecorderMinActiveFreeBytes = 512 << 20
 )
 
 // runRecordingWorker runs the recorder droplet's clip-capture loop. It
@@ -65,6 +71,15 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		HeartbeatSec:  *heartbeatSec,
 		PollInterval:  time.Duration(*pollSec) * time.Second,
 		UploadWorkers: cfg.RelayUploadWorkers,
+		DiskFreeBytes: func() (uint64, error) {
+			var stat syscall.Statfs_t
+			if err := syscall.Statfs(os.TempDir(), &stat); err != nil {
+				return 0, err
+			}
+			return stat.Bavail * uint64(stat.Bsize), nil
+		},
+		MinLeaseFreeBytes:  cloudRecorderMinLeaseFreeBytes,
+		MinActiveFreeBytes: cloudRecorderMinActiveFreeBytes,
 	})
 	if err != nil {
 		log.Fatalf("init recording worker: %v", err)
