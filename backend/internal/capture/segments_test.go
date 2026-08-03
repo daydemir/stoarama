@@ -538,8 +538,6 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-nostdin",
-		"-reconnect_at_eof 1",
-		"-reconnect_delay_total_max 15",
 		"-live_start_index -1",
 		"-fflags +discardcorrupt",
 		"-i https://example.com/live.m3u8",
@@ -557,11 +555,11 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 			t.Fatalf("expected %q in continuous args: %s", want, joined)
 		}
 	}
+	requireArgPair(t, args, "-reconnect_at_eof", "1")
 	liveEdge := slices.Index(args, "-live_start_index")
 	reconnectAtEOF := slices.Index(args, "-reconnect_at_eof")
-	reconnectBudget := slices.Index(args, "-reconnect_delay_total_max")
 	input := slices.Index(args, "-i")
-	if reconnectAtEOF < 0 || reconnectBudget < 0 || liveEdge < 0 || input < 0 || reconnectAtEOF > input || reconnectBudget > input || liveEdge > input {
+	if reconnectAtEOF < 0 || liveEdge < 0 || input < 0 || reconnectAtEOF > input || liveEdge > input {
 		t.Fatalf("HLS reconnect/live-edge options must be input-scoped before -i: %s", joined)
 	}
 	// The persistent muxer must NOT carry the single-clip -t bound.
@@ -577,9 +575,29 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 	}
 }
 
+func requireArgPair(t *testing.T, args []string, flag, want string) {
+	t.Helper()
+	i := slices.Index(args, flag)
+	if i < 0 || i+1 >= len(args) || args[i+1] != want {
+		t.Fatalf("expected exact %s %s in args: %s", flag, want, strings.Join(args, " "))
+	}
+}
+
+func TestContinuousProgressTimeoutBoundsHLSReconnect(t *testing.T) {
+	if got := continuousProgressTimeout("https://example.com/live.m3u8?token=x", 60*time.Second); got != 30*time.Second {
+		t.Fatalf("HLS progress timeout=%v want 30s", got)
+	}
+	if got := continuousProgressTimeout("https://example.com/live.mp4", 60*time.Second); got != 75*time.Second {
+		t.Fatalf("direct-video progress timeout=%v want 75s", got)
+	}
+	if got := continuousProgressTimeout("https://example.com/live.m3u8", 10*time.Second); got != 25*time.Second {
+		t.Fatalf("short HLS progress timeout=%v want 25s", got)
+	}
+}
+
 func TestBuildFFmpegContinuousArgsDoesNotSendHLSOptionToHTTPVideo(t *testing.T) {
 	args := buildFFmpegContinuousArgs("https://example.com/live.mp4?token=secret", "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", nil)
-	for _, option := range []string{"-reconnect_at_eof", "-reconnect_delay_total_max", "-live_start_index"} {
+	for _, option := range []string{"-reconnect_at_eof", "-live_start_index"} {
 		if slices.Contains(args, option) {
 			t.Fatalf("non-HLS input received HLS-only option %q: %s", option, strings.Join(args, " "))
 		}
@@ -599,7 +617,7 @@ func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			base := []string{"-nostdin"}
 			args := appendHLSLiveEdgeInputArgs(slices.Clone(base), tt.sourceURL)
-			for _, option := range []string{"-reconnect_at_eof", "-reconnect_delay_total_max", "-live_start_index"} {
+			for _, option := range []string{"-reconnect_at_eof", "-live_start_index"} {
 				if got := slices.Contains(args, option); got != tt.wantHLS {
 					t.Fatalf("HLS option %q presence=%t want=%t: %v", option, got, tt.wantHLS, args)
 				}

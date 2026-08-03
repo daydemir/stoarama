@@ -122,6 +122,7 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 		         SELECT 1 FROM recording_jobs j
 		         WHERE j.lease_owner='node:'||n.id::text
 		           AND j.status='leased' AND j.kind='continuous_window'
+		           AND j.lease_expires_at>$2
 		           AND j.fire_at<=$2 AND j.window_end_at>$2
 		       ) AS active_capture
 		FROM nodes n

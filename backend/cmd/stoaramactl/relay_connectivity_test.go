@@ -123,7 +123,7 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL);
 		CREATE TABLE users (email TEXT PRIMARY KEY, is_operator BOOLEAN NOT NULL);
 		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, display_name TEXT NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ);
-		CREATE TABLE recording_jobs (id BIGSERIAL PRIMARY KEY, lease_owner TEXT, status TEXT NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, window_end_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGSERIAL PRIMARY KEY, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, status TEXT NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, window_end_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_states (node_id BIGINT PRIMARY KEY, observed_state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL);
 		CREATE TABLE relay_connectivity_alert_events (id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL, node_id BIGINT NOT NULL, state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, last_heartbeat_at TIMESTAMPTZ, notified_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_deliveries (event_id BIGINT NOT NULL, recipient TEXT NOT NULL, delivered_at TIMESTAMPTZ, PRIMARY KEY (event_id, recipient));
@@ -143,14 +143,21 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	}
 	if _, err := pool.Exec(ctx, `
 		UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7;
-		INSERT INTO recording_jobs (lease_owner,status,kind,fire_at,window_end_at)
-		VALUES ('node:7','leased','continuous_window',$2,$3)
-	`, now.Add(-4*time.Minute), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
+		INSERT INTO recording_jobs (lease_owner,lease_expires_at,status,kind,fire_at,window_end_at)
+		VALUES ('node:7',$2,'leased','continuous_window',$3,$4)
+	`, now.Add(-4*time.Minute), now.Add(70*time.Second), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	states, err = currentRelayConnectivity(ctx, pool, now)
 	if err != nil || len(states) != 1 || !states[0].ActiveCapture || states[0].State != relayOffline {
 		t.Fatalf("capturing stale relay states=%v err=%v, want fast offline", states, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET lease_expires_at=$1`, now.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	states, err = currentRelayConnectivity(ctx, pool, now)
+	if err != nil || len(states) != 1 || states[0].ActiveCapture || states[0].State != relayOnline {
+		t.Fatalf("expired lease states=%v err=%v, want idle-threshold online", states, err)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs; UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
 		t.Fatal(err)

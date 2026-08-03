@@ -212,7 +212,15 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 }
 
 func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
-	return captureContinuousWithHeaders(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, clipDuration+15*time.Second)
+	return captureContinuousWithHeaders(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration))
+}
+
+func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) time.Duration {
+	timeout := clipDuration + 15*time.Second
+	if isHLSManifestURL(sourceURL) && timeout > 30*time.Second {
+		return 30 * time.Second
+	}
+	return timeout
 }
 
 func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration) error {
@@ -577,24 +585,30 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 // It also asks FFmpeg's HTTP layer to reconnect when a live manifest connection
 // reports EOF. Some endless HLS origins close established TLS connections this
 // way; the generic network-error option only covers connection-time failures.
-// Bound the internal retry budget so a persistently dead or expired signed URL
-// returns to recordingworker's outer loop, which re-resolves a fresh URL, rather
-// than waiting for the longer no-output watchdog.
+// The continuous HLS progress watchdog is capped at 30 seconds so a persistently
+// dead or expired signed URL returns to recordingworker's outer loop, which
+// re-resolves a fresh URL, rather than retrying the stale URL indefinitely.
 //
 // These are input-scoped HLS/HTTP options, so they must appear before -i and
 // must not be sent to ordinary HTTP video inputs. A resolved manifest's URL
 // path is the reliable discriminator; query strings do not affect the .m3u8
 // suffix.
 func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
-	u, err := url.Parse(strings.TrimSpace(sourceURL))
-	if err != nil || !strings.EqualFold(filepath.Ext(u.Path), ".m3u8") {
+	if !isHLSManifestURL(sourceURL) {
 		return args
 	}
 	return append(args,
 		"-reconnect_at_eof", "1",
-		"-reconnect_delay_total_max", "15",
 		"-live_start_index", "-1",
 	)
+}
+
+func isHLSManifestURL(sourceURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(sourceURL))
+	if err != nil || !strings.EqualFold(filepath.Ext(u.Path), ".m3u8") {
+		return false
+	}
+	return true
 }
 
 // ProbeReachable verifies that sourceURL opens and yields at least one packet
