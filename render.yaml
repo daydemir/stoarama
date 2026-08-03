@@ -3,6 +3,7 @@ databases:
     databaseName: stoarama
     user: stoarama
     plan: basic-1gb
+    storageAutoscalingEnabled: true
 
 services:
   - type: web
