@@ -45,12 +45,26 @@ func TestSignerRoundTripRejectsTamperingAndWrongKey(t *testing.T) {
 }
 
 func TestRelayReleaseScriptsParse(t *testing.T) {
-	for _, script := range []string{"release-relay.sh", "relay-release-immutable.sh", "relay-release-immutable-test.sh", "promote-relay.sh", "relay-install.sh"} {
+	for _, script := range []string{"release-relay.sh", "relay-release-provenance.sh", "relay-release-immutable.sh", "relay-release-immutable-test.sh", "promote-relay.sh", "relay-install.sh"} {
 		cmd := exec.Command("bash", "-n", filepath.Join("..", "..", "scripts", script))
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", script, err, output)
 		}
 	}
+}
+
+func TestRelayReleaseProvenanceMatchesVersionAndBinary(t *testing.T) {
+	revision := strings.TrimSpace(runCommand(t, "git", "rev-parse", "HEAD"))
+	version := revision[:8] + "-test"
+	helper := filepath.Join("..", "..", "scripts", "relay-release-provenance.sh")
+	runCommand(t, "bash", helper, "version", revision, version)
+	assertCommandFails(t, "bash", helper, "version", strings.Repeat("0", 40), version)
+
+	binary := filepath.Join(t.TempDir(), "stoarama-relay")
+	ldflags := "-X main.version=" + version + " -X main.sourceRevision=" + revision
+	runCommand(t, "go", "build", "-ldflags", ldflags, "-o", binary, "../stoarama-relay")
+	runCommand(t, "bash", helper, "binary", binary, revision, version)
+	assertCommandFails(t, "bash", helper, "binary", binary, strings.Repeat("0", 40), version)
 }
 
 func TestRelayPromotionPublishesSignatureBeforeManifest(t *testing.T) {
@@ -85,6 +99,26 @@ func TestRelayPromotionRequiresSignedCandidateAndExplicitUnsignedBootstrap(t *te
 	}
 	if strings.Index(body, candidateVerify) > strings.Index(body, `download "latest.json" "${live}"`) {
 		t.Fatal("candidate signature must be verified before inspecting live bootstrap state")
+	}
+}
+
+func TestRelayPromotionRequiresProvenanceButPreservesLegacyRollback(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join("..", "..", "scripts", "promote-relay.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(script)
+	for _, required := range []string{
+		`candidate_revision="$(jq -er '.source_revision // empty' "${candidate}")"`,
+		`elif [[ "${MODE}" == "promote" ]]`,
+		`refusing to promote relay ${VERSION} without signed source_revision provenance`,
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("promotion provenance guard missing %q", required)
+		}
+	}
+	if strings.Contains(body, `elif [[ "${MODE}" == "rollback" ]]`) {
+		t.Fatal("legacy rollback was incorrectly made dependent on source_revision")
 	}
 }
 
@@ -151,5 +185,23 @@ func assertSignerFails(t *testing.T, binary string, args ...string) {
 	cmd := exec.Command(binary, args...)
 	if output, err := cmd.CombinedOutput(); err == nil {
 		t.Fatalf("relay-manifest-sign %v unexpectedly succeeded\n%s", args, output)
+	}
+}
+
+func runCommand(t *testing.T, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s %v: %v\n%s", name, args, err, output)
+	}
+	return string(output)
+}
+
+func assertCommandFails(t *testing.T, name string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	if output, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("%s %v unexpectedly succeeded\n%s", name, args, output)
 	}
 }

@@ -33,6 +33,8 @@ BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "${BUILD_DIR}"' EXIT
 
 RELAY_VERSION="${RELAY_VERSION:-$(git -C "${ROOT_DIR}" rev-parse --short=8 HEAD)}"
+SOURCE_REVISION="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
+"${ROOT_DIR}/scripts/relay-release-provenance.sh" version "${SOURCE_REVISION}" "${RELAY_VERSION}"
 : "${YTDLP_VERSION:?YTDLP_VERSION must be an explicit release tag}"
 : "${RELAY_SIGNING_PRIVATE_KEY_FILE:?RELAY_SIGNING_PRIVATE_KEY_FILE is required}"
 [[ -f "${RELAY_SIGNING_PRIVATE_KEY_FILE}" ]] || {
@@ -209,8 +211,9 @@ for t in "${TARGETS[@]}"; do
   bin="${BUILD_DIR}/stoarama-relay"
   GOOS="${GOOS}" GOARCH="${GOARCH}" CGO_ENABLED=0 \
     go build -C "${ROOT_DIR}" \
-    -ldflags "-X main.version=${RELAY_VERSION} -X main.releasePublicKeyBase64=${RELAY_TRUSTED_PUBLIC_KEYS}" \
+    -ldflags "-X main.version=${RELAY_VERSION} -X main.sourceRevision=${SOURCE_REVISION} -X main.releasePublicKeyBase64=${RELAY_TRUSTED_PUBLIC_KEYS}" \
     -o "${bin}" ./cmd/stoarama-relay
+  "${ROOT_DIR}/scripts/relay-release-provenance.sh" binary "${bin}" "${SOURCE_REVISION}" "${RELAY_VERSION}"
   tarball="stoarama-relay-${RELAY_VERSION}-${key}.tar.gz"
   tar -C "${BUILD_DIR}" -czf "${BUILD_DIR}/${tarball}" stoarama-relay
   rm -f "${bin}"
@@ -246,6 +249,7 @@ latest="${BUILD_DIR}/latest.json"
 {
   echo "{"
   echo "  \"version\": \"${RELAY_VERSION}\","
+  echo "  \"source_revision\": \"${SOURCE_REVISION}\","
   echo "  \"previous_version\": \"${PREVIOUS_VERSION}\","
   echo "  \"previous_relay\": ${PREVIOUS_RELAY_JSON},"
   echo "  \"relay\": {"

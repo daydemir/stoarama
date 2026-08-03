@@ -583,12 +583,12 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 // an HLS source's already-published tail drain faster than wall time after each
 // restart. The recorder then chains those media durations onto wall-clock file
 // labels and eventually has to jump backward, creating overlapping clip times.
-// It also asks FFmpeg's HTTP layer to reconnect when a live manifest connection
-// reports EOF. Some endless HLS origins close established TLS connections this
-// way; the generic network-error option only covers connection-time failures.
 // The continuous HLS progress watchdog is capped at 30 seconds so a persistently
 // dead or expired signed URL returns to recordingworker's outer loop, which
 // re-resolves a fresh URL, rather than retrying the stale URL indefinitely.
+// Do not set reconnect_at_eof for HLS. EOF is the normal end of each finite
+// playlist HTTP response; reconnecting that response prevents FFmpeg's HLS
+// demuxer from completing the manifest and can produce zero media forever.
 //
 // These are input-scoped HLS/HTTP options, so they must appear before -i and
 // must not be sent to ordinary HTTP video inputs. A resolved manifest's URL
@@ -599,7 +599,6 @@ func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
 		return args
 	}
 	return append(args,
-		"-reconnect_at_eof", "1",
 		"-live_start_index", "-1",
 	)
 }

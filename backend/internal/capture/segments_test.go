@@ -575,12 +575,13 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 			t.Fatalf("expected %q in continuous args: %s", want, joined)
 		}
 	}
-	requireArgPair(t, args, "-reconnect_at_eof", "1")
 	liveEdge := slices.Index(args, "-live_start_index")
-	reconnectAtEOF := slices.Index(args, "-reconnect_at_eof")
 	input := slices.Index(args, "-i")
-	if reconnectAtEOF < 0 || liveEdge < 0 || input < 0 || reconnectAtEOF > input || liveEdge > input {
-		t.Fatalf("HLS reconnect/live-edge options must be input-scoped before -i: %s", joined)
+	if liveEdge < 0 || input < 0 || liveEdge > input {
+		t.Fatalf("HLS live-edge option must be input-scoped before -i: %s", joined)
+	}
+	if slices.Contains(args, "-reconnect_at_eof") {
+		t.Fatalf("HLS manifest EOF is normal and must not be reconnected: %s", joined)
 	}
 	// The persistent muxer must NOT carry the single-clip -t bound.
 	for _, field := range args {
@@ -637,10 +638,11 @@ func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			base := []string{"-nostdin"}
 			args := appendHLSLiveEdgeInputArgs(slices.Clone(base), tt.sourceURL)
-			for _, option := range []string{"-reconnect_at_eof", "-live_start_index"} {
-				if got := slices.Contains(args, option); got != tt.wantHLS {
-					t.Fatalf("HLS option %q presence=%t want=%t: %v", option, got, tt.wantHLS, args)
-				}
+			if got := slices.Contains(args, "-live_start_index"); got != tt.wantHLS {
+				t.Fatalf("HLS live-edge option presence=%t want=%t: %v", got, tt.wantHLS, args)
+			}
+			if slices.Contains(args, "-reconnect_at_eof") {
+				t.Fatalf("HLS manifest EOF reconnect must remain disabled: %v", args)
 			}
 			if !tt.wantHLS && !slices.Equal(args, base) {
 				t.Fatalf("non-HLS args changed: got=%v want=%v", args, base)

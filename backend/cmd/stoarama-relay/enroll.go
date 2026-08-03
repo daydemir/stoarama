@@ -53,9 +53,10 @@ func runEnroll(args []string) error {
 		"hostname":     hostname(),
 		"platform":     runtime.GOOS + "/" + runtime.GOARCH,
 		"capabilities_json": map[string]any{
-			"youtube_mode":  "cookieless",
-			"youtube_ready": false,
-			"relay_version": version,
+			"youtube_mode":          "cookieless",
+			"youtube_ready":         false,
+			"relay_version":         version,
+			"relay_source_revision": sourceRevision,
 		},
 	}
 	b, err := json.Marshal(payload)
