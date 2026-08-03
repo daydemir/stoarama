@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/apihttp"
+	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
@@ -105,7 +106,9 @@ func TestSegmentDeliveryReusesReservedIntentAcrossUploadRetry(t *testing.T) {
 
 func TestSegmentDeliveryRefreshesExpiringUploadIntent(t *testing.T) {
 	var reserveCalls, uploadCalls, ingestCalls, retryCalls int
-	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := deliverSegmentWithRetry(ctx, time.Millisecond, func() bool { return true }, segmentDeliveryOps{
 		Reserve: func() (recordingapi.ClipUploadIntent, error) {
 			reserveCalls++
 			if reserveCalls == 1 {
@@ -332,13 +335,49 @@ func TestHeartbeatContinuesAfterCaptureWindowCloses(t *testing.T) {
 	defer cancelJob()
 	canceled := worker.startHeartbeat(jobCtx, cancelJob, 4, "", time.Now().Add(time.Second))
 	windowCtx, closeWindow := context.WithCancel(jobCtx)
+	deliveryStarted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	pool := startSegmentDeliveryPool(1, nil, func(capture.Segment) error {
+		close(deliveryStarted)
+		<-releaseDelivery
+		return nil
+	})
+	if err := pool.Submit(capture.Segment{Path: "post-window.mp4"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-deliveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("delivery worker did not start")
+	}
+	drainDone := make(chan segmentDeliveryResult, 1)
+	go func() { drainDone <- pool.close() }()
+
+	// Match processContinuousJob: capture's child window closes while the pool
+	// drains on the still-live parent job context.
+	heartbeatsBeforeWindowClose := heartbeats.Load()
 	closeWindow()
 	if windowCtx.Err() == nil {
 		t.Fatal("capture window did not close")
 	}
-	waitFor(t, "post-window lease renewals", func() bool { return heartbeats.Load() >= 3 })
+	waitFor(t, "post-window lease renewals", func() bool { return heartbeats.Load() >= heartbeatsBeforeWindowClose+3 })
 	if canceled() || jobCtx.Err() != nil {
 		t.Fatal("window close canceled job heartbeat during delivery drain")
+	}
+	select {
+	case <-drainDone:
+		t.Fatal("delivery drain completed while upload was still blocked")
+	default:
+	}
+	close(releaseDelivery)
+	var result segmentDeliveryResult
+	select {
+	case result = <-drainDone:
+	case <-time.After(time.Second):
+		t.Fatal("post-window delivery drain did not finish after upload release")
+	}
+	if result.err != nil || result.pending != 0 {
+		t.Fatalf("post-window delivery result=%+v", result)
 	}
 }
 
@@ -594,7 +633,7 @@ func TestFinalizedSegmentStartingBeforeWindowEndGetsPostWindowGrace(t *testing.T
 }
 
 func TestSegmentDeliveryBudgetIsBoundedEarlyAndAfterWindow(t *testing.T) {
-	if segmentDeliveryRetryBudget < 30*time.Minute || segmentDeliveryRetryBudget > time.Hour {
+	if segmentDeliveryRetryBudget < 45*time.Minute || segmentDeliveryRetryBudget > time.Hour {
 		t.Fatalf("delivery budget=%s must cover the observed 30m outage without becoming unbounded", segmentDeliveryRetryBudget)
 	}
 	now := time.Now()

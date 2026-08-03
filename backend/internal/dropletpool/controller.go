@@ -54,7 +54,18 @@ type Controller struct {
 	store *Store
 	do    DOClient
 	cfg   Config
+
+	fleetReadFailureSince time.Time
+	fleetReadLastFailure  time.Time
+	fleetReadSuccessSince time.Time
+	fleetReadFailures     int
+	fleetReadAlerted      bool
 }
+
+const fleetReadSustainedFailureThreshold = 5 * time.Minute
+const fleetReadRecoveryDwell = 5 * time.Minute
+
+var errFleetRead = errors.New("fleet read failed")
 
 // NewController builds the autoscaler. doClient is the real godo client in
 // production (or a fake in tests).
@@ -109,8 +120,34 @@ func (c *Controller) tick(ctx context.Context) error {
 	}
 
 	// (1) reconcile against the live DO fleet + reap stuck provisioning rows.
+	// No scale, drain, or destroy decision is safe without a current complete
+	// fleet read. Return before any decision code when reconciliation fails; the
+	// next ordinary tick retries from the read boundary.
 	if err := c.reconcile(ctx, now); err != nil {
-		log.Printf("droplet pool: reconcile: %v", err)
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
+		if !errors.Is(err, errFleetRead) {
+			return err
+		}
+		if c.noteFleetReadFailure(now) {
+			log.Printf("droplet pool: CRITICAL fleet reconciliation degraded for %s across %d failed ticks; provider mutations remain paused: %v",
+				now.Sub(c.fleetReadFailureSince).Truncate(time.Second), c.fleetReadFailures, err)
+		} else {
+			log.Printf("droplet pool: reconcile: %v", err)
+		}
+		log.Printf("droplet pool: fleet truth is stale; skipping scale-up, drain, and destroy progression for this tick")
+		return nil
+	} else {
+		alert, outageDuration, failures, recovered := c.noteFleetReadSuccess(now)
+		if alert {
+			log.Printf("droplet pool: CRITICAL fleet reconciliation intermittently degraded for %s across %d failed ticks; current fleet read is fresh but incident remains open",
+				outageDuration.Truncate(time.Second), failures)
+		}
+		if recovered {
+			log.Printf("droplet pool: fleet reconciliation stable for %s; incident recovered after %s and %d failed ticks",
+				fleetReadRecoveryDwell, outageDuration.Truncate(time.Second), failures)
+		}
 	}
 
 	// Refresh per-droplet idle tracking before deciding.
@@ -186,6 +223,52 @@ func (c *Controller) tick(ctx context.Context) error {
 	return nil
 }
 
+// noteFleetReadFailure latches one provider-read incident across ticks. It
+// returns true exactly once when the incident crosses the sustained threshold,
+// keeping the ordinary per-tick error useful without emitting CRITICAL noise on
+// every subsequent tick.
+func (c *Controller) noteFleetReadFailure(now time.Time) bool {
+	if c.fleetReadFailureSince.IsZero() {
+		c.fleetReadFailureSince = now
+	}
+	c.fleetReadLastFailure = now
+	c.fleetReadSuccessSince = time.Time{}
+	c.fleetReadFailures++
+	if c.fleetReadAlerted || now.Sub(c.fleetReadFailureSince) < fleetReadSustainedFailureThreshold {
+		return false
+	}
+	c.fleetReadAlerted = true
+	return true
+}
+
+// noteFleetReadSuccess keeps an intermittent incident open until a full healthy
+// dwell has elapsed since its latest failure. alert is true exactly once if the
+// incident crosses the sustained threshold on a successful tick between
+// failures; recovered becomes true only after the healthy dwell.
+func (c *Controller) noteFleetReadSuccess(now time.Time) (alert bool, duration time.Duration, failures int, recovered bool) {
+	if c.fleetReadFailureSince.IsZero() {
+		return false, 0, 0, false
+	}
+	duration = now.Sub(c.fleetReadFailureSince)
+	failures = c.fleetReadFailures
+	if c.fleetReadSuccessSince.IsZero() {
+		c.fleetReadSuccessSince = now
+	}
+	if !c.fleetReadAlerted && duration >= fleetReadSustainedFailureThreshold && failures >= 2 {
+		c.fleetReadAlerted = true
+		alert = true
+	}
+	if now.Sub(c.fleetReadSuccessSince) >= fleetReadRecoveryDwell {
+		c.fleetReadFailureSince = time.Time{}
+		c.fleetReadLastFailure = time.Time{}
+		c.fleetReadSuccessSince = time.Time{}
+		c.fleetReadFailures = 0
+		c.fleetReadAlerted = false
+		return alert, duration, failures, true
+	}
+	return alert, duration, failures, false
+}
+
 // poolPool exposes the underlying pgx pool for the forecast query.
 func (c *Controller) poolPool() *pgxpool.Pool {
 	return c.store.pool
@@ -196,7 +279,7 @@ func (c *Controller) poolPool() *pgxpool.Pool {
 func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 	fleet, err := c.do.ListDropletsByName(ctx, c.cfg.ProjectID, NamePrefix)
 	if err != nil {
-		return fmt.Errorf("list DO fleet: %w", err)
+		return fmt.Errorf("%w: list DO fleet: %w", errFleetRead, err)
 	}
 	liveRows, err := c.store.ListByStates(ctx, "provisioning", "active", "draining", "destroying")
 	if err != nil {

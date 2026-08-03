@@ -13,7 +13,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log"
+	mathrand "math/rand/v2"
 	"strconv"
 	"strings"
 	"text/template"
@@ -35,6 +38,8 @@ var dropletTags = []string{
 	"env:prod",
 }
 
+const doFleetReadAttempts = 3
+
 // CreateDropletInput is the provider-agnostic create request the controller
 // hands to the DO client. The node token is injected via cloud-init user_data;
 // it is never logged or stored in plaintext.
@@ -42,8 +47,8 @@ type CreateDropletInput struct {
 	Name       string
 	Region     string
 	Size       string
-	Image      string   // snapshot id (numeric) or image slug
-	SSHKey     string   // optional fingerprint or numeric id; comma-separated adds multiple keys
+	Image      string // snapshot id (numeric) or image slug
+	SSHKey     string // optional fingerprint or numeric id; comma-separated adds multiple keys
 	UserData   string
 	ProjectID  string
 	FirewallID string
@@ -168,7 +173,7 @@ func (g *godoClient) ListDropletsByName(ctx context.Context, projectID, prefix s
 	out := make([]DODroplet, 0, 16)
 	opt := &godo.ListOptions{Page: 1, PerPage: 200}
 	for {
-		droplets, resp, err := g.c.Droplets.List(ctx, opt)
+		droplets, resp, err := listDropletsPageWithRetry(ctx, g.c, opt, time.Second)
 		if err != nil {
 			return nil, fmt.Errorf("list droplets: %w", err)
 		}
@@ -190,6 +195,58 @@ func (g *godoClient) ListDropletsByName(ctx context.Context, projectID, prefix s
 		opt.Page = page + 1
 	}
 	return out, nil
+}
+
+// listDropletsPageWithRetry narrowly absorbs the intermittent DigitalOcean
+// edge rejection observed from Render on 2026-08-03: a 401 whose provider body
+// is exactly "mTLS verification failed" even though the same bearer token
+// succeeds immediately before and after. Godo already retries 429 and 5xx, but
+// intentionally does not retry 401. This helper retries only that known
+// read-only failure; it never broadens retries for create/delete operations or
+// ordinary authentication failures. A final error remains fail-closed: the
+// controller performs no scale or orphan decision without fresh fleet truth.
+func listDropletsPageWithRetry(ctx context.Context, client *godo.Client, opt *godo.ListOptions, retryDelay time.Duration) ([]godo.Droplet, *godo.Response, error) {
+	for attempt := 1; ; attempt++ {
+		droplets, resp, err := client.Droplets.List(ctx, opt)
+		if err == nil || attempt >= doFleetReadAttempts || !isTransientDOMTLSEdgeError(err) {
+			return droplets, resp, err
+		}
+		requestID := ""
+		var providerErr *godo.ErrorResponse
+		if errors.As(err, &providerErr) {
+			requestID = providerErr.RequestID
+		}
+		log.Printf("droplet pool: transient DigitalOcean edge auth failure request_id=%q attempt=%d/%d; retrying fleet read",
+			requestID, attempt, doFleetReadAttempts)
+		timer := time.NewTimer(jitteredDOReadRetryDelay(retryDelay, attempt))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, resp, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func jitteredDOReadRetryDelay(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	ceiling := base * time.Duration(max(1, attempt))
+	// Spread simultaneous controllers/maintenance calls across the latter half
+	// of the bounded delay without ever exceeding it.
+	span := int64(ceiling - ceiling/2)
+	if span < 1 {
+		span = 1
+	}
+	return ceiling/2 + time.Duration(mathrand.Int64N(span))
+}
+
+func isTransientDOMTLSEdgeError(err error) bool {
+	var providerErr *godo.ErrorResponse
+	return errors.As(err, &providerErr) &&
+		providerErr.Response != nil && providerErr.Response.StatusCode == 401 &&
+		strings.EqualFold(strings.TrimSpace(providerErr.Message), "mTLS verification failed")
 }
 
 // parseImage interprets the image config as a numeric snapshot id when it parses

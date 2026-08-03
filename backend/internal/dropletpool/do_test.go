@@ -1,9 +1,264 @@
 package dropletpool
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/digitalocean/godo"
 )
+
+func TestListDropletsPageRetriesOnlyTransientMTLSEdgeFailure(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := calls.Add(1)
+		if attempt < doFleetReadAttempts {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprintf(w, `{"message":"mTLS verification failed","request_id":"edge-%d"}`, attempt)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"droplets":[{"id":42,"name":"stoarama-rec-42","status":"active"}],"links":{},"meta":{}}`)
+	}))
+	defer server.Close()
+
+	client := godo.NewClient(server.Client())
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.BaseURL = baseURL
+	droplets, _, err := listDropletsPageWithRetry(context.Background(), client, &godo.ListOptions{PerPage: 200}, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != doFleetReadAttempts || len(droplets) != 1 || droplets[0].ID != 42 {
+		t.Fatalf("calls=%d droplets=%+v want recovery on attempt %d", calls.Load(), droplets, doFleetReadAttempts)
+	}
+}
+
+func TestListDropletsPageDoesNotRetryOrdinaryUnauthorized(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprint(w, `{"message":"Unable to authenticate you","request_id":"auth-1"}`)
+	}))
+	defer server.Close()
+
+	client := godo.NewClient(server.Client())
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.BaseURL = baseURL
+	_, _, err = listDropletsPageWithRetry(context.Background(), client, &godo.ListOptions{}, time.Millisecond)
+	if err == nil || calls.Load() != 1 {
+		t.Fatalf("error=%v calls=%d want ordinary 401 fail closed without retry", err, calls.Load())
+	}
+}
+
+func TestListDropletsPageExhaustsTransientMTLSEdgeRetries(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprint(w, `{"message":"mTLS verification failed","request_id":"edge-final"}`)
+	}))
+	defer server.Close()
+
+	client := godo.NewClient(server.Client())
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.BaseURL = baseURL
+	_, _, err = listDropletsPageWithRetry(context.Background(), client, &godo.ListOptions{}, time.Millisecond)
+	if err == nil || calls.Load() != doFleetReadAttempts {
+		t.Fatalf("error=%v calls=%d want exact transient exhaustion after %d attempts", err, calls.Load(), doFleetReadAttempts)
+	}
+}
+
+func TestListDropletsPageDoesNotRetryMTLSMessageOnOtherStatus(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprint(w, `{"message":"mTLS verification failed","request_id":"not-401"}`)
+	}))
+	defer server.Close()
+
+	client := godo.NewClient(server.Client())
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.BaseURL = baseURL
+	_, _, err = listDropletsPageWithRetry(context.Background(), client, &godo.ListOptions{}, time.Millisecond)
+	if err == nil || calls.Load() != 1 {
+		t.Fatalf("error=%v calls=%d want non-401 fail closed without retry", err, calls.Load())
+	}
+}
+
+func TestJitteredDOReadRetryDelayIsBounded(t *testing.T) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		ceiling := time.Second * time.Duration(attempt)
+		for range 100 {
+			got := jitteredDOReadRetryDelay(time.Second, attempt)
+			if got < ceiling/2 || got > ceiling {
+				t.Fatalf("attempt=%d delay=%s want [%s,%s]", attempt, got, ceiling/2, ceiling)
+			}
+		}
+	}
+}
+
+func TestFleetReadIncidentLatchesOnceAndRecovers(t *testing.T) {
+	controller := &Controller{}
+	started := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
+	if controller.noteFleetReadFailure(started) {
+		t.Fatal("first fleet-read failure alerted before sustained threshold")
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(time.Minute)); alert || recovered {
+		t.Fatal("one successful tick cleared or alerted an intermittent incident")
+	}
+	if controller.noteFleetReadFailure(started.Add(2 * time.Minute)) {
+		t.Fatal("second intermittent failure alerted early")
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(3 * time.Minute)); alert || recovered {
+		t.Fatal("intermediate success cleared incident before healthy dwell")
+	}
+	if controller.noteFleetReadFailure(started.Add(4 * time.Minute)) {
+		t.Fatal("third intermittent failure alerted before span threshold")
+	}
+	alert, duration, failures, recovered := controller.noteFleetReadSuccess(started.Add(5 * time.Minute))
+	if !alert || recovered || duration != 5*time.Minute || failures != 3 {
+		t.Fatalf("threshold success alert=%t duration=%s failures=%d recovered=%t", alert, duration, failures, recovered)
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(8 * time.Minute)); alert || recovered {
+		t.Fatal("incident duplicated alert or recovered before healthy dwell")
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(9 * time.Minute)); alert || recovered {
+		t.Fatal("incident recovered before five continuous healthy minutes")
+	}
+	alert, duration, failures, recovered = controller.noteFleetReadSuccess(started.Add(10 * time.Minute))
+	if alert || !recovered || duration != 10*time.Minute || failures != 3 {
+		t.Fatalf("recovery alert=%t duration=%s failures=%d recovered=%t", alert, duration, failures, recovered)
+	}
+	if _, _, _, recovered := controller.noteFleetReadSuccess(started.Add(11 * time.Minute)); recovered {
+		t.Fatal("fleet-read recovery emitted twice")
+	}
+	if controller.noteFleetReadFailure(started.Add(12 * time.Minute)) {
+		t.Fatal("fresh incident inherited prior alert state")
+	}
+}
+
+func TestFleetReadIncidentRequiresContinuousSuccessfulDwell(t *testing.T) {
+	controller := &Controller{}
+	started := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
+	controller.noteFleetReadFailure(started)
+
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(10 * time.Minute)); alert || recovered {
+		t.Fatal("a single delayed success recovered the incident")
+	}
+	if !controller.noteFleetReadFailure(started.Add(12 * time.Minute)) {
+		t.Fatal("sustained interrupted incident did not alert")
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(17 * time.Minute)); alert || recovered {
+		t.Fatal("first success after interruption recovered immediately or duplicated alert")
+	}
+	if alert, _, _, recovered := controller.noteFleetReadSuccess(started.Add(21*time.Minute + 59*time.Second)); alert || recovered {
+		t.Fatal("incident recovered before restarted healthy dwell completed")
+	}
+	if alert, _, failures, recovered := controller.noteFleetReadSuccess(started.Add(22 * time.Minute)); alert || !recovered || failures != 2 {
+		t.Fatalf("recovery alert=%t failures=%d recovered=%t", alert, failures, recovered)
+	}
+}
+
+func TestFleetReadIncidentAlertsBeforeSameTickRecovery(t *testing.T) {
+	controller := &Controller{}
+	started := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
+	controller.noteFleetReadFailure(started)
+	controller.noteFleetReadFailure(started.Add(time.Minute))
+	controller.noteFleetReadSuccess(started.Add(2 * time.Minute))
+
+	alert, duration, failures, recovered := controller.noteFleetReadSuccess(started.Add(7 * time.Minute))
+	if !alert || !recovered || duration != 7*time.Minute || failures != 2 {
+		t.Fatalf("alert=%t duration=%s failures=%d recovered=%t", alert, duration, failures, recovered)
+	}
+}
+
+type failingFleetDO struct {
+	lists   atomic.Int64
+	creates atomic.Int64
+	deletes atomic.Int64
+	listErr error
+}
+
+func (f *failingFleetDO) ListDropletsByName(context.Context, string, string) ([]DODroplet, error) {
+	f.lists.Add(1)
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return nil, errors.New("provider fleet unavailable")
+}
+
+func TestReconcileClassifiesOnlyProviderFleetReadFailure(t *testing.T) {
+	providerErr := errors.New("provider fleet unavailable")
+	controller := &Controller{do: &failingFleetDO{listErr: providerErr}}
+	err := controller.reconcile(context.Background(), time.Now())
+	if !errors.Is(err, errFleetRead) || !errors.Is(err, providerErr) {
+		t.Fatalf("reconcile error=%v want fleet-read marker and provider cause", err)
+	}
+	storeErr := errors.New("store unavailable")
+	if errors.Is(storeErr, errFleetRead) {
+		t.Fatal("unmarked store error classified as fleet-read failure")
+	}
+}
+
+func TestControllerTickPropagatesCancellationWithoutDegradationLatch(t *testing.T) {
+	provider := &failingFleetDO{listErr: fmt.Errorf("list interrupted: %w", context.Canceled)}
+	controller := &Controller{do: provider}
+	err := controller.tick(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("tick error=%v want wrapped cancellation", err)
+	}
+	if controller.fleetReadFailures != 0 || !controller.fleetReadFailureSince.IsZero() {
+		t.Fatalf("cancellation latched as outage: failures=%d since=%s", controller.fleetReadFailures, controller.fleetReadFailureSince)
+	}
+}
+
+func (f *failingFleetDO) CreateDroplet(context.Context, CreateDropletInput) (DODroplet, error) {
+	f.creates.Add(1)
+	return DODroplet{}, nil
+}
+
+func (f *failingFleetDO) DeleteDroplet(context.Context, int64) error {
+	f.deletes.Add(1)
+	return nil
+}
+
+func TestControllerTickMakesNoProviderMutationWithoutFreshFleet(t *testing.T) {
+	provider := &failingFleetDO{}
+	controller := &Controller{do: provider}
+	if err := controller.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.lists.Load() != 1 || provider.creates.Load() != 0 || provider.deletes.Load() != 0 {
+		t.Fatalf("lists=%d creates=%d deletes=%d want one read and zero mutations",
+			provider.lists.Load(), provider.creates.Load(), provider.deletes.Load())
+	}
+}
 
 func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 	out, err := BuildUserData(UserDataConfig{
