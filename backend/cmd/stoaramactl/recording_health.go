@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -114,6 +117,11 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
+	releaseRunLock, err := acquireRecordingHealthRunLock(ctx, pool)
+	if err != nil {
+		log.Fatalf("acquire recording health run lock: %v", err)
+	}
+	defer releaseRunLock()
 
 	incidents := detectRecordingHealthIncidents(ctx, pool, *freshnessMin)
 	if *verifyMedia {
@@ -139,26 +147,33 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		return
 	}
 
-	// runStart anchors the notify predicate: the UPSERT sets last_alerted_at to
-	// the DB now() (which is >= runStart) exactly when this cycle should notify.
-	runStart := time.Now()
+	now := time.Now()
 	toNotify := make([]healthIncident, 0, len(incidents))
 	for _, inc := range incidents {
 		newlyInserted, lastAlertedAt, err := upsertHealthAlert(ctx, pool, inc.RecordingID, inc.Signal)
 		if err != nil {
 			log.Fatalf("upsert health alert recording=%d signal=%s: %v", inc.RecordingID, inc.Signal, err)
 		}
-		if shouldNotifyHealthIncident(newlyInserted, lastAlertedAt, runStart) {
+		if shouldNotifyHealthIncident(newlyInserted, lastAlertedAt, now) {
 			toNotify = append(toNotify, inc)
 		}
 	}
-	if err := resolveClearedHealthAlerts(ctx, pool, incidents); err != nil {
+	if err := resolveClearedHealthAlerts(ctx, pool, incidents, evaluatedHealthSignals(*verifyMedia)); err != nil {
 		log.Fatalf("resolve cleared health alerts: %v", err)
 	}
 
 	emailed := 0
 	if len(toNotify) > 0 {
-		emailed = deliverRecordingHealthEmail(ctx, pool, cfg, toNotify)
+		var err error
+		emailed, err = deliverRecordingHealthEmail(ctx, pool, cfg, toNotify)
+		if err != nil {
+			// last_alerted_at is deliberately unchanged until delivery succeeds,
+			// so the next cron retries instead of suppressing this alert for 24h.
+			log.Fatalf("deliver recording health alerts: %v", err)
+		}
+		if err := markHealthAlertsDelivered(ctx, pool, toNotify); err != nil {
+			log.Fatalf("mark recording health alerts delivered: %v", err)
+		}
 	}
 
 	printJSON(map[string]any{
@@ -170,29 +185,62 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	})
 }
 
-// shouldNotifyHealthIncident decides whether an incident warrants an email this
-// cycle: it is newly inserted, or its last_alerted_at was (re)stamped to the DB
-// now() this run (which is at-or-after runStart) because it had resolved or aged
-// past the 24h re-notify threshold. A stale last_alerted_at (before runStart)
-// means an active, already-notified incident that must stay quiet.
-func shouldNotifyHealthIncident(newlyInserted bool, lastAlertedAt, runStart time.Time) bool {
-	return newlyInserted || !lastAlertedAt.Before(runStart)
+const recordingHealthAdvisoryLock int64 = 0x53544f4152414d41
+
+// acquireRecordingHealthRunLock serializes hourly, daily-media, and manual
+// sweeps. PostgreSQL owns the session lock, so process death releases it and a
+// waiting run can safely retry detection without a stale external lease.
+func acquireRecordingHealthRunLock(ctx context.Context, pool *pgxpool.Pool) (func(), error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, recordingHealthAdvisoryLock); err != nil {
+		conn.Release()
+		return nil, err
+	}
+	return func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, recordingHealthAdvisoryLock)
+		conn.Release()
+	}, nil
+}
+
+// shouldNotifyHealthIncident decides whether an incident warrants an email.
+// last_alerted_at means successfully delivered, never merely attempted.
+func shouldNotifyHealthIncident(newlyInserted bool, lastAlertedAt, now time.Time) bool {
+	return newlyInserted || lastAlertedAt.Before(now.Add(-24*time.Hour))
 }
 
 func upsertHealthAlert(ctx context.Context, pool *pgxpool.Pool, recordingID int64, signal string) (bool, time.Time, error) {
 	var newlyInserted bool
 	var lastAlertedAt time.Time
 	err := pool.QueryRow(ctx, `
-		INSERT INTO recorder_health_alerts (recording_id, signal) VALUES ($1,$2)
+		INSERT INTO recorder_health_alerts (recording_id, signal, last_alerted_at)
+		VALUES ($1,$2,'1970-01-01 00:00:00+00'::timestamptz)
 		ON CONFLICT (recording_id,signal) DO UPDATE
-		  SET last_alerted_at = CASE WHEN recorder_health_alerts.resolved_at IS NOT NULL OR recorder_health_alerts.last_alerted_at < now()-interval '24 hours' THEN now() ELSE recorder_health_alerts.last_alerted_at END,
+		  SET last_alerted_at = CASE WHEN recorder_health_alerts.resolved_at IS NOT NULL THEN '1970-01-01 00:00:00+00'::timestamptz ELSE recorder_health_alerts.last_alerted_at END,
 		      resolved_at = NULL
 		RETURNING (xmax=0) AS newly_inserted, last_alerted_at
 	`, recordingID, signal).Scan(&newlyInserted, &lastAlertedAt)
 	return newlyInserted, lastAlertedAt, err
 }
 
-func resolveClearedHealthAlerts(ctx context.Context, pool *pgxpool.Pool, incidents []healthIncident) error {
+func markHealthAlertsDelivered(ctx context.Context, pool *pgxpool.Pool, incidents []healthIncident) error {
+	recIDs := make([]int64, 0, len(incidents))
+	signals := make([]string, 0, len(incidents))
+	for _, inc := range incidents {
+		recIDs = append(recIDs, inc.RecordingID)
+		signals = append(signals, inc.Signal)
+	}
+	_, err := pool.Exec(ctx, `
+		UPDATE recorder_health_alerts a SET last_alerted_at=now()
+		FROM unnest($1::bigint[], $2::text[]) AS delivered(recording_id, signal)
+		WHERE a.recording_id=delivered.recording_id AND a.signal=delivered.signal
+	`, recIDs, signals)
+	return err
+}
+
+func resolveClearedHealthAlerts(ctx context.Context, pool *pgxpool.Pool, incidents []healthIncident, evaluatedSignals []string) error {
 	recIDs := make([]int64, 0, len(incidents))
 	signals := make([]string, 0, len(incidents))
 	for _, inc := range incidents {
@@ -202,28 +250,41 @@ func resolveClearedHealthAlerts(ctx context.Context, pool *pgxpool.Pool, inciden
 	_, err := pool.Exec(ctx, `
 		UPDATE recorder_health_alerts a SET resolved_at=now()
 		WHERE a.resolved_at IS NULL
+		  AND a.signal=ANY($3::text[])
 		  AND NOT EXISTS (
 		    SELECT 1 FROM unnest($1::bigint[], $2::text[]) AS d(recording_id, signal)
 		    WHERE d.recording_id = a.recording_id AND d.signal = a.signal
 		  )
-	`, recIDs, signals)
+	`, recIDs, signals, evaluatedSignals)
 	return err
+}
+
+func evaluatedHealthSignals(verifyMedia bool) []string {
+	signals := []string{
+		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
+		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
+		signalClipTimestampDrift, signalContinuousCoverageLow,
+		signalContinuousOverlap, signalContinuousLongGap, signalContinuousFragmented,
+	}
+	if verifyMedia {
+		signals = append(signals, signalStoredClipInvalid)
+	}
+	return signals
 }
 
 // deliverRecordingHealthEmail sends one summary email per operator recipient. If
 // email is not configured (provider != resend) it loudly logs that N incidents
 // went un-emailed rather than silently succeeding. Returns the number of Send
-// calls made.
-func deliverRecordingHealthEmail(ctx context.Context, pool *pgxpool.Pool, cfg config.Config, incidents []healthIncident) int {
+// calls made. Any zero-delivery condition is an error so the caller leaves
+// last_alerted_at untouched and the next cron retries.
+func deliverRecordingHealthEmail(ctx context.Context, pool *pgxpool.Pool, cfg config.Config, incidents []healthIncident) (int, error) {
 	if strings.ToLower(strings.TrimSpace(cfg.EmailProvider)) != "resend" {
-		log.Printf("recording-health: EMAIL_PROVIDER=%q is not resend; email not sent for %d recording health incident(s) (dedup/resolve bookkeeping still applied)", cfg.EmailProvider, len(incidents))
-		return 0
+		return 0, fmt.Errorf("EMAIL_PROVIDER=%q is not resend; %d incident(s) not delivered", cfg.EmailProvider, len(incidents))
 	}
 
 	recipients := operatorRecipients(ctx, pool)
 	if len(recipients) == 0 {
-		log.Printf("recording-health: no operator recipients (users.is_operator=true); %d incident(s) not emailed", len(incidents))
-		return 0
+		return 0, fmt.Errorf("no operator recipients; %d incident(s) not delivered", len(incidents))
 	}
 
 	mailer, err := email.NewSender(email.Config{
@@ -233,7 +294,7 @@ func deliverRecordingHealthEmail(ctx context.Context, pool *pgxpool.Pool, cfg co
 		ResendKey: cfg.EmailResendAPIKey,
 	})
 	if err != nil {
-		log.Fatalf("init email sender: %v", err)
+		return 0, fmt.Errorf("init email sender: %w", err)
 	}
 
 	subject := composeHealthEmailSubject(incidents)
@@ -246,11 +307,11 @@ func deliverRecordingHealthEmail(ctx context.Context, pool *pgxpool.Pool, cfg co
 			PlainText:   body,
 			MessageType: "recording_health_alert",
 		}); err != nil {
-			log.Fatalf("send recording health alert to %s: %v", addr, err)
+			return sent, fmt.Errorf("send recording health alert to %s: %w", addr, err)
 		}
 		sent++
 	}
-	return sent
+	return sent, nil
 }
 
 func operatorRecipients(ctx context.Context, pool *pgxpool.Pool) []string {
@@ -471,54 +532,84 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 	sort.Slice(intervals, func(i, j int) bool { return intervals[i][0].Before(intervals[j][0]) })
 	m := stitchWindowMetrics{}
 	var covered time.Duration
+	var unionStart, unionEnd time.Time
 	var runStart, runEnd time.Time
 	if len(intervals) > 0 {
 		m.maxGap = intervals[0][0].Sub(open)
 	}
 	for _, iv := range intervals {
-		if runEnd.IsZero() {
+		if unionEnd.IsZero() {
+			unionStart, unionEnd = iv[0], iv[1]
 			runStart, runEnd = iv[0], iv[1]
 			continue
 		}
-		if iv[0].Before(runEnd.Add(-joinTolerance)) {
+		// Coverage and overlaps are exact. Tolerance is used only to decide
+		// whether a tiny seam should split the operational "longest run".
+		if iv[0].Before(unionEnd) {
 			m.overlapClips++
 			overlapEnd := iv[1]
-			if overlapEnd.After(runEnd) {
-				overlapEnd = runEnd
+			if overlapEnd.After(unionEnd) {
+				overlapEnd = unionEnd
 			}
 			m.overlapSeconds += overlapEnd.Sub(iv[0]).Seconds()
+		}
+		if !iv[0].After(unionEnd) {
+			if iv[1].After(unionEnd) {
+				unionEnd = iv[1]
+			}
+		} else {
+			covered += unionEnd.Sub(unionStart)
+			if gap := iv[0].Sub(unionEnd); gap > m.maxGap {
+				m.maxGap = gap
+			}
+			unionStart, unionEnd = iv[0], iv[1]
 		}
 		if !iv[0].After(runEnd.Add(joinTolerance)) {
 			if iv[1].After(runEnd) {
 				runEnd = iv[1]
 			}
-			continue
+		} else {
+			if run := runEnd.Sub(runStart); run > m.longestRun {
+				m.longestRun = run
+			}
+			m.gapClips++
+			runStart, runEnd = iv[0], iv[1]
 		}
-		run := runEnd.Sub(runStart)
-		covered += run
-		if run > m.longestRun {
-			m.longestRun = run
+	}
+	if !unionEnd.IsZero() {
+		covered += unionEnd.Sub(unionStart)
+		if trail := close.Sub(unionEnd); trail > m.maxGap {
+			m.maxGap = trail
 		}
-		if gap := iv[0].Sub(runEnd); gap > m.maxGap {
-			m.maxGap = gap
-		}
-		m.gapClips++
-		runStart, runEnd = iv[0], iv[1]
 	}
 	if !runEnd.IsZero() {
 		run := runEnd.Sub(runStart)
-		covered += run
 		if run > m.longestRun {
 			m.longestRun = run
-		}
-		if trail := close.Sub(runEnd); trail > m.maxGap {
-			m.maxGap = trail
 		}
 	}
 	if expected := close.Sub(open); expected > 0 {
 		m.coveragePct = 100 * float64(covered) / float64(expected)
 	}
 	return m
+}
+
+const (
+	mediaHealthRecordingTimeout = 5 * time.Minute
+	mediaHealthDiagnosticLimit  = 4096
+)
+
+type storedClipObject struct {
+	clipID, expectedSize, destinationID                    int64
+	objectKey, sha256, endpoint, region, bucket, accessKey string
+	secretEnc                                              []byte
+}
+
+type storedClipCandidate struct {
+	recordingID, streamID, accountID      int64
+	recName, streamURL, orgName, orgEmail string
+	latest                                storedClipObject
+	previous                              *storedClipObject
 }
 
 // detectLatestStoredClipHealth verifies one recent object per active recording.
@@ -529,110 +620,150 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 func detectLatestStoredClipHealth(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) []healthIncident {
 	cipher := mustBuildStorageCipher(cfg)
 	rows, err := pool.Query(ctx, `
-		SELECT DISTINCT ON (r.id)
+		SELECT
 		  r.id,COALESCE(r.stream_id,0),r.account_id,r.name,r.stream_url,
-		  acc.name,acc.email,c.id,c.object_key,c.size_bytes,
+		  acc.name,acc.email,c.id,c.object_key,c.size_bytes,COALESCE(c.sha256,''),
 		  sd.id,sd.endpoint,sd.region,sd.bucket,sd.access_key_id,sd.secret_access_key_enc,
-		  prev.id,prev.object_key,prev.size_bytes,
+		  prev.id,prev.object_key,prev.size_bytes,prev.sha256,
 		  psd.id,psd.endpoint,psd.region,psd.bucket,psd.access_key_id,psd.secret_access_key_enc
 		FROM recordings r
 		JOIN accounts acc ON acc.id=r.account_id
-		JOIN recording_clips c ON c.recording_id=r.id AND c.purged_at IS NULL
-		JOIN storage_destinations sd ON sd.id=c.storage_destination_id
+		JOIN account_billing b ON b.account_id=r.account_id AND b.has_payment_method=true
 		JOIN LATERAL (
-		  SELECT p.id,p.object_key,p.size_bytes,p.storage_destination_id
+		  SELECT c.* FROM recording_clips c
+		  WHERE c.recording_id=r.id AND c.purged_at IS NULL AND c.released_at IS NULL
+		    AND c.created_at>=now()-interval '24 hours'
+		  ORDER BY c.clip_start_at DESC,c.id DESC LIMIT 1
+		) c ON true
+		JOIN storage_destinations sd ON sd.id=c.storage_destination_id
+		LEFT JOIN LATERAL (
+		  SELECT p.id,p.object_key,p.size_bytes,COALESCE(p.sha256,'') AS sha256,p.storage_destination_id
 		  FROM recording_clips p
-		  WHERE p.recording_id=r.id AND p.purged_at IS NULL AND p.id<>c.id
-		    AND (p.created_at,p.id)<(c.created_at,c.id)
-		  ORDER BY p.created_at DESC,p.id DESC LIMIT 1
+		  WHERE p.recording_id=r.id AND p.purged_at IS NULL AND p.released_at IS NULL AND p.id<>c.id
+		    AND (
+		      (c.capture_lease_token IS NOT NULL AND c.capture_sequence IS NOT NULL
+		       AND p.capture_lease_token=c.capture_lease_token AND p.capture_sequence<c.capture_sequence)
+		      OR
+		      ((c.capture_lease_token IS NULL OR c.capture_sequence IS NULL
+		        OR p.capture_lease_token IS DISTINCT FROM c.capture_lease_token)
+		       AND (p.clip_start_at,p.id)<(c.clip_start_at,c.id))
+		    )
+		  ORDER BY (p.capture_lease_token=c.capture_lease_token AND p.capture_sequence IS NOT NULL) DESC,
+		           CASE WHEN p.capture_lease_token=c.capture_lease_token THEN p.capture_sequence END DESC NULLS LAST,
+		           p.clip_start_at DESC,p.id DESC LIMIT 1
 		) prev ON true
-		JOIN storage_destinations psd ON psd.id=prev.storage_destination_id
-		WHERE r.status='active' AND c.created_at>=now()-interval '24 hours'
-		ORDER BY r.id,c.created_at DESC,c.id DESC
+		LEFT JOIN storage_destinations psd ON psd.id=prev.storage_destination_id
+		WHERE r.status='active' AND now()>=r.start_at AND now()<COALESCE(r.end_at,'infinity'::timestamptz)
+		ORDER BY r.id
 	`)
 	if err != nil {
 		log.Fatalf("signal stored_clip_invalid: %v", err)
 	}
-	defer rows.Close()
-	out := []healthIncident{}
+	candidates := []storedClipCandidate{}
 	for rows.Next() {
-		var recID, streamID, accountID, clipID, expectedSize, destinationID int64
-		var prevClipID, prevExpectedSize, prevDestinationID int64
-		var recName, streamURL, orgName, orgEmail, objectKey string
-		var endpoint, region, bucket, accessKey string
-		var secretEnc []byte
-		var prevObjectKey, prevEndpoint, prevRegion, prevBucket, prevAccessKey string
-		var prevSecretEnc []byte
-		if err := rows.Scan(&recID, &streamID, &accountID, &recName, &streamURL,
-			&orgName, &orgEmail, &clipID, &objectKey, &expectedSize,
-			&destinationID, &endpoint, &region, &bucket, &accessKey, &secretEnc,
-			&prevClipID, &prevObjectKey, &prevExpectedSize,
-			&prevDestinationID, &prevEndpoint, &prevRegion, &prevBucket, &prevAccessKey, &prevSecretEnc); err != nil {
+		var c storedClipCandidate
+		var prevID, prevSize, prevDestID *int64
+		var prevKey, prevSHA, prevEndpoint, prevRegion, prevBucket, prevAccessKey *string
+		var prevSecret []byte
+		if err := rows.Scan(&c.recordingID, &c.streamID, &c.accountID, &c.recName, &c.streamURL,
+			&c.orgName, &c.orgEmail, &c.latest.clipID, &c.latest.objectKey, &c.latest.expectedSize, &c.latest.sha256,
+			&c.latest.destinationID, &c.latest.endpoint, &c.latest.region, &c.latest.bucket, &c.latest.accessKey, &c.latest.secretEnc,
+			&prevID, &prevKey, &prevSize, &prevSHA,
+			&prevDestID, &prevEndpoint, &prevRegion, &prevBucket, &prevAccessKey, &prevSecret); err != nil {
 			log.Fatalf("scan stored_clip_invalid: %v", err)
 		}
+		if prevID != nil {
+			c.previous = &storedClipObject{clipID: *prevID, expectedSize: *prevSize, destinationID: *prevDestID,
+				objectKey: *prevKey, sha256: *prevSHA, endpoint: *prevEndpoint, region: *prevRegion,
+				bucket: *prevBucket, accessKey: *prevAccessKey, secretEnc: prevSecret}
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("iterate stored_clip_invalid: %v", err)
+	}
+	rows.Close()
+
+	out := []healthIncident{}
+	for _, candidate := range candidates {
+		candidateCtx, cancel := context.WithTimeout(ctx, mediaHealthRecordingTimeout)
+		recID, streamID, accountID := candidate.recordingID, candidate.streamID, candidate.accountID
+		recName, streamURL, orgName, orgEmail := candidate.recName, candidate.streamURL, candidate.orgName, candidate.orgEmail
+		latest := candidate.latest
 		base := healthIncident{
 			RecordingID: recID, StreamID: streamID, AccountID: accountID,
 			OrgName: orgName, OrgEmail: orgEmail, RecName: recName, StreamURL: streamURL,
 			Signal: signalStoredClipInvalid, Severity: healthSignalSeverity[signalStoredClipInvalid],
-			SinceText: fmt.Sprintf("latest clip id=%d", clipID),
+			SinceText: fmt.Sprintf("latest clip id=%d", latest.clipID),
 		}
 		problemFor := func(stage string, failedClipID, failedDestinationID int64, verifyErr error) {
 			inc := base
-			inc.Diag = diagText("stage", stage, "clip_id", fmt.Sprint(failedClipID), "destination_id", fmt.Sprint(failedDestinationID), "error", verifyErr.Error())
+			inc.Diag = diagText("stage", stage, "clip_id", fmt.Sprint(failedClipID), "destination_id", fmt.Sprint(failedDestinationID), "error", boundedHealthDiagnostic(verifyErr.Error()))
 			out = append(out, inc)
 		}
-		problem := func(stage string, verifyErr error) { problemFor(stage, clipID, destinationID, verifyErr) }
+		problem := func(stage string, verifyErr error) { problemFor(stage, latest.clipID, latest.destinationID, verifyErr) }
 		if cipher == nil {
 			problem("configuration", fmt.Errorf("STORAGE_CRED_KEY is unset"))
+			cancel()
 			continue
 		}
-		secret, err := cipher.Decrypt(secretEnc)
+		secret, err := cipher.Decrypt(latest.secretEnc)
 		if err != nil {
 			problem("decrypt_destination", err)
+			cancel()
 			continue
 		}
-		client, err := r2.New(ctx, r2.Config{AccessKey: accessKey, SecretKey: string(secret), Region: region, Bucket: bucket, Endpoint: endpoint})
+		client, err := r2.New(candidateCtx, r2.Config{AccessKey: latest.accessKey, SecretKey: string(secret), Region: latest.region, Bucket: latest.bucket, Endpoint: latest.endpoint})
 		if err != nil {
 			problem("storage_client", err)
+			cancel()
 			continue
 		}
-		latestPath, err := downloadAndProbeStoredClip(ctx, client, objectKey, expectedSize)
+		latestPath, err := downloadAndProbeStoredClip(candidateCtx, client, latest.objectKey, latest.expectedSize, latest.sha256)
 		if err != nil {
 			problem("latest_clip", err)
+			cancel()
 			continue
 		}
-		prevSecret, err := cipher.Decrypt(prevSecretEnc)
+		if candidate.previous == nil {
+			_ = os.Remove(latestPath)
+			cancel()
+			continue
+		}
+		previous := *candidate.previous
+		prevSecret, err := cipher.Decrypt(previous.secretEnc)
 		if err != nil {
 			_ = os.Remove(latestPath)
-			problemFor("decrypt_predecessor_destination", prevClipID, prevDestinationID, err)
+			problemFor("decrypt_predecessor_destination", previous.clipID, previous.destinationID, err)
+			cancel()
 			continue
 		}
-		prevClient, err := r2.New(ctx, r2.Config{AccessKey: prevAccessKey, SecretKey: string(prevSecret), Region: prevRegion, Bucket: prevBucket, Endpoint: prevEndpoint})
+		prevClient, err := r2.New(candidateCtx, r2.Config{AccessKey: previous.accessKey, SecretKey: string(prevSecret), Region: previous.region, Bucket: previous.bucket, Endpoint: previous.endpoint})
 		if err != nil {
 			_ = os.Remove(latestPath)
-			problemFor("predecessor_storage_client", prevClipID, prevDestinationID, err)
+			problemFor("predecessor_storage_client", previous.clipID, previous.destinationID, err)
+			cancel()
 			continue
 		}
-		prevPath, err := downloadAndProbeStoredClip(ctx, prevClient, prevObjectKey, prevExpectedSize)
+		prevPath, err := downloadAndProbeStoredClip(candidateCtx, prevClient, previous.objectKey, previous.expectedSize, previous.sha256)
 		if err != nil {
 			_ = os.Remove(latestPath)
-			problemFor("predecessor_clip", prevClipID, prevDestinationID, err)
+			problemFor("predecessor_clip", previous.clipID, previous.destinationID, err)
+			cancel()
 			continue
 		}
-		concatErr := capture.ValidateConcatFiles(ctx, []string{prevPath, latestPath})
+		concatErr := capture.ValidateConcatFiles(candidateCtx, []string{prevPath, latestPath})
 		_ = os.Remove(prevPath)
 		_ = os.Remove(latestPath)
 		if concatErr != nil {
 			problem("concat_decode", concatErr)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Fatalf("iterate stored_clip_invalid: %v", err)
+		cancel()
 	}
 	return out
 }
 
-func downloadAndProbeStoredClip(ctx context.Context, client *r2.Client, objectKey string, expectedSize int64) (string, error) {
+func downloadAndProbeStoredClip(ctx context.Context, client *r2.Client, objectKey string, expectedSize int64, expectedSHA string) (string, error) {
 	head, err := client.Head(ctx, objectKey)
 	if err != nil {
 		return "", fmt.Errorf("head: %w", err)
@@ -649,18 +780,50 @@ func downloadAndProbeStoredClip(ctx context.Context, client *r2.Client, objectKe
 		_ = body.Close()
 		return "", fmt.Errorf("tempfile: %w", err)
 	}
-	_, copyErr := io.Copy(tmp, body)
+	hasher := sha256.New()
+	copied, copyErr := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(body, expectedSize+1))
 	bodyErr := body.Close()
 	closeErr := tmp.Close()
 	if copyErr != nil || bodyErr != nil || closeErr != nil {
 		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("download: %w", errors.Join(copyErr, bodyErr, closeErr))
 	}
+	if copied != expectedSize {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("downloaded size=%d database=%d", copied, expectedSize)
+	}
+	if err := verifyStoredClipSHA(hasher.Sum(nil), expectedSHA); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
 	if err := capture.ValidateSegmentFile(ctx, tmp.Name()); err != nil {
 		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("ffprobe: %w", err)
 	}
 	return tmp.Name(), nil
+}
+
+func verifyStoredClipSHA(actual []byte, expected string) error {
+	expected = strings.ToLower(strings.TrimSpace(expected))
+	if expected == "" {
+		return nil // legacy rows predate stored checksums; size+decode still apply.
+	}
+	want, err := hex.DecodeString(expected)
+	if err != nil || len(want) != sha256.Size {
+		return fmt.Errorf("invalid stored sha256 metadata")
+	}
+	if subtle.ConstantTimeCompare(actual, want) != 1 {
+		return fmt.Errorf("sha256 mismatch: downloaded object differs from ingest metadata")
+	}
+	return nil
+}
+
+func boundedHealthDiagnostic(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= mediaHealthDiagnosticLimit {
+		return value
+	}
+	return value[:mediaHealthDiagnosticLimit] + "…[truncated]"
 }
 
 // detectClipTimestampDrift finds recordings whose newest clip is stamped for an

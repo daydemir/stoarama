@@ -843,10 +843,10 @@ func ValidateSegmentFile(ctx context.Context, path string) error {
 	return nil
 }
 
-// ValidateConcatFiles decodes clips through FFmpeg's concat demuxer in the
-// supplied order. It writes no output video and never transforms the inputs; a
-// success proves the actual stored containers/codecs/timestamps can be consumed
-// as one continuous decode stream rather than merely probing in isolation.
+// ValidateConcatFiles creates the same quality-preserving stream-copy MP4 that
+// clip exports document, then strictly decodes that derived file. Inputs are
+// read-only and never transformed. Success proves both muxability and decoder
+// consumption of the actual long-video artifact users will create.
 func ValidateConcatFiles(ctx context.Context, paths []string) error {
 	if len(paths) < 2 {
 		return fmt.Errorf("concat validation requires at least two clips")
@@ -873,13 +873,65 @@ func ValidateConcatFiles(ctx context.Context, paths []string) error {
 	if err := manifest.Close(); err != nil {
 		return fmt.Errorf("close concat manifest: %w", err)
 	}
+	output, err := os.CreateTemp("", "stoarama-stitched-*.mp4")
+	if err != nil {
+		return fmt.Errorf("create stitched output: %w", err)
+	}
+	outputPath := output.Name()
+	_ = output.Close()
+	_ = os.Remove(outputPath)
+	defer os.Remove(outputPath)
+
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(probeCtx, ffmpegBin(),
-		"-v", "error", "-xerror", "-f", "concat", "-safe", "0", "-i", manifestPath,
+	copyCmd := exec.CommandContext(probeCtx, ffmpegBin(),
+		"-v", "error", "-xerror", "-err_detect", "explode",
+		"-f", "concat", "-safe", "0", "-i", manifestPath,
+		"-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+		"-avoid_negative_ts", "make_zero", "-movflags", "+faststart", "-y", outputPath)
+	if err := runFFmpegHealthCommand(copyCmd); err != nil {
+		return fmt.Errorf("ffmpeg lossless stitch: %w", err)
+	}
+	decodeCmd := exec.CommandContext(probeCtx, ffmpegBin(),
+		"-v", "error", "-xerror", "-err_detect", "explode", "-i", outputPath,
 		"-map", "0:v:0", "-map", "0:a?", "-f", "null", "-")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ffmpeg concat decode: %w (%s)", err, strings.TrimSpace(string(out)))
+	if err := runFFmpegHealthCommand(decodeCmd); err != nil {
+		return fmt.Errorf("ffmpeg stitched decode: %w", err)
+	}
+	return nil
+}
+
+const ffmpegHealthOutputLimit = 16 << 10
+
+type boundedCommandOutput struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (w *boundedCommandOutput) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := ffmpegHealthOutputLimit - w.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+			w.truncated = true
+		}
+		_, _ = w.buf.Write(p)
+	} else {
+		w.truncated = true
+	}
+	return written, nil
+}
+
+func runFFmpegHealthCommand(cmd *exec.Cmd) error {
+	var output boundedCommandOutput
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Run(); err != nil {
+		text := strings.TrimSpace(output.buf.String())
+		if output.truncated {
+			text += " …[truncated]"
+		}
+		return fmt.Errorf("%w (%s)", err, text)
 	}
 	return nil
 }
