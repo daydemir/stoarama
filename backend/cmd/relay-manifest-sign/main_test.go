@@ -45,7 +45,7 @@ func TestSignerRoundTripRejectsTamperingAndWrongKey(t *testing.T) {
 }
 
 func TestRelayReleaseScriptsParse(t *testing.T) {
-	for _, script := range []string{"release-relay.sh", "promote-relay.sh", "relay-install.sh"} {
+	for _, script := range []string{"release-relay.sh", "relay-release-immutable.sh", "relay-release-immutable-test.sh", "promote-relay.sh", "relay-install.sh"} {
 		cmd := exec.Command("bash", "-n", filepath.Join("..", "..", "scripts", script))
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", script, err, output)
@@ -85,6 +85,44 @@ func TestRelayPromotionRequiresSignedCandidateAndExplicitUnsignedBootstrap(t *te
 	}
 	if strings.Index(body, candidateVerify) > strings.Index(body, `download "latest.json" "${live}"`) {
 		t.Fatal("candidate signature must be verified before inspecting live bootstrap state")
+	}
+}
+
+func TestRelayPublisherUsesConditionalImmutableWrites(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join("..", "..", "scripts", "relay-release-immutable.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := os.ReadFile(filepath.Join("..", "..", "scripts", "release-relay.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(release), `. "${ROOT_DIR}/scripts/relay-release-immutable.sh"`) {
+		t.Fatal("release publisher does not source immutable-write helper")
+	}
+	body := string(script) + string(release)
+	for _, required := range []string{
+		`aws s3api put-object`,
+		`--if-none-match '*'`,
+		`cmp -s "${source}" "${existing}"`,
+		`for attempt in 1 2 3`,
+		`r2_put "${previous_latest_signature}"`,
+		`refusing to overwrite non-identical immutable relay artifact`,
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("release publisher missing immutable-write guard %q", required)
+		}
+	}
+	legacyOverwrite := `aws s3 cp "$1" "s3://${R2_BUCKET}/relay-releases/$2"`
+	if strings.Contains(body, legacyOverwrite) {
+		t.Fatal("release publisher still contains unconditional immutable artifact overwrite")
+	}
+}
+
+func TestRelayPublisherImmutableWriteBehavior(t *testing.T) {
+	cmd := exec.Command("bash", filepath.Join("..", "..", "scripts", "relay-release-immutable-test.sh"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("immutable publisher behavior: %v\n%s", err, output)
 	}
 }
 
