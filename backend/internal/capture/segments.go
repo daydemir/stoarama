@@ -22,6 +22,11 @@ import (
 
 var errContinuousSegmentDelivery = errors.New("continuous segment delivery failed")
 
+// ErrContinuousSegmentDuplicate lets the recording worker acknowledge a replayed
+// file without advancing CaptureContinuous's media clock. The worker owns the
+// job-scoped SHA set because it spans ffmpeg reconnect attempts.
+var ErrContinuousSegmentDuplicate = errors.New("continuous segment is a duplicate replay")
+
 const (
 	SegmentTargetFPS       = 30
 	DefaultSegmentDuration = 30 * time.Second
@@ -367,27 +372,23 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	}
 }
 
-// continuousChainDriftLimit bounds how far the chained media timeline may run
-// AHEAD of a segment's own strftime open instant before the chain re-anchors to
-// that instant. The chain exists to close whole-second rounding gaps between
-// back-to-back segments, which is sub-second jitter; it silently assumed a live
-// source hands ffmpeg no more media than wall-clock time. A DVR-backed playlist
-// breaks that assumption -- SkylineWebcams let ffmpeg outrun real time on stream
-// 14478, and over one window its chained starts reached 26 minutes into the
-// future, so clips were stored under filenames and clip_start_at values for
-// instants that had not happened yet (and its coverage read 128%).
-//
-// Only forward drift is clamped. A chain that falls BEHIND the label is the
-// normal catch-up case: the media really is older than now, and re-anchoring
-// there would reintroduce the phantom gap the chain removes.
-const continuousChainDriftLimit = 90 * time.Second
-
 func deliverContinuousSegment(processed map[string]bool, path string, segment Segment, nextStart *time.Time, deliver func(Segment) error) error {
-	if !nextStart.IsZero() && nextStart.Sub(segment.StartAt) <= continuousChainDriftLimit {
+	// A persistent segment muxer writes packets to these files in capture order,
+	// making probed media durations the authoritative intra-attempt timeline.
+	// Never jump backward to a strftime wall-clock label: a DVR-backed HLS tail
+	// can be consumed faster than real time, and the old 90-second re-anchor
+	// manufactured overlaps between otherwise sequential files. Retaining every
+	// unique media second can put this logical media timeline ahead of wall time;
+	// the recording-health drift signal keeps that separate semantic issue visible.
+	if !nextStart.IsZero() {
 		segment.StartAt = *nextStart
 		segment.EndAt = segment.StartAt.Add(time.Duration(segment.DurationMs) * time.Millisecond)
 	}
 	if err := deliver(segment); err != nil {
+		if errors.Is(err, ErrContinuousSegmentDuplicate) {
+			processed[path] = true
+			return nil
+		}
 		return fmt.Errorf("%w: %w", errContinuousSegmentDelivery, err)
 	}
 	processed[path] = true
