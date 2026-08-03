@@ -15,8 +15,60 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestRelaySelfUpdateDefersForActiveCapture(t *testing.T) {
+	if deferUpdate, count := relaySelfUpdateDeferred(nil); deferUpdate || count != 0 {
+		t.Fatalf("nil active counter deferred=%t count=%d", deferUpdate, count)
+	}
+	var active atomic.Int64
+	if deferUpdate, count := relaySelfUpdateDeferred(&active); deferUpdate || count != 0 {
+		t.Fatalf("idle relay deferred=%t count=%d", deferUpdate, count)
+	}
+	active.Store(3)
+	if deferUpdate, count := relaySelfUpdateDeferred(&active); !deferUpdate || count != 3 {
+		t.Fatalf("active relay deferred=%t count=%d, want true/3", deferUpdate, count)
+	}
+}
+
+func TestRelayRestartGateWaitsForLeaseAdmission(t *testing.T) {
+	var gate sync.RWMutex
+	var active atomic.Int64
+	gate.RLock() // Model the worker immediately before LeaseRecordingJob.
+
+	type result struct {
+		deferred bool
+		count    int64
+	}
+	done := make(chan result, 1)
+	go func() {
+		unlock, deferred, count := lockRelayRestartGate(&gate, &active)
+		defer unlock()
+		done <- result{deferred: deferred, count: count}
+	}()
+
+	select {
+	case got := <-done:
+		t.Fatalf("restart gate crossed in-flight lease admission: %+v", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	// A successful lease becomes visible before the worker releases its read lock.
+	active.Add(1)
+	gate.RUnlock()
+	select {
+	case got := <-done:
+		if !got.deferred || got.count != 1 {
+			t.Fatalf("restart gate deferred=%t count=%d, want true/1", got.deferred, got.count)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("restart gate did not resume after lease admission completed")
+	}
+}
 
 func TestUpdateExecutableIfChangedSkipsMatchingFile(t *testing.T) {
 	data := []byte("already installed")

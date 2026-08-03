@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -180,7 +181,7 @@ func runSelfUpdate(args []string) error {
 // after start (not immediately) so a fresh install does not restart itself on boot.
 // When the relay binary itself changes it kickstarts the service so the new binary is
 // exec'd; a yt-dlp-only refresh is picked up by the next capture without a restart.
-func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
+func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int64, leaseGate *sync.RWMutex) {
 	ticker := time.NewTicker(selfUpdateInterval)
 	defer ticker.Stop()
 	manifest := cfg.updateManifest()
@@ -189,6 +190,10 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if deferUpdate, count := relaySelfUpdateDeferred(activeJobs); deferUpdate {
+				log.Printf("relay self-update: deferred while %d recording job(s) are active", count)
+				continue
+			}
 			if manifest != liveReleaseManifest {
 				live, err := fetchLatest(cfg.APIURL, liveReleaseManifest)
 				if err != nil {
@@ -202,7 +207,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 					}
 				}
 			}
-			checkAndApplyUpdate(cfg.APIURL, manifest)
+			checkAndApplyUpdate(cfg.APIURL, manifest, activeJobs, leaseGate)
 		}
 	}
 }
@@ -211,7 +216,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig) {
 // relay binary and refresh yt-dlp (both sha256-verified), and restart only if the relay
 // binary actually changed. Errors are logged and swallowed so a bad manifest or a
 // transient network failure never takes the relay down.
-func checkAndApplyUpdate(base string, manifest releaseManifest) {
+func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atomic.Int64, leaseGate *sync.RWMutex) {
 	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
 	lj, err := fetchLatest(base, manifest)
 	if err != nil {
@@ -244,11 +249,42 @@ func checkAndApplyUpdate(base string, manifest releaseManifest) {
 	}
 
 	if relayUpdated {
+		// A recording can be leased while the update downloads. Exclude lease
+		// admission across the final idle check and restart initiation: workers hold
+		// the read side from before the lease request until ActiveJobs is incremented.
+		// If a capture is active, leave the old process running; the next idle tick
+		// restarts into the already-verified binary without losing an open segment.
+		unlock, deferUpdate, count := lockRelayRestartGate(leaseGate, activeJobs)
+		defer unlock()
+		if deferUpdate {
+			log.Printf("relay self-update: restart deferred while %d recording job(s) are active", count)
+			return
+		}
 		log.Printf("relay self-update: restarting service to load new binary")
 		if err := restartAfterSelfUpdate(); err != nil {
 			log.Printf("relay self-update: restart failed: %v", err)
 		}
 	}
+}
+
+func lockRelayRestartGate(leaseGate *sync.RWMutex, activeJobs *atomic.Int64) (func(), bool, int64) {
+	if leaseGate != nil {
+		leaseGate.Lock()
+	}
+	deferred, count := relaySelfUpdateDeferred(activeJobs)
+	return func() {
+		if leaseGate != nil {
+			leaseGate.Unlock()
+		}
+	}, deferred, count
+}
+
+func relaySelfUpdateDeferred(activeJobs *atomic.Int64) (bool, int64) {
+	if activeJobs == nil {
+		return false, 0
+	}
+	count := activeJobs.Load()
+	return count > 0, count
 }
 
 func fetchLatest(base string, manifest releaseManifest) (latestJSON, error) {

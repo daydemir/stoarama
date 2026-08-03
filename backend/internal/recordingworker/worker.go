@@ -44,6 +44,11 @@ type Config struct {
 	// in the node heartbeat. The zero value (nil) is a no-op for cloud droplet
 	// workers.
 	ActiveJobs *atomic.Int64
+	// LeaseGate, when non-nil, prevents a relay self-update restart from racing
+	// with lease admission. The worker holds a read lock from immediately before
+	// requesting a lease until ActiveJobs reflects the admitted job. Cloud
+	// workers leave it nil.
+	LeaseGate *sync.RWMutex
 	// RelayDiagnostics, when non-nil, is updated with non-secret job progress for
 	// relay node heartbeats. Cloud droplet workers leave it nil.
 	RelayDiagnostics *RelayDiagnostics
@@ -96,6 +101,9 @@ const diskErrorLogInterval = 5 * time.Minute
 func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("client is required")
+	}
+	if cfg.LeaseGate != nil && cfg.ActiveJobs == nil {
+		return nil, fmt.Errorf("lease gate requires active jobs counter")
 	}
 	if cfg.ContinuousNoProgressTimeout > 0 && cfg.RelayDiagnostics == nil {
 		return nil, fmt.Errorf("continuous no-progress timeout requires relay diagnostics")
@@ -194,8 +202,14 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			<-sem
 			return
 		}
+		if w.cfg.LeaseGate != nil {
+			w.cfg.LeaseGate.RLock()
+		}
 		job, err := w.cfg.Client.LeaseRecordingJob(ctx)
 		if err != nil {
+			if w.cfg.LeaseGate != nil {
+				w.cfg.LeaseGate.RUnlock()
+			}
 			<-sem
 			if !errors.Is(err, context.Canceled) {
 				log.Printf("recording worker lease error: %v", err)
@@ -203,12 +217,18 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			return
 		}
 		if job == nil {
+			if w.cfg.LeaseGate != nil {
+				w.cfg.LeaseGate.RUnlock()
+			}
 			<-sem
 			return
 		}
 		wg.Add(1)
 		if w.cfg.ActiveJobs != nil {
 			w.cfg.ActiveJobs.Add(1)
+		}
+		if w.cfg.LeaseGate != nil {
+			w.cfg.LeaseGate.RUnlock()
 		}
 		go func(j recordingapi.RecordingJob) {
 			defer wg.Done()

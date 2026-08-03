@@ -104,6 +104,7 @@ func runRelay(ctx context.Context) error {
 	}
 
 	var activeJobs atomic.Int64
+	var leaseGate sync.RWMutex
 	relayDiag := &recordingworker.RelayDiagnostics{}
 	worker, err := recordingworker.NewWorker(recordingworker.Config{
 		Client:                      client,
@@ -114,6 +115,7 @@ func runRelay(ctx context.Context) error {
 		SkipDropletHeartbeat:        true,
 		ClassifyYouTubeCookieErrors: true,
 		ActiveJobs:                  &activeJobs,
+		LeaseGate:                   &leaseGate,
 		RelayDiagnostics:            relayDiag,
 		ContinuousNoProgressTimeout: 5 * time.Minute,
 		CaptureTempDir:              tempRoot,
@@ -160,7 +162,7 @@ func runRelay(ctx context.Context) error {
 
 	go pr.runLoop(ctx)
 	if selfUpdatesEnabled {
-		go selfUpdateLoop(ctx, cfg)
+		go selfUpdateLoop(ctx, cfg, &activeJobs, &leaseGate)
 	}
 
 	err = worker.Run(ctx)
