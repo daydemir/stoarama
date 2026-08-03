@@ -151,10 +151,10 @@ services:
       # Operator Access").
 
   # Hourly recording-health check: sweeps active paid recordings for silent
-  # death (a continuous recording marked done/idle mid-window producing zero
-  # clips) plus stuck/exhausted jobs and overdue sampled fires, and emails
-  # operators. Pure DB reads + Resend; no ffmpeg/yt-dlp needed, so this build is
-  # just the Go binary. Runs at :30 to stay clear of the top-of-hour survey.
+  # death, low completed-window coverage, overlaps, >5m gaps, stuck/exhausted
+  # jobs, and overdue sampled fires. Pure DB reads + Resend; the separate daily
+  # verifier below owns object reads and ffprobe. Runs at :30 to stay clear of
+  # the top-of-hour survey.
   - type: cron
     name: stoarama-recording-health
     env: go
@@ -169,6 +169,51 @@ services:
         fromDatabase:
           name: stoarama-db
           property: connectionString
+      - key: APP_BASE_URL
+        value: https://stoarama.com
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_REPLY_TO
+        sync: false
+      - key: EMAIL_RESEND_API_KEY
+        sync: false
+
+  # Daily storage/media proof: runs the same health sweep plus HEAD, exact-size,
+  # full-download, and ffprobe verification of the newest adjacent clip pair for
+  # every active recording, followed by a decode-only concat proof. This detects
+  # an object that disappeared or media that exists but cannot be stitched. It
+  # never rewrites media.
+  - type: cron
+    name: stoarama-recording-media-health
+    env: go
+    rootDir: backend
+    plan: starter
+    schedule: "15 4 * * *"
+    autoDeployTrigger: commit
+    buildCommand: |
+      set -euo pipefail
+      go build -o bin/stoaramactl ./cmd/stoaramactl
+      curl -fsSL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+      mkdir -p /tmp/ffmpeg-extract
+      tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+      cp /tmp/ffmpeg-extract/bin/ffmpeg /tmp/ffmpeg-extract/bin/ffprobe bin/
+      chmod +x bin/ffmpeg bin/ffprobe
+      ./bin/ffmpeg -version
+      ./bin/ffprobe -version
+    startCommand: ./bin/stoaramactl recording-health run --verify-media
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stoarama-db
+          property: connectionString
+      - key: STORAGE_CRED_KEY
+        sync: false
+      - key: FFPROBE_BIN
+        value: ./bin/ffprobe
+      - key: FFMPEG_BIN
+        value: ./bin/ffmpeg
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER

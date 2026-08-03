@@ -2,17 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/email"
+	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
 // Signal identifiers persisted in recorder_health_alerts.signal and their
@@ -24,6 +29,11 @@ const (
 	signalStuckLease                 = "stuck_lease"
 	signalSampledOverdue             = "sampled_overdue"
 	signalClipTimestampDrift         = "clip_timestamp_drift"
+	signalContinuousCoverageLow      = "continuous_coverage_low"
+	signalContinuousOverlap          = "continuous_timeline_overlap"
+	signalContinuousLongGap          = "continuous_long_gap"
+	signalContinuousFragmented       = "continuous_fragmented"
+	signalStoredClipInvalid          = "stored_clip_invalid"
 )
 
 // clipTimestampDriftLimitSec is how far a clip's start may lead its own ingest
@@ -39,6 +49,11 @@ var healthSignalLabels = map[string]string{
 	signalStuckLease:                 "Recording job lease stuck (scheduler reclaim may be stalled)",
 	signalSampledOverdue:             "Sampled recording is overdue to fire",
 	signalClipTimestampDrift:         "Clip timestamps are running ahead of real time (capture chain has lost its epoch)",
+	signalContinuousCoverageLow:      "Completed continuous window captured less than 95% of its timeline",
+	signalContinuousOverlap:          "Completed continuous window contains overlapping clip timelines",
+	signalContinuousLongGap:          "Completed continuous window contains a gap longer than five minutes",
+	signalContinuousFragmented:       "Completed continuous window is fragmented by frequent reconnect gaps",
+	signalStoredClipInvalid:          "Latest stored clip is missing, truncated, or not decodable",
 }
 
 var healthSignalSeverity = map[string]string{
@@ -48,6 +63,11 @@ var healthSignalSeverity = map[string]string{
 	signalStuckLease:                 "HIGH",
 	signalSampledOverdue:             "HIGH",
 	signalClipTimestampDrift:         "CRITICAL",
+	signalContinuousCoverageLow:      "CRITICAL",
+	signalContinuousOverlap:          "HIGH",
+	signalContinuousLongGap:          "HIGH",
+	signalContinuousFragmented:       "HIGH",
+	signalStoredClipInvalid:          "CRITICAL",
 }
 
 // healthIncident is one detected recording-health problem, enriched with the
@@ -86,6 +106,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	fs := flag.NewFlagSet("recording-health run", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "detect + print incidents only; do not email or write dedup rows")
 	freshnessMin := fs.Int("freshness-min", 10, "continuous silent-death freshness window in minutes")
+	verifyMedia := fs.Bool("verify-media", false, "download and ffprobe the latest clip for every active recording")
 	_ = fs.Parse(args)
 	if *freshnessMin <= 0 {
 		log.Fatalf("--freshness-min must be > 0")
@@ -95,6 +116,9 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	defer pool.Close()
 
 	incidents := detectRecordingHealthIncidents(ctx, pool, *freshnessMin)
+	if *verifyMedia {
+		incidents = append(incidents, detectLatestStoredClipHealth(ctx, pool, cfg)...)
+	}
 	bySignal := map[string]int{}
 	for _, inc := range incidents {
 		bySignal[inc.Signal]++
@@ -299,6 +323,7 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	incidents = append(incidents, detectStuckLease(ctx, pool)...)
 	incidents = append(incidents, detectSampledOverdue(ctx, pool)...)
 	incidents = append(incidents, detectClipTimestampDrift(ctx, pool)...)
+	incidents = append(incidents, detectCompletedWindowStitchHealth(ctx, pool)...)
 
 	severityRank := map[string]int{"CRITICAL": 0, "HIGH": 1}
 	sort.SliceStable(incidents, func(i, j int) bool {
@@ -316,6 +341,320 @@ func humanSince(t *time.Time) string {
 		return "never"
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+type stitchWindow struct {
+	incidentBase healthIncident
+	open         time.Time
+	close        time.Time
+	clips        [][2]time.Time
+}
+
+type stitchWindowMetrics struct {
+	coveragePct    float64
+	overlapClips   int
+	overlapSeconds float64
+	maxGap         time.Duration
+	gapClips       int
+	longestRun     time.Duration
+}
+
+// detectCompletedWindowStitchHealth scores the most recently completed window
+// for every active continuous recording. Coverage is the UNION of clipped media
+// intervals, so overlaps never inflate it above 100%. Overlaps and internal gaps
+// are reported separately: operators can distinguish duplicated capture chains
+// from honest missing footage, and researchers know exactly when a long-video or
+// CV track must break.
+func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
+	rows, err := pool.Query(ctx, `
+		WITH latest AS (
+		  SELECT DISTINCT ON (r.id)
+		    r.id, COALESCE(r.stream_id,0) AS stream_id, r.account_id,
+		    r.name AS recording_name, r.stream_url,
+		    acc.name AS org_name, acc.email AS org_email, j.fire_at, j.window_end_at
+		  FROM recordings r
+		  JOIN accounts acc ON acc.id=r.account_id
+		  JOIN account_billing b ON b.account_id=r.account_id AND b.has_payment_method=true
+		  JOIN recording_jobs j ON j.recording_id=r.id AND j.kind='continuous_window'
+		  WHERE r.status='active' AND r.mode='continuous'
+		    AND j.window_end_at <= now()
+		    AND j.window_end_at >= now()-interval '48 hours'
+		  ORDER BY r.id, j.window_end_at DESC, j.id DESC
+		)
+		SELECT l.id,l.stream_id,l.account_id,l.recording_name,l.stream_url,l.org_name,l.org_email,
+		       l.fire_at,l.window_end_at,c.clip_start_at,c.clip_end_at
+		FROM latest l
+		LEFT JOIN recording_clips c ON c.recording_id=l.id
+		  AND c.clip_end_at>l.fire_at AND c.clip_start_at<l.window_end_at
+		ORDER BY l.id,c.clip_start_at,c.id
+	`)
+	if err != nil {
+		log.Fatalf("signal completed_window_stitch_health: %v", err)
+	}
+	defer rows.Close()
+	windows := map[int64]*stitchWindow{}
+	order := []int64{}
+	for rows.Next() {
+		var id, streamID, accountID int64
+		var recName, streamURL, orgName, orgEmail string
+		var open, close time.Time
+		var clipStart, clipEnd *time.Time
+		if err := rows.Scan(&id, &streamID, &accountID, &recName, &streamURL, &orgName, &orgEmail,
+			&open, &close, &clipStart, &clipEnd); err != nil {
+			log.Fatalf("scan completed_window_stitch_health: %v", err)
+		}
+		win := windows[id]
+		if win == nil {
+			win = &stitchWindow{incidentBase: healthIncident{
+				RecordingID: id, StreamID: streamID, AccountID: accountID,
+				OrgName: orgName, OrgEmail: orgEmail, RecName: recName, StreamURL: streamURL,
+			}, open: open, close: close}
+			windows[id] = win
+			order = append(order, id)
+		}
+		if clipStart != nil && clipEnd != nil {
+			win.clips = append(win.clips, [2]time.Time{*clipStart, *clipEnd})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("iterate completed_window_stitch_health: %v", err)
+	}
+
+	out := []healthIncident{}
+	for _, id := range order {
+		win := windows[id]
+		m := measureStitchWindow(win.open, win.close, win.clips)
+		since := fmt.Sprintf("completed window %s to %s", win.open.UTC().Format(time.RFC3339), win.close.UTC().Format(time.RFC3339))
+		if m.coveragePct < 95 {
+			inc := win.incidentBase
+			inc.Signal, inc.Severity, inc.SinceText = signalContinuousCoverageLow, healthSignalSeverity[signalContinuousCoverageLow], since
+			inc.Diag = diagText("coverage", fmt.Sprintf("%.2f%%", m.coveragePct), "longest_run", m.longestRun.Round(time.Second).String())
+			out = append(out, inc)
+		}
+		if m.overlapClips > 0 {
+			inc := win.incidentBase
+			inc.Signal, inc.Severity, inc.SinceText = signalContinuousOverlap, healthSignalSeverity[signalContinuousOverlap], since
+			inc.Diag = diagText("overlap_clips", fmt.Sprint(m.overlapClips), "overlap_time", time.Duration(m.overlapSeconds*float64(time.Second)).Round(time.Second).String())
+			out = append(out, inc)
+		}
+		if m.maxGap > 5*time.Minute {
+			inc := win.incidentBase
+			inc.Signal, inc.Severity, inc.SinceText = signalContinuousLongGap, healthSignalSeverity[signalContinuousLongGap], since
+			inc.Diag = diagText("largest_internal_gap", m.maxGap.Round(time.Second).String(), "longest_run", m.longestRun.Round(time.Second).String())
+			out = append(out, inc)
+		}
+		if m.gapClips > 10 {
+			inc := win.incidentBase
+			inc.Signal, inc.Severity, inc.SinceText = signalContinuousFragmented, healthSignalSeverity[signalContinuousFragmented], since
+			inc.Diag = diagText("reconnect_gaps", fmt.Sprint(m.gapClips), "largest_internal_gap", m.maxGap.Round(time.Second).String())
+			out = append(out, inc)
+		}
+	}
+	return out
+}
+
+func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWindowMetrics {
+	const joinTolerance = time.Second
+	intervals := make([][2]time.Time, 0, len(clips))
+	for _, clip := range clips {
+		start, end := clip[0], clip[1]
+		if start.Before(open) {
+			start = open
+		}
+		if end.After(close) {
+			end = close
+		}
+		if end.After(start) {
+			intervals = append(intervals, [2]time.Time{start, end})
+		}
+	}
+	sort.Slice(intervals, func(i, j int) bool { return intervals[i][0].Before(intervals[j][0]) })
+	m := stitchWindowMetrics{}
+	var covered time.Duration
+	var runStart, runEnd time.Time
+	for _, iv := range intervals {
+		if runEnd.IsZero() {
+			runStart, runEnd = iv[0], iv[1]
+			continue
+		}
+		if iv[0].Before(runEnd.Add(-joinTolerance)) {
+			m.overlapClips++
+			overlapEnd := iv[1]
+			if overlapEnd.After(runEnd) {
+				overlapEnd = runEnd
+			}
+			m.overlapSeconds += overlapEnd.Sub(iv[0]).Seconds()
+		}
+		if !iv[0].After(runEnd.Add(joinTolerance)) {
+			if iv[1].After(runEnd) {
+				runEnd = iv[1]
+			}
+			continue
+		}
+		run := runEnd.Sub(runStart)
+		covered += run
+		if run > m.longestRun {
+			m.longestRun = run
+		}
+		if gap := iv[0].Sub(runEnd); gap > m.maxGap {
+			m.maxGap = gap
+		}
+		m.gapClips++
+		runStart, runEnd = iv[0], iv[1]
+	}
+	if !runEnd.IsZero() {
+		run := runEnd.Sub(runStart)
+		covered += run
+		if run > m.longestRun {
+			m.longestRun = run
+		}
+	}
+	if expected := close.Sub(open); expected > 0 {
+		m.coveragePct = 100 * float64(covered) / float64(expected)
+	}
+	return m
+}
+
+// detectLatestStoredClipHealth verifies one recent object per active recording.
+// Ingest already HEAD-checks an upload before committing its row; this daily
+// sweep catches later disappearance, byte truncation, or a formally present MP4
+// whose trailer/streams cannot be decoded. It reads and probes only—never rewrites
+// or normalizes media, so quality and source-native FPS remain untouched.
+func detectLatestStoredClipHealth(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) []healthIncident {
+	cipher := mustBuildStorageCipher(cfg)
+	rows, err := pool.Query(ctx, `
+		SELECT DISTINCT ON (r.id)
+		  r.id,COALESCE(r.stream_id,0),r.account_id,r.name,r.stream_url,
+		  acc.name,acc.email,c.id,c.object_key,c.size_bytes,
+		  sd.id,sd.endpoint,sd.region,sd.bucket,sd.access_key_id,sd.secret_access_key_enc,
+		  prev.id,prev.object_key,prev.size_bytes,
+		  psd.id,psd.endpoint,psd.region,psd.bucket,psd.access_key_id,psd.secret_access_key_enc
+		FROM recordings r
+		JOIN accounts acc ON acc.id=r.account_id
+		JOIN recording_clips c ON c.recording_id=r.id AND c.purged_at IS NULL
+		JOIN storage_destinations sd ON sd.id=c.storage_destination_id
+		JOIN LATERAL (
+		  SELECT p.id,p.object_key,p.size_bytes,p.storage_destination_id
+		  FROM recording_clips p
+		  WHERE p.recording_id=r.id AND p.purged_at IS NULL AND p.id<>c.id
+		    AND (p.created_at,p.id)<(c.created_at,c.id)
+		  ORDER BY p.created_at DESC,p.id DESC LIMIT 1
+		) prev ON true
+		JOIN storage_destinations psd ON psd.id=prev.storage_destination_id
+		WHERE r.status='active' AND c.created_at>=now()-interval '24 hours'
+		ORDER BY r.id,c.created_at DESC,c.id DESC
+	`)
+	if err != nil {
+		log.Fatalf("signal stored_clip_invalid: %v", err)
+	}
+	defer rows.Close()
+	out := []healthIncident{}
+	for rows.Next() {
+		var recID, streamID, accountID, clipID, expectedSize, destinationID int64
+		var prevClipID, prevExpectedSize, prevDestinationID int64
+		var recName, streamURL, orgName, orgEmail, objectKey string
+		var endpoint, region, bucket, accessKey string
+		var secretEnc []byte
+		var prevObjectKey, prevEndpoint, prevRegion, prevBucket, prevAccessKey string
+		var prevSecretEnc []byte
+		if err := rows.Scan(&recID, &streamID, &accountID, &recName, &streamURL,
+			&orgName, &orgEmail, &clipID, &objectKey, &expectedSize,
+			&destinationID, &endpoint, &region, &bucket, &accessKey, &secretEnc,
+			&prevClipID, &prevObjectKey, &prevExpectedSize,
+			&prevDestinationID, &prevEndpoint, &prevRegion, &prevBucket, &prevAccessKey, &prevSecretEnc); err != nil {
+			log.Fatalf("scan stored_clip_invalid: %v", err)
+		}
+		base := healthIncident{
+			RecordingID: recID, StreamID: streamID, AccountID: accountID,
+			OrgName: orgName, OrgEmail: orgEmail, RecName: recName, StreamURL: streamURL,
+			Signal: signalStoredClipInvalid, Severity: healthSignalSeverity[signalStoredClipInvalid],
+			SinceText: fmt.Sprintf("latest clip id=%d", clipID),
+		}
+		problemFor := func(stage string, failedClipID, failedDestinationID int64, verifyErr error) {
+			inc := base
+			inc.Diag = diagText("stage", stage, "clip_id", fmt.Sprint(failedClipID), "destination_id", fmt.Sprint(failedDestinationID), "error", verifyErr.Error())
+			out = append(out, inc)
+		}
+		problem := func(stage string, verifyErr error) { problemFor(stage, clipID, destinationID, verifyErr) }
+		if cipher == nil {
+			problem("configuration", fmt.Errorf("STORAGE_CRED_KEY is unset"))
+			continue
+		}
+		secret, err := cipher.Decrypt(secretEnc)
+		if err != nil {
+			problem("decrypt_destination", err)
+			continue
+		}
+		client, err := r2.New(ctx, r2.Config{AccessKey: accessKey, SecretKey: string(secret), Region: region, Bucket: bucket, Endpoint: endpoint})
+		if err != nil {
+			problem("storage_client", err)
+			continue
+		}
+		latestPath, err := downloadAndProbeStoredClip(ctx, client, objectKey, expectedSize)
+		if err != nil {
+			problem("latest_clip", err)
+			continue
+		}
+		prevSecret, err := cipher.Decrypt(prevSecretEnc)
+		if err != nil {
+			_ = os.Remove(latestPath)
+			problemFor("decrypt_predecessor_destination", prevClipID, prevDestinationID, err)
+			continue
+		}
+		prevClient, err := r2.New(ctx, r2.Config{AccessKey: prevAccessKey, SecretKey: string(prevSecret), Region: prevRegion, Bucket: prevBucket, Endpoint: prevEndpoint})
+		if err != nil {
+			_ = os.Remove(latestPath)
+			problemFor("predecessor_storage_client", prevClipID, prevDestinationID, err)
+			continue
+		}
+		prevPath, err := downloadAndProbeStoredClip(ctx, prevClient, prevObjectKey, prevExpectedSize)
+		if err != nil {
+			_ = os.Remove(latestPath)
+			problemFor("predecessor_clip", prevClipID, prevDestinationID, err)
+			continue
+		}
+		concatErr := capture.ValidateConcatFiles(ctx, []string{prevPath, latestPath})
+		_ = os.Remove(prevPath)
+		_ = os.Remove(latestPath)
+		if concatErr != nil {
+			problem("concat_decode", concatErr)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("iterate stored_clip_invalid: %v", err)
+	}
+	return out
+}
+
+func downloadAndProbeStoredClip(ctx context.Context, client *r2.Client, objectKey string, expectedSize int64) (string, error) {
+	head, err := client.Head(ctx, objectKey)
+	if err != nil {
+		return "", fmt.Errorf("head: %w", err)
+	}
+	if head.SizeBytes != expectedSize {
+		return "", fmt.Errorf("size: stored=%d database=%d", head.SizeBytes, expectedSize)
+	}
+	body, err := client.Open(ctx, objectKey)
+	if err != nil {
+		return "", fmt.Errorf("download: %w", err)
+	}
+	tmp, err := os.CreateTemp("", "stoarama-media-health-*.mp4")
+	if err != nil {
+		_ = body.Close()
+		return "", fmt.Errorf("tempfile: %w", err)
+	}
+	_, copyErr := io.Copy(tmp, body)
+	bodyErr := body.Close()
+	closeErr := tmp.Close()
+	if copyErr != nil || bodyErr != nil || closeErr != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("download: %w", errors.Join(copyErr, bodyErr, closeErr))
+	}
+	if err := capture.ValidateSegmentFile(ctx, tmp.Name()); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("ffprobe: %w", err)
+	}
+	return tmp.Name(), nil
 }
 
 // detectClipTimestampDrift finds recordings whose newest clip is stamped for an

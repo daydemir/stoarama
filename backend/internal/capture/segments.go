@@ -53,7 +53,12 @@ type Segment struct {
 	VideoCodec   string
 	AudioCodec   string
 	AudioPresent bool
-	Thumbnail    *SegmentThumbnail
+	// CaptureSequence is assigned by the recording worker across every ffmpeg
+	// reconnect in one job. It is not media metadata; it preserves the recorder's
+	// authoritative concatenation order even when a source's wall-clock labels
+	// jump or overlap.
+	CaptureSequence int64
+	Thumbnail       *SegmentThumbnail
 }
 
 type SegmentThumbnail struct {
@@ -819,11 +824,71 @@ type ffprobeMeta struct {
 	AudioPresent bool
 }
 
+// ValidateSegmentFile proves that a stored clip is a decodable media container
+// with a positive duration and a video stream. It intentionally performs no
+// transcoding and therefore cannot change recording quality; the health sweeper
+// uses it on a downloaded sample to catch missing/truncated MP4 trailers and
+// other files that exist in object storage but cannot be stitched or used by CV.
+func ValidateSegmentFile(ctx context.Context, path string) error {
+	meta, err := probeSegment(ctx, path)
+	if err != nil {
+		return fmt.Errorf("ffprobe: %w", err)
+	}
+	if meta.DurationMs <= 0 {
+		return fmt.Errorf("ffprobe returned no positive duration")
+	}
+	if strings.TrimSpace(meta.VideoCodec) == "" {
+		return fmt.Errorf("ffprobe returned no video stream")
+	}
+	return nil
+}
+
+// ValidateConcatFiles decodes clips through FFmpeg's concat demuxer in the
+// supplied order. It writes no output video and never transforms the inputs; a
+// success proves the actual stored containers/codecs/timestamps can be consumed
+// as one continuous decode stream rather than merely probing in isolation.
+func ValidateConcatFiles(ctx context.Context, paths []string) error {
+	if len(paths) < 2 {
+		return fmt.Errorf("concat validation requires at least two clips")
+	}
+	manifest, err := os.CreateTemp("", "stoarama-concat-*.txt")
+	if err != nil {
+		return fmt.Errorf("create concat manifest: %w", err)
+	}
+	manifestPath := manifest.Name()
+	defer os.Remove(manifestPath)
+	for _, path := range paths {
+		// Paths come from os.CreateTemp and cannot contain a newline. Single quotes
+		// are escaped using the concat demuxer's documented shell-like syntax.
+		if strings.ContainsAny(path, "\r\n") {
+			_ = manifest.Close()
+			return fmt.Errorf("concat path contains a newline")
+		}
+		escaped := strings.ReplaceAll(path, "'", "'\\''")
+		if _, err := fmt.Fprintf(manifest, "file '%s'\n", escaped); err != nil {
+			_ = manifest.Close()
+			return fmt.Errorf("write concat manifest: %w", err)
+		}
+	}
+	if err := manifest.Close(); err != nil {
+		return fmt.Errorf("close concat manifest: %w", err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, ffmpegBin(),
+		"-v", "error", "-xerror", "-f", "concat", "-safe", "0", "-i", manifestPath,
+		"-map", "0:v:0", "-f", "null", "-")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ffmpeg concat decode: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx,
-		"ffprobe",
+		ffprobeBin(),
 		"-v", "error",
 		"-show_entries", "format=duration:stream=codec_type,codec_name,avg_frame_rate,r_frame_rate",
 		"-of", "json",
@@ -870,6 +935,13 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 		}
 	}
 	return meta, nil
+}
+
+func ffprobeBin() string {
+	if bin := strings.TrimSpace(os.Getenv("FFPROBE_BIN")); bin != "" {
+		return bin
+	}
+	return "ffprobe"
 }
 
 func parseFrameRate(raw string) *float64 {

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -128,10 +129,11 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 	}
 
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT id, fire_at, clip_start_at, clip_end_at, duration_ms, actual_fps, size_bytes, object_key, purged_at
+		SELECT id, fire_at, clip_start_at, clip_end_at, duration_ms, actual_fps, size_bytes,
+		       object_key, purged_at, capture_lease_token, capture_sequence
 		FROM recording_clips
 		WHERE recording_id=$1
-		ORDER BY fire_at DESC
+		ORDER BY clip_start_at DESC, id DESC
 	`, recordingID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list clips: %v", err))
@@ -148,20 +150,23 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 	_ = cw.Write([]string{
 		"id", "filename", "fire_at", "start", "end", "duration_ms",
 		"actual_fps", "size_bytes", "object_key", "status",
+		"capture_lease_token", "capture_sequence",
 	})
 	for rows.Next() {
 		var (
-			clipID      int64
-			fireAt      time.Time
-			clipStartAt time.Time
-			clipEndAt   time.Time
-			durationMs  int64
-			actualFPS   *float64
-			sizeBytes   int64
-			objectKey   string
-			purgedAt    *time.Time
+			clipID            int64
+			fireAt            time.Time
+			clipStartAt       time.Time
+			clipEndAt         time.Time
+			durationMs        int64
+			actualFPS         *float64
+			sizeBytes         int64
+			objectKey         string
+			purgedAt          *time.Time
+			captureLeaseToken *uuid.UUID
+			captureSequence   *int64
 		)
-		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &durationMs, &actualFPS, &sizeBytes, &objectKey, &purgedAt); err != nil {
+		if err := rows.Scan(&clipID, &fireAt, &clipStartAt, &clipEndAt, &durationMs, &actualFPS, &sizeBytes, &objectKey, &purgedAt, &captureLeaseToken, &captureSequence); err != nil {
 			// Headers are already sent; flush what we have and stop.
 			cw.Flush()
 			return
@@ -169,6 +174,14 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 		status := "live"
 		if purgedAt != nil {
 			status = "purged"
+		}
+		leaseToken := ""
+		if captureLeaseToken != nil {
+			leaseToken = captureLeaseToken.String()
+		}
+		sequence := ""
+		if captureSequence != nil {
+			sequence = strconv.FormatInt(*captureSequence, 10)
 		}
 		fps := ""
 		if actualFPS != nil {
@@ -185,6 +198,8 @@ func (s *Server) handleAccountRecordingClipsCSV(w http.ResponseWriter, r *http.R
 			strconv.FormatInt(sizeBytes, 10),
 			strings.TrimSpace(objectKey),
 			status,
+			leaseToken,
+			sequence,
 		})
 		// Flush periodically so rows reach the client incrementally and peak
 		// memory stays O(1) for large clip sets.

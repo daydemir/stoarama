@@ -222,7 +222,7 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 	// (a) reclaim expired leases.
 	if _, err := tx.Exec(ctx, `
 		UPDATE recording_jobs
-		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, updated_at=now()
+		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, lease_token=NULL, updated_at=now()
 		WHERE status='leased' AND lease_expires_at < now()
 	`); err != nil {
 		return fmt.Errorf("reclaim expired recording leases: %w", err)
@@ -315,6 +315,7 @@ func (s *Scheduler) markStaleJobsMissed(ctx context.Context, tx pgx.Tx) error {
 		SET status='error',
 		    error_text='capacity: not captured on schedule (freshness deadline exceeded)',
 		    lease_owner=NULL,
+		    lease_token=NULL,
 		    lease_expires_at=NULL,
 		    completed_at=now(),
 		    updated_at=now()
@@ -477,6 +478,7 @@ func (s *Scheduler) enqueueContinuousRecording(ctx context.Context, tx pgx.Tx, r
 			    scheduled_for=now(),
 			    clip_duration_sec=$2,
 			    lease_owner=NULL,
+			    lease_token=NULL,
 			    lease_expires_at=NULL,
 			    attempt_count=0,
 			    error_text='',

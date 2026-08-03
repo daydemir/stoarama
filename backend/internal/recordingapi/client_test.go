@@ -14,6 +14,7 @@ import (
 func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
 	type receivedRequest struct {
 		idempotencyKey string
+		leaseToken     string
 		payload        map[string]any
 		err            error
 	}
@@ -23,6 +24,7 @@ func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
 		err := json.NewDecoder(r.Body).Decode(&payload)
 		received <- receivedRequest{
 			idempotencyKey: r.Header.Get("Idempotency-Key"),
+			leaseToken:     r.Header.Get(leaseTokenHeader),
 			payload:        payload,
 			err:            err,
 		}
@@ -35,7 +37,7 @@ func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent, err := client.ReserveClipUpload(context.Background(), 42, "video/mp4", 1234)
+	intent, err := client.ReserveClipUpload(context.Background(), 42, "lease-42", "video/mp4", "abc123", 1234)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,8 +51,32 @@ func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
 	if request.idempotencyKey != "recording-seg-42-1234" {
 		t.Fatalf("Idempotency-Key=%q", request.idempotencyKey)
 	}
+	if request.leaseToken != "lease-42" {
+		t.Fatalf("lease token header=%q", request.leaseToken)
+	}
 	if request.payload["job_id"] != float64(42) || request.payload["segment_start_ms"] != float64(1234) {
 		t.Fatalf("payload=%v", request.payload)
+	}
+	if request.payload["sha256"] != "abc123" {
+		t.Fatalf("sha256 payload=%v", request.payload["sha256"])
+	}
+}
+
+func TestLeaseAdvertisesGenerationSupport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(leaseTokenSupportedHeader); got != "true" {
+			t.Errorf("generation support header=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"job":null}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.LeaseRecordingJob(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -99,7 +125,7 @@ func TestHeartbeatReturnsConfirmedLeaseExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
-	canceled, got, err := client.HeartbeatRecordingJob(context.Background(), 42)
+	canceled, got, err := client.HeartbeatRecordingJob(context.Background(), 42, "")
 	if err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
@@ -34,7 +35,9 @@ const (
 	// wrong content). This is the single source of truth for the window; the
 	// scheduler's miss-marking sweep uses the same value. The grace covers normal
 	// lease/poll latency and a brief autoscaler cold-boot, never minutes.
-	recordingFreshnessGraceSec = 30
+	recordingFreshnessGraceSec         = 30
+	recordingLeaseTokenHeader          = "X-Stoarama-Recording-Lease-Token"
+	recordingLeaseTokenSupportedHeader = "X-Stoarama-Recording-Lease-Token-Supported"
 )
 
 // recorderWorkerID is the canonical lease_owner string for a recorder principal.
@@ -50,19 +53,36 @@ func recorderWorkerID(principal nodePrincipal) string {
 	return strings.TrimSpace(principal.DisplayName)
 }
 
+// recordingLeaseToken reads the exact lease issuance carried by a generation-
+// aware worker. A missing token is valid only for a legacy lease whose database
+// token is also NULL; SQL uses IS NOT DISTINCT FROM so a legacy process can
+// never mutate a token-protected replacement lease on the same machine.
+func recordingLeaseToken(r *http.Request) (*uuid.UUID, error) {
+	raw := strings.TrimSpace(r.Header.Get(recordingLeaseTokenHeader))
+	if raw == "" {
+		return nil, nil
+	}
+	token, err := uuid.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid recording lease token")
+	}
+	return &token, nil
+}
+
 type recordingLeaseResponse struct {
-	JobID                int64     `json:"job_id"`
-	RecordingID          int64     `json:"recording_id"`
-	SourceURL            string    `json:"source_url"`
-	StreamID             int64     `json:"stream_id,omitempty"`
-	StreamProvider       string    `json:"stream_provider,omitempty"`
-	SourcePageURL        string    `json:"source_page_url,omitempty"`
-	ClipDurationSec      int       `json:"clip_duration_sec"`
-	StorageDestinationID int64     `json:"storage_destination_id"`
-	FireAt               time.Time `json:"fire_at"`
-	AttemptCount         int       `json:"attempt_count"`
-	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
-	TargetFPS            *int      `json:"target_fps"`
+	JobID                int64      `json:"job_id"`
+	RecordingID          int64      `json:"recording_id"`
+	SourceURL            string     `json:"source_url"`
+	StreamID             int64      `json:"stream_id,omitempty"`
+	StreamProvider       string     `json:"stream_provider,omitempty"`
+	SourcePageURL        string     `json:"source_page_url,omitempty"`
+	ClipDurationSec      int        `json:"clip_duration_sec"`
+	StorageDestinationID int64      `json:"storage_destination_id"`
+	FireAt               time.Time  `json:"fire_at"`
+	AttemptCount         int        `json:"attempt_count"`
+	LeaseExpiresAt       time.Time  `json:"lease_expires_at"`
+	LeaseToken           *uuid.UUID `json:"lease_token,omitempty"`
+	TargetFPS            *int       `json:"target_fps"`
 	// Kind is 'clip' (default, per-cron-fire) or 'continuous_window' (one window-
 	// long lease driving back-to-back segment capture). WindowEndAt is the
 	// continuous window's close instant (zero for a clip job).
@@ -136,6 +156,7 @@ const relayLeaseSQL = `
 	    handoff_owner = NULL,
 	    handoff_until = NULL,
 	    attempt_count = attempt_count + 1,
+	    lease_token = CASE WHEN $5 THEN gen_random_uuid() ELSE NULL END,
 	    updated_at = now()
 	FROM cte, recordings rec
 	LEFT JOIN streams st ON st.id = rec.stream_id
@@ -143,10 +164,10 @@ const relayLeaseSQL = `
 	RETURNING j.id, j.recording_id, rec.stream_url, COALESCE(rec.stream_id, 0),
 	          COALESCE(st.provider, ''), COALESCE(st.source_page_url, ''), j.clip_duration_sec,
 	          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
-	          rec.target_fps, j.kind, j.window_end_at
+	          rec.target_fps, j.kind, j.window_end_at, j.lease_token
 `
 
-func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrincipal, billingDisabled bool, margin int) (recordingLeaseResponse, error) {
+func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrincipal, billingDisabled bool, margin int, tokenSupported bool) (recordingLeaseResponse, error) {
 	var resp recordingLeaseResponse
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -157,10 +178,10 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 		return resp, err
 	}
 	err = tx.QueryRow(ctx, relayLeaseSQL,
-		principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec).Scan(
+		principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec, tokenSupported).Scan(
 		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
 		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
-		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
+		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt, &resp.LeaseToken,
 	)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return resp, err
@@ -227,6 +248,7 @@ const cloudRecordingJobsLeaseSQL = `
 	    lease_owner = $1,
 	    lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)),
 	    attempt_count = attempt_count + 1,
+	    lease_token = CASE WHEN $6 THEN gen_random_uuid() ELSE NULL END,
 	    updated_at = now()
 	FROM cte, recordings rec
 	LEFT JOIN streams st ON st.id = rec.stream_id
@@ -234,7 +256,7 @@ const cloudRecordingJobsLeaseSQL = `
 	RETURNING j.id, j.recording_id, rec.stream_url, COALESCE(rec.stream_id, 0),
 	          COALESCE(st.provider, ''), COALESCE(st.source_page_url, ''), j.clip_duration_sec,
 	          rec.storage_destination_id, j.fire_at, j.attempt_count, j.lease_expires_at,
-	          rec.target_fps, j.kind, j.window_end_at
+	          rec.target_fps, j.kind, j.window_end_at, j.lease_token
 `
 
 // handleRecordingJobsLease leases at most one due recording job for the calling
@@ -254,6 +276,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 	}
 	billingDisabled := s.billing == nil
 	margin := recordingCaptureTimeoutMarginSec + recordingUploadMarginSec
+	tokenSupported := strings.EqualFold(strings.TrimSpace(r.Header.Get(recordingLeaseTokenSupportedHeader)), "true")
 
 	var resp recordingLeaseResponse
 	var err error
@@ -263,7 +286,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		// n.id is the authenticated principal's node id (token lookup), never request
 		// input, so a relay can never lease another account's or a cloud recording's job.
 		// $1=NodeID, $2=billingDisabled, $3=margin, $4=freshnessGrace.
-		resp, err = s.leaseRelayRecordingJob(r.Context(), principal, billingDisabled, margin)
+		resp, err = s.leaseRelayRecordingJob(r.Context(), principal, billingDisabled, margin, tokenSupported)
 	} else {
 		// The operator-owned cloud pool intentionally serves every account.
 		// $1=workerID, $2=billingDisabled, $3=margin, $4=freshnessGrace, $5=capacity.
@@ -276,10 +299,10 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 			err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
 			if err == nil {
 				err = tx.QueryRow(r.Context(), cloudRecordingJobsLeaseSQL,
-					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity).Scan(
+					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported).Scan(
 					&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
 					&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
-					&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt,
+					&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt, &resp.LeaseToken,
 				)
 			}
 			if err == nil {
@@ -312,6 +335,7 @@ func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, node
 type recordingUploadIntentRequest struct {
 	JobID    int64  `json:"job_id"`
 	MimeType string `json:"mime_type"`
+	SHA256   string `json:"sha256"`
 	// SegmentStartMs, when > 0, is the UTC start instant (Unix millis) of a
 	// continuous-capture segment. The per-segment object key is derived from it so
 	// each back-to-back segment of one window job gets a unique, ordered,
@@ -342,6 +366,11 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	workerID := recorderWorkerID(principal)
+	leaseToken, err := recordingLeaseToken(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var req recordingUploadIntentRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -376,7 +405,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		accessKeyID     string
 		secretEnc       []byte
 	)
-	err := s.pool.QueryRow(r.Context(), `
+	err = s.pool.QueryRow(r.Context(), `
 		SELECT j.recording_id, j.clip_duration_sec, j.fire_at, j.kind,
 		       sd.id, sd.endpoint, sd.region, sd.bucket, sd.key_prefix,
 		       rec.cron_timezone, rec.naming_profile, rec.folder_name, rec.naming_metadata_jsonb,
@@ -384,9 +413,10 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		FROM recording_jobs j
 		JOIN recordings rec ON rec.id = j.recording_id
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2 AND j.lease_expires_at > now()
+		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+		  AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > now()
 		  AND rec.status='active'
-	`, req.JobID, workerID).Scan(
+	`, req.JobID, workerID, leaseToken).Scan(
 		&recordingID, &clipDurationSec, &fireAt, &jobKind,
 		&destID, &endpoint, &region, &bucket, &keyPrefix,
 		&cronTimezone, &namingProfile, &folderName, &namingMetadata,
@@ -399,6 +429,27 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording job: %v", err))
 		return
+	}
+
+	// A reconnect can reopen the exact same HLS segment under a fresh signed URL.
+	// Skip it before presigning/uploading when its content hash is already part of
+	// this window job. This removes only byte-identical media; a unique tail or a
+	// visually similar but different clip is always retained.
+	if sha256 := strings.TrimSpace(req.SHA256); sha256 != "" {
+		var alreadyIngested bool
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT EXISTS(
+			  SELECT 1 FROM recording_clips
+			  WHERE recording_job_id=$1 AND sha256=$2
+			)
+		`, req.JobID, sha256).Scan(&alreadyIngested); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check duplicate recording segment: %v", err))
+			return
+		}
+		if alreadyIngested {
+			util.WriteJSON(w, http.StatusOK, map[string]any{"already_ingested": true})
+			return
+		}
 	}
 
 	secret, err := s.secrets.Decrypt(secretEnc)
@@ -546,20 +597,21 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 }
 
 type recordingClipIngestRequest struct {
-	IntentID     string   `json:"intent_id"`
-	JobID        int64    `json:"job_id"`
-	SizeBytes    int64    `json:"size_bytes"`
-	ETag         string   `json:"etag"`
-	SHA256       string   `json:"sha256"`
-	DurationMs   int64    `json:"duration_ms"`
-	VideoCodec   string   `json:"video_codec"`
-	AudioCodec   string   `json:"audio_codec"`
-	AudioPresent bool     `json:"audio_present"`
-	ActualFPS    *float64 `json:"actual_fps"`
-	Container    string   `json:"container"`
-	ResolvedURL  string   `json:"resolved_url"`
-	ClipStartAt  string   `json:"clip_start_at"`
-	ClipEndAt    string   `json:"clip_end_at"`
+	IntentID        string   `json:"intent_id"`
+	JobID           int64    `json:"job_id"`
+	SizeBytes       int64    `json:"size_bytes"`
+	ETag            string   `json:"etag"`
+	SHA256          string   `json:"sha256"`
+	DurationMs      int64    `json:"duration_ms"`
+	VideoCodec      string   `json:"video_codec"`
+	AudioCodec      string   `json:"audio_codec"`
+	AudioPresent    bool     `json:"audio_present"`
+	ActualFPS       *float64 `json:"actual_fps"`
+	Container       string   `json:"container"`
+	ResolvedURL     string   `json:"resolved_url"`
+	ClipStartAt     string   `json:"clip_start_at"`
+	ClipEndAt       string   `json:"clip_end_at"`
+	CaptureSequence int64    `json:"capture_sequence"`
 }
 
 // handleRecordingClipIngest records a successfully uploaded clip. In one tx it
@@ -577,6 +629,11 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	workerID := recorderWorkerID(principal)
+	leaseToken, err := recordingLeaseToken(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var req recordingClipIngestRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -597,6 +654,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusBadRequest, "clip_end_at must be RFC3339")
 		return
 	}
+	var captureSequence *int64
+	if req.CaptureSequence > 0 {
+		captureSequence = &req.CaptureSequence
+	}
 
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
@@ -607,43 +668,46 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 
 	// Load the intent and assert ownership via the owning job's lease (S-2).
 	var (
-		recordingID     int64
-		jobID           int64
-		destID          int64
-		endpoint        string
-		region          string
-		bucket          string
-		objectKey       string
-		displayPath     string
-		mimeType        string
-		maxSize         int64
-		fireAt          time.Time
-		jobKind         string
-		windowEndAt     *time.Time
-		clipDurationSec int
-		recordingStatus string
-		clipNaming      string
-		clipFolderName  string
-		accessKeyID     string
-		secretEnc       []byte
+		recordingID       int64
+		jobID             int64
+		destID            int64
+		endpoint          string
+		region            string
+		bucket            string
+		objectKey         string
+		displayPath       string
+		mimeType          string
+		maxSize           int64
+		fireAt            time.Time
+		jobKind           string
+		windowEndAt       *time.Time
+		clipDurationSec   int
+		recordingStatus   string
+		clipNaming        string
+		clipFolderName    string
+		accessKeyID       string
+		secretEnc         []byte
+		captureLeaseToken *uuid.UUID
 	)
 	err = tx.QueryRow(r.Context(), `
 		SELECT ui.recording_id, ui.recording_job_id, ui.storage_destination_id, ui.endpoint, sd.region,
 		       ui.bucket, ui.object_key, ui.display_path, ui.mime_type, ui.max_size_bytes, j.fire_at,
 		       j.kind, j.window_end_at, j.clip_duration_sec, rec.status, rec.naming_profile, rec.folder_name,
+		       j.lease_token,
 		       sd.access_key_id, sd.secret_access_key_enc
 		FROM recording_upload_intents ui
 		JOIN recording_jobs j ON j.id = ui.recording_job_id
 		JOIN recordings rec ON rec.id = ui.recording_id
 		JOIN storage_destinations sd ON sd.id = ui.storage_destination_id
 		WHERE ui.id=$1 AND ui.status='pending'
-		  AND j.status='leased' AND j.lease_owner=$2 AND j.lease_expires_at > now()
+		  AND j.status='leased' AND j.lease_owner=$2
+		  AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > now()
 		FOR UPDATE OF ui
-	`, intentID, workerID).Scan(
+	`, intentID, workerID, leaseToken).Scan(
 		&recordingID, &jobID, &destID, &endpoint, &region,
 		&bucket, &objectKey, &displayPath, &mimeType, &maxSize, &fireAt,
 		&jobKind, &windowEndAt, &clipDurationSec, &recordingStatus,
-		&clipNaming, &clipFolderName,
+		&clipNaming, &clipFolderName, &captureLeaseToken,
 		&accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -733,14 +797,15 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		INSERT INTO recording_clips
 			(recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path,
 			 mime_type, container, size_bytes, etag, sha256, duration_ms, video_codec, audio_codec,
-			 audio_present, actual_fps, resolved_url, fire_at, clip_start_at, clip_end_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+			 audio_present, actual_fps, resolved_url, fire_at, clip_start_at, clip_end_at,
+			 capture_lease_token, capture_sequence)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 		ON CONFLICT (bucket, object_key) DO NOTHING
 		RETURNING id
 	`, recordingID, jobID, destID, endpoint, bucket, objectKey,
 		displayPath, mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), durationMs,
 		strings.TrimSpace(req.VideoCodec), strings.TrimSpace(req.AudioCodec), req.AudioPresent, req.ActualFPS,
-		strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt).Scan(&clipID)
+		strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt, captureLeaseToken, captureSequence).Scan(&clipID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// 0-row insert means a clip already exists for this (bucket,object_key).
 		// Treat as an error so the job is NOT marked done and the dropped clip
@@ -748,6 +813,19 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		util.WriteJSON(w, http.StatusConflict, map[string]any{
 			"code":  recordingapi.ErrorCodeClipAlreadyIngested,
 			"error": "a clip already exists for this object key",
+		})
+		return
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		(pgErr.ConstraintName == "uq_recording_clips_capture_sequence" ||
+			pgErr.ConstraintName == "uq_recording_clips_capture_sha256") {
+		// A parallel retry can pass the preflight before the first ingest commits.
+		// The generation-scoped unique indexes are the concurrency backstop; expose
+		// the same idempotent result as the ordinary already-ingested path.
+		util.WriteJSON(w, http.StatusConflict, map[string]any{
+			"code":  recordingapi.ErrorCodeClipAlreadyIngested,
+			"error": "this lease generation already ingested the clip",
 		})
 		return
 	}
@@ -817,15 +895,16 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 const recordingJobHeartbeatSQL = `
 	UPDATE recording_jobs j
 	SET lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)), updated_at = now()
-	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2 AND j.lease_expires_at > now()
+	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+	  AND j.lease_token IS NOT DISTINCT FROM $4 AND j.lease_expires_at > now()
 	RETURNING j.lease_expires_at
 `
 
-func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrincipal, jobID int64, workerID string) (time.Time, error) {
+func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrincipal, jobID int64, workerID string, leaseToken *uuid.UUID) (time.Time, error) {
 	var leaseExpiresAt time.Time
 	if principal.NodeType != nodeTypeRelay {
 		err := s.pool.QueryRow(ctx, recordingJobHeartbeatSQL,
-			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec).Scan(&leaseExpiresAt)
+			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt)
 		return leaseExpiresAt, err
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -837,7 +916,7 @@ func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrinci
 		return leaseExpiresAt, err
 	}
 	if err := tx.QueryRow(ctx, recordingJobHeartbeatSQL,
-		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec).Scan(&leaseExpiresAt); err != nil {
+		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt); err != nil {
 		return leaseExpiresAt, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -861,8 +940,13 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	workerID := recorderWorkerID(principal)
+	leaseToken, err := recordingLeaseToken(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	leaseExpiresAt, err := s.heartbeatRecordingJob(r.Context(), principal, id, workerID)
+	leaseExpiresAt, err := s.heartbeatRecordingJob(r.Context(), principal, id, workerID, leaseToken)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Not owned / not leased anymore (canceled, reclaimed, or completed).
 		util.WriteJSON(w, http.StatusConflict, map[string]any{"cancel": true})
@@ -913,19 +997,25 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	workerID := recorderWorkerID(principal)
+	leaseToken, err := recordingLeaseToken(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	var (
 		recordingID int64
 		kind        string
 		clipCount   int64
 	)
-	err := s.pool.QueryRow(r.Context(), `
+	err = s.pool.QueryRow(r.Context(), `
 		SELECT j.recording_id, j.kind, COUNT(c.id)
 		FROM recording_jobs j
 		LEFT JOIN recording_clips c ON c.recording_job_id=j.id
 		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+		  AND j.lease_token IS NOT DISTINCT FROM $3
 		GROUP BY j.id
-	`, id, workerID).Scan(&recordingID, &kind, &clipCount)
+	`, id, workerID, leaseToken).Scan(&recordingID, &kind, &clipCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
 		return
@@ -946,7 +1036,8 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 			UPDATE recording_jobs
 			SET status='error', completed_at=now(), lease_expires_at=NULL, error_text=$3, updated_at=now()
 			WHERE id=$1 AND status='leased' AND lease_owner=$2
-		`, id, workerID, errText); err != nil {
+			  AND lease_token IS NOT DISTINCT FROM $4
+		`, id, workerID, errText, leaseToken); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("mark empty continuous job failed: %v", err))
 			return
 		}
@@ -969,7 +1060,8 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		UPDATE recording_jobs
 		SET status='done', completed_at=now(), lease_expires_at=NULL, updated_at=now()
 		WHERE id=$1 AND status='leased' AND lease_owner=$2
-	`, id, workerID)
+		  AND lease_token IS NOT DISTINCT FROM $3
+	`, id, workerID, leaseToken)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("complete recording job: %v", err))
 		return
@@ -1006,6 +1098,7 @@ const recordingJobSurrenderSQL = `
 	    scheduled_for = now(),
 	    lease_owner = NULL,
 	    lease_expires_at = NULL,
+	    lease_token = NULL,
 	    handoff_owner = $2,
 	    handoff_until = now() + interval '5 minutes',
 	    error_text = $3,
@@ -1015,6 +1108,7 @@ const recordingJobSurrenderSQL = `
 	  AND j.kind='continuous_window'
 	  AND j.status='leased'
 	  AND j.lease_owner=$2
+	  AND j.lease_token IS NOT DISTINCT FROM $4
 	  AND j.lease_expires_at > now()
 	RETURNING j.handoff_until
 `
@@ -1027,6 +1121,11 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 	}
 	if principal.NodeType != nodeTypeRelay {
 		util.WriteError(w, http.StatusForbidden, "only relay nodes can surrender recording jobs")
+		return
+	}
+	leaseToken, err := recordingLeaseToken(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	id, ok := parseInt64Path(w, r, "id")
@@ -1044,12 +1143,13 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 	}
 
 	var handoffUntil time.Time
-	err := s.pool.QueryRow(
+	err = s.pool.QueryRow(
 		r.Context(),
 		recordingJobSurrenderSQL,
 		id,
 		recorderWorkerID(principal),
 		string(req.Reason),
+		leaseToken,
 	).Scan(&handoffUntil)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not an unexpired continuous lease owned by this relay")
@@ -1068,10 +1168,12 @@ const recordingJobFailSQL = `
 	    scheduled_for = CASE WHEN j.attempt_count < j.max_attempts THEN now() + interval '60 seconds' ELSE j.scheduled_for END,
 	    lease_owner = NULL,
 	    lease_expires_at = NULL,
+	    lease_token = NULL,
 	    error_text = $3,
 	    completed_at = CASE WHEN j.attempt_count < j.max_attempts THEN NULL ELSE now() END,
 	    updated_at = now()
 	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+	  AND j.lease_token IS NOT DISTINCT FROM $4
 	RETURNING j.recording_id
 `
 
@@ -1088,6 +1190,11 @@ func (s *Server) handleRecordingJobFail(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	workerID := recorderWorkerID(principal)
+	leaseToken, err := recordingLeaseToken(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var req recordingJobFailRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -1106,7 +1213,7 @@ func (s *Server) handleRecordingJobFail(w http.ResponseWriter, r *http.Request) 
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
 	var recordingID int64
-	err = tx.QueryRow(r.Context(), recordingJobFailSQL, id, workerID, errText).Scan(&recordingID)
+	err = tx.QueryRow(r.Context(), recordingJobFailSQL, id, workerID, errText, leaseToken).Scan(&recordingID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
 		return

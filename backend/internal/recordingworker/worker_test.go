@@ -259,7 +259,7 @@ func TestHeartbeatStopsAtConfirmedLeaseBoundary(t *testing.T) {
 		defer closeServer()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		canceled := worker.startHeartbeat(ctx, cancel, 1, time.Now().Add(80*time.Millisecond))
+		canceled := worker.startHeartbeat(ctx, cancel, 1, "", time.Now().Add(80*time.Millisecond))
 		waitCanceled(t, canceled)
 	})
 
@@ -267,7 +267,7 @@ func TestHeartbeatStopsAtConfirmedLeaseBoundary(t *testing.T) {
 		worker, closeServer := heartbeatTestWorker(t, http.StatusOK, time.Now().Add(time.Second))
 		defer closeServer()
 		ctx, cancel := context.WithCancel(context.Background())
-		canceled := worker.startHeartbeat(ctx, cancel, 2, time.Now().Add(50*time.Millisecond))
+		canceled := worker.startHeartbeat(ctx, cancel, 2, "", time.Now().Add(50*time.Millisecond))
 		time.Sleep(100 * time.Millisecond)
 		if canceled() {
 			t.Fatal("worker canceled despite confirmed renewal")
@@ -280,7 +280,7 @@ func TestHeartbeatStopsAtConfirmedLeaseBoundary(t *testing.T) {
 		defer closeServer()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		canceled := worker.startHeartbeat(ctx, cancel, 3, time.Now().Add(time.Second))
+		canceled := worker.startHeartbeat(ctx, cancel, 3, "", time.Now().Add(time.Second))
 		waitCanceled(t, canceled)
 	})
 }
