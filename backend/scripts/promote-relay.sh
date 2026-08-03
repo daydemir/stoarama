@@ -47,6 +47,14 @@ jq -e --arg version "${VERSION}" '
   ([.relay, .ytdlp] | all(type == "object" and length == 4)) and
   (.ffmpeg | type == "object" and length == 3)
 ' "${candidate}" >/dev/null
+candidate_revision="$(jq -er '.source_revision // empty' "${candidate}")"
+if [[ -n "${candidate_revision}" ]]; then
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/relay-release-provenance.sh" \
+    version "${candidate_revision}" "${VERSION}"
+elif [[ "${MODE}" == "promote" ]]; then
+  echo "error: refusing to promote relay ${VERSION} without signed source_revision provenance" >&2
+  exit 1
+fi
 
 while IFS= read -r artifact; do
   require_object "${artifact}"

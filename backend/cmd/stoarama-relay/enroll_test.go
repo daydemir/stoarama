@@ -21,6 +21,9 @@ func TestEnrollPersistsCandidateManifest(t *testing.T) {
 			t.Fatal("enrollment must leave relay capacity to the server")
 		}
 		capabilities, _ := payload["capabilities_json"].(map[string]any)
+		if got := capabilities["relay_source_revision"]; got != sourceRevision {
+			t.Fatalf("relay source revision=%v want %q", got, sourceRevision)
+		}
 		if _, exists := capabilities["max_concurrent_streams"]; exists {
 			t.Fatal("enrollment must not advertise a client-side capacity")
 		}

@@ -874,11 +874,12 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			health["dns_probe"] = info
 		}
 		caps := map[string]any{
-			"youtube_mode":     mode,
-			"active_jobs":      active.Load(),
-			"relay_version":    version,
-			"relay_started_at": startedAt,
-			"health":           health,
+			"youtube_mode":          mode,
+			"active_jobs":           active.Load(),
+			"relay_version":         version,
+			"relay_source_revision": sourceRevision,
+			"relay_started_at":      startedAt,
+			"health":                health,
 		}
 		if recoveryPending {
 			caps["recovery"] = map[string]any{"recovered_at": time.Now().UTC(), "previous_exit": reportedPreviousExit, "boot_id": previousRecovery.BootID, "started_at": previousRecovery.StartedAt, "last_heartbeat_at": previousRecovery.LastHeartbeatAt, "last_capture_at": previousRecovery.LastCaptureAt, "last_upload_at": previousRecovery.LastUploadAt, "last_updater_at": previousRecovery.LastUpdaterAt, "error_tail": previousRecovery.ErrorTail, "log_tail": relayLogTail(relayLogPath(relayDataDir))}

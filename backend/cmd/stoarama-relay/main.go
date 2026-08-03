@@ -23,8 +23,11 @@ import (
 	"syscall"
 )
 
-// version is set at build time via -ldflags "-X main.version=...".
+// version and sourceRevision are set at build time. sourceRevision is also
+// signed into the release manifest, so an operator can prove that the version
+// label, binary, and source checkout all identify the same immutable commit.
 var version = "dev"
+var sourceRevision = "dev"
 
 func main() {
 	if len(os.Args) < 2 {

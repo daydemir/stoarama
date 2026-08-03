@@ -78,6 +78,9 @@ func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
 
 	select {
 	case capabilities := <-received:
+		if got := capabilities["relay_source_revision"]; got != sourceRevision {
+			t.Fatalf("relay source revision=%v want %q", got, sourceRevision)
+		}
 		if _, ok := capabilities["youtube_ready"]; ok {
 			t.Fatal("unprobed YouTube readiness was reported")
 		}
