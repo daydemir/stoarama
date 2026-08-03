@@ -26,6 +26,9 @@ func TestAccountClipsCursorSQLShape(t *testing.T) {
 		"r.delivery = 'nas_pull'",
 		"c.created_at < now() - ",
 		"c.id > $2",
+		"c.recording_job_id",
+		"c.capture_lease_token",
+		"c.capture_sequence",
 		"ORDER BY c.id ASC",
 		"LIMIT $3",
 	} {
@@ -89,6 +92,15 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 	// by insert order). Both purged and released must be excluded from the pull feed.
 	live1 := insertClip(ownerRecID, 111, false, false)
 	live2 := insertClip(ownerRecID, 222, false, false)
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_clips
+		SET recording_job_id=7001,
+		    capture_lease_token=md5('account-clips-stitch-order')::uuid,
+		    capture_sequence=CASE id WHEN $1 THEN 2 ELSE 1 END
+		WHERE id IN ($1,$2)
+	`, live1, live2); err != nil {
+		t.Fatalf("set clip stitch provenance: %v", err)
+	}
 	purged := insertClip(ownerRecID, 333, true, false)
 	released := insertClip(ownerRecID, 666, false, true)
 	live3 := insertClip(ownerRecID, 444, false, false)
@@ -117,6 +129,31 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 		if c["sha256"] != strings.Repeat("a", 64) {
 			t.Fatalf("unexpected sha256: %v", c["sha256"])
 		}
+		if _, ok := c["recording_job_id"]; !ok {
+			t.Fatalf("clip omitted recording_job_id stitch provenance: %v", c)
+		}
+		if _, ok := c["capture_generation"]; !ok {
+			t.Fatalf("clip omitted capture_generation stitch provenance: %v", c)
+		}
+		if _, ok := c["capture_sequence"]; !ok {
+			t.Fatalf("clip omitted capture_sequence stitch provenance: %v", c)
+		}
+		if int64(c["clip_id"].(float64)) == live1 {
+			if c["recording_job_id"] != float64(7001) || c["capture_sequence"] != float64(2) {
+				t.Fatalf("clip stitch provenance changed: %v", c)
+			}
+			generation, ok := c["capture_generation"].(string)
+			if !ok || !strings.HasPrefix(generation, "sha256:") {
+				t.Fatalf("capture generation must be a non-reversible fingerprint: %v", c["capture_generation"])
+			}
+		}
+	}
+	// Delivery remains monotonic by clip ID even when concurrent uploads commit in
+	// the opposite media order. The shared generation plus sequence 2,1 lets a NAS
+	// archive reconstruct the canonical 1,2 stitch order after the full generation.
+	if page.Clips[0]["capture_sequence"] != float64(2) || page.Clips[1]["capture_sequence"] != float64(1) ||
+		page.Clips[0]["capture_generation"] != page.Clips[1]["capture_generation"] {
+		t.Fatalf("cursor delivery lost canonical out-of-order stitch provenance: %v", page.Clips[:2])
 	}
 
 	// (c) Cursor monotonic: after_id=live1 filters to id>live1 (drops live1, keeps
@@ -371,7 +408,10 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			display_path TEXT NOT NULL DEFAULT 'clips/test.mp4',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now() - interval '10 minutes',
 			purged_at TIMESTAMPTZ,
-			released_at TIMESTAMPTZ
+			released_at TIMESTAMPTZ,
+			recording_job_id BIGINT,
+			capture_lease_token UUID,
+			capture_sequence BIGINT
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

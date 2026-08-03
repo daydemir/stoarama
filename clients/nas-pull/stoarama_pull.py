@@ -423,6 +423,39 @@ def release_clip(cfg, recording_id, clip_id):
             raise
 
 
+def stitch_sidecar_path(clip_path):
+    return clip_path.with_name(clip_path.name + ".stoarama.json")
+
+
+def stitch_provenance(clip):
+    """Return the durable metadata needed to order and verify this clip later.
+
+    The pull feed is deliberately ID-cursor ordered for exactly-once delivery,
+    while concurrent uploads may commit out of media order. Generation-aware
+    clips must therefore be grouped by capture_generation and ordered by
+    capture_sequence. Legacy clips have null provenance and fall back to their
+    explicit clip timestamps.
+    """
+    return {
+        "schema_version": 1,
+        "clip_id": int(clip["clip_id"]),
+        "recording_id": int(clip["recording_id"]),
+        "recording_job_id": clip.get("recording_job_id"),
+        "capture_generation": clip.get("capture_generation"),
+        "capture_sequence": clip.get("capture_sequence"),
+        "clip_start_at": clip.get("clip_start_at"),
+        "clip_end_at": clip.get("clip_end_at"),
+        "size_bytes": int(clip["size_bytes"]),
+        "sha256": str(clip.get("sha256", "")).lower(),
+        "relative_path": str(clip.get("relative_path", "")),
+    }
+
+
+def write_stitch_sidecar(clip_path, clip):
+    payload = json.dumps(stitch_provenance(clip), sort_keys=True, separators=(",", ":"))
+    atomic_write(stitch_sidecar_path(clip_path), (payload + "\n").encode("utf-8"))
+
+
 def process_clip(cfg, clip, release=True):
     clip_id = int(clip["clip_id"])
     recording_id = int(clip["recording_id"])
@@ -458,6 +491,10 @@ def process_clip(cfg, clip, release=True):
         os.replace(str(temp_path), str(final_path))
         fsync_dir(final_path.parent)
         downloaded_bytes = expected_bytes
+    # Persist stitch provenance durably before releasing the server-side row.
+    # If the process crashes after this write, replay safely verifies the MP4 and
+    # rewrites the same deterministic sidecar before retrying release.
+    write_stitch_sidecar(final_path, clip)
     if release and not cfg.dry_run:
         _, release_retries = retry_transient(
             lambda: release_clip(cfg, recording_id, clip_id), clip_id, "release"

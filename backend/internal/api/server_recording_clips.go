@@ -1331,7 +1331,8 @@ func deliveryObjectKey(keyPrefix string, recordingID, clipID int64, sourceObject
 const accountClipsCommitWatermark = `interval '90 seconds'`
 
 const accountClipsCursorSQL = `
-	SELECT c.id, c.recording_id, c.size_bytes, c.sha256, c.clip_start_at, c.clip_end_at, c.display_path
+	SELECT c.id, c.recording_id, c.size_bytes, c.sha256, c.clip_start_at, c.clip_end_at, c.display_path,
+	       c.recording_job_id, c.capture_lease_token, c.capture_sequence
 	FROM recording_clips c
 	JOIN recordings r ON r.id = c.recording_id
 	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
@@ -1346,8 +1347,11 @@ const accountClipsCursorSQL = `
 // unpurged clips, ordered by the monotonic clip id, for the NAS pull client.
 // It is mounted under requireAccountAuth so a Bearer sir_ account API key can
 // drain it. Each row carries a download_path to the existing per-recording clip
-// download endpoint; object_key is never exposed. next_after_id is the max clip
-// id in the page (the client's next cursor), or null when the page is empty.
+// download endpoint; object_key is never exposed. The response order is delivery
+// order, not stitch order: recording_job_id, capture_generation, and
+// capture_sequence give clients the canonical lossless ordering within a capture
+// generation. next_after_id is the max clip id in the page (the client's next
+// cursor), or null when the page is empty.
 func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -1368,15 +1372,19 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 	var nextAfterID *int64
 	for rows.Next() {
 		var (
-			clipID      int64
-			recordingID int64
-			sizeBytes   int64
-			sha256      string
-			clipStartAt time.Time
-			clipEndAt   *time.Time
-			displayPath string
+			clipID            int64
+			recordingID       int64
+			sizeBytes         int64
+			sha256            string
+			clipStartAt       time.Time
+			clipEndAt         *time.Time
+			displayPath       string
+			recordingJobID    *int64
+			captureLeaseToken *uuid.UUID
+			captureSequence   *int64
 		)
-		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &sha256, &clipStartAt, &clipEndAt, &displayPath); err != nil {
+		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &sha256, &clipStartAt, &clipEndAt, &displayPath,
+			&recordingJobID, &captureLeaseToken, &captureSequence); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan account clip: %v", err))
 			return
 		}
@@ -1393,6 +1401,12 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 			"clip_end_at":   endAt,
 			"relative_path": displayPath,
 			"download_path": fmt.Sprintf("/api/v1/account/recordings/%d/clips/%d/download", recordingID, clipID),
+			// The feed remains ID-cursor ordered for exactly-once delivery. Concurrent
+			// uploads may commit out of media order, so stitchers must order within a
+			// capture generation by capture_sequence instead of response position.
+			"recording_job_id":   recordingJobID,
+			"capture_generation": captureGenerationFingerprint(captureLeaseToken),
+			"capture_sequence":   captureSequence,
 		})
 		id := clipID
 		nextAfterID = &id
