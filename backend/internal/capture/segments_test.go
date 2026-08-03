@@ -679,7 +679,7 @@ func TestValidateConcatFiles(t *testing.T) {
 			t.Fatalf("stitch call missing %q:\n%s", want, stitch)
 		}
 	}
-	stitchArgs := strings.Fields(stitch)
+	stitchArgs := strings.Split(strings.TrimSpace(stitch), "\n")
 	stitchedPath := stitchArgs[len(stitchArgs)-1]
 	for _, want := range []string{"-xerror\n", "-err_detect\nexplode\n", "-i\n" + stitchedPath + "\n", "-map\n0:v:0\n", "-map\n0:a?\n", "-f\nnull\n-\n"} {
 		if !strings.Contains(decode, want) {
