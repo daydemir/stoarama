@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -537,6 +538,7 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-nostdin",
+		"-live_start_index -1",
 		"-fflags +discardcorrupt",
 		"-i https://example.com/live.m3u8",
 		"-map 0:v:0",
@@ -553,6 +555,11 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 			t.Fatalf("expected %q in continuous args: %s", want, joined)
 		}
 	}
+	liveEdge := slices.Index(args, "-live_start_index")
+	input := slices.Index(args, "-i")
+	if liveEdge < 0 || input < 0 || liveEdge > input {
+		t.Fatalf("HLS live-edge option must be input-scoped before -i: %s", joined)
+	}
 	// The persistent muxer must NOT carry the single-clip -t bound.
 	for _, field := range args {
 		if field == "-t" {
@@ -563,6 +570,36 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 		if strings.Contains(joined, unwanted) {
 			t.Fatalf("source/native continuous capture should not transcode (%q): %s", unwanted, joined)
 		}
+	}
+}
+
+func TestBuildFFmpegContinuousArgsDoesNotSendHLSOptionToHTTPVideo(t *testing.T) {
+	args := buildFFmpegContinuousArgs("https://example.com/live.mp4?token=secret", "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", nil)
+	if slices.Contains(args, "-live_start_index") {
+		t.Fatalf("non-HLS input received HLS-only option: %s", strings.Join(args, " "))
+	}
+}
+
+func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		sourceURL string
+		wantHLS   bool
+	}{
+		{name: "signed HLS URL", sourceURL: "https://example.com/live.m3u8?token=test", wantHLS: true},
+		{name: "malformed URL", sourceURL: "https://example.com/live%ZZ.m3u8", wantHLS: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := []string{"-nostdin"}
+			args := appendHLSLiveEdgeInputArgs(slices.Clone(base), tt.sourceURL)
+			if got := slices.Contains(args, "-live_start_index"); got != tt.wantHLS {
+				t.Fatalf("HLS option presence=%t want=%t: %v", got, tt.wantHLS, args)
+			}
+			if !tt.wantHLS && !slices.Equal(args, base) {
+				t.Fatalf("non-HLS args changed: got=%v want=%v", args, base)
+			}
+		})
 	}
 }
 
