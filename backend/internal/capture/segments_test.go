@@ -319,9 +319,8 @@ func TestFinalizedSegmentRetryWithExistingTimelineDoesNotAdvanceUntilAck(t *test
 	processed := map[string]bool{}
 	initialNext := time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC)
 	nextStart := initialNext
-	// The chain leads this segment's strftime label, but by less than
-	// continuousChainDriftLimit, so chaining still wins and the assertions below
-	// are about retry identity rather than about how far the chain may drift.
+	// The chain leads this segment's strftime label; media order still wins, so
+	// the assertions below are about retry identity.
 	segment := Segment{
 		StartAt:    time.Date(2026, 7, 28, 12, 59, 30, 0, time.UTC),
 		EndAt:      time.Date(2026, 7, 28, 13, 0, 30, 0, time.UTC),
@@ -375,14 +374,34 @@ func TestZeroDurationFinalizedSegmentsUseDistinctTimelineKeys(t *testing.T) {
 	}
 }
 
-func TestContinuousChainReanchorsWhenMediaOutrunsWallClock(t *testing.T) {
-	// A DVR-backed playlist hands ffmpeg more media than wall-clock time, so the
-	// chained timeline walks into the future. Once it is further ahead of the
-	// segment's own strftime open instant than the drift limit, the chain must
-	// re-anchor to that instant instead of compounding (stream 14478 reached 26
-	// minutes ahead).
+func TestDuplicateContinuousSegmentDoesNotAdvanceMediaClock(t *testing.T) {
+	processed := map[string]bool{}
+	nextStart := time.Date(2026, 8, 3, 13, 10, 0, 0, time.UTC)
+	segment := Segment{
+		StartAt:    nextStart.Add(-time.Minute),
+		EndAt:      nextStart,
+		DurationMs: 60_000,
+	}
+	if err := deliverContinuousSegment(processed, "replayed.mp4", segment, &nextStart, func(Segment) error {
+		return ErrContinuousSegmentDuplicate
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !processed["replayed.mp4"] {
+		t.Fatal("duplicate file was not marked processed")
+	}
+	want := time.Date(2026, 8, 3, 13, 10, 0, 0, time.UTC)
+	if !nextStart.Equal(want) {
+		t.Fatalf("duplicate advanced media clock to %s want %s", nextStart, want)
+	}
+}
+
+func TestContinuousChainNeverMovesBackwardWhenMediaOutrunsWallClock(t *testing.T) {
+	// A DVR-backed playlist can hand ffmpeg more media than wall-clock time. Files
+	// from one persistent muxer remain in media order, so a large lead must stay
+	// end-to-start rather than jumping backward to the filename label.
 	label := time.Date(2026, 7, 31, 19, 30, 0, 0, time.UTC)
-	drifted := label.Add(continuousChainDriftLimit + time.Second)
+	drifted := label.Add(3 * time.Minute)
 	nextStart := drifted
 	var got Segment
 	deliver := func(segment Segment) error {
@@ -393,11 +412,11 @@ func TestContinuousChainReanchorsWhenMediaOutrunsWallClock(t *testing.T) {
 	if err := deliverContinuousSegment(map[string]bool{}, "drifted.mp4", segment, &nextStart, deliver); err != nil {
 		t.Fatal(err)
 	}
-	if !got.StartAt.Equal(label) {
-		t.Fatalf("drifted start=%s want re-anchor to %s", got.StartAt, label)
+	if !got.StartAt.Equal(drifted) {
+		t.Fatalf("drifted start=%s want monotonic chain at %s", got.StartAt, drifted)
 	}
-	if want := label.Add(time.Minute); !nextStart.Equal(want) {
-		t.Fatalf("timeline=%s want %s (chain must continue from the re-anchor)", nextStart, want)
+	if want := drifted.Add(time.Minute); !nextStart.Equal(want) {
+		t.Fatalf("timeline=%s want %s", nextStart, want)
 	}
 
 	// Within the limit the chain still wins, so ordinary sub-second jitter does
@@ -411,7 +430,8 @@ func TestContinuousChainReanchorsWhenMediaOutrunsWallClock(t *testing.T) {
 		t.Fatalf("jittered start=%s want chained %s", got.StartAt, chained)
 	}
 
-	// A chain that lags the label is the catch-up case and must keep chaining.
+	// A chain that lags the label also keeps chaining; there is no reconnect gap
+	// between files written by one persistent muxer.
 	nextStart = label.Add(-2 * time.Hour)
 	lagging := nextStart
 	if err := deliverContinuousSegment(map[string]bool{}, "lagging.mp4", segment, &nextStart, deliver); err != nil {

@@ -429,6 +429,13 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// leaves the previous attempt's value untouched, as the inline path did).
 	segmentDeliveryPending := false
 	var captureSequence int64
+	seenSegmentSHA := make(map[string]struct{})
+	// CaptureContinuous owns one media chain per ffmpeg attempt. This job-scoped
+	// high-water mark preserves genuine reconnect downtime while ensuring a
+	// restarted resolver or DVR tail can never move behind accepted footage.
+	// Only timeline metadata changes; source MP4 bytes are never trimmed or
+	// transcoded here.
+	var timelineEnd time.Time
 	progress := newContinuousProgress(time.Now())
 	deliverSegment := func(sourceURL string, seg capture.Segment) error {
 		if !w.diskHasSpace(w.cfg.MinActiveFreeBytes) {
@@ -610,9 +617,24 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return deliverSegment(resolved, seg)
 		})
 		submitInCaptureOrder := func(seg capture.Segment) error {
-			captureSequence++
-			seg.CaptureSequence = captureSequence
-			return pool.Submit(seg)
+			if _, duplicate := seenSegmentSHA[seg.SHA256]; seg.SHA256 != "" && duplicate {
+				// A reconnect may replay the tail of an HLS playlist. Do not enqueue,
+				// sequence, or advance either media clock for exact bytes already
+				// accepted by this worker generation.
+				capture.RemoveSegmentFile(seg)
+				return capture.ErrContinuousSegmentDuplicate
+			}
+			seg = clampContinuousSegmentTimeline(seg, timelineEnd)
+			seg.CaptureSequence = captureSequence + 1
+			if err := pool.Submit(seg); err != nil {
+				return err
+			}
+			captureSequence = seg.CaptureSequence
+			timelineEnd = seg.EndAt
+			if seg.SHA256 != "" {
+				seenSegmentSHA[seg.SHA256] = struct{}{}
+			}
+			return nil
 		}
 		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", job.TargetFPS, outDir, submitInCaptureOrder, inputHeaders)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
@@ -685,6 +707,24 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	}
 	w.cfg.RelayDiagnostics.Finish(job.JobID, "done", nil)
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
+}
+
+// clampContinuousSegmentTimeline preserves a real reconnect gap when the new
+// attempt starts after prior media, but forbids a backward seam when it starts
+// behind the job's accepted capture sequence.
+func clampContinuousSegmentTimeline(seg capture.Segment, timelineEnd time.Time) capture.Segment {
+	if timelineEnd.IsZero() || !seg.StartAt.Before(timelineEnd) {
+		return seg
+	}
+	seg.StartAt = timelineEnd
+	if seg.DurationMs > 0 {
+		seg.EndAt = seg.StartAt.Add(time.Duration(seg.DurationMs) * time.Millisecond)
+	} else {
+		// Match CaptureContinuous's unknown-duration fallback so two clamped
+		// segments cannot reuse the same millisecond idempotency key.
+		seg.EndAt = seg.StartAt.Add(time.Millisecond)
+	}
+	return seg
 }
 
 type segmentDeliveryOps struct {

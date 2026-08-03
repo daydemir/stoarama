@@ -205,6 +205,41 @@ func TestContinuousProgressIsConcurrentAndMonotonic(t *testing.T) {
 	}
 }
 
+func TestClampContinuousSegmentTimelineAcrossReconnects(t *testing.T) {
+	priorEnd := time.Date(2026, 8, 3, 13, 10, 0, 0, time.UTC)
+
+	// A replayed/DVR-backed attempt continues at the accepted media end.
+	replayed := capture.Segment{
+		StartAt:    priorEnd.Add(-2 * time.Minute),
+		EndAt:      priorEnd.Add(-time.Minute),
+		DurationMs: 60_000,
+	}
+	got := clampContinuousSegmentTimeline(replayed, priorEnd)
+	if !got.StartAt.Equal(priorEnd) || !got.EndAt.Equal(priorEnd.Add(time.Minute)) {
+		t.Fatalf("replayed segment=%+v want start=%s end=%s", got, priorEnd, priorEnd.Add(time.Minute))
+	}
+
+	// Actual reconnect downtime remains visible rather than being collapsed.
+	afterGap := capture.Segment{
+		StartAt:    priorEnd.Add(37 * time.Second),
+		EndAt:      priorEnd.Add(97 * time.Second),
+		DurationMs: 60_000,
+	}
+	got = clampContinuousSegmentTimeline(afterGap, priorEnd)
+	if !got.StartAt.Equal(afterGap.StartAt) || !got.EndAt.Equal(afterGap.EndAt) {
+		t.Fatalf("real reconnect gap changed: got=%+v want=%+v", got, afterGap)
+	}
+
+	unknownDuration := capture.Segment{
+		StartAt: priorEnd.Add(-time.Minute),
+		EndAt:   priorEnd.Add(-time.Minute),
+	}
+	got = clampContinuousSegmentTimeline(unknownDuration, priorEnd)
+	if !got.StartAt.Equal(priorEnd) || !got.EndAt.Equal(priorEnd.Add(time.Millisecond)) {
+		t.Fatalf("unknown-duration segment=%+v want distinct 1ms timeline key", got)
+	}
+}
+
 func TestUploadWorkersDefaultsToBoundedConcurrency(t *testing.T) {
 	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: "https://api.test", NodeToken: "test"})
 	if err != nil {
