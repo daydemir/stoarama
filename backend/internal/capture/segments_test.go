@@ -538,6 +538,8 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-nostdin",
+		"-reconnect_at_eof 1",
+		"-reconnect_delay_total_max 15",
 		"-live_start_index -1",
 		"-fflags +discardcorrupt",
 		"-i https://example.com/live.m3u8",
@@ -556,9 +558,11 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 		}
 	}
 	liveEdge := slices.Index(args, "-live_start_index")
+	reconnectAtEOF := slices.Index(args, "-reconnect_at_eof")
+	reconnectBudget := slices.Index(args, "-reconnect_delay_total_max")
 	input := slices.Index(args, "-i")
-	if liveEdge < 0 || input < 0 || liveEdge > input {
-		t.Fatalf("HLS live-edge option must be input-scoped before -i: %s", joined)
+	if reconnectAtEOF < 0 || reconnectBudget < 0 || liveEdge < 0 || input < 0 || reconnectAtEOF > input || reconnectBudget > input || liveEdge > input {
+		t.Fatalf("HLS reconnect/live-edge options must be input-scoped before -i: %s", joined)
 	}
 	// The persistent muxer must NOT carry the single-clip -t bound.
 	for _, field := range args {
@@ -575,8 +579,10 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 
 func TestBuildFFmpegContinuousArgsDoesNotSendHLSOptionToHTTPVideo(t *testing.T) {
 	args := buildFFmpegContinuousArgs("https://example.com/live.mp4?token=secret", "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", nil)
-	if slices.Contains(args, "-live_start_index") {
-		t.Fatalf("non-HLS input received HLS-only option: %s", strings.Join(args, " "))
+	for _, option := range []string{"-reconnect_at_eof", "-reconnect_delay_total_max", "-live_start_index"} {
+		if slices.Contains(args, option) {
+			t.Fatalf("non-HLS input received HLS-only option %q: %s", option, strings.Join(args, " "))
+		}
 	}
 }
 
@@ -593,8 +599,10 @@ func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			base := []string{"-nostdin"}
 			args := appendHLSLiveEdgeInputArgs(slices.Clone(base), tt.sourceURL)
-			if got := slices.Contains(args, "-live_start_index"); got != tt.wantHLS {
-				t.Fatalf("HLS option presence=%t want=%t: %v", got, tt.wantHLS, args)
+			for _, option := range []string{"-reconnect_at_eof", "-reconnect_delay_total_max", "-live_start_index"} {
+				if got := slices.Contains(args, option); got != tt.wantHLS {
+					t.Fatalf("HLS option %q presence=%t want=%t: %v", option, got, tt.wantHLS, args)
+				}
 			}
 			if !tt.wantHLS && !slices.Equal(args, base) {
 				t.Fatalf("non-HLS args changed: got=%v want=%v", args, base)

@@ -12,26 +12,33 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The threshold is a deliberate, measured value rather than a knob: laptops in
-// the fleet sleep for up to ~30 min and must not page. Assert it directly so a
-// well-meaning revert to a "more responsive" value is caught here.
-func TestRelayOnlineThresholdIsFleetSleepTolerant(t *testing.T) {
-	if relayOnlineThreshold != 45*time.Minute {
-		t.Fatalf("relayOnlineThreshold = %v, want 45m: shorter values page on laptop sleep (measured max gap 30.5m)", relayOnlineThreshold)
+// The thresholds are deliberate, measured values rather than knobs: an idle
+// laptop may sleep for ~30 minutes, but a node carrying footage must page before
+// its outage becomes a five-minute stitching gap.
+func TestRelayThresholdsSeparateIdlePresenceFromActiveCapture(t *testing.T) {
+	if relayIdleOnlineThreshold != 45*time.Minute {
+		t.Fatalf("relayIdleOnlineThreshold = %v, want 45m: shorter values page on idle laptop sleep", relayIdleOnlineThreshold)
+	}
+	if relayCapturingOnlineThreshold != 2*time.Minute {
+		t.Fatalf("relayCapturingOnlineThreshold = %v, want 2m", relayCapturingOnlineThreshold)
 	}
 }
 
-func TestRelayStateAtUsesFleetThreshold(t *testing.T) {
+func TestRelayStateAtUsesCaptureAwareThreshold(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
-		name string
-		last *time.Time
-		want relayConnectivityState
+		name   string
+		last   *time.Time
+		active bool
+		want   relayConnectivityState
 	}{
 		{name: "never seen", want: relayOffline},
 		{name: "fresh", last: timePtr(now.Add(-119 * time.Second)), want: relayOnline},
-		{name: "threshold is offline", last: timePtr(now.Add(-relayOnlineThreshold)), want: relayOffline},
-		// Pinned to absolute durations, not to relayOnlineThreshold, so a revert
+		{name: "idle threshold is offline", last: timePtr(now.Add(-relayIdleOnlineThreshold)), want: relayOffline},
+		{name: "capturing two minute threshold is offline", last: timePtr(now.Add(-relayCapturingOnlineThreshold)), active: true, want: relayOffline},
+		{name: "next minute cron catches outage before lease reclaim", last: timePtr(now.Add(-140 * time.Second)), active: true, want: relayOffline},
+		{name: "capturing relay alerts before five minute gap", last: timePtr(now.Add(-4 * time.Minute)), active: true, want: relayOffline},
+		// Pinned to absolute durations, not to the named constants, so a revert
 		// to a short threshold fails here instead of passing silently. A sleeping
 		// laptop's longest measured gap was 30.5 min; 44m must still read online.
 		{name: "sleeping laptop gap stays online", last: timePtr(now.Add(-44 * time.Minute)), want: relayOnline},
@@ -39,10 +46,24 @@ func TestRelayStateAtUsesFleetThreshold(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := relayStateAt(tc.last, now); got != tc.want {
+			if got := relayStateAt(tc.last, tc.active, now); got != tc.want {
 				t.Fatalf("relayStateAt=%s want %s", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRelayObservedStateRequiresFreshHeartbeatToClearFastOffline(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	stale := now.Add(-4 * time.Minute)
+	state := relayConnectivityTransition{State: relayOnline, LastHeartbeatAt: &stale}
+	if got := relayObservedState(state, relayOffline, now); got != relayOffline {
+		t.Fatalf("idle threshold manufactured recovery=%s, want offline", got)
+	}
+	fresh := now.Add(-time.Minute)
+	state.LastHeartbeatAt = &fresh
+	if got := relayObservedState(state, relayOffline, now); got != relayOnline {
+		t.Fatalf("fresh heartbeat recovery=%s, want online", got)
 	}
 }
 
@@ -102,6 +123,7 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL);
 		CREATE TABLE users (email TEXT PRIMARY KEY, is_operator BOOLEAN NOT NULL);
 		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, display_name TEXT NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGSERIAL PRIMARY KEY, lease_owner TEXT, status TEXT NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, window_end_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_states (node_id BIGINT PRIMARY KEY, observed_state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL);
 		CREATE TABLE relay_connectivity_alert_events (id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL, node_id BIGINT NOT NULL, state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, last_heartbeat_at TIMESTAMPTZ, notified_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_deliveries (event_id BIGINT NOT NULL, recipient TEXT NOT NULL, delivered_at TIMESTAMPTZ, PRIMARY KEY (event_id, recipient));
@@ -118,6 +140,20 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	states, err := currentRelayConnectivity(ctx, pool, now)
 	if err != nil || len(states) != 1 || states[0].OrgName != "MIT SCL" {
 		t.Fatalf("alert-scoped relay states=%v err=%v", states, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7;
+		INSERT INTO recording_jobs (lease_owner,status,kind,fire_at,window_end_at)
+		VALUES ('node:7','leased','continuous_window',$2,$3)
+	`, now.Add(-4*time.Minute), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	states, err = currentRelayConnectivity(ctx, pool, now)
+	if err != nil || len(states) != 1 || !states[0].ActiveCapture || states[0].State != relayOffline {
+		t.Fatalf("capturing stale relay states=%v err=%v, want fast offline", states, err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs; UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
+		t.Fatal(err)
 	}
 	if got, err := recordRelayConnectivity(ctx, pool, now); err != nil || len(got) != 0 {
 		t.Fatalf("baseline transitions=%v err=%v, want none", got, err)
@@ -140,7 +176,7 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now.Add(-relayOnlineThreshold)); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now.Add(-relayIdleOnlineThreshold)); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := recordRelayConnectivity(ctx, pool, now); err != nil || len(got) != 1 || got[0].State != relayOffline {

@@ -574,16 +574,27 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 // an HLS source's already-published tail drain faster than wall time after each
 // restart. The recorder then chains those media durations onto wall-clock file
 // labels and eventually has to jump backward, creating overlapping clip times.
+// It also asks FFmpeg's HTTP layer to reconnect when a live manifest connection
+// reports EOF. Some endless HLS origins close established TLS connections this
+// way; the generic network-error option only covers connection-time failures.
+// Bound the internal retry budget so a persistently dead or expired signed URL
+// returns to recordingworker's outer loop, which re-resolves a fresh URL, rather
+// than waiting for the longer no-output watchdog.
 //
-// This is an HLS demuxer input option, so it must appear before -i and must not
-// be sent to ordinary HTTP video inputs. A resolved manifest's URL path is the
-// reliable discriminator; query strings do not affect the .m3u8 suffix.
+// These are input-scoped HLS/HTTP options, so they must appear before -i and
+// must not be sent to ordinary HTTP video inputs. A resolved manifest's URL
+// path is the reliable discriminator; query strings do not affect the .m3u8
+// suffix.
 func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
 	u, err := url.Parse(strings.TrimSpace(sourceURL))
 	if err != nil || !strings.EqualFold(filepath.Ext(u.Path), ".m3u8") {
 		return args
 	}
-	return append(args, "-live_start_index", "-1")
+	return append(args,
+		"-reconnect_at_eof", "1",
+		"-reconnect_delay_total_max", "15",
+		"-live_start_index", "-1",
+	)
 }
 
 // ProbeReachable verifies that sourceURL opens and yields at least one packet

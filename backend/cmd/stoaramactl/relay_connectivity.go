@@ -16,7 +16,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/email"
 )
 
-// relayOnlineThreshold is deliberately long. Laptops in the fleet sleep and
+// relayIdleOnlineThreshold is deliberately long. Laptops in the fleet sleep and
 // dark-wake, which is indistinguishable from a short outage at the heartbeat
 // level, so a short threshold pages on healthy hardware. MIT-MAC-1 (a MacBook
 // Air) produced 86 alert events in 7 days -- 66% of all relay alerts -- while
@@ -32,7 +32,14 @@ import (
 // Duration hysteresis rather than a rate limit or a mute: a genuinely dead node
 // still pages within the hour, which is what this alert exists for. A per-node
 // cap would drop the one message that matters -- the outage that does not end.
-const relayOnlineThreshold = 45 * time.Minute
+const relayIdleOnlineThreshold = 45 * time.Minute
+
+// A relay that currently owns a continuous capture window is production
+// infrastructure, not an idle presence indicator. The API treats a relay
+// heartbeat as live for 120 seconds, so use the same boundary. With a one-minute
+// cron this guarantees an observation before the scheduler's ~210-second lease
+// reclaim can clear the dead node's ownership and hide that it was capturing.
+const relayCapturingOnlineThreshold = 2 * time.Minute
 const relayConnectivityLockID int64 = 821754932
 const relayConnectivityAlertAccountID int64 = 47
 
@@ -53,6 +60,7 @@ type relayConnectivityTransition struct {
 	State           relayConnectivityState
 	ChangedAt       time.Time
 	LastHeartbeatAt *time.Time
+	ActiveCapture   bool
 }
 
 func runRelayConnectivity(ctx context.Context, cfg config.Config, args []string) {
@@ -109,12 +117,18 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }, now time.Time) ([]relayConnectivityTransition, error) {
 	rows, err := q.Query(ctx, `
-		SELECT n.id, n.display_name, n.hostname, a.name, a.email, n.last_heartbeat_at
+		SELECT n.id, n.display_name, n.hostname, a.name, a.email, n.last_heartbeat_at,
+		       EXISTS (
+		         SELECT 1 FROM recording_jobs j
+		         WHERE j.lease_owner='node:'||n.id::text
+		           AND j.status='leased' AND j.kind='continuous_window'
+		           AND j.fire_at<=$2 AND j.window_end_at>$2
+		       ) AS active_capture
 		FROM nodes n
 		JOIN accounts a ON a.id=n.account_id
 		WHERE n.node_type='relay' AND n.status='active' AND n.account_id=$1
 		ORDER BY n.id
-	`, relayConnectivityAlertAccountID)
+	`, relayConnectivityAlertAccountID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -122,17 +136,21 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 	states := []relayConnectivityTransition{}
 	for rows.Next() {
 		var state relayConnectivityTransition
-		if err := rows.Scan(&state.NodeID, &state.Name, &state.Hostname, &state.OrgName, &state.OrgEmail, &state.LastHeartbeatAt); err != nil {
+		if err := rows.Scan(&state.NodeID, &state.Name, &state.Hostname, &state.OrgName, &state.OrgEmail, &state.LastHeartbeatAt, &state.ActiveCapture); err != nil {
 			return nil, err
 		}
-		state.State = relayStateAt(state.LastHeartbeatAt, now)
+		state.State = relayStateAt(state.LastHeartbeatAt, state.ActiveCapture, now)
 		states = append(states, state)
 	}
 	return states, rows.Err()
 }
 
-func relayStateAt(lastHeartbeatAt *time.Time, now time.Time) relayConnectivityState {
-	if lastHeartbeatAt != nil && now.Sub(*lastHeartbeatAt) < relayOnlineThreshold {
+func relayStateAt(lastHeartbeatAt *time.Time, activeCapture bool, now time.Time) relayConnectivityState {
+	threshold := relayIdleOnlineThreshold
+	if activeCapture {
+		threshold = relayCapturingOnlineThreshold
+	}
+	if lastHeartbeatAt != nil && now.Sub(*lastHeartbeatAt) < threshold {
 		return relayOnline
 	}
 	return relayOffline
@@ -167,6 +185,11 @@ func recordRelayConnectivity(ctx context.Context, pool *pgxpool.Pool, now time.T
 		if err != nil {
 			return nil, err
 		}
+		// Once a capturing relay has crossed the fast offline threshold, do not
+		// manufacture an "online" recovery merely because its work was handed
+		// elsewhere and the idle threshold became longer. Only a genuinely fresh
+		// heartbeat clears an offline transition.
+		state.State = relayObservedState(state, previous, now)
 		if previous == state.State {
 			continue
 		}
@@ -193,6 +216,14 @@ func recordRelayConnectivity(ctx context.Context, pool *pgxpool.Pool, now time.T
 		return nil, err
 	}
 	return pending, nil
+}
+
+func relayObservedState(state relayConnectivityTransition, previous relayConnectivityState, now time.Time) relayConnectivityState {
+	if previous == relayOffline && state.State == relayOnline &&
+		relayStateAt(state.LastHeartbeatAt, true, now) == relayOffline {
+		return relayOffline
+	}
+	return state.State
 }
 
 func pendingRelayConnectivity(ctx context.Context, q interface {
