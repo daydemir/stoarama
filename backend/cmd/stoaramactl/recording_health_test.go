@@ -2,35 +2,158 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestShouldNotifyHealthIncident(t *testing.T) {
-	runStart := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name          string
 		newlyInserted bool
 		lastAlertedAt time.Time
 		want          bool
 	}{
-		{"newly inserted always notifies", true, runStart.Add(-48 * time.Hour), true},
-		{"restamped this cycle notifies", false, runStart.Add(2 * time.Second), true},
-		{"restamped exactly at runStart notifies", false, runStart, true},
-		{"stale last_alerted stays quiet", false, runStart.Add(-3 * time.Hour), false},
+		{"newly inserted always notifies", true, now, true},
+		{"never delivered retries", false, time.Time{}, true},
+		{"older than 24h renotifies", false, now.Add(-24*time.Hour - time.Second), true},
+		{"exactly 24h stays quiet", false, now.Add(-24 * time.Hour), false},
+		{"recent successful delivery stays quiet", false, now.Add(-3 * time.Hour), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldNotifyHealthIncident(tc.newlyInserted, tc.lastAlertedAt, runStart); got != tc.want {
+			if got := shouldNotifyHealthIncident(tc.newlyInserted, tc.lastAlertedAt, now); got != tc.want {
 				t.Fatalf("shouldNotifyHealthIncident=%v want %v", got, tc.want)
 			}
 		})
 	}
+}
+
+func TestDeliverRecordingHealthEmailRejectsUndeliverableProvider(t *testing.T) {
+	sent, err := deliverRecordingHealthEmail(context.Background(), nil, config.Config{EmailProvider: "log"}, sampleIncidents())
+	if err == nil || sent != 0 {
+		t.Fatalf("sent=%d err=%v, want zero and retryable error", sent, err)
+	}
+}
+
+func TestHealthAlertDeliveryTimestampOnlyAdvancesAfterAcknowledgement(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed delivery acknowledgement regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("health_delivery_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE recordings (id BIGINT PRIMARY KEY);
+		CREATE TABLE recorder_health_alerts (
+		  recording_id BIGINT NOT NULL REFERENCES recordings(id), signal TEXT NOT NULL,
+		  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT now(), resolved_at TIMESTAMPTZ,
+		  PRIMARY KEY(recording_id,signal));
+		INSERT INTO recordings VALUES (1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	inserted, last, err := upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || !inserted || !shouldNotifyHealthIncident(inserted, last, time.Now()) {
+		t.Fatalf("first detection inserted=%v last=%v err=%v", inserted, last, err)
+	}
+	inserted, last, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || inserted || !shouldNotifyHealthIncident(inserted, last, time.Now()) {
+		t.Fatalf("unacknowledged detection must retry inserted=%v last=%v err=%v", inserted, last, err)
+	}
+	incidents := []healthIncident{{RecordingID: 1, Signal: signalStoredClipInvalid}}
+	if err := markHealthAlertsDelivered(ctx, pool, incidents); err != nil {
+		t.Fatal(err)
+	}
+	inserted, last, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || shouldNotifyHealthIncident(inserted, last, time.Now()) {
+		t.Fatalf("acknowledged detection must dedup inserted=%v last=%v err=%v", inserted, last, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recorder_health_alerts SET resolved_at=now()`); err != nil {
+		t.Fatal(err)
+	}
+	inserted, last, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || !shouldNotifyHealthIncident(inserted, last, time.Now()) {
+		t.Fatalf("reopened detection must notify inserted=%v last=%v err=%v", inserted, last, err)
+	}
+	if err := resolveClearedHealthAlerts(ctx, pool, nil, evaluatedHealthSignals(false)); err != nil {
+		t.Fatal(err)
+	}
+	var resolved *time.Time
+	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=1 AND signal=$1`, signalStoredClipInvalid).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved != nil {
+		t.Fatal("hourly-only sweep falsely resolved daily media incident")
+	}
+	if err := resolveClearedHealthAlerts(ctx, pool, nil, evaluatedHealthSignals(true)); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=1 AND signal=$1`, signalStoredClipInvalid).Scan(&resolved); err != nil || resolved == nil {
+		t.Fatalf("media sweep did not resolve cleared media incident: resolved=%v err=%v", resolved, err)
+	}
+}
+
+func TestRecordingHealthRunLockSerializesSweeps(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run advisory-lock regression")
+	}
+	pool, err := pgxpool.New(context.Background(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	release, err := acquireRecordingHealthRunLock(context.Background(), pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if secondRelease, err := acquireRecordingHealthRunLock(blockedCtx, pool); err == nil {
+		secondRelease()
+		release()
+		t.Fatal("second concurrent health sweep acquired advisory lock")
+	}
+	release()
+	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer recoverCancel()
+	thirdRelease, err := acquireRecordingHealthRunLock(recoverCtx, pool)
+	if err != nil {
+		t.Fatalf("lock did not recover after release: %v", err)
+	}
+	thirdRelease()
 }
 
 func sampleIncidents() []healthIncident {
@@ -139,8 +262,75 @@ func TestMeasureStitchWindowEdgeCases(t *testing.T) {
 		{open, open.Add(time.Minute)},
 		{open.Add(time.Minute + 500*time.Millisecond), close},
 	}
-	if m := measureStitchWindow(open, close, adjacent); m.gapClips != 0 || m.overlapClips != 0 || m.maxGap != 0 {
+	if m := measureStitchWindow(open, close, adjacent); m.gapClips != 0 || m.overlapClips != 0 || m.maxGap != 500*time.Millisecond || m.coveragePct != 99.91666666666667 {
 		t.Fatalf("sub-tolerance join: %+v", m)
+	}
+	subsecondOverlap := [][2]time.Time{
+		{open, open.Add(5 * time.Minute)},
+		{open.Add(5*time.Minute - 500*time.Millisecond), close},
+	}
+	if m := measureStitchWindow(open, close, subsecondOverlap); m.overlapClips != 1 || m.overlapSeconds != 0.5 || m.coveragePct != 100 {
+		t.Fatalf("sub-second overlap must remain visible: %+v", m)
+	}
+}
+
+func TestMeasureStitchWindowCoverageThresholdAndAccumulatedTinyGaps(t *testing.T) {
+	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	close := open.Add(100 * time.Second)
+	exact95 := [][2]time.Time{{open, open.Add(95 * time.Second)}}
+	if m := measureStitchWindow(open, close, exact95); m.coveragePct != 95 {
+		t.Fatalf("exact threshold coverage=%v", m.coveragePct)
+	}
+	below95 := [][2]time.Time{{open, open.Add(94990 * time.Millisecond)}}
+	if m := measureStitchWindow(open, close, below95); !(m.coveragePct < 95) {
+		t.Fatalf("below threshold coverage=%v", m.coveragePct)
+	}
+	clips := make([][2]time.Time, 0, 10)
+	for i := 0; i < 10; i++ {
+		start := open.Add(time.Duration(i) * 10 * time.Second)
+		clips = append(clips, [2]time.Time{start, start.Add(9100 * time.Millisecond)})
+	}
+	m := measureStitchWindow(open, close, clips)
+	if m.coveragePct != 91 || m.gapClips != 0 || m.maxGap != 900*time.Millisecond {
+		t.Fatalf("tiny gaps must reduce exact coverage without fragmenting: %+v", m)
+	}
+}
+
+func TestVerifyStoredClipSHA(t *testing.T) {
+	sum := sha256.Sum256([]byte("stored clip"))
+	if err := verifyStoredClipSHA(sum[:], fmt.Sprintf("%x", sum[:])); err != nil {
+		t.Fatalf("matching sha: %v", err)
+	}
+	if err := verifyStoredClipSHA(sum[:], ""); err != nil {
+		t.Fatalf("legacy missing sha: %v", err)
+	}
+	if err := verifyStoredClipSHA(sum[:], strings.Repeat("0", 64)); err == nil {
+		t.Fatal("mismatched sha accepted")
+	}
+	if err := verifyStoredClipSHA(sum[:], "not-a-sha"); err == nil {
+		t.Fatal("invalid sha metadata accepted")
+	}
+	matching := fmt.Sprintf("%x", sum[:])
+	if err := verifyStoredClipSHA(sum[:], "  "+strings.ToUpper(matching)+"  "); err != nil {
+		t.Fatalf("normalized sha rejected: %v", err)
+	}
+	if err := verifyStoredClipSHA(sum[:], strings.Repeat("ab", 16)); err == nil {
+		t.Fatal("short valid-hex sha accepted")
+	}
+}
+
+func TestBoundedHealthDiagnostic(t *testing.T) {
+	short := "brief failure"
+	if got := boundedHealthDiagnostic(short); got != short {
+		t.Fatalf("short diagnostic=%q", got)
+	}
+	got := boundedHealthDiagnostic(strings.Repeat("x", mediaHealthDiagnosticLimit+100))
+	if len(got) <= mediaHealthDiagnosticLimit || !strings.HasSuffix(got, "…[truncated]") {
+		t.Fatalf("diagnostic not bounded/marked: len=%d suffix=%q", len(got), got[len(got)-20:])
+	}
+	unicodeValue := strings.Repeat("x", mediaHealthDiagnosticLimit-1) + "é trailing"
+	if got := boundedHealthDiagnostic(unicodeValue); !utf8.ValidString(got) {
+		t.Fatalf("diagnostic split UTF-8 rune: %q", got[len(got)-20:])
 	}
 }
 

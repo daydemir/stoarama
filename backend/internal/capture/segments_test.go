@@ -657,7 +657,7 @@ func TestParseSegmentStart(t *testing.T) {
 func TestValidateConcatFiles(t *testing.T) {
 	argsFile := filepath.Join(t.TempDir(), "args")
 	t.Setenv("ARGS_FILE", argsFile)
-	t.Setenv("FFMPEG_BIN", writeFakeFFmpeg(t, `printf '%s\n' "$@" > "$ARGS_FILE"`))
+	t.Setenv("FFMPEG_BIN", writeFakeFFmpeg(t, `printf '%s\n' "$@" >> "$ARGS_FILE"; printf '%s\n' '__CALL__' >> "$ARGS_FILE"`))
 
 	first := filepath.Join(t.TempDir(), "first clip.mp4")
 	second := filepath.Join(t.TempDir(), "second clip.mp4")
@@ -669,15 +669,21 @@ func TestValidateConcatFiles(t *testing.T) {
 		t.Fatalf("read fake ffmpeg args: %v", err)
 	}
 	joined := string(args)
-	outputPath := strings.LastIndex(joined, "\n-\n")
-	videoMap := strings.Index(joined, "-map\n0:v:0\n")
-	audioMap := strings.Index(joined, "-map\n0:a?\n")
-	if outputPath < 0 || videoMap < 0 || audioMap < 0 || videoMap > outputPath || audioMap > outputPath {
-		t.Fatalf("expected maps before null output:\n%s", joined)
+	calls := strings.Split(strings.TrimSpace(joined), "__CALL__")
+	if len(calls) != 3 || strings.TrimSpace(calls[2]) != "" {
+		t.Fatalf("expected stitch and strict decode calls:\n%s", joined)
 	}
-	for _, want := range []string{"-xerror\n", "-f\nconcat\n", "-safe\n0\n", "-map\n0:v:0\n", "-map\n0:a?\n", "-f\nnull\n"} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("expected %q in ffmpeg args:\n%s", want, joined)
+	stitch, decode := calls[0], calls[1]
+	for _, want := range []string{"-xerror\n", "-err_detect\nexplode\n", "-f\nconcat\n", "-safe\n0\n", "-map\n0:v:0\n", "-map\n0:a?\n", "-c\ncopy\n", "-avoid_negative_ts\nmake_zero\n", "-movflags\n+faststart\n", "-y\n"} {
+		if !strings.Contains(stitch, want) {
+			t.Fatalf("stitch call missing %q:\n%s", want, stitch)
+		}
+	}
+	stitchArgs := strings.Split(strings.TrimSpace(stitch), "\n")
+	stitchedPath := stitchArgs[len(stitchArgs)-1]
+	for _, want := range []string{"-xerror\n", "-err_detect\nexplode\n", "-i\n" + stitchedPath + "\n", "-map\n0:v:0\n", "-map\n0:a?\n", "-f\nnull\n-\n"} {
+		if !strings.Contains(decode, want) {
+			t.Fatalf("decode call missing %q:\n%s", want, decode)
 		}
 	}
 }
