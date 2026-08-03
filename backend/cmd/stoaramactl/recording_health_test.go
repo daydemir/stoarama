@@ -92,6 +92,10 @@ func TestDiagTextDropsBlanks(t *testing.T) {
 func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
 	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
 	close := open.Add(10 * time.Minute)
+	leading := [][2]time.Time{{open.Add(2 * time.Minute), close}}
+	if m := measureStitchWindow(open, close, leading); m.maxGap != 2*time.Minute {
+		t.Fatalf("leading gap: %+v", m)
+	}
 	clips := [][2]time.Time{
 		{open.Add(-time.Minute), open.Add(2 * time.Minute)},     // clipped at window edge
 		{open.Add(90 * time.Second), open.Add(3 * time.Minute)}, // 30s overlap
@@ -112,6 +116,31 @@ func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
 	}
 	if m.longestRun != 3*time.Minute {
 		t.Fatalf("longest run=%s want 3m", m.longestRun)
+	}
+}
+
+func TestMeasureStitchWindowEdgeCases(t *testing.T) {
+	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	close := open.Add(10 * time.Minute)
+	if m := measureStitchWindow(open, close, nil); m.coveragePct != 0 || m.gapClips != 0 {
+		t.Fatalf("empty window: %+v", m)
+	}
+	if m := measureStitchWindow(open, open, nil); m.coveragePct != 0 {
+		t.Fatalf("zero-length window: %+v", m)
+	}
+	contained := [][2]time.Time{
+		{open, open.Add(5 * time.Minute)},
+		{open.Add(time.Minute), open.Add(2 * time.Minute)},
+	}
+	if m := measureStitchWindow(open, close, contained); m.overlapClips != 1 || m.overlapSeconds != 60 || m.maxGap != 5*time.Minute {
+		t.Fatalf("contained clip: %+v", m)
+	}
+	adjacent := [][2]time.Time{
+		{open, open.Add(time.Minute)},
+		{open.Add(time.Minute + 500*time.Millisecond), close},
+	}
+	if m := measureStitchWindow(open, close, adjacent); m.gapClips != 0 || m.overlapClips != 0 || m.maxGap != 0 {
+		t.Fatalf("sub-tolerance join: %+v", m)
 	}
 }
 

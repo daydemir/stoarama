@@ -669,7 +669,13 @@ func TestValidateConcatFiles(t *testing.T) {
 		t.Fatalf("read fake ffmpeg args: %v", err)
 	}
 	joined := string(args)
-	for _, want := range []string{"-xerror\n", "-f\nconcat\n", "-safe\n0\n", "-map\n0:v:0\n", "-f\nnull\n"} {
+	outputPath := strings.LastIndex(joined, "\n-\n")
+	videoMap := strings.Index(joined, "-map\n0:v:0\n")
+	audioMap := strings.Index(joined, "-map\n0:a?\n")
+	if outputPath < 0 || videoMap < 0 || audioMap < 0 || videoMap > outputPath || audioMap > outputPath {
+		t.Fatalf("expected maps before null output:\n%s", joined)
+	}
+	for _, want := range []string{"-xerror\n", "-f\nconcat\n", "-safe\n0\n", "-map\n0:v:0\n", "-map\n0:a?\n", "-f\nnull\n"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("expected %q in ffmpeg args:\n%s", want, joined)
 		}
