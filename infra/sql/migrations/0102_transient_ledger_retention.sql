@@ -14,7 +14,7 @@ BEGIN
     END IF;
     CREATE INDEX idx_upload_intents_created_at ON upload_intents (created_at);
   ELSE
-    SELECT i.indisvalid AND i.indisready
+    SELECT i.indisvalid AND i.indisready AND i.indpred IS NULL
            AND i.indrelid = 'upload_intents'::regclass
            AND i.indnkeyatts = 1 AND a.attname = 'created_at'
       INTO index_ok
@@ -38,7 +38,7 @@ BEGIN
     END IF;
     CREATE INDEX idx_api_idempotency_created_at ON api_idempotency (created_at);
   ELSE
-    SELECT i.indisvalid AND i.indisready
+    SELECT i.indisvalid AND i.indisready AND i.indpred IS NULL
            AND i.indrelid = 'api_idempotency'::regclass
            AND i.indnkeyatts = 1 AND a.attname = 'created_at'
       INTO index_ok
