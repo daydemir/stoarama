@@ -345,17 +345,22 @@ func TestHeartbeatContinuesAfterCaptureWindowCloses(t *testing.T) {
 	if err := pool.Submit(capture.Segment{Path: "post-window.mp4"}); err != nil {
 		t.Fatal(err)
 	}
-	<-deliveryStarted
+	select {
+	case <-deliveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("delivery worker did not start")
+	}
 	drainDone := make(chan segmentDeliveryResult, 1)
 	go func() { drainDone <- pool.close() }()
 
 	// Match processContinuousJob: capture's child window closes while the pool
 	// drains on the still-live parent job context.
+	heartbeatsBeforeWindowClose := heartbeats.Load()
 	closeWindow()
 	if windowCtx.Err() == nil {
 		t.Fatal("capture window did not close")
 	}
-	waitFor(t, "post-window lease renewals", func() bool { return heartbeats.Load() >= 3 })
+	waitFor(t, "post-window lease renewals", func() bool { return heartbeats.Load() >= heartbeatsBeforeWindowClose+3 })
 	if canceled() || jobCtx.Err() != nil {
 		t.Fatal("window close canceled job heartbeat during delivery drain")
 	}
@@ -365,7 +370,12 @@ func TestHeartbeatContinuesAfterCaptureWindowCloses(t *testing.T) {
 	default:
 	}
 	close(releaseDelivery)
-	result := <-drainDone
+	var result segmentDeliveryResult
+	select {
+	case result = <-drainDone:
+	case <-time.After(time.Second):
+		t.Fatal("post-window delivery drain did not finish after upload release")
+	}
 	if result.err != nil || result.pending != 0 {
 		t.Fatalf("post-window delivery result=%+v", result)
 	}

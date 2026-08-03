@@ -164,11 +164,27 @@ type failingFleetDO struct {
 	lists   atomic.Int64
 	creates atomic.Int64
 	deletes atomic.Int64
+	listErr error
 }
 
 func (f *failingFleetDO) ListDropletsByName(context.Context, string, string) ([]DODroplet, error) {
 	f.lists.Add(1)
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return nil, errors.New("provider fleet unavailable")
+}
+
+func TestControllerTickPropagatesCancellationWithoutDegradationLatch(t *testing.T) {
+	provider := &failingFleetDO{listErr: fmt.Errorf("list interrupted: %w", context.Canceled)}
+	controller := &Controller{do: provider}
+	err := controller.tick(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("tick error=%v want wrapped cancellation", err)
+	}
+	if controller.fleetReadFailures != 0 || !controller.fleetReadFailureSince.IsZero() {
+		t.Fatalf("cancellation latched as outage: failures=%d since=%s", controller.fleetReadFailures, controller.fleetReadFailureSince)
+	}
 }
 
 func (f *failingFleetDO) CreateDroplet(context.Context, CreateDropletInput) (DODroplet, error) {

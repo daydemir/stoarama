@@ -121,6 +121,9 @@ func (c *Controller) tick(ctx context.Context) error {
 	// fleet read. Return before any decision code when reconciliation fails; the
 	// next ordinary tick retries from the read boundary.
 	if err := c.reconcile(ctx, now); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
 		if c.noteFleetReadFailure(now) {
 			log.Printf("droplet pool: CRITICAL fleet reconciliation degraded for %s across %d failed ticks; provider mutations remain paused: %v",
 				now.Sub(c.fleetReadFailureSince).Truncate(time.Second), c.fleetReadFailures, err)
