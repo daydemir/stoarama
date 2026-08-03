@@ -575,7 +575,9 @@ func (s *Server) runClipsZipJob(jobID, slug string, recordingID int64, clips []c
 	open := func(ctx context.Context, key string) (io.ReadCloser, error) {
 		source, ok := keySource[key]
 		if !ok {
-			return nil, fmt.Errorf("no client for object %s", key)
+			// Do not expose the internal destination-qualified lookup key through
+			// manifest.csv; it contains storage endpoint and credential metadata.
+			return nil, errors.New("no source client for clip")
 		}
 		return source.client.Open(ctx, source.objectKey)
 	}
