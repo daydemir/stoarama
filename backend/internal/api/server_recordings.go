@@ -2204,7 +2204,7 @@ func (s *Server) handleAccountRecordingClips(w http.ResponseWriter, r *http.Requ
 			"storage_destination_id": sourceDestID,
 			"purged":                 purgedAt != nil,
 			"released":               releasedAt != nil,
-			"capture_lease_token":    captureLeaseToken,
+			"capture_generation":     captureGenerationFingerprint(captureLeaseToken),
 			"capture_sequence":       captureSequence,
 		})
 	}
