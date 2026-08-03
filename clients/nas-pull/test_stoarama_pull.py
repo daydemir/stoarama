@@ -90,10 +90,35 @@ class NASPullTests(unittest.TestCase):
                 "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 "relative_path": "recordings/clip.mp4",
                 "download_path": "/unused",
+                "recording_job_id": 7001,
+                "capture_generation": "sha256:generation",
+                "capture_sequence": 9,
+                "clip_start_at": "2026-08-03T12:00:00Z",
+                "clip_end_at": "2026-08-03T12:01:00Z",
             }
             with mock.patch.object(pull, "release_clip") as release:
                 self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 0, 0))
                 release.assert_called_once_with(cfg, 13, 7)
+            sidecar = json.loads(pull.stitch_sidecar_path(final).read_text())
+            self.assertEqual(sidecar["recording_job_id"], 7001)
+            self.assertEqual(sidecar["capture_generation"], "sha256:generation")
+            self.assertEqual(sidecar["capture_sequence"], 9)
+            self.assertEqual(sidecar["sha256"], clip["sha256"])
+
+    def test_legacy_stitch_sidecar_preserves_null_provenance(self):
+        clip = {
+            "clip_id": 8,
+            "recording_id": 13,
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+            "relative_path": "recordings/legacy.mp4",
+            "clip_start_at": "2026-08-03T12:00:00Z",
+            "clip_end_at": "2026-08-03T12:01:00Z",
+        }
+        provenance = pull.stitch_provenance(clip)
+        self.assertIsNone(provenance["recording_job_id"])
+        self.assertIsNone(provenance["capture_generation"])
+        self.assertIsNone(provenance["capture_sequence"])
 
     def test_checksum_mismatch_is_quarantined_and_redownloaded(self):
         with tempfile.TemporaryDirectory() as raw:
