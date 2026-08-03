@@ -45,22 +45,29 @@ func TestMaintainTransientLedgersDeletesOnlyExpiredBookkeeping(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-transientLedgerRetention - time.Hour)
 	recent := now.Add(-time.Hour)
-	if _, err := pool.Exec(ctx, `
-		CREATE TABLE upload_intents (
+	for _, ddl := range []string{
+		`CREATE TABLE upload_intents (
 		  id TEXT PRIMARY KEY, status TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
 		  created_at TIMESTAMPTZ NOT NULL
-		);
-		CREATE TABLE api_idempotency (
+		)`,
+		`CREATE TABLE api_idempotency (
 		  endpoint TEXT NOT NULL, idempotency_key TEXT NOT NULL,
 		  created_at TIMESTAMPTZ NOT NULL,
 		  PRIMARY KEY(endpoint,idempotency_key)
-		);
-		CREATE TABLE capture_segments (id BIGINT PRIMARY KEY);
-	`); err != nil {
-		t.Fatal(err)
+		)`,
+		`CREATE TABLE capture_segments (id BIGINT PRIMARY KEY)`,
+		`CREATE TABLE recording_clips (id BIGINT PRIMARY KEY)`,
+		`CREATE TABLE media_objects (id BIGINT PRIMARY KEY)`,
+		`CREATE TABLE recording_upload_intents (id BIGINT PRIMARY KEY)`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO capture_segments VALUES (1)`); err != nil {
-		t.Fatal(err)
+	for _, table := range []string{"capture_segments", "recording_clips", "media_objects", "recording_upload_intents"} {
+		if _, err := pool.Exec(ctx, `INSERT INTO `+table+` VALUES (1)`); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO upload_intents VALUES
@@ -85,7 +92,10 @@ func TestMaintainTransientLedgersDeletesOnlyExpiredBookkeeping(t *testing.T) {
 	if got.UploadIntentsDeleted != 2 || got.IdempotencyKeysDeleted != 1 {
 		t.Fatalf("maintenance=%+v, want upload=2 idempotency=1", got)
 	}
-	for table, want := range map[string]int{"upload_intents": 2, "api_idempotency": 1, "capture_segments": 1} {
+	for table, want := range map[string]int{
+		"upload_intents": 2, "api_idempotency": 1, "capture_segments": 1,
+		"recording_clips": 1, "media_objects": 1, "recording_upload_intents": 1,
+	} {
 		var count int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+table).Scan(&count); err != nil {
 			t.Fatal(err)
