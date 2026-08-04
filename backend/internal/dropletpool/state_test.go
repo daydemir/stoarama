@@ -3,6 +3,7 @@ package dropletpool
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -389,3 +390,23 @@ func (f *fakeDOClient) ListDropletsByName(_ context.Context, _, prefix string) (
 
 // Ensure the fake satisfies the production interface at compile time.
 var _ DOClient = (*fakeDOClient)(nil)
+
+func TestWorkerBuildReady(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	if !workerBuildReady("", "") || !workerBuildReady(sha, sha) {
+		t.Fatal("disabled and exact-match build gates must be ready")
+	}
+	if workerBuildReady(sha, "") || workerBuildReady(sha, strings.Repeat("b", 40)) {
+		t.Fatal("missing or mismatched worker build must not be ready")
+	}
+}
+
+func TestShouldDrainStaleBuild(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	if !shouldDrainStaleBuild(sha, "", false) || !shouldDrainStaleBuild(sha, strings.Repeat("b", 40), false) {
+		t.Fatal("idle legacy and mismatched builds must drain")
+	}
+	if shouldDrainStaleBuild(sha, "", true) || shouldDrainStaleBuild(sha, sha, false) || shouldDrainStaleBuild("", "", false) {
+		t.Fatal("busy, matching, and disabled-gate workers must not drain")
+	}
+}

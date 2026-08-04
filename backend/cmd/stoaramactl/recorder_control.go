@@ -335,6 +335,7 @@ func mustBuildDropletPool(ctx context.Context, cfg config.Config, pool *pgxpool.
 		ProjectID:         cfg.DropletPoolProjectID,
 		FirewallID:        cfg.DropletPoolFirewallID,
 		BackendAPIURL:     cfg.DropletPoolBackendAPIURL,
+		BuildSHA:          cfg.DropletPoolBuildSHA,
 		HeartbeatSec:      cfg.RecordingWorkerHeartbeatSec,
 		PollSec:           cfg.RecordingWorkerPollSec,
 		RepoURL:           cfg.DropletPoolRepoURL,

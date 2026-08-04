@@ -36,6 +36,7 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 	concurrency := fs.Int("concurrency", cfg.RecordingWorkerConcurrency, "concurrent clip captures (must equal the droplet's baked capacity)")
 	heartbeatSec := fs.Int("heartbeat-sec", cfg.RecordingWorkerHeartbeatSec, "lease heartbeat interval seconds")
 	pollSec := fs.Int("poll-sec", cfg.RecordingWorkerPollSec, "job poll interval seconds")
+	buildSHA := fs.String("build-sha", strings.TrimSpace(os.Getenv("RECORDER_BUILD_SHA")), "source commit for this worker binary")
 	duration := fs.Duration("duration", 0, "optional run duration (e.g. 30m, 8h)")
 	_ = fs.Parse(args[1:])
 
@@ -71,6 +72,7 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		Concurrency:                 *concurrency,
 		HeartbeatSec:                *heartbeatSec,
 		PollInterval:                time.Duration(*pollSec) * time.Second,
+		BuildSHA:                    strings.ToLower(strings.TrimSpace(*buildSHA)),
 		UploadWorkers:               cfg.RelayUploadWorkers,
 		ContinuousNoProgressTimeout: cloudRecorderNoProgressTimeout,
 		DiskFreeBytes: func() (uint64, error) {

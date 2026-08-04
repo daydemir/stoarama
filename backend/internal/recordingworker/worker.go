@@ -27,6 +27,7 @@ type Config struct {
 	Concurrency  int
 	HeartbeatSec int
 	PollInterval time.Duration
+	BuildSHA     string
 
 	// SkipDropletHeartbeat disables the recorder_droplets liveness touch loop.
 	// Relay workers have no recorder_droplets row and report liveness through the
@@ -176,7 +177,7 @@ func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
 	}
 	ticker := time.NewTicker(w.heartbeatInt)
 	defer ticker.Stop()
-	if err := w.cfg.Client.TouchDroplet(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := w.cfg.Client.TouchDroplet(ctx, w.cfg.BuildSHA); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("recording worker droplet heartbeat error: %v", err)
 	}
 	for {
@@ -184,7 +185,7 @@ func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.cfg.Client.TouchDroplet(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := w.cfg.Client.TouchDroplet(ctx, w.cfg.BuildSHA); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("recording worker droplet heartbeat error: %v", err)
 			}
 		}

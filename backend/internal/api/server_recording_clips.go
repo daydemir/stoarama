@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -321,14 +322,15 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 	util.WriteJSON(w, http.StatusOK, map[string]any{"job": resp})
 }
 
-func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, nodeID int64) error {
+func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, nodeID int64, buildSHA string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE recorder_droplets
 		SET last_seen_at=now(),
+		    build_sha=CASE WHEN $3 <> '' THEN $3 ELSE build_sha END,
 		    first_seen_at=COALESCE(first_seen_at, now()),
 		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
 		WHERE name=$1 AND node_id=$2
-	`, workerID, nodeID)
+	`, workerID, nodeID, buildSHA)
 	return err
 }
 
@@ -961,7 +963,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// Touch the droplet liveness row if this worker is a managed droplet.
-	_ = s.touchDropletLiveness(r.Context(), workerID, principal.NodeID)
+	_ = s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, "")
 	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt})
 }
 
@@ -981,7 +983,19 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 		util.WriteError(w, http.StatusBadRequest, "worker has no display name")
 		return
 	}
-	if err := s.touchDropletLiveness(r.Context(), workerID, principal.NodeID); err != nil {
+	var req struct {
+		BuildSHA string `json:"build_sha"`
+	}
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.BuildSHA = strings.ToLower(strings.TrimSpace(req.BuildSHA))
+	if req.BuildSHA != "" && !regexp.MustCompile(`^[0-9a-f]{40,64}$`).MatchString(req.BuildSHA) {
+		util.WriteError(w, http.StatusBadRequest, "build_sha must be a 40-64 character lowercase hex commit")
+		return
+	}
+	if err := s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, req.BuildSHA); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("touch droplet liveness: %v", err))
 		return
 	}

@@ -74,6 +74,7 @@ cmd=(
   --concurrency "${RECORDING_WORKER_CONCURRENCY}"
   --heartbeat-sec "${RECORDING_WORKER_HEARTBEAT_SEC}"
   --poll-sec "${RECORDING_WORKER_POLL_SEC}"
+  --build-sha "${RECORDER_BUILD_SHA:-}"
 )
 
 echo "starting recording worker: worker_id=${RECORDER_SERVER_ID} concurrency=${RECORDING_WORKER_CONCURRENCY} heartbeat_sec=${RECORDING_WORKER_HEARTBEAT_SEC} poll_sec=${RECORDING_WORKER_POLL_SEC}"

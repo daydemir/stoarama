@@ -270,6 +270,7 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 		PollSec:       5,
 		RepoURL:       "https://github.com/daydemir/stoarama.git",
 		RepoRef:       "main",
+		BuildSHA:      strings.Repeat("a", 40),
 	})
 	if err != nil {
 		t.Fatalf("BuildUserData: %v", err)
@@ -322,6 +323,12 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 	}
 	if !strings.Contains(out, "BACKEND_API_URL='https://stoarama-api.onrender.com'") {
 		t.Fatalf("cloud-init missing BACKEND_API_URL env")
+	}
+	if !strings.Contains(out, "git -C /opt/stoarama fetch --depth 1 origin "+strings.Repeat("a", 40)) {
+		t.Fatalf("cloud-init must fetch the controller's immutable build commit")
+	}
+	if !strings.Contains(out, `printf "export RECORDER_BUILD_SHA='%s'\n" "$HEAD_SHA"`) {
+		t.Fatalf("cloud-init must report the verified binary source commit")
 	}
 	// The egress firewall must be ordered before the recording worker.
 	if !strings.Contains(out, "stoarama-egress-firewall.service") {
