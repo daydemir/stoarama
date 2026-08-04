@@ -2,11 +2,71 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/billing"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run meter report ledger regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("meter_report_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE billing_meter_reports (
+			account_id BIGINT NOT NULL, period_end TIMESTAMPTZ NOT NULL,
+			meter_kind TEXT NOT NULL, expected_value TEXT NOT NULL,
+			identifier TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+			reported_at TIMESTAMPTZ,
+			UNIQUE(account_id,period_end,meter_kind)
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	periodEnd := time.Date(2026, 8, 29, 6, 28, 0, 0, time.UTC)
+	send, err := reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "912", "47-2026-08-29")
+	if err != nil || !send {
+		t.Fatalf("first reserve send=%v err=%v", send, err)
+	}
+	if send, err = reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "912", "47-2026-08-29"); err == nil || send || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous retry send=%v err=%v", send, err)
+	}
+	if err := markMeterReportReported(ctx, pool, 47, periodEnd, "recording_hour"); err != nil {
+		t.Fatal(err)
+	}
+	if send, err = reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "912", "47-2026-08-29"); err != nil || send {
+		t.Fatalf("reported retry send=%v err=%v", send, err)
+	}
+	if _, err := reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "913", "47-2026-08-29"); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("changed usage was accepted: %v", err)
+	}
+}
 
 func dateUTC(y int, m time.Month, d int) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)

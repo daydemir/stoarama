@@ -38,6 +38,9 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	}
 	fs := flag.NewFlagSet("recorder-control run", flag.ExitOnError)
 	_ = fs.Parse(args[1:])
+	if err := cfg.ValidateStripe(); err != nil {
+		log.Fatalf("invalid recorder-control Stripe configuration: %v", err)
+	}
 
 	if !cfg.RecSchedEnabled && !cfg.DropletPoolEnabled {
 		log.Printf("recorder-control: both REC_SCHED_ENABLED and DROPLET_POOL_ENABLED are false; nothing to run.")
@@ -48,7 +51,21 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	defer pool.Close()
 
 	// Billing gates capture on the billable predicate only when Stripe is wired.
-	billingEnabled := cfg.StripeSecretKey != "" && cfg.StripeWebhookSecret != "" && cfg.StripePriceID != "" && cfg.StripeGBMonthPriceID != ""
+	billingEnabled := cfg.StripeBillingEnabled()
+	var reporter *billing.Client
+	if billingEnabled {
+		var err error
+		reporter, err = billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.StripeGBMonthPriceID, cfg.AppBaseURL, cfg.StripeLivemode)
+		if err != nil {
+			log.Fatalf("init stripe billing client for metering: %v", err)
+		}
+		validateCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err = reporter.ValidateConfiguration(validateCtx, cfg.StripeMeterID, cfg.StripeGBMonthMeterID)
+		cancel()
+		if err != nil {
+			log.Fatalf("validate stripe billing configuration for metering: %v", err)
+		}
+	}
 
 	const restartDelay = 3 * time.Second
 	var wg sync.WaitGroup
@@ -88,10 +105,6 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	// Gated on billingEnabled (same secret+webhook+price gate as capture), so free
 	// mode never charges. Runs under the same restart-with-backoff loop.
 	if billingEnabled {
-		reporter, err := billing.New(cfg.StripeSecretKey, cfg.StripePriceID, cfg.StripeGBMonthPriceID, cfg.AppBaseURL, cfg.StripeLivemode)
-		if err != nil {
-			log.Fatalf("init stripe billing client for metering: %v", err)
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
