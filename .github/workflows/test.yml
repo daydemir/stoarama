@@ -83,6 +83,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./cmd/stoaramactl -run TestMaintainTransientLedgersDeletesOnlyExpiredBookkeeping -count=1
+      - name: Test billing meter report ledger
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./cmd/stoaramactl -run TestMeterReportLedgerFailsClosedOnAmbiguousRetry -count=1
       - name: Test
         run: go test ./...
       - name: Vet

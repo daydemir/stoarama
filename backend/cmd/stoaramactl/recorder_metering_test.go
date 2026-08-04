@@ -17,7 +17,8 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if databaseURL == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL to run meter report ledger regression")
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	admin, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		t.Fatal(err)
@@ -27,7 +28,11 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") }()
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = admin.Exec(cleanupCtx, "DROP SCHEMA "+schema+" CASCADE")
+	}()
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		t.Fatal(err)
@@ -41,16 +46,15 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	if _, err := pool.Exec(ctx, `
-		CREATE TABLE billing_meter_reports (
-			account_id BIGINT NOT NULL, period_end TIMESTAMPTZ NOT NULL,
-			meter_kind TEXT NOT NULL, expected_value TEXT NOT NULL,
-			identifier TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-			reported_at TIMESTAMPTZ,
-			UNIQUE(meter_kind,identifier)
-		)
-	`); err != nil {
+	if _, err := pool.Exec(ctx, `CREATE TABLE accounts(id BIGINT PRIMARY KEY); INSERT INTO accounts(id) VALUES(47)`); err != nil {
 		t.Fatal(err)
+	}
+	migration, err := os.ReadFile("../../../infra/sql/migrations/0103_billing_meter_report_ledger.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("apply production billing ledger migration: %v", err)
 	}
 	periodEnd := time.Date(2026, 8, 29, 6, 28, 0, 0, time.UTC)
 	send, err := reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "912", "47-2026-08-29")
