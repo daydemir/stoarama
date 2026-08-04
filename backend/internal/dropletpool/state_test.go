@@ -412,13 +412,16 @@ func TestShouldDrainStaleBuild(t *testing.T) {
 }
 
 func TestCanDrainStalePreservesRequiredCapacity(t *testing.T) {
-	if !canDrainStale(3, 2, 0) {
+	if !canDrainStale(12, 4, 8, 0) {
 		t.Fatal("one excess active worker should be drainable")
 	}
-	if canDrainStale(2, 2, 0) {
+	if canDrainStale(8, 4, 8, 0) {
 		t.Fatal("must not drain below forecast-required capacity")
 	}
-	if canDrainStale(3, 2, 1) {
+	if canDrainStale(12, 4, 8, 1) {
 		t.Fatal("must not start another drain while one is in progress")
+	}
+	if canDrainStale(7, 4, 7, 0) {
+		t.Fatal("must sum heterogeneous stored capacities, not count droplets")
 	}
 }
