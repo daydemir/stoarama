@@ -52,6 +52,32 @@ func TestMITSharedRecordingsConfiguration(t *testing.T) {
 	}
 }
 
+func TestMITSharedRecordingsPublicModeNeedsNoPasswordOrSigningKey(t *testing.T) {
+	t.Setenv("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID", "47")
+	t.Setenv("MIT_SCL_RECORDINGS_PUBLIC", "true")
+	t.Setenv("MIT_SCL_RECORDINGS_READ_PASSWORD", "")
+	t.Setenv("MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SharedRecordingsPublic || cfg.SharedRecordingsAccountID != 47 {
+		t.Fatalf("public shared recordings public=%v account_id=%d", cfg.SharedRecordingsPublic, cfg.SharedRecordingsAccountID)
+	}
+}
+
+func TestMITSharedRecordingsPublicModeRequiresAccount(t *testing.T) {
+	t.Setenv("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID", "")
+	t.Setenv("MIT_SCL_RECORDINGS_PUBLIC", "true")
+	t.Setenv("MIT_SCL_RECORDINGS_READ_PASSWORD", "")
+	t.Setenv("MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY", "")
+	t.Setenv("MIT_SCL_RECORDINGS_READ_SLUG", "mit-scl")
+	t.Setenv("MIT_SCL_RECORDINGS_TRUSTED_PROXY_CIDRS", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "MIT_SCL_RECORDINGS_READ_ACCOUNT_ID") {
+		t.Fatalf("Load error=%v, want MIT_SCL_RECORDINGS_READ_ACCOUNT_ID requirement", err)
+	}
+}
+
 func TestMITSharedRecordingsTrustedProxyCIDRsMustBeValid(t *testing.T) {
 	t.Setenv("MIT_SCL_RECORDINGS_TRUSTED_PROXY_CIDRS", "not-a-cidr")
 	if _, err := Load(); err == nil {

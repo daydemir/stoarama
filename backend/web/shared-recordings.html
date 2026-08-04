@@ -46,6 +46,12 @@
     #tooltip { position:fixed; z-index:20; pointer-events:none; max-width:330px; padding:7px 9px; border-radius:7px; background:#111827; color:#fff; font-size:12px; box-shadow:0 4px 18px #0004 }
     .back { display:inline-block; margin-bottom:12px }
     .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; color:var(--muted); font-size:12px }.legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:4px }
+    .clips-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin:22px 0 10px }
+    .clips-actions { display:flex; gap:7px; flex-wrap:wrap }
+    .clips-actions button { padding:5px 9px }
+    .clips-nav { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:12px }
+    .clips-nav button:disabled { cursor:default; opacity:.45 }
+    .pill { display:inline-block; padding:2px 7px; border-radius:999px; background:#eef2f6; color:var(--muted); font-size:12px }
     @media(max-width:650px){ main{width:min(100% - 18px,1180px);margin:18px auto} header{align-items:start;flex-direction:column}.panel{padding:12px} }
   </style>
 </head>
@@ -71,6 +77,7 @@
   <div id="tooltip" class="hidden" role="tooltip"></div>
   <script>
     const SHARED_PATH = '/shared/__SHARED_RECORDINGS_SLUG__';
+    const PUBLIC_ACCESS = __SHARED_RECORDINGS_PUBLIC__;
     const API = '/api/v1' + SHARED_PATH;
     const unlock = document.getElementById('unlock');
     const app = document.getElementById('app');
@@ -95,6 +102,15 @@
     function captureLocation(rec) {
       if (rec.capture_via !== 'relay') return 'Stoarama cloud';
       return rec.relay_node_name || 'Waiting for relay';
+    }
+    function bytes(value) {
+      let n=Number(value||0),unit='B';
+      for(const next of ['KB','MB','GB']){if(n<1024)break;n/=1024;unit=next}
+      return `${n>=10||unit==='B'?Math.round(n):n.toFixed(1)} ${unit}`;
+    }
+    function duration(value) {
+      const seconds=Math.round(Number(value||0)/1000);
+      return seconds<60?`${seconds}s`:`${Math.floor(seconds/60)}m ${seconds%60}s`;
     }
     function healthStrip(bins) {
       const cells = Array.from({length:Math.max(0,12-bins.length)},()=>'<i></i>');
@@ -146,6 +162,40 @@
       }).join('');
       return `<div class="heatmap">${rows||'<p class="muted">No scheduled hours in this period.</p>'}</div>`;
     }
+    function clipRow(clip,id,timezone) {
+      const unavailable=clip.purged||clip.released;
+      const start=dateTime(clip.clip_start_at,timezone), end=new Intl.DateTimeFormat([],{timeZone:timezone,hour:'numeric',minute:'2-digit'}).format(new Date(clip.clip_end_at));
+      const actions=unavailable?'<span class="pill">Unavailable</span>':`<div class="clips-actions"><button data-view="${clip.id}" type="button">View</button><button data-download="${clip.id}" type="button">Download</button></div>`;
+      return `<tr><td>${escapeHTML(start)}–${escapeHTML(end)}</td><td>${escapeHTML(duration(clip.duration_ms))}</td><td>${clip.actual_fps?`${Number(clip.actual_fps).toFixed(1)} fps`:'—'}</td><td>${escapeHTML(bytes(clip.size_bytes))}</td><td>${actions}</td></tr>`;
+    }
+    async function openClip(id,clipId,disposition) {
+      const preview=disposition==='inline'?window.open('about:blank','_blank'):null;
+      if(preview)preview.opener=null;
+      try {
+        const payload=await request(`/recordings/${id}/clips/${clipId}/download?disposition=${disposition}`);
+        if(preview)preview.location.href=payload.url;else location.assign(payload.url);
+      } catch(error) {
+        if(preview)preview.close();
+        window.alert(error.message);
+      }
+    }
+    async function renderClips(id,timezone,page=0) {
+      const mount=document.getElementById('clips');
+      const limit=100;
+      let payload;
+      try { payload=await request(`/recordings/${id}/clips?limit=${limit}&offset=${page*limit}`) }
+      catch(error) {
+        mount.innerHTML=`<p style="color:var(--red)">${escapeHTML(error.message)}</p><button id="clipsRetry" type="button">Retry clips</button>`;
+        document.getElementById('clipsRetry').onclick=()=>void renderClips(id,timezone,page);
+        return;
+      }
+      const items=payload.items||[], total=Number(payload.total||0);
+      mount.innerHTML=`<div class="clips-head"><div><h2>Clips</h2><span class="muted">${total} captured</span></div></div>${items.length?`<div class="table-wrap"><table><thead><tr><th>Time</th><th>Duration</th><th>Frame rate</th><th>Size</th><th></th></tr></thead><tbody>${items.map(c=>clipRow(c,id,timezone)).join('')}</tbody></table></div>`:'<p class="muted">No clips captured yet.</p>'}<div class="clips-nav"><button id="clipsPrev" ${page===0?'disabled':''}>Previous</button><span>Page ${page+1}</span><button id="clipsNext" ${(page+1)*limit>=total?'disabled':''}>Next</button></div>`;
+      mount.querySelectorAll('[data-view]').forEach(button=>button.onclick=()=>openClip(id,button.dataset.view,'inline'));
+      mount.querySelectorAll('[data-download]').forEach(button=>button.onclick=()=>openClip(id,button.dataset.download,'attachment'));
+      document.getElementById('clipsPrev').onclick=()=>void renderClips(id,timezone,page-1);
+      document.getElementById('clipsNext').onclick=()=>void renderClips(id,timezone,page+1);
+    }
     async function renderDetail(id, to) {
       const rec=await request(`/recordings/${id}`);
       const query=to?`?to=${encodeURIComponent(to)}`:'';
@@ -156,7 +206,7 @@
         <div class="metrics"><div class="metric"><span class="muted">Status</span><b>${escapeHTML(rec.status)}</b></div><div class="metric"><span class="muted">Capture health</span><b>${percent(captured,expected)}%</b><span>${captured}/${expected} clips</span></div><div class="metric"><span class="muted">Schedule</span><b>${escapeHTML(schedule(rec))}</b><span>${rec.clip_duration_sec}s clips</span></div><div class="metric"><span class="muted">Capture</span><b>${escapeHTML(rec.capture_via)}</b><span>${escapeHTML(captureLocation(rec))}</span></div></div>
         <div class="heat-head"><div><h2>Hourly capture health</h2><span class="muted">${page.from} through ${page.to}, local time</span></div><div><button id="older">Older</button> <button id="newer">Newer</button></div></div>
         ${heatmap(page)}
-        <div class="legend"><span><i class="healthy"></i>98% or better</span><span><i class="warning"></i>90–97.9%</span><span><i class="critical"></i>Below 90%</span><span><i></i>Not scheduled</span></div></div>`;
+        <div class="legend"><span><i class="healthy"></i>98% or better</span><span><i class="warning"></i>90–97.9%</span><span><i class="critical"></i>Below 90%</span><span><i></i>Not scheduled</span></div><div id="clips"></div></div>`;
       const older=document.getElementById('older');older.disabled=!page.has_older;older.onclick=()=>renderDetail(id,new Date(new Date(page.from+'T12:00:00Z').getTime()-86400000).toISOString().slice(0,10));
       const newer=document.getElementById('newer'); newer.disabled=!page.has_newer; newer.onclick=()=>{
         const pageDuration=new Date(page.to+'T12:00:00Z')-new Date(page.from+'T12:00:00Z')+86400000;
@@ -164,6 +214,7 @@
         const candidateDate=candidate.toISOString().slice(0,10), localToday=localParts(new Date().toISOString(),page.timezone).date;
         renderDetail(id,candidateDate>localToday?localToday:candidateDate);
       };
+      await renderClips(id,rec.cron_timezone);
     }
     function showTooltip(target) {
       const text=target&&target.dataset.tip;if(!text)return;
@@ -192,6 +243,7 @@
       try{await request('/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});await start()}
       catch(error){document.getElementById('error').textContent=error.message}
     };
+    if(PUBLIC_ACCESS){document.getElementById('logout').classList.add('hidden')}
     document.getElementById('logout').onclick=async()=>{await request('/logout',{method:'POST'});location.reload()};
     start();
   </script>

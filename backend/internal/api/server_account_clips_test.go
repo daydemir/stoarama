@@ -386,6 +386,15 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 	}
 
 	for _, stmt := range []string{
+		`CREATE TABLE storage_destinations (
+			id BIGSERIAL PRIMARY KEY,
+			account_id BIGINT NOT NULL,
+			region TEXT NOT NULL DEFAULT 'auto',
+			bucket TEXT NOT NULL DEFAULT 'clips',
+			endpoint TEXT NOT NULL DEFAULT 'https://example.r2.cloudflarestorage.com',
+			access_key_id TEXT NOT NULL DEFAULT 'access',
+			secret_access_key_enc BYTEA NOT NULL DEFAULT ''::bytea
+		)`,
 		`CREATE TABLE connections (
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
@@ -396,12 +405,20 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
 			name TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active',
+			naming_profile TEXT NOT NULL DEFAULT 'stoarama_v1',
+			folder_name TEXT NOT NULL DEFAULT 'recordings',
 			delivery TEXT NOT NULL DEFAULT 'managed'
 		)`,
 		`CREATE TABLE recording_clips (
 			id BIGSERIAL PRIMARY KEY,
 			recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
 			size_bytes BIGINT NOT NULL,
+			duration_ms BIGINT NOT NULL DEFAULT 60000,
+			actual_fps DOUBLE PRECISION,
+			object_key TEXT NOT NULL DEFAULT 'clips/test.mp4',
+			thumbnail_object_key TEXT NOT NULL DEFAULT '',
+			storage_destination_id BIGINT NOT NULL DEFAULT 0,
 			sha256 TEXT NOT NULL DEFAULT '` + strings.Repeat("a", 64) + `',
 			clip_start_at TIMESTAMPTZ NOT NULL,
 			clip_end_at TIMESTAMPTZ NOT NULL,

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
 func testSharedRecordingsSigningKey() string {
@@ -28,6 +30,19 @@ func TestSharedRecordingsTokenExpiresAndRotatesWithSigningKey(t *testing.T) {
 	}
 	if validSharedRecordingsToken(token, "first-signing-key", now.Add(time.Hour)) {
 		t.Fatal("expired token accepted")
+	}
+}
+
+func TestStorageEndpointRequiresHTTPS(t *testing.T) {
+	for _, endpoint := range []string{"", "http://example.test", "ftp://example.test", "https://user:pass@example.test", "https:///missing-host", "https://:443"} {
+		if err := validateStorageEndpointHTTPS(endpoint); err == nil {
+			t.Fatalf("endpoint %q accepted", endpoint)
+		}
+	}
+	for _, endpoint := range []string{"https://example.test", "HTTPS://example.test/storage"} {
+		if err := validateStorageEndpointHTTPS(endpoint); err != nil {
+			t.Fatalf("endpoint %q rejected: %v", endpoint, err)
+		}
 	}
 }
 
@@ -177,6 +192,122 @@ func TestSharedRecordingsUsesConfiguredSlug(t *testing.T) {
 	}
 }
 
+func TestPublicSharedRecordingsNeedsNoCookie(t *testing.T) {
+	s := &Server{cfg: config.Config{SharedRecordingsAccountID: 47, SharedRecordingsPublic: true}}
+	called := false
+	handler := s.requireSharedRecordingsAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings", nil))
+	if !called || rec.Code != http.StatusNoContent {
+		t.Fatalf("public read called=%v status=%d", called, rec.Code)
+	}
+}
+
+func TestPublicSharedClipsAreTenantScopedAndRedacted(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	var ownerRecordingID, foreignRecordingID int64
+	for _, target := range []struct {
+		accountID int64
+		name      string
+		out       *int64
+	}{{47, "MIT recording", &ownerRecordingID}, {99, "Private recording", &foreignRecordingID}} {
+		if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name) VALUES($1,$2) RETURNING id`, target.accountID, target.name).Scan(target.out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips(recording_id,size_bytes,duration_ms,actual_fps,clip_start_at,clip_end_at,display_path)
+		VALUES($1,123456,60000,29.97,now()-interval '1 minute',now(),'private/object-name.mp4')
+	`, ownerRecordingID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool, cfg: config.Config{
+		SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true,
+	}}
+	rec := httptest.NewRecorder()
+	s.router().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/"+strconv.FormatInt(ownerRecordingID, 10)+"/clips", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner clips status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, forbidden := range []string{"object_key", "display_path", "storage_destination", "capture_generation", "capture_sequence", "private/object-name.mp4"} {
+		if strings.Contains(rec.Body.String(), forbidden) {
+			t.Fatalf("public clip response leaked %q: %s", forbidden, rec.Body.String())
+		}
+	}
+	foreign := httptest.NewRecorder()
+	s.router().ServeHTTP(foreign, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/"+strconv.FormatInt(foreignRecordingID, 10)+"/clips", nil))
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign clips status=%d want 404 body=%s", foreign.Code, foreign.Body.String())
+	}
+}
+
+func TestPublicSharedClipDownloadIsTenantScopedAndNeedsNoCookie(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	secrets, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := secrets.Encrypt([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	var destinationID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO storage_destinations(account_id,secret_access_key_enc) VALUES(47,$1) RETURNING id
+	`, sealed).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	insertRecording := func(accountID int64, name string) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name) VALUES($1,$2) RETURNING id`, accountID, name).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	ownerRecordingID := insertRecording(47, "MIT recording")
+	foreignRecordingID := insertRecording(99, "Private recording")
+	insertClip := func(recordingID int64) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO recording_clips(recording_id,size_bytes,clip_start_at,clip_end_at,storage_destination_id)
+			VALUES($1,123456,now()-interval '1 minute',now(),$2) RETURNING id
+		`, recordingID, destinationID).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	ownerClipID := insertClip(ownerRecordingID)
+	foreignClipID := insertClip(foreignRecordingID)
+	s := &Server{pool: pool, secrets: secrets, cfg: config.Config{
+		SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true,
+		R2SignGetTTL: time.Minute,
+	}}
+	get := func(recordingID, clipID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		path := "/api/v1/shared/mit-scl/recordings/" + strconv.FormatInt(recordingID, 10) + "/clips/" + strconv.FormatInt(clipID, 10) + "/download?disposition=inline"
+		response := httptest.NewRecorder()
+		s.router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		return response
+	}
+	owner := get(ownerRecordingID, ownerClipID)
+	if owner.Code != http.StatusOK || !strings.Contains(owner.Body.String(), `"url":"https://`) || strings.Contains(owner.Body.String(), "object_key") {
+		t.Fatalf("owner download status=%d body=%s", owner.Code, owner.Body.String())
+	}
+	foreign := get(foreignRecordingID, foreignClipID)
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign download status=%d want 404 body=%s", foreign.Code, foreign.Body.String())
+	}
+}
+
 func TestSharedRecordingsNamespaceHasNoMutationRoutes(t *testing.T) {
 	now := time.Now().UTC()
 	s := &Server{
@@ -211,6 +342,9 @@ func TestSharedRecordingsPageHasAccessibleHeatmap(t *testing.T) {
 		`focusin`,
 		`Escape`,
 		`const SHARED_PATH = '/shared/__SHARED_RECORDINGS_SLUG__';`,
+		`const PUBLIC_ACCESS = __SHARED_RECORDINGS_PUBLIC__;`,
+		`/clips?limit=`,
+		`data-download=`,
 		`Array.from({length:24},()=>[])`,
 		`bins.map(bin=>({bin,hour}))`,
 		`repeat(${slots.length},minmax(19px,1fr))`,

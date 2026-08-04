@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -37,6 +38,14 @@ func (s *Server) buildClipClient(r *http.Request, d clipDestination) (*r2.Client
 	return s.buildClipClientCtx(r.Context(), d)
 }
 
+func validateStorageEndpointHTTPS(raw string) error {
+	endpoint, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(endpoint.Scheme, "https") || endpoint.Host == "" || endpoint.Hostname() == "" || endpoint.User != nil {
+		return fmt.Errorf("storage destination endpoint must be an HTTPS URL without embedded credentials")
+	}
+	return nil
+}
+
 // handleAccountRecordingClipDownload presigns a GET against the clip's bucket so
 // a browser-session researcher can download one clip. Ownership + location are
 // resolved in a single SELECT scoped to the account; a purged clip is 410 Gone.
@@ -46,16 +55,20 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if s.secrets == nil {
-		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
-		return
-	}
 	recordingID, ok := parseInt64Path(w, r, "id")
 	if !ok {
 		return
 	}
 	clipID, ok := parseInt64Path(w, r, "clipId")
 	if !ok {
+		return
+	}
+	s.writeRecordingClipDownload(w, r, principal.AccountID, recordingID, clipID, true)
+}
+
+func (s *Server) writeRecordingClipDownload(w http.ResponseWriter, r *http.Request, accountID, recordingID, clipID int64, includeObjectKey bool) {
+	if s.secrets == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
 		return
 	}
 
@@ -77,7 +90,7 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		JOIN recordings r ON r.id = c.recording_id
 		JOIN storage_destinations sd ON sd.id = c.storage_destination_id
 		WHERE c.id=$1 AND c.recording_id=$2 AND r.account_id=$3
-	`, clipID, recordingID, principal.AccountID).Scan(
+	`, clipID, recordingID, accountID).Scan(
 		&d.objectKey, &d.thumbnailObjectKey, &d.sizeBytes, &purgedAt, &releasedAt,
 		&d.region, &d.bucket, &d.endpoint, &d.accessKeyID, &d.secretEnc,
 		&displayPath, &recordingNm, &clipStartAt, &namingProf, &folderName,
@@ -95,6 +108,10 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 	// for the org's download endpoint.
 	if purgedAt != nil || releasedAt != nil {
 		util.WriteError(w, http.StatusGone, "clip is no longer available")
+		return
+	}
+	if err := validateStorageEndpointHTTPS(d.endpoint); err != nil {
+		util.WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
@@ -122,12 +139,15 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("presign download: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"url":            url,
-		"object_key":     d.objectKey,
 		"size_bytes":     d.sizeBytes,
 		"expires_in_sec": int(s.cfg.R2SignGetTTL.Seconds()),
-	})
+	}
+	if includeObjectKey {
+		payload["object_key"] = d.objectKey
+	}
+	util.WriteJSON(w, http.StatusOK, payload)
 }
 
 func clipDownloadFilename(recordingName string, recordingID int64, clipStartAt time.Time, objectKey, displayPath, namingProfile, folderName string) string {

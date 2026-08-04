@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -53,6 +55,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		ctx,
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")),
+		awsconfig.WithHTTPClient(newHTTPSRedirectClient()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
@@ -68,6 +71,24 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		s3:        client,
 		presigner: s3.NewPresignClient(client),
 	}, nil
+}
+
+func newHTTPSRedirectClient() *http.Client {
+	return &http.Client{
+		Transport:     awshttp.NewBuildableClient().GetTransport(),
+		CheckRedirect: sameAuthorityHTTPSRedirect,
+	}
+}
+
+func sameAuthorityHTTPSRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 || len(via) >= 10 {
+		return http.ErrUseLastResponse
+	}
+	origin := via[0].URL
+	if !strings.EqualFold(req.URL.Scheme, "https") || !strings.EqualFold(req.URL.Host, origin.Host) {
+		return http.ErrUseLastResponse
+	}
+	return nil
 }
 
 func (c *Client) Bucket() string { return c.bucket }
