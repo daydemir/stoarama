@@ -19,12 +19,13 @@ import (
 )
 
 const (
-	sharedRecordingsCookie      = "stoarama_shared_recordings_read"
-	sharedRecordingsSessionTTL  = 24 * time.Hour
-	sharedRecordingsRateWindow  = 15 * time.Minute
-	sharedRecordingsMaxFailures = 5
-	sharedRecordingsMaxClients  = 4096
-	sharedRecordingsListLimit   = 500
+	sharedRecordingsCookie             = "stoarama_shared_recordings_read"
+	sharedRecordingsSessionTTL         = 24 * time.Hour
+	sharedRecordingsRateWindow         = 15 * time.Minute
+	sharedRecordingsMaxFailures        = 5
+	sharedRecordingsMaxClients         = 4096
+	sharedRecordingsListLimit          = 500
+	sharedRecordingsVisibleStatusesSQL = "rec.status IN ('active','paused')"
 )
 
 type sharedRecording struct {
@@ -385,7 +386,7 @@ func (s *Server) handleSharedRecordingCaptureHealth(w http.ResponseWriter, r *ht
 
 func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sharedRecording, error) {
 	query := recordingListSelectSQL + `
-		WHERE rec.account_id=$1 AND rec.status <> 'canceled'`
+		WHERE rec.account_id=$1 AND ` + sharedRecordingsVisibleStatusesSQL
 	args := []any{s.cfg.SharedRecordingsAccountID}
 	if recordingID > 0 {
 		query += ` AND rec.id=$2`

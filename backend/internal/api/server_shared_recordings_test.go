@@ -161,6 +161,12 @@ func TestSharedRecordingDTOExcludesSensitiveFields(t *testing.T) {
 	}
 }
 
+func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
+	if sharedRecordingsVisibleStatusesSQL != "rec.status IN ('active','paused')" {
+		t.Fatalf("visible status predicate = %q", sharedRecordingsVisibleStatusesSQL)
+	}
+}
+
 func TestSharedRecordingsPageDisabledWithoutConfiguration(t *testing.T) {
 	s := &Server{cfg: config.Config{}, sharedRecordingsHTML: []byte("secret page")}
 	rec := httptest.NewRecorder()
