@@ -225,7 +225,7 @@ func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
 }
 
 func TestSharedRecordingsPageDisabledWithoutConfiguration(t *testing.T) {
-	s := &Server{cfg: config.Config{}, sharedRecordingsHTML: []byte("secret page")}
+	s := &Server{cfg: config.Config{}, recordingsHTML: []byte("secret page")}
 	rec := httptest.NewRecorder()
 	s.handleSharedRecordingsApp(rec, httptest.NewRequest("GET", "/shared/mit-scl/recordings", nil))
 	if rec.Code != 404 {
@@ -249,8 +249,13 @@ func TestSharedRecordingsUsesConfiguredSlug(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("configured slug %q status=%d", slug, rec.Code)
 		}
-		if body := rec.Body.String(); !strings.Contains(body, `const SHARED_PATH = '/shared/`+slug+`';`) || strings.Contains(body, "__SHARED_RECORDINGS_SLUG__") {
-			t.Fatalf("configured slug %q was not independently injected into shared page", slug)
+		if body := rec.Body.String(); !strings.Contains(body, `const sharedRouteMatch =`) || !strings.Contains(body, `id="cards"`) {
+			t.Fatalf("configured slug %q did not receive the standard recordings UI", slug)
+		}
+		detail := httptest.NewRecorder()
+		router.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/shared/"+slug+"/recordings/7", nil))
+		if detail.Code != http.StatusOK {
+			t.Fatalf("configured slug %q detail status=%d", slug, detail.Code)
 		}
 	}
 }
@@ -392,26 +397,23 @@ func TestSharedRecordingsNamespaceHasNoMutationRoutes(t *testing.T) {
 }
 
 func TestSharedRecordingsPageHasAccessibleHeatmap(t *testing.T) {
-	body, err := loadHTMLPage("shared-recordings.html")
+	body, err := loadRecordingsHTML()
 	if err != nil {
 		t.Fatal(err)
 	}
 	page := string(body)
 	for _, marker := range []string{
 		`role="tooltip"`,
-		`aria-label="Recent scheduled capture health"`,
-		`data-tip=`,
+		`data-health-tooltip`,
 		`pointerover`,
 		`focusin`,
-		`Escape`,
-		`const SHARED_PATH = '/shared/__SHARED_RECORDINGS_SLUG__';`,
-		`const PUBLIC_ACCESS = __SHARED_RECORDINGS_PUBLIC__;`,
+		`const sharedReadOnly = Boolean(sharedRouteMatch);`,
+		`function recordingAPIPath`,
+		`sharedReadOnly ? '' :`,
 		`/clips?limit=`,
-		`data-download=`,
-		`Array.from({length:24},()=>[])`,
-		`bins.map(bin=>({bin,hour}))`,
-		`repeat(${slots.length},minmax(19px,1fr))`,
-		`timeZoneName:'short'`,
+		`data-clipdownload`,
+		`Array.from({ length: 24 }, () => [])`,
+		`timeZoneName: 'short'`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("shared recordings page missing %q", marker)

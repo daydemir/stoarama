@@ -36,10 +36,6 @@ func loadRecordingsHTML() ([]byte, error) {
 	return loadHTMLPage("recordings.html")
 }
 
-func loadSharedRecordingsHTML() ([]byte, error) {
-	return loadHTMLPage("shared-recordings.html")
-}
-
 func loadOrgSettingsHTML() ([]byte, error) {
 	return loadHTMLPage("org-settings.html")
 }
@@ -76,7 +72,7 @@ func (s *Server) handleSharedRecordingsApp(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
-	writeHTML(w, s.sharedRecordingsHTML)
+	writeHTML(w, s.recordingsHTML)
 }
 
 func (s *Server) handleOrgSettingsApp(w http.ResponseWriter, _ *http.Request) {
