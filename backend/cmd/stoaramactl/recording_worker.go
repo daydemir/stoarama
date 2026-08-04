@@ -18,6 +18,7 @@ import (
 const (
 	cloudRecorderMinLeaseFreeBytes  = 2 << 30
 	cloudRecorderMinActiveFreeBytes = 512 << 20
+	cloudRecorderNoProgressTimeout  = 5 * time.Minute
 )
 
 // runRecordingWorker runs the recorder droplet's clip-capture loop. It
@@ -65,12 +66,13 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatalf("init recording api client: %v", err)
 	}
 	worker, err := recordingworker.NewWorker(recordingworker.Config{
-		Client:        client,
-		WorkerID:      strings.TrimSpace(*workerID),
-		Concurrency:   *concurrency,
-		HeartbeatSec:  *heartbeatSec,
-		PollInterval:  time.Duration(*pollSec) * time.Second,
-		UploadWorkers: cfg.RelayUploadWorkers,
+		Client:                      client,
+		WorkerID:                    strings.TrimSpace(*workerID),
+		Concurrency:                 *concurrency,
+		HeartbeatSec:                *heartbeatSec,
+		PollInterval:                time.Duration(*pollSec) * time.Second,
+		UploadWorkers:               cfg.RelayUploadWorkers,
+		ContinuousNoProgressTimeout: cloudRecorderNoProgressTimeout,
 		DiskFreeBytes: func() (uint64, error) {
 			var stat unix.Statfs_t
 			if err := unix.Statfs(os.TempDir(), &stat); err != nil {
