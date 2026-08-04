@@ -517,12 +517,18 @@
     async function loadBilling() {
       try {
         const b = await fetchJSON('/api/v1/account/billing');
-        if (b && b.billing_enabled === false) { billingPanel.classList.add('hidden'); return; }
         billingPanel.classList.remove('hidden');
         renderBilling(b || {});
         billingStatus.classList.add('hidden');
         billingBody.classList.remove('hidden');
-        void loadHistory();
+        if (b && b.billing_enabled === false) {
+          historyList.classList.add('hidden');
+          historyEmpty.classList.add('hidden');
+          historyStatus.classList.remove('hidden');
+          setStatus(historyStatus, 'Invoice history is temporarily unavailable. Usage estimates are still current.', '');
+        } else {
+          void loadHistory();
+        }
       } catch (err) {
         billingPanel.classList.remove('hidden');
         billingBody.classList.add('hidden');

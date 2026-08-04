@@ -68,7 +68,9 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 	winStart := now.Truncate(time.Hour)
 	winStart = time.Date(winStart.Year(), winStart.Month(), 1, 0, 0, 0, 0, time.UTC)
 	winEnd := winStart.AddDate(0, 1, 0)
-	var periodStart, periodEnd *string
+	startValue := winStart.Format(time.RFC3339)
+	endValue := winEnd.Format(time.RFC3339)
+	periodStart, periodEnd := &startValue, &endValue
 	if s.billing != nil {
 		var subID *string
 		_ = s.pool.QueryRow(r.Context(), `
