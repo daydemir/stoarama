@@ -10,6 +10,33 @@ func ptime(y int, mo time.Month, d, h int) time.Time {
 	return time.Date(y, mo, d, h, 0, 0, 0, time.UTC)
 }
 
+func TestResolveBillingWindow(t *testing.T) {
+	fallbackStart := ptime(2026, time.August, 1, 0)
+	fallbackEnd := ptime(2026, time.September, 1, 0)
+	validStart := ptime(2026, time.August, 7, 0)
+	validEnd := ptime(2026, time.September, 7, 0)
+
+	for _, tc := range []struct {
+		name       string
+		start, end time.Time
+		wantStart  time.Time
+		wantEnd    time.Time
+	}{
+		{"no period", time.Time{}, time.Time{}, fallbackStart, fallbackEnd},
+		{"partial start", validStart, time.Time{}, fallbackStart, fallbackEnd},
+		{"partial end", time.Time{}, validEnd, fallbackStart, fallbackEnd},
+		{"inverted", validEnd, validStart, fallbackStart, fallbackEnd},
+		{"valid", validStart, validEnd, validStart, validEnd},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotStart, gotEnd := resolveBillingWindow(fallbackStart, fallbackEnd, tc.start, tc.end)
+			if !gotStart.Equal(tc.wantStart) || !gotEnd.Equal(tc.wantEnd) {
+				t.Fatalf("window = [%s, %s), want [%s, %s)", gotStart, gotEnd, tc.wantStart, tc.wantEnd)
+			}
+		})
+	}
+}
+
 // TestProjectRecordingHours checks the EXACT forward projection against the
 // stored schedule. now is fixed and winEnd is chosen so the projected span is a
 // clean N days, and projStart lands on an hour boundary so the current-hour ceil

@@ -134,6 +134,12 @@ services:
         sync: false
       - key: STRIPE_PRICE_ID
         sync: false
+      - key: STRIPE_METER_ID
+        sync: false
+      - key: STRIPE_GB_MONTH_PRICE_ID
+        sync: false
+      - key: STRIPE_GB_MONTH_METER_ID
+        sync: false
       - key: STRIPE_LIVEMODE
         sync: false
       # secretbox master key (base64, e.g. `openssl rand -base64 32`). REQUIRED
@@ -299,6 +305,12 @@ services:
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
       - key: STRIPE_PRICE_ID
+        sync: false
+      - key: STRIPE_METER_ID
+        sync: false
+      - key: STRIPE_GB_MONTH_PRICE_ID
+        sync: false
+      - key: STRIPE_GB_MONTH_METER_ID
         sync: false
       - key: STRIPE_LIVEMODE
         sync: false

@@ -68,7 +68,6 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 	winStart := now.Truncate(time.Hour)
 	winStart = time.Date(winStart.Year(), winStart.Month(), 1, 0, 0, 0, 0, time.UTC)
 	winEnd := winStart.AddDate(0, 1, 0)
-	var periodStart, periodEnd *string
 	if s.billing != nil {
 		var subID *string
 		_ = s.pool.QueryRow(r.Context(), `
@@ -76,21 +75,13 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		`, principal.AccountID).Scan(&subID)
 		if subID != nil && strings.TrimSpace(*subID) != "" {
 			if start, end, err := s.billing.GetSubscriptionPeriod(r.Context(), strings.TrimSpace(*subID)); err == nil {
-				if !start.IsZero() && !end.IsZero() && end.After(start) {
-					winStart = start.UTC()
-					winEnd = end.UTC()
-				}
-				if !start.IsZero() {
-					v := start.UTC().Format(time.RFC3339)
-					periodStart = &v
-				}
-				if !end.IsZero() {
-					v := end.UTC().Format(time.RFC3339)
-					periodEnd = &v
-				}
+				winStart, winEnd = resolveBillingWindow(winStart, winEnd, start, end)
 			}
 		}
 	}
+	startValue := winStart.Format(time.RFC3339)
+	endValue := winEnd.Format(time.RFC3339)
+	periodStart, periodEnd := &startValue, &endValue
 
 	// Recording-hours measured TO DATE, over the resolved window [winStart, winEnd),
 	// from our own ledger (never Stripe summaries). Same [start,end) bind meterAccount
@@ -161,6 +152,13 @@ func (s *Server) handleAccountBillingMe(w http.ResponseWriter, r *http.Request) 
 		"recording_hour_rate_cents":        recordingHourRateCents,
 		"stream_hour_month_rate_cents":     streamHourMonthRateCents,
 	})
+}
+
+func resolveBillingWindow(fallbackStart, fallbackEnd, candidateStart, candidateEnd time.Time) (time.Time, time.Time) {
+	if candidateStart.IsZero() || candidateEnd.IsZero() || !candidateEnd.After(candidateStart) {
+		return fallbackStart, fallbackEnd
+	}
+	return candidateStart.UTC(), candidateEnd.UTC()
 }
 
 // projectAccountRecordingHours sums the forward-projected additional

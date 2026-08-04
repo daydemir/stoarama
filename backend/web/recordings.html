@@ -2759,7 +2759,6 @@
 
     function renderLedger() {
       const b = state.billing || {};
-      if (!state.billingEnabled) { els.ledger.classList.add('hidden'); return; }
       const lines = [];
       const hours = Number(b.recording_hours_this_month || 0);
       const scheduledHours = Number(b.projected_recording_hours || 0);
