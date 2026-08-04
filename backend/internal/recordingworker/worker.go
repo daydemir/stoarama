@@ -52,9 +52,9 @@ type Config struct {
 	// RelayDiagnostics, when non-nil, is updated with non-secret job progress for
 	// relay node heartbeats. Cloud droplet workers leave it nil.
 	RelayDiagnostics *RelayDiagnostics
-	// ContinuousNoProgressTimeout makes a relay surrender a continuous job after
-	// this long without a successfully ingested segment. Zero keeps cloud workers
-	// on their existing window-long retry behavior.
+	// ContinuousNoProgressTimeout makes a worker surrender a continuous job after
+	// this long without a successfully ingested segment. The server then hands the
+	// job to another worker; zero disables the safeguard.
 	ContinuousNoProgressTimeout time.Duration
 	// CaptureTempDir owns relay capture attempts outside the OS-wide temporary
 	// directory. Empty preserves the cloud worker's existing behavior.
@@ -113,9 +113,6 @@ func NewWorker(cfg Config) (*Worker, error) {
 	}
 	if cfg.LeaseGate != nil && cfg.ActiveJobs == nil {
 		return nil, fmt.Errorf("lease gate requires active jobs counter")
-	}
-	if cfg.ContinuousNoProgressTimeout > 0 && cfg.RelayDiagnostics == nil {
-		return nil, fmt.Errorf("continuous no-progress timeout requires relay diagnostics")
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 1
@@ -866,7 +863,7 @@ func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.Canc
 	if !continuousNoProgressExpired(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout) {
 		return false
 	}
-	err := fmt.Errorf("continuous relay made no progress for %s", w.cfg.ContinuousNoProgressTimeout)
+	err := fmt.Errorf("continuous capture made no progress for %s", w.cfg.ContinuousNoProgressTimeout)
 	return w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
 }
 

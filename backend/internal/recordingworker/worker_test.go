@@ -44,6 +44,26 @@ func TestContinuousShouldStop(t *testing.T) {
 	}
 }
 
+func TestCloudWorkerAllowsNoProgressHandoffWithoutRelayDiagnostics(t *testing.T) {
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{
+		BaseURL:   "https://api.example.test",
+		NodeToken: "test-node-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{
+		Client:                      client,
+		ContinuousNoProgressTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker rejected cloud no-progress handoff: %v", err)
+	}
+	if worker.cfg.ContinuousNoProgressTimeout != 5*time.Minute {
+		t.Fatalf("timeout = %s, want 5m", worker.cfg.ContinuousNoProgressTimeout)
+	}
+}
+
 func TestContinuousDeliveryExhaustionAfterWindowCloseDoesNotFailJob(t *testing.T) {
 	tests := []struct {
 		name         string
