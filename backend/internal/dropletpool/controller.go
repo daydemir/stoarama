@@ -215,11 +215,11 @@ func (c *Controller) tick(ctx context.Context) error {
 			break // a failing DO create will likely fail again this tick; retry next tick
 		}
 	}
-	requiredDroplets := (forecast.PeakConcurrent + c.cfg.Capacity - 1) / c.cfg.Capacity
-	if requiredDroplets < c.cfg.Min {
-		requiredDroplets = c.cfg.Min
+	requiredCapacity := forecast.PeakConcurrent
+	if minCapacity := c.cfg.Min * c.cfg.Capacity; requiredCapacity < minCapacity {
+		requiredCapacity = minCapacity
 	}
-	rollingBuild, err := c.rolloutBuild(ctx, now, live+decision.ScaleUpCount, decision.ScaleUpCount, requiredDroplets)
+	rollingBuild, err := c.rolloutBuild(ctx, now, live+decision.ScaleUpCount, decision.ScaleUpCount, requiredCapacity)
 	if err != nil {
 		log.Printf("droplet pool: build rollout: %v", err)
 	}
@@ -434,7 +434,7 @@ func shouldDrainStaleBuild(desired, reported string, busy bool) bool {
 // drainIdleStaleBuilds retires old binaries without interrupting an active
 // recording. Empty build_sha is intentionally stale when the controller has a
 // desired build, so workers deployed before the handshake are rolled forward.
-func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, nextBatchIndex, requiredDroplets int) (bool, error) {
+func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, nextBatchIndex, requiredCapacity int) (bool, error) {
 	if strings.TrimSpace(c.cfg.BuildSHA) == "" {
 		return false, nil
 	}
@@ -486,11 +486,15 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 	if err != nil {
 		return true, err
 	}
-	if !canDrainStale(len(active), requiredDroplets, len(draining)) {
-		return true, nil
+	activeCapacity := 0
+	for _, d := range active {
+		activeCapacity += d.Capacity
 	}
 	for _, d := range active {
 		if workerBuildReady(c.cfg.BuildSHA, d.BuildSHA) {
+			continue
+		}
+		if !canDrainStale(activeCapacity, d.Capacity, requiredCapacity, len(draining)) {
 			continue
 		}
 		drained, err := c.store.MarkDrainingIfIdle(ctx, d.ID)
@@ -505,10 +509,10 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 	return true, nil
 }
 
-func canDrainStale(activeCount, requiredDroplets, drainingCount int) bool {
+func canDrainStale(activeCapacity, candidateCapacity, requiredCapacity, drainingCount int) bool {
 	// Finish one replacement transition before starting another, and never
 	// retire capacity the current demand forecast needs.
-	return drainingCount == 0 && activeCount > 0 && activeCount-1 >= requiredDroplets
+	return drainingCount == 0 && candidateCapacity > 0 && activeCapacity-candidateCapacity >= requiredCapacity
 }
 
 // refreshIdle stamps/clears idle_since on active droplets based on whether they

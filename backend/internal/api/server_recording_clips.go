@@ -375,7 +375,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var req recordingUploadIntentRequest
-	if err := util.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -987,7 +987,7 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 	var req struct {
 		BuildSHA string `json:"build_sha"`
 	}
-	if err := util.DecodeJSON(r, &req); err != nil {
+	if err := util.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}

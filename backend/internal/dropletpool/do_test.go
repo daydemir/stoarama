@@ -324,11 +324,14 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 	if !strings.Contains(out, "BACKEND_API_URL='https://stoarama-api.onrender.com'") {
 		t.Fatalf("cloud-init missing BACKEND_API_URL env")
 	}
-	if !strings.Contains(out, "git -C /opt/stoarama fetch --depth 1 origin "+strings.Repeat("a", 40)) {
+	fetchIdx := strings.Index(out, "git -C /opt/stoarama fetch --depth 1 origin "+strings.Repeat("a", 40))
+	checkoutIdx := strings.Index(out, "git -C /opt/stoarama checkout --detach FETCH_HEAD")
+	headIdx := strings.Index(out, `printf "export RECORDER_BUILD_SHA='%s'\n" "$HEAD_SHA"`)
+	if fetchIdx < 0 {
 		t.Fatalf("cloud-init must fetch the controller's immutable build commit")
 	}
-	if !strings.Contains(out, "git -C /opt/stoarama checkout --detach FETCH_HEAD") {
-		t.Fatalf("cloud-init must check out the immutable build commit")
+	if checkoutIdx <= fetchIdx || headIdx <= checkoutIdx {
+		t.Fatalf("cloud-init must fetch, check out, then report the immutable build commit")
 	}
 	if !strings.Contains(out, `printf "export RECORDER_BUILD_SHA='%s'\n" "$HEAD_SHA"`) {
 		t.Fatalf("cloud-init must report the verified binary source commit")
