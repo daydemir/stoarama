@@ -1,5 +1,3 @@
-BEGIN;
-
 -- Durable outbox guard for Stripe meter events. Stripe only guarantees meter
 -- event identifier deduplication for a rolling window, so the monthly cursor
 -- alone cannot safely distinguish "request accepted, DB update failed" from
@@ -16,12 +14,9 @@ CREATE TABLE billing_meter_reports (
   status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','reported')),
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   reported_at    TIMESTAMPTZ,
-  UNIQUE (account_id, period_end, meter_kind),
   UNIQUE (meter_kind, identifier)
 );
 
 CREATE INDEX idx_billing_meter_reports_pending
 ON billing_meter_reports (created_at)
 WHERE status = 'pending';
-
-COMMIT;

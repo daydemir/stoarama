@@ -258,7 +258,7 @@ func reserveMeterReport(ctx context.Context, pool *pgxpool.Pool, accountID int64
 	result, err := pool.Exec(ctx, `
 		INSERT INTO billing_meter_reports(account_id,period_end,meter_kind,expected_value,identifier)
 		VALUES($1,$2,$3,$4,$5)
-		ON CONFLICT (account_id,period_end,meter_kind) DO NOTHING
+		ON CONFLICT (meter_kind,identifier) DO NOTHING
 	`, accountID, periodEnd, meterKind, expectedValue, identifier)
 	if err != nil {
 		return false, err
@@ -269,15 +269,15 @@ func reserveMeterReport(ctx context.Context, pool *pgxpool.Pool, accountID int64
 	var status, storedValue string
 	if err := pool.QueryRow(ctx, `
 		SELECT status,expected_value FROM billing_meter_reports
-		WHERE account_id=$1 AND period_end=$2 AND meter_kind=$3
-	`, accountID, periodEnd, meterKind).Scan(&status, &storedValue); err != nil {
+		WHERE meter_kind=$1 AND identifier=$2
+	`, meterKind, identifier).Scan(&status, &storedValue); err != nil {
 		return false, err
-	}
-	if storedValue != expectedValue {
-		return false, fmt.Errorf("existing report value %q differs from recomputed value %q", storedValue, expectedValue)
 	}
 	if status == "reported" {
 		return false, nil
+	}
+	if storedValue != expectedValue {
+		return false, fmt.Errorf("existing pending report value %q differs from recomputed value %q", storedValue, expectedValue)
 	}
 	return false, fmt.Errorf("ambiguous pending report requires Stripe reconciliation")
 }

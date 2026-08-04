@@ -1,11 +1,36 @@
 package billing
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	stripe "github.com/stripe/stripe-go/v82"
 )
+
+func TestRetryStripeConfigurationGet(t *testing.T) {
+	attempts := 0
+	if err := retryStripeConfigurationGet(context.Background(), "price", func() error {
+		attempts++
+		if attempts < 3 {
+			return fmt.Errorf("temporary")
+		}
+		return nil
+	}); err != nil || attempts != 3 {
+		t.Fatalf("retry success attempts=%d err=%v", attempts, err)
+	}
+	attempts = 0
+	err := retryStripeConfigurationGet(context.Background(), "meter", func() error {
+		attempts++
+		return fmt.Errorf("unavailable")
+	})
+	var retrievalErr *ConfigurationRetrievalError
+	if !errors.As(err, &retrievalErr) || attempts != 3 {
+		t.Fatalf("retry failure attempts=%d err=%v", attempts, err)
+	}
+}
 
 func validStripeObjects(livemode bool) (*stripe.Price, *stripe.BillingMeter) {
 	meterID := "mtr_test_recording"
@@ -52,7 +77,14 @@ func TestValidateStripePriceAndMeter(t *testing.T) {
 		{"wrong mode", func(p *stripe.Price, _ *stripe.BillingMeter) { p.Livemode = false }, "mode"},
 		{"wrong amount", func(p *stripe.Price, _ *stripe.BillingMeter) { p.UnitAmount = 50 }, "5 cents"},
 		{"wrong lookup key", func(p *stripe.Price, _ *stripe.BillingMeter) { p.LookupKey = "recording_day_v1" }, "lookup_key"},
+		{"licensed price", func(p *stripe.Price, _ *stripe.BillingMeter) {
+			p.Recurring.UsageType = stripe.PriceRecurringUsageTypeLicensed
+		}, "monthly metered"},
+		{"yearly price", func(p *stripe.Price, _ *stripe.BillingMeter) {
+			p.Recurring.Interval = stripe.PriceRecurringIntervalYear
+		}, "monthly metered"},
 		{"wrong meter", func(p *stripe.Price, _ *stripe.BillingMeter) { p.Recurring.Meter = "mtr_other" }, "attached"},
+		{"wrong meter mode", func(_ *stripe.Price, m *stripe.BillingMeter) { m.Livemode = false }, "mode"},
 		{"inactive meter", func(_ *stripe.Price, m *stripe.BillingMeter) { m.Status = stripe.BillingMeterStatusInactive }, "not active"},
 		{"wrong event", func(_ *stripe.Price, m *stripe.BillingMeter) { m.EventName = "recording_day" }, "event_name"},
 		{"wrong aggregation", func(_ *stripe.Price, m *stripe.BillingMeter) {

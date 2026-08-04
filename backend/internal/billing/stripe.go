@@ -79,26 +79,75 @@ func New(secretKey, priceID, streamHourMonthPriceID, appBaseURL string, livemode
 // livemode disagrees with this.
 func (c *Client) Livemode() bool { return c.livemode }
 
+// ConfigurationRetrievalError means Stripe could not be reached (or rejected a
+// read) after bounded retries. It is distinct from a successfully retrieved but
+// invalid price/meter configuration.
+type ConfigurationRetrievalError struct {
+	Object string
+	Err    error
+}
+
+func (e *ConfigurationRetrievalError) Error() string {
+	return fmt.Sprintf("retrieve %s: %v", e.Object, e.Err)
+}
+
+func (e *ConfigurationRetrievalError) Unwrap() error { return e.Err }
+
+func retryStripeConfigurationGet(ctx context.Context, object string, get func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = get(); err == nil {
+			return nil
+		}
+		if attempt == 2 {
+			break
+		}
+		delay := time.Duration(250*(1<<attempt)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return &ConfigurationRetrievalError{Object: object, Err: ctx.Err()}
+		case <-timer.C:
+		}
+	}
+	return &ConfigurationRetrievalError{Object: object, Err: err}
+}
+
 // ValidateConfiguration resolves the configured prices and meters from Stripe
 // before a billing-capable process starts. This is deliberately fail-closed: a
 // typo, archived object, wrong account/mode, wrong price, or crossed meter ID must
 // stop both Checkout and metering instead of producing incorrect invoices.
 func (c *Client) ValidateConfiguration(ctx context.Context, recordingMeterID, storageMeterID string) error {
-	recordingPrice, err := c.sc.Prices.Get(c.priceID, &stripe.PriceParams{Params: stripe.Params{Context: ctx}})
-	if err != nil {
-		return fmt.Errorf("retrieve recording-hour price: %w", err)
+	var recordingPrice, storagePrice *stripe.Price
+	var recordingMeter, storageMeter *stripe.BillingMeter
+	if err := retryStripeConfigurationGet(ctx, "recording-hour price", func() error {
+		var err error
+		recordingPrice, err = c.sc.Prices.Get(c.priceID, &stripe.PriceParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
 	}
-	storagePrice, err := c.sc.Prices.Get(c.streamHourMonthPriceID, &stripe.PriceParams{Params: stripe.Params{Context: ctx}})
-	if err != nil {
-		return fmt.Errorf("retrieve stream-hour-month price: %w", err)
+	if err := retryStripeConfigurationGet(ctx, "stream-hour-month price", func() error {
+		var err error
+		storagePrice, err = c.sc.Prices.Get(c.streamHourMonthPriceID, &stripe.PriceParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
 	}
-	recordingMeter, err := c.sc.BillingMeters.Get(strings.TrimSpace(recordingMeterID), &stripe.BillingMeterParams{Params: stripe.Params{Context: ctx}})
-	if err != nil {
-		return fmt.Errorf("retrieve recording-hour meter: %w", err)
+	if err := retryStripeConfigurationGet(ctx, "recording-hour meter", func() error {
+		var err error
+		recordingMeter, err = c.sc.BillingMeters.Get(strings.TrimSpace(recordingMeterID), &stripe.BillingMeterParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
 	}
-	storageMeter, err := c.sc.BillingMeters.Get(strings.TrimSpace(storageMeterID), &stripe.BillingMeterParams{Params: stripe.Params{Context: ctx}})
-	if err != nil {
-		return fmt.Errorf("retrieve stream-hour-month meter: %w", err)
+	if err := retryStripeConfigurationGet(ctx, "stream-hour-month meter", func() error {
+		var err error
+		storageMeter, err = c.sc.BillingMeters.Get(strings.TrimSpace(storageMeterID), &stripe.BillingMeterParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
 	}
 	if err := validateStripePriceAndMeter("recording-hour", recordingPrice, recordingMeter, strings.TrimSpace(recordingMeterID), recordingHourEventName, recordingHourLookupKey, recordingHourUnitAmountCents, c.livemode); err != nil {
 		return err

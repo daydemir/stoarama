@@ -47,7 +47,7 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 			meter_kind TEXT NOT NULL, expected_value TEXT NOT NULL,
 			identifier TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
 			reported_at TIMESTAMPTZ,
-			UNIQUE(account_id,period_end,meter_kind)
+			UNIQUE(meter_kind,identifier)
 		)
 	`); err != nil {
 		t.Fatal(err)
@@ -60,14 +60,20 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if send, err = reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "912", "47-2026-08-29"); err == nil || send || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous retry send=%v err=%v", send, err)
 	}
+	if _, err := reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "913", "47-2026-08-29"); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("changed pending usage was accepted: %v", err)
+	}
 	if err := markMeterReportReported(ctx, pool, 47, periodEnd, "recording_hour"); err != nil {
 		t.Fatal(err)
 	}
 	if send, err = reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "912", "47-2026-08-29"); err != nil || send {
 		t.Fatalf("reported retry send=%v err=%v", send, err)
 	}
-	if _, err := reserveMeterReport(ctx, pool, 47, periodEnd, "recording_hour", "913", "47-2026-08-29"); err == nil || !strings.Contains(err.Error(), "differs") {
-		t.Fatalf("changed usage was accepted: %v", err)
+	// The durable key exactly matches Stripe's (meter,event identifier) key. Even
+	// if a later retry reconstructed a different timestamp/value for that period
+	// key, an already-reported event is never sent again.
+	if send, err = reserveMeterReport(ctx, pool, 47, periodEnd.Add(time.Hour), "recording_hour", "913", "47-2026-08-29"); err != nil || send {
+		t.Fatalf("repeated Stripe identifier send=%v err=%v", send, err)
 	}
 }
 
