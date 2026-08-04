@@ -327,6 +327,9 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 	if !strings.Contains(out, "git -C /opt/stoarama fetch --depth 1 origin "+strings.Repeat("a", 40)) {
 		t.Fatalf("cloud-init must fetch the controller's immutable build commit")
 	}
+	if !strings.Contains(out, "git -C /opt/stoarama checkout --detach FETCH_HEAD") {
+		t.Fatalf("cloud-init must check out the immutable build commit")
+	}
 	if !strings.Contains(out, `printf "export RECORDER_BUILD_SHA='%s'\n" "$HEAD_SHA"`) {
 		t.Fatalf("cloud-init must report the verified binary source commit")
 	}

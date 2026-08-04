@@ -215,7 +215,11 @@ func (c *Controller) tick(ctx context.Context) error {
 			break // a failing DO create will likely fail again this tick; retry next tick
 		}
 	}
-	rollingBuild, err := c.rolloutBuild(ctx, now, live+decision.ScaleUpCount, decision.ScaleUpCount)
+	requiredDroplets := (forecast.PeakConcurrent + c.cfg.Capacity - 1) / c.cfg.Capacity
+	if requiredDroplets < c.cfg.Min {
+		requiredDroplets = c.cfg.Min
+	}
+	rollingBuild, err := c.rolloutBuild(ctx, now, live+decision.ScaleUpCount, decision.ScaleUpCount, requiredDroplets)
 	if err != nil {
 		log.Printf("droplet pool: build rollout: %v", err)
 	}
@@ -430,7 +434,7 @@ func shouldDrainStaleBuild(desired, reported string, busy bool) bool {
 // drainIdleStaleBuilds retires old binaries without interrupting an active
 // recording. Empty build_sha is intentionally stale when the controller has a
 // desired build, so workers deployed before the handshake are rolled forward.
-func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, nextBatchIndex int) (bool, error) {
+func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, nextBatchIndex, requiredDroplets int) (bool, error) {
 	if strings.TrimSpace(c.cfg.BuildSHA) == "" {
 		return false, nil
 	}
@@ -474,9 +478,16 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 	if !hasCurrentActive {
 		return true, nil
 	}
+	draining, err := c.store.ListByStates(ctx, "draining")
+	if err != nil {
+		return true, err
+	}
 	active, err := c.store.ListByStates(ctx, "active")
 	if err != nil {
 		return true, err
+	}
+	if !canDrainStale(len(active), requiredDroplets, len(draining)) {
+		return true, nil
 	}
 	for _, d := range active {
 		if workerBuildReady(c.cfg.BuildSHA, d.BuildSHA) {
@@ -492,6 +503,12 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 		}
 	}
 	return true, nil
+}
+
+func canDrainStale(activeCount, requiredDroplets, drainingCount int) bool {
+	// Finish one replacement transition before starting another, and never
+	// retire capacity the current demand forecast needs.
+	return drainingCount == 0 && activeCount > 0 && activeCount-1 >= requiredDroplets
 }
 
 // refreshIdle stamps/clears idle_since on active droplets based on whether they

@@ -410,3 +410,15 @@ func TestShouldDrainStaleBuild(t *testing.T) {
 		t.Fatal("busy, matching, and disabled-gate workers must not drain")
 	}
 }
+
+func TestCanDrainStalePreservesRequiredCapacity(t *testing.T) {
+	if !canDrainStale(3, 2, 0) {
+		t.Fatal("one excess active worker should be drainable")
+	}
+	if canDrainStale(2, 2, 0) {
+		t.Fatal("must not drain below forecast-required capacity")
+	}
+	if canDrainStale(3, 2, 1) {
+		t.Fatal("must not start another drain while one is in progress")
+	}
+}
