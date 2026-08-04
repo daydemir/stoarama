@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
 func testSharedRecordingsSigningKey() string {
@@ -29,6 +30,19 @@ func TestSharedRecordingsTokenExpiresAndRotatesWithSigningKey(t *testing.T) {
 	}
 	if validSharedRecordingsToken(token, "first-signing-key", now.Add(time.Hour)) {
 		t.Fatal("expired token accepted")
+	}
+}
+
+func TestStorageEndpointRequiresHTTPS(t *testing.T) {
+	for _, endpoint := range []string{"", "http://example.test", "ftp://example.test", "https://user:pass@example.test", "https:///missing-host"} {
+		if err := validateStorageEndpointHTTPS(endpoint); err == nil {
+			t.Fatalf("endpoint %q accepted", endpoint)
+		}
+	}
+	for _, endpoint := range []string{"https://example.test", "HTTPS://example.test/storage"} {
+		if err := validateStorageEndpointHTTPS(endpoint); err != nil {
+			t.Fatalf("endpoint %q rejected: %v", endpoint, err)
+		}
 	}
 }
 
@@ -229,6 +243,68 @@ func TestPublicSharedClipsAreTenantScopedAndRedacted(t *testing.T) {
 	s.router().ServeHTTP(foreign, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/"+strconv.FormatInt(foreignRecordingID, 10)+"/clips", nil))
 	if foreign.Code != http.StatusNotFound {
 		t.Fatalf("foreign clips status=%d want 404 body=%s", foreign.Code, foreign.Body.String())
+	}
+}
+
+func TestPublicSharedClipDownloadIsTenantScopedAndNeedsNoCookie(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	secrets, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := secrets.Encrypt([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	var destinationID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO storage_destinations(account_id,secret_access_key_enc) VALUES(47,$1) RETURNING id
+	`, sealed).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	insertRecording := func(accountID int64, name string) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name) VALUES($1,$2) RETURNING id`, accountID, name).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	ownerRecordingID := insertRecording(47, "MIT recording")
+	foreignRecordingID := insertRecording(99, "Private recording")
+	insertClip := func(recordingID int64) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO recording_clips(recording_id,size_bytes,clip_start_at,clip_end_at,storage_destination_id)
+			VALUES($1,123456,now()-interval '1 minute',now(),$2) RETURNING id
+		`, recordingID, destinationID).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	ownerClipID := insertClip(ownerRecordingID)
+	foreignClipID := insertClip(foreignRecordingID)
+	s := &Server{pool: pool, secrets: secrets, cfg: config.Config{
+		SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true,
+		R2SignGetTTL: time.Minute,
+	}}
+	get := func(recordingID, clipID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		path := "/api/v1/shared/mit-scl/recordings/" + strconv.FormatInt(recordingID, 10) + "/clips/" + strconv.FormatInt(clipID, 10) + "/download?disposition=inline"
+		response := httptest.NewRecorder()
+		s.router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		return response
+	}
+	owner := get(ownerRecordingID, ownerClipID)
+	if owner.Code != http.StatusOK || !strings.Contains(owner.Body.String(), `"url":"https://`) || strings.Contains(owner.Body.String(), "object_key") {
+		t.Fatalf("owner download status=%d body=%s", owner.Code, owner.Body.String())
+	}
+	foreign := get(foreignRecordingID, foreignClipID)
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign download status=%d want 404 body=%s", foreign.Code, foreign.Body.String())
 	}
 }
 

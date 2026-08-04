@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,6 +36,14 @@ type clipDestination struct {
 // clip's bucket, mirroring handleRecordingUploadIntent.
 func (s *Server) buildClipClient(r *http.Request, d clipDestination) (*r2.Client, error) {
 	return s.buildClipClientCtx(r.Context(), d)
+}
+
+func validateStorageEndpointHTTPS(raw string) error {
+	endpoint, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(endpoint.Scheme, "https") || endpoint.Host == "" || endpoint.User != nil {
+		return fmt.Errorf("storage destination endpoint must be an HTTPS URL without embedded credentials")
+	}
+	return nil
 }
 
 // handleAccountRecordingClipDownload presigns a GET against the clip's bucket so
@@ -99,6 +108,10 @@ func (s *Server) writeRecordingClipDownload(w http.ResponseWriter, r *http.Reque
 	// for the org's download endpoint.
 	if purgedAt != nil || releasedAt != nil {
 		util.WriteError(w, http.StatusGone, "clip is no longer available")
+		return
+	}
+	if err := validateStorageEndpointHTTPS(d.endpoint); err != nil {
+		util.WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 

@@ -430,6 +430,10 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording job: %v", err))
 		return
 	}
+	if err := validateStorageEndpointHTTPS(endpoint); err != nil {
+		util.WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
 
 	// A reconnect can reopen the exact same HLS segment under a fresh signed URL.
 	// Skip it before presigning/uploading when its content hash is already part of

@@ -91,6 +91,10 @@ func (s *Server) handleAdminStorageDestinationCreate(w http.ResponseWriter, r *h
 			return
 		}
 	}
+	if err := validateStorageEndpointHTTPS(endpoint); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	var nameExists bool
 	if err := s.pool.QueryRow(r.Context(), `

@@ -171,6 +171,10 @@ func (s *Server) handleAccountStorageDestinationsCreate(w http.ResponseWriter, r
 			return
 		}
 	}
+	if err := validateStorageEndpointHTTPS(endpoint); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	var nameExists bool
 	if err := s.pool.QueryRow(r.Context(), `

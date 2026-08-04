@@ -180,13 +180,21 @@
       }
     }
     async function renderClips(id,timezone,page=0) {
-      const limit=100, payload=await request(`/recordings/${id}/clips?limit=${limit}&offset=${page*limit}`), items=payload.items||[], total=Number(payload.total||0);
       const mount=document.getElementById('clips');
+      const limit=100;
+      let payload;
+      try { payload=await request(`/recordings/${id}/clips?limit=${limit}&offset=${page*limit}`) }
+      catch(error) {
+        mount.innerHTML=`<p style="color:var(--red)">${escapeHTML(error.message)}</p><button id="clipsRetry" type="button">Retry clips</button>`;
+        document.getElementById('clipsRetry').onclick=()=>void renderClips(id,timezone,page);
+        return;
+      }
+      const items=payload.items||[], total=Number(payload.total||0);
       mount.innerHTML=`<div class="clips-head"><div><h2>Clips</h2><span class="muted">${total} captured</span></div></div>${items.length?`<div class="table-wrap"><table><thead><tr><th>Time</th><th>Duration</th><th>Frame rate</th><th>Size</th><th></th></tr></thead><tbody>${items.map(c=>clipRow(c,id,timezone)).join('')}</tbody></table></div>`:'<p class="muted">No clips captured yet.</p>'}<div class="clips-nav"><button id="clipsPrev" ${page===0?'disabled':''}>Previous</button><span>Page ${page+1}</span><button id="clipsNext" ${(page+1)*limit>=total?'disabled':''}>Next</button></div>`;
       mount.querySelectorAll('[data-view]').forEach(button=>button.onclick=()=>openClip(id,button.dataset.view,'inline'));
       mount.querySelectorAll('[data-download]').forEach(button=>button.onclick=()=>openClip(id,button.dataset.download,'attachment'));
-      document.getElementById('clipsPrev').onclick=()=>renderClips(id,timezone,page-1);
-      document.getElementById('clipsNext').onclick=()=>renderClips(id,timezone,page+1);
+      document.getElementById('clipsPrev').onclick=()=>void renderClips(id,timezone,page-1);
+      document.getElementById('clipsNext').onclick=()=>void renderClips(id,timezone,page+1);
     }
     async function renderDetail(id, to) {
       const rec=await request(`/recordings/${id}`);
