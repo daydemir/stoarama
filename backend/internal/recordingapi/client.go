@@ -295,8 +295,10 @@ func leaseTokenHeaders(token string) map[string]string {
 // seen as worker-alive by the autoscaler, which gates promotion-to-active and
 // failed-node detection on last_seen_at rather than on DO power-on. For a manual
 // node with no managed droplet row the server update is a harmless no-op.
-func (c *Client) TouchDroplet(ctx context.Context) error {
-	return c.postJSON(ctx, "/api/v1/recording/droplets/heartbeat", map[string]any{}, nil)
+func (c *Client) TouchDroplet(ctx context.Context, buildSHA string) error {
+	return c.postJSON(ctx, "/api/v1/recording/droplets/heartbeat", map[string]any{
+		"build_sha": strings.ToLower(strings.TrimSpace(buildSHA)),
+	}, nil)
 }
 
 // NodeHeartbeat refreshes this node's last_heartbeat_at and merges the reported

@@ -269,6 +269,7 @@ type UserDataConfig struct {
 	PollSec        int
 	RepoURL        string
 	RepoRef        string
+	BuildSHA       string
 	RepoCloneToken string
 }
 
@@ -445,14 +446,21 @@ runcmd:
     if [ -n '{{.RepoCloneToken}}' ]; then
       clone_url="$(printf '%s' '{{.RepoURL}}' | sed 's#^https://#https://x-access-token:{{.RepoCloneToken}}@#')"
     fi
-    if [ ! -d /opt/stoarama/.git ]; then
+    {{if .BuildSHA}}if [ ! -d /opt/stoarama/.git ]; then
+      git clone --filter=blob:none --no-checkout "$clone_url" /opt/stoarama
+    else
+      git -C /opt/stoarama remote set-url origin "$clone_url"
+    fi
+    git -C /opt/stoarama fetch --depth 1 origin {{.BuildSHA}}
+    git -C /opt/stoarama checkout --detach FETCH_HEAD
+    {{else}}if [ ! -d /opt/stoarama/.git ]; then
       git clone --depth 1 --branch {{.RepoRef}} "$clone_url" /opt/stoarama
     else
       git -C /opt/stoarama remote set-url origin "$clone_url"
       git -C /opt/stoarama fetch --depth 1 origin {{.RepoRef}}
       git -C /opt/stoarama checkout {{.RepoRef}}
       git -C /opt/stoarama reset --hard origin/{{.RepoRef}}
-    fi
+    fi{{end}}
   - |
     # Prepare the worker binary. With DROPLET_POOL_MIN=0 the pool is cold between
     # fires, so the whole cold-start (snapshot boot + this step + worker register)
@@ -499,6 +507,8 @@ runcmd:
       echo "stoarama: baked worker binary missing or stale (have '$BUILT_SHA' want '$HEAD_SHA'); rebuilding"
       build_worker
     fi
+    sed -i '/^export RECORDER_BUILD_SHA=/d' /etc/stoarama/recorder.env
+    printf "export RECORDER_BUILD_SHA='%s'\n" "$HEAD_SHA" >> /etc/stoarama/recorder.env
   - chmod +x /opt/stoarama/backend/scripts/start-recording-worker.sh
   - systemctl daemon-reload
   - systemctl enable --now stoarama-egress-firewall.service

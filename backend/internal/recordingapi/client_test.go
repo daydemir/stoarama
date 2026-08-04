@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,5 +132,31 @@ func TestHeartbeatReturnsConfirmedLeaseExpiry(t *testing.T) {
 	}
 	if canceled || !got.Equal(want) {
 		t.Fatalf("heartbeat canceled=%t lease=%s want false/%s", canceled, got, want)
+	}
+}
+
+func TestTouchDropletReportsBuildSHA(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	got := make(chan map[string]string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/recording/droplets/heartbeat" {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		got <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.TouchDroplet(context.Background(), "  "+strings.ToUpper(sha)+"  "); err != nil {
+		t.Fatal(err)
+	}
+	if body := <-got; body["build_sha"] != sha {
+		t.Fatalf("build_sha=%q want %q", body["build_sha"], sha)
 	}
 }

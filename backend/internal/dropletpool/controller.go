@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -37,6 +38,7 @@ type Config struct {
 	FirewallID string
 
 	BackendAPIURL  string
+	BuildSHA       string
 	HeartbeatSec   int
 	PollSec        int
 	RepoURL        string
@@ -154,7 +156,6 @@ func (c *Controller) tick(ctx context.Context) error {
 	if err := c.refreshIdle(ctx); err != nil {
 		log.Printf("droplet pool: refresh idle: %v", err)
 	}
-
 	// Forecast demand.
 	forecast, err := ForecastDemand(ctx, c.poolPool(), c.cfg.BillingEnabled, now, c.cfg.Lookahead)
 	if err != nil {
@@ -214,7 +215,11 @@ func (c *Controller) tick(ctx context.Context) error {
 			break // a failing DO create will likely fail again this tick; retry next tick
 		}
 	}
-	if decision.DrainCount > 0 {
+	rollingBuild, err := c.rolloutBuild(ctx, now, live+decision.ScaleUpCount, decision.ScaleUpCount)
+	if err != nil {
+		log.Printf("droplet pool: build rollout: %v", err)
+	}
+	if !rollingBuild && decision.DrainCount > 0 {
 		c.beginDrains(ctx, now, idleEligible, decision.DrainCount)
 	}
 
@@ -385,7 +390,7 @@ func (c *Controller) promoteActive(ctx context.Context, now time.Time, fleet []D
 	}
 	window := c.workerReadyWindow()
 	for _, r := range provisioning {
-		workerReady := r.LastSeenAt != nil && now.Sub(*r.LastSeenAt) <= window
+		workerReady := r.LastSeenAt != nil && now.Sub(*r.LastSeenAt) <= window && workerBuildReady(c.cfg.BuildSHA, r.BuildSHA)
 		if !workerReady {
 			// Best-effort lead-miss warning: a provisioning row older than the
 			// provision lead whose worker has not reported in yet means the first
@@ -411,6 +416,76 @@ func (c *Controller) promoteActive(ctx context.Context, now time.Time, fleet []D
 		}
 		log.Printf("droplet pool: droplet id=%d name=%s active (worker ready)", r.ID, r.Name)
 	}
+}
+
+func workerBuildReady(desired, reported string) bool {
+	desired = strings.ToLower(strings.TrimSpace(desired))
+	return desired == "" || strings.ToLower(strings.TrimSpace(reported)) == desired
+}
+
+func shouldDrainStaleBuild(desired, reported string, busy bool) bool {
+	return !busy && !workerBuildReady(desired, reported)
+}
+
+// drainIdleStaleBuilds retires old binaries without interrupting an active
+// recording. Empty build_sha is intentionally stale when the controller has a
+// desired build, so workers deployed before the handshake are rolled forward.
+func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, nextBatchIndex int) (bool, error) {
+	if strings.TrimSpace(c.cfg.BuildSHA) == "" {
+		return false, nil
+	}
+	workers, err := c.store.ListByStates(ctx, "active", "provisioning")
+	if err != nil {
+		return false, err
+	}
+	hasStale := false
+	hasCurrentActive := false
+	hasCurrentPending := false
+	for _, d := range workers {
+		if workerBuildReady(c.cfg.BuildSHA, d.BuildSHA) {
+			hasCurrentPending = true
+			if d.State == "active" {
+				hasCurrentActive = true
+			}
+		} else if d.State == "active" {
+			hasStale = true
+		}
+	}
+	if !hasStale {
+		return false, nil
+	}
+	// Surge a pinned replacement before retiring the last old binary. This avoids
+	// a cold-capacity hole during rollout while respecting the hard spend cap.
+	if !hasCurrentPending {
+		if live >= c.cfg.Max {
+			return true, fmt.Errorf("stale workers present but hard cap %d leaves no replacement slot", c.cfg.Max)
+		}
+		if err := c.scaleUp(ctx, now, nextBatchIndex); err != nil {
+			return true, fmt.Errorf("provision build replacement: %w", err)
+		}
+		return true, nil
+	}
+	if !hasCurrentActive {
+		return true, nil
+	}
+	active, err := c.store.ListByStates(ctx, "active")
+	if err != nil {
+		return true, err
+	}
+	for _, d := range active {
+		if workerBuildReady(c.cfg.BuildSHA, d.BuildSHA) {
+			continue
+		}
+		drained, err := c.store.MarkDrainingIfIdle(ctx, d.ID)
+		if err != nil {
+			return true, fmt.Errorf("mark stale droplet %s draining: %w", d.Name, err)
+		}
+		if drained {
+			log.Printf("droplet pool: draining idle stale worker id=%d name=%s build=%q desired=%q", d.ID, d.Name, d.BuildSHA, c.cfg.BuildSHA)
+			break // roll one at a time so current capacity remains stable
+		}
+	}
+	return true, nil
 }
 
 // refreshIdle stamps/clears idle_since on active droplets based on whether they
@@ -472,6 +547,7 @@ func (c *Controller) scaleUp(ctx context.Context, now time.Time, batchIndex int)
 		PollSec:        c.cfg.PollSec,
 		RepoURL:        c.cfg.RepoURL,
 		RepoRef:        c.cfg.RepoRef,
+		BuildSHA:       c.cfg.BuildSHA,
 		RepoCloneToken: c.cfg.RepoCloneToken,
 	})
 	if err != nil {

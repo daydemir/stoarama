@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +150,7 @@ type Config struct {
 	DropletPoolRepoRef              string
 	DropletPoolRepoCloneToken       string
 	DropletPoolBackendAPIURL        string
+	DropletPoolBuildSHA             string
 }
 
 func Load() (Config, error) {
@@ -264,6 +266,7 @@ func Load() (Config, error) {
 		DropletPoolRepoRef:              strEnv("DROPLET_POOL_REPO_REF", "main"),
 		DropletPoolRepoCloneToken:       strings.TrimSpace(os.Getenv("DROPLET_POOL_REPO_CLONE_TOKEN")),
 		DropletPoolBackendAPIURL:        strings.TrimRight(strings.TrimSpace(firstNonEmpty(os.Getenv("DROPLET_POOL_BACKEND_API_URL"), os.Getenv("BACKEND_API_URL"))), "/"),
+		DropletPoolBuildSHA:             strings.ToLower(strings.TrimSpace(os.Getenv("RENDER_GIT_COMMIT"))),
 	}
 	var err error
 	cfg.SharedRecordingsProxyCIDRs, err = prefixesEnv("MIT_SCL_RECORDINGS_TRUSTED_PROXY_CIDRS")
@@ -433,6 +436,9 @@ func (c Config) ValidateR2() error {
 // the existing DO project + firewall so droplets are spend-audited and egress
 // -restricted (S-1).
 func (c Config) ValidatePool() error {
+	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(c.DropletPoolBuildSHA) {
+		return fmt.Errorf("DROPLET_POOL_ENABLED requires RENDER_GIT_COMMIT as a 40-character lowercase git SHA")
+	}
 	if strings.TrimSpace(c.DOAPIToken) == "" {
 		return fmt.Errorf("DROPLET_POOL_ENABLED requires DO_API_TOKEN")
 	}

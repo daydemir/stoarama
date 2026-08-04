@@ -23,6 +23,7 @@ type Droplet struct {
 	Capacity       int
 	State          string
 	IPAddress      string
+	BuildSHA       string
 	LastSeenAt     *time.Time
 	IdleSince      *time.Time
 	DrainStartedAt *time.Time
@@ -208,6 +209,38 @@ func (s *Store) MarkDraining(ctx context.Context, id int64) error {
 	return s.setState(ctx, id, "draining", `drain_started_at=now()`)
 }
 
+// MarkDrainingIfIdle serializes with the lease path's droplet row lock, then
+// rechecks the lease ledger before changing state. It cannot race a new lease
+// into a worker after the idle decision.
+func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var name, state string
+	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
+		return false, err
+	}
+	if state != "active" {
+		return false, nil
+	}
+	var busy bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM recording_jobs WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now())`, name).Scan(&busy); err != nil {
+		return false, err
+	}
+	if busy {
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='draining', drain_started_at=now(), updated_at=now() WHERE id=$1`, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // MarkDestroying flips a droplet to destroying just before the DeleteDroplet call.
 func (s *Store) MarkDestroying(ctx context.Context, id int64) error {
 	return s.setState(ctx, id, "destroying", "")
@@ -281,7 +314,7 @@ func (s *Store) CountLive(ctx context.Context) (int, error) {
 func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state,
-		       ip_address, last_seen_at, idle_since, drain_started_at, created_at
+		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
 		FROM recorder_droplets
 		WHERE state = ANY($1)
 		ORDER BY id ASC
@@ -294,7 +327,7 @@ func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, 
 	for rows.Next() {
 		var d Droplet
 		if err := rows.Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-			&d.Capacity, &d.State, &d.IPAddress, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt); err != nil {
+			&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan droplet: %w", err)
 		}
 		out = append(out, d)
@@ -311,11 +344,11 @@ func (s *Store) FindByDODropletID(ctx context.Context, doDropletID int64) (*Drop
 	var d Droplet
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state,
-		       ip_address, last_seen_at, idle_since, drain_started_at, created_at
+		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
 		FROM recorder_droplets
 		WHERE do_droplet_id=$1
 	`, doDropletID).Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-		&d.Capacity, &d.State, &d.IPAddress, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt)
+		&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
