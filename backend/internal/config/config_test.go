@@ -2,10 +2,107 @@ package config
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 )
+
+func completeStripeConfig(livemode bool) Config {
+	key := "sk_test_example"
+	meterPrefix := "mtr_test_"
+	if livemode {
+		key = "sk_live_example"
+		meterPrefix = "mtr_"
+	}
+	return Config{
+		StripeSecretKey:      key,
+		StripeWebhookSecret:  "whsec_example",
+		StripePriceID:        "price_recording",
+		StripeMeterID:        meterPrefix + "recording",
+		StripeGBMonthPriceID: "price_storage",
+		StripeGBMonthMeterID: meterPrefix + "storage",
+		StripeLivemode:       livemode,
+	}
+}
+
+func TestValidateStripeFailsClosed(t *testing.T) {
+	if err := (Config{}).ValidateStripe(); err != nil {
+		t.Fatalf("empty optional config: %v", err)
+	}
+	for _, livemode := range []bool{false, true} {
+		cfg := completeStripeConfig(livemode)
+		if err := cfg.ValidateStripe(); err != nil {
+			t.Fatalf("valid livemode=%v config: %v", livemode, err)
+		}
+		if !cfg.StripeBillingEnabled() {
+			t.Fatalf("complete livemode=%v config reported disabled", livemode)
+		}
+	}
+
+	tests := []struct {
+		name string
+		edit func(*Config)
+	}{
+		{"partial", func(c *Config) { c.StripeGBMonthMeterID = "" }},
+		{"live key in test mode", func(c *Config) { c.StripeSecretKey = "sk_live_wrong" }},
+		{"test meter in live mode", func(c *Config) { c.StripeLivemode = true; c.StripeSecretKey = "sk_live_ok" }},
+		{"bad webhook", func(c *Config) { c.StripeWebhookSecret = "secret" }},
+		{"bad price", func(c *Config) { c.StripePriceID = "prod_wrong" }},
+		{"bad meter", func(c *Config) { c.StripeMeterID = "meter_wrong" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := completeStripeConfig(false)
+			tc.edit(&cfg)
+			if err := cfg.ValidateStripe(); err == nil {
+				t.Fatal("invalid Stripe configuration was accepted")
+			}
+		})
+	}
+	if err := (Config{StripeLivemode: true}).ValidateStripe(); err == nil {
+		t.Fatal("livemode without Stripe objects was accepted")
+	}
+}
+
+func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
+	renderPath := filepath.Join("..", "..", "..", "render.yaml")
+	data, err := os.ReadFile(renderPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceKeys := func(name string) []string {
+		marker := "name: " + name
+		start := strings.Index(string(data), marker)
+		if start < 0 {
+			t.Fatalf("service %s not found in render.yaml", name)
+		}
+		section := string(data)[start:]
+		if next := strings.Index(section[len(marker):], "\n  - type:"); next >= 0 {
+			section = section[:len(marker)+next]
+		}
+		re := regexp.MustCompile(`(?m)^\s+- key: (STRIPE_[A-Z_]+)\s*$`)
+		keys := make([]string, 0)
+		for _, match := range re.FindAllStringSubmatch(section, -1) {
+			keys = append(keys, match[1])
+		}
+		sort.Strings(keys)
+		return keys
+	}
+	want := []string{
+		"STRIPE_GB_MONTH_METER_ID", "STRIPE_GB_MONTH_PRICE_ID", "STRIPE_LIVEMODE",
+		"STRIPE_METER_ID", "STRIPE_PRICE_ID", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
+	}
+	apiKeys := serviceKeys("stoarama-api")
+	controllerKeys := serviceKeys("stoarama-recorder-control")
+	if !reflect.DeepEqual(apiKeys, want) || !reflect.DeepEqual(controllerKeys, want) {
+		t.Fatalf("Stripe env drift: api=%v controller=%v want=%v", apiKeys, controllerKeys, want)
+	}
+}
 
 func testCookieSigningKey() string {
 	return strings.Repeat("test", 8)

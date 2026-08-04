@@ -194,8 +194,18 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 	// A zero-hour period reports nothing (Stripe suppresses the empty invoice) but
 	// the cursor still advances so the empty period is not re-examined.
 	if shouldReportHours(hours) {
-		if err := reporter.ReportRecordingHours(ctx, a.customerID, a.accountID, meterPeriodKey(end), hours); err != nil {
-			return fmt.Errorf("report recording hours: %w", err)
+		periodKey := meterPeriodKey(end)
+		send, err := reserveMeterReport(ctx, pool, a.accountID, end, "recording_hour", strconv.Itoa(hours), fmt.Sprintf("%d-%s", a.accountID, periodKey))
+		if err != nil {
+			return fmt.Errorf("reserve recording-hours report: %w", err)
+		}
+		if send {
+			if err := reporter.ReportRecordingHours(ctx, a.customerID, a.accountID, periodKey, hours); err != nil {
+				return fmt.Errorf("report recording hours (left pending for reconciliation): %w", err)
+			}
+			if err := markMeterReportReported(ctx, pool, a.accountID, end, "recording_hour"); err != nil {
+				return fmt.Errorf("mark recording-hours report complete (left pending for reconciliation): %w", err)
+			}
 		}
 	}
 
@@ -214,8 +224,19 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 		return fmt.Errorf("read storage snapshots: %w", err)
 	}
 	if hoursDecimal, ok := streamHourMonthMeterValue(sumHours, snapDays); ok {
-		if err := reporter.ReportStreamHourMonth(ctx, a.customerID, a.accountID, meterPeriodKey(end), hoursDecimal); err != nil {
-			return fmt.Errorf("report stream-hour-month: %w", err)
+		periodKey := meterPeriodKey(end)
+		identifier := fmt.Sprintf("%d-shm-%s", a.accountID, periodKey)
+		send, err := reserveMeterReport(ctx, pool, a.accountID, end, "stream_hour_month", hoursDecimal, identifier)
+		if err != nil {
+			return fmt.Errorf("reserve stream-hour-month report: %w", err)
+		}
+		if send {
+			if err := reporter.ReportStreamHourMonth(ctx, a.customerID, a.accountID, periodKey, hoursDecimal); err != nil {
+				return fmt.Errorf("report stream-hour-month (left pending for reconciliation): %w", err)
+			}
+			if err := markMeterReportReported(ctx, pool, a.accountID, end, "stream_hour_month"); err != nil {
+				return fmt.Errorf("mark stream-hour-month report complete (left pending for reconciliation): %w", err)
+			}
 		}
 	}
 
@@ -224,6 +245,54 @@ func meterAccount(ctx context.Context, pool *pgxpool.Pool, reporter meteringStri
 		WHERE account_id=$1
 	`, a.accountID, end); err != nil {
 		return fmt.Errorf("advance metering cursor: %w", err)
+	}
+	return nil
+}
+
+// reserveMeterReport is a durable outbox barrier in front of a Stripe side
+// effect. A pre-existing reported row makes a retry a no-op. A pre-existing
+// pending row is ambiguous (Stripe may have accepted the prior request before
+// the process lost its DB acknowledgement), so it fails closed and is never sent
+// again automatically.
+func reserveMeterReport(ctx context.Context, pool *pgxpool.Pool, accountID int64, periodEnd time.Time, meterKind, expectedValue, identifier string) (bool, error) {
+	result, err := pool.Exec(ctx, `
+		INSERT INTO billing_meter_reports(account_id,period_end,meter_kind,expected_value,identifier)
+		VALUES($1,$2,$3,$4,$5)
+		ON CONFLICT (meter_kind,identifier) DO NOTHING
+	`, accountID, periodEnd, meterKind, expectedValue, identifier)
+	if err != nil {
+		return false, err
+	}
+	if result.RowsAffected() == 1 {
+		return true, nil
+	}
+	var status, storedValue string
+	if err := pool.QueryRow(ctx, `
+		SELECT status,expected_value FROM billing_meter_reports
+		WHERE meter_kind=$1 AND identifier=$2
+	`, meterKind, identifier).Scan(&status, &storedValue); err != nil {
+		return false, err
+	}
+	if status == "reported" {
+		return false, nil
+	}
+	if storedValue != expectedValue {
+		return false, fmt.Errorf("existing pending report value %q differs from recomputed value %q", storedValue, expectedValue)
+	}
+	return false, fmt.Errorf("ambiguous pending report requires Stripe reconciliation")
+}
+
+func markMeterReportReported(ctx context.Context, pool *pgxpool.Pool, accountID int64, periodEnd time.Time, meterKind string) error {
+	result, err := pool.Exec(ctx, `
+		UPDATE billing_meter_reports
+		SET status='reported',reported_at=now()
+		WHERE account_id=$1 AND period_end=$2 AND meter_kind=$3 AND status='pending'
+	`, accountID, periodEnd, meterKind)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("pending report row not found")
 	}
 	return nil
 }

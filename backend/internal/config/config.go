@@ -325,18 +325,88 @@ func (c Config) ValidateAPI() error {
 	return c.ValidateStripe()
 }
 
-// ValidateStripe asserts the configured mode matches the secret-key prefix, so a
-// live key with STRIPE_LIVEMODE=false (which would make the webhook reject every
-// live event with 400 and silently leave all accounts unbillable) refuses to
-// start instead of failing silently in production. Billing is optional: an empty
-// or non-sk_ key skips the check (the server boots in free mode).
+// StripeBillingEnabled reports whether the complete billing configuration is
+// present. Call ValidateStripe first: a partially configured service must fail
+// closed rather than quietly booting in free mode.
+func (c Config) StripeBillingEnabled() bool {
+	return strings.TrimSpace(c.StripeSecretKey) != "" &&
+		strings.TrimSpace(c.StripeWebhookSecret) != "" &&
+		strings.TrimSpace(c.StripePriceID) != "" &&
+		strings.TrimSpace(c.StripeMeterID) != "" &&
+		strings.TrimSpace(c.StripeGBMonthPriceID) != "" &&
+		strings.TrimSpace(c.StripeGBMonthMeterID) != ""
+}
+
+// ValidateStripe rejects partial, malformed, and mixed-mode billing
+// configuration. Billing remains optional only when every Stripe object is
+// absent; once any Stripe setting is supplied, all six objects must agree on
+// live/test mode so capture and metering cannot silently diverge.
 func (c Config) ValidateStripe() error {
-	key := strings.TrimSpace(c.StripeSecretKey)
-	if strings.HasPrefix(key, "sk_live_") && !c.StripeLivemode {
-		return fmt.Errorf("STRIPE_SECRET_KEY is a live key but STRIPE_LIVEMODE is false; set STRIPE_LIVEMODE=true")
+	values := []struct {
+		name  string
+		value string
+	}{
+		{"STRIPE_SECRET_KEY", c.StripeSecretKey},
+		{"STRIPE_WEBHOOK_SECRET", c.StripeWebhookSecret},
+		{"STRIPE_PRICE_ID", c.StripePriceID},
+		{"STRIPE_METER_ID", c.StripeMeterID},
+		{"STRIPE_GB_MONTH_PRICE_ID", c.StripeGBMonthPriceID},
+		{"STRIPE_GB_MONTH_METER_ID", c.StripeGBMonthMeterID},
 	}
-	if strings.HasPrefix(key, "sk_test_") && c.StripeLivemode {
-		return fmt.Errorf("STRIPE_SECRET_KEY is a test key but STRIPE_LIVEMODE is true; set STRIPE_LIVEMODE=false")
+	configured := 0
+	for _, item := range values {
+		if strings.TrimSpace(item.value) != "" {
+			configured++
+		}
+	}
+	if configured == 0 {
+		if c.StripeLivemode {
+			return fmt.Errorf("STRIPE_LIVEMODE is true but Stripe billing is not configured")
+		}
+		return nil
+	}
+	if configured != len(values) {
+		missing := make([]string, 0, len(values)-configured)
+		for _, item := range values {
+			if strings.TrimSpace(item.value) == "" {
+				missing = append(missing, item.name)
+			}
+		}
+		return fmt.Errorf("partial Stripe billing configuration; missing %s", strings.Join(missing, ", "))
+	}
+
+	key := strings.TrimSpace(c.StripeSecretKey)
+	if c.StripeLivemode && !strings.HasPrefix(key, "sk_live_") {
+		return fmt.Errorf("STRIPE_LIVEMODE=true requires an sk_live_ STRIPE_SECRET_KEY")
+	}
+	if !c.StripeLivemode && !strings.HasPrefix(key, "sk_test_") {
+		return fmt.Errorf("STRIPE_LIVEMODE=false requires an sk_test_ STRIPE_SECRET_KEY")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(c.StripeWebhookSecret), "whsec_") {
+		return fmt.Errorf("STRIPE_WEBHOOK_SECRET must start with whsec_")
+	}
+	for _, item := range []struct{ name, value string }{
+		{"STRIPE_PRICE_ID", c.StripePriceID},
+		{"STRIPE_GB_MONTH_PRICE_ID", c.StripeGBMonthPriceID},
+	} {
+		if !strings.HasPrefix(strings.TrimSpace(item.value), "price_") {
+			return fmt.Errorf("%s must start with price_", item.name)
+		}
+	}
+	for _, item := range []struct{ name, value string }{
+		{"STRIPE_METER_ID", c.StripeMeterID},
+		{"STRIPE_GB_MONTH_METER_ID", c.StripeGBMonthMeterID},
+	} {
+		meterID := strings.TrimSpace(item.value)
+		if !strings.HasPrefix(meterID, "mtr_") {
+			return fmt.Errorf("%s must start with mtr_", item.name)
+		}
+		if c.StripeLivemode && strings.HasPrefix(meterID, "mtr_test_") {
+			return fmt.Errorf("%s is a test meter but STRIPE_LIVEMODE is true", item.name)
+		}
+		if !c.StripeLivemode && !strings.HasPrefix(meterID, "mtr_test_") {
+			return fmt.Errorf("%s is a live meter but STRIPE_LIVEMODE is false", item.name)
+		}
 	}
 	return nil
 }

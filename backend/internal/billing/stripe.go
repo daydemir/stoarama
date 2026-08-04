@@ -31,6 +31,13 @@ const recordingHourEventName = "recording_hour"
 // period).
 const streamHourMonthEventName = "stream_hour_month"
 
+const (
+	recordingHourUnitAmountCents   int64 = 5
+	streamHourMonthUnitAmountCents int64 = 10
+	recordingHourLookupKey               = "recording_hour_v1"
+	streamHourMonthLookupKey             = "stream_hour_month_v1"
+)
+
 // Client wraps a per-instance Stripe API client (no global stripe.Key mutation)
 // plus the metered recording-hour price id, the metered stream-hour-month (managed
 // storage) price id, and the app base URL for redirects.
@@ -71,6 +78,125 @@ func New(secretKey, priceID, streamHourMonthPriceID, appBaseURL string, livemode
 // Livemode reports the configured mode; webhook handling rejects events whose
 // livemode disagrees with this.
 func (c *Client) Livemode() bool { return c.livemode }
+
+// ConfigurationRetrievalError means Stripe could not be reached (or rejected a
+// read) after bounded retries. It is distinct from a successfully retrieved but
+// invalid price/meter configuration.
+type ConfigurationRetrievalError struct {
+	Object string
+	Err    error
+}
+
+func (e *ConfigurationRetrievalError) Error() string {
+	return fmt.Sprintf("retrieve %s: %v", e.Object, e.Err)
+}
+
+func (e *ConfigurationRetrievalError) Unwrap() error { return e.Err }
+
+func retryStripeConfigurationGet(ctx context.Context, object string, get func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = get(); err == nil {
+			return nil
+		}
+		if attempt == 2 {
+			break
+		}
+		delay := time.Duration(250*(1<<attempt)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return &ConfigurationRetrievalError{Object: object, Err: ctx.Err()}
+		case <-timer.C:
+		}
+	}
+	return &ConfigurationRetrievalError{Object: object, Err: err}
+}
+
+// ValidateConfiguration resolves the configured prices and meters from Stripe
+// before a billing-capable process starts. This is deliberately fail-closed: a
+// typo, archived object, wrong account/mode, wrong price, or crossed meter ID must
+// stop both Checkout and metering instead of producing incorrect invoices.
+func (c *Client) ValidateConfiguration(ctx context.Context, recordingMeterID, storageMeterID string) error {
+	var recordingPrice, storagePrice *stripe.Price
+	var recordingMeter, storageMeter *stripe.BillingMeter
+	if err := retryStripeConfigurationGet(ctx, "recording-hour price", func() error {
+		var err error
+		recordingPrice, err = c.sc.Prices.Get(c.priceID, &stripe.PriceParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := retryStripeConfigurationGet(ctx, "stream-hour-month price", func() error {
+		var err error
+		storagePrice, err = c.sc.Prices.Get(c.streamHourMonthPriceID, &stripe.PriceParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := retryStripeConfigurationGet(ctx, "recording-hour meter", func() error {
+		var err error
+		recordingMeter, err = c.sc.BillingMeters.Get(strings.TrimSpace(recordingMeterID), &stripe.BillingMeterParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := retryStripeConfigurationGet(ctx, "stream-hour-month meter", func() error {
+		var err error
+		storageMeter, err = c.sc.BillingMeters.Get(strings.TrimSpace(storageMeterID), &stripe.BillingMeterParams{Params: stripe.Params{Context: ctx}})
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := validateStripePriceAndMeter("recording-hour", recordingPrice, recordingMeter, strings.TrimSpace(recordingMeterID), recordingHourEventName, recordingHourLookupKey, recordingHourUnitAmountCents, c.livemode); err != nil {
+		return err
+	}
+	return validateStripePriceAndMeter("stream-hour-month", storagePrice, storageMeter, strings.TrimSpace(storageMeterID), streamHourMonthEventName, streamHourMonthLookupKey, streamHourMonthUnitAmountCents, c.livemode)
+}
+
+func validateStripePriceAndMeter(label string, price *stripe.Price, meter *stripe.BillingMeter, meterID, eventName, lookupKey string, unitAmount int64, livemode bool) error {
+	if price == nil || meter == nil {
+		return fmt.Errorf("%s Stripe objects are missing", label)
+	}
+	if !price.Active {
+		return fmt.Errorf("%s price is inactive", label)
+	}
+	if price.Livemode != livemode || meter.Livemode != livemode {
+		return fmt.Errorf("%s price/meter mode does not match STRIPE_LIVEMODE", label)
+	}
+	if price.Currency != stripe.CurrencyUSD || price.UnitAmount != unitAmount {
+		return fmt.Errorf("%s price must be USD %d cents per unit", label, unitAmount)
+	}
+	if price.LookupKey != lookupKey {
+		return fmt.Errorf("%s price lookup_key=%q want %q", label, price.LookupKey, lookupKey)
+	}
+	if price.Type != stripe.PriceTypeRecurring || price.Recurring == nil ||
+		price.Recurring.UsageType != stripe.PriceRecurringUsageTypeMetered ||
+		price.Recurring.Interval != stripe.PriceRecurringIntervalMonth ||
+		price.Recurring.IntervalCount != 1 {
+		return fmt.Errorf("%s price must be a monthly metered recurring price", label)
+	}
+	if price.Recurring.Meter != meterID || meter.ID != meterID {
+		return fmt.Errorf("%s price is not attached to its configured meter", label)
+	}
+	if meter.Status != stripe.BillingMeterStatusActive {
+		return fmt.Errorf("%s meter is not active", label)
+	}
+	if meter.EventName != eventName {
+		return fmt.Errorf("%s meter event_name=%q want %q", label, meter.EventName, eventName)
+	}
+	if meter.DefaultAggregation == nil || meter.DefaultAggregation.Formula != stripe.BillingMeterDefaultAggregationFormulaSum {
+		return fmt.Errorf("%s meter must aggregate by sum", label)
+	}
+	if meter.CustomerMapping == nil || meter.CustomerMapping.Type != stripe.BillingMeterCustomerMappingTypeByID || meter.CustomerMapping.EventPayloadKey != "stripe_customer_id" {
+		return fmt.Errorf("%s meter must map customers by stripe_customer_id", label)
+	}
+	if meter.ValueSettings == nil || meter.ValueSettings.EventPayloadKey != "value" {
+		return fmt.Errorf("%s meter value payload key must be value", label)
+	}
+	return nil
+}
 
 // EnsureCustomer returns the Stripe customer id for an account, creating one if
 // none exists. It is idempotent: it searches by metadata.account_id before
@@ -162,9 +288,9 @@ func (c *Client) CreatePortalSession(ctx context.Context, customerID, returnURL 
 // (a zero-hour period reports nothing; Stripe suppresses the empty invoice).
 //
 // Identifier is "<accountID>-<periodKey>", a per-customer-per-period key, so the
-// monthly job is re-runnable without double-billing: the meter-event identifier is
-// durably unique per event_name, so a re-send of the same period key is rejected
-// (handled as a no-op via isDuplicateMeterEvent), never summed. The customer is mapped via the
+// monthly job's immediate retries are idempotent within Stripe's rolling
+// deduplication window (the durable cross-day guard lives in billing_meter_reports).
+// A re-send rejected as a duplicate is handled as a no-op. The customer is mapped via the
 // payload "stripe_customer_id" (the meter's customer_mapping) and the hour count
 // via "value" (the meter's value_settings). Timestamp is omitted, so Stripe
 // stamps "now".
@@ -235,11 +361,9 @@ func (c *Client) ReportStreamHourMonth(ctx context.Context, customerID string, a
 }
 
 // isDuplicateMeterEvent reports whether err is Stripe rejecting a meter event
-// because its identifier was already used. The meter-event identifier is durably
-// unique per event_name, so a re-send of the SAME period key (a same-day retry, or
-// usage that a prior out-of-cycle invoice already consumed) is rejected rather than
-// summed. Treating that rejection as a no-op is what makes the metering job safe to
-// re-run and is the guarantee that already-consumed usage is never billed twice.
+// because its identifier was already used inside Stripe's rolling deduplication
+// window. The database billing_meter_reports ledger supplies the durable guard;
+// this check safely absorbs only immediate duplicate responses.
 // Two checks run in OR:
 //  1. Substring match on the stable identifier-collision phrase (Stripe currently
 //     returns this as a generic invalid_request_error; empirically verified in test mode).
