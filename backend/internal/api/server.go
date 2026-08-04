@@ -45,7 +45,6 @@ type Server struct {
 	mailer                  email.Sender
 	streamsHTML             []byte
 	recordingsHTML          []byte
-	sharedRecordingsHTML    []byte
 	accountHTML             []byte
 	orgSettingsHTML         []byte
 	docsHTML                []byte
@@ -146,13 +145,6 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
-	sharedRecordingsTemplate, err := loadSharedRecordingsHTML()
-	if err != nil {
-		return nil, err
-	}
-	sharedRecordingsPage := strings.ReplaceAll(string(sharedRecordingsTemplate), "__SHARED_RECORDINGS_SLUG__", cfg.SharedRecordingsSlug)
-	sharedRecordingsPage = strings.ReplaceAll(sharedRecordingsPage, "__SHARED_RECORDINGS_PUBLIC__", strconv.FormatBool(cfg.SharedRecordingsPublic))
-	sharedRecordingsHTML := []byte(sharedRecordingsPage)
 	s := &Server{
 		cfg:                     cfg,
 		pool:                    pool,
@@ -160,7 +152,6 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		mailer:                  mailer,
 		streamsHTML:             injectShell(streamsHTML, "streams"),
 		recordingsHTML:          injectShell(recordingsHTML, "recording"),
-		sharedRecordingsHTML:    sharedRecordingsHTML,
 		accountHTML:             injectShell(accountHTML, ""),
 		orgSettingsHTML:         injectShell(orgSettingsHTML, ""),
 		docsHTML:                injectShell(docsHTML, ""),

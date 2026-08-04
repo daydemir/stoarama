@@ -960,6 +960,19 @@
   <div id="healthTooltip" class="health-tooltip hidden" role="tooltip"></div>
 
   <script>
+    // The public MIT SCL route deliberately runs this exact recordings UI against
+    // the read-only shared API. The server registers only configured shared slugs.
+    const sharedRouteMatch = /^\/shared\/([^/]+)\/recordings(?:\/(\d+))?\/?$/.exec(window.location.pathname || '');
+    const sharedReadOnly = Boolean(sharedRouteMatch);
+    const sharedRecordingsSlug = sharedReadOnly ? decodeURIComponent(sharedRouteMatch[1]) : '';
+    const recordingsBasePath = sharedReadOnly
+      ? `/api/v1/shared/${encodeURIComponent(sharedRecordingsSlug)}/recordings`
+      : '/api/v1/account/recordings';
+    const recordingsPagePath = sharedReadOnly
+      ? `/shared/${encodeURIComponent(sharedRecordingsSlug)}/recordings`
+      : '/recordings';
+    function recordingAPIPath(suffix = '') { return recordingsBasePath + suffix; }
+
     const els = {
       signedOut: document.getElementById('signedOut'),
       signedIn: document.getElementById('signedIn'),
@@ -3131,7 +3144,7 @@
       const fps = Number(rec.target_fps || 0);
       const capture = rec.capture_via === 'relay'
         ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}` : 'Cloud';
-      let storage = rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage');
+      let storage = sharedReadOnly ? '&mdash;' : (rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage'));
       if (rec.storage_managed === true && rec.delivery !== 'nas_pull') storage += rec.storage_retention_tier === 'yearly_prepaid' ? ' · yearly $0.05/hr-mo' : ' · monthly $0.10/hr-mo';
       let warning = '';
       if (rec.needs_card === true) warning = '<div class="cell-sub cell-warning" style="color:var(--warn)">Not recording · payment method required</div>';
@@ -3140,14 +3153,14 @@
         const rs = relayCaptureState(rec);
         if (rs && rs.tone !== 'ok') warning = `<div class="cell-sub cell-warning">${rs.text}</div>`;
       }
-      let action = status === 'active'
+      let action = !sharedReadOnly && status === 'active'
         ? `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
-        : (status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}">Resume</button>` : '');
-      action += `<a class="btn-link secondary" href="/recordings/${id}">View</a>`;
+        : (!sharedReadOnly && status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}">Resume</button>` : '');
+      action += `<a class="btn-link secondary" href="${recordingsPagePath}/${id}">View</a>`;
       const localTime = localTimeLabel(timezone);
       const ends = instantInTimezone(rec.end_at, timezone);
       return `<tr class="${extraClass}" data-card="${id}">
-        <td><input type="checkbox" data-recordingselect="${id}" aria-label="Select recording #${id}"${state.selectedRecordings.has(id) ? ' checked' : ''}></td>
+        <td>${sharedReadOnly ? '' : `<input type="checkbox" data-recordingselect="${id}" aria-label="Select recording #${id}"${state.selectedRecordings.has(id) ? ' checked' : ''}>`}</td>
         <td><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
 		<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
         <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(timezone)}${localTime ? ` · Local time ${escapeHTML(localTime)}` : ''}</div>${ends ? `<div class="cell-sub">Ends ${escapeHTML(ends)}</div>` : '<div class="cell-sub">No scheduled end</div>'}</td>
@@ -3158,7 +3171,7 @@
     }
 
     function recordingsTableHTML(rows) {
-	  return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th><input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span></th><th>Recording</th><th>Status / Capture health</th><th>Schedule</th><th>Clip / Capture</th><th>Storage</th><th>Actions</th></tr></thead>${rows}</table></div>`;
+      return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th>${sharedReadOnly ? '' : '<input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span>'}</th><th>Recording</th><th>Status / Capture health</th><th>Schedule</th><th>Clip / Capture</th><th>Storage</th><th>Actions</th></tr></thead>${rows}</table></div>`;
     }
 
     // Update the status-filter chips: keep each chip's label with a live count and
@@ -3206,11 +3219,11 @@
 
     function renderCards() {
       hideHealthTooltip();
-      renderFleetSummary();
+      if (sharedReadOnly) els.relayBanner.classList.add('hidden'); else renderFleetSummary();
       const all = state.recordings;
       const empty = all.length === 0;
       els.heroCopy.classList.toggle('hidden', !empty);
-      els.newRecRow.classList.remove('hidden');
+      els.newRecRow.classList.toggle('hidden', sharedReadOnly);
       els.cards.classList.toggle('hidden', empty);
       els.statusFilter.classList.toggle('hidden', empty);
       if (empty) {
@@ -3330,7 +3343,7 @@
     // per-clip or bulk delete so the list reflects the new purged state.
     async function reloadClipDetail(panel, id) {
       try {
-        const payload = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(id)}/clips`);
+        const payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(id)}/clips`));
         renderClipDetail(panel, id, payload);
       } catch (err) {
         panel.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
@@ -3382,7 +3395,7 @@
         : (released ? `<span class="clip-pill ok">Sent to NAS</span>` : `<span class="clip-pill neutral">saved</span>`);
       const sourceDestId = Number(c.storage_destination_id || 0);
       const targets = (state.destinations || []).filter((d) => Number(d.id) !== sourceDestId);
-      const transferBtn = (!inactive && targets.length > 0)
+      const transferBtn = (!sharedReadOnly && !inactive && targets.length > 0)
         ? `<button type="button" class="secondary" data-cliptransfer="${clipRecId}:${cid}:${sourceDestId}">Send to my S3</button>`
         : '';
       const actions = inactive
@@ -3391,7 +3404,7 @@
           + `<button type="button" class="secondary" data-clipview="${clipRecId}:${cid}">View</button>`
           + `<button type="button" class="secondary" data-clipdownload="${clipRecId}:${cid}">Download</button>`
           + transferBtn
-          + `<button type="button" class="danger" data-clipdelete="${clipRecId}:${cid}">Delete</button>`
+          + (sharedReadOnly ? '' : `<button type="button" class="danger" data-clipdelete="${clipRecId}:${cid}">Delete</button>`)
           + `</div>`;
       const fps = (c.actual_fps != null && Number(c.actual_fps) > 0) ? escapeHTML(formatFps(c.actual_fps)) : '--';
       const sourceCell = showSource
@@ -3434,16 +3447,16 @@
       const shownNote = total > items.length ? ` (showing latest ${items.length})` : '';
       const summary = `<div class="clip-summary"><b>${total}</b> clip${total === 1 ? '' : 's'}${shownNote} &middot; ${escapeHTML(firstWhen)} → ${escapeHTML(lastWhen)}</div>`;
       const liveCount = items.filter(clipIsLive).length;
-      const bulk = liveCount > 0
+      const bulk = !sharedReadOnly && liveCount > 0
         ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
         : '';
       const rows = items.map((c) => clipRowHTML(c, recId)).join('');
       const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
-      const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
+      const exportCtl = !sharedReadOnly && liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
       panel.innerHTML = summary + bulk + exportCtl + clipTableHTML(rows, false);
       wireClipActions(panel);
       wireBulkExport(panel);
-      void reloadTransfers(panel, recId);
+      if (!sharedReadOnly) void reloadTransfers(panel, recId);
     }
 
     // ---- Dedicated clip-management page (/recordings/{id}) ----
@@ -3454,8 +3467,8 @@
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
     // switch the view into the dedicated clip page.
     function clipPageRecId() {
-      const m = /^\/recordings\/(\d+)\/?$/.exec(window.location.pathname || '');
-      return m ? Number(m[1]) : 0;
+      const m = sharedReadOnly ? sharedRouteMatch : /^\/recordings\/(\d+)\/?$/.exec(window.location.pathname || '');
+      return m ? Number(sharedReadOnly ? m[2] : m[1]) : 0;
     }
 
     // Render the full-page clip-management view for one recording. Loads the
@@ -3474,7 +3487,7 @@
       if (firstLoad) {
         root.innerHTML = `<div class="clip-summary">Loading recording...</div>`;
         try {
-          clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}`);
+          clipPageState.rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));
         } catch (err) {
           root.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
           clipPageState.loading = false;
@@ -3494,7 +3507,7 @@
       let payload;
       try {
         const offset = clipPageState.page * CLIP_PAGE_SIZE;
-        payload = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips?limit=${CLIP_PAGE_SIZE}&offset=${offset}`);
+        payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/clips?limit=${CLIP_PAGE_SIZE}&offset=${offset}`));
       } catch (err) {
         if (body) body.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
         clipPageState.loading = false;
@@ -3509,7 +3522,7 @@
     // the whole detail view (cards + current clip page). Keeps one source of truth.
     async function reloadClipPageRecording() {
       try {
-        clipPageState.rec = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}`);
+        clipPageState.rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(clipPageState.recId)}`));
       } catch (err) {
         window.alert(String(err.message || err));
         return;
@@ -3554,7 +3567,7 @@
       rows.push(['Recording window', `${startTxt || 'Now'} to ${endTxt || 'open-ended'}`]);
       const nextTxt = instantInTimezone(rec.next_fire_at, timezone);
       if (nextTxt) rows.push(['Next run', nextTxt]);
-      const editable = String(rec.status || '') !== 'canceled';
+      const editable = !sharedReadOnly && String(rec.status || '') !== 'canceled';
       const editLabel = isCompleted(rec) ? 'Record again' : 'Edit schedule';
       return `
         <div class="detail-card">
@@ -3628,7 +3641,7 @@
 
     async function fetchRecordingCaptureHealth(recordingID, toDate) {
       const query = toDate ? `?to=${encodeURIComponent(toDate)}` : '';
-      return fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recordingID)}/capture-health${query}`);
+      return fetchJSON(recordingAPIPath(`/${encodeURIComponent(recordingID)}/capture-health${query}`));
     }
 
     function captureHealthLocalParts(value, timezone) {
@@ -3800,6 +3813,7 @@
 
     // Recording-level actions card: pause/resume + a settings entry to storage options.
     function recActionsCardHTML(rec) {
+      if (sharedReadOnly) return '';
       const status = String(rec.status || '');
       const id = Number(rec.id);
       let actions = '';
@@ -3833,7 +3847,7 @@
             <div style="margin:0 0 4px;font-size:12px;color:var(--muted);">Recording ID <span class="clip-pill neutral" style="font-family:var(--mono);">#${recId}</span></div>
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
-          <a class="btn-link secondary" href="/recordings">Back to recordings</a>
+          <a class="btn-link secondary" href="${recordingsPagePath}">Back to recordings</a>
         </div>`;
       const blocked = rec.needs_card === true
         ? `<div class="card-blocked" style="margin:0 0 14px;"><span><b>Not recording</b>. Add a payment method in Org settings to start capturing.</span>`
@@ -3846,10 +3860,10 @@
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       teardownDetailPlayer();
-      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + streamCardHTML(rec) + captureHealthCardHTML() + scheduleCardHTML(rec) + storageCardHTML(rec)
+      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + (sharedReadOnly ? '' : streamCardHTML(rec)) + captureHealthCardHTML() + scheduleCardHTML(rec) + (sharedReadOnly ? '' : storageCardHTML(rec))
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
       wireDetailActions(root);
-      mountRecordingLivePlayer(rec);
+      if (!sharedReadOnly) mountRecordingLivePlayer(rec);
     }
 
     function wireDetailActions(root) {
@@ -4123,7 +4137,7 @@
       }
 
       const liveCount = items.filter(clipIsLive).length;
-      const pageActions = `
+      const pageActions = sharedReadOnly ? '' : `
         <div class="clip-page-actions">
           ${liveCount > 0 ? `<button type="button" class="secondary" data-clipzip="${recId}">Download ZIP</button>` : ''}
           <button type="button" class="secondary" data-clipscsv="${recId}">Download CSV</button>
@@ -4134,13 +4148,13 @@
       const rows = items.map((c) => clipRowHTML(c, recId)).join('');
       // The export-all control acts over the WHOLE recording, not just this page.
       const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
-      const exportCtl = liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
+      const exportCtl = !sharedReadOnly && liveCount > 0 ? bulkExportHTML({ scope: 'recording', recording_id: recId }, liveSources) : '';
 
       body.innerHTML = summary + pageActions + exportCtl + clipTableHTML(rows, false) + clipPagerHTML(page, pageCount);
       wireClipActions(body);
       wireBulkExport(body);
       wireClipPageNav(body);
-      void reloadTransfers(body, recId);
+      if (!sharedReadOnly) void reloadTransfers(body, recId);
     }
 
     function clipPagerHTML(page, pageCount) {
@@ -4422,7 +4436,7 @@
     async function downloadClip(ref) {
       const [recId, clipId] = String(ref || '').split(':');
       try {
-        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download?disposition=attachment`);
+        const out = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download?disposition=attachment`));
         if (out && out.url) {
           const a = document.createElement('a');
           a.href = out.url;
@@ -4444,7 +4458,7 @@
     async function viewClip(ref) {
       const [recId, clipId] = String(ref || '').split(':');
       try {
-        const out = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download?disposition=inline`);
+        const out = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}/download?disposition=inline`));
         if (out && out.url) { window.open(out.url, '_blank', 'noopener'); return; }
         window.alert('No view URL returned.');
       } catch (err) {
@@ -4493,8 +4507,8 @@
 
     async function refreshRecordings() {
       try {
-        const payload = await fetchJSON('/api/v1/account/recordings');
-        state.recordings = Array.isArray(payload.items) ? payload.items : [];
+        const payload = await fetchJSON(recordingAPIPath());
+        state.recordings = Array.isArray(payload.items) ? payload.items : (Array.isArray(payload.recordings) ? payload.recordings : []);
         const present = new Set(state.recordings.map((rec) => Number(rec.id)));
         state.selectedRecordings = new Set([...state.selectedRecordings].filter((id) => present.has(id)));
         updateBulkCancelButton();
@@ -4505,8 +4519,8 @@
         state.fleetRelayAvailableSlots = Number(payload.fleet_relay_available_slots || 0);
         // Refresh the relay snapshot alongside recordings so the banner + cards read a
         // consistent fleet view. Best-effort; a cloud-only account gets an empty list.
-        await loadRelays();
-        renderLedger();
+        if (!sharedReadOnly) await loadRelays();
+        if (!sharedReadOnly) renderLedger();
         renderCards();
       } catch (err) {
         // Keep the surface usable; surface the error near the ledger area.
@@ -5311,13 +5325,21 @@
       setNamingProfile('plaza_hourly_v1');
       renderCostEstimate();
       try {
-        const account = await fetchAccountWithRetry();
-        state.account = account;
+        if (sharedReadOnly) {
+          state.account = { name: 'MIT SCL' };
+          state.billingEnabled = false;
+          document.body.classList.add('shared-read-only');
+          document.title = 'MIT SCL recordings · Stoarama';
+        } else {
+          state.account = await fetchAccountWithRetry();
+        }
         els.signedOut.classList.add('hidden');
         els.signedIn.classList.remove('hidden');
-        await loadBilling();
-        await refreshDestinations();
-        await loadConnections();
+        if (!sharedReadOnly) {
+          await loadBilling();
+          await refreshDestinations();
+          await loadConnections();
+        }
         const recId = clipPageRecId();
         if (recId) {
           // Dedicated clip-management page: hide the list/composer chrome and render
@@ -5334,14 +5356,27 @@
           await loadClipPage(0);
           return;
         }
-        await handleBillingReturn();
-        if (newRecordingRoute()) {
+        if (sharedReadOnly) {
+          els.ledger.classList.add('hidden');
+          els.cardBanner.classList.add('hidden');
+          els.composer.classList.add('hidden');
+          await refreshRecordings();
+        } else {
+          await handleBillingReturn();
+        }
+        if (!sharedReadOnly && newRecordingRoute()) {
           await renderNewRecordingRoute();
           return;
         }
-      } catch (_) {
+      } catch (err) {
         els.signedIn.classList.add('hidden');
-        els.signedOut.classList.remove('hidden');
+        if (sharedReadOnly) {
+          els.signedOut.classList.add('hidden');
+          els.returnPanel.classList.remove('hidden');
+          els.returnBody.innerHTML = `<div class="eyebrow">MIT SCL recordings</div><h2>Unable to load recordings</h2><p class="muted">${escapeHTML(String(err.message || err))}</p>`;
+        } else {
+          els.signedOut.classList.remove('hidden');
+        }
       }
     }
 
@@ -5357,7 +5392,7 @@
     window.setInterval(() => {
       if (clipPageState.recId && clipPageState.rec && clipPageState.rec.capture_via === 'relay' && !detailEditorOpen()) {
         void loadClipPage(clipPageState.page);
-      } else if (!clipPageState.recId && !newRecordingRoute()) {
+      } else if (!clipPageState.recId && (sharedReadOnly || !newRecordingRoute())) {
         void refreshRecordings();
       }
     }, 30000);
