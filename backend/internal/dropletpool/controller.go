@@ -531,7 +531,7 @@ func (c *Controller) scaleUp(ctx context.Context, now time.Time, batchIndex int)
 		return fmt.Errorf("mint node token: %w", err)
 	}
 
-	rowID, err := c.store.InsertProvisioning(ctx, name, c.cfg.Region, c.cfg.Size, c.cfg.Capacity, nodeID)
+	rowID, err := c.store.InsertProvisioning(ctx, name, c.cfg.Region, c.cfg.Size, c.cfg.Capacity, nodeID, c.cfg.BuildSHA)
 	if err != nil {
 		// Roll back the token we just minted so it is not orphaned.
 		_ = c.store.RevokeNodeToken(ctx, &nodeTokenID, &nodeID)

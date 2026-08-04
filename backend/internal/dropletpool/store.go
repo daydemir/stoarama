@@ -175,13 +175,13 @@ func (s *Store) RevokeNodeToken(ctx context.Context, nodeTokenID, nodeID *int64)
 // row already exists and reconcile will adopt or destroy by name. The node token
 // is bound through node_id (its token id is recovered via NodeBinding on
 // destroy), so no node_token_id column is needed.
-func (s *Store) InsertProvisioning(ctx context.Context, name, region, size string, capacity int, nodeID int64) (int64, error) {
+func (s *Store) InsertProvisioning(ctx context.Context, name, region, size string, capacity int, nodeID int64, buildSHA string) (int64, error) {
 	var id int64
 	if err := s.pool.QueryRow(ctx, `
-		INSERT INTO recorder_droplets (name, node_id, region, size, capacity, state)
-		VALUES ($1, $2, $3, $4, $5, 'provisioning')
+		INSERT INTO recorder_droplets (name, node_id, region, size, capacity, state, build_sha)
+		VALUES ($1, $2, $3, $4, $5, 'provisioning', $6)
 		RETURNING id
-	`, name, nodeID, region, size, capacity).Scan(&id); err != nil {
+	`, name, nodeID, region, size, capacity, strings.ToLower(strings.TrimSpace(buildSHA))).Scan(&id); err != nil {
 		return 0, fmt.Errorf("insert provisioning droplet: %w", err)
 	}
 	return id, nil
