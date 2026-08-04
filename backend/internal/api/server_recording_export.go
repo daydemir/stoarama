@@ -40,7 +40,7 @@ func (s *Server) buildClipClient(r *http.Request, d clipDestination) (*r2.Client
 
 func validateStorageEndpointHTTPS(raw string) error {
 	endpoint, err := url.ParseRequestURI(strings.TrimSpace(raw))
-	if err != nil || !strings.EqualFold(endpoint.Scheme, "https") || endpoint.Host == "" || endpoint.User != nil {
+	if err != nil || !strings.EqualFold(endpoint.Scheme, "https") || endpoint.Host == "" || endpoint.Hostname() == "" || endpoint.User != nil {
 		return fmt.Errorf("storage destination endpoint must be an HTTPS URL without embedded credentials")
 	}
 	return nil

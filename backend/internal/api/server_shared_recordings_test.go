@@ -34,7 +34,7 @@ func TestSharedRecordingsTokenExpiresAndRotatesWithSigningKey(t *testing.T) {
 }
 
 func TestStorageEndpointRequiresHTTPS(t *testing.T) {
-	for _, endpoint := range []string{"", "http://example.test", "ftp://example.test", "https://user:pass@example.test", "https:///missing-host"} {
+	for _, endpoint := range []string{"", "http://example.test", "ftp://example.test", "https://user:pass@example.test", "https:///missing-host", "https://:443"} {
 		if err := validateStorageEndpointHTTPS(endpoint); err == nil {
 			t.Fatalf("endpoint %q accepted", endpoint)
 		}
