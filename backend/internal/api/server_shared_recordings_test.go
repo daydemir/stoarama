@@ -162,8 +162,65 @@ func TestSharedRecordingDTOExcludesSensitiveFields(t *testing.T) {
 }
 
 func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
-	if sharedRecordingsVisibleStatusesSQL != "rec.status IN ('active','paused')" {
-		t.Fatalf("visible status predicate = %q", sharedRecordingsVisibleStatusesSQL)
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status) VALUES(47,'mit-scl@example.test','MIT SCL','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(1,47,'MIT storage','https://example.test','auto','clips','access',''::bytea,'verified');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]int64{}
+	for _, status := range []string{"active", "paused", "completed", "canceled"} {
+		var id int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,cron_expr,status)
+			VALUES(47,1,$1,'https://example.test/live.m3u8','* * * * *',$2)
+			RETURNING id
+		`, status+" recording", status).Scan(&id); err != nil {
+			t.Fatalf("insert %s recording: %v", status, err)
+		}
+		ids[status] = id
+	}
+	s.cfg = config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}
+	router := s.router()
+
+	list := httptest.NewRecorder()
+	router.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+	var payload struct {
+		Recordings []sharedRecording `json:"recordings"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Recordings) != 2 {
+		t.Fatalf("list returned %d recordings, want active+paused only: %s", len(payload.Recordings), list.Body.String())
+	}
+	seen := map[string]bool{}
+	for _, recording := range payload.Recordings {
+		seen[recording.Status] = true
+	}
+	if !seen["active"] || !seen["paused"] || seen["completed"] || seen["canceled"] {
+		t.Fatalf("visible statuses=%v, want active and paused only", seen)
+	}
+
+	for _, status := range []string{"active", "paused", "completed", "canceled"} {
+		response := httptest.NewRecorder()
+		path := "/api/v1/shared/mit-scl/recordings/" + strconv.FormatInt(ids[status], 10)
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		want := http.StatusOK
+		if status == "completed" || status == "canceled" {
+			want = http.StatusNotFound
+		}
+		if response.Code != want {
+			t.Fatalf("%s detail status=%d want=%d body=%s", status, response.Code, want, response.Body.String())
+		}
 	}
 }
 
