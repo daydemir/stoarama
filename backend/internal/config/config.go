@@ -31,6 +31,7 @@ type Config struct {
 	SessionTTL                       time.Duration
 	SharedRecordingsAccountID        int64
 	SharedRecordingsSlug             string
+	SharedRecordingsPublic           bool
 	SharedRecordingsPassword         string
 	SharedRecordingsCookieSigningKey string
 	SharedRecordingsProxyCIDRs       []netip.Prefix
@@ -173,6 +174,7 @@ func Load() (Config, error) {
 		SessionTTL:                       durEnv("SESSION_TTL", durEnv("RESEARCH_SESSION_TTL", 24*30*time.Hour)),
 		SharedRecordingsAccountID:        int64(intEnv("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID", 0)),
 		SharedRecordingsSlug:             strEnv("MIT_SCL_RECORDINGS_READ_SLUG", "mit-scl"),
+		SharedRecordingsPublic:           boolEnv("MIT_SCL_RECORDINGS_PUBLIC", false),
 		SharedRecordingsPassword:         strings.TrimSpace(os.Getenv("MIT_SCL_RECORDINGS_READ_PASSWORD")),
 		SharedRecordingsCookieSigningKey: strings.TrimSpace(os.Getenv("MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY")),
 		EmailProvider:                    strEnv("EMAIL_PROVIDER", strEnv("RESEARCH_EMAIL_PROVIDER", "log")),
@@ -280,13 +282,16 @@ func Load() (Config, error) {
 	if cfg.SharedRecordingsAccountID < 0 {
 		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID must be positive")
 	}
-	if (cfg.SharedRecordingsAccountID > 0) != (cfg.SharedRecordingsPassword != "") {
-		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID and MIT_SCL_RECORDINGS_READ_PASSWORD must be set together")
+	if cfg.SharedRecordingsAccountID == 0 && (cfg.SharedRecordingsPassword != "" || cfg.SharedRecordingsPublic) {
+		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID is required when shared recordings are enabled")
+	}
+	if cfg.SharedRecordingsAccountID > 0 && cfg.SharedRecordingsPassword == "" && !cfg.SharedRecordingsPublic {
+		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_PASSWORD is required unless MIT_SCL_RECORDINGS_PUBLIC=true")
 	}
 	if !validSharedRecordingsSlug(cfg.SharedRecordingsSlug) {
 		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_SLUG must contain only lowercase letters, numbers, and single hyphens")
 	}
-	if cfg.SharedRecordingsAccountID > 0 && len(cfg.SharedRecordingsCookieSigningKey) < 32 {
+	if cfg.SharedRecordingsAccountID > 0 && !cfg.SharedRecordingsPublic && len(cfg.SharedRecordingsCookieSigningKey) < 32 {
 		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY must contain at least 32 characters when shared recordings are enabled")
 	}
 	if cfg.SharedRecordingsPassword != "" && len(cfg.SharedRecordingsPassword) < 8 {

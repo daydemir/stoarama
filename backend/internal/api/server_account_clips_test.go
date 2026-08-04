@@ -396,12 +396,15 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
 			name TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active',
 			delivery TEXT NOT NULL DEFAULT 'managed'
 		)`,
 		`CREATE TABLE recording_clips (
 			id BIGSERIAL PRIMARY KEY,
 			recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
 			size_bytes BIGINT NOT NULL,
+			duration_ms BIGINT NOT NULL DEFAULT 60000,
+			actual_fps DOUBLE PRECISION,
 			sha256 TEXT NOT NULL DEFAULT '` + strings.Repeat("a", 64) + `',
 			clip_start_at TIMESTAMPTZ NOT NULL,
 			clip_end_at TIMESTAMPTZ NOT NULL,

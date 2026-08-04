@@ -71,6 +71,8 @@ services:
         sync: false
       - key: MIT_SCL_RECORDINGS_READ_SLUG
         value: mit-scl
+      - key: MIT_SCL_RECORDINGS_PUBLIC
+        value: "true"
       - key: MIT_SCL_RECORDINGS_READ_PASSWORD
         sync: false
       - key: MIT_SCL_RECORDINGS_COOKIE_SIGNING_KEY

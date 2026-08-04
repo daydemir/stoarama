@@ -160,7 +160,7 @@ func recentSharedRecordingFailures(failures []time.Time, cutoff time.Time) []tim
 }
 
 func (s *Server) sharedRecordingsEnabled() bool {
-	return s.cfg.SharedRecordingsAccountID > 0 && s.cfg.SharedRecordingsPassword != ""
+	return s.cfg.SharedRecordingsAccountID > 0 && (s.cfg.SharedRecordingsPublic || s.cfg.SharedRecordingsPassword != "")
 }
 
 func (s *Server) requireSharedRecordingsAuth(next http.Handler) http.Handler {
@@ -168,6 +168,10 @@ func (s *Server) requireSharedRecordingsAuth(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		if !s.sharedRecordingsEnabled() {
 			http.NotFound(w, r)
+			return
+		}
+		if s.cfg.SharedRecordingsPublic {
+			next.ServeHTTP(w, r)
 			return
 		}
 		cookie, err := r.Cookie(sharedRecordingsCookie)
@@ -181,7 +185,7 @@ func (s *Server) requireSharedRecordingsAuth(next http.Handler) http.Handler {
 
 func (s *Server) handleSharedRecordingsUnlock(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	if !s.sharedRecordingsEnabled() {
+	if !s.sharedRecordingsEnabled() || s.cfg.SharedRecordingsPublic {
 		http.NotFound(w, r)
 		return
 	}
@@ -232,6 +236,80 @@ func (s *Server) handleSharedRecordingsLogout(w http.ResponseWriter, _ *http.Req
 		SameSite: http.SameSiteLaxMode,
 	})
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleSharedRecordingClips exposes only the media-browser fields needed by the
+// public read-only page. It intentionally omits object keys, destination IDs,
+// naming paths, capture generation tokens, and every mutation affordance.
+func (s *Server) handleSharedRecordingClips(w http.ResponseWriter, r *http.Request) {
+	recordingID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var ownerOK bool
+	if err := s.pool.QueryRow(r.Context(), `
+		SELECT EXISTS(SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2 AND status <> 'canceled')
+	`, recordingID, s.cfg.SharedRecordingsAccountID).Scan(&ownerOK); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load recording")
+		return
+	}
+	if !ownerOK {
+		util.WriteError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	var total int64
+	if err := s.pool.QueryRow(r.Context(), `SELECT count(*) FROM recording_clips WHERE recording_id=$1`, recordingID).Scan(&total); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "count clips")
+		return
+	}
+	limit := parseIntQuery(r, "limit", 100, 1, 500)
+	offset := parseIntQuery(r, "offset", 0, 0, 1<<30)
+	rows, err := s.pool.Query(r.Context(), `
+		SELECT id, clip_start_at, clip_end_at, size_bytes, duration_ms, actual_fps,
+		       purged_at IS NOT NULL, released_at IS NOT NULL
+		FROM recording_clips
+		WHERE recording_id=$1
+		ORDER BY clip_start_at DESC, id DESC
+		LIMIT $2 OFFSET $3
+	`, recordingID, limit, offset)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "list clips")
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0, limit)
+	for rows.Next() {
+		var id, sizeBytes, durationMS int64
+		var startAt, endAt time.Time
+		var actualFPS *float64
+		var purged, released bool
+		if err := rows.Scan(&id, &startAt, &endAt, &sizeBytes, &durationMS, &actualFPS, &purged, &released); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "scan clip")
+			return
+		}
+		items = append(items, map[string]any{
+			"id": id, "clip_start_at": startAt.UTC(), "clip_end_at": endAt.UTC(),
+			"size_bytes": sizeBytes, "duration_ms": durationMS, "actual_fps": actualFPS,
+			"purged": purged, "released": released,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "iterate clips")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) handleSharedRecordingClipDownload(w http.ResponseWriter, r *http.Request) {
+	recordingID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	clipID, ok := parseInt64Path(w, r, "clipId")
+	if !ok {
+		return
+	}
+	s.writeRecordingClipDownload(w, r, s.cfg.SharedRecordingsAccountID, recordingID, clipID, false)
 }
 
 func (s *Server) handleSharedRecordingsList(w http.ResponseWriter, r *http.Request) {

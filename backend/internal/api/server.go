@@ -150,7 +150,9 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
-	sharedRecordingsHTML := []byte(strings.ReplaceAll(string(sharedRecordingsTemplate), "__SHARED_RECORDINGS_SLUG__", cfg.SharedRecordingsSlug))
+	sharedRecordingsPage := strings.ReplaceAll(string(sharedRecordingsTemplate), "__SHARED_RECORDINGS_SLUG__", cfg.SharedRecordingsSlug)
+	sharedRecordingsPage = strings.ReplaceAll(sharedRecordingsPage, "__SHARED_RECORDINGS_PUBLIC__", strconv.FormatBool(cfg.SharedRecordingsPublic))
+	sharedRecordingsHTML := []byte(sharedRecordingsPage)
 	s := &Server{
 		cfg:                     cfg,
 		pool:                    pool,
@@ -231,6 +233,8 @@ func (s *Server) router() http.Handler {
 				read.Get("/recordings", s.handleSharedRecordingsList)
 				read.Get("/recordings/{id}", s.handleSharedRecordingGet)
 				read.Get("/recordings/{id}/capture-health", s.handleSharedRecordingCaptureHealth)
+				read.Get("/recordings/{id}/clips", s.handleSharedRecordingClips)
+				read.Get("/recordings/{id}/clips/{clipId}/download", s.handleSharedRecordingClipDownload)
 			})
 		})
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)

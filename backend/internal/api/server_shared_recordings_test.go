@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -177,6 +178,60 @@ func TestSharedRecordingsUsesConfiguredSlug(t *testing.T) {
 	}
 }
 
+func TestPublicSharedRecordingsNeedsNoCookie(t *testing.T) {
+	s := &Server{cfg: config.Config{SharedRecordingsAccountID: 47, SharedRecordingsPublic: true}}
+	called := false
+	handler := s.requireSharedRecordingsAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings", nil))
+	if !called || rec.Code != http.StatusNoContent {
+		t.Fatalf("public read called=%v status=%d", called, rec.Code)
+	}
+}
+
+func TestPublicSharedClipsAreTenantScopedAndRedacted(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	var ownerRecordingID, foreignRecordingID int64
+	for _, target := range []struct {
+		accountID int64
+		name      string
+		out       *int64
+	}{{47, "MIT recording", &ownerRecordingID}, {99, "Private recording", &foreignRecordingID}} {
+		if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name) VALUES($1,$2) RETURNING id`, target.accountID, target.name).Scan(target.out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips(recording_id,size_bytes,duration_ms,actual_fps,clip_start_at,clip_end_at,display_path)
+		VALUES($1,123456,60000,29.97,now()-interval '1 minute',now(),'private/object-name.mp4')
+	`, ownerRecordingID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool, cfg: config.Config{
+		SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true,
+	}}
+	rec := httptest.NewRecorder()
+	s.router().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/"+strconv.FormatInt(ownerRecordingID, 10)+"/clips", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner clips status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, forbidden := range []string{"object_key", "display_path", "storage_destination", "capture_generation", "capture_sequence", "private/object-name.mp4"} {
+		if strings.Contains(rec.Body.String(), forbidden) {
+			t.Fatalf("public clip response leaked %q: %s", forbidden, rec.Body.String())
+		}
+	}
+	foreign := httptest.NewRecorder()
+	s.router().ServeHTTP(foreign, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/"+strconv.FormatInt(foreignRecordingID, 10)+"/clips", nil))
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign clips status=%d want 404 body=%s", foreign.Code, foreign.Body.String())
+	}
+}
+
 func TestSharedRecordingsNamespaceHasNoMutationRoutes(t *testing.T) {
 	now := time.Now().UTC()
 	s := &Server{
@@ -211,6 +266,9 @@ func TestSharedRecordingsPageHasAccessibleHeatmap(t *testing.T) {
 		`focusin`,
 		`Escape`,
 		`const SHARED_PATH = '/shared/__SHARED_RECORDINGS_SLUG__';`,
+		`const PUBLIC_ACCESS = __SHARED_RECORDINGS_PUBLIC__;`,
+		`/clips?limit=`,
+		`data-download=`,
 		`Array.from({length:24},()=>[])`,
 		`bins.map(bin=>({bin,hour}))`,
 		`repeat(${slots.length},minmax(19px,1fr))`,
