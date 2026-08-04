@@ -442,12 +442,18 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 	hasCurrentActive := false
 	hasCurrentPending := false
 	for _, d := range workers {
+		// A provisioning row is already a write-ahead replacement reservation.
+		// Legacy rows created before build_sha tracking may be blank; treating them
+		// as absent would provision another droplet every tick until they heartbeat.
+		// Reconcile independently reaps genuinely stuck rows at ProvisionTimeout.
+		if d.State == "provisioning" {
+			hasCurrentPending = true
+			continue
+		}
 		if workerBuildReady(c.cfg.BuildSHA, d.BuildSHA) {
 			hasCurrentPending = true
-			if d.State == "active" {
-				hasCurrentActive = true
-			}
-		} else if d.State == "active" {
+			hasCurrentActive = true
+		} else {
 			hasStale = true
 		}
 	}
