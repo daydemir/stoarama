@@ -2,6 +2,7 @@ package recordingworker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -45,8 +46,24 @@ func TestContinuousShouldStop(t *testing.T) {
 }
 
 func TestCloudWorkerAllowsNoProgressHandoffWithoutRelayDiagnostics(t *testing.T) {
+	var gotReason recordingapi.SurrenderReason
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/recording/jobs/42/surrender" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		var body struct {
+			Reason recordingapi.SurrenderReason `json:"reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode surrender: %v", err)
+		}
+		gotReason = body.Reason
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
 	client, err := recordingapi.NewClient(recordingapi.ClientConfig{
-		BaseURL:   "https://api.example.test",
+		BaseURL:   server.URL,
 		NodeToken: "test-node-token",
 	})
 	if err != nil {
@@ -61,6 +78,15 @@ func TestCloudWorkerAllowsNoProgressHandoffWithoutRelayDiagnostics(t *testing.T)
 	}
 	if worker.cfg.ContinuousNoProgressTimeout != 5*time.Minute {
 		t.Fatalf("timeout = %s, want 5m", worker.cfg.ContinuousNoProgressTimeout)
+	}
+	_, cancel := context.WithCancel(context.Background())
+	if !worker.surrenderContinuousJob(context.Background(), cancel, recordingapi.RecordingJob{
+		JobID: 42, LeaseToken: "lease-token",
+	}, time.Now().Add(-6*time.Minute)) {
+		t.Fatal("expired no-progress timeout did not surrender job")
+	}
+	if gotReason != recordingapi.SurrenderNoProgress {
+		t.Fatalf("surrender reason = %q, want %q", gotReason, recordingapi.SurrenderNoProgress)
 	}
 }
 
