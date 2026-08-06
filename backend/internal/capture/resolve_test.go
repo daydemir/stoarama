@@ -2,6 +2,8 @@ package capture
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -154,6 +156,64 @@ func TestResolveCaptureInputFailsClosedWhenSkylinePageHasNoManifest(t *testing.T
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "skyline") {
 		t.Fatalf("error should name skyline resolution, got %q", err.Error())
+	}
+}
+
+func TestKnownSourcePageResolverDetection(t *testing.T) {
+	for _, raw := range []string{
+		"https://www.skylinewebcams.com/en/webcam/example.html",
+		"https://www.ipcamlive.com/570b5e81b9c8e",
+		"https://de.worldcam.eu/liveview/10391",
+		"https://myslenice-rynek.webcamera.pl/",
+	} {
+		if !IsResolvableSourcePage("global-street-scores", raw) {
+			t.Fatalf("expected supported resolver for %s", raw)
+		}
+	}
+	if IsResolvableSourcePage("global-street-scores", "https://example.com/camera") {
+		t.Fatal("unexpected generic page resolver")
+	}
+}
+
+func TestIPCamLivePlayerParsing(t *testing.T) {
+	page := `<script>var alias = '570b5e81b9c8e'; var token = 'abc+123=';</script>`
+	if got := firstMatch(ipCamAliasRE, page); got != "570b5e81b9c8e" {
+		t.Fatalf("alias=%q", got)
+	}
+	if got := firstMatch(ipCamTokenRE, page); got != "abc+123=" {
+		t.Fatalf("token=%q", got)
+	}
+	player := `<script>var address = 'http://s74.ipcamlive.com/'; var streamid = '4acuxd3wn0m52drp9';</script>`
+	if got := firstMatch(ipCamAddressRE, player); got != "http://s74.ipcamlive.com/" {
+		t.Fatalf("address=%q", got)
+	}
+	if got := firstMatch(ipCamStreamIDRE, player); got != "4acuxd3wn0m52drp9" {
+		t.Fatalf("stream id=%q", got)
+	}
+}
+
+func TestWorldCamPlayerParsing(t *testing.T) {
+	page := `<iframe src="https://worldcam.live/en/webcam/brzesko/embed/2"></iframe>`
+	if got := firstMatch(worldCamIframeRE, page); got != "https://worldcam.live/en/webcam/brzesko/embed/2" {
+		t.Fatalf("embed=%q", got)
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte("https://s1.worldcam.live:8082/brzesko/index.m3u8?token=test"))
+	player := `{"source":"` + encoded + `"}`
+	raw, err := base64.StdEncoding.DecodeString(firstMatch(worldCamSourceRE, player))
+	if err != nil || string(raw) != "https://s1.worldcam.live:8082/brzesko/index.m3u8?token=test" {
+		t.Fatalf("decoded=%q err=%v", raw, err)
+	}
+}
+
+func TestWebCameraPlayerParsing(t *testing.T) {
+	page := `<script>window.STREAM_PLAYER_CONFIG = {"video_src":"uggcf:\/\/ubxgnfgernz1.jropnzren.cy\/pnz.fgernz\/cynlyvfg.z3h8"};</script>`
+	encoded := firstMatch(webCameraSourceRE, page)
+	var escaped string
+	if err := json.Unmarshal([]byte(encoded), &escaped); err != nil {
+		t.Fatal(err)
+	}
+	if got := rot13(escaped); got != "https://hoktastream1.webcamera.pl/cam.stream/playlist.m3u8" {
+		t.Fatalf("manifest=%q", got)
 	}
 }
 

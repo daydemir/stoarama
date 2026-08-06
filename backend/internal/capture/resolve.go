@@ -2,6 +2,8 @@ package capture
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -58,6 +60,14 @@ func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, so
 		return u, false, earthCamInputHeaders(sourcePageURL), nil
 	}
 
+	if IsResolvableSourcePage(provider, sourcePageURL) {
+		u, err := resolveKnownSourcePage(ctx, sourcePageURL, 20*time.Second)
+		if err != nil {
+			return "", false, "", err
+		}
+		return u, false, "", nil
+	}
+
 	if provider == "KBS" && strings.Contains(streamURL, "!hls") {
 		if u, ok, err := resolveIndirectURL(ctx, streamURL, 20*time.Second); err != nil {
 			return "", false, "", err
@@ -95,6 +105,190 @@ func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, so
 	}
 
 	return streamURL, false, "", nil
+}
+
+// IsResolvableSourcePage reports whether capture has a stable runtime resolver
+// for a page URL. Importers use this to distinguish an offline supported camera
+// from a page whose player format is not implemented yet.
+func IsResolvableSourcePage(provider, sourcePageURL string) bool {
+	provider = strings.ToUpper(strings.TrimSpace(provider))
+	if isSkylineStream(provider, sourcePageURL, sourcePageURL) ||
+		isEarthCamStream(provider, sourcePageURL, sourcePageURL) {
+		return true
+	}
+	host := sourcePageHost(sourcePageURL)
+	return hostMatches(host, "ipcamlive.com") ||
+		hostMatches(host, "worldcam.eu") ||
+		hostMatches(host, "worldcam.live") ||
+		hostMatches(host, "webcamera.pl")
+}
+
+func sourcePageHost(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(u.Hostname()))
+}
+
+func hostMatches(host, root string) bool {
+	return host == root || strings.HasSuffix(host, "."+root)
+}
+
+func resolveKnownSourcePage(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	host := sourcePageHost(pageURL)
+	switch {
+	case hostMatches(host, "ipcamlive.com"):
+		return resolveIPCamLiveManifestURL(ctx, pageURL, timeout)
+	case hostMatches(host, "worldcam.eu"), hostMatches(host, "worldcam.live"):
+		return resolveWorldCamManifestURL(ctx, pageURL, timeout)
+	case hostMatches(host, "webcamera.pl"):
+		return resolveWebCameraManifestURL(ctx, pageURL, timeout)
+	default:
+		return "", fmt.Errorf("source page has no supported runtime resolver")
+	}
+}
+
+func fetchSourcePage(ctx context.Context, pageURL, referer string, timeout time.Duration) (string, error) {
+	if _, err := resolveValidateURL(pageURL); err != nil {
+		return "", fmt.Errorf("source page rejected: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build source page request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; stoarama-capture/1.0)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	if strings.TrimSpace(referer) != "" {
+		req.Header.Set("Referer", referer)
+	}
+	client := resolveHTTPClient(timeout)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("source page request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("source page request status=%d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("read source page: %w", err)
+	}
+	return string(b), nil
+}
+
+var (
+	ipCamAliasRE      = regexp.MustCompile(`(?i)\bvar\s+alias\s*=\s*['"]([^'"]+)['"]`)
+	ipCamTokenRE      = regexp.MustCompile(`(?i)\bvar\s+token\s*=\s*['"]([^'"]+)['"]`)
+	ipCamAddressRE    = regexp.MustCompile(`(?i)\bvar\s+address\s*=\s*['"]([^'"]+)['"]`)
+	ipCamStreamIDRE   = regexp.MustCompile(`(?i)\bvar\s+streamid\s*=\s*['"]([^'"]+)['"]`)
+	worldCamIframeRE  = regexp.MustCompile(`(?i)<iframe[^>]+\bsrc=["']([^"']+)["']`)
+	worldCamSourceRE  = regexp.MustCompile(`(?i)"source"\s*:\s*"([A-Za-z0-9+/=]+)"`)
+	webCameraSourceRE = regexp.MustCompile(`(?i)"video_src"\s*:\s*("(?:\\.|[^"\\])*")`)
+)
+
+func resolveIPCamLiveManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	page, err := fetchSourcePage(ctx, pageURL, "", timeout)
+	if err != nil {
+		return "", fmt.Errorf("ipcamlive page: %w", err)
+	}
+	alias := firstMatch(ipCamAliasRE, page)
+	token := firstMatch(ipCamTokenRE, page)
+	if alias == "" || token == "" {
+		return "", fmt.Errorf("ipcamlive page did not contain player credentials")
+	}
+	base, _ := url.Parse(pageURL)
+	player := base.ResolveReference(&url.URL{Path: "/player/player.php"})
+	q := player.Query()
+	q.Set("alias", alias)
+	q.Set("autoplay", "1")
+	q.Set("token", token)
+	player.RawQuery = q.Encode()
+	playerHTML, err := fetchSourcePage(ctx, player.String(), pageURL, timeout)
+	if err != nil {
+		return "", fmt.Errorf("ipcamlive player: %w", err)
+	}
+	address := firstMatch(ipCamAddressRE, playerHTML)
+	streamID := firstMatch(ipCamStreamIDRE, playerHTML)
+	if address == "" || streamID == "" {
+		return "", fmt.Errorf("ipcamlive camera is unavailable")
+	}
+	manifestBase, err := url.Parse(address)
+	if err != nil || !hostMatches(strings.ToLower(manifestBase.Hostname()), "ipcamlive.com") {
+		return "", fmt.Errorf("ipcamlive player returned an invalid stream host")
+	}
+	manifestBase.Scheme = "https"
+	manifestBase.Path = "/streams/" + url.PathEscape(streamID) + "/stream.m3u8"
+	manifestBase.RawQuery = ""
+	manifestBase.Fragment = ""
+	return manifestBase.String(), nil
+}
+
+func resolveWorldCamManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	page, err := fetchSourcePage(ctx, pageURL, "", timeout)
+	if err != nil {
+		return "", fmt.Errorf("worldcam page: %w", err)
+	}
+	embedURL := pageURL
+	if sourcePageHost(pageURL) != "worldcam.live" {
+		embedURL = firstMatch(worldCamIframeRE, page)
+		if embedURL == "" || !hostMatches(sourcePageHost(embedURL), "worldcam.live") {
+			return "", fmt.Errorf("worldcam page did not contain a trusted player embed")
+		}
+		page, err = fetchSourcePage(ctx, embedURL, pageURL, timeout)
+		if err != nil {
+			return "", fmt.Errorf("worldcam player: %w", err)
+		}
+	}
+	encoded := firstMatch(worldCamSourceRE, page)
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(raw) == 0 {
+		return "", fmt.Errorf("worldcam player did not contain a valid manifest")
+	}
+	manifest := strings.TrimSpace(string(raw))
+	if _, err := resolveValidateURL(manifest); err != nil || !isHLSManifestURL(manifest) {
+		return "", fmt.Errorf("worldcam manifest rejected")
+	}
+	return manifest, nil
+}
+
+func resolveWebCameraManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	page, err := fetchSourcePage(ctx, pageURL, "", timeout)
+	if err != nil {
+		return "", fmt.Errorf("webcamera page: %w", err)
+	}
+	encoded := firstMatch(webCameraSourceRE, page)
+	var escaped string
+	if encoded == "" || json.Unmarshal([]byte(encoded), &escaped) != nil {
+		return "", fmt.Errorf("webcamera page did not contain a valid player source")
+	}
+	manifest := rot13(escaped)
+	if _, err := resolveValidateURL(manifest); err != nil || !isHLSManifestURL(manifest) {
+		return "", fmt.Errorf("webcamera manifest rejected")
+	}
+	return manifest, nil
+}
+
+func firstMatch(re *regexp.Regexp, value string) string {
+	m := re.FindStringSubmatch(value)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(html.UnescapeString(m[1]))
+}
+
+func rot13(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return 'a' + (r-'a'+13)%26
+		case r >= 'A' && r <= 'Z':
+			return 'A' + (r-'A'+13)%26
+		default:
+			return r
+		}
+	}, value)
 }
 
 func isSkylineStream(provider, streamURL, sourcePageURL string) bool {
