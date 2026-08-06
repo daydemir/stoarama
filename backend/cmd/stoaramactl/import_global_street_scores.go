@@ -944,7 +944,7 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 		}
 		verifyCtx, cancel := context.WithTimeout(ctx, opts.ProbeTimeout)
 		defer cancel()
-		resolved, _, err := gssResolveCaptureInput(verifyCtx, gssProvider, result.Candidate.URL, result.Candidate.URL)
+		resolved, _, inputHeaders, err := gssResolveCaptureInputWithHeaders(verifyCtx, gssProvider, result.Candidate.URL, result.Candidate.URL)
 		if err != nil {
 			result.Status = gssStatusProbeFailed
 			result.Reason = err.Error()
@@ -953,7 +953,7 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 		result.SourceURL = result.Candidate.URL
 		result.SourcePageURL = result.Candidate.URL
 		result.ResolvedURL = resolved
-		if probe, err := gssProbeResolvedURL(verifyCtx, resolved); err != nil {
+		if probe, err := gssProbeResolvedURLWithHeaders(verifyCtx, resolved, inputHeaders); err != nil {
 			result.Status = gssStatusProbeFailed
 			result.Reason = err.Error()
 			return result
@@ -974,9 +974,10 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 }
 
 var (
-	gssIsResolvableSourcePage = capture.IsResolvableSourcePage
-	gssResolveCaptureInput    = capture.ResolveCaptureInput
-	gssProbeResolvedURL       = probeGSSResolvedURL
+	gssIsResolvableSourcePage         = capture.IsResolvableSourcePage
+	gssResolveCaptureInputWithHeaders = capture.ResolveCaptureInputWithHeaders
+	gssProbeResolvedURL               = probeGSSResolvedURL
+	gssProbeResolvedURLWithHeaders    = probeGSSResolvedURLWithHeaders
 )
 
 func classifyGSSCandidate(row gssRow, targetAPIURL string) gssCandidate {
@@ -1185,7 +1186,11 @@ func deleteJSONWithToken(ctx context.Context, baseURL string, token string, path
 }
 
 func probeGSSResolvedURL(ctx context.Context, resolvedURL string) (*gssProbe, error) {
-	frame, err := capture.CaptureFrame(ctx, resolvedURL)
+	return probeGSSResolvedURLWithHeaders(ctx, resolvedURL, "")
+}
+
+func probeGSSResolvedURLWithHeaders(ctx context.Context, resolvedURL, inputHeaders string) (*gssProbe, error) {
+	frame, err := capture.CaptureFrameWithHeaders(ctx, resolvedURL, inputHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("capture frame: %w", err)
 	}

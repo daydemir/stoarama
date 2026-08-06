@@ -251,6 +251,16 @@ func TestWorldCamPlayerParsing(t *testing.T) {
 	}
 }
 
+func TestWorldCamInputHeaders(t *testing.T) {
+	got := worldCamInputHeaders("https://worldcam.live/en/webcam/brzesko/embed/2")
+	if !strings.Contains(got, "Referer: https://worldcam.live/en/webcam/brzesko/embed/2\r\n") {
+		t.Fatalf("headers=%q", got)
+	}
+	if !strings.Contains(got, "User-Agent: Mozilla/5.0\r\n") {
+		t.Fatalf("headers=%q", got)
+	}
+}
+
 func TestWebCameraPlayerParsing(t *testing.T) {
 	page := `<script>window.STREAM_PLAYER_CONFIG = {"video_src":"uggcf:\/\/ubxgnfgernz1.jropnzren.cy\/pnz.fgernz\/cynlyvfg.z3h8"};</script>`
 	encoded := firstMatch(webCameraSourceRE, page)

@@ -72,6 +72,17 @@ func TestAppendFFmpegHTTPInputArgsInputHeaders(t *testing.T) {
 	}
 }
 
+func TestAppendFFmpegHTTPInputArgsUsesRequestedUserAgent(t *testing.T) {
+	headers := "Referer: https://worldcam.live/embed/2\r\nUser-Agent: Mozilla/5.0\r\n"
+	args := appendFFmpegHTTPInputArgsWithHeaders(nil, "https://s1.worldcam.live/live.m3u8", false, 0, "", headers)
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-user_agent" && args[i+1] == "Mozilla/5.0" {
+			return
+		}
+	}
+	t.Fatalf("expected requested user agent in %#v", args)
+}
+
 func TestAppendFFmpegHTTPInputArgsNonHTTP(t *testing.T) {
 	args := appendFFmpegHTTPInputArgs(nil, "rtsp://example.com/live", true, 10, "example.com")
 	if len(args) != 0 {

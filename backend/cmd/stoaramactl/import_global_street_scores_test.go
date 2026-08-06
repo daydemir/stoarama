@@ -109,15 +109,15 @@ func TestClassifyGSSCandidateRejectsMismatchedStoaramaHost(t *testing.T) {
 
 func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
 	originalSupported := gssIsResolvableSourcePage
-	originalResolve := gssResolveCaptureInput
-	originalProbe := gssProbeResolvedURL
+	originalResolve := gssResolveCaptureInputWithHeaders
+	originalProbe := gssProbeResolvedURLWithHeaders
 	t.Cleanup(func() {
 		gssIsResolvableSourcePage = originalSupported
-		gssResolveCaptureInput = originalResolve
-		gssProbeResolvedURL = originalProbe
+		gssResolveCaptureInputWithHeaders = originalResolve
+		gssProbeResolvedURLWithHeaders = originalProbe
 	})
 	gssIsResolvableSourcePage = func(string, string) bool { return true }
-	gssProbeResolvedURL = func(context.Context, string) (*gssProbe, error) {
+	gssProbeResolvedURLWithHeaders = func(context.Context, string, string) (*gssProbe, error) {
 		return &gssProbe{Width: 1920, Height: 1080}, nil
 	}
 
@@ -125,8 +125,8 @@ func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
 	row.List = gssListNils
 	row.RowNumber = 9
 	opts := gssOptions{TargetAPIURL: gssProductionAPIURL, ProbeTimeout: time.Second}
-	gssResolveCaptureInput = func(context.Context, string, string, string) (string, bool, error) {
-		return "https://media.example.com/live.m3u8", false, nil
+	gssResolveCaptureInputWithHeaders = func(context.Context, string, string, string) (string, bool, string, error) {
+		return "https://media.example.com/live.m3u8", false, "Referer: https://example.com/camera\r\n", nil
 	}
 	result := verifyGSSRow(context.Background(), row, opts)
 	if result.Status != gssStatusVerifiedImportable {
@@ -136,8 +136,8 @@ func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
 		t.Fatalf("source fields=%q %q", result.SourceURL, result.SourcePageURL)
 	}
 
-	gssResolveCaptureInput = func(context.Context, string, string, string) (string, bool, error) {
-		return "", false, errors.New("camera is unavailable")
+	gssResolveCaptureInputWithHeaders = func(context.Context, string, string, string) (string, bool, string, error) {
+		return "", false, "", errors.New("camera is unavailable")
 	}
 	result = verifyGSSRow(context.Background(), row, opts)
 	if result.Status != gssStatusProbeFailed || !strings.Contains(result.Reason, "unavailable") {
