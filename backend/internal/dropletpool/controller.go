@@ -414,6 +414,7 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 		if r.DODropletID != nil {
 			if err := c.do.DeleteDroplet(ctx, *r.DODropletID); err != nil {
 				log.Printf("droplet pool: destroy stuck droplet %s: %v", r.Name, err)
+				continue // Retain destroying state and credential for the next retry.
 			}
 		}
 		if err := c.store.MarkFailed(ctx, r.ID, "provision timed out"); err != nil {

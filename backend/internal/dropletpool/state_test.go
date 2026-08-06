@@ -396,11 +396,12 @@ func TestReconcileOrphans_MatchedByIDNoAction(t *testing.T) {
 // satisfiable without any live API call and to record CreateDroplet/DeleteDroplet
 // invocations. The production path always uses the real godo client.
 type fakeDOClient struct {
-	mu      sync.Mutex
-	fleet   []DODroplet
-	created []CreateDropletInput
-	deleted []int64
-	nextID  int64
+	mu        sync.Mutex
+	fleet     []DODroplet
+	created   []CreateDropletInput
+	deleted   []int64
+	deleteErr error
+	nextID    int64
 }
 
 func (f *fakeDOClient) CreateDroplet(_ context.Context, in CreateDropletInput) (DODroplet, error) {
@@ -417,6 +418,9 @@ func (f *fakeDOClient) DeleteDroplet(_ context.Context, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, id)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	out := f.fleet[:0]
 	for _, d := range f.fleet {
 		if d.ID != id {

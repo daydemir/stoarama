@@ -2,6 +2,7 @@ package dropletpool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,6 +86,7 @@ func TestReconcileOverdueProvisioningLeaseSafety(t *testing.T) {
 		leased       bool
 		fresh        bool
 		initialState string
+		deleteError  bool
 		wantState    string
 		wantDeleted  int
 		wantRevoked  bool
@@ -93,6 +95,7 @@ func TestReconcileOverdueProvisioningLeaseSafety(t *testing.T) {
 		{name: "missing leased stays provisioning", leased: true, fresh: true, wantState: "provisioning"},
 		{name: "present leased stale stays provisioning", provider: true, leased: true, wantState: "provisioning"},
 		{name: "present idle retires", provider: true, fresh: true, wantState: "failed", wantDeleted: 1, wantRevoked: true},
+		{name: "present idle delete failure retries", provider: true, fresh: true, deleteError: true, wantState: "destroying", wantDeleted: 1},
 		{name: "missing idle retires", fresh: true, wantState: "destroyed", wantRevoked: true},
 		{name: "present destroying resumes", provider: true, fresh: true, initialState: "destroying", wantState: "destroyed", wantDeleted: 1, wantRevoked: true},
 	}
@@ -111,6 +114,9 @@ func TestReconcileOverdueProvisioningLeaseSafety(t *testing.T) {
 				}
 			}
 			provider := &fakeDOClient{}
+			if tc.deleteError {
+				provider.deleteErr = errors.New("provider delete unavailable")
+			}
 			if tc.provider {
 				provider.fleet = []DODroplet{{ID: 7001, Name: "stoarama-rec-lease-safety", Status: "active", CreatedAt: now.Add(-time.Hour)}}
 			}
