@@ -120,7 +120,10 @@ func IsResolvableSourcePage(provider, sourcePageURL string) bool {
 	return hostMatches(host, "ipcamlive.com") ||
 		hostMatches(host, "worldcam.eu") ||
 		hostMatches(host, "worldcam.live") ||
-		hostMatches(host, "webcamera.pl")
+		hostMatches(host, "webcamera.pl") ||
+		hostMatches(host, "zachodnia.tv") ||
+		hostMatches(host, "embed.karkonosze.online") ||
+		hostMatches(host, "lubliniec.aztv.pl")
 }
 
 func sourcePageHost(raw string) string {
@@ -144,6 +147,10 @@ func resolveKnownSourcePage(ctx context.Context, pageURL string, timeout time.Du
 		return resolveWorldCamManifestURL(ctx, pageURL, timeout)
 	case hostMatches(host, "webcamera.pl"):
 		return resolveWebCameraManifestURL(ctx, pageURL, timeout)
+	case hostMatches(host, "zachodnia.tv"), hostMatches(host, "embed.karkonosze.online"):
+		return resolveKarkonoszeManifestURL(ctx, pageURL, timeout)
+	case hostMatches(host, "lubliniec.aztv.pl"):
+		return resolveEmbeddedManifestURL(ctx, pageURL, timeout, "aztv")
 	default:
 		return "", fmt.Errorf("source page has no supported runtime resolver")
 	}
@@ -186,6 +193,7 @@ var (
 	worldCamIframeRE  = regexp.MustCompile(`(?i)<iframe[^>]+\bsrc=["']([^"']+)["']`)
 	worldCamSourceRE  = regexp.MustCompile(`(?i)"source"\s*:\s*"([A-Za-z0-9+/=]+)"`)
 	webCameraSourceRE = regexp.MustCompile(`(?i)"video_src"\s*:\s*("(?:\\.|[^"\\])*")`)
+	embeddedHLSURLRE  = regexp.MustCompile(`(?i)https?[^"'<>[:space:]]+?\.m3u8[^"'<>[:space:]]*`)
 )
 
 func resolveIPCamLiveManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
@@ -281,12 +289,69 @@ func resolveWebCameraManifestURL(ctx context.Context, pageURL string, timeout ti
 	return manifest, nil
 }
 
+func resolveKarkonoszeManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	page, err := municipalFetchSourcePage(ctx, pageURL, "", timeout)
+	if err != nil {
+		return "", fmt.Errorf("karkonosze page: %w", err)
+	}
+	if hostMatches(sourcePageHost(pageURL), "zachodnia.tv") {
+		embedURL := trustedKarkonoszeEmbedURL(page)
+		if embedURL == "" {
+			return "", fmt.Errorf("karkonosze page did not contain a trusted player embed")
+		}
+		page, err = municipalFetchSourcePage(ctx, embedURL, pageURL, timeout)
+		if err != nil {
+			return "", fmt.Errorf("karkonosze player: %w", err)
+		}
+	}
+	return embeddedManifestURL(page, "karkonosze")
+}
+
+func trustedKarkonoszeEmbedURL(page string) string {
+	for _, match := range worldCamIframeRE.FindAllStringSubmatch(page, -1) {
+		if len(match) > 1 {
+			candidate := html.UnescapeString(match[1])
+			if hostMatches(sourcePageHost(candidate), "embed.karkonosze.online") {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func resolveEmbeddedManifestURL(ctx context.Context, pageURL string, timeout time.Duration, label string) (string, error) {
+	page, err := municipalFetchSourcePage(ctx, pageURL, "", timeout)
+	if err != nil {
+		return "", fmt.Errorf("%s page: %w", label, err)
+	}
+	return embeddedManifestURL(page, label)
+}
+
+var municipalFetchSourcePage = fetchSourcePage
+
+func embeddedManifestURL(page, label string) (string, error) {
+	manifest := embeddedManifestCandidate(page)
+	if _, err := resolveValidateURL(manifest); err != nil || !isHLSManifestURL(manifest) {
+		return "", fmt.Errorf("%s page did not contain a valid manifest", label)
+	}
+	return manifest, nil
+}
+
+func embeddedManifestCandidate(page string) string {
+	manifest := firstFullMatch(embeddedHLSURLRE, page)
+	return html.UnescapeString(strings.ReplaceAll(manifest, `\/`, `/`))
+}
+
 func firstMatch(re *regexp.Regexp, value string) string {
 	m := re.FindStringSubmatch(value)
 	if len(m) < 2 {
 		return ""
 	}
 	return strings.TrimSpace(html.UnescapeString(m[1]))
+}
+
+func firstFullMatch(re *regexp.Regexp, value string) string {
+	return strings.TrimSpace(re.FindString(value))
 }
 
 func rot13(value string) string {
