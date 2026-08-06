@@ -172,9 +172,9 @@ type OrphanPlan struct {
 	// DestroyOrphan are prefixed DO droplets with no live DB row that are older
 	// than the provision timeout: genuinely leaked, destroy them (SRE-orphan).
 	DestroyOrphan []DODroplet
-	// MissingFromDO are live DB rows (provisioning/active/draining/destroying)
-	// whose DO droplet has vanished: the row should be reconciled to destroyed
-	// and its token revoked.
+	// MissingFromDO are live DB rows whose DO droplet has vanished: the row should
+	// be reconciled to destroyed and its token revoked. Fresh provisioning rows
+	// are excluded while the provider's list endpoint catches up.
 	MissingFromDO []Droplet
 }
 
@@ -190,10 +190,11 @@ type OrphanPlan struct {
 //   - destroyed if its name is unknown AND it is older than provisionTimeout
 //     (a genuine leak).
 //
-// liveRows are the DB rows in provisioning/active/draining/destroying. A row
-// younger than provisionTimeout is never declared missing: DigitalOcean's list
-// endpoint can lag a successful create/get response for several ticks. Older
-// rows whose DO id is not present are flagged MissingFromDO.
+// liveRows are the DB rows in provisioning/active/draining/destroying. A
+// provisioning row younger than provisionTimeout is not declared missing:
+// DigitalOcean's list endpoint can lag a successful create/get response for
+// several ticks. Active/draining/destroying rows have already appeared in a
+// complete fleet list and are flagged immediately when their DO id disappears.
 func ReconcileOrphans(doFleet []DODroplet, liveRows []Droplet, now time.Time, provisionTimeout time.Duration) OrphanPlan {
 	var plan OrphanPlan
 
@@ -231,7 +232,7 @@ func ReconcileOrphans(doFleet []DODroplet, liveRows []Droplet, now time.Time, pr
 		if r.DODropletID == nil {
 			continue
 		}
-		if now.Sub(r.CreatedAt) < provisionTimeout {
+		if r.State == "provisioning" && now.Sub(r.CreatedAt) < provisionTimeout {
 			continue
 		}
 		if _, ok := presentDOIDs[*r.DODropletID]; !ok {
