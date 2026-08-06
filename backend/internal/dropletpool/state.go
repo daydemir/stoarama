@@ -189,8 +189,10 @@ type OrphanPlan struct {
 //   - destroyed if its name is unknown AND it is older than provisionTimeout
 //     (a genuine leak).
 //
-// liveRows are the DB rows in active/draining; any whose DO id is not present in
-// the live DO fleet is flagged MissingFromDO.
+// liveRows are the DB rows in provisioning/active/draining/destroying. A row
+// younger than provisionTimeout is never declared missing: DigitalOcean's list
+// endpoint can lag a successful create/get response for several ticks. Older
+// rows whose DO id is not present are flagged MissingFromDO.
 func ReconcileOrphans(doFleet []DODroplet, liveRows []Droplet, now time.Time, provisionTimeout time.Duration) OrphanPlan {
 	var plan OrphanPlan
 
@@ -226,6 +228,9 @@ func ReconcileOrphans(doFleet []DODroplet, liveRows []Droplet, now time.Time, pr
 	// DB rows whose DO droplet is gone.
 	for _, r := range liveRows {
 		if r.DODropletID == nil {
+			continue
+		}
+		if now.Sub(r.CreatedAt) < provisionTimeout {
 			continue
 		}
 		if _, ok := presentDOIDs[*r.DODropletID]; !ok {
