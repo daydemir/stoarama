@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/capture"
 )
 
 func TestParseStoaramaStreamID(t *testing.T) {
@@ -101,6 +104,77 @@ func TestClassifyGSSCandidateRejectsMismatchedStoaramaHost(t *testing.T) {
 	got := classifyGSSCandidate(row, "https://stoarama.com")
 	if got.Kind != gssCandidateManual {
 		t.Fatalf("kind=%q want %q", got.Kind, gssCandidateManual)
+	}
+}
+
+func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
+	originalSupported := gssIsResolvableSourcePage
+	originalResolve := gssResolveCaptureInput
+	originalProbe := gssProbeResolvedURL
+	t.Cleanup(func() {
+		gssIsResolvableSourcePage = originalSupported
+		gssResolveCaptureInput = originalResolve
+		gssProbeResolvedURL = originalProbe
+	})
+	gssIsResolvableSourcePage = func(string, string) bool { return true }
+	gssProbeResolvedURL = func(context.Context, string) (*gssProbe, error) {
+		return &gssProbe{Width: 1920, Height: 1080}, nil
+	}
+
+	row := gssTestRow(map[string]string{"source": "https://example.com/camera"})
+	row.List = gssListNils
+	row.RowNumber = 9
+	opts := gssOptions{TargetAPIURL: gssProductionAPIURL, ProbeTimeout: time.Second}
+	gssResolveCaptureInput = func(context.Context, string, string, string) (string, bool, error) {
+		return "https://media.example.com/live.m3u8", false, nil
+	}
+	result := verifyGSSRow(context.Background(), row, opts)
+	if result.Status != gssStatusVerifiedImportable {
+		t.Fatalf("status=%q reason=%q", result.Status, result.Reason)
+	}
+	if result.SourceURL != row.value("source") || result.SourcePageURL != row.value("source") {
+		t.Fatalf("source fields=%q %q", result.SourceURL, result.SourcePageURL)
+	}
+
+	gssResolveCaptureInput = func(context.Context, string, string, string) (string, bool, error) {
+		return "", false, errors.New("camera is unavailable")
+	}
+	result = verifyGSSRow(context.Background(), row, opts)
+	if result.Status != gssStatusProbeFailed || !strings.Contains(result.Reason, "unavailable") {
+		t.Fatalf("offline status=%q reason=%q", result.Status, result.Reason)
+	}
+}
+
+func TestCreateGSSStreamPreservesSourcePageFields(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		writeTestJSON(t, w, map[string]any{
+			"ok": true, "created": true,
+			"stream": map[string]any{"id": 321, "slug": "page-camera", "provider": gssProvider},
+		})
+	}))
+	defer server.Close()
+	pageURL := "https://www.ipcamlive.com/example"
+	result := gssResult{
+		List: gssListNils, RowNumber: 9, SourceURL: pageURL, SourcePageURL: pageURL,
+		ResolvedURL: "https://s24.ipcamlive.com/streams/example/stream.m3u8",
+		Values:      map[string]string{"city": "Prijedor", "location": "Mali trg", "country": "Bosnia and Herzegovina"},
+	}
+	_, err := createGSSStream(context.Background(), gssOptions{
+		TargetAPIURL: server.URL, ServiceToken: "test-token", ImportTimeout: time.Second,
+	}, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"source_url": pageURL, "source_page_url": pageURL, "capture_type": capture.CaptureTypeHLS,
+	} {
+		if got := payload[key]; got != want {
+			t.Fatalf("%s=%v want=%q", key, got, want)
+		}
 	}
 }
 

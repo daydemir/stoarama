@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/netguard"
 )
@@ -162,6 +163,7 @@ func TestResolveCaptureInputFailsClosedWhenSkylinePageHasNoManifest(t *testing.T
 func TestKnownSourcePageResolverDetection(t *testing.T) {
 	for _, raw := range []string{
 		"https://www.skylinewebcams.com/en/webcam/example.html",
+		"https://www.earthcam.com/example",
 		"https://www.ipcamlive.com/570b5e81b9c8e",
 		"https://de.worldcam.eu/liveview/10391",
 		"https://myslenice-rynek.webcamera.pl/",
@@ -193,6 +195,35 @@ func TestIPCamLivePlayerParsing(t *testing.T) {
 }
 
 func TestIPCamLiveManifestURL(t *testing.T) {
+	// Not parallel: this makes the loopback httptest server reachable through
+	// the same SSRF guard used by production fetches.
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if strings.Contains(r.URL.Path, "/player/player.php") {
+			t.Fatal("direct player page must not trigger a second player request")
+		}
+		_, _ = w.Write([]byte(`<script>var address = 'http://s24.ipcamlive.com/'; var streamid = '18ehdw7fodyulgibx';</script>`))
+	}))
+	defer server.Close()
+
+	resolved, err := resolveIPCamLiveManifestURL(context.Background(), server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://s24.ipcamlive.com/streams/18ehdw7fodyulgibx/stream.m3u8"; resolved != want {
+		t.Fatalf("resolved=%q want=%q", resolved, want)
+	}
+	if requests != 1 {
+		t.Fatalf("requests=%d want=1", requests)
+	}
+
 	got, err := ipCamManifestURL("http://s24.ipcamlive.com/", "18ehdw7fodyulgibx")
 	if err != nil {
 		t.Fatal(err)

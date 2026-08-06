@@ -937,14 +937,14 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 		result.Status = gssStatusVerifiedImportable
 		return result
 	case gssCandidatePageURL:
-		if !capture.IsResolvableSourcePage(gssProvider, result.Candidate.URL) {
+		if !gssIsResolvableSourcePage(gssProvider, result.Candidate.URL) {
 			result.Status = gssStatusResolverMissing
 			result.Reason = result.Candidate.Reason
 			return result
 		}
 		verifyCtx, cancel := context.WithTimeout(ctx, opts.ProbeTimeout)
 		defer cancel()
-		resolved, _, err := capture.ResolveCaptureInput(verifyCtx, gssProvider, result.Candidate.URL, result.Candidate.URL)
+		resolved, _, err := gssResolveCaptureInput(verifyCtx, gssProvider, result.Candidate.URL, result.Candidate.URL)
 		if err != nil {
 			result.Status = gssStatusProbeFailed
 			result.Reason = err.Error()
@@ -953,7 +953,7 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 		result.SourceURL = result.Candidate.URL
 		result.SourcePageURL = result.Candidate.URL
 		result.ResolvedURL = resolved
-		if probe, err := probeGSSResolvedURL(verifyCtx, resolved); err != nil {
+		if probe, err := gssProbeResolvedURL(verifyCtx, resolved); err != nil {
 			result.Status = gssStatusProbeFailed
 			result.Reason = err.Error()
 			return result
@@ -972,6 +972,12 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 		return result
 	}
 }
+
+var (
+	gssIsResolvableSourcePage = capture.IsResolvableSourcePage
+	gssResolveCaptureInput    = capture.ResolveCaptureInput
+	gssProbeResolvedURL       = probeGSSResolvedURL
+)
 
 func classifyGSSCandidate(row gssRow, targetAPIURL string) gssCandidate {
 	if ref, ok := parseStoaramaStreamRef(row.value("source")); ok {
