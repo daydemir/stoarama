@@ -324,10 +324,25 @@ func TestReconcileOrphans_YoungUnknownIsAdoptedNotDestroyed(t *testing.T) {
 func TestReconcileOrphans_MissingFromDO(t *testing.T) {
 	now := mustTime(t, "2026-06-24T12:00:00Z")
 	// DB row says active with do id 999, but the DO fleet no longer has it.
-	rows := []Droplet{{ID: 2, Name: NamePrefix + "gone", State: "active", DODropletID: ptrInt64(999)}}
+	rows := []Droplet{{ID: 2, Name: NamePrefix + "gone", State: "active", DODropletID: ptrInt64(999), CreatedAt: now.Add(-30 * time.Minute)}}
 	plan := ReconcileOrphans(nil, rows, now, 15*time.Minute)
 	if len(plan.MissingFromDO) != 1 || plan.MissingFromDO[0].ID != 2 {
 		t.Fatalf("expected the vanished DB row flagged MissingFromDO, got %+v", plan)
+	}
+}
+
+func TestReconcileOrphans_YoungCreatedDropletSurvivesListVisibilityLag(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+	rows := []Droplet{{
+		ID:          4,
+		Name:        NamePrefix + "new",
+		State:       "provisioning",
+		DODropletID: ptrInt64(1001),
+		CreatedAt:   now.Add(-30 * time.Second),
+	}}
+	plan := ReconcileOrphans(nil, rows, now, 15*time.Minute)
+	if len(plan.MissingFromDO) != 0 {
+		t.Fatalf("fresh create must survive provider list visibility lag, got %+v", plan)
 	}
 }
 
