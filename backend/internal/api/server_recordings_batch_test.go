@@ -96,6 +96,28 @@ func TestBatchScheduleDryRunIsReadOnly(t *testing.T) {
 		Delivery:             "managed",
 		DryRun:               true,
 	}
+	request.TargetAccountID = accountID
+	forbiddenBody, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbiddenReq := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(forbiddenBody)), principal, "")
+	forbiddenRec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(forbiddenRec, forbiddenReq)
+	if forbiddenRec.Code != http.StatusForbidden {
+		t.Fatalf("non-operator target status=%d body=%s", forbiddenRec.Code, forbiddenRec.Body.String())
+	}
+
+	operatorUserID, operatorAccountID := seedUserOrg(t, pool, "batch-operator@example.com", true)
+	operator := accountPrincipal{AccountID: operatorAccountID, UserID: operatorUserID, Role: accountRoleAdmin, MemberRole: "owner"}
+	operatorReq := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(forbiddenBody)), operator, "")
+	operatorRec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(operatorRec, operatorReq)
+	if operatorRec.Code != http.StatusOK {
+		t.Fatalf("operator target status=%d body=%s", operatorRec.Code, operatorRec.Body.String())
+	}
+
+	request.TargetAccountID = 0
 	body, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
