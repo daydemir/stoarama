@@ -263,9 +263,11 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/batch-streams", s.handleAccountRecordingBatchStreams)
 			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
 			account.Get("/clips", s.handleAccountClips)
+			account.Post("/clips/release", s.handleAccountClipsReleaseBatch)
 			// Heartbeat is called by the pull client with its scoped key, so it lives
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
+			account.Post("/connections/inventory", s.handleAccountConnectionInventorySync)
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
 			account.Get("/recordings/{id}/capture-health", s.handleAccountRecordingCaptureHealth)
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
@@ -459,6 +461,9 @@ func (s *Server) router() http.Handler {
 			// /account/connections (no trailing slash) matches.
 			connections.Post("/account/connections", s.handleAccountConnectionsCreate)
 			connections.Get("/account/connections", s.handleAccountConnectionsList)
+			connections.Get("/account/connections/{id}/inventory", s.handleAccountConnectionInventoryList)
+			connections.Get("/account/connections/{id}/inventory.csv", s.handleAccountConnectionInventoryCSV)
+			connections.Patch("/account/connections/{id}/inventory-mode", s.handleAccountConnectionInventoryMode)
 			connections.Post("/account/connections/{id}/rotate", s.handleAccountConnectionRotate)
 			connections.Delete("/account/connections/{id}", s.handleAccountConnectionDelete)
 		})

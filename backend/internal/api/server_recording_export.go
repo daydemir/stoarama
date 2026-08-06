@@ -305,6 +305,15 @@ func (s *Server) handleAccountRecordingClipRelease(w http.ResponseWriter, r *htt
 	if !ok {
 		return
 	}
+	confirmed, reason, err := s.verifyNASInventoryForRelease(r, principal, recordingID, clipID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("verify NAS inventory: %v", err))
+		return
+	}
+	if !confirmed {
+		util.WriteError(w, http.StatusConflict, "release retained: "+reason)
+		return
+	}
 
 	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID, true)
 	if err != nil {

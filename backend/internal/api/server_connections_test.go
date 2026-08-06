@@ -25,9 +25,11 @@ func TestPullPathAllowed(t *testing.T) {
 		path   string
 		want   bool
 	}{
-		// The 4 pull endpoints: list + heartbeat + download + release.
+		// The pull endpoints: list + heartbeat + inventory + download + release.
 		{http.MethodGet, "/api/v1/account/clips", true},
 		{http.MethodPost, "/api/v1/account/connections/heartbeat", true},
+		{http.MethodPost, "/api/v1/account/connections/inventory", true},
+		{http.MethodPost, "/api/v1/account/clips/release", true},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 
@@ -86,12 +88,14 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 	keyID := int64(99)
 	pull := accountPrincipal{AccountID: 7, AuthType: "api_key", APIKeyID: &keyID, KeyScopes: []string{accountScopePull}}
 
-	// 200 on all 4 pull endpoints.
+	// 200 on all pull endpoints.
 	pullPaths := []struct {
 		method, path string
 	}{
 		{http.MethodGet, "/api/v1/account/clips"},
 		{http.MethodPost, "/api/v1/account/connections/heartbeat"},
+		{http.MethodPost, "/api/v1/account/connections/inventory"},
+		{http.MethodPost, "/api/v1/account/clips/release"},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download"},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release"},
 	}
@@ -396,6 +400,11 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 			StartedAt:    &now,
 			FailureCount: 3,
 		},
+		Inventory: &connectionInventoryStatus{
+			Generation: "scan-20260806-abcd1234", ScanStartedAt: &now,
+			ScanCompletedAt: &now, Clips: 100, Bytes: 2048,
+			Digest: strings.Repeat("a", 64),
+		},
 	}
 	if err := validateConnectionHeartbeat(valid); err != nil {
 		t.Fatalf("valid heartbeat rejected: %v", err)
@@ -423,10 +432,54 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{Workers: 33}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &future, DurationMS: 1, Workers: 1}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "bad/generation"}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", Digest: "not-a-digest"}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanCompletedAt: &now}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {
 			t.Errorf("invalid heartbeat %d accepted: %+v", i, request)
 		}
+	}
+}
+
+func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID, apiKeyID = int64(42), int64(123)
+	if _, err := pool.Exec(ctx, `INSERT INTO connections(account_id,kind,api_key_id) VALUES($1,'nas_pull',$2)`, accountID, apiKeyID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	call := func(inv connectionInventoryStatus) {
+		payload, err := json.Marshal(connectionHeartbeatRequest{Inventory: &inv})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", bytes.NewReader(payload))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionHeartbeat(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	start := now.Add(-time.Hour)
+	completed := now.Add(-time.Minute)
+	call(connectionInventoryStatus{Generation: "complete", ScanStartedAt: &start, ScanCompletedAt: &completed, Clips: 10, Bytes: 1000, Mismatches: 7, Unmatched: 2, Digest: strings.Repeat("a", 64)})
+	call(connectionInventoryStatus{Generation: "same-time-conflict", ScanStartedAt: &start, ScanCompletedAt: &completed, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("c", 64)})
+	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &now, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0})
+	delayed := now.Add(-2 * time.Minute)
+	call(connectionInventoryStatus{Generation: "delayed", ScanStartedAt: &start, ScanCompletedAt: &delayed, Clips: 2, Bytes: 2, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("b", 64)})
+	var clips, bytesValue, mismatches, unmatched int64
+	var digest string
+	var storedCompleted time.Time
+	if err := pool.QueryRow(ctx, `SELECT inventory_clips,inventory_bytes,inventory_mismatches,inventory_unmatched,inventory_digest,inventory_scan_completed_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&clips, &bytesValue, &mismatches, &unmatched, &digest, &storedCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if clips != 10 || bytesValue != 1000 || mismatches != 7 || unmatched != 2 || digest != strings.Repeat("a", 64) || !storedCompleted.Equal(completed) {
+		t.Fatalf("completed summary regressed clips=%d bytes=%d mismatches=%d unmatched=%d digest=%q completed=%s", clips, bytesValue, mismatches, unmatched, digest, storedCompleted)
 	}
 }

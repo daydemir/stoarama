@@ -128,6 +128,17 @@
     .conn-alert.error .conn-alert-title { color: var(--err); }
     .conn-alert-body { margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
     .conn-actions { justify-content: flex-end; padding-top: 2px; }
+    details.action-menu { position: relative; }
+    details.action-menu > summary { list-style: none; width: 34px; height: 32px; display: grid; place-items: center; border: 1.5px solid var(--muted); border-radius: 10px; cursor: pointer; font-size: 20px; line-height: 1; }
+    details.action-menu > summary::-webkit-details-marker { display: none; }
+    .action-menu-pop { position: absolute; z-index: 20; right: 0; top: 38px; min-width: 190px; display: grid; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); box-shadow: 0 18px 45px rgba(0,0,0,.35); }
+    .action-menu-pop button { width: 100%; text-align: left; border-color: transparent; }
+    .action-menu-pop button.destructive { color: var(--err); }
+    .inventory-box { border-top: 1px solid var(--border); padding-top: 10px; }
+    .inventory-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .inventory-table th, .inventory-table td { padding: 7px 6px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    .inventory-table th { color: var(--muted); font-weight: 500; }
+    .inventory-path { max-width: 360px; overflow-wrap: anywhere; }
     .inline-form { display: flex; gap: 8px; align-items: flex-end; }
     .inline-form input { flex: 1 1 auto; }
     .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -264,7 +275,7 @@
         <div class="sub" style="margin-top:10px; line-height:1.6;">
           <ol style="margin:0; padding-left:18px;">
             <li>In DSM open <b>Package Center</b> and install <b>Container Manager</b> (skip if already installed).</li>
-            <li>Create two shared folders: <span class="mono">/volume1/stoarama-clips</span> holds the downloaded footage (one subfolder per recording), and <span class="mono">/volume1/stoarama-state</span> holds only <span class="mono">cursor.json</span>, which records the last drained clip id so a restart resumes in place.</li>
+            <li>Create two shared folders: <span class="mono">/volume1/stoarama-clips</span> holds the downloaded footage (one subfolder per recording), and <span class="mono">/volume1/stoarama-state</span> holds the durable cursor, update state, and SQLite checksum inventory so restarts resume safely.</li>
             <li>In <b>Container Manager &gt; Project &gt; Create</b>, set the path to any empty folder (e.g. <span class="mono">/volume1/docker/stoarama</span>) and paste the docker-compose shown above as the source. Nothing else goes in that folder, there is no file to upload and nothing to build. It is pre-filled with your API base, your token, and your chosen poll interval.</li>
             <li>To validate read-only first, set <span class="mono">STOARAMA_DRY_RUN</span> to <span class="mono">"1"</span> (downloads and verifies clips, never releases them, cursor not persisted), then set it back to <span class="mono">"0"</span> for live operation.</li>
             <li>Start the project. <span class="mono">restart: always</span> keeps it running across reboots.</li>
@@ -621,7 +632,7 @@
           const status = m.accepted_at ? 'Active' : 'Invited';
           const showRemove = canManage && !(role === 'owner' && items.filter((x) => String(x.role) === 'owner').length <= 1);
           const removeBtn = showRemove
-            ? `<button class="secondary small team-remove" type="button" data-email="${escapeHTML(email)}">Remove</button>`
+            ? `<details class="action-menu"><summary aria-label="Member actions">⋯</summary><div class="action-menu-pop"><button class="small destructive team-remove" type="button" data-email="${escapeHTML(email)}">Remove member…</button></div></details>`
             : '';
           const showRoleToggle = canManage && role !== 'owner';
           const nextRole = role === 'billing_admin' ? 'member' : 'billing_admin';
@@ -747,6 +758,11 @@
           const batchRetries = Number(c.nas_batch_retries || 0);
           const batchFailures = Number(c.nas_batch_failures || 0);
           const downloadWorkers = Number(c.nas_download_workers || 0);
+          const inventoryClips = Number(c.inventory_clips || 0);
+          const inventoryBytes = Number(c.inventory_bytes || 0);
+          const inventoryBad = Number(c.inventory_mismatches || 0);
+          const inventoryUnmatched = Number(c.inventory_unmatched || 0);
+          const inventoryMode = String(c.inventory_mode || 'observe');
           const outageRecovered = Boolean(c.last_outage_recovered_at);
           const outage = outageClass
             ? `<div class="conn-alert">
@@ -773,13 +789,20 @@
               <div><dt>Oldest waiting</dt><dd>${escapeHTML(c.oldest_pending_at ? connectionTimestamp(c.oldest_pending_at) : 'None')}</dd></div>
               <div><dt>Transfer rate</dt><dd>${payloadMbps > 0 ? `${payloadMbps.toFixed(1)} Mbps` : 'Measuring'}<span class="conn-stat-detail">${downloadWorkers || '—'} parallel downloads</span></dd></div>
               <div><dt>Last transfer batch</dt><dd>${batchClips.toLocaleString()} clips<span class="conn-stat-detail">${batchDurationMS > 0 ? `${Math.round(batchDurationMS / 1000)}s` : '—'} · ${batchRetries} retries · ${batchFailures} failed</span></dd></div>
+              <div><dt>NAS inventory</dt><dd>${inventoryClips.toLocaleString()} clips<span class="conn-stat-detail">${escapeHTML(connectionBytes(inventoryBytes))} · ${inventoryBad} mismatch${inventoryBad === 1 ? '' : 'es'} · ${inventoryUnmatched} unmatched</span></dd></div>
+              <div><dt>Inventory safety</dt><dd>${inventoryMode === 'enforce' ? 'Enforced' : 'Observing'}<span class="conn-stat-detail">${escapeHTML(c.inventory_scan_completed_at ? `Scanned ${connectionTimestamp(c.inventory_scan_completed_at)}` : 'Full scan pending')}</span></dd></div>
             </dl>
             ${latestError}
             ${outage}
             <div class="conn-actions">
-              <button class="secondary small conn-rotate" type="button" data-id="${id}">Rotate</button>
-              <button class="secondary small conn-remove" type="button" data-id="${id}">Remove</button>
+              <button class="secondary small conn-inventory" type="button" data-id="${id}">View NAS files</button>
+              <details class="action-menu"><summary aria-label="Connection actions">⋯</summary><div class="action-menu-pop">
+                <button class="secondary small conn-inventory-mode" type="button" data-id="${id}" data-mode="${inventoryMode === 'enforce' ? 'observe' : 'enforce'}">${inventoryMode === 'enforce' ? 'Return to observe-only…' : 'Enable inventory gate…'}</button>
+                <button class="secondary small conn-rotate" type="button" data-id="${id}">Rotate access key…</button>
+                <button class="small destructive conn-remove" type="button" data-id="${id}" data-label="${escapeHTML(label)}">Remove connection…</button>
+              </div></details>
             </div>
+            <div class="inventory-box hidden" data-inventory-box="${id}"></div>
           </div>`;
         }).join('');
         connectionsList.classList.remove('hidden');
@@ -787,7 +810,13 @@
           btn.addEventListener('click', () => rotateConnection(Number(btn.getAttribute('data-id'))));
         });
         connectionsList.querySelectorAll('.conn-remove').forEach((btn) => {
-          btn.addEventListener('click', () => removeConnection(Number(btn.getAttribute('data-id'))));
+          btn.addEventListener('click', () => removeConnection(Number(btn.getAttribute('data-id')), btn.getAttribute('data-label')));
+        });
+        connectionsList.querySelectorAll('.conn-inventory').forEach((btn) => {
+          btn.addEventListener('click', () => loadConnectionInventory(Number(btn.getAttribute('data-id'))));
+        });
+        connectionsList.querySelectorAll('.conn-inventory-mode').forEach((btn) => {
+          btn.addEventListener('click', () => setInventoryMode(Number(btn.getAttribute('data-id')), btn.getAttribute('data-mode')));
         });
         setStatus(connectionsStatus, `${items.length} connection${items.length === 1 ? '' : 's'}`, 'ok');
       } catch (err) {
@@ -822,6 +851,7 @@
     });
 
     async function rotateConnection(id) {
+      if (!window.confirm('Rotate this NAS access key? The currently running NAS key will be revoked immediately and transfers stop until the new compose configuration is installed.')) return;
       try {
         const data = await fetchJSON(`/api/v1/account/connections/${id}/rotate`, { method: 'POST' });
         showConnToken(data.compose_snippet);
@@ -832,10 +862,63 @@
       }
     }
 
-    async function removeConnection(id) {
+    async function removeConnection(id, label) {
+      const typed = window.prompt(`Remove ${label || 'this NAS connection'}? This revokes its key and removes its server inventory. Cloud clip objects are retained. Type REMOVE to continue.`);
+      if (typed !== 'REMOVE') return;
       try {
         await fetchJSON(`/api/v1/account/connections/${id}`, { method: 'DELETE' });
         setStatus(connectionsStatus, 'Connection removed and its key revoked', 'ok');
+        await loadConnections();
+      } catch (err) {
+        setStatus(connectionsStatus, String(err.message || err), 'err');
+      }
+    }
+
+    async function loadConnectionInventory(id, afterClipID = 0) {
+      const box = connectionsList.querySelector(`[data-inventory-box="${id}"]`);
+      if (!box) return;
+      box.classList.remove('hidden');
+      if (!afterClipID) box.innerHTML = '<div class="sub">Loading reconciled NAS filesystem…</div>';
+      try {
+        const data = await fetchJSON(`/api/v1/account/connections/${id}/inventory?limit=200&after_clip_id=${afterClipID}`);
+        const items = Array.isArray(data.items) ? data.items : [];
+        const unmatched = Array.isArray(data.unmatched_files) ? data.unmatched_files : [];
+        const rows = items.map((item) => `<tr><td class="mono">${Number(item.clip_id)}</td><td class="inventory-path mono">${escapeHTML(item.relative_path || '')}</td><td>${escapeHTML(connectionBytes(Number(item.size_bytes || 0)))}</td><td>${escapeHTML(item.reconciliation || item.state || '')}</td><td>${escapeHTML(connectionTimestamp(item.verified_at))}</td></tr>`).join('')
+          + unmatched.map((item) => `<tr><td class="mono">—</td><td class="inventory-path mono">${escapeHTML(item.relative_path || '')}</td><td>${escapeHTML(connectionBytes(Number(item.size_bytes || 0)))}</td><td>NAS only / unmatched</td><td>—</td></tr>`).join('');
+        if (!afterClipID) {
+          box.innerHTML = `<div class="kv-row" style="margin-bottom:8px;"><div><b>NAS filesystem</b><div class="sub"><span data-inventory-shown>${items.length + unmatched.length}</span> shown · ${Number(data.server_only || 0).toLocaleString()} server-only</div></div><a href="/api/v1/account/connections/${id}/inventory.csv">Download full manifest CSV</a></div>`
+            + (rows ? `<div style="overflow:auto;"><table class="inventory-table"><thead><tr><th>Clip</th><th>Path</th><th>Size</th><th>Reconciliation</th><th>Verified</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="sub">No inventory has synced yet.</div>');
+        } else {
+          const body = box.querySelector('tbody');
+          if (body) body.insertAdjacentHTML('beforeend', rows);
+          const shown = box.querySelector('[data-inventory-shown]');
+          if (shown) shown.textContent = String(Number(shown.textContent || 0) + items.length);
+        }
+        const priorMore = box.querySelector('[data-inventory-more]');
+        if (priorMore) priorMore.remove();
+        if (items.length === 200) {
+          const nextID = Number(items[items.length - 1].clip_id);
+          box.insertAdjacentHTML('beforeend', `<button class="secondary small" type="button" data-inventory-more="${nextID}" style="margin-top:10px;">Load next 200</button>`);
+          box.querySelector('[data-inventory-more]').addEventListener('click', (event) => {
+            event.currentTarget.disabled = true;
+            void loadConnectionInventory(id, nextID);
+          });
+        }
+      } catch (err) {
+        box.innerHTML = `<div class="status err">${escapeHTML(String(err.message || err))}</div>`;
+      }
+    }
+
+    async function setInventoryMode(id, mode) {
+      const message = mode === 'enforce'
+        ? 'Enable fail-closed inventory gating? Clip release will stop unless the NAS recently confirms the exact path, size, and SHA-256. This is allowed only after a clean complete scan and no unconfirmed server clips.'
+        : 'Return this connection to observe-only inventory mode? Cloud objects remain retained, but new NAS releases will no longer be blocked by missing inventory proof.';
+      if (!window.confirm(message)) return;
+      try {
+        await fetchJSON(`/api/v1/account/connections/${id}/inventory-mode`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
+        });
+        setStatus(connectionsStatus, mode === 'enforce' ? 'Inventory safety gate enabled' : 'Inventory returned to observe-only mode', 'ok');
         await loadConnections();
       } catch (err) {
         setStatus(connectionsStatus, String(err.message || err), 'err');
@@ -944,8 +1027,10 @@
           <div style="display:flex;gap:8px;flex-shrink:0;">
             <button class="secondary small relay-limit" type="button" data-id="${id}" data-max="${max}">Limit</button>
             <button class="secondary small relay-rename" type="button" data-id="${id}">Rename</button>
-            <button class="secondary small relay-toggle" type="button" data-id="${id}" data-status="${disabled ? 'active' : 'disabled'}">${toggleLabel}</button>
-            <button class="secondary small relay-remove" type="button" data-id="${id}">Remove</button>
+            <details class="action-menu"><summary aria-label="Computer actions">⋯</summary><div class="action-menu-pop">
+              <button class="secondary small relay-toggle" type="button" data-id="${id}" data-status="${disabled ? 'active' : 'disabled'}">${toggleLabel} computer…</button>
+              <button class="small destructive relay-remove" type="button" data-id="${id}">Remove computer…</button>
+            </div></details>
           </div>
         </div>
         <dl class="bill-meta" style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
@@ -984,7 +1069,7 @@
       }
       relayGroupList.innerHTML = groups.map((g) => `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
         <div><b>${escapeHTML(g.name)}</b><div class="sub">${Number(g.live_leases || 0)} recording now / ${Number(g.max_streams)} group limit &middot; ${Array.isArray(g.node_ids) ? g.node_ids.length : 0} computer${Array.isArray(g.node_ids) && g.node_ids.length === 1 ? '' : 's'}</div></div>
-        <div style="display:flex;gap:8px;"><button class="secondary small relay-group-edit" type="button" data-id="${Number(g.id)}">Edit</button><button class="secondary small relay-group-remove" type="button" data-id="${Number(g.id)}">Remove</button></div>
+        <div style="display:flex;gap:8px;"><button class="secondary small relay-group-edit" type="button" data-id="${Number(g.id)}">Edit</button><details class="action-menu"><summary aria-label="Internet group actions">⋯</summary><div class="action-menu-pop"><button class="small destructive relay-group-remove" type="button" data-id="${Number(g.id)}">Remove group…</button></div></details></div>
       </div>`).join('');
       relayGroupList.querySelectorAll('.relay-group-edit').forEach((btn) => btn.addEventListener('click', () => editRelayGroup(Number(btn.getAttribute('data-id')))));
       relayGroupList.querySelectorAll('.relay-group-remove').forEach((btn) => btn.addEventListener('click', () => removeRelayGroup(Number(btn.getAttribute('data-id')))));
@@ -1185,6 +1270,7 @@
 
     async function toggleRelay(id, status) {
       const next = status === 'active' ? 'active' : 'disabled';
+      if (next === 'disabled' && !window.confirm('Disable this computer? It will stop receiving new recording work until re-enabled.')) return;
       try {
         await fetchJSON(`/api/v1/account/nodes/${id}`, {
           method: 'PATCH',

@@ -7,9 +7,11 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -28,6 +30,9 @@ HTTP_TIMEOUT_SEC = 120
 HEARTBEAT_TIMEOUT_SEC = 20
 HEARTBEAT_INTERVAL_SEC = 30
 UPDATE_INTERVAL_SEC = 600
+INVENTORY_SCAN_INTERVAL_SEC = 24 * 60 * 60
+INVENTORY_SYNC_BATCH = 200
+INVENTORY_SHUTDOWN_TIMEOUT_SEC = HTTP_TIMEOUT_SEC + 5
 ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 
@@ -136,12 +141,16 @@ class Config:
         self.legacy_progress_file = self.state_dir / "cursor.json"
         self.runtime_file = self.state_dir / "runtime.json"
         self.outage_file = self.state_dir / "outage.json"
+        self.inventory_file = self.state_dir / "inventory.sqlite3"
         self.current_file = self.state_dir / "stoarama_pull.py"
         self.candidate_file = self.state_dir / "stoarama_pull.candidate.py"
         self.previous_file = self.state_dir / "stoarama_pull.previous.py"
         self.lock_file = self.state_dir / "client.lock"
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 60)
         self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
+        self.inventory_scan_interval_sec = env_int("STOARAMA_INVENTORY_SCAN_INTERVAL_SEC", INVENTORY_SCAN_INTERVAL_SEC)
+        self.inventory_scan_delay_ms = env_int("STOARAMA_INVENTORY_SCAN_DELAY_MS", 25)
+        self.inventory_hash_mbps = env_int("STOARAMA_INVENTORY_HASH_MBPS", 20)
         self.update_manifest_url = env_str(
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
@@ -159,6 +168,8 @@ class Config:
             raise SystemExit("STOARAMA_POLL_INTERVAL_SEC must be between 10 and 3600")
         if self.download_workers < 1 or self.download_workers > MAX_DOWNLOAD_WORKERS:
             raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
+        if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 1 or self.inventory_hash_mbps > 1000:
+            raise SystemExit("invalid NAS inventory scan cadence")
 
 
 def boot_id():
@@ -219,8 +230,327 @@ def retry_transient(operation, clip_id, phase):
             time.sleep(attempt)
 
 
-class Runtime:
+def utc_now_precise():
+    now_ns = time.time_ns()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now_ns // 1000000000)) + (".%06dZ" % (now_ns // 1000 % 1000000))
+
+
+class Inventory:
+    """Durable, locally authoritative NAS clip inventory.
+
+    SQLite is intentionally stored on the separate /state mount. Clip writes are
+    committed before the server is told it may release a clip. Full scans run in
+    the background and use generations so a crash or partial upload can never
+    turn an incomplete scan into a mass-missing report.
+    """
+
     def __init__(self, cfg):
+        self.cfg = cfg
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(str(cfg.inventory_file), timeout=30, check_same_thread=False)
+        with self.lock:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
+            self.db.execute("PRAGMA foreign_keys=ON")
+            self.db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS files (
+                    clip_id INTEGER PRIMARY KEY,
+                    recording_id INTEGER NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    verified_at TEXT,
+                    file_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    seen_generation TEXT NOT NULL DEFAULT '',
+                    client_updated_at TEXT NOT NULL,
+                    dirty INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS files_dirty_clip ON files(dirty, clip_id);
+                CREATE INDEX IF NOT EXISTS files_generation ON files(seen_generation);
+                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS unmatched_files (
+                    relative_path TEXT PRIMARY KEY,
+                    size_bytes INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    file_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    seen_generation TEXT NOT NULL DEFAULT '',
+                    client_updated_at TEXT NOT NULL,
+                    dirty INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS unmatched_dirty_path ON unmatched_files(dirty,relative_path);
+                """
+            )
+            self.db.commit()
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live"):
+        updated_at = utc_now_precise()
+        with self.lock:
+            self.db.execute(
+                """INSERT INTO files
+                   (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,seen_generation,client_updated_at,dirty)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,1)
+                   ON CONFLICT(clip_id) DO UPDATE SET
+                     recording_id=excluded.recording_id, relative_path=excluded.relative_path,
+                     size_bytes=excluded.size_bytes, sha256=excluded.sha256, state=excluded.state,
+                     verified_at=excluded.verified_at, file_mtime_ns=excluded.file_mtime_ns,
+                     seen_generation=excluded.seen_generation, client_updated_at=excluded.client_updated_at, dirty=1""",
+                (
+                    int(clip["clip_id"]), int(clip["recording_id"]), str(clip["relative_path"]),
+                    int(clip["size_bytes"]), str(clip["sha256"]).lower(), state,
+                    verified_at, int(mtime_ns), generation, updated_at,
+                ),
+            )
+            self.db.commit()
+
+    def record_verified(self, clip):
+        path = self.cfg.output_dir / valid_relative_path(clip)
+        stat = path.stat()
+        if stat.st_size != int(clip["size_bytes"]):
+            raise RuntimeError("inventory size changed after verification for clip %d" % int(clip["clip_id"]))
+        self._upsert(clip, "present", utc_now_precise(), stat.st_mtime_ns)
+
+    def _rows(self, where, params=(), limit=INVENTORY_SYNC_BATCH):
+        with self.lock:
+            return self.db.execute(
+                """SELECT clip_id,recording_id,relative_path,size_bytes,sha256,state,
+                          verified_at,file_mtime_ns,client_updated_at
+                   FROM files WHERE %s ORDER BY clip_id LIMIT ?""" % where,
+                tuple(params) + (limit,),
+            ).fetchall()
+
+    @staticmethod
+    def _reports(rows):
+        return [
+            {
+                "clip_id": row[0], "recording_id": row[1], "relative_path": row[2],
+                "size_bytes": row[3], "sha256": row[4], "state": row[5],
+                "verified_at": row[6], "file_mtime_ns": row[7], "client_updated_at": row[8],
+            }
+            for row in rows
+        ]
+
+    def _mark_clean(self, rows):
+        with self.lock:
+            self.db.executemany(
+                "UPDATE files SET dirty=0 WHERE clip_id=? AND client_updated_at=?",
+                [(row[0], row[8]) for row in rows],
+            )
+            self.db.commit()
+
+    def sync_clip_ids(self, cfg, clip_ids, generation="live"):
+        if not clip_ids:
+            return
+        placeholders = ",".join("?" for _ in clip_ids)
+        rows = self._rows("dirty=1 AND clip_id IN (%s)" % placeholders, tuple(clip_ids), len(clip_ids))
+        if not rows:
+            return
+        request_json(cfg, "POST", "/account/connections/inventory", body={
+            "generation": generation, "complete": False, "files": self._reports(rows),
+        })
+        self._mark_clean(rows)
+
+    def sync_dirty(self, cfg, generation="live"):
+        while True:
+            rows = self._rows("dirty=1")
+            if not rows:
+                break
+            request_json(cfg, "POST", "/account/connections/inventory", body={
+                "generation": generation, "complete": False, "files": self._reports(rows),
+            })
+            self._mark_clean(rows)
+        while True:
+            with self.lock:
+                rows = self.db.execute(
+                    """SELECT relative_path,size_bytes,sha256,state,file_mtime_ns,client_updated_at
+                       FROM unmatched_files WHERE dirty=1 ORDER BY relative_path LIMIT ?""",
+                    (INVENTORY_SYNC_BATCH,),
+                ).fetchall()
+            if not rows:
+                return
+            reports = [{
+                "relative_path": row[0], "size_bytes": row[1], "sha256": row[2],
+                "state": row[3], "file_mtime_ns": row[4], "client_updated_at": row[5],
+            } for row in rows]
+            request_json(cfg, "POST", "/account/connections/inventory", body={
+                "generation": generation, "complete": False, "files": [], "unmatched_files": reports,
+            })
+            with self.lock:
+                self.db.executemany(
+                    "UPDATE unmatched_files SET dirty=0 WHERE relative_path=? AND client_updated_at=?",
+                    [(row[0], row[5]) for row in rows],
+                )
+                self.db.commit()
+
+    def _meta_set(self, values):
+        with self.lock:
+            self.db.executemany(
+                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                list(values.items()),
+            )
+            self.db.commit()
+
+    def summary(self):
+        with self.lock:
+            values = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
+        generation = values.get("generation", "")
+        if not generation:
+            return None
+        return {
+            "generation": generation,
+            "scan_started_at": values.get("scan_started_at") or None,
+            "scan_completed_at": values.get("scan_completed_at") or None,
+            "clips": int(values.get("clips", 0)),
+            "bytes": int(values.get("bytes", 0)),
+            "mismatches": int(values.get("mismatches", 0)),
+            "unmatched": int(values.get("unmatched", 0)),
+            "digest": values.get("digest", ""),
+        }
+
+    def _digest_and_counts(self):
+        digest = hashlib.sha256()
+        clips = total_bytes = mismatches = unmatched = 0
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT clip_id,relative_path,size_bytes,sha256,state FROM files ORDER BY clip_id"
+            )
+            for clip_id, path, size_bytes, sha256, state in rows:
+                digest.update(("%d\0%s\0%d\0%s\0%s\n" % (clip_id, path, size_bytes, sha256, state)).encode("utf-8"))
+                if state == "present":
+                    clips += 1
+                    total_bytes += size_bytes
+                elif state == "mismatch":
+                    mismatches += 1
+            for path, size_bytes, sha256, state in self.db.execute(
+                "SELECT relative_path,size_bytes,sha256,state FROM unmatched_files ORDER BY relative_path"
+            ):
+                digest.update(("unmatched\0%s\0%d\0%s\0%s\n" % (path, size_bytes, sha256, state)).encode("utf-8"))
+                if state == "present":
+                    unmatched += 1
+        return digest.hexdigest(), clips, total_bytes, mismatches, unmatched
+
+    def full_scan(self, cfg, stop_event):
+        started_at = utc_now_precise()
+        generation = "scan-%s-%s" % (time.strftime("%Y%m%dT%H%M%S", time.gmtime()), os.urandom(4).hex())
+        self._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
+        scanned = 0
+        known_paths = set()
+        for sidecar in cfg.output_dir.rglob("*.stoarama.json"):
+            if stop_event.is_set():
+                return
+            try:
+                clip = json.loads(sidecar.read_text(encoding="utf-8"))
+                relative = valid_relative_path(clip)
+                if str(relative) != str(clip.get("relative_path", "")):
+                    raise ValueError("sidecar path is not canonical")
+                path = cfg.output_dir / relative
+                if sidecar.resolve() != stitch_sidecar_path(path).resolve():
+                    raise ValueError("sidecar location does not match its clip path")
+                expected_size = int(clip["size_bytes"])
+                expected_sha = str(clip["sha256"]).lower()
+                if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
+                    raise ValueError("sidecar checksum is invalid")
+                known_paths.add(str(relative))
+                if path.exists():
+                    actual_size, actual_sha = sha256_file_throttled(path, cfg.inventory_hash_mbps, stop_event)
+                    state = "present" if actual_size == expected_size and actual_sha == expected_sha else "mismatch"
+                    stat = path.stat()
+                    verified_at = utc_now_precise() if state == "present" else None
+                    mtime_ns = stat.st_mtime_ns
+                else:
+                    state, verified_at, mtime_ns = "missing", None, 0
+                self._upsert(clip, state, verified_at, mtime_ns, generation)
+                scanned += 1
+                if scanned % INVENTORY_SYNC_BATCH == 0:
+                    self.sync_dirty(cfg, generation)
+                if cfg.inventory_scan_delay_ms:
+                    stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+            except Exception as exc:
+                log("WARN", "inventory skipped sidecar=%s: %s" % (sidecar, exc))
+        for path in cfg.output_dir.rglob("*"):
+            if stop_event.is_set():
+                return
+            try:
+                if (
+                    not path.is_file()
+                    or path.name.endswith(".stoarama.json")
+                    or re.fullmatch(r".+\.part-\d+", path.name)
+                    or re.fullmatch(r"\..+\.invalid-\d+-\d+", path.name)
+                ):
+                    continue
+                relative = str(path.relative_to(cfg.output_dir))
+                if relative in known_paths:
+                    continue
+                size_bytes, sha256 = sha256_file_throttled(path, cfg.inventory_hash_mbps, stop_event)
+                stat = path.stat()
+                updated_at = utc_now_precise()
+                with self.lock:
+                    self.db.execute(
+                        """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,client_updated_at,dirty)
+                           VALUES(?,?,?,'present',?,?,?,1)
+                           ON CONFLICT(relative_path) DO UPDATE SET size_bytes=excluded.size_bytes,sha256=excluded.sha256,
+                             state='present',file_mtime_ns=excluded.file_mtime_ns,seen_generation=excluded.seen_generation,
+                             client_updated_at=excluded.client_updated_at,dirty=1""",
+                        (relative, size_bytes, sha256, stat.st_mtime_ns, generation, updated_at),
+                    )
+                    self.db.commit()
+                scanned += 1
+                if scanned % INVENTORY_SYNC_BATCH == 0:
+                    self.sync_dirty(cfg, generation)
+                if cfg.inventory_scan_delay_ms:
+                    stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+            except Exception as exc:
+                log("WARN", "inventory skipped unmatched file=%s: %s" % (path, exc))
+        completed_at = utc_now_precise()
+        with self.lock:
+            self.db.execute(
+                """UPDATE files SET state='missing',verified_at=NULL,dirty=1,client_updated_at=?
+                   WHERE seen_generation<>? AND client_updated_at<=?""",
+                (completed_at, generation, started_at),
+            )
+            self.db.execute(
+                """UPDATE unmatched_files SET state='missing',dirty=1,client_updated_at=?
+                   WHERE seen_generation<>? AND client_updated_at<=?""",
+                (completed_at, generation, started_at),
+            )
+            self.db.commit()
+        self.sync_dirty(cfg, generation)
+        digest, clips, total_bytes, mismatches, unmatched = self._digest_and_counts()
+        request_json(cfg, "POST", "/account/connections/inventory", body={
+            "generation": generation, "scan_started_at": started_at,
+            "scan_completed_at": completed_at, "digest": digest, "complete": True, "files": [],
+        })
+        self._meta_set({
+            "generation": generation, "scan_started_at": started_at,
+            "scan_completed_at": completed_at, "digest": digest,
+            "clips": str(clips), "bytes": str(total_bytes), "mismatches": str(mismatches),
+            "unmatched": str(unmatched),
+        })
+        log("INFO", "inventory scan complete generation=%s clips=%d bytes=%d mismatches=%d unmatched=%d" % (generation, clips, total_bytes, mismatches, unmatched))
+
+
+def inventory_loop(cfg, inventory, stop_event):
+    # Let the main drain establish connectivity first; inventory is deliberately
+    # background work and never blocks incoming clip delivery.
+    if stop_event.wait(10):
+        return
+    while not stop_event.is_set():
+        try:
+            inventory.sync_dirty(cfg)
+            inventory.full_scan(cfg, stop_event)
+        except Exception as exc:
+            log("WARN", "inventory scan/sync failed: %s" % exc)
+        stop_event.wait(cfg.inventory_scan_interval_sec)
+
+
+class Runtime:
+    def __init__(self, cfg, inventory=None):
         progress = read_json(cfg.progress_file, {})
         if not progress and cfg.legacy_progress_file.exists():
             progress = read_json(cfg.legacy_progress_file, {})
@@ -237,6 +567,8 @@ class Runtime:
         self.previous_exit = self._previous_exit(cfg)
         self.heartbeat_succeeded = False
         self.list_succeeded = False
+        self.stable_marked = False
+        self.inventory = inventory
         self.batch = {
             "completed_at": None,
             "clips": 0,
@@ -321,6 +653,10 @@ class Runtime:
             }
         if outage:
             payload["last_outage"] = outage
+        if self.inventory is not None:
+            inventory = self.inventory.summary()
+            if inventory is not None:
+                payload["inventory"] = inventory
         return payload
 
 
@@ -379,6 +715,24 @@ def sha256_file(path):
     return size, digest.hexdigest()
 
 
+def sha256_file_throttled(path, megabytes_per_sec, stop_event):
+    digest = hashlib.sha256()
+    size = 0
+    target_bytes_per_sec = megabytes_per_sec * 1024 * 1024
+    with open(path, "rb") as source:
+        while True:
+            started = time.monotonic()
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            delay = len(chunk) / target_bytes_per_sec - (time.monotonic() - started)
+            if delay > 0 and stop_event.wait(delay):
+                raise InterruptedError("inventory scan stopped")
+    return size, digest.hexdigest()
+
+
 def verified_file(path, expected_bytes, expected_sha):
     if not path.exists():
         return False
@@ -421,6 +775,23 @@ def release_clip(cfg, recording_id, clip_id):
     except urllib.error.HTTPError as exc:
         if exc.code not in (404, 410):
             raise
+
+
+def release_clips(cfg, clips):
+    body = {"clips": [
+        {"recording_id": int(clip["recording_id"]), "clip_id": int(clip["clip_id"])}
+        for clip in clips
+    ]}
+    try:
+        request_json(cfg, "POST", "/account/clips/release", body=body)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        # Compatibility during a backend-first rolling deploy. The batch route is
+        # live before this client is promoted; this fallback can be removed after
+        # every installation has crossed that release.
+        for clip in clips:
+            release_clip(cfg, int(clip["recording_id"]), int(clip["clip_id"]))
 
 
 def stitch_sidecar_path(clip_path):
@@ -505,7 +876,7 @@ def process_clip(cfg, clip, release=True):
     return clip_id, expected_bytes, downloaded_bytes, retries
 
 
-def drain_page(cfg, runtime):
+def drain_page(cfg, runtime, inventory=None):
     page = request_json(
         cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
     )
@@ -533,25 +904,40 @@ def drain_page(cfg, runtime):
     retries = sum(result[3] for result in prepared) + sum(
         error.retries for _, _, error in results if isinstance(error, RetryExhausted)
     )
-    recording_by_clip = {int(clip["clip_id"]): int(clip["recording_id"]) for clip in clips}
-    for index, (clip_id, result, error) in enumerate(results):
+    clip_by_id = {int(clip["clip_id"]): clip for clip in clips}
+    prepared_ids = [clip_id for clip_id, _, error in results if error is None]
+    if inventory is not None and not cfg.dry_run:
+        # The durable local commit and bounded server sync happen before any
+        # release call. If either fails, the page stays server-retained.
+        for clip_id in prepared_ids:
+            inventory.record_verified(clip_by_id[clip_id])
+        inventory.sync_clip_ids(cfg, prepared_ids)
+    result_by_id = {clip_id: result for clip_id, result, error in results if error is None}
+    releasable = []
+    for clip_id, _, error in results:
         if error is not None:
             break
-        try:
-            if not cfg.dry_run:
-                _, release_retries = retry_transient(
-                    lambda: release_clip(cfg, recording_by_clip[clip_id], clip_id),
-                    clip_id,
-                    "release",
-                )
-                retries += release_retries
-        except Exception as exc:
-            if isinstance(exc, RetryExhausted):
-                retries += exc.retries
-            log("ERROR", "clip_id=%d release failed: %s" % (clip_id, exc))
-            results[index] = (clip_id, None, exc)
-            break
-        successes.append(result)
+        releasable.append(clip_by_id[clip_id])
+    try:
+        if releasable and not cfg.dry_run:
+            _, release_retries = retry_transient(
+                lambda: release_clips(cfg, releasable), int(releasable[0]["clip_id"]), "release-batch"
+            )
+            retries += release_retries
+    except Exception as exc:
+        if isinstance(exc, RetryExhausted):
+            retries += exc.retries
+        first_id = int(releasable[0]["clip_id"]) if releasable else 0
+        log("ERROR", "clip_id=%d release batch failed: %s" % (first_id, exc))
+        if releasable:
+            for index, (clip_id, _, error) in enumerate(results):
+                if clip_id == first_id and error is None:
+                    results[index] = (clip_id, None, exc)
+                    break
+        releasable = []
+    for clip in releasable:
+        clip_id = int(clip["clip_id"])
+        successes.append(result_by_id[clip_id])
         cursor = clip_id
     if successes:
         runtime.add_successes(cfg, cursor, successes)
@@ -645,7 +1031,7 @@ def stage_update(cfg):
 
 
 def update_loop(cfg, runtime, stop_event, update_ready):
-    while not stop_event.wait(UPDATE_INTERVAL_SEC):
+    while not stop_event.is_set():
         try:
             if stage_update(cfg):
                 runtime.set_phase(Phase.UPDATING)
@@ -653,6 +1039,7 @@ def update_loop(cfg, runtime, stop_event, update_ready):
                 return
         except Exception as exc:
             log("WARN", "self-update check failed: %s" % exc)
+        stop_event.wait(UPDATE_INTERVAL_SEC)
 
 
 def promote_candidate(cfg):
@@ -676,7 +1063,8 @@ def exec_candidate(cfg, runtime):
 def run(cfg):
     cfg.validate()
     lock_handle = acquire_lock(cfg)
-    runtime = Runtime(cfg)
+    inventory = Inventory(cfg)
+    runtime = Runtime(cfg, inventory)
     mark_runtime(cfg, runtime)
     stop_event = threading.Event()
     update_ready = threading.Event()
@@ -690,6 +1078,8 @@ def run(cfg):
     heartbeat.start()
     updater = threading.Thread(target=update_loop, args=(cfg, runtime, stop_event, update_ready), daemon=True)
     updater.start()
+    inventory_worker = threading.Thread(target=inventory_loop, args=(cfg, inventory, stop_event), daemon=True)
+    inventory_worker.start()
     try:
         while not stop_event.is_set():
             if not heartbeat.is_alive():
@@ -705,9 +1095,16 @@ def run(cfg):
                 stop_event.wait(cfg.poll_interval_sec)
                 continue
             try:
-                progress = drain_page(cfg, runtime)
-                if cfg.is_candidate and runtime.heartbeat_succeeded and runtime.list_succeeded:
-                    promote_candidate(cfg)
+                progress = drain_page(cfg, runtime, inventory)
+                if runtime.heartbeat_succeeded and runtime.list_succeeded and not runtime.stable_marked:
+                    if cfg.is_candidate:
+                        promote_candidate(cfg)
+                    # Bootstrap v1 rolls back only runtime states "running" and
+                    # "self_update". Once both control-plane probes pass, mark
+                    # this release stable so an ordinary container restart does
+                    # not resurrect the previous client indefinitely.
+                    mark_runtime(cfg, runtime, "healthy")
+                    runtime.stable_marked = True
                 if update_ready.is_set():
                     exec_candidate(cfg, runtime)
                 runtime.set_phase(Phase.IDLE)
@@ -720,7 +1117,12 @@ def run(cfg):
     finally:
         stop_event.set()
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
+        inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
         mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
+        if inventory_worker.is_alive():
+            log("WARN", "inventory worker still running at shutdown; leaving database open")
+        else:
+            inventory.close()
         lock_handle.close()
     return 0
 
