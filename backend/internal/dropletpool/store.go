@@ -199,8 +199,55 @@ func (s *Store) SetDropletID(ctx context.Context, id, doDropletID int64, ip stri
 }
 
 // MarkActive flips a provisioning droplet to active and clears idle tracking.
-func (s *Store) MarkActive(ctx context.Context, id int64) error {
-	return s.setState(ctx, id, "active", `idle_since=NULL`)
+// The conditional transition prevents a stale controller snapshot from
+// resurrecting a row that another reconciliation path already retired.
+func (s *Store) MarkActive(ctx context.Context, id int64) (bool, error) {
+	result, err := s.pool.Exec(ctx, `
+		UPDATE recorder_droplets
+		SET state='active', idle_since=NULL, updated_at=now()
+		WHERE id=$1 AND state='provisioning'
+	`, id)
+	if err != nil {
+		return false, fmt.Errorf("mark active: %w", err)
+	}
+	return result.RowsAffected() == 1, nil
+}
+
+// BeginDestroyIfIdle serializes with the cloud lease path, which locks the same
+// recorder_droplets row before assigning work. It atomically proves there is no
+// live lease and moves the worker out of lease-eligible states before any
+// provider deletion or credential revocation can occur.
+func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var name, state string
+	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
+		return false, err
+	}
+	if state == "destroying" {
+		return true, tx.Commit(ctx)
+	}
+	if state != "provisioning" && state != "active" && state != "draining" {
+		return false, nil
+	}
+	var busy bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM recording_jobs WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now())`, name).Scan(&busy); err != nil {
+		return false, err
+	}
+	if busy {
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='destroying', updated_at=now() WHERE id=$1`, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // MarkDraining flips an active droplet to draining and stamps drain_started_at.

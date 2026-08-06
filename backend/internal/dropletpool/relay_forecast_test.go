@@ -78,6 +78,121 @@ func TestValidateLiveBindings(t *testing.T) {
 	}
 }
 
+func TestReconcileOverdueProvisioningLeaseSafety(t *testing.T) {
+	tests := []struct {
+		name         string
+		provider     bool
+		leased       bool
+		fresh        bool
+		initialState string
+		wantState    string
+		wantDeleted  int
+		wantRevoked  bool
+	}{
+		{name: "present leased fresh promotes", provider: true, leased: true, fresh: true, wantState: "active"},
+		{name: "missing leased stays provisioning", leased: true, fresh: true, wantState: "provisioning"},
+		{name: "present leased stale stays provisioning", provider: true, leased: true, wantState: "provisioning"},
+		{name: "present idle retires", provider: true, fresh: true, wantState: "failed", wantDeleted: 1, wantRevoked: true},
+		{name: "missing idle retires", fresh: true, wantState: "destroyed", wantRevoked: true},
+		{name: "present destroying resumes", provider: true, fresh: true, initialState: "destroying", wantState: "destroyed", wantDeleted: 1, wantRevoked: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, cleanup := testDropletPoolDB(t)
+			defer cleanup()
+
+			ctx := context.Background()
+			now := time.Now().UTC()
+			rowID, nodeID := insertProvisioningReconcileFixture(t, pool, now, tc.leased, tc.fresh)
+			if tc.initialState != "" {
+				if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET state=$2 WHERE id=$1`, rowID, tc.initialState); err != nil {
+					t.Fatalf("set initial state: %v", err)
+				}
+			}
+			provider := &fakeDOClient{}
+			if tc.provider {
+				provider.fleet = []DODroplet{{ID: 7001, Name: "stoarama-rec-lease-safety", Status: "active", CreatedAt: now.Add(-time.Hour)}}
+			}
+			controller := NewController(pool, provider, Config{ProvisionTimeout: 10 * time.Minute, HeartbeatSec: 30})
+			if err := controller.reconcile(ctx, now); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+
+			var state string
+			if err := pool.QueryRow(ctx, `SELECT state FROM recorder_droplets WHERE id=$1`, rowID).Scan(&state); err != nil {
+				t.Fatalf("read droplet state: %v", err)
+			}
+			if state != tc.wantState {
+				t.Fatalf("state=%q want %q", state, tc.wantState)
+			}
+			if len(provider.deleted) != tc.wantDeleted {
+				t.Fatalf("provider deletes=%v want count %d", provider.deleted, tc.wantDeleted)
+			}
+			var revoked bool
+			if err := pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM node_tokens WHERE node_id=$1`, nodeID).Scan(&revoked); err != nil {
+				t.Fatalf("read token state: %v", err)
+			}
+			if revoked != tc.wantRevoked {
+				t.Fatalf("token revoked=%t want %t", revoked, tc.wantRevoked)
+			}
+		})
+	}
+}
+
+func insertProvisioningReconcileFixture(t *testing.T, pool *pgxpool.Pool, now time.Time, leased, fresh bool) (int64, int64) {
+	t.Helper()
+	ctx := context.Background()
+	accountID := insertForecastAccount(t, pool)
+	destID := insertForecastDestination(t, pool, accountID)
+	var recordingID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recordings (
+		  account_id, storage_destination_id, name, stream_url, source_kind,
+		  mode, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at,
+		  start_at, capture_via
+		)
+		VALUES ($1, $2, 'lease-safety', 'https://example.com/live.m3u8', 'hls',
+		        'sampled', '* * * * *', 'UTC', 30, 'active', $3, $3, 'cloud')
+		RETURNING id
+	`, accountID, destID, now).Scan(&recordingID); err != nil {
+		t.Fatalf("insert recording: %v", err)
+	}
+	var nodeID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO nodes (account_id, node_type, display_name, status)
+		VALUES ($1, 'local_recorder', 'stoarama-rec-lease-safety', 'active') RETURNING id
+	`, accountID).Scan(&nodeID); err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO node_tokens (node_id, key_prefix, secret_hash) VALUES ($1, 'lease', 'hash')`, nodeID); err != nil {
+		t.Fatalf("insert token: %v", err)
+	}
+	lastSeen := now.Add(-time.Hour)
+	if fresh {
+		lastSeen = now.Add(-time.Minute)
+	}
+	var rowID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recorder_droplets
+		  (name, node_id, do_droplet_id, region, size, capacity, state, last_seen_at, created_at)
+		VALUES ('stoarama-rec-lease-safety', $1, 7001, 'nyc3', 's-1vcpu-1gb', 1, 'provisioning', $2, $3)
+		RETURNING id
+	`, nodeID, lastSeen, now.Add(-time.Hour)).Scan(&rowID); err != nil {
+		t.Fatalf("insert droplet: %v", err)
+	}
+	if leased {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO recording_jobs
+			  (recording_id, fire_at, scheduled_for, clip_duration_sec, status, lease_owner, lease_expires_at, idempotency_key)
+			VALUES ($1, $2, $2, 30, 'leased', 'stoarama-rec-lease-safety', $3, $4)
+		`, recordingID, now, now.Add(time.Hour), fmt.Sprintf("lease-safety:%d", rowID)); err != nil {
+			t.Fatalf("insert lease: %v", err)
+		}
+	}
+	return rowID, nodeID
+}
+
 func testDropletPoolDB(t *testing.T) (*pgxpool.Pool, func()) {
 	t.Helper()
 

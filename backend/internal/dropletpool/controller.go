@@ -295,6 +295,10 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 		return err
 	}
 	plan := ReconcileOrphans(fleet, liveRows, now, c.cfg.ProvisionTimeout)
+	presentDropletIDs := make(map[int64]struct{}, len(fleet))
+	for _, d := range fleet {
+		presentDropletIDs[d.ID] = struct{}{}
+	}
 
 	// Adopt: bind a DO id to an existing write-ahead row that lost its id, or
 	// (rarely) create a row for a prefixed droplet with no row. We only bind ids
@@ -328,7 +332,33 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 	// Reconcile DB rows whose DO droplet vanished: revoke their token and mark
 	// destroyed so they stop counting against the cap.
 	for _, r := range plan.MissingFromDO {
+		retired, retireErr := c.store.BeginDestroyIfIdle(ctx, r.ID)
+		if retireErr != nil {
+			log.Printf("droplet pool: CRITICAL cannot atomically verify idle before retiring missing droplet id=%d name=%s; teardown skipped: %v", r.ID, r.Name, retireErr)
+			continue
+		}
+		if !retired {
+			log.Printf("droplet pool: missing droplet id=%d name=%s is leased or no longer retireable; teardown skipped", r.ID, r.Name)
+			continue
+		}
 		log.Printf("droplet pool: DB droplet id=%d name=%s missing from DO; reconciling to destroyed", r.ID, r.Name)
+		c.revokeAndDestroyRow(ctx, r.ID)
+	}
+
+	// A crash or provider error after the atomic idle->destroying transition must
+	// not strand a billable droplet. Resume that durable state idempotently on
+	// every reconcile tick.
+	for _, r := range liveRows {
+		if r.State != "destroying" || r.DODropletID == nil {
+			continue
+		}
+		if _, present := presentDropletIDs[*r.DODropletID]; !present {
+			continue // MissingFromDO finalized it above.
+		}
+		if err := c.do.DeleteDroplet(ctx, *r.DODropletID); err != nil {
+			log.Printf("droplet pool: resume destroying droplet id=%d name=%s: %v", r.ID, r.Name, err)
+			continue
+		}
 		c.revokeAndDestroyRow(ctx, r.ID)
 	}
 
@@ -340,6 +370,44 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 			continue
 		}
 		if now.Sub(r.CreatedAt) < c.cfg.ProvisionTimeout {
+			continue
+		}
+		busy, busyErr := c.store.HasInflightJob(ctx, r.Name)
+		if busyErr != nil {
+			// Lease truth is required before teardown. A DB read failure must
+			// retain the worker and its credential, then retry next tick.
+			log.Printf("droplet pool: CRITICAL cannot verify leases for overdue provisioning droplet id=%d name=%s; teardown skipped: %v", r.ID, r.Name, busyErr)
+			continue
+		}
+		if busy {
+			// A live lease proves the worker is already doing production work,
+			// even when a build mismatch kept the rollout readiness gate from
+			// promoting its pool row. Never revoke or delete underneath it.
+			providerPresent := false
+			if r.DODropletID != nil {
+				_, providerPresent = presentDropletIDs[*r.DODropletID]
+			}
+			if providerPresent && r.LastSeenAt != nil && now.Sub(*r.LastSeenAt) <= c.workerReadyWindow() {
+				promoted, err := c.store.MarkActive(ctx, r.ID)
+				if err != nil {
+					log.Printf("droplet pool: CRITICAL preserve leased provisioning droplet id=%d name=%s but promote active failed: %v", r.ID, r.Name, err)
+					continue
+				}
+				if promoted {
+					log.Printf("droplet pool: preserving leased provisioning droplet id=%d name=%s as active; ordinary stale-build drain will wait for idle", r.ID, r.Name)
+				}
+			} else {
+				log.Printf("droplet pool: CRITICAL overdue provisioning droplet id=%d name=%s holds a live lease but provider identity or heartbeat is unavailable; teardown skipped", r.ID, r.Name)
+			}
+			continue
+		}
+		retired, retireErr := c.store.BeginDestroyIfIdle(ctx, r.ID)
+		if retireErr != nil {
+			log.Printf("droplet pool: CRITICAL cannot atomically verify idle before destroying overdue provisioning droplet id=%d name=%s; teardown skipped: %v", r.ID, r.Name, retireErr)
+			continue
+		}
+		if !retired {
+			log.Printf("droplet pool: overdue provisioning droplet id=%d name=%s became leased or changed state; teardown skipped", r.ID, r.Name)
 			continue
 		}
 		log.Printf("droplet pool: provisioning droplet id=%d name=%s stuck past timeout; failing + destroying", r.ID, r.Name)
@@ -414,7 +482,7 @@ func (c *Controller) promoteActive(ctx context.Context, now time.Time, fleet []D
 				_ = c.store.SetDropletID(ctx, r.ID, *r.DODropletID, d.IP)
 			}
 		}
-		if err := c.store.MarkActive(ctx, r.ID); err != nil {
+		if _, err := c.store.MarkActive(ctx, r.ID); err != nil {
 			log.Printf("droplet pool: promote active %s: %v", r.Name, err)
 			continue
 		}
