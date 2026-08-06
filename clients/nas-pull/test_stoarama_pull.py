@@ -32,12 +32,16 @@ class NASPullTests(unittest.TestCase):
             legacy_progress_file=state / "cursor.json",
             runtime_file=state / "runtime.json",
             outage_file=state / "outage.json",
+            inventory_file=state / "inventory.sqlite3",
             current_file=state / "stoarama_pull.py",
             candidate_file=state / "stoarama_pull.candidate.py",
             previous_file=state / "stoarama_pull.previous.py",
             lock_file=state / "client.lock",
             update_manifest_url="https://stoarama.test/nas/download/latest.json",
             download_workers=12,
+            inventory_scan_interval_sec=86400,
+            inventory_scan_delay_ms=0,
+            inventory_hash_mbps=1000,
             dry_run=dry_run,
             is_candidate=False,
         )
@@ -55,6 +59,57 @@ class NASPullTests(unittest.TestCase):
             pull.atomic_write(path, b"two")
             self.assertEqual(path.read_bytes(), b"two")
             self.assertFalse(path.with_name("progress.json.tmp").exists())
+
+    def test_inventory_is_durable_and_syncs_checksum_proof(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 7, "recording_id": 13, "relative_path": "recordings/clip.mp4",
+                "size_bytes": 3,
+                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir()
+            path.write_bytes(b"abc")
+            inventory = pull.Inventory(cfg)
+            inventory.record_verified(clip)
+            calls = []
+            with mock.patch.object(pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}):
+                inventory.sync_clip_ids(cfg, [7])
+            self.assertEqual(len(calls), 1)
+            report = calls[0]["files"][0]
+            self.assertEqual(report["clip_id"], 7)
+            self.assertEqual(report["state"], "present")
+            self.assertEqual(report["sha256"], clip["sha256"])
+            self.assertIsNotNone(report["verified_at"])
+            inventory.close()
+
+            reopened = pull.Inventory(cfg)
+            self.assertEqual(reopened._rows("clip_id=7")[0][2], clip["relative_path"])
+            reopened.close()
+
+    def test_full_inventory_scan_reports_complete_digest_and_mismatch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 8, "recording_id": 13, "relative_path": "recordings/clip.mp4",
+                "size_bytes": 3, "sha256": "a" * 64,
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir()
+            path.write_bytes(b"abc")
+            pull.write_stitch_sidecar(path, clip)
+            (cfg.output_dir / "orphan.mp4").write_bytes(b"orphan")
+            inventory = pull.Inventory(cfg)
+            calls = []
+            with mock.patch.object(pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}):
+                inventory.full_scan(cfg, threading.Event())
+            complete = [body for body in calls if body.get("complete")]
+            self.assertEqual(len(complete), 1)
+            self.assertEqual(len(complete[0]["digest"]), 64)
+            self.assertEqual(inventory.summary()["mismatches"], 1)
+            self.assertEqual(inventory.summary()["unmatched"], 1)
+            inventory.close()
 
     def test_storage_must_be_real_mounts(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -179,7 +234,7 @@ class NASPullTests(unittest.TestCase):
             clip = {"clip_id": 1, "recording_id": 3}
             with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
                 pull, "process_clip", return_value=(1, 10, 10, 0)
-            ), mock.patch.object(pull, "release_clip", side_effect=RuntimeError("release denied")):
+            ), mock.patch.object(pull, "release_clips", side_effect=RuntimeError("release denied")):
                 self.assertFalse(pull.drain_page(cfg, runtime))
             self.assertEqual(runtime.cursor_id, 0)
             self.assertEqual(runtime.last_error, "1 of 1 clips failed; first clip 1: release denied")
@@ -207,6 +262,18 @@ class NASPullTests(unittest.TestCase):
             # Loop kept beating through both the transport error and the failed
             # bookkeeping write, instead of dying on the first one.
             self.assertGreaterEqual(len(beats), 3)
+
+    def test_update_check_runs_immediately_on_startup(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            stop_event = threading.Event()
+            ready = threading.Event()
+            with mock.patch.object(pull, "stage_update", return_value="new-version") as stage:
+                pull.update_loop(cfg, runtime, stop_event, ready)
+            stage.assert_called_once_with(cfg)
+            self.assertTrue(ready.is_set())
+            self.assertEqual(runtime.phase, pull.Phase.UPDATING)
 
     def test_exhausted_retries_are_reported_for_download_and_release(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -241,6 +308,14 @@ class NASPullTests(unittest.TestCase):
         with mock.patch.object(pull.time, "sleep"), self.assertRaises(pull.RetryExhausted) as caught:
             pull.retry_transient(exhausted, 7, "download")
         self.assertEqual(caught.exception.retries, 2)
+
+    def test_release_page_is_one_batch_request(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clips = [{"clip_id": 1, "recording_id": 3}, {"clip_id": 2, "recording_id": 3}]
+            with mock.patch.object(pull, "request_json", return_value={}) as request:
+                pull.release_clips(cfg, clips)
+            request.assert_called_once_with(cfg, "POST", "/account/clips/release", body={"clips": clips})
 
     def test_manifest_validation_and_transport_classification(self):
         self.assertEqual(

@@ -32,7 +32,7 @@ var (
 //   - GET  /api/v1/account/recordings/{id}/clips/{clipId}/download      (presign)
 //   - POST /api/v1/account/recordings/{id}/clips/{clipId}/release       (release one clip)
 //
-// The pull key can RELEASE a clip (detach it from the org, keeping the R2 object)
+// The pull key can report its inventory and RELEASE a clip (detach it from the org, keeping the R2 object)
 // but can NOT hard-delete: the old DELETE .../clips/{clipId} allowance is removed,
 // so a leaked NAS key can never destroy recorded content.
 func pullPathAllowed(method, path string) bool {
@@ -40,6 +40,10 @@ func pullPathAllowed(method, path string) bool {
 	case method == http.MethodGet && path == "/api/v1/account/clips":
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/heartbeat":
+		return true
+	case method == http.MethodPost && path == "/api/v1/account/connections/inventory":
+		return true
+	case method == http.MethodPost && path == "/api/v1/account/clips/release":
 		return true
 	case method == http.MethodGet && pullDownloadPathRe.MatchString(path):
 		return true
@@ -128,6 +132,16 @@ type connectionListItem struct {
 	NASDownloadWorkers     int              `json:"nas_download_workers"`
 	NASBatchRetries        int              `json:"nas_batch_retries"`
 	NASBatchFailures       int              `json:"nas_batch_failures"`
+	InventoryMode          string           `json:"inventory_mode"`
+	InventoryGeneration    string           `json:"inventory_generation"`
+	InventoryScanStartedAt *time.Time       `json:"inventory_scan_started_at"`
+	InventoryScanComplete  *time.Time       `json:"inventory_scan_completed_at"`
+	InventoryReportedAt    *time.Time       `json:"inventory_reported_at"`
+	InventoryClips         int64            `json:"inventory_clips"`
+	InventoryBytes         int64            `json:"inventory_bytes"`
+	InventoryMismatches    int64            `json:"inventory_mismatches"`
+	InventoryUnmatched     int64            `json:"inventory_unmatched"`
+	InventoryDigest        string           `json:"inventory_digest"`
 	PendingClips           int64            `json:"pending_clips"`
 	PendingBytes           int64            `json:"pending_bytes"`
 	OldestPendingAt        *time.Time       `json:"oldest_pending_at"`
@@ -177,6 +191,7 @@ func connectionComposeSnippet(apiBase, token string, connectionID int64, pollInt
       STOARAMA_STATE_DIR: "/state"
       STOARAMA_POLL_INTERVAL_SEC: "%d"
       STOARAMA_DOWNLOAD_WORKERS: "12"
+      STOARAMA_INVENTORY_HASH_MBPS: "20"
       STOARAMA_UPDATE_MANIFEST_URL: "https://stoarama.com/nas/download/latest.json"
       STOARAMA_DRY_RUN: "0"
       PYTHONUNBUFFERED: "1"
@@ -291,7 +306,10 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		       last_outage_started_at, last_outage_recovered_at,
 		       last_outage_failure_count, nas_batch_completed_at, nas_batch_clips,
 		       nas_batch_bytes, nas_batch_duration_ms, nas_download_workers,
-		       nas_batch_retries, nas_batch_failures, conn.created_at,
+		       nas_batch_retries, nas_batch_failures, inventory_mode,
+		       inventory_generation, inventory_scan_started_at, inventory_scan_completed_at,
+		       inventory_reported_at, inventory_clips, inventory_bytes,
+		       inventory_mismatches, inventory_unmatched, inventory_digest, conn.created_at,
 		       pending.clips, pending.bytes, pending.oldest_at
 		FROM connections conn
 		`+connectionPendingLateralSQL+`
@@ -333,6 +351,16 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			downloadWorkers int
 			batchRetries    int
 			batchFailures   int
+			inventoryMode   string
+			inventoryGen    string
+			inventoryStart  *time.Time
+			inventoryDone   *time.Time
+			inventoryReport *time.Time
+			inventoryClips  int64
+			inventoryBytes  int64
+			inventoryBad    int64
+			inventoryOther  int64
+			inventoryDigest string
 			createdAt       time.Time
 			pendingClips    int64
 			pendingBytes    int64
@@ -343,7 +371,9 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			&previousExit, &lastSuccessAt, &lastError, &lastErrorAt, &outageClass,
 			&outageStartedAt, &outageRecovered, &outageFailures, &batchCompleted,
 			&batchClips, &batchBytes, &batchDurationMS, &downloadWorkers,
-			&batchRetries, &batchFailures, &createdAt,
+			&batchRetries, &batchFailures, &inventoryMode, &inventoryGen,
+			&inventoryStart, &inventoryDone, &inventoryReport, &inventoryClips,
+			&inventoryBytes, &inventoryBad, &inventoryOther, &inventoryDigest, &createdAt,
 			&pendingClips, &pendingBytes, &oldestPendingAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan connection: %v", err))
 			return
@@ -389,6 +419,16 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			NASDownloadWorkers:     downloadWorkers,
 			NASBatchRetries:        batchRetries,
 			NASBatchFailures:       batchFailures,
+			InventoryMode:          inventoryMode,
+			InventoryGeneration:    inventoryGen,
+			InventoryScanStartedAt: inventoryStart,
+			InventoryScanComplete:  inventoryDone,
+			InventoryReportedAt:    inventoryReport,
+			InventoryClips:         inventoryClips,
+			InventoryBytes:         inventoryBytes,
+			InventoryMismatches:    inventoryBad,
+			InventoryUnmatched:     inventoryOther,
+			InventoryDigest:        inventoryDigest,
 			PendingClips:           pendingClips,
 			PendingBytes:           pendingBytes,
 			OldestPendingAt:        oldestPendingAt,
@@ -544,6 +584,18 @@ type connectionHeartbeatRequest struct {
 	ClientLastErrorAt  *time.Time                 `json:"client_last_error_at"`
 	LastOutage         *connectionHeartbeatOutage `json:"last_outage"`
 	LastBatch          connectionHeartbeatBatch   `json:"last_batch"`
+	Inventory          *connectionInventoryStatus `json:"inventory,omitempty"`
+}
+
+type connectionInventoryStatus struct {
+	Generation      string     `json:"generation"`
+	ScanStartedAt   *time.Time `json:"scan_started_at"`
+	ScanCompletedAt *time.Time `json:"scan_completed_at"`
+	Clips           int64      `json:"clips"`
+	Bytes           int64      `json:"bytes"`
+	Mismatches      int64      `json:"mismatches"`
+	Unmatched       int64      `json:"unmatched"`
+	Digest          string     `json:"digest"`
 }
 
 type connectionHeartbeatBatch struct {
@@ -583,6 +635,19 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 	}
 	if batch.CompletedAt != nil && batch.CompletedAt.After(time.Now().Add(connectionHeartbeatFutureSkew)) {
 		return errors.New("completed NAS batch telemetry is too far in the future")
+	}
+	if inv := req.Inventory; inv != nil {
+		if inv.Generation == "" || len(inv.Generation) > nasInventoryMaxGeneration || !relayArtifactName.MatchString(inv.Generation) ||
+			inv.Clips < 0 || inv.Bytes < 0 || inv.Mismatches < 0 || inv.Unmatched < 0 {
+			return errors.New("invalid NAS inventory summary")
+		}
+		if inv.ScanCompletedAt != nil {
+			if inv.ScanStartedAt == nil || inv.ScanCompletedAt.Before(*inv.ScanStartedAt) ||
+				inv.ScanCompletedAt.After(time.Now().Add(connectionHeartbeatFutureSkew)) ||
+				len(inv.Digest) != 64 || !lowerHex(inv.Digest) {
+				return errors.New("invalid completed NAS inventory summary")
+			}
+		}
 	}
 	if req.ClientVersion == "" {
 		return nil // Backward compatibility for the old NAS client during rollout.
@@ -679,6 +744,21 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
+	}
+	if inv := req.Inventory; inv != nil {
+		_, err := s.pool.Exec(r.Context(), `
+			UPDATE connections SET inventory_reported_at=now(),
+				inventory_generation=$1, inventory_scan_started_at=$2,
+				inventory_scan_completed_at=CASE WHEN $3::timestamptz IS NOT NULL THEN $3::timestamptz ELSE inventory_scan_completed_at END,
+				inventory_clips=$4, inventory_bytes=$5, inventory_mismatches=$6,
+				inventory_unmatched=$7, inventory_digest=CASE WHEN $8<>'' THEN $8 ELSE inventory_digest END,
+				updated_at=now() WHERE api_key_id=$9 AND account_id=$10
+		`, inv.Generation, inv.ScanStartedAt, inv.ScanCompletedAt, inv.Clips, inv.Bytes,
+			inv.Mismatches, inv.Unmatched, inv.Digest, *principal.APIKeyID, principal.AccountID)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("inventory heartbeat: %v", err))
+			return
+		}
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

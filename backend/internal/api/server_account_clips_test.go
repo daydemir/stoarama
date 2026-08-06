@@ -399,6 +399,8 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
 			kind TEXT NOT NULL,
+			api_key_id BIGINT,
+			inventory_mode TEXT NOT NULL DEFAULT 'observe',
 			last_cursor_id BIGINT NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE recordings (
@@ -429,6 +431,17 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			recording_job_id BIGINT,
 			capture_lease_token UUID,
 			capture_sequence BIGINT
+		)`,
+		`CREATE TABLE nas_inventory_files (
+			connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+			clip_id BIGINT NOT NULL,
+			recording_id BIGINT NOT NULL,
+			relative_path TEXT NOT NULL,
+			size_bytes BIGINT NOT NULL,
+			sha256 TEXT NOT NULL,
+			state TEXT NOT NULL,
+			verified_at TIMESTAMPTZ,
+			PRIMARY KEY(connection_id,clip_id)
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

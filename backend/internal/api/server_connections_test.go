@@ -25,9 +25,11 @@ func TestPullPathAllowed(t *testing.T) {
 		path   string
 		want   bool
 	}{
-		// The 4 pull endpoints: list + heartbeat + download + release.
+		// The pull endpoints: list + heartbeat + inventory + download + release.
 		{http.MethodGet, "/api/v1/account/clips", true},
 		{http.MethodPost, "/api/v1/account/connections/heartbeat", true},
+		{http.MethodPost, "/api/v1/account/connections/inventory", true},
+		{http.MethodPost, "/api/v1/account/clips/release", true},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 
@@ -86,12 +88,14 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 	keyID := int64(99)
 	pull := accountPrincipal{AccountID: 7, AuthType: "api_key", APIKeyID: &keyID, KeyScopes: []string{accountScopePull}}
 
-	// 200 on all 4 pull endpoints.
+	// 200 on all pull endpoints.
 	pullPaths := []struct {
 		method, path string
 	}{
 		{http.MethodGet, "/api/v1/account/clips"},
 		{http.MethodPost, "/api/v1/account/connections/heartbeat"},
+		{http.MethodPost, "/api/v1/account/connections/inventory"},
+		{http.MethodPost, "/api/v1/account/clips/release"},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download"},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release"},
 	}
@@ -396,6 +400,11 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 			StartedAt:    &now,
 			FailureCount: 3,
 		},
+		Inventory: &connectionInventoryStatus{
+			Generation: "scan-20260806-abcd1234", ScanStartedAt: &now,
+			ScanCompletedAt: &now, Clips: 100, Bytes: 2048,
+			Digest: strings.Repeat("a", 64),
+		},
 	}
 	if err := validateConnectionHeartbeat(valid); err != nil {
 		t.Fatalf("valid heartbeat rejected: %v", err)
@@ -423,6 +432,8 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{Workers: 33}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &future, DurationMS: 1, Workers: 1}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "bad/generation"}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanCompletedAt: &now}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {

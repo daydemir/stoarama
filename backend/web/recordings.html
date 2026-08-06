@@ -272,6 +272,11 @@
        Delete button: accent border + accent text, not plain dark text. */
     .clip-row-actions button.secondary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
     .clip-row-actions button.secondary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+    details.action-menu { position: relative; display: inline-block; }
+    details.action-menu > summary { list-style: none; width: 30px; height: 28px; display: grid; place-items: center; border: 1px solid var(--muted); border-radius: 8px; cursor: pointer; font-size: 18px; line-height: 1; }
+    details.action-menu > summary::-webkit-details-marker { display: none; }
+    .action-menu-pop { position: absolute; z-index: 30; right: 0; top: 33px; min-width: 190px; display: grid; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: 0 18px 45px rgba(0,0,0,.35); }
+    .action-menu-pop button { width: 100% !important; text-align: left; min-height: 32px; }
     .clip-xfer-cell { padding: 0 8px 6px !important; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
     .clip-bulk { margin: 12px 0 8px; }
     .clip-bulk button { width: auto; min-width: 0; min-height: 28px; padding: 4px 10px; font-size: 12px; }
@@ -3154,7 +3159,7 @@
         if (rs && rs.tone !== 'ok') warning = `<div class="cell-sub cell-warning">${rs.text}</div>`;
       }
       let action = !sharedReadOnly && status === 'active'
-        ? `<button type="button" class="secondary" data-pause="${id}">Pause</button>`
+        ? `<details class="action-menu"><summary aria-label="Recording actions">⋯</summary><div class="action-menu-pop"><button type="button" class="danger" data-pause="${id}">Pause recording…</button></div></details>`
         : (!sharedReadOnly && status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}">Resume</button>` : '');
       action += `<a class="btn-link secondary" href="${recordingsPagePath}/${id}">View</a>`;
       const localTime = localTimeLabel(timezone);
@@ -3404,7 +3409,7 @@
           + `<button type="button" class="secondary" data-clipview="${clipRecId}:${cid}">View</button>`
           + `<button type="button" class="secondary" data-clipdownload="${clipRecId}:${cid}">Download</button>`
           + transferBtn
-          + (sharedReadOnly ? '' : `<button type="button" class="danger" data-clipdelete="${clipRecId}:${cid}">Delete</button>`)
+          + (sharedReadOnly ? '' : `<details class="action-menu"><summary aria-label="Clip actions">⋯</summary><div class="action-menu-pop"><button type="button" class="danger" data-clipdelete="${clipRecId}:${cid}">Remove clip…</button></div></details>`)
           + `</div>`;
       const fps = (c.actual_fps != null && Number(c.actual_fps) > 0) ? escapeHTML(formatFps(c.actual_fps)) : '--';
       const sourceCell = showSource
@@ -3448,7 +3453,7 @@
       const summary = `<div class="clip-summary"><b>${total}</b> clip${total === 1 ? '' : 's'}${shownNote} &middot; ${escapeHTML(firstWhen)} → ${escapeHTML(lastWhen)}</div>`;
       const liveCount = items.filter(clipIsLive).length;
       const bulk = !sharedReadOnly && liveCount > 0
-        ? `<div class="clip-bulk"><button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button></div>`
+        ? `<div class="clip-bulk"><details class="action-menu"><summary aria-label="Bulk clip actions">⋯</summary><div class="action-menu-pop"><button type="button" class="danger" data-clipsdeleteall="${recId}">Remove all clips…</button></div></details></div>`
         : '';
       const rows = items.map((c) => clipRowHTML(c, recId)).join('');
       const liveSources = [...new Set(items.filter(clipIsLive).map((c) => Number(c.storage_destination_id)))];
@@ -3818,7 +3823,7 @@
       const id = Number(rec.id);
       let actions = '';
       if (status === 'active') {
-        actions = `<button type="button" class="primary" data-recpause="${id}">Pause</button>`;
+        actions = `<details class="action-menu"><summary aria-label="Recording actions">⋯</summary><div class="action-menu-pop"><button type="button" class="danger" data-recpause="${id}">Pause recording…</button></div></details>`;
       } else if (status === 'paused') {
         actions = `<button type="button" class="primary" data-recresume="${id}">Resume</button>`;
       }
@@ -3880,6 +3885,7 @@
     }
 
     async function mutateRecordingDetail(id, action) {
+      if (action === 'pause' && !window.confirm('Pause this recording? New clip capture stops until it is resumed. Existing clips are retained.')) return;
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(String(id))}/${action}`, { method: 'POST' });
         await reloadClipPageRecording();
@@ -4141,7 +4147,7 @@
         <div class="clip-page-actions">
           ${liveCount > 0 ? `<button type="button" class="secondary" data-clipzip="${recId}">Download ZIP</button>` : ''}
           <button type="button" class="secondary" data-clipscsv="${recId}">Download CSV</button>
-          ${liveCount > 0 ? `<button type="button" class="danger" data-clipsdeleteall="${recId}">Delete all clips</button>` : ''}
+          ${liveCount > 0 ? `<details class="action-menu"><summary aria-label="Bulk clip actions">⋯</summary><div class="action-menu-pop"><button type="button" class="danger" data-clipsdeleteall="${recId}">Remove all clips…</button></div></details>` : ''}
           <span class="clip-pager-label" data-zipstatus></span>
         </div>`;
 
@@ -4476,7 +4482,7 @@
 
     async function deleteClip(panel, ref) {
       const [recId, clipId] = String(ref || '').split(':');
-      if (!window.confirm('Delete this clip from your bucket? This cannot be undone.')) return;
+      if (!window.confirm('Remove this clip from the Stoarama view and billing? The managed cloud object is retained as a recovery backup.')) return;
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips/${encodeURIComponent(clipId)}`, { method: 'DELETE' });
         await reloadClipPanel(panel, recId);
@@ -4486,7 +4492,8 @@
     }
 
     async function deleteAllClips(panel, recId) {
-      if (!window.confirm('Delete ALL clips for this recording from your bucket? This cannot be undone.')) return;
+      const typed = window.prompt('Remove ALL clips for this recording from the org view and billing? Managed cloud objects remain retained as recovery backups. Type REMOVE ALL to continue.');
+      if (typed !== 'REMOVE ALL') return;
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/clips`, { method: 'DELETE' });
         await reloadClipPanel(panel, recId);
@@ -4497,6 +4504,7 @@
 
     async function mutateRecording(id, action) {
       const rid = String(id || '').trim();
+      if (action === 'pause' && !window.confirm('Pause this recording? New clip capture stops until it is resumed. Existing clips are retained.')) return;
       try {
         await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(rid)}/${action}`, { method: 'POST' });
         await refreshRecordings();

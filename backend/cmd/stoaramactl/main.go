@@ -97,6 +97,8 @@ func main() {
 		runRelayConnectivity(ctx, cfg, os.Args[2:])
 	case "recordings":
 		runRecordings(ctx, cfg, os.Args[2:])
+	case "nas-inventory":
+		runNASInventory(ctx, cfg, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -182,6 +184,7 @@ func usage() {
 	  stoaramactl recordings schedule-batch --spec FILE [--dry-run --json --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-postflight (--recording-ids IDS | --batch-response FILE | --spec FILE) --session-cookie-file FILE [--max-nas-pending-clips N --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings capture-health --id ID [--from YYYY-MM-DD --to YYYY-MM-DD --backend-api-url URL --api-token TOKEN]
+	  stoaramactl nas-inventory report --connection-id ID [--limit 50 --json]
 `)
 }
 
