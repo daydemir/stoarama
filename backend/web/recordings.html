@@ -562,7 +562,7 @@
       <div id="newRecRow" class="button-row hidden" style="margin-bottom:16px;">
         <button id="newRecBtn" class="primary" type="button">New recording</button>
         <button id="selectStreamsBtn" class="secondary" type="button" style="width:auto;min-width:0;">Select streams</button>
-        <button id="bulkCancelBtn" class="danger hidden" type="button" style="width:auto;min-width:0;">Cancel selected (0)</button>
+        <details id="bulkCancelMenu" class="action-menu hidden"><summary aria-label="Selected recording actions">⋯</summary><div class="action-menu-pop"><button id="bulkCancelBtn" class="danger" type="button">Cancel selected (0)…</button></div></details>
         <button id="recordingsCsvBtn" class="secondary" type="button" style="width:auto;min-width:0;">Download CSV</button>
       </div>
 
@@ -1092,6 +1092,7 @@
       startBatchBtn: document.getElementById('startBatchBtn'),
       startStatus: document.getElementById('startStatus'),
       bulkCancelBtn: document.getElementById('bulkCancelBtn'),
+      bulkCancelMenu: document.getElementById('bulkCancelMenu'),
       selectStreamsBtn: document.getElementById('selectStreamsBtn'),
       batchSourceBlock: document.getElementById('batchSourceBlock'),
       batchStreamCount: document.getElementById('batchStreamCount'),
@@ -3296,7 +3297,7 @@
     function updateBulkCancelButton() {
       const count = state.selectedRecordings.size;
       els.bulkCancelBtn.textContent = `Cancel selected (${count})`;
-      els.bulkCancelBtn.classList.toggle('hidden', count === 0);
+      els.bulkCancelMenu.classList.toggle('hidden', count === 0);
       const visible = Array.from(els.cards.querySelectorAll('input[data-recordingselect]'));
       const checked = visible.filter((box) => box.checked).length;
       els.cards.querySelectorAll('input[data-selectvisible]').forEach((box) => {
@@ -5109,7 +5110,7 @@
     els.selectStreamsBtn.addEventListener('click', () => window.location.assign('/streams'));
     els.bulkCancelBtn.addEventListener('click', async () => {
       const ids = [...state.selectedRecordings];
-      if (ids.length === 0 || !window.confirm(`Cancel ${ids.length} selected recording${ids.length === 1 ? '' : 's'}?`)) return;
+      if (ids.length === 0 || !window.confirm(`Cancel ${ids.length} selected recording${ids.length === 1 ? '' : 's'}? Active capture stops immediately. Existing clips are retained.`)) return;
       els.bulkCancelBtn.disabled = true;
       try {
         await fetchJSON('/api/v1/account/recordings/batch-cancel', {

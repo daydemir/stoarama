@@ -204,6 +204,12 @@
       background: color-mix(in srgb, var(--accent-strong) 88%, #000);
       border-color: color-mix(in srgb, var(--accent-strong) 88%, #000);
     }
+    details.action-menu { position: relative; display: inline-block; }
+    details.action-menu > summary { list-style: none; width: 34px; height: 32px; display: grid; place-items: center; border: 1.5px solid var(--muted); border-radius: 10px; cursor: pointer; font-size: 20px; line-height: 1; }
+    details.action-menu > summary::-webkit-details-marker { display: none; }
+    .action-menu-pop { position: absolute; z-index: 30; right: 0; top: 38px; min-width: 190px; display: grid; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); box-shadow: 0 18px 45px rgba(0,0,0,.35); }
+    .action-menu-pop button { width: 100%; text-align: left; }
+    .action-menu-pop button.destructive { color: var(--err); }
     .overview-card-link.secondary {
       background: var(--panel);
       border-color: var(--accent);
@@ -1894,7 +1900,10 @@
       </div>
       <div class="detail-header-actions">
         <a id="detailRecordCTA" class="overview-card-link primary" href="/recordings">Set up recording</a>
-        <button id="detailDeleteStreamBtn" class="overview-card-link" type="button" style="display:none;">Delete stream</button>
+        <details id="detailStreamActionMenu" class="action-menu" style="display:none;">
+          <summary aria-label="Stream actions">⋯</summary>
+          <div class="action-menu-pop"><button id="detailDeleteStreamBtn" class="destructive" type="button">Delete stream…</button></div>
+        </details>
       </div>
     </div>
 
@@ -2107,6 +2116,7 @@ const detailTitle = $('detailTitle');
 const detailMeta = $('detailMeta');
 const detailRecordCTA = $('detailRecordCTA');
 const detailDeleteStreamBtn = $('detailDeleteStreamBtn');
+const detailStreamActionMenu = $('detailStreamActionMenu');
 const detailLivePlayer = $('detailLivePlayer');
 const detailLivePlayerMount = $('detailLivePlayerMount');
 const detailNoInlineNote = $('detailNoInlineNote');
@@ -3460,8 +3470,8 @@ async function copyStreamSourceURL(streamID) {
 function syncDetailMutationUI(payload) {
   const p = payload || {};
   const s = (p.stream && typeof p.stream === 'object') ? p.stream : p;
-  if (detailDeleteStreamBtn instanceof HTMLElement) {
-    detailDeleteStreamBtn.style.display = isAdminAccount() ? '' : 'none';
+  if (detailStreamActionMenu instanceof HTMLElement) {
+    detailStreamActionMenu.style.display = isAdminAccount() ? '' : 'none';
   }
   if (detailRecordCTA instanceof HTMLAnchorElement) {
     // Only offer the managed recorder for streams it can actually capture,
@@ -3494,7 +3504,9 @@ async function softDeleteDetailStream() {
   if (!Number.isFinite(id) || id <= 0) throw new Error('stream id is missing');
   if (!isAdminAccount()) throw new Error('admin account required');
   const label = String((stream && (stream.slug || stream.name)) || id).trim();
-  const reason = window.prompt(`Delete stream ${label} from the catalog? Enter a reason.`);
+  const confirmation = window.prompt(`Delete stream ${label} from the shared catalog? Existing recordings are not deleted, but the stream will disappear from discovery. Type DELETE to continue.`);
+  if (String(confirmation || '').trim() !== 'DELETE') return;
+  const reason = window.prompt(`Why is ${label} being deleted? This reason is stored in the audit log.`);
   const reasonText = String(reason || '').trim();
   if (!reasonText) return;
   await fetchJSON(`/api/v1/admin/streams/${Math.floor(id)}/delete`, {
