@@ -641,6 +641,9 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 			inv.Clips < 0 || inv.Bytes < 0 || inv.Mismatches < 0 || inv.Unmatched < 0 {
 			return errors.New("invalid NAS inventory summary")
 		}
+		if inv.Digest != "" && (len(inv.Digest) != 64 || !lowerHex(inv.Digest)) {
+			return errors.New("invalid NAS inventory digest")
+		}
 		if inv.ScanCompletedAt != nil {
 			if inv.ScanStartedAt == nil || inv.ScanCompletedAt.Before(*inv.ScanStartedAt) ||
 				inv.ScanCompletedAt.After(time.Now().Add(connectionHeartbeatFutureSkew)) ||
@@ -702,6 +705,19 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		outageRecoveredAt = req.LastOutage.RecoveredAt
 		outageFailureCount = req.LastOutage.FailureCount
 	}
+	var inventoryGeneration, inventoryDigest string
+	var inventoryScanStartedAt, inventoryScanCompletedAt *time.Time
+	var inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched int64
+	if req.Inventory != nil {
+		inventoryGeneration = req.Inventory.Generation
+		inventoryScanStartedAt = req.Inventory.ScanStartedAt
+		inventoryScanCompletedAt = req.Inventory.ScanCompletedAt
+		inventoryClips = req.Inventory.Clips
+		inventoryBytes = req.Inventory.Bytes
+		inventoryMismatches = req.Inventory.Mismatches
+		inventoryUnmatched = req.Inventory.Unmatched
+		inventoryDigest = req.Inventory.Digest
+	}
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE connections
 		SET last_seen_at=now(),
@@ -727,6 +743,15 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    nas_download_workers=CASE WHEN $20 > 0 THEN $20 ELSE nas_download_workers END,
 		    nas_batch_retries=CASE WHEN $16::timestamptz IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16::timestamptz > nas_batch_completed_at) THEN $21 ELSE nas_batch_retries END,
 		    nas_batch_failures=CASE WHEN $16::timestamptz IS NOT NULL AND (nas_batch_completed_at IS NULL OR $16::timestamptz > nas_batch_completed_at) THEN $22 ELSE nas_batch_failures END,
+		    inventory_reported_at=CASE WHEN $25 <> '' THEN now() ELSE inventory_reported_at END,
+		    inventory_generation=CASE WHEN $25 <> '' THEN $25 ELSE inventory_generation END,
+		    inventory_scan_started_at=CASE WHEN $25 <> '' THEN $26 ELSE inventory_scan_started_at END,
+		    inventory_scan_completed_at=CASE WHEN $27::timestamptz IS NOT NULL THEN $27::timestamptz ELSE inventory_scan_completed_at END,
+		    inventory_clips=CASE WHEN $25 <> '' THEN $28 ELSE inventory_clips END,
+		    inventory_bytes=CASE WHEN $25 <> '' THEN $29 ELSE inventory_bytes END,
+		    inventory_mismatches=CASE WHEN $25 <> '' THEN $30 ELSE inventory_mismatches END,
+		    inventory_unmatched=CASE WHEN $25 <> '' THEN $31 ELSE inventory_unmatched END,
+		    inventory_digest=CASE WHEN $32 <> '' THEN $32 ELSE inventory_digest END,
 		    updated_at=now()
 		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
@@ -736,7 +761,9 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		req.LastBatch.CompletedAt, req.LastBatch.Clips, req.LastBatch.Bytes,
 		req.LastBatch.DurationMS, req.LastBatch.Workers, req.LastBatch.Retries,
 		req.LastBatch.Failures,
-		*principal.APIKeyID, principal.AccountID)
+		*principal.APIKeyID, principal.AccountID,
+		inventoryGeneration, inventoryScanStartedAt, inventoryScanCompletedAt,
+		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
@@ -744,21 +771,6 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
-	}
-	if inv := req.Inventory; inv != nil {
-		_, err := s.pool.Exec(r.Context(), `
-			UPDATE connections SET inventory_reported_at=now(),
-				inventory_generation=$1, inventory_scan_started_at=$2,
-				inventory_scan_completed_at=CASE WHEN $3::timestamptz IS NOT NULL THEN $3::timestamptz ELSE inventory_scan_completed_at END,
-				inventory_clips=$4, inventory_bytes=$5, inventory_mismatches=$6,
-				inventory_unmatched=$7, inventory_digest=CASE WHEN $8<>'' THEN $8 ELSE inventory_digest END,
-				updated_at=now() WHERE api_key_id=$9 AND account_id=$10
-		`, inv.Generation, inv.ScanStartedAt, inv.ScanCompletedAt, inv.Clips, inv.Bytes,
-			inv.Mismatches, inv.Unmatched, inv.Digest, *principal.APIKeyID, principal.AccountID)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("inventory heartbeat: %v", err))
-			return
-		}
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

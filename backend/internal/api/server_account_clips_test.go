@@ -401,6 +401,16 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			kind TEXT NOT NULL,
 			api_key_id BIGINT,
 			inventory_mode TEXT NOT NULL DEFAULT 'observe',
+			inventory_generation TEXT NOT NULL DEFAULT '',
+			inventory_scan_started_at TIMESTAMPTZ,
+			inventory_scan_completed_at TIMESTAMPTZ,
+			inventory_reported_at TIMESTAMPTZ,
+			inventory_clips BIGINT NOT NULL DEFAULT 0,
+			inventory_bytes BIGINT NOT NULL DEFAULT 0,
+			inventory_mismatches BIGINT NOT NULL DEFAULT 0,
+			inventory_unmatched BIGINT NOT NULL DEFAULT 0,
+			inventory_digest TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			last_cursor_id BIGINT NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE recordings (
@@ -441,7 +451,23 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			sha256 TEXT NOT NULL,
 			state TEXT NOT NULL,
 			verified_at TIMESTAMPTZ,
+			file_mtime_ns BIGINT NOT NULL DEFAULT 0,
+			seen_generation TEXT NOT NULL DEFAULT '',
+			client_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			server_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY(connection_id,clip_id)
+		)`,
+		`CREATE TABLE nas_inventory_unmatched_files (
+			connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+			relative_path TEXT NOT NULL,
+			size_bytes BIGINT NOT NULL,
+			sha256 TEXT NOT NULL,
+			state TEXT NOT NULL,
+			file_mtime_ns BIGINT NOT NULL DEFAULT 0,
+			seen_generation TEXT NOT NULL DEFAULT '',
+			client_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			server_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY(connection_id,relative_path)
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

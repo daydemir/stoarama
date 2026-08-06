@@ -38,6 +38,7 @@ CREATE TABLE nas_inventory_files (
   PRIMARY KEY (connection_id, clip_id),
   CONSTRAINT chk_nas_inventory_clip_ids CHECK (clip_id > 0 AND recording_id > 0),
   CONSTRAINT chk_nas_inventory_path CHECK (relative_path <> '' AND left(relative_path, 1) <> '/'),
+  CONSTRAINT chk_nas_inventory_path_len CHECK (octet_length(relative_path) <= 1024),
   CONSTRAINT chk_nas_inventory_size CHECK (size_bytes >= 0),
   CONSTRAINT chk_nas_inventory_sha CHECK (sha256 ~ '^[0-9a-f]{64}$'),
   CONSTRAINT chk_nas_inventory_state CHECK (state IN ('present', 'missing', 'mismatch'))
@@ -64,6 +65,7 @@ CREATE TABLE nas_inventory_unmatched_files (
   server_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY(connection_id,relative_path),
   CONSTRAINT chk_nas_inventory_unmatched_path CHECK (relative_path<>'' AND left(relative_path,1)<>'/'),
+  CONSTRAINT chk_nas_inventory_unmatched_path_len CHECK (octet_length(relative_path)<=1024),
   CONSTRAINT chk_nas_inventory_unmatched_size CHECK (size_bytes>=0),
   CONSTRAINT chk_nas_inventory_unmatched_sha CHECK (sha256~'^[0-9a-f]{64}$'),
   CONSTRAINT chk_nas_inventory_unmatched_state CHECK (state IN ('present','missing'))

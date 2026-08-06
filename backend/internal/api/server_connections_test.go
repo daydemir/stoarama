@@ -433,6 +433,7 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{Workers: 33}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", LastBatch: connectionHeartbeatBatch{CompletedAt: &future, DurationMS: 1, Workers: 1}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "bad/generation"}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", Digest: "not-a-digest"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanCompletedAt: &now}},
 	}
 	for i, request := range invalid {

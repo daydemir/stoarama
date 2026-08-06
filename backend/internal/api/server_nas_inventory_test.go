@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -100,6 +101,30 @@ func TestNASInventoryReleaseGateFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSessionReleaseRemainsAvailableInObserveRollout(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID = int64(42)
+	var recordingID, clipID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name,delivery) VALUES($1,'session-release','nas_pull') RETURNING id`, accountID).Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,size_bytes,clip_start_at,clip_end_at) VALUES($1,3,now()-interval '1 minute',now()) RETURNING id`, recordingID).Scan(&clipID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/x/clips/y/release", nil)
+	req.SetPathValue("id", fmt.Sprint(recordingID))
+	req.SetPathValue("clipId", fmt.Sprint(clipID))
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}))
+	rec := httptest.NewRecorder()
+	s.handleAccountRecordingClipRelease(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session release status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 	pool, cleanup := testAccountClipsPool(t)
 	defer cleanup()
@@ -154,6 +179,104 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 	}
 	if released != 2 {
 		t.Fatalf("complete batch released %d clips, want 2", released)
+	}
+}
+
+func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID, apiKeyID = int64(42), int64(99)
+	var connectionID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,api_key_id) VALUES($1,'nas_pull',$2) RETURNING id`, accountID, apiKeyID).Scan(&connectionID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	callSync := func(payload nasInventorySyncRequest) *httptest.ResponseRecorder {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/inventory/sync", bytes.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionInventorySync(rec, req)
+		return rec
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	sha := strings.Repeat("a", 64)
+	newer := nasInventorySyncRequest{Generation: "scan-new", Files: []nasInventoryFileReport{{
+		ClipID: 10, RecordingID: 20, RelativePath: "clips/new.mp4", SizeBytes: 3, SHA256: sha,
+		State: "present", VerifiedAt: &now, ClientUpdatedAt: now,
+	}}}
+	if rec := callSync(newer); rec.Code != http.StatusOK {
+		t.Fatalf("new sync status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	olderTime := now.Add(-time.Hour)
+	older := newer
+	older.Generation = "scan-old"
+	older.Files = append([]nasInventoryFileReport(nil), newer.Files...)
+	older.Files[0].RelativePath = "clips/stale.mp4"
+	older.Files[0].ClientUpdatedAt = olderTime
+	if rec := callSync(older); rec.Code != http.StatusOK {
+		t.Fatalf("idempotent old sync status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var path string
+	if err := pool.QueryRow(ctx, `SELECT relative_path FROM nas_inventory_files WHERE connection_id=$1 AND clip_id=10`, connectionID).Scan(&path); err != nil || path != "clips/new.mp4" {
+		t.Fatalf("monotonic row path=%q err=%v", path, err)
+	}
+	scanStart := now.Add(-30 * time.Minute)
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation,client_updated_at) VALUES
+		($1,11,20,'clips/old.mp4',3,$2,'present',$3,'prior',$4),
+		($1,12,20,'clips/inflight.mp4',3,$2,'present',$3,'prior',$5)`, connectionID, sha, now, scanStart.Add(-time.Minute), scanStart.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	complete := nasInventorySyncRequest{Generation: "scan-complete", ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
+	if rec := callSync(complete); rec.Code != http.StatusOK {
+		t.Fatalf("complete sync status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var oldState, inflightState string
+	if err := pool.QueryRow(ctx, `SELECT max(state) FILTER(WHERE clip_id=11),max(state) FILTER(WHERE clip_id=12) FROM nas_inventory_files WHERE connection_id=$1`, connectionID).Scan(&oldState, &inflightState); err != nil {
+		t.Fatal(err)
+	}
+	if oldState != "missing" || inflightState != "present" {
+		t.Fatalf("completion sweep old=%q inflight=%q", oldState, inflightState)
+	}
+}
+
+func TestNASInventoryModeRequiresCompleteExactCoverage(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID = int64(42)
+	var connectionID, recordingID, clipID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,inventory_scan_completed_at) VALUES($1,'nas_pull',now()) RETURNING id`, accountID).Scan(&connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name,delivery) VALUES($1,'mode','nas_pull') RETURNING id`, accountID).Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,size_bytes,sha256,display_path,clip_start_at,clip_end_at) VALUES($1,3,$2,'mode/clip.mp4',now()-interval '1 minute',now()) RETURNING id`, recordingID, sha).Scan(&clipID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	callMode := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/account/connections/x/inventory-mode", bytes.NewBufferString(`{"mode":"enforce"}`))
+		req.SetPathValue("id", fmt.Sprint(connectionID))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionInventoryMode(rec, req)
+		return rec
+	}
+	if rec := callMode(); rec.Code != http.StatusConflict {
+		t.Fatalf("unconfirmed enforce status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'mode/clip.mp4',3,$4,'present',now())`, connectionID, clipID, recordingID, sha); err != nil {
+		t.Fatal(err)
+	}
+	if rec := callMode(); rec.Code != http.StatusOK {
+		t.Fatalf("ready enforce status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

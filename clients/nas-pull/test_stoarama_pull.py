@@ -100,6 +100,8 @@ class NASPullTests(unittest.TestCase):
             path.write_bytes(b"abc")
             pull.write_stitch_sidecar(path, clip)
             (cfg.output_dir / "orphan.mp4").write_bytes(b"orphan")
+            (cfg.output_dir / "clip.mp4.part-8").write_bytes(b"partial")
+            (cfg.output_dir / ".clip.mp4.invalid-8-123").write_bytes(b"quarantine")
             inventory = pull.Inventory(cfg)
             calls = []
             with mock.patch.object(pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}):
@@ -110,6 +112,44 @@ class NASPullTests(unittest.TestCase):
             self.assertEqual(inventory.summary()["mismatches"], 1)
             self.assertEqual(inventory.summary()["unmatched"], 1)
             inventory.close()
+
+    def test_inventory_is_synced_before_release_and_sync_failure_keeps_cursor(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            clip = {"clip_id": 1, "recording_id": 3}
+            calls = []
+
+            class Inventory:
+                def record_verified(self, item):
+                    calls.append(("record", item["clip_id"]))
+
+                def sync_clip_ids(self, _cfg, clip_ids):
+                    calls.append(("sync", list(clip_ids)))
+
+            with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
+                pull, "process_clip", return_value=(1, 10, 10, 0)
+            ), mock.patch.object(pull, "release_clips", side_effect=lambda *_args: calls.append(("release", 1)) or {}):
+                self.assertTrue(pull.drain_page(cfg, runtime, Inventory()))
+            self.assertEqual(calls, [("record", 1), ("sync", [1]), ("release", 1)])
+            self.assertEqual(runtime.cursor_id, 1)
+
+            runtime = pull.Runtime(cfg)
+            runtime.cursor_id = 0
+            runtime.clips_pulled = 0
+            calls.clear()
+
+            class FailingInventory(Inventory):
+                def sync_clip_ids(self, _cfg, clip_ids):
+                    calls.append(("sync", list(clip_ids)))
+                    raise RuntimeError("inventory sync failed")
+
+            with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
+                pull, "process_clip", return_value=(1, 10, 10, 0)
+            ), mock.patch.object(pull, "release_clips") as release, self.assertRaisesRegex(RuntimeError, "inventory sync failed"):
+                pull.drain_page(cfg, runtime, FailingInventory())
+            release.assert_not_called()
+            self.assertEqual(runtime.cursor_id, 0)
 
     def test_storage_must_be_real_mounts(self):
         with tempfile.TemporaryDirectory() as raw:

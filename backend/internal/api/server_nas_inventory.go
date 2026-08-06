@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,7 +20,7 @@ const (
 	nasInventoryMaxPage       = 500
 	nasInventoryFreshness     = 72 * time.Hour
 	nasInventoryMaxFutureSkew = 5 * time.Minute
-	nasInventoryMaxPathBytes  = 4096
+	nasInventoryMaxPathBytes  = 1024
 	nasInventoryMaxGeneration = 128
 )
 
@@ -133,7 +134,7 @@ func lowerHex(value string) bool {
 // verification. Observe mode records inventory without interrupting rollout.
 func (s *Server) verifyNASInventoryForRelease(r *http.Request, principal accountPrincipal, recordingID, clipID int64) (bool, string, error) {
 	if principal.APIKeyID == nil {
-		return false, "no NAS pull key", nil
+		return true, "non-pull caller", nil
 	}
 	var mode string
 	var state, localPath, localSHA, serverPath, serverSHA string
@@ -152,7 +153,7 @@ func (s *Server) verifyNASInventoryForRelease(r *http.Request, principal account
 		&mode, &state, &localPath, &localSize, &localSHA, &verifiedAt,
 		&serverPath, &serverSize, &serverSHA)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, "connection or clip not found", nil
+		return true, "non-pull caller", nil
 	}
 	if err != nil {
 		return false, "", err
@@ -418,11 +419,20 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="stoarama-nas-%d-inventory.csv"`, connectionID))
 	writer := csv.NewWriter(w)
-	_ = writer.Write([]string{"clip_id", "recording_id", "relative_path", "size_bytes", "sha256", "state", "verified_at", "server_received_at", "reconciliation"})
+	failExport := func(err error) {
+		log.Printf("NAS inventory CSV export connection_id=%d incomplete: %v", connectionID, err)
+		_ = writer.Write([]string{"", "", "", "", "", "error", "", "", "INCOMPLETE EXPORT: " + err.Error()})
+		writer.Flush()
+	}
+	if err := writer.Write([]string{"clip_id", "recording_id", "relative_path", "size_bytes", "sha256", "state", "verified_at", "server_received_at", "reconciliation"}); err != nil {
+		failExport(fmt.Errorf("write header: %w", err))
+		return
+	}
 	var afterID int64
 	for {
 		rows, err := s.inventoryRows(r, principal.AccountID, connectionID, afterID, nasInventoryMaxPage)
 		if err != nil {
+			failExport(fmt.Errorf("load inventory page: %w", err))
 			return
 		}
 		count := 0
@@ -430,19 +440,30 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 			var item nasInventoryListItem
 			if err := rows.Scan(&item.ClipID, &item.RecordingID, &item.RelativePath, &item.SizeBytes, &item.SHA256, &item.State, &item.VerifiedAt, &item.ServerReceivedAt, &item.Reconciliation); err != nil {
 				rows.Close()
+				failExport(fmt.Errorf("scan inventory row: %w", err))
 				return
 			}
 			verified := ""
 			if item.VerifiedAt != nil {
 				verified = item.VerifiedAt.UTC().Format(time.RFC3339)
 			}
-			_ = writer.Write([]string{strconv.FormatInt(item.ClipID, 10), strconv.FormatInt(item.RecordingID, 10), item.RelativePath, strconv.FormatInt(item.SizeBytes, 10), item.SHA256, item.State, verified, item.ServerReceivedAt.UTC().Format(time.RFC3339), item.Reconciliation})
+			if err := writer.Write([]string{strconv.FormatInt(item.ClipID, 10), strconv.FormatInt(item.RecordingID, 10), item.RelativePath, strconv.FormatInt(item.SizeBytes, 10), item.SHA256, item.State, verified, item.ServerReceivedAt.UTC().Format(time.RFC3339), item.Reconciliation}); err != nil {
+				rows.Close()
+				failExport(fmt.Errorf("write inventory row: %w", err))
+				return
+			}
 			afterID = item.ClipID
 			count++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			failExport(fmt.Errorf("iterate inventory page: %w", err))
+			return
 		}
 		rows.Close()
 		writer.Flush()
 		if writer.Error() != nil {
+			failExport(fmt.Errorf("flush inventory page: %w", writer.Error()))
 			return
 		}
 		if count < nasInventoryMaxPage {
@@ -451,6 +472,7 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 	}
 	rows, err := s.pool.Query(r.Context(), `SELECT relative_path,size_bytes,sha256,state,server_received_at FROM nas_inventory_unmatched_files WHERE connection_id=$1 ORDER BY relative_path`, connectionID)
 	if err != nil {
+		failExport(fmt.Errorf("load unmatched files: %w", err))
 		return
 	}
 	defer rows.Close()
@@ -459,11 +481,22 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 		var size int64
 		var received time.Time
 		if err := rows.Scan(&path, &size, &sha, &state, &received); err != nil {
+			failExport(fmt.Errorf("scan unmatched file: %w", err))
 			return
 		}
-		_ = writer.Write([]string{"", "", path, strconv.FormatInt(size, 10), sha, state, "", received.UTC().Format(time.RFC3339), "nas_only"})
+		if err := writer.Write([]string{"", "", path, strconv.FormatInt(size, 10), sha, state, "", received.UTC().Format(time.RFC3339), "nas_only"}); err != nil {
+			failExport(fmt.Errorf("write unmatched file: %w", err))
+			return
+		}
+	}
+	if err := rows.Err(); err != nil {
+		failExport(fmt.Errorf("iterate unmatched files: %w", err))
+		return
 	}
 	writer.Flush()
+	if err := writer.Error(); err != nil {
+		failExport(fmt.Errorf("flush unmatched files: %w", err))
+	}
 }
 
 type nasInventoryModeRequest struct {
@@ -551,7 +584,7 @@ func (s *Server) handleAccountClipsReleaseBatch(w http.ResponseWriter, r *http.R
 				SELECT EXISTS(SELECT 1 FROM nas_inventory_files
 				WHERE connection_id=$1 AND clip_id=$2 AND state='present' AND relative_path=$3
 				  AND size_bytes=$4 AND sha256=$5 AND verified_at>=now()-$6::interval)
-			`, connectionID, item.ClipID, path, size, sha, "72 hours").Scan(&confirmed); err != nil {
+			`, connectionID, item.ClipID, path, size, sha, nasInventoryFreshness.String()).Scan(&confirmed); err != nil {
 				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("verify batch clip %d: %v", item.ClipID, err))
 				return
 			}
@@ -611,7 +644,7 @@ func (s *Server) handleAccountConnectionInventoryMode(w http.ResponseWriter, r *
 			           )
 			       )
 			FROM connections conn WHERE conn.id=$1 AND conn.account_id=$2
-		`, connectionID, principal.AccountID, "72 hours").Scan(&ready)
+		`, connectionID, principal.AccountID, nasInventoryFreshness.String()).Scan(&ready)
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "connection not found")
 			return

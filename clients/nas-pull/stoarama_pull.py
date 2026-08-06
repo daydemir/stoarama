@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -31,6 +32,7 @@ HEARTBEAT_INTERVAL_SEC = 30
 UPDATE_INTERVAL_SEC = 600
 INVENTORY_SCAN_INTERVAL_SEC = 24 * 60 * 60
 INVENTORY_SYNC_BATCH = 200
+INVENTORY_SHUTDOWN_TIMEOUT_SEC = HTTP_TIMEOUT_SEC + 5
 ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 
@@ -475,7 +477,12 @@ class Inventory:
             if stop_event.is_set():
                 return
             try:
-                if not path.is_file() or path.name.endswith(".stoarama.json"):
+                if (
+                    not path.is_file()
+                    or path.name.endswith(".stoarama.json")
+                    or re.fullmatch(r".+\.part-\d+", path.name)
+                    or re.fullmatch(r"\..+\.invalid-\d+-\d+", path.name)
+                ):
                     continue
                 relative = str(path.relative_to(cfg.output_dir))
                 if relative in known_paths:
@@ -905,8 +912,9 @@ def drain_page(cfg, runtime, inventory=None):
         for clip_id in prepared_ids:
             inventory.record_verified(clip_by_id[clip_id])
         inventory.sync_clip_ids(cfg, prepared_ids)
+    result_by_id = {clip_id: result for clip_id, result, error in results if error is None}
     releasable = []
-    for clip_id, result, error in results:
+    for clip_id, _, error in results:
         if error is not None:
             break
         releasable.append(clip_by_id[clip_id])
@@ -929,8 +937,7 @@ def drain_page(cfg, runtime, inventory=None):
         releasable = []
     for clip in releasable:
         clip_id = int(clip["clip_id"])
-        result = next(result for candidate_id, result, error in results if candidate_id == clip_id and error is None)
-        successes.append(result)
+        successes.append(result_by_id[clip_id])
         cursor = clip_id
     if successes:
         runtime.add_successes(cfg, cursor, successes)
@@ -1110,9 +1117,12 @@ def run(cfg):
     finally:
         stop_event.set()
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
-        inventory_worker.join(timeout=2)
+        inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
         mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
-        inventory.close()
+        if inventory_worker.is_alive():
+            log("WARN", "inventory worker still running at shutdown; leaving database open")
+        else:
+            inventory.close()
         lock_handle.close()
     return 0
 
