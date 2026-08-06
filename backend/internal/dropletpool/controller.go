@@ -462,7 +462,11 @@ func (c *Controller) promoteActive(ctx context.Context, now time.Time, fleet []D
 	}
 	window := c.workerReadyWindow()
 	for _, r := range provisioning {
-		workerReady := r.LastSeenAt != nil && now.Sub(*r.LastSeenAt) <= window && workerBuildReady(c.cfg.BuildSHA, r.BuildSHA)
+		providerPresent := false
+		if r.DODropletID != nil {
+			_, providerPresent = byID[*r.DODropletID]
+		}
+		workerReady := providerPresent && r.LastSeenAt != nil && now.Sub(*r.LastSeenAt) <= window && workerBuildReady(c.cfg.BuildSHA, r.BuildSHA)
 		if !workerReady {
 			// Best-effort lead-miss warning: a provisioning row older than the
 			// provision lead whose worker has not reported in yet means the first
