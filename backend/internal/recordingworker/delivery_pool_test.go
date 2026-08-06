@@ -295,11 +295,25 @@ func TestContinuousTimelineDelay(t *testing.T) {
 
 func TestWaitForContinuousTimelineCancels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 	now := time.Date(2026, 8, 6, 20, 0, 0, 0, time.UTC)
-	err := waitForContinuousTimeline(ctx, now.Add(time.Hour), func() time.Time { return now })
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("wait error=%v want context canceled", err)
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- waitForContinuousTimeline(ctx, now.Add(time.Hour), func() time.Time {
+			close(started)
+			return now
+		})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("wait error=%v want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeline wait did not return promptly after cancellation")
 	}
 }
 
