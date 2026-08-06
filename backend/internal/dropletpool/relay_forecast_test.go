@@ -152,7 +152,7 @@ func insertProvisioningReconcileFixture(t *testing.T, pool *pgxpool.Pool, now ti
 		  mode, cron_expr, cron_timezone, clip_duration_sec, status, next_fire_at,
 		  start_at, capture_via
 		)
-		VALUES ($1, $2, 'lease-safety', 'https://example.com/live.m3u8', 'hls',
+		VALUES ($1, $2, 'lease-safety', 'https://example.com/live.m3u8', 'hls_live',
 		        'sampled', '* * * * *', 'UTC', 30, 'active', $3, $3, 'cloud')
 		RETURNING id
 	`, accountID, destID, now).Scan(&recordingID); err != nil {
@@ -307,7 +307,7 @@ func insertForecastRecording(t *testing.T, pool *pgxpool.Pool, accountID, destID
 		  start_at, capture_via
 		)
 		VALUES (
-		  $1, $2, $3, 'https://example.com/live.m3u8', 'hls',
+		  $1, $2, $3, 'https://example.com/live.m3u8', 'hls_live',
 		  'sampled', '* * * * *', 'UTC', 30, 'active', now(),
 		  '2026-06-24T00:00:00Z', $4
 		)
