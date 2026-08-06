@@ -112,11 +112,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	accountID := principal.AccountID
 	if req.TargetAccountID < 0 {
-		util.WriteError(w, http.StatusBadRequest, "target_account_id must be positive")
+		util.WriteError(w, http.StatusBadRequest, "target_account_id must be non-negative")
 		return
 	}
 	if req.TargetAccountID > 0 {
-		if principal.Role != accountRoleAdmin {
+		if req.TargetAccountID != principal.AccountID && principal.Role != accountRoleAdmin {
 			util.WriteError(w, http.StatusForbidden, "target_account_id requires platform operator access")
 			return
 		}

@@ -217,7 +217,7 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 		return spec, fmt.Errorf("stream_ids must contain 1 to 200 ids")
 	}
 	if spec.TargetAccountID < 0 {
-		return spec, fmt.Errorf("target_account_id must be positive")
+		return spec, fmt.Errorf("target_account_id must be non-negative")
 	}
 	if spec.Mode != recordingScheduleSampled && spec.Mode != recordingScheduleContinuous {
 		return spec, fmt.Errorf("mode is required")
