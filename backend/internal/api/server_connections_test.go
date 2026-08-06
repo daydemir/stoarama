@@ -469,6 +469,7 @@ func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
 	start := now.Add(-time.Hour)
 	completed := now.Add(-time.Minute)
 	call(connectionInventoryStatus{Generation: "complete", ScanStartedAt: &start, ScanCompletedAt: &completed, Clips: 10, Bytes: 1000, Mismatches: 7, Unmatched: 2, Digest: strings.Repeat("a", 64)})
+	call(connectionInventoryStatus{Generation: "same-time-conflict", ScanStartedAt: &start, ScanCompletedAt: &completed, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("c", 64)})
 	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &now, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0})
 	delayed := now.Add(-2 * time.Minute)
 	call(connectionInventoryStatus{Generation: "delayed", ScanStartedAt: &start, ScanCompletedAt: &delayed, Clips: 2, Bytes: 2, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("b", 64)})
