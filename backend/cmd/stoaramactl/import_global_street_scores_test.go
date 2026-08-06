@@ -128,7 +128,7 @@ func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
 	row.RowNumber = 9
 	opts := gssOptions{TargetAPIURL: gssProductionAPIURL, ProbeTimeout: time.Second}
 	gssResolveCaptureInputWithHeaders = func(context.Context, string, string, string) (string, bool, string, error) {
-		return "https://media.example.com/live.m3u8", false, "Referer: https://example.com/camera\r\n", nil
+		return "https://media.example.com/live.m3u8", false, "Referer: https://example.com/camera\r\nUser-Agent: Mozilla/5.0\r\n", nil
 	}
 	result := verifyGSSRow(context.Background(), row, opts)
 	if result.Status != gssStatusVerifiedImportable {
@@ -137,7 +137,7 @@ func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
 	if result.SourceURL != row.value("source") || result.SourcePageURL != row.value("source") {
 		t.Fatalf("source fields=%q %q", result.SourceURL, result.SourcePageURL)
 	}
-	if probedHeaders != "Referer: https://example.com/camera\r\n" {
+	if probedHeaders != "Referer: https://example.com/camera\r\nUser-Agent: Mozilla/5.0\r\n" {
 		t.Fatalf("probe headers=%q", probedHeaders)
 	}
 
