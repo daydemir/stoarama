@@ -212,6 +212,12 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load inventory connection: %v", err))
 		return
 	}
+	if req.Complete && existingCompletedAt != nil && !req.ScanCompletedAt.After(*existingCompletedAt) {
+		util.WriteJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "accepted": 0, "complete": false, "completion_stale": true,
+		})
+		return
+	}
 	for _, file := range req.Files {
 		_, err = tx.Exec(r.Context(), `
 			INSERT INTO nas_inventory_files
@@ -248,7 +254,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			return
 		}
 	}
-	applyCompletion := req.Complete && (existingCompletedAt == nil || req.ScanCompletedAt.After(*existingCompletedAt))
+	applyCompletion := req.Complete
 	if applyCompletion {
 		_, err = tx.Exec(r.Context(), `
 			UPDATE nas_inventory_files

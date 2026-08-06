@@ -244,17 +244,31 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	}
 	olderComplete := scanStart.Add(-time.Minute)
 	olderStart := olderComplete.Add(-time.Hour)
-	stale := nasInventorySyncRequest{Generation: "scan-stale", ScanStartedAt: &olderStart, ScanCompletedAt: &olderComplete, Digest: strings.Repeat("c", 64), Complete: true}
+	laterClientUpdate := now.Add(time.Minute)
+	stale := nasInventorySyncRequest{
+		Generation: "scan-stale", ScanStartedAt: &olderStart, ScanCompletedAt: &olderComplete,
+		Digest: strings.Repeat("c", 64), Complete: true,
+		Files: []nasInventoryFileReport{{
+			ClipID: 10, RecordingID: 20, RelativePath: "clips/stale-completion-mutation.mp4",
+			SizeBytes: 9, SHA256: strings.Repeat("d", 64), State: "mismatch", ClientUpdatedAt: laterClientUpdate,
+		}},
+	}
 	if rec := callSync(stale); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"completion_stale":true`) {
 		t.Fatalf("stale complete sync status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var generation, digest string
+	var generation, digest, preservedPath, preservedState string
 	var completedAt time.Time
 	if err := pool.QueryRow(ctx, `SELECT inventory_generation,inventory_digest,inventory_scan_completed_at FROM connections WHERE id=$1`, connectionID).Scan(&generation, &digest, &completedAt); err != nil {
 		t.Fatal(err)
 	}
 	if generation != "scan-complete" || digest != strings.Repeat("b", 64) || !completedAt.Equal(now) {
 		t.Fatalf("stale completion replaced summary generation=%q digest=%q completed=%s", generation, digest, completedAt)
+	}
+	if err := pool.QueryRow(ctx, `SELECT relative_path,state FROM nas_inventory_files WHERE connection_id=$1 AND clip_id=10`, connectionID).Scan(&preservedPath, &preservedState); err != nil {
+		t.Fatal(err)
+	}
+	if preservedPath != "clips/new.mp4" || preservedState != "present" {
+		t.Fatalf("stale completion mutated row path=%q state=%q", preservedPath, preservedState)
 	}
 }
 
