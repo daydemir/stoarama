@@ -8,7 +8,7 @@ import (
 )
 
 func TestParseNASInventoryArgs(t *testing.T) {
-	for _, args := range [][]string{nil, {"list"}, {"report"}, {"report", "--connection-id", "0"}, {"report", "--connection-id", "1", "--limit", "0"}, {"report", "--connection-id", "1", "--limit", "501"}} {
+	for _, args := range [][]string{nil, {"list"}, {"report"}, {"report", "--connection-id", "0"}, {"report", "--connection-id", "1", "--limit", "0"}, {"report", "--connection-id", "1", "--limit", "501"}, {"report", "--connection-id", "7", "typo"}} {
 		if _, err := parseNASInventoryArgs(args); err == nil {
 			t.Errorf("accepted invalid args %v", args)
 		}

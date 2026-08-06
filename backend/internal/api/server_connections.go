@@ -746,12 +746,12 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    inventory_reported_at=CASE WHEN $25 <> '' THEN now() ELSE inventory_reported_at END,
 		    inventory_generation=CASE WHEN $25 <> '' THEN $25 ELSE inventory_generation END,
 		    inventory_scan_started_at=CASE WHEN $25 <> '' THEN $26 ELSE inventory_scan_started_at END,
-		    inventory_scan_completed_at=CASE WHEN $27::timestamptz IS NOT NULL THEN $27::timestamptz ELSE inventory_scan_completed_at END,
-		    inventory_clips=CASE WHEN $25 <> '' THEN $28 ELSE inventory_clips END,
-		    inventory_bytes=CASE WHEN $25 <> '' THEN $29 ELSE inventory_bytes END,
-		    inventory_mismatches=CASE WHEN $25 <> '' THEN $30 ELSE inventory_mismatches END,
-		    inventory_unmatched=CASE WHEN $25 <> '' THEN $31 ELSE inventory_unmatched END,
-		    inventory_digest=CASE WHEN $32 <> '' THEN $32 ELSE inventory_digest END,
+		    inventory_scan_completed_at=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz >= inventory_scan_completed_at) THEN $27::timestamptz ELSE inventory_scan_completed_at END,
+		    inventory_clips=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz >= inventory_scan_completed_at) THEN $28 ELSE inventory_clips END,
+		    inventory_bytes=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz >= inventory_scan_completed_at) THEN $29 ELSE inventory_bytes END,
+		    inventory_mismatches=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz >= inventory_scan_completed_at) THEN $30 ELSE inventory_mismatches END,
+		    inventory_unmatched=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz >= inventory_scan_completed_at) THEN $31 ELSE inventory_unmatched END,
+		    inventory_digest=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz >= inventory_scan_completed_at) THEN $32 ELSE inventory_digest END,
 		    updated_at=now()
 		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,

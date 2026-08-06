@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,6 +47,9 @@ func parseNASInventoryArgs(args []string) (nasInventoryOptions, error) {
 	asJSON := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args[1:]); err != nil {
 		return nasInventoryOptions{}, err
+	}
+	if len(fs.Args()) != 0 {
+		return nasInventoryOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
 	if *connectionID <= 0 || *limit < 1 || *limit > 500 {
 		return nasInventoryOptions{}, fmt.Errorf("--connection-id is required and --limit must be 1..500")
