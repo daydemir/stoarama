@@ -242,6 +242,20 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	if oldState != "missing" || inflightState != "present" {
 		t.Fatalf("completion sweep old=%q inflight=%q", oldState, inflightState)
 	}
+	olderComplete := scanStart.Add(-time.Minute)
+	olderStart := olderComplete.Add(-time.Hour)
+	stale := nasInventorySyncRequest{Generation: "scan-stale", ScanStartedAt: &olderStart, ScanCompletedAt: &olderComplete, Digest: strings.Repeat("c", 64), Complete: true}
+	if rec := callSync(stale); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"completion_stale":true`) {
+		t.Fatalf("stale complete sync status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var generation, digest string
+	var completedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT inventory_generation,inventory_digest,inventory_scan_completed_at FROM connections WHERE id=$1`, connectionID).Scan(&generation, &digest, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if generation != "scan-complete" || digest != strings.Repeat("b", 64) || !completedAt.Equal(now) {
+		t.Fatalf("stale completion replaced summary generation=%q digest=%q completed=%s", generation, digest, completedAt)
+	}
 }
 
 func TestNASInventoryModeRequiresCompleteExactCoverage(t *testing.T) {

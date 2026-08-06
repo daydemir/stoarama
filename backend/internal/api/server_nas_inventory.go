@@ -204,7 +204,8 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var connectionID int64
-	if err := tx.QueryRow(r.Context(), `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID); errors.Is(err, pgx.ErrNoRows) {
+	var existingCompletedAt *time.Time
+	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_scan_completed_at FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &existingCompletedAt); errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	} else if err != nil {
@@ -247,7 +248,8 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			return
 		}
 	}
-	if req.Complete {
+	applyCompletion := req.Complete && (existingCompletedAt == nil || req.ScanCompletedAt.After(*existingCompletedAt))
+	if applyCompletion {
 		_, err = tx.Exec(r.Context(), `
 			UPDATE nas_inventory_files
 			SET state='missing', verified_at=NULL, client_updated_at=$3, server_received_at=now()
@@ -294,7 +296,10 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit inventory sync: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "accepted": len(req.Files) + len(req.Unmatched), "complete": req.Complete})
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "accepted": len(req.Files) + len(req.Unmatched),
+		"complete": applyCompletion, "completion_stale": req.Complete && !applyCompletion,
+	})
 }
 
 type nasInventoryListItem struct {
