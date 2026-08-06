@@ -433,7 +433,10 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			nas_batch_duration_ms BIGINT NOT NULL DEFAULT 0,
 			nas_download_workers INTEGER NOT NULL DEFAULT 0,
 			nas_batch_retries INTEGER NOT NULL DEFAULT 0,
-			nas_batch_failures INTEGER NOT NULL DEFAULT 0
+			nas_batch_failures INTEGER NOT NULL DEFAULT 0,
+			nas_storage_total_bytes BIGINT,
+			nas_storage_free_bytes BIGINT,
+			nas_storage_reported_at TIMESTAMPTZ
 		)`,
 		`CREATE TABLE recordings (
 			id BIGSERIAL PRIMARY KEY,

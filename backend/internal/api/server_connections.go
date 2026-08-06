@@ -142,6 +142,9 @@ type connectionListItem struct {
 	InventoryMismatches    int64            `json:"inventory_mismatches"`
 	InventoryUnmatched     int64            `json:"inventory_unmatched"`
 	InventoryDigest        string           `json:"inventory_digest"`
+	NASStorageTotalBytes   *int64           `json:"nas_storage_total_bytes"`
+	NASStorageFreeBytes    *int64           `json:"nas_storage_free_bytes"`
+	NASStorageReportedAt   *time.Time       `json:"nas_storage_reported_at"`
 	PendingClips           int64            `json:"pending_clips"`
 	PendingBytes           int64            `json:"pending_bytes"`
 	OldestPendingAt        *time.Time       `json:"oldest_pending_at"`
@@ -309,7 +312,8 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		       nas_batch_retries, nas_batch_failures, inventory_mode,
 		       inventory_generation, inventory_scan_started_at, inventory_scan_completed_at,
 		       inventory_reported_at, inventory_clips, inventory_bytes,
-		       inventory_mismatches, inventory_unmatched, inventory_digest, conn.created_at,
+		       inventory_mismatches, inventory_unmatched, inventory_digest,
+		       nas_storage_total_bytes, nas_storage_free_bytes, nas_storage_reported_at, conn.created_at,
 		       pending.clips, pending.bytes, pending.oldest_at
 		FROM connections conn
 		`+connectionPendingLateralSQL+`
@@ -361,6 +365,9 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			inventoryBad    int64
 			inventoryOther  int64
 			inventoryDigest string
+			nasStorageTotal *int64
+			nasStorageFree  *int64
+			nasStorageAt    *time.Time
 			createdAt       time.Time
 			pendingClips    int64
 			pendingBytes    int64
@@ -373,7 +380,8 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			&batchClips, &batchBytes, &batchDurationMS, &downloadWorkers,
 			&batchRetries, &batchFailures, &inventoryMode, &inventoryGen,
 			&inventoryStart, &inventoryDone, &inventoryReport, &inventoryClips,
-			&inventoryBytes, &inventoryBad, &inventoryOther, &inventoryDigest, &createdAt,
+			&inventoryBytes, &inventoryBad, &inventoryOther, &inventoryDigest,
+			&nasStorageTotal, &nasStorageFree, &nasStorageAt, &createdAt,
 			&pendingClips, &pendingBytes, &oldestPendingAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan connection: %v", err))
 			return
@@ -429,6 +437,9 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			InventoryMismatches:    inventoryBad,
 			InventoryUnmatched:     inventoryOther,
 			InventoryDigest:        inventoryDigest,
+			NASStorageTotalBytes:   nasStorageTotal,
+			NASStorageFreeBytes:    nasStorageFree,
+			NASStorageReportedAt:   nasStorageAt,
 			PendingClips:           pendingClips,
 			PendingBytes:           pendingBytes,
 			OldestPendingAt:        oldestPendingAt,
@@ -585,6 +596,12 @@ type connectionHeartbeatRequest struct {
 	LastOutage         *connectionHeartbeatOutage `json:"last_outage"`
 	LastBatch          connectionHeartbeatBatch   `json:"last_batch"`
 	Inventory          *connectionInventoryStatus `json:"inventory,omitempty"`
+	Storage            *connectionStorageStatus   `json:"storage,omitempty"`
+}
+
+type connectionStorageStatus struct {
+	TotalBytes int64 `json:"total_bytes"`
+	FreeBytes  int64 `json:"free_bytes"`
 }
 
 type connectionInventoryStatus struct {
@@ -650,6 +667,11 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 				len(inv.Digest) != 64 || !lowerHex(inv.Digest) {
 				return errors.New("invalid completed NAS inventory summary")
 			}
+		}
+	}
+	if storage := req.Storage; storage != nil {
+		if storage.TotalBytes <= 0 || storage.FreeBytes < 0 || storage.FreeBytes > storage.TotalBytes {
+			return errors.New("invalid NAS storage telemetry")
 		}
 	}
 	if req.ClientVersion == "" {
@@ -752,6 +774,9 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    inventory_mismatches=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz > inventory_scan_completed_at) THEN $30 ELSE inventory_mismatches END,
 		    inventory_unmatched=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz > inventory_scan_completed_at) THEN $31 ELSE inventory_unmatched END,
 		    inventory_digest=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz > inventory_scan_completed_at) THEN $32 ELSE inventory_digest END,
+		    nas_storage_total_bytes=CASE WHEN $33::bigint IS NOT NULL THEN $33 ELSE nas_storage_total_bytes END,
+		    nas_storage_free_bytes=CASE WHEN $33::bigint IS NOT NULL THEN $34 ELSE nas_storage_free_bytes END,
+		    nas_storage_reported_at=CASE WHEN $33::bigint IS NOT NULL THEN now() ELSE nas_storage_reported_at END,
 		    updated_at=now()
 		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
@@ -763,7 +788,8 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		req.LastBatch.Failures,
 		*principal.APIKeyID, principal.AccountID,
 		inventoryGeneration, inventoryScanStartedAt, inventoryScanCompletedAt,
-		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest)
+		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
+		storageTotal(req.Storage), storageFree(req.Storage))
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
@@ -773,4 +799,18 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func storageTotal(storage *connectionStorageStatus) any {
+	if storage == nil {
+		return nil
+	}
+	return storage.TotalBytes
+}
+
+func storageFree(storage *connectionStorageStatus) any {
+	if storage == nil {
+		return nil
+	}
+	return storage.FreeBytes
 }

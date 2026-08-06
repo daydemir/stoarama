@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import tempfile
 import threading
@@ -157,6 +158,17 @@ class NASPullTests(unittest.TestCase):
             with mock.patch.object(pull.os.path, "ismount", return_value=False):
                 with self.assertRaisesRegex(RuntimeError, "not mounted"):
                     pull.check_storage(cfg)
+
+    def test_storage_status_only_reports_real_mount(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            with mock.patch.object(pull.os.path, "ismount", return_value=False):
+                self.assertIsNone(pull.storage_status(cfg))
+            usage = shutil._ntuple_diskusage(total=1000, used=750, free=250)
+            with mock.patch.object(pull.os.path, "ismount", return_value=True), mock.patch.object(
+                pull.shutil, "disk_usage", return_value=usage
+            ):
+                self.assertEqual(pull.storage_status(cfg), {"total_bytes": 1000, "free_bytes": 250})
 
     def test_download_verifies_size_and_sha(self):
         with tempfile.TemporaryDirectory() as raw:

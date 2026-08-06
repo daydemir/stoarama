@@ -435,11 +435,21 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "bad/generation"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", Digest: "not-a-digest"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanCompletedAt: &now}},
+		{Storage: &connectionStorageStatus{}},
+		{Storage: &connectionStorageStatus{TotalBytes: 100, FreeBytes: -1}},
+		{Storage: &connectionStorageStatus{TotalBytes: 100, FreeBytes: 101}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {
 			t.Errorf("invalid heartbeat %d accepted: %+v", i, request)
 		}
+	}
+}
+
+func TestValidateConnectionHeartbeatStorage(t *testing.T) {
+	request := connectionHeartbeatRequest{Storage: &connectionStorageStatus{TotalBytes: 1000, FreeBytes: 250}}
+	if err := validateConnectionHeartbeat(request); err != nil {
+		t.Fatalf("valid storage telemetry rejected: %v", err)
 	}
 }
 

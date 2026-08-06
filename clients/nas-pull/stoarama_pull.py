@@ -635,7 +635,7 @@ class Runtime:
                 "failures": failures,
             }
 
-    def heartbeat_payload(self, outage):
+    def heartbeat_payload(self, outage, storage=None):
         with self.lock:
             payload = {
                 "cursor_id": self.cursor_id,
@@ -653,6 +653,8 @@ class Runtime:
             }
         if outage:
             payload["last_outage"] = outage
+        if storage is not None:
+            payload["storage"] = storage
         if self.inventory is not None:
             inventory = self.inventory.summary()
             if inventory is not None:
@@ -679,6 +681,14 @@ def check_storage(cfg):
         fsync_dir(path)
     if cfg.output_dir.resolve() == cfg.state_dir.resolve():
         raise RuntimeError("clip and state mounts must be different")
+
+
+def storage_status(cfg):
+    """Report capacity only for the mounted clip destination, never its host fallback."""
+    if not cfg.output_dir.is_dir() or not os.path.ismount(str(cfg.output_dir)):
+        return None
+    usage = shutil.disk_usage(cfg.output_dir)
+    return {"total_bytes": usage.total, "free_bytes": usage.free}
 
 
 def acquire_lock(cfg):
@@ -963,7 +973,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
                 cfg,
                 "POST",
                 "/account/connections/heartbeat",
-                body=runtime.heartbeat_payload(outage),
+                body=runtime.heartbeat_payload(outage, storage_status(cfg)),
                 timeout=HEARTBEAT_TIMEOUT_SEC,
             )
             runtime.heartbeat_succeeded = True
@@ -973,7 +983,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
                     cfg,
                     "POST",
                     "/account/connections/heartbeat",
-                    body=runtime.heartbeat_payload(outage),
+                    body=runtime.heartbeat_payload(outage, storage_status(cfg)),
                     timeout=HEARTBEAT_TIMEOUT_SEC,
                 )
                 outage = None
