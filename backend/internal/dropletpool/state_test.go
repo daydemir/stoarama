@@ -333,6 +333,7 @@ func TestReconcileOrphans_MissingFromDO(t *testing.T) {
 
 func TestReconcileOrphans_YoungCreatedDropletSurvivesListVisibilityLag(t *testing.T) {
 	now := mustTime(t, "2026-06-24T12:00:00Z")
+	provisionTimeout := 15 * time.Minute
 	rows := []Droplet{{
 		ID:          4,
 		Name:        NamePrefix + "new",
@@ -340,9 +341,44 @@ func TestReconcileOrphans_YoungCreatedDropletSurvivesListVisibilityLag(t *testin
 		DODropletID: ptrInt64(1001),
 		CreatedAt:   now.Add(-30 * time.Second),
 	}}
-	plan := ReconcileOrphans(nil, rows, now, 15*time.Minute)
+	plan := ReconcileOrphans(nil, rows, now, provisionTimeout)
 	if len(plan.MissingFromDO) != 0 {
 		t.Fatalf("fresh create must survive provider list visibility lag, got %+v", plan)
+	}
+}
+
+func TestReconcileOrphans_AgedProvisioningDropletIsMissing(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+	provisionTimeout := 15 * time.Minute
+	rows := []Droplet{{
+		ID:          6,
+		Name:        NamePrefix + "aged",
+		State:       "provisioning",
+		DODropletID: ptrInt64(1003),
+		CreatedAt:   now.Add(-provisionTimeout),
+	}}
+	plan := ReconcileOrphans(nil, rows, now, provisionTimeout)
+	if len(plan.MissingFromDO) != 1 || plan.MissingFromDO[0].ID != 6 {
+		t.Fatalf("provisioning row at timeout must be reconciled, got %+v", plan)
+	}
+}
+
+func TestReconcileOrphans_YoungNonProvisioningDropletIsMissingImmediately(t *testing.T) {
+	now := mustTime(t, "2026-06-24T12:00:00Z")
+	for _, state := range []string{"active", "draining", "destroying"} {
+		t.Run(state, func(t *testing.T) {
+			rows := []Droplet{{
+				ID:          5,
+				Name:        NamePrefix + state,
+				State:       state,
+				DODropletID: ptrInt64(1002),
+				CreatedAt:   now.Add(-30 * time.Second),
+			}}
+			plan := ReconcileOrphans(nil, rows, now, 15*time.Minute)
+			if len(plan.MissingFromDO) != 1 || plan.MissingFromDO[0].ID != 5 {
+				t.Fatalf("young %s row must be reconciled immediately, got %+v", state, plan)
+			}
+		})
 	}
 }
 
@@ -360,11 +396,12 @@ func TestReconcileOrphans_MatchedByIDNoAction(t *testing.T) {
 // satisfiable without any live API call and to record CreateDroplet/DeleteDroplet
 // invocations. The production path always uses the real godo client.
 type fakeDOClient struct {
-	mu      sync.Mutex
-	fleet   []DODroplet
-	created []CreateDropletInput
-	deleted []int64
-	nextID  int64
+	mu        sync.Mutex
+	fleet     []DODroplet
+	created   []CreateDropletInput
+	deleted   []int64
+	deleteErr error
+	nextID    int64
 }
 
 func (f *fakeDOClient) CreateDroplet(_ context.Context, in CreateDropletInput) (DODroplet, error) {
@@ -381,6 +418,9 @@ func (f *fakeDOClient) DeleteDroplet(_ context.Context, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, id)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	out := f.fleet[:0]
 	for _, d := range f.fleet {
 		if d.ID != id {
