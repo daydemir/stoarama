@@ -192,6 +192,19 @@ func TestIPCamLivePlayerParsing(t *testing.T) {
 	}
 }
 
+func TestIPCamLiveManifestURL(t *testing.T) {
+	got, err := ipCamManifestURL("http://s24.ipcamlive.com/", "18ehdw7fodyulgibx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://s24.ipcamlive.com/streams/18ehdw7fodyulgibx/stream.m3u8"; got != want {
+		t.Fatalf("manifest=%q want=%q", got, want)
+	}
+	if _, err := ipCamManifestURL("https://example.com/", "stream"); err == nil {
+		t.Fatal("expected untrusted player address to be rejected")
+	}
+}
+
 func TestWorldCamPlayerParsing(t *testing.T) {
 	page := `<iframe src="https://worldcam.live/en/webcam/brzesko/embed/2"></iframe>`
 	if got := firstMatch(worldCamIframeRE, page); got != "https://worldcam.live/en/webcam/brzesko/embed/2" {

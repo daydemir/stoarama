@@ -193,6 +193,13 @@ func resolveIPCamLiveManifestURL(ctx context.Context, pageURL string, timeout ti
 	if err != nil {
 		return "", fmt.Errorf("ipcamlive page: %w", err)
 	}
+	// Some municipal sites embed IPCamLive's trusted player directly instead
+	// of linking to a public camera landing page. In that case the fetched page
+	// already contains the address and stream id and no short-lived token is
+	// needed.
+	if address, streamID := firstMatch(ipCamAddressRE, page), firstMatch(ipCamStreamIDRE, page); address != "" && streamID != "" {
+		return ipCamManifestURL(address, streamID)
+	}
 	alias := firstMatch(ipCamAliasRE, page)
 	token := firstMatch(ipCamTokenRE, page)
 	if alias == "" || token == "" {
@@ -214,6 +221,10 @@ func resolveIPCamLiveManifestURL(ctx context.Context, pageURL string, timeout ti
 	if address == "" || streamID == "" {
 		return "", fmt.Errorf("ipcamlive camera is unavailable")
 	}
+	return ipCamManifestURL(address, streamID)
+}
+
+func ipCamManifestURL(address, streamID string) (string, error) {
 	manifestBase, err := url.Parse(address)
 	if err != nil || !hostMatches(strings.ToLower(manifestBase.Hostname()), "ipcamlive.com") {
 		return "", fmt.Errorf("ipcamlive player returned an invalid stream host")
