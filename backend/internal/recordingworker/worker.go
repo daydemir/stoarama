@@ -107,6 +107,7 @@ const uploadIntentRefreshMargin = recordingapi.UploadTimeout + 30*time.Second
 const continuousDiskMonitorInterval = 5 * time.Second
 const diskPauseLogInterval = 5 * time.Minute
 const diskErrorLogInterval = 5 * time.Minute
+const continuousTimelineLeadAllowance = 5 * time.Second
 
 func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.Client == nil {
@@ -635,6 +636,14 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				return capture.ErrContinuousSegmentDuplicate
 			}
 			seg = clampContinuousSegmentTimeline(seg, timelineEnd)
+			// Some live HLS origins briefly drain an already-published DVR tail
+			// faster than wall time after a reconnect. Keep every source-quality
+			// segment, but do not publish its logical timeline in the future: wait
+			// for wall time to catch up before handing it to the upload pool. The
+			// capture directory remains protected by the disk-pressure monitor.
+			if err := waitForContinuousTimeline(attemptCtx, seg.EndAt, time.Now); err != nil {
+				return err
+			}
 			seg.CaptureSequence = captureSequence + 1
 			if err := pool.Submit(seg); err != nil {
 				return err
@@ -763,6 +772,32 @@ func clampContinuousSegmentTimeline(seg capture.Segment, timelineEnd time.Time) 
 		seg.EndAt = seg.StartAt.Add(time.Millisecond)
 	}
 	return seg
+}
+
+func continuousTimelineDelay(endAt, now time.Time) time.Duration {
+	if endAt.IsZero() {
+		return 0
+	}
+	delay := endAt.Sub(now.Add(continuousTimelineLeadAllowance))
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+func waitForContinuousTimeline(ctx context.Context, endAt time.Time, now func() time.Time) error {
+	delay := continuousTimelineDelay(endAt, now())
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type segmentDeliveryOps struct {

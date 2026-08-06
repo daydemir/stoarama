@@ -280,6 +280,43 @@ func TestClampContinuousSegmentTimelineAcrossReconnects(t *testing.T) {
 	}
 }
 
+func TestContinuousTimelineDelay(t *testing.T) {
+	now := time.Date(2026, 8, 6, 20, 0, 0, 0, time.UTC)
+	if got := continuousTimelineDelay(now.Add(4*time.Second), now); got != 0 {
+		t.Fatalf("ordinary lead delay=%s want 0", got)
+	}
+	if got := continuousTimelineDelay(now.Add(2*time.Minute), now); got != 115*time.Second {
+		t.Fatalf("future timeline delay=%s want 1m55s", got)
+	}
+	if got := continuousTimelineDelay(time.Time{}, now); got != 0 {
+		t.Fatalf("zero end delay=%s want 0", got)
+	}
+}
+
+func TestWaitForContinuousTimelineCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	now := time.Date(2026, 8, 6, 20, 0, 0, 0, time.UTC)
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- waitForContinuousTimeline(ctx, now.Add(time.Hour), func() time.Time {
+			close(started)
+			return now
+		})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("wait error=%v want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeline wait did not return promptly after cancellation")
+	}
+}
+
 func TestUploadWorkersDefaultsToBoundedConcurrency(t *testing.T) {
 	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: "https://api.test", NodeToken: "test"})
 	if err != nil {
