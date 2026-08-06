@@ -145,6 +145,12 @@
       opacity: 0.88;
       border-color: var(--accent);
     }
+    details.action-menu { position: relative; display: inline-block; }
+    details.action-menu > summary { list-style: none; width: 32px; height: 30px; display: grid; place-items: center; border: 1px solid var(--muted); border-radius: 9px; cursor: pointer; font-size: 19px; line-height: 1; }
+    details.action-menu > summary::-webkit-details-marker { display: none; }
+    .action-menu-pop { position: absolute; z-index: 40; right: 0; top: 35px; min-width: 190px; display: grid; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: 0 18px 45px rgba(0,0,0,.35); }
+    .action-menu-pop button { width: 100%; text-align: left; }
+    .action-menu-pop button.destructive { color: var(--err); }
     .panel-intro {
       display: flex;
       flex-wrap: wrap;
@@ -7519,7 +7525,7 @@ function renderSharedStorageRows(items) {
   sharedStorageRows.innerHTML = items.map((d) => {
     const grants = Array.isArray(d.grants) ? d.grants : [];
     const chips = grants.map((g) =>
-      `<span class="rec-toggle on" style="margin-right:4px;">${esc(g.email || ('#' + g.account_id))} <button class="btn-sm" data-shared-revoke="${Number(d.id)}" data-account="${Number(g.account_id)}">x</button></span>`
+      `<span class="rec-toggle on" style="margin-right:4px;">${esc(g.email || ('#' + g.account_id))} <details class="action-menu"><summary aria-label="Grant actions">⋯</summary><div class="action-menu-pop"><button class="btn-sm destructive" data-shared-revoke="${Number(d.id)}" data-account="${Number(g.account_id)}" data-email="${esc(g.email || ('#' + g.account_id))}">Revoke access…</button></div></details></span>`
     ).join('') || '<span class="muted">none</span>';
     return `<tr>
       <td>${esc(d.name)}</td>
@@ -7527,7 +7533,7 @@ function renderSharedStorageRows(items) {
       <td style="max-width:280px; overflow:hidden; text-overflow:ellipsis;">${esc(d.endpoint)}</td>
       <td>${esc(d.status)}${d.last_verify_error ? ` <span class="muted">(${esc(d.last_verify_error)})</span>` : ''}</td>
       <td>${chips}<div class="row" style="margin-top:4px;"><input type="text" placeholder="grant email" data-shared-grant-email="${Number(d.id)}" style="width:160px;" /><button class="btn-sm" data-shared-grant="${Number(d.id)}">Grant</button></div></td>
-      <td><button class="btn-sm" data-shared-delete="${Number(d.id)}">Delete</button></td>
+      <td><details class="action-menu"><summary aria-label="Storage destination actions">⋯</summary><div class="action-menu-pop"><button class="btn-sm destructive" data-shared-delete="${Number(d.id)}" data-name="${esc(d.name)}">Delete destination…</button></div></details></td>
     </tr>`;
   }).join('');
 }
@@ -7572,6 +7578,9 @@ if (sharedStorageRows) {
     const revoke = t.getAttribute('data-shared-revoke');
     try {
       if (del) {
+        const name = String(t.getAttribute('data-name') || `#${Number(del)}`);
+        const confirmation = window.prompt(`Delete shared storage destination ${name}? Future deliveries and all account grants will stop. Existing files at the destination are not deleted. Type DELETE to continue.`);
+        if (String(confirmation || '').trim() !== 'DELETE') return;
         await fetchJSON(`/api/v1/admin/storage-destinations/${Number(del)}`, { method: 'DELETE' });
         await loadSharedStorage();
       } else if (grant) {
@@ -7584,6 +7593,8 @@ if (sharedStorageRows) {
         await loadSharedStorage();
       } else if (revoke) {
         const account = Number(t.getAttribute('data-account') || 0);
+        const email = String(t.getAttribute('data-email') || `account #${account}`);
+        if (!window.confirm(`Revoke ${email}'s access to this shared storage destination? Future deliveries for that account will stop.`)) return;
         await fetchJSON(`/api/v1/admin/storage-destinations/${Number(revoke)}/grants/${account}`, { method: 'DELETE' });
         await loadSharedStorage();
       }

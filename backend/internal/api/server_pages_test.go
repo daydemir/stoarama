@@ -17,6 +17,37 @@ func TestLoadHTMLPageUsesEmbeddedAssets(t *testing.T) {
 	}
 }
 
+func TestDestructiveWebActionsUseMenusAndConfirmations(t *testing.T) {
+	checks := map[string][]string{
+		"streams.html": {
+			`id="detailStreamActionMenu" class="action-menu"`,
+			`Type DELETE to continue.`,
+		},
+		"recordings.html": {
+			`id="bulkCancelMenu" class="action-menu hidden"`,
+			`Active capture stops immediately. Existing clips are retained.`,
+		},
+		"admin.html": {
+			`aria-label="Storage destination actions"`,
+			`aria-label="Grant actions"`,
+			`Type DELETE to continue.`,
+			`if (!window.confirm(`,
+		},
+	}
+	for name, markers := range checks {
+		body, err := loadHTMLPage(name)
+		if err != nil {
+			t.Fatalf("load %s: %v", name, err)
+		}
+		page := string(body)
+		for _, marker := range markers {
+			if !strings.Contains(page, marker) {
+				t.Errorf("%s missing destructive-action safety marker %q", name, marker)
+			}
+		}
+	}
+}
+
 func TestStreamsPageIgnoresStaleFilterResponses(t *testing.T) {
 	body, err := loadHTMLPage("streams.html")
 	if err != nil {
