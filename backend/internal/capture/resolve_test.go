@@ -280,22 +280,48 @@ func TestMunicipalManifestResolverWorkflows(t *testing.T) {
 	// same SSRF guard and guarded dialer used by production resolution.
 	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
 	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	originalMunicipalFetch := municipalFetchSourcePage
 	t.Cleanup(func() {
 		resolveValidateURL = netguard.ValidatePublicURL
 		resolveDialControl = netguard.ControlReject
+		municipalFetchSourcePage = originalMunicipalFetch
 	})
 
+	var sourceFetches, embedFetches int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/karkonosze":
 			_, _ = w.Write([]byte(`<source src="https://webcam10.zachodnia.tv/live/cieplice/playlist.m3u8?token=abc&amp;x=1">`))
 		case "/lubliniec":
 			_, _ = w.Write([]byte(`["https:\/\/cdn02.aztv.pl\/live_lubliniec\/camera\/playlist.m3u8?scendtime=123&amp;schash=abc"]`))
+		case "/source":
+			sourceFetches++
+			_, _ = w.Write([]byte(`<iframe src="https://embed.karkonosze.online/ssl/cieplicelalka"></iframe>`))
+		case "/untrusted":
+			_, _ = w.Write([]byte(`<iframe src="https://attacker.example/ssl/cieplicelalka"></iframe>`))
+		case "/embed":
+			embedFetches++
+			if got := r.Header.Get("Referer"); got != "https://zachodnia.tv/camera" {
+				t.Fatalf("embed referer=%q", got)
+			}
+			_, _ = w.Write([]byte(`<source src="https://webcam10.zachodnia.tv/live/cieplice/playlist.m3u8?token=xyz&amp;x=2">`))
 		default:
 			_, _ = w.Write([]byte(`<html>no manifest</html>`))
 		}
 	}))
 	defer server.Close()
+	municipalFetchSourcePage = func(ctx context.Context, pageURL, referer string, timeout time.Duration) (string, error) {
+		mapped := pageURL
+		switch pageURL {
+		case "https://zachodnia.tv/camera":
+			mapped = server.URL + "/source"
+		case "https://zachodnia.tv/untrusted":
+			mapped = server.URL + "/untrusted"
+		case "https://embed.karkonosze.online/ssl/cieplicelalka":
+			mapped = server.URL + "/embed"
+		}
+		return fetchSourcePage(ctx, mapped, referer, timeout)
+	}
 
 	got, err := resolveKarkonoszeManifestURL(context.Background(), server.URL+"/karkonosze", time.Second)
 	if err != nil {
@@ -313,6 +339,19 @@ func TestMunicipalManifestResolverWorkflows(t *testing.T) {
 	}
 	if _, err := resolveEmbeddedManifestURL(context.Background(), server.URL+"/invalid", time.Second, "invalid"); err == nil {
 		t.Fatal("expected invalid manifest rejection")
+	}
+	got, err = resolveKarkonoszeManifestURL(context.Background(), "https://zachodnia.tv/camera", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://webcam10.zachodnia.tv/live/cieplice/playlist.m3u8?token=xyz&x=2"; got != want {
+		t.Fatalf("zachodnia=%q want=%q", got, want)
+	}
+	if sourceFetches != 1 || embedFetches != 1 {
+		t.Fatalf("workflow fetches source=%d embed=%d", sourceFetches, embedFetches)
+	}
+	if _, err := resolveKarkonoszeManifestURL(context.Background(), "https://zachodnia.tv/untrusted", time.Second); err == nil || !strings.Contains(err.Error(), "trusted player embed") {
+		t.Fatalf("untrusted workflow err=%v", err)
 	}
 
 	trusted := `<iframe src="https://embed.karkonosze.online/ssl/cieplicelalka"></iframe>`

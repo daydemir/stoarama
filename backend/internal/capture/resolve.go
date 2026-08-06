@@ -290,7 +290,7 @@ func resolveWebCameraManifestURL(ctx context.Context, pageURL string, timeout ti
 }
 
 func resolveKarkonoszeManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
-	page, err := fetchSourcePage(ctx, pageURL, "", timeout)
+	page, err := municipalFetchSourcePage(ctx, pageURL, "", timeout)
 	if err != nil {
 		return "", fmt.Errorf("karkonosze page: %w", err)
 	}
@@ -299,7 +299,7 @@ func resolveKarkonoszeManifestURL(ctx context.Context, pageURL string, timeout t
 		if embedURL == "" {
 			return "", fmt.Errorf("karkonosze page did not contain a trusted player embed")
 		}
-		page, err = fetchSourcePage(ctx, embedURL, pageURL, timeout)
+		page, err = municipalFetchSourcePage(ctx, embedURL, pageURL, timeout)
 		if err != nil {
 			return "", fmt.Errorf("karkonosze player: %w", err)
 		}
@@ -320,12 +320,14 @@ func trustedKarkonoszeEmbedURL(page string) string {
 }
 
 func resolveEmbeddedManifestURL(ctx context.Context, pageURL string, timeout time.Duration, label string) (string, error) {
-	page, err := fetchSourcePage(ctx, pageURL, "", timeout)
+	page, err := municipalFetchSourcePage(ctx, pageURL, "", timeout)
 	if err != nil {
 		return "", fmt.Errorf("%s page: %w", label, err)
 	}
 	return embeddedManifestURL(page, label)
 }
+
+var municipalFetchSourcePage = fetchSourcePage
 
 func embeddedManifestURL(page, label string) (string, error) {
 	manifest := embeddedManifestCandidate(page)
