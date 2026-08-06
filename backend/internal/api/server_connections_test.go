@@ -463,8 +463,8 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{pool: pool}
-	call := func(storage connectionStorageStatus) {
-		body, err := json.Marshal(connectionHeartbeatRequest{Storage: &storage})
+	call := func(storage *connectionStorageStatus) {
+		body, err := json.Marshal(connectionHeartbeatRequest{Storage: storage})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -476,7 +476,7 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 			t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
 		}
 	}
-	call(connectionStorageStatus{Available: true, TotalBytes: 1000, FreeBytes: 250})
+	call(&connectionStorageStatus{Available: true, TotalBytes: 1000, FreeBytes: 250})
 	var total, free *int64
 	var reportedAt *time.Time
 	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
@@ -484,6 +484,14 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 	}
 	if total == nil || *total != 1000 || free == nil || *free != 250 || reportedAt == nil {
 		t.Fatalf("persisted storage total=%v free=%v reported=%v", total, free, reportedAt)
+	}
+	storedReportedAt := *reportedAt
+	call(nil)
+	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
+		t.Fatal(err)
+	}
+	if total == nil || *total != 1000 || free == nil || *free != 250 || reportedAt == nil || !reportedAt.Equal(storedReportedAt) {
+		t.Fatalf("omitted storage did not preserve values total=%v free=%v reported=%v want_reported=%v", total, free, reportedAt, storedReportedAt)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/connections", nil)
@@ -499,7 +507,7 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 		}
 	}
 
-	call(connectionStorageStatus{Available: false})
+	call(&connectionStorageStatus{Available: false})
 	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
 		t.Fatal(err)
 	}
