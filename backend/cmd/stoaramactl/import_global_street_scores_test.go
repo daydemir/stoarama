@@ -117,7 +117,9 @@ func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
 		gssProbeResolvedURLWithHeaders = originalProbe
 	})
 	gssIsResolvableSourcePage = func(string, string) bool { return true }
-	gssProbeResolvedURLWithHeaders = func(context.Context, string, string) (*gssProbe, error) {
+	var probedHeaders string
+	gssProbeResolvedURLWithHeaders = func(_ context.Context, _ string, inputHeaders string) (*gssProbe, error) {
+		probedHeaders = inputHeaders
 		return &gssProbe{Width: 1920, Height: 1080}, nil
 	}
 
@@ -134,6 +136,9 @@ func TestVerifyGSSRowResolvableAndOfflinePages(t *testing.T) {
 	}
 	if result.SourceURL != row.value("source") || result.SourcePageURL != row.value("source") {
 		t.Fatalf("source fields=%q %q", result.SourceURL, result.SourcePageURL)
+	}
+	if probedHeaders != "Referer: https://example.com/camera\r\n" {
+		t.Fatalf("probe headers=%q", probedHeaders)
 	}
 
 	gssResolveCaptureInputWithHeaders = func(context.Context, string, string, string) (string, bool, string, error) {
