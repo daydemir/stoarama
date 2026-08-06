@@ -152,6 +152,7 @@ type gssResult struct {
 	StreamID        int64             `json:"stream_id,omitempty"`
 	StreamSlug      string            `json:"stream_slug,omitempty"`
 	SourceURL       string            `json:"source_url,omitempty"`
+	SourcePageURL   string            `json:"source_page_url,omitempty"`
 	ResolvedURL     string            `json:"resolved_url,omitempty"`
 	Probe           *gssProbe         `json:"probe,omitempty"`
 	Tags            []string          `json:"tags"`
@@ -936,8 +937,30 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 		result.Status = gssStatusVerifiedImportable
 		return result
 	case gssCandidatePageURL:
-		result.Status = gssStatusResolverMissing
-		result.Reason = result.Candidate.Reason
+		if !gssIsResolvableSourcePage(gssProvider, result.Candidate.URL) {
+			result.Status = gssStatusResolverMissing
+			result.Reason = result.Candidate.Reason
+			return result
+		}
+		verifyCtx, cancel := context.WithTimeout(ctx, opts.ProbeTimeout)
+		defer cancel()
+		resolved, _, err := gssResolveCaptureInput(verifyCtx, gssProvider, result.Candidate.URL, result.Candidate.URL)
+		if err != nil {
+			result.Status = gssStatusProbeFailed
+			result.Reason = err.Error()
+			return result
+		}
+		result.SourceURL = result.Candidate.URL
+		result.SourcePageURL = result.Candidate.URL
+		result.ResolvedURL = resolved
+		if probe, err := gssProbeResolvedURL(verifyCtx, resolved); err != nil {
+			result.Status = gssStatusProbeFailed
+			result.Reason = err.Error()
+			return result
+		} else {
+			result.Probe = probe
+		}
+		result.Status = gssStatusVerifiedImportable
 		return result
 	case gssCandidateManual:
 		result.Status = gssStatusManualReview
@@ -949,6 +972,12 @@ func verifyGSSRow(ctx context.Context, row gssRow, opts gssOptions) (result gssR
 		return result
 	}
 }
+
+var (
+	gssIsResolvableSourcePage = capture.IsResolvableSourcePage
+	gssResolveCaptureInput    = capture.ResolveCaptureInput
+	gssProbeResolvedURL       = probeGSSResolvedURL
+)
 
 func classifyGSSCandidate(row gssRow, targetAPIURL string) gssCandidate {
 	if ref, ok := parseStoaramaStreamRef(row.value("source")); ok {
@@ -1326,7 +1355,11 @@ func fetchGSSStreamByExternalID(ctx context.Context, opts gssOptions, externalID
 }
 
 func createGSSStream(ctx context.Context, opts gssOptions, result gssResult) (model.Stream, error) {
-	fields, err := capture.DeriveCanonicalStreamFields(result.SourceURL, "", "", "", "")
+	captureType := ""
+	if result.SourcePageURL != "" {
+		captureType = capture.CaptureTypeHLS
+	}
+	fields, err := capture.DeriveCanonicalStreamFields(result.SourceURL, result.SourcePageURL, captureType, "", "")
 	if err != nil {
 		return model.Stream{}, err
 	}
@@ -1335,7 +1368,7 @@ func createGSSStream(ctx context.Context, opts gssOptions, result gssResult) (mo
 		"external_id":           gssExternalID(result),
 		"name":                  gssStreamName(result),
 		"source_url":            result.SourceURL,
-		"source_page_url":       "",
+		"source_page_url":       result.SourcePageURL,
 		"source_family":         fields.SourceFamily,
 		"capture_type":          fields.CaptureType,
 		"execution_class":       fields.ExecutionClass,
