@@ -172,8 +172,9 @@ type OrphanPlan struct {
 	// DestroyOrphan are prefixed DO droplets with no live DB row that are older
 	// than the provision timeout: genuinely leaked, destroy them (SRE-orphan).
 	DestroyOrphan []DODroplet
-	// MissingFromDO are live DB rows (active/draining) whose DO droplet has
-	// vanished: the row should be reconciled to destroyed and its token revoked.
+	// MissingFromDO are live DB rows (provisioning/active/draining/destroying)
+	// whose DO droplet has vanished: the row should be reconciled to destroyed
+	// and its token revoked.
 	MissingFromDO []Droplet
 }
 
