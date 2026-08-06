@@ -121,6 +121,10 @@
     .conn-stats > div { padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--panel) 55%, transparent); }
     .conn-stats dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
     .conn-stats dd { margin: 3px 0 0; font-family: var(--mono); font-size: 13px; }
+    .conn-stats > div.warn { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
+    .conn-stats > div.warn dd { color: var(--warn); }
+    .conn-stats > div.error { border-color: color-mix(in srgb, var(--err) 55%, var(--border)); }
+    .conn-stats > div.error dd { color: var(--err); }
     .conn-stat-detail { display: block; margin-top: 2px; color: var(--muted); font-family: var(--sans); font-size: 12px; }
     .conn-alert { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--panel2) 70%, transparent); }
     .conn-alert.error { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: color-mix(in srgb, var(--err) 7%, var(--panel2)); }
@@ -763,6 +767,13 @@
           const inventoryBad = Number(c.inventory_mismatches || 0);
           const inventoryUnmatched = Number(c.inventory_unmatched || 0);
           const inventoryMode = String(c.inventory_mode || 'observe');
+          const storageFree = c.nas_storage_free_bytes == null ? NaN : Number(c.nas_storage_free_bytes);
+          const storageTotal = c.nas_storage_total_bytes == null ? NaN : Number(c.nas_storage_total_bytes);
+          const storageClass = Number.isFinite(storageFree) && storageFree < 200 * (1024 ** 3) ? 'error' :
+            Number.isFinite(storageFree) && storageFree < 1024 ** 4 ? 'warn' : '';
+          const storageSeverity = storageClass === 'error' ? 'Critical low storage · ' : storageClass === 'warn' ? 'Low storage · ' : '';
+          const storageText = Number.isFinite(storageFree) && Number.isFinite(storageTotal)
+            ? `${storageSeverity}${connectionBytes(storageFree)} free of ${connectionBytes(storageTotal)}` : 'Storage unavailable';
           const outageRecovered = Boolean(c.last_outage_recovered_at);
           const outage = outageClass
             ? `<div class="conn-alert">
@@ -791,6 +802,7 @@
               <div><dt>Last transfer batch</dt><dd>${batchClips.toLocaleString()} clips<span class="conn-stat-detail">${batchDurationMS > 0 ? `${Math.round(batchDurationMS / 1000)}s` : '—'} · ${batchRetries} retries · ${batchFailures} failed</span></dd></div>
               <div><dt>NAS inventory</dt><dd>${inventoryClips.toLocaleString()} clips<span class="conn-stat-detail">${escapeHTML(connectionBytes(inventoryBytes))} · ${inventoryBad} mismatch${inventoryBad === 1 ? '' : 'es'} · ${inventoryUnmatched} unmatched</span></dd></div>
               <div><dt>Inventory safety</dt><dd>${inventoryMode === 'enforce' ? 'Enforced' : 'Observing'}<span class="conn-stat-detail">${escapeHTML(c.inventory_scan_completed_at ? `Scanned ${connectionTimestamp(c.inventory_scan_completed_at)}` : 'Full scan pending')}</span></dd></div>
+              <div class="${storageClass}"><dt>NAS storage</dt><dd>${escapeHTML(storageText)}<span class="conn-stat-detail">${escapeHTML(c.nas_storage_reported_at ? `Reported ${connectionTimestamp(c.nas_storage_reported_at)}` : 'Not reported yet')}</span></dd></div>
             </dl>
             ${latestError}
             ${outage}

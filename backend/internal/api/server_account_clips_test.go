@@ -399,6 +399,9 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
 			kind TEXT NOT NULL,
+			label TEXT NOT NULL DEFAULT 'NAS',
+			poll_interval_sec INTEGER NOT NULL DEFAULT 60,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			api_key_id BIGINT,
 			inventory_mode TEXT NOT NULL DEFAULT 'observe',
 			inventory_generation TEXT NOT NULL DEFAULT '',
@@ -433,7 +436,15 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			nas_batch_duration_ms BIGINT NOT NULL DEFAULT 0,
 			nas_download_workers INTEGER NOT NULL DEFAULT 0,
 			nas_batch_retries INTEGER NOT NULL DEFAULT 0,
-			nas_batch_failures INTEGER NOT NULL DEFAULT 0
+			nas_batch_failures INTEGER NOT NULL DEFAULT 0,
+			nas_storage_total_bytes BIGINT,
+			nas_storage_free_bytes BIGINT,
+			nas_storage_reported_at TIMESTAMPTZ,
+			CONSTRAINT chk_connections_nas_storage CHECK (
+				(nas_storage_total_bytes IS NULL AND nas_storage_free_bytes IS NULL AND nas_storage_reported_at IS NULL)
+				OR (nas_storage_total_bytes IS NOT NULL AND nas_storage_free_bytes IS NOT NULL AND nas_storage_reported_at IS NOT NULL
+					AND nas_storage_total_bytes > 0 AND nas_storage_free_bytes >= 0 AND nas_storage_free_bytes <= nas_storage_total_bytes)
+			)
 		)`,
 		`CREATE TABLE recordings (
 			id BIGSERIAL PRIMARY KEY,
