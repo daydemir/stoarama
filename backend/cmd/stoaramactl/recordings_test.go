@@ -52,6 +52,7 @@ func TestDecodeRecordingBatchSpecStrict(t *testing.T) {
 		`{"stream_ids":[1],"naming_profile":"plaza_hourly_v1","mode":"continuous","active_weekdays":[8],"delivery":"managed","storage_destination_id":1}`,
 		`{"stream_ids":[1],"stream_timezones":[{"stream_id":2,"timezone":"UTC"}],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"managed","storage_destination_id":1}`,
 		`{"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"managed","storage_destination_id":1,"required_relay_slots":-1}`,
+		`{"target_account_id":-1,"stream_ids":[1],"naming_profile":"stoarama_v1","mode":"sampled","delivery":"managed","storage_destination_id":1}`,
 		valid + `{}`,
 	} {
 		if _, err := decodeRecordingBatchSpec(strings.NewReader(raw)); err == nil {

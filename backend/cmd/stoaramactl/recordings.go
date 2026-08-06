@@ -165,6 +165,7 @@ type recordingBatchTimezone struct {
 }
 
 type recordingBatchSpec struct {
+	TargetAccountID              int64                    `json:"target_account_id"`
 	StreamIDs                    []int64                  `json:"stream_ids"`
 	StreamTimezones              []recordingBatchTimezone `json:"stream_timezones"`
 	NamingProfile                recordingnaming.Profile  `json:"naming_profile"`
@@ -214,6 +215,9 @@ func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
 	}
 	if len(spec.StreamIDs) == 0 || len(spec.StreamIDs) > 200 {
 		return spec, fmt.Errorf("stream_ids must contain 1 to 200 ids")
+	}
+	if spec.TargetAccountID < 0 {
+		return spec, fmt.Errorf("target_account_id must be non-negative")
 	}
 	if spec.Mode != recordingScheduleSampled && spec.Mode != recordingScheduleContinuous {
 		return spec, fmt.Errorf("mode is required")

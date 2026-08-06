@@ -45,6 +45,7 @@ type streamTimezoneInput struct {
 }
 
 type batchScheduleRequest struct {
+	TargetAccountID              int64                 `json:"target_account_id"`
 	StreamIDs                    []int64               `json:"stream_ids"`
 	StreamTimezones              []streamTimezoneInput `json:"stream_timezones"`
 	NamingProfile                string                `json:"naming_profile"`
@@ -108,6 +109,29 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	accountID := principal.AccountID
+	if req.TargetAccountID < 0 {
+		util.WriteError(w, http.StatusBadRequest, "target_account_id must be non-negative")
+		return
+	}
+	if req.TargetAccountID > 0 {
+		if req.TargetAccountID != principal.AccountID && principal.Role != accountRoleAdmin {
+			util.WriteError(w, http.StatusForbidden, "target_account_id requires platform operator access")
+			return
+		}
+		var status string
+		if err := s.pool.QueryRow(r.Context(), `SELECT status FROM accounts WHERE id=$1`, req.TargetAccountID).Scan(&status); errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusBadRequest, "target account not found")
+			return
+		} else if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load target account")
+			return
+		} else if status != "active" {
+			util.WriteError(w, http.StatusBadRequest, "target account is not active")
+			return
+		}
+		accountID = req.TargetAccountID
 	}
 	ids, err := uniqueBatchStreamIDs(req.StreamIDs)
 	if err != nil {
@@ -241,7 +265,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		       (SELECT count(*) FROM recordings rec WHERE rec.account_id=$2 AND rec.stream_id=st.id AND rec.status <> 'canceled')
 		FROM streams st WHERE st.id=ANY($1::bigint[]) AND st.deleted_at IS NULL
 		ORDER BY st.id %s
-	`, batchEffectiveTimezoneSQL, batchTimezoneMissingSQL, streamLock), ids, principal.AccountID)
+	`, batchEffectiveTimezoneSQL, batchTimezoneMissingSQL, streamLock), ids, accountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load batch streams")
 		return
@@ -308,7 +332,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	// This is a preflight snapshot, not a reservation. The recording worker's
 	// lease limits remain the enforcement backstop if capacity changes.
-	onlineRelaySlots, err := availableRelayCapacity(r.Context(), tx, principal.AccountID, ids)
+	onlineRelaySlots, err := availableRelayCapacity(r.Context(), tx, accountID, ids)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load relay capacity")
 		return
@@ -346,7 +370,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	var deliveryDestArg any
 	if delivery == deliveryNASPull {
 		var hasConnection bool
-		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM connections WHERE account_id=$1 AND kind='nas_pull')`, principal.AccountID).Scan(&hasConnection); err != nil {
+		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM connections WHERE account_id=$1 AND kind='nas_pull')`, accountID).Scan(&hasConnection); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, "check nas pull connection")
 			return
 		}
@@ -357,7 +381,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	if req.DeliveryStorageDestinationID > 0 {
 		var status, provider string
-		err := tx.QueryRow(r.Context(), fmt.Sprintf(`SELECT status, provider FROM storage_destinations sd WHERE sd.id=$1 AND %s`, fmt.Sprintf(storageDestAccessPredicate, "$2")), req.DeliveryStorageDestinationID, principal.AccountID).Scan(&status, &provider)
+		err := tx.QueryRow(r.Context(), fmt.Sprintf(`SELECT status, provider FROM storage_destinations sd WHERE sd.id=$1 AND %s`, fmt.Sprintf(storageDestAccessPredicate, "$2")), req.DeliveryStorageDestinationID, accountID).Scan(&status, &provider)
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusBadRequest, "a verified WebDAV delivery_storage_destination_id is required")
 			return
@@ -376,7 +400,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 				return
 			}
 		} else {
-			managedID, _, err := s.provisionManagedDestination(r.Context(), tx, principal.AccountID)
+			managedID, _, err := s.provisionManagedDestination(r.Context(), tx, accountID)
 			if err != nil {
 				util.WriteError(w, http.StatusServiceUnavailable, "managed staging unavailable")
 				return
@@ -386,7 +410,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		deliveryDestArg = req.DeliveryStorageDestinationID
 	} else {
 		var verified, managed bool
-		err := tx.QueryRow(r.Context(), fmt.Sprintf(`SELECT status='verified', managed FROM storage_destinations sd WHERE sd.id=$1 AND %s`, fmt.Sprintf(storageDestAccessPredicate, "$2")), req.StorageDestinationID, principal.AccountID).Scan(&verified, &managed)
+		err := tx.QueryRow(r.Context(), fmt.Sprintf(`SELECT status='verified', managed FROM storage_destinations sd WHERE sd.id=$1 AND %s`, fmt.Sprintf(storageDestAccessPredicate, "$2")), req.StorageDestinationID, accountID).Scan(&verified, &managed)
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusBadRequest, "a verified storage_destination_id is required")
 			return
@@ -422,7 +446,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			PlazaName: st.namingDefaults.PlazaName,
 		}}
 		if namingProfile == recordingnaming.ProfilePlazaHourlyV1 && !req.DryRun {
-			namingRequest.Metadata.PlazaID, err = recordingnaming.EnsureStreamPlazaID(r.Context(), tx, principal.AccountID, st.id)
+			namingRequest.Metadata.PlazaID, err = recordingnaming.EnsureStreamPlazaID(r.Context(), tx, accountID, st.id)
 			if err != nil {
 				util.WriteError(w, http.StatusInternalServerError, "allocate plaza id")
 				return
@@ -484,7 +508,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			continue
 		}
 		if recordingID != 0 {
-			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, capture_via=$17, naming_profile=$18, folder_name=$19, naming_metadata_jsonb=$20, last_enqueued_fire_at=NULL, status='active', paused_at=NULL, completed_captured_clip_count=NULL, completed_expected_clip_count=NULL, consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, principal.AccountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery, captureVia, resolvedProfile.String(), folderName, namingMetadata)
+			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, capture_via=$17, naming_profile=$18, folder_name=$19, naming_metadata_jsonb=$20, last_enqueued_fire_at=NULL, status='active', paused_at=NULL, completed_captured_clip_count=NULL, completed_expected_clip_count=NULL, consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, accountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery, captureVia, resolvedProfile.String(), folderName, namingMetadata)
 			err = updateErr
 			if err == nil && updatedRecording.RowsAffected() != 1 {
 				err = fmt.Errorf("recording was canceled while scheduling")
@@ -503,7 +527,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 				sourceKind, err = classifyRecordingSource(strings.TrimSpace(st.sourceURL))
 			}
 			if err == nil {
-				recordingID, _, _, _, err = s.insertRecordingTx(r.Context(), tx, recordingInsertParams{accountID: principal.AccountID, captureDestID: captureDestID, deliveryDestArg: deliveryDestArg, name: fmt.Sprintf("%s [%d]", st.name, st.id), streamURL: st.sourceURL, streamIDArg: st.id, sourceKind: sourceKind, mode: string(mode), cronExprArg: cronArg, cronTimezone: st.timezone, clipDuration: clipDuration, dailyWindowStartArg: dailyStartArg, dailyWindowEndArg: dailyEndArg, activeWeekdays: weekdays, targetFPSArg: req.TargetFPS, nextFireArg: nextArg, startAt: startAt, endAtArg: endAt, delivery: delivery, captureVia: captureVia, namingProfile: resolvedProfile, folderName: folderName, namingMetadata: namingMetadata})
+				recordingID, _, _, _, err = s.insertRecordingTx(r.Context(), tx, recordingInsertParams{accountID: accountID, captureDestID: captureDestID, deliveryDestArg: deliveryDestArg, name: fmt.Sprintf("%s [%d]", st.name, st.id), streamURL: st.sourceURL, streamIDArg: st.id, sourceKind: sourceKind, mode: string(mode), cronExprArg: cronArg, cronTimezone: st.timezone, clipDuration: clipDuration, dailyWindowStartArg: dailyStartArg, dailyWindowEndArg: dailyEndArg, activeWeekdays: weekdays, targetFPSArg: req.TargetFPS, nextFireArg: nextArg, startAt: startAt, endAtArg: endAt, delivery: delivery, captureVia: captureVia, namingProfile: resolvedProfile, folderName: folderName, namingMetadata: namingMetadata})
 			}
 			created++
 		}

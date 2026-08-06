@@ -96,6 +96,45 @@ func TestBatchScheduleDryRunIsReadOnly(t *testing.T) {
 		Delivery:             "managed",
 		DryRun:               true,
 	}
+	_, otherAccountID := seedUserOrg(t, pool, "batch-other@example.com", false)
+	request.TargetAccountID = otherAccountID
+	forbiddenBody, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbiddenReq := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(forbiddenBody)), principal, "")
+	forbiddenRec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(forbiddenRec, forbiddenReq)
+	if forbiddenRec.Code != http.StatusForbidden {
+		t.Fatalf("non-operator target status=%d body=%s", forbiddenRec.Code, forbiddenRec.Body.String())
+	}
+	request.TargetAccountID = accountID
+	selfBody, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfReq := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(selfBody)), principal, "")
+	selfRec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(selfRec, selfReq)
+	if selfRec.Code != http.StatusOK {
+		t.Fatalf("self target status=%d body=%s", selfRec.Code, selfRec.Body.String())
+	}
+
+	operatorUserID, operatorAccountID := seedUserOrg(t, pool, "batch-operator@example.com", true)
+	operator := accountPrincipal{AccountID: operatorAccountID, UserID: operatorUserID, Role: accountRoleAdmin, MemberRole: "owner"}
+	request.TargetAccountID = accountID
+	operatorBody, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorReq := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(operatorBody)), operator, "")
+	operatorRec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(operatorRec, operatorReq)
+	if operatorRec.Code != http.StatusOK {
+		t.Fatalf("operator target status=%d body=%s", operatorRec.Code, operatorRec.Body.String())
+	}
+
+	request.TargetAccountID = 0
 	body, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
