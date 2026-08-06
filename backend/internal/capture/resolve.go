@@ -60,6 +60,14 @@ func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, so
 		return u, false, earthCamInputHeaders(sourcePageURL), nil
 	}
 
+	if host := sourcePageHost(sourcePageURL); hostMatches(host, "worldcam.eu") || hostMatches(host, "worldcam.live") {
+		u, referer, err := resolveWorldCamCaptureInput(ctx, sourcePageURL, 20*time.Second)
+		if err != nil {
+			return "", false, "", err
+		}
+		return u, false, worldCamInputHeaders(referer), nil
+	}
+
 	if IsResolvableSourcePage(provider, sourcePageURL) {
 		u, err := resolveKnownSourcePage(ctx, sourcePageURL, 20*time.Second)
 		if err != nil {
@@ -245,31 +253,40 @@ func ipCamManifestURL(address, streamID string) (string, error) {
 }
 
 func resolveWorldCamManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {
+	manifest, _, err := resolveWorldCamCaptureInput(ctx, pageURL, timeout)
+	return manifest, err
+}
+
+func resolveWorldCamCaptureInput(ctx context.Context, pageURL string, timeout time.Duration) (string, string, error) {
 	page, err := fetchSourcePage(ctx, pageURL, "", timeout)
 	if err != nil {
-		return "", fmt.Errorf("worldcam page: %w", err)
+		return "", "", fmt.Errorf("worldcam page: %w", err)
 	}
 	embedURL := pageURL
 	if sourcePageHost(pageURL) != "worldcam.live" {
 		embedURL = firstMatch(worldCamIframeRE, page)
 		if embedURL == "" || !hostMatches(sourcePageHost(embedURL), "worldcam.live") {
-			return "", fmt.Errorf("worldcam page did not contain a trusted player embed")
+			return "", "", fmt.Errorf("worldcam page did not contain a trusted player embed")
 		}
 		page, err = fetchSourcePage(ctx, embedURL, pageURL, timeout)
 		if err != nil {
-			return "", fmt.Errorf("worldcam player: %w", err)
+			return "", "", fmt.Errorf("worldcam player: %w", err)
 		}
 	}
 	encoded := firstMatch(worldCamSourceRE, page)
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil || len(raw) == 0 {
-		return "", fmt.Errorf("worldcam player did not contain a valid manifest")
+		return "", "", fmt.Errorf("worldcam player did not contain a valid manifest")
 	}
 	manifest := strings.TrimSpace(string(raw))
 	if _, err := resolveValidateURL(manifest); err != nil || !isHLSManifestURL(manifest) {
-		return "", fmt.Errorf("worldcam manifest rejected")
+		return "", "", fmt.Errorf("worldcam manifest rejected")
 	}
-	return manifest, nil
+	return manifest, embedURL, nil
+}
+
+func worldCamInputHeaders(referer string) string {
+	return "Referer: " + referer + "\r\nUser-Agent: Mozilla/5.0\r\n"
 }
 
 func resolveWebCameraManifestURL(ctx context.Context, pageURL string, timeout time.Duration) (string, error) {

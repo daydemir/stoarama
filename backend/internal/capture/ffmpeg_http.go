@@ -34,8 +34,8 @@ func appendFFmpegHTTPInputArgsWithHeaders(args []string, sourceURL string, recon
 	if pinHost != "" {
 		headers = strings.TrimRight("Host: "+pinHost+"\r\n"+headers, "\r\n")
 	}
-	if strings.Contains(strings.ToLower(headers), "user-agent:") {
-		args = append(args, "-user_agent", earthCamUserAgent)
+	if userAgent := httpInputHeaderValue(headers, "user-agent"); userAgent != "" {
+		args = append(args, "-user_agent", userAgent)
 	}
 	if headers != "" {
 		args = append(args, "-headers", headers+"\r\n")
@@ -56,4 +56,14 @@ func appendFFmpegHTTPInputArgsWithHeaders(args []string, sourceURL string, recon
 		)
 	}
 	return args
+}
+
+func httpInputHeaderValue(headers, name string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(headers, "\r\n", "\n"), "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(key), name) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }

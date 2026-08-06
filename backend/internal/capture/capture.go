@@ -31,6 +31,10 @@ type Frame struct {
 }
 
 func CaptureFrame(ctx context.Context, sourceURL string) (Frame, error) {
+	return CaptureFrameWithHeaders(ctx, sourceURL, "")
+}
+
+func CaptureFrameWithHeaders(ctx context.Context, sourceURL, inputHeaders string) (Frame, error) {
 	if sourceURL == "" {
 		return Frame{}, fmt.Errorf("source_url is empty")
 	}
@@ -41,7 +45,7 @@ func CaptureFrame(ctx context.Context, sourceURL string) (Frame, error) {
 		}
 		return buildFrame(b, mimeType, "snapshot_url")
 	}
-	b, err := captureWithFFmpeg(ctx, sourceURL)
+	b, err := captureWithFFmpeg(ctx, sourceURL, inputHeaders)
 	if err != nil {
 		return Frame{}, err
 	}
@@ -91,22 +95,25 @@ func ffmpegBin() string {
 	return "ffmpeg"
 }
 
-func captureWithFFmpeg(ctx context.Context, sourceURL string) ([]byte, error) {
+func captureWithFFmpeg(ctx context.Context, sourceURL, inputHeaders string) ([]byte, error) {
 	tmpDir, err := os.MkdirTemp("", "capture-frame-*")
 	if err != nil {
 		return nil, fmt.Errorf("mktemp: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 	outPath := filepath.Join(tmpDir, "frame.jpg")
-	cmd := exec.CommandContext(ctx,
-		ffmpegBin(),
+	args := []string{
 		"-y",
 		"-loglevel", "error",
+	}
+	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, false, 0, "", inputHeaders)
+	args = append(args,
 		"-i", sourceURL,
 		"-frames:v", "1",
 		"-q:v", "2",
 		outPath,
 	)
+	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg capture failed: %w (%s)", err, strings.TrimSpace(string(out)))
