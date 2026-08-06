@@ -167,6 +167,8 @@ func TestKnownSourcePageResolverDetection(t *testing.T) {
 		"https://www.ipcamlive.com/570b5e81b9c8e",
 		"https://de.worldcam.eu/liveview/10391",
 		"https://myslenice-rynek.webcamera.pl/",
+		"https://zachodnia.tv/kamera/cieplice-lalka/",
+		"https://lubliniec.aztv.pl/",
 	} {
 		if !IsResolvableSourcePage("global-street-scores", raw) {
 			t.Fatalf("expected supported resolver for %s", raw)
@@ -258,6 +260,18 @@ func TestWebCameraPlayerParsing(t *testing.T) {
 	}
 	if got := rot13(escaped); got != "https://hoktastream1.webcamera.pl/cam.stream/playlist.m3u8" {
 		t.Fatalf("manifest=%q", got)
+	}
+}
+
+func TestEmbeddedManifestURLParsing(t *testing.T) {
+	for _, page := range []string{
+		`<source src="https://webcam10.zachodnia.tv/live/cieplice/playlist.m3u8?token=abc&amp;x=1">`,
+		`["https:\/\/cdn02.aztv.pl\/live_lubliniec\/camera\/playlist.m3u8?scendtime=123&amp;schash=abc"]`,
+	} {
+		got := embeddedManifestCandidate(page)
+		if !strings.HasPrefix(got, "https://") || !strings.Contains(got, "playlist.m3u8?") || strings.Contains(got, `\/`) {
+			t.Fatalf("manifest=%q", got)
+		}
 	}
 }
 
