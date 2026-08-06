@@ -295,13 +295,7 @@ func resolveKarkonoszeManifestURL(ctx context.Context, pageURL string, timeout t
 		return "", fmt.Errorf("karkonosze page: %w", err)
 	}
 	if hostMatches(sourcePageHost(pageURL), "zachodnia.tv") {
-		embedURL := ""
-		for _, match := range worldCamIframeRE.FindAllStringSubmatch(page, -1) {
-			if len(match) > 1 && hostMatches(sourcePageHost(html.UnescapeString(match[1])), "embed.karkonosze.online") {
-				embedURL = html.UnescapeString(match[1])
-				break
-			}
-		}
+		embedURL := trustedKarkonoszeEmbedURL(page)
 		if embedURL == "" {
 			return "", fmt.Errorf("karkonosze page did not contain a trusted player embed")
 		}
@@ -311,6 +305,18 @@ func resolveKarkonoszeManifestURL(ctx context.Context, pageURL string, timeout t
 		}
 	}
 	return embeddedManifestURL(page, "karkonosze")
+}
+
+func trustedKarkonoszeEmbedURL(page string) string {
+	for _, match := range worldCamIframeRE.FindAllStringSubmatch(page, -1) {
+		if len(match) > 1 {
+			candidate := html.UnescapeString(match[1])
+			if hostMatches(sourcePageHost(candidate), "embed.karkonosze.online") {
+				return candidate
+			}
+		}
+	}
+	return ""
 }
 
 func resolveEmbeddedManifestURL(ctx context.Context, pageURL string, timeout time.Duration, label string) (string, error) {

@@ -275,6 +275,56 @@ func TestEmbeddedManifestURLParsing(t *testing.T) {
 	}
 }
 
+func TestMunicipalManifestResolverWorkflows(t *testing.T) {
+	// Not parallel: make the loopback workflow server reachable through the
+	// same SSRF guard and guarded dialer used by production resolution.
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/karkonosze":
+			_, _ = w.Write([]byte(`<source src="https://webcam10.zachodnia.tv/live/cieplice/playlist.m3u8?token=abc&amp;x=1">`))
+		case "/lubliniec":
+			_, _ = w.Write([]byte(`["https:\/\/cdn02.aztv.pl\/live_lubliniec\/camera\/playlist.m3u8?scendtime=123&amp;schash=abc"]`))
+		default:
+			_, _ = w.Write([]byte(`<html>no manifest</html>`))
+		}
+	}))
+	defer server.Close()
+
+	got, err := resolveKarkonoszeManifestURL(context.Background(), server.URL+"/karkonosze", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://webcam10.zachodnia.tv/live/cieplice/playlist.m3u8?token=abc&x=1"; got != want {
+		t.Fatalf("karkonosze=%q want=%q", got, want)
+	}
+	got, err = resolveEmbeddedManifestURL(context.Background(), server.URL+"/lubliniec", time.Second, "aztv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://cdn02.aztv.pl/live_lubliniec/camera/playlist.m3u8?scendtime=123&schash=abc"; got != want {
+		t.Fatalf("lubliniec=%q want=%q", got, want)
+	}
+	if _, err := resolveEmbeddedManifestURL(context.Background(), server.URL+"/invalid", time.Second, "invalid"); err == nil {
+		t.Fatal("expected invalid manifest rejection")
+	}
+
+	trusted := `<iframe src="https://embed.karkonosze.online/ssl/cieplicelalka"></iframe>`
+	if got := trustedKarkonoszeEmbedURL(trusted); got != "https://embed.karkonosze.online/ssl/cieplicelalka" {
+		t.Fatalf("trusted embed=%q", got)
+	}
+	untrusted := `<iframe src="https://attacker.example/ssl/cieplicelalka"></iframe>`
+	if got := trustedKarkonoszeEmbedURL(untrusted); got != "" {
+		t.Fatalf("untrusted embed accepted: %q", got)
+	}
+}
+
 func TestEarthCamManifestCandidatesFromHTML(t *testing.T) {
 	html := `<script>{"stream":"https:\/\/videos-3.earthcam.com\/fecnetwork\/15041.flv\/playlist.m3u8?t=abc&td=1"}</script>`
 	got := earthCamManifestCandidatesFromHTML(html)
