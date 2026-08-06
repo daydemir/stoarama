@@ -771,8 +771,9 @@
           const storageTotal = c.nas_storage_total_bytes == null ? NaN : Number(c.nas_storage_total_bytes);
           const storageClass = Number.isFinite(storageFree) && storageFree < 200 * (1024 ** 3) ? 'error' :
             Number.isFinite(storageFree) && storageFree < 1024 ** 4 ? 'warn' : '';
+          const storageSeverity = storageClass === 'error' ? 'Critical low storage · ' : storageClass === 'warn' ? 'Low storage · ' : '';
           const storageText = Number.isFinite(storageFree) && Number.isFinite(storageTotal)
-            ? `${connectionBytes(storageFree)} free of ${connectionBytes(storageTotal)}` : 'Waiting for NAS';
+            ? `${storageSeverity}${connectionBytes(storageFree)} free of ${connectionBytes(storageTotal)}` : 'Storage unavailable';
           const outageRecovered = Boolean(c.last_outage_recovered_at);
           const outage = outageClass
             ? `<div class="conn-alert">

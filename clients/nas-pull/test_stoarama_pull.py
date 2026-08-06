@@ -1,7 +1,6 @@
 import importlib.util
 import json
 import os
-import shutil
 import socket
 import tempfile
 import threading
@@ -162,13 +161,48 @@ class NASPullTests(unittest.TestCase):
     def test_storage_status_only_reports_real_mount(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
-            with mock.patch.object(pull.os.path, "ismount", return_value=False):
-                self.assertIsNone(pull.storage_status(cfg))
-            usage = shutil._ntuple_diskusage(total=1000, used=750, free=250)
-            with mock.patch.object(pull.os.path, "ismount", return_value=True), mock.patch.object(
-                pull.shutil, "disk_usage", return_value=usage
+            opened = SimpleNamespace(st_dev=1, st_ino=2)
+            usage = SimpleNamespace(f_frsize=1, f_bsize=1, f_blocks=1000, f_bavail=250)
+            with mock.patch.object(pull.os, "open", return_value=9), mock.patch.object(
+                pull.os, "close"
+            ), mock.patch.object(pull.os, "fstat", return_value=opened), mock.patch.object(
+                pull.os.path, "ismount", return_value=True
+            ), mock.patch.object(pull.os, "stat", return_value=opened), mock.patch.object(
+                pull.os, "fstatvfs", return_value=usage
             ):
-                self.assertEqual(pull.storage_status(cfg), {"total_bytes": 1000, "free_bytes": 250})
+                status = {"available": True, "total_bytes": 1000, "free_bytes": 250}
+                self.assertEqual(pull.storage_status(cfg), status)
+                runtime = pull.Runtime(cfg)
+                runtime.set_storage(status)
+                self.assertEqual(runtime.heartbeat_payload(None)["storage"], status)
+                outage = {"class": "timeout", "started_at": pull.utc_now(), "failure_count": 1}
+                self.assertEqual(runtime.heartbeat_payload(outage)["storage"], status)
+
+            with mock.patch.object(pull.os, "open", return_value=9), mock.patch.object(
+                pull.os, "close"
+            ), mock.patch.object(pull.os, "fstat", return_value=opened), mock.patch.object(
+                pull.os.path, "ismount", return_value=False
+            ):
+                unavailable = {"available": False}
+                self.assertEqual(pull.storage_status(cfg), unavailable)
+                runtime.set_storage(unavailable)
+                self.assertEqual(runtime.heartbeat_payload(None)["storage"], unavailable)
+                runtime.set_storage(status)
+                runtime.storage_observed_monotonic -= pull.STORAGE_TELEMETRY_MAX_AGE_SEC + 1
+                self.assertEqual(runtime.heartbeat_payload(None)["storage"], unavailable)
+
+    def test_storage_status_rejects_path_identity_change(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            with mock.patch.object(pull.os, "open", return_value=9), mock.patch.object(
+                pull.os, "close"
+            ), mock.patch.object(pull.os, "fstat", return_value=SimpleNamespace(st_dev=1, st_ino=2)), mock.patch.object(
+                pull.os.path, "ismount", return_value=True
+            ), mock.patch.object(pull.os, "stat", return_value=SimpleNamespace(st_dev=3, st_ino=4)), mock.patch.object(
+                pull.os, "fstatvfs"
+            ) as capacity:
+                self.assertEqual(pull.storage_status(cfg), {"available": False})
+                capacity.assert_not_called()
 
     def test_download_verifies_size_and_sha(self):
         with tempfile.TemporaryDirectory() as raw:

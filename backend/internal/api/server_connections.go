@@ -600,6 +600,7 @@ type connectionHeartbeatRequest struct {
 }
 
 type connectionStorageStatus struct {
+	Available  bool  `json:"available"`
 	TotalBytes int64 `json:"total_bytes"`
 	FreeBytes  int64 `json:"free_bytes"`
 }
@@ -670,7 +671,8 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 		}
 	}
 	if storage := req.Storage; storage != nil {
-		if storage.TotalBytes <= 0 || storage.FreeBytes < 0 || storage.FreeBytes > storage.TotalBytes {
+		if (!storage.Available && (storage.TotalBytes != 0 || storage.FreeBytes != 0)) ||
+			(storage.Available && (storage.TotalBytes <= 0 || storage.FreeBytes < 0 || storage.FreeBytes > storage.TotalBytes)) {
 			return errors.New("invalid NAS storage telemetry")
 		}
 	}
@@ -774,9 +776,9 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    inventory_mismatches=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz > inventory_scan_completed_at) THEN $30 ELSE inventory_mismatches END,
 		    inventory_unmatched=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz > inventory_scan_completed_at) THEN $31 ELSE inventory_unmatched END,
 		    inventory_digest=CASE WHEN $27::timestamptz IS NOT NULL AND (inventory_scan_completed_at IS NULL OR $27::timestamptz > inventory_scan_completed_at) THEN $32 ELSE inventory_digest END,
-		    nas_storage_total_bytes=CASE WHEN $33::bigint IS NOT NULL THEN $33 ELSE nas_storage_total_bytes END,
-		    nas_storage_free_bytes=CASE WHEN $33::bigint IS NOT NULL THEN $34 ELSE nas_storage_free_bytes END,
-		    nas_storage_reported_at=CASE WHEN $33::bigint IS NOT NULL THEN now() ELSE nas_storage_reported_at END,
+		    nas_storage_total_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_total_bytes WHEN $33 THEN $34 ELSE NULL END,
+		    nas_storage_free_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_free_bytes WHEN $33 THEN $35 ELSE NULL END,
+		    nas_storage_reported_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_reported_at WHEN $33 THEN now() ELSE NULL END,
 		    updated_at=now()
 		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
@@ -789,7 +791,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		*principal.APIKeyID, principal.AccountID,
 		inventoryGeneration, inventoryScanStartedAt, inventoryScanCompletedAt,
 		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
-		storageTotal(req.Storage), storageFree(req.Storage))
+		storageAvailable(req.Storage), storageTotal(req.Storage), storageFree(req.Storage))
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
@@ -799,6 +801,13 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func storageAvailable(storage *connectionStorageStatus) any {
+	if storage == nil {
+		return nil
+	}
+	return storage.Available
 }
 
 func storageTotal(storage *connectionStorageStatus) any {

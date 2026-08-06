@@ -435,9 +435,10 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "bad/generation"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", Digest: "not-a-digest"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanCompletedAt: &now}},
-		{Storage: &connectionStorageStatus{}},
-		{Storage: &connectionStorageStatus{TotalBytes: 100, FreeBytes: -1}},
-		{Storage: &connectionStorageStatus{TotalBytes: 100, FreeBytes: 101}},
+		{Storage: &connectionStorageStatus{Available: true}},
+		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: -1}},
+		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: 101}},
+		{Storage: &connectionStorageStatus{Available: false, TotalBytes: 100}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {
@@ -447,9 +448,66 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 }
 
 func TestValidateConnectionHeartbeatStorage(t *testing.T) {
-	request := connectionHeartbeatRequest{Storage: &connectionStorageStatus{TotalBytes: 1000, FreeBytes: 250}}
+	request := connectionHeartbeatRequest{Storage: &connectionStorageStatus{Available: true, TotalBytes: 1000, FreeBytes: 250}}
 	if err := validateConnectionHeartbeat(request); err != nil {
 		t.Fatalf("valid storage telemetry rejected: %v", err)
+	}
+}
+
+func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID, apiKeyID = int64(47), int64(123)
+	if _, err := pool.Exec(ctx, `INSERT INTO connections(account_id,kind,api_key_id) VALUES($1,'nas_pull',$2)`, accountID, apiKeyID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	call := func(storage connectionStorageStatus) {
+		body, err := json.Marshal(connectionHeartbeatRequest{Storage: &storage})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", bytes.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionHeartbeat(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	call(connectionStorageStatus{Available: true, TotalBytes: 1000, FreeBytes: 250})
+	var total, free *int64
+	var reportedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
+		t.Fatal(err)
+	}
+	if total == nil || *total != 1000 || free == nil || *free != 250 || reportedAt == nil {
+		t.Fatalf("persisted storage total=%v free=%v reported=%v", total, free, reportedAt)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/connections", nil)
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}))
+	rec := httptest.NewRecorder()
+	s.handleAccountConnectionsList(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{`"nas_storage_total_bytes":1000`, `"nas_storage_free_bytes":250`, `"nas_storage_reported_at":"`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("connection list missing %s: %s", want, rec.Body.String())
+		}
+	}
+
+	call(connectionStorageStatus{Available: false})
+	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
+		t.Fatal(err)
+	}
+	if total != nil || free != nil || reportedAt != nil {
+		t.Fatalf("unavailable storage was not cleared total=%v free=%v reported=%v", total, free, reportedAt)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_total_bytes=100,nas_storage_free_bytes=NULL,nas_storage_reported_at=NULL WHERE api_key_id=$1`, apiKeyID); err == nil {
+		t.Fatal("partial-null NAS storage row accepted")
 	}
 }
 

@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import sqlite3
@@ -29,6 +28,7 @@ DOWNLOAD_ATTEMPTS = 3
 HTTP_TIMEOUT_SEC = 120
 HEARTBEAT_TIMEOUT_SEC = 20
 HEARTBEAT_INTERVAL_SEC = 30
+STORAGE_TELEMETRY_MAX_AGE_SEC = HEARTBEAT_INTERVAL_SEC * 3
 UPDATE_INTERVAL_SEC = 600
 INVENTORY_SCAN_INTERVAL_SEC = 24 * 60 * 60
 INVENTORY_SYNC_BATCH = 200
@@ -569,6 +569,10 @@ class Runtime:
         self.list_succeeded = False
         self.stable_marked = False
         self.inventory = inventory
+        # A new client explicitly clears any stale server-side capacity until
+        # the independent probe proves that the configured NAS mount is live.
+        self.storage = {"available": False}
+        self.storage_observed_monotonic = time.monotonic()
         self.batch = {
             "completed_at": None,
             "clips": 0,
@@ -635,7 +639,12 @@ class Runtime:
                 "failures": failures,
             }
 
-    def heartbeat_payload(self, outage, storage=None):
+    def set_storage(self, storage):
+        with self.lock:
+            self.storage = storage.copy()
+            self.storage_observed_monotonic = time.monotonic()
+
+    def heartbeat_payload(self, outage):
         with self.lock:
             payload = {
                 "cursor_id": self.cursor_id,
@@ -651,10 +660,14 @@ class Runtime:
                 "client_last_error_at": self.last_error_at,
                 "last_batch": self.batch.copy(),
             }
+            storage = self.storage.copy() if self.storage is not None else None
+            storage_age = time.monotonic() - self.storage_observed_monotonic
         if outage:
             payload["last_outage"] = outage
-        if storage is not None:
+        if storage is not None and storage_age <= STORAGE_TELEMETRY_MAX_AGE_SEC:
             payload["storage"] = storage
+        elif self.storage is not None:
+            payload["storage"] = {"available": False}
         if self.inventory is not None:
             inventory = self.inventory.summary()
             if inventory is not None:
@@ -684,11 +697,39 @@ def check_storage(cfg):
 
 
 def storage_status(cfg):
-    """Report capacity only for the mounted clip destination, never its host fallback."""
-    if not cfg.output_dir.is_dir() or not os.path.ismount(str(cfg.output_dir)):
-        return None
-    usage = shutil.disk_usage(cfg.output_dir)
-    return {"total_bytes": usage.total, "free_bytes": usage.free}
+    """Read capacity from a stable mounted-directory descriptor, never its host fallback."""
+    fd = None
+    try:
+        fd = os.open(cfg.output_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        opened = os.fstat(fd)
+        if not os.path.ismount(str(cfg.output_dir)):
+            return {"available": False}
+        current = os.stat(cfg.output_dir)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            return {"available": False}
+        usage = os.fstatvfs(fd)
+        unit = usage.f_frsize or usage.f_bsize
+        return {
+            "available": True,
+            "total_bytes": usage.f_blocks * unit,
+            "free_bytes": usage.f_bavail * unit,
+        }
+    except OSError:
+        return {"available": False}
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def storage_probe_loop(cfg, runtime, stop_event):
+    """Keep filesystem syscalls off the liveness-critical heartbeat thread."""
+    while not stop_event.is_set():
+        try:
+            runtime.set_storage(storage_status(cfg))
+        except Exception as exc:
+            runtime.set_storage({"available": False})
+            log("WARN", "storage telemetry probe failed: %s" % exc)
+        stop_event.wait(HEARTBEAT_INTERVAL_SEC)
 
 
 def acquire_lock(cfg):
@@ -973,7 +1014,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
                 cfg,
                 "POST",
                 "/account/connections/heartbeat",
-                body=runtime.heartbeat_payload(outage, storage_status(cfg)),
+                body=runtime.heartbeat_payload(outage),
                 timeout=HEARTBEAT_TIMEOUT_SEC,
             )
             runtime.heartbeat_succeeded = True
@@ -983,7 +1024,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
                     cfg,
                     "POST",
                     "/account/connections/heartbeat",
-                    body=runtime.heartbeat_payload(outage, storage_status(cfg)),
+                    body=runtime.heartbeat_payload(outage),
                     timeout=HEARTBEAT_TIMEOUT_SEC,
                 )
                 outage = None
@@ -1086,6 +1127,8 @@ def run(cfg):
     signal.signal(signal.SIGINT, stop)
     heartbeat = threading.Thread(target=heartbeat_loop, args=(cfg, runtime, stop_event), daemon=True)
     heartbeat.start()
+    storage_probe = threading.Thread(target=storage_probe_loop, args=(cfg, runtime, stop_event), daemon=True)
+    storage_probe.start()
     updater = threading.Thread(target=update_loop, args=(cfg, runtime, stop_event, update_ready), daemon=True)
     updater.start()
     inventory_worker = threading.Thread(target=inventory_loop, args=(cfg, inventory, stop_event), daemon=True)
@@ -1127,6 +1170,7 @@ def run(cfg):
     finally:
         stop_event.set()
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
+        storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
         mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
         if inventory_worker.is_alive():

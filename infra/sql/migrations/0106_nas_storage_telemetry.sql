@@ -10,5 +10,10 @@ ALTER TABLE connections
     CHECK (
       (nas_storage_total_bytes IS NULL AND nas_storage_free_bytes IS NULL AND nas_storage_reported_at IS NULL)
       OR
-      (nas_storage_total_bytes > 0 AND nas_storage_free_bytes >= 0 AND nas_storage_free_bytes <= nas_storage_total_bytes AND nas_storage_reported_at IS NOT NULL)
-    );
+      (nas_storage_total_bytes IS NOT NULL
+       AND nas_storage_free_bytes IS NOT NULL
+       AND nas_storage_reported_at IS NOT NULL
+       AND nas_storage_total_bytes > 0
+       AND nas_storage_free_bytes >= 0
+       AND nas_storage_free_bytes <= nas_storage_total_bytes)
+    ) NOT VALID;
