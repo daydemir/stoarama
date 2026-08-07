@@ -370,7 +370,7 @@ func TestBatchScheduleRefreshesExistingRecordingSource(t *testing.T) {
 	`, accountID).Scan(&destinationID); err != nil {
 		t.Fatal(err)
 	}
-	const oldURL = "https://old.example.com/live.m3u8"
+	const oldURL = "https://old.example.com/live/stream.flv"
 	const newURL = "https://new.example.com/live.m3u8"
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps, local_timezone)
@@ -381,7 +381,7 @@ func TestBatchScheduleRefreshesExistingRecordingSource(t *testing.T) {
 	}
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, status, start_at, capture_via)
-		VALUES ($1, $2, 'Source Refresh', $3, $4, 'hls_live', 'sampled', '0 * * * *', 'UTC', 60, 'active', now(), 'cloud')
+		VALUES ($1, $2, 'Source Refresh', $3, $4, 'ffmpeg_direct', 'sampled', '0 * * * *', 'UTC', 60, 'active', now(), 'cloud')
 		RETURNING id
 	`, accountID, destinationID, oldURL, streamID).Scan(&recordingID); err != nil {
 		t.Fatal(err)
