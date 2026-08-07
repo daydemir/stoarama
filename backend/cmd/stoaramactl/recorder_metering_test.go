@@ -140,7 +140,7 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 		{`INSERT INTO account_billing(account_id,stripe_customer_id,stripe_subscription_id) VALUES(47,'cus_47','sub_47')`, nil},
 		{`UPDATE billing_storage_fact_config SET eligible_from='2026-09-01'`, nil},
 		{`INSERT INTO billing_meter_periods(account_id,stripe_customer_id,stripe_subscription_id,period_start,period_end) VALUES(47,'cus_47','sub_47',$1,$2)`, []any{start, end}},
-		{`INSERT INTO recording_billing_hours(account_id,rec_hour) SELECT 47,$1 + (n||' hours')::interval FROM generate_series(1,5) n`, []any{start}},
+		{`INSERT INTO recording_billing_hours(account_id,rec_hour) SELECT 47,$1::timestamptz + (n||' hours')::interval FROM generate_series(1,5) n`, []any{start}},
 	} {
 		if _, err := pool.Exec(ctx, setup.sql, setup.args...); err != nil {
 			t.Fatal(err)
