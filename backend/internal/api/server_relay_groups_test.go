@@ -56,6 +56,10 @@ func TestRelayGroupChangeAllowed(t *testing.T) {
 func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
 	for _, want := range []string{
 		"n.relay_group_id IS NULL",
+		"j.scheduled_for <= now()-interval '3 seconds'",
+		"peer.relay_group_id=n.relay_group_id",
+		"peer.last_heartbeat_at >= now()-interval '120 seconds'",
+		"pj.lease_owner='node:'||peer.id::text",
 		"gn.account_id=n.account_id",
 		"gn.relay_group_id=n.relay_group_id",
 		"g.account_id=n.account_id",
@@ -158,6 +162,52 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	var renewedAt time.Time
 	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, nil).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expired heartbeat err=%v, want pgx.ErrNoRows", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE relay_groups SET max_streams=10 WHERE id=1;
+		INSERT INTO recordings VALUES
+		  (10, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/10.m3u8', NULL, 1, NULL),
+		  (11, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/11.m3u8', NULL, 1, NULL),
+		  (12, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/12.m3u8', NULL, 1, NULL);
+		INSERT INTO recording_jobs VALUES
+		  (10, 10, 'pending', now()-interval '1 second', 'continuous_window', now(), 60, NULL, NULL, 0, now(), now()+interval '1 hour'),
+		  (11, 11, 'pending', now()-interval '1 second', 'continuous_window', now(), 60, NULL, NULL, 0, now(), now()+interval '1 hour'),
+		  (12, 12, 'pending', now()-interval '1 second', 'continuous_window', now(), 60, NULL, NULL, 0, now(), now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	lease := func(nodeID int64) error {
+		_, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: nodeID, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
+		return err
+	}
+	if err := lease(1); err != nil {
+		t.Fatalf("first balanced lease: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET scheduled_for=now() WHERE id IN (11,12)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("busier node lease err=%v, want pgx.ErrNoRows", err)
+	}
+	if err := lease(2); err != nil {
+		t.Fatalf("least-loaded peer lease: %v", err)
+	}
+	var node1Leases, node2Leases int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER(WHERE lease_owner='node:1'),count(*) FILTER(WHERE lease_owner='node:2')
+		FROM recording_jobs WHERE status='leased' AND lease_expires_at>now()
+	`).Scan(&node1Leases, &node2Leases); err != nil {
+		t.Fatal(err)
+	}
+	if node1Leases != 1 || node2Leases != 1 {
+		t.Fatalf("balanced leases node1=%d node2=%d, want 1/1", node1Leases, node2Leases)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET scheduled_for=now()-interval '4 seconds' WHERE id=12`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); err != nil {
+		t.Fatalf("overdue fairness fallback lease: %v", err)
 	}
 
 	if _, err := pool.Exec(ctx, `

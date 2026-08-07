@@ -136,6 +136,29 @@ const relayLeaseSQL = `
 	         WHERE aj.status = 'leased'
 	           AND aj.lease_owner = 'node:' || $1::text
 	           AND aj.lease_expires_at > now()) < n.relay_max_streams
+	    -- Within a group, only a least-loaded healthy node may take the next job.
+	    -- The surrounding group row lock makes this comparison authoritative, so
+	    -- simultaneous pollers converge on an even distribution instead of the
+	    -- fastest poller monopolizing long continuous-window leases.
+	    AND (j.scheduled_for <= now()-interval '3 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
+	         SELECT 1 FROM nodes peer
+	         WHERE peer.account_id=n.account_id
+	           AND peer.relay_group_id=n.relay_group_id
+	           AND peer.node_type='relay'
+	           AND peer.status='active'
+	           AND peer.last_heartbeat_at >= now()-interval '120 seconds'
+	           AND (SELECT COUNT(*) FROM recording_jobs pj
+	                WHERE pj.status='leased'
+	                  AND pj.lease_owner='node:'||peer.id::text
+	                  AND pj.lease_expires_at>now()) < peer.relay_max_streams
+	           AND (SELECT COUNT(*) FROM recording_jobs pj
+	                WHERE pj.status='leased'
+	                  AND pj.lease_owner='node:'||peer.id::text
+	                  AND pj.lease_expires_at>now()) <
+	               (SELECT COUNT(*) FROM recording_jobs nj
+	                WHERE nj.status='leased'
+	                  AND nj.lease_owner='node:'||n.id::text
+	                  AND nj.lease_expires_at>now())))
 	    AND (n.relay_group_id IS NULL OR (
 	         SELECT COUNT(*)
 	         FROM recording_jobs gj
