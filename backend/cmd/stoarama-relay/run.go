@@ -27,6 +27,7 @@ const (
 	relayMinActiveFreeBytes = 512 << 20
 	relayLogMaxBytes        = 8 << 20
 	relayLogTailBytes       = 64 << 10
+	relayJobPollInterval    = time.Second
 )
 
 // runRelay is the launchd/systemd service entrypoint. It runs the shared
@@ -114,7 +115,7 @@ func runRelay(ctx context.Context) error {
 		WorkerID:                    fmt.Sprintf("node:%d", cfg.NodeID),
 		Concurrency:                 relayWorkerCeiling,
 		HeartbeatSec:                15,
-		PollInterval:                5 * time.Second,
+		PollInterval:                relayJobPollInterval,
 		SkipDropletHeartbeat:        true,
 		ClassifyYouTubeCookieErrors: true,
 		ActiveJobs:                  &activeJobs,
