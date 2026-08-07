@@ -140,7 +140,9 @@ install_verified_executable() {
 # Fetch the release manifest up front so every downloaded artifact it lists (the
 # relay tarball and yt-dlp) is checksum-verified before anything is executed.
 LATEST_JSON="$(mktemp)"
-trap 'rm -f "${LATEST_JSON}"' EXIT
+RELAY_ARCHIVE="$(mktemp)"
+FFMPEG_ARCHIVE="$(mktemp)"
+trap 'rm -f "${LATEST_JSON}" "${RELAY_ARCHIVE}" "${FFMPEG_ARCHIVE}"' EXIT
 echo "Fetching release manifest ${MANIFEST_NAME}..."
 download "${MANIFEST_NAME}" "${LATEST_JSON}"
 MANIFEST="$(tr '\n' ' ' < "${LATEST_JSON}" | sed -E 's/[[:space:]]+/ /g')"
@@ -171,8 +173,8 @@ if [[ -z "$(sha_for_artifact "${RELAY_TARBALL}")" ]]; then
   echo "error: no relay artifact for ${KEY} in ${MANIFEST_NAME}" >&2
   exit 1
 fi
-download "${RELAY_TARBALL}" "/tmp/stoarama-relay.tar.gz"
-verify_sha "/tmp/stoarama-relay.tar.gz" "${RELAY_TARBALL}"
+download "${RELAY_TARBALL}" "${RELAY_ARCHIVE}"
+verify_sha "${RELAY_ARCHIVE}" "${RELAY_TARBALL}"
 
 YTDLP_ARTIFACT="yt-dlp-${RELEASE_VERSION}-${KEY}"
 if [[ -z "$(sha_for_artifact "${YTDLP_ARTIFACT}")" ]]; then
@@ -189,7 +191,7 @@ fi
 
 # Replace the relay only after every required dependency has been verified. This
 # leaves an existing installation untouched if dependency preparation fails.
-tar -xzf "/tmp/stoarama-relay.tar.gz" -C "${BIN_DIR}"
+tar -xzf "${RELAY_ARCHIVE}" -C "${BIN_DIR}"
 chmod +x "${BIN_DIR}/stoarama-relay"
 unquarantine "${BIN_DIR}/stoarama-relay"
 
@@ -205,9 +207,9 @@ if [[ ! -x "${BIN_DIR}/ffmpeg" ]]; then
   fi
   if [[ -n "$(sha_for_artifact "${FFMPEG_TARBALL}")" ]]; then
     echo "Downloading ffmpeg..."
-    download "${FFMPEG_TARBALL}" "/tmp/stoarama-ffmpeg.tar.gz"
-    verify_sha "/tmp/stoarama-ffmpeg.tar.gz" "${FFMPEG_TARBALL}"
-    tar -xzf "/tmp/stoarama-ffmpeg.tar.gz" -C "${BIN_DIR}"
+    download "${FFMPEG_TARBALL}" "${FFMPEG_ARCHIVE}"
+    verify_sha "${FFMPEG_ARCHIVE}" "${FFMPEG_TARBALL}"
+    tar -xzf "${FFMPEG_ARCHIVE}" -C "${BIN_DIR}"
     chmod +x "${BIN_DIR}/ffmpeg" "${BIN_DIR}/ffprobe" 2>/dev/null || true
     unquarantine "${BIN_DIR}/ffmpeg"
     unquarantine "${BIN_DIR}/ffprobe"
