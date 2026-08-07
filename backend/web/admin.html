@@ -1400,6 +1400,7 @@
       }
     }
     @media (max-width: 640px) {
+      .action-menu-pop { position: fixed; top: 50%; right: 12px; left: 12px; min-width: 0; max-height: calc(100vh - 24px); overflow-y: auto; transform: translateY(-50%); z-index: 1000; }
       .shell { padding: 14px 12px 32px; }
       /* Horizontal scroll for wide tables instead of clipping */
       .tbl-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -2797,6 +2798,7 @@ async function handleTagMutation(action, streamID, rawTagValue) {
   if (action === 'tag-add') {
     next = normalizeTags(current.concat(inputTags));
   } else if (action === 'tag-remove') {
+    if (!window.confirm(`Remove tag ${inputTags.join(', ')} from stream ${streamID}?`)) return false;
     const removeSet = new Set(inputTags);
     next = current.filter((tag) => !removeSet.has(tag));
   } else {
@@ -2818,7 +2820,7 @@ async function setStreamRecordingState(streamID, recordingState) {
       const confirmToken = `unassign:${streamID}`;
       const entered = window.prompt(`Type ${confirmToken} to stop recording for stream ${streamID}.`, '');
       if (String(entered || '').trim() !== confirmToken) {
-        throw new Error(`recording disable cancelled (confirmation must equal ${confirmToken})`);
+        return false;
       }
     }
     return fetchJSON(`/api/v1/recording/streams/${streamID}/state`, {
@@ -3350,9 +3352,10 @@ async function toggleStreamTagFromImageModal(tagName) {
   const action = tagOn ? 'tag-remove' : 'tag-add';
   imageModalShortlistBusy = true;
   try {
-    await withLoading(tagOn ? `Removing ${tag}...` : `Adding ${tag}...`, async () => {
-      await handleTagMutation(action, streamID, tag);
+    const changed = await withLoading(tagOn ? `Removing ${tag}...` : `Adding ${tag}...`, async () => {
+      return handleTagMutation(action, streamID, tag);
     });
+    if (changed === false) { setStreamStatus('No changes.'); return; }
     rerenderTagEditorsForStream(streamID);
     renderImageModalMetadata(linkEl);
     renderImageModalMetaStatus(tagOn ? `removed ${tag}` : `added ${tag}`, 'ok');
@@ -4425,7 +4428,7 @@ function renderServersAssignments(items) {
       <td class="mono fs11">${esc(it.execution_class || '-')}</td>
       <td class="mono fs11">${esc(formatDateTimeShort(it.assigned_at) || '-')}</td>
       <td class="mono fs11">${esc(it.last_frame_at ? formatDateTimeShort(it.last_frame_at) : '-')}</td>
-      <td><button class="btn-sm" data-server-action="unassign" data-stream-id="${streamID}">Unassign</button></td>
+      <td><details class="action-menu"><summary aria-label="Assignment actions">⋯</summary><div class="action-menu-pop"><button class="btn-sm destructive" data-server-action="unassign" data-stream-id="${streamID}">Unassign…</button></div></details></td>
     `;
     serversAssignmentsRows.appendChild(tr);
   }
@@ -5063,7 +5066,7 @@ function renderStreamRows() {
     const state = String(s.recording_state || 'off');
     const canStartRecording = supportsClipRecording(s);
     const recHtml = state === 'on'
-      ? `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;"><button class="btn-sm" data-action="recording-disable" data-id="${s.id}">Turn Off</button></div>`
+      ? `<span class="rec-toggle on"><span class="dot dot-ok"></span>Recording</span><div class="row" style="margin-top:4px;"><details class="action-menu"><summary aria-label="Recording actions">⋯</summary><div class="action-menu-pop"><button class="btn-sm destructive" data-action="recording-disable" data-id="${s.id}">Turn Off…</button></div></details></div>`
       : `<span class="rec-toggle"><span class="dot dot-off"></span>Off</span><div class="row" style="margin-top:4px;">${canStartRecording ? `<button class="btn-sm" data-action="recording-enable" data-id="${s.id}">Turn On</button>` : '<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>'}</div>`;
     const mode = String(s.capture_type || '-');
     const captureFamily = formatCaptureFamilyLabel(s.capture_family);
@@ -5188,7 +5191,7 @@ function renderRecRows() {
         </div>
       </td>
       <td>${renderTagEditor(s, 'recording')}</td>
-      <td><button class="btn-sm" data-action="recording-disable" data-id="${s.id}">Turn Off</button></td>
+      <td><details class="action-menu"><summary aria-label="Recording actions">⋯</summary><div class="action-menu-pop"><button class="btn-sm destructive" data-action="recording-disable" data-id="${s.id}">Turn Off…</button></div></details></td>
     `;
     recRowsEl.appendChild(tr);
   }
@@ -6297,7 +6300,9 @@ function renderDetailPipelines(items) {
       <td class="mono fs11">${Number(it.active_claims || 0)}</td>
       <td>${workers.length ? listToMeta(workers) : '<span class="muted fs11">-</span>'}</td>
       <td class="mono fs11">${esc(status)}<div class="muted fs10">${esc(latest)}</div></td>
-      <td><button class="btn-sm" data-detail-action="pipeline-toggle" data-pipeline-id="${esc(pid)}" data-enabled="${enabled ? '1' : '0'}">${enabled ? 'Disable' : 'Enable'}</button></td>
+      <td>${enabled
+        ? `<details class="action-menu"><summary aria-label="Pipeline actions">⋯</summary><div class="action-menu-pop"><button class="btn-sm destructive" data-detail-action="pipeline-toggle" data-pipeline-id="${esc(pid)}" data-enabled="1">Disable pipeline…</button></div></details>`
+        : `<button class="btn-sm" data-detail-action="pipeline-toggle" data-pipeline-id="${esc(pid)}" data-enabled="0">Enable</button>`}</td>
     `;
     detailPipelineRows.appendChild(tr);
   }
@@ -6382,7 +6387,7 @@ async function loadDetail(options = {}) {
   detailActions.innerHTML = `
     ${preferredViewURL ? `<a href="${esc(preferredViewURL)}" target="_blank" rel="noopener noreferrer"><button class="btn-sm primary">View Live Stream</button></a>` : ''}
     ${s.recording_state === 'on'
-      ? `<button class="btn-sm" data-detail-action="recording-disable" data-id="${s.id}">Turn Recording Off</button>`
+      ? `<details class="action-menu"><summary aria-label="Recording actions">⋯</summary><div class="action-menu-pop"><button class="btn-sm destructive" data-detail-action="recording-disable" data-id="${s.id}">Turn Recording Off…</button></div></details>`
       : (canStartRecording
         ? `<button class="btn-sm" data-detail-action="recording-enable" data-id="${s.id}">Turn Recording On</button>`
         : `<span class="tag tag-muted" title="Image-poll streams capture individual frames and do not support continuous recording">Not recordable</span>`)}
@@ -6465,7 +6470,8 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
 
   if (action === 'tag-add' || action === 'tag-remove') {
     const tagValue = String(rawTag || extractTagInputValue(actionEl)).trim();
-    await handleTagMutation(action, id, tagValue);
+    const changed = await handleTagMutation(action, id, tagValue);
+    if (changed === false) return false;
     if (tableKey === 'streams') {
       await loadStreams();
     } else if (tableKey === 'recording') {
@@ -6480,7 +6486,8 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
     if (nextState === 'on' && !supportsClipRecording(stream)) {
       throw new Error('this stream is not startable in the clip-native recording path');
     }
-    await setStreamRecordingState(id, nextState);
+    const changed = await setStreamRecordingState(id, nextState);
+    if (changed === false) return false;
     await Promise.all([
       loadOverview(),
       loadStreamsForActiveView(),
@@ -6509,7 +6516,12 @@ async function onStreamTableClick(e, tableKey) {
       if (tableKey === 'streams') setStreamStatus('updating...');
       else setRecStatus('updating...');
     }
-    await handleStreamTableAction(action, id, tableKey, btn);
+    const changed = await handleStreamTableAction(action, id, tableKey, btn);
+    if (changed === false) {
+      if (tableKey === 'streams') setStreamStatus('No changes.');
+      else setRecStatus('No changes.');
+      return;
+    }
     if (!localOnlyAction) {
       if (tableKey === 'streams') setStreamStatus('updated', 'ok');
       else setRecStatus('updated', 'ok');
@@ -6555,7 +6567,8 @@ if (serversAssignmentsRows) {
         const confirmToken = `unassign:${streamID}`;
         const entered = window.prompt(`Type ${confirmToken} to remove recording assignment for stream ${streamID}.`, '');
         if (String(entered || '').trim() !== confirmToken) {
-          throw new Error(`unassign cancelled (confirmation must equal ${confirmToken})`);
+          setServersAssignmentsStatus('No changes.');
+          return;
         }
         setServersAssignmentsStatus('updating...');
         await fetchJSON(`/api/v1/recording/streams/${streamID}/unassign`, {
@@ -6720,7 +6733,8 @@ detailTagEditor.addEventListener('click', async (e) => {
   if (!action || !Number.isFinite(id) || id <= 0) return;
   try {
     setDetailStatus('updating tags...');
-    await handleStreamTableAction(action, id, 'detail', btn);
+    const changed = await handleStreamTableAction(action, id, 'detail', btn);
+    if (changed === false) { setDetailStatus('No changes.'); return; }
     await loadDetail();
     setDetailStatus('tags updated', 'ok');
   } catch (err) {
@@ -6761,7 +6775,8 @@ detailActions.addEventListener('click', async (e) => {
     if (!localOnlyAction) setDetailStatus('updating...');
     if (action === 'recording-enable' || action === 'recording-disable') {
       const nextState = action === 'recording-enable' ? 'on' : 'off';
-      await setStreamRecordingState(id, nextState);
+      const changed = await setStreamRecordingState(id, nextState);
+      if (changed === false) { setDetailStatus('No changes.'); return; }
       await loadDetail();
       void Promise.allSettled([
         loadOverview(),
@@ -6773,7 +6788,8 @@ detailActions.addEventListener('click', async (e) => {
       setDetailStatus('updated', 'ok');
       return;
     }
-    await handleStreamTableAction(action, id, 'detail', btn);
+    const changed = await handleStreamTableAction(action, id, 'detail', btn);
+    if (changed === false) { setDetailStatus('No changes.'); return; }
     if (localOnlyAction) return;
     await loadDetail();
     setDetailStatus('updated', 'ok');
@@ -7366,6 +7382,7 @@ if (detailPipelineRows) detailPipelineRows.addEventListener('click', (e) => {
   const pipelineID = String(btn.getAttribute('data-pipeline-id') || '').trim();
   if (!pipelineID) return;
   const enabled = btn.getAttribute('data-enabled') === '1';
+  if (enabled && !window.confirm(`Disable pipeline ${pipelineID}? Processing for this stream will stop until the pipeline is enabled again.`)) return;
   setDetailWorkloadStatus('updating...');
   void (async () => {
     await fetchJSON(`/api/v1/dashboard/streams/${detailStreamID}/pipelines/${encodeURIComponent(pipelineID)}`, {

@@ -178,6 +178,9 @@
       .bill-items .bill-total-label { grid-column: 1; }
       .conn-stats { grid-template-columns: 1fr; }
     }
+    @media (max-width: 640px) {
+      .action-menu-pop { position: fixed; top: 50%; right: 12px; left: 12px; min-width: 0; max-height: calc(100vh - 24px); overflow-y: auto; transform: translateY(-50%); z-index: 1000; }
+    }
     @media (max-width: 600px) {
       /* Prevent iOS Safari from zooming when a field gains focus (needs >=16px). */
       input, textarea { font-size: 16px; }
@@ -615,6 +618,7 @@
 
     async function setMemberRole(email, role) {
       if (!email || !role) return;
+      if (role === 'member' && !window.confirm(`Remove billing-admin access from ${email}? They will no longer be able to manage billing.`)) return;
       try {
         await fetchJSON(`/api/v1/account/members/${encodeURIComponent(email)}/role`, {
           method: 'PATCH',
@@ -641,20 +645,28 @@
           const role = String(m.role || 'member');
           const status = m.accepted_at ? 'Active' : 'Invited';
           const showRemove = canManage && !(role === 'owner' && items.filter((x) => String(x.role) === 'owner').length <= 1);
-          const removeBtn = showRemove
-            ? `<details class="action-menu"><summary aria-label="Member actions">⋯</summary><div class="action-menu-pop"><button class="small destructive team-remove" type="button" data-email="${escapeHTML(email)}">Remove member…</button></div></details>`
-            : '';
           const showRoleToggle = canManage && role !== 'owner';
           const nextRole = role === 'billing_admin' ? 'member' : 'billing_admin';
-          const roleBtn = showRoleToggle
-            ? `<button class="secondary small team-role" type="button" data-email="${escapeHTML(email)}" data-role="${escapeHTML(nextRole)}">${nextRole === 'billing_admin' ? 'Make billing admin' : 'Make member'}</button>`
+          const roleBtn = showRoleToggle && nextRole === 'billing_admin'
+            ? `<button class="secondary small team-role" type="button" data-email="${escapeHTML(email)}" data-role="billing_admin">Make billing admin</button>`
+            : '';
+          const menuItems = [
+            showRoleToggle && nextRole === 'member'
+              ? `<button class="small destructive team-role" type="button" data-email="${escapeHTML(email)}" data-role="member">Make member…</button>`
+              : '',
+            showRemove
+              ? `<button class="small destructive team-remove" type="button" data-email="${escapeHTML(email)}">Remove member…</button>`
+              : '',
+          ].filter(Boolean).join('');
+          const memberMenu = menuItems
+            ? `<details class="action-menu"><summary aria-label="Member actions">⋯</summary><div class="action-menu-pop">${menuItems}</div></details>`
             : '';
           return `<div class="rec-row kv-row">
             <div style="min-width:0;">
               <div class="mono">${escapeHTML(email)}</div>
               <div class="sub"><span class="role-badge">${escapeHTML(role)}</span> ${escapeHTML(status)}</div>
             </div>
-            <div style="display:flex;gap:8px;flex-shrink:0;">${roleBtn}${removeBtn}</div>
+            <div style="display:flex;gap:8px;flex-shrink:0;">${roleBtn}${memberMenu}</div>
           </div>`;
         }).join('');
         teamList.classList.remove('hidden');

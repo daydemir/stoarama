@@ -22,6 +22,7 @@ func TestDestructiveWebActionsUseMenusAndConfirmations(t *testing.T) {
 		"streams.html": {
 			`id="detailStreamActionMenu" class="action-menu"`,
 			`Type DELETE to continue.`,
+			`Remove tag ${inputTags[0]} from stream ${streamID}?`,
 		},
 		"recordings.html": {
 			`id="bulkCancelMenu" class="action-menu hidden"`,
@@ -30,8 +31,16 @@ func TestDestructiveWebActionsUseMenusAndConfirmations(t *testing.T) {
 		"admin.html": {
 			`aria-label="Storage destination actions"`,
 			`aria-label="Grant actions"`,
+			`aria-label="Assignment actions"`,
+			`aria-label="Pipeline actions"`,
+			`Disable pipeline ${pipelineID}?`,
+			`Remove tag ${inputTags.join(', ')} from stream ${streamID}?`,
 			`Type DELETE to continue.`,
 			`if (!window.confirm(`,
+		},
+		"org-settings.html": {
+			`aria-label="Member actions"`,
+			`Remove billing-admin access from ${email}?`,
 		},
 	}
 	for name, markers := range checks {
@@ -45,6 +54,78 @@ func TestDestructiveWebActionsUseMenusAndConfirmations(t *testing.T) {
 				t.Errorf("%s missing destructive-action safety marker %q", name, marker)
 			}
 		}
+	}
+}
+
+func TestAdminCancellationGuardsPrecedeMutationsAndSuccessUI(t *testing.T) {
+	body, err := loadHTMLPage("admin.html")
+	if err != nil {
+		t.Fatalf("load admin html: %v", err)
+	}
+	page := string(body)
+	assertOrdered := func(name string, markers ...string) {
+		t.Helper()
+		at := 0
+		for _, marker := range markers {
+			next := strings.Index(page[at:], marker)
+			if next < 0 {
+				t.Fatalf("%s missing ordered marker %q", name, marker)
+			}
+			at += next + len(marker)
+		}
+	}
+	assertOrdered("recording cancellation",
+		`async function setStreamRecordingState`,
+		`if (String(entered || '').trim() !== confirmToken) {`,
+		`return false;`,
+		"return fetchJSON(`/api/v1/recording/streams/",
+		`const changed = await setStreamRecordingState(id, nextState);`,
+		`if (changed === false) return false;`,
+		`await Promise.all([`,
+	)
+	assertOrdered("detail tag cancellation",
+		`async function handleTagMutation(action, streamID, rawTagValue)`,
+		`if (!window.confirm(`,
+		`return false;`,
+		`return patchStreamTags(streamID, next);`,
+		`detailTagEditor.addEventListener('click'`,
+		`const changed = await handleStreamTableAction(action, id, 'detail', btn);`,
+		`if (changed === false) { setDetailStatus('No changes.'); return; }`,
+		`await loadDetail();`,
+		`setDetailStatus('tags updated', 'ok');`,
+	)
+	assertOrdered("unassign cancellation",
+		`data-server-action="unassign"`,
+		`if (String(entered || '').trim() !== confirmToken) {`,
+		`setServersAssignmentsStatus('No changes.');`,
+		`return;`,
+		"await fetchJSON(`/api/v1/recording/streams/${streamID}/unassign",
+	)
+}
+
+func TestStreamsTagCancellationGuardPrecedesDeleteAndReload(t *testing.T) {
+	body, err := loadHTMLPage("streams.html")
+	if err != nil {
+		t.Fatalf("load streams html: %v", err)
+	}
+	page := string(body)
+	guard := strings.Index(page, `if (!window.confirm(`)
+	if guard < 0 {
+		t.Fatal("streams tag removal confirmation guard is missing")
+	}
+	cancel := strings.Index(page[guard:], `return false;`)
+	remove := strings.Index(page[guard:], `method: 'DELETE'`)
+	if cancel < 0 || remove < 0 || cancel >= remove {
+		t.Fatal("streams tag cancellation must return before the DELETE request")
+	}
+	action := strings.Index(page, `const changed = await handleTagMutation(action, id, tagValue);`)
+	if action < 0 {
+		t.Fatal("streams tag mutation call is missing")
+	}
+	stop := strings.Index(page[action:], `if (changed === false) return false;`)
+	reload := strings.Index(page[action:], `await loadStreams();`)
+	if stop < 0 || reload < 0 || stop >= reload {
+		t.Fatal("streams tag cancellation must return before list reload and success handling")
 	}
 }
 

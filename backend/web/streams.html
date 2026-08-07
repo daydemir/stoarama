@@ -1633,6 +1633,7 @@
        cuts Location mid-word. Collapse each row into a stacked card so name, slug,
        tags, location and a full-width recording CTA all stay on screen. */
     @media (max-width: 640px) {
+      .action-menu-pop { position: fixed; top: 50%; right: 12px; left: 12px; min-width: 0; max-height: calc(100vh - 24px); overflow-y: auto; transform: translateY(-50%); z-index: 1000; }
       .filter-grid-primary,
       .filter-grid-secondary,
       .filter-field-wide {
@@ -2975,6 +2976,7 @@ async function handleTagMutation(action, streamID, rawTagValue) {
     return applyTagMutationResult(streamID, payload);
   }
   if (action === 'tag-remove') {
+    if (!window.confirm(`Remove tag ${inputTags[0]} from stream ${streamID}?`)) return false;
     const payload = await fetchJSON(`/api/v1/dashboard/streams/${streamID}/tags`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
@@ -3938,9 +3940,10 @@ async function toggleStreamTagFromImageModal(tagName) {
   const action = tagOn ? 'tag-remove' : 'tag-add';
   imageModalShortlistBusy = true;
   try {
-    await withLoading(tagOn ? `Removing ${tag}...` : `Adding ${tag}...`, async () => {
-      await handleTagMutation(action, streamID, tag);
+    const changed = await withLoading(tagOn ? `Removing ${tag}...` : `Adding ${tag}...`, async () => {
+      return handleTagMutation(action, streamID, tag);
     });
+    if (changed === false) { setStreamStatus('No changes.'); return; }
     rerenderTagEditorsForStream(streamID);
     renderImageModalMetadata(linkEl);
     renderImageModalMetaStatus(tagOn ? `removed ${tag}` : `added ${tag}`, 'ok');
@@ -6029,7 +6032,8 @@ async function handleStreamTableAction(action, id, tableKey, actionEl, rawTag = 
 
   if (action === 'tag-add' || action === 'tag-remove') {
     const tagValue = String(rawTag || extractTagInputValue(actionEl)).trim();
-    await handleTagMutation(action, id, tagValue);
+    const changed = await handleTagMutation(action, id, tagValue);
+    if (changed === false) return false;
     if (tableKey === 'streams') {
       await loadStreams();
     } else {
@@ -6053,7 +6057,8 @@ async function onStreamTableClick(e, tableKey) {
   const localOnlyAction = action === 'show-stream-json' || action === 'copy-source-url';
   try {
     if (!localOnlyAction) setStreamStatus('updating...');
-    await handleStreamTableAction(action, id, tableKey, btn);
+    const changed = await handleStreamTableAction(action, id, tableKey, btn);
+    if (changed === false) { setStreamStatus('No changes.'); return; }
     if (!localOnlyAction) setStreamStatus('updated', 'ok');
   } catch (err) {
     setStreamStatus(String(err), 'err');
