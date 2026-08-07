@@ -74,15 +74,17 @@ type heartbeatDiagnostics struct {
 }
 
 type relayRecoveryState struct {
-	BootID          string    `json:"boot_id"`
-	StartedAt       time.Time `json:"started_at"`
-	PreviousExit    string    `json:"previous_exit"`
-	LastHeartbeatAt time.Time `json:"last_heartbeat_at,omitempty"`
-	LastCaptureAt   time.Time `json:"last_capture_at,omitempty"`
-	LastUploadAt    time.Time `json:"last_upload_at,omitempty"`
-	LastUpdaterAt   time.Time `json:"last_updater_at,omitempty"`
-	LastError       string    `json:"last_error,omitempty"`
-	ErrorTail       []string  `json:"error_tail,omitempty"`
+	ServiceInstanceID     string    `json:"service_instance_id,omitempty"`
+	HeartbeatSuccessCount uint64    `json:"heartbeat_success_count,omitempty"`
+	BootID                string    `json:"boot_id"`
+	StartedAt             time.Time `json:"started_at"`
+	PreviousExit          string    `json:"previous_exit"`
+	LastHeartbeatAt       time.Time `json:"last_heartbeat_at,omitempty"`
+	LastCaptureAt         time.Time `json:"last_capture_at,omitempty"`
+	LastUploadAt          time.Time `json:"last_upload_at,omitempty"`
+	LastUpdaterAt         time.Time `json:"last_updater_at,omitempty"`
+	LastError             string    `json:"last_error,omitempty"`
+	ErrorTail             []string  `json:"error_tail,omitempty"`
 }
 
 type networkCounters struct {
@@ -843,6 +845,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 	previousRecovery := *recovery
 	recovery.BootID = bootID()
 	recovery.StartedAt = startedAt
+	recovery.ServiceInstanceID = os.Getenv("STOARAMA_SERVICE_INSTANCE_ID")
 	recoveryPending, reportedPreviousExit := classifyPreviousRelayExit(previousRecovery, recovery.BootID)
 	recovery.PreviousExit = relayExitUncleanProcess
 	if err := recovery.persist(recoveryPath); err != nil {
@@ -936,6 +939,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			log.Printf("relay heartbeat error: %s", sanitized)
 		} else if err == nil {
 			recovery.LastHeartbeatAt = time.Now().UTC()
+			recovery.HeartbeatSuccessCount++
 			recovery.LastError = ""
 			if persistErr := recovery.persist(recoveryPath); persistErr != nil {
 				log.Printf("relay recovery state persist error: %v", persistErr)

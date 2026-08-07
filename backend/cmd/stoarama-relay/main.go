@@ -50,6 +50,10 @@ func main() {
 		if err := installLaunchd(); err != nil {
 			fatal(err)
 		}
+	case "launchd-handoff":
+		if err := completeLaunchdHandoff(args); err != nil {
+			fatal(err)
+		}
 	case "install-systemd":
 		if err := installSystemd(); err != nil {
 			fatal(err)

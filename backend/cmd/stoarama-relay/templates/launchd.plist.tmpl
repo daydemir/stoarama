@@ -8,6 +8,10 @@
     <string>{{.ExePath}}</string>
     <string>run</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>STOARAMA_SERVICE_INSTANCE_ID</key><string>{{.InstanceID}}</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>

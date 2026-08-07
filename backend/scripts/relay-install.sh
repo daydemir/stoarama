@@ -142,7 +142,78 @@ install_verified_executable() {
 LATEST_JSON="$(mktemp)"
 RELAY_ARCHIVE="$(mktemp)"
 FFMPEG_ARCHIVE="$(mktemp)"
-trap 'rm -f "${LATEST_JSON}" "${RELAY_ARCHIVE}" "${FFMPEG_ARCHIVE}"' EXIT
+ROLLBACK_DIR="$(mktemp -d "${INSTALL_DIR}/install-rollback.XXXXXX")"
+HAD_RELAY=0
+HAD_CONFIG=0
+SERVICE_TARGET=""
+SYSTEMD_UNIT_PATH="${HOME}/.config/systemd/user/stoarama-relay.service"
+HAD_SYSTEMD_UNIT=0
+INSTALL_COMMITTED=0
+if [[ -f "${BIN_DIR}/stoarama-relay" ]]; then cp -p "${BIN_DIR}/stoarama-relay" "${ROLLBACK_DIR}/stoarama-relay"; HAD_RELAY=1; fi
+if [[ -f "${INSTALL_DIR}/config.json" ]]; then cp -p "${INSTALL_DIR}/config.json" "${ROLLBACK_DIR}/config.json"; HAD_CONFIG=1; fi
+if [[ "${OS}" == "darwin" ]]; then
+  for domain in "gui/$(id -u)" "user/$(id -u)"; do
+    if launchctl print "${domain}/com.stoarama.relay" >/dev/null 2>&1; then SERVICE_TARGET="${domain}/com.stoarama.relay"; break; fi
+  done
+elif [[ -f "${SYSTEMD_UNIT_PATH}" ]]; then
+  cp -p "${SYSTEMD_UNIT_PATH}" "${ROLLBACK_DIR}/stoarama-relay.service"
+  HAD_SYSTEMD_UNIT=1
+  if systemctl --user is-active --quiet stoarama-relay.service; then SERVICE_TARGET="systemd"; fi
+fi
+cleanup_install() {
+  status=$?
+  # A fresh macOS install may have completed launchd activation just before an
+  # interrupt. Never remove its binary/config while that candidate remains live.
+  if [[ "${INSTALL_COMMITTED}" -ne 1 && "${OS}" == "darwin" && -z "${SERVICE_TARGET}" ]]; then
+    for domain in "gui/$(id -u)" "user/$(id -u)"; do
+      if launchctl print "${domain}/com.stoarama.relay" >/dev/null 2>&1; then
+        INSTALL_COMMITTED=1
+        echo "warning: retaining verified relay artifacts because launchd activation is live" >&2
+        break
+      fi
+    done
+  fi
+  if [[ "${INSTALL_COMMITTED}" -ne 1 && "${OS}" == "linux" && "${HAD_SYSTEMD_UNIT}" -eq 0 ]]; then
+    load_state="$(systemctl --user show stoarama-relay.service -p LoadState --value 2>/dev/null || true)"
+    if systemctl --user is-active --quiet stoarama-relay.service || [[ "${load_state}" == "loaded" ]]; then
+      INSTALL_COMMITTED=1
+      echo "warning: retaining relay artifacts because systemd activation is active or loaded" >&2
+    fi
+  fi
+  if [[ "${INSTALL_COMMITTED}" -ne 1 ]]; then
+    if [[ "${HAD_RELAY}" -eq 1 ]]; then cp -p "${ROLLBACK_DIR}/stoarama-relay" "${BIN_DIR}/stoarama-relay.restore" && mv -f "${BIN_DIR}/stoarama-relay.restore" "${BIN_DIR}/stoarama-relay"; else rm -f "${BIN_DIR}/stoarama-relay"; fi
+    if [[ "${HAD_CONFIG}" -eq 1 ]]; then cp -p "${ROLLBACK_DIR}/config.json" "${INSTALL_DIR}/config.json.restore" && mv -f "${INSTALL_DIR}/config.json.restore" "${INSTALL_DIR}/config.json"; else rm -f "${INSTALL_DIR}/config.json"; fi
+    if [[ "${OS}" == "linux" ]]; then
+      if [[ "${HAD_SYSTEMD_UNIT}" -eq 1 ]]; then
+        mkdir -p "$(dirname "${SYSTEMD_UNIT_PATH}")"
+        cp -p "${ROLLBACK_DIR}/stoarama-relay.service" "${SYSTEMD_UNIT_PATH}.restore" && mv -f "${SYSTEMD_UNIT_PATH}.restore" "${SYSTEMD_UNIT_PATH}"
+      else
+        rm -f "${SYSTEMD_UNIT_PATH}"
+      fi
+      systemctl --user daemon-reload || echo "warning: restored systemd unit could not be reloaded" >&2
+      if [[ "${SERVICE_TARGET}" == "systemd" ]]; then systemctl --user restart stoarama-relay.service || echo "warning: restored systemd relay could not be restarted" >&2; fi
+    elif [[ -n "${SERVICE_TARGET}" ]]; then
+      before="$(grep -oE '"heartbeat_success_count":[0-9]+' "${INSTALL_DIR}/relay-recovery.json" 2>/dev/null | tail -n1 | cut -d: -f2 || true)"
+      before="${before:-0}"
+      if launchctl kickstart -k "${SERVICE_TARGET}" >/dev/null 2>&1; then
+        restored=0
+        for _ in $(seq 1 70); do
+          now="$(grep -oE '"heartbeat_success_count":[0-9]+' "${INSTALL_DIR}/relay-recovery.json" 2>/dev/null | tail -n1 | cut -d: -f2 || true)"
+          now="${now:-0}"
+          if (( now >= before + 2 )) && launchctl print "${SERVICE_TARGET}" 2>/dev/null | grep -q 'state = running'; then restored=1; break; fi
+          sleep 1
+        done
+        [[ "${restored}" -eq 1 ]] || echo "warning: restored relay did not verify two heartbeats" >&2
+      else
+        echo "warning: restored relay could not be restarted" >&2
+      fi
+    fi
+  fi
+  rm -f "${LATEST_JSON}" "${RELAY_ARCHIVE}" "${FFMPEG_ARCHIVE}"
+  rm -rf "${ROLLBACK_DIR}"
+  exit "${status}"
+}
+trap cleanup_install EXIT
 echo "Fetching release manifest ${MANIFEST_NAME}..."
 download "${MANIFEST_NAME}" "${LATEST_JSON}"
 MANIFEST="$(tr '\n' ' ' < "${LATEST_JSON}" | sed -E 's/[[:space:]]+/ /g')"
@@ -253,9 +324,9 @@ echo ""
 # Load/start the background service. install-launchd/install-systemd replace any prior
 # instance and kickstart it, so a re-run also restarts an already-loaded service.
 if [[ "${OS}" == "darwin" ]]; then
-  "${BIN_DIR}/stoarama-relay" install-launchd
+  "${BIN_DIR}/stoarama-relay" install-launchd && INSTALL_COMMITTED=1
 else
-  "${BIN_DIR}/stoarama-relay" install-systemd
+  "${BIN_DIR}/stoarama-relay" install-systemd && INSTALL_COMMITTED=1
 fi
 
 echo ""
