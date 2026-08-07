@@ -201,7 +201,9 @@ func denoUsable(bin string) bool {
 }
 
 func ytdlpSupportsJSRuntime(bin string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The signed macOS executable can take close to ten seconds to initialize on
+	// first launch, especially while Gatekeeper validates a freshly updated file.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "--help").Output()
 	return err == nil && bytes.Contains(out, []byte("--js-runtimes"))
