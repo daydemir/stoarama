@@ -199,7 +199,11 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if len(f.reports) != 1 {
 		t.Fatalf("aggregate retry resent event: %+v", f.reports)
 	}
-	if !f.invoiceStart.Equal(start) || !f.invoiceEnd.Equal(end) || !f.meterStarts["recording_hour"].Equal(start) || !f.meterEnds["stream_hour_month"].Equal(end) {
+	if !f.invoiceStart.Equal(start) || !f.invoiceEnd.Equal(end) ||
+		!f.meterStarts["recording_hour"].Equal(start) ||
+		!f.meterEnds["recording_hour"].Equal(end) ||
+		!f.meterStarts["stream_hour_month"].Equal(start) ||
+		!f.meterEnds["stream_hour_month"].Equal(end) {
 		t.Fatalf("Stripe period bounds not preserved")
 	}
 	wantStorageCents := int64(math.Round(storageUsage * float64(billing.StreamHourMonthUnitAmountCents)))
