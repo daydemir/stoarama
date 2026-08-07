@@ -489,14 +489,16 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		}
 		action := "updated"
 		recordingID := st.recordingID
+		sourceKind := "auto"
+		if captureVia == "cloud" {
+			sourceKind, err = classifyRecordingSource(strings.TrimSpace(st.sourceURL))
+			if err != nil {
+				util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream %d: %v", st.id, err))
+				return
+			}
+		}
 		if recordingID == 0 {
 			action = "created"
-			if req.DryRun && captureVia == "cloud" {
-				if _, classifyErr := classifyRecordingSource(strings.TrimSpace(st.sourceURL)); classifyErr != nil {
-					util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("stream %d: %v", st.id, classifyErr))
-					return
-				}
-			}
 		}
 		if req.DryRun {
 			if recordingID == 0 {
@@ -508,7 +510,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			continue
 		}
 		if recordingID != 0 {
-			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, capture_via=$17, naming_profile=$18, folder_name=$19, naming_metadata_jsonb=$20, last_enqueued_fire_at=NULL, status='active', paused_at=NULL, completed_captured_clip_count=NULL, completed_expected_clip_count=NULL, consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, accountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery, captureVia, resolvedProfile.String(), folderName, namingMetadata)
+			updatedRecording, updateErr := tx.Exec(r.Context(), `UPDATE recordings SET mode=$3, cron_expr=$4, cron_timezone=$5, clip_duration_sec=$6, daily_window_start=$7, daily_window_end=$8, active_weekdays=$9, target_fps=$10, start_at=$11, end_at=$12, next_fire_at=$13, storage_destination_id=$14, delivery_storage_destination_id=$15, delivery=$16, capture_via=$17, naming_profile=$18, folder_name=$19, naming_metadata_jsonb=$20, stream_url=$21, source_kind=$22, last_enqueued_fire_at=NULL, status='active', paused_at=NULL, completed_captured_clip_count=NULL, completed_expected_clip_count=NULL, consecutive_failures=0, last_error_text='', last_error_at=NULL, updated_at=now() WHERE id=$1 AND account_id=$2 AND status <> 'canceled'`, recordingID, accountID, mode, cronArg, st.timezone, clipDuration, dailyStartArg, dailyEndArg, weekdays, req.TargetFPS, startAt, endAt, nextArg, captureDestID, deliveryDestArg, delivery, captureVia, resolvedProfile.String(), folderName, namingMetadata, st.sourceURL, sourceKind)
 			err = updateErr
 			if err == nil && updatedRecording.RowsAffected() != 1 {
 				err = fmt.Errorf("recording was canceled while scheduling")
@@ -522,10 +524,6 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			}
 			updated++
 		} else {
-			sourceKind := "auto"
-			if captureVia == "cloud" {
-				sourceKind, err = classifyRecordingSource(strings.TrimSpace(st.sourceURL))
-			}
 			if err == nil {
 				recordingID, _, _, _, err = s.insertRecordingTx(r.Context(), tx, recordingInsertParams{accountID: accountID, captureDestID: captureDestID, deliveryDestArg: deliveryDestArg, name: fmt.Sprintf("%s [%d]", st.name, st.id), streamURL: st.sourceURL, streamIDArg: st.id, sourceKind: sourceKind, mode: string(mode), cronExprArg: cronArg, cronTimezone: st.timezone, clipDuration: clipDuration, dailyWindowStartArg: dailyStartArg, dailyWindowEndArg: dailyEndArg, activeWeekdays: weekdays, targetFPSArg: req.TargetFPS, nextFireArg: nextArg, startAt: startAt, endAtArg: endAt, delivery: delivery, captureVia: captureVia, namingProfile: resolvedProfile, folderName: folderName, namingMetadata: namingMetadata})
 			}

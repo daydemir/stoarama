@@ -356,6 +356,74 @@ func TestAvailableRelayCapacityCountsOfflineGroupLeases(t *testing.T) {
 	}
 }
 
+func TestBatchScheduleRefreshesExistingRecordingSource(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+
+	userID, accountID := seedUserOrg(t, pool, "batch-source-refresh@example.com", false)
+	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
+	var destinationID, streamID, recordingID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO storage_destinations (account_id, name, provider, endpoint, region, bucket, access_key_id, secret_access_key_enc, status, managed)
+		VALUES ($1, 'source-refresh', 's3_compatible', 'https://s3.example.com', 'auto', 'source-refresh', 'key', decode('00','hex'), 'verified', true)
+		RETURNING id
+	`, accountID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	const oldURL = "https://old.example.com/live/stream.flv"
+	const newURL = "https://new.example.com/live.m3u8"
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps, local_timezone)
+		VALUES ('test', 'source-refresh', 'Source Refresh', 'source-refresh', $1, 'hls', 'direct_stream', 'video_live', 'continuous_video', 30, 'UTC')
+		RETURNING id
+	`, oldURL).Scan(&streamID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, status, start_at, capture_via)
+		VALUES ($1, $2, 'Source Refresh', $3, $4, 'ffmpeg_direct', 'sampled', '0 * * * *', 'UTC', 60, 'active', now(), 'cloud')
+		RETURNING id
+	`, accountID, destinationID, oldURL, streamID).Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE streams SET source_url=$2 WHERE id=$1`, streamID, newURL); err != nil {
+		t.Fatal(err)
+	}
+
+	request := batchScheduleRequest{
+		StreamIDs:            []int64{streamID},
+		NamingProfile:        recordingnaming.ProfileStoaramaV1.String(),
+		Mode:                 "sampled",
+		CronExpr:             "30 * * * *",
+		ClipDurationSec:      60,
+		StorageDestinationID: destinationID,
+		Delivery:             "managed",
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(body)), principal, "")
+	rec := httptest.NewRecorder()
+	s.handleAccountRecordingsBatchSchedule(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("schedule status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var gotURL, gotKind string
+	var gotRecordingID int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT id, stream_url, source_kind
+		FROM recordings
+		WHERE account_id=$1 AND stream_id=$2 AND status <> 'canceled'
+	`, accountID, streamID).Scan(&gotRecordingID, &gotURL, &gotKind); err != nil {
+		t.Fatal(err)
+	}
+	if gotRecordingID != recordingID || gotURL != newURL || gotKind != "hls_live" {
+		t.Fatalf("recording id=%d url=%q kind=%q, want id=%d url=%q kind=hls_live", gotRecordingID, gotURL, gotKind, recordingID, newURL)
+	}
+}
+
 func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
