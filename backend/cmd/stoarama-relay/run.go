@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -90,6 +92,7 @@ func runRelay(ctx context.Context) error {
 	// a stale value from the environment (or a leftover ~/.stoarama/cookies.txt) can
 	// never leak in. --cookies-from-browser is never used in this headless path.
 	os.Setenv("YT_DLP_BIN", ytdlp)
+	configureYTDLPJSRuntime(bd, ytdlp)
 	os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
 	os.Unsetenv("YT_DLP_COOKIES_FILE")
 	os.Setenv("FFMPEG_BIN", relayFFmpegBin(bd))
@@ -176,6 +179,32 @@ func runRelay(ctx context.Context) error {
 		markRelayExit(relayExitProcessError)
 	}
 	return err
+}
+
+func configureYTDLPJSRuntime(binDir, ytdlp string) {
+	deno := filepath.Join(binDir, "deno")
+	if ytdlpJSRuntimeReady(binDir, ytdlp) {
+		os.Setenv("YT_DLP_JS_RUNTIME", "deno:"+deno)
+	} else {
+		os.Unsetenv("YT_DLP_JS_RUNTIME")
+	}
+}
+
+func ytdlpJSRuntimeReady(binDir, ytdlp string) bool {
+	return denoUsable(filepath.Join(binDir, "deno")) && ytdlpSupportsJSRuntime(ytdlp)
+}
+
+func denoUsable(bin string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, bin, "--version").Run() == nil
+}
+
+func ytdlpSupportsJSRuntime(bin string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--help").Output()
+	return err == nil && bytes.Contains(out, []byte("--js-runtimes"))
 }
 
 func prepareSelfUpdates(cfg relayConfig) (bool, error) {

@@ -60,13 +60,13 @@ const experimentalCookieEnv = "STOARAMA_RELAY_YT_COOKIES"
 //
 // COOKIELESS-DEFAULT DESIGN NOTE (decision 2026-07-04): the relay records generally
 // PUBLIC streams and resolves YouTube COOKIELESS by default. yt-dlp's android client
-// resolves public YouTube from a residential IP with no cookies and no JS runtime.
+// resolves public YouTube from a residential IP with no cookies. A pinned Deno
+// runtime is now bundled because some public live streams require challenge solving.
 // The with-cookies path (link-youtube export + cookie-file resolve) is kept present
 // but DORMANT: the installer never runs it and it is not the default run mode. It is
 // deferred because a cookie'd resolve uses yt-dlp's WEB client, which must solve the
-// n-challenge and therefore needs a bundled JS runtime (Deno) we do NOT ship; without
-// it the web client returns "No video formats found". REVISIT (enable this opt-in and
-// bundle Deno) only if/when the cookieless android-client bypass stops working.
+// n-challenge and uses the same bundled Deno runtime. The opt-in remains dormant
+// because cookie handling, not runtime availability, is the remaining risk.
 func experimentalCookieMode() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(experimentalCookieEnv)))
 	return v == "1" || v == "true" || v == "yes"

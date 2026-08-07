@@ -644,7 +644,7 @@ func resolveYouTubeStreamURL(ctx context.Context, watchURL string) (string, erro
 	if bin == "" {
 		bin = "yt-dlp"
 	}
-	args := ytDLPResolveArgs(watchURL)
+	args := YTDLPResolveArgs(watchURL)
 	if cookies := strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FILE")); cookies != "" {
 		args = append(args, "--cookies", cookies)
 	}
@@ -685,8 +685,15 @@ func firstHTTPURL(out string) string {
 	return ""
 }
 
-func ytDLPResolveArgs(watchURL string) []string {
+// YTDLPResolveArgs returns the common, non-authenticated yt-dlp arguments used by
+// both the capture resolver and the relay health probe. A release-bundled runtime
+// is supplied explicitly because yt-dlp does not enable Node automatically and
+// some otherwise-public live streams now require JavaScript challenge solving.
+func YTDLPResolveArgs(watchURL string) []string {
 	args := []string{"-g", "--no-warnings", "--no-playlist"}
+	if runtimeSpec := strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")); runtimeSpec != "" {
+		args = append(args, "--js-runtimes", runtimeSpec)
+	}
 	if format := strings.TrimSpace(os.Getenv("YT_DLP_FORMAT")); format != "" {
 		args = append(args, "-f", format)
 	}
