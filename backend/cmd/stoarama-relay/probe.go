@@ -73,7 +73,7 @@ func (p *probe) runLoop(ctx context.Context) {
 func (p *probe) runOnce(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	args := []string{"-g", "--no-warnings", "--no-playlist", probeURL}
+	args := capture.YTDLPResolveArgs(probeURL)
 	if experimentalCookieMode() {
 		if cp, _ := cookiesFilePath(); cp != "" && fileExists(cp) {
 			args = append([]string{"--cookies", cp}, args...)

@@ -13,6 +13,7 @@ set -euo pipefail
 #   AWS_ACCESS_KEY_ID    R2 access key id
 #   AWS_SECRET_ACCESS_KEY R2 secret access key
 #   YTDLP_VERSION        pinned yt-dlp release tag
+#   DENO_VERSION         pinned Deno release tag, including the leading v
 #   RELAY_SIGNING_PRIVATE_KEY_FILE file containing a base64 Ed25519 private key
 # Optional env:
 #   RELAY_VERSION        immutable version stamped into artifacts + latest.json
@@ -36,6 +37,7 @@ RELAY_VERSION="${RELAY_VERSION:-$(git -C "${ROOT_DIR}" rev-parse --short=8 HEAD)
 SOURCE_REVISION="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
 "${ROOT_DIR}/scripts/relay-release-provenance.sh" version "${SOURCE_REVISION}" "${RELAY_VERSION}"
 : "${YTDLP_VERSION:?YTDLP_VERSION must be an explicit release tag}"
+: "${DENO_VERSION:?DENO_VERSION must be an explicit release tag}"
 : "${RELAY_SIGNING_PRIVATE_KEY_FILE:?RELAY_SIGNING_PRIVATE_KEY_FILE is required}"
 [[ -f "${RELAY_SIGNING_PRIVATE_KEY_FILE}" ]] || {
   echo "error: RELAY_SIGNING_PRIVATE_KEY_FILE does not exist" >&2
@@ -145,6 +147,14 @@ ytdlp_asset() {
     linux/arm64)               echo "yt-dlp_linux_aarch64" ;;
   esac
 }
+deno_asset() {
+  case "$1" in
+    darwin/arm64) echo "deno-aarch64-apple-darwin.zip" ;;
+    darwin/amd64) echo "deno-x86_64-apple-darwin.zip" ;;
+    linux/amd64)  echo "deno-x86_64-unknown-linux-gnu.zip" ;;
+    linux/arm64)  echo "deno-aarch64-unknown-linux-gnu.zip" ;;
+  esac
+}
 # build_ffmpeg <target> <stage-dir> <tarball-name>: fetches an upstream static
 # ffmpeg build for the target, assembles a tarball containing ffmpeg AND ffprobe at
 # its root, uploads it to R2, and prints the latest.json fragment for it on stdout.
@@ -202,6 +212,7 @@ build_ffmpeg() {
 echo "Building stoarama-relay ${RELAY_VERSION}"
 RELAY_JSON=""
 YTDLP_JSON=""
+DENO_JSON=""
 FFMPEG_JSON=""
 for t in "${TARGETS[@]}"; do
   GOOS="${t%/*}"; GOARCH="${t#*/}"
@@ -227,6 +238,20 @@ for t in "${TARGETS[@]}"; do
   yt_sha="$(sha256_of "${BUILD_DIR}/${yt_name}")"
   r2_put "${BUILD_DIR}/${yt_name}" "${yt_name}" "application/octet-stream"
   YTDLP_JSON="${YTDLP_JSON}    \"${key}\": {\"artifact\": \"${yt_name}\", \"sha256\": \"${yt_sha}\"},\n"
+
+  # Pinned JavaScript runtime for yt-dlp challenge solving. Publish the extracted
+  # executable so install and self-update can use the same atomic verified path.
+  deno_name="deno-${RELAY_VERSION}-${key}"
+  deno_zip="${BUILD_DIR}/${deno_name}.zip"
+  deno_stage="${BUILD_DIR}/deno-${key}"
+  rm -rf "${deno_stage}"; mkdir -p "${deno_stage}"
+  curl -fsSL "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/$(deno_asset "${t}")" -o "${deno_zip}"
+  unzip -q "${deno_zip}" -d "${deno_stage}"
+  [[ -x "${deno_stage}/deno" || -f "${deno_stage}/deno" ]] || { echo "error: Deno binary missing for ${t}" >&2; exit 1; }
+  chmod +x "${deno_stage}/deno"
+  deno_sha="$(sha256_of "${deno_stage}/deno")"
+  r2_put "${deno_stage}/deno" "${deno_name}" "application/octet-stream"
+  DENO_JSON="${DENO_JSON}    \"${key}\": {\"artifact\": \"${deno_name}\", \"sha256\": \"${deno_sha}\"},\n"
 
   # pinned ffmpeg: fetched from upstream static builds and republished with sha256
   # so the installer can verify it exactly like the relay tarball and yt-dlp.
@@ -257,6 +282,9 @@ latest="${BUILD_DIR}/latest.json"
   echo "  },"
   echo "  \"ytdlp\": {"
   printf "%b" "${YTDLP_JSON}" | sed '$ s/,$//'
+  echo "  },"
+  echo "  \"deno\": {"
+  printf "%b" "${DENO_JSON}" | sed '$ s/,$//'
   echo "  },"
   echo "  \"ffmpeg\": {"
   printf "%b" "${FFMPEG_JSON}" | sed '$ s/,$//'

@@ -105,19 +105,44 @@ verify_sha() {
   want="$(sha_for_artifact "$2")"
   if [[ -z "${want}" ]]; then
     echo "error: no sha256 for $2 in latest.json; refusing to install" >&2
-    exit 1
+    return 1
   fi
   got="$(sha256_of "$1")"
   if [[ "${got}" != "${want}" ]]; then
     echo "error: sha256 mismatch for $2 (got ${got}, want ${want}); aborting install" >&2
-    exit 1
+    return 1
   fi
+}
+
+install_verified_executable() {
+  local artifact="$1" target="$2" label="$3" want tmp
+  want="$(sha_for_artifact "${artifact}")"
+  if [[ -z "${want}" ]]; then
+    echo "error: no ${label} artifact for ${KEY} in ${MANIFEST_NAME}" >&2
+    return 1
+  fi
+  if [[ -f "${target}" && "$(sha256_of "${target}")" == "${want}" ]]; then
+    chmod +x "${target}"
+    unquarantine "${target}"
+    return 0
+  fi
+  echo "Downloading ${label}..."
+  tmp="$(mktemp "${target}.new.XXXXXX")"
+  if ! download "${artifact}" "${tmp}" || ! verify_sha "${tmp}" "${artifact}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  chmod +x "${tmp}"
+  unquarantine "${tmp}"
+  mv -f "${tmp}" "${target}"
 }
 
 # Fetch the release manifest up front so every downloaded artifact it lists (the
 # relay tarball and yt-dlp) is checksum-verified before anything is executed.
 LATEST_JSON="$(mktemp)"
-trap 'rm -f "${LATEST_JSON}"' EXIT
+RELAY_ARCHIVE="$(mktemp)"
+FFMPEG_ARCHIVE="$(mktemp)"
+trap 'rm -f "${LATEST_JSON}" "${RELAY_ARCHIVE}" "${FFMPEG_ARCHIVE}"' EXIT
 echo "Fetching release manifest ${MANIFEST_NAME}..."
 download "${MANIFEST_NAME}" "${LATEST_JSON}"
 MANIFEST="$(tr '\n' ' ' < "${LATEST_JSON}" | sed -E 's/[[:space:]]+/ /g')"
@@ -148,27 +173,27 @@ if [[ -z "$(sha_for_artifact "${RELAY_TARBALL}")" ]]; then
   echo "error: no relay artifact for ${KEY} in ${MANIFEST_NAME}" >&2
   exit 1
 fi
-download "${RELAY_TARBALL}" "/tmp/stoarama-relay.tar.gz"
-verify_sha "/tmp/stoarama-relay.tar.gz" "${RELAY_TARBALL}"
-tar -xzf "/tmp/stoarama-relay.tar.gz" -C "${BIN_DIR}"
+download "${RELAY_TARBALL}" "${RELAY_ARCHIVE}"
+verify_sha "${RELAY_ARCHIVE}" "${RELAY_TARBALL}"
+
+YTDLP_ARTIFACT="yt-dlp-${RELEASE_VERSION}-${KEY}"
+if [[ -z "$(sha_for_artifact "${YTDLP_ARTIFACT}")" ]]; then
+  YTDLP_ARTIFACT="yt-dlp-${KEY}"
+fi
+install_verified_executable "${YTDLP_ARTIFACT}" "${BIN_DIR}/yt-dlp" "yt-dlp"
+
+DENO_ARTIFACT="deno-${RELEASE_VERSION}-${KEY}"
+if [[ -n "$(sha_for_artifact "${DENO_ARTIFACT}")" ]]; then
+  install_verified_executable "${DENO_ARTIFACT}" "${BIN_DIR}/deno" "Deno JavaScript runtime"
+else
+  echo "No Deno artifact in this legacy manifest; YouTube will use the no-JS fallback."
+fi
+
+# Replace the relay only after every required dependency has been verified. This
+# leaves an existing installation untouched if dependency preparation fails.
+tar -xzf "${RELAY_ARCHIVE}" -C "${BIN_DIR}"
 chmod +x "${BIN_DIR}/stoarama-relay"
 unquarantine "${BIN_DIR}/stoarama-relay"
-
-if [[ ! -x "${BIN_DIR}/yt-dlp" ]]; then
-  echo "Downloading yt-dlp..."
-  YTDLP_ARTIFACT="yt-dlp-${RELEASE_VERSION}-${KEY}"
-  if [[ -z "$(sha_for_artifact "${YTDLP_ARTIFACT}")" ]]; then
-    YTDLP_ARTIFACT="yt-dlp-${KEY}"
-  fi
-  if [[ -z "$(sha_for_artifact "${YTDLP_ARTIFACT}")" ]]; then
-    echo "error: no yt-dlp artifact for ${KEY} in ${MANIFEST_NAME}" >&2
-    exit 1
-  fi
-  download "${YTDLP_ARTIFACT}" "${BIN_DIR}/yt-dlp"
-  verify_sha "${BIN_DIR}/yt-dlp" "${YTDLP_ARTIFACT}"
-  chmod +x "${BIN_DIR}/yt-dlp"
-  unquarantine "${BIN_DIR}/yt-dlp"
-fi
 
 # ffmpeg is optional to bundle: some targets (notably darwin/arm64) have no
 # statically linkable build we can safely ship. Prefer a bundled+verified ffmpeg
@@ -182,9 +207,9 @@ if [[ ! -x "${BIN_DIR}/ffmpeg" ]]; then
   fi
   if [[ -n "$(sha_for_artifact "${FFMPEG_TARBALL}")" ]]; then
     echo "Downloading ffmpeg..."
-    download "${FFMPEG_TARBALL}" "/tmp/stoarama-ffmpeg.tar.gz"
-    verify_sha "/tmp/stoarama-ffmpeg.tar.gz" "${FFMPEG_TARBALL}"
-    tar -xzf "/tmp/stoarama-ffmpeg.tar.gz" -C "${BIN_DIR}"
+    download "${FFMPEG_TARBALL}" "${FFMPEG_ARCHIVE}"
+    verify_sha "${FFMPEG_ARCHIVE}" "${FFMPEG_TARBALL}"
+    tar -xzf "${FFMPEG_ARCHIVE}" -C "${BIN_DIR}"
     chmod +x "${BIN_DIR}/ffmpeg" "${BIN_DIR}/ffprobe" 2>/dev/null || true
     unquarantine "${BIN_DIR}/ffmpeg"
     unquarantine "${BIN_DIR}/ffprobe"
@@ -219,11 +244,11 @@ ENROLL_ARGS=(enroll --token "${TOKEN}" --api-url "${API_URL}")
 
 echo ""
 # COOKIELESS install (decision 2026-07-04): the relay records generally PUBLIC streams
-# and resolves YouTube cookieless (yt-dlp's android client, no cookies, no JS runtime).
+# and resolves YouTube cookieless. A pinned Deno runtime is bundled because some
+# public live streams now require yt-dlp's JavaScript challenge solver.
 # There is NO cookie-export step and NO macOS Keychain prompt during install. The
 # with-cookies path for private/members YouTube (stoarama-relay link-youtube) is
-# dormant and gated behind STOARAMA_RELAY_YT_COOKIES=1 plus a bundled JS runtime (Deno)
-# that we do not ship; enable it only if the cookieless bypass stops working.
+# dormant and gated behind STOARAMA_RELAY_YT_COOKIES=1.
 #
 # Load/start the background service. install-launchd/install-systemd replace any prior
 # instance and kickstart it, so a re-run also restarts an already-loaded service.

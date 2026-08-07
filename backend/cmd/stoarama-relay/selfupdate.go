@@ -27,6 +27,7 @@ import (
 
 var lastUpdaterUnix atomic.Int64
 var releasePublicKeyBase64 string
+var restartRelayAfterSelfUpdate = restartAfterSelfUpdate
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
 // binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
@@ -44,6 +45,7 @@ type latestJSON struct {
 	Version         string                    `json:"version"`
 	Relay           map[string]latestArtifact `json:"relay"`
 	Ytdlp           map[string]latestArtifact `json:"ytdlp"`
+	Deno            map[string]latestArtifact `json:"deno"`
 	PreviousVersion string                    `json:"previous_version"`
 	PreviousRelay   map[string]latestArtifact `json:"previous_relay"`
 }
@@ -115,7 +117,7 @@ func runSelfUpdate(args []string) error {
 		if err := atomicWriteExecutable(target, previous); err != nil {
 			return err
 		}
-		return restartAfterSelfUpdate()
+		return restartRelayAfterSelfUpdate()
 	}
 	manifest := releaseManifest(*manifestName)
 	base := strings.TrimRight(strings.TrimSpace(*apiURL), "/")
@@ -144,6 +146,17 @@ func runSelfUpdate(args []string) error {
 	if err := setUpdateManifest(manifest); err != nil {
 		return err
 	}
+	ytdlpPresent, _, err := refreshExecutableDependency(base, lj.Ytdlp, target, "yt-dlp")
+	if err != nil {
+		return fmt.Errorf("refresh yt-dlp before relay activation: %w", err)
+	}
+	denoPresent, _, err := refreshExecutableDependency(base, lj.Deno, target, "deno")
+	if err != nil {
+		return fmt.Errorf("refresh Deno before relay activation: %w", err)
+	}
+	if denoPresent && !ytdlpPresent {
+		return fmt.Errorf("release includes Deno without a pinned yt-dlp artifact for %s", target)
+	}
 	diskUpdated, err := updateRelayBinary(base, rel)
 	if err != nil {
 		if manifest != liveReleaseManifest {
@@ -158,19 +171,16 @@ func runSelfUpdate(args []string) error {
 		fmt.Printf("updated relay %s -> %s\n", version, lj.Version)
 	}
 
-	// yt-dlp refresh follows the same download+verify+atomic-rename pattern.
-	if yt, ok := lj.Ytdlp[target]; ok && strings.TrimSpace(yt.SHA256) != "" {
-		updated, err := updateExecutableIfChanged(base, yt, "yt-dlp")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "yt-dlp refresh skipped: %v\n", err)
-		} else if updated {
-			fmt.Println("yt-dlp refreshed")
+	runtimeActivationNeeded := false
+	if denoPresent && strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")) == "" {
+		if bd, pathErr := binDir(); pathErr == nil && ytdlpJSRuntimeReady(bd, filepath.Join(bd, "yt-dlp")) {
+			runtimeActivationNeeded = true
 		} else {
-			fmt.Println("yt-dlp already up to date")
+			fmt.Fprintln(os.Stderr, "Deno runtime activation held: installed dependencies failed capability checks")
 		}
 	}
-	if relayUpdated {
-		return restartAfterSelfUpdate()
+	if relayUpdated || runtimeActivationNeeded {
+		return restartRelayAfterSelfUpdate()
 	}
 	return nil
 }
@@ -224,6 +234,28 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 		return
 	}
 	target := runtime.GOOS + "-" + runtime.GOARCH
+	ytdlpPresent, _, err := refreshExecutableDependency(base, lj.Ytdlp, target, "yt-dlp")
+	if err != nil {
+		log.Printf("relay self-update: yt-dlp refresh failed; relay activation held: %v", err)
+		return
+	}
+	denoPresent, _, err := refreshExecutableDependency(base, lj.Deno, target, "deno")
+	if err != nil {
+		log.Printf("relay self-update: Deno refresh failed; relay activation held: %v", err)
+		return
+	}
+	if denoPresent && !ytdlpPresent {
+		log.Printf("relay self-update: release includes Deno without pinned yt-dlp for %s; relay activation held", target)
+		return
+	}
+	runtimeActivationNeeded := false
+	if denoPresent && strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")) == "" {
+		if bd, pathErr := binDir(); pathErr == nil && ytdlpJSRuntimeReady(bd, filepath.Join(bd, "yt-dlp")) {
+			runtimeActivationNeeded = true
+		} else {
+			log.Printf("relay self-update: Deno runtime activation held; installed dependencies failed capability checks")
+		}
+	}
 
 	relayUpdated := false
 	if rel, ok := lj.Relay[target]; ok && lj.Version != "" && lj.Version != version {
@@ -237,18 +269,7 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 		log.Printf("relay self-update: relay up to date (%s)", version)
 	}
 
-	if yt, ok := lj.Ytdlp[target]; ok && strings.TrimSpace(yt.SHA256) != "" {
-		updated, err := updateExecutableIfChanged(base, yt, "yt-dlp")
-		if err != nil {
-			log.Printf("relay self-update: yt-dlp refresh failed: %v", err)
-		} else if updated {
-			log.Printf("relay self-update: yt-dlp refreshed")
-		} else {
-			log.Printf("relay self-update: yt-dlp up to date")
-		}
-	}
-
-	if relayUpdated {
+	if relayUpdated || runtimeActivationNeeded {
 		// A recording can be leased while the update downloads. Exclude lease
 		// admission across the final idle check and restart initiation: workers hold
 		// the read side from before the lease request until ActiveJobs is incremented.
@@ -261,10 +282,27 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 			return
 		}
 		log.Printf("relay self-update: restarting service to load new binary")
-		if err := restartAfterSelfUpdate(); err != nil {
+		if err := restartRelayAfterSelfUpdate(); err != nil {
 			log.Printf("relay self-update: restart failed: %v", err)
 		}
 	}
+}
+
+func refreshExecutableDependency(base string, artifacts map[string]latestArtifact, target, name string) (bool, bool, error) {
+	artifact, ok := artifacts[target]
+	if !ok || strings.TrimSpace(artifact.SHA256) == "" {
+		return false, false, nil
+	}
+	updated, err := updateExecutableIfChanged(base, artifact, name)
+	if err != nil {
+		return true, false, err
+	}
+	if updated {
+		log.Printf("relay self-update: %s refreshed", name)
+	} else {
+		log.Printf("relay self-update: %s up to date", name)
+	}
+	return true, updated, nil
 }
 
 func lockRelayRestartGate(leaseGate *sync.RWMutex, activeJobs *atomic.Int64) (func(), bool, int64) {

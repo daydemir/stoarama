@@ -44,6 +44,35 @@ func TestExecutable(t *testing.T) {
 	}
 }
 
+func TestConfigureYTDLPJSRuntimeUsesOnlyBundledDeno(t *testing.T) {
+	t.Setenv("YT_DLP_JS_RUNTIME", "node:/untrusted/path")
+	dir := t.TempDir()
+	ytdlp := filepath.Join(dir, "yt-dlp")
+	if err := os.WriteFile(ytdlp, []byte("#!/bin/sh\nprintf '%s\\n' 'no runtime support'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureYTDLPJSRuntime(dir, ytdlp)
+	if got := os.Getenv("YT_DLP_JS_RUNTIME"); got != "" {
+		t.Fatalf("runtime without bundled Deno = %q", got)
+	}
+
+	deno := filepath.Join(dir, "deno")
+	if err := os.WriteFile(deno, []byte("#!/bin/sh\nprintf '%s\\n' 'deno 2.8.1'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureYTDLPJSRuntime(dir, ytdlp)
+	if got := os.Getenv("YT_DLP_JS_RUNTIME"); got != "" {
+		t.Fatalf("runtime with unsupported yt-dlp = %q", got)
+	}
+	if err := os.WriteFile(ytdlp, []byte("#!/bin/sh\nprintf '%s\\n' '--js-runtimes RUNTIME[:PATH]'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureYTDLPJSRuntime(dir, ytdlp)
+	if got, want := os.Getenv("YT_DLP_JS_RUNTIME"), "deno:"+deno; got != want {
+		t.Fatalf("runtime = %q, want %q", got, want)
+	}
+}
+
 func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	received := make(chan map[string]any, 1)
