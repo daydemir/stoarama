@@ -481,6 +481,7 @@
       .recordings-table tbody { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
+      .action-menu-pop { position: fixed; top: 50%; right: 12px; left: 12px; min-width: 0; max-height: calc(100vh - 24px); overflow-y: auto; transform: translateY(-50%); z-index: 1000; }
       .grid-2 { grid-template-columns: 1fr; }
       .batch-stream-table { min-width: 620px; }
       /* Stack the detail header so the "Back to recordings" link (last in DOM)
