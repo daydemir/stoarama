@@ -608,6 +608,9 @@ func TestContinuousProgressTimeoutBoundsHLSReconnect(t *testing.T) {
 	if got := continuousProgressTimeout("https://example.com/live.m3u8?token=x", 60*time.Second); got != 30*time.Second {
 		t.Fatalf("HLS progress timeout=%v want 30s", got)
 	}
+	if got := continuousProgressTimeout("https://example.com/manifest?format=.m3u8", 60*time.Second); got != 30*time.Second {
+		t.Fatalf("query-declared HLS progress timeout=%v want 30s", got)
+	}
 	if got := continuousProgressTimeout("https://example.com/live.mp4", 60*time.Second); got != 75*time.Second {
 		t.Fatalf("direct-video progress timeout=%v want 75s", got)
 	}
@@ -632,6 +635,9 @@ func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
 		wantHLS   bool
 	}{
 		{name: "signed HLS URL", sourceURL: "https://example.com/live.m3u8?token=test", wantHLS: true},
+		{name: "API HLS format", sourceURL: "https://example.com/manifest?format=.m3u8", wantHLS: true},
+		{name: "API HLS name", sourceURL: "https://example.com/manifest?format=hls", wantHLS: true},
+		{name: "irrelevant query value", sourceURL: "https://example.com/live.mp4?next=.m3u8", wantHLS: false},
 		{name: "malformed URL", sourceURL: "https://example.com/live%ZZ.m3u8", wantHLS: false},
 	}
 	for _, tt := range tests {
@@ -648,6 +654,12 @@ func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
 				t.Fatalf("non-HLS args changed: got=%v want=%v", args, base)
 			}
 		})
+	}
+}
+
+func TestHLSManifestURLKeepsResolverValidationPathStrict(t *testing.T) {
+	if isHLSManifestURL("https://example.com/manifest?format=.m3u8") {
+		t.Fatal("query-declared runtime HLS input passed strict resolver manifest validation")
 	}
 }
 

@@ -222,7 +222,7 @@ func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 
 func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) time.Duration {
 	timeout := clipDuration + 15*time.Second
-	if isHLSManifestURL(sourceURL) && timeout > 30*time.Second {
+	if isHLSInputURL(sourceURL) && timeout > 30*time.Second {
 		return 30 * time.Second
 	}
 	return timeout
@@ -592,10 +592,10 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 //
 // These are input-scoped HLS/HTTP options, so they must appear before -i and
 // must not be sent to ordinary HTTP video inputs. A resolved manifest's URL
-// path is the reliable discriminator; query strings do not affect the .m3u8
-// suffix.
+// path is the reliable discriminator. Signed/API endpoints may instead declare
+// their format explicitly in the query.
 func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
-	if !isHLSManifestURL(sourceURL) {
+	if !isHLSInputURL(sourceURL) {
 		return args
 	}
 	return append(args,
@@ -609,6 +609,18 @@ func isHLSManifestURL(sourceURL string) bool {
 		return false
 	}
 	return true
+}
+
+func isHLSInputURL(sourceURL string) bool {
+	if isHLSManifestURL(sourceURL) {
+		return true
+	}
+	u, err := url.Parse(strings.TrimSpace(sourceURL))
+	if err != nil {
+		return false
+	}
+	format := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(u.Query().Get("format"))), ".")
+	return format == "m3u8" || format == "hls"
 }
 
 // ProbeReachable verifies that sourceURL opens and yields at least one packet
