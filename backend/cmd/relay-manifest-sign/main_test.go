@@ -45,11 +45,18 @@ func TestSignerRoundTripRejectsTamperingAndWrongKey(t *testing.T) {
 }
 
 func TestRelayReleaseScriptsParse(t *testing.T) {
-	for _, script := range []string{"release-relay.sh", "relay-release-provenance.sh", "relay-release-immutable.sh", "relay-release-immutable-test.sh", "promote-relay.sh", "relay-install.sh"} {
+	for _, script := range []string{"release-relay.sh", "relay-release-provenance.sh", "relay-release-immutable.sh", "relay-release-immutable-test.sh", "promote-relay.sh", "relay-install.sh", "relay-install-rollback-test.sh"} {
 		cmd := exec.Command("bash", "-n", filepath.Join("..", "..", "scripts", script))
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", script, err, output)
 		}
+	}
+}
+
+func TestRelayInstallerRollbackRestoresExactBytes(t *testing.T) {
+	cmd := exec.Command("bash", filepath.Join("..", "..", "scripts", "relay-install-rollback-test.sh"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("installer rollback: %v\n%s", err, output)
 	}
 }
 

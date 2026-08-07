@@ -130,6 +130,10 @@ func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
 		case <-deadline.C:
 			t.Fatal("first heartbeat completion was not signaled")
 		}
+		state, err := loadRecoveryState(recoveryStatePath())
+		if err != nil || state.HeartbeatSuccessCount != 1 {
+			t.Fatalf("heartbeat success count=%d err=%v, want 1", state.HeartbeatSuccessCount, err)
+		}
 	case <-deadline.C:
 		t.Fatal("first heartbeat waited for an external probe")
 	}
