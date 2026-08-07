@@ -244,9 +244,39 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	if startupTimeout <= 0 || progressTimeout <= 0 {
 		return fmt.Errorf("continuous watchdog timeouts must be > 0")
 	}
+	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true)
+	if !isMalformedAudioMuxError(err) {
+		return err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, ctxErr)
+	}
+	clean, cleanupErr := removeZeroLengthContinuousSegments(outDir)
+	if cleanupErr != nil {
+		return errors.Join(err, cleanupErr)
+	}
+	if !clean {
+		// Never change stream selection after FFmpeg produced media. That could mix
+		// audio-bearing and video-only files in one attempt or duplicate footage.
+		return err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, ctxErr)
+	}
+	// Some HLS feeds advertise AAC but never provide a sample rate. MP4 cannot
+	// write that track and exits before producing any video. Retry once without
+	// audio; video remains a lossless stream copy and healthy audio is preserved
+	// on every source that did not hit this exact muxer failure.
+	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false)
+}
+
+func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	outPattern := filepath.Join(outDir, "seg-%Y%m%d-%H%M%S.mp4")
-	args := buildFFmpegContinuousArgsWithHeaders(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders)
+	args := buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, includeAudio)
 	cmd := exec.Command(ffmpegBin(), args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -372,6 +402,40 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	}
 }
 
+func isMalformedAudioMuxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "sample rate not set") &&
+		strings.Contains(text, "could not write header (incorrect codec parameters ?): invalid argument")
+}
+
+// removeZeroLengthContinuousSegments makes the one safe retry case explicit:
+// no usable media may exist. It removes only empty files left by FFmpeg's failed
+// header write and refuses fallback if any segment contains bytes.
+func removeZeroLengthContinuousSegments(outDir string) (bool, error) {
+	paths, err := filepath.Glob(filepath.Join(outDir, "seg-*.mp4"))
+	if err != nil {
+		return false, fmt.Errorf("glob failed continuous output: %w", err)
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return false, fmt.Errorf("stat failed continuous output: %w", err)
+		}
+		if info.Size() != 0 {
+			return false, nil
+		}
+	}
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil {
+			return false, fmt.Errorf("remove empty continuous output: %w", err)
+		}
+	}
+	return true, nil
+}
+
 func deliverContinuousSegment(processed map[string]bool, path string, segment Segment, nextStart *time.Time, deliver func(Segment) error) error {
 	// A persistent segment muxer writes packets to these files in capture order,
 	// making probed media durations the authoritative intra-attempt timeline.
@@ -469,6 +533,9 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 	if err != nil {
 		return Segment{}, fmt.Errorf("stat segment: %w", err)
 	}
+	if info.Size() == 0 {
+		return Segment{}, fmt.Errorf("finalized segment is empty")
+	}
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return Segment{}, fmt.Errorf("read segment: %w", err)
@@ -536,6 +603,10 @@ func buildFFmpegContinuousArgs(sourceURL string, outPattern string, clipDuration
 }
 
 func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int, inputHeaders string) []string {
+	return buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, true)
+}
+
+func buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int, inputHeaders string, includeAudio bool) []string {
 	seconds := strconv.FormatFloat(clipDuration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
@@ -548,8 +619,10 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 		"-fflags", "+discardcorrupt",
 		"-i", sourceURL,
 		"-map", "0:v:0",
-		"-map", "0:a?",
 	)
+	if includeAudio {
+		args = append(args, "-map", "0:a?")
+	}
 	if targetFPS != nil && *targetFPS > 0 {
 		// Fixed-fps path: re-encode to the chosen rate so segments are exactly
 		// clipDuration. Identical to buildFFmpegSegmentArgs's re-encode fork.
@@ -559,9 +632,10 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 			"-preset", "veryfast",
 			"-crf", "23",
 			"-pix_fmt", "yuv420p",
-			"-c:a", "aac",
-			"-b:a", "128k",
 		)
+		if includeAudio {
+			args = append(args, "-c:a", "aac", "-b:a", "128k")
+		}
 	} else {
 		// Source/native path: stream-copy. Segment cuts land on input keyframes, so
 		// each segment is ~clipDuration; this is the cheap, gapless default.

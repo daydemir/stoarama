@@ -519,6 +519,155 @@ func TestCaptureContinuousDoesNotRedeliverAfterCallbackFailure(t *testing.T) {
 	}
 }
 
+func TestCaptureContinuousFallsBackToVideoOnlyForMalformedAudio(t *testing.T) {
+	temp := t.TempDir()
+	ffmpeg := filepath.Join(temp, "ffmpeg")
+	logPath := filepath.Join(temp, "args.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FFMPEG_ARGS_LOG"
+for last do :; done
+out=${last%/*}
+case " $* " in
+  *" -map 0:a? "*)
+    : > "$out/seg-20260807-120000.mp4"
+    echo 'sample rate not set' >&2
+    echo 'Could not write header (incorrect codec parameters ?): Invalid argument' >&2
+    exit 1
+    ;;
+esac
+printf first > "$out/seg-20260807-120000.mp4"
+printf second > "$out/seg-20260807-120001.mp4"
+trap 'exit 0' INT TERM
+while :; do sleep 0.1; done
+`
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	t.Setenv("FFMPEG_BIN", ffmpeg)
+	t.Setenv("FFMPEG_ARGS_LOG", logPath)
+	output := filepath.Join(temp, "output")
+	if err := os.Mkdir(output, 0o755); err != nil {
+		t.Fatalf("create output dir: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	deliveries := 0
+	var deliveredSizes []int64
+	err := captureContinuousWithHeaders(
+		ctx, "https://example.com/live.m3u8", time.Second, "", nil, output,
+		func(seg Segment) error {
+			deliveries++
+			deliveredSizes = append(deliveredSizes, seg.SizeBytes)
+			cancel()
+			return nil
+		}, "", time.Second, 5*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("capture malformed-audio fallback: %v", err)
+	}
+	if deliveries == 0 {
+		t.Fatal("video-only fallback produced no segment")
+	}
+	for _, size := range deliveredSizes {
+		if size == 0 {
+			t.Fatalf("delivered sizes=%v; empty first-attempt artifact reached callback", deliveredSizes)
+		}
+	}
+	logBody, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg args: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(logBody)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("ffmpeg attempts=%d want 2: %q", len(lines), logBody)
+	}
+	if !strings.Contains(lines[0], "-map 0:a?") {
+		t.Fatalf("first attempt must preserve audio: %s", lines[0])
+	}
+	if strings.Contains(lines[1], "-map 0:a?") || !strings.Contains(lines[1], "-map 0:v:0") {
+		t.Fatalf("fallback must be video-only: %s", lines[1])
+	}
+}
+
+func TestMalformedAudioFallbackRefusesExistingMedia(t *testing.T) {
+	out := t.TempDir()
+	path := filepath.Join(out, "seg-20260807-120000.mp4")
+	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clean, err := removeZeroLengthContinuousSegments(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean {
+		t.Fatal("fallback allowed despite existing media")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("existing media was altered: %v", err)
+	}
+}
+
+func TestMalformedAudioMuxErrorRequiresExactHeaderFailure(t *testing.T) {
+	known := errors.New("sample rate not set\nCould not write header (incorrect codec parameters ?): Invalid argument")
+	if !isMalformedAudioMuxError(known) {
+		t.Fatal("known malformed-audio header failure was not recognized")
+	}
+	nearMatch := errors.New("sample rate not set\nCould not write header: permission denied")
+	if isMalformedAudioMuxError(nearMatch) {
+		t.Fatal("unrelated header failure triggered audio removal")
+	}
+}
+
+func TestMalformedAudioFallbackDoesNotRestartAfterCancellation(t *testing.T) {
+	temp := t.TempDir()
+	ffmpeg := filepath.Join(temp, "ffmpeg")
+	logPath := filepath.Join(temp, "args.log")
+	script := `#!/bin/sh
+echo invoked >> "$FFMPEG_ARGS_LOG"
+sleep 0.1
+echo 'sample rate not set' >&2
+echo 'Could not write header (incorrect codec parameters ?): Invalid argument' >&2
+exit 1
+`
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFMPEG_BIN", ffmpeg)
+	t.Setenv("FFMPEG_ARGS_LOG", logPath)
+	output := filepath.Join(temp, "output")
+	if err := os.Mkdir(output, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- captureContinuousWithHeaders(ctx, "https://example.com/live.m3u8", time.Second, "", nil, output, func(Segment) error { return nil }, "", time.Second, time.Second)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		body, _ := os.ReadFile(logPath)
+		if strings.Contains(string(body), "invoked") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first FFmpeg attempt did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	// Normal window cancellation returns nil when ctx.Done wins the select; if
+	// FFmpeg exit wins, the wrapper returns the joined cancellation. Either is
+	// valid, but neither may start the video-only retry.
+	<-errCh
+	body, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got := strings.Count(string(body), "invoked"); got != 1 {
+		t.Fatalf("ffmpeg invocations=%d want 1: %q", got, body)
+	}
+}
+
 func TestCaptureContinuousRetriesFinalSweepAfterFinalizeFailure(t *testing.T) {
 	temp := t.TempDir()
 	ffmpeg := filepath.Join(temp, "ffmpeg")
