@@ -462,6 +462,7 @@ func (s *Server) router() http.Handler {
 			connections.Post("/account/connections", s.handleAccountConnectionsCreate)
 			connections.Get("/account/connections", s.handleAccountConnectionsList)
 			connections.Get("/account/connections/{id}/inventory", s.handleAccountConnectionInventoryList)
+			connections.Get("/account/connections/{id}/inventory/tree", s.handleAccountConnectionInventoryTree)
 			connections.Get("/account/connections/{id}/inventory.csv", s.handleAccountConnectionInventoryCSV)
 			connections.Patch("/account/connections/{id}/inventory-mode", s.handleAccountConnectionInventoryMode)
 			connections.Post("/account/connections/{id}/rotate", s.handleAccountConnectionRotate)

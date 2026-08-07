@@ -275,6 +275,29 @@ func TestOrganizationNASConnectionUsesStructuredHealthCard(t *testing.T) {
 	}
 }
 
+func TestOrganizationNASInventoryUsesPaginatedFolderBrowser(t *testing.T) {
+	body, err := loadHTMLPage("org-settings.html")
+	if err != nil {
+		t.Fatalf("load org settings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`/inventory/tree?${params.toString()}`,
+		`inventoryBreadcrumbs(path)`,
+		`data-inventory-path=`,
+		`Up one folder`,
+		`data.next_cursor`,
+		`box.dataset.inventoryRequest !== requestGeneration`,
+		`box.dataset.inventoryServerOnly = String(Number(data.server_only || 0))`,
+		`server-only clips across this NAS`,
+		`Download full manifest CSV`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("org settings html missing NAS folder-browser marker %q", marker)
+		}
+	}
+}
+
 func TestHandleDashboardStaticServesDashboardJS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/static/dashboard.js", nil)
 	rec := httptest.NewRecorder()
