@@ -88,6 +88,9 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(backfillMigration)); err != nil {
 		t.Fatal(err)
 	}
+	if err := meterDuePeriods(ctx, pool, &fakeMeteringStripe{}, time.Now().UTC()); err != nil {
+		t.Fatalf("parse empty due-period query: %v", err)
+	}
 	var legacyAuthoritative bool
 	if err := pool.QueryRow(ctx, `SELECT authoritative FROM clip_storage_billing_contracts WHERE clip_id=9`).Scan(&legacyAuthoritative); err != nil || legacyAuthoritative {
 		t.Fatalf("legacy authoritative=%v err=%v", legacyAuthoritative, err)

@@ -186,7 +186,7 @@ func meterDuePeriods(ctx context.Context, pool *pgxpool.Pool, reporter meteringS
 	rows, err := pool.Query(ctx, `
 		SELECT p.account_id,p.stripe_customer_id,p.stripe_subscription_id,p.period_start,p.period_end
 		FROM billing_meter_periods p
-		WHERE p.metered_at IS NULL AND p.period_end <= $1 - interval '70 minutes'
+		WHERE p.metered_at IS NULL AND p.period_end <= $1::timestamptz - interval '70 minutes'
 		ORDER BY p.period_end,p.account_id`, now.UTC())
 	if err != nil {
 		return err
