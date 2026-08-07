@@ -3,10 +3,12 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +61,171 @@ func TestValidNASRelativePath(t *testing.T) {
 	}
 	if !validNASRelativePath("recording/day/clip.mp4") {
 		t.Fatal("safe relative path rejected")
+	}
+}
+
+func TestNASInventoryTreeCursorRejectsTampering(t *testing.T) {
+	want := nasInventoryTreeCursor{Kind: 0, Name: "August"}
+	encoded := encodeNASInventoryTreeCursor(want)
+	got, err := decodeNASInventoryTreeCursor(encoded)
+	if err != nil || got != want {
+		t.Fatalf("cursor round trip got=%+v err=%v", got, err)
+	}
+	for _, value := range []string{"not-base64!", base64.RawURLEncoding.EncodeToString([]byte(`{"kind":2,"name":"x"}`)), base64.RawURLEncoding.EncodeToString([]byte(`{"kind":0,"name":"../x"}`))} {
+		if _, err := decodeNASInventoryTreeCursor(value); err == nil {
+			t.Errorf("invalid cursor accepted: %q", value)
+		}
+	}
+}
+
+func TestNASInventoryTreeContinuationQuerySkipsFolderAggregation(t *testing.T) {
+	direct := nasInventoryTreeSQL("Africa/July/", true)
+	if strings.Contains(direct, "GROUP BY") || strings.Contains(direct, "split_part") {
+		t.Fatalf("direct-file continuation still aggregates folders:\n%s", direct)
+	}
+	for _, marker := range []string{"i.connection_id=$1", "starts_with(i.relative_path,$3)", "u.connection_id=$1", "starts_with(u.relative_path,$3)"} {
+		if !strings.Contains(direct, marker) {
+			t.Fatalf("nested query missing connection-scoped literal prefix %q", marker)
+		}
+	}
+	if strings.Contains(direct, "relative_path >=") || strings.Contains(direct, "relative_path <") {
+		t.Fatal("nested query retained collation-dependent range bounds")
+	}
+	for _, marker := range []string{
+		"i.relative_path > ($3 || $5)",
+		"u.relative_path > ($3 || $5)",
+		"substring(i.relative_path FROM char_length($3)+1)",
+		"substring(u.relative_path FROM char_length($3)+1)",
+	} {
+		if !strings.Contains(direct, marker) {
+			t.Fatalf("direct continuation did not push %q into raw source branches", marker)
+		}
+	}
+	unionAt := strings.Index(direct, "UNION ALL")
+	deduplicateAt := strings.Index(direct, "), deduplicated AS")
+	if unionAt < 0 || deduplicateAt < 0 || strings.Index(direct, "i.relative_path > ($3 || $5)") > unionAt ||
+		strings.Index(direct, "u.relative_path > ($3 || $5)") < unionAt || strings.Index(direct, "u.relative_path > ($3 || $5)") > deduplicateAt {
+		t.Fatal("direct keyset predicates are not inside both pre-union raw branches")
+	}
+	if aggregate := nasInventoryTreeSQL("Africa/", false); !strings.Contains(aggregate, "GROUP BY") {
+		t.Fatal("folder phase omitted folder aggregation")
+	}
+}
+
+func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID = int64(42)
+	var connectionID, recordingID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind) VALUES($1,'nas_pull') RETURNING id`, accountID).Scan(&connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name,delivery) VALUES($1,'tree','nas_pull') RETURNING id`, accountID).Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	for index, path := range []string{"Africa/July/one.mp4", "Africa/August/two.mp4", "Europe/three.mp4", "root.mp4"} {
+		var clipID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,size_bytes,sha256,display_path,clip_start_at,clip_end_at) VALUES($1,$2,$3,$4,now()-interval '1 minute',now()) RETURNING id`, recordingID, index+1, sha, path).Scan(&clipID); err != nil {
+			t.Fatal(err)
+		}
+		state := "present"
+		if path == "Africa/August/two.mp4" {
+			state = "mismatch"
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,now(),now())`, connectionID, clipID, recordingID, path, index+1, sha, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES($1,'Africa/July/orphan.mp4',9,$2,'present',now())`, connectionID, sha); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	call := func(path, cursor string, limit int) (int, map[string]any) {
+		url := fmt.Sprintf("/api/v1/account/connections/%d/inventory/tree?limit=%d", connectionID, limit)
+		if path != "" {
+			url += "&path=" + neturl.QueryEscape(path)
+		}
+		if cursor != "" {
+			url += "&cursor=" + cursor
+		}
+		req := httptest.NewRequest(http.MethodGet, url, nil)
+		req.SetPathValue("id", fmt.Sprint(connectionID))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionInventoryTree(rec, req)
+		var body map[string]any
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return rec.Code, body
+	}
+	status, first := call("", "", 2)
+	if status != http.StatusOK {
+		t.Fatalf("root status=%d", status)
+	}
+	firstEntries := first["entries"].([]any)
+	if len(firstEntries) != 2 || firstEntries[0].(map[string]any)["name"] != "Africa" || firstEntries[1].(map[string]any)["name"] != "Europe" {
+		t.Fatalf("root first page=%v", firstEntries)
+	}
+	cursor, _ := first["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatal("root first page omitted cursor")
+	}
+	status, second := call("", cursor, 2)
+	secondEntries := second["entries"].([]any)
+	if status != http.StatusOK || len(secondEntries) != 1 || secondEntries[0].(map[string]any)["name"] != "root.mp4" {
+		t.Fatalf("root second page status=%d entries=%v", status, secondEntries)
+	}
+	if _, ok := second["server_only"]; ok {
+		t.Fatal("continuation page recomputed server-only summary")
+	}
+	status, africa := call("Africa", "", 20)
+	africaEntries := africa["entries"].([]any)
+	if status != http.StatusOK || len(africaEntries) != 2 || africaEntries[0].(map[string]any)["kind"] != "directory" {
+		t.Fatalf("Africa status=%d entries=%v", status, africaEntries)
+	}
+	if _, ok := africa["server_only"]; ok {
+		t.Fatal("nested folder first page recomputed account-wide server-only summary")
+	}
+	status, july := call("Africa/July", "", 20)
+	julyEntries := july["entries"].([]any)
+	if status != http.StatusOK || len(julyEntries) != 2 {
+		t.Fatalf("July status=%d entries=%v", status, julyEntries)
+	}
+	if julyEntries[1].(map[string]any)["reconciliation"] != "nas_only" {
+		t.Fatalf("July unmatched file missing: %v", julyEntries)
+	}
+	status, julyFirst := call("Africa/July", "", 1)
+	julyCursor, _ := julyFirst["next_cursor"].(string)
+	if status != http.StatusOK || julyCursor == "" {
+		t.Fatalf("July first file page status=%d cursor=%q", status, julyCursor)
+	}
+	decoded, err := decodeNASInventoryTreeCursor(julyCursor)
+	if err != nil || decoded.Kind != 1 {
+		t.Fatalf("July cursor=%+v err=%v, want direct-file phase", decoded, err)
+	}
+	status, julySecond := call("Africa/July", julyCursor, 1)
+	if status != http.StatusOK || len(julySecond["entries"].([]any)) != 1 {
+		t.Fatalf("July direct continuation status=%d body=%v", status, julySecond)
+	}
+	if status, _ := call("../private", "", 20); status != http.StatusBadRequest {
+		t.Fatalf("unsafe directory status=%d, want 400", status)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES
+		($1,'100%/literal.mp4',5,$2,'present',now()),($1,'1000/sibling.mp4',6,$2,'present',now()),
+		($1,'under_score/literal.mp4',7,$2,'present',now()),($1,'underXscore/sibling.mp4',8,$2,'present',now())`, connectionID, sha); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"100%", "under_score"} {
+		status, body := call(path, "", 20)
+		entries := body["entries"].([]any)
+		if status != http.StatusOK || len(entries) != 1 || entries[0].(map[string]any)["name"] != "literal.mp4" {
+			t.Fatalf("escaped prefix %q status=%d entries=%v", path, status, entries)
+		}
 	}
 }
 

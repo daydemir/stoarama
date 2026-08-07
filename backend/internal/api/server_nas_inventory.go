@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -318,6 +320,213 @@ type nasInventoryListItem struct {
 	VerifiedAt       *time.Time `json:"verified_at"`
 	ServerReceivedAt time.Time  `json:"server_received_at"`
 	Reconciliation   string     `json:"reconciliation"`
+}
+
+type nasInventoryTreeCursor struct {
+	Kind int    `json:"kind"`
+	Name string `json:"name"`
+}
+
+type nasInventoryTreeEntry struct {
+	Kind            string     `json:"kind"`
+	Name            string     `json:"name"`
+	RelativePath    string     `json:"relative_path"`
+	DescendantFiles int64      `json:"descendant_files,omitempty"`
+	ClipID          *int64     `json:"clip_id,omitempty"`
+	RecordingID     *int64     `json:"recording_id,omitempty"`
+	SizeBytes       int64      `json:"size_bytes"`
+	SHA256          string     `json:"sha256,omitempty"`
+	State           string     `json:"state,omitempty"`
+	VerifiedAt      *time.Time `json:"verified_at,omitempty"`
+	Reconciliation  string     `json:"reconciliation,omitempty"`
+	MismatchFiles   int64      `json:"mismatch_files,omitempty"`
+	NASOnlyFiles    int64      `json:"nas_only_files,omitempty"`
+}
+
+func encodeNASInventoryTreeCursor(cursor nasInventoryTreeCursor) string {
+	payload, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeNASInventoryTreeCursor(value string) (nasInventoryTreeCursor, error) {
+	if value == "" {
+		return nasInventoryTreeCursor{Kind: -1}, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return nasInventoryTreeCursor{}, errors.New("invalid inventory cursor")
+	}
+	var cursor nasInventoryTreeCursor
+	if err := json.Unmarshal(payload, &cursor); err != nil || (cursor.Kind != 0 && cursor.Kind != 1) ||
+		cursor.Name == "" || len(cursor.Name) > nasInventoryMaxPathBytes || strings.ContainsAny(cursor.Name, `/\`) || cursor.Name == "." || cursor.Name == ".." {
+		return nasInventoryTreeCursor{}, errors.New("invalid inventory cursor")
+	}
+	return cursor, nil
+}
+
+func nasInventoryTreeSQL(prefix string, directFilesOnly bool) string {
+	linkedScope, unmatchedScope := "", ""
+	if prefix != "" {
+		// starts_with is literal prefix matching: it does not depend on locale
+		// sort order and gives '%' and '_' no wildcard meaning. The existing
+		// compound indexes still narrow each scan to this connection first.
+		linkedScope = " AND starts_with(i.relative_path,$3)"
+		unmatchedScope = " AND starts_with(u.relative_path,$3)"
+	}
+	if directFilesOnly {
+		// Apply both the keyset seek and immediate-child test before UNION and
+		// DISTINCT so continued file pages do not scan or sort the whole subtree.
+		linkedScope += " AND i.relative_path > ($3 || $5) AND strpos(substring(i.relative_path FROM char_length($3)+1),'/')=0"
+		unmatchedScope += " AND u.relative_path > ($3 || $5) AND strpos(substring(u.relative_path FROM char_length($3)+1),'/')=0"
+	}
+	cte := `
+		WITH raw AS (
+			SELECT i.relative_path,i.clip_id,i.recording_id,i.size_bytes,i.sha256,i.state,i.verified_at,
+			       CASE WHEN c.id IS NULL THEN 'nas_only'
+			            WHEN i.state='mismatch' OR c.size_bytes<>i.size_bytes OR lower(c.sha256)<>i.sha256 OR c.display_path<>i.relative_path THEN 'mismatch'
+			            ELSE 'confirmed' END AS reconciliation,0 AS source_order
+			FROM nas_inventory_files i
+			LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
+			WHERE i.connection_id=$1 AND i.state IN('present','mismatch')` + linkedScope + `
+			UNION ALL
+			SELECT u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',1
+			FROM nas_inventory_unmatched_files u
+			WHERE u.connection_id=$1 AND u.state='present'` + unmatchedScope + `
+		), deduplicated AS (
+			SELECT DISTINCT ON(relative_path) relative_path,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation
+			FROM raw ORDER BY relative_path,source_order
+		), scoped AS (
+			SELECT *,substring(relative_path FROM char_length($3)+1) AS remainder FROM deduplicated
+		)`
+	if directFilesOnly {
+		return cte + `
+		SELECT 1 AS kind_sort,remainder AS name,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation,
+		       1::bigint AS descendant_files,
+		       CASE WHEN reconciliation='mismatch' THEN 1 ELSE 0 END::bigint AS mismatch_files,
+		       CASE WHEN reconciliation='nas_only' THEN 1 ELSE 0 END::bigint AS nas_only_files
+		FROM scoped
+		ORDER BY remainder LIMIT $6`
+	}
+	return cte + `
+		, entries AS (
+			SELECT 0 AS kind_sort,split_part(remainder,'/',1) AS name,NULL::bigint AS clip_id,NULL::bigint AS recording_id,
+			       sum(size_bytes)::bigint AS size_bytes,''::text AS sha256,''::text AS state,NULL::timestamptz AS verified_at,
+			       ''::text AS reconciliation,count(*)::bigint AS descendant_files,
+			       count(*) FILTER(WHERE reconciliation='mismatch')::bigint AS mismatch_files,
+			       count(*) FILTER(WHERE reconciliation='nas_only')::bigint AS nas_only_files
+			FROM scoped WHERE strpos(remainder,'/')>0 GROUP BY split_part(remainder,'/',1)
+			UNION ALL
+			SELECT 1,remainder,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation,1,
+			       CASE WHEN reconciliation='mismatch' THEN 1 ELSE 0 END,
+			       CASE WHEN reconciliation='nas_only' THEN 1 ELSE 0 END
+			FROM scoped WHERE strpos(remainder,'/')=0
+		)
+		SELECT kind_sort,name,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation,
+		       descendant_files,mismatch_files,nas_only_files
+		FROM entries
+		WHERE kind_sort>$4 OR (kind_sort=$4 AND name>$5)
+		ORDER BY kind_sort,name LIMIT $6`
+}
+
+// handleAccountConnectionInventoryTree lists only the immediate children of a
+// directory. The opaque keyset cursor keeps response size bounded even when a
+// NAS has hundreds of thousands of files; the existing flat endpoint and CSV
+// remain available for reconciliation and full-manifest workflows.
+func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	connectionID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	directory := r.URL.Query().Get("path")
+	if directory != "" && !validNASRelativePath(directory) {
+		util.WriteError(w, http.StatusBadRequest, "invalid inventory directory")
+		return
+	}
+	cursor, err := decodeNASInventoryTreeCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit < 1 || limit > nasInventoryMaxPage {
+		limit = 200
+	}
+	var exists bool
+	if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM connections WHERE id=$1 AND account_id=$2)`, connectionID, principal.AccountID).Scan(&exists); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load connection: %v", err))
+		return
+	}
+	if !exists {
+		util.WriteError(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	prefix := ""
+	if directory != "" {
+		prefix = directory + "/"
+	}
+	rows, err := s.pool.Query(r.Context(), nasInventoryTreeSQL(prefix, cursor.Kind == 1),
+		connectionID, principal.AccountID, prefix, cursor.Kind, cursor.Name, limit+1)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("browse inventory: %v", err))
+		return
+	}
+	defer rows.Close()
+	entries := make([]nasInventoryTreeEntry, 0, limit)
+	var nextCursor string
+	for rows.Next() {
+		var kind int
+		var name, sha, state, reconciliation string
+		var clipID, recordingID *int64
+		var sizeBytes, descendantFiles, mismatchFiles, nasOnlyFiles int64
+		var verifiedAt *time.Time
+		if err := rows.Scan(&kind, &name, &clipID, &recordingID, &sizeBytes, &sha, &state, &verifiedAt, &reconciliation, &descendantFiles, &mismatchFiles, &nasOnlyFiles); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan inventory directory: %v", err))
+			return
+		}
+		if len(entries) == limit {
+			last := entries[len(entries)-1]
+			lastKind := 1
+			if last.Kind == "directory" {
+				lastKind = 0
+			}
+			nextCursor = encodeNASInventoryTreeCursor(nasInventoryTreeCursor{Kind: lastKind, Name: last.Name})
+			break
+		}
+		entryPath := name
+		if directory != "" {
+			entryPath = directory + "/" + name
+		}
+		entry := nasInventoryTreeEntry{Kind: "file", Name: name, RelativePath: entryPath, DescendantFiles: descendantFiles,
+			ClipID: clipID, RecordingID: recordingID, SizeBytes: sizeBytes, SHA256: sha, State: state,
+			VerifiedAt: verifiedAt, Reconciliation: reconciliation, MismatchFiles: mismatchFiles, NASOnlyFiles: nasOnlyFiles}
+		if kind == 0 {
+			entry.Kind = "directory"
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate inventory directory: %v", err))
+		return
+	}
+	response := map[string]any{"path": directory, "entries": entries, "next_cursor": nextCursor}
+	if directory == "" && r.URL.Query().Get("cursor") == "" {
+		var serverOnly int64
+		if err := s.pool.QueryRow(r.Context(), `
+			SELECT count(*) FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
+			WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=$2 AND i.clip_id=c.id AND i.state='present')
+		`, principal.AccountID, connectionID).Scan(&serverOnly); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count server-only clips: %v", err))
+			return
+		}
+		response["server_only"] = serverOnly
+	}
+	util.WriteJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) inventoryRows(r *http.Request, accountID, connectionID, afterID int64, limit int) (pgx.Rows, error) {
