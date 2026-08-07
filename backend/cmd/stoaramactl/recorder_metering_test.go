@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -93,9 +94,9 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recordings VALUES(1,47,'monthly','nas_pull');
 		INSERT INTO storage_destinations VALUES(1,true);
-		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(1,1,1,now(),now(),now()+interval '1 minute',1);
+		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(1,1,1,'2026-09-02','2026-09-02','2026-09-02 00:01',1);
 		UPDATE recordings SET storage_retention_tier='yearly_prepaid',delivery='managed' WHERE id=1;
-		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(2,1,1,now(),now(),now()+interval '1 minute',1);
+		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(2,1,1,'2026-09-02','2026-09-02','2026-09-02 00:01',1);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +172,14 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if len(f.reports) != 1 || f.reports[0].hours != 5 {
 		t.Fatalf("submitted reports=%+v", f.reports)
 	}
-	f.meterUsage = 5
+	if len(f.shmReports) != 1 {
+		t.Fatalf("submitted storage reports=%+v", f.shmReports)
+	}
+	storageUsage, parseErr := strconv.ParseFloat(f.shmReports[0].hoursDecimal, 64)
+	if parseErr != nil {
+		t.Fatal(parseErr)
+	}
+	f.meterUsageByKind = map[string]float64{"recording_hour": 5, "stream_hour_month": storageUsage}
 	if err := meterClosedPeriod(ctx, pool, f, a, start, end); err == nil || !strings.Contains(err.Error(), "awaiting invoice") {
 		t.Fatalf("aggregate phase err=%v", err)
 	}
@@ -233,12 +241,12 @@ func TestShouldReportHours(t *testing.T) {
 // each report branch's arguments (customer, account, period key, value) can be
 // asserted without Stripe.
 type fakeMeteringStripe struct {
-	periodStart time.Time
-	periodEnd   time.Time
-	reports     []reportCall
-	shmReports  []shmReportCall
-	meterUsage  float64
-	invoice     billing.PeriodInvoice
+	periodStart      time.Time
+	periodEnd        time.Time
+	reports          []reportCall
+	shmReports       []shmReportCall
+	meterUsageByKind map[string]float64
+	invoice          billing.PeriodInvoice
 }
 
 type reportCall struct {
@@ -269,8 +277,8 @@ func (f *fakeMeteringStripe) ReportStreamHourMonth(_ context.Context, customerID
 	return nil
 }
 
-func (f *fakeMeteringStripe) MeterUsage(_ context.Context, _ string, _ string, _, _ time.Time) (float64, error) {
-	return f.meterUsage, nil
+func (f *fakeMeteringStripe) MeterUsage(_ context.Context, _ string, kind string, _, _ time.Time) (float64, error) {
+	return f.meterUsageByKind[kind], nil
 }
 func (f *fakeMeteringStripe) PeriodInvoice(_ context.Context, _, _ string, _, _ time.Time) (billing.PeriodInvoice, error) {
 	if f.invoice.ID == "" {
