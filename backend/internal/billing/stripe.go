@@ -45,8 +45,18 @@ type Client struct {
 	sc                     *client.API
 	priceID                string
 	streamHourMonthPriceID string
+	recordingHourMeterID   string
+	streamHourMonthMeterID string
 	appBaseURL             string
 	livemode               bool
+}
+
+type PeriodInvoice struct {
+	ID             string
+	Status         stripe.InvoiceStatus
+	RecordingCents int64
+	StorageCents   int64
+	FinalizesAt    time.Time
 }
 
 // New builds a Stripe client bound to secretKey. priceID is the metered
@@ -149,10 +159,17 @@ func (c *Client) ValidateConfiguration(ctx context.Context, recordingMeterID, st
 	}); err != nil {
 		return err
 	}
-	if err := validateStripePriceAndMeter("recording-hour", recordingPrice, recordingMeter, strings.TrimSpace(recordingMeterID), recordingHourEventName, recordingHourLookupKey, recordingHourUnitAmountCents, c.livemode); err != nil {
+	recordingMeterID = strings.TrimSpace(recordingMeterID)
+	storageMeterID = strings.TrimSpace(storageMeterID)
+	if err := validateStripePriceAndMeter("recording-hour", recordingPrice, recordingMeter, recordingMeterID, recordingHourEventName, recordingHourLookupKey, recordingHourUnitAmountCents, c.livemode); err != nil {
 		return err
 	}
-	return validateStripePriceAndMeter("stream-hour-month", storagePrice, storageMeter, strings.TrimSpace(storageMeterID), streamHourMonthEventName, streamHourMonthLookupKey, streamHourMonthUnitAmountCents, c.livemode)
+	if err := validateStripePriceAndMeter("stream-hour-month", storagePrice, storageMeter, storageMeterID, streamHourMonthEventName, streamHourMonthLookupKey, streamHourMonthUnitAmountCents, c.livemode); err != nil {
+		return err
+	}
+	c.recordingHourMeterID = recordingMeterID
+	c.streamHourMonthMeterID = storageMeterID
+	return nil
 }
 
 func validateStripePriceAndMeter(label string, price *stripe.Price, meter *stripe.BillingMeter, meterID, eventName, lookupKey string, unitAmount int64, livemode bool) error {
@@ -292,9 +309,10 @@ func (c *Client) CreatePortalSession(ctx context.Context, customerID, returnURL 
 // deduplication window (the durable cross-day guard lives in billing_meter_reports).
 // A re-send rejected as a duplicate is handled as a no-op. The customer is mapped via the
 // payload "stripe_customer_id" (the meter's customer_mapping) and the hour count
-// via "value" (the meter's value_settings). Timestamp is omitted, so Stripe
-// stamps "now".
-func (c *Client) ReportRecordingHours(ctx context.Context, customerID string, accountID int64, periodKey string, hours int) error {
+// via "value" (the meter's value_settings). eventAt is explicit so a catch-up
+// report after period close is attributed to the closed period rather than the
+// new current period.
+func (c *Client) ReportRecordingHours(ctx context.Context, customerID string, accountID int64, periodKey string, eventAt time.Time, hours int) error {
 	if strings.TrimSpace(customerID) == "" {
 		return fmt.Errorf("customer id is required")
 	}
@@ -307,6 +325,7 @@ func (c *Client) ReportRecordingHours(ctx context.Context, customerID string, ac
 	ev := &stripe.BillingMeterEventParams{
 		EventName:  strPtr(recordingHourEventName),
 		Identifier: strPtr(fmt.Sprintf("%d-%s", accountID, periodKey)),
+		Timestamp:  stripe.Int64(eventAt.UTC().Unix()),
 		Payload: map[string]string{
 			"stripe_customer_id": customerID,
 			"value":              strconv.Itoa(hours),
@@ -332,7 +351,7 @@ func (c *Client) ReportRecordingHours(ctx context.Context, customerID string, ac
 // guarantees it can never collide with the recording_hour identifier
 // "<accountID>-<periodKey>", so the two meters dedup independently within Stripe's
 // rolling window. The customer is mapped via payload "stripe_customer_id".
-func (c *Client) ReportStreamHourMonth(ctx context.Context, customerID string, accountID int64, periodKey, hoursDecimal string) error {
+func (c *Client) ReportStreamHourMonth(ctx context.Context, customerID string, accountID int64, periodKey string, eventAt time.Time, hoursDecimal string) error {
 	if strings.TrimSpace(customerID) == "" {
 		return fmt.Errorf("customer id is required")
 	}
@@ -345,6 +364,7 @@ func (c *Client) ReportStreamHourMonth(ctx context.Context, customerID string, a
 	ev := &stripe.BillingMeterEventParams{
 		EventName:  strPtr(streamHourMonthEventName),
 		Identifier: strPtr(fmt.Sprintf("%d-shm-%s", accountID, periodKey)),
+		Timestamp:  stripe.Int64(eventAt.UTC().Unix()),
 		Payload: map[string]string{
 			"stripe_customer_id": customerID,
 			"value":              hoursDecimal,
@@ -358,6 +378,94 @@ func (c *Client) ReportStreamHourMonth(ctx context.Context, customerID string, a
 		return fmt.Errorf("report stream-hour-month: %w", err)
 	}
 	return nil
+}
+
+// MeterUsage returns Stripe's aggregate for one customer and exact period. It
+// is the reconciliation read for an ambiguous outbox row: equality proves the
+// event was accepted even if recorder-control lost its local acknowledgement.
+func (c *Client) MeterUsage(ctx context.Context, customerID, meterKind string, start, end time.Time) (float64, error) {
+	meterID := c.recordingHourMeterID
+	if meterKind == "stream_hour_month" {
+		meterID = c.streamHourMonthMeterID
+	} else if meterKind != "recording_hour" {
+		return 0, fmt.Errorf("unsupported meter kind %q", meterKind)
+	}
+	if strings.TrimSpace(customerID) == "" || strings.TrimSpace(meterID) == "" {
+		return 0, fmt.Errorf("customer and validated meter id are required")
+	}
+	start = start.UTC().Truncate(time.Minute)
+	end = end.UTC().Truncate(time.Minute)
+	if !end.After(start) {
+		return 0, fmt.Errorf("invalid meter summary range")
+	}
+	params := &stripe.BillingMeterEventSummaryListParams{
+		ID:        strPtr(meterID),
+		Customer:  strPtr(customerID),
+		StartTime: stripe.Int64(start.Unix()),
+		EndTime:   stripe.Int64(end.Unix()),
+	}
+	params.Context = ctx
+	iter := c.sc.BillingMeterEventSummaries.List(params)
+	var total float64
+	for iter.Next() {
+		if summary := iter.BillingMeterEventSummary(); summary != nil {
+			total += summary.AggregatedValue
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return 0, fmt.Errorf("read %s meter usage: %w", meterKind, err)
+	}
+	return total, nil
+}
+
+// PeriodInvoice finds the unique subscription-cycle invoice for exact frozen
+// period bounds and, once finalized, sums its matching metered-price lines.
+func (c *Client) PeriodInvoice(ctx context.Context, customerID, subscriptionID string, start, end time.Time) (PeriodInvoice, error) {
+	params := &stripe.InvoiceListParams{Customer: strPtr(customerID), Subscription: strPtr(subscriptionID)}
+	params.Context = ctx
+	params.Limit = stripe.Int64(100)
+	iter := c.sc.Invoices.List(params)
+	var matches []*stripe.Invoice
+	for iter.Next() {
+		inv := iter.Invoice()
+		if inv != nil && inv.PeriodStart == start.UTC().Unix() && inv.PeriodEnd == end.UTC().Unix() {
+			matches = append(matches, inv)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return PeriodInvoice{}, fmt.Errorf("list period invoices: %w", err)
+	}
+	if len(matches) != 1 {
+		return PeriodInvoice{}, fmt.Errorf("expected one invoice for subscription %s period, found %d", subscriptionID, len(matches))
+	}
+	inv := matches[0]
+	result := PeriodInvoice{ID: inv.ID, Status: inv.Status}
+	if inv.AutomaticallyFinalizesAt > 0 {
+		result.FinalizesAt = time.Unix(inv.AutomaticallyFinalizesAt, 0).UTC()
+	}
+	if inv.Status == stripe.InvoiceStatusDraft {
+		return result, nil
+	}
+	lineParams := &stripe.InvoiceListLinesParams{Invoice: strPtr(inv.ID)}
+	lineParams.Context = ctx
+	lineParams.Limit = stripe.Int64(100)
+	lines := c.sc.Invoices.ListLines(lineParams)
+	for lines.Next() {
+		line := lines.InvoiceLineItem()
+		if line == nil || line.Period == nil || line.Period.Start != start.UTC().Unix() || line.Period.End != end.UTC().Unix() || line.Parent == nil || line.Parent.Type != stripe.InvoiceLineItemParentTypeSubscriptionItemDetails || line.Parent.SubscriptionItemDetails == nil || line.Parent.SubscriptionItemDetails.Subscription != subscriptionID || line.Pricing == nil || line.Pricing.Type != stripe.InvoiceLineItemPricingTypePriceDetails || line.Pricing.PriceDetails == nil {
+			continue
+		}
+		switch line.Pricing.PriceDetails.Price {
+		case c.priceID:
+			result.RecordingCents += line.Amount
+		case c.streamHourMonthPriceID:
+			result.StorageCents += line.Amount
+		}
+	}
+	if err := lines.Err(); err != nil {
+		return PeriodInvoice{}, fmt.Errorf("list period invoice lines: %w", err)
+	}
+	return result, nil
 }
 
 // isDuplicateMeterEvent reports whether err is Stripe rejecting a meter event
