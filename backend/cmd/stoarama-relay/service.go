@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,8 +21,9 @@ import (
 var templatesFS embed.FS
 
 const (
-	launchdLabel = "com.stoarama.relay"
-	systemdUnit  = "stoarama-relay.service"
+	launchdLabel            = "com.stoarama.relay"
+	systemdUnit             = "stoarama-relay.service"
+	launchdReadinessTimeout = 2*heartbeatInterval + 15*time.Second
 )
 
 // installLaunchd writes the launchd USER agent (so the login user's Keychain is
@@ -61,12 +63,7 @@ func installLaunchd() error {
 	}
 	plistPath := filepath.Join(agentsDir, launchdLabel+".plist")
 	instanceID := newServiceInstanceID()
-	rendered, err := executeTemplate("templates/launchd.plist.tmpl", map[string]string{
-		"Label":      launchdLabel,
-		"ExePath":    filepath.Join(bd, "stoarama-relay"),
-		"LogPath":    logPath,
-		"InstanceID": instanceID,
-	})
+	rendered, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), logPath, instanceID))
 	if err != nil {
 		return err
 	}
@@ -120,7 +117,7 @@ func installLaunchd() error {
 		runLock, err = acquireRelayRunLock()
 	}
 	if err != nil {
-		cause := fmt.Errorf("relay process is running outside the managed service; refusing replacement: %w", err)
+		cause := fmt.Errorf("relay process is still running; wait for active recordings to finish, then rerun install-launchd (or run uninstall only after confirming it is safe to stop recordings): %w", err)
 		if priorDomain != "" {
 			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, cause)
 		}
@@ -181,7 +178,7 @@ func bootstrapLaunchd(domain, plistPath, instanceID string, baselineSuccesses ui
 	if out, err := exec.Command("launchctl", "kickstart", "-k", domain+"/"+launchdLabel).CombinedOutput(); err != nil {
 		return cleanupLaunchdFailure(domain, fmt.Errorf("launchctl kickstart %s: %w (%s)", domain, err, strings.TrimSpace(string(out))))
 	}
-	if !waitLaunchdReady(domain, instanceID, startedAt, baselineSuccesses, 45*time.Second) {
+	if !waitLaunchdReady(domain, instanceID, startedAt, baselineSuccesses, launchdReadinessTimeout) {
 		return cleanupLaunchdFailure(domain, fmt.Errorf("health check %s: candidate did not remain running through a second successful heartbeat", domain))
 	}
 	return nil
@@ -229,7 +226,7 @@ func loadedLaunchdDomains(uid int) []string {
 func ensureNoLoadedRelay(uid int) error {
 	loaded := loadedLaunchdDomains(uid)
 	if len(loaded) > 0 {
-		return fmt.Errorf("relay service is already loaded in %s; refusing replacement (use idle-gated self-update)", strings.Join(loaded, " and "))
+		return fmt.Errorf("relay service remains loaded in %s; wait for active recordings to finish, then retry (or run uninstall only after confirming it is safe to stop recordings)", strings.Join(loaded, " and "))
 	}
 	return nil
 }
@@ -244,7 +241,7 @@ func heartbeatSuccessCount() uint64 {
 
 func ownedRelayPlist(content []byte, executable string) bool {
 	s := string(content)
-	return strings.Contains(s, "<string>"+launchdLabel+"</string>") && strings.Contains(s, "<string>"+executable+"</string>")
+	return strings.Contains(s, "<string>"+launchdLabel+"</string>") && strings.Contains(s, "<string>"+html.EscapeString(executable)+"</string>")
 }
 
 func serviceInstanceIDFromPlist(content []byte) string {
@@ -282,6 +279,11 @@ func acquireServiceOperationLock() (*os.File, error) {
 
 func newServiceInstanceID() string {
 	return rand.Text()
+}
+
+func launchdTemplateData(label, exePath, logPath, instanceID string) map[string]string {
+	escape := html.EscapeString
+	return map[string]string{"Label": escape(label), "ExePath": escape(exePath), "LogPath": escape(logPath), "InstanceID": escape(instanceID)}
 }
 
 func readPriorFile(path string) ([]byte, os.FileMode, bool, error) {
@@ -552,10 +554,8 @@ func scheduleLegacyLaunchdHandoff(domain, plistPath string, prior []byte) error 
 		return fmt.Errorf("loaded relay canonical plist is not installer-owned; refusing migration")
 	}
 	instanceID := newServiceInstanceID()
-	updated, err := executeTemplate("templates/launchd.plist.tmpl", map[string]string{
-		"Label": launchdLabel, "ExePath": exe,
-		"LogPath": filepath.Join(home, ".stoarama", "logs", "relay.log"), "InstanceID": instanceID,
-	})
+	logPath := filepath.Join(home, ".stoarama", "logs", "relay.log")
+	updated, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, exe, logPath, instanceID))
 	if err != nil {
 		return err
 	}
@@ -582,7 +582,8 @@ func scheduleLegacyLaunchdHandoff(domain, plistPath string, prior []byte) error 
 		_ = os.Remove(candidate)
 		return err
 	}
-	helperXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>%s</string><key>ProgramArguments</key><array><string>%s</string><string>launchd-handoff</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string></array><key>ProcessType</key><string>Background</string></dict></plist>`, label, exe, domain, plistPath, candidate, rollback, instanceID, label, helper)
+	escape := html.EscapeString
+	helperXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>%s</string><key>ProgramArguments</key><array><string>%s</string><string>launchd-handoff</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string><string>%s</string></array><key>ProcessType</key><string>Background</string><key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string></dict></plist>`, escape(label), escape(exe), escape(domain), escape(plistPath), escape(candidate), escape(rollback), escape(instanceID), escape(label), escape(helper), escape(logPath), escape(logPath))
 	if err := os.WriteFile(helper, []byte(helperXML), 0o600); err != nil {
 		if cleanupErr := cleanupLaunchdHandoff(domain, label, candidate, rollback, helper); cleanupErr != nil {
 			return fmt.Errorf("write migration helper: %w; cleanup failed: %v", err, cleanupErr)
@@ -603,6 +604,7 @@ func scheduleLegacyLaunchdHandoff(domain, plistPath string, prior []byte) error 
 		}
 		return cause
 	}
+	fmt.Printf("Scheduled legacy relay migration with helper %s; progress is logged to %s\n", label, logPath)
 	return nil
 }
 
@@ -630,6 +632,9 @@ func completeLaunchdHandoff(args []string) error {
 		return fmt.Errorf("invalid launchd handoff")
 	}
 	domain, plistPath, candidate, rollback, instanceID, helperLabel, helperPath := args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+	if err := validateLaunchdHandoffPaths(domain, plistPath, candidate, rollback, helperLabel, helperPath); err != nil {
+		return err
+	}
 	completed := false
 	defer func() {
 		if !completed {
@@ -674,6 +679,26 @@ func completeLaunchdHandoff(args []string) error {
 		return err
 	}
 	completed = true
+	return nil
+}
+
+func validateLaunchdHandoffPaths(domain, plistPath, candidate, rollback, helperLabel, helperPath string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	stageDir := filepath.Join(home, ".stoarama", "service-install")
+	if domain != fmt.Sprintf("gui/%d", os.Getuid()) ||
+		filepath.Clean(plistPath) != filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist") ||
+		helperLabel != launchdLabel+".handoff" || filepath.Clean(helperPath) != filepath.Join(stageDir, "handoff-job") {
+		return fmt.Errorf("invalid launchd handoff target")
+	}
+	for path, prefix := range map[string]string{candidate: "handoff-candidate-", rollback: "handoff-prior-"} {
+		clean := filepath.Clean(path)
+		if filepath.Dir(clean) != stageDir || !strings.HasPrefix(filepath.Base(clean), prefix) {
+			return fmt.Errorf("invalid launchd handoff stage path")
+		}
+	}
 	return nil
 }
 

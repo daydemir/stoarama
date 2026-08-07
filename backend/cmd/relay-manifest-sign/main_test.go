@@ -45,7 +45,7 @@ func TestSignerRoundTripRejectsTamperingAndWrongKey(t *testing.T) {
 }
 
 func TestRelayReleaseScriptsParse(t *testing.T) {
-	for _, script := range []string{"release-relay.sh", "relay-release-provenance.sh", "relay-release-immutable.sh", "relay-release-immutable-test.sh", "promote-relay.sh", "relay-install.sh"} {
+	for _, script := range []string{"release-relay.sh", "relay-release-provenance.sh", "relay-release-immutable.sh", "relay-release-immutable-test.sh", "promote-relay.sh", "relay-install.sh", "relay-install-rollback-test.sh"} {
 		cmd := exec.Command("bash", "-n", filepath.Join("..", "..", "scripts", script))
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", script, err, output)
@@ -53,35 +53,10 @@ func TestRelayReleaseScriptsParse(t *testing.T) {
 	}
 }
 
-func TestRelayInstallerRestoresBinaryAndConfigBeforeRestart(t *testing.T) {
-	script, err := os.ReadFile(filepath.Join("..", "..", "scripts", "relay-install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := string(script)
-	relayRestore := `mv -f "${BIN_DIR}/stoarama-relay.restore" "${BIN_DIR}/stoarama-relay"`
-	configRestore := `mv -f "${INSTALL_DIR}/config.json.restore" "${INSTALL_DIR}/config.json"`
-	restart := `launchctl kickstart -k "${SERVICE_TARGET}"`
-	verify := `now >= before + 2`
-	for _, required := range []string{relayRestore, configRestore, restart, verify, `INSTALL_COMMITTED=1`} {
-		if !strings.Contains(body, required) {
-			t.Fatalf("installer transaction missing %q", required)
-		}
-	}
-	if strings.Index(body, relayRestore) > strings.Index(body, restart) || strings.Index(body, configRestore) > strings.Index(body, restart) {
-		t.Fatal("installer must restore binary and config before restarting prior service")
-	}
-	for _, required := range []string{
-		`cp -p "${SYSTEMD_UNIT_PATH}" "${ROLLBACK_DIR}/stoarama-relay.service"`,
-		`systemctl --user daemon-reload`,
-		`systemctl --user restart stoarama-relay.service`,
-		`retaining verified relay artifacts because launchd activation is live`,
-		`retaining relay artifacts because systemd activation is active or loaded`,
-		`install-launchd && INSTALL_COMMITTED=1`,
-	} {
-		if !strings.Contains(body, required) {
-			t.Fatalf("installer cross-platform rollback missing %q", required)
-		}
+func TestRelayInstallerRollbackRestoresExactBytes(t *testing.T) {
+	cmd := exec.Command("bash", filepath.Join("..", "..", "scripts", "relay-install-rollback-test.sh"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("installer rollback: %v\n%s", err, output)
 	}
 }
 

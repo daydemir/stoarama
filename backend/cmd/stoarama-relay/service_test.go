@@ -114,16 +114,16 @@ func writeTestLaunchdPlist(t *testing.T, instanceID string) (string, []byte) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	b, err := executeTemplate("templates/launchd.plist.tmpl", map[string]string{
-		"Label": launchdLabel, "ExePath": filepath.Join(bd, "stoarama-relay"),
-		"LogPath": filepath.Join(home, ".stoarama", "logs", "relay.log"), "InstanceID": instanceID,
-	})
+	b, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), filepath.Join(home, ".stoarama", "logs", "relay.log"), instanceID))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if instanceID == "" {
 		start := strings.Index(string(b), "  <key>EnvironmentVariables</key>")
 		end := strings.Index(string(b), "  <key>RunAtLoad</key>")
+		if start < 0 || end < 0 || start >= end {
+			t.Fatal("launchd template environment block not found")
+		}
 		b = append(append([]byte{}, b[:start]...), b[end:]...)
 	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {
@@ -249,6 +249,58 @@ func TestCleanupStaleHandoffFilesOnlyRemovesOwnedArtifacts(t *testing.T) {
 	}
 }
 
+func TestLegacyHandoffPlistEscapesSpecialCharacterPaths(t *testing.T) {
+	fakeLaunchctl(t, `if [ "$1" = print ]; then exit 1; fi; exit 0`)
+	root := filepath.Join(t.TempDir(), "home&special")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", root)
+	path, prior := writeTestLaunchdPlist(t, "")
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	if err := scheduleLegacyLaunchdHandoff(domain, path, prior); err != nil {
+		t.Fatal(err)
+	}
+	helper, err := os.ReadFile(filepath.Join(root, ".stoarama", "service-install", "handoff-job"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(helper), "home&special") || !strings.Contains(string(helper), "home&amp;special") {
+		t.Fatalf("helper plist path was not XML escaped: %s", helper)
+	}
+	if strings.Count(string(helper), "<key>StandardOutPath</key>") != 1 || strings.Count(string(helper), "<key>StandardErrorPath</key>") != 1 {
+		t.Fatal("helper diagnostics are not routed to the advertised log")
+	}
+	candidates, err := filepath.Glob(filepath.Join(root, ".stoarama", "service-install", "handoff-candidate-*"))
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidate files=%v err=%v", candidates, err)
+	}
+	candidate, err := os.ReadFile(candidates[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(candidate), "home&special") || !strings.Contains(string(candidate), "home&amp;special") {
+		t.Fatalf("candidate plist path was not XML escaped: %s", candidate)
+	}
+}
+
+func TestValidateLaunchdHandoffRejectsForeignTargets(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	home, _ := os.UserHomeDir()
+	stage := filepath.Join(home, ".stoarama", "service-install")
+	canonical := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	if err := validateLaunchdHandoffPaths(domain, canonical, filepath.Join(stage, "handoff-candidate-x"), filepath.Join(stage, "handoff-prior-x"), launchdLabel+".handoff", filepath.Join(stage, "handoff-job")); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLaunchdHandoffPaths("user/0", canonical, filepath.Join(stage, "handoff-candidate-x"), filepath.Join(stage, "handoff-prior-x"), launchdLabel+".handoff", filepath.Join(stage, "handoff-job")); err == nil {
+		t.Fatal("foreign domain accepted")
+	}
+	if err := validateLaunchdHandoffPaths(domain, "/tmp/relay.plist", filepath.Join(stage, "handoff-candidate-x"), filepath.Join(stage, "handoff-prior-x"), launchdLabel+".handoff", filepath.Join(stage, "handoff-job")); err == nil {
+		t.Fatal("foreign plist accepted")
+	}
+}
+
 func TestRestorePriorFileIsTransactional(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "relay.plist")
@@ -367,9 +419,13 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate := filepath.Join(home, ".stoarama", "candidate")
-	rollback := filepath.Join(home, ".stoarama", "rollback")
-	helper := filepath.Join(home, ".stoarama", "helper")
+	stage := filepath.Join(home, ".stoarama", "service-install")
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(stage, "handoff-candidate-candidate")
+	rollback := filepath.Join(stage, "handoff-prior-candidate")
+	helper := filepath.Join(stage, "handoff-job")
 	if err := os.WriteFile(candidate, candidateBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -379,12 +435,15 @@ exit 0
 	if err := os.WriteFile(helper, []byte("helper"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := completeLaunchdHandoff([]string{"gui/501", path, candidate, rollback, "candidate", "helper-label", helper}); err != nil {
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	if err := completeLaunchdHandoff([]string{domain, path, candidate, rollback, "candidate", launchdLabel + ".handoff", helper}); err != nil {
 		t.Fatal(err)
 	}
 	calls, _ := os.ReadFile(logPath)
 	text := string(calls)
-	if strings.Index(text, "bootout gui/501/com.stoarama.relay") > strings.Index(text, "bootstrap gui/501 "+path) {
+	bootoutAt := strings.Index(text, "bootout "+domain+"/com.stoarama.relay")
+	bootstrapAt := strings.Index(text, "bootstrap "+domain+" "+path)
+	if bootoutAt < 0 || bootstrapAt < 0 || bootoutAt > bootstrapAt {
 		t.Fatalf("candidate was bootstrapped before cached job bootout:\n%s", text)
 	}
 	got, _ := os.ReadFile(path)

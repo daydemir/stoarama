@@ -181,18 +181,30 @@ cleanup_install() {
     fi
   fi
   if [[ "${INSTALL_COMMITTED}" -ne 1 ]]; then
-    if [[ "${HAD_RELAY}" -eq 1 ]]; then cp -p "${ROLLBACK_DIR}/stoarama-relay" "${BIN_DIR}/stoarama-relay.restore" && mv -f "${BIN_DIR}/stoarama-relay.restore" "${BIN_DIR}/stoarama-relay"; else rm -f "${BIN_DIR}/stoarama-relay"; fi
-    if [[ "${HAD_CONFIG}" -eq 1 ]]; then cp -p "${ROLLBACK_DIR}/config.json" "${INSTALL_DIR}/config.json.restore" && mv -f "${INSTALL_DIR}/config.json.restore" "${INSTALL_DIR}/config.json"; else rm -f "${INSTALL_DIR}/config.json"; fi
+	RESTORE_OK=1
+    if [[ "${HAD_RELAY}" -eq 1 ]]; then
+	  if ! cp -p "${ROLLBACK_DIR}/stoarama-relay" "${BIN_DIR}/stoarama-relay.restore" || ! mv -f "${BIN_DIR}/stoarama-relay.restore" "${BIN_DIR}/stoarama-relay"; then echo "error: failed to restore prior relay binary" >&2; RESTORE_OK=0; fi
+	else rm -f "${BIN_DIR}/stoarama-relay" || { echo "error: failed to remove uncommitted relay binary" >&2; RESTORE_OK=0; }; fi
+    if [[ "${HAD_CONFIG}" -eq 1 ]]; then
+	  if ! cp -p "${ROLLBACK_DIR}/config.json" "${INSTALL_DIR}/config.json.restore" || ! mv -f "${INSTALL_DIR}/config.json.restore" "${INSTALL_DIR}/config.json"; then echo "error: failed to restore prior relay config" >&2; RESTORE_OK=0; fi
+	else rm -f "${INSTALL_DIR}/config.json" || { echo "error: failed to remove uncommitted relay config" >&2; RESTORE_OK=0; }; fi
     if [[ "${OS}" == "linux" ]]; then
       if [[ "${HAD_SYSTEMD_UNIT}" -eq 1 ]]; then
-        mkdir -p "$(dirname "${SYSTEMD_UNIT_PATH}")"
-        cp -p "${ROLLBACK_DIR}/stoarama-relay.service" "${SYSTEMD_UNIT_PATH}.restore" && mv -f "${SYSTEMD_UNIT_PATH}.restore" "${SYSTEMD_UNIT_PATH}"
+		if ! mkdir -p "$(dirname "${SYSTEMD_UNIT_PATH}")"; then
+		  echo "error: failed to create systemd unit directory" >&2
+		  RESTORE_OK=0
+		elif ! cp -p "${ROLLBACK_DIR}/stoarama-relay.service" "${SYSTEMD_UNIT_PATH}.restore" || ! mv -f "${SYSTEMD_UNIT_PATH}.restore" "${SYSTEMD_UNIT_PATH}"; then
+		  echo "error: failed to restore prior systemd unit" >&2
+		  RESTORE_OK=0
+		fi
       else
-        rm -f "${SYSTEMD_UNIT_PATH}"
+		rm -f "${SYSTEMD_UNIT_PATH}" || { echo "error: failed to remove uncommitted systemd unit" >&2; RESTORE_OK=0; }
       fi
-      systemctl --user daemon-reload || echo "warning: restored systemd unit could not be reloaded" >&2
-      if [[ "${SERVICE_TARGET}" == "systemd" ]]; then systemctl --user restart stoarama-relay.service || echo "warning: restored systemd relay could not be restarted" >&2; fi
-    elif [[ -n "${SERVICE_TARGET}" ]]; then
+	  if [[ "${RESTORE_OK}" -eq 1 ]]; then
+		systemctl --user daemon-reload || { echo "error: restored systemd unit could not be reloaded" >&2; RESTORE_OK=0; }
+		if [[ "${RESTORE_OK}" -eq 1 && "${SERVICE_TARGET}" == "systemd" ]]; then systemctl --user restart stoarama-relay.service || { echo "error: restored systemd relay could not be restarted" >&2; RESTORE_OK=0; }; fi
+	  fi
+	elif [[ -n "${SERVICE_TARGET}" && "${RESTORE_OK}" -eq 1 ]]; then
       before="$(grep -oE '"heartbeat_success_count":[0-9]+' "${INSTALL_DIR}/relay-recovery.json" 2>/dev/null | tail -n1 | cut -d: -f2 || true)"
       before="${before:-0}"
       if launchctl kickstart -k "${SERVICE_TARGET}" >/dev/null 2>&1; then
@@ -203,14 +215,29 @@ cleanup_install() {
           if (( now >= before + 2 )) && launchctl print "${SERVICE_TARGET}" 2>/dev/null | grep -q 'state = running'; then restored=1; break; fi
           sleep 1
         done
-        [[ "${restored}" -eq 1 ]] || echo "warning: restored relay did not verify two heartbeats" >&2
+        [[ "${restored}" -eq 1 ]] || { echo "error: restored relay did not verify two heartbeats" >&2; RESTORE_OK=0; }
       else
-        echo "warning: restored relay could not be restarted" >&2
-      fi
-    fi
+        echo "error: restored relay could not be restarted" >&2
+		RESTORE_OK=0
+	  fi
+	fi
+	if [[ "${RESTORE_OK}" -ne 1 ]]; then
+	  status=1
+	  if [[ "${OS}" == "darwin" && -n "${SERVICE_TARGET}" ]]; then
+		launchctl bootout "${SERVICE_TARGET}" >/dev/null 2>&1 || echo "error: failed to stop relay after incomplete rollback" >&2
+		launchctl print "${SERVICE_TARGET}" >/dev/null 2>&1 && echo "error: relay remains loaded after incomplete rollback" >&2
+	  elif [[ "${OS}" == "linux" && "${SERVICE_TARGET}" == "systemd" ]]; then
+		systemctl --user stop stoarama-relay.service >/dev/null 2>&1 || echo "error: failed to stop relay after incomplete rollback" >&2
+		systemctl --user is-active --quiet stoarama-relay.service && echo "error: relay remains active after incomplete rollback" >&2
+	  fi
+	fi
   fi
   rm -f "${LATEST_JSON}" "${RELAY_ARCHIVE}" "${FFMPEG_ARCHIVE}"
-  rm -rf "${ROLLBACK_DIR}"
+  if [[ "${INSTALL_COMMITTED}" -eq 1 || "${RESTORE_OK:-1}" -eq 1 ]]; then
+	rm -rf "${ROLLBACK_DIR}"
+  else
+	echo "error: incomplete rollback artifacts retained at ${ROLLBACK_DIR}" >&2
+  fi
   exit "${status}"
 }
 trap cleanup_install EXIT
