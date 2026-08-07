@@ -119,6 +119,178 @@ func TestUpdateExecutableIfChangedReplacesMismatchedFile(t *testing.T) {
 	}
 }
 
+func TestRunSelfUpdateActivationSafety(t *testing.T) {
+	t.Run("legacy manifest without Deno", func(t *testing.T) {
+		current := setupSelfUpdateHome(t, "legacy1")
+		newRelay := relayScript("legacy2")
+		ytdlp := []byte("#!/bin/sh\nprintf '%s\\n' 'legacy yt-dlp'\n")
+		manifest := latestJSON{
+			Version: "legacy2",
+			Relay:   map[string]latestArtifact{testRelayTarget(): testArtifact("relay.tar.gz", testRelayTarball(t, newRelay))},
+			Ytdlp:   map[string]latestArtifact{testRelayTarget(): testArtifact("yt-dlp", ytdlp)},
+		}
+		server := serveTestRelayRelease(t, manifest, map[string][]byte{
+			"relay.tar.gz": testRelayTarball(t, newRelay),
+			"yt-dlp":       ytdlp,
+		})
+		restarts := captureSelfUpdateRestarts(t)
+
+		if err := runSelfUpdate([]string{"--api-url", server.URL}); err != nil {
+			t.Fatal(err)
+		}
+		if *restarts != 1 {
+			t.Fatalf("restarts=%d want 1", *restarts)
+		}
+		if got, err := os.ReadFile(current); err != nil || !bytes.Equal(got, newRelay) {
+			t.Fatalf("relay updated=%t err=%v", bytes.Equal(got, newRelay), err)
+		}
+		if _, err := os.Stat(filepath.Join(filepath.Dir(current), "deno")); !os.IsNotExist(err) {
+			t.Fatalf("legacy manifest installed Deno: %v", err)
+		}
+	})
+
+	t.Run("Deno without pinned yt-dlp is rejected", func(t *testing.T) {
+		current := setupSelfUpdateHome(t, "badpair1")
+		original, err := os.ReadFile(current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newRelay := relayScript("badpair2")
+		deno := []byte("#!/bin/sh\nprintf '%s\\n' 'deno 2.8.1'\n")
+		relayTar := testRelayTarball(t, newRelay)
+		manifest := latestJSON{
+			Version: "badpair2",
+			Relay:   map[string]latestArtifact{testRelayTarget(): testArtifact("relay.tar.gz", relayTar)},
+			Deno:    map[string]latestArtifact{testRelayTarget(): testArtifact("deno", deno)},
+		}
+		server := serveTestRelayRelease(t, manifest, map[string][]byte{"relay.tar.gz": relayTar, "deno": deno})
+		captureSelfUpdateRestarts(t)
+
+		if err := runSelfUpdate([]string{"--api-url", server.URL}); err == nil || !strings.Contains(err.Error(), "without a pinned yt-dlp") {
+			t.Fatalf("error=%v", err)
+		}
+		if got, err := os.ReadFile(current); err != nil || !bytes.Equal(got, original) {
+			t.Fatalf("relay changed before dependency validation: err=%v", err)
+		}
+	})
+
+	t.Run("dependency failure holds relay activation", func(t *testing.T) {
+		current := setupSelfUpdateHome(t, "depfail1")
+		original, err := os.ReadFile(current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newRelay := relayScript("depfail2")
+		relayTar := testRelayTarball(t, newRelay)
+		manifest := latestJSON{
+			Version: "depfail2",
+			Relay:   map[string]latestArtifact{testRelayTarget(): testArtifact("relay.tar.gz", relayTar)},
+			Ytdlp:   map[string]latestArtifact{testRelayTarget(): testArtifact("missing-yt-dlp", []byte("expected"))},
+		}
+		server := serveTestRelayRelease(t, manifest, map[string][]byte{"relay.tar.gz": relayTar})
+		captureSelfUpdateRestarts(t)
+
+		if err := runSelfUpdate([]string{"--api-url", server.URL}); err == nil || !strings.Contains(err.Error(), "refresh yt-dlp") {
+			t.Fatalf("error=%v", err)
+		}
+		if got, err := os.ReadFile(current); err != nil || !bytes.Equal(got, original) {
+			t.Fatalf("relay changed after dependency failure: err=%v", err)
+		}
+	})
+}
+
+func TestCheckAndApplyUpdateRestartsForReadyDenoActivation(t *testing.T) {
+	setupSelfUpdateHome(t, "runtime1")
+	ytdlp := []byte("#!/bin/sh\nprintf '%s\\n' '--js-runtimes RUNTIME[:PATH]'\n")
+	deno := []byte("#!/bin/sh\nprintf '%s\\n' 'deno 2.8.1'\n")
+	manifest := latestJSON{
+		Version: "runtime1",
+		Ytdlp:   map[string]latestArtifact{testRelayTarget(): testArtifact("yt-dlp", ytdlp)},
+		Deno:    map[string]latestArtifact{testRelayTarget(): testArtifact("deno", deno)},
+	}
+	server := serveTestRelayRelease(t, manifest, map[string][]byte{"yt-dlp": ytdlp, "deno": deno})
+	restarts := captureSelfUpdateRestarts(t)
+	t.Setenv("YT_DLP_JS_RUNTIME", "")
+
+	checkAndApplyUpdate(server.URL, liveReleaseManifest, &atomic.Int64{}, &sync.RWMutex{})
+	if *restarts != 1 {
+		t.Fatalf("restarts=%d want 1", *restarts)
+	}
+}
+
+func setupSelfUpdateHome(t *testing.T, runningVersion string) string {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	dir, err := binDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	current := filepath.Join(dir, "stoarama-relay")
+	if err := os.WriteFile(current, relayScript(runningVersion), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(relayConfig{NodeID: 1, NodeToken: "test", APIURL: "https://stoarama.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	oldVersion := version
+	version = runningVersion
+	t.Cleanup(func() { version = oldVersion })
+	return current
+}
+
+func captureSelfUpdateRestarts(t *testing.T) *int {
+	t.Helper()
+	restarts := new(int)
+	oldRestart := restartRelayAfterSelfUpdate
+	restartRelayAfterSelfUpdate = func() error {
+		*restarts++
+		return nil
+	}
+	t.Cleanup(func() { restartRelayAfterSelfUpdate = oldRestart })
+	return restarts
+}
+
+func serveTestRelayRelease(t *testing.T, manifest latestJSON, artifacts map[string][]byte) *httptest.Server {
+	t.Helper()
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature := setTestReleaseSigningKey(t, manifestBytes)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/relay/download/")
+		switch name {
+		case "latest.json":
+			_, _ = w.Write(manifestBytes)
+		case "latest.json.sig":
+			_, _ = w.Write([]byte(signature))
+		default:
+			if artifact, ok := artifacts[name]; ok {
+				_, _ = w.Write(artifact)
+				return
+			}
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func testRelayTarget() string {
+	return runtime.GOOS + "-" + runtime.GOARCH
+}
+
+func testArtifact(name string, data []byte) latestArtifact {
+	return latestArtifact{Artifact: name, SHA256: testSHA256(data)}
+}
+
+func relayScript(releaseVersion string) []byte {
+	return []byte("#!/bin/sh\nprintf 'stoarama-relay %s\\n' '" + releaseVersion + "'\n")
+}
+
 func TestReplaceRelayBinaryPreservesPrevious(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "stoarama-relay")
 	if err := os.WriteFile(target, []byte("old"), 0o755); err != nil {
