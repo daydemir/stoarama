@@ -38,6 +38,11 @@ const (
 	streamHourMonthLookupKey             = "stream_hour_month_v1"
 )
 
+const (
+	RecordingHourUnitAmountCents   = recordingHourUnitAmountCents
+	StreamHourMonthUnitAmountCents = streamHourMonthUnitAmountCents
+)
+
 // Client wraps a per-instance Stripe API client (no global stripe.Key mutation)
 // plus the metered recording-hour price id, the metered stream-hour-month (managed
 // storage) price id, and the app base URL for redirects.
@@ -428,7 +433,10 @@ func (c *Client) PeriodInvoice(ctx context.Context, customerID, subscriptionID s
 	var matches []*stripe.Invoice
 	for iter.Next() {
 		inv := iter.Invoice()
-		if inv != nil && inv.PeriodStart == start.UTC().Unix() && inv.PeriodEnd == end.UTC().Unix() {
+		if inv == nil || inv.Deleted || inv.Status == stripe.InvoiceStatusVoid {
+			continue
+		}
+		if inv.PeriodStart == start.UTC().Unix() && inv.PeriodEnd == end.UTC().Unix() {
 			matches = append(matches, inv)
 		}
 	}

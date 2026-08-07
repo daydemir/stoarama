@@ -15,9 +15,8 @@ import (
 	"github.com/stripe/stripe-go/v82"
 )
 
-// meteringTickInterval is the metering loop's wakeup cadence. The job acts at most
-// once per UTC day (see runRecordingMetering); the hourly tick just bounds how
-// soon after a period close the meter event is pushed.
+// Period close checks run every five minutes. Stripe period discovery runs hourly;
+// storage snapshots and yearly prepay run once per UTC day.
 const meteringTickInterval = 5 * time.Minute
 
 // nasStagingGrace is the free window a nas_pull clip may sit in managed staging
@@ -27,6 +26,7 @@ const meteringTickInterval = 5 * time.Minute
 const nasStagingGrace = 24 * time.Hour
 
 var errAmbiguousMeterReport = errors.New("ambiguous pending meter report")
+var errMeteringPending = errors.New("billing verification pending")
 
 // meteringStripe is the thin seam over the Stripe client that the metering job
 // needs: read a subscription's current period bounds and push one meter event. The
@@ -46,8 +46,7 @@ type meteringStripe interface {
 	ChargePrepaidBatch(ctx context.Context, customerID, batchKey string, cents int64, metadata map[string]string) (billing.PrepaidBatch, error)
 }
 
-// meterableAccount is one account the metering job may bill: it has a Stripe
-// customer + subscription and the cursor that makes re-runs idempotent.
+// meterableAccount is one account with a Stripe customer and subscription.
 type meterableAccount struct {
 	accountID      int64
 	customerID     string
@@ -63,11 +62,16 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 	ticker := time.NewTicker(meteringTickInterval)
 	defer ticker.Stop()
 
-	var lastHousekeepingDay string
+	var lastSnapshotDay, lastPrepayDay string
+	var lastDiscovery time.Time
 	runOnce := func() {
 		now := time.Now().UTC()
-		if err := discoverBillingPeriods(ctx, pool, reporter); err != nil && ctx.Err() == nil {
-			log.Printf("billing period discovery error: %v", err)
+		if lastDiscovery.IsZero() || now.Sub(lastDiscovery) >= time.Hour {
+			if err := discoverBillingPeriods(ctx, pool, reporter); err != nil && ctx.Err() == nil {
+				log.Printf("billing period discovery error: %v", err)
+			} else {
+				lastDiscovery = now
+			}
 		}
 		if err := meterDuePeriods(ctx, pool, reporter, now); err != nil {
 			if ctx.Err() != nil {
@@ -76,16 +80,16 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 			log.Printf("recording metering sweep error: %v", err)
 		}
 		today := now.Format("2006-01-02")
-		if today == lastHousekeepingDay {
-			return
-		}
 		// Daily storage/prepay work is deliberately independent: failure here can
 		// never suppress a closed-period report.
-		if err := snapshotManagedStorage(ctx, pool); err != nil {
-			if ctx.Err() == nil {
-				log.Printf("managed storage snapshot error: %v", err)
+		if today != lastSnapshotDay {
+			if err := snapshotManagedStorage(ctx, pool); err != nil {
+				if ctx.Err() == nil {
+					log.Printf("managed storage snapshot error: %v", err)
+				}
+			} else {
+				lastSnapshotDay = today
 			}
-			return
 		}
 		// Yearly-prepaid: after the snapshot + metered pass, charge each account with
 		// yearly_prepaid recordings once per calendar month for that month's new
@@ -93,14 +97,16 @@ func runRecordingMetering(ctx context.Context, pool *pgxpool.Pool, reporter mete
 		// is reported UNCHANGED; the credit grant (made on invoice.paid) nets the
 		// monthly line to $0 while it lasts. Log-and-continue: a prepay failure never
 		// stalls the metered path (which already advanced its cursor).
-		if err := prepayYearlyBatches(ctx, pool, reporter, time.Now().UTC()); err != nil {
-			if ctx.Err() != nil {
-				return
+		if today != lastPrepayDay {
+			if err := prepayYearlyBatches(ctx, pool, reporter, time.Now().UTC()); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("yearly prepay sweep error: %v", err)
+			} else {
+				lastPrepayDay = today
 			}
-			log.Printf("yearly prepay sweep error: %v", err)
-			// Do not return: metering already succeeded; retry prepay next tick/day.
 		}
-		lastHousekeepingDay = today
 	}
 
 	runOnce()
@@ -122,14 +128,17 @@ func discoverBillingPeriods(ctx context.Context, pool *pgxpool.Pool, reporter me
 	if err != nil {
 		return err
 	}
+	hadError := false
 	for _, a := range accts {
 		start, end, err := reporter.GetSubscriptionPeriod(ctx, a.subscriptionID)
 		if err != nil {
 			log.Printf("billing period discovery: account %d: %v", a.accountID, err)
+			hadError = true
 			continue
 		}
 		if start.IsZero() || !end.After(start) {
 			log.Printf("billing period discovery: account %d invalid bounds", a.accountID)
+			hadError = true
 			continue
 		}
 		result, err := pool.Exec(ctx, `
@@ -142,11 +151,16 @@ func discoverBillingPeriods(ctx context.Context, pool *pgxpool.Pool, reporter me
 		`, a.accountID, a.customerID, a.subscriptionID, start.UTC(), end.UTC())
 		if err != nil {
 			log.Printf("billing period discovery: account %d: %v", a.accountID, err)
+			hadError = true
 			continue
 		}
 		if result.RowsAffected() != 1 {
 			log.Printf("billing period discovery: account %d conflicting bounds for %s", a.accountID, end.UTC())
+			hadError = true
 		}
+	}
+	if hadError {
+		return fmt.Errorf("one or more billing periods were not persisted")
 	}
 	return nil
 }
@@ -199,7 +213,9 @@ func meterDuePeriods(ctx context.Context, pool *pgxpool.Pool, reporter meteringS
 			continue
 		}
 		if err := meterClosedPeriod(ctx, pool, reporter, d.a, d.start, d.end); err != nil {
-			log.Printf("recording metering: account %d period %s skipped: %v", d.a.accountID, d.end.UTC(), err)
+			if !errors.Is(err, errMeteringPending) {
+				log.Printf("recording metering: account %d period %s skipped: %v", d.a.accountID, d.end.UTC(), err)
+			}
 		}
 	}
 	return nil
@@ -238,8 +254,8 @@ func meterClosedPeriod(ctx context.Context, pool *pgxpool.Pool, reporter meterin
 		SELECT EXISTS(
 		  SELECT 1 FROM recording_clips c
 		  JOIN recordings r ON r.id=c.recording_id
-		  JOIN clip_storage_billing_contracts bc ON bc.clip_id=c.id
-		  WHERE r.account_id=$1 AND NOT bc.authoritative
+		  LEFT JOIN clip_storage_billing_contracts bc ON bc.clip_id=c.id
+		  WHERE r.account_id=$1 AND (bc.clip_id IS NULL OR NOT bc.authoritative)
 		    AND c.created_at < $3
 		    AND (c.released_at IS NULL OR c.released_at >= $2)
 		    AND (c.purged_at IS NULL OR c.purged_at >= $2)
@@ -254,7 +270,7 @@ func meterClosedPeriod(ctx context.Context, pool *pgxpool.Pool, reporter meterin
 	}
 	var sumHours float64
 	var snapDays int
-	if err := pool.QueryRow(ctx, `SELECT COALESCE(SUM(stream_hours_stored),0),COUNT(*) FROM billing_storage_daily_facts WHERE account_id=$1 AND usage_date >= $2::date AND usage_date < $3::date`, a.accountID, start, end).Scan(&sumHours, &snapDays); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(SUM(stream_hours_stored),0),COUNT(*) FROM billing_storage_daily_facts WHERE account_id=$1 AND usage_date >= ($2 AT TIME ZONE 'UTC')::date AND usage_date < ($3 AT TIME ZONE 'UTC')::date`, a.accountID, start, end).Scan(&sumHours, &snapDays); err != nil {
 		return fmt.Errorf("read storage daily facts: %w", err)
 	}
 	storageDecimal, hasStorage := streamHourMonthMeterValue(sumHours, snapDays)
@@ -326,9 +342,9 @@ func meterClosedPeriod(ctx context.Context, pool *pgxpool.Pool, reporter meterin
 		}
 	}
 	if awaitingVerification {
-		return fmt.Errorf("meter events submitted; awaiting Stripe aggregate and invoice verification")
+		return fmt.Errorf("%w: meter events submitted; awaiting Stripe aggregate and invoice verification", errMeteringPending)
 	}
-	return fmt.Errorf("meter aggregates verified; awaiting invoice finalization")
+	return fmt.Errorf("%w: meter aggregates verified; awaiting invoice finalization", errMeteringPending)
 }
 
 func reconcilePendingMeterReport(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, a meterableAccount, periodStart, periodEnd time.Time, meterKind string, expected float64) error {
@@ -376,22 +392,27 @@ func verifyFinalizedPeriod(ctx context.Context, pool *pgxpool.Pool, reporter met
 			return err
 		}
 	}
-	wantRecording := int64(hours * 5)
-	wantStorage := int64(math.Round(storageExpected * 10))
+	wantRecording := int64(hours) * billing.RecordingHourUnitAmountCents
+	wantStorage := int64(math.Round(storageExpected * float64(billing.StreamHourMonthUnitAmountCents)))
 	if inv.RecordingCents != wantRecording || inv.StorageCents != wantStorage {
 		return fmt.Errorf("finalized invoice %s usage mismatch: recording %d/%d cents storage %d/%d cents; manual adjustment required", inv.ID, inv.RecordingCents, wantRecording, inv.StorageCents, wantStorage)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE account_billing SET last_metered_period_end=$2::date,updated_at=now() WHERE account_id=$1`, a.accountID, end); err != nil {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
 		return err
 	}
-	result, err := pool.Exec(ctx, `UPDATE billing_meter_periods SET metered_at=now(),invoice_verified_at=now(),recording_amount_cents=$3,storage_amount_cents=$4 WHERE account_id=$1 AND period_end=$2 AND metered_at IS NULL`, a.accountID, end, wantRecording, wantStorage)
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE account_billing SET last_metered_period_end=GREATEST(COALESCE(last_metered_period_end,($2 AT TIME ZONE 'UTC')::date),($2 AT TIME ZONE 'UTC')::date),updated_at=now() WHERE account_id=$1`, a.accountID, end); err != nil {
+		return err
+	}
+	result, err := tx.Exec(ctx, `UPDATE billing_meter_periods SET metered_at=now(),invoice_verified_at=now(),recording_amount_cents=$3,storage_amount_cents=$4 WHERE account_id=$1 AND period_end=$2 AND metered_at IS NULL`, a.accountID, end, wantRecording, wantStorage)
 	if err != nil {
 		return err
 	}
 	if result.RowsAffected() != 1 {
 		return fmt.Errorf("billing period already completed concurrently")
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func requireVerifiedMeterReport(ctx context.Context, pool *pgxpool.Pool, reporter meteringStripe, a meterableAccount, start, end time.Time, kind string, expected float64) error {
@@ -460,23 +481,27 @@ func markMeterReportReported(ctx context.Context, pool *pgxpool.Pool, accountID 
 
 func reconstructStorageDailyFacts(ctx context.Context, pool *pgxpool.Pool, accountID int64, start, end time.Time) error {
 	_, err := pool.Exec(ctx, `
+		WITH days AS (
+		  SELECT (($2::timestamptz AT TIME ZONE 'UTC')::date + n)::date AS day_date
+		  FROM generate_series(0, (($3::timestamptz AT TIME ZONE 'UTC')::date - ($2::timestamptz AT TIME ZONE 'UTC')::date) - 1) n
+		)
 		INSERT INTO billing_storage_daily_facts(account_id,usage_date,stream_hours_stored)
-		SELECT $1, day::date,
+		SELECT $1, day_date,
 		       COALESCE((
 		         SELECT SUM(GREATEST(EXTRACT(EPOCH FROM (c.clip_end_at-c.clip_start_at)),0)/3600.0)
 		         FROM recording_clips c
 		         JOIN recordings r ON r.id=c.recording_id
 		         JOIN clip_storage_billing_contracts bc ON bc.clip_id=c.id
 		         WHERE r.account_id=$1 AND bc.mode <> 'excluded'
-		           AND c.created_at < day + interval '1 day'
-		           AND (c.released_at IS NULL OR c.released_at >= day + interval '1 day')
-		           AND (c.purged_at IS NULL OR c.purged_at >= day + interval '1 day')
-		           AND (bc.mode <> 'nas_pull_monthly' OR c.created_at < day + interval '1 day' - interval '24 hours')
+		           AND c.created_at < ((day_date + 1)::timestamp AT TIME ZONE 'UTC')
+		           AND (c.released_at IS NULL OR c.released_at >= ((day_date + 1)::timestamp AT TIME ZONE 'UTC'))
+		           AND (c.purged_at IS NULL OR c.purged_at >= ((day_date + 1)::timestamp AT TIME ZONE 'UTC'))
+		           AND (bc.mode <> 'nas_pull_monthly' OR c.created_at < ((day_date + 1)::timestamp AT TIME ZONE 'UTC') - $4::interval)
 		       ),0)
-		FROM generate_series($2::date, $3::date - 1, interval '1 day') AS day
-		WHERE NOT EXISTS (SELECT 1 FROM billing_storage_daily_facts f WHERE f.account_id=$1 AND f.usage_date=day::date)
+		FROM days
+		WHERE NOT EXISTS (SELECT 1 FROM billing_storage_daily_facts f WHERE f.account_id=$1 AND f.usage_date=day_date)
 		ON CONFLICT(account_id,usage_date) DO NOTHING
-	`, accountID, start.UTC(), end.UTC())
+	`, accountID, start.UTC(), end.UTC(), nasStagingGrace)
 	if err != nil {
 		return fmt.Errorf("reconstruct storage daily facts: %w", err)
 	}

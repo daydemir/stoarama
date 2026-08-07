@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -62,7 +63,7 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recordings VALUES(9,47,'monthly','managed');
 		INSERT INTO storage_destinations VALUES(9,true);
-		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(9,9,9,'2026-07-01','2026-07-01','2026-07-01 00:01',1);
+		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(9,9,9,'2026-07-01 00:00+00','2026-07-01 00:00+00','2026-07-01 00:01+00',1);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -94,9 +95,9 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recordings VALUES(1,47,'monthly','nas_pull');
 		INSERT INTO storage_destinations VALUES(1,true);
-		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(1,1,1,'2026-09-02','2026-09-02','2026-09-02 00:01',1);
+		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(1,1,1,'2026-09-02 00:00+00','2026-09-02 00:00+00','2026-09-03 00:00+00',1);
 		UPDATE recordings SET storage_retention_tier='yearly_prepaid',delivery='managed' WHERE id=1;
-		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(2,1,1,'2026-09-02','2026-09-02','2026-09-02 00:01',1);
+		INSERT INTO recording_clips(id,recording_id,storage_destination_id,created_at,clip_start_at,clip_end_at,size_bytes) VALUES(2,1,1,'2026-09-02 00:00+00','2026-09-02 00:00+00','2026-09-03 00:00+00',1);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -158,6 +159,18 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET released_at='2026-08-01' WHERE id=9`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `DELETE FROM clip_storage_billing_contracts WHERE clip_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := meterClosedPeriod(ctx, pool, f, a, start, end); err == nil || !strings.Contains(err.Error(), "legacy inventory") {
+		t.Fatalf("missing contract guard err=%v", err)
+	}
+	if len(f.reports) != 0 {
+		t.Fatalf("missing contract guard emitted reports: %+v", f.reports)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO clip_storage_billing_contracts(clip_id,mode,authoritative) VALUES(1,'nas_pull_monthly',true)`); err != nil {
+		t.Fatal(err)
+	}
 	f.invoice.FinalizesAt = time.Now().Add(10 * time.Minute)
 	if err := meterClosedPeriod(ctx, pool, f, a, start, end); err == nil || !strings.Contains(err.Error(), "30 minutes") {
 		t.Fatalf("short grace guard err=%v", err)
@@ -186,7 +199,15 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 	if len(f.reports) != 1 {
 		t.Fatalf("aggregate retry resent event: %+v", f.reports)
 	}
-	f.invoice = billing.PeriodInvoice{ID: "in_period", Status: "paid", RecordingCents: 25}
+	if !f.invoiceStart.Equal(start) || !f.invoiceEnd.Equal(end) || !f.meterStarts["recording_hour"].Equal(start) || !f.meterEnds["stream_hour_month"].Equal(end) {
+		t.Fatalf("Stripe period bounds not preserved")
+	}
+	wantStorageCents := int64(math.Round(storageUsage * float64(billing.StreamHourMonthUnitAmountCents)))
+	f.invoice = billing.PeriodInvoice{ID: "in_period", Status: "paid", RecordingCents: 25, StorageCents: wantStorageCents + 1}
+	if err := meterClosedPeriod(ctx, pool, f, a, start, end); err == nil || !strings.Contains(err.Error(), "usage mismatch") {
+		t.Fatalf("storage mismatch err=%v", err)
+	}
+	f.invoice.StorageCents = wantStorageCents
 	if err := meterClosedPeriod(ctx, pool, f, a, start, end); err != nil {
 		t.Fatalf("invoice verification: %v", err)
 	}
@@ -241,12 +262,14 @@ func TestShouldReportHours(t *testing.T) {
 // each report branch's arguments (customer, account, period key, value) can be
 // asserted without Stripe.
 type fakeMeteringStripe struct {
-	periodStart      time.Time
-	periodEnd        time.Time
-	reports          []reportCall
-	shmReports       []shmReportCall
-	meterUsageByKind map[string]float64
-	invoice          billing.PeriodInvoice
+	periodStart              time.Time
+	periodEnd                time.Time
+	reports                  []reportCall
+	shmReports               []shmReportCall
+	meterUsageByKind         map[string]float64
+	invoice                  billing.PeriodInvoice
+	invoiceStart, invoiceEnd time.Time
+	meterStarts, meterEnds   map[string]time.Time
 }
 
 type reportCall struct {
@@ -277,10 +300,16 @@ func (f *fakeMeteringStripe) ReportStreamHourMonth(_ context.Context, customerID
 	return nil
 }
 
-func (f *fakeMeteringStripe) MeterUsage(_ context.Context, _ string, kind string, _, _ time.Time) (float64, error) {
+func (f *fakeMeteringStripe) MeterUsage(_ context.Context, _ string, kind string, start, end time.Time) (float64, error) {
+	if f.meterStarts == nil {
+		f.meterStarts = map[string]time.Time{}
+		f.meterEnds = map[string]time.Time{}
+	}
+	f.meterStarts[kind], f.meterEnds[kind] = start, end
 	return f.meterUsageByKind[kind], nil
 }
-func (f *fakeMeteringStripe) PeriodInvoice(_ context.Context, _, _ string, _, _ time.Time) (billing.PeriodInvoice, error) {
+func (f *fakeMeteringStripe) PeriodInvoice(_ context.Context, _, _ string, start, end time.Time) (billing.PeriodInvoice, error) {
+	f.invoiceStart, f.invoiceEnd = start, end
 	if f.invoice.ID == "" {
 		return billing.PeriodInvoice{ID: "in_test", Status: "draft"}, nil
 	}
@@ -394,7 +423,7 @@ func TestStreamHourMonthReportBranch(t *testing.T) {
 	// Fresh account, 31 snapshots => one report with the averaged decimal string.
 	got := report(meterableAccount{accountID: 42, customerID: "cus_x"}, 76.601, 31)
 	if len(got) != 1 || got[0] != (shmReportCall{"cus_x", 42, "20260801T000000Z", "2.471"}) {
-		t.Fatalf("fresh stream-hour-month report = %+v, want one {cus_x,42,2026-08-01,2.471}", got)
+		t.Fatalf("fresh stream-hour-month report = %+v, want one {cus_x,42,20260801T000000Z,2.471}", got)
 	}
 
 	// No managed footage (BYO / fully purged): no report.
