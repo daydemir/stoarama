@@ -133,13 +133,18 @@ func TestMeterReportLedgerFailsClosedOnAmbiguousRetry(t *testing.T) {
 
 	start := time.Date(2026, 9, 1, 12, 9, 0, 0, time.UTC)
 	end := time.Date(2026, 10, 1, 12, 9, 0, 0, time.UTC)
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO account_billing(account_id,stripe_customer_id,stripe_subscription_id) VALUES(47,'cus_47','sub_47');
-		UPDATE billing_storage_fact_config SET eligible_from='2026-09-01';
-		INSERT INTO billing_meter_periods(account_id,stripe_customer_id,stripe_subscription_id,period_start,period_end) VALUES(47,'cus_47','sub_47',$1,$2);
-		INSERT INTO recording_billing_hours(account_id,rec_hour) SELECT 47,$1 + (n||' hours')::interval FROM generate_series(1,5) n;
-	`, start, end); err != nil {
-		t.Fatal(err)
+	for _, setup := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO account_billing(account_id,stripe_customer_id,stripe_subscription_id) VALUES(47,'cus_47','sub_47')`, nil},
+		{`UPDATE billing_storage_fact_config SET eligible_from='2026-09-01'`, nil},
+		{`INSERT INTO billing_meter_periods(account_id,stripe_customer_id,stripe_subscription_id,period_start,period_end) VALUES(47,'cus_47','sub_47',$1,$2)`, []any{start, end}},
+		{`INSERT INTO recording_billing_hours(account_id,rec_hour) SELECT 47,$1 + (n||' hours')::interval FROM generate_series(1,5) n`, []any{start}},
+	} {
+		if _, err := pool.Exec(ctx, setup.sql, setup.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	f := &fakeMeteringStripe{invoice: billing.PeriodInvoice{ID: "in_period", Status: "draft", FinalizesAt: time.Now().Add(2 * time.Hour)}}
 	a := meterableAccount{accountID: 47, customerID: "cus_47", subscriptionID: "sub_47"}
