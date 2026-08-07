@@ -405,6 +405,7 @@ func nasInventoryTreeSQL(prefix string, directFilesOnly bool) string {
 		       CASE WHEN reconciliation='mismatch' THEN 1 ELSE 0 END::bigint AS mismatch_files,
 		       CASE WHEN reconciliation='nas_only' THEN 1 ELSE 0 END::bigint AS nas_only_files
 		FROM scoped
+		WHERE $4::int=1
 		ORDER BY remainder LIMIT $6`
 	}
 	return cte + `
@@ -519,8 +520,13 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		if err := s.pool.QueryRow(r.Context(), `
 			SELECT count(*) FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
 			WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL
-			  AND NOT EXISTS (SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=$2 AND i.clip_id=c.id AND i.state='present')
-		`, principal.AccountID, connectionID).Scan(&serverOnly); err != nil {
+			  AND NOT EXISTS (
+			    SELECT 1 FROM nas_inventory_files i
+			    WHERE i.connection_id=$2 AND i.clip_id=c.id AND i.state='present'
+			      AND i.relative_path=c.display_path AND i.size_bytes=c.size_bytes
+			      AND i.sha256=lower(c.sha256) AND i.verified_at>=now()-$3::interval
+			  )
+		`, principal.AccountID, connectionID, nasInventoryFreshness.String()).Scan(&serverOnly); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count server-only clips: %v", err))
 			return
 		}

@@ -171,29 +171,41 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if len(firstEntries) != 2 || firstEntries[0].(map[string]any)["name"] != "Africa" || firstEntries[1].(map[string]any)["name"] != "Europe" {
 		t.Fatalf("root first page=%v", firstEntries)
 	}
+	if first["server_only"] != float64(1) {
+		t.Fatalf("root server_only=%v, want mismatched clip counted as unsafe", first["server_only"])
+	}
 	cursor, _ := first["next_cursor"].(string)
 	if cursor == "" {
 		t.Fatal("root first page omitted cursor")
 	}
 	status, second := call("", cursor, 2)
-	secondEntries := second["entries"].([]any)
-	if status != http.StatusOK || len(secondEntries) != 1 || secondEntries[0].(map[string]any)["name"] != "root.mp4" {
+	if status != http.StatusOK {
+		t.Fatalf("root second page status=%d", status)
+	}
+	secondEntries, _ := second["entries"].([]any)
+	if len(secondEntries) != 1 || secondEntries[0].(map[string]any)["name"] != "root.mp4" {
 		t.Fatalf("root second page status=%d entries=%v", status, secondEntries)
 	}
 	if _, ok := second["server_only"]; ok {
 		t.Fatal("continuation page recomputed server-only summary")
 	}
 	status, africa := call("Africa", "", 20)
-	africaEntries := africa["entries"].([]any)
-	if status != http.StatusOK || len(africaEntries) != 2 || africaEntries[0].(map[string]any)["kind"] != "directory" {
+	if status != http.StatusOK {
+		t.Fatalf("Africa status=%d", status)
+	}
+	africaEntries, _ := africa["entries"].([]any)
+	if len(africaEntries) != 2 || africaEntries[0].(map[string]any)["kind"] != "directory" {
 		t.Fatalf("Africa status=%d entries=%v", status, africaEntries)
 	}
 	if _, ok := africa["server_only"]; ok {
 		t.Fatal("nested folder first page recomputed account-wide server-only summary")
 	}
 	status, july := call("Africa/July", "", 20)
-	julyEntries := july["entries"].([]any)
-	if status != http.StatusOK || len(julyEntries) != 2 {
+	if status != http.StatusOK {
+		t.Fatalf("July status=%d", status)
+	}
+	julyEntries, _ := july["entries"].([]any)
+	if len(julyEntries) != 2 {
 		t.Fatalf("July status=%d entries=%v", status, julyEntries)
 	}
 	if julyEntries[1].(map[string]any)["reconciliation"] != "nas_only" {
@@ -209,7 +221,11 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 		t.Fatalf("July cursor=%+v err=%v, want direct-file phase", decoded, err)
 	}
 	status, julySecond := call("Africa/July", julyCursor, 1)
-	if status != http.StatusOK || len(julySecond["entries"].([]any)) != 1 {
+	if status != http.StatusOK {
+		t.Fatalf("July direct continuation status=%d", status)
+	}
+	julySecondEntries, _ := julySecond["entries"].([]any)
+	if len(julySecondEntries) != 1 {
 		t.Fatalf("July direct continuation status=%d body=%v", status, julySecond)
 	}
 	if status, _ := call("../private", "", 20); status != http.StatusBadRequest {
@@ -222,8 +238,11 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	}
 	for _, path := range []string{"100%", "under_score"} {
 		status, body := call(path, "", 20)
-		entries := body["entries"].([]any)
-		if status != http.StatusOK || len(entries) != 1 || entries[0].(map[string]any)["name"] != "literal.mp4" {
+		if status != http.StatusOK {
+			t.Fatalf("escaped prefix %q status=%d", path, status)
+		}
+		entries, _ := body["entries"].([]any)
+		if len(entries) != 1 || entries[0].(map[string]any)["name"] != "literal.mp4" {
 			t.Fatalf("escaped prefix %q status=%d entries=%v", path, status, entries)
 		}
 	}
