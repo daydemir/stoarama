@@ -5,7 +5,8 @@ ALTER TABLE relay_groups
   DROP CONSTRAINT IF EXISTS relay_groups_bandwidth_capacity_bps_check;
 ALTER TABLE relay_groups
   ADD CONSTRAINT relay_groups_bandwidth_capacity_bps_check
-  CHECK (bandwidth_capacity_bps IS NULL OR bandwidth_capacity_bps BETWEEN 1000000 AND 10000000000);
+  CHECK (bandwidth_capacity_bps IS NULL OR bandwidth_capacity_bps BETWEEN 1000000 AND 10000000000)
+  NOT VALID;
 
 CREATE TABLE IF NOT EXISTS recording_bandwidth_observations (
   recording_id BIGINT PRIMARY KEY REFERENCES recordings(id) ON DELETE CASCADE,
