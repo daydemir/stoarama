@@ -270,11 +270,13 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	if states[0].RelayVersion != "abc123" || states[0].RelayGroupName != "deniz-durham" || states[0].ReportedJobs != 2 || states[0].LiveLeases != 0 {
 		t.Fatalf("relay diagnostics missing from state: %+v", states[0])
 	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now.Add(-4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `
-		UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7;
 		INSERT INTO recording_jobs (lease_owner,lease_expires_at,status,kind,fire_at,window_end_at)
-		VALUES ('node:7',$2,'leased','continuous_window',$3,$4)
-	`, now.Add(-4*time.Minute), now.Add(70*time.Second), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
+		VALUES ('node:7',$1,'leased','continuous_window',$2,$3)
+	`, now.Add(70*time.Second), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	states, err = currentRelayConnectivity(ctx, pool, now)
@@ -288,7 +290,10 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	if err != nil || len(states) != 1 || states[0].ActiveCapture || states[0].State != relayOnline {
 		t.Fatalf("expired lease states=%v err=%v, want idle-threshold online", states, err)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs; UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := recordRelayConnectivity(ctx, pool, now); err != nil || len(got) != 0 {
@@ -296,9 +301,11 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO relay_connectivity_alert_events (account_id, node_id, state, observed_at)
-		VALUES (47, 7, 'offline', $1), (2, 8, 'offline', $1);
-		UPDATE nodes SET account_id=2 WHERE id=7;
+		VALUES (47, 7, 'offline', $1), (2, 8, 'offline', $1)
 	`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET account_id=2 WHERE id=7`); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := pendingRelayConnectivity(ctx, pool)
