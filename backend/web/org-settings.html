@@ -781,8 +781,8 @@
           const storageTotal = c.nas_storage_total_bytes == null ? NaN : Number(c.nas_storage_total_bytes);
           const storagePercent = Number.isFinite(storageFree) && Number.isFinite(storageTotal) && storageTotal > 0
             ? storageFree / storageTotal * 100 : NaN;
-          const storageClass = Number.isFinite(storageFree) && (storageFree < 200 * (1024 ** 3) || (Number.isFinite(storagePercent) && storagePercent <= 5)) ? 'error' :
-            Number.isFinite(storageFree) && (storageFree < 1024 ** 4 || (Number.isFinite(storagePercent) && storagePercent <= 10)) ? 'warn' : '';
+          const storageClass = Number.isFinite(storagePercent) && storagePercent <= 5 ? 'error' :
+            Number.isFinite(storagePercent) && storagePercent <= 10 ? 'warn' : '';
           const storageSeverity = storageClass === 'error' ? 'Critical low storage · ' : storageClass === 'warn' ? 'Low storage · ' : '';
           const storageText = Number.isFinite(storageFree) && Number.isFinite(storageTotal)
             ? `${storageSeverity}${connectionBytes(storageFree)} free of ${connectionBytes(storageTotal)}${Number.isFinite(storagePercent) ? ` · ${storagePercent.toFixed(1)}% free` : ''}` : 'Storage unavailable';

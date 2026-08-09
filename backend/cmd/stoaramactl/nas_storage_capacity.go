@@ -39,7 +39,7 @@ type nasStorageCapacityTransition struct {
 }
 
 func nasStorageStateAt(total, free *int64, reportedAt *time.Time, now time.Time) nasStorageCapacityState {
-	if total == nil || free == nil || reportedAt == nil || *total <= 0 || now.Sub(*reportedAt) > nasStorageTelemetryFreshness {
+	if total == nil || free == nil || reportedAt == nil || *total <= 0 || *free < 0 || *free > *total || now.Sub(*reportedAt) >= nasStorageTelemetryFreshness {
 		return nasStorageUnknown
 	}
 	percent := float64(*free) * 100 / float64(*total)
@@ -74,6 +74,10 @@ func currentNASStorageCapacity(ctx context.Context, q interface {
 			return nil, err
 		}
 		state.State = nasStorageStateAt(state.TotalBytes, state.FreeBytes, state.StorageReportedAt, now)
+		if state.TotalBytes == nil || state.FreeBytes == nil || *state.TotalBytes <= 0 || *state.FreeBytes < 0 || *state.FreeBytes > *state.TotalBytes {
+			state.TotalBytes = nil
+			state.FreeBytes = nil
+		}
 		state.ChangedAt = now
 		states = append(states, state)
 	}
@@ -180,6 +184,10 @@ func deliverNASStorageCapacityEmail(ctx context.Context, pool *pgxpool.Pool, cfg
 	if err != nil {
 		return err
 	}
+	return deliverNASStorageCapacityEmailWithSender(ctx, pool, cfg, mailer, transitions)
+}
+
+func deliverNASStorageCapacityEmailWithSender(ctx context.Context, pool *pgxpool.Pool, cfg config.Config, mailer email.Sender, transitions []nasStorageCapacityTransition) error {
 	for _, transition := range transitions {
 		rows, err := pool.Query(ctx, `SELECT recipient FROM nas_storage_capacity_alert_deliveries WHERE event_id=$1 AND delivered_at IS NULL ORDER BY recipient`, transition.EventID)
 		if err != nil {
