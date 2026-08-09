@@ -57,6 +57,24 @@ func TestDestructiveWebActionsUseMenusAndConfirmations(t *testing.T) {
 	}
 }
 
+func TestOrgSettingsNASStorageUsesPercentageThresholds(t *testing.T) {
+	body, err := loadHTMLPage("org-settings.html")
+	if err != nil {
+		t.Fatalf("load org settings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`storagePercent <= 5`,
+		`storagePercent <= 10`,
+		`Critical low storage`,
+		`storagePercent.toFixed(1)}% free`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("org settings missing NAS capacity marker %q", marker)
+		}
+	}
+}
+
 func TestRecordingRelayRoutingIsSoftAndExplicit(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {

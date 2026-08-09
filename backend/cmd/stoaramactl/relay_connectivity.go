@@ -83,7 +83,11 @@ func runRelayConnectivity(ctx context.Context, cfg config.Config, args []string)
 		if err != nil {
 			log.Fatalf("load relay capacity: %v", err)
 		}
-		printJSON(map[string]any{"dry_run": true, "relays": states, "capacity": capacity})
+		nasStorage, err := currentNASStorageCapacity(ctx, pool, now)
+		if err != nil {
+			log.Fatalf("load NAS storage capacity: %v", err)
+		}
+		printJSON(map[string]any{"dry_run": true, "relays": states, "capacity": capacity, "nas_storage": nasStorage})
 		return
 	}
 	lockConn, err := pool.Acquire(ctx)
@@ -110,8 +114,12 @@ func runRelayConnectivity(ctx context.Context, cfg config.Config, args []string)
 	if err != nil {
 		log.Fatalf("record relay capacity: %v", err)
 	}
-	if len(transitions) == 0 && len(capacityTransitions) == 0 {
-		printJSON(map[string]any{"dry_run": false, "transitions": 0, "capacity_transitions": 0, "emailed": 0})
+	nasStorageTransitions, err := recordNASStorageCapacity(ctx, pool, now)
+	if err != nil {
+		log.Fatalf("record NAS storage capacity: %v", err)
+	}
+	if len(transitions) == 0 && len(capacityTransitions) == 0 && len(nasStorageTransitions) == 0 {
+		printJSON(map[string]any{"dry_run": false, "transitions": 0, "capacity_transitions": 0, "nas_storage_transitions": 0, "emailed": 0})
 		return
 	}
 	if len(transitions) > 0 {
@@ -130,7 +138,15 @@ func runRelayConnectivity(ctx context.Context, cfg config.Config, args []string)
 			log.Fatalf("mark relay capacity alerts notified: %v", err)
 		}
 	}
-	printJSON(map[string]any{"dry_run": false, "transitions": len(transitions), "capacity_transitions": len(capacityTransitions), "emailed": 1})
+	if len(nasStorageTransitions) > 0 {
+		if err := deliverNASStorageCapacityEmail(ctx, pool, cfg, nasStorageTransitions); err != nil {
+			log.Fatalf("deliver NAS storage capacity alert: %v", err)
+		}
+		if err := markNASStorageCapacityNotified(ctx, pool, nasStorageTransitions); err != nil {
+			log.Fatalf("mark NAS storage capacity alerts notified: %v", err)
+		}
+	}
+	printJSON(map[string]any{"dry_run": false, "transitions": len(transitions), "capacity_transitions": len(capacityTransitions), "nas_storage_transitions": len(nasStorageTransitions), "emailed": 1})
 }
 
 func currentRelayConnectivity(ctx context.Context, q interface {
