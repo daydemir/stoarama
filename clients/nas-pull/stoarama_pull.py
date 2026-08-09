@@ -448,28 +448,29 @@ class Inventory:
                    FROM files WHERE clip_id=?""",
                 (int(clip["clip_id"]),),
             ).fetchone()
-        if row is None or row[6] != generation:
-            return False
-        if row[0] != int(clip["recording_id"]) or row[1] != str(clip["relative_path"]):
-            return False
-        if row[2] != int(clip["size_bytes"]) or row[3] != str(clip["sha256"]).lower():
-            return False
-        current = False
-        if path.exists():
-            stat = path.stat()
-            current = (
-                row[4] in ("present", "mismatch") and row[5] == stat.st_mtime_ns
-                and row[7] != 0 and row[7] == stat.st_ctime_ns
-                and row[8] != 0 and row[8] == stat.st_ino
-                and row[9] != 0 and row[9] == stat.st_dev
-                and stat.st_size == int(clip["size_bytes"])
-            )
-        else:
-            current = row[4] == "missing" and row[5] == 0
-        if current:
-            with self.lock:
+            if row is None or row[6] != generation:
+                return False
+            if row[0] != int(clip["recording_id"]) or row[1] != str(clip["relative_path"]):
+                return False
+            if row[2] != int(clip["size_bytes"]) or row[3] != str(clip["sha256"]).lower():
+                return False
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                stat = None
+            if stat is None:
+                current = row[4] == "missing" and row[5] == 0
+            else:
+                current = (
+                    row[4] in ("present", "mismatch") and row[5] == stat.st_mtime_ns
+                    and row[7] != 0 and row[7] == stat.st_ctime_ns
+                    and row[8] != 0 and row[8] == stat.st_ino
+                    and row[9] != 0 and row[9] == stat.st_dev
+                    and stat.st_size == int(clip["size_bytes"])
+                )
+            if current:
                 self.db.execute("UPDATE files SET scan_pass=? WHERE clip_id=?", (scan_pass, int(clip["clip_id"])))
-        return current
+            return current
 
     def _unmatched_scan_row_is_current(self, relative_path, generation, scan_pass, stat):
         with self.lock:
@@ -478,17 +479,16 @@ class Inventory:
                    FROM unmatched_files WHERE relative_path=?""",
                 (relative_path,),
             ).fetchone()
-        current = (
-            row is not None and row[3] == generation and row[1] == "present"
-            and row[0] == stat.st_size and row[2] == stat.st_mtime_ns
-            and row[4] != 0 and row[4] == stat.st_ctime_ns
-            and row[5] != 0 and row[5] == stat.st_ino
-            and row[6] != 0 and row[6] == stat.st_dev
-        )
-        if current:
-            with self.lock:
+            current = (
+                row is not None and row[3] == generation and row[1] == "present"
+                and row[0] == stat.st_size and row[2] == stat.st_mtime_ns
+                and row[4] != 0 and row[4] == stat.st_ctime_ns
+                and row[5] != 0 and row[5] == stat.st_ino
+                and row[6] != 0 and row[6] == stat.st_dev
+            )
+            if current:
                 self.db.execute("UPDATE unmatched_files SET scan_pass=? WHERE relative_path=?", (scan_pass, relative_path))
-        return current
+            return current
 
     def _retire_unmatched_linked_path(self, relative_path, generation, scan_pass):
         with self.lock:
@@ -575,19 +575,27 @@ class Inventory:
                         self._commit_scan_batch()
                         self.sync_dirty(cfg, generation, started_at)
                     continue
-                if path.exists():
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    stat = None
+                if stat is not None:
                     try:
                         actual_size, actual_sha, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
+                    except FileNotFoundError:
+                        state, verified_at, mtime_ns = "missing", None, 0
+                        identity = (0, 0, 0)
                     except FileChangedDuringHash:
                         self._upsert(
                             clip, "mismatch", None, 0, generation, commit=False,
                             scan_pass=scan_pass, file_identity=(0, 0, 0),
                         )
                         raise
-                    state = "present" if actual_size == expected_size and actual_sha == expected_sha else "mismatch"
-                    verified_at = utc_now_precise() if state == "present" else None
-                    mtime_ns = stat.st_mtime_ns
-                    identity = (stat.st_ctime_ns, stat.st_ino, stat.st_dev)
+                    else:
+                        state = "present" if actual_size == expected_size and actual_sha == expected_sha else "mismatch"
+                        verified_at = utc_now_precise() if state == "present" else None
+                        mtime_ns = stat.st_mtime_ns
+                        identity = (stat.st_ctime_ns, stat.st_ino, stat.st_dev)
                 else:
                     state, verified_at, mtime_ns = "missing", None, 0
                     identity = (0, 0, 0)
@@ -656,12 +664,12 @@ class Inventory:
         with self.lock:
             self.db.execute(
                 """UPDATE files SET state='missing',verified_at=NULL,seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
-                   WHERE scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
+                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
                 (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.execute(
                 """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
-                   WHERE scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
+                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
                 (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.commit()

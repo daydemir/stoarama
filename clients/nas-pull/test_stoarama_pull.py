@@ -335,6 +335,7 @@ class NASPullTests(unittest.TestCase):
                 inventory.full_scan(cfg, stop)
             before = path.stat()
             path.write_bytes(b"z")
+            # Linux ctime advances even when mtime is restored; this client runs on Linux/Synology.
             os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
             hashed = []
 
@@ -451,10 +452,18 @@ class NASPullTests(unittest.TestCase):
                     inventory._commit_scan_batch()
             commits = []
             inventory.db.set_trace_callback(lambda statement: commits.append(statement) if statement == "COMMIT" else None)
-            with mock.patch.object(pull, "sha256_file_throttled", side_effect=AssertionError("unchanged cached file was rehashed")), mock.patch.object(
+            rehashed = []
+            original_hash = pull.sha256_file_throttled
+
+            def record_rehash(path_arg, mbps, stop_event):
+                rehashed.append(str(path_arg))
+                return original_hash(path_arg, mbps, stop_event)
+
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=record_rehash), mock.patch.object(
                 pull, "request_json", return_value={}
             ):
                 inventory.full_scan(cfg, threading.Event())
+            self.assertEqual(rehashed, [], "unchanged cached file was rehashed")
             self.assertGreaterEqual(len(commits), 1000 // pull.INVENTORY_SYNC_BATCH)
             self.assertLessEqual(len(commits), 15)
             inventory.close()
