@@ -295,6 +295,16 @@ func TestContinuousMediaLagExpired(t *testing.T) {
 	}
 }
 
+func TestRecordingCaptureTargetFPSAlwaysPreservesSource(t *testing.T) {
+	legacy := 15
+	if got := recordingCaptureTargetFPS(&legacy); got != nil {
+		t.Fatalf("legacy target selected re-encode path: %v", *got)
+	}
+	if got := recordingCaptureTargetFPS(nil); got != nil {
+		t.Fatalf("native target=%v want nil", *got)
+	}
+}
+
 func TestContinuousMediaLagSurrendersOnlyAfterCleanSpoolDrain(t *testing.T) {
 	if !continuousMediaLagCanSurrender(true, nil, false) {
 		t.Fatal("cleanly drained lagged capture did not surrender")

@@ -54,7 +54,7 @@ func TestRecordingScheduleValidationAndAuth(t *testing.T) {
 		{"bad mode", map[string]any{"mode": "hourly", "cron_expr": "*/5 * * * *"}},
 		{"clip too short", map[string]any{"mode": "sampled", "cron_expr": "*/5 * * * *", "clip_duration_sec": 2}},
 		{"clip too long", map[string]any{"mode": "sampled", "cron_expr": "*/5 * * * *", "clip_duration_sec": 901}},
-		{"bad target_fps", map[string]any{"mode": "sampled", "cron_expr": "*/5 * * * *", "target_fps": 120}},
+		{"re-encoding target_fps", map[string]any{"mode": "sampled", "cron_expr": "*/5 * * * *", "target_fps": 30}},
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()
