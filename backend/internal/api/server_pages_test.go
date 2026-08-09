@@ -380,7 +380,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`continuous timeline · native layout compatible`,
 	} {
 		if !strings.Contains(page, marker) {
-			t.Fatalf("recordings list timeline health missing %q", marker)
+			t.Fatalf("recordings list health-column layout missing %q", marker)
 		}
 	}
 }
