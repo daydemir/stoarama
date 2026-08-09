@@ -405,6 +405,12 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			api_key_id BIGINT,
 			inventory_mode TEXT NOT NULL DEFAULT 'observe',
 			inventory_generation TEXT NOT NULL DEFAULT '',
+			inventory_tree_generation TEXT NOT NULL DEFAULT '',
+			inventory_live_revision BIGINT NOT NULL DEFAULT 0,
+			inventory_tree_revision BIGINT NOT NULL DEFAULT 0,
+			inventory_in_progress_generation TEXT NOT NULL DEFAULT '',
+			inventory_in_progress_started_at TIMESTAMPTZ,
+			inventory_in_progress_reported_at TIMESTAMPTZ,
 			inventory_scan_started_at TIMESTAMPTZ,
 			inventory_scan_completed_at TIMESTAMPTZ,
 			inventory_reported_at TIMESTAMPTZ,
@@ -488,6 +494,8 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			seen_generation TEXT NOT NULL DEFAULT '',
 			client_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			server_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			tree_parent_path TEXT,
+			tree_name TEXT,
 			PRIMARY KEY(connection_id,clip_id)
 		)`,
 		`CREATE TABLE nas_inventory_unmatched_files (
@@ -500,7 +508,22 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			seen_generation TEXT NOT NULL DEFAULT '',
 			client_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			server_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			tree_parent_path TEXT,
+			tree_name TEXT,
 			PRIMARY KEY(connection_id,relative_path)
+		)`,
+		`CREATE TABLE nas_inventory_tree_directories (
+			connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+			generation TEXT NOT NULL,
+			parent_path TEXT NOT NULL,
+			name TEXT NOT NULL,
+			size_bytes BIGINT NOT NULL,
+			descendant_files BIGINT NOT NULL,
+			mismatch_files BIGINT NOT NULL,
+			nas_only_files BIGINT NOT NULL,
+			stale_files BIGINT NOT NULL,
+			ambiguous_files BIGINT NOT NULL,
+			PRIMARY KEY(connection_id,generation,parent_path,name)
 		)`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

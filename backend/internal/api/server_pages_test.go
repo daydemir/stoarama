@@ -356,26 +356,34 @@ func TestOrganizationNASConnectionUsesStructuredHealthCard(t *testing.T) {
 	}
 }
 
-func TestOrganizationNASInventoryUsesPaginatedFolderBrowser(t *testing.T) {
-	body, err := loadHTMLPage("org-settings.html")
+func TestNASFilesPageUsesPaginatedFolderBrowser(t *testing.T) {
+	body, err := loadHTMLPage("nas-files.html")
 	if err != nil {
-		t.Fatalf("load org settings html: %v", err)
+		t.Fatalf("load NAS files html: %v", err)
 	}
 	page := string(body)
 	for _, marker := range []string{
-		`/inventory/tree?${params.toString()}`,
-		`inventoryBreadcrumbs(path)`,
-		`data-inventory-path=`,
+		`/inventory/tree?${params}`,
+		`renderBreadcrumbs(path)`,
+		`data-path=`,
 		`Up one folder`,
 		`data.next_cursor`,
-		`box.dataset.inventoryRequest !== requestGeneration`,
-		`box.dataset.inventoryServerOnly = String(Number(data.server_only || 0))`,
+		`generation!==requestGeneration`,
+		`rootServerOnly=Number(data.server_only||0)`,
 		`server-only clips across this NAS`,
 		`Download full manifest CSV`,
+		`SHA-256`,
 	} {
 		if !strings.Contains(page, marker) {
-			t.Fatalf("org settings html missing NAS folder-browser marker %q", marker)
+			t.Fatalf("NAS files html missing folder-browser marker %q", marker)
 		}
+	}
+	orgBody, err := loadHTMLPage("org-settings.html")
+	if err != nil {
+		t.Fatalf("load org settings html: %v", err)
+	}
+	if !strings.Contains(string(orgBody), `href="/nas-files?connection=${id}"`) {
+		t.Fatal("org settings does not link to the dedicated NAS files page")
 	}
 }
 

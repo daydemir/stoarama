@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
@@ -18,12 +20,13 @@ import (
 )
 
 const (
-	nasInventoryMaxBatch      = 500
-	nasInventoryMaxPage       = 500
-	nasInventoryFreshness     = 72 * time.Hour
-	nasInventoryMaxFutureSkew = 5 * time.Minute
-	nasInventoryMaxPathBytes  = 1024
-	nasInventoryMaxGeneration = 128
+	nasInventoryMaxBatch        = 500
+	nasInventoryMaxPage         = 500
+	nasInventoryFreshness       = 72 * time.Hour
+	nasInventoryScanProgressTTL = 24 * time.Hour
+	nasInventoryMaxFutureSkew   = 5 * time.Minute
+	nasInventoryMaxPathBytes    = 1024
+	nasInventoryMaxGeneration   = 128
 )
 
 type nasInventoryFileReport struct {
@@ -69,12 +72,22 @@ func validNASRelativePath(path string) bool {
 	return true
 }
 
+func nasInventoryTreeParts(path string) (string, string) {
+	if index := strings.LastIndexByte(path, '/'); index >= 0 {
+		return path[:index], path[index+1:]
+	}
+	return "", path
+}
+
 func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error {
 	if req.Generation == "" || len(req.Generation) > nasInventoryMaxGeneration || !relayArtifactName.MatchString(req.Generation) {
 		return errors.New("invalid inventory generation")
 	}
 	if len(req.Files)+len(req.Unmatched) > nasInventoryMaxBatch {
 		return fmt.Errorf("inventory batch exceeds %d files", nasInventoryMaxBatch)
+	}
+	if req.ScanStartedAt != nil && req.ScanStartedAt.After(now.Add(nasInventoryMaxFutureSkew)) {
+		return errors.New("inventory scan start is too far in the future")
 	}
 	unmatchedSeen := make(map[string]bool, len(req.Unmatched))
 	for _, file := range req.Unmatched {
@@ -131,21 +144,89 @@ func lowerHex(value string) bool {
 	return true
 }
 
+// rebuildNASInventoryTreeDirectories refreshes derived leaf keys and the small
+// completed-generation directory rollup. Leaves remain in the authoritative live
+// ledgers; duplicate paths are explicitly ambiguous and can never look confirmed.
+func rebuildNASInventoryTreeDirectories(ctx context.Context, tx pgx.Tx, connectionID, accountID int64, generation string) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM nas_inventory_tree_directories WHERE connection_id=$1`, connectionID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		WITH RECURSIVE raw AS (
+		  SELECT i.relative_path,i.clip_id,i.recording_id,i.size_bytes,i.sha256,i.state,i.verified_at,
+		         CASE WHEN c.id IS NULL THEN 'nas_only'
+		              WHEN i.state='mismatch' OR c.size_bytes<>i.size_bytes OR lower(c.sha256)<>i.sha256 OR c.display_path<>i.relative_path THEN 'mismatch'
+		              ELSE 'confirmed' END AS reconciliation,
+		         (i.verified_at IS NULL OR i.verified_at<now()-$4::interval OR i.verified_at>now()+$5::interval) AS stale
+		  FROM nas_inventory_files i
+		  LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
+		  WHERE i.connection_id=$1 AND i.state IN('present','mismatch')
+		  UNION ALL
+		  SELECT u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',false
+		  FROM nas_inventory_unmatched_files u
+		  WHERE u.connection_id=$1 AND u.state='present'
+		), ranked AS (
+		  SELECT *,count(*) OVER(PARTITION BY relative_path) AS path_count,row_number() OVER(PARTITION BY relative_path ORDER BY
+		    CASE reconciliation WHEN 'mismatch' THEN 2 WHEN 'nas_only' THEN 1 ELSE 0 END DESC,
+		    clip_id NULLS LAST) AS rank
+		  FROM raw
+		), files AS (
+		  SELECT relative_path,size_bytes,
+		         CASE WHEN path_count>1 THEN 'ambiguous' WHEN reconciliation='confirmed' AND stale THEN 'stale' ELSE reconciliation END AS reconciliation,
+		         CASE WHEN strpos(reverse(relative_path),'/')=0 THEN '' ELSE left(relative_path,length(relative_path)-strpos(reverse(relative_path),'/')) END AS parent_path
+		  FROM ranked WHERE rank=1
+		), ancestry(file_path,directory_path) AS (
+		  SELECT relative_path,parent_path FROM files WHERE parent_path<>''
+		  UNION ALL
+		  SELECT file_path,
+		         CASE WHEN strpos(reverse(directory_path),'/')=0 THEN ''
+		              ELSE left(directory_path,length(directory_path)-strpos(reverse(directory_path),'/')) END
+		  FROM ancestry WHERE directory_path<>''
+		), directories AS (
+		  SELECT a.directory_path,
+		         CASE WHEN strpos(reverse(a.directory_path),'/')=0 THEN ''
+		              ELSE left(a.directory_path,length(a.directory_path)-strpos(reverse(a.directory_path),'/')) END AS parent_path,
+		         CASE WHEN strpos(reverse(a.directory_path),'/')=0 THEN a.directory_path
+		              ELSE right(a.directory_path,strpos(reverse(a.directory_path),'/')-1) END AS name,
+		         sum(f.size_bytes)::bigint AS size_bytes,count(*)::bigint AS descendant_files,
+		         count(*) FILTER(WHERE f.reconciliation='mismatch')::bigint AS mismatch_files,
+		         count(*) FILTER(WHERE f.reconciliation='nas_only')::bigint AS nas_only_files,
+		         count(*) FILTER(WHERE f.reconciliation='stale')::bigint AS stale_files,
+		         count(*) FILTER(WHERE f.reconciliation='ambiguous')::bigint AS ambiguous_files
+		  FROM ancestry a JOIN files f ON f.relative_path=a.file_path
+		  WHERE a.directory_path<>'' GROUP BY a.directory_path
+		)
+		INSERT INTO nas_inventory_tree_directories
+		  (connection_id,generation,parent_path,name,size_bytes,descendant_files,mismatch_files,nas_only_files,stale_files,ambiguous_files)
+		SELECT $1,$3,parent_path,name,size_bytes,descendant_files,mismatch_files,nas_only_files,stale_files,ambiguous_files FROM directories
+	`, connectionID, accountID, generation, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String())
+	return err
+}
+
 // verifyNASInventoryForRelease is fail-closed in enforce mode. It compares the
 // NAS proof with the authoritative clip identity and requires a recent checksum
 // verification. Observe mode records inventory without interrupting rollout.
-func (s *Server) verifyNASInventoryForRelease(r *http.Request, principal accountPrincipal, recordingID, clipID int64) (bool, string, error) {
+type nasInventoryQueryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func verifyNASInventoryForRelease(ctx context.Context, query nasInventoryQueryRower, principal accountPrincipal, recordingID, clipID int64) (bool, string, error) {
 	if principal.APIKeyID == nil {
 		return true, "non-pull caller", nil
 	}
 	var mode string
 	var state, localPath, localSHA, serverPath, serverSHA string
-	var localSize, serverSize int64
+	var localSize, serverSize, duplicateClaims int64
 	var verifiedAt *time.Time
-	err := s.pool.QueryRow(r.Context(), `
+	err := query.QueryRow(ctx, `
 		SELECT conn.inventory_mode, COALESCE(i.state,''), COALESCE(i.relative_path,''),
 		       COALESCE(i.size_bytes,0), COALESCE(i.sha256,''), i.verified_at,
-		       COALESCE(c.display_path,''), c.size_bytes, lower(COALESCE(c.sha256,''))
+		       COALESCE(c.display_path,''), c.size_bytes, lower(COALESCE(c.sha256,'')),
+		       (SELECT count(*) FROM nas_inventory_files other
+		        WHERE other.connection_id=conn.id AND other.relative_path=i.relative_path
+		          AND other.clip_id<>c.id AND other.state IN('present','mismatch'))
+		       +(SELECT count(*) FROM nas_inventory_unmatched_files unmatched
+		         WHERE unmatched.connection_id=conn.id AND unmatched.relative_path=i.relative_path AND unmatched.state='present')
 		FROM connections conn
 		JOIN recording_clips c ON c.id=$3 AND c.recording_id=$4
 		JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=conn.account_id
@@ -153,7 +234,7 @@ func (s *Server) verifyNASInventoryForRelease(r *http.Request, principal account
 		WHERE conn.api_key_id=$1 AND conn.account_id=$2
 	`, *principal.APIKeyID, principal.AccountID, clipID, recordingID).Scan(
 		&mode, &state, &localPath, &localSize, &localSHA, &verifiedAt,
-		&serverPath, &serverSize, &serverSHA)
+		&serverPath, &serverSize, &serverSHA, &duplicateClaims)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return true, "non-pull caller", nil
 	}
@@ -165,6 +246,9 @@ func (s *Server) verifyNASInventoryForRelease(r *http.Request, principal account
 	}
 	if state != "present" || verifiedAt == nil {
 		return false, "clip is not confirmed present in NAS inventory", nil
+	}
+	if duplicateClaims > 0 {
+		return false, "NAS path is claimed by multiple live inventory rows", nil
 	}
 	age := time.Since(verifiedAt.UTC())
 	if age < -nasInventoryMaxFutureSkew || age > nasInventoryFreshness {
@@ -220,37 +304,64 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		})
 		return
 	}
+	// Ordinary incremental proofs use generation "live" and are not a full
+	// filesystem walk. Only scan pages carrying scan_started_at make the
+	// completed folder rollup temporarily inconsistent.
+	if !req.Complete && (req.ScanStartedAt != nil || req.Generation != "live") {
+		_, err = tx.Exec(r.Context(), `
+			UPDATE connections SET
+			  inventory_in_progress_started_at=CASE
+			    WHEN inventory_in_progress_generation<>$1 THEN COALESCE($2,now())
+			    ELSE COALESCE(inventory_in_progress_started_at,$2,now()) END,
+			  inventory_in_progress_generation=$1,inventory_in_progress_reported_at=now(),updated_at=now()
+			WHERE id=$3
+		`, req.Generation, req.ScanStartedAt, connectionID)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update inventory scan progress: %v", err))
+			return
+		}
+	}
+	if len(req.Files)+len(req.Unmatched) > 0 {
+		if _, err := tx.Exec(r.Context(), `UPDATE connections SET inventory_live_revision=inventory_live_revision+1 WHERE id=$1`, connectionID); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("advance inventory revision: %v", err))
+			return
+		}
+	}
 	for _, file := range req.Files {
+		parentPath, name := nasInventoryTreeParts(file.RelativePath)
 		_, err = tx.Exec(r.Context(), `
 			INSERT INTO nas_inventory_files
-				(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,seen_generation,client_updated_at,server_received_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
+				(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,seen_generation,client_updated_at,server_received_at,tree_parent_path,tree_name)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),$12,$13)
 			ON CONFLICT (connection_id,clip_id) DO UPDATE SET
 				recording_id=EXCLUDED.recording_id, relative_path=EXCLUDED.relative_path,
 				size_bytes=EXCLUDED.size_bytes, sha256=EXCLUDED.sha256, state=EXCLUDED.state,
 				verified_at=EXCLUDED.verified_at, file_mtime_ns=EXCLUDED.file_mtime_ns,
 				seen_generation=EXCLUDED.seen_generation, client_updated_at=EXCLUDED.client_updated_at,
+				tree_parent_path=EXCLUDED.tree_parent_path,tree_name=EXCLUDED.tree_name,
 				server_received_at=now()
 			WHERE EXCLUDED.client_updated_at >= nas_inventory_files.client_updated_at
 		`, connectionID, file.ClipID, file.RecordingID, file.RelativePath, file.SizeBytes,
-			file.SHA256, file.State, file.VerifiedAt, file.FileMTimeNS, req.Generation, file.ClientUpdatedAt)
+			file.SHA256, file.State, file.VerifiedAt, file.FileMTimeNS, req.Generation, file.ClientUpdatedAt, parentPath, name)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert inventory file: %v", err))
 			return
 		}
 	}
 	for _, file := range req.Unmatched {
+		parentPath, name := nasInventoryTreeParts(file.RelativePath)
 		_, err = tx.Exec(r.Context(), `
 			INSERT INTO nas_inventory_unmatched_files
-				(connection_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,client_updated_at,server_received_at)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,now())
+				(connection_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,client_updated_at,server_received_at,tree_parent_path,tree_name)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,now(),$9,$10)
 			ON CONFLICT(connection_id,relative_path) DO UPDATE SET
 				size_bytes=EXCLUDED.size_bytes,sha256=EXCLUDED.sha256,state=EXCLUDED.state,
 				file_mtime_ns=EXCLUDED.file_mtime_ns,seen_generation=EXCLUDED.seen_generation,
+				tree_parent_path=EXCLUDED.tree_parent_path,tree_name=EXCLUDED.tree_name,
 				client_updated_at=EXCLUDED.client_updated_at,server_received_at=now()
 			WHERE EXCLUDED.client_updated_at>=nas_inventory_unmatched_files.client_updated_at
 		`, connectionID, file.RelativePath, file.SizeBytes, file.SHA256, file.State,
-			file.FileMTimeNS, req.Generation, file.ClientUpdatedAt)
+			file.FileMTimeNS, req.Generation, file.ClientUpdatedAt, parentPath, name)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert unmatched inventory file: %v", err))
 			return
@@ -289,11 +400,17 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("summarize unmatched inventory: %v", err))
 			return
 		}
+		if err := rebuildNASInventoryTreeDirectories(r.Context(), tx, connectionID, principal.AccountID, req.Generation); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("rebuild inventory tree: %v", err))
+			return
+		}
 		_, err = tx.Exec(r.Context(), `
 			UPDATE connections SET inventory_generation=$1, inventory_scan_started_at=$2,
 			inventory_scan_completed_at=$3, inventory_reported_at=now(), inventory_clips=$4,
 			inventory_bytes=$5, inventory_mismatches=$6, inventory_unmatched=$7,
-			inventory_digest=$8, updated_at=now() WHERE id=$9
+			inventory_digest=$8,inventory_tree_generation=$1,inventory_tree_revision=inventory_live_revision,inventory_in_progress_generation='',
+			inventory_in_progress_started_at=NULL,inventory_in_progress_reported_at=NULL,
+			updated_at=now() WHERE id=$9
 		`, req.Generation, req.ScanStartedAt, req.ScanCompletedAt, clips, bytes, mismatches, unmatched, req.Digest, connectionID)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update inventory summary: %v", err))
@@ -323,8 +440,9 @@ type nasInventoryListItem struct {
 }
 
 type nasInventoryTreeCursor struct {
-	Kind int    `json:"kind"`
-	Name string `json:"name"`
+	Kind  int    `json:"kind"`
+	Name  string `json:"name"`
+	State string `json:"state,omitempty"`
 }
 
 type nasInventoryTreeEntry struct {
@@ -341,6 +459,8 @@ type nasInventoryTreeEntry struct {
 	Reconciliation  string     `json:"reconciliation,omitempty"`
 	MismatchFiles   int64      `json:"mismatch_files,omitempty"`
 	NASOnlyFiles    int64      `json:"nas_only_files,omitempty"`
+	StaleFiles      int64      `json:"stale_files,omitempty"`
+	AmbiguousFiles  int64      `json:"ambiguous_files,omitempty"`
 }
 
 func encodeNASInventoryTreeCursor(cursor nasInventoryTreeCursor) string {
@@ -352,82 +472,64 @@ func decodeNASInventoryTreeCursor(value string) (nasInventoryTreeCursor, error) 
 	if value == "" {
 		return nasInventoryTreeCursor{Kind: -1}, nil
 	}
+	if len(value) > 2048 {
+		return nasInventoryTreeCursor{}, errors.New("invalid inventory cursor")
+	}
 	payload, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
 		return nasInventoryTreeCursor{}, errors.New("invalid inventory cursor")
 	}
 	var cursor nasInventoryTreeCursor
 	if err := json.Unmarshal(payload, &cursor); err != nil || (cursor.Kind != 0 && cursor.Kind != 1) ||
-		cursor.Name == "" || len(cursor.Name) > nasInventoryMaxPathBytes || strings.ContainsAny(cursor.Name, `/\`) || cursor.Name == "." || cursor.Name == ".." {
+		cursor.Name == "" || len(cursor.Name) > nasInventoryMaxPathBytes || len(cursor.State) > 512 || strings.ContainsAny(cursor.Name, `/\`) || cursor.Name == "." || cursor.Name == ".." {
 		return nasInventoryTreeCursor{}, errors.New("invalid inventory cursor")
 	}
 	return cursor, nil
 }
 
-func nasInventoryTreeSQL(prefix string, directFilesOnly bool) string {
-	linkedScope, unmatchedScope := "", ""
-	if prefix != "" {
-		// starts_with is literal prefix matching: it does not depend on locale
-		// sort order and gives '%' and '_' no wildcard meaning. The existing
-		// compound indexes still narrow each scan to this connection first.
-		linkedScope = " AND starts_with(i.relative_path,$3)"
-		unmatchedScope = " AND starts_with(u.relative_path,$3)"
-	}
-	if directFilesOnly {
-		// Apply both the keyset seek and immediate-child test before UNION and
-		// DISTINCT so continued file pages do not scan or sort the whole subtree.
-		linkedScope += " AND i.relative_path > ($3 || $5) AND strpos(substring(i.relative_path FROM char_length($3)+1),'/')=0"
-		unmatchedScope += " AND u.relative_path > ($3 || $5) AND strpos(substring(u.relative_path FROM char_length($3)+1),'/')=0"
-	}
-	cte := `
-		WITH raw AS (
-			SELECT i.relative_path,i.clip_id,i.recording_id,i.size_bytes,i.sha256,i.state,i.verified_at,
+const nasInventoryTreeSQL = `
+		WITH raw_files AS (
+			SELECT i.tree_name AS name,i.relative_path,i.clip_id,i.recording_id,i.size_bytes,i.sha256,i.state,i.verified_at,
 			       CASE WHEN c.id IS NULL THEN 'nas_only'
 			            WHEN i.state='mismatch' OR c.size_bytes<>i.size_bytes OR lower(c.sha256)<>i.sha256 OR c.display_path<>i.relative_path THEN 'mismatch'
-			            ELSE 'confirmed' END AS reconciliation,0 AS source_order
+			            ELSE 'confirmed' END AS reconciliation,
+			       (i.verified_at IS NULL OR i.verified_at<now()-$8::interval OR i.verified_at>now()+$9::interval) AS stale
 			FROM nas_inventory_files i
 			LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
-			WHERE i.connection_id=$1 AND i.state IN('present','mismatch')` + linkedScope + `
+			WHERE i.connection_id=$1 AND i.tree_parent_path=$4 AND i.state IN('present','mismatch')
+			  AND ($5::int<1 OR i.tree_name>$6)
 			UNION ALL
-			SELECT u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',1
+			SELECT u.tree_name,u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',false
 			FROM nas_inventory_unmatched_files u
-			WHERE u.connection_id=$1 AND u.state='present'` + unmatchedScope + `
-		), deduplicated AS (
-			SELECT DISTINCT ON(relative_path) relative_path,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation
-			FROM raw ORDER BY relative_path,source_order
-		), scoped AS (
-			SELECT *,substring(relative_path FROM char_length($3)+1) AS remainder FROM deduplicated
-		)`
-	if directFilesOnly {
-		return cte + `
-		SELECT 1 AS kind_sort,remainder AS name,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation,
+			WHERE u.connection_id=$1 AND u.tree_parent_path=$4 AND u.state='present'
+			  AND ($5::int<1 OR u.tree_name>$6)
+		), ranked_files AS (
+			SELECT *,count(*) OVER(PARTITION BY name) AS path_count,row_number() OVER(PARTITION BY name ORDER BY
+			  CASE reconciliation WHEN 'mismatch' THEN 2 WHEN 'nas_only' THEN 1 ELSE 0 END DESC,
+			  clip_id NULLS LAST) AS rank FROM raw_files
+		), entries AS (
+		SELECT 0 AS kind_sort,d.name,NULL::bigint AS clip_id,NULL::bigint AS recording_id,d.size_bytes,
+		       ''::text AS sha256,''::text AS state,NULL::timestamptz AS verified_at,''::text AS reconciliation,
+		       d.descendant_files,d.mismatch_files,d.nas_only_files,
+		       d.stale_files AS stale_files,
+		       d.ambiguous_files AS ambiguous_files
+		FROM nas_inventory_tree_directories d
+		WHERE d.connection_id=$1 AND d.generation=$3 AND d.parent_path=$4
+		  AND (0>$5::int OR (0=$5::int AND d.name>$6))
+		UNION ALL
+		SELECT 1,name,clip_id,recording_id,size_bytes,sha256,state,verified_at,
+		       CASE WHEN path_count>1 THEN 'ambiguous' WHEN reconciliation='confirmed' AND stale THEN 'stale' ELSE reconciliation END,
 		       1::bigint AS descendant_files,
-		       CASE WHEN reconciliation='mismatch' THEN 1 ELSE 0 END::bigint AS mismatch_files,
-		       CASE WHEN reconciliation='nas_only' THEN 1 ELSE 0 END::bigint AS nas_only_files
-		FROM scoped
-		WHERE $4::int=1
-		ORDER BY remainder LIMIT $6`
-	}
-	return cte + `
-		, entries AS (
-			SELECT 0 AS kind_sort,split_part(remainder,'/',1) AS name,NULL::bigint AS clip_id,NULL::bigint AS recording_id,
-			       sum(size_bytes)::bigint AS size_bytes,''::text AS sha256,''::text AS state,NULL::timestamptz AS verified_at,
-			       ''::text AS reconciliation,count(*)::bigint AS descendant_files,
-			       count(*) FILTER(WHERE reconciliation='mismatch')::bigint AS mismatch_files,
-			       count(*) FILTER(WHERE reconciliation='nas_only')::bigint AS nas_only_files
-			FROM scoped WHERE strpos(remainder,'/')>0 GROUP BY split_part(remainder,'/',1)
-			UNION ALL
-			SELECT 1,remainder,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation,1,
-			       CASE WHEN reconciliation='mismatch' THEN 1 ELSE 0 END,
-			       CASE WHEN reconciliation='nas_only' THEN 1 ELSE 0 END
-			FROM scoped WHERE strpos(remainder,'/')=0
+		       CASE WHEN path_count=1 AND reconciliation='mismatch' THEN 1 ELSE 0 END::bigint AS mismatch_files,
+		       CASE WHEN path_count=1 AND reconciliation='nas_only' THEN 1 ELSE 0 END::bigint AS nas_only_files,
+		       CASE WHEN path_count=1 AND reconciliation='confirmed' AND stale THEN 1 ELSE 0 END::bigint AS stale_files,
+		       CASE WHEN path_count>1 THEN 1 ELSE 0 END::bigint AS ambiguous_files
+		FROM ranked_files WHERE rank=1
 		)
 		SELECT kind_sort,name,clip_id,recording_id,size_bytes,sha256,state,verified_at,reconciliation,
-		       descendant_files,mismatch_files,nas_only_files
+		       descendant_files,mismatch_files,nas_only_files,stale_files,ambiguous_files
 		FROM entries
-		WHERE kind_sort>$4 OR (kind_sort=$4 AND name>$5)
-		ORDER BY kind_sort,name LIMIT $6`
-}
+		ORDER BY kind_sort,name LIMIT $7`
 
 // handleAccountConnectionInventoryTree lists only the immediate children of a
 // directory. The opaque keyset cursor keeps response size bounded even when a
@@ -457,21 +559,51 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 	if limit < 1 || limit > nasInventoryMaxPage {
 		limit = 200
 	}
-	var exists bool
-	if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM connections WHERE id=$1 AND account_id=$2)`, connectionID, principal.AccountID).Scan(&exists); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load connection: %v", err))
+	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin inventory browse: %v", err))
 		return
 	}
-	if !exists {
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	var completedGeneration, treeGeneration, activeGeneration string
+	var liveRevision, treeRevision int64
+	var scanStartedAt, scanCompletedAt, reportedAt, activeStartedAt, activeReportedAt *time.Time
+	err = tx.QueryRow(r.Context(), `
+		SELECT inventory_generation,inventory_tree_generation,inventory_live_revision,inventory_tree_revision,inventory_scan_started_at,inventory_scan_completed_at,inventory_reported_at,
+		       inventory_in_progress_generation,inventory_in_progress_started_at,inventory_in_progress_reported_at
+		FROM connections WHERE id=$1 AND account_id=$2
+	`, connectionID, principal.AccountID).Scan(&completedGeneration, &treeGeneration, &liveRevision, &treeRevision, &scanStartedAt, &scanCompletedAt, &reportedAt,
+		&activeGeneration, &activeStartedAt, &activeReportedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "connection not found")
 		return
 	}
-	prefix := ""
-	if directory != "" {
-		prefix = directory + "/"
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load connection: %v", err))
+		return
 	}
-	rows, err := s.pool.Query(r.Context(), nasInventoryTreeSQL(prefix, cursor.Kind == 1),
-		connectionID, principal.AccountID, prefix, cursor.Kind, cursor.Name, limit+1)
+	timestampToken := func(value *time.Time) string {
+		if value == nil {
+			return ""
+		}
+		return value.UTC().Format(time.RFC3339Nano)
+	}
+	fresh := scanStartedAt != nil && scanCompletedAt != nil &&
+		time.Since(scanStartedAt.UTC()) <= nasInventoryFreshness && time.Since(scanStartedAt.UTC()) >= -nasInventoryMaxFutureSkew &&
+		time.Since(scanCompletedAt.UTC()) <= nasInventoryFreshness && time.Since(scanCompletedAt.UTC()) >= -nasInventoryMaxFutureSkew
+	if activeReportedAt != nil && time.Since(activeReportedAt.UTC()) > nasInventoryScanProgressTTL {
+		activeGeneration, activeStartedAt, activeReportedAt = "", nil, nil
+	}
+	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration
+	snapshotIdentity := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration, directory}, "|")
+	snapshotState := fmt.Sprintf("%x", sha256.Sum256([]byte(snapshotIdentity)))
+	if r.URL.Query().Get("cursor") != "" && cursor.State != snapshotState {
+		util.WriteError(w, http.StatusConflict, "inventory changed while paging; restart this folder")
+		return
+	}
+	rows, err := tx.Query(r.Context(), nasInventoryTreeSQL,
+		connectionID, principal.AccountID, completedGeneration, directory, cursor.Kind, cursor.Name, limit+1,
+		nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String())
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("browse inventory: %v", err))
 		return
@@ -483,9 +615,9 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		var kind int
 		var name, sha, state, reconciliation string
 		var clipID, recordingID *int64
-		var sizeBytes, descendantFiles, mismatchFiles, nasOnlyFiles int64
+		var sizeBytes, descendantFiles, mismatchFiles, nasOnlyFiles, staleFiles, ambiguousFiles int64
 		var verifiedAt *time.Time
-		if err := rows.Scan(&kind, &name, &clipID, &recordingID, &sizeBytes, &sha, &state, &verifiedAt, &reconciliation, &descendantFiles, &mismatchFiles, &nasOnlyFiles); err != nil {
+		if err := rows.Scan(&kind, &name, &clipID, &recordingID, &sizeBytes, &sha, &state, &verifiedAt, &reconciliation, &descendantFiles, &mismatchFiles, &nasOnlyFiles, &staleFiles, &ambiguousFiles); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan inventory directory: %v", err))
 			return
 		}
@@ -495,7 +627,7 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 			if last.Kind == "directory" {
 				lastKind = 0
 			}
-			nextCursor = encodeNASInventoryTreeCursor(nasInventoryTreeCursor{Kind: lastKind, Name: last.Name})
+			nextCursor = encodeNASInventoryTreeCursor(nasInventoryTreeCursor{Kind: lastKind, Name: last.Name, State: snapshotState})
 			break
 		}
 		entryPath := name
@@ -504,7 +636,8 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		}
 		entry := nasInventoryTreeEntry{Kind: "file", Name: name, RelativePath: entryPath, DescendantFiles: descendantFiles,
 			ClipID: clipID, RecordingID: recordingID, SizeBytes: sizeBytes, SHA256: sha, State: state,
-			VerifiedAt: verifiedAt, Reconciliation: reconciliation, MismatchFiles: mismatchFiles, NASOnlyFiles: nasOnlyFiles}
+			VerifiedAt: verifiedAt, Reconciliation: reconciliation, MismatchFiles: mismatchFiles, NASOnlyFiles: nasOnlyFiles,
+			StaleFiles: staleFiles, AmbiguousFiles: ambiguousFiles}
 		if kind == 0 {
 			entry.Kind = "directory"
 		}
@@ -514,23 +647,40 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate inventory directory: %v", err))
 		return
 	}
-	response := map[string]any{"path": directory, "entries": entries, "next_cursor": nextCursor}
+	rows.Close()
+	response := map[string]any{
+		"path": directory, "entries": entries, "next_cursor": nextCursor,
+		"generation": completedGeneration, "scan_started_at": scanStartedAt, "scan_completed_at": scanCompletedAt,
+		"reported_at": reportedAt, "fresh": fresh, "stale": !fresh,
+		"snapshot_available": snapshotAvailable, "snapshot_consistent": snapshotAvailable && activeGeneration == "" && liveRevision == treeRevision, "in_progress_generation": activeGeneration,
+		"in_progress_started_at": activeStartedAt, "in_progress_reported_at": activeReportedAt,
+	}
 	if directory == "" && r.URL.Query().Get("cursor") == "" {
 		var serverOnly int64
-		if err := s.pool.QueryRow(r.Context(), `
+		if err := tx.QueryRow(r.Context(), `
 			SELECT count(*) FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
 			WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL
 			  AND NOT EXISTS (
 			    SELECT 1 FROM nas_inventory_files i
-			    WHERE i.connection_id=$2 AND i.clip_id=c.id AND i.state='present'
-			      AND i.relative_path=c.display_path AND i.size_bytes=c.size_bytes
-			      AND i.sha256=lower(c.sha256) AND i.verified_at>=now()-$3::interval
-			  )
-		`, principal.AccountID, connectionID, nasInventoryFreshness.String()).Scan(&serverOnly); err != nil {
+				    WHERE i.connection_id=$2 AND i.clip_id=c.id AND i.state='present'
+				      AND i.relative_path=c.display_path AND i.size_bytes=c.size_bytes
+				      AND i.sha256=lower(c.sha256) AND i.verified_at>=now()-$3::interval
+				      AND i.verified_at<=now()+$4::interval
+				      AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other
+				        WHERE other.connection_id=i.connection_id AND other.relative_path=i.relative_path
+				          AND other.clip_id<>i.clip_id AND other.state IN('present','mismatch'))
+				      AND NOT EXISTS (SELECT 1 FROM nas_inventory_unmatched_files unmatched
+				        WHERE unmatched.connection_id=i.connection_id AND unmatched.relative_path=i.relative_path AND unmatched.state='present')
+				  )
+		`, principal.AccountID, connectionID, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String()).Scan(&serverOnly); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count server-only clips: %v", err))
 			return
 		}
 		response["server_only"] = serverOnly
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit inventory browse: %v", err))
+		return
 	}
 	util.WriteJSON(w, http.StatusOK, response)
 }
@@ -807,10 +957,16 @@ func (s *Server) handleAccountClipsReleaseBatch(w http.ResponseWriter, r *http.R
 		if mode == "enforce" {
 			var confirmed bool
 			if err := tx.QueryRow(r.Context(), `
-				SELECT EXISTS(SELECT 1 FROM nas_inventory_files
-				WHERE connection_id=$1 AND clip_id=$2 AND state='present' AND relative_path=$3
-				  AND size_bytes=$4 AND sha256=$5 AND verified_at>=now()-$6::interval)
-			`, connectionID, item.ClipID, path, size, sha, nasInventoryFreshness.String()).Scan(&confirmed); err != nil {
+				SELECT EXISTS(SELECT 1 FROM nas_inventory_files i
+				WHERE i.connection_id=$1 AND i.clip_id=$2 AND i.state='present' AND i.relative_path=$3
+				  AND i.size_bytes=$4 AND i.sha256=$5 AND i.verified_at>=now()-$6::interval
+				  AND i.verified_at<=now()+$7::interval
+				  AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other
+				    WHERE other.connection_id=i.connection_id AND other.relative_path=i.relative_path
+				      AND other.clip_id<>i.clip_id AND other.state IN('present','mismatch'))
+				  AND NOT EXISTS (SELECT 1 FROM nas_inventory_unmatched_files unmatched
+				    WHERE unmatched.connection_id=i.connection_id AND unmatched.relative_path=i.relative_path AND unmatched.state='present'))
+			`, connectionID, item.ClipID, path, size, sha, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String()).Scan(&confirmed); err != nil {
 				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("verify batch clip %d: %v", item.ClipID, err))
 				return
 			}
@@ -867,10 +1023,16 @@ func (s *Server) handleAccountConnectionInventoryMode(w http.ResponseWriter, r *
 			             WHERE i.connection_id=conn.id AND i.clip_id=c.id AND i.state='present'
 			               AND i.relative_path=c.display_path AND i.size_bytes=c.size_bytes
 			               AND i.sha256=lower(c.sha256) AND i.verified_at>=now()-$3::interval
+			               AND i.verified_at<=now()+$4::interval
+			               AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other
+			                 WHERE other.connection_id=i.connection_id AND other.relative_path=i.relative_path
+			                   AND other.clip_id<>i.clip_id AND other.state IN('present','mismatch'))
+			               AND NOT EXISTS (SELECT 1 FROM nas_inventory_unmatched_files unmatched
+			                 WHERE unmatched.connection_id=i.connection_id AND unmatched.relative_path=i.relative_path AND unmatched.state='present')
 			           )
-			       )
+		       )
 			FROM connections conn WHERE conn.id=$1 AND conn.account_id=$2
-		`, connectionID, principal.AccountID, nasInventoryFreshness.String()).Scan(&ready)
+		`, connectionID, principal.AccountID, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String()).Scan(&ready)
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "connection not found")
 			return

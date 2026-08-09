@@ -47,6 +47,7 @@ type Server struct {
 	recordingsHTML          []byte
 	accountHTML             []byte
 	orgSettingsHTML         []byte
+	nasFilesHTML            []byte
 	docsHTML                []byte
 	pricingHTML             []byte
 	adminHTML               []byte
@@ -129,6 +130,10 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	if err != nil {
 		return nil, err
 	}
+	nasFilesHTML, err := loadNASFilesHTML()
+	if err != nil {
+		return nil, err
+	}
 	docsHTML, err := loadDocsHTML()
 	if err != nil {
 		return nil, err
@@ -154,6 +159,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		recordingsHTML:          injectShell(recordingsHTML, "recording"),
 		accountHTML:             injectShell(accountHTML, ""),
 		orgSettingsHTML:         injectShell(orgSettingsHTML, ""),
+		nasFilesHTML:            injectShell(nasFilesHTML, ""),
 		docsHTML:                injectShell(docsHTML, ""),
 		pricingHTML:             injectShell(pricingHTML, ""),
 		adminHTML:               injectShell(adminHTML, ""),
@@ -203,6 +209,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/pricing", s.handlePricingApp)
 	r.Get("/account", s.handleAccountApp)
 	r.Get("/org-settings", s.handleOrgSettingsApp)
+	r.Get("/nas-files", s.handleNASFilesApp)
 	r.Get("/recordings", s.handleRecordingsApp)
 	r.Get("/recordings/new", s.handleRecordingsApp)
 	r.Get("/recordings/{id}", s.handleRecordingsApp)
