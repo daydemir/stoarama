@@ -507,15 +507,19 @@ func TestDetectClipTimestampDriftAndLayoutChangeFindsNativeSeamChange(t *testing
 		INSERT INTO account_billing VALUES (1,true);
 		INSERT INTO recordings VALUES
 		  (20,120,1,'changed','https://e.test/changed','active','continuous'),
-		  (21,121,1,'stable','https://e.test/stable','active','continuous');
+		  (21,121,1,'stable','https://e.test/stable','active','continuous'),
+		  (22,122,1,'native variable fps','https://e.test/variable','active','continuous');
 		INSERT INTO recording_jobs VALUES
 		  (200,20,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
-		  (210,21,'continuous_window',now()-interval '2 hours',now()-interval '1 hour');
+		  (210,21,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
+		  (220,22,'continuous_window',now()-interval '2 hours',now()-interval '1 hour');
 		INSERT INTO recording_clips VALUES
 		  (1,20,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
 		  (2,20,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1920,1080),
 		  (3,21,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
-		  (4,21,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720);
+		  (4,21,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
+		  (5,22,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (6,22,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,24,1280,720);
 	`); err != nil {
 		t.Fatal(err)
 	}
