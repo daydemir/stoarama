@@ -579,8 +579,7 @@ func detectCompletedWindowLayoutChanges(ctx context.Context, pool *pgxpool.Pool)
 		    audio_present IS DISTINCT FROM previous_audio_present OR
 		    (audio_present AND audio_codec IS DISTINCT FROM previous_audio_codec) OR
 		    (video_width>0 AND previous_video_width>0 AND
-		      (video_width<>previous_video_width OR video_height<>previous_video_height)) OR
-		    (actual_fps>0 AND previous_actual_fps>0 AND abs(actual_fps-previous_actual_fps)>0.1)
+		      (video_width<>previous_video_width OR video_height<>previous_video_height))
 		  )
 		)
 		SELECT DISTINCT ON (id)
