@@ -368,9 +368,11 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
-		`Status / Last 12 hours`,
-		`Timeline health`,
-		`${captureHealthGraph(healthBins, timezone)}<div class="cell-sub">Last 12 scheduled hours`,
+		`<th>Recording</th><th>Status / Last 12 hours</th><th>Timeline health</th><th>Schedule</th>`,
+		`<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
+		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
+		`const captureHealthHTML = captureHealth === 'unavailable'`,
+		"? `${captureHealthGraph(healthBins, timezone)}<div class=\"cell-sub\">Last 12 scheduled hours",
 		`recent coverage`,
 		`Largest gap`,
 		`Whole period`,
@@ -378,7 +380,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`continuous timeline · native layout compatible`,
 	} {
 		if !strings.Contains(page, marker) {
-			t.Fatalf("recordings list timeline health missing %q", marker)
+			t.Fatalf("recordings list health-column layout missing %q", marker)
 		}
 	}
 }
