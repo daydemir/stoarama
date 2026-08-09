@@ -158,13 +158,26 @@ func refreshRecordingHealthSummaries(ctx context.Context, pool *pgxpool.Pool, no
 		    SUM(overlap_count)::bigint AS lifetime_overlaps,SUM(overlap_seconds)::double precision AS lifetime_overlap_seconds,
 		    SUM(layout_change_count)::bigint AS lifetime_layout_changes,COUNT(*)::int AS lifetime_windows
 		  FROM recording_window_health GROUP BY recording_id
+		), durable AS (
+		  SELECT aggregates.*,
+		    GREATEST(
+		      COALESCE((SELECT prior.lifetime_expected_window_count FROM recording_health_summaries prior WHERE prior.recording_id=aggregates.recording_id),0),
+		      lifetime_windows + (
+		        SELECT COUNT(*)::int FROM recording_jobs j
+		        LEFT JOIN recording_window_health missing ON missing.recording_id=j.recording_id AND missing.job_id=j.id
+		        WHERE j.recording_id=aggregates.recording_id AND j.kind='continuous_window'
+		          AND j.window_end_at<=$1 AND missing.job_id IS NULL
+		      )
+		    ) AS expected_lifetime_windows
+		  FROM aggregates
 		)
 		INSERT INTO recording_health_summaries (
 		  recording_id,recent_expected_seconds,recent_covered_seconds,recent_coverage_pct,
 		  recent_largest_gap_seconds,recent_gap_count,recent_overlap_count,recent_overlap_seconds,
 		  recent_layout_change_count,recent_window_count,lifetime_expected_seconds,lifetime_covered_seconds,
 		  lifetime_coverage_pct,lifetime_largest_gap_seconds,lifetime_gap_count,lifetime_overlap_count,
-		  lifetime_overlap_seconds,lifetime_layout_change_count,lifetime_window_count,lifetime_complete,calculated_at
+		  lifetime_overlap_seconds,lifetime_layout_change_count,lifetime_window_count,
+		  lifetime_expected_window_count,lifetime_complete,calculated_at
 		)
 		SELECT recording_id,recent_expected,recent_covered,
 		  CASE WHEN recent_expected>0 THEN LEAST(100,100*recent_covered/recent_expected) END,
@@ -172,12 +185,8 @@ func refreshRecordingHealthSummaries(ctx context.Context, pool *pgxpool.Pool, no
 		  lifetime_expected,lifetime_covered,
 		  CASE WHEN lifetime_expected>0 THEN LEAST(100,100*lifetime_covered/lifetime_expected) END,
 		  lifetime_largest_gap,lifetime_gaps,lifetime_overlaps,lifetime_overlap_seconds,lifetime_layout_changes,lifetime_windows,
-		  NOT EXISTS (
-		    SELECT 1 FROM recording_jobs j
-		    LEFT JOIN recording_window_health missing ON missing.recording_id=j.recording_id AND missing.job_id=j.id
-		    WHERE j.recording_id=aggregates.recording_id AND j.kind='continuous_window' AND j.window_end_at<=$1 AND missing.job_id IS NULL
-		  ),$1
-		FROM aggregates
+		  expected_lifetime_windows,lifetime_windows>=expected_lifetime_windows,$1
+		FROM durable
 		ON CONFLICT (recording_id) DO UPDATE SET
 		  recent_expected_seconds=EXCLUDED.recent_expected_seconds,recent_covered_seconds=EXCLUDED.recent_covered_seconds,
 		  recent_coverage_pct=EXCLUDED.recent_coverage_pct,recent_largest_gap_seconds=EXCLUDED.recent_largest_gap_seconds,
@@ -188,6 +197,7 @@ func refreshRecordingHealthSummaries(ctx context.Context, pool *pgxpool.Pool, no
 		  lifetime_largest_gap_seconds=EXCLUDED.lifetime_largest_gap_seconds,lifetime_gap_count=EXCLUDED.lifetime_gap_count,
 		  lifetime_overlap_count=EXCLUDED.lifetime_overlap_count,lifetime_overlap_seconds=EXCLUDED.lifetime_overlap_seconds,
 		  lifetime_layout_change_count=EXCLUDED.lifetime_layout_change_count,lifetime_window_count=EXCLUDED.lifetime_window_count,
+		  lifetime_expected_window_count=GREATEST(recording_health_summaries.lifetime_expected_window_count,EXCLUDED.lifetime_expected_window_count),
 		  lifetime_complete=EXCLUDED.lifetime_complete,calculated_at=EXCLUDED.calculated_at
 	`, now)
 	if err != nil {

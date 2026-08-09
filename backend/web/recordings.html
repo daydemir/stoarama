@@ -3131,10 +3131,10 @@
 	       ${lifetimeCoverage == null ? '' : `<div class="cell-sub">Whole period ${lifetimeCoverage.toFixed(2)}% · ${Number(timeline.lifetime_window_count || 0)} completed window(s)${timeline.lifetime_complete === true ? '' : ' · historical check in progress'}</div>`}
 	       <div class="cell-sub">${lastHTML}</div>`
 	    : '';
-	  const captureHealthHTML = captureHealth === 'unavailable'
-	    ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
-	    : timelineHealthHTML
-	      ? timelineHealthHTML
+	  const captureHealthHTML = timelineHealthHTML
+	    ? timelineHealthHTML
+	    : captureHealth === 'unavailable'
+	      ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
 	    : healthBins.length
 	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, timezone)}<div class="cell-sub">${lastHTML}</div>`
 	      : expected > 0

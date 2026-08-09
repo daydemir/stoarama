@@ -54,7 +54,8 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 		  recent_largest_gap_seconds DOUBLE PRECISION NOT NULL,recent_gap_count BIGINT NOT NULL,recent_overlap_count BIGINT NOT NULL,recent_overlap_seconds DOUBLE PRECISION NOT NULL,
 		  recent_layout_change_count BIGINT NOT NULL,recent_window_count INTEGER NOT NULL,lifetime_expected_seconds BIGINT NOT NULL,lifetime_covered_seconds DOUBLE PRECISION NOT NULL,
 		  lifetime_coverage_pct DOUBLE PRECISION,lifetime_largest_gap_seconds DOUBLE PRECISION NOT NULL,lifetime_gap_count BIGINT NOT NULL,lifetime_overlap_count BIGINT NOT NULL,
-		  lifetime_overlap_seconds DOUBLE PRECISION NOT NULL,lifetime_layout_change_count BIGINT NOT NULL,lifetime_window_count INTEGER NOT NULL,lifetime_complete BOOLEAN NOT NULL,calculated_at TIMESTAMPTZ NOT NULL);
+		  lifetime_overlap_seconds DOUBLE PRECISION NOT NULL,lifetime_layout_change_count BIGINT NOT NULL,lifetime_window_count INTEGER NOT NULL,
+		  lifetime_expected_window_count INTEGER NOT NULL,lifetime_complete BOOLEAN NOT NULL,calculated_at TIMESTAMPTZ NOT NULL);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -85,11 +86,24 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 		t.Fatalf("window coverage=%f gap=%f gaps=%d overlaps=%d layouts=%d clips=%d", coverage, largestGap, gaps, overlaps, layouts, clips)
 	}
 	var recentCoverage, lifetimeCoverage float64
-	var recentWindows, lifetimeWindows int
-	if err := pool.QueryRow(ctx, `SELECT recent_coverage_pct,lifetime_coverage_pct,recent_window_count,lifetime_window_count FROM recording_health_summaries WHERE recording_id=402`).Scan(&recentCoverage, &lifetimeCoverage, &recentWindows, &lifetimeWindows); err != nil {
+	var recentWindows, lifetimeWindows, expectedWindows int
+	var complete bool
+	if err := pool.QueryRow(ctx, `SELECT recent_coverage_pct,lifetime_coverage_pct,recent_window_count,lifetime_window_count,lifetime_expected_window_count,lifetime_complete FROM recording_health_summaries WHERE recording_id=402`).Scan(&recentCoverage, &lifetimeCoverage, &recentWindows, &lifetimeWindows, &expectedWindows, &complete); err != nil {
 		t.Fatal(err)
 	}
-	if recentCoverage != coverage || lifetimeCoverage != coverage || recentWindows != 1 || lifetimeWindows != 1 {
-		t.Fatalf("summary recent=%f lifetime=%f windows=%d/%d", recentCoverage, lifetimeCoverage, recentWindows, lifetimeWindows)
+	if recentCoverage != coverage || lifetimeCoverage != coverage || recentWindows != 1 || lifetimeWindows != 1 || expectedWindows != 1 || !complete {
+		t.Fatalf("summary recent=%f lifetime=%f windows=%d/%d expected=%d complete=%t", recentCoverage, lifetimeCoverage, recentWindows, lifetimeWindows, expectedWindows, complete)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := refreshRecordingHealthSummaries(ctx, pool, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT lifetime_expected_window_count,lifetime_complete FROM recording_health_summaries WHERE recording_id=402`).Scan(&expectedWindows, &complete); err != nil {
+		t.Fatal(err)
+	}
+	if expectedWindows != 1 || !complete {
+		t.Fatalf("pruned job regressed durable watermark expected=%d complete=%t", expectedWindows, complete)
 	}
 }
