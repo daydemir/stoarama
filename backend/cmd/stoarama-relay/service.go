@@ -189,7 +189,10 @@ func bootstrapLaunchd(domain, plistPath, instanceID string, baselineSuccesses ui
 		}
 		return cause
 	}
-	if out, err := runLaunchctlBounded("kickstart", "-k", domain+"/"+launchdLabel); err != nil {
+	// The canonical plist is RunAtLoad, so bootstrap normally starts the
+	// candidate. A non-destructive kickstart also covers a delayed start without
+	// killing that fresh process or racing launchd's registration transition.
+	if out, err := runLaunchctlBounded("kickstart", domain+"/"+launchdLabel); err != nil {
 		return cleanupLaunchdFailure(domain, fmt.Errorf("launchctl kickstart %s: %w (%s)", domain, err, strings.TrimSpace(string(out))))
 	}
 	if !waitLaunchdReady(domain, instanceID, startedAt, baselineSuccesses, launchdReadinessTimeout) {
