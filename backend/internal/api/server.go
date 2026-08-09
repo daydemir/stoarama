@@ -974,6 +974,11 @@ func (s *Server) reconcileStreamRecordingAssignments(
 		}); err != nil {
 			return nil, 0, fmt.Errorf("insert stream source revision: %w", err)
 		}
+		if updated.CaptureFamily == capture.CaptureFamilyContinuousVideo {
+			if _, err := propagateStreamSourceToActiveRelayRecordingsTx(ctx, tx, streamID, updated.SourceURL); err != nil {
+				return nil, 0, fmt.Errorf("propagate stream source to active relay recordings: %w", err)
+			}
+		}
 	}
 	if existed {
 		issues := buildRecordingAssignmentAuditIssues(updated, assignment, nil)
@@ -992,6 +997,29 @@ func (s *Server) reconcileStreamRecordingAssignments(
 		return result, status, nil
 	}
 	return nil, 0, nil
+}
+
+// propagateStreamSourceToActiveRelayRecordingsTx updates the source snapshot used
+// by future leases without disturbing an in-flight job. Relay recordings resolve
+// the raw source locally, so source_kind remains auto. Cloud recordings are excluded:
+// changing their source requires the normal server-side validation/probe workflow.
+func propagateStreamSourceToActiveRelayRecordingsTx(ctx context.Context, tx pgx.Tx, streamID int64, sourceURL string) (int64, error) {
+	sourceURL = strings.TrimSpace(sourceURL)
+	if sourceURL == "" {
+		return 0, nil
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE recordings
+		SET stream_url=$2, source_kind='auto', updated_at=now()
+		WHERE stream_id=$1
+		  AND status='active'
+		  AND capture_via='relay'
+		  AND (stream_url IS DISTINCT FROM $2 OR source_kind IS DISTINCT FROM 'auto')
+	`, streamID, sourceURL)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (s *Server) handleStreamsList(w http.ResponseWriter, r *http.Request) {
