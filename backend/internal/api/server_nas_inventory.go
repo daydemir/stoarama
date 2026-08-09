@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
@@ -594,7 +595,8 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		activeGeneration, activeStartedAt, activeReportedAt = "", nil, nil
 	}
 	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration
-	snapshotState := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration}, "|")
+	snapshotIdentity := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration, directory}, "|")
+	snapshotState := fmt.Sprintf("%x", sha256.Sum256([]byte(snapshotIdentity)))
 	if r.URL.Query().Get("cursor") != "" && cursor.State != snapshotState {
 		util.WriteError(w, http.StatusConflict, "inventory changed while paging; restart this folder")
 		return

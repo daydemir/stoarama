@@ -189,6 +189,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if cursor == "" {
 		t.Fatal("root first page omitted cursor")
 	}
+	if status, _ := call("Africa", cursor, 2); status != http.StatusConflict {
+		t.Fatalf("cursor reused across directories status=%d, want 409", status)
+	}
 	status, second := call("", cursor, 2)
 	if status != http.StatusOK {
 		t.Fatalf("root second page status=%d", status)
@@ -301,6 +304,34 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 		if len(entries) != 1 || entries[0].(map[string]any)["name"] != "literal.mp4" {
 			t.Fatalf("escaped prefix %q status=%d entries=%v", path, status, entries)
 		}
+	}
+	longDirectory := strings.Repeat("d", 600)
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at,tree_parent_path,tree_name) VALUES
+		($1,$2||'/a.mp4',1,$3,'present',now(),$2,'a.mp4'),($1,$2||'/b.mp4',1,$3,'present',now(),$2,'b.mp4')`, connectionID, longDirectory, sha); err != nil {
+		t.Fatal(err)
+	}
+	refresh("tree-three")
+	status, longFirst := call(longDirectory, "", 1)
+	longCursor, _ := longFirst["next_cursor"].(string)
+	if status != http.StatusOK || longCursor == "" {
+		t.Fatalf("long directory first page status=%d body=%v", status, longFirst)
+	}
+	if status, body := call(longDirectory, longCursor, 1); status != http.StatusOK || len(body["entries"].([]any)) != 1 {
+		t.Fatalf("long directory continuation status=%d body=%v", status, body)
+	}
+	maxGeneration := strings.Repeat("g", nasInventoryMaxGeneration)
+	refresh(maxGeneration)
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation=$2,inventory_in_progress_started_at=now(),inventory_in_progress_reported_at=now() WHERE id=$1`,
+		connectionID, strings.Repeat("a", nasInventoryMaxGeneration)); err != nil {
+		t.Fatal(err)
+	}
+	status, maxStateFirst := call(longDirectory, "", 1)
+	maxStateCursor, _ := maxStateFirst["next_cursor"].(string)
+	if status != http.StatusOK || maxStateCursor == "" {
+		t.Fatalf("maximum metadata first page status=%d body=%v", status, maxStateFirst)
+	}
+	if status, body := call(longDirectory, maxStateCursor, 1); status != http.StatusOK || len(body["entries"].([]any)) != 1 {
+		t.Fatalf("maximum metadata continuation status=%d body=%v", status, body)
 	}
 }
 
