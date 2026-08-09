@@ -24,6 +24,86 @@ func fakeLaunchctl(t *testing.T, script string) string {
 	return logPath
 }
 
+func TestRemoveLaunchdLabelWaitsForAsynchronousAbsence(t *testing.T) {
+	logPath := fakeLaunchctl(t, `
+echo "$*" >> "$LAUNCHCTL_TEST_LOG"
+if [ "$1" = bootout ]; then exit 0; fi
+if [ "$1" = print ] && [ ! -f "$HOME/first-print" ]; then touch "$HOME/first-print"; exit 0; fi
+if [ "$1" = print ]; then exit 113; fi
+exit 0
+`)
+	if err := removeLaunchdLabel("gui/501", launchdLabel); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(calls), "print gui/501/"+launchdLabel); got != 2 {
+		t.Fatalf("print calls=%d want 2:\n%s", got, calls)
+	}
+}
+
+func TestLaunchdProbeRejectsUnexpectedFailure(t *testing.T) {
+	fakeLaunchctl(t, `if [ "$1" = print ]; then exit 77; fi; exit 0`)
+	if _, err := loadedLaunchdDomains(501); err == nil {
+		t.Fatal("unexpected launchctl failure was misclassified as service absence")
+	}
+}
+
+func TestRemovalTimeoutRestartsAndVerifiesPriorRelay(t *testing.T) {
+	oldTimeout := launchdRemovalTimeout
+	launchdRemovalTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { launchdRemovalTimeout = oldTimeout })
+	fakeLaunchctl(t, `
+if [ "$1" = bootout ]; then exit 0; fi
+if [ "$1" = print ]; then echo 'state = running'; exit 0; fi
+if [ "$1" = kickstart ]; then
+  mkdir -p "$HOME/.stoarama"
+  echo '{"service_instance_id":"prior","heartbeat_success_count":2,"started_at":"2099-01-01T00:00:00Z"}' > "$HOME/.stoarama/relay-recovery.json"
+  exit 0
+fi
+exit 1
+`)
+	prior := []byte(`<key>STOARAMA_SERVICE_INSTANCE_ID</key><string>prior</string>`)
+	err := removeLaunchdLabel("gui/501", launchdLabel)
+	if err == nil {
+		t.Fatal("persistent loaded job accepted as absent")
+	}
+	err = recoverPriorAfterRemovalFailure("gui/501", filepath.Join(t.TempDir(), "relay.plist"), prior, 0o644, 0, err)
+	if err == nil || !strings.Contains(err.Error(), "restarted and verified") {
+		t.Fatalf("recovery error=%v", err)
+	}
+}
+
+func TestRemovalRecoveryBootstrapsPriorWhenJobVanishesBeforeKickstart(t *testing.T) {
+	fakeLaunchctl(t, `
+if [ "$1" = print ]; then
+  if [ -f "$HOME/bootstrap-complete" ]; then echo 'state = running'; exit 0; fi
+  if [ -f "$HOME/kickstart-raced" ]; then exit 113; fi
+  echo 'state = running'; exit 0
+fi
+if [ "$1" = kickstart ] && [ ! -f "$HOME/bootstrap-complete" ]; then touch "$HOME/kickstart-raced"; exit 7; fi
+if [ "$1" = bootstrap ]; then touch "$HOME/bootstrap-complete"; exit 0; fi
+if [ "$1" = kickstart ]; then
+  mkdir -p "$HOME/.stoarama"
+  echo '{"service_instance_id":"prior","heartbeat_success_count":2,"started_at":"2099-01-01T00:00:00Z"}' > "$HOME/.stoarama/relay-recovery.json"
+  exit 0
+fi
+exit 1
+`)
+	path := filepath.Join(t.TempDir(), "relay.plist")
+	prior := []byte(`<key>STOARAMA_SERVICE_INSTANCE_ID</key><string>prior</string>`)
+	err := recoverPriorAfterRemovalFailure("gui/501", path, prior, 0o644, 0, fmt.Errorf("removal unconfirmed"))
+	if err == nil || !strings.Contains(err.Error(), "prior service was restored and verified") {
+		t.Fatalf("recovery error=%v", err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil || string(got) != string(prior) {
+		t.Fatalf("prior plist=%q err=%v", got, readErr)
+	}
+}
+
 func TestInstallLaunchdReplacesOwnedLoadedService(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd install is macOS-only")
@@ -31,7 +111,7 @@ func TestInstallLaunchdReplacesOwnedLoadedService(t *testing.T) {
 	logPath := fakeLaunchctl(t, `
 echo "$*" >> "$LAUNCHCTL_TEST_LOG"
 marker="$HOME/loaded"
-if [ "$1" = print ]; then case "$2" in gui/*) [ -f "$marker" ] && echo 'state = running' && exit 0;; esac; exit 1; fi
+if [ "$1" = print ]; then case "$2" in gui/*) [ -f "$marker" ] && echo 'state = running' && exit 0;; esac; exit 113; fi
 if [ "$1" = bootout ]; then rm -f "$marker"; exit 0; fi
 if [ "$1" = bootstrap ]; then touch "$marker"; exit 0; fi
 if [ "$1" = kickstart ]; then
@@ -70,7 +150,7 @@ func TestInstallLaunchdRestartsPriorServiceAfterCandidateFailure(t *testing.T) {
 	}
 	fakeLaunchctl(t, `
 marker="$HOME/loaded"
-if [ "$1" = print ]; then case "$2" in gui/*) [ -f "$marker" ] && echo 'state = running' && exit 0;; esac; exit 1; fi
+if [ "$1" = print ]; then case "$2" in gui/*) [ -f "$marker" ] && echo 'state = running' && exit 0;; esac; exit 113; fi
 if [ "$1" = bootout ]; then rm -f "$marker"; exit 0; fi
 if [ "$1" = bootstrap ]; then touch "$marker"; exit 0; fi
 if [ "$1" = kickstart ]; then
@@ -250,7 +330,7 @@ func TestCleanupStaleHandoffFilesOnlyRemovesOwnedArtifacts(t *testing.T) {
 }
 
 func TestLegacyHandoffPlistEscapesSpecialCharacterPaths(t *testing.T) {
-	fakeLaunchctl(t, `if [ "$1" = print ]; then exit 1; fi; exit 0`)
+	fakeLaunchctl(t, `if [ "$1" = print ]; then exit 113; fi; exit 0`)
 	root := filepath.Join(t.TempDir(), "home&special")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
@@ -331,7 +411,7 @@ func TestRestartServiceUsesOnlyLoadedUserDomain(t *testing.T) {
 	logPath := fakeLaunchctl(t, `
 echo "$*" >> "$LAUNCHCTL_TEST_LOG"
 if [ "$1" = print ] && [ "$2" = "user/`+fmt.Sprint(uid)+`/com.stoarama.relay" ]; then exit 0; fi
-if [ "$1" = print ]; then exit 1; fi
+if [ "$1" = print ]; then exit 113; fi
 exit 0
 `)
 	writeTestLaunchdPlist(t, "existing")
@@ -348,7 +428,7 @@ func TestRestartSchedulesLegacyHandoffWithoutMutatingCachedJob(t *testing.T) {
 	logPath := fakeLaunchctl(t, `
 echo "$*" >> "$LAUNCHCTL_TEST_LOG"
 if [ "$1" = print ] && [ "$2" = "gui/501/com.stoarama.relay" ]; then exit 0; fi
-if [ "$1" = print ]; then exit 1; fi
+if [ "$1" = print ]; then exit 113; fi
 exit 0
 `)
 	path, prior := writeTestLaunchdPlist(t, "")
@@ -371,7 +451,7 @@ exit 0
 func TestRestartLeavesLegacyPlistWhenHandoffCannotStart(t *testing.T) {
 	fakeLaunchctl(t, `
 if [ "$1" = print ] && [ "$2" = "gui/501/com.stoarama.relay" ]; then exit 0; fi
-if [ "$1" = print ]; then exit 1; fi
+if [ "$1" = print ]; then exit 113; fi
 if [ "$1" = kickstart ]; then exit 7; fi
 exit 0
 `)
@@ -392,7 +472,7 @@ func TestHandoffBootsOutCachedJobBeforeApplyingCandidate(t *testing.T) {
 	logPath := fakeLaunchctl(t, `
 echo "$*" >> "$LAUNCHCTL_TEST_LOG"
 marker="$HOME/loaded"
-if [ "$1" = print ]; then [ -f "$marker" ] && echo 'state = running' && exit 0; exit 1; fi
+if [ "$1" = print ]; then [ -f "$marker" ] && echo 'state = running' && exit 0; exit 113; fi
 if [ "$1" = bootout ]; then rm -f "$marker"; exit 0; fi
 if [ "$1" = bootstrap ]; then
   touch "$marker"

@@ -56,7 +56,10 @@ func TestRelayGroupChangeAllowed(t *testing.T) {
 func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
 	for _, want := range []string{
 		"n.relay_group_id IS NULL",
-		"j.scheduled_for <= now()-interval '3 seconds'",
+		"j.relay_fairness_started_at <= now()-interval '3 seconds'",
+		"peer_group.id<>n.relay_group_id",
+		"peer_group_node.last_heartbeat_at>=now()-interval '120 seconds'",
+		"peer_group_jobs.lease_expires_at>now()",
 		"peer.relay_group_id=n.relay_group_id",
 		"peer.last_heartbeat_at >= now()-interval '120 seconds'",
 		"pj.lease_owner='node:'||peer.id::text",
@@ -104,20 +107,22 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	defer pool.Close()
 
 	if _, err := pool.Exec(ctx, `
+		CREATE TABLE accounts (id BIGINT PRIMARY KEY);
 		CREATE TABLE relay_groups (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, max_streams INT NOT NULL);
 		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ, relay_max_streams INT NOT NULL, relay_group_id BIGINT);
 		CREATE TABLE streams (id BIGINT PRIMARY KEY, provider TEXT, source_page_url TEXT);
 		CREATE TABLE storage_destinations (id BIGINT PRIMARY KEY);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT);
-		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
+		INSERT INTO accounts VALUES (47);
 		INSERT INTO relay_groups VALUES (1, 47, 1);
 		INSERT INTO nodes VALUES (1, 47, 'relay', 'active', now(), 6, 1), (2, 47, 'relay', 'active', now(), 6, 1);
 		INSERT INTO storage_destinations VALUES (1);
 		INSERT INTO recordings VALUES
 		  (1, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/1.m3u8', NULL, 1, NULL),
 		  (2, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/2.m3u8', NULL, 1, NULL);
-		INSERT INTO recording_jobs VALUES
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
 		  (1, 1, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL),
 		  (2, 2, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL);
 	`); err != nil {
@@ -170,7 +175,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		  (10, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/10.m3u8', NULL, 1, NULL),
 		  (11, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/11.m3u8', NULL, 1, NULL),
 		  (12, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/12.m3u8', NULL, 1, NULL);
-		INSERT INTO recording_jobs VALUES
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
 		  (10, 10, 'pending', now()-interval '1 second', 'continuous_window', now(), 60, NULL, NULL, 0, now(), now()+interval '1 hour'),
 		  (11, 11, 'pending', now()-interval '1 second', 'continuous_window', now(), 60, NULL, NULL, 0, now(), now()+interval '1 hour'),
 		  (12, 12, 'pending', now()-interval '1 second', 'continuous_window', now(), 60, NULL, NULL, 0, now(), now()+interval '1 hour');
@@ -203,7 +208,21 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	if node1Leases != 1 || node2Leases != 1 {
 		t.Fatalf("balanced leases node1=%d node2=%d, want 1/1", node1Leases, node2Leases)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET scheduled_for=now()-interval '4 seconds' WHERE id=12`); err != nil {
+	if err := lease(1); err != nil {
+		t.Fatalf("tie permits either healthy peer: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings VALUES
+		  (13,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/13.m3u8',NULL,1,NULL);
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
+		  (13,13,'pending',now()-interval '1 hour','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("nonpolling peer must receive bounded first opportunity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET relay_fairness_started_at=now()-interval '4 seconds' WHERE id=13`); err != nil {
 		t.Fatal(err)
 	}
 	if err := lease(1); err != nil {
@@ -211,11 +230,50 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_groups VALUES (10,47,10);
+		INSERT INTO nodes VALUES (15,47,'relay','active',now(),6,10);
+		INSERT INTO recordings VALUES
+		  (20,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/20.m3u8',NULL,1,NULL),
+		  (21,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/21.m3u8',NULL,1,NULL),
+		  (22,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/22.m3u8',NULL,1,NULL),
+		  (23,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/23.m3u8',NULL,1,NULL);
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
+		  (20,20,'pending',now()-interval '1 hour','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour'),
+		  (21,21,'pending',now()-interval '1 hour','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour'),
+		  (22,22,'pending',now()-interval '1 hour','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour'),
+		  (23,23,'pending',now()-interval '1 hour','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("busier internet group lease err=%v, want pgx.ErrNoRows", err)
+	}
+	if err := lease(15); err != nil {
+		t.Fatalf("least-loaded internet group lease: %v", err)
+	}
+	for range 3 {
+		if err := lease(15); err != nil {
+			t.Fatalf("least-loaded internet group catch-up lease: %v", err)
+		}
+	}
+	var group1Leases, group10Leases int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER(WHERE n.relay_group_id=1),count(*) FILTER(WHERE n.relay_group_id=10)
+		FROM recording_jobs j JOIN nodes n ON j.lease_owner='node:'||n.id::text
+		WHERE j.status='leased' AND j.lease_expires_at>now()
+	`).Scan(&group1Leases, &group10Leases); err != nil {
+		t.Fatal(err)
+	}
+	if group1Leases != group10Leases {
+		t.Fatalf("overdue batch group loads=%d/%d want equal", group1Leases, group10Leases)
+	}
+
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO nodes VALUES (3, 47, 'relay', 'active', now(), 1, NULL), (4, 47, 'relay', 'active', now(), 1, NULL);
 		INSERT INTO recordings VALUES
 		  (3, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/3.m3u8', NULL, 1, NULL),
 		  (4, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/4.m3u8', NULL, 1, NULL);
-		INSERT INTO recording_jobs VALUES
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
 		  (3, 3, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL),
 		  (4, 4, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL);
 	`); err != nil {
@@ -266,7 +324,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		  (6, 47, 'relay', 'active', now(), 1, 1);
 		INSERT INTO recordings VALUES
 		  (6, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/6.m3u8', NULL, 1, NULL);
-		INSERT INTO recording_jobs VALUES
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
 		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), NULL),
 		  (6, 6, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL);
 	`); err != nil {

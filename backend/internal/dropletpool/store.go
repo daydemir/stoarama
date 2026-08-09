@@ -443,7 +443,8 @@ func (s *Store) HasInflightJob(ctx context.Context, name string) (bool, error) {
 func (s *Store) ReclaimExpiredLeases(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE recording_jobs
-		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, lease_token=NULL, updated_at=now()
+		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, lease_token=NULL,
+		    relay_fairness_started_at=NULL, updated_at=now()
 		WHERE status='leased' AND lease_expires_at < now()
 	`); err != nil {
 		return fmt.Errorf("reclaim expired leases: %w", err)
