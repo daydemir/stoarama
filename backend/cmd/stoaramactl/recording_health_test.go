@@ -248,6 +248,33 @@ func TestDiagTextDropsBlanks(t *testing.T) {
 	}
 }
 
+func TestContinuousSilenceDetailShowsMediaLagNotJustIngestActivity(t *testing.T) {
+	winOpen := time.Date(2026, 8, 9, 4, 39, 0, 0, time.UTC)
+	mediaEnd := time.Date(2026, 8, 9, 6, 48, 0, 0, time.UTC)
+	ingestedAt := time.Date(2026, 8, 9, 7, 44, 30, 0, time.UTC)
+	lastClipAt := ingestedAt
+	since, diag := continuousSilenceDetail(winOpen, &mediaEnd, &ingestedAt, &lastClipAt, 56*60+30, "")
+	for _, want := range []string{"window opened 2026-08-09T04:39:00Z", "latest media ended 2026-08-09T06:48:00Z", "latest ingest 2026-08-09T07:44:30Z"} {
+		if !strings.Contains(since, want) {
+			t.Fatalf("since=%q missing %q", since, want)
+		}
+	}
+	if diag != "media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
+		t.Fatalf("diag=%q", diag)
+	}
+}
+
+func TestContinuousSilenceDetailHandlesNoMedia(t *testing.T) {
+	winOpen := time.Date(2026, 8, 9, 6, 0, 0, 0, time.UTC)
+	since, diag := continuousSilenceDetail(winOpen, nil, nil, nil, 0, "source returned 404")
+	if !strings.Contains(since, "latest media ended never, latest ingest never") {
+		t.Fatalf("since=%q", since)
+	}
+	if strings.Contains(diag, "media_behind") || diag != "recording_last_clip=never last_error=source returned 404" {
+		t.Fatalf("diag=%q", diag)
+	}
+}
+
 func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
 	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
 	close := open.Add(10 * time.Minute)

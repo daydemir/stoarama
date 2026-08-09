@@ -430,6 +430,16 @@ func humanSince(t *time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
+func continuousSilenceDetail(winOpen time.Time, latestMediaEnd, latestIngestedAt, lastClipAt *time.Time, mediaLagSec int64, lastErr string) (string, string) {
+	mediaLag := ""
+	if latestMediaEnd != nil {
+		mediaLag = (time.Duration(mediaLagSec) * time.Second).Round(time.Second).String()
+	}
+	return fmt.Sprintf("window opened %s, latest media ended %s, latest ingest %s",
+			winOpen.UTC().Format(time.RFC3339), humanSince(latestMediaEnd), humanSince(latestIngestedAt)),
+		diagText("media_behind", mediaLag, "recording_last_clip", humanSince(lastClipAt), "last_error", lastErr)
+}
+
 type stitchWindow struct {
 	incidentBase healthIncident
 	open         time.Time
@@ -1028,8 +1038,13 @@ func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshn
 		  WHERE r.status='active' AND r.mode='continuous' AND b.has_payment_method=true
 		    AND now()>=r.start_at AND now()<COALESCE(r.end_at,'infinity'::timestamptz))
 		SELECT c.id,c.stream_id,c.account_id,c.name,c.stream_url,c.win_open,c.win_close,c.last_clip_at,c.last_error_text,
-		       acc.name, acc.email
+		       acc.name,acc.email,media.latest_media_end,media.latest_ingested_at,
+		       COALESCE(EXTRACT(EPOCH FROM (now()-media.latest_media_end))::bigint,0)
 		FROM cont c JOIN accounts acc ON acc.id=c.account_id
+		LEFT JOIN LATERAL (
+		  SELECT max(cl.clip_end_at) AS latest_media_end,max(cl.created_at) AS latest_ingested_at
+		  FROM recording_clips cl WHERE cl.recording_id=c.id AND cl.clip_start_at>=c.win_open
+		) media ON true
 		WHERE now() >= c.win_open + make_interval(mins=>$1) AND now() < c.win_close
 		  AND NOT EXISTS (SELECT 1 FROM recording_clips cl WHERE cl.recording_id=c.id AND cl.clip_start_at >= now()-make_interval(mins=>$1))
 	`, freshnessMin)
@@ -1045,16 +1060,21 @@ func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshn
 			orgEmail, lastErr        string
 			winOpen, winClose        time.Time
 			lastClipAt               *time.Time
+			latestMediaEnd           *time.Time
+			latestIngestedAt         *time.Time
+			mediaLagSec              int64
 		)
-		if err := rows.Scan(&id, &streamID, &accountID, &name, &streamURL, &winOpen, &winClose, &lastClipAt, &lastErr, &orgName, &orgEmail); err != nil {
+		if err := rows.Scan(&id, &streamID, &accountID, &name, &streamURL, &winOpen, &winClose, &lastClipAt, &lastErr,
+			&orgName, &orgEmail, &latestMediaEnd, &latestIngestedAt, &mediaLagSec); err != nil {
 			log.Fatalf("scan continuous_silent_death: %v", err)
 		}
+		sinceText, diag := continuousSilenceDetail(winOpen, latestMediaEnd, latestIngestedAt, lastClipAt, mediaLagSec, lastErr)
 		out = append(out, healthIncident{
 			RecordingID: id, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,
 			Signal: signalContinuousSilentDeath, Severity: healthSignalSeverity[signalContinuousSilentDeath],
-			SinceText: fmt.Sprintf("window opened %s, last clip %s", winOpen.UTC().Format(time.RFC3339), humanSince(lastClipAt)),
-			Diag:      diagText("last_error", lastErr),
+			SinceText: sinceText,
+			Diag:      diag,
 		})
 	}
 	if err := rows.Err(); err != nil {
