@@ -632,6 +632,7 @@ func testSchedulerPool(t *testing.T) (*pgxpool.Pool, func()) {
 			idempotency_key TEXT NOT NULL UNIQUE,
 			kind TEXT NOT NULL DEFAULT 'clip',
 			window_end_at TIMESTAMPTZ,
+			relay_fairness_started_at TIMESTAMPTZ,
 			completed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
