@@ -509,7 +509,8 @@ const nasInventoryTreeSQL = `
 		SELECT 0 AS kind_sort,d.name,NULL::bigint AS clip_id,NULL::bigint AS recording_id,d.size_bytes,
 		       ''::text AS sha256,''::text AS state,NULL::timestamptz AS verified_at,''::text AS reconciliation,
 		       d.descendant_files,d.mismatch_files,d.nas_only_files,
-		       CASE WHEN $10::boolean THEN d.stale_files ELSE d.descendant_files END,d.ambiguous_files
+		       CASE WHEN $10::boolean THEN d.stale_files ELSE d.descendant_files END AS stale_files,
+		       d.ambiguous_files AS ambiguous_files
 		FROM nas_inventory_tree_directories d
 		WHERE d.connection_id=$1 AND d.generation=$3 AND d.parent_path=$4
 		  AND (0>$5::int OR (0=$5::int AND d.name>$6))
