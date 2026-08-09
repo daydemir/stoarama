@@ -36,6 +36,9 @@ type nasInventorySummary struct {
 	InProgressGeneration string           `json:"in_progress_generation"`
 	InProgressStartedAt  *time.Time       `json:"in_progress_started_at"`
 	InProgressReportedAt *time.Time       `json:"in_progress_reported_at"`
+	ScanPassStartedAt    *time.Time       `json:"scan_pass_started_at"`
+	ScanRowsVisited      int64            `json:"scan_rows_visited"`
+	ScanRowsSkipped      int64            `json:"scan_rows_skipped"`
 	SnapshotAvailable    bool             `json:"snapshot_available"`
 	SnapshotConsistent   bool             `json:"snapshot_consistent"`
 	Clips                int64            `json:"clips"`
@@ -93,6 +96,7 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 		SELECT c.id,c.label,c.inventory_mode,c.inventory_generation,c.inventory_tree_generation,
 		       c.inventory_live_revision,c.inventory_tree_revision,c.inventory_scan_started_at,c.inventory_scan_completed_at,c.inventory_reported_at,
 		       c.inventory_in_progress_generation,c.inventory_in_progress_started_at,c.inventory_in_progress_reported_at,
+		       c.inventory_scan_pass_started_at,c.inventory_scan_rows_visited,c.inventory_scan_rows_skipped,
 		       c.inventory_clips,c.inventory_bytes,c.inventory_mismatches,c.inventory_unmatched,
 		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
 		        WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
@@ -112,6 +116,7 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	`, opts.connectionID).Scan(&summary.ConnectionID, &summary.Label, &summary.Mode, &summary.Generation, &summary.TreeGeneration,
 		&summary.LiveRevision, &summary.TreeRevision, &summary.ScanStartedAt, &summary.ScanCompletedAt, &summary.ReportedAt,
 		&summary.InProgressGeneration, &summary.InProgressStartedAt, &summary.InProgressReportedAt,
+		&summary.ScanPassStartedAt, &summary.ScanRowsVisited, &summary.ScanRowsSkipped,
 		&summary.Clips, &summary.Bytes, &summary.Mismatches, &summary.Unmatched, &summary.ServerOnly,
 		&summary.StorageTotalBytes, &summary.StorageFreeBytes, &summary.StorageReportedAt,
 		&summary.LastBatchClips, &summary.LastBatchBytes, &summary.LastBatchDurationMS, &summary.LastBatchWorkers,
@@ -188,7 +193,7 @@ func writeNASInventoryReport(out io.Writer, summary nasInventorySummary, asJSON 
 		enc.SetIndent("", "  ")
 		return enc.Encode(summary)
 	}
-	if _, err := fmt.Fprintf(out, "connection=%d label=%q mode=%s generation=%s tree_generation=%s revisions=%d/%d snapshot_available=%t snapshot_consistent=%t scan_started=%v scan_completed=%v reported=%v in_progress=%s in_progress_started=%v in_progress_reported=%v clips=%d bytes=%d mismatches=%d unmatched=%d server_only=%d client_version=%s\n", summary.ConnectionID, summary.Label, summary.Mode, summary.Generation, summary.TreeGeneration, summary.LiveRevision, summary.TreeRevision, summary.SnapshotAvailable, summary.SnapshotConsistent, summary.ScanStartedAt, summary.ScanCompletedAt, summary.ReportedAt, summary.InProgressGeneration, summary.InProgressStartedAt, summary.InProgressReportedAt, summary.Clips, summary.Bytes, summary.Mismatches, summary.Unmatched, summary.ServerOnly, summary.ClientVersion); err != nil {
+	if _, err := fmt.Fprintf(out, "connection=%d label=%q mode=%s generation=%s tree_generation=%s revisions=%d/%d snapshot_available=%t snapshot_consistent=%t scan_started=%v scan_completed=%v reported=%v in_progress=%s in_progress_started=%v in_progress_reported=%v pass_started=%v rows_visited=%d rows_skipped=%d clips=%d bytes=%d mismatches=%d unmatched=%d server_only=%d client_version=%s\n", summary.ConnectionID, summary.Label, summary.Mode, summary.Generation, summary.TreeGeneration, summary.LiveRevision, summary.TreeRevision, summary.SnapshotAvailable, summary.SnapshotConsistent, summary.ScanStartedAt, summary.ScanCompletedAt, summary.ReportedAt, summary.InProgressGeneration, summary.InProgressStartedAt, summary.InProgressReportedAt, summary.ScanPassStartedAt, summary.ScanRowsVisited, summary.ScanRowsSkipped, summary.Clips, summary.Bytes, summary.Mismatches, summary.Unmatched, summary.ServerOnly, summary.ClientVersion); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(out, "storage_total=%s storage_free=%s storage_reported=%v last_batch_clips=%d last_batch_bytes=%d last_batch_duration_ms=%d workers=%d retries=%d failures=%d completed=%v\n", optionalInt64Text(summary.StorageTotalBytes), optionalInt64Text(summary.StorageFreeBytes), summary.StorageReportedAt, summary.LastBatchClips, summary.LastBatchBytes, summary.LastBatchDurationMS, summary.LastBatchWorkers, summary.LastBatchRetries, summary.LastBatchFailures, summary.LastBatchCompletedAt); err != nil {
