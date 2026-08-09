@@ -166,16 +166,14 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 		rec := httptest.NewRecorder()
 		s.handleAccountConnectionInventoryTree(rec, req)
 		var body map[string]any
-		if rec.Code == http.StatusOK {
-			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-				t.Fatal(err)
-			}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
 		}
 		return rec.Code, body
 	}
 	status, first := call("", "", 2)
 	if status != http.StatusOK {
-		t.Fatalf("root status=%d", status)
+		t.Fatalf("root status=%d body=%v", status, first)
 	}
 	firstEntries := first["entries"].([]any)
 	if len(firstEntries) != 2 || firstEntries[0].(map[string]any)["name"] != "Africa" || firstEntries[1].(map[string]any)["name"] != "Europe" {
