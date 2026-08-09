@@ -182,8 +182,8 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if firstEntries[1].(map[string]any)["stale_files"] != float64(1) {
 		t.Fatalf("Europe directory omitted stale descendant: %v", firstEntries[1])
 	}
-	if first["server_only"] != float64(1) {
-		t.Fatalf("root server_only=%v, want mismatched clip counted as unsafe", first["server_only"])
+	if first["server_only"] != float64(4) {
+		t.Fatalf("root server_only=%v, want mismatch, stale, and ambiguous clips counted as unsafe", first["server_only"])
 	}
 	cursor, _ := first["next_cursor"].(string)
 	if cursor == "" {
