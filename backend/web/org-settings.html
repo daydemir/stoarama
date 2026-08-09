@@ -1053,7 +1053,7 @@
         return;
       }
       relayGroupList.innerHTML = groups.map((g) => `<div class="rec-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-        <div><b>${escapeHTML(g.name)}</b><div class="sub">${Number(g.live_leases || 0)} recording now / ${Number(g.max_streams)} group limit &middot; ${Array.isArray(g.node_ids) ? g.node_ids.length : 0} computer${Array.isArray(g.node_ids) && g.node_ids.length === 1 ? '' : 's'}</div></div>
+        <div><b>${escapeHTML(g.name)}</b><div class="sub">${Number(g.live_leases || 0)} recording now / ${Number(g.max_streams)} group limit &middot; ~${Number(g.estimated_bandwidth_mbps || 0).toFixed(1)} Mbps native load / ${g.bandwidth_capacity_mbps == null ? 'automatic budget' : `${Number(g.bandwidth_capacity_mbps).toLocaleString()} Mbps budget`} &middot; ${Array.isArray(g.node_ids) ? g.node_ids.length : 0} computer${Array.isArray(g.node_ids) && g.node_ids.length === 1 ? '' : 's'}</div></div>
         <div style="display:flex;gap:8px;"><button class="secondary small relay-group-edit" type="button" data-id="${Number(g.id)}">Edit</button><details class="action-menu"><summary aria-label="Internet group actions">⋯</summary><div class="action-menu-pop"><button class="small destructive relay-group-remove" type="button" data-id="${Number(g.id)}">Remove group…</button></div></details></div>
       </div>`).join('');
       relayGroupList.querySelectorAll('.relay-group-edit').forEach((btn) => btn.addEventListener('click', () => editRelayGroup(Number(btn.getAttribute('data-id')))));
@@ -1144,7 +1144,21 @@
         setStatus(relayStatus, 'Group limit must be between 1 and 200.', 'err');
         return;
       }
-      return { name: String(name).trim(), max_streams: max };
+      const currentBandwidth = group && group.bandwidth_capacity_mbps != null ? String(group.bandwidth_capacity_mbps) : '';
+      const bandwidthInput = window.prompt('Conservative total bandwidth for this internet connection in Mbps (leave blank for automatic)', currentBandwidth);
+      if (bandwidthInput == null) return;
+      const update = { name: String(name).trim(), max_streams: max };
+      if (String(bandwidthInput).trim()) {
+        const bandwidth = Number(bandwidthInput);
+        if (!Number.isFinite(bandwidth) || bandwidth < 1 || bandwidth > 10000) {
+          setStatus(relayStatus, 'Bandwidth budget must be between 1 and 10,000 Mbps.', 'err');
+          return;
+        }
+        update.bandwidth_capacity_mbps = bandwidth;
+      } else {
+        update.bandwidth_capacity_mbps = null;
+      }
+      return update;
     }
 
     relayGroupCreateBtn.addEventListener('click', async () => {

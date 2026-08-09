@@ -166,9 +166,13 @@ const relayLeaseSQL = `
 	                            WHERE preferred_node_jobs.status='leased'
 	                              AND preferred_node_jobs.lease_owner='node:'||preferred_node.id::text
 	                              AND preferred_node_jobs.lease_expires_at>now()) < preferred_node.relay_max_streams)))
-	    -- Prefer the least-loaded healthy internet group before balancing machines
-	    -- inside it. A group participates only while it has an online node with spare
-	    -- node and group capacity. The fallback is measured from this job's first
+	    -- Prefer the lowest projected native-bandwidth utilization across healthy
+	    -- internet groups before balancing machines inside one. Successful clip
+	    -- ingests learn each recording's source-copy bitrate; unknown streams reserve
+	    -- a conservative 4 Mbps. A configured group bandwidth budget lets a stronger
+	    -- uplink intentionally carry more native media without changing its quality.
+	    -- A group participates only while it has an online node with spare node and
+	    -- group capacity. The fallback is measured from this job's first
 	    -- actual lease opportunity, not its scheduled time, so an old recovery batch
 	    -- still balances while a heartbeat-only peer can delay one job by at most 12s.
 	    -- Twelve seconds covers two polls from legacy 5s relay builds, so an older
@@ -180,10 +184,13 @@ const relayLeaseSQL = `
 	         SELECT 1
 	         FROM relay_groups peer_group
 	         CROSS JOIN LATERAL (
-	              SELECT COUNT(*) AS lease_count
+	              SELECT COUNT(*) AS lease_count,
+	                     COALESCE(SUM(GREATEST(COALESCE(peer_group_bandwidth.observed_bandwidth_bps, 0), 4000000)), 0) AS bandwidth_load
 	              FROM recording_jobs peer_group_jobs
 	              JOIN nodes peer_group_nodes
 	                ON peer_group_jobs.lease_owner='node:'||peer_group_nodes.id::text
+	              JOIN recordings peer_group_recordings ON peer_group_recordings.id=peer_group_jobs.recording_id
+	              LEFT JOIN recording_bandwidth_observations peer_group_bandwidth ON peer_group_bandwidth.recording_id=peer_group_recordings.id
 	              WHERE peer_group_nodes.account_id=n.account_id
 	                AND peer_group_nodes.relay_group_id=peer_group.id
 	                AND peer_group_jobs.status='leased'
@@ -203,15 +210,25 @@ const relayLeaseSQL = `
 	                       WHERE peer_node_jobs.status='leased'
 	                         AND peer_node_jobs.lease_owner='node:'||peer_group_node.id::text
 	                         AND peer_node_jobs.lease_expires_at>now()) < peer_group_node.relay_max_streams)
-	           AND peer_group_load.lease_count <
-	               (SELECT COUNT(*)
+	           AND (peer_group_load.bandwidth_load + GREATEST(COALESCE((SELECT observed_bandwidth_bps FROM recording_bandwidth_observations WHERE recording_id=rec.id), 0), 4000000))::numeric
+	                 / COALESCE(peer_group.bandwidth_capacity_bps, peer_group.max_streams::bigint * 4000000)
+	               <
+	               ((SELECT COALESCE(SUM(GREATEST(COALESCE(current_group_bandwidth.observed_bandwidth_bps, 0), 4000000)), 0)
 	                FROM recording_jobs current_group_jobs
 	                JOIN nodes current_group_nodes
 	                  ON current_group_jobs.lease_owner='node:'||current_group_nodes.id::text
+	                JOIN recordings current_group_recordings ON current_group_recordings.id=current_group_jobs.recording_id
+	                LEFT JOIN recording_bandwidth_observations current_group_bandwidth ON current_group_bandwidth.recording_id=current_group_recordings.id
 	                WHERE current_group_nodes.account_id=n.account_id
 	                  AND current_group_nodes.relay_group_id=n.relay_group_id
 	                  AND current_group_jobs.status='leased'
-	                  AND current_group_jobs.lease_expires_at>now())))
+	                  AND current_group_jobs.lease_expires_at>now()) + GREATEST(COALESCE((SELECT observed_bandwidth_bps FROM recording_bandwidth_observations WHERE recording_id=rec.id), 0), 4000000))::numeric
+	                 / COALESCE((SELECT current_group.bandwidth_capacity_bps
+	                             FROM relay_groups current_group
+	                             WHERE current_group.id=n.relay_group_id AND current_group.account_id=n.account_id),
+	                            (SELECT current_group.max_streams::bigint * 4000000
+	                             FROM relay_groups current_group
+	                             WHERE current_group.id=n.relay_group_id AND current_group.account_id=n.account_id))))
 	    -- Within a group, only a least-loaded healthy node may take the next job.
 	    -- The surrounding group row lock makes this comparison authoritative, so
 	    -- simultaneous pollers converge on an even distribution instead of the
@@ -980,6 +997,24 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("insert recording clip: %v", err))
 		return
+	}
+	// Learn the native stream's network weight from media that was actually stored.
+	// This value is scheduling telemetry only: capture remains source-copy and this
+	// must never become a bitrate target. Retain recent peaks and decay very slowly
+	// so one quiet clip cannot make a high-bitrate stream look cheap.
+	if durationMs > 0 && head.SizeBytes > 0 {
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO recording_bandwidth_observations (recording_id, observed_bandwidth_bps, observed_at)
+			VALUES ($1, ($3::bigint * 8000 / $2)::bigint, now())
+			ON CONFLICT (recording_id) DO UPDATE SET
+			  observed_bandwidth_bps=GREATEST(
+			    EXCLUDED.observed_bandwidth_bps,
+			    recording_bandwidth_observations.observed_bandwidth_bps * 999 / 1000),
+			  observed_at=now()
+		`, recordingID, durationMs, head.SizeBytes); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update recording bandwidth observation: %v", err))
+			return
+		}
 	}
 
 	// Auto-enqueue a delivery transfer for a WebDAV recording. The clip was captured
