@@ -25,8 +25,8 @@ import (
 type failedLogWriter struct{}
 
 func TestRelayJobPollIntervalSupportsFairnessGrace(t *testing.T) {
-	if relayJobPollInterval >= 3*time.Second {
-		t.Fatalf("relay poll interval %s must stay below the 3s grouped fairness fallback", relayJobPollInterval)
+	if relayJobPollInterval >= 12*time.Second {
+		t.Fatalf("relay poll interval %s must stay below the 12s grouped fairness fallback", relayJobPollInterval)
 	}
 }
 

@@ -56,7 +56,7 @@ func TestRelayGroupChangeAllowed(t *testing.T) {
 func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
 	for _, want := range []string{
 		"n.relay_group_id IS NULL",
-		"j.relay_fairness_started_at <= now()-interval '3 seconds'",
+		"j.relay_fairness_started_at <= now()-interval '12 seconds'",
 		"peer_group.id<>n.relay_group_id",
 		"peer_group_node.last_heartbeat_at>=now()-interval '120 seconds'",
 		"peer_group_jobs.lease_expires_at>now()",
@@ -287,7 +287,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	if err := lease(1); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("nonpolling peer must receive bounded first opportunity: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET relay_fairness_started_at=now()-interval '4 seconds' WHERE id=13`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET relay_fairness_started_at=now()-interval '13 seconds' WHERE id=13`); err != nil {
 		t.Fatal(err)
 	}
 	if err := lease(1); err != nil {
