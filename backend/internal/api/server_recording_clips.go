@@ -140,8 +140,10 @@ const relayLeaseSQL = `
 	    -- inside it. A group participates only while it has an online node with spare
 	    -- node and group capacity. The fallback is measured from this job's first
 	    -- actual lease opportunity, not its scheduled time, so an old recovery batch
-	    -- still balances while a heartbeat-only peer can delay one job by at most 3s.
-	    AND (j.relay_fairness_started_at <= now()-interval '3 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
+	    -- still balances while a heartbeat-only peer can delay one job by at most 12s.
+	    -- Twelve seconds covers two polls from legacy 5s relay builds, so an older
+	    -- healthy node on an independent uplink is not starved by newer 1s pollers.
+	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
 	         SELECT 1
 	         FROM relay_groups peer_group
 	         CROSS JOIN LATERAL (
@@ -181,7 +183,7 @@ const relayLeaseSQL = `
 	    -- The surrounding group row lock makes this comparison authoritative, so
 	    -- simultaneous pollers converge on an even distribution instead of the
 	    -- fastest poller monopolizing long continuous-window leases.
-	    AND (j.relay_fairness_started_at <= now()-interval '3 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
+	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
 	         SELECT 1 FROM nodes peer
 	         WHERE peer.account_id=n.account_id
 	           AND peer.relay_group_id=n.relay_group_id
