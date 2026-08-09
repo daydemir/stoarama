@@ -107,7 +107,10 @@ class NASPullTests(unittest.TestCase):
             with mock.patch.object(pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}):
                 inventory.full_scan(cfg, threading.Event())
             complete = [body for body in calls if body.get("complete")]
+            pages = [body for body in calls if not body.get("complete")]
             self.assertEqual(len(complete), 1)
+            self.assertTrue(pages)
+            self.assertTrue(all(body.get("scan_started_at") == complete[0]["scan_started_at"] for body in pages))
             self.assertEqual(len(complete[0]["digest"]), 64)
             self.assertEqual(inventory.summary()["mismatches"], 1)
             self.assertEqual(inventory.summary()["unmatched"], 1)

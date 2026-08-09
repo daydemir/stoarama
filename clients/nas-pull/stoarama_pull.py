@@ -356,13 +356,14 @@ class Inventory:
         })
         self._mark_clean(rows)
 
-    def sync_dirty(self, cfg, generation="live"):
+    def sync_dirty(self, cfg, generation="live", scan_started_at=None):
         while True:
             rows = self._rows("dirty=1")
             if not rows:
                 break
             request_json(cfg, "POST", "/account/connections/inventory", body={
-                "generation": generation, "complete": False, "files": self._reports(rows),
+                "generation": generation, "scan_started_at": scan_started_at,
+                "complete": False, "files": self._reports(rows),
             })
             self._mark_clean(rows)
         while True:
@@ -379,7 +380,8 @@ class Inventory:
                 "state": row[3], "file_mtime_ns": row[4], "client_updated_at": row[5],
             } for row in rows]
             request_json(cfg, "POST", "/account/connections/inventory", body={
-                "generation": generation, "complete": False, "files": [], "unmatched_files": reports,
+                "generation": generation, "scan_started_at": scan_started_at,
+                "complete": False, "files": [], "unmatched_files": reports,
             })
             with self.lock:
                 self.db.executemany(
@@ -468,7 +470,7 @@ class Inventory:
                 self._upsert(clip, state, verified_at, mtime_ns, generation)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self.sync_dirty(cfg, generation)
+                    self.sync_dirty(cfg, generation, started_at)
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except Exception as exc:
@@ -502,7 +504,7 @@ class Inventory:
                     self.db.commit()
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self.sync_dirty(cfg, generation)
+                    self.sync_dirty(cfg, generation, started_at)
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except Exception as exc:
@@ -520,7 +522,7 @@ class Inventory:
                 (completed_at, generation, started_at),
             )
             self.db.commit()
-        self.sync_dirty(cfg, generation)
+        self.sync_dirty(cfg, generation, started_at)
         digest, clips, total_bytes, mismatches, unmatched = self._digest_and_counts()
         request_json(cfg, "POST", "/account/connections/inventory", body={
             "generation": generation, "scan_started_at": started_at,

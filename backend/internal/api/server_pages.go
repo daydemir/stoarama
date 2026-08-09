@@ -40,6 +40,10 @@ func loadOrgSettingsHTML() ([]byte, error) {
 	return loadHTMLPage("org-settings.html")
 }
 
+func loadNASFilesHTML() ([]byte, error) {
+	return loadHTMLPage("nas-files.html")
+}
+
 func writeHTML(w http.ResponseWriter, body []byte) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -77,6 +81,10 @@ func (s *Server) handleSharedRecordingsApp(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleOrgSettingsApp(w http.ResponseWriter, _ *http.Request) {
 	writeHTML(w, s.orgSettingsHTML)
+}
+
+func (s *Server) handleNASFilesApp(w http.ResponseWriter, _ *http.Request) {
+	writeHTML(w, s.nasFilesHTML)
 }
 
 func (s *Server) handleKoreaApp(w http.ResponseWriter, r *http.Request) {

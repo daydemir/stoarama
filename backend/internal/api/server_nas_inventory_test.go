@@ -78,37 +78,15 @@ func TestNASInventoryTreeCursorRejectsTampering(t *testing.T) {
 	}
 }
 
-func TestNASInventoryTreeContinuationQuerySkipsFolderAggregation(t *testing.T) {
-	direct := nasInventoryTreeSQL("Africa/July/", true)
-	if strings.Contains(direct, "GROUP BY") || strings.Contains(direct, "split_part") {
-		t.Fatalf("direct-file continuation still aggregates folders:\n%s", direct)
+func TestNASInventoryTreeQueryUsesExactParentIndexes(t *testing.T) {
+	direct := nasInventoryTreeSQL
+	if strings.Contains(direct, "GROUP BY") || strings.Contains(direct, "split_part") || strings.Contains(direct, "starts_with") {
+		t.Fatalf("browse query still aggregates or scans path prefixes:\n%s", direct)
 	}
-	for _, marker := range []string{"i.connection_id=$1", "starts_with(i.relative_path,$3)", "u.connection_id=$1", "starts_with(u.relative_path,$3)"} {
+	for _, marker := range []string{"i.connection_id=$1 AND i.tree_parent_path=$4", "u.connection_id=$1 AND u.tree_parent_path=$4", "d.generation=$3", "row_number() OVER(PARTITION BY name"} {
 		if !strings.Contains(direct, marker) {
-			t.Fatalf("nested query missing connection-scoped literal prefix %q", marker)
+			t.Fatalf("tree query missing bounded snapshot marker %q", marker)
 		}
-	}
-	if strings.Contains(direct, "relative_path >=") || strings.Contains(direct, "relative_path <") {
-		t.Fatal("nested query retained collation-dependent range bounds")
-	}
-	for _, marker := range []string{
-		"i.relative_path > ($3 || $5)",
-		"u.relative_path > ($3 || $5)",
-		"substring(i.relative_path FROM char_length($3)+1)",
-		"substring(u.relative_path FROM char_length($3)+1)",
-	} {
-		if !strings.Contains(direct, marker) {
-			t.Fatalf("direct continuation did not push %q into raw source branches", marker)
-		}
-	}
-	unionAt := strings.Index(direct, "UNION ALL")
-	deduplicateAt := strings.Index(direct, "), deduplicated AS")
-	if unionAt < 0 || deduplicateAt < 0 || strings.Index(direct, "i.relative_path > ($3 || $5)") > unionAt ||
-		strings.Index(direct, "u.relative_path > ($3 || $5)") < unionAt || strings.Index(direct, "u.relative_path > ($3 || $5)") > deduplicateAt {
-		t.Fatal("direct keyset predicates are not inside both pre-union raw branches")
-	}
-	if aggregate := nasInventoryTreeSQL("Africa/", false); !strings.Contains(aggregate, "GROUP BY") {
-		t.Fatal("folder phase omitted folder aggregation")
 	}
 }
 
@@ -138,9 +116,38 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES($1,'Africa/July/orphan.mp4',9,$2,'present',now())`, connectionID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES
+		($1,'Africa/July/orphan.mp4',9,$2,'present',now()),($1,'Africa/July/one.mp4',1,$2,'present',now()),($1,'root.mp4',4,$2,'present',now())`, connectionID, sha); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET verified_at=now()-interval '73 hours' WHERE connection_id=$1 AND relative_path='Europe/three.mp4'`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"nas_inventory_files", "nas_inventory_unmatched_files"} {
+		if _, err := pool.Exec(ctx, `UPDATE `+table+` SET
+			tree_parent_path=CASE WHEN strpos(reverse(relative_path),'/')=0 THEN '' ELSE left(relative_path,length(relative_path)-strpos(reverse(relative_path),'/')) END,
+			tree_name=CASE WHEN strpos(reverse(relative_path),'/')=0 THEN relative_path ELSE right(relative_path,strpos(reverse(relative_path),'/')-1) END
+			WHERE connection_id=$1`, connectionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refresh := func(generation string) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := rebuildNASInventoryTreeDirectories(ctx, tx, connectionID, accountID, generation); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE connections SET inventory_generation=$1,inventory_tree_generation=$1,inventory_scan_started_at=now()-interval '1 minute',inventory_scan_completed_at=now(),inventory_reported_at=now(),inventory_in_progress_generation='' WHERE id=$2`, generation, connectionID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refresh("tree-one")
 	s := &Server{pool: pool}
 	call := func(path, cursor string, limit int) (int, map[string]any) {
 		url := fmt.Sprintf("/api/v1/account/connections/%d/inventory/tree?limit=%d", connectionID, limit)
@@ -171,6 +178,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if len(firstEntries) != 2 || firstEntries[0].(map[string]any)["name"] != "Africa" || firstEntries[1].(map[string]any)["name"] != "Europe" {
 		t.Fatalf("root first page=%v", firstEntries)
 	}
+	if firstEntries[1].(map[string]any)["stale_files"] != float64(1) {
+		t.Fatalf("Europe directory omitted stale descendant: %v", firstEntries[1])
+	}
 	if first["server_only"] != float64(1) {
 		t.Fatalf("root server_only=%v, want mismatched clip counted as unsafe", first["server_only"])
 	}
@@ -186,8 +196,23 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if len(secondEntries) != 1 || secondEntries[0].(map[string]any)["name"] != "root.mp4" {
 		t.Fatalf("root second page status=%d entries=%v", status, secondEntries)
 	}
+	if secondEntries[0].(map[string]any)["reconciliation"] != "ambiguous" {
+		t.Fatalf("duplicate root path was not ambiguous: %v", secondEntries[0])
+	}
 	if _, ok := second["server_only"]; ok {
 		t.Fatal("continuation page recomputed server-only summary")
+	}
+	if first["generation"] != "tree-one" || first["fresh"] != true || first["snapshot_consistent"] != true {
+		t.Fatalf("root snapshot metadata=%v", first)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='tree-active',inventory_in_progress_started_at=now(),inventory_in_progress_reported_at=now() WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := call("", cursor, 2); status != http.StatusConflict {
+		t.Fatalf("cursor spanning active-generation change status=%d, want 409", status)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='',inventory_in_progress_started_at=NULL,inventory_in_progress_reported_at=NULL WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
 	}
 	status, africa := call("Africa", "", 20)
 	if status != http.StatusOK {
@@ -196,6 +221,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	africaEntries, _ := africa["entries"].([]any)
 	if len(africaEntries) != 2 || africaEntries[0].(map[string]any)["kind"] != "directory" {
 		t.Fatalf("Africa status=%d entries=%v", status, africaEntries)
+	}
+	if africaEntries[1].(map[string]any)["ambiguous_files"] != float64(1) {
+		t.Fatalf("July directory omitted ambiguous descendant: %v", africaEntries[1])
 	}
 	if _, ok := africa["server_only"]; ok {
 		t.Fatal("nested folder first page recomputed account-wide server-only summary")
@@ -210,6 +238,17 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	}
 	if julyEntries[1].(map[string]any)["reconciliation"] != "nas_only" {
 		t.Fatalf("July unmatched file missing: %v", julyEntries)
+	}
+	if julyEntries[0].(map[string]any)["reconciliation"] != "ambiguous" {
+		t.Fatalf("July duplicate file was not ambiguous: %v", julyEntries)
+	}
+	status, europe := call("Europe", "", 20)
+	if status != http.StatusOK {
+		t.Fatalf("Europe status=%d", status)
+	}
+	europeEntries := europe["entries"].([]any)
+	if len(europeEntries) != 1 || europeEntries[0].(map[string]any)["reconciliation"] != "stale" {
+		t.Fatalf("stale file not classified explicitly: %v", europeEntries)
 	}
 	status, julyFirst := call("Africa/July", "", 1)
 	julyCursor, _ := julyFirst["next_cursor"].(string)
@@ -236,6 +275,7 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 		($1,'under_score/literal.mp4',7,$2,'present',now()),($1,'underXscore/sibling.mp4',8,$2,'present',now())`, connectionID, sha); err != nil {
 		t.Fatal(err)
 	}
+	refresh("tree-two")
 	for _, path := range []string{"100%", "under_score"} {
 		status, body := call(path, "", 20)
 		if status != http.StatusOK {
@@ -267,21 +307,31 @@ func TestNASInventoryReleaseGateFailsClosed(t *testing.T) {
 	s := &Server{pool: pool}
 	principal := accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}
 	r := httptest.NewRequest("POST", "/", nil)
-	confirmed, _, err := s.verifyNASInventoryForRelease(r, principal, recordingID, clipID)
+	confirmed, _, err := verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
 	if err != nil || confirmed {
 		t.Fatalf("missing inventory confirmed=%v err=%v, want false/nil", confirmed, err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'safe/clip.mp4',3,$4,'present',now())`, connectionID, clipID, recordingID, sha); err != nil {
 		t.Fatal(err)
 	}
-	confirmed, reason, err := s.verifyNASInventoryForRelease(r, principal, recordingID, clipID)
+	confirmed, reason, err := verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
 	if err != nil || !confirmed || reason != "confirmed" {
 		t.Fatalf("exact inventory confirmed=%v reason=%q err=%v", confirmed, reason, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES($1,'safe/clip.mp4',3,$2,'present',now())`, connectionID, sha); err != nil {
+		t.Fatal(err)
+	}
+	confirmed, reason, err = verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
+	if err != nil || confirmed || !strings.Contains(reason, "multiple") {
+		t.Fatalf("ambiguous path confirmed=%v reason=%q err=%v, want fail closed", confirmed, reason, err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND relative_path='safe/clip.mp4'`, connectionID); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET size_bytes=4 WHERE connection_id=$1 AND clip_id=$2`, connectionID, clipID); err != nil {
 		t.Fatal(err)
 	}
-	confirmed, _, err = s.verifyNASInventoryForRelease(r, principal, recordingID, clipID)
+	confirmed, _, err = verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
 	if err != nil || confirmed {
 		t.Fatalf("mismatched inventory confirmed=%v err=%v, want false/nil", confirmed, err)
 	}
@@ -355,6 +405,15 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 		t.Fatalf("partial batch released %d clips, want 0", released)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'safe/2.mp4',3,$4,'present',now())`, connectionID, secondID, recordingID, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES($1,'safe/1.mp4',3,$2,'present',now())`, connectionID, sha); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(); rec.Code != http.StatusConflict {
+		t.Fatalf("ambiguous proof status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND relative_path='safe/1.mp4'`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if rec := call(); rec.Code != http.StatusOK {

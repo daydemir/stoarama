@@ -305,7 +305,36 @@ func (s *Server) handleAccountRecordingClipRelease(w http.ResponseWriter, r *htt
 	if !ok {
 		return
 	}
-	confirmed, reason, err := s.verifyNASInventoryForRelease(r, principal, recordingID, clipID)
+	if principal.APIKeyID == nil {
+		found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID, true)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clip: %v", err))
+			return
+		}
+		if !found {
+			util.WriteError(w, http.StatusNotFound, "clip not found")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"id": clipID, "released": true})
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin release: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	// Inventory sync holds this same row lock. Keeping it through verification
+	// and released_at closes the proof-to-release race.
+	var connectionID int64
+	if err := tx.QueryRow(r.Context(), `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID); errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "NAS connection not found")
+		return
+	} else if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock NAS connection: %v", err))
+		return
+	}
+	confirmed, reason, err := verifyNASInventoryForRelease(r.Context(), tx, principal, recordingID, clipID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("verify NAS inventory: %v", err))
 		return
@@ -315,13 +344,28 @@ func (s *Server) handleAccountRecordingClipRelease(w http.ResponseWriter, r *htt
 		return
 	}
 
-	found, _, err := s.releaseClip(r.Context(), principal.AccountID, recordingID, clipID, true)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clip: %v", err))
+	var purgedAt, releasedAt *time.Time
+	err = tx.QueryRow(r.Context(), `
+		SELECT c.purged_at,c.released_at FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
+		WHERE c.id=$1 AND c.recording_id=$2 AND rec.account_id=$3 AND rec.delivery='nas_pull'
+		FOR UPDATE OF c
+	`, clipID, recordingID, principal.AccountID).Scan(&purgedAt, &releasedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "clip not found")
 		return
 	}
-	if !found {
-		util.WriteError(w, http.StatusNotFound, "clip not found")
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock clip: %v", err))
+		return
+	}
+	if purgedAt == nil && releasedAt == nil {
+		if _, err := tx.Exec(r.Context(), `UPDATE recording_clips SET released_at=now() WHERE id=$1 AND released_at IS NULL`, clipID); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("release clip: %v", err))
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit release: %v", err))
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"id": clipID, "released": true})

@@ -100,6 +100,8 @@
     button.primary { font-weight: 600; }
     button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
     button.small { min-height: 30px; padding: 5px 12px; font-size: 12px; }
+    a.btn-link { display: inline-flex; align-items: center; justify-content: center; min-height: 30px; padding: 5px 12px; border: 1.5px solid var(--muted); border-radius: 10px; color: var(--text); font-size: 12px; font-weight: 500; text-decoration: none; }
+    a.btn-link:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); text-decoration: none; }
     .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .kv-val { font-family: var(--mono); font-size: 13px; color: var(--text); word-break: break-all; }
     .sub { color: var(--muted); font-size: 12px; }
@@ -138,17 +140,6 @@
     .action-menu-pop { position: absolute; z-index: 20; right: 0; top: 38px; min-width: 190px; display: grid; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); box-shadow: 0 18px 45px rgba(0,0,0,.35); }
     .action-menu-pop button { width: 100%; text-align: left; border-color: transparent; }
     .action-menu-pop button.destructive { color: var(--err); }
-    .inventory-box { border-top: 1px solid var(--border); padding-top: 10px; }
-    .inventory-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .inventory-table th, .inventory-table td { padding: 7px 6px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-    .inventory-table th { color: var(--muted); font-weight: 500; }
-    .inventory-path { max-width: 360px; overflow-wrap: anywhere; }
-    .inventory-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-    .inventory-breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
-    .inventory-breadcrumbs button, .inventory-folder { appearance: none; padding: 0; border: 0; background: none; color: var(--accent); font: inherit; cursor: pointer; text-align: left; }
-    .inventory-breadcrumbs button:hover, .inventory-folder:hover { text-decoration: underline; }
-    .inventory-folder { font-family: inherit; font-weight: 600; }
-    .inventory-kind { width: 22px; color: var(--muted); }
     .inline-form { display: flex; gap: 8px; align-items: flex-end; }
     .inline-form input { flex: 1 1 auto; }
     .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -196,6 +187,7 @@
       /* Comfortable tap targets. */
       button { min-height: 44px; }
       button.small { min-height: 40px; }
+      a.btn-link { min-height: 40px; }
       /* Let key/value rows wrap so the right-side action buttons never run off
          the viewport, and let long labels/names/emails break instead of forcing
          width. Inline white-space:nowrap needs !important to override. */
@@ -204,7 +196,7 @@
       .rec-row.kv-row > div:last-child { flex-wrap: wrap; }
       .rec-row .mono { white-space: normal !important; word-break: break-word; }
       .conn-head { flex-wrap: wrap; }
-      .conn-actions button { flex: 1; }
+      .conn-actions button, .conn-actions a.btn-link { flex: 1; }
     }
   </style>
 <!--SHELL_HEAD-->
@@ -825,14 +817,13 @@
             ${latestError}
             ${outage}
             <div class="conn-actions">
-              <button class="secondary small conn-inventory" type="button" data-id="${id}">View NAS files</button>
+              <a class="btn-link secondary" href="/nas-files?connection=${id}">View NAS files</a>
               <details class="action-menu"><summary aria-label="Connection actions">⋯</summary><div class="action-menu-pop">
                 <button class="secondary small conn-inventory-mode" type="button" data-id="${id}" data-mode="${inventoryMode === 'enforce' ? 'observe' : 'enforce'}">${inventoryMode === 'enforce' ? 'Return to observe-only…' : 'Enable inventory gate…'}</button>
                 <button class="secondary small conn-rotate" type="button" data-id="${id}">Rotate access key…</button>
                 <button class="small destructive conn-remove" type="button" data-id="${id}" data-label="${escapeHTML(label)}">Remove connection…</button>
               </div></details>
             </div>
-            <div class="inventory-box hidden" data-inventory-box="${id}"></div>
           </div>`;
         }).join('');
         connectionsList.classList.remove('hidden');
@@ -841,9 +832,6 @@
         });
         connectionsList.querySelectorAll('.conn-remove').forEach((btn) => {
           btn.addEventListener('click', () => removeConnection(Number(btn.getAttribute('data-id')), btn.getAttribute('data-label')));
-        });
-        connectionsList.querySelectorAll('.conn-inventory').forEach((btn) => {
-          btn.addEventListener('click', () => loadConnectionInventory(Number(btn.getAttribute('data-id'))));
         });
         connectionsList.querySelectorAll('.conn-inventory-mode').forEach((btn) => {
           btn.addEventListener('click', () => setInventoryMode(Number(btn.getAttribute('data-id')), btn.getAttribute('data-mode')));
@@ -901,88 +889,6 @@
         await loadConnections();
       } catch (err) {
         setStatus(connectionsStatus, String(err.message || err), 'err');
-      }
-    }
-
-    function inventoryBreadcrumbs(path) {
-      const parts = String(path || '').split('/').filter(Boolean);
-      let current = '';
-      const crumbs = [`<button type="button" data-inventory-path="">NAS</button>`];
-      for (const part of parts) {
-        current = current ? `${current}/${part}` : part;
-        crumbs.push('<span aria-hidden="true">/</span>');
-        crumbs.push(`<button type="button" data-inventory-path="${escapeHTML(current)}">${escapeHTML(part)}</button>`);
-      }
-      return crumbs.join('');
-    }
-
-    function bindInventoryNavigation(box, id) {
-      box.querySelectorAll('[data-inventory-path]').forEach((button) => {
-        if (button.dataset.inventoryBound === 'true') return;
-        button.dataset.inventoryBound = 'true';
-        button.addEventListener('click', () => void loadConnectionInventory(id, button.dataset.inventoryPath || ''));
-      });
-    }
-
-    async function loadConnectionInventory(id, path = '', cursor = '') {
-      const box = connectionsList.querySelector(`[data-inventory-box="${id}"]`);
-      if (!box) return;
-      box.classList.remove('hidden');
-      if (!cursor) {
-        box.dataset.inventoryPath = path;
-        box.dataset.inventoryRequest = String(Number(box.dataset.inventoryRequest || 0) + 1);
-        box.innerHTML = '<div class="sub">Loading NAS folder…</div>';
-      }
-      const requestGeneration = box.dataset.inventoryRequest || '0';
-      try {
-        const params = new URLSearchParams({ limit: '200' });
-        if (path) params.set('path', path);
-        if (cursor) params.set('cursor', cursor);
-        const data = await fetchJSON(`/api/v1/account/connections/${id}/inventory/tree?${params.toString()}`);
-        if (box.dataset.inventoryPath !== path || box.dataset.inventoryRequest !== requestGeneration) return;
-        if (!cursor && !path && data.server_only !== undefined) {
-          box.dataset.inventoryServerOnly = String(Number(data.server_only || 0));
-        }
-        const serverOnly = Number(box.dataset.inventoryServerOnly || 0);
-        const entries = Array.isArray(data.entries) ? data.entries : [];
-        const rows = entries.map((item) => {
-          const isDirectory = item.kind === 'directory';
-          const name = escapeHTML(item.name || '');
-          const label = isDirectory
-            ? `<button class="inventory-folder" type="button" data-inventory-path="${escapeHTML(item.relative_path || '')}">${name}</button>`
-            : `<span class="mono">${name}</span>`;
-          const reconciliation = isDirectory
-            ? `${Number(item.descendant_files || 0).toLocaleString()} file${Number(item.descendant_files || 0) === 1 ? '' : 's'}${Number(item.mismatch_files || 0) ? ` · ${Number(item.mismatch_files).toLocaleString()} mismatched` : ''}${Number(item.nas_only_files || 0) ? ` · ${Number(item.nas_only_files).toLocaleString()} NAS-only` : ''}`
-            : (item.reconciliation === 'nas_only' ? 'NAS only / unmatched' : (item.reconciliation || item.state || ''));
-          return `<tr><td class="inventory-kind" aria-label="${isDirectory ? 'Folder' : 'File'}">${isDirectory ? '📁' : '▤'}</td><td class="inventory-path">${label}</td><td>${escapeHTML(connectionBytes(Number(item.size_bytes || 0)))}</td><td>${escapeHTML(reconciliation)}</td><td>${isDirectory ? '—' : escapeHTML(connectionTimestamp(item.verified_at))}</td></tr>`;
-        }).join('');
-        if (!cursor) {
-          const parentPath = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
-          box.innerHTML = `<div class="inventory-toolbar"><div><b>NAS filesystem</b><div class="inventory-breadcrumbs" aria-label="Current NAS folder">${inventoryBreadcrumbs(path)}</div></div><div style="display:flex;gap:8px;align-items:center;"><button class="secondary small" type="button" data-inventory-path="${escapeHTML(parentPath)}" ${path ? '' : 'disabled'}>Up one folder</button><a href="/api/v1/account/connections/${id}/inventory.csv">Download full manifest CSV</a></div></div>`
-            + `<div class="sub" style="margin-bottom:8px;"><span data-inventory-shown>${entries.length}</span> entries shown in this folder · ${serverOnly.toLocaleString()} server-only clips across this NAS. Folder sizes and counts include descendants; CSV retains the complete reconciliation manifest.</div>`
-            + `<div style="overflow:auto;"><table class="inventory-table"><thead><tr><th></th><th>Name</th><th>Size</th><th>Reconciliation</th><th>Verified</th></tr></thead><tbody>${rows}</tbody></table></div>`;
-          if (!rows) box.querySelector('tbody').innerHTML = '<tr><td colspan="5" class="sub">This folder is empty, or its inventory has not synced yet.</td></tr>';
-        } else {
-          const body = box.querySelector('tbody');
-          if (body) body.insertAdjacentHTML('beforeend', rows);
-          const shown = box.querySelector('[data-inventory-shown]');
-          if (shown) shown.textContent = String(Number(shown.textContent || 0) + entries.length);
-        }
-        const priorMore = box.querySelector('[data-inventory-more]');
-        if (priorMore) priorMore.remove();
-        if (data.next_cursor) {
-          box.insertAdjacentHTML('beforeend', `<button class="secondary small" type="button" data-inventory-more="${escapeHTML(data.next_cursor)}" style="margin-top:10px;">Load next 200</button>`);
-          box.querySelector('[data-inventory-more]').addEventListener('click', (event) => {
-            event.currentTarget.disabled = true;
-            void loadConnectionInventory(id, path, data.next_cursor);
-          });
-        }
-        bindInventoryNavigation(box, id);
-      } catch (err) {
-        if (box.dataset.inventoryPath !== path || box.dataset.inventoryRequest !== requestGeneration) return;
-        const message = `<div class="status err">${escapeHTML(String(err.message || err))}</div>`;
-        if (cursor) box.insertAdjacentHTML('beforeend', message);
-        else box.innerHTML = message;
       }
     }
 

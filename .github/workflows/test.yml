@@ -43,7 +43,7 @@ jobs:
       - name: Test NAS backlog eligibility
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run TestConnectionPendingClipsEligibility -count=1
+        run: go test ./internal/api -run 'Test(ConnectionPendingClipsEligibility|NASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination|NASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe)' -count=1
       - name: Test batch Plaza naming
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
