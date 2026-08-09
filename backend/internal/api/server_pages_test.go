@@ -57,6 +57,25 @@ func TestDestructiveWebActionsUseMenusAndConfirmations(t *testing.T) {
 	}
 }
 
+func TestRecordingRelayRoutingIsSoftAndExplicit(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`Preferred home internet`,
+		`Immediate if the preferred connection is unavailable or full; after 12 seconds if it is healthy but does not take the job`,
+		`This is a soft preference. Stoarama falls back automatically rather than miss footage.`,
+		`/relay-routing`,
+		`preferred_relay_group_id: raw ? Number(raw) : null`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing relay-routing marker %q", marker)
+		}
+	}
+}
+
 func TestAdminCancellationGuardsPrecedeMutationsAndSuccessUI(t *testing.T) {
 	body, err := loadHTMLPage("admin.html")
 	if err != nil {

@@ -136,6 +136,36 @@ const relayLeaseSQL = `
 	         WHERE aj.status = 'leased'
 	           AND aj.lease_owner = 'node:' || $1::text
 	           AND aj.lease_expires_at > now()) < n.relay_max_streams
+	    -- A recording may softly prefer one internet group. The preferred group gets
+	    -- the same bounded 12-second first opportunity as ordinary fairness, but an
+	    -- unavailable/full/non-polling preferred group can never strand capture.
+	    AND (rec.preferred_relay_group_id IS NULL
+	         OR n.relay_group_id=rec.preferred_relay_group_id
+	         OR j.relay_fairness_started_at<=now()-interval '12 seconds'
+	         OR NOT EXISTS (
+	              SELECT 1
+	              FROM relay_groups preferred_group
+	              WHERE preferred_group.id=rec.preferred_relay_group_id
+	                AND preferred_group.account_id=rec.account_id
+	                AND (SELECT COUNT(*)
+	                     FROM recording_jobs preferred_jobs
+	                     JOIN nodes preferred_nodes
+	                       ON preferred_jobs.lease_owner='node:'||preferred_nodes.id::text
+	                     WHERE preferred_nodes.account_id=rec.account_id
+	                       AND preferred_nodes.relay_group_id=preferred_group.id
+	                       AND preferred_jobs.status='leased'
+	                       AND preferred_jobs.lease_expires_at>now()) < preferred_group.max_streams
+	                AND EXISTS (
+	                     SELECT 1 FROM nodes preferred_node
+	                     WHERE preferred_node.account_id=rec.account_id
+	                       AND preferred_node.relay_group_id=preferred_group.id
+	                       AND preferred_node.node_type='relay'
+	                       AND preferred_node.status='active'
+	                       AND preferred_node.last_heartbeat_at>=now()-interval '120 seconds'
+	                       AND (SELECT COUNT(*) FROM recording_jobs preferred_node_jobs
+	                            WHERE preferred_node_jobs.status='leased'
+	                              AND preferred_node_jobs.lease_owner='node:'||preferred_node.id::text
+	                              AND preferred_node_jobs.lease_expires_at>now()) < preferred_node.relay_max_streams)))
 	    -- Prefer the least-loaded healthy internet group before balancing machines
 	    -- inside it. A group participates only while it has an online node with spare
 	    -- node and group capacity. The fallback is measured from this job's first
@@ -143,7 +173,10 @@ const relayLeaseSQL = `
 	    -- still balances while a heartbeat-only peer can delay one job by at most 12s.
 	    -- Twelve seconds covers two polls from legacy 5s relay builds, so an older
 	    -- healthy node on an independent uplink is not starved by newer 1s pollers.
-	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
+	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds'
+	         OR n.relay_group_id IS NULL
+	         OR n.relay_group_id=rec.preferred_relay_group_id
+	         OR NOT EXISTS (
 	         SELECT 1
 	         FROM relay_groups peer_group
 	         CROSS JOIN LATERAL (
