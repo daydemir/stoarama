@@ -286,6 +286,7 @@ func TestBootstrapLaunchdRefusesHeadlessFallback(t *testing.T) {
 	logPath := fakeLaunchctl(t, `
 echo "$*" >> "$LAUNCHCTL_TEST_LOG"
 if [ "$1" = bootstrap ]; then echo no-gui >&2; exit 125; fi
+if [ "$1" = print ]; then exit 113; fi
 exit 0
 `)
 	err := bootstrapLaunchd("gui/501", "/tmp/relay.plist", "candidate", 0)
@@ -308,6 +309,32 @@ exit 1
 	err := bootstrapLaunchd("gui/501", "/tmp/relay.plist", "candidate", 0)
 	if err == nil || !strings.Contains(err.Error(), "candidate cleanup failed") {
 		t.Fatalf("error=%v, want cleanup failure", err)
+	}
+}
+
+func TestBootstrapLaunchdDoesNotKillFreshRunAtLoadCandidate(t *testing.T) {
+	logPath := fakeLaunchctl(t, `
+echo "$*" >> "$LAUNCHCTL_TEST_LOG"
+if [ "$1" = bootstrap ]; then
+  exit 0
+fi
+if [ "$1" = kickstart ]; then
+  mkdir -p "$HOME/.stoarama"
+  echo '{"service_instance_id":"candidate","heartbeat_success_count":2,"started_at":"2099-01-01T00:00:00Z"}' > "$HOME/.stoarama/relay-recovery.json"
+  exit 0
+fi
+if [ "$1" = print ]; then echo 'state = running'; exit 0; fi
+exit 1
+`)
+	if err := bootstrapLaunchd("gui/501", "/tmp/relay.plist", "candidate", 0); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "kickstart gui/501/"+launchdLabel) || strings.Contains(string(calls), "kickstart -k") {
+		t.Fatalf("fresh RunAtLoad candidate was not started non-destructively:\n%s", calls)
 	}
 }
 
