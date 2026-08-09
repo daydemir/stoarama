@@ -58,6 +58,8 @@ func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
 		"n.relay_group_id IS NULL",
 		"j.relay_fairness_started_at <= now()-interval '12 seconds'",
 		"peer_group.id<>n.relay_group_id",
+		"n.relay_group_id=rec.preferred_relay_group_id",
+		"preferred_group.id=rec.preferred_relay_group_id",
 		"peer_group_node.last_heartbeat_at>=now()-interval '120 seconds'",
 		"peer_group_jobs.lease_expires_at>now()",
 		"peer.relay_group_id=n.relay_group_id",
@@ -113,7 +115,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		CREATE TABLE streams (id BIGINT PRIMARY KEY, provider TEXT, source_page_url TEXT);
 		CREATE TABLE storage_destinations (id BIGINT PRIMARY KEY);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
-		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT);
+		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT);
 		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
 		INSERT INTO accounts VALUES (47);
 		INSERT INTO relay_groups VALUES (1, 47, 1);
@@ -333,6 +335,57 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		t.Fatalf("overdue batch group loads=%d/%d want equal", group1Leases, group10Leases)
 	}
 
+	// A soft preference gives the selected independent uplink the first opportunity
+	// even when ordinary least-load balancing is tied. It must never become a pin:
+	// an unavailable preferred group falls back immediately, and a heartbeat-fresh
+	// group that does not poll delays capture only for the bounded fairness turn.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings (id,account_id,status,start_at,capture_via,stream_url,storage_destination_id,preferred_relay_group_id)
+		VALUES (24,47,'active',now()-interval '1 hour','relay','https://example.com/24.m3u8',1,10);
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,attempt_count,updated_at,window_end_at)
+		VALUES (24,24,'pending',now(),'continuous_window',now(),60,0,now(),now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("nonpreferred group took preferred job: %v", err)
+	}
+	if err := lease(15); err != nil {
+		t.Fatalf("preferred group did not take job: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs SET status='complete',lease_owner=NULL,lease_expires_at=NULL WHERE id=24;
+		UPDATE nodes SET last_heartbeat_at=now()-interval '3 minutes' WHERE id=15;
+		INSERT INTO recordings (id,account_id,status,start_at,capture_via,stream_url,storage_destination_id,preferred_relay_group_id)
+		VALUES (25,47,'active',now()-interval '1 hour','relay','https://example.com/25.m3u8',1,10);
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,attempt_count,updated_at,window_end_at)
+		VALUES (25,25,'pending',now(),'continuous_window',now(),60,0,now(),now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); err != nil {
+		t.Fatalf("offline preferred group blocked fallback: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs SET status='complete',lease_owner=NULL,lease_expires_at=NULL WHERE id=25;
+		UPDATE nodes SET last_heartbeat_at=now() WHERE id=15;
+		INSERT INTO recordings (id,account_id,status,start_at,capture_via,stream_url,storage_destination_id,preferred_relay_group_id)
+		VALUES (26,47,'active',now()-interval '1 hour','relay','https://example.com/26.m3u8',1,10);
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,attempt_count,updated_at,window_end_at)
+		VALUES (26,26,'pending',now(),'continuous_window',now(),60,0,now(),now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("healthy preferred group did not receive first opportunity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET relay_fairness_started_at=now()-interval '13 seconds' WHERE id=26`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); err != nil {
+		t.Fatalf("nonpolling preferred group blocked bounded fallback: %v", err)
+	}
+
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO nodes VALUES (3, 47, 'relay', 'active', now(), 1, NULL), (4, 47, 'relay', 'active', now(), 1, NULL);
 		INSERT INTO recordings VALUES
@@ -381,6 +434,38 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	s.handleAccountNodeRelayGroupPut(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-account assignment status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	routingRequest := func(body string) *httptest.ResponseRecorder {
+		routeCtx := chi.NewRouteContext()
+		routeCtx.URLParams.Add("id", "24")
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/account/recordings/24/relay-routing", strings.NewReader(body))
+		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47}), chi.RouteCtxKey, routeCtx))
+		rec := httptest.NewRecorder()
+		s.handleAccountRecordingRelayRouting(rec, req)
+		return rec
+	}
+	if rec := routingRequest(`{"preferred_relay_group_id":2}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("cross-account preferred group status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := routingRequest(`{"preferred_relay_group_id":10}`); rec.Code != http.StatusOK {
+		t.Fatalf("set preferred group status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var preferredGroupID *int64
+	if err := pool.QueryRow(ctx, `SELECT preferred_relay_group_id FROM recordings WHERE id=24`).Scan(&preferredGroupID); err != nil {
+		t.Fatal(err)
+	}
+	if preferredGroupID == nil || *preferredGroupID != 10 {
+		t.Fatalf("preferred group=%v want 10", preferredGroupID)
+	}
+	if rec := routingRequest(`{"preferred_relay_group_id":null}`); rec.Code != http.StatusOK {
+		t.Fatalf("clear preferred group status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := pool.QueryRow(ctx, `SELECT preferred_relay_group_id FROM recordings WHERE id=24`).Scan(&preferredGroupID); err != nil {
+		t.Fatal(err)
+	}
+	if preferredGroupID != nil {
+		t.Fatalf("preferred group not cleared: %v", *preferredGroupID)
 	}
 
 	if _, err := pool.Exec(ctx, `

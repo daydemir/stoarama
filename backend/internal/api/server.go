@@ -293,6 +293,7 @@ func (s *Server) router() http.Handler {
 			account.Patch("/recordings/{id}/schedule", s.handleAccountRecordingSchedule)
 			account.Patch("/recordings/{id}/naming", s.handleAccountRecordingNaming)
 			account.Patch("/recordings/{id}/delivery", s.handleAccountRecordingDelivery)
+			account.Patch("/recordings/{id}/relay-routing", s.handleAccountRecordingRelayRouting)
 			account.Post("/recordings/{id}/pause", s.handleAccountRecordingPause)
 			account.Post("/recordings/{id}/resume", s.handleAccountRecordingResume)
 			account.Delete("/recordings/{id}", s.handleAccountRecordingDelete)

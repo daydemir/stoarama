@@ -88,6 +88,7 @@ const recordingListSelectSQL = `
 		rec.mode, COALESCE(to_char(rec.daily_window_start,'HH24:MI'),''), COALESCE(to_char(rec.daily_window_end,'HH24:MI'),''), rec.active_weekdays,
 		rec.storage_retention_tier, rec.delivery,
 		rec.capture_via,
+		rec.preferred_relay_group_id, preferred_group.name,
 		rec.naming_profile, rec.folder_name, rec.naming_metadata_jsonb,
 		-- Relay readiness (per-recording). Both expressions short-circuit to false/NULL
 		-- for a cloud recording (capture_via='cloud'), so they are cheap and dark until a
@@ -122,7 +123,10 @@ const recordingListSelectSQL = `
 		) ELSE NULL END AS relay_node_name
 	FROM recordings rec
 	JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-	LEFT JOIN streams st ON st.id = rec.stream_id`
+	LEFT JOIN streams st ON st.id = rec.stream_id
+	LEFT JOIN relay_groups preferred_group
+	  ON preferred_group.id=rec.preferred_relay_group_id
+	 AND preferred_group.account_id=rec.account_id`
 
 // recordingProbeTimeout bounds the create-time ffmpeg reachability probe.
 const recordingProbeTimeout = 8 * time.Second
@@ -1867,6 +1871,76 @@ func (s *Server) handleAccountRecordingDelivery(w http.ResponseWriter, r *http.R
 	s.writeRecordingJSON(w, r, id, principal.AccountID)
 }
 
+type recordingRelayRoutingRequest struct {
+	PreferredRelayGroupID *int64 `json:"preferred_relay_group_id"`
+}
+
+// handleAccountRecordingRelayRouting sets a soft failure-domain preference. It
+// never pins a recording: the lease query falls back after a bounded opportunity,
+// preserving capture availability if the preferred uplink is offline or full.
+func (s *Server) handleAccountRecordingRelayRouting(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var req recordingRelayRoutingRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.PreferredRelayGroupID != nil && *req.PreferredRelayGroupID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "preferred_relay_group_id must be positive or null")
+		return
+	}
+
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin relay routing update: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if req.PreferredRelayGroupID != nil {
+		var groupID int64
+		if err := tx.QueryRow(r.Context(), `
+			SELECT id FROM relay_groups WHERE id=$1 AND account_id=$2
+		`, *req.PreferredRelayGroupID, principal.AccountID).Scan(&groupID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusBadRequest, "preferred relay group not found")
+				return
+			}
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load preferred relay group: %v", err))
+			return
+		}
+	}
+	ct, err := tx.Exec(r.Context(), `
+		UPDATE recordings
+		SET preferred_relay_group_id=$3, updated_at=now()
+		WHERE id=$1 AND account_id=$2 AND status<>'canceled' AND capture_via='relay'
+	`, id, principal.AccountID, req.PreferredRelayGroupID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update relay routing: %v", err))
+		return
+	}
+	if ct.RowsAffected() != 1 {
+		util.WriteError(w, http.StatusNotFound, "relay recording not found")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit relay routing update: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"recording_id":             id,
+		"preferred_relay_group_id": req.PreferredRelayGroupID,
+		"soft_preference":          true,
+	})
+}
+
 // recordingRetentionRequest is the tier-change PATCH body.
 type recordingRetentionRequest struct {
 	Tier string `json:"tier"`
@@ -2464,6 +2538,8 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		retentionTier     string
 		delivery          string
 		captureVia        string
+		preferredGroupID  *int64
+		preferredGroup    *string
 		namingProfile     string
 		folderName        string
 		namingMetadata    []byte
@@ -2479,7 +2555,7 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		&streamID, &streamName, &streamLocation,
 		&mode, &dailyWindowStart, &dailyWindowEnd, &activeWeekdays,
 		&retentionTier, &delivery,
-		&captureVia, &namingProfile, &folderName, &namingMetadata,
+		&captureVia, &preferredGroupID, &preferredGroup, &namingProfile, &folderName, &namingMetadata,
 		&hasRelayOnline, &relayNodeName,
 	); err != nil {
 		return nil, err
@@ -2508,45 +2584,47 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		return nil, err
 	}
 	return map[string]any{
-		"id":                       id,
-		"name":                     name,
-		"stream_url":               streamURL,
-		"storage_destination_id":   storageDestID,
-		"storage_destination_name": storageDestName,
-		"storage_managed":          managed,
-		"source_kind":              sourceKind,
-		"mode":                     mode,
-		"cron_expr":                cronExpr,
-		"cron_timezone":            cronTimezone,
-		"clip_duration_sec":        clipDurationSec,
-		"daily_window_start":       dailyWindowStart,
-		"daily_window_end":         dailyWindowEnd,
-		"active_weekdays":          uint8(activeWeekdays),
-		"target_fps":               targetFPS,
-		"status":                   status,
-		"start_at":                 startAt.UTC(),
-		"end_at":                   endAt,
-		"has_payment_method":       hasPaymentMethod,
-		"live":                     live,
-		"needs_card":               needsCard,
-		"health":                   recordingHealth(status, consecutiveFails),
-		"next_fire_at":             nextFireAt,
-		"last_clip_at":             lastClipAt,
-		"last_error_text":          lastErrorText,
-		"last_error_at":            lastErrorAt,
-		"consecutive_failures":     consecutiveFails,
-		"recent_clip_count":        recentClipCount,
-		"captured_clip_count":      capturedClips,
-		"expected_clip_count":      expectedClips,
-		"capture_health":           captureHealth,
-		"created_at":               createdAt.UTC(),
-		"stream_id":                streamID,
-		"stream_name":              streamName,
-		"stream_location":          streamLocation,
-		"storage_retention_tier":   retentionTier,
-		"delivery":                 delivery,
-		"capture_via":              captureVia,
-		"naming":                   naming,
+		"id":                         id,
+		"name":                       name,
+		"stream_url":                 streamURL,
+		"storage_destination_id":     storageDestID,
+		"storage_destination_name":   storageDestName,
+		"storage_managed":            managed,
+		"source_kind":                sourceKind,
+		"mode":                       mode,
+		"cron_expr":                  cronExpr,
+		"cron_timezone":              cronTimezone,
+		"clip_duration_sec":          clipDurationSec,
+		"daily_window_start":         dailyWindowStart,
+		"daily_window_end":           dailyWindowEnd,
+		"active_weekdays":            uint8(activeWeekdays),
+		"target_fps":                 targetFPS,
+		"status":                     status,
+		"start_at":                   startAt.UTC(),
+		"end_at":                     endAt,
+		"has_payment_method":         hasPaymentMethod,
+		"live":                       live,
+		"needs_card":                 needsCard,
+		"health":                     recordingHealth(status, consecutiveFails),
+		"next_fire_at":               nextFireAt,
+		"last_clip_at":               lastClipAt,
+		"last_error_text":            lastErrorText,
+		"last_error_at":              lastErrorAt,
+		"consecutive_failures":       consecutiveFails,
+		"recent_clip_count":          recentClipCount,
+		"captured_clip_count":        capturedClips,
+		"expected_clip_count":        expectedClips,
+		"capture_health":             captureHealth,
+		"created_at":                 createdAt.UTC(),
+		"stream_id":                  streamID,
+		"stream_name":                streamName,
+		"stream_location":            streamLocation,
+		"storage_retention_tier":     retentionTier,
+		"delivery":                   delivery,
+		"capture_via":                captureVia,
+		"preferred_relay_group_id":   preferredGroupID,
+		"preferred_relay_group_name": preferredGroup,
+		"naming":                     naming,
 		// Derived relay readiness. has_relay_assigned = a relay currently holds the
 		// lease (relay_node_name is non-null). All false/null for cloud recordings.
 		"has_relay_online":   hasRelayOnline,

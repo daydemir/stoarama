@@ -3150,7 +3150,7 @@
       const clip = Number(rec.clip_duration_sec || 0);
       const fps = Number(rec.target_fps || 0);
       const capture = rec.capture_via === 'relay'
-        ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}` : 'Cloud';
+        ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}${rec.preferred_relay_group_name ? ` · prefers ${escapeHTML(String(rec.preferred_relay_group_name))}` : ''}` : 'Cloud';
       let storage = sharedReadOnly ? '&mdash;' : (rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage'));
       if (rec.storage_managed === true && rec.delivery !== 'nas_pull') storage += rec.storage_retention_tier === 'yearly_prepaid' ? ' · yearly $0.05/hr-mo' : ' · monthly $0.10/hr-mo';
       let warning = '';
@@ -3587,6 +3587,23 @@
         </div>`;
     }
 
+    function relayRoutingCardHTML(rec) {
+      if (rec.capture_via !== 'relay' || sharedReadOnly) return '';
+      const preferred = String(rec.preferred_relay_group_name || '').trim();
+      return `
+        <div class="detail-card">
+          <div class="detail-card-head">
+            <span class="detail-card-title">Internet routing</span>
+            <button type="button" class="secondary" data-routingedit style="width:auto;min-width:0;min-height:32px;padding:6px 12px;">Edit routing</button>
+          </div>
+          <dl class="detail-rows">
+            <dt>Preferred connection</dt><dd>${escapeHTML(preferred || 'Automatic balancing')}</dd>
+            <dt>Fallback</dt><dd>Automatic after 12 seconds if the preferred connection is unavailable or full</dd>
+          </dl>
+          <div id="routingEditForm" class="detail-edit hidden"></div>
+        </div>`;
+    }
+
     function captureHealthGraph(rawBins, timezone) {
       const bins = Array.isArray(rawBins) ? rawBins : [];
       if (!bins.length) return '';
@@ -3867,7 +3884,7 @@
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       teardownDetailPlayer();
-      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + (sharedReadOnly ? '' : streamCardHTML(rec)) + captureHealthCardHTML() + scheduleCardHTML(rec) + (sharedReadOnly ? '' : storageCardHTML(rec))
+      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + (sharedReadOnly ? '' : streamCardHTML(rec)) + captureHealthCardHTML() + scheduleCardHTML(rec) + relayRoutingCardHTML(rec) + (sharedReadOnly ? '' : storageCardHTML(rec))
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
       wireDetailActions(root);
       if (!sharedReadOnly) mountRecordingLivePlayer(rec);
@@ -3882,8 +3899,63 @@
         b.addEventListener('click', () => openStorageOptions()));
       const editBtn = root.querySelector('button[data-schededit]');
       if (editBtn) editBtn.addEventListener('click', () => openScheduleEdit());
+      const routingBtn = root.querySelector('button[data-routingedit]');
+      if (routingBtn) routingBtn.addEventListener('click', () => openRelayRoutingEdit());
       root.querySelectorAll('button[data-health-page]').forEach((button) =>
         button.addEventListener('click', () => loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))));
+    }
+
+    async function openRelayRoutingEdit() {
+      const form = els.clipPage.querySelector('#routingEditForm');
+      const editBtn = els.clipPage.querySelector('button[data-routingedit]');
+      if (!form) return;
+      if (!form.classList.contains('hidden')) {
+        form.classList.add('hidden');
+        form.innerHTML = '';
+        if (editBtn) editBtn.textContent = 'Edit routing';
+        return;
+      }
+      if (editBtn) { editBtn.disabled = true; editBtn.textContent = 'Loading…'; }
+      try {
+        const payload = await fetchJSON('/api/v1/account/relay-groups');
+        const groups = Array.isArray(payload.items) ? payload.items : [];
+        const selected = Number(clipPageState.rec.preferred_relay_group_id || 0);
+        const options = [`<option value="">Automatic balancing</option>`].concat(groups.map((group) => {
+          const id = Number(group.id || 0);
+          const name = String(group.name || `Group #${id}`);
+          const load = `${Number(group.live_leases || 0)}/${Number(group.max_streams || 0)} active`;
+          return `<option value="${id}"${id === selected ? ' selected' : ''}>${escapeHTML(name)} · ${escapeHTML(load)}</option>`;
+        })).join('');
+        form.innerHTML = `
+          <div class="field"><label for="routingGroup">Preferred home internet</label><select id="routingGroup">${options}</select></div>
+          <p class="muted" style="margin:8px 0 12px;">This is a soft preference. Stoarama falls back automatically rather than miss footage.</p>
+          <div class="detail-actions"><button type="button" data-routingsave>Save</button><button type="button" class="secondary" data-routingcancel>Cancel</button></div>
+          <div class="status" data-routingstatus></div>`;
+        form.classList.remove('hidden');
+        form.querySelector('button[data-routingcancel]').addEventListener('click', () => openRelayRoutingEdit());
+        form.querySelector('button[data-routingsave]').addEventListener('click', async () => {
+          const save = form.querySelector('button[data-routingsave]');
+          const status = form.querySelector('[data-routingstatus]');
+          const raw = form.querySelector('#routingGroup').value;
+          save.disabled = true;
+          setStatus(status, 'Saving…', '');
+          try {
+            await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(clipPageState.recId)}/relay-routing`, {
+              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ preferred_relay_group_id: raw ? Number(raw) : null }),
+            });
+            await reloadClipPageRecording();
+          } catch (err) {
+            setStatus(status, String(err.message || err), 'err');
+            save.disabled = false;
+          }
+        });
+      } catch (err) {
+        form.innerHTML = `<div class="status err">${escapeHTML(String(err.message || err))}</div>`;
+        form.classList.remove('hidden');
+      } finally {
+        if (editBtn) { editBtn.disabled = false; editBtn.textContent = 'Close'; }
+      }
     }
 
     async function mutateRecordingDetail(id, action) {
