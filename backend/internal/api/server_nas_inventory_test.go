@@ -122,7 +122,7 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 		($1,'Africa/July/orphan.mp4',9,$2,'present',now()),($1,'Africa/July/one.mp4',1,$2,'present',now()),($1,'root.mp4',4,$2,'present',now())`, connectionID, sha); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET verified_at=now()-interval '73 hours' WHERE connection_id=$1 AND relative_path='Europe/three.mp4'`, connectionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET verified_at=now()-$2::interval WHERE connection_id=$1 AND relative_path='Europe/three.mp4'`, connectionID, (nasInventoryFreshness + time.Hour).String()); err != nil {
 		t.Fatal(err)
 	}
 	for _, table := range []string{"nas_inventory_files", "nas_inventory_unmatched_files"} {
@@ -206,11 +206,26 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if first["generation"] != "tree-one" || first["fresh"] != true || first["snapshot_consistent"] != true {
 		t.Fatalf("root snapshot metadata=%v", first)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_live_revision=inventory_tree_revision+1 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := call("", "", 2); status != http.StatusOK || body["snapshot_consistent"] != false {
+		t.Fatalf("revision gap status=%d body=%v, want inconsistent snapshot", status, body)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_tree_revision=inventory_live_revision WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='tree-active',inventory_in_progress_started_at=now(),inventory_in_progress_reported_at=now() WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := call("", cursor, 2); status != http.StatusConflict {
 		t.Fatalf("cursor spanning active-generation change status=%d, want 409", status)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_reported_at=now()-$2::interval WHERE id=$1`, connectionID, (nasInventoryScanProgressTTL + time.Hour).String()); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := call("", "", 2); status != http.StatusOK || body["snapshot_consistent"] != true || body["in_progress_generation"] != "" {
+		t.Fatalf("expired scan progress status=%d body=%v, want ignored stale progress", status, body)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='',inventory_in_progress_started_at=NULL,inventory_in_progress_reported_at=NULL WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)

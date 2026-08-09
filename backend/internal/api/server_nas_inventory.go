@@ -19,12 +19,13 @@ import (
 )
 
 const (
-	nasInventoryMaxBatch      = 500
-	nasInventoryMaxPage       = 500
-	nasInventoryFreshness     = 72 * time.Hour
-	nasInventoryMaxFutureSkew = 5 * time.Minute
-	nasInventoryMaxPathBytes  = 1024
-	nasInventoryMaxGeneration = 128
+	nasInventoryMaxBatch        = 500
+	nasInventoryMaxPage         = 500
+	nasInventoryFreshness       = 72 * time.Hour
+	nasInventoryScanProgressTTL = 24 * time.Hour
+	nasInventoryMaxFutureSkew   = 5 * time.Minute
+	nasInventoryMaxPathBytes    = 1024
+	nasInventoryMaxGeneration   = 128
 )
 
 type nasInventoryFileReport struct {
@@ -509,7 +510,7 @@ const nasInventoryTreeSQL = `
 		SELECT 0 AS kind_sort,d.name,NULL::bigint AS clip_id,NULL::bigint AS recording_id,d.size_bytes,
 		       ''::text AS sha256,''::text AS state,NULL::timestamptz AS verified_at,''::text AS reconciliation,
 		       d.descendant_files,d.mismatch_files,d.nas_only_files,
-		       CASE WHEN $10::boolean THEN d.stale_files ELSE d.descendant_files END AS stale_files,
+		       d.stale_files AS stale_files,
 		       d.ambiguous_files AS ambiguous_files
 		FROM nas_inventory_tree_directories d
 		WHERE d.connection_id=$1 AND d.generation=$3 AND d.parent_path=$4
@@ -589,15 +590,18 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 	fresh := scanStartedAt != nil && scanCompletedAt != nil &&
 		time.Since(scanStartedAt.UTC()) <= nasInventoryFreshness && time.Since(scanStartedAt.UTC()) >= -nasInventoryMaxFutureSkew &&
 		time.Since(scanCompletedAt.UTC()) <= nasInventoryFreshness && time.Since(scanCompletedAt.UTC()) >= -nasInventoryMaxFutureSkew
+	if activeReportedAt != nil && time.Since(activeReportedAt.UTC()) > nasInventoryScanProgressTTL {
+		activeGeneration, activeStartedAt, activeReportedAt = "", nil, nil
+	}
 	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration
-	snapshotState := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration, strconv.FormatBool(fresh)}, "|")
+	snapshotState := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration}, "|")
 	if r.URL.Query().Get("cursor") != "" && cursor.State != snapshotState {
 		util.WriteError(w, http.StatusConflict, "inventory changed while paging; restart this folder")
 		return
 	}
 	rows, err := tx.Query(r.Context(), nasInventoryTreeSQL,
 		connectionID, principal.AccountID, completedGeneration, directory, cursor.Kind, cursor.Name, limit+1,
-		nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String(), fresh)
+		nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String())
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("browse inventory: %v", err))
 		return
