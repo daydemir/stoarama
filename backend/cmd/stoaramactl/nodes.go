@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,7 +46,7 @@ func runNodesRelayGroups(ctx context.Context, cfg config.Config, args []string) 
 	bandwidthMbps := fs.Float64("bandwidth-mbps", 0, "conservative internet connection routing budget in Mbps")
 	nodeID := fs.Int64("node-id", 0, "relay node id")
 	_ = fs.Parse(args[1:])
-	if *bandwidthMbps != 0 && (*bandwidthMbps < 1 || *bandwidthMbps > 10000) {
+	if math.IsNaN(*bandwidthMbps) || math.IsInf(*bandwidthMbps, 0) || (*bandwidthMbps != 0 && (*bandwidthMbps < 1 || *bandwidthMbps > 10000)) {
 		log.Fatalf("--bandwidth-mbps must be between 1 and 10000")
 	}
 	base := strings.TrimSpace(*backendAPIURL)
