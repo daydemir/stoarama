@@ -422,6 +422,7 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	if err := validateConnectionHeartbeat(legacy); err != nil {
 		t.Fatalf("legacy heartbeat rejected during rollout: %v", err)
 	}
+	afterCompleted := now.Add(time.Second)
 	invalid := []connectionHeartbeatRequest{
 		{CursorID: -1},
 		{LastBatch: connectionHeartbeatBatch{CompletedAt: &now, Workers: 12}},
@@ -435,6 +436,7 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "bad/generation"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", Digest: "not-a-digest"}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanCompletedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanStartedAt: &now, ScanCompletedAt: &now, ScanPassStartedAt: &afterCompleted, Digest: strings.Repeat("a", 64)}},
 		{Storage: &connectionStorageStatus{Available: true}},
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: -1}},
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: 101}},

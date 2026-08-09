@@ -6,4 +6,4 @@ ALTER TABLE connections
 ALTER TABLE connections DROP CONSTRAINT IF EXISTS connections_inventory_scan_progress_nonnegative;
 ALTER TABLE connections ADD CONSTRAINT connections_inventory_scan_progress_nonnegative CHECK (
   inventory_scan_rows_visited >= 0 AND inventory_scan_rows_skipped >= 0
-);
+) NOT VALID;

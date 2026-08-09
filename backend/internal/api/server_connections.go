@@ -683,7 +683,8 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 				return errors.New("invalid completed NAS inventory summary")
 			}
 		}
-		if inv.ScanPassStartedAt != nil && (inv.ScanStartedAt == nil || inv.ScanPassStartedAt.Before(*inv.ScanStartedAt) || inv.ScanPassStartedAt.After(time.Now().Add(connectionHeartbeatFutureSkew))) {
+		if inv.ScanPassStartedAt != nil && (inv.ScanStartedAt == nil || inv.ScanPassStartedAt.Before(*inv.ScanStartedAt) ||
+			(inv.ScanCompletedAt != nil && inv.ScanPassStartedAt.After(*inv.ScanCompletedAt)) || inv.ScanPassStartedAt.After(time.Now().Add(connectionHeartbeatFutureSkew))) {
 			return errors.New("invalid NAS inventory scan progress")
 		}
 		if (inv.ScanRowsVisited > 0 || inv.ScanRowsSkipped > 0) && inv.ScanPassStartedAt == nil {
