@@ -310,6 +310,69 @@ func TestContinuousMediaLagSurrendersOnlyAfterCleanSpoolDrain(t *testing.T) {
 	}
 }
 
+func TestContinuousSelfUpdateSurrendersOnlyAfterCleanSpoolDrain(t *testing.T) {
+	if !continuousSelfUpdateCanSurrender(true, nil, false) {
+		t.Fatal("cleanly drained update did not surrender")
+	}
+	if continuousSelfUpdateCanSurrender(true, errors.New("upload failed"), false) {
+		t.Fatal("update surrendered with unacknowledged media")
+	}
+	if continuousSelfUpdateCanSurrender(false, nil, false) {
+		t.Fatal("ordinary capture surrendered as an update")
+	}
+	if continuousSelfUpdateCanSurrender(true, nil, true) {
+		t.Fatal("closed window surrendered instead of completing")
+	}
+}
+
+func TestUpdateDrainRefusesNewLeases(t *testing.T) {
+	var leaseCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaseCalls.Add(1)
+		http.Error(w, "unexpected lease", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var drain atomic.Bool
+	drain.Store(true)
+	worker, err := NewWorker(Config{Client: client, DrainForUpdate: &drain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sem := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	worker.drain(context.Background(), sem, &wg)
+	if got := leaseCalls.Load(); got != 0 {
+		t.Fatalf("lease calls=%d want 0", got)
+	}
+}
+
+func TestUpdateDrainStopsStalledContinuousCapture(t *testing.T) {
+	oldInterval := continuousUpdateDrainPollInterval
+	continuousUpdateDrainPollInterval = time.Millisecond
+	t.Cleanup(func() { continuousUpdateDrainPollInterval = oldInterval })
+	var drain atomic.Bool
+	var aborted atomic.Int64
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		monitorContinuousUpdateDrain(stop, &drain, func() { aborted.Add(1) })
+	}()
+	drain.Store(true)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stalled capture was not stopped for update")
+	}
+	if got := aborted.Load(); got != 1 {
+		t.Fatalf("aborts=%d want 1", got)
+	}
+}
+
 func TestContinuousMediaLagStopsCaptureThenDrainsBeforeSurrender(t *testing.T) {
 	now := time.Date(2026, time.August, 9, 2, 0, 0, 0, time.UTC)
 	var delivered atomic.Int64

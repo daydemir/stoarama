@@ -50,6 +50,10 @@ type Config struct {
 	// requesting a lease until ActiveJobs reflects the admitted job. Cloud
 	// workers leave it nil.
 	LeaseGate *sync.RWMutex
+	// DrainForUpdate stops new lease admission and asks continuous captures to
+	// surrender at the next fully accepted segment boundary. It lets a relay load
+	// a verified binary during a 12-hour window without dropping its local spool.
+	DrainForUpdate *atomic.Bool
 	// RelayDiagnostics, when non-nil, is updated with non-secret job progress for
 	// relay node heartbeats. Cloud droplet workers leave it nil.
 	RelayDiagnostics *RelayDiagnostics
@@ -113,6 +117,8 @@ const continuousDiskMonitorInterval = 5 * time.Second
 const diskPauseLogInterval = 5 * time.Minute
 const diskErrorLogInterval = 5 * time.Minute
 const continuousTimelineLeadAllowance = 5 * time.Second
+
+var continuousUpdateDrainPollInterval = time.Second
 
 func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.Client == nil {
@@ -202,6 +208,9 @@ func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
 // at capacity.
 func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGroup) {
 	for {
+		if w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load() {
+			return
+		}
 		if !w.diskHasSpace(w.cfg.MinLeaseFreeBytes) {
 			w.logDiskPause(time.Now())
 			return
@@ -217,6 +226,13 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 		}
 		if w.cfg.LeaseGate != nil {
 			w.cfg.LeaseGate.RLock()
+		}
+		if w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load() {
+			if w.cfg.LeaseGate != nil {
+				w.cfg.LeaseGate.RUnlock()
+			}
+			<-sem
+			return
 		}
 		job, err := w.cfg.Client.LeaseRecordingJob(ctx)
 		if err != nil {
@@ -639,6 +655,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		var diskPressure atomic.Bool
 		stopDiskMonitor := make(chan struct{})
 		go w.monitorContinuousDisk(stopDiskMonitor, &diskPressure, abortAttempt)
+		stopUpdateMonitor := make(chan struct{})
+		if w.cfg.DrainForUpdate != nil {
+			go monitorContinuousUpdateDrain(stopUpdateMonitor, w.cfg.DrainForUpdate, abortAttempt)
+		}
 		submitInCaptureOrder := func(seg capture.Segment) error {
 			if _, duplicate := seenSegmentSHA[seg.SHA256]; seg.SHA256 != "" && duplicate {
 				// A reconnect may replay the tail of an HLS playlist. Do not enqueue,
@@ -665,10 +685,14 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			if seg.SHA256 != "" {
 				seenSegmentSHA[seg.SHA256] = struct{}{}
 			}
+			if w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load() {
+				abortAttempt()
+			}
 			return nil
 		}
 		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", job.TargetFPS, outDir, submitInCaptureOrder, inputHeaders)
 		close(stopDiskMonitor)
+		close(stopUpdateMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
 		// never closes (and outDir is never removed) with an upload still running.
 		delivery := pool.close()
@@ -691,6 +715,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return
 		}
 		windowClosed := continuousShouldStop(canceled(), windowCtx.Err() != nil)
+		if continuousSelfUpdateCanSurrender(w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load(), delivery.err, windowClosed) {
+			err := fmt.Errorf("relay is draining for a verified self-update")
+			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, err)
+			return
+		}
 		if continuousMediaLagCanSurrender(mediaLagged.Load(), delivery.err, windowClosed) {
 			err := fmt.Errorf("continuous media timeline fell behind by at least %s", w.cfg.ContinuousMaxMediaLag)
 			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
@@ -747,6 +776,26 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	}
 	w.cfg.RelayDiagnostics.Finish(job.JobID, "done", nil)
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
+}
+
+func continuousSelfUpdateCanSurrender(draining bool, deliveryErr error, windowClosed bool) bool {
+	return draining && deliveryErr == nil && !windowClosed
+}
+
+func monitorContinuousUpdateDrain(stop <-chan struct{}, drain *atomic.Bool, abort func()) {
+	ticker := time.NewTicker(continuousUpdateDrainPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if drain != nil && drain.Load() {
+				abort()
+				return
+			}
+		}
+	}
 }
 
 func (w *Worker) monitorContinuousDisk(stop <-chan struct{}, pressured *atomic.Bool, abort context.CancelFunc) {
