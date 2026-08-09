@@ -363,7 +363,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	`); err != nil {
 		t.Fatal(err)
 	}
-	if err := lease(1); err != nil {
+	if err := lease(2); err != nil {
 		t.Fatalf("offline preferred group blocked fallback: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
