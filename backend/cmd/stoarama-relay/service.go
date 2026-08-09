@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"embed"
+	"errors"
 	"fmt"
 	"html"
 	"os"
@@ -21,10 +22,16 @@ import (
 var templatesFS embed.FS
 
 const (
-	launchdLabel            = "com.stoarama.relay"
-	systemdUnit             = "stoarama-relay.service"
-	launchdReadinessTimeout = 2*heartbeatInterval + 15*time.Second
+	launchdLabel = "com.stoarama.relay"
+	systemdUnit  = "stoarama-relay.service"
 )
+
+var (
+	launchdReadinessTimeout = 2*heartbeatInterval + 15*time.Second
+	launchdRemovalTimeout   = 10 * time.Second
+)
+
+const launchctlCommandTimeout = 5 * time.Second
 
 // installLaunchd writes the launchd USER agent (so the login user's Keychain is
 // reachable for Chrome cookie decryption, which a system LaunchDaemon could not do)
@@ -98,7 +105,10 @@ func installLaunchd() error {
 		return err
 	}
 	uid := os.Getuid()
-	loaded := loadedLaunchdDomains(uid)
+	loaded, err := loadedLaunchdDomains(uid)
+	if err != nil {
+		return err
+	}
 	if len(loaded) > 1 {
 		return fmt.Errorf("duplicate relay jobs loaded in %s; refusing replacement", strings.Join(loaded, " and "))
 	}
@@ -110,7 +120,7 @@ func installLaunchd() error {
 		}
 		priorDomain = loaded[0]
 		if err := removeLaunchdJob(priorDomain); err != nil {
-			return fmt.Errorf("stop prior relay for replacement: %w", err)
+			return recoverPriorAfterRemovalFailure(priorDomain, plistPath, prior, priorMode, fmt.Errorf("stop prior relay for replacement: %w", err))
 		}
 		runLock, err = waitForRelayRunLock(5 * time.Second)
 	} else {
@@ -119,7 +129,7 @@ func installLaunchd() error {
 	if err != nil {
 		cause := fmt.Errorf("relay process is still running; wait for active recordings to finish, then rerun install-launchd (or run uninstall only after confirming it is safe to stop recordings): %w", err)
 		if priorDomain != "" {
-			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, cause)
+			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, heartbeatSuccessCount(), cause)
 		}
 		return cause
 	}
@@ -127,7 +137,7 @@ func installLaunchd() error {
 	if err := os.Rename(stagedPath, plistPath); err != nil {
 		cause := fmt.Errorf("install launchd plist: %w", err)
 		if priorDomain != "" {
-			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, cause)
+			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, heartbeatSuccessCount(), cause)
 		}
 		return cause
 	}
@@ -155,11 +165,11 @@ func installLaunchd() error {
 	return nil
 }
 
-func restorePriorLaunchd(plistPath string, prior []byte, priorMode os.FileMode, priorDomain string, cause error) error {
+func restorePriorLaunchd(plistPath string, prior []byte, priorMode os.FileMode, priorDomain string, baseline uint64, cause error) error {
 	if err := restorePriorFile(plistPath, prior, priorMode, true); err != nil {
 		return fmt.Errorf("%w; prior plist restoration failed: %v", cause, err)
 	}
-	if err := bootstrapLaunchd(priorDomain, plistPath, serviceInstanceIDFromPlist(prior), heartbeatSuccessCount()); err != nil {
+	if err := bootstrapLaunchd(priorDomain, plistPath, serviceInstanceIDFromPlist(prior), baseline); err != nil {
 		return fmt.Errorf("%w; prior service rollback failed: %v", cause, err)
 	}
 	return fmt.Errorf("%w; prior service was restored and verified", cause)
@@ -167,15 +177,19 @@ func restorePriorLaunchd(plistPath string, prior []byte, priorMode os.FileMode, 
 
 func bootstrapLaunchd(domain, plistPath, instanceID string, baselineSuccesses uint64) error {
 	startedAt := time.Now().UTC()
-	out, err := exec.Command("launchctl", "bootstrap", domain, plistPath).CombinedOutput()
+	out, err := runLaunchctlBounded("bootstrap", domain, plistPath)
 	if err != nil {
 		cause := fmt.Errorf("launchctl bootstrap %s: %w (%s); this non-admin service requires an active GUI login session", domain, err, strings.TrimSpace(string(out)))
-		if exec.Command("launchctl", "print", domain+"/"+launchdLabel).Run() == nil {
+		loaded, probeErr := launchdJobLoadedBounded(domain + "/" + launchdLabel)
+		if probeErr != nil {
+			return fmt.Errorf("%w; candidate state probe failed: %v", cause, probeErr)
+		}
+		if loaded {
 			return cleanupLaunchdFailure(domain, cause)
 		}
 		return cause
 	}
-	if out, err := exec.Command("launchctl", "kickstart", "-k", domain+"/"+launchdLabel).CombinedOutput(); err != nil {
+	if out, err := runLaunchctlBounded("kickstart", "-k", domain+"/"+launchdLabel); err != nil {
 		return cleanupLaunchdFailure(domain, fmt.Errorf("launchctl kickstart %s: %w (%s)", domain, err, strings.TrimSpace(string(out))))
 	}
 	if !waitLaunchdReady(domain, instanceID, startedAt, baselineSuccesses, launchdReadinessTimeout) {
@@ -194,7 +208,7 @@ func cleanupLaunchdFailure(domain string, cause error) error {
 func waitLaunchdReady(domain, instanceID string, startedAt time.Time, baselineSuccesses uint64, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
-		out, err := exec.Command("launchctl", "print", domain+"/"+launchdLabel).CombinedOutput()
+		out, err := runLaunchctlBounded("print", domain+"/"+launchdLabel)
 		if err == nil && strings.Contains(string(out), "state = running") {
 			if state, stateErr := loadRecoveryState(recoveryStatePath()); stateErr == nil &&
 				state.ServiceInstanceID == instanceID && !state.StartedAt.Before(startedAt) &&
@@ -213,18 +227,55 @@ func removeLaunchdJob(domain string) error {
 	return removeLaunchdLabel(domain, launchdLabel)
 }
 
-func loadedLaunchdDomains(uid int) []string {
+func recoverPriorAfterRemovalFailure(domain, plistPath string, prior []byte, priorMode os.FileMode, cause error) error {
+	target := domain + "/" + launchdLabel
+	loaded, probeErr := launchdJobLoadedBounded(target)
+	if probeErr != nil {
+		return fmt.Errorf("%w; prior relay recovery probe failed: %v", cause, probeErr)
+	}
+	if loaded {
+		baseline := heartbeatSuccessCount()
+		startedAt := time.Now().UTC()
+		out, err := runLaunchctlBounded("kickstart", "-k", target)
+		if err != nil {
+			// bootout may have completed between the successful print and kickstart.
+			// Re-probe and bootstrap the still-canonical prior definition if it vanished.
+			stillLoaded, recheckErr := launchdJobLoadedBounded(target)
+			if recheckErr != nil {
+				return fmt.Errorf("%w; prior relay recovery kickstart failed: %v (%s); recheck failed: %v", cause, err, strings.TrimSpace(string(out)), recheckErr)
+			}
+			if stillLoaded {
+				return fmt.Errorf("%w; prior relay recovery kickstart failed while job remains loaded: %v (%s)", cause, err, strings.TrimSpace(string(out)))
+			}
+			return restorePriorLaunchd(plistPath, prior, priorMode, domain, heartbeatSuccessCount(), cause)
+		}
+		if !waitLaunchdReady(domain, serviceInstanceIDFromPlist(prior), startedAt, baseline, launchdReadinessTimeout) {
+			return fmt.Errorf("%w; prior relay recovery did not produce two verified heartbeats", cause)
+		}
+		return fmt.Errorf("%w; prior relay remained loaded and was restarted and verified", cause)
+	}
+	return restorePriorLaunchd(plistPath, prior, priorMode, domain, heartbeatSuccessCount(), cause)
+}
+
+func loadedLaunchdDomains(uid int) ([]string, error) {
 	var loaded []string
 	for _, domain := range []string{fmt.Sprintf("gui/%d", uid), fmt.Sprintf("user/%d", uid)} {
-		if exec.Command("launchctl", "print", domain+"/"+launchdLabel).Run() == nil {
+		isLoaded, err := launchdJobLoadedBounded(domain + "/" + launchdLabel)
+		if err != nil {
+			return nil, fmt.Errorf("probe launchd service in %s: %w", domain, err)
+		}
+		if isLoaded {
 			loaded = append(loaded, domain)
 		}
 	}
-	return loaded
+	return loaded, nil
 }
 
 func ensureNoLoadedRelay(uid int) error {
-	loaded := loadedLaunchdDomains(uid)
+	loaded, err := loadedLaunchdDomains(uid)
+	if err != nil {
+		return err
+	}
 	if len(loaded) > 0 {
 		return fmt.Errorf("relay service remains loaded in %s; wait for active recordings to finish, then retry (or run uninstall only after confirming it is safe to stop recordings)", strings.Join(loaded, " and "))
 	}
@@ -448,27 +499,9 @@ func uninstall() error {
 			return lockErr
 		}
 		defer operationLock.Close()
-		uid := os.Getuid()
-		for _, domain := range []string{fmt.Sprintf("gui/%d", uid), fmt.Sprintf("user/%d", uid)} {
-			if exec.Command("launchctl", "print", domain+"/"+launchdLabel).Run() == nil {
-				if err := removeLaunchdJob(domain); err != nil {
-					return fmt.Errorf("stop launchd agent before uninstall: %w", err)
-				}
-			}
+		if err := uninstallLaunchd(os.Getuid(), home); err != nil {
+			return err
 		}
-		if err := ensureNoLoadedRelay(uid); err != nil {
-			return fmt.Errorf("confirm relay absence before uninstall: %w", err)
-		}
-		runLock, runLockErr := waitForRelayRunLock(5 * time.Second)
-		if runLockErr != nil {
-			return fmt.Errorf("relay process remains live outside launchd; refusing to remove its service definition: %w", runLockErr)
-		}
-		defer runLock.Close()
-		plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
-		if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove launchd plist: %w", err)
-		}
-		fmt.Printf("Stopped launchd agent and removed %s\n", plistPath)
 	case "linux":
 		_ = exec.Command("systemctl", "--user", "disable", "--now", systemdUnit).Run()
 		unitPath := filepath.Join(home, ".config", "systemd", "user", systemdUnit)
@@ -478,6 +511,34 @@ func uninstall() error {
 	default:
 		return fmt.Errorf("uninstall is only supported on macOS and Linux")
 	}
+	return nil
+}
+
+func uninstallLaunchd(uid int, home string) error {
+	for _, domain := range []string{fmt.Sprintf("gui/%d", uid), fmt.Sprintf("user/%d", uid)} {
+		loaded, probeErr := launchdJobLoadedBounded(domain + "/" + launchdLabel)
+		if probeErr != nil {
+			return fmt.Errorf("probe launchd agent before uninstall: %w", probeErr)
+		}
+		if loaded {
+			if err := removeLaunchdJob(domain); err != nil {
+				return fmt.Errorf("stop launchd agent before uninstall: %w", err)
+			}
+		}
+	}
+	if err := ensureNoLoadedRelay(uid); err != nil {
+		return fmt.Errorf("confirm relay absence before uninstall: %w", err)
+	}
+	runLock, runLockErr := waitForRelayRunLock(5 * time.Second)
+	if runLockErr != nil {
+		return fmt.Errorf("relay process remains live outside launchd; refusing to remove its service definition: %w", runLockErr)
+	}
+	defer runLock.Close()
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove launchd plist: %w", err)
+	}
+	fmt.Printf("Stopped launchd agent and removed %s\n", plistPath)
 	return nil
 }
 
@@ -502,7 +563,10 @@ func restartLaunchd(uid int) error {
 		return err
 	}
 	defer operationLock.Close()
-	loaded := loadedLaunchdDomains(uid)
+	loaded, err := loadedLaunchdDomains(uid)
+	if err != nil {
+		return err
+	}
 	if len(loaded) == 0 {
 		return fmt.Errorf("restart launchd service: relay is not loaded")
 	}
@@ -517,7 +581,7 @@ func restartLaunchd(uid int) error {
 	if serviceInstanceIDFromPlist(prior) == "" {
 		return scheduleLegacyLaunchdHandoff(loaded[0], plistPath, prior)
 	}
-	out, err := exec.Command("launchctl", "kickstart", "-k", target).CombinedOutput()
+	out, err := runLaunchctlBounded("kickstart", "-k", target)
 	if err != nil {
 		return fmt.Errorf("restart launchd service %s: %w (%s)", target, err, strings.TrimSpace(string(out)))
 	}
@@ -567,7 +631,11 @@ func scheduleLegacyLaunchdHandoff(domain, plistPath string, prior []byte) error 
 	rollback := filepath.Join(stageDir, "handoff-prior-"+instanceID)
 	label := launchdLabel + ".handoff"
 	helper := filepath.Join(stageDir, "handoff-job")
-	if exec.Command("launchctl", "print", domain+"/"+label).Run() == nil {
+	helperLoaded, probeErr := launchdJobLoadedBounded(domain + "/" + label)
+	if probeErr != nil {
+		return fmt.Errorf("probe stale migration helper: %w", probeErr)
+	}
+	if helperLoaded {
 		if err := removeLaunchdLabel(domain, label); err != nil {
 			return fmt.Errorf("remove stale migration helper: %w", err)
 		}
@@ -590,14 +658,14 @@ func scheduleLegacyLaunchdHandoff(domain, plistPath string, prior []byte) error 
 		}
 		return err
 	}
-	if out, err := exec.Command("launchctl", "bootstrap", domain, helper).CombinedOutput(); err != nil {
+	if out, err := runLaunchctlBounded("bootstrap", domain, helper); err != nil {
 		cause := fmt.Errorf("bootstrap migration helper: %w (%s)", err, strings.TrimSpace(string(out)))
 		if cleanupErr := cleanupLaunchdHandoff(domain, label, candidate, rollback, helper); cleanupErr != nil {
 			return fmt.Errorf("%w; cleanup failed: %v", cause, cleanupErr)
 		}
 		return cause
 	}
-	if out, err := exec.Command("launchctl", "kickstart", domain+"/"+label).CombinedOutput(); err != nil {
+	if out, err := runLaunchctlBounded("kickstart", domain+"/"+label); err != nil {
 		cause := fmt.Errorf("start migration helper: %w (%s)", err, strings.TrimSpace(string(out)))
 		if cleanupErr := cleanupLaunchdHandoff(domain, label, candidate, rollback, helper); cleanupErr != nil {
 			return fmt.Errorf("%w; cleanup failed: %v", cause, cleanupErr)
@@ -654,15 +722,15 @@ func completeLaunchdHandoff(args []string) error {
 	defer os.Remove(rollback)
 	defer os.Remove(helperPath)
 	if err := removeLaunchdJob(domain); err != nil {
-		return err
+		return recoverPriorAfterRemovalFailure(domain, plistPath, prior, 0o644, err)
 	}
 	runLock, err := waitForRelayRunLock(5 * time.Second)
 	if err != nil {
-		return restorePriorLaunchd(plistPath, prior, 0o644, domain, err)
+		return restorePriorLaunchd(plistPath, prior, 0o644, domain, heartbeatSuccessCount(), err)
 	}
 	if err := os.Rename(candidate, plistPath); err != nil {
 		_ = runLock.Close()
-		return restorePriorLaunchd(plistPath, prior, 0o644, domain, err)
+		return restorePriorLaunchd(plistPath, prior, 0o644, domain, heartbeatSuccessCount(), err)
 	}
 	baseline := heartbeatSuccessCount()
 	_ = runLock.Close()
@@ -670,7 +738,7 @@ func completeLaunchdHandoff(args []string) error {
 		if absenceErr := ensureNoLoadedRelay(os.Getuid()); absenceErr != nil {
 			return fmt.Errorf("%w; cannot safely rollback: %v", err, absenceErr)
 		}
-		return restorePriorLaunchd(plistPath, prior, 0o644, domain, err)
+		return restorePriorLaunchd(plistPath, prior, 0o644, domain, heartbeatSuccessCount(), err)
 	}
 	// Everything the helper owns must be durable or removed before it synchronously
 	// asks launchd to terminate this one-shot job; no goroutine can outlive it.
@@ -709,7 +777,10 @@ func cleanupLaunchdHandoff(domain, label string, paths ...string) error {
 			failures = append(failures, "remove "+path+": "+err.Error())
 		}
 	}
-	if exec.Command("launchctl", "print", domain+"/"+label).Run() == nil {
+	loaded, probeErr := launchdJobLoadedBounded(domain + "/" + label)
+	if probeErr != nil {
+		failures = append(failures, "probe launchd handoff: "+probeErr.Error())
+	} else if loaded {
 		if err := removeLaunchdLabel(domain, label); err != nil {
 			failures = append(failures, err.Error())
 		}
@@ -722,14 +793,69 @@ func cleanupLaunchdHandoff(domain, label string, paths ...string) error {
 
 func removeLaunchdLabel(domain, label string) error {
 	target := domain + "/" + label
-	out, err := exec.Command("launchctl", "bootout", target).CombinedOutput()
+	out, err := runLaunchctlBounded("bootout", target)
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 113 {
+			return nil
+		}
 		return fmt.Errorf("bootout %s: %w (%s)", target, err, strings.TrimSpace(string(out)))
 	}
-	if exec.Command("launchctl", "print", target).Run() == nil {
-		return fmt.Errorf("bootout %s returned success but job remains loaded", target)
+	// launchctl can return from bootout before the job disappears from print. That
+	// transition is observable on real Macs and is not a failed removal. Wait for a
+	// bounded absence instead of falsely failing a transactional replacement after
+	// we have already stopped the prior service.
+	deadline := time.Now().Add(launchdRemovalTimeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("bootout %s returned success but job remains loaded", target)
+		}
+		if remaining > time.Second {
+			remaining = time.Second
+		}
+		loaded, err := launchdJobLoadedWithin(target, remaining)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			return fmt.Errorf("check bootout %s: %w", target, err)
+		}
+		if !loaded {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("bootout %s returned success but job remains loaded", target)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	return nil
+}
+
+func runLaunchctlBounded(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), launchctlCommandTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "launchctl", args...).CombinedOutput()
+}
+
+func launchdJobLoadedBounded(target string) (bool, error) {
+	return launchdJobLoadedWithin(target, launchctlCommandTimeout)
+}
+
+func launchdJobLoadedWithin(target string, timeout time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	err := exec.CommandContext(ctx, "launchctl", "print", target).Run()
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 113 {
+		return false, nil
+	}
+	return false, err
 }
 
 func waitForServiceOperationLock(timeout time.Duration) (*os.File, error) {

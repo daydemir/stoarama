@@ -66,10 +66,10 @@ jobs:
       # A forced droplet roll assumes a draining droplet stops taking work; if that
       # ever regressed, the drain would look clean while the old capture binary kept
       # leasing new windows until the drain timeout killed it mid-capture.
-      - name: Test droplet lease gating
+      - name: Test recorder lease gating and relay balancing
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run 'TestRecordingJobsLease(RespectsDropletCapacityOne|RefusesDrainingDroplet)' -count=1
+        run: go test ./internal/api -run 'Test(RecordingJobsLease(RespectsDropletCapacityOne|RefusesDrainingDroplet)|RelayGroupLeaseCapConcurrent)' -count=1
       - name: Test provisioning teardown lease safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

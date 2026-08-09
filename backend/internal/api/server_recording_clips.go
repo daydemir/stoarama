@@ -101,11 +101,11 @@ type recordingLeaseResponse struct {
 // input) and n.account_id=rec.account_id is the tenant wall, both enforced in SQL, so
 // a relay can only ever lease its own account's relay recordings.
 //
-// Capacity is authoritative because leaseRelayRecordingJob locks the authenticated
-// node and then its optional group before running this statement. Concurrent calls
-// for one computer serialize on the node; calls from computers sharing an internet
-// group serialize on the group. Params: $1=NodeID, $2=billingDisabled, $3=margin,
-// $4=freshnessGrace.
+// Capacity and failure-domain fairness are authoritative because the lease path
+// locks the account, authenticated node, and optional group before running this
+// statement. Heartbeats intentionally retain only node/group locks, so a slow job
+// row cannot couple independent internet groups. Params: $1=NodeID,
+// $2=billingDisabled, $3=margin, $4=freshnessGrace.
 const relayLeaseSQL = `
 	WITH cte AS (
 	  SELECT j.id
@@ -136,11 +136,52 @@ const relayLeaseSQL = `
 	         WHERE aj.status = 'leased'
 	           AND aj.lease_owner = 'node:' || $1::text
 	           AND aj.lease_expires_at > now()) < n.relay_max_streams
+	    -- Prefer the least-loaded healthy internet group before balancing machines
+	    -- inside it. A group participates only while it has an online node with spare
+	    -- node and group capacity. The fallback is measured from this job's first
+	    -- actual lease opportunity, not its scheduled time, so an old recovery batch
+	    -- still balances while a heartbeat-only peer can delay one job by at most 3s.
+	    AND (j.relay_fairness_started_at <= now()-interval '3 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
+	         SELECT 1
+	         FROM relay_groups peer_group
+	         CROSS JOIN LATERAL (
+	              SELECT COUNT(*) AS lease_count
+	              FROM recording_jobs peer_group_jobs
+	              JOIN nodes peer_group_nodes
+	                ON peer_group_jobs.lease_owner='node:'||peer_group_nodes.id::text
+	              WHERE peer_group_nodes.account_id=n.account_id
+	                AND peer_group_nodes.relay_group_id=peer_group.id
+	                AND peer_group_jobs.status='leased'
+	                AND peer_group_jobs.lease_expires_at>now()
+	         ) peer_group_load
+	         WHERE peer_group.account_id=n.account_id
+	           AND peer_group.id<>n.relay_group_id
+	           AND peer_group_load.lease_count < peer_group.max_streams
+	           AND EXISTS (
+	                SELECT 1 FROM nodes peer_group_node
+	                WHERE peer_group_node.account_id=n.account_id
+	                  AND peer_group_node.relay_group_id=peer_group.id
+	                  AND peer_group_node.node_type='relay'
+	                  AND peer_group_node.status='active'
+	                  AND peer_group_node.last_heartbeat_at>=now()-interval '120 seconds'
+	                  AND (SELECT COUNT(*) FROM recording_jobs peer_node_jobs
+	                       WHERE peer_node_jobs.status='leased'
+	                         AND peer_node_jobs.lease_owner='node:'||peer_group_node.id::text
+	                         AND peer_node_jobs.lease_expires_at>now()) < peer_group_node.relay_max_streams)
+	           AND peer_group_load.lease_count <
+	               (SELECT COUNT(*)
+	                FROM recording_jobs current_group_jobs
+	                JOIN nodes current_group_nodes
+	                  ON current_group_jobs.lease_owner='node:'||current_group_nodes.id::text
+	                WHERE current_group_nodes.account_id=n.account_id
+	                  AND current_group_nodes.relay_group_id=n.relay_group_id
+	                  AND current_group_jobs.status='leased'
+	                  AND current_group_jobs.lease_expires_at>now())))
 	    -- Within a group, only a least-loaded healthy node may take the next job.
 	    -- The surrounding group row lock makes this comparison authoritative, so
 	    -- simultaneous pollers converge on an even distribution instead of the
 	    -- fastest poller monopolizing long continuous-window leases.
-	    AND (j.scheduled_for <= now()-interval '3 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
+	    AND (j.relay_fairness_started_at <= now()-interval '3 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
 	         SELECT 1 FROM nodes peer
 	         WHERE peer.account_id=n.account_id
 	           AND peer.relay_group_id=n.relay_group_id
@@ -199,7 +240,36 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 		return resp, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var accountID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, principal.AccountID).Scan(&accountID); err != nil {
+		return resp, err
+	}
 	if err := lockRelayNodeAndGroup(ctx, tx, principal); err != nil {
+		return resp, err
+	}
+	// Start the bounded fairness turn only when the oldest due relay job is first
+	// considered. Using scheduled_for would let an overdue recovery batch bypass all
+	// balancing immediately; setting every pending job at once would do the same after
+	// three seconds. One row per poll preserves both distribution and bounded pickup.
+	if _, err := tx.Exec(ctx, `
+		UPDATE recording_jobs SET relay_fairness_started_at=now()
+		WHERE id=(
+		  SELECT j.id FROM recording_jobs j
+		  JOIN recordings rec ON rec.id=j.recording_id
+		  WHERE rec.account_id=$1 AND rec.capture_via='relay' AND rec.status='active'
+		    AND rec.start_at<=now() AND (rec.end_at IS NULL OR now()<rec.end_at)
+		    AND j.status='pending' AND j.scheduled_for<=now()
+		    AND (j.handoff_owner IS NULL
+		         OR j.handoff_owner<>'node:'||$2::bigint::text
+		         OR j.handoff_until<=now())
+		    AND ($3 OR EXISTS (
+		         SELECT 1 FROM account_billing b
+		         WHERE b.account_id=rec.account_id AND b.has_payment_method))
+		    AND (j.kind='continuous_window'
+		         OR j.fire_at+make_interval(secs=>(j.clip_duration_sec+$4))>now())
+		  ORDER BY j.scheduled_for,j.id LIMIT 1
+		) AND relay_fairness_started_at IS NULL
+	`, principal.AccountID, principal.NodeID, billingDisabled, recordingFreshnessGraceSec); err != nil {
 		return resp, err
 	}
 	err = tx.QueryRow(ctx, relayLeaseSQL,
@@ -1143,6 +1213,7 @@ const recordingJobSurrenderSQL = `
 	    lease_token = NULL,
 	    handoff_owner = $2,
 	    handoff_until = now() + interval '5 minutes',
+	    relay_fairness_started_at = NULL,
 	    error_text = $3,
 	    completed_at = NULL,
 	    updated_at = now()
