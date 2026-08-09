@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,12 @@ type relayConnectivityTransition struct {
 	NodeID          int64
 	Name            string
 	Hostname        string
+	RelayVersion    string
+	RelayStartedAt  string
+	RelayGroupID    *int64
+	RelayGroupName  string
+	ReportedJobs    int
+	LiveLeases      int
 	OrgName         string
 	OrgEmail        string
 	State           relayConnectivityState
@@ -153,7 +160,16 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }, now time.Time) ([]relayConnectivityTransition, error) {
 	rows, err := q.Query(ctx, `
-		SELECT n.id, n.display_name, n.hostname, a.name, a.email, n.last_heartbeat_at,
+		SELECT n.id, n.display_name, n.hostname,
+		       COALESCE(n.capabilities_jsonb->>'relay_version',''),
+		       COALESCE(n.capabilities_jsonb->>'relay_started_at',''),
+		       n.relay_group_id, COALESCE(g.name,''),
+		       CASE WHEN jsonb_typeof(n.capabilities_jsonb->'active_jobs')='number'
+		            THEN n.capabilities_jsonb->>'active_jobs' ELSE '' END,
+		       (SELECT count(*) FROM recording_jobs live_jobs
+		         WHERE live_jobs.lease_owner='node:'||n.id::text
+		           AND live_jobs.status='leased' AND live_jobs.lease_expires_at>$2)::integer,
+		       a.name, a.email, n.last_heartbeat_at,
 		       EXISTS (
 		         SELECT 1 FROM recording_jobs j
 		         WHERE j.lease_owner='node:'||n.id::text
@@ -163,6 +179,7 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 		       ) AS active_capture
 		FROM nodes n
 		JOIN accounts a ON a.id=n.account_id
+		LEFT JOIN relay_groups g ON g.id=n.relay_group_id AND g.account_id=n.account_id
 		WHERE n.node_type='relay' AND n.status='active' AND n.account_id=$1
 		ORDER BY n.id
 	`, relayConnectivityAlertAccountID, now)
@@ -173,13 +190,26 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 	states := []relayConnectivityTransition{}
 	for rows.Next() {
 		var state relayConnectivityTransition
-		if err := rows.Scan(&state.NodeID, &state.Name, &state.Hostname, &state.OrgName, &state.OrgEmail, &state.LastHeartbeatAt, &state.ActiveCapture); err != nil {
+		var reportedJobs string
+		if err := rows.Scan(&state.NodeID, &state.Name, &state.Hostname,
+			&state.RelayVersion, &state.RelayStartedAt, &state.RelayGroupID, &state.RelayGroupName,
+			&reportedJobs, &state.LiveLeases,
+			&state.OrgName, &state.OrgEmail, &state.LastHeartbeatAt, &state.ActiveCapture); err != nil {
 			return nil, err
 		}
+		state.ReportedJobs = parseRelayReportedJobs(reportedJobs)
 		state.State = relayStateAt(state.LastHeartbeatAt, state.ActiveCapture, now)
 		states = append(states, state)
 	}
 	return states, rows.Err()
+}
+
+func parseRelayReportedJobs(raw string) int {
+	jobs, err := strconv.Atoi(raw)
+	if err != nil || jobs < 0 {
+		return 0
+	}
+	return jobs
 }
 
 func relayStateAt(lastHeartbeatAt *time.Time, activeCapture bool, now time.Time) relayConnectivityState {

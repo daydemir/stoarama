@@ -3,13 +3,18 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	appconfig "github.com/daydemir/stoarama/backend/internal/config"
 )
 
 // The thresholds are deliberate, measured values rather than knobs: an idle
@@ -246,16 +251,20 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		CREATE TYPE relay_connectivity_state AS ENUM ('online', 'offline');
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL);
 		CREATE TABLE users (email TEXT PRIMARY KEY, is_operator BOOLEAN NOT NULL);
-		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, display_name TEXT NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ);
-		CREATE TABLE recording_jobs (id BIGSERIAL PRIMARY KEY, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, status TEXT NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, window_end_at TIMESTAMPTZ);
+		CREATE TABLE relay_groups (id BIGINT, account_id BIGINT, name TEXT NOT NULL, max_streams INTEGER NOT NULL, PRIMARY KEY(account_id,id));
+		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, display_name TEXT NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ, capabilities_jsonb JSONB NOT NULL DEFAULT '{}', relay_group_id BIGINT, relay_max_streams INTEGER NOT NULL);
+		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, capture_via TEXT NOT NULL, status TEXT NOT NULL);
+		CREATE TABLE recording_jobs (id BIGSERIAL PRIMARY KEY, recording_id BIGINT, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, status TEXT NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, window_end_at TIMESTAMPTZ, clip_duration_sec INTEGER);
+		CREATE TABLE connections (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL, nas_storage_total_bytes BIGINT, nas_storage_free_bytes BIGINT, nas_storage_reported_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_states (node_id BIGINT PRIMARY KEY, observed_state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL);
 		CREATE TABLE relay_connectivity_alert_events (id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL, node_id BIGINT NOT NULL, state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, last_heartbeat_at TIMESTAMPTZ, notified_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_deliveries (event_id BIGINT NOT NULL, recipient TEXT NOT NULL, delivered_at TIMESTAMPTZ, PRIMARY KEY (event_id, recipient));
-		INSERT INTO accounts VALUES (1, 'MIT SCL', 'scl@example.edu'), (2, 'Other Org', 'other@example.edu');
+		INSERT INTO accounts VALUES (47, 'MIT SCL', 'scl@example.edu'), (2, 'Other Org', 'other@example.edu');
 		INSERT INTO users VALUES ('deniz@aydemir.us', true);
-		INSERT INTO nodes VALUES
-		  (7, 1, 'relay', 'MIT-MAC-1', 'mit-mac-1', 'active', '2026-07-22T12:00:00Z'),
-		  (8, 2, 'relay', 'OTHER-RELAY', 'other-relay', 'active', '2026-07-22T12:00:00Z');
+		INSERT INTO relay_groups VALUES (3,47,'deniz-durham',20);
+		INSERT INTO nodes (id,account_id,node_type,display_name,hostname,status,last_heartbeat_at,capabilities_jsonb,relay_group_id,relay_max_streams) VALUES
+		  (7, 47, 'relay', 'MIT-MAC-1', 'mit-mac-1', 'active', '2026-07-22T12:00:00Z', '{"relay_version":"abc123","relay_started_at":"2026-07-22T11:00:00Z","active_jobs":2}', 3, 5),
+		  (8, 2, 'relay', 'OTHER-RELAY', 'other-relay', 'active', '2026-07-22T12:00:00Z', '{}', NULL, 5);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -265,25 +274,67 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	if err != nil || len(states) != 1 || states[0].OrgName != "MIT SCL" {
 		t.Fatalf("alert-scoped relay states=%v err=%v", states, err)
 	}
+	if states[0].RelayVersion != "abc123" || states[0].RelayStartedAt != "2026-07-22T11:00:00Z" ||
+		states[0].RelayGroupID == nil || *states[0].RelayGroupID != 3 || states[0].RelayGroupName != "deniz-durham" ||
+		states[0].ReportedJobs != 2 || states[0].LiveLeases != 0 {
+		t.Fatalf("relay diagnostics missing from state: %+v", states[0])
+	}
+	for _, capabilities := range []string{`{"active_jobs":1.5}`, `{"active_jobs":-1}`} {
+		if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb=$1 WHERE id=7`, capabilities); err != nil {
+			t.Fatal(err)
+		}
+		malformed, err := currentRelayConnectivity(ctx, pool, now)
+		if err != nil || len(malformed) != 1 || malformed[0].ReportedJobs != 0 {
+			t.Fatalf("malformed reported jobs capabilities=%s states=%v err=%v", capabilities, malformed, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{"relay_version":"abc123","relay_started_at":"2026-07-22T11:00:00Z","active_jobs":2}' WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now.Add(-4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `
-		UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7;
 		INSERT INTO recording_jobs (lease_owner,lease_expires_at,status,kind,fire_at,window_end_at)
-		VALUES ('node:7',$2,'leased','continuous_window',$3,$4)
-	`, now.Add(-4*time.Minute), now.Add(70*time.Second), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
+		VALUES ('node:7',$1,'leased','continuous_window',$2,$3)
+	`, now.AddDate(10, 0, 0), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	states, err = currentRelayConnectivity(ctx, pool, now)
-	if err != nil || len(states) != 1 || !states[0].ActiveCapture || states[0].State != relayOffline {
+	if err != nil || len(states) != 1 || !states[0].ActiveCapture || states[0].State != relayOffline || states[0].LiveLeases != 1 {
 		t.Fatalf("capturing stale relay states=%v err=%v, want fast offline", states, err)
+	}
+	output := captureStdout(t, func() {
+		testDatabaseURL, err := url.Parse(cfg.ConnString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		query := testDatabaseURL.Query()
+		query.Set("search_path", schema)
+		testDatabaseURL.RawQuery = query.Encode()
+		runRelayConnectivity(ctx, appconfig.Config{DatabaseURL: testDatabaseURL.String()}, []string{"run", "--dry-run"})
+	})
+	var dryRun struct {
+		DryRun bool                          `json:"dry_run"`
+		Relays []relayConnectivityTransition `json:"relays"`
+	}
+	if err := json.Unmarshal(output, &dryRun); err != nil || !dryRun.DryRun || len(dryRun.Relays) != 1 {
+		t.Fatalf("dry-run output=%s err=%v", output, err)
+	}
+	if relay := dryRun.Relays[0]; relay.RelayStartedAt != "2026-07-22T11:00:00Z" || relay.RelayGroupID == nil || *relay.RelayGroupID != 3 || relay.LiveLeases != 1 {
+		t.Fatalf("dry-run relay diagnostics=%+v", relay)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET lease_expires_at=$1`, now.Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	states, err = currentRelayConnectivity(ctx, pool, now)
-	if err != nil || len(states) != 1 || states[0].ActiveCapture || states[0].State != relayOnline {
+	if err != nil || len(states) != 1 || states[0].ActiveCapture || states[0].State != relayOnline || states[0].LiveLeases != 0 {
 		t.Fatalf("expired lease states=%v err=%v, want idle-threshold online", states, err)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs; UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7`, now); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := recordRelayConnectivity(ctx, pool, now); err != nil || len(got) != 0 {
@@ -291,9 +342,11 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO relay_connectivity_alert_events (account_id, node_id, state, observed_at)
-		VALUES (1, 7, 'offline', $1), (2, 8, 'offline', $1);
-		UPDATE nodes SET account_id=2 WHERE id=7;
+		VALUES (47, 7, 'offline', $1), (2, 8, 'offline', $1)
 	`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET account_id=2 WHERE id=7`); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := pendingRelayConnectivity(ctx, pool)
@@ -301,7 +354,7 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		t.Fatalf("account-snapshotted pending transitions=%v err=%v", pending, err)
 	}
 	if _, err := pool.Exec(ctx, `
-		UPDATE nodes SET account_id=1 WHERE id=7;
+		UPDATE nodes SET account_id=47 WHERE id=7;
 		DELETE FROM relay_connectivity_alert_events;
 		ALTER SEQUENCE relay_connectivity_alert_events_id_seq RESTART WITH 1;
 	`); err != nil {
@@ -342,3 +395,26 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 }
 
 func timePtr(value time.Time) *time.Time { return &value }
+
+func captureStdout(t *testing.T, run func()) []byte {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdout
+	os.Stdout = writer
+	run()
+	os.Stdout = previous
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output
+}
