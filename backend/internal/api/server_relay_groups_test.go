@@ -170,6 +170,71 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings VALUES
+		  (7,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/7.m3u8',NULL,1,NULL),
+		  (8,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/8.m3u8',NULL,1,NULL);
+		INSERT INTO recording_jobs
+		  (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at,handoff_owner,handoff_until)
+		VALUES
+		  (7,7,'pending',now()-interval '2 minutes','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour','node:1',now()+interval '5 minutes'),
+		  (8,8,'pending',now()-interval '1 minute','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour',NULL,NULL);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	handoffLease, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 47, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
+	if err != nil {
+		t.Fatalf("lease behind handed-off oldest job: %v", err)
+	}
+	if handoffLease.JobID != 8 {
+		t.Fatalf("leased job=%d want later eligible job 8", handoffLease.JobID)
+	}
+	var handedOffFairness *time.Time
+	if err := pool.QueryRow(ctx, `SELECT relay_fairness_started_at FROM recording_jobs WHERE id=7`).Scan(&handedOffFairness); err != nil {
+		t.Fatal(err)
+	}
+	if handedOffFairness != nil {
+		t.Fatal("handed-off job incorrectly started its fairness timer")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET status='complete',lease_expires_at=NULL WHERE id IN (7,8)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings VALUES
+		  (9,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/9.m3u8',NULL,1,NULL);
+		INSERT INTO recording_jobs
+		  (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at)
+		VALUES
+		  (9,9,'pending',now()-interval '1 minute','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour');
+		INSERT INTO account_billing VALUES (47,false);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 47, NodeType: nodeTypeRelay}, false, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("lease without payment err=%v, want pgx.ErrNoRows", err)
+	}
+	var unpaidFairness *time.Time
+	if err := pool.QueryRow(ctx, `SELECT relay_fairness_started_at FROM recording_jobs WHERE id=9`).Scan(&unpaidFairness); err != nil {
+		t.Fatal(err)
+	}
+	if unpaidFairness != nil {
+		t.Fatal("unpaid job incorrectly started its fairness timer")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE account_billing SET has_payment_method=true WHERE account_id=47`); err != nil {
+		t.Fatal(err)
+	}
+	paidLease, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 47, NodeType: nodeTypeRelay}, false, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
+	if err != nil {
+		t.Fatalf("lease after payment became available: %v", err)
+	}
+	if paidLease.JobID != 9 {
+		t.Fatalf("leased job=%d want newly eligible job 9", paidLease.JobID)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET status='complete',lease_expires_at=NULL WHERE id=9`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pool.Exec(ctx, `
 		UPDATE relay_groups SET max_streams=10 WHERE id=1;
 		INSERT INTO recordings VALUES
 		  (10, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/10.m3u8', NULL, 1, NULL),

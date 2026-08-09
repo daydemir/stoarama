@@ -22,12 +22,14 @@ import (
 var templatesFS embed.FS
 
 const (
-	launchdLabel            = "com.stoarama.relay"
-	systemdUnit             = "stoarama-relay.service"
-	launchdReadinessTimeout = 2*heartbeatInterval + 15*time.Second
+	launchdLabel = "com.stoarama.relay"
+	systemdUnit  = "stoarama-relay.service"
 )
 
-var launchdRemovalTimeout = 10 * time.Second
+var (
+	launchdReadinessTimeout = 2*heartbeatInterval + 15*time.Second
+	launchdRemovalTimeout   = 10 * time.Second
+)
 
 const launchctlCommandTimeout = 5 * time.Second
 
@@ -117,9 +119,8 @@ func installLaunchd() error {
 			return fmt.Errorf("relay job is loaded in %s but its canonical plist is not owned by this installer; refusing replacement", loaded[0])
 		}
 		priorDomain = loaded[0]
-		baseline := heartbeatSuccessCount()
 		if err := removeLaunchdJob(priorDomain); err != nil {
-			return recoverPriorAfterRemovalFailure(priorDomain, plistPath, prior, priorMode, baseline, fmt.Errorf("stop prior relay for replacement: %w", err))
+			return recoverPriorAfterRemovalFailure(priorDomain, plistPath, prior, priorMode, fmt.Errorf("stop prior relay for replacement: %w", err))
 		}
 		runLock, err = waitForRelayRunLock(5 * time.Second)
 	} else {
@@ -128,7 +129,7 @@ func installLaunchd() error {
 	if err != nil {
 		cause := fmt.Errorf("relay process is still running; wait for active recordings to finish, then rerun install-launchd (or run uninstall only after confirming it is safe to stop recordings): %w", err)
 		if priorDomain != "" {
-			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, cause)
+			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, heartbeatSuccessCount(), cause)
 		}
 		return cause
 	}
@@ -136,7 +137,7 @@ func installLaunchd() error {
 	if err := os.Rename(stagedPath, plistPath); err != nil {
 		cause := fmt.Errorf("install launchd plist: %w", err)
 		if priorDomain != "" {
-			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, cause)
+			return restorePriorLaunchd(plistPath, prior, priorMode, priorDomain, heartbeatSuccessCount(), cause)
 		}
 		return cause
 	}
@@ -164,11 +165,11 @@ func installLaunchd() error {
 	return nil
 }
 
-func restorePriorLaunchd(plistPath string, prior []byte, priorMode os.FileMode, priorDomain string, cause error) error {
+func restorePriorLaunchd(plistPath string, prior []byte, priorMode os.FileMode, priorDomain string, baseline uint64, cause error) error {
 	if err := restorePriorFile(plistPath, prior, priorMode, true); err != nil {
 		return fmt.Errorf("%w; prior plist restoration failed: %v", cause, err)
 	}
-	if err := bootstrapLaunchd(priorDomain, plistPath, serviceInstanceIDFromPlist(prior), heartbeatSuccessCount()); err != nil {
+	if err := bootstrapLaunchd(priorDomain, plistPath, serviceInstanceIDFromPlist(prior), baseline); err != nil {
 		return fmt.Errorf("%w; prior service rollback failed: %v", cause, err)
 	}
 	return fmt.Errorf("%w; prior service was restored and verified", cause)
@@ -226,13 +227,14 @@ func removeLaunchdJob(domain string) error {
 	return removeLaunchdLabel(domain, launchdLabel)
 }
 
-func recoverPriorAfterRemovalFailure(domain, plistPath string, prior []byte, priorMode os.FileMode, baseline uint64, cause error) error {
+func recoverPriorAfterRemovalFailure(domain, plistPath string, prior []byte, priorMode os.FileMode, cause error) error {
 	target := domain + "/" + launchdLabel
 	loaded, probeErr := launchdJobLoadedBounded(target)
 	if probeErr != nil {
 		return fmt.Errorf("%w; prior relay recovery probe failed: %v", cause, probeErr)
 	}
 	if loaded {
+		baseline := heartbeatSuccessCount()
 		startedAt := time.Now().UTC()
 		out, err := runLaunchctlBounded("kickstart", "-k", target)
 		if err != nil {
@@ -245,24 +247,14 @@ func recoverPriorAfterRemovalFailure(domain, plistPath string, prior []byte, pri
 			if stillLoaded {
 				return fmt.Errorf("%w; prior relay recovery kickstart failed while job remains loaded: %v (%s)", cause, err, strings.TrimSpace(string(out)))
 			}
-			return bootstrapPriorAfterRemoval(plistPath, prior, priorMode, domain, baseline, cause)
+			return restorePriorLaunchd(plistPath, prior, priorMode, domain, heartbeatSuccessCount(), cause)
 		}
 		if !waitLaunchdReady(domain, serviceInstanceIDFromPlist(prior), startedAt, baseline, launchdReadinessTimeout) {
 			return fmt.Errorf("%w; prior relay recovery did not produce two verified heartbeats", cause)
 		}
 		return fmt.Errorf("%w; prior relay remained loaded and was restarted and verified", cause)
 	}
-	return bootstrapPriorAfterRemoval(plistPath, prior, priorMode, domain, baseline, cause)
-}
-
-func bootstrapPriorAfterRemoval(plistPath string, prior []byte, priorMode os.FileMode, domain string, baseline uint64, cause error) error {
-	if err := restorePriorFile(plistPath, prior, priorMode, true); err != nil {
-		return fmt.Errorf("%w; prior plist restoration failed: %v", cause, err)
-	}
-	if err := bootstrapLaunchd(domain, plistPath, serviceInstanceIDFromPlist(prior), baseline); err != nil {
-		return fmt.Errorf("%w; prior service rollback failed: %v", cause, err)
-	}
-	return fmt.Errorf("%w; prior service was restored and verified", cause)
+	return restorePriorLaunchd(plistPath, prior, priorMode, domain, heartbeatSuccessCount(), cause)
 }
 
 func loadedLaunchdDomains(uid int) ([]string, error) {
@@ -507,31 +499,9 @@ func uninstall() error {
 			return lockErr
 		}
 		defer operationLock.Close()
-		uid := os.Getuid()
-		for _, domain := range []string{fmt.Sprintf("gui/%d", uid), fmt.Sprintf("user/%d", uid)} {
-			loaded, probeErr := launchdJobLoadedBounded(domain + "/" + launchdLabel)
-			if probeErr != nil {
-				return fmt.Errorf("probe launchd agent before uninstall: %w", probeErr)
-			}
-			if loaded {
-				if err := removeLaunchdJob(domain); err != nil {
-					return fmt.Errorf("stop launchd agent before uninstall: %w", err)
-				}
-			}
+		if err := uninstallLaunchd(os.Getuid(), home); err != nil {
+			return err
 		}
-		if err := ensureNoLoadedRelay(uid); err != nil {
-			return fmt.Errorf("confirm relay absence before uninstall: %w", err)
-		}
-		runLock, runLockErr := waitForRelayRunLock(5 * time.Second)
-		if runLockErr != nil {
-			return fmt.Errorf("relay process remains live outside launchd; refusing to remove its service definition: %w", runLockErr)
-		}
-		defer runLock.Close()
-		plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
-		if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove launchd plist: %w", err)
-		}
-		fmt.Printf("Stopped launchd agent and removed %s\n", plistPath)
 	case "linux":
 		_ = exec.Command("systemctl", "--user", "disable", "--now", systemdUnit).Run()
 		unitPath := filepath.Join(home, ".config", "systemd", "user", systemdUnit)
@@ -541,6 +511,34 @@ func uninstall() error {
 	default:
 		return fmt.Errorf("uninstall is only supported on macOS and Linux")
 	}
+	return nil
+}
+
+func uninstallLaunchd(uid int, home string) error {
+	for _, domain := range []string{fmt.Sprintf("gui/%d", uid), fmt.Sprintf("user/%d", uid)} {
+		loaded, probeErr := launchdJobLoadedBounded(domain + "/" + launchdLabel)
+		if probeErr != nil {
+			return fmt.Errorf("probe launchd agent before uninstall: %w", probeErr)
+		}
+		if loaded {
+			if err := removeLaunchdJob(domain); err != nil {
+				return fmt.Errorf("stop launchd agent before uninstall: %w", err)
+			}
+		}
+	}
+	if err := ensureNoLoadedRelay(uid); err != nil {
+		return fmt.Errorf("confirm relay absence before uninstall: %w", err)
+	}
+	runLock, runLockErr := waitForRelayRunLock(5 * time.Second)
+	if runLockErr != nil {
+		return fmt.Errorf("relay process remains live outside launchd; refusing to remove its service definition: %w", runLockErr)
+	}
+	defer runLock.Close()
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove launchd plist: %w", err)
+	}
+	fmt.Printf("Stopped launchd agent and removed %s\n", plistPath)
 	return nil
 }
 
@@ -723,25 +721,24 @@ func completeLaunchdHandoff(args []string) error {
 	defer os.Remove(candidate)
 	defer os.Remove(rollback)
 	defer os.Remove(helperPath)
-	baseline := heartbeatSuccessCount()
 	if err := removeLaunchdJob(domain); err != nil {
-		return recoverPriorAfterRemovalFailure(domain, plistPath, prior, 0o644, baseline, err)
+		return recoverPriorAfterRemovalFailure(domain, plistPath, prior, 0o644, err)
 	}
 	runLock, err := waitForRelayRunLock(5 * time.Second)
 	if err != nil {
-		return restorePriorLaunchd(plistPath, prior, 0o644, domain, err)
+		return restorePriorLaunchd(plistPath, prior, 0o644, domain, heartbeatSuccessCount(), err)
 	}
 	if err := os.Rename(candidate, plistPath); err != nil {
 		_ = runLock.Close()
-		return restorePriorLaunchd(plistPath, prior, 0o644, domain, err)
+		return restorePriorLaunchd(plistPath, prior, 0o644, domain, heartbeatSuccessCount(), err)
 	}
-	baseline = heartbeatSuccessCount()
+	baseline := heartbeatSuccessCount()
 	_ = runLock.Close()
 	if err := bootstrapLaunchd(domain, plistPath, instanceID, baseline); err != nil {
 		if absenceErr := ensureNoLoadedRelay(os.Getuid()); absenceErr != nil {
 			return fmt.Errorf("%w; cannot safely rollback: %v", err, absenceErr)
 		}
-		return restorePriorLaunchd(plistPath, prior, 0o644, domain, err)
+		return restorePriorLaunchd(plistPath, prior, 0o644, domain, heartbeatSuccessCount(), err)
 	}
 	// Everything the helper owns must be durable or removed before it synchronously
 	// asks launchd to terminate this one-shot job; no goroutine can outlive it.
@@ -798,6 +795,10 @@ func removeLaunchdLabel(domain, label string) error {
 	target := domain + "/" + label
 	out, err := runLaunchctlBounded("bootout", target)
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 113 {
+			return nil
+		}
 		return fmt.Errorf("bootout %s: %w (%s)", target, err, strings.TrimSpace(string(out)))
 	}
 	// launchctl can return from bootout before the job disappears from print. That

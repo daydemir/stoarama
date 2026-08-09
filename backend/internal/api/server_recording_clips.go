@@ -259,11 +259,17 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 		  WHERE rec.account_id=$1 AND rec.capture_via='relay' AND rec.status='active'
 		    AND rec.start_at<=now() AND (rec.end_at IS NULL OR now()<rec.end_at)
 		    AND j.status='pending' AND j.scheduled_for<=now()
+		    AND (j.handoff_owner IS NULL
+		         OR j.handoff_owner<>'node:'||$2::text
+		         OR j.handoff_until<=now())
+		    AND ($3 OR EXISTS (
+		         SELECT 1 FROM account_billing b
+		         WHERE b.account_id=rec.account_id AND b.has_payment_method))
 		    AND (j.kind='continuous_window'
-		         OR j.fire_at+make_interval(secs=>(j.clip_duration_sec+$2))>now())
+		         OR j.fire_at+make_interval(secs=>(j.clip_duration_sec+$4))>now())
 		  ORDER BY j.scheduled_for,j.id LIMIT 1
 		) AND relay_fairness_started_at IS NULL
-	`, principal.AccountID, recordingFreshnessGraceSec); err != nil {
+	`, principal.AccountID, principal.NodeID, billingDisabled, recordingFreshnessGraceSec); err != nil {
 		return resp, err
 	}
 	err = tx.QueryRow(ctx, relayLeaseSQL,

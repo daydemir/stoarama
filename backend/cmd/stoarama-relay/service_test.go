@@ -51,6 +51,34 @@ func TestLaunchdProbeRejectsUnexpectedFailure(t *testing.T) {
 	}
 }
 
+func TestUninstallLaunchdKeepsPlistOnUnexpectedProbeFailure(t *testing.T) {
+	fakeLaunchctl(t, `if [ "$1" = print ]; then exit 77; fi; exit 0`)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plistPath, []byte("prior"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := uninstallLaunchd(501, home); err == nil || !strings.Contains(err.Error(), "probe launchd agent before uninstall") {
+		t.Fatalf("uninstall error=%v", err)
+	}
+	if got, err := os.ReadFile(plistPath); err != nil || string(got) != "prior" {
+		t.Fatalf("plist changed after probe failure: %q err=%v", got, err)
+	}
+}
+
+func TestRemoveLaunchdLabelAcceptsAlreadyAbsentBootout(t *testing.T) {
+	fakeLaunchctl(t, `if [ "$1" = bootout ]; then exit 113; fi; exit 1`)
+	if err := removeLaunchdLabel("gui/501", launchdLabel); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRemovalTimeoutRestartsAndVerifiesPriorRelay(t *testing.T) {
 	oldTimeout := launchdRemovalTimeout
 	launchdRemovalTimeout = 100 * time.Millisecond
@@ -70,8 +98,33 @@ exit 1
 	if err == nil {
 		t.Fatal("persistent loaded job accepted as absent")
 	}
-	err = recoverPriorAfterRemovalFailure("gui/501", filepath.Join(t.TempDir(), "relay.plist"), prior, 0o644, 0, err)
+	err = recoverPriorAfterRemovalFailure("gui/501", filepath.Join(t.TempDir(), "relay.plist"), prior, 0o644, err)
 	if err == nil || !strings.Contains(err.Error(), "restarted and verified") {
+		t.Fatalf("recovery error=%v", err)
+	}
+}
+
+func TestRemovalRecoveryRequiresTwoHeartbeatsAfterKickstart(t *testing.T) {
+	oldTimeout := launchdReadinessTimeout
+	launchdReadinessTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { launchdReadinessTimeout = oldTimeout })
+	fakeLaunchctl(t, `
+if [ "$1" = print ]; then echo 'state = running'; exit 0; fi
+if [ "$1" = kickstart ]; then
+  echo '{"service_instance_id":"prior","heartbeat_success_count":2,"started_at":"2099-01-01T00:00:00Z"}' > "$HOME/.stoarama/relay-recovery.json"
+  exit 0
+fi
+exit 1
+`)
+	if err := os.MkdirAll(filepath.Join(os.Getenv("HOME"), ".stoarama"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recoveryStatePath(), []byte(`{"service_instance_id":"prior","heartbeat_success_count":1,"started_at":"2099-01-01T00:00:00Z"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prior := []byte(`<key>STOARAMA_SERVICE_INSTANCE_ID</key><string>prior</string>`)
+	err := recoverPriorAfterRemovalFailure("gui/501", filepath.Join(t.TempDir(), "relay.plist"), prior, 0o644, fmt.Errorf("removal unconfirmed"))
+	if err == nil || !strings.Contains(err.Error(), "did not produce two verified heartbeats") {
 		t.Fatalf("recovery error=%v", err)
 	}
 }
@@ -94,7 +147,7 @@ exit 1
 `)
 	path := filepath.Join(t.TempDir(), "relay.plist")
 	prior := []byte(`<key>STOARAMA_SERVICE_INSTANCE_ID</key><string>prior</string>`)
-	err := recoverPriorAfterRemovalFailure("gui/501", path, prior, 0o644, 0, fmt.Errorf("removal unconfirmed"))
+	err := recoverPriorAfterRemovalFailure("gui/501", path, prior, 0o644, fmt.Errorf("removal unconfirmed"))
 	if err == nil || !strings.Contains(err.Error(), "prior service was restored and verified") {
 		t.Fatalf("recovery error=%v", err)
 	}
