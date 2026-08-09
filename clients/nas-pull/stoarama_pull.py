@@ -149,7 +149,9 @@ class Config:
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 60)
         self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
         self.inventory_scan_interval_sec = env_int("STOARAMA_INVENTORY_SCAN_INTERVAL_SEC", INVENTORY_SCAN_INTERVAL_SEC)
-        self.inventory_scan_delay_ms = env_int("STOARAMA_INVENTORY_SCAN_DELAY_MS", 25)
+        # Hash throughput already bounds disk pressure. An additional per-file
+        # sleep makes a 100k+ first scan spend hours idle on small clips.
+        self.inventory_scan_delay_ms = env_int("STOARAMA_INVENTORY_SCAN_DELAY_MS", 0)
         self.inventory_hash_mbps = env_int("STOARAMA_INVENTORY_HASH_MBPS", 20)
         self.update_manifest_url = env_str(
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
@@ -289,7 +291,7 @@ class Inventory:
         with self.lock:
             self.db.close()
 
-    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live"):
+    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True):
         updated_at = utc_now_precise()
         with self.lock:
             self.db.execute(
@@ -307,6 +309,11 @@ class Inventory:
                     verified_at, int(mtime_ns), generation, updated_at,
                 ),
             )
+            if commit:
+                self.db.commit()
+
+    def _commit_scan_batch(self):
+        with self.lock:
             self.db.commit()
 
     def record_verified(self, clip):
@@ -442,9 +449,11 @@ class Inventory:
         generation = "scan-%s-%s" % (time.strftime("%Y%m%dT%H%M%S", time.gmtime()), os.urandom(4).hex())
         self._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
         scanned = 0
+        skipped = 0
         known_paths = set()
         for sidecar in cfg.output_dir.rglob("*.stoarama.json"):
             if stop_event.is_set():
+                self._commit_scan_batch()
                 return
             try:
                 clip = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -467,16 +476,19 @@ class Inventory:
                     mtime_ns = stat.st_mtime_ns
                 else:
                     state, verified_at, mtime_ns = "missing", None, 0
-                self._upsert(clip, state, verified_at, mtime_ns, generation)
+                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
+                    self._commit_scan_batch()
                     self.sync_dirty(cfg, generation, started_at)
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except Exception as exc:
+                skipped += 1
                 log("WARN", "inventory skipped sidecar=%s: %s" % (sidecar, exc))
         for path in cfg.output_dir.rglob("*"):
             if stop_event.is_set():
+                self._commit_scan_batch()
                 return
             try:
                 if (
@@ -501,14 +513,22 @@ class Inventory:
                              client_updated_at=excluded.client_updated_at,dirty=1""",
                         (relative, size_bytes, sha256, stat.st_mtime_ns, generation, updated_at),
                     )
-                    self.db.commit()
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
+                    self._commit_scan_batch()
                     self.sync_dirty(cfg, generation, started_at)
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except Exception as exc:
+                skipped += 1
                 log("WARN", "inventory skipped unmatched file=%s: %s" % (path, exc))
+        # Flush and publish every successfully observed row, but never promote a
+        # partial generation. In particular, do not turn unseen prior rows into
+        # "missing" when an unreadable/corrupt path was skipped.
+        self._commit_scan_batch()
+        self.sync_dirty(cfg, generation, started_at)
+        if skipped:
+            raise RuntimeError("inventory scan incomplete: %d path(s) could not be verified" % skipped)
         completed_at = utc_now_precise()
         with self.lock:
             self.db.execute(

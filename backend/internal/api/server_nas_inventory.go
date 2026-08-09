@@ -685,8 +685,12 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 	util.WriteJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) inventoryRows(r *http.Request, accountID, connectionID, afterID int64, limit int) (pgx.Rows, error) {
-	return s.pool.Query(r.Context(), `
+type nasInventoryQueryer interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+func inventoryRows(ctx context.Context, queryer nasInventoryQueryer, accountID, connectionID, afterID int64, limit int) (pgx.Rows, error) {
+	return queryer.Query(ctx, `
 		SELECT i.clip_id,i.recording_id,i.relative_path,i.size_bytes,i.sha256,i.state,i.verified_at,i.server_received_at,
 		       CASE WHEN c.id IS NULL THEN 'nas_only'
 		            WHEN i.state='missing' THEN 'missing'
@@ -723,7 +727,7 @@ func (s *Server) handleAccountConnectionInventoryList(w http.ResponseWriter, r *
 	if limit < 1 || limit > nasInventoryMaxPage {
 		limit = 200
 	}
-	rows, err := s.inventoryRows(r, principal.AccountID, connectionID, afterID, limit)
+	rows, err := inventoryRows(r.Context(), s.pool, principal.AccountID, connectionID, afterID, limit)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list inventory: %v", err))
 		return
@@ -783,8 +787,25 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 	if !ok {
 		return
 	}
+	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin inventory export: %v", err))
+		return
+	}
+	defer tx.Rollback(r.Context())
+	// The snapshot must not become an unbounded old xmin if a large client
+	// download stalls between pages. Normal API writes already time out at 60s;
+	// this additionally makes PostgreSQL retire an idle export transaction.
+	if _, err := tx.Exec(r.Context(), `SET LOCAL statement_timeout='30s'`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("bound inventory export: %v", err))
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `SET LOCAL idle_in_transaction_session_timeout='60s'`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("bound inventory export idle time: %v", err))
+		return
+	}
 	var exists bool
-	if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM connections WHERE id=$1 AND account_id=$2)`, connectionID, principal.AccountID).Scan(&exists); err != nil || !exists {
+	if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM connections WHERE id=$1 AND account_id=$2)`, connectionID, principal.AccountID).Scan(&exists); err != nil || !exists {
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load connection: %v", err))
 		} else {
@@ -806,7 +827,7 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 	}
 	var afterID int64
 	for {
-		rows, err := s.inventoryRows(r, principal.AccountID, connectionID, afterID, nasInventoryMaxPage)
+		rows, err := inventoryRows(r.Context(), tx, principal.AccountID, connectionID, afterID, nasInventoryMaxPage)
 		if err != nil {
 			failExport(fmt.Errorf("load inventory page: %w", err))
 			return
@@ -846,7 +867,7 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 			break
 		}
 	}
-	rows, err := s.pool.Query(r.Context(), `SELECT relative_path,size_bytes,sha256,state,server_received_at FROM nas_inventory_unmatched_files WHERE connection_id=$1 ORDER BY relative_path`, connectionID)
+	rows, err := tx.Query(r.Context(), `SELECT relative_path,size_bytes,sha256,state,server_received_at FROM nas_inventory_unmatched_files WHERE connection_id=$1 ORDER BY relative_path`, connectionID)
 	if err != nil {
 		failExport(fmt.Errorf("load unmatched files: %w", err))
 		return
@@ -872,6 +893,10 @@ func (s *Server) handleAccountConnectionInventoryCSV(w http.ResponseWriter, r *h
 	writer.Flush()
 	if err := writer.Error(); err != nil {
 		failExport(fmt.Errorf("flush unmatched files: %w", err))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		log.Printf("NAS inventory CSV export connection_id=%d snapshot commit failed: %v", connectionID, err)
 	}
 }
 
