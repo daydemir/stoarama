@@ -546,7 +546,10 @@ func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
 	completed := now.Add(-time.Minute)
 	call(connectionInventoryStatus{Generation: "complete", ScanStartedAt: &start, ScanCompletedAt: &completed, Clips: 10, Bytes: 1000, Mismatches: 7, Unmatched: 2, Digest: strings.Repeat("a", 64)})
 	call(connectionInventoryStatus{Generation: "same-time-conflict", ScanStartedAt: &start, ScanCompletedAt: &completed, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("c", 64)})
-	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &now, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0})
+	progressStarted := now.Add(-time.Minute)
+	passStarted := now.Add(-30 * time.Second)
+	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12345, ScanRowsSkipped: 2, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0})
+	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12000, ScanRowsSkipped: 1})
 	delayed := now.Add(-2 * time.Minute)
 	call(connectionInventoryStatus{Generation: "delayed", ScanStartedAt: &start, ScanCompletedAt: &delayed, Clips: 2, Bytes: 2, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("b", 64)})
 	var clips, bytesValue, mismatches, unmatched int64
@@ -557,5 +560,13 @@ func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
 	}
 	if clips != 10 || bytesValue != 1000 || mismatches != 7 || unmatched != 2 || digest != strings.Repeat("a", 64) || !storedCompleted.Equal(completed) {
 		t.Fatalf("completed summary regressed clips=%d bytes=%d mismatches=%d unmatched=%d digest=%q completed=%s", clips, bytesValue, mismatches, unmatched, digest, storedCompleted)
+	}
+	var storedPass time.Time
+	var visited, skipped int64
+	if err := pool.QueryRow(ctx, `SELECT inventory_scan_pass_started_at,inventory_scan_rows_visited,inventory_scan_rows_skipped FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&storedPass, &visited, &skipped); err != nil {
+		t.Fatal(err)
+	}
+	if !storedPass.Equal(passStarted) || visited != 12345 || skipped != 2 {
+		t.Fatalf("scan progress pass=%s visited=%d skipped=%d", storedPass, visited, skipped)
 	}
 }

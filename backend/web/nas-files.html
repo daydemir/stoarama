@@ -63,9 +63,9 @@
     function stat(label,value,detail='',cls=''){return`<div class="stat ${cls}"><span class="eyebrow">${esc(label)}</span><b>${esc(value)}</b>${detail?`<span class="muted">${esc(detail)}</span>`:''}</div>`;}
     function renderConnection(connection){
       if(!connection){connectionStats.hidden=true;connectionStatus.textContent='No NAS connection selected.';return;}
-      const mismatches=Number(connection.inventory_mismatches||0), unmatched=Number(connection.inventory_unmatched||0), scan=connection.inventory_scan_completed_at;
+      const mismatches=Number(connection.inventory_mismatches||0), unmatched=Number(connection.inventory_unmatched||0), scan=connection.inventory_scan_completed_at, pass=connection.inventory_scan_pass_started_at, visited=Number(connection.inventory_scan_rows_visited||0), skipped=Number(connection.inventory_scan_rows_skipped||0), active=pass&&(!scan||new Date(pass)>new Date(scan));
       connectionStatus.className='status'+(mismatches?' err':'');
-      connectionStatus.textContent=scan?`Inventory generation ${connection.inventory_generation||'unknown'} completed ${when(scan)}.`:'A full inventory scan has not completed yet. Server copies remain protected.';
+      connectionStatus.textContent=active?`Full inventory scan in progress: ${visited.toLocaleString()} filesystem entries visited${skipped?`, ${skipped.toLocaleString()} skipped`:''}; pass started ${when(pass)}. Server copies remain protected.`:scan?`Inventory generation ${connection.inventory_generation||'unknown'} completed ${when(scan)}${pass?`; latest pass visited ${visited.toLocaleString()} entries${skipped?` and skipped ${skipped.toLocaleString()}`:''}`:''}.`:'A full inventory scan has not completed yet. Server copies remain protected.';
       connectionStats.innerHTML=stat('NAS inventory',`${Number(connection.inventory_clips||0).toLocaleString()} files`,bytes(connection.inventory_bytes||0))
         +stat('Mismatches',mismatches.toLocaleString(),'path, size, or checksum',mismatches?'err':'')
         +stat('NAS only',unmatched.toLocaleString(),'not linked to a server clip',unmatched?'warn':'')

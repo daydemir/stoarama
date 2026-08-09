@@ -43,7 +43,7 @@ func TestWriteNASInventoryReportEmptyAndPopulated(t *testing.T) {
 		if !strings.Contains(textOut.String(), "connection=") {
 			t.Fatalf("missing report header: %q", textOut.String())
 		}
-		for _, marker := range []string{"snapshot_available=", "snapshot_consistent=", "storage_total=", "last_batch_clips="} {
+		for _, marker := range []string{"snapshot_available=", "snapshot_consistent=", "pass_started=", "rows_visited=", "rows_skipped=", "storage_total=", "last_batch_clips="} {
 			if !strings.Contains(textOut.String(), marker) {
 				t.Fatalf("missing status marker %q: %q", marker, textOut.String())
 			}

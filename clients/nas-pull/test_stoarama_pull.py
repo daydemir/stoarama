@@ -143,8 +143,12 @@ class NASPullTests(unittest.TestCase):
             self.assertTrue(pages)
             self.assertTrue(all(body.get("scan_started_at") == complete[0]["scan_started_at"] for body in pages))
             self.assertEqual(len(complete[0]["digest"]), 64)
-            self.assertEqual(inventory.summary()["mismatches"], 1)
-            self.assertEqual(inventory.summary()["unmatched"], 1)
+            summary = inventory.summary()
+            self.assertEqual(summary["mismatches"], 1)
+            self.assertEqual(summary["unmatched"], 1)
+            self.assertIsNotNone(summary["scan_pass_started_at"])
+            self.assertEqual(summary["scan_rows_visited"], 2)
+            self.assertEqual(summary["scan_rows_skipped"], 0)
             inventory.close()
 
     def test_full_inventory_scan_error_never_publishes_complete_or_marks_unseen_missing(self):
