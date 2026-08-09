@@ -260,7 +260,7 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 		    AND rec.start_at<=now() AND (rec.end_at IS NULL OR now()<rec.end_at)
 		    AND j.status='pending' AND j.scheduled_for<=now()
 		    AND (j.handoff_owner IS NULL
-		         OR j.handoff_owner<>'node:'||$2::text
+		         OR j.handoff_owner<>'node:'||$2::bigint::text
 		         OR j.handoff_until<=now())
 		    AND ($3 OR EXISTS (
 		         SELECT 1 FROM account_billing b
