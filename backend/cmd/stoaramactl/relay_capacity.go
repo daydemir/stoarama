@@ -80,6 +80,7 @@ func currentRelayCapacity(ctx context.Context, q interface {
 	if err != nil {
 		return state, err
 	}
+	state.ChangedAt = now
 	state.State = relayCapacityStateFor(state.ActiveDemand, state.LiveFailureDomains, state.RemainingCapacity)
 	return state, nil
 }

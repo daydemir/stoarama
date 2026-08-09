@@ -176,7 +176,7 @@ func TestCurrentRelayCapacityCollapsesGroupsAndPreservesUngroupedDomains(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.ActiveDemand != 3 || state.LiveFailureDomains != 2 || state.EffectiveCapacity != 17 || state.RemainingCapacity != 3 || state.State != relayCapacityHealthy {
+	if state.ActiveDemand != 3 || state.LiveFailureDomains != 2 || state.EffectiveCapacity != 17 || state.RemainingCapacity != 3 || state.State != relayCapacityHealthy || !state.ChangedAt.Equal(now) {
 		t.Fatalf("capacity=%+v, want demand=3 including overlapping jobs from one recording, domains=2 effective=17 remaining=3 healthy", state)
 	}
 	if pending, err := recordRelayCapacity(ctx, pool, now); err != nil || len(pending) != 0 {
