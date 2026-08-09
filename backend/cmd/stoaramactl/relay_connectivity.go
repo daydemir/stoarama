@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -164,7 +165,7 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 		       COALESCE(n.capabilities_jsonb->>'relay_started_at',''),
 		       n.relay_group_id, COALESCE(g.name,''),
 		       CASE WHEN jsonb_typeof(n.capabilities_jsonb->'active_jobs')='number'
-		            THEN (n.capabilities_jsonb->>'active_jobs')::integer ELSE 0 END,
+		            THEN n.capabilities_jsonb->>'active_jobs' ELSE '' END,
 		       (SELECT count(*) FROM recording_jobs live_jobs
 		         WHERE live_jobs.lease_owner='node:'||n.id::text
 		           AND live_jobs.status='leased' AND live_jobs.lease_expires_at>$2)::integer,
@@ -189,16 +190,26 @@ func currentRelayConnectivity(ctx context.Context, q interface {
 	states := []relayConnectivityTransition{}
 	for rows.Next() {
 		var state relayConnectivityTransition
+		var reportedJobs string
 		if err := rows.Scan(&state.NodeID, &state.Name, &state.Hostname,
 			&state.RelayVersion, &state.RelayStartedAt, &state.RelayGroupID, &state.RelayGroupName,
-			&state.ReportedJobs, &state.LiveLeases,
+			&reportedJobs, &state.LiveLeases,
 			&state.OrgName, &state.OrgEmail, &state.LastHeartbeatAt, &state.ActiveCapture); err != nil {
 			return nil, err
 		}
+		state.ReportedJobs = parseRelayReportedJobs(reportedJobs)
 		state.State = relayStateAt(state.LastHeartbeatAt, state.ActiveCapture, now)
 		states = append(states, state)
 	}
 	return states, rows.Err()
+}
+
+func parseRelayReportedJobs(raw string) int {
+	jobs, err := strconv.Atoi(raw)
+	if err != nil || jobs < 0 {
+		return 0
+	}
+	return jobs
 }
 
 func relayStateAt(lastHeartbeatAt *time.Time, activeCapture bool, now time.Time) relayConnectivityState {
