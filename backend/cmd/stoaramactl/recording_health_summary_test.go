@@ -60,9 +60,13 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 	}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	start := now.Add(-2 * time.Hour)
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (402)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2)`, start, start.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recordings VALUES (402);
-		INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2);
 		INSERT INTO recording_clips VALUES
 		  (1,402,$1,$1::timestamptz+interval '20 minutes','h264','aac',true,1280,720),
 		  (2,402,$1::timestamptz+interval '30 minutes',$2,'h264','',false,1280,720)
