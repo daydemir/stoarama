@@ -191,7 +191,7 @@ func writeNASInventoryReport(out io.Writer, summary nasInventorySummary, asJSON 
 	if _, err := fmt.Fprintf(out, "connection=%d label=%q mode=%s generation=%s tree_generation=%s revisions=%d/%d snapshot_available=%t snapshot_consistent=%t scan_started=%v scan_completed=%v reported=%v in_progress=%s in_progress_started=%v in_progress_reported=%v clips=%d bytes=%d mismatches=%d unmatched=%d server_only=%d client_version=%s\n", summary.ConnectionID, summary.Label, summary.Mode, summary.Generation, summary.TreeGeneration, summary.LiveRevision, summary.TreeRevision, summary.SnapshotAvailable, summary.SnapshotConsistent, summary.ScanStartedAt, summary.ScanCompletedAt, summary.ReportedAt, summary.InProgressGeneration, summary.InProgressStartedAt, summary.InProgressReportedAt, summary.Clips, summary.Bytes, summary.Mismatches, summary.Unmatched, summary.ServerOnly, summary.ClientVersion); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(out, "storage_total=%v storage_free=%v storage_reported=%v last_batch_clips=%d last_batch_bytes=%d last_batch_duration_ms=%d workers=%d retries=%d failures=%d completed=%v\n", summary.StorageTotalBytes, summary.StorageFreeBytes, summary.StorageReportedAt, summary.LastBatchClips, summary.LastBatchBytes, summary.LastBatchDurationMS, summary.LastBatchWorkers, summary.LastBatchRetries, summary.LastBatchFailures, summary.LastBatchCompletedAt); err != nil {
+	if _, err := fmt.Fprintf(out, "storage_total=%s storage_free=%s storage_reported=%v last_batch_clips=%d last_batch_bytes=%d last_batch_duration_ms=%d workers=%d retries=%d failures=%d completed=%v\n", optionalInt64Text(summary.StorageTotalBytes), optionalInt64Text(summary.StorageFreeBytes), summary.StorageReportedAt, summary.LastBatchClips, summary.LastBatchBytes, summary.LastBatchDurationMS, summary.LastBatchWorkers, summary.LastBatchRetries, summary.LastBatchFailures, summary.LastBatchCompletedAt); err != nil {
 		return err
 	}
 	for _, item := range summary.Items {
@@ -200,4 +200,11 @@ func writeNASInventoryReport(out io.Writer, summary nasInventorySummary, asJSON 
 		}
 	}
 	return nil
+}
+
+func optionalInt64Text(value *int64) string {
+	if value == nil {
+		return "unknown"
+	}
+	return fmt.Sprint(*value)
 }
