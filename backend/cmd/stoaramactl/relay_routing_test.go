@@ -34,6 +34,7 @@ func TestParseRelayRoutingArgsRejectsUnsafeInput(t *testing.T) {
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", " deniz-durham ", "--bandwidth-mbps", "80"},
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "deniz-durham", "--bandwidth-mbps", "0"},
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "deniz-durham", "--bandwidth-mbps", "NaN"},
+		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "deniz-durham", "--bandwidth-mbps", "+Inf"},
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "deniz-durham", "--bandwidth-mbps", "10001"},
 	}
 	for _, args := range tests {
