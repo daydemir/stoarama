@@ -124,6 +124,7 @@ type SurrenderReason string
 const (
 	SurrenderNoProgress   SurrenderReason = "no_progress"
 	SurrenderDiskPressure SurrenderReason = "disk_pressure"
+	SurrenderSelfUpdate   SurrenderReason = "self_update"
 )
 
 // ClipUploadIntent is a presigned PUT against the user's bucket.

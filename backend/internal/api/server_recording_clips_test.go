@@ -40,6 +40,9 @@ func TestRecordingJobSurrenderReason(t *testing.T) {
 	if !recordingJobSurrenderDiskPressure.valid() {
 		t.Fatal("disk_pressure surrender reason rejected")
 	}
+	if !recordingJobSurrenderSelfUpdate.valid() {
+		t.Fatal("self_update surrender reason rejected")
+	}
 	if recordingJobSurrenderReason("capture_error").valid() {
 		t.Fatal("unknown surrender reason accepted")
 	}

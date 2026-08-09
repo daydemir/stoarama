@@ -108,6 +108,7 @@ func runRelay(ctx context.Context) error {
 	}
 
 	var activeJobs atomic.Int64
+	var drainForUpdate atomic.Bool
 	var leaseGate sync.RWMutex
 	relayDiag := &recordingworker.RelayDiagnostics{}
 	worker, err := recordingworker.NewWorker(recordingworker.Config{
@@ -120,6 +121,7 @@ func runRelay(ctx context.Context) error {
 		ClassifyYouTubeCookieErrors: true,
 		ActiveJobs:                  &activeJobs,
 		LeaseGate:                   &leaseGate,
+		DrainForUpdate:              &drainForUpdate,
 		RelayDiagnostics:            relayDiag,
 		ContinuousNoProgressTimeout: 5 * time.Minute,
 		ContinuousMaxMediaLag:       15 * time.Minute,
@@ -167,7 +169,7 @@ func runRelay(ctx context.Context) error {
 
 	go pr.runLoop(ctx)
 	if selfUpdatesEnabled {
-		go selfUpdateLoop(ctx, cfg, &activeJobs, &leaseGate)
+		go selfUpdateLoop(ctx, cfg, &activeJobs, &leaseGate, &drainForUpdate)
 	}
 
 	err = worker.Run(ctx)

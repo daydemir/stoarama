@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -212,7 +213,39 @@ func TestCheckAndApplyUpdateRestartsForReadyDenoActivation(t *testing.T) {
 	restarts := captureSelfUpdateRestarts(t)
 	t.Setenv("YT_DLP_JS_RUNTIME", "")
 
-	checkAndApplyUpdate(server.URL, liveReleaseManifest, &atomic.Int64{}, &sync.RWMutex{})
+	checkAndApplyUpdate(server.URL, liveReleaseManifest, &atomic.Int64{}, &sync.RWMutex{}, &atomic.Bool{})
+	if *restarts != 1 {
+		t.Fatalf("restarts=%d want 1", *restarts)
+	}
+}
+
+func TestCheckAndApplyUpdateDrainsActiveJobsBeforeRestart(t *testing.T) {
+	setupSelfUpdateHome(t, "old")
+	newRelay := relayScript("new")
+	relayTar := testRelayTarball(t, newRelay)
+	manifest := latestJSON{
+		Version: "new",
+		Relay:   map[string]latestArtifact{testRelayTarget(): testArtifact("relay.tar.gz", relayTar)},
+	}
+	server := serveTestRelayRelease(t, manifest, map[string][]byte{"relay.tar.gz": relayTar})
+	restarts := captureSelfUpdateRestarts(t)
+	active := &atomic.Int64{}
+	active.Store(1)
+	drain := &atomic.Bool{}
+	gate := &sync.RWMutex{}
+	if !checkAndApplyUpdate(server.URL, liveReleaseManifest, active, gate, drain) {
+		t.Fatal("active update did not enter drain mode")
+	}
+	if !drain.Load() || *restarts != 0 {
+		t.Fatalf("drain=%v restarts=%d want true,0", drain.Load(), *restarts)
+	}
+	active.Store(0)
+	oldPoll := selfUpdateDrainPollInterval
+	selfUpdateDrainPollInterval = time.Millisecond
+	t.Cleanup(func() { selfUpdateDrainPollInterval = oldPoll })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waitForSelfUpdateDrain(ctx, active, gate, drain)
 	if *restarts != 1 {
 		t.Fatalf("restarts=%d want 1", *restarts)
 	}
@@ -593,16 +626,19 @@ func TestValidManifestName(t *testing.T) {
 
 func TestCandidateManifestStaysPinnedUntilPromotion(t *testing.T) {
 	candidate := releaseManifest("latest-new12345.json")
-	if got := updateManifestAfterPromotion(candidate, "old12345", "older1234", "new12345"); got != candidate {
+	if got := updateManifestAfterPromotion(candidate, "old12345", "old12345", "older1234", "new12345"); got != candidate {
 		t.Fatalf("candidate changed before promotion: %q", got)
 	}
-	if got := updateManifestAfterPromotion(candidate, "new12345", "old12345", "new12345"); got != liveReleaseManifest {
+	if got := updateManifestAfterPromotion(candidate, "old12345", "new12345", "old12345", "new12345"); got != liveReleaseManifest {
 		t.Fatalf("candidate remained pinned after promotion: %q", got)
 	}
-	if got := updateManifestAfterPromotion(candidate, "newer1234", "new12345", "new12345"); got != liveReleaseManifest {
+	if got := updateManifestAfterPromotion(candidate, "old12345", "newer1234", "new12345", "new12345"); got != liveReleaseManifest {
 		t.Fatalf("late candidate remained pinned after next promotion: %q", got)
 	}
-	if got := updateManifestAfterPromotion(candidate, "newer1234", "new12345", "other1234"); got != candidate {
+	if got := updateManifestAfterPromotion(candidate, "old12345", "newer1234", "newprev12", "new12345"); got != liveReleaseManifest {
+		t.Fatalf("superseded installed candidate remained pinned: %q", got)
+	}
+	if got := updateManifestAfterPromotion(candidate, "old12345", "newer1234", "new12345", "other1234"); got != candidate {
 		t.Fatalf("non-running candidate changed: %q", got)
 	}
 }

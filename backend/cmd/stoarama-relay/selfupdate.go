@@ -28,6 +28,7 @@ import (
 var lastUpdaterUnix atomic.Int64
 var releasePublicKeyBase64 string
 var restartRelayAfterSelfUpdate = restartAfterSelfUpdate
+var selfUpdateDrainPollInterval = time.Second
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
 // binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
@@ -191,7 +192,7 @@ func runSelfUpdate(args []string) error {
 // after start (not immediately) so a fresh install does not restart itself on boot.
 // When the relay binary itself changes it kickstarts the service so the new binary is
 // exec'd; a yt-dlp-only refresh is picked up by the next capture without a restart.
-func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int64, leaseGate *sync.RWMutex) {
+func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
 	ticker := time.NewTicker(selfUpdateInterval)
 	defer ticker.Stop()
 	manifest := cfg.updateManifest()
@@ -200,15 +201,13 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if deferUpdate, count := relaySelfUpdateDeferred(activeJobs); deferUpdate {
-				log.Printf("relay self-update: deferred while %d recording job(s) are active", count)
-				continue
-			}
 			if manifest != liveReleaseManifest {
 				live, err := fetchLatest(cfg.APIURL, liveReleaseManifest)
 				if err != nil {
 					log.Printf("relay self-update: check live promotion: %v", err)
-				} else if next := updateManifestAfterPromotion(manifest, live.Version, live.PreviousVersion, version); next != manifest {
+				} else if pinned, pinnedErr := fetchLatest(cfg.APIURL, manifest); pinnedErr != nil {
+					log.Printf("relay self-update: check candidate promotion: %v", pinnedErr)
+				} else if next := updateManifestAfterPromotion(manifest, pinned.PreviousVersion, live.Version, live.PreviousVersion, version); next != manifest {
 					if err := setUpdateManifest(liveReleaseManifest); err != nil {
 						log.Printf("relay self-update: clear candidate pin: %v", err)
 					} else {
@@ -217,7 +216,9 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int
 					}
 				}
 			}
-			checkAndApplyUpdate(cfg.APIURL, manifest, activeJobs, leaseGate)
+			if checkAndApplyUpdate(cfg.APIURL, manifest, activeJobs, leaseGate, drainForUpdate) {
+				waitForSelfUpdateDrain(ctx, activeJobs, leaseGate, drainForUpdate)
+			}
 		}
 	}
 }
@@ -226,27 +227,27 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int
 // relay binary and refresh yt-dlp (both sha256-verified), and restart only if the relay
 // binary actually changed. Errors are logged and swallowed so a bad manifest or a
 // transient network failure never takes the relay down.
-func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atomic.Int64, leaseGate *sync.RWMutex) {
+func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) bool {
 	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
 	lj, err := fetchLatest(base, manifest)
 	if err != nil {
 		log.Printf("relay self-update: fetch latest.json: %v", err)
-		return
+		return false
 	}
 	target := runtime.GOOS + "-" + runtime.GOARCH
 	ytdlpPresent, _, err := refreshExecutableDependency(base, lj.Ytdlp, target, "yt-dlp")
 	if err != nil {
 		log.Printf("relay self-update: yt-dlp refresh failed; relay activation held: %v", err)
-		return
+		return false
 	}
 	denoPresent, _, err := refreshExecutableDependency(base, lj.Deno, target, "deno")
 	if err != nil {
 		log.Printf("relay self-update: Deno refresh failed; relay activation held: %v", err)
-		return
+		return false
 	}
 	if denoPresent && !ytdlpPresent {
 		log.Printf("relay self-update: release includes Deno without pinned yt-dlp for %s; relay activation held", target)
-		return
+		return false
 	}
 	runtimeActivationNeeded := false
 	if denoPresent && strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")) == "" {
@@ -270,6 +271,9 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 	}
 
 	if relayUpdated || runtimeActivationNeeded {
+		if drainForUpdate != nil {
+			drainForUpdate.Store(true)
+		}
 		// A recording can be leased while the update downloads. Exclude lease
 		// admission across the final idle check and restart initiation: workers hold
 		// the read side from before the lease request until ActiveJobs is incremented.
@@ -278,12 +282,44 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 		unlock, deferUpdate, count := lockRelayRestartGate(leaseGate, activeJobs)
 		defer unlock()
 		if deferUpdate {
-			log.Printf("relay self-update: restart deferred while %d recording job(s) are active", count)
-			return
+			log.Printf("relay self-update: draining %d recording job(s) before restart", count)
+			return true
 		}
 		log.Printf("relay self-update: restarting service to load new binary")
 		if err := restartRelayAfterSelfUpdate(); err != nil {
 			log.Printf("relay self-update: restart failed: %v", err)
+			if drainForUpdate != nil {
+				drainForUpdate.Store(false)
+			}
+		}
+	}
+	return false
+}
+
+func waitForSelfUpdateDrain(ctx context.Context, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
+	ticker := time.NewTicker(selfUpdateDrainPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			unlock, deferred, count := lockRelayRestartGate(leaseGate, activeJobs)
+			if deferred {
+				unlock()
+				log.Printf("relay self-update: waiting for %d recording job(s) to drain", count)
+				continue
+			}
+			log.Printf("relay self-update: drain complete; restarting service")
+			err := restartRelayAfterSelfUpdate()
+			unlock()
+			if err != nil {
+				log.Printf("relay self-update: restart after drain failed: %v", err)
+				if drainForUpdate != nil {
+					drainForUpdate.Store(false)
+				}
+			}
+			return
 		}
 	}
 }
@@ -407,9 +443,17 @@ func (cfg relayConfig) updateManifest() releaseManifest {
 	return liveReleaseManifest
 }
 
-func updateManifestAfterPromotion(current releaseManifest, liveVersion, livePreviousVersion, runningVersion string) releaseManifest {
+func updateManifestAfterPromotion(current releaseManifest, pinnedPreviousVersion, liveVersion, livePreviousVersion, runningVersion string) releaseManifest {
 	pinnedVersion, pinned := current.version()
-	if pinned && pinnedVersion == runningVersion && (liveVersion == runningVersion || livePreviousVersion == runningVersion) {
+	if !pinned || pinnedVersion != runningVersion {
+		return current
+	}
+	// Follow live after promotion, or after the live channel has moved beyond the
+	// release the candidate was based on. The latter recovers idle canaries whose
+	// promotion window was missed without letting a pre-promotion canary downgrade
+	// to the older live build.
+	if liveVersion == runningVersion || livePreviousVersion == runningVersion ||
+		(strings.TrimSpace(pinnedPreviousVersion) != "" && liveVersion != pinnedPreviousVersion) {
 		return liveReleaseManifest
 	}
 	return current

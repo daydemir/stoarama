@@ -1194,10 +1194,11 @@ type recordingJobSurrenderReason string
 const (
 	recordingJobSurrenderNoProgress   recordingJobSurrenderReason = "no_progress"
 	recordingJobSurrenderDiskPressure recordingJobSurrenderReason = "disk_pressure"
+	recordingJobSurrenderSelfUpdate   recordingJobSurrenderReason = "self_update"
 )
 
 func (r recordingJobSurrenderReason) valid() bool {
-	return r == recordingJobSurrenderNoProgress || r == recordingJobSurrenderDiskPressure
+	return r == recordingJobSurrenderNoProgress || r == recordingJobSurrenderDiskPressure || r == recordingJobSurrenderSelfUpdate
 }
 
 type recordingJobSurrenderRequest struct {
