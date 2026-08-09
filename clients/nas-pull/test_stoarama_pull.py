@@ -1,7 +1,9 @@
 import importlib.util
+import hashlib
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -114,6 +116,79 @@ class NASPullTests(unittest.TestCase):
             self.assertEqual(len(complete[0]["digest"]), 64)
             self.assertEqual(inventory.summary()["mismatches"], 1)
             self.assertEqual(inventory.summary()["unmatched"], 1)
+            inventory.close()
+
+    def test_full_inventory_scan_error_never_publishes_complete_or_marks_unseen_missing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            prior = {
+                "clip_id": 91, "recording_id": 13, "relative_path": "recordings/prior.mp4",
+                "size_bytes": 3, "sha256": "b" * 64,
+            }
+            inventory._upsert(prior, "present", pull.utc_now_precise(), 1, "prior-generation")
+            broken = cfg.output_dir / "recordings" / "broken.mp4.stoarama.json"
+            broken.parent.mkdir(parents=True)
+            broken.write_text("{not-json", encoding="utf-8")
+            calls = []
+            with mock.patch.object(pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}), self.assertRaisesRegex(
+                RuntimeError, "inventory scan incomplete"
+            ):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertFalse(any(body.get("complete") for body in calls))
+            self.assertEqual(inventory._rows("clip_id=91")[0][5], "present")
+            self.assertIsNone(inventory.summary()["scan_completed_at"])
+            inventory.close()
+
+    def test_scan_upserts_use_bounded_durable_commits_at_100k_scale(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            commits = []
+            inventory.db.set_trace_callback(lambda statement: commits.append(statement) if statement == "COMMIT" else None)
+            for clip_id in range(1, 100001):
+                clip = {
+                    "clip_id": clip_id, "recording_id": 1,
+                    "relative_path": "recordings/%06d.mp4" % clip_id,
+                    "size_bytes": 1, "sha256": "c" * 64,
+                }
+                inventory._upsert(clip, "present", "2026-08-09T00:00:00Z", 1, "large-scan", commit=False)
+                if clip_id % pull.INVENTORY_SYNC_BATCH == 0:
+                    inventory._commit_scan_batch()
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM files").fetchone()[0], 100000)
+            self.assertEqual(len(commits), 100000 // pull.INVENTORY_SYNC_BATCH)
+            inventory.close()
+
+    def test_full_scan_commits_each_batch_before_server_sync(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            sha = hashlib.sha256(b"x").hexdigest()
+            for clip_id in (1, 2):
+                clip = {
+                    "clip_id": clip_id, "recording_id": 1,
+                    "relative_path": "recordings/%d.mp4" % clip_id,
+                    "size_bytes": 1, "sha256": sha,
+                }
+                path = cfg.output_dir / clip["relative_path"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x")
+                pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            durable_counts = []
+
+            def observe_sync(*_args, **kwargs):
+                if kwargs["body"].get("files"):
+                    other = sqlite3.connect(str(cfg.inventory_file))
+                    try:
+                        durable_counts.append(other.execute("SELECT count(*) FROM files").fetchone()[0])
+                    finally:
+                        other.close()
+                return {}
+
+            with mock.patch.object(pull, "INVENTORY_SYNC_BATCH", 2), mock.patch.object(pull, "request_json", side_effect=observe_sync):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertTrue(durable_counts)
+            self.assertGreaterEqual(durable_counts[0], 2)
             inventory.close()
 
     def test_inventory_is_synced_before_release_and_sync_failure_keeps_cursor(self):

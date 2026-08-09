@@ -43,7 +43,7 @@ jobs:
       - name: Test NAS backlog eligibility
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run 'Test(ConnectionPendingClipsEligibility|NASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination|NASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe|NASInventoryReleaseGateFailsClosed|NASBatchReleaseIsAtomicAndInventoryGated)' -count=1
+        run: go test ./internal/api -run 'Test(ConnectionPendingClipsEligibility|NASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination|NASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe|NASInventoryReleaseGateFailsClosed|NASBatchReleaseIsAtomicAndInventoryGated|NASInventoryCSVUsesOneRepeatableReadSnapshot)' -count=1
       - name: Test batch Plaza naming
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -94,5 +94,8 @@ jobs:
         run: go test ./cmd/stoaramactl -run TestMeterReportLedgerFailsClosedOnAmbiguousRetry -count=1
       - name: Test
         run: go test ./...
+      - name: Test NAS pull client
+        working-directory: .
+        run: python3 -m unittest -q clients/nas-pull/test_stoarama_pull.py
       - name: Vet
         run: go vet ./...

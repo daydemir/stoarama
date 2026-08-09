@@ -16,6 +16,22 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+type firstWriteRecorder struct {
+	*httptest.ResponseRecorder
+	onFirstWrite func()
+	wrote        bool
+}
+
+func (r *firstWriteRecorder) Write(body []byte) (int, error) {
+	if !r.wrote {
+		r.wrote = true
+		if r.onFirstWrite != nil {
+			r.onFirstWrite()
+		}
+	}
+	return r.ResponseRecorder.Write(body)
+}
+
 func TestValidateNASInventorySync(t *testing.T) {
 	now := time.Now().UTC()
 	start := now.Add(-time.Minute)
@@ -332,6 +348,52 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	}
 	if status, body := call(longDirectory, maxStateCursor, 1); status != http.StatusOK || len(body["entries"].([]any)) != 1 {
 		t.Fatalf("maximum metadata continuation status=%d body=%v", status, body)
+	}
+}
+
+func TestNASInventoryCSVUsesOneRepeatableReadSnapshot(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID = int64(42)
+	var connectionID, recordingID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind) VALUES($1,'nas_pull') RETURNING id`, accountID).Scan(&connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name,delivery) VALUES($1,'csv','nas_pull') RETURNING id`, accountID).Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips(recording_id,size_bytes,sha256,display_path,clip_start_at,clip_end_at)
+		SELECT $1,1,$2,'bulk/'||n||'.mp4',now()-interval '1 minute',now() FROM generate_series(1,501) n`, recordingID, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at)
+		SELECT $1,id,recording_id,display_path,size_bytes,sha256,'present',now() FROM recording_clips WHERE recording_id=$2`, connectionID, recordingID); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/account/connections/%d/inventory.csv", connectionID), nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", fmt.Sprint(connectionID))
+	req = req.WithContext(context.WithValue(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}), chi.RouteCtxKey, routeCtx))
+	var mutationErr error
+	recorder := &firstWriteRecorder{ResponseRecorder: httptest.NewRecorder(), onFirstWrite: func() {
+		_, mutationErr = pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state) VALUES($1,'late.mp4',1,$2,'present')`, connectionID, sha)
+	}}
+	(&Server{pool: pool}).handleAccountConnectionInventoryCSV(recorder, req)
+	if mutationErr != nil {
+		t.Fatal(mutationErr)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "late.mp4") {
+		t.Fatal("CSV mixed an unmatched row committed after its first snapshot page")
+	}
+	if lines := strings.Count(strings.TrimSpace(recorder.Body.String()), "\n") + 1; lines != 502 {
+		t.Fatalf("CSV lines=%d want header + 501 snapshot rows", lines)
 	}
 }
 
