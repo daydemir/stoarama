@@ -368,6 +368,9 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
+		`Status / Last 12 hours`,
+		`Timeline health`,
+		`${captureHealthGraph(healthBins, timezone)}<div class="cell-sub">Last 12 scheduled hours`,
 		`recent coverage`,
 		`Largest gap`,
 		`Whole period`,
