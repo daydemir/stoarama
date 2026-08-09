@@ -641,6 +641,7 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate inventory directory: %v", err))
 		return
 	}
+	rows.Close()
 	response := map[string]any{
 		"path": directory, "entries": entries, "next_cursor": nextCursor,
 		"generation": completedGeneration, "scan_started_at": scanStartedAt, "scan_completed_at": scanCompletedAt,
