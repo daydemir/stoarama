@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -302,7 +303,14 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		t.Fatalf("capturing stale relay states=%v err=%v, want fast offline", states, err)
 	}
 	output := captureStdout(t, func() {
-		runRelayConnectivity(ctx, appconfig.Config{DatabaseURL: cfg.ConnString()}, []string{"run", "--dry-run"})
+		testDatabaseURL, err := url.Parse(cfg.ConnString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		query := testDatabaseURL.Query()
+		query.Set("search_path", schema)
+		testDatabaseURL.RawQuery = query.Encode()
+		runRelayConnectivity(ctx, appconfig.Config{DatabaseURL: testDatabaseURL.String()}, []string{"run", "--dry-run"})
 	})
 	var dryRun struct {
 		DryRun bool                          `json:"dry_run"`
