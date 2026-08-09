@@ -246,16 +246,18 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		CREATE TYPE relay_connectivity_state AS ENUM ('online', 'offline');
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL);
 		CREATE TABLE users (email TEXT PRIMARY KEY, is_operator BOOLEAN NOT NULL);
-		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, display_name TEXT NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ);
+		CREATE TABLE relay_groups (id BIGINT, account_id BIGINT, name TEXT NOT NULL, PRIMARY KEY(account_id,id));
+		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, display_name TEXT NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ, capabilities_jsonb JSONB NOT NULL DEFAULT '{}', relay_group_id BIGINT);
 		CREATE TABLE recording_jobs (id BIGSERIAL PRIMARY KEY, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, status TEXT NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, window_end_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_states (node_id BIGINT PRIMARY KEY, observed_state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL);
 		CREATE TABLE relay_connectivity_alert_events (id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL, node_id BIGINT NOT NULL, state relay_connectivity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, last_heartbeat_at TIMESTAMPTZ, notified_at TIMESTAMPTZ);
 		CREATE TABLE relay_connectivity_alert_deliveries (event_id BIGINT NOT NULL, recipient TEXT NOT NULL, delivered_at TIMESTAMPTZ, PRIMARY KEY (event_id, recipient));
 		INSERT INTO accounts VALUES (1, 'MIT SCL', 'scl@example.edu'), (2, 'Other Org', 'other@example.edu');
 		INSERT INTO users VALUES ('deniz@aydemir.us', true);
-		INSERT INTO nodes VALUES
-		  (7, 1, 'relay', 'MIT-MAC-1', 'mit-mac-1', 'active', '2026-07-22T12:00:00Z'),
-		  (8, 2, 'relay', 'OTHER-RELAY', 'other-relay', 'active', '2026-07-22T12:00:00Z');
+		INSERT INTO relay_groups VALUES (3,1,'deniz-durham');
+		INSERT INTO nodes (id,account_id,node_type,display_name,hostname,status,last_heartbeat_at,capabilities_jsonb,relay_group_id) VALUES
+		  (7, 1, 'relay', 'MIT-MAC-1', 'mit-mac-1', 'active', '2026-07-22T12:00:00Z', '{"relay_version":"abc123","relay_started_at":"2026-07-22T11:00:00Z","active_jobs":2}', 3),
+		  (8, 2, 'relay', 'OTHER-RELAY', 'other-relay', 'active', '2026-07-22T12:00:00Z', '{}', NULL);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -264,6 +266,9 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	states, err := currentRelayConnectivity(ctx, pool, now)
 	if err != nil || len(states) != 1 || states[0].OrgName != "MIT SCL" {
 		t.Fatalf("alert-scoped relay states=%v err=%v", states, err)
+	}
+	if states[0].RelayVersion != "abc123" || states[0].RelayGroupName != "deniz-durham" || states[0].ReportedJobs != 2 || states[0].LiveLeases != 0 {
+		t.Fatalf("relay diagnostics missing from state: %+v", states[0])
 	}
 	if _, err := pool.Exec(ctx, `
 		UPDATE nodes SET last_heartbeat_at=$1 WHERE id=7;
