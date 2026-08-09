@@ -172,9 +172,8 @@ type recordingCreateRequest struct {
 	Mode             string `json:"mode"`
 	DailyWindowStart string `json:"daily_window_start"`
 	DailyWindowEnd   string `json:"daily_window_end"`
-	// TargetFPS normalizes each captured clip to that exact frame rate. nil =
-	// Source/native (stream-copy, preserve source fps, no re-encode, the cheap
-	// default). The composer offers 15 and 30; the server accepts only those.
+	// TargetFPS remains in the request shape for compatibility with older clients.
+	// It must be nil: recordings always preserve the source without re-encoding.
 	TargetFPS *int `json:"target_fps"`
 	// Capture window. StartAt defaults to now() (start immediately); EndAt is
 	// open-ended when nil. When both are set, EndAt must be strictly after StartAt.
