@@ -41,6 +41,10 @@ class ExistingFileMismatch(RuntimeError):
     pass
 
 
+class FileChangedDuringHash(RuntimeError):
+    pass
+
+
 class RetryExhausted(RuntimeError):
     def __init__(self, cause, retries):
         super().__init__(str(cause))
@@ -265,7 +269,11 @@ class Inventory:
                     state TEXT NOT NULL,
                     verified_at TEXT,
                     file_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    file_ctime_ns INTEGER NOT NULL DEFAULT 0,
+                    file_inode INTEGER NOT NULL DEFAULT 0,
+                    file_device INTEGER NOT NULL DEFAULT 0,
                     seen_generation TEXT NOT NULL DEFAULT '',
+                    scan_pass TEXT NOT NULL DEFAULT '',
                     client_updated_at TEXT NOT NULL,
                     dirty INTEGER NOT NULL DEFAULT 1
                 );
@@ -278,35 +286,53 @@ class Inventory:
                     sha256 TEXT NOT NULL,
                     state TEXT NOT NULL,
                     file_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    file_ctime_ns INTEGER NOT NULL DEFAULT 0,
+                    file_inode INTEGER NOT NULL DEFAULT 0,
+                    file_device INTEGER NOT NULL DEFAULT 0,
                     seen_generation TEXT NOT NULL DEFAULT '',
+                    scan_pass TEXT NOT NULL DEFAULT '',
                     client_updated_at TEXT NOT NULL,
                     dirty INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS unmatched_dirty_path ON unmatched_files(dirty,relative_path);
                 """
             )
+            added_columns = {
+                "scan_pass": "TEXT NOT NULL DEFAULT ''",
+                "file_ctime_ns": "INTEGER NOT NULL DEFAULT 0",
+                "file_inode": "INTEGER NOT NULL DEFAULT 0",
+                "file_device": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for table in ("files", "unmatched_files"):
+                columns = {row[1] for row in self.db.execute("PRAGMA table_info(%s)" % table)}
+                for column, definition in added_columns.items():
+                    if column not in columns:
+                        self.db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, definition))
             self.db.commit()
 
     def close(self):
         with self.lock:
             self.db.close()
 
-    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True):
+    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True, scan_pass="", file_identity=(0, 0, 0)):
         updated_at = utc_now_precise()
+        ctime_ns, inode, device = file_identity
         with self.lock:
             self.db.execute(
                 """INSERT INTO files
-                   (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,seen_generation,client_updated_at,dirty)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,1)
+                   (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,file_ctime_ns,file_inode,file_device,seen_generation,scan_pass,client_updated_at,dirty)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
                    ON CONFLICT(clip_id) DO UPDATE SET
                      recording_id=excluded.recording_id, relative_path=excluded.relative_path,
                      size_bytes=excluded.size_bytes, sha256=excluded.sha256, state=excluded.state,
                      verified_at=excluded.verified_at, file_mtime_ns=excluded.file_mtime_ns,
-                     seen_generation=excluded.seen_generation, client_updated_at=excluded.client_updated_at, dirty=1""",
+                     file_ctime_ns=excluded.file_ctime_ns,file_inode=excluded.file_inode,file_device=excluded.file_device,
+                     seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
+                     client_updated_at=excluded.client_updated_at,dirty=1""",
                 (
                     int(clip["clip_id"]), int(clip["recording_id"]), str(clip["relative_path"]),
                     int(clip["size_bytes"]), str(clip["sha256"]).lower(), state,
-                    verified_at, int(mtime_ns), generation, updated_at,
+                    verified_at, int(mtime_ns), int(ctime_ns), int(inode), int(device), generation, scan_pass, updated_at,
                 ),
             )
             if commit:
@@ -321,7 +347,7 @@ class Inventory:
         stat = path.stat()
         if stat.st_size != int(clip["size_bytes"]):
             raise RuntimeError("inventory size changed after verification for clip %d" % int(clip["clip_id"]))
-        self._upsert(clip, "present", utc_now_precise(), stat.st_mtime_ns)
+        self._upsert(clip, "present", utc_now_precise(), stat.st_mtime_ns, file_identity=(stat.st_ctime_ns, stat.st_ino, stat.st_dev))
 
     def _rows(self, where, params=(), limit=INVENTORY_SYNC_BATCH):
         with self.lock:
@@ -405,6 +431,73 @@ class Inventory:
             )
             self.db.commit()
 
+    def _incomplete_scan(self):
+        with self.lock:
+            values = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
+        generation = values.get("generation", "")
+        started_at = values.get("scan_started_at", "")
+        if generation.startswith("scan-") and started_at and not values.get("scan_completed_at"):
+            return generation, started_at
+        return None
+
+    def _linked_scan_row_is_current(self, clip, generation, scan_pass, path):
+        with self.lock:
+            row = self.db.execute(
+                """SELECT recording_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,
+                          file_ctime_ns,file_inode,file_device
+                   FROM files WHERE clip_id=?""",
+                (int(clip["clip_id"]),),
+            ).fetchone()
+        if row is None or row[6] != generation:
+            return False
+        if row[0] != int(clip["recording_id"]) or row[1] != str(clip["relative_path"]):
+            return False
+        if row[2] != int(clip["size_bytes"]) or row[3] != str(clip["sha256"]).lower():
+            return False
+        current = False
+        if path.exists():
+            stat = path.stat()
+            current = (
+                row[4] in ("present", "mismatch") and row[5] == stat.st_mtime_ns
+                and row[7] != 0 and row[7] == stat.st_ctime_ns
+                and row[8] != 0 and row[8] == stat.st_ino
+                and row[9] != 0 and row[9] == stat.st_dev
+                and stat.st_size == int(clip["size_bytes"])
+            )
+        else:
+            current = row[4] == "missing" and row[5] == 0
+        if current:
+            with self.lock:
+                self.db.execute("UPDATE files SET scan_pass=? WHERE clip_id=?", (scan_pass, int(clip["clip_id"])))
+        return current
+
+    def _unmatched_scan_row_is_current(self, relative_path, generation, scan_pass, stat):
+        with self.lock:
+            row = self.db.execute(
+                """SELECT size_bytes,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device
+                   FROM unmatched_files WHERE relative_path=?""",
+                (relative_path,),
+            ).fetchone()
+        current = (
+            row is not None and row[3] == generation and row[1] == "present"
+            and row[0] == stat.st_size and row[2] == stat.st_mtime_ns
+            and row[4] != 0 and row[4] == stat.st_ctime_ns
+            and row[5] != 0 and row[5] == stat.st_ino
+            and row[6] != 0 and row[6] == stat.st_dev
+        )
+        if current:
+            with self.lock:
+                self.db.execute("UPDATE unmatched_files SET scan_pass=? WHERE relative_path=?", (scan_pass, relative_path))
+        return current
+
+    def _retire_unmatched_linked_path(self, relative_path, generation, scan_pass):
+        with self.lock:
+            self.db.execute(
+                """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1
+                   WHERE relative_path=? AND state<>'missing'""",
+                (generation, scan_pass, utc_now_precise(), relative_path),
+            )
+
     def summary(self):
         with self.lock:
             values = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
@@ -445,9 +538,16 @@ class Inventory:
         return digest.hexdigest(), clips, total_bytes, mismatches, unmatched
 
     def full_scan(self, cfg, stop_event):
-        started_at = utc_now_precise()
-        generation = "scan-%s-%s" % (time.strftime("%Y%m%dT%H%M%S", time.gmtime()), os.urandom(4).hex())
-        self._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
+        pass_started_at = utc_now_precise()
+        resumed = self._incomplete_scan()
+        if resumed is None:
+            started_at = utc_now_precise()
+            generation = "scan-%s-%s" % (time.strftime("%Y%m%dT%H%M%S", time.gmtime()), os.urandom(4).hex())
+            self._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
+        else:
+            generation, started_at = resumed
+            log("INFO", "inventory resuming incomplete generation=%s started_at=%s" % (generation, started_at))
+        scan_pass = os.urandom(8).hex()
         scanned = 0
         skipped = 0
         known_paths = set()
@@ -468,15 +568,30 @@ class Inventory:
                 if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
                     raise ValueError("sidecar checksum is invalid")
                 known_paths.add(str(relative))
+                self._retire_unmatched_linked_path(str(relative), generation, scan_pass)
+                if self._linked_scan_row_is_current(clip, generation, scan_pass, path):
+                    scanned += 1
+                    if scanned % INVENTORY_SYNC_BATCH == 0:
+                        self._commit_scan_batch()
+                        self.sync_dirty(cfg, generation, started_at)
+                    continue
                 if path.exists():
-                    actual_size, actual_sha = sha256_file_throttled(path, cfg.inventory_hash_mbps, stop_event)
+                    try:
+                        actual_size, actual_sha, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
+                    except FileChangedDuringHash:
+                        self._upsert(
+                            clip, "mismatch", None, 0, generation, commit=False,
+                            scan_pass=scan_pass, file_identity=(0, 0, 0),
+                        )
+                        raise
                     state = "present" if actual_size == expected_size and actual_sha == expected_sha else "mismatch"
-                    stat = path.stat()
                     verified_at = utc_now_precise() if state == "present" else None
                     mtime_ns = stat.st_mtime_ns
+                    identity = (stat.st_ctime_ns, stat.st_ino, stat.st_dev)
                 else:
                     state, verified_at, mtime_ns = "missing", None, 0
-                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False)
+                    identity = (0, 0, 0)
+                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
                     self._commit_scan_batch()
@@ -501,17 +616,25 @@ class Inventory:
                 relative = str(path.relative_to(cfg.output_dir))
                 if relative in known_paths:
                     continue
-                size_bytes, sha256 = sha256_file_throttled(path, cfg.inventory_hash_mbps, stop_event)
                 stat = path.stat()
+                if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat):
+                    scanned += 1
+                    if scanned % INVENTORY_SYNC_BATCH == 0:
+                        self._commit_scan_batch()
+                        self.sync_dirty(cfg, generation, started_at)
+                    continue
+                size_bytes, sha256, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
                 updated_at = utc_now_precise()
                 with self.lock:
                     self.db.execute(
-                        """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,client_updated_at,dirty)
-                           VALUES(?,?,?,'present',?,?,?,1)
+                        """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,file_mtime_ns,file_ctime_ns,file_inode,file_device,seen_generation,scan_pass,client_updated_at,dirty)
+                           VALUES(?,?,?,'present',?,?,?,?,?,?,?,1)
                            ON CONFLICT(relative_path) DO UPDATE SET size_bytes=excluded.size_bytes,sha256=excluded.sha256,
-                             state='present',file_mtime_ns=excluded.file_mtime_ns,seen_generation=excluded.seen_generation,
+                             state='present',file_mtime_ns=excluded.file_mtime_ns,file_ctime_ns=excluded.file_ctime_ns,
+                             file_inode=excluded.file_inode,file_device=excluded.file_device,
+                             seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
                              client_updated_at=excluded.client_updated_at,dirty=1""",
-                        (relative, size_bytes, sha256, stat.st_mtime_ns, generation, updated_at),
+                        (relative, size_bytes, sha256, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev, generation, scan_pass, updated_at),
                     )
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
@@ -532,14 +655,14 @@ class Inventory:
         completed_at = utc_now_precise()
         with self.lock:
             self.db.execute(
-                """UPDATE files SET state='missing',verified_at=NULL,dirty=1,client_updated_at=?
-                   WHERE seen_generation<>? AND client_updated_at<=?""",
-                (completed_at, generation, started_at),
+                """UPDATE files SET state='missing',verified_at=NULL,seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
+                   WHERE scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
+                (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.execute(
-                """UPDATE unmatched_files SET state='missing',dirty=1,client_updated_at=?
-                   WHERE seen_generation<>? AND client_updated_at<=?""",
-                (completed_at, generation, started_at),
+                """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
+                   WHERE scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
+                (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.commit()
         self.sync_dirty(cfg, generation, started_at)
@@ -804,6 +927,19 @@ def sha256_file_throttled(path, megabytes_per_sec, stop_event):
             if delay > 0 and stop_event.wait(delay):
                 raise InterruptedError("inventory scan stopped")
     return size, digest.hexdigest()
+
+
+def file_identity(stat):
+    return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev)
+
+
+def sha256_file_throttled_stable(path, megabytes_per_sec, stop_event):
+    before = path.stat()
+    size, digest = sha256_file_throttled(path, megabytes_per_sec, stop_event)
+    after = path.stat()
+    if file_identity(before) != file_identity(after) or size != after.st_size:
+        raise FileChangedDuringHash("inventory file changed while it was being hashed")
+    return size, digest, after
 
 
 def verified_file(path, expected_bytes, expected_sha):
