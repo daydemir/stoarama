@@ -339,6 +339,7 @@ func TestDetectContinuousSilentDeathReportsMediaAgeAndNoMedia(t *testing.T) {
 	byID := map[int64]healthIncident{got[0].RecordingID: got[0], got[1].RecordingID: got[1]}
 	lagging := byID[1]
 	if !strings.Contains(lagging.SinceText, "latest media ended 2026-08-09T07:03:30Z") ||
+		!strings.Contains(lagging.SinceText, "latest ingest 2026-08-09T07:44:30Z") ||
 		lagging.Diag != "media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
 		t.Fatalf("lagging=%+v", lagging)
 	}
