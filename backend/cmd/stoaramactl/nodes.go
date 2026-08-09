@@ -42,8 +42,12 @@ func runNodesRelayGroups(ctx context.Context, cfg config.Config, args []string) 
 	id := fs.Int64("id", 0, "relay group id")
 	name := fs.String("name", "", "relay group name")
 	maxStreams := fs.Int("max-streams", 0, "group stream limit")
+	bandwidthMbps := fs.Float64("bandwidth-mbps", 0, "conservative internet connection routing budget in Mbps")
 	nodeID := fs.Int64("node-id", 0, "relay node id")
 	_ = fs.Parse(args[1:])
+	if *bandwidthMbps != 0 && (*bandwidthMbps < 1 || *bandwidthMbps > 10000) {
+		log.Fatalf("--bandwidth-mbps must be between 1 and 10000")
+	}
 	base := strings.TrimSpace(*backendAPIURL)
 	token := strings.TrimSpace(*apiToken)
 
@@ -58,6 +62,9 @@ func runNodesRelayGroups(ctx context.Context, cfg config.Config, args []string) 
 		if *maxStreams != 0 {
 			payload["max_streams"] = *maxStreams
 		}
+		if *bandwidthMbps != 0 {
+			payload["bandwidth_capacity_mbps"] = *bandwidthMbps
+		}
 		printJSON(mustAPIRequest(ctx, http.MethodPost, base, token, "/api/v1/account/relay-groups", payload))
 	case "update":
 		requireRelayGroupID(*id)
@@ -68,8 +75,11 @@ func runNodesRelayGroups(ctx context.Context, cfg config.Config, args []string) 
 		if *maxStreams != 0 {
 			payload["max_streams"] = *maxStreams
 		}
+		if *bandwidthMbps != 0 {
+			payload["bandwidth_capacity_mbps"] = *bandwidthMbps
+		}
 		if len(payload) == 0 {
-			log.Fatalf("--name or --max-streams is required")
+			log.Fatalf("--name, --max-streams, or --bandwidth-mbps is required")
 		}
 		printJSON(mustAPIRequest(ctx, http.MethodPatch, base, token, "/api/v1/account/relay-groups/"+strconv.FormatInt(*id, 10), payload))
 	case "assign":
