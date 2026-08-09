@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -28,6 +29,32 @@ func TestRelayGroupLimits(t *testing.T) {
 		if err := validateRelayGroupMaxStreams(max); err == nil {
 			t.Fatalf("max %d accepted", max)
 		}
+	}
+}
+
+func TestRelayGroupBandwidthBudgetJSON(t *testing.T) {
+	var req relayGroupPatchRequest
+	if err := json.Unmarshal([]byte(`{"bandwidth_capacity_mbps":125.5}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if !req.BandwidthCapacityMbps.Set || req.BandwidthCapacityMbps.Value == nil || *req.BandwidthCapacityMbps.Value != 125.5 {
+		t.Fatalf("decoded bandwidth=%+v", req.BandwidthCapacityMbps)
+	}
+	if got, err := bandwidthBPS(req.BandwidthCapacityMbps.Value); err != nil || got != int64(125500000) {
+		t.Fatalf("bandwidth bps=%v err=%v", got, err)
+	}
+	if err := json.Unmarshal([]byte(`{"bandwidth_capacity_mbps":null}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if !req.BandwidthCapacityMbps.Set || req.BandwidthCapacityMbps.Value != nil {
+		t.Fatalf("null bandwidth=%+v", req.BandwidthCapacityMbps)
+	}
+	req = relayGroupPatchRequest{}
+	if err := json.Unmarshal([]byte(`{}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.BandwidthCapacityMbps.Set {
+		t.Fatal("omitted bandwidth was marked present")
 	}
 }
 
@@ -68,6 +95,9 @@ func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
 		"gn.account_id=n.account_id",
 		"gn.relay_group_id=n.relay_group_id",
 		"g.account_id=n.account_id",
+		"peer_group.bandwidth_capacity_bps",
+		"recording_bandwidth_observations",
+		"GREATEST(COALESCE(peer_group_bandwidth.observed_bandwidth_bps, 0), 4000000)",
 	} {
 		if !strings.Contains(relayLeaseSQL, want) {
 			t.Fatalf("relay lease SQL missing %q", want)
@@ -110,18 +140,19 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY);
-		CREATE TABLE relay_groups (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, max_streams INT NOT NULL);
+		CREATE TABLE relay_groups (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, max_streams INT NOT NULL, bandwidth_capacity_bps BIGINT);
 		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ, relay_max_streams INT NOT NULL, relay_group_id BIGINT);
 		CREATE TABLE streams (id BIGINT PRIMARY KEY, provider TEXT, source_page_url TEXT);
 		CREATE TABLE storage_destinations (id BIGINT PRIMARY KEY);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+		CREATE TABLE recording_bandwidth_observations (recording_id BIGINT PRIMARY KEY, observed_bandwidth_bps BIGINT NOT NULL, observed_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
 		INSERT INTO accounts VALUES (47);
-		INSERT INTO relay_groups VALUES (1, 47, 1);
+		INSERT INTO relay_groups (id,account_id,max_streams) VALUES (1, 47, 1);
 		INSERT INTO nodes VALUES (1, 47, 'relay', 'active', now(), 6, 1), (2, 47, 'relay', 'active', now(), 6, 1);
 		INSERT INTO storage_destinations VALUES (1);
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
 		  (1, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/1.m3u8', NULL, 1, NULL),
 		  (2, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/2.m3u8', NULL, 1, NULL);
 		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
@@ -172,7 +203,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
 		  (7,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/7.m3u8',NULL,1,NULL),
 		  (8,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/8.m3u8',NULL,1,NULL);
 		INSERT INTO recording_jobs
@@ -202,7 +233,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
 		  (9,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/9.m3u8',NULL,1,NULL);
 		INSERT INTO recording_jobs
 		  (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at)
@@ -238,7 +269,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 
 	if _, err := pool.Exec(ctx, `
 		UPDATE relay_groups SET max_streams=10 WHERE id=1;
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
 		  (10, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/10.m3u8', NULL, 1, NULL),
 		  (11, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/11.m3u8', NULL, 1, NULL),
 		  (12, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/12.m3u8', NULL, 1, NULL);
@@ -279,7 +310,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		t.Fatalf("tie permits either healthy peer: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
 		  (13,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/13.m3u8',NULL,1,NULL);
 		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
 		  (13,13,'pending',now()-interval '1 hour','continuous_window',now(),60,NULL,NULL,0,now(),now()+interval '1 hour');
@@ -297,9 +328,9 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO relay_groups VALUES (10,47,10);
+		INSERT INTO relay_groups (id,account_id,max_streams) VALUES (10,47,10);
 		INSERT INTO nodes VALUES (15,47,'relay','active',now(),6,10);
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
 		  (20,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/20.m3u8',NULL,1,NULL),
 		  (21,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/21.m3u8',NULL,1,NULL),
 		  (22,47,'active',now()-interval '1 hour',NULL,'relay','https://example.com/22.m3u8',NULL,1,NULL),
@@ -333,6 +364,33 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	}
 	if group1Leases != group10Leases {
 		t.Fatalf("overdue batch group loads=%d/%d want equal", group1Leases, group10Leases)
+	}
+
+	// Equal lease counts are not equal network load. With explicit conservative
+	// uplink budgets, the next native high-bitrate stream must go to the stronger
+	// connection. This is a placement signal only; it never changes media quality.
+	if _, err := pool.Exec(ctx, `
+		UPDATE relay_groups SET bandwidth_capacity_bps=20000000 WHERE id=1;
+		UPDATE relay_groups SET bandwidth_capacity_bps=80000000 WHERE id=10;
+		INSERT INTO recordings (id,account_id,status,start_at,capture_via,stream_url,storage_destination_id)
+		VALUES (28,47,'active',now()-interval '1 hour','relay','https://example.com/high-bitrate.m3u8',1);
+		INSERT INTO recording_bandwidth_observations (recording_id,observed_bandwidth_bps) VALUES (28,12000000);
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,attempt_count,updated_at,window_end_at)
+		VALUES (28,28,'pending',now(),'continuous_window',now(),60,0,now(),now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(1); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("weaker bandwidth group took high-bitrate job: %v", err)
+	}
+	if err := lease(15); err != nil {
+		t.Fatalf("stronger bandwidth group did not take high-bitrate job: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs SET status='complete',lease_owner=NULL,lease_expires_at=NULL WHERE id=28;
+		UPDATE relay_groups SET bandwidth_capacity_bps=NULL WHERE id IN (1,10);
+	`); err != nil {
+		t.Fatal(err)
 	}
 
 	// A soft preference gives the selected independent uplink the first opportunity
@@ -406,7 +464,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO nodes VALUES (3, 47, 'relay', 'active', now(), 1, NULL), (4, 47, 'relay', 'active', now(), 1, NULL);
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
 		  (3, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/3.m3u8', NULL, 1, NULL),
 		  (4, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/4.m3u8', NULL, 1, NULL);
 		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
@@ -440,7 +498,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		t.Fatalf("ungrouped leased=%d empty=%d, want 1/1", leased, empty)
 	}
 
-	if _, err := pool.Exec(ctx, `INSERT INTO relay_groups VALUES (2, 48, 1)`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO relay_groups (id,account_id,max_streams) VALUES (2, 48, 1)`); err != nil {
 		t.Fatal(err)
 	}
 	routeCtx := chi.NewRouteContext()
@@ -490,7 +548,8 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		INSERT INTO nodes VALUES
 		  (5, 47, 'relay', 'active', now(), 1, 1),
 		  (6, 47, 'relay', 'active', now(), 1, 1);
-		INSERT INTO recordings VALUES
+		INSERT INTO recordings (id,account_id,status,start_at,end_at,capture_via,stream_url,stream_id,storage_destination_id,target_fps) VALUES
+		  (5, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/5.m3u8', NULL, 1, NULL),
 		  (6, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/6.m3u8', NULL, 1, NULL);
 		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
 		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), NULL),

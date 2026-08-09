@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 
@@ -18,6 +19,8 @@ const (
 	relayGroupDefaultMaxStreams = 8
 	relayGroupMinMaxStreams     = 1
 	relayGroupMaxMaxStreams     = 200
+	relayGroupMinBandwidthMbps  = 1
+	relayGroupMaxBandwidthMbps  = 10000
 )
 
 func lockRelayNodeRow(ctx context.Context, tx pgx.Tx, nodeID, accountID int64) (*int64, error) {
@@ -54,7 +57,7 @@ func relayGroupChangeAllowed(current, target *int64, liveLeases int) bool {
 }
 
 const relayGroupSelectSQL = `
-	SELECT g.id, g.name, g.max_streams,
+	SELECT g.id, g.name, g.max_streams, g.bandwidth_capacity_bps,
 	       COALESCE((
 	         SELECT jsonb_agg(n.id ORDER BY n.id)
 	         FROM nodes n
@@ -64,28 +67,56 @@ const relayGroupSelectSQL = `
 	        FROM recording_jobs j
 	        JOIN nodes n ON j.lease_owner='node:'||n.id::text
 	        WHERE n.account_id=g.account_id AND n.relay_group_id=g.id
-	          AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases
+	          AND j.status='leased' AND j.lease_expires_at > now())::int AS live_leases,
+	       (SELECT COALESCE(SUM(GREATEST(COALESCE(b.observed_bandwidth_bps, 0), 4000000)), 0)
+	        FROM recording_jobs j
+	        JOIN nodes n ON j.lease_owner='node:'||n.id::text
+	        LEFT JOIN recording_bandwidth_observations b ON b.recording_id=j.recording_id
+	        WHERE n.account_id=g.account_id AND n.relay_group_id=g.id
+	          AND j.status='leased' AND j.lease_expires_at > now())::bigint AS estimated_bandwidth_bps
 	FROM relay_groups g
 `
 
 type relayGroupCreateRequest struct {
-	Name       string `json:"name"`
-	MaxStreams *int   `json:"max_streams"`
+	Name                  string       `json:"name"`
+	MaxStreams            *int         `json:"max_streams"`
+	BandwidthCapacityMbps optionalMbps `json:"bandwidth_capacity_mbps"`
 }
 
 type relayGroupPatchRequest struct {
-	Name       *string `json:"name"`
-	MaxStreams *int    `json:"max_streams"`
+	Name                  *string      `json:"name"`
+	MaxStreams            *int         `json:"max_streams"`
+	BandwidthCapacityMbps optionalMbps `json:"bandwidth_capacity_mbps"`
+}
+
+type optionalMbps struct {
+	Set   bool
+	Value *float64
+}
+
+func (o *optionalMbps) UnmarshalJSON(data []byte) error {
+	o.Set = true
+	if string(data) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var value float64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	o.Value = &value
+	return nil
 }
 
 func scanRelayGroup(row pgx.Row) (map[string]any, error) {
 	var (
-		id, liveLeases int64
-		name           string
-		maxStreams     int
-		nodeIDsRaw     json.RawMessage
+		id, liveLeases, estimatedBandwidthBPS int64
+		name                                  string
+		maxStreams                            int
+		bandwidthBPS                          *int64
+		nodeIDsRaw                            json.RawMessage
 	)
-	if err := row.Scan(&id, &name, &maxStreams, &nodeIDsRaw, &liveLeases); err != nil {
+	if err := row.Scan(&id, &name, &maxStreams, &bandwidthBPS, &nodeIDsRaw, &liveLeases, &estimatedBandwidthBPS); err != nil {
 		return nil, err
 	}
 	var nodeIDs []int64
@@ -94,8 +125,28 @@ func scanRelayGroup(row pgx.Row) (map[string]any, error) {
 	}
 	return map[string]any{
 		"id": id, "name": name, "max_streams": maxStreams,
-		"node_ids": nodeIDs, "live_leases": liveLeases,
+		"bandwidth_capacity_mbps":  nullableMbps(bandwidthBPS),
+		"estimated_bandwidth_mbps": float64(estimatedBandwidthBPS) / 1_000_000,
+		"node_ids":                 nodeIDs,
+		"live_leases":              liveLeases,
 	}, nil
+}
+
+func nullableMbps(bps *int64) any {
+	if bps == nil {
+		return nil
+	}
+	return float64(*bps) / 1_000_000
+}
+
+func bandwidthBPS(mbps *float64) (any, error) {
+	if mbps == nil {
+		return nil, nil
+	}
+	if math.IsNaN(*mbps) || math.IsInf(*mbps, 0) || *mbps < relayGroupMinBandwidthMbps || *mbps > relayGroupMaxBandwidthMbps {
+		return nil, fmt.Errorf("bandwidth_capacity_mbps must be between %d and %d", relayGroupMinBandwidthMbps, relayGroupMaxBandwidthMbps)
+	}
+	return int64(*mbps * 1_000_000), nil
 }
 
 func validateRelayGroupMaxStreams(max int) error {
@@ -162,12 +213,17 @@ func (s *Server) handleAccountRelayGroupsCreate(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	bandwidth, err := bandwidthBPS(req.BandwidthCapacityMbps.Value)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var id int64
-	err := s.pool.QueryRow(r.Context(), `
-		INSERT INTO relay_groups (account_id, name, max_streams)
-		VALUES ($1, $2, $3)
+	err = s.pool.QueryRow(r.Context(), `
+		INSERT INTO relay_groups (account_id, name, max_streams, bandwidth_capacity_bps)
+		VALUES ($1, $2, $3, $4)
 		RETURNING id
-	`, principal.AccountID, name, maxStreams).Scan(&id)
+	`, principal.AccountID, name, maxStreams, bandwidth).Scan(&id)
 	if relayGroupConflict(err) {
 		util.WriteError(w, http.StatusConflict, "relay group name already exists")
 		return
@@ -199,8 +255,8 @@ func (s *Server) handleAccountRelayGroupPatch(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Name == nil && req.MaxStreams == nil {
-		util.WriteError(w, http.StatusBadRequest, "name or max_streams is required")
+	if req.Name == nil && req.MaxStreams == nil && !req.BandwidthCapacityMbps.Set {
+		util.WriteError(w, http.StatusBadRequest, "name, max_streams, or bandwidth_capacity_mbps is required")
 		return
 	}
 	var name any
@@ -220,11 +276,17 @@ func (s *Server) handleAccountRelayGroupPatch(w http.ResponseWriter, r *http.Req
 		}
 		maxStreams = *req.MaxStreams
 	}
+	bandwidth, err := bandwidthBPS(req.BandwidthCapacityMbps.Value)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	ct, err := s.pool.Exec(r.Context(), `
 		UPDATE relay_groups
-		SET name=COALESCE($3, name), max_streams=COALESCE($4, max_streams)
+		SET name=COALESCE($3, name), max_streams=COALESCE($4, max_streams),
+		    bandwidth_capacity_bps=CASE WHEN $6 THEN $5 ELSE bandwidth_capacity_bps END
 		WHERE id=$1 AND account_id=$2
-	`, id, principal.AccountID, name, maxStreams)
+	`, id, principal.AccountID, name, maxStreams, bandwidth, req.BandwidthCapacityMbps.Set)
 	if relayGroupConflict(err) {
 		util.WriteError(w, http.StatusConflict, "relay group name already exists")
 		return

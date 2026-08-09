@@ -94,6 +94,24 @@ func TestRecordingRelayRoutingIsSoftAndExplicit(t *testing.T) {
 	}
 }
 
+func TestOrgSettingsRelayGroupsExposeNativeBandwidthRouting(t *testing.T) {
+	body, err := loadHTMLPage("org-settings.html")
+	if err != nil {
+		t.Fatalf("load org settings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`Mbps native load`,
+		`Conservative total bandwidth for this internet connection in Mbps`,
+		`bandwidth_capacity_mbps`,
+		`automatic budget`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("org settings missing bandwidth-routing marker %q", marker)
+		}
+	}
+}
+
 func TestAdminCancellationGuardsPrecedeMutationsAndSuccessUI(t *testing.T) {
 	body, err := loadHTMLPage("admin.html")
 	if err != nil {
