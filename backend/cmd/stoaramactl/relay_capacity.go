@@ -49,7 +49,7 @@ func currentRelayCapacity(ctx context.Context, q interface {
 		  SELECT n.id, n.relay_group_id, n.relay_max_streams
 		  FROM nodes n
 		  WHERE n.account_id=$1 AND n.node_type='relay' AND n.status='active'
-		    AND n.last_heartbeat_at>$2-interval '120 seconds'
+		    AND n.last_heartbeat_at>$2::timestamptz-interval '120 seconds'
 		), domains AS (
 		  SELECT 'group:'||ln.relay_group_id::text AS domain,
 		         LEAST(max(rg.max_streams), sum(ln.relay_max_streams))::integer AS capacity
