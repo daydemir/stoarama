@@ -23,17 +23,38 @@ type nasInventoryOptions struct {
 }
 
 type nasInventorySummary struct {
-	ConnectionID    int64            `json:"connection_id"`
-	Label           string           `json:"label"`
-	Mode            string           `json:"mode"`
-	Generation      string           `json:"generation"`
-	ScanCompletedAt *time.Time       `json:"scan_completed_at"`
-	Clips           int64            `json:"clips"`
-	Bytes           int64            `json:"bytes"`
-	Mismatches      int64            `json:"mismatches"`
-	Unmatched       int64            `json:"unmatched"`
-	ServerOnly      int64            `json:"server_only"`
-	Items           []map[string]any `json:"items"`
+	ConnectionID         int64            `json:"connection_id"`
+	Label                string           `json:"label"`
+	Mode                 string           `json:"mode"`
+	Generation           string           `json:"generation"`
+	TreeGeneration       string           `json:"tree_generation"`
+	LiveRevision         int64            `json:"live_revision"`
+	TreeRevision         int64            `json:"tree_revision"`
+	ScanStartedAt        *time.Time       `json:"scan_started_at"`
+	ScanCompletedAt      *time.Time       `json:"scan_completed_at"`
+	ReportedAt           *time.Time       `json:"reported_at"`
+	InProgressGeneration string           `json:"in_progress_generation"`
+	InProgressStartedAt  *time.Time       `json:"in_progress_started_at"`
+	InProgressReportedAt *time.Time       `json:"in_progress_reported_at"`
+	SnapshotAvailable    bool             `json:"snapshot_available"`
+	SnapshotConsistent   bool             `json:"snapshot_consistent"`
+	Clips                int64            `json:"clips"`
+	Bytes                int64            `json:"bytes"`
+	Mismatches           int64            `json:"mismatches"`
+	Unmatched            int64            `json:"unmatched"`
+	ServerOnly           int64            `json:"server_only"`
+	StorageTotalBytes    *int64           `json:"storage_total_bytes"`
+	StorageFreeBytes     *int64           `json:"storage_free_bytes"`
+	StorageReportedAt    *time.Time       `json:"storage_reported_at"`
+	LastBatchClips       int64            `json:"last_batch_clips"`
+	LastBatchBytes       int64            `json:"last_batch_bytes"`
+	LastBatchDurationMS  int64            `json:"last_batch_duration_ms"`
+	LastBatchWorkers     int              `json:"last_batch_workers"`
+	LastBatchRetries     int64            `json:"last_batch_retries"`
+	LastBatchFailures    int64            `json:"last_batch_failures"`
+	LastBatchCompletedAt *time.Time       `json:"last_batch_completed_at"`
+	ClientVersion        string           `json:"client_version"`
+	Items                []map[string]any `json:"items"`
 }
 
 func parseNASInventoryArgs(args []string) (nasInventoryOptions, error) {
@@ -69,16 +90,42 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	defer pool.Close()
 	var summary nasInventorySummary
 	err = pool.QueryRow(ctx, `
-		SELECT c.id,c.label,c.inventory_mode,c.inventory_generation,c.inventory_scan_completed_at,
+		SELECT c.id,c.label,c.inventory_mode,c.inventory_generation,c.inventory_tree_generation,
+		       c.inventory_live_revision,c.inventory_tree_revision,c.inventory_scan_started_at,c.inventory_scan_completed_at,c.inventory_reported_at,
+		       c.inventory_in_progress_generation,c.inventory_in_progress_started_at,c.inventory_in_progress_reported_at,
 		       c.inventory_clips,c.inventory_bytes,c.inventory_mismatches,c.inventory_unmatched,
 		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
-		        WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL
-		          AND NOT EXISTS(SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'))
+		        WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
+		          AND NOT EXISTS(SELECT 1 FROM nas_inventory_files i
+		            WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'
+		              AND i.relative_path=rc.display_path AND i.size_bytes=rc.size_bytes AND i.sha256=lower(rc.sha256)
+		              AND i.verified_at>=now()-interval '72 hours' AND i.verified_at<=now()+interval '5 minutes'
+		              AND NOT EXISTS(SELECT 1 FROM nas_inventory_files other
+		                WHERE other.connection_id=i.connection_id AND other.relative_path=i.relative_path
+		                  AND other.clip_id<>i.clip_id AND other.state IN('present','mismatch'))
+		              AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files unmatched
+		                WHERE unmatched.connection_id=i.connection_id AND unmatched.relative_path=i.relative_path AND unmatched.state='present'))),
+		       c.nas_storage_total_bytes,c.nas_storage_free_bytes,c.nas_storage_reported_at,
+		       c.nas_batch_clips,c.nas_batch_bytes,c.nas_batch_duration_ms,c.nas_download_workers,
+		       c.nas_batch_retries,c.nas_batch_failures,c.nas_batch_completed_at,c.client_version
 		FROM connections c WHERE c.id=$1
-	`, opts.connectionID).Scan(&summary.ConnectionID, &summary.Label, &summary.Mode, &summary.Generation, &summary.ScanCompletedAt, &summary.Clips, &summary.Bytes, &summary.Mismatches, &summary.Unmatched, &summary.ServerOnly)
+	`, opts.connectionID).Scan(&summary.ConnectionID, &summary.Label, &summary.Mode, &summary.Generation, &summary.TreeGeneration,
+		&summary.LiveRevision, &summary.TreeRevision, &summary.ScanStartedAt, &summary.ScanCompletedAt, &summary.ReportedAt,
+		&summary.InProgressGeneration, &summary.InProgressStartedAt, &summary.InProgressReportedAt,
+		&summary.Clips, &summary.Bytes, &summary.Mismatches, &summary.Unmatched, &summary.ServerOnly,
+		&summary.StorageTotalBytes, &summary.StorageFreeBytes, &summary.StorageReportedAt,
+		&summary.LastBatchClips, &summary.LastBatchBytes, &summary.LastBatchDurationMS, &summary.LastBatchWorkers,
+		&summary.LastBatchRetries, &summary.LastBatchFailures, &summary.LastBatchCompletedAt, &summary.ClientVersion)
 	if err != nil {
 		log.Fatalf("load inventory summary: %v", err)
 	}
+	if summary.InProgressReportedAt != nil && time.Since(summary.InProgressReportedAt.UTC()) > 24*time.Hour {
+		summary.InProgressGeneration = ""
+		summary.InProgressStartedAt = nil
+		summary.InProgressReportedAt = nil
+	}
+	summary.SnapshotAvailable = summary.Generation != "" && summary.TreeGeneration == summary.Generation && summary.ScanCompletedAt != nil
+	summary.SnapshotConsistent = summary.SnapshotAvailable && summary.InProgressGeneration == "" && summary.LiveRevision == summary.TreeRevision
 	rows, err := pool.Query(ctx, `
 		SELECT i.clip_id,i.relative_path,
 		       CASE WHEN c.id IS NULL THEN 'nas_only'
@@ -141,7 +188,10 @@ func writeNASInventoryReport(out io.Writer, summary nasInventorySummary, asJSON 
 		enc.SetIndent("", "  ")
 		return enc.Encode(summary)
 	}
-	if _, err := fmt.Fprintf(out, "connection=%d label=%q mode=%s generation=%s scan_completed=%v clips=%d bytes=%d mismatches=%d unmatched=%d server_only=%d\n", summary.ConnectionID, summary.Label, summary.Mode, summary.Generation, summary.ScanCompletedAt, summary.Clips, summary.Bytes, summary.Mismatches, summary.Unmatched, summary.ServerOnly); err != nil {
+	if _, err := fmt.Fprintf(out, "connection=%d label=%q mode=%s generation=%s tree_generation=%s revisions=%d/%d snapshot_available=%t snapshot_consistent=%t scan_started=%v scan_completed=%v reported=%v in_progress=%s in_progress_started=%v in_progress_reported=%v clips=%d bytes=%d mismatches=%d unmatched=%d server_only=%d client_version=%s\n", summary.ConnectionID, summary.Label, summary.Mode, summary.Generation, summary.TreeGeneration, summary.LiveRevision, summary.TreeRevision, summary.SnapshotAvailable, summary.SnapshotConsistent, summary.ScanStartedAt, summary.ScanCompletedAt, summary.ReportedAt, summary.InProgressGeneration, summary.InProgressStartedAt, summary.InProgressReportedAt, summary.Clips, summary.Bytes, summary.Mismatches, summary.Unmatched, summary.ServerOnly, summary.ClientVersion); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "storage_total=%v storage_free=%v storage_reported=%v last_batch_clips=%d last_batch_bytes=%d last_batch_duration_ms=%d workers=%d retries=%d failures=%d completed=%v\n", summary.StorageTotalBytes, summary.StorageFreeBytes, summary.StorageReportedAt, summary.LastBatchClips, summary.LastBatchBytes, summary.LastBatchDurationMS, summary.LastBatchWorkers, summary.LastBatchRetries, summary.LastBatchFailures, summary.LastBatchCompletedAt); err != nil {
 		return err
 	}
 	for _, item := range summary.Items {
