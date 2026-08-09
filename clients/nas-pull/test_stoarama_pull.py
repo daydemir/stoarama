@@ -90,6 +90,35 @@ class NASPullTests(unittest.TestCase):
             self.assertEqual(reopened._rows("clip_id=7")[0][2], clip["relative_path"])
             reopened.close()
 
+    def test_inventory_adds_scan_pass_to_existing_sqlite_schema(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            legacy = sqlite3.connect(str(cfg.inventory_file))
+            legacy.executescript(
+                """
+                CREATE TABLE files (
+                    clip_id INTEGER PRIMARY KEY,recording_id INTEGER NOT NULL,relative_path TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,state TEXT NOT NULL,verified_at TEXT,
+                    file_mtime_ns INTEGER NOT NULL DEFAULT 0,seen_generation TEXT NOT NULL DEFAULT '',
+                    client_updated_at TEXT NOT NULL,dirty INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE unmatched_files (
+                    relative_path TEXT PRIMARY KEY,size_bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,state TEXT NOT NULL,
+                    file_mtime_ns INTEGER NOT NULL DEFAULT 0,seen_generation TEXT NOT NULL DEFAULT '',
+                    client_updated_at TEXT NOT NULL,dirty INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                """
+            )
+            legacy.commit()
+            legacy.close()
+            inventory = pull.Inventory(cfg)
+            for table in ("files", "unmatched_files"):
+                columns = {row[1] for row in inventory.db.execute("PRAGMA table_info(%s)" % table)}
+                for column in ("scan_pass", "file_ctime_ns", "file_inode", "file_device"):
+                    self.assertIn(column, columns)
+            inventory.close()
+
     def test_full_inventory_scan_reports_complete_digest_and_mismatch(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -189,6 +218,254 @@ class NASPullTests(unittest.TestCase):
                 inventory.full_scan(cfg, threading.Event())
             self.assertTrue(durable_counts)
             self.assertGreaterEqual(durable_counts[0], 2)
+            inventory.close()
+
+    def test_full_scan_resumes_generation_without_rehashing_committed_rows(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            for clip_id, content in ((1, b"a"), (2, b"b")):
+                clip = {
+                    "clip_id": clip_id, "recording_id": 1,
+                    "relative_path": "recordings/%d.mp4" % clip_id,
+                    "size_bytes": 1, "sha256": hashlib.sha256(content).hexdigest(),
+                }
+                path = cfg.output_dir / clip["relative_path"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+                pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            stop = threading.Event()
+            original_hash = pull.sha256_file_throttled
+
+            def stop_after_first(path, mbps, stop_event):
+                result = original_hash(path, mbps, stop_event)
+                stop.set()
+                return result
+
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=stop_after_first), mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, stop)
+            first = inventory.db.execute("SELECT relative_path,seen_generation FROM files").fetchone()
+            self.assertIsNotNone(first)
+            generation = first[1]
+            inventory.close()
+
+            resumed = pull.Inventory(cfg)
+            hashed = []
+
+            def record_hash(path, mbps, stop_event):
+                relative = str(path.relative_to(cfg.output_dir))
+                hashed.append(relative)
+                if relative == first[0]:
+                    raise AssertionError("resumed scan rehashed its committed row")
+                return original_hash(path, mbps, stop_event)
+
+            calls = []
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=record_hash), mock.patch.object(
+                pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}
+            ):
+                resumed.full_scan(cfg, threading.Event())
+            complete = [body for body in calls if body.get("complete")]
+            self.assertEqual(len(complete), 1)
+            self.assertEqual(complete[0]["generation"], generation)
+            self.assertEqual(len(hashed), 1)
+            resumed.close()
+
+    def test_resumed_scan_reconciles_sidecar_removal_and_repair(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            content = b"x"
+            clip = {
+                "clip_id": 7, "recording_id": 1, "relative_path": "recordings/7.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(content).hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(content)
+            sidecar = pull.stitch_sidecar_path(path)
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            stop = threading.Event()
+            original_hash = pull.sha256_file_throttled
+
+            def interrupt(path_arg, mbps, stop_event):
+                result = original_hash(path_arg, mbps, stop_event)
+                stop.set()
+                return result
+
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=interrupt), mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, stop)
+            sidecar.unlink()
+            with mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertEqual(inventory.db.execute("SELECT state FROM files WHERE clip_id=7").fetchone()[0], "missing")
+            self.assertEqual(inventory.db.execute("SELECT state FROM unmatched_files WHERE relative_path=?", (clip["relative_path"],)).fetchone()[0], "present")
+
+            sidecar.write_text("{broken", encoding="utf-8")
+            inventory._meta_set({"scan_completed_at": ""})
+            with mock.patch.object(pull, "request_json", return_value={}), self.assertRaisesRegex(RuntimeError, "inventory scan incomplete"):
+                inventory.full_scan(cfg, threading.Event())
+            pull.write_stitch_sidecar(path, clip)
+            with mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertEqual(inventory.db.execute("SELECT state FROM files WHERE clip_id=7").fetchone()[0], "present")
+            self.assertEqual(inventory.db.execute("SELECT state FROM unmatched_files WHERE relative_path=?", (clip["relative_path"],)).fetchone()[0], "missing")
+            inventory.close()
+
+    def test_resumed_scan_rehashes_same_size_file_when_mtime_is_restored(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"a").hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"a")
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            stop = threading.Event()
+            original_hash = pull.sha256_file_throttled
+
+            def interrupt(path_arg, mbps, stop_event):
+                result = original_hash(path_arg, mbps, stop_event)
+                stop.set()
+                return result
+
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=interrupt), mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, stop)
+            before = path.stat()
+            path.write_bytes(b"z")
+            # Linux ctime advances even when mtime is restored; this client runs on Linux/Synology.
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            hashed = []
+
+            def record_hash(path_arg, mbps, stop_event):
+                hashed.append(str(path_arg.relative_to(cfg.output_dir)))
+                return original_hash(path_arg, mbps, stop_event)
+
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=record_hash), mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertIn(clip["relative_path"], hashed)
+            self.assertEqual(inventory.db.execute("SELECT state FROM files WHERE clip_id=1").fetchone()[0], "mismatch")
+            inventory.close()
+
+    def test_full_scan_rejects_atomic_replacement_during_hash(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"a").hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"a")
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            prior_stat = path.stat()
+            inventory._upsert(
+                clip, "present", pull.utc_now_precise(), prior_stat.st_mtime_ns,
+                "prior-generation", file_identity=(prior_stat.st_ctime_ns, prior_stat.st_ino, prior_stat.st_dev),
+            )
+            original_hash = pull.sha256_file_throttled
+
+            def replace_after_hash(path_arg, mbps, stop_event):
+                result = original_hash(path_arg, mbps, stop_event)
+                replacement = path_arg.with_suffix(".replacement")
+                replacement.write_bytes(b"z")
+                os.replace(replacement, path_arg)
+                return result
+
+            calls = []
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=replace_after_hash), mock.patch.object(
+                pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}
+            ), self.assertRaisesRegex(RuntimeError, "inventory scan incomplete"):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertFalse(any(body.get("complete") for body in calls))
+            row = inventory.db.execute("SELECT state FROM files WHERE clip_id=1").fetchone()
+            self.assertEqual(row[0], "mismatch")
+            published = [row for body in calls for row in body.get("files", []) if row.get("clip_id") == 1]
+            self.assertTrue(published)
+            self.assertEqual(published[-1]["state"], "mismatch")
+            inventory.close()
+
+    def test_resumed_pass_marks_post_start_live_row_missing_if_removed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            original = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"a").hexdigest(),
+            }
+            original_path = cfg.output_dir / original["relative_path"]
+            original_path.parent.mkdir(parents=True)
+            original_path.write_bytes(b"a")
+            pull.write_stitch_sidecar(original_path, original)
+            inventory = pull.Inventory(cfg)
+            stop = threading.Event()
+            original_hash = pull.sha256_file_throttled
+
+            def interrupt(path_arg, mbps, stop_event):
+                result = original_hash(path_arg, mbps, stop_event)
+                stop.set()
+                return result
+
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=interrupt), mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, stop)
+            live = {
+                "clip_id": 2, "recording_id": 1, "relative_path": "recordings/2.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"b").hexdigest(),
+            }
+            live_path = cfg.output_dir / live["relative_path"]
+            live_path.write_bytes(b"b")
+            pull.write_stitch_sidecar(live_path, live)
+            inventory.record_verified(live)
+            live_path.unlink()
+            pull.stitch_sidecar_path(live_path).unlink()
+            with mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertEqual(inventory.db.execute("SELECT state FROM files WHERE clip_id=2").fetchone()[0], "missing")
+            inventory.close()
+
+    def test_large_cached_resume_commits_visit_markers_in_bounded_batches(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            generation = "scan-20260809-cached"
+            started_at = "2026-08-09T00:00:00Z"
+            inventory = pull.Inventory(cfg)
+            inventory._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
+            sha = hashlib.sha256(b"x").hexdigest()
+            for clip_id in range(1, 1001):
+                clip = {
+                    "clip_id": clip_id, "recording_id": 1,
+                    "relative_path": "recordings/%04d.mp4" % clip_id,
+                    "size_bytes": 1, "sha256": sha,
+                }
+                path = cfg.output_dir / clip["relative_path"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x")
+                pull.write_stitch_sidecar(path, clip)
+                stat = path.stat()
+                inventory._upsert(
+                    clip, "present", started_at, stat.st_mtime_ns, generation,
+                    commit=False, scan_pass="prior", file_identity=(stat.st_ctime_ns, stat.st_ino, stat.st_dev),
+                )
+                if clip_id % pull.INVENTORY_SYNC_BATCH == 0:
+                    inventory._commit_scan_batch()
+            commits = []
+            inventory.db.set_trace_callback(lambda statement: commits.append(statement) if statement == "COMMIT" else None)
+            rehashed = []
+            original_hash = pull.sha256_file_throttled
+
+            def record_rehash(path_arg, mbps, stop_event):
+                rehashed.append(str(path_arg))
+                return original_hash(path_arg, mbps, stop_event)
+
+            with mock.patch.object(pull, "sha256_file_throttled", side_effect=record_rehash), mock.patch.object(
+                pull, "request_json", return_value={}
+            ):
+                inventory.full_scan(cfg, threading.Event())
+            self.assertEqual(rehashed, [], "unchanged cached file was rehashed")
+            self.assertGreaterEqual(len(commits), 1000 // pull.INVENTORY_SYNC_BATCH)
+            self.assertLessEqual(len(commits), 15)
             inventory.close()
 
     def test_inventory_is_synced_before_release_and_sync_failure_keeps_cursor(self):
