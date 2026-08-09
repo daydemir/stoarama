@@ -152,8 +152,13 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		})
 		return
 	}
-
 	now := time.Now()
+	if !*verifyMedia {
+		if err := materializeRecordingWindowHealth(ctx, pool, now); err != nil {
+			log.Fatalf("materialize recording window health: %v", err)
+		}
+	}
+
 	toNotify := make([]healthIncident, 0, len(incidents))
 	for _, inc := range incidents {
 		newlyInserted, lastAlertedAt, err := upsertHealthAlert(ctx, pool, inc.RecordingID, inc.Signal)
@@ -449,6 +454,7 @@ type stitchWindow struct {
 
 type stitchWindowMetrics struct {
 	coveragePct    float64
+	covered        time.Duration
 	overlapClips   int
 	overlapSeconds float64
 	maxGap         time.Duration
@@ -651,6 +657,9 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 	}
 	sort.Slice(intervals, func(i, j int) bool { return intervals[i][0].Before(intervals[j][0]) })
 	m := stitchWindowMetrics{}
+	if len(intervals) == 0 && close.After(open) {
+		m.maxGap = close.Sub(open)
+	}
 	var covered time.Duration
 	var unionStart, unionEnd time.Time
 	var runStart, runEnd time.Time
@@ -709,6 +718,7 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 		}
 	}
 	if expected := close.Sub(open); expected > 0 {
+		m.covered = covered
 		m.coveragePct = 100 * float64(covered) / float64(expected)
 	}
 	return m

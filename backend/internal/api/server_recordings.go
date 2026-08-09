@@ -478,13 +478,15 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	rows.Close()
-	healthBins, err := s.recordingHealthBinsForAccount(r.Context(), principal.AccountID, recordingIDs)
+	timelineHealth, err := s.recordingTimelineHealthForAccount(r.Context(), principal.AccountID, recordingIDs)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("compute recording health history: %v", err))
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording timeline health: %v", err))
 		return
 	}
 	for _, item := range items {
-		item["capture_health_bins"] = healthBins[item["id"].(int64)]
+		if health, ok := timelineHealth[item["id"].(int64)]; ok {
+			item["timeline_health"] = health
+		}
 	}
 	// Fleet relay aggregate: total nodes, online nodes (heartbeat within 120s), live
 	// leases across all relay nodes, available slots across ONLINE relays, and the

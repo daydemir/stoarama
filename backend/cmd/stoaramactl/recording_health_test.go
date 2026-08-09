@@ -383,7 +383,7 @@ func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
 func TestMeasureStitchWindowEdgeCases(t *testing.T) {
 	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
 	close := open.Add(10 * time.Minute)
-	if m := measureStitchWindow(open, close, nil); m.coveragePct != 0 || m.gapClips != 0 {
+	if m := measureStitchWindow(open, close, nil); m.coveragePct != 0 || m.gapClips != 0 || m.maxGap != close.Sub(open) {
 		t.Fatalf("empty window: %+v", m)
 	}
 	if m := measureStitchWindow(open, open, nil); m.coveragePct != 0 {

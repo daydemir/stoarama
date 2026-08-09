@@ -3117,8 +3117,24 @@
 	  const captureHealth = String(rec.capture_health || 'not_expected');
 	  const capturePercent = expected > 0 ? Math.min(100, Math.round(captured / expected * 1000) / 10) : null;
 	  const healthBins = Array.isArray(rec.capture_health_bins) ? rec.capture_health_bins : [];
+	  const timeline = rec.timeline_health && typeof rec.timeline_health === 'object' ? rec.timeline_health : null;
+	  const timelineGrade = timeline ? String(timeline.grade || 'unknown') : 'unknown';
+	  const recentCoverage = timeline && Number.isFinite(Number(timeline.recent_coverage_pct))
+	    ? Number(timeline.recent_coverage_pct) : null;
+	  const lifetimeCoverage = timeline && Number.isFinite(Number(timeline.lifetime_coverage_pct))
+	    ? Number(timeline.lifetime_coverage_pct) : null;
+	  const stitchLabels = { continuous: 'continuous timeline · native layout compatible', gapped: 'gapped timeline', overlap: 'overlapping timeline', layout_changed: 'native layout changed', unknown: 'not checked yet' };
+	  const timelineHealthHTML = timeline
+	    ? `<div class="capture-health ${escapeHTML(timelineGrade)}">${recentCoverage == null ? 'Awaiting a completed window' : `${recentCoverage.toFixed(2)}% recent coverage`}</div>
+	       <div class="cell-sub">${escapeHTML(stitchLabels[String(timeline.stitchability || 'unknown')] || String(timeline.stitchability || 'unknown'))} · ${escapeHTML(String(timeline.diagnosis || ''))}</div>
+	       ${recentCoverage == null ? '' : `<div class="cell-sub">Largest gap ${escapeHTML(formatDuration(Number(timeline.recent_largest_gap_seconds || 0) * 1000))} · overlaps ${Number(timeline.recent_overlap_count || 0)} · layout changes ${Number(timeline.recent_layout_change_count || 0)}</div>`}
+	       ${lifetimeCoverage == null ? '' : `<div class="cell-sub">Whole period ${lifetimeCoverage.toFixed(2)}% · ${Number(timeline.lifetime_window_count || 0)} completed window(s)${timeline.lifetime_complete === true ? '' : ' · historical check in progress'}</div>`}
+	       <div class="cell-sub">${lastHTML}</div>`
+	    : '';
 	  const captureHealthHTML = captureHealth === 'unavailable'
 	    ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
+	    : timelineHealthHTML
+	      ? timelineHealthHTML
 	    : healthBins.length
 	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, timezone)}<div class="cell-sub">${lastHTML}</div>`
 	      : expected > 0
