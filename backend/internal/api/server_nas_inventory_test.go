@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func TestValidateNASInventorySync(t *testing.T) {
@@ -158,8 +160,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 			url += "&cursor=" + cursor
 		}
 		req := httptest.NewRequest(http.MethodGet, url, nil)
-		req.SetPathValue("id", fmt.Sprint(connectionID))
-		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}))
+		routeCtx := chi.NewRouteContext()
+		routeCtx.URLParams.Add("id", fmt.Sprint(connectionID))
+		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}), chi.RouteCtxKey, routeCtx))
 		rec := httptest.NewRecorder()
 		s.handleAccountConnectionInventoryTree(rec, req)
 		var body map[string]any
