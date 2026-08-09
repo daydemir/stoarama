@@ -271,9 +271,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if status, _ := call("../private", "", 20); status != http.StatusBadRequest {
 		t.Fatalf("unsafe directory status=%d, want 400", status)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES
-		($1,'100%/literal.mp4',5,$2,'present',now()),($1,'1000/sibling.mp4',6,$2,'present',now()),
-		($1,'under_score/literal.mp4',7,$2,'present',now()),($1,'underXscore/sibling.mp4',8,$2,'present',now())`, connectionID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at,tree_parent_path,tree_name) VALUES
+		($1,'100%/literal.mp4',5,$2,'present',now(),'100%','literal.mp4'),($1,'1000/sibling.mp4',6,$2,'present',now(),'1000','sibling.mp4'),
+		($1,'under_score/literal.mp4',7,$2,'present',now(),'under_score','literal.mp4'),($1,'underXscore/sibling.mp4',8,$2,'present',now(),'underXscore','sibling.mp4')`, connectionID, sha); err != nil {
 		t.Fatal(err)
 	}
 	refresh("tree-two")
