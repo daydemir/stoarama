@@ -37,6 +37,7 @@ const (
 	signalContinuousOverlap          = "continuous_timeline_overlap"
 	signalContinuousLongGap          = "continuous_long_gap"
 	signalContinuousFragmented       = "continuous_fragmented"
+	signalContinuousLayoutChange     = "continuous_layout_change"
 	signalStoredClipInvalid          = "stored_clip_invalid"
 )
 
@@ -57,6 +58,7 @@ var healthSignalLabels = map[string]string{
 	signalContinuousOverlap:          "Completed continuous window contains overlapping clip timelines",
 	signalContinuousLongGap:          "Completed continuous window contains a gap longer than five minutes",
 	signalContinuousFragmented:       "Completed continuous window is fragmented by frequent reconnect gaps",
+	signalContinuousLayoutChange:     "Adjacent native clips changed media layout and may not losslessly stitch",
 	signalStoredClipInvalid:          "Latest stored clip is missing, truncated, or not decodable",
 }
 
@@ -71,6 +73,7 @@ var healthSignalSeverity = map[string]string{
 	signalContinuousOverlap:          "HIGH",
 	signalContinuousLongGap:          "HIGH",
 	signalContinuousFragmented:       "HIGH",
+	signalContinuousLayoutChange:     "HIGH",
 	signalStoredClipInvalid:          "CRITICAL",
 }
 
@@ -291,6 +294,7 @@ func evaluatedHealthSignals(verifyMedia bool) []string {
 		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
 		signalClipTimestampDrift, signalContinuousCoverageLow,
 		signalContinuousOverlap, signalContinuousLongGap, signalContinuousFragmented,
+		signalContinuousLayoutChange,
 	}
 	return signals
 }
@@ -406,6 +410,7 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	incidents = append(incidents, detectSampledOverdue(ctx, pool)...)
 	incidents = append(incidents, detectClipTimestampDrift(ctx, pool)...)
 	incidents = append(incidents, detectCompletedWindowStitchHealth(ctx, pool)...)
+	incidents = append(incidents, detectCompletedWindowLayoutChanges(ctx, pool)...)
 
 	severityRank := map[string]int{"CRITICAL": 0, "HIGH": 1}
 	sort.SliceStable(incidents, func(i, j int) bool {
@@ -531,6 +536,91 @@ func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) 
 			inc.Diag = diagText("reconnect_gaps", fmt.Sprint(m.gapClips), "largest_gap", m.maxGap.Round(time.Second).String())
 			out = append(out, inc)
 		}
+	}
+	return out
+}
+
+// detectCompletedWindowLayoutChanges checks every adjacent seam in the latest
+// completed window using metadata already measured by ffprobe before ingest.
+// It is O(clips) SQL metadata work and never downloads, rewrites, or normalizes
+// source-native media.
+func detectCompletedWindowLayoutChanges(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
+	rows, err := pool.Query(ctx, `
+		WITH latest AS (
+		  SELECT DISTINCT ON (r.id)
+		    r.id,COALESCE(r.stream_id,0) AS stream_id,r.account_id,r.name AS recording_name,r.stream_url,
+		    acc.name AS org_name,acc.email AS org_email,j.fire_at,j.window_end_at
+		  FROM recordings r
+		  JOIN accounts acc ON acc.id=r.account_id
+		  JOIN account_billing b ON b.account_id=r.account_id AND b.has_payment_method=true
+		  JOIN recording_jobs j ON j.recording_id=r.id AND j.kind='continuous_window'
+		  WHERE r.status='active' AND r.mode='continuous' AND j.window_end_at<=now()
+		    AND j.window_end_at>=now()-interval '48 hours'
+		  ORDER BY r.id,j.window_end_at DESC,j.id DESC
+		), ordered AS (
+		  SELECT l.*,c.id AS clip_id,COALESCE(c.video_codec,'') AS video_codec,COALESCE(c.audio_codec,'') AS audio_codec,
+		    c.audio_present,COALESCE(c.actual_fps,0) AS actual_fps,
+		    COALESCE(c.video_width,0) AS video_width,COALESCE(c.video_height,0) AS video_height,
+		    lag(c.id) OVER seam AS previous_clip_id,
+		    lag(COALESCE(c.video_codec,'')) OVER seam AS previous_video_codec,
+		    lag(COALESCE(c.audio_codec,'')) OVER seam AS previous_audio_codec,
+		    lag(c.audio_present) OVER seam AS previous_audio_present,
+		    lag(COALESCE(c.actual_fps,0)) OVER seam AS previous_actual_fps,
+		    lag(COALESCE(c.video_width,0)) OVER seam AS previous_video_width,
+		    lag(COALESCE(c.video_height,0)) OVER seam AS previous_video_height
+		  FROM latest l
+		  JOIN recording_clips c ON c.recording_id=l.id
+		    AND c.clip_end_at>l.fire_at AND c.clip_start_at<l.window_end_at
+		  WINDOW seam AS (PARTITION BY l.id ORDER BY c.clip_start_at,c.id)
+		), changed AS (
+		  SELECT * FROM ordered
+		  WHERE previous_clip_id IS NOT NULL AND (
+		    video_codec IS DISTINCT FROM previous_video_codec OR
+		    audio_present IS DISTINCT FROM previous_audio_present OR
+		    (audio_present AND audio_codec IS DISTINCT FROM previous_audio_codec) OR
+		    (video_width>0 AND previous_video_width>0 AND
+		      (video_width<>previous_video_width OR video_height<>previous_video_height)) OR
+		    (actual_fps>0 AND previous_actual_fps>0 AND abs(actual_fps-previous_actual_fps)>0.1)
+		  )
+		)
+		SELECT DISTINCT ON (id)
+		  id,stream_id,account_id,recording_name,stream_url,org_name,org_email,fire_at,window_end_at,
+		  previous_clip_id,clip_id,previous_video_codec,video_codec,previous_audio_present,audio_present,
+		  previous_audio_codec,audio_codec,previous_actual_fps,actual_fps,
+		  previous_video_width,previous_video_height,video_width,video_height
+		FROM changed ORDER BY id,clip_id
+	`)
+	if err != nil {
+		log.Fatalf("signal continuous_layout_change: %v", err)
+	}
+	defer rows.Close()
+	out := []healthIncident{}
+	for rows.Next() {
+		var inc healthIncident
+		var open, close time.Time
+		var previousClipID, clipID int64
+		var previousVideoCodec, videoCodec, previousAudioCodec, audioCodec string
+		var previousAudioPresent, audioPresent bool
+		var previousFPS, actualFPS float64
+		var previousWidth, previousHeight, width, height int
+		if err := rows.Scan(&inc.RecordingID, &inc.StreamID, &inc.AccountID, &inc.RecName, &inc.StreamURL,
+			&inc.OrgName, &inc.OrgEmail, &open, &close, &previousClipID, &clipID,
+			&previousVideoCodec, &videoCodec, &previousAudioPresent, &audioPresent,
+			&previousAudioCodec, &audioCodec, &previousFPS, &actualFPS,
+			&previousWidth, &previousHeight, &width, &height); err != nil {
+			log.Fatalf("scan continuous_layout_change: %v", err)
+		}
+		inc.Signal, inc.Severity = signalContinuousLayoutChange, healthSignalSeverity[signalContinuousLayoutChange]
+		inc.SinceText = fmt.Sprintf("completed window %s to %s", open.UTC().Format(time.RFC3339), close.UTC().Format(time.RFC3339))
+		inc.Diag = diagText("seam", fmt.Sprintf("%d->%d", previousClipID, clipID),
+			"video", fmt.Sprintf("%s/%s", previousVideoCodec, videoCodec),
+			"audio", fmt.Sprintf("%t:%s/%t:%s", previousAudioPresent, previousAudioCodec, audioPresent, audioCodec),
+			"fps", fmt.Sprintf("%.3f/%.3f", previousFPS, actualFPS),
+			"dimensions", fmt.Sprintf("%d×%d/%d×%d", previousWidth, previousHeight, width, height))
+		out = append(out, inc)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("iterate continuous_layout_change: %v", err)
 	}
 	return out
 }

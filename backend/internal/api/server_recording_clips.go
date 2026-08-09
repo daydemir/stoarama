@@ -709,11 +709,20 @@ type recordingClipIngestRequest struct {
 	AudioCodec      string   `json:"audio_codec"`
 	AudioPresent    bool     `json:"audio_present"`
 	ActualFPS       *float64 `json:"actual_fps"`
+	VideoWidth      int      `json:"video_width"`
+	VideoHeight     int      `json:"video_height"`
 	Container       string   `json:"container"`
 	ResolvedURL     string   `json:"resolved_url"`
 	ClipStartAt     string   `json:"clip_start_at"`
 	ClipEndAt       string   `json:"clip_end_at"`
 	CaptureSequence int64    `json:"capture_sequence"`
+}
+
+func nullablePositiveInt(value int) any {
+	if value > 0 {
+		return value
+	}
+	return nil
 }
 
 // handleRecordingClipIngest records a successfully uploaded clip. In one tx it
@@ -754,6 +763,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	clipEndAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(req.ClipEndAt))
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, "clip_end_at must be RFC3339")
+		return
+	}
+	if (req.VideoWidth > 0) != (req.VideoHeight > 0) || req.VideoWidth < 0 || req.VideoHeight < 0 {
+		util.WriteError(w, http.StatusBadRequest, "video_width and video_height must both be positive or both be omitted")
 		return
 	}
 	var captureSequence *int64
@@ -899,15 +912,15 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		INSERT INTO recording_clips
 			(recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path,
 			 mime_type, container, size_bytes, etag, sha256, duration_ms, video_codec, audio_codec,
-			 audio_present, actual_fps, resolved_url, fire_at, clip_start_at, clip_end_at,
+			 audio_present, actual_fps, video_width, video_height, resolved_url, fire_at, clip_start_at, clip_end_at,
 			 capture_lease_token, capture_sequence)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		ON CONFLICT (bucket, object_key) DO NOTHING
 		RETURNING id
 	`, recordingID, jobID, destID, endpoint, bucket, objectKey,
 		displayPath, mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), durationMs,
 		strings.TrimSpace(req.VideoCodec), strings.TrimSpace(req.AudioCodec), req.AudioPresent, req.ActualFPS,
-		strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt, captureLeaseToken, captureSequence).Scan(&clipID)
+		nullablePositiveInt(req.VideoWidth), nullablePositiveInt(req.VideoHeight), strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt, captureLeaseToken, captureSequence).Scan(&clipID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// 0-row insert means a clip already exists for this (bucket,object_key).
 		// Treat as an error so the job is NOT marked done and the dropped clip

@@ -242,6 +242,23 @@ func TestParseFrameRate(t *testing.T) {
 	}
 }
 
+func TestProbeSegmentCapturesNativeVideoDimensions(t *testing.T) {
+	probe := filepath.Join(t.TempDir(), "ffprobe")
+	script := `#!/bin/sh
+printf '%s\n' '{"format":{"duration":"60.0"},"streams":[{"codec_type":"video","codec_name":"h264","avg_frame_rate":"30/1","width":1280,"height":720}]}'`
+	if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
+	meta, err := probeSegment(context.Background(), filepath.Join(t.TempDir(), "clip.mp4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.VideoWidth != 1280 || meta.VideoHeight != 720 {
+		t.Fatalf("dimensions=%dx%d want 1280x720", meta.VideoWidth, meta.VideoHeight)
+	}
+}
+
 func TestContinuousWatchdogStartupAndProgressTimeouts(t *testing.T) {
 	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	lastProgress := started.Add(62 * time.Second)
