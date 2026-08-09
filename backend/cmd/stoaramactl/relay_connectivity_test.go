@@ -279,12 +279,14 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 		states[0].ReportedJobs != 2 || states[0].LiveLeases != 0 {
 		t.Fatalf("relay diagnostics missing from state: %+v", states[0])
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{"active_jobs":1.5}' WHERE id=7`); err != nil {
-		t.Fatal(err)
-	}
-	malformed, err := currentRelayConnectivity(ctx, pool, now)
-	if err != nil || len(malformed) != 1 || malformed[0].ReportedJobs != 0 {
-		t.Fatalf("malformed reported jobs states=%v err=%v", malformed, err)
+	for _, capabilities := range []string{`{"active_jobs":1.5}`, `{"active_jobs":-1}`} {
+		if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb=$1 WHERE id=7`, capabilities); err != nil {
+			t.Fatal(err)
+		}
+		malformed, err := currentRelayConnectivity(ctx, pool, now)
+		if err != nil || len(malformed) != 1 || malformed[0].ReportedJobs != 0 {
+			t.Fatalf("malformed reported jobs capabilities=%s states=%v err=%v", capabilities, malformed, err)
+		}
 	}
 	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{"relay_version":"abc123","relay_started_at":"2026-07-22T11:00:00Z","active_jobs":2}' WHERE id=7`); err != nil {
 		t.Fatal(err)
@@ -295,7 +297,7 @@ func TestRecordRelayConnectivityBaselinesAndQueuesEveryTransition(t *testing.T) 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recording_jobs (lease_owner,lease_expires_at,status,kind,fire_at,window_end_at)
 		VALUES ('node:7',$1,'leased','continuous_window',$2,$3)
-	`, time.Now().UTC().Add(time.Minute), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
+	`, now.AddDate(10, 0, 0), now.Add(-time.Hour), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	states, err = currentRelayConnectivity(ctx, pool, now)
