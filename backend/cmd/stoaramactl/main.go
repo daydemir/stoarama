@@ -95,6 +95,8 @@ func main() {
 		runRecordingHealth(ctx, cfg, os.Args[2:])
 	case "relay-connectivity":
 		runRelayConnectivity(ctx, cfg, os.Args[2:])
+	case "relay-routing":
+		runRelayRouting(ctx, cfg, os.Args[2:])
 	case "recordings":
 		runRecordings(ctx, cfg, os.Args[2:])
 	case "nas-inventory":
@@ -180,6 +182,7 @@ func usage() {
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl relay-connectivity run [--dry-run]
+	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]
 	  stoaramactl recordings naming allocate|get|set|preview
 	  stoaramactl recordings schedule-batch --spec FILE [--dry-run --json --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-postflight (--recording-ids IDS | --batch-response FILE | --spec FILE) --session-cookie-file FILE [--max-nas-pending-clips N --backend-api-url URL --api-token TOKEN]
