@@ -360,6 +360,26 @@ func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) 
 	}
 }
 
+func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
+		`recent coverage`,
+		`Largest gap`,
+		`Whole period`,
+		`native layout changed`,
+		`continuous timeline · native layout compatible`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings list timeline health missing %q", marker)
+		}
+	}
+}
+
 func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
