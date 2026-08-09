@@ -40,9 +40,12 @@ func parseRelayRoutingArgs(args []string) (relayRoutingOptions, error) {
 	if len(fs.Args()) != 0 {
 		return relayRoutingOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
-	name := strings.TrimSpace(*expectedName)
+	name := *expectedName
 	if *accountID <= 0 || *groupID <= 0 || name == "" {
 		return relayRoutingOptions{}, fmt.Errorf("--account-id, --group-id, and --expected-name are required")
+	}
+	if strings.TrimSpace(name) != name {
+		return relayRoutingOptions{}, fmt.Errorf("--expected-name must match exactly without surrounding whitespace")
 	}
 	if math.IsNaN(*bandwidthMbps) || math.IsInf(*bandwidthMbps, 0) || *bandwidthMbps < 1 || *bandwidthMbps > 10000 {
 		return relayRoutingOptions{}, fmt.Errorf("--bandwidth-mbps must be between 1 and 10000")

@@ -31,6 +31,7 @@ func TestParseRelayRoutingArgs(t *testing.T) {
 func TestParseRelayRoutingArgsRejectsUnsafeInput(t *testing.T) {
 	tests := [][]string{
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "", "--bandwidth-mbps", "80"},
+		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", " deniz-durham ", "--bandwidth-mbps", "80"},
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "deniz-durham", "--bandwidth-mbps", "0"},
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "deniz-durham", "--bandwidth-mbps", "NaN"},
 		{"set-group-bandwidth", "--account-id", "47", "--group-id", "3", "--expected-name", "deniz-durham", "--bandwidth-mbps", "10001"},
