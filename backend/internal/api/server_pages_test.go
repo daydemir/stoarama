@@ -65,7 +65,7 @@ func TestRecordingRelayRoutingIsSoftAndExplicit(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`Preferred home internet`,
-		`Automatic after 12 seconds if the preferred connection is unavailable or full`,
+		`Immediate if the preferred connection is unavailable or full; after 12 seconds if it is healthy but does not take the job`,
 		`This is a soft preference. Stoarama falls back automatically rather than miss footage.`,
 		`/relay-routing`,
 		`preferred_relay_group_id: raw ? Number(raw) : null`,

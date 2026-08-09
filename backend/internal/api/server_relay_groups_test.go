@@ -115,7 +115,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		CREATE TABLE streams (id BIGINT PRIMARY KEY, provider TEXT, source_page_url TEXT);
 		CREATE TABLE storage_destinations (id BIGINT PRIMARY KEY);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
-		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT);
+		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
 		INSERT INTO accounts VALUES (47);
 		INSERT INTO relay_groups VALUES (1, 47, 1);
@@ -369,6 +369,24 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		UPDATE recording_jobs SET status='complete',lease_owner=NULL,lease_expires_at=NULL WHERE id=25;
 		UPDATE nodes SET last_heartbeat_at=now() WHERE id=15;
+		UPDATE relay_groups SET max_streams=(
+		  SELECT count(*) FROM recording_jobs j
+		  JOIN nodes n ON j.lease_owner='node:'||n.id::text
+		  WHERE n.relay_group_id=10 AND j.status='leased' AND j.lease_expires_at>now()
+		) WHERE id=10;
+		INSERT INTO recordings (id,account_id,status,start_at,capture_via,stream_url,storage_destination_id,preferred_relay_group_id)
+		VALUES (27,47,'active',now()-interval '1 hour','relay','https://example.com/27.m3u8',1,10);
+		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,attempt_count,updated_at,window_end_at)
+		VALUES (27,27,'pending',now(),'continuous_window',now(),60,0,now(),now()+interval '1 hour');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease(2); err != nil {
+		t.Fatalf("full preferred group blocked immediate fallback: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs SET status='complete',lease_owner=NULL,lease_expires_at=NULL WHERE id=27;
+		UPDATE relay_groups SET max_streams=10 WHERE id=10;
 		INSERT INTO recordings (id,account_id,status,start_at,capture_via,stream_url,storage_destination_id,preferred_relay_group_id)
 		VALUES (26,47,'active',now()-interval '1 hour','relay','https://example.com/26.m3u8',1,10);
 		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,attempt_count,updated_at,window_end_at)

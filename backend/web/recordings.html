@@ -3598,7 +3598,7 @@
           </div>
           <dl class="detail-rows">
             <dt>Preferred connection</dt><dd>${escapeHTML(preferred || 'Automatic balancing')}</dd>
-            <dt>Fallback</dt><dd>Automatic after 12 seconds if the preferred connection is unavailable or full</dd>
+            <dt>Fallback</dt><dd>Immediate if the preferred connection is unavailable or full; after 12 seconds if it is healthy but does not take the job</dd>
           </dl>
           <div id="routingEditForm" class="detail-edit hidden"></div>
         </div>`;
