@@ -271,6 +271,86 @@ func TestContinuousNoProgressExpired(t *testing.T) {
 	}
 }
 
+func TestContinuousMediaLagExpired(t *testing.T) {
+	now := time.Date(2026, time.August, 9, 2, 0, 0, 0, time.UTC)
+	timeout := 15 * time.Minute
+	for _, tc := range []struct {
+		name     string
+		mediaEnd time.Time
+		now      time.Time
+		timeout  time.Duration
+		want     bool
+	}{
+		{name: "within bound", mediaEnd: now.Add(-timeout + time.Nanosecond), now: now, timeout: timeout},
+		{name: "at bound", mediaEnd: now.Add(-timeout), now: now, timeout: timeout, want: true},
+		{name: "well behind despite progress", mediaEnd: now.Add(-48 * time.Minute), now: now, timeout: timeout, want: true},
+		{name: "disabled", mediaEnd: now.Add(-time.Hour), now: now, timeout: 0},
+		{name: "unknown media end", now: now, timeout: timeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := continuousMediaLagExpired(tc.mediaEnd, tc.now, tc.timeout); got != tc.want {
+				t.Fatalf("continuousMediaLagExpired()=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestContinuousMediaLagSurrendersOnlyAfterCleanSpoolDrain(t *testing.T) {
+	if !continuousMediaLagCanSurrender(true, nil, false) {
+		t.Fatal("cleanly drained lagged capture did not surrender")
+	}
+	if continuousMediaLagCanSurrender(true, errors.New("upload failed"), false) {
+		t.Fatal("lagged capture surrendered despite an unacknowledged spool")
+	}
+	if continuousMediaLagCanSurrender(false, nil, false) {
+		t.Fatal("unrelated capture failure surrendered as lag")
+	}
+	if continuousMediaLagCanSurrender(true, nil, true) {
+		t.Fatal("fully drained closed window was surrendered instead of completed")
+	}
+}
+
+func TestContinuousMediaLagStopsCaptureThenDrainsBeforeSurrender(t *testing.T) {
+	now := time.Date(2026, time.August, 9, 2, 0, 0, 0, time.UTC)
+	var delivered atomic.Int64
+	var lagged atomic.Bool
+	var aborted atomic.Int64
+	pool := startSegmentDeliveryPool(2, func() {}, func(seg capture.Segment) error {
+		observeContinuousMediaLag(seg.EndAt, now, 15*time.Minute, &lagged, func() { aborted.Add(1) })
+		delivered.Add(1)
+		return nil
+	})
+	for sequence := int64(1); sequence <= 5; sequence++ {
+		if err := pool.Submit(capture.Segment{CaptureSequence: sequence, EndAt: now.Add(-48 * time.Minute)}); err != nil {
+			t.Fatalf("submit %d: %v", sequence, err)
+		}
+	}
+	result := pool.close()
+	if result.err != nil || result.pending != 0 || delivered.Load() != 5 || !lagged.Load() || aborted.Load() != 1 {
+		t.Fatalf("drain result=%+v delivered=%d lagged=%v aborts=%d, want five acknowledged and one stop", result, delivered.Load(), lagged.Load(), aborted.Load())
+	}
+	if !continuousMediaLagCanSurrender(lagged.Load(), result.err, false) {
+		t.Fatal("fully drained lagged capture did not surrender")
+	}
+
+	var failedLagged atomic.Bool
+	failedPool := startSegmentDeliveryPool(1, func() {}, func(seg capture.Segment) error {
+		observeContinuousMediaLag(seg.EndAt, now, 15*time.Minute, &failedLagged, func() {})
+		return errSegmentDeliveryExhausted
+	})
+	if err := failedPool.Submit(capture.Segment{CaptureSequence: 1, EndAt: now.Add(-48 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	failed := failedPool.close()
+	joined := joinSegmentDeliveryError(context.Canceled, failed.err)
+	if continuousMediaLagCanSurrender(failedLagged.Load(), failed.err, false) {
+		t.Fatal("lagged capture surrendered with an unacknowledged segment")
+	}
+	if shouldCleanupContinuousAttempt(failed.pending > 0, joined, failedLagged.Load()) {
+		t.Fatal("lagged capture deleted its unacknowledged spool")
+	}
+}
+
 func TestDiskHasSpaceFailsClosed(t *testing.T) {
 	worker := &Worker{cfg: Config{
 		DiskFreeBytes: func() (uint64, error) { return 9, nil },
@@ -724,6 +804,7 @@ func TestContinuousAttemptCleanupDecision(t *testing.T) {
 		name    string
 		pending bool
 		err     error
+		lagged  bool
 		want    bool
 	}{
 		{name: "acknowledged", pending: false, want: true},
@@ -732,11 +813,12 @@ func TestContinuousAttemptCleanupDecision(t *testing.T) {
 		{name: "disk pressure", pending: true, err: errDiskPressure, want: true},
 		{name: "permanent delivery failure", pending: true, err: errPermanentSegmentDelivery, want: true},
 		{name: "delivery budget exhausted", pending: true, err: errSegmentDeliveryExhausted, want: true},
+		{name: "lag plus delivery failure preserves spool", pending: true, err: errSegmentDeliveryExhausted, lagged: true, want: false},
 		{name: "transient unclean failure", pending: true, err: errors.New("connection reset"), want: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := shouldCleanupContinuousAttempt(test.pending, test.err); got != test.want {
+			if got := shouldCleanupContinuousAttempt(test.pending, test.err, test.lagged); got != test.want {
 				t.Fatalf("cleanup=%v want %v", got, test.want)
 			}
 		})

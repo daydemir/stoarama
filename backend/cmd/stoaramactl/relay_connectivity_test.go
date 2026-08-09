@@ -67,6 +67,130 @@ func TestRelayObservedStateRequiresFreshHeartbeatToClearFastOffline(t *testing.T
 	}
 }
 
+func TestRelayCapacityStateRequiresIndependentUplinkAndNPlusOneCapacity(t *testing.T) {
+	tests := []struct {
+		name      string
+		demand    int
+		domains   int
+		remaining int
+		want      relayCapacityState
+	}{
+		{name: "idle fleet does not page", demand: 0, domains: 0, remaining: 0, want: relayCapacityHealthy},
+		{name: "one uplink cannot fail over", demand: 1, domains: 1, remaining: 20, want: relayCapacityDegraded},
+		{name: "second uplink too small", demand: 3, domains: 2, remaining: 2, want: relayCapacityDegraded},
+		{name: "second uplink exactly covers demand", demand: 3, domains: 2, remaining: 3, want: relayCapacityHealthy},
+		{name: "three uplinks cover demand", demand: 3, domains: 3, remaining: 6, want: relayCapacityHealthy},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := relayCapacityStateFor(tc.demand, tc.domains, tc.remaining); got != tc.want {
+				t.Fatalf("relayCapacityStateFor(%d,%d,%d)=%s, want %s", tc.demand, tc.domains, tc.remaining, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRelayCapacityMessageContainsFailoverDiagnostics(t *testing.T) {
+	state := relayCapacityTransition{
+		OrgName: "MIT SCL", OrgEmail: "scl@example.edu", State: relayCapacityDegraded,
+		ChangedAt: time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC), ActiveDemand: 9,
+		LiveFailureDomains: 1, EffectiveCapacity: 50, RemainingCapacity: 0,
+	}
+	body := relayCapacityBody("https://stoarama.com/", state)
+	for _, want := range []string{"MIT SCL <scl@example.edu>", "Active relay capture demand: 9", "Live uplink failure domains: 1", "Capacity after largest uplink loss: 0", "org-settings#relay-computers"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestCurrentRelayCapacityCollapsesGroupsAndPreservesUngroupedDomains(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed relay capacity regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("relay_capacity_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE TYPE relay_capacity_state AS ENUM ('healthy','degraded');
+		CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL);
+		CREATE TABLE users (email TEXT PRIMARY KEY, is_operator BOOLEAN NOT NULL);
+		CREATE TABLE relay_groups (id BIGINT PRIMARY KEY, max_streams INTEGER NOT NULL);
+		CREATE TABLE nodes (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, node_type TEXT NOT NULL, status TEXT NOT NULL, last_heartbeat_at TIMESTAMPTZ, relay_group_id BIGINT, relay_max_streams INTEGER NOT NULL);
+		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, capture_via TEXT NOT NULL, status TEXT NOT NULL);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, lease_expires_at TIMESTAMPTZ, fire_at TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, window_end_at TIMESTAMPTZ, clip_duration_sec INTEGER NOT NULL);
+		CREATE TABLE relay_capacity_alert_states (account_id BIGINT PRIMARY KEY, observed_state relay_capacity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL);
+		CREATE TABLE relay_capacity_alert_events (id BIGSERIAL PRIMARY KEY, account_id BIGINT NOT NULL, state relay_capacity_state NOT NULL, observed_at TIMESTAMPTZ NOT NULL, active_demand INTEGER NOT NULL, live_failure_domains INTEGER NOT NULL, effective_capacity INTEGER NOT NULL, remaining_capacity INTEGER NOT NULL, notified_at TIMESTAMPTZ);
+		CREATE TABLE relay_capacity_alert_deliveries (event_id BIGINT NOT NULL, recipient TEXT NOT NULL, delivered_at TIMESTAMPTZ, PRIMARY KEY(event_id,recipient));
+		INSERT INTO accounts VALUES (47,'MIT SCL','scl@example.edu');
+		INSERT INTO users VALUES ('operator@example.com',true);
+		INSERT INTO relay_groups VALUES (1,14);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO nodes VALUES
+		  (1,47,'relay','active',$1,1,10),
+		  (2,47,'relay','active',$1,1,10),
+		  (3,47,'relay','active',$1,NULL,3),
+		  (4,47,'relay','active',$2,NULL,99)
+	`, now.Add(-time.Minute), now.Add(-3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (1,47,'relay','active'),(2,47,'relay','active'),(3,47,'cloud','active')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_jobs VALUES
+		  (1,1,'leased',$1,$2,'continuous_window',$3,60),
+		  (2,2,'pending',NULL,$2,'clip',NULL,60),
+		  (3,3,'leased',$1,$2,'continuous_window',$3,60),
+		  (4,1,'pending',NULL,$2,'clip',NULL,60)
+	`, now.Add(time.Minute), now.Add(-30*time.Second), now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	state, err := currentRelayCapacity(ctx, pool, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ActiveDemand != 3 || state.LiveFailureDomains != 2 || state.EffectiveCapacity != 17 || state.RemainingCapacity != 3 || state.State != relayCapacityHealthy || !state.ChangedAt.Equal(now) {
+		t.Fatalf("capacity=%+v, want demand=3 including overlapping jobs from one recording, domains=2 effective=17 remaining=3 healthy", state)
+	}
+	if pending, err := recordRelayCapacity(ctx, pool, now); err != nil || len(pending) != 0 {
+		t.Fatalf("healthy baseline pending=%v err=%v, want silent baseline", pending, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=$1 WHERE id=3`, now.Add(-3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := recordRelayCapacity(ctx, pool, now.Add(time.Second))
+	if err != nil || len(pending) != 1 || pending[0].State != relayCapacityDegraded || pending[0].LiveFailureDomains != 1 || pending[0].RemainingCapacity != 0 {
+		t.Fatalf("degraded transition=%v err=%v", pending, err)
+	}
+}
+
 func TestRelayConnectivityMessageContainsDiagnostics(t *testing.T) {
 	changed := time.Date(2026, 7, 22, 12, 5, 0, 0, time.UTC)
 	heartbeat := changed.Add(-3 * time.Minute)

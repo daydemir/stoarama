@@ -122,6 +122,7 @@ func runRelay(ctx context.Context) error {
 		LeaseGate:                   &leaseGate,
 		RelayDiagnostics:            relayDiag,
 		ContinuousNoProgressTimeout: 5 * time.Minute,
+		ContinuousMaxMediaLag:       15 * time.Minute,
 		CaptureTempDir:              tempRoot,
 		UploadWorkers:               config.RelayUploadWorkersFromEnv(),
 		DiskFreeBytes: func() (uint64, error) {
