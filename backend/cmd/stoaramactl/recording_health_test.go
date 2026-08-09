@@ -468,3 +468,59 @@ func TestDetectClipTimestampDriftFindsWorstClipNotNewest(t *testing.T) {
 		t.Fatalf("diag missing lead: %q", got[0].Diag)
 	}
 }
+
+func TestDetectClipTimestampDriftAndLayoutChangeFindsNativeSeamChange(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed layout regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("clip_layout_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE accounts (id BIGINT PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL);
+		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY,has_payment_method BOOLEAN NOT NULL);
+		CREATE TABLE recordings (id BIGINT PRIMARY KEY,stream_id BIGINT,account_id BIGINT NOT NULL,name TEXT NOT NULL,stream_url TEXT NOT NULL,status TEXT NOT NULL,mode TEXT NOT NULL);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,kind TEXT NOT NULL,fire_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ);
+		CREATE TABLE recording_clips (
+		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
+		  video_codec TEXT,audio_codec TEXT,audio_present BOOLEAN NOT NULL,actual_fps DOUBLE PRECISION,video_width INTEGER,video_height INTEGER);
+		INSERT INTO accounts VALUES (1,'MIT SCL','scl@example.edu');
+		INSERT INTO account_billing VALUES (1,true);
+		INSERT INTO recordings VALUES
+		  (20,120,1,'changed','https://e.test/changed','active','continuous'),
+		  (21,121,1,'stable','https://e.test/stable','active','continuous');
+		INSERT INTO recording_jobs VALUES
+		  (200,20,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
+		  (210,21,'continuous_window',now()-interval '2 hours',now()-interval '1 hour');
+		INSERT INTO recording_clips VALUES
+		  (1,20,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (2,20,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1920,1080),
+		  (3,21,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (4,21,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	got := detectCompletedWindowLayoutChanges(ctx, pool)
+	if len(got) != 1 || got[0].RecordingID != 20 || got[0].Signal != signalContinuousLayoutChange {
+		t.Fatalf("layout incidents=%+v", got)
+	}
+}

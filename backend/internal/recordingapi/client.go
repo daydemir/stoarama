@@ -152,6 +152,8 @@ type IngestClipRequest struct {
 	AudioCodec      string
 	AudioPresent    bool
 	ActualFPS       *float64
+	VideoWidth      int
+	VideoHeight     int
 	Container       string
 	ResolvedURL     string
 	ClipStartAt     time.Time
@@ -225,6 +227,8 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 		"audio_codec":   strings.TrimSpace(req.AudioCodec),
 		"audio_present": req.AudioPresent,
 		"actual_fps":    req.ActualFPS,
+		"video_width":   req.VideoWidth,
+		"video_height":  req.VideoHeight,
 		"container":     strings.TrimSpace(req.Container),
 		"resolved_url":  strings.TrimSpace(req.ResolvedURL),
 		"clip_start_at": req.ClipStartAt.UTC().Format(time.RFC3339Nano),

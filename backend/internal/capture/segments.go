@@ -58,6 +58,8 @@ type Segment struct {
 	VideoCodec   string
 	AudioCodec   string
 	AudioPresent bool
+	VideoWidth   int
+	VideoHeight  int
 	// CaptureSequence is assigned by the recording worker across every ffmpeg
 	// reconnect in one job. It is not media metadata; it preserves the recorder's
 	// authoritative concatenation order even when a source's wall-clock labels
@@ -142,6 +144,7 @@ func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, durat
 	audioCodec := ""
 	audioPresent := false
 	var actualFPS *float64
+	videoWidth, videoHeight := 0, 0
 	if metaErr == nil {
 		if meta.DurationMs > 0 {
 			durationMs = meta.DurationMs
@@ -152,6 +155,7 @@ func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, durat
 		}
 		audioCodec = meta.AudioCodec
 		audioPresent = meta.AudioPresent
+		videoWidth, videoHeight = meta.VideoWidth, meta.VideoHeight
 		if durationMs > 0 {
 			endAt = startAt.Add(time.Duration(durationMs) * time.Millisecond)
 		}
@@ -176,6 +180,8 @@ func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, durat
 		VideoCodec:   videoCodec,
 		AudioCodec:   audioCodec,
 		AudioPresent: audioPresent,
+		VideoWidth:   videoWidth,
+		VideoHeight:  videoHeight,
 		Thumbnail:    thumb,
 	}, nil
 }
@@ -548,6 +554,7 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 	audioCodec := ""
 	audioPresent := false
 	var actualFPS *float64
+	videoWidth, videoHeight := 0, 0
 	if metaErr == nil {
 		durationMs = meta.DurationMs
 		actualFPS = meta.ActualFPS
@@ -556,6 +563,7 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 		}
 		audioCodec = meta.AudioCodec
 		audioPresent = meta.AudioPresent
+		videoWidth, videoHeight = meta.VideoWidth, meta.VideoHeight
 	}
 	// A probe miss (or a degenerate probe reporting <=0 duration) must not collapse
 	// the segment to zero width: fall back to the muxer's expected cut span so the
@@ -581,6 +589,8 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 		VideoCodec:   videoCodec,
 		AudioCodec:   audioCodec,
 		AudioPresent: audioPresent,
+		VideoWidth:   videoWidth,
+		VideoHeight:  videoHeight,
 	}, nil
 }
 
@@ -933,6 +943,8 @@ type ffprobeMeta struct {
 	VideoCodec   string
 	AudioCodec   string
 	AudioPresent bool
+	VideoWidth   int
+	VideoHeight  int
 }
 
 // ValidateSegmentFile proves that a stored clip is a decodable media container
@@ -1053,7 +1065,7 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 	cmd := exec.CommandContext(probeCtx,
 		ffprobeBin(),
 		"-v", "error",
-		"-show_entries", "format=duration:stream=codec_type,codec_name,avg_frame_rate,r_frame_rate",
+		"-show_entries", "format=duration:stream=codec_type,codec_name,avg_frame_rate,r_frame_rate,width,height",
 		"-of", "json",
 		path,
 	)
@@ -1070,6 +1082,8 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 			CodecName    string `json:"codec_name"`
 			AvgFrameRate string `json:"avg_frame_rate"`
 			RFrameRate   string `json:"r_frame_rate"`
+			Width        int    `json:"width"`
+			Height       int    `json:"height"`
 		} `json:"streams"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
@@ -1086,6 +1100,8 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 		case "video":
 			if meta.VideoCodec == "" {
 				meta.VideoCodec = strings.TrimSpace(stream.CodecName)
+				meta.VideoWidth = stream.Width
+				meta.VideoHeight = stream.Height
 			}
 			if meta.ActualFPS == nil {
 				meta.ActualFPS = parseFrameRate(strings.TrimSpace(stream.AvgFrameRate))
