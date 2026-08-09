@@ -118,15 +118,17 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
-	releaseRunLock, err := acquireRecordingHealthRunLock(ctx, pool)
+	releaseRunLock, err := acquireRecordingHealthRunLock(ctx, pool, *verifyMedia)
 	if err != nil {
 		log.Fatalf("acquire recording health run lock: %v", err)
 	}
 	defer releaseRunLock()
 
-	incidents := detectRecordingHealthIncidents(ctx, pool, *freshnessMin)
+	var incidents []healthIncident
 	if *verifyMedia {
-		incidents = append(incidents, detectLatestStoredClipHealth(ctx, pool, cfg)...)
+		incidents = detectLatestStoredClipHealth(ctx, pool, cfg)
+	} else {
+		incidents = detectRecordingHealthIncidents(ctx, pool, *freshnessMin)
 	}
 	bySignal := map[string]int{}
 	for _, inc := range incidents {
@@ -198,22 +200,30 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	})
 }
 
-const recordingHealthAdvisoryLock int64 = 0x53544f4152414d41
+const (
+	recordingHealthTimelineAdvisoryLock int64 = 0x53544f4152414d41
+	recordingHealthMediaAdvisoryLock    int64 = 0x53544f4152414d42
+)
 
-// acquireRecordingHealthRunLock serializes hourly, daily-media, and manual
-// sweeps. PostgreSQL owns the session lock, so process death releases it and a
-// waiting run can safely retry detection without a stale external lease.
-func acquireRecordingHealthRunLock(ctx context.Context, pool *pgxpool.Pool) (func(), error) {
+// acquireRecordingHealthRunLock serializes runs within one signal class. The
+// expensive daily object/decode verifier deliberately uses a different lock
+// from the hourly timeline sweep, so it cannot delay a silent-death alert.
+// PostgreSQL owns the session lock, so process death releases it.
+func acquireRecordingHealthRunLock(ctx context.Context, pool *pgxpool.Pool, verifyMedia bool) (func(), error) {
+	lockID := recordingHealthTimelineAdvisoryLock
+	if verifyMedia {
+		lockID = recordingHealthMediaAdvisoryLock
+	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, recordingHealthAdvisoryLock); err != nil {
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
 		conn.Release()
 		return nil, err
 	}
 	return func() {
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, recordingHealthAdvisoryLock)
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockID)
 		conn.Release()
 	}, nil
 }
@@ -273,14 +283,14 @@ func resolveClearedHealthAlerts(ctx context.Context, pool *pgxpool.Pool, inciden
 }
 
 func evaluatedHealthSignals(verifyMedia bool) []string {
+	if verifyMedia {
+		return []string{signalStoredClipInvalid}
+	}
 	signals := []string{
 		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
 		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
 		signalClipTimestampDrift, signalContinuousCoverageLow,
 		signalContinuousOverlap, signalContinuousLongGap, signalContinuousFragmented,
-	}
-	if verifyMedia {
-		signals = append(signals, signalStoredClipInvalid)
 	}
 	return signals
 }

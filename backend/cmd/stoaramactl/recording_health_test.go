@@ -135,13 +135,13 @@ func TestRecordingHealthRunLockSerializesSweeps(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	release, err := acquireRecordingHealthRunLock(context.Background(), pool)
+	release, err := acquireRecordingHealthRunLock(context.Background(), pool, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	blockedCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if secondRelease, err := acquireRecordingHealthRunLock(blockedCtx, pool); err == nil {
+	if secondRelease, err := acquireRecordingHealthRunLock(blockedCtx, pool, false); err == nil {
 		secondRelease()
 		release()
 		t.Fatal("second concurrent health sweep acquired advisory lock")
@@ -149,11 +149,47 @@ func TestRecordingHealthRunLockSerializesSweeps(t *testing.T) {
 	release()
 	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer recoverCancel()
-	thirdRelease, err := acquireRecordingHealthRunLock(recoverCtx, pool)
+	thirdRelease, err := acquireRecordingHealthRunLock(recoverCtx, pool, false)
 	if err != nil {
 		t.Fatalf("lock did not recover after release: %v", err)
 	}
 	thirdRelease()
+}
+
+func TestRecordingHealthRunLockAllowsMediaAndTimelineConcurrently(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run advisory-lock regression")
+	}
+	pool, err := pgxpool.New(context.Background(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	releaseMedia, err := acquireRecordingHealthRunLock(context.Background(), pool, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseMedia()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	releaseTimeline, err := acquireRecordingHealthRunLock(ctx, pool, false)
+	if err != nil {
+		t.Fatalf("media verifier blocked timeline sweep: %v", err)
+	}
+	releaseTimeline()
+}
+
+func TestEvaluatedHealthSignalsAreDisjointByRunClass(t *testing.T) {
+	media := evaluatedHealthSignals(true)
+	if len(media) != 1 || media[0] != signalStoredClipInvalid {
+		t.Fatalf("media signals=%v", media)
+	}
+	for _, signal := range evaluatedHealthSignals(false) {
+		if signal == signalStoredClipInvalid {
+			t.Fatal("timeline sweep evaluates media signal")
+		}
+	}
 }
 
 func sampleIncidents() []healthIncident {
