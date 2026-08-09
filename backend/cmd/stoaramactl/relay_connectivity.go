@@ -74,11 +74,16 @@ func runRelayConnectivity(ctx context.Context, cfg config.Config, args []string)
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
 	if *dryRun {
-		states, err := currentRelayConnectivity(ctx, pool, time.Now().UTC())
+		now := time.Now().UTC()
+		states, err := currentRelayConnectivity(ctx, pool, now)
 		if err != nil {
 			log.Fatalf("load relay connectivity: %v", err)
 		}
-		printJSON(map[string]any{"dry_run": true, "relays": states})
+		capacity, err := currentRelayCapacity(ctx, pool, now)
+		if err != nil {
+			log.Fatalf("load relay capacity: %v", err)
+		}
+		printJSON(map[string]any{"dry_run": true, "relays": states, "capacity": capacity})
 		return
 	}
 	lockConn, err := pool.Acquire(ctx)
@@ -96,21 +101,36 @@ func runRelayConnectivity(ctx context.Context, cfg config.Config, args []string)
 	}
 	defer func() { _, _ = lockConn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, relayConnectivityLockID) }()
 
-	transitions, err := recordRelayConnectivity(ctx, pool, time.Now().UTC())
+	now := time.Now().UTC()
+	transitions, err := recordRelayConnectivity(ctx, pool, now)
 	if err != nil {
 		log.Fatalf("record relay connectivity: %v", err)
 	}
-	if len(transitions) == 0 {
-		printJSON(map[string]any{"dry_run": false, "transitions": 0, "emailed": 0})
+	capacityTransitions, err := recordRelayCapacity(ctx, pool, now)
+	if err != nil {
+		log.Fatalf("record relay capacity: %v", err)
+	}
+	if len(transitions) == 0 && len(capacityTransitions) == 0 {
+		printJSON(map[string]any{"dry_run": false, "transitions": 0, "capacity_transitions": 0, "emailed": 0})
 		return
 	}
-	if err := deliverRelayConnectivityEmail(ctx, pool, cfg, transitions); err != nil {
-		log.Fatalf("deliver relay connectivity alert: %v", err)
+	if len(transitions) > 0 {
+		if err := deliverRelayConnectivityEmail(ctx, pool, cfg, transitions); err != nil {
+			log.Fatalf("deliver relay connectivity alert: %v", err)
+		}
+		if err := markRelayConnectivityNotified(ctx, pool, transitions); err != nil {
+			log.Fatalf("mark relay connectivity alerts notified: %v", err)
+		}
 	}
-	if err := markRelayConnectivityNotified(ctx, pool, transitions); err != nil {
-		log.Fatalf("mark relay connectivity alerts notified: %v", err)
+	if len(capacityTransitions) > 0 {
+		if err := deliverRelayCapacityEmail(ctx, pool, cfg, capacityTransitions); err != nil {
+			log.Fatalf("deliver relay capacity alert: %v", err)
+		}
+		if err := markRelayCapacityNotified(ctx, pool, capacityTransitions); err != nil {
+			log.Fatalf("mark relay capacity alerts notified: %v", err)
+		}
 	}
-	printJSON(map[string]any{"dry_run": false, "transitions": len(transitions), "emailed": 1})
+	printJSON(map[string]any{"dry_run": false, "transitions": len(transitions), "capacity_transitions": len(capacityTransitions), "emailed": 1})
 }
 
 func currentRelayConnectivity(ctx context.Context, q interface {

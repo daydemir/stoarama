@@ -57,6 +57,11 @@ type Config struct {
 	// this long without a successfully ingested segment. The server then hands the
 	// job to another worker; zero disables the safeguard.
 	ContinuousNoProgressTimeout time.Duration
+	// ContinuousMaxMediaLag makes a worker surrender a continuous job when a
+	// finalized segment's media timestamp trails wall time by this much. This
+	// catches a delivery queue that is making slow progress but can never return to
+	// real time; zero disables the safeguard.
+	ContinuousMaxMediaLag time.Duration
 	// CaptureTempDir owns relay capture attempts outside the OS-wide temporary
 	// directory. Empty preserves the cloud worker's existing behavior.
 	CaptureTempDir string
@@ -621,7 +626,14 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// jobCtx, so uploads already in flight keep their full retry budget (and the
 		// post-window grace) while the pool is drained.
 		attemptCtx, abortAttempt := context.WithCancel(windowCtx)
+		var mediaLagged atomic.Bool
 		pool := startSegmentDeliveryPool(w.cfg.UploadWorkers, abortAttempt, func(seg capture.Segment) error {
+			// Measure age when an upload worker actually reaches the descriptor, not
+			// when capture enqueues it. Submit is intentionally nonblocking, so only
+			// this point can detect a queue that is falling behind real time. Stopping
+			// capture is control flow only: this segment and the rest of the accepted
+			// spool still drain normally on jobCtx.
+			observeContinuousMediaLag(seg.EndAt, time.Now(), w.cfg.ContinuousMaxMediaLag, &mediaLagged, abortAttempt)
 			return deliverSegment(resolved, seg)
 		})
 		var diskPressure atomic.Bool
@@ -668,7 +680,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if delivery.submitted > 0 {
 			segmentDeliveryPending = delivery.pending > 0
 		}
-		if shouldCleanupContinuousAttempt(segmentDeliveryPending, captureErr) {
+		if shouldCleanupContinuousAttempt(segmentDeliveryPending, captureErr, mediaLagged.Load()) {
 			if removeErr := os.RemoveAll(outDir); removeErr != nil {
 				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
 			}
@@ -679,6 +691,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return
 		}
 		windowClosed := continuousShouldStop(canceled(), windowCtx.Err() != nil)
+		if continuousMediaLagCanSurrender(mediaLagged.Load(), delivery.err, windowClosed) {
+			err := fmt.Errorf("continuous media timeline fell behind by at least %s", w.cfg.ContinuousMaxMediaLag)
+			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
+			return
+		}
 		if continuousDeliveryFailureShouldFail(captureErr, windowClosed) {
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", captureErr)
 			w.fail(ctx, job.JobID, job.LeaseToken, captureErr)
@@ -920,6 +937,20 @@ func continuousNoProgressExpired(lastProgressAt, now time.Time, timeout time.Dur
 	return timeout > 0 && !now.Before(lastProgressAt.Add(timeout))
 }
 
+func continuousMediaLagExpired(mediaEnd, now time.Time, timeout time.Duration) bool {
+	return timeout > 0 && !mediaEnd.IsZero() && !now.Before(mediaEnd.Add(timeout))
+}
+
+func observeContinuousMediaLag(mediaEnd, now time.Time, timeout time.Duration, lagged *atomic.Bool, abort context.CancelFunc) {
+	if continuousMediaLagExpired(mediaEnd, now, timeout) && lagged.CompareAndSwap(false, true) {
+		abort()
+	}
+}
+
+func continuousMediaLagCanSurrender(lagged bool, deliveryErr error, windowClosed bool) bool {
+	return lagged && deliveryErr == nil && !windowClosed
+}
+
 func continuousReconnectDelay(lastProgressAt, now time.Time, timeout, delay time.Duration) time.Duration {
 	if timeout <= 0 {
 		return delay
@@ -1015,7 +1046,13 @@ func continuousSegmentDeliveryContext(jobCtx context.Context, windowEnd *time.Ti
 	return context.WithDeadline(jobCtx, deadline)
 }
 
-func shouldCleanupContinuousAttempt(deliveryPending bool, captureErr error) bool {
+func shouldCleanupContinuousAttempt(deliveryPending bool, captureErr error, mediaLagged bool) bool {
+	// A lag-triggered stop deliberately accepted its entire finalized spool before
+	// stopping capture. If that drain then failed, retain the files for operator
+	// recovery instead of applying the ordinary terminal-error cleanup policy.
+	if deliveryPending && mediaLagged {
+		return false
+	}
 	return !deliveryPending ||
 		errors.Is(captureErr, context.Canceled) ||
 		errors.Is(captureErr, errDiskPressure) ||
