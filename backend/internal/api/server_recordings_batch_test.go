@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
@@ -54,6 +55,34 @@ func TestBatchCaptureVia(t *testing.T) {
 				t.Fatalf("capture via = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBatchScheduleRejectsReencodingTargetFPSBeforePersistence(t *testing.T) {
+	targetFPS := 30
+	request := batchScheduleRequest{
+		StreamIDs:            []int64{1},
+		NamingProfile:        recordingnaming.ProfileStoaramaV1.String(),
+		Mode:                 "sampled",
+		CronExpr:             "*/5 * * * *",
+		ClipDurationSec:      60,
+		TargetFPS:            &targetFPS,
+		StorageDestinationID: 1,
+		Delivery:             "managed",
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := withPrincipal(
+		httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(body)),
+		accountPrincipal{AccountID: 1, UserID: 1, MemberRole: "owner"},
+		"",
+	)
+	rec := httptest.NewRecorder()
+	(&Server{}).handleAccountRecordingsBatchSchedule(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "without re-encoding") {
+		t.Fatalf("status=%d body=%s, want native-only rejection", rec.Code, rec.Body.String())
 	}
 }
 

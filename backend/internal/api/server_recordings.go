@@ -172,9 +172,8 @@ type recordingCreateRequest struct {
 	Mode             string `json:"mode"`
 	DailyWindowStart string `json:"daily_window_start"`
 	DailyWindowEnd   string `json:"daily_window_end"`
-	// TargetFPS normalizes each captured clip to that exact frame rate. nil =
-	// Source/native (stream-copy, preserve source fps, no re-encode, the cheap
-	// default). The composer offers 15 and 30; the server accepts only those.
+	// TargetFPS remains in the request shape for compatibility with older clients.
+	// It must be nil: recordings always preserve the source without re-encoding.
 	TargetFPS *int `json:"target_fps"`
 	// Capture window. StartAt defaults to now() (start immediately); EndAt is
 	// open-ended when nil. When both are set, EndAt must be strictly after StartAt.
@@ -712,17 +711,12 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// target_fps: NULL = Source/native (preserve source fps, no re-encode). The
-	// composer offers Source/30/15 quick-picks plus a custom rate, so accept any
-	// integer in 1..60 (the DB CHECK allows up to 240; 60 is the sensible ceiling
-	// for a capture re-encode). Anything outside that range is rejected.
+	// Recording footage must remain source-native. Fixed target FPS necessarily
+	// re-encodes video, so reject it instead of permitting a silent quality change.
 	var targetFPSArg any
 	if req.TargetFPS != nil {
-		if *req.TargetFPS < 1 || *req.TargetFPS > 60 {
-			util.WriteError(w, http.StatusBadRequest, "target_fps must be between 1 and 60 (omit for Source)")
-			return
-		}
-		targetFPSArg = *req.TargetFPS
+		util.WriteError(w, http.StatusBadRequest, "target_fps is not supported; recordings preserve the source without re-encoding")
+		return
 	}
 
 	// Capture window: start_at defaults to now() (start immediately), end_at is
@@ -1440,15 +1434,11 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
 	}
-	// target_fps: NULL = Source/native; otherwise 1..60 (mirrors create). Validated up
-	// front with the other pure-input checks so a bad value fails fast before any DB work.
+	// Fixed FPS requires re-encoding. Recording schedules are source-native only.
 	var targetFPSArg any
 	if req.TargetFPS != nil {
-		if *req.TargetFPS < 1 || *req.TargetFPS > 60 {
-			util.WriteError(w, http.StatusBadRequest, "target_fps must be between 1 and 60 (omit for Source)")
-			return
-		}
-		targetFPSArg = *req.TargetFPS
+		util.WriteError(w, http.StatusBadRequest, "target_fps is not supported; recordings preserve the source without re-encoding")
+		return
 	}
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {

@@ -10,6 +10,29 @@ import (
 	"time"
 )
 
+func TestRecordingCreateRejectsReencodingTargetFPSBeforePersistence(t *testing.T) {
+	body := bytes.NewBufferString(`{
+		"name":"native only",
+		"stream_url":"https://example.com/live.m3u8",
+		"storage_destination_id":1,
+		"cron_expr":"*/5 * * * *",
+		"cron_timezone":"UTC",
+		"clip_duration_sec":60,
+		"capture_via":"cloud",
+		"target_fps":30
+	}`)
+	req := withPrincipal(
+		httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings", body),
+		accountPrincipal{AccountID: 1, UserID: 1},
+		"",
+	)
+	rec := httptest.NewRecorder()
+	(&Server{}).handleAccountRecordingsCreate(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "without re-encoding") {
+		t.Fatalf("status=%d body=%s, want native-only rejection", rec.Code, rec.Body.String())
+	}
+}
+
 func TestRecordingProbeRequiresRelayForManualRelayURL(t *testing.T) {
 	body := bytes.NewBufferString(`{"stream_url":"https://61e0c5d388c2e.streamlock.net/live/test/playlist.m3u8"}`)
 	req := withPrincipal(

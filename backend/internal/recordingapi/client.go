@@ -109,8 +109,8 @@ type RecordingJob struct {
 	AttemptCount         int       `json:"attempt_count"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
 	LeaseToken           string    `json:"lease_token,omitempty"`
-	// TargetFPS, when non-nil, normalizes each captured clip to that exact frame
-	// rate (re-encode). nil = Source/native (stream-copy, preserve source fps).
+	// TargetFPS may be populated by an older API response. Workers must ignore it:
+	// recording capture always preserves the source without video re-encoding.
 	TargetFPS *int `json:"target_fps"`
 	// Kind is 'clip' (default, per-cron-fire) or 'continuous_window' (one window-
 	// long lease driving back-to-back segment capture). WindowEndAt is the

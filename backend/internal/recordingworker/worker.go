@@ -336,7 +336,10 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "capturing")
 	captureCtx, captureCancel := context.WithTimeout(jobCtx, capture.SegmentCaptureTimeout(clipDuration))
-	seg, err := capture.CaptureSegmentInDirWithHeaders(captureCtx, sourceURL, clipDuration, "", job.TargetFPS, w.cfg.CaptureTempDir, inputHeaders)
+	// Recording footage is always captured source-native. TargetFPS is retained in
+	// the wire shape only for compatibility with older API/relay versions; never
+	// allow it to select FFmpeg's re-encode branch.
+	seg, err := capture.CaptureSegmentInDirWithHeaders(captureCtx, sourceURL, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), w.cfg.CaptureTempDir, inputHeaders)
 	captureCancel()
 	if err != nil {
 		if canceled() {
@@ -694,7 +697,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			return nil
 		}
-		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", job.TargetFPS, outDir, submitInCaptureOrder, inputHeaders)
+		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
@@ -993,6 +996,11 @@ func continuousNoProgressExpired(lastProgressAt, now time.Time, timeout time.Dur
 func continuousMediaLagExpired(mediaEnd, now time.Time, timeout time.Duration) bool {
 	return timeout > 0 && !mediaEnd.IsZero() && !now.Before(mediaEnd.Add(timeout))
 }
+
+// recordingCaptureTargetFPS is deliberately nil even for jobs created by an
+// older API that carried target_fps. A non-nil value selects FFmpeg's x264
+// branch; recording footage must always use source/native stream-copy.
+func recordingCaptureTargetFPS(_ *int) *int { return nil }
 
 func observeContinuousMediaLag(mediaEnd, now time.Time, timeout time.Duration, lagged *atomic.Bool, abort context.CancelFunc) {
 	if continuousMediaLagExpired(mediaEnd, now, timeout) && lagged.CompareAndSwap(false, true) {

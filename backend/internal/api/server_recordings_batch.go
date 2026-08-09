@@ -177,8 +177,8 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusBadRequest, "clip_duration_sec must be between 5 and 900")
 		return
 	}
-	if req.TargetFPS != nil && (*req.TargetFPS < 1 || *req.TargetFPS > 60) {
-		util.WriteError(w, http.StatusBadRequest, "target_fps must be between 1 and 60 (omit for Source)")
+	if req.TargetFPS != nil {
+		util.WriteError(w, http.StatusBadRequest, "target_fps is not supported; recordings preserve the source without re-encoding")
 		return
 	}
 	if req.RequiredRelaySlots < 0 {

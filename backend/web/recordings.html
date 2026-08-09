@@ -784,22 +784,17 @@
           </div>
         </div>
 
-        <!-- Frame rate: Source/30/15 quick-picks plus an arbitrary custom rate
-             (1-60). Custom reveals the number input and drives target_fps. -->
+        <!-- Record source-native so footage is never degraded by re-encoding. -->
         <div class="field">
           <label>Frame rate</label>
           <div class="seg" id="fpsSeg">
             <button type="button" data-fps="source" class="on">Source</button>
-            <button type="button" data-fps="30">30 fps</button>
-            <button type="button" data-fps="15">15 fps</button>
-            <button type="button" data-fps="custom">Custom</button>
           </div>
-          <div id="fpsCustomWrap" class="field hidden" style="margin-top:12px;margin-bottom:0;max-width:240px;">
+          <div id="fpsCustomWrap" class="field hidden" aria-hidden="true">
             <label for="fpsCustom">Frame rate (fps)</label>
-            <input id="fpsCustom" type="number" min="1" max="60" step="1" value="10" />
+            <input id="fpsCustom" type="number" value="0" disabled />
           </div>
-          <div class="hint">Source keeps the stream's native frame rate with no re-encode, the cheapest option. A fixed rate re-encodes each clip and cuts storage, with 15 fps common for pedestrian detection.</div>
-          <div class="hint">Custom accepts 1 to 60 fps</div>
+          <div class="hint">Source preserves the stream's native frame rate and quality. Recording footage is never re-encoded.</div>
         </div>
         </div><!-- /Section C -->
 
@@ -1952,26 +1947,8 @@
       refreshStartEnabled();
     }
 
-    // Returns the chosen frame rate as an integer, or null for the Source/native
-    // option (omitted from the create body so the server stores NULL). Quick-picks
-    // are 30/15; 'custom' reads the number input, clamped to the server's 1..60
-    // contract. Returns null when custom is empty/out of range (Start stays gated).
-    function selectedTargetFps() {
-      if (state.targetFps === 'source') return null;
-      if (state.targetFps === 'custom') {
-        const n = Math.trunc(Number(els.fpsCustom.value || 0));
-        return Number.isFinite(n) && n >= 1 && n <= 60 ? n : null;
-      }
-      return Number(state.targetFps);
-    }
-
-    // True when the frame-rate choice is well-formed: Source, a quick-pick, or a
-    // custom value in 1..60. A blank/invalid custom entry gates Start.
-    function fpsValid() {
-      if (state.targetFps !== 'custom') return true;
-      const n = Number(els.fpsCustom.value || 0);
-      return Number.isFinite(n) && Math.trunc(n) >= 1 && Math.trunc(n) <= 60;
-    }
+    // Recording capture is source-native only.
+    function fpsValid() { return state.targetFps === 'source'; }
 
     // ---- Bucket connection state (change 1) ----
 
@@ -3551,17 +3528,16 @@
       return `Sampled, ${scheduleLabel(rec)}`;
     }
 
-    // The schedule card: current mode, cron/window, clip length, fps, capture window,
+    // The schedule card: current mode, cron/window, clip length, native frame rate, capture window,
     // next fire. Edit reveals the shared composer schedule controls, populated from
     // the recording and submitted via PATCH /recordings/{id}/schedule.
     function scheduleCardHTML(rec) {
-      const tfps = Number(rec.target_fps || 0);
       const timezone = String(rec.cron_timezone || 'UTC');
       const rows = [
         ['Schedule', escapeHTML(scheduleLabelFull(rec))],
         ['Local time', `${escapeHTML(localTimeLabel(timezone) || 'Unavailable')} · ${escapeHTML(timezone)}`],
         ['Clip length', fmtClipLength(rec.clip_duration_sec)],
-        ['Frame rate', tfps > 0 ? `${tfps} fps` : 'Source'],
+        ['Frame rate', 'Source (native, no re-encode)'],
       ];
       // Capture method row: S1-S9 schedule-row text via shared helper.
       if (rec.capture_via === 'relay') {
@@ -4078,7 +4054,7 @@
     // Build the schedule-edit form from the composer's own controls (cloned semantics,
     // kept lean). It reuses the same field names the create composer sends and PATCHes
     // /recordings/{id}/schedule. Mode toggles cron vs daily window; both share clip
-    // length, fps, and the optional capture window.
+    // length and the optional capture window. Frame rate remains source-native.
     function openScheduleEdit() {
       const rec = clipPageState.rec;
       const form = els.clipPage.querySelector('#schedEditForm');
@@ -4093,7 +4069,6 @@
       const winStart = String(rec.daily_window_start || '09:00').slice(0, 5);
       const winEnd = String(rec.daily_window_end || '21:00').slice(0, 5);
       const clip = Number(rec.clip_duration_sec || 60);
-      const tfps = Number(rec.target_fps || 0);
       const completed = isCompleted(rec);
       const startVal = completed ? '' : (rec.start_at ? toLocalInputValue(new Date(rec.start_at)) : '');
       const endVal = completed ? '' : (rec.end_at ? toLocalInputValue(new Date(rec.end_at)) : '');
@@ -4121,14 +4096,11 @@
           <label for="edTz">Timezone</label>
           <select id="edTz">${tzOpts}</select>
         </div>
-        <div class="grid-2">
-          <div class="field"><label for="edClip">Clip length</label><select id="edClip">
+        <div class="field"><label for="edClip">Clip length</label><select id="edClip">
             <option value="60"${clip === 60 ? ' selected' : ''}>1 min</option>
             <option value="300"${clip === 300 ? ' selected' : ''}>5 min</option>
             <option value="600"${clip === 600 ? ' selected' : ''}>10 min</option>
-          </select></div>
-          <div class="field"><label for="edFps">Frame rate (fps, 0 = source)</label><input id="edFps" type="number" min="0" max="60" step="1" value="${tfps}" /></div>
-        </div>
+          </select><div class="hint">Frame rate and codec remain source-native; no re-encoding.</div></div>
         <div class="grid-2">
           <div class="field"><label for="edStart">Overall start (optional)</label><input id="edStart" type="datetime-local" value="${startVal}" /></div>
           <div class="field"><label for="edEnd">Overall stop (optional)</label><input id="edEnd" type="datetime-local" value="${endVal}" /></div>
@@ -4168,7 +4140,6 @@
       const mode = form.querySelector('button[data-emode].on').getAttribute('data-emode');
       const tz = String(form.querySelector('#edTz').value || browserTimezone());
       const clip = Math.trunc(Number(form.querySelector('#edClip').value || 0));
-      const fps = Math.trunc(Number(form.querySelector('#edFps').value || 0));
       const startRaw = String(form.querySelector('#edStart').value || '').trim();
       const endRaw = String(form.querySelector('#edEnd').value || '').trim();
       const body = { mode, cron_timezone: tz, clip_duration_sec: clip };
@@ -4178,7 +4149,6 @@
       } else {
         body.cron_expr = String(form.querySelector('#edCron').value || '').trim().replace(/\s+/g, ' ');
       }
-      if (fps > 0) body.target_fps = fps;
       body.start_at = startRaw ? new Date(startRaw).toISOString() : null;
       body.end_at = endRaw ? new Date(endRaw).toISOString() : null;
       const saveBtn = form.querySelector('button[data-schedsave]');
@@ -4894,10 +4864,6 @@
       } else {
         body.cron_expr = sched.cron;
       }
-      // Frame rate: omit for Source/native (server stores NULL, keeps -c copy),
-      // send the number for 30 or 15 (server re-encodes each clip to that rate).
-      const tfps = selectedTargetFps();
-      if (tfps) body.target_fps = tfps;
       // A webdav shared dest delivers via managed staging: send only
       // delivery_storage_destination_id. Otherwise send the capture dest.
       if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
@@ -5369,8 +5335,6 @@
         body.mode = 'sampled';
         body.cron_expr = sched.cron;
       }
-      const tfps = selectedTargetFps();
-      if (tfps) body.target_fps = tfps;
       if (deliveryDest > 0) body.delivery_storage_destination_id = deliveryDest;
       else body.storage_destination_id = dest;
 
