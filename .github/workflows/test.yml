@@ -83,7 +83,7 @@ jobs:
       - name: Test recording health alert delivery
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run 'Test(HealthAlertDeliveryTimestamp|RecordingHealthRunLock|CurrentRelayCapacityCollapsesGroupsAndPreservesUngroupedDomains)' -count=1
+        run: go test ./cmd/stoaramactl -run 'Test(HealthAlertDeliveryTimestamp|RecordingHealthRunLock|CurrentRelayCapacityCollapsesGroupsAndPreservesUngroupedDomains|RecordNASStorageCapacityQueuesInitialRiskTransitionsAndRecovery)' -count=1
       - name: Test transient ledger retention boundaries
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
