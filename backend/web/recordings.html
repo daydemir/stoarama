@@ -399,12 +399,13 @@
     .recordings-table th { position: sticky; top: 0; z-index: 1; background: var(--panel2); color: var(--muted); text-align: left; font-weight: 500; }
     .recordings-table th, .recordings-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
     .recordings-table th:nth-child(1) { width: 38px; }
-    .recordings-table th:nth-child(2) { width: 25%; }
-    .recordings-table th:nth-child(3) { width: 28%; }
-    .recordings-table th:nth-child(4) { width: 13%; }
-    .recordings-table th:nth-child(5) { width: 10%; }
+    .recordings-table th:nth-child(2) { width: 20%; }
+    .recordings-table th:nth-child(3) { width: 16%; }
+    .recordings-table th:nth-child(4) { width: 19%; }
+    .recordings-table th:nth-child(5) { width: 12%; }
     .recordings-table th:nth-child(6) { width: 9%; }
-    .recordings-table th:nth-child(7) { width: 134px; }
+    .recordings-table th:nth-child(7) { width: 8%; }
+    .recordings-table th:nth-child(8) { width: 124px; }
     .recordings-table tbody:last-child tr:last-child td { border-bottom: 0; }
     .recordings-table input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
     .recordings-table .cell-main { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
@@ -468,13 +469,14 @@
       .recordings-table td { min-width: 0; padding: 0; border: 0; }
       .recordings-table td::before { display: block; margin-bottom: 2px; color: var(--muted); font-size: 10px; text-transform: uppercase; }
       .recordings-table td:nth-child(1) { position: absolute; top: 14px; left: 14px; width: auto; }
-      .recordings-table td:nth-child(2), .recordings-table td:nth-child(7) { grid-column: 1 / -1; }
+      .recordings-table td:nth-child(2), .recordings-table td:nth-child(3), .recordings-table td:nth-child(4), .recordings-table td:nth-child(8) { grid-column: 1 / -1; }
       .recordings-table td:nth-child(2)::before { content: "Recording"; }
-      .recordings-table td:nth-child(3)::before { content: "Status"; }
-      .recordings-table td:nth-child(4)::before { content: "Schedule"; }
-      .recordings-table td:nth-child(5)::before { content: "Clip / Capture"; }
-	  .recordings-table td:nth-child(6)::before { content: "Storage"; }
-      .recordings-table td:nth-child(7)::before { content: "Actions"; }
+      .recordings-table td:nth-child(3)::before { content: "Status / Last 12 hours"; }
+      .recordings-table td:nth-child(4)::before { content: "Timeline health"; }
+      .recordings-table td:nth-child(5)::before { content: "Schedule"; }
+      .recordings-table td:nth-child(6)::before { content: "Clip / Capture"; }
+	  .recordings-table td:nth-child(7)::before { content: "Storage"; }
+      .recordings-table td:nth-child(8)::before { content: "Actions"; }
       .recordings-table .row-actions { flex-wrap: wrap; }
     }
     @media (max-width: 800px) {
@@ -3129,14 +3131,12 @@
 	       <div class="cell-sub">${escapeHTML(stitchLabels[String(timeline.stitchability || 'unknown')] || String(timeline.stitchability || 'unknown'))} · ${escapeHTML(String(timeline.diagnosis || ''))}</div>
 	       ${recentCoverage == null ? '' : `<div class="cell-sub">Largest gap ${escapeHTML(formatDuration(Number(timeline.recent_largest_gap_seconds || 0) * 1000))} · overlaps ${Number(timeline.recent_overlap_count || 0)} · layout changes ${Number(timeline.recent_layout_change_count || 0)}</div>`}
 	       ${lifetimeCoverage == null ? '' : `<div class="cell-sub">Whole period ${lifetimeCoverage.toFixed(2)}% · ${Number(timeline.lifetime_window_count || 0)} completed window(s)${timeline.lifetime_complete === true ? '' : ' · historical check in progress'}</div>`}
-	       <div class="cell-sub">${lastHTML}</div>`
+	       `
 	    : '';
-	  const captureHealthHTML = timelineHealthHTML
-	    ? timelineHealthHTML
-	    : captureHealth === 'unavailable'
+	  const captureHealthHTML = captureHealth === 'unavailable'
 	      ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
 	    : healthBins.length
-	      ? `<div class="cell-sub">Recent scheduled capture health</div>${captureHealthGraph(healthBins, timezone)}<div class="cell-sub">${lastHTML}</div>`
+	      ? `${captureHealthGraph(healthBins, timezone)}<div class="cell-sub">Last 12 scheduled hours · ${lastHTML}</div>`
 	      : expected > 0
 	        ? `<div class="capture-health ${escapeHTML(captureHealth)}">${capturePercent}% · ${captured}/${expected} clips</div><div class="cell-sub">${lastHTML}</div>`
 	      : `<div class="capture-health not_expected">No clips expected yet</div><div class="cell-sub">${lastHTML}</div>`;
@@ -3163,6 +3163,7 @@
         <td>${sharedReadOnly ? '' : `<input type="checkbox" data-recordingselect="${id}" aria-label="Select recording #${id}"${state.selectedRecordings.has(id) ? ' checked' : ''}>`}</td>
         <td><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
 		<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
+		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>
         <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(timezone)}${localTime ? ` · Local time ${escapeHTML(localTime)}` : ''}</div>${ends ? `<div class="cell-sub">Ends ${escapeHTML(ends)}</div>` : '<div class="cell-sub">No scheduled end</div>'}</td>
         <td><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
 		<td><div class="cell-main">${storage}</div></td>
@@ -3171,7 +3172,7 @@
     }
 
     function recordingsTableHTML(rows) {
-      return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th>${sharedReadOnly ? '' : '<input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span>'}</th><th>Recording</th><th>Status / Capture health</th><th>Schedule</th><th>Clip / Capture</th><th>Storage</th><th>Actions</th></tr></thead>${rows}</table></div>`;
+      return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th>${sharedReadOnly ? '' : '<input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span>'}</th><th>Recording</th><th>Status / Last 12 hours</th><th>Timeline health</th><th>Schedule</th><th>Clip / Capture</th><th>Storage</th><th>Actions</th></tr></thead>${rows}</table></div>`;
     }
 
     // Update the status-filter chips: keep each chip's label with a live count and
