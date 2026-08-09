@@ -248,6 +248,108 @@ func TestDiagTextDropsBlanks(t *testing.T) {
 	}
 }
 
+func TestContinuousSilenceDetailShowsMediaLagNotJustIngestActivity(t *testing.T) {
+	winOpen := time.Date(2026, 8, 9, 4, 39, 0, 0, time.UTC)
+	mediaEnd := time.Date(2026, 8, 9, 6, 48, 0, 0, time.UTC)
+	ingestedAt := time.Date(2026, 8, 9, 7, 44, 30, 0, time.UTC)
+	lastClipAt := ingestedAt
+	since, diag := continuousSilenceDetail(winOpen, &mediaEnd, &ingestedAt, &lastClipAt, 56*60+30, "")
+	for _, want := range []string{"window opened 2026-08-09T04:39:00Z", "latest media ended 2026-08-09T06:48:00Z", "latest ingest 2026-08-09T07:44:30Z"} {
+		if !strings.Contains(since, want) {
+			t.Fatalf("since=%q missing %q", since, want)
+		}
+	}
+	if diag != "media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
+		t.Fatalf("diag=%q", diag)
+	}
+}
+
+func TestContinuousSilenceDetailHandlesNoMedia(t *testing.T) {
+	winOpen := time.Date(2026, 8, 9, 6, 0, 0, 0, time.UTC)
+	since, diag := continuousSilenceDetail(winOpen, nil, nil, nil, 0, "source returned 404")
+	if !strings.Contains(since, "latest media ended never, latest ingest never") {
+		t.Fatalf("since=%q", since)
+	}
+	if strings.Contains(diag, "media_behind") || diag != "recording_last_clip=never last_error=source returned 404" {
+		t.Fatalf("diag=%q", diag)
+	}
+}
+
+func TestDetectContinuousSilentDeathReportsMediaAgeAndNoMedia(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed continuous silence regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("continuous_silence_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	// Put the fixture schema before pg_catalog so its fixed clock controls every
+	// unqualified now() in the production detector query.
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema + ",pg_catalog"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE FUNCTION now() RETURNS timestamptz LANGUAGE sql IMMUTABLE
+		  AS $$ SELECT timestamptz '2026-08-09 08:00:00+00' $$;
+		CREATE TABLE accounts (id BIGINT PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL);
+		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY,has_payment_method BOOLEAN NOT NULL);
+		CREATE TABLE recordings (
+		  id BIGINT PRIMARY KEY,stream_id BIGINT,account_id BIGINT NOT NULL,name TEXT NOT NULL,stream_url TEXT NOT NULL,
+		  status TEXT NOT NULL,mode TEXT NOT NULL,start_at TIMESTAMPTZ NOT NULL,end_at TIMESTAMPTZ,
+		  cron_timezone TEXT NOT NULL,daily_window_start TIME NOT NULL,daily_window_end TIME NOT NULL,
+		  last_clip_at TIMESTAMPTZ,last_error_text TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE recording_clips (
+		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,
+		  clip_end_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL
+		);
+		INSERT INTO accounts VALUES (1,'Ops','ops@example.com');
+		INSERT INTO account_billing VALUES (1,true);
+		INSERT INTO recordings VALUES
+		  (1,101,1,'lagging','https://e.test/lagging','active','continuous','2026-08-01',NULL,'UTC','00:00','12:00','2026-08-09 07:44:30+00',''),
+		  (2,102,1,'dead','https://e.test/dead','active','continuous','2026-08-01',NULL,'UTC','00:00','12:00',NULL,'source returned 404');
+		INSERT INTO recording_clips VALUES
+		  (1,1,'2026-08-09 06:47:00+00','2026-08-09 07:03:30+00','2026-08-09 07:44:30+00');
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	got := detectContinuousSilentDeath(ctx, pool, 15)
+	if len(got) != 2 {
+		t.Fatalf("incidents=%+v", got)
+	}
+	byID := map[int64]healthIncident{got[0].RecordingID: got[0], got[1].RecordingID: got[1]}
+	lagging := byID[1]
+	if !strings.Contains(lagging.SinceText, "latest media ended 2026-08-09T07:03:30Z") ||
+		!strings.Contains(lagging.SinceText, "latest ingest 2026-08-09T07:44:30Z") ||
+		lagging.Diag != "media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
+		t.Fatalf("lagging=%+v", lagging)
+	}
+	dead := byID[2]
+	if !strings.Contains(dead.SinceText, "latest media ended never, latest ingest never") ||
+		dead.Diag != "recording_last_clip=never last_error=source returned 404" {
+		t.Fatalf("dead=%+v", dead)
+	}
+}
+
 func TestMeasureStitchWindowSeparatesCoverageOverlapAndGap(t *testing.T) {
 	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
 	close := open.Add(10 * time.Minute)
