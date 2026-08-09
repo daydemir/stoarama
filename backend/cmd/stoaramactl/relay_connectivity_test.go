@@ -156,14 +156,20 @@ func TestCurrentRelayCapacityCollapsesGroupsAndPreservesUngroupedDomains(t *test
 		  (1,47,'relay','active',$1,1,10),
 		  (2,47,'relay','active',$1,1,10),
 		  (3,47,'relay','active',$1,NULL,3),
-		  (4,47,'relay','active',$2,NULL,99);
-		INSERT INTO recordings VALUES (1,47,'relay','active'),(2,47,'relay','active'),(3,47,'cloud','active');
+		  (4,47,'relay','active',$2,NULL,99)
+	`, now.Add(-time.Minute), now.Add(-3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (1,47,'relay','active'),(2,47,'relay','active'),(3,47,'cloud','active')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO recording_jobs VALUES
-		  (1,1,'leased',$3,$4,'continuous_window',$5,60),
-		  (2,2,'pending',NULL,$4,'clip',NULL,60),
-		  (3,3,'leased',$3,$4,'continuous_window',$5,60),
-		  (4,1,'pending',NULL,$4,'clip',NULL,60);
-	`, now.Add(-time.Minute), now.Add(-3*time.Minute), now.Add(time.Minute), now.Add(-30*time.Second), now.Add(time.Hour)); err != nil {
+		  (1,1,'leased',$1,$2,'continuous_window',$3,60),
+		  (2,2,'pending',NULL,$2,'clip',NULL,60),
+		  (3,3,'leased',$1,$2,'continuous_window',$3,60),
+		  (4,1,'pending',NULL,$2,'clip',NULL,60)
+	`, now.Add(time.Minute), now.Add(-30*time.Second), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	state, err := currentRelayCapacity(ctx, pool, now)
