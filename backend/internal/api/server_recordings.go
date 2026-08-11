@@ -478,16 +478,17 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	rows.Close()
+	captureHealthBins, err := s.recordingHealthBinsForAccount(r.Context(), principal.AccountID, recordingIDs)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording capture health: %v", err))
+		return
+	}
 	timelineHealth, err := s.recordingTimelineHealthForAccount(r.Context(), principal.AccountID, recordingIDs)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording timeline health: %v", err))
 		return
 	}
-	for _, item := range items {
-		if health, ok := timelineHealth[item["id"].(int64)]; ok {
-			item["timeline_health"] = health
-		}
-	}
+	attachRecordingListHealth(items, captureHealthBins, timelineHealth)
 	// Fleet relay aggregate: total nodes, online nodes (heartbeat within 120s), live
 	// leases across all relay nodes, available slots across ONLINE relays, and the
 	// existing fleet_relay_warning (kept for rollout compatibility).
@@ -527,6 +528,18 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		"fleet_relay_live_leases":     fleetRelayLiveLeases,
 		"fleet_relay_available_slots": fleetRelayAvailableSlots,
 	})
+}
+
+func attachRecordingListHealth(items []map[string]any, capture map[int64][]recordingHealthBin, timeline map[int64]recordingTimelineHealth) {
+	for _, item := range items {
+		id := item["id"].(int64)
+		if bins := capture[id]; len(bins) > 0 {
+			item["capture_health_bins"] = bins
+		}
+		if health, ok := timeline[id]; ok {
+			item["timeline_health"] = health
+		}
+	}
 }
 
 func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Request) {
