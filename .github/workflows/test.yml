@@ -74,6 +74,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run TestRecordingUploadIntentReplaysPendingAndConsumedSegment -count=1
+      - name: Test continuous timestamp contract and canary are fail closed
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api ./internal/db -run 'Test(RelayLeaseAtomicallyPersistsTimestampAdmission|RelayLeaseTimestampAdmissionNegativeMatrix|RecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent|AccountClipsFeedPreservesTimestampContractTriState|RecordingClipTimestampContractMigration)' -count=1
       - name: Test migration lock timeout
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

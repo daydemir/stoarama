@@ -1257,6 +1257,47 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         self.assertIsNone(provenance["capture_generation"])
         self.assertIsNone(provenance["capture_sequence"])
 
+    def test_unknown_timestamp_contract_survives_sidecar_exactly(self):
+        clip = {
+            "clip_id": 9, "recording_id": 13, "size_bytes": 3,
+            "sha256": "a" * 64, "relative_path": "recordings/unknown.mp4",
+            "clip_start_at": "2026-08-03T12:00:00Z", "clip_end_at": "2026-08-03T12:01:00Z",
+            "capture_attempt_id": "00000000-0000-4000-8000-000000000001",
+            "timestamp_contract_status": "per_clip_probe_unknown",
+            "timestamp_contract_reason": "missing_terminal_duration",
+        }
+        provenance = pull.stitch_provenance(clip)
+        self.assertEqual(provenance["schema_version"], 2)
+        self.assertEqual(provenance["capture_attempt_id"], clip["capture_attempt_id"])
+        self.assertEqual(provenance["timestamp_contract_status"], "per_clip_probe_unknown")
+        self.assertEqual(provenance["timestamp_contract_reason"], "missing_terminal_duration")
+        self.assertIsNone(provenance["timestamp_contract"])
+
+    def test_complete_timestamp_contract_survives_sidecar_exactly(self):
+        contract = {
+            "version": 1, "mode": "muxed_source_copy", "audio_selection": "first_optional",
+            "tracks": [{"stream_index": 0, "media_type": "video",
+                        "time_base_num": 1, "time_base_den": 1000,
+                        "first_timestamp": 0, "last_timestamp": 1000,
+                        "last_duration": 40, "unit_count": 26,
+                        "codec_signature_sha256": "b" * 64}],
+        }
+        clip = {
+            "clip_id": 10, "recording_id": 13, "size_bytes": 3,
+            "sha256": "a" * 64, "relative_path": "recordings/complete.mp4",
+            "clip_start_at": "2026-08-03T12:00:00Z", "clip_end_at": "2026-08-03T12:01:00Z",
+            "capture_attempt_id": "00000000-0000-4000-8000-000000000002",
+            "timestamp_contract_version": "continuous-source-pts-v1",
+            "timestamp_contract_status": "per_clip_probe_complete",
+            "timestamp_contract": contract,
+        }
+        provenance = pull.stitch_provenance(clip)
+        self.assertEqual(provenance["schema_version"], 2)
+        self.assertEqual(provenance["timestamp_contract_version"], "continuous-source-pts-v1")
+        self.assertEqual(provenance["timestamp_contract_status"], "per_clip_probe_complete")
+        self.assertEqual(provenance["timestamp_contract"], contract)
+        self.assertIsNone(provenance["timestamp_contract_reason"])
+
     def test_checksum_mismatch_is_quarantined_and_redownloaded(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))

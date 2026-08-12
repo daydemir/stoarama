@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"image"
 	_ "image/jpeg"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -18,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var errContinuousSegmentDelivery = errors.New("continuous segment delivery failed")
@@ -28,8 +31,11 @@ var errContinuousSegmentDelivery = errors.New("continuous segment delivery faile
 var ErrContinuousSegmentDuplicate = errors.New("continuous segment is a duplicate replay")
 
 const (
-	SegmentTargetFPS       = 30
-	DefaultSegmentDuration = 30 * time.Second
+	SegmentTargetFPS                      = 30
+	DefaultSegmentDuration                = 30 * time.Second
+	TimestampVersionContinuousSourcePTSV1 = "continuous-source-pts-v1"
+	TimestampProbeComplete                = "per_clip_probe_complete"
+	TimestampProbeUnknown                 = "per_clip_probe_unknown"
 	// ContinuousSegmentPollInterval is how often CaptureContinuous scans the
 	// output dir for newly finalized segments. ffmpeg's segment muxer has no
 	// per-segment callback, so a segment is detected as final once a strictly
@@ -65,6 +71,13 @@ type Segment struct {
 	// authoritative concatenation order even when a source's wall-clock labels
 	// jump or overlap.
 	CaptureSequence int64
+	// CaptureAttemptSequence identifies one persistent FFmpeg process. Timestamp
+	// continuity is meaningful only inside the same attempt; reconnects are hard
+	// generation boundaries even if their numeric timestamps happen to align.
+	CaptureAttemptID        string
+	TimestampContract       *TimestampContract
+	TimestampContractStatus string
+	TimestampContractReason string
 	// Local phase durations are ephemeral relay diagnostics. They are never sent
 	// with clip metadata and contain no paths, URLs, tokens, or error text.
 	FinalizeReadDuration  time.Duration
@@ -81,6 +94,30 @@ type SegmentThumbnail struct {
 	SHA256    string
 	Width     int
 	Height    int
+}
+
+// TimestampContract is exact, source-copy timing evidence from the finalized
+// MP4. Integer timestamps remain in each track's declared time base; consumers
+// must never infer seam continuity from wall-clock duration or average FPS.
+type TimestampContract struct {
+	Version        int                   `json:"version"`
+	Mode           string                `json:"mode"`
+	AudioSelection string                `json:"audio_selection"`
+	Tracks         []TrackTimingContract `json:"tracks"`
+}
+
+type TrackTimingContract struct {
+	StreamIndex          int    `json:"stream_index"`
+	MediaType            string `json:"media_type"`
+	TimeBaseNum          int64  `json:"time_base_num"`
+	TimeBaseDen          int64  `json:"time_base_den"`
+	FirstTimestamp       int64  `json:"first_timestamp"`
+	LastTimestamp        int64  `json:"last_timestamp"`
+	LastDuration         int64  `json:"last_duration"`
+	UnitCount            int64  `json:"unit_count"`
+	SampleRate           int64  `json:"sample_rate,omitempty"`
+	LastSampleCount      int64  `json:"last_sample_count,omitempty"`
+	CodecSignatureSHA256 string `json:"codec_signature_sha256"`
 }
 
 func SegmentCaptureTimeout(duration time.Duration) time.Duration {
@@ -243,7 +280,14 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 }
 
 func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
-	return captureContinuousWithHeaders(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration))
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), false)
+}
+
+func CaptureContinuousWithTimestampContract(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
+	if targetFPS != nil {
+		return fmt.Errorf("timestamp contract requires native source-copy capture")
+	}
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), true)
 }
 
 func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) time.Duration {
@@ -255,6 +299,10 @@ func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) tim
 }
 
 func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration) error {
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false)
+}
+
+func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
@@ -270,7 +318,7 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	if startupTimeout <= 0 || progressTimeout <= 0 {
 		return fmt.Errorf("continuous watchdog timeouts must be > 0")
 	}
-	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true)
+	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract)
 	if !isMalformedAudioMuxError(err) {
 		return err
 	}
@@ -293,16 +341,20 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 	// write that track and exits before producing any video. Retry once without
 	// audio; video remains a lossless stream copy and healthy audio is preserved
 	// on every source that did not hit this exact muxer failure.
-	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false)
+	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract)
 }
 
-func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio bool) error {
+func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	outPattern := filepath.Join(outDir, "seg-%Y%m%d-%H%M%S.mp4")
-	args := buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, includeAudio)
+	captureAttemptID := ""
+	if timestampContract {
+		captureAttemptID = uuid.NewString()
+	}
+	args := buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, includeAudio, timestampContract)
 	cmd := exec.Command(ffmpegBin(), args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -351,7 +403,7 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 	// finalizeAll=false treats a segment as final only when a strictly newer one
 	// exists (steady state); finalizeAll=true treats every unprocessed segment as
 	// final (post-SIGINT sweep, when ffmpeg has closed the last trailer).
-	sweepFinal := func(finalizeAll bool) error {
+	sweepFinal := func(probeCtx context.Context, finalizeAll bool) error {
 		segs, err := sortedSegments(outDir)
 		if err != nil {
 			return err
@@ -365,10 +417,11 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 				// The newest segment is still being written; leave it for a later poll.
 				continue
 			}
-			seg, err := finalizeSegment(ctx, path, clipDuration)
+			seg, err := finalizeSegmentWithTimestampContract(probeCtx, path, clipDuration, timestampContract)
 			if err != nil {
 				return err
 			}
+			seg.CaptureAttemptID = captureAttemptID
 			if err := deliverContinuousSegment(processed, path, seg, &nextStart, onSegment); err != nil {
 				return err
 			}
@@ -381,14 +434,16 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 		case <-ctx.Done():
 			stopFFmpeg()
 			// Final sweep: the last open segment now has a clean trailer.
-			if err := sweepFinal(true); err != nil {
+			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancelFinalize()
+			if err := sweepFinal(finalizeCtx, true); err != nil {
 				return err
 			}
 			return nil
 		case err := <-waitErr:
 			// ffmpeg exited on its own (stream ended or a hard error). Sweep whatever
 			// finalized segments remain, then surface the error if it was non-clean.
-			sweepErr := sweepFinal(true)
+			sweepErr := sweepFinal(ctx, true)
 			if err != nil {
 				return errors.Join(
 					fmt.Errorf("continuous ffmpeg exited: %w (%s)", err, strings.TrimSpace(stderr.String())),
@@ -410,17 +465,23 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 			lastOutputSizes = outputSizes
 			if err := continuousWatchdogError(now, startedAt, lastProgressAt, sawProgress, startupTimeout, progressTimeout); err != nil {
 				stopFFmpeg()
-				if sweepErr := sweepFinal(true); sweepErr != nil {
+				finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 30*time.Second)
+				if sweepErr := sweepFinal(finalizeCtx, true); sweepErr != nil {
+					cancelFinalize()
 					return errors.Join(err, fmt.Errorf("finalize stalled output: %w", sweepErr))
 				}
+				cancelFinalize()
 				return err
 			}
-			if err := sweepFinal(false); err != nil {
+			if err := sweepFinal(ctx, false); err != nil {
 				stopFFmpeg()
 				if !errors.Is(err, errContinuousSegmentDelivery) {
-					if finalErr := sweepFinal(true); finalErr != nil {
+					finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 30*time.Second)
+					if finalErr := sweepFinal(finalizeCtx, true); finalErr != nil {
+						cancelFinalize()
 						return errors.Join(err, fmt.Errorf("finalize after sweep failure: %w", finalErr))
 					}
+					cancelFinalize()
 				}
 				return err
 			}
@@ -551,6 +612,10 @@ func sortedSegments(outDir string) ([]string, error) {
 // StartAt is parsed from the strftime filename (UTC), so the per-segment object
 // key the worker derives downstream is deterministic and ordered.
 func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duration) (Segment, error) {
+	return finalizeSegmentWithTimestampContract(ctx, path, fallbackSpan, false)
+}
+
+func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fallbackSpan time.Duration, timestampContractEnabled bool) (Segment, error) {
 	startAt, err := parseSegmentStart(filepath.Base(path))
 	if err != nil {
 		return Segment{}, err
@@ -574,6 +639,16 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 
 	probeStarted := time.Now()
 	meta, metaErr := probeSegment(ctx, path)
+	var timestampContract *TimestampContract
+	timestampStatus, timestampReason := "", ""
+	if timestampContractEnabled {
+		var timestampErr error
+		timestampContract, timestampErr = probeTimestampContract(ctx, path)
+		timestampStatus = TimestampProbeComplete
+		if timestampErr != nil {
+			timestampContract, timestampStatus, timestampReason = nil, TimestampProbeUnknown, timestampContractErrorCode(timestampErr)
+		}
+	}
 	probeDuration := time.Since(probeStarted)
 	durationMs := int64(0)
 	videoCodec := "h264"
@@ -602,25 +677,44 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 		endAt = startAt.Add(time.Duration(durationMs) * time.Millisecond)
 	}
 	return Segment{
-		Path:                  path,
-		MIMEType:              "video/mp4",
-		SizeBytes:             info.Size(),
-		FinalizeReadDuration:  readDuration,
-		FinalizeHashDuration:  hashDuration,
-		FinalizeProbeDuration: probeDuration,
-		SHA256:                hex.EncodeToString(sum[:]),
-		SourceKind:            "live",
-		StartAt:               startAt,
-		EndAt:                 endAt,
-		DurationMs:            durationMs,
-		Container:             "mp4",
-		ActualFPS:             actualFPS,
-		VideoCodec:            videoCodec,
-		AudioCodec:            audioCodec,
-		AudioPresent:          audioPresent,
-		VideoWidth:            videoWidth,
-		VideoHeight:           videoHeight,
+		Path:                    path,
+		MIMEType:                "video/mp4",
+		SizeBytes:               info.Size(),
+		FinalizeReadDuration:    readDuration,
+		FinalizeHashDuration:    hashDuration,
+		FinalizeProbeDuration:   probeDuration,
+		SHA256:                  hex.EncodeToString(sum[:]),
+		SourceKind:              "live",
+		StartAt:                 startAt,
+		EndAt:                   endAt,
+		DurationMs:              durationMs,
+		Container:               "mp4",
+		ActualFPS:               actualFPS,
+		VideoCodec:              videoCodec,
+		AudioCodec:              audioCodec,
+		AudioPresent:            audioPresent,
+		VideoWidth:              videoWidth,
+		VideoHeight:             videoHeight,
+		TimestampContract:       timestampContract,
+		TimestampContractStatus: timestampStatus,
+		TimestampContractReason: timestampReason,
 	}, nil
+}
+
+func timestampContractErrorCode(err error) string {
+	text := err.Error()
+	switch {
+	case strings.Contains(text, "terminal duration"):
+		return "missing_terminal_duration"
+	case strings.Contains(text, "sample count"):
+		return "missing_audio_sample_count"
+	case strings.Contains(text, "time base"):
+		return "invalid_time_base"
+	case strings.Contains(text, "output exceeds"):
+		return "probe_output_limit"
+	default:
+		return "probe_unavailable"
+	}
 }
 
 // parseSegmentStart parses the strftime segment filename seg-YYYYMMDD-HHMMSS.mp4
@@ -646,6 +740,10 @@ func buildFFmpegContinuousArgsWithHeaders(sourceURL string, outPattern string, c
 }
 
 func buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int, inputHeaders string, includeAudio bool) []string {
+	return buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, includeAudio, false)
+}
+
+func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int, inputHeaders string, includeAudio, timestampContractEnabled bool) []string {
 	seconds := strconv.FormatFloat(clipDuration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
@@ -660,7 +758,13 @@ func buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL string, outPattern s
 		"-map", "0:v:0",
 	)
 	if includeAudio {
-		args = append(args, "-map", "0:a?")
+		if timestampContractEnabled {
+			// The v1 contract carries exactly one optional audio timing domain.
+			// Never capture extra tracks that its COMPLETE evidence cannot represent.
+			args = append(args, "-map", "0:a:0?")
+		} else {
+			args = append(args, "-map", "0:a?")
+		}
 	}
 	if targetFPS != nil && *targetFPS > 0 {
 		// Fixed-fps path: re-encode to the chosen rate so segments are exactly
@@ -683,7 +787,17 @@ func buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL string, outPattern s
 	args = append(args,
 		"-f", "segment",
 		"-segment_time", seconds,
-		"-reset_timestamps", "1",
+	)
+	if timestampContractEnabled {
+		// Preserve the persistent process's muxed source-copy timestamp domain.
+		// Never normalize each file independently: that destroys seam evidence.
+		args = append(args, "-reset_timestamps", "0", "-avoid_negative_ts", "disabled")
+	} else {
+		// This is the deployed legacy byte path. Keep it exact until a job is
+		// explicitly admitted to the timestamp-contract canary.
+		args = append(args, "-reset_timestamps", "1")
+	}
+	args = append(args,
 		"-segment_format", "mp4",
 		"-strftime", "1",
 		outPattern,
@@ -1164,6 +1278,163 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 		}
 	}
 	return meta, nil
+}
+
+const timestampProbeOutputLimit = 16 << 20
+
+type timestampProbeOutput struct {
+	buf bytes.Buffer
+}
+
+func (w *timestampProbeOutput) Write(p []byte) (int, error) {
+	if w.buf.Len()+len(p) > timestampProbeOutputLimit {
+		return 0, fmt.Errorf("timestamp probe output exceeds limit")
+	}
+	return w.buf.Write(p)
+}
+
+// probeTimestampContract derives the immutable seam evidence from the exact
+// finalized bytes. Decoded best-effort timestamps are used for presentation
+// order (packet PTS order is not presentation order with B-frames); audio keeps
+// its own sample-domain end evidence.
+func probeTimestampContract(ctx context.Context, path string) (*TimestampContract, error) {
+	// A clean window shutdown cancels capture before the final muxer trailer is
+	// swept. The finalized immutable bytes still require bounded provenance.
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, ffprobeBin(), "-v", "error", "-show_frames", "-show_streams", "-show_data",
+		"-show_entries", "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,time_base,extradata,sample_rate,channels,channel_layout:frame=stream_index,media_type,best_effort_timestamp,pkt_dts,pkt_duration,nb_samples",
+		"-of", "json", path)
+	var out timestampProbeOutput
+	cmd.Stdout = &out
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Streams []struct {
+			Index         int    `json:"index"`
+			CodecType     string `json:"codec_type"`
+			CodecName     string `json:"codec_name"`
+			CodecTag      string `json:"codec_tag_string"`
+			Profile       string `json:"profile"`
+			PixFmt        string `json:"pix_fmt"`
+			TimeBase      string `json:"time_base"`
+			ExtraData     string `json:"extradata"`
+			SampleRate    string `json:"sample_rate"`
+			ChannelLayout string `json:"channel_layout"`
+			Level         int    `json:"level"`
+			Width         int    `json:"width"`
+			Height        int    `json:"height"`
+			Channels      int    `json:"channels"`
+		} `json:"streams"`
+		Frames []struct {
+			StreamIndex         int         `json:"stream_index"`
+			MediaType           string      `json:"media_type"`
+			BestEffortTimestamp json.Number `json:"best_effort_timestamp"`
+			PacketDTS           json.Number `json:"pkt_dts"`
+			PacketDuration      json.Number `json:"pkt_duration"`
+			NBSamples           int64       `json:"nb_samples"`
+		} `json:"frames"`
+	}
+	if err := json.Unmarshal(out.buf.Bytes(), &payload); err != nil {
+		return nil, err
+	}
+	videoStreams, audioStreams := 0, 0
+	for _, stream := range payload.Streams {
+		switch stream.CodecType {
+		case "video":
+			videoStreams++
+		case "audio":
+			audioStreams++
+		default:
+			return nil, fmt.Errorf("unsupported output stream type")
+		}
+	}
+	if videoStreams != 1 || audioStreams > 1 {
+		return nil, fmt.Errorf("unsupported output stream cardinality")
+	}
+	contract := &TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional"}
+	for _, mediaType := range []string{"video", "audio"} {
+		streamPos := -1
+		for i := range payload.Streams {
+			if payload.Streams[i].CodecType == mediaType {
+				streamPos = i
+				break
+			}
+		}
+		if streamPos < 0 {
+			continue
+		}
+		s := payload.Streams[streamPos]
+		num, den, err := parsePositiveRational(s.TimeBase)
+		if err != nil {
+			return nil, err
+		}
+		track := TrackTimingContract{StreamIndex: s.Index, MediaType: mediaType, TimeBaseNum: num, TimeBaseDen: den}
+		if mediaType == "audio" {
+			track.SampleRate, err = strconv.ParseInt(strings.TrimSpace(s.SampleRate), 10, 64)
+			if err != nil || track.SampleRate <= 0 {
+				return nil, fmt.Errorf("invalid audio sample rate")
+			}
+		}
+		parts := []string{mediaType, s.CodecName, s.CodecTag, s.Profile, s.PixFmt,
+			strconv.Itoa(s.Level), strconv.Itoa(s.Width), strconv.Itoa(s.Height), strconv.Itoa(s.Channels),
+			s.ChannelLayout, s.ExtraData, s.SampleRate}
+		var signature strings.Builder
+		for _, part := range parts {
+			fmt.Fprintf(&signature, "%d:%s|", len(part), part)
+		}
+		sum := sha256.Sum256([]byte(signature.String()))
+		track.CodecSignatureSHA256 = hex.EncodeToString(sum[:])
+		for _, f := range payload.Frames {
+			if f.StreamIndex != s.Index || f.MediaType != mediaType {
+				continue
+			}
+			pts, err := strconv.ParseInt(string(f.BestEffortTimestamp), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("missing %s presentation timestamp", mediaType)
+			}
+			duration, err := strconv.ParseInt(string(f.PacketDuration), 10, 64)
+			if err != nil || duration <= 0 {
+				return nil, fmt.Errorf("missing %s terminal duration", mediaType)
+			}
+			if track.UnitCount == 0 {
+				track.FirstTimestamp = pts
+			} else if pts < track.LastTimestamp {
+				return nil, fmt.Errorf("nonmonotonic decoded %s presentation timestamps", mediaType)
+			}
+			track.LastTimestamp, track.LastDuration = pts, duration
+			track.UnitCount++
+			if mediaType == "audio" {
+				if f.NBSamples <= 0 {
+					return nil, fmt.Errorf("missing audio sample count")
+				}
+				track.LastSampleCount = f.NBSamples
+			}
+		}
+		if track.UnitCount == 0 {
+			return nil, fmt.Errorf("timestamp probe returned no %s frames", mediaType)
+		}
+		contract.Tracks = append(contract.Tracks, track)
+	}
+	if len(contract.Tracks) == 0 || contract.Tracks[0].MediaType != "video" {
+		return nil, fmt.Errorf("timestamp probe returned no video track")
+	}
+	return contract, nil
+}
+
+func parsePositiveRational(raw string) (int64, int64, error) {
+	parts := strings.Split(strings.TrimSpace(raw), "/")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid time base")
+	}
+	n, errN := strconv.ParseInt(parts[0], 10, 64)
+	d, errD := strconv.ParseInt(parts[1], 10, 64)
+	if errN != nil || errD != nil || n <= 0 || d <= 0 {
+		return 0, 0, fmt.Errorf("invalid time base")
+	}
+	return n, d, nil
 }
 
 func ffprobeBin() string {

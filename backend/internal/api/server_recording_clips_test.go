@@ -10,12 +10,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
@@ -49,6 +51,34 @@ func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
 		if !strings.Contains(cloudRecordingJobsLeaseSQL, want) {
 			t.Fatalf("lease SQL missing %q", want)
 		}
+	}
+}
+
+func TestValidTimestampProvenanceVersionParity(t *testing.T) {
+	attempt := "123e4567-e89b-12d3-a456-426614174000"
+	contract := &capture.TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional", Tracks: []capture.TrackTimingContract{{
+		StreamIndex: 0, MediaType: "video", TimeBaseNum: 1, TimeBaseDen: 1000,
+		FirstTimestamp: 0, LastTimestamp: 1000, LastDuration: 40, UnitCount: 26,
+		CodecSignatureSHA256: strings.Repeat("a", 64),
+	}}}
+	tests := []struct {
+		name string
+		req  recordingClipIngestRequest
+		want bool
+	}{
+		{"complete", recordingClipIngestRequest{CaptureAttemptID: attempt, TimestampContractVersion: capture.TimestampVersionContinuousSourcePTSV1, TimestampContractStatus: capture.TimestampProbeComplete, TimestampContract: contract}, true},
+		{"complete missing version", recordingClipIngestRequest{CaptureAttemptID: attempt, TimestampContractStatus: capture.TimestampProbeComplete, TimestampContract: contract}, false},
+		{"unknown", recordingClipIngestRequest{CaptureAttemptID: attempt, TimestampContractStatus: capture.TimestampProbeUnknown, TimestampContractReason: "missing_terminal_duration"}, true},
+		{"unknown must omit version", recordingClipIngestRequest{CaptureAttemptID: attempt, TimestampContractVersion: capture.TimestampVersionContinuousSourcePTSV1, TimestampContractStatus: capture.TimestampProbeUnknown, TimestampContractReason: "missing_terminal_duration"}, false},
+		{"video contract rejects claimed audio", recordingClipIngestRequest{CaptureAttemptID: attempt, TimestampContractVersion: capture.TimestampVersionContinuousSourcePTSV1, TimestampContractStatus: capture.TimestampProbeComplete, TimestampContract: contract, AudioPresent: true}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got := validTimestampProvenance(tc.req)
+			if got != tc.want {
+				t.Fatalf("valid=%v want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -142,6 +172,200 @@ func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 	}
 	if _, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expired relay window lease err=%v, want pgx.ErrNoRows", err)
+	}
+}
+
+func TestRelayLeaseAtomicallyPersistsTimestampAdmission(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id) VALUES(42);
+		INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,'relay','active',now(),4,'{"continuous_source_pts_v1":true}');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(445,42,7,'canary','https://example/live.m3u8','active',now()-interval '1 hour','relay');
+		INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','atomic-admit','continuous_window',now()+interval '1 hour')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool, cfg: config.Config{ContinuousSourcePTSCanary: "77:445"}}
+	principal := nodePrincipal{NodeID: 77, AccountID: 42, NodeType: nodeTypeRelay}
+	resp, err := s.leaseRelayRecordingJob(ctx, principal, true, 150, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.TimestampContractSupported || resp.LeaseToken == nil {
+		t.Fatalf("lease=%+v", resp)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_timestamp_contract_admissions WHERE recording_job_id=700 AND lease_token=$1 AND node_id=77 AND account_id=42 AND recording_id=445`, *resp.LeaseToken).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("admission count=%d err=%v", count, err)
+	}
+	// Later policy/capability changes cannot retroactively remove or forge the exact
+	// immutable generation admission already committed with the lease.
+	s.cfg.ContinuousSourcePTSCanary = ""
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{}'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_timestamp_contract_admissions WHERE lease_token=$1`, *resp.LeaseToken).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("durable admission count=%d err=%v", count, err)
+	}
+}
+
+func TestRelayLeaseTimestampAdmissionNegativeMatrix(t *testing.T) {
+	tests := []struct {
+		name, config, capability, status string
+		age                              time.Duration
+		target                           *int
+	}{
+		{"disabled", "", `{"continuous_source_pts_v1":true}`, "active", 0, nil},
+		{"wrong pair", "77:446", `{"continuous_source_pts_v1":true}`, "active", 0, nil},
+		{"stale", "77:445", `{"continuous_source_pts_v1":true}`, "active", 3 * time.Minute, nil},
+		{"inactive", "77:445", `{"continuous_source_pts_v1":true}`, "inactive", 0, nil},
+		{"nonboolean", "77:445", `{"continuous_source_pts_v1":"true"}`, "active", 0, nil},
+		{"target fps", "77:445", `{"continuous_source_pts_v1":true}`, "active", 0, func() *int { v := 15; return &v }()},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, cleanup := testRecordingLeasePool(t)
+			defer cleanup()
+			ctx := context.Background()
+			raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, string(raw)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(42); INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,'relay',$1,now()-$2::interval,4,$3::jsonb); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,target_fps,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour',$4,'relay'); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','matrix','continuous_window',now()+interval '1 hour')`, tc.status, tc.age.String(), tc.capability, tc.target); err != nil {
+				t.Fatal(err)
+			}
+			s := &Server{pool: pool, cfg: config.Config{ContinuousSourcePTSCanary: tc.config}}
+			resp, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 77, AccountID: 42, NodeType: nodeTypeRelay}, true, 150, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.TimestampContractSupported {
+				t.Fatalf("unexpected admission lease=%+v", resp)
+			}
+			var count int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_timestamp_contract_admissions`).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("admissions=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestTimestampAdmissionRequiresGenerationAwareRelayLease(t *testing.T) {
+	for _, tc := range []struct {
+		name, nodeType, captureVia string
+		tokenSupported             bool
+	}{
+		{"zero lease token", "relay", "relay", false},
+		{"non-relay node", "local_recorder", "relay", true},
+		{"cloud recording", "relay", "cloud", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, cleanup := testRecordingLeasePool(t)
+			defer cleanup()
+			ctx := context.Background()
+			raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, string(raw)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(42); INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,$1,'active',now(),4,'{"continuous_source_pts_v1":true}'); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour',$2); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','generation-gate','continuous_window',now()+interval '1 hour')`, tc.nodeType, tc.captureVia); err != nil {
+				t.Fatal(err)
+			}
+			s := &Server{pool: pool, cfg: config.Config{ContinuousSourcePTSCanary: "77:445"}}
+			resp, leaseErr := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 77, AccountID: 42, NodeType: tc.nodeType}, true, 150, tc.tokenSupported)
+			if tc.nodeType == "relay" && tc.captureVia == "relay" && leaseErr != nil {
+				t.Fatal(leaseErr)
+			}
+			if resp.TimestampContractSupported {
+				t.Fatalf("unexpected admission lease=%+v", resp)
+			}
+			var count int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_timestamp_contract_admissions`).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("admissions=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestTimestampAdmissionCannotBeActivatedAfterLeaseAndIsTokenIsolated(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(42); INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,'relay','active',now(),4,'{"continuous_source_pts_v1":true}'); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour','relay'); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','token-isolation','continuous_window',now()+interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	principal := nodePrincipal{NodeID: 77, AccountID: 42, NodeType: nodeTypeRelay}
+	s := &Server{pool: pool}
+	first, err := s.leaseRelayRecordingJob(ctx, principal, true, 150, true)
+	if err != nil || first.LeaseToken == nil {
+		t.Fatalf("first lease=%+v err=%v", first, err)
+	}
+	s.cfg.ContinuousSourcePTSCanary = "77:445"
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_timestamp_contract_admissions`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("post-activation admissions=%d err=%v", count, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,scheduled_for=now() WHERE id=700`); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.leaseRelayRecordingJob(ctx, principal, true, 150, true)
+	if err != nil || second.LeaseToken == nil || *second.LeaseToken == *first.LeaseToken || !second.TimestampContractSupported {
+		t.Fatalf("second lease=%+v first=%+v err=%v", second, first, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_timestamp_contract_admissions WHERE lease_token=$1`, *first.LeaseToken).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("old token admissions=%d err=%v", count, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_timestamp_contract_admissions WHERE lease_token=$1`, *second.LeaseToken).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("new token admissions=%d err=%v", count, err)
+	}
+}
+
+func TestTimestampAdmissionFailureRollsBackLease(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `CREATE FUNCTION aaa_test_reject_timestamp_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced admission failure'; END $$; CREATE TRIGGER aaa_test_reject_timestamp_admission BEFORE INSERT ON recording_timestamp_contract_admissions FOR EACH ROW EXECUTE FUNCTION aaa_test_reject_timestamp_admission(); INSERT INTO accounts VALUES(42); INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,'relay','active',now(),4,'{"continuous_source_pts_v1":true}'); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour','relay'); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','rollback-admit','continuous_window',now()+interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool, cfg: config.Config{ContinuousSourcePTSCanary: "77:445"}}
+	if _, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 77, AccountID: 42, NodeType: nodeTypeRelay}, true, 150, true); err == nil {
+		t.Fatal("forced admission failure unexpectedly leased")
+	}
+	var status string
+	var owner, token *string
+	if err := pool.QueryRow(ctx, `SELECT status,lease_owner,lease_token::text FROM recording_jobs WHERE id=700`).Scan(&status, &owner, &token); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || owner != nil || token != nil {
+		t.Fatalf("lease was not rolled back: status=%s owner=%v token=%v", status, owner, token)
 	}
 }
 
@@ -701,6 +925,202 @@ func leaseRecordingJob(pool *pgxpool.Pool, principal nodePrincipal) (*recordingL
 		return nil, fmt.Errorf("decode lease response: %w", err)
 	}
 	return payload.Job, nil
+}
+
+func TestAccountClipsFeedPreservesTimestampContractTriState(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	for _, ddl := range []string{
+		`ALTER TABLE recordings ADD COLUMN delivery text NOT NULL DEFAULT 'nas_pull'`,
+		`ALTER TABLE recording_clips ADD COLUMN recording_id bigint, ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text, ADD COLUMN clip_start_at timestamptz, ADD COLUMN clip_end_at timestamptz, ADD COLUMN display_path text, ADD COLUMN purged_at timestamptz, ADD COLUMN released_at timestamptz, ADD COLUMN created_at timestamptz NOT NULL DEFAULT now()`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(1,42,1,'tri-state','https://example.test/live','paused',now(),'relay')`); err != nil {
+		t.Fatal(err)
+	}
+	lease, attempt := "123e4567-e89b-12d3-a456-426614174000", "123e4567-e89b-12d3-a456-426614174001"
+	contract := `{"version":1,"mode":"muxed_source_copy","audio_selection":"first_optional","tracks":[{"stream_index":0,"media_type":"video","time_base_num":1,"time_base_den":1000,"first_timestamp":0,"last_timestamp":1000,"last_duration":40,"unit_count":26,"codec_signature_sha256":"` + strings.Repeat("a", 64) + `"}]}`
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,recording_job_id,size_bytes,sha256,clip_start_at,clip_end_at,display_path,created_at,capture_lease_token,capture_sequence) VALUES(1,1,1,3,$1,now()-interval '3 minutes',now()-interval '2 minutes','legacy.mp4',now()-interval '2 minutes',$2,1)`, strings.Repeat("1", 64), lease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,recording_job_id,size_bytes,sha256,clip_start_at,clip_end_at,display_path,created_at,capture_lease_token,capture_sequence,capture_attempt_id,timestamp_contract_version,timestamp_contract,timestamp_contract_status) VALUES(2,1,1,3,$1,now()-interval '3 minutes',now()-interval '2 minutes','complete.mp4',now()-interval '2 minutes',$2,2,$3,'continuous-source-pts-v1',$4,'per_clip_probe_complete')`, strings.Repeat("2", 64), lease, attempt, contract); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,recording_job_id,size_bytes,sha256,clip_start_at,clip_end_at,display_path,created_at,capture_lease_token,capture_sequence,capture_attempt_id,timestamp_contract_status,timestamp_contract_reason) VALUES(3,1,1,3,$1,now()-interval '3 minutes',now()-interval '2 minutes','unknown.mp4',now()-interval '2 minutes',$2,3,$3,'per_clip_probe_unknown','missing_terminal_duration')`, strings.Repeat("3", 64), lease, attempt); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/clips", nil)
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 42}))
+	rec := httptest.NewRecorder()
+	s.handleAccountClips(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Clips []map[string]any `json:"clips"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Clips) != 3 {
+		t.Fatalf("clips=%v", payload.Clips)
+	}
+	if payload.Clips[0]["timestamp_contract_status"] != nil || payload.Clips[0]["capture_attempt_id"] != nil {
+		t.Fatalf("legacy=%v", payload.Clips[0])
+	}
+	if payload.Clips[1]["timestamp_contract_status"] != capture.TimestampProbeComplete || payload.Clips[1]["timestamp_contract_version"] != capture.TimestampVersionContinuousSourcePTSV1 || payload.Clips[1]["timestamp_contract"] == nil {
+		t.Fatalf("complete=%v", payload.Clips[1])
+	}
+	if payload.Clips[2]["timestamp_contract_status"] != capture.TimestampProbeUnknown || payload.Clips[2]["timestamp_contract_version"] != nil || payload.Clips[2]["timestamp_contract"] != nil || payload.Clips[2]["timestamp_contract_reason"] != "missing_terminal_duration" {
+		t.Fatalf("unknown=%v", payload.Clips[2])
+	}
+}
+
+func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	var headCount atomic.Int64
+	objectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("method=%s", r.Method)
+		}
+		headCount.Add(1)
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("ETag", `"etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer objectServer.Close()
+	raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	for _, ddl := range []string{
+		`ALTER TABLE recordings ADD COLUMN delivery_storage_destination_id bigint, ADD COLUMN last_clip_at timestamptz, ADD COLUMN consecutive_failures integer NOT NULL DEFAULT 0, ADD COLUMN last_error_text text NOT NULL DEFAULT '', ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()`,
+		`ALTER TABLE recording_clips ADD COLUMN recording_id bigint, ADD COLUMN storage_destination_id bigint, ADD COLUMN endpoint text, ADD COLUMN bucket text, ADD COLUMN object_key text, ADD COLUMN display_path text, ADD COLUMN mime_type text, ADD COLUMN container text, ADD COLUMN size_bytes bigint, ADD COLUMN etag text, ADD COLUMN sha256 text, ADD COLUMN duration_ms bigint, ADD COLUMN video_codec text, ADD COLUMN audio_codec text, ADD COLUMN audio_present boolean, ADD COLUMN actual_fps double precision, ADD COLUMN video_width integer, ADD COLUMN video_height integer, ADD COLUMN resolved_url text, ADD COLUMN fire_at timestamptz, ADD COLUMN clip_start_at timestamptz, ADD COLUMN clip_end_at timestamptz`,
+		`CREATE UNIQUE INDEX test_recording_clip_object ON recording_clips(bucket,object_key)`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secrets, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := secrets.Encrypt([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO storage_destinations(id,account_id,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc) VALUES(7,42,$2,'auto','bucket','prefix','access',$1)`, sealed, objectServer.URL); err != nil {
+		t.Fatal(err)
+	}
+	lease := "123e4567-e89b-12d3-a456-426614174000"
+	intent := "123e4567-e89b-12d3-a456-426614174010"
+	if _, err := pool.Exec(ctx, `INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams) VALUES(1,42,'relay','active',now(),4); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(1,42,7,'ingest','https://example/live','active',now()-interval '1 hour','relay'); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES(1,1,now(),now(),60,'leased','node:1',now()+interval '1 hour',$1,'ingest','continuous_window',now()+interval '1 hour'); INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) VALUES($2,1,1,7,$3,'bucket','key','clip.mp4','video/mp4',1000,'pending',now()+interval '1 hour')`, lease, intent, objectServer.URL); err != nil {
+		t.Fatal(err)
+	}
+	contract := `{"version":1,"mode":"muxed_source_copy","audio_selection":"first_optional","tracks":[{"stream_index":0,"media_type":"video","time_base_num":1,"time_base_den":1000,"first_timestamp":0,"last_timestamp":1000,"last_duration":40,"unit_count":26,"codec_signature_sha256":"` + strings.Repeat("a", 64) + `"}]}`
+	body := fmt.Sprintf(`{"intent_id":%q,"job_id":1,"sha256":%q,"clip_start_at":%q,"clip_end_at":%q,"capture_sequence":1,"capture_attempt_id":%q,"timestamp_contract_version":"continuous-source-pts-v1","timestamp_contract_status":"per_clip_probe_complete","timestamp_contract":%s}`, intent, strings.Repeat("b", 64), time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano), "123e4567-e89b-12d3-a456-426614174001", contract)
+	mismatchBody := fmt.Sprintf(`{"intent_id":%q,"job_id":1,"sha256":%q,"audio_present":true,"clip_start_at":%q,"clip_end_at":%q,"capture_sequence":1,"capture_attempt_id":%q,"timestamp_contract_version":"continuous-source-pts-v1","timestamp_contract_status":"per_clip_probe_complete","timestamp_contract":%s}`, intent, strings.Repeat("b", 64), time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano), "123e4567-e89b-12d3-a456-426614174001", contract)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/clips/ingest", strings.NewReader(mismatchBody))
+	req.Header.Set(recordingLeaseTokenHeader, lease)
+	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
+	rec := httptest.NewRecorder()
+	(&Server{pool: pool, secrets: secrets}).handleRecordingClipIngest(rec, req)
+	if rec.Code != http.StatusBadRequest || headCount.Load() != 0 {
+		t.Fatalf("audio mismatch status=%d heads=%d body=%s", rec.Code, headCount.Load(), rec.Body.String())
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM recording_upload_intents WHERE id=$1`, intent).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("audio mismatch intent status=%q err=%v", status, err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/recording/clips/ingest", strings.NewReader(body))
+	req.Header.Set(recordingLeaseTokenHeader, lease)
+	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
+	rec = httptest.NewRecorder()
+	(&Server{pool: pool, secrets: secrets}).handleRecordingClipIngest(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if headCount.Load() != 0 {
+		t.Fatalf("unadmitted request performed %d HEADs", headCount.Load())
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM recording_upload_intents WHERE id=$1`, intent).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("intent status=%q err=%v", status, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_timestamp_contract_admissions(recording_job_id,lease_token,node_id,account_id,recording_id,policy_version) VALUES(1,$1,1,42,1,'continuous-source-pts-v1')`, lease); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/recording/clips/ingest", strings.NewReader(body))
+	req.Header.Set(recordingLeaseTokenHeader, lease)
+	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
+	rec = httptest.NewRecorder()
+	(&Server{pool: pool, secrets: secrets}).handleRecordingClipIngest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admitted status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if headCount.Load() != 1 {
+		t.Fatalf("admitted request HEAD count=%d", headCount.Load())
+	}
+	var persistedStatus string
+	var persistedVersion *string
+	var persistedContract []byte
+	var persistedReason *string
+	if err := pool.QueryRow(ctx, `SELECT timestamp_contract_status,timestamp_contract_version,timestamp_contract,timestamp_contract_reason FROM recording_clips LIMIT 1`).Scan(&persistedStatus, &persistedVersion, &persistedContract, &persistedReason); err != nil {
+		t.Fatal(err)
+	}
+	if persistedStatus != capture.TimestampProbeComplete || persistedVersion == nil || *persistedVersion != capture.TimestampVersionContinuousSourcePTSV1 || len(persistedContract) == 0 || persistedReason != nil {
+		t.Fatalf("persisted status=%q version=%v contract=%s reason=%v", persistedStatus, persistedVersion, persistedContract, persistedReason)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM recording_upload_intents WHERE id=$1`, intent).Scan(&status); err != nil || status != "consumed" {
+		t.Fatalf("consumed status=%q err=%v", status, err)
+	}
+
+	unknownIntent := "123e4567-e89b-12d3-a456-426614174011"
+	legacyIntent := "123e4567-e89b-12d3-a456-426614174012"
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) VALUES($1,1,1,7,$3,'bucket','unknown-key','unknown.mp4','video/mp4',1000,'pending',now()+interval '1 hour'),($2,1,1,7,$3,'bucket','legacy-key','legacy.mp4','video/mp4',1000,'pending',now()+interval '1 hour')`, unknownIntent, legacyIntent, objectServer.URL); err != nil {
+		t.Fatal(err)
+	}
+	requestIngest := func(raw string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/recording/clips/ingest", strings.NewReader(raw))
+		r.Header.Set(recordingLeaseTokenHeader, lease)
+		r = r.WithContext(context.WithValue(r.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
+		out := httptest.NewRecorder()
+		(&Server{pool: pool, secrets: secrets}).handleRecordingClipIngest(out, r)
+		return out
+	}
+	unknownBody := fmt.Sprintf(`{"intent_id":%q,"job_id":1,"sha256":%q,"clip_start_at":%q,"clip_end_at":%q,"capture_sequence":2,"capture_attempt_id":%q,"timestamp_contract_status":"per_clip_probe_unknown","timestamp_contract_reason":"probe_unavailable"}`, unknownIntent, strings.Repeat("c", 64), time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano), "123e4567-e89b-12d3-a456-426614174002")
+	if out := requestIngest(unknownBody); out.Code != http.StatusOK {
+		t.Fatalf("unknown ingest status=%d body=%s", out.Code, out.Body.String())
+	}
+	legacyBody := fmt.Sprintf(`{"intent_id":%q,"job_id":1,"sha256":%q,"clip_start_at":%q,"clip_end_at":%q,"capture_sequence":3}`, legacyIntent, strings.Repeat("d", 64), time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano))
+	if out := requestIngest(legacyBody); out.Code != http.StatusOK {
+		t.Fatalf("legacy ingest status=%d body=%s", out.Code, out.Body.String())
+	}
+	var unknownStatus, unknownReason string
+	if err := pool.QueryRow(ctx, `SELECT timestamp_contract_status,timestamp_contract_reason FROM recording_clips WHERE object_key='unknown-key'`).Scan(&unknownStatus, &unknownReason); err != nil || unknownStatus != capture.TimestampProbeUnknown || unknownReason != "probe_unavailable" {
+		t.Fatalf("unknown persisted status=%q reason=%q err=%v", unknownStatus, unknownReason, err)
+	}
+	var legacyAttempt *string
+	if err := pool.QueryRow(ctx, `SELECT capture_attempt_id::text FROM recording_clips WHERE object_key='legacy-key'`).Scan(&legacyAttempt); err != nil || legacyAttempt != nil {
+		t.Fatalf("legacy attempt=%v err=%v", legacyAttempt, err)
+	}
 }
 
 func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {

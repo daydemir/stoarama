@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestBuildFFmpegSegmentArgsHTTPVideo(t *testing.T) {
@@ -290,6 +292,90 @@ printf '%s\n' '{"format":{"duration":"60.0"},"streams":[{"codec_type":"video","c
 	}
 }
 
+func TestProbeTimestampContractPreservesPresentationAndAudioDomains(t *testing.T) {
+	probe := filepath.Join(t.TempDir(), "ffprobe-contract")
+	script := `#!/bin/sh
+printf '%s\n' '{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","codec_tag_string":"avc1","profile":"High","level":40,"width":1280,"height":720,"pix_fmt":"yuv420p","time_base":"1/90000","extradata":"0164"},{"index":1,"codec_type":"audio","codec_name":"aac","codec_tag_string":"mp4a","profile":"LC","sample_rate":"48000","channels":2,"channel_layout":"stereo","time_base":"1/48000","extradata":"1190"}],"frames":[{"stream_index":0,"media_type":"video","best_effort_timestamp":-3000,"pkt_dts":-6000,"pkt_duration":3000},{"stream_index":0,"media_type":"video","best_effort_timestamp":0,"pkt_dts":-3000,"pkt_duration":4500},{"stream_index":1,"media_type":"audio","best_effort_timestamp":-1024,"pkt_dts":-1024,"pkt_duration":1024,"nb_samples":1024},{"stream_index":1,"media_type":"audio","best_effort_timestamp":0,"pkt_dts":0,"pkt_duration":1024,"nb_samples":1024}]}'`
+	if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
+	contract, err := probeTimestampContract(context.Background(), "clip.mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.Version != 1 || contract.Mode != "muxed_source_copy" || len(contract.Tracks) != 2 {
+		t.Fatalf("contract=%+v", contract)
+	}
+	v, a := contract.Tracks[0], contract.Tracks[1]
+	if v.FirstTimestamp != -3000 || v.LastTimestamp != 0 || v.LastDuration != 4500 || v.UnitCount != 2 {
+		t.Fatalf("video=%+v", v)
+	}
+	if a.FirstTimestamp != -1024 || a.LastSampleCount != 1024 || a.SampleRate != 48000 {
+		t.Fatalf("audio=%+v", a)
+	}
+	if v.CodecSignatureSHA256 == a.CodecSignatureSHA256 {
+		t.Fatal("video/audio codec signatures collided")
+	}
+}
+
+func TestProbeTimestampContractRejectsMissingTerminalDuration(t *testing.T) {
+	probe := filepath.Join(t.TempDir(), "ffprobe-contract")
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"index\":0,\"codec_type\":\"video\",\"codec_name\":\"h264\",\"time_base\":\"1/1000\"}],\"frames\":[{\"stream_index\":0,\"media_type\":\"video\",\"best_effort_timestamp\":0}]}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
+	if _, err := probeTimestampContract(context.Background(), "clip.mp4"); err == nil || !strings.Contains(err.Error(), "terminal duration") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestFinalizeSegmentOnlyProbesTimestampContractWhenEnabled(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "probe.log")
+	probe := filepath.Join(dir, "ffprobe")
+	script := `#!/bin/sh
+printf 'called\n' >> "$PROBE_LOG"
+printf '%s\n' '{"format":{"duration":"1.0"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","time_base":"1/1000"}],"frames":[{"stream_index":0,"media_type":"video","best_effort_timestamp":0,"pkt_dts":0,"pkt_duration":1000}]}'`
+	if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
+	t.Setenv("PROBE_LOG", logPath)
+	path := filepath.Join(dir, "seg-20260807-120000.mp4")
+	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := finalizeSegment(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.TimestampContract != nil || legacy.TimestampContractStatus != "" {
+		t.Fatalf("legacy segment unexpectedly gained timestamp evidence: %+v", legacy)
+	}
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(body), "called\n"); got != 1 {
+		t.Fatalf("legacy probe count=%d want 1", got)
+	}
+	contract, err := finalizeSegmentWithTimestampContract(context.Background(), path, time.Second, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.TimestampContractStatus != "per_clip_probe_complete" || contract.TimestampContract == nil {
+		t.Fatalf("canary timestamp evidence=%+v", contract)
+	}
+	body, err = os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(body), "called\n"); got != 3 {
+		t.Fatalf("canary added probes=%d want total 3", got)
+	}
+}
+
 func TestContinuousWatchdogStartupAndProgressTimeouts(t *testing.T) {
 	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	lastProgress := started.Add(62 * time.Second)
@@ -537,6 +623,7 @@ func TestCaptureContinuousStopsAliveStalledChild(t *testing.T) {
 
 func TestCaptureContinuousDoesNotRedeliverAfterCallbackFailure(t *testing.T) {
 	temp := t.TempDir()
+	installTimestampProbeFixture(t, temp)
 	ffmpeg := filepath.Join(temp, "ffmpeg")
 	script := "#!/bin/sh\nfor last do :; done\nout=${last%/*}\nprintf first > \"$out/seg-20260728-120000.mp4\"\nprintf second > \"$out/seg-20260728-120001.mp4\"\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.1; done\n"
 	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
@@ -567,8 +654,9 @@ func TestCaptureContinuousDoesNotRedeliverAfterCallbackFailure(t *testing.T) {
 	}
 }
 
-func TestCaptureContinuousFallsBackToVideoOnlyForMalformedAudio(t *testing.T) {
+func TestTimestampContractCaptureFallsBackWithSecondProcessAttemptID(t *testing.T) {
 	temp := t.TempDir()
+	installTimestampProbeFixture(t, temp)
 	ffmpeg := filepath.Join(temp, "ffmpeg")
 	logPath := filepath.Join(temp, "args.log")
 	script := `#!/bin/sh
@@ -576,7 +664,7 @@ printf '%s\n' "$*" >> "$FFMPEG_ARGS_LOG"
 for last do :; done
 out=${last%/*}
 case " $* " in
-  *" -map 0:a? "*)
+  *" -map 0:a:0? "*)
     : > "$out/seg-20260807-120000.mp4"
     echo 'sample rate not set' >&2
     echo 'Could not write header (incorrect codec parameters ?): Invalid argument' >&2
@@ -601,14 +689,16 @@ while :; do sleep 0.1; done
 	ctx, cancel := context.WithCancel(context.Background())
 	deliveries := 0
 	var deliveredSizes []int64
-	err := captureContinuousWithHeaders(
+	var deliveredAttemptIDs []string
+	err := captureContinuousWithHeadersMode(
 		ctx, "https://example.com/live.m3u8", time.Second, "", nil, output,
 		func(seg Segment) error {
 			deliveries++
 			deliveredSizes = append(deliveredSizes, seg.SizeBytes)
+			deliveredAttemptIDs = append(deliveredAttemptIDs, seg.CaptureAttemptID)
 			cancel()
 			return nil
-		}, "", time.Second, 5*time.Second,
+		}, "", time.Second, 5*time.Second, true,
 	)
 	if err != nil {
 		t.Fatalf("capture malformed-audio fallback: %v", err)
@@ -621,6 +711,11 @@ while :; do sleep 0.1; done
 			t.Fatalf("delivered sizes=%v; empty first-attempt artifact reached callback", deliveredSizes)
 		}
 	}
+	for _, attemptID := range deliveredAttemptIDs {
+		if _, err := uuid.Parse(attemptID); err != nil {
+			t.Fatalf("video-only fallback attempt id=%q: %v", attemptID, err)
+		}
+	}
 	logBody, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read ffmpeg args: %v", err)
@@ -629,12 +724,23 @@ while :; do sleep 0.1; done
 	if len(lines) != 2 {
 		t.Fatalf("ffmpeg attempts=%d want 2: %q", len(lines), logBody)
 	}
-	if !strings.Contains(lines[0], "-map 0:a?") {
+	if !strings.Contains(lines[0], "-map 0:a:0?") {
 		t.Fatalf("first attempt must preserve audio: %s", lines[0])
 	}
-	if strings.Contains(lines[1], "-map 0:a?") || !strings.Contains(lines[1], "-map 0:v:0") {
+	if strings.Contains(lines[1], "-map 0:a:0?") || !strings.Contains(lines[1], "-map 0:v:0") {
 		t.Fatalf("fallback must be video-only: %s", lines[1])
 	}
+}
+
+func installTimestampProbeFixture(t *testing.T, dir string) {
+	t.Helper()
+	probe := filepath.Join(dir, "ffprobe")
+	script := `#!/bin/sh
+printf '%s\n' '{"format":{"duration":"1.0"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","codec_tag_string":"avc1","profile":"Main","level":31,"width":32,"height":24,"pix_fmt":"yuv420p","time_base":"1/1000","extradata":"00"}],"frames":[{"stream_index":0,"media_type":"video","best_effort_timestamp":0,"pkt_dts":0,"pkt_duration":1000}]}'`
+	if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
 }
 
 func TestMalformedAudioFallbackRefusesExistingMedia(t *testing.T) {
@@ -691,7 +797,7 @@ exit 1
 	go func() {
 		errCh <- captureContinuousWithHeaders(ctx, "https://example.com/live.m3u8", time.Second, "", nil, output, func(Segment) error { return nil }, "", time.Second, time.Second)
 	}()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		body, _ := os.ReadFile(logPath)
 		if strings.Contains(string(body), "invoked") {
@@ -790,6 +896,56 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 		if strings.Contains(joined, unwanted) {
 			t.Fatalf("source/native continuous capture should not transcode (%q): %s", unwanted, joined)
 		}
+	}
+	if strings.Contains(joined, "-avoid_negative_ts") {
+		t.Fatalf("legacy continuous capture must preserve its exact mux arguments: %s", joined)
+	}
+	wantTail := []string{"-f", "segment", "-segment_time", "60", "-reset_timestamps", "1", "-segment_format", "mp4", "-strftime", "1", "/out/seg-%Y%m%d-%H%M%S.mp4"}
+	if got := args[len(args)-len(wantTail):]; !slices.Equal(got, wantTail) {
+		t.Fatalf("legacy mux tail=%q want exact %q", got, wantTail)
+	}
+}
+
+func TestBuildFFmpegContinuousArgsLegacyFullVector(t *testing.T) {
+	got := buildFFmpegContinuousArgs("https://example.com/live.mp4", "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", nil)
+	want := []string{
+		"-y", "-nostdin", "-loglevel", "error",
+		"-rw_timeout", "15000000", "-timeout", "15000000",
+		"-protocol_whitelist", "https,tls,tcp,http,crypto,data",
+		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
+		"-reconnect_on_http_error", "4xx,5xx", "-reconnect_delay_max", "10",
+		"-fflags", "+discardcorrupt", "-i", "https://example.com/live.mp4",
+		"-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+		"-f", "segment", "-segment_time", "60", "-reset_timestamps", "1",
+		"-segment_format", "mp4", "-strftime", "1", "/out/seg-%Y%m%d-%H%M%S.mp4",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("legacy args changed\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestBuildFFmpegContinuousArgsTimestampContractIsExplicit(t *testing.T) {
+	args := buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(
+		"https://example.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4",
+		60*time.Second, "", nil, "", true, true,
+	)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-c copy") ||
+		!strings.Contains(joined, "-reset_timestamps 0") ||
+		!strings.Contains(joined, "-avoid_negative_ts disabled") {
+		t.Fatalf("timestamp-contract canary must use native reset=0 mode: %s", joined)
+	}
+	wantTail := []string{"-f", "segment", "-segment_time", "60", "-reset_timestamps", "0", "-avoid_negative_ts", "disabled", "-segment_format", "mp4", "-strftime", "1", "/out/seg-%Y%m%d-%H%M%S.mp4"}
+	if got := args[len(args)-len(wantTail):]; !slices.Equal(got, wantTail) {
+		t.Fatalf("canary mux tail=%q want exact %q", got, wantTail)
+	}
+}
+
+func TestTimestampContractCaptureRejectsReencodeTarget(t *testing.T) {
+	fps := 15
+	err := CaptureContinuousWithTimestampContract(context.Background(), "https://example.com/live.m3u8", time.Minute, "", &fps, t.TempDir(), func(Segment) error { return nil }, "")
+	if err == nil || !strings.Contains(err.Error(), "native source-copy") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

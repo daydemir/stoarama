@@ -1506,12 +1506,17 @@ def stitch_provenance(clip):
     explicit clip timestamps.
     """
     return {
-        "schema_version": 1,
+        "schema_version": 2 if clip.get("capture_attempt_id") else 1,
         "clip_id": int(clip["clip_id"]),
         "recording_id": int(clip["recording_id"]),
         "recording_job_id": clip.get("recording_job_id"),
         "capture_generation": clip.get("capture_generation"),
         "capture_sequence": clip.get("capture_sequence"),
+        "capture_attempt_id": clip.get("capture_attempt_id"),
+        "timestamp_contract_version": clip.get("timestamp_contract_version"),
+        "timestamp_contract": clip.get("timestamp_contract"),
+        "timestamp_contract_status": clip.get("timestamp_contract_status"),
+        "timestamp_contract_reason": clip.get("timestamp_contract_reason"),
         "clip_start_at": clip.get("clip_start_at"),
         "clip_end_at": clip.get("clip_end_at"),
         "size_bytes": int(clip["size_bytes"]),

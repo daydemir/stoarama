@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
@@ -89,8 +91,9 @@ type recordingLeaseResponse struct {
 	// Kind is 'clip' (default, per-cron-fire) or 'continuous_window' (one window-
 	// long lease driving back-to-back segment capture). WindowEndAt is the
 	// continuous window's close instant (zero for a clip job).
-	Kind        string     `json:"kind"`
-	WindowEndAt *time.Time `json:"window_end_at"`
+	Kind                       string     `json:"kind"`
+	WindowEndAt                *time.Time `json:"window_end_at"`
+	TimestampContractSupported bool       `json:"timestamp_contract_supported"`
 }
 
 // relayLeaseSQL is the relay branch of handleRecordingJobsLease, entered only for a
@@ -359,6 +362,22 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 	)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return resp, err
+	}
+	if err == nil && resp.TargetFPS == nil && resp.LeaseToken != nil && strings.TrimSpace(s.cfg.ContinuousSourcePTSCanary) == fmt.Sprintf("%d:%d", principal.NodeID, resp.RecordingID) {
+		var capable bool
+		if queryErr := tx.QueryRow(ctx, `SELECT COALESCE(jsonb_typeof(capabilities_jsonb->'continuous_source_pts_v1')='boolean' AND (capabilities_jsonb->>'continuous_source_pts_v1')::boolean,false) FROM nodes WHERE id=$1 AND account_id=$2 AND node_type='relay' AND status='active' AND last_heartbeat_at>=now()-interval '2 minutes'`, principal.NodeID, principal.AccountID).Scan(&capable); queryErr != nil {
+			return resp, queryErr
+		}
+		if capable {
+			command, admitErr := tx.Exec(ctx, `INSERT INTO recording_timestamp_contract_admissions(recording_job_id,lease_token,node_id,account_id,recording_id,policy_version) VALUES($1,$2,$3,$4,$5,'continuous-source-pts-v1')`, resp.JobID, *resp.LeaseToken, principal.NodeID, principal.AccountID, resp.RecordingID)
+			if admitErr != nil {
+				return resp, fmt.Errorf("persist timestamp contract admission: %w", admitErr)
+			}
+			if command.RowsAffected() != 1 {
+				return resp, fmt.Errorf("persist timestamp contract admission: unexpected row count")
+			}
+			resp.TimestampContractSupported = true
+		}
 	}
 	if commitErr := tx.Commit(ctx); commitErr != nil {
 		return resp, commitErr
@@ -782,23 +801,28 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 }
 
 type recordingClipIngestRequest struct {
-	IntentID        string   `json:"intent_id"`
-	JobID           int64    `json:"job_id"`
-	SizeBytes       int64    `json:"size_bytes"`
-	ETag            string   `json:"etag"`
-	SHA256          string   `json:"sha256"`
-	DurationMs      int64    `json:"duration_ms"`
-	VideoCodec      string   `json:"video_codec"`
-	AudioCodec      string   `json:"audio_codec"`
-	AudioPresent    bool     `json:"audio_present"`
-	ActualFPS       *float64 `json:"actual_fps"`
-	VideoWidth      int      `json:"video_width"`
-	VideoHeight     int      `json:"video_height"`
-	Container       string   `json:"container"`
-	ResolvedURL     string   `json:"resolved_url"`
-	ClipStartAt     string   `json:"clip_start_at"`
-	ClipEndAt       string   `json:"clip_end_at"`
-	CaptureSequence int64    `json:"capture_sequence"`
+	IntentID                 string                     `json:"intent_id"`
+	JobID                    int64                      `json:"job_id"`
+	SizeBytes                int64                      `json:"size_bytes"`
+	ETag                     string                     `json:"etag"`
+	SHA256                   string                     `json:"sha256"`
+	DurationMs               int64                      `json:"duration_ms"`
+	VideoCodec               string                     `json:"video_codec"`
+	AudioCodec               string                     `json:"audio_codec"`
+	AudioPresent             bool                       `json:"audio_present"`
+	ActualFPS                *float64                   `json:"actual_fps"`
+	VideoWidth               int                        `json:"video_width"`
+	VideoHeight              int                        `json:"video_height"`
+	Container                string                     `json:"container"`
+	ResolvedURL              string                     `json:"resolved_url"`
+	ClipStartAt              string                     `json:"clip_start_at"`
+	ClipEndAt                string                     `json:"clip_end_at"`
+	CaptureSequence          int64                      `json:"capture_sequence"`
+	CaptureAttemptID         string                     `json:"capture_attempt_id"`
+	TimestampContractVersion string                     `json:"timestamp_contract_version"`
+	TimestampContract        *capture.TimestampContract `json:"timestamp_contract"`
+	TimestampContractStatus  string                     `json:"timestamp_contract_status"`
+	TimestampContractReason  string                     `json:"timestamp_contract_reason"`
 }
 
 func nullablePositiveInt(value int) any {
@@ -806,6 +830,48 @@ func nullablePositiveInt(value int) any {
 		return value
 	}
 	return nil
+}
+
+func validTimestampContract(contract *capture.TimestampContract) bool {
+	if contract == nil || contract.Version != 1 || contract.Mode != "muxed_source_copy" || contract.AudioSelection != "first_optional" || len(contract.Tracks) < 1 || len(contract.Tracks) > 2 {
+		return false
+	}
+	seen := map[string]bool{}
+	streamIndices := map[int]bool{}
+	for _, track := range contract.Tracks {
+		if track.StreamIndex < 0 || streamIndices[track.StreamIndex] || (track.MediaType != "video" && track.MediaType != "audio") || seen[track.MediaType] ||
+			track.TimeBaseNum <= 0 || track.TimeBaseNum > 1_000_000_000 || track.TimeBaseDen <= 0 || track.TimeBaseDen > 1_000_000_000 || track.LastDuration <= 0 || track.UnitCount <= 0 || track.UnitCount > 100_000_000 ||
+			track.LastTimestamp < track.FirstTimestamp || len(track.CodecSignatureSHA256) != 64 || !lowerHex(track.CodecSignatureSHA256) {
+			return false
+		}
+		seen[track.MediaType] = true
+		streamIndices[track.StreamIndex] = true
+		if track.MediaType == "audio" && (track.SampleRate < 8000 || track.SampleRate > 768000 || track.LastSampleCount <= 0 || track.LastSampleCount > 1_000_000) {
+			return false
+		}
+	}
+	return seen["video"]
+}
+
+func nullableTimestampVersion(attemptID *uuid.UUID, status string) any {
+	if attemptID == nil || status != capture.TimestampProbeComplete {
+		return nil
+	}
+	return capture.TimestampVersionContinuousSourcePTSV1
+}
+
+func nullableTimestampStatus(attemptID *uuid.UUID, value string) any {
+	if attemptID == nil {
+		return nil
+	}
+	return value
+}
+
+func nullableTimestampReason(attemptID *uuid.UUID, value string) any {
+	if attemptID == nil || value == "" {
+		return nil
+	}
+	return value
 }
 
 // handleRecordingClipIngest records a successfully uploaded clip. In one tx it
@@ -853,8 +919,22 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var captureSequence *int64
+	var captureAttemptID *uuid.UUID
 	if req.CaptureSequence > 0 {
 		captureSequence = &req.CaptureSequence
+		// Rolling deploy compatibility: legacy generation-aware workers omit all
+		// timestamp fields and continue to ingest. New provenance is all-or-none.
+		if strings.TrimSpace(req.CaptureAttemptID) != "" || strings.TrimSpace(req.TimestampContractVersion) != "" || req.TimestampContract != nil || req.TimestampContractStatus != "" || req.TimestampContractReason != "" {
+			parsed, valid := validTimestampProvenance(req)
+			if !valid {
+				util.WriteError(w, http.StatusBadRequest, "timestamp provenance is incomplete or invalid")
+				return
+			}
+			captureAttemptID = &parsed
+		}
+	} else if strings.TrimSpace(req.CaptureAttemptID) != "" || strings.TrimSpace(req.TimestampContractVersion) != "" || req.TimestampContract != nil || req.TimestampContractStatus != "" || req.TimestampContractReason != "" {
+		util.WriteError(w, http.StatusBadRequest, "timestamp provenance requires capture_sequence")
+		return
 	}
 
 	tx, err := s.pool.Begin(r.Context())
@@ -921,6 +1001,17 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load upload intent: %v", err))
 		return
+	}
+	if captureAttemptID != nil {
+		if leaseToken == nil || captureLeaseToken == nil {
+			util.WriteError(w, http.StatusConflict, "timestamp provenance requires a generation-fenced lease")
+			return
+		}
+		var admitted bool
+		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_timestamp_contract_admissions WHERE recording_job_id=$1 AND lease_token=$2 AND node_id=$3 AND account_id=$4 AND recording_id=$5)`, jobID, captureLeaseToken, principal.NodeID, principal.AccountID, recordingID).Scan(&admitted); err != nil || !admitted {
+			util.WriteError(w, http.StatusConflict, "timestamp provenance was not admitted for this lease")
+			return
+		}
 	}
 	if recordingStatus == "canceled" {
 		util.WriteError(w, http.StatusGone, "recording was canceled")
@@ -999,14 +1090,14 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 			(recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path,
 			 mime_type, container, size_bytes, etag, sha256, duration_ms, video_codec, audio_codec,
 			 audio_present, actual_fps, video_width, video_height, resolved_url, fire_at, clip_start_at, clip_end_at,
-			 capture_lease_token, capture_sequence)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+			 capture_lease_token, capture_sequence, capture_attempt_id, timestamp_contract_version, timestamp_contract, timestamp_contract_status, timestamp_contract_reason)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
 		ON CONFLICT (bucket, object_key) DO NOTHING
 		RETURNING id
 	`, recordingID, jobID, destID, endpoint, bucket, objectKey,
 		displayPath, mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), durationMs,
 		strings.TrimSpace(req.VideoCodec), strings.TrimSpace(req.AudioCodec), req.AudioPresent, req.ActualFPS,
-		nullablePositiveInt(req.VideoWidth), nullablePositiveInt(req.VideoHeight), strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt, captureLeaseToken, captureSequence).Scan(&clipID)
+		nullablePositiveInt(req.VideoWidth), nullablePositiveInt(req.VideoHeight), strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt, captureLeaseToken, captureSequence, captureAttemptID, nullableTimestampVersion(captureAttemptID, req.TimestampContractStatus), req.TimestampContract, nullableTimestampStatus(captureAttemptID, req.TimestampContractStatus), nullableTimestampReason(captureAttemptID, req.TimestampContractReason)).Scan(&clipID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// 0-row insert means a clip already exists for this (bucket,object_key).
 		// Treat as an error so the job is NOT marked done and the dropped clip
@@ -1109,6 +1200,34 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"clip_id": clipID})
+}
+
+func validTimestampProvenance(req recordingClipIngestRequest) (uuid.UUID, bool) {
+	parsed, err := uuid.Parse(strings.TrimSpace(req.CaptureAttemptID))
+	complete := req.TimestampContractStatus == capture.TimestampProbeComplete && req.TimestampContractVersion == capture.TimestampVersionContinuousSourcePTSV1 && req.TimestampContractReason == "" && validTimestampContract(req.TimestampContract) && timestampContractAudioPresent(req.TimestampContract) == req.AudioPresent
+	unknown := req.TimestampContractStatus == capture.TimestampProbeUnknown && req.TimestampContractVersion == "" && req.TimestampContract == nil && validTimestampContractReason(req.TimestampContractReason)
+	return parsed, err == nil && (complete || unknown)
+}
+
+func validTimestampContractReason(reason string) bool {
+	switch reason {
+	case "missing_terminal_duration", "missing_audio_sample_count", "invalid_time_base", "probe_output_limit", "probe_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+func timestampContractAudioPresent(contract *capture.TimestampContract) bool {
+	if contract == nil {
+		return false
+	}
+	for _, track := range contract.Tracks {
+		if track.MediaType == "audio" {
+			return true
+		}
+	}
+	return false
 }
 
 const recordingJobHeartbeatSQL = `
@@ -1676,7 +1795,8 @@ const accountClipsCommitWatermark = `interval '90 seconds'`
 
 const accountClipsCursorSQL = `
 	SELECT c.id, c.recording_id, c.size_bytes, c.sha256, c.clip_start_at, c.clip_end_at, c.display_path,
-	       c.recording_job_id, c.capture_lease_token, c.capture_sequence
+	       c.recording_job_id, c.capture_lease_token, c.capture_sequence,
+	       c.capture_attempt_id,c.timestamp_contract_version,c.timestamp_contract,c.timestamp_contract_status,c.timestamp_contract_reason
 	FROM recording_clips c
 	JOIN recordings r ON r.id = c.recording_id
 	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
@@ -1716,19 +1836,23 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 	var nextAfterID *int64
 	for rows.Next() {
 		var (
-			clipID            int64
-			recordingID       int64
-			sizeBytes         int64
-			sha256            string
-			clipStartAt       time.Time
-			clipEndAt         *time.Time
-			displayPath       string
-			recordingJobID    *int64
-			captureLeaseToken *uuid.UUID
-			captureSequence   *int64
+			clipID                           int64
+			recordingID                      int64
+			sizeBytes                        int64
+			sha256                           string
+			clipStartAt                      time.Time
+			clipEndAt                        *time.Time
+			displayPath                      string
+			recordingJobID                   *int64
+			captureLeaseToken                *uuid.UUID
+			captureSequence                  *int64
+			captureAttemptID                 *uuid.UUID
+			timestampVersion                 *string
+			timestampContract                []byte
+			timestampStatus, timestampReason *string
 		)
 		if err := rows.Scan(&clipID, &recordingID, &sizeBytes, &sha256, &clipStartAt, &clipEndAt, &displayPath,
-			&recordingJobID, &captureLeaseToken, &captureSequence); err != nil {
+			&recordingJobID, &captureLeaseToken, &captureSequence, &captureAttemptID, &timestampVersion, &timestampContract, &timestampStatus, &timestampReason); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan account clip: %v", err))
 			return
 		}
@@ -1748,9 +1872,14 @@ func (s *Server) handleAccountClips(w http.ResponseWriter, r *http.Request) {
 			// The feed remains ID-cursor ordered for exactly-once delivery. Concurrent
 			// uploads may commit out of media order, so stitchers must order within a
 			// capture generation by capture_sequence instead of response position.
-			"recording_job_id":   recordingJobID,
-			"capture_generation": captureGenerationFingerprint(captureLeaseToken),
-			"capture_sequence":   captureSequence,
+			"recording_job_id":           recordingJobID,
+			"capture_generation":         captureGenerationFingerprint(captureLeaseToken),
+			"capture_sequence":           captureSequence,
+			"capture_attempt_id":         captureAttemptID,
+			"timestamp_contract_version": timestampVersion,
+			"timestamp_contract":         json.RawMessage(timestampContract),
+			"timestamp_contract_status":  timestampStatus,
+			"timestamp_contract_reason":  timestampReason,
 		})
 		id := clipID
 		nextAfterID = &id

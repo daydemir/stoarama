@@ -10,7 +10,58 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/capture"
 )
+
+func TestIngestClipTimestampProvenancePayloadModes(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        string
+		reason        string
+		contract      *capture.TimestampContract
+		wantVersion   bool
+		wantTimestamp bool
+	}{
+		{name: "legacy"},
+		{name: "complete", status: capture.TimestampProbeComplete, contract: &capture.TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional"}, wantVersion: true, wantTimestamp: true},
+		{name: "unknown", status: capture.TimestampProbeUnknown, reason: "missing_terminal_duration", wantTimestamp: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Error(err)
+				}
+				_, _ = w.Write([]byte(`{"clip_id":1}`))
+			}))
+			defer server.Close()
+			client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := IngestClipRequest{JobID: 1, LeaseToken: "lease", CaptureSequence: 1}
+			if tc.wantTimestamp {
+				req.CaptureAttemptID = "123e4567-e89b-12d3-a456-426614174000"
+				req.TimestampContractStatus = tc.status
+				req.TimestampContractReason = tc.reason
+				req.TimestampContract = tc.contract
+			}
+			if _, err := client.IngestClip(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			_, hasVersion := got["timestamp_contract_version"]
+			if hasVersion != tc.wantVersion {
+				t.Fatalf("payload=%v version_present=%v want %v", got, hasVersion, tc.wantVersion)
+			}
+			_, hasStatus := got["timestamp_contract_status"]
+			if hasStatus != tc.wantTimestamp {
+				t.Fatalf("payload=%v status_present=%v want %v", got, hasStatus, tc.wantTimestamp)
+			}
+		})
+	}
+}
 
 func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
 	type receivedRequest struct {
@@ -78,6 +129,22 @@ func TestLeaseAdvertisesGenerationSupport(t *testing.T) {
 	}
 	if _, err := client.LeaseRecordingJob(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLeaseReadsTimestampContractCapability(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"job":{"job_id":1,"recording_id":2,"timestamp_contract_supported":true}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := client.LeaseRecordingJob(context.Background())
+	if err != nil || job == nil || !job.TimestampContractSupported {
+		t.Fatalf("job=%+v err=%v", job, err)
 	}
 }
 

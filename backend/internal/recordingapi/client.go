@@ -116,8 +116,9 @@ type RecordingJob struct {
 	// Kind is 'clip' (default, per-cron-fire) or 'continuous_window' (one window-
 	// long lease driving back-to-back segment capture). WindowEndAt is the
 	// continuous window's close instant (zero/nil for a clip job).
-	Kind        string     `json:"kind"`
-	WindowEndAt *time.Time `json:"window_end_at"`
+	Kind                       string     `json:"kind"`
+	WindowEndAt                *time.Time `json:"window_end_at"`
+	TimestampContractSupported bool       `json:"timestamp_contract_supported"`
 }
 
 // RecordingCanarySpec is the canonical, account-scoped source returned to an
@@ -157,24 +158,28 @@ type ClipUploadIntent struct {
 
 // IngestClipRequest carries the captured clip's metadata to the ingest endpoint.
 type IngestClipRequest struct {
-	IntentID        string
-	JobID           int64
-	SizeBytes       int64
-	ETag            string
-	SHA256          string
-	DurationMs      int64
-	VideoCodec      string
-	AudioCodec      string
-	AudioPresent    bool
-	ActualFPS       *float64
-	VideoWidth      int
-	VideoHeight     int
-	Container       string
-	ResolvedURL     string
-	ClipStartAt     time.Time
-	ClipEndAt       time.Time
-	LeaseToken      string
-	CaptureSequence int64
+	IntentID                string
+	JobID                   int64
+	SizeBytes               int64
+	ETag                    string
+	SHA256                  string
+	DurationMs              int64
+	VideoCodec              string
+	AudioCodec              string
+	AudioPresent            bool
+	ActualFPS               *float64
+	VideoWidth              int
+	VideoHeight             int
+	Container               string
+	ResolvedURL             string
+	ClipStartAt             time.Time
+	ClipEndAt               time.Time
+	LeaseToken              string
+	CaptureSequence         int64
+	CaptureAttemptID        string
+	TimestampContract       *capture.TimestampContract
+	TimestampContractStatus string
+	TimestampContractReason string
 }
 
 type SurveyLease struct {
@@ -251,6 +256,15 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 	}
 	if strings.TrimSpace(req.LeaseToken) != "" && req.CaptureSequence > 0 {
 		payload["capture_sequence"] = req.CaptureSequence
+		if strings.TrimSpace(req.CaptureAttemptID) != "" {
+			payload["capture_attempt_id"] = req.CaptureAttemptID
+			if req.TimestampContractStatus == capture.TimestampProbeComplete {
+				payload["timestamp_contract_version"] = capture.TimestampVersionContinuousSourcePTSV1
+			}
+			payload["timestamp_contract"] = req.TimestampContract
+			payload["timestamp_contract_status"] = req.TimestampContractStatus
+			payload["timestamp_contract_reason"] = req.TimestampContractReason
+		}
 	}
 	var out struct {
 		ClipID int64 `json:"clip_id"`
