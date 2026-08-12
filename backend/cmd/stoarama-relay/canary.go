@@ -26,6 +26,9 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 	if *recordingID <= 0 {
 		return fmt.Errorf("--recording-id is required")
 	}
+	if err := configureCanaryCaptureRuntime(); err != nil {
+		return err
+	}
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -56,9 +59,6 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 		return fmt.Errorf("canary safety window is too short")
 	}
 
-	if err := configureCanaryCaptureRuntime(); err != nil {
-		return err
-	}
 	resolveCtx, cancelResolve := context.WithTimeout(reservationCtx, 60*time.Second)
 	resolvedURL, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(
 		resolveCtx, spec.Provider, spec.SourceURL, spec.SourcePageURL,
@@ -209,6 +209,9 @@ func configureCanaryCaptureRuntime() error {
 	}
 	if err := os.Unsetenv("YT_DLP_COOKIES_FILE"); err != nil {
 		return fmt.Errorf("unset YT_DLP_COOKIES_FILE: %w", err)
+	}
+	if err := configureRelayTLSRuntime(); err != nil {
+		return fmt.Errorf("configure canary TLS runtime: %w", err)
 	}
 	if err := os.Setenv("FFMPEG_BIN", relayFFmpegBin(bd)); err != nil {
 		return fmt.Errorf("set FFMPEG_BIN: %w", err)
