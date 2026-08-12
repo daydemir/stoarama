@@ -209,6 +209,15 @@ func TestNormalizeSceneIdentityStableAndBounded(t *testing.T) {
 	if a != b {
 		t.Fatalf("%q != %q", a, b)
 	}
+	if _, err := normalizeSceneIdentity(strings.Repeat("x", 2)); err == nil {
+		t.Fatal("short identity accepted")
+	}
+	if _, err := normalizeSceneIdentity(strings.Repeat("x", 3)); err != nil {
+		t.Fatalf("minimum identity rejected: %v", err)
+	}
+	if _, err := normalizeSceneIdentity(strings.Repeat("x", 240)); err != nil {
+		t.Fatalf("maximum identity rejected: %v", err)
+	}
 	if _, err := normalizeSceneIdentity(strings.Repeat("x", 241)); err == nil {
 		t.Fatal("long identity accepted")
 	}
