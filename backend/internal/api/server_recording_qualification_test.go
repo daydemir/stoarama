@@ -85,7 +85,7 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	}
 	_, err = pool.Exec(ctx, `
 	 WITH ss AS (INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps)
-	   SELECT 'direct','q'||n,'stream-'||n,'qualification-'||n,'https://example.test/'||n||'.m3u8','','hls','direct','cloud','continuous_video',30 FROM generate_series(1,50)n RETURNING id),
+	   SELECT 'direct','q'||n,'stream-'||n,'qualification-'||n,'https://example.test/'||n||'.m3u8','','hls','direct','video_live','continuous_video',30 FROM generate_series(1,50)n RETURNING id),
 	 rr AS (INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays)
 	   SELECT $1,(SELECT id FROM storage_destinations WHERE account_id=$1 AND name='qual'),'recording-'||row_number() over(),'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'active','2026-08-01',id,'continuous','08:00','20:00',127 FROM ss RETURNING stream_id),
 	 mo AS (INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256)
