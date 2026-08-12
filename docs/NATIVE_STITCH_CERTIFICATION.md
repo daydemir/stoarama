@@ -12,23 +12,44 @@ fact. Objective capture-attempt, native-layout, or real timeline boundaries are
 `not_applicable` seams between independently certified runs; they never get
 silently bridged.
 
-`passed` is intentionally strict: one run, all five axes passed (or audio
-truthfully absent), and every stored video/audio boundary derives from immutable
-continuous-source timestamp provenance. A multi-run result is terminal
+`passed` is intentionally strict: one run, the complete scheduled envelope,
+all five axes passed (or audio truthfully absent), and every stored video/audio
+boundary derives from immutable capture provenance. The currently merged
+`continuous-source-pts-v1` capture contract freezes rational endpoints but not
+packet-edge byte identities, so it cannot earn frame-perfect video or
+whole-window PASS. Its exact NAS bytes, decode, native-run, timeline, and local
+edge observations remain useful terminal partial evidence. A separate future
+capture contract must freeze bounded edge packet identities before the PASS
+gate can recognize it; decoded-pixel hashes remain verifier observations. A
+multi-run result is terminal
 `partial` with `whole_window_continuity=partitioned`, even when bytes, decode,
 each run, and every within-run seam pass. Historical reset-timestamp clips may
 still earn immutable byte/decode/run facts, but video/audio adjacency remains
 terminal `unknown`; it is never retried endlessly or promoted to seamless.
 Logical clip wall times and reset per-file PTS do not establish adjacency.
 
+A retryable `unknown` attempt asserts no completed axis, including audio
+absence; it carries no partial clip/run facts and is safe to repeat. A
+deterministic `failed` attempt records only the first canonical clip-decode or
+run-concat defect that stopped verification. Every unexecuted later axis stays
+`unknown`, so failure evidence never masquerades as an exhaustive sweep.
+The worker stops new verification work after 35 minutes of a 45-minute server
+lease, reserves at least five minutes for exact-report submission, and retries
+only the byte-identical completion. The server returns the already committed
+result for an authenticated identical replay; a changed replay is rejected.
+Signals, resource exhaustion, I/O or dynamic-library failures, timeouts, and
+cancellation remain retryable `unknown`. A terminal media failure requires the
+same affirmative corrupt-byte diagnostic on two exact-byte validation passes.
+
 ## Prospective capture contract
 
-The existing segmented capture uses reset timestamps. A separate capture PR
-may evaluate continuous per-generation presentation timestamps, but only after
-source-native canaries cover HLS and YouTube, B-frame and VFR presentation
-order, audio sample continuity, independent segment playback, lossless concat,
-upload/ingest, reconnect generation changes, and safe rollback. Protected live
-windows must not be the first canary.
+Capture supports a default-off, exact node-plus-recording admission for
+`continuous-source-pts-v1`; every unadmitted recording retains legacy reset
+timestamps. Enabling an admission still requires source-native canaries covering
+HLS and YouTube, B-frame and VFR presentation order, audio sample continuity,
+independent segment playback, lossless concat, upload/ingest, reconnect attempt
+boundaries, and safe rollback. Protected live windows must not be the first
+canary.
 
 ## Segment-duration study
 

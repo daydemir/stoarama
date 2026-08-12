@@ -103,8 +103,10 @@ func selectNativeStitchCandidates(ctx context.Context, tx pgx.Tx, accountID int6
 		  AND j.idempotency_key='reccont:'||j.recording_id||':'||extract(epoch from j.fire_at)::bigint
 		  AND h.metric_version>=2 AND h.expected_seconds=extract(epoch from j.window_end_at-j.fire_at)::bigint AND h.expected_seconds=43200
 		  AND h.coverage_pct>=95 AND h.largest_gap_seconds<=900 AND h.gap_over_5m_count<=1 AND h.gap_over_30s_count<=6 AND h.overlap_count=0
+		  AND NOT EXISTS(SELECT 1 FROM recording_native_stitch_tasks existing
+		                 WHERE existing.account_id=t.account_id AND existing.recording_job_id=j.id AND existing.policy_version=$3)
 	) SELECT account_id,recording_id,rank,deadline_at,id,fire_at,window_end_at,completed_at,clip_duration_sec,idempotency_key,db_now,calculated_at,layout_change_count
-	FROM eligible ORDER BY wave,(layout_change_count=0) DESC,rank,window_end_at DESC LIMIT $2`, accountID, limit)
+	FROM eligible ORDER BY wave,(layout_change_count=0) DESC,rank,window_end_at DESC LIMIT $2`, accountID, limit, stitchcert.PolicyVersion)
 	if err != nil {
 		return nil, err
 	}

@@ -317,6 +317,13 @@ func nativeStitchTimelineMatches(got, want stitchcert.Timeline) bool {
 		close(got.OverlapSeconds, want.OverlapSeconds)
 }
 
+func nativeStitchWholeWindowContinuous(t stitchcert.Timeline) bool {
+	const epsilon = 0.0000011
+	return math.Abs(t.LeadingGapSeconds) <= epsilon && math.Abs(t.LargestInternalGapSecond) <= epsilon &&
+		math.Abs(t.TrailingGapSeconds) <= epsilon && t.GapCount == 0 && t.OverlapCount == 0 &&
+		math.Abs(t.OverlapSeconds) <= epsilon && math.Abs(t.CoveredSeconds-t.ExpectedSeconds) <= epsilon
+}
+
 func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *http.Request) {
 	p, ok := accountPrincipalFromContext(r.Context())
 	if !ok || p.APIKeyID == nil {
@@ -360,7 +367,7 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 		util.WriteError(w, 409, "certification attempted a forbidden media mutation")
 		return
 	}
-	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		util.WriteError(w, 500, "begin completion")
 		return
@@ -372,13 +379,42 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 	var frozenRaw, healthRaw []byte
 	var lease *time.Time
 	var dbNow time.Time
-	err = tx.QueryRow(r.Context(), `SELECT c.id,t.recording_id,t.recording_job_id,t.window_start_at,t.window_end_at,t.clip_manifest_sha256,t.policy_version,t.state,t.clip_manifest,t.health_facts,t.lease_expires_at,now() FROM connections c JOIN recording_native_stitch_tasks t ON t.claimed_connection_id=c.id WHERE c.api_key_id=$1 AND c.account_id=$2 AND t.id=$3 AND t.claim_token=$4 FOR UPDATE OF t,c`, *p.APIKeyID, p.AccountID, report.TaskID, req.ClaimToken).Scan(&connectionID, &recordingID, &jobID, &start, &end, &manifestSHA, &policy, &state, &frozenRaw, &healthRaw, &lease, &dbNow)
-	if errors.Is(err, pgx.ErrNoRows) || state != "leased" || lease == nil || lease.Before(dbNow) {
+	if err = tx.QueryRow(r.Context(), `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2`, *p.APIKeyID, p.AccountID).Scan(&connectionID); err != nil {
+		util.WriteError(w, 403, "no NAS connection for this key")
+		return
+	}
+	err = tx.QueryRow(r.Context(), `SELECT recording_id,recording_job_id,window_start_at,window_end_at,clip_manifest_sha256,policy_version,state,clip_manifest,health_facts,lease_expires_at,now() FROM recording_native_stitch_tasks WHERE account_id=$1 AND id=$2 FOR UPDATE`, p.AccountID, report.TaskID).Scan(&recordingID, &jobID, &start, &end, &manifestSHA, &policy, &state, &frozenRaw, &healthRaw, &lease, &dbNow)
+	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, 409, "stale stitch claim")
 		return
 	}
 	if err != nil {
 		util.WriteError(w, 500, "load stitch claim")
+		return
+	}
+	var priorID int64
+	var priorStatus, priorSHA string
+	priorErr := tx.QueryRow(r.Context(), `SELECT id,status,report_sha256 FROM recording_native_stitch_certifications WHERE task_id=$1 AND claim_token=$2 AND connection_id=$3`, report.TaskID, req.ClaimToken, connectionID).Scan(&priorID, &priorStatus, &priorSHA)
+	if priorErr == nil {
+		if priorSHA != actualSHA {
+			util.WriteError(w, 409, "stitch completion replay differs")
+			return
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			util.WriteError(w, 409, "stitch completion replay raced; retry")
+			return
+		}
+		util.WriteJSON(w, 200, map[string]any{"ok": true, "certification_id": priorID, "status": priorStatus, "replayed": true})
+		return
+	}
+	if !errors.Is(priorErr, pgx.ErrNoRows) {
+		util.WriteError(w, 500, "load prior stitch completion")
+		return
+	}
+	var claimedConnectionID *int64
+	var claimToken *uuid.UUID
+	if err = tx.QueryRow(r.Context(), `SELECT claimed_connection_id,claim_token FROM recording_native_stitch_tasks WHERE id=$1`, report.TaskID).Scan(&claimedConnectionID, &claimToken); err != nil || state != "leased" || lease == nil || lease.Before(dbNow) || claimedConnectionID == nil || *claimedConnectionID != connectionID || claimToken == nil || *claimToken != req.ClaimToken {
+		util.WriteError(w, 409, "stale stitch claim")
 		return
 	}
 	if report.RecordingID != recordingID || report.RecordingJobID != jobID || !report.WindowStartAt.Equal(start) || !report.WindowEndAt.Equal(end) || report.ClipManifestSHA256 != manifestSHA || report.PolicyVersion != policy {
@@ -391,7 +427,7 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 		return
 	}
 	leaseStart := lease.Add(-nativeStitchLease)
-	if report.SchemaVersion != 1 || report.StartedAt.Before(leaseStart.Add(-5*time.Second)) || report.CompletedAt.Before(report.StartedAt) || report.CompletedAt.After(*lease) || report.CompletedAt.After(dbNow.Add(time.Minute)) || len(report.ClientVersion) < 1 || len(report.ClientVersion) > 128 || len(report.FFmpegVersion) < 1 || len(report.FFmpegVersion) > 256 || len(report.FFprobeVersion) < 1 || len(report.FFprobeVersion) > 256 || len(report.InventoryGeneration) < 1 || len(report.InventoryGeneration) > 256 || len(report.InventoryDigest) != 64 || report.SourceMediaModified || report.Reencoded || report.PersistentOutput {
+	if report.SchemaVersion != 1 || report.StartedAt.Before(leaseStart.Add(-3*time.Minute)) || report.CompletedAt.Before(report.StartedAt) || report.CompletedAt.Sub(report.StartedAt) > 36*time.Minute || report.CompletedAt.After(dbNow.Add(time.Minute)) || len(report.ClientVersion) < 1 || len(report.ClientVersion) > 128 || len(report.FFmpegVersion) < 1 || len(report.FFmpegVersion) > 256 || len(report.FFprobeVersion) < 1 || len(report.FFprobeVersion) > 256 || len(report.InventoryGeneration) < 1 || len(report.InventoryGeneration) > 256 || len(report.InventoryDigest) != 64 || report.SourceMediaModified || report.Reencoded || report.PersistentOutput {
 		util.WriteError(w, 409, "report metadata is invalid or outside claim lease")
 		return
 	}
@@ -425,6 +461,10 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 		util.WriteError(w, 409, "timeline evidence mismatch")
 		return
 	}
+	if report.WindowContinuityStatus == "passed" && !nativeStitchWholeWindowContinuous(measuredTimeline) {
+		util.WriteError(w, 409, "whole-window continuity requires the full scheduled envelope")
+		return
+	}
 	revalidateExactMedia := false
 	if report.Status == "passed" || report.Status == "partial" {
 		if len(report.Clips) != len(frozen) || report.NASByteDecodeStatus != "passed" || report.NativeRunConcatStatus != "passed" {
@@ -452,6 +492,10 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 			util.WriteError(w, 409, "invalid audio-seam evidence")
 			return
 		}
+		if err = stitchcert.ValidateAudioAxisStatus(report.Clips, report.WithinRunAudioContinuityStatus); err != nil {
+			util.WriteError(w, 409, "audio continuity axis differs from frozen clip evidence")
+			return
+		}
 		measured := measuredTimeline
 		var health struct {
 			ClipCount         int     `json:"clip_count"`
@@ -474,7 +518,15 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 			util.WriteError(w, 409, "invalid partial native run evidence")
 			return
 		}
-		if len(report.Clips) == len(frozen) {
+		// A terminal media failure may happen before seam extraction, and a
+		// transient UNKNOWN deliberately publishes no partial axes. Seam facts
+		// are mandatory for completed PASS/PARTIAL certification, not fabricated
+		// after a failed decode/concat or interrupted attempt.
+		if len(report.Seams) != 0 || len(report.AudioSeams) != 0 {
+			if len(report.Clips) != len(frozen) {
+				util.WriteError(w, 409, "partial seam evidence lacks the full frozen clip set")
+				return
+			}
 			if err = stitchcert.ValidatePartialSeams(report.Clips, report.NativeRuns, report.Seams); err != nil {
 				util.WriteError(w, 409, "invalid partial frame-seam evidence")
 				return
@@ -485,16 +537,7 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 			}
 		}
 		if report.Status == "failed" {
-			clipFailed := false
-			for _, c := range report.Clips {
-				clipFailed = clipFailed || c.StrictDecode == "failed"
-			}
-			runFailed := false
-			for _, run := range report.NativeRuns {
-				runFailed = runFailed || run.ValidationStatus == "failed"
-			}
-			coherent := (reasons[0] == "clip_decode_failed" && clipFailed && report.NASByteDecodeStatus == "failed") || (reasons[0] == "run_concat_failed" && runFailed && report.NativeRunConcatStatus == "failed")
-			if !nativeStitchDeterministicFailures[reasons[0]] || !coherent {
+			if err = stitchcert.ValidateDeterministicFailureEvidence(report, reasons); err != nil {
 				util.WriteError(w, 409, "FAILED requires deterministic media evidence")
 				return
 			}

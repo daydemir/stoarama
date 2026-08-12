@@ -10,6 +10,8 @@ import tempfile
 import threading
 import datetime
 import signal
+import shutil
+import subprocess
 import time
 import unittest
 import urllib.error
@@ -60,6 +62,80 @@ class NASPullTests(unittest.TestCase):
     def certify_media_canary(self, *args, **kwargs):
         with mock.patch.object(pull.os.path, "ismount", return_value=True):
             return pull.certify_media_canary(*args, **kwargs)
+
+    def run_mocked_v1_stitch(self, cfg, generations, validate_run=None, validate_clip=None):
+        """Run the complete worker path for current v1 timestamp provenance."""
+        start = datetime.datetime(2026, 8, 10, 8, tzinfo=datetime.timezone.utc)
+        attempt = "123e4567-e89b-12d3-a456-426614174099"
+        contract = {
+            "version": 1, "mode": "muxed_source_copy", "audio_selection": "first_optional",
+            "tracks": [{"stream_index": 0, "media_type": "video", "time_base_num": 1,
+                        "time_base_den": 30, "first_timestamp": 0, "last_timestamp": 29,
+                        "last_duration": 1, "unit_count": 30,
+                        "codec_signature_sha256": "c" * 64}],
+        }
+        timeline = {"frame_count": 30, "first_timestamp": 0, "last_timestamp": 29,
+                    "last_duration_timestamp": 1, "time_base_numerator": 1,
+                    "time_base_denominator": 30, "duplicate_timestamp_count": 0,
+                    "non_monotonic_step_count": 0, "discontinuous_step_count": 0}
+        frozen, local, paths = [], [], []
+        for index, generation in enumerate(generations):
+            content = ("v1-clip-%d" % index).encode()
+            path = cfg.output_dir / ("recordings/v1-%d.mp4" % index)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            clip_start = start + datetime.timedelta(seconds=index)
+            clip_end = clip_start + datetime.timedelta(seconds=1)
+            item = {
+                "ordinal": index + 1, "clip_id": index + 1, "recording_id": 7,
+                "recording_job_id": 9, "relative_path": "recordings/v1-%d.mp4" % index,
+                "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+                "clip_start_at": clip_start.isoformat().replace("+00:00", "Z"),
+                "clip_end_at": clip_end.isoformat().replace("+00:00", "Z"),
+                "capture_generation": generation, "capture_sequence": index + 1,
+                "capture_attempt_id": attempt, "timestamp_contract_version": "continuous-source-pts-v1",
+                "timestamp_contract_status": "per_clip_probe_complete", "timestamp_contract_reason": "",
+                "timestamp_contract_sha256": pull.timestamp_contract_hash(contract),
+            }
+            frozen.append(item)
+            local.append({**item, "clip_start_at": clip_start, "clip_end_at": clip_end,
+                          "sidecar_sha256": "b" * 64, "timestamp_contract": contract})
+            paths.append(path)
+        task = {
+            "task_id": 90, "claim_token": "claim", "recording_id": 7, "recording_job_id": 9,
+            "policy_version": "native-window-v1", "window_start_at": frozen[0]["clip_start_at"],
+            "window_end_at": frozen[-1]["clip_end_at"],
+            "clip_manifest_sha256": pull.native_stitch_manifest_hash(frozen), "clips": frozen,
+            "inventory_generation": "generation", "inventory_digest": "d" * 64,
+            "inventory_completed_at": "2026-08-10T21:00:00Z",
+        }
+        completed = []
+        def request(_cfg, _method, endpoint, body=None, **_kwargs):
+            if endpoint.endswith("/complete"):
+                completed.append(body["report"])
+            return {"ok": True}
+        probe = {"stable_signature_v1": {"schema_version": 1, "format_name": "mov,mp4",
+                                         "streams": [{"codec_type": "video", "codec_name": "h264"}]}}
+        if validate_run is None:
+            validate_run = lambda *_args: "lossless_concat_decode_passed"
+        if validate_clip is None:
+            validate_clip = lambda *_args: None
+        summary = {"generation": "generation", "digest": "d" * 64,
+                   "scan_completed_at": "2026-08-10T21:00:00Z"}
+        with mock.patch.object(pull, "open_certification_inventory", return_value=(SimpleNamespace(close=lambda: None), summary)), \
+             mock.patch.object(pull, "collect_certification_candidates", return_value=local), \
+             mock.patch.object(pull, "check_native_stitch_delivery", return_value=False), \
+             mock.patch.object(pull, "recompute_timestamp_contract", return_value=(contract, {"video": timeline, "_video_frames": []})), \
+             mock.patch.object(pull, "native_stitch_video_edge_frames", return_value={"first": [], "last": []}), \
+             mock.patch.object(pull, "probe_native_media_cancellable", return_value=probe), \
+             mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=validate_clip), \
+             mock.patch.object(pull, "validate_native_run_cancellable", side_effect=validate_run), \
+             mock.patch.object(pull, "media_tool_version_cancellable", return_value="tool test"), \
+             mock.patch.object(pull, "request_json", side_effect=request):
+            self.assertTrue(pull._run_native_stitch_task(
+                cfg, None, None, threading.Event(), threading.Event(), task,
+                datetime.datetime.now(datetime.timezone.utc), time.monotonic() + 60, "ffmpeg", "ffprobe"))
+        return completed[-1], paths
 
     def media_tools(self, root):
         log_path = root / "ffmpeg.log"
@@ -1755,6 +1831,14 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             "52aa500473f858f6ebeac4cf64d06940d591e1c9a866a6c6e81ae045d1655036",
         )
 
+    def test_timestamp_contract_hash_matches_go_typed_struct(self):
+        contract = {"version": 1, "mode": "muxed_source_copy", "audio_selection": "first_optional", "tracks": [{
+            "stream_index": 0, "media_type": "video", "time_base_num": 1, "time_base_den": 30,
+            "first_timestamp": 0, "last_timestamp": 1, "last_duration": 1, "unit_count": 2,
+            "codec_signature_sha256": "a" * 64,
+        }]}
+        self.assertEqual(pull.timestamp_contract_hash(contract), "4ce417b7312b190cee462327346cc95c1133383257004211603869df6bd755fc")
+
     def test_native_stitch_disabled_never_claims(self):
         cfg = SimpleNamespace(native_stitch_enabled=False)
         with mock.patch.object(pull, "request_json") as request:
@@ -1815,10 +1899,11 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             is_capacity_blocked=lambda: False,
         )
         delivery_checks = 0
-        claimed = {"task_id": 9, "claim_token": "claim"}
+        claimed = {"task_id": 9, "claim_token": "claim", "lease_expires_at":
+                   (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=45)).isoformat().replace("+00:00", "Z")}
         worker_observed_cancel = threading.Event()
 
-        def request(_cfg, method, path, body=None):
+        def request(_cfg, method, path, body=None, **_kwargs):
             nonlocal delivery_checks
             if method == "GET":
                 delivery_checks += 1
@@ -1851,7 +1936,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             "inventory_completed_at": "2026-08-10T21:00:00Z",
         }
         calls = []
-        def request(_cfg, method, path, body=None):
+        def request(_cfg, method, path, body=None, **_kwargs):
             calls.append((method, path, body))
             return {"ok": True}
         with mock.patch.object(pull, "request_json", side_effect=request):
@@ -1884,6 +1969,49 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             pid = int(child_pid.read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+    def test_native_stitch_tool_failures_are_deterministic_only_for_repeatable_corruption(self):
+        cancel = threading.Event()
+        infrastructure = (
+            pull.ToolProcessError(-signal.SIGKILL, b"Killed"),
+            pull.ToolProcessError(1, b"Cannot allocate memory"),
+            pull.ToolProcessError(1, b"Input/output error"),
+            pull.ToolProcessError(127, b"error while loading shared libraries"),
+        )
+        for failure in infrastructure:
+            with self.subTest(returncode=failure.returncode, stderr=failure.stderr), \
+                 mock.patch.object(pull, "cancellable_tool_output", side_effect=failure), \
+                 self.assertRaises(pull.ToolProcessError):
+                pull.strict_decode_media_cancellable(Path("exact.mp4"), "ffmpeg", cancel)
+        corrupt = pull.ToolProcessError(1, b"Invalid data found when processing input")
+        with mock.patch.object(pull, "cancellable_tool_output", side_effect=[corrupt, corrupt]) as tool, \
+             self.assertRaisesRegex(pull.DeterministicMediaError, "clip_decode_failed"):
+            pull.strict_decode_media_cancellable(Path("corrupt.mp4"), "ffmpeg", cancel)
+        self.assertEqual(tool.call_count, 2)
+        with mock.patch.object(pull, "cancellable_tool_output", side_effect=[corrupt, pull.ToolProcessError(-signal.SIGKILL, b"Killed")]), \
+             self.assertRaises(pull.ToolProcessError):
+            pull.strict_decode_media_cancellable(Path("unstable.mp4"), "ffmpeg", cancel)
+        with mock.patch.object(pull, "cancellable_tool_output", side_effect=[corrupt, b""]), \
+             self.assertRaisesRegex(pull.MediaCertificationError, "inconsistent"):
+            pull.strict_decode_media_cancellable(Path("fail-then-pass.mp4"), "ffmpeg", cancel)
+        with tempfile.TemporaryDirectory() as raw, \
+             mock.patch.object(pull, "cancellable_tool_output", side_effect=[corrupt, b""]), \
+             self.assertRaisesRegex(pull.MediaCertificationError, "inconsistent"):
+            pull.validate_native_run_cancellable(
+                [Path("left.mp4"), Path("right.mp4")], "ffmpeg", cancel, Path(raw))
+
+    def test_native_stitch_completion_retries_exact_report_inside_lease(self):
+        calls = []
+        def request(_cfg, _method, _path, body=None, **_kwargs):
+            calls.append(body)
+            if len(calls) == 1:
+                raise urllib.error.URLError(TimeoutError("lost response"))
+            return {"ok": True, "replayed": True}
+        task = {"claim_token": "claim", "_completion_deadline_monotonic": time.monotonic() + 5}
+        with mock.patch.object(pull, "request_json", side_effect=request), mock.patch.object(pull.time, "sleep"):
+            result = pull.submit_native_stitch_completion(SimpleNamespace(), task, {"status": "unknown"})
+        self.assertTrue(result["replayed"])
+        self.assertEqual(calls[0], calls[1], "completion retry changed immutable evidence")
 
     def test_native_stitch_hash_yields_and_rejects_atomic_replacement(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1937,6 +2065,35 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         with self.assertRaisesRegex(pull.MediaCertificationError, "manifest"):
             pull.native_stitch_largest_possible_run([clip(1)] * (pull.NATIVE_STITCH_MAX_CLIPS + 1))
 
+    def test_native_stitch_collects_only_frozen_window_rows(self):
+        database = sqlite3.connect(":memory:")
+        database.execute("""CREATE TABLE files(clip_id integer,recording_id integer,relative_path text,size_bytes integer,
+            sha256 text,verified_at text,seen_generation text,state text,clip_start_us integer,clip_end_us integer)""")
+        start = datetime.datetime(2026, 8, 10, 8, tzinfo=datetime.timezone.utc)
+        end = start + datetime.timedelta(hours=12)
+        micros = lambda value: pull.certification_timestamp_microseconds(value, "test")
+        rows = [
+            (7, 47, "recordings/current.mp4", 4, "a" * 64, "2026-08-10T21:00:00Z", "generation", "present", micros("2026-08-10T08:00:00Z"), micros("2026-08-10T20:00:00Z")),
+            (8, 47, "recordings/old-corrupt.mp4", 4, "b" * 64, "2026-08-01T21:00:00Z", "generation", "present", micros("2026-08-01T08:00:00Z"), micros("2026-08-01T20:00:00Z")),
+        ]
+        database.executemany("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+        frozen = [{"clip_id": 7}]
+        sidecar = {"schema_version": 1, "clip_id": 7, "recording_id": 47, "recording_job_id": 9,
+                   "relative_path": "recordings/current.mp4", "size_bytes": 4, "sha256": "a" * 64,
+                   "clip_start_at": "2026-08-10T08:00:00Z", "clip_end_at": "2026-08-10T20:00:00Z",
+                   "capture_generation": "generation", "capture_sequence": 1}
+        with mock.patch.object(pull, "read_certification_sidecar", return_value=(sidecar, 10, "c" * 64)) as read:
+            candidates = pull.collect_certification_candidates(SimpleNamespace(output_dir=Path("/unused")), database,
+                "generation", 47, start, end, frozen)
+        self.assertEqual([item["clip_id"] for item in candidates], [7])
+        self.assertEqual(read.call_count, 1, "out-of-window history was parsed")
+        database.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?)", (9, 47, "recordings/extra.mp4", 4,
+            "d" * 64, "2026-08-10T21:00:00Z", "generation", "present", micros("2026-08-10T09:00:00Z"), micros("2026-08-10T10:00:00Z")))
+        with self.assertRaisesRegex(pull.MediaCertificationError, "extra media"):
+            pull.collect_certification_candidates(SimpleNamespace(output_dir=Path("/unused")), database,
+                "generation", 47, start, end, frozen)
+        database.close()
+
     def test_historical_native_stitch_finishes_terminal_partial_with_all_pair_facts(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1956,6 +2113,8 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                     "clip_end_at": (start + datetime.timedelta(seconds=index + 1)).isoformat().replace("+00:00", "Z"),
                     "capture_generation": "generation", "capture_sequence": index + 1,
                     "capture_attempt_id": "", "timestamp_contract_version": "",
+                    "timestamp_contract_status": "", "timestamp_contract_reason": "",
+                    "timestamp_contract_sha256": "",
                 }
                 clips.append(frozen)
                 local.append({**frozen,
@@ -1968,7 +2127,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 "recording_job_id": 9, "policy_version": "native-window-v1",
                 "window_start_at": start.isoformat().replace("+00:00", "Z"),
                 "window_end_at": (start + datetime.timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
-                "clip_manifest_sha256": pull.canonical_report_hash(clips), "clips": clips,
+                "clip_manifest_sha256": pull.native_stitch_manifest_hash(clips), "clips": clips,
                 "inventory_generation": "generation", "inventory_digest": "d" * 64,
                 "inventory_completed_at": "2026-08-10T21:00:00Z",
             }
@@ -1976,7 +2135,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             database = SimpleNamespace(close=lambda: None)
             completed = []
             requests = []
-            def request(_cfg, method, path, body=None):
+            def request(_cfg, method, path, body=None, **_kwargs):
                 requests.append((method, path))
                 if path.endswith("/complete"):
                     completed.append(body["report"])
@@ -2031,12 +2190,12 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             task = {
                 "task_id": 5, "claim_token": "claim", "recording_id": 7, "recording_job_id": 9,
                 "policy_version": "native-window-v1", "window_start_at": frozen["clip_start_at"],
-                "window_end_at": frozen["clip_end_at"], "clip_manifest_sha256": pull.canonical_report_hash([frozen]),
+                "window_end_at": frozen["clip_end_at"], "clip_manifest_sha256": pull.native_stitch_manifest_hash([frozen]),
                 "clips": [frozen], "inventory_generation": "generation", "inventory_digest": "d" * 64,
                 "inventory_completed_at": "2026-08-10T21:00:00Z",
             }
             completed = []
-            def request(_cfg, _method, endpoint, body=None):
+            def request(_cfg, _method, endpoint, body=None, **_kwargs):
                 if endpoint.endswith("/complete"):
                     completed.append(body["report"])
                 return {"ok": True}
@@ -2071,11 +2230,16 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 {"index": 1, "codec_type": "audio", "codec_name": "aac", "codec_tag_string": "mp4a", "profile": "LC", "time_base": "1/48000", "extradata": "def", "sample_rate": "48000", "channels": 2, "channel_layout": "stereo"},
             ],
             "frames": [
-                {"stream_index": 0, "media_type": "video", "best_effort_timestamp": 0, "pkt_dts": 0, "pkt_duration": 1},
-                {"stream_index": 0, "media_type": "video", "best_effort_timestamp": 1, "pkt_dts": 1, "pkt_duration": 1},
-                {"stream_index": 0, "media_type": "video", "best_effort_timestamp": 3, "pkt_dts": 3, "pkt_duration": 1},
+                {"stream_index": 0, "media_type": "video", "best_effort_timestamp": 0, "pkt_dts": 0, "pkt_duration": 1, "key_frame": 1, "pict_type": "I"},
+                {"stream_index": 0, "media_type": "video", "best_effort_timestamp": 1, "pkt_dts": 1, "pkt_duration": 1, "key_frame": 0, "pict_type": "P"},
+                {"stream_index": 0, "media_type": "video", "best_effort_timestamp": 3, "pkt_dts": 3, "pkt_duration": 1, "key_frame": 0, "pict_type": "P"},
                 {"stream_index": 1, "media_type": "audio", "best_effort_timestamp": 0, "pkt_dts": 0, "pkt_duration": 1024, "nb_samples": 1024},
                 {"stream_index": 1, "media_type": "audio", "best_effort_timestamp": 1024, "pkt_dts": 1024, "pkt_duration": 1024, "nb_samples": 1024},
+            ],
+            "packets": [
+                {"stream_index": 0, "pts": 0, "dts": -2, "duration": 1, "data_hash": "SHA256:" + "a" * 64},
+                {"stream_index": 0, "pts": 1, "dts": -1, "duration": 1, "data_hash": "SHA256:" + "b" * 64},
+                {"stream_index": 0, "pts": 3, "dts": 0, "duration": 1, "data_hash": "SHA256:" + "c" * 64},
             ],
         }
         raw = json.dumps(payload, separators=(",", ":")).encode()
@@ -2087,9 +2251,197 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         self.assertEqual(contract["tracks"][0]["unit_count"], 3)
         self.assertEqual(contract["tracks"][1]["last_sample_count"], 1024)
         self.assertEqual(timelines["video"]["discontinuous_step_count"], 1)
+        self.assertEqual(timelines["_video_frames"][0]["packet_dts"], -2)
+        self.assertEqual(timelines["_video_frames"][2]["packet_sha256"], "c" * 64)
         self.assertEqual(timelines["audio"]["first_sample"], 0)
         self.assertEqual(timelines["audio"]["end_sample"], 2048)
         self.assertEqual(tool.call_args.kwargs["stdout_limit"], 16 * 1024 * 1024)
+
+    def test_timestamp_contract_duration_alias_matches_capture_and_fails_closed(self):
+        self.assertEqual(pull.timestamp_frame_duration({"duration": 1001}), 1001)
+        self.assertEqual(pull.timestamp_frame_duration({"pkt_duration": 1001}), 1001)
+        self.assertEqual(pull.timestamp_frame_duration({"duration": "1001", "pkt_duration": 1001}), 1001)
+        for frame in (
+            {},
+            {"duration": None, "pkt_duration": None},
+            {"duration": 1001, "pkt_duration": None},
+            {"duration": "N/A", "pkt_duration": 1001},
+            {"duration": 0},
+            {"duration": 1.5},
+            {"duration": 1001, "pkt_duration": 1000},
+        ):
+            with self.subTest(frame=frame), self.assertRaises(pull.MediaCertificationError):
+                pull.timestamp_frame_duration(frame)
+
+        fixture_path = MODULE_PATH.parents[2] / "backend" / "internal" / "capture" / "testdata" / "ffprobe-8.1.2-bframes-aac-native-copy.json"
+        payload = json.loads(fixture_path.read_text())
+        self.assertTrue(all("duration" in frame and "pkt_duration" not in frame for frame in payload["frames"]))
+        payload["packets"] = [
+            {"stream_index": 0, "pts": frame["best_effort_timestamp"], "dts": frame["pkt_dts"],
+             "duration": frame["duration"], "data_hash": "SHA256:" + chr(ord("a") + index) * 64}
+            for index, frame in enumerate(payload["frames"])
+            if frame["media_type"] == "video"
+        ]
+        with mock.patch.object(pull, "cancellable_tool_output", return_value=json.dumps(payload).encode()):
+            contract, timelines = pull.recompute_timestamp_contract(Path("captured.mp4"), "ffprobe", threading.Event())
+        self.assertEqual(contract["tracks"][0]["last_duration"], 1001)
+        self.assertEqual(contract["tracks"][1]["last_duration"], 1024)
+        self.assertEqual(timelines["video"]["frame_count"], 3)
+
+    def test_native_stitch_decoded_frame_edges_bind_presentation_order_and_hashes(self):
+        rows = (
+            "#tb 0: 1/30\n"
+            "#stream#, dts, pts, duration, size, hash\n"
+            "0, -2, 0, 1, 6144, " + "a" * 64 + "\n"
+            "0, -1, 1, 1, 6144, " + "b" * 64 + "\n"
+            "0, 0, 2, 1, 6144, " + "c" * 64 + "\n"
+        ).encode()
+        source = [{"best_effort_timestamp": i, "duration_timestamp": 1,
+                   "time_base_numerator": 1, "time_base_denominator": 30,
+                   "packet_dts": i - 2, "key_frame": i == 0,
+                   "picture_type": "I" if i == 0 else "P", "packet_sha256": "d" * 64}
+                  for i in range(3)]
+        with mock.patch.object(pull, "cancellable_tool_output", return_value=rows):
+            edge = pull.native_stitch_video_edge_frames(Path("safe.mp4"), "ffmpeg", source, threading.Event())
+        self.assertEqual(edge["first"][0]["best_effort_timestamp"], 0)
+        self.assertEqual(edge["last"][-1]["decoded_sha256"], "c" * 64)
+        self.assertEqual(len(edge["first"]), 3)
+
+    def test_native_stitch_real_reset0_video_fixture_reaches_full_pass(self):
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            self.skipTest("ffmpeg/ffprobe required for native seam fixture")
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            media_dir = cfg.output_dir / "recordings"
+            media_dir.mkdir(parents=True)
+            subprocess.run([
+                ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
+                "-t", "4", "-c:v", "libx264", "-g", "10", "-keyint_min", "10", "-sc_threshold", "0",
+                "-pix_fmt", "yuv420p", "-f", "segment", "-segment_time", "2", "-reset_timestamps", "0",
+                str(media_dir / "%02d.mp4"),
+            ], check=True)
+            paths = sorted(media_dir.glob("*.mp4"))
+            self.assertEqual(len(paths), 2)
+            start = datetime.datetime(2026, 8, 10, 8, tzinfo=datetime.timezone.utc)
+            attempt = "123e4567-e89b-12d3-a456-426614174000"
+            frozen = []
+            local = []
+            for index, path in enumerate(paths):
+                body = path.read_bytes()
+                contract, _ = pull.recompute_timestamp_contract(path, ffprobe, threading.Event())
+                item = {
+                    "ordinal": index + 1, "clip_id": index + 1, "recording_id": 7, "recording_job_id": 9,
+                    "relative_path": "recordings/%s" % path.name, "size_bytes": len(body),
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "clip_start_at": (start + datetime.timedelta(seconds=index * 2)).isoformat().replace("+00:00", "Z"),
+                    "clip_end_at": (start + datetime.timedelta(seconds=(index + 1) * 2)).isoformat().replace("+00:00", "Z"),
+                    "capture_generation": "generation", "capture_sequence": index + 1,
+                    "capture_attempt_id": attempt, "timestamp_contract_version": "continuous-source-pts-v1",
+                    "timestamp_contract_status": "per_clip_probe_complete", "timestamp_contract_reason": "",
+                    "timestamp_contract_sha256": pull.timestamp_contract_hash(contract),
+                }
+                frozen.append(item)
+                local.append({**item, "clip_start_at": start + datetime.timedelta(seconds=index * 2),
+                              "clip_end_at": start + datetime.timedelta(seconds=(index + 1) * 2),
+                              "sidecar_sha256": "b" * 64, "timestamp_contract": contract})
+            task = {
+                "task_id": 6, "claim_token": "claim", "recording_id": 7, "recording_job_id": 9,
+                "policy_version": "native-window-v1", "window_start_at": frozen[0]["clip_start_at"],
+                "window_end_at": frozen[-1]["clip_end_at"], "clip_manifest_sha256": pull.native_stitch_manifest_hash(frozen),
+                "clips": frozen, "inventory_generation": "generation", "inventory_digest": "d" * 64,
+                "inventory_completed_at": "2026-08-10T21:00:00Z",
+            }
+            completed = []
+            def request(_cfg, _method, endpoint, body=None, **_kwargs):
+                if endpoint.endswith("/complete"):
+                    completed.append(body["report"])
+                return {"ok": True}
+            summary = {"generation": "generation", "digest": "d" * 64, "scan_completed_at": "2026-08-10T21:00:00Z"}
+            with mock.patch.object(pull, "open_certification_inventory", return_value=(SimpleNamespace(close=lambda: None), summary)), \
+                 mock.patch.object(pull, "collect_certification_candidates", return_value=local), \
+                 mock.patch.object(pull, "check_native_stitch_delivery", return_value=False), \
+                 mock.patch.object(pull, "request_json", side_effect=request):
+                self.assertTrue(pull._run_native_stitch_task(cfg, None, None, threading.Event(), threading.Event(), task,
+                    datetime.datetime.now(datetime.timezone.utc), time.monotonic() + 120, ffmpeg, ffprobe))
+            report = completed[-1]
+            self.assertEqual(report["status"], "partial", report)
+            self.assertEqual(report["within_run_frame_adjacency_status"], "unknown")
+            self.assertEqual(report["within_run_audio_sample_continuity_status"], "not_present")
+            self.assertEqual(report["window_continuity_status"], "unknown")
+            self.assertEqual(report["seams"][0]["verdict"], "ambiguous")
+            self.assertEqual(report["seams"][0]["reason"], "continuous_source_pts_unavailable")
+
+    def test_native_stitch_real_reset0_bframes_aac_keeps_audio_axis_fail_closed(self):
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            self.skipTest("ffmpeg/ffprobe required for native seam fixture")
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            media_dir = cfg.output_dir / "recordings"
+            media_dir.mkdir(parents=True)
+            subprocess.run([
+                ffmpeg, "-v", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30000/1001",
+                "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
+                "-t", "4.004", "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "libx264", "-bf", "3", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "segment", "-segment_time", "2.002",
+                "-reset_timestamps", "0", str(media_dir / "%02d.mp4"),
+            ], check=True)
+            paths = sorted(media_dir.glob("*.mp4"))
+            self.assertEqual(len(paths), 2)
+            start = datetime.datetime(2026, 8, 10, 8, tzinfo=datetime.timezone.utc)
+            attempt = "123e4567-e89b-12d3-a456-426614174001"
+            frozen, local = [], []
+            for index, path in enumerate(paths):
+                body = path.read_bytes()
+                contract, _ = pull.recompute_timestamp_contract(path, ffprobe, threading.Event())
+                clip_start = start + datetime.timedelta(seconds=index * 2.002)
+                clip_end = start + datetime.timedelta(seconds=(index + 1) * 2.002)
+                item = {
+                    "ordinal": index + 1, "clip_id": index + 11, "recording_id": 7, "recording_job_id": 10,
+                    "relative_path": "recordings/%s" % path.name, "size_bytes": len(body),
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "clip_start_at": clip_start.isoformat().replace("+00:00", "Z"),
+                    "clip_end_at": clip_end.isoformat().replace("+00:00", "Z"),
+                    "capture_generation": "generation-aac", "capture_sequence": index + 1,
+                    "capture_attempt_id": attempt, "timestamp_contract_version": "continuous-source-pts-v1",
+                    "timestamp_contract_status": "per_clip_probe_complete", "timestamp_contract_reason": "",
+                    "timestamp_contract_sha256": pull.timestamp_contract_hash(contract),
+                }
+                frozen.append(item)
+                local.append({**item, "clip_start_at": clip_start, "clip_end_at": clip_end,
+                              "sidecar_sha256": "b" * 64, "timestamp_contract": contract})
+            task = {
+                "task_id": 7, "claim_token": "claim", "recording_id": 7, "recording_job_id": 10,
+                "policy_version": "native-window-v1", "window_start_at": frozen[0]["clip_start_at"],
+                "window_end_at": frozen[-1]["clip_end_at"], "clip_manifest_sha256": pull.native_stitch_manifest_hash(frozen),
+                "clips": frozen, "inventory_generation": "generation", "inventory_digest": "d" * 64,
+                "inventory_completed_at": "2026-08-10T21:00:00Z",
+            }
+            completed = []
+            def request(_cfg, _method, endpoint, body=None, **_kwargs):
+                if endpoint.endswith("/complete"):
+                    completed.append(body["report"])
+                return {"ok": True}
+            summary = {"generation": "generation", "digest": "d" * 64, "scan_completed_at": "2026-08-10T21:00:00Z"}
+            with mock.patch.object(pull, "open_certification_inventory", return_value=(SimpleNamespace(close=lambda: None), summary)), \
+                 mock.patch.object(pull, "collect_certification_candidates", return_value=local), \
+                 mock.patch.object(pull, "check_native_stitch_delivery", return_value=False), \
+                 mock.patch.object(pull, "request_json", side_effect=request):
+                self.assertTrue(pull._run_native_stitch_task(cfg, None, None, threading.Event(), threading.Event(), task,
+                    datetime.datetime.now(datetime.timezone.utc), time.monotonic() + 120, ffmpeg, ffprobe))
+            report = completed[-1]
+            self.assertEqual(report["status"], "partial", report)
+            self.assertEqual(report["nas_byte_decode_status"], "passed")
+            self.assertEqual(report["native_run_concat_status"], "passed")
+            self.assertEqual(report["within_run_frame_adjacency_status"], "unknown")
+            self.assertEqual(report["within_run_audio_sample_continuity_status"], "unknown")
+            self.assertEqual(report["window_continuity_status"], "unknown")
+            self.assertEqual(report["audio_seams"][0]["verdict"], "ambiguous")
 
     def test_native_stitch_timeline_tracks_internal_without_edge_gaps(self):
         utc = datetime.timezone.utc
@@ -2103,6 +2455,90 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         self.assertEqual(got["trailing_gap_seconds"], 0)
         self.assertEqual(got["largest_internal_gap_seconds"], 10)
         self.assertEqual(got["gap_count"], 1)
+
+    def test_native_stitch_whole_window_rejects_single_run_edge_loss(self):
+        full = {"expected_seconds": 43200, "covered_seconds": 43200, "leading_gap_seconds": 0,
+                "largest_internal_gap_seconds": 0, "trailing_gap_seconds": 0, "gap_count": 0,
+                "overlap_count": 0, "overlap_seconds": 0}
+        self.assertTrue(pull.native_stitch_full_envelope(full))
+        lost = dict(full, covered_seconds=42300, leading_gap_seconds=900, gap_count=1)
+        self.assertFalse(pull.native_stitch_full_envelope(lost))
+
+    def test_native_stitch_single_clip_cannot_bypass_timestamp_axis_gates(self):
+        historical = [{"timestamp_contract_status": "", "audio_present": False}]
+        self.assertEqual(pull.native_stitch_clip_axis_continuity(historical), (False, True))
+        incomplete_audio = [{
+            "timestamp_contract_status": "per_clip_probe_complete", "audio_present": True,
+            "video_timeline": {"duplicate_timestamp_count": 0, "non_monotonic_step_count": 0, "discontinuous_step_count": 0},
+            "audio_timeline": None,
+        }]
+        self.assertEqual(pull.native_stitch_clip_axis_continuity(incomplete_audio), (False, False))
+
+    def test_native_stitch_v1_singleton_finishes_terminal_partial(self):
+        with tempfile.TemporaryDirectory() as raw:
+            report, _ = self.run_mocked_v1_stitch(self.config(Path(raw)), ["generation-1"])
+        self.assertEqual(report["status"], "partial", report)
+        self.assertEqual(report["nas_byte_decode_status"], "passed")
+        self.assertEqual(report["native_run_concat_status"], "passed")
+        self.assertEqual(report["within_run_frame_adjacency_status"], "unknown")
+        self.assertEqual(report["within_run_audio_sample_continuity_status"], "not_present")
+        self.assertEqual(report["window_continuity_status"], "unknown")
+        self.assertEqual(report["reason_codes"], ["continuous_source_pts_unavailable"])
+        self.assertEqual(report["seams"], [])
+
+    def test_native_stitch_v1_all_objective_boundaries_finish_terminal_partial(self):
+        with tempfile.TemporaryDirectory() as raw:
+            report, _ = self.run_mocked_v1_stitch(
+                self.config(Path(raw)), ["generation-1", "generation-2"])
+        self.assertEqual(report["status"], "partial", report)
+        self.assertEqual(report["native_run_concat_status"], "passed")
+        self.assertEqual(report["within_run_frame_adjacency_status"], "unknown")
+        self.assertEqual(report["window_continuity_status"], "partitioned")
+        self.assertEqual(len(report["native_runs"]), 2)
+        self.assertEqual(len(report["seams"]), 1)
+        self.assertEqual(report["seams"][0]["verdict"], "not_applicable")
+        self.assertEqual(report["seams"][0]["reason"], "capture_generation_change")
+
+    def test_native_stitch_source_replacement_during_failed_concat_is_unknown(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            def replace_then_fail(paths, *_args):
+                replacement = paths[0].with_suffix(".replacement")
+                replacement.write_bytes(b"changed source identity")
+                os.replace(replacement, paths[0])
+                raise pull.DeterministicMediaError("run_concat_failed")
+            report, _ = self.run_mocked_v1_stitch(
+                cfg, ["generation-1", "generation-1"], validate_run=replace_then_fail)
+        self.assertEqual(report["status"], "unknown", report)
+        self.assertEqual(report["reason_codes"], ["verification_transient"])
+        self.assertEqual(report["nas_byte_decode_status"], "unknown")
+        self.assertEqual(report["native_run_concat_status"], "unknown")
+        self.assertEqual(report["clips"], [])
+        self.assertEqual(report["native_runs"], [])
+
+    def test_native_stitch_inconsistent_clip_decode_is_unknown_without_axes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            report, _ = self.run_mocked_v1_stitch(
+                self.config(Path(raw)), ["generation-1"],
+                validate_clip=lambda *_args: (_ for _ in ()).throw(
+                    pull.MediaCertificationError("media verification result was inconsistent")))
+        self.assertEqual(report["status"], "unknown", report)
+        self.assertEqual(report["nas_byte_decode_status"], "unknown")
+        self.assertEqual(report["native_run_concat_status"], "unknown")
+        self.assertEqual(report["clips"], [])
+        self.assertEqual(report["native_runs"], [])
+
+    def test_native_stitch_inconsistent_concat_is_unknown_without_axes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            report, _ = self.run_mocked_v1_stitch(
+                self.config(Path(raw)), ["generation-1", "generation-1"],
+                validate_run=lambda *_args: (_ for _ in ()).throw(
+                    pull.MediaCertificationError("media verification result was inconsistent")))
+        self.assertEqual(report["status"], "unknown", report)
+        self.assertEqual(report["nas_byte_decode_status"], "unknown")
+        self.assertEqual(report["native_run_concat_status"], "unknown")
+        self.assertEqual(report["clips"], [])
+        self.assertEqual(report["native_runs"], [])
 
 
 if __name__ == "__main__":

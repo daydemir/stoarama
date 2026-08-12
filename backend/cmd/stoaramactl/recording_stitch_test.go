@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -84,6 +85,34 @@ INSERT INTO recording_window_health VALUES
 	_ = tx.Rollback(ctx)
 	if err != nil || len(selected) != 2 || selected[0].RecordingID == selected[1].RecordingID {
 		t.Fatalf("first-wave candidates=%+v err=%v", selected, err)
+	}
+	// Existing top-ranked tasks are excluded before LIMIT, so later protected
+	// recordings cannot starve behind the same first page forever.
+	if _, err = conn.Exec(ctx, `INSERT INTO accounts VALUES(48); INSERT INTO recording_campaign_tracks VALUES(2,48,'delivery30','active',$1+interval '9 days')`, end); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 22; i++ {
+		recordingID, jobID := int64(100+i), int64(1000+i)
+		if _, err = conn.Exec(ctx, `INSERT INTO recordings VALUES($1,48,'continuous'); INSERT INTO recording_campaign_roster_entries VALUES(2,$1,$2,'primary','protect'); INSERT INTO recording_jobs VALUES($3,$1,'done','continuous_window',$6,$6,$4,$5,60,'reccont:'||$1||':'||extract(epoch from $4)::bigint); INSERT INTO recording_window_health VALUES($1,$3,$6,2,43200,43200,100,0,0,0,0,0,0,0,1)`, recordingID, i+1, jobID, start, end, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	firstPage, err := selectNativeStitchCandidates(ctx, tx, 48, 20)
+	_ = tx.Rollback(ctx)
+	if err != nil || len(firstPage) != 20 {
+		t.Fatalf("first bounded page=%d err=%v", len(firstPage), err)
+	}
+	for _, candidate := range firstPage {
+		if _, err = conn.Exec(ctx, `INSERT INTO recording_native_stitch_tasks(account_id,recording_id,recording_job_id,window_start_at,window_end_at,health_calculated_at,health_metric_version,health_facts,job_schedule_facts,clip_manifest,clip_manifest_sha256,clip_count,source_bytes,policy_version) VALUES(48,$1,$2,$3,$4,$5,2,'{}','{}','[{}]',repeat('a',64),1,1,$6)`, candidate.RecordingID, candidate.JobID, candidate.FireAt, candidate.WindowEnd, candidate.HealthCalculated, stitchcert.PolicyVersion); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	secondPage, err := selectNativeStitchCandidates(ctx, tx, 48, 20)
+	_ = tx.Rollback(ctx)
+	if err != nil || len(secondPage) != 2 {
+		t.Fatalf("second bounded page=%d want=2 err=%v", len(secondPage), err)
 	}
 	tx, err = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {

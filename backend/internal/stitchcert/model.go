@@ -121,6 +121,7 @@ type SeamFact struct {
 	PreviousSequence      int64               `json:"previous_capture_sequence"`
 	NextSequence          int64               `json:"next_capture_sequence"`
 	NativeSignatureSHA256 string              `json:"native_signature_sha256"`
+	CaptureAttemptID      string              `json:"capture_attempt_id"`
 	TimelineBasis         string              `json:"timeline_basis"`
 	CaptureContract       string              `json:"capture_contract"`
 	PreviousFrames        []SeamFrameEvidence `json:"previous_frames"`
@@ -312,6 +313,13 @@ func HasCompleteTimestampProvenance(c ManifestClip) bool {
 		c.TimestampContractVersion == "continuous-source-pts-v1" && lowerHex64(c.TimestampContractSHA256)
 }
 
+func HasFramePerfectTimestampProvenance(c ManifestClip) bool {
+	// continuous-source-pts-v1 freezes rational endpoints, not packet-edge byte
+	// identities. A future capture contract must supply server-owned edge facts
+	// before this gate can recognize any version.
+	return false
+}
+
 func MeasureTimeline(clips []ManifestClip, start, end time.Time) Timeline {
 	expected := end.Sub(start).Seconds()
 	t := Timeline{ExpectedSeconds: expected}
@@ -437,6 +445,7 @@ func validateSeamEvidence(clips []ClipFact, runs []RunFact, seams []SeamFact, re
 			return fmt.Errorf("native run crosses an objective boundary")
 		}
 		if seam.CaptureGeneration != left.CaptureGeneration || seam.CaptureGeneration != right.CaptureGeneration ||
+			seam.CaptureAttemptID != left.CaptureAttemptID || seam.CaptureAttemptID != right.CaptureAttemptID ||
 			seam.NativeSignatureSHA256 != left.NativeSignatureSHA256 || seam.NativeSignatureSHA256 != right.NativeSignatureSHA256 {
 			return fmt.Errorf("native seam provenance differs from its run")
 		}
@@ -465,6 +474,15 @@ func validateSeamEvidence(clips []ClipFact, runs []RunFact, seams []SeamFact, re
 		}
 		last := seam.PreviousFrames[len(seam.PreviousFrames)-1]
 		first := seam.NextFrames[0]
+		leftTrack := timestampTrack(left.RecomputedTimestampContract, "video")
+		rightTrack := timestampTrack(right.RecomputedTimestampContract, "video")
+		if leftTrack == nil || rightTrack == nil ||
+			last.TimeBaseNumerator != leftTrack.TimeBaseNum || last.TimeBaseDenominator != leftTrack.TimeBaseDen ||
+			first.TimeBaseNumerator != rightTrack.TimeBaseNum || first.TimeBaseDenominator != rightTrack.TimeBaseDen ||
+			last.BestEffortTimestamp != leftTrack.LastTimestamp || last.DurationTimestamp != leftTrack.LastDuration ||
+			first.BestEffortTimestamp != rightTrack.FirstTimestamp {
+			return fmt.Errorf("seam frame evidence differs from the recomputed timestamp contract")
+		}
 		if first.TimeBaseNumerator != last.TimeBaseNumerator || first.TimeBaseDenominator != last.TimeBaseDenominator ||
 			first.BestEffortTimestamp != last.BestEffortTimestamp+last.DurationTimestamp {
 			return fmt.Errorf("seam is not exactly adjacent on the attested rational presentation timeline")
@@ -500,20 +518,20 @@ func ValidateAudioSeams(clips []ClipFact, seams []AudioSeamFact, requireExact bo
 		if seam.Ordinal != i+1 || seam.PreviousClipID != left.ClipID || seam.NextClipID != right.ClipID {
 			return fmt.Errorf("audio seam identity is invalid")
 		}
-		leftAudio, rightAudio := left.AudioPresent, right.AudioPresent
-		if !leftAudio && !rightAudio {
-			if seam.Verdict != "not_present" || seam.Reason != "audio_not_present" {
-				return fmt.Errorf("audio-free seam is mislabeled")
-			}
-			continue
-		}
 		boundaryReason := runBoundaryReason(left, right)
-		if leftAudio != rightAudio || boundaryReason != "" {
+		leftAudio, rightAudio := left.AudioPresent, right.AudioPresent
+		if boundaryReason != "" || leftAudio != rightAudio {
 			if boundaryReason == "" {
 				boundaryReason = "audio_stream_presence_change"
 			}
 			if seam.Verdict != "not_applicable" || seam.Reason != boundaryReason {
 				return fmt.Errorf("objective audio boundary is invalid")
+			}
+			continue
+		}
+		if !leftAudio && !rightAudio {
+			if seam.Verdict != "not_present" || seam.Reason != "audio_not_present" {
+				return fmt.Errorf("audio-free seam is mislabeled")
 			}
 			continue
 		}
@@ -528,6 +546,8 @@ func ValidateAudioSeams(clips []ClipFact, seams []AudioSeamFact, requireExact bo
 		}
 		if seam.Verdict != "exact" || seam.Reason != "audio_sample_adjacency_proven" ||
 			seam.SampleRate <= 0 || seam.SampleRate != left.AudioTimeline.SampleRate || seam.SampleRate != right.AudioTimeline.SampleRate ||
+			seam.PreviousEndSample != left.AudioTimeline.EndSample || seam.NextStartSample != right.AudioTimeline.FirstSample ||
+			seam.PreviousSampleCount != left.AudioTimeline.SampleCount || seam.NextSampleCount != right.AudioTimeline.SampleCount ||
 			seam.PreviousEndSample != seam.NextStartSample || seam.PreviousSampleCount <= 0 || seam.NextSampleCount <= 0 ||
 			seam.CaptureAttemptID == "" || seam.CaptureAttemptID != left.CaptureAttemptID || seam.CaptureAttemptID != right.CaptureAttemptID ||
 			seam.TimestampContract != "continuous-source-pts-v1" {
@@ -558,7 +578,8 @@ func ValidateAxisStatuses(report Report) error {
 	}
 	if report.Status == "partial" {
 		if report.NASByteDecodeStatus != "passed" || report.NativeRunConcatStatus != "passed" ||
-			report.WindowContinuityStatus == "passed" {
+			report.WithinRunFrameAdjacencyStatus == "failed" || report.WithinRunAudioContinuityStatus == "failed" ||
+			report.WindowContinuityStatus == "passed" || report.WindowContinuityStatus == "failed" {
 			return fmt.Errorf("partial report does not preserve useful media proof or uncertainty")
 		}
 		if len(report.NativeRuns) == 1 && report.WindowContinuityStatus != "unknown" {
@@ -568,7 +589,58 @@ func ValidateAxisStatuses(report Report) error {
 			return fmt.Errorf("multi-run partial is not explicitly partitioned")
 		}
 	}
+	if report.Status == "failed" {
+		clipFailure := report.NASByteDecodeStatus == "failed" && report.NativeRunConcatStatus == "unknown"
+		runFailure := report.NASByteDecodeStatus == "unknown" && report.NativeRunConcatStatus == "failed"
+		if (!clipFailure && !runFailure) || report.WithinRunFrameAdjacencyStatus != "unknown" ||
+			report.WithinRunAudioContinuityStatus != "unknown" || report.WindowContinuityStatus != "unknown" {
+			return fmt.Errorf("failed report axes do not identify one deterministic media failure")
+		}
+	}
+	if report.Status == "unknown" && (report.NASByteDecodeStatus != "unknown" || report.NativeRunConcatStatus != "unknown" ||
+		report.WithinRunFrameAdjacencyStatus != "unknown" || report.WithinRunAudioContinuityStatus != "unknown" ||
+		report.WindowContinuityStatus != "unknown") {
+		return fmt.Errorf("unknown report contains an asserted media axis")
+	}
 	return nil
+}
+
+// ValidateAudioAxisStatus binds the report-level audio label to exact clip
+// facts. `not_present` is an affirmative claim, not a generic not-required
+// value, and therefore cannot be used when any frozen clip contains audio.
+func ValidateAudioAxisStatus(clips []ClipFact, status string) error {
+	hasAudio := false
+	for _, clip := range clips {
+		hasAudio = hasAudio || clip.AudioPresent
+	}
+	if (status == "not_present") != !hasAudio {
+		return fmt.Errorf("audio continuity status differs from clip evidence")
+	}
+	return nil
+}
+
+// ValidateDeterministicFailureEvidence records the first canonical media
+// defect that stopped verification. Later axes were not executed and remain
+// UNKNOWN; a FAILED report must never imply an exhaustive multi-axis sweep.
+func ValidateDeterministicFailureEvidence(report Report, reasons []string) error {
+	if report.Status != "failed" || len(reasons) != 1 {
+		return fmt.Errorf("failed report must contain one primary deterministic reason")
+	}
+	switch reasons[0] {
+	case "clip_decode_failed":
+		for _, clip := range report.Clips {
+			if clip.StrictDecode == "failed" && report.NASByteDecodeStatus == "failed" {
+				return nil
+			}
+		}
+	case "run_concat_failed":
+		for _, run := range report.NativeRuns {
+			if run.ValidationStatus == "failed" && report.NativeRunConcatStatus == "failed" {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("failed report lacks matching deterministic media evidence")
 }
 
 func validateFrameEdge(frames []SeamFrameEvidence) error {
@@ -593,20 +665,33 @@ func validateFrameEdge(frames []SeamFrameEvidence) error {
 
 func ValidateClipTimelines(clips []ClipFact, requireVideoContinuity, requireAudioContinuity bool) error {
 	for _, clip := range clips {
+		if requireVideoContinuity && !HasFramePerfectTimestampProvenance(clip.ManifestClip) {
+			return fmt.Errorf("video continuity lacks server-frozen packet-edge provenance")
+		}
+		videoTrack := timestampTrack(clip.RecomputedTimestampContract, "video")
+		audioTrack := timestampTrack(clip.RecomputedTimestampContract, "audio")
+		if clip.RecomputedTimestampContract != nil && (videoTrack == nil || (audioTrack != nil) != clip.AudioPresent) {
+			return fmt.Errorf("clip stream presence differs from the recomputed timestamp contract")
+		}
 		if clip.VideoTimeline == nil {
 			if requireVideoContinuity {
 				return fmt.Errorf("missing per-clip video presentation evidence")
 			}
-			continue
-		}
-		v := clip.VideoTimeline
-		if v.FrameCount <= 0 || v.TimeBaseNumerator <= 0 || v.TimeBaseDenominator <= 0 ||
-			v.LastDurationTimestamp <= 0 || v.LastTimestamp < v.FirstTimestamp ||
-			v.DuplicateTimestamps < 0 || v.NonMonotonicSteps < 0 || v.DiscontinuousSteps < 0 {
-			return fmt.Errorf("invalid per-clip video presentation evidence")
-		}
-		if requireVideoContinuity && (v.DuplicateTimestamps != 0 || v.NonMonotonicSteps != 0 || v.DiscontinuousSteps != 0) {
-			return fmt.Errorf("per-clip video presentation timeline is not continuous")
+		} else {
+			v := clip.VideoTimeline
+			if v.FrameCount <= 0 || v.TimeBaseNumerator <= 0 || v.TimeBaseDenominator <= 0 ||
+				v.LastDurationTimestamp <= 0 || v.LastTimestamp < v.FirstTimestamp ||
+				v.DuplicateTimestamps < 0 || v.NonMonotonicSteps < 0 || v.DiscontinuousSteps < 0 {
+				return fmt.Errorf("invalid per-clip video presentation evidence")
+			}
+			if videoTrack == nil || v.FrameCount != videoTrack.UnitCount || v.FirstTimestamp != videoTrack.FirstTimestamp ||
+				v.LastTimestamp != videoTrack.LastTimestamp || v.LastDurationTimestamp != videoTrack.LastDuration ||
+				v.TimeBaseNumerator != videoTrack.TimeBaseNum || v.TimeBaseDenominator != videoTrack.TimeBaseDen {
+				return fmt.Errorf("per-clip video evidence differs from the recomputed timestamp contract")
+			}
+			if requireVideoContinuity && (v.DuplicateTimestamps != 0 || v.NonMonotonicSteps != 0 || v.DiscontinuousSteps != 0) {
+				return fmt.Errorf("per-clip video presentation timeline is not continuous")
+			}
 		}
 		if clip.AudioTimeline != nil {
 			if !clip.AudioPresent {
@@ -618,12 +703,30 @@ func ValidateClipTimelines(clips []ClipFact, requireVideoContinuity, requireAudi
 				a.EndSample-a.FirstSample != a.SampleCount {
 				return fmt.Errorf("invalid per-clip audio sample evidence")
 			}
+			if audioTrack == nil || audioTrack.TimeBaseNum != 1 || audioTrack.TimeBaseDen != audioTrack.SampleRate ||
+				a.SampleRate != audioTrack.SampleRate || a.FirstSample != audioTrack.FirstTimestamp ||
+				a.EndSample != audioTrack.LastTimestamp+audioTrack.LastSampleCount ||
+				a.SampleCount != a.EndSample-a.FirstSample {
+				return fmt.Errorf("per-clip audio evidence differs from the recomputed timestamp contract")
+			}
 			if requireAudioContinuity && (a.DuplicateTimestamps != 0 || a.NonMonotonicSteps != 0 || a.DiscontinuousSteps != 0) {
 				return fmt.Errorf("per-clip audio timeline is not continuous")
 			}
 		}
 		if requireAudioContinuity && clip.AudioPresent && clip.AudioTimeline == nil {
 			return fmt.Errorf("missing per-clip audio sample evidence")
+		}
+	}
+	return nil
+}
+
+func timestampTrack(contract *TimestampContract, mediaType string) *TimestampContractTrack {
+	if contract == nil {
+		return nil
+	}
+	for i := range contract.Tracks {
+		if contract.Tracks[i].MediaType == mediaType {
+			return &contract.Tracks[i]
 		}
 	}
 	return nil

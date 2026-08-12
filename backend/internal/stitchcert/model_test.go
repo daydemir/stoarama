@@ -121,6 +121,8 @@ func TestValidateSeamsRequiresContinuousCaptureProvenance(t *testing.T) {
 		{ManifestClip: base[0], NativeSignatureSHA256: sig, StrictDecode: "passed"},
 		{ManifestClip: base[1], NativeSignatureSHA256: sig, StrictDecode: "passed"},
 	}
+	clips[0].RecomputedTimestampContract = &TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional", Tracks: []TimestampContractTrack{{MediaType: "video", TimeBaseNum: 1, TimeBaseDen: 30, FirstTimestamp: 27, LastTimestamp: 29, LastDuration: 1, UnitCount: 3}}}
+	clips[1].RecomputedTimestampContract = &TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional", Tracks: []TimestampContractTrack{{MediaType: "video", TimeBaseNum: 1, TimeBaseDen: 30, FirstTimestamp: 30, LastTimestamp: 32, LastDuration: 1, UnitCount: 3}}}
 	runs := []RunFact{{Ordinal: 1, FirstClipOrdinal: 1, LastClipOrdinal: 2, ClipCount: 2, NativeSignatureSHA256: sig, CaptureGeneration: "g", BoundaryReason: "window_start", ValidationStatus: "lossless_concat_decode_passed", SourceBytes: 2}}
 	frame := func(ts int64, hash string) SeamFrameEvidence {
 		return SeamFrameEvidence{BestEffortTimestamp: ts, DurationTimestamp: 1, TimeBaseNumerator: 1, TimeBaseDenominator: 30, PictureType: "P", DecodedSHA256: hash, PacketSHA256: hash}
@@ -129,7 +131,7 @@ func TestValidateSeamsRequiresContinuousCaptureProvenance(t *testing.T) {
 	hashB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	seam := SeamFact{
 		Ordinal: 1, PreviousClipID: 1, NextClipID: 2, CaptureGeneration: "g", PreviousSequence: 1, NextSequence: 2,
-		NativeSignatureSHA256: sig, TimelineBasis: "continuous_source_pts_v1", CaptureContract: "continuous-source-pts-v1",
+		NativeSignatureSHA256: sig, CaptureAttemptID: "attempt-1", TimelineBasis: "continuous_source_pts_v1", CaptureContract: "continuous-source-pts-v1",
 		PreviousFrames: []SeamFrameEvidence{frame(27, hashA), frame(28, hashA), frame(29, hashA)},
 		NextFrames:     []SeamFrameEvidence{frame(30, hashA), frame(31, hashB), frame(32, hashB)},
 		Confidence:     "high", Verdict: "exact", Reason: "frame_adjacency_proven",
@@ -193,6 +195,13 @@ func TestValidateAudioSeamsSeparatesAbsentAmbiguousAndExact(t *testing.T) {
 	if err := ValidateAudioSeams(clips, []AudioSeamFact{absent}, false); err != nil {
 		t.Fatal(err)
 	}
+	clips[0].NativeSignatureSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	clips[1].NativeSignatureSHA256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	boundary := AudioSeamFact{Ordinal: 1, PreviousClipID: 1, NextClipID: 2, Verdict: "not_applicable", Reason: "native_signature_change"}
+	if err := ValidateAudioSeams(clips, []AudioSeamFact{boundary}, false); err != nil {
+		t.Fatalf("audio-free objective run boundary was not preserved: %v", err)
+	}
+	clips[1].NativeSignatureSHA256 = clips[0].NativeSignatureSHA256
 	clips[0].AudioTimeline = &AudioTimelineEvidence{SampleRate: 48000, FirstSample: 0, EndSample: 48000, SampleCount: 48000}
 	clips[1].AudioTimeline = &AudioTimelineEvidence{SampleRate: 48000, FirstSample: 48000, EndSample: 96000, SampleCount: 48000}
 	clips[0].AudioPresent, clips[1].AudioPresent = true, true
@@ -213,6 +222,10 @@ func TestValidateAudioSeamsSeparatesAbsentAmbiguousAndExact(t *testing.T) {
 	if err := ValidateAudioSeams(clips, []AudioSeamFact{exact}, true); err != nil {
 		t.Fatal(err)
 	}
+	exact.PreviousSampleCount--
+	if err := ValidateAudioSeams(clips, []AudioSeamFact{exact}, true); err == nil {
+		t.Fatal("client-authored audio seam count diverged from per-clip sample evidence")
+	}
 }
 
 func TestValidateAxisStatusesAllowsTerminalHistoricalPartialOnly(t *testing.T) {
@@ -223,6 +236,25 @@ func TestValidateAxisStatusesAllowsTerminalHistoricalPartialOnly(t *testing.T) {
 	report.Status = "passed"
 	if err := ValidateAxisStatuses(report); err == nil {
 		t.Fatal("full pass accepted unknown frame/audio axes")
+	}
+	report = Report{Status: "unknown", NASByteDecodeStatus: "unknown", NativeRunConcatStatus: "unknown", WithinRunFrameAdjacencyStatus: "passed", WithinRunAudioContinuityStatus: "unknown", WindowContinuityStatus: "unknown"}
+	if err := ValidateAxisStatuses(report); err == nil {
+		t.Fatal("retryable UNKNOWN asserted a passing presentation axis")
+	}
+	report = Report{Status: "failed", NASByteDecodeStatus: "failed", NativeRunConcatStatus: "unknown", WithinRunFrameAdjacencyStatus: "unknown", WithinRunAudioContinuityStatus: "unknown", WindowContinuityStatus: "unknown"}
+	if err := ValidateAxisStatuses(report); err != nil {
+		t.Fatal(err)
+	}
+	report.NativeRunConcatStatus = "failed"
+	if err := ValidateAxisStatuses(report); err == nil {
+		t.Fatal("FAILED asserted two incompatible deterministic axes")
+	}
+	report = Report{Status: "failed", NASByteDecodeStatus: "failed", NativeRunConcatStatus: "unknown", WithinRunFrameAdjacencyStatus: "unknown", WithinRunAudioContinuityStatus: "unknown", WindowContinuityStatus: "unknown", Clips: []ClipFact{{StrictDecode: "failed"}}}
+	if err := ValidateDeterministicFailureEvidence(report, []string{"clip_decode_failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateDeterministicFailureEvidence(report, []string{"clip_decode_failed", "run_concat_failed"}); err == nil {
+		t.Fatal("FAILED claimed multiple defects after verification stopped at the primary failure")
 	}
 }
 
@@ -246,6 +278,10 @@ func TestWithinRunAdjacencyPassAllowsObjectivePartitionButNotSeamlessWindow(t *t
 		{ManifestClip: base[1], NativeSignatureSHA256: sigA, StrictDecode: "passed"},
 		{ManifestClip: base[2], NativeSignatureSHA256: sigB, StrictDecode: "passed"},
 	}
+	for i := range clips {
+		first := int64(27 + i*3)
+		clips[i].RecomputedTimestampContract = &TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional", Tracks: []TimestampContractTrack{{MediaType: "video", TimeBaseNum: 1, TimeBaseDen: 30, FirstTimestamp: first, LastTimestamp: first + 2, LastDuration: 1, UnitCount: 3}}}
+	}
 	runs := []RunFact{
 		{Ordinal: 1, FirstClipOrdinal: 1, LastClipOrdinal: 2, ClipCount: 2, NativeSignatureSHA256: sigA, CaptureGeneration: "g", CaptureAttemptID: "attempt", TimestampContract: "continuous-source-pts-v1", BoundaryReason: "window_start", ValidationStatus: "lossless_concat_decode_passed", SourceBytes: 2},
 		{Ordinal: 2, FirstClipOrdinal: 3, LastClipOrdinal: 3, ClipCount: 1, NativeSignatureSHA256: sigB, CaptureGeneration: "g", CaptureAttemptID: "attempt", TimestampContract: "continuous-source-pts-v1", BoundaryReason: "native_signature_change", ValidationStatus: "single_clip_decode_only", SourceBytes: 1},
@@ -254,7 +290,7 @@ func TestWithinRunAdjacencyPassAllowsObjectivePartitionButNotSeamlessWindow(t *t
 		return SeamFrameEvidence{BestEffortTimestamp: ts, DurationTimestamp: 1, TimeBaseNumerator: 1, TimeBaseDenominator: 30, PictureType: "P", DecodedSHA256: sigA, PacketSHA256: sigA}
 	}
 	seams := []SeamFact{
-		{Ordinal: 1, PreviousClipID: 1, NextClipID: 2, CaptureGeneration: "g", PreviousSequence: 1, NextSequence: 2, NativeSignatureSHA256: sigA, TimelineBasis: "continuous_source_pts_v1", CaptureContract: "continuous-source-pts-v1", PreviousFrames: []SeamFrameEvidence{frame(27), frame(28), frame(29)}, NextFrames: []SeamFrameEvidence{frame(30), frame(31), frame(32)}, Confidence: "high", Verdict: "exact", Reason: "frame_adjacency_proven"},
+		{Ordinal: 1, PreviousClipID: 1, NextClipID: 2, CaptureGeneration: "g", PreviousSequence: 1, NextSequence: 2, NativeSignatureSHA256: sigA, CaptureAttemptID: "attempt", TimelineBasis: "continuous_source_pts_v1", CaptureContract: "continuous-source-pts-v1", PreviousFrames: []SeamFrameEvidence{frame(27), frame(28), frame(29)}, NextFrames: []SeamFrameEvidence{frame(30), frame(31), frame(32)}, Confidence: "high", Verdict: "exact", Reason: "frame_adjacency_proven"},
 		{Ordinal: 2, PreviousClipID: 2, NextClipID: 3, PreviousSequence: 2, NextSequence: 3, Verdict: "not_applicable", Reason: "native_signature_change"},
 	}
 	if err := ValidateRuns(clips, runs); err != nil {
@@ -270,6 +306,82 @@ func TestWithinRunAdjacencyPassAllowsObjectivePartitionButNotSeamlessWindow(t *t
 	report.Status, report.WindowContinuityStatus = "passed", "passed"
 	if err := ValidateAxisStatuses(report); err == nil {
 		t.Fatal("multi-run proof was mislabeled as one seamless window")
+	}
+}
+
+func TestValidateClipAndSeamEvidenceCannotDivergeFromRecomputedContract(t *testing.T) {
+	start := time.Now().UTC().Truncate(time.Second)
+	sig := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	base := []ManifestClip{mc(1, start, start.Add(time.Second), "g", 1, 1), mc(2, start.Add(time.Second), start.Add(2*time.Second), "g", 2, 1)}
+	for i := range base {
+		base[i].CaptureAttemptID = "attempt"
+		base[i].TimestampContractVersion = "continuous-source-pts-v1"
+		base[i].TimestampContractStatus = "per_clip_probe_complete"
+		base[i].TimestampContractSHA256 = sig
+	}
+	makeClip := func(c ManifestClip, first int64) ClipFact {
+		contract := &TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional", Tracks: []TimestampContractTrack{{MediaType: "video", TimeBaseNum: 1, TimeBaseDen: 30, FirstTimestamp: first, LastTimestamp: first + 2, LastDuration: 1, UnitCount: 3}}}
+		return ClipFact{ManifestClip: c, NativeSignatureSHA256: sig, StrictDecode: "passed", RecomputedTimestampContract: contract,
+			VideoTimeline: &StreamTimelineEvidence{FrameCount: 3, FirstTimestamp: first, LastTimestamp: first + 2, LastDurationTimestamp: 1, TimeBaseNumerator: 1, TimeBaseDenominator: 30}}
+	}
+	clips := []ClipFact{makeClip(base[0], 27), makeClip(base[1], 30)}
+	if err := ValidateClipTimelines(clips, false, false); err != nil {
+		t.Fatal(err)
+	}
+	withAudioTrack := *clips[0].RecomputedTimestampContract
+	withAudioTrack.Tracks = append(append([]TimestampContractTrack(nil), withAudioTrack.Tracks...), TimestampContractTrack{
+		MediaType: "audio", TimeBaseNum: 1, TimeBaseDen: 48000, FirstTimestamp: 0,
+		LastTimestamp: 47999, LastDuration: 1, UnitCount: 48000, SampleRate: 48000, LastSampleCount: 1,
+	})
+	clips[0].RecomputedTimestampContract = &withAudioTrack
+	if err := ValidateClipTimelines(clips, false, false); err == nil {
+		t.Fatal("audio-bearing exact-byte contract was forged as audio-free")
+	}
+	clips[0].AudioPresent = true
+	clips[0].RecomputedTimestampContract = makeClip(base[0], 27).RecomputedTimestampContract
+	if err := ValidateClipTimelines(clips, false, false); err == nil {
+		t.Fatal("video-only exact-byte contract was forged as audio-bearing")
+	}
+	clips[0] = makeClip(base[0], 27)
+	clips[0].VideoTimeline.LastTimestamp = 28
+	if err := ValidateClipTimelines(clips, false, false); err == nil {
+		t.Fatal("client-authored video timeline diverged from exact-byte contract")
+	}
+	clips[0] = makeClip(base[0], 27)
+	frame := func(ts int64) SeamFrameEvidence {
+		return SeamFrameEvidence{BestEffortTimestamp: ts, DurationTimestamp: 1, TimeBaseNumerator: 1, TimeBaseDenominator: 30, PictureType: "P", DecodedSHA256: sig, PacketSHA256: sig}
+	}
+	runs := []RunFact{{Ordinal: 1, FirstClipOrdinal: 1, LastClipOrdinal: 2, ClipCount: 2, NativeSignatureSHA256: sig, CaptureGeneration: "g", CaptureAttemptID: "attempt", TimestampContract: "continuous-source-pts-v1", BoundaryReason: "window_start", ValidationStatus: "lossless_concat_decode_passed", SourceBytes: 2}}
+	seam := SeamFact{Ordinal: 1, PreviousClipID: 1, NextClipID: 2, CaptureGeneration: "g", PreviousSequence: 1, NextSequence: 2, NativeSignatureSHA256: sig, CaptureAttemptID: "attempt", TimelineBasis: "continuous_source_pts_v1", CaptureContract: "continuous-source-pts-v1", PreviousFrames: []SeamFrameEvidence{frame(27), frame(28), frame(29)}, NextFrames: []SeamFrameEvidence{frame(30), frame(31), frame(32)}, Confidence: "high", Verdict: "exact", Reason: "frame_adjacency_proven"}
+	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err != nil {
+		t.Fatal(err)
+	}
+	seam.PreviousFrames[2].BestEffortTimestamp = 26
+	seam.NextFrames[0].BestEffortTimestamp = 27
+	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err == nil {
+		t.Fatal("fabricated but internally adjacent edge escaped exact-byte contract binding")
+	}
+}
+
+func TestValidateSingleClipCannotBypassPresentationAxisProvenance(t *testing.T) {
+	start := time.Now().UTC().Truncate(time.Second)
+	historical := ClipFact{ManifestClip: mc(1, start, start.Add(time.Second), "g", 1, 1), StrictDecode: "passed"}
+	if err := ValidateClipTimelines([]ClipFact{historical}, true, false); err == nil {
+		t.Fatal("historical single clip falsely passed video presentation axis")
+	}
+	audio := historical
+	audio.AudioPresent = true
+	if err := ValidateClipTimelines([]ClipFact{audio}, false, true); err == nil {
+		t.Fatal("audio-present single clip falsely passed without sample evidence")
+	}
+	if err := ValidateAudioAxisStatus([]ClipFact{historical}, "not_present"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAudioAxisStatus([]ClipFact{audio}, "not_present"); err == nil {
+		t.Fatal("audio-present clip was mislabeled not_present")
+	}
+	if err := ValidateAudioAxisStatus([]ClipFact{historical}, "unknown"); err == nil {
+		t.Fatal("audio-free completed proof was mislabeled unknown")
 	}
 }
 
