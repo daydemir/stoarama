@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -351,22 +352,25 @@ func (c *Client) StartRecordingCanary(ctx context.Context, recordingID int64) (R
 	return out, nil
 }
 
+// CheckRecordingCanary confirms that this relay still owns a live reservation.
 func (c *Client) CheckRecordingCanary(ctx context.Context, recordingID int64, reservationID string) (RecordingCanarySpec, error) {
 	var out RecordingCanarySpec
 	if recordingID <= 0 || strings.TrimSpace(reservationID) == "" {
 		return out, fmt.Errorf("recording id and reservation id are required")
 	}
-	if err := c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/check", recordingID, strings.TrimSpace(reservationID)), map[string]any{}, &out); err != nil {
+	reservation := url.PathEscape(strings.TrimSpace(reservationID))
+	if err := c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/check", recordingID, reservation), map[string]any{}, &out); err != nil {
 		return RecordingCanarySpec{}, err
 	}
 	return out, nil
 }
 
+// FinishRecordingCanary releases this relay's reservation early.
 func (c *Client) FinishRecordingCanary(ctx context.Context, recordingID int64, reservationID string) error {
 	if recordingID <= 0 || strings.TrimSpace(reservationID) == "" {
 		return fmt.Errorf("recording id and reservation id are required")
 	}
-	return c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/finish", recordingID, strings.TrimSpace(reservationID)), map[string]any{}, nil)
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/finish", recordingID, url.PathEscape(strings.TrimSpace(reservationID))), map[string]any{}, nil)
 }
 
 func (c *Client) LeaseSurveyTargets(ctx context.Context, limit int) (SurveyLease, error) {

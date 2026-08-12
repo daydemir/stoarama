@@ -93,7 +93,7 @@ func TestBuildFFmpegSegmentArgsFixedFPS(t *testing.T) {
 func TestCaptureSegmentNoThumbnailUsesOnlyNativeCopy(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "args.log")
-	script := `printf '%s\n' "$*" >> ` + argsLog + `
+	script := `printf '%s\n' "$*" >> '` + argsLog + `'
 eval "out=\${$#}"
 printf 'native-media' > "$out"`
 	t.Setenv("FFMPEG_BIN", writeFakeFFmpeg(t, script))

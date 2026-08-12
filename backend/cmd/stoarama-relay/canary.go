@@ -144,6 +144,9 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 		return fmt.Errorf("canary stopped because production safety could not be confirmed: %s",
 			recordingworker.SanitizeDiagnosticError(observedSafetyErr))
 	}
+	if reservationCtx.Err() == context.DeadlineExceeded && !time.Now().Before(spec.SafeUntil) {
+		return fmt.Errorf("canary reservation expired before media validation completed")
+	}
 	if captureErr != nil {
 		return fmt.Errorf("canary capture failed: %s", recordingworker.SanitizeDiagnosticError(captureErr))
 	}
@@ -175,12 +178,22 @@ func configureCanaryCaptureRuntime() error {
 		return err
 	}
 	ytdlp := filepath.Join(bd, "yt-dlp")
-	os.Setenv("TZ", "UTC")
-	os.Setenv("YT_DLP_BIN", ytdlp)
+	if err := os.Setenv("TZ", "UTC"); err != nil {
+		return fmt.Errorf("set TZ: %w", err)
+	}
+	if err := os.Setenv("YT_DLP_BIN", ytdlp); err != nil {
+		return fmt.Errorf("set YT_DLP_BIN: %w", err)
+	}
 	configureYTDLPJSRuntime(bd, ytdlp)
-	os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
-	os.Unsetenv("YT_DLP_COOKIES_FILE")
-	os.Setenv("FFMPEG_BIN", relayFFmpegBin(bd))
+	if err := os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER"); err != nil {
+		return fmt.Errorf("unset YT_DLP_COOKIES_FROM_BROWSER: %w", err)
+	}
+	if err := os.Unsetenv("YT_DLP_COOKIES_FILE"); err != nil {
+		return fmt.Errorf("unset YT_DLP_COOKIES_FILE: %w", err)
+	}
+	if err := os.Setenv("FFMPEG_BIN", relayFFmpegBin(bd)); err != nil {
+		return fmt.Errorf("set FFMPEG_BIN: %w", err)
+	}
 	prependPath(bd)
 	return nil
 }

@@ -983,6 +983,13 @@ func ValidateSegmentFile(ctx context.Context, path string) error {
 // ValidateSegmentDecode reads the captured file through FFmpeg's strict decoder
 // into a null sink. It creates no output media and performs no re-encoding.
 func ValidateSegmentDecode(ctx context.Context, path string) error {
+	meta, err := probeSegment(ctx, path)
+	if err != nil {
+		return fmt.Errorf("ffprobe before strict decode: %w", err)
+	}
+	if strings.TrimSpace(meta.VideoCodec) == "" {
+		return fmt.Errorf("strict decode requires a video stream")
+	}
 	decodeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(decodeCtx, ffmpegBin(),

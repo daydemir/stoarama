@@ -53,7 +53,6 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	now := time.Now().UTC()
 	var spec recordingCanarySpec
 	var preferredGroupID, nodeGroupID *int64
 	err = tx.QueryRow(r.Context(), `
@@ -93,33 +92,33 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		SELECT EXISTS(
 		  SELECT 1 FROM recording_jobs j
 		  JOIN nodes owner ON j.lease_owner='node:'||owner.id::text
-		  WHERE j.status='leased' AND j.lease_expires_at>$2
+		  WHERE j.status='leased' AND j.lease_expires_at>now()
 		    AND owner.account_id=$1
-		    AND (($3::bigint IS NULL AND owner.id=$4)
-		         OR ($3::bigint IS NOT NULL AND owner.relay_group_id=$3))
+		    AND (($2::bigint IS NULL AND owner.id=$3)
+		         OR ($2::bigint IS NOT NULL AND owner.relay_group_id=$2))
 		) OR EXISTS(
 		  SELECT 1 FROM recording_jobs j
 		  JOIN recordings due_rec ON due_rec.id=j.recording_id
 		  WHERE j.status='pending'
-		    AND j.scheduled_for<=$2+make_interval(secs=>$5)
+		    AND j.scheduled_for<=now()+make_interval(secs=>$4)
 		    AND due_rec.account_id=$1 AND due_rec.status='active' AND due_rec.capture_via='relay'
 		    AND (due_rec.preferred_relay_group_id IS NULL
-		         OR due_rec.preferred_relay_group_id IS NOT DISTINCT FROM $3::bigint)
+		         OR due_rec.preferred_relay_group_id IS NOT DISTINCT FROM $2::bigint)
 		) OR EXISTS(
 		  SELECT 1 FROM recording_canary_reservations active_canary
 		  JOIN nodes canary_node ON canary_node.id=active_canary.node_id
-		  WHERE active_canary.expires_at>$2
+		  WHERE active_canary.expires_at>now()
 		    AND canary_node.account_id=$1
-		    AND (($3::bigint IS NULL AND canary_node.id=$4)
-		         OR ($3::bigint IS NOT NULL AND canary_node.relay_group_id=$3))
+		    AND (($2::bigint IS NULL AND canary_node.id=$3)
+		         OR ($2::bigint IS NOT NULL AND canary_node.relay_group_id=$2))
 		) OR EXISTS(
 		  SELECT 1 FROM nodes active_node
 		  WHERE active_node.account_id=$1
 		    AND active_node.node_type='relay'
 		    AND active_node.status='active'
-		    AND active_node.last_heartbeat_at>$2-interval '120 seconds'
-		    AND (($3::bigint IS NULL AND active_node.id=$4)
-		         OR ($3::bigint IS NOT NULL AND active_node.relay_group_id=$3))
+		    AND active_node.last_heartbeat_at>now()-interval '120 seconds'
+		    AND (($2::bigint IS NULL AND active_node.id=$3)
+		         OR ($2::bigint IS NOT NULL AND active_node.relay_group_id=$2))
 		    AND CASE
 		          WHEN NOT (active_node.capabilities_jsonb ? 'active_jobs') THEN 0
 		          WHEN COALESCE(active_node.capabilities_jsonb->>'active_jobs', '') ~ '^[0-9]+$'
@@ -127,7 +126,7 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		          ELSE 1
 		        END>0
 		)
-	`, principal.AccountID, now, nodeGroupID, principal.NodeID, int(recordingCanaryJobGuard/time.Second)).Scan(&groupBusy); err != nil {
+	`, principal.AccountID, nodeGroupID, principal.NodeID, int(recordingCanaryJobGuard/time.Second)).Scan(&groupBusy); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "check relay canary capacity")
 		return
 	}
@@ -135,10 +134,10 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		SELECT EXISTS(
 		  SELECT 1 FROM recording_jobs
 		  WHERE recording_id=$1
-		    AND ((status='leased' AND lease_expires_at>$2)
-		         OR (status='pending' AND scheduled_for<=$2+make_interval(secs=>$3)))
+		    AND ((status='leased' AND lease_expires_at>now())
+		         OR (status='pending' AND scheduled_for<=now()+make_interval(secs=>$2)))
 		)
-	`, recordingID, now, int(recordingCanaryJobGuard/time.Second)).Scan(&targetBusy); err != nil {
+	`, recordingID, int(recordingCanaryJobGuard/time.Second)).Scan(&targetBusy); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "check recording canary safety")
 		return
 	}
@@ -147,20 +146,25 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	if _, err := tx.Exec(r.Context(), `DELETE FROM recording_canary_reservations WHERE expires_at<=now()`); err != nil {
+	if _, err := tx.Exec(r.Context(), `
+		DELETE FROM recording_canary_reservations canary
+		USING nodes canary_node
+		WHERE canary_node.id=canary.node_id
+		  AND canary_node.account_id=$1
+		  AND canary.expires_at<=now()
+	`, principal.AccountID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "clean expired recording canary reservations")
 		return
 	}
 	var reservationID uuid.UUID
-	spec.SafeUntil = now.Add(recordingCanaryReservationTTL)
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO recording_canary_reservations (recording_id, node_id, expires_at)
-		SELECT $1, $2, $3
+		SELECT $1, $2, now()+make_interval(secs=>$3)
 		WHERE NOT EXISTS (
 		  SELECT 1 FROM recording_canary_reservations
 		  WHERE recording_id=$1 AND expires_at>now())
-		RETURNING id
-	`, recordingID, principal.NodeID, spec.SafeUntil).Scan(&reservationID)
+		RETURNING id, expires_at
+	`, recordingID, principal.NodeID, int(recordingCanaryReservationTTL/time.Second)).Scan(&reservationID, &spec.SafeUntil)
 	if err == pgx.ErrNoRows {
 		util.WriteError(w, http.StatusConflict, "recording already has an active canary")
 		return

@@ -20,6 +20,25 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
+const testRelayNodesTableDDL = `CREATE TABLE nodes (
+	id BIGINT PRIMARY KEY,
+	account_id BIGINT NOT NULL,
+	node_type TEXT NOT NULL,
+	status TEXT NOT NULL,
+	last_heartbeat_at TIMESTAMPTZ,
+	relay_max_streams INTEGER NOT NULL,
+	relay_group_id BIGINT,
+	capabilities_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb
+)`
+
+const testRecordingCanaryReservationsTableDDL = `CREATE TABLE recording_canary_reservations (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	recording_id BIGINT NOT NULL,
+	node_id BIGINT NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)`
+
 func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
 	for _, want := range []string{"node_id = $2", "state IN ('provisioning', 'active')", "FOR UPDATE"} {
 		if !strings.Contains(cloudRecorderLockSQL, want) {
@@ -746,16 +765,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			recording_id BIGINT PRIMARY KEY,
 			observed_bandwidth_bps BIGINT NOT NULL
 		)`,
-		`CREATE TABLE nodes (
-			id BIGINT PRIMARY KEY,
-			account_id BIGINT NOT NULL,
-			node_type TEXT NOT NULL,
-			status TEXT NOT NULL,
-			last_heartbeat_at TIMESTAMPTZ,
-			relay_max_streams INTEGER NOT NULL,
-			relay_group_id BIGINT,
-			capabilities_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb
-		)`,
+		testRelayNodesTableDDL,
 		`CREATE TABLE streams (
 			id BIGSERIAL PRIMARY KEY,
 			provider TEXT NOT NULL DEFAULT '',
@@ -806,13 +816,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			recording_job_id BIGINT NOT NULL,
 			capture_lease_token UUID
 		)`,
-		`CREATE TABLE recording_canary_reservations (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-			recording_id BIGINT NOT NULL,
-			node_id BIGINT NOT NULL,
-			expires_at TIMESTAMPTZ NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`,
+		testRecordingCanaryReservationsTableDDL,
 		`CREATE TABLE storage_destinations (
 			id BIGINT PRIMARY KEY,
 			account_id BIGINT NOT NULL,

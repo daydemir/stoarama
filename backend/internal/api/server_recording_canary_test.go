@@ -111,6 +111,18 @@ func TestRecordingCanarySpecRefusesProductionAndAllowsIdleRelay(t *testing.T) {
 	if reservations != 0 {
 		t.Fatalf("production lease left %d active canary reservation(s)", reservations)
 	}
+	checkReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	checkRoute := chi.NewRouteContext()
+	checkRoute.URLParams.Add("id", "11")
+	checkRoute.URLParams.Add("reservationId", spec.ReservationID)
+	checkReq = checkReq.WithContext(context.WithValue(context.WithValue(checkReq.Context(), chi.RouteCtxKey, checkRoute), nodePrincipalContextKey, nodePrincipal{
+		NodeID: 7, AccountID: 42, NodeType: nodeTypeRelay,
+	}))
+	checkRec := httptest.NewRecorder()
+	s.handleNodeRecordingCanaryCheck(checkRec, checkReq)
+	if checkRec.Code != http.StatusConflict {
+		t.Fatalf("preempted reservation check status=%d body=%s", checkRec.Code, checkRec.Body.String())
+	}
 }
 
 func TestRecordingCanaryRefusesBusyHeartbeatAndSecondGroupReservation(t *testing.T) {
@@ -186,18 +198,78 @@ func TestRecordingCanarySpecTenantAndNodeTypeWalls(t *testing.T) {
 	}
 
 	s := &Server{pool: pool}
-	for _, principal := range []nodePrincipal{
-		{NodeID: 8, AccountID: 43, NodeType: nodeTypeRelay},
-		{NodeID: 7, AccountID: 42, NodeType: nodeTypeLocalRecorder},
+	for _, tc := range []struct {
+		principal nodePrincipal
+		want      int
+	}{
+		{principal: nodePrincipal{NodeID: 8, AccountID: 43, NodeType: nodeTypeRelay}, want: http.StatusNotFound},
+		{principal: nodePrincipal{NodeID: 7, AccountID: 42, NodeType: nodeTypeLocalRecorder}, want: http.StatusForbidden},
 	} {
 		req := httptest.NewRequest(http.MethodPost, "/", nil)
 		rctx := chi.NewRouteContext()
 		rctx.URLParams.Add("id", "11")
-		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, rctx), nodePrincipalContextKey, principal))
+		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, rctx), nodePrincipalContextKey, tc.principal))
 		rec := httptest.NewRecorder()
 		s.handleNodeRecordingCanaryStart(rec, req)
-		if rec.Code != http.StatusNotFound && rec.Code != http.StatusForbidden {
-			t.Fatalf("principal=%+v status=%d body=%s", principal, rec.Code, rec.Body.String())
+		if rec.Code != tc.want {
+			t.Fatalf("principal=%+v status=%d want=%d body=%s", tc.principal, rec.Code, tc.want, rec.Body.String())
 		}
+	}
+}
+
+func TestRecordingCanaryCheckAndFinishAreOwnerBound(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	var firstID, secondID string
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id) VALUES (42);
+		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES (7, 42, 'relay', 'active', now(), 2), (8, 42, 'relay', 'active', now(), 2);
+		INSERT INTO recordings
+			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
+		VALUES (11, 42, 7, 'canary', 'https://example.test/live.m3u8', 'active', now()-interval '1 hour', 'relay')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_canary_reservations (recording_id, node_id, expires_at)
+		VALUES (11, 7, now()+interval '3 minutes') RETURNING id::text
+	`).Scan(&firstID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	call := func(handler http.HandlerFunc, nodeID int64, reservationID string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "11")
+		rctx.URLParams.Add("reservationId", reservationID)
+		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, rctx), nodePrincipalContextKey, nodePrincipal{
+			NodeID: nodeID, AccountID: 42, NodeType: nodeTypeRelay,
+		}))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		return rec
+	}
+	if rec := call(s.handleNodeRecordingCanaryCheck, 8, firstID); rec.Code != http.StatusConflict {
+		t.Fatalf("other-node check status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_canary_reservations WHERE id=$1`, firstID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(s.handleNodeRecordingCanaryCheck, 7, firstID); rec.Code != http.StatusConflict {
+		t.Fatalf("deleted check status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_canary_reservations (recording_id, node_id, expires_at)
+		VALUES (11, 7, now()+interval '3 minutes') RETURNING id::text
+	`).Scan(&secondID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(s.handleNodeRecordingCanaryFinish, 7, secondID); rec.Code != http.StatusOK {
+		t.Fatalf("finish status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := call(s.handleNodeRecordingCanaryCheck, 7, secondID); rec.Code != http.StatusConflict {
+		t.Fatalf("post-finish check status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

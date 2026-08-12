@@ -102,7 +102,9 @@ func TestRecordingCanaryReservationUsesNodeAuthAndExactRecording(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.RecordingID != 445 || spec.NodeID != 150 || spec.StreamID != 17342 {
+	if spec.RecordingID != 445 || spec.NodeID != 150 || spec.StreamID != 17342 ||
+		spec.ReservationID != "123e4567-e89b-12d3-a456-426614174000" ||
+		!spec.SafeUntil.Equal(time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)) {
 		t.Fatalf("unexpected canary spec: %+v", spec)
 	}
 }
