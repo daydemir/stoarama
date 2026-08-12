@@ -98,7 +98,23 @@ func loadHealthDigestRecordings(ctx context.Context, pool *pgxpool.Pool) ([]dige
 	if len(liveSignals) == 0 {
 		return nil, errors.New("live recording health signal registry is empty")
 	}
-	rows, err := pool.Query(ctx, `
+	rows, err := pool.Query(ctx, healthDigestRecordingsSQL, liveSignals)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []digestRecording
+	for rows.Next() {
+		var item digestRecording
+		if err := rows.Scan(&item.ID, &item.StreamID, &item.Name, &item.Scheduled, &item.Bucket, &item.CurrentCause, &item.HistoryBucket, &item.HistoryNote); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+const healthDigestRecordingsSQL = `
 		SELECT r.id,COALESCE(r.stream_id,0),r.name,
 		       live.id IS NOT NULL,
 		       CASE
@@ -125,7 +141,7 @@ func loadHealthDigestRecordings(ctx context.Context, pool *pgxpool.Pool) ([]dige
 		         ELSE 'failing'
 		       END,
 		       CASE WHEN wh.recording_id IS NULL OR wh.calculated_at < now()-interval '2 hours' THEN 'latest completed window not freshly measured'
-		            ELSE format('latest completed %.2f%%; largest gap %ss; >5m gaps %s; overlaps %s',wh.coverage_pct,round(wh.largest_gap_seconds),COALESCE(wh.gap_over_5m_count::text,'unknown'),wh.overlap_count) END
+		            ELSE format('latest completed %s%%; largest gap %ss; >5m gaps %s; overlaps %s',to_char(wh.coverage_pct,'FM990.00'),round(wh.largest_gap_seconds),COALESCE(wh.gap_over_5m_count::text,'unknown'),wh.overlap_count) END
 		FROM recordings r
 		LEFT JOIN LATERAL (SELECT j.id,j.status FROM recording_jobs j WHERE j.recording_id=r.id AND j.kind='continuous_window' AND j.fire_at<=now() AND j.window_end_at>now() ORDER BY j.id DESC LIMIT 1) live ON true
 		LEFT JOIN LATERAL (SELECT max(c.clip_end_at) clip_end_at,max(c.created_at) created_at FROM recording_clips c WHERE c.recording_job_id=live.id) latest ON true
@@ -137,21 +153,7 @@ func loadHealthDigestRecordings(ctx context.Context, pool *pgxpool.Pool) ([]dige
 		  ORDER BY a.last_detected_at DESC NULLS LAST LIMIT 1) inc ON true
 		LEFT JOIN LATERAL (SELECT h.* FROM recording_window_health h WHERE h.recording_id=r.id ORDER BY h.window_end_at DESC LIMIT 1) wh ON true
 		WHERE r.status='active' AND r.start_at<=now() AND (r.end_at IS NULL OR now()<r.end_at)
-		ORDER BY r.id`, liveSignals)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []digestRecording
-	for rows.Next() {
-		var item digestRecording
-		if err := rows.Scan(&item.ID, &item.StreamID, &item.Name, &item.Scheduled, &item.Bucket, &item.CurrentCause, &item.HistoryBucket, &item.HistoryNote); err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
-}
+		ORDER BY r.id`
 
 func claimHealthDigestDelivery(ctx context.Context, pool *pgxpool.Pool, bucket time.Time, recipient string) (bool, error) {
 	var claimed bool
