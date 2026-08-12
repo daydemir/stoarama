@@ -90,6 +90,37 @@ func TestBuildFFmpegSegmentArgsFixedFPS(t *testing.T) {
 	}
 }
 
+func TestCaptureSegmentNoThumbnailUsesOnlyNativeCopy(t *testing.T) {
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "args.log")
+	script := `printf '%s\n' "$*" >> '` + argsLog + `'
+eval "out=\${$#}"
+printf 'native-media' > "$out"`
+	t.Setenv("FFMPEG_BIN", writeFakeFFmpeg(t, script))
+	t.Setenv("FFPROBE_BIN", filepath.Join(dir, "missing-ffprobe"))
+	seg, err := CaptureSegmentInDirWithHeadersNoThumbnail(context.Background(), "https://example.com/live.m3u8", time.Second, "", dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CleanupSegment(seg)
+	logged, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(logged)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("ffmpeg invocations=%d want 1; thumbnail extraction ran: %q", len(lines), logged)
+	}
+	if !strings.Contains(lines[0], "-c copy") {
+		t.Fatalf("native copy missing: %s", lines[0])
+	}
+	for _, forbidden := range []string{"libx264", "-vf", "thumbnail"} {
+		if strings.Contains(lines[0], forbidden) {
+			t.Fatalf("no-thumbnail canary encoded with %q: %s", forbidden, lines[0])
+		}
+	}
+}
+
 // writeFakeFFmpeg writes a tiny executable shell stub to a temp dir and returns
 // its path, for driving ProbeReachable's failure handling without real ffmpeg.
 func writeFakeFFmpeg(t *testing.T, script string) string {

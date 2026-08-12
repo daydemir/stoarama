@@ -81,6 +81,34 @@ func TestLeaseAdvertisesGenerationSupport(t *testing.T) {
 	}
 }
 
+func TestRecordingCanaryReservationUsesNodeAuthAndExactRecording(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/node/recordings/445/canary-reservations" {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer node-token" {
+			t.Errorf("authorization=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"reservation_id":"123e4567-e89b-12d3-a456-426614174000","recording_id":445,"node_id":150,"stream_id":17342,"provider":"YOUTUBE","source_url":"https://example.test/watch","safe_until":"2026-08-12T12:00:00Z"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "node-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := client.StartRecordingCanary(context.Background(), 445)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.RecordingID != 445 || spec.NodeID != 150 || spec.StreamID != 17342 ||
+		spec.ReservationID != "123e4567-e89b-12d3-a456-426614174000" ||
+		!spec.SafeUntil.Equal(time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("unexpected canary spec: %+v", spec)
+	}
+}
+
 func TestUploadUsesLongerTimeoutThanAPIRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)

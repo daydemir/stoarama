@@ -70,6 +70,12 @@ func main() {
 		if err := runSelfUpdate(args); err != nil {
 			fatal(err)
 		}
+	case "canary":
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := runRecordingCanary(ctx, args); err != nil {
+			fatal(err)
+		}
 	case "record-exit":
 		if err := recordSystemdExit(args); err != nil {
 			fatal(err)
@@ -93,6 +99,7 @@ func usage() {
 		"  link-youtube                                          [experimental] export Chrome cookies for private/members YouTube; needs STOARAMA_RELAY_YT_COOKIES=1 + a bundled JS runtime",
 		"  self-update [--api-url URL] [--manifest NAME]          update from a release manifest",
 		"  self-update --rollback                                 restore the previous relay binary",
+		"  canary --recording-id ID                               run a 15s local native capture without recording or upload",
 		"  record-exit                                            persist systemd stop result (service helper)",
 		"  version                                               print the relay version",
 		"",

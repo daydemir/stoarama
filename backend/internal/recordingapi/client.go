@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -117,6 +118,20 @@ type RecordingJob struct {
 	// continuous window's close instant (zero/nil for a clip job).
 	Kind        string     `json:"kind"`
 	WindowEndAt *time.Time `json:"window_end_at"`
+}
+
+// RecordingCanarySpec is the canonical, account-scoped source returned to an
+// authenticated relay for a short local canary. Fetching it never leases or
+// changes production recording state.
+type RecordingCanarySpec struct {
+	ReservationID string    `json:"reservation_id"`
+	RecordingID   int64     `json:"recording_id"`
+	NodeID        int64     `json:"node_id"`
+	StreamID      int64     `json:"stream_id"`
+	Provider      string    `json:"provider"`
+	SourceURL     string    `json:"source_url"`
+	SourcePageURL string    `json:"source_page_url,omitempty"`
+	SafeUntil     time.Time `json:"safe_until"`
 }
 
 type SurrenderReason string
@@ -322,6 +337,40 @@ func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any)
 		return &apihttp.StatusError{Label: "node heartbeat", Code: status, Body: strings.TrimSpace(string(body))}
 	}
 	return nil
+}
+
+// StartRecordingCanary creates a short metadata-only reservation honored by
+// the production lease query, then returns the canonical source.
+func (c *Client) StartRecordingCanary(ctx context.Context, recordingID int64) (RecordingCanarySpec, error) {
+	var out RecordingCanarySpec
+	if recordingID <= 0 {
+		return out, fmt.Errorf("recording id must be positive")
+	}
+	if err := c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations", recordingID), map[string]any{}, &out); err != nil {
+		return RecordingCanarySpec{}, err
+	}
+	return out, nil
+}
+
+// CheckRecordingCanary confirms that this relay still owns a live reservation.
+func (c *Client) CheckRecordingCanary(ctx context.Context, recordingID int64, reservationID string) (RecordingCanarySpec, error) {
+	var out RecordingCanarySpec
+	if recordingID <= 0 || strings.TrimSpace(reservationID) == "" {
+		return out, fmt.Errorf("recording id and reservation id are required")
+	}
+	reservation := url.PathEscape(strings.TrimSpace(reservationID))
+	if err := c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/check", recordingID, reservation), map[string]any{}, &out); err != nil {
+		return RecordingCanarySpec{}, err
+	}
+	return out, nil
+}
+
+// FinishRecordingCanary releases this relay's reservation early.
+func (c *Client) FinishRecordingCanary(ctx context.Context, recordingID int64, reservationID string) error {
+	if recordingID <= 0 || strings.TrimSpace(reservationID) == "" {
+		return fmt.Errorf("recording id and reservation id are required")
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/finish", recordingID, url.PathEscape(strings.TrimSpace(reservationID))), map[string]any{}, nil)
 }
 
 func (c *Client) LeaseSurveyTargets(ctx context.Context, limit int) (SurveyLease, error) {

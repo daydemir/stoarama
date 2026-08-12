@@ -268,6 +268,21 @@ const relayLeaseSQL = `
 	  ORDER BY j.scheduled_for ASC, j.id ASC
 	  LIMIT 1
 	  FOR UPDATE SKIP LOCKED
+	), cleared_canaries AS (
+	  -- Production always outranks a diagnostic canary. The surrounding
+	  -- account/node/group locks serialize this with reservation creation; once a
+	  -- real job is selected, invalidate the failure-domain reservation. The
+	  -- canary polls this state and cancels promptly; a short bounded overlap is
+	  -- possible while that cancellation propagates.
+	  DELETE FROM recording_canary_reservations canary
+	  USING cte, nodes current_node, nodes canary_node
+	  WHERE current_node.id=$1
+	    AND canary_node.id=canary.node_id
+	    AND canary.expires_at>now()
+	    AND canary_node.account_id=current_node.account_id
+	    AND ((current_node.relay_group_id IS NULL AND canary_node.id=current_node.id)
+	         OR (current_node.relay_group_id IS NOT NULL AND canary_node.relay_group_id=current_node.relay_group_id))
+	  RETURNING canary.id
 	)
 	UPDATE recording_jobs j
 	SET status = 'leased',
