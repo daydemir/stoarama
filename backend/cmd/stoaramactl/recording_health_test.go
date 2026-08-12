@@ -490,6 +490,30 @@ func TestMeasureStitchWindowCoverageThresholdAndAccumulatedTinyGaps(t *testing.T
 	}
 }
 
+func TestMeasureStitchWindowQualificationGapThresholdsIncludeEdges(t *testing.T) {
+	open := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	close := open.Add(20 * time.Minute)
+	clips := [][2]time.Time{
+		// Leading edge is exactly 30s and therefore does not count for the
+		// strict >30s threshold.
+		{open.Add(30 * time.Second), open.Add(2 * time.Minute)},
+		// Internal 31s gap counts only for >30s.
+		{open.Add(2*time.Minute + 31*time.Second), open.Add(8 * time.Minute)},
+		// Internal gap exactly five minutes counts for >30s, not strict >5m.
+		{open.Add(13 * time.Minute), open.Add(14 * time.Minute)},
+		// Trailing six-minute edge counts for both thresholds.
+	}
+	m := measureStitchWindow(open, close, clips)
+	if m.gapsOver30s != 3 || m.gapsOver5m != 1 || m.maxGap != 6*time.Minute {
+		t.Fatalf("qualification gaps: %+v", m)
+	}
+
+	empty := measureStitchWindow(open, close, nil)
+	if empty.gapsOver30s != 1 || empty.gapsOver5m != 1 || empty.maxGap != 20*time.Minute {
+		t.Fatalf("empty qualification gap: %+v", empty)
+	}
+}
+
 func TestVerifyStoredClipSHA(t *testing.T) {
 	sum := sha256.Sum256([]byte("stored clip"))
 	if err := verifyStoredClipSHA(sum[:], fmt.Sprintf("%x", sum[:])); err != nil {

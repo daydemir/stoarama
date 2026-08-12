@@ -8,6 +8,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const recordingWindowMetricVersion = 2
+
 type healthClipLayout struct {
 	videoCodec string
 	audioCodec string
@@ -39,7 +41,7 @@ func materializeRecordingWindowHealth(ctx context.Context, pool *pgxpool.Pool, n
 		  LEFT JOIN recording_window_health h ON h.recording_id=j.recording_id AND h.job_id=j.id
 		  WHERE j.kind='continuous_window' AND j.window_end_at<=$1
 		    AND j.window_end_at>$1::timestamptz-interval '48 hours'
-		    AND (h.job_id IS NULL OR EXISTS (
+		    AND (h.job_id IS NULL OR h.metric_version IS DISTINCT FROM $2 OR EXISTS (
 		      SELECT 1 FROM recording_clips late
 		      WHERE late.recording_id=j.recording_id AND late.clip_end_at>j.fire_at
 		        AND late.clip_start_at<j.window_end_at AND late.created_at>h.calculated_at
@@ -49,7 +51,7 @@ func materializeRecordingWindowHealth(ctx context.Context, pool *pgxpool.Pool, n
 		  FROM recording_jobs j
 		  LEFT JOIN recording_window_health h ON h.recording_id=j.recording_id AND h.job_id=j.id
 		  WHERE j.kind='continuous_window' AND j.window_end_at<=$1::timestamptz-interval '48 hours'
-		    AND h.job_id IS NULL
+		    AND (h.job_id IS NULL OR h.metric_version IS DISTINCT FROM $2)
 		  ORDER BY j.window_end_at DESC,j.id DESC
 		  LIMIT 32
 		), candidate_jobs AS (
@@ -64,7 +66,7 @@ func materializeRecordingWindowHealth(ctx context.Context, pool *pgxpool.Pool, n
 		LEFT JOIN recording_clips c ON c.recording_id=j.recording_id
 		  AND c.clip_end_at>j.fire_at AND c.clip_start_at<j.window_end_at
 		ORDER BY j.recording_id,j.id,c.clip_start_at,c.id
-	`, now.UTC())
+	`, now.UTC(), recordingWindowMetricVersion)
 	if err != nil {
 		return fmt.Errorf("query recording windows for health materialization: %w", err)
 	}
@@ -88,20 +90,24 @@ func materializeRecordingWindowHealth(ctx context.Context, pool *pgxpool.Pool, n
 			INSERT INTO recording_window_health (
 			  recording_id,job_id,window_start_at,window_end_at,expected_seconds,
 			  covered_seconds,coverage_pct,largest_gap_seconds,gap_count,
-			  overlap_count,overlap_seconds,longest_run_seconds,layout_change_count,clip_count,calculated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			  gap_over_30s_count,gap_over_5m_count,overlap_count,overlap_seconds,
+			  longest_run_seconds,layout_change_count,clip_count,metric_version,calculated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 			ON CONFLICT (recording_id,job_id) DO UPDATE SET
 			  window_start_at=EXCLUDED.window_start_at,window_end_at=EXCLUDED.window_end_at,
 			  expected_seconds=EXCLUDED.expected_seconds,covered_seconds=EXCLUDED.covered_seconds,
 			  coverage_pct=EXCLUDED.coverage_pct,largest_gap_seconds=EXCLUDED.largest_gap_seconds,
 			  gap_count=EXCLUDED.gap_count,overlap_count=EXCLUDED.overlap_count,
+			  gap_over_30s_count=EXCLUDED.gap_over_30s_count,gap_over_5m_count=EXCLUDED.gap_over_5m_count,
 			  overlap_seconds=EXCLUDED.overlap_seconds,longest_run_seconds=EXCLUDED.longest_run_seconds,
 			  layout_change_count=EXCLUDED.layout_change_count,clip_count=EXCLUDED.clip_count,
+			  metric_version=EXCLUDED.metric_version,
 			  calculated_at=EXCLUDED.calculated_at
 		`, current.recordingID, current.jobID, current.start, current.end,
 			int64(current.end.Sub(current.start)/time.Second), metrics.covered.Seconds(),
-			metrics.coveragePct, metrics.maxGap.Seconds(), metrics.gapClips, metrics.overlapClips,
-			metrics.overlapSeconds, metrics.longestRun.Seconds(), current.layoutChanges, current.clipCount, now.UTC())
+			metrics.coveragePct, metrics.maxGap.Seconds(), metrics.gapClips, metrics.gapsOver30s,
+			metrics.gapsOver5m, metrics.overlapClips, metrics.overlapSeconds, metrics.longestRun.Seconds(),
+			current.layoutChanges, current.clipCount, recordingWindowMetricVersion, now.UTC())
 		return err
 	}
 

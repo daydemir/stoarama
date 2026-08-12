@@ -46,9 +46,9 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 		CREATE TABLE recording_window_health (
 		  recording_id BIGINT NOT NULL,job_id BIGINT NOT NULL,window_start_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ NOT NULL,
 		  expected_seconds BIGINT NOT NULL,covered_seconds DOUBLE PRECISION NOT NULL,coverage_pct DOUBLE PRECISION NOT NULL,
-		  largest_gap_seconds DOUBLE PRECISION NOT NULL,gap_count INTEGER NOT NULL,overlap_count INTEGER NOT NULL,
+		  largest_gap_seconds DOUBLE PRECISION NOT NULL,gap_count INTEGER NOT NULL,gap_over_30s_count INTEGER,gap_over_5m_count INTEGER,overlap_count INTEGER NOT NULL,
 		  overlap_seconds DOUBLE PRECISION NOT NULL,longest_run_seconds DOUBLE PRECISION NOT NULL,layout_change_count INTEGER NOT NULL,
-		  clip_count INTEGER NOT NULL,calculated_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(recording_id,job_id));
+		  clip_count INTEGER NOT NULL,metric_version INTEGER,calculated_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(recording_id,job_id));
 		CREATE TABLE recording_health_summaries (
 		  recording_id BIGINT PRIMARY KEY,recent_expected_seconds BIGINT NOT NULL,recent_covered_seconds DOUBLE PRECISION NOT NULL,recent_coverage_pct DOUBLE PRECISION,
 		  recent_largest_gap_seconds DOUBLE PRECISION NOT NULL,recent_gap_count BIGINT NOT NULL,recent_overlap_count BIGINT NOT NULL,recent_overlap_seconds DOUBLE PRECISION NOT NULL,
@@ -78,12 +78,13 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 		t.Fatal(err)
 	}
 	var coverage, largestGap float64
-	var gaps, overlaps, layouts, clips int
-	if err := pool.QueryRow(ctx, `SELECT coverage_pct,largest_gap_seconds,gap_count,overlap_count,layout_change_count,clip_count FROM recording_window_health WHERE recording_id=402`).Scan(&coverage, &largestGap, &gaps, &overlaps, &layouts, &clips); err != nil {
+	var gaps, gapsOver30s, gapsOver5m, overlaps, layouts, clips int
+	var metricVersion int
+	if err := pool.QueryRow(ctx, `SELECT coverage_pct,largest_gap_seconds,gap_count,gap_over_30s_count,gap_over_5m_count,overlap_count,layout_change_count,clip_count,metric_version FROM recording_window_health WHERE recording_id=402`).Scan(&coverage, &largestGap, &gaps, &gapsOver30s, &gapsOver5m, &overlaps, &layouts, &clips, &metricVersion); err != nil {
 		t.Fatal(err)
 	}
-	if coverage < 83.32 || coverage > 83.34 || largestGap != 600 || gaps != 1 || overlaps != 0 || layouts != 1 || clips != 2 {
-		t.Fatalf("window coverage=%f gap=%f gaps=%d overlaps=%d layouts=%d clips=%d", coverage, largestGap, gaps, overlaps, layouts, clips)
+	if coverage < 83.32 || coverage > 83.34 || largestGap != 600 || gaps != 1 || gapsOver30s != 1 || gapsOver5m != 1 || overlaps != 0 || layouts != 1 || clips != 2 || metricVersion != recordingWindowMetricVersion {
+		t.Fatalf("window coverage=%f gap=%f gaps=%d >30s=%d >5m=%d overlaps=%d layouts=%d clips=%d", coverage, largestGap, gaps, gapsOver30s, gapsOver5m, overlaps, layouts, clips)
 	}
 	var recentCoverage, lifetimeCoverage float64
 	var recentWindows, lifetimeWindows, expectedWindows int

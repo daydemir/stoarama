@@ -566,7 +566,13 @@ type stitchWindowMetrics struct {
 	overlapSeconds float64
 	maxGap         time.Duration
 	gapClips       int
-	longestRun     time.Duration
+	// Threshold counts use the exact uncovered UNION intervals, including the
+	// leading and trailing window edges. They intentionally do not reuse
+	// gapClips: that operational counter ignores edge gaps and joins seams up to
+	// one second, while qualification grades require strict >30s and >5m facts.
+	gapsOver30s int
+	gapsOver5m  int
+	longestRun  time.Duration
 }
 
 // detectCompletedWindowStitchHealth scores the most recently completed window
@@ -766,12 +772,15 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 	m := stitchWindowMetrics{}
 	if len(intervals) == 0 && close.After(open) {
 		m.maxGap = close.Sub(open)
+		m.countQualificationGap(m.maxGap)
 	}
 	var covered time.Duration
 	var unionStart, unionEnd time.Time
 	var runStart, runEnd time.Time
 	if len(intervals) > 0 {
-		m.maxGap = intervals[0][0].Sub(open)
+		leading := intervals[0][0].Sub(open)
+		m.maxGap = leading
+		m.countQualificationGap(leading)
 	}
 	for _, iv := range intervals {
 		if unionEnd.IsZero() {
@@ -795,7 +804,9 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 			}
 		} else {
 			covered += unionEnd.Sub(unionStart)
-			if gap := iv[0].Sub(unionEnd); gap > m.maxGap {
+			gap := iv[0].Sub(unionEnd)
+			m.countQualificationGap(gap)
+			if gap > m.maxGap {
 				m.maxGap = gap
 			}
 			unionStart, unionEnd = iv[0], iv[1]
@@ -814,7 +825,9 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 	}
 	if !unionEnd.IsZero() {
 		covered += unionEnd.Sub(unionStart)
-		if trail := close.Sub(unionEnd); trail > m.maxGap {
+		trail := close.Sub(unionEnd)
+		m.countQualificationGap(trail)
+		if trail > m.maxGap {
 			m.maxGap = trail
 		}
 	}
@@ -829,6 +842,15 @@ func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWind
 		m.coveragePct = 100 * float64(covered) / float64(expected)
 	}
 	return m
+}
+
+func (m *stitchWindowMetrics) countQualificationGap(gap time.Duration) {
+	if gap > 30*time.Second {
+		m.gapsOver30s++
+	}
+	if gap > 5*time.Minute {
+		m.gapsOver5m++
+	}
 }
 
 const (
