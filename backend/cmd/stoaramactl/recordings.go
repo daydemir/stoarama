@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,12 +81,19 @@ func postRecordingSessionJSON(ctx context.Context, baseURL, cookie, path string,
 		log.Fatalf("request: %v", err)
 	}
 	defer resp.Body.Close()
-	var out map[string]any
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		log.Fatalf("decode response status=%d: %v", resp.StatusCode, err)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		log.Fatalf("read response: %v", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Fatalf("request failed status=%d error=%v", resp.StatusCode, out["error"])
+		log.Fatalf("request failed status=%d body=%q", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		log.Fatalf("decode response status=%d: %v", resp.StatusCode, err)
 	}
 	return out
 }
@@ -111,8 +119,8 @@ func runRecordingSceneAttest(ctx context.Context, args []string) {
 func parseQualificationIDs(raw string) []int64 {
 	var ids []int64
 	for _, part := range strings.Split(raw, ",") {
-		var id int64
-		if _, err := fmt.Sscan(strings.TrimSpace(part), &id); err != nil || id <= 0 {
+		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || id <= 0 {
 			log.Fatalf("invalid recording id %q", part)
 		}
 		ids = append(ids, id)

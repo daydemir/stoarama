@@ -24,6 +24,12 @@ const recordingQualificationDefinition = "recording-qualification-v1"
 const recordingQualificationMetricVersion = 2
 const qualificationWindowGeneratorVersion = "recsched-next-full-v1"
 
+var errQualificationCohortInvalid = errors.New("qualification cohort invalid")
+
+func invalidQualification(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", errQualificationCohortInvalid, fmt.Sprintf(format, args...))
+}
+
 type sceneAttestRequest struct {
 	RecordingID   int64  `json:"recording_id"`
 	FrameID       int64  `json:"frame_id"`
@@ -142,11 +148,11 @@ func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, re
 	ids := append([]int64(nil), req.RecordingIDs...)
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	if len(ids) < 50 || req.SequenceStart.IsZero() {
-		return qualificationPlan{}, fmt.Errorf("at least 50 explicit recording_ids and sequence_start_at are required")
+		return qualificationPlan{}, invalidQualification("at least 50 explicit recording_ids and sequence_start_at are required")
 	}
 	for i, id := range ids {
 		if id <= 0 || (i > 0 && id == ids[i-1]) {
-			return qualificationPlan{}, fmt.Errorf("recording_ids must be unique positive integers")
+			return qualificationPlan{}, invalidQualification("recording_ids must be unique positive integers")
 		}
 	}
 	rows, err := s.pool.Query(ctx, `
@@ -155,7 +161,7 @@ func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, re
 		FROM unnest($2::bigint[]) WITH ORDINALITY q(id,ord)
 		JOIN recordings r ON r.id=q.id AND r.account_id=$1 AND r.status='active' AND r.mode='continuous'
 		JOIN streams s ON s.id=r.stream_id
-		JOIN LATERAL (SELECT id,scene_identity_sha256 FROM recording_scene_frame_evidence WHERE account_id=$1 AND stream_id=r.stream_id ORDER BY verified_at DESC,id DESC LIMIT 1)e ON true
+		JOIN LATERAL (SELECT id,scene_identity_sha256 FROM recording_scene_frame_evidence WHERE account_id=$1 AND stream_id=r.stream_id AND captured_at>=now()-interval '24 hours' ORDER BY verified_at DESC,id DESC LIMIT 1)e ON true
 		ORDER BY q.ord`, accountID, ids)
 	if err != nil {
 		return qualificationPlan{}, err
@@ -169,10 +175,10 @@ func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, re
 			return qualificationPlan{}, err
 		}
 		if m.Start != "08:00:00" || m.End != "20:00:00" {
-			return qualificationPlan{}, fmt.Errorf("recording %d is not an 08:00-20:00 schedule", m.RecordingID)
+			return qualificationPlan{}, invalidQualification("recording %d is not an 08:00-20:00 schedule", m.RecordingID)
 		}
 		if prior, exists := seenScenes[m.SceneHash]; exists {
-			return qualificationPlan{}, fmt.Errorf("recordings %d and %d attest the same scene", prior, m.RecordingID)
+			return qualificationPlan{}, invalidQualification("recordings %d and %d attest the same scene", prior, m.RecordingID)
 		}
 		seenScenes[m.SceneHash] = m.RecordingID
 		start, err := recsched.ParseTimeOfDay(m.Start)
@@ -185,7 +191,7 @@ func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, re
 		}
 		m.Windows, err = recsched.NextFullContinuousWindowsOn(m.Timezone, start, end, recsched.WeekdaySet(m.Weekdays), m.ScheduleStart, zeroIfNil(m.ScheduleEnd), plan.SequenceStart, 14)
 		if err != nil {
-			return qualificationPlan{}, fmt.Errorf("recording %d: %w", m.RecordingID, err)
+			return qualificationPlan{}, invalidQualification("recording %d: %v", m.RecordingID, err)
 		}
 		plan.Members = append(plan.Members, m)
 	}
@@ -193,7 +199,7 @@ func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, re
 		return qualificationPlan{}, err
 	}
 	if len(plan.Members) != len(ids) {
-		return qualificationPlan{}, fmt.Errorf("selected cohort is missing active recordings or current scene evidence: got %d of %d", len(plan.Members), len(ids))
+		return qualificationPlan{}, invalidQualification("selected cohort is missing active recordings or current scene evidence: got %d of %d", len(plan.Members), len(ids))
 	}
 	canonical, _ := json.Marshal(plan)
 	plan.PlanSHA256 = sha256Hex(canonical)
@@ -219,7 +225,12 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 	}
 	plan, err := s.buildQualificationPlan(r.Context(), principal.AccountID, req)
 	if err != nil {
-		util.WriteError(w, http.StatusConflict, err.Error())
+		if errors.Is(err, errQualificationCohortInvalid) {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		log.Printf("qualification plan failed account_id=%d: %v", principal.AccountID, err)
+		util.WriteError(w, http.StatusInternalServerError, "build qualification plan")
 		return
 	}
 	if !req.Apply {
@@ -236,7 +247,7 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 		return
 	}
 	defer tx.Rollback(r.Context())
-	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1,$2)`, principal.AccountID, int64(0x5155414c)); err != nil {
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-qualification:'||$1::text,0))`, principal.AccountID); err != nil {
 		util.WriteError(w, 500, "lock qualification build")
 		return
 	}
@@ -264,29 +275,37 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 		util.WriteError(w, 500, "create qualification run")
 		return
 	}
+	memberBatch := &pgx.Batch{}
+	windowBatch := &pgx.Batch{}
 	for i, m := range plan.Members {
 		scheduleJSON, _ := json.Marshal(struct {
 			TZ, Start, End string
 			Weekdays       int16
 		}{m.Timezone, m.Start, m.End, m.Weekdays})
 		windowJSON, _ := json.Marshal(m.Windows)
-		_, err = tx.Exec(r.Context(), `INSERT INTO recording_qualification_members(run_id,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,daily_window_start,daily_window_end,active_weekdays,schedule_start_at,schedule_end_at,window_generator_version,schedule_config_sha256,window_sequence_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, runID, principal.AccountID, m.RecordingID, i+1, m.StreamID, m.Name, m.StreamName, m.SceneHash, m.EvidenceID, m.Timezone, m.Start, m.End, m.Weekdays, m.ScheduleStart, m.ScheduleEnd, qualificationWindowGeneratorVersion, sha256Hex(scheduleJSON), sha256Hex(windowJSON))
-		if err != nil {
-			util.WriteError(w, 500, "insert qualification member")
-			return
-		}
+		memberBatch.Queue(`INSERT INTO recording_qualification_members(run_id,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,daily_window_start,daily_window_end,active_weekdays,schedule_start_at,schedule_end_at,window_generator_version,schedule_config_sha256,window_sequence_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, runID, principal.AccountID, m.RecordingID, i+1, m.StreamID, m.Name, m.StreamName, m.SceneHash, m.EvidenceID, m.Timezone, m.Start, m.End, m.Weekdays, m.ScheduleStart, m.ScheduleEnd, qualificationWindowGeneratorVersion, sha256Hex(scheduleJSON), sha256Hex(windowJSON))
 		for _, win := range m.Windows {
 			_, offOpen := win.LocalOpenAt.Zone()
 			_, offEnd := win.LocalEndAt.Zone()
-			_, err = tx.Exec(r.Context(), `INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, runID, m.RecordingID, win.Ordinal, win.LocalOpenAt.Format("2006-01-02 15:04:05"), win.LocalEndAt.Format("2006-01-02 15:04:05"), offOpen, offEnd, win.OpenAt, win.EndAt, int64(win.EndAt.Sub(win.OpenAt).Seconds()))
-			if err != nil {
-				util.WriteError(w, 500, "insert qualification window")
-				return
-			}
+			windowBatch.Queue(`INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, runID, m.RecordingID, win.Ordinal, win.LocalOpenAt.Format("2006-01-02 15:04:05"), win.LocalEndAt.Format("2006-01-02 15:04:05"), offOpen, offEnd, win.OpenAt, win.EndAt, int64(win.EndAt.Sub(win.OpenAt).Seconds()))
 		}
 	}
-	if _, err = tx.Exec(r.Context(), `UPDATE recording_qualification_runs SET status='active',frozen_at=now() WHERE id=$1 AND status='building'`, runID); err != nil {
-		util.WriteError(w, http.StatusConflict, "freeze qualification run: "+err.Error())
+	if err = execQualificationBatch(r.Context(), tx, memberBatch); err != nil {
+		util.WriteError(w, 500, "insert qualification members")
+		return
+	}
+	if err = execQualificationBatch(r.Context(), tx, windowBatch); err != nil {
+		util.WriteError(w, 500, "insert qualification windows")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `UPDATE recording_qualification_runs SET status='active',frozen_at=now() WHERE id=$1 AND status='building'`, runID)
+	if err != nil {
+		log.Printf("freeze qualification failed run_id=%d: %v", runID, err)
+		util.WriteError(w, http.StatusConflict, "freeze qualification run")
+		return
+	}
+	if tag.RowsAffected() != 1 {
+		util.WriteError(w, http.StatusConflict, "qualification run was not transitioned")
 		return
 	}
 	if err = tx.Commit(r.Context()); err != nil {
@@ -294,6 +313,17 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"run_id": runID, "frozen": true, "target_recordings": len(plan.Members), "target_windows": 14, "plan_sha256": plan.PlanSHA256})
+}
+
+func execQualificationBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch) error {
+	results := tx.SendBatch(ctx, batch)
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := results.Exec(); err != nil {
+			_ = results.Close()
+			return err
+		}
+	}
+	return results.Close()
 }
 
 type qualificationWindowMetrics struct {
@@ -359,12 +389,11 @@ type recordingQualificationWindow struct {
 }
 
 type recordingQualificationMember struct {
-	RecordingID  int64                          `json:"recording_id"`
-	Name         string                         `json:"name"`
-	Ordinal      int                            `json:"ordinal"`
-	Status       string                         `json:"status"`
-	Strict14Good bool                           `json:"strict_14_good"`
-	Windows      []recordingQualificationWindow `json:"windows"`
+	RecordingID int64                          `json:"recording_id"`
+	Name        string                         `json:"name"`
+	Ordinal     int                            `json:"ordinal"`
+	Status      string                         `json:"status"`
+	Windows     []recordingQualificationWindow `json:"windows"`
 }
 
 type recordingQualificationResponse struct {
@@ -375,8 +404,6 @@ type recordingQualificationResponse struct {
 	RunStatus         string                         `json:"run_status"`
 	FrozenAt          time.Time                      `json:"frozen_at"`
 	TargetRecordings  int                            `json:"target_recordings"`
-	QualifiedCount    int                            `json:"qualified_count"`
-	Strict14GoodCount int                            `json:"strict_14_good_count"`
 	Members           []recordingQualificationMember `json:"members"`
 }
 
@@ -466,10 +493,6 @@ func (s *Server) handleAccountRecordingQualification(w http.ResponseWriter, r *h
 	if err := rows.Err(); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read qualification matrix")
 		return
-	}
-	// Qualification remains UNKNOWN until both mandatory evidence axes are durably certified.
-	for i := range out.Members {
-		out.Members[i].Status = "UNKNOWN"
 	}
 	util.WriteJSON(w, http.StatusOK, out)
 }

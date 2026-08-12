@@ -51,6 +51,24 @@ func TestClassifyQualificationTimeline(t *testing.T) {
 	if got, _ := classifyQualificationTimeline(inconsistent); got != "UNKNOWN" {
 		t.Fatalf("inconsistent=%s", got)
 	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*qualificationWindowMetrics)
+		want   string
+	}{
+		{"job count", func(m *qualificationWindowMetrics) { m.JobCount = 0 }, "UNKNOWN"},
+		{"overlap", func(m *qualificationWindowMetrics) { m.OverlapCount = pi(1) }, "FAILED"},
+		{"expected duration", func(m *qualificationWindowMetrics) { m.MeasuredExpected = pi64(43199) }, "UNKNOWN"},
+		{"late clip", func(m *qualificationWindowMetrics) { m.LateClip = true }, "UNKNOWN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base
+			tc.mutate(&m)
+			if got, _ := classifyQualificationTimeline(m); got != tc.want {
+				t.Fatalf("got=%s want=%s", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestQualificationBuildFailsClosedBelowFiftyBeforeDatabase(t *testing.T) {
@@ -77,14 +95,27 @@ func TestQualificationBuildRejectsDuplicateIDsBeforeDatabase(t *testing.T) {
 }
 
 func TestSceneAttestRequiresMemberSession(t *testing.T) {
-	body := bytes.NewBufferString(`{"recording_id":1,"frame_id":2,"scene_identity":"place"}`)
 	for _, principal := range []accountPrincipal{{AccountID: 1, UserID: 0}, {}} {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", body)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", bytes.NewBufferString(`{"recording_id":1,"frame_id":2,"scene_identity":"place"}`))
 		if principal.AccountID != 0 {
 			req = withPrincipal(req, principal, "")
 		}
 		rec := httptest.NewRecorder()
 		(&Server{}).handleAccountRecordingSceneAttest(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestQualificationBuildRequiresMemberSession(t *testing.T) {
+	for _, principal := range []accountPrincipal{{AccountID: 1, UserID: 0}, {}} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/build", bytes.NewBufferString(`{"recording_ids":[],"sequence_start_at":"2026-08-13T00:00:00Z","apply":false}`))
+		if principal.AccountID != 0 {
+			req = withPrincipal(req, principal, "")
+		}
+		rec := httptest.NewRecorder()
+		(&Server{}).handleAccountRecordingQualificationBuild(rec, req)
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}
