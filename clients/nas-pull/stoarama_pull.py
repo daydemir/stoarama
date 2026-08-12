@@ -445,7 +445,7 @@ class Inventory:
                 "size_bytes": row[3], "sha256": row[4], "state": row[5],
                 "verified_at": row[6], "file_mtime_ns": row[7], "client_updated_at": row[8],
             }
-            if row[9] > 0 and row[10] > 0 and row[11] > 0 and row[12] and row[13] >= 0 and len(row[14]) == 64:
+            if row[9] > 0 and row[10] > 0 and row[11] > 0 and row[12] and row[13] > 0 and len(row[14]) == 64:
                 report.update({
                     "file_ctime_ns": row[9], "file_inode": row[10], "file_device": row[11],
                     "sidecar_relative_path": row[12], "sidecar_size_bytes": row[13], "sidecar_sha256": row[14],

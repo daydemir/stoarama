@@ -138,7 +138,7 @@ func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error 
 			return errors.New("invalid inventory client_updated_at")
 		}
 		evidenceFields := file.FileCTimeNS != nil || file.FileInode != nil || file.FileDevice != nil || file.SidecarPath != nil || file.SidecarSize != nil || file.SidecarSHA256 != nil
-		if evidenceFields && (file.FileCTimeNS == nil || *file.FileCTimeNS <= 0 || file.FileInode == nil || *file.FileInode <= 0 || file.FileDevice == nil || *file.FileDevice <= 0 || file.SidecarPath == nil || !validNASRelativePath(*file.SidecarPath) || file.SidecarSize == nil || *file.SidecarSize < 0 || file.SidecarSHA256 == nil || len(*file.SidecarSHA256) != 64 || !lowerHex(*file.SidecarSHA256)) {
+		if evidenceFields && (file.FileCTimeNS == nil || *file.FileCTimeNS <= 0 || file.FileInode == nil || *file.FileInode <= 0 || file.FileDevice == nil || *file.FileDevice <= 0 || file.SidecarPath == nil || !validNASRelativePath(*file.SidecarPath) || file.SidecarSize == nil || *file.SidecarSize <= 0 || file.SidecarSHA256 == nil || len(*file.SidecarSHA256) != 64 || !lowerHex(*file.SidecarSHA256)) {
 			return errors.New("inventory cleanup evidence must be complete and valid")
 		}
 	}

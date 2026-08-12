@@ -16,5 +16,5 @@ ALTER TABLE nas_inventory_files
     OR
     (file_ctime_ns > 0 AND file_inode > 0 AND file_device > 0
       AND sidecar_relative_path <> '' AND left(sidecar_relative_path,1) <> '/'
-      AND sidecar_size_bytes >= 0 AND sidecar_sha256 ~ '^[0-9a-f]{64}$')
-  );
+      AND sidecar_size_bytes > 0 AND sidecar_sha256 ~ '^[0-9a-f]{64}$')
+  ) NOT VALID;
