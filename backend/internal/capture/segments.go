@@ -103,6 +103,16 @@ func CaptureSegmentWithHeaders(ctx context.Context, sourceURL string, duration t
 // can be scavenged on restart; an empty parent preserves the cloud worker's
 // OS-temporary behavior.
 func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int, tempDir, inputHeaders string) (Segment, error) {
+	return captureSegmentInDirWithHeaders(ctx, sourceURL, duration, pinHost, targetFPS, tempDir, inputHeaders, true)
+}
+
+// CaptureSegmentInDirWithHeadersNoThumbnail is the source-native canary path.
+// It skips thumbnail extraction entirely, so no video or image encoding occurs.
+func CaptureSegmentInDirWithHeadersNoThumbnail(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, tempDir, inputHeaders string) (Segment, error) {
+	return captureSegmentInDirWithHeaders(ctx, sourceURL, duration, pinHost, nil, tempDir, inputHeaders, false)
+}
+
+func captureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int, tempDir, inputHeaders string, createThumbnail bool) (Segment, error) {
 	if strings.TrimSpace(sourceURL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
 	}
@@ -161,9 +171,13 @@ func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, durat
 		}
 	}
 
-	thumb, thumbErr := extractSegmentThumbnail(ctx, outPath)
-	if thumbErr != nil {
-		thumb = nil
+	var thumb *SegmentThumbnail
+	if createThumbnail {
+		var thumbErr error
+		thumb, thumbErr = extractSegmentThumbnail(ctx, outPath)
+		if thumbErr != nil {
+			thumb = nil
+		}
 	}
 
 	return Segment{
@@ -962,6 +976,20 @@ func ValidateSegmentFile(ctx context.Context, path string) error {
 	}
 	if strings.TrimSpace(meta.VideoCodec) == "" {
 		return fmt.Errorf("ffprobe returned no video stream")
+	}
+	return nil
+}
+
+// ValidateSegmentDecode reads the captured file through FFmpeg's strict decoder
+// into a null sink. It creates no output media and performs no re-encoding.
+func ValidateSegmentDecode(ctx context.Context, path string) error {
+	decodeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(decodeCtx, ffmpegBin(),
+		"-v", "error", "-xerror", "-err_detect", "explode", "-i", path,
+		"-map", "0:v:0", "-map", "0:a?", "-f", "null", "-")
+	if err := runFFmpegHealthCommand(cmd); err != nil {
+		return fmt.Errorf("ffmpeg strict decode: %w", err)
 	}
 	return nil
 }
