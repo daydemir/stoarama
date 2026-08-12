@@ -343,6 +343,7 @@ func (s *Server) router() http.Handler {
 			node.Post("/heartbeat", s.handleNodeHeartbeat)
 			node.Post("/recordings/{id}/canary-reservations", s.handleNodeRecordingCanaryStart)
 			node.Post("/recordings/{id}/canary-reservations/{reservationId}/check", s.handleNodeRecordingCanaryCheck)
+			node.Post("/recordings/{id}/canary-reservations/{reservationId}/complete", s.handleNodeRecordingCanaryComplete)
 			node.Post("/recordings/{id}/canary-reservations/{reservationId}/finish", s.handleNodeRecordingCanaryFinish)
 			node.Get("/pipeline-runs/{id}", s.handlePipelineRunGet)
 			node.Get("/pipeline-runs/{id}/targets", s.handlePipelineRunTargetsList)

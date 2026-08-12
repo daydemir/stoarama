@@ -44,7 +44,7 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 		}
 	}
 
-	var starts, checks, finishes atomic.Int64
+	var starts, checks, completes, finishes atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -54,6 +54,16 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 		case strings.HasSuffix(r.URL.Path, "/check"):
 			checks.Add(1)
 			writeCanaryTestSpec(w)
+		case strings.HasSuffix(r.URL.Path, "/complete"):
+			completes.Add(1)
+			var result recordingapi.RecordingCanaryResult
+			if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+				t.Errorf("decode complete: %v", err)
+			}
+			if !result.NativeCopy || !result.ProbeOK || !result.DecodeOK || result.Uploaded || result.SHA256 == "" {
+				t.Errorf("unsafe completion: %+v", result)
+			}
+			_, _ = w.Write([]byte(`{"recorded":true}`))
 		case strings.HasSuffix(r.URL.Path, "/finish"):
 			finishes.Add(1)
 			_, _ = w.Write([]byte(`{"finished":true}`))
@@ -72,8 +82,8 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 	if err != nil {
 		t.Fatal(err)
 	}
-	if starts.Load() != 1 || checks.Load() < 1 || finishes.Load() != 1 {
-		t.Fatalf("reservation calls start=%d check=%d finish=%d", starts.Load(), checks.Load(), finishes.Load())
+	if starts.Load() != 1 || checks.Load() < 1 || completes.Load() != 1 || finishes.Load() != 1 {
+		t.Fatalf("reservation calls start=%d check=%d complete=%d finish=%d", starts.Load(), checks.Load(), completes.Load(), finishes.Load())
 	}
 	logged, err := os.ReadFile(argsLog)
 	if err != nil {

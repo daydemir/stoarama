@@ -38,6 +38,8 @@ const testRecordingCanaryReservationsTableDDL = `CREATE TABLE recording_canary_r
 	recording_id BIGINT NOT NULL,
 	node_id BIGINT NOT NULL,
 	expires_at TIMESTAMPTZ NOT NULL,
+	window_start_at TIMESTAMPTZ,
+	preopen_stage TEXT,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )`
 
@@ -1235,6 +1237,8 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			end_at TIMESTAMPTZ,
 			target_fps INTEGER,
 			capture_via TEXT NOT NULL DEFAULT 'cloud',
+			mode TEXT NOT NULL DEFAULT 'continuous',
+			next_fire_at TIMESTAMPTZ NOT NULL DEFAULT (now()+interval '90 minutes'),
 			preferred_relay_group_id BIGINT,
 			cron_timezone TEXT NOT NULL DEFAULT 'UTC',
 			naming_profile TEXT NOT NULL DEFAULT 'stoarama_v1',

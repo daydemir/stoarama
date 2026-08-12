@@ -176,6 +176,38 @@ func TestRecordingCanaryReservationUsesNodeAuthAndExactRecording(t *testing.T) {
 	}
 }
 
+func TestRecordingCanaryCompletionUsesNodeAuthExactReservationAndProof(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		want := "/api/v1/node/recordings/445/canary-reservations/123e4567-e89b-12d3-a456-426614174000/complete"
+		if r.URL.Path != want {
+			t.Errorf("path=%s want=%s", r.URL.Path, want)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer node-token" {
+			t.Errorf("authorization=%q", got)
+		}
+		var result RecordingCanaryResult
+		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+			t.Errorf("decode result: %v", err)
+		}
+		if result.SHA256 != strings.Repeat("a", 64) || !result.NativeCopy || result.Uploaded {
+			t.Errorf("result=%+v", result)
+		}
+		_, _ = w.Write([]byte(`{"recorded":true}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "node-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.CompleteRecordingCanary(context.Background(), 445, "123e4567-e89b-12d3-a456-426614174000", RecordingCanaryResult{
+		DurationMS: 15_000, SizeBytes: 1234, SHA256: strings.Repeat("a", 64), VideoCodec: "h264",
+		ProbeOK: true, DecodeOK: true, NativeCopy: true, RelayVersion: "a1adf4b9", SourceRevision: strings.Repeat("b", 40),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUploadUsesLongerTimeoutThanAPIRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
