@@ -3124,7 +3124,7 @@ func (s *Server) persistAuthoritativeFrameSuccess(ctx context.Context, accountID
 }
 
 func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error)) error {
-	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/authoritative-%d.jpg", streamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(), capturedAt.UnixNano())
+	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/authoritative-%d-%s.jpg", streamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(), capturedAt.UnixNano(), frame.SHA256)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin authoritative frame tx: %w", err)

@@ -146,7 +146,7 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 	store := func() error {
 		return s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, capturedAt, frame, "test-bucket", func(_ context.Context, key, mime string, body []byte) (string, error) {
 			putCount.Add(1)
-			if !strings.Contains(key, "/authoritative-") || mime != "image/jpeg" || len(body) == 0 {
+			if !strings.Contains(key, "/authoritative-") || !strings.Contains(key, frame.SHA256) || mime != "image/jpeg" || len(body) == 0 {
 				t.Fatal("invalid upload")
 			}
 			return "etag", nil
