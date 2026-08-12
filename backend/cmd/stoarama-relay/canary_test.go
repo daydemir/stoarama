@@ -22,20 +22,26 @@ func TestRecordingCanaryIsReservedNativeLocalAndCleaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	argsLog := filepath.Join(home, "ffmpeg-args.log")
+	decodeStarted := filepath.Join(home, "decode-started")
 	watcherStarted := filepath.Join(home, "watcher-started")
 	ffmpeg := `#!/bin/sh
 printf '%s\n' "$*" >> '` + argsLog + `'
 case " $* " in
-  *" -f null "*) exit 0 ;;
+  *" -f null "*)
+    printf started > '` + decodeStarted + `'
+    tries=0
+    while [ ! -f '` + watcherStarted + `' ]; do
+      tries=$((tries + 1))
+      [ "$tries" -ge 100 ] && exit 1
+      sleep 0.05
+    done
+    exit 0
+    ;;
+  *)
+    eval "out=\${$#}"
+    printf 'native-media' > "$out"
+    ;;
 esac
-tries=0
-while [ ! -f '` + watcherStarted + `' ]; do
-  tries=$((tries + 1))
-  [ "$tries" -ge 100 ] && exit 1
-  sleep 0.05
-done
-eval "out=\${$#}"
-printf 'native-media' > "$out"
 `
 	ffprobe := `#!/bin/sh
 printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","codec_name":"h264","avg_frame_rate":"30/1","r_frame_rate":"30/1","width":1280,"height":720},{"codec_type":"audio","codec_name":"aac"}]}'
@@ -55,11 +61,15 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 			starts.Add(1)
 			writeCanaryTestSpec(w)
 		case strings.HasSuffix(r.URL.Path, "/check"):
-			if checks.Add(1) > 1 {
+			checks.Add(1)
+			if _, err := os.Stat(decodeStarted); err == nil {
 				// Keep a watcher request in flight until normal media validation
 				// cancels it. Self-cancellation must not become a false safety error.
 				_ = os.WriteFile(watcherStarted, []byte("started"), 0o600)
-				<-watcherRelease
+				select {
+				case <-r.Context().Done():
+				case <-watcherRelease:
+				}
 				return
 			}
 			writeCanaryTestSpec(w)
