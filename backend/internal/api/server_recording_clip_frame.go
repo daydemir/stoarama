@@ -46,6 +46,11 @@ type recordingClipFrameSource struct {
 	dest                                     clipDestination
 }
 
+type recordingClipFrameIdentity struct {
+	sha, etag, endpoint, bucket, objectKey string
+	destinationID, size                    int64
+}
+
 type clipFrameObject interface {
 	Head(context.Context, string) (r2.ObjectHead, error)
 	OpenExact(context.Context, string, string, string) (io.ReadCloser, error)
@@ -296,16 +301,15 @@ func (s *Server) persistClipBackedAuthoritativeFrame(ctx context.Context, src re
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, identity); err != nil {
 		return 0, "", fmt.Errorf("lock clip frame identity: %w", err)
 	}
-	var currentSHA, currentETag, currentEndpoint, currentBucket, currentObjectKey string
-	var currentDestinationID, currentSize int64
-	if err = tx.QueryRow(ctx, `SELECT lower(c.sha256),btrim(c.etag),sd.id,sd.endpoint,sd.bucket,c.object_key,c.size_bytes FROM recordings r JOIN recording_clips c ON c.recording_id=r.id JOIN storage_destinations sd ON sd.id=c.storage_destination_id WHERE r.account_id=$1 AND r.id=$2 AND r.stream_id=$3 AND r.status='active' AND c.id=$4 AND c.purged_at IS NULL AND c.clip_end_at>=now()-interval '24 hours' AND sd.account_id=r.account_id AND sd.status='verified' AND sd.managed FOR SHARE OF r,c,sd`, src.accountID, src.recordingID, src.streamID, src.clipID).Scan(&currentSHA, &currentETag, &currentDestinationID, &currentEndpoint, &currentBucket, &currentObjectKey, &currentSize); err != nil {
+	current, err := lockRecordingClipFrameIdentity(ctx, tx, src)
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip is no longer eligible for an authoritative frame"}
 		}
 		return 0, "", fmt.Errorf("recheck clip identity: %w", err)
 	}
-	currentEndpoint, endpointErr := canonicalClipStorageEndpoint(currentEndpoint)
-	if endpointErr != nil || currentSHA != src.clipSHA || currentETag != src.clipETag || currentDestinationID != src.dest.id || currentEndpoint != src.dest.endpoint || currentBucket != src.dest.bucket || currentObjectKey != src.dest.objectKey || currentSize != src.dest.sizeBytes {
+	current.endpoint, err = canonicalClipStorageEndpoint(current.endpoint)
+	if err != nil || current.sha != src.clipSHA || current.etag != src.clipETag || current.destinationID != src.dest.id || current.endpoint != src.dest.endpoint || current.bucket != src.dest.bucket || current.objectKey != src.dest.objectKey || current.size != src.dest.sizeBytes {
 		return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip identity changed before persistence"}
 	}
 	var frameID int64
@@ -339,4 +343,14 @@ func (s *Server) persistClipBackedAuthoritativeFrame(ctx context.Context, src re
 		return 0, "", fmt.Errorf("commit clip frame: %w", err)
 	}
 	return frameID, frame.SHA256, nil
+}
+
+type clipFrameIdentityLocker interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func lockRecordingClipFrameIdentity(ctx context.Context, q clipFrameIdentityLocker, src recordingClipFrameSource) (recordingClipFrameIdentity, error) {
+	var got recordingClipFrameIdentity
+	err := q.QueryRow(ctx, `SELECT lower(c.sha256),btrim(c.etag),sd.id,sd.endpoint,sd.bucket,c.object_key,c.size_bytes FROM recordings r JOIN recording_clips c ON c.recording_id=r.id JOIN storage_destinations sd ON sd.id=c.storage_destination_id WHERE r.account_id=$1 AND r.id=$2 AND r.stream_id=$3 AND r.status='active' AND c.id=$4 AND c.purged_at IS NULL AND c.clip_end_at>=now()-interval '24 hours' AND sd.account_id=r.account_id AND sd.status='verified' AND sd.managed FOR SHARE OF r,c,sd`, src.accountID, src.recordingID, src.streamID, src.clipID).Scan(&got.sha, &got.etag, &got.destinationID, &got.endpoint, &got.bucket, &got.objectKey, &got.size)
+	return got, err
 }

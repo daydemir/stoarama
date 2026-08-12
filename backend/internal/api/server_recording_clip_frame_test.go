@@ -291,3 +291,59 @@ func TestClipFramePersistenceConflictsAreTyped(t *testing.T) {
 		t.Fatalf("err=%v typed=%+v", err, typed)
 	}
 }
+
+func TestClipFrameIdentityLockRejectsConcurrentObjectPointerDrift(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := "clip_frame_drift_" + strings.ReplaceAll(time.Now().UTC().Format("150405.000000000"), ".", "")
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE")
+	cfg, _ := pgxpool.ParseConfig(databaseURL)
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	for _, ddl := range []string{
+		`CREATE TABLE recordings(id bigint primary key,account_id bigint,stream_id bigint,status text)`,
+		`CREATE TABLE storage_destinations(id bigint primary key,account_id bigint,status text,managed boolean,endpoint text,bucket text)`,
+		`CREATE TABLE recording_clips(id bigint primary key,recording_id bigint,storage_destination_id bigint,sha256 text,etag text,purged_at timestamptz,clip_end_at timestamptz,object_key text,size_bytes bigint)`,
+		`INSERT INTO recordings VALUES(10,47,99,'active')`,
+		`INSERT INTO storage_destinations VALUES(20,47,'verified',true,'https://storage.example.test','bucket')`,
+		`INSERT INTO recording_clips VALUES(30,10,20,'` + strings.Repeat("a", 64) + `','etag',NULL,now(),'old.mp4',4)`,
+	} {
+		if _, err = pool.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := recordingClipFrameSource{accountID: 47, recordingID: 10, streamID: 99, clipID: 30, clipSHA: strings.Repeat("a", 64), clipETag: "etag", dest: clipDestination{id: 20, endpoint: "https://storage.example.test", bucket: "bucket", objectKey: "old.mp4", sizeBytes: 4}}
+	// Simulate the exact race window: the clip retains the same content SHA/ETag
+	// but its storage pointer changes after object verification and before the
+	// persistence transaction. The locked identity must expose that drift.
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET object_key='new.mp4' WHERE id=30`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	got, err := lockRecordingClipFrameIdentity(ctx, tx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.objectKey == src.dest.objectKey || got.sha != src.clipSHA || got.etag != src.clipETag {
+		t.Fatalf("drift not isolated got=%+v source=%+v", got, src.dest)
+	}
+}
