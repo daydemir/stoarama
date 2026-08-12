@@ -104,7 +104,7 @@ func (s *Server) createRecordingClipAuthoritativeFrame(ctx context.Context, acco
 	if err != nil {
 		return 0, "", err
 	}
-	if s.secrets == nil {
+	if s.secrets == nil || s.r2 == nil {
 		return 0, "", &clipFrameHTTPError{http.StatusServiceUnavailable, "managed storage is unavailable"}
 	}
 	if err := validateStorageEndpointHTTPS(src.dest.endpoint); err != nil {
@@ -137,6 +137,8 @@ func (s *Server) loadRecordingClipFrameSource(ctx context.Context, accountID, re
 		FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
 		JOIN storage_destinations sd ON sd.id=c.storage_destination_id
 		WHERE r.account_id=$1 AND r.id=$2 AND r.status='active' AND c.id=$3
+		  AND sd.account_id=r.account_id AND sd.status='verified'
+		  AND c.clip_end_at>=now()-interval '24 hours'
 	`, accountID, recordingID, clipID).Scan(
 		&src.accountID, &src.recordingID, &src.streamID, &src.clipID, &src.clipStartAt, &src.clipEndAt,
 		&src.clipSHA, &src.clipETag, &src.dest.objectKey, &src.dest.sizeBytes,
@@ -168,7 +170,7 @@ func verifiedFrameFromClip(ctx context.Context, obj clipFrameObject, src recordi
 	if err != nil {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object is unavailable"}
 	}
-	if head.SizeBytes != src.dest.sizeBytes || !strings.EqualFold(strings.TrimSpace(head.ETag), src.clipETag) {
+	if head.SizeBytes != src.dest.sizeBytes || strings.TrimSpace(head.ETag) != src.clipETag {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object metadata mismatch"}
 	}
 	body, err := obj.OpenExact(ctx, src.dest.objectKey, head.ETag, head.VersionID)
@@ -193,7 +195,7 @@ func verifiedFrameFromClip(ctx context.Context, obj clipFrameObject, src recordi
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object SHA-256 mismatch"}
 	}
 	headAfter, err := obj.Head(ctx, src.dest.objectKey)
-	if err != nil || headAfter.SizeBytes != head.SizeBytes || !strings.EqualFold(headAfter.ETag, head.ETag) || headAfter.VersionID != head.VersionID {
+	if err != nil || headAfter.SizeBytes != head.SizeBytes || headAfter.ETag != head.ETag || headAfter.VersionID != head.VersionID {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object changed during verification"}
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
@@ -252,7 +254,7 @@ func ffmpegFrameFromClip(parent context.Context, input io.Reader) (capture.Frame
 func clipFrameFFmpegArgs() []string {
 	return []string{
 		"-nostdin", "-v", "error",
-		"-protocol_whitelist", "pipe,fd", "-protocol_blacklist", "file,http,https,tcp,tls,udp,rtp,ftp",
+		"-protocol_whitelist", "pipe", "-protocol_blacklist", "file,http,https,tcp,tls,udp,rtp,ftp",
 		"-i", "pipe:0", "-map", "0:v:0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
 	}
 }
@@ -260,10 +262,9 @@ func clipFrameFFmpegArgs() []string {
 type clipFramePut func(context.Context, string, string, []byte) (string, error)
 
 func (s *Server) persistClipBackedAuthoritativeFrame(ctx context.Context, src recordingClipFrameSource, versionID string, frame capture.Frame, bucket string, put clipFramePut) (int64, string, error) {
+	// ffmpeg decodes the first video frame from the pipe, so the only honest
+	// timeline anchor is the clip start (never midpoint or request time).
 	capturedAt := src.clipStartAt.UTC()
-	if src.clipEndAt != nil && src.clipEndAt.After(src.clipStartAt) {
-		capturedAt = src.clipStartAt.Add(src.clipEndAt.Sub(src.clipStartAt) / 2).UTC()
-	}
 	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/authoritative-clip-%d-%s-%s.jpg", src.streamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(), src.clipID, src.clipSHA, frame.SHA256)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

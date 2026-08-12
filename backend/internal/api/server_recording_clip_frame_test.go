@@ -85,15 +85,6 @@ func TestVerifiedFrameFromClipRejectsObjectMismatchBeforeDecode(t *testing.T) {
 	}
 }
 
-func TestClipFrameCapturedAtIsDeterministic(t *testing.T) {
-	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
-	end := start.Add(time.Minute)
-	src := recordingClipFrameSource{clipStartAt: start, clipEndAt: &end}
-	if got := src.clipStartAt.Add(src.clipEndAt.Sub(src.clipStartAt) / 2); !got.Equal(start.Add(30 * time.Second)) {
-		t.Fatal(got)
-	}
-}
-
 func TestClipFrameFFmpegDisablesNestedIOAndDecodesOneJPEG(t *testing.T) {
 	bin, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -110,7 +101,7 @@ func TestClipFrameFFmpegDisablesNestedIOAndDecodesOneJPEG(t *testing.T) {
 		t.Fatal("nested file playlist unexpectedly decoded")
 	}
 	args := strings.Join(clipFrameFFmpegArgs(), " ")
-	for _, required := range []string{"-protocol_whitelist pipe,fd", "-protocol_blacklist file,http,https,tcp,tls,udp,rtp,ftp", "-frames:v 1"} {
+	for _, required := range []string{"-protocol_whitelist pipe", "-protocol_blacklist file,http,https,tcp,tls,udp,rtp,ftp", "-frames:v 1"} {
 		if !strings.Contains(args, required) {
 			t.Fatalf("missing ffmpeg safety arg %q in %q", required, args)
 		}
@@ -174,14 +165,14 @@ func TestPersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime(
 	defer pool.Close()
 	for _, ddl := range []string{
 		`CREATE TABLE recordings(id bigint primary key,account_id bigint not null,stream_id bigint not null,status text not null,stream_url text not null)`,
-		`CREATE TABLE storage_destinations(id bigint primary key,managed boolean not null,region text,bucket text,endpoint text,access_key_id text,secret_access_key_enc bytea)`,
+		`CREATE TABLE storage_destinations(id bigint primary key,account_id bigint not null,status text not null,managed boolean not null,region text,bucket text,endpoint text,access_key_id text,secret_access_key_enc bytea)`,
 		`CREATE TABLE recording_clips(id bigint primary key,recording_id bigint not null,storage_destination_id bigint not null,sha256 text not null,etag text not null,purged_at timestamptz,released_at timestamptz,clip_start_at timestamptz,clip_end_at timestamptz,object_key text,size_bytes bigint)`,
 		`CREATE TABLE media_objects(id bigserial primary key,storage_provider text not null,bucket text not null,object_key text not null,mime_type text not null,size_bytes bigint not null,etag text not null default '',sha256 text,width integer,height integer,created_at timestamptz not null default now(),unique(bucket,object_key))`,
 		`CREATE TABLE frames(id bigserial primary key,stream_id bigint not null,capture_job_id bigint,captured_at timestamptz not null,raw_media_object_id bigint,capture_status text not null,capture_error text,source_kind text not null,source_recording_clip_id bigint unique,source_recording_clip_sha256 text,source_recording_clip_etag text,source_recording_clip_version_id text)`,
 		`CREATE TABLE stream_health(stream_id bigint primary key,captures_total bigint not null default 0,captures_success bigint not null default 0,captures_error bigint not null default 0,last_error_at timestamptz,last_error_text text,last_capture_at timestamptz,updated_at timestamptz not null default now())`,
 		`CREATE TABLE stream_capture_runtime(stream_id bigint primary key,execution_class text,resolved_url text,status text,last_frame_at timestamptz)`,
 		`INSERT INTO recordings VALUES(10,47,99,'active','https://unchanged.example/live')`,
-		`INSERT INTO storage_destinations VALUES(20,true,'auto','bucket','https://storage.example.test','key','secret')`,
+		`INSERT INTO storage_destinations VALUES(20,47,'verified',true,'auto','bucket','https://storage.example.test','key','secret')`,
 		`INSERT INTO recording_clips VALUES(30,10,20,'` + strings.Repeat("a", 64) + `','clip-etag',NULL,now(),now()-interval '1 minute',now(),'clip.mp4',4)`,
 		`INSERT INTO stream_capture_runtime VALUES(99,'video_live','https://secret.example/live','running',now()-interval '5 minutes')`,
 	} {
