@@ -56,6 +56,8 @@ type clipFrameObject interface {
 	OpenExact(context.Context, string, string, string) (io.ReadCloser, error)
 }
 
+type verifiedClipDecoder func(context.Context, *os.File) (capture.Frame, error)
+
 type clipFrameHTTPError struct {
 	status int
 	public string
@@ -190,7 +192,7 @@ func (s *Server) loadRecordingClipFrameSource(ctx context.Context, accountID, re
 	return src, nil
 }
 
-func verifiedFrameFromClip(ctx context.Context, obj clipFrameObject, src recordingClipFrameSource, decode func(context.Context, io.Reader) (capture.Frame, error)) (capture.Frame, string, error) {
+func verifiedFrameFromClip(ctx context.Context, obj clipFrameObject, src recordingClipFrameSource, decode verifiedClipDecoder) (capture.Frame, string, error) {
 	downloadCtx, cancel := context.WithTimeout(ctx, clipFrameDownloadTTL)
 	defer cancel()
 	head, err := obj.Head(downloadCtx, src.dest.objectKey)
@@ -247,13 +249,16 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 	return w.b.Write(p)
 }
 
-func ffmpegFrameFromClip(parent context.Context, input io.Reader) (capture.Frame, error) {
+func ffmpegFrameFromClip(parent context.Context, seekable *os.File) (capture.Frame, error) {
 	bin := strings.TrimSpace(os.Getenv("FFMPEG_BIN"))
 	if bin == "" {
 		return capture.Frame{}, fmt.Errorf("FFMPEG_BIN is required")
 	}
 	ctx, cancel := context.WithTimeout(parent, clipFrameTimeout)
 	defer cancel()
+	// /dev/fd/N gives ffmpeg a seekable descriptor without exposing an object URL
+	// or a filesystem path. The descriptor is an already verified bounded temp
+	// file, and no other file/network protocols are enabled.
 	cmd := exec.CommandContext(ctx, bin, clipFrameFFmpegArgs()...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -263,7 +268,7 @@ func ffmpegFrameFromClip(parent context.Context, input io.Reader) (capture.Frame
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 	cmd.WaitDelay = time.Second
-	cmd.Stdin = input
+	cmd.ExtraFiles = []*os.File{seekable}
 	out := &boundedWriter{n: authoritativeFrameMaxBytes}
 	errOut := &boundedWriter{n: 32 << 10}
 	cmd.Stdout, cmd.Stderr = out, errOut
@@ -281,8 +286,9 @@ func ffmpegFrameFromClip(parent context.Context, input io.Reader) (capture.Frame
 func clipFrameFFmpegArgs() []string {
 	return []string{
 		"-nostdin", "-v", "error",
-		"-protocol_whitelist", "pipe", "-protocol_blacklist", "file,http,https,tcp,tls,udp,rtp,ftp",
-		"-i", "pipe:0", "-map", "0:v:0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+		"-protocol_whitelist", "file,pipe", "-protocol_blacklist", "http,https,tcp,tls,udp,rtp,ftp,concat,crypto,data,subfile",
+		"-format_whitelist", "mov,matroska,webm,mpegts", "-enable_drefs", "0", "-use_absolute_path", "0",
+		"-i", "/dev/fd/3", "-map", "0:v:0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
 	}
 }
 

@@ -47,7 +47,7 @@ func TestVerifiedFrameFromClipPinsAndVerifiesExactObject(t *testing.T) {
 	src := recordingClipFrameSource{clipSHA: hex.EncodeToString(sum[:]), clipETag: "etag", dest: clipDestination{objectKey: "clip.mp4", sizeBytes: int64(len(body))}}
 	obj := &fakeClipFrameObject{head: r2.ObjectHead{ETag: "etag", SizeBytes: int64(len(body)), VersionID: "version"}, body: body}
 	want := capture.Frame{SHA256: strings.Repeat("b", 64)}
-	got, version, err := verifiedFrameFromClip(context.Background(), obj, src, func(_ context.Context, r io.Reader) (capture.Frame, error) {
+	got, version, err := verifiedFrameFromClip(context.Background(), obj, src, func(_ context.Context, r *os.File) (capture.Frame, error) {
 		seen, readErr := io.ReadAll(r)
 		if readErr != nil || !bytes.Equal(seen, body) {
 			t.Fatalf("decode input=%q err=%v", seen, readErr)
@@ -76,7 +76,7 @@ func TestVerifiedFrameFromClipRejectsObjectMismatchBeforeDecode(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			decoded := false
-			_, _, err := verifiedFrameFromClip(context.Background(), &fakeClipFrameObject{head: tc.head, body: tc.body}, src, func(context.Context, io.Reader) (capture.Frame, error) {
+			_, _, err := verifiedFrameFromClip(context.Background(), &fakeClipFrameObject{head: tc.head, body: tc.body}, src, func(context.Context, *os.File) (capture.Frame, error) {
 				decoded = true
 				return capture.Frame{}, nil
 			})
@@ -93,16 +93,49 @@ func TestClipFrameFFmpegDisablesNestedIOAndDecodesOneJPEG(t *testing.T) {
 		t.Skip("ffmpeg unavailable")
 	}
 	t.Setenv("FFMPEG_BIN", bin)
-	// concat would read a nested file if the protocol gate were missing.
-	playlist := []byte("ffconcat version 1.0\nfile '/etc/passwd'\n")
-	if _, err := ffmpegFrameFromClip(context.Background(), bytes.NewReader(playlist)); err == nil {
+	// concat would read a nested file if the format/protocol gate were missing.
+	playlist, err := os.CreateTemp(t.TempDir(), "hostile-*.ffconcat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := playlist.WriteString("ffconcat version 1.0\nfile '/etc/passwd'\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := playlist.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ffmpegFrameFromClip(context.Background(), playlist); err == nil {
 		t.Fatal("nested file playlist unexpectedly decoded")
 	}
 	args := strings.Join(clipFrameFFmpegArgs(), " ")
-	for _, required := range []string{"-protocol_whitelist pipe", "-protocol_blacklist file,http,https,tcp,tls,udp,rtp,ftp", "-frames:v 1"} {
+	for _, required := range []string{"-protocol_whitelist file,pipe", "-format_whitelist mov,matroska,webm,mpegts", "-enable_drefs 0", "-use_absolute_path 0", "-frames:v 1"} {
 		if !strings.Contains(args, required) {
 			t.Fatalf("missing ffmpeg safety arg %q in %q", required, args)
 		}
+	}
+}
+
+func TestClipFrameFFmpegDecodesSeekRequiredMP4(t *testing.T) {
+	bin, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	t.Setenv("FFMPEG_BIN", bin)
+	path := t.TempDir() + "/moov-tail.mp4"
+	// Ordinary MP4 output puts its movie index at the tail. It cannot be decoded
+	// from a non-seekable stdin pipe but must work through the verified fd path.
+	cmd := exec.Command(bin, "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=32x24:d=1", "-frames:v", "1", "-c:v", "mpeg4", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build seek-required fixture: %v (%s)", err, out)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	frame, err := ffmpegFrameFromClip(context.Background(), f)
+	if err != nil || frame.Width != 32 || frame.Height != 24 || frame.MIMEType != "image/jpeg" {
+		t.Fatalf("frame=%+v err=%v", frame, err)
 	}
 }
 
