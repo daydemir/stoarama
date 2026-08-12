@@ -125,8 +125,12 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 			ids[e.RecordingID] = true
 			ranks[e.Rank] = true
 			var sid int64
-			if err = tx.QueryRow(ctx, `SELECT r.stream_id FROM recordings r JOIN streams s ON s.id=r.stream_id WHERE r.account_id=$1 AND r.id=$2`, m.AccountID, e.RecordingID).Scan(&sid); err != nil {
+			var attestationCount int
+			if err = tx.QueryRow(ctx, `SELECT r.stream_id,count(ev.id)::int FROM recordings r JOIN streams s ON s.id=r.stream_id LEFT JOIN recording_scene_frame_evidence ev ON ev.account_id=r.account_id AND ev.stream_id=r.stream_id AND ev.scene_identity_sha256=$3 AND ev.captured_at>=now()-interval '24 hours' WHERE r.account_id=$1 AND r.id=$2 AND r.status='active' GROUP BY r.stream_id`, m.AccountID, e.RecordingID, e.SceneIdentitySHA256).Scan(&sid, &attestationCount); err != nil {
 				log.Fatalf("recording %d: %v", e.RecordingID, err)
+			}
+			if attestationCount != 1 {
+				log.Fatalf("recording %d lacks exactly one current owned scene attestation", e.RecordingID)
 			}
 			scene := e.SceneIdentitySHA256
 			if len(scene) != 64 {
@@ -146,6 +150,10 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 			err = tx.QueryRow(ctx, `SELECT id,state FROM recording_campaign_tracks WHERE account_id=$1 AND campaign_key=$2 AND label=$3 AND deadline_at=$4 AND target_count=$5 AND grade_floor=$6 AND required_consecutive_windows=$7`, m.AccountID, t.Key, t.Label, t.DeadlineAt, t.TargetCount, t.GradeFloor, t.RequiredConsecutiveWindows).Scan(&trackID, &state)
 			if err != nil || state != "active" {
 				log.Fatalf("track %s exists with different definition/state", t.Key)
+			}
+			var total int
+			if err = tx.QueryRow(ctx, `SELECT count(*) FROM recording_campaign_roster_entries WHERE track_id=$1`, trackID).Scan(&total); err != nil || total != t.TargetCount {
+				log.Fatalf("active track %s has extra or missing rows", t.Key)
 			}
 			for _, e := range rr {
 				var matched int
