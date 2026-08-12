@@ -214,6 +214,51 @@ services:
       - key: EMAIL_RESEND_API_KEY
         sync: false
 
+  # Two-stage source validation: first repair signal up to two hours before a
+  # local window, then confirmation in its final thirty minutes. The command
+  # never leases, uploads, bills, or changes a recording and caps concurrency
+  # so the 06:00Z cohort cannot compete materially with production capture.
+  # This is an alerting preflight, not an admission gate: it never changes a
+  # recording or blocks its scheduled window.
+  - type: cron
+    name: stoarama-recording-preopen
+    env: go
+    rootDir: backend
+    plan: starter
+    schedule: "3,13,23,33,43,53 * * * *"
+    autoDeployTrigger: commit
+    buildCommand: |
+      set -euo pipefail
+      go build -o bin/stoaramactl ./cmd/stoaramactl
+      curl -fsSL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+      mkdir -p /tmp/ffmpeg-extract
+      tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+      cp /tmp/ffmpeg-extract/bin/ffmpeg /tmp/ffmpeg-extract/bin/ffprobe bin/
+      chmod +x bin/ffmpeg bin/ffprobe
+    startCommand: ./bin/stoaramactl recording-preopen run --concurrency 4 --probe-sec 20
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stoarama-db
+          property: connectionString
+      - key: APP_BASE_URL
+        value: https://stoarama.com
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_REPLY_TO
+        sync: false
+      - key: EMAIL_RESEND_API_KEY
+        sync: false
+      - key: FFMPEG_BIN
+        value: ./bin/ffmpeg
+      - key: FFPROBE_BIN
+        value: ./bin/ffprobe
+      # The source-native HTTPS HLS probe inherits this CA bundle.
+      - key: SSL_CERT_FILE
+        value: /etc/ssl/certs/ca-certificates.crt
+
   # Daily storage/media proof: runs the same health sweep plus HEAD, exact-size,
   # full-download, and ffprobe verification of the newest adjacent clip pair for
   # every active recording, followed by a decode-only concat proof. This detects

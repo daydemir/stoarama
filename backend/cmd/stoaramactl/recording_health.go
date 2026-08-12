@@ -39,6 +39,7 @@ const (
 	signalContinuousFragmented       = "continuous_fragmented"
 	signalContinuousLayoutChange     = "continuous_layout_change"
 	signalStoredClipInvalid          = "stored_clip_invalid"
+	signalPreopenQualityGate         = "preopen_quality_gate"
 )
 
 // clipTimestampDriftLimitSec is how far a clip's start may lead its own ingest
@@ -73,6 +74,7 @@ var healthSignalLabels = map[string]string{
 	signalContinuousFragmented:       "Completed continuous window is fragmented by frequent reconnect gaps",
 	signalContinuousLayoutChange:     "Adjacent native clips changed media layout and may not losslessly stitch",
 	signalStoredClipInvalid:          "Latest stored clip is missing, truncated, or not decodable",
+	signalPreopenQualityGate:         "Pre-open source validation needs attention",
 }
 
 var healthSignalSeverity = map[string]string{
