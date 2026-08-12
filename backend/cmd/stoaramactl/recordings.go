@@ -52,6 +52,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 		runRecordingStreakPriority(ctx, cfg, args[1:])
 		return
 	}
+	if args[0] == "campaign-tracks" {
+		runRecordingCampaignTracks(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) < 2 || args[0] != "naming" {
 		log.Fatal(recordingsUsage)
 	}
@@ -67,6 +71,20 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingCampaignTracks(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) < 1 || args[0] != "report" {
+		log.Fatal("campaign-tracks requires report")
+	}
+	fs := flag.NewFlagSet("recordings campaign-tracks report", flag.ExitOnError)
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
+	_ = fs.Parse(args[1:])
+	if len(fs.Args()) != 0 {
+		log.Fatalf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	printJSON(mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/account/recordings/campaign-tracks"))
 }
 
 func runRecordingStreakPriority(ctx context.Context, cfg config.Config, args []string) {
