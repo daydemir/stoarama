@@ -126,6 +126,16 @@ const relayLeaseSQL = `
 	    AND rec.start_at <= now()
 	    AND (rec.end_at IS NULL OR now() < rec.end_at)
 	    AND rec.capture_via = 'relay'
+	    -- YouTube resolution is egress-sensitive. Only nodes whose fresh heartbeat
+	    -- positively proves readiness may lease an authoritatively classified
+	    -- YouTube stream. Other source families retain the existing availability
+	    -- behavior; a missing/malformed readiness value fails closed for YouTube.
+	    AND (NOT EXISTS (
+	           SELECT 1 FROM streams source_stream
+	           WHERE source_stream.id=rec.stream_id
+	             AND source_stream.execution_class='youtube_direct')
+	         OR (jsonb_typeof(n.capabilities_jsonb->'youtube_ready') = 'boolean'
+	             AND (n.capabilities_jsonb->>'youtube_ready')::boolean))
 	    AND (j.handoff_owner IS NULL
 	         OR j.handoff_owner <> 'node:' || $1::text
 	         OR j.handoff_until <= now())
