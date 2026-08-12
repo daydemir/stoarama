@@ -117,6 +117,18 @@ func claimCleanupVerification(ctx context.Context, pool *pgxpool.Pool, owner str
 		return cleanupVerificationJob{}, false, err
 	}
 	defer tx.Rollback(ctx)
+	// A destination edited after the immutable candidate snapshot can never be
+	// verified with that snapshot's credentials/location. Terminalize it
+	// explicitly instead of leaving an invisible queued row forever.
+	if _, err := tx.Exec(ctx, `UPDATE r2_content_verifications v SET status='unknown',
+	  error_code='destination_identity_changed',updated_at=now()
+	  WHERE v.status='queued' AND EXISTS(
+	    SELECT 1 FROM nas_cleanup_candidate_items item JOIN nas_cleanup_candidate_runs run ON run.id=item.run_id
+	    LEFT JOIN storage_destinations d ON d.id=v.storage_destination_id AND d.account_id=run.account_id
+	      AND d.endpoint=v.endpoint_snapshot AND d.bucket=v.bucket
+	    WHERE item.verification_id=v.id AND d.id IS NULL)`); err != nil {
+		return cleanupVerificationJob{}, false, err
+	}
 	j := cleanupVerificationJob{LeaseToken: uuid.New()}
 	err = tx.QueryRow(ctx, `WITH candidate AS (
 	  SELECT v.id FROM r2_content_verifications v JOIN storage_destinations d ON d.id=v.storage_destination_id WHERE
