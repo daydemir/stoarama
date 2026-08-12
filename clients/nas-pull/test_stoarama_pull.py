@@ -44,6 +44,7 @@ class NASPullTests(unittest.TestCase):
             lock_file=state / "client.lock",
             update_manifest_url="https://stoarama.test/nas/download/latest.json",
             download_workers=12,
+            poll_interval_sec=1,
             inventory_scan_interval_sec=86400,
             inventory_scan_delay_ms=0,
             inventory_hash_mbps=1000,
@@ -1199,12 +1200,233 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg = self.config(Path(raw))
             runtime = pull.Runtime(cfg)
             stop_event = threading.Event()
+            inventory_stop_event = threading.Event()
             ready = threading.Event()
             with mock.patch.object(pull, "stage_update", return_value="new-version") as stage:
-                pull.update_loop(cfg, runtime, stop_event, ready)
+                pull.update_loop(cfg, runtime, stop_event, inventory_stop_event, ready)
             stage.assert_called_once_with(cfg)
+            self.assertTrue(inventory_stop_event.is_set())
             self.assertTrue(ready.is_set())
-            self.assertEqual(runtime.phase, pull.Phase.UPDATING)
+            self.assertEqual(runtime.phase, pull.Phase.STARTING)
+
+    def test_update_exec_waits_for_inventory_without_blocking_delivery_thread(self):
+        ready = threading.Event()
+        ready.set()
+        inventory_release = threading.Event()
+
+        def inventory_work():
+            inventory_release.wait()
+
+        inventory_worker = threading.Thread(target=inventory_work)
+        inventory_worker.start()
+        try:
+            self.assertFalse(pull.update_can_exec(ready, inventory_worker))
+            # The check is nonblocking: the caller can keep draining clips while
+            # a slow NAS read reaches its cooperative cancellation point.
+            self.assertTrue(inventory_worker.is_alive())
+            inventory_release.set()
+            inventory_worker.join(timeout=1)
+            self.assertTrue(pull.update_can_exec(ready, inventory_worker))
+            stopping = threading.Event()
+            stopping.set()
+            self.assertFalse(pull.update_can_exec(ready, inventory_worker, stopping))
+        finally:
+            inventory_release.set()
+            inventory_worker.join(timeout=1)
+
+    def test_update_exec_failure_is_terminal_and_bounded(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            with mock.patch.object(pull, "mark_runtime") as mark, mock.patch.object(
+                pull.os, "execve", side_effect=OSError("secret-bearing operating-system detail")
+            ), self.assertRaisesRegex(pull.SelfUpdateExecError, "failed to activate staged NAS client") as caught:
+                pull.exec_candidate(cfg, runtime)
+            mark.assert_called_once_with(cfg, runtime, pull.PreviousExit.SELF_UPDATE.value)
+            self.assertNotIn("secret-bearing", str(caught.exception))
+
+    def test_inventory_dirty_sync_stops_between_batches_and_preserves_unsent_rows(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            with inventory.lock:
+                for clip_id in range(1, pull.INVENTORY_SYNC_BATCH + 2):
+                    inventory._upsert({
+                        "clip_id": clip_id, "recording_id": 1,
+                        "relative_path": "recordings/%d.mp4" % clip_id,
+                        "size_bytes": 1, "sha256": "a" * 64,
+                    }, "present", pull.utc_now_precise(), 1, commit=False)
+                inventory.db.commit()
+            stop_event = threading.Event()
+            calls = []
+
+            def publish(*_args, **kwargs):
+                calls.append(kwargs["body"])
+                stop_event.set()
+                return {}
+
+            with mock.patch.object(pull, "request_json", side_effect=publish):
+                inventory.sync_dirty(cfg, stop_event=stop_event)
+            self.assertEqual(len(calls), 1)
+            remaining = inventory.db.execute("SELECT COUNT(*) FROM files WHERE dirty=1").fetchone()[0]
+            self.assertEqual(remaining, 1)
+            inventory.close()
+
+    def test_run_activates_quiescent_update_before_storage_work(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.validate = mock.Mock()
+            fake_inventory = mock.Mock()
+            fake_lock = mock.Mock()
+
+            class FakeThread:
+                def __init__(self, target, args=(), **_kwargs):
+                    self.target = target
+                    self.args = args
+                    self.alive = target is not pull.inventory_loop
+
+                def start(self):
+                    if self.target is pull.update_loop:
+                        self.target(*self.args)
+
+                def is_alive(self):
+                    return self.alive
+
+                def join(self, timeout=None):
+                    del timeout
+
+            with mock.patch.object(pull, "acquire_lock", return_value=fake_lock), mock.patch.object(
+                pull, "Inventory", return_value=fake_inventory
+            ), mock.patch.object(pull.threading, "Thread", FakeThread), mock.patch.object(
+                pull.signal, "signal"
+            ), mock.patch.object(pull, "mark_runtime"), mock.patch.object(
+                pull, "stage_update", return_value="new-version"
+            ), mock.patch.object(
+                pull, "check_storage", side_effect=AssertionError("storage work ran before update gate")
+            ), mock.patch.object(
+                pull, "exec_candidate", side_effect=pull.SelfUpdateExecError("activated")
+            ) as activate, self.assertRaisesRegex(pull.SelfUpdateExecError, "activated"):
+                pull.run(cfg)
+            activate.assert_called_once()
+
+    def test_signal_during_delivery_never_activates_staged_candidate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.validate = mock.Mock()
+            fake_inventory = mock.Mock()
+            fake_lock = mock.Mock()
+            handlers = []
+            inventory_threads = []
+
+            class FakeThread:
+                def __init__(self, target, args=(), **_kwargs):
+                    self.target = target
+                    self.args = args
+                    self.alive = True
+                    if target is pull.inventory_loop:
+                        inventory_threads.append(self)
+
+                def start(self):
+                    if self.target is pull.update_loop:
+                        self.target(*self.args)
+
+                def is_alive(self):
+                    return self.alive
+
+                def join(self, timeout=None):
+                    del timeout
+                    self.alive = False
+
+            def remember_handler(_signal_number, handler):
+                handlers.append(handler)
+
+            def stop_during_drain(*_args, **_kwargs):
+                handlers[0](None, None)
+                inventory_threads[0].alive = False
+                return False
+
+            with mock.patch.object(pull, "acquire_lock", return_value=fake_lock), mock.patch.object(
+                pull, "Inventory", return_value=fake_inventory
+            ), mock.patch.object(pull.threading, "Thread", FakeThread), mock.patch.object(
+                pull.signal, "signal", side_effect=remember_handler
+            ), mock.patch.object(pull, "mark_runtime"), mock.patch.object(
+                pull, "stage_update", return_value="new-version"
+            ), mock.patch.object(pull, "check_storage"), mock.patch.object(
+                pull, "drain_page", side_effect=stop_during_drain
+            ), mock.patch.object(pull, "exec_candidate") as activate:
+                self.assertEqual(pull.run(cfg), 0)
+            activate.assert_not_called()
+
+    def test_inventory_hash_cancellation_commits_progress_without_completing_scan(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.inventory_hash_mbps = 1
+            content = b"x" * (2 * 1024 * 1024)
+            clip = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(content)
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            stop_event = threading.Event()
+            original_wait = stop_event.wait
+            reads = 0
+
+            def cancel_after_first_chunk(delay):
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    stop_event.set()
+                    return True
+                return original_wait(delay)
+
+            with mock.patch.object(stop_event, "wait", side_effect=cancel_after_first_chunk), mock.patch.object(
+                pull, "request_json", return_value={}
+            ) as request:
+                inventory.full_scan(cfg, stop_event)
+            summary = inventory.summary()
+            self.assertIsNone(summary["scan_completed_at"])
+            self.assertEqual(summary["scan_rows_skipped"], 0)
+            self.assertFalse(any(call.kwargs.get("body", {}).get("complete") for call in request.mock_calls))
+            inventory.close()
+
+    def test_inventory_final_sync_cancellation_never_promotes_missing_or_complete(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            with inventory.lock:
+                inventory.db.execute(
+                    """INSERT INTO unmatched_files
+                       (relative_path,size_bytes,sha256,state,seen_generation,scan_pass,client_updated_at,dirty)
+                       VALUES ('old.mp4',1,?,'present','live','','2000-01-01T00:00:00Z',0)""",
+                    ("a" * 64,),
+                )
+                inventory.db.commit()
+            stop_event = threading.Event()
+            original_sync = inventory.sync_dirty
+            sync_calls = 0
+
+            def cancel_final_sync(*args, **kwargs):
+                nonlocal sync_calls
+                sync_calls += 1
+                stop_event.set()
+                return original_sync(*args, **kwargs)
+
+            with mock.patch.object(inventory, "sync_dirty", side_effect=cancel_final_sync), mock.patch.object(
+                pull, "request_json", return_value={}
+            ) as request:
+                inventory.full_scan(cfg, stop_event)
+            self.assertEqual(sync_calls, 1)
+            state = inventory.db.execute(
+                "SELECT state FROM unmatched_files WHERE relative_path='old.mp4'"
+            ).fetchone()[0]
+            self.assertEqual(state, "present")
+            self.assertIsNone(inventory.summary()["scan_completed_at"])
+            self.assertFalse(any(call.kwargs.get("body", {}).get("complete") for call in request.mock_calls))
+            inventory.close()
 
     def test_exhausted_retries_are_reported_for_download_and_release(self):
         with tempfile.TemporaryDirectory() as raw:

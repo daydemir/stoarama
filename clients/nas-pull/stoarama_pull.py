@@ -74,6 +74,14 @@ class InventoryProgressError(RuntimeError):
     pass
 
 
+class InventoryScanStopped(RuntimeError):
+    pass
+
+
+class SelfUpdateExecError(RuntimeError):
+    pass
+
+
 class MediaCertificationError(RuntimeError):
     pass
 
@@ -389,10 +397,10 @@ class Inventory:
                 )
             self.db.commit()
 
-    def _publish_scan_batch(self, cfg, generation, started_at, progress):
+    def _publish_scan_batch(self, cfg, generation, started_at, progress, stop_event=None):
         try:
             self._commit_scan_batch(progress)
-            self.sync_dirty(cfg, generation, started_at)
+            self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
         except Exception as exc:
             raise InventoryProgressError("inventory progress persistence failed") from exc
 
@@ -443,8 +451,10 @@ class Inventory:
         })
         self._mark_clean(rows)
 
-    def sync_dirty(self, cfg, generation="live", scan_started_at=None):
+    def sync_dirty(self, cfg, generation="live", scan_started_at=None, stop_event=None):
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return
             rows = self._rows("dirty=1")
             if not rows:
                 break
@@ -454,6 +464,8 @@ class Inventory:
             })
             self._mark_clean(rows)
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return
             with self.lock:
                 rows = self.db.execute(
                     """SELECT relative_path,size_bytes,sha256,state,file_mtime_ns,client_updated_at
@@ -647,7 +659,9 @@ class Inventory:
                 if self._linked_scan_row_is_current(clip, generation, scan_pass, path):
                     scanned += 1
                     if scanned % INVENTORY_SYNC_BATCH == 0:
-                        self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
+                        self._publish_scan_batch(
+                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                        )
                     continue
                 try:
                     stat = path.stat()
@@ -676,9 +690,14 @@ class Inventory:
                 self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
+                    self._publish_scan_batch(
+                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                    )
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+            except InventoryScanStopped:
+                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                return
             except sqlite3.Error as exc:
                 raise InventoryProgressError("inventory state persistence failed") from exc
             except InventoryProgressError:
@@ -707,7 +726,9 @@ class Inventory:
                 if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat):
                     scanned += 1
                     if scanned % INVENTORY_SYNC_BATCH == 0:
-                        self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
+                        self._publish_scan_batch(
+                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                        )
                     continue
                 size_bytes, sha256, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
                 updated_at = utc_now_precise()
@@ -724,9 +745,14 @@ class Inventory:
                     )
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
+                    self._publish_scan_batch(
+                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                    )
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+            except InventoryScanStopped:
+                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                return
             except sqlite3.Error as exc:
                 raise InventoryProgressError("inventory state persistence failed") from exc
             except InventoryProgressError:
@@ -740,7 +766,9 @@ class Inventory:
         # partial generation. In particular, do not turn unseen prior rows into
         # "missing" when an unreadable/corrupt path was skipped.
         self._commit_scan_batch((scanned, skipped, skip_reasons))
-        self.sync_dirty(cfg, generation, started_at)
+        self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
+        if stop_event.is_set():
+            return
         if skipped:
             raise RuntimeError("inventory scan incomplete: %d path(s) could not be verified" % skipped)
         completed_at = utc_now_precise()
@@ -756,8 +784,12 @@ class Inventory:
                 (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.commit()
-        self.sync_dirty(cfg, generation, started_at)
+        self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
+        if stop_event.is_set():
+            return
         digest, clips, total_bytes, mismatches, unmatched = self._digest_and_counts()
+        if stop_event.is_set():
+            return
         request_json(cfg, "POST", "/account/connections/inventory", body={
             "generation": generation, "scan_started_at": started_at,
             "scan_completed_at": completed_at, "digest": digest, "complete": True, "files": [],
@@ -778,7 +810,9 @@ def inventory_loop(cfg, inventory, stop_event):
         return
     while not stop_event.is_set():
         try:
-            inventory.sync_dirty(cfg)
+            inventory.sync_dirty(cfg, stop_event=stop_event)
+            if stop_event.is_set():
+                return
             inventory.full_scan(cfg, stop_event)
         except Exception as exc:
             log("WARN", "inventory scan/sync failed: %s" % exc)
@@ -1008,6 +1042,8 @@ def sha256_file_throttled(path, megabytes_per_sec, stop_event):
     target_bytes_per_sec = megabytes_per_sec * 1024 * 1024
     with open(path, "rb") as source:
         while True:
+            if stop_event.is_set():
+                raise InventoryScanStopped("inventory scan stopped")
             started = time.monotonic()
             chunk = source.read(1024 * 1024)
             if not chunk:
@@ -1016,7 +1052,7 @@ def sha256_file_throttled(path, megabytes_per_sec, stop_event):
             size += len(chunk)
             delay = len(chunk) / target_bytes_per_sec - (time.monotonic() - started)
             if delay > 0 and stop_event.wait(delay):
-                raise InterruptedError("inventory scan stopped")
+                raise InventoryScanStopped("inventory scan stopped")
     return size, digest.hexdigest()
 
 
@@ -1574,11 +1610,14 @@ def stage_update(cfg):
     return version
 
 
-def update_loop(cfg, runtime, stop_event, update_ready):
+def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready):
     while not stop_event.is_set():
         try:
             if stage_update(cfg):
-                runtime.set_phase(Phase.UPDATING)
+                # Staging is harmless, but process replacement is not. Ask the
+                # background inventory scan to stop at a durable checkpoint;
+                # the delivery loop remains live while it winds down.
+                inventory_stop_event.set()
                 update_ready.set()
                 return
         except Exception as exc:
@@ -1601,7 +1640,19 @@ def exec_candidate(cfg, runtime):
     mark_runtime(cfg, runtime, PreviousExit.SELF_UPDATE.value)
     env = os.environ.copy()
     env["STOARAMA_CANDIDATE"] = "1"
-    os.execve(sys.executable, [sys.executable, str(cfg.candidate_file), "run"], env)
+    try:
+        os.execve(sys.executable, [sys.executable, str(cfg.candidate_file), "run"], env)
+    except OSError as exc:
+        raise SelfUpdateExecError("failed to activate staged NAS client") from exc
+
+
+def update_can_exec(update_ready, inventory_worker, stop_event=None):
+    """Process replacement is safe only between delivery pages and scans."""
+    return (
+        update_ready.is_set()
+        and (stop_event is None or not stop_event.is_set())
+        and not inventory_worker.is_alive()
+    )
 
 
 def run(cfg):
@@ -1611,10 +1662,12 @@ def run(cfg):
     runtime = Runtime(cfg, inventory)
     mark_runtime(cfg, runtime)
     stop_event = threading.Event()
+    inventory_stop_event = threading.Event()
     update_ready = threading.Event()
 
     def stop(_signum, _frame):
         stop_event.set()
+        inventory_stop_event.set()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -1622,12 +1675,24 @@ def run(cfg):
     heartbeat.start()
     storage_probe = threading.Thread(target=storage_probe_loop, args=(cfg, runtime, stop_event), daemon=True)
     storage_probe.start()
-    updater = threading.Thread(target=update_loop, args=(cfg, runtime, stop_event, update_ready), daemon=True)
+    updater = threading.Thread(
+        target=update_loop,
+        args=(cfg, runtime, stop_event, inventory_stop_event, update_ready),
+        daemon=True,
+    )
     updater.start()
-    inventory_worker = threading.Thread(target=inventory_loop, args=(cfg, inventory, stop_event), daemon=True)
+    inventory_worker = threading.Thread(
+        target=inventory_loop, args=(cfg, inventory, inventory_stop_event), daemon=True,
+    )
     inventory_worker.start()
     try:
         while not stop_event.is_set():
+            # No delivery page is active at this boundary. A staged candidate
+            # may replace the process even when storage/list work is failing,
+            # provided the inventory thread has reached its stop checkpoint.
+            if update_can_exec(update_ready, inventory_worker, stop_event):
+                runtime.set_phase(Phase.UPDATING)
+                exec_candidate(cfg, runtime)
             if not heartbeat.is_alive():
                 log("WARN", "heartbeat thread dead; restarting")
                 heartbeat = threading.Thread(target=heartbeat_loop, args=(cfg, runtime, stop_event), daemon=True)
@@ -1651,17 +1716,21 @@ def run(cfg):
                     # not resurrect the previous client indefinitely.
                     mark_runtime(cfg, runtime, "healthy")
                     runtime.stable_marked = True
-                if update_ready.is_set():
+                if update_can_exec(update_ready, inventory_worker, stop_event):
+                    runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 runtime.set_phase(Phase.IDLE)
                 if not progress:
                     stop_event.wait(cfg.poll_interval_sec)
             except Exception as exc:
+                if isinstance(exc, SelfUpdateExecError):
+                    raise
                 runtime.set_error(str(exc))
                 log("ERROR", "drain failed: %s" % exc)
                 stop_event.wait(ERROR_BACKOFF_SEC)
     finally:
         stop_event.set()
+        inventory_stop_event.set()
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
         storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
