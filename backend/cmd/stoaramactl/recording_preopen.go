@@ -149,19 +149,23 @@ func selectPreopenTargets(ctx context.Context, pool *pgxpool.Pool, now time.Time
 }
 
 func probePreopenTargets(ctx context.Context, pool *pgxpool.Pool, targets []preopenTarget, limit int, probeWindow time.Duration) []preopenResult {
-	sem := make(chan struct{}, limit)
+	jobs := make(chan preopenTarget)
 	ch := make(chan preopenResult, len(targets))
 	var wg sync.WaitGroup
-	for _, t := range targets {
-		t := t
+	workerCount := min(limit, len(targets))
+	for range workerCount {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			ch <- probePreopenTarget(ctx, pool, t, probeWindow)
+			for t := range jobs {
+				ch <- probePreopenTarget(ctx, pool, t, probeWindow)
+			}
 		}()
 	}
+	for _, t := range targets {
+		jobs <- t
+	}
+	close(jobs)
 	wg.Wait()
 	close(ch)
 	out := make([]preopenResult, 0, len(targets))
