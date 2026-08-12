@@ -51,6 +51,15 @@ const clipTimestampDriftLimitSec = 90
 // must not hammer the provider or duplicate mail every five minutes.
 const healthAlertDeliveryRetryBackoff = 15 * time.Minute
 
+const (
+	healthAlertSilentDeathMaturity = 4 * time.Minute
+	// The hourly full sweep deliberately occupies the missing :30 live slot and
+	// evaluates the same live registry under the same timeline lock. Therefore
+	// either timeline run refreshes this continuity interval.
+	healthAlertDetectionContinuity = 12 * time.Minute
+	healthAlertReopenCooldown      = 30 * time.Minute
+)
+
 var healthSignalLabels = map[string]string{
 	signalContinuousSilentDeath:      "Continuous recording stopped producing clips mid-window",
 	signalContinuousWindowEndedEarly: "Continuous recording window ended early with no footage",
@@ -95,6 +104,7 @@ type healthIncident struct {
 	Severity    string
 	SinceText   string
 	Diag        string
+	Immediate   bool
 }
 
 func runRecordingHealth(ctx context.Context, cfg config.Config, args []string) {
@@ -172,11 +182,11 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 
 	toNotify := make([]healthIncident, 0, len(incidents))
 	for _, inc := range incidents {
-		newlyInserted, lastAlertedAt, lastDeliveryAttemptAt, err := upsertHealthAlert(ctx, pool, inc.RecordingID, inc.Signal)
+		newlyInserted, episodeStartedAt, lastAlertedAt, lastDeliveryAttemptAt, err := upsertHealthAlert(ctx, pool, inc.RecordingID, inc.Signal)
 		if err != nil {
 			log.Fatalf("upsert health alert recording=%d signal=%s: %v", inc.RecordingID, inc.Signal, err)
 		}
-		if shouldNotifyHealthIncident(newlyInserted, lastAlertedAt, lastDeliveryAttemptAt, now) {
+		if shouldNotifyHealthIncident(inc, newlyInserted, episodeStartedAt, lastAlertedAt, lastDeliveryAttemptAt, now) {
 			toNotify = append(toNotify, inc)
 		}
 	}
@@ -253,27 +263,43 @@ func acquireRecordingHealthRunLock(ctx context.Context, pool *pgxpool.Pool, veri
 
 // shouldNotifyHealthIncident decides whether an incident warrants an email.
 // last_alerted_at means successfully delivered, never merely attempted.
-func shouldNotifyHealthIncident(newlyInserted bool, lastAlertedAt time.Time, lastDeliveryAttemptAt *time.Time, now time.Time) bool {
+func shouldNotifyHealthIncident(inc healthIncident, newlyInserted bool, episodeStartedAt, lastAlertedAt time.Time, lastDeliveryAttemptAt *time.Time, now time.Time) bool {
+	if inc.Signal == signalContinuousSilentDeath && !inc.Immediate && now.Before(episodeStartedAt.Add(healthAlertSilentDeathMaturity)) {
+		return false
+	}
 	if !newlyInserted && lastDeliveryAttemptAt != nil && !lastDeliveryAttemptAt.Before(now.Add(-healthAlertDeliveryRetryBackoff)) {
 		return false
+	}
+	if inc.Signal == signalContinuousSilentDeath && lastAlertedAt.Before(episodeStartedAt) {
+		return lastAlertedAt.Before(now.Add(-healthAlertReopenCooldown))
 	}
 	return newlyInserted || lastAlertedAt.Before(now.Add(-24*time.Hour))
 }
 
-func upsertHealthAlert(ctx context.Context, pool *pgxpool.Pool, recordingID int64, signal string) (bool, time.Time, *time.Time, error) {
+func upsertHealthAlert(ctx context.Context, pool *pgxpool.Pool, recordingID int64, signal string) (bool, time.Time, time.Time, *time.Time, error) {
 	var newlyInserted bool
+	var episodeStartedAt time.Time
 	var lastAlertedAt time.Time
 	var lastDeliveryAttemptAt *time.Time
 	err := pool.QueryRow(ctx, `
-		INSERT INTO recorder_health_alerts (recording_id, signal, last_alerted_at)
-		VALUES ($1,$2,'1970-01-01 00:00:00+00'::timestamptz)
+		INSERT INTO recorder_health_alerts (recording_id, signal, last_alerted_at, episode_started_at, last_detected_at)
+		VALUES ($1,$2,'1970-01-01 00:00:00+00'::timestamptz,now(),now())
 		ON CONFLICT (recording_id,signal) DO UPDATE
-		  SET last_alerted_at = CASE WHEN recorder_health_alerts.resolved_at IS NOT NULL THEN '1970-01-01 00:00:00+00'::timestamptz ELSE recorder_health_alerts.last_alerted_at END,
+		  SET episode_started_at = CASE
+		        WHEN recorder_health_alerts.resolved_at IS NOT NULL
+		          OR recorder_health_alerts.last_detected_at IS NULL
+		          OR recorder_health_alerts.last_detected_at < now()-$3::interval
+		        THEN now() ELSE recorder_health_alerts.episode_started_at END,
+		      last_alerted_at = CASE
+		        WHEN recorder_health_alerts.resolved_at IS NOT NULL AND $2<>$4
+		        THEN '1970-01-01 00:00:00+00'::timestamptz
+		        ELSE recorder_health_alerts.last_alerted_at END,
+		      last_detected_at = now(),
 		      last_delivery_attempt_at = CASE WHEN recorder_health_alerts.resolved_at IS NOT NULL THEN NULL ELSE recorder_health_alerts.last_delivery_attempt_at END,
 		      resolved_at = NULL
-		RETURNING (xmax=0) AS newly_inserted, last_alerted_at, last_delivery_attempt_at
-	`, recordingID, signal).Scan(&newlyInserted, &lastAlertedAt, &lastDeliveryAttemptAt)
-	return newlyInserted, lastAlertedAt, lastDeliveryAttemptAt, err
+		RETURNING (xmax=0) AS newly_inserted, episode_started_at, last_alerted_at, last_delivery_attempt_at
+	`, recordingID, signal, healthAlertDetectionContinuity.String(), signalContinuousSilentDeath).Scan(&newlyInserted, &episodeStartedAt, &lastAlertedAt, &lastDeliveryAttemptAt)
+	return newlyInserted, episodeStartedAt, lastAlertedAt, lastDeliveryAttemptAt, err
 }
 
 func markHealthAlertsDeliveryAttempted(ctx context.Context, pool *pgxpool.Pool, incidents []healthIncident) error {
@@ -1221,6 +1247,7 @@ func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshn
 			Signal: signalContinuousSilentDeath, Severity: healthSignalSeverity[signalContinuousSilentDeath],
 			SinceText: sinceText,
 			Diag:      diag,
+			Immediate: strings.Contains(diag, "capture_state=fresh_ingest_stale_media") || strings.TrimSpace(lastErr) != "",
 		})
 	}
 	if err := rows.Err(); err != nil {
