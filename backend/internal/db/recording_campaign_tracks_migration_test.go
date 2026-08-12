@@ -62,6 +62,21 @@ func TestRecordingCampaignTracksAuditAndProtection(t *testing.T) {
 	if err = c.QueryRow(ctx, `SELECT count(*) FROM protected_campaign_recordings WHERE account_id=1 AND recording_id=4`).Scan(&protected); err != nil || protected != 1 {
 		t.Fatalf("protected=%d err=%v", protected, err)
 	}
+	if _, err = c.Exec(ctx, `UPDATE recording_campaign_roster_entries SET status='removed',decision_at=now(),updated_by_user_id=2 WHERE track_id=$1 AND recording_id=4`, track); err == nil {
+		t.Fatal("active target drift succeeded")
+	}
+	if _, err = c.Exec(ctx, `UPDATE recording_campaign_tracks SET target_count=2 WHERE id=$1`, track); err == nil {
+		t.Fatal("active definition mutation succeeded")
+	}
+	if _, err = c.Exec(ctx, `SELECT transition_recording_campaign_track($1,'complete',ARRAY['deadline_complete'],2,now())`, track); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.QueryRow(ctx, `SELECT count(*) FROM protected_campaign_recordings WHERE account_id=1 AND recording_id=4`).Scan(&protected); err != nil || protected != 1 {
+		t.Fatalf("complete protection=%d err=%v", protected, err)
+	}
+	if _, err = c.Exec(ctx, `SELECT transition_recording_campaign_track($1,'retired',ARRAY['approved_retire'],2,now())`, track); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = c.Exec(ctx, `UPDATE recording_campaign_roster_entries SET status='removed',decision_at=now(),updated_by_user_id=2 WHERE track_id=$1 AND recording_id=4`, track); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +86,7 @@ func TestRecordingCampaignTracksAuditAndProtection(t *testing.T) {
 	if _, err = c.Exec(ctx, `DELETE FROM recording_campaign_roster_events WHERE track_id=$1`, track); err == nil {
 		t.Fatal("append-only event delete succeeded")
 	}
-	if _, err = c.Exec(ctx, `UPDATE recording_campaign_tracks SET state='retired' WHERE id=$1`, track); err == nil {
+	if _, err = c.Exec(ctx, `UPDATE recording_campaign_tracks SET state='active' WHERE id=$1`, track); err == nil {
 		t.Fatal("direct lifecycle update succeeded")
 	}
 }

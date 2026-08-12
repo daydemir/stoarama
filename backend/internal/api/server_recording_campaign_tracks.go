@@ -22,6 +22,7 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 		 r.name,r.status,
 		 j.fire_at,j.window_end_at,j.status,
 		 COALESCE(first3.clip_count,0),first3.latest_media_at,first3.latest_ingest_at,
+		 joblatest.clip_end_at,joblatest.created_at,
 		 early.result,early.checked_at,confirm.result,confirm.checked_at,
 		 COALESCE(q.good_windows,0),COALESCE(q.total_windows,0),q.latest_coverage_pct,
 		 latest.clip_end_at,latest.created_at
@@ -30,6 +31,7 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 		JOIN recordings r ON r.id=e.recording_id AND r.account_id=t.account_id AND r.stream_id=e.stream_id
 		LEFT JOIN LATERAL (SELECT id,fire_at,window_end_at,status FROM recording_jobs x WHERE x.recording_id=r.id AND x.kind='continuous_window' AND x.window_end_at>now() ORDER BY x.fire_at LIMIT 1) j ON true
 		LEFT JOIN LATERAL (SELECT count(*)::int clip_count,max(clip_end_at) latest_media_at,max(created_at) latest_ingest_at FROM (SELECT clip_end_at,created_at FROM recording_clips c WHERE c.recording_job_id=j.id ORDER BY created_at LIMIT 3) bounded) first3 ON true
+		LEFT JOIN LATERAL (SELECT clip_end_at,created_at FROM recording_clips c WHERE c.recording_job_id=j.id ORDER BY created_at DESC LIMIT 1) joblatest ON true
 		LEFT JOIN recording_preopen_checks early ON early.recording_id=r.id AND early.window_start_at=j.fire_at AND early.stage='early'
 		LEFT JOIN recording_preopen_checks confirm ON confirm.recording_id=r.id AND confirm.window_start_at=j.fire_at AND confirm.stage='confirm'
 		LEFT JOIN LATERAL (SELECT count(*) FILTER(WHERE metric_version>=2 AND coverage_pct>=95 AND largest_gap_seconds<=900 AND gap_over_5m_count<=1 AND gap_over_30s_count<=6 AND overlap_count=0)::int good_windows,
@@ -54,12 +56,13 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 		var jobState *string
 		var clips int
 		var firstMedia, firstIngest *time.Time
+		var jobMedia, jobIngest *time.Time
 		var earlyResult, confirmResult *string
 		var earlyAt, confirmAt *time.Time
 		var goodWindows, totalWindows int
 		var latestCoverage *float64
 		var latestMedia, latestIngest *time.Time
-		if err := rows.Scan(&key, &label, &deadline, &target, &floor, &required, &trackState, &recordingID, &streamID, &scene, &role, &rank, &rosterState, &reasons, &decision, &evidenceAt, &evidenceSHA, &recName, &recState, &fire, &end, &jobState, &clips, &firstMedia, &firstIngest, &earlyResult, &earlyAt, &confirmResult, &confirmAt, &goodWindows, &totalWindows, &latestCoverage, &latestMedia, &latestIngest); err != nil {
+		if err := rows.Scan(&key, &label, &deadline, &target, &floor, &required, &trackState, &recordingID, &streamID, &scene, &role, &rank, &rosterState, &reasons, &decision, &evidenceAt, &evidenceSHA, &recName, &recState, &fire, &end, &jobState, &clips, &firstMedia, &firstIngest, &jobMedia, &jobIngest, &earlyResult, &earlyAt, &confirmResult, &confirmAt, &goodWindows, &totalWindows, &latestCoverage, &latestMedia, &latestIngest); err != nil {
 			util.WriteError(w, 500, "scan campaign tracks")
 			return
 		}
@@ -73,7 +76,7 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 				checkpoint = "preopen_t_minus_2h_due"
 			case d > 0 && (confirmResult == nil || *confirmResult != "pass"):
 				checkpoint = "preopen_t_minus_30m_due"
-			case d <= 0 && (clips < 3 || firstMedia == nil || firstIngest == nil || firstIngest.Before(time.Now().Add(-5*time.Minute))):
+			case d <= 0 && (clips < 3 || firstMedia == nil || firstIngest == nil || jobMedia == nil || jobIngest == nil || jobMedia.Before(time.Now().Add(-5*time.Minute)) || jobIngest.Before(time.Now().Add(-5*time.Minute))):
 				checkpoint = "first_3_clips_due"
 			default:
 				checkpoint = "first_3_clips_observed_current_job"

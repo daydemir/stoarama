@@ -46,10 +46,10 @@ CREATE TABLE recording_campaign_roster_entries (
   source_health_job_id BIGINT,
   updated_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(track_id,recording_id),
-  UNIQUE(track_id,rank),
-  UNIQUE(track_id,scene_identity_sha256),
-  CHECK(cardinality(reason_codes)<=16)
+  UNIQUE(track_id,recording_id) DEFERRABLE INITIALLY DEFERRED,
+  UNIQUE(track_id,rank) DEFERRABLE INITIALLY DEFERRED,
+  UNIQUE(track_id,scene_identity_sha256) DEFERRABLE INITIALLY DEFERRED,
+  CHECK(cardinality(reason_codes) BETWEEN 1 AND 16)
 );
 CREATE INDEX idx_campaign_roster_protection ON recording_campaign_roster_entries(recording_id,track_id)
   WHERE status IN ('protect','probation');
@@ -85,7 +85,7 @@ FROM recording_campaign_tracks t JOIN recording_campaign_roster_entries e ON e.t
 WHERE t.state IN ('active','complete') AND e.status IN ('protect','probation');
 
 CREATE FUNCTION validate_recording_campaign_roster_entry() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE expected_stream BIGINT; expected_account BIGINT; track_account BIGINT; authorized BOOLEAN;
+DECLARE expected_stream BIGINT; expected_account BIGINT; track_account BIGINT; authorized BOOLEAN; evidence_count INTEGER;
 BEGIN
   IF TG_OP='UPDATE' AND (NEW.track_id,NEW.recording_id,NEW.stream_id,NEW.scene_identity_sha256)
     IS DISTINCT FROM (OLD.track_id,OLD.recording_id,OLD.stream_id,OLD.scene_identity_sha256) THEN
@@ -98,6 +98,15 @@ BEGIN
   END IF;
   SELECT (u.is_operator OR EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.org_id=track_account AND m.accepted_at IS NOT NULL AND m.role IN ('owner','admin'))) INTO authorized FROM users u WHERE u.id=NEW.updated_by_user_id;
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign decision actor is not an account owner/operator'; END IF;
+  IF (NEW.source_health_recording_id IS NULL)<>(NEW.source_health_job_id IS NULL) THEN RAISE EXCEPTION 'health evidence identity must be wholly present or absent'; END IF;
+  IF NEW.source_job_id IS NOT NULL THEN
+    SELECT count(*) INTO evidence_count FROM recording_jobs j WHERE j.id=NEW.source_job_id AND j.recording_id=NEW.recording_id;
+    IF evidence_count<>1 THEN RAISE EXCEPTION 'job evidence does not belong to roster recording'; END IF;
+  END IF;
+  IF NEW.source_health_recording_id IS NOT NULL THEN
+    SELECT count(*) INTO evidence_count FROM recording_window_health h WHERE h.recording_id=NEW.recording_id AND h.recording_id=NEW.source_health_recording_id AND h.job_id=NEW.source_health_job_id AND (NEW.source_window_end_at IS NULL OR h.window_end_at=NEW.source_window_end_at);
+    IF evidence_count<>1 THEN RAISE EXCEPTION 'health evidence does not belong to roster recording/window'; END IF;
+  END IF;
   NEW.updated_at=now();
   RETURN NEW;
 END $$;
@@ -107,6 +116,20 @@ CREATE FUNCTION reject_recording_campaign_roster_delete() RETURNS trigger LANGUA
 BEGIN RAISE EXCEPTION 'campaign roster entries use removed status and cannot be deleted'; END $$;
 CREATE TRIGGER trg_recording_campaign_roster_no_delete BEFORE DELETE ON recording_campaign_roster_entries
 FOR EACH ROW EXECUTE FUNCTION reject_recording_campaign_roster_delete();
+
+CREATE FUNCTION enforce_active_campaign_target() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE target_track BIGINT; expected INTEGER; actual INTEGER; track_state TEXT;
+BEGIN
+ target_track=COALESCE(NEW.track_id,OLD.track_id);
+ SELECT state,target_count INTO track_state,expected FROM recording_campaign_tracks WHERE id=target_track;
+ IF track_state IN ('active','complete') THEN
+   SELECT count(*) INTO actual FROM recording_campaign_roster_entries WHERE track_id=target_track AND role='primary' AND status IN ('protect','probation');
+   IF actual<>expected THEN RAISE EXCEPTION 'active campaign must retain exact target primary roster'; END IF;
+ END IF;
+ RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER trg_campaign_roster_exact_target AFTER INSERT OR UPDATE OR DELETE ON recording_campaign_roster_entries
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_active_campaign_target();
 
 CREATE FUNCTION audit_recording_campaign_roster_entry() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE kind TEXT;
@@ -140,7 +163,7 @@ BEGIN
  IF NOT ((old_state='draft' AND p_to='active') OR (old_state='active' AND p_to='complete') OR (old_state IN ('draft','active','complete') AND p_to='retired')) THEN RAISE EXCEPTION 'invalid campaign track transition'; END IF;
  SELECT (u.is_operator OR EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.org_id=track_account AND m.accepted_at IS NOT NULL AND m.role IN ('owner','admin'))) INTO authorized FROM users u WHERE u.id=p_actor;
  IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign transition actor is not an account owner/operator'; END IF;
- IF p_to='active' THEN
+ IF p_to IN ('active','complete') THEN
    SELECT count(*) INTO actual_count FROM recording_campaign_roster_entries WHERE track_id=p_track AND role='primary' AND status IN ('protect','probation');
    IF actual_count<>expected_count THEN RAISE EXCEPTION 'active track requires exact target primary roster'; END IF;
  END IF;
@@ -152,9 +175,12 @@ END $$;
 
 CREATE FUNCTION guard_recording_campaign_track_state() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ IF OLD.state<>'draft' AND (NEW.account_id,NEW.campaign_key,NEW.label,NEW.deadline_at,NEW.target_count,NEW.grade_floor,NEW.required_consecutive_windows,NEW.created_by_user_id)
+   IS DISTINCT FROM (OLD.account_id,OLD.campaign_key,OLD.label,OLD.deadline_at,OLD.target_count,OLD.grade_floor,OLD.required_consecutive_windows,OLD.created_by_user_id) THEN RAISE EXCEPTION 'active campaign definition is immutable'; END IF;
  IF NEW.state IS DISTINCT FROM OLD.state AND current_setting('stoarama.campaign_transition',true) IS DISTINCT FROM '1' THEN RAISE EXCEPTION 'use transition_recording_campaign_track'; END IF;
  RETURN NEW;
 END $$;
 CREATE TRIGGER trg_campaign_track_state_guard BEFORE UPDATE ON recording_campaign_tracks FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_track_state();
 
 CREATE INDEX idx_recording_clips_job_created ON recording_clips(recording_job_id,created_at DESC);
+CREATE INDEX idx_recording_clips_recording_created ON recording_clips(recording_id,created_at DESC);
