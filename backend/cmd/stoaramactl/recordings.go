@@ -53,6 +53,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 		return
 	}
 	if args[0] == "campaign-tracks" {
+		if len(args) > 1 && args[1] == "seed" {
+			runCampaignTrackSeed(ctx, cfg, args[2:])
+			return
+		}
 		runRecordingCampaignTracks(ctx, cfg, args[1:])
 		return
 	}
