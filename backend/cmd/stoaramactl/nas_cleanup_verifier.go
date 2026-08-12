@@ -119,10 +119,14 @@ func claimCleanupVerification(ctx context.Context, pool *pgxpool.Pool, owner str
 	defer tx.Rollback(ctx)
 	j := cleanupVerificationJob{LeaseToken: uuid.New()}
 	err = tx.QueryRow(ctx, `WITH candidate AS (
-	  SELECT id FROM r2_content_verifications WHERE
-	    (status='queued' OR (status='leased' AND lease_expires_at<now()))
-	    AND next_attempt_at<=now() AND attempt_count<max_attempts
-	  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+	  SELECT v.id FROM r2_content_verifications v JOIN storage_destinations d ON d.id=v.storage_destination_id WHERE
+	    (v.status='queued' OR (v.status='leased' AND v.lease_expires_at<now()))
+	    AND v.next_attempt_at<=now() AND v.attempt_count<v.max_attempts
+	    AND d.endpoint=v.endpoint_snapshot AND d.bucket=v.bucket
+	    AND EXISTS(SELECT 1 FROM nas_cleanup_candidate_items item
+	      JOIN nas_cleanup_candidate_runs run ON run.id=item.run_id
+	      WHERE item.verification_id=v.id AND run.account_id=d.account_id)
+	  ORDER BY v.id FOR UPDATE OF v SKIP LOCKED LIMIT 1)
 	UPDATE r2_content_verifications v SET status='leased',lease_token=$1,lease_owner=$2,
 	  lease_expires_at=now()+$3::interval,attempt_count=attempt_count+1,updated_at=now()
 	FROM candidate c,storage_destinations d
@@ -222,6 +226,8 @@ func finalizeReadyCandidateRuns(ctx context.Context, pool *pgxpool.Pool) error {
 	 WHERE run.state IN('queued','verifying','unknown') AND run.unknown_count=0
 	 AND conn.inventory_scan_rows_skipped=0 AND conn.inventory_scan_started_at>run.created_at
 	 AND conn.inventory_scan_completed_at>run.created_at AND conn.inventory_scan_completed_at>=conn.inventory_scan_started_at
+	 AND conn.inventory_scan_completed_at>=now()-interval '72 hours'
+	 AND conn.inventory_scan_completed_at<=now()+interval '5 minutes'
 	 AND conn.inventory_in_progress_generation='' AND conn.inventory_generation<>''
 	 AND conn.inventory_digest~'^[0-9a-f]{64}$' AND conn.inventory_live_revision=conn.inventory_tree_revision
 	 AND NOT EXISTS(SELECT 1 FROM recording_qualification_members protected
@@ -284,8 +290,20 @@ func finalizeReadyCandidateRun(ctx context.Context, pool *pgxpool.Pool, id uuid.
 	 WHERE run.id=$1 AND run.state IN('queued','verifying','unknown') AND run.unknown_count=0
 	 AND conn.inventory_scan_rows_skipped=0 AND conn.inventory_scan_started_at>run.created_at AND conn.inventory_scan_completed_at>run.created_at
 	 AND conn.inventory_scan_completed_at>=conn.inventory_scan_started_at AND conn.inventory_in_progress_generation=''
+	 AND conn.inventory_scan_completed_at>=now()-interval '72 hours'
+	 AND conn.inventory_scan_completed_at<=now()+interval '5 minutes'
 	 AND conn.inventory_generation<>'' AND conn.inventory_digest~'^[0-9a-f]{64}$'
 	 AND conn.inventory_live_revision=conn.inventory_tree_revision
+	 AND run.item_count=(SELECT count(*) FROM recording_clips clip
+	   WHERE clip.recording_id=ANY(run.recording_ids) AND clip.purged_at IS NULL)
+	 AND run.total_bytes=(SELECT COALESCE(sum(clip.size_bytes),0) FROM recording_clips clip
+	   WHERE clip.recording_id=ANY(run.recording_ids) AND clip.purged_at IS NULL)
+	 AND NOT EXISTS(SELECT 1 FROM recording_clips clip
+	   LEFT JOIN nas_cleanup_candidate_items item ON item.run_id=run.id AND item.clip_id=clip.id
+	   WHERE clip.recording_id=ANY(run.recording_ids) AND clip.purged_at IS NULL
+	     AND (item.clip_id IS NULL OR item.recording_id IS DISTINCT FROM clip.recording_id
+	       OR item.size_bytes IS DISTINCT FROM clip.size_bytes OR item.content_sha256 IS DISTINCT FROM lower(clip.sha256)
+	       OR item.relative_path IS DISTINCT FROM clip.display_path))
 	 AND NOT EXISTS(SELECT 1 FROM recording_qualification_members protected
 	   WHERE protected.account_id=run.account_id AND protected.recording_id=ANY(run.recording_ids))
 	 AND NOT EXISTS(SELECT 1 FROM protected_campaign_recordings protected
@@ -317,7 +335,14 @@ func finalizeReadyCandidateRun(ctx context.Context, pool *pgxpool.Pool, id uuid.
 	 AND inv.file_mtime_ns IS NOT DISTINCT FROM item.file_mtime_ns AND inv.file_ctime_ns IS NOT DISTINCT FROM item.file_ctime_ns
 	 AND inv.file_inode IS NOT DISTINCT FROM item.file_inode AND inv.file_device IS NOT DISTINCT FROM item.file_device
 	 AND inv.sidecar_relative_path IS NOT DISTINCT FROM item.sidecar_relative_path AND inv.sidecar_size_bytes IS NOT DISTINCT FROM item.sidecar_size_bytes
-	 AND lower(inv.sidecar_sha256) IS NOT DISTINCT FROM item.sidecar_sha256 ORDER BY item.ordinal FOR SHARE OF item,inv,verification`, id)
+	 AND lower(inv.sidecar_sha256) IS NOT DISTINCT FROM item.sidecar_sha256
+	 AND NOT EXISTS(SELECT 1 FROM nas_inventory_files duplicate
+	   WHERE duplicate.connection_id=inv.connection_id AND duplicate.relative_path=inv.relative_path
+	     AND duplicate.clip_id<>inv.clip_id AND duplicate.state IN('present','mismatch'))
+	 AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files unmatched
+	   WHERE unmatched.connection_id=inv.connection_id AND unmatched.relative_path=inv.relative_path
+	     AND unmatched.state='present')
+	 ORDER BY item.ordinal FOR SHARE OF item,inv,verification`, id)
 	if err != nil {
 		return err
 	}
