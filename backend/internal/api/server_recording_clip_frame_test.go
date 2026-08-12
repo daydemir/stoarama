@@ -169,7 +169,6 @@ func TestPersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime(
 		`CREATE TABLE recording_clips(id bigint primary key,recording_id bigint not null,storage_destination_id bigint not null,sha256 text not null,etag text not null,purged_at timestamptz,released_at timestamptz,clip_start_at timestamptz,clip_end_at timestamptz,object_key text,size_bytes bigint)`,
 		`CREATE TABLE media_objects(id bigserial primary key,storage_provider text not null,bucket text not null,object_key text not null,mime_type text not null,size_bytes bigint not null,etag text not null default '',sha256 text,width integer,height integer,created_at timestamptz not null default now(),unique(bucket,object_key))`,
 		`CREATE TABLE frames(id bigserial primary key,stream_id bigint not null,capture_job_id bigint,captured_at timestamptz not null,raw_media_object_id bigint,capture_status text not null,capture_error text,source_kind text not null,source_recording_clip_id bigint unique,source_recording_clip_sha256 text,source_recording_clip_etag text,source_recording_clip_version_id text)`,
-		`CREATE TABLE stream_health(stream_id bigint primary key,captures_total bigint not null default 0,captures_success bigint not null default 0,captures_error bigint not null default 0,last_error_at timestamptz,last_error_text text,last_capture_at timestamptz,updated_at timestamptz not null default now())`,
 		`CREATE TABLE stream_capture_runtime(stream_id bigint primary key,execution_class text,resolved_url text,status text,last_frame_at timestamptz)`,
 		`INSERT INTO recordings VALUES(10,47,99,'active','https://unchanged.example/live')`,
 		`INSERT INTO storage_destinations VALUES(20,47,'verified',true,'auto','bucket','https://storage.example.test','key','secret')`,
@@ -225,13 +224,13 @@ func TestPersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime(
 	if puts.Load() != 1 {
 		t.Fatalf("uploads=%d", puts.Load())
 	}
-	var frames, successes int
+	var frames int
 	var recStatus, recURL, runtimeClass, runtimeURL, runtimeStatus, clipETag string
 	var purgedAt *time.Time
-	if err = pool.QueryRow(ctx, `SELECT count(*),(SELECT captures_success FROM stream_health WHERE stream_id=99),(SELECT status FROM recordings WHERE id=10),(SELECT stream_url FROM recordings WHERE id=10),(SELECT execution_class FROM stream_capture_runtime WHERE stream_id=99),(SELECT resolved_url FROM stream_capture_runtime WHERE stream_id=99),(SELECT status FROM stream_capture_runtime WHERE stream_id=99),(SELECT etag FROM recording_clips WHERE id=30),(SELECT purged_at FROM recording_clips WHERE id=30) FROM frames WHERE source_recording_clip_id=30`).Scan(&frames, &successes, &recStatus, &recURL, &runtimeClass, &runtimeURL, &runtimeStatus, &clipETag, &purgedAt); err != nil {
+	if err = pool.QueryRow(ctx, `SELECT count(*),(SELECT status FROM recordings WHERE id=10),(SELECT stream_url FROM recordings WHERE id=10),(SELECT execution_class FROM stream_capture_runtime WHERE stream_id=99),(SELECT resolved_url FROM stream_capture_runtime WHERE stream_id=99),(SELECT status FROM stream_capture_runtime WHERE stream_id=99),(SELECT etag FROM recording_clips WHERE id=30),(SELECT purged_at FROM recording_clips WHERE id=30) FROM frames WHERE source_recording_clip_id=30`).Scan(&frames, &recStatus, &recURL, &runtimeClass, &runtimeURL, &runtimeStatus, &clipETag, &purgedAt); err != nil {
 		t.Fatal(err)
 	}
-	if frames != 1 || successes != 1 || recStatus != "active" || recURL != "https://unchanged.example/live" || runtimeClass != "video_live" || runtimeURL != "https://secret.example/live" || runtimeStatus != "running" || clipETag != "clip-etag" || purgedAt != nil {
-		t.Fatalf("unexpected mutation frames=%d successes=%d rec=%s/%s runtime=%s/%s/%s clip=%s purged=%v", frames, successes, recStatus, recURL, runtimeClass, runtimeURL, runtimeStatus, clipETag, purgedAt)
+	if frames != 1 || recStatus != "active" || recURL != "https://unchanged.example/live" || runtimeClass != "video_live" || runtimeURL != "https://secret.example/live" || runtimeStatus != "running" || clipETag != "clip-etag" || purgedAt != nil {
+		t.Fatalf("unexpected mutation frames=%d rec=%s/%s runtime=%s/%s/%s clip=%s purged=%v", frames, recStatus, recURL, runtimeClass, runtimeURL, runtimeStatus, clipETag, purgedAt)
 	}
 }

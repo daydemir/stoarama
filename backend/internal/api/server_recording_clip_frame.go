@@ -308,9 +308,6 @@ func (s *Server) persistClipBackedAuthoritativeFrame(ctx context.Context, src re
 	if err = tx.QueryRow(ctx, `INSERT INTO frames(stream_id,capture_job_id,captured_at,raw_media_object_id,capture_status,capture_error,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag,source_recording_clip_version_id) VALUES($1,NULL,$2,$3,'success',NULL,'authoritative_frame_refresh',$4,$5,$6,NULLIF($7,'')) RETURNING id`, src.streamID, capturedAt, mediaID, src.clipID, src.clipSHA, src.clipETag, versionID).Scan(&frameID); err != nil {
 		return 0, "", fmt.Errorf("insert clip frame: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO stream_health(stream_id,captures_total,captures_success,captures_error,last_capture_at,last_error_at,last_error_text) VALUES($1,1,1,0,$2,NULL,NULL) ON CONFLICT(stream_id) DO UPDATE SET captures_total=stream_health.captures_total+1,captures_success=stream_health.captures_success+1,last_capture_at=GREATEST(stream_health.last_capture_at,EXCLUDED.last_capture_at),updated_at=now()`, src.streamID, capturedAt); err != nil {
-		return 0, "", fmt.Errorf("update clip frame health: %w", err)
-	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, "", fmt.Errorf("commit clip frame: %w", err)
 	}
