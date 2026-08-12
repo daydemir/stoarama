@@ -131,7 +131,6 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 		t.Fatal(err)
 	}
 	var putCount atomic.Int32
-	var removeCount atomic.Int32
 	s := &Server{pool: pool}
 	capturedAt := time.Now().UTC()
 	store := func() error {
@@ -141,7 +140,7 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 				t.Fatal("invalid upload")
 			}
 			return "etag", nil
-		}, func(context.Context, string) error { removeCount.Add(1); return nil })
+		})
 	}
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
@@ -156,8 +155,8 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if putCount.Load() != 1 || removeCount.Load() != 0 {
-		t.Fatalf("uploads=%d removes=%d", putCount.Load(), removeCount.Load())
+	if putCount.Load() != 1 {
+		t.Fatalf("uploads=%d", putCount.Load())
 	}
 	var status, recURL, execClass, resolvedURL, runtimeStatus, sourceKind, mediaSHA string
 	var frames, successes int
@@ -174,17 +173,70 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 		t.Fatalf("frames=%d err=%v", frames, err)
 	}
 	putCount.Store(0)
-	if err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID+1, streamID, time.Now().UTC(), frame, "test-bucket", func(context.Context, string, string, []byte) (string, error) { putCount.Add(1); return "etag", nil }, func(context.Context, string) error { return nil }); err == nil || putCount.Load() != 0 {
+	if err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID+1, streamID, time.Now().UTC(), frame, "test-bucket", func(context.Context, string, string, []byte) (string, error) { putCount.Add(1); return "etag", nil }); err == nil || putCount.Load() != 0 {
 		t.Fatalf("foreign account err=%v uploads=%d", err, putCount.Load())
 	}
-	// A post-upload DB failure must roll back rows and remove the R2 object.
+	// A post-upload DB failure rolls back rows but intentionally preserves the
+	// deterministic R2 object. Its ownership may be ambiguous; the exact-hash
+	// retry below must safely reuse the same key and create one evidence row.
 	if _, err = pool.Exec(ctx, `DROP TABLE stream_health`); err != nil {
 		t.Fatal(err)
 	}
 	putCount.Store(0)
-	removeCount.Store(0)
-	err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, time.Now().Add(time.Second).UTC(), frame, "test-bucket", func(context.Context, string, string, []byte) (string, error) { putCount.Add(1); return "etag", nil }, func(context.Context, string) error { removeCount.Add(1); return nil })
-	if err == nil || putCount.Load() != 1 || removeCount.Load() != 1 {
-		t.Fatalf("failure cleanup err=%v uploads=%d removes=%d", err, putCount.Load(), removeCount.Load())
+	failureAt := time.Now().Add(time.Second).UTC()
+	var preservedKey string
+	err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, failureAt, frame, "test-bucket", func(_ context.Context, key, _ string, body []byte) (string, error) {
+		putCount.Add(1)
+		preservedKey = key
+		if sha256.Sum256(body) != sha256.Sum256(frame.Bytes) {
+			t.Fatal("post-upload failure changed object bytes")
+		}
+		return "etag", nil
+	})
+	if err == nil || putCount.Load() != 1 {
+		t.Fatalf("post-upload failure err=%v uploads=%d", err, putCount.Load())
+	}
+	if _, err = pool.Exec(ctx, `CREATE TABLE stream_health(stream_id bigint primary key,captures_total bigint not null default 0,captures_success bigint not null default 0,captures_error bigint not null default 0,last_error_at timestamptz,last_error_text text,last_capture_at timestamptz,updated_at timestamptz not null default now())`); err != nil {
+		t.Fatal(err)
+	}
+	err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, failureAt, frame, "test-bucket", func(_ context.Context, key, _ string, body []byte) (string, error) {
+		putCount.Add(1)
+		if key != preservedKey || sha256.Sum256(body) != sha256.Sum256(frame.Bytes) {
+			t.Fatal("retry did not reuse deterministic object identity")
+		}
+		return "etag", nil
+	})
+	if err != nil || putCount.Load() != 2 {
+		t.Fatalf("retry err=%v uploads=%d", err, putCount.Load())
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM frames WHERE stream_id=$1 AND captured_at=$2 AND source_kind='authoritative_frame_refresh'`, streamID, failureAt).Scan(&frames); err != nil || frames != 1 {
+		t.Fatalf("retry frames=%d err=%v", frames, err)
+	}
+
+	// A Put error is also ambiguous: the object may already exist. The helper
+	// leaves it alone and a retry uses the identical key and bytes.
+	ambiguousAt := failureAt.Add(time.Second)
+	var ambiguousKey string
+	err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, ambiguousAt, frame, "test-bucket", func(_ context.Context, key, _ string, body []byte) (string, error) {
+		ambiguousKey = key
+		if sha256.Sum256(body) != sha256.Sum256(frame.Bytes) {
+			t.Fatal("ambiguous upload changed object bytes")
+		}
+		return "", fmt.Errorf("ambiguous transport failure")
+	})
+	if err == nil {
+		t.Fatal("ambiguous upload unexpectedly succeeded")
+	}
+	err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, ambiguousAt, frame, "test-bucket", func(_ context.Context, key, _ string, body []byte) (string, error) {
+		if key != ambiguousKey || sha256.Sum256(body) != sha256.Sum256(frame.Bytes) {
+			t.Fatal("ambiguous retry did not reuse deterministic object identity")
+		}
+		return "etag", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM frames WHERE stream_id=$1 AND captured_at=$2 AND source_kind='authoritative_frame_refresh'`, streamID, ambiguousAt).Scan(&frames); err != nil || frames != 1 {
+		t.Fatalf("ambiguous retry frames=%d err=%v", frames, err)
 	}
 }

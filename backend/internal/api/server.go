@@ -3115,12 +3115,10 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) persistAuthoritativeFrameSuccess(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame) error {
-	return s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, capturedAt, frame, s.r2.Bucket(), s.r2.PutBytes, func(ctx context.Context, key string) error {
-		return s.r2.DeleteObjects(ctx, []string{key})
-	})
+	return s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, capturedAt, frame, s.r2.Bucket(), s.r2.PutBytes)
 }
 
-func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error), remove func(context.Context, string) error) (retErr error) {
+func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error)) error {
 	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/authoritative-%d.jpg", streamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(), capturedAt.UnixNano())
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -3148,38 +3146,11 @@ func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context
 	}
 	etag, err := put(ctx, objectKey, frame.MIMEType, frame.Bytes)
 	if err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if cleanupErr := remove(cleanupCtx, objectKey); cleanupErr != nil {
-			return fmt.Errorf("upload authoritative frame: %v; cleanup uncertain upload: %w", err, cleanupErr)
-		}
+		// Put failures can be ambiguous: R2 may have accepted the deterministic
+		// object before the client observed an error. Never delete this key. A
+		// retry carries the same verified bytes and safely overwrites/reuses it.
 		return fmt.Errorf("upload authoritative frame: %w", err)
 	}
-	uploaded := true
-	committed := false
-	defer func() {
-		_ = tx.Rollback(context.Background())
-		if uploaded && !committed {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			// A commit error can be ambiguous. Preserve a frame that did commit;
-			// otherwise remove the deterministic object before returning failure.
-			var persistedSHA string
-			verifyErr := s.pool.QueryRow(cleanupCtx, `SELECT lower(m.sha256) FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.stream_id=$1 AND f.captured_at=$2 AND f.source_kind='authoritative_frame_refresh'`, streamID, capturedAt).Scan(&persistedSHA)
-			if verifyErr == nil && persistedSHA == frame.SHA256 {
-				committed = true
-				retErr = nil
-				return
-			}
-			if cleanupErr := remove(cleanupCtx, objectKey); cleanupErr != nil {
-				if retErr == nil {
-					retErr = fmt.Errorf("cleanup authoritative frame after failure: %w", cleanupErr)
-				} else {
-					retErr = fmt.Errorf("%v; cleanup authoritative frame: %w", retErr, cleanupErr)
-				}
-			}
-		}
-	}()
 	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{StorageProvider: "r2", Bucket: bucket, ObjectKey: objectKey, MIMEType: frame.MIMEType, SizeBytes: frame.SizeBytes, ETag: etag, SHA256: frame.SHA256, Width: frame.Width, Height: frame.Height})
 	if err != nil {
 		return fmt.Errorf("upsert authoritative media: %w", err)
@@ -3191,9 +3162,11 @@ func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context
 		return fmt.Errorf("update authoritative stream health: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
+		// The commit result can be ambiguous. Preserve the deterministic R2
+		// object: if rows committed, the next retry observes the exact identity;
+		// otherwise it reuses the same key and verified content.
 		return fmt.Errorf("commit authoritative frame: %w", err)
 	}
-	committed = true
 	return nil
 }
 
