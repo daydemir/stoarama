@@ -810,6 +810,8 @@ type ffmpegTelemetry struct {
 	runtime       ffmpegRuntimeEvidence
 }
 
+const ffmpegTelemetryRefreshInterval = time.Minute
+
 func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
 	active := relayFFmpegBin(binDir)
 	result := &ffmpegTelemetry{
@@ -861,7 +863,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 	bd, _ := binDir()
 	var ffmpegInfo atomic.Pointer[ffmpegTelemetry]
 	var dnsInfo atomic.Pointer[dnsProbeTelemetry]
-	go func() { ffmpegInfo.Store(loadFFmpegTelemetry(bd)) }()
+	go refreshFFmpegTelemetry(ctx, bd, ffmpegTelemetryRefreshInterval, &ffmpegInfo, loadFFmpegTelemetry)
 	if host, err := dnsProbeHost(apiURL); err != nil {
 		log.Printf("relay DNS probe disabled: %v", err)
 	} else {
@@ -968,6 +970,24 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			return
 		case <-ticker.C:
 			send()
+		}
+	}
+}
+
+func refreshFFmpegTelemetry(ctx context.Context, binDir string, interval time.Duration, destination *atomic.Pointer[ffmpegTelemetry], load func(string) *ffmpegTelemetry) {
+	if interval <= 0 {
+		return
+	}
+	refresh := func() { destination.Store(load(binDir)) }
+	refresh()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
 		}
 	}
 }

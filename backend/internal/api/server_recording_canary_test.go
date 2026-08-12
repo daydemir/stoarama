@@ -18,10 +18,19 @@ func TestRecordingCanarySpecRefusesProductionAndAllowsIdleRelay(t *testing.T) {
 	pool, cleanup := testRecordingLeasePool(t)
 	defer cleanup()
 	ctx := context.Background()
+	runtimeFresh := `{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached","observed_at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}}`
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO accounts (id) VALUES (42);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams, capabilities_jsonb)
-		VALUES (7, 42, 'relay', 'active', now(), 2, '{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached"}}');
+		VALUES (7, 42, 'relay', 'active', now(), 2, $1::jsonb)
+	`, runtimeFresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO streams (id, provider, source_page_url)
 		VALUES (9, 'TEST', 'https://example.test/camera');
 		INSERT INTO recordings
@@ -77,10 +86,14 @@ func TestRecordingCanarySpecRefusesProductionAndAllowsIdleRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, capabilities := range map[string]string{
-		"missing":      `{}`,
-		"wrong-type":   `{"ffmpeg_runtime":{"qualified":"true","network_probe":"host_reached"}}`,
-		"tls-failed":   `{"ffmpeg_runtime":{"qualified":false,"network_probe":"tls_verify_failed"}}`,
-		"inconsistent": `{"ffmpeg_runtime":{"qualified":true,"network_probe":"other_failure"}}`,
+		"missing":        `{}`,
+		"wrong-type":     `{"ffmpeg_runtime":{"qualified":"true","network_probe":"host_reached","observed_at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}}`,
+		"tls-failed":     `{"ffmpeg_runtime":{"qualified":false,"network_probe":"tls_verify_failed","observed_at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}}`,
+		"inconsistent":   `{"ffmpeg_runtime":{"qualified":true,"network_probe":"other_failure","observed_at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}}`,
+		"missing-time":   `{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached"}}`,
+		"malformed-time": `{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached","observed_at":"not-time"}}`,
+		"stale-time":     `{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached","observed_at":"` + time.Now().UTC().Add(-3*time.Minute).Format(time.RFC3339Nano) + `"}}`,
+		"future-time":    `{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached","observed_at":"` + time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano) + `"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb=$1::jsonb WHERE id=7`, capabilities); err != nil {
@@ -91,7 +104,7 @@ func TestRecordingCanarySpecRefusesProductionAndAllowsIdleRelay(t *testing.T) {
 			}
 		})
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached"}}'::jsonb WHERE id=7`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb=$1::jsonb WHERE id=7`, runtimeFresh); err != nil {
 		t.Fatal(err)
 	}
 	rec := request()
@@ -149,13 +162,22 @@ func TestRecordingCanaryRefusesBusyHeartbeatAndSecondGroupReservation(t *testing
 	pool, cleanup := testRecordingLeasePool(t)
 	defer cleanup()
 	ctx := context.Background()
+	runtimeFresh := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO accounts (id) VALUES (42);
 		INSERT INTO relay_groups (id, account_id, max_streams) VALUES (3, 42, 4), (4, 42, 4);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams, relay_group_id, capabilities_jsonb)
-		VALUES (7, 42, 'relay', 'active', now(), 2, 3, '{"active_jobs":1,"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached"}}'),
-		       (8, 42, 'relay', 'active', now(), 2, 3, '{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached"}}'),
-		       (9, 42, 'relay', 'active', now(), 2, 4, '{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached"}}');
+		VALUES (7, 42, 'relay', 'active', now(), 2, 3, jsonb_build_object('active_jobs',1,'ffmpeg_runtime',jsonb_build_object('qualified',true,'network_probe','host_reached','observed_at',$1::text))),
+		       (8, 42, 'relay', 'active', now(), 2, 3, jsonb_build_object('ffmpeg_runtime',jsonb_build_object('qualified',true,'network_probe','host_reached','observed_at',$1::text))),
+		       (9, 42, 'relay', 'active', now(), 2, 4, jsonb_build_object('ffmpeg_runtime',jsonb_build_object('qualified',true,'network_probe','host_reached','observed_at',$1::text)))
+	`, runtimeFresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO recordings
 			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via, preferred_relay_group_id)
 		VALUES (11, 42, 7, 'first', 'https://example.test/first.m3u8', 'active', now()-interval '1 hour', 'relay', 3),

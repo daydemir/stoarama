@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -169,6 +171,43 @@ func TestClassifyFFmpegOrigin(t *testing.T) {
 				t.Fatalf("origin=%q want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRefreshFFmpegTelemetryRecoversAndRevokes(t *testing.T) {
+	var calls atomic.Int64
+	load := func(string) *ffmpegTelemetry {
+		qualified := calls.Add(1) == 2
+		return &ffmpegTelemetry{runtime: ffmpegRuntimeEvidence{Qualified: qualified}}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var destination atomic.Pointer[ffmpegTelemetry]
+	done := make(chan struct{})
+	go func() {
+		refreshFFmpegTelemetry(ctx, "unused", time.Millisecond, &destination, load)
+		close(done)
+	}()
+	want := []bool{false, true, false}
+	seen := 0
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for seen < len(want) {
+		select {
+		case <-deadline.C:
+			t.Fatalf("refresh sequence stopped at %d", seen)
+		default:
+			current := destination.Load()
+			if current != nil && current.runtime.Qualified == want[seen] {
+				seen++
+			}
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry refresher did not stop")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -39,6 +40,7 @@ type ffmpegRuntimeEvidence struct {
 	CABundleSource string `json:"ca_bundle_source,omitempty"`
 	CABundleSHA256 string `json:"ca_bundle_sha256,omitempty"`
 	NetworkProbe   string `json:"network_probe"`
+	ObservedAt     string `json:"observed_at"`
 }
 
 var darwinCABundleCandidates = []caBundleCandidate{
@@ -139,7 +141,7 @@ func attestFFmpegRuntime(binDir, active, version, networkProbe string) ffmpegRun
 }
 
 func attestFFmpegRuntimeForOS(goos, binDir, active, version, networkProbe string, caCandidates []caBundleCandidate) ffmpegRuntimeEvidence {
-	evidence := ffmpegRuntimeEvidence{Origin: "unmanaged", Version: version, NetworkProbe: networkProbe}
+	evidence := ffmpegRuntimeEvidence{Origin: "unmanaged", Version: version, NetworkProbe: networkProbe, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	resolved, digest, err := inspectFFmpegBinary(active)
 	if err != nil {
 		return evidence
