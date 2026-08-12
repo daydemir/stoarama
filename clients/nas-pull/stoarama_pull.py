@@ -327,6 +327,9 @@ class Inventory:
                     file_ctime_ns INTEGER NOT NULL DEFAULT 0,
                     file_inode INTEGER NOT NULL DEFAULT 0,
                     file_device INTEGER NOT NULL DEFAULT 0,
+                    sidecar_relative_path TEXT NOT NULL DEFAULT '',
+                    sidecar_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    sidecar_sha256 TEXT NOT NULL DEFAULT '',
                     seen_generation TEXT NOT NULL DEFAULT '',
                     scan_pass TEXT NOT NULL DEFAULT '',
                     client_updated_at TEXT NOT NULL,
@@ -357,6 +360,9 @@ class Inventory:
                 "file_ctime_ns": "INTEGER NOT NULL DEFAULT 0",
                 "file_inode": "INTEGER NOT NULL DEFAULT 0",
                 "file_device": "INTEGER NOT NULL DEFAULT 0",
+                "sidecar_relative_path": "TEXT NOT NULL DEFAULT ''",
+                "sidecar_size_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "sidecar_sha256": "TEXT NOT NULL DEFAULT ''",
             }
             for table in ("files", "unmatched_files"):
                 columns = {row[1] for row in self.db.execute("PRAGMA table_info(%s)" % table)}
@@ -369,25 +375,28 @@ class Inventory:
         with self.lock:
             self.db.close()
 
-    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True, scan_pass="", file_identity=(0, 0, 0)):
+    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True, scan_pass="", file_identity=(0, 0, 0), sidecar_evidence=("", 0, "")):
         updated_at = utc_now_precise()
         ctime_ns, inode, device = file_identity
+        sidecar_path, sidecar_size, sidecar_sha = sidecar_evidence
         with self.lock:
             self.db.execute(
                 """INSERT INTO files
-                   (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,file_ctime_ns,file_inode,file_device,seen_generation,scan_pass,client_updated_at,dirty)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                   (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,seen_generation,scan_pass,client_updated_at,dirty)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
                    ON CONFLICT(clip_id) DO UPDATE SET
                      recording_id=excluded.recording_id, relative_path=excluded.relative_path,
                      size_bytes=excluded.size_bytes, sha256=excluded.sha256, state=excluded.state,
                      verified_at=excluded.verified_at, file_mtime_ns=excluded.file_mtime_ns,
                      file_ctime_ns=excluded.file_ctime_ns,file_inode=excluded.file_inode,file_device=excluded.file_device,
+                     sidecar_relative_path=excluded.sidecar_relative_path,sidecar_size_bytes=excluded.sidecar_size_bytes,sidecar_sha256=excluded.sidecar_sha256,
                      seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
                      client_updated_at=excluded.client_updated_at,dirty=1""",
                 (
                     int(clip["clip_id"]), int(clip["recording_id"]), str(clip["relative_path"]),
                     int(clip["size_bytes"]), str(clip["sha256"]).lower(), state,
-                    verified_at, int(mtime_ns), int(ctime_ns), int(inode), int(device), generation, scan_pass, updated_at,
+                    verified_at, int(mtime_ns), int(ctime_ns), int(inode), int(device),
+                    str(sidecar_path), int(sidecar_size), str(sidecar_sha).lower(), generation, scan_pass, updated_at,
                 ),
             )
             if commit:
@@ -421,21 +430,28 @@ class Inventory:
         with self.lock:
             return self.db.execute(
                 """SELECT clip_id,recording_id,relative_path,size_bytes,sha256,state,
-                          verified_at,file_mtime_ns,client_updated_at
+                          verified_at,file_mtime_ns,client_updated_at,file_ctime_ns,file_inode,file_device,
+                          sidecar_relative_path,sidecar_size_bytes,sidecar_sha256
                    FROM files WHERE %s ORDER BY clip_id LIMIT ?""" % where,
                 tuple(params) + (limit,),
             ).fetchall()
 
     @staticmethod
     def _reports(rows):
-        return [
-            {
+        reports = []
+        for row in rows:
+            report = {
                 "clip_id": row[0], "recording_id": row[1], "relative_path": row[2],
                 "size_bytes": row[3], "sha256": row[4], "state": row[5],
                 "verified_at": row[6], "file_mtime_ns": row[7], "client_updated_at": row[8],
             }
-            for row in rows
-        ]
+            if row[9] > 0 and row[10] > 0 and row[11] > 0 and row[12] and row[13] > 0 and len(row[14]) == 64:
+                report.update({
+                    "file_ctime_ns": row[9], "file_inode": row[10], "file_device": row[11],
+                    "sidecar_relative_path": row[12], "sidecar_size_bytes": row[13], "sidecar_sha256": row[14],
+                })
+            reports.append(report)
+        return reports
 
     def _mark_clean(self, rows):
         with self.lock:
@@ -512,11 +528,11 @@ class Inventory:
             return generation, started_at
         return None
 
-    def _linked_scan_row_is_current(self, clip, generation, scan_pass, path):
+    def _linked_scan_row_is_current(self, clip, generation, scan_pass, path, sidecar_evidence):
         with self.lock:
             row = self.db.execute(
                 """SELECT recording_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,
-                          file_ctime_ns,file_inode,file_device
+                          file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256
                    FROM files WHERE clip_id=?""",
                 (int(clip["clip_id"]),),
             ).fetchone()
@@ -539,6 +555,7 @@ class Inventory:
                     and row[8] != 0 and row[8] == stat.st_ino
                     and row[9] != 0 and row[9] == stat.st_dev
                     and stat.st_size == int(clip["size_bytes"])
+                    and tuple(row[10:13]) == tuple(sidecar_evidence)
                 )
             if current:
                 self.db.execute("UPDATE files SET scan_pass=? WHERE clip_id=?", (scan_pass, int(clip["clip_id"])))
@@ -649,20 +666,23 @@ class Inventory:
                 self._commit_scan_batch((scanned, skipped, skip_reasons))
                 return
             try:
-                clip = json.loads(sidecar.read_text(encoding="utf-8"))
+                sidecar_bytes, _sidecar_stat = stable_regular_file_bytes(sidecar, 1024 * 1024)
+                clip = json.loads(sidecar_bytes.decode("utf-8"))
                 relative = valid_relative_path(clip)
                 if str(relative) != str(clip.get("relative_path", "")):
                     raise ValueError("sidecar path is not canonical")
                 path = cfg.output_dir / relative
-                if sidecar.resolve() != stitch_sidecar_path(path).resolve():
+                if sidecar != stitch_sidecar_path(path):
                     raise ValueError("sidecar location does not match its clip path")
                 expected_size = int(clip["size_bytes"])
                 expected_sha = str(clip["sha256"]).lower()
                 if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
                     raise ValueError("sidecar checksum is invalid")
+                sidecar_relative = str(sidecar.relative_to(cfg.output_dir))
+                sidecar_evidence = (sidecar_relative, len(sidecar_bytes), hashlib.sha256(sidecar_bytes).hexdigest())
                 known_paths.add(str(relative))
                 self._retire_unmatched_linked_path(str(relative), generation, scan_pass)
-                if self._linked_scan_row_is_current(clip, generation, scan_pass, path):
+                if self._linked_scan_row_is_current(clip, generation, scan_pass, path, sidecar_evidence):
                     scanned += 1
                     if scanned % INVENTORY_SYNC_BATCH == 0:
                         self._publish_scan_batch(
@@ -693,7 +713,7 @@ class Inventory:
                 else:
                     state, verified_at, mtime_ns = "missing", None, 0
                     identity = (0, 0, 0)
-                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity)
+                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity, sidecar_evidence=sidecar_evidence)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
                     self._publish_scan_batch(
@@ -1139,6 +1159,32 @@ def sha256_file_throttled_stable(path, megabytes_per_sec, stop_event):
     if file_identity(before) != file_identity(after) or size != after.st_size:
         raise FileChangedDuringHash("inventory file changed while it was being hashed")
     return size, digest, after
+
+
+def stable_regular_file_bytes(path, max_bytes):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(str(path), flags)
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode) or before.st_size < 0 or before.st_size > max_bytes:
+            raise ValueError("sidecar is not a bounded regular file")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("sidecar exceeds its size bound")
+        after = os.fstat(descriptor)
+        if certification_identity(before) != certification_identity(after):
+            raise FileChangedDuringHash("sidecar changed while it was read")
+        return b"".join(chunks), after
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def verified_file(path, expected_bytes, expected_sha):

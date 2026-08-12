@@ -936,10 +936,13 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"x")
                 pull.write_stitch_sidecar(path, clip)
+                sidecar = pull.stitch_sidecar_path(path)
+                sidecar_bytes = sidecar.read_bytes()
                 stat = path.stat()
                 inventory._upsert(
                     clip, "present", started_at, stat.st_mtime_ns, generation,
                     commit=False, scan_pass="prior", file_identity=(stat.st_ctime_ns, stat.st_ino, stat.st_dev),
+                    sidecar_evidence=(str(sidecar.relative_to(cfg.output_dir)), len(sidecar_bytes), hashlib.sha256(sidecar_bytes).hexdigest()),
                 )
                 if clip_id % pull.INVENTORY_SYNC_BATCH == 0:
                     inventory._commit_scan_batch()
@@ -1648,6 +1651,58 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg = self.config(Path(raw))
             cfg.legacy_progress_file.write_text(json.dumps({"after_id": 8814}))
             self.assertEqual(pull.Runtime(cfg).cursor_id, 8814)
+
+    def test_full_scan_reports_all_or_none_cleanup_evidence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            content = b"native clip"
+            clip = {
+                "schema_version": 1, "clip_id": 71, "recording_id": 9,
+                "relative_path": "recording/clip.mp4", "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "clip_start_at": "2026-08-12T00:00:00Z", "clip_end_at": "2026-08-12T00:01:00Z",
+                "capture_generation": "gen", "capture_sequence": 1, "recording_job_id": 3,
+            }
+            media = cfg.output_dir / clip["relative_path"]
+            media.parent.mkdir()
+            media.write_bytes(content)
+            pull.write_stitch_sidecar(media, clip)
+            inventory = pull.Inventory(cfg)
+            reports = []
+            with mock.patch.object(pull, "request_json", side_effect=lambda _c, _m, _p, body=None, **_k: reports.extend(body.get("files", [])) or {}):
+                inventory.full_scan(cfg, threading.Event())
+            inventory.close()
+            report = next(row for row in reports if row["clip_id"] == 71)
+            self.assertGreater(report["file_ctime_ns"], 0)
+            self.assertGreater(report["file_inode"], 0)
+            self.assertGreater(report["file_device"], 0)
+            self.assertEqual(report["sidecar_relative_path"], "recording/clip.mp4.stoarama.json")
+            sidecar_bytes = pull.stitch_sidecar_path(media).read_bytes()
+            self.assertEqual(report["sidecar_size_bytes"], len(sidecar_bytes))
+            self.assertEqual(report["sidecar_sha256"], hashlib.sha256(sidecar_bytes).hexdigest())
+
+    def test_incremental_delivery_omits_incomplete_cleanup_evidence(self):
+        row = (1, 2, "r/c.mp4", 3, "a" * 64, "present", None, 4, "now", 5, 6, 7, "", 0, "")
+        report = pull.Inventory._reports([row])[0]
+        self.assertNotIn("file_ctime_ns", report)
+        self.assertNotIn("sidecar_relative_path", report)
+
+    def test_full_scan_rejects_sidecar_symlink(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            media = cfg.output_dir / "r/clip.mp4"
+            media.parent.mkdir()
+            media.write_bytes(b"x")
+            target = cfg.output_dir / "target.json"
+            target.write_text("{}")
+            pull.stitch_sidecar_path(media).symlink_to(target)
+            inventory = pull.Inventory(cfg)
+            with mock.patch.object(pull, "request_json", return_value={}), self.assertRaisesRegex(RuntimeError, "inventory scan incomplete"):
+                inventory.full_scan(cfg, threading.Event())
+            summary = inventory.summary()
+            inventory.close()
+            self.assertEqual(summary["scan_rows_skipped"], 1)
+            self.assertEqual(summary["scan_skip_reasons"], {"io_error": 1})
 
 
 if __name__ == "__main__":

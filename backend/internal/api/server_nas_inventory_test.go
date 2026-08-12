@@ -45,6 +45,21 @@ func TestValidateNASInventorySync(t *testing.T) {
 	if err := validateNASInventorySync(valid, now); err != nil {
 		t.Fatalf("valid incremental inventory rejected: %v", err)
 	}
+	ctime, inode, device, sidecarSize := int64(1), int64(2), int64(3), int64(4)
+	sidecarPath, sidecarSHA := "recording/clip.mp4.stoarama.json", strings.Repeat("d", 64)
+	withEvidence := valid
+	withEvidence.Files = append([]nasInventoryFileReport(nil), valid.Files...)
+	withEvidence.Files[0].FileCTimeNS, withEvidence.Files[0].FileInode, withEvidence.Files[0].FileDevice = &ctime, &inode, &device
+	withEvidence.Files[0].SidecarPath, withEvidence.Files[0].SidecarSize, withEvidence.Files[0].SidecarSHA256 = &sidecarPath, &sidecarSize, &sidecarSHA
+	if err := validateNASInventorySync(withEvidence, now); err != nil {
+		t.Fatalf("complete cleanup evidence rejected: %v", err)
+	}
+	partialEvidence := valid
+	partialEvidence.Files = append([]nasInventoryFileReport(nil), valid.Files...)
+	partialEvidence.Files[0].FileCTimeNS = &ctime
+	if err := validateNASInventorySync(partialEvidence, now); err == nil {
+		t.Fatal("partial cleanup evidence accepted")
+	}
 	completed := valid
 	completed.ScanStartedAt = &start
 	completed.ScanCompletedAt = &now
