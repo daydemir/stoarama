@@ -21,6 +21,13 @@ func TestFinishStreakPriorityProtectsNearGoal(t *testing.T) {
 }
 
 func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T) {
+	// Freeze the handler's planning clock before the 20:00 UTC occurrence closes.
+	// Otherwise this fixture changes shape at wall-clock 20:00 and gains a newer
+	// expected window that has no seeded job/health facts.
+	fixedNow := time.Date(2026, 8, 12, 19, 0, 0, 0, time.UTC)
+	originalNow := streakPriorityNow
+	streakPriorityNow = func() time.Time { return fixedNow }
+	defer func() { streakPriorityNow = originalNow }()
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
 	userID, accountID := seedUserOrg(t, pool, "streak@example.com", false)
@@ -38,7 +45,7 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 		VALUES('direct','streak','streak','streak','https://example.test/live.m3u8','hls','video_manifest','video_live','continuous_video',30) RETURNING id`).Scan(&streamID); err != nil {
 		t.Fatal(err)
 	}
-	open := time.Now().UTC().Truncate(24 * time.Hour).Add(-24*time.Hour + 8*time.Hour)
+	open := fixedNow.Truncate(24 * time.Hour).Add(-24*time.Hour + 8*time.Hour)
 	var recID, otherRecID int64
 	insertRec := `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays)
 		VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),$2,'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'active',$3,$4,'continuous','08:00','20:00',127) RETURNING id`
@@ -60,11 +67,11 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	}
 	var pausedInside, pausedOutside int64
 	pausedInsert := `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays,paused_at)
-	 VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),$2,'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'paused',$3,$4,'continuous','08:00','20:00',127,now()+$5::interval) RETURNING id`
-	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-inside", open.Add(-48*time.Hour), streamID, "-6 days 23 hours 59 minutes").Scan(&pausedInside); err != nil {
+	 VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),$2,'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'paused',$3,$4,'continuous','08:00','20:00',127,$6::timestamptz+$5::interval) RETURNING id`
+	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-inside", open.Add(-48*time.Hour), streamID, "-6 days 23 hours 59 minutes", fixedNow).Scan(&pausedInside); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-outside", open.Add(-48*time.Hour), streamID, "-7 days -1 minute").Scan(&pausedOutside); err != nil {
+	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-outside", open.Add(-48*time.Hour), streamID, "-7 days -1 minute", fixedNow).Scan(&pausedOutside); err != nil {
 		t.Fatal(err)
 	}
 	var jobID int64
@@ -220,7 +227,7 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	}
 	// Explain the bounded production-shaped calendar query under PostgreSQL.
 	var plan string
-	if err := pool.QueryRow(ctx, `EXPLAIN (FORMAT TEXT) `+streakPriorityFactsSQL, accountID, time.Now().UTC()).Scan(&plan); err != nil || plan == "" {
+	if err := pool.QueryRow(ctx, `EXPLAIN (FORMAT TEXT) `+streakPriorityFactsSQL, accountID, fixedNow).Scan(&plan); err != nil || plan == "" {
 		t.Fatalf("explain=%q err=%v", plan, err)
 	}
 }
