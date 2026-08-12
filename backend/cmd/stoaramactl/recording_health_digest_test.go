@@ -24,7 +24,7 @@ func TestComposeHealthDigestSeparatesCurrentAndHistorical(t *testing.T) {
 	body := composeHealthDigest("https://stoarama.com", now, items, digestNAS{})
 	for _, want := range []string{
 		"Active fleet: 3 total; 2 currently scheduled/live; 1 off-window/not assessed.",
-		"Current operational health: 1/2 current healthy, 1 failing, 0 unknown.",
+		"Current operational health: 1 stable, 0 degraded, 1 failing, 0 unknown (of 2 live).",
 		"Latest completed-window quality (historical, not current status): 1 stable, 1 degraded, 1 failing, 0 unknown.",
 		"CURRENT FAILING (1)",
 		"#3 live failure",
@@ -36,6 +36,21 @@ func TestComposeHealthDigestSeparatesCurrentAndHistorical(t *testing.T) {
 	}
 	if strings.Contains(body, "#1 healthy now — latest completed 50%") {
 		t.Fatalf("historical failure was rendered as a current failure:\n%s", body)
+	}
+}
+
+func TestHealthDigestIdempotencyKey(t *testing.T) {
+	bucket := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
+	a := healthDigestIdempotencyKey(bucket, " Deniz@Example.com ")
+	b := healthDigestIdempotencyKey(bucket, "deniz@example.com")
+	if a != b {
+		t.Fatalf("normalized recipient keys differ: %q != %q", a, b)
+	}
+	if a == healthDigestIdempotencyKey(bucket.Add(8*time.Hour), "deniz@example.com") {
+		t.Fatal("adjacent buckets reused idempotency key")
+	}
+	if strings.Contains(a, "deniz") || strings.Contains(a, "example") {
+		t.Fatalf("idempotency key exposed recipient: %q", a)
 	}
 }
 

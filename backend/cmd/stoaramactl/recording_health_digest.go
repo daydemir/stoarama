@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -75,7 +76,7 @@ func runRecordingHealthSummary(ctx context.Context, cfg config.Config) {
 		if !claimed {
 			continue
 		}
-		if _, err := mailer.Send(ctx, email.Message{To: recipient, Subject: fmt.Sprintf("[Stoarama] 8-hour recording health: %s", digestCounts(items)), PlainText: body, MessageType: "recording_health_digest"}); err != nil {
+		if _, err := mailer.Send(ctx, email.Message{To: recipient, Subject: fmt.Sprintf("[Stoarama] 8-hour recording health: %s", digestCounts(items)), PlainText: body, MessageType: "recording_health_digest", IdempotencyKey: healthDigestIdempotencyKey(bucket, recipient)}); err != nil {
 			log.Fatalf("send digest: %v", err)
 		}
 		if _, err := pool.Exec(ctx, `UPDATE recording_health_digest_deliveries SET delivered_at=now() WHERE bucket_start_at=$1 AND recipient=$2`, bucket, recipient); err != nil {
@@ -154,13 +155,20 @@ func claimHealthDigestDelivery(ctx context.Context, pool *pgxpool.Pool, bucket t
 
 func loadDigestNAS(ctx context.Context, pool *pgxpool.Pool) digestNAS {
 	var n digestNAS
-	_ = pool.QueryRow(ctx, `
+	if err := pool.QueryRow(ctx, `
 		SELECT c.label,c.client_phase,c.nas_storage_free_bytes,c.nas_storage_total_bytes,c.nas_storage_reported_at,c.nas_capacity_blocked,
 		       COALESCE(s.observed_state::text,'unknown'),s.observed_at,c.last_outage_class,c.last_outage_recovered_at
 		FROM connections c LEFT JOIN nas_storage_capacity_alert_states s ON s.connection_id=c.id
 		WHERE c.kind='nas_pull' ORDER BY c.last_seen_at DESC LIMIT 1`).Scan(
-		&n.Label, &n.Phase, &n.Free, &n.Total, &n.ReportedAt, &n.Blocked, &n.AlertState, &n.AlertObservedAt, &n.LastOutageClass, &n.OutageRecoveredAt)
+		&n.Label, &n.Phase, &n.Free, &n.Total, &n.ReportedAt, &n.Blocked, &n.AlertState, &n.AlertObservedAt, &n.LastOutageClass, &n.OutageRecoveredAt); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		log.Printf("recording health digest NAS telemetry unavailable: %v", err)
+	}
 	return n
+}
+
+func healthDigestIdempotencyKey(bucket time.Time, recipient string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(recipient))))
+	return fmt.Sprintf("recording-health-digest:%s:%x", bucket.UTC().Format("20060102T15"), sum[:12])
 }
 
 func digestCounts(items []digestRecording) string {
@@ -170,7 +178,7 @@ func digestCounts(items []digestRecording) string {
 			c[item.Bucket]++
 		}
 	}
-	return fmt.Sprintf("%d/%d current healthy, %d failing, %d unknown", c["stable"]+c["degraded"], c["stable"]+c["degraded"]+c["failing"]+c["unknown"], c["failing"], c["unknown"])
+	return fmt.Sprintf("%d stable, %d degraded, %d failing, %d unknown (of %d live)", c["stable"], c["degraded"], c["failing"], c["unknown"], c["stable"]+c["degraded"]+c["failing"]+c["unknown"])
 }
 
 func composeHealthDigest(base string, now time.Time, items []digestRecording, nas digestNAS) string {
