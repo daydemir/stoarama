@@ -70,13 +70,16 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 }
 
 func runRecordingStreakPriority(ctx context.Context, cfg config.Config, args []string) {
-	if len(args) != 1 || args[0] != "report" {
+	if len(args) < 1 || args[0] != "report" {
 		log.Fatal("streak-priority requires report")
 	}
 	fs := flag.NewFlagSet("recordings streak-priority report", flag.ExitOnError)
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
 	_ = fs.Parse(args[1:])
+	if len(fs.Args()) != 0 {
+		log.Fatalf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
 	printJSON(mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/account/recordings/streak-priority"))
 }
 
