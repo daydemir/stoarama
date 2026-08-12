@@ -94,6 +94,10 @@ func runRecordingHealthSummary(ctx context.Context, cfg config.Config) {
 }
 
 func loadHealthDigestRecordings(ctx context.Context, pool *pgxpool.Pool) ([]digestRecording, error) {
+	liveSignals := liveRecordingHealthSignals()
+	if len(liveSignals) == 0 {
+		return nil, errors.New("live recording health signal registry is empty")
+	}
 	rows, err := pool.Query(ctx, `
 		SELECT r.id,COALESCE(r.stream_id,0),r.name,
 		       live.id IS NOT NULL,
@@ -133,7 +137,7 @@ func loadHealthDigestRecordings(ctx context.Context, pool *pgxpool.Pool) ([]dige
 		  ORDER BY a.last_detected_at DESC NULLS LAST LIMIT 1) inc ON true
 		LEFT JOIN LATERAL (SELECT h.* FROM recording_window_health h WHERE h.recording_id=r.id ORDER BY h.window_end_at DESC LIMIT 1) wh ON true
 		WHERE r.status='active' AND r.start_at<=now() AND (r.end_at IS NULL OR now()<r.end_at)
-		ORDER BY r.id`, liveRecordingHealthSignals())
+		ORDER BY r.id`, liveSignals)
 	if err != nil {
 		return nil, err
 	}

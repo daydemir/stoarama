@@ -59,6 +59,12 @@ func TestRecordingCampaignTracksAuditAndProtection(t *testing.T) {
 	if _, err = c.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,4,3,repeat('a',64),'primary',1,'protect',ARRAY['current_stable'],now(),now(),now(),repeat('b',64),2)`, track); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = c.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,4,3,repeat('a',64),'backup',2,'protect',ARRAY['duplicate_scene'],now(),now(),now(),repeat('c',64),2)`, track); err == nil {
+		t.Fatal("duplicate scene succeeded")
+	}
+	if _, err = c.Exec(ctx, `UPDATE recording_campaign_roster_entries SET source_window_end_at=now(),decision_at=now(),updated_by_user_id=2 WHERE track_id=$1`, track); err == nil {
+		t.Fatal("orphan source window succeeded")
+	}
 	if _, err = c.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['approved_roster'],2,now())`, track); err != nil {
 		t.Fatal(err)
 	}

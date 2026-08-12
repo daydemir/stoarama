@@ -25,7 +25,7 @@ func campaignCheckpoint(now time.Time, fire *time.Time, jobState *string, clips 
 		return "preopen_pass"
 	case jobState == nil:
 		return "window_job_missing"
-	case *jobState == "error" || *jobState == "canceled" || (*jobState == "done" && jobMedia == nil):
+	case *jobState == "error" || *jobState == "canceled" || *jobState == "done":
 		return "current_job_terminal_failure"
 	case d <= 0 && (clips < 3 || firstMedia == nil || firstIngest == nil || jobMedia == nil || jobIngest == nil || jobMedia.Before(now.Add(-5*time.Minute)) || jobIngest.Before(now.Add(-5*time.Minute))):
 		return "first_3_clips_due"
