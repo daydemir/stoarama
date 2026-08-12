@@ -418,6 +418,7 @@ func (s *Server) router() http.Handler {
 			admin.Post("/source-candidates/{id}/import", s.handleSourceCandidateImport)
 			admin.Get("/recorder-pool", s.handleAdminRecorderPool)
 			admin.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
+			admin.Post("/recordings/{id}/repair-source", s.handleAdminRecordingSourceRepair)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
 			admin.Post("/pipeline-runs", s.handlePipelineRunsCreate)
