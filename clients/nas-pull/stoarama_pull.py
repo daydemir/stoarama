@@ -1685,6 +1685,7 @@ def run(cfg):
         target=inventory_loop, args=(cfg, inventory, inventory_stop_event), daemon=True,
     )
     inventory_worker.start()
+    self_update_failed = False
     try:
         while not stop_event.is_set():
             # No delivery page is active at this boundary. A staged candidate
@@ -1728,13 +1729,17 @@ def run(cfg):
                 runtime.set_error(str(exc))
                 log("ERROR", "drain failed: %s" % exc)
                 stop_event.wait(ERROR_BACKOFF_SEC)
+    except SelfUpdateExecError:
+        self_update_failed = True
+        raise
     finally:
         stop_event.set()
         inventory_stop_event.set()
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
         storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
-        mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
+        if not self_update_failed:
+            mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
         if inventory_worker.is_alive():
             log("WARN", "inventory worker still running at shutdown; leaving database open")
         else:

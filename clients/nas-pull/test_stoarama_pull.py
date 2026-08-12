@@ -44,7 +44,7 @@ class NASPullTests(unittest.TestCase):
             lock_file=state / "client.lock",
             update_manifest_url="https://stoarama.test/nas/download/latest.json",
             download_workers=12,
-            poll_interval_sec=1,
+            poll_interval_sec=10,
             inventory_scan_interval_sec=86400,
             inventory_scan_delay_ms=0,
             inventory_hash_mbps=1000,
@@ -1299,15 +1299,16 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 pull, "Inventory", return_value=fake_inventory
             ), mock.patch.object(pull.threading, "Thread", FakeThread), mock.patch.object(
                 pull.signal, "signal"
-            ), mock.patch.object(pull, "mark_runtime"), mock.patch.object(
+            ), mock.patch.object(pull, "mark_runtime") as mark, mock.patch.object(
                 pull, "stage_update", return_value="new-version"
             ), mock.patch.object(
                 pull, "check_storage", side_effect=AssertionError("storage work ran before update gate")
             ), mock.patch.object(
-                pull, "exec_candidate", side_effect=pull.SelfUpdateExecError("activated")
-            ) as activate, self.assertRaisesRegex(pull.SelfUpdateExecError, "activated"):
+                pull.os, "execve", side_effect=OSError("activation failed")
+            ) as activate, self.assertRaisesRegex(pull.SelfUpdateExecError, "failed to activate"):
                 pull.run(cfg)
             activate.assert_called_once()
+            self.assertEqual(mark.call_args_list[-1].args[2], pull.PreviousExit.SELF_UPDATE.value)
 
     def test_signal_during_delivery_never_activates_staged_candidate(self):
         with tempfile.TemporaryDirectory() as raw:
