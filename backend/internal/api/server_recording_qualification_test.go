@@ -131,7 +131,7 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mutation.Exec(ctx, `UPDATE recordings SET status='paused' WHERE id=$1`, ids[0]); err != nil {
+	if _, err := mutation.Exec(ctx, `UPDATE recordings SET status='paused',paused_at=now() WHERE id=$1`, ids[0]); err != nil {
 		_ = mutation.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -161,14 +161,14 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	if changed.Code != http.StatusConflict {
 		t.Fatalf("concurrent mutation status=%d body=%s", changed.Code, changed.Body.String())
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, ids[0]); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='active',paused_at=NULL WHERE id=$1`, ids[0]); err != nil {
 		t.Fatal(err)
 	}
 	frozen := call(true, planned.Plan.PlanSHA256)
 	if frozen.Code != http.StatusCreated {
 		t.Fatalf("freeze status=%d body=%s", frozen.Code, frozen.Body.String())
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='paused' WHERE id=$1`, ids[0]); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='paused',paused_at=now() WHERE id=$1`, ids[0]); err != nil {
 		t.Fatal(err)
 	}
 	idempotent := call(true, planned.Plan.PlanSHA256)
