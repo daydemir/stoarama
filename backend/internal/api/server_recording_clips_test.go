@@ -728,7 +728,12 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 		`CREATE TABLE relay_groups (
 			id BIGINT PRIMARY KEY,
 			account_id BIGINT NOT NULL,
-			max_streams INTEGER NOT NULL
+			max_streams INTEGER NOT NULL,
+			bandwidth_capacity_bps BIGINT
+		)`,
+		`CREATE TABLE recording_bandwidth_observations (
+			recording_id BIGINT PRIMARY KEY,
+			observed_bandwidth_bps BIGINT NOT NULL
 		)`,
 		`CREATE TABLE nodes (
 			id BIGINT PRIMARY KEY,
@@ -756,6 +761,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			end_at TIMESTAMPTZ,
 			target_fps INTEGER,
 			capture_via TEXT NOT NULL DEFAULT 'cloud',
+			preferred_relay_group_id BIGINT,
 			cron_timezone TEXT NOT NULL DEFAULT 'UTC',
 			naming_profile TEXT NOT NULL DEFAULT 'stoarama_v1',
 			folder_name TEXT NOT NULL DEFAULT 'recordings',
