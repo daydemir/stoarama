@@ -76,6 +76,57 @@ func TestClaimHealthDigestDeliveryLifecycle(t *testing.T) {
 	}
 }
 
+func TestLoadHealthDigestRecordingsFormatsCoverageInPostgres(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed digest query regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("health_digest_query_%d", time.Now().UnixNano())
+	if _, err = admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err = pool.Exec(ctx, `
+		CREATE TABLE recordings(id BIGINT PRIMARY KEY,stream_id BIGINT,name TEXT,status TEXT,start_at TIMESTAMPTZ,end_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs(id BIGINT PRIMARY KEY,recording_id BIGINT,kind TEXT,status TEXT,fire_at TIMESTAMPTZ,window_end_at TIMESTAMPTZ);
+		CREATE TABLE recording_clips(id BIGINT PRIMARY KEY,recording_job_id BIGINT,clip_end_at TIMESTAMPTZ,created_at TIMESTAMPTZ);
+		CREATE TABLE recorder_health_alerts(id BIGINT PRIMARY KEY,recording_id BIGINT,signal TEXT,resolved_at TIMESTAMPTZ,last_detected_at TIMESTAMPTZ);
+		CREATE TABLE recording_window_health(recording_id BIGINT,job_id BIGINT,window_end_at TIMESTAMPTZ,calculated_at TIMESTAMPTZ,coverage_pct DOUBLE PRECISION,largest_gap_seconds DOUBLE PRECISION,gap_over_30s_count INTEGER,gap_over_5m_count INTEGER,overlap_count INTEGER);
+		INSERT INTO recordings VALUES(402,14478,'format regression','active',now()-interval '1 day',now()+interval '1 day');
+		INSERT INTO recording_jobs VALUES(9,402,'continuous_window','leased',now()-interval '1 hour',now()+interval '11 hours');
+		INSERT INTO recording_clips VALUES(90,9,now(),now());
+		INSERT INTO recording_window_health VALUES(402,8,now()-interval '1 hour',now(),99.954,61.4,1,0,0);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	items, err := loadHealthDigestRecordings(ctx, pool)
+	if err != nil {
+		t.Fatalf("production digest query failed: %v", err)
+	}
+	if len(items) != 1 || items[0].HistoryNote != "latest completed 99.95%; largest gap 61s; >5m gaps 0; overlaps 0" {
+		t.Fatalf("unexpected digest rows: %+v", items)
+	}
+}
+
 func TestComposeHealthDigestSeparatesCurrentAndHistorical(t *testing.T) {
 	now := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
 	items := []digestRecording{
