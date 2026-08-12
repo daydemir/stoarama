@@ -290,11 +290,15 @@ func upsertHealthAlert(ctx context.Context, pool *pgxpool.Pool, recordingID int6
 		          OR recorder_health_alerts.last_detected_at IS NULL
 		          OR recorder_health_alerts.last_detected_at < now()-$3::interval
 		        THEN now() ELSE recorder_health_alerts.episode_started_at END,
+		      last_alerted_at = CASE
+		        WHEN recorder_health_alerts.resolved_at IS NOT NULL AND $2<>$4
+		        THEN '1970-01-01 00:00:00+00'::timestamptz
+		        ELSE recorder_health_alerts.last_alerted_at END,
 		      last_detected_at = now(),
 		      last_delivery_attempt_at = CASE WHEN recorder_health_alerts.resolved_at IS NOT NULL THEN NULL ELSE recorder_health_alerts.last_delivery_attempt_at END,
 		      resolved_at = NULL
 		RETURNING (xmax=0) AS newly_inserted, episode_started_at, last_alerted_at, last_delivery_attempt_at
-	`, recordingID, signal, healthAlertDetectionContinuity.String()).Scan(&newlyInserted, &episodeStartedAt, &lastAlertedAt, &lastDeliveryAttemptAt)
+	`, recordingID, signal, healthAlertDetectionContinuity.String(), signalContinuousSilentDeath).Scan(&newlyInserted, &episodeStartedAt, &lastAlertedAt, &lastDeliveryAttemptAt)
 	return newlyInserted, episodeStartedAt, lastAlertedAt, lastDeliveryAttemptAt, err
 }
 
