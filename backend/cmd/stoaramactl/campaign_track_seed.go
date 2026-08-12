@@ -126,6 +126,12 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 		if existing != 0 && existing != t.TargetCount {
 			log.Fatal("existing draft roster differs")
 		}
+		for _, e := range rr {
+			var matched int
+			if err = tx.QueryRow(ctx, `SELECT count(*) FROM recording_campaign_roster_entries WHERE track_id=$1 AND recording_id=$2 AND stream_id=$3 AND scene_identity_sha256=$4 AND role=$5 AND rank=$6 AND status=$7 AND reason_codes=$8 AND evidence_observed_at=$9 AND evidence_sha256=$10 AND updated_by_user_id=$11`, trackID, e.RecordingID, e.StreamID, e.Scene, e.Role, e.Rank, e.Status, e.ReasonCodes, m.EvidenceObservedAt, m.EvidenceSHA256, m.ActorUserID).Scan(&matched); err != nil || matched != 1 {
+				log.Fatalf("track %s recording %d differs from manifest", t.Key, e.RecordingID)
+			}
+		}
 		if _, err = tx.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['reviewed_exact_manifest',$2],$3,$4)`, trackID, m.EvidenceSHA256, m.ActorUserID, m.EvidenceObservedAt); err != nil {
 			log.Fatal(err)
 		}
