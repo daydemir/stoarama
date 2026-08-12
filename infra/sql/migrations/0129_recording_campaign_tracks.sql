@@ -82,6 +82,10 @@ BEGIN
 END $$;
 CREATE TRIGGER trg_recording_campaign_roster_validate BEFORE INSERT OR UPDATE ON recording_campaign_roster_entries
 FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_roster_entry();
+CREATE FUNCTION reject_recording_campaign_roster_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'campaign roster entries use removed status and cannot be deleted'; END $$;
+CREATE TRIGGER trg_recording_campaign_roster_no_delete BEFORE DELETE ON recording_campaign_roster_entries
+FOR EACH ROW EXECUTE FUNCTION reject_recording_campaign_roster_delete();
 
 CREATE FUNCTION audit_recording_campaign_roster_entry() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE kind TEXT;
