@@ -149,6 +149,7 @@ class NASPullTests(unittest.TestCase):
             self.assertIsNotNone(summary["scan_pass_started_at"])
             self.assertEqual(summary["scan_rows_visited"], 2)
             self.assertEqual(summary["scan_rows_skipped"], 0)
+            self.assertEqual(summary["scan_skip_reasons"], {})
             inventory.close()
 
     def test_full_inventory_scan_error_never_publishes_complete_or_marks_unseen_missing(self):
@@ -170,7 +171,39 @@ class NASPullTests(unittest.TestCase):
                 inventory.full_scan(cfg, threading.Event())
             self.assertFalse(any(body.get("complete") for body in calls))
             self.assertEqual(inventory._rows("clip_id=91")[0][5], "present")
-            self.assertIsNone(inventory.summary()["scan_completed_at"])
+            summary = inventory.summary()
+            self.assertIsNone(summary["scan_completed_at"])
+            self.assertEqual(summary["scan_rows_skipped"], 1)
+            self.assertEqual(summary["scan_skip_reasons"], {"invalid_sidecar": 1})
+            inventory.close()
+
+    def test_inventory_skip_reasons_are_bounded_and_stable(self):
+        cases = (
+            (pull.FileChangedDuringHash("changed"), False, "changed_during_hash"),
+            (FileNotFoundError("gone"), False, "vanished_during_scan"),
+            (PermissionError("denied"), False, "permission_denied"),
+            (OSError("read"), False, "io_error"),
+            (ValueError("bad sidecar"), True, "invalid_sidecar"),
+            (RuntimeError("unknown"), False, "unexpected"),
+        )
+        for exc, sidecar, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(pull.inventory_skip_reason(exc, sidecar), expected)
+                self.assertIn(expected, pull.INVENTORY_SKIP_REASONS)
+
+    def test_legacy_or_corrupt_skip_reason_meta_is_omitted(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            inventory._meta_set({
+                "generation": "legacy-scan", "scan_rows_skipped": "13",
+                "scan_pass_started_at": "2026-08-09T00:00:00Z",
+            })
+            self.assertNotIn("scan_skip_reasons", inventory.summary())
+            for malformed in ('{"io_error":"x"}', '[]', '{not-json'):
+                with self.subTest(malformed=malformed):
+                    inventory._meta_set({"scan_skip_reasons": malformed})
+                    self.assertNotIn("scan_skip_reasons", inventory.summary())
             inventory.close()
 
     def test_scan_upserts_use_bounded_durable_commits_at_100k_scale(self):

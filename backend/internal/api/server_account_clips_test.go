@@ -416,6 +416,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			inventory_scan_pass_started_at TIMESTAMPTZ,
 			inventory_scan_rows_visited BIGINT NOT NULL DEFAULT 0,
 			inventory_scan_rows_skipped BIGINT NOT NULL DEFAULT 0,
+			inventory_scan_skip_reasons JSONB NOT NULL DEFAULT '{}'::jsonb,
 			inventory_reported_at TIMESTAMPTZ,
 			inventory_clips BIGINT NOT NULL DEFAULT 0,
 			inventory_bytes BIGINT NOT NULL DEFAULT 0,

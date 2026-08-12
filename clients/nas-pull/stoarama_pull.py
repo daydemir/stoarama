@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import errno
 import fcntl
 import hashlib
 import json
@@ -36,6 +37,11 @@ INVENTORY_SHUTDOWN_TIMEOUT_SEC = HTTP_TIMEOUT_SEC + 5
 ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 
+INVENTORY_SKIP_REASONS = frozenset((
+    "changed_during_hash", "invalid_sidecar", "io_error",
+    "permission_denied", "unexpected", "vanished_during_scan",
+))
+
 
 class ExistingFileMismatch(RuntimeError):
     pass
@@ -49,6 +55,20 @@ class RetryExhausted(RuntimeError):
     def __init__(self, cause, retries):
         super().__init__(str(cause))
         self.retries = retries
+
+
+def inventory_skip_reason(exc, sidecar):
+    if isinstance(exc, FileChangedDuringHash):
+        return "changed_during_hash"
+    if isinstance(exc, FileNotFoundError):
+        return "vanished_during_scan"
+    if isinstance(exc, PermissionError) or (isinstance(exc, OSError) and exc.errno in (errno.EACCES, errno.EPERM)):
+        return "permission_denied"
+    if sidecar and isinstance(exc, (json.JSONDecodeError, KeyError, TypeError, ValueError)):
+        return "invalid_sidecar"
+    if isinstance(exc, OSError):
+        return "io_error"
+    return "unexpected"
 
 
 class Phase(str, Enum):
@@ -343,7 +363,8 @@ class Inventory:
             if progress is not None:
                 self.db.executemany(
                     "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (("scan_rows_visited", str(progress[0])), ("scan_rows_skipped", str(progress[1]))),
+                    (("scan_rows_visited", str(progress[0])), ("scan_rows_skipped", str(progress[1])),
+                     ("scan_skip_reasons", json.dumps(progress[2], sort_keys=True, separators=(",", ":")))),
                 )
             self.db.commit()
 
@@ -509,7 +530,18 @@ class Inventory:
         generation = values.get("generation", "")
         if not generation:
             return None
-        return {
+        skip_reasons = None
+        if "scan_skip_reasons" in values:
+            try:
+                parsed_reasons = json.loads(values["scan_skip_reasons"])
+            except (TypeError, ValueError):
+                parsed_reasons = None
+            if isinstance(parsed_reasons, dict) and all(
+                key in INVENTORY_SKIP_REASONS and isinstance(value, int) and value > 0
+                for key, value in parsed_reasons.items()
+            ):
+                skip_reasons = parsed_reasons
+        summary = {
             "generation": generation,
             "scan_started_at": values.get("scan_started_at") or None,
             "scan_completed_at": values.get("scan_completed_at") or None,
@@ -522,6 +554,9 @@ class Inventory:
             "unmatched": int(values.get("unmatched", 0)),
             "digest": values.get("digest", ""),
         }
+        if skip_reasons is not None:
+            summary["scan_skip_reasons"] = skip_reasons
+        return summary
 
     def _digest_and_counts(self):
         digest = hashlib.sha256()
@@ -558,12 +593,13 @@ class Inventory:
         scan_pass = os.urandom(8).hex()
         scanned = 0
         skipped = 0
-        self._meta_set({"scan_pass_started_at": pass_started_at, "scan_rows_visited": "0", "scan_rows_skipped": "0"})
+        skip_reasons = {}
+        self._meta_set({"scan_pass_started_at": pass_started_at, "scan_rows_visited": "0", "scan_rows_skipped": "0", "scan_skip_reasons": "{}"})
 
         known_paths = set()
         for sidecar in cfg.output_dir.rglob("*.stoarama.json"):
             if stop_event.is_set():
-                self._commit_scan_batch((scanned, skipped))
+                self._commit_scan_batch((scanned, skipped, skip_reasons))
                 return
             try:
                 clip = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -582,7 +618,7 @@ class Inventory:
                 if self._linked_scan_row_is_current(clip, generation, scan_pass, path):
                     scanned += 1
                     if scanned % INVENTORY_SYNC_BATCH == 0:
-                        self._commit_scan_batch((scanned, skipped))
+                        self._commit_scan_batch((scanned, skipped, skip_reasons))
                         self.sync_dirty(cfg, generation, started_at)
                     continue
                 try:
@@ -612,16 +648,18 @@ class Inventory:
                 self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self._commit_scan_batch((scanned, skipped))
+                    self._commit_scan_batch((scanned, skipped, skip_reasons))
                     self.sync_dirty(cfg, generation, started_at)
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except Exception as exc:
                 skipped += 1
+                reason = inventory_skip_reason(exc, sidecar=True)
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 log("WARN", "inventory skipped sidecar=%s: %s" % (sidecar, exc))
         for path in cfg.output_dir.rglob("*"):
             if stop_event.is_set():
-                self._commit_scan_batch((scanned, skipped))
+                self._commit_scan_batch((scanned, skipped, skip_reasons))
                 return
             try:
                 if (
@@ -638,7 +676,7 @@ class Inventory:
                 if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat):
                     scanned += 1
                     if scanned % INVENTORY_SYNC_BATCH == 0:
-                        self._commit_scan_batch((scanned, skipped))
+                        self._commit_scan_batch((scanned, skipped, skip_reasons))
                         self.sync_dirty(cfg, generation, started_at)
                     continue
                 size_bytes, sha256, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
@@ -656,17 +694,19 @@ class Inventory:
                     )
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self._commit_scan_batch((scanned, skipped))
+                    self._commit_scan_batch((scanned, skipped, skip_reasons))
                     self.sync_dirty(cfg, generation, started_at)
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except Exception as exc:
                 skipped += 1
+                reason = inventory_skip_reason(exc, sidecar=False)
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 log("WARN", "inventory skipped unmatched file=%s: %s" % (path, exc))
         # Flush and publish every successfully observed row, but never promote a
         # partial generation. In particular, do not turn unseen prior rows into
         # "missing" when an unreadable/corrupt path was skipped.
-        self._commit_scan_batch((scanned, skipped))
+        self._commit_scan_batch((scanned, skipped, skip_reasons))
         self.sync_dirty(cfg, generation, started_at)
         if skipped:
             raise RuntimeError("inventory scan incomplete: %d path(s) could not be verified" % skipped)

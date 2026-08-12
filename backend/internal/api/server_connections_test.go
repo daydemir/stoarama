@@ -440,6 +440,8 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanRowsVisited: -1}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanRowsSkipped: -1}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanRowsVisited: 1}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanPassStartedAt: &now, ScanRowsSkipped: 1, ScanSkipReasons: map[string]int64{"unknown": 1}}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", Inventory: &connectionInventoryStatus{Generation: "scan", ScanPassStartedAt: &now, ScanRowsSkipped: 2, ScanSkipReasons: map[string]int64{"io_error": 1}}},
 		{Storage: &connectionStorageStatus{Available: true}},
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: -1}},
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: 101}},
@@ -553,8 +555,11 @@ func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
 	call(connectionInventoryStatus{Generation: "same-time-conflict", ScanStartedAt: &start, ScanCompletedAt: &completed, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("c", 64)})
 	progressStarted := now.Add(-time.Minute)
 	passStarted := now.Add(-30 * time.Second)
-	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12345, ScanRowsSkipped: 2, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0})
-	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12000, ScanRowsSkipped: 1})
+	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12345, ScanRowsSkipped: 2, ScanSkipReasons: map[string]int64{"invalid_sidecar": 1, "permission_denied": 1}, Clips: 1, Bytes: 1, Mismatches: 0, Unmatched: 0})
+	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12000, ScanRowsSkipped: 1, ScanSkipReasons: map[string]int64{"invalid_sidecar": 1}})
+	// A legacy client may omit reason telemetry while this pass is still running;
+	// it must not erase the newer client's reason counts.
+	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12346, ScanRowsSkipped: 2})
 	delayed := now.Add(-2 * time.Minute)
 	call(connectionInventoryStatus{Generation: "delayed", ScanStartedAt: &start, ScanCompletedAt: &delayed, Clips: 2, Bytes: 2, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("b", 64)})
 	var clips, bytesValue, mismatches, unmatched int64
@@ -568,10 +573,15 @@ func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
 	}
 	var storedPass time.Time
 	var visited, skipped int64
-	if err := pool.QueryRow(ctx, `SELECT inventory_scan_pass_started_at,inventory_scan_rows_visited,inventory_scan_rows_skipped FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&storedPass, &visited, &skipped); err != nil {
+	var reasons []byte
+	if err := pool.QueryRow(ctx, `SELECT inventory_scan_pass_started_at,inventory_scan_rows_visited,inventory_scan_rows_skipped,inventory_scan_skip_reasons FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&storedPass, &visited, &skipped, &reasons); err != nil {
 		t.Fatal(err)
 	}
-	if !storedPass.Equal(passStarted) || visited != 12345 || skipped != 2 {
-		t.Fatalf("scan progress pass=%s visited=%d skipped=%d", storedPass, visited, skipped)
+	var storedReasons map[string]int64
+	if err := json.Unmarshal(reasons, &storedReasons); err != nil {
+		t.Fatal(err)
+	}
+	if !storedPass.Equal(passStarted) || visited != 12346 || skipped != 2 || storedReasons["invalid_sidecar"] != 1 || storedReasons["permission_denied"] != 1 {
+		t.Fatalf("scan progress pass=%s visited=%d skipped=%d reasons=%s", storedPass, visited, skipped, reasons)
 	}
 }
