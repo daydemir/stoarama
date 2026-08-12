@@ -45,7 +45,10 @@ func TestValidateCaptureBackfillOptionsBoundsWork(t *testing.T) {
 	}{
 		{"zero concurrency", 0, 0, nil},
 		{"excess concurrency", 0, 5, nil},
+		{"negative limit", -1, 1, nil},
 		{"too many ids", 0, 1, append(ids50, 51)},
+		{"zero id", 0, 1, []int64{0}},
+		{"negative id", 0, 1, []int64{-1}},
 		{"duplicate ids", 0, 1, []int64{7, 7}},
 		{"limit with ids", 1, 1, []int64{7}},
 	} {
@@ -66,6 +69,7 @@ func TestLoadCaptureBackfillMissingTargetsUsesOnlyExplicitIDs(t *testing.T) {
 			map[string]any{"stream": map[string]any{"id": 11, "slug": "eleven"}, "captures_success": 7},
 			map[string]any{"stream": map[string]any{"id": 12, "slug": "twelve"}, "captures_success": 0},
 			map[string]any{"stream": map[string]any{"id": 13, "slug": "thirteen"}, "captures_success": 9},
+			map[string]any{"stream": map[string]any{"id": 14, "slug": "must-not-slip-in"}, "captures_success": 0},
 		}})
 	}))
 	defer server.Close()

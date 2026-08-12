@@ -299,6 +299,7 @@ func processCaptureBackfillMissingTarget(
 func loadCaptureBackfillMissingTargets(ctx context.Context, baseURL, apiToken string, limit int, explicitIDs []int64) ([]captureBackfillMissingCandidate, error) {
 	const pageSize = 500
 	out := make([]captureBackfillMissingCandidate, 0, 512)
+	explicitSelection := len(explicitIDs) > 0
 	wanted := make(map[int64]bool, len(explicitIDs))
 	for _, id := range explicitIDs {
 		if wanted[id] {
@@ -329,7 +330,7 @@ func loadCaptureBackfillMissingTargets(ctx context.Context, baseURL, apiToken st
 			}
 			capturesSuccess := int64FromAny(item["captures_success"])
 			explicit := wanted[stream.ID]
-			if len(wanted) > 0 && !explicit {
+			if explicitSelection && !explicit {
 				continue
 			}
 			if !explicit && capturesSuccess > 0 {
@@ -345,6 +346,9 @@ func loadCaptureBackfillMissingTargets(ctx context.Context, baseURL, apiToken st
 				BackfillReason:  reason,
 			})
 			delete(wanted, stream.ID)
+			if explicitSelection && len(wanted) == 0 {
+				return out, nil
+			}
 			if limit > 0 && len(out) >= limit {
 				return out, nil
 			}
