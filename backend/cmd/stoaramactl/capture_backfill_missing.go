@@ -56,7 +56,7 @@ func (v *streamIDFlags) Set(raw string) error {
 	return nil
 }
 
-func validateCaptureBackfillOptions(limit, concurrency int, ids []int64) error {
+func validateCaptureBackfillOptions(limit, concurrency int, ids []int64, dryRun bool, accountID int64) error {
 	if limit < 0 {
 		return fmt.Errorf("--limit must be >= 0")
 	}
@@ -68,6 +68,15 @@ func validateCaptureBackfillOptions(limit, concurrency int, ids []int64) error {
 	}
 	if len(ids) > 0 && limit > 0 {
 		return fmt.Errorf("--limit cannot be combined with --stream-id")
+	}
+	if !dryRun && len(ids) == 0 {
+		return fmt.Errorf("non-dry-run refresh requires explicit --stream-id values")
+	}
+	if !dryRun && accountID <= 0 {
+		return fmt.Errorf("--account-id is required for authoritative frame ingest")
+	}
+	if len(ids) == 0 && accountID != 0 {
+		return fmt.Errorf("--account-id requires explicit --stream-id values")
 	}
 	seen := make(map[int64]bool, len(ids))
 	for _, id := range ids {
@@ -104,6 +113,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	fs.Var(&streamIDs, "stream-id", "explicit stream id to refresh (repeatable; includes streams with existing frames)")
 	timeoutSec := fs.Int("timeout-sec", 90, "per-stream resolution/capture timeout seconds")
 	dryRun := fs.Bool("dry-run", false, "print actions without ingesting frames")
+	accountID := fs.Int64("account-id", 0, "owning account for explicit authoritative frame refresh")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
 
@@ -115,7 +125,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	if token == "" {
 		log.Fatalf("--api-token is required")
 	}
-	if err := validateCaptureBackfillOptions(*limit, *concurrency, streamIDs); err != nil {
+	if err := validateCaptureBackfillOptions(*limit, *concurrency, streamIDs, *dryRun, *accountID); err != nil {
 		log.Fatal(err)
 	}
 	if *timeoutSec <= 0 {
@@ -151,7 +161,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 		go func() {
 			defer wg.Done()
 			for target := range workCh {
-				resCh <- processCaptureBackfillMissingTarget(ctx, registry, client, target, time.Duration(*timeoutSec)*time.Second, *dryRun)
+				resCh <- processCaptureBackfillMissingTarget(ctx, registry, client, target, time.Duration(*timeoutSec)*time.Second, *dryRun, *accountID)
 			}
 		}()
 	}
@@ -208,6 +218,7 @@ func processCaptureBackfillMissingTarget(
 	target captureBackfillMissingCandidate,
 	timeout time.Duration,
 	dryRun bool,
+	accountID int64,
 ) captureBackfillMissingResult {
 	stream := target.Stream
 	result := captureBackfillMissingResult{
@@ -279,14 +290,17 @@ func processCaptureBackfillMissingTarget(
 	ingestCtx, cancelIngest := context.WithTimeout(ctx, timeout)
 	defer cancelIngest()
 	if err := client.IngestSuccess(ingestCtx, captureapi.IngestSuccessRequest{
-		StreamID:           stream.ID,
-		CapturedAt:         result.CapturedAt,
-		SourceKind:         "backfill_missing_frame",
-		EffectiveMode:      effective,
-		ResolvedURL:        resolved.URL,
-		MIMEType:           frame.MIMEType,
-		FrameBytes:         frame.Bytes,
-		RecordingHeartbeat: false,
+		AccountID:              accountID,
+		StreamID:               stream.ID,
+		CapturedAt:             result.CapturedAt,
+		SourceKind:             "backfill_missing_frame",
+		EffectiveMode:          effective,
+		ResolvedURL:            resolved.URL,
+		MIMEType:               frame.MIMEType,
+		FrameBytes:             frame.Bytes,
+		FrameSHA256:            frame.SHA256,
+		RecordingHeartbeat:     false,
+		AuthoritativeFrameOnly: true,
 	}); err != nil {
 		result.Status = "error"
 		result.Reason = "ingest capture success failed"

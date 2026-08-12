@@ -2,13 +2,46 @@ package captureapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 )
+
+func TestAuthoritativeFramePayloadCarriesAccountHashAndNoHeartbeat(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"consecutive_errors":0,"unsupported":false}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, APIToken: "test", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.IngestSuccess(context.Background(), IngestSuccessRequest{AccountID: 47, StreamID: 123, CapturedAt: time.Now(), SourceKind: "backfill_missing_frame", EffectiveMode: capture.ModeHLSLive, ResolvedURL: "https://source.example/live.m3u8?token=secret", MIMEType: "image/jpeg", FrameBytes: []byte{1, 2, 3}, FrameSHA256: strings.Repeat("a", 64), AuthoritativeFrameOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload["account_id"] != float64(47) || payload["authoritative_frame_only"] != true || payload["recording_heartbeat"] != false || payload["frame_sha256"] != strings.Repeat("a", 64) {
+		t.Fatalf("payload=%v", payload)
+	}
+	if _, ok := payload["resolved_url"]; ok {
+		t.Fatal("authoritative payload leaked resolved_url")
+	}
+	if _, ok := payload["execution_class"]; ok {
+		t.Fatal("authoritative payload carried execution_class")
+	}
+	if err = client.IngestSuccess(context.Background(), IngestSuccessRequest{StreamID: 123, FrameBytes: []byte{1}, AuthoritativeFrameOnly: true}); err == nil || !strings.Contains(err.Error(), "account_id") {
+		t.Fatalf("missing account validation err=%v", err)
+	}
+}
 
 func TestIngestSuccessRetriesOnTransientFailure(t *testing.T) {
 	t.Parallel()
