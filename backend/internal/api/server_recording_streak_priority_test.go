@@ -64,7 +64,7 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-inside", open.Add(-48*time.Hour), streamID, "-6 days 23 hours 59 minutes").Scan(&pausedInside); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-outside", open.Add(-48*time.Hour), streamID, "-7 days 1 minute").Scan(&pausedOutside); err != nil {
+	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-outside", open.Add(-48*time.Hour), streamID, "-7 days -1 minute").Scan(&pausedOutside); err != nil {
 		t.Fatal(err)
 	}
 	var jobID int64
