@@ -440,6 +440,8 @@ func (s *Server) router() http.Handler {
 			admin.Post("/dashboard/inference/cleanup-unboxed", s.handleDashboardInferenceCleanupUnboxed)
 			admin.Put("/dashboard/streams/{id}/pipelines/{pipeline_id}", s.handleDashboardStreamPipelineUpsert)
 			admin.Post("/dashboard/streams/{id}/frame-exports", s.handleDashboardStreamFrameExportCreate)
+			admin.Post("/nas-cleanup/candidates", s.handleAdminNASCleanupCandidateCreate)
+			admin.Get("/nas-cleanup/candidates/{id}", s.handleAdminNASCleanupCandidateGet)
 		})
 
 		// Shared catalog tagging for any signed-in browser session (member or
