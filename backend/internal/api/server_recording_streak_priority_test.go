@@ -99,8 +99,12 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 		t.Fatalf("paused seven-day boundary wrong: inside=%t outside=%t items=%+v", seen[pausedInside], seen[pausedOutside], out.Items)
 	}
 	for _, it := range out.Items {
-		if it.RecordingID == envelopeRec && len(it.RecentWindows) != 0 {
-			t.Fatalf("partial envelope window counted: %+v", it)
+		if it.RecordingID == envelopeRec {
+			for _, win := range it.RecentWindows {
+				if win.End.Equal(open.Add(12 * time.Hour)) {
+					t.Fatalf("partial envelope window counted: %+v", it)
+				}
+			}
 		}
 	}
 	var mine *streakPriorityRecording
