@@ -139,18 +139,18 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		    AND daily_window_start='08:00:00'::time AND daily_window_end='20:00:00'::time
 		    AND (status='active' OR (status='paused' AND paused_at>=now()-interval '7 days'))
 		), expected AS (
-		  SELECT r.id,r.name,r.status,(d.day+'08:00:00'::time) AT TIME ZONE r.cron_timezone fire_at,
-		         (d.day+'20:00:00'::time) AT TIME ZONE r.cron_timezone window_end_at,
+		  SELECT r.id,r.name,r.status,(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone fire_at,
+		         (d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone window_end_at,
 		         count(j.id)::int job_count,min(j.id) job_id
 		  FROM eligible r CROSS JOIN LATERAL generate_series(
 		    (now() AT TIME ZONE r.cron_timezone)::date-60,(now() AT TIME ZONE r.cron_timezone)::date,interval '1 day') d(day)
 		  LEFT JOIN recording_jobs j ON j.recording_id=r.id AND j.kind='continuous_window'
-		    AND j.fire_at=(d.day+'08:00:00'::time) AT TIME ZONE r.cron_timezone
-		    AND j.window_end_at=(d.day+'20:00:00'::time) AT TIME ZONE r.cron_timezone
-		  WHERE ((d.day+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=now()
-		    AND ((d.day+'08:00:00'::time) AT TIME ZONE r.cron_timezone)>=r.start_at
-		    AND (r.end_at IS NULL OR ((d.day+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=r.end_at)
-		    AND (r.active_weekdays & (1 << (extract(isodow FROM d.day)::int-1)))<>0
+		    AND j.fire_at=(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone
+		    AND j.window_end_at=(d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone
+		  WHERE ((d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=now()
+		    AND ((d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone)>=r.start_at
+		    AND (r.end_at IS NULL OR ((d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=r.end_at)
+		    AND (r.active_weekdays & (1 << (extract(isodow FROM d.day::date)::int-1)))<>0
 		  GROUP BY r.id,r.name,r.status,d.day,r.cron_timezone
 		), recent AS (
 		  SELECT *,row_number() OVER(PARTITION BY id ORDER BY window_end_at DESC) rn FROM expected
