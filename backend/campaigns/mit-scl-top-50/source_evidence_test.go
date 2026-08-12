@@ -34,7 +34,7 @@ func TestSourceEvidenceContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if regexp.MustCompile(`(?i)(\.m3u8|X-Amz-|wowzatoken|bearer\s|access[_-]?key|secret[_-]?key)`).Match(raw) {
+	if regexp.MustCompile(`(?i)(\.m3u8|\.mpd(?:[?"'\s]|$)|X-Amz-|wowzatoken|bearer\s|api[_-]?key|access[_-]?(?:key|token)|client[_-]?secret|secret[_-]?key|[?&](?:token|access_token|api_key)=)`).Match(raw) {
 		t.Fatal("source evidence contains a live media URL or credential-shaped value")
 	}
 	var catalog sourceEvidence
@@ -46,7 +46,19 @@ func TestSourceEvidenceContract(t *testing.T) {
 	}
 	caps := map[string]int{}
 	for _, cap := range catalog.ProviderCaps {
+		if _, duplicate := caps[cap.FailureDomain]; duplicate {
+			t.Fatalf("duplicate provider cap %q", cap.FailureDomain)
+		}
 		caps[cap.FailureDomain] = cap.Maximum
+	}
+	wantCaps := map[string]int{"youtube_live": 3, "skylinewebcams": 3, "seattle_streamlock": 2}
+	if len(caps) != len(wantCaps) {
+		t.Fatalf("provider caps=%v want=%v", caps, wantCaps)
+	}
+	for failureDomain, maximum := range wantCaps {
+		if caps[failureDomain] != maximum {
+			t.Fatalf("provider cap %s=%d want=%d", failureDomain, caps[failureDomain], maximum)
+		}
 	}
 	seen := map[int64]bool{}
 	selected := []int64{}
@@ -65,6 +77,9 @@ func TestSourceEvidenceContract(t *testing.T) {
 		}
 	}
 	wantSelected := []int64{17200, 415, 78, 17237}
+	if len(selected) != len(wantSelected) {
+		t.Fatalf("selected additions=%v want=%v", selected, wantSelected)
+	}
 	for i := range wantSelected {
 		if selected[i] != wantSelected[i] {
 			t.Fatalf("selected additions=%v", selected)
