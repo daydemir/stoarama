@@ -56,6 +56,9 @@ func TestSelectPreopenTargetsStagesRetriesAndNeverAfterOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.RuntimeParams = map[string]string{"search_path": schema}
+	// The fixture setup and migration contain multiple SQL statements, matching
+	// the repository migration runner's simple-protocol execution.
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
