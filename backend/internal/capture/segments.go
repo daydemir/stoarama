@@ -1323,7 +1323,7 @@ func probeTimestampContract(ctx context.Context, path string) (*TimestampContrac
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, ffprobeBin(), "-v", "error", "-show_frames", "-show_streams", "-show_data",
-		"-show_entries", "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,time_base,extradata,sample_rate,channels,channel_layout:frame=stream_index,media_type,best_effort_timestamp,pkt_dts,pkt_duration,nb_samples",
+		"-show_entries", "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,time_base,extradata,sample_rate,channels,channel_layout:frame=stream_index,media_type,best_effort_timestamp,pkt_dts,duration,pkt_duration,nb_samples",
 		"-of", "json", path)
 	var out timestampProbeOutput
 	cmd.Stdout = &out
@@ -1353,6 +1353,7 @@ func probeTimestampContract(ctx context.Context, path string) (*TimestampContrac
 			MediaType           string      `json:"media_type"`
 			BestEffortTimestamp json.Number `json:"best_effort_timestamp"`
 			PacketDTS           json.Number `json:"pkt_dts"`
+			Duration            json.Number `json:"duration"`
 			PacketDuration      json.Number `json:"pkt_duration"`
 			NBSamples           int64       `json:"nb_samples"`
 		} `json:"frames"`
@@ -1415,9 +1416,9 @@ func probeTimestampContract(ctx context.Context, path string) (*TimestampContrac
 			if err != nil {
 				return nil, fmt.Errorf("missing %s presentation timestamp", mediaType)
 			}
-			duration, err := strconv.ParseInt(string(f.PacketDuration), 10, 64)
-			if err != nil || duration <= 0 {
-				return nil, fmt.Errorf("missing %s terminal duration", mediaType)
+			duration, err := timestampFrameDuration(f.Duration, f.PacketDuration)
+			if err != nil {
+				return nil, fmt.Errorf("missing %s terminal duration: %w", mediaType, err)
 			}
 			if track.UnitCount == 0 {
 				track.FirstTimestamp = pts
@@ -1442,6 +1443,42 @@ func probeTimestampContract(ctx context.Context, path string) (*TimestampContrac
 		return nil, fmt.Errorf("timestamp probe returned no video track")
 	}
 	return contract, nil
+}
+
+// timestampFrameDuration accepts the decoded-frame field emitted by current
+// ffprobe (duration) and the legacy name (pkt_duration). If both are present,
+// they must describe the same positive integer tick count; ambiguous evidence
+// remains UNKNOWN rather than becoming a false complete contract.
+func timestampFrameDuration(duration, packetDuration json.Number) (int64, error) {
+	parse := func(name string, raw json.Number) (int64, bool, error) {
+		text := strings.TrimSpace(string(raw))
+		if text == "" {
+			return 0, false, nil
+		}
+		value, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || value <= 0 {
+			return 0, true, fmt.Errorf("invalid %s", name)
+		}
+		return value, true, nil
+	}
+	decoded, hasDecoded, err := parse("duration", duration)
+	if err != nil {
+		return 0, err
+	}
+	legacy, hasLegacy, err := parse("pkt_duration", packetDuration)
+	if err != nil {
+		return 0, err
+	}
+	if !hasDecoded && !hasLegacy {
+		return 0, fmt.Errorf("duration absent")
+	}
+	if hasDecoded && hasLegacy && decoded != legacy {
+		return 0, fmt.Errorf("duration fields conflict")
+	}
+	if hasDecoded {
+		return decoded, nil
+	}
+	return legacy, nil
 }
 
 func parsePositiveRational(raw string) (int64, int64, error) {
