@@ -18,7 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | scene-attest | qualification build|freeze|report | streak-priority report"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -38,6 +38,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if args[0] == "repair-source" {
 		runRecordingSourceRepair(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] == "authoritative-frame" {
+		runRecordingClipAuthoritativeFrame(ctx, cfg, args[1:])
 		return
 	}
 	if args[0] == "scene-attest" {
@@ -71,6 +75,23 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingClipAuthoritativeFrame(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordings authoritative-frame", flag.ExitOnError)
+	accountID := fs.Int64("account-id", 0, "exact account id")
+	recordingID := fs.Int64("recording-id", 0, "exact active recording id")
+	clipID := fs.Int64("clip-id", 0, "exact landed recording clip id")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	serviceToken := fs.String("service-token", cfg.ServiceToken, "service bearer token")
+	_ = fs.Parse(args)
+	if len(fs.Args()) != 0 || *accountID <= 0 || *recordingID <= 0 || *clipID <= 0 {
+		log.Fatal("--account-id, --recording-id, and --clip-id are required")
+	}
+	if strings.TrimSpace(*backendAPIURL) == "" || strings.TrimSpace(*serviceToken) == "" {
+		log.Fatal("--backend-api-url and --service-token are required")
+	}
+	printJSON(mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*serviceToken), fmt.Sprintf("/api/v1/recordings/%d/clips/%d/authoritative-frame", *recordingID, *clipID), map[string]any{"account_id": *accountID}))
 }
 
 func runRecordingCampaignTracks(ctx context.Context, cfg config.Config, args []string) {

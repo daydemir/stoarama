@@ -512,6 +512,7 @@ func (s *Server) router() http.Handler {
 
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
+			service.Post("/recordings/{id}/clips/{clipId}/authoritative-frame", s.handleRecordingClipAuthoritativeFrame)
 
 			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)
 			service.Post("/source-candidates", s.handleSourceCandidatesUpsert)

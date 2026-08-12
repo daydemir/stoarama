@@ -38,6 +38,7 @@ type Config struct {
 type ObjectHead struct {
 	ETag      string
 	SizeBytes int64
+	VersionID string
 }
 
 type ObjectInfo struct {
@@ -200,7 +201,23 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength)}, nil
+	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId))}, nil
+}
+
+// OpenExact returns the exact object generation observed by Head. If the store
+// has versioning, VersionId pins the generation; IfMatch closes the Head->GET
+// race even when versioning is unavailable.
+func (c *Client) OpenExact(ctx context.Context, key, etag, versionID string) (io.ReadCloser, error) {
+	clean := cleanETag(etag)
+	in := &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(`"` + clean + `"`)}
+	if strings.TrimSpace(versionID) != "" {
+		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	out, err := c.s3.GetObject(ctx, in)
+	if err != nil {
+		return nil, fmt.Errorf("open exact object %s: %w", key, err)
+	}
+	return out.Body, nil
 }
 
 func IsNotFound(err error) bool {
