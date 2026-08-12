@@ -43,6 +43,9 @@ type captureBackfillMissingResult struct {
 
 type streamIDFlags []int64
 
+const maxFrameRefreshConcurrency = 4
+const maxExplicitFrameRefreshStreams = 50
+
 func (v *streamIDFlags) String() string { return fmt.Sprint([]int64(*v)) }
 func (v *streamIDFlags) Set(raw string) error {
 	id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
@@ -50,6 +53,32 @@ func (v *streamIDFlags) Set(raw string) error {
 		return fmt.Errorf("stream id must be a positive integer")
 	}
 	*v = append(*v, id)
+	return nil
+}
+
+func validateCaptureBackfillOptions(limit, concurrency int, ids []int64) error {
+	if limit < 0 {
+		return fmt.Errorf("--limit must be >= 0")
+	}
+	if concurrency < 1 || concurrency > maxFrameRefreshConcurrency {
+		return fmt.Errorf("--concurrency must be 1..%d", maxFrameRefreshConcurrency)
+	}
+	if len(ids) > maxExplicitFrameRefreshStreams {
+		return fmt.Errorf("at most %d --stream-id values are allowed", maxExplicitFrameRefreshStreams)
+	}
+	if len(ids) > 0 && limit > 0 {
+		return fmt.Errorf("--limit cannot be combined with --stream-id")
+	}
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return fmt.Errorf("stream ids must be positive")
+		}
+		if seen[id] {
+			return fmt.Errorf("duplicate --stream-id %d", id)
+		}
+		seen[id] = true
+	}
 	return nil
 }
 
@@ -86,14 +115,8 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	if token == "" {
 		log.Fatalf("--api-token is required")
 	}
-	if *limit < 0 {
-		log.Fatalf("--limit must be >= 0")
-	}
-	if len(streamIDs) > 0 && *limit > 0 {
-		log.Fatalf("--limit cannot be combined with --stream-id")
-	}
-	if *concurrency <= 0 {
-		log.Fatalf("--concurrency must be > 0")
+	if err := validateCaptureBackfillOptions(*limit, *concurrency, streamIDs); err != nil {
+		log.Fatal(err)
 	}
 	if *timeoutSec <= 0 {
 		log.Fatalf("--timeout-sec must be > 0")

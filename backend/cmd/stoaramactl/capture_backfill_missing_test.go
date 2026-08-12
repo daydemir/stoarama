@@ -30,6 +30,33 @@ func TestBackfillMissingEffectiveModeMapsLegacyRelayToDirect(t *testing.T) {
 	}
 }
 
+func TestValidateCaptureBackfillOptionsBoundsWork(t *testing.T) {
+	ids50 := make([]int64, 50)
+	for i := range ids50 {
+		ids50[i] = int64(i + 1)
+	}
+	if err := validateCaptureBackfillOptions(0, 1, ids50); err != nil {
+		t.Fatalf("valid boundary: %v", err)
+	}
+	for _, tc := range []struct {
+		name               string
+		limit, concurrency int
+		ids                []int64
+	}{
+		{"zero concurrency", 0, 0, nil},
+		{"excess concurrency", 0, 5, nil},
+		{"too many ids", 0, 1, append(ids50, 51)},
+		{"duplicate ids", 0, 1, []int64{7, 7}},
+		{"limit with ids", 1, 1, []int64{7}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateCaptureBackfillOptions(tc.limit, tc.concurrency, tc.ids); err == nil {
+				t.Fatal("invalid options accepted")
+			}
+		})
+	}
+}
+
 func TestLoadCaptureBackfillMissingTargetsUsesOnlyExplicitIDs(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer operator" {
