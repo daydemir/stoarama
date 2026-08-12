@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
 func TestRecordingCanaryIsReservedNativeLocalAndCleaned(t *testing.T) {
@@ -22,21 +25,10 @@ func TestRecordingCanaryIsReservedNativeLocalAndCleaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	argsLog := filepath.Join(home, "ffmpeg-args.log")
-	decodeStarted := filepath.Join(home, "decode-started")
-	watcherStarted := filepath.Join(home, "watcher-started")
 	ffmpeg := `#!/bin/sh
 printf '%s\n' "$*" >> '` + argsLog + `'
 case " $* " in
-  *" -f null "*)
-    printf started > '` + decodeStarted + `'
-    tries=0
-    while [ ! -f '` + watcherStarted + `' ]; do
-      tries=$((tries + 1))
-      [ "$tries" -ge 100 ] && exit 1
-      sleep 0.05
-    done
-    exit 0
-    ;;
+	*" -f null "*) exit 0 ;;
   *)
     eval "out=\${$#}"
     printf 'native-media' > "$out"
@@ -53,7 +45,6 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 	}
 
 	var starts, checks, finishes atomic.Int64
-	watcherRelease := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -62,16 +53,6 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 			writeCanaryTestSpec(w)
 		case strings.HasSuffix(r.URL.Path, "/check"):
 			checks.Add(1)
-			if _, err := os.Stat(decodeStarted); err == nil {
-				// Keep a watcher request in flight until normal media validation
-				// cancels it. Self-cancellation must not become a false safety error.
-				_ = os.WriteFile(watcherStarted, []byte("started"), 0o600)
-				select {
-				case <-r.Context().Done():
-				case <-watcherRelease:
-				}
-				return
-			}
 			writeCanaryTestSpec(w)
 		case strings.HasSuffix(r.URL.Path, "/finish"):
 			finishes.Add(1)
@@ -88,11 +69,10 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 	}
 
 	err := runRecordingCanary(context.Background(), []string{"--recording-id", "445"})
-	close(watcherRelease)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if starts.Load() != 1 || checks.Load() < 2 || finishes.Load() != 1 {
+	if starts.Load() != 1 || checks.Load() < 1 || finishes.Load() != 1 {
 		t.Fatalf("reservation calls start=%d check=%d finish=%d", starts.Load(), checks.Load(), finishes.Load())
 	}
 	logged, err := os.ReadFile(argsLog)
@@ -291,6 +271,85 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 	if checks.Load() < 2 || finishes.Load() != 1 {
 		t.Fatalf("reservation calls checks=%d finish=%d", checks.Load(), finishes.Load())
 	}
+}
+
+func TestWatchRecordingCanarySafety(t *testing.T) {
+	expected := recordingapi.RecordingCanarySpec{
+		ReservationID: "123e4567-e89b-12d3-a456-426614174000",
+		RecordingID:   445, NodeID: 150, StreamID: 17342, Provider: "TEST",
+		SourceURL: "https://203.0.113.10/live.m3u8",
+	}
+	t.Run("matching check continues until normal cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ticks := make(chan time.Time, 1)
+		checked := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- watchRecordingCanarySafety(ctx, ticks, expected, func(context.Context) (recordingapi.RecordingCanarySpec, error) {
+				close(checked)
+				return expected, nil
+			})
+		}()
+		ticks <- time.Time{}
+		<-checked
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("check error fails closed", func(t *testing.T) {
+		ticks := make(chan time.Time, 1)
+		ticks <- time.Time{}
+		want := errors.New("reservation unavailable")
+		err := watchRecordingCanarySafety(context.Background(), ticks, expected, func(context.Context) (recordingapi.RecordingCanarySpec, error) {
+			return recordingapi.RecordingCanarySpec{}, want
+		})
+		if !errors.Is(err, want) {
+			t.Fatalf("err=%v want=%v", err, want)
+		}
+	})
+	t.Run("source mismatch fails closed", func(t *testing.T) {
+		ticks := make(chan time.Time, 1)
+		ticks <- time.Time{}
+		changed := expected
+		changed.SourceURL = "https://203.0.113.11/live.m3u8"
+		err := watchRecordingCanarySafety(context.Background(), ticks, expected, func(context.Context) (recordingapi.RecordingCanarySpec, error) {
+			return changed, nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "source changed") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("normal cancellation during check is not a safety error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ticks := make(chan time.Time, 1)
+		ticks <- time.Time{}
+		started := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- watchRecordingCanarySafety(ctx, ticks, expected, func(checkCtx context.Context) (recordingapi.RecordingCanarySpec, error) {
+				close(started)
+				<-checkCtx.Done()
+				return recordingapi.RecordingCanarySpec{}, checkCtx.Err()
+			})
+		}()
+		<-started
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("closed ticker fails closed", func(t *testing.T) {
+		ticks := make(chan time.Time)
+		close(ticks)
+		err := watchRecordingCanarySafety(context.Background(), ticks, expected, func(context.Context) (recordingapi.RecordingCanarySpec, error) {
+			t.Fatal("check called after ticker closed")
+			return recordingapi.RecordingCanarySpec{}, nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "ticker stopped") {
+			t.Fatalf("err=%v", err)
+		}
+	})
 }
 
 func writeCanaryTestSpec(w http.ResponseWriter) {
