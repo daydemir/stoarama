@@ -20,6 +20,10 @@ ALTER TABLE frames ADD CONSTRAINT frames_recording_clip_provenance_coherent CHEC
    AND source_recording_clip_sha256 IS NOT NULL
    AND source_recording_clip_etag IS NOT NULL
    AND source_recording_destination_id IS NOT NULL
+   AND source_recording_endpoint IS NOT NULL
+   AND source_recording_bucket IS NOT NULL
+   AND source_recording_object_key IS NOT NULL
+   AND source_recording_size_bytes IS NOT NULL
    AND length(btrim(source_recording_endpoint)) BETWEEN 9 AND 2048
    AND length(btrim(source_recording_bucket)) BETWEEN 1 AND 255
    AND length(source_recording_object_key) BETWEEN 1 AND 2048
