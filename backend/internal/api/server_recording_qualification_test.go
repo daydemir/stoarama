@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -68,6 +69,76 @@ func TestClassifyQualificationTimeline(t *testing.T) {
 				t.Fatalf("got=%s want=%s", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	userID, accountID := seedUserOrg(t, pool, "qualification-freeze@example.com", false)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `
+	 INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,access_key_id,secret_access_key_enc,status,managed)
+	 VALUES($1,'qual','s3_compatible','https://s3.example.test','auto','qual','key',decode('00','hex'),'verified',true);
+	 WITH ss AS (INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps)
+	   SELECT 'direct','q'||n,'stream-'||n,'qualification-'||n,'https://example.test/'||n||'.m3u8','','hls','direct','cloud','video',30 FROM generate_series(1,50)n RETURNING id),
+	 rr AS (INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays)
+	   SELECT $1,(SELECT id FROM storage_destinations WHERE account_id=$1 AND name='qual'),'recording-'||row_number() over(),'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'active','2026-08-01',id,'continuous','08:00','20:00',127 FROM ss RETURNING stream_id),
+	 mo AS (INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256)
+	   SELECT 'r2','qual','frame-'||stream_id,'image/jpeg',1,lpad(to_hex(stream_id),64,'0') FROM rr RETURNING id,object_key,sha256),
+	 ff AS (INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind)
+	   SELECT rr.stream_id,now()-interval '1 hour',mo.id,'success','live' FROM rr JOIN mo ON mo.object_key='frame-'||rr.stream_id RETURNING id,stream_id,raw_media_object_id,captured_at)
+	 INSERT INTO recording_scene_frame_evidence(account_id,stream_id,frame_id,media_object_id,captured_at,frame_sha256,scene_identity_sha256,verification_method,verified_by_user_id)
+	 SELECT $1,ff.stream_id,ff.id,ff.raw_media_object_id,ff.captured_at,mo.sha256,lpad(to_hex(ff.stream_id+100000),64,'0'),'operator_visual',$2 FROM ff JOIN mo ON mo.id=ff.raw_media_object_id`, accountID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	rows, err := pool.Query(ctx, `SELECT id FROM recordings WHERE account_id=$1 ORDER BY id`, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	call := func(apply bool, expected string) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(qualificationBuildRequest{RecordingIDs: ids, SequenceStart: time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC), Apply: apply, ExpectedPlanSHA256: expected})
+		req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/build", bytes.NewReader(raw)), accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}, "")
+		rec := httptest.NewRecorder()
+		s.handleAccountRecordingQualificationBuild(rec, req)
+		return rec
+	}
+	dry := call(false, "")
+	if dry.Code != http.StatusOK {
+		t.Fatalf("dry status=%d body=%s", dry.Code, dry.Body.String())
+	}
+	var planned struct {
+		Plan qualificationPlan `json:"plan"`
+	}
+	if err := json.Unmarshal(dry.Body.Bytes(), &planned); err != nil {
+		t.Fatal(err)
+	}
+	frozen := call(true, planned.Plan.PlanSHA256)
+	if frozen.Code != http.StatusCreated {
+		t.Fatalf("freeze status=%d body=%s", frozen.Code, frozen.Body.String())
+	}
+	idempotent := call(true, planned.Plan.PlanSHA256)
+	if idempotent.Code != http.StatusOK || !strings.Contains(idempotent.Body.String(), "idempotent") {
+		t.Fatalf("idempotent status=%d body=%s", idempotent.Code, idempotent.Body.String())
+	}
+	var status string
+	var frozenAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT status,frozen_at FROM recording_qualification_runs WHERE account_id=$1`, accountID).Scan(&status, &frozenAt); err != nil || status != "active" || frozenAt == nil {
+		t.Fatalf("status=%s frozen=%v err=%v", status, frozenAt, err)
+	}
+	stale := call(true, strings.Repeat("0", 64))
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale status=%d body=%s", stale.Code, stale.Body.String())
 	}
 }
 
