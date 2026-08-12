@@ -47,6 +47,10 @@ const (
 // what "drifted" means.
 const clipTimestampDriftLimitSec = 90
 
+// Failed or ambiguous email delivery remains retryable, but the live sweep
+// must not hammer the provider or duplicate mail every five minutes.
+const healthAlertDeliveryRetryBackoff = 15 * time.Minute
+
 var healthSignalLabels = map[string]string{
 	signalContinuousSilentDeath:      "Continuous recording stopped producing clips mid-window",
 	signalContinuousWindowEndedEarly: "Continuous recording window ended early with no footage",
@@ -95,7 +99,7 @@ type healthIncident struct {
 
 func runRecordingHealth(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recording-health run [--dry-run --freshness-min 10]")
+		log.Fatalf("usage: stoaramactl recording-health run [--dry-run --live-only --freshness-min 10]")
 	}
 	switch args[0] {
 	case "run":
@@ -112,11 +116,15 @@ func runRecordingHealth(ctx context.Context, cfg config.Config, args []string) {
 func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("recording-health run", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "detect + print incidents only; do not email or write dedup rows")
+	liveOnly := fs.Bool("live-only", false, "check only current capture progress and jobs")
 	freshnessMin := fs.Int("freshness-min", 10, "continuous silent-death freshness window in minutes")
 	verifyMedia := fs.Bool("verify-media", false, "download and ffprobe the newest adjacent clip pair for each paid active recording with recent retained clips, then decode-verify their concatenation")
 	_ = fs.Parse(args)
 	if *freshnessMin <= 0 {
 		log.Fatalf("--freshness-min must be > 0")
+	}
+	if *liveOnly && *verifyMedia {
+		log.Fatalf("--live-only and --verify-media are mutually exclusive")
 	}
 
 	pool := mustOpenPool(ctx, cfg)
@@ -130,6 +138,8 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	var incidents []healthIncident
 	if *verifyMedia {
 		incidents = detectLatestStoredClipHealth(ctx, pool, cfg)
+	} else if *liveOnly {
+		incidents = detectLiveRecordingHealthIncidents(ctx, pool, *freshnessMin)
 	} else {
 		incidents = detectRecordingHealthIncidents(ctx, pool, *freshnessMin)
 	}
@@ -145,6 +155,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		}
 		printJSON(map[string]any{
 			"dry_run":   true,
+			"run_class": healthRunClass(*verifyMedia, *liveOnly),
 			"detected":  len(incidents),
 			"by_signal": bySignal,
 			"notified":  0,
@@ -153,7 +164,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		return
 	}
 	now := time.Now()
-	if !*verifyMedia {
+	if !*verifyMedia && !*liveOnly {
 		if err := materializeRecordingWindowHealth(ctx, pool, now); err != nil {
 			log.Fatalf("materialize recording window health: %v", err)
 		}
@@ -161,20 +172,23 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 
 	toNotify := make([]healthIncident, 0, len(incidents))
 	for _, inc := range incidents {
-		newlyInserted, lastAlertedAt, err := upsertHealthAlert(ctx, pool, inc.RecordingID, inc.Signal)
+		newlyInserted, lastAlertedAt, lastDeliveryAttemptAt, err := upsertHealthAlert(ctx, pool, inc.RecordingID, inc.Signal)
 		if err != nil {
 			log.Fatalf("upsert health alert recording=%d signal=%s: %v", inc.RecordingID, inc.Signal, err)
 		}
-		if shouldNotifyHealthIncident(newlyInserted, lastAlertedAt, now) {
+		if shouldNotifyHealthIncident(newlyInserted, lastAlertedAt, lastDeliveryAttemptAt, now) {
 			toNotify = append(toNotify, inc)
 		}
 	}
-	if err := resolveClearedHealthAlerts(ctx, pool, incidents, evaluatedHealthSignals(*verifyMedia)); err != nil {
+	if err := resolveClearedHealthAlerts(ctx, pool, incidents, evaluatedHealthSignals(*verifyMedia, *liveOnly)); err != nil {
 		log.Fatalf("resolve cleared health alerts: %v", err)
 	}
 
 	emailed := 0
 	if len(toNotify) > 0 {
+		if err := markHealthAlertsDeliveryAttempted(ctx, pool, toNotify); err != nil {
+			log.Fatalf("mark recording health alert delivery attempted: %v", err)
+		}
 		var err error
 		emailed, err = deliverRecordingHealthEmail(ctx, pool, cfg, toNotify)
 		if err != nil {
@@ -188,7 +202,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	}
 
 	maintenance := transientLedgerMaintenanceResult{}
-	if !*verifyMedia {
+	if !*verifyMedia && !*liveOnly {
 		maintenance, err = maintainTransientLedgers(ctx, pool, time.Now())
 		if err != nil {
 			// Alert detection and delivery have already completed. Fail the cron now so
@@ -198,6 +212,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	}
 
 	printJSON(map[string]any{
+		"run_class":                healthRunClass(*verifyMedia, *liveOnly),
 		"dry_run":                  false,
 		"detected":                 len(incidents),
 		"by_signal":                bySignal,
@@ -238,22 +253,42 @@ func acquireRecordingHealthRunLock(ctx context.Context, pool *pgxpool.Pool, veri
 
 // shouldNotifyHealthIncident decides whether an incident warrants an email.
 // last_alerted_at means successfully delivered, never merely attempted.
-func shouldNotifyHealthIncident(newlyInserted bool, lastAlertedAt, now time.Time) bool {
+func shouldNotifyHealthIncident(newlyInserted bool, lastAlertedAt time.Time, lastDeliveryAttemptAt *time.Time, now time.Time) bool {
+	if !newlyInserted && lastDeliveryAttemptAt != nil && !lastDeliveryAttemptAt.Before(now.Add(-healthAlertDeliveryRetryBackoff)) {
+		return false
+	}
 	return newlyInserted || lastAlertedAt.Before(now.Add(-24*time.Hour))
 }
 
-func upsertHealthAlert(ctx context.Context, pool *pgxpool.Pool, recordingID int64, signal string) (bool, time.Time, error) {
+func upsertHealthAlert(ctx context.Context, pool *pgxpool.Pool, recordingID int64, signal string) (bool, time.Time, *time.Time, error) {
 	var newlyInserted bool
 	var lastAlertedAt time.Time
+	var lastDeliveryAttemptAt *time.Time
 	err := pool.QueryRow(ctx, `
 		INSERT INTO recorder_health_alerts (recording_id, signal, last_alerted_at)
 		VALUES ($1,$2,'1970-01-01 00:00:00+00'::timestamptz)
 		ON CONFLICT (recording_id,signal) DO UPDATE
 		  SET last_alerted_at = CASE WHEN recorder_health_alerts.resolved_at IS NOT NULL THEN '1970-01-01 00:00:00+00'::timestamptz ELSE recorder_health_alerts.last_alerted_at END,
+		      last_delivery_attempt_at = CASE WHEN recorder_health_alerts.resolved_at IS NOT NULL THEN NULL ELSE recorder_health_alerts.last_delivery_attempt_at END,
 		      resolved_at = NULL
-		RETURNING (xmax=0) AS newly_inserted, last_alerted_at
-	`, recordingID, signal).Scan(&newlyInserted, &lastAlertedAt)
-	return newlyInserted, lastAlertedAt, err
+		RETURNING (xmax=0) AS newly_inserted, last_alerted_at, last_delivery_attempt_at
+	`, recordingID, signal).Scan(&newlyInserted, &lastAlertedAt, &lastDeliveryAttemptAt)
+	return newlyInserted, lastAlertedAt, lastDeliveryAttemptAt, err
+}
+
+func markHealthAlertsDeliveryAttempted(ctx context.Context, pool *pgxpool.Pool, incidents []healthIncident) error {
+	recIDs := make([]int64, 0, len(incidents))
+	signals := make([]string, 0, len(incidents))
+	for _, inc := range incidents {
+		recIDs = append(recIDs, inc.RecordingID)
+		signals = append(signals, inc.Signal)
+	}
+	_, err := pool.Exec(ctx, `
+		UPDATE recorder_health_alerts a SET last_delivery_attempt_at=now()
+		FROM unnest($1::bigint[], $2::text[]) AS attempted(recording_id, signal)
+		WHERE a.recording_id=attempted.recording_id AND a.signal=attempted.signal
+	`, recIDs, signals)
+	return err
 }
 
 func markHealthAlertsDelivered(ctx context.Context, pool *pgxpool.Pool, incidents []healthIncident) error {
@@ -290,9 +325,12 @@ func resolveClearedHealthAlerts(ctx context.Context, pool *pgxpool.Pool, inciden
 	return err
 }
 
-func evaluatedHealthSignals(verifyMedia bool) []string {
+func evaluatedHealthSignals(verifyMedia, liveOnly bool) []string {
 	if verifyMedia {
 		return []string{signalStoredClipInvalid}
+	}
+	if liveOnly {
+		return liveRecordingHealthSignals()
 	}
 	signals := []string{
 		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
@@ -302,6 +340,25 @@ func evaluatedHealthSignals(verifyMedia bool) []string {
 		signalContinuousLayoutChange,
 	}
 	return signals
+}
+
+func liveRecordingHealthSignals() []string {
+	detectors := liveRecordingHealthDetectors()
+	signals := make([]string, 0, len(detectors))
+	for _, detector := range detectors {
+		signals = append(signals, detector.signal)
+	}
+	return signals
+}
+
+func healthRunClass(verifyMedia, liveOnly bool) string {
+	if verifyMedia {
+		return "media"
+	}
+	if liveOnly {
+		return "live"
+	}
+	return "full"
 }
 
 // deliverRecordingHealthEmail sends one summary email per operator recipient.
@@ -428,6 +485,49 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	return incidents
 }
 
+// detectLiveRecordingHealthIncidents is the cheap, current-window subset used
+// between hourly full sweeps. It never scans completed-window clip timelines,
+// downloads objects, materializes summaries, or runs ledger maintenance.
+func detectLiveRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) []healthIncident {
+	incidents := make([]healthIncident, 0, 8)
+	for _, detector := range liveRecordingHealthDetectors() {
+		incidents = append(incidents, detector.detect(ctx, pool, freshnessMin)...)
+	}
+
+	severityRank := map[string]int{"CRITICAL": 0, "HIGH": 1}
+	sort.SliceStable(incidents, func(i, j int) bool {
+		ri, rj := severityRank[incidents[i].Severity], severityRank[incidents[j].Severity]
+		if ri != rj {
+			return ri < rj
+		}
+		return incidents[i].RecordingID < incidents[j].RecordingID
+	})
+	return incidents
+}
+
+type liveHealthDetector struct {
+	signal string
+	detect func(context.Context, *pgxpool.Pool, int) []healthIncident
+}
+
+// Keep detector execution and cleared-signal resolution derived from one list:
+// omitting a detector while still resolving its signal would falsely close a
+// real incident on every live run.
+func liveRecordingHealthDetectors() []liveHealthDetector {
+	return []liveHealthDetector{
+		{signalContinuousSilentDeath, detectContinuousSilentDeath},
+		{signalContinuousWindowEndedEarly, func(ctx context.Context, pool *pgxpool.Pool, _ int) []healthIncident {
+			return detectContinuousWindowEndedEarly(ctx, pool)
+		}},
+		{signalJobRetriesExhausted, func(ctx context.Context, pool *pgxpool.Pool, _ int) []healthIncident {
+			return detectJobRetriesExhausted(ctx, pool)
+		}},
+		{signalStuckLease, func(ctx context.Context, pool *pgxpool.Pool, _ int) []healthIncident {
+			return detectStuckLease(ctx, pool)
+		}},
+	}
+}
+
 func humanSince(t *time.Time) string {
 	if t == nil {
 		return "never"
@@ -435,14 +535,18 @@ func humanSince(t *time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-func continuousSilenceDetail(winOpen time.Time, latestMediaEnd, latestIngestedAt, lastClipAt *time.Time, mediaLagSec int64, lastErr string) (string, string) {
+func continuousSilenceDetail(observedAt, winOpen time.Time, latestMediaEnd, latestIngestedAt, lastClipAt *time.Time, mediaLagSec int64, freshness time.Duration, lastErr string) (string, string) {
 	mediaLag := ""
 	if latestMediaEnd != nil {
 		mediaLag = (time.Duration(mediaLagSec) * time.Second).Round(time.Second).String()
 	}
+	transport := "no_recent_ingest"
+	if latestIngestedAt != nil && observedAt.Sub(*latestIngestedAt) <= freshness {
+		transport = "fresh_ingest_stale_media"
+	}
 	return fmt.Sprintf("window opened %s, latest media ended %s, latest ingest %s",
 			winOpen.UTC().Format(time.RFC3339), humanSince(latestMediaEnd), humanSince(latestIngestedAt)),
-		diagText("media_behind", mediaLag, "recording_last_clip", humanSince(lastClipAt), "last_error", lastErr)
+		diagText("capture_state", transport, "media_behind", mediaLag, "recording_last_clip", humanSince(lastClipAt), "last_error", lastErr)
 }
 
 type stitchWindow struct {
@@ -1049,7 +1153,7 @@ func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshn
 		    AND now()>=r.start_at AND now()<COALESCE(r.end_at,'infinity'::timestamptz))
 		SELECT c.id,c.stream_id,c.account_id,c.name,c.stream_url,c.win_open,c.win_close,c.last_clip_at,c.last_error_text,
 		       acc.name,acc.email,media.latest_media_end,media.latest_ingested_at,
-		       COALESCE(EXTRACT(EPOCH FROM (now()-media.latest_media_end))::bigint,0)
+		       COALESCE(EXTRACT(EPOCH FROM (now()-media.latest_media_end))::bigint,0),now()
 		FROM cont c JOIN accounts acc ON acc.id=c.account_id
 		LEFT JOIN LATERAL (
 		  SELECT max(cl.clip_end_at) AS latest_media_end,max(cl.created_at) AS latest_ingested_at
@@ -1073,12 +1177,13 @@ func detectContinuousSilentDeath(ctx context.Context, pool *pgxpool.Pool, freshn
 			latestMediaEnd           *time.Time
 			latestIngestedAt         *time.Time
 			mediaLagSec              int64
+			observedAt               time.Time
 		)
 		if err := rows.Scan(&id, &streamID, &accountID, &name, &streamURL, &winOpen, &winClose, &lastClipAt, &lastErr,
-			&orgName, &orgEmail, &latestMediaEnd, &latestIngestedAt, &mediaLagSec); err != nil {
+			&orgName, &orgEmail, &latestMediaEnd, &latestIngestedAt, &mediaLagSec, &observedAt); err != nil {
 			log.Fatalf("scan continuous_silent_death: %v", err)
 		}
-		sinceText, diag := continuousSilenceDetail(winOpen, latestMediaEnd, latestIngestedAt, lastClipAt, mediaLagSec, lastErr)
+		sinceText, diag := continuousSilenceDetail(observedAt, winOpen, latestMediaEnd, latestIngestedAt, lastClipAt, mediaLagSec, time.Duration(freshnessMin)*time.Minute, lastErr)
 		out = append(out, healthIncident{
 			RecordingID: id, StreamID: streamID, AccountID: accountID, OrgName: orgName, OrgEmail: orgEmail,
 			RecName: name, StreamURL: streamURL,

@@ -20,17 +20,20 @@ func TestShouldNotifyHealthIncident(t *testing.T) {
 		name          string
 		newlyInserted bool
 		lastAlertedAt time.Time
+		lastAttemptAt *time.Time
 		want          bool
 	}{
-		{"newly inserted always notifies", true, now, true},
-		{"never delivered retries", false, time.Time{}, true},
-		{"older than 24h renotifies", false, now.Add(-24*time.Hour - time.Second), true},
-		{"exactly 24h stays quiet", false, now.Add(-24 * time.Hour), false},
-		{"recent successful delivery stays quiet", false, now.Add(-3 * time.Hour), false},
+		{"newly inserted always notifies", true, now, ptrTime(now), true},
+		{"never attempted retries", false, time.Time{}, nil, true},
+		{"recent failed attempt backs off", false, time.Time{}, ptrTime(now.Add(-time.Minute)), false},
+		{"failed attempt retries after backoff", false, time.Time{}, ptrTime(now.Add(-healthAlertDeliveryRetryBackoff - time.Second)), true},
+		{"older than 24h renotifies", false, now.Add(-24*time.Hour - time.Second), nil, true},
+		{"exactly 24h stays quiet", false, now.Add(-24 * time.Hour), nil, false},
+		{"recent successful delivery stays quiet", false, now.Add(-3 * time.Hour), nil, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldNotifyHealthIncident(tc.newlyInserted, tc.lastAlertedAt, now); got != tc.want {
+			if got := shouldNotifyHealthIncident(tc.newlyInserted, tc.lastAlertedAt, tc.lastAttemptAt, now); got != tc.want {
 				t.Fatalf("shouldNotifyHealthIncident=%v want %v", got, tc.want)
 			}
 		})
@@ -78,36 +81,47 @@ func TestHealthAlertDeliveryTimestampOnlyAdvancesAfterAcknowledgement(t *testing
 		CREATE TABLE recorder_health_alerts (
 		  recording_id BIGINT NOT NULL REFERENCES recordings(id), signal TEXT NOT NULL,
 		  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		  last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT now(), resolved_at TIMESTAMPTZ,
+		  last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_delivery_attempt_at TIMESTAMPTZ,
+		  resolved_at TIMESTAMPTZ,
 		  PRIMARY KEY(recording_id,signal));
 		INSERT INTO recordings VALUES (1);
 	`); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, err := upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || !inserted || !shouldNotifyHealthIncident(inserted, last, time.Now()) {
+	inserted, last, attempted, err := upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || !inserted || !shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
 		t.Fatalf("first detection inserted=%v last=%v err=%v", inserted, last, err)
 	}
-	inserted, last, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || inserted || !shouldNotifyHealthIncident(inserted, last, time.Now()) {
-		t.Fatalf("unacknowledged detection must retry inserted=%v last=%v err=%v", inserted, last, err)
-	}
 	incidents := []healthIncident{{RecordingID: 1, Signal: signalStoredClipInvalid}}
+	if err := markHealthAlertsDeliveryAttempted(ctx, pool, incidents); err != nil {
+		t.Fatal(err)
+	}
+	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || inserted || shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
+		t.Fatalf("recent failed attempt must back off inserted=%v last=%v attempted=%v err=%v", inserted, last, attempted, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recorder_health_alerts SET last_delivery_attempt_at=now()-interval '16 minutes'`); err != nil {
+		t.Fatal(err)
+	}
+	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || inserted || !shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
+		t.Fatalf("unacknowledged detection must retry after backoff inserted=%v last=%v attempted=%v err=%v", inserted, last, attempted, err)
+	}
 	if err := markHealthAlertsDelivered(ctx, pool, incidents); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || shouldNotifyHealthIncident(inserted, last, time.Now()) {
+	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
 		t.Fatalf("acknowledged detection must dedup inserted=%v last=%v err=%v", inserted, last, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recorder_health_alerts SET resolved_at=now()`); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || !shouldNotifyHealthIncident(inserted, last, time.Now()) {
+	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || !shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
 		t.Fatalf("reopened detection must notify inserted=%v last=%v err=%v", inserted, last, err)
 	}
-	if err := resolveClearedHealthAlerts(ctx, pool, nil, evaluatedHealthSignals(false)); err != nil {
+	if err := resolveClearedHealthAlerts(ctx, pool, nil, evaluatedHealthSignals(false, false)); err != nil {
 		t.Fatal(err)
 	}
 	var resolved *time.Time
@@ -117,7 +131,7 @@ func TestHealthAlertDeliveryTimestampOnlyAdvancesAfterAcknowledgement(t *testing
 	if resolved != nil {
 		t.Fatal("hourly-only sweep falsely resolved daily media incident")
 	}
-	if err := resolveClearedHealthAlerts(ctx, pool, nil, evaluatedHealthSignals(true)); err != nil {
+	if err := resolveClearedHealthAlerts(ctx, pool, nil, evaluatedHealthSignals(true, false)); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=1 AND signal=$1`, signalStoredClipInvalid).Scan(&resolved); err != nil || resolved == nil {
@@ -181,16 +195,31 @@ func TestRecordingHealthRunLockAllowsMediaAndTimelineConcurrently(t *testing.T) 
 }
 
 func TestEvaluatedHealthSignalsAreDisjointByRunClass(t *testing.T) {
-	media := evaluatedHealthSignals(true)
+	media := evaluatedHealthSignals(true, false)
 	if len(media) != 1 || media[0] != signalStoredClipInvalid {
 		t.Fatalf("media signals=%v", media)
 	}
-	for _, signal := range evaluatedHealthSignals(false) {
+	for _, signal := range evaluatedHealthSignals(false, false) {
 		if signal == signalStoredClipInvalid {
 			t.Fatal("timeline sweep evaluates media signal")
 		}
 	}
+	live := evaluatedHealthSignals(false, true)
+	wantLive := liveRecordingHealthSignals()
+	if fmt.Sprint(live) != fmt.Sprint(wantLive) || len(live) != 4 {
+		t.Fatalf("live signals=%v want=%v", live, wantLive)
+	}
+	for _, signal := range live {
+		if signal == signalContinuousCoverageLow || signal == signalStoredClipInvalid || signal == signalClipTimestampDrift {
+			t.Fatalf("live sweep evaluates non-live signal %q", signal)
+		}
+	}
+	if got := healthRunClass(false, true); got != "live" {
+		t.Fatalf("healthRunClass live=%q", got)
+	}
 }
+
+func ptrTime(v time.Time) *time.Time { return &v }
 
 func sampleIncidents() []healthIncident {
 	return []healthIncident{
@@ -252,26 +281,44 @@ func TestContinuousSilenceDetailShowsMediaLagNotJustIngestActivity(t *testing.T)
 	winOpen := time.Date(2026, 8, 9, 4, 39, 0, 0, time.UTC)
 	mediaEnd := time.Date(2026, 8, 9, 6, 48, 0, 0, time.UTC)
 	ingestedAt := time.Date(2026, 8, 9, 7, 44, 30, 0, time.UTC)
+	observedAt := ingestedAt.Add(30 * time.Second)
 	lastClipAt := ingestedAt
-	since, diag := continuousSilenceDetail(winOpen, &mediaEnd, &ingestedAt, &lastClipAt, 56*60+30, "")
+	since, diag := continuousSilenceDetail(observedAt, winOpen, &mediaEnd, &ingestedAt, &lastClipAt, 56*60+30, 5*time.Minute, "")
 	for _, want := range []string{"window opened 2026-08-09T04:39:00Z", "latest media ended 2026-08-09T06:48:00Z", "latest ingest 2026-08-09T07:44:30Z"} {
 		if !strings.Contains(since, want) {
 			t.Fatalf("since=%q missing %q", since, want)
 		}
 	}
-	if diag != "media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
+	if diag != "capture_state=fresh_ingest_stale_media media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
 		t.Fatalf("diag=%q", diag)
 	}
 }
 
 func TestContinuousSilenceDetailHandlesNoMedia(t *testing.T) {
 	winOpen := time.Date(2026, 8, 9, 6, 0, 0, 0, time.UTC)
-	since, diag := continuousSilenceDetail(winOpen, nil, nil, nil, 0, "source returned 404")
+	since, diag := continuousSilenceDetail(winOpen.Add(time.Hour), winOpen, nil, nil, nil, 0, 5*time.Minute, "source returned 404")
 	if !strings.Contains(since, "latest media ended never, latest ingest never") {
 		t.Fatalf("since=%q", since)
 	}
-	if strings.Contains(diag, "media_behind") || diag != "recording_last_clip=never last_error=source returned 404" {
+	if strings.Contains(diag, "media_behind") || diag != "capture_state=no_recent_ingest recording_last_clip=never last_error=source returned 404" {
 		t.Fatalf("diag=%q", diag)
+	}
+}
+
+func TestContinuousSilenceDetailFreshIngestBoundary(t *testing.T) {
+	observedAt := time.Date(2026, 8, 9, 8, 0, 0, 0, time.UTC)
+	winOpen := observedAt.Add(-time.Hour)
+	mediaEnd := observedAt.Add(-20 * time.Minute)
+	freshness := 5 * time.Minute
+	exact := observedAt.Add(-freshness)
+	_, exactDiag := continuousSilenceDetail(observedAt, winOpen, &mediaEnd, &exact, &exact, 20*60, freshness, "")
+	if !strings.Contains(exactDiag, "capture_state=fresh_ingest_stale_media") {
+		t.Fatalf("exact boundary diag=%q", exactDiag)
+	}
+	after := exact.Add(-time.Nanosecond)
+	_, afterDiag := continuousSilenceDetail(observedAt, winOpen, &mediaEnd, &after, &after, 20*60, freshness, "")
+	if !strings.Contains(afterDiag, "capture_state=no_recent_ingest") {
+		t.Fatalf("after boundary diag=%q", afterDiag)
 	}
 }
 
@@ -340,12 +387,12 @@ func TestDetectContinuousSilentDeathReportsMediaAgeAndNoMedia(t *testing.T) {
 	lagging := byID[1]
 	if !strings.Contains(lagging.SinceText, "latest media ended 2026-08-09T07:03:30Z") ||
 		!strings.Contains(lagging.SinceText, "latest ingest 2026-08-09T07:44:30Z") ||
-		lagging.Diag != "media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
+		lagging.Diag != "capture_state=no_recent_ingest media_behind=56m30s recording_last_clip=2026-08-09T07:44:30Z" {
 		t.Fatalf("lagging=%+v", lagging)
 	}
 	dead := byID[2]
 	if !strings.Contains(dead.SinceText, "latest media ended never, latest ingest never") ||
-		dead.Diag != "recording_last_clip=never last_error=source returned 404" {
+		dead.Diag != "capture_state=no_recent_ingest recording_last_clip=never last_error=source returned 404" {
 		t.Fatalf("dead=%+v", dead)
 	}
 }
