@@ -22,12 +22,18 @@ func TestRecordingCanaryIsReservedNativeLocalAndCleaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	argsLog := filepath.Join(home, "ffmpeg-args.log")
+	watcherStarted := filepath.Join(home, "watcher-started")
 	ffmpeg := `#!/bin/sh
 printf '%s\n' "$*" >> '` + argsLog + `'
 case " $* " in
   *" -f null "*) exit 0 ;;
 esac
-sleep 2
+tries=0
+while [ ! -f '` + watcherStarted + `' ]; do
+  tries=$((tries + 1))
+  [ "$tries" -ge 100 ] && exit 1
+  sleep 0.05
+done
 eval "out=\${$#}"
 printf 'native-media' > "$out"
 `
@@ -41,6 +47,7 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 	}
 
 	var starts, checks, finishes atomic.Int64
+	watcherRelease := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -48,7 +55,13 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 			starts.Add(1)
 			writeCanaryTestSpec(w)
 		case strings.HasSuffix(r.URL.Path, "/check"):
-			checks.Add(1)
+			if checks.Add(1) > 1 {
+				// Keep a watcher request in flight until normal media validation
+				// cancels it. Self-cancellation must not become a false safety error.
+				_ = os.WriteFile(watcherStarted, []byte("started"), 0o600)
+				<-watcherRelease
+				return
+			}
 			writeCanaryTestSpec(w)
 		case strings.HasSuffix(r.URL.Path, "/finish"):
 			finishes.Add(1)
@@ -64,10 +77,12 @@ printf '%s\n' '{"format":{"duration":"15.0"},"streams":[{"codec_type":"video","c
 		t.Fatal(err)
 	}
 
-	if err := runRecordingCanary(context.Background(), []string{"--recording-id", "445"}); err != nil {
+	err := runRecordingCanary(context.Background(), []string{"--recording-id", "445"})
+	close(watcherRelease)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if starts.Load() != 1 || checks.Load() < 1 || finishes.Load() != 1 {
+	if starts.Load() != 1 || checks.Load() < 2 || finishes.Load() != 1 {
 		t.Fatalf("reservation calls start=%d check=%d finish=%d", starts.Load(), checks.Load(), finishes.Load())
 	}
 	logged, err := os.ReadFile(argsLog)

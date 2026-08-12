@@ -116,15 +116,16 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		  WHERE active_node.account_id=$1
 		    AND active_node.node_type='relay'
 		    AND active_node.status='active'
-		    AND active_node.last_heartbeat_at>now()-interval '120 seconds'
 		    AND (($2::bigint IS NULL AND active_node.id=$3)
 		         OR ($2::bigint IS NOT NULL AND active_node.relay_group_id=$2))
-		    AND CASE
-		          WHEN NOT (active_node.capabilities_jsonb ? 'active_jobs') THEN 0
-		          WHEN COALESCE(active_node.capabilities_jsonb->>'active_jobs', '') ~ '^[0-9]+$'
-		          THEN (active_node.capabilities_jsonb->>'active_jobs')::bigint
-		          ELSE 1
-		        END>0
+		    AND (active_node.last_heartbeat_at IS NULL
+		         OR active_node.last_heartbeat_at<=now()-interval '120 seconds'
+		         OR CASE
+		              WHEN NOT (active_node.capabilities_jsonb ? 'active_jobs') THEN 0
+		              WHEN COALESCE(active_node.capabilities_jsonb->>'active_jobs', '') ~ '^[0-9]+$'
+		              THEN (active_node.capabilities_jsonb->>'active_jobs')::bigint
+		              ELSE 1
+		            END>0)
 		)
 	`, principal.AccountID, nodeGroupID, principal.NodeID, int(recordingCanaryJobGuard/time.Second)).Scan(&groupBusy); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "check relay canary capacity")

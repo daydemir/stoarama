@@ -167,7 +167,19 @@ func TestRecordingCanaryRefusesBusyHeartbeatAndSecondGroupReservation(t *testing
 	if rec := start(8, 11); rec.Code != http.StatusConflict {
 		t.Fatalf("malformed active_jobs must fail closed: status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{}'::jsonb WHERE id=7`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{}'::jsonb, last_heartbeat_at=now()-interval '3 minutes' WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	if rec := start(8, 11); rec.Code != http.StatusConflict {
+		t.Fatalf("stale peer heartbeat must fail closed: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=NULL WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	if rec := start(8, 11); rec.Code != http.StatusConflict {
+		t.Fatalf("missing peer heartbeat must fail closed: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=now() WHERE id=7`); err != nil {
 		t.Fatal(err)
 	}
 	if rec := start(8, 11); rec.Code != http.StatusOK {

@@ -101,6 +101,12 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 				checkCtx, cancel := context.WithTimeout(canaryCtx, time.Second)
 				checkedSpec, checkErr := client.CheckRecordingCanary(checkCtx, *recordingID, spec.ReservationID)
 				cancel()
+				// Normal completion cancels canaryCtx to stop this watcher. An
+				// in-flight HTTP check then returns context.Canceled; that is not a
+				// production-safety failure.
+				if canaryCtx.Err() != nil {
+					return
+				}
 				if checkErr != nil || !sameCanarySource(spec, checkedSpec) {
 					if checkErr == nil {
 						checkErr = fmt.Errorf("canary source changed")
