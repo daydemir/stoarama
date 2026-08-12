@@ -46,7 +46,10 @@ func TestNASCleanupCandidateMigrationFreezesQualificationEvidence(t *testing.T) 
 		t.Fatalf("apply migration: %v", err)
 	}
 	const runID = "11111111-1111-1111-1111-111111111111"
-	if _, err = conn.Exec(ctx, `INSERT INTO nas_cleanup_candidate_runs(id,account_id,connection_id,recording_ids,inventory_generation,inventory_digest,inventory_started_at,inventory_completed_at,item_count,total_bytes,unknown_count,request_digest,created_by_user_id) VALUES($1,1,2,ARRAY[5],'g',repeat('a',64),now()-interval '2 minutes',now()-interval '1 minute',1,7,1,repeat('b',64),3); INSERT INTO r2_content_verifications(storage_destination_id,endpoint_snapshot,bucket,object_key,expected_size_bytes,expected_sha256) VALUES(4,'https://example.invalid','bucket','key',7,repeat('c',64));`, runID); err != nil {
+	if _, err = conn.Exec(ctx, `INSERT INTO nas_cleanup_candidate_runs(id,account_id,connection_id,recording_ids,inventory_generation,inventory_digest,inventory_started_at,inventory_completed_at,item_count,total_bytes,unknown_count,request_digest,created_by_user_id) VALUES($1,1,2,ARRAY[5],'g',repeat('a',64),now()-interval '2 minutes',now()-interval '1 minute',1,7,1,repeat('b',64),3)`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `INSERT INTO r2_content_verifications(storage_destination_id,endpoint_snapshot,bucket,object_key,expected_size_bytes,expected_sha256) VALUES(4,'https://example.invalid','bucket','key',7,repeat('c',64))`); err != nil {
 		t.Fatal(err)
 	}
 	var verificationID int64
