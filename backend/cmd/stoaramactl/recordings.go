@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,7 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE | campaign-postflight | capture-health --id ID | repair-source --id ID --account-id ID --stream-id ID --job-id ID --expected-source-sha256 HASH --replacement-source-url URL --reason TEXT --apply"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | scene-attest | qualification build|freeze|report"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -38,6 +40,14 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 		runRecordingSourceRepair(ctx, cfg, args[1:])
 		return
 	}
+	if args[0] == "scene-attest" {
+		runRecordingSceneAttest(ctx, args[1:])
+		return
+	}
+	if args[0] == "qualification" {
+		runRecordingQualification(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) < 2 || args[0] != "naming" {
 		log.Fatal(recordingsUsage)
 	}
@@ -53,6 +63,111 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func postRecordingSessionJSON(ctx context.Context, baseURL, cookie, path string, payload any) map[string]any {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Fatalf("encode request: %v", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+path, strings.NewReader(string(body)))
+	if err != nil {
+		log.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", cookie)
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		log.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		log.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Fatalf("request failed status=%d body=%q", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		log.Fatalf("decode response status=%d: %v", resp.StatusCode, err)
+	}
+	return out
+}
+
+func runRecordingSceneAttest(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("recordings scene-attest", flag.ExitOnError)
+	recordingID := fs.Int64("recording-id", 0, "recording id")
+	frameID := fs.Int64("frame-id", 0, "authoritative successful frame id")
+	identity := fs.String("scene-identity", "", "operator-confirmed canonical scene identity")
+	cookieFile := fs.String("session-cookie-file", "", "file containing member session cookie")
+	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	_ = fs.Parse(args)
+	cookie, err := readCampaignSessionCookie(*cookieFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *recordingID <= 0 || *frameID <= 0 || strings.TrimSpace(*identity) == "" {
+		log.Fatal("--recording-id, --frame-id, and --scene-identity are required")
+	}
+	printJSON(postRecordingSessionJSON(ctx, *base, cookie, "/api/v1/account/recordings/qualification/scene-attest", map[string]any{"recording_id": *recordingID, "frame_id": *frameID, "scene_identity": strings.TrimSpace(*identity)}))
+}
+
+func parseQualificationIDs(raw string) []int64 {
+	var ids []int64
+	for _, part := range strings.Split(raw, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || id <= 0 {
+			log.Fatalf("invalid recording id %q", part)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func runRecordingQualification(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) < 1 {
+		log.Fatal("qualification requires build, freeze, or report")
+	}
+	if args[0] == "report" {
+		runRecordingQualificationReport(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] != "build" && args[0] != "freeze" {
+		log.Fatal("qualification requires build, freeze, or report")
+	}
+	fs := flag.NewFlagSet("recordings qualification "+args[0], flag.ExitOnError)
+	idsRaw := fs.String("recording-ids", "", "comma-separated explicit recording ids")
+	startRaw := fs.String("sequence-start", "", "RFC3339 earliest full-window instant")
+	expected := fs.String("expected-plan-sha256", "", "required exact dry-run hash for freeze")
+	cookieFile := fs.String("session-cookie-file", "", "file containing member session cookie")
+	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	_ = fs.Parse(args[1:])
+	start, err := time.Parse(time.RFC3339, strings.TrimSpace(*startRaw))
+	if err != nil {
+		log.Fatal("--sequence-start must be RFC3339")
+	}
+	cookie, err := readCampaignSessionCookie(*cookieFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	apply := args[0] == "freeze"
+	if apply && len(strings.TrimSpace(*expected)) != 64 {
+		log.Fatal("freeze requires --expected-plan-sha256 from the immediately preceding build")
+	}
+	printJSON(postRecordingSessionJSON(ctx, *base, cookie, "/api/v1/account/recordings/qualification/build", map[string]any{"recording_ids": parseQualificationIDs(*idsRaw), "sequence_start_at": start.UTC(), "apply": apply, "expected_plan_sha256": strings.ToLower(strings.TrimSpace(*expected))}))
+}
+
+func runRecordingQualificationReport(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordings qualification report", flag.ExitOnError)
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
+	_ = fs.Parse(args)
+	payload := mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/account/recordings/qualification")
+	printJSON(payload)
 }
 
 func runRecordingSourceRepair(ctx context.Context, cfg config.Config, args []string) {
