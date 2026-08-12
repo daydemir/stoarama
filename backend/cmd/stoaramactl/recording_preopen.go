@@ -122,7 +122,7 @@ func selectPreopenTargets(ctx context.Context, pool *pgxpool.Pool, now time.Time
 	rows, err := pool.Query(ctx, `
 	WITH candidates AS (
 	 SELECT r.id,COALESCE(r.stream_id,0) stream_id,r.account_id,r.name,a.name org_name,a.email,
-	   COALESCE(s.provider,''),COALESCE(s.source_url,r.stream_url),COALESCE(s.source_page_url,''),r.capture_via,r.next_fire_at,
+	   COALESCE(s.provider,'') provider,COALESCE(s.source_url,r.stream_url) source_url,COALESCE(s.source_page_url,'') source_page_url,r.capture_via,r.next_fire_at,
 	   CASE WHEN r.next_fire_at>$1::timestamptz+interval '30 minutes' THEN 'early' ELSE 'confirm' END stage
 	 FROM recordings r JOIN accounts a ON a.id=r.account_id LEFT JOIN streams s ON s.id=r.stream_id
 	 WHERE r.status='active' AND r.mode='continuous' AND r.next_fire_at>$1::timestamptz AND r.next_fire_at<=$1::timestamptz+interval '2 hours'
