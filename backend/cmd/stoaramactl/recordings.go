@@ -74,7 +74,7 @@ func runRecordingSourceRepair(ctx context.Context, cfg config.Config, args []str
 	if !*apply {
 		log.Fatal("repair-source is mutation-only; pass --apply after verifying every fence")
 	}
-	payload := mustAPIRequest(ctx, "POST", strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/admin/recordings/%d/repair-source", *id), map[string]any{
+	payload := mustAPIRequest(ctx, "POST", strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/recordings/%d/repair-source", *id), map[string]any{
 		"account_id": *accountID, "stream_id": *streamID, "job_id": *jobID,
 		"expected_current_source_sha256": strings.ToLower(strings.TrimSpace(*expectedHash)),
 		"replacement_source_url":         strings.TrimSpace(*replacement), "reason": strings.TrimSpace(*reason),
