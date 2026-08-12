@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -27,6 +28,7 @@ import (
 
 const (
 	clipFrameMaxClipBytes = int64(128 << 20)
+	clipFrameDownloadTTL  = 30 * time.Second
 	clipFrameTimeout      = 20 * time.Second
 )
 
@@ -107,9 +109,11 @@ func (s *Server) createRecordingClipAuthoritativeFrame(ctx context.Context, acco
 	if s.secrets == nil || s.r2 == nil {
 		return 0, "", &clipFrameHTTPError{http.StatusServiceUnavailable, "managed storage is unavailable"}
 	}
-	if err := validateStorageEndpointHTTPS(src.dest.endpoint); err != nil {
+	canonicalEndpoint, err := canonicalClipStorageEndpoint(src.dest.endpoint)
+	if err != nil {
 		return 0, "", &clipFrameHTTPError{http.StatusConflict, "managed clip destination is invalid"}
 	}
+	src.dest.endpoint = canonicalEndpoint
 	// Managed rows are a snapshot of the operator destination. Refuse a drifted
 	// row instead of decrypting or forwarding credentials to another endpoint.
 	if strings.TrimSpace(src.dest.endpoint) != strings.TrimSpace(s.cfg.R2Endpoint) || strings.TrimSpace(src.dest.bucket) != strings.TrimSpace(s.cfg.R2Bucket) {
@@ -126,6 +130,21 @@ func (s *Server) createRecordingClipAuthoritativeFrame(ctx context.Context, acco
 	return s.persistClipBackedAuthoritativeFrame(ctx, src, versionID, frame, s.r2.Bucket(), s.r2.PutBytes)
 }
 
+func canonicalClipStorageEndpoint(raw string) (string, error) {
+	if err := validateStorageEndpointHTTPS(raw); err != nil {
+		return "", err
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", err
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.Path = strings.TrimRight(u.EscapedPath(), "/")
+	u.RawPath, u.RawQuery, u.Fragment = "", "", ""
+	return u.String(), nil
+}
+
 func (s *Server) loadRecordingClipFrameSource(ctx context.Context, accountID, recordingID, clipID int64) (recordingClipFrameSource, error) {
 	var src recordingClipFrameSource
 	var purgedAt *time.Time
@@ -133,7 +152,7 @@ func (s *Server) loadRecordingClipFrameSource(ctx context.Context, accountID, re
 	err := s.pool.QueryRow(ctx, `
 		SELECT r.account_id,r.id,r.stream_id,c.id,c.clip_start_at,c.clip_end_at,
 		       lower(c.sha256),btrim(c.etag),c.object_key,c.size_bytes,
-		       c.purged_at,sd.managed,sd.region,sd.bucket,sd.endpoint,sd.access_key_id,sd.secret_access_key_enc
+		       c.purged_at,sd.managed,sd.id,sd.region,sd.bucket,sd.endpoint,sd.access_key_id,sd.secret_access_key_enc
 		FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
 		JOIN storage_destinations sd ON sd.id=c.storage_destination_id
 		WHERE r.account_id=$1 AND r.id=$2 AND r.status='active' AND c.id=$3
@@ -142,7 +161,7 @@ func (s *Server) loadRecordingClipFrameSource(ctx context.Context, accountID, re
 	`, accountID, recordingID, clipID).Scan(
 		&src.accountID, &src.recordingID, &src.streamID, &src.clipID, &src.clipStartAt, &src.clipEndAt,
 		&src.clipSHA, &src.clipETag, &src.dest.objectKey, &src.dest.sizeBytes,
-		&purgedAt, &managed, &src.dest.region, &src.dest.bucket, &src.dest.endpoint, &src.dest.accessKeyID, &src.dest.secretEnc,
+		&purgedAt, &managed, &src.dest.id, &src.dest.region, &src.dest.bucket, &src.dest.endpoint, &src.dest.accessKeyID, &src.dest.secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return src, &clipFrameHTTPError{http.StatusNotFound, "active recording clip not found"}
@@ -166,14 +185,16 @@ func (s *Server) loadRecordingClipFrameSource(ctx context.Context, accountID, re
 }
 
 func verifiedFrameFromClip(ctx context.Context, obj clipFrameObject, src recordingClipFrameSource, decode func(context.Context, io.Reader) (capture.Frame, error)) (capture.Frame, string, error) {
-	head, err := obj.Head(ctx, src.dest.objectKey)
+	downloadCtx, cancel := context.WithTimeout(ctx, clipFrameDownloadTTL)
+	defer cancel()
+	head, err := obj.Head(downloadCtx, src.dest.objectKey)
 	if err != nil {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object is unavailable"}
 	}
 	if head.SizeBytes != src.dest.sizeBytes || strings.TrimSpace(head.ETag) != src.clipETag {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object metadata mismatch"}
 	}
-	body, err := obj.OpenExact(ctx, src.dest.objectKey, head.ETag, head.VersionID)
+	body, err := obj.OpenExact(downloadCtx, src.dest.objectKey, head.ETag, head.VersionID)
 	if err != nil {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object generation changed"}
 	}
@@ -194,7 +215,7 @@ func verifiedFrameFromClip(ctx context.Context, obj clipFrameObject, src recordi
 	if got := hex.EncodeToString(hash.Sum(nil)); got != src.clipSHA {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object SHA-256 mismatch"}
 	}
-	headAfter, err := obj.Head(ctx, src.dest.objectKey)
+	headAfter, err := obj.Head(downloadCtx, src.dest.objectKey)
 	if err != nil || headAfter.SizeBytes != head.SizeBytes || headAfter.ETag != head.ETag || headAfter.VersionID != head.VersionID {
 		return capture.Frame{}, "", &clipFrameHTTPError{http.StatusConflict, "managed clip object changed during verification"}
 	}
@@ -275,21 +296,24 @@ func (s *Server) persistClipBackedAuthoritativeFrame(ctx context.Context, src re
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, identity); err != nil {
 		return 0, "", fmt.Errorf("lock clip frame identity: %w", err)
 	}
-	var currentSHA, currentETag string
-	if err = tx.QueryRow(ctx, `SELECT lower(c.sha256),btrim(c.etag) FROM recordings r JOIN recording_clips c ON c.recording_id=r.id JOIN storage_destinations sd ON sd.id=c.storage_destination_id WHERE r.account_id=$1 AND r.id=$2 AND r.stream_id=$3 AND r.status='active' AND c.id=$4 AND c.purged_at IS NULL AND c.clip_end_at>=now()-interval '24 hours' AND sd.account_id=r.account_id AND sd.status='verified' AND sd.managed FOR SHARE OF r,c,sd`, src.accountID, src.recordingID, src.streamID, src.clipID).Scan(&currentSHA, &currentETag); err != nil {
+	var currentSHA, currentETag, currentEndpoint, currentBucket, currentObjectKey string
+	var currentDestinationID, currentSize int64
+	if err = tx.QueryRow(ctx, `SELECT lower(c.sha256),btrim(c.etag),sd.id,sd.endpoint,sd.bucket,c.object_key,c.size_bytes FROM recordings r JOIN recording_clips c ON c.recording_id=r.id JOIN storage_destinations sd ON sd.id=c.storage_destination_id WHERE r.account_id=$1 AND r.id=$2 AND r.stream_id=$3 AND r.status='active' AND c.id=$4 AND c.purged_at IS NULL AND c.clip_end_at>=now()-interval '24 hours' AND sd.account_id=r.account_id AND sd.status='verified' AND sd.managed FOR SHARE OF r,c,sd`, src.accountID, src.recordingID, src.streamID, src.clipID).Scan(&currentSHA, &currentETag, &currentDestinationID, &currentEndpoint, &currentBucket, &currentObjectKey, &currentSize); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip is no longer eligible for an authoritative frame"}
 		}
 		return 0, "", fmt.Errorf("recheck clip identity: %w", err)
 	}
-	if currentSHA != src.clipSHA || currentETag != src.clipETag {
+	currentEndpoint, endpointErr := canonicalClipStorageEndpoint(currentEndpoint)
+	if endpointErr != nil || currentSHA != src.clipSHA || currentETag != src.clipETag || currentDestinationID != src.dest.id || currentEndpoint != src.dest.endpoint || currentBucket != src.dest.bucket || currentObjectKey != src.dest.objectKey || currentSize != src.dest.sizeBytes {
 		return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip identity changed before persistence"}
 	}
 	var frameID int64
-	var existingFrameSHA, existingClipSHA, existingETag, existingVersion string
-	err = tx.QueryRow(ctx, `SELECT f.id,lower(m.sha256),f.source_recording_clip_sha256,f.source_recording_clip_etag,COALESCE(f.source_recording_clip_version_id,'') FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.source_recording_clip_id=$1`, src.clipID).Scan(&frameID, &existingFrameSHA, &existingClipSHA, &existingETag, &existingVersion)
+	var existingFrameSHA, existingClipSHA, existingETag, existingVersion, existingEndpoint, existingBucket, existingObjectKey string
+	var existingDestinationID, existingSize int64
+	err = tx.QueryRow(ctx, `SELECT f.id,lower(m.sha256),f.source_recording_clip_sha256,f.source_recording_clip_etag,COALESCE(f.source_recording_clip_version_id,''),f.source_recording_destination_id,f.source_recording_endpoint,f.source_recording_bucket,f.source_recording_object_key,f.source_recording_size_bytes FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.source_recording_clip_id=$1`, src.clipID).Scan(&frameID, &existingFrameSHA, &existingClipSHA, &existingETag, &existingVersion, &existingDestinationID, &existingEndpoint, &existingBucket, &existingObjectKey, &existingSize)
 	if err == nil {
-		if existingFrameSHA != frame.SHA256 || existingClipSHA != src.clipSHA || existingETag != src.clipETag || existingVersion != versionID {
+		if existingFrameSHA != frame.SHA256 || existingClipSHA != src.clipSHA || existingETag != src.clipETag || existingVersion != versionID || existingDestinationID != src.dest.id || existingEndpoint != src.dest.endpoint || existingBucket != src.dest.bucket || existingObjectKey != src.dest.objectKey || existingSize != src.dest.sizeBytes {
 			return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip frame provenance conflict"}
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -308,7 +332,7 @@ func (s *Server) persistClipBackedAuthoritativeFrame(ctx context.Context, src re
 	if err != nil {
 		return 0, "", fmt.Errorf("upsert clip frame media: %w", err)
 	}
-	if err = tx.QueryRow(ctx, `INSERT INTO frames(stream_id,capture_job_id,captured_at,raw_media_object_id,capture_status,capture_error,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag,source_recording_clip_version_id) VALUES($1,NULL,$2,$3,'success',NULL,'authoritative_frame_refresh',$4,$5,$6,NULLIF($7,'')) RETURNING id`, src.streamID, capturedAt, mediaID, src.clipID, src.clipSHA, src.clipETag, versionID).Scan(&frameID); err != nil {
+	if err = tx.QueryRow(ctx, `INSERT INTO frames(stream_id,capture_job_id,captured_at,raw_media_object_id,capture_status,capture_error,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag,source_recording_clip_version_id,source_recording_destination_id,source_recording_endpoint,source_recording_bucket,source_recording_object_key,source_recording_size_bytes) VALUES($1,NULL,$2,$3,'success',NULL,'authoritative_frame_refresh',$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12) RETURNING id`, src.streamID, capturedAt, mediaID, src.clipID, src.clipSHA, src.clipETag, versionID, src.dest.id, src.dest.endpoint, src.dest.bucket, src.dest.objectKey, src.dest.sizeBytes).Scan(&frameID); err != nil {
 		return 0, "", fmt.Errorf("insert clip frame: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {

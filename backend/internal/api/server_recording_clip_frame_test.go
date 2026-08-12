@@ -113,6 +113,18 @@ func TestBoundedWriterFailsClosed(t *testing.T) {
 	}
 }
 
+func TestCanonicalClipStorageEndpoint(t *testing.T) {
+	got, err := canonicalClipStorageEndpoint("HTTPS://STORAGE.EXAMPLE.TEST:443/prefix/")
+	if err != nil || got != "https://storage.example.test:443/prefix" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	for _, raw := range []string{"http://storage.example.test", "https://user:pass@storage.example.test", "https://"} {
+		if _, err := canonicalClipStorageEndpoint(raw); err == nil {
+			t.Fatalf("accepted endpoint %q", raw)
+		}
+	}
+}
+
 func TestRecordingClipAuthoritativeFrameRequiresServiceAuth(t *testing.T) {
 	s := &Server{cfg: config.Config{ServiceToken: "service-secret"}}
 	request := func(token string) *httptest.ResponseRecorder {
@@ -166,7 +178,7 @@ func TestPersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime(
 		`CREATE TABLE storage_destinations(id bigint primary key,account_id bigint not null,status text not null,managed boolean not null,region text,bucket text,endpoint text,access_key_id text,secret_access_key_enc bytea)`,
 		`CREATE TABLE recording_clips(id bigint primary key,recording_id bigint not null,storage_destination_id bigint not null,sha256 text not null,etag text not null,purged_at timestamptz,released_at timestamptz,clip_start_at timestamptz,clip_end_at timestamptz,object_key text,size_bytes bigint)`,
 		`CREATE TABLE media_objects(id bigserial primary key,storage_provider text not null,bucket text not null,object_key text not null,mime_type text not null,size_bytes bigint not null,etag text not null default '',sha256 text,width integer,height integer,created_at timestamptz not null default now(),unique(bucket,object_key))`,
-		`CREATE TABLE frames(id bigserial primary key,stream_id bigint not null,capture_job_id bigint,captured_at timestamptz not null,raw_media_object_id bigint,capture_status text not null,capture_error text,source_kind text not null,source_recording_clip_id bigint unique,source_recording_clip_sha256 text,source_recording_clip_etag text,source_recording_clip_version_id text)`,
+		`CREATE TABLE frames(id bigserial primary key,stream_id bigint not null,capture_job_id bigint,captured_at timestamptz not null,raw_media_object_id bigint,capture_status text not null,capture_error text,source_kind text not null,source_recording_clip_id bigint unique,source_recording_clip_sha256 text,source_recording_clip_etag text,source_recording_clip_version_id text,source_recording_destination_id bigint,source_recording_endpoint text,source_recording_bucket text,source_recording_object_key text,source_recording_size_bytes bigint)`,
 		`CREATE TABLE stream_capture_runtime(stream_id bigint primary key,execution_class text,resolved_url text,status text,last_frame_at timestamptz)`,
 		`INSERT INTO recordings VALUES(10,47,99,'active','https://unchanged.example/live')`,
 		`INSERT INTO storage_destinations VALUES(20,47,'verified',true,'auto','bucket','https://storage.example.test','key','secret')`,
@@ -194,7 +206,7 @@ func TestPersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime(
 	}
 	frame := capture.Frame{Bytes: []byte("jpeg"), MIMEType: "image/jpeg", SHA256: strings.Repeat("b", 64), SizeBytes: 4, Width: 1, Height: 1}
 	end := time.Now().UTC()
-	src := recordingClipFrameSource{accountID: 47, recordingID: 10, streamID: 99, clipID: 30, clipStartAt: end.Add(-time.Minute), clipEndAt: &end, clipSHA: strings.Repeat("a", 64), clipETag: "clip-etag"}
+	src := recordingClipFrameSource{accountID: 47, recordingID: 10, streamID: 99, clipID: 30, clipStartAt: end.Add(-time.Minute), clipEndAt: &end, clipSHA: strings.Repeat("a", 64), clipETag: "clip-etag", dest: clipDestination{id: 20, endpoint: "https://storage.example.test", bucket: "bucket", objectKey: "clip.mp4", sizeBytes: 4}}
 	s := &Server{pool: pool}
 	var puts atomic.Int32
 	store := func() (int64, string, error) {
@@ -262,7 +274,7 @@ func TestClipFramePersistenceConflictsAreTyped(t *testing.T) {
 		`CREATE TABLE storage_destinations(id bigint primary key,account_id bigint,status text,managed boolean)`,
 		`CREATE TABLE recording_clips(id bigint primary key,recording_id bigint,storage_destination_id bigint,sha256 text,etag text,purged_at timestamptz,clip_end_at timestamptz)`,
 		`CREATE TABLE media_objects(id bigserial primary key,storage_provider text,bucket text,object_key text,mime_type text,size_bytes bigint,etag text,sha256 text,width integer,height integer,created_at timestamptz default now(),unique(bucket,object_key))`,
-		`CREATE TABLE frames(id bigserial primary key,stream_id bigint,captured_at timestamptz,raw_media_object_id bigint,capture_status text,capture_error text,source_kind text,capture_job_id bigint,source_recording_clip_id bigint unique,source_recording_clip_sha256 text,source_recording_clip_etag text,source_recording_clip_version_id text)`,
+		`CREATE TABLE frames(id bigserial primary key,stream_id bigint,captured_at timestamptz,raw_media_object_id bigint,capture_status text,capture_error text,source_kind text,capture_job_id bigint,source_recording_clip_id bigint unique,source_recording_clip_sha256 text,source_recording_clip_etag text,source_recording_clip_version_id text,source_recording_destination_id bigint,source_recording_endpoint text,source_recording_bucket text,source_recording_object_key text,source_recording_size_bytes bigint)`,
 		`INSERT INTO recordings VALUES(10,47,99,'paused')`,
 		`INSERT INTO storage_destinations VALUES(20,47,'verified',true)`,
 		`INSERT INTO recording_clips VALUES(30,10,20,'` + strings.Repeat("a", 64) + `','etag',NULL,now())`,
