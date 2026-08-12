@@ -65,6 +65,61 @@ func TestSegmentDeliveryPoolKeepsSeveralUploadsInFlight(t *testing.T) {
 	}
 }
 
+func TestSegmentDeliveryPoolQueueObserverPreservesMutationOrderWithoutBlockingSubmit(t *testing.T) {
+	observerEntered := make(chan struct{})
+	releaseObserver := make(chan struct{})
+	delivered := make(chan struct{})
+	var mu sync.Mutex
+	var depths []int
+	pool := startSegmentDeliveryPool(1, func() {}, func(capture.Segment) error { <-delivered; return nil }, func(depth int) {
+		mu.Lock()
+		first := len(depths) == 0
+		mu.Unlock()
+		if first {
+			close(observerEntered)
+			<-releaseObserver
+		}
+		mu.Lock()
+		depths = append(depths, depth)
+		mu.Unlock()
+	})
+	if err := pool.Submit(capture.Segment{Path: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	<-observerEntered
+	// A blocked diagnostics consumer must not block capture admission.
+	submitted := make(chan error, 1)
+	go func() { submitted <- pool.Submit(capture.Segment{Path: "two"}) }()
+	select {
+	case err := <-submitted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked observer blocked Submit")
+	}
+	close(releaseObserver)
+	close(delivered)
+	result := pool.close()
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	mu.Lock()
+	got := append([]int(nil), depths...)
+	mu.Unlock()
+	if len(got) < 4 {
+		t.Fatalf("depth events=%v", got)
+	}
+	// Mutations were enqueue one, dequeue one, enqueue two, dequeue two. Even
+	// though the first callback was blocked, later callbacks cannot overtake it.
+	want := []int{1, 0, 1, 0}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("depth events=%v want prefix=%v", got, want)
+		}
+	}
+}
+
 // TestSegmentDeliveryPoolCloseDrainsOutstandingUploads pins the window-close
 // contract: close() joins every accepted segment, so making delivery concurrent
 // does not simply move clip loss to the window boundary.
