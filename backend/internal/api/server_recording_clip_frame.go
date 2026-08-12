@@ -121,7 +121,8 @@ func (s *Server) createRecordingClipAuthoritativeFrame(ctx context.Context, acco
 	src.dest.endpoint = canonicalEndpoint
 	// Managed rows are a snapshot of the operator destination. Refuse a drifted
 	// row instead of decrypting or forwarding credentials to another endpoint.
-	if strings.TrimSpace(src.dest.endpoint) != strings.TrimSpace(s.cfg.R2Endpoint) || strings.TrimSpace(src.dest.bucket) != strings.TrimSpace(s.cfg.R2Bucket) {
+	operatorEndpoint, err := canonicalClipStorageEndpoint(s.cfg.R2Endpoint)
+	if err != nil || src.dest.endpoint != operatorEndpoint || strings.TrimSpace(src.dest.bucket) != strings.TrimSpace(s.cfg.R2Bucket) {
 		return 0, "", &clipFrameHTTPError{http.StatusConflict, "managed clip destination does not match operator storage"}
 	}
 	client, err := s.buildClipClientCtx(ctx, src.dest)
