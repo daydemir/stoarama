@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -139,6 +140,7 @@ type connectionListItem struct {
 	InventoryPassStartedAt *time.Time       `json:"inventory_scan_pass_started_at"`
 	InventoryRowsVisited   int64            `json:"inventory_scan_rows_visited"`
 	InventoryRowsSkipped   int64            `json:"inventory_scan_rows_skipped"`
+	InventorySkipReasons   map[string]int64 `json:"inventory_scan_skip_reasons"`
 	InventoryReportedAt    *time.Time       `json:"inventory_reported_at"`
 	InventoryClips         int64            `json:"inventory_clips"`
 	InventoryBytes         int64            `json:"inventory_bytes"`
@@ -314,7 +316,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		       nas_batch_bytes, nas_batch_duration_ms, nas_download_workers,
 		       nas_batch_retries, nas_batch_failures, inventory_mode,
 		       inventory_generation, inventory_scan_started_at, inventory_scan_completed_at,
-		       inventory_scan_pass_started_at, inventory_scan_rows_visited, inventory_scan_rows_skipped,
+		       inventory_scan_pass_started_at, inventory_scan_rows_visited, inventory_scan_rows_skipped, inventory_scan_skip_reasons,
 		       inventory_reported_at, inventory_clips, inventory_bytes,
 		       inventory_mismatches, inventory_unmatched, inventory_digest,
 		       nas_storage_total_bytes, nas_storage_free_bytes, nas_storage_reported_at, conn.created_at,
@@ -366,6 +368,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			inventoryPass    *time.Time
 			inventoryVisited int64
 			inventorySkipped int64
+			inventoryReasons []byte
 			inventoryReport  *time.Time
 			inventoryClips   int64
 			inventoryBytes   int64
@@ -386,7 +389,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			&outageStartedAt, &outageRecovered, &outageFailures, &batchCompleted,
 			&batchClips, &batchBytes, &batchDurationMS, &downloadWorkers,
 			&batchRetries, &batchFailures, &inventoryMode, &inventoryGen,
-			&inventoryStart, &inventoryDone, &inventoryPass, &inventoryVisited, &inventorySkipped, &inventoryReport, &inventoryClips,
+			&inventoryStart, &inventoryDone, &inventoryPass, &inventoryVisited, &inventorySkipped, &inventoryReasons, &inventoryReport, &inventoryClips,
 			&inventoryBytes, &inventoryBad, &inventoryOther, &inventoryDigest,
 			&nasStorageTotal, &nasStorageFree, &nasStorageAt, &createdAt,
 			&pendingClips, &pendingBytes, &oldestPendingAt); err != nil {
@@ -404,6 +407,10 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			} else {
 				health = connectionHealthStale
 			}
+		}
+		parsedReasons := map[string]int64{}
+		if len(inventoryReasons) > 0 {
+			_ = json.Unmarshal(inventoryReasons, &parsedReasons)
 		}
 		items = append(items, connectionListItem{
 			ID:                     id,
@@ -441,6 +448,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			InventoryPassStartedAt: inventoryPass,
 			InventoryRowsVisited:   inventoryVisited,
 			InventoryRowsSkipped:   inventorySkipped,
+			InventorySkipReasons:   parsedReasons,
 			InventoryReportedAt:    inventoryReport,
 			InventoryClips:         inventoryClips,
 			InventoryBytes:         inventoryBytes,
@@ -616,17 +624,18 @@ type connectionStorageStatus struct {
 }
 
 type connectionInventoryStatus struct {
-	Generation        string     `json:"generation"`
-	ScanStartedAt     *time.Time `json:"scan_started_at"`
-	ScanCompletedAt   *time.Time `json:"scan_completed_at"`
-	ScanPassStartedAt *time.Time `json:"scan_pass_started_at"`
-	ScanRowsVisited   int64      `json:"scan_rows_visited"`
-	ScanRowsSkipped   int64      `json:"scan_rows_skipped"`
-	Clips             int64      `json:"clips"`
-	Bytes             int64      `json:"bytes"`
-	Mismatches        int64      `json:"mismatches"`
-	Unmatched         int64      `json:"unmatched"`
-	Digest            string     `json:"digest"`
+	Generation        string           `json:"generation"`
+	ScanStartedAt     *time.Time       `json:"scan_started_at"`
+	ScanCompletedAt   *time.Time       `json:"scan_completed_at"`
+	ScanPassStartedAt *time.Time       `json:"scan_pass_started_at"`
+	ScanRowsVisited   int64            `json:"scan_rows_visited"`
+	ScanRowsSkipped   int64            `json:"scan_rows_skipped"`
+	ScanSkipReasons   map[string]int64 `json:"scan_skip_reasons,omitempty"`
+	Clips             int64            `json:"clips"`
+	Bytes             int64            `json:"bytes"`
+	Mismatches        int64            `json:"mismatches"`
+	Unmatched         int64            `json:"unmatched"`
+	Digest            string           `json:"digest"`
 }
 
 type connectionHeartbeatBatch struct {
@@ -649,6 +658,10 @@ type connectionHeartbeatOutage struct {
 var connectionPhases = map[string]bool{"starting": true, "idle": true, "draining": true, "updating": true, "blocked": true, "degraded": true}
 var connectionPreviousExits = map[string]bool{"unknown": true, "clean": true, "self_update": true, "unclean_process": true, "unclean_reboot": true}
 var connectionOutageClasses = map[string]bool{"dns_failed": true, "timeout": true, "connection": true, "http": true, "other": true}
+var inventorySkipReasons = map[string]bool{
+	"changed_during_hash": true, "invalid_sidecar": true, "io_error": true,
+	"permission_denied": true, "unexpected": true, "vanished_during_scan": true,
+}
 
 const connectionHeartbeatFutureSkew = 5 * time.Minute
 
@@ -689,6 +702,21 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 		}
 		if (inv.ScanRowsVisited > 0 || inv.ScanRowsSkipped > 0) && inv.ScanPassStartedAt == nil {
 			return errors.New("NAS inventory scan progress requires pass start")
+		}
+		if inv.ScanSkipReasons != nil {
+			var reasonTotal int64
+			if len(inv.ScanSkipReasons) > len(inventorySkipReasons) {
+				return errors.New("invalid NAS inventory skip reasons")
+			}
+			for reason, count := range inv.ScanSkipReasons {
+				if !inventorySkipReasons[reason] || count < 1 || count > inv.ScanRowsSkipped || reasonTotal > inv.ScanRowsSkipped-count {
+					return errors.New("invalid NAS inventory skip reasons")
+				}
+				reasonTotal += count
+			}
+			if reasonTotal != inv.ScanRowsSkipped {
+				return errors.New("NAS inventory skip reasons do not match skipped rows")
+			}
 		}
 	}
 	if storage := req.Storage; storage != nil {
@@ -754,6 +782,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	var inventoryScanStartedAt, inventoryScanCompletedAt, inventoryScanPassStartedAt *time.Time
 	var inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched int64
 	var inventoryRowsVisited, inventoryRowsSkipped int64
+	var inventorySkipReasonsJSON []byte
 	if req.Inventory != nil {
 		inventoryGeneration = req.Inventory.Generation
 		inventoryScanStartedAt = req.Inventory.ScanStartedAt
@@ -761,6 +790,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryScanPassStartedAt = req.Inventory.ScanPassStartedAt
 		inventoryRowsVisited = req.Inventory.ScanRowsVisited
 		inventoryRowsSkipped = req.Inventory.ScanRowsSkipped
+		if req.Inventory.ScanSkipReasons != nil {
+			encodedReasons, marshalErr := json.Marshal(req.Inventory.ScanSkipReasons)
+			if marshalErr != nil {
+				util.WriteError(w, http.StatusBadRequest, "invalid NAS inventory skip reasons")
+				return
+			}
+			inventorySkipReasonsJSON = encodedReasons
+		}
 		inventoryClips = req.Inventory.Clips
 		inventoryBytes = req.Inventory.Bytes
 		inventoryMismatches = req.Inventory.Mismatches
@@ -804,6 +841,11 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    inventory_scan_pass_started_at=CASE WHEN $36::timestamptz IS NOT NULL AND (inventory_scan_pass_started_at IS NULL OR $36::timestamptz >= inventory_scan_pass_started_at) THEN $36::timestamptz ELSE inventory_scan_pass_started_at END,
 		    inventory_scan_rows_visited=CASE WHEN $36::timestamptz IS NOT NULL AND (inventory_scan_pass_started_at IS NULL OR $36::timestamptz > inventory_scan_pass_started_at) THEN $37 WHEN $36::timestamptz = inventory_scan_pass_started_at THEN GREATEST(inventory_scan_rows_visited,$37) ELSE inventory_scan_rows_visited END,
 		    inventory_scan_rows_skipped=CASE WHEN $36::timestamptz IS NOT NULL AND (inventory_scan_pass_started_at IS NULL OR $36::timestamptz > inventory_scan_pass_started_at) THEN $38 WHEN $36::timestamptz = inventory_scan_pass_started_at THEN GREATEST(inventory_scan_rows_skipped,$38) ELSE inventory_scan_rows_skipped END,
+		    inventory_scan_skip_reasons=CASE
+		      WHEN $36::timestamptz IS NOT NULL AND (inventory_scan_pass_started_at IS NULL OR $36::timestamptz > inventory_scan_pass_started_at) THEN COALESCE($39::jsonb, '{}'::jsonb)
+		      WHEN $36::timestamptz = inventory_scan_pass_started_at AND $39::jsonb IS NOT NULL AND $38 >= inventory_scan_rows_skipped THEN $39::jsonb
+		      WHEN $36::timestamptz = inventory_scan_pass_started_at AND $39::jsonb IS NULL AND $38 > inventory_scan_rows_skipped THEN '{}'::jsonb
+		      ELSE inventory_scan_skip_reasons END,
 		    nas_storage_total_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_total_bytes WHEN $33 THEN $34 ELSE NULL END,
 		    nas_storage_free_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_free_bytes WHEN $33 THEN $35 ELSE NULL END,
 		    nas_storage_reported_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_reported_at WHEN $33 THEN now() ELSE NULL END,
@@ -820,7 +862,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryGeneration, inventoryScanStartedAt, inventoryScanCompletedAt,
 		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
 		storageAvailable(req.Storage), storageTotal(req.Storage), storageFree(req.Storage),
-		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped)
+		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped, inventorySkipReasonsJSON)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return

@@ -149,6 +149,7 @@ class NASPullTests(unittest.TestCase):
             self.assertIsNotNone(summary["scan_pass_started_at"])
             self.assertEqual(summary["scan_rows_visited"], 2)
             self.assertEqual(summary["scan_rows_skipped"], 0)
+            self.assertEqual(summary["scan_skip_reasons"], {})
             inventory.close()
 
     def test_full_inventory_scan_error_never_publishes_complete_or_marks_unseen_missing(self):
@@ -164,13 +165,49 @@ class NASPullTests(unittest.TestCase):
             broken.parent.mkdir(parents=True)
             broken.write_text("{not-json", encoding="utf-8")
             calls = []
+            log_messages = []
             with mock.patch.object(pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}), self.assertRaisesRegex(
                 RuntimeError, "inventory scan incomplete"
-            ):
+            ), mock.patch.object(pull, "log", side_effect=lambda level, message: log_messages.append((level, message))):
                 inventory.full_scan(cfg, threading.Event())
             self.assertFalse(any(body.get("complete") for body in calls))
             self.assertEqual(inventory._rows("clip_id=91")[0][5], "present")
-            self.assertIsNone(inventory.summary()["scan_completed_at"])
+            summary = inventory.summary()
+            self.assertIsNone(summary["scan_completed_at"])
+            self.assertEqual(summary["scan_rows_skipped"], 1)
+            self.assertEqual(summary["scan_skip_reasons"], {"invalid_sidecar": 1})
+            self.assertIn(("WARN", "inventory skipped reason=invalid_sidecar count=1"), log_messages)
+            self.assertFalse(any(str(broken) in message or "not-json" in message for _, message in log_messages))
+            inventory.close()
+
+    def test_inventory_skip_reasons_are_bounded_and_stable(self):
+        cases = (
+            (pull.FileChangedDuringHash("changed"), False, "changed_during_hash"),
+            (FileNotFoundError("gone"), False, "vanished_during_scan"),
+            (PermissionError("denied"), False, "permission_denied"),
+            (OSError("read"), False, "io_error"),
+            (ValueError("bad sidecar"), True, "invalid_sidecar"),
+            (RuntimeError("unknown"), False, "unexpected"),
+        )
+        for exc, sidecar, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(pull.inventory_skip_reason(exc, sidecar), expected)
+                self.assertIn(expected, pull.INVENTORY_SKIP_REASONS)
+        self.assertEqual(pull.INVENTORY_SKIP_REASONS, frozenset(expected for _, _, expected in cases))
+
+    def test_legacy_or_corrupt_skip_reason_meta_is_omitted(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            inventory._meta_set({
+                "generation": "legacy-scan", "scan_rows_skipped": "13",
+                "scan_pass_started_at": "2026-08-09T00:00:00Z",
+            })
+            self.assertNotIn("scan_skip_reasons", inventory.summary())
+            for malformed in ('{"io_error":"x"}', '{"io_error":true}', '{"io_error":12}', '[]', '{not-json'):
+                with self.subTest(malformed=malformed):
+                    inventory._meta_set({"scan_skip_reasons": malformed})
+                    self.assertNotIn("scan_skip_reasons", inventory.summary())
             inventory.close()
 
     def test_scan_upserts_use_bounded_durable_commits_at_100k_scale(self):
@@ -222,6 +259,48 @@ class NASPullTests(unittest.TestCase):
                 inventory.full_scan(cfg, threading.Event())
             self.assertTrue(durable_counts)
             self.assertGreaterEqual(durable_counts[0], 2)
+            inventory.close()
+
+    def test_full_scan_sync_failure_is_not_counted_as_a_skipped_path(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"x").hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"x")
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            with mock.patch.object(pull, "INVENTORY_SYNC_BATCH", 1), mock.patch.object(
+                inventory, "sync_dirty", side_effect=RuntimeError("server unavailable")
+            ), self.assertRaisesRegex(pull.InventoryProgressError, "progress persistence failed"):
+                inventory.full_scan(cfg, threading.Event())
+            summary = inventory.summary()
+            self.assertEqual(summary["scan_rows_skipped"], 0)
+            self.assertEqual(summary["scan_skip_reasons"], {})
+            inventory.close()
+
+    def test_full_scan_sqlite_failure_is_not_counted_as_a_skipped_path(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"x").hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"x")
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            with mock.patch.object(
+                inventory, "_linked_scan_row_is_current", side_effect=sqlite3.OperationalError("database full")
+            ), self.assertRaisesRegex(pull.InventoryProgressError, "state persistence failed"):
+                inventory.full_scan(cfg, threading.Event())
+            summary = inventory.summary()
+            self.assertEqual(summary["scan_rows_skipped"], 0)
+            self.assertEqual(summary["scan_skip_reasons"], {})
             inventory.close()
 
     def test_full_scan_resumes_generation_without_rehashing_committed_rows(self):

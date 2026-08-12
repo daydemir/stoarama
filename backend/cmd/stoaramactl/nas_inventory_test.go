@@ -24,6 +24,7 @@ func TestWriteNASInventoryReportEmptyAndPopulated(t *testing.T) {
 	for _, summary := range []nasInventorySummary{
 		{ConnectionID: 1, Items: []map[string]any{}},
 		{ConnectionID: 2, Label: "NAS", Mode: "observe", SnapshotAvailable: true, SnapshotConsistent: true,
+			ScanRowsSkipped: 2, ScanSkipReasons: map[string]int64{"invalid_sidecar": 2},
 			StorageTotalBytes: &total, StorageFreeBytes: &free, LastBatchClips: 200, LastBatchBytes: 2_865_751_462,
 			LastBatchDurationMS: 221_656, LastBatchWorkers: 12, LastBatchRetries: 2, LastBatchFailures: 1,
 			Items: []map[string]any{{"clip_id": int64(3), "state": "mismatch", "relative_path": "clips/3.mp4", "verified_at": nil}}},
@@ -43,7 +44,7 @@ func TestWriteNASInventoryReportEmptyAndPopulated(t *testing.T) {
 		if !strings.Contains(textOut.String(), "connection=") {
 			t.Fatalf("missing report header: %q", textOut.String())
 		}
-		for _, marker := range []string{"snapshot_available=", "snapshot_consistent=", "pass_started=", "rows_visited=", "rows_skipped=", "storage_total=", "last_batch_clips="} {
+		for _, marker := range []string{"snapshot_available=", "snapshot_consistent=", "pass_started=", "rows_visited=", "rows_skipped=", "skip_reasons=", "storage_total=", "last_batch_clips="} {
 			if !strings.Contains(textOut.String(), marker) {
 				t.Fatalf("missing status marker %q: %q", marker, textOut.String())
 			}
@@ -52,7 +53,7 @@ func TestWriteNASInventoryReportEmptyAndPopulated(t *testing.T) {
 			t.Fatalf("nil storage values not explicit: %q", textOut.String())
 		}
 		if summary.ConnectionID == 2 {
-			for _, exact := range []string{"snapshot_available=true", "snapshot_consistent=true", "storage_total=92136325632000", "storage_free=3725420699648", "last_batch_clips=200", "last_batch_bytes=2865751462", "last_batch_duration_ms=221656", "workers=12", "retries=2", "failures=1"} {
+			for _, exact := range []string{"snapshot_available=true", "snapshot_consistent=true", `skip_reasons={"invalid_sidecar":2}`, "storage_total=92136325632000", "storage_free=3725420699648", "last_batch_clips=200", "last_batch_bytes=2865751462", "last_batch_duration_ms=221656", "workers=12", "retries=2", "failures=1"} {
 				if !strings.Contains(textOut.String(), exact) {
 					t.Fatalf("missing exact status %q: %q", exact, textOut.String())
 				}
