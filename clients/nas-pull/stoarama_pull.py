@@ -1062,7 +1062,7 @@ def require_storage_capacity(cfg, runtime, expected_bytes=0):
 def prepare_clip_with_capacity(cfg, runtime, clip):
     expected_bytes = clip.get("size_bytes")
     if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes <= 0:
-        raise ValueError("clip %s has invalid positive size_bytes" % clip.get("clip_id", "?"))
+        raise ValueError(f"clip {clip.get('clip_id', '?')} has invalid positive size_bytes")
     require_storage_capacity(cfg, runtime, expected_bytes)
     try:
         return process_clip(cfg, clip, False)
