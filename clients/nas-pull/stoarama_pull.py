@@ -35,6 +35,8 @@ HTTP_TIMEOUT_SEC = 120
 HEARTBEAT_TIMEOUT_SEC = 20
 HEARTBEAT_INTERVAL_SEC = 30
 STORAGE_TELEMETRY_MAX_AGE_SEC = HEARTBEAT_INTERVAL_SEC * 3
+DEFAULT_MIN_FREE_BYTES = 1_250_000_000_000
+CAPACITY_RESUME_HYSTERESIS_BYTES = 100_000_000_000
 UPDATE_INTERVAL_SEC = 600
 INVENTORY_SCAN_INTERVAL_SEC = 24 * 60 * 60
 INVENTORY_SYNC_BATCH = 200
@@ -194,6 +196,7 @@ class Config:
         self.legacy_progress_file = self.state_dir / "cursor.json"
         self.runtime_file = self.state_dir / "runtime.json"
         self.outage_file = self.state_dir / "outage.json"
+        self.capacity_file = self.state_dir / "capacity.json"
         self.inventory_file = self.state_dir / "inventory.sqlite3"
         self.current_file = self.state_dir / "stoarama_pull.py"
         self.candidate_file = self.state_dir / "stoarama_pull.candidate.py"
@@ -206,6 +209,7 @@ class Config:
         # sleep makes a 100k+ first scan spend hours idle on small clips.
         self.inventory_scan_delay_ms = env_int("STOARAMA_INVENTORY_SCAN_DELAY_MS", 0)
         self.inventory_hash_mbps = env_int("STOARAMA_INVENTORY_HASH_MBPS", 20)
+        self.min_free_bytes = env_int("STOARAMA_MIN_FREE_BYTES", DEFAULT_MIN_FREE_BYTES)
         self.update_manifest_url = env_str(
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
@@ -225,6 +229,8 @@ class Config:
             raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
         if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 1 or self.inventory_hash_mbps > 1000:
             raise SystemExit("invalid NAS inventory scan cadence")
+        if self.min_free_bytes < 1:
+            raise SystemExit("STOARAMA_MIN_FREE_BYTES must be positive")
 
 
 def boot_id():
@@ -843,6 +849,11 @@ class Runtime:
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
         self.storage_observed_monotonic = time.monotonic()
+        # Restarts always re-enter the blocked side of hysteresis. A fresh high
+        # watermark stat must explicitly reopen admission, so a failed state
+        # write can never resurrect an older durable "unblocked" decision.
+        self.capacity_blocked = True
+        self.capacity_reserved_bytes = 0
         self.batch = {
             "completed_at": None,
             "clips": 0,
@@ -914,6 +925,35 @@ class Runtime:
             self.storage = storage.copy()
             self.storage_observed_monotonic = time.monotonic()
 
+    def is_capacity_blocked(self):
+        with self.lock:
+            return self.capacity_blocked
+
+    def reserve_storage(self, cfg, storage, expected_bytes=0):
+        """Atomically admit expected bytes and persist hysteresis across restarts."""
+        available = bool(storage.get("available"))
+        free_bytes = int(storage.get("free_bytes", 0)) if available else 0
+        expected_bytes = max(0, int(expected_bytes))
+        with self.lock:
+            was_blocked = self.capacity_blocked
+            resume_at = cfg.min_free_bytes + CAPACITY_RESUME_HYSTERESIS_BYTES
+            usable_free = free_bytes - self.capacity_reserved_bytes - expected_bytes
+            self.capacity_blocked = (not available) or usable_free < (resume_at if was_blocked else cfg.min_free_bytes)
+            changed = self.capacity_blocked != was_blocked
+            if not self.capacity_blocked:
+                self.capacity_reserved_bytes += expected_bytes
+            if changed and self.capacity_blocked:
+                try:
+                    atomic_write(cfg.capacity_file, b'{"blocked":true}')
+                except Exception:
+                    self.capacity_blocked = True
+                    raise
+        return not self.capacity_blocked
+
+    def release_storage_reservation(self, expected_bytes):
+        with self.lock:
+            self.capacity_reserved_bytes = max(0, self.capacity_reserved_bytes - max(0, int(expected_bytes)))
+
     def heartbeat_payload(self, outage):
         with self.lock:
             payload = {
@@ -929,6 +969,7 @@ class Runtime:
                 "client_last_error": self.last_error,
                 "client_last_error_at": self.last_error_at,
                 "last_batch": self.batch.copy(),
+                "capacity_blocked": self.capacity_blocked,
             }
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
@@ -1000,6 +1041,37 @@ def storage_probe_loop(cfg, runtime, stop_event):
             runtime.set_storage({"available": False})
             log("WARN", "storage telemetry probe failed: %s" % exc)
         stop_event.wait(HEARTBEAT_INTERVAL_SEC)
+
+
+def require_storage_capacity(cfg, runtime, expected_bytes=0):
+    """Use a fresh mount-bound stat for every admission decision."""
+    try:
+        storage = storage_status(cfg)
+    except Exception:
+        storage = {"available": False}
+    runtime.set_storage(storage)
+    if not runtime.reserve_storage(cfg, storage, expected_bytes):
+        if storage.get("available"):
+            detail = "NAS free-space reserve reached"
+        else:
+            detail = "NAS free-space check unavailable"
+        runtime.set_phase(Phase.BLOCKED)
+        raise RuntimeError(detail)
+
+
+def prepare_clip_with_capacity(cfg, runtime, clip):
+    expected_bytes = clip.get("size_bytes")
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes <= 0:
+        raise ValueError(f"clip {clip.get('clip_id', '?')} has invalid positive size_bytes")
+    require_storage_capacity(cfg, runtime, expected_bytes)
+    try:
+        return process_clip(cfg, clip, False)
+    finally:
+        runtime.release_storage_reservation(expected_bytes)
+
+
+def set_idle_unless_capacity_blocked(runtime):
+    runtime.set_phase(Phase.BLOCKED if runtime.is_capacity_blocked() else Phase.IDLE)
 
 
 def acquire_lock(cfg):
@@ -1457,6 +1529,7 @@ def process_clip(cfg, clip, release=True):
 
 
 def drain_page(cfg, runtime, inventory=None):
+    require_storage_capacity(cfg, runtime)
     page = request_json(
         cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
     )
@@ -1470,7 +1543,7 @@ def drain_page(cfg, runtime, inventory=None):
     started = time.monotonic()
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.download_workers) as executor:
-        futures = [executor.submit(process_clip, cfg, clip, False) for clip in clips]
+        futures = [executor.submit(prepare_clip_with_capacity, cfg, runtime, clip) for clip in clips]
         for clip, future in zip(clips, futures):
             try:
                 results.append((int(clip["clip_id"]), future.result(), None))
@@ -1500,6 +1573,7 @@ def drain_page(cfg, runtime, inventory=None):
         releasable.append(clip_by_id[clip_id])
     try:
         if releasable and not cfg.dry_run:
+            require_storage_capacity(cfg, runtime)
             _, release_retries = retry_transient(
                 lambda: release_clips(cfg, releasable), int(releasable[0]["clip_id"]), "release-batch"
             )
@@ -1528,6 +1602,8 @@ def drain_page(cfg, runtime, inventory=None):
         runtime.set_error(
             f"{len(failures)} of {len(results)} clips failed; first clip {first_id}: {first_error}"[:1000]
         )
+        if runtime.is_capacity_blocked():
+            runtime.set_phase(Phase.BLOCKED)
     return bool(successes)
 
 
@@ -1700,9 +1776,9 @@ def run(cfg):
                 heartbeat.start()
             try:
                 check_storage(cfg)
+                require_storage_capacity(cfg, runtime)
             except (RuntimeError, OSError) as exc:
                 runtime.set_phase(Phase.BLOCKED)
-                runtime.set_error(str(exc))
                 log("ERROR", "storage blocked: %s" % exc)
                 stop_event.wait(cfg.poll_interval_sec)
                 continue
@@ -1720,7 +1796,7 @@ def run(cfg):
                 if update_can_exec(update_ready, inventory_worker, stop_event):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
-                runtime.set_phase(Phase.IDLE)
+                set_idle_unless_capacity_blocked(runtime)
                 if not progress:
                     stop_event.wait(cfg.poll_interval_sec)
             except Exception as exc:

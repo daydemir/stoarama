@@ -305,6 +305,7 @@ func TestConnectionComposeUsesDurableClientLauncher(t *testing.T) {
 		nasPythonImage,
 		`STOARAMA_CONNECTION_ID: "27"`,
 		`STOARAMA_STATE_DIR: "/state"`,
+		`STOARAMA_MIN_FREE_BYTES: "1250000000000"`,
 		`https://stoarama.com/nas/download/latest.json`,
 		nasBootstrapURL,
 		nasBootstrapSHA256,
@@ -478,8 +479,8 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{pool: pool}
-	call := func(storage *connectionStorageStatus) {
-		body, err := json.Marshal(connectionHeartbeatRequest{Storage: storage})
+	call := func(storage *connectionStorageStatus, capacityBlocked bool) {
+		body, err := json.Marshal(connectionHeartbeatRequest{Storage: storage, CapacityBlocked: capacityBlocked})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -491,7 +492,7 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 			t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
 		}
 	}
-	call(&connectionStorageStatus{Available: true, TotalBytes: 1000, FreeBytes: 250})
+	call(&connectionStorageStatus{Available: true, TotalBytes: 1000, FreeBytes: 250}, true)
 	var total, free *int64
 	var reportedAt *time.Time
 	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
@@ -501,7 +502,7 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 		t.Fatalf("persisted storage total=%v free=%v reported=%v", total, free, reportedAt)
 	}
 	storedReportedAt := *reportedAt
-	call(nil)
+	call(nil, true)
 	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
 		t.Fatal(err)
 	}
@@ -516,13 +517,26 @@ func TestConnectionHeartbeatStoragePersistenceAndList(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	for _, want := range []string{`"nas_storage_total_bytes":1000`, `"nas_storage_free_bytes":250`, `"nas_storage_reported_at":"`} {
+	for _, want := range []string{`"nas_storage_total_bytes":1000`, `"nas_storage_free_bytes":250`, `"nas_storage_reported_at":"`, `"nas_capacity_blocked":true`} {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("connection list missing %s: %s", want, rec.Body.String())
 		}
 	}
+	call(nil, false)
+	var capacityBlocked bool
+	if err := pool.QueryRow(ctx, `SELECT nas_capacity_blocked FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&capacityBlocked); err != nil {
+		t.Fatal(err)
+	}
+	if capacityBlocked {
+		t.Fatal("capacity_blocked true-to-false heartbeat did not persist")
+	}
+	rec = httptest.NewRecorder()
+	s.handleAccountConnectionsList(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"nas_capacity_blocked":false`) {
+		t.Fatalf("connection list did not map cleared capacity block status=%d body=%s", rec.Code, rec.Body.String())
+	}
 
-	call(&connectionStorageStatus{Available: false})
+	call(&connectionStorageStatus{Available: false}, false)
 	if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &reportedAt); err != nil {
 		t.Fatal(err)
 	}
