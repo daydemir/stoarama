@@ -273,13 +273,21 @@ func TestExpiredContinuousJobsFinalizeFromPreservedMedia(t *testing.T) {
 
 	ctx := context.Background()
 	recID := insertSchedulerContinuousRecording(t, pool)
-	var emptyJobID, capturedJobID int64
+	var emptyJobID, genericJobID, capturedJobID int64
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO recording_jobs
 		  (recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at,error_text)
 		VALUES ($1,now()-interval '2 hours',now(),60,'pending','expired-empty','continuous_window',now()-interval '1 minute','skyline manifest contains no playable media segments')
 		RETURNING id
 	`, recID).Scan(&emptyJobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_jobs
+		  (recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at,error_text)
+		VALUES ($1,now()-interval '2 hours',now(),60,'pending','expired-generic','continuous_window',now()-interval '1 minute','')
+		RETURNING id
+	`, recID).Scan(&genericJobID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `
@@ -308,11 +316,14 @@ func TestExpiredContinuousJobsFinalizeFromPreservedMedia(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var emptyStatus, emptyError, capturedStatus, capturedError string
+	var emptyStatus, emptyError, genericStatus, genericError, capturedStatus, capturedError string
 	if err := pool.QueryRow(ctx, `SELECT status,error_text FROM recording_jobs WHERE id=$1`, emptyJobID).Scan(&emptyStatus, &emptyError); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT status,error_text FROM recording_jobs WHERE id=$1`, capturedJobID).Scan(&capturedStatus, &capturedError); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,error_text FROM recording_jobs WHERE id=$1`, genericJobID).Scan(&genericStatus, &genericError); err != nil {
 		t.Fatal(err)
 	}
 	if emptyStatus != "error" || emptyError != "skyline manifest contains no playable media segments" {
@@ -321,13 +332,16 @@ func TestExpiredContinuousJobsFinalizeFromPreservedMedia(t *testing.T) {
 	if capturedStatus != "done" || capturedError != "prior handoff detail" {
 		t.Fatalf("captured job=%q error=%q", capturedStatus, capturedError)
 	}
+	if genericStatus != "error" || genericError != "continuous recording produced no clips" {
+		t.Fatalf("generic job=%q error=%q", genericStatus, genericError)
+	}
 	var failures int
 	var lastError string
 	if err := pool.QueryRow(ctx, `SELECT consecutive_failures,last_error_text FROM recordings WHERE id=$1`, recID).Scan(&failures, &lastError); err != nil {
 		t.Fatal(err)
 	}
-	if failures != 1 {
-		t.Fatalf("recording failures=%d want 1", failures)
+	if failures != 2 {
+		t.Fatalf("recording failures=%d want 2", failures)
 	}
 	if lastError != "skyline manifest contains no playable media segments" {
 		t.Fatalf("recording last error=%q", lastError)

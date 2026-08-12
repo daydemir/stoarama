@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -109,7 +110,7 @@ func TestResolveCaptureInputRefreshesSkylineManifestFromSourcePage(t *testing.T)
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("User-Agent"), "Chrome/") {
-			t.Fatalf("skyline request User-Agent=%q", r.Header.Get("User-Agent"))
+			t.Errorf("skyline request User-Agent=%q", r.Header.Get("User-Agent"))
 		}
 		switch r.URL.Path {
 		case "/webcam.html":
@@ -117,7 +118,7 @@ func TestResolveCaptureInputRefreshesSkylineManifestFromSourcePage(t *testing.T)
 			_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"` + server.URL + `/fresh.m3u8"});</script>`))
 		case "/fresh.m3u8":
 			if got := r.Header.Get("Referer"); got != server.URL+"/webcam.html" {
-				t.Fatalf("manifest Referer=%q", got)
+				t.Errorf("manifest Referer=%q", got)
 			}
 			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsegment.ts\n"))
 		default:
@@ -155,12 +156,12 @@ func TestResolveCaptureInputRejectsHTTP200EmptySkylineManifest(t *testing.T) {
 		resolveDialControl = netguard.ControlReject
 	})
 
-	var pageRequests int
+	var pageRequests atomic.Int64
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/webcam.html":
-			pageRequests++
+			pageRequests.Add(1)
 			_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"` + server.URL + `/empty.m3u8"});</script>`))
 		case "/empty.m3u8":
 			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:0\n#EXT-X-ENDLIST\n"))
@@ -174,8 +175,8 @@ func TestResolveCaptureInputRejectsHTTP200EmptySkylineManifest(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no playable media segments") {
 		t.Fatalf("ResolveCaptureInput() error=%v, want playable-media failure", err)
 	}
-	if pageRequests != 2 {
-		t.Fatalf("page requests=%d want=2 fresh attempts", pageRequests)
+	if got := pageRequests.Load(); got != 2 {
+		t.Fatalf("page requests=%d want=2 fresh attempts", got)
 	}
 }
 
@@ -234,7 +235,7 @@ func TestResolveCaptureInputSelectsPlayableTrustedSkylineMasterVariant(t *testin
 			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:0\n#EXT-X-ENDLIST\n"))
 		case "/live.m3u8":
 			if got := r.Header.Get("Referer"); got != server.URL+"/webcam.html" {
-				t.Fatalf("variant Referer=%q", got)
+				t.Errorf("variant Referer=%q", got)
 			}
 			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsegment.ts\n"))
 		default:

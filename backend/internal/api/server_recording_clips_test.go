@@ -211,6 +211,15 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET scheduled_for=now() WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
+	var priorOwner recordingLeaseResponse
+	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
+		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		&priorOwner.JobID, &priorOwner.RecordingID, &priorOwner.SourceURL, &priorOwner.StreamID, &priorOwner.StreamProvider, &priorOwner.SourcePageURL, &priorOwner.ClipDurationSec,
+		&priorOwner.StorageDestinationID, &priorOwner.FireAt, &priorOwner.AttemptCount, &priorOwner.LeaseExpiresAt, &priorOwner.TargetFPS, &priorOwner.Kind, &priorOwner.WindowEndAt, &priorOwner.LeaseToken,
+	)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("prior owner leased job during active handoff: err=%v", err)
+	}
 	var job recordingLeaseResponse
 	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
 		"cloud-b", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, true).Scan(

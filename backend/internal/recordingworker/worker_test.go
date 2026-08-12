@@ -49,6 +49,7 @@ func TestContinuousShouldStop(t *testing.T) {
 func TestCloudWorkerAllowsNoProgressHandoffWithoutRelayDiagnostics(t *testing.T) {
 	var gotReason recordingapi.SurrenderReason
 	var gotErrorText string
+	var observationsMu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/recording/jobs/42/surrender" {
 			t.Errorf("path = %q", r.URL.Path)
@@ -60,8 +61,10 @@ func TestCloudWorkerAllowsNoProgressHandoffWithoutRelayDiagnostics(t *testing.T)
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode surrender: %v", err)
 		}
+		observationsMu.Lock()
 		gotReason = body.Reason
 		gotErrorText = body.ErrorText
+		observationsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -89,11 +92,14 @@ func TestCloudWorkerAllowsNoProgressHandoffWithoutRelayDiagnostics(t *testing.T)
 	}, time.Now().Add(-6*time.Minute), errors.New("skyline manifest contains no playable media segments")) {
 		t.Fatal("expired no-progress timeout did not surrender job")
 	}
-	if gotReason != recordingapi.SurrenderNoProgress {
-		t.Fatalf("surrender reason = %q, want %q", gotReason, recordingapi.SurrenderNoProgress)
+	observationsMu.Lock()
+	observedReason, observedErrorText := gotReason, gotErrorText
+	observationsMu.Unlock()
+	if observedReason != recordingapi.SurrenderNoProgress {
+		t.Fatalf("surrender reason = %q, want %q", observedReason, recordingapi.SurrenderNoProgress)
 	}
-	if !strings.Contains(gotErrorText, "skyline manifest contains no playable media segments") {
-		t.Fatalf("surrender error_text=%q", gotErrorText)
+	if !strings.Contains(observedErrorText, "skyline manifest contains no playable media segments") {
+		t.Fatalf("surrender error_text=%q", observedErrorText)
 	}
 }
 

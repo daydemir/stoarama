@@ -435,32 +435,42 @@ func resolveSkylineManifestURL(ctx context.Context, pageURL string, timeout time
 	if _, err := resolveValidateURL(pageURL); err != nil {
 		return "", fmt.Errorf("skyline page rejected: %w", err)
 	}
-	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
+	overallCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := skylineHTTPClient(timeout)
+	attemptTimeout := timeout / 2
+	if attemptTimeout <= 0 {
+		attemptTimeout = timeout
+	}
+	client := skylineHTTPClient(attemptTimeout)
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		attemptURL := pageURL
 		if attempt > 0 {
 			attemptURL = skylineRefreshURL(pageURL)
 		}
-		page, err := fetchSkylineResource(resolveCtx, client, attemptURL, "", "text/html,application/xhtml+xml", 512*1024)
+		attemptCtx, attemptCancel := context.WithTimeout(overallCtx, attemptTimeout)
+		page, err := fetchSkylineResource(attemptCtx, client, attemptURL, "", "text/html,application/xhtml+xml", 512*1024)
 		if err != nil {
+			attemptCancel()
 			lastErr = fmt.Errorf("skyline page: %w", err)
 			continue
 		}
 		manifest := skylineManifestFromHTML(string(page))
 		if manifest == "" {
+			attemptCancel()
 			lastErr = fmt.Errorf("skyline page did not contain player source")
 			continue
 		}
 		if !skylineURLAllowed(manifest) {
+			attemptCancel()
 			return "", fmt.Errorf("skyline page returned an untrusted manifest host")
 		}
 		if _, err := resolveValidateURL(manifest); err != nil {
+			attemptCancel()
 			return "", fmt.Errorf("skyline manifest rejected: %w", err)
 		}
-		captureURL, err := validateSkylineManifest(resolveCtx, client, manifest, pageURL)
+		captureURL, err := validateSkylineManifest(attemptCtx, client, manifest, pageURL)
+		attemptCancel()
 		if err != nil {
 			lastErr = err
 			continue

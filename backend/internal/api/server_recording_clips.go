@@ -1337,6 +1337,8 @@ func sanitizeRecordingSurrenderError(raw, fallback string) string {
 	}, s)
 	runes := []rune(strings.TrimSpace(s))
 	if len(runes) > 500 {
+		// Keep 500 content runes plus the three-rune ellipsis pinned by the
+		// regression test, for a maximum persisted length of 503 runes.
 		runes = append(runes[:500], '.', '.', '.')
 	}
 	return string(runes)

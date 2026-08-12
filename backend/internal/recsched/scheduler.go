@@ -310,17 +310,24 @@ const freshnessGraceSec = 30
 // closes a surrender whose bounded retry landed after the window boundary.
 func (s *Scheduler) markStaleJobsMissed(ctx context.Context, tx pgx.Tx) error {
 	rows, err := tx.Query(ctx, `
+		WITH stale AS (
+		  SELECT j.id,
+		         EXISTS (
+		           SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id
+		         ) AS has_clips
+		  FROM recording_jobs j
+		  WHERE j.status='pending'
+		    AND ((j.kind='clip'
+		          AND j.fire_at + make_interval(secs => (j.clip_duration_sec + $1)) <= now())
+		         OR (j.kind='continuous_window' AND j.window_end_at <= now()))
+		)
 		UPDATE recording_jobs j
 		SET status=CASE
-		      WHEN j.kind='continuous_window' AND EXISTS (
-		        SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id
-		      ) THEN 'done'
+		      WHEN j.kind='continuous_window' AND stale.has_clips THEN 'done'
 		      ELSE 'error'
 		    END,
 		    error_text=CASE
-		      WHEN j.kind='continuous_window' AND EXISTS (
-		        SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id
-		      ) THEN j.error_text
+		      WHEN j.kind='continuous_window' AND stale.has_clips THEN j.error_text
 		      WHEN j.kind='continuous_window' THEN COALESCE(
 		        NULLIF(btrim(j.error_text), ''),
 		        'continuous recording produced no clips'
@@ -332,10 +339,8 @@ func (s *Scheduler) markStaleJobsMissed(ctx context.Context, tx pgx.Tx) error {
 		    lease_expires_at=NULL,
 		    completed_at=now(),
 		    updated_at=now()
-		WHERE j.status='pending'
-		  AND ((j.kind='clip'
-		        AND j.fire_at + make_interval(secs => (j.clip_duration_sec + $1)) <= now())
-		       OR (j.kind='continuous_window' AND j.window_end_at <= now()))
+		FROM stale
+		WHERE j.id=stale.id
 		RETURNING j.recording_id, j.status, j.error_text
 	`, freshnessGraceSec)
 	if err != nil {
