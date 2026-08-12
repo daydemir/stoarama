@@ -22,6 +22,7 @@ import (
 // clip, joined from recording_clips -> storage_destinations under the account
 // scope. It mirrors the decrypt->client->op pattern in handleRecordingUploadIntent.
 type clipDestination struct {
+	id                 int64
 	objectKey          string
 	thumbnailObjectKey string
 	sizeBytes          int64

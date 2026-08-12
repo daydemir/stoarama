@@ -1,8 +1,12 @@
 package r2
 
 import (
+	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -51,4 +55,31 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return parsed
+}
+
+func TestOpenExactSendsConditionalGenerationIdentity(t *testing.T) {
+	var ifMatch, version string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ifMatch, version = r.Header.Get("If-Match"), r.URL.Query().Get("versionId")
+		_, _ = io.WriteString(w, "clip")
+	}))
+	defer server.Close()
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := client.OpenExact(context.Background(), "clip.mp4", "abc123", "version-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if _, err := io.ReadAll(body); err != nil {
+		t.Fatal(err)
+	}
+	if ifMatch != `"abc123"` || version != "version-7" {
+		t.Fatalf("If-Match=%q versionId=%q", ifMatch, version)
+	}
+	if strings.Contains(ifMatch, "clip") {
+		t.Fatal("object key leaked into conditional identity")
+	}
 }

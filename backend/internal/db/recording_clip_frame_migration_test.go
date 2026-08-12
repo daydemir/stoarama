@@ -1,0 +1,75 @@
+package db
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+func TestRecordingClipFrameProvenanceMigration(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx := context.Background()
+	c, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(ctx)
+	schema := fmt.Sprintf("clip_frame_migration_%d", time.Now().UnixNano())
+	if _, err = c.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE")
+	if _, err = c.Exec(ctx, "SET search_path="+schema); err != nil {
+		t.Fatal(err)
+	}
+	for _, ddl := range []string{
+		`CREATE TABLE storage_destinations(id bigint primary key)`,
+		`CREATE TABLE recording_clips(id bigint primary key)`,
+		`CREATE TABLE frames(id bigserial primary key,stream_id bigint,captured_at timestamptz,raw_media_object_id bigint,source_kind text)`,
+		`CREATE UNIQUE INDEX idx_frames_authoritative_identity ON frames(stream_id,captured_at) WHERE source_kind='authoritative_frame_refresh'`,
+		`INSERT INTO storage_destinations VALUES(7)`,
+		`INSERT INTO recording_clips VALUES(1),(2)`,
+		`INSERT INTO frames(stream_id,captured_at,raw_media_object_id,source_kind) VALUES(9,now(),3,'authoritative_frame_refresh')`,
+	} {
+		if _, err = c.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile("../../../infra/sql/migrations/0131_recording_clip_frame_provenance.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Exec(ctx, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	if _, err = c.Exec(ctx, `INSERT INTO frames(stream_id,captured_at,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag,source_recording_destination_id,source_recording_endpoint,source_recording_bucket,source_recording_object_key,source_recording_size_bytes) VALUES(9,now(),'authoritative_frame_refresh',1,$1,'etag',7,'https://storage.example.test','bucket','clip.mp4',4)`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Exec(ctx, `UPDATE frames SET source_recording_clip_etag='other' WHERE source_recording_clip_id=1`); err == nil {
+		t.Fatal("provenance mutation succeeded")
+	}
+	if _, err = c.Exec(ctx, `INSERT INTO frames(stream_id,captured_at,source_kind,source_recording_clip_id,source_recording_clip_sha256) VALUES(9,now(),'authoritative_frame_refresh',2,$1)`, sha); err == nil {
+		t.Fatal("partial provenance succeeded")
+	}
+	if _, err = c.Exec(ctx, `INSERT INTO frames(stream_id,captured_at,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag,source_recording_destination_id,source_recording_endpoint,source_recording_bucket,source_recording_object_key,source_recording_size_bytes) VALUES(9,now(),'authoritative_frame_refresh',1,$1,'etag',7,'https://storage.example.test','bucket','clip.mp4',4)`, sha); err == nil {
+		t.Fatal("duplicate source clip succeeded")
+	}
+	// A clip frame may honestly share a stream/timestamp with a preexisting
+	// source refresh; clip identity is the stronger idempotency key.
+	var sourceAt time.Time
+	if err = c.QueryRow(ctx, `SELECT captured_at FROM frames WHERE source_recording_clip_id IS NULL LIMIT 1`).Scan(&sourceAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Exec(ctx, `INSERT INTO frames(stream_id,captured_at,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag,source_recording_destination_id,source_recording_endpoint,source_recording_bucket,source_recording_object_key,source_recording_size_bytes) VALUES(9,$1,'authoritative_frame_refresh',2,$2,'etag2',7,'https://storage.example.test','bucket','clip2.mp4',4)`, sourceAt, sha); err != nil {
+		t.Fatalf("clip identity collided with source timestamp: %v", err)
+	}
+}
