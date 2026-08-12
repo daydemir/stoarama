@@ -97,6 +97,8 @@ func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
 		"g.account_id=n.account_id",
 		"peer_group.bandwidth_capacity_bps",
 		"recording_bandwidth_observations",
+		"source_stream.execution_class",
+		"n.capabilities_jsonb->'youtube_ready'",
 		"GREATEST(COALESCE(peer_group_bandwidth.observed_bandwidth_bps, 0), 4000000)",
 	} {
 		if !strings.Contains(relayLeaseSQL, want) {
@@ -108,6 +110,87 @@ func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
 func TestRecordingHeartbeatCannotReviveExpiredLease(t *testing.T) {
 	if !strings.Contains(recordingJobHeartbeatSQL, "j.lease_expires_at > now()") {
 		t.Fatal("recording heartbeat must reject expired leases")
+	}
+}
+
+func TestRelayLeaseRequiresYouTubeReadinessOnlyForYouTube(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed readiness test")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("relay_readiness_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE accounts (id BIGINT PRIMARY KEY);
+		CREATE TABLE relay_groups (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, max_streams INT NOT NULL, bandwidth_capacity_bps BIGINT);
+		`+testRelayNodesTableDDL+`;
+		CREATE TABLE streams (id BIGINT PRIMARY KEY, provider TEXT, source_page_url TEXT, execution_class TEXT);
+		CREATE TABLE storage_destinations (id BIGINT PRIMARY KEY);
+		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
+		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+		CREATE TABLE recording_bandwidth_observations (recording_id BIGINT PRIMARY KEY, observed_bandwidth_bps BIGINT NOT NULL, observed_at TIMESTAMPTZ NOT NULL DEFAULT now());
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
+		`+testRecordingCanaryReservationsTableDDL+`;
+		INSERT INTO accounts VALUES (47);
+		INSERT INTO relay_groups VALUES (1,47,4,NULL);
+		INSERT INTO nodes (id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,relay_group_id,capabilities_jsonb)
+		VALUES (1,47,'relay','active',now(),4,1,'{"youtube_ready":false}');
+		INSERT INTO storage_destinations VALUES (1);
+		INSERT INTO streams VALUES (1,'youtube','https://example.invalid','youtube_direct'),(2,'other','https://example.invalid','hls_direct');
+		INSERT INTO recordings VALUES
+		  (1,47,'active',now()-interval '1 hour',NULL,'relay','source-1',1,1,NULL,NULL,now()),
+		  (2,47,'active',now()-interval '1 hour',NULL,'relay','source-2',2,1,NULL,NULL,now());
+		INSERT INTO recording_jobs VALUES
+		  (1,1,'pending',now()-interval '2 seconds','continuous_window',now(),60,NULL,NULL,NULL,0,now(),now()+interval '1 hour',NULL,NULL,NULL),
+		  (2,2,'pending',now()-interval '1 second','continuous_window',now(),60,NULL,NULL,NULL,0,now(),now()+interval '1 hour',NULL,NULL,NULL);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	principal := nodePrincipal{NodeID: 1, AccountID: 47, NodeType: nodeTypeRelay}
+	lease, err := s.leaseRelayRecordingJob(ctx, principal, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
+	if err != nil || lease.RecordingID != 2 {
+		t.Fatalf("unready node lease=%+v err=%v, want non-YouTube recording 2", lease, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET status='done',lease_owner=NULL,lease_expires_at=NULL WHERE id=2`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.leaseRelayRecordingJob(ctx, principal, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("unready node leased YouTube: %v", err)
+	}
+	for _, capabilities := range []string{`{}`, `{"youtube_ready":"true"}`} {
+		if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb=$1`, capabilities); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.leaseRelayRecordingJob(ctx, principal, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("malformed readiness %s leased YouTube: %v", capabilities, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET capabilities_jsonb='{"youtube_ready":true}'`); err != nil {
+		t.Fatal(err)
+	}
+	lease, err = s.leaseRelayRecordingJob(ctx, principal, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false)
+	if err != nil || lease.RecordingID != 1 {
+		t.Fatalf("ready node lease=%+v err=%v, want YouTube recording 1", lease, err)
 	}
 }
 
@@ -142,7 +225,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY);
 		CREATE TABLE relay_groups (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, max_streams INT NOT NULL, bandwidth_capacity_bps BIGINT);
 		`+testRelayNodesTableDDL+`;
-		CREATE TABLE streams (id BIGINT PRIMARY KEY, provider TEXT, source_page_url TEXT);
+		CREATE TABLE streams (id BIGINT PRIMARY KEY, provider TEXT, source_page_url TEXT, execution_class TEXT);
 		CREATE TABLE storage_destinations (id BIGINT PRIMARY KEY);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());

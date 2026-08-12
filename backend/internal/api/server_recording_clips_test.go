@@ -769,7 +769,8 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 		`CREATE TABLE streams (
 			id BIGSERIAL PRIMARY KEY,
 			provider TEXT NOT NULL DEFAULT '',
-			source_page_url TEXT NOT NULL DEFAULT ''
+			source_page_url TEXT NOT NULL DEFAULT '',
+			execution_class TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE TABLE recordings (
 			id BIGSERIAL PRIMARY KEY,
