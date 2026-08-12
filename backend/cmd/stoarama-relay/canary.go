@@ -133,6 +133,13 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 	if validationErr != nil {
 		return validationErr
 	}
+	if err := client.CompleteRecordingCanary(ctx, spec.RecordingID, spec.ReservationID, recordingapi.RecordingCanaryResult{
+		DurationMS: seg.DurationMs, SizeBytes: seg.SizeBytes, SHA256: seg.SHA256,
+		VideoCodec: seg.VideoCodec, ProbeOK: true, DecodeOK: true, NativeCopy: true,
+		Uploaded: false, RelayVersion: version, SourceRevision: sourceRevision,
+	}); err != nil {
+		return fmt.Errorf("persist canary validation: %s", recordingworker.SanitizeDiagnosticError(err))
+	}
 
 	hostname, _ := os.Hostname()
 	fps := "unknown"

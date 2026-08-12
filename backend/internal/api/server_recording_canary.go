@@ -1,8 +1,13 @@
 package api
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -11,6 +16,10 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
+
+var recordingCanaryDigestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var recordingCanaryVersionRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+var recordingCanaryCodecRE = regexp.MustCompile(`^[a-z0-9._-]{1,32}$`)
 
 const (
 	recordingCanaryReservationTTL = 3 * time.Minute
@@ -55,10 +64,13 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 
 	var spec recordingCanarySpec
 	var preferredGroupID, nodeGroupID *int64
+	var windowStart time.Time
+	var preopenStage string
 	err = tx.QueryRow(r.Context(), `
 		SELECT rec.id, n.id, COALESCE(rec.stream_id, 0), COALESCE(st.provider, ''),
 		       rec.stream_url, COALESCE(st.source_page_url, ''),
-		       rec.preferred_relay_group_id, n.relay_group_id
+		       rec.preferred_relay_group_id, n.relay_group_id, rec.next_fire_at,
+		       CASE WHEN rec.next_fire_at>now()+interval '30 minutes' THEN 'early' ELSE 'confirm' END
 		FROM recordings rec
 		JOIN nodes n ON n.id=$1
 		LEFT JOIN streams st ON st.id=rec.stream_id
@@ -69,10 +81,12 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		  AND n.node_type='relay'
 		  AND n.status='active'
 		  AND n.last_heartbeat_at>=now()-interval '120 seconds'
+		  AND rec.mode='continuous' AND rec.next_fire_at>now()
+		  AND rec.next_fire_at<=now()+interval '2 hours'
 		FOR UPDATE OF rec
 	`, principal.NodeID, recordingID).Scan(
 		&spec.RecordingID, &spec.NodeID, &spec.StreamID, &spec.Provider,
-		&spec.SourceURL, &spec.SourcePageURL, &preferredGroupID, &nodeGroupID,
+		&spec.SourceURL, &spec.SourcePageURL, &preferredGroupID, &nodeGroupID, &windowStart, &preopenStage,
 	)
 	if err == pgx.ErrNoRows {
 		util.WriteError(w, http.StatusNotFound, "active relay recording not available to this node")
@@ -159,13 +173,13 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 	}
 	var reservationID uuid.UUID
 	err = tx.QueryRow(r.Context(), `
-		INSERT INTO recording_canary_reservations (recording_id, node_id, expires_at)
-		SELECT $1, $2, now()+make_interval(secs=>$3)
+		INSERT INTO recording_canary_reservations (recording_id, node_id, expires_at, window_start_at, preopen_stage)
+		SELECT $1, $2, now()+make_interval(secs=>$3), $4, $5
 		WHERE NOT EXISTS (
 		  SELECT 1 FROM recording_canary_reservations
 		  WHERE recording_id=$1 AND expires_at>now())
 		RETURNING id, expires_at
-	`, recordingID, principal.NodeID, int(recordingCanaryReservationTTL/time.Second)).Scan(&reservationID, &spec.SafeUntil)
+	`, recordingID, principal.NodeID, int(recordingCanaryReservationTTL/time.Second), windowStart, preopenStage).Scan(&reservationID, &spec.SafeUntil)
 	if err == pgx.ErrNoRows {
 		util.WriteError(w, http.StatusConflict, "recording already has an active canary")
 		return
@@ -213,6 +227,186 @@ func (s *Server) handleNodeRecordingCanaryCheck(w http.ResponseWriter, r *http.R
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, spec)
+}
+
+type recordingCanaryResult struct {
+	DurationMS     int64  `json:"duration_ms"`
+	SizeBytes      int64  `json:"size_bytes"`
+	SHA256         string `json:"sha256"`
+	VideoCodec     string `json:"video_codec"`
+	ProbeOK        bool   `json:"probe_ok"`
+	DecodeOK       bool   `json:"decode_ok"`
+	NativeCopy     bool   `json:"native_copy"`
+	Uploaded       bool   `json:"uploaded"`
+	RelayVersion   string `json:"relay_version"`
+	SourceRevision string `json:"source_revision"`
+}
+
+// handleNodeRecordingCanaryComplete records only the outcome of the exact live
+// reservation owned by this relay. It does not touch jobs, recordings, frames,
+// clips, uploads, or runtime state. The ordinary Finish call releases the
+// reservation afterward, so an ambiguous response remains safely retryable.
+func (s *Server) handleNodeRecordingCanaryComplete(w http.ResponseWriter, r *http.Request) {
+	principal, recordingID, ok := recordingCanaryPrincipal(w, r)
+	if !ok {
+		return
+	}
+	reservationID, err := uuid.Parse(chi.URLParam(r, "reservationId"))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid canary reservation id")
+		return
+	}
+	var result recordingCanaryResult
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&result); err != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid canary result")
+		return
+	}
+	if dec.Decode(&struct{}{}) != io.EOF {
+		util.WriteError(w, http.StatusBadRequest, "invalid canary result")
+		return
+	}
+	result.SHA256 = strings.ToLower(strings.TrimSpace(result.SHA256))
+	result.VideoCodec = strings.ToLower(strings.TrimSpace(result.VideoCodec))
+	if result.DurationMS < 10_000 || result.DurationMS > 30_000 || result.SizeBytes <= 0 || result.SizeBytes > 512<<20 ||
+		!recordingCanaryDigestRE.MatchString(result.SHA256) || !recordingCanaryCodecRE.MatchString(result.VideoCodec) ||
+		!result.ProbeOK || !result.DecodeOK || !result.NativeCopy || result.Uploaded ||
+		!recordingCanaryVersionRE.MatchString(result.RelayVersion) || !recordingCanaryVersionRE.MatchString(result.SourceRevision) {
+		util.WriteError(w, http.StatusBadRequest, "canary result did not prove bounded native media")
+		return
+	}
+	// Exact retry after an ambiguous response is safe even though Finish may
+	// already have released the reservation. Any field mismatch is a conflict.
+	var replay recordingCanaryResult
+	var replayWindow time.Time
+	var replayStage string
+	var replayReflected bool
+	err = s.pool.QueryRow(r.Context(), `
+		SELECT window_start_at,stage,duration_ms,size_bytes,media_sha256,video_codec,
+		       probe_ok,decode_ok,native_copy,uploaded,relay_version,source_revision,
+		       EXISTS(SELECT 1 FROM recording_preopen_checks p
+		              WHERE p.recording_id=e.recording_id AND p.window_start_at=e.window_start_at
+		                AND p.stage=e.stage AND p.result='pass' AND p.method='relay_canary'
+		                AND p.detail LIKE '%evidence='||e.reservation_id::text)
+		FROM recording_canary_preopen_evidence e
+		WHERE reservation_id=$1 AND recording_id=$2 AND node_id=$3 AND account_id=$4
+	`, reservationID, recordingID, principal.NodeID, principal.AccountID).Scan(
+		&replayWindow, &replayStage, &replay.DurationMS, &replay.SizeBytes, &replay.SHA256, &replay.VideoCodec,
+		&replay.ProbeOK, &replay.DecodeOK, &replay.NativeCopy, &replay.Uploaded, &replay.RelayVersion, &replay.SourceRevision, &replayReflected)
+	if err == nil {
+		if replay != result {
+			util.WriteError(w, http.StatusConflict, "canary completion evidence differs from prior result")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"recorded": true, "reflected": replayReflected, "stale": !replayReflected, "window_start_at": replayWindow, "stage": replayStage})
+		return
+	}
+	if err != pgx.ErrNoRows {
+		util.WriteError(w, http.StatusInternalServerError, "load prior recording canary completion")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin recording canary completion")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	var windowStart time.Time
+	var stage string
+	var reservationCreatedAt time.Time
+	err = tx.QueryRow(r.Context(), `
+		SELECT canary.window_start_at,canary.preopen_stage,canary.created_at
+		FROM recording_canary_reservations canary
+		JOIN recordings rec ON rec.id=canary.recording_id
+		WHERE canary.id=$1 AND canary.recording_id=$2 AND canary.node_id=$3
+		  AND canary.expires_at>now() AND rec.account_id=$4
+		  AND rec.status='active' AND rec.mode='continuous' AND rec.capture_via='relay'
+		  AND canary.window_start_at IS NOT NULL AND canary.preopen_stage IS NOT NULL
+		  AND rec.next_fire_at=canary.window_start_at AND rec.next_fire_at>now()
+		FOR UPDATE OF canary,rec
+	`, reservationID, recordingID, principal.NodeID, principal.AccountID).Scan(&windowStart, &stage, &reservationCreatedAt)
+	if err == pgx.ErrNoRows {
+		util.WriteError(w, http.StatusConflict, "recording canary reservation expired or pre-open window unavailable")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "validate recording canary completion")
+		return
+	}
+	insertedEvidence, err := tx.Exec(r.Context(), `
+		INSERT INTO recording_canary_preopen_evidence(
+		  reservation_id,recording_id,node_id,account_id,window_start_at,stage,duration_ms,size_bytes,
+		  media_sha256,video_codec,probe_ok,decode_ok,native_copy,uploaded,relay_version,source_revision,reservation_created_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+		ON CONFLICT(reservation_id) DO NOTHING
+	`, reservationID, recordingID, principal.NodeID, principal.AccountID, windowStart, stage,
+		result.DurationMS, result.SizeBytes, result.SHA256, result.VideoCodec, result.ProbeOK,
+		result.DecodeOK, result.NativeCopy, result.Uploaded, result.RelayVersion, result.SourceRevision, reservationCreatedAt)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "persist immutable recording canary evidence")
+		return
+	}
+	if insertedEvidence.RowsAffected() == 0 {
+		var concurrent recordingCanaryResult
+		var concurrentReservation uuid.UUID
+		err := tx.QueryRow(r.Context(), `
+			SELECT reservation_id,duration_ms,size_bytes,media_sha256,video_codec,
+			       probe_ok,decode_ok,native_copy,uploaded,relay_version,source_revision
+			FROM recording_canary_preopen_evidence
+			WHERE reservation_id=$1 AND recording_id=$2 AND window_start_at=$3 AND stage=$4
+			FOR SHARE
+		`, reservationID, recordingID, windowStart, stage).Scan(
+			&concurrentReservation, &concurrent.DurationMS, &concurrent.SizeBytes, &concurrent.SHA256,
+			&concurrent.VideoCodec, &concurrent.ProbeOK, &concurrent.DecodeOK, &concurrent.NativeCopy,
+			&concurrent.Uploaded, &concurrent.RelayVersion, &concurrent.SourceRevision)
+		if err != nil || concurrentReservation != reservationID || concurrent != result {
+			util.WriteError(w, http.StatusConflict, "canary completion evidence differs from prior result")
+			return
+		}
+	}
+	detail := fmt.Sprintf("relay node=%d native duration_ms=%d size_bytes=%d codec=%s probe_ok=true decode_ok=true uploaded=false evidence=%s",
+		principal.NodeID, result.DurationMS, result.SizeBytes, result.VideoCodec, reservationID.String())
+	if len(detail) > 500 {
+		util.WriteError(w, http.StatusBadRequest, "canary result detail too large")
+		return
+	}
+	projection, err := tx.Exec(r.Context(), `
+		INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method,detail,attempt_count,next_retry_at)
+		VALUES($1,$2,$3,'pass','relay_canary',$4,1,NULL)
+		ON CONFLICT(recording_id,window_start_at,stage) DO UPDATE SET
+		  checked_at=now(),result='pass',method='relay_canary',detail=EXCLUDED.detail,
+		  attempt_count=recording_preopen_checks.attempt_count,next_retry_at=NULL
+		WHERE recording_preopen_checks.checked_at<= $5
+	`, recordingID, windowStart, stage, detail, reservationCreatedAt)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "persist recording canary completion")
+		return
+	}
+	projected := projection.RowsAffected() == 1
+	if !projected {
+		if err := tx.Commit(r.Context()); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "commit stale recording canary evidence")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"recorded": true, "reflected": false, "stale": true, "window_start_at": windowStart, "stage": stage})
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE recorder_health_alerts SET resolved_at=now()
+		WHERE recording_id=$1 AND signal='preopen_quality_gate' AND resolved_at IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM recording_preopen_checks
+		    WHERE recording_id=$1 AND window_start_at=$2 AND result<>'pass')
+	`, recordingID, windowStart); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "resolve recording pre-open alert")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit recording canary completion")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"recorded": true, "reflected": true, "window_start_at": windowStart, "stage": stage})
 }
 
 func (s *Server) handleNodeRecordingCanaryFinish(w http.ResponseWriter, r *http.Request) {

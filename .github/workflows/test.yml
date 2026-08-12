@@ -118,6 +118,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./cmd/stoaramactl -run TestSelectPreopenTargetsStagesRetriesAndNeverAfterOpen -count=1
+      - name: Test reservation-backed relay pre-open evidence
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api ./internal/db -run 'Test(RecordingCanaryCompletion|RecordingCanaryPreopenMigration)' -count=1
       - name: Test transient ledger retention boundaries
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

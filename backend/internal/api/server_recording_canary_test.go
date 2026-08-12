@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -283,5 +285,143 @@ func TestRecordingCanaryCheckAndFinishAreOwnerBound(t *testing.T) {
 	}
 	if rec := call(s.handleNodeRecordingCanaryCheck, 7, secondID); rec.Code != http.StatusConflict {
 		t.Fatalf("post-finish check status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRecordingCanaryCompletionPersistsExactDueStageAndResolvesAlert(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE recording_preopen_checks (
+		  recording_id BIGINT NOT NULL, window_start_at TIMESTAMPTZ NOT NULL,
+		  stage TEXT NOT NULL, checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  result TEXT NOT NULL, method TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+		  attempt_count INTEGER NOT NULL DEFAULT 1, next_retry_at TIMESTAMPTZ,
+		  PRIMARY KEY(recording_id,window_start_at,stage));
+		CREATE TABLE recorder_health_alerts (
+		  recording_id BIGINT NOT NULL, signal TEXT NOT NULL, first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  last_alerted_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ, PRIMARY KEY(recording_id,signal));
+		CREATE TABLE recording_canary_preopen_evidence (
+		  reservation_id UUID PRIMARY KEY, recording_id BIGINT NOT NULL, node_id BIGINT NOT NULL,
+		  account_id BIGINT NOT NULL, window_start_at TIMESTAMPTZ NOT NULL, stage TEXT NOT NULL,
+		  duration_ms BIGINT NOT NULL, size_bytes BIGINT NOT NULL, media_sha256 TEXT NOT NULL,
+		  video_codec TEXT NOT NULL, relay_version TEXT NOT NULL, source_revision TEXT NOT NULL,
+		  probe_ok BOOLEAN NOT NULL, decode_ok BOOLEAN NOT NULL, native_copy BOOLEAN NOT NULL,
+		  uploaded BOOLEAN NOT NULL, completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  reservation_created_at TIMESTAMPTZ NOT NULL);
+		INSERT INTO accounts(id) VALUES(42);
+		INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams)
+		VALUES(7,42,'relay','active',now(),2),(8,42,'relay','active',now(),2);
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via,mode,next_fire_at)
+		VALUES(11,42,7,'canary','https://example.test/live.m3u8','active',now()-interval '1 hour','relay','continuous',now()+interval '90 minutes');
+		INSERT INTO recorder_health_alerts(recording_id,signal,last_alerted_at) VALUES(11,'preopen_quality_gate',now());
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var reservation string
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_canary_reservations(recording_id,node_id,expires_at,window_start_at,preopen_stage) SELECT 11,7,now()+interval '3 minutes',next_fire_at,'early' FROM recordings WHERE id=11 RETURNING id::text`).Scan(&reservation); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	call := func(targetID, nodeID int64, targetReservation, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", fmt.Sprint(targetID))
+		rctx.URLParams.Add("reservationId", targetReservation)
+		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, rctx), nodePrincipalContextKey, nodePrincipal{NodeID: nodeID, AccountID: 42, NodeType: nodeTypeRelay}))
+		rec := httptest.NewRecorder()
+		s.handleNodeRecordingCanaryComplete(rec, req)
+		return rec
+	}
+	valid := fmt.Sprintf(`{"duration_ms":15000,"size_bytes":1234,"sha256":%q,"video_codec":"h264","probe_ok":true,"decode_ok":true,"native_copy":true,"uploaded":false,"relay_version":"a1adf4b9","source_revision":%q}`, strings.Repeat("a", 64), strings.Repeat("b", 40))
+	if rec := call(11, 8, reservation, valid); rec.Code != http.StatusConflict {
+		t.Fatalf("wrong owner status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := call(11, 7, reservation, strings.Replace(valid, `"native_copy":true`, `"native_copy":false`, 1)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("non-native status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// A check observed after the reservation started wins over its older proof.
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method,detail,attempt_count,next_retry_at) SELECT id,next_fire_at,'early','unknown','relay_canary','newer check',2,now()+interval '15 minutes' FROM recordings WHERE id=11`); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(11, 7, reservation, valid); rec.Code != http.StatusOK {
+		t.Fatalf("completion status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_canary_reservations WHERE id=$1`, reservation); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(11, 7, reservation, valid); rec.Code != http.StatusOK {
+		t.Fatalf("exact replay after finish status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	changed := strings.Replace(valid, `"size_bytes":1234`, `"size_bytes":1235`, 1)
+	if rec := call(11, 7, reservation, changed); rec.Code != http.StatusConflict {
+		t.Fatalf("changed replay status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var stage, result, method, detail string
+	var attempt int
+	if err := pool.QueryRow(ctx, `SELECT stage,result,method,detail,attempt_count FROM recording_preopen_checks WHERE recording_id=11`).Scan(&stage, &result, &method, &detail, &attempt); err != nil {
+		t.Fatal(err)
+	}
+	if stage != "early" || result != "unknown" || method != "relay_canary" || attempt != 2 || detail != "newer check" {
+		t.Fatalf("persisted stage=%s result=%s method=%s attempt=%d detail=%q", stage, result, method, attempt, detail)
+	}
+	var resolved *time.Time
+	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=11 AND signal='preopen_quality_gate'`).Scan(&resolved); err != nil || resolved != nil {
+		t.Fatalf("newer unknown alert was resolved: %v resolved=%v", err, resolved)
+	}
+	var canaryCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_canary_reservations WHERE id=$1`, reservation).Scan(&canaryCount); err != nil || canaryCount != 0 {
+		t.Fatalf("test finish did not delete reservation: count=%d err=%v", canaryCount, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_jobs`).Scan(&canaryCount); err != nil || canaryCount != 0 {
+		t.Fatalf("completion mutated jobs: count=%d err=%v", canaryCount, err)
+	}
+	concurrent := func(recID int64, bodies []string) []int {
+		if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via,mode,next_fire_at) VALUES($1,42,7,'concurrent','https://example.test/concurrent.m3u8','active',now()-interval '1 hour','relay','continuous',now()+interval '90 minutes')`, recID); err != nil {
+			t.Fatal(err)
+		}
+		var rid string
+		if err := pool.QueryRow(ctx, `INSERT INTO recording_canary_reservations(recording_id,node_id,expires_at,window_start_at,preopen_stage) SELECT $1,7,now()+interval '3 minutes',next_fire_at,'early' FROM recordings WHERE id=$1 RETURNING id::text`, recID).Scan(&rid); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		codes := make([]int, len(bodies))
+		var wg sync.WaitGroup
+		for i, body := range bodies {
+			wg.Add(1)
+			go func(i int, body string) { defer wg.Done(); <-start; codes[i] = call(recID, 7, rid, body).Code }(i, body)
+		}
+		close(start)
+		wg.Wait()
+		var facts int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_canary_preopen_evidence WHERE reservation_id=$1`, rid).Scan(&facts); err != nil || facts != 1 {
+			t.Fatalf("concurrent facts=%d err=%v", facts, err)
+		}
+		return codes
+	}
+	if codes := concurrent(13, []string{valid, valid}); codes[0] != http.StatusOK || codes[1] != http.StatusOK {
+		t.Fatalf("identical concurrency codes=%v", codes)
+	}
+	if codes := concurrent(14, []string{valid, changed}); !((codes[0] == http.StatusOK && codes[1] == http.StatusConflict) || (codes[1] == http.StatusOK && codes[0] == http.StatusConflict)) {
+		t.Fatalf("different concurrency codes=%v", codes)
+	}
+	// A fresh completion projects PASS and resolves its alert.
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via,mode,next_fire_at) VALUES(12,42,7,'fresh','https://example.test/live2.m3u8','active',now()-interval '1 hour','relay','continuous',now()+interval '90 minutes'); INSERT INTO recorder_health_alerts(recording_id,signal,last_alerted_at) VALUES(12,'preopen_quality_gate',now())`); err != nil {
+		t.Fatal(err)
+	}
+	var freshReservation string
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_canary_reservations(recording_id,node_id,expires_at,window_start_at,preopen_stage) SELECT 12,7,now()+interval '3 minutes',next_fire_at,'early' FROM recordings WHERE id=12 RETURNING id::text`).Scan(&freshReservation); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(12, 7, freshReservation, valid); rec.Code != http.StatusOK {
+		t.Fatalf("fresh completion status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var freshResult string
+	if err := pool.QueryRow(ctx, `SELECT result FROM recording_preopen_checks WHERE recording_id=12`).Scan(&freshResult); err != nil || freshResult != "pass" {
+		t.Fatalf("fresh result=%q err=%v", freshResult, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=12 AND signal='preopen_quality_gate'`).Scan(&resolved); err != nil || resolved == nil {
+		t.Fatalf("fresh alert unresolved: %v %v", err, resolved)
 	}
 }

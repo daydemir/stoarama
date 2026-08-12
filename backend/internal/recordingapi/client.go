@@ -135,6 +135,22 @@ type RecordingCanarySpec struct {
 	SafeUntil     time.Time `json:"safe_until"`
 }
 
+// RecordingCanaryResult is the bounded native-media proof produced by the
+// reservation owner. The server accepts it only while that exact reservation
+// is live and atomically records the matching pre-open PASS.
+type RecordingCanaryResult struct {
+	DurationMS     int64  `json:"duration_ms"`
+	SizeBytes      int64  `json:"size_bytes"`
+	SHA256         string `json:"sha256"`
+	VideoCodec     string `json:"video_codec"`
+	ProbeOK        bool   `json:"probe_ok"`
+	DecodeOK       bool   `json:"decode_ok"`
+	NativeCopy     bool   `json:"native_copy"`
+	Uploaded       bool   `json:"uploaded"`
+	RelayVersion   string `json:"relay_version"`
+	SourceRevision string `json:"source_revision"`
+}
+
 type SurrenderReason string
 
 const (
@@ -385,6 +401,15 @@ func (c *Client) FinishRecordingCanary(ctx context.Context, recordingID int64, r
 		return fmt.Errorf("recording id and reservation id are required")
 	}
 	return c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/finish", recordingID, url.PathEscape(strings.TrimSpace(reservationID))), map[string]any{}, nil)
+}
+
+// CompleteRecordingCanary atomically persists a reservation-backed pre-open
+// PASS. Finish releases the reservation on both success and failure.
+func (c *Client) CompleteRecordingCanary(ctx context.Context, recordingID int64, reservationID string, result RecordingCanaryResult) error {
+	if recordingID <= 0 || strings.TrimSpace(reservationID) == "" {
+		return fmt.Errorf("recording id and reservation id are required")
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/node/recordings/%d/canary-reservations/%s/complete", recordingID, url.PathEscape(strings.TrimSpace(reservationID))), result, nil)
 }
 
 func (c *Client) LeaseSurveyTargets(ctx context.Context, limit int) (SurveyLease, error) {
