@@ -103,6 +103,10 @@ func main() {
 		runRecordings(ctx, cfg, os.Args[2:])
 	case "nas-inventory":
 		runNASInventory(ctx, cfg, os.Args[2:])
+	case "nas-cleanup-verifier":
+		runNASCleanupVerifier(ctx, cfg, os.Args[2:])
+	case "nas-cleanup":
+		runNASCleanup(ctx, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -198,6 +202,8 @@ func usage() {
 	  stoaramactl recordings streak-priority report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-tracks report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl nas-inventory report --connection-id ID [--limit 50 --json]
+	  stoaramactl nas-cleanup-verifier run-once [--max-bytes 50000000000 --max-object-bytes 2147483648]
+	  stoaramactl nas-cleanup candidate-create --account-id ID --connection-id ID --recording-ids IDS --session-cookie-file FILE
 `)
 }
 

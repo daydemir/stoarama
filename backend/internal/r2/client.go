@@ -38,6 +38,17 @@ type Config struct {
 type ObjectHead struct {
 	ETag      string
 	SizeBytes int64
+	VersionID string
+}
+
+// ObjectReader is a streaming object response. Callers must close Body.
+// Metadata is captured from the same conditional GET that opened Body, so a
+// verifier never has to infer object identity from a separate request.
+type ObjectReader struct {
+	Body      io.ReadCloser
+	ETag      string
+	SizeBytes int64
+	VersionID string
 }
 
 type ObjectInfo struct {
@@ -200,7 +211,7 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength)}, nil
+	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: aws.ToString(out.VersionId)}, nil
 }
 
 func IsNotFound(err error) bool {
@@ -234,6 +245,29 @@ func (c *Client) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("open object %s: %w", key, err)
 	}
 	return out.Body, nil
+}
+
+// OpenIfMatch streams exactly the object represented by etag. S3/R2 rejects
+// the GET if the key changed after the caller's HEAD, closing the otherwise
+// unavoidable HEAD-to-GET race for byte-hash verification.
+func (c *Client) OpenIfMatch(ctx context.Context, key, etag, versionID string) (ObjectReader, error) {
+	in := &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}
+	if strings.TrimSpace(etag) != "" {
+		in.IfMatch = aws.String(strings.TrimSpace(etag))
+	}
+	if strings.TrimSpace(versionID) != "" {
+		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	out, err := c.s3.GetObject(ctx, in)
+	if err != nil {
+		return ObjectReader{}, fmt.Errorf("open conditional object %s: %w", key, err)
+	}
+	return ObjectReader{
+		Body:      out.Body,
+		ETag:      cleanETag(aws.ToString(out.ETag)),
+		SizeBytes: aws.ToInt64(out.ContentLength),
+		VersionID: aws.ToString(out.VersionId),
+	}, nil
 }
 
 func (c *Client) ListPrefix(ctx context.Context, prefix string, limit int, fn func(ObjectInfo) error) error {
