@@ -1235,7 +1235,8 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 		`CREATE TABLE recording_clips (
 			id BIGSERIAL PRIMARY KEY,
 			recording_job_id BIGINT NOT NULL,
-			capture_lease_token UUID
+			capture_lease_token UUID,
+			capture_sequence BIGINT
 		)`,
 		testRecordingCanaryReservationsTableDDL,
 		`CREATE TABLE storage_destinations (
