@@ -1114,20 +1114,46 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 "available": True, "total_bytes": 10**12,
                 "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES + 200,
             }))
-            self.assertFalse(pull.Runtime(cfg).capacity_blocked)
+            # Restart conservatively re-enters blocked hysteresis even after a
+            # clean unblock; only a fresh high-watermark stat reopens it.
+            self.assertTrue(pull.Runtime(cfg).capacity_blocked)
 
     def test_capacity_state_write_failure_remains_blocked(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = pull.Runtime(cfg)
-            storage = {
+            high = {
                 "available": True, "total_bytes": 10**13,
                 "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES + 200,
             }
+            self.assertTrue(runtime.reserve_storage(cfg, high))
+            low = {"available": True, "total_bytes": 10**13, "free_bytes": cfg.min_free_bytes - 1}
             with mock.patch.object(pull, "atomic_write", side_effect=OSError("state full")), self.assertRaisesRegex(OSError, "state full"):
-                runtime.reserve_storage(cfg, storage, 200)
+                runtime.reserve_storage(cfg, low)
             self.assertTrue(runtime.capacity_blocked)
             self.assertEqual(runtime.capacity_reserved_bytes, 0)
+            self.assertTrue(pull.Runtime(cfg).capacity_blocked)
+
+    def test_invalid_clip_size_never_downloads_releases_or_advances_cursor(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            runtime.cursor_id = 41
+            storage = {
+                "available": True, "total_bytes": 10**13,
+                "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES,
+            }
+            for invalid in (None, 0, -1, "100", True):
+                clip = {"clip_id": 42, "recording_id": 1, "size_bytes": invalid}
+                with self.subTest(size=invalid), mock.patch.object(pull, "storage_status", return_value=storage), mock.patch.object(
+                    pull, "request_json", return_value={"clips": [clip]}
+                ), mock.patch.object(pull, "process_clip") as process, mock.patch.object(
+                    pull, "release_clips"
+                ) as release:
+                    self.assertFalse(pull.drain_page(cfg, runtime))
+                    process.assert_not_called()
+                    release.assert_not_called()
+                    self.assertEqual(runtime.cursor_id, 41)
 
     def test_concurrent_capacity_reservations_cannot_cross_floor(self):
         with tempfile.TemporaryDirectory() as raw:

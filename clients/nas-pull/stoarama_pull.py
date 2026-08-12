@@ -849,8 +849,10 @@ class Runtime:
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
         self.storage_observed_monotonic = time.monotonic()
-        capacity = read_json(cfg.capacity_file, {})
-        self.capacity_blocked = bool(capacity.get("blocked", True))
+        # Restarts always re-enter the blocked side of hysteresis. A fresh high
+        # watermark stat must explicitly reopen admission, so a failed state
+        # write can never resurrect an older durable "unblocked" decision.
+        self.capacity_blocked = True
         self.capacity_reserved_bytes = 0
         self.batch = {
             "completed_at": None,
@@ -940,12 +942,10 @@ class Runtime:
             changed = self.capacity_blocked != was_blocked
             if not self.capacity_blocked:
                 self.capacity_reserved_bytes += expected_bytes
-            if changed:
+            if changed and self.capacity_blocked:
                 try:
-                    atomic_write(cfg.capacity_file, json.dumps({"blocked": self.capacity_blocked}).encode("utf-8"))
+                    atomic_write(cfg.capacity_file, b'{"blocked":true}')
                 except Exception:
-                    if not self.capacity_blocked:
-                        self.capacity_reserved_bytes = max(0, self.capacity_reserved_bytes - expected_bytes)
                     self.capacity_blocked = True
                     raise
         return not self.capacity_blocked
@@ -1060,7 +1060,9 @@ def require_storage_capacity(cfg, runtime, expected_bytes=0):
 
 
 def prepare_clip_with_capacity(cfg, runtime, clip):
-    expected_bytes = int(clip.get("size_bytes", 0))
+    expected_bytes = clip.get("size_bytes")
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes <= 0:
+        raise ValueError("clip %s has invalid positive size_bytes" % clip.get("clip_id", "?"))
     require_storage_capacity(cfg, runtime, expected_bytes)
     try:
         return process_clip(cfg, clip, False)
