@@ -2,8 +2,10 @@ package capture
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -319,6 +321,126 @@ printf '%s\n' '{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","
 	}
 }
 
+func TestTimestampFrameDurationSupportsCurrentAndLegacyFFprobeJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		json    string
+		want    int64
+		wantErr bool
+	}{
+		{name: "current duration", json: `{"duration":2048}`, want: 2048},
+		{name: "legacy packet duration", json: `{"pkt_duration":2048}`, want: 2048},
+		{name: "matching aliases", json: `{"duration":2048,"pkt_duration":2048}`, want: 2048},
+		{name: "conflicting aliases", json: `{"duration":2048,"pkt_duration":1024}`, wantErr: true},
+		{name: "missing", json: `{}`, wantErr: true},
+		{name: "noninteger", json: `{"duration":1.5}`, wantErr: true},
+		{name: "nonpositive", json: `{"duration":0}`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var frame struct {
+				Duration       json.Number `json:"duration"`
+				PacketDuration json.Number `json:"pkt_duration"`
+			}
+			if err := json.Unmarshal([]byte(test.json), &frame); err != nil {
+				t.Fatal(err)
+			}
+			got, err := timestampFrameDuration(frame.Duration, frame.PacketDuration)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("duration=%d want error", got)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("duration=%d err=%v want=%d", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestProbeTimestampContractParsesCapturedReleasedFFprobe81Output(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("testdata", "ffprobe-8.1.2-bframes-aac-native-copy.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fixture), `"duration":`) || strings.Contains(string(fixture), `"pkt_duration":`) {
+		t.Fatal("captured FFprobe 8.1 fixture must prove duration-only output")
+	}
+	if !strings.Contains(string(fixture), `"pict_type":"B"`) {
+		t.Fatal("captured fixture must retain B-frame evidence")
+	}
+	probe := filepath.Join(t.TempDir(), "ffprobe")
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\nprintf '%s\\n' \"$FFPROBE_CAPTURE_JSON\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
+	t.Setenv("FFPROBE_CAPTURE_JSON", string(fixture))
+	contract, err := probeTimestampContract(context.Background(), "captured-native-copy.mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contract.Tracks) != 2 {
+		t.Fatalf("tracks=%d want video+audio: %+v", len(contract.Tracks), contract)
+	}
+	video, audio := contract.Tracks[0], contract.Tracks[1]
+	if video.UnitCount != 3 || video.LastDuration != 1001 {
+		t.Fatalf("video timing=%+v", video)
+	}
+	if audio.UnitCount != 2 || audio.LastDuration != 1024 || audio.LastSampleCount != 1024 {
+		t.Fatalf("audio timing=%+v", audio)
+	}
+}
+
+func TestProbeTimestampContractWithCurrentFFprobeBFramesAndNativeCopy(t *testing.T) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe unavailable")
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.mp4")
+	nativeCopy := filepath.Join(dir, "native-copy.mp4")
+	encode := exec.Command(ffmpeg,
+		"-v", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30000/1001:duration=2",
+		"-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=2",
+		"-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-bf", "3", "-g", "30",
+		"-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", "-y", source,
+	)
+	if output, err := encode.CombinedOutput(); err != nil {
+		t.Fatalf("create B-frame fixture: %v (%s)", err, output)
+	}
+	remux := exec.Command(ffmpeg, "-v", "error", "-i", source, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-y", nativeCopy)
+	if output, err := remux.CombinedOutput(); err != nil {
+		t.Fatalf("create native-copy fixture: %v (%s)", err, output)
+	}
+	bFrames := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=pict_type", "-of", "csv=p=0", nativeCopy)
+	frameTypes, err := bFrames.Output()
+	if err != nil {
+		t.Fatalf("inspect B-frame fixture: %v", err)
+	}
+	if !strings.Contains(string(frameTypes), "B") {
+		t.Fatalf("fixture has no B-frames: %q", frameTypes)
+	}
+	t.Setenv("FFPROBE_BIN", ffprobe)
+	contract, err := probeTimestampContract(context.Background(), nativeCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contract.Tracks) != 2 {
+		t.Fatalf("tracks=%d want video+audio: %+v", len(contract.Tracks), contract)
+	}
+	for _, track := range contract.Tracks {
+		if track.UnitCount <= 1 || track.LastDuration <= 0 {
+			t.Fatalf("incomplete %s timing: %+v", track.MediaType, track)
+		}
+	}
+}
+
 func TestProbeTimestampContractRejectsMissingTerminalDuration(t *testing.T) {
 	probe := filepath.Join(t.TempDir(), "ffprobe-contract")
 	if err := os.WriteFile(probe, []byte("#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"index\":0,\"codec_type\":\"video\",\"codec_name\":\"h264\",\"time_base\":\"1/1000\"}],\"frames\":[{\"stream_index\":0,\"media_type\":\"video\",\"best_effort_timestamp\":0}]}'\n"), 0o755); err != nil {
@@ -327,6 +449,49 @@ func TestProbeTimestampContractRejectsMissingTerminalDuration(t *testing.T) {
 	t.Setenv("FFPROBE_BIN", probe)
 	if _, err := probeTimestampContract(context.Background(), "clip.mp4"); err == nil || !strings.Contains(err.Error(), "terminal duration") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestFinalizeTimestampDurationAmbiguityIsUnknownWithoutDroppingMedia(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame string
+	}{
+		{name: "missing", frame: `{"stream_index":0,"media_type":"video","best_effort_timestamp":0}`},
+		{name: "conflicting aliases", frame: `{"stream_index":0,"media_type":"video","best_effort_timestamp":0,"duration":1000,"pkt_duration":999}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			probe := filepath.Join(dir, "ffprobe")
+			script := `#!/bin/sh
+case " $* " in
+  *" -show_frames "*)
+    printf '%s\n' '{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","time_base":"1/1000"}],"frames":[` + test.frame + `]}'
+    ;;
+  *)
+    printf '%s\n' '{"format":{"duration":"1.0"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","time_base":"1/1000"}]}'
+    ;;
+esac`
+			if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FFPROBE_BIN", probe)
+			path := filepath.Join(dir, "seg-20260812-120000.mp4")
+			if err := os.WriteFile(path, []byte("valid-media"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			seg, err := finalizeSegmentWithTimestampContract(context.Background(), path, time.Second, true)
+			if err != nil {
+				t.Fatalf("valid media was dropped: %v", err)
+			}
+			if seg.TimestampContract != nil || seg.TimestampContractStatus != TimestampProbeUnknown || seg.TimestampContractReason != "missing_terminal_duration" {
+				t.Fatalf("ambiguous evidence was not UNKNOWN: %+v", seg)
+			}
+			if body, err := os.ReadFile(path); err != nil || string(body) != "valid-media" {
+				t.Fatalf("finalized media changed: body=%q err=%v", body, err)
+			}
+		})
 	}
 }
 

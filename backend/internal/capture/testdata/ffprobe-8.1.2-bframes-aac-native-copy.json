@@ -1,0 +1,40 @@
+{
+  "capture": {
+    "tool": "released relay FFprobe 8.1.2",
+    "source": "H.264 B-frame + AAC MP4 remuxed with -c copy"
+  },
+  "streams": [
+    {
+      "index": 0,
+      "codec_name": "h264",
+      "profile": "High",
+      "codec_type": "video",
+      "codec_tag_string": "avc1",
+      "width": 64,
+      "height": 64,
+      "pix_fmt": "yuv420p",
+      "level": 10,
+      "time_base": "1/30000",
+      "extradata": "\n00000000: 0164 000a ffe1 0016 6764 000a acd9 4426  .d......gd....D&\n00000010: c044 0000 0fa4 0003 a980 3c48 9658 0100  .D........<H.X..\n00000020: 0668 ebe3 cb22 c0fd f8f8 00              .h...\".....\n"
+    },
+    {
+      "index": 1,
+      "codec_name": "aac",
+      "profile": "LC",
+      "codec_type": "audio",
+      "codec_tag_string": "mp4a",
+      "sample_rate": "48000",
+      "channels": 1,
+      "channel_layout": "mono",
+      "time_base": "1/48000",
+      "extradata": "\n00000000: 1188 56e5 00                             ..V..\n"
+    }
+  ],
+  "frames": [
+    {"media_type":"video","stream_index":0,"pkt_dts":0,"best_effort_timestamp":0,"duration":1001,"pict_type":"I"},
+    {"media_type":"video","stream_index":0,"pkt_dts":1001,"best_effort_timestamp":1001,"duration":1001,"pict_type":"B"},
+    {"media_type":"video","stream_index":0,"pkt_dts":2002,"best_effort_timestamp":2002,"duration":1001,"pict_type":"B"},
+    {"media_type":"audio","stream_index":1,"pkt_dts":0,"best_effort_timestamp":0,"duration":1024,"nb_samples":1024},
+    {"media_type":"audio","stream_index":1,"pkt_dts":1024,"best_effort_timestamp":1024,"duration":1024,"nb_samples":1024}
+  ]
+}
