@@ -86,6 +86,7 @@ type Worker struct {
 	cfg               Config
 	heartbeatInt      time.Duration
 	leaseSafetyMargin time.Duration
+	reconnectDelay    func(int64, int) time.Duration
 	lastDiskPauseLog  time.Time
 	lastDiskErrorLog  atomic.Int64
 }
@@ -143,6 +144,7 @@ func NewWorker(cfg Config) (*Worker, error) {
 		cfg:               cfg,
 		heartbeatInt:      time.Duration(cfg.HeartbeatSec) * time.Second,
 		leaseSafetyMargin: 5 * time.Second,
+		reconnectDelay:    reconnectBackoff,
 	}, nil
 }
 
@@ -597,7 +599,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "resolve_retry", err)
 			failures++
-			delay := reconnectBackoff(job.JobID, failures)
+			delay := w.nextReconnectDelay(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
@@ -621,7 +623,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "ssrf_retry", err)
 			failures++
-			delay := reconnectBackoff(job.JobID, failures)
+			delay := w.nextReconnectDelay(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
@@ -645,7 +647,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "mktemp_retry", err)
 			failures++
-			delay := reconnectBackoff(job.JobID, failures)
+			delay := w.nextReconnectDelay(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous mktemp failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
@@ -769,7 +771,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			failures = 0
 		}
 		failures++
-		delay := reconnectBackoff(job.JobID, failures)
+		delay := w.nextReconnectDelay(job.JobID, failures)
 		if captureErr != nil {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "capture_retry", captureErr)
 		} else {
@@ -1088,6 +1090,13 @@ const continuousReconnectMaxDelay = 30 * time.Second
 // failure on the old multi-minute backoff.
 func reconnectBackoff(jobID int64, failures int) time.Duration {
 	return reconnectBackoffFor(jobID, failures, 2*time.Second, continuousReconnectMaxDelay)
+}
+
+func (w *Worker) nextReconnectDelay(jobID int64, failures int) time.Duration {
+	if w.reconnectDelay == nil {
+		return reconnectBackoff(jobID, failures)
+	}
+	return w.reconnectDelay(jobID, failures)
 }
 
 func reconnectBackoffFor(jobID int64, failures int, base, maxDelay time.Duration) time.Duration {

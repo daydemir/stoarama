@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -695,6 +695,7 @@ func TestReconnectBackoff(t *testing.T) {
 		{failures: 1, min: time.Second, max: 2 * time.Second},
 		{failures: 2, min: 2 * time.Second, max: 4 * time.Second},
 		{failures: 3, min: 4 * time.Second, max: 8 * time.Second},
+		{failures: 5, min: 15 * time.Second, max: 30 * time.Second},
 		{failures: 6, min: 15 * time.Second, max: 30 * time.Second},
 		{failures: 9, min: 15 * time.Second, max: 30 * time.Second},
 		{failures: 100, min: 15 * time.Second, max: 30 * time.Second},
@@ -713,54 +714,100 @@ func TestReconnectBackoff(t *testing.T) {
 	}
 }
 
-// TestContinuousReconnectRecoversWhenHLSReturns verifies the production retry
-// policy against a fake HLS origin that is unavailable long enough to hit the
-// cap, then becomes live. Durations are scaled down; reconnectBackoffFor is the
-// same implementation used by the worker's supervisor loop.
+// TestContinuousReconnectRecoversWhenHLSReturns drives processContinuousJob's
+// real resolve -> SSRF gate -> CaptureContinuous -> delivery -> complete path.
+// The fake ffmpeg reports seven HLS 404s, then emits native-copy-shaped MP4
+// segments and stays live until the window closes. Only retry time is scaled.
 func TestContinuousReconnectRecoversWhenHLSReturns(t *testing.T) {
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) <= 7 {
-			http.NotFound(w, nil)
-			return
+	realFFmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	temp := t.TempDir()
+	attemptsPath := filepath.Join(temp, "attempts")
+	argsPath := filepath.Join(temp, "args")
+	fakeFFmpeg := filepath.Join(temp, "ffmpeg")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FFMPEG_ARGS"
+n=0
+test ! -f "$FFMPEG_ATTEMPTS" || n=$(cat "$FFMPEG_ATTEMPTS")
+n=$((n+1))
+printf '%s' "$n" > "$FFMPEG_ATTEMPTS"
+if test "$n" -le 7; then
+  echo 'Error opening input: Server returned 404 Not Found' >&2
+  exit 8
+fi
+for last do :; done
+out=${last%/*}
+"$REAL_FFMPEG" -loglevel error -f lavfi -i color=c=red:s=64x64:d=0.3 -an -c:v libx264 -pix_fmt yuv420p -y "$out/seg-20260812-120000.mp4"
+"$REAL_FFMPEG" -loglevel error -f lavfi -i color=c=blue:s=64x64:d=0.3 -an -c:v libx264 -pix_fmt yuv420p -y "$out/seg-20260812-120001.mp4"
+trap 'exit 0' INT TERM
+while :; do sleep .1; done
+`
+	if err := os.WriteFile(fakeFFmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFMPEG_BIN", fakeFFmpeg)
+	t.Setenv("REAL_FFMPEG", realFFmpeg)
+	t.Setenv("FFMPEG_ATTEMPTS", attemptsPath)
+	t.Setenv("FFMPEG_ARGS", argsPath)
+
+	var ingested atomic.Int32
+	var completed atomic.Bool
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			_, _ = fmt.Fprintf(w, `{"lease_expires_at":%q}`, time.Now().Add(time.Minute).Format(time.RFC3339Nano))
+		case r.URL.Path == "/api/v1/recording/upload-intents":
+			_, _ = fmt.Fprintf(w, `{"intent_id":"intent-%d","upload_url":%q,"expires_at":%q}`, ingested.Load()+1, server.URL+"/upload", time.Now().Add(time.Hour).Format(time.RFC3339Nano))
+		case r.URL.Path == "/upload":
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v1/recording/clips/ingest":
+			id := ingested.Add(1)
+			_, _ = fmt.Fprintf(w, `{"clip_id":%d}`, id)
+		case strings.HasSuffix(r.URL.Path, "/complete"):
+			completed.Store(true)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			http.NotFound(w, r)
 		}
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:42\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n"))
 	}))
 	defer server.Close()
-
-	client := server.Client()
-	started := time.Now()
-	for failure := 1; ; failure++ {
-		resp, err := client.Get(server.URL + "/live.m3u8")
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if resp.StatusCode == http.StatusOK {
-			if !strings.Contains(string(body), "#EXT-X-MEDIA-SEQUENCE:42") {
-				t.Fatalf("recovered response is not the live HLS manifest: %q", body)
-			}
-			break
-		}
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("status=%d want 404", resp.StatusCode)
-		}
-		delay := reconnectBackoffFor(438, failure, time.Millisecond, 10*time.Millisecond)
-		if delay > 10*time.Millisecond {
-			t.Fatalf("retry delay=%s exceeds cap", delay)
-		}
-		time.Sleep(delay)
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "test"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := requests.Load(); got != 8 {
-		t.Fatalf("requests=%d want 8", got)
+	worker, err := NewWorker(Config{Client: client, HeartbeatSec: 1, CaptureTempDir: temp, UploadWorkers: 1})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("recovery took %s with scaled 10ms cap", elapsed)
+	worker.reconnectDelay = func(jobID int64, failures int) time.Duration {
+		return reconnectBackoffFor(jobID, failures, time.Millisecond, 10*time.Millisecond)
+	}
+	windowEnd := time.Now().Add(4 * time.Second)
+	worker.processContinuousJob(context.Background(), recordingapi.RecordingJob{
+		JobID: 438, RecordingID: 438, SourceURL: "https://example.com/live.m3u8",
+		ClipDurationSec: 1, LeaseExpiresAt: time.Now().Add(time.Minute), LeaseToken: "lease",
+		Kind: "continuous_window", WindowEndAt: &windowEnd,
+	})
+	attemptData, err := os.ReadFile(attemptsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(attemptData)); got != "8" {
+		t.Fatalf("ffmpeg attempts=%s want 8", got)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args := string(argsData); !strings.Contains(args, " -c copy ") || strings.Contains(args, "libx264") {
+		t.Fatalf("production capture did not stay on native stream-copy args: %q", args)
+	}
+	if ingested.Load() == 0 || !completed.Load() {
+		t.Fatalf("ingested=%d completed=%v, want recovered media and completed window", ingested.Load(), completed.Load())
 	}
 }
 
