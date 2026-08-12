@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +21,6 @@ import (
 type captureBackfillMissingCandidate struct {
 	Stream          model.Stream `json:"stream"`
 	CapturesSuccess int64        `json:"captures_success"`
-	LatestFrameURL  string       `json:"latest_frame_url,omitempty"`
 	BackfillReason  string       `json:"backfill_reason,omitempty"`
 }
 
@@ -32,14 +33,53 @@ type captureBackfillMissingResult struct {
 	CaptureType     string    `json:"capture_type"`
 	ExecutionClass  string    `json:"execution_class"`
 	EffectiveMode   string    `json:"effective_mode"`
-	ResolvedURL     string    `json:"resolved_url,omitempty"`
 	CapturedAt      time.Time `json:"captured_at,omitempty"`
 	Width           int       `json:"width,omitempty"`
 	Height          int       `json:"height,omitempty"`
 	SizeBytes       int64     `json:"size_bytes,omitempty"`
 	CapturesSuccess int64     `json:"captures_success"`
-	LatestFrameURL  string    `json:"latest_frame_url,omitempty"`
 	BackfillReason  string    `json:"backfill_reason,omitempty"`
+}
+
+type streamIDFlags []int64
+
+const maxFrameRefreshConcurrency = 4
+const maxExplicitFrameRefreshStreams = 50
+
+func (v *streamIDFlags) String() string { return fmt.Sprint([]int64(*v)) }
+func (v *streamIDFlags) Set(raw string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("stream id must be a positive integer")
+	}
+	*v = append(*v, id)
+	return nil
+}
+
+func validateCaptureBackfillOptions(limit, concurrency int, ids []int64) error {
+	if limit < 0 {
+		return fmt.Errorf("--limit must be >= 0")
+	}
+	if concurrency < 1 || concurrency > maxFrameRefreshConcurrency {
+		return fmt.Errorf("--concurrency must be 1..%d", maxFrameRefreshConcurrency)
+	}
+	if len(ids) > maxExplicitFrameRefreshStreams {
+		return fmt.Errorf("at most %d --stream-id values are allowed", maxExplicitFrameRefreshStreams)
+	}
+	if len(ids) > 0 && limit > 0 {
+		return fmt.Errorf("--limit cannot be combined with --stream-id")
+	}
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return fmt.Errorf("stream ids must be positive")
+		}
+		if seen[id] {
+			return fmt.Errorf("duplicate --stream-id %d", id)
+		}
+		seen[id] = true
+	}
+	return nil
 }
 
 type captureBackfillMissingReport struct {
@@ -59,7 +99,9 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "service token")
 	limit := fs.Int("limit", 0, "maximum streams to process (0=unlimited)")
-	concurrency := fs.Int("concurrency", 4, "parallel stream workers")
+	concurrency := fs.Int("concurrency", 1, "parallel stream workers")
+	var streamIDs streamIDFlags
+	fs.Var(&streamIDs, "stream-id", "explicit stream id to refresh (repeatable; includes streams with existing frames)")
 	timeoutSec := fs.Int("timeout-sec", 90, "per-stream resolution/capture timeout seconds")
 	dryRun := fs.Bool("dry-run", false, "print actions without ingesting frames")
 	asJSON := fs.Bool("json", false, "print JSON")
@@ -73,11 +115,8 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	if token == "" {
 		log.Fatalf("--api-token is required")
 	}
-	if *limit < 0 {
-		log.Fatalf("--limit must be >= 0")
-	}
-	if *concurrency <= 0 {
-		log.Fatalf("--concurrency must be > 0")
+	if err := validateCaptureBackfillOptions(*limit, *concurrency, streamIDs); err != nil {
+		log.Fatal(err)
 	}
 	if *timeoutSec <= 0 {
 		log.Fatalf("--timeout-sec must be > 0")
@@ -92,7 +131,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 		log.Fatalf("init capture registry: %v", err)
 	}
 
-	targets, err := loadCaptureBackfillMissingTargets(ctx, baseURL, token, *limit)
+	targets, err := loadCaptureBackfillMissingTargets(ctx, baseURL, token, *limit, streamIDs)
 	if err != nil {
 		log.Fatalf("load backfill targets: %v", err)
 	}
@@ -142,9 +181,9 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 		if !*asJSON {
 			switch res.Status {
 			case "success":
-				fmt.Printf("stream_id=%d slug=%s status=success mode=%s resolved_url=%s\n", res.StreamID, res.Slug, res.EffectiveMode, res.ResolvedURL)
+				fmt.Printf("stream_id=%d slug=%s status=success mode=%s\n", res.StreamID, res.Slug, res.EffectiveMode)
 			case "dry_run":
-				fmt.Printf("stream_id=%d slug=%s status=dry_run mode=%s resolved_url=%s\n", res.StreamID, res.Slug, res.EffectiveMode, res.ResolvedURL)
+				fmt.Printf("stream_id=%d slug=%s status=dry_run mode=%s\n", res.StreamID, res.Slug, res.EffectiveMode)
 			default:
 				fmt.Printf("stream_id=%d slug=%s status=%s reason=%s\n", res.StreamID, res.Slug, res.Status, res.Reason)
 			}
@@ -176,7 +215,6 @@ func processCaptureBackfillMissingTarget(
 		Slug:            strings.TrimSpace(stream.Slug),
 		Provider:        strings.TrimSpace(stream.Provider),
 		CapturesSuccess: target.CapturesSuccess,
-		LatestFrameURL:  strings.TrimSpace(target.LatestFrameURL),
 		BackfillReason:  strings.TrimSpace(target.BackfillReason),
 	}
 	if stream.ID <= 0 {
@@ -212,11 +250,9 @@ func processCaptureBackfillMissingTarget(
 	cancelResolve()
 	if err != nil {
 		result.Status = "error"
-		result.Reason = fmt.Sprintf("resolve capture source: %v", err)
+		result.Reason = "resolve capture source failed"
 		return result
 	}
-	result.ResolvedURL = resolved.URL
-
 	capCtx, cancelCap := context.WithTimeout(ctx, timeout)
 	defer cancelCap()
 	var frame capture.Frame
@@ -227,7 +263,7 @@ func processCaptureBackfillMissingTarget(
 	}
 	if err != nil {
 		result.Status = "error"
-		result.Reason = fmt.Sprintf("capture frame: %v", err)
+		result.Reason = "capture frame failed"
 		return result
 	}
 	result.CapturedAt = time.Now().UTC()
@@ -253,20 +289,28 @@ func processCaptureBackfillMissingTarget(
 		RecordingHeartbeat: false,
 	}); err != nil {
 		result.Status = "error"
-		result.Reason = fmt.Sprintf("ingest capture success: %v", err)
+		result.Reason = "ingest capture success failed"
 		return result
 	}
 	result.Status = "success"
 	return result
 }
 
-func loadCaptureBackfillMissingTargets(ctx context.Context, baseURL, apiToken string, limit int) ([]captureBackfillMissingCandidate, error) {
+func loadCaptureBackfillMissingTargets(ctx context.Context, baseURL, apiToken string, limit int, explicitIDs []int64) ([]captureBackfillMissingCandidate, error) {
 	const pageSize = 500
 	out := make([]captureBackfillMissingCandidate, 0, 512)
+	explicitSelection := len(explicitIDs) > 0
+	wanted := make(map[int64]bool, len(explicitIDs))
+	for _, id := range explicitIDs {
+		if wanted[id] {
+			return nil, fmt.Errorf("duplicate --stream-id %d", id)
+		}
+		wanted[id] = true
+	}
 	offset := 0
 	for {
 		remaining := pageSize
-		if limit > 0 && limit-len(out) < remaining {
+		if len(wanted) == 0 && limit > 0 && limit-len(out) < remaining {
 			remaining = limit - len(out)
 		}
 		if remaining <= 0 {
@@ -285,22 +329,42 @@ func loadCaptureBackfillMissingTargets(ctx context.Context, baseURL, apiToken st
 				return nil, fmt.Errorf("decode dashboard stream item: %w", err)
 			}
 			capturesSuccess := int64FromAny(item["captures_success"])
-			if capturesSuccess > 0 {
+			explicit := wanted[stream.ID]
+			if explicitSelection && !explicit {
 				continue
+			}
+			if !explicit && capturesSuccess > 0 {
+				continue
+			}
+			reason := "zero_success"
+			if explicit {
+				reason = "explicit_refresh"
 			}
 			out = append(out, captureBackfillMissingCandidate{
 				Stream:          stream,
 				CapturesSuccess: capturesSuccess,
-				BackfillReason:  "zero_success",
+				BackfillReason:  reason,
 			})
+			delete(wanted, stream.ID)
+			if explicitSelection && len(wanted) == 0 {
+				return out, nil
+			}
 			if limit > 0 && len(out) >= limit {
 				return out, nil
 			}
 		}
-		if len(items) < remaining {
+		if len(items) < remaining || (len(explicitIDs) > 0 && len(wanted) == 0) {
 			break
 		}
 		offset += len(items)
+	}
+	if len(wanted) > 0 {
+		missing := make([]int64, 0, len(wanted))
+		for id := range wanted {
+			missing = append(missing, id)
+		}
+		sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+		return nil, fmt.Errorf("stream ids not found: %v", missing)
 	}
 	return out, nil
 }
