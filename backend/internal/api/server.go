@@ -2856,6 +2856,10 @@ type captureIngestRequest struct {
 
 const authoritativeFrameMaxBytes = 8 << 20
 
+func (req captureIngestRequest) hasNonAuthoritativeFrameFields() bool {
+	return req.RecordingHeartbeat || strings.TrimSpace(req.UploadIntentID) != "" || strings.TrimSpace(req.ObjectKey) != "" || req.SegmentStartAt != nil || req.SegmentEndAt != nil || strings.TrimSpace(req.CaptureError) != "" || strings.TrimSpace(req.ErrorText) != "" || strings.TrimSpace(req.ThumbnailBase64) != "" || strings.TrimSpace(req.ThumbnailIntentID) != "" || strings.TrimSpace(req.ThumbnailObjectKey) != "" || strings.ToLower(strings.TrimSpace(req.Status)) != "success"
+}
+
 func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 	var req captureIngestRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
@@ -3070,7 +3074,7 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 			return
 		}
 	}
-	if req.RecordingHeartbeat || strings.TrimSpace(req.UploadIntentID) != "" || strings.TrimSpace(req.ObjectKey) != "" || req.SegmentStartAt != nil || req.SegmentEndAt != nil || strings.TrimSpace(req.CaptureError) != "" || strings.TrimSpace(req.ErrorText) != "" || strings.TrimSpace(req.ThumbnailBase64) != "" || strings.TrimSpace(req.ThumbnailIntentID) != "" || strings.TrimSpace(req.ThumbnailObjectKey) != "" || strings.ToLower(strings.TrimSpace(req.Status)) != "success" {
+	if req.hasNonAuthoritativeFrameFields() {
 		util.WriteError(w, http.StatusBadRequest, "authoritative frame ingest accepts only a non-heartbeat frame success")
 		return
 	}
@@ -3078,11 +3082,12 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, "authoritative frame captured_at must be current")
 		return
 	}
-	if strings.TrimSpace(req.MimeType) != "image/jpeg" || len(req.FrameBase64) == 0 || len(req.FrameBase64) > (authoritativeFrameMaxBytes*4/3)+8 {
+	frameBase64 := strings.TrimSpace(req.FrameBase64)
+	if strings.TrimSpace(req.MimeType) != "image/jpeg" || len(frameBase64) == 0 || len(frameBase64) > (authoritativeFrameMaxBytes*4/3)+8 {
 		util.WriteError(w, http.StatusBadRequest, "authoritative frame must be a bounded JPEG")
 		return
 	}
-	frameBytes, err := base64.StdEncoding.DecodeString(req.FrameBase64)
+	frameBytes, err := base64.StdEncoding.DecodeString(frameBase64)
 	if err != nil || len(frameBytes) == 0 || len(frameBytes) > authoritativeFrameMaxBytes {
 		util.WriteError(w, http.StatusBadRequest, "invalid authoritative frame payload")
 		return

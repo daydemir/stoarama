@@ -128,6 +128,9 @@ func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) er
 	if len(req.FrameBytes) == 0 {
 		return fmt.Errorf("frame bytes are empty")
 	}
+	if req.AuthoritativeFrameOnly && req.AccountID <= 0 {
+		return fmt.Errorf("account_id must be > 0 for authoritative frame ingest")
+	}
 	if req.CapturedAt.IsZero() {
 		req.CapturedAt = time.Now().UTC()
 	}

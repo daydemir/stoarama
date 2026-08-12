@@ -35,7 +35,7 @@ func TestValidateCaptureBackfillOptionsBoundsWork(t *testing.T) {
 	for i := range ids50 {
 		ids50[i] = int64(i + 1)
 	}
-	if err := validateCaptureBackfillOptions(0, 1, ids50); err != nil {
+	if err := validateCaptureBackfillOptions(0, 1, ids50, false, 47); err != nil {
 		t.Fatalf("valid boundary: %v", err)
 	}
 	for _, tc := range []struct {
@@ -53,10 +53,29 @@ func TestValidateCaptureBackfillOptionsBoundsWork(t *testing.T) {
 		{"limit with ids", 1, 1, []int64{7}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateCaptureBackfillOptions(tc.limit, tc.concurrency, tc.ids); err == nil {
+			if err := validateCaptureBackfillOptions(tc.limit, tc.concurrency, tc.ids, true, 0); err == nil {
 				t.Fatal("invalid options accepted")
 			}
 		})
+	}
+	for _, tc := range []struct {
+		name      string
+		ids       []int64
+		dryRun    bool
+		accountID int64
+	}{
+		{"non-dry-run without ids", nil, false, 0},
+		{"non-dry-run without account", []int64{7}, false, 0},
+		{"account without ids", nil, true, 47},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateCaptureBackfillOptions(0, 1, tc.ids, tc.dryRun, tc.accountID); err == nil {
+				t.Fatal("invalid authoritative options accepted")
+			}
+		})
+	}
+	if err := validateCaptureBackfillOptions(0, 1, nil, true, 0); err != nil {
+		t.Fatalf("bulk dry-run rejected: %v", err)
 	}
 }
 

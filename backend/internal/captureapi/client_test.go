@@ -25,7 +25,7 @@ func TestAuthoritativeFramePayloadCarriesAccountHashAndNoHeartbeat(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = client.IngestSuccess(context.Background(), IngestSuccessRequest{AccountID: 47, StreamID: 123, CapturedAt: time.Now(), SourceKind: "backfill_missing_frame", EffectiveMode: capture.ModeHLSLive, MIMEType: "image/jpeg", FrameBytes: []byte{1, 2, 3}, FrameSHA256: strings.Repeat("a", 64), AuthoritativeFrameOnly: true})
+	err = client.IngestSuccess(context.Background(), IngestSuccessRequest{AccountID: 47, StreamID: 123, CapturedAt: time.Now(), SourceKind: "backfill_missing_frame", EffectiveMode: capture.ModeHLSLive, ResolvedURL: "https://source.example/live.m3u8?token=secret", MIMEType: "image/jpeg", FrameBytes: []byte{1, 2, 3}, FrameSHA256: strings.Repeat("a", 64), AuthoritativeFrameOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +37,9 @@ func TestAuthoritativeFramePayloadCarriesAccountHashAndNoHeartbeat(t *testing.T)
 	}
 	if _, ok := payload["execution_class"]; ok {
 		t.Fatal("authoritative payload carried execution_class")
+	}
+	if err = client.IngestSuccess(context.Background(), IngestSuccessRequest{StreamID: 123, FrameBytes: []byte{1}, AuthoritativeFrameOnly: true}); err == nil || !strings.Contains(err.Error(), "account_id") {
+		t.Fatalf("missing account validation err=%v", err)
 	}
 }
 

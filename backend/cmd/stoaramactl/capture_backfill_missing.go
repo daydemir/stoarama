@@ -56,7 +56,7 @@ func (v *streamIDFlags) Set(raw string) error {
 	return nil
 }
 
-func validateCaptureBackfillOptions(limit, concurrency int, ids []int64) error {
+func validateCaptureBackfillOptions(limit, concurrency int, ids []int64, dryRun bool, accountID int64) error {
 	if limit < 0 {
 		return fmt.Errorf("--limit must be >= 0")
 	}
@@ -68,6 +68,15 @@ func validateCaptureBackfillOptions(limit, concurrency int, ids []int64) error {
 	}
 	if len(ids) > 0 && limit > 0 {
 		return fmt.Errorf("--limit cannot be combined with --stream-id")
+	}
+	if !dryRun && len(ids) == 0 {
+		return fmt.Errorf("non-dry-run refresh requires explicit --stream-id values")
+	}
+	if !dryRun && accountID <= 0 {
+		return fmt.Errorf("--account-id is required for authoritative frame ingest")
+	}
+	if len(ids) == 0 && accountID != 0 {
+		return fmt.Errorf("--account-id requires explicit --stream-id values")
 	}
 	seen := make(map[int64]bool, len(ids))
 	for _, id := range ids {
@@ -116,11 +125,8 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	if token == "" {
 		log.Fatalf("--api-token is required")
 	}
-	if err := validateCaptureBackfillOptions(*limit, *concurrency, streamIDs); err != nil {
+	if err := validateCaptureBackfillOptions(*limit, *concurrency, streamIDs, *dryRun, *accountID); err != nil {
 		log.Fatal(err)
-	}
-	if len(streamIDs) > 0 && !*dryRun && *accountID <= 0 {
-		log.Fatal("--account-id is required for explicit authoritative frame ingest")
 	}
 	if *timeoutSec <= 0 {
 		log.Fatalf("--timeout-sec must be > 0")

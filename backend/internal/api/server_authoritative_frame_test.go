@@ -34,21 +34,31 @@ func TestAuthoritativeFrameHandlerRejectsHeartbeatAndWrongAccount(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := func(account int64, heartbeat bool) *http.Request {
-		raw, _ := json.Marshal(map[string]any{"account_id": account, "stream_id": 9, "status": "success", "captured_at": time.Now().UTC(), "mime_type": "image/jpeg", "frame_base64": base64.StdEncoding.EncodeToString(buf.Bytes()), "frame_sha256": frame.SHA256, "recording_heartbeat": heartbeat, "authoritative_frame_only": true})
+	body := func(account int64, heartbeat bool, frameSHA string) *http.Request {
+		raw, _ := json.Marshal(map[string]any{"account_id": account, "stream_id": 9, "status": "success", "captured_at": time.Now().UTC(), "mime_type": "image/jpeg", "frame_base64": base64.StdEncoding.EncodeToString(buf.Bytes()), "frame_sha256": frameSHA, "recording_heartbeat": heartbeat, "authoritative_frame_only": true})
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/capture/ingest", bytes.NewReader(raw))
 		return req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{AccountID: 47, NodeType: nodeTypeLocalRecorder}))
 	}
 	s := &Server{}
 	rr := httptest.NewRecorder()
-	s.handleCaptureIngest(rr, body(47, true))
+	s.handleCaptureIngest(rr, body(47, true, frame.SHA256))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("heartbeat status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	rr = httptest.NewRecorder()
-	s.handleCaptureIngest(rr, body(48, false))
+	s.handleCaptureIngest(rr, body(48, false, frame.SHA256))
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("account status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	s.handleCaptureIngest(rr, body(0, false, frame.SHA256))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("missing account status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	s.handleCaptureIngest(rr, body(47, false, strings.Repeat("0", 64)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("wrong sha status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
