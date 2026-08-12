@@ -80,7 +80,11 @@ never authorize purge.
 
 Rank only paused recordings, prioritizing low completed-window coverage and
 meaningful bytes while retaining unique historical scenes unless Deniz chooses
-otherwise. One recording per initial plan keeps review comprehensible. Current
+otherwise. Membership in SDOT or removal from the live roster is never cleanup
+evidence: preserve all clips/evidence needed to audit qualification streaks and
+the dynamic 60-candidate reserve. Cleanup considers only separately obsolete,
+low-quality recordings after exact evidence and digest approval. One recording
+per initial plan keeps review comprehensible. Current
 mutable evidence shows the complete small validation cohort is about 33.28 GB;
 that is useful to validate the workflow but does not solve current NAS runway.
 No candidate is called safe until the complete-scan, fresh-rehash and R2
