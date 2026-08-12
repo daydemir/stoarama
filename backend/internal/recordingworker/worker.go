@@ -86,6 +86,7 @@ type Worker struct {
 	cfg               Config
 	heartbeatInt      time.Duration
 	leaseSafetyMargin time.Duration
+	reconnectDelay    func(int64, int) time.Duration
 	lastDiskPauseLog  time.Time
 	lastDiskErrorLog  atomic.Int64
 }
@@ -143,6 +144,7 @@ func NewWorker(cfg Config) (*Worker, error) {
 		cfg:               cfg,
 		heartbeatInt:      time.Duration(cfg.HeartbeatSec) * time.Second,
 		leaseSafetyMargin: 5 * time.Second,
+		reconnectDelay:    reconnectBackoff,
 	}, nil
 }
 
@@ -568,10 +570,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// restarts must NOT consume attempt_count, so fail() is never called for a
 	// resolve/capture drop here; the job only fails on a permanent misconfiguration.
 	// Jittered exponential reconnect backoff gives transient drops a fast retry and
-	// grows to a five-minute cap so a persistently dead source is not hammered,
+	// grows to a 30-second cap so a persistently dead source is not hammered,
 	// while an attempt that ingested at least one clip resets failures to zero. The
-	// sleep stays interruptible by windowCtx.Done() (window close / job cancel) just
-	// like a fixed delay.
+	// separate five-minute no-progress safeguard still hands a dead source to a new
+	// worker. The sleep stays interruptible by windowCtx.Done() (window close / job
+	// cancel) just like a fixed delay.
 	failures := 0
 	backoff := func(delay time.Duration) {
 		select {
@@ -597,7 +600,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "resolve_retry", err)
 			failures++
-			delay := reconnectBackoff(job.JobID, failures)
+			delay := w.nextReconnectDelay(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
@@ -621,7 +624,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "ssrf_retry", err)
 			failures++
-			delay := reconnectBackoff(job.JobID, failures)
+			delay := w.nextReconnectDelay(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
@@ -645,7 +648,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			w.cfg.RelayDiagnostics.Error(job.JobID, "mktemp_retry", err)
 			failures++
-			delay := reconnectBackoff(job.JobID, failures)
+			delay := w.nextReconnectDelay(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous mktemp failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
 			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
@@ -769,7 +772,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			failures = 0
 		}
 		failures++
-		delay := reconnectBackoff(job.JobID, failures)
+		delay := w.nextReconnectDelay(job.JobID, failures)
 		if captureErr != nil {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "capture_retry", captureErr)
 		} else {
@@ -1076,16 +1079,37 @@ func continuousDeliveryFailureShouldFail(captureErr error, windowClosed bool) bo
 		(!windowClosed && errors.Is(captureErr, errSegmentDeliveryExhausted))
 }
 
+const continuousReconnectMaxDelay = 30 * time.Second
+
 // reconnectBackoff returns a deterministic per-job jittered delay. It starts at
-// 1-2s for fast recovery after a healthy source drop and grows to 2.5-5m for a
+// 1-2s for fast recovery after a healthy source drop and grows to 15-30s for a
 // persistently dead source without synchronizing every job against one origin.
+// Keeping this well below the no-progress handoff timeout bounds how long an
+// active window can miss a source that recovered between attempts. FFmpeg exit
+// diagnostics are strings, not typed HTTP errors, so applying this only to
+// 404/5xx would be unreliable and could strand an equally transient transport
+// failure on the old multi-minute backoff.
 func reconnectBackoff(jobID int64, failures int) time.Duration {
-	const base = 2 * time.Second
-	const maxDelay = 5 * time.Minute
-	nominal := maxDelay
-	if failures-1 < 8 {
-		nominal = base << (failures - 1)
+	return reconnectBackoffFor(jobID, failures, 2*time.Second, continuousReconnectMaxDelay)
+}
+
+func (w *Worker) nextReconnectDelay(jobID int64, failures int) time.Duration {
+	if w.reconnectDelay == nil {
+		return reconnectBackoff(jobID, failures)
 	}
+	return w.reconnectDelay(jobID, failures)
+}
+
+func reconnectBackoffFor(jobID int64, failures int, base, maxDelay time.Duration) time.Duration {
+	nominal := base
+	for attempt := 1; attempt < failures && nominal < maxDelay; attempt++ {
+		if nominal > maxDelay/2 {
+			nominal = maxDelay
+			break
+		}
+		nominal *= 2
+	}
+	nominal = min(nominal, maxDelay)
 	return jitteredDelay(jobID, failures, nominal)
 }
 
