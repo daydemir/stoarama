@@ -1070,6 +1070,10 @@ def prepare_clip_with_capacity(cfg, runtime, clip):
         runtime.release_storage_reservation(expected_bytes)
 
 
+def set_idle_unless_capacity_blocked(runtime):
+    runtime.set_phase(Phase.BLOCKED if runtime.is_capacity_blocked() else Phase.IDLE)
+
+
 def acquire_lock(cfg):
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     handle = open(cfg.lock_file, "a+", encoding="utf-8")
@@ -1792,7 +1796,7 @@ def run(cfg):
                 if update_can_exec(update_ready, inventory_worker, stop_event):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
-                runtime.set_phase(Phase.IDLE)
+                set_idle_unless_capacity_blocked(runtime)
                 if not progress:
                     stop_event.wait(cfg.poll_interval_sec)
             except Exception as exc:

@@ -1187,6 +1187,16 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(runtime.capacity_reserved_bytes, 200)
             runtime.release_storage_reservation(200)
             self.assertEqual(runtime.capacity_reserved_bytes, 0)
+
+    def test_idle_transition_preserves_capacity_blocked_phase(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            pull.set_idle_unless_capacity_blocked(runtime)
+            self.assertEqual(runtime.phase, pull.Phase.BLOCKED)
+            runtime.capacity_blocked = False
+            pull.set_idle_unless_capacity_blocked(runtime)
+            self.assertEqual(runtime.phase, pull.Phase.IDLE)
     def test_download_verifies_size_and_sha(self):
         with tempfile.TemporaryDirectory() as raw:
             target = Path(raw) / "clip.part"
