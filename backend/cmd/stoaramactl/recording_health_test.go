@@ -18,22 +18,29 @@ func TestShouldNotifyHealthIncident(t *testing.T) {
 	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name          string
+		incident      healthIncident
 		newlyInserted bool
+		episodeAt     time.Time
 		lastAlertedAt time.Time
 		lastAttemptAt *time.Time
 		want          bool
 	}{
-		{"newly inserted always notifies", true, now, ptrTime(now), true},
-		{"never attempted retries", false, time.Time{}, nil, true},
-		{"recent failed attempt backs off", false, time.Time{}, ptrTime(now.Add(-time.Minute)), false},
-		{"failed attempt retries after backoff", false, time.Time{}, ptrTime(now.Add(-healthAlertDeliveryRetryBackoff - time.Second)), true},
-		{"older than 24h renotifies", false, now.Add(-24*time.Hour - time.Second), nil, true},
-		{"exactly 24h stays quiet", false, now.Add(-24 * time.Hour), nil, false},
-		{"recent successful delivery stays quiet", false, now.Add(-3 * time.Hour), nil, false},
+		{"new non-live signal notifies", healthIncident{Signal: signalStoredClipInvalid}, true, now, now, nil, true},
+		{"ordinary silent death waits", healthIncident{Signal: signalContinuousSilentDeath}, true, now, time.Time{}, nil, false},
+		{"ordinary silent death matures", healthIncident{Signal: signalContinuousSilentDeath}, false, now.Add(-5 * time.Minute), time.Time{}, nil, true},
+		{"stale media is immediate", healthIncident{Signal: signalContinuousSilentDeath, Immediate: true}, true, now, time.Time{}, nil, true},
+		{"never attempted retries", healthIncident{Signal: signalStoredClipInvalid}, false, now, time.Time{}, nil, true},
+		{"recent failed attempt backs off", healthIncident{Signal: signalStoredClipInvalid}, false, now, time.Time{}, ptrTime(now.Add(-time.Minute)), false},
+		{"failed attempt retries after backoff", healthIncident{Signal: signalStoredClipInvalid}, false, now, time.Time{}, ptrTime(now.Add(-healthAlertDeliveryRetryBackoff - time.Second)), true},
+		{"older than 24h renotifies", healthIncident{Signal: signalStoredClipInvalid}, false, now.Add(-25 * time.Hour), now.Add(-24*time.Hour - time.Second), nil, true},
+		{"exactly 24h stays quiet", healthIncident{Signal: signalStoredClipInvalid}, false, now.Add(-25 * time.Hour), now.Add(-24 * time.Hour), nil, false},
+		{"recent successful delivery stays quiet", healthIncident{Signal: signalStoredClipInvalid}, false, now.Add(-4 * time.Hour), now.Add(-3 * time.Hour), nil, false},
+		{"silent reopen cooldown", healthIncident{Signal: signalContinuousSilentDeath}, false, now.Add(-5 * time.Minute), now.Add(-20 * time.Minute), nil, false},
+		{"silent reopen after cooldown", healthIncident{Signal: signalContinuousSilentDeath}, false, now.Add(-5 * time.Minute), now.Add(-31 * time.Minute), nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldNotifyHealthIncident(tc.newlyInserted, tc.lastAlertedAt, tc.lastAttemptAt, now); got != tc.want {
+			if got := shouldNotifyHealthIncident(tc.incident, tc.newlyInserted, tc.episodeAt, tc.lastAlertedAt, tc.lastAttemptAt, now); got != tc.want {
 				t.Fatalf("shouldNotifyHealthIncident=%v want %v", got, tc.want)
 			}
 		})
@@ -82,43 +89,45 @@ func TestHealthAlertDeliveryTimestampOnlyAdvancesAfterAcknowledgement(t *testing
 		  recording_id BIGINT NOT NULL REFERENCES recordings(id), signal TEXT NOT NULL,
 		  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 		  last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_delivery_attempt_at TIMESTAMPTZ,
+		  episode_started_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_detected_at TIMESTAMPTZ,
 		  resolved_at TIMESTAMPTZ,
 		  PRIMARY KEY(recording_id,signal));
-		INSERT INTO recordings VALUES (1);
+		INSERT INTO recordings VALUES (1),(2);
 	`); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, attempted, err := upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || !inserted || !shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
+	inc := healthIncident{RecordingID: 1, Signal: signalStoredClipInvalid}
+	inserted, episode, last, attempted, err := upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || !inserted || !shouldNotifyHealthIncident(inc, inserted, episode, last, attempted, time.Now()) {
 		t.Fatalf("first detection inserted=%v last=%v err=%v", inserted, last, err)
 	}
 	incidents := []healthIncident{{RecordingID: 1, Signal: signalStoredClipInvalid}}
 	if err := markHealthAlertsDeliveryAttempted(ctx, pool, incidents); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || inserted || shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
+	inserted, episode, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || inserted || shouldNotifyHealthIncident(inc, inserted, episode, last, attempted, time.Now()) {
 		t.Fatalf("recent failed attempt must back off inserted=%v last=%v attempted=%v err=%v", inserted, last, attempted, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recorder_health_alerts SET last_delivery_attempt_at=now()-interval '16 minutes'`); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || inserted || !shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
+	inserted, episode, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || inserted || !shouldNotifyHealthIncident(inc, inserted, episode, last, attempted, time.Now()) {
 		t.Fatalf("unacknowledged detection must retry after backoff inserted=%v last=%v attempted=%v err=%v", inserted, last, attempted, err)
 	}
 	if err := markHealthAlertsDelivered(ctx, pool, incidents); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
+	inserted, episode, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || shouldNotifyHealthIncident(inc, inserted, episode, last, attempted, time.Now()) {
 		t.Fatalf("acknowledged detection must dedup inserted=%v last=%v err=%v", inserted, last, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recorder_health_alerts SET resolved_at=now()`); err != nil {
 		t.Fatal(err)
 	}
-	inserted, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
-	if err != nil || !shouldNotifyHealthIncident(inserted, last, attempted, time.Now()) {
+	inserted, episode, last, attempted, err = upsertHealthAlert(ctx, pool, 1, signalStoredClipInvalid)
+	if err != nil || !shouldNotifyHealthIncident(inc, inserted, episode, last, attempted, time.Now()) {
 		t.Fatalf("reopened detection must notify inserted=%v last=%v err=%v", inserted, last, err)
 	}
 	if err := resolveClearedHealthAlerts(ctx, pool, nil, evaluatedHealthSignals(false, false)); err != nil {
@@ -136,6 +145,34 @@ func TestHealthAlertDeliveryTimestampOnlyAdvancesAfterAcknowledgement(t *testing
 	}
 	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=1 AND signal=$1`, signalStoredClipInvalid).Scan(&resolved); err != nil || resolved == nil {
 		t.Fatalf("media sweep did not resolve cleared media incident: resolved=%v err=%v", resolved, err)
+	}
+
+	silent := healthIncident{RecordingID: 2, Signal: signalContinuousSilentDeath}
+	inserted, episode, last, attempted, err = upsertHealthAlert(ctx, pool, 2, signalContinuousSilentDeath)
+	if err != nil || !inserted || shouldNotifyHealthIncident(silent, inserted, episode, last, attempted, time.Now()) {
+		t.Fatalf("first ordinary silence must open without email inserted=%v episode=%v err=%v", inserted, episode, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recorder_health_alerts
+		SET episode_started_at=now()-interval '5 minutes',last_detected_at=now()-interval '5 minutes'
+		WHERE recording_id=2 AND signal=$1
+	`, signalContinuousSilentDeath); err != nil {
+		t.Fatal(err)
+	}
+	inserted, episode, last, attempted, err = upsertHealthAlert(ctx, pool, 2, signalContinuousSilentDeath)
+	if err != nil || inserted || !shouldNotifyHealthIncident(silent, inserted, episode, last, attempted, time.Now()) {
+		t.Fatalf("continuous silence did not mature inserted=%v episode=%v err=%v", inserted, episode, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recorder_health_alerts
+		SET last_detected_at=now()-interval '13 minutes'
+		WHERE recording_id=2 AND signal=$1
+	`, signalContinuousSilentDeath); err != nil {
+		t.Fatal(err)
+	}
+	inserted, episode, last, attempted, err = upsertHealthAlert(ctx, pool, 2, signalContinuousSilentDeath)
+	if err != nil || inserted || shouldNotifyHealthIncident(silent, inserted, episode, last, attempted, time.Now()) {
+		t.Fatalf("discontinuous silence did not reset inserted=%v episode=%v err=%v", inserted, episode, err)
 	}
 }
 
