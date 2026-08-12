@@ -82,26 +82,30 @@ type segmentDeliveryPool struct {
 	// for the next finalized segment to observe the error.
 	abort context.CancelFunc
 
-	mu        sync.Mutex
-	ready     *sync.Cond
-	queue     []capture.Segment
-	err       error
-	submitted int
-	inFlight  int
-	ingested  bool
-	closed    bool
+	mu           sync.Mutex
+	ready        *sync.Cond
+	queue        []capture.Segment
+	err          error
+	submitted    int
+	inFlight     int
+	ingested     bool
+	closed       bool
+	onQueueDepth func(int)
 }
 
 // startSegmentDeliveryPool starts worker goroutines draining the on-disk spool's
 // descriptor queue. deliver performs one segment's reserve -> PUT -> ingest and
 // must be safe to call from several goroutines at once.
-func startSegmentDeliveryPool(workers int, abort context.CancelFunc, deliver func(capture.Segment) error) *segmentDeliveryPool {
+func startSegmentDeliveryPool(workers int, abort context.CancelFunc, deliver func(capture.Segment) error, queueObserver ...func(int)) *segmentDeliveryPool {
 	if workers <= 0 {
 		workers = 1
 	}
 	p := &segmentDeliveryPool{
 		deliver: deliver,
 		abort:   abort,
+	}
+	if len(queueObserver) > 0 {
+		p.onQueueDepth = queueObserver[0]
 	}
 	p.ready = sync.NewCond(&p.mu)
 	p.wg.Add(workers)
@@ -134,16 +138,21 @@ func (p *segmentDeliveryPool) run() {
 
 func (p *segmentDeliveryPool) take() (capture.Segment, bool) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for len(p.queue) == 0 && !p.closed {
 		p.ready.Wait()
 	}
 	if len(p.queue) == 0 {
+		p.mu.Unlock()
 		return capture.Segment{}, false
 	}
 	seg := p.queue[0]
 	p.queue[0] = capture.Segment{}
 	p.queue = p.queue[1:]
+	depth := len(p.queue)
+	p.mu.Unlock()
+	if p.onQueueDepth != nil {
+		p.onQueueDepth(depth)
+	}
 	return seg, true
 }
 
@@ -157,17 +166,24 @@ func (p *segmentDeliveryPool) take() (capture.Segment, bool) {
 // outage; local media growth is bounded independently by the disk monitor.
 func (p *segmentDeliveryPool) Submit(seg capture.Segment) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.err != nil {
+		p.mu.Unlock()
 		return p.err
 	}
 	if p.closed {
+		p.mu.Unlock()
 		return context.Canceled
 	}
 	p.submitted++
 	p.inFlight++
+	seg.DeliveryQueuedAt = time.Now().UTC()
 	p.queue = append(p.queue, seg)
+	depth := len(p.queue)
 	p.ready.Signal()
+	p.mu.Unlock()
+	if p.onQueueDepth != nil {
+		p.onQueueDepth(depth)
+	}
 	return nil
 }
 
