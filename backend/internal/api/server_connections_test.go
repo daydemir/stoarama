@@ -305,6 +305,7 @@ func TestConnectionComposeUsesDurableClientLauncher(t *testing.T) {
 		nasPythonImage,
 		`STOARAMA_CONNECTION_ID: "27"`,
 		`STOARAMA_STATE_DIR: "/state"`,
+		`STOARAMA_MIN_FREE_BYTES: "1250000000000"`,
 		`https://stoarama.com/nas/download/latest.json`,
 		nasBootstrapURL,
 		nasBootstrapSHA256,

@@ -37,6 +37,7 @@ class NASPullTests(unittest.TestCase):
             legacy_progress_file=state / "cursor.json",
             runtime_file=state / "runtime.json",
             outage_file=state / "outage.json",
+            capacity_file=state / "capacity.json",
             inventory_file=state / "inventory.sqlite3",
             current_file=state / "stoarama_pull.py",
             candidate_file=state / "stoarama_pull.candidate.py",
@@ -48,6 +49,7 @@ class NASPullTests(unittest.TestCase):
             inventory_scan_interval_sec=86400,
             inventory_scan_delay_ms=0,
             inventory_hash_mbps=1000,
+            min_free_bytes=100,
             dry_run=dry_run,
             is_candidate=False,
         )
@@ -973,7 +975,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 def sync_clip_ids(self, _cfg, clip_ids):
                     calls.append(("sync", list(clip_ids)))
 
-            with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
                 pull, "process_clip", return_value=(1, 10, 10, 0)
             ), mock.patch.object(pull, "release_clips", side_effect=lambda *_args: calls.append(("release", 1)) or {}):
                 self.assertTrue(pull.drain_page(cfg, runtime, Inventory()))
@@ -990,7 +992,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                     calls.append(("sync", list(clip_ids)))
                     raise RuntimeError("inventory sync failed")
 
-            with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
                 pull, "process_clip", return_value=(1, 10, 10, 0)
             ), mock.patch.object(pull, "release_clips") as release, self.assertRaisesRegex(RuntimeError, "inventory sync failed"):
                 pull.drain_page(cfg, runtime, FailingInventory())
@@ -1050,6 +1052,108 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 self.assertEqual(pull.storage_status(cfg), {"available": False})
                 capacity.assert_not_called()
 
+    def test_capacity_guard_fails_closed_and_uses_resume_hysteresis(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.min_free_bytes = 1_000
+            runtime = pull.Runtime(cfg)
+
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 1_099}):
+                with self.assertRaisesRegex(RuntimeError, "reserve reached"):
+                    pull.require_storage_capacity(cfg, runtime)
+            self.assertTrue(runtime.heartbeat_payload(None)["capacity_blocked"])
+            self.assertEqual(runtime.phase, pull.Phase.BLOCKED)
+
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 1_000 + pull.CAPACITY_RESUME_HYSTERESIS_BYTES}):
+                pull.require_storage_capacity(cfg, runtime)
+            self.assertFalse(runtime.heartbeat_payload(None)["capacity_blocked"])
+
+            with mock.patch.object(pull, "storage_status", side_effect=OSError("stat failed")):
+                with self.assertRaisesRegex(RuntimeError, "check unavailable"):
+                    pull.require_storage_capacity(cfg, runtime)
+            self.assertTrue(runtime.heartbeat_payload(None)["capacity_blocked"])
+
+    def test_capacity_guard_prevents_list_download_release_and_cursor_advance(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.min_free_bytes = 1_000
+            runtime = pull.Runtime(cfg)
+            runtime.cursor_id = 41
+            blocked = {"available": True, "total_bytes": 10_000, "free_bytes": 999}
+            with mock.patch.object(pull, "storage_status", return_value=blocked), mock.patch.object(
+                pull, "request_json"
+            ) as request, mock.patch.object(pull, "process_clip") as process, mock.patch.object(
+                pull, "release_clips"
+            ) as release, self.assertRaisesRegex(RuntimeError, "reserve reached"):
+                pull.drain_page(cfg, runtime)
+            request.assert_not_called()
+            process.assert_not_called()
+            release.assert_not_called()
+            self.assertEqual(runtime.cursor_id, 41)
+            self.assertEqual(runtime.phase, pull.Phase.BLOCKED)
+
+    def test_capacity_hysteresis_survives_restart(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.min_free_bytes = 1_000
+            runtime = pull.Runtime(cfg)
+            low = {"available": True, "total_bytes": 10**12, "free_bytes": 1_000}
+            self.assertFalse(runtime.reserve_storage(cfg, low))
+            restarted = pull.Runtime(cfg)
+            self.assertTrue(restarted.capacity_blocked)
+            self.assertFalse(restarted.reserve_storage(cfg, {
+                "available": True, "total_bytes": 10**12,
+                "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES - 1,
+            }))
+            self.assertTrue(restarted.reserve_storage(cfg, {
+                "available": True, "total_bytes": 10**12,
+                "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES + 200,
+            }))
+            self.assertFalse(pull.Runtime(cfg).capacity_blocked)
+
+    def test_capacity_state_write_failure_remains_blocked(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            storage = {
+                "available": True, "total_bytes": 10**13,
+                "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES + 200,
+            }
+            with mock.patch.object(pull, "atomic_write", side_effect=OSError("state full")), self.assertRaisesRegex(OSError, "state full"):
+                runtime.reserve_storage(cfg, storage, 200)
+            self.assertTrue(runtime.capacity_blocked)
+            self.assertEqual(runtime.capacity_reserved_bytes, 0)
+
+    def test_concurrent_capacity_reservations_cannot_cross_floor(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.min_free_bytes = 1_000
+            runtime = pull.Runtime(cfg)
+            storage = {"available": True, "total_bytes": 10_000, "free_bytes": 1_300}
+            # Establish the unblocked side of hysteresis before workers race.
+            self.assertTrue(runtime.reserve_storage(cfg, {
+                "available": True, "total_bytes": 10**12,
+                "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES,
+            }))
+            barrier = threading.Barrier(3)
+            results = []
+
+            def reserve():
+                barrier.wait()
+                results.append(runtime.reserve_storage(cfg, storage, 200))
+                barrier.wait()
+
+            workers = [threading.Thread(target=reserve) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            barrier.wait()
+            barrier.wait()
+            for worker in workers:
+                worker.join()
+            self.assertEqual(sorted(results), [False, True])
+            self.assertEqual(runtime.capacity_reserved_bytes, 200)
+            runtime.release_storage_reservation(200)
+            self.assertEqual(runtime.capacity_reserved_bytes, 0)
     def test_download_verifies_size_and_sha(self):
         with tempfile.TemporaryDirectory() as raw:
             target = Path(raw) / "clip.part"
@@ -1148,7 +1252,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                     raise RuntimeError("poison")
                 return clip["clip_id"], 10, 10, 0
 
-            with mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
                 pull, "process_clip", side_effect=process
             ):
                 self.assertTrue(pull.drain_page(cfg, runtime))
@@ -1164,7 +1268,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg = self.config(Path(raw))
             runtime = pull.Runtime(cfg)
             clip = {"clip_id": 1, "recording_id": 3}
-            with mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
                 pull, "process_clip", return_value=(1, 10, 10, 0)
             ), mock.patch.object(pull, "release_clips", side_effect=RuntimeError("release denied")):
                 self.assertFalse(pull.drain_page(cfg, runtime))
@@ -1353,6 +1457,8 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ), mock.patch.object(pull, "mark_runtime"), mock.patch.object(
                 pull, "stage_update", return_value="new-version"
             ), mock.patch.object(pull, "check_storage"), mock.patch.object(
+                pull, "require_storage_capacity"
+            ), mock.patch.object(
                 pull, "drain_page", side_effect=stop_during_drain
             ), mock.patch.object(pull, "exec_candidate") as activate:
                 self.assertEqual(pull.run(cfg), 0)
@@ -1442,7 +1548,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                     raise download_error
                 return 1, 10, 10, 0
 
-            with mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
                 pull, "process_clip", side_effect=process
             ), mock.patch.object(pull, "retry_transient", side_effect=release_error):
                 self.assertFalse(pull.drain_page(cfg, runtime))

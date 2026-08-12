@@ -150,6 +150,7 @@ type connectionListItem struct {
 	NASStorageTotalBytes   *int64           `json:"nas_storage_total_bytes"`
 	NASStorageFreeBytes    *int64           `json:"nas_storage_free_bytes"`
 	NASStorageReportedAt   *time.Time       `json:"nas_storage_reported_at"`
+	NASCapacityBlocked     bool             `json:"nas_capacity_blocked"`
 	PendingClips           int64            `json:"pending_clips"`
 	PendingBytes           int64            `json:"pending_bytes"`
 	OldestPendingAt        *time.Time       `json:"oldest_pending_at"`
@@ -200,6 +201,7 @@ func connectionComposeSnippet(apiBase, token string, connectionID int64, pollInt
       STOARAMA_POLL_INTERVAL_SEC: "%d"
       STOARAMA_DOWNLOAD_WORKERS: "12"
       STOARAMA_INVENTORY_HASH_MBPS: "20"
+      STOARAMA_MIN_FREE_BYTES: "1250000000000"
       STOARAMA_UPDATE_MANIFEST_URL: "https://stoarama.com/nas/download/latest.json"
       STOARAMA_DRY_RUN: "0"
       PYTHONUNBUFFERED: "1"
@@ -319,7 +321,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 		       inventory_scan_pass_started_at, inventory_scan_rows_visited, inventory_scan_rows_skipped, inventory_scan_skip_reasons,
 		       inventory_reported_at, inventory_clips, inventory_bytes,
 		       inventory_mismatches, inventory_unmatched, inventory_digest,
-		       nas_storage_total_bytes, nas_storage_free_bytes, nas_storage_reported_at, conn.created_at,
+		       nas_storage_total_bytes, nas_storage_free_bytes, nas_storage_reported_at, nas_capacity_blocked, conn.created_at,
 		       pending.clips, pending.bytes, pending.oldest_at
 		FROM connections conn
 		`+connectionPendingLateralSQL+`
@@ -378,6 +380,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			nasStorageTotal  *int64
 			nasStorageFree   *int64
 			nasStorageAt     *time.Time
+			nasCapacityBlock bool
 			createdAt        time.Time
 			pendingClips     int64
 			pendingBytes     int64
@@ -391,7 +394,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			&batchRetries, &batchFailures, &inventoryMode, &inventoryGen,
 			&inventoryStart, &inventoryDone, &inventoryPass, &inventoryVisited, &inventorySkipped, &inventoryReasons, &inventoryReport, &inventoryClips,
 			&inventoryBytes, &inventoryBad, &inventoryOther, &inventoryDigest,
-			&nasStorageTotal, &nasStorageFree, &nasStorageAt, &createdAt,
+			&nasStorageTotal, &nasStorageFree, &nasStorageAt, &nasCapacityBlock, &createdAt,
 			&pendingClips, &pendingBytes, &oldestPendingAt); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan connection: %v", err))
 			return
@@ -458,6 +461,7 @@ func (s *Server) handleAccountConnectionsList(w http.ResponseWriter, r *http.Req
 			NASStorageTotalBytes:   nasStorageTotal,
 			NASStorageFreeBytes:    nasStorageFree,
 			NASStorageReportedAt:   nasStorageAt,
+			NASCapacityBlocked:     nasCapacityBlock,
 			PendingClips:           pendingClips,
 			PendingBytes:           pendingBytes,
 			OldestPendingAt:        oldestPendingAt,
@@ -615,6 +619,7 @@ type connectionHeartbeatRequest struct {
 	LastBatch          connectionHeartbeatBatch   `json:"last_batch"`
 	Inventory          *connectionInventoryStatus `json:"inventory,omitempty"`
 	Storage            *connectionStorageStatus   `json:"storage,omitempty"`
+	CapacityBlocked    bool                       `json:"capacity_blocked"`
 }
 
 type connectionStorageStatus struct {
@@ -849,6 +854,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    nas_storage_total_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_total_bytes WHEN $33 THEN $34 ELSE NULL END,
 		    nas_storage_free_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_free_bytes WHEN $33 THEN $35 ELSE NULL END,
 		    nas_storage_reported_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_reported_at WHEN $33 THEN now() ELSE NULL END,
+		    nas_capacity_blocked=$40,
 		    updated_at=now()
 		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
@@ -862,7 +868,8 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryGeneration, inventoryScanStartedAt, inventoryScanCompletedAt,
 		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
 		storageAvailable(req.Storage), storageTotal(req.Storage), storageFree(req.Storage),
-		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped, inventorySkipReasonsJSON)
+		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped, inventorySkipReasonsJSON,
+		req.CapacityBlocked)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
