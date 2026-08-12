@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -376,6 +377,13 @@ func TestNASLauncherUsesVerifiedCacheWhenDownloadIsUnavailable(t *testing.T) {
 }
 
 func TestValidateConnectionHeartbeat(t *testing.T) {
+	expectedSkipReasons := map[string]bool{
+		"changed_during_hash": true, "invalid_sidecar": true, "io_error": true,
+		"permission_denied": true, "unexpected": true, "vanished_during_scan": true,
+	}
+	if !reflect.DeepEqual(inventorySkipReasons, expectedSkipReasons) {
+		t.Fatalf("inventory skip reason contract drifted: %#v", inventorySkipReasons)
+	}
 	now := time.Now().UTC()
 	future := now.Add(connectionHeartbeatFutureSkew + time.Minute)
 	valid := connectionHeartbeatRequest{

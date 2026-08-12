@@ -193,6 +193,7 @@ class NASPullTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(pull.inventory_skip_reason(exc, sidecar), expected)
                 self.assertIn(expected, pull.INVENTORY_SKIP_REASONS)
+        self.assertEqual(pull.INVENTORY_SKIP_REASONS, frozenset(expected for _, _, expected in cases))
 
     def test_legacy_or_corrupt_skip_reason_meta_is_omitted(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -258,6 +259,48 @@ class NASPullTests(unittest.TestCase):
                 inventory.full_scan(cfg, threading.Event())
             self.assertTrue(durable_counts)
             self.assertGreaterEqual(durable_counts[0], 2)
+            inventory.close()
+
+    def test_full_scan_sync_failure_is_not_counted_as_a_skipped_path(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"x").hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"x")
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            with mock.patch.object(pull, "INVENTORY_SYNC_BATCH", 1), mock.patch.object(
+                inventory, "sync_dirty", side_effect=RuntimeError("server unavailable")
+            ), self.assertRaisesRegex(pull.InventoryProgressError, "progress persistence failed"):
+                inventory.full_scan(cfg, threading.Event())
+            summary = inventory.summary()
+            self.assertEqual(summary["scan_rows_skipped"], 0)
+            self.assertEqual(summary["scan_skip_reasons"], {})
+            inventory.close()
+
+    def test_full_scan_sqlite_failure_is_not_counted_as_a_skipped_path(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            clip = {
+                "clip_id": 1, "recording_id": 1, "relative_path": "recordings/1.mp4",
+                "size_bytes": 1, "sha256": hashlib.sha256(b"x").hexdigest(),
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"x")
+            pull.write_stitch_sidecar(path, clip)
+            inventory = pull.Inventory(cfg)
+            with mock.patch.object(
+                inventory, "_linked_scan_row_is_current", side_effect=sqlite3.OperationalError("database full")
+            ), self.assertRaisesRegex(pull.InventoryProgressError, "state persistence failed"):
+                inventory.full_scan(cfg, threading.Event())
+            summary = inventory.summary()
+            self.assertEqual(summary["scan_rows_skipped"], 0)
+            self.assertEqual(summary["scan_skip_reasons"], {})
             inventory.close()
 
     def test_full_scan_resumes_generation_without_rehashing_committed_rows(self):

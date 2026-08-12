@@ -57,6 +57,10 @@ class RetryExhausted(RuntimeError):
         self.retries = retries
 
 
+class InventoryProgressError(RuntimeError):
+    pass
+
+
 def inventory_skip_reason(exc, sidecar):
     if isinstance(exc, FileChangedDuringHash):
         return "changed_during_hash"
@@ -368,6 +372,13 @@ class Inventory:
                 )
             self.db.commit()
 
+    def _publish_scan_batch(self, cfg, generation, started_at, progress):
+        try:
+            self._commit_scan_batch(progress)
+            self.sync_dirty(cfg, generation, started_at)
+        except Exception as exc:
+            raise InventoryProgressError("inventory progress persistence failed") from exc
+
     def record_verified(self, clip):
         path = self.cfg.output_dir / valid_relative_path(clip)
         stat = path.stat()
@@ -619,8 +630,7 @@ class Inventory:
                 if self._linked_scan_row_is_current(clip, generation, scan_pass, path):
                     scanned += 1
                     if scanned % INVENTORY_SYNC_BATCH == 0:
-                        self._commit_scan_batch((scanned, skipped, skip_reasons))
-                        self.sync_dirty(cfg, generation, started_at)
+                        self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
                     continue
                 try:
                     stat = path.stat()
@@ -649,15 +659,18 @@ class Inventory:
                 self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self._commit_scan_batch((scanned, skipped, skip_reasons))
-                    self.sync_dirty(cfg, generation, started_at)
+                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+            except sqlite3.Error as exc:
+                raise InventoryProgressError("inventory state persistence failed") from exc
+            except InventoryProgressError:
+                raise
             except Exception as exc:
                 skipped += 1
                 reason = inventory_skip_reason(exc, sidecar=True)
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                log("WARN", "inventory skipped reason=%s count=%d" % (reason, skip_reasons[reason]))
+                log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
         for path in cfg.output_dir.rglob("*"):
             if stop_event.is_set():
                 self._commit_scan_batch((scanned, skipped, skip_reasons))
@@ -677,8 +690,7 @@ class Inventory:
                 if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat):
                     scanned += 1
                     if scanned % INVENTORY_SYNC_BATCH == 0:
-                        self._commit_scan_batch((scanned, skipped, skip_reasons))
-                        self.sync_dirty(cfg, generation, started_at)
+                        self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
                     continue
                 size_bytes, sha256, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
                 updated_at = utc_now_precise()
@@ -695,15 +707,18 @@ class Inventory:
                     )
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
-                    self._commit_scan_batch((scanned, skipped, skip_reasons))
-                    self.sync_dirty(cfg, generation, started_at)
+                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons))
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+            except sqlite3.Error as exc:
+                raise InventoryProgressError("inventory state persistence failed") from exc
+            except InventoryProgressError:
+                raise
             except Exception as exc:
                 skipped += 1
                 reason = inventory_skip_reason(exc, sidecar=False)
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                log("WARN", "inventory skipped reason=%s count=%d" % (reason, skip_reasons[reason]))
+                log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
         # Flush and publish every successfully observed row, but never promote a
         # partial generation. In particular, do not turn unseen prior rows into
         # "missing" when an unreadable/corrupt path was skipped.
