@@ -1058,7 +1058,9 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg.min_free_bytes = 1_000
             runtime = pull.Runtime(cfg)
 
-            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 1_099}):
+            with mock.patch.object(pull, "storage_status", return_value={
+                "available": True, "total_bytes": 10**12, "free_bytes": cfg.min_free_bytes - 1,
+            }):
                 with self.assertRaisesRegex(RuntimeError, "reserve reached"):
                     pull.require_storage_capacity(cfg, runtime)
             self.assertTrue(runtime.heartbeat_payload(None)["capacity_blocked"])
