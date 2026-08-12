@@ -508,6 +508,7 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			status TEXT NOT NULL DEFAULT 'pending',
 			lease_owner TEXT,
 			lease_expires_at TIMESTAMPTZ,
+			lease_token UUID,
 			attempt_count INT NOT NULL DEFAULT 0,
 			error_text TEXT NOT NULL DEFAULT '',
 			idempotency_key TEXT NOT NULL UNIQUE,

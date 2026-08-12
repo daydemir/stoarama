@@ -70,6 +70,7 @@ func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id) VALUES (42);
 		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams)
 		VALUES (1, 42, 'relay', 'active', now(), 1),
 		       (2, 42, 'relay', 'active', now(), 1);
@@ -711,6 +712,9 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 	}
 
 	for _, stmt := range []string{
+		`CREATE TABLE accounts (
+			id BIGINT PRIMARY KEY
+		)`,
 		`CREATE TABLE recorder_droplets (
 			name TEXT NOT NULL,
 			node_id BIGINT,
