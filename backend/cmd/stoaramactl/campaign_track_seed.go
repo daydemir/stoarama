@@ -28,10 +28,11 @@ type campaignSeedTrack struct {
 	Entries                                 []campaignSeedEntry
 }
 type campaignSeedEntry struct {
-	RecordingID  int64
-	Role, Status string
-	Rank         int
-	ReasonCodes  []string
+	RecordingID         int64
+	SceneIdentitySHA256 string
+	Role, Status        string
+	Rank                int
+	ReasonCodes         []string
 }
 
 func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string) {
@@ -52,6 +53,19 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 	if m.AccountID <= 0 || m.ActorUserID <= 0 || m.EvidenceObservedAt.IsZero() || len(m.EvidenceSHA256) != 64 || len(m.Tracks) != 2 {
 		log.Fatal("invalid manifest identity")
 	}
+	claimed := m.EvidenceSHA256
+	m.EvidenceSHA256 = ""
+	canonical, err := json.Marshal(m)
+	if err != nil {
+		log.Fatal(err)
+	}
+	digest := sha256.Sum256(canonical)
+	m.EvidenceSHA256 = claimed
+	if hex.EncodeToString(digest[:]) != claimed {
+		log.Fatal("manifest evidence_sha256 does not match canonical payload")
+	}
+	wantKeys := map[string]time.Time{"delivery30": time.Date(2026, 8, 19, 23, 59, 59, 0, time.UTC), "repair21": time.Date(2026, 8, 26, 23, 59, 59, 0, time.UTC)}
+	seenKeys := map[string]bool{}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
@@ -64,9 +78,11 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 		log.Fatal("actor is not authorized for account")
 	}
 	for _, t := range m.Tracks {
-		if t.Key == "" || t.Label == "" || t.GradeFloor != "GOOD" || t.TargetCount <= 0 || len(t.Entries) != t.TargetCount {
+		deadline, known := wantKeys[t.Key]
+		if !known || seenKeys[t.Key] || !t.DeadlineAt.Equal(deadline) || t.RequiredConsecutiveWindows != 0 || t.Label == "" || t.GradeFloor != "GOOD" || t.TargetCount <= 0 || len(t.Entries) != t.TargetCount {
 			log.Fatalf("invalid track %s", t.Key)
 		}
+		seenKeys[t.Key] = true
 		ids := map[int64]bool{}
 		ranks := map[int]bool{}
 		scenes := map[string]bool{}
@@ -83,12 +99,13 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 			ids[e.RecordingID] = true
 			ranks[e.Rank] = true
 			var sid int64
-			var provider, external string
-			if err = tx.QueryRow(ctx, `SELECT r.stream_id,s.provider,s.external_id FROM recordings r JOIN streams s ON s.id=r.stream_id WHERE r.account_id=$1 AND r.id=$2`, m.AccountID, e.RecordingID).Scan(&sid, &provider, &external); err != nil {
+			if err = tx.QueryRow(ctx, `SELECT r.stream_id FROM recordings r JOIN streams s ON s.id=r.stream_id WHERE r.account_id=$1 AND r.id=$2`, m.AccountID, e.RecordingID).Scan(&sid); err != nil {
 				log.Fatalf("recording %d: %v", e.RecordingID, err)
 			}
-			sum := sha256.Sum256([]byte(provider + "\x00" + external))
-			scene := hex.EncodeToString(sum[:])
+			scene := e.SceneIdentitySHA256
+			if len(scene) != 64 {
+				log.Fatalf("recording %d missing reviewed physical scene hash", e.RecordingID)
+			}
 			if scenes[scene] {
 				log.Fatalf("duplicate scene %s", scene)
 			}
@@ -100,13 +117,15 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 		err = tx.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,state,created_by_user_id) VALUES($1,$2,$3,$4,$5,$6,$7,'draft',$8) ON CONFLICT(account_id,campaign_key) DO UPDATE SET updated_at=recording_campaign_tracks.updated_at WHERE recording_campaign_tracks.state='draft' AND recording_campaign_tracks.label=EXCLUDED.label AND recording_campaign_tracks.deadline_at=EXCLUDED.deadline_at AND recording_campaign_tracks.target_count=EXCLUDED.target_count AND recording_campaign_tracks.grade_floor=EXCLUDED.grade_floor AND recording_campaign_tracks.required_consecutive_windows=EXCLUDED.required_consecutive_windows RETURNING id`, m.AccountID, t.Key, t.Label, t.DeadlineAt, t.TargetCount, t.GradeFloor, t.RequiredConsecutiveWindows, m.ActorUserID).Scan(&trackID)
 		if err == pgx.ErrNoRows {
 			var state string
-			var matched int
 			err = tx.QueryRow(ctx, `SELECT id,state FROM recording_campaign_tracks WHERE account_id=$1 AND campaign_key=$2 AND label=$3 AND deadline_at=$4 AND target_count=$5 AND grade_floor=$6 AND required_consecutive_windows=$7`, m.AccountID, t.Key, t.Label, t.DeadlineAt, t.TargetCount, t.GradeFloor, t.RequiredConsecutiveWindows).Scan(&trackID, &state)
 			if err != nil || state != "active" {
 				log.Fatalf("track %s exists with different definition/state", t.Key)
 			}
-			if err = tx.QueryRow(ctx, `SELECT count(*) FROM recording_campaign_roster_entries WHERE track_id=$1 AND evidence_sha256=$2`, trackID, m.EvidenceSHA256).Scan(&matched); err != nil || matched != t.TargetCount {
-				log.Fatalf("active track %s does not match manifest", t.Key)
+			for _, e := range rr {
+				var matched int
+				if err = tx.QueryRow(ctx, `SELECT count(*) FROM recording_campaign_roster_entries WHERE track_id=$1 AND recording_id=$2 AND stream_id=$3 AND scene_identity_sha256=$4 AND role=$5 AND rank=$6 AND status=$7 AND reason_codes=$8 AND evidence_observed_at=$9 AND evidence_sha256=$10 AND updated_by_user_id=$11`, trackID, e.RecordingID, e.StreamID, e.Scene, e.Role, e.Rank, e.Status, e.ReasonCodes, m.EvidenceObservedAt, m.EvidenceSHA256, m.ActorUserID).Scan(&matched); err != nil || matched != 1 {
+					log.Fatalf("active track %s differs", t.Key)
+				}
 			}
 			continue
 		}
