@@ -175,12 +175,16 @@ func (s *Server) handleAdminNASCleanupCandidateCreate(w http.ResponseWriter, r *
 		return
 	}
 	var protectedCount int
-	if err = tx.QueryRow(r.Context(), `SELECT count(DISTINCT recording_id) FROM recording_qualification_members WHERE account_id=$1 AND recording_id=ANY($2)`, req.AccountID, ids).Scan(&protectedCount); err != nil {
+	if err = tx.QueryRow(r.Context(), `SELECT count(DISTINCT recording_id) FROM (
+	  SELECT recording_id FROM recording_qualification_members WHERE account_id=$1 AND recording_id=ANY($2)
+	  UNION ALL SELECT recording_id FROM protected_campaign_recordings WHERE account_id=$1 AND recording_id=ANY($2)
+	  UNION ALL SELECT id FROM recordings WHERE account_id=$1 AND id=ANY($2) AND status='active'
+	) protected`, req.AccountID, ids).Scan(&protectedCount); err != nil {
 		util.WriteError(w, 500, err.Error())
 		return
 	}
 	if protectedCount != 0 {
-		util.WriteError(w, 409, "UNKNOWN: qualification cohort recordings are permanently excluded from cleanup candidates")
+		util.WriteError(w, 409, "UNKNOWN: active, campaign-protected, and qualification cohort recordings are excluded from cleanup candidates")
 		return
 	}
 	var expectedCount, expectedBytes int64

@@ -226,6 +226,11 @@ func finalizeReadyCandidateRuns(ctx context.Context, pool *pgxpool.Pool) error {
 	 AND conn.inventory_digest~'^[0-9a-f]{64}$' AND conn.inventory_live_revision=conn.inventory_tree_revision
 	 AND NOT EXISTS(SELECT 1 FROM recording_qualification_members protected
 	   WHERE protected.account_id=run.account_id AND protected.recording_id=ANY(run.recording_ids))
+	 AND NOT EXISTS(SELECT 1 FROM protected_campaign_recordings protected
+	   WHERE protected.account_id=run.account_id AND protected.recording_id=ANY(run.recording_ids))
+	 AND NOT EXISTS(SELECT 1 FROM recordings protected
+	   WHERE protected.account_id=run.account_id AND protected.id=ANY(run.recording_ids)
+	     AND protected.status IS DISTINCT FROM 'paused')
 	 AND NOT EXISTS(SELECT 1 FROM nas_cleanup_candidate_items item
 	   LEFT JOIN nas_inventory_files inv ON inv.connection_id=run.connection_id AND inv.clip_id=item.clip_id
 	   JOIN r2_content_verifications verification ON verification.id=item.verification_id
@@ -283,6 +288,11 @@ func finalizeReadyCandidateRun(ctx context.Context, pool *pgxpool.Pool, id uuid.
 	 AND conn.inventory_live_revision=conn.inventory_tree_revision
 	 AND NOT EXISTS(SELECT 1 FROM recording_qualification_members protected
 	   WHERE protected.account_id=run.account_id AND protected.recording_id=ANY(run.recording_ids))
+	 AND NOT EXISTS(SELECT 1 FROM protected_campaign_recordings protected
+	   WHERE protected.account_id=run.account_id AND protected.recording_id=ANY(run.recording_ids))
+	 AND NOT EXISTS(SELECT 1 FROM recordings protected
+	   WHERE protected.account_id=run.account_id AND protected.id=ANY(run.recording_ids)
+	     AND protected.status IS DISTINCT FROM 'paused')
 	 FOR UPDATE OF run,conn`, id).Scan(&header)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
