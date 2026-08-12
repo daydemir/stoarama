@@ -38,6 +38,12 @@ type nasInventoryFileReport struct {
 	State           string     `json:"state"`
 	VerifiedAt      *time.Time `json:"verified_at"`
 	FileMTimeNS     int64      `json:"file_mtime_ns"`
+	FileCTimeNS     *int64     `json:"file_ctime_ns,omitempty"`
+	FileInode       *int64     `json:"file_inode,omitempty"`
+	FileDevice      *int64     `json:"file_device,omitempty"`
+	SidecarPath     *string    `json:"sidecar_relative_path,omitempty"`
+	SidecarSize     *int64     `json:"sidecar_size_bytes,omitempty"`
+	SidecarSHA256   *string    `json:"sidecar_sha256,omitempty"`
 	ClientUpdatedAt time.Time  `json:"client_updated_at"`
 }
 
@@ -130,6 +136,10 @@ func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error 
 		}
 		if file.ClientUpdatedAt.IsZero() || file.ClientUpdatedAt.After(now.Add(nasInventoryMaxFutureSkew)) {
 			return errors.New("invalid inventory client_updated_at")
+		}
+		evidenceFields := file.FileCTimeNS != nil || file.FileInode != nil || file.FileDevice != nil || file.SidecarPath != nil || file.SidecarSize != nil || file.SidecarSHA256 != nil
+		if evidenceFields && (file.FileCTimeNS == nil || *file.FileCTimeNS <= 0 || file.FileInode == nil || *file.FileInode <= 0 || file.FileDevice == nil || *file.FileDevice <= 0 || file.SidecarPath == nil || !validNASRelativePath(*file.SidecarPath) || file.SidecarSize == nil || *file.SidecarSize < 0 || file.SidecarSHA256 == nil || len(*file.SidecarSHA256) != 64 || !lowerHex(*file.SidecarSHA256)) {
+			return errors.New("inventory cleanup evidence must be complete and valid")
 		}
 	}
 	return nil
@@ -331,18 +341,20 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		parentPath, name := nasInventoryTreeParts(file.RelativePath)
 		_, err = tx.Exec(r.Context(), `
 			INSERT INTO nas_inventory_files
-				(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,seen_generation,client_updated_at,server_received_at,tree_parent_path,tree_name)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),$12,$13)
+				(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,seen_generation,client_updated_at,server_received_at,tree_parent_path,tree_name)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now(),$18,$19)
 			ON CONFLICT (connection_id,clip_id) DO UPDATE SET
 				recording_id=EXCLUDED.recording_id, relative_path=EXCLUDED.relative_path,
 				size_bytes=EXCLUDED.size_bytes, sha256=EXCLUDED.sha256, state=EXCLUDED.state,
 				verified_at=EXCLUDED.verified_at, file_mtime_ns=EXCLUDED.file_mtime_ns,
+				file_ctime_ns=EXCLUDED.file_ctime_ns,file_inode=EXCLUDED.file_inode,file_device=EXCLUDED.file_device,
+				sidecar_relative_path=EXCLUDED.sidecar_relative_path,sidecar_size_bytes=EXCLUDED.sidecar_size_bytes,sidecar_sha256=EXCLUDED.sidecar_sha256,
 				seen_generation=EXCLUDED.seen_generation, client_updated_at=EXCLUDED.client_updated_at,
 				tree_parent_path=EXCLUDED.tree_parent_path,tree_name=EXCLUDED.tree_name,
 				server_received_at=now()
 			WHERE EXCLUDED.client_updated_at >= nas_inventory_files.client_updated_at
 		`, connectionID, file.ClipID, file.RecordingID, file.RelativePath, file.SizeBytes,
-			file.SHA256, file.State, file.VerifiedAt, file.FileMTimeNS, req.Generation, file.ClientUpdatedAt, parentPath, name)
+			file.SHA256, file.State, file.VerifiedAt, file.FileMTimeNS, file.FileCTimeNS, file.FileInode, file.FileDevice, file.SidecarPath, file.SidecarSize, file.SidecarSHA256, req.Generation, file.ClientUpdatedAt, parentPath, name)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upsert inventory file: %v", err))
 			return

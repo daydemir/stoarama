@@ -1649,6 +1649,92 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg.legacy_progress_file.write_text(json.dumps({"after_id": 8814}))
             self.assertEqual(pull.Runtime(cfg).cursor_id, 8814)
 
+    def test_cleanup_paths_reject_every_noncanonical_shape(self):
+        self.assertEqual(pull.cleanup_path_parts("recording/clip.mp4"), ["recording", "clip.mp4"])
+        for path in ("", "/clip.mp4", "../clip.mp4", "a/../b", "a//b", "a/./b", "a\\b", "a\x00b"):
+            with self.subTest(path=path), self.assertRaises(pull.NASCleanupSafetyError):
+                pull.cleanup_path_parts(path)
+
+    def test_cleanup_hash_and_quarantine_are_exact_move_only(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            media_dir = root / "recording"
+            media_dir.mkdir()
+            content = b"exact native media bytes"
+            media = media_dir / "clip.mp4"
+            media.write_bytes(content)
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                root_stat = os.fstat(root_fd)
+                identity = (root_stat.st_dev, root_stat.st_ino)
+                file_identity = pull.cleanup_hash_exact_file(
+                    root_fd, identity, "recording/clip.mp4", len(content), hashlib.sha256(content).hexdigest(),
+                )
+                quarantine = pull.cleanup_quarantine_exact(
+                    root_fd, identity, "12345678-1234-1234-1234-123456789abc", 1,
+                    "recording/clip.mp4", file_identity,
+                )
+                self.assertFalse(media.exists())
+                self.assertEqual((root / quarantine).read_bytes(), content)
+                self.assertTrue(media_dir.is_dir())
+            finally:
+                os.close(root_fd)
+
+    def test_cleanup_drift_and_symlink_fail_without_moving(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source"
+            source.mkdir()
+            media = source / "clip.mp4"
+            media.write_bytes(b"before")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                root_stat = os.fstat(root_fd)
+                identity = (root_stat.st_dev, root_stat.st_ino)
+                hashed = pull.cleanup_hash_exact_file(root_fd, identity, "source/clip.mp4", 6, hashlib.sha256(b"before").hexdigest())
+                media.write_bytes(b"after!")
+                with self.assertRaisesRegex(pull.NASCleanupSafetyError, "drifted"):
+                    pull.cleanup_quarantine_exact(root_fd, identity, "12345678-1234-1234-1234-123456789abc", 1, "source/clip.mp4", hashed)
+                self.assertEqual(media.read_bytes(), b"after!")
+                target = root / "outside.mp4"
+                target.write_bytes(b"outside")
+                media.unlink()
+                media.symlink_to(target)
+                with self.assertRaises(pull.NASCleanupSafetyError):
+                    pull.cleanup_hash_exact_file(root_fd, identity, "source/clip.mp4", 7, hashlib.sha256(b"outside").hexdigest())
+                self.assertEqual(target.read_bytes(), b"outside")
+            finally:
+                os.close(root_fd)
+
+    def test_full_scan_reports_all_or_none_cleanup_evidence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            content = b"native clip"
+            clip = {
+                "schema_version": 1, "clip_id": 71, "recording_id": 9,
+                "relative_path": "recording/clip.mp4", "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "clip_start_at": "2026-08-12T00:00:00Z", "clip_end_at": "2026-08-12T00:01:00Z",
+                "capture_generation": "gen", "capture_sequence": 1, "recording_job_id": 3,
+            }
+            media = cfg.output_dir / clip["relative_path"]
+            media.parent.mkdir()
+            media.write_bytes(content)
+            pull.write_stitch_sidecar(media, clip)
+            inventory = pull.Inventory(cfg)
+            reports = []
+            with mock.patch.object(pull, "request_json", side_effect=lambda _c, _m, _p, body=None, **_k: reports.extend(body.get("files", [])) or {}):
+                inventory.full_scan(cfg, threading.Event())
+            inventory.close()
+            report = next(row for row in reports if row["clip_id"] == 71)
+            self.assertGreater(report["file_ctime_ns"], 0)
+            self.assertGreater(report["file_inode"], 0)
+            self.assertGreater(report["file_device"], 0)
+            self.assertEqual(report["sidecar_relative_path"], "recording/clip.mp4.stoarama.json")
+            sidecar_bytes = pull.stitch_sidecar_path(media).read_bytes()
+            self.assertEqual(report["sidecar_size_bytes"], len(sidecar_bytes))
+            self.assertEqual(report["sidecar_sha256"], hashlib.sha256(sidecar_bytes).hexdigest())
+
 
 if __name__ == "__main__":
     unittest.main()

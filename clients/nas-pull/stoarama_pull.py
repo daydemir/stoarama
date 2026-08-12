@@ -88,6 +88,156 @@ class MediaCertificationError(RuntimeError):
     pass
 
 
+class NASCleanupSafetyError(RuntimeError):
+    """An exact cleanup manifest or filesystem identity failed closed."""
+
+
+def cleanup_path_parts(value):
+    raw = str(value or "")
+    if not raw or raw.startswith("/") or "\\" in raw or "\x00" in raw:
+        raise NASCleanupSafetyError("cleanup path is not a canonical relative POSIX path")
+    parts = raw.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise NASCleanupSafetyError("cleanup path contains an unsafe component")
+    return parts
+
+
+def cleanup_open_mount_root(root):
+    """Open and identify the mounted root used for all later dir-fd traversal."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(root), flags)
+        opened = os.fstat(descriptor)
+        current = os.stat(root, follow_symlinks=False)
+    except OSError as exc:
+        raise NASCleanupSafetyError("cleanup mount root is unavailable") from exc
+    if not os.path.ismount(str(root)) or stat_module.S_ISLNK(current.st_mode):
+        os.close(descriptor)
+        raise NASCleanupSafetyError("cleanup root is not a direct mounted directory")
+    if certification_identity(opened) != certification_identity(current):
+        os.close(descriptor)
+        raise NASCleanupSafetyError("cleanup root identity changed")
+    return descriptor, (opened.st_dev, opened.st_ino)
+
+
+def cleanup_open_parent(root_fd, root_device, relative_path):
+    """Traverse parents without following a symlink and return (fd, basename)."""
+    parts = cleanup_path_parts(relative_path)
+    cursor = os.dup(root_fd)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, flags, dir_fd=cursor)
+            child_stat = os.fstat(child)
+            if child_stat.st_dev != root_device or not stat_module.S_ISDIR(child_stat.st_mode):
+                os.close(child)
+                raise NASCleanupSafetyError("cleanup path crossed a device or non-directory")
+            os.close(cursor)
+            cursor = child
+        return cursor, parts[-1]
+    except Exception:
+        os.close(cursor)
+        raise
+
+
+def cleanup_hash_exact_file(root_fd, root_identity, relative_path, expected_size, expected_sha):
+    """Hash exact bytes through a no-follow fd and return their stable identity."""
+    root_now = os.fstat(root_fd)
+    if (root_now.st_dev, root_now.st_ino) != root_identity:
+        raise NASCleanupSafetyError("cleanup mount identity changed")
+    parent_fd, name = cleanup_open_parent(root_fd, root_identity[0], relative_path)
+    file_fd = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(name, flags, dir_fd=parent_fd)
+        before = os.fstat(file_fd)
+        if before.st_dev != root_identity[0] or not stat_module.S_ISREG(before.st_mode):
+            raise NASCleanupSafetyError("cleanup target is not a same-device regular file")
+        digest = hashlib.sha256()
+        actual_size = 0
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            actual_size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(file_fd)
+        if certification_identity(before) != certification_identity(after):
+            raise NASCleanupSafetyError("cleanup target changed during hash")
+        actual_sha = digest.hexdigest()
+        if actual_size != expected_size or actual_sha != str(expected_sha).lower():
+            raise NASCleanupSafetyError("cleanup target bytes differ from immutable manifest")
+        return certification_identity(after)
+    except OSError as exc:
+        raise NASCleanupSafetyError("cleanup target could not be opened safely") from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def cleanup_ensure_quarantine_dir(root_fd, root_device, plan_id):
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", str(plan_id or "")):
+        raise NASCleanupSafetyError("invalid cleanup plan id")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    cursor = os.dup(root_fd)
+    try:
+        for part in (".stoarama-quarantine", str(plan_id).lower()):
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=cursor)
+                os.fsync(cursor)
+            except FileExistsError:
+                pass
+            child = os.open(part, flags, dir_fd=cursor)
+            child_stat = os.fstat(child)
+            if child_stat.st_dev != root_device or not stat_module.S_ISDIR(child_stat.st_mode):
+                os.close(child)
+                raise NASCleanupSafetyError("cleanup quarantine is unsafe")
+            os.close(cursor)
+            cursor = child
+        return cursor
+    except Exception:
+        os.close(cursor)
+        raise
+
+
+def cleanup_quarantine_exact(root_fd, root_identity, plan_id, ordinal, relative_path, expected_identity, artifact_kind="media"):
+    """Atomically move one pre-hashed exact file; never unlink or recurse."""
+    if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 1:
+        raise NASCleanupSafetyError("invalid cleanup item ordinal")
+    if artifact_kind not in ("media", "sidecar"):
+        raise NASCleanupSafetyError("invalid cleanup artifact kind")
+    source_parent, source_name = cleanup_open_parent(root_fd, root_identity[0], relative_path)
+    quarantine_fd = cleanup_ensure_quarantine_dir(root_fd, root_identity[0], plan_id)
+    target_name = "%08d.%s" % (ordinal, artifact_kind)
+    try:
+        source_now = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+        if certification_identity(source_now) != tuple(expected_identity):
+            raise NASCleanupSafetyError("cleanup target identity drifted after hash")
+        try:
+            os.stat(target_name, dir_fd=quarantine_fd, follow_symlinks=False)
+            raise NASCleanupSafetyError("cleanup quarantine target already exists")
+        except FileNotFoundError:
+            pass
+        os.rename(source_name, target_name, src_dir_fd=source_parent, dst_dir_fd=quarantine_fd)
+        os.fsync(source_parent)
+        os.fsync(quarantine_fd)
+        moved = os.stat(target_name, dir_fd=quarantine_fd, follow_symlinks=False)
+        # A rename may update ctime while preserving the exact same inode and
+        # bytes. Compare every stable identity component and deliberately omit
+        # only ctime after the atomic move.
+        moved_identity = certification_identity(moved)
+        stable_indexes = (0, 1, 2, 4, 5)
+        if tuple(moved_identity[i] for i in stable_indexes) != tuple(expected_identity[i] for i in stable_indexes):
+            raise NASCleanupSafetyError("quarantined target identity changed")
+        return ".stoarama-quarantine/%s/%s" % (str(plan_id).lower(), target_name)
+    except OSError as exc:
+        raise NASCleanupSafetyError("exact quarantine move failed") from exc
+    finally:
+        os.close(source_parent)
+        os.close(quarantine_fd)
+
+
 def inventory_skip_reason(exc, sidecar):
     if isinstance(exc, FileChangedDuringHash):
         return "changed_during_hash"
@@ -327,6 +477,9 @@ class Inventory:
                     file_ctime_ns INTEGER NOT NULL DEFAULT 0,
                     file_inode INTEGER NOT NULL DEFAULT 0,
                     file_device INTEGER NOT NULL DEFAULT 0,
+                    sidecar_relative_path TEXT NOT NULL DEFAULT '',
+                    sidecar_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    sidecar_sha256 TEXT NOT NULL DEFAULT '',
                     seen_generation TEXT NOT NULL DEFAULT '',
                     scan_pass TEXT NOT NULL DEFAULT '',
                     client_updated_at TEXT NOT NULL,
@@ -357,6 +510,9 @@ class Inventory:
                 "file_ctime_ns": "INTEGER NOT NULL DEFAULT 0",
                 "file_inode": "INTEGER NOT NULL DEFAULT 0",
                 "file_device": "INTEGER NOT NULL DEFAULT 0",
+                "sidecar_relative_path": "TEXT NOT NULL DEFAULT ''",
+                "sidecar_size_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "sidecar_sha256": "TEXT NOT NULL DEFAULT ''",
             }
             for table in ("files", "unmatched_files"):
                 columns = {row[1] for row in self.db.execute("PRAGMA table_info(%s)" % table)}
@@ -369,25 +525,28 @@ class Inventory:
         with self.lock:
             self.db.close()
 
-    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True, scan_pass="", file_identity=(0, 0, 0)):
+    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True, scan_pass="", file_identity=(0, 0, 0), sidecar_evidence=("", 0, "")):
         updated_at = utc_now_precise()
         ctime_ns, inode, device = file_identity
+        sidecar_path, sidecar_size, sidecar_sha = sidecar_evidence
         with self.lock:
             self.db.execute(
                 """INSERT INTO files
-                   (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,file_ctime_ns,file_inode,file_device,seen_generation,scan_pass,client_updated_at,dirty)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                   (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,seen_generation,scan_pass,client_updated_at,dirty)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
                    ON CONFLICT(clip_id) DO UPDATE SET
                      recording_id=excluded.recording_id, relative_path=excluded.relative_path,
                      size_bytes=excluded.size_bytes, sha256=excluded.sha256, state=excluded.state,
                      verified_at=excluded.verified_at, file_mtime_ns=excluded.file_mtime_ns,
                      file_ctime_ns=excluded.file_ctime_ns,file_inode=excluded.file_inode,file_device=excluded.file_device,
+                     sidecar_relative_path=excluded.sidecar_relative_path,sidecar_size_bytes=excluded.sidecar_size_bytes,sidecar_sha256=excluded.sidecar_sha256,
                      seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
                      client_updated_at=excluded.client_updated_at,dirty=1""",
                 (
                     int(clip["clip_id"]), int(clip["recording_id"]), str(clip["relative_path"]),
                     int(clip["size_bytes"]), str(clip["sha256"]).lower(), state,
-                    verified_at, int(mtime_ns), int(ctime_ns), int(inode), int(device), generation, scan_pass, updated_at,
+                    verified_at, int(mtime_ns), int(ctime_ns), int(inode), int(device),
+                    str(sidecar_path), int(sidecar_size), str(sidecar_sha).lower(), generation, scan_pass, updated_at,
                 ),
             )
             if commit:
@@ -421,7 +580,8 @@ class Inventory:
         with self.lock:
             return self.db.execute(
                 """SELECT clip_id,recording_id,relative_path,size_bytes,sha256,state,
-                          verified_at,file_mtime_ns,client_updated_at
+                          verified_at,file_mtime_ns,client_updated_at,file_ctime_ns,file_inode,file_device,
+                          sidecar_relative_path,sidecar_size_bytes,sidecar_sha256
                    FROM files WHERE %s ORDER BY clip_id LIMIT ?""" % where,
                 tuple(params) + (limit,),
             ).fetchall()
@@ -433,6 +593,8 @@ class Inventory:
                 "clip_id": row[0], "recording_id": row[1], "relative_path": row[2],
                 "size_bytes": row[3], "sha256": row[4], "state": row[5],
                 "verified_at": row[6], "file_mtime_ns": row[7], "client_updated_at": row[8],
+                "file_ctime_ns": row[9], "file_inode": row[10], "file_device": row[11],
+                "sidecar_relative_path": row[12], "sidecar_size_bytes": row[13], "sidecar_sha256": row[14],
             }
             for row in rows
         ]
@@ -660,6 +822,9 @@ class Inventory:
                 expected_sha = str(clip["sha256"]).lower()
                 if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
                     raise ValueError("sidecar checksum is invalid")
+                sidecar_bytes = sidecar.read_bytes()
+                sidecar_relative = str(sidecar.relative_to(cfg.output_dir))
+                sidecar_evidence = (sidecar_relative, len(sidecar_bytes), hashlib.sha256(sidecar_bytes).hexdigest())
                 known_paths.add(str(relative))
                 self._retire_unmatched_linked_path(str(relative), generation, scan_pass)
                 if self._linked_scan_row_is_current(clip, generation, scan_pass, path):
@@ -693,7 +858,7 @@ class Inventory:
                 else:
                     state, verified_at, mtime_ns = "missing", None, 0
                     identity = (0, 0, 0)
-                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity)
+                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity, sidecar_evidence=sidecar_evidence)
                 scanned += 1
                 if scanned % INVENTORY_SYNC_BATCH == 0:
                     self._publish_scan_batch(
