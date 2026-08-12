@@ -985,8 +985,8 @@ func TestRelayDiagnosticsSnapshotRedactsURLs(t *testing.T) {
 			t.Fatalf("active[%d] job_id=%v want %d", i, job["job_id"], i+1)
 		}
 	}
-	if got := active[2]["last_error"]; got != "HTTP 404 https://example.com/live.m3u8?[query]" {
-		t.Fatalf("last_error=%q want url with redacted query", got)
+	if got := active[2]["last_error"]; got != "HTTP 404 [url]" {
+		t.Fatalf("last_error=%q want fully redacted url", got)
 	}
 
 	segAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
@@ -1035,9 +1035,9 @@ func TestRelayDiagnosticsSnapshotBoundsActiveJobs(t *testing.T) {
 	}
 }
 
-func TestSanitizeDiagnosticURLCollapsesSignedGoogleVideoPath(t *testing.T) {
+func TestSanitizeDiagnosticURLRemovesProviderAndSourceIdentity(t *testing.T) {
 	got := sanitizeDiagnosticError(errString("open https://rr4---sn.example.googlevideo.com/api/manifest/hls_playlist/expire/123/sig/secret/playlist/index.m3u8?token=abc"))
-	want := "open https://rr4---sn.example.googlevideo.com/.../index.m3u8?[query]"
+	want := "open [url]"
 	if got != want {
 		t.Fatalf("sanitized=%q want %q", got, want)
 	}

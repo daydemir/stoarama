@@ -1,8 +1,6 @@
 package recordingworker
 
 import (
-	"net/url"
-	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -284,7 +282,10 @@ func sanitizeDiagnosticError(err error) string {
 	if s == "" {
 		return ""
 	}
-	s = diagnosticURLRe.ReplaceAllStringFunc(s, sanitizeDiagnosticURL)
+	// Heartbeat diagnostics are fleet-wide control-plane telemetry. A source URL's
+	// host and path can identify a private provider, camera, or video even after
+	// its query credentials are removed, so retain no part of it here.
+	s = diagnosticURLRe.ReplaceAllString(s, "[url]")
 	s = diagnosticBearerRe.ReplaceAllString(s, "${1}[redacted]")
 	s = diagnosticTokenFieldRe.ReplaceAllString(s, "${1}=[redacted]")
 	if len(s) > 500 {
@@ -295,25 +296,4 @@ func sanitizeDiagnosticError(err error) string {
 
 func SanitizeDiagnosticError(err error) string {
 	return sanitizeDiagnosticError(err)
-}
-
-func sanitizeDiagnosticURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "[url]"
-	}
-	p := u.EscapedPath()
-	if len(p) > 120 || strings.Contains(u.Host, "googlevideo.com") {
-		base := path.Base(u.Path)
-		if base == "." || base == "/" || base == "" {
-			p = "/..."
-		} else {
-			p = "/.../" + base
-		}
-	}
-	out := u.Scheme + "://" + u.Host + p
-	if u.RawQuery != "" {
-		out += "?[query]"
-	}
-	return out
 }
