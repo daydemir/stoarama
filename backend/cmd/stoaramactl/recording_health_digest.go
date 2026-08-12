@@ -129,11 +129,11 @@ func loadHealthDigestRecordings(ctx context.Context, pool *pgxpool.Pool) ([]dige
 		-- live sweep. Completed-window gap/fragment/layout alerts remain historical
 		-- risk and must never label fresh capture as currently degraded.
 		LEFT JOIN LATERAL (SELECT a.signal incident_type FROM recorder_health_alerts a WHERE a.recording_id=r.id AND a.resolved_at IS NULL
-		  AND a.signal IN ('continuous_silent_death','continuous_window_ended_early','job_retries_exhausted','stuck_lease','clip_timestamp_drift')
+		  AND a.signal=ANY($1)
 		  ORDER BY a.last_detected_at DESC NULLS LAST LIMIT 1) inc ON true
 		LEFT JOIN LATERAL (SELECT h.* FROM recording_window_health h WHERE h.recording_id=r.id ORDER BY h.window_end_at DESC LIMIT 1) wh ON true
 		WHERE r.status='active' AND r.start_at<=now() AND (r.end_at IS NULL OR now()<r.end_at)
-		ORDER BY r.id`)
+		ORDER BY r.id`, liveRecordingHealthSignals())
 	if err != nil {
 		return nil, err
 	}
