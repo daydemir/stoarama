@@ -33,6 +33,7 @@ func TestRecordingCampaignTracksAuditAndProtection(t *testing.T) {
 	for _, q := range []string{
 		`CREATE TABLE accounts(id bigint primary key)`, `CREATE TABLE users(id bigint primary key,is_operator boolean not null default false)`, `CREATE TABLE memberships(user_id bigint,org_id bigint,role text,accepted_at timestamptz)`, `CREATE TABLE streams(id bigint primary key)`,
 		`CREATE TABLE recordings(id bigint primary key,account_id bigint,stream_id bigint)`, `CREATE TABLE recording_jobs(id bigint primary key)`,
+		`CREATE TABLE recording_clips(id bigint primary key,recording_id bigint,recording_job_id bigint,created_at timestamptz)`, `CREATE TABLE recording_window_health(recording_id bigint,job_id bigint,window_end_at timestamptz)`,
 	} {
 		if _, err = c.Exec(ctx, q); err != nil {
 			t.Fatal(err)
@@ -47,6 +48,9 @@ func TestRecordingCampaignTracksAuditAndProtection(t *testing.T) {
 	}
 	if _, err = c.Exec(ctx, `INSERT INTO accounts VALUES(1); INSERT INTO users VALUES(2,true); INSERT INTO streams VALUES(3); INSERT INTO recordings VALUES(4,1,3)`); err != nil {
 		t.Fatal(err)
+	}
+	if _, err = c.Exec(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,state,created_by_user_id) VALUES(1,'bypass','bypass',now(),1,'GOOD','active',2)`); err == nil {
+		t.Fatal("explicit active insert bypass succeeded")
 	}
 	var track int64
 	if err = c.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,created_by_user_id) VALUES(1,'delivery30','Delivery 30',now()+interval '7 days',1,'GOOD',2) RETURNING id`).Scan(&track); err != nil {

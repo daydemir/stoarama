@@ -9,7 +9,7 @@ CREATE TABLE recording_campaign_tracks (
   target_count INTEGER NOT NULL CHECK(target_count>0),
   grade_floor TEXT NOT NULL CHECK(grade_floor IN ('GOOD','GREAT')),
   required_consecutive_windows INTEGER NOT NULL DEFAULT 0 CHECK(required_consecutive_windows BETWEEN 0 AND 14),
-  state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('draft','active','complete','retired')),
+  state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','active','complete','retired')),
   created_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -98,7 +98,7 @@ BEGIN
   END IF;
   SELECT (u.is_operator OR EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.org_id=track_account AND m.accepted_at IS NOT NULL AND m.role IN ('owner','admin'))) INTO authorized FROM users u WHERE u.id=NEW.updated_by_user_id;
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign decision actor is not an account owner/operator'; END IF;
-  IF (NEW.source_health_recording_id IS NULL)<>(NEW.source_health_job_id IS NULL) THEN RAISE EXCEPTION 'health evidence identity must be wholly present or absent'; END IF;
+  IF (NEW.source_health_recording_id IS NULL)<>(NEW.source_health_job_id IS NULL) OR (NEW.source_window_end_at IS NOT NULL AND NEW.source_health_recording_id IS NULL) THEN RAISE EXCEPTION 'health/window evidence identity must be wholly coherent'; END IF;
   IF NEW.source_job_id IS NOT NULL THEN
     SELECT count(*) INTO evidence_count FROM recording_jobs j WHERE j.id=NEW.source_job_id AND j.recording_id=NEW.recording_id;
     IF evidence_count<>1 THEN RAISE EXCEPTION 'job evidence does not belong to roster recording'; END IF;
@@ -181,6 +181,9 @@ BEGIN
  RETURN NEW;
 END $$;
 CREATE TRIGGER trg_campaign_track_state_guard BEFORE UPDATE ON recording_campaign_tracks FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_track_state();
+CREATE FUNCTION force_recording_campaign_track_draft() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN IF NEW.state<>'draft' THEN RAISE EXCEPTION 'campaign tracks must be inserted as draft'; END IF; RETURN NEW; END $$;
+CREATE TRIGGER trg_campaign_track_insert_draft BEFORE INSERT ON recording_campaign_tracks FOR EACH ROW EXECUTE FUNCTION force_recording_campaign_track_draft();
 
 CREATE INDEX idx_recording_clips_job_created ON recording_clips(recording_job_id,created_at DESC);
 CREATE INDEX idx_recording_clips_recording_created ON recording_clips(recording_id,created_at DESC);

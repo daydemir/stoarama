@@ -7,6 +7,33 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
+func campaignCheckpoint(now time.Time, fire *time.Time, jobState *string, clips int, firstMedia, firstIngest, jobMedia, jobIngest *time.Time, earlyResult, confirmResult *string) string {
+	if fire == nil {
+		return "off_window"
+	}
+	d := fire.Sub(now)
+	switch {
+	case d > 2*time.Hour && earlyResult == nil:
+		return "preopen_t_minus_2h_pending"
+	case d > 30*time.Minute && earlyResult == nil:
+		return "preopen_t_minus_2h_due"
+	case d > 30*time.Minute:
+		return "preopen_early_observed"
+	case d > 0 && (confirmResult == nil || *confirmResult != "pass"):
+		return "preopen_t_minus_30m_due"
+	case d > 0:
+		return "preopen_pass"
+	case jobState == nil:
+		return "window_job_missing"
+	case *jobState == "error" || *jobState == "canceled" || (*jobState == "done" && jobMedia == nil):
+		return "current_job_terminal_failure"
+	case d <= 0 && (clips < 3 || firstMedia == nil || firstIngest == nil || jobMedia == nil || jobIngest == nil || jobMedia.Before(now.Add(-5*time.Minute)) || jobIngest.Before(now.Add(-5*time.Minute))):
+		return "first_3_clips_due"
+	default:
+		return "first_3_clips_observed_current_job"
+	}
+}
+
 // handleAccountRecordingCampaignTracks is the read-only operational campaign
 // board. Roster mutations are intentionally limited to audited operator SQL
 // until a separately reviewed write contract exists.
@@ -66,22 +93,7 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 			util.WriteError(w, 500, "scan campaign tracks")
 			return
 		}
-		checkpoint := "off_window"
-		if fire != nil {
-			d := time.Until(*fire)
-			switch {
-			case d > 2*time.Hour && earlyResult == nil:
-				checkpoint = "preopen_t_minus_2h_pending"
-			case d > 30*time.Minute && earlyResult == nil:
-				checkpoint = "preopen_t_minus_2h_due"
-			case d > 0 && (confirmResult == nil || *confirmResult != "pass"):
-				checkpoint = "preopen_t_minus_30m_due"
-			case d <= 0 && (clips < 3 || firstMedia == nil || firstIngest == nil || jobMedia == nil || jobIngest == nil || jobMedia.Before(time.Now().Add(-5*time.Minute)) || jobIngest.Before(time.Now().Add(-5*time.Minute))):
-				checkpoint = "first_3_clips_due"
-			default:
-				checkpoint = "first_3_clips_observed_current_job"
-			}
-		}
+		checkpoint := campaignCheckpoint(time.Now(), fire, jobState, clips, firstMedia, firstIngest, jobMedia, jobIngest, earlyResult, confirmResult)
 		items = append(items, map[string]any{"campaign_key": key, "label": label, "deadline_at": deadline, "target_count": target, "grade_floor": floor, "required_consecutive_windows": required, "track_state": trackState, "recording_id": recordingID, "stream_id": streamID, "scene_identity_sha256": scene, "role": role, "rank": rank, "roster_status": rosterState, "reason_codes": reasons, "decision_at": decision, "evidence_observed_at": evidenceAt, "evidence_sha256": evidenceSHA, "recording_name": recName, "recording_status": recState, "next_window_start_at": fire, "next_window_end_at": end, "job_status": jobState, "current_job_first3_clip_count": clips, "current_job_first3_latest_media_at": firstMedia, "current_job_first3_latest_ingest_at": firstIngest, "preopen_early_result": earlyResult, "preopen_early_checked_at": earlyAt, "preopen_confirm_result": confirmResult, "preopen_confirm_checked_at": confirmAt, "checkpoint": checkpoint, "health_metric_good_candidate_windows": goodWindows, "health_metric_windows": totalWindows, "latest_coverage_pct": latestCoverage, "latest_media_at": latestMedia, "latest_ingest_at": latestIngest})
 	}
 	if err := rows.Err(); err != nil {
