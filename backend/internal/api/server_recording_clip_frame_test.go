@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -90,11 +91,7 @@ func TestClipFrameFFmpegDisablesNestedIOAndDecodesOneJPEG(t *testing.T) {
 	if err != nil {
 		t.Skip("ffmpeg unavailable")
 	}
-	old := os.Getenv("FFMPEG_BIN")
-	t.Cleanup(func() { _ = os.Setenv("FFMPEG_BIN", old) })
-	if err := os.Setenv("FFMPEG_BIN", bin); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv("FFMPEG_BIN", bin)
 	// concat would read a nested file if the protocol gate were missing.
 	playlist := []byte("ffconcat version 1.0\nfile '/etc/passwd'\n")
 	if _, err := ffmpegFrameFromClip(context.Background(), bytes.NewReader(playlist)); err == nil {
@@ -203,7 +200,8 @@ func TestPersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime(
 		return s.persistClipBackedAuthoritativeFrame(ctx, src, "v1", frame, "bucket", func(_ context.Context, key, mime string, body []byte) (string, error) {
 			puts.Add(1)
 			if !strings.Contains(key, "authoritative-clip-30-") || mime != "image/jpeg" || !bytes.Equal(body, frame.Bytes) {
-				t.Fatal("invalid deterministic frame upload")
+				t.Errorf("invalid deterministic frame upload key=%q mime=%q", key, mime)
+				return "", fmt.Errorf("invalid deterministic frame upload")
 			}
 			return "frame-etag", nil
 		})
@@ -232,5 +230,51 @@ func TestPersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime(
 	}
 	if frames != 1 || recStatus != "active" || recURL != "https://unchanged.example/live" || runtimeClass != "video_live" || runtimeURL != "https://secret.example/live" || runtimeStatus != "running" || clipETag != "clip-etag" || purgedAt != nil {
 		t.Fatalf("unexpected mutation frames=%d rec=%s/%s runtime=%s/%s/%s clip=%s purged=%v", frames, recStatus, recURL, runtimeClass, runtimeURL, runtimeStatus, clipETag, purgedAt)
+	}
+}
+
+func TestClipFramePersistenceConflictsAreTyped(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := "clip_frame_conflict_" + strings.ReplaceAll(time.Now().UTC().Format("150405.000000000"), ".", "")
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE")
+	cfg, _ := pgxpool.ParseConfig(databaseURL)
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	for _, ddl := range []string{
+		`CREATE TABLE recordings(id bigint primary key,account_id bigint,stream_id bigint,status text)`,
+		`CREATE TABLE storage_destinations(id bigint primary key,account_id bigint,status text,managed boolean)`,
+		`CREATE TABLE recording_clips(id bigint primary key,recording_id bigint,storage_destination_id bigint,sha256 text,etag text,purged_at timestamptz,clip_end_at timestamptz)`,
+		`CREATE TABLE media_objects(id bigserial primary key,storage_provider text,bucket text,object_key text,mime_type text,size_bytes bigint,etag text,sha256 text,width integer,height integer,created_at timestamptz default now(),unique(bucket,object_key))`,
+		`CREATE TABLE frames(id bigserial primary key,stream_id bigint,captured_at timestamptz,raw_media_object_id bigint,capture_status text,capture_error text,source_kind text,capture_job_id bigint,source_recording_clip_id bigint unique,source_recording_clip_sha256 text,source_recording_clip_etag text,source_recording_clip_version_id text)`,
+		`INSERT INTO recordings VALUES(10,47,99,'paused')`,
+		`INSERT INTO storage_destinations VALUES(20,47,'verified',true)`,
+		`INSERT INTO recording_clips VALUES(30,10,20,'` + strings.Repeat("a", 64) + `','etag',NULL,now())`,
+	} {
+		if _, err = pool.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := recordingClipFrameSource{accountID: 47, recordingID: 10, streamID: 99, clipID: 30, clipStartAt: time.Now().UTC(), clipSHA: strings.Repeat("a", 64), clipETag: "etag"}
+	frame := capture.Frame{Bytes: []byte("jpeg"), MIMEType: "image/jpeg", SHA256: strings.Repeat("b", 64), SizeBytes: 4, Width: 1, Height: 1}
+	_, _, err = (&Server{pool: pool}).persistClipBackedAuthoritativeFrame(ctx, src, "", frame, "bucket", func(context.Context, string, string, []byte) (string, error) { return "etag", nil })
+	var typed *clipFrameHTTPError
+	if !errors.As(err, &typed) || typed.status != http.StatusConflict {
+		t.Fatalf("err=%v typed=%+v", err, typed)
 	}
 }

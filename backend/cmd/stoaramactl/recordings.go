@@ -83,8 +83,11 @@ func runRecordingClipAuthoritativeFrame(ctx context.Context, cfg config.Config, 
 	recordingID := fs.Int64("recording-id", 0, "exact active recording id")
 	clipID := fs.Int64("clip-id", 0, "exact landed recording clip id")
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-	serviceToken := fs.String("service-token", cfg.ServiceToken, "service bearer token")
+	serviceToken := fs.String("service-token", "", "service bearer token")
 	_ = fs.Parse(args)
+	if strings.TrimSpace(*serviceToken) == "" {
+		*serviceToken = cfg.ServiceToken
+	}
 	if len(fs.Args()) != 0 || *accountID <= 0 || *recordingID <= 0 || *clipID <= 0 {
 		log.Fatal("--account-id, --recording-id, and --clip-id are required")
 	}

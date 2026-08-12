@@ -276,18 +276,21 @@ func (s *Server) persistClipBackedAuthoritativeFrame(ctx context.Context, src re
 		return 0, "", fmt.Errorf("lock clip frame identity: %w", err)
 	}
 	var currentSHA, currentETag string
-	if err = tx.QueryRow(ctx, `SELECT lower(c.sha256),btrim(c.etag) FROM recordings r JOIN recording_clips c ON c.recording_id=r.id JOIN storage_destinations sd ON sd.id=c.storage_destination_id WHERE r.account_id=$1 AND r.id=$2 AND r.stream_id=$3 AND r.status='active' AND c.id=$4 AND c.purged_at IS NULL AND sd.managed FOR SHARE OF r,c,sd`, src.accountID, src.recordingID, src.streamID, src.clipID).Scan(&currentSHA, &currentETag); err != nil {
-		return 0, "", err
+	if err = tx.QueryRow(ctx, `SELECT lower(c.sha256),btrim(c.etag) FROM recordings r JOIN recording_clips c ON c.recording_id=r.id JOIN storage_destinations sd ON sd.id=c.storage_destination_id WHERE r.account_id=$1 AND r.id=$2 AND r.stream_id=$3 AND r.status='active' AND c.id=$4 AND c.purged_at IS NULL AND c.clip_end_at>=now()-interval '24 hours' AND sd.account_id=r.account_id AND sd.status='verified' AND sd.managed FOR SHARE OF r,c,sd`, src.accountID, src.recordingID, src.streamID, src.clipID).Scan(&currentSHA, &currentETag); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip is no longer eligible for an authoritative frame"}
+		}
+		return 0, "", fmt.Errorf("recheck clip identity: %w", err)
 	}
 	if currentSHA != src.clipSHA || currentETag != src.clipETag {
-		return 0, "", fmt.Errorf("clip identity changed before persistence")
+		return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip identity changed before persistence"}
 	}
 	var frameID int64
 	var existingFrameSHA, existingClipSHA, existingETag, existingVersion string
 	err = tx.QueryRow(ctx, `SELECT f.id,lower(m.sha256),f.source_recording_clip_sha256,f.source_recording_clip_etag,COALESCE(f.source_recording_clip_version_id,'') FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.source_recording_clip_id=$1`, src.clipID).Scan(&frameID, &existingFrameSHA, &existingClipSHA, &existingETag, &existingVersion)
 	if err == nil {
 		if existingFrameSHA != frame.SHA256 || existingClipSHA != src.clipSHA || existingETag != src.clipETag || existingVersion != versionID {
-			return 0, "", fmt.Errorf("clip frame provenance conflict")
+			return 0, "", &clipFrameHTTPError{http.StatusConflict, "clip frame provenance conflict"}
 		}
 		if err = tx.Commit(ctx); err != nil {
 			return 0, "", fmt.Errorf("commit existing clip frame: %w", err)

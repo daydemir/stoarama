@@ -10,9 +10,12 @@ ALTER TABLE frames ADD CONSTRAINT frames_recording_clip_provenance_coherent CHEC
   (source_recording_clip_id IS NULL AND source_recording_clip_sha256 IS NULL AND source_recording_clip_etag IS NULL AND source_recording_clip_version_id IS NULL)
   OR
   (source_recording_clip_id IS NOT NULL
+   AND source_recording_clip_sha256 IS NOT NULL
+   AND source_recording_clip_etag IS NOT NULL
    AND source_recording_clip_sha256 ~ '^[0-9a-f]{64}$'
    AND length(btrim(source_recording_clip_etag)) BETWEEN 1 AND 256)
-);
+) NOT VALID;
+ALTER TABLE frames VALIDATE CONSTRAINT frames_recording_clip_provenance_coherent;
 
 CREATE UNIQUE INDEX idx_frames_source_recording_clip
   ON frames(source_recording_clip_id) WHERE source_recording_clip_id IS NOT NULL;
