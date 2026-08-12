@@ -255,6 +255,9 @@ services:
         value: ./bin/ffmpeg
       - key: FFPROBE_BIN
         value: ./bin/ffprobe
+      # The source-native HTTPS HLS probe inherits this CA bundle.
+      - key: SSL_CERT_FILE
+        value: /etc/ssl/certs/ca-certificates.crt
 
   # Daily storage/media proof: runs the same health sweep plus HEAD, exact-size,
   # full-download, and ffprobe verification of the newest adjacent clip pair for
