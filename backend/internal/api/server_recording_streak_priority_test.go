@@ -48,6 +48,13 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if err := pool.QueryRow(ctx, insertRec, otherAccount, "other", open.Add(-48*time.Hour), streamID).Scan(&otherRecID); err != nil {
 		t.Fatal(err)
 	}
+	var envelopeRec int64
+	if err := pool.QueryRow(ctx, insertRec, accountID, "envelope-excluded", open.Add(-48*time.Hour), streamID).Scan(&envelopeRec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET end_at=$2 WHERE id=$1; INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES($1,$3,$3,60,'done','envelope-job','continuous_window',$4)`, envelopeRec, open.Add(11*time.Hour), open, open.Add(12*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	var pausedInside, pausedOutside int64
 	pausedInsert := `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays,paused_at)
 	 VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),$2,'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'paused',$3,$4,'continuous','08:00','20:00',127,now()+$5::interval) RETURNING id`
@@ -87,6 +94,11 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	}
 	if !seen[recID] || !seen[pausedInside] || seen[pausedOutside] {
 		t.Fatalf("paused seven-day boundary wrong: inside=%t outside=%t items=%+v", seen[pausedInside], seen[pausedOutside], out.Items)
+	}
+	for _, it := range out.Items {
+		if it.RecordingID == envelopeRec && len(it.RecentWindows) != 0 {
+			t.Fatalf("partial envelope window counted: %+v", it)
+		}
 	}
 	var mine *streakPriorityRecording
 	for i := range out.Items {
@@ -143,6 +155,24 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if err == nil {
 		t.Fatal("duplicate health facts accepted")
 	}
+	_, err = pool.Exec(ctx, `INSERT INTO recording_window_health(recording_id,job_id,window_start_at,window_end_at,expected_seconds,covered_seconds,coverage_pct,largest_gap_seconds,gap_count,gap_over_30s_count,gap_over_5m_count,overlap_count,overlap_seconds,longest_run_seconds,layout_change_count,clip_count,metric_version,calculated_at) VALUES($1,$2,$3,$4,43200,43100,99.8,10,1,0,0,0,0,43100,0,10,2,$4::timestamptz+interval '1 minute')`, recID, jobID, open, open.Add(12*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,(SELECT id FROM storage_destinations WHERE account_id=$3 LIMIT 1),'https://s3.example.test','streak','late',1,$4,$4,$4+interval '1 minute',$5)`, recID, jobID, accountID, open, open.Add(12*time.Hour+2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = call()
+	mine = nil
+	for i := range out.Items {
+		if out.Items[i].RecordingID == recID {
+			mine = &out.Items[i]
+		}
+	}
+	if mine == nil || mine.RecentWindows[0].Grade != "UNKNOWN" {
+		t.Fatalf("late clip did not fail closed: %+v", mine)
+	}
 	// Real non-UTC handler path: Sunday-only fall-back window is generated at
 	// local 08:00-20:00 and appears UNKNOWN because its health is absent.
 	var nyRec int64
@@ -154,6 +184,9 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES($1,$2,$2,60,'done','ny-dst-job','continuous_window',$3)`, nyRec, nyOpen, nyEnd); err != nil {
 		t.Fatal(err)
 	}
+	priorNow := streakPriorityNow
+	streakPriorityNow = func() time.Time { return nyEnd.Add(time.Hour) }
+	defer func() { streakPriorityNow = priorNow }()
 	out = call()
 	var ny *streakPriorityRecording
 	for i := range out.Items {
@@ -177,7 +210,7 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	}
 	// Explain the bounded production-shaped calendar query under PostgreSQL.
 	var plan string
-	if err := pool.QueryRow(ctx, `EXPLAIN (FORMAT TEXT) `+streakPriorityFactsSQL, accountID).Scan(&plan); err != nil || plan == "" {
+	if err := pool.QueryRow(ctx, `EXPLAIN (FORMAT TEXT) `+streakPriorityFactsSQL, accountID, time.Now().UTC()).Scan(&plan); err != nil || plan == "" {
 		t.Fatalf("explain=%q err=%v", plan, err)
 	}
 }

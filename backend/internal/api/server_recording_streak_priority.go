@@ -38,18 +38,20 @@ type streakPriorityResponse struct {
 	Items                     []streakPriorityRecording `json:"items"`
 }
 
+var streakPriorityNow = func() time.Time { return time.Now().UTC() }
+
 const streakPriorityFactsSQL = `
 		WITH eligible AS (
 		  SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'
 		  UNION ALL
-		  SELECT * FROM (SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=now()-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) p
+		  SELECT * FROM (SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=$2::timestamptz-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) p
 		), expected AS (
 		  SELECT r.id,r.name,r.status,(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone fire_at,
 		         (d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone window_end_at,
 		         count(j.id)::int job_count,min(j.id) job_id
-		  FROM eligible r CROSS JOIN LATERAL generate_series((now() AT TIME ZONE r.cron_timezone)::date-60,(now() AT TIME ZONE r.cron_timezone)::date,interval '1 day') d(day)
+		  FROM eligible r CROSS JOIN LATERAL generate_series(($2::timestamptz AT TIME ZONE r.cron_timezone)::date-60,($2::timestamptz AT TIME ZONE r.cron_timezone)::date,interval '1 day') d(day)
 		  LEFT JOIN recording_jobs j ON j.recording_id=r.id AND j.kind='continuous_window' AND j.fire_at=(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone AND j.window_end_at=(d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone
-		  WHERE ((d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=now() AND ((d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone)>=r.start_at
+		  WHERE ((d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=$2::timestamptz AND ((d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone)>=r.start_at
 		    AND (r.end_at IS NULL OR ((d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=r.end_at) AND (r.active_weekdays & (1 << (extract(isodow FROM d.day::date)::int-1)))<>0
 		  GROUP BY r.id,r.name,r.status,d.day,r.cron_timezone
 		), recent AS (SELECT *,row_number() OVER(PARTITION BY id ORDER BY window_end_at DESC) rn FROM expected)
@@ -58,7 +60,7 @@ const streakPriorityFactsSQL = `
 		       EXISTS(SELECT 1 FROM recording_clips c WHERE c.recording_id=q.id AND c.clip_end_at>q.fire_at AND c.clip_start_at<q.window_end_at AND c.created_at>h.calculated_at) late_clip
 		FROM recent q LEFT JOIN LATERAL (SELECT count(*)::int health_count,max(coverage_pct) coverage_pct,max(largest_gap_seconds) largest_gap_seconds,max(gap_over_30s_count) gap_over_30s_count,
 		 max(gap_over_5m_count) gap_over_5m_count,max(overlap_count) overlap_count,max(metric_version) metric_version,max(expected_seconds) expected_seconds,max(calculated_at) calculated_at
-		 FROM recording_window_health x WHERE x.recording_id=q.id AND x.job_id=q.job_id AND x.calculated_at>=q.window_end_at AND x.calculated_at<=now()+interval '5 minutes') h ON true
+		 FROM recording_window_health x WHERE x.recording_id=q.id AND x.job_id=q.job_id AND x.calculated_at>=q.window_end_at AND x.calculated_at<=$2::timestamptz+interval '5 minutes') h ON true
 		WHERE q.rn<=30 ORDER BY q.id,q.window_end_at DESC`
 
 func gradePassesStreak(grade string) bool {
@@ -138,9 +140,10 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		return
 	}
 	defer tx.Rollback(r.Context())
+	asOf := streakPriorityNow()
 	items := map[int64]*streakPriorityRecording{}
 	statuses := map[int64]string{}
-	eligibleRows, err := tx.Query(r.Context(), `WITH active AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'), paused AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=now()-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) SELECT * FROM active UNION ALL SELECT * FROM paused ORDER BY id`, p.AccountID)
+	eligibleRows, err := tx.Query(r.Context(), `WITH active AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'), paused AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=$2-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) SELECT * FROM active UNION ALL SELECT * FROM paused ORDER BY id`, p.AccountID, asOf)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read streak candidates")
 		return
@@ -162,7 +165,7 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		return
 	}
 	eligibleRows.Close()
-	rows, err := tx.Query(r.Context(), streakPriorityFactsSQL, p.AccountID)
+	rows, err := tx.Query(r.Context(), streakPriorityFactsSQL, p.AccountID, asOf)
 
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read streak priority")
@@ -199,7 +202,7 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		return
 	}
 	var pausedTotal int
-	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=now()-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00'`, p.AccountID).Scan(&pausedTotal); err != nil {
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=$2-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00'`, p.AccountID, asOf).Scan(&pausedTotal); err != nil {
 		util.WriteError(w, 500, "count streak candidates")
 		return
 	}
