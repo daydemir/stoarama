@@ -129,6 +129,8 @@ const relayLeaseSQL = `
 	    AND (j.handoff_owner IS NULL
 	         OR j.handoff_owner <> 'node:' || $1::text
 	         OR j.handoff_until <= now())
+	    AND (j.graceful_handoff_excluded_relay_group_id IS NULL
+	         OR n.relay_group_id IS DISTINCT FROM j.graceful_handoff_excluded_relay_group_id)
 	    AND ($2 OR EXISTS (
 	          SELECT 1 FROM account_billing b
 	          WHERE b.account_id = rec.account_id
@@ -290,6 +292,7 @@ const relayLeaseSQL = `
 	    lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)),
 	    handoff_owner = NULL,
 	    handoff_until = NULL,
+	    graceful_handoff_excluded_relay_group_id = NULL,
 	    attempt_count = attempt_count + 1,
 	    lease_token = CASE WHEN $5 THEN gen_random_uuid() ELSE NULL END,
 	    updated_at = now()
@@ -1106,32 +1109,41 @@ const recordingJobHeartbeatSQL = `
 	SET lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)), updated_at = now()
 	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 	  AND j.lease_token IS NOT DISTINCT FROM $4 AND j.lease_expires_at > now()
-	RETURNING j.lease_expires_at
+	RETURNING j.lease_expires_at,
+	  CASE WHEN j.graceful_handoff_owner=j.lease_owner
+	             AND j.graceful_handoff_lease_token IS NOT DISTINCT FROM j.lease_token
+	       THEN j.graceful_handoff_request_id ELSE NULL END
 `
 
 func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrincipal, jobID int64, workerID string, leaseToken *uuid.UUID) (time.Time, error) {
+	expires, _, err := s.heartbeatRecordingJobWithControl(ctx, principal, jobID, workerID, leaseToken)
+	return expires, err
+}
+
+func (s *Server) heartbeatRecordingJobWithControl(ctx context.Context, principal nodePrincipal, jobID int64, workerID string, leaseToken *uuid.UUID) (time.Time, *uuid.UUID, error) {
 	var leaseExpiresAt time.Time
+	var handoffRequestID *uuid.UUID
 	if principal.NodeType != nodeTypeRelay {
 		err := s.pool.QueryRow(ctx, recordingJobHeartbeatSQL,
-			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt)
-		return leaseExpiresAt, err
+			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt, &handoffRequestID)
+		return leaseExpiresAt, handoffRequestID, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return leaseExpiresAt, err
+		return leaseExpiresAt, nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := lockRelayNodeAndGroup(ctx, tx, principal); err != nil {
-		return leaseExpiresAt, err
+		return leaseExpiresAt, nil, err
 	}
 	if err := tx.QueryRow(ctx, recordingJobHeartbeatSQL,
-		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt); err != nil {
-		return leaseExpiresAt, err
+		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt, &handoffRequestID); err != nil {
+		return leaseExpiresAt, nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return leaseExpiresAt, err
+		return leaseExpiresAt, nil, err
 	}
-	return leaseExpiresAt, nil
+	return leaseExpiresAt, handoffRequestID, nil
 }
 
 // handleRecordingJobHeartbeat extends the lease (and touches the droplet
@@ -1155,7 +1167,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	leaseExpiresAt, err := s.heartbeatRecordingJob(r.Context(), principal, id, workerID, leaseToken)
+	leaseExpiresAt, handoffRequestID, err := s.heartbeatRecordingJobWithControl(r.Context(), principal, id, workerID, leaseToken)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Not owned / not leased anymore (canceled, reclaimed, or completed).
 		util.WriteJSON(w, http.StatusConflict, map[string]any{"cancel": true})
@@ -1167,7 +1179,11 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 	}
 	// Touch the droplet liveness row if this worker is a managed droplet.
 	_ = s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, "")
-	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt})
+	response := map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt}
+	if handoffRequestID != nil {
+		response["graceful_handoff_request_id"] = handoffRequestID.String()
+	}
+	util.WriteJSON(w, http.StatusOK, response)
 }
 
 // handleRecordingDropletHeartbeat records droplet liveness independent of any
@@ -1302,19 +1318,37 @@ type recordingJobFailRequest struct {
 type recordingJobSurrenderReason string
 
 const (
-	recordingJobSurrenderNoProgress   recordingJobSurrenderReason = "no_progress"
-	recordingJobSurrenderDiskPressure recordingJobSurrenderReason = "disk_pressure"
-	recordingJobSurrenderSelfUpdate   recordingJobSurrenderReason = "self_update"
+	recordingJobSurrenderNoProgress      recordingJobSurrenderReason = "no_progress"
+	recordingJobSurrenderDiskPressure    recordingJobSurrenderReason = "disk_pressure"
+	recordingJobSurrenderSelfUpdate      recordingJobSurrenderReason = "self_update"
+	recordingJobSurrenderOperatorHandoff recordingJobSurrenderReason = "operator_handoff"
 )
 
 func (r recordingJobSurrenderReason) valid() bool {
-	return r == recordingJobSurrenderNoProgress || r == recordingJobSurrenderDiskPressure || r == recordingJobSurrenderSelfUpdate
+	return r == recordingJobSurrenderNoProgress || r == recordingJobSurrenderDiskPressure || r == recordingJobSurrenderSelfUpdate || r == recordingJobSurrenderOperatorHandoff
 }
 
 type recordingJobSurrenderRequest struct {
-	Reason    recordingJobSurrenderReason `json:"reason"`
-	ErrorText string                      `json:"error_text"`
+	Reason                   recordingJobSurrenderReason `json:"reason"`
+	ErrorText                string                      `json:"error_text"`
+	GracefulHandoffRequestID string                      `json:"graceful_handoff_request_id"`
 }
+
+const recordingJobGracefulHandoffSurrenderSQL = `
+	UPDATE recording_jobs j SET status='pending',scheduled_for=now(),
+	  lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,
+	  handoff_owner=$2,handoff_until=now()+interval '30 minutes',
+	  relay_fairness_started_at=NULL,error_text=$3,completed_at=NULL,
+	  graceful_handoff_request_id=NULL,graceful_handoff_requested_at=NULL,
+		graceful_handoff_reason=NULL,graceful_handoff_owner=NULL,
+	  graceful_handoff_lease_token=NULL,updated_at=now()
+	WHERE j.id=$1 AND j.kind='continuous_window' AND j.window_end_at>now()
+	  AND j.status='leased' AND j.lease_owner=$2
+	  AND j.lease_token IS NOT DISTINCT FROM $4 AND j.lease_expires_at>now()
+	  AND j.graceful_handoff_request_id=$5
+	  AND j.graceful_handoff_owner=$2
+	  AND j.graceful_handoff_lease_token IS NOT DISTINCT FROM $4
+	RETURNING j.handoff_until`
 
 var (
 	recordingSurrenderURLRE        = regexp.MustCompile(`https?://\S+`)
@@ -1455,6 +1489,10 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusBadRequest, "cloud recorders can only surrender for no progress")
 		return
 	}
+	if req.Reason == recordingJobSurrenderOperatorHandoff && principal.NodeType != nodeTypeRelay {
+		util.WriteError(w, http.StatusBadRequest, "operator handoff is relay-only")
+		return
+	}
 
 	errorText := sanitizeRecordingSurrenderError(req.ErrorText, string(req.Reason))
 	var handoffUntil time.Time
@@ -1470,6 +1508,14 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 			leaseToken,
 			principal.NodeID,
 		).Scan(&handoffUntil, &nextRetryAt, &hadClips)
+	} else if req.Reason == recordingJobSurrenderOperatorHandoff {
+		requestID, parseErr := uuid.Parse(strings.TrimSpace(req.GracefulHandoffRequestID))
+		if parseErr != nil {
+			util.WriteError(w, http.StatusBadRequest, "valid graceful_handoff_request_id is required")
+			return
+		}
+		err = s.pool.QueryRow(r.Context(), recordingJobGracefulHandoffSurrenderSQL, id, recorderWorkerID(principal), errorText, leaseToken, requestID).Scan(&handoffUntil)
+		nextRetryAt = time.Now()
 	} else {
 		err = s.pool.QueryRow(
 			r.Context(),

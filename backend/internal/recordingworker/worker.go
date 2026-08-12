@@ -296,7 +296,8 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
+	heartbeat := w.startHeartbeatState(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
+	canceled := heartbeat.canceled
 
 	// Resolve the stored reference (e.g. a KBS '!hls' indirect URL) to a live
 	// playable URL fresh on every capture, so an expiring token (the KBS Wowza
@@ -427,7 +428,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
+	heartbeat := w.startHeartbeatState(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
+	canceled := heartbeat.canceled
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 
@@ -666,6 +668,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if w.cfg.DrainForUpdate != nil {
 			go monitorContinuousUpdateDrain(stopUpdateMonitor, w.cfg.DrainForUpdate, abortAttempt)
 		}
+		stopHandoffMonitor := make(chan struct{})
+		go monitorContinuousGracefulHandoff(stopHandoffMonitor, heartbeat, abortAttempt)
 		submitInCaptureOrder := func(seg capture.Segment) error {
 			if _, duplicate := seenSegmentSHA[seg.SHA256]; seg.SHA256 != "" && duplicate {
 				// A reconnect may replay the tail of an HLS playlist. Do not enqueue,
@@ -700,6 +704,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
+		close(stopHandoffMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
 		// never closes (and outDir is never removed) with an upload still running.
 		delivery := pool.close()
@@ -725,6 +730,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if continuousSelfUpdateCanSurrender(w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load(), delivery.err, windowClosed) {
 			err := fmt.Errorf("relay is draining for a verified self-update")
 			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, err)
+			return
+		}
+		if requestID := heartbeat.handoffRequestID(); gracefulHandoffCanSurrender(requestID, delivery.err, windowClosed) {
+			err := fmt.Errorf("operator requested graceful handoff")
+			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderOperatorHandoff, err, requestID)
 			return
 		}
 		if continuousMediaLagCanSurrender(mediaLagged.Load(), delivery.err, windowClosed) {
@@ -783,6 +793,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	}
 	w.cfg.RelayDiagnostics.Finish(job.JobID, "done", nil)
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
+}
+
+func gracefulHandoffCanSurrender(requestID string, deliveryErr error, windowClosed bool) bool {
+	return strings.TrimSpace(requestID) != "" && deliveryErr == nil && !windowClosed
 }
 
 func continuousSelfUpdateCanSurrender(draining bool, deliveryErr error, windowClosed bool) bool {
@@ -979,12 +993,12 @@ func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.Canc
 	return w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
 }
 
-func (w *Worker) surrenderContinuousJobForReason(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, reason recordingapi.SurrenderReason, cause error) bool {
+func (w *Worker) surrenderContinuousJobForReason(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, reason recordingapi.SurrenderReason, cause error, gracefulHandoffRequestID ...string) bool {
 	cancel()
 	surrenderCtx, surrenderCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer surrenderCancel()
 	errorText := SanitizeDiagnosticError(cause)
-	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, job.LeaseToken, reason, errorText); surrenderErr != nil {
+	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, job.LeaseToken, reason, errorText, gracefulHandoffRequestID...); surrenderErr != nil {
 		if job.WindowEndAt != nil && !time.Now().Before(*job.WindowEndAt) {
 			completeCtx, completeCancel := context.WithTimeout(context.Background(), 15*time.Second)
 			completeErr := w.cfg.Client.CompleteRecordingJob(completeCtx, job.JobID, job.LeaseToken)
@@ -1174,13 +1188,38 @@ func isUploadIntentStateConflict(err error) bool {
 // startHeartbeat extends the lease on a ticker; on a cancel signal it cancels the
 // job context (aborting ffmpeg). The returned func reports whether a cancel was
 // observed, so the caller skips ingest for a canceled job.
+type recordingHeartbeatState struct {
+	mu          sync.Mutex
+	wasCanceled bool
+	handoffID   string
+}
+
+func (s *recordingHeartbeatState) canceled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wasCanceled
+}
+func (s *recordingHeartbeatState) handoffRequestID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handoffID
+}
+func (s *recordingHeartbeatState) setHandoff(id string) {
+	s.mu.Lock()
+	s.handoffID = strings.TrimSpace(id)
+	s.mu.Unlock()
+}
+
 func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseToken string, leaseExpiresAt time.Time) func() bool {
-	var mu sync.Mutex
-	wasCanceled := false
+	return w.startHeartbeatState(ctx, cancel, jobID, leaseToken, leaseExpiresAt).canceled
+}
+
+func (w *Worker) startHeartbeatState(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseToken string, leaseExpiresAt time.Time) *recordingHeartbeatState {
+	state := &recordingHeartbeatState{}
 	markCanceled := func() {
-		mu.Lock()
-		wasCanceled = true
-		mu.Unlock()
+		state.mu.Lock()
+		state.wasCanceled = true
+		state.mu.Unlock()
 		cancel()
 	}
 	go func() {
@@ -1198,7 +1237,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 				return
 			case <-ticker.C:
 				heartbeatCtx, heartbeatCancel := context.WithDeadline(ctx, leaseExpiresAt)
-				cancelSignal, renewedUntil, err := w.cfg.Client.HeartbeatRecordingJob(heartbeatCtx, jobID, leaseToken)
+				cancelSignal, renewedUntil, handoffRequestID, err := w.cfg.Client.HeartbeatRecordingJobWithControl(heartbeatCtx, jobID, leaseToken)
 				heartbeatCancel()
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
@@ -1212,6 +1251,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 					return
 				}
 				leaseExpiresAt = renewedUntil
+				state.setHandoff(handoffRequestID)
 				if !leaseTimer.Stop() {
 					select {
 					case <-leaseTimer.C:
@@ -1222,10 +1262,22 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 			}
 		}
 	}()
-	return func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return wasCanceled
+	return state
+}
+
+func monitorContinuousGracefulHandoff(stop <-chan struct{}, state *recordingHeartbeatState, abort context.CancelFunc) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if state.handoffRequestID() != "" {
+				abort()
+				return
+			}
+		}
 	}
 }
 
