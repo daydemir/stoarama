@@ -82,20 +82,15 @@ type segmentDeliveryPool struct {
 	// for the next finalized segment to observe the error.
 	abort context.CancelFunc
 
-	mu             sync.Mutex
-	ready          *sync.Cond
-	queue          []capture.Segment
-	err            error
-	submitted      int
-	inFlight       int
-	ingested       bool
-	closed         bool
-	onQueueDepth   func(int)
-	observerMu     sync.Mutex
-	observerReady  *sync.Cond
-	observerQueue  []int
-	observerClosed bool
-	observerWG     sync.WaitGroup
+	mu           sync.Mutex
+	ready        *sync.Cond
+	queue        []capture.Segment
+	err          error
+	submitted    int
+	inFlight     int
+	ingested     bool
+	closed       bool
+	onQueueDepth func(int)
 }
 
 // startSegmentDeliveryPool starts worker goroutines draining the on-disk spool's
@@ -111,9 +106,6 @@ func startSegmentDeliveryPool(workers int, abort context.CancelFunc, deliver fun
 	}
 	if len(queueObserver) > 0 {
 		p.onQueueDepth = queueObserver[0]
-		p.observerReady = sync.NewCond(&p.observerMu)
-		p.observerWG.Add(1)
-		go p.runQueueObserver()
 	}
 	p.ready = sync.NewCond(&p.mu)
 	p.wg.Add(workers)
@@ -121,36 +113,6 @@ func startSegmentDeliveryPool(workers int, abort context.CancelFunc, deliver fun
 		go p.run()
 	}
 	return p
-}
-
-func (p *segmentDeliveryPool) observeQueueDepth(depth int) {
-	if p.onQueueDepth == nil {
-		return
-	}
-	p.observerMu.Lock()
-	if !p.observerClosed {
-		p.observerQueue = append(p.observerQueue, depth)
-		p.observerReady.Signal()
-	}
-	p.observerMu.Unlock()
-}
-
-func (p *segmentDeliveryPool) runQueueObserver() {
-	defer p.observerWG.Done()
-	for {
-		p.observerMu.Lock()
-		for len(p.observerQueue) == 0 && !p.observerClosed {
-			p.observerReady.Wait()
-		}
-		if len(p.observerQueue) == 0 {
-			p.observerMu.Unlock()
-			return
-		}
-		depth := p.observerQueue[0]
-		p.observerQueue = p.observerQueue[1:]
-		p.observerMu.Unlock()
-		p.onQueueDepth(depth)
-	}
 }
 
 func (p *segmentDeliveryPool) run() {
@@ -187,8 +149,10 @@ func (p *segmentDeliveryPool) take() (capture.Segment, bool) {
 	p.queue[0] = capture.Segment{}
 	p.queue = p.queue[1:]
 	depth := len(p.queue)
+	if p.onQueueDepth != nil {
+		p.onQueueDepth(depth)
+	}
 	p.mu.Unlock()
-	p.observeQueueDepth(depth)
 	return seg, true
 }
 
@@ -216,8 +180,10 @@ func (p *segmentDeliveryPool) Submit(seg capture.Segment) error {
 	p.queue = append(p.queue, seg)
 	depth := len(p.queue)
 	p.ready.Signal()
+	if p.onQueueDepth != nil {
+		p.onQueueDepth(depth)
+	}
 	p.mu.Unlock()
-	p.observeQueueDepth(depth)
 	return nil
 }
 
@@ -258,13 +224,6 @@ func (p *segmentDeliveryPool) close() segmentDeliveryResult {
 	}
 	p.mu.Unlock()
 	p.wg.Wait()
-	if p.onQueueDepth != nil {
-		p.observerMu.Lock()
-		p.observerClosed = true
-		p.observerReady.Broadcast()
-		p.observerMu.Unlock()
-		p.observerWG.Wait()
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return segmentDeliveryResult{
