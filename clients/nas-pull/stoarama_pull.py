@@ -3,16 +3,21 @@
 
 import argparse
 import concurrent.futures
+import datetime
 import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import signal
 import socket
 import sqlite3
+import stat as stat_module
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -41,6 +46,14 @@ INVENTORY_SKIP_REASONS = frozenset((
     "changed_during_hash", "invalid_sidecar", "io_error",
     "permission_denied", "unexpected", "vanished_during_scan",
 ))
+MEDIA_CERTIFICATION_SCHEMA_VERSION = 1
+MEDIA_CERTIFICATION_MAX_CLIPS = 8
+MEDIA_CERTIFICATION_MAX_BYTES = 512 * 1024 * 1024
+MEDIA_CERTIFICATION_TEMP_RESERVE_BYTES = 256 * 1024 * 1024
+MEDIA_CERTIFICATION_TOOL_TIMEOUT_SEC = 180
+MEDIA_CERTIFICATION_DURATION_TOLERANCE_SEC = 2.0
+MEDIA_CERTIFICATION_PROTOCOLS = "file,pipe"
+MEDIA_CERTIFICATION_FORMATS = frozenset(("mov", "mp4", "m4a", "3gp", "3g2", "mj2"))
 
 
 class ExistingFileMismatch(RuntimeError):
@@ -58,6 +71,10 @@ class RetryExhausted(RuntimeError):
 
 
 class InventoryProgressError(RuntimeError):
+    pass
+
+
+class MediaCertificationError(RuntimeError):
     pass
 
 
@@ -1025,6 +1042,249 @@ def verified_file(path, expected_bytes, expected_sha):
     return True
 
 
+def parse_certification_timestamp(value, field):
+    raw = str(value or "").strip()
+    if not raw:
+        raise MediaCertificationError(f"{field} is required")
+    try:
+        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise MediaCertificationError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise MediaCertificationError(f"{field} must include a timezone")
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def certification_identity(file_stat):
+    return (
+        file_stat.st_mode, file_stat.st_size, file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns, file_stat.st_ino, file_stat.st_dev,
+    )
+
+
+def confined_regular_file(root, relative_path):
+    raw = str(relative_path or "")
+    relative = Path(raw)
+    if not raw or relative.is_absolute() or "\\" in raw or any(part in ("", ".", "..") for part in relative.parts):
+        raise MediaCertificationError("invalid relative media path")
+    resolved_root = root.resolve(strict=True)
+    cursor = resolved_root
+    for part in relative.parts:
+        cursor = cursor / part
+        try:
+            current_stat = cursor.lstat()
+        except OSError as exc:
+            raise MediaCertificationError("media path is unavailable") from exc
+        if stat_module.S_ISLNK(current_stat.st_mode):
+            raise MediaCertificationError("media path contains a symlink")
+    resolved = cursor.resolve(strict=True)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise MediaCertificationError("media path escapes the NAS root") from exc
+    final_stat = resolved.stat()
+    if not stat_module.S_ISREG(final_stat.st_mode):
+        raise MediaCertificationError("media path is not a regular file")
+    return resolved, final_stat
+
+
+def hash_certification_file(root, relative_path, expected_size, expected_sha):
+    path, path_before = confined_regular_file(root, relative_path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise MediaCertificationError("media file could not be opened safely") from exc
+    digest = hashlib.sha256()
+    actual_size = 0
+    try:
+        opened_before = os.fstat(descriptor)
+        if certification_identity(opened_before) != certification_identity(path_before):
+            raise MediaCertificationError("media identity changed before hashing")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            actual_size += len(chunk)
+            digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    path_after = path.stat()
+    if (
+        certification_identity(opened_before) != certification_identity(opened_after)
+        or certification_identity(opened_after) != certification_identity(path_after)
+        or actual_size != path_after.st_size
+    ):
+        raise MediaCertificationError("media identity changed while hashing")
+    actual_sha = digest.hexdigest()
+    if actual_size != expected_size or actual_sha != expected_sha:
+        raise MediaCertificationError("media bytes do not match the sidecar")
+    return path, path_after, actual_sha
+
+
+def read_certification_sidecar(root, relative_path):
+    sidecar_relative = str(relative_path) + ".stoarama.json"
+    path, path_before = confined_regular_file(root, sidecar_relative)
+    if path_before.st_size > 1024 * 1024:
+        raise MediaCertificationError("stitch sidecar exceeds its size bound")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise MediaCertificationError("stitch sidecar could not be opened safely") from exc
+    try:
+        opened_before = os.fstat(descriptor)
+        body = b""
+        while len(body) <= 1024 * 1024:
+            chunk = os.read(descriptor, min(64 * 1024, 1024 * 1024 + 1 - len(body)))
+            if not chunk:
+                break
+            body += chunk
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    path_after = path.stat()
+    if (
+        len(body) > 1024 * 1024
+        or certification_identity(path_before) != certification_identity(opened_before)
+        or certification_identity(opened_before) != certification_identity(opened_after)
+        or certification_identity(opened_after) != certification_identity(path_after)
+    ):
+        raise MediaCertificationError("stitch sidecar changed while it was read")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise MediaCertificationError("stitch sidecar is invalid") from exc
+    if not isinstance(payload, dict):
+        raise MediaCertificationError("stitch sidecar is invalid")
+    return payload, len(body), hashlib.sha256(body).hexdigest()
+
+
+def bounded_tool_output(command, timeout=MEDIA_CERTIFICATION_TOOL_TIMEOUT_SEC):
+    with tempfile.TemporaryFile() as stdout_file:
+        try:
+            completed = subprocess.run(
+                command, check=False, stdout=stdout_file, stderr=subprocess.DEVNULL,
+                timeout=timeout, env={"PATH": os.environ.get("PATH", "")},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise MediaCertificationError("media verification tool unavailable or timed out") from exc
+        if completed.returncode != 0:
+            raise MediaCertificationError("media verification tool rejected the file")
+        stdout_file.seek(0)
+        output = stdout_file.read(1024 * 1024 + 1)
+    if len(output) > 1024 * 1024:
+        raise MediaCertificationError("media verification output exceeded its bound")
+    return output
+
+
+def media_tool_version(binary):
+    raw = bounded_tool_output([binary, "-version"], timeout=30).decode("utf-8", "replace")
+    return raw.splitlines()[0][:256] if raw else "unknown"
+
+
+def probe_native_media(path, ffprobe_bin):
+    raw = bounded_tool_output([
+        ffprobe_bin, "-v", "error", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
+        "-show_format", "-show_streams", "-show_data_hash", "sha256", "-of", "json", str(path),
+    ])
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise MediaCertificationError("ffprobe returned invalid metadata") from exc
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        raise MediaCertificationError("ffprobe returned no stream list")
+    format_info = payload.get("format") if isinstance(payload.get("format"), dict) else {}
+    formats = {part.strip() for part in str(format_info.get("format_name", "")).split(",") if part.strip()}
+    if not formats or not formats.issubset(MEDIA_CERTIFICATION_FORMATS):
+        raise MediaCertificationError("media container is not approved for local certification")
+    try:
+        duration = float(format_info.get("duration"))
+        start_time = float(format_info.get("start_time", "0"))
+    except (TypeError, ValueError) as exc:
+        raise MediaCertificationError("media timing metadata is invalid") from exc
+    if not math.isfinite(duration) or duration <= 0 or not math.isfinite(start_time):
+        raise MediaCertificationError("media timing metadata is invalid")
+    signature_streams = []
+    seen_indexes = set()
+    video_count = audio_count = 0
+    common_keys = (
+        "index", "codec_type", "codec_name", "codec_long_name", "codec_tag_string", "profile", "level",
+        "time_base", "start_pts", "duration_ts", "extradata_hash", "disposition",
+    )
+    video_keys = (
+        "pix_fmt", "width", "height", "coded_width", "coded_height", "field_order",
+        "sample_aspect_ratio", "display_aspect_ratio", "avg_frame_rate", "r_frame_rate",
+        "color_range", "color_space", "color_transfer", "color_primaries", "chroma_location",
+    )
+    audio_keys = ("sample_fmt", "sample_rate", "channels", "channel_layout", "bits_per_sample")
+    for stream in sorted(streams, key=lambda item: item.get("index", -1) if isinstance(item, dict) else -1):
+        if not isinstance(stream, dict) or type(stream.get("index")) is not int:
+            raise MediaCertificationError("media stream metadata is invalid")
+        index = stream["index"]
+        stream_type = stream.get("codec_type")
+        if index in seen_indexes or stream_type not in ("video", "audio"):
+            raise MediaCertificationError("media contains unsupported stream structure")
+        if not str(stream.get("codec_name", "")).strip() or not str(stream.get("extradata_hash", "")).strip():
+            raise MediaCertificationError("media stream configuration is incomplete")
+        seen_indexes.add(index)
+        video_count += stream_type == "video"
+        audio_count += stream_type == "audio"
+        keys = common_keys + (video_keys if stream_type == "video" else audio_keys)
+        signature_streams.append({key: stream.get(key) for key in keys})
+    if video_count != 1 or audio_count > 1:
+        raise MediaCertificationError("media contains unsupported stream structure")
+    return {
+        "format_name": ",".join(sorted(formats)),
+        "duration_seconds": duration,
+        "container_start_time_seconds": start_time,
+        "signature": {"format_names": sorted(formats), "streams": signature_streams},
+    }
+
+
+def strict_decode_media(path, ffmpeg_bin):
+    bounded_tool_output([
+        ffmpeg_bin, "-v", "error", "-xerror", "-err_detect", "explode",
+        "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS, "-i", str(path),
+        "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-",
+    ])
+
+
+def concat_manifest_line(path):
+    raw = str(path)
+    if "\n" in raw or "\r" in raw:
+        raise MediaCertificationError("media path contains a newline")
+    return "file '%s'\n" % raw.replace("'", "'\\''")
+
+
+def validate_native_run(paths, ffmpeg_bin, temp_root):
+    if len(paths) < 2:
+        return "single_clip"
+    manifest = temp_root / "concat.txt"
+    output = temp_root / "stitched.mp4"
+    manifest.write_text("".join(concat_manifest_line(path) for path in paths), encoding="utf-8")
+    bounded_tool_output([
+        ffmpeg_bin, "-v", "error", "-xerror", "-err_detect", "explode",
+        "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
+        "-f", "concat", "-safe", "0", "-i", str(manifest),
+        "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+        "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", "-y", str(output),
+    ])
+    strict_decode_media(output, ffmpeg_bin)
+    try:
+        output.unlink()
+    except FileNotFoundError:
+        pass
+    return "lossless_concat_and_decode_passed"
+
+
+def canonical_report_hash(report):
+    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def download_verified(url, temp_path, expected_bytes, expected_sha):
     digest = hashlib.sha256()
     written = 0
@@ -1423,9 +1683,334 @@ def check(cfg):
     return 0
 
 
+def validate_certification_storage(cfg):
+    try:
+        output_root = cfg.output_dir.resolve(strict=True)
+        state_root = cfg.state_dir.resolve(strict=True)
+        inventory_path = cfg.inventory_file.resolve(strict=True)
+        lock_path = cfg.lock_file.resolve(strict=True)
+    except OSError as exc:
+        raise MediaCertificationError("required NAS certification storage is unavailable") from exc
+    if (
+        not output_root.is_dir() or not state_root.is_dir()
+        or not os.path.ismount(str(output_root)) or not os.path.ismount(str(state_root))
+        or output_root == state_root
+    ):
+        raise MediaCertificationError("NAS certification requires distinct mounted storage roots")
+    if inventory_path.parent != state_root or lock_path.parent != state_root:
+        raise MediaCertificationError("NAS certification state paths escape the state mount")
+
+
+def acquire_certification_lock(cfg):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(cfg.lock_file), flags)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as exc:
+        try:
+            os.close(descriptor)
+        except UnboundLocalError:
+            pass
+        raise MediaCertificationError("the NAS pull client must be stopped before certification") from exc
+    return descriptor
+
+
+def open_certification_inventory(cfg):
+    if not cfg.inventory_file.is_file():
+        raise MediaCertificationError("the NAS inventory database is unavailable")
+    uri = "file:%s?mode=ro" % urllib.parse.quote(str(cfg.inventory_file.resolve()), safe="/")
+    try:
+        database = sqlite3.connect(uri, uri=True)
+        database.execute("PRAGMA query_only=ON")
+        values = dict(database.execute("SELECT key,value FROM meta").fetchall())
+    except sqlite3.Error as exc:
+        try:
+            database.close()
+        except UnboundLocalError:
+            pass
+        raise MediaCertificationError("the NAS inventory database is unreadable") from exc
+    generation = values.get("generation", "")
+    started_at = values.get("scan_started_at", "")
+    pass_started_at = values.get("scan_pass_started_at", "")
+    completed_at = values.get("scan_completed_at", "")
+    digest = str(values.get("digest", "")).lower()
+    try:
+        skipped = int(values.get("scan_rows_skipped", "0"))
+    except (TypeError, ValueError) as exc:
+        database.close()
+        raise MediaCertificationError("the NAS inventory completion proof is invalid") from exc
+    if not generation or not started_at or not pass_started_at or not completed_at:
+        database.close()
+        raise MediaCertificationError("a completed NAS inventory scan is required")
+    try:
+        started = parse_certification_timestamp(started_at, "inventory scan_started_at")
+        pass_started = parse_certification_timestamp(pass_started_at, "inventory scan_pass_started_at")
+        completed = parse_certification_timestamp(completed_at, "inventory scan_completed_at")
+    except MediaCertificationError as exc:
+        database.close()
+        raise MediaCertificationError("the NAS inventory completion proof is invalid") from exc
+    if started > completed or pass_started > completed or certification_sha(digest, "inventory digest") != digest:
+        database.close()
+        raise MediaCertificationError("the NAS inventory completion proof is invalid")
+    if skipped != 0:
+        database.close()
+        raise MediaCertificationError("the completed NAS inventory contains skipped paths")
+    return database, {
+        "generation": generation, "scan_started_at": started_at,
+        "scan_pass_started_at": pass_started_at, "scan_completed_at": completed_at, "digest": digest,
+    }
+
+
+def certification_integer(value, field, minimum=0):
+    if type(value) is not int or value < minimum:
+        raise MediaCertificationError("stitch sidecar %s is invalid" % field)
+    return value
+
+
+def certification_sha(value, field):
+    digest = str(value or "").lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise MediaCertificationError("%s is invalid" % field)
+    return digest
+
+
+def collect_certification_candidates(cfg, database, inventory_generation, recording_id, window_start, window_end):
+    try:
+        rows = database.execute(
+            """SELECT clip_id,relative_path,size_bytes,sha256,verified_at,seen_generation,state
+               FROM files WHERE recording_id=? ORDER BY clip_id""",
+            (recording_id,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise MediaCertificationError("the NAS inventory clip proof is unreadable") from exc
+    candidates = []
+    seen_clip_ids = set()
+    seen_sequences = set()
+    for clip_id, relative_path, expected_size, expected_sha, verified_at, seen_generation, state in rows:
+        sidecar, sidecar_size_bytes, sidecar_sha = read_certification_sidecar(cfg.output_dir, relative_path)
+        inventory_clip_id = certification_integer(clip_id, "inventory clip_id", 1)
+        inventory_size = certification_integer(expected_size, "inventory size_bytes", 0)
+        inventory_sha = certification_sha(expected_sha, "inventory sha256")
+        sidecar_clip_id = certification_integer(sidecar.get("clip_id"), "clip_id", 1)
+        sidecar_recording_id = certification_integer(sidecar.get("recording_id"), "recording_id", 1)
+        sidecar_size = certification_integer(sidecar.get("size_bytes"), "size_bytes", 0)
+        sidecar_digest = certification_sha(sidecar.get("sha256"), "stitch sidecar sha256")
+        if (
+            sidecar.get("schema_version") != 1 or sidecar_clip_id != inventory_clip_id
+            or sidecar_recording_id != recording_id
+            or str(sidecar.get("relative_path", "")) != relative_path
+            or sidecar_size != inventory_size or sidecar_digest != inventory_sha
+        ):
+            raise MediaCertificationError("stitch sidecar does not match inventory metadata")
+        clip_start = parse_certification_timestamp(sidecar.get("clip_start_at"), "clip_start_at")
+        clip_end = parse_certification_timestamp(sidecar.get("clip_end_at"), "clip_end_at")
+        if clip_end <= clip_start:
+            raise MediaCertificationError("clip timeline is invalid")
+        if clip_end <= window_start or clip_start >= window_end:
+            continue
+        if state != "present":
+            raise MediaCertificationError("requested window contains media without exact NAS proof")
+        if str(seen_generation) != inventory_generation:
+            raise MediaCertificationError("clip proof is not from the completed inventory generation")
+        verified_timestamp = parse_certification_timestamp(verified_at, "inventory verified_at")
+        capture_generation = str(sidecar.get("capture_generation") or "").strip()
+        sequence = certification_integer(sidecar.get("capture_sequence"), "capture_sequence", 0)
+        job_id = certification_integer(sidecar.get("recording_job_id"), "recording_job_id", 1)
+        if not capture_generation or len(capture_generation) > 256 or any(ord(character) < 32 for character in capture_generation):
+            raise MediaCertificationError("clip lacks canonical stitch provenance")
+        if inventory_clip_id in seen_clip_ids or (job_id, capture_generation, sequence) in seen_sequences:
+            raise MediaCertificationError("duplicate stitch provenance")
+        seen_clip_ids.add(inventory_clip_id)
+        seen_sequences.add((job_id, capture_generation, sequence))
+        candidates.append({
+            "clip_id": inventory_clip_id, "recording_job_id": job_id,
+            "relative_path": relative_path, "size_bytes": inventory_size,
+            "sha256": inventory_sha,
+            "inventory_verified_at": verified_timestamp.isoformat().replace("+00:00", "Z"),
+            "sidecar_size_bytes": sidecar_size_bytes, "sidecar_sha256": sidecar_sha,
+            "capture_generation": capture_generation, "capture_sequence": sequence,
+            "clip_start_at": clip_start, "clip_end_at": clip_end,
+        })
+    candidates.sort(key=lambda item: (
+        item["clip_start_at"], item["capture_generation"], item["capture_sequence"], item["clip_id"],
+    ))
+    if len({item["recording_job_id"] for item in candidates}) > 1:
+        raise MediaCertificationError("requested window contains multiple recording jobs")
+    sequence_groups = {}
+    for item in candidates:
+        key = (item["recording_job_id"], item["capture_generation"])
+        sequence_groups.setdefault(key, []).append(item["capture_sequence"])
+    for sequences in sequence_groups.values():
+        ordered = sorted(sequences)
+        if ordered != list(range(ordered[0], ordered[-1] + 1)):
+            raise MediaCertificationError("selected capture sequence is incomplete")
+    for previous, current in zip(candidates, candidates[1:]):
+        if current["clip_start_at"] < previous["clip_end_at"]:
+            raise MediaCertificationError("selected clips overlap")
+    return candidates
+
+
+def certify_media_canary(cfg, recording_id, window_start_raw, window_end_raw, limit, ffmpeg_bin, ffprobe_bin):
+    if recording_id <= 0:
+        raise MediaCertificationError("recording id must be positive")
+    if limit < 1 or limit > MEDIA_CERTIFICATION_MAX_CLIPS:
+        raise MediaCertificationError("limit must be between 1 and %d" % MEDIA_CERTIFICATION_MAX_CLIPS)
+    window_start = parse_certification_timestamp(window_start_raw, "window_start")
+    window_end = parse_certification_timestamp(window_end_raw, "window_end")
+    if window_end <= window_start:
+        raise MediaCertificationError("window_end must be after window_start")
+    validate_certification_storage(cfg)
+    lock_descriptor = acquire_certification_lock(cfg)
+    try:
+        return certify_media_canary_locked(
+            cfg, recording_id, window_start, window_end, limit, ffmpeg_bin, ffprobe_bin,
+        )
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
+
+
+def certify_media_canary_locked(cfg, recording_id, window_start, window_end, limit, ffmpeg_bin, ffprobe_bin):
+    inventory, summary = open_certification_inventory(cfg)
+    try:
+        all_candidates = collect_certification_candidates(
+            cfg, inventory, summary["generation"], recording_id, window_start, window_end,
+        )
+    finally:
+        inventory.close()
+    if not all_candidates:
+        raise MediaCertificationError("no inventory clips intersect the requested window")
+    selected = all_candidates[:limit]
+    selected_bytes = sum(item["size_bytes"] for item in selected)
+    if selected_bytes > MEDIA_CERTIFICATION_MAX_BYTES:
+        raise MediaCertificationError("selected media exceeds the canary byte budget")
+    filesystem = os.statvfs(str(cfg.state_dir))
+    free_bytes = filesystem.f_bavail * filesystem.f_frsize
+    if free_bytes < selected_bytes * 2 + MEDIA_CERTIFICATION_TEMP_RESERVE_BYTES:
+        raise MediaCertificationError("insufficient temporary capacity for lossless validation")
+    tool_versions = {
+        "ffmpeg": media_tool_version(ffmpeg_bin),
+        "ffprobe": media_tool_version(ffprobe_bin),
+    }
+    clip_reports = []
+    selected_paths = []
+    selected_identities = []
+    for item in selected:
+        path, file_stat, actual_sha = hash_certification_file(
+            cfg.output_dir, item["relative_path"], item["size_bytes"], item["sha256"],
+        )
+        probe = probe_native_media(path, ffprobe_bin)
+        expected_duration = (item["clip_end_at"] - item["clip_start_at"]).total_seconds()
+        if abs(probe["duration_seconds"] - expected_duration) > MEDIA_CERTIFICATION_DURATION_TOLERANCE_SEC:
+            raise MediaCertificationError("container duration does not match the clip timeline")
+        strict_decode_media(path, ffmpeg_bin)
+        # The decode is a second full read. Recheck the pathname identity so a
+        # replacement during verification cannot inherit the earlier hash proof.
+        after_decode = path.stat()
+        if certification_identity(file_stat) != certification_identity(after_decode):
+            raise MediaCertificationError("media identity changed during decode")
+        signature_sha = canonical_report_hash(probe["signature"])
+        clip_reports.append({
+            "clip_id": item["clip_id"], "recording_job_id": item["recording_job_id"],
+            "relative_path": item["relative_path"], "size_bytes": item["size_bytes"],
+            "sha256": actual_sha, "capture_generation": item["capture_generation"],
+            "capture_sequence": item["capture_sequence"],
+            "clip_start_at": item["clip_start_at"].isoformat().replace("+00:00", "Z"),
+            "clip_end_at": item["clip_end_at"].isoformat().replace("+00:00", "Z"),
+            "inventory_verified_at": item["inventory_verified_at"],
+            "sidecar_size_bytes": item["sidecar_size_bytes"],
+            "sidecar_sha256": item["sidecar_sha256"],
+            "file_identity": {
+                "size": after_decode.st_size, "mtime_ns": after_decode.st_mtime_ns,
+                "ctime_ns": after_decode.st_ctime_ns, "inode": after_decode.st_ino,
+                "device": after_decode.st_dev,
+            },
+            "probe": probe, "native_signature_sha256": signature_sha,
+            "strict_decode": "passed",
+        })
+        selected_paths.append(path)
+        selected_identities.append(certification_identity(after_decode))
+    runs = []
+    run_start = 0
+    with tempfile.TemporaryDirectory(prefix="stoarama-certify-", dir=str(cfg.state_dir)) as raw_temp:
+        temp_root = Path(raw_temp)
+        for index in range(1, len(clip_reports) + 1):
+            boundary = index == len(clip_reports)
+            if not boundary:
+                current_key = (
+                    clip_reports[index]["recording_job_id"], clip_reports[index]["capture_generation"],
+                    clip_reports[index]["native_signature_sha256"],
+                )
+                run_key = (
+                    clip_reports[run_start]["recording_job_id"], clip_reports[run_start]["capture_generation"],
+                    clip_reports[run_start]["native_signature_sha256"],
+                )
+                boundary = current_key != run_key
+            if not boundary:
+                continue
+            run_paths = selected_paths[run_start:index]
+            run_dir = temp_root / ("run-%d" % len(runs))
+            run_dir.mkdir()
+            concat_state = validate_native_run(run_paths, ffmpeg_bin, run_dir)
+            runs.append({
+                "first_clip_id": clip_reports[run_start]["clip_id"],
+                "last_clip_id": clip_reports[index - 1]["clip_id"],
+                "clip_count": index - run_start,
+                "native_signature_sha256": clip_reports[run_start]["native_signature_sha256"],
+                "lossless_stitch_validation": concat_state,
+            })
+            run_start = index
+    for path, expected_identity in zip(selected_paths, selected_identities):
+        if certification_identity(path.stat()) != expected_identity:
+            raise MediaCertificationError("media identity changed during stitch validation")
+    final_inventory, final_summary = open_certification_inventory(cfg)
+    final_inventory.close()
+    if final_summary != summary:
+        raise MediaCertificationError("NAS inventory completion changed during certification")
+    internal_gaps = [
+        max(0.0, (current["clip_start_at"] - previous["clip_end_at"]).total_seconds())
+        for previous, current in zip(selected, selected[1:])
+    ]
+    report = {
+        "schema_version": MEDIA_CERTIFICATION_SCHEMA_VERSION,
+        "certification_scope": "bounded_clip_canary",
+        "window_complete": False,
+        "recording_id": recording_id,
+        "window_start_at": window_start.isoformat().replace("+00:00", "Z"),
+        "window_end_at": window_end.isoformat().replace("+00:00", "Z"),
+        "inventory_generation": summary.get("generation", ""),
+        "inventory_digest": summary.get("digest", ""),
+        "inventory_scan_started_at": summary.get("scan_started_at"),
+        "inventory_scan_pass_started_at": summary.get("scan_pass_started_at"),
+        "inventory_completed_at": summary.get("scan_completed_at"),
+        "available_window_clip_count": len(all_candidates),
+        "selected_clip_count": len(selected),
+        "selected_bytes": selected_bytes,
+        "selected_internal_gap_count": sum(1 for gap in internal_gaps if gap > 0),
+        "selected_largest_internal_gap_seconds": max(internal_gaps, default=0.0),
+        "selected_overlap_count": 0,
+        "truncated_by_canary_limit": len(selected) < len(all_candidates),
+        "clips": clip_reports,
+        "native_runs": runs,
+        "tools": tool_versions,
+        "source_media_modified": False,
+        "reencoded": False,
+        "persistent_output_created": False,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    report["report_sha256"] = canonical_report_hash(report)
+    return report
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Stoarama NAS pull client")
-    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify"), default="run")
+    parser.add_argument("--recording-id", type=int, default=0)
+    parser.add_argument("--window-start", default="")
+    parser.add_argument("--window-end", default="")
+    parser.add_argument("--limit", type=int, default=2)
+    parser.add_argument("--ffmpeg-bin", default=os.environ.get("FFMPEG_BIN", "ffmpeg"))
+    parser.add_argument("--ffprobe-bin", default=os.environ.get("FFPROBE_BIN", "ffprobe"))
     args = parser.parse_args(argv)
     if args.command == "version":
         print(CLIENT_VERSION)
@@ -1436,6 +2021,20 @@ def main(argv=None):
     if args.command == "self-update":
         cfg.validate()
         print(stage_update(cfg) or "already-current")
+        return 0
+    if args.command == "certify":
+        try:
+            report = certify_media_canary(
+                cfg, args.recording_id, args.window_start, args.window_end,
+                args.limit, args.ffmpeg_bin, args.ffprobe_bin,
+            )
+        except MediaCertificationError as exc:
+            print("certification failed: %s" % exc, file=sys.stderr)
+            return 1
+        except Exception:
+            print("certification failed: unexpected local verification failure", file=sys.stderr)
+            return 1
+        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return 0
     return run(cfg)
 

@@ -1,6 +1,8 @@
 import importlib.util
 import hashlib
+import io
 import json
+import fcntl
 import os
 import socket
 import sqlite3
@@ -24,6 +26,7 @@ class NASPullTests(unittest.TestCase):
         clips = root / "clips"
         state.mkdir()
         clips.mkdir()
+        (state / "client.lock").touch()
         return SimpleNamespace(
             api_base="https://stoarama.test/api/v1",
             api_key="sir_test",
@@ -47,6 +50,76 @@ class NASPullTests(unittest.TestCase):
             dry_run=dry_run,
             is_candidate=False,
         )
+
+    def certify_media_canary(self, *args, **kwargs):
+        with mock.patch.object(pull.os.path, "ismount", return_value=True):
+            return pull.certify_media_canary(*args, **kwargs)
+
+    def media_tools(self, root):
+        log_path = root / "ffmpeg.log"
+        ffprobe = root / "ffprobe"
+        ffmpeg = root / "ffmpeg"
+        ffprobe.write_text(
+            """#!/usr/bin/env python3
+import json,sys
+if '-version' in sys.argv:
+    print('ffprobe test-1')
+else:
+    print(json.dumps({'format':{'format_name':'mov,mp4','duration':'60.0','start_time':'0.0'},'streams':[{'index':0,'codec_type':'video','codec_name':'h264','codec_tag_string':'avc1','profile':'High','level':40,'pix_fmt':'yuv420p','width':1920,'height':1080,'sample_aspect_ratio':'1:1','time_base':'1/90000','avg_frame_rate':'30/1','r_frame_rate':'30/1','extradata_hash':'SHA256:video','disposition':{'default':1}},{'index':1,'codec_type':'audio','codec_name':'aac','codec_tag_string':'mp4a','sample_rate':'48000','channels':2,'channel_layout':'stereo','time_base':'1/48000','extradata_hash':'SHA256:audio','disposition':{'default':1}}]}))
+""",
+            encoding="utf-8",
+        )
+        ffmpeg.write_text(
+            """#!/usr/bin/env python3
+import os,sys
+if '-version' in sys.argv:
+    print('ffmpeg test-1')
+    raise SystemExit(0)
+with open(%r,'a',encoding='utf-8') as out:
+    out.write('\\0'.join(sys.argv[1:])+'\\n')
+if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
+    with open(sys.argv[-1],'wb') as out:
+        out.write(b'stitched')
+""" % str(log_path),
+            encoding="utf-8",
+        )
+        ffprobe.chmod(0o755)
+        ffmpeg.chmod(0o755)
+        return ffmpeg, ffprobe, log_path
+
+    def seed_certification_window(self, cfg, count=2):
+        inventory = pull.Inventory(cfg)
+        inventory._meta_set({
+            "generation": "completed-generation",
+            "scan_started_at": "2026-08-10T00:00:00Z",
+            "scan_completed_at": "2026-08-10T01:00:00Z",
+            "scan_pass_started_at": "2026-08-10T00:00:00Z",
+            "scan_rows_visited": str(count), "scan_rows_skipped": "0",
+            "scan_skip_reasons": "{}", "digest": "d" * 64,
+        })
+        paths = []
+        for index in range(count):
+            content = ("native-%d" % index).encode("utf-8")
+            clip = {
+                "clip_id": index + 1, "recording_id": 77, "recording_job_id": 900,
+                "relative_path": "recordings/%d.mp4" % (index + 1),
+                "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+                "capture_generation": "gen-1", "capture_sequence": index,
+                "clip_start_at": "2026-08-10T%02d:00:00Z" % index,
+                "clip_end_at": "2026-08-10T%02d:01:00Z" % index,
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            pull.write_stitch_sidecar(path, clip)
+            file_stat = path.stat()
+            inventory._upsert(
+                clip, "present", "2026-08-10T01:00:00Z", file_stat.st_mtime_ns,
+                "completed-generation", file_identity=(file_stat.st_ctime_ns, file_stat.st_ino, file_stat.st_dev),
+            )
+            paths.append(path)
+        inventory.close()
+        return paths
 
     def test_relative_path_is_required_and_confined(self):
         self.assertEqual(pull.valid_relative_path({"clip_id": 1, "relative_path": "a/b.mp4"}), Path("a/b.mp4"))
@@ -209,6 +282,310 @@ class NASPullTests(unittest.TestCase):
                     inventory._meta_set({"scan_skip_reasons": malformed})
                     self.assertNotIn("scan_skip_reasons", inventory.summary())
             inventory.close()
+
+    def test_media_certification_canary_hashes_decodes_and_losslessly_stitches(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg)
+            before = [path.read_bytes() for path in paths]
+            ffmpeg, ffprobe, log_path = self.media_tools(root)
+            report = self.certify_media_canary(
+                cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                2, str(ffmpeg), str(ffprobe),
+            )
+            self.assertEqual(report["certification_scope"], "bounded_clip_canary")
+            self.assertFalse(report["window_complete"])
+            self.assertFalse(report["reencoded"])
+            self.assertFalse(report["source_media_modified"])
+            self.assertEqual(report["selected_clip_count"], 2)
+            self.assertEqual(report["native_runs"][0]["lossless_stitch_validation"], "lossless_concat_and_decode_passed")
+            report_hash = report.pop("report_sha256")
+            self.assertEqual(report_hash, pull.canonical_report_hash(report))
+            self.assertEqual([path.read_bytes() for path in paths], before)
+            calls = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any("\0-c\0copy\0" in ("\0" + call + "\0") for call in calls))
+            self.assertTrue(all("-protocol_whitelist\0file,pipe" in call for call in calls))
+            self.assertFalse(any(protocol in call for call in calls for protocol in ("http:", "https:", "tcp:", "udp:")))
+            self.assertFalse(any("libx264" in call or "libx265" in call or "-vf" in call for call in calls))
+            self.assertFalse(any(cfg.state_dir.glob("stoarama-certify-*")))
+
+    def test_media_certification_refuses_incomplete_inventory_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg, count=1)
+            inventory = pull.Inventory(cfg)
+            inventory._meta_set({"scan_completed_at": ""})
+            inventory.close()
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            with self.assertRaisesRegex(pull.MediaCertificationError, "completed NAS inventory"):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    1, str(ffmpeg), str(ffprobe),
+                )
+            inventory = pull.Inventory(cfg)
+            inventory._meta_set({"scan_completed_at": "2026-08-10T01:00:00Z"})
+            inventory.close()
+            real = paths[0]
+            moved = real.with_suffix(".real")
+            real.rename(moved)
+            real.symlink_to(moved.name)
+            with self.assertRaisesRegex(pull.MediaCertificationError, "symlink"):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    1, str(ffmpeg), str(ffprobe),
+                )
+
+    def test_media_certification_partitions_native_layouts_without_cross_run_concat(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            self.seed_certification_window(cfg)
+            ffmpeg, ffprobe, log_path = self.media_tools(root)
+            original_probe = pull.probe_native_media
+            probe_count = 0
+
+            def different_audio(path, binary):
+                nonlocal probe_count
+                result = original_probe(path, binary)
+                probe_count += 1
+                if probe_count == 2:
+                    result["signature"]["streams"][1]["extradata_hash"] = "SHA256:different-audio"
+                return result
+
+            with mock.patch.object(pull, "probe_native_media", side_effect=different_audio):
+                report = self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    2, str(ffmpeg), str(ffprobe),
+                )
+            self.assertEqual(len(report["native_runs"]), 2)
+            self.assertTrue(all(run["lossless_stitch_validation"] == "single_clip" for run in report["native_runs"]))
+            calls = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertFalse(any("\0-c\0copy\0" in ("\0" + call + "\0") for call in calls))
+
+    def test_media_certification_detects_change_during_decode(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg, count=1)
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+
+            def mutate_after_decode(path, _binary):
+                path.write_bytes(b"replacement")
+
+            with mock.patch.object(pull, "strict_decode_media", side_effect=mutate_after_decode), self.assertRaisesRegex(
+                pull.MediaCertificationError, "identity changed during decode"
+            ):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    1, str(ffmpeg), str(ffprobe),
+                )
+            self.assertEqual(paths[0].read_bytes(), b"replacement")
+
+    def test_media_certification_cli_failure_is_bounded(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            stderr = io.StringIO()
+            with mock.patch.object(pull, "Config", return_value=cfg), mock.patch("sys.stderr", stderr):
+                status = pull.main([
+                    "certify", "--recording-id", "77", "--window-start", "bad-secret-path",
+                    "--window-end", "2026-08-10T02:00:00Z",
+                ])
+            self.assertEqual(status, 1)
+            self.assertEqual(stderr.getvalue(), "certification failed: window_start must be an ISO-8601 timestamp\n")
+
+    def test_media_certification_cli_bounds_malformed_sidecar_failure(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg, count=1)
+            sidecar_path = pull.stitch_sidecar_path(paths[0])
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar["clip_id"] = "not-an-integer"
+            sidecar_path.write_text(json.dumps(sidecar) + "\n", encoding="utf-8")
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            stderr = io.StringIO()
+            with mock.patch.object(pull, "Config", return_value=cfg), mock.patch.object(
+                pull.os.path, "ismount", return_value=True
+            ), mock.patch("sys.stderr", stderr):
+                status = pull.main([
+                    "certify", "--recording-id", "77", "--window-start", "2026-08-10T00:00:00Z",
+                    "--window-end", "2026-08-10T02:00:00Z", "--ffmpeg-bin", str(ffmpeg),
+                    "--ffprobe-bin", str(ffprobe),
+                ])
+            self.assertEqual(status, 1)
+            self.assertIn("stitch sidecar clip_id is invalid", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertNotIn(str(cfg.output_dir), stderr.getvalue())
+
+    def test_media_certification_inventory_is_opened_read_only_and_generation_bound(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg, count=1)
+            database, summary = pull.open_certification_inventory(cfg)
+            try:
+                self.assertEqual(summary["generation"], "completed-generation")
+                with self.assertRaisesRegex(sqlite3.OperationalError, "readonly"):
+                    database.execute("UPDATE meta SET value='changed' WHERE key='generation'")
+            finally:
+                database.close()
+
+            writable = sqlite3.connect(str(cfg.inventory_file))
+            writable.execute("UPDATE files SET seen_generation='older-generation'")
+            writable.commit()
+            writable.close()
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            with self.assertRaisesRegex(pull.MediaCertificationError, "completed inventory generation"):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    1, str(ffmpeg), str(ffprobe),
+                )
+
+    def test_media_certification_refuses_mixed_recording_jobs(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg)
+            sidecar_path = pull.stitch_sidecar_path(paths[1])
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar["recording_job_id"] = 901
+            sidecar_path.write_text(json.dumps(sidecar, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            with self.assertRaisesRegex(pull.MediaCertificationError, "multiple recording jobs"):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    2, str(ffmpeg), str(ffprobe),
+                )
+
+    def test_media_certification_refuses_known_nonpresent_window_media(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            self.seed_certification_window(cfg, count=1)
+            inventory = pull.Inventory(cfg)
+            inventory.db.execute("UPDATE files SET state='mismatch' WHERE clip_id=1")
+            inventory.db.commit()
+            inventory.close()
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            with self.assertRaisesRegex(pull.MediaCertificationError, "without exact NAS proof"):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    1, str(ffmpeg), str(ffprobe),
+                )
+
+    def test_media_certification_ignores_newer_out_of_window_inventory_rows(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            self.seed_certification_window(cfg, count=1)
+            content = b"later"
+            clip = {
+                "clip_id": 99, "recording_id": 77, "recording_job_id": 901,
+                "relative_path": "recordings/99.mp4", "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(), "capture_generation": "gen-live",
+                "capture_sequence": 0, "clip_start_at": "2026-08-11T00:00:00Z",
+                "clip_end_at": "2026-08-11T00:01:00Z",
+            }
+            path = cfg.output_dir / clip["relative_path"]
+            path.write_bytes(content)
+            pull.write_stitch_sidecar(path, clip)
+            file_stat = path.stat()
+            inventory = pull.Inventory(cfg)
+            inventory._upsert(
+                clip, "present", "2026-08-11T00:02:00Z", file_stat.st_mtime_ns, "live",
+                file_identity=(file_stat.st_ctime_ns, file_stat.st_ino, file_stat.st_dev),
+            )
+            inventory.close()
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            report = self.certify_media_canary(
+                cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                1, str(ffmpeg), str(ffprobe),
+            )
+            self.assertEqual(report["selected_clip_count"], 1)
+
+    def test_media_certification_capture_generation_is_a_hard_run_boundary(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg)
+            sidecar_path = pull.stitch_sidecar_path(paths[1])
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar["capture_generation"] = "gen-2"
+            sidecar["capture_sequence"] = 0
+            sidecar_path.write_text(json.dumps(sidecar, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+            ffmpeg, ffprobe, log_path = self.media_tools(root)
+            report = self.certify_media_canary(
+                cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                2, str(ffmpeg), str(ffprobe),
+            )
+            self.assertEqual(len(report["native_runs"]), 2)
+            self.assertFalse(any("\0-c\0copy\0" in ("\0" + call + "\0") for call in log_path.read_text().splitlines()))
+
+    def test_media_certification_checks_generation_sequences_globally(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg, count=3)
+            changes = ((paths[0], "gen-a", 0), (paths[1], "gen-b", 0), (paths[2], "gen-a", 2))
+            for path, generation, sequence in changes:
+                sidecar_path = pull.stitch_sidecar_path(path)
+                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                sidecar["capture_generation"] = generation
+                sidecar["capture_sequence"] = sequence
+                sidecar_path.write_text(json.dumps(sidecar, sort_keys=True, separators=(",", ":")) + "\n")
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            with self.assertRaisesRegex(pull.MediaCertificationError, "sequence is incomplete"):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T03:00:00Z",
+                    3, str(ffmpeg), str(ffprobe),
+                )
+
+    def test_media_certification_rejects_duration_mismatch_and_invalid_timing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            paths = self.seed_certification_window(cfg, count=1)
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            with mock.patch.object(pull, "probe_native_media", return_value={
+                "duration_seconds": 5.0, "signature": {"streams": []},
+                "format_name": "mov,mp4", "container_start_time_seconds": 0.0,
+            }), self.assertRaisesRegex(pull.MediaCertificationError, "duration does not match"):
+                self.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    1, str(ffmpeg), str(ffprobe),
+                )
+            invalid = json.dumps({
+                "format": {"format_name": "mov,mp4", "duration": "NaN", "start_time": "0"},
+                "streams": [],
+            }).encode()
+            with mock.patch.object(pull, "bounded_tool_output", return_value=invalid), self.assertRaisesRegex(
+                pull.MediaCertificationError, "timing metadata is invalid"
+            ):
+                pull.probe_native_media(paths[0], str(ffprobe))
+
+    def test_media_certification_fails_closed_when_client_is_running_or_mounts_are_unverified(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cfg = self.config(root)
+            self.seed_certification_window(cfg, count=1)
+            ffmpeg, ffprobe, _ = self.media_tools(root)
+            with self.assertRaisesRegex(pull.MediaCertificationError, "distinct mounted storage roots"):
+                pull.certify_media_canary(
+                    cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                    1, str(ffmpeg), str(ffprobe),
+                )
+            holder = open(cfg.lock_file, "r", encoding="utf-8")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with self.assertRaisesRegex(pull.MediaCertificationError, "must be stopped"):
+                    self.certify_media_canary(
+                        cfg, 77, "2026-08-10T00:00:00Z", "2026-08-10T02:00:00Z",
+                        1, str(ffmpeg), str(ffprobe),
+                    )
+            finally:
+                holder.close()
 
     def test_scan_upserts_use_bounded_durable_commits_at_100k_scale(self):
         with tempfile.TemporaryDirectory() as raw:
