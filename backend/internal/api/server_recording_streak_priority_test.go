@@ -169,7 +169,7 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,(SELECT id FROM storage_destinations WHERE account_id=$3 LIMIT 1),'https://s3.example.test','streak','late',1,$4,$4,$4+interval '1 minute',$5)`, recID, jobID, accountID, open, open.Add(12*time.Hour+2*time.Minute))
+	_, err = pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,(SELECT id FROM storage_destinations WHERE account_id=$3 LIMIT 1),'https://s3.example.test','streak','late',1,$4::timestamptz,$4::timestamptz,$4::timestamptz+interval '1 minute',$5::timestamptz)`, recID, jobID, accountID, open, open.Add(12*time.Hour+2*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
