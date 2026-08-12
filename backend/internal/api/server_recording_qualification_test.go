@@ -127,6 +127,43 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	if err := json.Unmarshal(dry.Body.Bytes(), &planned); err != nil {
 		t.Fatal(err)
 	}
+	mutation, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutation.Exec(ctx, `UPDATE recordings SET status='paused' WHERE id=$1`, ids[0]); err != nil {
+		_ = mutation.Rollback(ctx)
+		t.Fatal(err)
+	}
+	concurrent := make(chan *httptest.ResponseRecorder, 1)
+	go func() { concurrent <- call(true, planned.Plan.PlanSHA256) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '/* qualification_plan */%')`).Scan(&waiting)
+		if err != nil {
+			_ = mutation.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = mutation.Rollback(ctx)
+			t.Fatal("qualification freeze did not reach the transaction-backed locked plan query")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := mutation.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	changed := <-concurrent
+	if changed.Code != http.StatusConflict {
+		t.Fatalf("concurrent mutation status=%d body=%s", changed.Code, changed.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
 	frozen := call(true, planned.Plan.PlanSHA256)
 	if frozen.Code != http.StatusCreated {
 		t.Fatalf("freeze status=%d body=%s", frozen.Code, frozen.Body.String())

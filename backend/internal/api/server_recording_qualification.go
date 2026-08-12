@@ -18,6 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const recordingQualificationDefinition = "recording-qualification-v1"
@@ -144,7 +145,15 @@ type qualificationPlan struct {
 	PlanSHA256        string                    `json:"plan_sha256"`
 }
 
+type qualificationPlanQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
 func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, req qualificationBuildRequest) (qualificationPlan, error) {
+	return buildQualificationPlanWith(ctx, s.pool, accountID, req)
+}
+
+func buildQualificationPlanWith(ctx context.Context, db qualificationPlanQuerier, accountID int64, req qualificationBuildRequest) (qualificationPlan, error) {
 	ids := append([]int64(nil), req.RecordingIDs...)
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	if len(ids) < 50 || req.SequenceStart.IsZero() {
@@ -155,14 +164,15 @@ func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, re
 			return qualificationPlan{}, invalidQualification("recording_ids must be unique positive integers")
 		}
 	}
-	rows, err := s.pool.Query(ctx, `
+	rows, err := db.Query(ctx, `/* qualification_plan */
 		SELECT r.id,r.stream_id,r.name,s.name,e.id,e.scene_identity_sha256,r.cron_timezone,
 		 to_char(r.daily_window_start,'HH24:MI:SS'),to_char(r.daily_window_end,'HH24:MI:SS'),r.active_weekdays,r.start_at,r.end_at
 		FROM unnest($2::bigint[]) WITH ORDINALITY q(id,ord)
 		JOIN recordings r ON r.id=q.id AND r.account_id=$1 AND r.status='active' AND r.mode='continuous'
 		JOIN streams s ON s.id=r.stream_id
 		JOIN LATERAL (SELECT id,scene_identity_sha256 FROM recording_scene_frame_evidence WHERE account_id=$1 AND stream_id=r.stream_id AND captured_at>=now()-interval '24 hours' ORDER BY verified_at DESC,id DESC LIMIT 1)e ON true
-		ORDER BY q.ord`, accountID, ids)
+		ORDER BY q.ord
+		FOR SHARE OF r,s`, accountID, ids)
 	if err != nil {
 		return qualificationPlan{}, err
 	}
@@ -223,21 +233,16 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 	if !decodeQualificationJSON(w, r, &req) {
 		return
 	}
-	plan, err := s.buildQualificationPlan(r.Context(), principal.AccountID, req)
-	if err != nil {
-		if errors.Is(err, errQualificationCohortInvalid) {
-			util.WriteError(w, http.StatusConflict, err.Error())
+	if !req.Apply {
+		plan, err := s.buildQualificationPlan(r.Context(), principal.AccountID, req)
+		if err != nil {
+			writeQualificationPlanError(w, principal.AccountID, err)
 			return
 		}
-		log.Printf("qualification plan failed account_id=%d: %v", principal.AccountID, err)
-		util.WriteError(w, http.StatusInternalServerError, "build qualification plan")
-		return
-	}
-	if !req.Apply {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": true, "plan": plan})
 		return
 	}
-	if len(req.ExpectedPlanSHA256) != 64 || !strings.EqualFold(req.ExpectedPlanSHA256, plan.PlanSHA256) {
+	if len(req.ExpectedPlanSHA256) != 64 {
 		util.WriteError(w, http.StatusConflict, "expected_plan_sha256 does not match current plan")
 		return
 	}
@@ -249,6 +254,15 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 	defer tx.Rollback(r.Context())
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-qualification:'||($1::bigint)::text,0))`, principal.AccountID); err != nil {
 		util.WriteError(w, 500, "lock qualification build")
+		return
+	}
+	plan, err := buildQualificationPlanWith(r.Context(), tx, principal.AccountID, req)
+	if err != nil {
+		writeQualificationPlanError(w, principal.AccountID, err)
+		return
+	}
+	if !strings.EqualFold(req.ExpectedPlanSHA256, plan.PlanSHA256) {
+		util.WriteError(w, http.StatusConflict, "expected_plan_sha256 does not match current plan")
 		return
 	}
 	var existing int64
@@ -313,6 +327,16 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"run_id": runID, "frozen": true, "target_recordings": len(plan.Members), "target_windows": 14, "plan_sha256": plan.PlanSHA256})
+}
+
+func writeQualificationPlanError(w http.ResponseWriter, accountID int64, err error) {
+	var pgErr *pgconn.PgError
+	if errors.Is(err, errQualificationCohortInvalid) || (errors.As(err, &pgErr) && pgErr.Code == "40001") {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	log.Printf("qualification plan failed account_id=%d: %v", accountID, err)
+	util.WriteError(w, http.StatusInternalServerError, "build qualification plan")
 }
 
 func execQualificationBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch) error {
