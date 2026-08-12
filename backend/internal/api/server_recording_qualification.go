@@ -247,7 +247,7 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 		return
 	}
 	defer tx.Rollback(r.Context())
-	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-qualification:'||$1::text,0))`, principal.AccountID); err != nil {
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-qualification:'||($1::bigint)::text,0))`, principal.AccountID); err != nil {
 		util.WriteError(w, 500, "lock qualification build")
 		return
 	}
