@@ -1970,6 +1970,36 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    def test_cancellable_tool_live_caps_stdout_stderr_and_kills_descendants(self):
+        for channel in ("stdout", "stderr"):
+            with self.subTest(channel=channel), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                script = root / "overflow.py"
+                child_pid = root / "child.pid"
+                stream = "sys.stdout.buffer" if channel == "stdout" else "sys.stderr.buffer"
+                script.write_text(
+                    "import subprocess,sys\n"
+                    "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+                    "open(sys.argv[1],'w').write(str(p.pid))\n"
+                    "chunk=b'x'*65536\n"
+                    "while True:\n"
+                    "  %s.write(chunk); %s.flush()\n" % (stream, stream),
+                    encoding="utf-8",
+                )
+                started = time.monotonic()
+                with self.assertRaisesRegex(pull.MediaCertificationError, "output exceeded"):
+                    pull.cancellable_tool_output(
+                        [os.sys.executable, str(script), str(child_pid)], threading.Event(), 30,
+                        stdout_limit=1024, stderr_limit=1024)
+                self.assertLess(time.monotonic() - started, 3, "live cap waited for the child timeout")
+                deadline = time.time() + 2
+                while not child_pid.exists() and time.time() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(child_pid.exists())
+                pid = int(child_pid.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
     def test_native_stitch_tool_failures_are_deterministic_only_for_repeatable_corruption(self):
         cancel = threading.Event()
         infrastructure = (

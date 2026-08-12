@@ -43,6 +43,9 @@ CREATE TABLE recording_upload_intents(recording_job_id bigint,status text,expire
 CREATE TABLE recording_clips(id bigint primary key,recording_id bigint,recording_job_id bigint,display_path text,size_bytes bigint,sha256 text,clip_start_at timestamptz,clip_end_at timestamptz,capture_lease_token uuid,capture_sequence bigint,purged_at timestamptz,capture_attempt_id uuid,timestamp_contract_version text,timestamp_contract jsonb,timestamp_contract_status text,timestamp_contract_reason text,storage_destination_id bigint,endpoint text,bucket text,object_key text,created_at timestamptz);
 CREATE TABLE recording_campaign_tracks(id bigint primary key,account_id bigint,campaign_key text,state text,deadline_at timestamptz);
 CREATE TABLE recording_campaign_roster_entries(track_id bigint,recording_id bigint,rank integer,role text,status text);
+CREATE TABLE recording_qualification_runs(id bigint primary key,account_id bigint,status text);
+CREATE TABLE recording_qualification_members(run_id bigint,account_id bigint,recording_id bigint,cron_timezone text,daily_window_start time,daily_window_end time,active_weekdays smallint,schedule_start_at timestamptz,schedule_end_at timestamptz,window_generator_version text,schedule_config_sha256 text,window_sequence_sha256 text,primary key(run_id,recording_id));
+CREATE TABLE recording_qualification_windows(run_id bigint,recording_id bigint,ordinal integer,local_open_at timestamp,local_end_at timestamp,open_utc_offset_seconds integer,end_utc_offset_seconds integer,window_start_at timestamptz,window_end_at timestamptz,primary key(run_id,recording_id,ordinal));
 INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO recordings VALUES(7,47,'continuous'),(8,47,'continuous');`
 	if _, err = conn.Exec(ctx, ddl); err != nil {
 		t.Fatal(err)
@@ -125,9 +128,49 @@ INSERT INTO recording_window_health VALUES
 	if err = tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	var qualificationScope string
+	if err = conn.QueryRow(ctx, `SELECT qualification_scope FROM recording_native_stitch_tasks WHERE recording_job_id=9`).Scan(&qualificationScope); err != nil || qualificationScope != "byte_run_audit" {
+		t.Fatalf("unfrozen historical job scope=%q err=%v", qualificationScope, err)
+	}
 	var tasks, taskClips int
 	if err = conn.QueryRow(ctx, `SELECT count(*),(SELECT count(*) FROM recording_native_stitch_task_clips) FROM recording_native_stitch_tasks`).Scan(&tasks, &taskClips); err != nil || tasks != 1 || taskClips != 1 {
 		t.Fatalf("tasks=%d task_clips=%d err=%v", tasks, taskClips, err)
+	}
+
+	// Only a frozen qualification occurrence rebuilt by the shared scheduler
+	// may be surfaced as qualification evidence. A wrong frozen UTC offset is
+	// rejected rather than inferred from the current recording schedule.
+	if _, err = conn.Exec(ctx, `INSERT INTO recording_qualification_runs VALUES(1,47,'active'); INSERT INTO recording_qualification_members VALUES(1,47,7,'UTC','08:00','20:00',127,$1-interval '1 day',NULL,'qualification-windows-v1',repeat('b',64),repeat('c',64)); INSERT INTO recording_qualification_windows VALUES(1,7,1,$1::timestamp,$2::timestamp,0,0,$1,$2)`, start, end); err != nil {
+		t.Fatal(err)
+	}
+	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	authority, authorityErr := loadStitchOccurrenceAuthority(ctx, tx, 47, 7, start, end)
+	_ = tx.Rollback(ctx)
+	if authorityErr != nil || authority.Scope != "authoritative_occurrence" {
+		t.Fatalf("frozen occurrence authority=%+v err=%v", authority, authorityErr)
+	}
+	if _, err = conn.Exec(ctx, `UPDATE recording_qualification_windows SET open_utc_offset_seconds=3600 WHERE run_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	_, authorityErr = loadStitchOccurrenceAuthority(ctx, tx, 47, 7, start, end)
+	_ = tx.Rollback(ctx)
+	if authorityErr == nil {
+		t.Fatal("mismatched frozen occurrence offset was accepted")
+	}
+	if _, err = conn.Exec(ctx, `UPDATE recording_qualification_windows SET open_utc_offset_seconds=0 WHERE run_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	dstStart := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	dstEnd := dstStart.Add(12 * time.Hour)
+	if _, err = conn.Exec(ctx, `INSERT INTO recording_qualification_runs VALUES(2,47,'active'); INSERT INTO recording_qualification_members VALUES(2,47,8,'America/New_York','08:00','20:00',127,$1-interval '1 day',NULL,'qualification-windows-v1',repeat('d',64),repeat('e',64)); INSERT INTO recording_qualification_windows VALUES(2,8,1,'2026-03-08 08:00:00','2026-03-08 20:00:00',-18000,-14400,$1,$2)`, dstStart, dstEnd); err != nil {
+		t.Fatal(err)
+	}
+	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	_, authorityErr = loadStitchOccurrenceAuthority(ctx, tx, 47, 8, dstStart, dstEnd)
+	_ = tx.Rollback(ctx)
+	if authorityErr == nil {
+		t.Fatal("DST occurrence with a pre-transition open offset was accepted")
 	}
 
 	// A fresh intent blocks planning under the transaction's DB-derived time.

@@ -456,6 +456,13 @@ func validateSeamEvidence(clips []ClipFact, runs []RunFact, seams []SeamFact, re
 			}
 			continue
 		}
+		// Exactness is a per-seam assertion and must be independently bound to
+		// server-frozen capture provenance even when the aggregate report keeps
+		// the frame axis UNKNOWN. Current v1 endpoint-only provenance cannot
+		// authorize client-authored packet/frame identities.
+		if !HasFramePerfectTimestampProvenance(left.ManifestClip) || !HasFramePerfectTimestampProvenance(right.ManifestClip) {
+			return fmt.Errorf("exact seam lacks server-owned frame provenance")
+		}
 		if seam.Verdict != "exact" || seam.Reason != "frame_adjacency_proven" || seam.Confidence != "high" ||
 			left.CaptureAttemptID == "" || left.CaptureAttemptID != right.CaptureAttemptID ||
 			!HasCompleteTimestampProvenance(left.ManifestClip) || !HasCompleteTimestampProvenance(right.ManifestClip) ||

@@ -15,6 +15,8 @@ CREATE TABLE recording_native_stitch_tasks (
   health_metric_version INTEGER NOT NULL CHECK(health_metric_version>=2),
   health_facts JSONB NOT NULL CHECK(jsonb_typeof(health_facts)='object'),
   job_schedule_facts JSONB NOT NULL CHECK(jsonb_typeof(job_schedule_facts)='object'),
+  qualification_scope TEXT NOT NULL DEFAULT 'byte_run_audit'
+    CHECK(qualification_scope IN('byte_run_audit','authoritative_occurrence')),
   clip_manifest JSONB NOT NULL CHECK(jsonb_typeof(clip_manifest)='array'),
   clip_manifest_sha256 TEXT NOT NULL CHECK(clip_manifest_sha256~'^[0-9a-f]{64}$'),
   clip_count INTEGER NOT NULL CHECK(clip_count BETWEEN 1 AND 1024),
@@ -181,11 +183,11 @@ BEGIN
   IF TG_OP='INSERT' AND NEW.state<>'pending' THEN RAISE EXCEPTION 'native stitch tasks start pending'; END IF;
   IF TG_OP='UPDATE' AND
     (NEW.account_id,NEW.recording_id,NEW.recording_job_id,NEW.window_start_at,NEW.window_end_at,
-     NEW.health_calculated_at,NEW.health_metric_version,NEW.health_facts,NEW.job_schedule_facts,NEW.clip_manifest,
+     NEW.health_calculated_at,NEW.health_metric_version,NEW.health_facts,NEW.job_schedule_facts,NEW.qualification_scope,NEW.clip_manifest,
      NEW.clip_manifest_sha256,NEW.clip_count,NEW.source_bytes,NEW.policy_version,NEW.priority)
     IS DISTINCT FROM
     (OLD.account_id,OLD.recording_id,OLD.recording_job_id,OLD.window_start_at,OLD.window_end_at,
-     OLD.health_calculated_at,OLD.health_metric_version,OLD.health_facts,OLD.job_schedule_facts,OLD.clip_manifest,
+     OLD.health_calculated_at,OLD.health_metric_version,OLD.health_facts,OLD.job_schedule_facts,OLD.qualification_scope,OLD.clip_manifest,
      OLD.clip_manifest_sha256,OLD.clip_count,OLD.source_bytes,OLD.policy_version,OLD.priority) THEN
     RAISE EXCEPTION 'native stitch task evidence is immutable';
   END IF;
@@ -246,7 +248,7 @@ FOR EACH STATEMENT EXECUTE FUNCTION reject_native_stitch_fact_mutation();
 
 CREATE VIEW recording_native_stitch_facts AS
 SELECT t.id task_id,t.policy_version,t.created_at task_created_at,
-  t.account_id,t.recording_id,t.recording_job_id,t.window_start_at,t.window_end_at,
+  t.account_id,t.recording_id,t.recording_job_id,t.window_start_at,t.window_end_at,t.qualification_scope,
   t.clip_manifest_sha256,t.clip_count,t.source_bytes,t.state,
   c.id certification_id,c.status,c.nas_byte_decode_status,c.native_run_concat_status,
   c.within_run_frame_adjacency_status,c.within_run_audio_sample_continuity_status,c.window_continuity_status,

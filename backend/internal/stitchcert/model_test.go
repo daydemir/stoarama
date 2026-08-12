@@ -136,22 +136,17 @@ func TestValidateSeamsRequiresContinuousCaptureProvenance(t *testing.T) {
 		NextFrames:     []SeamFrameEvidence{frame(30, hashA), frame(31, hashB), frame(32, hashB)},
 		Confidence:     "high", Verdict: "exact", Reason: "frame_adjacency_proven",
 	}
-	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err != nil {
-		t.Fatal(err)
-	}
-	seam.TimelineBasis = "clip_start_plus_presentation_offset_v1"
 	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err == nil {
-		t.Fatal("logical clip wall-time must not substitute for continuous source PTS")
+		t.Fatal("v1 endpoint-only provenance authorized an exact seam")
 	}
-	seam.TimelineBasis = "continuous_source_pts_v1"
-	// Equal decoded/packet payloads are legitimate for static scenes. The
-	// attested rational source timeline, not hashes, proves distinct adjacency.
-	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err != nil {
-		t.Fatalf("static repeated frame was falsely rejected: %v", err)
+	if err := ValidatePartialSeams(clips, runs, []SeamFact{seam}); err == nil {
+		t.Fatal("aggregate UNKNOWN persisted a client-authored exact v1 seam")
 	}
-	seam.NextFrames[0].BestEffortTimestamp++
-	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err == nil {
-		t.Fatal("missing rational presentation tick must fail")
+	seam.TimelineBasis, seam.CaptureContract = "unavailable", ""
+	seam.PreviousFrames, seam.NextFrames = nil, nil
+	seam.Confidence, seam.Verdict, seam.Reason = "none", "ambiguous", "continuous_source_pts_unavailable"
+	if err := ValidatePartialSeams(clips, runs, []SeamFact{seam}); err != nil {
+		t.Fatalf("honest v1 ambiguity was rejected: %v", err)
 	}
 }
 
@@ -296,10 +291,19 @@ func TestWithinRunAdjacencyPassAllowsObjectivePartitionButNotSeamlessWindow(t *t
 	if err := ValidateRuns(clips, runs); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateSeams(clips, runs, seams); err != nil {
+	if err := ValidateSeams(clips, runs, seams); err == nil {
+		t.Fatal("v1 exact seam escaped server-owned edge provenance gate")
+	}
+	seams[0].Verdict = "ambiguous"
+	seams[0].Reason = "continuous_source_pts_unavailable"
+	seams[0].TimelineBasis = "unavailable"
+	seams[0].Confidence = "none"
+	seams[0].PreviousFrames = nil
+	seams[0].NextFrames = nil
+	if err := ValidatePartialSeams(clips, runs, seams); err != nil {
 		t.Fatal(err)
 	}
-	report := Report{Status: "partial", NASByteDecodeStatus: "passed", NativeRunConcatStatus: "passed", WithinRunFrameAdjacencyStatus: "passed", WithinRunAudioContinuityStatus: "not_present", WindowContinuityStatus: "partitioned", NativeRuns: runs}
+	report := Report{Status: "partial", NASByteDecodeStatus: "passed", NativeRunConcatStatus: "passed", WithinRunFrameAdjacencyStatus: "unknown", WithinRunAudioContinuityStatus: "not_present", WindowContinuityStatus: "partitioned", NativeRuns: runs}
 	if err := ValidateAxisStatuses(report); err != nil {
 		t.Fatal(err)
 	}
@@ -353,8 +357,8 @@ func TestValidateClipAndSeamEvidenceCannotDivergeFromRecomputedContract(t *testi
 	}
 	runs := []RunFact{{Ordinal: 1, FirstClipOrdinal: 1, LastClipOrdinal: 2, ClipCount: 2, NativeSignatureSHA256: sig, CaptureGeneration: "g", CaptureAttemptID: "attempt", TimestampContract: "continuous-source-pts-v1", BoundaryReason: "window_start", ValidationStatus: "lossless_concat_decode_passed", SourceBytes: 2}}
 	seam := SeamFact{Ordinal: 1, PreviousClipID: 1, NextClipID: 2, CaptureGeneration: "g", PreviousSequence: 1, NextSequence: 2, NativeSignatureSHA256: sig, CaptureAttemptID: "attempt", TimelineBasis: "continuous_source_pts_v1", CaptureContract: "continuous-source-pts-v1", PreviousFrames: []SeamFrameEvidence{frame(27), frame(28), frame(29)}, NextFrames: []SeamFrameEvidence{frame(30), frame(31), frame(32)}, Confidence: "high", Verdict: "exact", Reason: "frame_adjacency_proven"}
-	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err != nil {
-		t.Fatal(err)
+	if err := ValidateSeams(clips, runs, []SeamFact{seam}); err == nil {
+		t.Fatal("v1 exact seam escaped server-owned edge provenance gate")
 	}
 	seam.PreviousFrames[2].BestEffortTimestamp = 26
 	seam.NextFrames[0].BestEffortTimestamp = 27

@@ -113,6 +113,7 @@ type nativeStitchClaimResponse struct {
 	WindowEndAt          time.Time                 `json:"window_end_at"`
 	ClipManifestSHA256   string                    `json:"clip_manifest_sha256"`
 	PolicyVersion        string                    `json:"policy_version"`
+	QualificationScope   string                    `json:"qualification_scope"`
 	Clips                []stitchcert.ManifestClip `json:"clips"`
 	InventoryGeneration  string                    `json:"inventory_generation"`
 	InventoryDigest      string                    `json:"inventory_digest"`
@@ -166,7 +167,7 @@ func (s *Server) handleAccountNativeStitchClaim(w http.ResponseWriter, r *http.R
 		raw []byte
 	}
 	claimRows, err := tx.Query(r.Context(), `
-		SELECT t.id,t.recording_id,t.recording_job_id,t.window_start_at,t.window_end_at,t.clip_manifest_sha256,t.policy_version,t.clip_manifest
+		SELECT t.id,t.recording_id,t.recording_job_id,t.window_start_at,t.window_end_at,t.clip_manifest_sha256,t.policy_version,t.qualification_scope,t.clip_manifest
 		FROM recording_native_stitch_tasks t
 		WHERE t.account_id=$1 AND t.state='pending' AND t.next_attempt_at<=now()
 		  AND (SELECT count(*) FROM nas_inventory_files i
@@ -182,7 +183,7 @@ func (s *Server) handleAccountNativeStitchClaim(w http.ResponseWriter, r *http.R
 	candidates := []candidate{}
 	for claimRows.Next() {
 		var c candidate
-		if err := claimRows.Scan(&c.out.TaskID, &c.out.RecordingID, &c.out.RecordingJobID, &c.out.WindowStartAt, &c.out.WindowEndAt, &c.out.ClipManifestSHA256, &c.out.PolicyVersion, &c.raw); err != nil {
+		if err := claimRows.Scan(&c.out.TaskID, &c.out.RecordingID, &c.out.RecordingJobID, &c.out.WindowStartAt, &c.out.WindowEndAt, &c.out.ClipManifestSHA256, &c.out.PolicyVersion, &c.out.QualificationScope, &c.raw); err != nil {
 			claimRows.Close()
 			util.WriteError(w, 500, "scan stitch task")
 			return

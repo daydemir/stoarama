@@ -1489,42 +1489,84 @@ def stable_native_signature_v1(probe_streams, format_name):
 
 def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024):
     """Bounded child group: cancellation cannot strand ffmpeg descendants."""
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        process = subprocess.Popen(
-            command, stdin=subprocess.DEVNULL, stdout=stdout_file, stderr=stderr_file,
-            start_new_session=True, env={"PATH": os.environ.get("PATH", "")},
-        )
-        started = time.monotonic()
+    if stdout_limit < 0 or stderr_limit < 0:
+        raise MediaCertificationError("media verification output bound is invalid")
+    process = subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True, env={"PATH": os.environ.get("PATH", "")},
+    )
+    exceeded = threading.Event()
+    stdout = bytearray()
+    stderr = bytearray()
+
+    def drain(stream, destination, limit):
         try:
-            while process.poll() is None:
-                cancelled = cancel.is_set()
-                timed_out = time.monotonic() - started > timeout
-                if cancelled or timed_out:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait(timeout=5)
-                    if cancelled:
-                        raise InventoryScanStopped("native stitch verification yielded to delivery or shutdown")
-                    raise MediaCertificationError("media verification tool timed out")
-                cancel.wait(.25)
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                remaining = max(0, limit + 1 - len(destination))
+                if remaining:
+                    destination.extend(chunk[:remaining])
+                if len(destination) > limit or len(chunk) > remaining:
+                    exceeded.set()
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=5)
-        stdout_file.seek(0); stdout = stdout_file.read(stdout_limit + 1)
-        stderr_file.seek(0); stderr = stderr_file.read(stderr_limit + 1)
-        if len(stdout) > stdout_limit or len(stderr) > stderr_limit:
-            raise MediaCertificationError("media verification output exceeded its bound")
-        if process.returncode:
-            raise ToolProcessError(process.returncode, stderr)
-        return stdout
+            stream.close()
+
+    readers = [
+        threading.Thread(target=drain, args=(process.stdout, stdout, stdout_limit), name="native-stitch-stdout", daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, stderr, stderr_limit), name="native-stitch-stderr", daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    def terminate_group():
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+
+    started = time.monotonic()
+    failure = None
+    try:
+        while process.poll() is None:
+            if exceeded.is_set():
+                failure = MediaCertificationError("media verification output exceeded its bound")
+                terminate_group()
+                break
+            if cancel.is_set():
+                failure = InventoryScanStopped("native stitch verification yielded to delivery or shutdown")
+                terminate_group()
+                break
+            if time.monotonic() - started > timeout:
+                failure = MediaCertificationError("media verification tool timed out")
+                terminate_group()
+                break
+            cancel.wait(.01)
+        process.wait()
+    finally:
+        terminate_group()
+        for reader in readers:
+            reader.join(timeout=5)
+        if any(reader.is_alive() for reader in readers):
+            raise MediaCertificationError("media verification output drain did not stop")
+    if exceeded.is_set() and failure is None:
+        failure = MediaCertificationError("media verification output exceeded its bound")
+    if failure is not None:
+        raise failure
+    if process.returncode:
+        raise ToolProcessError(process.returncode, bytes(stderr))
+    return bytes(stdout)
 
 
 _DETERMINISTIC_MEDIA_DIAGNOSTICS = (

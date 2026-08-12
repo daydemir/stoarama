@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -130,6 +131,71 @@ type consumedStitchIntent struct {
 	endpoint, bucket, key, path string
 }
 
+type stitchOccurrenceAuthority struct {
+	Scope string
+	Facts map[string]any
+}
+
+func loadStitchOccurrenceAuthority(ctx context.Context, tx pgx.Tx, accountID, recordingID int64, fire, windowEnd time.Time) (stitchOccurrenceAuthority, error) {
+	authority := stitchOccurrenceAuthority{Scope: "byte_run_audit", Facts: map[string]any{
+		"qualification_eligible": false, "authority_reason": "no_frozen_qualification_occurrence",
+	}}
+	var runID int64
+	var timezone, startRaw, endRaw, generator, scheduleSHA, windowsSHA string
+	var weekdays int16
+	var envStart time.Time
+	var envEnd *time.Time
+	var ordinal, openOffset, endOffset int
+	var localOpen, localEnd time.Time
+	err := tx.QueryRow(ctx, `SELECT m.run_id,m.cron_timezone,to_char(m.daily_window_start,'HH24:MI:SS'),to_char(m.daily_window_end,'HH24:MI:SS'),m.active_weekdays,m.schedule_start_at,m.schedule_end_at,m.window_generator_version,m.schedule_config_sha256,m.window_sequence_sha256,w.ordinal,w.local_open_at,w.local_end_at,w.open_utc_offset_seconds,w.end_utc_offset_seconds FROM recording_qualification_runs q JOIN recording_qualification_members m ON m.run_id=q.id AND m.account_id=q.account_id JOIN recording_qualification_windows w ON w.run_id=m.run_id AND w.recording_id=m.recording_id WHERE q.account_id=$1 AND q.status='active' AND m.recording_id=$2 AND w.window_start_at=$3 AND w.window_end_at=$4 FOR SHARE OF q,m,w`, accountID, recordingID, fire, windowEnd).Scan(
+		&runID, &timezone, &startRaw, &endRaw, &weekdays, &envStart, &envEnd, &generator, &scheduleSHA, &windowsSHA,
+		&ordinal, &localOpen, &localEnd, &openOffset, &endOffset)
+	if err == pgx.ErrNoRows {
+		return authority, nil
+	}
+	if err != nil {
+		return stitchOccurrenceAuthority{}, err
+	}
+	start, err := recsched.ParseTimeOfDay(startRaw)
+	if err != nil {
+		return stitchOccurrenceAuthority{}, err
+	}
+	end, err := recsched.ParseTimeOfDay(endRaw)
+	if err != nil {
+		return stitchOccurrenceAuthority{}, err
+	}
+	mask := recsched.WeekdaySet(weekdays)
+	envelopeEnd := time.Time{}
+	if envEnd != nil {
+		envelopeEnd = *envEnd
+	}
+	windows, err := recsched.NextFullContinuousWindowsOn(timezone, start, end, mask, envStart, envelopeEnd, fire, 1)
+	if err != nil {
+		return stitchOccurrenceAuthority{}, fmt.Errorf("rebuild frozen scheduler occurrence: %w", err)
+	}
+	if len(windows) != 1 {
+		return stitchOccurrenceAuthority{}, fmt.Errorf("rebuild frozen scheduler occurrence: got %d windows", len(windows))
+	}
+	window := windows[0]
+	_, rebuiltOpenOffset := window.LocalOpenAt.Zone()
+	_, rebuiltEndOffset := window.LocalEndAt.Zone()
+	if !window.OpenAt.Equal(fire) || !window.EndAt.Equal(windowEnd) ||
+		localOpen.Format("2006-01-02 15:04:05") != window.LocalOpenAt.Format("2006-01-02 15:04:05") ||
+		localEnd.Format("2006-01-02 15:04:05") != window.LocalEndAt.Format("2006-01-02 15:04:05") ||
+		openOffset != rebuiltOpenOffset || endOffset != rebuiltEndOffset {
+		return stitchOccurrenceAuthority{}, fmt.Errorf("frozen scheduler occurrence differs from recsched")
+	}
+	return stitchOccurrenceAuthority{Scope: "authoritative_occurrence", Facts: map[string]any{
+		"qualification_eligible": true, "qualification_run_id": runID, "qualification_window_ordinal": ordinal,
+		"cron_timezone": timezone, "daily_window_start": startRaw, "daily_window_end": endRaw,
+		"active_weekdays": weekdays, "schedule_start_at": envStart, "schedule_end_at": envEnd,
+		"window_generator_version": generator, "schedule_config_sha256": scheduleSHA,
+		"window_sequence_sha256": windowsSHA, "local_open_at": window.LocalOpenAt.Format("2006-01-02 15:04:05"),
+		"local_end_at":            window.LocalEndAt.Format("2006-01-02 15:04:05"),
+		"open_utc_offset_seconds": openOffset, "end_utc_offset_seconds": endOffset,
+	}}, nil
+}
+
 func planOneNativeStitch(ctx context.Context, tx pgx.Tx, c stitchPlanCandidate, apply bool) (string, string) {
 	var status, kind, idempotency string
 	var completed *time.Time
@@ -138,6 +204,10 @@ func planOneNativeStitch(ctx context.Context, tx pgx.Tx, c stitchPlanCandidate, 
 	err := tx.QueryRow(ctx, `SELECT status,kind,completed_at,scheduled_for,fire_at,window_end_at,clip_duration_sec,idempotency_key FROM recording_jobs WHERE id=$1 AND recording_id=$2 FOR SHARE`, c.JobID, c.RecordingID).Scan(&status, &kind, &completed, &scheduled, &fire, &windowEnd, &clipDuration, &idempotency)
 	if err != nil || status != "done" || kind != "continuous_window" || completed == nil || completed.Before(windowEnd) || !fire.Equal(c.FireAt) || !windowEnd.Equal(c.WindowEnd) || windowEnd.Sub(fire) != 12*time.Hour || idempotency != fmt.Sprintf("reccont:%d:%d", c.RecordingID, fire.Unix()) || scheduled.Before(fire) {
 		return "rejected", "invalid_scheduler_job_snapshot"
+	}
+	occurrence, err := loadStitchOccurrenceAuthority(ctx, tx, c.AccountID, c.RecordingID, fire, windowEnd)
+	if err != nil {
+		return "rejected", "invalid_authoritative_occurrence"
 	}
 	intentRows, err := tx.Query(ctx, `SELECT status,expires_at,recording_id,storage_destination_id,endpoint,bucket,object_key,display_path,max_size_bytes FROM recording_upload_intents WHERE recording_job_id=$1 FOR SHARE`, c.JobID)
 	if err != nil {
@@ -208,9 +278,10 @@ func planOneNativeStitch(ctx context.Context, tx pgx.Tx, c stitchPlanCandidate, 
 		return "rejected", "priority_out_of_range"
 	}
 	manifestJSON, _ := json.Marshal(clips)
-	jobFacts, _ := json.Marshal(map[string]any{"kind": kind, "fire_at": fire, "window_end_at": windowEnd, "scheduled_for": scheduled, "completed_at": completed, "clip_duration_sec": clipDuration, "idempotency_key": idempotency})
+	jobFactsMap := map[string]any{"kind": kind, "fire_at": fire, "window_end_at": windowEnd, "scheduled_for": scheduled, "completed_at": completed, "clip_duration_sec": clipDuration, "idempotency_key": idempotency, "occurrence_authority": occurrence.Facts}
+	jobFacts, _ := json.Marshal(jobFactsMap)
 	var taskID int64
-	err = tx.QueryRow(ctx, `INSERT INTO recording_native_stitch_tasks(account_id,recording_id,recording_job_id,window_start_at,window_end_at,health_calculated_at,health_metric_version,health_facts,job_schedule_facts,clip_manifest,clip_manifest_sha256,clip_count,source_bytes,policy_version,priority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, c.AccountID, c.RecordingID, c.JobID, c.FireAt, c.WindowEnd, healthAt, metric, healthRaw, jobFacts, manifestJSON, manifestSHA, len(clips), total, stitchcert.PolicyVersion, priority).Scan(&taskID)
+	err = tx.QueryRow(ctx, `INSERT INTO recording_native_stitch_tasks(account_id,recording_id,recording_job_id,window_start_at,window_end_at,health_calculated_at,health_metric_version,health_facts,job_schedule_facts,qualification_scope,clip_manifest,clip_manifest_sha256,clip_count,source_bytes,policy_version,priority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`, c.AccountID, c.RecordingID, c.JobID, c.FireAt, c.WindowEnd, healthAt, metric, healthRaw, jobFacts, occurrence.Scope, manifestJSON, manifestSHA, len(clips), total, stitchcert.PolicyVersion, priority).Scan(&taskID)
 	if err != nil {
 		return "rejected", "task_insert_failed"
 	}

@@ -289,6 +289,13 @@ func TestNativeStitchCompletionKeepsV1FrameProofPartialAndRejectsForgedSeamProve
 	report.WithinRunFrameAdjacencyStatus = "unknown"
 	report.WindowContinuityStatus = "unknown"
 	report.ReasonCodes = []string{"continuous_source_pts_unavailable"}
+	if rec := complete(report); rec.Code != http.StatusConflict {
+		t.Fatalf("partial v1 report persisted client-authored exact seam status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var rejectedState string
+	if err = pool.QueryRow(ctx, `SELECT state FROM recording_native_stitch_tasks WHERE id=$1`, taskID).Scan(&rejectedState); err != nil || rejectedState != "leased" {
+		t.Fatalf("rejected exact-v1 partial mutated task state=%s err=%v", rejectedState, err)
+	}
 	report.Seams[0].TimelineBasis = "unavailable"
 	report.Seams[0].Confidence = "none"
 	report.Seams[0].Verdict = "ambiguous"
