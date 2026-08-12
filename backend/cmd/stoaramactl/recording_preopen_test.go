@@ -56,6 +56,9 @@ func TestSelectPreopenTargetsStagesRetriesAndNeverAfterOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.RuntimeParams = map[string]string{"search_path": schema}
+	// The fixture setup and migration contain multiple SQL statements, matching
+	// the repository migration runner's simple-protocol execution.
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +76,7 @@ func TestSelectPreopenTargetsStagesRetriesAndNeverAfterOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
-	_, err = pool.Exec(ctx, `INSERT INTO recordings SELECT n,n,1,'r'||n,'https://example.com/live.m3u8','cloud','active','continuous',$1 + CASE n WHEN 1 THEN interval '90 minutes' WHEN 2 THEN interval '20 minutes' WHEN 3 THEN interval '-1 minute' WHEN 4 THEN interval '90 minutes' WHEN 5 THEN interval '90 minutes' ELSE interval '20 minutes' END FROM generate_series(1,6)n;INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method,attempt_count,next_retry_at) SELECT id,next_fire_at,'early','fail','media_probe',1,$1-interval '1 minute' FROM recordings WHERE id=4;INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method,attempt_count,next_retry_at) SELECT id,next_fire_at,'early','fail','media_probe',1,$1+interval '1 minute' FROM recordings WHERE id=5;INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method) SELECT id,next_fire_at,'confirm','pass','media_probe' FROM recordings WHERE id=6;`, now)
+	_, err = pool.Exec(ctx, `INSERT INTO recordings SELECT n,n,1,'r'||n,'https://example.com/live.m3u8','cloud','active','continuous',$1::timestamptz + CASE n WHEN 1 THEN interval '90 minutes' WHEN 2 THEN interval '20 minutes' WHEN 3 THEN interval '-1 minute' WHEN 4 THEN interval '90 minutes' WHEN 5 THEN interval '90 minutes' ELSE interval '20 minutes' END FROM generate_series(1,6)n;INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method,attempt_count,next_retry_at) SELECT id,next_fire_at,'early','fail','media_probe',1,$1::timestamptz-interval '1 minute' FROM recordings WHERE id=4;INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method,attempt_count,next_retry_at) SELECT id,next_fire_at,'early','fail','media_probe',1,$1::timestamptz+interval '1 minute' FROM recordings WHERE id=5;INSERT INTO recording_preopen_checks(recording_id,window_start_at,stage,result,method) SELECT id,next_fire_at,'confirm','pass','media_probe' FROM recordings WHERE id=6;`, now)
 	if err != nil {
 		t.Fatal(err)
 	}
