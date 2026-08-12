@@ -48,6 +48,15 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if err := pool.QueryRow(ctx, insertRec, otherAccount, "other", open.Add(-48*time.Hour), streamID).Scan(&otherRecID); err != nil {
 		t.Fatal(err)
 	}
+	var pausedInside, pausedOutside int64
+	pausedInsert := `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays,paused_at)
+	 VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),$2,'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'paused',$3,$4,'continuous','08:00','20:00',127,now()+$5::interval) RETURNING id`
+	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-inside", open.Add(-48*time.Hour), streamID, "-6 days 23 hours 59 minutes").Scan(&pausedInside); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, pausedInsert, accountID, "paused-outside", open.Add(-48*time.Hour), streamID, "-7 days 1 minute").Scan(&pausedOutside); err != nil {
+		t.Fatal(err)
+	}
 	var jobID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at)
 		VALUES($1,$2,$2,60,'done',$3,'continuous_window',$4) RETURNING id`, recID, open, "streak-job", open.Add(12*time.Hour)).Scan(&jobID); err != nil {
@@ -72,7 +81,20 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 		return out
 	}
 	out := call()
-	if len(out.Items) != 1 || out.Items[0].RecordingID != recID || out.Items[0].CurrentStreak != 1 {
+	seen := map[int64]bool{}
+	for _, it := range out.Items {
+		seen[it.RecordingID] = true
+	}
+	if !seen[recID] || !seen[pausedInside] || seen[pausedOutside] {
+		t.Fatalf("paused seven-day boundary wrong: inside=%t outside=%t items=%+v", seen[pausedInside], seen[pausedOutside], out.Items)
+	}
+	var mine *streakPriorityRecording
+	for i := range out.Items {
+		if out.Items[i].RecordingID == recID {
+			mine = &out.Items[i]
+		}
+	}
+	if mine == nil || mine.CurrentStreak != 1 {
 		t.Fatalf("out=%+v", out)
 	}
 	// A duplicate scheduled job makes the same expected window UNKNOWN.
@@ -81,22 +103,40 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 		t.Fatal(err)
 	}
 	out = call()
-	if out.Items[0].CurrentStreak != 0 || out.Items[0].RecentWindows[0].Grade != "UNKNOWN" {
-		t.Fatalf("duplicate did not fail closed: %+v", out.Items[0])
+	mine = nil
+	for i := range out.Items {
+		if out.Items[i].RecordingID == recID {
+			mine = &out.Items[i]
+		}
+	}
+	if mine == nil || mine.CurrentStreak != 0 || mine.RecentWindows[0].Grade != "UNKNOWN" {
+		t.Fatalf("duplicate did not fail closed: %+v", mine)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs WHERE id<>$1 AND recording_id=$2; UPDATE recording_window_health SET calculated_at=window_end_at-interval '1 second' WHERE recording_id=$2`, jobID, recID); err != nil {
 		t.Fatal(err)
 	}
 	out = call()
-	if out.Items[0].RecentWindows[0].Grade != "UNKNOWN" {
-		t.Fatalf("stale health did not fail closed: %+v", out.Items[0])
+	mine = nil
+	for i := range out.Items {
+		if out.Items[i].RecordingID == recID {
+			mine = &out.Items[i]
+		}
+	}
+	if mine == nil || mine.RecentWindows[0].Grade != "UNKNOWN" {
+		t.Fatalf("stale health did not fail closed: %+v", mine)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_window_health WHERE recording_id=$1`, recID); err != nil {
 		t.Fatal(err)
 	}
 	out = call()
-	if out.Items[0].RecentWindows[0].Grade != "UNKNOWN" {
-		t.Fatalf("missing health did not fail closed: %+v", out.Items[0])
+	mine = nil
+	for i := range out.Items {
+		if out.Items[i].RecordingID == recID {
+			mine = &out.Items[i]
+		}
+	}
+	if mine == nil || mine.RecentWindows[0].Grade != "UNKNOWN" {
+		t.Fatalf("missing health did not fail closed: %+v", mine)
 	}
 	// PostgreSQL timezone/calendar semantics used by the production query: DST
 	// changes UTC offsets while preserving the exact local 08:00-20:00 window.
