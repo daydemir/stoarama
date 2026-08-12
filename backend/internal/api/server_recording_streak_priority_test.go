@@ -52,7 +52,10 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if err := pool.QueryRow(ctx, insertRec, accountID, "envelope-excluded", open.Add(-48*time.Hour), streamID).Scan(&envelopeRec); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recordings SET end_at=$2 WHERE id=$1; INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES($1,$3,$3,60,'done','envelope-job','continuous_window',$4)`, envelopeRec, open.Add(11*time.Hour), open, open.Add(12*time.Hour)); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET end_at=$2 WHERE id=$1`, envelopeRec, open.Add(11*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES($1,$2,$2,60,'done','envelope-job','continuous_window',$3)`, envelopeRec, open, open.Add(12*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	var pausedInside, pausedOutside int64
