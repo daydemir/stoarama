@@ -186,7 +186,7 @@ services:
       - key: EMAIL_RESEND_API_KEY
         sync: false
 
-  # Cheap current-window and job checks every five minutes. This shares
+  # Cheap current-window, job, and timestamp checks every five minutes. This shares
   # the timeline advisory lock with the hourly sweep, so a coincident :30 run
   # serializes safely rather than racing alert transitions or delivery.
   - type: cron

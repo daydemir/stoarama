@@ -116,7 +116,7 @@ func runRecordingHealth(ctx context.Context, cfg config.Config, args []string) {
 func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("recording-health run", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "detect + print incidents only; do not email or write dedup rows")
-	liveOnly := fs.Bool("live-only", false, "check only current capture progress and jobs")
+	liveOnly := fs.Bool("live-only", false, "check only current capture progress, jobs, and timestamps")
 	freshnessMin := fs.Int("freshness-min", 10, "continuous silent-death freshness window in minutes")
 	verifyMedia := fs.Bool("verify-media", false, "download and ffprobe the newest adjacent clip pair for each paid active recording with recent retained clips, then decode-verify their concatenation")
 	_ = fs.Parse(args)
@@ -524,6 +524,9 @@ func liveRecordingHealthDetectors() []liveHealthDetector {
 		}},
 		{signalStuckLease, func(ctx context.Context, pool *pgxpool.Pool, _ int) []healthIncident {
 			return detectStuckLease(ctx, pool)
+		}},
+		{signalClipTimestampDrift, func(ctx context.Context, pool *pgxpool.Pool, _ int) []healthIncident {
+			return detectClipTimestampDrift(ctx, pool)
 		}},
 	}
 }
@@ -1103,6 +1106,12 @@ func detectClipTimestampDrift(ctx context.Context, pool *pgxpool.Pool) []healthI
 		  FROM recording_clips c
 		  WHERE c.recording_id = r.id
 		    AND c.created_at > now() - interval '1 hour'
+		    -- Every positive drift candidate necessarily starts after this bound:
+		    -- created_at > now()-1h AND clip_start_at > created_at+90s implies
+		    -- clip_start_at > now()-1h. Stating it lets PostgreSQL use the existing
+		    -- (recording_id, clip_start_at DESC) index instead of walking years of
+		    -- retained clips for every active recording.
+		    AND c.clip_start_at > now() - interval '1 hour'
 		  ORDER BY (c.clip_start_at - c.created_at) DESC
 		  LIMIT 1
 		) worst ON true

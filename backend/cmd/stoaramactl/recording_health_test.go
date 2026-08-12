@@ -206,11 +206,11 @@ func TestEvaluatedHealthSignalsAreDisjointByRunClass(t *testing.T) {
 	}
 	live := evaluatedHealthSignals(false, true)
 	wantLive := liveRecordingHealthSignals()
-	if fmt.Sprint(live) != fmt.Sprint(wantLive) || len(live) != 4 {
+	if fmt.Sprint(live) != fmt.Sprint(wantLive) || len(live) != 5 {
 		t.Fatalf("live signals=%v want=%v", live, wantLive)
 	}
 	for _, signal := range live {
-		if signal == signalContinuousCoverageLow || signal == signalStoredClipInvalid || signal == signalClipTimestampDrift {
+		if signal == signalContinuousCoverageLow || signal == signalStoredClipInvalid {
 			t.Fatalf("live sweep evaluates non-live signal %q", signal)
 		}
 	}
@@ -573,7 +573,8 @@ func TestDetectClipTimestampDriftFindsWorstClipNotNewest(t *testing.T) {
 		  (11, 101, 1, 'marginal',   'https://e.test/b', 'active', 'continuous'),
 		  (12, 102, 1, 'reanchored', 'https://e.test/c', 'active', 'continuous'),
 		  (13, 103, 1, 'stale',      'https://e.test/d', 'active', 'continuous'),
-		  (14, 104, 1, 'exactly90',  'https://e.test/e', 'active', 'continuous');
+		  (14, 104, 1, 'exactly90',  'https://e.test/e', 'active', 'continuous'),
+		  (15, 105, 1, 'old-timeline','https://e.test/f', 'active', 'continuous');
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +595,11 @@ func TestDetectClipTimestampDriftFindsWorstClipNotNewest(t *testing.T) {
 		  (13, now() - interval '5 hours' + interval '4 hours', now() - interval '5 hours'),
 		  -- exactly at the limit: the comparison is strictly greater-than, so the
 		  -- threshold itself is still healthy and must not page anyone
-		  (14, now() - interval '5 minutes' + interval '90 seconds', now() - interval '5 minutes');
+		  (14, now() - interval '5 minutes' + interval '90 seconds', now() - interval '5 minutes'),
+		  -- recently ingested but stamped on an old timeline. The index-enabling
+		  -- start-time bound drops this non-alertable negative drift without masking
+		  -- recording 12's qualifying future-stamped row.
+		  (15, now() - interval '2 hours', now() - interval '5 minutes');
 	`); err != nil {
 		t.Fatal(err)
 	}
