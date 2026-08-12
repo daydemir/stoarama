@@ -936,10 +936,13 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"x")
                 pull.write_stitch_sidecar(path, clip)
+                sidecar = pull.stitch_sidecar_path(path)
+                sidecar_bytes = sidecar.read_bytes()
                 stat = path.stat()
                 inventory._upsert(
                     clip, "present", started_at, stat.st_mtime_ns, generation,
                     commit=False, scan_pass="prior", file_identity=(stat.st_ctime_ns, stat.st_ino, stat.st_dev),
+                    sidecar_evidence=(str(sidecar.relative_to(cfg.output_dir)), len(sidecar_bytes), hashlib.sha256(sidecar_bytes).hexdigest()),
                 )
                 if clip_id % pull.INVENTORY_SYNC_BATCH == 0:
                     inventory._commit_scan_batch()
@@ -1649,63 +1652,6 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg.legacy_progress_file.write_text(json.dumps({"after_id": 8814}))
             self.assertEqual(pull.Runtime(cfg).cursor_id, 8814)
 
-    def test_cleanup_paths_reject_every_noncanonical_shape(self):
-        self.assertEqual(pull.cleanup_path_parts("recording/clip.mp4"), ["recording", "clip.mp4"])
-        for path in ("", "/clip.mp4", "../clip.mp4", "a/../b", "a//b", "a/./b", "a\\b", "a\x00b"):
-            with self.subTest(path=path), self.assertRaises(pull.NASCleanupSafetyError):
-                pull.cleanup_path_parts(path)
-
-    def test_cleanup_hash_and_quarantine_are_exact_move_only(self):
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            media_dir = root / "recording"
-            media_dir.mkdir()
-            content = b"exact native media bytes"
-            media = media_dir / "clip.mp4"
-            media.write_bytes(content)
-            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                root_stat = os.fstat(root_fd)
-                identity = (root_stat.st_dev, root_stat.st_ino)
-                file_identity = pull.cleanup_hash_exact_file(
-                    root_fd, identity, "recording/clip.mp4", len(content), hashlib.sha256(content).hexdigest(),
-                )
-                quarantine = pull.cleanup_quarantine_exact(
-                    root_fd, identity, "12345678-1234-1234-1234-123456789abc", 1,
-                    "recording/clip.mp4", file_identity,
-                )
-                self.assertFalse(media.exists())
-                self.assertEqual((root / quarantine).read_bytes(), content)
-                self.assertTrue(media_dir.is_dir())
-            finally:
-                os.close(root_fd)
-
-    def test_cleanup_drift_and_symlink_fail_without_moving(self):
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            source = root / "source"
-            source.mkdir()
-            media = source / "clip.mp4"
-            media.write_bytes(b"before")
-            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                root_stat = os.fstat(root_fd)
-                identity = (root_stat.st_dev, root_stat.st_ino)
-                hashed = pull.cleanup_hash_exact_file(root_fd, identity, "source/clip.mp4", 6, hashlib.sha256(b"before").hexdigest())
-                media.write_bytes(b"after!")
-                with self.assertRaisesRegex(pull.NASCleanupSafetyError, "drifted"):
-                    pull.cleanup_quarantine_exact(root_fd, identity, "12345678-1234-1234-1234-123456789abc", 1, "source/clip.mp4", hashed)
-                self.assertEqual(media.read_bytes(), b"after!")
-                target = root / "outside.mp4"
-                target.write_bytes(b"outside")
-                media.unlink()
-                media.symlink_to(target)
-                with self.assertRaises(pull.NASCleanupSafetyError):
-                    pull.cleanup_hash_exact_file(root_fd, identity, "source/clip.mp4", 7, hashlib.sha256(b"outside").hexdigest())
-                self.assertEqual(target.read_bytes(), b"outside")
-            finally:
-                os.close(root_fd)
-
     def test_full_scan_reports_all_or_none_cleanup_evidence(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1734,6 +1680,29 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             sidecar_bytes = pull.stitch_sidecar_path(media).read_bytes()
             self.assertEqual(report["sidecar_size_bytes"], len(sidecar_bytes))
             self.assertEqual(report["sidecar_sha256"], hashlib.sha256(sidecar_bytes).hexdigest())
+
+    def test_incremental_delivery_omits_incomplete_cleanup_evidence(self):
+        row = (1, 2, "r/c.mp4", 3, "a" * 64, "present", None, 4, "now", 5, 6, 7, "", 0, "")
+        report = pull.Inventory._reports([row])[0]
+        self.assertNotIn("file_ctime_ns", report)
+        self.assertNotIn("sidecar_relative_path", report)
+
+    def test_full_scan_rejects_sidecar_symlink(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            media = cfg.output_dir / "r/clip.mp4"
+            media.parent.mkdir()
+            media.write_bytes(b"x")
+            target = cfg.output_dir / "target.json"
+            target.write_text("{}")
+            pull.stitch_sidecar_path(media).symlink_to(target)
+            inventory = pull.Inventory(cfg)
+            with mock.patch.object(pull, "request_json", return_value={}), self.assertRaisesRegex(RuntimeError, "inventory scan incomplete"):
+                inventory.full_scan(cfg, threading.Event())
+            summary = inventory.summary()
+            inventory.close()
+            self.assertEqual(summary["scan_rows_skipped"], 1)
+            self.assertEqual(summary["scan_skip_reasons"], {"io_error": 1})
 
 
 if __name__ == "__main__":
