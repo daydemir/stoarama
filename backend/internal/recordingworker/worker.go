@@ -570,10 +570,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// restarts must NOT consume attempt_count, so fail() is never called for a
 	// resolve/capture drop here; the job only fails on a permanent misconfiguration.
 	// Jittered exponential reconnect backoff gives transient drops a fast retry and
-	// grows to a five-minute cap so a persistently dead source is not hammered,
+	// grows to a 30-second cap so a persistently dead source is not hammered,
 	// while an attempt that ingested at least one clip resets failures to zero. The
-	// sleep stays interruptible by windowCtx.Done() (window close / job cancel) just
-	// like a fixed delay.
+	// separate five-minute no-progress safeguard still hands a dead source to a new
+	// worker. The sleep stays interruptible by windowCtx.Done() (window close / job
+	// cancel) just like a fixed delay.
 	failures := 0
 	backoff := func(delay time.Duration) {
 		select {

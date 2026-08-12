@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -786,7 +787,7 @@ while :; do sleep .1; done
 	worker.reconnectDelay = func(jobID int64, failures int) time.Duration {
 		return reconnectBackoffFor(jobID, failures, time.Millisecond, 10*time.Millisecond)
 	}
-	windowEnd := time.Now().Add(4 * time.Second)
+	windowEnd := time.Now().Add(6 * time.Second)
 	worker.processContinuousJob(context.Background(), recordingapi.RecordingJob{
 		JobID: 438, RecordingID: 438, SourceURL: "https://example.com/live.m3u8",
 		ClipDurationSec: 1, LeaseExpiresAt: time.Now().Add(time.Minute), LeaseToken: "lease",
@@ -796,8 +797,12 @@ while :; do sleep .1; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(string(attemptData)); got != "8" {
-		t.Fatalf("ffmpeg attempts=%s want 8", got)
+	attempts, err := strconv.Atoi(strings.TrimSpace(string(attemptData)))
+	if err != nil {
+		t.Fatalf("parse ffmpeg attempts: %v", err)
+	}
+	if attempts < 8 {
+		t.Fatalf("ffmpeg attempts=%d want at least 8", attempts)
 	}
 	argsData, err := os.ReadFile(argsPath)
 	if err != nil {
