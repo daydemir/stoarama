@@ -519,23 +519,27 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "ingest", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
 				_, err := w.cfg.Client.IngestClip(segmentCtx, recordingapi.IngestClipRequest{
-					IntentID:        intent.IntentID,
-					JobID:           job.JobID,
-					SizeBytes:       seg.SizeBytes,
-					SHA256:          seg.SHA256,
-					DurationMs:      seg.DurationMs,
-					VideoCodec:      seg.VideoCodec,
-					AudioCodec:      seg.AudioCodec,
-					AudioPresent:    seg.AudioPresent,
-					ActualFPS:       seg.ActualFPS,
-					VideoWidth:      seg.VideoWidth,
-					VideoHeight:     seg.VideoHeight,
-					Container:       seg.Container,
-					ResolvedURL:     sourceURL,
-					ClipStartAt:     seg.StartAt,
-					ClipEndAt:       seg.EndAt,
-					LeaseToken:      job.LeaseToken,
-					CaptureSequence: seg.CaptureSequence,
+					IntentID:                intent.IntentID,
+					JobID:                   job.JobID,
+					SizeBytes:               seg.SizeBytes,
+					SHA256:                  seg.SHA256,
+					DurationMs:              seg.DurationMs,
+					VideoCodec:              seg.VideoCodec,
+					AudioCodec:              seg.AudioCodec,
+					AudioPresent:            seg.AudioPresent,
+					ActualFPS:               seg.ActualFPS,
+					VideoWidth:              seg.VideoWidth,
+					VideoHeight:             seg.VideoHeight,
+					Container:               seg.Container,
+					ResolvedURL:             sourceURL,
+					ClipStartAt:             seg.StartAt,
+					ClipEndAt:               seg.EndAt,
+					LeaseToken:              job.LeaseToken,
+					CaptureSequence:         seg.CaptureSequence,
+					CaptureAttemptID:        seg.CaptureAttemptID,
+					TimestampContract:       seg.TimestampContract,
+					TimestampContractStatus: seg.TimestampContractStatus,
+					TimestampContractReason: seg.TimestampContractReason,
 				})
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
@@ -700,6 +704,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				return err
 			}
 			seg.CaptureSequence = captureSequence + 1
+			if !job.TimestampContractSupported {
+				seg.CaptureAttemptID = ""
+				seg.TimestampContract = nil
+				seg.TimestampContractStatus = ""
+				seg.TimestampContractReason = ""
+			}
 			if err := pool.Submit(seg); err != nil {
 				return err
 			}
@@ -713,7 +723,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			return nil
 		}
-		captureErr := capture.CaptureContinuousWithHeaders(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
+		captureContinuous := continuousCaptureForJob(job)
+		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
@@ -799,6 +810,15 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	}
 	w.cfg.RelayDiagnostics.Finish(job.JobID, "done", nil)
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
+}
+
+type continuousCaptureFunc func(context.Context, string, time.Duration, string, *int, string, func(capture.Segment) error, string) error
+
+func continuousCaptureForJob(job recordingapi.RecordingJob) continuousCaptureFunc {
+	if job.TimestampContractSupported {
+		return capture.CaptureContinuousWithTimestampContract
+	}
+	return capture.CaptureContinuousWithHeaders
 }
 
 func continuousSelfUpdateCanSurrender(draining bool, deliveryErr error, windowClosed bool) bool {

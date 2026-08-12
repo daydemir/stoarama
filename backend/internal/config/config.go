@@ -49,6 +49,7 @@ type Config struct {
 	CaptureTickSec                   int
 	CaptureConcurrency               int
 	CaptureModeAllowlist             string
+	ContinuousSourcePTSCanary        string
 	CaptureLeaseSec                  int
 	CaptureUnsupportedThreshold      int
 	CaptureFrameQueueSize            int
@@ -192,6 +193,7 @@ func Load() (Config, error) {
 		CaptureTickSec:                   intEnv("CAPTURE_TICK_SEC", 1),
 		CaptureConcurrency:               intEnv("CAPTURE_CONCURRENCY", 8),
 		CaptureModeAllowlist:             strEnv("CAPTURE_MODE_ALLOWLIST", ""),
+		ContinuousSourcePTSCanary:        strEnv("CONTINUOUS_SOURCE_PTS_CANARY", ""),
 		CaptureLeaseSec:                  intEnv("CAPTURE_LEASE_SEC", 30),
 		CaptureUnsupportedThreshold:      intEnv("CAPTURE_UNSUPPORTED_THRESHOLD", 8),
 		CaptureFrameQueueSize:            intEnv("CAPTURE_FRAME_QUEUE_SIZE", 16),

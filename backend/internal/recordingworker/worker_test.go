@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,17 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
+
+func TestContinuousCaptureForJobRoutesCanaryExplicitly(t *testing.T) {
+	legacy := continuousCaptureForJob(recordingapi.RecordingJob{})
+	if reflect.ValueOf(legacy).Pointer() != reflect.ValueOf(capture.CaptureContinuousWithHeaders).Pointer() {
+		t.Fatal("default job did not select the legacy continuous capture path")
+	}
+	canary := continuousCaptureForJob(recordingapi.RecordingJob{TimestampContractSupported: true})
+	if reflect.ValueOf(canary).Pointer() != reflect.ValueOf(capture.CaptureContinuousWithTimestampContract).Pointer() {
+		t.Fatal("eligible job did not select the timestamp-contract capture path")
+	}
+}
 
 // TestContinuousShouldStop locks the supervisor loop's stop-vs-reconnect decision.
 // The load-bearing case is (canceled=false, windowClosed=false): CaptureContinuous
