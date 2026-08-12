@@ -81,6 +81,7 @@ func (s *Server) handleNodeRecordingCanaryStart(w http.ResponseWriter, r *http.R
 		  AND n.node_type='relay'
 		  AND n.status='active'
 		  AND n.last_heartbeat_at>=now()-interval '120 seconds'
+		  AND n.capabilities_jsonb @> '{"ffmpeg_runtime":{"qualified":true,"network_probe":"host_reached"}}'::jsonb
 		  AND rec.mode='continuous' AND rec.next_fire_at>now()
 		  AND rec.next_fire_at<=now()+interval '2 hours'
 		FOR UPDATE OF rec

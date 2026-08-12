@@ -221,8 +221,18 @@ func ffmpegNetworkProbe(bin string) string {
 
 func classifyFFmpegNetworkProbe(out string) string {
 	lower := strings.ToLower(out)
-	if strings.Contains(lower, "failed to resolve hostname") || strings.Contains(lower, "temporary failure in name resolution") {
+	switch {
+	case strings.Contains(lower, "failed to resolve hostname"), strings.Contains(lower, "temporary failure in name resolution"):
 		return "dns_failed"
+	case strings.Contains(lower, "certificate verify failed"),
+		strings.Contains(lower, "unable to get local issuer certificate"),
+		strings.Contains(lower, "certificate verification failed"),
+		strings.Contains(lower, "peer certificate cannot be authenticated"):
+		return "tls_verify_failed"
+	case strings.Contains(lower, "server returned 4"), strings.Contains(lower, "server returned 5"),
+		strings.Contains(lower, "http error 4"), strings.Contains(lower, "http error 5"):
+		return "host_reached"
+	default:
+		return "other_failure"
 	}
-	return "host_reached"
 }

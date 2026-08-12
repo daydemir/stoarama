@@ -96,6 +96,9 @@ func runRelay(ctx context.Context) error {
 	configureYTDLPJSRuntime(bd, ytdlp)
 	os.Unsetenv("YT_DLP_COOKIES_FROM_BROWSER")
 	os.Unsetenv("YT_DLP_COOKIES_FILE")
+	if err := configureRelayTLSRuntime(); err != nil {
+		return fmt.Errorf("configure relay TLS runtime: %w", err)
+	}
 	os.Setenv("FFMPEG_BIN", relayFFmpegBin(bd))
 	prependPath(bd) // ffprobe is resolved from PATH by the capture path
 

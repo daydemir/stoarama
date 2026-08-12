@@ -807,6 +807,7 @@ type ffmpegTelemetry struct {
 	networkProbe  string
 	systemVersion string
 	systemProbe   string
+	runtime       ffmpegRuntimeEvidence
 }
 
 func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
@@ -815,6 +816,7 @@ func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
 		version:      ffmpegVersion(active),
 		networkProbe: ffmpegNetworkProbe(active),
 	}
+	result.runtime = attestFFmpegRuntime(binDir, active, result.version, result.networkProbe)
 	if active == "/usr/bin/ffmpeg" {
 		result.systemVersion = result.version
 		result.systemProbe = result.networkProbe
@@ -900,6 +902,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			caps["ffmpeg_network_probe"] = info.networkProbe
 			caps["system_ffmpeg_version"] = info.systemVersion
 			caps["system_ffmpeg_probe"] = info.systemProbe
+			caps["ffmpeg_runtime"] = info.runtime
 		}
 		if diag != nil {
 			recording := diag.Snapshot()
