@@ -111,11 +111,16 @@ type healthIncident struct {
 
 func runRecordingHealth(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recording-health run [--dry-run --live-only --freshness-min 10]")
+		log.Fatalf("usage: stoaramactl recording-health run [--dry-run --live-only --freshness-min 10] | summary")
 	}
 	switch args[0] {
 	case "run":
 		runRecordingHealthRun(ctx, cfg, args[1:])
+	case "summary":
+		if len(args) != 1 {
+			log.Fatalf("usage: stoaramactl recording-health summary")
+		}
+		runRecordingHealthSummary(ctx, cfg)
 	default:
 		log.Fatalf("unknown recording-health subcommand: %s", args[0])
 	}

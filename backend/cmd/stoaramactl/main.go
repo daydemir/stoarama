@@ -183,6 +183,7 @@ func usage() {
 	  stoaramactl recorder-control run
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
+	  stoaramactl recording-health summary
 	  stoaramactl recording-preopen run [--dry-run --concurrency 4 --probe-sec 20 --frame-fresh-min 30]
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]
