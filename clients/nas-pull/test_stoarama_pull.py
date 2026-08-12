@@ -965,7 +965,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = pull.Runtime(cfg)
-            clip = {"clip_id": 1, "recording_id": 3}
+            clip = {"clip_id": 1, "recording_id": 3, "size_bytes": 10}
             calls = []
 
             class Inventory:
@@ -1276,7 +1276,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = pull.Runtime(cfg)
-            clips = [{"clip_id": value, "recording_id": 1} for value in (1, 2, 3)]
+            clips = [{"clip_id": value, "recording_id": 1, "size_bytes": 10} for value in (1, 2, 3)]
 
             def process(_cfg, clip, release=True):
                 if clip["clip_id"] == 2:
@@ -1298,7 +1298,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = pull.Runtime(cfg)
-            clip = {"clip_id": 1, "recording_id": 3}
+            clip = {"clip_id": 1, "recording_id": 3, "size_bytes": 10}
             with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), mock.patch.object(pull, "request_json", return_value={"clips": [clip]}), mock.patch.object(
                 pull, "process_clip", return_value=(1, 10, 10, 0)
             ), mock.patch.object(pull, "release_clips", side_effect=RuntimeError("release denied")):
@@ -1570,7 +1570,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = pull.Runtime(cfg)
-            clips = [{"clip_id": value, "recording_id": 3} for value in (1, 2)]
+            clips = [{"clip_id": value, "recording_id": 3, "size_bytes": 10} for value in (1, 2)]
             download_error = pull.RetryExhausted(RuntimeError("download failed"), 2)
             release_error = pull.RetryExhausted(RuntimeError("release failed"), 2)
 
