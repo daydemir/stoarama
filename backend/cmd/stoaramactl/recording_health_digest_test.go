@@ -116,6 +116,23 @@ func TestHealthDigestIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestDigestOperationalSignalsExcludeCompletedWindowOnlyAlerts(t *testing.T) {
+	live := map[string]bool{}
+	for _, signal := range liveRecordingHealthSignals() {
+		live[signal] = true
+	}
+	for _, historical := range []string{signalContinuousCoverageLow, signalContinuousOverlap, signalContinuousLongGap, signalContinuousFragmented, signalContinuousLayoutChange} {
+		if live[historical] {
+			t.Fatalf("completed-window signal %q would contaminate current digest", historical)
+		}
+	}
+	for _, current := range []string{signalContinuousSilentDeath, signalJobRetriesExhausted, signalStuckLease, signalClipTimestampDrift} {
+		if !live[current] {
+			t.Fatalf("current signal %q missing from digest registry", current)
+		}
+	}
+}
+
 func TestComposeHealthDigestNASCurrentAndRecoveredAreDistinct(t *testing.T) {
 	now := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
 	reported := now.Add(-time.Minute)

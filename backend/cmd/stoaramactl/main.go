@@ -196,6 +196,7 @@ func usage() {
 	  stoaramactl recordings qualification freeze --recording-ids IDS --sequence-start RFC3339 --expected-plan-sha256 HASH --session-cookie-file FILE
 	  stoaramactl recordings qualification report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings streak-priority report [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl recordings campaign-tracks report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl nas-inventory report --connection-id ID [--limit 50 --json]
 `)
 }
