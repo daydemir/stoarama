@@ -1097,7 +1097,12 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg = self.config(Path(raw))
             cfg.min_free_bytes = 1_000
             runtime = pull.Runtime(cfg)
-            low = {"available": True, "total_bytes": 10**12, "free_bytes": 1_000}
+            high = {
+                "available": True, "total_bytes": 10**12,
+                "free_bytes": cfg.min_free_bytes + pull.CAPACITY_RESUME_HYSTERESIS_BYTES,
+            }
+            self.assertTrue(runtime.reserve_storage(cfg, high))
+            low = {"available": True, "total_bytes": 10**12, "free_bytes": cfg.min_free_bytes - 1}
             self.assertFalse(runtime.reserve_storage(cfg, low))
             restarted = pull.Runtime(cfg)
             self.assertTrue(restarted.capacity_blocked)
