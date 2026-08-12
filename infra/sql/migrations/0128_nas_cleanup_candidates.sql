@@ -13,13 +13,15 @@ CREATE TABLE nas_cleanup_candidate_runs (
   total_bytes BIGINT NOT NULL CHECK(total_bytes>=0),
   unknown_count BIGINT NOT NULL DEFAULT 0 CHECK(unknown_count>=0),
   nas_rehash_required BOOLEAN NOT NULL DEFAULT true,
-  canonical_digest TEXT NOT NULL CHECK(canonical_digest~'^[0-9a-f]{64}$'),
+  request_digest TEXT NOT NULL CHECK(request_digest~'^[0-9a-f]{64}$'),
+  final_digest TEXT CHECK(final_digest IS NULL OR final_digest~'^[0-9a-f]{64}$'),
   error_code TEXT NOT NULL DEFAULT '',
   created_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,
-  UNIQUE(account_id,canonical_digest)
+  UNIQUE(account_id,request_digest),
+  CHECK ((state='ready')=(final_digest IS NOT NULL))
 );
 
 CREATE TABLE r2_content_verifications (
@@ -28,7 +30,7 @@ CREATE TABLE r2_content_verifications (
   endpoint_snapshot TEXT NOT NULL,
   bucket TEXT NOT NULL CHECK(bucket<>''),
   object_key TEXT NOT NULL CHECK(object_key<>''),
-  expected_size_bytes BIGINT NOT NULL CHECK(expected_size_bytes>=0),
+  expected_size_bytes BIGINT NOT NULL CHECK(expected_size_bytes>0),
   expected_sha256 TEXT NOT NULL CHECK(expected_sha256~'^[0-9a-f]{64}$'),
   status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN('queued','leased','verified','unknown')),
   observed_etag TEXT,
@@ -46,10 +48,21 @@ CREATE TABLE r2_content_verifications (
   error_code TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(storage_destination_id,endpoint_snapshot,bucket,object_key,expected_size_bytes,expected_sha256),
   CHECK((status='verified')=(verified_at IS NOT NULL AND observed_size_bytes=expected_size_bytes AND observed_sha256=expected_sha256))
 );
 CREATE INDEX idx_r2_content_verifications_claim ON r2_content_verifications(status,next_attempt_at,id);
+CREATE FUNCTION guard_r2_verification_identity() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF (NEW.id,NEW.storage_destination_id,NEW.endpoint_snapshot,NEW.bucket,NEW.object_key,
+     NEW.expected_size_bytes,NEW.expected_sha256,NEW.created_at)
+ IS DISTINCT FROM
+    (OLD.id,OLD.storage_destination_id,OLD.endpoint_snapshot,OLD.bucket,OLD.object_key,
+     OLD.expected_size_bytes,OLD.expected_sha256,OLD.created_at) THEN
+   RAISE EXCEPTION 'verification expected identity is immutable';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER trg_r2_verification_identity BEFORE UPDATE OR DELETE ON r2_content_verifications FOR EACH ROW EXECUTE FUNCTION guard_r2_verification_identity();
 
 CREATE TABLE nas_cleanup_candidate_items (
   run_id UUID NOT NULL REFERENCES nas_cleanup_candidate_runs(id) ON DELETE RESTRICT,
@@ -82,12 +95,18 @@ CREATE INDEX idx_nas_cleanup_candidate_items_verification ON nas_cleanup_candida
 -- Snapshot identity is immutable. Status/progress fields are worker-derived.
 CREATE FUNCTION guard_nas_cleanup_candidate_run() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+	IF OLD.final_digest IS NOT NULL AND NEW.final_digest IS DISTINCT FROM OLD.final_digest THEN
+	 RAISE EXCEPTION 'candidate final digest is immutable';
+	END IF;
+	IF NEW.final_digest IS NOT NULL AND NEW.state<>'ready' THEN
+	 RAISE EXCEPTION 'candidate final digest requires ready state';
+	END IF;
  IF (NEW.id,NEW.account_id,NEW.connection_id,NEW.recording_ids,NEW.inventory_generation,NEW.inventory_digest,
-     NEW.inventory_started_at,NEW.inventory_completed_at,NEW.item_count,NEW.total_bytes,NEW.canonical_digest,
+     NEW.inventory_started_at,NEW.inventory_completed_at,NEW.item_count,NEW.total_bytes,NEW.request_digest,
      NEW.created_by_user_id,NEW.created_at)
  IS DISTINCT FROM
     (OLD.id,OLD.account_id,OLD.connection_id,OLD.recording_ids,OLD.inventory_generation,OLD.inventory_digest,
-     OLD.inventory_started_at,OLD.inventory_completed_at,OLD.item_count,OLD.total_bytes,OLD.canonical_digest,
+     OLD.inventory_started_at,OLD.inventory_completed_at,OLD.item_count,OLD.total_bytes,OLD.request_digest,
      OLD.created_by_user_id,OLD.created_at) THEN RAISE EXCEPTION 'candidate snapshot is immutable'; END IF;
  RETURN NEW;
 END $$;
