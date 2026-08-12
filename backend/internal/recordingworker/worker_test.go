@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -694,9 +695,9 @@ func TestReconnectBackoff(t *testing.T) {
 		{failures: 1, min: time.Second, max: 2 * time.Second},
 		{failures: 2, min: 2 * time.Second, max: 4 * time.Second},
 		{failures: 3, min: 4 * time.Second, max: 8 * time.Second},
-		{failures: 6, min: 32 * time.Second, max: 64 * time.Second},
-		{failures: 9, min: 150 * time.Second, max: 5 * time.Minute},
-		{failures: 100, min: 150 * time.Second, max: 5 * time.Minute},
+		{failures: 6, min: 15 * time.Second, max: 30 * time.Second},
+		{failures: 9, min: 15 * time.Second, max: 30 * time.Second},
+		{failures: 100, min: 15 * time.Second, max: 30 * time.Second},
 	}
 	for _, tc := range cases {
 		got := reconnectBackoff(145539, tc.failures)
@@ -709,6 +710,57 @@ func TestReconnectBackoff(t *testing.T) {
 	}
 	if reconnectBackoff(145539, 1) == reconnectBackoff(145540, 1) {
 		t.Fatal("different jobs received identical first reconnect delay")
+	}
+}
+
+// TestContinuousReconnectRecoversWhenHLSReturns verifies the production retry
+// policy against a fake HLS origin that is unavailable long enough to hit the
+// cap, then becomes live. Durations are scaled down; reconnectBackoffFor is the
+// same implementation used by the worker's supervisor loop.
+func TestContinuousReconnectRecoversWhenHLSReturns(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) <= 7 {
+			http.NotFound(w, nil)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:42\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n"))
+	}))
+	defer server.Close()
+
+	client := server.Client()
+	started := time.Now()
+	for failure := 1; ; failure++ {
+		resp, err := client.Get(server.URL + "/live.m3u8")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if resp.StatusCode == http.StatusOK {
+			if !strings.Contains(string(body), "#EXT-X-MEDIA-SEQUENCE:42") {
+				t.Fatalf("recovered response is not the live HLS manifest: %q", body)
+			}
+			break
+		}
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status=%d want 404", resp.StatusCode)
+		}
+		delay := reconnectBackoffFor(438, failure, time.Millisecond, 10*time.Millisecond)
+		if delay > 10*time.Millisecond {
+			t.Fatalf("retry delay=%s exceeds cap", delay)
+		}
+		time.Sleep(delay)
+	}
+	if got := requests.Load(); got != 8 {
+		t.Fatalf("requests=%d want 8", got)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("recovery took %s with scaled 10ms cap", elapsed)
 	}
 }
 

@@ -1076,16 +1076,30 @@ func continuousDeliveryFailureShouldFail(captureErr error, windowClosed bool) bo
 		(!windowClosed && errors.Is(captureErr, errSegmentDeliveryExhausted))
 }
 
+const continuousReconnectMaxDelay = 30 * time.Second
+
 // reconnectBackoff returns a deterministic per-job jittered delay. It starts at
-// 1-2s for fast recovery after a healthy source drop and grows to 2.5-5m for a
+// 1-2s for fast recovery after a healthy source drop and grows to 15-30s for a
 // persistently dead source without synchronizing every job against one origin.
+// Keeping this well below the no-progress handoff timeout bounds how long an
+// active window can miss a source that recovered between attempts. FFmpeg exit
+// diagnostics are strings, not typed HTTP errors, so applying this only to
+// 404/5xx would be unreliable and could strand an equally transient transport
+// failure on the old multi-minute backoff.
 func reconnectBackoff(jobID int64, failures int) time.Duration {
-	const base = 2 * time.Second
-	const maxDelay = 5 * time.Minute
-	nominal := maxDelay
-	if failures-1 < 8 {
-		nominal = base << (failures - 1)
+	return reconnectBackoffFor(jobID, failures, 2*time.Second, continuousReconnectMaxDelay)
+}
+
+func reconnectBackoffFor(jobID int64, failures int, base, maxDelay time.Duration) time.Duration {
+	nominal := base
+	for attempt := 1; attempt < failures && nominal < maxDelay; attempt++ {
+		if nominal > maxDelay/2 {
+			nominal = maxDelay
+			break
+		}
+		nominal *= 2
 	}
+	nominal = min(nominal, maxDelay)
 	return jitteredDelay(jobID, failures, nominal)
 }
 
