@@ -131,7 +131,10 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if mine == nil || mine.CurrentStreak != 0 || mine.RecentWindows[0].Grade != "UNKNOWN" {
 		t.Fatalf("duplicate did not fail closed: %+v", mine)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs WHERE id<>$1 AND recording_id=$2; UPDATE recording_window_health SET calculated_at=window_end_at-interval '1 second' WHERE recording_id=$2`, jobID, recID); err != nil {
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs WHERE id<>$1 AND recording_id=$2`, jobID, recID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_window_health SET calculated_at=window_end_at-interval '1 second' WHERE recording_id=$1`, recID); err != nil {
 		t.Fatal(err)
 	}
 	out = call()
