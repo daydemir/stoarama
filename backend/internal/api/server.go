@@ -2,12 +2,14 @@ package api
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"math"
@@ -3085,8 +3087,13 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, "invalid authoritative frame payload")
 		return
 	}
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(frameBytes))
+	if err != nil || format != "jpeg" || cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > 8192 || cfg.Height > 8192 || int64(cfg.Width)*int64(cfg.Height) > 33_554_432 {
+		util.WriteError(w, http.StatusBadRequest, "invalid authoritative JPEG")
+		return
+	}
 	frame, err := capture.BuildFrameFromBytes(frameBytes, "image/jpeg", "authoritative_frame_refresh")
-	if err != nil || frame.Width <= 0 || frame.Height <= 0 || frame.Width > 8192 || frame.Height > 8192 || int64(frame.Width)*int64(frame.Height) > 33_554_432 {
+	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, "invalid authoritative JPEG")
 		return
 	}
@@ -3108,29 +3115,71 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) persistAuthoritativeFrameSuccess(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame) error {
-	return s.persistAuthoritativeFrameSuccessWithUpload(ctx, accountID, streamID, capturedAt, frame, s.r2.Bucket(), s.r2.PutBytes)
+	return s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, capturedAt, frame, s.r2.Bucket(), s.r2.PutBytes, func(ctx context.Context, key string) error {
+		return s.r2.DeleteObjects(ctx, []string{key})
+	})
 }
 
-func (s *Server) persistAuthoritativeFrameSuccessWithUpload(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error)) error {
-	var recordingID int64
-	if err := s.pool.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active' ORDER BY id LIMIT 1`, accountID, streamID).Scan(&recordingID); err != nil {
-		return err
-	}
+func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error), remove func(context.Context, string) error) (retErr error) {
 	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/authoritative-%d.jpg", streamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(), capturedAt.UnixNano())
-	etag, err := put(ctx, objectKey, frame.MIMEType, frame.Bytes)
-	if err != nil {
-		return fmt.Errorf("upload authoritative frame: %w", err)
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin authoritative frame tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Recheck under a shared row lock after upload so a concurrent pause/cancel
-	// cannot turn the uploaded object into accepted evidence for an inactive recording.
-	if err = tx.QueryRow(ctx, `SELECT id FROM recordings WHERE id=$1 AND account_id=$2 AND stream_id=$3 AND status='active' FOR SHARE`, recordingID, accountID, streamID).Scan(&recordingID); err != nil {
+	identity := fmt.Sprintf("authoritative-frame:%d:%s", streamID, capturedAt.UTC().Format(time.RFC3339Nano))
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, identity); err != nil {
+		return fmt.Errorf("lock authoritative frame identity: %w", err)
+	}
+	var recordingID int64
+	if err = tx.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active' ORDER BY id LIMIT 1 FOR SHARE`, accountID, streamID).Scan(&recordingID); err != nil {
 		return err
 	}
+	var existingSHA string
+	err = tx.QueryRow(ctx, `SELECT lower(m.sha256) FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.stream_id=$1 AND f.captured_at=$2 AND f.source_kind='authoritative_frame_refresh'`, streamID, capturedAt).Scan(&existingSHA)
+	if err == nil {
+		if existingSHA != frame.SHA256 {
+			return fmt.Errorf("authoritative frame identity hash conflict")
+		}
+		return tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("read authoritative frame identity: %w", err)
+	}
+	etag, err := put(ctx, objectKey, frame.MIMEType, frame.Bytes)
+	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if cleanupErr := remove(cleanupCtx, objectKey); cleanupErr != nil {
+			return fmt.Errorf("upload authoritative frame: %v; cleanup uncertain upload: %w", err, cleanupErr)
+		}
+		return fmt.Errorf("upload authoritative frame: %w", err)
+	}
+	uploaded := true
+	committed := false
+	defer func() {
+		_ = tx.Rollback(context.Background())
+		if uploaded && !committed {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			// A commit error can be ambiguous. Preserve a frame that did commit;
+			// otherwise remove the deterministic object before returning failure.
+			var persistedSHA string
+			verifyErr := s.pool.QueryRow(cleanupCtx, `SELECT lower(m.sha256) FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.stream_id=$1 AND f.captured_at=$2 AND f.source_kind='authoritative_frame_refresh'`, streamID, capturedAt).Scan(&persistedSHA)
+			if verifyErr == nil && persistedSHA == frame.SHA256 {
+				committed = true
+				retErr = nil
+				return
+			}
+			if cleanupErr := remove(cleanupCtx, objectKey); cleanupErr != nil {
+				if retErr == nil {
+					retErr = fmt.Errorf("cleanup authoritative frame after failure: %w", cleanupErr)
+				} else {
+					retErr = fmt.Errorf("%v; cleanup authoritative frame: %w", retErr, cleanupErr)
+				}
+			}
+		}
+	}()
 	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{StorageProvider: "r2", Bucket: bucket, ObjectKey: objectKey, MIMEType: frame.MIMEType, SizeBytes: frame.SizeBytes, ETag: etag, SHA256: frame.SHA256, Width: frame.Width, Height: frame.Height})
 	if err != nil {
 		return fmt.Errorf("upsert authoritative media: %w", err)
@@ -3144,6 +3193,7 @@ func (s *Server) persistAuthoritativeFrameSuccessWithUpload(ctx context.Context,
 	if err = tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit authoritative frame: %w", err)
 	}
+	committed = true
 	return nil
 }
 

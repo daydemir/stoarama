@@ -3,7 +3,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -13,6 +15,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +49,21 @@ func TestAuthoritativeFrameHandlerRejectsHeartbeatAndWrongAccount(t *testing.T) 
 	s.handleCaptureIngest(rr, body(48, false))
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("account status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAuthoritativeFrameHandlerRejectsOversizedJPEGHeaderBeforePersistence(t *testing.T) {
+	// Valid JPEG SOF metadata declaring 65535x65535 pixels. DecodeConfig can
+	// read it, but the handler must reject it before any persistence call.
+	huge := []byte{0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0xff, 0xff, 0xff, 0xff, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00, 0xff, 0xd9}
+	sum := sha256.Sum256(huge)
+	raw, _ := json.Marshal(map[string]any{"account_id": 47, "stream_id": 9, "status": "success", "captured_at": time.Now().UTC(), "mime_type": "image/jpeg", "frame_base64": base64.StdEncoding.EncodeToString(huge), "frame_sha256": hex.EncodeToString(sum[:]), "authoritative_frame_only": true})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/capture/ingest", bytes.NewReader(raw))
+	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{AccountID: 47, NodeType: nodeTypeLocalRecorder}))
+	rr := httptest.NewRecorder()
+	(&Server{}).handleCaptureIngest(rr, req)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "invalid authoritative JPEG") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -81,7 +100,8 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 		`CREATE TABLE streams(id bigserial primary key)`,
 		`CREATE TABLE recordings(id bigserial primary key,account_id bigint not null,stream_id bigint not null,status text not null,stream_url text not null)`,
 		`CREATE TABLE media_objects(id bigserial primary key,storage_provider text not null,bucket text not null,object_key text not null,mime_type text not null,size_bytes bigint not null,etag text not null default '',sha256 text,width integer,height integer,created_at timestamptz not null default now(),unique(bucket,object_key))`,
-		`CREATE TABLE frames(id bigserial primary key,stream_id bigint not null,capture_job_id bigint,captured_at timestamptz not null,raw_media_object_id bigint,capture_status text not null,capture_error text,source_kind text not null check(source_kind in ('live','snapshot_url','authoritative_frame_refresh')),created_at timestamptz not null default now())`,
+		`CREATE TABLE frames(id bigserial primary key,stream_id bigint not null,capture_job_id bigint,captured_at timestamptz not null,raw_media_object_id bigint,capture_status text not null,capture_error text,source_kind text not null check(source_kind in ('live','snapshot_url','survey','authoritative_frame_refresh')),created_at timestamptz not null default now())`,
+		`CREATE UNIQUE INDEX idx_frames_authoritative_identity ON frames(stream_id,captured_at) WHERE source_kind='authoritative_frame_refresh'`,
 		`CREATE TABLE stream_health(stream_id bigint primary key,captures_total bigint not null default 0,captures_success bigint not null default 0,captures_error bigint not null default 0,last_error_at timestamptz,last_error_text text,last_capture_at timestamptz,updated_at timestamptz not null default now())`,
 		`CREATE TABLE stream_capture_runtime(stream_id bigint primary key,execution_class text,resolved_capture_type text,resolved_url text,status text,last_resolved_at timestamptz,last_frame_at timestamptz,consecutive_errors integer not null default 0,last_error_text text,created_at timestamptz not null default now(),updated_at timestamptz not null default now())`,
 	} {
@@ -110,20 +130,34 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	putCount := 0
+	var putCount atomic.Int32
+	var removeCount atomic.Int32
 	s := &Server{pool: pool}
-	err = s.persistAuthoritativeFrameSuccessWithUpload(ctx, accountID, streamID, time.Now().UTC(), frame, "test-bucket", func(_ context.Context, key, mime string, body []byte) (string, error) {
-		putCount++
-		if !strings.Contains(key, "/authoritative-") || mime != "image/jpeg" || len(body) == 0 {
-			t.Fatal("invalid upload")
-		}
-		return "etag", nil
-	})
-	if err != nil {
-		t.Fatal(err)
+	capturedAt := time.Now().UTC()
+	store := func() error {
+		return s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, capturedAt, frame, "test-bucket", func(_ context.Context, key, mime string, body []byte) (string, error) {
+			putCount.Add(1)
+			if !strings.Contains(key, "/authoritative-") || mime != "image/jpeg" || len(body) == 0 {
+				t.Fatal("invalid upload")
+			}
+			return "etag", nil
+		}, func(context.Context, string) error { removeCount.Add(1); return nil })
 	}
-	if putCount != 1 {
-		t.Fatalf("uploads=%d", putCount)
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() { defer wg.Done(); errs <- store() }()
+	}
+	wg.Wait()
+	close(errs)
+	for err = range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if putCount.Load() != 1 || removeCount.Load() != 0 {
+		t.Fatalf("uploads=%d removes=%d", putCount.Load(), removeCount.Load())
 	}
 	var status, recURL, execClass, resolvedURL, runtimeStatus, sourceKind, mediaSHA string
 	var frames, successes int
@@ -139,8 +173,18 @@ func TestPersistAuthoritativeFrameDoesNotMutateRecordingOrRuntime(t *testing.T) 
 	if err = pool.QueryRow(ctx, `SELECT count(*) FROM frames WHERE stream_id=$1`, streamID).Scan(&frames); err != nil || frames != 1 {
 		t.Fatalf("frames=%d err=%v", frames, err)
 	}
-	putCount = 0
-	if err = s.persistAuthoritativeFrameSuccessWithUpload(ctx, accountID+1, streamID, time.Now().UTC(), frame, "test-bucket", func(context.Context, string, string, []byte) (string, error) { putCount++; return "etag", nil }); err == nil || putCount != 0 {
-		t.Fatalf("foreign account err=%v uploads=%d", err, putCount)
+	putCount.Store(0)
+	if err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID+1, streamID, time.Now().UTC(), frame, "test-bucket", func(context.Context, string, string, []byte) (string, error) { putCount.Add(1); return "etag", nil }, func(context.Context, string) error { return nil }); err == nil || putCount.Load() != 0 {
+		t.Fatalf("foreign account err=%v uploads=%d", err, putCount.Load())
+	}
+	// A post-upload DB failure must roll back rows and remove the R2 object.
+	if _, err = pool.Exec(ctx, `DROP TABLE stream_health`); err != nil {
+		t.Fatal(err)
+	}
+	putCount.Store(0)
+	removeCount.Store(0)
+	err = s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, time.Now().Add(time.Second).UTC(), frame, "test-bucket", func(context.Context, string, string, []byte) (string, error) { putCount.Add(1); return "etag", nil }, func(context.Context, string) error { removeCount.Add(1); return nil })
+	if err == nil || putCount.Load() != 1 || removeCount.Load() != 1 {
+		t.Fatalf("failure cleanup err=%v uploads=%d removes=%d", err, putCount.Load(), removeCount.Load())
 	}
 }
