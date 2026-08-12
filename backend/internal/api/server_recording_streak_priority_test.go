@@ -84,9 +84,34 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if out.Items[0].CurrentStreak != 0 || out.Items[0].RecentWindows[0].Grade != "UNKNOWN" {
 		t.Fatalf("duplicate did not fail closed: %+v", out.Items[0])
 	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs WHERE id<>$1 AND recording_id=$2; UPDATE recording_window_health SET calculated_at=window_end_at-interval '1 second' WHERE recording_id=$2`, jobID, recID); err != nil {
+		t.Fatal(err)
+	}
+	out = call()
+	if out.Items[0].RecentWindows[0].Grade != "UNKNOWN" {
+		t.Fatalf("stale health did not fail closed: %+v", out.Items[0])
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_window_health WHERE recording_id=$1`, recID); err != nil {
+		t.Fatal(err)
+	}
+	out = call()
+	if out.Items[0].RecentWindows[0].Grade != "UNKNOWN" {
+		t.Fatalf("missing health did not fail closed: %+v", out.Items[0])
+	}
+	// PostgreSQL timezone/calendar semantics used by the production query: DST
+	// changes UTC offsets while preserving the exact local 08:00-20:00 window.
+	var springHours, fallHours float64
+	if err := pool.QueryRow(ctx, `SELECT extract(epoch FROM((date '2026-03-08'+time '20:00') AT TIME ZONE 'America/New_York'-(date '2026-03-08'+time '08:00') AT TIME ZONE 'America/New_York'))/3600,
+	 extract(epoch FROM((date '2026-11-01'+time '20:00') AT TIME ZONE 'America/New_York'-(date '2026-11-01'+time '08:00') AT TIME ZONE 'America/New_York'))/3600`).Scan(&springHours, &fallHours); err != nil || springHours != 12 || fallHours != 12 {
+		t.Fatalf("DST local windows spring=%v fall=%v err=%v", springHours, fallHours, err)
+	}
+	var mondayIncluded, sundayIncluded bool
+	if err := pool.QueryRow(ctx, `SELECT (1::int & (1 << (extract(isodow FROM date '2026-08-10')::int-1)))<>0,(1::int & (1 << (extract(isodow FROM date '2026-08-09')::int-1)))<>0`).Scan(&mondayIncluded, &sundayIncluded); err != nil || !mondayIncluded || sundayIncluded {
+		t.Fatalf("weekday mask monday=%t sunday=%t err=%v", mondayIncluded, sundayIncluded, err)
+	}
 	// Explain the bounded production-shaped calendar query under PostgreSQL.
 	var plan string
-	if err := pool.QueryRow(ctx, `EXPLAIN (FORMAT TEXT) SELECT r.id,d.day FROM recordings r CROSS JOIN LATERAL generate_series((now() AT TIME ZONE r.cron_timezone)::date-60,(now() AT TIME ZONE r.cron_timezone)::date,interval '1 day')d(day) WHERE r.account_id=$1 AND r.id=$2`, accountID, recID).Scan(&plan); err != nil || plan == "" {
+	if err := pool.QueryRow(ctx, `EXPLAIN (FORMAT TEXT) `+streakPriorityFactsSQL, accountID).Scan(&plan); err != nil || plan == "" {
 		t.Fatalf("explain=%q err=%v", plan, err)
 	}
 }
