@@ -143,7 +143,7 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 	asOf := streakPriorityNow()
 	items := map[int64]*streakPriorityRecording{}
 	statuses := map[int64]string{}
-	eligibleRows, err := tx.Query(r.Context(), `WITH active AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'), paused AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=$2-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) SELECT * FROM active UNION ALL SELECT * FROM paused ORDER BY id`, p.AccountID, asOf)
+	eligibleRows, err := tx.Query(r.Context(), `WITH active AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'), paused AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=$2::timestamptz-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) SELECT * FROM active UNION ALL SELECT * FROM paused ORDER BY id`, p.AccountID, asOf)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read streak candidates")
 		return
@@ -202,7 +202,7 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		return
 	}
 	var pausedTotal int
-	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=$2-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00'`, p.AccountID, asOf).Scan(&pausedTotal); err != nil {
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=$2::timestamptz-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00'`, p.AccountID, asOf).Scan(&pausedTotal); err != nil {
 		util.WriteError(w, 500, "count streak candidates")
 		return
 	}
