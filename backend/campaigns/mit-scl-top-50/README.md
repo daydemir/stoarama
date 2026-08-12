@@ -35,3 +35,9 @@ expected to be ready. It exits nonzero for missing/inactive recordings,
 critical or unavailable capture health, missing relay readiness for any
 relay-backed recording, non-Plaza naming, non-NAS delivery, an unhealthy NAS,
 or a NAS backlog above `--max-nas-pending-clips` (zero by default).
+
+Ongoing delivery membership and repair priority are database-owned campaign
+tracks, not these schedule templates. See [OPERATIONS.md](OPERATIONS.md) for the
+live report command, evidence boundaries, provider caps, and safe swap policy.
+The versioned [source-evidence.json](source-evidence.json) records scouting and
+public source bindings only; it is never live roster or qualification truth.
