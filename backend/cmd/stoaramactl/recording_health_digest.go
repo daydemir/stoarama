@@ -167,7 +167,12 @@ func loadDigestNAS(ctx context.Context, pool *pgxpool.Pool) (digestNAS, error) {
 		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
 		         WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
 		           AND NOT EXISTS (SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'
-		             AND i.relative_path=rc.display_path AND i.size_bytes=rc.size_bytes AND i.sha256=lower(rc.sha256))),
+		             AND i.relative_path=rc.display_path AND i.size_bytes=rc.size_bytes AND i.sha256=lower(rc.sha256)
+		             AND i.verified_at>=now()-interval '72 hours' AND i.verified_at<=now()+interval '5 minutes'
+		             AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other WHERE other.connection_id=i.connection_id
+		               AND other.relative_path=i.relative_path AND other.clip_id<>i.clip_id AND other.state IN ('present','mismatch'))
+		             AND NOT EXISTS (SELECT 1 FROM nas_inventory_unmatched_files unmatched WHERE unmatched.connection_id=i.connection_id
+		               AND unmatched.relative_path=i.relative_path AND unmatched.state='present'))),
 		       COALESCE(e.state::text,''),e.observed_at
 		FROM connections c
 		LEFT JOIN LATERAL (SELECT state,observed_at FROM nas_storage_capacity_alert_events WHERE connection_id=c.id ORDER BY id DESC LIMIT 1) e ON true
