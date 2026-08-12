@@ -48,12 +48,29 @@ func TestRecordingJobSurrenderReason(t *testing.T) {
 	}
 }
 
+func TestSanitizeRecordingSurrenderError(t *testing.T) {
+	raw := "open https://user:pass@hd-auth.skylinewebcams.com/live.m3u8?a=secret token=secret\nAuthorization: Bearer abc.def " + strings.Repeat("x", 800)
+	got := sanitizeRecordingSurrenderError(raw, "no_progress")
+	for _, forbidden := range []string{"user:pass", "a=secret", "token=secret", "abc.def", "\n"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("sanitized error retained %q: %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "https://hd-auth.skylinewebcams.com/live.m3u8?[query]") {
+		t.Fatalf("sanitized error omitted safe URL shape: %q", got)
+	}
+	if len([]rune(got)) > 503 {
+		t.Fatalf("sanitized error length=%d", len([]rune(got)))
+	}
+}
+
 func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 	pool, cleanup := testRecordingLeasePool(t)
 	defer cleanup()
 
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id) VALUES (42);
 		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams)
 		VALUES (1, 42, 'relay', 'active', now(), 1),
 		       (2, 42, 'relay', 'active', now(), 1);
@@ -95,6 +112,184 @@ func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 	}
 	if handoffOwner != nil || persistedUntil != nil {
 		t.Fatalf("handoff was not cleared on lease: owner=%v until=%v", handoffOwner, persistedUntil)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs
+		SET status='pending', scheduled_for=now(), lease_owner=NULL, lease_expires_at=NULL,
+		    window_end_at=now()-interval '1 minute'
+		WHERE id=1
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, false); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("expired relay window lease err=%v, want pgx.ErrNoRows", err)
+	}
+}
+
+func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES (10, 42, 'local_recorder', 'active', now(), 1),
+		       (11, 42, 'local_recorder', 'active', now(), 1);
+		INSERT INTO recorder_droplets (name, node_id, state, capacity)
+		VALUES ('cloud-a', 10, 'active', 1),
+		       ('cloud-b', 11, 'active', 1);
+		INSERT INTO recordings
+			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
+		VALUES (1, 42, 7, 'continuous', 'https://example.test/live.m3u8', 'active', now()-interval '1 hour', 'cloud');
+		INSERT INTO recording_jobs
+			(id, recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+			 lease_owner, lease_expires_at, lease_token, attempt_count, idempotency_key, kind, window_end_at)
+		VALUES (1, 1, now(), now(), 60, 'leased',
+		        'cloud-a', now()+interval '3 minutes', '00000000-0000-0000-0000-000000000001', 1, 'cloud-handoff', 'continuous_window', now()+interval '1 hour');
+		INSERT INTO recording_clips (recording_job_id, capture_lease_token)
+		VALUES (1, '00000000-0000-0000-0000-000000000099')
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{pool: pool}
+	surrender := func(body, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/jobs/1/surrender", strings.NewReader(body))
+		req = req.WithContext(recordingJobReq(1, nodePrincipal{
+			NodeID: 10, AccountID: 42, NodeType: nodeTypeLocalRecorder, DisplayName: "cloud-a",
+		}).Context())
+		req.Header.Set(recordingLeaseTokenHeader, token)
+		rec := httptest.NewRecorder()
+		server.handleRecordingJobSurrender(rec, req)
+		return rec
+	}
+	if rec := surrender(`{"reason":"disk_pressure"}`, "00000000-0000-0000-0000-000000000001"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("cloud non-no-progress surrender status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := surrender(`{"reason":"no_progress"}`, "00000000-0000-0000-0000-000000000002"); rec.Code != http.StatusConflict {
+		t.Fatalf("cloud wrong-generation surrender status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var guardedStatus, guardedOwner string
+	if err := pool.QueryRow(ctx, `SELECT status,lease_owner FROM recording_jobs WHERE id=1`).Scan(&guardedStatus, &guardedOwner); err != nil {
+		t.Fatal(err)
+	}
+	if guardedStatus != "leased" || guardedOwner != "cloud-a" {
+		t.Fatalf("rejected surrender mutated job: status=%q owner=%q", guardedStatus, guardedOwner)
+	}
+	rec := surrender(`{
+		"reason":"no_progress",
+		"error_text":"skyline manifest contains no playable media segments"
+	}`, "00000000-0000-0000-0000-000000000001")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cloud surrender status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		HandoffUntil time.Time `json:"handoff_until"`
+		NextRetryAt  time.Time `json:"next_retry_at"`
+		HadClips     bool      `json:"had_clips"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.HadClips {
+		t.Fatal("zero-clip job reported landed clips")
+	}
+	delay := time.Until(response.NextRetryAt)
+	if delay < 50*time.Second || delay > 70*time.Second {
+		t.Fatalf("first no-progress retry delay=%s want about 1m", delay)
+	}
+	var blocked recordingLeaseResponse
+	err := pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
+		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		&blocked.JobID, &blocked.RecordingID, &blocked.SourceURL, &blocked.StreamID, &blocked.StreamProvider, &blocked.SourcePageURL, &blocked.ClipDurationSec,
+		&blocked.StorageDestinationID, &blocked.FireAt, &blocked.AttemptCount, &blocked.LeaseExpiresAt, &blocked.TargetFPS, &blocked.Kind, &blocked.WindowEndAt, &blocked.LeaseToken,
+	)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cloud job leased before retry deadline: err=%v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET scheduled_for=now() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	var priorOwner recordingLeaseResponse
+	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
+		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		&priorOwner.JobID, &priorOwner.RecordingID, &priorOwner.SourceURL, &priorOwner.StreamID, &priorOwner.StreamProvider, &priorOwner.SourcePageURL, &priorOwner.ClipDurationSec,
+		&priorOwner.StorageDestinationID, &priorOwner.FireAt, &priorOwner.AttemptCount, &priorOwner.LeaseExpiresAt, &priorOwner.TargetFPS, &priorOwner.Kind, &priorOwner.WindowEndAt, &priorOwner.LeaseToken,
+	)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("prior owner leased job during active handoff: err=%v", err)
+	}
+	var job recordingLeaseResponse
+	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
+		"cloud-b", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, true).Scan(
+		&job.JobID, &job.RecordingID, &job.SourceURL, &job.StreamID, &job.StreamProvider, &job.SourcePageURL, &job.ClipDurationSec,
+		&job.StorageDestinationID, &job.FireAt, &job.AttemptCount, &job.LeaseExpiresAt, &job.TargetFPS, &job.Kind, &job.WindowEndAt, &job.LeaseToken,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.JobID != 1 {
+		t.Fatalf("different cloud egress leased job=%d want 1", job.JobID)
+	}
+	var handoffOwner *string
+	var persistedUntil *time.Time
+	if err := pool.QueryRow(ctx, `SELECT handoff_owner, handoff_until FROM recording_jobs WHERE id=1`).Scan(&handoffOwner, &persistedUntil); err != nil {
+		t.Fatal(err)
+	}
+	if handoffOwner != nil || persistedUntil != nil {
+		t.Fatalf("cloud handoff was not cleared on lease: owner=%v until=%v", handoffOwner, persistedUntil)
+	}
+	var errorText string
+	if err := pool.QueryRow(ctx, `SELECT error_text FROM recording_jobs WHERE id=1`).Scan(&errorText); err != nil {
+		t.Fatal(err)
+	}
+	if errorText != "skyline manifest contains no playable media segments" {
+		t.Fatalf("error_text=%q", errorText)
+	}
+
+	if job.LeaseToken == nil {
+		t.Fatal("generation-aware cloud lease returned no token")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips (recording_job_id, capture_lease_token) VALUES (1, $1)`, job.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	var landedHandoffUntil, landedNextRetryAt time.Time
+	var landedHadClips bool
+	if err := pool.QueryRow(ctx, recordingJobCloudSurrenderSQL, 1, "cloud-b", "capture stopped after landed media", job.LeaseToken, 11).Scan(
+		&landedHandoffUntil, &landedNextRetryAt, &landedHadClips,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !landedHadClips {
+		t.Fatal("landed clip was not recognized during cloud handoff")
+	}
+	if delay := time.Until(landedNextRetryAt); delay < -5*time.Second || delay > 5*time.Second {
+		t.Fatalf("landed-media retry delay=%s want immediate", delay)
+	}
+	var clipCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM recording_clips WHERE recording_job_id=1`).Scan(&clipCount); err != nil {
+		t.Fatal(err)
+	}
+	if clipCount != 2 {
+		t.Fatalf("clip count=%d want old and current generation clips preserved", clipCount)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE recording_jobs
+		SET scheduled_for=now(), handoff_owner=NULL, handoff_until=NULL,
+		    window_end_at=now()-interval '1 minute'
+		WHERE id=1
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var expired recordingLeaseResponse
+	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
+		"cloud-c", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		&expired.JobID, &expired.RecordingID, &expired.SourceURL, &expired.StreamID, &expired.StreamProvider, &expired.SourcePageURL, &expired.ClipDurationSec,
+		&expired.StorageDestinationID, &expired.FireAt, &expired.AttemptCount, &expired.LeaseExpiresAt, &expired.TargetFPS, &expired.Kind, &expired.WindowEndAt, &expired.LeaseToken,
+	)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("expired cloud window lease err=%v, want pgx.ErrNoRows", err)
 	}
 }
 
@@ -526,6 +721,9 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 	}
 
 	for _, stmt := range []string{
+		`CREATE TABLE accounts (
+			id BIGINT PRIMARY KEY
+		)`,
 		`CREATE TABLE recorder_droplets (
 			name TEXT NOT NULL,
 			node_id BIGINT,
@@ -539,7 +737,12 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 		`CREATE TABLE relay_groups (
 			id BIGINT PRIMARY KEY,
 			account_id BIGINT NOT NULL,
-			max_streams INTEGER NOT NULL
+			max_streams INTEGER NOT NULL,
+			bandwidth_capacity_bps BIGINT
+		)`,
+		`CREATE TABLE recording_bandwidth_observations (
+			recording_id BIGINT PRIMARY KEY,
+			observed_bandwidth_bps BIGINT NOT NULL
 		)`,
 		`CREATE TABLE nodes (
 			id BIGINT PRIMARY KEY,
@@ -567,6 +770,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			end_at TIMESTAMPTZ,
 			target_fps INTEGER,
 			capture_via TEXT NOT NULL DEFAULT 'cloud',
+			preferred_relay_group_id BIGINT,
 			cron_timezone TEXT NOT NULL DEFAULT 'UTC',
 			naming_profile TEXT NOT NULL DEFAULT 'stoarama_v1',
 			folder_name TEXT NOT NULL DEFAULT 'recordings',
@@ -589,9 +793,15 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			window_end_at TIMESTAMPTZ,
 			handoff_owner TEXT,
 			handoff_until TIMESTAMPTZ,
+			relay_fairness_started_at TIMESTAMPTZ,
 			error_text TEXT,
 			completed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE recording_clips (
+			id BIGSERIAL PRIMARY KEY,
+			recording_job_id BIGINT NOT NULL,
+			capture_lease_token UUID
 		)`,
 		`CREATE TABLE storage_destinations (
 			id BIGINT PRIMARY KEY,

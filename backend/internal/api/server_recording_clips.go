@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -118,8 +119,9 @@ const relayLeaseSQL = `
 	    AND n.last_heartbeat_at >= now() - interval '120 seconds'
 	  WHERE j.status = 'pending'
 	    AND j.scheduled_for <= now()
-	    AND (j.kind = 'continuous_window'
-	         OR j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now())
+	    AND ((j.kind = 'continuous_window' AND j.window_end_at > now())
+	         OR (j.kind <> 'continuous_window'
+	             AND j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now()))
 	    AND rec.status = 'active'
 	    AND rec.start_at <= now()
 	    AND (rec.end_at IS NULL OR now() < rec.end_at)
@@ -376,12 +378,16 @@ const cloudRecordingJobsLeaseSQL = `
 	            AND live.lease_expires_at > now()
 	        ) < $5
 	    AND j.status = 'pending' AND j.scheduled_for <= now()
-	    AND (j.kind = 'continuous_window'
-	         OR j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now())
+	    AND ((j.kind = 'continuous_window' AND j.window_end_at > now())
+	         OR (j.kind <> 'continuous_window'
+	             AND j.fire_at + make_interval(secs => (j.clip_duration_sec + $4)) > now()))
 	    AND rec.status = 'active'
 	    AND rec.start_at <= now()
 	    AND (rec.end_at IS NULL OR now() < rec.end_at)
 	    AND rec.capture_via = 'cloud'
+	    AND (j.handoff_owner IS NULL
+	         OR j.handoff_owner <> $1
+	         OR j.handoff_until <= now())
 	    AND ($2 OR EXISTS (
 	          SELECT 1 FROM account_billing b
 	          WHERE b.account_id = rec.account_id
@@ -394,6 +400,8 @@ const cloudRecordingJobsLeaseSQL = `
 	SET status = 'leased',
 	    lease_owner = $1,
 	    lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)),
+	    handoff_owner = NULL,
+	    handoff_until = NULL,
 	    attempt_count = attempt_count + 1,
 	    lease_token = CASE WHEN $6 THEN gen_random_uuid() ELSE NULL END,
 	    updated_at = now()
@@ -867,7 +875,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		WHERE ui.id=$1 AND ui.status='pending'
 		  AND j.status='leased' AND j.lease_owner=$2
 		  AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > now()
-		FOR UPDATE OF ui
+		-- Serialize ingest with generation-fenced surrender. If ingest wins, the
+		-- clip commits before surrender computes had_clips; if surrender wins, this
+		-- rechecks the lease after waiting and rejects the old generation.
+		FOR UPDATE OF ui, j
 	`, intentID, workerID, leaseToken).Scan(
 		&recordingID, &jobID, &destID, &endpoint, &region,
 		&bucket, &objectKey, &displayPath, &mimeType, &maxSize, &fireAt,
@@ -1202,15 +1213,16 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		recordingID int64
 		kind        string
 		clipCount   int64
+		jobError    string
 	)
 	err = s.pool.QueryRow(r.Context(), `
-		SELECT j.recording_id, j.kind, COUNT(c.id)
+		SELECT j.recording_id, j.kind, COUNT(c.id), COALESCE(j.error_text, '')
 		FROM recording_jobs j
 		LEFT JOIN recording_clips c ON c.recording_job_id=j.id
 		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 		  AND j.lease_token IS NOT DISTINCT FROM $3
 		GROUP BY j.id
-	`, id, workerID, leaseToken).Scan(&recordingID, &kind, &clipCount)
+	`, id, workerID, leaseToken).Scan(&recordingID, &kind, &clipCount, &jobError)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
 		return
@@ -1220,7 +1232,7 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if kind == "continuous_window" && clipCount == 0 {
-		errText := "continuous recording produced no clips"
+		errText := sanitizeRecordingSurrenderError(jobError, "continuous recording produced no clips")
 		tx, err := s.pool.Begin(r.Context())
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin complete tx: %v", err))
@@ -1285,7 +1297,51 @@ func (r recordingJobSurrenderReason) valid() bool {
 }
 
 type recordingJobSurrenderRequest struct {
-	Reason recordingJobSurrenderReason `json:"reason"`
+	Reason    recordingJobSurrenderReason `json:"reason"`
+	ErrorText string                      `json:"error_text"`
+}
+
+var (
+	recordingSurrenderURLRE        = regexp.MustCompile(`https?://\S+`)
+	recordingSurrenderBearerRE     = regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]+=*`)
+	recordingSurrenderTokenFieldRE = regexp.MustCompile(`(?i)\b(token|signature|credential|access_key|secret_key)=\S+`)
+)
+
+func sanitizeRecordingSurrenderError(raw, fallback string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		s = fallback
+	}
+	s = recordingSurrenderURLRE.ReplaceAllStringFunc(s, func(rawURL string) string {
+		u, err := url.Parse(rawURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return "[url]"
+		}
+		hadQuery := u.RawQuery != ""
+		u.User = nil
+		u.RawQuery = ""
+		u.Fragment = ""
+		out := u.String()
+		if hadQuery {
+			out += "?[query]"
+		}
+		return out
+	})
+	s = recordingSurrenderBearerRE.ReplaceAllString(s, "${1}[redacted]")
+	s = recordingSurrenderTokenFieldRE.ReplaceAllString(s, "${1}=[redacted]")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	runes := []rune(strings.TrimSpace(s))
+	if len(runes) > 500 {
+		// Keep 500 content runes plus the three-rune ellipsis pinned by the
+		// regression test, for a maximum persisted length of 503 runes.
+		runes = append(runes[:500], '.', '.', '.')
+	}
+	return string(runes)
 }
 
 const recordingJobSurrenderSQL = `
@@ -1303,11 +1359,53 @@ const recordingJobSurrenderSQL = `
 	    updated_at = now()
 	WHERE j.id=$1
 	  AND j.kind='continuous_window'
+	  AND j.window_end_at > now()
 	  AND j.status='leased'
 	  AND j.lease_owner=$2
 	  AND j.lease_token IS NOT DISTINCT FROM $4
 	  AND j.lease_expires_at > now()
 	RETURNING j.handoff_until
+`
+
+const recordingJobCloudSurrenderSQL = `
+	WITH eligible AS (
+	  SELECT j.id, j.attempt_count,
+	         EXISTS (
+	           SELECT 1 FROM recording_clips c
+	           WHERE c.recording_job_id=j.id
+	             AND c.capture_lease_token IS NOT DISTINCT FROM j.lease_token
+	         ) AS had_clips
+	  FROM recording_jobs j
+	  JOIN recorder_droplets d ON d.name=$2 AND d.node_id=$5
+	    AND d.state IN ('provisioning', 'active')
+	  WHERE j.id=$1
+	    AND j.kind='continuous_window'
+	    AND j.window_end_at > now()
+	    AND j.status='leased'
+	    AND j.lease_owner=$2
+	    AND j.lease_token IS NOT DISTINCT FROM $4
+	    AND j.lease_expires_at > now()
+	  FOR UPDATE OF j
+	)
+	UPDATE recording_jobs j
+	SET status='pending',
+	    scheduled_for=now() + CASE
+	      WHEN eligible.had_clips THEN interval '0'
+	      WHEN eligible.attempt_count <= 1 THEN interval '1 minute'
+	      WHEN eligible.attempt_count = 2 THEN interval '2 minutes'
+	      ELSE interval '5 minutes'
+	    END,
+	    lease_owner=NULL,
+	    lease_expires_at=NULL,
+	    lease_token=NULL,
+	    handoff_owner=$2,
+	    handoff_until=now()+interval '5 minutes',
+	    error_text=$3,
+	    completed_at=NULL,
+	    updated_at=now()
+	FROM eligible
+	WHERE j.id=eligible.id
+	RETURNING j.handoff_until, j.scheduled_for, eligible.had_clips
 `
 
 func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Request) {
@@ -1316,8 +1414,8 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if principal.NodeType != nodeTypeRelay {
-		util.WriteError(w, http.StatusForbidden, "only relay nodes can surrender recording jobs")
+	if principal.NodeType != nodeTypeRelay && principal.NodeType != nodeTypeLocalRecorder {
+		util.WriteError(w, http.StatusForbidden, "only recording workers can surrender recording jobs")
 		return
 	}
 	leaseToken, err := recordingLeaseToken(r)
@@ -1338,25 +1436,49 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusBadRequest, "invalid surrender reason")
 		return
 	}
+	if principal.NodeType == nodeTypeLocalRecorder && req.Reason != recordingJobSurrenderNoProgress {
+		util.WriteError(w, http.StatusBadRequest, "cloud recorders can only surrender for no progress")
+		return
+	}
 
+	errorText := sanitizeRecordingSurrenderError(req.ErrorText, string(req.Reason))
 	var handoffUntil time.Time
-	err = s.pool.QueryRow(
-		r.Context(),
-		recordingJobSurrenderSQL,
-		id,
-		recorderWorkerID(principal),
-		string(req.Reason),
-		leaseToken,
-	).Scan(&handoffUntil)
+	var nextRetryAt time.Time
+	var hadClips bool
+	if principal.NodeType == nodeTypeLocalRecorder {
+		err = s.pool.QueryRow(
+			r.Context(),
+			recordingJobCloudSurrenderSQL,
+			id,
+			recorderWorkerID(principal),
+			errorText,
+			leaseToken,
+			principal.NodeID,
+		).Scan(&handoffUntil, &nextRetryAt, &hadClips)
+	} else {
+		err = s.pool.QueryRow(
+			r.Context(),
+			recordingJobSurrenderSQL,
+			id,
+			recorderWorkerID(principal),
+			errorText,
+			leaseToken,
+		).Scan(&handoffUntil)
+		nextRetryAt = time.Now()
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusConflict, "job is not an unexpired continuous lease owned by this relay")
+		util.WriteError(w, http.StatusConflict, "job is not an unexpired continuous lease owned by this worker")
 		return
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("surrender recording job: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"handoff_until": handoffUntil})
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"handoff_until": handoffUntil,
+		"next_retry_at": nextRetryAt,
+		"had_clips":     hadClips,
+	})
 }
 
 const recordingJobFailSQL = `

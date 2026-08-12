@@ -304,53 +304,83 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 // time.
 const freshnessGraceSec = 30
 
-// markStaleJobsMissed fails (status='error') every pending job past its freshness
-// window and bumps the owning recording's health counters so the miss is visible
-// in the recordings payload. The job moves to the terminal 'error' bucket (the
-// recording_jobs CHECK allows pending/leased/done/error/canceled), distinct from a
-// captured clip, so the schedule the user sees is truthful: on-time clip, or honest
-// miss, never a silently-wrong on-schedule-looking clip.
+// markStaleJobsMissed terminalizes work that can no longer be captured. Sampled
+// jobs past their freshness deadline are errors. An ended continuous window is
+// done when it preserved at least one clip and otherwise an error; this also
+// closes a surrender whose bounded retry landed after the window boundary.
 func (s *Scheduler) markStaleJobsMissed(ctx context.Context, tx pgx.Tx) error {
 	rows, err := tx.Query(ctx, `
-		UPDATE recording_jobs
-		SET status='error',
-		    error_text='capacity: not captured on schedule (freshness deadline exceeded)',
+		WITH stale AS (
+		  SELECT j.id,
+		         EXISTS (
+		           SELECT 1 FROM recording_clips c WHERE c.recording_job_id=j.id
+		         ) AS has_clips
+		  FROM recording_jobs j
+		  WHERE j.status='pending'
+		    AND ((j.kind='clip'
+		          AND j.fire_at + make_interval(secs => (j.clip_duration_sec + $1)) <= now())
+		         OR (j.kind='continuous_window' AND j.window_end_at <= now()))
+		)
+		UPDATE recording_jobs j
+		SET status=CASE
+		      WHEN j.kind='continuous_window' AND stale.has_clips THEN 'done'
+		      ELSE 'error'
+		    END,
+		    error_text=CASE
+		      WHEN j.kind='continuous_window' AND stale.has_clips THEN j.error_text
+		      WHEN j.kind='continuous_window' THEN COALESCE(
+		        NULLIF(btrim(j.error_text), ''),
+		        'continuous recording produced no clips'
+		      )
+		      ELSE 'capacity: not captured on schedule (freshness deadline exceeded)'
+		    END,
 		    lease_owner=NULL,
 		    lease_token=NULL,
 		    lease_expires_at=NULL,
 		    completed_at=now(),
 		    updated_at=now()
-		WHERE status='pending'
-		  AND kind='clip'
-		  AND fire_at + make_interval(secs => (clip_duration_sec + $1)) <= now()
-		RETURNING recording_id
+		FROM stale
+		WHERE j.id=stale.id
+		RETURNING j.recording_id, j.status, j.error_text
 	`, freshnessGraceSec)
 	if err != nil {
 		return fmt.Errorf("mark stale recording jobs missed: %w", err)
 	}
-	missedByRecording := make(map[int64]int)
+	type missedRecording struct {
+		count   int
+		message string
+	}
+	missedByRecording := make(map[int64]missedRecording)
 	for rows.Next() {
 		var recordingID int64
-		if err := rows.Scan(&recordingID); err != nil {
+		var status, errorText string
+		if err := rows.Scan(&recordingID, &status, &errorText); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan missed recording job: %w", err)
 		}
-		missedByRecording[recordingID]++
+		if status == "error" {
+			missed := missedByRecording[recordingID]
+			missed.count++
+			if missed.message == "" || (missed.message == "continuous recording produced no clips" && errorText != "continuous recording produced no clips") {
+				missed.message = errorText
+			}
+			missedByRecording[recordingID] = missed
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return fmt.Errorf("iterate missed recording jobs: %w", err)
 	}
 	rows.Close()
-	for recordingID, n := range missedByRecording {
+	for recordingID, missed := range missedByRecording {
 		if _, err := tx.Exec(ctx, `
 			UPDATE recordings
 			SET consecutive_failures = consecutive_failures + $2,
-			    last_error_text='capacity: not captured on schedule (freshness deadline exceeded)',
+			    last_error_text=$3,
 			    last_error_at=now(),
 			    updated_at=now()
 			WHERE id=$1
-		`, recordingID, n); err != nil {
+		`, recordingID, missed.count, missed.message); err != nil {
 			return fmt.Errorf("bump recording health for missed jobs: %w", err)
 		}
 	}

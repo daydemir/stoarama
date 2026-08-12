@@ -282,8 +282,11 @@ func (c *Client) FailRecordingJob(ctx context.Context, jobID int64, leaseToken, 
 	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/fail", jobID), map[string]any{"error_text": strings.TrimSpace(errText)}, leaseTokenHeaders(leaseToken), nil)
 }
 
-func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, leaseToken string, reason SurrenderReason) error {
-	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{"reason": reason}, leaseTokenHeaders(leaseToken), nil)
+func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, leaseToken string, reason SurrenderReason, errorText string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{
+		"reason":     reason,
+		"error_text": strings.TrimSpace(errorText),
+	}, leaseTokenHeaders(leaseToken), nil)
 }
 
 func leaseTokenHeaders(token string) map[string]string {
