@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "campaign_key": "mit-scl-top-50",
+  "evidence_as_of": "2026-08-12T16:39:10Z",
+  "scope": "Static public source binding and scouting decisions only. This file is not live roster membership, admission, qualification, NAS proof, or stitch certification.",
+  "provider_caps": [
+    {
+      "failure_domain": "youtube_live",
+      "max_probationary_scenes": 3,
+      "until": "independent clean completed windows prove the provider path"
+    },
+    {
+      "failure_domain": "skylinewebcams",
+      "max_probationary_scenes": 3,
+      "until": "independent clean completed windows prove the provider path"
+    },
+    {
+      "failure_domain": "seattle_streamlock",
+      "max_probationary_scenes": 2,
+      "until": "independent clean completed windows prove the provider path"
+    }
+  ],
+  "candidates": [
+    {
+      "rank": 1,
+      "stream_id": 17200,
+      "name": "Public square 052: Marktplatz",
+      "decision": "selected_addition",
+      "provider": "EU_SQUARES",
+      "failure_domain": "fairfast_native_hls",
+      "authoritative_binding": {
+        "kind": "official_city_page",
+        "public_page": "https://www.schwaebisch-gmuend.de/webcam-marktplatz.html",
+        "provider_source_id": "wolff-eu-square-052",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "independent_provider", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["city_page_to_wbc002_session_attestation_pending"]
+    },
+    {
+      "rank": 2,
+      "stream_id": 415,
+      "name": "Busan - Sebyeonggyo (Oncheoncheon)",
+      "decision": "selected_addition",
+      "provider": "KBS",
+      "failure_domain": "kbs_cctv",
+      "authoritative_binding": {
+        "kind": "official_catalog_id_and_address",
+        "public_page": "https://d.kbs.co.kr/special/cctv",
+        "provider_source_id": "9967",
+        "location": "Dongnae-gu, Busan; 부산 동래구 수안동 709-1",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "official_catalog", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_kbs_failure_domain"]
+    },
+    {
+      "rank": 3,
+      "stream_id": 78,
+      "name": "Seoul - Daechi Station Intersection",
+      "decision": "selected_addition",
+      "provider": "KBS",
+      "failure_domain": "kbs_cctv",
+      "authoritative_binding": {
+        "kind": "official_catalog_id_and_address",
+        "public_page": "https://d.kbs.co.kr/special/cctv",
+        "provider_source_id": "9996",
+        "location": "Gangnam-gu, Seoul; 서울 강남구 대치동 600",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "official_catalog", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_kbs_failure_domain"]
+    },
+    {
+      "rank": 4,
+      "stream_id": 17237,
+      "name": "Seoul - Anguk",
+      "decision": "selected_addition",
+      "provider": "SPATIC",
+      "failure_domain": "spatic",
+      "authoritative_binding": {
+        "kind": "official_wfs_device_mapping",
+        "provider_source_id": "CTV0000131",
+        "location": "Anguk, Seoul",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "official_device_mapping", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["official_page_session_attestation_pending"]
+    },
+    {
+      "rank": 5,
+      "stream_id": 17189,
+      "name": "Krakow Webcam - Central Square Live Cam",
+      "decision": "primary_reserve",
+      "provider": "WEBCAM.SCS.COM.UA",
+      "failure_domain": "webcamera_pl_native_hls",
+      "authoritative_binding": {
+        "kind": "public_source_page",
+        "public_page": "https://webcam.scs.com.ua/en/europe/poland/krakow/central-square-live/",
+        "provider_source_id": "webcam.scs.com.ua-87c345bce93ba407",
+        "confidence": "medium"
+      },
+      "reason_codes": ["distinct_scene", "independent_provider", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["third_party_page_not_city_owned"]
+    },
+    {
+      "rank": 6,
+      "stream_id": 12750,
+      "name": "Prague - Old Town Live cam",
+      "decision": "probationary_reserve",
+      "provider": "SKYLINEWEBCAMS",
+      "failure_domain": "skylinewebcams",
+      "authoritative_binding": {
+        "kind": "provider_camera_page",
+        "public_page": "https://www.skylinewebcams.com/en/webcam/czech-republic/prague/prague/old-town.html",
+        "provider_source_id": "3537",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_skyline_cap", "tokenized_master_source"]
+    },
+    {
+      "rank": 7,
+      "stream_id": 13126,
+      "name": "Madrid - Calle de Alcalá Live cam",
+      "decision": "probationary_reserve",
+      "provider": "SKYLINEWEBCAMS",
+      "failure_domain": "skylinewebcams",
+      "authoritative_binding": {
+        "kind": "provider_camera_page",
+        "public_page": "https://www.skylinewebcams.com/en/webcam/espana/comunidad-de-madrid/madrid/calle-alcala.html",
+        "provider_source_id": "314",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_skyline_cap", "tokenized_master_source"]
+    },
+    {
+      "rank": 8,
+      "stream_id": 13874,
+      "name": "Milan Cathedral Live cam",
+      "decision": "probationary_reserve",
+      "provider": "SKYLINEWEBCAMS",
+      "failure_domain": "skylinewebcams",
+      "authoritative_binding": {
+        "kind": "provider_camera_page",
+        "public_page": "https://www.skylinewebcams.com/en/webcam/italia/lombardia/milano/duomo-milano.html",
+        "provider_source_id": "395",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_skyline_cap", "tokenized_master_source"]
+    },
+    {
+      "rank": 9,
+      "stream_id": 17243,
+      "name": "Key West - Duval Street",
+      "decision": "probationary_reserve",
+      "provider": "YOUTUBE",
+      "failure_domain": "youtube_live",
+      "authoritative_binding": {
+        "kind": "publisher_watch_page",
+        "public_page": "https://www.youtube.com/watch?v=3bXyYuk-XK0",
+        "provider_source_id": "3bXyYuk-XK0",
+        "confidence": "medium"
+      },
+      "reason_codes": ["distinct_scene", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_youtube_cap", "publisher_location_binding_pending"]
+    },
+    {
+      "rank": 10,
+      "stream_id": 17247,
+      "name": "Koh Samui - Chaweng Beach, Hush Bar",
+      "decision": "probationary_reserve",
+      "provider": "YOUTUBE",
+      "failure_domain": "youtube_live",
+      "authoritative_binding": {
+        "kind": "publisher_watch_page",
+        "public_page": "https://www.youtube.com/watch?v=DwKCna1mumk",
+        "provider_source_id": "DwKCna1mumk",
+        "confidence": "medium"
+      },
+      "reason_codes": ["distinct_scene", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_youtube_cap", "publisher_location_binding_pending"]
+    },
+    {
+      "rank": 11,
+      "stream_id": 17235,
+      "name": "Davao City - Soliman Street, Agdao",
+      "decision": "probationary_reserve",
+      "provider": "YOUTUBE",
+      "failure_domain": "youtube_live",
+      "authoritative_binding": {
+        "kind": "publisher_watch_page",
+        "public_page": "https://www.youtube.com/watch?v=DSRm7V_bsm8",
+        "provider_source_id": "DSRm7V_bsm8",
+        "confidence": "low"
+      },
+      "reason_codes": ["distinct_scene", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_youtube_cap", "catalog_valid_no", "publisher_location_binding_pending"]
+    },
+    {
+      "rank": 12,
+      "stream_id": 16843,
+      "name": "102nd Ave NE & NE 4th St",
+      "decision": "probationary_reserve",
+      "provider": "BELLEVUE_TRAFFICMAP",
+      "failure_domain": "bellevue_city_hls",
+      "authoritative_binding": {
+        "kind": "official_arcgis_camera",
+        "public_page": "https://trafficmap.bellevuewa.gov/",
+        "provider_source_id": "CCTV145",
+        "location": "102nd Ave NE & NE 4th St",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "official_city_catalog", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_bellevue_failure_domain"]
+    },
+    {
+      "rank": 13,
+      "stream_id": 16847,
+      "name": "100th Ave NE & Main St",
+      "decision": "probationary_reserve",
+      "provider": "BELLEVUE_TRAFFICMAP",
+      "failure_domain": "bellevue_city_hls",
+      "authoritative_binding": {
+        "kind": "official_arcgis_camera",
+        "public_page": "https://trafficmap.bellevuewa.gov/",
+        "provider_source_id": "CCTV001",
+        "location": "100th Ave NE & Main St",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "official_city_catalog", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_bellevue_failure_domain"]
+    },
+    {
+      "rank": 14,
+      "stream_id": 16933,
+      "name": "143rd Ave NE & NE 8th St",
+      "decision": "probationary_reserve",
+      "provider": "BELLEVUE_TRAFFICMAP",
+      "failure_domain": "bellevue_city_hls",
+      "authoritative_binding": {
+        "kind": "official_arcgis_camera",
+        "public_page": "https://trafficmap.bellevuewa.gov/",
+        "provider_source_id": "CCTV046",
+        "location": "143rd Ave NE & NE 8th St",
+        "confidence": "high"
+      },
+      "reason_codes": ["distinct_scene", "official_city_catalog", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_bellevue_failure_domain"]
+    },
+    {
+      "rank": 15,
+      "stream_id": 17244,
+      "name": "Seattle - 5th Ave & Pine St EW",
+      "decision": "probationary_reserve",
+      "provider": "SEATTLE_STREAMLOCK",
+      "failure_domain": "seattle_streamlock",
+      "authoritative_binding": {
+        "kind": "catalog_location_and_source_path",
+        "provider_source_id": "5_Pine_EW",
+        "location": "5th Ave & Pine St, Seattle",
+        "confidence": "medium"
+      },
+      "reason_codes": ["distinct_scene", "two_native_copy_decode_probes_passed"],
+      "risk_codes": ["shared_streamlock_cap", "official_city_page_binding_pending"]
+    }
+  ],
+  "rejected_groups": [
+    {
+      "group": "duplicate_catalog_rows",
+      "decision": "reject",
+      "reason_codes": ["same_scene_identity_or_source_ancestry", "ids_do_not_equal_unique_scenes"]
+    },
+    {
+      "group": "unbound_youtube_or_aggregator_sources",
+      "decision": "reject_until_repaired",
+      "reason_codes": ["authoritative_location_binding_missing"]
+    },
+    {
+      "group": "bulk_sdot",
+      "decision": "reject_bulk_admission",
+      "reason_codes": ["historical_platform_and_source_failures", "correlated_streamlock_failure_domain", "require_fresh_two_probe_and_probation_windows"]
+    }
+  ],
+  "proven_sdot_reserve": [
+    {"stream_id": 2667, "provider_source_id": "CMR-0178", "name": "1st Ave & Union St"},
+    {"stream_id": 2693, "provider_source_id": "CMR-0040", "name": "4th Ave & Battery St"},
+    {"stream_id": 2717, "provider_source_id": "CMR-0171", "name": "1st Ave & Broad St"},
+    {"stream_id": 2757, "provider_source_id": "CMR-0325", "name": "35th Ave SW & SW Barton St"},
+    {"stream_id": 2965, "provider_source_id": "CMR-0386", "name": "Eastlake Ave E & Fuhrman Ave E"},
+    {"stream_id": 2973, "provider_source_id": "CMR-0116", "name": "Latona Ave NE & NE 50th St"},
+    {"stream_id": 3007, "provider_source_id": "CMR-0044", "name": "4th Ave S & Michigan St"},
+    {"stream_id": 3039, "provider_source_id": "CMR-0033", "name": "3rd Ave & Columbia St"},
+    {"stream_id": 3049, "provider_source_id": "CMR-0020", "name": "1st Ave S & S Atlantic St"}
+  ],
+  "sdot_policy": "Reserve only. Admit one at a time after fresh authoritative binding, two separated native copy+decode probes, and capacity-safe probation. Do not infer present quality from old low-coverage recordings; separate former platform capture defects from source-native instability using new evidence."
+}
