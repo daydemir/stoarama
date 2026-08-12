@@ -43,6 +43,71 @@ type TimeOfDay struct {
 	Second int
 }
 
+// ContinuousWindow is one complete scheduled occurrence generated with the
+// same Go timezone rules as the production scheduler. LocalOpenAt and
+// LocalEndAt retain their location and UTC offset as audit evidence; OpenAt and
+// EndAt are the exact capture bounds used by recording jobs.
+type ContinuousWindow struct {
+	Ordinal     int
+	LocalOpenAt time.Time
+	LocalEndAt  time.Time
+	OpenAt      time.Time
+	EndAt       time.Time
+}
+
+// NextFullContinuousWindowsOn returns the first limit complete occurrences at
+// or after atOrAfter. Partial envelope-edge occurrences are intentionally
+// excluded: qualification promises full scheduled windows and must never grade
+// a shortened campaign boundary as if it were a complete occurrence.
+func NextFullContinuousWindowsOn(tz string, start, end TimeOfDay, weekdays WeekdaySet, envStart, envEnd, atOrAfter time.Time, limit int) ([]ContinuousWindow, error) {
+	if limit <= 0 || limit > 14 {
+		return nil, fmt.Errorf("qualification window limit must be between 1 and 14")
+	}
+	if weekdays == 0 {
+		return nil, fmt.Errorf("active weekdays must not be empty")
+	}
+	loc, err := LoadLocation(tz)
+	if err != nil {
+		return nil, err
+	}
+	cursor := atOrAfter.UTC()
+	if cursor.Before(envStart.UTC()) {
+		cursor = envStart.UTC()
+	}
+	localCursor := cursor.In(loc)
+	y, mo, d := localCursor.Date()
+	// Include the prior local opening date because a full-day/overnight window
+	// may open before local midnight while still meeting an exact UTC cutoff.
+	y, mo, d = prevLocalDate(y, mo, d, loc)
+	windows := make([]ContinuousWindow, 0, limit)
+	// Seven days per occurrence is the worst nonempty weekday mask. The extra
+	// eight days cover the prior-date probe plus one cursor/envelope rejection.
+	maxScanDays := limit*7 + 8
+	for scanned := 0; scanned < maxScanDays && len(windows) < limit; scanned++ {
+		localOpen := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc)
+		openUTC := localOpen.UTC()
+		localEndY, localEndMo, localEndD := y, mo, d
+		if IsOvernightWindow(start, end) {
+			localEndY, localEndMo, localEndD = nextLocalDate(y, mo, d, loc)
+		}
+		localEnd := time.Date(localEndY, localEndMo, localEndD, end.Hour, end.Minute, end.Second, 0, loc)
+		endUTC := localEnd.UTC()
+		if weekdays.Contains(localOpen.Weekday()) && !openUTC.Before(cursor) && !openUTC.Before(envStart.UTC()) &&
+			(envEnd.IsZero() || !endUTC.After(envEnd.UTC())) {
+			windows = append(windows, ContinuousWindow{
+				Ordinal: len(windows) + 1, LocalOpenAt: localOpen, LocalEndAt: localEnd,
+				OpenAt: openUTC, EndAt: endUTC,
+			})
+		}
+		next := time.Date(y, mo, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
+		y, mo, d = next.Date()
+	}
+	if len(windows) != limit {
+		return nil, fmt.Errorf("schedule has only %d complete windows, need %d", len(windows), limit)
+	}
+	return windows, nil
+}
+
 // ParseTimeOfDay parses "HH:MM" or "HH:MM:SS" into a TimeOfDay.
 func ParseTimeOfDay(s string) (TimeOfDay, error) {
 	var h, m, sec int
