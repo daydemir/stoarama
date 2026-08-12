@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -2815,38 +2816,43 @@ func (s *Server) handleProcessingWorkerStopped(w http.ResponseWriter, r *http.Re
 }
 
 type captureIngestRequest struct {
-	StreamID           int64      `json:"stream_id"`
-	Status             string     `json:"status"`
-	EffectiveMode      string     `json:"execution_class"`
-	ResolvedURL        string     `json:"resolved_url"`
-	CapturedAt         *time.Time `json:"captured_at"`
-	UploadIntentID     string     `json:"upload_intent_id"`
-	ObjectKey          string     `json:"object_key"`
-	SizeBytes          *int64     `json:"size_bytes"`
-	ETag               string     `json:"etag"`
-	SHA256             string     `json:"sha256"`
-	SegmentStartAt     *time.Time `json:"segment_start_at"`
-	SegmentEndAt       *time.Time `json:"segment_end_at"`
-	DurationMs         *int64     `json:"duration_ms"`
-	TargetFPS          *int       `json:"target_fps"`
-	ActualFPS          *float64   `json:"actual_fps"`
-	VideoCodec         string     `json:"video_codec"`
-	AudioCodec         string     `json:"audio_codec"`
-	Container          string     `json:"container"`
-	AudioPresent       *bool      `json:"audio_present"`
-	FrameBase64        string     `json:"frame_base64"`
-	ThumbnailBase64    string     `json:"thumbnail_base64"`
-	ThumbnailIntentID  string     `json:"thumbnail_upload_intent_id"`
-	ThumbnailObjectKey string     `json:"thumbnail_object_key"`
-	ThumbnailMimeType  string     `json:"thumbnail_mime_type"`
-	ThumbnailSizeBytes *int64     `json:"thumbnail_size_bytes"`
-	ThumbnailSHA256    string     `json:"thumbnail_sha256"`
-	MimeType           string     `json:"mime_type"`
-	SourceKind         string     `json:"source_kind"`
-	CaptureError       string     `json:"capture_error"`
-	ErrorText          string     `json:"error_text"`
-	RecordingHeartbeat bool       `json:"recording_heartbeat"`
+	AccountID              int64      `json:"account_id"`
+	StreamID               int64      `json:"stream_id"`
+	Status                 string     `json:"status"`
+	EffectiveMode          string     `json:"execution_class"`
+	ResolvedURL            string     `json:"resolved_url"`
+	CapturedAt             *time.Time `json:"captured_at"`
+	UploadIntentID         string     `json:"upload_intent_id"`
+	ObjectKey              string     `json:"object_key"`
+	SizeBytes              *int64     `json:"size_bytes"`
+	ETag                   string     `json:"etag"`
+	SHA256                 string     `json:"sha256"`
+	SegmentStartAt         *time.Time `json:"segment_start_at"`
+	SegmentEndAt           *time.Time `json:"segment_end_at"`
+	DurationMs             *int64     `json:"duration_ms"`
+	TargetFPS              *int       `json:"target_fps"`
+	ActualFPS              *float64   `json:"actual_fps"`
+	VideoCodec             string     `json:"video_codec"`
+	AudioCodec             string     `json:"audio_codec"`
+	Container              string     `json:"container"`
+	AudioPresent           *bool      `json:"audio_present"`
+	FrameBase64            string     `json:"frame_base64"`
+	FrameSHA256            string     `json:"frame_sha256"`
+	ThumbnailBase64        string     `json:"thumbnail_base64"`
+	ThumbnailIntentID      string     `json:"thumbnail_upload_intent_id"`
+	ThumbnailObjectKey     string     `json:"thumbnail_object_key"`
+	ThumbnailMimeType      string     `json:"thumbnail_mime_type"`
+	ThumbnailSizeBytes     *int64     `json:"thumbnail_size_bytes"`
+	ThumbnailSHA256        string     `json:"thumbnail_sha256"`
+	MimeType               string     `json:"mime_type"`
+	SourceKind             string     `json:"source_kind"`
+	CaptureError           string     `json:"capture_error"`
+	ErrorText              string     `json:"error_text"`
+	RecordingHeartbeat     bool       `json:"recording_heartbeat"`
+	AuthoritativeFrameOnly bool       `json:"authoritative_frame_only"`
 }
+
+const authoritativeFrameMaxBytes = 8 << 20
 
 func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 	var req captureIngestRequest
@@ -2856,6 +2862,10 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.StreamID <= 0 {
 		util.WriteError(w, http.StatusBadRequest, "stream_id must be > 0")
+		return
+	}
+	if req.AuthoritativeFrameOnly {
+		s.handleAuthoritativeFrameIngest(w, r, req)
 		return
 	}
 	executionClass, err := normalizeExecutionClassInput(req.EffectiveMode)
@@ -3044,6 +3054,97 @@ func (s *Server) handleCaptureIngest(w http.ResponseWriter, r *http.Request) {
 		"consecutive_errors": 0,
 		"unsupported":        false,
 	})
+}
+
+func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.Request, req captureIngestRequest) {
+	if req.AccountID <= 0 || req.StreamID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "account_id and stream_id are required")
+		return
+	}
+	if !s.hasServiceBearerToken(r) {
+		principal, ok := nodePrincipalFromContext(r.Context())
+		if !ok || principal.AccountID != req.AccountID || strings.TrimSpace(principal.NodeType) != nodeTypeLocalRecorder {
+			util.WriteError(w, http.StatusForbidden, "authoritative frame account mismatch")
+			return
+		}
+	}
+	if req.RecordingHeartbeat || strings.TrimSpace(req.UploadIntentID) != "" || strings.TrimSpace(req.ObjectKey) != "" || req.SegmentStartAt != nil || req.SegmentEndAt != nil || strings.TrimSpace(req.CaptureError) != "" || strings.TrimSpace(req.ErrorText) != "" || strings.TrimSpace(req.ThumbnailBase64) != "" || strings.TrimSpace(req.ThumbnailIntentID) != "" || strings.TrimSpace(req.ThumbnailObjectKey) != "" || strings.ToLower(strings.TrimSpace(req.Status)) != "success" {
+		util.WriteError(w, http.StatusBadRequest, "authoritative frame ingest accepts only a non-heartbeat frame success")
+		return
+	}
+	if req.CapturedAt == nil || req.CapturedAt.IsZero() || req.CapturedAt.Before(time.Now().Add(-10*time.Minute)) || req.CapturedAt.After(time.Now().Add(time.Minute)) {
+		util.WriteError(w, http.StatusBadRequest, "authoritative frame captured_at must be current")
+		return
+	}
+	if strings.TrimSpace(req.MimeType) != "image/jpeg" || len(req.FrameBase64) == 0 || len(req.FrameBase64) > (authoritativeFrameMaxBytes*4/3)+8 {
+		util.WriteError(w, http.StatusBadRequest, "authoritative frame must be a bounded JPEG")
+		return
+	}
+	frameBytes, err := base64.StdEncoding.DecodeString(req.FrameBase64)
+	if err != nil || len(frameBytes) == 0 || len(frameBytes) > authoritativeFrameMaxBytes {
+		util.WriteError(w, http.StatusBadRequest, "invalid authoritative frame payload")
+		return
+	}
+	frame, err := capture.BuildFrameFromBytes(frameBytes, "image/jpeg", "authoritative_frame_refresh")
+	if err != nil || frame.Width <= 0 || frame.Height <= 0 || frame.Width > 8192 || frame.Height > 8192 || int64(frame.Width)*int64(frame.Height) > 33_554_432 {
+		util.WriteError(w, http.StatusBadRequest, "invalid authoritative JPEG")
+		return
+	}
+	claimedSHA := strings.ToLower(strings.TrimSpace(req.FrameSHA256))
+	if len(claimedSHA) != 64 || claimedSHA != frame.SHA256 {
+		util.WriteError(w, http.StatusBadRequest, "authoritative frame SHA-256 mismatch")
+		return
+	}
+	if err := s.persistAuthoritativeFrameSuccess(r.Context(), req.AccountID, req.StreamID, req.CapturedAt.UTC(), frame); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusNotFound, "active account recording stream not found")
+			return
+		}
+		log.Printf("authoritative frame ingest failed account_id=%d stream_id=%d: %v", req.AccountID, req.StreamID, err)
+		util.WriteError(w, http.StatusInternalServerError, "persist authoritative frame")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "stored", "recording_heartbeat": false})
+}
+
+func (s *Server) persistAuthoritativeFrameSuccess(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame) error {
+	return s.persistAuthoritativeFrameSuccessWithUpload(ctx, accountID, streamID, capturedAt, frame, s.r2.Bucket(), s.r2.PutBytes)
+}
+
+func (s *Server) persistAuthoritativeFrameSuccessWithUpload(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error)) error {
+	var recordingID int64
+	if err := s.pool.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active' ORDER BY id LIMIT 1`, accountID, streamID).Scan(&recordingID); err != nil {
+		return err
+	}
+	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/authoritative-%d.jpg", streamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(), capturedAt.UnixNano())
+	etag, err := put(ctx, objectKey, frame.MIMEType, frame.Bytes)
+	if err != nil {
+		return fmt.Errorf("upload authoritative frame: %w", err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin authoritative frame tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Recheck under a shared row lock after upload so a concurrent pause/cancel
+	// cannot turn the uploaded object into accepted evidence for an inactive recording.
+	if err = tx.QueryRow(ctx, `SELECT id FROM recordings WHERE id=$1 AND account_id=$2 AND stream_id=$3 AND status='active' FOR SHARE`, recordingID, accountID, streamID).Scan(&recordingID); err != nil {
+		return err
+	}
+	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{StorageProvider: "r2", Bucket: bucket, ObjectKey: objectKey, MIMEType: frame.MIMEType, SizeBytes: frame.SizeBytes, ETag: etag, SHA256: frame.SHA256, Width: frame.Width, Height: frame.Height})
+	if err != nil {
+		return fmt.Errorf("upsert authoritative media: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO frames(stream_id,capture_job_id,captured_at,raw_media_object_id,capture_status,capture_error,source_kind) VALUES($1,NULL,$2,$3,'success',NULL,'authoritative_frame_refresh')`, streamID, capturedAt, mediaID); err != nil {
+		return fmt.Errorf("insert authoritative frame: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO stream_health(stream_id,captures_total,captures_success,captures_error,last_capture_at,last_error_at,last_error_text) VALUES($1,1,1,0,$2,NULL,NULL) ON CONFLICT(stream_id) DO UPDATE SET captures_total=stream_health.captures_total+1,captures_success=stream_health.captures_success+1,last_capture_at=EXCLUDED.last_capture_at,updated_at=now()`, streamID, capturedAt); err != nil {
+		return fmt.Errorf("update authoritative stream health: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit authoritative frame: %w", err)
+	}
+	return nil
 }
 
 type captureMarkUnsupportedRequest struct {

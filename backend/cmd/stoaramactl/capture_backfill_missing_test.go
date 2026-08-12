@@ -115,12 +115,15 @@ func TestExplicitFrameRefreshIngestsAuthoritativeFrameWithoutHeartbeatOrLeak(t *
 		t.Fatal(err)
 	}
 	target := captureBackfillMissingCandidate{Stream: model.Stream{ID: 339, Slug: "secret-token-should-not-appear", Provider: "direct", SourceURL: server.URL + "/frame.jpg?token=secret", CaptureType: "snapshot_url", ExecutionClass: "image_poll"}, BackfillReason: "explicit_refresh"}
-	result := processCaptureBackfillMissingTarget(context.Background(), registry, client, target, 5*time.Second, false)
+	result := processCaptureBackfillMissingTarget(context.Background(), registry, client, target, 5*time.Second, false, 47)
 	if result.Status != "success" {
 		t.Fatalf("result=%+v", result)
 	}
-	if ingested["stream_id"] != float64(339) || ingested["recording_heartbeat"] != false || ingested["source_kind"] != "backfill_missing_frame" {
+	if ingested["account_id"] != float64(47) || ingested["stream_id"] != float64(339) || ingested["recording_heartbeat"] != false || ingested["source_kind"] != "backfill_missing_frame" || ingested["authoritative_frame_only"] != true {
 		t.Fatalf("ingest=%v", ingested)
+	}
+	if got, _ := ingested["frame_sha256"].(string); len(got) != 64 {
+		t.Fatalf("frame_sha256=%q", got)
 	}
 	frame, err := base64.StdEncoding.DecodeString(ingested["frame_base64"].(string))
 	if err != nil || len(frame) == 0 {
@@ -148,16 +151,16 @@ func TestExplicitFrameRefreshDryRunDoesNotIngestAndFailureIsIsolated(t *testing.
 	client, _ := captureapi.NewClient(captureapi.ClientConfig{BaseURL: server.URL, APIToken: "operator", HTTPClient: server.Client()})
 	registry, _ := capture.NewDefaultRegistry()
 	bad := captureBackfillMissingCandidate{Stream: model.Stream{ID: 1, Provider: "direct", SourceURL: "http://127.0.0.1:1/private?token=secret", CaptureType: "snapshot_url", ExecutionClass: "image_poll"}}
-	badResult := processCaptureBackfillMissingTarget(context.Background(), registry, client, bad, 100*time.Millisecond, false)
+	badResult := processCaptureBackfillMissingTarget(context.Background(), registry, client, bad, 100*time.Millisecond, false, 47)
 	if badResult.Status != "error" || strings.Contains(badResult.Reason, "secret") {
 		t.Fatalf("bad=%+v", badResult)
 	}
 	good := captureBackfillMissingCandidate{Stream: model.Stream{ID: 2, Provider: "direct", SourceURL: server.URL + "/good.jpg", CaptureType: "snapshot_url", ExecutionClass: "image_poll"}}
-	dry := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, true)
+	dry := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, true, 47)
 	if dry.Status != "dry_run" || ingests != 0 {
 		t.Fatalf("dry=%+v ingests=%d", dry, ingests)
 	}
-	success := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, false)
+	success := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, false, 47)
 	if success.Status != "success" || ingests != 1 {
 		t.Fatalf("success=%+v ingests=%d", success, ingests)
 	}

@@ -28,14 +28,17 @@ type Client struct {
 }
 
 type IngestSuccessRequest struct {
-	StreamID           int64
-	CapturedAt         time.Time
-	SourceKind         string
-	EffectiveMode      capture.Mode
-	ResolvedURL        string
-	MIMEType           string
-	FrameBytes         []byte
-	RecordingHeartbeat bool
+	AccountID              int64
+	StreamID               int64
+	CapturedAt             time.Time
+	SourceKind             string
+	EffectiveMode          capture.Mode
+	ResolvedURL            string
+	MIMEType               string
+	FrameBytes             []byte
+	FrameSHA256            string
+	RecordingHeartbeat     bool
+	AuthoritativeFrameOnly bool
 }
 
 type SegmentUploadIntentRequest struct {
@@ -138,15 +141,24 @@ func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) er
 	}
 
 	payload := map[string]any{
-		"stream_id":           req.StreamID,
-		"status":              "success",
-		"captured_at":         req.CapturedAt.UTC().Format(time.RFC3339Nano),
-		"source_kind":         sourceKind,
-		"execution_class":     capture.ModeToExecutionClass(req.EffectiveMode),
-		"resolved_url":        strings.TrimSpace(req.ResolvedURL),
-		"mime_type":           mimeType,
-		"frame_base64":        base64.StdEncoding.EncodeToString(req.FrameBytes),
-		"recording_heartbeat": req.RecordingHeartbeat,
+		"account_id":               req.AccountID,
+		"stream_id":                req.StreamID,
+		"status":                   "success",
+		"captured_at":              req.CapturedAt.UTC().Format(time.RFC3339Nano),
+		"source_kind":              sourceKind,
+		"execution_class":          capture.ModeToExecutionClass(req.EffectiveMode),
+		"resolved_url":             strings.TrimSpace(req.ResolvedURL),
+		"mime_type":                mimeType,
+		"frame_base64":             base64.StdEncoding.EncodeToString(req.FrameBytes),
+		"frame_sha256":             strings.ToLower(strings.TrimSpace(req.FrameSHA256)),
+		"recording_heartbeat":      req.RecordingHeartbeat,
+		"authoritative_frame_only": req.AuthoritativeFrameOnly,
+	}
+	if req.AuthoritativeFrameOnly {
+		// This endpoint never needs the resolved live URL or execution class.
+		// Omitting both keeps signed source material out of request/log surfaces.
+		delete(payload, "resolved_url")
+		delete(payload, "execution_class")
 	}
 	var out ingestResponse
 	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {

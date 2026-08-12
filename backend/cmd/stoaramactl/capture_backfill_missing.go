@@ -104,6 +104,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	fs.Var(&streamIDs, "stream-id", "explicit stream id to refresh (repeatable; includes streams with existing frames)")
 	timeoutSec := fs.Int("timeout-sec", 90, "per-stream resolution/capture timeout seconds")
 	dryRun := fs.Bool("dry-run", false, "print actions without ingesting frames")
+	accountID := fs.Int64("account-id", 0, "owning account for explicit authoritative frame refresh")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
 
@@ -117,6 +118,9 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	}
 	if err := validateCaptureBackfillOptions(*limit, *concurrency, streamIDs); err != nil {
 		log.Fatal(err)
+	}
+	if len(streamIDs) > 0 && !*dryRun && *accountID <= 0 {
+		log.Fatal("--account-id is required for explicit authoritative frame ingest")
 	}
 	if *timeoutSec <= 0 {
 		log.Fatalf("--timeout-sec must be > 0")
@@ -151,7 +155,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 		go func() {
 			defer wg.Done()
 			for target := range workCh {
-				resCh <- processCaptureBackfillMissingTarget(ctx, registry, client, target, time.Duration(*timeoutSec)*time.Second, *dryRun)
+				resCh <- processCaptureBackfillMissingTarget(ctx, registry, client, target, time.Duration(*timeoutSec)*time.Second, *dryRun, *accountID)
 			}
 		}()
 	}
@@ -208,6 +212,7 @@ func processCaptureBackfillMissingTarget(
 	target captureBackfillMissingCandidate,
 	timeout time.Duration,
 	dryRun bool,
+	accountID int64,
 ) captureBackfillMissingResult {
 	stream := target.Stream
 	result := captureBackfillMissingResult{
@@ -279,14 +284,17 @@ func processCaptureBackfillMissingTarget(
 	ingestCtx, cancelIngest := context.WithTimeout(ctx, timeout)
 	defer cancelIngest()
 	if err := client.IngestSuccess(ingestCtx, captureapi.IngestSuccessRequest{
-		StreamID:           stream.ID,
-		CapturedAt:         result.CapturedAt,
-		SourceKind:         "backfill_missing_frame",
-		EffectiveMode:      effective,
-		ResolvedURL:        resolved.URL,
-		MIMEType:           frame.MIMEType,
-		FrameBytes:         frame.Bytes,
-		RecordingHeartbeat: false,
+		AccountID:              accountID,
+		StreamID:               stream.ID,
+		CapturedAt:             result.CapturedAt,
+		SourceKind:             "backfill_missing_frame",
+		EffectiveMode:          effective,
+		ResolvedURL:            resolved.URL,
+		MIMEType:               frame.MIMEType,
+		FrameBytes:             frame.Bytes,
+		FrameSHA256:            frame.SHA256,
+		RecordingHeartbeat:     false,
+		AuthoritativeFrameOnly: true,
 	}); err != nil {
 		result.Status = "error"
 		result.Reason = "ingest capture success failed"
