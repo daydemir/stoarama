@@ -168,9 +168,21 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	if frozen.Code != http.StatusCreated {
 		t.Fatalf("freeze status=%d body=%s", frozen.Code, frozen.Body.String())
 	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='paused' WHERE id=$1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
 	idempotent := call(true, planned.Plan.PlanSHA256)
 	if idempotent.Code != http.StatusOK || !strings.Contains(idempotent.Body.String(), "idempotent") {
 		t.Fatalf("idempotent status=%d body=%s", idempotent.Code, idempotent.Body.String())
+	}
+	differentIDs := append([]int64(nil), ids...)
+	differentIDs[0] = 999999999
+	raw, _ := json.Marshal(qualificationBuildRequest{RecordingIDs: differentIDs, SequenceStart: time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC), Apply: true, ExpectedPlanSHA256: planned.Plan.PlanSHA256})
+	req := withPrincipal(httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/build", bytes.NewReader(raw)), accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}, "")
+	different := httptest.NewRecorder()
+	s.handleAccountRecordingQualificationBuild(different, req)
+	if different.Code != http.StatusConflict {
+		t.Fatalf("different request status=%d body=%s", different.Code, different.Body.String())
 	}
 	var status string
 	var frozenAt *time.Time

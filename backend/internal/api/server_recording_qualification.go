@@ -153,16 +153,24 @@ func (s *Server) buildQualificationPlan(ctx context.Context, accountID int64, re
 	return buildQualificationPlanWith(ctx, s.pool, accountID, req)
 }
 
-func buildQualificationPlanWith(ctx context.Context, db qualificationPlanQuerier, accountID int64, req qualificationBuildRequest) (qualificationPlan, error) {
+func normalizeQualificationRecordingIDs(req qualificationBuildRequest) ([]int64, error) {
 	ids := append([]int64(nil), req.RecordingIDs...)
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	if len(ids) < 50 || req.SequenceStart.IsZero() {
-		return qualificationPlan{}, invalidQualification("at least 50 explicit recording_ids and sequence_start_at are required")
+		return nil, invalidQualification("at least 50 explicit recording_ids and sequence_start_at are required")
 	}
 	for i, id := range ids {
 		if id <= 0 || (i > 0 && id == ids[i-1]) {
-			return qualificationPlan{}, invalidQualification("recording_ids must be unique positive integers")
+			return nil, invalidQualification("recording_ids must be unique positive integers")
 		}
+	}
+	return ids, nil
+}
+
+func buildQualificationPlanWith(ctx context.Context, db qualificationPlanQuerier, accountID int64, req qualificationBuildRequest) (qualificationPlan, error) {
+	ids, err := normalizeQualificationRecordingIDs(req)
+	if err != nil {
+		return qualificationPlan{}, err
 	}
 	rows, err := db.Query(ctx, `/* qualification_plan */
 		SELECT r.id,r.stream_id,r.name,s.name,e.id,e.scene_identity_sha256,r.cron_timezone,
@@ -246,6 +254,13 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 		util.WriteError(w, http.StatusConflict, "expected_plan_sha256 does not match current plan")
 		return
 	}
+	ids, err := normalizeQualificationRecordingIDs(req)
+	if err != nil {
+		writeQualificationPlanError(w, principal.AccountID, err)
+		return
+	}
+	idsJSON, _ := json.Marshal(ids)
+	requestIDsHash := sha256Hex(idsJSON)
 	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		util.WriteError(w, 500, "start qualification transaction")
@@ -254,6 +269,25 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 	defer tx.Rollback(r.Context())
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-qualification:'||($1::bigint)::text,0))`, principal.AccountID); err != nil {
 		util.WriteError(w, 500, "lock qualification build")
+		return
+	}
+	var existing int64
+	var existingPlan string
+	var existingIDsHash string
+	var existingDefinition string
+	var existingCount int
+	var existingStart time.Time
+	err = tx.QueryRow(r.Context(), `SELECT id,definition_version,COALESCE(definition_jsonb->>'plan_sha256',''),COALESCE(definition_jsonb->>'recording_ids_sha256',''),target_recording_count,window_sequence_start_at FROM recording_qualification_runs WHERE account_id=$1 AND status='active'`, principal.AccountID).Scan(&existing, &existingDefinition, &existingPlan, &existingIDsHash, &existingCount, &existingStart)
+	if err == nil {
+		if existingDefinition != recordingQualificationDefinition || !strings.EqualFold(existingPlan, req.ExpectedPlanSHA256) || existingIDsHash != requestIDsHash || existingCount != len(ids) || !existingStart.Equal(req.SequenceStart.UTC()) {
+			util.WriteError(w, http.StatusConflict, "a different active qualification run already exists")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"run_id": existing, "idempotent": true, "plan_sha256": existingPlan})
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, 500, "check active qualification run")
 		return
 	}
 	plan, err := buildQualificationPlanWith(r.Context(), tx, principal.AccountID, req)
@@ -265,24 +299,7 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 		util.WriteError(w, http.StatusConflict, "expected_plan_sha256 does not match current plan")
 		return
 	}
-	var existing int64
-	var existingPlan string
-	var existingCount int
-	var existingStart time.Time
-	err = tx.QueryRow(r.Context(), `SELECT id,COALESCE(definition_jsonb->>'plan_sha256',''),target_recording_count,window_sequence_start_at FROM recording_qualification_runs WHERE account_id=$1 AND status='active'`, principal.AccountID).Scan(&existing, &existingPlan, &existingCount, &existingStart)
-	if err == nil {
-		if existingPlan != plan.PlanSHA256 || existingCount != len(plan.Members) || !existingStart.Equal(plan.SequenceStart) {
-			util.WriteError(w, http.StatusConflict, "a different active qualification run already exists")
-			return
-		}
-		util.WriteJSON(w, http.StatusOK, map[string]any{"run_id": existing, "idempotent": true, "plan_sha256": plan.PlanSHA256})
-		return
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		util.WriteError(w, 500, "check active qualification run")
-		return
-	}
-	definition := map[string]any{"version": recordingQualificationDefinition, "window_count": 14, "required_good_or_great": 13, "max_acceptable": 1, "plan_sha256": plan.PlanSHA256}
+	definition := map[string]any{"version": recordingQualificationDefinition, "window_count": 14, "required_good_or_great": 13, "max_acceptable": 1, "plan_sha256": plan.PlanSHA256, "recording_ids_sha256": requestIDsHash}
 	var runID int64
 	err = tx.QueryRow(r.Context(), `INSERT INTO recording_qualification_runs(account_id,definition_version,definition_jsonb,target_recording_count,window_sequence_start_at) VALUES($1,$2,$3,$4,$5) RETURNING id`, principal.AccountID, recordingQualificationDefinition, definition, len(plan.Members), plan.SequenceStart).Scan(&runID)
 	if err != nil {
