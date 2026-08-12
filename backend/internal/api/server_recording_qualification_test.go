@@ -79,7 +79,11 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	_, err := pool.Exec(ctx, `
 	 INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,access_key_id,secret_access_key_enc,status,managed)
-	 VALUES($1,'qual','s3_compatible','https://s3.example.test','auto','qual','key',decode('00','hex'),'verified',true);
+	 VALUES($1,'qual','s3_compatible','https://s3.example.test','auto','qual','key',decode('00','hex'),'verified',true)`, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = pool.Exec(ctx, `
 	 WITH ss AS (INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps)
 	   SELECT 'direct','q'||n,'stream-'||n,'qualification-'||n,'https://example.test/'||n||'.m3u8','','hls','direct','cloud','video',30 FROM generate_series(1,50)n RETURNING id),
 	 rr AS (INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays)
