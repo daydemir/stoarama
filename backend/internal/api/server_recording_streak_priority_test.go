@@ -54,7 +54,7 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 		t.Fatal(err)
 	}
 	_, err = pool.Exec(ctx, `INSERT INTO recording_window_health(recording_id,job_id,window_start_at,window_end_at,expected_seconds,covered_seconds,coverage_pct,largest_gap_seconds,gap_count,gap_over_30s_count,gap_over_5m_count,overlap_count,overlap_seconds,longest_run_seconds,layout_change_count,clip_count,metric_version,calculated_at)
-		VALUES($1,$2,$3,$4,43200,43100,99.8,10,1,0,0,0,0,43100,0,10,2,$4+interval '1 minute')`, recID, jobID, open, open.Add(12*time.Hour))
+		VALUES($1,$2,$3,$4::timestamptz,43200,43100,99.8,10,1,0,0,0,0,43100,0,10,2,$4::timestamptz+interval '1 minute')`, recID, jobID, open, open.Add(12*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
