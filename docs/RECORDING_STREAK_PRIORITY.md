@@ -11,9 +11,10 @@ FAILED, UNKNOWN, a second ACCEPTABLE, a duplicate/missing job, stale metrics,
 late clips, or any overlap ends it. NAS byte proof and native stitch
 certification remain explicitly separate.
 
-Eligibility is bounded: all matching active 08:00–20:00 continuous recordings
-plus paused candidates changed within seven days, capped at 200 rows per
-account. Facts are read in one repeatable-read, read-only database snapshot.
+Eligibility includes every matching active 08:00–20:00 continuous recording.
+Paused candidates are separately bounded to the 100 most recently paused within
+seven days; the response explicitly reports if that candidate list was truncated.
+Facts are read in one repeatable-read, read-only database snapshot.
 The query expands at most 61 local calendar days per eligible recording, then
 retains 30 windows, so its work is bounded independently of recording history.
 

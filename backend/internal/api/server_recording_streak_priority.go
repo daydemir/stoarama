@@ -31,9 +31,11 @@ type streakPriorityRecording struct {
 }
 
 type streakPriorityResponse struct {
-	GeneratedAt time.Time                 `json:"generated_at"`
-	Scope       string                    `json:"scope"`
-	Items       []streakPriorityRecording `json:"items"`
+	GeneratedAt               time.Time                 `json:"generated_at"`
+	Scope                     string                    `json:"scope"`
+	PausedCandidateLimit      int                       `json:"paused_candidate_limit"`
+	PausedCandidatesTruncated bool                      `json:"paused_candidates_truncated"`
+	Items                     []streakPriorityRecording `json:"items"`
 }
 
 func gradePassesStreak(grade string) bool {
@@ -115,9 +117,7 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 	defer tx.Rollback(r.Context())
 	items := map[int64]*streakPriorityRecording{}
 	statuses := map[int64]string{}
-	eligibleRows, err := tx.Query(r.Context(), `SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous'
-		AND daily_window_start='08:00:00'::time AND daily_window_end='20:00:00'::time
-		AND (status='active' OR (status='paused' AND paused_at>=now()-interval '7 days')) ORDER BY id LIMIT 200`, p.AccountID)
+	eligibleRows, err := tx.Query(r.Context(), `WITH active AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'), paused AS (SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=now()-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) SELECT * FROM active UNION ALL SELECT * FROM paused ORDER BY id`, p.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read streak candidates")
 		return
@@ -141,10 +141,9 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 	eligibleRows.Close()
 	rows, err := tx.Query(r.Context(), `
 		WITH eligible AS (
-		  SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous'
-		    AND daily_window_start='08:00:00'::time AND daily_window_end='20:00:00'::time
-		    AND (status='active' OR (status='paused' AND paused_at>=now()-interval '7 days'))
-		  ORDER BY id LIMIT 200
+		  SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'
+		  UNION ALL
+		  SELECT * FROM (SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=now()-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) p
 		), expected AS (
 		  SELECT r.id,r.name,r.status,(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone fire_at,
 		         (d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone window_end_at,
@@ -210,7 +209,12 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusInternalServerError, "read streak priority")
 		return
 	}
-	out := streakPriorityResponse{GeneratedAt: time.Now().UTC(), Scope: "dynamic active/probation/candidate recordings; timeline grades only; NAS and stitch certification remain separate", Items: []streakPriorityRecording{}}
+	var pausedTotal int
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=now()-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00'`, p.AccountID).Scan(&pausedTotal); err != nil {
+		util.WriteError(w, 500, "count streak candidates")
+		return
+	}
+	out := streakPriorityResponse{GeneratedAt: time.Now().UTC(), Scope: "dynamic active/probation/candidate recordings; timeline grades only; NAS and stitch certification remain separate", PausedCandidateLimit: 100, PausedCandidatesTruncated: pausedTotal > 100, Items: []streakPriorityRecording{}}
 	for id, item := range items {
 		item.CompletedWindows = len(item.RecentWindows)
 		finishStreakPriority(item, statuses[id])
