@@ -209,6 +209,15 @@ func TestEvaluatedHealthSignalsAreDisjointByRunClass(t *testing.T) {
 	if fmt.Sprint(live) != fmt.Sprint(wantLive) || len(live) != 5 {
 		t.Fatalf("live signals=%v want=%v", live, wantLive)
 	}
+	driftDetectorFound := false
+	for _, detector := range liveRecordingHealthDetectors() {
+		if detector.signal == signalClipTimestampDrift {
+			driftDetectorFound = true
+		}
+	}
+	if !driftDetectorFound {
+		t.Fatal("live detector registry omits timestamp drift")
+	}
 	for _, signal := range live {
 		if signal == signalContinuousCoverageLow || signal == signalStoredClipInvalid {
 			t.Fatalf("live sweep evaluates non-live signal %q", signal)
