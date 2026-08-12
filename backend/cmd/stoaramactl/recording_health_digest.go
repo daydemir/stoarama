@@ -251,7 +251,7 @@ func composeHealthDigest(base string, now time.Time, items []digestRecording, na
 	if nas.CapacityTransitionState != "" && nas.CapacityTransitionAt != nil {
 		fmt.Fprintf(&b, "  Latest historical storage-capacity transition: %s at %s (not the current derived state above).\n", nas.CapacityTransitionState, nas.CapacityTransitionAt.UTC().Format(time.RFC3339))
 	}
-	b.WriteString("\nUrgent alerts remain independent and are not suppressed by this summary.\n")
+	b.WriteString("\nLongitudinal priority: review /api/v1/account/recordings/streak-priority; 13/14 streams receive highest change protection.\nUrgent alerts remain independent and are not suppressed by this summary.\n")
 	return b.String()
 }
 

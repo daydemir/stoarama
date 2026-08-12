@@ -18,7 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | scene-attest | qualification build|freeze|report"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | scene-attest | qualification build|freeze|report | streak-priority report"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -48,6 +48,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 		runRecordingQualification(ctx, cfg, args[1:])
 		return
 	}
+	if args[0] == "streak-priority" {
+		runRecordingStreakPriority(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) < 2 || args[0] != "naming" {
 		log.Fatal(recordingsUsage)
 	}
@@ -63,6 +67,20 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingStreakPriority(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) < 1 || args[0] != "report" {
+		log.Fatal("streak-priority requires report")
+	}
+	fs := flag.NewFlagSet("recordings streak-priority report", flag.ExitOnError)
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
+	_ = fs.Parse(args[1:])
+	if len(fs.Args()) != 0 {
+		log.Fatalf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	printJSON(mustAPIGet(ctx, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/account/recordings/streak-priority"))
 }
 
 func postRecordingSessionJSON(ctx context.Context, baseURL, cookie, path string, payload any) map[string]any {
