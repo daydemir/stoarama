@@ -165,9 +165,10 @@ class NASPullTests(unittest.TestCase):
             broken.parent.mkdir(parents=True)
             broken.write_text("{not-json", encoding="utf-8")
             calls = []
+            log_messages = []
             with mock.patch.object(pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}), self.assertRaisesRegex(
                 RuntimeError, "inventory scan incomplete"
-            ):
+            ), mock.patch.object(pull, "log", side_effect=lambda level, message: log_messages.append((level, message))):
                 inventory.full_scan(cfg, threading.Event())
             self.assertFalse(any(body.get("complete") for body in calls))
             self.assertEqual(inventory._rows("clip_id=91")[0][5], "present")
@@ -175,6 +176,8 @@ class NASPullTests(unittest.TestCase):
             self.assertIsNone(summary["scan_completed_at"])
             self.assertEqual(summary["scan_rows_skipped"], 1)
             self.assertEqual(summary["scan_skip_reasons"], {"invalid_sidecar": 1})
+            self.assertIn(("WARN", "inventory skipped reason=invalid_sidecar count=1"), log_messages)
+            self.assertFalse(any(str(broken) in message or "not-json" in message for _, message in log_messages))
             inventory.close()
 
     def test_inventory_skip_reasons_are_bounded_and_stable(self):
@@ -200,7 +203,7 @@ class NASPullTests(unittest.TestCase):
                 "scan_pass_started_at": "2026-08-09T00:00:00Z",
             })
             self.assertNotIn("scan_skip_reasons", inventory.summary())
-            for malformed in ('{"io_error":"x"}', '[]', '{not-json'):
+            for malformed in ('{"io_error":"x"}', '{"io_error":true}', '{"io_error":12}', '[]', '{not-json'):
                 with self.subTest(malformed=malformed):
                     inventory._meta_set({"scan_skip_reasons": malformed})
                     self.assertNotIn("scan_skip_reasons", inventory.summary())

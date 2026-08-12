@@ -530,6 +530,7 @@ class Inventory:
         generation = values.get("generation", "")
         if not generation:
             return None
+        scan_rows_skipped = int(values.get("scan_rows_skipped", 0))
         skip_reasons = None
         if "scan_skip_reasons" in values:
             try:
@@ -537,9 +538,9 @@ class Inventory:
             except (TypeError, ValueError):
                 parsed_reasons = None
             if isinstance(parsed_reasons, dict) and all(
-                key in INVENTORY_SKIP_REASONS and isinstance(value, int) and value > 0
+                key in INVENTORY_SKIP_REASONS and type(value) is int and value > 0
                 for key, value in parsed_reasons.items()
-            ):
+            ) and sum(parsed_reasons.values()) == scan_rows_skipped:
                 skip_reasons = parsed_reasons
         summary = {
             "generation": generation,
@@ -547,7 +548,7 @@ class Inventory:
             "scan_completed_at": values.get("scan_completed_at") or None,
             "scan_pass_started_at": values.get("scan_pass_started_at") or None,
             "scan_rows_visited": int(values.get("scan_rows_visited", 0)),
-            "scan_rows_skipped": int(values.get("scan_rows_skipped", 0)),
+            "scan_rows_skipped": scan_rows_skipped,
             "clips": int(values.get("clips", 0)),
             "bytes": int(values.get("bytes", 0)),
             "mismatches": int(values.get("mismatches", 0)),
@@ -656,7 +657,7 @@ class Inventory:
                 skipped += 1
                 reason = inventory_skip_reason(exc, sidecar=True)
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                log("WARN", "inventory skipped sidecar=%s: %s" % (sidecar, exc))
+                log("WARN", "inventory skipped reason=%s count=%d" % (reason, skip_reasons[reason]))
         for path in cfg.output_dir.rglob("*"):
             if stop_event.is_set():
                 self._commit_scan_batch((scanned, skipped, skip_reasons))
@@ -702,7 +703,7 @@ class Inventory:
                 skipped += 1
                 reason = inventory_skip_reason(exc, sidecar=False)
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                log("WARN", "inventory skipped unmatched file=%s: %s" % (path, exc))
+                log("WARN", "inventory skipped reason=%s count=%d" % (reason, skip_reasons[reason]))
         # Flush and publish every successfully observed row, but never promote a
         # partial generation. In particular, do not turn unseen prior rows into
         # "missing" when an unreadable/corrupt path was skipped.

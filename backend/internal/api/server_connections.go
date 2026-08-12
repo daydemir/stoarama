@@ -844,6 +844,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    inventory_scan_skip_reasons=CASE
 		      WHEN $36::timestamptz IS NOT NULL AND (inventory_scan_pass_started_at IS NULL OR $36::timestamptz > inventory_scan_pass_started_at) THEN COALESCE($39::jsonb, '{}'::jsonb)
 		      WHEN $36::timestamptz = inventory_scan_pass_started_at AND $39::jsonb IS NOT NULL AND $38 >= inventory_scan_rows_skipped THEN $39::jsonb
+		      WHEN $36::timestamptz = inventory_scan_pass_started_at AND $39::jsonb IS NULL AND $38 > inventory_scan_rows_skipped THEN '{}'::jsonb
 		      ELSE inventory_scan_skip_reasons END,
 		    nas_storage_total_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_total_bytes WHEN $33 THEN $34 ELSE NULL END,
 		    nas_storage_free_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_free_bytes WHEN $33 THEN $35 ELSE NULL END,

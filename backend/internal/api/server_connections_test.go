@@ -560,6 +560,21 @@ func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
 	// A legacy client may omit reason telemetry while this pass is still running;
 	// it must not erase the newer client's reason counts.
 	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12346, ScanRowsSkipped: 2})
+	var preservedReasons []byte
+	if err := pool.QueryRow(ctx, `SELECT inventory_scan_skip_reasons FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&preservedReasons); err != nil {
+		t.Fatal(err)
+	}
+	var preservedReasonCounts map[string]int64
+	if err := json.Unmarshal(preservedReasons, &preservedReasonCounts); err != nil {
+		t.Fatal(err)
+	}
+	if preservedReasonCounts["invalid_sidecar"] != 1 || preservedReasonCounts["permission_denied"] != 1 {
+		t.Fatalf("same-count legacy heartbeat erased reasons: %s", preservedReasons)
+	}
+	// If a legacy client observes another skip, retaining the old map would make
+	// its total contradict the authoritative skipped-row count. Clear only the
+	// unavailable reason detail while preserving the larger aggregate.
+	call(connectionInventoryStatus{Generation: "in-progress", ScanStartedAt: &progressStarted, ScanPassStartedAt: &passStarted, ScanRowsVisited: 12347, ScanRowsSkipped: 3})
 	delayed := now.Add(-2 * time.Minute)
 	call(connectionInventoryStatus{Generation: "delayed", ScanStartedAt: &start, ScanCompletedAt: &delayed, Clips: 2, Bytes: 2, Mismatches: 0, Unmatched: 0, Digest: strings.Repeat("b", 64)})
 	var clips, bytesValue, mismatches, unmatched int64
@@ -581,7 +596,7 @@ func TestInventoryHeartbeatDoesNotRegressCompletedSummary(t *testing.T) {
 	if err := json.Unmarshal(reasons, &storedReasons); err != nil {
 		t.Fatal(err)
 	}
-	if !storedPass.Equal(passStarted) || visited != 12346 || skipped != 2 || storedReasons["invalid_sidecar"] != 1 || storedReasons["permission_denied"] != 1 {
+	if !storedPass.Equal(passStarted) || visited != 12347 || skipped != 3 || len(storedReasons) != 0 {
 		t.Fatalf("scan progress pass=%s visited=%d skipped=%d reasons=%s", storedPass, visited, skipped, reasons)
 	}
 }
