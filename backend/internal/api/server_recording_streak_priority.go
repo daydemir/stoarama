@@ -107,11 +107,17 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "start streak snapshot")
+		return
+	}
+	defer tx.Rollback(r.Context())
 	items := map[int64]*streakPriorityRecording{}
 	statuses := map[int64]string{}
-	eligibleRows, err := s.pool.Query(r.Context(), `SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous'
+	eligibleRows, err := tx.Query(r.Context(), `SELECT id,name,status FROM recordings WHERE account_id=$1 AND mode='continuous'
 		AND daily_window_start='08:00:00'::time AND daily_window_end='20:00:00'::time
-		AND (status='active' OR (status='paused' AND paused_at>=now()-interval '7 days')) ORDER BY id`, p.AccountID)
+		AND (status='active' OR (status='paused' AND paused_at>=now()-interval '7 days')) ORDER BY id LIMIT 200`, p.AccountID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read streak candidates")
 		return
@@ -133,11 +139,12 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		return
 	}
 	eligibleRows.Close()
-	rows, err := s.pool.Query(r.Context(), `
+	rows, err := tx.Query(r.Context(), `
 		WITH eligible AS (
 		  SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous'
 		    AND daily_window_start='08:00:00'::time AND daily_window_end='20:00:00'::time
 		    AND (status='active' OR (status='paused' AND paused_at>=now()-interval '7 days'))
+		  ORDER BY id LIMIT 200
 		), expected AS (
 		  SELECT r.id,r.name,r.status,(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone fire_at,
 		         (d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone window_end_at,
@@ -215,5 +222,9 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 		}
 		return out.Items[i].RecordingID < out.Items[j].RecordingID
 	})
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, 500, "finish streak snapshot")
+		return
+	}
 	util.WriteJSON(w, http.StatusOK, out)
 }
