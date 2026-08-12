@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -86,39 +85,17 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 	}
 	canaryCtx, cancelCanary := context.WithCancel(reservationCtx)
 	defer cancelCanary()
-	var safetyErr error
-	var safetyMu sync.Mutex
-	watchDone := make(chan struct{})
+	watchDone := make(chan error, 1)
 	go func() {
-		defer close(watchDone)
 		ticker := time.NewTicker(recordingCanarySafetyPoll)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-canaryCtx.Done():
-				return
-			case <-ticker.C:
-				checkCtx, cancel := context.WithTimeout(canaryCtx, time.Second)
-				checkedSpec, checkErr := client.CheckRecordingCanary(checkCtx, *recordingID, spec.ReservationID)
-				cancel()
-				// Normal completion cancels canaryCtx to stop this watcher. An
-				// in-flight HTTP check then returns context.Canceled; that is not a
-				// production-safety failure.
-				if canaryCtx.Err() != nil {
-					return
-				}
-				if checkErr != nil || !sameCanarySource(spec, checkedSpec) {
-					if checkErr == nil {
-						checkErr = fmt.Errorf("canary source changed")
-					}
-					safetyMu.Lock()
-					safetyErr = checkErr
-					safetyMu.Unlock()
-					cancelCanary()
-					return
-				}
-			}
+		err := watchRecordingCanarySafety(canaryCtx, ticker.C, spec, func(checkCtx context.Context) (recordingapi.RecordingCanarySpec, error) {
+			return client.CheckRecordingCanary(checkCtx, *recordingID, spec.ReservationID)
+		})
+		if err != nil {
+			cancelCanary()
 		}
+		watchDone <- err
 	}()
 
 	root, err := os.MkdirTemp("", "stoarama-relay-canary-*")
@@ -142,10 +119,7 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 		}
 	}
 	cancelCanary()
-	<-watchDone
-	safetyMu.Lock()
-	observedSafetyErr := safetyErr
-	safetyMu.Unlock()
+	observedSafetyErr := <-watchDone
 	if observedSafetyErr != nil {
 		return fmt.Errorf("canary stopped because production safety could not be confirmed: %s",
 			recordingworker.SanitizeDiagnosticError(observedSafetyErr))
@@ -170,6 +144,38 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 		time.Since(started).Round(time.Millisecond), seg.DurationMs, seg.SizeBytes, seg.SHA256,
 		seg.VideoCodec, seg.AudioCodec, seg.AudioPresent, fps, seg.VideoWidth, seg.VideoHeight)
 	return nil
+}
+
+func watchRecordingCanarySafety(
+	ctx context.Context,
+	ticks <-chan time.Time,
+	expected recordingapi.RecordingCanarySpec,
+	check func(context.Context) (recordingapi.RecordingCanarySpec, error),
+) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case _, ok := <-ticks:
+			if !ok {
+				return fmt.Errorf("canary safety ticker stopped")
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, time.Second)
+			actual, err := check(checkCtx)
+			cancel()
+			// Normal completion cancels ctx to stop this watcher. An in-flight
+			// check then returns context.Canceled; that is not a safety failure.
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if !sameCanarySource(expected, actual) {
+				return fmt.Errorf("canary source changed")
+			}
+		}
+	}
 }
 
 func sameCanarySource(a, b recordingapi.RecordingCanarySpec) bool {
