@@ -137,9 +137,10 @@ type RecordingCanarySpec struct {
 type SurrenderReason string
 
 const (
-	SurrenderNoProgress   SurrenderReason = "no_progress"
-	SurrenderDiskPressure SurrenderReason = "disk_pressure"
-	SurrenderSelfUpdate   SurrenderReason = "self_update"
+	SurrenderNoProgress      SurrenderReason = "no_progress"
+	SurrenderDiskPressure    SurrenderReason = "disk_pressure"
+	SurrenderSelfUpdate      SurrenderReason = "self_update"
+	SurrenderOperatorHandoff SurrenderReason = "operator_handoff"
 )
 
 // ClipUploadIntent is a presigned PUT against the user's bucket.
@@ -263,28 +264,34 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 
 // HeartbeatRecordingJob extends the lease. It returns cancel=true when the
 // server signals (409) that the job was canceled or is no longer owned.
-func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64, leaseToken string) (cancel bool, leaseExpiresAt time.Time, err error) {
+func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64, leaseToken string) (bool, time.Time, error) {
+	cancel, expires, _, err := c.HeartbeatRecordingJobWithControl(ctx, jobID, leaseToken)
+	return cancel, expires, err
+}
+
+func (c *Client) HeartbeatRecordingJobWithControl(ctx context.Context, jobID int64, leaseToken string) (cancel bool, leaseExpiresAt time.Time, gracefulHandoffRequestID string, err error) {
 	path := fmt.Sprintf("/api/v1/recording/jobs/%d/heartbeat", jobID)
 	status, body, err := c.postRawWithHeaders(ctx, path, map[string]any{}, leaseTokenHeaders(leaseToken))
 	if err != nil {
-		return false, time.Time{}, err
+		return false, time.Time{}, "", err
 	}
 	if status == http.StatusConflict {
-		return true, time.Time{}, nil
+		return true, time.Time{}, "", nil
 	}
 	if status < 200 || status >= 300 {
-		return false, time.Time{}, fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
+		return false, time.Time{}, "", fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
 	}
 	var out struct {
-		LeaseExpiresAt time.Time `json:"lease_expires_at"`
+		LeaseExpiresAt           time.Time `json:"lease_expires_at"`
+		GracefulHandoffRequestID string    `json:"graceful_handoff_request_id"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return false, time.Time{}, fmt.Errorf("decode heartbeat: %w", err)
+		return false, time.Time{}, "", fmt.Errorf("decode heartbeat: %w", err)
 	}
 	if out.LeaseExpiresAt.IsZero() {
-		return false, time.Time{}, fmt.Errorf("heartbeat response missing lease_expires_at")
+		return false, time.Time{}, "", fmt.Errorf("heartbeat response missing lease_expires_at")
 	}
-	return false, out.LeaseExpiresAt, nil
+	return false, out.LeaseExpiresAt, strings.TrimSpace(out.GracefulHandoffRequestID), nil
 }
 
 // CompleteRecordingJob marks the job done (no reschedule).
@@ -297,10 +304,15 @@ func (c *Client) FailRecordingJob(ctx context.Context, jobID int64, leaseToken, 
 	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/fail", jobID), map[string]any{"error_text": strings.TrimSpace(errText)}, leaseTokenHeaders(leaseToken), nil)
 }
 
-func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, leaseToken string, reason SurrenderReason, errorText string) error {
+func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, leaseToken string, reason SurrenderReason, errorText string, gracefulHandoffRequestID ...string) error {
+	payload := map[string]any{
+		"reason": reason, "error_text": strings.TrimSpace(errorText),
+	}
+	if len(gracefulHandoffRequestID) > 0 && strings.TrimSpace(gracefulHandoffRequestID[0]) != "" {
+		payload["graceful_handoff_request_id"] = strings.TrimSpace(gracefulHandoffRequestID[0])
+	}
 	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{
-		"reason":     reason,
-		"error_text": strings.TrimSpace(errorText),
+		"reason": payload["reason"], "error_text": payload["error_text"], "graceful_handoff_request_id": payload["graceful_handoff_request_id"],
 	}, leaseTokenHeaders(leaseToken), nil)
 }
 

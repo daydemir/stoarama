@@ -16,7 +16,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE | campaign-postflight | capture-health --id ID | repair-source --id ID --account-id ID --stream-id ID --job-id ID --expected-source-sha256 HASH --replacement-source-url URL --reason TEXT --apply"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE | campaign-postflight | capture-health --id ID | repair-source ... | graceful-handoff --id ID --account-id ID --job-id ID --expected-owner OWNER --expected-attempt-count N --request-id UUID --reason TEXT --apply"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -38,6 +38,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 		runRecordingSourceRepair(ctx, cfg, args[1:])
 		return
 	}
+	if args[0] == "graceful-handoff" {
+		runRecordingGracefulHandoff(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) < 2 || args[0] != "naming" {
 		log.Fatal(recordingsUsage)
 	}
@@ -53,6 +57,29 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingGracefulHandoff(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordings graceful-handoff", flag.ExitOnError)
+	id := fs.Int64("id", 0, "recording id")
+	accountID := fs.Int64("account-id", 0, "expected account id")
+	jobID := fs.Int64("job-id", 0, "expected live job id")
+	owner := fs.String("expected-owner", "", "expected exact lease owner")
+	attempt := fs.Int("expected-attempt-count", 0, "expected attempt count")
+	requestID := fs.String("request-id", "", "stable UUID for idempotency")
+	reason := fs.String("reason", "", "audited handoff reason")
+	apply := fs.Bool("apply", false, "request graceful handoff")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "admin API token")
+	_ = fs.Parse(args)
+	if *id <= 0 || *accountID <= 0 || *jobID <= 0 || *attempt <= 0 || strings.TrimSpace(*owner) == "" || strings.TrimSpace(*requestID) == "" || strings.TrimSpace(*reason) == "" {
+		log.Fatal("all graceful-handoff fences and reason are required")
+	}
+	if !*apply {
+		log.Fatal("graceful-handoff is mutation-only; pass --apply after verifying every fence")
+	}
+	payload := mustAPIRequest(ctx, "POST", strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/recordings/%d/graceful-handoff", *id), map[string]any{"account_id": *accountID, "job_id": *jobID, "expected_owner": strings.TrimSpace(*owner), "expected_attempt_count": *attempt, "request_id": strings.TrimSpace(*requestID), "reason": strings.TrimSpace(*reason)})
+	printJSON(payload)
 }
 
 func runRecordingSourceRepair(ctx context.Context, cfg config.Config, args []string) {

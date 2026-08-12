@@ -163,6 +163,24 @@ func TestHeartbeatReturnsConfirmedLeaseExpiry(t *testing.T) {
 	}
 }
 
+func TestHeartbeatReturnsGenerationFencedGracefulHandoff(t *testing.T) {
+	want := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	requestID := "a95354d5-74e1-4f7d-93d4-e24aaec31f49"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"cancel":false,"lease_expires_at":"` + want.Format(time.RFC3339) + `","graceful_handoff_request_id":"` + requestID + `"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, gotExpires, gotRequest, err := client.HeartbeatRecordingJobWithControl(context.Background(), 42, "lease")
+	if err != nil || canceled || !gotExpires.Equal(want) || gotRequest != requestID {
+		t.Fatalf("heartbeat canceled=%v expires=%v request=%q err=%v", canceled, gotExpires, gotRequest, err)
+	}
+}
+
 func TestTouchDropletReportsBuildSHA(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	got := make(chan map[string]string, 1)

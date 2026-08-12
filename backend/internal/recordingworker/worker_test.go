@@ -383,6 +383,41 @@ func TestContinuousSelfUpdateSurrendersOnlyAfterCleanSpoolDrain(t *testing.T) {
 	}
 }
 
+func TestGracefulHandoffMonitorStopsCaptureWithoutCancelingLease(t *testing.T) {
+	state := &recordingHeartbeatState{}
+	var aborted atomic.Int64
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { defer close(done); monitorContinuousGracefulHandoff(stop, state, func() { aborted.Add(1) }) }()
+	state.setHandoff("a95354d5-74e1-4f7d-93d4-e24aaec31f49")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not stop capture")
+	}
+	if aborted.Load() != 1 {
+		t.Fatalf("aborts=%d", aborted.Load())
+	}
+	if state.canceled() {
+		t.Fatal("graceful handoff incorrectly canceled lease renewal")
+	}
+}
+
+func TestGracefulHandoffSurrendersOnlyAfterCleanSpoolDrain(t *testing.T) {
+	if !gracefulHandoffCanSurrender("request", nil, false) {
+		t.Fatal("clean drain did not surrender")
+	}
+	if gracefulHandoffCanSurrender("request", errors.New("upload blocked"), false) {
+		t.Fatal("upload-blocked drain surrendered")
+	}
+	if gracefulHandoffCanSurrender("", nil, false) {
+		t.Fatal("unrequested handoff surrendered")
+	}
+	if gracefulHandoffCanSurrender("request", nil, true) {
+		t.Fatal("closed window surrendered instead of completing")
+	}
+}
+
 func TestUpdateDrainRefusesNewLeases(t *testing.T) {
 	var leaseCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

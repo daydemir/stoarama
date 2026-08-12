@@ -807,6 +807,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			handoff_owner TEXT,
 			handoff_until TIMESTAMPTZ,
 			relay_fairness_started_at TIMESTAMPTZ,
+			graceful_handoff_excluded_relay_group_id BIGINT,
 			error_text TEXT,
 			completed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
