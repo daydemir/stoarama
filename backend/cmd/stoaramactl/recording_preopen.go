@@ -63,10 +63,9 @@ func runRecordingPreopen(ctx context.Context, cfg config.Config, args []string) 
 	fs := flag.NewFlagSet("recording-preopen run", flag.ExitOnError)
 	concurrency := fs.Int("concurrency", 4, "maximum concurrent probes")
 	probeSec := fs.Int("probe-sec", 20, "source-native media probe duration")
-	frameFresh := fs.Int("frame-fresh-min", 30, "maximum relay catalog-frame age")
 	dryRun := fs.Bool("dry-run", false, "select only")
 	_ = fs.Parse(args)
-	if *concurrency < 1 || *concurrency > 6 || *probeSec < 5 || *probeSec > 30 || *frameFresh < 5 || *frameFresh > 120 {
+	if *concurrency < 1 || *concurrency > 6 || *probeSec < 5 || *probeSec > 30 {
 		log.Fatal("invalid bounded pre-open options")
 	}
 	pool := mustOpenPool(ctx, cfg)
@@ -96,7 +95,7 @@ func runRecordingPreopen(ctx context.Context, cfg config.Config, args []string) 
 		printJSON(map[string]any{"dry_run": true, "selected": len(targets)})
 		return
 	}
-	results := probePreopenTargets(ctx, pool, targets, *concurrency, time.Duration(*probeSec)*time.Second, time.Duration(*frameFresh)*time.Minute)
+	results := probePreopenTargets(ctx, pool, targets, *concurrency, time.Duration(*probeSec)*time.Second)
 	incidents := []healthIncident{}
 	counts := map[string]int{"pass": 0, "fail": 0, "unknown": 0}
 	for _, res := range results {
@@ -149,7 +148,7 @@ func selectPreopenTargets(ctx context.Context, pool *pgxpool.Pool, now time.Time
 	return out, rows.Err()
 }
 
-func probePreopenTargets(ctx context.Context, pool *pgxpool.Pool, targets []preopenTarget, limit int, probeWindow, frameFresh time.Duration) []preopenResult {
+func probePreopenTargets(ctx context.Context, pool *pgxpool.Pool, targets []preopenTarget, limit int, probeWindow time.Duration) []preopenResult {
 	sem := make(chan struct{}, limit)
 	ch := make(chan preopenResult, len(targets))
 	var wg sync.WaitGroup
@@ -160,7 +159,7 @@ func probePreopenTargets(ctx context.Context, pool *pgxpool.Pool, targets []preo
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			ch <- probePreopenTarget(ctx, pool, t, probeWindow, frameFresh)
+			ch <- probePreopenTarget(ctx, pool, t, probeWindow)
 		}()
 	}
 	wg.Wait()
@@ -173,20 +172,14 @@ func probePreopenTargets(ctx context.Context, pool *pgxpool.Pool, targets []preo
 	return out
 }
 
-func probePreopenTarget(ctx context.Context, pool *pgxpool.Pool, t preopenTarget, probeWindow, frameFresh time.Duration) preopenResult {
+func probePreopenTarget(ctx context.Context, pool *pgxpool.Pool, t preopenTarget, probeWindow time.Duration) preopenResult {
 	if t.captureVia == "relay" {
-		var captured *time.Time
-		err := pool.QueryRow(ctx, `SELECT max(captured_at) FROM frames WHERE stream_id=$1 AND capture_status='success'`, t.streamID).Scan(&captured)
-		if err != nil {
-			return preopenResult{t, "unknown", "catalog_frame", sanitizePreopenDetail(err.Error())}
-		}
-		if captured == nil {
-			return preopenResult{t, "unknown", "catalog_frame", "no authoritative catalog frame"}
-		}
-		if captured.Before(time.Now().Add(-frameFresh)) {
-			return preopenResult{t, "fail", "catalog_frame", fmt.Sprintf("latest authoritative frame age %s", time.Since(*captured).Round(time.Minute))}
-		}
-		return preopenResult{t, "pass", "catalog_frame", "current authoritative catalog frame"}
+		// A generic catalog frame proves the source was visible somewhere, not that
+		// the recording's intended relay group/uplink can capture it. The cron does
+		// not possess a relay identity and therefore cannot safely run the existing
+		// node-local reservation-backed canary. Fail closed instead of certifying the
+		// wrong failure domain. Relay canary orchestration belongs on an idle relay.
+		return preopenResult{t, "unknown", "relay_canary", "intended relay path was not reservation-canary validated"}
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeWindow+35*time.Second)
 	defer cancel()

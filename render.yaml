@@ -218,6 +218,8 @@ services:
   # local window, then confirmation in its final thirty minutes. The command
   # never leases, uploads, bills, or changes a recording and caps concurrency
   # so the 06:00Z cohort cannot compete materially with production capture.
+  # This is an alerting preflight, not an admission gate: it never changes a
+  # recording or blocks its scheduled window.
   - type: cron
     name: stoarama-recording-preopen
     env: go
@@ -233,7 +235,7 @@ services:
       tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
       cp /tmp/ffmpeg-extract/bin/ffmpeg /tmp/ffmpeg-extract/bin/ffprobe bin/
       chmod +x bin/ffmpeg bin/ffprobe
-    startCommand: ./bin/stoaramactl recording-preopen run --concurrency 4 --probe-sec 20 --frame-fresh-min 30
+    startCommand: ./bin/stoaramactl recording-preopen run --concurrency 4 --probe-sec 20
     envVars:
       - key: DATABASE_URL
         fromDatabase:

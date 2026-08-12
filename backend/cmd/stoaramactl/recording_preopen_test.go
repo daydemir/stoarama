@@ -102,3 +102,24 @@ func TestSanitizePreopenDetail(t *testing.T) {
 		t.Fatal("detail not bounded")
 	}
 }
+
+func TestRelayPreopenNeverPassesFromGenericFrameEvidence(t *testing.T) {
+	target := preopenTarget{recordingID: 445, streamID: 99, captureVia: "relay"}
+	// No database is needed: even a fresh generic frame must never be consulted
+	// because it cannot identify the intended relay group or uplink.
+	got := probePreopenTarget(context.Background(), nil, target, 20*time.Second)
+	if got.result != "unknown" || got.method != "relay_canary" {
+		t.Fatalf("relay result=%+v, want fail-closed UNKNOWN relay canary", got)
+	}
+}
+
+func TestRelayPreopenAbsentOrStaleEvidenceRemainsUnknown(t *testing.T) {
+	for _, name := range []string{"absent", "stale"} {
+		t.Run(name, func(t *testing.T) {
+			got := probePreopenTarget(context.Background(), nil, preopenTarget{captureVia: "relay"}, 20*time.Second)
+			if got.result != "unknown" {
+				t.Fatalf("relay result=%q, want unknown", got.result)
+			}
+		})
+	}
+}
