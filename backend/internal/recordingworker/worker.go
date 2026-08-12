@@ -472,6 +472,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	var timelineEnd time.Time
 	progress := newContinuousProgress(time.Now())
 	deliverSegment := func(sourceURL string, seg capture.Segment) error {
+		w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "finalize_read", seg.FinalizeReadDuration)
+		w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "finalize_hash", seg.FinalizeHashDuration)
+		w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "finalize_probe", seg.FinalizeProbeDuration)
+		if !seg.DeliveryQueuedAt.IsZero() {
+			w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "queue_wait", time.Since(seg.DeliveryQueuedAt))
+		}
 		if !w.diskHasSpace(w.cfg.MinActiveFreeBytes) {
 			return errDiskPressure
 		}
@@ -485,6 +491,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return w.diskHasSpace(w.cfg.MinActiveFreeBytes)
 		}, segmentDeliveryOps{
 			Reserve: func() (recordingapi.ClipUploadIntent, error) {
+				started := time.Now()
+				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "reserve", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
 				reserved, err := w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, segStartMs)
 				if err != nil {
@@ -493,6 +501,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				return reserved, err
 			},
 			Upload: func(intent recordingapi.ClipUploadIntent) error {
+				started := time.Now()
+				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "put", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
 				uploadCtx, uploadCancel := context.WithTimeout(segmentCtx, recordingapi.UploadTimeout)
 				err := w.cfg.Client.UploadFile(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType)
@@ -503,6 +513,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				return err
 			},
 			Ingest: func(intent recordingapi.ClipUploadIntent) error {
+				started := time.Now()
+				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "ingest", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
 				_, err := w.cfg.Client.IngestClip(segmentCtx, recordingapi.IngestClipRequest{
 					IntentID:        intent.IntentID,
@@ -530,6 +542,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				return nil
 			},
 		}, func(err error) {
+			w.cfg.RelayDiagnostics.DeliveryRetry(job.JobID)
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_delivery_retry", err)
 			log.Printf("recording worker job=%d recording=%d segment delivery failed: %v; retrying in %s",
 				job.JobID, job.RecordingID, err, segmentDeliveryRetryDelay)
@@ -658,7 +671,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// spool still drain normally on jobCtx.
 			observeContinuousMediaLag(seg.EndAt, time.Now(), w.cfg.ContinuousMaxMediaLag, &mediaLagged, abortAttempt)
 			return deliverSegment(resolved, seg)
-		})
+		}, func(depth int) { w.cfg.RelayDiagnostics.DeliveryQueue(job.JobID, depth) })
 		var diskPressure atomic.Bool
 		stopDiskMonitor := make(chan struct{})
 		go w.monitorContinuousDisk(stopDiskMonitor, &diskPressure, abortAttempt)

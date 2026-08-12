@@ -30,15 +30,84 @@ type RelayDiagnostics struct {
 }
 
 type jobDiagnostic struct {
-	JobID         int64
-	RecordingID   int64
-	Stage         string
-	LastError     string
-	StartedAt     time.Time
-	StageAt       time.Time
-	FinishedAt    *time.Time
-	SegmentCount  int
-	LastSegmentAt *time.Time
+	JobID              int64
+	RecordingID        int64
+	Stage              string
+	LastError          string
+	StartedAt          time.Time
+	StageAt            time.Time
+	FinishedAt         *time.Time
+	SegmentCount       int
+	LastSegmentAt      *time.Time
+	DeliveryPhases     map[string]phaseDiagnostic
+	DeliveryQueueDepth int
+	DeliveryQueueMax   int
+	DeliveryRetries    int
+}
+
+type phaseDiagnostic struct {
+	Count   int   `json:"count"`
+	TotalMS int64 `json:"total_ms"`
+	MaxMS   int64 `json:"max_ms"`
+}
+
+var deliveryPhaseAllowlist = map[string]bool{"finalize_read": true, "finalize_hash": true, "finalize_probe": true, "queue_wait": true, "reserve": true, "put": true, "ingest": true}
+
+func (d *RelayDiagnostics) DeliveryPhase(jobID int64, phase string, duration time.Duration) {
+	if d == nil || !deliveryPhaseAllowlist[phase] {
+		return
+	}
+	ms := duration.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	if ms > 3_600_000 {
+		ms = 3_600_000
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if j := d.current[jobID]; j != nil {
+		if j.DeliveryPhases == nil {
+			j.DeliveryPhases = map[string]phaseDiagnostic{}
+		}
+		p := j.DeliveryPhases[phase]
+		p.Count++
+		p.TotalMS += ms
+		if ms > p.MaxMS {
+			p.MaxMS = ms
+		}
+		j.DeliveryPhases[phase] = p
+	}
+}
+
+func (d *RelayDiagnostics) DeliveryQueue(jobID int64, depth int) {
+	if d == nil {
+		return
+	}
+	if depth < 0 {
+		depth = 0
+	}
+	if depth > 10000 {
+		depth = 10000
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if j := d.current[jobID]; j != nil {
+		j.DeliveryQueueDepth = depth
+		if depth > j.DeliveryQueueMax {
+			j.DeliveryQueueMax = depth
+		}
+	}
+}
+func (d *RelayDiagnostics) DeliveryRetry(jobID int64) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if j := d.current[jobID]; j != nil && j.DeliveryRetries < 1000000 {
+		j.DeliveryRetries++
+	}
 }
 
 func (d *RelayDiagnostics) Start(job recordingapi.RecordingJob) {
@@ -198,6 +267,12 @@ func diagnosticMap(j *jobDiagnostic) map[string]any {
 	if j.LastSegmentAt != nil {
 		out["last_segment_at"] = j.LastSegmentAt.UTC().Format(time.RFC3339Nano)
 	}
+	if len(j.DeliveryPhases) > 0 {
+		out["delivery_phases"] = j.DeliveryPhases
+	}
+	out["delivery_queue_depth"] = j.DeliveryQueueDepth
+	out["delivery_queue_max"] = j.DeliveryQueueMax
+	out["delivery_retries"] = j.DeliveryRetries
 	return out
 }
 

@@ -65,6 +65,61 @@ func TestSegmentDeliveryPoolKeepsSeveralUploadsInFlight(t *testing.T) {
 	}
 }
 
+func TestSegmentDeliveryPoolQueueObserverCannotPublishAfterLaterMutation(t *testing.T) {
+	observerEntered := make(chan struct{})
+	releaseObserver := make(chan struct{})
+	delivered := make(chan struct{})
+	var mu sync.Mutex
+	var depths []int
+	pool := startSegmentDeliveryPool(1, func() {}, func(capture.Segment) error { <-delivered; return nil }, func(depth int) {
+		mu.Lock()
+		first := len(depths) == 0
+		mu.Unlock()
+		if first {
+			close(observerEntered)
+			<-releaseObserver
+		}
+		mu.Lock()
+		depths = append(depths, depth)
+		mu.Unlock()
+	})
+	submittedOne := make(chan error, 1)
+	go func() { submittedOne <- pool.Submit(capture.Segment{Path: "one"}) }()
+	<-observerEntered
+	// This forces the original inversion: enqueue(1) has mutated the queue but its
+	// publication is blocked while a worker and another submit try to mutate it.
+	// Both must wait behind the same queue lock, so depth 1 cannot publish stale
+	// after a later depth 0/1 mutation.
+	submitted := make(chan error, 1)
+	go func() { submitted <- pool.Submit(capture.Segment{Path: "two"}) }()
+	select {
+	case <-submitted:
+		t.Fatal("later mutation overtook blocked depth publication")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseObserver)
+	if err := <-submittedOne; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-submitted; err != nil {
+		t.Fatal(err)
+	}
+	close(delivered)
+	result := pool.close()
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	mu.Lock()
+	got := append([]int(nil), depths...)
+	mu.Unlock()
+	if len(got) != 4 {
+		t.Fatalf("depth events=%v", got)
+	}
+	if got[0] != 1 || got[len(got)-1] != 0 {
+		t.Fatalf("depth events=%v: stale publication escaped mutation order", got)
+	}
+}
+
 // TestSegmentDeliveryPoolCloseDrainsOutstandingUploads pins the window-close
 // contract: close() joins every accepted segment, so making delivery concurrent
 // does not simply move clip loss to the window boundary.

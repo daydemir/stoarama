@@ -65,7 +65,13 @@ type Segment struct {
 	// authoritative concatenation order even when a source's wall-clock labels
 	// jump or overlap.
 	CaptureSequence int64
-	Thumbnail       *SegmentThumbnail
+	// Local phase durations are ephemeral relay diagnostics. They are never sent
+	// with clip metadata and contain no paths, URLs, tokens, or error text.
+	FinalizeReadDuration  time.Duration
+	FinalizeHashDuration  time.Duration
+	FinalizeProbeDuration time.Duration
+	DeliveryQueuedAt      time.Time
+	Thumbnail             *SegmentThumbnail
 }
 
 type SegmentThumbnail struct {
@@ -556,13 +562,19 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 	if info.Size() == 0 {
 		return Segment{}, fmt.Errorf("finalized segment is empty")
 	}
+	readStarted := time.Now()
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return Segment{}, fmt.Errorf("read segment: %w", err)
 	}
+	readDuration := time.Since(readStarted)
+	hashStarted := time.Now()
 	sum := sha256.Sum256(body)
+	hashDuration := time.Since(hashStarted)
 
+	probeStarted := time.Now()
 	meta, metaErr := probeSegment(ctx, path)
+	probeDuration := time.Since(probeStarted)
 	durationMs := int64(0)
 	videoCodec := "h264"
 	audioCodec := ""
@@ -590,21 +602,24 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 		endAt = startAt.Add(time.Duration(durationMs) * time.Millisecond)
 	}
 	return Segment{
-		Path:         path,
-		MIMEType:     "video/mp4",
-		SizeBytes:    info.Size(),
-		SHA256:       hex.EncodeToString(sum[:]),
-		SourceKind:   "live",
-		StartAt:      startAt,
-		EndAt:        endAt,
-		DurationMs:   durationMs,
-		Container:    "mp4",
-		ActualFPS:    actualFPS,
-		VideoCodec:   videoCodec,
-		AudioCodec:   audioCodec,
-		AudioPresent: audioPresent,
-		VideoWidth:   videoWidth,
-		VideoHeight:  videoHeight,
+		Path:                  path,
+		MIMEType:              "video/mp4",
+		SizeBytes:             info.Size(),
+		FinalizeReadDuration:  readDuration,
+		FinalizeHashDuration:  hashDuration,
+		FinalizeProbeDuration: probeDuration,
+		SHA256:                hex.EncodeToString(sum[:]),
+		SourceKind:            "live",
+		StartAt:               startAt,
+		EndAt:                 endAt,
+		DurationMs:            durationMs,
+		Container:             "mp4",
+		ActualFPS:             actualFPS,
+		VideoCodec:            videoCodec,
+		AudioCodec:            audioCodec,
+		AudioPresent:          audioPresent,
+		VideoWidth:            videoWidth,
+		VideoHeight:           videoHeight,
 	}, nil
 }
 
