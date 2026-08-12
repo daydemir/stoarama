@@ -25,10 +25,13 @@ type digestRecording struct {
 }
 
 type digestNAS struct {
-	Label, Phase, AlertState, LastOutageClass      string
+	Label, Phase, CapacityTransitionState          string
 	Free, Total                                    *int64
-	ReportedAt, AlertObservedAt, OutageRecoveredAt *time.Time
+	ReportedAt, BatchCompletedAt, InventoryAt      *time.Time
+	CapacityTransitionAt                           *time.Time
 	Blocked                                        bool
+	BatchClips, BatchFailures, ServerOnly          int64
+	InventoryClips, InventoryMismatches, Unmatched int64
 }
 
 func healthDigestBucket(now time.Time) time.Time {
@@ -56,7 +59,10 @@ func runRecordingHealthSummary(ctx context.Context, cfg config.Config) {
 	if err != nil {
 		log.Fatalf("query digest recordings: %v", err)
 	}
-	nas := loadDigestNAS(ctx, pool)
+	nas, err := loadDigestNAS(ctx, pool)
+	if err != nil {
+		log.Fatalf("load digest NAS telemetry: %v", err)
+	}
 	body := composeHealthDigest(cfg.AppBaseURL, now, items, nas)
 	recipients := operatorRecipients(ctx, pool)
 	if len(recipients) == 0 {
@@ -153,17 +159,26 @@ func claimHealthDigestDelivery(ctx context.Context, pool *pgxpool.Pool, bucket t
 	return claimed, err
 }
 
-func loadDigestNAS(ctx context.Context, pool *pgxpool.Pool) digestNAS {
+func loadDigestNAS(ctx context.Context, pool *pgxpool.Pool) (digestNAS, error) {
 	var n digestNAS
-	if err := pool.QueryRow(ctx, `
+	err := pool.QueryRow(ctx, `
 		SELECT c.label,c.client_phase,c.nas_storage_free_bytes,c.nas_storage_total_bytes,c.nas_storage_reported_at,c.nas_capacity_blocked,
-		       COALESCE(s.observed_state::text,'unknown'),s.observed_at,c.last_outage_class,c.last_outage_recovered_at
-		FROM connections c LEFT JOIN nas_storage_capacity_alert_states s ON s.connection_id=c.id
+		       c.nas_batch_clips,c.nas_batch_failures,c.nas_batch_completed_at,c.inventory_clips,c.inventory_mismatches,c.inventory_unmatched,c.inventory_reported_at,
+		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
+		         WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
+		           AND NOT EXISTS (SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'
+		             AND i.relative_path=rc.display_path AND i.size_bytes=rc.size_bytes AND i.sha256=lower(rc.sha256))),
+		       COALESCE(e.state::text,''),e.observed_at
+		FROM connections c
+		LEFT JOIN LATERAL (SELECT state,observed_at FROM nas_storage_capacity_alert_events WHERE connection_id=c.id ORDER BY id DESC LIMIT 1) e ON true
 		WHERE c.kind='nas_pull' ORDER BY c.last_seen_at DESC LIMIT 1`).Scan(
-		&n.Label, &n.Phase, &n.Free, &n.Total, &n.ReportedAt, &n.Blocked, &n.AlertState, &n.AlertObservedAt, &n.LastOutageClass, &n.OutageRecoveredAt); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		log.Printf("recording health digest NAS telemetry unavailable: %v", err)
+		&n.Label, &n.Phase, &n.Free, &n.Total, &n.ReportedAt, &n.Blocked,
+		&n.BatchClips, &n.BatchFailures, &n.BatchCompletedAt, &n.InventoryClips, &n.InventoryMismatches, &n.Unmatched, &n.InventoryAt,
+		&n.ServerOnly, &n.CapacityTransitionState, &n.CapacityTransitionAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return digestNAS{}, nil
 	}
-	return n
+	return n, err
 }
 
 func healthDigestIdempotencyKey(bucket time.Time, recipient string) string {
@@ -220,16 +235,26 @@ func composeHealthDigest(base string, now time.Time, items []digestRecording, na
 	sort.Slice(stable, func(i, j int) bool { return stable[i] < stable[j] })
 	fmt.Fprintf(&b, "CURRENT STABLE (%d)\n  IDs: %v\n\n", len(stable), stable)
 	b.WriteString("NAS\n")
-	if nas.ReportedAt == nil || now.Sub(nas.ReportedAt.UTC()) > 2*time.Minute {
+	state := nasStorageStateAt(nas.Total, nas.Free, nas.ReportedAt, now)
+	if state == nasStorageUnknown {
 		b.WriteString("  Current capacity telemetry: unknown/stale.\n")
 	} else {
-		fmt.Fprintf(&b, "  Current: alert=%s phase=%s free=%s total=%s capacity_blocked=%t reported=%s\n", nas.AlertState, nas.Phase, formatDigestBytes(nas.Free), formatDigestBytes(nas.Total), nas.Blocked, nas.ReportedAt.UTC().Format(time.RFC3339))
+		percent := float64(*nas.Free) * 100 / float64(*nas.Total)
+		fmt.Fprintf(&b, "  Current: state=%s phase=%s free=%s/%s (%.2f%%) capacity_blocked=%t telemetry_age=%s. Gates: warning <=10%%, critical <=5%%, stale >=15m is unknown.\n", state, nas.Phase, formatDigestBytes(nas.Free), formatDigestBytes(nas.Total), percent, nas.Blocked, now.Sub(nas.ReportedAt.UTC()).Round(time.Second))
 	}
-	if nas.LastOutageClass != "" && nas.OutageRecoveredAt != nil {
-		fmt.Fprintf(&b, "  Historical transient: %s recovered=%s (not a current outage).\n", nas.LastOutageClass, nas.OutageRecoveredAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "  Delivery: server_only=%d; last_batch clips=%d failures=%d completed=%s. Inventory: clips=%d mismatches=%d unmatched=%d reported=%s.\n", nas.ServerOnly, nas.BatchClips, nas.BatchFailures, formatDigestTime(nas.BatchCompletedAt), nas.InventoryClips, nas.InventoryMismatches, nas.Unmatched, formatDigestTime(nas.InventoryAt))
+	if nas.CapacityTransitionState != "" && nas.CapacityTransitionAt != nil {
+		fmt.Fprintf(&b, "  Latest historical storage-capacity transition: %s at %s (not the current derived state above).\n", nas.CapacityTransitionState, nas.CapacityTransitionAt.UTC().Format(time.RFC3339))
 	}
 	b.WriteString("\nUrgent alerts remain independent and are not suppressed by this summary.\n")
 	return b.String()
+}
+
+func formatDigestTime(v *time.Time) string {
+	if v == nil {
+		return "unknown"
+	}
+	return v.UTC().Format(time.RFC3339)
 }
 
 func formatDigestBytes(v *int64) string {

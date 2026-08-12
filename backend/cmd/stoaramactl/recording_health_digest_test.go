@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestHealthDigestBucket(t *testing.T) {
@@ -11,6 +16,63 @@ func TestHealthDigestBucket(t *testing.T) {
 	want := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
 	if !got.Equal(want) {
 		t.Fatalf("bucket = %s, want %s", got, want)
+	}
+}
+
+func TestClaimHealthDigestDeliveryLifecycle(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed digest claim regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("health_digest_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `CREATE TABLE recording_health_digest_deliveries(bucket_start_at TIMESTAMPTZ NOT NULL,recipient TEXT NOT NULL,attempted_at TIMESTAMPTZ,delivered_at TIMESTAMPTZ,PRIMARY KEY(bucket_start_at,recipient))`); err != nil {
+		t.Fatal(err)
+	}
+	bucket := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
+	claimed, err := claimHealthDigestDelivery(ctx, pool, bucket, "ops@example.com")
+	if err != nil || !claimed {
+		t.Fatalf("first claim=%t err=%v", claimed, err)
+	}
+	claimed, err = claimHealthDigestDelivery(ctx, pool, bucket, "ops@example.com")
+	if err != nil || claimed {
+		t.Fatalf("immediate duplicate=%t err=%v", claimed, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_health_digest_deliveries SET attempted_at=now()-interval '11 minutes'`); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = claimHealthDigestDelivery(ctx, pool, bucket, "ops@example.com")
+	if err != nil || !claimed {
+		t.Fatalf("expired attempt=%t err=%v", claimed, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_health_digest_deliveries SET delivered_at=now(),attempted_at=now()-interval '11 minutes'`); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = claimHealthDigestDelivery(ctx, pool, bucket, "ops@example.com")
+	if err != nil || claimed {
+		t.Fatalf("delivered claim=%t err=%v", claimed, err)
 	}
 }
 
@@ -60,10 +122,10 @@ func TestComposeHealthDigestNASCurrentAndRecoveredAreDistinct(t *testing.T) {
 	recovered := now.Add(-time.Hour)
 	free, total := int64(2e12), int64(8e12)
 	body := composeHealthDigest("", now, nil, digestNAS{
-		Label: "NAS", Phase: "idle", AlertState: "critical", Free: &free, Total: &total,
-		ReportedAt: &reported, Blocked: true, LastOutageClass: "timeout", OutageRecoveredAt: &recovered,
+		Label: "NAS", Phase: "idle", Free: &free, Total: &total,
+		ReportedAt: &reported, Blocked: true, CapacityTransitionState: "unknown", CapacityTransitionAt: &recovered,
 	})
-	if !strings.Contains(body, "Current: alert=critical") || !strings.Contains(body, "Historical transient: timeout recovered=") || !strings.Contains(body, "not a current outage") {
+	if !strings.Contains(body, "Current: state=healthy") || !strings.Contains(body, "Latest historical storage-capacity transition: unknown") || !strings.Contains(body, "not the current derived state") {
 		t.Fatalf("NAS current/recovered wording missing:\n%s", body)
 	}
 }
