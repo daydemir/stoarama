@@ -1165,7 +1165,8 @@ def bounded_tool_output(command, timeout=MEDIA_CERTIFICATION_TOOL_TIMEOUT_SEC):
     with tempfile.TemporaryFile() as stdout_file:
         try:
             completed = subprocess.run(
-                command, check=False, stdout=stdout_file, stderr=subprocess.DEVNULL,
+                command, check=False, stdin=subprocess.DEVNULL,
+                stdout=stdout_file, stderr=subprocess.DEVNULL,
                 timeout=timeout, env={"PATH": os.environ.get("PATH", "")},
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1746,10 +1747,11 @@ def open_certification_inventory(cfg):
         started = parse_certification_timestamp(started_at, "inventory scan_started_at")
         pass_started = parse_certification_timestamp(pass_started_at, "inventory scan_pass_started_at")
         completed = parse_certification_timestamp(completed_at, "inventory scan_completed_at")
+        certification_sha(digest, "inventory digest")
     except MediaCertificationError as exc:
         database.close()
         raise MediaCertificationError("the NAS inventory completion proof is invalid") from exc
-    if started > completed or pass_started > completed or certification_sha(digest, "inventory digest") != digest:
+    if started > completed or pass_started > completed:
         database.close()
         raise MediaCertificationError("the NAS inventory completion proof is invalid")
     if skipped != 0:

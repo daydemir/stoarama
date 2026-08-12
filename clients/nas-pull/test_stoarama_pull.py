@@ -395,6 +395,36 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(status, 1)
             self.assertEqual(stderr.getvalue(), "certification failed: window_start must be an ISO-8601 timestamp\n")
 
+    def test_media_tool_subprocess_is_noninteractive(self):
+        completed = SimpleNamespace(returncode=0)
+        with mock.patch.object(pull.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(pull.bounded_tool_output(["ffprobe", "-version"]), b"")
+        self.assertIs(run.call_args.kwargs["stdin"], pull.subprocess.DEVNULL)
+
+    def test_media_certification_closes_inventory_on_malformed_digest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            self.seed_certification_window(cfg, count=1)
+            writable = sqlite3.connect(str(cfg.inventory_file))
+            writable.execute("UPDATE meta SET value='malformed' WHERE key='digest'")
+            writable.commit()
+            writable.close()
+            real_connect = pull.sqlite3.connect
+            opened = []
+
+            def track_connect(*args, **kwargs):
+                connection = real_connect(*args, **kwargs)
+                opened.append(connection)
+                return connection
+
+            with mock.patch.object(pull.sqlite3, "connect", side_effect=track_connect), self.assertRaisesRegex(
+                pull.MediaCertificationError, "completion proof is invalid"
+            ):
+                pull.open_certification_inventory(cfg)
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                opened[0].execute("SELECT 1")
+
     def test_media_certification_cli_bounds_malformed_sidecar_failure(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
