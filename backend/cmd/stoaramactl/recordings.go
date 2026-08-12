@@ -16,7 +16,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE | campaign-postflight | capture-health --id ID"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch --spec FILE | campaign-postflight | capture-health --id ID | repair-source --id ID --account-id ID --stream-id ID --job-id ID --expected-source-sha256 HASH --replacement-source-url URL --reason TEXT --apply"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -34,6 +34,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 		runRecordingCaptureHealth(ctx, cfg, args[1:])
 		return
 	}
+	if args[0] == "repair-source" {
+		runRecordingSourceRepair(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) < 2 || args[0] != "naming" {
 		log.Fatal(recordingsUsage)
 	}
@@ -49,6 +53,33 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingSourceRepair(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordings repair-source", flag.ExitOnError)
+	id := fs.Int64("id", 0, "recording id")
+	accountID := fs.Int64("account-id", 0, "expected account id")
+	streamID := fs.Int64("stream-id", 0, "expected catalog stream id")
+	jobID := fs.Int64("job-id", 0, "expected pending job id")
+	expectedHash := fs.String("expected-source-sha256", "", "SHA-256 of expected current source URL")
+	replacement := fs.String("replacement-source-url", "", "validated replacement source URL")
+	reason := fs.String("reason", "", "audited repair reason")
+	apply := fs.Bool("apply", false, "perform the fenced repair")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "admin API token")
+	_ = fs.Parse(args)
+	if *id <= 0 || *accountID <= 0 || *streamID <= 0 || *jobID <= 0 || len(strings.TrimSpace(*expectedHash)) != 64 || strings.TrimSpace(*replacement) == "" || strings.TrimSpace(*reason) == "" {
+		log.Fatal("all repair-source identifiers, hash, replacement URL, and reason are required")
+	}
+	if !*apply {
+		log.Fatal("repair-source is mutation-only; pass --apply after verifying every fence")
+	}
+	payload := mustAPIRequest(ctx, "POST", strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), fmt.Sprintf("/api/v1/recordings/%d/repair-source", *id), map[string]any{
+		"account_id": *accountID, "stream_id": *streamID, "job_id": *jobID,
+		"expected_current_source_sha256": strings.ToLower(strings.TrimSpace(*expectedHash)),
+		"replacement_source_url":         strings.TrimSpace(*replacement), "reason": strings.TrimSpace(*reason),
+	})
+	printJSON(payload)
 }
 
 func runRecordingCaptureHealth(ctx context.Context, cfg config.Config, args []string) {
