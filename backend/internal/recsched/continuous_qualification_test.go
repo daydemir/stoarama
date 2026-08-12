@@ -106,3 +106,28 @@ func TestNextFullContinuousWindowsOnFindsFourteenSparseWeekdays(t *testing.T) {
 		t.Fatal("qualification helper accepted more than fourteen windows")
 	}
 }
+
+func TestNextFullContinuousWindowsOnRejectsInvalidInputs(t *testing.T) {
+	start := TimeOfDay{Hour: 8}
+	end := TimeOfDay{Hour: 20}
+	envStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name     string
+		weekdays WeekdaySet
+		limit    int
+	}{
+		{name: "zero limit", weekdays: AllWeekdays, limit: 0},
+		{name: "negative limit", weekdays: AllWeekdays, limit: -1},
+		{name: "over contract limit", weekdays: AllWeekdays, limit: 15},
+		{name: "empty weekdays", weekdays: 0, limit: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NextFullContinuousWindowsOn(
+				"UTC", start, end, test.weekdays, envStart, time.Time{}, envStart, test.limit,
+			); err == nil {
+				t.Fatal("expected invalid-input error")
+			}
+		})
+	}
+}

@@ -137,13 +137,6 @@ func TestRecordingQualificationMigrationFreezesCompleteCohort(t *testing.T) {
 	`, runID); err != nil {
 		t.Fatalf("insert expected windows: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `UPDATE recordings SET stream_id=999999 WHERE id=1001`); err != nil {
-		t.Fatalf("prepare authoritative recording: %v", err)
-	}
-	if _, err := conn.Exec(ctx, `UPDATE recordings SET stream_id=2001 WHERE id=1001`); err != nil {
-		t.Fatalf("restore authoritative recording: %v", err)
-	}
-
 	// Hold an uncommitted schedule mutation on a second connection. Activation
 	// must wait for that authoritative row lock, then validate the committed new
 	// version and reject it rather than freezing the old statement snapshot.
@@ -155,6 +148,19 @@ func TestRecordingQualificationMigrationFreezesCompleteCohort(t *testing.T) {
 	if _, err := conn2.Exec(ctx, `SET search_path TO `+pgx.Identifier{schema}.Sanitize()); err != nil {
 		t.Fatalf("set concurrent schema: %v", err)
 	}
+	activationConn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect activator: %v", err)
+	}
+	defer activationConn.Close(context.Background())
+	if _, err := activationConn.Exec(ctx, `SET search_path TO `+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatalf("set activator schema: %v", err)
+	}
+	observerConn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect lock observer: %v", err)
+	}
+	defer observerConn.Close(context.Background())
 	tx2, err := conn2.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin concurrent edit: %v", err)
@@ -163,19 +169,49 @@ func TestRecordingQualificationMigrationFreezesCompleteCohort(t *testing.T) {
 		t.Fatalf("concurrent authoritative edit: %v", err)
 	}
 	activationResult := make(chan error, 1)
+	activationCtx, cancelActivation := context.WithCancel(ctx)
+	defer cancelActivation()
 	go func() {
-		_, activateErr := conn.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, runID)
+		_, activateErr := activationConn.Exec(activationCtx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, runID)
 		activationResult <- activateErr
 	}()
-	select {
-	case err := <-activationResult:
-		t.Fatalf("activation did not serialize behind authoritative edit: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelWait()
+	blocked := false
+	var waitErr error
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !blocked && waitErr == nil {
+		waitErr = observerConn.QueryRow(waitCtx,
+			`SELECT $2::int = ANY(pg_blocking_pids($1::int))`,
+			activationConn.PgConn().PID(), conn2.PgConn().PID(),
+		).Scan(&blocked)
+		if waitErr == nil && !blocked {
+			select {
+			case <-waitCtx.Done():
+				waitErr = waitCtx.Err()
+			case <-ticker.C:
+			}
+		}
 	}
-	if err := tx2.Commit(ctx); err != nil {
-		t.Fatalf("commit concurrent edit: %v", err)
+	var releaseErr error
+	if blocked {
+		releaseErr = tx2.Commit(ctx)
+	} else {
+		releaseErr = tx2.Rollback(ctx)
 	}
-	if err := <-activationResult; err == nil {
+	activationErr := <-activationResult
+	cancelActivation()
+	if waitErr != nil {
+		t.Fatalf("observe activation lock wait: %v", waitErr)
+	}
+	if !blocked {
+		t.Fatal("activation was not blocked by authoritative edit")
+	}
+	if releaseErr != nil {
+		t.Fatalf("release concurrent edit: %v", releaseErr)
+	}
+	if activationErr == nil {
 		t.Fatal("activation ignored committed concurrent recording mutation")
 	}
 	if _, err := conn.Exec(ctx, `UPDATE recordings SET stream_id=2001 WHERE id=1001`); err != nil {
@@ -233,9 +269,46 @@ func TestRecordingQualificationMigrationFreezesCompleteCohort(t *testing.T) {
 	}
 	assertRejected("activate underfilled run", `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, underfilledID)
 	assertRejected("reparent active member", `UPDATE recording_qualification_members SET run_id=$2 WHERE run_id=$1 AND ordinal=1`, runID, underfilledID)
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO recording_qualification_members (
+		  run_id,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,
+		  scene_identity_sha256,scene_frame_evidence_id,cron_timezone,daily_window_start,daily_window_end,
+		  active_weekdays,schedule_start_at,window_generator_version
+		)
+		SELECT $1,47,1001,1,2001,'recording-1','stream-1',scene_identity_sha256,id,
+		       'UTC','08:00','20:00',127,'2026-08-01 00:00:00+00','recsched-next-full-v1'
+		FROM recording_scene_frame_evidence WHERE account_id=47 AND stream_id=2001
+	`, underfilledID); err != nil {
+		t.Fatalf("populate canceled-builder member: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO recording_qualification_windows (
+		  run_id,recording_id,ordinal,local_open_at,local_end_at,
+		  open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds
+		) VALUES (
+		  $1,1001,1,'2026-08-13 08:00:00','2026-08-13 20:00:00',0,0,
+		  '2026-08-13 08:00:00+00','2026-08-13 20:00:00+00',43200
+		)
+	`, underfilledID); err != nil {
+		t.Fatalf("populate canceled-builder window: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE recording_qualification_runs SET status='canceled' WHERE id=$1`, underfilledID); err != nil {
+		t.Fatalf("cancel unactivated builder: %v", err)
+	}
+	for _, cleanup := range []struct{ label, stmt string }{
+		{label: "windows", stmt: `DELETE FROM recording_qualification_windows WHERE run_id=$1`},
+		{label: "members", stmt: `DELETE FROM recording_qualification_members WHERE run_id=$1`},
+		{label: "run", stmt: `DELETE FROM recording_qualification_runs WHERE id=$1`},
+	} {
+		if _, err := conn.Exec(ctx, cleanup.stmt, underfilledID); err != nil {
+			t.Fatalf("delete canceled unactivated builder %s: %v", cleanup.label, err)
+		}
+	}
 
 	if _, err := conn.Exec(ctx, `UPDATE recording_qualification_runs SET status='canceled' WHERE id=$1`, runID); err != nil {
 		t.Fatalf("cancel active run: %v", err)
 	}
 	assertRejected("reopen canceled run", `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, runID)
+	assertRejected("delete frozen canceled child", `DELETE FROM recording_qualification_windows WHERE run_id=$1 AND ordinal=14`, runID)
+	assertRejected("delete frozen canceled run", `DELETE FROM recording_qualification_runs WHERE id=$1`, runID)
 }

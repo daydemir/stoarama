@@ -80,7 +80,10 @@ func NextFullContinuousWindowsOn(tz string, start, end TimeOfDay, weekdays Weekd
 	// may open before local midnight while still meeting an exact UTC cutoff.
 	y, mo, d = prevLocalDate(y, mo, d, loc)
 	windows := make([]ContinuousWindow, 0, limit)
-	for scanned := 0; scanned < limit*7+8 && len(windows) < limit; scanned++ {
+	// Seven days per occurrence is the worst nonempty weekday mask. The extra
+	// eight days cover the prior-date probe plus one cursor/envelope rejection.
+	maxScanDays := limit*7 + 8
+	for scanned := 0; scanned < maxScanDays && len(windows) < limit; scanned++ {
 		localOpen := time.Date(y, mo, d, start.Hour, start.Minute, start.Second, 0, loc)
 		openUTC := localOpen.UTC()
 		localEndY, localEndMo, localEndD := y, mo, d

@@ -200,6 +200,7 @@ CREATE OR REPLACE FUNCTION enforce_recording_qualification_child_mutability()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   old_status TEXT;
+  old_frozen_at TIMESTAMPTZ;
   new_status TEXT;
 BEGIN
   IF TG_OP='INSERT' THEN
@@ -207,9 +208,13 @@ BEGIN
     IF new_status IS DISTINCT FROM 'building' THEN RAISE EXCEPTION 'qualification run is not building'; END IF;
     RETURN NEW;
   END IF;
-  SELECT status INTO old_status FROM recording_qualification_runs WHERE id=OLD.run_id FOR UPDATE;
+  SELECT status,frozen_at INTO old_status,old_frozen_at
+  FROM recording_qualification_runs WHERE id=OLD.run_id FOR UPDATE;
   IF TG_OP='DELETE' THEN
-    IF old_status IS DISTINCT FROM 'building' THEN RAISE EXCEPTION 'activated qualification run is immutable'; END IF;
+    IF old_status IS DISTINCT FROM 'building' AND
+       NOT (old_status='canceled' AND old_frozen_at IS NULL) THEN
+      RAISE EXCEPTION 'activated qualification run is immutable';
+    END IF;
     RETURN OLD;
   END IF;
   IF NEW.run_id<>OLD.run_id OR NEW.recording_id<>OLD.recording_id THEN
@@ -248,7 +253,9 @@ BEGIN
     RETURN NEW;
   END IF;
   IF TG_OP='DELETE' THEN
-    IF OLD.status<>'building' THEN RAISE EXCEPTION 'activated qualification run cannot be deleted'; END IF;
+    IF OLD.status<>'building' AND NOT (OLD.status='canceled' AND OLD.frozen_at IS NULL) THEN
+      RAISE EXCEPTION 'activated qualification run cannot be deleted';
+    END IF;
     RETURN OLD;
   END IF;
   IF OLD.status='building' AND NEW.status='active' THEN
@@ -322,6 +329,9 @@ BEGIN
     );
     IF invalid_count<>0 THEN RAISE EXCEPTION 'qualification evidence or window set is invalid'; END IF;
 
+    -- This hash write runs inside the run row's BEFORE UPDATE trigger. The
+    -- persisted parent is therefore still building, which lets the child
+    -- mutability trigger accept it; moving this work to AFTER would reject it.
     UPDATE recording_qualification_members m SET
       schedule_config_sha256=encode(sha256(convert_to(jsonb_build_object(
         'cron_timezone',m.cron_timezone,'daily_window_start',m.daily_window_start,
