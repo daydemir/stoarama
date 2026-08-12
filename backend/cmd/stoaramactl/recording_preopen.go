@@ -123,13 +123,13 @@ func selectPreopenTargets(ctx context.Context, pool *pgxpool.Pool, now time.Time
 	WITH candidates AS (
 	 SELECT r.id,COALESCE(r.stream_id,0) stream_id,r.account_id,r.name,a.name org_name,a.email,
 	   COALESCE(s.provider,''),COALESCE(s.source_url,r.stream_url),COALESCE(s.source_page_url,''),r.capture_via,r.next_fire_at,
-	   CASE WHEN r.next_fire_at>$1+interval '30 minutes' THEN 'early' ELSE 'confirm' END stage
+	   CASE WHEN r.next_fire_at>$1::timestamptz+interval '30 minutes' THEN 'early' ELSE 'confirm' END stage
 	 FROM recordings r JOIN accounts a ON a.id=r.account_id LEFT JOIN streams s ON s.id=r.stream_id
-	 WHERE r.status='active' AND r.mode='continuous' AND r.next_fire_at>$1 AND r.next_fire_at<=$1+interval '2 hours'
+	 WHERE r.status='active' AND r.mode='continuous' AND r.next_fire_at>$1::timestamptz AND r.next_fire_at<=$1::timestamptz+interval '2 hours'
 	), due AS (
 	 SELECT c.*,COALESCE(p.attempt_count,0) prior_attempt
 	 FROM candidates c LEFT JOIN recording_preopen_checks p ON p.recording_id=c.id AND p.window_start_at=c.next_fire_at AND p.stage=c.stage
-	 WHERE p.recording_id IS NULL OR (c.stage='early' AND p.result<>'pass' AND p.attempt_count<3 AND p.next_retry_at<=$1)
+	 WHERE p.recording_id IS NULL OR (c.stage='early' AND p.result<>'pass' AND p.attempt_count<3 AND p.next_retry_at<=$1::timestamptz)
 	)
 	SELECT id,stream_id,account_id,name,org_name,email,provider,source_url,source_page_url,capture_via,stage,next_fire_at,prior_attempt+1
 	FROM due ORDER BY next_fire_at,id`, now)
