@@ -56,6 +56,12 @@ MEDIA_CERTIFICATION_TOOL_TIMEOUT_SEC = 180
 MEDIA_CERTIFICATION_DURATION_TOLERANCE_SEC = 2.0
 MEDIA_CERTIFICATION_PROTOCOLS = "file,pipe"
 MEDIA_CERTIFICATION_FORMATS = frozenset(("mov", "mp4", "m4a", "3gp", "3g2", "mj2"))
+NATIVE_STITCH_MAX_CLIPS = 1024
+NATIVE_STITCH_MAX_SOURCE_BYTES = 64 * 1024 * 1024 * 1024
+NATIVE_STITCH_MAX_RUN_BYTES = 32 * 1024 * 1024 * 1024
+NATIVE_STITCH_TEMP_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
+NATIVE_STITCH_ATTEMPT_SEC = 40 * 60
+NATIVE_STITCH_DELIVERY_POLL_SEC = 5
 
 
 class ExistingFileMismatch(RuntimeError):
@@ -87,6 +93,9 @@ class SelfUpdateExecError(RuntimeError):
 class MediaCertificationError(RuntimeError):
     pass
 
+class DeterministicMediaError(MediaCertificationError):
+    pass
+
 
 def inventory_skip_reason(exc, sidecar):
     if isinstance(exc, FileChangedDuringHash):
@@ -109,6 +118,7 @@ class Phase(str, Enum):
     UPDATING = "updating"
     BLOCKED = "blocked"
     DEGRADED = "degraded"
+    CERTIFYING = "certifying"
 
 
 class PreviousExit(str, Enum):
@@ -214,6 +224,9 @@ class Config:
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
+        # Release/deploy safe by default. Operators enable only after migration,
+        # API and a completed clean inventory are independently verified.
+        self.native_stitch_enabled = env_str("STOARAMA_NATIVE_STITCH_ENABLED", "false").lower() == "true"
         self.is_candidate = env_str("STOARAMA_CANDIDATE", "0") == "1"
         parsed = urllib.parse.urlsplit(self.api_base)
         self.origin = "%s://%s" % (parsed.scheme, parsed.netloc) if parsed.scheme else ""
@@ -308,6 +321,10 @@ class Inventory:
     def __init__(self, cfg):
         self.cfg = cfg
         self.lock = threading.RLock()
+        # Whole-operation activity fence. Inventory holds this from the first
+        # filesystem observation through completion publication; certification
+        # only takes it nonblocking at a main-loop delivery-idle boundary.
+        self.activity_lock = threading.RLock()
         self.db = sqlite3.connect(str(cfg.inventory_file), timeout=30, check_same_thread=False)
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
@@ -645,6 +662,10 @@ class Inventory:
         return digest.hexdigest(), clips, total_bytes, mismatches, unmatched
 
     def full_scan(self, cfg, stop_event):
+        with self.activity_lock:
+            return self._full_scan_locked(cfg, stop_event)
+
+    def _full_scan_locked(self, cfg, stop_event):
         pass_started_at = utc_now_precise()
         resumed = self._incomplete_scan()
         if resumed is None:
@@ -836,10 +857,11 @@ def inventory_loop(cfg, inventory, stop_event):
         return
     while not stop_event.is_set():
         try:
-            inventory.sync_dirty(cfg, stop_event=stop_event)
-            if stop_event.is_set():
-                return
-            inventory.full_scan(cfg, stop_event)
+            with inventory.activity_lock:
+                inventory.sync_dirty(cfg, stop_event=stop_event)
+                if stop_event.is_set():
+                    return
+                inventory.full_scan(cfg, stop_event)
         except Exception as exc:
             log("WARN", "inventory scan/sync failed: %s" % exc)
         stop_event.wait(cfg.inventory_scan_interval_sec)
@@ -1344,6 +1366,19 @@ def probe_native_media(path, ffprobe_bin):
         ffprobe_bin, "-v", "error", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
         "-show_format", "-show_streams", "-show_data_hash", "sha256", "-of", "json", str(path),
     ])
+    return parse_native_media_probe(raw)
+
+
+def probe_native_media_cancellable(path, ffprobe_bin, cancel):
+    raw = cancellable_tool_output([
+        ffprobe_bin, "-v", "error", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
+        "-enable_drefs", "0", "-use_absolute_path", "0",
+        "-show_format", "-show_streams", "-show_data_hash", "sha256", "-of", "json", str(path),
+    ], cancel, 600)
+    return parse_native_media_probe(raw)
+
+
+def parse_native_media_probe(raw):
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -1396,7 +1431,149 @@ def probe_native_media(path, ffprobe_bin):
         "duration_seconds": duration,
         "container_start_time_seconds": start_time,
         "signature": {"format_names": sorted(formats), "streams": signature_streams},
+        "stable_signature_v1": stable_native_signature_v1(streams, ",".join(sorted(formats))),
     }
+
+
+def stable_native_signature_v1(probe_streams, format_name):
+    """Decoder/layout identity only; never clip-local index/PTS/duration."""
+    common = ("codec_type", "codec_name", "codec_tag_string", "profile", "level", "time_base", "extradata_hash")
+    video = (
+        "pix_fmt", "width", "height", "coded_width", "coded_height", "field_order",
+        "sample_aspect_ratio", "display_aspect_ratio", "avg_frame_rate", "r_frame_rate",
+        "color_range", "color_space", "color_transfer", "color_primaries", "chroma_location",
+    )
+    audio = ("sample_fmt", "sample_rate", "channels", "channel_layout", "bits_per_sample")
+    canonical = []
+    for stream in probe_streams:
+        kind = stream.get("codec_type")
+        if kind not in ("video", "audio"):
+            raise MediaCertificationError("media contains unsupported stream structure")
+        keys = common + (video if kind == "video" else audio)
+        canonical.append({key: stream.get(key) for key in keys})
+    canonical.sort(key=lambda item: item["codec_type"])
+    return {"schema_version": 1, "format_name": format_name, "streams": canonical}
+
+
+def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024):
+    """Bounded child group: cancellation cannot strand ffmpeg descendants."""
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=stdout_file, stderr=stderr_file,
+            start_new_session=True, env={"PATH": os.environ.get("PATH", "")},
+        )
+        started = time.monotonic()
+        try:
+            while process.poll() is None:
+                cancelled = cancel.is_set()
+                timed_out = time.monotonic() - started > timeout
+                if cancelled or timed_out:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+                    if cancelled:
+                        raise InventoryScanStopped("native stitch verification yielded to delivery or shutdown")
+                    raise MediaCertificationError("media verification tool timed out")
+                cancel.wait(.25)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+        stdout_file.seek(0); stdout = stdout_file.read(stdout_limit + 1)
+        stderr_file.seek(0); stderr = stderr_file.read(stderr_limit + 1)
+        if len(stdout) > stdout_limit or len(stderr) > stderr_limit:
+            raise MediaCertificationError("media verification output exceeded its bound")
+        if process.returncode:
+            raise MediaCertificationError("media verification tool rejected the file")
+        return stdout
+
+
+def media_tool_version_cancellable(binary, cancel):
+    raw = cancellable_tool_output([binary, "-version"], cancel, 30).decode("utf-8", "replace")
+    return raw.splitlines()[0][:256] if raw else "unknown"
+
+
+def recompute_timestamp_contract(path, ffprobe_bin, cancel):
+    raw = cancellable_tool_output([
+        ffprobe_bin, "-v", "error", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
+        "-enable_drefs", "0", "-use_absolute_path", "0", "-show_frames", "-show_streams", "-show_data",
+        "-show_entries", "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,time_base,extradata,sample_rate,channels,channel_layout:frame=stream_index,media_type,best_effort_timestamp,pkt_dts,pkt_duration,nb_samples",
+        "-of", "json", str(path),
+    ], cancel, 30, stdout_limit=16 * 1024 * 1024)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise MediaCertificationError("timestamp contract probe returned invalid JSON") from exc
+    streams = payload.get("streams")
+    frames = payload.get("frames")
+    if not isinstance(streams, list) or not isinstance(frames, list):
+        raise MediaCertificationError("timestamp contract probe is incomplete")
+    by_type = {"video": [], "audio": []}
+    for stream in streams:
+        if not isinstance(stream, dict) or stream.get("codec_type") not in by_type:
+            raise MediaCertificationError("timestamp contract has unsupported streams")
+        by_type[stream["codec_type"]].append(stream)
+    if len(by_type["video"]) != 1 or len(by_type["audio"]) > 1:
+        raise MediaCertificationError("timestamp contract has unsupported stream cardinality")
+    contract = {"version": 1, "mode": "muxed_source_copy", "audio_selection": "first_optional", "tracks": []}
+    timelines = {}
+    for media_type in ("video", "audio"):
+        if not by_type[media_type]:
+            continue
+        stream = by_type[media_type][0]
+        try:
+            time_num, time_den = [int(part) for part in str(stream.get("time_base", "")).split("/", 1)]
+            stream_index = int(stream["index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MediaCertificationError("timestamp contract time base is invalid") from exc
+        if time_num <= 0 or time_den <= 0 or stream_index < 0:
+            raise MediaCertificationError("timestamp contract time base is invalid")
+        signature_parts = [media_type, stream.get("codec_name", ""), stream.get("codec_tag_string", ""), stream.get("profile", ""), stream.get("pix_fmt", ""), stream.get("level", 0), stream.get("width", 0), stream.get("height", 0), stream.get("channels", 0), stream.get("channel_layout", ""), stream.get("extradata", ""), stream.get("sample_rate", "")]
+        signature = "".join("%d:%s|" % (len(str(part).encode("utf-8")), str(part)) for part in signature_parts)
+        track = {"stream_index": stream_index, "media_type": media_type, "time_base_num": time_num, "time_base_den": time_den, "first_timestamp": 0, "last_timestamp": 0, "last_duration": 0, "unit_count": 0, "codec_signature_sha256": hashlib.sha256(signature.encode()).hexdigest()}
+        if media_type == "audio":
+            try: track["sample_rate"] = int(stream.get("sample_rate"))
+            except (TypeError, ValueError) as exc: raise MediaCertificationError("timestamp contract audio sample rate is invalid") from exc
+            if track["sample_rate"] <= 0: raise MediaCertificationError("timestamp contract audio sample rate is invalid")
+        previous_pts = previous_duration = None
+        duplicates = nonmonotonic = discontinuities = 0
+        for frame in frames:
+            if not isinstance(frame, dict) or frame.get("stream_index") != stream_index or frame.get("media_type") != media_type:
+                continue
+            try:
+                pts = int(frame["best_effort_timestamp"]); duration = int(frame["pkt_duration"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MediaCertificationError("timestamp contract frame timing is missing") from exc
+            if duration <= 0: raise MediaCertificationError("timestamp contract frame duration is missing")
+            if previous_pts is not None:
+                duplicates += pts == previous_pts
+                nonmonotonic += pts < previous_pts
+                discontinuities += pts != previous_pts + previous_duration
+            if track["unit_count"] == 0: track["first_timestamp"] = pts
+            track["last_timestamp"] = pts;track["last_duration"] = duration;track["unit_count"] += 1
+            previous_pts, previous_duration = pts, duration
+            if media_type == "audio":
+                try: sample_count = int(frame["nb_samples"])
+                except (KeyError, TypeError, ValueError) as exc: raise MediaCertificationError("timestamp contract audio sample count is missing") from exc
+                if sample_count <= 0: raise MediaCertificationError("timestamp contract audio sample count is missing")
+                track["last_sample_count"] = sample_count
+        if track["unit_count"] == 0 or nonmonotonic:
+            raise MediaCertificationError("timestamp contract presentation order is invalid")
+        contract["tracks"].append(track)
+        timelines[media_type] = {"first_timestamp": track["first_timestamp"], "last_timestamp": track["last_timestamp"], "last_duration_timestamp": track["last_duration"], "time_base_numerator": time_num, "time_base_denominator": time_den, "duplicate_timestamp_count": duplicates, "non_monotonic_step_count": nonmonotonic, "discontinuous_step_count": discontinuities}
+        if media_type == "video": timelines[media_type]["frame_count"] = track["unit_count"]
+        elif time_num == 1 and time_den == track["sample_rate"]:
+            timelines[media_type] = {"sample_rate": track["sample_rate"], "first_sample": track["first_timestamp"], "end_sample": track["last_timestamp"] + track["last_sample_count"], "sample_count": track["last_timestamp"] + track["last_sample_count"] - track["first_timestamp"], "duplicate_timestamp_count": duplicates, "non_monotonic_step_count": nonmonotonic, "discontinuous_step_count": discontinuities}
+        else:
+            timelines[media_type] = None
+    return contract, timelines
 
 
 def strict_decode_media(path, ffmpeg_bin):
@@ -1435,8 +1612,265 @@ def validate_native_run(paths, ffmpeg_bin, temp_root):
     return "lossless_concat_and_decode_passed"
 
 
+def check_native_stitch_delivery(cfg, runtime, cancel):
+    if cancel.is_set():
+        return True
+    page = request_json(cfg, "GET", "/account/clips?after_id=%d&limit=1" % runtime.cursor_id)
+    waiting = bool(page.get("clips"))
+    if waiting:
+        cancel.set()
+    return waiting
+
+
+def hash_certification_file_cancellable(root, relative_path, expected_size, expected_sha, cancel):
+    path, path_before = confined_regular_file(root, relative_path)
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256(); actual_size = 0
+    try:
+        opened_before = os.fstat(descriptor)
+        if certification_identity(opened_before) != certification_identity(path_before):
+            raise MediaCertificationError("media identity changed before hashing")
+        while True:
+            if cancel.is_set(): raise InventoryScanStopped("certification yielded to delivery")
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk: break
+            digest.update(chunk); actual_size += len(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    path_after = path.stat()
+    if certification_identity(opened_before) != certification_identity(opened_after) or certification_identity(opened_after) != certification_identity(path_after):
+        raise MediaCertificationError("media identity changed while hashing")
+    if actual_size != expected_size or digest.hexdigest() != expected_sha:
+        raise MediaCertificationError("media bytes do not match frozen manifest")
+    return path, path_after
+
+
+def strict_decode_media_cancellable(path, ffmpeg_bin, cancel):
+    try:
+        cancellable_tool_output([ffmpeg_bin, "-v", "error", "-xerror", "-err_detect", "explode", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS, "-enable_drefs", "0", "-use_absolute_path", "0", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"], cancel, 600)
+    except MediaCertificationError as exc:
+        if "rejected" in str(exc): raise DeterministicMediaError("clip_decode_failed") from exc
+        raise
+
+
+def validate_native_run_cancellable(paths, ffmpeg_bin, cancel, temp_root):
+    if len(paths) == 1: return "single_clip_decode_only"
+    manifest = temp_root / "concat.txt"; output = temp_root / "stitched.mp4"
+    manifest.write_text("".join(concat_manifest_line(path) for path in paths), encoding="utf-8")
+    try:
+        cancellable_tool_output([ffmpeg_bin,"-v","error","-xerror","-err_detect","explode","-protocol_whitelist",MEDIA_CERTIFICATION_PROTOCOLS,"-enable_drefs","0","-use_absolute_path","0","-f","concat","-safe","0","-i",str(manifest),"-map","0:v:0","-map","0:a?","-c","copy","-y",str(output)],cancel,600)
+        strict_decode_media_cancellable(output,ffmpeg_bin,cancel)
+    except DeterministicMediaError as exc:
+        raise DeterministicMediaError("run_concat_failed") from exc
+    except MediaCertificationError as exc:
+        if "rejected" in str(exc): raise DeterministicMediaError("run_concat_failed") from exc
+        raise
+    return "lossless_concat_decode_passed"
+
+
+def native_stitch_timeline(clips, window_start, window_end):
+    cursor=window_start; covered=overlaps=0.0; gaps=[]; internal_gaps=[]; overlap_count=0
+    leading=max(0.0,(clips[0]["clip_start_at"]-window_start).total_seconds())
+    for clip in clips:
+        left=max(window_start,clip["clip_start_at"]); right=min(window_end,clip["clip_end_at"])
+        if right<=left: continue
+        if left>cursor:
+            gap=(left-cursor).total_seconds();gaps.append(gap)
+            if cursor>window_start:internal_gaps.append(gap)
+        elif left<cursor:
+            overlap_end=min(right,cursor)
+            if overlap_end>left: overlap_count+=1;overlaps+=(overlap_end-left).total_seconds()
+        if right>cursor: covered+=(right-max(left,cursor)).total_seconds();cursor=right
+    trailing=max(0.0,(window_end-cursor).total_seconds())
+    if trailing>0:gaps.append(trailing)
+    expected=(window_end-window_start).total_seconds()
+    return {"expected_seconds":expected,"covered_seconds":covered,"coverage_pct":covered/expected*100,"leading_gap_seconds":leading,"largest_internal_gap_seconds":max(internal_gaps,default=0),"trailing_gap_seconds":trailing,"largest_gap_seconds":max(gaps,default=0),"gap_count":len(gaps),"gap_over_30s_count":sum(g>30 for g in gaps),"gap_over_5m_count":sum(g>300 for g in gaps),"overlap_count":overlap_count,"overlap_seconds":overlaps}
+
+
+def native_stitch_largest_possible_run(raw_clips):
+    """Fail-closed temp bound before native signatures are probed."""
+    if not isinstance(raw_clips, list) or not raw_clips or len(raw_clips) > NATIVE_STITCH_MAX_CLIPS:
+        raise MediaCertificationError("invalid frozen task manifest")
+    largest = current = 0
+    previous = None
+    for frozen in raw_clips:
+        try:
+            size = int(frozen["size_bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MediaCertificationError("invalid frozen task size") from exc
+        if size <= 0:
+            raise MediaCertificationError("invalid frozen task size")
+        split = previous is not None and (
+            frozen.get("capture_generation") != previous.get("capture_generation") or
+            frozen.get("capture_attempt_id", "") != previous.get("capture_attempt_id", "") or
+            frozen.get("timestamp_contract_version", "") != previous.get("timestamp_contract_version", "") or
+            frozen.get("clip_start_at") != previous.get("clip_end_at")
+        )
+        if split:
+            current = 0
+        current += size
+        largest = max(largest, current)
+        previous = frozen
+    if largest > NATIVE_STITCH_MAX_RUN_BYTES:
+        raise MediaCertificationError("native run byte bound exceeded")
+    return largest
+
+
+def maybe_run_native_stitch(cfg, runtime, inventory, stop_event, ffmpeg_bin="ffmpeg", ffprobe_bin="ffprobe"):
+    if not getattr(cfg, "native_stitch_enabled", False): return False
+    if not inventory.activity_lock.acquire(blocking=False): return False
+    cancel=threading.Event(); watcher_stop=threading.Event(); started=datetime.datetime.now(datetime.timezone.utc)
+    absolute_deadline=time.monotonic()+NATIVE_STITCH_ATTEMPT_SEC
+    try:
+        if check_native_stitch_delivery(cfg,runtime,cancel): return False
+        claimed=request_json(cfg,"POST","/account/connections/stitch-certifications/claim",body={})
+        task=claimed.get("task")
+        if not isinstance(task,dict): return False
+        runtime.set_phase(Phase.CERTIFYING)
+        def watch_delivery():
+            while not watcher_stop.wait(NATIVE_STITCH_DELIVERY_POLL_SEC):
+                if stop_event.is_set() or time.monotonic()>=absolute_deadline:
+                    cancel.set(); return
+                try:
+                    if check_native_stitch_delivery(cfg,runtime,cancel): return
+                except Exception:
+                    # Loss of the delivery check is unsafe: certification yields.
+                    cancel.set(); return
+        watcher=threading.Thread(target=watch_delivery,name="native-stitch-delivery-watch",daemon=True)
+        watcher.start()
+        return run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started,absolute_deadline,ffmpeg_bin,ffprobe_bin)
+    finally:
+        watcher_stop.set()
+        watcher=locals().get("watcher")
+        if watcher is not None: watcher.join(timeout=1)
+        set_idle_unless_capacity_blocked(runtime)
+        inventory.activity_lock.release()
+
+
+def run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started,absolute_deadline,ffmpeg_bin,ffprobe_bin):
+    try:
+        return _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started,absolute_deadline,ffmpeg_bin,ffprobe_bin)
+    except Exception as exc:
+        # A claim is never abandoned merely because local setup failed. Return
+        # bounded retryable UNKNOWN under the exact token; stale tokens remain
+        # fenced by the server.
+        completed=datetime.datetime.now(datetime.timezone.utc)
+        raw_clips=task.get("clips") if isinstance(task.get("clips"),list) else []
+        try:
+            window_start=parse_certification_timestamp(task.get("window_start_at"),"window_start_at")
+            window_end=parse_certification_timestamp(task.get("window_end_at"),"window_end_at")
+            timeline=native_stitch_timeline([
+                {**c,"clip_start_at":parse_certification_timestamp(c.get("clip_start_at"),"clip_start_at"),"clip_end_at":parse_certification_timestamp(c.get("clip_end_at"),"clip_end_at")}
+                for c in raw_clips
+            ],window_start,window_end) if raw_clips else {"expected_seconds":(window_end-window_start).total_seconds(),"covered_seconds":0,"coverage_pct":0,"leading_gap_seconds":(window_end-window_start).total_seconds(),"largest_internal_gap_seconds":0,"trailing_gap_seconds":(window_end-window_start).total_seconds(),"largest_gap_seconds":(window_end-window_start).total_seconds(),"gap_count":1,"gap_over_30s_count":1,"gap_over_5m_count":1,"overlap_count":0,"overlap_seconds":0}
+        except Exception:
+            raise exc
+        reason="attempt_deadline" if time.monotonic()>=absolute_deadline else ("delivery_preempted" if cancel.is_set() else "post_claim_setup_failed")
+        report={"schema_version":1,"policy_version":task["policy_version"],"task_id":task["task_id"],"recording_id":task["recording_id"],"recording_job_id":task["recording_job_id"],"window_start_at":task["window_start_at"],"window_end_at":task["window_end_at"],"clip_manifest_sha256":task["clip_manifest_sha256"],"inventory_generation":task["inventory_generation"],"inventory_digest":task["inventory_digest"],"inventory_completed_at":task["inventory_completed_at"],"status":"unknown","nas_byte_decode_status":"unknown","native_run_concat_status":"unknown","within_run_frame_adjacency_status":"unknown","within_run_audio_sample_continuity_status":"unknown","window_continuity_status":"unknown","timeline":timeline,"clips":[],"native_runs":[],"seams":[],"audio_seams":[],"reason_codes":[reason],"client_version":CLIENT_VERSION,"ffmpeg_version":"unavailable","ffprobe_version":"unavailable","started_at":started.isoformat().replace("+00:00","Z"),"completed_at":completed.isoformat().replace("+00:00","Z"),"source_media_modified":False,"reencoded":False,"persistent_output_created":False}
+        request_json(cfg,"POST","/account/connections/stitch-certifications/complete",body={"claim_token":task["claim_token"],"report":report})
+        return True
+
+
+def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started,absolute_deadline,ffmpeg_bin,ffprobe_bin):
+    raw_clips=task.get("clips")
+    if not isinstance(raw_clips,list) or not raw_clips or len(raw_clips)>NATIVE_STITCH_MAX_CLIPS: raise MediaCertificationError("invalid frozen task manifest")
+    if canonical_report_hash(raw_clips)!=str(task.get("clip_manifest_sha256") or ""):
+        raise MediaCertificationError("frozen task manifest hash differs")
+    window_start=parse_certification_timestamp(task.get("window_start_at"),"window_start_at");window_end=parse_certification_timestamp(task.get("window_end_at"),"window_end_at")
+    database,summary=open_certification_inventory(cfg)
+    try: local=collect_certification_candidates(cfg,database,summary["generation"],int(task["recording_id"]),window_start,window_end)
+    finally: database.close()
+    frozen_ids=[int(c["clip_id"]) for c in raw_clips]
+    if [c["clip_id"] for c in local]!=frozen_ids: raise MediaCertificationError("local inventory does not equal frozen manifest")
+    source_bytes=sum(int(c["size_bytes"]) for c in raw_clips)
+    if source_bytes>NATIVE_STITCH_MAX_SOURCE_BYTES: raise MediaCertificationError("source byte bound exceeded")
+    # Before probing signatures, generation/attempt/timeline boundaries give a
+    # safe upper bound on the largest possible run. Signature discovery can
+    # only split it further.
+    largest_possible_run=native_stitch_largest_possible_run(raw_clips)
+    filesystem=os.statvfs(str(cfg.state_dir));free=filesystem.f_bavail*filesystem.f_frsize
+    if free<largest_possible_run*2+NATIVE_STITCH_TEMP_RESERVE_BYTES: raise MediaCertificationError("insufficient temporary capacity")
+    ffmpeg_version=media_tool_version_cancellable(ffmpeg_bin,cancel);ffprobe_version=media_tool_version_cancellable(ffprobe_bin,cancel)
+    clips=[];paths=[];identities=[]
+    reason="completed"
+    try:
+        for frozen,item in zip(raw_clips,local):
+            if stop_event.is_set() or check_native_stitch_delivery(cfg,runtime,cancel): raise InventoryScanStopped("certification yielded to delivery")
+            if int(frozen.get("ordinal",0))!=len(clips)+1 or parse_certification_timestamp(frozen.get("clip_start_at"),"clip_start_at")!=item.get("clip_start_at") or parse_certification_timestamp(frozen.get("clip_end_at"),"clip_end_at")!=item.get("clip_end_at"):
+                raise MediaCertificationError("sidecar timeline differs from frozen manifest")
+            for key in ("clip_id","recording_id","recording_job_id","relative_path","size_bytes","sha256","capture_generation","capture_sequence","capture_attempt_id","timestamp_contract_version","timestamp_contract_status","timestamp_contract_reason","timestamp_contract_sha256"):
+                if frozen.get(key)!=item.get(key): raise MediaCertificationError("sidecar differs from frozen manifest")
+            path,identity=hash_certification_file_cancellable(cfg.output_dir,item["relative_path"],item["size_bytes"],item["sha256"],cancel)
+            if time.monotonic()>=absolute_deadline: raise InventoryScanStopped("native stitch attempt deadline")
+            recomputed_contract=video_timeline=audio_timeline=None
+            if frozen.get("timestamp_contract_status")=="per_clip_probe_complete":
+                recomputed_contract,timelines=recompute_timestamp_contract(path,ffprobe_bin,cancel)
+                if canonical_report_hash(recomputed_contract)!=frozen.get("timestamp_contract_sha256") or recomputed_contract!=item.get("timestamp_contract"):
+                    raise MediaCertificationError("exact NAS bytes recompute a different timestamp contract")
+                video_timeline=timelines.get("video");audio_timeline=timelines.get("audio")
+            probe=probe_native_media_cancellable(path,ffprobe_bin,cancel)
+            signature=probe["stable_signature_v1"];signature_sha=canonical_report_hash(signature)
+            audio_present=any(s.get("codec_type")=="audio" for s in signature.get("streams",[]))
+            decode_status="passed"
+            try: strict_decode_media_cancellable(path,ffmpeg_bin,cancel)
+            except DeterministicMediaError: decode_status="failed"
+            after_decode=path.stat()
+            if certification_identity(after_decode)!=certification_identity(identity): raise MediaCertificationError("media identity changed during decode")
+            clip_fact={**{k:(v.isoformat().replace("+00:00","Z") if isinstance(v,datetime.datetime) else v) for k,v in frozen.items()},"sidecar_sha256":item["sidecar_sha256"],"file_identity":{"size":after_decode.st_size,"mtime_ns":after_decode.st_mtime_ns,"ctime_ns":after_decode.st_ctime_ns,"inode":after_decode.st_ino,"device":after_decode.st_dev},"native_signature":signature,"native_signature_sha256":signature_sha,"strict_decode":decode_status,"audio_present":audio_present}
+            if recomputed_contract is not None: clip_fact["recomputed_timestamp_contract"]=recomputed_contract
+            if video_timeline is not None: clip_fact["video_timeline"]=video_timeline
+            if audio_timeline is not None: clip_fact["audio_timeline"]=audio_timeline
+            clips.append(clip_fact);paths.append(path);identities.append(certification_identity(after_decode))
+            if decode_status=="failed": raise DeterministicMediaError("clip_decode_failed")
+        runs=[];run_start=0
+        with tempfile.TemporaryDirectory(prefix="stoarama-native-stitch-",dir=str(cfg.state_dir)) as raw_temp:
+            for index in range(1,len(clips)+1):
+                boundary=index==len(clips) or clips[index]["capture_generation"]!=clips[run_start]["capture_generation"] or clips[index].get("capture_attempt_id","")!=clips[run_start].get("capture_attempt_id","") or clips[index].get("timestamp_contract_version","")!=clips[run_start].get("timestamp_contract_version","") or clips[index]["native_signature_sha256"]!=clips[run_start]["native_signature_sha256"] or clips[index]["clip_start_at"]!=clips[index-1]["clip_end_at"]
+                if not boundary: continue
+                if check_native_stitch_delivery(cfg,runtime,cancel): raise InventoryScanStopped("certification yielded to delivery")
+                run_bytes=sum(c["size_bytes"] for c in clips[run_start:index]);
+                if run_bytes>NATIVE_STITCH_MAX_RUN_BYTES: raise MediaCertificationError("native run byte bound exceeded")
+                run_dir=Path(raw_temp)/("run-%d"%len(runs));run_dir.mkdir()
+                try: validation=validate_native_run_cancellable(paths[run_start:index],ffmpeg_bin,cancel,run_dir)
+                except DeterministicMediaError: validation="failed"
+                if run_start==0: boundary_reason="window_start"
+                elif clips[run_start-1]["capture_generation"]!=clips[run_start]["capture_generation"]: boundary_reason="capture_generation_change"
+                elif clips[run_start-1].get("capture_attempt_id","")!=clips[run_start].get("capture_attempt_id","") or clips[run_start-1].get("timestamp_contract_version","")!=clips[run_start].get("timestamp_contract_version",""): boundary_reason="capture_attempt_change"
+                elif clips[run_start-1]["native_signature_sha256"]!=clips[run_start]["native_signature_sha256"]: boundary_reason="native_signature_change"
+                else: boundary_reason="temporal_gap"
+                runs.append({"ordinal":len(runs)+1,"first_clip_ordinal":run_start+1,"last_clip_ordinal":index,"clip_count":index-run_start,"source_bytes":run_bytes,"native_signature_sha256":clips[run_start]["native_signature_sha256"],"capture_generation":clips[run_start]["capture_generation"],"capture_attempt_id":clips[run_start].get("capture_attempt_id",""),"timestamp_contract_version":clips[run_start].get("timestamp_contract_version",""),"boundary_reason":boundary_reason,"validation_status":validation});run_start=index
+                if validation=="failed": raise DeterministicMediaError("run_concat_failed")
+        for path,identity in zip(paths,identities):
+            if certification_identity(path.stat())!=identity: raise MediaCertificationError("media identity changed during run validation")
+        run_starts={r["first_clip_ordinal"]:r for r in runs};seams=[];audio_seams=[]
+        for i,(left,right) in enumerate(zip(clips,clips[1:]),start=1):
+            boundary=run_starts.get(i+1)
+            if boundary:
+                seams.append({"ordinal":i,"previous_clip_id":left["clip_id"],"next_clip_id":right["clip_id"],"capture_generation":"","previous_capture_sequence":left["capture_sequence"],"next_capture_sequence":right["capture_sequence"],"native_signature_sha256":"","timeline_basis":"unavailable","capture_contract":"","previous_frames":[],"next_frames":[],"confidence":"none","verdict":"not_applicable","reason":boundary["boundary_reason"]})
+                audio_seams.append({"ordinal":i,"previous_clip_id":left["clip_id"],"next_clip_id":right["clip_id"],"sample_rate":0,"previous_end_sample":0,"next_start_sample":0,"previous_sample_count":0,"next_sample_count":0,"capture_attempt_id":"","timestamp_contract_version":"","verdict":"not_applicable","reason":boundary["boundary_reason"]})
+            else:
+                seams.append({"ordinal":i,"previous_clip_id":left["clip_id"],"next_clip_id":right["clip_id"],"capture_generation":left["capture_generation"],"previous_capture_sequence":left["capture_sequence"],"next_capture_sequence":right["capture_sequence"],"native_signature_sha256":left["native_signature_sha256"],"timeline_basis":"unavailable","capture_contract":"","previous_frames":[],"next_frames":[],"confidence":"none","verdict":"ambiguous","reason":"continuous_source_pts_unavailable"})
+                audio_verdict="ambiguous" if left["audio_present"] or right["audio_present"] else "not_present"
+                audio_reason="continuous_source_pts_unavailable" if audio_verdict=="ambiguous" else "audio_not_present"
+                audio_seams.append({"ordinal":i,"previous_clip_id":left["clip_id"],"next_clip_id":right["clip_id"],"sample_rate":0,"previous_end_sample":0,"next_start_sample":0,"previous_sample_count":0,"next_sample_count":0,"capture_attempt_id":"","timestamp_contract_version":"","verdict":audio_verdict,"reason":audio_reason})
+        status="partial";decode=concat="passed";frame_adjacency="unknown";audio_continuity="unknown" if any(c["audio_present"] for c in clips) else "not_present";window_continuity="partitioned" if len(runs)>1 else "unknown";reason="continuous_source_pts_unavailable"
+    except DeterministicMediaError as exc:
+        status="failed";reason=str(exc);decode="failed" if reason=="clip_decode_failed" else "unknown";concat="failed" if reason=="run_concat_failed" else "unknown";frame_adjacency=audio_continuity=window_continuity="unknown";runs=locals().get("runs",[]);seams=locals().get("seams",[]);audio_seams=locals().get("audio_seams",[])
+    except (MediaCertificationError,InventoryScanStopped) as exc:
+        status="unknown";reason="attempt_deadline" if time.monotonic()>=absolute_deadline else ("delivery_preempted" if isinstance(exc,InventoryScanStopped) else "verification_transient");decode=concat=frame_adjacency=audio_continuity=window_continuity="unknown";runs=locals().get("runs",[]);seams=locals().get("seams",[]);audio_seams=locals().get("audio_seams",[])
+    completed=datetime.datetime.now(datetime.timezone.utc)
+    report={"schema_version":1,"policy_version":task["policy_version"],"task_id":task["task_id"],"recording_id":task["recording_id"],"recording_job_id":task["recording_job_id"],"window_start_at":task["window_start_at"],"window_end_at":task["window_end_at"],"clip_manifest_sha256":task["clip_manifest_sha256"],"inventory_generation":summary["generation"],"inventory_digest":summary["digest"],"inventory_completed_at":summary["scan_completed_at"],"status":status,"nas_byte_decode_status":decode,"native_run_concat_status":concat,"within_run_frame_adjacency_status":frame_adjacency,"within_run_audio_sample_continuity_status":audio_continuity,"window_continuity_status":window_continuity,"timeline":native_stitch_timeline(local,window_start,window_end),"clips":clips,"native_runs":runs,"seams":seams,"audio_seams":audio_seams,"reason_codes":[reason],"client_version":CLIENT_VERSION,"ffmpeg_version":ffmpeg_version,"ffprobe_version":ffprobe_version,"started_at":started.isoformat().replace("+00:00","Z"),"completed_at":completed.isoformat().replace("+00:00","Z"),"source_media_modified":False,"reencoded":False,"persistent_output_created":False}
+    request_json(cfg,"POST","/account/connections/stitch-certifications/complete",body={"claim_token":task["claim_token"],"report":report})
+    return True
+
+
 def canonical_report_hash(report):
-    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    # Match encoding/json's UTF-8 canonical form. Go deliberately escapes the
+    # two JavaScript line separators even with HTML escaping disabled.
+    canonical = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    canonical = canonical.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    encoded = canonical.encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -1849,7 +2283,13 @@ def run(cfg):
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
                 if not progress:
-                    stop_event.wait(cfg.poll_interval_sec)
+                    try:
+                        certified = maybe_run_native_stitch(cfg, runtime, inventory, stop_event)
+                    except Exception as exc:
+                        certified = False
+                        log("WARN", "native stitch certification deferred: %s" % exc)
+                    if not certified:
+                        stop_event.wait(cfg.poll_interval_sec)
             except Exception as exc:
                 if isinstance(exc, SelfUpdateExecError):
                     raise
@@ -2019,6 +2459,19 @@ def collect_certification_candidates(cfg, database, inventory_generation, record
         capture_generation = str(sidecar.get("capture_generation") or "").strip()
         sequence = certification_integer(sidecar.get("capture_sequence"), "capture_sequence", 0)
         job_id = certification_integer(sidecar.get("recording_job_id"), "recording_job_id", 1)
+        # Capture provenance is tri-state during rolling deployment: historical
+        # NULL, probe UNKNOWN, or COMPLETE with an exact contract.
+        capture_attempt_id = str(sidecar.get("capture_attempt_id") or "")
+        timestamp_version = str(sidecar.get("timestamp_contract_version") or "")
+        timestamp_status = str(sidecar.get("timestamp_contract_status") or "")
+        timestamp_reason = str(sidecar.get("timestamp_contract_reason") or "")
+        timestamp_contract = sidecar.get("timestamp_contract")
+        timestamp_contract_sha = canonical_report_hash(timestamp_contract) if isinstance(timestamp_contract, dict) else ""
+        complete_timestamp = capture_attempt_id and timestamp_status == "per_clip_probe_complete" and timestamp_version == "continuous-source-pts-v1" and timestamp_reason == "" and isinstance(timestamp_contract, dict)
+        unknown_timestamp = capture_attempt_id and timestamp_status == "per_clip_probe_unknown" and not timestamp_version and timestamp_reason in ("missing_terminal_duration","missing_audio_sample_count","invalid_time_base","probe_output_limit","probe_unavailable") and timestamp_contract is None
+        legacy_timestamp = not capture_attempt_id and not timestamp_version and not timestamp_status and not timestamp_reason and timestamp_contract is None
+        if not (complete_timestamp or unknown_timestamp or legacy_timestamp):
+            raise MediaCertificationError("clip timestamp provenance is incoherent")
         if not capture_generation or len(capture_generation) > 256 or any(ord(character) < 32 for character in capture_generation):
             raise MediaCertificationError("clip lacks canonical stitch provenance")
         if inventory_clip_id in seen_clip_ids or (job_id, capture_generation, sequence) in seen_sequences:
@@ -2026,12 +2479,18 @@ def collect_certification_candidates(cfg, database, inventory_generation, record
         seen_clip_ids.add(inventory_clip_id)
         seen_sequences.add((job_id, capture_generation, sequence))
         candidates.append({
-            "clip_id": inventory_clip_id, "recording_job_id": job_id,
+            "clip_id": inventory_clip_id, "recording_id": sidecar_recording_id, "recording_job_id": job_id,
             "relative_path": relative_path, "size_bytes": inventory_size,
             "sha256": inventory_sha,
             "inventory_verified_at": verified_timestamp.isoformat().replace("+00:00", "Z"),
             "sidecar_size_bytes": sidecar_size_bytes, "sidecar_sha256": sidecar_sha,
             "capture_generation": capture_generation, "capture_sequence": sequence,
+            "capture_attempt_id": capture_attempt_id,
+            "timestamp_contract_version": timestamp_version,
+            "timestamp_contract_status": timestamp_status,
+            "timestamp_contract_reason": timestamp_reason,
+            "timestamp_contract_sha256": timestamp_contract_sha,
+            "timestamp_contract": timestamp_contract,
             "clip_start_at": clip_start, "clip_end_at": clip_end,
         })
     candidates.sort(key=lambda item: (

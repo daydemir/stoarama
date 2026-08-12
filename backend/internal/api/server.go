@@ -283,10 +283,13 @@ func (s *Server) router() http.Handler {
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
 			account.Post("/connections/inventory", s.handleAccountConnectionInventorySync)
+			account.Post("/connections/stitch-certifications/claim", s.handleAccountNativeStitchClaim)
+			account.Post("/connections/stitch-certifications/complete", s.handleAccountNativeStitchComplete)
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
 			account.Get("/recordings/{id}/capture-health", s.handleAccountRecordingCaptureHealth)
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
+			account.Get("/recordings/{id}/stitch-certification", s.handleAccountNativeStitchGet)
 			account.Get("/recordings/{id}/clips/{clipId}/download", s.handleAccountRecordingClipDownload)
 			account.Delete("/recordings/{id}/clips/{clipId}", s.handleAccountRecordingClipDelete)
 			account.Post("/recordings/{id}/clips/{clipId}/release", s.handleAccountRecordingClipRelease)

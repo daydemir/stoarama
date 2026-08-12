@@ -44,6 +44,10 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/inventory":
 		return true
+	case method == http.MethodPost && path == "/api/v1/account/connections/stitch-certifications/claim":
+		return true
+	case method == http.MethodPost && path == "/api/v1/account/connections/stitch-certifications/complete":
+		return true
 	case method == http.MethodPost && path == "/api/v1/account/clips/release":
 		return true
 	case method == http.MethodGet && pullDownloadPathRe.MatchString(path):
