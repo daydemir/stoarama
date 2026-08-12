@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -35,6 +36,25 @@ type campaignSeedEntry struct {
 	ReasonCodes         []string
 }
 
+func validateCampaignSeedPolicy(m campaignSeedManifest) error {
+	if len(m.Tracks) != 2 {
+		return errors.New("exactly two tracks required")
+	}
+	want := map[string]struct {
+		deadline time.Time
+		count    int
+	}{"delivery30": {time.Date(2026, 8, 19, 23, 59, 59, 0, time.UTC), 30}, "repair17": {time.Date(2026, 8, 26, 23, 59, 59, 0, time.UTC), 17}}
+	seen := map[string]bool{}
+	for _, t := range m.Tracks {
+		p, ok := want[t.Key]
+		if !ok || seen[t.Key] || !t.DeadlineAt.Equal(p.deadline) || t.TargetCount != p.count || len(t.Entries) != p.count || t.GradeFloor != "GOOD" || t.RequiredConsecutiveWindows != 0 {
+			return errors.New("track policy mismatch")
+		}
+		seen[t.Key] = true
+	}
+	return nil
+}
+
 func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("recordings campaign-tracks seed", flag.ExitOnError)
 	file := fs.String("manifest", "", "exact reviewed manifest JSON")
@@ -53,6 +73,9 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 	if m.AccountID <= 0 || m.ActorUserID <= 0 || m.EvidenceObservedAt.IsZero() || len(m.EvidenceSHA256) != 64 || len(m.Tracks) != 2 {
 		log.Fatal("invalid manifest identity")
 	}
+	if err = validateCampaignSeedPolicy(m); err != nil {
+		log.Fatal(err)
+	}
 	claimed := m.EvidenceSHA256
 	m.EvidenceSHA256 = ""
 	canonical, err := json.Marshal(m)
@@ -64,7 +87,10 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 	if hex.EncodeToString(digest[:]) != claimed {
 		log.Fatal("manifest evidence_sha256 does not match canonical payload")
 	}
-	wantKeys := map[string]time.Time{"delivery30": time.Date(2026, 8, 19, 23, 59, 59, 0, time.UTC), "repair21": time.Date(2026, 8, 26, 23, 59, 59, 0, time.UTC)}
+	wantKeys := map[string]struct {
+		Deadline time.Time
+		Count    int
+	}{"delivery30": {time.Date(2026, 8, 19, 23, 59, 59, 0, time.UTC), 30}, "repair17": {time.Date(2026, 8, 26, 23, 59, 59, 0, time.UTC), 17}}
 	seenKeys := map[string]bool{}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
@@ -78,8 +104,8 @@ func runCampaignTrackSeed(ctx context.Context, cfg config.Config, args []string)
 		log.Fatal("actor is not authorized for account")
 	}
 	for _, t := range m.Tracks {
-		deadline, known := wantKeys[t.Key]
-		if !known || seenKeys[t.Key] || !t.DeadlineAt.Equal(deadline) || t.RequiredConsecutiveWindows != 0 || t.Label == "" || t.GradeFloor != "GOOD" || t.TargetCount <= 0 || len(t.Entries) != t.TargetCount {
+		policy, known := wantKeys[t.Key]
+		if !known || seenKeys[t.Key] || !t.DeadlineAt.Equal(policy.Deadline) || t.TargetCount != policy.Count || t.RequiredConsecutiveWindows != 0 || t.Label == "" || t.GradeFloor != "GOOD" || len(t.Entries) != t.TargetCount {
 			log.Fatalf("invalid track %s", t.Key)
 		}
 		seenKeys[t.Key] = true
