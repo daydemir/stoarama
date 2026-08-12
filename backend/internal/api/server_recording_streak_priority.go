@@ -163,42 +163,7 @@ func (s *Server) handleAccountRecordingStreakPriority(w http.ResponseWriter, r *
 	}
 	eligibleRows.Close()
 	rows, err := tx.Query(r.Context(), streakPriorityFactsSQL, p.AccountID)
-	/*
-		WITH eligible AS (
-		  SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='active' AND daily_window_start='08:00' AND daily_window_end='20:00'
-		  UNION ALL
-		  SELECT * FROM (SELECT * FROM recordings WHERE account_id=$1 AND mode='continuous' AND status='paused' AND paused_at>=now()-interval '7 days' AND daily_window_start='08:00' AND daily_window_end='20:00' ORDER BY paused_at DESC,id LIMIT 100) p
-		), expected AS (
-		  SELECT r.id,r.name,r.status,(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone fire_at,
-		         (d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone window_end_at,
-		         count(j.id)::int job_count,min(j.id) job_id
-		  FROM eligible r CROSS JOIN LATERAL generate_series(
-		    (now() AT TIME ZONE r.cron_timezone)::date-60,(now() AT TIME ZONE r.cron_timezone)::date,interval '1 day') d(day)
-		  LEFT JOIN recording_jobs j ON j.recording_id=r.id AND j.kind='continuous_window'
-		    AND j.fire_at=(d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone
-		    AND j.window_end_at=(d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone
-		  WHERE ((d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=now()
-		    AND ((d.day::date+'08:00:00'::time) AT TIME ZONE r.cron_timezone)>=r.start_at
-		    AND (r.end_at IS NULL OR ((d.day::date+'20:00:00'::time) AT TIME ZONE r.cron_timezone)<=r.end_at)
-		    AND (r.active_weekdays & (1 << (extract(isodow FROM d.day::date)::int-1)))<>0
-		  GROUP BY r.id,r.name,r.status,d.day,r.cron_timezone
-		), recent AS (
-		  SELECT *,row_number() OVER(PARTITION BY id ORDER BY window_end_at DESC) rn FROM expected
-		)
-		SELECT q.id,q.name,q.status,q.window_end_at,h.coverage_pct,h.largest_gap_seconds,
-		       h.gap_over_30s_count,h.gap_over_5m_count,h.overlap_count,h.metric_version,h.expected_seconds,
-		       extract(epoch FROM(q.window_end_at-q.fire_at))::bigint,
-		       q.job_count,
-		       COALESCE(h.health_count,0),
-		       EXISTS(SELECT 1 FROM recording_clips c WHERE c.recording_id=q.id AND c.clip_end_at>q.fire_at
-		          AND c.clip_start_at<q.window_end_at AND c.created_at>h.calculated_at) late_clip
-		FROM recent q
-		LEFT JOIN LATERAL (SELECT count(*)::int health_count,max(coverage_pct) coverage_pct,max(largest_gap_seconds) largest_gap_seconds,
-		              max(gap_over_30s_count) gap_over_30s_count,max(gap_over_5m_count) gap_over_5m_count,max(overlap_count) overlap_count,
-		              max(metric_version) metric_version,max(expected_seconds) expected_seconds,max(calculated_at) calculated_at
-		              FROM recording_window_health x WHERE x.recording_id=q.id AND x.job_id=q.job_id
-		                AND x.calculated_at>=q.window_end_at AND x.calculated_at<=now()+interval '5 minutes') h ON true
-		WHERE q.rn<=30 ORDER BY q.id,q.window_end_at DESC` */
+
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read streak priority")
 		return

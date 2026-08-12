@@ -138,6 +138,32 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if mine == nil || mine.RecentWindows[0].Grade != "UNKNOWN" {
 		t.Fatalf("missing health did not fail closed: %+v", mine)
 	}
+	// Duplicate health is impossible by schema, pinning the exact-one invariant.
+	_, err = pool.Exec(ctx, `INSERT INTO recording_window_health(recording_id,job_id,window_start_at,window_end_at,expected_seconds,covered_seconds,coverage_pct,largest_gap_seconds,gap_count,overlap_count,overlap_seconds,longest_run_seconds,layout_change_count,clip_count) VALUES($1,$2,$3,$4,43200,43200,100,0,0,0,0,43200,0,1),($1,$2,$3,$4,43200,43200,100,0,0,0,0,43200,0,1)`, recID, jobID, open, open.Add(12*time.Hour))
+	if err == nil {
+		t.Fatal("duplicate health facts accepted")
+	}
+	// Real non-UTC handler path: Sunday-only fall-back window is generated at
+	// local 08:00-20:00 and appears UNKNOWN because its health is absent.
+	var nyRec int64
+	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays) VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),'ny-dst','https://example.test/live.m3u8','hls_live','0 8 * * *','America/New_York',60,'active','2026-10-31',$2,'continuous','08:00','20:00',64) RETURNING id`, accountID, streamID).Scan(&nyRec); err != nil {
+		t.Fatal(err)
+	}
+	nyOpen := time.Date(2026, 11, 1, 13, 0, 0, 0, time.UTC)
+	nyEnd := time.Date(2026, 11, 2, 1, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES($1,$2,$2,60,'done','ny-dst-job','continuous_window',$3)`, nyRec, nyOpen, nyEnd); err != nil {
+		t.Fatal(err)
+	}
+	out = call()
+	var ny *streakPriorityRecording
+	for i := range out.Items {
+		if out.Items[i].RecordingID == nyRec {
+			ny = &out.Items[i]
+		}
+	}
+	if ny == nil || len(ny.RecentWindows) == 0 || !ny.RecentWindows[0].End.Equal(nyEnd) || ny.RecentWindows[0].Grade != "UNKNOWN" {
+		t.Fatalf("DST handler window wrong: %+v", ny)
+	}
 	// PostgreSQL timezone/calendar semantics used by the production query: DST
 	// changes UTC offsets while preserving the exact local 08:00-20:00 window.
 	var springHours, fallHours float64
