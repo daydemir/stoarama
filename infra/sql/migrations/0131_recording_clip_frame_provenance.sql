@@ -17,6 +17,14 @@ ALTER TABLE frames ADD CONSTRAINT frames_recording_clip_provenance_coherent CHEC
 CREATE UNIQUE INDEX idx_frames_source_recording_clip
   ON frames(source_recording_clip_id) WHERE source_recording_clip_id IS NOT NULL;
 
+-- Source-captured frames retain their timestamp identity. Clip-backed frames
+-- use the stronger exact clip identity above; this also avoids a false conflict
+-- if an earlier source refresh happened at the exact clip boundary.
+DROP INDEX idx_frames_authoritative_identity;
+CREATE UNIQUE INDEX idx_frames_authoritative_identity
+  ON frames(stream_id,captured_at)
+  WHERE source_kind='authoritative_frame_refresh' AND source_recording_clip_id IS NULL;
+
 CREATE OR REPLACE FUNCTION prevent_frame_provenance_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF ROW(OLD.stream_id,OLD.captured_at,OLD.raw_media_object_id,OLD.source_kind,

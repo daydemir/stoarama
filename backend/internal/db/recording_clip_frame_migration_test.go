@@ -33,6 +33,7 @@ func TestRecordingClipFrameProvenanceMigration(t *testing.T) {
 	for _, ddl := range []string{
 		`CREATE TABLE recording_clips(id bigint primary key)`,
 		`CREATE TABLE frames(id bigserial primary key,stream_id bigint,captured_at timestamptz,raw_media_object_id bigint,source_kind text)`,
+		`CREATE UNIQUE INDEX idx_frames_authoritative_identity ON frames(stream_id,captured_at) WHERE source_kind='authoritative_frame_refresh'`,
 		`INSERT INTO recording_clips VALUES(1),(2)`,
 		`INSERT INTO frames(stream_id,captured_at,raw_media_object_id,source_kind) VALUES(9,now(),3,'authoritative_frame_refresh')`,
 	} {
@@ -59,5 +60,14 @@ func TestRecordingClipFrameProvenanceMigration(t *testing.T) {
 	}
 	if _, err = c.Exec(ctx, `INSERT INTO frames(stream_id,captured_at,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag) VALUES(9,now(),'authoritative_frame_refresh',1,$1,'etag')`, sha); err == nil {
 		t.Fatal("duplicate source clip succeeded")
+	}
+	// A clip frame may honestly share a stream/timestamp with a preexisting
+	// source refresh; clip identity is the stronger idempotency key.
+	var sourceAt time.Time
+	if err = c.QueryRow(ctx, `SELECT captured_at FROM frames WHERE source_recording_clip_id IS NULL LIMIT 1`).Scan(&sourceAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Exec(ctx, `INSERT INTO frames(stream_id,captured_at,source_kind,source_recording_clip_id,source_recording_clip_sha256,source_recording_clip_etag) VALUES(9,$1,'authoritative_frame_refresh',2,$2,'etag2')`, sourceAt, sha); err != nil {
+		t.Fatalf("clip identity collided with source timestamp: %v", err)
 	}
 }
