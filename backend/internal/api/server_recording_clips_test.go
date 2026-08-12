@@ -243,11 +243,23 @@ func TestRelayLeaseTimestampAdmissionNegativeMatrix(t *testing.T) {
 			if _, err = pool.Exec(ctx, string(raw)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(42); INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,'relay',$1,now()-$2::interval,4,$3::jsonb); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,target_fps,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour',$4,'relay'); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','matrix','continuous_window',now()+interval '1 hour')`, tc.status, tc.age.String(), tc.capability, tc.target); err != nil {
+			if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(42)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,'relay',$1,now()-$2::interval,4,$3::jsonb)`, tc.status, tc.age.String(), tc.capability); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,target_fps,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour',$1,'relay')`, tc.target); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','matrix','continuous_window',now()+interval '1 hour')`); err != nil {
 				t.Fatal(err)
 			}
 			s := &Server{pool: pool, cfg: config.Config{ContinuousSourcePTSCanary: tc.config}}
 			resp, err := s.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: 77, AccountID: 42, NodeType: nodeTypeRelay}, true, 150, true)
+			if (tc.status == "inactive" || tc.age >= 2*time.Minute) && errors.Is(err, pgx.ErrNoRows) {
+				err = nil
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -282,7 +294,16 @@ func TestTimestampAdmissionRequiresGenerationAwareRelayLease(t *testing.T) {
 			if _, err = pool.Exec(ctx, string(raw)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(42); INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,$1,'active',now(),4,'{"continuous_source_pts_v1":true}'); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour',$2); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','generation-gate','continuous_window',now()+interval '1 hour')`, tc.nodeType, tc.captureVia); err != nil {
+			if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(42)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,capabilities_jsonb) VALUES(77,42,$1,'active',now(),4,'{"continuous_source_pts_v1":true}')`, tc.nodeType); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(445,42,7,'canary','https://example/live','active',now()-interval '1 hour',$1)`, tc.captureVia); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES(700,445,now(),now(),60,'pending','generation-gate','continuous_window',now()+interval '1 hour')`); err != nil {
 				t.Fatal(err)
 			}
 			s := &Server{pool: pool, cfg: config.Config{ContinuousSourcePTSCanary: "77:445"}}
@@ -1032,7 +1053,16 @@ func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testi
 	}
 	lease := "123e4567-e89b-12d3-a456-426614174000"
 	intent := "123e4567-e89b-12d3-a456-426614174010"
-	if _, err := pool.Exec(ctx, `INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams) VALUES(1,42,'relay','active',now(),4); INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(1,42,7,'ingest','https://example/live','active',now()-interval '1 hour','relay'); INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES(1,1,now(),now(),60,'leased','node:1',now()+interval '1 hour',$1,'ingest','continuous_window',now()+interval '1 hour'); INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) VALUES($2,1,1,7,$3,'bucket','key','clip.mp4','video/mp4',1000,'pending',now()+interval '1 hour')`, lease, intent, objectServer.URL); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams) VALUES(1,42,'relay','active',now(),4)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(1,42,7,'ingest','https://example/live','active',now()-interval '1 hour','relay')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES(1,1,now(),now(),60,'leased','node:1',now()+interval '1 hour',$1,'ingest','continuous_window',now()+interval '1 hour')`, lease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) VALUES($1,1,1,7,$2,'bucket','key','clip.mp4','video/mp4',1000,'pending',now()+interval '1 hour')`, intent, objectServer.URL); err != nil {
 		t.Fatal(err)
 	}
 	contract := `{"version":1,"mode":"muxed_source_copy","audio_selection":"first_optional","tracks":[{"stream_index":0,"media_type":"video","time_base_num":1,"time_base_den":1000,"first_timestamp":0,"last_timestamp":1000,"last_duration":40,"unit_count":26,"codec_signature_sha256":"` + strings.Repeat("a", 64) + `"}]}`
@@ -1183,7 +1213,8 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 		)`,
 		`CREATE TABLE recording_bandwidth_observations (
 			recording_id BIGINT PRIMARY KEY,
-			observed_bandwidth_bps BIGINT NOT NULL
+			observed_bandwidth_bps BIGINT NOT NULL,
+			observed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		testRelayNodesTableDDL,
 		`CREATE TABLE streams (

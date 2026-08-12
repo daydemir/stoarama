@@ -60,24 +60,31 @@ DECLARE
   first_ts bigint;
   last_ts bigint;
 BEGIN
-  IF jsonb_typeof(value) <> 'object'
-     OR value->>'version' <> '1'
-     OR value->>'mode' <> 'muxed_source_copy'
-     OR value->>'audio_selection' <> 'first_optional'
-     OR jsonb_typeof(value->'tracks') <> 'array'
-     OR jsonb_array_length(value->'tracks') NOT BETWEEN 1 AND 2 THEN
+  IF jsonb_typeof(value) IS DISTINCT FROM 'object' THEN
+    RETURN false;
+  END IF;
+  IF value->>'version' IS DISTINCT FROM '1'
+     OR value->>'mode' IS DISTINCT FROM 'muxed_source_copy'
+     OR value->>'audio_selection' IS DISTINCT FROM 'first_optional'
+     OR jsonb_typeof(value->'tracks') IS DISTINCT FROM 'array' THEN
+    RETURN false;
+  END IF;
+  IF jsonb_array_length(value->'tracks') NOT BETWEEN 1 AND 2 THEN
     RETURN false;
   END IF;
   FOR track IN SELECT * FROM jsonb_array_elements(value->'tracks') LOOP
-    IF jsonb_typeof(track) <> 'object'
-       OR jsonb_typeof(track->'stream_index') <> 'number'
-       OR jsonb_typeof(track->'time_base_num') <> 'number'
-       OR jsonb_typeof(track->'time_base_den') <> 'number'
-       OR jsonb_typeof(track->'first_timestamp') <> 'number'
-       OR jsonb_typeof(track->'last_timestamp') <> 'number'
-       OR jsonb_typeof(track->'last_duration') <> 'number'
-       OR jsonb_typeof(track->'unit_count') <> 'number'
-       OR jsonb_typeof(track->'codec_signature_sha256') <> 'string' THEN
+    IF jsonb_typeof(track) IS DISTINCT FROM 'object' THEN
+      RETURN false;
+    END IF;
+    IF jsonb_typeof(track->'stream_index') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(track->'media_type') IS DISTINCT FROM 'string'
+       OR jsonb_typeof(track->'time_base_num') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(track->'time_base_den') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(track->'first_timestamp') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(track->'last_timestamp') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(track->'last_duration') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(track->'unit_count') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(track->'codec_signature_sha256') IS DISTINCT FROM 'string' THEN
       RETURN false;
     END IF;
     media_type := track->>'media_type';
@@ -100,8 +107,8 @@ BEGIN
       RETURN false;
     END IF;
     IF media_type = 'audio' AND
-       (jsonb_typeof(track->'sample_rate') <> 'number'
-        OR jsonb_typeof(track->'last_sample_count') <> 'number'
+       (jsonb_typeof(track->'sample_rate') IS DISTINCT FROM 'number'
+        OR jsonb_typeof(track->'last_sample_count') IS DISTINCT FROM 'number'
         OR (track->>'sample_rate')::bigint NOT BETWEEN 8000 AND 768000
         OR (track->>'last_sample_count')::bigint NOT BETWEEN 1 AND 1000000) THEN
       RETURN false;

@@ -666,6 +666,14 @@ func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fall
 		audioPresent = meta.AudioPresent
 		videoWidth, videoHeight = meta.VideoWidth, meta.VideoHeight
 	}
+	// A COMPLETE timestamp contract is derived from the exact finalized bytes
+	// and is authoritative about the output track set. The ordinary metadata
+	// probe is best-effort; if it misses audio while the richer probe proves an
+	// audio track, preserve the clip and keep ingest metadata coherent with the
+	// immutable contract instead of rejecting valid footage downstream.
+	if timestampStatus == TimestampProbeComplete {
+		audioPresent = timestampContractHasAudio(timestampContract)
+	}
 	// A probe miss (or a degenerate probe reporting <=0 duration) must not collapse
 	// the segment to zero width: fall back to the muxer's expected cut span so the
 	// clip carries a real duration/end and the continuous timeline stays gapless.
@@ -699,6 +707,18 @@ func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fall
 		TimestampContractStatus: timestampStatus,
 		TimestampContractReason: timestampReason,
 	}, nil
+}
+
+func timestampContractHasAudio(contract *TimestampContract) bool {
+	if contract == nil {
+		return false
+	}
+	for _, track := range contract.Tracks {
+		if track.MediaType == "audio" {
+			return true
+		}
+	}
+	return false
 }
 
 func timestampContractErrorCode(err error) string {

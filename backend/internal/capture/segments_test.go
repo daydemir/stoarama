@@ -376,6 +376,33 @@ printf '%s\n' '{"format":{"duration":"1.0"},"streams":[{"index":0,"codec_type":"
 	}
 }
 
+func TestFinalizeTimestampContractPreservesAudioWhenOrdinaryProbeFails(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "ffprobe")
+	script := `#!/bin/sh
+case " $* " in
+  *" -show_frames "*)
+    printf '%s\n' '{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","time_base":"1/1000"},{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo","time_base":"1/48000"}],"frames":[{"stream_index":0,"media_type":"video","best_effort_timestamp":0,"pkt_dts":0,"pkt_duration":1000},{"stream_index":1,"media_type":"audio","best_effort_timestamp":0,"pkt_dts":0,"pkt_duration":1024,"nb_samples":1024}]}'
+    ;;
+  *) exit 1 ;;
+esac`
+	if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
+	path := filepath.Join(dir, "seg-20260807-120000.mp4")
+	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seg, err := finalizeSegmentWithTimestampContract(context.Background(), path, time.Second, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seg.TimestampContractStatus != TimestampProbeComplete || seg.TimestampContract == nil || !seg.AudioPresent {
+		t.Fatalf("segment lost authoritative audio evidence: %+v", seg)
+	}
+}
+
 func TestContinuousWatchdogStartupAndProgressTimeouts(t *testing.T) {
 	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	lastProgress := started.Add(62 * time.Second)

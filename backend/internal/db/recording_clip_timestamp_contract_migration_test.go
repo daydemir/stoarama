@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -52,6 +53,77 @@ func TestRecordingClipTimestampContractMigration(t *testing.T) {
 	lease, attempt := "123e4567-e89b-12d3-a456-426614174000", "123e4567-e89b-12d3-a456-426614174001"
 	wrongLease := "123e4567-e89b-12d3-a456-426614174099"
 	contract := `{"version":1,"mode":"muxed_source_copy","audio_selection":"first_optional","tracks":[{"stream_index":0,"media_type":"video","time_base_num":1,"time_base_den":1000,"first_timestamp":0,"last_timestamp":1000,"last_duration":40,"unit_count":26,"codec_signature_sha256":"` + strings.Repeat("a", 64) + `"}]}`
+	var valid bool
+	if err = c.QueryRow(ctx, `SELECT valid_recording_clip_timestamp_contract($1::jsonb)`, contract).Scan(&valid); err != nil || !valid {
+		t.Fatalf("valid timestamp contract rejected: valid=%v err=%v", valid, err)
+	}
+	baseTrack := map[string]any{
+		"stream_index": 0, "media_type": "video", "time_base_num": 1, "time_base_den": 1000,
+		"first_timestamp": 0, "last_timestamp": 1000, "last_duration": 40, "unit_count": 26,
+		"codec_signature_sha256": strings.Repeat("a", 64),
+	}
+	for _, key := range []string{"stream_index", "media_type", "time_base_num", "time_base_den", "first_timestamp", "last_timestamp", "last_duration", "unit_count", "codec_signature_sha256"} {
+		t.Run("missing track "+key, func(t *testing.T) {
+			track := make(map[string]any, len(baseTrack))
+			for k, v := range baseTrack {
+				track[k] = v
+			}
+			delete(track, key)
+			payload, marshalErr := json.Marshal(map[string]any{"version": 1, "mode": "muxed_source_copy", "audio_selection": "first_optional", "tracks": []any{track}})
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			var accepted bool
+			if queryErr := c.QueryRow(ctx, `SELECT valid_recording_clip_timestamp_contract($1::jsonb)`, payload).Scan(&accepted); queryErr != nil {
+				t.Fatal(queryErr)
+			}
+			if accepted {
+				t.Fatalf("incomplete contract accepted: %s", payload)
+			}
+		})
+	}
+	for _, key := range []string{"version", "mode", "audio_selection", "tracks"} {
+		t.Run("missing contract "+key, func(t *testing.T) {
+			payloadMap := map[string]any{"version": 1, "mode": "muxed_source_copy", "audio_selection": "first_optional", "tracks": []any{baseTrack}}
+			delete(payloadMap, key)
+			payload, marshalErr := json.Marshal(payloadMap)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			var accepted bool
+			if queryErr := c.QueryRow(ctx, `SELECT valid_recording_clip_timestamp_contract($1::jsonb)`, payload).Scan(&accepted); queryErr != nil {
+				t.Fatal(queryErr)
+			}
+			if accepted {
+				t.Fatalf("incomplete contract accepted: %s", payload)
+			}
+		})
+	}
+	audioTrack := map[string]any{
+		"stream_index": 1, "media_type": "audio", "time_base_num": 1, "time_base_den": 48000,
+		"first_timestamp": 0, "last_timestamp": 1024, "last_duration": 1024, "unit_count": 2,
+		"codec_signature_sha256": strings.Repeat("b", 64), "sample_rate": 48000, "last_sample_count": 1024,
+	}
+	for _, key := range []string{"sample_rate", "last_sample_count"} {
+		t.Run("missing audio "+key, func(t *testing.T) {
+			audio := make(map[string]any, len(audioTrack))
+			for k, v := range audioTrack {
+				audio[k] = v
+			}
+			delete(audio, key)
+			payload, marshalErr := json.Marshal(map[string]any{"version": 1, "mode": "muxed_source_copy", "audio_selection": "first_optional", "tracks": []any{baseTrack, audio}})
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			var accepted bool
+			if queryErr := c.QueryRow(ctx, `SELECT valid_recording_clip_timestamp_contract($1::jsonb)`, payload).Scan(&accepted); queryErr != nil {
+				t.Fatal(queryErr)
+			}
+			if accepted {
+				t.Fatalf("incomplete audio contract accepted: %s", payload)
+			}
+		})
+	}
 	if _, err = c.Exec(ctx, `INSERT INTO recording_clips(id,capture_lease_token,capture_sequence,capture_attempt_id,timestamp_contract_version,timestamp_contract,timestamp_contract_status) VALUES(1,$1,1,$2,'continuous-source-pts-v1',$3,'per_clip_probe_complete')`, lease, attempt, contract); err != nil {
 		t.Fatal(err)
 	}
