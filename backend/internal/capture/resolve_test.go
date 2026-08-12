@@ -106,13 +106,27 @@ func TestResolveCaptureInputRefreshesSkylineManifestFromSourcePage(t *testing.T)
 		resolveDialControl = netguard.ControlReject
 	})
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"livee.m3u8?a=fresh-token"});</script>`))
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("User-Agent"), "Chrome/") {
+			t.Fatalf("skyline request User-Agent=%q", r.Header.Get("User-Agent"))
+		}
+		switch r.URL.Path {
+		case "/webcam.html":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"` + server.URL + `/fresh.m3u8"});</script>`))
+		case "/fresh.m3u8":
+			if got := r.Header.Get("Referer"); got != server.URL+"/webcam.html" {
+				t.Fatalf("manifest Referer=%q", got)
+			}
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsegment.ts\n"))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer server.Close()
 
-	got, isImage, err := ResolveCaptureInput(
+	got, isImage, inputHeaders, err := ResolveCaptureInputWithHeaders(
 		context.Background(),
 		"SKYLINEWEBCAMS",
 		"https://hd-auth.skylinewebcams.com/live.m3u8?a=stale-token",
@@ -124,9 +138,151 @@ func TestResolveCaptureInputRefreshesSkylineManifestFromSourcePage(t *testing.T)
 	if isImage {
 		t.Fatalf("ResolveCaptureInput() isImage=true, want false")
 	}
-	want := "https://hd-auth.skylinewebcams.com/live.m3u8?a=fresh-token"
+	if !strings.Contains(inputHeaders, "Referer: "+server.URL+"/webcam.html\r\n") || !strings.Contains(inputHeaders, "User-Agent: "+skylineBrowserUserAgent+"\r\n") {
+		t.Fatalf("ResolveCaptureInputWithHeaders() headers=%q", inputHeaders)
+	}
+	want := server.URL + "/fresh.m3u8"
 	if got != want {
 		t.Fatalf("ResolveCaptureInput()=%q want %q", got, want)
+	}
+}
+
+func TestResolveCaptureInputRejectsHTTP200EmptySkylineManifest(t *testing.T) {
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+
+	var pageRequests int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/webcam.html":
+			pageRequests++
+			_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"` + server.URL + `/empty.m3u8"});</script>`))
+		case "/empty.m3u8":
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:0\n#EXT-X-ENDLIST\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, _, err := ResolveCaptureInput(context.Background(), "SKYLINEWEBCAMS", "https://example.invalid/stale.m3u8", server.URL+"/webcam.html")
+	if err == nil || !strings.Contains(err.Error(), "no playable media segments") {
+		t.Fatalf("ResolveCaptureInput() error=%v, want playable-media failure", err)
+	}
+	if pageRequests != 2 {
+		t.Fatalf("page requests=%d want=2 fresh attempts", pageRequests)
+	}
+}
+
+func TestResolveCaptureInputRefreshesAfterEmptySkylineToken(t *testing.T) {
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/webcam.html":
+			manifest := "/stale.m3u8"
+			if r.URL.Query().Get("_stoarama_refresh") != "" {
+				manifest = "/fresh.m3u8"
+			}
+			_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"` + server.URL + manifest + `"});</script>`))
+		case "/stale.m3u8":
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-ALLOW-CACHE:NO\n#EXT-X-TARGETDURATION:0\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-ENDLIST"))
+		case "/fresh.m3u8":
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsegment.ts\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	got, _, err := ResolveCaptureInput(context.Background(), "SKYLINEWEBCAMS", "https://hd-auth.skylinewebcams.com/live.m3u8?a=stale", server.URL+"/webcam.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != server.URL+"/fresh.m3u8" {
+		t.Fatalf("resolved=%q want refreshed manifest", got)
+	}
+}
+
+func TestResolveCaptureInputSelectsPlayableTrustedSkylineMasterVariant(t *testing.T) {
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/webcam.html":
+			_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"` + server.URL + `/master.m3u8"});</script>`))
+		case "/master.m3u8":
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nstale.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=200000\nlive.m3u8\n"))
+		case "/stale.m3u8":
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:0\n#EXT-X-ENDLIST\n"))
+		case "/live.m3u8":
+			if got := r.Header.Get("Referer"); got != server.URL+"/webcam.html" {
+				t.Fatalf("variant Referer=%q", got)
+			}
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsegment.ts\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	got, _, err := ResolveCaptureInput(context.Background(), "SKYLINEWEBCAMS", "https://hd-auth.skylinewebcams.com/stale.m3u8", server.URL+"/webcam.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != server.URL+"/live.m3u8" {
+		t.Fatalf("resolved=%q want playable child", got)
+	}
+}
+
+func TestResolveCaptureInputRejectsUntrustedSkylineRedirect(t *testing.T) {
+	resolveValidateURL = func(string) (net.IP, error) { return net.IPv4(127, 0, 0, 1), nil }
+	resolveDialControl = func(string, string, syscall.RawConn) error { return nil }
+	t.Cleanup(func() {
+		resolveValidateURL = netguard.ValidatePublicURL
+		resolveDialControl = netguard.ControlReject
+	})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/webcam.html":
+			_, _ = w.Write([]byte(`<script>new Clappr.Player({source:"` + server.URL + `/redirect.m3u8"});</script>`))
+		case "/redirect.m3u8":
+			http.Redirect(w, r, "https://example.com/media.m3u8", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, _, err := ResolveCaptureInput(context.Background(), "SKYLINEWEBCAMS", "https://hd-auth.skylinewebcams.com/stale.m3u8", server.URL+"/webcam.html")
+	if err == nil || !strings.Contains(err.Error(), "untrusted host") {
+		t.Fatalf("ResolveCaptureInput() error=%v, want untrusted redirect", err)
+	}
+}
+
+func TestResolveCaptureInputRejectsUntrustedSkylinePage(t *testing.T) {
+	_, _, err := ResolveCaptureInput(context.Background(), "SKYLINEWEBCAMS", "https://hd-auth.skylinewebcams.com/live.m3u8?a=stale", "https://example.com/webcam.html")
+	if err == nil || !strings.Contains(err.Error(), "untrusted host") {
+		t.Fatalf("ResolveCaptureInput() error=%v, want untrusted host", err)
 	}
 }
 

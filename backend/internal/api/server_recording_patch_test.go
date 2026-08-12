@@ -277,8 +277,8 @@ func TestRecordingJobCompleteRejectsZeroClipContinuous(t *testing.T) {
 	var jobID int64
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO recording_jobs
-			(recording_id, fire_at, scheduled_for, clip_duration_sec, status, lease_owner, attempt_count, idempotency_key, kind, window_end_at)
-		VALUES ($1, now(), now(), 60, 'leased', 'node:7', 1, 'reccont-test', 'continuous_window', now()+interval '1 hour')
+			(recording_id, fire_at, scheduled_for, clip_duration_sec, status, lease_owner, attempt_count, idempotency_key, kind, window_end_at, error_text)
+		VALUES ($1, now(), now(), 60, 'leased', 'node:7', 1, 'reccont-test', 'continuous_window', now()+interval '1 hour', 'skyline manifest contains no playable media segments')
 		RETURNING id
 	`, recID).Scan(&jobID); err != nil {
 		t.Fatalf("insert job: %v", err)
@@ -300,7 +300,7 @@ func TestRecordingJobCompleteRejectsZeroClipContinuous(t *testing.T) {
 	`, jobID).Scan(&status, &errText, &lastErr, &failures); err != nil {
 		t.Fatalf("read state: %v", err)
 	}
-	if status != "error" || errText == "" || lastErr == "" || failures != 1 {
+	if status != "error" || errText != "skyline manifest contains no playable media segments" || lastErr != errText || failures != 1 {
 		t.Fatalf("state = job %q/%q rec %q failures %d, want error with health bump", status, errText, lastErr, failures)
 	}
 }

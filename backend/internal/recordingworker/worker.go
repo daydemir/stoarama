@@ -587,7 +587,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			if w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
 				return
 			}
 			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
@@ -611,7 +611,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous ssrf guard rejected url (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			if w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
 				return
 			}
 			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
@@ -635,7 +635,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			delay := reconnectBackoff(job.JobID, failures)
 			log.Printf("recording worker job=%d recording=%d continuous mktemp failed (attempt %d): %v; retrying in %s",
 				job.JobID, job.RecordingID, attempt, err, delay)
-			if w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
 				return
 			}
 			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
@@ -764,7 +764,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}
 		log.Printf("recording worker job=%d recording=%d continuous source dropped (attempt %d): %v; reconnecting in %s",
 			job.JobID, job.RecordingID, attempt, captureErr, delay)
-		if !errors.Is(captureErr, errSegmentDelivery) && w.surrenderContinuousJob(ctx, cancel, job, progress.last()) {
+		if !errors.Is(captureErr, errSegmentDelivery) && w.surrenderContinuousJob(ctx, cancel, job, progress.last(), captureErr) {
 			return
 		}
 		backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
@@ -968,11 +968,14 @@ func (w *Worker) shouldLogDiskError(now time.Time) bool {
 	}
 }
 
-func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, lastProgressAt time.Time) bool {
+func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, lastProgressAt time.Time, cause error) bool {
 	if !continuousNoProgressExpired(lastProgressAt, time.Now(), w.cfg.ContinuousNoProgressTimeout) {
 		return false
 	}
 	err := fmt.Errorf("continuous capture made no progress for %s", w.cfg.ContinuousNoProgressTimeout)
+	if cause != nil {
+		err = fmt.Errorf("%w: %v", err, cause)
+	}
 	return w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
 }
 
@@ -980,7 +983,18 @@ func (w *Worker) surrenderContinuousJobForReason(ctx context.Context, cancel con
 	cancel()
 	surrenderCtx, surrenderCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer surrenderCancel()
-	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, job.LeaseToken, reason); surrenderErr != nil {
+	errorText := SanitizeDiagnosticError(cause)
+	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, job.LeaseToken, reason, errorText); surrenderErr != nil {
+		if job.WindowEndAt != nil && !time.Now().Before(*job.WindowEndAt) {
+			completeCtx, completeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			completeErr := w.cfg.Client.CompleteRecordingJob(completeCtx, job.JobID, job.LeaseToken)
+			completeCancel()
+			if completeErr == nil {
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "done", nil)
+				return true
+			}
+			log.Printf("recording worker job=%d close-time complete after surrender failure failed: %v", job.JobID, completeErr)
+		}
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "surrender_failed", surrenderErr)
 		log.Printf("recording worker job=%d surrender failed: %v", job.JobID, surrenderErr)
 		return true

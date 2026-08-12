@@ -267,6 +267,73 @@ func TestContinuousRevivesDoneZeroClipWindow(t *testing.T) {
 	}
 }
 
+func TestExpiredContinuousJobsFinalizeFromPreservedMedia(t *testing.T) {
+	pool, cleanup := testSchedulerPool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	recID := insertSchedulerContinuousRecording(t, pool)
+	var emptyJobID, capturedJobID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_jobs
+		  (recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at,error_text)
+		VALUES ($1,now()-interval '2 hours',now(),60,'pending','expired-empty','continuous_window',now()-interval '1 minute','skyline manifest contains no playable media segments')
+		RETURNING id
+	`, recID).Scan(&emptyJobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_jobs
+		  (recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at,error_text)
+		VALUES ($1,now()-interval '2 hours',now(),60,'pending','expired-captured','continuous_window',now()-interval '1 minute','prior handoff detail')
+		RETURNING id
+	`, recID).Scan(&capturedJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips (recording_id,recording_job_id,clip_start_at,clip_end_at)
+		VALUES ($1,$2,now()-interval '2 hours',now()-interval '119 minutes')
+	`, recID, capturedJobID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(pool, Config{}).markStaleJobsMissed(ctx, tx); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var emptyStatus, emptyError, capturedStatus, capturedError string
+	if err := pool.QueryRow(ctx, `SELECT status,error_text FROM recording_jobs WHERE id=$1`, emptyJobID).Scan(&emptyStatus, &emptyError); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,error_text FROM recording_jobs WHERE id=$1`, capturedJobID).Scan(&capturedStatus, &capturedError); err != nil {
+		t.Fatal(err)
+	}
+	if emptyStatus != "error" || emptyError != "skyline manifest contains no playable media segments" {
+		t.Fatalf("empty job=%q error=%q", emptyStatus, emptyError)
+	}
+	if capturedStatus != "done" || capturedError != "prior handoff detail" {
+		t.Fatalf("captured job=%q error=%q", capturedStatus, capturedError)
+	}
+	var failures int
+	var lastError string
+	if err := pool.QueryRow(ctx, `SELECT consecutive_failures,last_error_text FROM recordings WHERE id=$1`, recID).Scan(&failures, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if failures != 1 {
+		t.Fatalf("recording failures=%d want 1", failures)
+	}
+	if lastError != "skyline manifest contains no playable media segments" {
+		t.Fatalf("recording last error=%q", lastError)
+	}
+}
+
 func TestContinuousDoesNotReviveDoneJobWithClips(t *testing.T) {
 	pool, cleanup := testSchedulerPool(t)
 	defer cleanup()
@@ -612,6 +679,9 @@ func testSchedulerPool(t *testing.T) (*pgxpool.Pool, func()) {
 			active_weekdays SMALLINT NOT NULL DEFAULT 127,
 			completed_captured_clip_count BIGINT,
 			completed_expected_clip_count BIGINT,
+			consecutive_failures INT NOT NULL DEFAULT 0,
+			last_error_text TEXT NOT NULL DEFAULT '',
+			last_error_at TIMESTAMPTZ,
 			last_enqueued_fire_at TIMESTAMPTZ,
 			next_fire_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

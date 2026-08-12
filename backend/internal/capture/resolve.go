@@ -46,7 +46,7 @@ func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, so
 		if u == "" {
 			return "", false, "", fmt.Errorf("skyline source page did not contain a playable manifest")
 		}
-		return u, false, "", nil
+		return u, false, skylineInputHeaders(sourcePageURL), nil
 	}
 
 	if shouldResolveEarthCamPage(provider, streamURL, sourcePageURL) {
@@ -429,53 +429,227 @@ func resolveSkylineManifestURL(ctx context.Context, pageURL string, timeout time
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
+	if !skylineURLAllowed(pageURL) {
+		return "", fmt.Errorf("skyline source page has an untrusted host")
+	}
 	if _, err := resolveValidateURL(pageURL); err != nil {
 		return "", fmt.Errorf("skyline page rejected: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("build skyline request: %w", err)
+	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client := skylineHTTPClient(timeout)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		attemptURL := pageURL
+		if attempt > 0 {
+			attemptURL = skylineRefreshURL(pageURL)
+		}
+		page, err := fetchSkylineResource(resolveCtx, client, attemptURL, "", "text/html,application/xhtml+xml", 512*1024)
+		if err != nil {
+			lastErr = fmt.Errorf("skyline page: %w", err)
+			continue
+		}
+		manifest := skylineManifestFromHTML(string(page))
+		if manifest == "" {
+			lastErr = fmt.Errorf("skyline page did not contain player source")
+			continue
+		}
+		if !skylineURLAllowed(manifest) {
+			return "", fmt.Errorf("skyline page returned an untrusted manifest host")
+		}
+		if _, err := resolveValidateURL(manifest); err != nil {
+			return "", fmt.Errorf("skyline manifest rejected: %w", err)
+		}
+		captureURL, err := validateSkylineManifest(resolveCtx, client, manifest, pageURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return captureURL, nil
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; stoarama-capture/1.0)")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-				Control:   resolveDialControl,
-			}).DialContext,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("too many redirects resolving skyline page")
-			}
-			if _, err := resolveValidateURL(req.URL.String()); err != nil {
-				return fmt.Errorf("redirect target rejected: %w", err)
-			}
-			return nil
-		},
+	return "", fmt.Errorf("skyline source unavailable after fresh resolution: %w", lastErr)
+}
+
+// Skyline returns an empty, valid-looking ENDLIST with HTTP 200 for expired
+// hd-auth tokens. A URL alone is therefore not a capture input: require a media
+// playlist with at least one trusted media segment.
+func validateSkylineManifest(ctx context.Context, client *http.Client, manifestURL, pageURL string) (string, error) {
+	body, err := fetchSkylineResource(ctx, client, manifestURL, pageURL, "application/vnd.apple.mpegurl,application/x-mpegURL,*/*", 1024*1024)
+	if err != nil {
+		return "", fmt.Errorf("skyline manifest: %w", err)
+	}
+	if err := validateSkylineMediaPlaylist(string(body), manifestURL); err == nil {
+		return manifestURL, nil
+	}
+	variants, err := skylineMasterVariants(string(body), manifestURL)
+	if err != nil {
+		return "", err
+	}
+	var lastErr error
+	for _, variantURL := range variants {
+		if !skylineURLAllowed(variantURL) {
+			lastErr = fmt.Errorf("skyline master contains an untrusted variant host")
+			continue
+		}
+		if _, err := resolveValidateURL(variantURL); err != nil {
+			lastErr = fmt.Errorf("skyline variant rejected: %w", err)
+			continue
+		}
+		variant, err := fetchSkylineResource(ctx, client, variantURL, pageURL, "application/vnd.apple.mpegurl,application/x-mpegURL,*/*", 1024*1024)
+		if err != nil {
+			lastErr = fmt.Errorf("skyline variant: %w", err)
+			continue
+		}
+		if err := validateSkylineMediaPlaylist(string(variant), variantURL); err != nil {
+			lastErr = err
+			continue
+		}
+		return variantURL, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("skyline master contains no variants")
+	}
+	return "", fmt.Errorf("skyline master contains no playable variant: %w", lastErr)
+}
+
+func fetchSkylineResource(ctx context.Context, client *http.Client, rawURL, referer, accept string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("User-Agent", skylineBrowserUserAgent)
+	req.Header.Set("Accept", accept)
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	if referer != "" {
+		req.Header.Set("Referer", referer)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("skyline request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("skyline request status=%d", resp.StatusCode)
+		return nil, fmt.Errorf("request status=%d", resp.StatusCode)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return "", fmt.Errorf("read skyline page: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
-	u := skylineManifestFromHTML(string(b))
-	if u == "" {
-		return "", fmt.Errorf("skyline page did not contain player source")
-	}
-	return u, nil
+	return body, nil
 }
 
+func validateSkylineMediaPlaylist(body, manifestURL string) error {
+	if !strings.Contains(body, "#EXTM3U") {
+		return fmt.Errorf("skyline response is not an HLS playlist")
+	}
+	base, err := url.Parse(manifestURL)
+	if err != nil {
+		return fmt.Errorf("invalid skyline manifest URL")
+	}
+	wantsSegment := false
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#EXTINF:") {
+			wantsSegment = true
+			continue
+		}
+		if !wantsSegment || line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		segment, err := url.Parse(line)
+		if err != nil {
+			return fmt.Errorf("skyline playlist contains an invalid segment URL")
+		}
+		segmentURL := base.ResolveReference(segment).String()
+		if !skylineURLAllowed(segmentURL) {
+			return fmt.Errorf("skyline playlist contains an untrusted segment host")
+		}
+		if _, err := resolveValidateURL(segmentURL); err != nil {
+			return fmt.Errorf("skyline segment rejected: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("skyline manifest contains no playable media segments")
+}
+
+func skylineMasterVariants(body, manifestURL string) ([]string, error) {
+	if !strings.Contains(body, "#EXTM3U") || !strings.Contains(body, "#EXT-X-STREAM-INF:") {
+		return nil, fmt.Errorf("skyline manifest contains no playable media segments")
+	}
+	base, err := url.Parse(manifestURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid skyline master URL")
+	}
+	variants := make([]string, 0, 4)
+	wantsVariant := false
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
+			wantsVariant = true
+			continue
+		}
+		if !wantsVariant || line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		variant, err := url.Parse(line)
+		if err != nil {
+			return nil, fmt.Errorf("skyline master contains an invalid variant URL")
+		}
+		variants = append(variants, base.ResolveReference(variant).String())
+		wantsVariant = false
+		if len(variants) == 8 {
+			break
+		}
+	}
+	if len(variants) == 0 {
+		return nil, fmt.Errorf("skyline master contains no variants")
+	}
+	return variants, nil
+}
+
+func skylineHTTPClient(timeout time.Duration) *http.Client {
+	client := resolveHTTPClient(timeout)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return fmt.Errorf("too many redirects resolving skyline source")
+		}
+		if !skylineURLAllowed(req.URL.String()) {
+			return fmt.Errorf("skyline redirect target has an untrusted host")
+		}
+		if _, err := resolveValidateURL(req.URL.String()); err != nil {
+			return fmt.Errorf("skyline redirect target rejected: %w", err)
+		}
+		return nil
+	}
+	return client
+}
+
+func skylineURLAllowed(rawURL string) bool {
+	host := sourcePageHost(rawURL)
+	if hostMatches(host, "skylinewebcams.com") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func skylineRefreshURL(pageURL string) string {
+	u, err := url.Parse(pageURL)
+	if err != nil {
+		return pageURL
+	}
+	q := u.Query()
+	q.Set("_stoarama_refresh", fmt.Sprintf("%d", time.Now().UnixNano()))
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func skylineInputHeaders(pageURL string) string {
+	return "Referer: " + strings.TrimSpace(pageURL) + "\r\nUser-Agent: " + skylineBrowserUserAgent + "\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n"
+}
+
+const skylineBrowserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 const earthCamUserAgent = "Mozilla/5.0 (compatible; stoarama-capture/1.0)"
 
 var skylinePlayerSourceRE = regexp.MustCompile(`(?i)\bsource\s*:\s*["']([^"']+?\.m3u8[^"']*)["']`)
