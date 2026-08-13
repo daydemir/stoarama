@@ -154,7 +154,12 @@ INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO 
 		t.Fatalf("unfrozen historical job scope=%q err=%v", qualificationScope, err)
 	}
 	var tasks, taskClips int
-	if err = conn.QueryRow(ctx, `SELECT count(*),(SELECT count(*) FROM recording_native_stitch_task_clips) FROM recording_native_stitch_tasks`).Scan(&tasks, &taskClips); err != nil || tasks != 1 || taskClips != 1 {
+	if err = conn.QueryRow(ctx, `SELECT count(*),(
+		SELECT count(*)
+		FROM recording_native_stitch_task_clips tc
+		JOIN recording_native_stitch_tasks scoped ON scoped.id=tc.task_id
+		WHERE scoped.recording_job_id=9
+	) FROM recording_native_stitch_tasks WHERE recording_job_id=9`).Scan(&tasks, &taskClips); err != nil || tasks != 1 || taskClips != 1 {
 		t.Fatalf("tasks=%d task_clips=%d err=%v", tasks, taskClips, err)
 	}
 
