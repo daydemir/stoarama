@@ -114,8 +114,11 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES($1,$2,now(),now(),60,'leased',$3,now()+interval '1 hour',$4,$5,'continuous_window',now()+interval '1 hour')`, jobID, recordingID, fmt.Sprintf("node:%d", nodeID), lease, fmt.Sprintf("v2-job-%d", suffix)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET source_page_url=source_page_url||'?revision=1' WHERE id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
 	var revisionID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO stream_source_revisions(stream_id,actor,reason,new_source_url,new_source_page_url,new_source_family,new_capture_type,new_execution_class) SELECT id,'test','v2 fixture',source_url,source_page_url,source_family,capture_type,execution_class FROM streams WHERE id=$1 RETURNING id`, streamID).Scan(&revisionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO stream_source_revisions(stream_id,actor,reason,previous_source_url,new_source_url,previous_source_page_url,new_source_page_url,previous_source_family,new_source_family,previous_capture_type,new_capture_type,previous_execution_class,new_execution_class) SELECT id,'test','v2 fixture',source_url,source_url,$2,source_page_url,source_family,source_family,capture_type,capture_type,execution_class,execution_class FROM streams WHERE id=$1 RETURNING id`, streamID, fmt.Sprintf("https://source.example.test/page/%d", suffix)).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
