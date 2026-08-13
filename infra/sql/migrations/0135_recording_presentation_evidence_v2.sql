@@ -592,7 +592,7 @@ BEGIN
     SELECT * INTO a FROM recording_presentation_v2_admissions WHERE id=NEW.admission_id FOR SHARE;
     SELECT * INTO p FROM recording_presentation_v2_attempts WHERE id=NEW.attempt_id FOR SHARE;
     SELECT recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,
-           size_bytes,lower(sha256),capture_lease_token,capture_sequence
+           size_bytes,lower(sha256) AS sha256,capture_lease_token,capture_sequence
       INTO c FROM recording_clips WHERE id=NEW.clip_id FOR SHARE;
     SELECT recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,max_size_bytes,status
       INTO i FROM recording_upload_intents WHERE id=NEW.upload_intent_id FOR SHARE;
