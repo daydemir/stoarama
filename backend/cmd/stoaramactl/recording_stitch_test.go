@@ -113,7 +113,7 @@ INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO 
 		}{
 			{`INSERT INTO recordings VALUES($1,48,'continuous')`, []any{recordingID}},
 			{`INSERT INTO recording_campaign_roster_entries VALUES(2,$1,$2,'primary','protect')`, []any{recordingID, i + 1}},
-			{`INSERT INTO recording_jobs VALUES($1,$2,'done','continuous_window',$5,$5,$3,$4,60,'reccont:'||$2::text||':'||extract(epoch from $3::timestamptz)::bigint)`, []any{jobID, recordingID, start, end, now}},
+			{`INSERT INTO recording_jobs VALUES($1,$2,'done','continuous_window',$5,$5,$3,$4,60,'reccont:'||$2::bigint::text||':'||extract(epoch from $3::timestamptz)::bigint)`, []any{jobID, recordingID, start, end, now}},
 			{`INSERT INTO recording_window_health VALUES($1,$2,$3,2,43200,43200,100,0,0,0,0,0,0,0,1)`, []any{recordingID, jobID, now}},
 		} {
 			if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
