@@ -646,7 +646,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		  (5, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/5.m3u8', NULL, 1, NULL),
 		  (6, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/6.m3u8', NULL, 1, NULL);
 		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
-		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), NULL),
+		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), now()+interval '1 hour'),
 		  (6, 6, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL);
 	`); err != nil {
 		t.Fatal(err)
