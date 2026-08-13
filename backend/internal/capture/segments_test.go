@@ -574,14 +574,17 @@ func TestContinuousWatchdogStartupAndProgressTimeouts(t *testing.T) {
 	if err := continuousWatchdogError(started.Add(29*time.Second), started, started, false, 30*time.Second, 75*time.Second); err != nil {
 		t.Fatalf("watchdog expired before startup timeout: %v", err)
 	}
-	if err := continuousWatchdogError(started.Add(30*time.Second), started, started, false, 30*time.Second, 75*time.Second); err == nil || !strings.Contains(err.Error(), "startup stalled") {
+	if err := continuousWatchdogError(started.Add(30*time.Second), started, started, false, 30*time.Second, 75*time.Second); err == nil || !strings.Contains(err.Error(), "startup stalled") || !IsCleanContinuousNoOutput(err) || !errors.Is(err, ErrContinuousNoOutput) {
 		t.Fatalf("startup timeout error=%v", err)
 	}
 	if err := continuousWatchdogError(started.Add(136*time.Second), started, lastProgress, true, 30*time.Second, 75*time.Second); err != nil {
 		t.Fatalf("watchdog expired before progress timeout: %v", err)
 	}
-	if err := continuousWatchdogError(started.Add(137*time.Second), started, lastProgress, true, 30*time.Second, 75*time.Second); err == nil || !strings.Contains(err.Error(), "progress stalled") {
+	if err := continuousWatchdogError(started.Add(137*time.Second), started, lastProgress, true, 30*time.Second, 75*time.Second); err == nil || !strings.Contains(err.Error(), "progress stalled") || !IsCleanContinuousNoOutput(err) || !errors.Is(err, ErrContinuousNoOutput) {
 		t.Fatalf("progress timeout error=%v", err)
+	}
+	if IsCleanContinuousNoOutput(errors.Join(ErrContinuousNoOutput, errors.New("finalize failed"))) {
+		t.Fatal("joined partial-spool failure classified as clean no-output")
 	}
 }
 

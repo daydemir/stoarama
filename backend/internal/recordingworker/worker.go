@@ -66,6 +66,11 @@ type Config struct {
 	// catches a delivery queue that is making slow progress but can never return to
 	// real time; zero disables the safeguard.
 	ContinuousMaxMediaLag time.Duration
+	// FrozenHLSQuiescenceAllowlist is a comma-separated list of exact
+	// "worker-id/recording-id" pairs. Empty is structurally disabled. The policy
+	// only suppresses repeated FFmpeg launches after a bounded frozen-playlist
+	// proof; it never suppresses or acknowledges media.
+	FrozenHLSQuiescenceAllowlist string
 	// CaptureTempDir owns relay capture attempts outside the OS-wide temporary
 	// directory. Empty preserves the cloud worker's existing behavior.
 	CaptureTempDir string
@@ -83,19 +88,29 @@ type Config struct {
 }
 
 type Worker struct {
-	cfg               Config
-	heartbeatInt      time.Duration
-	leaseSafetyMargin time.Duration
-	reconnectDelay    func(int64, int) time.Duration
-	lastDiskPauseLog  time.Time
-	lastDiskErrorLog  atomic.Int64
+	cfg                     Config
+	heartbeatInt            time.Duration
+	leaseSafetyMargin       time.Duration
+	reconnectDelay          func(int64, int) time.Duration
+	lastDiskPauseLog        time.Time
+	lastDiskErrorLog        atomic.Int64
+	frozenHLSAllowlist      frozenHLSAllowlist
+	frozenHLSObserve        frozenHLSObserveFunc
+	frozenHLSObserveCurrent frozenHLSObserveCurrentFunc
+	frozenHLSPollMax        time.Duration
+	frozenHLSForceCapture   time.Duration
+	frozenHLSSafetyInterval time.Duration
+	frozenHLSWait           func(context.Context, time.Duration) error
+	frozenHLSProofSpan      func(time.Duration) time.Duration
+	continuousCapture       continuousCaptureFunc
 }
 
 var (
-	errSegmentDelivery          = errors.New("segment delivery failed")
-	errPermanentSegmentDelivery = errors.New("permanent segment delivery failure")
-	errSegmentDeliveryExhausted = errors.New("segment delivery retry budget exhausted")
-	errReplaySegmentDelivery    = errors.New("segment delivery must reserve again")
+	errSegmentDelivery           = errors.New("segment delivery failed")
+	errPermanentSegmentDelivery  = errors.New("permanent segment delivery failure")
+	errSegmentDeliveryExhausted  = errors.New("segment delivery retry budget exhausted")
+	errReplaySegmentDelivery     = errors.New("segment delivery must reserve again")
+	errSegmentReplayAcknowledged = errors.New("segment replay already ingested")
 )
 
 // defaultUploadWorkers is the per-job segment upload concurrency used when
@@ -140,11 +155,20 @@ func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.UploadWorkers <= 0 {
 		cfg.UploadWorkers = defaultUploadWorkers
 	}
+	frozenHLSAllowlist, err := parseFrozenHLSAllowlist(cfg.FrozenHLSQuiescenceAllowlist)
+	if err != nil {
+		return nil, err
+	}
 	return &Worker{
-		cfg:               cfg,
-		heartbeatInt:      time.Duration(cfg.HeartbeatSec) * time.Second,
-		leaseSafetyMargin: 5 * time.Second,
-		reconnectDelay:    reconnectBackoff,
+		cfg:                     cfg,
+		heartbeatInt:            time.Duration(cfg.HeartbeatSec) * time.Second,
+		leaseSafetyMargin:       5 * time.Second,
+		reconnectDelay:          reconnectBackoff,
+		frozenHLSAllowlist:      frozenHLSAllowlist,
+		frozenHLSObserve:        observeFrozenHLS,
+		frozenHLSPollMax:        30 * time.Second,
+		frozenHLSForceCapture:   frozenHLSForcedCaptureMax,
+		frozenHLSSafetyInterval: time.Second,
 	}, nil
 }
 
@@ -489,6 +513,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		segStartMs := seg.StartAt.UTC().UnixMilli()
 		segmentCtx, segmentCancel := continuousSegmentDeliveryContext(jobCtx, job.WindowEndAt, time.Now())
 		defer segmentCancel()
+		alreadyIngested := false
 		err := deliverSegmentWithRetry(segmentCtx, segmentDeliveryRetryDelay, func() bool {
 			return w.diskHasSpace(w.cfg.MinActiveFreeBytes)
 		}, segmentDeliveryOps{
@@ -547,12 +572,20 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				}
 				return nil
 			},
+			AlreadyIngested: func() { alreadyIngested = true },
 		}, func(err error) {
 			w.cfg.RelayDiagnostics.DeliveryRetry(job.JobID)
 			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_delivery_retry", err)
 			log.Printf("recording worker job=%d recording=%d segment delivery failed: %v; retrying in %s",
 				job.JobID, job.RecordingID, err, segmentDeliveryRetryDelay)
 		})
+		if alreadyIngested {
+			// A different lease generation may have ingested this exact byte run.
+			// Acknowledge and remove only this local replay, but do not move the
+			// no-progress clock or claim a new unique ingest.
+			capture.RemoveSegmentFile(seg)
+			return errSegmentReplayAcknowledged
+		}
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) && jobCtx.Err() == nil {
 				return fmt.Errorf("%w: %v", errSegmentDeliveryExhausted, err)
@@ -580,6 +613,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// worker. The sleep stays interruptible by windowCtx.Done() (window close / job
 	// cancel) just like a fixed delay.
 	failures := 0
+	var frozenHLSState frozenHLSJobState
 	backoff := func(delay time.Duration) {
 		select {
 		case <-windowCtx.Done():
@@ -723,7 +757,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			return nil
 		}
-		captureContinuous := continuousCaptureForJob(job)
+		captureContinuous := w.continuousCapture
+		if captureContinuous == nil {
+			captureContinuous = continuousCaptureForJob(job)
+		}
 		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
@@ -763,6 +800,46 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", captureErr)
 			w.fail(ctx, job.JobID, job.LeaseToken, captureErr)
 			return
+		}
+		if delivery.ingested {
+			// Any new unique media invalidates the frozen-live-edge baseline. A later
+			// no-output episode must earn a fresh three-observation classification.
+			frozenHLSState = frozenHLSJobState{}
+		}
+		if frozenHLSCanObserve(windowClosed, delivery.err, segmentDeliveryPending, captureErr) {
+			ffmpegExitAt := time.Now()
+			forcedLaunchDeadline := ffmpegExitAt.Add(min(w.frozenHLSForceCapture, frozenHLSForcedCaptureMax))
+			if !frozenHLSState.classified {
+				// The first classification may not extend the existing no-unique-
+				// ingest handoff boundary. A late FFmpeg output-growth stall must
+				// fail open to the ordinary surrender path when three separated
+				// observations no longer fit. Already-classified cycles use the
+				// fresh per-cycle forced-launch ceiling while retaining the lease.
+				forcedLaunchDeadline = frozenHLSInitialDeadline(
+					ffmpegExitAt, progress.last(), w.frozenHLSForceCapture, w.cfg.ContinuousNoProgressTimeout,
+				)
+			}
+			cycleResult, observeErr := w.handleFrozenHLSCycle(
+				windowCtx, job, resolved, inputHeaders, &frozenHLSState, forcedLaunchDeadline,
+			)
+			switch {
+			case errors.Is(observeErr, errDiskPressure):
+				w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderDiskPressure, errDiskPressure)
+				return
+			case errors.Is(observeErr, errFrozenHLSSelfUpdate):
+				w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, observeErr)
+				return
+			case observeErr != nil && windowCtx.Err() != nil:
+				windowClosed = true
+			case cycleResult == frozenHLSCycleResumeCapture:
+				// A changed/ambiguous observation or the absolute five-minute
+				// forced-launch ceiling resumes at the top of the ordinary loop.
+				// Persisted classified state prevents the stale unique-progress
+				// clock from causing an immediate lease surrender on the next
+				// unchanged no-output cycle.
+				failures = 0
+				continue
+			}
 		}
 		// Window close vs premature drop: CaptureContinuous returns nil on ctx.Done,
 		// so windowCtx.Err() (NOT captureErr) is what distinguishes a real window
@@ -910,9 +987,10 @@ func waitForContinuousTimeline(ctx context.Context, endAt time.Time, now func() 
 }
 
 type segmentDeliveryOps struct {
-	Reserve func() (recordingapi.ClipUploadIntent, error)
-	Upload  func(recordingapi.ClipUploadIntent) error
-	Ingest  func(recordingapi.ClipUploadIntent) error
+	Reserve         func() (recordingapi.ClipUploadIntent, error)
+	Upload          func(recordingapi.ClipUploadIntent) error
+	Ingest          func(recordingapi.ClipUploadIntent) error
+	AlreadyIngested func()
 }
 
 func deliverReservedClip(intent recordingapi.ClipUploadIntent, upload, ingest func() error) error {
@@ -940,6 +1018,9 @@ func deliverSegmentWithRetry(ctx context.Context, retryDelay time.Duration, disk
 			intent = &reserved
 		}
 		if intent.AlreadyIngested {
+			if ops.AlreadyIngested != nil {
+				ops.AlreadyIngested()
+			}
 			return nil
 		}
 		// Presigned PUT URLs are shorter-lived than the storage-outage retry
@@ -959,6 +1040,9 @@ func deliverSegmentWithRetry(ctx context.Context, retryDelay time.Duration, disk
 		}
 		if err := ops.Ingest(*intent); err != nil {
 			if isAlreadyIngested(err) {
+				if ops.AlreadyIngested != nil {
+					ops.AlreadyIngested()
+				}
 				return nil
 			}
 			if retryableTransportError(ctx, err) || isUploadIntentStateConflict(err) {
@@ -1190,6 +1274,11 @@ func shouldCleanupContinuousAttempt(deliveryPending bool, captureErr error, medi
 		errors.Is(captureErr, errDiskPressure) ||
 		errors.Is(captureErr, errPermanentSegmentDelivery) ||
 		errors.Is(captureErr, errSegmentDeliveryExhausted)
+}
+
+func frozenHLSCanObserve(windowClosed bool, deliveryErr error, deliveryPending bool, captureErr error) bool {
+	return !windowClosed && deliveryErr == nil && !deliveryPending &&
+		capture.IsCleanContinuousNoOutput(captureErr)
 }
 
 func (w *Worker) ensureCaptureTempDir() error {

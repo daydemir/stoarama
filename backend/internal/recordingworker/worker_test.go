@@ -245,7 +245,7 @@ func TestSegmentDeliveryRefreshesExpiringUploadIntent(t *testing.T) {
 }
 
 func TestSegmentDeliverySkipsConsumedReplay(t *testing.T) {
-	var uploadCalls, ingestCalls int
+	var uploadCalls, ingestCalls, replayCalls int
 	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{
 		Reserve: func() (recordingapi.ClipUploadIntent, error) {
 			return recordingapi.ClipUploadIntent{IntentID: "intent-1", AlreadyIngested: true}, nil
@@ -258,12 +258,13 @@ func TestSegmentDeliverySkipsConsumedReplay(t *testing.T) {
 			ingestCalls++
 			return nil
 		},
+		AlreadyIngested: func() { replayCalls++ },
 	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if uploadCalls != 0 || ingestCalls != 0 {
-		t.Fatalf("consumed replay uploaded=%d ingested=%d", uploadCalls, ingestCalls)
+	if uploadCalls != 0 || ingestCalls != 0 || replayCalls != 1 {
+		t.Fatalf("consumed replay uploaded=%d ingested=%d replay=%d", uploadCalls, ingestCalls, replayCalls)
 	}
 }
 
@@ -283,7 +284,7 @@ func TestClipDeliverySkipsConsumedReplay(t *testing.T) {
 }
 
 func TestSegmentDeliveryRereservesAfterCommittedIngestResponseLoss(t *testing.T) {
-	var reserveCalls, uploadCalls, ingestCalls int
+	var reserveCalls, uploadCalls, ingestCalls, replayCalls int
 	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{
 		Reserve: func() (recordingapi.ClipUploadIntent, error) {
 			reserveCalls++
@@ -304,12 +305,50 @@ func TestSegmentDeliveryRereservesAfterCommittedIngestResponseLoss(t *testing.T)
 				Body:  `{"code":"recording_upload_intent_unavailable","error":"upload intent not found, already consumed, or job not owned"}`,
 			}
 		},
+		AlreadyIngested: func() { replayCalls++ },
 	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserveCalls != 2 || uploadCalls != 1 || ingestCalls != 1 {
-		t.Fatalf("reserve=%d upload=%d ingest=%d", reserveCalls, uploadCalls, ingestCalls)
+	if reserveCalls != 2 || uploadCalls != 1 || ingestCalls != 1 || replayCalls != 1 {
+		t.Fatalf("reserve=%d upload=%d ingest=%d replay=%d", reserveCalls, uploadCalls, ingestCalls, replayCalls)
+	}
+}
+
+func TestSegmentDeliveryPoolReplayAcknowledgesWithoutUniqueProgress(t *testing.T) {
+	pool := startSegmentDeliveryPool(1, nil, func(capture.Segment) error {
+		return errSegmentReplayAcknowledged
+	})
+	if err := pool.Submit(capture.Segment{SHA256: strings.Repeat("a", 64)}); err != nil {
+		t.Fatal(err)
+	}
+	result := pool.close()
+	if result.err != nil || result.pending != 0 || result.submitted != 1 {
+		t.Fatalf("replay result=%+v", result)
+	}
+	if result.ingested {
+		t.Fatal("already-ingested replay reset the unique-media progress signal")
+	}
+}
+
+func TestSegmentDeliveryPoolMixedReplayAndUniqueReportsUniqueProgress(t *testing.T) {
+	pool := startSegmentDeliveryPool(1, nil, func(seg capture.Segment) error {
+		if seg.SHA256 == strings.Repeat("a", 64) {
+			return errSegmentReplayAcknowledged
+		}
+		return nil
+	})
+	for _, sha := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
+		if err := pool.Submit(capture.Segment{SHA256: sha}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := pool.close()
+	if result.err != nil || result.pending != 0 || result.submitted != 2 {
+		t.Fatalf("mixed result=%+v", result)
+	}
+	if !result.ingested {
+		t.Fatal("unique ingest was lost when the same attempt also acknowledged a replay")
 	}
 }
 
