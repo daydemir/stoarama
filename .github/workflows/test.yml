@@ -130,6 +130,39 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api ./internal/db -run 'Test(RecordingCanarySpecRefusesProductionAndAllowsIdleRelay|RecordingCanaryCompletion|RecordingCanaryPreopenMigration)' -count=1
+      - name: Test audited relay quarantine serialization and permanent fencing
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          go test -json ./internal/api ./internal/db ./cmd/stoaramactl -run 'Test(RelayNodeQuarantine|MigrationNumbersAreUniqueIncludingReservedRelaySequence|NodesQuarantineCLIUsesTypedAdminAPIKeyAcrossTenants)' -count=1 | tee "$output"
+          python3 - "$output" <<'PY'
+          import json, sys
+          expected = {
+              "TestRelayNodeQuarantinePersistsExactReplayAndPermanentlyFencesNode",
+              "TestRelayNodeQuarantineAuthWorkAndCapacityFailClosed",
+              "TestRelayNodeQuarantineAPIKeyActorIsTypedAndCrossTenant",
+              "TestRelayNodeQuarantineRequestIsSingleAndCanonical",
+              "TestRelayNodeQuarantineRejectsHandoffReservationAndInsufficientCapacity",
+              "TestRelayNodeQuarantineSerializesWithClaimInBothCommitOrders",
+              "TestRelayNodeQuarantineSerializesWithCanaryInBothCommitOrders",
+              "TestRelayNodeQuarantineMigrationIsPermanentAndAppendOnly",
+              "TestMigrationNumbersAreUniqueIncludingReservedRelaySequence",
+              "TestNodesQuarantineCLIUsesTypedAdminAPIKeyAcrossTenants",
+          }
+          runs, passes, skips = set(), set(), set()
+          for line in open(sys.argv[1], encoding="utf-8"):
+              event = json.loads(line)
+              test = event.get("Test", "")
+              if "/" not in test and event.get("Action") == "run": runs.add(test)
+              if "/" not in test and event.get("Action") == "pass": passes.add(test)
+              if event.get("Action") == "skip": skips.add(test or event.get("Package", "package"))
+              if "no tests to run" in event.get("Output", ""): skips.add("no tests to run")
+          if runs != expected or passes != expected or skips:
+              raise SystemExit(f"quarantine PG proof failed: runs={sorted(runs)} passes={sorted(passes)} skips={sorted(skips)} expected={sorted(expected)}")
+          PY
       - name: Test transient ledger retention boundaries
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

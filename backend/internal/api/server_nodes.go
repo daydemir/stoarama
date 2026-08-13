@@ -485,6 +485,13 @@ func (s *Server) handleAccountNodePatch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if quarantined, qerr := relayNodeIsQuarantined(r.Context(), tx, id); qerr != nil {
+		util.WriteError(w, http.StatusInternalServerError, "check relay node quarantine")
+		return
+	} else if quarantined {
+		util.WriteError(w, http.StatusConflict, "quarantined relay node requires typed release")
+		return
+	}
 
 	ct, err := tx.Exec(r.Context(), `
 		UPDATE nodes
@@ -553,6 +560,13 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 		return
 	} else if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock node: %v", err))
+		return
+	}
+	if quarantined, qerr := relayNodeIsQuarantined(r.Context(), tx, id); qerr != nil {
+		util.WriteError(w, http.StatusInternalServerError, "check relay node quarantine")
+		return
+	} else if quarantined {
+		util.WriteError(w, http.StatusConflict, "quarantined relay node requires typed release")
 		return
 	}
 	if !relayGroupChangeAllowed(relayGroupID, nil, liveLeases) {
