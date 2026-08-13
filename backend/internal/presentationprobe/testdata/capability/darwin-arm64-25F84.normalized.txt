@@ -1,0 +1,1 @@
+seatbelt:sandbox=0;media_pread=5;media_seek=0;preopened_outside_pread=7;new_outside_errno=1|memory:rlimit_as_errno=22;rlimit_data_errno=22;malloc_touch=268435456;mmap_touch=268435456
