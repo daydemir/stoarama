@@ -169,6 +169,7 @@ func usage() {
 	  stoaramactl nodes relay-groups assign --id N --node-id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl nodes relay-groups unassign --node-id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl nodes relay-groups delete --id N [--backend-api-url URL --api-token TOKEN]
+	  stoaramactl nodes quarantine --node-id N --expected-account-id N --expected-relay-group-id N --expected-relay-max-streams N --expected-relay-version V --expected-source-revision SHA --expected-relay-started-at RFC3339 --expected-heartbeat-at RFC3339 --reason-code CODE --evidence-sha256 SHA --idempotency-key UUID [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines overview [--backend-api-url URL --api-token TOKEN --include-inactive=true]
 	  stoaramactl pipelines stream-list --id N [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl pipelines set --stream-id N --pipeline-id P --enabled=true|false [--updated-by stoaramactl --backend-api-url URL --api-token TOKEN]

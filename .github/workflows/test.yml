@@ -130,6 +130,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api ./internal/db -run 'Test(RecordingCanarySpecRefusesProductionAndAllowsIdleRelay|RecordingCanaryCompletion|RecordingCanaryPreopenMigration)' -count=1
+      - name: Test audited relay quarantine serialization and permanent fencing
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api ./internal/db -run 'Test(RelayNodeQuarantine|MigrationNumbersAreUniqueIncludingReservedRelaySequence)' -count=1 -v
       - name: Test transient ledger retention boundaries
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

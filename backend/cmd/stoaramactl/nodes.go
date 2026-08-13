@@ -15,7 +15,7 @@ import (
 
 func runNodes(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Print("stoaramactl nodes enrollment-token create ...\nstoaramactl nodes relay-groups list|create|update|assign|unassign|delete ...\n")
+		fmt.Print("stoaramactl nodes enrollment-token create ...\nstoaramactl nodes relay-groups list|create|update|assign|unassign|delete ...\nstoaramactl nodes quarantine ...\n")
 		return
 	}
 	if len(args) < 1 {
@@ -27,9 +27,41 @@ func runNodes(ctx context.Context, cfg config.Config, args []string) {
 		runNodesEnrollmentToken(ctx, cfg, args[1:])
 	case "relay-groups":
 		runNodesRelayGroups(ctx, cfg, args[1:])
+	case "quarantine":
+		runNodesQuarantine(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown nodes subcommand: %s", args[0])
 	}
+}
+
+func runNodesQuarantine(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("nodes quarantine", flag.ExitOnError)
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "operator API token")
+	nodeID := fs.Int64("node-id", 0, "exact relay node id")
+	accountID := fs.Int64("expected-account-id", 0, "expected account id")
+	groupID := fs.Int64("expected-relay-group-id", 0, "expected relay group id")
+	cap := fs.Int("expected-relay-max-streams", 0, "expected node stream cap")
+	status := fs.String("expected-status", "active", "expected node status")
+	version := fs.String("expected-relay-version", "", "expected relay version")
+	revision := fs.String("expected-source-revision", "", "expected source revision")
+	started := fs.String("expected-relay-started-at", "", "expected relay start RFC3339")
+	heartbeat := fs.String("expected-heartbeat-at", "", "expected heartbeat RFC3339")
+	reason := fs.String("reason-code", "", "allowlisted quarantine reason")
+	evidence := fs.String("evidence-sha256", "", "lowercase evidence digest")
+	idempotency := fs.String("idempotency-key", "", "show-once operation UUID")
+	_ = fs.Parse(args)
+	if fs.NArg() != 0 || *nodeID <= 0 || *accountID <= 0 || *groupID <= 0 || *cap <= 0 || strings.TrimSpace(*version) == "" || strings.TrimSpace(*revision) == "" || strings.TrimSpace(*started) == "" || strings.TrimSpace(*heartbeat) == "" || strings.TrimSpace(*reason) == "" || strings.TrimSpace(*evidence) == "" || strings.TrimSpace(*idempotency) == "" {
+		log.Fatal("nodes quarantine requires exact node/account/group/cap/runtime/timestamps/reason/evidence/idempotency fields")
+	}
+	payload := map[string]any{
+		"idempotency_key": strings.TrimSpace(*idempotency), "expected_account_id": *accountID,
+		"expected_relay_group_id": *groupID, "expected_relay_max_streams": *cap, "expected_status": strings.TrimSpace(*status),
+		"expected_relay_version": strings.TrimSpace(*version), "expected_source_revision": strings.TrimSpace(*revision),
+		"expected_relay_started_at": strings.TrimSpace(*started), "expected_heartbeat_at": strings.TrimSpace(*heartbeat),
+		"reason_code": strings.TrimSpace(*reason), "evidence_sha256": strings.TrimSpace(*evidence),
+	}
+	printJSON(mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/admin/relay-nodes/"+strconv.FormatInt(*nodeID, 10)+"/quarantine", payload))
 }
 
 func runNodesRelayGroups(ctx context.Context, cfg config.Config, args []string) {
