@@ -186,7 +186,9 @@ chmod +x "$fake_bin/"*
 cat >"$fake_bin/python3" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == *verify_pr_workflow.py ]]; then
+if [[ "${1:-}" == -I && "${2:-}" == *verify_pr_workflow.py ]]; then
+  [[ -z "${AWS_ACCESS_KEY_ID:-}${DATABASE_URL:-}${STOARAMA_TEST_DATABASE_URL:-}${RUNNER_START_SECRET:-}" ]] || exit 78
+  [[ "${PYTHONNOUSERSITE:-}" == 1 && "${PYTHONDONTWRITEBYTECODE:-}" == 1 ]] || exit 77
   exec /usr/bin/python3 "$@"
 fi
 [[ "${1:-}" == -m && "${2:-}" == unittest ]] || exit 88
@@ -217,7 +219,8 @@ run_verify() {
     cd "$repo"
     env -u DATABASE_URL -u STOARAMA_TEST_DATABASE_URL \
       PATH="$fake_bin:$PATH" HOME="$real_home" FAKE_LOG="$fake_log" FAKE_DOCKER_SOCKET="$socket_path" \
-      FAKE_STATE_DIR="$test_root/fake-state" FAKE_AMBIENT_REPO="$repo" "$@"
+      FAKE_STATE_DIR="$test_root/fake-state" FAKE_AMBIENT_REPO="$repo" \
+      AWS_ACCESS_KEY_ID=forbidden RUNNER_START_SECRET=forbidden "$@"
   )
 }
 touch "$real_home/real-home-sentinel"
@@ -373,6 +376,12 @@ for mutation in \
   sed -E "$mutation" "$repo/.github/workflows/test.yml" >"$bad_workflow"
   if /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" --workflow "$bad_workflow" --check >/dev/null 2>&1; then
     fail "mutated backend job envelope was accepted"
+  fi
+done
+for appended in '    if: false' '    continue-on-error: true'; do
+  printf '%s\n%s\n' "$(cat "$repo/.github/workflows/test.yml")" "$appended" >"$bad_workflow"
+  if /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" --workflow "$bad_workflow" --check >/dev/null 2>&1; then
+    fail "post-step backend control was accepted"
   fi
 done
 perl -0pe 's/TestLockOrganizationPlazaIDsAcceptsIntegerAccountID/TestRecordingQualificationMigrationFreezesCompleteCohort/' \

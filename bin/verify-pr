@@ -256,9 +256,10 @@ for _ in {1..60}; do
 done
 [[ "$ready" -eq 1 ]] || die "disposable PostgreSQL 17 did not become ready within 60 seconds"
 
-HOME="$sanitized_home" GOCACHE="$safe_gocache" GOMODCACHE="$safe_gomodcache" GOPATH="$safe_gopath" \
-  TMPDIR="$scratch_root" STOARAMA_VERIFY_ACTIVE_PGID_FILE="$runner_pgid_file" \
-  python3 "$snapshot_root/bin/verify_pr_workflow.py" \
+env -i PATH="$PATH" HOME="$sanitized_home" GOCACHE="$safe_gocache" GOMODCACHE="$safe_gomodcache" \
+  GOPATH="$safe_gopath" TMPDIR="$scratch_root" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 STOARAMA_VERIFY_ACTIVE_PGID_FILE="$runner_pgid_file" \
+  python3 -I "$snapshot_root/bin/verify_pr_workflow.py" \
   --root "$snapshot_root" \
   --workflow "$snapshot_root/.github/workflows/test.yml" \
   --database-url "$test_database_url" &

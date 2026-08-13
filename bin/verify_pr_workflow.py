@@ -43,7 +43,7 @@ FROZEN_COMMANDS = (
     ("Vet", "vet"),
 )
 FROZEN_COMMAND_SHA256 = "066c7696d36a862c178df1fa9b3a5188c987f539f990c12cdb90b3a50aa0b6e8"
-FROZEN_BACKEND_ENVELOPE_SHA256 = "ed8e14df9e4e62d7b796b99b480db16068baf9909a09b23e8807e9aabefedca3"
+FROZEN_BACKEND_JOB_SHA256 = "7c175b05b8f9522c131b721cde7465c5a8b4d212e66a5b9133a65a02b433318e"
 
 
 class WorkflowError(RuntimeError):
@@ -73,13 +73,17 @@ def parse_workflow(path: pathlib.Path) -> list[dict[str, object]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     import hashlib
     try:
-        envelope_start = lines.index("  backend:")
-        envelope_end = lines.index("      - name: Test PostgreSQL type boundaries")
+        job_start = lines.index("  backend:")
     except ValueError as exc:
-        raise WorkflowError("workflow lacks the frozen backend job envelope") from exc
-    envelope = ("\n".join(lines[envelope_start:envelope_end]) + "\n").encode()
-    if hashlib.sha256(envelope).hexdigest() != FROZEN_BACKEND_ENVELOPE_SHA256:
-        raise WorkflowError("jobs.backend runner/services/defaults/actions differ from the frozen envelope")
+        raise WorkflowError("workflow lacks the frozen backend job") from exc
+    job_end = len(lines)
+    for index in range(job_start + 1, len(lines)):
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:\s*", lines[index]):
+            job_end = index
+            break
+    job_bytes = ("\n".join(lines[job_start:job_end]) + "\n").encode()
+    if hashlib.sha256(job_bytes).hexdigest() != FROZEN_BACKEND_JOB_SHA256:
+        raise WorkflowError("the complete jobs.backend definition differs from the frozen gate")
     seen_jobs = False
     seen_backend = False
     seen_defaults = False
