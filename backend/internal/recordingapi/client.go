@@ -349,8 +349,29 @@ func leaseTokenHeaders(token string) map[string]string {
 // failed-node detection on last_seen_at rather than on DO power-on. For a manual
 // node with no managed droplet row the server update is a harmless no-op.
 func (c *Client) TouchDroplet(ctx context.Context, buildSHA string) error {
+	return c.TouchDropletFacts(ctx, buildSHA, nil)
+}
+
+// DropletRolloutFacts are bounded raw observations derived from the running
+// executable, effective worker flags, and host firewall state. They contain no
+// caller-selected digest and no credential-bearing data.
+type DropletRolloutFacts struct {
+	ExecutableBuildSHA string `json:"executable_build_sha"`
+	Capacity           int    `json:"capacity"`
+	HeartbeatSec       int    `json:"heartbeat_sec"`
+	PollSec            int    `json:"poll_sec"`
+	BackendAPIURL      string `json:"backend_api_origin"`
+	HostFirewallScript string `json:"host_firewall_script"`
+	KernelPolicy       string `json:"kernel_firewall_policy"`
+}
+
+// TouchDropletFacts preserves the legacy build_sha alias while optionally
+// submitting one typed raw observation. A missing observation keeps liveness
+// working but can never make a rollout standby ready.
+func (c *Client) TouchDropletFacts(ctx context.Context, buildSHA string, facts *DropletRolloutFacts) error {
 	return c.postJSON(ctx, "/api/v1/recording/droplets/heartbeat", map[string]any{
-		"build_sha": strings.ToLower(strings.TrimSpace(buildSHA)),
+		"build_sha":     strings.ToLower(strings.TrimSpace(buildSHA)),
+		"rollout_facts": facts,
 	}, nil)
 }
 

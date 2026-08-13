@@ -3,6 +3,7 @@ package dropletpool
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -441,6 +442,25 @@ func (f *fakeDOClient) ListDropletsByName(_ context.Context, _, prefix string) (
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeDOClient) InspectRollout(context.Context, string, string, string) (RolloutProviderFacts, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := make([]int64, 0, len(f.fleet))
+	objects := make([]DODroplet, 0, len(f.fleet))
+	for _, d := range f.fleet {
+		ids = append(ids, d.ID)
+		d.Region = "nyc1"
+		d.Size = "s-2vcpu-4gb"
+		d.ProjectMember = true
+		if len(d.Tags) == 0 {
+			d.Tags = []string{recorderFirewallTag}
+		}
+		objects = append(objects, d)
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].ID < objects[j].ID })
+	return RolloutProviderFacts{AccountDropletLimit: 25, AccountDropletCount: len(f.fleet) + 2, PoolDropletIDs: ids, PoolDroplets: objects, NonPoolDropletIDs: []int64{9001, 9002}, NonPoolDroplets: []DODroplet{{ID: 9001, Name: "other-one", Region: "nyc1", Size: "s-1vcpu-1gb", Status: "active"}, {ID: 9002, Name: "other-two", Region: "nyc1", Size: "s-1vcpu-1gb", Status: "active"}}, FirewallStatus: "succeeded", FirewallTags: []string{recorderFirewallTag}}, nil
 }
 
 // Ensure the fake satisfies the production interface at compile time.

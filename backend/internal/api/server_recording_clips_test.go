@@ -46,7 +46,7 @@ const testRecordingCanaryReservationsTableDDL = `CREATE TABLE recording_canary_r
 )`
 
 func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
-	for _, want := range []string{"node_id = $2", "state IN ('provisioning', 'active')", "FOR UPDATE"} {
+	for _, want := range []string{"node_id = $2", "state='active'", "lease_admission_enabled", "FOR UPDATE"} {
 		if !strings.Contains(cloudRecorderLockSQL, want) {
 			t.Fatalf("droplet lock SQL missing %q", want)
 		}

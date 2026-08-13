@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
@@ -408,9 +409,11 @@ func lockRelayNodeAndGroup(ctx context.Context, tx pgx.Tx, principal nodePrincip
 const cloudRecorderLockSQL = `
 	SELECT capacity
 	FROM recorder_droplets
-	WHERE name = $1 AND node_id = $2 AND state IN ('provisioning', 'active')
+	WHERE name = $1 AND node_id = $2 AND state='active' AND lease_admission_enabled
 	FOR UPDATE
 `
+
+const cloudRecorderPoolSharedFenceSQL = `SELECT pg_advisory_xact_lock_shared(hashtextextended('stoarama-recorder-pool-rollout-v1',0))`
 
 // Managed cloud recorders are operator-owned shared infrastructure and
 // intentionally lease jobs across customer accounts. Storage credentials stay
@@ -501,7 +504,10 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		} else {
 			defer func() { _ = tx.Rollback(r.Context()) }()
 			var capacity int
-			err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
+			_, err = tx.Exec(r.Context(), cloudRecorderPoolSharedFenceSQL)
+			if err == nil {
+				err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
+			}
 			if err == nil {
 				err = tx.QueryRow(r.Context(), cloudRecordingJobsLeaseSQL,
 					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported).Scan(
@@ -536,6 +542,41 @@ func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, node
 		WHERE name=$1 AND node_id=$2
 	`, workerID, nodeID, buildSHA)
 	return err
+}
+
+func (s *Server) recordDropletRolloutObservation(ctx context.Context, workerID string, nodeID int64, facts recordingapi.DropletRolloutFacts) error {
+	validated, err := dropletpool.ValidateWorkerRolloutFacts(dropletpool.WorkerRolloutFacts{
+		ExecutableBuildSHA: facts.ExecutableBuildSHA,
+		Capacity:           facts.Capacity,
+		HeartbeatSec:       facts.HeartbeatSec,
+		PollSec:            facts.PollSec,
+		BackendAPIURL:      facts.BackendAPIURL,
+		HostFirewallScript: facts.HostFirewallScript,
+		KernelPolicy:       facts.KernelPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var dropletID int64
+	if err = tx.QueryRow(ctx, `SELECT id FROM recorder_droplets WHERE name=$1 AND node_id=$2 FOR UPDATE`, workerID, nodeID).Scan(&dropletID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=now(),build_sha=$3,first_seen_at=COALESCE(first_seen_at,now()),activated_at=COALESCE(activated_at,CASE WHEN state='active' THEN now() END) WHERE id=$1 AND node_id=$2`, dropletID, nodeID, validated.ExecutableBuildSHA); err != nil {
+		return err
+	}
+	// Identical facts are intentionally appended on each managed heartbeat. The
+	// immutable digest proves semantic equality, while observed_at proves current
+	// possession of the exact running/host state; deduplicating by digest would
+	// make an unchanged healthy worker go stale after ninety seconds.
+	if _, err = tx.Exec(ctx, `INSERT INTO recorder_worker_rollout_observations(droplet_id,node_id,worker_id,executable_build_sha,capacity,heartbeat_sec,poll_sec,backend_api_origin,host_firewall_script_sha256,kernel_firewall_policy_sha256,observation_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, dropletID, nodeID, workerID, validated.ExecutableBuildSHA, validated.Capacity, validated.HeartbeatSec, validated.PollSec, validated.BackendAPIURL, validated.HostFirewallScriptSHA256, validated.KernelFirewallPolicySHA256, validated.ObservationSHA256); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 type recordingUploadIntentRequest struct {
@@ -1420,7 +1461,8 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 		return
 	}
 	var req struct {
-		BuildSHA string `json:"build_sha"`
+		BuildSHA     string                            `json:"build_sha"`
+		RolloutFacts *recordingapi.DropletRolloutFacts `json:"rollout_facts"`
 	}
 	if err := util.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -1429,6 +1471,18 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 	req.BuildSHA = strings.ToLower(strings.TrimSpace(req.BuildSHA))
 	if req.BuildSHA != "" && !regexp.MustCompile(`^[0-9a-f]{40,64}$`).MatchString(req.BuildSHA) {
 		util.WriteError(w, http.StatusBadRequest, "build_sha must be a 40-64 character lowercase hex commit")
+		return
+	}
+	if req.RolloutFacts != nil {
+		if req.BuildSHA != "" && req.BuildSHA != strings.ToLower(strings.TrimSpace(req.RolloutFacts.ExecutableBuildSHA)) {
+			util.WriteError(w, http.StatusBadRequest, "legacy build alias differs from executable observation")
+			return
+		}
+		if err := s.recordDropletRolloutObservation(r.Context(), workerID, principal.NodeID, *req.RolloutFacts); err != nil {
+			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid rollout observation: %v", err))
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
 	if err := s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, req.BuildSHA); err != nil {

@@ -13,10 +13,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	mathrand "math/rand/v2"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -52,16 +54,39 @@ type CreateDropletInput struct {
 	UserData   string
 	ProjectID  string
 	FirewallID string
-	Tags       []string // optional; when empty the default recorder-pool dropletTags are applied
+	// FirewallByTag means the already-verified firewall targets the immutable
+	// recorder pool tag. In that mode attaching the tag in Droplets.Create is
+	// the firewall admission; adding an explicit droplet id would make the
+	// provider object drift from its reviewed semantic shape.
+	FirewallByTag bool
+	Tags          []string // optional; when empty the default recorder-pool dropletTags are applied
 }
 
 // DODroplet is the minimal view of a DigitalOcean droplet the controller needs.
 type DODroplet struct {
-	ID        int64
-	Name      string
-	IP        string
-	Status    string
-	CreatedAt time.Time // DO droplet creation instant (zero if unknown)
+	ID            int64
+	Name          string
+	IP            string
+	Status        string
+	Region        string
+	Size          string
+	ProjectMember bool
+	CreatedAt     time.Time // DO droplet creation instant (zero if unknown)
+	Tags          []string
+}
+
+type RolloutProviderFacts struct {
+	AccountDropletLimit int
+	AccountDropletCount int
+	PoolDropletIDs      []int64
+	PoolDroplets        []DODroplet
+	NonPoolDropletIDs   []int64
+	NonPoolDroplets     []DODroplet
+	FirewallID          string
+	FirewallStatus      string
+	FirewallTags        []string
+	FirewallDropletIDs  []int64
+	FirewallRulesSHA256 string
 }
 
 // DOClient is the narrow DigitalOcean surface the controller depends on. The
@@ -77,6 +102,152 @@ type DOClient interface {
 	// ListDropletsByName returns every droplet in the configured project whose
 	// name starts with prefix.
 	ListDropletsByName(ctx context.Context, projectID, prefix string) ([]DODroplet, error)
+	InspectRollout(ctx context.Context, projectID, firewallID, poolTag string) (RolloutProviderFacts, error)
+}
+
+func (g *godoClient) InspectRollout(ctx context.Context, projectID, firewallID, poolTag string) (RolloutProviderFacts, error) {
+	account, _, err := g.c.Account.Get(ctx)
+	if err != nil {
+		return RolloutProviderFacts{}, fmt.Errorf("read DO account: %w", err)
+	}
+	all := make([]godo.Droplet, 0, 32)
+	for opt := (&godo.ListOptions{Page: 1, PerPage: 200}); ; {
+		page, resp, listErr := listDropletsPageWithRetry(ctx, g.c, opt, time.Second)
+		if listErr != nil {
+			return RolloutProviderFacts{}, fmt.Errorf("list DO account droplets: %w", listErr)
+		}
+		all = append(all, page...)
+		if resp == nil || resp.Links == nil || resp.Links.IsLastPage() {
+			break
+		}
+		current, pageErr := resp.Links.CurrentPage()
+		if pageErr != nil {
+			return RolloutProviderFacts{}, fmt.Errorf("paginate DO account droplets: %w", pageErr)
+		}
+		opt.Page = current + 1
+	}
+	resources := make([]godo.ProjectResource, 0, 32)
+	for opt := (&godo.ListOptions{Page: 1, PerPage: 200}); ; {
+		page, resp, listErr := g.c.Projects.ListResources(ctx, strings.TrimSpace(projectID), opt)
+		if listErr != nil {
+			return RolloutProviderFacts{}, fmt.Errorf("list recorder project resources: %w", listErr)
+		}
+		resources = append(resources, page...)
+		if resp == nil || resp.Links == nil || resp.Links.IsLastPage() {
+			break
+		}
+		current, pageErr := resp.Links.CurrentPage()
+		if pageErr != nil {
+			return RolloutProviderFacts{}, fmt.Errorf("paginate recorder project resources: %w", pageErr)
+		}
+		opt.Page = current + 1
+	}
+	projectURNs := make(map[string]struct{}, len(resources))
+	for _, resource := range resources {
+		projectURNs[resource.URN] = struct{}{}
+	}
+	fw, _, err := g.c.Firewalls.Get(ctx, strings.TrimSpace(firewallID))
+	if err != nil {
+		return RolloutProviderFacts{}, fmt.Errorf("read recorder firewall: %w", err)
+	}
+	facts := RolloutProviderFacts{
+		AccountDropletLimit: account.DropletLimit,
+		AccountDropletCount: len(all),
+		FirewallID:          fw.ID,
+		FirewallStatus:      fw.Status,
+		FirewallTags:        append([]string(nil), fw.Tags...),
+		FirewallRulesSHA256: semanticFirewallRulesSHA256(*fw),
+	}
+	for _, d := range all {
+		tagged := containsString(d.Tags, poolTag)
+		ownedName := strings.HasPrefix(d.Name, NamePrefix)
+		_, projectMember := projectURNs[fmt.Sprintf("do:droplet:%d", d.ID)]
+		if tagged && !ownedName {
+			return RolloutProviderFacts{}, fmt.Errorf("non-pool droplet %d carries reserved pool tag %q", d.ID, poolTag)
+		}
+		if ownedName && !tagged {
+			return RolloutProviderFacts{}, fmt.Errorf("recorder droplet %d lacks pool tag %q", d.ID, poolTag)
+		}
+		if !tagged {
+			facts.NonPoolDropletIDs = append(facts.NonPoolDropletIDs, int64(d.ID))
+			facts.NonPoolDroplets = append(facts.NonPoolDroplets, DODroplet{ID: int64(d.ID), Name: d.Name, Status: d.Status, Region: d.Region.Slug, Size: d.SizeSlug, ProjectMember: projectMember, Tags: append([]string(nil), d.Tags...)})
+			continue
+		}
+		if !projectMember {
+			return RolloutProviderFacts{}, fmt.Errorf("pool droplet %d is outside configured project", d.ID)
+		}
+		facts.PoolDropletIDs = append(facts.PoolDropletIDs, int64(d.ID))
+		facts.PoolDroplets = append(facts.PoolDroplets, DODroplet{ID: int64(d.ID), Name: d.Name, Status: d.Status, Region: d.Region.Slug, Size: d.SizeSlug, ProjectMember: true, Tags: append([]string(nil), d.Tags...)})
+	}
+	for _, id := range fw.DropletIDs {
+		facts.FirewallDropletIDs = append(facts.FirewallDropletIDs, int64(id))
+	}
+	sort.Slice(facts.PoolDropletIDs, func(i, j int) bool { return facts.PoolDropletIDs[i] < facts.PoolDropletIDs[j] })
+	sort.Slice(facts.PoolDroplets, func(i, j int) bool { return facts.PoolDroplets[i].ID < facts.PoolDroplets[j].ID })
+	sort.Slice(facts.NonPoolDropletIDs, func(i, j int) bool { return facts.NonPoolDropletIDs[i] < facts.NonPoolDropletIDs[j] })
+	sort.Slice(facts.NonPoolDroplets, func(i, j int) bool { return facts.NonPoolDroplets[i].ID < facts.NonPoolDroplets[j].ID })
+	sort.Slice(facts.FirewallDropletIDs, func(i, j int) bool { return facts.FirewallDropletIDs[i] < facts.FirewallDropletIDs[j] })
+	sort.Strings(facts.FirewallTags)
+	return facts, nil
+}
+
+func semanticFirewallRulesSHA256(fw godo.Firewall) string {
+	type endpoint struct {
+		Addresses, Tags                 []string
+		DropletIDs                      []int
+		LoadBalancerUIDs, KubernetesIDs []string
+	}
+	type rule struct {
+		Direction, Protocol, Ports string
+		Endpoint                   endpoint
+	}
+	normalize := func(addresses, tags []string, ids []int, lbs, k8s []string) endpoint {
+		e := endpoint{
+			Addresses:        append([]string(nil), addresses...),
+			Tags:             append([]string(nil), tags...),
+			DropletIDs:       append([]int(nil), ids...),
+			LoadBalancerUIDs: append([]string(nil), lbs...),
+			KubernetesIDs:    append([]string(nil), k8s...),
+		}
+		sort.Strings(e.Addresses)
+		sort.Strings(e.Tags)
+		sort.Ints(e.DropletIDs)
+		sort.Strings(e.LoadBalancerUIDs)
+		sort.Strings(e.KubernetesIDs)
+		return e
+	}
+	rules := make([]rule, 0, len(fw.InboundRules)+len(fw.OutboundRules))
+	for _, r := range fw.InboundRules {
+		e := endpoint{}
+		if r.Sources != nil {
+			e = normalize(r.Sources.Addresses, r.Sources.Tags, r.Sources.DropletIDs, r.Sources.LoadBalancerUIDs, r.Sources.KubernetesIDs)
+		}
+		rules = append(rules, rule{Direction: "in", Protocol: strings.ToLower(r.Protocol), Ports: r.PortRange, Endpoint: e})
+	}
+	for _, r := range fw.OutboundRules {
+		e := endpoint{}
+		if r.Destinations != nil {
+			e = normalize(r.Destinations.Addresses, r.Destinations.Tags, r.Destinations.DropletIDs, r.Destinations.LoadBalancerUIDs, r.Destinations.KubernetesIDs)
+		}
+		rules = append(rules, rule{Direction: "out", Protocol: strings.ToLower(r.Protocol), Ports: r.PortRange, Endpoint: e})
+	}
+	sort.Slice(rules, func(i, j int) bool {
+		a, _ := json.Marshal(rules[i])
+		b, _ := json.Marshal(rules[j])
+		return string(a) < string(b)
+	})
+	body, _ := json.Marshal(rules)
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // godoClient is the production DOClient backed by the godo SDK.
@@ -138,7 +309,7 @@ func (g *godoClient) CreateDroplet(ctx context.Context, in CreateDropletInput) (
 		}
 	}
 	// Apply the egress firewall that blocks the metadata IP / RFC1918 (S-1).
-	if fid := strings.TrimSpace(in.FirewallID); fid != "" {
+	if fid := strings.TrimSpace(in.FirewallID); fid != "" && !in.FirewallByTag {
 		if _, err := g.c.Firewalls.AddDroplets(ctx, fid, droplet.ID); err != nil {
 			return DODroplet{}, g.destroyAfterFailedSetup(ctx, droplet.ID, fmt.Errorf("apply firewall to droplet %d: %w", droplet.ID, err))
 		}
@@ -183,7 +354,7 @@ func (g *godoClient) ListDropletsByName(ctx context.Context, projectID, prefix s
 			}
 			ip, _ := d.PublicIPv4()
 			created, _ := time.Parse(time.RFC3339, d.Created)
-			out = append(out, DODroplet{ID: int64(d.ID), Name: d.Name, IP: ip, Status: d.Status, CreatedAt: created})
+			out = append(out, DODroplet{ID: int64(d.ID), Name: d.Name, IP: ip, Status: d.Status, CreatedAt: created, Tags: append([]string(nil), d.Tags...)})
 		}
 		if resp == nil || resp.Links == nil || resp.Links.IsLastPage() {
 			break
@@ -261,16 +432,17 @@ func parseImage(image string) godo.DropletCreateImage {
 
 // UserDataConfig is the set of values rendered into a droplet's cloud-init.
 type UserDataConfig struct {
-	ServerID       string // = droplet name = recorder_droplets.name = worker_id
-	NodeToken      string // per-droplet local_recorder node token (RECORDER_NODE_TOKEN)
-	BackendAPIURL  string
-	Capacity       int // RECORDING_WORKER_CONCURRENCY; must equal DROPLET_POOL_CAPACITY
-	HeartbeatSec   int
-	PollSec        int
-	RepoURL        string
-	RepoRef        string
-	BuildSHA       string
-	RepoCloneToken string
+	ServerID                   string // = droplet name = recorder_droplets.name = worker_id
+	NodeToken                  string // per-droplet local_recorder node token (RECORDER_NODE_TOKEN)
+	BackendAPIURL              string
+	Capacity                   int // RECORDING_WORKER_CONCURRENCY; must equal DROPLET_POOL_CAPACITY
+	HeartbeatSec               int
+	PollSec                    int
+	RepoURL                    string
+	RepoRef                    string
+	BuildSHA                   string
+	RepoCloneToken             string
+	RenderedHostFirewallScript string
 }
 
 // BuildUserData renders the recorder droplet cloud-init. It installs an outbound
@@ -302,6 +474,7 @@ func BuildUserData(cfg UserDataConfig) (string, error) {
 	if strings.TrimSpace(cfg.RepoRef) == "" {
 		cfg.RepoRef = "main"
 	}
+	cfg.RenderedHostFirewallScript = indentCloudInit(hostFirewallScriptV1, 6)
 	var buf bytes.Buffer
 	if err := userDataTemplate.Execute(&buf, cfg); err != nil {
 		return "", fmt.Errorf("render recorder cloud-init: %w", err)
@@ -337,62 +510,13 @@ write_files:
       export RECORDING_WORKER_CONCURRENCY='{{.Capacity}}'
       export RECORDING_WORKER_HEARTBEAT_SEC='{{.HeartbeatSec}}'
       export RECORDING_WORKER_POLL_SEC='{{.PollSec}}'
+      export RECORDING_FROZEN_HLS_QUIESCENCE_ALLOWLIST=''
 
   - path: /usr/local/sbin/stoarama-egress-firewall.sh
     permissions: "0755"
     owner: root:root
     content: |
-      #!/usr/bin/env bash
-      # Outbound egress firewall (S-1): DROP traffic from this droplet to the
-      # cloud metadata service and every private/internal range so ffmpeg cannot
-      # be redirected (via an HLS child segment or HTTP redirect) at a private or
-      # metadata target the in-app guard never sees. Public egress (DO API, the
-      # user's S3, public streams) and DNS stay allowed. RECORDER_SERVER_ID is
-      # passed via cloud-init env, so the worker never needs the metadata service.
-      set -euo pipefail
-      BLOCKED4=(
-        169.254.0.0/16
-        10.0.0.0/8
-        172.16.0.0/12
-        192.168.0.0/16
-        127.0.0.0/8
-        100.64.0.0/10
-      )
-      BLOCKED6=(
-        fc00::/7
-        fe80::/10
-        ::1/128
-      )
-      # Allow established/related and loopback (stub-resolver) DNS first, then drop
-      # the private ranges; public DNS and everything else fall through to the
-      # final RETURN. DNS is scoped to loopback so a query cannot be aimed at the
-      # metadata IP or an internal resolver (the earlier blanket dport-53 RETURN
-      # let DNS reach any address before the REJECT rules, S-1).
-      iptables -F STOARAMA_EGRESS 2>/dev/null || true
-      iptables -N STOARAMA_EGRESS 2>/dev/null || true
-      iptables -F STOARAMA_EGRESS
-      iptables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
-      iptables -A STOARAMA_EGRESS -p udp --dport 53 -d 127.0.0.0/8 -j RETURN
-      iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN
-      for cidr in "${BLOCKED4[@]}"; do
-        iptables -A STOARAMA_EGRESS -d "$cidr" -j REJECT
-      done
-      iptables -A STOARAMA_EGRESS -j RETURN
-      iptables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || iptables -I OUTPUT 1 -j STOARAMA_EGRESS
-
-      ip6tables -F STOARAMA_EGRESS 2>/dev/null || true
-      ip6tables -N STOARAMA_EGRESS 2>/dev/null || true
-      ip6tables -F STOARAMA_EGRESS
-      ip6tables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
-      ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d ::1/128 -j RETURN
-      ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d ::1/128 -j RETURN
-      for cidr in "${BLOCKED6[@]}"; do
-        ip6tables -A STOARAMA_EGRESS -d "$cidr" -j REJECT
-      done
-      ip6tables -A STOARAMA_EGRESS -j RETURN
-      ip6tables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || ip6tables -I OUTPUT 1 -j STOARAMA_EGRESS
-
-      netfilter-persistent save || true
+{{.RenderedHostFirewallScript}}
 
   - path: /etc/systemd/system/stoarama-egress-firewall.service
     permissions: "0644"
@@ -495,7 +619,7 @@ runcmd:
       # function did not just produce (the staleness bug that removed the old
       # fast-path).
       tmp="$(mktemp /opt/stoarama/bin/.stoaramactl.XXXXXX)"
-      (cd /opt/stoarama/backend && go build -o "$tmp" ./cmd/stoaramactl)
+      (cd /opt/stoarama/backend && go build -ldflags "-X main.recorderExecutableBuildSHA=$HEAD_SHA" -o "$tmp" ./cmd/stoaramactl)
       chmod +x "$tmp"
       mv -f "$tmp" "$BIN"
       printf '%s' "$HEAD_SHA" > "$SHA_FILE"
@@ -514,6 +638,42 @@ runcmd:
   - systemctl enable --now stoarama-egress-firewall.service
   - systemctl enable --now stoarama-recording.service
 `))
+
+const hostFirewallScriptV1 = `#!/usr/bin/env bash
+# Outbound egress firewall (S-1): block metadata and private/internal ranges.
+set -euo pipefail
+BLOCKED4=(169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 100.64.0.0/10)
+BLOCKED6=(fc00::/7 fe80::/10 ::1/128)
+iptables -F STOARAMA_EGRESS 2>/dev/null || true
+iptables -N STOARAMA_EGRESS 2>/dev/null || true
+iptables -F STOARAMA_EGRESS
+iptables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
+iptables -A STOARAMA_EGRESS -p udp --dport 53 -d 127.0.0.0/8 -j RETURN
+iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN
+for cidr in "${BLOCKED4[@]}"; do iptables -A STOARAMA_EGRESS -d "$cidr" -j REJECT; done
+iptables -A STOARAMA_EGRESS -j RETURN
+iptables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || iptables -I OUTPUT 1 -j STOARAMA_EGRESS
+ip6tables -F STOARAMA_EGRESS 2>/dev/null || true
+ip6tables -N STOARAMA_EGRESS 2>/dev/null || true
+ip6tables -F STOARAMA_EGRESS
+ip6tables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
+ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d ::1/128 -j RETURN
+ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d ::1/128 -j RETURN
+for cidr in "${BLOCKED6[@]}"; do ip6tables -A STOARAMA_EGRESS -d "$cidr" -j REJECT; done
+ip6tables -A STOARAMA_EGRESS -j RETURN
+ip6tables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || ip6tables -I OUTPUT 1 -j STOARAMA_EGRESS
+netfilter-persistent save || true
+`
+
+func indentCloudInit(value string, spaces int) string {
+	prefix := strings.Repeat(" ", spaces)
+	return prefix + strings.ReplaceAll(strings.TrimSuffix(value, "\n"), "\n", "\n"+prefix)
+}
+
+func ExpectedHostFirewallScriptSHA256() string {
+	sum := sha256.Sum256([]byte(hostFirewallScriptV1))
+	return hex.EncodeToString(sum[:])
+}
 
 // generateNodeSecret mirrors the API's generateSecret: base64url random with no
 // padding. Used to mint the per-droplet local_recorder node token.

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,82 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// Reserved migration numbers can merge in either PR order. A lower-numbered
+// migration arriving after a higher-numbered migration is already in the
+// filename ledger must still run exactly once; the ledger is not a numeric
+// high-water mark.
+func TestMigrateUpAppliesLowerReservedMigrationAfterHigherHistory(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run the reserved migration ordering regression")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("migration_reserved_order_%d", time.Now().UnixNano())
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams = map[string]string{"search_path": schema}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	dir := t.TempDir()
+	higher := "0137_reserved_higher_test.sql"
+	lower := "0136_reserved_lower_test.sql"
+	if err = os.WriteFile(filepath.Join(dir, higher), []byte("CREATE TABLE reserved_higher(id integer PRIMARY KEY);\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = MigrateUp(ctx, pool, dir); err != nil {
+		t.Fatalf("apply higher reserved migration: %v", err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, lower), []byte("CREATE TABLE reserved_lower(id integer PRIMARY KEY);\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = MigrateUp(ctx, pool, dir); err != nil {
+		t.Fatalf("apply later lower reserved migration: %v", err)
+	}
+	if err = MigrateUp(ctx, pool, dir); err != nil {
+		t.Fatalf("replay reserved migrations: %v", err)
+	}
+	var versions []string
+	rows, err := pool.Query(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version string
+		if err = rows.Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		versions = append(versions, version)
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(versions, ","); got != lower+","+higher {
+		t.Fatalf("migration ledger=%q", got)
+	}
+	for _, table := range []string{"reserved_lower", "reserved_higher"} {
+		var present *string
+		if err = pool.QueryRow(ctx, `SELECT to_regclass($1)::text`, table).Scan(&present); err != nil || present == nil {
+			t.Fatalf("table %s missing: present=%v err=%v", table, present, err)
+		}
+	}
+}
 
 // A migration that cannot take its lock must abort quickly instead of queueing
 // behind a live transaction. Without SET LOCAL lock_timeout this blocks forever

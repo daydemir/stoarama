@@ -29,13 +29,19 @@ type Config struct {
 	Min               int
 	Max               int
 	MaxScaleUpBatch   int
+	RolloutEnabled    bool
+	RolloutMaxSurge   int
 
-	Region     string
-	Size       string
-	Image      string
-	SSHKey     string
-	ProjectID  string
-	FirewallID string
+	Region              string
+	Size                string
+	Image               string
+	SSHKey              string
+	ProjectID           string
+	FirewallID          string
+	FirewallRulesSHA256 string
+	FirewallTag         string
+	HostFirewallSHA256  string
+	KernelPolicySHA256  string
 
 	BackendAPIURL  string
 	BuildSHA       string
@@ -209,19 +215,43 @@ func (c *Controller) tick(ctx context.Context) error {
 		log.Printf("droplet pool: CAP HIT scale-up wanted but at hard cap max=%d live=%d peak=%d need_droplets_over_cap=%d ceiling=%d; raise DROPLET_POOL_MAX",
 			c.cfg.Max, live, forecast.PeakConcurrent, decision.CapShortfall, c.cfg.Max*c.cfg.Capacity)
 	}
-	for i := 0; i < decision.ScaleUpCount; i++ {
-		if err := c.scaleUp(ctx, now, i); err != nil {
-			log.Printf("droplet pool: scale up: %v", err)
-			break // a failing DO create will likely fail again this tick; retry next tick
+	scaleUpCount := decision.ScaleUpCount
+	_, rolloutInProgress, rolloutStateErr := c.store.ActiveRollout(ctx)
+	if rolloutStateErr != nil {
+		return rolloutStateErr
+	}
+	rolloutManaged := c.cfg.RolloutEnabled || rolloutInProgress
+	if rolloutManaged {
+		// R0 owns the one bounded surge slot. Ordinary demand scale-up must not
+		// compete for it or create an unregistered worker during convergence.
+		scaleUpCount = 0
+	}
+	scaledUp := 0
+	runScaleUp := func(count int) {
+		for i := 0; i < count; i++ {
+			if err := c.scaleUp(ctx, now, i); err != nil {
+				log.Printf("droplet pool: scale up: %v", err)
+				break // a failing DO create will likely fail again this tick; retry next tick
+			}
+			scaledUp++
 		}
+	}
+	if !rolloutManaged {
+		runScaleUp(scaleUpCount)
 	}
 	requiredCapacity := forecast.PeakConcurrent
 	if minCapacity := c.cfg.Min * c.cfg.Capacity; requiredCapacity < minCapacity {
 		requiredCapacity = minCapacity
 	}
-	rollingBuild, err := c.rolloutBuild(ctx, now, live+decision.ScaleUpCount, decision.ScaleUpCount, requiredCapacity)
+	rollingBuild, err := c.rolloutBuild(ctx, now, live+scaledUp, scaledUp, requiredCapacity)
 	if err != nil {
 		log.Printf("droplet pool: build rollout: %v", err)
+	}
+	if rolloutManaged && !rollingBuild && err == nil {
+		// An exact completed target is reusable and must not suppress legacy
+		// autoscaling forever. Only resume after R0 has proved there is no live
+		// convergence/stopping state on this tick.
+		runScaleUp(decision.ScaleUpCount)
 	}
 	if !rollingBuild && decision.DrainCount > 0 {
 		c.beginDrains(ctx, now, idleEligible, decision.DrainCount)
@@ -290,7 +320,7 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("%w: list DO fleet: %w", errFleetRead, err)
 	}
-	liveRows, err := c.store.ListByStates(ctx, "provisioning", "active", "draining", "destroying")
+	liveRows, err := c.store.ListByStates(ctx, "provisioning", "standby_ready", "active", "rollout_draining", "draining", "destroying")
 	if err != nil {
 		return err
 	}
@@ -332,6 +362,13 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 	// Reconcile DB rows whose DO droplet vanished: revoke their token and mark
 	// destroyed so they stop counting against the cap.
 	for _, r := range plan.MissingFromDO {
+		if r.RolloutGeneration != nil {
+			// R0 owns rollout absence. Its append-only complete-provider
+			// observations and bounded two-read fence distinguish a vanished
+			// object from a stale/eventually-consistent list response.
+			log.Printf("droplet pool: rollout worker id=%d name=%s absent from one provider read; retaining until rollout absence fence", r.ID, r.Name)
+			continue
+		}
 		retired, retireErr := c.store.BeginDestroyIfIdle(ctx, r.ID)
 		if retireErr != nil {
 			log.Printf("droplet pool: CRITICAL cannot atomically verify idle before retiring missing droplet id=%d name=%s; teardown skipped: %v", r.ID, r.Name, retireErr)
@@ -359,7 +396,13 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 			log.Printf("droplet pool: resume destroying droplet id=%d name=%s: %v", r.ID, r.Name, err)
 			continue
 		}
-		c.revokeAndDestroyRow(ctx, r.ID)
+		if r.RolloutGeneration != nil {
+			if err := c.store.FinalizeRolloutDestroy(ctx, r.ID); err != nil {
+				log.Printf("droplet pool: finalize rollout worker id=%d: %v", r.ID, err)
+			}
+		} else {
+			c.revokeAndDestroyRow(ctx, r.ID)
+		}
 	}
 
 	// Reap stuck provisioning rows past the provision timeout with no DO id (the
@@ -368,6 +411,9 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 	for _, r := range liveRows {
 		if r.State != "provisioning" {
 			continue
+		}
+		if r.RolloutGeneration != nil {
+			continue // R0 owns its crash-fenced provisioning lifecycle.
 		}
 		if now.Sub(r.CreatedAt) < c.cfg.ProvisionTimeout {
 			continue
@@ -463,6 +509,9 @@ func (c *Controller) promoteActive(ctx context.Context, now time.Time, fleet []D
 	}
 	window := c.workerReadyWindow()
 	for _, r := range provisioning {
+		if r.RolloutGeneration != nil {
+			continue // never admit a rollout worker through the legacy path
+		}
 		providerPresent := false
 		if r.DODropletID != nil {
 			_, providerPresent = byID[*r.DODropletID]
@@ -508,6 +557,13 @@ func shouldDrainStaleBuild(desired, reported string, busy bool) bool {
 // recording. Empty build_sha is intentionally stale when the controller has a
 // desired build, so workers deployed before the handshake are rolled forward.
 func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, nextBatchIndex, requiredCapacity int) (bool, error) {
+	_, activeRollout, activeErr := c.store.ActiveRollout(ctx)
+	if activeErr != nil {
+		return true, activeErr
+	}
+	if c.cfg.RolloutEnabled || activeRollout {
+		return c.rolloutBuildV2(ctx, now, requiredCapacity)
+	}
 	if strings.TrimSpace(c.cfg.BuildSHA) == "" {
 		return false, nil
 	}
@@ -579,6 +635,306 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 			break // roll one at a time so current capacity remains stable
 		}
 	}
+	return true, nil
+}
+
+func (c *Controller) rolloutBuildV2(ctx context.Context, now time.Time, requiredCapacity int) (bool, error) {
+	rolloutCapacity := recorderRolloutSteadyWorkers * recorderRolloutWorkerCapacity
+	if !c.cfg.RolloutEnabled || requiredCapacity > rolloutCapacity {
+		rollout, ok, err := c.store.ActiveRollout(ctx)
+		if err != nil || !ok {
+			return ok, err
+		}
+		reason := "disabled"
+		if requiredCapacity > rolloutCapacity {
+			reason = "forecast_exceeds_capacity"
+		}
+		if err = c.store.RequestRolloutStop(ctx, rollout.Generation, reason); err != nil {
+			return true, err
+		}
+		facts, inspectErr := c.do.InspectRollout(ctx, c.cfg.ProjectID, c.cfg.FirewallID, c.cfg.FirewallTag)
+		if inspectErr != nil {
+			return true, inspectErr
+		}
+		if err = validateRolloutProviderFacts(facts, c.cfg.FirewallID, c.cfg.FirewallRulesSHA256, c.cfg.FirewallTag, recorderRolloutSteadyWorkers, c.cfg.RolloutMaxSurge); err != nil {
+			return true, err
+		}
+		if err = validateProviderTargetObjects(facts, c.cfg); err != nil {
+			return true, err
+		}
+		if _, err = c.store.AppendProviderObservation(ctx, rollout.Generation, "pre_delete", facts); err != nil {
+			return true, err
+		}
+		workers, listErr := c.store.ListByStates(ctx, "provisioning", "standby_ready", "rollout_draining", "destroying")
+		if listErr != nil {
+			return true, listErr
+		}
+		providerIDs := make(map[int64]struct{}, len(facts.PoolDropletIDs))
+		for _, providerID := range facts.PoolDropletIDs {
+			providerIDs[providerID] = struct{}{}
+		}
+		for _, worker := range workers {
+			if worker.RolloutGeneration == nil || *worker.RolloutGeneration != rollout.Generation {
+				continue
+			}
+			if worker.DODropletID != nil {
+				if _, present := providerIDs[*worker.DODropletID]; !present {
+					minimumAge := c.cfg.TickInterval
+					if worker.State == "provisioning" || worker.State == "standby_ready" {
+						minimumAge = c.cfg.ProvisionTimeout
+					}
+					_, finalizeErr := c.store.FinalizeAbsentRolloutWorker(ctx, worker.ID, minimumAge)
+					if finalizeErr != nil {
+						return true, finalizeErr
+					}
+					return true, nil
+				}
+			}
+			if worker.State == "destroying" {
+				continue
+			}
+			var ready bool
+			if worker.State == "rollout_draining" {
+				ready, err = c.store.BeginRolloutDestroy(ctx, worker.ID, c.cfg.TickInterval)
+			} else {
+				ready, err = c.store.BeginUnswitchedRolloutDestroy(ctx, worker.ID, c.cfg.TickInterval)
+			}
+			if err != nil {
+				return true, err
+			}
+			if !ready {
+				return true, nil
+			}
+			if worker.DODropletID == nil {
+				return true, fmt.Errorf("stopping worker %d lacks provider identity", worker.ID)
+			}
+			if err = c.do.DeleteDroplet(ctx, *worker.DODropletID); err != nil {
+				return true, err
+			}
+			if err = c.store.FinalizeRolloutDestroy(ctx, worker.ID); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
+		if len(facts.PoolDropletIDs) == recorderRolloutSteadyWorkers {
+			if _, err = c.store.AppendProviderObservation(ctx, rollout.Generation, "post_delete", facts); err != nil {
+				return true, err
+			}
+		}
+		stopped, stopErr := c.store.CompleteRolloutStop(ctx, rollout.Generation)
+		return !stopped, stopErr
+	}
+	commonSHA, err := (CommonPolicyIdentity{
+		BuildSHA: c.cfg.BuildSHA, Capacity: c.cfg.Capacity, HeartbeatSec: c.cfg.HeartbeatSec,
+		PollSec: c.cfg.PollSec, BackendAPIURL: c.cfg.BackendAPIURL, FirewallID: c.cfg.FirewallID,
+		FirewallRulesSHA256: c.cfg.FirewallRulesSHA256, FirewallTag: c.cfg.FirewallTag,
+		HostFirewallScriptSHA256: c.cfg.HostFirewallSHA256, KernelFirewallPolicySHA256: c.cfg.KernelPolicySHA256,
+	}).Digest()
+	if err != nil {
+		return true, fmt.Errorf("common rollout policy: %w", err)
+	}
+	facts, err := c.do.InspectRollout(ctx, c.cfg.ProjectID, c.cfg.FirewallID, c.cfg.FirewallTag)
+	if err != nil {
+		return true, fmt.Errorf("inspect provider rollout facts: %w", err)
+	}
+	if err = validateRolloutProviderFacts(facts, c.cfg.FirewallID, c.cfg.FirewallRulesSHA256, c.cfg.FirewallTag, recorderRolloutSteadyWorkers, c.cfg.RolloutMaxSurge); err != nil {
+		if active, ok, loadErr := c.store.ActiveRollout(ctx); loadErr == nil && ok {
+			_ = c.store.RequestRolloutStop(ctx, active.Generation, "provider_drift")
+		}
+		return true, err
+	}
+	if err = validateProviderTargetObjects(facts, c.cfg); err != nil {
+		return true, err
+	}
+	rollout, err := c.store.EnsureRollout(ctx, c.cfg, commonSHA, facts)
+	if err != nil {
+		return true, fmt.Errorf("ensure rollout: %w", err)
+	}
+	if rollout.Status == "complete" {
+		return false, nil
+	}
+	if _, err = c.store.AppendProviderObservation(ctx, rollout.Generation, "reconcile", facts); err != nil {
+		return true, fmt.Errorf("append provider observation: %w", err)
+	}
+	workers, err := c.store.ListByStates(ctx, "provisioning", "standby_ready", "active", "rollout_draining", "destroying")
+	if err != nil {
+		return true, err
+	}
+	providerIDs := make(map[int64]struct{}, len(facts.PoolDropletIDs))
+	for _, id := range facts.PoolDropletIDs {
+		providerIDs[id] = struct{}{}
+	}
+	for _, worker := range workers {
+		if worker.RolloutGeneration == nil || *worker.RolloutGeneration != rollout.Generation || worker.DODropletID == nil || worker.State == "active" {
+			continue
+		}
+		if _, present := providerIDs[*worker.DODropletID]; present {
+			continue
+		}
+		minimumAge := c.cfg.TickInterval
+		if worker.State == "provisioning" || worker.State == "standby_ready" {
+			minimumAge = c.cfg.ProvisionTimeout
+		}
+		finalized, finalizeErr := c.store.FinalizeAbsentRolloutWorker(ctx, worker.ID, minimumAge)
+		if finalizeErr != nil {
+			return true, finalizeErr
+		}
+		if finalized {
+			log.Printf("droplet pool: finalized absent nonclaimable rollout worker id=%d name=%s after two complete provider reads", worker.ID, worker.Name)
+		}
+		return true, nil
+	}
+	for _, worker := range workers {
+		if worker.State != "rollout_draining" {
+			continue
+		}
+		if worker.DODropletID == nil {
+			return true, fmt.Errorf("rollout draining worker %d lacks provider identity", worker.ID)
+		}
+		if _, ok := providerIDs[*worker.DODropletID]; !ok {
+			return true, fmt.Errorf("rollout draining worker %d missing before provider delete authorization", worker.ID)
+		}
+		if _, err = c.store.AppendProviderObservation(ctx, rollout.Generation, "pre_delete", facts); err != nil {
+			return true, err
+		}
+		ready, beginErr := c.store.BeginRolloutDestroy(ctx, worker.ID, c.cfg.TickInterval)
+		if beginErr != nil {
+			return true, beginErr
+		}
+		if !ready {
+			return true, nil
+		}
+		if err = c.do.DeleteDroplet(ctx, *worker.DODropletID); err != nil {
+			return true, fmt.Errorf("delete rollout-drained provider worker: %w", err)
+		}
+		if err = c.store.FinalizeRolloutDestroy(ctx, worker.ID); err != nil {
+			return true, fmt.Errorf("finalize rollout destroy: %w", err)
+		}
+		return true, nil
+	}
+	for _, worker := range workers {
+		if worker.RolloutGeneration == nil || *worker.RolloutGeneration != rollout.Generation {
+			continue
+		}
+		switch worker.State {
+		case "provisioning":
+			if worker.DODropletID == nil {
+				// A controller crash after reservation loses the one-use plaintext
+				// token. Reconcile may still adopt an existing provider object by
+				// name; absent that, revoke this reservation rather than recovering
+				// or regenerating credentials.
+				_, _, failed, failErr := c.store.FailAbsentRolloutReservation(ctx, worker.ID, c.cfg.ProvisionTimeout)
+				if failErr != nil {
+					return true, failErr
+				}
+				if failed {
+					log.Printf("droplet pool: revoked absent rollout reservation id=%d name=%s; successor may be reserved next tick", worker.ID, worker.Name)
+				}
+				return true, nil
+			}
+			if _, ok := providerIDs[*worker.DODropletID]; !ok {
+				return true, fmt.Errorf("replacement provider identity is not in exact tagged project fleet")
+			}
+			ready, readyErr := c.store.MarkRolloutStandbyReady(ctx, worker.ID)
+			if readyErr != nil {
+				return true, readyErr
+			}
+			if ready {
+				log.Printf("droplet pool: rollout replacement id=%d name=%s ready but nonclaimable", worker.ID, worker.Name)
+			}
+			return true, nil
+		case "standby_ready":
+			if _, readyErr := c.store.MarkRolloutStandbyReady(ctx, worker.ID); readyErr != nil {
+				return true, readyErr
+			}
+			freshFacts, inspectErr := c.do.InspectRollout(ctx, c.cfg.ProjectID, c.cfg.FirewallID, c.cfg.FirewallTag)
+			if inspectErr != nil {
+				return true, fmt.Errorf("pre-switch provider observation: %w", inspectErr)
+			}
+			if inspectErr = validateRolloutProviderFacts(freshFacts, c.cfg.FirewallID, c.cfg.FirewallRulesSHA256, c.cfg.FirewallTag, recorderRolloutSteadyWorkers, c.cfg.RolloutMaxSurge); inspectErr != nil {
+				return true, inspectErr
+			}
+			if inspectErr = validateProviderTargetObjects(freshFacts, c.cfg); inspectErr != nil {
+				return true, inspectErr
+			}
+			observationID, observeErr := c.store.AppendProviderObservation(ctx, rollout.Generation, "pre_switch", freshFacts)
+			if observeErr != nil {
+				return true, observeErr
+			}
+			minimum := rolloutCapacity
+			if requiredCapacity > minimum {
+				minimum = requiredCapacity
+			}
+			switched, switchErr := c.store.SwitchRolloutReplacement(ctx, worker.ID, observationID, minimum)
+			if switchErr != nil {
+				return true, switchErr
+			}
+			if switched {
+				log.Printf("droplet pool: atomically admitted rollout replacement id=%d name=%s", worker.ID, worker.Name)
+			}
+			return true, nil
+		}
+	}
+	stale := false
+	for _, worker := range workers {
+		if worker.State == "active" && worker.LeaseAdmissionEnabled && (firstNonemptyBuild(worker.ObservedBuildSHA, worker.BuildSHA) != c.cfg.BuildSHA || worker.ObservedCommonPolicySHA256 != commonSHA) {
+			stale = true
+			break
+		}
+	}
+	if !stale {
+		postFacts, inspectErr := c.do.InspectRollout(ctx, c.cfg.ProjectID, c.cfg.FirewallID, c.cfg.FirewallTag)
+		if inspectErr != nil {
+			return true, inspectErr
+		}
+		if inspectErr = validateRolloutProviderFacts(postFacts, c.cfg.FirewallID, c.cfg.FirewallRulesSHA256, c.cfg.FirewallTag, recorderRolloutSteadyWorkers, c.cfg.RolloutMaxSurge); inspectErr != nil {
+			return true, inspectErr
+		}
+		if len(postFacts.PoolDropletIDs) != recorderRolloutSteadyWorkers {
+			return true, nil
+		}
+		if _, inspectErr = c.store.AppendProviderObservation(ctx, rollout.Generation, "post_delete", postFacts); inspectErr != nil {
+			return true, inspectErr
+		}
+		completed, completeErr := c.store.CompleteRollout(ctx, rollout.Generation)
+		if completeErr != nil {
+			return true, completeErr
+		}
+		return !completed, nil
+	}
+	name, err := c.store.NextReplacementIdentity(ctx, rollout)
+	if err != nil {
+		return true, err
+	}
+	replacement, err := c.store.ReserveRolloutReplacement(ctx, rollout, c.cfg, name)
+	if err != nil {
+		return true, err
+	}
+	userData, err := BuildUserData(UserDataConfig{
+		ServerID: name, NodeToken: replacement.PlainToken, BackendAPIURL: c.cfg.BackendAPIURL,
+		Capacity: c.cfg.Capacity, HeartbeatSec: c.cfg.HeartbeatSec, PollSec: c.cfg.PollSec,
+		RepoURL: c.cfg.RepoURL, RepoRef: c.cfg.RepoRef, BuildSHA: c.cfg.BuildSHA,
+		RepoCloneToken: c.cfg.RepoCloneToken,
+	})
+	if err != nil {
+		c.failProvision(ctx, replacement.ID, *replacement.NodeID, replacement.NodeTokenID, fmt.Sprintf("build rollout user data: %v", err))
+		return true, err
+	}
+	droplet, err := c.do.CreateDroplet(ctx, CreateDropletInput{
+		Name: name, Region: c.cfg.Region, Size: c.cfg.Size, Image: c.cfg.Image, SSHKey: c.cfg.SSHKey,
+		UserData: userData, ProjectID: c.cfg.ProjectID, FirewallID: c.cfg.FirewallID,
+		FirewallByTag: true,
+	})
+	if err != nil {
+		// The provider request may have committed while its response was lost.
+		// Retain the preregistration and token hash; complete fleet reads adopt
+		// an existing object by exact name, or bounded absence revokes it.
+		return true, fmt.Errorf("create rollout droplet (awaiting exact-name reconciliation): %w", err)
+	}
+	if err = c.store.SetDropletID(ctx, replacement.ID, droplet.ID, droplet.IP); err != nil {
+		return true, fmt.Errorf("set rollout provider id (reconcile by name): %w", err)
+	}
+	log.Printf("droplet pool: provisioned nonclaimable rollout replacement name=%s do_id=%d", name, droplet.ID)
 	return true, nil
 }
 
@@ -787,7 +1143,7 @@ func (c *Controller) revokeAndDestroyRow(ctx context.Context, rowID int64) {
 
 // findRowByName loads a recorder_droplets row by name in any live state.
 func (c *Controller) findRowByName(ctx context.Context, name string) (*Droplet, error) {
-	rows, err := c.store.ListByStates(ctx, "provisioning", "active", "draining", "destroying")
+	rows, err := c.store.ListByStates(ctx, "provisioning", "standby_ready", "active", "rollout_draining", "draining", "destroying")
 	if err != nil {
 		return nil, err
 	}

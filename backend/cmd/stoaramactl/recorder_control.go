@@ -216,6 +216,9 @@ func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []stri
 		log.Fatalf("begin drain tx: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := dropletpool.AcquireRolloutExclusiveFence(ctx, tx); err != nil {
+		log.Fatalf("acquire rollout/drain fence: %v", err)
+	}
 
 	var (
 		name      string
@@ -268,7 +271,7 @@ func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []stri
 	// because the store is constructed over a *pgxpool.Pool and so cannot join
 	// this transaction -- and the row lock is the whole point of the transaction.
 	if _, err := tx.Exec(ctx, `
-		UPDATE recorder_droplets SET state='draining', drain_started_at=now(), updated_at=now() WHERE id=$1
+		UPDATE recorder_droplets SET state='draining', lease_admission_enabled=false, drain_started_at=now(), updated_at=now() WHERE id=$1
 	`, id); err != nil {
 		log.Fatalf("mark droplet %d draining: %v", id, err)
 	}
@@ -314,34 +317,40 @@ func mustBuildDropletPool(ctx context.Context, cfg config.Config, pool *pgxpool.
 		log.Fatalf("resolve droplet pool operator account: %v", err)
 	}
 	return dropletpool.NewController(pool, doClient, dropletpool.Config{
-		OperatorAccountID: operatorAccountID,
-		BillingEnabled:    billingEnabled,
-		TickInterval:      time.Duration(cfg.DropletPoolTickSec) * time.Second,
-		Lookahead:         time.Duration(cfg.DropletPoolLookaheadSec) * time.Second,
-		Capacity:          cfg.DropletPoolCapacity,
-		ProvisionLead:     time.Duration(cfg.DropletPoolProvisionLeadSec) * time.Second,
-		ProvisionTimeout:  time.Duration(cfg.DropletPoolProvisionTimeoutSec) * time.Second,
-		IdleGrace:         time.Duration(cfg.DropletPoolIdleGraceSec) * time.Second,
-		DrainTimeout:      time.Duration(cfg.DropletPoolDrainTimeoutSec) * time.Second,
-		ScaleUpCooldown:   time.Duration(cfg.DropletPoolScaleUpCooldownSec) * time.Second,
-		ScaleDownCooldown: time.Duration(cfg.DropletPoolScaleDownCooldownSec) * time.Second,
-		Min:               cfg.DropletPoolMin,
-		Max:               cfg.DropletPoolMax,
-		MaxScaleUpBatch:   cfg.DropletPoolMaxScaleUpBatch,
-		Region:            cfg.DropletPoolRegion,
-		Size:              cfg.DropletPoolSize,
-		Image:             cfg.DropletPoolImage,
-		SSHKey:            cfg.DropletPoolSSHKey,
-		ProjectID:         cfg.DropletPoolProjectID,
-		FirewallID:        cfg.DropletPoolFirewallID,
-		BackendAPIURL:     cfg.DropletPoolBackendAPIURL,
-		BuildSHA:          cfg.DropletPoolBuildSHA,
-		HeartbeatSec:      cfg.RecordingWorkerHeartbeatSec,
-		PollSec:           cfg.RecordingWorkerPollSec,
-		RepoURL:           cfg.DropletPoolRepoURL,
-		RepoRef:           cfg.DropletPoolRepoRef,
-		RepoCloneToken:    cfg.DropletPoolRepoCloneToken,
-		ReclaimLeases:     !cfg.RecSchedEnabled,
+		OperatorAccountID:   operatorAccountID,
+		BillingEnabled:      billingEnabled,
+		TickInterval:        time.Duration(cfg.DropletPoolTickSec) * time.Second,
+		Lookahead:           time.Duration(cfg.DropletPoolLookaheadSec) * time.Second,
+		Capacity:            cfg.DropletPoolCapacity,
+		ProvisionLead:       time.Duration(cfg.DropletPoolProvisionLeadSec) * time.Second,
+		ProvisionTimeout:    time.Duration(cfg.DropletPoolProvisionTimeoutSec) * time.Second,
+		IdleGrace:           time.Duration(cfg.DropletPoolIdleGraceSec) * time.Second,
+		DrainTimeout:        time.Duration(cfg.DropletPoolDrainTimeoutSec) * time.Second,
+		ScaleUpCooldown:     time.Duration(cfg.DropletPoolScaleUpCooldownSec) * time.Second,
+		ScaleDownCooldown:   time.Duration(cfg.DropletPoolScaleDownCooldownSec) * time.Second,
+		Min:                 cfg.DropletPoolMin,
+		Max:                 cfg.DropletPoolMax,
+		MaxScaleUpBatch:     cfg.DropletPoolMaxScaleUpBatch,
+		RolloutEnabled:      cfg.DropletPoolRolloutEnabled,
+		RolloutMaxSurge:     cfg.DropletPoolRolloutMaxSurge,
+		Region:              cfg.DropletPoolRegion,
+		Size:                cfg.DropletPoolSize,
+		Image:               cfg.DropletPoolImage,
+		SSHKey:              cfg.DropletPoolSSHKey,
+		ProjectID:           cfg.DropletPoolProjectID,
+		FirewallID:          cfg.DropletPoolFirewallID,
+		FirewallRulesSHA256: cfg.DropletPoolFirewallRulesSHA256,
+		FirewallTag:         cfg.DropletPoolFirewallTag,
+		HostFirewallSHA256:  dropletpool.ExpectedHostFirewallScriptSHA256(),
+		KernelPolicySHA256:  dropletpool.ExpectedKernelFirewallPolicySHA256(),
+		BackendAPIURL:       cfg.DropletPoolBackendAPIURL,
+		BuildSHA:            cfg.DropletPoolBuildSHA,
+		HeartbeatSec:        cfg.RecordingWorkerHeartbeatSec,
+		PollSec:             cfg.RecordingWorkerPollSec,
+		RepoURL:             cfg.DropletPoolRepoURL,
+		RepoRef:             cfg.DropletPoolRepoRef,
+		RepoCloneToken:      cfg.DropletPoolRepoCloneToken,
+		ReclaimLeases:       !cfg.RecSchedEnabled,
 	})
 }
 

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -156,6 +157,10 @@ type Config struct {
 	DropletPoolRepoCloneToken       string
 	DropletPoolBackendAPIURL        string
 	DropletPoolBuildSHA             string
+	DropletPoolRolloutEnabled       bool
+	DropletPoolRolloutMaxSurge      int
+	DropletPoolFirewallRulesSHA256  string
+	DropletPoolFirewallTag          string
 }
 
 func Load() (Config, error) {
@@ -274,6 +279,10 @@ func Load() (Config, error) {
 		DropletPoolRepoCloneToken:       strings.TrimSpace(os.Getenv("DROPLET_POOL_REPO_CLONE_TOKEN")),
 		DropletPoolBackendAPIURL:        strings.TrimRight(strings.TrimSpace(firstNonEmpty(os.Getenv("DROPLET_POOL_BACKEND_API_URL"), os.Getenv("BACKEND_API_URL"))), "/"),
 		DropletPoolBuildSHA:             strings.ToLower(strings.TrimSpace(os.Getenv("RENDER_GIT_COMMIT"))),
+		DropletPoolRolloutEnabled:       boolEnv("DROPLET_POOL_ROLLOUT_ENABLED", false),
+		DropletPoolRolloutMaxSurge:      intEnv("DROPLET_POOL_ROLLOUT_MAX_SURGE", 1),
+		DropletPoolFirewallRulesSHA256:  strings.ToLower(strings.TrimSpace(os.Getenv("DROPLET_POOL_FIREWALL_RULES_SHA256"))),
+		DropletPoolFirewallTag:          strEnv("DROPLET_POOL_FIREWALL_TAG", "fleet:recorder-pool-v1"),
 	}
 	var err error
 	cfg.SharedRecordingsProxyCIDRs, err = prefixesEnv("MIT_SCL_RECORDINGS_TRUSTED_PROXY_CIDRS")
@@ -478,6 +487,32 @@ func (c Config) ValidatePool() error {
 	}
 	if strings.TrimSpace(c.DropletPoolRegion) == "" || strings.TrimSpace(c.DropletPoolSize) == "" || strings.TrimSpace(c.DropletPoolImage) == "" {
 		return fmt.Errorf("DROPLET_POOL_REGION, DROPLET_POOL_SIZE, and DROPLET_POOL_IMAGE are required")
+	}
+	if c.DropletPoolRolloutEnabled {
+		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(c.DropletPoolBuildSHA) {
+			return fmt.Errorf("DROPLET_POOL_ROLLOUT_ENABLED requires exact 40-character RENDER_GIT_COMMIT")
+		}
+		if c.DropletPoolCapacity != 5 || c.DropletPoolMax < 9 {
+			return fmt.Errorf("DROPLET_POOL_ROLLOUT_ENABLED requires CAPACITY=5 and a legacy hard cap of at least 9")
+		}
+		if c.DropletPoolRolloutMaxSurge != 1 {
+			return fmt.Errorf("DROPLET_POOL_ROLLOUT_ENABLED requires DROPLET_POOL_ROLLOUT_MAX_SURGE=1")
+		}
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(c.DropletPoolFirewallRulesSHA256) {
+			return fmt.Errorf("DROPLET_POOL_ROLLOUT_ENABLED requires DROPLET_POOL_FIREWALL_RULES_SHA256")
+		}
+		if c.DropletPoolFirewallTag != "fleet:recorder-pool-v1" {
+			return fmt.Errorf("DROPLET_POOL_ROLLOUT_ENABLED requires the exact recorder pool firewall tag")
+		}
+		rawOrigin := strings.TrimSpace(c.DropletPoolBackendAPIURL)
+		u, err := url.Parse(rawOrigin)
+		if err != nil || u.Scheme != "https" || u.User != nil || u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" || u.EscapedPath() != "" {
+			return fmt.Errorf("DROPLET_POOL_ROLLOUT_ENABLED requires a canonical HTTPS backend API origin")
+		}
+		u.Host = strings.ToLower(u.Host)
+		if rawOrigin != u.String() {
+			return fmt.Errorf("DROPLET_POOL_ROLLOUT_ENABLED requires a canonical HTTPS backend API origin")
+		}
 	}
 	return nil
 }

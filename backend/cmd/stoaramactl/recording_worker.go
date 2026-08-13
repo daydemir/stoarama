@@ -4,16 +4,24 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingworker"
 	"golang.org/x/sys/unix"
 )
+
+// recorderExecutableBuildSHA is set by the cloud build's -X linker flag. It is
+// deliberately not sourced from worker environment or flags.
+var recorderExecutableBuildSHA string
 
 const (
 	cloudRecorderMinLeaseFreeBytes  = 2 << 30
@@ -36,7 +44,6 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 	concurrency := fs.Int("concurrency", cfg.RecordingWorkerConcurrency, "concurrent clip captures (must equal the droplet's baked capacity)")
 	heartbeatSec := fs.Int("heartbeat-sec", cfg.RecordingWorkerHeartbeatSec, "lease heartbeat interval seconds")
 	pollSec := fs.Int("poll-sec", cfg.RecordingWorkerPollSec, "job poll interval seconds")
-	buildSHA := fs.String("build-sha", strings.TrimSpace(os.Getenv("RECORDER_BUILD_SHA")), "source commit for this worker binary")
 	duration := fs.Duration("duration", 0, "optional run duration (e.g. 30m, 8h)")
 	_ = fs.Parse(args[1:])
 
@@ -67,12 +74,15 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatalf("init recording api client: %v", err)
 	}
 	worker, err := recordingworker.NewWorker(recordingworker.Config{
-		Client:                       client,
-		WorkerID:                     strings.TrimSpace(*workerID),
-		Concurrency:                  *concurrency,
-		HeartbeatSec:                 *heartbeatSec,
-		PollInterval:                 time.Duration(*pollSec) * time.Second,
-		BuildSHA:                     strings.ToLower(strings.TrimSpace(*buildSHA)),
+		Client:       client,
+		WorkerID:     strings.TrimSpace(*workerID),
+		Concurrency:  *concurrency,
+		HeartbeatSec: *heartbeatSec,
+		PollInterval: time.Duration(*pollSec) * time.Second,
+		BuildSHA:     derivedRecorderExecutableBuildSHA(),
+		DropletRolloutFacts: func(observeCtx context.Context) (*recordingapi.DropletRolloutFacts, error) {
+			return collectDropletRolloutFacts(observeCtx, derivedRecorderExecutableBuildSHA(), *concurrency, *heartbeatSec, *pollSec, *backendAPIURL)
+		},
 		UploadWorkers:                cfg.RelayUploadWorkers,
 		ContinuousNoProgressTimeout:  cloudRecorderNoProgressTimeout,
 		FrozenHLSQuiescenceAllowlist: cfg.RecordingFrozenHLSQuiescenceAllowlist,
@@ -100,6 +110,61 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 	if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Fatalf("recording-worker run failed: %v", err)
 	}
+}
+
+func derivedRecorderExecutableBuildSHA() string {
+	if value := strings.ToLower(strings.TrimSpace(recorderExecutableBuildSHA)); len(value) == 40 {
+		return value
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var revision string
+	modified := false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = strings.ToLower(strings.TrimSpace(setting.Value))
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if modified || len(revision) != 40 {
+		return ""
+	}
+	return revision
+}
+
+func collectDropletRolloutFacts(ctx context.Context, buildSHA string, capacity, heartbeatSec, pollSec int, backendAPIURL string) (*recordingapi.DropletRolloutFacts, error) {
+	if len(buildSHA) != 40 {
+		return nil, fmt.Errorf("running executable has no exact clean build identity")
+	}
+	script, err := os.ReadFile("/usr/local/sbin/stoarama-egress-firewall.sh")
+	if err != nil {
+		return nil, fmt.Errorf("read installed host firewall: %w", err)
+	}
+	v4, err := exec.CommandContext(ctx, "iptables", "-S").Output()
+	if err != nil {
+		return nil, fmt.Errorf("read active IPv4 firewall: %w", err)
+	}
+	v6, err := exec.CommandContext(ctx, "ip6tables", "-S").Output()
+	if err != nil {
+		return nil, fmt.Errorf("read active IPv6 firewall: %w", err)
+	}
+	policy, err := dropletpool.DeriveKernelFirewallPolicy(v4, v6)
+	if err != nil {
+		return nil, err
+	}
+	return &recordingapi.DropletRolloutFacts{
+		ExecutableBuildSHA: buildSHA,
+		Capacity:           capacity,
+		HeartbeatSec:       heartbeatSec,
+		PollSec:            pollSec,
+		BackendAPIURL:      strings.TrimRight(strings.TrimSpace(backendAPIURL), "/"),
+		HostFirewallScript: string(script),
+		KernelPolicy:       policy,
+	}, nil
 }
 
 // defaultRecordingWorkerID prefers RECORDER_SERVER_ID (set via cloud-init so the

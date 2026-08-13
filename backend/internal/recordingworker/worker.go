@@ -28,6 +28,10 @@ type Config struct {
 	HeartbeatSec int
 	PollInterval time.Duration
 	BuildSHA     string
+	// DropletRolloutFacts re-derives host facts on every managed heartbeat.
+	// Returning an error or nil preserves liveness but emits no rollout
+	// observation and therefore cannot advance readiness.
+	DropletRolloutFacts func(context.Context) (*recordingapi.DropletRolloutFacts, error)
 
 	// SkipDropletHeartbeat disables the recorder_droplets liveness touch loop.
 	// Relay workers have no recorder_droplets row and report liveness through the
@@ -215,18 +219,29 @@ func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
 	}
 	ticker := time.NewTicker(w.heartbeatInt)
 	defer ticker.Stop()
-	if err := w.cfg.Client.TouchDroplet(ctx, w.cfg.BuildSHA); err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("recording worker droplet heartbeat error: %v", err)
-	}
+	w.touchDroplet(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.cfg.Client.TouchDroplet(ctx, w.cfg.BuildSHA); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("recording worker droplet heartbeat error: %v", err)
-			}
+			w.touchDroplet(ctx)
 		}
+	}
+}
+
+func (w *Worker) touchDroplet(ctx context.Context) {
+	var facts *recordingapi.DropletRolloutFacts
+	if w.cfg.DropletRolloutFacts != nil {
+		observed, err := w.cfg.DropletRolloutFacts(ctx)
+		if err != nil {
+			log.Printf("recording worker rollout facts unavailable: %v", err)
+		} else {
+			facts = observed
+		}
+	}
+	if err := w.cfg.Client.TouchDropletFacts(ctx, w.cfg.BuildSHA, facts); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("recording worker droplet heartbeat error: %v", err)
 	}
 }
 
