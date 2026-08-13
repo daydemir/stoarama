@@ -157,13 +157,16 @@ func VerifyUStar(archive []byte, manifest ArtifactManifest) error {
 		if string(header[257:263]) != "ustar\x00" || string(header[263:265]) != "00" {
 			return errors.New("archive is not POSIX ustar")
 		}
-		if header[156] != '0' && header[156] != 0 {
+		if header[156] != '0' {
 			return errors.New("archive member is not regular")
 		}
-		if !allZero(header[157:257]) || cString(header[265:297]) != "" || cString(header[297:329]) != "" || !allZero(header[345:500]) {
+		if !allZero(header[157:257]) || !allZero(header[265:329]) || !allZero(header[345:512]) {
 			return errors.New("archive contains link, owner, prefix, or extension metadata")
 		}
-		name := cString(header[0:100])
+		name, err := parseCanonicalString(header[0:100])
+		if err != nil {
+			return err
+		}
 		if err := validateArchivePath(name); err != nil {
 			return err
 		}
@@ -249,25 +252,19 @@ func allZero(data []byte) bool {
 	}
 	return true
 }
-func cString(data []byte) string {
-	if i := bytes.IndexByte(data, 0); i >= 0 {
-		data = data[:i]
+func parseCanonicalString(data []byte) (string, error) {
+	end := bytes.IndexByte(data, 0)
+	if end < 0 || !allZero(data[end:]) {
+		return "", errors.New("archive string field is not canonically zero padded")
 	}
-	return string(data)
+	return string(data[:end]), nil
 }
 
 func parseCanonicalOctal(data []byte) (int64, error) {
-	value := cString(data)
-	value = strings.TrimSuffix(value, " ")
-	if value == "" {
-		return 0, errors.New("empty octal")
+	if len(data) < 2 || data[len(data)-1] != 0 {
+		return 0, errors.New("archive octal field terminator invalid")
 	}
-	if value != "0" && strings.HasPrefix(value, "0") {
-		value = strings.TrimLeft(value, "0")
-		if value == "" {
-			value = "0"
-		}
-	}
+	value := data[:len(data)-1]
 	var result int64
 	for _, c := range value {
 		if c < '0' || c > '7' {
@@ -280,7 +277,12 @@ func parseCanonicalOctal(data []byte) (int64, error) {
 	}
 	return result, nil
 }
-func parseChecksum(data []byte) (int64, error) { return parseCanonicalOctal(data) }
+func parseChecksum(data []byte) (int64, error) {
+	if len(data) != 8 || data[6] != 0 || data[7] != ' ' {
+		return 0, errors.New("archive checksum field terminator invalid")
+	}
+	return parseCanonicalOctal(append(append([]byte(nil), data[:6]...), 0))
+}
 
 func validateArchivePath(name string) error {
 	if name == "" || len(name) > 255 || path.IsAbs(name) || strings.Contains(name, "\\") || path.Clean(name) != name {

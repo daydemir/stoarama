@@ -33,6 +33,47 @@ func completeAxis(axis AxisName, index int32) AxisReport {
 	}
 	return base
 }
+
+func multiUnitPacketAxis() AxisReport {
+	count := int64(8)
+	firstOrdinal, endOrdinal := int64(10), int64(17)
+	firstTimestamp, endTimestamp := int64(100), int64(108)
+	index := int32(0)
+	timeBase := Rational{Num: 1, Den: 30}
+	axis := AxisReport{
+		Axis: AxisDemuxVideo, Status: AxisComplete, StreamIndex: &index,
+		UnitCount: &count, CanonicalSHA256: SHA256([]byte("multi-unit")), TimeBase: &timeBase,
+		FirstOrdinal: &firstOrdinal, FirstTimestamp: &firstTimestamp,
+		EndOrdinal: &endOrdinal, EndTimestamp: &endTimestamp,
+	}
+	for rank := int32(1); rank <= 4; rank++ {
+		for _, side := range []string{"leading", "trailing"} {
+			ordinal := firstOrdinal + int64(rank) - 1
+			if side == "trailing" {
+				ordinal = endOrdinal - 4 + int64(rank)
+			}
+			axis.Packets = append(axis.Packets, PacketEdge{
+				Side: side, Rank: rank, Ordinal: ordinal,
+				PTS: firstTimestamp + ordinal - firstOrdinal, DTS: firstTimestamp + ordinal - firstOrdinal,
+				Duration: 1, TimeBase: timeBase, Flags: "key",
+				SideDataSHA256: SHA256(nil), PayloadSHA256: SHA256([]byte{byte(ordinal)}),
+			})
+		}
+	}
+	return axis
+}
+
+func TestMultiUnitCanonicalLeadingAndTrailingOrdinals(t *testing.T) {
+	config := validConfig()
+	axis := multiUnitPacketAxis()
+	if err := axis.Validate(config); err != nil {
+		t.Fatalf("valid multi-unit edge set rejected: %v", err)
+	}
+	axis.Packets[len(axis.Packets)-1].Ordinal--
+	if err := axis.Validate(config); err == nil {
+		t.Fatal("shifted trailing ordinal accepted")
+	}
+}
 func validReport(t *testing.T) (Config, Report) {
 	t.Helper()
 	c := validConfig()

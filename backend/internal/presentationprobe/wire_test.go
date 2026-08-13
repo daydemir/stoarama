@@ -56,6 +56,24 @@ func TestStrictNDJSONLiveByteLimit(t *testing.T) {
 	}
 }
 
+func TestStrictNDJSONRequiresLFOnlyTerminatedRecordsWithoutFacts(t *testing.T) {
+	config, report := validReport(t)
+	raw := encodeReportFixture(t, report)
+	cases := map[string][]byte{
+		"crlf":              bytes.ReplaceAll(raw, []byte{'\n'}, []byte{'\r', '\n'}),
+		"embedded carriage": bytes.Replace(raw, []byte(`"type":"header"`), []byte("\"type\":\"head\rder\""), 1),
+		"missing final LF":  append([]byte(nil), raw[:len(raw)-1]...),
+	}
+	for name, malformed := range cases {
+		t.Run(name, func(t *testing.T) {
+			partial, err := ParseReportNDJSON(bytes.NewReader(malformed), int64(len(malformed))+1, config)
+			if err == nil || len(partial.Axes) != 0 {
+				t.Fatalf("invalid framing retained facts: err=%v axes=%d", err, len(partial.Axes))
+			}
+		})
+	}
+}
+
 func TestStrictNDJSONRejectsAggregateForgeriesAndDiscardsFacts(t *testing.T) {
 	tests := map[string]func(*Report){
 		"wrong stream": func(report *Report) { *report.Axes[2].StreamIndex = 8 },

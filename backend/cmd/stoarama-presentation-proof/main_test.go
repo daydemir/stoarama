@@ -11,6 +11,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/daydemir/stoarama/backend/internal/presentationprobe"
 )
 
 func capabilityFixture(t *testing.T, name string) string {
@@ -69,57 +71,62 @@ func TestOnlyCLICommandVerifiesPinnedUnrunnableCapabilityWithoutWrites(t *testin
 	}
 }
 
-func TestRealCLIRejectsSelfSignedRootClassAndTargetSubstitutionForMatrix(t *testing.T) {
+func TestRealCLIRejectsCanonicalSelfSignedRootAndClassSubstitution(t *testing.T) {
 	canonical, err := os.ReadFile(capabilityFixture(t, "darwin-arm64-25F84.envelope.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var base map[string]any
-	if err := json.Unmarshal(canonical, &base); err != nil {
+	var envelope presentationprobe.CapabilityEnvelope
+	if err := json.Unmarshal(canonical, &envelope); err != nil {
 		t.Fatal(err)
 	}
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	targets := [][2]string{{"darwin", "arm64"}, {"darwin", "amd64"}, {"linux", "arm64"}, {"linux", "amd64"}}
-	for _, target := range targets {
-		t.Run(target[0]+"-"+target[1], func(t *testing.T) {
-			var envelope map[string]any
-			copyBytes, _ := json.Marshal(base)
-			_ = json.Unmarshal(copyBytes, &envelope)
-			envelope["root_id"] = "caller-root"
-			envelope["provenance_class"] = "ci_test"
-			evidence := envelope["evidence"].(map[string]any)
-			evidence["provenance_class"] = "ci_test"
-			evidence["target_os"] = target[0]
-			evidence["target_arch"] = target[1]
-			raw, err := json.Marshal(envelope)
-			if err != nil {
-				t.Fatal(err)
-			}
-			sig := ed25519.Sign(private, append([]byte("presentation-probe-capability-v2\x00"), raw...))
-			root := t.TempDir()
-			envelopePath := filepath.Join(root, "input.json")
-			signaturePath := filepath.Join(root, "input.sig")
-			if err := os.WriteFile(envelopePath, raw, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(signaturePath, []byte(hex.EncodeToString(sig)), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			before := names(t, root)
-			var output bytes.Buffer
-			if err := run([]string{"verify-capability", "--envelope", envelopePath, "--signature", signaturePath}, &output); err == nil {
-				t.Fatal("self-signed/root/class/target substitution accepted")
-			}
-			if output.Len() != 0 {
-				t.Fatalf("failed verification emitted success output: %q", output.String())
-			}
-			if after := names(t, root); !reflect.DeepEqual(before, after) {
-				t.Fatalf("failed CLI wrote files: before=%v after=%v", before, after)
-			}
-		})
+	envelope.RootID = "caller-root"
+	envelope.ProvenanceClass = presentationprobe.ProvenanceCI
+	envelope.Evidence.ProvenanceClass = presentationprobe.ProvenanceCI
+	evidenceBytes, err := json.Marshal(envelope.Evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.EvidenceSHA256 = presentationprobe.SHA256(evidenceBytes)
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonicalRoundTrip presentationprobe.CapabilityEnvelope
+	if err := json.Unmarshal(raw, &canonicalRoundTrip); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := json.Marshal(canonicalRoundTrip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, roundTrip) {
+		t.Fatal("typed capability envelope did not preserve canonical bytes")
+	}
+	sig := ed25519.Sign(private, append([]byte(presentationprobe.CapabilityDomain+"\x00"), raw...))
+	root := t.TempDir()
+	envelopePath := filepath.Join(root, "input.json")
+	signaturePath := filepath.Join(root, "input.sig")
+	if err := os.WriteFile(envelopePath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(signaturePath, []byte(hex.EncodeToString(sig)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := names(t, root)
+	var output bytes.Buffer
+	if err := run([]string{"verify-capability", "--envelope", envelopePath, "--signature", signaturePath}, &output); err == nil {
+		t.Fatal("canonical self-signed/root/class substitution accepted")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("failed verification emitted success output: %q", output.String())
+	}
+	if after := names(t, root); !reflect.DeepEqual(before, after) {
+		t.Fatalf("failed CLI wrote files: before=%v after=%v", before, after)
 	}
 }
 

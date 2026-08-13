@@ -231,8 +231,11 @@ func (a AxisReport) Validate(config Config) error {
 		}
 		return nil
 	}
-	if a.StreamIndex == nil || a.UnitCount == nil || *a.UnitCount <= 0 || *a.UnitCount > int64(config.Limits.Units) || !ValidSHA256(a.CanonicalSHA256) || a.TimeBase == nil || a.FirstOrdinal == nil || a.FirstTimestamp == nil || a.EndOrdinal == nil || a.EndTimestamp == nil {
+	if a.StreamIndex == nil || a.UnitCount == nil || *a.UnitCount <= 0 || !ValidSHA256(a.CanonicalSHA256) || a.TimeBase == nil || a.FirstOrdinal == nil || a.FirstTimestamp == nil || a.EndOrdinal == nil || a.EndTimestamp == nil {
 		return errors.New("complete axis summary incomplete")
+	}
+	if uint64(*a.UnitCount) > config.Limits.Units {
+		return errors.New("complete axis exceeds configured unit limit")
 	}
 	if err := a.TimeBase.Validate(); err != nil {
 		return err
@@ -495,4 +498,3 @@ func writeField(b *bytes.Buffer, value string) {
 	_ = binary.Write(b, binary.BigEndian, uint32(len(value)))
 	_, _ = b.WriteString(value)
 }
-func writeInt64(b *bytes.Buffer, value int64) { _ = binary.Write(b, binary.BigEndian, value) }

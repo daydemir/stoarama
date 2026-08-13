@@ -33,6 +33,7 @@ func ParseReportNDJSON(reader io.Reader, maximum int64, config Config) (Report, 
 	limited := &hardLimitReader{reader: reader, remaining: maximum}
 	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	scanner.Split(splitStrictLFRecord)
 	records := make([]wireRecord, 0, 8)
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
@@ -106,6 +107,20 @@ func ParseReportNDJSON(reader io.Reader, maximum int64, config Config) (Report, 
 		return Report{}, err
 	}
 	return report, nil
+}
+
+func splitStrictLFRecord(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if index := bytes.IndexByte(data, '\n'); index >= 0 {
+		line := data[:index]
+		if bytes.IndexByte(line, '\r') >= 0 {
+			return 0, nil, errors.New("report record contains carriage return")
+		}
+		return index + 1, line, nil
+	}
+	if atEOF && len(data) != 0 {
+		return 0, nil, errors.New("report record missing final newline")
+	}
+	return 0, nil, nil
 }
 
 func rejectDuplicateJSONKeys(line []byte) error {

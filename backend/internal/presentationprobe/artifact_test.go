@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -106,6 +107,55 @@ func TestArtifactRejectsSignatureArchiveAndUStarTampering(t *testing.T) {
 	}
 	_ = newRaw
 }
+
+func rewriteUStarChecksum(header []byte) {
+	for i := 148; i < 156; i++ {
+		header[i] = ' '
+	}
+	var sum int64
+	for _, value := range header {
+		sum += int64(value)
+	}
+	copy(header[148:156], fmt.Sprintf("%06o\x00 ", sum))
+}
+
+func TestUStarRejectsEveryIgnoredOrAlternateHeaderEncoding(t *testing.T) {
+	_, _, archive, manifest, _ := makeArtifact(t)
+	nameEnd := bytes.IndexByte(archive[0:100], 0)
+	if nameEnd < 0 || nameEnd+1 >= 100 {
+		t.Fatal("fixture name has no padding to mutate")
+	}
+	mutations := map[string]func([]byte){
+		"reserved byte":         func(header []byte) { header[500] = 1 },
+		"name padding":          func(header []byte) { header[nameEnd+1] = 1 },
+		"owner padding":         func(header []byte) { header[266] = 1 },
+		"group padding":         func(header []byte) { header[298] = 1 },
+		"link padding":          func(header []byte) { header[158] = 1 },
+		"prefix padding":        func(header []byte) { header[346] = 1 },
+		"nul regular typeflag":  func(header []byte) { header[156] = 0 },
+		"space-padded mode":     func(header []byte) { header[100] = ' ' },
+		"space mode terminator": func(header []byte) { header[107] = ' ' },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := append([]byte(nil), archive...)
+			mutate(changed[:512])
+			rewriteUStarChecksum(changed[:512])
+			if err := VerifyUStar(changed, manifest); err == nil {
+				t.Fatal("alternate ustar header encoding accepted")
+			}
+		})
+	}
+
+	t.Run("alternate checksum padding", func(t *testing.T) {
+		changed := append([]byte(nil), archive...)
+		changed[148] = ' '
+		if err := VerifyUStar(changed, manifest); err == nil {
+			t.Fatal("alternate checksum encoding accepted")
+		}
+	})
+}
+
 func TestArtifactManifestRejectsProductionAndUnsafePaths(t *testing.T) {
 	_, _, _, m, _ := makeArtifact(t)
 	m.ProvenanceClass = "production"

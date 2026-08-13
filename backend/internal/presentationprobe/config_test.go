@@ -2,6 +2,7 @@ package presentationprobe
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -69,6 +70,79 @@ func TestConfigRejectsNoncanonicalFileIdentity(t *testing.T) {
 				if _, err := EncodeConfig(config); err == nil {
 					t.Fatalf("%s accepted noncanonical value %q", field, value)
 				}
+			}
+		})
+	}
+}
+
+func TestConfigRejectsInvalidSealedIdentityAndUnknownMethod(t *testing.T) {
+	mutations := map[string]func(*FileIdentity){
+		"sealed device":  func(identity *FileIdentity) { identity.Device = "1" },
+		"sealed inode":   func(identity *FileIdentity) { identity.Inode = "1" },
+		"empty clone":    func(identity *FileIdentity) { identity.CloneIdentity = "" },
+		"invalid clone":  func(identity *FileIdentity) { identity.CloneIdentity = "not-a-sha" },
+		"unknown method": func(identity *FileIdentity) { identity.Method = "other" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			config := validConfig()
+			config.Identity = FileIdentity{Method: "sealed_memfd", CloneIdentity: SHA256([]byte("clone"))}
+			mutate(&config.Identity)
+			if _, err := EncodeConfig(config); err == nil {
+				t.Fatal("invalid file identity accepted")
+			}
+		})
+	}
+}
+
+func configAudioPresenceOffset(t *testing.T, raw []byte) int {
+	t.Helper()
+	offset := len(ConfigDomain) + 1 + 2 + 4 + 32 + 8
+	skipString := func() {
+		if offset+4 > len(raw) {
+			t.Fatal("config fixture ended before string length")
+		}
+		length := int(binary.BigEndian.Uint32(raw[offset : offset+4]))
+		offset += 4 + length
+		if offset > len(raw) {
+			t.Fatal("config fixture ended inside string")
+		}
+	}
+	for range 8 {
+		skipString()
+	}
+	offset += 4
+	skipString()
+	skipString()
+	offset += 16
+	if offset >= len(raw) {
+		t.Fatal("config fixture has no audio presence byte")
+	}
+	return offset
+}
+
+func TestDecodeConfigRejectsHeaderLengthAndAudioPresenceMutations(t *testing.T) {
+	raw, err := EncodeConfig(validConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionOffset := len(ConfigDomain) + 1
+	lengthOffset := versionOffset + 2
+	mutations := map[string]func([]byte){
+		"domain":  func(data []byte) { data[0] ^= 1 },
+		"version": func(data []byte) { binary.BigEndian.PutUint16(data[versionOffset:versionOffset+2], configVersion+1) },
+		"declared length": func(data []byte) {
+			length := binary.BigEndian.Uint32(data[lengthOffset : lengthOffset+4])
+			binary.BigEndian.PutUint32(data[lengthOffset:lengthOffset+4], length-1)
+		},
+		"audio presence": func(data []byte) { data[configAudioPresenceOffset(t, data)] = 2 },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := append([]byte(nil), raw...)
+			mutate(changed)
+			if _, err := DecodeConfig(changed); err == nil {
+				t.Fatal("mutated config accepted")
 			}
 		})
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 )
 
@@ -144,13 +145,14 @@ func EncodeConfig(c Config) ([]byte, error) {
 	}
 	var body bytes.Buffer
 	writeString := func(value string) error {
-		if len(value) > 1<<20 {
-			return errors.New("config string too large")
-		}
-		if err := binary.Write(&body, binary.BigEndian, uint32(len(value))); err != nil {
+		length, err := checkedUint32Length(len(value), 1<<20)
+		if err != nil {
 			return err
 		}
-		_, err := body.WriteString(value)
+		if err := binary.Write(&body, binary.BigEndian, length); err != nil {
+			return err
+		}
+		_, err = body.WriteString(value)
 		return err
 	}
 	_, _ = body.Write(c.InvocationID[:])
@@ -197,7 +199,11 @@ func EncodeConfig(c Config) ([]byte, error) {
 	_, _ = out.WriteString(ConfigDomain)
 	_ = out.WriteByte(0)
 	_ = binary.Write(&out, binary.BigEndian, configVersion)
-	_ = binary.Write(&out, binary.BigEndian, uint32(body.Len()))
+	bodyLength, err := checkedUint32Length(body.Len(), math.MaxUint32)
+	if err != nil {
+		return nil, err
+	}
+	_ = binary.Write(&out, binary.BigEndian, bodyLength)
 	_, _ = out.Write(body.Bytes())
 	return out.Bytes(), nil
 }
@@ -211,12 +217,23 @@ func DecodeConfig(data []byte) (Config, error) {
 	}
 	var version uint16
 	var length uint32
-	if binary.Read(r, binary.BigEndian, &version) != nil || version != configVersion || binary.Read(r, binary.BigEndian, &length) != nil || uint64(length) != uint64(r.Len()) {
+	if err := binary.Read(r, binary.BigEndian, &version); err != nil || version != configVersion {
+		return c, errors.New("config version or length mismatch")
+	}
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return c, errors.New("config version or length mismatch")
+	}
+	remaining := r.Len()
+	if remaining < 0 || uint64(length) != uint64(remaining) {
 		return c, errors.New("config version or length mismatch")
 	}
 	readString := func() (string, error) {
 		var n uint32
-		if err := binary.Read(r, binary.BigEndian, &n); err != nil || n > 1<<20 || uint64(n) > uint64(r.Len()) {
+		if err := binary.Read(r, binary.BigEndian, &n); err != nil {
+			return "", errors.New("invalid config string length")
+		}
+		remaining := r.Len()
+		if n > 1<<20 || remaining < 0 || uint64(n) > uint64(remaining) {
 			return "", errors.New("invalid config string length")
 		}
 		b := make([]byte, n)
@@ -277,4 +294,11 @@ func DecodeConfig(data []byte) (Config, error) {
 		return c, errors.New("trailing config bytes")
 	}
 	return c, c.Validate()
+}
+
+func checkedUint32Length(value int, maximum uint64) (uint32, error) {
+	if value < 0 || uint64(value) > maximum || uint64(value) > math.MaxUint32 {
+		return 0, errors.New("config length exceeds uint32 bound")
+	}
+	return uint32(value), nil
 }
