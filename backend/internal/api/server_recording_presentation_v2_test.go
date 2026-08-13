@@ -93,7 +93,7 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 	if _, err := pool.Exec(ctx, `INSERT INTO accounts(id,email,name,status,role) VALUES($1,$2,$2,'active','admin') ON CONFLICT(id) DO NOTHING`, accountID, fmt.Sprintf("presentation-%d@example.test", accountID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO storage_destinations(id,account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,managed) VALUES($1,$2,'v2','r2_managed','https://storage.example.test','auto','v2','','access',decode('00','hex'),'active',true)`, destinationID, accountID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO storage_destinations(id,account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,verified_at,managed,shared) VALUES($1,$2,'v2','r2_managed','https://storage.example.test','auto','v2','','access',decode('00','hex'),'verified',now(),true,false)`, destinationID, accountID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,recording_state) VALUES($1,'test',$2,$2,$2,$3,$4,'hls','video_manifest','video_live','continuous_video','on')`, streamID, fmt.Sprintf("v2-%d", suffix), fmt.Sprintf("https://source.example.test/%d.m3u8", suffix), fmt.Sprintf("https://source.example.test/page/%d", suffix)); err != nil {
