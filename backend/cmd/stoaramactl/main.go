@@ -95,6 +95,8 @@ func main() {
 		runRecordingHealth(ctx, cfg, os.Args[2:])
 	case "recording-preopen":
 		runRecordingPreopen(ctx, cfg, os.Args[2:])
+	case "recording-stitch":
+		runRecordingStitch(ctx, cfg, os.Args[2:])
 	case "relay-connectivity":
 		runRelayConnectivity(ctx, cfg, os.Args[2:])
 	case "relay-routing":
