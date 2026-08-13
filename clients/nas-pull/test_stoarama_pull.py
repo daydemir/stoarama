@@ -2123,6 +2123,22 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             with self.assertRaises(pull.InventoryScanStopped):
                 pull.snapshot_certification_run(paths, identities, clips, root / "preempted", cancel)
 
+    def test_run_snapshot_never_writes_past_frozen_size(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); source_dir = root / "source"; snapshot_dir = root / "snapshots"
+            source_dir.mkdir(); snapshot_dir.mkdir()
+            path = source_dir / "growing.mp4"
+            frozen = b"frozen"
+            path.write_bytes(frozen + b"unbounded-tail")
+            identity = (pull.certification_identity(path.stat()), pull.certification_identity(path.parent.stat()))
+            clip = {"size_bytes": len(frozen), "sha256": hashlib.sha256(frozen).hexdigest()}
+            with self.assertRaisesRegex(pull.MediaCertificationError, "exceeds frozen size"):
+                pull.snapshot_certification_run([path], [identity], [clip], snapshot_dir, threading.Event())
+            snapshot = snapshot_dir / "clip-0001.mp4"
+            self.assertLessEqual(snapshot.stat().st_size, len(frozen))
+            with self.assertRaisesRegex(pull.MediaCertificationError, "different lengths"):
+                pull.snapshot_certification_run([path], [], [clip], snapshot_dir, threading.Event())
+
     def test_native_stitch_collects_only_frozen_window_rows(self):
         database = sqlite3.connect(":memory:")
         database.execute("""CREATE TABLE files(clip_id integer,recording_id integer,relative_path text,size_bytes integer,

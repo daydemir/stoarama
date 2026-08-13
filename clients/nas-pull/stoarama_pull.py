@@ -1927,6 +1927,8 @@ def verify_certification_source_identities(paths, identities, phase):
 
 def snapshot_certification_run(paths, identities, clips, destination, cancel):
     """Copy exact frozen bytes into one task-owned run using O(1) source fds."""
+    if len(paths) != len(identities) or len(paths) != len(clips):
+        raise MediaCertificationError("run snapshot inputs have different lengths")
     snapshots = []
     for ordinal, (path, identity, clip) in enumerate(zip(paths, identities, clips), start=1):
         if cancel.is_set():
@@ -1939,12 +1941,13 @@ def snapshot_certification_run(paths, identities, clips, destination, cancel):
         try:
             if (certification_identity(os.fstat(source)), certification_identity(path.parent.stat())) != identity:
                 raise MediaCertificationError("media identity changed before run snapshot")
-            while True:
+            expected_size = int(clip["size_bytes"])
+            while copied < expected_size:
                 if cancel.is_set():
                     raise InventoryScanStopped("certification yielded while snapshotting a run")
-                chunk = os.read(source, 1024 * 1024)
+                chunk = os.read(source, min(1024 * 1024, expected_size - copied))
                 if not chunk:
-                    break
+                    raise MediaCertificationError("run snapshot source ended before frozen size")
                 digest.update(chunk)
                 copied += len(chunk)
                 view = memoryview(chunk)
@@ -1953,13 +1956,15 @@ def snapshot_certification_run(paths, identities, clips, destination, cancel):
                     if written <= 0:
                         raise MediaCertificationError("run snapshot write made no progress")
                     view = view[written:]
+            if os.read(source, 1):
+                raise MediaCertificationError("run snapshot source exceeds frozen size")
             os.fsync(target)
             if (certification_identity(os.fstat(source)), certification_identity(path.parent.stat())) != identity:
                 raise MediaCertificationError("media identity changed during run snapshot")
         finally:
             os.close(target)
             os.close(source)
-        if copied != int(clip["size_bytes"]) or digest.hexdigest() != clip["sha256"]:
+        if copied != expected_size or digest.hexdigest() != clip["sha256"]:
             raise MediaCertificationError("run snapshot differs from frozen bytes")
         snapshots.append(snapshot)
     return snapshots
