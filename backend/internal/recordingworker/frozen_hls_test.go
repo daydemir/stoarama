@@ -531,16 +531,22 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 	baseline := frozenHLSSnapshot{TargetDuration: 2 * time.Millisecond, MediaSequence: 1, ManifestSHA256: "manifest", LastSegmentSHA256: "segment"}
 	var captureCalls atomic.Int64
 	var changed atomic.Bool
+	launches := make(chan int64, 4)
 	jobCtx, cancelJob := context.WithCancel(context.Background())
 	defer cancelJob()
-	w.continuousCapture = func(context.Context, string, time.Duration, string, *int, string, func(capture.Segment) error, string) error {
+	w.continuousCapture = func(ctx context.Context, _ string, _ time.Duration, _ string, _ *int, _ string, _ func(capture.Segment) error, _ string) error {
 		call := captureCalls.Add(1)
 		if call == 3 {
 			changed.Store(true)
 		}
+		select {
+		case launches <- call:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		if call == 4 {
-			cancelJob()
-			return context.Canceled
+			<-ctx.Done()
+			return ctx.Err()
 		}
 		return capture.ErrContinuousNoOutput
 	}
@@ -552,21 +558,46 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 		}
 		return observed, nil
 	}
-	windowEnd := time.Now().Add(time.Second)
+	windowEnd := time.Now().Add(30 * time.Second)
 	job := recordingapi.RecordingJob{
 		JobID: 437, RecordingID: 437, SourceURL: "https://example.com/live.m3u8",
 		ClipDurationSec: 30, Kind: "continuous_window", WindowEndAt: &windowEnd,
-		LeaseToken: "lease", LeaseExpiresAt: time.Now().Add(time.Second),
+		LeaseToken: "lease", LeaseExpiresAt: time.Now().Add(30 * time.Second),
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		w.processContinuousJob(jobCtx, job)
 	}()
+	var launchErr error
+	for want := int64(1); want <= 4; want++ {
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case got := <-launches:
+			if got != want {
+				launchErr = fmt.Errorf("capture launch=%d want %d", got, want)
+			}
+		case <-timer.C:
+			launchErr = fmt.Errorf("timed out waiting for capture launch %d", want)
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if launchErr != nil {
+			break
+		}
+	}
+	cancelJob()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("continuous lifecycle did not finish")
+	}
+	if launchErr != nil {
+		t.Fatal(launchErr)
 	}
 	if captureCalls.Load() != 4 {
 		t.Fatalf("capture launches=%d want 4", captureCalls.Load())
