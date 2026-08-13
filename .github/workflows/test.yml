@@ -70,6 +70,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/db ./internal/api ./cmd/stoaramactl -run 'Test(RecordingNativeStitchMigrationAndLifecycle|NativeStitchClaimSelectsEligibleConnectionBeforeLimitAndFencesLease|NativeStitchCompletionAcceptsExactFullPassAndRejectsForgedSeamProvenance|NativeStitchCompletionRejectsForgedHistoricalSingleClipPass|PlanOneNativeStitchPostgresHistoricalPartialAndIntentFence)' -count=1 -v
+      - name: Test presentation v2 C1 is structurally disabled and evidence is fenced
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/db ./internal/api -run 'Test(RecordingPresentationV2MigrationRunsThroughMigrateUp|RecordingPresentationV2DisabledClaimAndFencedLifecyclePostgres|RecordingPresentationV2CampaignProtectionFencePostgres|RecordingPresentationV2IngestAmbiguousReplayAndUnavailablePostgres|RecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent|RecordingClipTimestampContractMigration)' -count=1 -v
       - name: Test dynamic streak priority PostgreSQL schedule and plan
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

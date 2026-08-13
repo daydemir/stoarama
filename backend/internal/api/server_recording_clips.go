@@ -801,28 +801,29 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 }
 
 type recordingClipIngestRequest struct {
-	IntentID                 string                     `json:"intent_id"`
-	JobID                    int64                      `json:"job_id"`
-	SizeBytes                int64                      `json:"size_bytes"`
-	ETag                     string                     `json:"etag"`
-	SHA256                   string                     `json:"sha256"`
-	DurationMs               int64                      `json:"duration_ms"`
-	VideoCodec               string                     `json:"video_codec"`
-	AudioCodec               string                     `json:"audio_codec"`
-	AudioPresent             bool                       `json:"audio_present"`
-	ActualFPS                *float64                   `json:"actual_fps"`
-	VideoWidth               int                        `json:"video_width"`
-	VideoHeight              int                        `json:"video_height"`
-	Container                string                     `json:"container"`
-	ResolvedURL              string                     `json:"resolved_url"`
-	ClipStartAt              string                     `json:"clip_start_at"`
-	ClipEndAt                string                     `json:"clip_end_at"`
-	CaptureSequence          int64                      `json:"capture_sequence"`
-	CaptureAttemptID         string                     `json:"capture_attempt_id"`
-	TimestampContractVersion string                     `json:"timestamp_contract_version"`
-	TimestampContract        *capture.TimestampContract `json:"timestamp_contract"`
-	TimestampContractStatus  string                     `json:"timestamp_contract_status"`
-	TimestampContractReason  string                     `json:"timestamp_contract_reason"`
+	IntentID                 string                        `json:"intent_id"`
+	JobID                    int64                         `json:"job_id"`
+	SizeBytes                int64                         `json:"size_bytes"`
+	ETag                     string                        `json:"etag"`
+	SHA256                   string                        `json:"sha256"`
+	DurationMs               int64                         `json:"duration_ms"`
+	VideoCodec               string                        `json:"video_codec"`
+	AudioCodec               string                        `json:"audio_codec"`
+	AudioPresent             bool                          `json:"audio_present"`
+	ActualFPS                *float64                      `json:"actual_fps"`
+	VideoWidth               int                           `json:"video_width"`
+	VideoHeight              int                           `json:"video_height"`
+	Container                string                        `json:"container"`
+	ResolvedURL              string                        `json:"resolved_url"`
+	ClipStartAt              string                        `json:"clip_start_at"`
+	ClipEndAt                string                        `json:"clip_end_at"`
+	CaptureSequence          int64                         `json:"capture_sequence"`
+	CaptureAttemptID         string                        `json:"capture_attempt_id"`
+	TimestampContractVersion string                        `json:"timestamp_contract_version"`
+	TimestampContract        *capture.TimestampContract    `json:"timestamp_contract"`
+	TimestampContractStatus  string                        `json:"timestamp_contract_status"`
+	TimestampContractReason  string                        `json:"timestamp_contract_reason"`
+	PresentationProbe        *presentationV2IngestEnvelope `json:"presentation_probe,omitempty"`
 }
 
 func nullablePositiveInt(value int) any {
@@ -903,6 +904,32 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, "intent_id must be a uuid")
 		return
+	}
+	presentationAttemptID, err := validatePresentationV2IngestEnvelope(req.PresentationProbe)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	presentationRequestSHA := ""
+	if req.PresentationProbe != nil {
+		if leaseToken == nil || req.CaptureSequence <= 0 || !lowerHex64(strings.ToLower(strings.TrimSpace(req.SHA256))) {
+			util.WriteError(w, http.StatusBadRequest, "presentation probe requires capture_sequence and exact sha256")
+			return
+		}
+		presentationRequestSHA = presentationV2IngestRequestSHA(intentID, req)
+		prior, replayErr := loadPresentationV2IngestReplay(r.Context(), s.pool, intentID, principal, leaseToken)
+		if replayErr == nil {
+			if prior.RequestSHA256 != presentationRequestSHA {
+				util.WriteError(w, http.StatusConflict, "presentation ingest differs from committed request")
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, presentationV2ReplayResponse(prior))
+			return
+		}
+		if !errors.Is(replayErr, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, "load prior presentation ingest")
+			return
+		}
 	}
 	clipStartAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(req.ClipStartAt))
 	if err != nil {
@@ -992,6 +1019,25 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		&accessKeyID, &secretEnc,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if req.PresentationProbe != nil {
+			prior, replayErr := loadPresentationV2IngestReplay(r.Context(), tx, intentID, principal, leaseToken)
+			if replayErr == nil {
+				if prior.RequestSHA256 != presentationRequestSHA {
+					util.WriteError(w, http.StatusConflict, "presentation ingest differs from committed request")
+					return
+				}
+				if err = tx.Commit(r.Context()); err != nil {
+					util.WriteError(w, http.StatusInternalServerError, "commit presentation ingest replay")
+					return
+				}
+				util.WriteJSON(w, http.StatusOK, presentationV2ReplayResponse(prior))
+				return
+			}
+			if replayErr != nil && !errors.Is(replayErr, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusInternalServerError, "load concurrent presentation ingest replay")
+				return
+			}
+		}
 		util.WriteJSON(w, http.StatusConflict, map[string]any{
 			"code":  recordingapi.ErrorCodeUploadIntentUnavailable,
 			"error": "upload intent not found, already consumed, or job not owned",
@@ -1186,6 +1232,41 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("consume upload intent: %v", err))
 		return
 	}
+	var presentationResponse map[string]any
+	if req.PresentationProbe != nil {
+		taskID := uuid.New()
+		state, retentionState := "awaiting_retention", "awaiting"
+		if req.PresentationProbe.Disposition == "unavailable" {
+			state, retentionState = "unavailable", "none"
+		}
+		responseSHA := presentationV2ResponseSHA(taskID, clipID, state)
+		var deadline time.Time
+		err = tx.QueryRow(r.Context(), `
+			INSERT INTO recording_presentation_v2_probe_tasks(
+			 id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,
+			 lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,
+				 staging_identity_sha256,staging_method,request_sha256,response_sha256,initial_disposition,state,retention_state,
+				 unavailable_reason,absolute_deadline_at)
+			SELECT $1,p.admission_id,p.id,p.account_id,p.recording_id,p.stream_id,p.recording_job_id,$2,$3,
+				 p.lease_token,p.node_id,$4,$5,$6,$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,NULLIF($15,''),LEAST(now()+interval '10 minutes',a.deadline_at)
+			FROM recording_presentation_v2_attempts p
+			JOIN recording_presentation_v2_admissions a ON a.id=p.admission_id
+			WHERE p.id=$16 AND p.account_id=$17 AND p.node_id=$18 AND p.recording_job_id=$19 AND p.lease_token=$20
+			RETURNING absolute_deadline_at
+		`, taskID, clipID, intentID, req.CaptureSequence, head.SizeBytes, strings.ToLower(strings.TrimSpace(req.SHA256)),
+			strings.ToLower(req.PresentationProbe.LocalUploadIdentitySHA256), strings.ToLower(req.PresentationProbe.StagingIdentitySHA256),
+			req.PresentationProbe.StagingMethod, presentationRequestSHA, responseSHA, req.PresentationProbe.Disposition, state, retentionState,
+			req.PresentationProbe.UnavailableReason, presentationAttemptID, principal.AccountID, principal.NodeID, jobID, captureLeaseToken).Scan(&deadline)
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusConflict, "presentation attempt unavailable for ingest")
+			return
+		}
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("create presentation probe task: %v", err))
+			return
+		}
+		presentationResponse = map[string]any{"task_id": taskID, "state": state, "retention_state": retentionState, "absolute_deadline_at": deadline, "request_sha256": presentationRequestSHA, "creation_response_sha256": responseSHA}
+	}
 	if _, err := tx.Exec(r.Context(), `
 		UPDATE recordings
 		SET last_clip_at=now(), consecutive_failures=0, last_error_text='', updated_at=now()
@@ -1199,7 +1280,11 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit ingest tx: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"clip_id": clipID})
+	response := map[string]any{"clip_id": clipID}
+	if presentationResponse != nil {
+		response["presentation_probe"] = presentationResponse
+	}
+	util.WriteJSON(w, http.StatusOK, response)
 }
 
 func validTimestampProvenance(req recordingClipIngestRequest) (uuid.UUID, bool) {
