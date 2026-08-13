@@ -369,8 +369,11 @@ func (w *Worker) observeCurrentFrozenHLS(ctx context.Context, job recordingapi.R
 
 func isDirectHLSURL(rawURL string) bool {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
 	scheme := strings.ToLower(u.Scheme)
-	if err != nil || u.User != nil || u.Hostname() == "" || u.Fragment != "" || (scheme != "http" && scheme != "https") {
+	if u.User != nil || u.Hostname() == "" || u.Fragment != "" || (scheme != "http" && scheme != "https") {
 		return false
 	}
 	return strings.EqualFold(pathExtension(u.Path), ".m3u8")

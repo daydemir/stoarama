@@ -49,8 +49,9 @@ type segmentDeliveryResult struct {
 	// "unacknowledged segment" condition the window-close and temp-dir cleanup
 	// decisions key on.
 	pending int
-	// ingested reports whether at least one segment was delivered this attempt
-	// (the supervisor's healthy-connection signal that resets reconnect backoff).
+	// ingested reports whether at least one unique segment was ingested this
+	// attempt (the supervisor's healthy-connection signal that resets reconnect
+	// backoff). Acknowledged replays do not set it.
 	ingested bool
 }
 

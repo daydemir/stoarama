@@ -331,6 +331,27 @@ func TestSegmentDeliveryPoolReplayAcknowledgesWithoutUniqueProgress(t *testing.T
 	}
 }
 
+func TestSegmentDeliveryPoolMixedReplayAndUniqueReportsUniqueProgress(t *testing.T) {
+	pool := startSegmentDeliveryPool(1, nil, func(seg capture.Segment) error {
+		if seg.SHA256 == strings.Repeat("a", 64) {
+			return errSegmentReplayAcknowledged
+		}
+		return nil
+	})
+	for _, sha := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
+		if err := pool.Submit(capture.Segment{SHA256: sha}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := pool.close()
+	if result.err != nil || result.pending != 0 || result.submitted != 2 {
+		t.Fatalf("mixed result=%+v", result)
+	}
+	if !result.ingested {
+		t.Fatal("unique ingest was lost when the same attempt also acknowledged a replay")
+	}
+}
+
 func TestContinuousNoProgressExpired(t *testing.T) {
 	started := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	timeout := 5 * time.Minute
