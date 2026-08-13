@@ -176,8 +176,15 @@ func TestClassifyFFmpegOrigin(t *testing.T) {
 
 func TestRefreshFFmpegTelemetryRecoversAndRevokes(t *testing.T) {
 	var calls atomic.Int64
+	loaded := make(chan int64, 4)
+	release := make(chan struct{}, 2)
 	load := func(string) *ffmpegTelemetry {
-		qualified := calls.Add(1) == 2
+		call := calls.Add(1)
+		loaded <- call
+		if call == 2 || call == 3 {
+			<-release
+		}
+		qualified := call == 2
 		return &ffmpegTelemetry{runtime: ffmpegRuntimeEvidence{Qualified: qualified}}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -188,21 +195,37 @@ func TestRefreshFFmpegTelemetryRecoversAndRevokes(t *testing.T) {
 		refreshFFmpegTelemetry(ctx, "unused", time.Millisecond, &destination, load)
 		close(done)
 	}()
-	want := []bool{false, true, false}
-	seen := 0
-	deadline := time.NewTimer(time.Second)
-	defer deadline.Stop()
-	for seen < len(want) {
+	waitForLoad := func(want int64) {
+		t.Helper()
 		select {
-		case <-deadline.C:
-			t.Fatalf("refresh sequence stopped at %d", seen)
-		default:
-			current := destination.Load()
-			if current != nil && current.runtime.Qualified == want[seen] {
-				seen++
+		case got := <-loaded:
+			if got != want {
+				t.Fatalf("load call=%d want %d", got, want)
 			}
+		case <-time.After(time.Second):
+			t.Fatalf("load call %d did not start", want)
 		}
 	}
+	assertQualified := func(want bool) {
+		t.Helper()
+		current := destination.Load()
+		if current == nil || current.runtime.Qualified != want {
+			t.Fatalf("qualified=%v want %v", current != nil && current.runtime.Qualified, want)
+		}
+	}
+
+	// The next load cannot start until the prior result has been stored. Hold
+	// calls two and three so each transition is observed before it can be
+	// overwritten by the following refresh.
+	waitForLoad(1)
+	waitForLoad(2)
+	assertQualified(false)
+	release <- struct{}{}
+	waitForLoad(3)
+	assertQualified(true)
+	release <- struct{}{}
+	waitForLoad(4)
+	assertQualified(false)
 	cancel()
 	select {
 	case <-done:
