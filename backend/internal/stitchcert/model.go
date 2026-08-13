@@ -635,19 +635,50 @@ func ValidateDeterministicFailureEvidence(report Report, reasons []string) error
 	}
 	switch reasons[0] {
 	case "clip_decode_failed":
-		for _, clip := range report.Clips {
-			if clip.StrictDecode == "failed" && report.NASByteDecodeStatus == "failed" {
-				return nil
+		if report.NASByteDecodeStatus != "failed" || len(report.Clips) == 0 || len(report.NativeRuns) != 0 ||
+			len(report.Seams) != 0 || len(report.AudioSeams) != 0 {
+			break
+		}
+		for i, clip := range report.Clips {
+			want := "passed"
+			if i == len(report.Clips)-1 {
+				want = "failed"
+			}
+			if clip.StrictDecode != want {
+				return fmt.Errorf("clip failure is not the single last evaluated fact")
 			}
 		}
+		return nil
 	case "run_concat_failed":
-		for _, run := range report.NativeRuns {
-			if run.ValidationStatus == "failed" && report.NativeRunConcatStatus == "failed" {
-				return nil
+		if report.NativeRunConcatStatus != "failed" || len(report.Clips) == 0 || len(report.NativeRuns) == 0 ||
+			len(report.Seams) != 0 || len(report.AudioSeams) != 0 {
+			break
+		}
+		for _, clip := range report.Clips {
+			if clip.StrictDecode != "passed" {
+				return fmt.Errorf("run failure contains an incompatible clip failure")
 			}
 		}
+		for i, run := range report.NativeRuns {
+			if i == len(report.NativeRuns)-1 {
+				if run.ValidationStatus != "failed" {
+					return fmt.Errorf("run failure is not the last evaluated fact")
+				}
+			} else if run.ValidationStatus == "failed" || run.ValidationStatus == "unknown" {
+				return fmt.Errorf("run failure contains an earlier incomplete fact")
+			}
+		}
+		return nil
 	}
 	return fmt.Errorf("failed report lacks matching deterministic media evidence")
+}
+
+func ValidateUnknownEvidenceEmpty(report Report) error {
+	if report.Status != "unknown" || len(report.Clips) != 0 || len(report.NativeRuns) != 0 ||
+		len(report.Seams) != 0 || len(report.AudioSeams) != 0 {
+		return fmt.Errorf("unknown report must contain no media facts")
+	}
+	return nil
 }
 
 func validateFrameEdge(frames []SeamFrameEvidence) error {

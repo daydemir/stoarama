@@ -389,6 +389,33 @@ func TestValidateSingleClipCannotBypassPresentationAxisProvenance(t *testing.T) 
 	}
 }
 
+func TestIncompleteReportsCannotCarryExtraOrLaterFacts(t *testing.T) {
+	unknown := Report{Status: "unknown", Clips: []ClipFact{{StrictDecode: "unknown"}}}
+	if err := ValidateUnknownEvidenceEmpty(unknown); err == nil {
+		t.Fatal("UNKNOWN report carried a clip fact")
+	}
+	unknown.Clips = nil
+	if err := ValidateUnknownEvidenceEmpty(unknown); err != nil {
+		t.Fatal(err)
+	}
+	clipFailure := Report{Status: "failed", NASByteDecodeStatus: "failed", NativeRunConcatStatus: "unknown", Clips: []ClipFact{{StrictDecode: "failed"}, {StrictDecode: "passed"}}}
+	if err := ValidateDeterministicFailureEvidence(clipFailure, []string{"clip_decode_failed"}); err == nil {
+		t.Fatal("clip failure carried a later clip fact")
+	}
+	clipFailure.Clips = clipFailure.Clips[:1]
+	if err := ValidateDeterministicFailureEvidence(clipFailure, []string{"clip_decode_failed"}); err != nil {
+		t.Fatal(err)
+	}
+	runFailure := Report{Status: "failed", NASByteDecodeStatus: "unknown", NativeRunConcatStatus: "failed", Clips: []ClipFact{{StrictDecode: "passed"}}, NativeRuns: []RunFact{{ValidationStatus: "failed"}, {ValidationStatus: "lossless_concat_decode_passed"}}}
+	if err := ValidateDeterministicFailureEvidence(runFailure, []string{"run_concat_failed"}); err == nil {
+		t.Fatal("run failure carried a later run fact")
+	}
+	runFailure.NativeRuns = runFailure.NativeRuns[:1]
+	if err := ValidateDeterministicFailureEvidence(runFailure, []string{"run_concat_failed"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateManifestRejectsBoundaryAndUnsafePath(t *testing.T) {
 	start := time.Now().UTC()
 	c := mc(1, start.Add(-time.Minute), start, "g", 1, 1)

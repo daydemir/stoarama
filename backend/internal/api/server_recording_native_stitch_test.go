@@ -319,6 +319,29 @@ func TestNativeStitchCompletionKeepsV1FrameProofPartialAndRejectsForgedSeamProve
 	if err = pool.QueryRow(ctx, `SELECT state FROM recording_native_stitch_tasks WHERE id=$1`, taskID).Scan(&rejectedState); err != nil || rejectedState != "leased" {
 		t.Fatalf("rejected exact-v1 partial mutated task state=%s err=%v", rejectedState, err)
 	}
+	unknownWithFacts := report
+	unknownWithFacts.Status = "unknown"
+	unknownWithFacts.NASByteDecodeStatus = "unknown"
+	unknownWithFacts.NativeRunConcatStatus = "unknown"
+	unknownWithFacts.WithinRunFrameAdjacencyStatus = "unknown"
+	unknownWithFacts.WithinRunAudioContinuityStatus = "unknown"
+	unknownWithFacts.WindowContinuityStatus = "unknown"
+	unknownWithFacts.NativeRuns = nil
+	unknownWithFacts.Seams = nil
+	unknownWithFacts.AudioSeams = nil
+	unknownWithFacts.ReasonCodes = []string{"verification_transient"}
+	if rec := complete(unknownWithFacts); rec.Code != http.StatusConflict {
+		t.Fatalf("UNKNOWN with clip facts status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	failedWithLaterFact := unknownWithFacts
+	failedWithLaterFact.Status = "failed"
+	failedWithLaterFact.NASByteDecodeStatus = "failed"
+	failedWithLaterFact.ReasonCodes = []string{"clip_decode_failed"}
+	failedWithLaterFact.Clips = append([]stitchcert.ClipFact(nil), facts...)
+	failedWithLaterFact.Clips[0].StrictDecode = "failed"
+	if rec := complete(failedWithLaterFact); rec.Code != http.StatusConflict {
+		t.Fatalf("FAILED with a later clip fact status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	report.Seams[0].TimelineBasis = "unavailable"
 	report.Seams[0].Confidence = "none"
 	report.Seams[0].Verdict = "ambiguous"

@@ -128,8 +128,8 @@ class NASPullTests(unittest.TestCase):
              mock.patch.object(pull, "recompute_timestamp_contract", return_value=(contract, {"video": timeline, "_video_frames": []})), \
              mock.patch.object(pull, "native_stitch_video_edge_frames", return_value={"first": [], "last": []}), \
              mock.patch.object(pull, "probe_native_media_cancellable", return_value=probe), \
-             mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=validate_clip), \
-             mock.patch.object(pull, "validate_native_run_cancellable", side_effect=validate_run), \
+             mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=lambda *args, **_kwargs: validate_clip(*args)), \
+             mock.patch.object(pull, "validate_native_run_cancellable", side_effect=lambda _tool_paths, *args, **_kwargs: validate_run(paths, *args)), \
              mock.patch.object(pull, "media_tool_version_cancellable", return_value="tool test"), \
              mock.patch.object(pull, "request_json", side_effect=request):
             self.assertTrue(pull._run_native_stitch_task(
@@ -2543,6 +2543,32 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         self.assertEqual(report["reason_codes"], ["verification_transient"])
         self.assertEqual(report["nas_byte_decode_status"], "unknown")
         self.assertEqual(report["native_run_concat_status"], "unknown")
+        self.assertEqual(report["clips"], [])
+        self.assertEqual(report["native_runs"], [])
+
+    def test_native_stitch_swap_and_swap_back_during_tool_is_unknown(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            swapped = False
+            def swap_back(tool_path, *_args):
+                nonlocal swapped
+                if swapped:
+                    return
+                swapped = True
+                original = cfg.output_dir / "recordings/v1-0.mp4"
+                held = original.with_suffix(".held")
+                replacement = original.with_suffix(".replacement")
+                displaced = original.with_suffix(".displaced")
+                replacement.write_bytes(b"different bytes")
+                os.replace(original, held)
+                os.replace(replacement, original)
+                self.assertEqual(Path(tool_path).read_bytes(), b"v1-clip-0")
+                os.replace(original, displaced)
+                os.replace(held, original)
+                displaced.unlink()
+            report, _ = self.run_mocked_v1_stitch(
+                cfg, ["generation-1"], validate_clip=swap_back)
+        self.assertEqual(report["status"], "unknown", report)
         self.assertEqual(report["clips"], [])
         self.assertEqual(report["native_runs"], [])
 

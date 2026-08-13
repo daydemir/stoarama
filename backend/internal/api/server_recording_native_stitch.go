@@ -544,6 +544,10 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 			}
 		}
 		if report.Status == "unknown" {
+			if err = stitchcert.ValidateUnknownEvidenceEmpty(report); err != nil {
+				util.WriteError(w, 409, "UNKNOWN must not contain media facts")
+				return
+			}
 			if nativeStitchDeterministicFailures[reasons[0]] || report.NASByteDecodeStatus == "failed" || report.NativeRunConcatStatus == "failed" || report.WithinRunFrameAdjacencyStatus == "failed" || report.WithinRunAudioContinuityStatus == "failed" {
 				util.WriteError(w, 409, "UNKNOWN cannot contain deterministic failure")
 				return

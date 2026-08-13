@@ -1401,12 +1401,12 @@ def probe_native_media(path, ffprobe_bin):
     return parse_native_media_probe(raw)
 
 
-def probe_native_media_cancellable(path, ffprobe_bin, cancel):
+def probe_native_media_cancellable(path, ffprobe_bin, cancel, pass_fds=()):
     raw = cancellable_tool_output([
         ffprobe_bin, "-v", "error", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
         "-enable_drefs", "0", "-use_absolute_path", "0",
         "-show_format", "-show_streams", "-show_data_hash", "sha256", "-of", "json", str(path),
-    ], cancel, 600)
+    ], cancel, 600, pass_fds=pass_fds)
     return parse_native_media_probe(raw)
 
 
@@ -1487,13 +1487,15 @@ def stable_native_signature_v1(probe_streams, format_name):
     return {"schema_version": 1, "format_name": format_name, "streams": canonical}
 
 
-def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024):
+def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024, pass_fds=()):
     """Bounded child group: cancellation cannot strand ffmpeg descendants."""
     if stdout_limit < 0 or stderr_limit < 0:
         raise MediaCertificationError("media verification output bound is invalid")
+    for descriptor in pass_fds:
+        os.lseek(descriptor, 0, os.SEEK_SET)
     process = subprocess.Popen(
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True, env={"PATH": os.environ.get("PATH", "")},
+        start_new_session=True, env={"PATH": os.environ.get("PATH", "")}, pass_fds=tuple(pass_fds),
     )
     exceeded = threading.Event()
     stdout = bytearray()
@@ -1595,18 +1597,18 @@ def deterministic_media_rejection(exc):
     return any(marker in diagnostic for marker in _DETERMINISTIC_MEDIA_DIAGNOSTICS)
 
 
-def run_media_validation_command(command, cancel, timeout, deterministic_reason):
+def run_media_validation_command(command, cancel, timeout, deterministic_reason, pass_fds=()):
     """Require the same affirmative media rejection twice before terminal failure."""
     first_error = None
     try:
-        cancellable_tool_output(command, cancel, timeout)
+        cancellable_tool_output(command, cancel, timeout, pass_fds=pass_fds)
         return
     except ToolProcessError as first:
         if not deterministic_media_rejection(first):
             raise
         first_error = first
     try:
-        cancellable_tool_output(command, cancel, timeout)
+        cancellable_tool_output(command, cancel, timeout, pass_fds=pass_fds)
     except ToolProcessError as second:
         if deterministic_media_rejection(second):
             raise DeterministicMediaError(deterministic_reason) from second
@@ -1647,13 +1649,13 @@ def timestamp_frame_duration(frame):
     return values[0]
 
 
-def recompute_timestamp_contract(path, ffprobe_bin, cancel):
+def recompute_timestamp_contract(path, ffprobe_bin, cancel, pass_fds=()):
     raw = cancellable_tool_output([
         ffprobe_bin, "-v", "error", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
         "-enable_drefs", "0", "-use_absolute_path", "0", "-show_frames", "-show_packets", "-show_streams", "-show_data", "-show_data_hash", "sha256",
         "-show_entries", "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,time_base,extradata,sample_rate,channels,channel_layout:frame=stream_index,media_type,best_effort_timestamp,pkt_dts,pkt_duration,duration,nb_samples,key_frame,pict_type:packet=stream_index,pts,dts,duration,data_hash",
         "-of", "json", str(path),
-    ], cancel, 30, stdout_limit=16 * 1024 * 1024)
+    ], cancel, 30, stdout_limit=16 * 1024 * 1024, pass_fds=pass_fds)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -1764,7 +1766,7 @@ def recompute_timestamp_contract(path, ffprobe_bin, cancel):
     return contract, timelines
 
 
-def decoded_video_frame_hashes(path, ffmpeg_bin, cancel):
+def decoded_video_frame_hashes(path, ffmpeg_bin, cancel, pass_fds=()):
     """Decode every video frame and return presentation-order SHA-256 facts.
 
     The output is bounded and retains source timestamps with -copyts. Hashes
@@ -1776,7 +1778,7 @@ def decoded_video_frame_hashes(path, ffmpeg_bin, cancel):
         "-enable_drefs", "0", "-use_absolute_path", "0", "-i", str(path),
         "-map", "0:v:0", "-an", "-fps_mode", "passthrough",
         "-f", "framemd5", "-hash", "sha256", "-",
-    ], cancel, 600, stdout_limit=16 * 1024 * 1024)
+    ], cancel, 600, stdout_limit=16 * 1024 * 1024, pass_fds=pass_fds)
     frames = []
     time_base = None
     for raw_line in raw.decode("ascii", "strict").splitlines():
@@ -1812,8 +1814,8 @@ def decoded_video_frame_hashes(path, ffmpeg_bin, cancel):
     return time_base, frames
 
 
-def native_stitch_video_edge_frames(path, ffmpeg_bin, source_frames, cancel):
-    _, decoded = decoded_video_frame_hashes(path, ffmpeg_bin, cancel)
+def native_stitch_video_edge_frames(path, ffmpeg_bin, source_frames, cancel, pass_fds=()):
+    _, decoded = decoded_video_frame_hashes(path, ffmpeg_bin, cancel, pass_fds=pass_fds)
     if len(decoded) != len(source_frames):
         raise MediaCertificationError("decoded frame count differs from timestamp contract")
     facts = []
@@ -1880,6 +1882,7 @@ def check_native_stitch_delivery(cfg, runtime, cancel):
 
 def hash_certification_file_cancellable(root, relative_path, expected_size, expected_sha, cancel):
     path, path_before = confined_regular_file(root, relative_path)
+    parent_before = path.parent.stat()
     descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
     digest = hashlib.sha256(); actual_size = 0
     try:
@@ -1892,14 +1895,22 @@ def hash_certification_file_cancellable(root, relative_path, expected_size, expe
             if not chunk: break
             digest.update(chunk); actual_size += len(chunk)
         opened_after = os.fstat(descriptor)
-    finally:
+    except BaseException:
         os.close(descriptor)
+        raise
     path_after = path.stat()
+    parent_after = path.parent.stat()
     if certification_identity(opened_before) != certification_identity(opened_after) or certification_identity(opened_after) != certification_identity(path_after):
+        os.close(descriptor)
         raise MediaCertificationError("media identity changed while hashing")
+    if certification_identity(parent_before) != certification_identity(parent_after):
+        os.close(descriptor)
+        raise MediaCertificationError("media directory changed while hashing")
     if actual_size != expected_size or digest.hexdigest() != expected_sha:
+        os.close(descriptor)
         raise MediaCertificationError("media bytes do not match frozen manifest")
-    return path, path_after
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return path, path_after, parent_after, descriptor, Path("/dev/fd/%d" % descriptor)
 
 
 def verify_certification_source_identities(paths, identities, phase):
@@ -1907,23 +1918,24 @@ def verify_certification_source_identities(paths, identities, phase):
     for path, identity in zip(paths, identities):
         try:
             current = certification_identity(path.stat())
+            current_parent = certification_identity(path.parent.stat())
         except OSError as exc:
             raise MediaCertificationError("media identity changed during %s" % phase) from exc
-        if current != identity:
+        if (current, current_parent) != identity:
             raise MediaCertificationError("media identity changed during %s" % phase)
 
 
-def strict_decode_media_cancellable(path, ffmpeg_bin, cancel):
+def strict_decode_media_cancellable(path, ffmpeg_bin, cancel, pass_fds=()):
     command = [ffmpeg_bin, "-v", "error", "-xerror", "-err_detect", "explode", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS, "-enable_drefs", "0", "-use_absolute_path", "0", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"]
-    run_media_validation_command(command, cancel, 600, "clip_decode_failed")
+    run_media_validation_command(command, cancel, 600, "clip_decode_failed", pass_fds=pass_fds)
 
 
-def validate_native_run_cancellable(paths, ffmpeg_bin, cancel, temp_root):
+def validate_native_run_cancellable(paths, ffmpeg_bin, cancel, temp_root, pass_fds=()):
     if len(paths) == 1: return "single_clip_decode_only"
     manifest = temp_root / "concat.txt"; output = temp_root / "stitched.mp4"
     manifest.write_text("".join(concat_manifest_line(path) for path in paths), encoding="utf-8")
     concat = [ffmpeg_bin,"-v","error","-xerror","-err_detect","explode","-protocol_whitelist",MEDIA_CERTIFICATION_PROTOCOLS,"-f","concat","-safe","0","-i",str(manifest),"-map","0:v:0","-map","0:a?","-c","copy","-y",str(output)]
-    run_media_validation_command(concat, cancel, 600, "run_concat_failed")
+    run_media_validation_command(concat, cancel, 600, "run_concat_failed", pass_fds=pass_fds)
     try:
         strict_decode_media_cancellable(output,ffmpeg_bin,cancel)
     except DeterministicMediaError as exc:
@@ -2106,7 +2118,7 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
     filesystem=os.statvfs(str(cfg.state_dir));free=filesystem.f_bavail*filesystem.f_frsize
     if free<largest_possible_run*2+NATIVE_STITCH_TEMP_RESERVE_BYTES: raise MediaCertificationError("insufficient temporary capacity")
     ffmpeg_version=media_tool_version_cancellable(ffmpeg_bin,cancel);ffprobe_version=media_tool_version_cancellable(ffprobe_bin,cancel)
-    clips=[];paths=[];identities=[];video_edges=[]
+    clips=[];paths=[];tool_paths=[];source_fds=[];identities=[];video_edges=[]
     reason="completed"
     try:
         for frozen,item in zip(raw_clips,local):
@@ -2115,30 +2127,31 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
                 raise MediaCertificationError("sidecar timeline differs from frozen manifest")
             for key in ("clip_id","recording_id","recording_job_id","relative_path","size_bytes","sha256","capture_generation","capture_sequence","capture_attempt_id","timestamp_contract_version","timestamp_contract_status","timestamp_contract_reason","timestamp_contract_sha256"):
                 if frozen.get(key)!=item.get(key): raise MediaCertificationError("sidecar differs from frozen manifest")
-            path,identity=hash_certification_file_cancellable(cfg.output_dir,item["relative_path"],item["size_bytes"],item["sha256"],cancel)
+            path,identity,parent_identity,source_fd,tool_path=hash_certification_file_cancellable(cfg.output_dir,item["relative_path"],item["size_bytes"],item["sha256"],cancel)
+            source_fds.append(source_fd);tool_paths.append(tool_path)
             if time.monotonic()>=absolute_deadline: raise InventoryScanStopped("native stitch attempt deadline")
             recomputed_contract=video_timeline=audio_timeline=None
             if frozen.get("timestamp_contract_status")=="per_clip_probe_complete":
-                recomputed_contract,timelines=recompute_timestamp_contract(path,ffprobe_bin,cancel)
+                recomputed_contract,timelines=recompute_timestamp_contract(tool_path,ffprobe_bin,cancel,pass_fds=(source_fd,))
                 if timestamp_contract_hash(recomputed_contract)!=frozen.get("timestamp_contract_sha256") or recomputed_contract!=item.get("timestamp_contract"):
                     raise MediaCertificationError("exact NAS bytes recompute a different timestamp contract")
                 video_timeline=timelines.get("video");audio_timeline=timelines.get("audio")
-            probe=probe_native_media_cancellable(path,ffprobe_bin,cancel)
+            probe=probe_native_media_cancellable(tool_path,ffprobe_bin,cancel,pass_fds=(source_fd,))
             signature=probe["stable_signature_v1"];signature_sha=canonical_report_hash(signature)
             audio_present=any(s.get("codec_type")=="audio" for s in signature.get("streams",[]))
             decode_status="passed"
-            try: strict_decode_media_cancellable(path,ffmpeg_bin,cancel)
+            try: strict_decode_media_cancellable(tool_path,ffmpeg_bin,cancel,pass_fds=(source_fd,))
             except DeterministicMediaError: decode_status="failed"
             edges=None
             if recomputed_contract is not None:
-                edges=native_stitch_video_edge_frames(path,ffmpeg_bin,timelines.get("_video_frames",[]),cancel)
+                edges=native_stitch_video_edge_frames(tool_path,ffmpeg_bin,timelines.get("_video_frames",[]),cancel,pass_fds=(source_fd,))
             after_decode=path.stat()
-            if certification_identity(after_decode)!=certification_identity(identity): raise MediaCertificationError("media identity changed during decode")
+            if certification_identity(after_decode)!=certification_identity(identity) or certification_identity(path.parent.stat())!=certification_identity(parent_identity): raise MediaCertificationError("media identity changed during decode")
             clip_fact={**{k:(v.isoformat().replace("+00:00","Z") if isinstance(v,datetime.datetime) else v) for k,v in frozen.items()},"sidecar_sha256":item["sidecar_sha256"],"file_identity":{"size":after_decode.st_size,"mtime_ns":after_decode.st_mtime_ns,"ctime_ns":after_decode.st_ctime_ns,"inode":after_decode.st_ino,"device":after_decode.st_dev},"native_signature":signature,"native_signature_sha256":signature_sha,"strict_decode":decode_status,"audio_present":audio_present}
             if recomputed_contract is not None: clip_fact["recomputed_timestamp_contract"]=recomputed_contract
             if video_timeline is not None: clip_fact["video_timeline"]=video_timeline
             if audio_timeline is not None: clip_fact["audio_timeline"]=audio_timeline
-            clips.append(clip_fact);paths.append(path);identities.append(certification_identity(after_decode));video_edges.append(edges)
+            clips.append(clip_fact);paths.append(path);identities.append((certification_identity(after_decode),certification_identity(parent_identity)));video_edges.append(edges)
             if decode_status=="failed": raise DeterministicMediaError("clip_decode_failed")
         runs=[];run_start=0
         with tempfile.TemporaryDirectory(prefix="stoarama-native-stitch-",dir=str(cfg.state_dir)) as raw_temp:
@@ -2149,7 +2162,7 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
                 run_bytes=sum(c["size_bytes"] for c in clips[run_start:index]);
                 if run_bytes>NATIVE_STITCH_MAX_RUN_BYTES: raise MediaCertificationError("native run byte bound exceeded")
                 run_dir=Path(raw_temp)/("run-%d"%len(runs));run_dir.mkdir()
-                try: validation=validate_native_run_cancellable(paths[run_start:index],ffmpeg_bin,cancel,run_dir)
+                try: validation=validate_native_run_cancellable(tool_paths[run_start:index],ffmpeg_bin,cancel,run_dir,pass_fds=source_fds[run_start:index])
                 except DeterministicMediaError: validation="failed"
                 # A deterministic tool diagnosis is attributable only while
                 # every source file is still the exact identity hashed above.
@@ -2203,6 +2216,10 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
         status="failed";reason=str(exc);decode="failed" if reason=="clip_decode_failed" else "unknown";concat="failed" if reason=="run_concat_failed" else "unknown";frame_adjacency=audio_continuity=window_continuity="unknown";runs=locals().get("runs",[]);seams=locals().get("seams",[]);audio_seams=locals().get("audio_seams",[])
     except (MediaCertificationError,InventoryScanStopped) as exc:
         status="unknown";reason="attempt_deadline" if time.monotonic()>=absolute_deadline else ("delivery_preempted" if isinstance(exc,InventoryScanStopped) else "verification_transient");decode=concat=frame_adjacency=audio_continuity=window_continuity="unknown";clips=[];runs=[];seams=[];audio_seams=[]
+    finally:
+        for source_fd in source_fds:
+            try: os.close(source_fd)
+            except OSError: pass
     completed=datetime.datetime.now(datetime.timezone.utc)
     report={"schema_version":1,"policy_version":task["policy_version"],"task_id":task["task_id"],"recording_id":task["recording_id"],"recording_job_id":task["recording_job_id"],"window_start_at":task["window_start_at"],"window_end_at":task["window_end_at"],"clip_manifest_sha256":task["clip_manifest_sha256"],"inventory_generation":summary["generation"],"inventory_digest":summary["digest"],"inventory_completed_at":summary["scan_completed_at"],"status":status,"nas_byte_decode_status":decode,"native_run_concat_status":concat,"within_run_frame_adjacency_status":frame_adjacency,"within_run_audio_sample_continuity_status":audio_continuity,"window_continuity_status":window_continuity,"timeline":native_stitch_timeline(local,window_start,window_end),"clips":clips,"native_runs":runs,"seams":seams,"audio_seams":audio_seams,"reason_codes":[reason],"client_version":CLIENT_VERSION,"ffmpeg_version":ffmpeg_version,"ffprobe_version":ffprobe_version,"started_at":started.isoformat().replace("+00:00","Z"),"completed_at":completed.isoformat().replace("+00:00","Z"),"source_media_modified":False,"reencoded":False,"persistent_output_created":False}
     submit_native_stitch_completion(cfg,task,report)
