@@ -83,7 +83,8 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 	streamID := 8100 + suffix
 	recordingID := 8200 + suffix
 	jobID := 8300 + suffix
-	destinationID := 8400 + suffix
+	destinationCandidateID := 8400 + suffix
+	var destinationID int64
 	clipID := 8500 + suffix
 	lease := uuid.New()
 	admission := uuid.New()
@@ -93,16 +94,21 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 	if _, err := pool.Exec(ctx, `INSERT INTO accounts(id,email,name,status,role) VALUES($1,$2,$2,'active','admin') ON CONFLICT(id) DO NOTHING`, accountID, fmt.Sprintf("presentation-%d@example.test", accountID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO storage_destinations(id,account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,verified_at,managed,shared) VALUES($1,$2,'v2','r2_managed','https://storage.example.test','auto','v2','','access',decode('00','hex'),'verified',now(),true,false)`, destinationID, accountID); err != nil {
+	if err := pool.QueryRow(ctx, `WITH inserted AS (
+		INSERT INTO storage_destinations(id,account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,verified_at,managed,shared)
+		VALUES($1,$2,'v2','r2_managed','https://storage.example.test','auto','v2','','access',decode('00','hex'),'verified',now(),true,false)
+		ON CONFLICT (account_id) WHERE managed DO NOTHING
+		RETURNING id
+	) SELECT id FROM inserted UNION ALL SELECT id FROM storage_destinations WHERE account_id=$2 AND managed ORDER BY id LIMIT 1`, destinationCandidateID, accountID).Scan(&destinationID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,recording_state) VALUES($1,'test',$2,$2,$2,$3,$4,'hls','video_manifest','video_live','continuous_video','on')`, streamID, fmt.Sprintf("v2-%d", suffix), fmt.Sprintf("https://source.example.test/%d.m3u8", suffix), fmt.Sprintf("https://source.example.test/page/%d", suffix)); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,recording_state) VALUES($1,'test',$2,$2,$2,$3,$4,'hls','video_manifest','video_live','continuous_video',30,'on')`, streamID, fmt.Sprintf("v2-%d", suffix), fmt.Sprintf("https://source.example.test/%d.m3u8", suffix), fmt.Sprintf("https://source.example.test/page/%d", suffix)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nodes(id,account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,$2,$3,'relay','active',now(),4)`, nodeID, accountID, fmt.Sprintf("v2-node-%d", suffix)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,stream_id,source_kind,mode,status,start_at,capture_via) VALUES($1,$2,$3,$4,$5,$6,'hls_live','continuous','active',now()-interval '1 hour','relay')`, recordingID, accountID, destinationID, fmt.Sprintf("v2-rec-%d", suffix), fmt.Sprintf("https://source.example.test/%d.m3u8", suffix), streamID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,stream_id,source_kind,cron_timezone,clip_duration_sec,mode,daily_window_start,daily_window_end,active_weekdays,target_fps,status,start_at,capture_via) VALUES($1,$2,$3,$4,$5,$6,'hls_live','UTC',60,'continuous','08:00','20:00',127,NULL,'active',now()-interval '1 hour','relay')`, recordingID, accountID, destinationID, fmt.Sprintf("v2-rec-%d", suffix), fmt.Sprintf("https://source.example.test/%d.m3u8", suffix), streamID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES($1,$2,now(),now(),60,'leased',$3,now()+interval '1 hour',$4,$5,'continuous_window',now()+interval '1 hour')`, jobID, recordingID, fmt.Sprintf("node:%d", nodeID), lease, fmt.Sprintf("v2-job-%d", suffix)); err != nil {
