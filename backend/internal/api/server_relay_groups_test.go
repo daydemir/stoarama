@@ -111,6 +111,11 @@ func TestRecordingHeartbeatCannotReviveExpiredLease(t *testing.T) {
 	if !strings.Contains(recordingJobHeartbeatSQL, "j.lease_expires_at > now()") {
 		t.Fatal("recording heartbeat must reject expired leases")
 	}
+	if !strings.Contains(recordingJobHeartbeatSQL, "j.window_end_at IS NOT NULL") ||
+		!strings.Contains(recordingJobHeartbeatSQL, "j.window_end_at + make_interval(secs => $5) > now()") ||
+		!strings.Contains(recordingJobHeartbeatSQL, "LEAST(") {
+		t.Fatal("continuous heartbeat must reject post-drain renewals and cap the lease at the drain deadline")
+	}
 }
 
 func TestRelayLeaseRequiresYouTubeReadinessOnlyForYouTube(t *testing.T) {
@@ -283,7 +288,9 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var renewedAt time.Time
-	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, nil).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
+	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner,
+		recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, nil,
+		recordingContinuousPostWindowLeaseSec).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expired heartbeat err=%v, want pgx.ErrNoRows", err)
 	}
 
