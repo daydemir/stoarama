@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Strictly parse and run the backend commands in the GitHub test workflow."""
+"""Strictly parse and run the frozen backend commands in the GitHub workflow."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import re
@@ -13,7 +14,34 @@ import sys
 
 
 DB_ENV = "STOARAMA_TEST_DATABASE_URL"
-ALLOWED_ENV = {"HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "GOCACHE", "GOMODCACHE", "GOPATH"}
+ALLOWED_ENV = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "GOCACHE", "GOMODCACHE", "GOPATH"}
+FROZEN_STEPS = (
+    ("Test PostgreSQL type boundaries", "db"),
+    ("Test NAS backlog eligibility", "db"),
+    ("Test batch Plaza naming", "db"),
+    ("Test recording qualification freeze transaction", "db"),
+    ("Test recording clip authoritative frame provenance", "db"),
+    ("Test recording health digest production query", "db"),
+    ("Test native stitch migration, claim fencing, and planner races", "db"),
+    ("Test presentation v2 C1 is structurally disabled and evidence is fenced", "db"),
+    ("Test dynamic streak priority PostgreSQL schedule and plan", "db"),
+    ("Test recording upload intent replay", "db"),
+    ("Test continuous timestamp contract and canary are fail closed", "db"),
+    ("Test migration lock timeout", "db"),
+    ("Test frozen qualification cohort migration", "db"),
+    ("Test continuous window revive rules", "db"),
+    ("Test recorder lease gating, relay balancing, and source propagation", "db"),
+    ("Test provisioning teardown lease safety", "db"),
+    ("Test clip timestamp drift signal", "db"),
+    ("Test recording health alert delivery", "db"),
+    ("Test pre-open target selection SQL", "db"),
+    ("Test reservation-backed relay pre-open evidence", "db"),
+    ("Test transient ledger retention boundaries", "db"),
+    ("Test billing meter report ledger", "db"),
+    ("Test", "go"),
+    ("Test NAS pull client", "python"),
+    ("Vet", "vet"),
+)
 
 
 class WorkflowError(RuntimeError):
@@ -24,25 +52,33 @@ def scalar(value: str, context: str) -> str:
     value = value.strip()
     if not value or value[0] in "|>" or "${{" in value:
         raise WorkflowError(f"unsupported {context}")
-    if value[0] in "'\"":
-        try:
-            words = shlex.split(value)
-        except ValueError as exc:
-            raise WorkflowError(f"invalid {context}: {exc}") from exc
-        if len(words) != 1:
-            raise WorkflowError(f"unsupported {context}")
-        return words[0]
-    return value
+    try:
+        words = shlex.split(value) if value[0] in "'\"" else [value]
+    except ValueError as exc:
+        raise WorkflowError(f"invalid {context}: {exc}") from exc
+    if len(words) != 1:
+        raise WorkflowError(f"unsupported {context}")
+    return words[0]
 
 
-def parse_workflow(path: pathlib.Path) -> tuple[str, list[dict[str, object]]]:
+def put_once(target: dict[str, object], key: str, value: object, line_no: int) -> None:
+    if key in target:
+        raise WorkflowError(f"duplicate {key!r} at line {line_no}")
+    target[key] = value
+
+
+def parse_workflow(path: pathlib.Path) -> list[dict[str, object]]:
     lines = path.read_text(encoding="utf-8").splitlines()
-    in_backend = False
-    in_steps = False
+    seen_jobs = False
+    seen_backend = False
+    seen_defaults = False
+    seen_run_defaults = False
+    seen_steps = False
     default_workdir: str | None = None
+    section = "root"
     steps: list[dict[str, object]] = []
     current: dict[str, object] | None = None
-    in_env = False
+    in_step_env = False
 
     for line_no, raw in enumerate(lines, 1):
         if not raw.strip() or raw.lstrip().startswith("#"):
@@ -52,97 +88,148 @@ def parse_workflow(path: pathlib.Path) -> tuple[str, list[dict[str, object]]]:
             raise WorkflowError(f"tabs are unsupported at line {line_no}")
         text = raw.strip()
 
-        if indent == 2 and text.endswith(":"):
-            in_backend = text == "backend:"
-            in_steps = False
+        if indent == 0:
+            if text == "backend:":
+                raise WorkflowError(f"top-level backend key is forbidden at line {line_no}")
+            section = "jobs" if text == "jobs:" else "root"
             current = None
+            if text == "jobs:":
+                if seen_jobs:
+                    raise WorkflowError(f"duplicate jobs at line {line_no}")
+                seen_jobs = True
             continue
-        if not in_backend:
+        if section == "root":
             continue
-        if indent == 8 and text.startswith("working-directory:") and not in_steps:
-            default_workdir = scalar(text.split(":", 1)[1], f"working-directory at line {line_no}")
-            continue
-        if indent == 4 and text == "steps:":
-            in_steps = True
+        if indent == 2:
+            section = "backend" if text == "backend:" else "other-job"
             current = None
+            if text == "backend:":
+                if seen_backend:
+                    raise WorkflowError(f"duplicate jobs.backend at line {line_no}")
+                seen_backend = True
             continue
-        if not in_steps:
+        if not section.startswith("backend"):
+            continue
+        if indent == 4:
+            current = None
+            in_step_env = False
+            if text == "defaults:":
+                if seen_defaults:
+                    raise WorkflowError(f"duplicate jobs.backend.defaults at line {line_no}")
+                seen_defaults = True
+                section = "backend-defaults"
+            elif text == "steps:":
+                if seen_steps:
+                    raise WorkflowError(f"duplicate jobs.backend.steps at line {line_no}")
+                seen_steps = True
+                section = "backend-steps"
+            elif text.startswith("env:"):
+                raise WorkflowError("jobs.backend.env is forbidden")
+            else:
+                section = "backend"
+            continue
+        if section == "backend-defaults":
+            if indent == 6 and text == "run:":
+                if seen_run_defaults:
+                    raise WorkflowError(f"duplicate jobs.backend.defaults.run at line {line_no}")
+                seen_run_defaults = True
+                section = "backend-run-defaults"
+                continue
+            if indent >= 6:
+                raise WorkflowError(f"unsupported jobs.backend.defaults at line {line_no}")
+        if section == "backend-run-defaults":
+            if indent == 8 and text.startswith("working-directory:"):
+                if default_workdir is not None:
+                    raise WorkflowError(f"duplicate default working-directory at line {line_no}")
+                default_workdir = scalar(text.split(":", 1)[1], f"working-directory at line {line_no}")
+                continue
+            if indent >= 8:
+                raise WorkflowError(f"default shell/env is forbidden at line {line_no}")
+        if section != "backend-steps":
             continue
         if indent == 6 and text.startswith("- "):
-            current = {"name": "", "run": None, "env": {}, "working_directory": None, "uses": False}
+            current = {"env": {}, "uses": False}
             steps.append(current)
-            in_env = False
-            text = text[2:]
-            if text.startswith("uses:"):
+            in_step_env = False
+            declaration = text[2:]
+            if declaration.startswith("uses:"):
                 current["uses"] = True
-            elif text.startswith("name:"):
-                current["name"] = scalar(text.split(":", 1)[1], f"step name at line {line_no}")
+            elif declaration.startswith("name:"):
+                put_once(current, "name", scalar(declaration.split(":", 1)[1], "step name"), line_no)
             else:
                 raise WorkflowError(f"unsupported step declaration at line {line_no}")
             continue
         if current is None:
             raise WorkflowError(f"step field without step at line {line_no}")
         if indent == 8 and text.startswith("name:"):
-            current["name"] = scalar(text.split(":", 1)[1], f"step name at line {line_no}")
-            in_env = False
+            put_once(current, "name", scalar(text.split(":", 1)[1], "step name"), line_no)
+            in_step_env = False
         elif indent == 8 and text.startswith("run:"):
             if current["uses"]:
                 raise WorkflowError(f"step mixes uses and run at line {line_no}")
-            current["run"] = scalar(text.split(":", 1)[1], f"run command at line {line_no}")
-            in_env = False
+            put_once(current, "run", scalar(text.split(":", 1)[1], "run command"), line_no)
+            in_step_env = False
         elif indent == 8 and text.startswith("working-directory:"):
-            current["working_directory"] = scalar(
-                text.split(":", 1)[1], f"working-directory at line {line_no}"
-            )
-            in_env = False
+            put_once(current, "working_directory", scalar(text.split(":", 1)[1], "working-directory"), line_no)
+            in_step_env = False
         elif indent == 8 and text == "env:":
-            in_env = True
-        elif indent == 10 and in_env and ":" in text:
+            if current["env"]:
+                raise WorkflowError(f"duplicate step env at line {line_no}")
+            in_step_env = True
+        elif indent == 10 and in_step_env and ":" in text:
             key, value = text.split(":", 1)
             if key != DB_ENV:
                 raise WorkflowError(f"unsupported run-step env {key!r} at line {line_no}")
-            current_env = current["env"]
-            assert isinstance(current_env, dict)
-            current_env[key] = scalar(value, f"environment value at line {line_no}")
+            env = current["env"]
+            assert isinstance(env, dict)
+            put_once(env, key, scalar(value, "environment value"), line_no)
         elif indent >= 8 and current["uses"]:
-            # Action configuration is not executed locally.
             continue
         else:
             raise WorkflowError(f"unsupported backend step syntax at line {line_no}: {text}")
 
+    if not (seen_jobs and seen_backend and seen_defaults and seen_run_defaults and seen_steps):
+        raise WorkflowError("workflow lacks unique jobs.backend.defaults.run/steps ancestry")
     if default_workdir != "backend":
         raise WorkflowError("backend default working-directory must be exactly 'backend'")
-
-    run_steps = [step for step in steps if step["run"] is not None]
-    if not run_steps:
-        raise WorkflowError("backend workflow has no run steps")
+    run_steps = [step for step in steps if "run" in step]
+    observed = []
     for step in run_steps:
+        name = str(step.get("name", ""))
         command = str(step["run"])
         try:
             argv = shlex.split(command)
         except ValueError as exc:
-            raise WorkflowError(f"invalid command in {step['name']!r}: {exc}") from exc
-        if not argv:
-            raise WorkflowError(f"empty command in {step['name']!r}")
-        allowed = argv[:2] in (["go", "test"], ["go", "vet"]) or argv[:3] == ["python3", "-m", "unittest"]
-        if not allowed or any(token in command for token in (";", "&&", "||", "`", "$(", "\n")):
-            raise WorkflowError(f"unsupported command in {step['name']!r}")
+            raise WorkflowError(f"invalid command in {name!r}: {exc}") from exc
+        if not argv or any(token in command for token in (";", "&&", "||", "`", "$(", "\n")):
+            raise WorkflowError(f"unsupported command in {name!r}")
         env = step["env"]
         assert isinstance(env, dict)
         if env:
-            if set(env) != {DB_ENV} or argv[:2] != ["go", "test"]:
-                raise WorkflowError(f"unsupported database step {step['name']!r}")
-            if "-v" not in argv:
-                raise WorkflowError(f"database step {step['name']!r} must use go test -v")
+            kind = "db"
+            if set(env) != {DB_ENV} or argv[:2] != ["go", "test"] or "-v" not in argv:
+                raise WorkflowError(f"unsupported database step {name!r}")
+        elif argv[:2] == ["go", "test"]:
+            kind = "go"
+        elif argv[:2] == ["go", "vet"]:
+            kind = "vet"
+        elif argv[:3] == ["python3", "-m", "unittest"]:
+            kind = "python"
+        else:
+            raise WorkflowError(f"unsupported command in {name!r}")
+        observed.append((name, kind))
         step["argv"] = argv
-    return default_workdir, run_steps
+        step["kind"] = kind
+    if tuple(observed) != FROZEN_STEPS:
+        raise WorkflowError("backend run-step names/order/classes differ from the frozen 25-step gate")
+    return run_steps
 
 
 def clean_environment() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key in ALLOWED_ENV and value}
-    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-    env.setdefault("HOME", str(pathlib.Path.home()))
-    env.setdefault("TMPDIR", "/tmp")
+    for required in ("PATH", "HOME", "TMPDIR"):
+        if not env.get(required):
+            raise WorkflowError(f"sanitized environment lacks {required}")
     env.setdefault("LANG", "C.UTF-8")
     env.setdefault("LC_ALL", "C.UTF-8")
     return env
@@ -153,39 +240,47 @@ def run_steps(root: pathlib.Path, steps: list[dict[str, object]], database_url: 
         raise WorkflowError("test database URL is not the generated loopback form")
     base_env = clean_environment()
     for step in steps:
-        name = str(step["name"])
+        name, kind = str(step["name"]), str(step["kind"])
         argv = list(step["argv"])
-        workdir = str(step["working_directory"] or "backend")
+        workdir = str(step.get("working_directory") or "backend")
         if pathlib.PurePosixPath(workdir).is_absolute() or ".." in pathlib.PurePosixPath(workdir).parts:
             raise WorkflowError(f"unsafe working-directory in {name!r}")
         cwd = (root / workdir).resolve()
         if not cwd.is_relative_to(root.resolve()):
             raise WorkflowError(f"working-directory escapes repository in {name!r}")
         env = dict(base_env)
-        is_database = bool(step["env"])
-        if is_database:
+        if kind == "db":
             env[DB_ENV] = database_url
+            argv.append("-json")
         print(f"verify-pr: {name}", flush=True)
-        completed = subprocess.run(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-        output = completed.stdout
-        sys.stdout.write(output)
+        completed = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        sys.stdout.write(completed.stdout)
         if completed.returncode:
             raise WorkflowError(f"workflow step failed: {name}")
-        if is_database:
-            if "--- SKIP:" in output:
-                raise WorkflowError(f"database step skipped a test: {name}")
-            runs = re.findall(r"^=== RUN\s+(.+)$", output, flags=re.MULTILINE)
-            passes = set(re.findall(r"^--- PASS:\s+([^ ]+)", output, flags=re.MULTILINE))
-            if not runs or not all(run.split("/", 1)[0] in passes for run in runs if "/" not in run):
-                raise WorkflowError(f"database step lacks RUN/PASS proof: {name}")
+        if kind == "db":
+            events = []
+            for line in completed.stdout.splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise WorkflowError(f"non-JSON go-test output in {name!r}") from exc
+                if isinstance(event, dict):
+                    events.append(event)
+            packages = {event.get("Package") for event in events if event.get("Action") == "start" and event.get("Package")}
+            requested_packages = {str(arg) for arg in step["argv"][2:] if str(arg).startswith("./")}
+            matched_packages = {
+                requested: {package for package in packages if str(package).endswith(requested[1:])}
+                for requested in requested_packages
+            }
+            if any(len(matches) != 1 for matches in matched_packages.values()) or len(packages) != len(requested_packages):
+                raise WorkflowError(f"database step package proof mismatch: {name}")
+            for package in packages:
+                runs = {event.get("Test") for event in events if event.get("Package") == package and event.get("Action") == "run" and event.get("Test") and "/" not in event.get("Test", "")}
+                passed = {event.get("Test") for event in events if event.get("Package") == package and event.get("Action") == "pass" and event.get("Test")}
+                skipped = {event.get("Test") for event in events if event.get("Package") == package and event.get("Action") == "skip" and event.get("Test")}
+                warnings = [event.get("Output", "") for event in events if event.get("Package") == package]
+                if not runs or not runs.issubset(passed) or skipped or any("no tests to run" in output for output in warnings):
+                    raise WorkflowError(f"database step lacks per-package RUN/PASS proof: {name} {package}")
 
 
 def main() -> int:
@@ -196,9 +291,9 @@ def main() -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     try:
-        _, steps = parse_workflow(args.workflow)
+        steps = parse_workflow(args.workflow)
         if args.check:
-            print(f"verify-pr: parsed {len(steps)} backend run steps")
+            print(f"verify-pr: parsed frozen {len(steps)} backend run steps")
         else:
             if not args.database_url:
                 raise WorkflowError("--database-url is required")

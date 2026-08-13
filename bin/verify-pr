@@ -27,6 +27,11 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run inside a Gi
 cd "$repo_root"
 readonly repo_root
 readonly docker="$(find_docker)"
+readonly operator_home="$HOME"
+
+for docker_var in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH; do
+  [[ -z "${!docker_var:-}" ]] || die "unset $docker_var; remote/custom Docker endpoints are forbidden"
+done
 
 [[ -z "${DATABASE_URL:-}" && -z "${STOARAMA_TEST_DATABASE_URL:-}" ]] ||
   die "unset DATABASE_URL and STOARAMA_TEST_DATABASE_URL before verification"
@@ -56,6 +61,7 @@ if [[ "$mode" == "pre-push" ]]; then
     fi
     peeled="$(git rev-parse --verify "${local_oid}^{commit}" 2>/dev/null)" ||
       die "pushed object $local_oid is not a commit or commit-peeling tag"
+    [[ "$peeled" == "$local_oid" ]] || die "annotated tag objects are not scanned; push the commit or a lightweight tag"
     ref_raw="$(git rev-parse --verify "$local_ref" 2>/dev/null)" || die "cannot resolve local ref $local_ref"
     ref_peeled="$(git rev-parse --verify "${local_ref}^{commit}" 2>/dev/null)" ||
       die "local ref $local_ref does not peel to a commit"
@@ -86,6 +92,17 @@ git fetch --quiet origin main || die "cannot fetch origin/main"
 base_oid="$(git merge-base origin/main "$frozen_oid")" || die "cannot compute merge-base with origin/main"
 [[ -n "$base_oid" ]] || die "empty merge-base"
 
+docker_context="$("$docker" context show 2>/dev/null)" || die "cannot resolve Docker context"
+docker_endpoint="$("$docker" context inspect "$docker_context" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)" ||
+  die "cannot inspect Docker endpoint"
+[[ "$docker_endpoint" == unix:///* ]] || die "Docker endpoint must be a local Unix socket"
+docker_socket="${docker_endpoint#unix://}"
+[[ -S "$docker_socket" ]] || die "Docker endpoint is not a local Unix socket"
+case "$docker_socket" in
+  /var/run/docker.sock|"$operator_home"/.docker/run/docker.sock) ;;
+  *) die "Docker endpoint is not the supported local Docker Desktop socket" ;;
+esac
+
 "$docker" info >/dev/null 2>&1 ||
   die "Docker daemon is not running; start Docker Desktop through Muavin before retrying"
 
@@ -100,6 +117,10 @@ ensure_image() {
 ensure_image "$GITLEAKS_IMAGE"
 ensure_image "$POSTGRES_IMAGE"
 
+reported_gitleaks_version="$("$docker" run --rm "$GITLEAKS_IMAGE" version 2>/dev/null | head -n1)"
+[[ "$reported_gitleaks_version" =~ (^|[[:space:]])${GITLEAKS_VERSION}($|[[:space:]]) ]] ||
+  die "pinned gitleaks image did not report version $GITLEAKS_VERSION"
+
 printf 'verify-pr: scanning first-parent branch history with gitleaks %s\n' "$GITLEAKS_VERSION"
 "$docker" run --rm \
   --mount "type=bind,src=$repo_root,dst=/repo,readonly" \
@@ -110,15 +131,42 @@ printf 'verify-pr: scanning first-parent branch history with gitleaks %s\n' "$GI
 nonce="$(printf '%s-%s-%s' "$$" "$RANDOM" "$frozen_oid" | shasum -a 256 | cut -c1-16)"
 pg_name="stoarama-verify-pr-$nonce"
 pg_started=0
+active_child=""
+scratch_root="$(mktemp -d "${TMPDIR:-/tmp}/stoarama-verify-pr.XXXXXX")"
+chmod 700 "$scratch_root"
+sanitized_home="$scratch_root/home"
+mkdir -m 700 "$sanitized_home"
+safe_gocache="$(go env GOCACHE)"
+safe_gomodcache="$(go env GOMODCACHE)"
+safe_gopath="$(go env GOPATH)"
 
 cleanup() {
   local status=$?
+  local cleanup_failed=0
   trap - EXIT INT TERM HUP
+  if [[ -n "$active_child" ]]; then
+    kill "$active_child" >/dev/null 2>&1 || true
+    wait "$active_child" 2>/dev/null || true
+    active_child=""
+  fi
   if [[ "$pg_started" -eq 1 && "$pg_name" == stoarama-verify-pr-* ]]; then
     label="$("$docker" inspect --format '{{ index .Config.Labels "com.stoarama.verify-pr" }}' "$pg_name" 2>/dev/null || true)"
     if [[ "$label" == "$nonce" ]]; then
-      "$docker" rm -f "$pg_name" >/dev/null 2>&1 || true
+      "$docker" rm -f "$pg_name" >/dev/null 2>&1 || cleanup_failed=1
+      if "$docker" inspect "$pg_name" >/dev/null 2>&1; then
+        cleanup_failed=1
+      fi
+    else
+      cleanup_failed=1
     fi
+  fi
+  if [[ -d "$scratch_root" && "$scratch_root" == */stoarama-verify-pr.* ]]; then
+    find "$scratch_root" -depth -mindepth 1 -delete 2>/dev/null || cleanup_failed=1
+    rmdir "$scratch_root" 2>/dev/null || cleanup_failed=1
+  fi
+  if [[ "$cleanup_failed" -eq 1 && "$status" -eq 0 ]]; then
+    printf 'verify-pr: cleanup verification failed\n' >&2
+    status=1
   fi
   exit "$status"
 }
@@ -145,15 +193,20 @@ test_database_url="postgres://stoarama@127.0.0.1:${pg_port}/stoarama_test?sslmod
 
 ready=0
 for _ in {1..60}; do
-  if "$docker" exec "$pg_name" pg_isready -U stoarama -d stoarama_test >/dev/null 2>&1; then
+  "$docker" exec "$pg_name" pg_isready -U stoarama -d stoarama_test >/dev/null 2>&1 &
+  active_child=$!
+  if wait "$active_child"; then
+    active_child=""
     ready=1
     break
   fi
+  active_child=""
   sleep 1
 done
 [[ "$ready" -eq 1 ]] || die "disposable PostgreSQL 17 did not become ready within 60 seconds"
 
-python3 bin/verify_pr_workflow.py \
+HOME="$sanitized_home" GOCACHE="$safe_gocache" GOMODCACHE="$safe_gomodcache" GOPATH="$safe_gopath" \
+  python3 bin/verify_pr_workflow.py \
   --root "$repo_root" \
   --workflow "$repo_root/.github/workflows/test.yml" \
   --database-url "$test_database_url"

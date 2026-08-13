@@ -7,9 +7,16 @@ root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
 }
 cd "$root"
 
-current="$(git config --local --get core.hooksPath || true)"
+current="$(git config --get core.hooksPath || true)"
 if [[ -n "$current" && "$current" != ".githooks" ]]; then
-  printf 'install-dev-hooks: refusing to replace existing core.hooksPath=%s\n' "$current" >&2
+  printf 'install-dev-hooks: refusing effective core.hooksPath=%s; migrate it explicitly first\n' "$current" >&2
+  exit 1
+fi
+
+legacy_hook="$(git rev-parse --git-path hooks/pre-push)"
+repo_hook="$root/.githooks/pre-push"
+if [[ -e "$legacy_hook" ]] && ! cmp -s "$legacy_hook" "$repo_hook"; then
+  printf 'install-dev-hooks: refusing to disable existing %s; migrate it explicitly first\n' "$legacy_hook" >&2
   exit 1
 fi
 
