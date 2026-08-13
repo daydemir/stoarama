@@ -886,6 +886,9 @@ func (s *Server) unassignRecordingStreamTx(ctx context.Context, tx pgx.Tx, strea
 }
 
 func (s *Server) loadStreamForAssignmentTx(ctx context.Context, tx pgx.Tx, streamID int64) (model.Stream, error) {
+	if err := lockRecordingCampaignSourceStreamTx(ctx, tx, streamID); err != nil {
+		return model.Stream{}, err
+	}
 	var stream model.Stream
 	var recordingState string
 	var metaBytes []byte

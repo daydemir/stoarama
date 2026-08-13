@@ -22,6 +22,13 @@ type streamSourceRevisionInput struct {
 	Metadata map[string]any
 }
 
+func lockRecordingCampaignSourceStreamTx(ctx context.Context, tx pgx.Tx, streamID int64) error {
+	if _, err := tx.Exec(ctx, `SELECT recording_campaign_v2_lock_source_stream($1)`, streamID); err != nil {
+		return fmt.Errorf("lock stream source/roster fence: %w", err)
+	}
+	return nil
+}
+
 func streamSourceChanged(previous model.Stream, current model.Stream) bool {
 	return strings.TrimSpace(previous.SourceURL) != strings.TrimSpace(current.SourceURL) ||
 		strings.TrimSpace(previous.SourcePageURL) != strings.TrimSpace(current.SourcePageURL) ||
