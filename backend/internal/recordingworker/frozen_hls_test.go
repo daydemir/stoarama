@@ -496,12 +496,17 @@ func TestFrozenHLSJobStatePersistsAcrossForcedCyclesWithHeartbeat(t *testing.T) 
 
 func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.T) {
 	var heartbeats, surrenders, completes atomic.Int64
+	heartbeatEvents := make(chan struct{}, 16)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
 			heartbeats.Add(1)
+			select {
+			case heartbeatEvents <- struct{}{}:
+			default:
+			}
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"cancel":false,"lease_expires_at":%q}`, time.Now().Add(time.Second).Format(time.RFC3339Nano))
+			fmt.Fprintf(w, `{"cancel":false,"lease_expires_at":%q}`, time.Now().Add(5*time.Second).Format(time.RFC3339Nano))
 		case strings.HasSuffix(r.URL.Path, "/surrender"):
 			surrenders.Add(1)
 			w.Header().Set("Content-Type", "application/json")
@@ -525,11 +530,13 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 	w.cfg.CaptureTempDir = t.TempDir()
 	w.cfg.HeartbeatSec = 1
 	w.cfg.UploadWorkers = 1
+	w.cfg.ContinuousNoProgressTimeout = 5 * time.Second
 	w.heartbeatInt = 2 * time.Millisecond
 	w.leaseSafetyMargin = time.Millisecond
 	w.frozenHLSForceCapture = 100 * time.Millisecond
 	baseline := frozenHLSSnapshot{TargetDuration: 2 * time.Millisecond, MediaSequence: 1, ManifestSHA256: "manifest", LastSegmentSHA256: "segment"}
 	var captureCalls atomic.Int64
+	var initialObservations atomic.Int64
 	var changed atomic.Bool
 	launches := make(chan int64, 4)
 	jobCtx, cancelJob := context.WithCancel(context.Background())
@@ -550,7 +557,10 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 		}
 		return capture.ErrContinuousNoOutput
 	}
-	w.frozenHLSObserve = func(context.Context, string, string) (frozenHLSSnapshot, error) { return baseline, nil }
+	w.frozenHLSObserve = func(context.Context, string, string) (frozenHLSSnapshot, error) {
+		initialObservations.Add(1)
+		return baseline, nil
+	}
 	w.frozenHLSObserveCurrent = func(context.Context, recordingapi.RecordingJob) (frozenHLSSnapshot, error) {
 		observed := baseline
 		if changed.Load() {
@@ -560,9 +570,9 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 	}
 	windowEnd := time.Now().Add(30 * time.Second)
 	job := recordingapi.RecordingJob{
-		JobID: 437, RecordingID: 437, SourceURL: "https://example.com/live.m3u8",
+		JobID: 437, RecordingID: 437, SourceURL: "https://192.0.2.1/live.m3u8",
 		ClipDurationSec: 30, Kind: "continuous_window", WindowEndAt: &windowEnd,
-		LeaseToken: "lease", LeaseExpiresAt: time.Now().Add(30 * time.Second),
+		LeaseToken: "lease", LeaseExpiresAt: time.Now().Add(5 * time.Second),
 	}
 	done := make(chan struct{})
 	go func() {
@@ -590,6 +600,25 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 			break
 		}
 	}
+	if launchErr == nil {
+		heartbeatTimer := time.NewTimer(2 * time.Second)
+		for observed := 0; observed < 3; observed++ {
+			select {
+			case <-heartbeatEvents:
+			case <-heartbeatTimer.C:
+				launchErr = fmt.Errorf("timed out after %d heartbeat events", observed)
+			}
+			if launchErr != nil {
+				break
+			}
+		}
+		if !heartbeatTimer.Stop() {
+			select {
+			case <-heartbeatTimer.C:
+			default:
+			}
+		}
+	}
 	cancelJob()
 	select {
 	case <-done:
@@ -601,6 +630,9 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 	}
 	if captureCalls.Load() != 4 {
 		t.Fatalf("capture launches=%d want 4", captureCalls.Load())
+	}
+	if initialObservations.Load() != 1 {
+		t.Fatalf("initial frozen HLS observations=%d want 1", initialObservations.Load())
 	}
 	if surrenders.Load() != 0 || completes.Load() != 0 {
 		t.Fatalf("surrenders=%d completes=%d", surrenders.Load(), completes.Load())
