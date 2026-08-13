@@ -2,6 +2,7 @@ package dropletpool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -111,6 +112,47 @@ func TestListDropletsPageDoesNotRetryMTLSMessageOnOtherStatus(t *testing.T) {
 	}
 }
 
+func TestCreateDropletTagScopedFirewallNeverAddsExplicitMembership(t *testing.T) {
+	var firewallAdds atomic.Int64
+	var sawPoolTag atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/droplets":
+			var body struct {
+				Tags []string `json:"tags"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			sawPoolTag.Store(containsString(body.Tags, recorderFirewallTag))
+			_, _ = fmt.Fprint(w, `{"droplet":{"id":42,"name":"stoarama-rec-rollout-1-1","status":"new","networks":{"v4":[]}},"links":{}}`)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/resources"):
+			_, _ = fmt.Fprint(w, `{"resources":[]}`)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/firewalls/"):
+			firewallAdds.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := godo.NewClient(server.Client())
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.BaseURL = baseURL
+	provider := &godoClient{c: client}
+	_, err = provider.CreateDroplet(context.Background(), CreateDropletInput{Name: "stoarama-rec-rollout-1-1", Region: "nyc1", Size: "s-2vcpu-4gb", Image: "ubuntu-24-04-x64", ProjectID: "project", FirewallID: "fw-v2", FirewallByTag: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawPoolTag.Load() || firewallAdds.Load() != 0 {
+		t.Fatalf("pool_tag=%t explicit_firewall_adds=%d", sawPoolTag.Load(), firewallAdds.Load())
+	}
+}
+
 func TestJitteredDOReadRetryDelayIsBounded(t *testing.T) {
 	for attempt := 1; attempt <= 3; attempt++ {
 		ceiling := time.Second * time.Duration(attempt)
@@ -211,6 +253,10 @@ func (f *failingFleetDO) ListDropletsByName(context.Context, string, string) ([]
 		return nil, f.listErr
 	}
 	return nil, errors.New("provider fleet unavailable")
+}
+
+func (f *failingFleetDO) InspectRollout(context.Context, string, string, string) (RolloutProviderFacts, error) {
+	return RolloutProviderFacts{}, f.listErr
 }
 
 func TestReconcileClassifiesOnlyProviderFleetReadFailure(t *testing.T) {

@@ -13,21 +13,32 @@ import (
 
 // Droplet is the controller's view of a recorder_droplets row.
 type Droplet struct {
-	ID             int64
-	Name           string
-	NodeID         *int64
-	NodeTokenID    *int64
-	DODropletID    *int64
-	Region         string
-	Size           string
-	Capacity       int
-	State          string
-	IPAddress      string
-	BuildSHA       string
-	LastSeenAt     *time.Time
-	IdleSince      *time.Time
-	DrainStartedAt *time.Time
-	CreatedAt      time.Time
+	ID                          int64
+	Name                        string
+	NodeID                      *int64
+	NodeTokenID                 *int64
+	DODropletID                 *int64
+	Region                      string
+	Size                        string
+	Capacity                    int
+	State                       string
+	IPAddress                   string
+	BuildSHA                    string
+	DesiredBuildSHA             string
+	DesiredCommonPolicySHA256   string
+	DesiredRuntimeConfigSHA256  string
+	ObservedBuildSHA            string
+	ObservedCommonPolicySHA256  string
+	ObservedRuntimeConfigSHA256 string
+	FirewallFingerprint         string
+	FirewallVerifiedAt          *time.Time
+	RolloutGeneration           *int64
+	ReplacementForID            *int64
+	LeaseAdmissionEnabled       bool
+	LastSeenAt                  *time.Time
+	IdleSince                   *time.Time
+	DrainStartedAt              *time.Time
+	CreatedAt                   time.Time
 }
 
 // Store is the recorder_droplets + recorder_pool_state + node-token data access
@@ -50,7 +61,7 @@ func (s *Store) ValidateLiveBindings(ctx context.Context) error {
 		SELECT d.name
 		FROM recorder_droplets d
 		LEFT JOIN nodes n ON n.id=d.node_id
-		WHERE d.state IN ('provisioning', 'active', 'draining')
+		WHERE d.state IN ('provisioning','standby_ready','active','rollout_draining','draining')
 		  AND (
 			d.node_id IS NULL
 			OR n.id IS NULL
@@ -204,7 +215,7 @@ func (s *Store) SetDropletID(ctx context.Context, id, doDropletID int64, ip stri
 func (s *Store) MarkActive(ctx context.Context, id int64) (bool, error) {
 	result, err := s.pool.Exec(ctx, `
 		UPDATE recorder_droplets
-		SET state='active', idle_since=NULL, updated_at=now()
+		SET state='active', lease_admission_enabled=true, idle_since=NULL, updated_at=now()
 		WHERE id=$1 AND state='provisioning'
 	`, id)
 	if err != nil {
@@ -223,6 +234,9 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, rolloutFenceSQL); err != nil {
+		return false, err
+	}
 
 	var name, state string
 	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
@@ -231,7 +245,7 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 	if state == "destroying" {
 		return true, tx.Commit(ctx)
 	}
-	if state != "provisioning" && state != "active" && state != "draining" {
+	if state != "provisioning" && state != "standby_ready" && state != "active" && state != "rollout_draining" && state != "draining" {
 		return false, nil
 	}
 	var busy bool
@@ -241,7 +255,7 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 	if busy {
 		return false, nil
 	}
-	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='destroying', updated_at=now() WHERE id=$1`, id); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='destroying', lease_admission_enabled=false, updated_at=now() WHERE id=$1`, id); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -253,7 +267,18 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 // MarkDraining flips an active droplet to draining and stamps drain_started_at.
 // The lease query already refuses new jobs to draining droplets.
 func (s *Store) MarkDraining(ctx context.Context, id int64) error {
-	return s.setState(ctx, id, "draining", `drain_started_at=now()`)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, rolloutFenceSQL); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET state='draining',lease_admission_enabled=false,drain_started_at=now() WHERE id=$1 AND state='active'`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // MarkDrainingIfIdle serializes with the lease path's droplet row lock, then
@@ -265,6 +290,9 @@ func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, rolloutFenceSQL); err != nil {
+		return false, err
+	}
 	var name, state string
 	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
 		return false, err
@@ -279,7 +307,7 @@ func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) 
 	if busy {
 		return false, nil
 	}
-	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='draining', drain_started_at=now(), updated_at=now() WHERE id=$1`, id); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='draining', lease_admission_enabled=false, drain_started_at=now(), updated_at=now() WHERE id=$1`, id); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -301,7 +329,7 @@ func (s *Store) MarkDestroyed(ctx context.Context, id int64) error {
 // MarkFailed flips a droplet to failed with a reason.
 func (s *Store) MarkFailed(ctx context.Context, id int64, reason string) error {
 	if _, err := s.pool.Exec(ctx, `
-		UPDATE recorder_droplets SET state='failed', provision_error=$2, updated_at=now() WHERE id=$1
+		UPDATE recorder_droplets SET state='failed', lease_admission_enabled=false, provision_error=$2, updated_at=now() WHERE id=$1
 	`, id, strings.TrimSpace(reason)); err != nil {
 		return fmt.Errorf("mark droplet failed: %w", err)
 	}
@@ -310,6 +338,9 @@ func (s *Store) MarkFailed(ctx context.Context, id int64, reason string) error {
 
 func (s *Store) setState(ctx context.Context, id int64, state, extra string) error {
 	q := `UPDATE recorder_droplets SET state=$2, updated_at=now()`
+	if state != "active" {
+		q += ", lease_admission_enabled=false"
+	}
 	if strings.TrimSpace(extra) != "" {
 		q += ", " + extra
 	}
@@ -344,13 +375,14 @@ func (s *Store) NodeBinding(ctx context.Context, id int64) (nodeID, nodeTokenID 
 }
 
 // CountLive returns the number of recorder_droplets rows in a billing-relevant
-// state (provisioning, active, draining, destroying). This is the spend-cap
+// state (provisioning, standby_ready, active, rollout_draining, draining,
+// destroying). This is the spend-cap
 // denominator; a destroyed/failed droplet does not count.
 func (s *Store) CountLive(ctx context.Context) (int, error) {
 	var n int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT count(*) FROM recorder_droplets
-		WHERE state IN ('provisioning','active','draining','destroying')
+		WHERE state IN ('provisioning','standby_ready','active','rollout_draining','draining','destroying')
 	`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count live droplets: %w", err)
 	}
@@ -361,7 +393,10 @@ func (s *Store) CountLive(ctx context.Context) (int, error) {
 func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state,
-		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
+		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at,
+		       COALESCE(desired_build_sha,''), COALESCE(desired_common_policy_sha256,''), COALESCE(desired_runtime_config_sha256,''),
+		       COALESCE(observed_build_sha,''), COALESCE(observed_common_policy_sha256,''), COALESCE(observed_runtime_config_sha256,''),
+		       COALESCE(firewall_fingerprint,''), firewall_verified_at, rollout_generation, replacement_for_id, lease_admission_enabled
 		FROM recorder_droplets
 		WHERE state = ANY($1)
 		ORDER BY id ASC
@@ -374,7 +409,10 @@ func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, 
 	for rows.Next() {
 		var d Droplet
 		if err := rows.Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-			&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt); err != nil {
+			&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt,
+			&d.DesiredBuildSHA, &d.DesiredCommonPolicySHA256, &d.DesiredRuntimeConfigSHA256,
+			&d.ObservedBuildSHA, &d.ObservedCommonPolicySHA256, &d.ObservedRuntimeConfigSHA256,
+			&d.FirewallFingerprint, &d.FirewallVerifiedAt, &d.RolloutGeneration, &d.ReplacementForID, &d.LeaseAdmissionEnabled); err != nil {
 			return nil, fmt.Errorf("scan droplet: %w", err)
 		}
 		out = append(out, d)
@@ -391,11 +429,17 @@ func (s *Store) FindByDODropletID(ctx context.Context, doDropletID int64) (*Drop
 	var d Droplet
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state,
-		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
+		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at,
+		       COALESCE(desired_build_sha,''), COALESCE(desired_common_policy_sha256,''), COALESCE(desired_runtime_config_sha256,''),
+		       COALESCE(observed_build_sha,''), COALESCE(observed_common_policy_sha256,''), COALESCE(observed_runtime_config_sha256,''),
+		       COALESCE(firewall_fingerprint,''), firewall_verified_at, rollout_generation, replacement_for_id, lease_admission_enabled
 		FROM recorder_droplets
 		WHERE do_droplet_id=$1
 	`, doDropletID).Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-		&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt)
+		&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt,
+		&d.DesiredBuildSHA, &d.DesiredCommonPolicySHA256, &d.DesiredRuntimeConfigSHA256,
+		&d.ObservedBuildSHA, &d.ObservedCommonPolicySHA256, &d.ObservedRuntimeConfigSHA256,
+		&d.FirewallFingerprint, &d.FirewallVerifiedAt, &d.RolloutGeneration, &d.ReplacementForID, &d.LeaseAdmissionEnabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

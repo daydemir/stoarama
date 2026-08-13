@@ -121,6 +121,45 @@ func TestDefaultMagicLinkTTLIsOneHour(t *testing.T) {
 	}
 }
 
+func TestDropletPoolRolloutDefaultsStructurallyOff(t *testing.T) {
+	t.Setenv("DROPLET_POOL_ROLLOUT_ENABLED", "")
+	t.Setenv("DROPLET_POOL_CONFIG_PLAN_SHA256", "")
+	t.Setenv("DROPLET_POOL_FIREWALL_RULES_SHA256", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DropletPoolRolloutEnabled || cfg.DropletPoolConfigPlanSHA256 != "" || cfg.DropletPoolFirewallRulesSHA256 != "" {
+		t.Fatalf("rollout enabled by defaults: enabled=%t plan=%q rules=%q", cfg.DropletPoolRolloutEnabled, cfg.DropletPoolConfigPlanSHA256, cfg.DropletPoolFirewallRulesSHA256)
+	}
+}
+
+func TestValidateDropletPoolRolloutRequiresExactSurgeAndFirewallFacts(t *testing.T) {
+	cfg := Config{
+		DOAPIToken: "token", DropletPoolBackendAPIURL: "https://api.example.com",
+		DropletPoolProjectID: "project", DropletPoolFirewallID: "firewall",
+		DropletPoolOperatorEmail: "operator@example.com", DropletPoolCapacity: 5,
+		RecordingWorkerConcurrency: 5, DropletPoolMin: 8, DropletPoolMax: 9,
+		DropletPoolMaxScaleUpBatch: 1, DropletPoolRegion: "nyc1", DropletPoolSize: "s-2vcpu-4gb",
+		DropletPoolImage: "image", DropletPoolBuildSHA: strings.Repeat("a", 40),
+		DropletPoolRolloutEnabled: true, DropletPoolRolloutMaxSurge: 1,
+		DropletPoolFirewallRulesSHA256: strings.Repeat("b", 64), DropletPoolFirewallTag: "fleet:recorder-pool-v1",
+	}
+	if err := cfg.ValidatePool(); err != nil {
+		t.Fatalf("valid rollout config: %v", err)
+	}
+	bad := cfg
+	bad.DropletPoolRolloutMaxSurge = 2
+	if err := bad.ValidatePool(); err == nil {
+		t.Fatal("accepted two-worker surge")
+	}
+	bad = cfg
+	bad.DropletPoolFirewallTag = "caller-selected"
+	if err := bad.ValidatePool(); err == nil {
+		t.Fatal("accepted caller-selected firewall tag")
+	}
+}
+
 func TestMITSharedRecordingsConfiguration(t *testing.T) {
 	t.Setenv("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID", "47")
 	t.Setenv("MIT_SCL_RECORDINGS_READ_SLUG", "mit-scl")

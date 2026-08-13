@@ -37,6 +37,8 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 	heartbeatSec := fs.Int("heartbeat-sec", cfg.RecordingWorkerHeartbeatSec, "lease heartbeat interval seconds")
 	pollSec := fs.Int("poll-sec", cfg.RecordingWorkerPollSec, "job poll interval seconds")
 	buildSHA := fs.String("build-sha", strings.TrimSpace(os.Getenv("RECORDER_BUILD_SHA")), "source commit for this worker binary")
+	commonPolicySHA := strings.ToLower(strings.TrimSpace(os.Getenv("RECORDER_COMMON_POLICY_SHA256")))
+	runtimeConfigSHA := strings.ToLower(strings.TrimSpace(os.Getenv("RECORDER_RUNTIME_CONFIG_SHA256")))
 	duration := fs.Duration("duration", 0, "optional run duration (e.g. 30m, 8h)")
 	_ = fs.Parse(args[1:])
 
@@ -73,6 +75,8 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		HeartbeatSec:                 *heartbeatSec,
 		PollInterval:                 time.Duration(*pollSec) * time.Second,
 		BuildSHA:                     strings.ToLower(strings.TrimSpace(*buildSHA)),
+		CommonPolicySHA256:           commonPolicySHA,
+		RuntimeConfigSHA256:          runtimeConfigSHA,
 		UploadWorkers:                cfg.RelayUploadWorkers,
 		ContinuousNoProgressTimeout:  cloudRecorderNoProgressTimeout,
 		FrozenHLSQuiescenceAllowlist: cfg.RecordingFrozenHLSQuiescenceAllowlist,

@@ -349,8 +349,17 @@ func leaseTokenHeaders(token string) map[string]string {
 // failed-node detection on last_seen_at rather than on DO power-on. For a manual
 // node with no managed droplet row the server update is a harmless no-op.
 func (c *Client) TouchDroplet(ctx context.Context, buildSHA string) error {
+	return c.TouchDropletIdentity(ctx, buildSHA, "", "")
+}
+
+// TouchDropletIdentity reports the worker-derived immutable deployment
+// identity. Empty hashes preserve legacy heartbeats but cannot make a rollout
+// standby claimable.
+func (c *Client) TouchDropletIdentity(ctx context.Context, buildSHA, commonPolicySHA256, runtimeConfigSHA256 string) error {
 	return c.postJSON(ctx, "/api/v1/recording/droplets/heartbeat", map[string]any{
-		"build_sha": strings.ToLower(strings.TrimSpace(buildSHA)),
+		"build_sha":             strings.ToLower(strings.TrimSpace(buildSHA)),
+		"common_policy_sha256":  strings.ToLower(strings.TrimSpace(commonPolicySHA256)),
+		"runtime_config_sha256": strings.ToLower(strings.TrimSpace(runtimeConfigSHA256)),
 	}, nil)
 }
 
