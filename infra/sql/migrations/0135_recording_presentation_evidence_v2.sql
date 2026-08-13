@@ -345,7 +345,7 @@ CREATE TABLE recording_presentation_v2_probe_tasks (
           AND ((retention_method='hardlink' AND retention_device_id=staging_device_id AND retention_inode_id=staging_inode_id
               AND retention_clone_identity_sha256 IS NULL AND staging_clone_identity_sha256 IS NULL)
             OR (retention_method='clone' AND retention_device_id IS NULL AND retention_inode_id IS NULL
-              AND retention_clone_identity_sha256=staging_clone_identity_sha256 AND retention_clone_identity_sha256 IS NOT NULL))))),
+              AND retention_clone_identity_sha256=staging_clone_identity_sha256 AND retention_clone_identity_sha256 IS NOT NULL)))))),
   CHECK(
     (state='awaiting_retention' AND retention_state='awaiting')
     OR (state IN('pending','leased') AND retention_state='active')
