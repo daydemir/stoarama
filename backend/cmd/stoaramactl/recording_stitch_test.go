@@ -64,7 +64,7 @@ INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO 
 		query string
 		args  []any
 	}{
-		{`INSERT INTO recording_jobs VALUES(9,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1)::bigint)`, []any{start, end, now}},
+		{`INSERT INTO recording_jobs VALUES(9,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1::timestamptz)::bigint)`, []any{start, end, now}},
 		{`INSERT INTO recording_window_health VALUES(7,9,$1,2,43200,43200,100,0,0,0,0,0,0,0,1)`, []any{now}},
 		{`INSERT INTO recording_clips VALUES(11,7,9,'safe/clip.mp4',4,repeat('a',64),$1,$2,'00000000-0000-4000-8000-000000000001',1,NULL,NULL,NULL,NULL,NULL,NULL,3,'https://storage.example','bucket','clip',$3-interval '20 minutes')`, []any{start, end, now}},
 	} {
@@ -81,7 +81,7 @@ INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO 
 	}{
 		{`INSERT INTO recording_campaign_tracks VALUES(1,47,'delivery30','active',$1+interval '9 days')`, []any{end}},
 		{`INSERT INTO recording_campaign_roster_entries VALUES(1,7,1,'primary','protect'),(1,8,2,'primary','protect')`, nil},
-		{`INSERT INTO recording_jobs VALUES (19,7,'done','continuous_window',$2,$2,$3,$1,60,'reccont:7:'||extract(epoch from $3)::bigint),(20,8,'done','continuous_window',$2,$2,$3,$1,60,'reccont:8:'||extract(epoch from $3)::bigint)`, []any{end, now, start}},
+		{`INSERT INTO recording_jobs VALUES (19,7,'done','continuous_window',$2,$2,$3,$1,60,'reccont:7:'||extract(epoch from $3::timestamptz)::bigint),(20,8,'done','continuous_window',$2,$2,$3,$1,60,'reccont:8:'||extract(epoch from $3::timestamptz)::bigint)`, []any{end, now, start}},
 		{`INSERT INTO recording_window_health VALUES (7,19,$1,2,43200,43200,100,0,0,0,0,0,0,0,1),(8,20,$1,2,43200,43200,100,0,0,0,0,0,0,0,1)`, []any{now}},
 	} {
 		if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
@@ -113,7 +113,7 @@ INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO 
 		}{
 			{`INSERT INTO recordings VALUES($1,48,'continuous')`, []any{recordingID}},
 			{`INSERT INTO recording_campaign_roster_entries VALUES(2,$1,$2,'primary','protect')`, []any{recordingID, i + 1}},
-			{`INSERT INTO recording_jobs VALUES($1,$2,'done','continuous_window',$5,$5,$3,$4,60,'reccont:'||$2||':'||extract(epoch from $3)::bigint)`, []any{jobID, recordingID, start, end, now}},
+			{`INSERT INTO recording_jobs VALUES($1,$2,'done','continuous_window',$5,$5,$3,$4,60,'reccont:'||$2||':'||extract(epoch from $3::timestamptz)::bigint)`, []any{jobID, recordingID, start, end, now}},
 			{`INSERT INTO recording_window_health VALUES($1,$2,$3,2,43200,43200,100,0,0,0,0,0,0,0,1)`, []any{recordingID, jobID, now}},
 		} {
 			if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
@@ -217,7 +217,7 @@ INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO 
 		query string
 		args  []any
 	}{
-		{`INSERT INTO recording_jobs VALUES(10,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1)::bigint)`, []any{start, end, now}},
+		{`INSERT INTO recording_jobs VALUES(10,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1::timestamptz)::bigint)`, []any{start, end, now}},
 		{`INSERT INTO recording_window_health SELECT 7,10,$1,2,43200,43200,100,0,0,0,0,0,0,0,1`, []any{now}},
 		{`UPDATE recording_clips SET recording_job_id=10 WHERE id=11`, nil},
 		{`INSERT INTO recording_upload_intents VALUES(10,'pending',$1+interval '1 minute',7,3,'https://storage.example','bucket','next','safe/next.mp4',100)`, []any{now}},
