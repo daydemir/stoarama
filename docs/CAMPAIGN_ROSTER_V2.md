@@ -66,14 +66,16 @@ evidence gates. Retirement is audited and does not erase facts.
 | Kind | State allowed for operation | Exact denominator rule |
 |---|---|---|
 | `delivery30` | active, complete | exactly 30 current filled primary slots in `protect` or `probation` |
-| `repair21` | planning | exactly 21 current plan slots; initial reviewed policy may be exactly 17 filled and 4 prospective |
-| `repair21` | active, complete | exact policy-defined filled denominator; prospective/vacant/replace/removed never count |
-| `reserve` | planning, active | policy-sized ordered backup slots; filled and prospective counts reported separately |
-| `strict50` | active, complete | exactly 50 filled members at freeze; separate strict-window policy |
+| `repair21` | planning | exactly 21 current repair slots: exactly 17 filled `protect`/`probation` plus exactly 4 prospective |
+| `repair21` | active, complete | exactly 21 current filled repair slots in `protect` or `probation`; zero prospective, vacant, replace, or removed heads |
+| `reserve` | planning, active | exactly the frozen target count of ordered backup/reserve slots; each head is filled `protect`/`probation` or prospective, with the two counts reported separately; it is never a qualification denominator |
+| `strict50` | active, complete | exactly 50 current filled primary slots in `protect` or `probation`; zero prospective, vacant, replace, or removed heads |
 
-Any later change to the initial 17-plus-4 policy requires a new policy version,
-not a mutable target. A denominator cannot shrink because a member fails,
-pauses, is replaced, or leaves the current head.
+Repair21's target is always 21. The reviewed planning transition is exactly
+17 filled plus 4 prospective; activation requires all 21 to be filled. A later
+composition change requires a new immutable policy version and revision but
+cannot alter the target or activate with fewer than 21. A denominator cannot
+shrink because a member fails, pauses, is replaced, or leaves the current head.
 
 ## Append-only slots and current heads
 
@@ -85,11 +87,26 @@ A campaign owns stable slot ordinals. Each immutable slot version contains:
 - `effective_from` and optional `superseded_at`;
 - actor and canonical request/decision digests.
 
-Allowed roles are `primary`, `backup`, `repair`, and `reserve`. Allowed current
-dispositions are `protect`, `probation`, `replace`, `removed`, `prospective`,
-and `vacant`, constrained by subject and campaign kind. A filled subject is
-required for protect/probation. Prospective and vacant subjects cannot satisfy a
-delivery or qualification denominator.
+Allowed roles and current-head combinations are exact:
+
+| Campaign kind | Allowed current roles |
+|---|---|
+| `delivery30` | `primary` only |
+| `repair21` | `repair` only |
+| `reserve` | `backup` or `reserve` |
+| `strict50` | `primary` only |
+
+| Subject shape | Allowed current disposition | Denominator/protection effect |
+|---|---|---|
+| filled recording | `protect`, `probation`, or `replace` | only `protect`/`probation` count and are campaign-protected; `replace` counts as zero |
+| prospective binding | `prospective` only | counts as zero and is never qualification evidence or campaign protection |
+| vacant | `vacant` only | counts as zero and is never qualification evidence or campaign protection |
+
+`removed` is allowed only on an immutable superseded historical version; it
+cannot be a current head. Any role, subject, and disposition tuple outside
+these tables is rejected by database constraints. Delivery30, active/complete
+repair21, and strict50 therefore cannot activate or remain complete with a
+prospective, vacant, replace, or removed member satisfying the denominator.
 
 The current head is not an unrestricted mutable pointer. Database constraints
 and deferred triggers enforce:
@@ -194,16 +211,27 @@ heads in `protect` or `probation` on active or complete campaigns.
 
 Removing that veto never authorizes deletion. Any cleanup still requires its
 own immutable exact file manifest—connection, confined path, size, current
-SHA-256 and recoverability evidence—plus explicit one-time Deniz approval
-through the supported operator channel, final path/byte/mount/backend
-revalidation, and the cleanup product's audit and rollback rules. There is no
-automatic NAS delete.
+SHA-256 and recoverability evidence—an exact canonical manifest digest, plus
+explicit one-time Deniz approval through the supported Jelly/Hermes Telegram
+approval contract for that digest. It also requires final
+path/byte/mount/backend revalidation and the cleanup product's audit and
+rollback rules. Approval for another digest, candidate, or run is invalid.
+There is no automatic NAS delete.
 
-Cleanup candidate creation records the current campaign/protection revision or
-locks the occupancy. Finalization runs serializably, locks the recording and all
-campaign heads/occupancy, and rejects any intervening protection or revision.
-Abandoned candidates expire without mutation. Tests must prove retirement alone
-cannot release or delete media.
+Cleanup candidate creation runs serializably, locks the recording, every
+current campaign head and occupancy row that could protect it, queries the
+stable protected-recording view under those locks, and refuses to create a
+candidate when the recording is protected. The candidate freezes the exact
+protection/campaign revisions and file-manifest digest.
+
+Final deletion repeats the same serializable locks and protected-view query,
+exact-compares every frozen revision and manifest fact, and refuses when the
+recording is currently protected or any protection, campaign, occupancy, file,
+mount, or backend fact changed. It also revalidates the exact unconsumed
+one-time Jelly/Hermes Telegram approval before deletion. Abandoned candidates
+and approvals expire without mutation. Tests must prove retirement alone
+cannot release or delete media and that protection added between candidate and
+finalization always vetoes deletion.
 
 ## Authenticated mutation contract
 

@@ -67,8 +67,10 @@ next segment, upload, ingest acknowledgment, heartbeat, or lease renewal.
 
 After the muxer has closed the trailer and relinquished every writable handle,
 the serialized segment owner may create a durable fail-safe retained reference
-under an app-owned, mode-restricted staging root. The recorder never modifies,
-truncates, or reuses a finalized inode.
+under an app-owned, mode-restricted staging root. The staging name and registry
+key are derived only from the immutable local clip/upload idempotency identity,
+never from a mutable path, server response, timestamp, or caller-selected name.
+The recorder never modifies, truncates, or reuses a finalized inode.
 
 The retained reference must be on the same filesystem:
 
@@ -79,10 +81,17 @@ The retained reference must be on the same filesystem:
 
 The source is opened `O_RDONLY|O_NOFOLLOW`. The staging reference is verified
 as a regular file with the exact expected device/inode for a hard link, or the
-approved clone identity, plus exact size and SHA-256. Its registry record and
-parent directory are fsynced. If durable retention cannot be established,
-ordinary ingest proceeds with probe disposition `unavailable`; no claimable
-task is created.
+approved clone identity, plus exact size and SHA-256. Creation, the typed
+registry record, and its idempotency binding are committed by atomic rename;
+the file, registry file, staging directory, and parent directory are fsynced.
+An existing registry key must exact-match every immutable field or conflict.
+This makes response-loss and crash reconciliation deterministic and prevents
+two local clips from adopting one retained object.
+
+If durable retention cannot be established, ordinary ingest proceeds with
+probe disposition `unavailable`. Base ingest then creates the one stable task
+directly in terminal operational state `unavailable`; it never passes through
+`awaiting_retention`, can never activate, and is never claimable.
 
 ### Idempotent base ingest
 
@@ -93,13 +102,20 @@ Base ingest is idempotent on the immutable tuple:
 - capture sequence and attempt;
 - clip SHA-256 and size.
 
-The first successful transaction commits the clip, one stable probe task ID,
-its absolute deadline, and an idempotency response. The initial task state is
-`awaiting_retention`, which is not claimable. An identical retry or exact status
-lookup returns the same `clip_id`, `probe_task_id`, disposition, and deadline,
-even when the upload intent is already consumed. Any changed immutable field is
-a conflict. Concurrent identical calls converge; different calls cannot create
-two clips or tasks.
+The first successful transaction commits the clip, exactly one stable probe
+task ID, its absolute deadline, disposition, and an idempotency response. Its
+initial state is selected exactly once from the retention disposition:
+
+- retained and registry-fsynced: `awaiting_retention`, nonclaimable until the
+  activation handshake completes;
+- unavailable: terminal operational `unavailable`, permanently nonclaimable.
+
+No other initial state is valid, and the unavailable branch can never be
+reactivated. An identical retry or exact status lookup returns the same
+`clip_id`, `probe_task_id`, disposition, state, and deadline, even when the
+upload intent is already consumed. Any changed immutable field is a conflict.
+Concurrent identical calls converge; different calls cannot create two clips
+or tasks.
 
 Local cleanup retains the ordinary source or fail-safe reference until this
 exact result is recovered. A generic conflict is never treated as success.
@@ -107,9 +123,16 @@ exact result is recovered. A generic conflict is never treated as success.
 ### Adopt and activate retention
 
 After recovering the stable server task ID, the owner adopts the same retained
-inode into a confined task directory keyed by the server UUID. The adoption is
-same-filesystem, fsynced, and revalidated `O_NOFOLLOW` against device/inode,
-size, SHA-256, deadline, and the local registry.
+inode into a confined task directory keyed by the server UUID. Adoption uses
+the immutable local clip/upload registry key to locate the staging entry. It
+creates the task reference without copying or substituting bytes and proves
+that staging and task references identify the same retained device/inode (or
+the exact approved clone identity), size, and SHA-256 before removing the
+staging name. The registry transition, task reference, both directories, and
+parent are atomically recorded and fsynced. A crash before, during, or after
+adoption is reconciled from those identities; an identity collision or changed
+binding conflicts rather than choosing a path. The probe later reopens only
+the confined task reference `O_NOFOLLOW`.
 
 `retention_identity_sha256` is a canonical typed digest of the server task ID,
 node ID, retained device/inode or approved clone identity, size, SHA-256, and
@@ -192,6 +215,18 @@ The server may configure lower limits. Awaiting-retention and release-pending
 bytes count against every limit. Failure to remain within the bounds makes the
 probe unavailable or expired without affecting footage. Lack of bounded cleanup
 progress disables future admissions for that node and recording.
+
+These priority rules apply to every probe in every rollout stage, not only a
+canary. A probe may start only when the delivery queue is empty, no upload is in
+flight, heartbeat and lease renewal are current, and every CPU/load, memory,
+state-reserve, retained-byte, count, and deadline guard is healthy. While it
+runs, a watcher checks at intervals no greater than five seconds. New delivery,
+upload activity, heartbeat or lease risk, resource pressure, SIGTERM, or an
+expired absolute deadline cancels the entire probe process group. Abnormal,
+preempted, or incompletely observed work resolves the affected axes as UNKNOWN
+and never delays upload acknowledgment, capture, heartbeat, or lease renewal.
+Future admissions remain default-off unless their exact rollout gate permits
+them.
 
 ## Authored evidence versus independent corroboration
 
