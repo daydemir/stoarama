@@ -695,7 +695,7 @@ CREATE TRIGGER recording_presentation_v2_task_audit AFTER INSERT OR UPDATE ON re
 CREATE FUNCTION validate_recording_presentation_v2_fact(p_fact_id BIGINT) RETURNS VOID LANGUAGE plpgsql AS $$
 DECLARE f recording_presentation_v2_authored_facts%ROWTYPE; t recording_presentation_v2_probe_tasks%ROWTYPE;
   v_axes INTEGER; v_complete INTEGER; v_unknown INTEGER; v_not_present INTEGER; v_audio_not_present INTEGER;
-  a RECORD; expected_edges INTEGER; actual_edges INTEGER; corresponding TEXT;
+  axis_fact RECORD; expected_edges INTEGER; actual_edges INTEGER; corresponding TEXT;
 BEGIN
   SELECT * INTO f FROM recording_presentation_v2_authored_facts WHERE id=p_fact_id;
   IF NOT FOUND THEN RETURN; END IF;
@@ -723,29 +723,29 @@ BEGIN
      OR (f.authored_status='unknown' AND f.terminal_reason<>'all_axes_unknown') THEN
     RAISE EXCEPTION 'presentation terminal reason differs from axes';
   END IF;
-  FOR a IN SELECT * FROM recording_presentation_v2_fact_axes WHERE fact_id=f.id LOOP
-    SELECT count(*) INTO actual_edges FROM recording_presentation_v2_packet_edges WHERE fact_id=f.id AND axis=a.axis;
-    IF a.axis IN('demux_video','demux_audio') AND a.status='complete' THEN
-      expected_edges:=2*LEAST(4,a.unit_count)::integer;
+  FOR axis_fact IN SELECT * FROM recording_presentation_v2_fact_axes WHERE fact_id=f.id LOOP
+    SELECT count(*) INTO actual_edges FROM recording_presentation_v2_packet_edges WHERE fact_id=f.id AND axis=axis_fact.axis;
+    IF axis_fact.axis IN('demux_video','demux_audio') AND axis_fact.status='complete' THEN
+      expected_edges:=2*LEAST(4,axis_fact.unit_count)::integer;
       IF actual_edges<>expected_edges THEN RAISE EXCEPTION 'demux edge cardinality mismatch'; END IF;
       IF EXISTS(
         SELECT 1 FROM recording_presentation_v2_packet_edges e
-        WHERE e.fact_id=f.id AND e.axis=a.axis AND
-          (e.time_base_num<>a.time_base_num OR e.time_base_den<>a.time_base_den
-           OR (e.edge_side='leading' AND e.demux_ordinal<>a.first_ordinal+e.edge_rank-1)
-           OR (e.edge_side='trailing' AND e.demux_ordinal<>a.end_ordinal-e.edge_rank+1)))
-        OR NOT EXISTS(SELECT 1 FROM recording_presentation_v2_packet_edges e WHERE e.fact_id=f.id AND e.axis=a.axis AND e.edge_side='leading' AND e.edge_rank=1 AND e.pts=a.first_timestamp)
-        OR NOT EXISTS(SELECT 1 FROM recording_presentation_v2_packet_edges e WHERE e.fact_id=f.id AND e.axis=a.axis AND e.edge_side='trailing' AND e.edge_rank=1 AND e.pts+e.duration=a.end_timestamp) THEN
+        WHERE e.fact_id=f.id AND e.axis=axis_fact.axis AND
+          (e.time_base_num<>axis_fact.time_base_num OR e.time_base_den<>axis_fact.time_base_den
+           OR (e.edge_side='leading' AND e.demux_ordinal<>axis_fact.first_ordinal+e.edge_rank-1)
+           OR (e.edge_side='trailing' AND e.demux_ordinal<>axis_fact.end_ordinal-e.edge_rank+1)))
+        OR NOT EXISTS(SELECT 1 FROM recording_presentation_v2_packet_edges e WHERE e.fact_id=f.id AND e.axis=axis_fact.axis AND e.edge_side='leading' AND e.edge_rank=1 AND e.pts=axis_fact.first_timestamp)
+        OR NOT EXISTS(SELECT 1 FROM recording_presentation_v2_packet_edges e WHERE e.fact_id=f.id AND e.axis=axis_fact.axis AND e.edge_side='trailing' AND e.edge_rank=1 AND e.pts+e.duration=axis_fact.end_timestamp) THEN
         RAISE EXCEPTION 'demux edge ordering or endpoint mismatch';
       END IF;
     ELSIF actual_edges<>0 THEN RAISE EXCEPTION 'non-complete demux axis has children'; END IF;
-    SELECT count(*) INTO actual_edges FROM recording_presentation_v2_raw_extents WHERE fact_id=f.id AND axis=a.axis;
-    IF a.axis IN('raw_video','raw_audio') AND a.status='complete' THEN
-      expected_edges:=2*LEAST(4,a.unit_count)::integer;
+    SELECT count(*) INTO actual_edges FROM recording_presentation_v2_raw_extents WHERE fact_id=f.id AND axis=axis_fact.axis;
+    IF axis_fact.axis IN('raw_video','raw_audio') AND axis_fact.status='complete' THEN
+      expected_edges:=2*LEAST(4,axis_fact.unit_count)::integer;
       IF actual_edges<>expected_edges THEN RAISE EXCEPTION 'raw extent cardinality mismatch'; END IF;
-      corresponding:=CASE a.axis WHEN 'raw_video' THEN 'demux_video' ELSE 'demux_audio' END;
-      IF NOT EXISTS(SELECT 1 FROM recording_presentation_v2_fact_axes d WHERE d.fact_id=f.id AND d.axis=corresponding AND d.status='complete' AND d.unit_count=a.unit_count)
-         OR EXISTS(SELECT 1 FROM recording_presentation_v2_raw_extents x WHERE x.fact_id=f.id AND x.axis=a.axis AND NOT EXISTS(SELECT 1 FROM recording_presentation_v2_packet_edges p WHERE p.fact_id=f.id AND p.axis=corresponding AND p.edge_side=x.edge_side AND p.edge_rank=x.edge_rank AND p.demux_ordinal=x.demux_ordinal)) THEN
+      corresponding:=CASE axis_fact.axis WHEN 'raw_video' THEN 'demux_video' ELSE 'demux_audio' END;
+      IF NOT EXISTS(SELECT 1 FROM recording_presentation_v2_fact_axes d WHERE d.fact_id=f.id AND d.axis=corresponding AND d.status='complete' AND d.unit_count=axis_fact.unit_count)
+         OR EXISTS(SELECT 1 FROM recording_presentation_v2_raw_extents x WHERE x.fact_id=f.id AND x.axis=axis_fact.axis AND NOT EXISTS(SELECT 1 FROM recording_presentation_v2_packet_edges p WHERE p.fact_id=f.id AND p.axis=corresponding AND p.edge_side=x.edge_side AND p.edge_rank=x.edge_rank AND p.demux_ordinal=x.demux_ordinal)) THEN
         RAISE EXCEPTION 'raw extent does not match demux edges';
       END IF;
     ELSIF actual_edges<>0 THEN RAISE EXCEPTION 'non-complete raw axis has children'; END IF;

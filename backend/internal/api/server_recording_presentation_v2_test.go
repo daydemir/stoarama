@@ -163,13 +163,14 @@ func addPresentationV2Task(t *testing.T, pool *pgxpool.Pool, f presentationV2Fix
 	intent, task := uuid.New(), uuid.New()
 	var clipID int64
 	name := fmt.Sprintf("extra-%s-%d.mp4", f.taskID.String()[:8], sequence)
+	clipSHA := fmt.Sprintf("%064x", sequence)
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) SELECT $1,$2,$3,id,endpoint,bucket,$4,$4,'video/mp4',4096,'consumed',now()+interval '1 hour' FROM storage_destinations WHERE id=$5`, intent, f.recordingID, f.jobID, name, f.destinationID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,audio_present,fire_at,clip_start_at,clip_end_at,capture_lease_token,capture_sequence) SELECT $1,$2,id,endpoint,bucket,$3,$3,'video/mp4','mp4',1024,'etag',repeat('e',64),60000,'h264',false,now(),now(),now()+interval '1 minute',$4,$5 FROM storage_destinations WHERE id=$6 RETURNING id`, f.recordingID, f.jobID, name, f.leaseToken, sequence, f.destinationID).Scan(&clipID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,audio_present,fire_at,clip_start_at,clip_end_at,capture_lease_token,capture_sequence) SELECT $1,$2,id,endpoint,bucket,$3,$3,'video/mp4','mp4',1024,'etag',$4,60000,'h264',false,now(),now(),now()+interval '1 minute',$5,$6 FROM storage_destinations WHERE id=$7 RETURNING id`, f.recordingID, f.jobID, name, clipSHA, f.leaseToken, sequence, f.destinationID).Scan(&clipID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_presentation_v2_probe_tasks(id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,staging_identity_sha256,staging_method,staging_device_id,staging_inode_id,request_sha256,response_sha256,initial_disposition,state,retention_state,absolute_deadline_at,created_at) VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8::bigint,$9,$10,$11,$12,1024,repeat('e',64),repeat('f',64),repeat('1',64),'hardlink','42',$13,repeat('2',64),encode(sha256(convert_to('task:'||$1::uuid::text||':'||$8::bigint::text||':awaiting_retention','UTF8')),'hex'),'retained','awaiting_retention','awaiting',CASE WHEN $14 THEN now()-interval '1 minute' ELSE now()+interval '8 minutes' END,CASE WHEN $14 THEN now()-interval '2 minutes' ELSE now() END)`, task, f.admissionID, f.attemptID, f.accountID, f.recordingID, f.streamID, f.jobID, clipID, intent, f.leaseToken, f.nodeID, sequence, fmt.Sprint(200000+sequence), mode == "expired"); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_presentation_v2_probe_tasks(id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,staging_identity_sha256,staging_method,staging_device_id,staging_inode_id,request_sha256,response_sha256,initial_disposition,state,retention_state,absolute_deadline_at,created_at) VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8::bigint,$9,$10,$11,$12,1024,$13,repeat('f',64),repeat('1',64),'hardlink','42',$14,repeat('2',64),encode(sha256(convert_to('task:'||$1::uuid::text||':'||$8::bigint::text||':awaiting_retention','UTF8')),'hex'),'retained','awaiting_retention','awaiting',CASE WHEN $15 THEN now()-interval '1 minute' ELSE now()+interval '8 minutes' END,CASE WHEN $15 THEN now()-interval '2 minutes' ELSE now() END)`, task, f.admissionID, f.attemptID, f.accountID, f.recordingID, f.streamID, f.jobID, clipID, intent, f.leaseToken, f.nodeID, sequence, clipSHA, fmt.Sprint(200000+sequence), mode == "expired"); err != nil {
 		t.Fatal(err)
 	}
 	if mode == "expired" {
@@ -262,6 +263,7 @@ func TestRecordingPresentationV2IngestAmbiguousReplayAndUnavailablePostgres(t *t
 		t.Fatal(err)
 	}
 	body.IntentID, body.CaptureSequence, body.DurationMs = unavailableIntent.String(), 3, 60_000
+	body.SHA256 = strings.Repeat("a", 64)
 	body.PresentationProbe = &presentationV2IngestEnvelope{AttemptID: f.attemptID.String(), LocalUploadIdentitySHA256: strings.Repeat("9", 64), Disposition: "unavailable", UnavailableReason: "retention_unavailable"}
 	unavailable := request(body)
 	if unavailable.Code != http.StatusOK || !strings.Contains(unavailable.Body.String(), `"state":"unavailable"`) {
@@ -364,17 +366,17 @@ func TestRecordingPresentationV2CampaignProtectionFencePostgres(t *testing.T) {
 	if _, err = pool.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,repeat('c',64),'primary',1,'protect',ARRAY['test'],now(),now(),now(),repeat('d',64),$4)`, protectedTrack, protectedFirst.recordingID, protectedFirst.streamID, actor); err != nil {
 		t.Fatal(err)
 	}
+	protectedJob := protectedFirst.jobID + 1_000_000
+	protectedLease := uuid.New()
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES($1,$2,now(),now(),60,'leased',$3,now()+interval '1 hour',$4,$5,'continuous_window',now()+interval '1 hour')`, protectedJob, protectedFirst.recordingID, fmt.Sprintf("node:%d", protectedFirst.nodeID), protectedLease, fmt.Sprintf("protected-first-%d", time.Now().UnixNano())); err != nil {
+		t.Fatal(err)
+	}
 	protectTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer protectTx.Rollback(ctx)
 	if _, err = protectTx.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['protect'],$2,now())`, protectedTrack, actor); err != nil {
-		t.Fatal(err)
-	}
-	protectedJob := protectedFirst.jobID + 1_000_000
-	protectedLease := uuid.New()
-	if _, err = pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES($1,$2,now(),now(),60,'leased',$3,now()+interval '1 hour',$4,$5,'continuous_window',now()+interval '1 hour')`, protectedJob, protectedFirst.recordingID, fmt.Sprintf("node:%d", protectedFirst.nodeID), protectedLease, fmt.Sprintf("protected-first-%d", time.Now().UnixNano())); err != nil {
 		t.Fatal(err)
 	}
 	latePID, lateResult := make(chan int32, 1), make(chan error, 1)
