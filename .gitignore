@@ -73,4 +73,5 @@ credentials.json
 !/bin/verify_pr_workflow.py
 !/bin/install-dev-hooks
 !/bin/test-verify-pr.sh
+!/bin/run_clean.py
 /backend/bin/

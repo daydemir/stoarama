@@ -132,7 +132,9 @@ nonce="$(printf '%s-%s-%s' "$$" "$RANDOM" "$frozen_oid" | shasum -a 256 | cut -c
 pg_name="stoarama-verify-pr-$nonce"
 pg_started=0
 active_child=""
+runner_pid=""
 scratch_root="$(mktemp -d "${TMPDIR:-/tmp}/stoarama-verify-pr.XXXXXX")"
+runner_pgid_file="$scratch_root/active-pgid"
 chmod 700 "$scratch_root"
 sanitized_home="$scratch_root/home"
 mkdir -m 700 "$sanitized_home"
@@ -148,6 +150,19 @@ cleanup() {
     kill "$active_child" >/dev/null 2>&1 || true
     wait "$active_child" 2>/dev/null || true
     active_child=""
+  fi
+  if [[ -n "$runner_pid" ]]; then
+    if [[ -f "$runner_pgid_file" ]]; then
+      runner_pgid="$(cat "$runner_pgid_file" 2>/dev/null || true)"
+      if [[ "$runner_pgid" =~ ^[0-9]+$ ]]; then
+        kill -TERM -- "-$runner_pgid" >/dev/null 2>&1 || true
+        sleep 1
+        kill -KILL -- "-$runner_pgid" >/dev/null 2>&1 || true
+      fi
+    fi
+    kill "$runner_pid" >/dev/null 2>&1 || true
+    wait "$runner_pid" 2>/dev/null || true
+    runner_pid=""
   fi
   if [[ "$pg_started" -eq 1 && "$pg_name" == stoarama-verify-pr-* ]]; then
     label="$("$docker" inspect --format '{{ index .Config.Labels "com.stoarama.verify-pr" }}' "$pg_name" 2>/dev/null || true)"
@@ -206,10 +221,14 @@ done
 [[ "$ready" -eq 1 ]] || die "disposable PostgreSQL 17 did not become ready within 60 seconds"
 
 HOME="$sanitized_home" GOCACHE="$safe_gocache" GOMODCACHE="$safe_gomodcache" GOPATH="$safe_gopath" \
+  TMPDIR="$scratch_root" STOARAMA_VERIFY_ACTIVE_PGID_FILE="$runner_pgid_file" \
   python3 bin/verify_pr_workflow.py \
   --root "$repo_root" \
   --workflow "$repo_root/.github/workflows/test.yml" \
-  --database-url "$test_database_url"
+  --database-url "$test_database_url" &
+runner_pid=$!
+wait "$runner_pid"
+runner_pid=""
 
 printf 'verify-pr: checking tracked Go formatting and committed diff whitespace\n'
 go_files=()

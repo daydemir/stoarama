@@ -37,6 +37,7 @@ mkdir -p "$repo/bin" "$repo/.githooks" "$repo/.github/workflows" "$repo/backend"
 cp "$source_root/bin/verify-pr" "$repo/bin/verify-pr"
 cp "$source_root/bin/verify_pr_workflow.py" "$repo/bin/verify_pr_workflow.py"
 cp "$source_root/bin/install-dev-hooks" "$repo/bin/install-dev-hooks"
+cp "$source_root/bin/run_clean.py" "$repo/bin/run_clean.py"
 cp "$source_root/.githooks/pre-push" "$repo/.githooks/pre-push"
 cp "$source_root/.github/workflows/test.yml" "$repo/.github/workflows/test.yml"
 chmod +x "$repo/bin/"* "$repo/.githooks/pre-push"
@@ -128,6 +129,9 @@ cat >"$fake_bin/go" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ -z "${DATABASE_URL:-}" ]] || exit 81
+[[ "${GOENV:-}" == off && "${GOPROXY:-}" == off && "${GOSUMDB:-}" == off ]] || {
+  [[ "${1:-}" == env ]] || exit 79
+}
 if [[ "${1:-}" == env ]]; then
   case "${2:-}" in
     GOCACHE) printf '%s\n' "${TMPDIR:-/tmp}/go-cache" ;;
@@ -138,6 +142,11 @@ if [[ "${1:-}" == env ]]; then
 elif [[ "${1:-}" == test && " $* " == *" -json "* ]]; then
   [[ "${STOARAMA_TEST_DATABASE_URL:-}" == postgres://stoarama@127.0.0.1:49123/stoarama_test\?sslmode=disable ]] || exit 82
   [[ ! -e "$HOME/real-home-sentinel" ]] || exit 87
+  gate_dir="${GOCACHE%/go-cache}"
+  if [[ -e "$gate_dir/block-go" ]]; then
+    printf '%s\n' $$ >"$gate_dir/blocked-go-pid"
+    sleep 300
+  fi
   packages=()
   for arg in "$@"; do [[ "$arg" == ./* ]] && packages+=("$arg"); done
   for index in "${!packages[@]}"; do
@@ -153,7 +162,7 @@ elif [[ "${1:-}" == test && " $* " == *" -json "* ]]; then
   done
 elif [[ "${1:-}" == test ]]; then
   [[ -z "${STOARAMA_TEST_DATABASE_URL:-}" ]] || exit 83
-  [[ ! -e "${TMPDIR:-/tmp}/fail-go" ]] || exit 84
+  [[ ! -e "${GOCACHE%/go-cache}/fail-go" ]] || exit 84
   printf 'ok fixture\n'
 elif [[ "${1:-}" == vet ]]; then
   [[ -z "${STOARAMA_TEST_DATABASE_URL:-}" ]] || exit 85
@@ -219,7 +228,10 @@ grep -q -- '--log-opts=--no-merges' "$fake_log" || fail "gitleaks first-parent f
 )
 : >"$fake_log"
 mkdir -p "$test_root/fake-state"
-run_verify bin/verify-pr >"$test_root/pass.out" 2>&1 || fail "clean verifier fixture failed"
+run_verify bin/verify-pr >"$test_root/pass.out" 2>&1 || {
+  cat "$test_root/pass.out" >&2
+  fail "clean verifier fixture failed"
+}
 grep -Eq 'docker rm .* -f .*stoarama-verify-pr-' "$fake_log" || {
   cat "$fake_log" >&2
   fail "PostgreSQL cleanup was not attempted"
@@ -345,16 +357,59 @@ awk 'BEGIN{done=0} /jobs:/ && !done {print "backend:\n  steps:\n    - name: fake
 if /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" --workflow "$bad_workflow" --check >/dev/null 2>&1; then
   fail "spoofed top-level backend ancestry was accepted"
 fi
+for mutation in \
+  's/    runs-on: ubuntu-latest/    if: false\n    runs-on: ubuntu-latest/' \
+  's/    runs-on: ubuntu-latest/    continue-on-error: true\n    runs-on: ubuntu-latest/' \
+  's#image: postgres:17@sha256:[a-f0-9]*#image: postgres:17#'; do
+  sed -E "$mutation" "$repo/.github/workflows/test.yml" >"$bad_workflow"
+  if /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" --workflow "$bad_workflow" --check >/dev/null 2>&1; then
+    fail "mutated backend job envelope was accepted"
+  fi
+done
+perl -0pe 's/TestLockOrganizationPlazaIDsAcceptsIntegerAccountID/TestRecordingQualificationMigrationFreezesCompleteCohort/' \
+  "$repo/.github/workflows/test.yml" >"$bad_workflow"
+if /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" --workflow "$bad_workflow" --check >/dev/null 2>&1; then
+  fail "mutated frozen -run command was accepted"
+fi
 
 mkdir -p "$test_root/omit-tmp"
 touch "$test_root/omit-tmp/omit-last"
 if env PATH="$fake_bin:$PATH" HOME="$real_home" TMPDIR="$test_root/omit-tmp" \
+    STOARAMA_VERIFY_ACTIVE_PGID_FILE="$test_root/omit-tmp/active-pgid" \
     /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" \
     --workflow "$repo/.github/workflows/test.yml" \
     --database-url 'postgres://stoarama@127.0.0.1:49123/stoarama_test?sslmode=disable' \
     >"$test_root/zero-match.out" 2>&1; then
   fail "multi-package zero-match proof was accepted"
 fi
+
+gate_tmp="$test_root/gate-signal"
+mkdir -p "$gate_tmp"
+touch "$gate_tmp/block-go"
+: >"$fake_log"
+(
+  cd "$repo"
+  exec env -u DATABASE_URL -u STOARAMA_TEST_DATABASE_URL \
+    PATH="$fake_bin:$PATH" HOME="$real_home" TMPDIR="$gate_tmp" FAKE_LOG="$fake_log" \
+    FAKE_DOCKER_SOCKET="$socket_path" FAKE_STATE_DIR="$test_root/fake-state" bin/verify-pr
+) >"$test_root/gate-signal.out" 2>&1 &
+gate_pid=$!
+for _ in {1..200}; do [[ -s "$gate_tmp/blocked-go-pid" ]] && break; sleep 0.02; done
+[[ -s "$gate_tmp/blocked-go-pid" ]] || fail "blocked Go gate never started"
+child_pid="$(cat "$gate_tmp/blocked-go-pid")"
+kill -TERM "$gate_pid"
+if wait "$gate_pid"; then fail "TERM during Go gate succeeded"; fi
+for _ in {1..100}; do
+  child_state="$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)"
+  [[ -z "$child_state" || "$child_state" == Z* ]] && break
+  sleep 0.02
+done
+child_state="$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)"
+if [[ -n "$child_state" && "$child_state" != Z* ]]; then
+  ps -o pid,ppid,pgid,sid,stat,command -p "$child_pid" >&2 || true
+  fail "TERM left Go child running"
+fi
+grep -Eq 'docker rm .* -f .*stoarama-verify-pr-' "$fake_log" || fail "TERM during Go gate did not clean PostgreSQL"
 sed '/      - name: Test PostgreSQL type boundaries/,/ -v$/d' "$repo/.github/workflows/test.yml" >"$bad_workflow"
 if /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" --workflow "$bad_workflow" --check >/dev/null 2>&1; then
   fail "removed frozen workflow step was accepted"

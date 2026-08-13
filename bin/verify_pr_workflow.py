@@ -15,7 +15,7 @@ import sys
 
 DB_ENV = "STOARAMA_TEST_DATABASE_URL"
 ALLOWED_ENV = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "GOCACHE", "GOMODCACHE", "GOPATH"}
-FROZEN_STEPS = (
+FROZEN_COMMANDS = (
     ("Test PostgreSQL type boundaries", "db"),
     ("Test NAS backlog eligibility", "db"),
     ("Test batch Plaza naming", "db"),
@@ -42,6 +42,8 @@ FROZEN_STEPS = (
     ("Test NAS pull client", "python"),
     ("Vet", "vet"),
 )
+FROZEN_COMMAND_SHA256 = "066c7696d36a862c178df1fa9b3a5188c987f539f990c12cdb90b3a50aa0b6e8"
+FROZEN_BACKEND_ENVELOPE_SHA256 = "ed8e14df9e4e62d7b796b99b480db16068baf9909a09b23e8807e9aabefedca3"
 
 
 class WorkflowError(RuntimeError):
@@ -69,6 +71,15 @@ def put_once(target: dict[str, object], key: str, value: object, line_no: int) -
 
 def parse_workflow(path: pathlib.Path) -> list[dict[str, object]]:
     lines = path.read_text(encoding="utf-8").splitlines()
+    import hashlib
+    try:
+        envelope_start = lines.index("  backend:")
+        envelope_end = lines.index("      - name: Test PostgreSQL type boundaries")
+    except ValueError as exc:
+        raise WorkflowError("workflow lacks the frozen backend job envelope") from exc
+    envelope = ("\n".join(lines[envelope_start:envelope_end]) + "\n").encode()
+    if hashlib.sha256(envelope).hexdigest() != FROZEN_BACKEND_ENVELOPE_SHA256:
+        raise WorkflowError("jobs.backend runner/services/defaults/actions differ from the frozen envelope")
     seen_jobs = False
     seen_backend = False
     seen_defaults = False
@@ -220,8 +231,15 @@ def parse_workflow(path: pathlib.Path) -> list[dict[str, object]]:
         observed.append((name, kind))
         step["argv"] = argv
         step["kind"] = kind
-    if tuple(observed) != FROZEN_STEPS:
+    if tuple(observed) != FROZEN_COMMANDS:
         raise WorkflowError("backend run-step names/order/classes differ from the frozen 25-step gate")
+    digest_payload = json.dumps(
+        [(step["name"], step["kind"], step["argv"], step.get("working_directory") or "backend", bool(step["env"])) for step in run_steps],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode()
+    if hashlib.sha256(digest_payload).hexdigest() != FROZEN_COMMAND_SHA256:
+        raise WorkflowError("backend run-step argv differ from the frozen command digest")
     return run_steps
 
 
@@ -232,6 +250,9 @@ def clean_environment() -> dict[str, str]:
             raise WorkflowError(f"sanitized environment lacks {required}")
     env.setdefault("LANG", "C.UTF-8")
     env.setdefault("LC_ALL", "C.UTF-8")
+    env["GOENV"] = "off"
+    env["GOPROXY"] = "off"
+    env["GOSUMDB"] = "off"
     return env
 
 
@@ -253,7 +274,29 @@ def run_steps(root: pathlib.Path, steps: list[dict[str, object]], database_url: 
             env[DB_ENV] = database_url
             argv.append("-json")
         print(f"verify-pr: {name}", flush=True)
-        completed = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        runner_env = {
+            "PATH": env["PATH"],
+            "STOARAMA_VERIFY_ARGV_JSON": json.dumps(argv),
+            "STOARAMA_VERIFY_ENV_JSON": json.dumps(env),
+            "STOARAMA_VERIFY_PGID_FILE": str(root / ".git" / "verify-pr-forbidden"),
+        }
+        configured_pgid_file = os.environ.get("STOARAMA_VERIFY_ACTIVE_PGID_FILE", "")
+        if not configured_pgid_file:
+            raise WorkflowError("runner PGID file is not configured")
+        pgid_file = pathlib.Path(configured_pgid_file)
+        try:
+            pgid_file.unlink()
+        except FileNotFoundError:
+            pass
+        runner_env["STOARAMA_VERIFY_PGID_FILE"] = str(pgid_file)
+        completed = subprocess.run(
+            [sys.executable, str(root / "bin" / "run_clean.py")], cwd=cwd, env=runner_env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            pgid_file.unlink()
+        except FileNotFoundError:
+            pass
         sys.stdout.write(completed.stdout)
         if completed.returncode:
             raise WorkflowError(f"workflow step failed: {name}")
