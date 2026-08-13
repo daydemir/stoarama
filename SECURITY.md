@@ -15,8 +15,9 @@ belong in git. This repo is public.
 ### Layered protection
 
 1. `.gitignore` blocks the known secret file patterns from ever being staged.
-2. A local `pre-commit` hook runs [gitleaks](https://github.com/gitleaks/gitleaks)
-   before each commit and rejects any commit containing a secret.
+2. A repo-local `pre-push` hook runs [gitleaks](https://github.com/gitleaks/gitleaks)
+   across the exact first-parent branch history before running the same
+   PostgreSQL-backed and ordinary test commands as CI.
 3. CI (`.github/workflows/gitleaks.yml`) runs gitleaks on every push and pull
    request and **fails the build** on any finding. This is the authoritative
    gate and cannot be bypassed by local configuration.
@@ -24,16 +25,23 @@ belong in git. This repo is public.
 ### One-time local setup
 
 ```bash
-pip install pre-commit   # or: brew install pre-commit
-pre-commit install       # installs the git hook in this repo
+bin/install-dev-hooks
 ```
 
-After that, gitleaks runs automatically on every `git commit`. You can run it
-manually at any time:
+The verifier requires Docker Desktop to be installed through the supported host
+bootstrap/Brewfile workflow and already running. It does not install, open, or
+restart Docker. A complete pre-push run is intentionally about as expensive as
+backend CI and may fetch `origin/main` and pull the immutable gitleaks and
+PostgreSQL images. Run it manually at any time:
 
 ```bash
-pre-commit run gitleaks --all-files
+bin/verify-pr
 ```
+
+The hook accepts deletion-only pushes. For content pushes it deliberately
+requires one exact commit shared by every pushed ref, equal to a clean current
+`HEAD`; check out and push other branches separately. It fails closed when the
+Docker daemon, pinned images, origin history, or local tests are unavailable.
 
 CI enforces the same scan regardless of whether you installed the hook, so a
 missed local setup still cannot land a secret on the default branch.

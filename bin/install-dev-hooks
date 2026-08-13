@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  printf 'install-dev-hooks: run inside the Stoarama repository\n' >&2
+  exit 1
+}
+cd "$root"
+
+current="$(git config --local --get core.hooksPath || true)"
+if [[ -n "$current" && "$current" != ".githooks" ]]; then
+  printf 'install-dev-hooks: refusing to replace existing core.hooksPath=%s\n' "$current" >&2
+  exit 1
+fi
+
+git config --local core.hooksPath .githooks
+printf 'install-dev-hooks: installed repo-local pre-push verifier\n'

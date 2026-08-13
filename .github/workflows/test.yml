@@ -45,27 +45,27 @@ jobs:
       - name: Test PostgreSQL type boundaries
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/recordingnaming -run TestLockOrganizationPlazaIDsAcceptsIntegerAccountID -count=1
+        run: go test ./internal/recordingnaming -run TestLockOrganizationPlazaIDsAcceptsIntegerAccountID -count=1 -v
       - name: Test NAS backlog eligibility
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run 'Test(ConnectionPendingClipsEligibility|InventoryHeartbeatDoesNotRegressCompletedSummary|NASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination|NASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe|NASInventoryReleaseGateFailsClosed|NASBatchReleaseIsAtomicAndInventoryGated|NASInventoryCSVUsesOneRepeatableReadSnapshot)' -count=1
+        run: go test ./internal/api -run 'Test(ConnectionPendingClipsEligibility|InventoryHeartbeatDoesNotRegressCompletedSummary|NASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination|NASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe|NASInventoryReleaseGateFailsClosed|NASBatchReleaseIsAtomicAndInventoryGated|NASInventoryCSVUsesOneRepeatableReadSnapshot)' -count=1 -v
       - name: Test batch Plaza naming
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run TestBatchSchedulePersistsPlazaHourlyNamingAndDaytimeWindow -count=1
+        run: go test ./internal/api -run TestBatchSchedulePersistsPlazaHourlyNamingAndDaytimeWindow -count=1 -v
       - name: Test recording qualification freeze transaction
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run TestQualificationBuildFreezesAndIsIdempotent -count=1
+        run: go test ./internal/api -run TestQualificationBuildFreezesAndIsIdempotent -count=1 -v
       - name: Test recording clip authoritative frame provenance
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./internal/db -run 'Test(PersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime|ClipFrameIdentityLockRejectsConcurrentObjectPointerDrift|RecordingClipFrameProvenanceMigration)' -count=1
+        run: go test ./internal/api ./internal/db -run 'Test(PersistClipBackedAuthoritativeFrameIsIdempotentAndDoesNotMutateRuntime|ClipFrameIdentityLockRejectsConcurrentObjectPointerDrift|RecordingClipFrameProvenanceMigration)' -count=1 -v
       - name: Test recording health digest production query
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run TestLoadHealthDigestRecordingsFormatsCoverageInPostgres -count=1
+        run: go test ./cmd/stoaramactl -run TestLoadHealthDigestRecordingsFormatsCoverageInPostgres -count=1 -v
       - name: Test native stitch migration, claim fencing, and planner races
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -77,30 +77,30 @@ jobs:
       - name: Test dynamic streak priority PostgreSQL schedule and plan
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall -count=1
+        run: go test ./internal/api -run TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall -count=1 -v
       - name: Test recording upload intent replay
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run TestRecordingUploadIntentReplaysPendingAndConsumedSegment -count=1
+        run: go test ./internal/api -run TestRecordingUploadIntentReplaysPendingAndConsumedSegment -count=1 -v
       - name: Test continuous timestamp contract and canary are fail closed
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./internal/db -run 'Test(RelayLeaseAtomicallyPersistsTimestampAdmission|RelayLeaseTimestampAdmissionNegativeMatrix|TimestampAdmission|RecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent|AccountClipsFeedPreservesTimestampContractTriState|RecordingClipTimestampContractMigration)' -count=1
+        run: go test ./internal/api ./internal/db -run 'Test(RelayLeaseAtomicallyPersistsTimestampAdmission|RelayLeaseTimestampAdmissionNegativeMatrix|TimestampAdmission|RecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent|AccountClipsFeedPreservesTimestampContractTriState|RecordingClipTimestampContractMigration)' -count=1 -v
       - name: Test migration lock timeout
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/db -run TestMigrateUpAbortsWhenLockIsHeld -count=1
+        run: go test ./internal/db -run TestMigrateUpAbortsWhenLockIsHeld -count=1 -v
       - name: Test frozen qualification cohort migration
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/db -run TestRecordingQualificationMigrationFreezesCompleteCohort -count=1
+        run: go test ./internal/db -run TestRecordingQualificationMigrationFreezesCompleteCohort -count=1 -v
       # The continuous-window revive rules decide whether a 12-hour window resumes
       # after a failure or stays forfeited, and every test covering them is
       # DB-backed, so they all skipped in CI until this step named them.
       - name: Test continuous window revive rules
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/recsched -run 'Test(Continuous(Revives|DoesNotRevive)|ExpiredContinuousJobsFinalizeFromPreservedMedia)' -count=1
+        run: go test ./internal/recsched -run 'Test(Continuous(Revives|DoesNotRevive)|ExpiredContinuousJobsFinalizeFromPreservedMedia)' -count=1 -v
       # A forced droplet roll assumes a draining droplet stops taking work; if that
       # ever regressed, the drain would look clean while the old capture binary kept
       # leasing new windows until the drain timeout killed it mid-capture.
@@ -111,33 +111,33 @@ jobs:
       - name: Test provisioning teardown lease safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/dropletpool -run TestReconcileOverdueProvisioningLeaseSafety -count=1
+        run: go test ./internal/dropletpool -run TestReconcileOverdueProvisioningLeaseSafety -count=1 -v
       # Backtested against the Zanzibar drift; DB-backed, so it needs naming here
       # or it silently skips like the rest of this suite did.
       - name: Test clip timestamp drift signal
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run TestDetectClipTimestampDrift -count=1
+        run: go test ./cmd/stoaramactl -run TestDetectClipTimestampDrift -count=1 -v
       - name: Test recording health alert delivery
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run 'Test(HealthAlertDeliveryTimestamp|RecordingHealthRunLock|DetectContinuousSilentDeathReportsMediaAgeAndNoMedia|MaterializeRecordingWindowHealthPersistsExactTimelineAndSummary|CurrentRelayCapacityCollapsesGroupsAndPreservesUngroupedDomains|RecordRelayConnectivityBaselinesAndQueuesEveryTransition|RecordNASStorageCapacityQueuesInitialRiskTransitionsAndRecovery|SetRelayGroupBandwidthPreviewsAndAppliesExactGroup)' -count=1
+        run: go test ./cmd/stoaramactl -run 'Test(HealthAlertDeliveryTimestamp|RecordingHealthRunLock|DetectContinuousSilentDeathReportsMediaAgeAndNoMedia|MaterializeRecordingWindowHealthPersistsExactTimelineAndSummary|CurrentRelayCapacityCollapsesGroupsAndPreservesUngroupedDomains|RecordRelayConnectivityBaselinesAndQueuesEveryTransition|RecordNASStorageCapacityQueuesInitialRiskTransitionsAndRecovery|SetRelayGroupBandwidthPreviewsAndAppliesExactGroup)' -count=1 -v
       - name: Test pre-open target selection SQL
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run TestSelectPreopenTargetsStagesRetriesAndNeverAfterOpen -count=1
+        run: go test ./cmd/stoaramactl -run TestSelectPreopenTargetsStagesRetriesAndNeverAfterOpen -count=1 -v
       - name: Test reservation-backed relay pre-open evidence
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./internal/db -run 'Test(RecordingCanarySpecRefusesProductionAndAllowsIdleRelay|RecordingCanaryCompletion|RecordingCanaryPreopenMigration)' -count=1
+        run: go test ./internal/api ./internal/db -run 'Test(RecordingCanarySpecRefusesProductionAndAllowsIdleRelay|RecordingCanaryCompletion|RecordingCanaryPreopenMigration)' -count=1 -v
       - name: Test transient ledger retention boundaries
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run TestMaintainTransientLedgersDeletesOnlyExpiredBookkeeping -count=1
+        run: go test ./cmd/stoaramactl -run TestMaintainTransientLedgersDeletesOnlyExpiredBookkeeping -count=1 -v
       - name: Test billing meter report ledger
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run TestMeterReportLedgerFailsClosedOnAmbiguousRetry -count=1
+        run: go test ./cmd/stoaramactl -run TestMeterReportLedgerFailsClosedOnAmbiguousRetry -count=1 -v
       - name: Test
         run: go test ./...
       - name: Test NAS pull client

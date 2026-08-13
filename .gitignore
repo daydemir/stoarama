@@ -68,4 +68,9 @@ credentials.json
 # local build output (render.yaml sets rootDir: backend, so artifacts land in
 # backend/bin/; /bin/ covers ad-hoc builds at the repo root)
 /bin/
+!/bin/
+!/bin/verify-pr
+!/bin/verify_pr_workflow.py
+!/bin/install-dev-hooks
+!/bin/test-verify-pr.sh
 /backend/bin/

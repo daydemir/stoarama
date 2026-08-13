@@ -23,6 +23,17 @@ Every product workflow ships in this order:
 
 The public `stoarama` CLI is narrower and is for account/node workflows, not operator administration.
 
+## Pre-push Verification
+
+Before pushing a code branch, run `bin/verify-pr` from a clean checkout. Install
+the repo-local hook once with `bin/install-dev-hooks`; the hook verifies the
+exact single checked-out commit described by Git's pre-push ref input. The
+verifier runs the branch-history secret scan and the PostgreSQL-backed and
+ordinary test gates used by CI. It requires an already-running, supported
+Docker Desktop installation and may fetch `origin/main` and pull pinned images.
+It never starts Docker, uses production credentials, or replaces GitHub's
+required checks and notifications.
+
 ## V1 Product Shape
 
 - admin-curated streams

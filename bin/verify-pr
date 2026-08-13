@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly GITLEAKS_VERSION="8.24.3"
+readonly GITLEAKS_IMAGE="ghcr.io/gitleaks/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055"
+readonly POSTGRES_IMAGE="postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d"
+readonly ZERO_OID="0000000000000000000000000000000000000000"
+
+die() {
+  printf 'verify-pr: %s\n' "$*" >&2
+  exit 1
+}
+
+find_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    command -v docker
+    return
+  fi
+  if [[ -x /Applications/Docker.app/Contents/Resources/bin/docker ]]; then
+    printf '%s\n' /Applications/Docker.app/Contents/Resources/bin/docker
+    return
+  fi
+  die "Docker CLI is unavailable; install it through the supported Brewfile/bootstrap workflow"
+}
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run inside a Git worktree"
+cd "$repo_root"
+readonly repo_root
+readonly docker="$(find_docker)"
+
+[[ -z "${DATABASE_URL:-}" && -z "${STOARAMA_TEST_DATABASE_URL:-}" ]] ||
+  die "unset DATABASE_URL and STOARAMA_TEST_DATABASE_URL before verification"
+
+mode="direct"
+if [[ "${1:-}" == "--pre-push" ]]; then
+  mode="pre-push"
+  shift
+fi
+[[ $# -eq 0 ]] || die "usage: bin/verify-pr [--pre-push]"
+
+declare -a frozen_refs=()
+declare -a frozen_raw_oids=()
+frozen_oid=""
+
+if [[ "$mode" == "pre-push" ]]; then
+  saw_tuple=0
+  while IFS=' ' read -r local_ref local_oid remote_ref remote_oid extra; do
+    [[ -n "${local_ref:-}" ]] || continue
+    saw_tuple=1
+    [[ -z "${extra:-}" && -n "${local_oid:-}" && -n "${remote_ref:-}" && -n "${remote_oid:-}" ]] ||
+      die "malformed pre-push ref tuple"
+    [[ "$local_oid" =~ ^[0-9a-f]{40}$ && "$remote_oid" =~ ^[0-9a-f]{40}$ ]] ||
+      die "pre-push ref tuple contains an invalid object ID"
+    if [[ "$local_oid" == "$ZERO_OID" ]]; then
+      continue
+    fi
+    peeled="$(git rev-parse --verify "${local_oid}^{commit}" 2>/dev/null)" ||
+      die "pushed object $local_oid is not a commit or commit-peeling tag"
+    ref_raw="$(git rev-parse --verify "$local_ref" 2>/dev/null)" || die "cannot resolve local ref $local_ref"
+    ref_peeled="$(git rev-parse --verify "${local_ref}^{commit}" 2>/dev/null)" ||
+      die "local ref $local_ref does not peel to a commit"
+    [[ "$ref_raw" == "$local_oid" && "$ref_peeled" == "$peeled" ]] ||
+      die "local ref $local_ref changed before verification"
+    if [[ -n "$frozen_oid" && "$peeled" != "$frozen_oid" ]]; then
+      die "push contains multiple commit OIDs; check out and push each clean branch separately"
+    fi
+    frozen_oid="$peeled"
+    frozen_refs+=("$local_ref")
+    frozen_raw_oids+=("$local_oid")
+  done
+  [[ "$saw_tuple" -eq 1 ]] || die "pre-push hook received no ref tuples"
+  if [[ -z "$frozen_oid" ]]; then
+    printf 'verify-pr: deletion-only push; no local content to verify\n'
+    exit 0
+  fi
+else
+  frozen_oid="$(git rev-parse --verify HEAD^{commit})" || die "HEAD is not a commit"
+fi
+
+snapshot_head="$(git rev-parse --verify HEAD^{commit})" || die "HEAD is not a commit"
+[[ "$frozen_oid" == "$snapshot_head" ]] ||
+  die "pushed commit is not clean current HEAD; check it out and push separately"
+[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || die "worktree must be clean"
+
+git fetch --quiet origin main || die "cannot fetch origin/main"
+base_oid="$(git merge-base origin/main "$frozen_oid")" || die "cannot compute merge-base with origin/main"
+[[ -n "$base_oid" ]] || die "empty merge-base"
+
+"$docker" info >/dev/null 2>&1 ||
+  die "Docker daemon is not running; start Docker Desktop through Muavin before retrying"
+
+ensure_image() {
+  local image="$1"
+  if ! "$docker" image inspect "$image" >/dev/null 2>&1; then
+    printf 'verify-pr: pulling pinned image %s\n' "${image%@*}"
+    "$docker" pull "$image" >/dev/null || die "cannot pull pinned image ${image%@*}"
+  fi
+}
+
+ensure_image "$GITLEAKS_IMAGE"
+ensure_image "$POSTGRES_IMAGE"
+
+printf 'verify-pr: scanning first-parent branch history with gitleaks %s\n' "$GITLEAKS_VERSION"
+"$docker" run --rm \
+  --mount "type=bind,src=$repo_root,dst=/repo,readonly" \
+  --workdir /repo \
+  "$GITLEAKS_IMAGE" detect --redact -v --exit-code=2 \
+  --config=.gitleaks.toml --log-opts=--no-merges --first-parent "${base_oid}..${frozen_oid}"
+
+nonce="$(printf '%s-%s-%s' "$$" "$RANDOM" "$frozen_oid" | shasum -a 256 | cut -c1-16)"
+pg_name="stoarama-verify-pr-$nonce"
+pg_started=0
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [[ "$pg_started" -eq 1 && "$pg_name" == stoarama-verify-pr-* ]]; then
+    label="$("$docker" inspect --format '{{ index .Config.Labels "com.stoarama.verify-pr" }}' "$pg_name" 2>/dev/null || true)"
+    if [[ "$label" == "$nonce" ]]; then
+      "$docker" rm -f "$pg_name" >/dev/null 2>&1 || true
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+"$docker" run --detach --rm \
+  --name "$pg_name" \
+  --label "com.stoarama.verify-pr=$nonce" \
+  --tmpfs /var/lib/postgresql/data:rw,nosuid,noexec,size=1g \
+  --publish 127.0.0.1::5432 \
+  --env POSTGRES_DB=stoarama_test \
+  --env POSTGRES_USER=stoarama \
+  --env POSTGRES_HOST_AUTH_METHOD=trust \
+  "$POSTGRES_IMAGE" >/dev/null
+pg_started=1
+
+binding="$("$docker" port "$pg_name" 5432/tcp 2>/dev/null | head -n1)"
+[[ "$binding" =~ ^127\.0\.0\.1:([0-9]+)$ ]] || die "PostgreSQL did not bind an ephemeral loopback port"
+pg_port="${BASH_REMATCH[1]}"
+test_database_url="postgres://stoarama@127.0.0.1:${pg_port}/stoarama_test?sslmode=disable"
+
+ready=0
+for _ in {1..60}; do
+  if "$docker" exec "$pg_name" pg_isready -U stoarama -d stoarama_test >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+[[ "$ready" -eq 1 ]] || die "disposable PostgreSQL 17 did not become ready within 60 seconds"
+
+python3 bin/verify_pr_workflow.py \
+  --root "$repo_root" \
+  --workflow "$repo_root/.github/workflows/test.yml" \
+  --database-url "$test_database_url"
+
+printf 'verify-pr: checking tracked Go formatting and committed diff whitespace\n'
+go_files=()
+while IFS= read -r -d '' go_file; do
+  go_files+=("$go_file")
+done < <(git ls-files -z '*.go')
+if [[ ${#go_files[@]} -gt 0 ]]; then
+  formatting="$(gofmt -l "${go_files[@]}")"
+  [[ -z "$formatting" ]] || die "gofmt required for: $formatting"
+fi
+git diff --check "$base_oid" "$frozen_oid" || die "committed diff has whitespace errors"
+
+[[ "$(git rev-parse --verify HEAD^{commit})" == "$snapshot_head" ]] || die "HEAD changed during verification"
+[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || die "worktree changed during verification"
+if [[ "$mode" == "pre-push" ]]; then
+  for index in "${!frozen_refs[@]}"; do
+    ref="${frozen_refs[$index]}"
+    raw_oid="${frozen_raw_oids[$index]}"
+    [[ "$(git rev-parse --verify "$ref" 2>/dev/null)" == "$raw_oid" ]] || die "local ref $ref changed during verification"
+    [[ "$(git rev-parse --verify "${ref}^{commit}" 2>/dev/null)" == "$frozen_oid" ]] ||
+      die "local ref $ref changed commit during verification"
+  done
+fi
+
+printf 'verify-pr: PASS exact commit %s\n' "${frozen_oid:0:12}"
