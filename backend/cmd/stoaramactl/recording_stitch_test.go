@@ -60,25 +60,33 @@ INSERT INTO accounts VALUES(47); INSERT INTO connections VALUES(8); INSERT INTO 
 	start := time.Date(2026, 8, 10, 8, 0, 0, 0, time.UTC)
 	end := start.Add(12 * time.Hour)
 	now := end.Add(time.Hour)
-	if _, err = conn.Exec(ctx, `
-INSERT INTO recording_jobs VALUES(9,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1)::bigint);
-INSERT INTO recording_window_health VALUES(7,9,$3,2,43200,43200,100,0,0,0,0,0,0,0,1);
-INSERT INTO recording_clips VALUES(11,7,9,'safe/clip.mp4',4,repeat('a',64),$1,$2,'00000000-0000-4000-8000-000000000001',1,NULL,NULL,NULL,NULL,NULL,NULL,3,'https://storage.example','bucket','clip', $3-interval '20 minutes')`, start, end, now); err != nil {
-		t.Fatal(err)
+	for _, fixture := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO recording_jobs VALUES(9,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1)::bigint)`, []any{start, end, now}},
+		{`INSERT INTO recording_window_health VALUES(7,9,$1,2,43200,43200,100,0,0,0,0,0,0,0,1)`, []any{now}},
+		{`INSERT INTO recording_clips VALUES(11,7,9,'safe/clip.mp4',4,repeat('a',64),$1,$2,'00000000-0000-4000-8000-000000000001',1,NULL,NULL,NULL,NULL,NULL,NULL,3,'https://storage.example','bucket','clip',$3-interval '20 minutes')`, []any{start, end, now}},
+	} {
+		if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	// Candidate selection is one best historical GOOD window per protected
 	// recording before a second wave. A revived job may have scheduled_for after
 	// fire_at; reccont fire/window identity is the immutable occurrence contract.
-	if _, err = conn.Exec(ctx, `
-INSERT INTO recording_campaign_tracks VALUES(1,47,'delivery30','active',$1+interval '9 days');
-INSERT INTO recording_campaign_roster_entries VALUES(1,7,1,'primary','protect'),(1,8,2,'primary','protect');
-INSERT INTO recording_jobs VALUES
- (19,7,'done','continuous_window',$2,$2,$3,$1,60,'reccont:7:'||extract(epoch from $3)::bigint),
- (20,8,'done','continuous_window',$2,$2,$3,$1,60,'reccont:8:'||extract(epoch from $3)::bigint);
-INSERT INTO recording_window_health VALUES
- (7,19,$2,2,43200,43200,100,0,0,0,0,0,0,0,1),
- (8,20,$2,2,43200,43200,100,0,0,0,0,0,0,0,1)`, end, now, start); err != nil {
-		t.Fatal(err)
+	for _, fixture := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO recording_campaign_tracks VALUES(1,47,'delivery30','active',$1+interval '9 days')`, []any{end}},
+		{`INSERT INTO recording_campaign_roster_entries VALUES(1,7,1,'primary','protect'),(1,8,2,'primary','protect')`, nil},
+		{`INSERT INTO recording_jobs VALUES (19,7,'done','continuous_window',$2,$2,$3,$1,60,'reccont:7:'||extract(epoch from $3)::bigint),(20,8,'done','continuous_window',$2,$2,$3,$1,60,'reccont:8:'||extract(epoch from $3)::bigint)`, []any{end, now, start}},
+		{`INSERT INTO recording_window_health VALUES (7,19,$1,2,43200,43200,100,0,0,0,0,0,0,0,1),(8,20,$1,2,43200,43200,100,0,0,0,0,0,0,0,1)`, []any{now}},
+	} {
+		if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -91,13 +99,26 @@ INSERT INTO recording_window_health VALUES
 	}
 	// Existing top-ranked tasks are excluded before LIMIT, so later protected
 	// recordings cannot starve behind the same first page forever.
-	if _, err = conn.Exec(ctx, `INSERT INTO accounts VALUES(48); INSERT INTO recording_campaign_tracks VALUES(2,48,'delivery30','active',$1+interval '9 days')`, end); err != nil {
+	if _, err = conn.Exec(ctx, `INSERT INTO accounts VALUES(48)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `INSERT INTO recording_campaign_tracks VALUES(2,48,'delivery30','active',$1+interval '9 days')`, end); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 22; i++ {
 		recordingID, jobID := int64(100+i), int64(1000+i)
-		if _, err = conn.Exec(ctx, `INSERT INTO recordings VALUES($1,48,'continuous'); INSERT INTO recording_campaign_roster_entries VALUES(2,$1,$2,'primary','protect'); INSERT INTO recording_jobs VALUES($3,$1,'done','continuous_window',$6,$6,$4,$5,60,'reccont:'||$1||':'||extract(epoch from $4)::bigint); INSERT INTO recording_window_health VALUES($1,$3,$6,2,43200,43200,100,0,0,0,0,0,0,0,1)`, recordingID, i+1, jobID, start, end, now); err != nil {
-			t.Fatal(err)
+		for _, fixture := range []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO recordings VALUES($1,48,'continuous')`, []any{recordingID}},
+			{`INSERT INTO recording_campaign_roster_entries VALUES(2,$1,$2,'primary','protect')`, []any{recordingID, i + 1}},
+			{`INSERT INTO recording_jobs VALUES($1,$2,'done','continuous_window',$5,$5,$3,$4,60,'reccont:'||$2||':'||extract(epoch from $3)::bigint)`, []any{jobID, recordingID, start, end, now}},
+			{`INSERT INTO recording_window_health VALUES($1,$2,$3,2,43200,43200,100,0,0,0,0,0,0,0,1)`, []any{recordingID, jobID, now}},
+		} {
+			if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
@@ -140,8 +161,17 @@ INSERT INTO recording_window_health VALUES
 	// Only a frozen qualification occurrence rebuilt by the shared scheduler
 	// may be surfaced as qualification evidence. A wrong frozen UTC offset is
 	// rejected rather than inferred from the current recording schedule.
-	if _, err = conn.Exec(ctx, `INSERT INTO recording_qualification_runs VALUES(1,47,'active'); INSERT INTO recording_qualification_members VALUES(1,47,7,'UTC','08:00','20:00',127,$1-interval '1 day',NULL,'qualification-windows-v1',repeat('b',64),repeat('c',64)); INSERT INTO recording_qualification_windows VALUES(1,7,1,$1::timestamp,$2::timestamp,0,0,$1,$2)`, start, end); err != nil {
-		t.Fatal(err)
+	for _, fixture := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO recording_qualification_runs VALUES(1,47,'active')`, nil},
+		{`INSERT INTO recording_qualification_members VALUES(1,47,7,'UTC','08:00','20:00',127,$1-interval '1 day',NULL,'qualification-windows-v1',repeat('b',64),repeat('c',64))`, []any{start}},
+		{`INSERT INTO recording_qualification_windows VALUES(1,7,1,$1::timestamp,$2::timestamp,0,0,$1,$2)`, []any{start, end}},
+	} {
+		if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	authority, authorityErr := loadStitchOccurrenceAuthority(ctx, tx, 47, 7, start, end)
@@ -163,8 +193,17 @@ INSERT INTO recording_window_health VALUES
 	}
 	dstStart := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
 	dstEnd := dstStart.Add(12 * time.Hour)
-	if _, err = conn.Exec(ctx, `INSERT INTO recording_qualification_runs VALUES(2,47,'active'); INSERT INTO recording_qualification_members VALUES(2,47,8,'America/New_York','08:00','20:00',127,$1-interval '1 day',NULL,'qualification-windows-v1',repeat('d',64),repeat('e',64)); INSERT INTO recording_qualification_windows VALUES(2,8,1,'2026-03-08 08:00:00','2026-03-08 20:00:00',-18000,-14400,$1,$2)`, dstStart, dstEnd); err != nil {
-		t.Fatal(err)
+	for _, fixture := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO recording_qualification_runs VALUES(2,47,'active')`, nil},
+		{`INSERT INTO recording_qualification_members VALUES(2,47,8,'America/New_York','08:00','20:00',127,$1-interval '1 day',NULL,'qualification-windows-v1',repeat('d',64),repeat('e',64))`, []any{dstStart}},
+		{`INSERT INTO recording_qualification_windows VALUES(2,8,1,'2026-03-08 08:00:00','2026-03-08 20:00:00',-18000,-14400,$1,$2)`, []any{dstStart, dstEnd}},
+	} {
+		if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	_, authorityErr = loadStitchOccurrenceAuthority(ctx, tx, 47, 8, dstStart, dstEnd)
@@ -174,8 +213,18 @@ INSERT INTO recording_window_health VALUES
 	}
 
 	// A fresh intent blocks planning under the transaction's DB-derived time.
-	if _, err = conn.Exec(ctx, `INSERT INTO recording_jobs VALUES(10,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1)::bigint); INSERT INTO recording_window_health SELECT 7,10,$3,2,43200,43200,100,0,0,0,0,0,0,0,1; UPDATE recording_clips SET recording_job_id=10 WHERE id=11; INSERT INTO recording_upload_intents VALUES(10,'pending',$3+interval '1 minute',7,3,'https://storage.example','bucket','next','safe/next.mp4',100)`, start, end, now); err != nil {
-		t.Fatal(err)
+	for _, fixture := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO recording_jobs VALUES(10,7,'done','continuous_window',$3,$3,$1,$2,60,'reccont:7:'||extract(epoch from $1)::bigint)`, []any{start, end, now}},
+		{`INSERT INTO recording_window_health SELECT 7,10,$1,2,43200,43200,100,0,0,0,0,0,0,0,1`, []any{now}},
+		{`UPDATE recording_clips SET recording_job_id=10 WHERE id=11`, nil},
+		{`INSERT INTO recording_upload_intents VALUES(10,'pending',$1+interval '1 minute',7,3,'https://storage.example','bucket','next','safe/next.mp4',100)`, []any{now}},
+	} {
+		if _, err = conn.Exec(ctx, fixture.query, fixture.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	tx, _ = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	candidate.JobID = 10

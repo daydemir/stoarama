@@ -130,7 +130,8 @@ CREATE TABLE recording_native_stitch_certification_clips (
     OR
     (capture_attempt_id IS NOT NULL AND timestamp_contract_version='continuous-source-pts-v1' AND
      timestamp_contract_status='per_clip_probe_complete' AND timestamp_contract_reason IS NULL AND
-     timestamp_contract_sha256 IS NOT NULL AND jsonb_typeof(recomputed_timestamp_contract)='object')
+     timestamp_contract_sha256 IS NOT NULL AND recomputed_timestamp_contract IS NOT NULL AND
+     jsonb_typeof(recomputed_timestamp_contract)='object')
   )
 );
 

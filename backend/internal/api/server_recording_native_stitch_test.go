@@ -394,7 +394,10 @@ func TestNativeStitchCompletionRejectsForgedHistoricalSingleClipPass(t *testing.
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	start, end, lease, claim := now.Add(-14*time.Hour), now.Add(-2*time.Hour), uuid.New(), uuid.New()
-	if _, err = pool.Exec(ctx, `INSERT INTO recordings(id,account_id,name,status,delivery) VALUES(88,47,'historical','active','nas_pull'); INSERT INTO recording_clips(id,recording_id,size_bytes,sha256,clip_start_at,clip_end_at,display_path,released_at,recording_job_id,capture_lease_token,capture_sequence) VALUES(31,88,4,repeat('a',64),$1,$2,'recordings/historical.mp4',now(),109,$3,1)`, start, end, lease); err != nil {
+	if _, err = pool.Exec(ctx, `INSERT INTO recordings(id,account_id,name,status,delivery) VALUES(88,47,'historical','active','nas_pull')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,size_bytes,sha256,clip_start_at,clip_end_at,display_path,released_at,recording_job_id,capture_lease_token,capture_sequence) VALUES(31,88,4,repeat('a',64),$1,$2,'recordings/historical.mp4',now(),109,$3,1)`, start, end, lease); err != nil {
 		t.Fatal(err)
 	}
 	clips, manifestSHA, sourceBytes, err := loadNativeStitchManifest(ctx, pool, 47, 88, 109, start, end)
@@ -410,8 +413,17 @@ func TestNativeStitchCompletionRejectsForgedHistoricalSingleClipPass(t *testing.
 	if err = pool.QueryRow(ctx, `INSERT INTO recording_native_stitch_tasks(account_id,recording_id,recording_job_id,window_start_at,window_end_at,health_calculated_at,health_metric_version,health_facts,job_schedule_facts,clip_manifest,clip_manifest_sha256,clip_count,source_bytes,policy_version) VALUES(47,88,109,$1,$2,now(),2,$3,'{}',$4,$5,1,$6,$7) RETURNING id`, start, end, health, manifestRaw, manifestSHA, sourceBytes, stitchcert.PolicyVersion).Scan(&taskID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pool.Exec(ctx, `INSERT INTO recording_native_stitch_task_clips(task_id,ordinal,clip_id,relative_path,size_bytes,sha256) VALUES($1,1,31,'recordings/historical.mp4',4,repeat('a',64)); INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,seen_generation) VALUES($2,31,88,'recordings/historical.mp4',4,repeat('a',64),'present','g2'); UPDATE recording_native_stitch_tasks SET state='leased',attempt_count=1,claim_token=$3,claimed_connection_id=$2,lease_expires_at=now()+interval '45 minutes' WHERE id=$1`, taskID, connectionID, claim); err != nil {
-		t.Fatal(err)
+	for _, fixture := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO recording_native_stitch_task_clips(task_id,ordinal,clip_id,relative_path,size_bytes,sha256) VALUES($1,1,31,'recordings/historical.mp4',4,repeat('a',64))`, []any{taskID}},
+		{`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,seen_generation) VALUES($1,31,88,'recordings/historical.mp4',4,repeat('a',64),'present','g2')`, []any{connectionID}},
+		{`UPDATE recording_native_stitch_tasks SET state='leased',attempt_count=1,claim_token=$2,claimed_connection_id=$3,lease_expires_at=now()+interval '45 minutes' WHERE id=$1`, []any{taskID, claim, connectionID}},
+	} {
+		if _, err = pool.Exec(ctx, fixture.query, fixture.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	signature := map[string]any{"schema_version": float64(1), "format_name": "mov,mp4", "streams": []any{map[string]any{"codec_type": "video", "codec_name": "h264"}}}
 	signatureSHA, _, _ := stitchcert.CanonicalSHA(signature)
