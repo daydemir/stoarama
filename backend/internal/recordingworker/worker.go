@@ -22,12 +22,14 @@ import (
 )
 
 type Config struct {
-	Client       *recordingapi.Client
-	WorkerID     string
-	Concurrency  int
-	HeartbeatSec int
-	PollInterval time.Duration
-	BuildSHA     string
+	Client              *recordingapi.Client
+	WorkerID            string
+	Concurrency         int
+	HeartbeatSec        int
+	PollInterval        time.Duration
+	BuildSHA            string
+	CommonPolicySHA256  string
+	RuntimeConfigSHA256 string
 
 	// SkipDropletHeartbeat disables the recorder_droplets liveness touch loop.
 	// Relay workers have no recorder_droplets row and report liveness through the
@@ -215,7 +217,7 @@ func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
 	}
 	ticker := time.NewTicker(w.heartbeatInt)
 	defer ticker.Stop()
-	if err := w.cfg.Client.TouchDroplet(ctx, w.cfg.BuildSHA); err != nil && !errors.Is(err, context.Canceled) {
+	if err := w.cfg.Client.TouchDropletIdentity(ctx, w.cfg.BuildSHA, w.cfg.CommonPolicySHA256, w.cfg.RuntimeConfigSHA256); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("recording worker droplet heartbeat error: %v", err)
 	}
 	for {
@@ -223,7 +225,7 @@ func (w *Worker) dropletHeartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.cfg.Client.TouchDroplet(ctx, w.cfg.BuildSHA); err != nil && !errors.Is(err, context.Canceled) {
+			if err := w.cfg.Client.TouchDropletIdentity(ctx, w.cfg.BuildSHA, w.cfg.CommonPolicySHA256, w.cfg.RuntimeConfigSHA256); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("recording worker droplet heartbeat error: %v", err)
 			}
 		}

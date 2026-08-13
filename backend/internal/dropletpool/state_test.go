@@ -443,6 +443,16 @@ func (f *fakeDOClient) ListDropletsByName(_ context.Context, _, prefix string) (
 	return out, nil
 }
 
+func (f *fakeDOClient) InspectRollout(context.Context, string, string, string) (RolloutProviderFacts, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := make([]int64, 0, len(f.fleet))
+	for _, d := range f.fleet {
+		ids = append(ids, d.ID)
+	}
+	return RolloutProviderFacts{AccountDropletLimit: 25, AccountDropletCount: len(f.fleet) + 2, PoolDropletIDs: ids, FirewallStatus: "succeeded", FirewallTags: []string{recorderFirewallTag}}, nil
+}
+
 // Ensure the fake satisfies the production interface at compile time.
 var _ DOClient = (*fakeDOClient)(nil)
 

@@ -408,9 +408,11 @@ func lockRelayNodeAndGroup(ctx context.Context, tx pgx.Tx, principal nodePrincip
 const cloudRecorderLockSQL = `
 	SELECT capacity
 	FROM recorder_droplets
-	WHERE name = $1 AND node_id = $2 AND state IN ('provisioning', 'active')
+	WHERE name = $1 AND node_id = $2 AND state='active' AND lease_admission_enabled
 	FOR UPDATE
 `
+
+const cloudRecorderPoolSharedFenceSQL = `SELECT pg_advisory_xact_lock_shared(hashtextextended('stoarama-recorder-pool-rollout-v1',0))`
 
 // Managed cloud recorders are operator-owned shared infrastructure and
 // intentionally lease jobs across customer accounts. Storage credentials stay
@@ -501,7 +503,10 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		} else {
 			defer func() { _ = tx.Rollback(r.Context()) }()
 			var capacity int
-			err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
+			_, err = tx.Exec(r.Context(), cloudRecorderPoolSharedFenceSQL)
+			if err == nil {
+				err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
+			}
 			if err == nil {
 				err = tx.QueryRow(r.Context(), cloudRecordingJobsLeaseSQL,
 					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported).Scan(
@@ -526,15 +531,18 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 	util.WriteJSON(w, http.StatusOK, map[string]any{"job": resp})
 }
 
-func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, nodeID int64, buildSHA string) error {
+func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, nodeID int64, buildSHA, commonPolicySHA256, runtimeConfigSHA256 string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE recorder_droplets
 		SET last_seen_at=now(),
 		    build_sha=CASE WHEN $3 <> '' THEN $3 ELSE build_sha END,
+		    observed_build_sha=CASE WHEN $3 <> '' THEN $3 ELSE observed_build_sha END,
+		    observed_common_policy_sha256=CASE WHEN $4 <> '' THEN $4 ELSE observed_common_policy_sha256 END,
+		    observed_runtime_config_sha256=CASE WHEN $5 <> '' THEN $5 ELSE observed_runtime_config_sha256 END,
 		    first_seen_at=COALESCE(first_seen_at, now()),
 		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
 		WHERE name=$1 AND node_id=$2
-	`, workerID, nodeID, buildSHA)
+	`, workerID, nodeID, buildSHA, commonPolicySHA256, runtimeConfigSHA256)
 	return err
 }
 
@@ -1399,7 +1407,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// Touch the droplet liveness row if this worker is a managed droplet.
-	_ = s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, "")
+	_ = s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, "", "", "")
 	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt})
 }
 
@@ -1420,18 +1428,28 @@ func (s *Server) handleRecordingDropletHeartbeat(w http.ResponseWriter, r *http.
 		return
 	}
 	var req struct {
-		BuildSHA string `json:"build_sha"`
+		BuildSHA            string `json:"build_sha"`
+		CommonPolicySHA256  string `json:"common_policy_sha256"`
+		RuntimeConfigSHA256 string `json:"runtime_config_sha256"`
 	}
 	if err := util.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	req.BuildSHA = strings.ToLower(strings.TrimSpace(req.BuildSHA))
+	req.CommonPolicySHA256 = strings.ToLower(strings.TrimSpace(req.CommonPolicySHA256))
+	req.RuntimeConfigSHA256 = strings.ToLower(strings.TrimSpace(req.RuntimeConfigSHA256))
 	if req.BuildSHA != "" && !regexp.MustCompile(`^[0-9a-f]{40,64}$`).MatchString(req.BuildSHA) {
 		util.WriteError(w, http.StatusBadRequest, "build_sha must be a 40-64 character lowercase hex commit")
 		return
 	}
-	if err := s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, req.BuildSHA); err != nil {
+	for label, value := range map[string]string{"common_policy_sha256": req.CommonPolicySHA256, "runtime_config_sha256": req.RuntimeConfigSHA256} {
+		if value != "" && !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(value) {
+			util.WriteError(w, http.StatusBadRequest, label+" must be empty or 64-character lowercase hex")
+			return
+		}
+	}
+	if err := s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, req.BuildSHA, req.CommonPolicySHA256, req.RuntimeConfigSHA256); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("touch droplet liveness: %v", err))
 		return
 	}
