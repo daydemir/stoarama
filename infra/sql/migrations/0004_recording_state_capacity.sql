@@ -2,7 +2,11 @@ BEGIN;
 
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'recording_state_enum') THEN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_type t
+    JOIN pg_namespace n ON n.oid=t.typnamespace
+    WHERE t.typname='recording_state_enum' AND n.nspname=current_schema()
+  ) THEN
     CREATE TYPE recording_state_enum AS ENUM ('off', 'on', 'failed');
   END IF;
 END
@@ -18,7 +22,7 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'streams' AND column_name = 'recording_enabled'
+    WHERE table_schema = current_schema() AND table_name = 'streams' AND column_name = 'recording_enabled'
   ) THEN
     EXECUTE $sql$
       UPDATE streams

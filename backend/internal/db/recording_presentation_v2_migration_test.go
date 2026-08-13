@@ -25,6 +25,14 @@ func TestRecordingPresentationV2MigrationRunsThroughMigrateUp(t *testing.T) {
 	}
 	defer admin.Close()
 	schema := fmt.Sprintf("presentation_v2_migration_%d", time.Now().UnixNano())
+	decoySchema := fmt.Sprintf("presentation_v2_decoy_%d", time.Now().UnixNano())
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+decoySchema); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(context.Background(), "DROP SCHEMA "+decoySchema+" CASCADE")
+	if _, err = admin.Exec(ctx, "CREATE TYPE "+decoySchema+".recording_state_enum AS ENUM ('off','on','failed')"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +49,10 @@ func TestRecordingPresentationV2MigrationRunsThroughMigrateUp(t *testing.T) {
 	defer pool.Close()
 	if err = MigrateUp(ctx, pool, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
 		t.Fatalf("MigrateUp with presentation v2 C1: %v", err)
+	}
+	var enumSchema, enumLabels string
+	if err = pool.QueryRow(ctx, `SELECT n.nspname,string_agg(e.enumlabel,',' ORDER BY e.enumsortorder) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace JOIN pg_enum e ON e.enumtypid=t.oid WHERE t.typname='recording_state_enum' AND n.nspname=current_schema() GROUP BY n.nspname`).Scan(&enumSchema, &enumLabels); err != nil || enumSchema != schema || enumLabels != "off,on" {
+		t.Fatalf("current-schema enum missing or contaminated schema=%q labels=%q err=%v", enumSchema, enumLabels, err)
 	}
 	for _, table := range []string{
 		"recording_presentation_v2_admissions",
