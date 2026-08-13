@@ -2,6 +2,7 @@ package recordingworker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -128,11 +129,14 @@ func (p *segmentDeliveryPool) run() {
 			// as pending for the supervisor's cleanup/retry decision.
 			continue
 		}
-		if err := p.deliver(seg); err != nil {
+		if err := p.deliver(seg); errors.Is(err, errSegmentReplayAcknowledged) {
+			p.acknowledge(false)
+			continue
+		} else if err != nil {
 			p.fail(err)
 			continue
 		}
-		p.acknowledge()
+		p.acknowledge(true)
 	}
 }
 
@@ -204,11 +208,13 @@ func (p *segmentDeliveryPool) fail(err error) {
 	}
 }
 
-func (p *segmentDeliveryPool) acknowledge() {
+func (p *segmentDeliveryPool) acknowledge(uniqueIngest bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.inFlight--
-	p.ingested = true
+	if uniqueIngest {
+		p.ingested = true
+	}
 }
 
 // close stops accepting segments, waits for every outstanding upload to finish,

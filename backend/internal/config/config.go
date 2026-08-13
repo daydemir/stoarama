@@ -109,6 +109,10 @@ type Config struct {
 	RecordingWorkerConcurrency  int
 	RecordingWorkerHeartbeatSec int
 	RecordingWorkerPollSec      int
+	// RecordingFrozenHLSQuiescenceAllowlist is an exact, default-empty list of
+	// worker/recording pairs allowed to use the frozen-live-edge watcher. Merely
+	// deploying the code cannot enable it for any recording.
+	RecordingFrozenHLSQuiescenceAllowlist string
 	// RelayUploadWorkers bounds how many segment uploads ONE continuous recording
 	// job keeps in flight. Segment delivery used to be strictly serial per job, so
 	// a single job could not exceed one reserve+upload+ingest round trip at a time
@@ -238,10 +242,11 @@ func Load() (Config, error) {
 		StripeGBMonthMeterID: strings.TrimSpace(os.Getenv("STRIPE_GB_MONTH_METER_ID")),
 		StripeLivemode:       boolEnv("STRIPE_LIVEMODE", false),
 
-		RecordingWorkerConcurrency:  intEnv("RECORDING_WORKER_CONCURRENCY", 1),
-		RecordingWorkerHeartbeatSec: intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),
-		RecordingWorkerPollSec:      intEnv("RECORDING_WORKER_POLL_SEC", 5),
-		RelayUploadWorkers:          RelayUploadWorkersFromEnv(),
+		RecordingWorkerConcurrency:            intEnv("RECORDING_WORKER_CONCURRENCY", 1),
+		RecordingWorkerHeartbeatSec:           intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),
+		RecordingWorkerPollSec:                intEnv("RECORDING_WORKER_POLL_SEC", 5),
+		RecordingFrozenHLSQuiescenceAllowlist: strEnv("RECORDING_FROZEN_HLS_QUIESCENCE_ALLOWLIST", ""),
+		RelayUploadWorkers:                    RelayUploadWorkersFromEnv(),
 
 		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),

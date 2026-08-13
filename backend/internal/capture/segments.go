@@ -30,6 +30,26 @@ var errContinuousSegmentDelivery = errors.New("continuous segment delivery faile
 // job-scoped SHA set because it spans ffmpeg reconnect attempts.
 var ErrContinuousSegmentDuplicate = errors.New("continuous segment is a duplicate replay")
 
+// ErrContinuousNoOutput identifies watchdog exits eligible for the separately
+// fenced frozen-live-edge observer. It says nothing about the playlist itself.
+var ErrContinuousNoOutput = errors.New("continuous ffmpeg made no output progress")
+
+type continuousNoOutputError struct{ message string }
+
+func (e *continuousNoOutputError) Error() string { return e.message }
+func (e *continuousNoOutputError) Unwrap() error { return ErrContinuousNoOutput }
+
+// IsCleanContinuousNoOutput is true only for the standalone watchdog outcome.
+// A joined finalization/delivery error must not be reclassified as a frozen
+// source, even though errors.Is still exposes ErrContinuousNoOutput within it.
+func IsCleanContinuousNoOutput(err error) bool {
+	if err == ErrContinuousNoOutput {
+		return true
+	}
+	_, ok := err.(*continuousNoOutputError)
+	return ok
+}
+
 const (
 	SegmentTargetFPS                      = 30
 	DefaultSegmentDuration                = 30 * time.Second
@@ -587,12 +607,12 @@ func continuousOutputAdvanced(previous, current map[string]int64) bool {
 func continuousWatchdogError(now, startedAt, lastProgressAt time.Time, sawProgress bool, startupTimeout, progressTimeout time.Duration) error {
 	if !sawProgress {
 		if now.Sub(startedAt) >= startupTimeout {
-			return fmt.Errorf("continuous ffmpeg startup stalled: no output for %s", startupTimeout)
+			return &continuousNoOutputError{message: fmt.Sprintf("continuous ffmpeg startup stalled: no output for %s", startupTimeout)}
 		}
 		return nil
 	}
 	if now.Sub(lastProgressAt) >= progressTimeout {
-		return fmt.Errorf("continuous ffmpeg progress stalled: no output growth for %s", progressTimeout)
+		return &continuousNoOutputError{message: fmt.Sprintf("continuous ffmpeg progress stalled: no output growth for %s", progressTimeout)}
 	}
 	return nil
 }
