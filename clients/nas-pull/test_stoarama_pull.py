@@ -4,6 +4,7 @@ import io
 import json
 import fcntl
 import os
+import resource
 import socket
 import sqlite3
 import tempfile
@@ -2094,6 +2095,33 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             pull.native_stitch_largest_possible_run([clip(pull.NATIVE_STITCH_MAX_RUN_BYTES + 1)])
         with self.assertRaisesRegex(pull.MediaCertificationError, "manifest"):
             pull.native_stitch_largest_possible_run([clip(1)] * (pull.NATIVE_STITCH_MAX_CLIPS + 1))
+
+    def test_run_snapshot_handles_720_clips_under_low_fd_limit_and_cleans_on_preemption(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_dir = root / "source"
+            snapshot_dir = root / "snapshots"
+            source_dir.mkdir(); snapshot_dir.mkdir()
+            paths, identities, clips = [], [], []
+            for index in range(720):
+                path = source_dir / ("%04d.mp4" % index)
+                body = ("clip-%04d" % index).encode()
+                path.write_bytes(body)
+                paths.append(path)
+                identities.append(None)
+                clips.append({"size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()})
+            identities = [(pull.certification_identity(path.stat()), pull.certification_identity(path.parent.stat())) for path in paths]
+            old_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, hard), hard))
+                snapshots = pull.snapshot_certification_run(paths, identities, clips, snapshot_dir, threading.Event())
+            finally:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (old_soft, hard))
+            self.assertEqual(len(snapshots), 720)
+            self.assertTrue(all(path.is_file() for path in snapshots))
+            cancel = threading.Event(); cancel.set()
+            with self.assertRaises(pull.InventoryScanStopped):
+                pull.snapshot_certification_run(paths, identities, clips, root / "preempted", cancel)
 
     def test_native_stitch_collects_only_frozen_window_rows(self):
         database = sqlite3.connect(":memory:")

@@ -1925,6 +1925,46 @@ def verify_certification_source_identities(paths, identities, phase):
             raise MediaCertificationError("media identity changed during %s" % phase)
 
 
+def snapshot_certification_run(paths, identities, clips, destination, cancel):
+    """Copy exact frozen bytes into one task-owned run using O(1) source fds."""
+    snapshots = []
+    for ordinal, (path, identity, clip) in enumerate(zip(paths, identities, clips), start=1):
+        if cancel.is_set():
+            raise InventoryScanStopped("certification yielded while snapshotting a run")
+        source = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        snapshot = destination / ("clip-%04d.mp4" % ordinal)
+        target = os.open(str(snapshot), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o400)
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            if (certification_identity(os.fstat(source)), certification_identity(path.parent.stat())) != identity:
+                raise MediaCertificationError("media identity changed before run snapshot")
+            while True:
+                if cancel.is_set():
+                    raise InventoryScanStopped("certification yielded while snapshotting a run")
+                chunk = os.read(source, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                copied += len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(target, view)
+                    if written <= 0:
+                        raise MediaCertificationError("run snapshot write made no progress")
+                    view = view[written:]
+            os.fsync(target)
+            if (certification_identity(os.fstat(source)), certification_identity(path.parent.stat())) != identity:
+                raise MediaCertificationError("media identity changed during run snapshot")
+        finally:
+            os.close(target)
+            os.close(source)
+        if copied != int(clip["size_bytes"]) or digest.hexdigest() != clip["sha256"]:
+            raise MediaCertificationError("run snapshot differs from frozen bytes")
+        snapshots.append(snapshot)
+    return snapshots
+
+
 def strict_decode_media_cancellable(path, ffmpeg_bin, cancel, pass_fds=()):
     command = [ffmpeg_bin, "-v", "error", "-xerror", "-err_detect", "explode", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS, "-enable_drefs", "0", "-use_absolute_path", "0", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"]
     run_media_validation_command(command, cancel, 600, "clip_decode_failed", pass_fds=pass_fds)
@@ -2118,7 +2158,7 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
     filesystem=os.statvfs(str(cfg.state_dir));free=filesystem.f_bavail*filesystem.f_frsize
     if free<largest_possible_run*2+NATIVE_STITCH_TEMP_RESERVE_BYTES: raise MediaCertificationError("insufficient temporary capacity")
     ffmpeg_version=media_tool_version_cancellable(ffmpeg_bin,cancel);ffprobe_version=media_tool_version_cancellable(ffprobe_bin,cancel)
-    clips=[];paths=[];tool_paths=[];source_fds=[];identities=[];video_edges=[]
+    clips=[];paths=[];identities=[];video_edges=[]
     reason="completed"
     try:
         for frozen,item in zip(raw_clips,local):
@@ -2128,23 +2168,25 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
             for key in ("clip_id","recording_id","recording_job_id","relative_path","size_bytes","sha256","capture_generation","capture_sequence","capture_attempt_id","timestamp_contract_version","timestamp_contract_status","timestamp_contract_reason","timestamp_contract_sha256"):
                 if frozen.get(key)!=item.get(key): raise MediaCertificationError("sidecar differs from frozen manifest")
             path,identity,parent_identity,source_fd,tool_path=hash_certification_file_cancellable(cfg.output_dir,item["relative_path"],item["size_bytes"],item["sha256"],cancel)
-            source_fds.append(source_fd);tool_paths.append(tool_path)
-            if time.monotonic()>=absolute_deadline: raise InventoryScanStopped("native stitch attempt deadline")
-            recomputed_contract=video_timeline=audio_timeline=None
-            if frozen.get("timestamp_contract_status")=="per_clip_probe_complete":
-                recomputed_contract,timelines=recompute_timestamp_contract(tool_path,ffprobe_bin,cancel,pass_fds=(source_fd,))
-                if timestamp_contract_hash(recomputed_contract)!=frozen.get("timestamp_contract_sha256") or recomputed_contract!=item.get("timestamp_contract"):
-                    raise MediaCertificationError("exact NAS bytes recompute a different timestamp contract")
-                video_timeline=timelines.get("video");audio_timeline=timelines.get("audio")
-            probe=probe_native_media_cancellable(tool_path,ffprobe_bin,cancel,pass_fds=(source_fd,))
-            signature=probe["stable_signature_v1"];signature_sha=canonical_report_hash(signature)
-            audio_present=any(s.get("codec_type")=="audio" for s in signature.get("streams",[]))
-            decode_status="passed"
-            try: strict_decode_media_cancellable(tool_path,ffmpeg_bin,cancel,pass_fds=(source_fd,))
-            except DeterministicMediaError: decode_status="failed"
-            edges=None
-            if recomputed_contract is not None:
-                edges=native_stitch_video_edge_frames(tool_path,ffmpeg_bin,timelines.get("_video_frames",[]),cancel,pass_fds=(source_fd,))
+            try:
+                if time.monotonic()>=absolute_deadline: raise InventoryScanStopped("native stitch attempt deadline")
+                recomputed_contract=video_timeline=audio_timeline=None
+                if frozen.get("timestamp_contract_status")=="per_clip_probe_complete":
+                    recomputed_contract,timelines=recompute_timestamp_contract(tool_path,ffprobe_bin,cancel,pass_fds=(source_fd,))
+                    if timestamp_contract_hash(recomputed_contract)!=frozen.get("timestamp_contract_sha256") or recomputed_contract!=item.get("timestamp_contract"):
+                        raise MediaCertificationError("exact NAS bytes recompute a different timestamp contract")
+                    video_timeline=timelines.get("video");audio_timeline=timelines.get("audio")
+                probe=probe_native_media_cancellable(tool_path,ffprobe_bin,cancel,pass_fds=(source_fd,))
+                signature=probe["stable_signature_v1"];signature_sha=canonical_report_hash(signature)
+                audio_present=any(s.get("codec_type")=="audio" for s in signature.get("streams",[]))
+                decode_status="passed"
+                try: strict_decode_media_cancellable(tool_path,ffmpeg_bin,cancel,pass_fds=(source_fd,))
+                except DeterministicMediaError: decode_status="failed"
+                edges=None
+                if recomputed_contract is not None:
+                    edges=native_stitch_video_edge_frames(tool_path,ffmpeg_bin,timelines.get("_video_frames",[]),cancel,pass_fds=(source_fd,))
+            finally:
+                os.close(source_fd)
             after_decode=path.stat()
             if certification_identity(after_decode)!=certification_identity(identity) or certification_identity(path.parent.stat())!=certification_identity(parent_identity): raise MediaCertificationError("media identity changed during decode")
             clip_fact={**{k:(v.isoformat().replace("+00:00","Z") if isinstance(v,datetime.datetime) else v) for k,v in frozen.items()},"sidecar_sha256":item["sidecar_sha256"],"file_identity":{"size":after_decode.st_size,"mtime_ns":after_decode.st_mtime_ns,"ctime_ns":after_decode.st_ctime_ns,"inode":after_decode.st_ino,"device":after_decode.st_dev},"native_signature":signature,"native_signature_sha256":signature_sha,"strict_decode":decode_status,"audio_present":audio_present}
@@ -2154,29 +2196,30 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
             clips.append(clip_fact);paths.append(path);identities.append((certification_identity(after_decode),certification_identity(parent_identity)));video_edges.append(edges)
             if decode_status=="failed": raise DeterministicMediaError("clip_decode_failed")
         runs=[];run_start=0
-        with tempfile.TemporaryDirectory(prefix="stoarama-native-stitch-",dir=str(cfg.state_dir)) as raw_temp:
-            for index in range(1,len(clips)+1):
-                boundary=index==len(clips) or clips[index]["capture_generation"]!=clips[run_start]["capture_generation"] or clips[index].get("capture_attempt_id","")!=clips[run_start].get("capture_attempt_id","") or clips[index].get("timestamp_contract_version","")!=clips[run_start].get("timestamp_contract_version","") or clips[index]["native_signature_sha256"]!=clips[run_start]["native_signature_sha256"] or clips[index]["clip_start_at"]!=clips[index-1]["clip_end_at"]
-                if not boundary: continue
-                if check_native_stitch_delivery(cfg,runtime,cancel): raise InventoryScanStopped("certification yielded to delivery")
-                run_bytes=sum(c["size_bytes"] for c in clips[run_start:index]);
-                if run_bytes>NATIVE_STITCH_MAX_RUN_BYTES: raise MediaCertificationError("native run byte bound exceeded")
-                run_dir=Path(raw_temp)/("run-%d"%len(runs));run_dir.mkdir()
-                try: validation=validate_native_run_cancellable(tool_paths[run_start:index],ffmpeg_bin,cancel,run_dir,pass_fds=source_fds[run_start:index])
+        for index in range(1,len(clips)+1):
+            boundary=index==len(clips) or clips[index]["capture_generation"]!=clips[run_start]["capture_generation"] or clips[index].get("capture_attempt_id","")!=clips[run_start].get("capture_attempt_id","") or clips[index].get("timestamp_contract_version","")!=clips[run_start].get("timestamp_contract_version","") or clips[index]["native_signature_sha256"]!=clips[run_start]["native_signature_sha256"] or clips[index]["clip_start_at"]!=clips[index-1]["clip_end_at"]
+            if not boundary: continue
+            if check_native_stitch_delivery(cfg,runtime,cancel): raise InventoryScanStopped("certification yielded to delivery")
+            run_bytes=sum(c["size_bytes"] for c in clips[run_start:index]);
+            if run_bytes>NATIVE_STITCH_MAX_RUN_BYTES: raise MediaCertificationError("native run byte bound exceeded")
+            with tempfile.TemporaryDirectory(prefix="stoarama-native-stitch-run-",dir=str(cfg.state_dir)) as raw_run:
+                run_dir=Path(raw_run)
+                snapshot_paths=snapshot_certification_run(paths[run_start:index],identities[run_start:index],clips[run_start:index],run_dir,cancel)
+                try: validation=validate_native_run_cancellable(snapshot_paths,ffmpeg_bin,cancel,run_dir)
                 except DeterministicMediaError: validation="failed"
-                # A deterministic tool diagnosis is attributable only while
-                # every source file is still the exact identity hashed above.
-                # This check deliberately precedes persistence of a FAILED run
-                # fact, including the failure path itself.
-                verify_certification_source_identities(
-                    paths[run_start:index], identities[run_start:index], "run validation")
-                if run_start==0: boundary_reason="window_start"
-                elif clips[run_start-1]["capture_generation"]!=clips[run_start]["capture_generation"]: boundary_reason="capture_generation_change"
-                elif clips[run_start-1].get("capture_attempt_id","")!=clips[run_start].get("capture_attempt_id","") or clips[run_start-1].get("timestamp_contract_version","")!=clips[run_start].get("timestamp_contract_version",""): boundary_reason="capture_attempt_change"
-                elif clips[run_start-1]["native_signature_sha256"]!=clips[run_start]["native_signature_sha256"]: boundary_reason="native_signature_change"
-                else: boundary_reason="temporal_gap"
-                runs.append({"ordinal":len(runs)+1,"first_clip_ordinal":run_start+1,"last_clip_ordinal":index,"clip_count":index-run_start,"source_bytes":run_bytes,"native_signature_sha256":clips[run_start]["native_signature_sha256"],"capture_generation":clips[run_start]["capture_generation"],"capture_attempt_id":clips[run_start].get("capture_attempt_id",""),"timestamp_contract_version":clips[run_start].get("timestamp_contract_version",""),"boundary_reason":boundary_reason,"validation_status":validation});run_start=index
-                if validation=="failed": raise DeterministicMediaError("run_concat_failed")
+            # A deterministic tool diagnosis is attributable only while
+            # every source file is still the exact identity hashed above.
+            # This check deliberately precedes persistence of a FAILED run
+            # fact, including the failure path itself.
+            verify_certification_source_identities(
+                paths[run_start:index], identities[run_start:index], "run validation")
+            if run_start==0: boundary_reason="window_start"
+            elif clips[run_start-1]["capture_generation"]!=clips[run_start]["capture_generation"]: boundary_reason="capture_generation_change"
+            elif clips[run_start-1].get("capture_attempt_id","")!=clips[run_start].get("capture_attempt_id","") or clips[run_start-1].get("timestamp_contract_version","")!=clips[run_start].get("timestamp_contract_version",""): boundary_reason="capture_attempt_change"
+            elif clips[run_start-1]["native_signature_sha256"]!=clips[run_start]["native_signature_sha256"]: boundary_reason="native_signature_change"
+            else: boundary_reason="temporal_gap"
+            runs.append({"ordinal":len(runs)+1,"first_clip_ordinal":run_start+1,"last_clip_ordinal":index,"clip_count":index-run_start,"source_bytes":run_bytes,"native_signature_sha256":clips[run_start]["native_signature_sha256"],"capture_generation":clips[run_start]["capture_generation"],"capture_attempt_id":clips[run_start].get("capture_attempt_id",""),"timestamp_contract_version":clips[run_start].get("timestamp_contract_version",""),"boundary_reason":boundary_reason,"validation_status":validation});run_start=index
+            if validation=="failed": raise DeterministicMediaError("run_concat_failed")
         verify_certification_source_identities(paths, identities, "run validation")
         run_starts={r["first_clip_ordinal"]:r for r in runs};seams=[];audio_seams=[]
         exact_video,exact_audio=native_stitch_clip_axis_continuity(clips)
@@ -2216,10 +2259,6 @@ def _run_native_stitch_task(cfg,runtime,inventory,stop_event,cancel,task,started
         status="failed";reason=str(exc);decode="failed" if reason=="clip_decode_failed" else "unknown";concat="failed" if reason=="run_concat_failed" else "unknown";frame_adjacency=audio_continuity=window_continuity="unknown";runs=locals().get("runs",[]);seams=locals().get("seams",[]);audio_seams=locals().get("audio_seams",[])
     except (MediaCertificationError,InventoryScanStopped) as exc:
         status="unknown";reason="attempt_deadline" if time.monotonic()>=absolute_deadline else ("delivery_preempted" if isinstance(exc,InventoryScanStopped) else "verification_transient");decode=concat=frame_adjacency=audio_continuity=window_continuity="unknown";clips=[];runs=[];seams=[];audio_seams=[]
-    finally:
-        for source_fd in source_fds:
-            try: os.close(source_fd)
-            except OSError: pass
     completed=datetime.datetime.now(datetime.timezone.utc)
     report={"schema_version":1,"policy_version":task["policy_version"],"task_id":task["task_id"],"recording_id":task["recording_id"],"recording_job_id":task["recording_job_id"],"window_start_at":task["window_start_at"],"window_end_at":task["window_end_at"],"clip_manifest_sha256":task["clip_manifest_sha256"],"inventory_generation":summary["generation"],"inventory_digest":summary["digest"],"inventory_completed_at":summary["scan_completed_at"],"status":status,"nas_byte_decode_status":decode,"native_run_concat_status":concat,"within_run_frame_adjacency_status":frame_adjacency,"within_run_audio_sample_continuity_status":audio_continuity,"window_continuity_status":window_continuity,"timeline":native_stitch_timeline(local,window_start,window_end),"clips":clips,"native_runs":runs,"seams":seams,"audio_seams":audio_seams,"reason_codes":[reason],"client_version":CLIENT_VERSION,"ffmpeg_version":ffmpeg_version,"ffprobe_version":ffprobe_version,"started_at":started.isoformat().replace("+00:00","Z"),"completed_at":completed.isoformat().replace("+00:00","Z"),"source_media_modified":False,"reencoded":False,"persistent_output_created":False}
     submit_native_stitch_completion(cfg,task,report)
