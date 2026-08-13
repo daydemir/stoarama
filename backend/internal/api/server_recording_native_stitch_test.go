@@ -16,6 +16,29 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestNativeStitchQualificationEligibilityFailsClosed(t *testing.T) {
+	passed := "passed"
+	partial := "partial"
+	tests := []struct {
+		name, scope, state, current string
+		status                      *string
+		want                        bool
+	}{
+		{"authoritative full current", "authoritative_occurrence", "passed", "current", &passed, true},
+		{"byte audit cannot qualify", "byte_run_audit", "passed", "current", &passed, false},
+		{"partial cannot qualify", "authoritative_occurrence", "partial", "current", &partial, false},
+		{"missing certification cannot qualify", "authoritative_occurrence", "pending", "current", nil, false},
+		{"stale NAS cannot qualify", "authoritative_occurrence", "passed", "unknown", &passed, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := nativeStitchQualificationEligible(test.scope, test.state, test.status, test.current); got != test.want {
+				t.Fatalf("eligible=%v want=%v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestNativeStitchClaimSelectsEligibleConnectionBeforeLimitAndFencesLease(t *testing.T) {
 	pool, cleanup := testAccountClipsPool(t)
 	defer cleanup()

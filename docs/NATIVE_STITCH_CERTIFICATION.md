@@ -28,6 +28,13 @@ still earn immutable byte/decode/run facts, but video/audio adjacency remains
 terminal `unknown`; it is never retried endlessly or promoted to seamless.
 Logical clip wall times and reset per-file PTS do not establish adjacency.
 
+The read API exposes the frozen `qualification_scope` for every task. Missing
+frozen qualification-window authority is `byte_run_audit`, never campaign
+qualification. The server-derived `qualification_eligible` flag is true only
+for an `authoritative_occurrence` whose task and certification are fully
+passed and whose exact NAS inventory proof is current; consumers must use this
+flag rather than infer qualification from media facts.
+
 A retryable `unknown` attempt asserts no completed axis, including audio
 absence; it carries no partial clip/run facts and is safe to repeat. A
 deterministic `failed` attempt records only the first canonical clip-decode or

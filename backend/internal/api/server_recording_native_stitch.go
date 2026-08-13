@@ -648,6 +648,11 @@ func nativeStitchMin(a, b int) int {
 	return b
 }
 
+func nativeStitchQualificationEligible(scope, taskState string, certificationStatus *string, currentNAS string) bool {
+	return scope == "authoritative_occurrence" && taskState == "passed" && certificationStatus != nil &&
+		*certificationStatus == "passed" && currentNAS == "current"
+}
+
 func (s *Server) handleAccountNativeStitchGet(w http.ResponseWriter, r *http.Request) {
 	p, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -659,7 +664,7 @@ func (s *Server) handleAccountNativeStitchGet(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 400, "recording_id required")
 		return
 	}
-	rows, err := s.pool.Query(r.Context(), `SELECT l.recording_job_id,l.window_start_at,l.window_end_at,l.clip_manifest_sha256,l.clip_count,l.source_bytes,l.state,l.certification_id,l.status,l.nas_byte_decode_status,l.native_run_concat_status,l.within_run_frame_adjacency_status,l.within_run_audio_sample_continuity_status,l.window_continuity_status,l.run_count,l.seam_count,l.audio_seam_count,l.inventory_generation,l.inventory_digest,l.inventory_completed_at,l.report_sha256,l.reason_codes,l.completed_at, CASE WHEN l.certification_id IS NULL THEN 'unknown' WHEN c.id IS NULL OR c.inventory_scan_rows_skipped<>0 OR c.inventory_in_progress_generation<>'' OR c.inventory_generation<>l.inventory_generation THEN 'unknown' WHEN (SELECT count(*) FROM recording_native_stitch_certification_clips f JOIN nas_inventory_files i ON i.connection_id=c.id AND i.clip_id=f.clip_id AND i.seen_generation=c.inventory_generation AND i.state='present' AND i.relative_path=f.relative_path AND i.size_bytes=f.size_bytes AND i.sha256=f.sha256 WHERE f.certification_id=l.certification_id AND NOT EXISTS(SELECT 1 FROM nas_inventory_files x WHERE x.connection_id=i.connection_id AND x.relative_path=i.relative_path AND x.clip_id<>i.clip_id AND x.state IN('present','mismatch')) AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=i.connection_id AND u.relative_path=i.relative_path AND u.state='present'))=l.clip_count THEN 'current' ELSE 'unknown' END current_nas_presence FROM recording_native_stitch_facts l LEFT JOIN connections c ON c.id=(SELECT connection_id FROM recording_native_stitch_certifications WHERE id=l.certification_id) WHERE l.account_id=$1 AND l.recording_id=$2 AND l.policy_version=$3 ORDER BY l.window_end_at DESC,l.completed_at DESC NULLS LAST`, p.AccountID, id, stitchcert.PolicyVersion)
+	rows, err := s.pool.Query(r.Context(), `SELECT l.recording_job_id,l.window_start_at,l.window_end_at,l.qualification_scope,l.clip_manifest_sha256,l.clip_count,l.source_bytes,l.state,l.certification_id,l.status,l.nas_byte_decode_status,l.native_run_concat_status,l.within_run_frame_adjacency_status,l.within_run_audio_sample_continuity_status,l.window_continuity_status,l.run_count,l.seam_count,l.audio_seam_count,l.inventory_generation,l.inventory_digest,l.inventory_completed_at,l.report_sha256,l.reason_codes,l.completed_at, CASE WHEN l.certification_id IS NULL THEN 'unknown' WHEN c.id IS NULL OR c.inventory_scan_rows_skipped<>0 OR c.inventory_in_progress_generation<>'' OR c.inventory_generation<>l.inventory_generation THEN 'unknown' WHEN (SELECT count(*) FROM recording_native_stitch_certification_clips f JOIN nas_inventory_files i ON i.connection_id=c.id AND i.clip_id=f.clip_id AND i.seen_generation=c.inventory_generation AND i.state='present' AND i.relative_path=f.relative_path AND i.size_bytes=f.size_bytes AND i.sha256=f.sha256 WHERE f.certification_id=l.certification_id AND NOT EXISTS(SELECT 1 FROM nas_inventory_files x WHERE x.connection_id=i.connection_id AND x.relative_path=i.relative_path AND x.clip_id<>i.clip_id AND x.state IN('present','mismatch')) AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=i.connection_id AND u.relative_path=i.relative_path AND u.state='present'))=l.clip_count THEN 'current' ELSE 'unknown' END current_nas_presence FROM recording_native_stitch_facts l LEFT JOIN connections c ON c.id=(SELECT connection_id FROM recording_native_stitch_certifications WHERE id=l.certification_id) WHERE l.account_id=$1 AND l.recording_id=$2 AND l.policy_version=$3 ORDER BY l.window_end_at DESC,l.completed_at DESC NULLS LAST`, p.AccountID, id, stitchcert.PolicyVersion)
 	if err != nil {
 		util.WriteError(w, 500, "read stitch certifications")
 		return
@@ -669,18 +674,18 @@ func (s *Server) handleAccountNativeStitchGet(w http.ResponseWriter, r *http.Req
 	for rows.Next() {
 		var job, clips, bytes int64
 		var start, end time.Time
-		var manifest, state, current string
+		var qualificationScope, manifest, state, current string
 		var cert *int64
 		var status, decode, concat, withinVideo, withinAudio, windowContinuity *string
 		var runCount, seamCount, audioSeamCount *int
 		var generation, digest, reportSHA *string
 		var invAt, doneAt *time.Time
 		var reasons []string
-		if err := rows.Scan(&job, &start, &end, &manifest, &clips, &bytes, &state, &cert, &status, &decode, &concat, &withinVideo, &withinAudio, &windowContinuity, &runCount, &seamCount, &audioSeamCount, &generation, &digest, &invAt, &reportSHA, &reasons, &doneAt, &current); err != nil {
+		if err := rows.Scan(&job, &start, &end, &qualificationScope, &manifest, &clips, &bytes, &state, &cert, &status, &decode, &concat, &withinVideo, &withinAudio, &windowContinuity, &runCount, &seamCount, &audioSeamCount, &generation, &digest, &invAt, &reportSHA, &reasons, &doneAt, &current); err != nil {
 			util.WriteError(w, 500, "scan stitch certifications")
 			return
 		}
-		items = append(items, map[string]any{"recording_job_id": job, "window_start_at": start, "window_end_at": end, "clip_manifest_sha256": manifest, "clip_count": clips, "source_bytes": bytes, "task_state": state, "certification_id": cert, "certification_status": status, "media_byte_decode": decode, "native_run_concat": concat, "within_run_frame_adjacency": withinVideo, "within_run_audio_sample_continuity": withinAudio, "whole_window_continuity": windowContinuity, "native_run_count": runCount, "video_seam_fact_count": seamCount, "audio_seam_fact_count": audioSeamCount, "current_nas_presence": current, "inventory_generation": generation, "inventory_digest": digest, "inventory_completed_at": invAt, "report_sha256": reportSHA, "reason_codes": reasons, "completed_at": doneAt})
+		items = append(items, map[string]any{"recording_job_id": job, "qualification_scope": qualificationScope, "qualification_eligible": nativeStitchQualificationEligible(qualificationScope, state, status, current), "window_start_at": start, "window_end_at": end, "clip_manifest_sha256": manifest, "clip_count": clips, "source_bytes": bytes, "task_state": state, "certification_id": cert, "certification_status": status, "media_byte_decode": decode, "native_run_concat": concat, "within_run_frame_adjacency": withinVideo, "within_run_audio_sample_continuity": withinAudio, "whole_window_continuity": windowContinuity, "native_run_count": runCount, "video_seam_fact_count": seamCount, "audio_seam_fact_count": audioSeamCount, "current_nas_presence": current, "inventory_generation": generation, "inventory_digest": digest, "inventory_completed_at": invAt, "report_sha256": reportSHA, "reason_codes": reasons, "completed_at": doneAt})
 	}
 	if err := rows.Err(); err != nil {
 		util.WriteError(w, 500, "read stitch certifications")
