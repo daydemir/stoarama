@@ -94,12 +94,12 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 	if _, err := pool.Exec(ctx, `INSERT INTO accounts(id,email,name,status,role) VALUES($1,$2,$2,'active','admin') ON CONFLICT(id) DO NOTHING`, accountID, fmt.Sprintf("presentation-%d@example.test", accountID)); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `WITH inserted AS (
-		INSERT INTO storage_destinations(id,account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,verified_at,managed,shared)
+	if _, err := pool.Exec(ctx, `INSERT INTO storage_destinations(id,account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,verified_at,managed,shared)
 		VALUES($1,$2,'v2','r2_managed','https://storage.example.test','auto','v2','','access',decode('00','hex'),'verified',now(),true,false)
-		ON CONFLICT (account_id) WHERE managed DO NOTHING
-		RETURNING id
-	) SELECT id FROM inserted UNION ALL SELECT id FROM storage_destinations WHERE account_id=$2 AND managed ORDER BY id LIMIT 1`, destinationCandidateID, accountID).Scan(&destinationID); err != nil {
+		ON CONFLICT (account_id) WHERE managed DO NOTHING`, destinationCandidateID, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT id FROM storage_destinations WHERE account_id=$1 AND managed`, accountID).Scan(&destinationID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,recording_state) VALUES($1,'test',$2,$2,$2,$3,$4,'hls','video_manifest','video_live','continuous_video',30,'on')`, streamID, fmt.Sprintf("v2-%d", suffix), fmt.Sprintf("https://source.example.test/%d.m3u8", suffix), fmt.Sprintf("https://source.example.test/page/%d", suffix)); err != nil {
@@ -124,17 +124,18 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 		 recording_stream_url_sha256,stream_source_url_sha256,stream_source_page_url_sha256,source_snapshot_sha256,
 		 provider,external_id,source_family,capture_type,execution_class,capture_mode,audio_selection,policy_version,
 		 parser_schema,capture_tool_identity_sha256,deadline_at)
-		SELECT $1,r.account_id,r.id,r.stream_id,j.id,j.lease_token,n.id,$2,
+		SELECT $1,r.account_id,r.id,r.stream_id,j.id,j.lease_token,n.id,sr.id,
 		 encode(sha256(convert_to(r.stream_url,'UTF8')),'hex'),encode(sha256(convert_to(s.source_url,'UTF8')),'hex'),
 		 encode(sha256(convert_to(s.source_page_url,'UTF8')),'hex'),
 		 encode(sha256(convert_to(jsonb_build_array(r.account_id,r.id,r.stream_id,j.id,j.lease_token,n.id,
 		 r.stream_url,s.source_url,s.source_page_url,s.provider,s.external_id,s.source_family,s.capture_type,
-		 s.execution_class,$2,'source_copy','first_optional')::text,'UTF8')),'hex'),
+			s.execution_class,sr.id,'source_copy','first_optional')::text,'UTF8')),'hex'),
 		 s.provider,s.external_id,s.source_family,s.capture_type,s.execution_class,'source_copy','first_optional',
 		 'continuous-source-presentation-edge-v2','presentation-probe-v2',
 		 recording_presentation_v2_tool_identity('8.1','8.1','62','62','60',repeat('b',64),'mov','h264','aac','presentation-probe-v2'),
 		 now()+interval '14 minutes'
-		FROM recordings r JOIN recording_jobs j ON j.recording_id=r.id JOIN streams s ON s.id=r.stream_id JOIN nodes n ON n.id=$3
+		FROM recordings r JOIN recording_jobs j ON j.recording_id=r.id JOIN streams s ON s.id=r.stream_id
+		JOIN stream_source_revisions sr ON sr.id=$2::bigint JOIN nodes n ON n.id=$3
 		WHERE r.id=$4 AND j.id=$5`, admission, revisionID, nodeID, recordingID, jobID); err != nil {
 		t.Fatal(err)
 	}
