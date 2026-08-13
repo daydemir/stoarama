@@ -95,7 +95,15 @@ case "${1:-}" in
     fi
     range="${*: -1}"
     [[ " $* " == *" --log-opts=--no-merges --first-parent "* ]] || exit 91
-    if [[ "$(git log -p "$range")" == *SECRET_HISTORY* ]]; then
+    mount=""
+    for argument in "$@"; do
+      [[ "$argument" == type=bind,src=*,dst=/repo,readonly ]] && mount="$argument"
+    done
+    [[ -n "$mount" ]] || exit 90
+    snapshot="${mount#type=bind,src=}"
+    snapshot="${snapshot%,dst=/repo,readonly}"
+    [[ "$snapshot" != "$FAKE_AMBIENT_REPO" && ! -w "$snapshot" ]] || exit 89
+    if [[ "$(git -C "$snapshot" log -p "$range")" == *SECRET_HISTORY* ]]; then
       exit 2
     fi
     ;;
@@ -129,7 +137,7 @@ cat >"$fake_bin/go" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ -z "${DATABASE_URL:-}" ]] || exit 81
-[[ "${GOENV:-}" == off && "${GOPROXY:-}" == off && "${GOSUMDB:-}" == off ]] || {
+[[ "${GOENV:-}" == off && "${GOTOOLCHAIN:-}" == local && "${GOPROXY:-}" == off && "${GOSUMDB:-}" == off ]] || {
   [[ "${1:-}" == env ]] || exit 79
 }
 if [[ "${1:-}" == env ]]; then
@@ -209,7 +217,7 @@ run_verify() {
     cd "$repo"
     env -u DATABASE_URL -u STOARAMA_TEST_DATABASE_URL \
       PATH="$fake_bin:$PATH" HOME="$real_home" FAKE_LOG="$fake_log" FAKE_DOCKER_SOCKET="$socket_path" \
-      FAKE_STATE_DIR="$test_root/fake-state" "$@"
+      FAKE_STATE_DIR="$test_root/fake-state" FAKE_AMBIENT_REPO="$repo" "$@"
   )
 }
 touch "$real_home/real-home-sentinel"
@@ -278,6 +286,7 @@ for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
         "FAKE_LOG": str(log),
         "FAKE_DOCKER_SOCKET": os.environ["FAKE_SOCKET"],
         "FAKE_STATE_DIR": str(state),
+        "FAKE_AMBIENT_REPO": str(repo),
         "FAKE_BLOCK_READY": "1",
     }
     out=open(pathlib.Path(os.environ["OUT_DIR"])/f"signal-{signame}.out","w")
@@ -391,7 +400,8 @@ touch "$gate_tmp/block-go"
   cd "$repo"
   exec env -u DATABASE_URL -u STOARAMA_TEST_DATABASE_URL \
     PATH="$fake_bin:$PATH" HOME="$real_home" TMPDIR="$gate_tmp" FAKE_LOG="$fake_log" \
-    FAKE_DOCKER_SOCKET="$socket_path" FAKE_STATE_DIR="$test_root/fake-state" bin/verify-pr
+    FAKE_DOCKER_SOCKET="$socket_path" FAKE_STATE_DIR="$test_root/fake-state" \
+    FAKE_AMBIENT_REPO="$repo" bin/verify-pr
 ) >"$test_root/gate-signal.out" 2>&1 &
 gate_pid=$!
 for _ in {1..200}; do [[ -s "$gate_tmp/blocked-go-pid" ]] && break; sleep 0.02; done
@@ -410,6 +420,32 @@ if [[ -n "$child_state" && "$child_state" != Z* ]]; then
   fail "TERM left Go child running"
 fi
 grep -Eq 'docker rm .* -f .*stoarama-verify-pr-' "$fake_log" || fail "TERM during Go gate did not clean PostgreSQL"
+
+# Stress the runner's spawn/publication boundary directly. The child signals
+# its parent immediately after spawn, before it can rely on PGID publication;
+# the pending signal must be handled only after supervision is complete.
+immediate_tmp="$test_root/immediate-signal"
+mkdir -p "$immediate_tmp"
+for attempt in {1..40}; do
+  pgid_file="$immediate_tmp/pgid-$attempt"
+  child_file="$immediate_tmp/child-$attempt"
+  STOARAMA_VERIFY_ARGV_JSON="$(printf '[\"/bin/sh\",\"-c\",\"echo $$ >%s; kill -TERM $PPID; sleep 300\"]' "$child_file")" \
+    STOARAMA_VERIFY_ENV_JSON="$(printf '{\"PATH\":\"%s\"}' "$PATH")" \
+    STOARAMA_VERIFY_PGID_FILE="$pgid_file" \
+    /usr/bin/python3 "$repo/bin/run_clean.py" >/dev/null 2>&1 &
+  immediate_runner=$!
+  wait "$immediate_runner" 2>/dev/null || true
+  [[ -s "$child_file" && -s "$pgid_file" ]] || fail "immediate signal did not cross the spawn/PGID boundary"
+  immediate_child="$(cat "$child_file")"
+  for _ in {1..100}; do
+    child_state="$(ps -o stat= -p "$immediate_child" 2>/dev/null | tr -d ' ' || true)"
+    [[ -z "$child_state" || "$child_state" == Z* ]] && break
+    sleep 0.01
+  done
+  child_state="$(ps -o stat= -p "$immediate_child" 2>/dev/null | tr -d ' ' || true)"
+  [[ -z "$child_state" || "$child_state" == Z* ]] || fail "immediate signal left runner child alive"
+done
+
 sed '/      - name: Test PostgreSQL type boundaries/,/ -v$/d' "$repo/.github/workflows/test.yml" >"$bad_workflow"
 if /usr/bin/python3 "$repo/bin/verify_pr_workflow.py" --root "$repo" --workflow "$bad_workflow" --check >/dev/null 2>&1; then
   fail "removed frozen workflow step was accepted"

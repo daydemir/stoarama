@@ -251,8 +251,10 @@ def clean_environment() -> dict[str, str]:
     env.setdefault("LANG", "C.UTF-8")
     env.setdefault("LC_ALL", "C.UTF-8")
     env["GOENV"] = "off"
+    env["GOTOOLCHAIN"] = "local"
     env["GOPROXY"] = "off"
     env["GOSUMDB"] = "off"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 

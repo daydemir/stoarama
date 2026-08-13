@@ -88,59 +88,14 @@ snapshot_head="$(git rev-parse --verify HEAD^{commit})" || die "HEAD is not a co
   die "pushed commit is not clean current HEAD; check it out and push separately"
 [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || die "worktree must be clean"
 
-git fetch --quiet origin main || die "cannot fetch origin/main"
-base_oid="$(git merge-base origin/main "$frozen_oid")" || die "cannot compute merge-base with origin/main"
-[[ -n "$base_oid" ]] || die "empty merge-base"
-
-docker_context="$("$docker" context show 2>/dev/null)" || die "cannot resolve Docker context"
-docker_endpoint="$("$docker" context inspect "$docker_context" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)" ||
-  die "cannot inspect Docker endpoint"
-[[ "$docker_endpoint" == unix:///* ]] || die "Docker endpoint must be a local Unix socket"
-docker_socket="${docker_endpoint#unix://}"
-[[ -S "$docker_socket" ]] || die "Docker endpoint is not a local Unix socket"
-case "$docker_socket" in
-  /var/run/docker.sock|"$operator_home"/.docker/run/docker.sock) ;;
-  *) die "Docker endpoint is not the supported local Docker Desktop socket" ;;
-esac
-
-"$docker" info >/dev/null 2>&1 ||
-  die "Docker daemon is not running; start Docker Desktop through Muavin before retrying"
-
-ensure_image() {
-  local image="$1"
-  if ! "$docker" image inspect "$image" >/dev/null 2>&1; then
-    printf 'verify-pr: pulling pinned image %s\n' "${image%@*}"
-    "$docker" pull "$image" >/dev/null || die "cannot pull pinned image ${image%@*}"
-  fi
-}
-
-ensure_image "$GITLEAKS_IMAGE"
-ensure_image "$POSTGRES_IMAGE"
-
-reported_gitleaks_version="$("$docker" run --rm "$GITLEAKS_IMAGE" version 2>/dev/null | head -n1)"
-[[ "$reported_gitleaks_version" =~ (^|[[:space:]])${GITLEAKS_VERSION}($|[[:space:]]) ]] ||
-  die "pinned gitleaks image did not report version $GITLEAKS_VERSION"
-
-printf 'verify-pr: scanning first-parent branch history with gitleaks %s\n' "$GITLEAKS_VERSION"
-"$docker" run --rm \
-  --mount "type=bind,src=$repo_root,dst=/repo,readonly" \
-  --workdir /repo \
-  "$GITLEAKS_IMAGE" detect --redact -v --exit-code=2 \
-  --config=.gitleaks.toml --log-opts=--no-merges --first-parent "${base_oid}..${frozen_oid}"
-
 nonce="$(printf '%s-%s-%s' "$$" "$RANDOM" "$frozen_oid" | shasum -a 256 | cut -c1-16)"
 pg_name="stoarama-verify-pr-$nonce"
 pg_started=0
 active_child=""
 runner_pid=""
-scratch_root="$(mktemp -d "${TMPDIR:-/tmp}/stoarama-verify-pr.XXXXXX")"
-runner_pgid_file="$scratch_root/active-pgid"
-chmod 700 "$scratch_root"
-sanitized_home="$scratch_root/home"
-mkdir -m 700 "$sanitized_home"
-safe_gocache="$(go env GOCACHE)"
-safe_gomodcache="$(go env GOMODCACHE)"
-safe_gopath="$(go env GOPATH)"
+scratch_root=""
+lock_dir=""
+lock_owned=0
 
 cleanup() {
   local status=$?
@@ -175,9 +130,18 @@ cleanup() {
       cleanup_failed=1
     fi
   fi
-  if [[ -d "$scratch_root" && "$scratch_root" == */stoarama-verify-pr.* ]]; then
+  if [[ -n "$scratch_root" && -d "$scratch_root" && "$scratch_root" == */stoarama-verify-pr.* ]]; then
+    chmod -R u+w "$scratch_root" 2>/dev/null || cleanup_failed=1
     find "$scratch_root" -depth -mindepth 1 -delete 2>/dev/null || cleanup_failed=1
     rmdir "$scratch_root" 2>/dev/null || cleanup_failed=1
+  fi
+  if [[ "$lock_owned" -eq 1 && -n "$lock_dir" && "$lock_dir" == */stoarama-verify-pr.lock ]]; then
+    if [[ "$(cat "$lock_dir/owner" 2>/dev/null || true)" == "$nonce" ]]; then
+      unlink "$lock_dir/owner" 2>/dev/null || cleanup_failed=1
+      rmdir "$lock_dir" 2>/dev/null || cleanup_failed=1
+    else
+      cleanup_failed=1
+    fi
   fi
   if [[ "$cleanup_failed" -eq 1 && "$status" -eq 0 ]]; then
     printf 'verify-pr: cleanup verification failed\n' >&2
@@ -189,6 +153,78 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+
+common_git_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+  die "cannot resolve the shared Git directory"
+lock_dir="$common_git_dir/stoarama-verify-pr.lock"
+mkdir "$lock_dir" 2>/dev/null || die "another repository verifier is already running"
+printf '%s\n' "$nonce" >"$lock_dir/owner"
+lock_owned=1
+
+# Recheck under the repository-wide verifier lock before freezing any evidence.
+[[ "$(git rev-parse --verify HEAD^{commit})" == "$snapshot_head" ]] || die "HEAD changed before verification lock"
+[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || die "worktree changed before verification lock"
+
+git fetch --quiet origin main || die "cannot fetch origin/main"
+base_oid="$(git merge-base origin/main "$frozen_oid")" || die "cannot compute merge-base with origin/main"
+[[ -n "$base_oid" ]] || die "empty merge-base"
+
+scratch_root="$(mktemp -d "${TMPDIR:-/tmp}/stoarama-verify-pr.XXXXXX")"
+chmod 700 "$scratch_root"
+snapshot_root="$scratch_root/repository"
+git init -q "$snapshot_root" || die "cannot initialize immutable verifier snapshot"
+git -C "$snapshot_root" fetch --quiet --no-tags "$repo_root" "$frozen_oid" ||
+  die "cannot copy the frozen commit into the verifier snapshot"
+git -C "$snapshot_root" checkout --quiet --detach "$frozen_oid" ||
+  die "cannot check out the frozen verifier snapshot"
+[[ "$(git -C "$snapshot_root" rev-parse --verify HEAD^{commit})" == "$frozen_oid" ]] ||
+  die "verifier snapshot does not match the frozen commit"
+[[ -z "$(git -C "$snapshot_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+  die "verifier snapshot is not clean"
+chmod -R a-w "$snapshot_root" || die "cannot make the verifier snapshot read-only"
+
+runner_pgid_file="$scratch_root/active-pgid"
+sanitized_home="$scratch_root/home"
+mkdir -m 700 "$sanitized_home"
+safe_gocache="$(GOENV=off GOTOOLCHAIN=local go env GOCACHE)"
+safe_gomodcache="$(GOENV=off GOTOOLCHAIN=local go env GOMODCACHE)"
+safe_gopath="$(GOENV=off GOTOOLCHAIN=local go env GOPATH)"
+
+docker_context="$("$docker" context show 2>/dev/null)" || die "cannot resolve Docker context"
+docker_endpoint="$("$docker" context inspect "$docker_context" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)" ||
+  die "cannot inspect Docker endpoint"
+[[ "$docker_endpoint" == unix:///* ]] || die "Docker endpoint must be a local Unix socket"
+docker_socket="${docker_endpoint#unix://}"
+[[ -S "$docker_socket" ]] || die "Docker endpoint is not a local Unix socket"
+case "$docker_socket" in
+  /var/run/docker.sock|"$operator_home"/.docker/run/docker.sock) ;;
+  *) die "Docker endpoint is not the supported local Docker Desktop socket" ;;
+esac
+
+"$docker" info >/dev/null 2>&1 ||
+  die "Docker daemon is not running; start Docker Desktop through Muavin before retrying"
+
+ensure_image() {
+  local image="$1"
+  if ! "$docker" image inspect "$image" >/dev/null 2>&1; then
+    printf 'verify-pr: pulling pinned image %s\n' "${image%@*}"
+    "$docker" pull "$image" >/dev/null || die "cannot pull pinned image ${image%@*}"
+  fi
+}
+
+ensure_image "$GITLEAKS_IMAGE"
+ensure_image "$POSTGRES_IMAGE"
+
+reported_gitleaks_version="$("$docker" run --rm "$GITLEAKS_IMAGE" version 2>/dev/null | head -n1)"
+[[ "$reported_gitleaks_version" =~ (^|[[:space:]])${GITLEAKS_VERSION}($|[[:space:]]) ]] ||
+  die "pinned gitleaks image did not report version $GITLEAKS_VERSION"
+
+printf 'verify-pr: scanning first-parent branch history with gitleaks %s\n' "$GITLEAKS_VERSION"
+"$docker" run --rm \
+  --mount "type=bind,src=$snapshot_root,dst=/repo,readonly" \
+  --workdir /repo \
+  "$GITLEAKS_IMAGE" detect --redact -v --exit-code=2 \
+  --config=.gitleaks.toml --log-opts=--no-merges --first-parent "${base_oid}..${frozen_oid}"
 
 "$docker" run --detach --rm \
   --name "$pg_name" \
@@ -222,9 +258,9 @@ done
 
 HOME="$sanitized_home" GOCACHE="$safe_gocache" GOMODCACHE="$safe_gomodcache" GOPATH="$safe_gopath" \
   TMPDIR="$scratch_root" STOARAMA_VERIFY_ACTIVE_PGID_FILE="$runner_pgid_file" \
-  python3 bin/verify_pr_workflow.py \
-  --root "$repo_root" \
-  --workflow "$repo_root/.github/workflows/test.yml" \
+  python3 "$snapshot_root/bin/verify_pr_workflow.py" \
+  --root "$snapshot_root" \
+  --workflow "$snapshot_root/.github/workflows/test.yml" \
   --database-url "$test_database_url" &
 runner_pid=$!
 wait "$runner_pid"
@@ -233,13 +269,18 @@ runner_pid=""
 printf 'verify-pr: checking tracked Go formatting and committed diff whitespace\n'
 go_files=()
 while IFS= read -r -d '' go_file; do
-  go_files+=("$go_file")
-done < <(git ls-files -z '*.go')
+  go_files+=("$snapshot_root/$go_file")
+done < <(git -C "$snapshot_root" ls-files -z '*.go')
 if [[ ${#go_files[@]} -gt 0 ]]; then
   formatting="$(gofmt -l "${go_files[@]}")"
   [[ -z "$formatting" ]] || die "gofmt required for: $formatting"
 fi
-git diff --check "$base_oid" "$frozen_oid" || die "committed diff has whitespace errors"
+git -C "$snapshot_root" diff --check "$base_oid" "$frozen_oid" || die "committed diff has whitespace errors"
+
+[[ "$(git -C "$snapshot_root" rev-parse --verify HEAD^{commit})" == "$frozen_oid" ]] ||
+  die "verifier snapshot HEAD changed during verification"
+[[ -z "$(git -C "$snapshot_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+  die "verifier snapshot changed during verification"
 
 [[ "$(git rev-parse --verify HEAD^{commit})" == "$snapshot_head" ]] || die "HEAD changed during verification"
 [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || die "worktree changed during verification"

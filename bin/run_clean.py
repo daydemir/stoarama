@@ -16,11 +16,18 @@ def main() -> int:
         return 97
     if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
         return 98
+    forwarded = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    # Do not expose a child-session escape window between spawn and publishing
+    # its PGID. Signals stay pending until the group is fully supervised.
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, forwarded)
     child = subprocess.Popen(argv, env=env, start_new_session=True)
     pgid_file = os.environ.get("STOARAMA_VERIFY_PGID_FILE")
     if pgid_file:
-        with open(pgid_file, "x", encoding="ascii") as handle:
+        descriptor = os.open(pgid_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
             handle.write(f"{child.pid}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def forward(signum, _frame):
         try:
@@ -36,8 +43,9 @@ def main() -> int:
             except ProcessLookupError:
                 pass
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    for signum in forwarded:
         signal.signal(signum, forward)
+    signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     return child.wait()
 
 
