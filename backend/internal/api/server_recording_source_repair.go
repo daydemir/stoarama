@@ -69,6 +69,10 @@ func (s *Server) handleAdminRecordingSourceRepair(w http.ResponseWriter, r *http
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockRecordingCampaignSourceStreamTx(r.Context(), tx, req.StreamID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock source repair roster fence")
+		return
+	}
 	var jobStatus string
 	var jobRecordingID int64
 	var jobKind string
