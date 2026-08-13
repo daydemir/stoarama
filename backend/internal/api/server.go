@@ -373,6 +373,7 @@ func (s *Server) router() http.Handler {
 			admin.Delete("/storage-destinations/{id}", s.handleAdminStorageDestinationDelete)
 			admin.Post("/storage-destinations/{id}/grants", s.handleAdminStorageDestinationGrantCreate)
 			admin.Delete("/storage-destinations/{id}/grants/{accountId}", s.handleAdminStorageDestinationGrantDelete)
+			admin.Post("/relay-nodes/{id}/quarantine", s.handleAdminRelayNodeQuarantine)
 		})
 
 		api.Group(func(public chi.Router) {

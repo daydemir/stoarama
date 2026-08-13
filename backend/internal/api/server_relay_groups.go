@@ -336,6 +336,13 @@ func (s *Server) handleAccountNodeRelayGroupPut(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock relay node: %v", err))
 		return
 	}
+	if quarantined, qerr := relayNodeIsQuarantined(r.Context(), tx, nodeID); qerr != nil {
+		util.WriteError(w, http.StatusInternalServerError, "check relay node quarantine")
+		return
+	} else if quarantined {
+		util.WriteError(w, http.StatusConflict, "quarantined relay node requires typed release")
+		return
+	}
 	if !relayGroupChangeAllowed(currentGroupID, &groupID, liveLeases) {
 		util.WriteError(w, http.StatusConflict, "wait for this computer's active recordings to finish")
 		return
@@ -391,6 +398,13 @@ func (s *Server) handleAccountNodeRelayGroupDelete(w http.ResponseWriter, r *htt
 		return
 	} else if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock relay node: %v", err))
+		return
+	}
+	if quarantined, qerr := relayNodeIsQuarantined(r.Context(), tx, nodeID); qerr != nil {
+		util.WriteError(w, http.StatusInternalServerError, "check relay node quarantine")
+		return
+	} else if quarantined {
+		util.WriteError(w, http.StatusConflict, "quarantined relay node requires typed release")
 		return
 	}
 	if !relayGroupChangeAllowed(currentGroupID, nil, liveLeases) {
