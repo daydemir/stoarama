@@ -83,6 +83,27 @@ RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT AS $$
     octet_length(p_parser)::text||':'||p_parser||chr(10),'UTF8')),'hex')
 $$;
 
+-- Canonical retained-file identity. Device/inode are canonical unsigned
+-- decimal strings so the contract is lossless across Go, PostgreSQL, and
+-- platforms whose stat fields exceed signed 64-bit application types.
+CREATE FUNCTION recording_presentation_v2_retention_identity(
+  p_task UUID,p_node BIGINT,p_method TEXT,p_device TEXT,p_inode TEXT,p_clone TEXT,
+  p_size BIGINT,p_file_sha TEXT,p_deadline TIMESTAMPTZ)
+RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT AS $$
+  SELECT encode(sha256(convert_to(
+    'presentation-retention-v2'||chr(10)||
+    octet_length(p_task::text)::text||':'||p_task::text||chr(10)||
+    octet_length(p_node::text)::text||':'||p_node::text||chr(10)||
+    octet_length(p_method)::text||':'||p_method||chr(10)||
+    octet_length(p_device)::text||':'||p_device||chr(10)||
+    octet_length(p_inode)::text||':'||p_inode||chr(10)||
+    octet_length(p_clone)::text||':'||p_clone||chr(10)||
+    octet_length(p_size::text)::text||':'||p_size::text||chr(10)||
+    octet_length(p_file_sha)::text||':'||p_file_sha||chr(10)||
+    octet_length(((extract(epoch from p_deadline)*1000000)::bigint)::text)::text||':'||
+      ((extract(epoch from p_deadline)*1000000)::bigint)::text||chr(10),'UTF8')),'hex')
+$$;
+
 CREATE TABLE recording_presentation_v2_admissions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
@@ -260,6 +281,9 @@ CREATE TABLE recording_presentation_v2_probe_tasks (
   local_upload_identity_sha256 TEXT NOT NULL CHECK(local_upload_identity_sha256~'^[0-9a-f]{64}$'),
   staging_identity_sha256 TEXT CHECK(staging_identity_sha256 IS NULL OR staging_identity_sha256~'^[0-9a-f]{64}$'),
   staging_method TEXT CHECK(staging_method IS NULL OR staging_method IN('hardlink','clone')),
+  staging_device_id TEXT CHECK(staging_device_id IS NULL OR CASE WHEN staging_device_id~'^(0|[1-9][0-9]{0,19})$' THEN staging_device_id::numeric<=18446744073709551615 ELSE false END),
+  staging_inode_id TEXT CHECK(staging_inode_id IS NULL OR CASE WHEN staging_inode_id~'^[1-9][0-9]{0,19}$' THEN staging_inode_id::numeric<=18446744073709551615 ELSE false END),
+  staging_clone_identity_sha256 TEXT CHECK(staging_clone_identity_sha256 IS NULL OR staging_clone_identity_sha256~'^[0-9a-f]{64}$'),
   request_sha256 TEXT NOT NULL CHECK(request_sha256~'^[0-9a-f]{64}$'),
   response_sha256 TEXT NOT NULL CHECK(response_sha256~'^[0-9a-f]{64}$'),
   initial_disposition TEXT NOT NULL CHECK(initial_disposition IN('retained','unavailable')),
@@ -268,6 +292,9 @@ CREATE TABLE recording_presentation_v2_probe_tasks (
   unavailable_reason TEXT,
   retention_identity_sha256 TEXT CHECK(retention_identity_sha256 IS NULL OR retention_identity_sha256~'^[0-9a-f]{64}$'),
   retention_method TEXT CHECK(retention_method IS NULL OR retention_method IN('hardlink','clone')),
+  retention_device_id TEXT CHECK(retention_device_id IS NULL OR CASE WHEN retention_device_id~'^(0|[1-9][0-9]{0,19})$' THEN retention_device_id::numeric<=18446744073709551615 ELSE false END),
+  retention_inode_id TEXT CHECK(retention_inode_id IS NULL OR CASE WHEN retention_inode_id~'^[1-9][0-9]{0,19}$' THEN retention_inode_id::numeric<=18446744073709551615 ELSE false END),
+  retention_clone_identity_sha256 TEXT CHECK(retention_clone_identity_sha256 IS NULL OR retention_clone_identity_sha256~'^[0-9a-f]{64}$'),
   revision BIGINT NOT NULL DEFAULT 1 CHECK(revision>0),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count BETWEEN 0 AND 5),
   claim_token UUID,
@@ -284,7 +311,10 @@ CREATE TABLE recording_presentation_v2_probe_tasks (
   CHECK(
     (initial_disposition='unavailable' AND state='unavailable' AND retention_state='none'
       AND staging_identity_sha256 IS NULL AND retention_identity_sha256 IS NULL
-      AND staging_method IS NULL AND retention_method IS NULL AND unavailable_reason IS NOT NULL)
+      AND staging_method IS NULL AND retention_method IS NULL
+      AND staging_device_id IS NULL AND staging_inode_id IS NULL AND staging_clone_identity_sha256 IS NULL
+      AND retention_device_id IS NULL AND retention_inode_id IS NULL AND retention_clone_identity_sha256 IS NULL
+      AND unavailable_reason IS NOT NULL)
     OR initial_disposition='retained'),
   CHECK(unavailable_reason IS NULL OR unavailable_reason IN(
     'retention_unavailable','state_reserve','link_unavailable','retention_deadline',
@@ -293,20 +323,38 @@ CREATE TABLE recording_presentation_v2_probe_tasks (
   CHECK(state='leased' OR (claim_token IS NULL AND lease_expires_at IS NULL)),
   CHECK(
     (retention_state='none' AND staging_identity_sha256 IS NULL AND staging_method IS NULL
-      AND retention_identity_sha256 IS NULL AND retention_method IS NULL)
+      AND staging_device_id IS NULL AND staging_inode_id IS NULL AND staging_clone_identity_sha256 IS NULL
+      AND retention_identity_sha256 IS NULL AND retention_method IS NULL
+      AND retention_device_id IS NULL AND retention_inode_id IS NULL AND retention_clone_identity_sha256 IS NULL)
     OR (retention_state='awaiting' AND staging_identity_sha256 IS NOT NULL AND staging_method IS NOT NULL
-      AND retention_identity_sha256 IS NULL AND retention_method IS NULL)
+      AND ((staging_method='hardlink' AND staging_device_id IS NOT NULL AND staging_inode_id IS NOT NULL AND staging_clone_identity_sha256 IS NULL)
+        OR (staging_method='clone' AND staging_device_id IS NULL AND staging_inode_id IS NULL AND staging_clone_identity_sha256 IS NOT NULL))
+      AND retention_identity_sha256 IS NULL AND retention_method IS NULL
+      AND retention_device_id IS NULL AND retention_inode_id IS NULL AND retention_clone_identity_sha256 IS NULL)
     OR (retention_state='active' AND staging_identity_sha256 IS NOT NULL AND staging_method IS NOT NULL
-      AND retention_identity_sha256=staging_identity_sha256 AND retention_method=staging_method)
+      AND retention_identity_sha256 IS NOT NULL AND retention_method=staging_method
+      AND ((retention_method='hardlink' AND retention_device_id=staging_device_id AND retention_inode_id=staging_inode_id
+          AND retention_clone_identity_sha256 IS NULL AND staging_clone_identity_sha256 IS NULL)
+        OR (retention_method='clone' AND retention_device_id IS NULL AND retention_inode_id IS NULL
+          AND retention_clone_identity_sha256=staging_clone_identity_sha256 AND retention_clone_identity_sha256 IS NOT NULL)))
     OR (retention_state IN('release_pending','released') AND staging_identity_sha256 IS NOT NULL
       AND staging_method IS NOT NULL
-      AND ((retention_identity_sha256 IS NULL AND retention_method IS NULL)
-        OR (retention_identity_sha256=staging_identity_sha256 AND retention_method=staging_method)))),
+      AND ((retention_identity_sha256 IS NULL AND retention_method IS NULL
+          AND retention_device_id IS NULL AND retention_inode_id IS NULL AND retention_clone_identity_sha256 IS NULL)
+        OR (retention_identity_sha256 IS NOT NULL AND retention_method=staging_method
+          AND ((retention_method='hardlink' AND retention_device_id=staging_device_id AND retention_inode_id=staging_inode_id
+              AND retention_clone_identity_sha256 IS NULL AND staging_clone_identity_sha256 IS NULL)
+            OR (retention_method='clone' AND retention_device_id IS NULL AND retention_inode_id IS NULL
+              AND retention_clone_identity_sha256=staging_clone_identity_sha256 AND retention_clone_identity_sha256 IS NOT NULL))))),
   CHECK(
     (state='awaiting_retention' AND retention_state='awaiting')
     OR (state IN('pending','leased') AND retention_state='active')
     OR (state IN('completed','expired') AND retention_state IN('release_pending','released'))
-    OR (state='unavailable' AND retention_state IN('none','release_pending','released')))
+    OR (state='unavailable' AND retention_state IN('none','release_pending','released'))),
+  CHECK(retention_identity_sha256 IS NULL OR (retention_method IS NOT NULL AND retention_identity_sha256=
+    recording_presentation_v2_retention_identity(id,node_id,retention_method,
+      COALESCE(retention_device_id,''),COALESCE(retention_inode_id,''),
+      COALESCE(retention_clone_identity_sha256,''),clip_size_bytes,clip_sha256,absolute_deadline_at)))
 );
 CREATE INDEX recording_presentation_v2_probe_claim_idx
 ON recording_presentation_v2_probe_tasks(account_id,node_id,next_attempt_at,id)
@@ -536,7 +584,9 @@ BEGIN
     END IF;
     IF NEW.initial_disposition='retained' AND
        (NEW.state<>'awaiting_retention' OR NEW.retention_state<>'awaiting' OR NEW.staging_identity_sha256 IS NULL
-        OR NEW.staging_method IS NULL OR NEW.unavailable_reason IS NOT NULL) THEN
+        OR NEW.staging_method IS NULL OR NEW.unavailable_reason IS NOT NULL
+        OR (NEW.staging_method='hardlink' AND (NEW.staging_device_id IS NULL OR NEW.staging_inode_id IS NULL OR NEW.staging_clone_identity_sha256 IS NOT NULL))
+        OR (NEW.staging_method='clone' AND (NEW.staging_device_id IS NOT NULL OR NEW.staging_inode_id IS NOT NULL OR NEW.staging_clone_identity_sha256 IS NULL))) THEN
       RAISE EXCEPTION 'retained presentation task must await retention';
     END IF;
     SELECT * INTO a FROM recording_presentation_v2_admissions WHERE id=NEW.admission_id FOR SHARE;
@@ -581,12 +631,14 @@ BEGIN
   ELSE
     IF (NEW.admission_id,NEW.attempt_id,NEW.account_id,NEW.recording_id,NEW.stream_id,NEW.recording_job_id,
         NEW.clip_id,NEW.upload_intent_id,NEW.lease_token,NEW.node_id,NEW.capture_sequence,NEW.clip_size_bytes,
-        NEW.clip_sha256,NEW.local_upload_identity_sha256,NEW.staging_identity_sha256,NEW.staging_method,NEW.request_sha256,
+        NEW.clip_sha256,NEW.local_upload_identity_sha256,NEW.staging_identity_sha256,NEW.staging_method,
+        NEW.staging_device_id,NEW.staging_inode_id,NEW.staging_clone_identity_sha256,NEW.request_sha256,
         NEW.response_sha256,NEW.initial_disposition,NEW.created_at,NEW.absolute_deadline_at)
       IS DISTINCT FROM
        (OLD.admission_id,OLD.attempt_id,OLD.account_id,OLD.recording_id,OLD.stream_id,OLD.recording_job_id,
         OLD.clip_id,OLD.upload_intent_id,OLD.lease_token,OLD.node_id,OLD.capture_sequence,OLD.clip_size_bytes,
-        OLD.clip_sha256,OLD.local_upload_identity_sha256,OLD.staging_identity_sha256,OLD.staging_method,OLD.request_sha256,
+        OLD.clip_sha256,OLD.local_upload_identity_sha256,OLD.staging_identity_sha256,OLD.staging_method,
+        OLD.staging_device_id,OLD.staging_inode_id,OLD.staging_clone_identity_sha256,OLD.request_sha256,
         OLD.response_sha256,OLD.initial_disposition,OLD.created_at,OLD.absolute_deadline_at) THEN
       RAISE EXCEPTION 'presentation task identity is immutable';
     END IF;
@@ -598,8 +650,18 @@ BEGIN
     END IF;
     IF OLD.state='awaiting_retention' AND NEW.state='pending' THEN
       IF OLD.retention_state<>'awaiting' OR NEW.retention_state<>'active'
-         OR NEW.retention_identity_sha256 IS DISTINCT FROM OLD.staging_identity_sha256
-         OR NEW.retention_method IS DISTINCT FROM OLD.staging_method THEN RAISE EXCEPTION 'invalid retention activation'; END IF;
+         OR NEW.retention_method IS DISTINCT FROM OLD.staging_method
+         OR (NEW.retention_method='hardlink' AND
+           (NEW.retention_device_id,NEW.retention_inode_id,NEW.retention_clone_identity_sha256)
+             IS DISTINCT FROM (OLD.staging_device_id,OLD.staging_inode_id,NULL::text))
+         OR (NEW.retention_method='clone' AND
+           (NEW.retention_device_id,NEW.retention_inode_id,NEW.retention_clone_identity_sha256)
+             IS DISTINCT FROM (NULL::text,NULL::text,OLD.staging_clone_identity_sha256))
+         OR NEW.retention_identity_sha256 IS DISTINCT FROM recording_presentation_v2_retention_identity(
+           NEW.id,NEW.node_id,NEW.retention_method,COALESCE(NEW.retention_device_id,''),
+           COALESCE(NEW.retention_inode_id,''),COALESCE(NEW.retention_clone_identity_sha256,''),
+           NEW.clip_size_bytes,NEW.clip_sha256,NEW.absolute_deadline_at)
+      THEN RAISE EXCEPTION 'invalid retention activation'; END IF;
     ELSIF OLD.state='pending' AND NEW.state='leased' THEN
       IF OLD.retention_state<>'active' OR NEW.retention_state<>'active' OR NEW.attempt_count<>OLD.attempt_count+1 THEN RAISE EXCEPTION 'invalid presentation claim'; END IF;
     ELSIF OLD.state='leased' AND NEW.state='pending' THEN

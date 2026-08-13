@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,12 +43,15 @@ type presentationV2AttemptRequest struct {
 }
 
 type presentationV2IngestEnvelope struct {
-	AttemptID                 string `json:"attempt_id"`
-	LocalUploadIdentitySHA256 string `json:"local_upload_identity_sha256"`
-	Disposition               string `json:"disposition"`
-	StagingIdentitySHA256     string `json:"staging_identity_sha256,omitempty"`
-	StagingMethod             string `json:"staging_method,omitempty"`
-	UnavailableReason         string `json:"unavailable_reason,omitempty"`
+	AttemptID                  string `json:"attempt_id"`
+	LocalUploadIdentitySHA256  string `json:"local_upload_identity_sha256"`
+	Disposition                string `json:"disposition"`
+	StagingIdentitySHA256      string `json:"staging_identity_sha256,omitempty"`
+	StagingMethod              string `json:"staging_method,omitempty"`
+	StagingDeviceID            string `json:"staging_device_id,omitempty"`
+	StagingInodeID             string `json:"staging_inode_id,omitempty"`
+	StagingCloneIdentitySHA256 string `json:"staging_clone_identity_sha256,omitempty"`
+	UnavailableReason          string `json:"unavailable_reason,omitempty"`
 }
 
 type presentationV2IngestReplay struct {
@@ -95,14 +99,28 @@ func validatePresentationV2IngestEnvelope(v *presentationV2IngestEnvelope) (uuid
 		if !lowerHex64(v.StagingIdentitySHA256) || (v.StagingMethod != "hardlink" && v.StagingMethod != "clone") || v.UnavailableReason != "" {
 			return uuid.Nil, fmt.Errorf("retained presentation probe requires staging identity only")
 		}
+		if v.StagingMethod == "hardlink" && (!canonicalUnsignedDecimal(v.StagingDeviceID, true) || !canonicalUnsignedDecimal(v.StagingInodeID, false) || v.StagingCloneIdentitySHA256 != "") {
+			return uuid.Nil, fmt.Errorf("hardlink presentation probe requires exact device and inode")
+		}
+		if v.StagingMethod == "clone" && (v.StagingDeviceID != "" || v.StagingInodeID != "" || !lowerHex64(v.StagingCloneIdentitySHA256)) {
+			return uuid.Nil, fmt.Errorf("clone presentation probe requires exact clone identity")
+		}
 	case "unavailable":
-		if v.StagingIdentitySHA256 != "" || v.StagingMethod != "" || !presentationUnavailableReason(v.UnavailableReason) {
+		if v.StagingIdentitySHA256 != "" || v.StagingMethod != "" || v.StagingDeviceID != "" || v.StagingInodeID != "" || v.StagingCloneIdentitySHA256 != "" || !presentationUnavailableReason(v.UnavailableReason) {
 			return uuid.Nil, fmt.Errorf("unavailable presentation probe reason is invalid")
 		}
 	default:
 		return uuid.Nil, fmt.Errorf("presentation probe disposition is invalid")
 	}
 	return id, nil
+}
+
+func canonicalUnsignedDecimal(v string, zeroAllowed bool) bool {
+	if v == "" || (len(v) > 1 && v[0] == '0') {
+		return false
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	return err == nil && (zeroAllowed || n > 0)
 }
 
 func presentationUnavailableReason(v string) bool {
@@ -257,6 +275,29 @@ func presentationV2ToolIdentity(req presentationV2AttemptRequest) string {
 	}
 	var canonical strings.Builder
 	canonical.WriteString("presentation-semantic-tool-v2\n")
+	for _, field := range fields {
+		fmt.Fprintf(&canonical, "%d:%s\n", len([]byte(field)), field)
+	}
+	return presentationSHA([]byte(canonical.String()))
+}
+
+type presentationV2RetentionIdentityInput struct {
+	TaskID      uuid.UUID
+	NodeID      int64
+	Method      string
+	DeviceID    string
+	InodeID     string
+	CloneSHA256 string
+	SizeBytes   int64
+	FileSHA256  string
+	Deadline    time.Time
+}
+
+func presentationV2RetentionIdentity(v presentationV2RetentionIdentityInput) string {
+	fields := []string{v.TaskID.String(), strconv.FormatInt(v.NodeID, 10), v.Method, v.DeviceID, v.InodeID,
+		v.CloneSHA256, strconv.FormatInt(v.SizeBytes, 10), v.FileSHA256, strconv.FormatInt(v.Deadline.UnixMicro(), 10)}
+	var canonical strings.Builder
+	canonical.WriteString("presentation-retention-v2\n")
 	for _, field := range fields {
 		fmt.Fprintf(&canonical, "%d:%s\n", len([]byte(field)), field)
 	}
@@ -423,23 +464,74 @@ func (s *Server) handleRecordingPresentationV2Activate(w http.ResponseWriter, r 
 		StagingIdentitySHA256   string `json:"staging_identity_sha256"`
 		RetentionIdentitySHA256 string `json:"retention_identity_sha256"`
 		Method                  string `json:"method"`
+		DeviceID                string `json:"device_id,omitempty"`
+		InodeID                 string `json:"inode_id,omitempty"`
+		CloneIdentitySHA256     string `json:"clone_identity_sha256,omitempty"`
+		FileSizeBytes           int64  `json:"file_size_bytes"`
+		FileSHA256              string `json:"file_sha256"`
 	}
 	if _, ok := decodePresentationV2(w, r, 4096, &req); !ok {
 		return
 	}
-	ct, err := s.pool.Exec(r.Context(), `UPDATE recording_presentation_v2_probe_tasks SET state='pending',retention_state='active',retention_identity_sha256=$4,retention_method=$5,revision=revision+1 WHERE id=$1 AND account_id=$2 AND node_id=$3 AND revision=$6 AND state='awaiting_retention' AND retention_state='awaiting' AND staging_identity_sha256=$7 AND staging_method=$5 AND absolute_deadline_at>now()`, id, p.AccountID, p.NodeID, strings.ToLower(req.RetentionIdentitySHA256), req.Method, req.ExpectedRevision, strings.ToLower(req.StagingIdentitySHA256))
-	if err != nil || ct.RowsAffected() != 1 {
-		var revision int64
-		var state, retention, staging, retained, method string
-		replayErr := s.pool.QueryRow(r.Context(), `SELECT revision,state,retention_state,staging_identity_sha256,retention_identity_sha256,retention_method FROM recording_presentation_v2_probe_tasks WHERE id=$1 AND account_id=$2 AND node_id=$3`, id, p.AccountID, p.NodeID).Scan(&revision, &state, &retention, &staging, &retained, &method)
-		if replayErr == nil && revision == req.ExpectedRevision+1 && state == "pending" && retention == "active" && staging == strings.ToLower(req.StagingIdentitySHA256) && retained == strings.ToLower(req.RetentionIdentitySHA256) && method == req.Method {
-			util.WriteJSON(w, 200, map[string]any{"task_id": id, "state": "pending", "retention_state": "active", "revision": revision, "replayed": true})
+	req.StagingIdentitySHA256 = strings.ToLower(strings.TrimSpace(req.StagingIdentitySHA256))
+	req.RetentionIdentitySHA256 = strings.ToLower(strings.TrimSpace(req.RetentionIdentitySHA256))
+	req.FileSHA256 = strings.ToLower(strings.TrimSpace(req.FileSHA256))
+	req.CloneIdentitySHA256 = strings.ToLower(strings.TrimSpace(req.CloneIdentitySHA256))
+	if !lowerHex64(req.StagingIdentitySHA256) || !lowerHex64(req.RetentionIdentitySHA256) || !lowerHex64(req.FileSHA256) || req.FileSizeBytes <= 0 ||
+		(req.Method == "hardlink" && (!canonicalUnsignedDecimal(req.DeviceID, true) || !canonicalUnsignedDecimal(req.InodeID, false) || req.CloneIdentitySHA256 != "")) ||
+		(req.Method == "clone" && (req.DeviceID != "" || req.InodeID != "" || !lowerHex64(req.CloneIdentitySHA256))) ||
+		(req.Method != "hardlink" && req.Method != "clone") {
+		util.WriteError(w, 400, "invalid typed presentation retention identity")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, 500, "begin presentation retention activation")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var revision int64
+	var state, retention, staging, stagingMethod, stagingDevice, stagingInode, stagingClone string
+	var retained, retainedMethod, retainedDevice, retainedInode, retainedClone *string
+	var clipSize int64
+	var clipSHA string
+	var deadline, dbNow time.Time
+	err = tx.QueryRow(r.Context(), `SELECT revision,state,retention_state,staging_identity_sha256,staging_method,COALESCE(staging_device_id,''),COALESCE(staging_inode_id,''),COALESCE(staging_clone_identity_sha256,''),retention_identity_sha256,retention_method,retention_device_id,retention_inode_id,retention_clone_identity_sha256,clip_size_bytes,clip_sha256,absolute_deadline_at,now() FROM recording_presentation_v2_probe_tasks WHERE id=$1 AND account_id=$2 AND node_id=$3 FOR UPDATE`, id, p.AccountID, p.NodeID).Scan(&revision, &state, &retention, &staging, &stagingMethod, &stagingDevice, &stagingInode, &stagingClone, &retained, &retainedMethod, &retainedDevice, &retainedInode, &retainedClone, &clipSize, &clipSHA, &deadline, &dbNow)
+	if err != nil {
+		util.WriteError(w, 409, "presentation retention activation conflict")
+		return
+	}
+	identity := presentationV2RetentionIdentity(presentationV2RetentionIdentityInput{TaskID: id, NodeID: p.NodeID, Method: req.Method, DeviceID: req.DeviceID, InodeID: req.InodeID, CloneSHA256: req.CloneIdentitySHA256, SizeBytes: req.FileSizeBytes, FileSHA256: req.FileSHA256, Deadline: deadline})
+	exact := staging == req.StagingIdentitySHA256 && stagingMethod == req.Method && stagingDevice == req.DeviceID && stagingInode == req.InodeID && stagingClone == req.CloneIdentitySHA256 && clipSize == req.FileSizeBytes && clipSHA == req.FileSHA256 && identity == req.RetentionIdentitySHA256
+	if revision == req.ExpectedRevision+1 && state == "pending" && retention == "active" && exact && retained != nil && *retained == identity && retainedMethod != nil && *retainedMethod == req.Method && valueOrEmpty(retainedDevice) == req.DeviceID && valueOrEmpty(retainedInode) == req.InodeID && valueOrEmpty(retainedClone) == req.CloneIdentitySHA256 {
+		if err = tx.Commit(r.Context()); err != nil {
+			util.WriteError(w, 409, "presentation retention activation conflict")
 			return
 		}
+		util.WriteJSON(w, 200, map[string]any{"task_id": id, "state": "pending", "retention_state": "active", "revision": revision, "replayed": true})
+		return
+	}
+	if revision != req.ExpectedRevision || state != "awaiting_retention" || retention != "awaiting" || !exact || !deadline.After(dbNow) {
+		util.WriteError(w, 409, "presentation retention activation conflict")
+		return
+	}
+	ct, err := tx.Exec(r.Context(), `UPDATE recording_presentation_v2_probe_tasks SET state='pending',retention_state='active',retention_identity_sha256=$2,retention_method=$3,retention_device_id=NULLIF($4,''),retention_inode_id=NULLIF($5,''),retention_clone_identity_sha256=NULLIF($6,''),revision=revision+1 WHERE id=$1`, id, identity, req.Method, req.DeviceID, req.InodeID, req.CloneIdentitySHA256)
+	if err != nil || ct.RowsAffected() != 1 {
+		util.WriteError(w, 409, "presentation retention activation conflict")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, 409, "presentation retention activation conflict")
 		return
 	}
 	util.WriteJSON(w, 200, map[string]any{"task_id": id, "state": "pending", "retention_state": "active", "revision": req.ExpectedRevision + 1})
+}
+
+func valueOrEmpty(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 type presentationV2ClaimedTask struct {

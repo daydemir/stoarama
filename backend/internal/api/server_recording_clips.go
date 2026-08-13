@@ -1244,18 +1244,21 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		err = tx.QueryRow(r.Context(), `
 			INSERT INTO recording_presentation_v2_probe_tasks(
 			 id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,
-			 lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,
-				 staging_identity_sha256,staging_method,request_sha256,response_sha256,initial_disposition,state,retention_state,
+				 lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,
+				 staging_identity_sha256,staging_method,staging_device_id,staging_inode_id,staging_clone_identity_sha256,
+				 request_sha256,response_sha256,initial_disposition,state,retention_state,
 				 unavailable_reason,absolute_deadline_at)
 			SELECT $1,p.admission_id,p.id,p.account_id,p.recording_id,p.stream_id,p.recording_job_id,$2,$3,
-				 p.lease_token,p.node_id,$4,$5,$6,$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,NULLIF($15,''),LEAST(now()+interval '10 minutes',a.deadline_at)
+				 p.lease_token,p.node_id,$4,$5,$6,$7,NULLIF($8,''),NULLIF($9,''),NULLIF($10,''),NULLIF($11,''),NULLIF($12,''),
+				 $13,$14,$15,$16,$17,NULLIF($18,''),LEAST(now()+interval '10 minutes',a.deadline_at)
 			FROM recording_presentation_v2_attempts p
 			JOIN recording_presentation_v2_admissions a ON a.id=p.admission_id
-			WHERE p.id=$16 AND p.account_id=$17 AND p.node_id=$18 AND p.recording_job_id=$19 AND p.lease_token=$20
+			WHERE p.id=$19 AND p.account_id=$20 AND p.node_id=$21 AND p.recording_job_id=$22 AND p.lease_token=$23
 			RETURNING absolute_deadline_at
 		`, taskID, clipID, intentID, req.CaptureSequence, head.SizeBytes, strings.ToLower(strings.TrimSpace(req.SHA256)),
 			strings.ToLower(req.PresentationProbe.LocalUploadIdentitySHA256), strings.ToLower(req.PresentationProbe.StagingIdentitySHA256),
-			req.PresentationProbe.StagingMethod, presentationRequestSHA, responseSHA, req.PresentationProbe.Disposition, state, retentionState,
+			req.PresentationProbe.StagingMethod, req.PresentationProbe.StagingDeviceID, req.PresentationProbe.StagingInodeID,
+			strings.ToLower(req.PresentationProbe.StagingCloneIdentitySHA256), presentationRequestSHA, responseSHA, req.PresentationProbe.Disposition, state, retentionState,
 			req.PresentationProbe.UnavailableReason, presentationAttemptID, principal.AccountID, principal.NodeID, jobID, captureLeaseToken).Scan(&deadline)
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusConflict, "presentation attempt unavailable for ingest")
