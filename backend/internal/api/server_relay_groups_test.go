@@ -111,6 +111,11 @@ func TestRecordingHeartbeatCannotReviveExpiredLease(t *testing.T) {
 	if !strings.Contains(recordingJobHeartbeatSQL, "j.lease_expires_at > now()") {
 		t.Fatal("recording heartbeat must reject expired leases")
 	}
+	if !strings.Contains(recordingJobHeartbeatSQL, "j.window_end_at IS NOT NULL") ||
+		!strings.Contains(recordingJobHeartbeatSQL, "j.window_end_at + make_interval(secs => $5) > now()") ||
+		!strings.Contains(recordingJobHeartbeatSQL, "LEAST(") {
+		t.Fatal("continuous heartbeat must reject post-drain renewals and cap the lease at the drain deadline")
+	}
 }
 
 func TestRelayLeaseRequiresYouTubeReadinessOnlyForYouTube(t *testing.T) {
@@ -283,7 +288,9 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var renewedAt time.Time
-	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, nil).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
+	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner,
+		recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, nil,
+		recordingContinuousPostWindowLeaseSec).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expired heartbeat err=%v, want pgx.ErrNoRows", err)
 	}
 
@@ -639,7 +646,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		  (5, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/5.m3u8', NULL, 1, NULL),
 		  (6, 47, 'active', now()-interval '1 hour', NULL, 'relay', 'https://example.com/6.m3u8', NULL, 1, NULL);
 		INSERT INTO recording_jobs (id,recording_id,status,scheduled_for,kind,fire_at,clip_duration_sec,lease_owner,lease_expires_at,attempt_count,updated_at,window_end_at) VALUES
-		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), NULL),
+		  (5, 5, 'leased', now(), 'continuous_window', now(), 60, 'node:5', now()+interval '500 milliseconds', 1, now(), now()+interval '1 hour'),
 		  (6, 6, 'pending', now()-interval '1 second', 'clip', now(), 60, NULL, NULL, 0, now(), NULL);
 	`); err != nil {
 		t.Fatal(err)

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -594,6 +596,147 @@ func TestLeaseGenerationRejectsPreviousProcessOnSameNode(t *testing.T) {
 	}
 	if _, err := s.heartbeatRecordingJob(ctx, principal, job.JobID, "node:1", job.LeaseToken); err != nil {
 		t.Fatalf("current lease generation could not renew: %v", err)
+	}
+}
+
+func TestRecordingHeartbeatCapsContinuousWindowDrain(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id) VALUES(42);
+		INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams)
+		VALUES(1,42,'relay','active',now(),4),(2,42,'relay','active',now(),4);
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via)
+		VALUES(1,42,1,'heartbeat','https://example.test/live.m3u8','active',now()-interval '1 hour','relay');
+		INSERT INTO recording_jobs
+			(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,
+			 attempt_count,idempotency_key,kind,window_end_at)
+		VALUES
+			(1,1,now(),now(),60,'leased','node:1',now()+interval '5 minutes',1,'heartbeat-far','continuous_window',now()+interval '1 hour'),
+			(2,1,now(),now(),60,'leased','node:1',now()+interval '5 minutes',1,'heartbeat-near','continuous_window',now()-interval '45 minutes'),
+			(3,1,now(),now(),60,'leased','node:1',now()+interval '5 minutes',1,'heartbeat-past','continuous_window',now()-interval '47 minutes'),
+			(4,1,now(),now(),60,'leased','node:1',now()+interval '5 minutes',1,'heartbeat-malformed','continuous_window',NULL),
+			(5,1,now(),now(),60,'leased','node:1',now()+interval '5 minutes',1,'heartbeat-clip','clip',NULL)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	principal := nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}
+	dbNow := func() time.Time {
+		var now time.Time
+		if err := pool.QueryRow(ctx, `SELECT now()`).Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
+
+	farBefore := dbNow()
+	far, err := s.heartbeatRecordingJob(ctx, principal, 1, "node:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalLease := time.Duration(60+recordingCaptureTimeoutMarginSec+recordingUploadMarginSec) * time.Second
+	if got := far.Sub(farBefore); got < normalLease-time.Second || got > normalLease+time.Second {
+		t.Fatalf("far continuous lease=%s want normal rolling lease %s", got, normalLease)
+	}
+
+	var fixedCap time.Time
+	if err := pool.QueryRow(ctx, `SELECT window_end_at+make_interval(secs=>$2) FROM recording_jobs WHERE id=$1`, 2, recordingContinuousPostWindowLeaseSec).Scan(&fixedCap); err != nil {
+		t.Fatal(err)
+	}
+	near, err := s.heartbeatRecordingJob(ctx, principal, 2, "node:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !near.Equal(fixedCap) {
+		t.Fatalf("near-close lease=%s want exact fixed cap %s", near, fixedCap)
+	}
+	nearAgain, err := s.heartbeatRecordingJob(ctx, principal, 2, "node:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nearAgain.Equal(fixedCap) {
+		t.Fatalf("repeated heartbeat moved cap: got %s want %s", nearAgain, fixedCap)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(recording_job_id) VALUES(2)`); err != nil {
+		t.Fatal(err)
+	}
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "2")
+	completeReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/jobs/2/complete", nil)
+	completeReq = completeReq.WithContext(context.WithValue(context.WithValue(completeReq.Context(), chi.RouteCtxKey, rctx), nodePrincipalContextKey, principal))
+	completeResponse := httptest.NewRecorder()
+	s.handleRecordingJobComplete(completeResponse, completeReq)
+	if completeResponse.Code != http.StatusOK {
+		t.Fatalf("completion inside drain allowance status=%d body=%s", completeResponse.Code, completeResponse.Body.String())
+	}
+
+	for _, tc := range []struct {
+		name      string
+		jobID     int64
+		principal nodePrincipal
+		owner     string
+		token     *uuid.UUID
+	}{
+		{name: "post cap", jobID: 3, principal: principal, owner: "node:1"},
+		{name: "continuous null end", jobID: 4, principal: principal, owner: "node:1"},
+		{name: "wrong owner", jobID: 1, principal: nodePrincipal{NodeID: 2, AccountID: 42, NodeType: nodeTypeRelay}, owner: "node:2"},
+		{name: "wrong token", jobID: 1, principal: principal, owner: "node:1", token: ptrUUID(uuid.MustParse("123e4567-e89b-12d3-a456-426614174000"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := s.heartbeatRecordingJob(ctx, tc.principal, tc.jobID, tc.owner, tc.token); !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("heartbeat err=%v want pgx.ErrNoRows", err)
+			}
+		})
+	}
+
+	clipBefore := dbNow()
+	clip, err := s.heartbeatRecordingJob(ctx, principal, 5, "node:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := clip.Sub(clipBefore); got < normalLease-time.Second || got > normalLease+time.Second {
+		t.Fatalf("finite clip lease=%s want unchanged rolling lease %s", got, normalLease)
+	}
+}
+
+func ptrUUID(v uuid.UUID) *uuid.UUID { return &v }
+
+func TestRecordingHeartbeatHandlerCancelsAfterContinuousDrainCap(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id) VALUES(42);
+		INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams)
+		VALUES(1,42,'relay','active',now(),4);
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via)
+		VALUES(1,42,1,'heartbeat','https://example.test/live.m3u8','active',now()-interval '1 hour','relay');
+		INSERT INTO recording_jobs
+			(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,
+			 attempt_count,idempotency_key,kind,window_end_at)
+		VALUES(1,1,now(),now(),60,'leased','node:1',now()+interval '5 minutes',1,'heartbeat-handler','continuous_window',now()-interval '47 minutes')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/jobs/1/heartbeat", nil)
+	req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, rctx), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
+	response := httptest.NewRecorder()
+	s.handleRecordingJobHeartbeat(response, req)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"cancel":true`) {
+		t.Fatalf("heartbeat status=%d body=%s want 409 cancel", response.Code, response.Body.String())
+	}
+	var status, owner string
+	var expires time.Time
+	if err := pool.QueryRow(ctx, `SELECT status,lease_owner,lease_expires_at FROM recording_jobs WHERE id=1`).Scan(&status, &owner, &expires); err != nil {
+		t.Fatal(err)
+	}
+	if status != "leased" || owner != "node:1" {
+		t.Fatalf("heartbeat mutated job status=%q owner=%q", status, owner)
 	}
 }
 

@@ -30,6 +30,12 @@ const (
 	// the upload. lease = clip_duration + capture margin + upload margin.
 	recordingCaptureTimeoutMarginSec = 90
 	recordingUploadMarginSec         = 60
+	// recordingContinuousPostWindowLeaseSec is the server-side ceiling for a
+	// continuous job's final, already-accepted segment deliveries: the worker's
+	// 45-minute delivery retry budget plus one bounded minute to complete the job.
+	// The lease fence must stand on its own so a stale or buggy worker cannot
+	// heartbeat forever past window close.
+	recordingContinuousPostWindowLeaseSec = 45*60 + 60
 	// recordingMaxBitrateBytesPerSec bounds the presigned upload size (S-4): a
 	// generous 8 MB/s, so a 900s clip caps at ~7.2 GB.
 	recordingMaxBitrateBytesPerSec = 8 * 1024 * 1024
@@ -1320,9 +1326,17 @@ func timestampContractAudioPresent(contract *capture.TimestampContract) bool {
 
 const recordingJobHeartbeatSQL = `
 	UPDATE recording_jobs j
-	SET lease_expires_at = now() + make_interval(secs => (j.clip_duration_sec + $3)), updated_at = now()
+	SET lease_expires_at = LEAST(
+	      now() + make_interval(secs => (j.clip_duration_sec + $3)),
+	      CASE WHEN j.kind='continuous_window'
+	           THEN j.window_end_at + make_interval(secs => $5)
+	           ELSE 'infinity'::timestamptz END
+	    ), updated_at = now()
 	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 	  AND j.lease_token IS NOT DISTINCT FROM $4 AND j.lease_expires_at > now()
+	  AND (j.kind<>'continuous_window'
+	       OR (j.window_end_at IS NOT NULL
+	           AND j.window_end_at + make_interval(secs => $5) > now()))
 	RETURNING j.lease_expires_at
 `
 
@@ -1330,7 +1344,8 @@ func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrinci
 	var leaseExpiresAt time.Time
 	if principal.NodeType != nodeTypeRelay {
 		err := s.pool.QueryRow(ctx, recordingJobHeartbeatSQL,
-			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt)
+			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken,
+			recordingContinuousPostWindowLeaseSec).Scan(&leaseExpiresAt)
 		return leaseExpiresAt, err
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -1342,7 +1357,8 @@ func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrinci
 		return leaseExpiresAt, err
 	}
 	if err := tx.QueryRow(ctx, recordingJobHeartbeatSQL,
-		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken).Scan(&leaseExpiresAt); err != nil {
+		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken,
+		recordingContinuousPostWindowLeaseSec).Scan(&leaseExpiresAt); err != nil {
 		return leaseExpiresAt, err
 	}
 	if err := tx.Commit(ctx); err != nil {
