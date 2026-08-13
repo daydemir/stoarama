@@ -250,6 +250,19 @@ func presentationSHA(raw []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func presentationV2ToolIdentity(req presentationV2AttemptRequest) string {
+	fields := []string{
+		req.FFmpegVersion, req.FFprobeVersion, req.Libavformat, req.Libavcodec, req.Libavutil,
+		req.BuildFlagsSHA256, req.Demuxer, req.VideoDecoder, req.AudioDecoder, req.ParserSchema,
+	}
+	var canonical strings.Builder
+	canonical.WriteString("presentation-semantic-tool-v2\n")
+	for _, field := range fields {
+		fmt.Fprintf(&canonical, "%d:%s\n", len([]byte(field)), field)
+	}
+	return presentationSHA([]byte(canonical.String()))
+}
+
 func presentationNodeTask(w http.ResponseWriter, r *http.Request) (nodePrincipal, uuid.UUID, bool) {
 	p, ok := nodePrincipalFromContext(r.Context())
 	if !ok || p.NodeType != nodeTypeRelay {
@@ -298,8 +311,27 @@ func (s *Server) handleRecordingPresentationV2Attempt(w http.ResponseWriter, r *
 	req.AdmissionID = admissionID.String()
 	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
 	req.BuildFlagsSHA256 = strings.ToLower(strings.TrimSpace(req.BuildFlagsSHA256))
+	if !lowerHex64(req.BuildFlagsSHA256) {
+		util.WriteError(w, http.StatusBadRequest, "invalid presentation semantic tool identity")
+		return
+	}
+	toolIdentity := presentationV2ToolIdentity(req)
 	canonical, _ := json.Marshal(req)
 	requestSHA := presentationSHA(canonical)
+	var admittedToolIdentity string
+	err = tx.QueryRow(r.Context(), `SELECT capture_tool_identity_sha256 FROM recording_presentation_v2_admissions WHERE id=$1 AND recording_job_id=$2 AND lease_token=$3 AND node_id=$4 AND account_id=$5`, admissionID, jobID, *lease, p.NodeID, p.AccountID).Scan(&admittedToolIdentity)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, 404, "presentation admission unavailable")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, 500, "load presentation admission tool identity")
+		return
+	}
+	if admittedToolIdentity != toolIdentity {
+		util.WriteError(w, 409, "presentation semantic tool identity differs from admission")
+		return
+	}
 	var priorID uuid.UUID
 	var priorRequestSHA, priorResponseSHA string
 	priorErr := tx.QueryRow(r.Context(), `SELECT id,request_sha256,response_sha256 FROM recording_presentation_v2_attempts WHERE admission_id=$1 AND idempotency_key=$2 AND account_id=$3 AND node_id=$4`, admissionID, req.IdempotencyKey, p.AccountID, p.NodeID).Scan(&priorID, &priorRequestSHA, &priorResponseSHA)
@@ -426,45 +458,54 @@ type presentationV2ClaimedTask struct {
 // deterministic tests. No production route calls it in C1; enabling the route
 // requires a later reviewed code change, not configuration.
 func (s *Server) claimRecordingPresentationV2(ctx context.Context, p nodePrincipal) (*presentationV2ClaimedTask, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// Row locks and state/claim-token transition triggers are the claim fence.
+	// READ COMMITTED plus SKIP LOCKED lets concurrent node polls take distinct
+	// eligible rows without a predicate-serialization failure.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	// Expiry is server-first and releases retained bytes; do at most one per poll.
-	var expired uuid.UUID
-	var binding string
-	err = tx.QueryRow(ctx, `SELECT id,COALESCE(retention_identity_sha256,staging_identity_sha256) FROM recording_presentation_v2_probe_tasks WHERE account_id=$1 AND node_id=$2 AND initial_disposition='retained' AND state IN('awaiting_retention','pending','leased') AND absolute_deadline_at<=now() ORDER BY absolute_deadline_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`, p.AccountID, p.NodeID).Scan(&expired, &binding)
-	if err == nil {
-		if _, err = tx.Exec(ctx, `UPDATE recording_presentation_v2_probe_tasks SET state='expired',retention_state='release_pending',claim_token=NULL,lease_expires_at=NULL,revision=revision+1 WHERE id=$1`, expired); err != nil {
-			return nil, err
-		}
-		if _, err = tx.Exec(ctx, `INSERT INTO recording_presentation_v2_release_authorizations(task_id,release_version,node_id,binding_sha256,terminal_state) VALUES($1,1,$2,$3,'expired')`, expired, p.NodeID, binding); err != nil {
-			return nil, err
-		}
-		if err = tx.Commit(ctx); err != nil {
-			return nil, err
-		}
-		return nil, nil
+	// Cleanup is bounded and never consumes the claim result. Stale rows are
+	// prefiltered/locked in small batches; even a much larger backlog cannot
+	// starve an eligible task in this same poll.
+	type staleTask struct {
+		id      uuid.UUID
+		binding string
 	}
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	cleanup := func(query, terminalState, reason string, args ...any) error {
+		rows, queryErr := tx.Query(ctx, query, args...)
+		if queryErr != nil {
+			return queryErr
+		}
+		stale := make([]staleTask, 0, 16)
+		for rows.Next() {
+			var item staleTask
+			if scanErr := rows.Scan(&item.id, &item.binding); scanErr != nil {
+				rows.Close()
+				return scanErr
+			}
+			stale = append(stale, item)
+		}
+		if rows.Err() != nil {
+			rows.Close()
+			return rows.Err()
+		}
+		rows.Close()
+		for _, item := range stale {
+			if _, updateErr := tx.Exec(ctx, `UPDATE recording_presentation_v2_probe_tasks SET state=$2,retention_state='release_pending',unavailable_reason=NULLIF($3,''),claim_token=NULL,lease_expires_at=NULL,revision=revision+1 WHERE id=$1`, item.id, terminalState, reason); updateErr != nil {
+				return updateErr
+			}
+			if _, insertErr := tx.Exec(ctx, `INSERT INTO recording_presentation_v2_release_authorizations(task_id,release_version,node_id,binding_sha256,terminal_state) VALUES($1,1,$2,$3,$4)`, item.id, p.NodeID, item.binding, terminalState); insertErr != nil {
+				return insertErr
+			}
+		}
+		return nil
+	}
+	if err = cleanup(`SELECT id,COALESCE(retention_identity_sha256,staging_identity_sha256) FROM recording_presentation_v2_probe_tasks WHERE account_id=$1 AND node_id=$2 AND initial_disposition='retained' AND state IN('awaiting_retention','pending','leased') AND absolute_deadline_at<=now() ORDER BY absolute_deadline_at,id LIMIT 16 FOR UPDATE SKIP LOCKED`, "expired", "", p.AccountID, p.NodeID); err != nil {
 		return nil, err
 	}
-	var exhausted uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT id,retention_identity_sha256 FROM recording_presentation_v2_probe_tasks WHERE account_id=$1 AND node_id=$2 AND initial_disposition='retained' AND retention_state='active' AND attempt_count>=$3 AND (state='pending' OR (state='leased' AND lease_expires_at<=now())) ORDER BY next_attempt_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`, p.AccountID, p.NodeID, presentationV2MaxAttempts).Scan(&exhausted, &binding)
-	if err == nil {
-		if _, err = tx.Exec(ctx, `UPDATE recording_presentation_v2_probe_tasks SET state='unavailable',retention_state='release_pending',unavailable_reason='probe_unavailable',claim_token=NULL,lease_expires_at=NULL,revision=revision+1 WHERE id=$1`, exhausted); err != nil {
-			return nil, err
-		}
-		if _, err = tx.Exec(ctx, `INSERT INTO recording_presentation_v2_release_authorizations(task_id,release_version,node_id,binding_sha256,terminal_state) VALUES($1,1,$2,$3,'unavailable')`, exhausted, p.NodeID, binding); err != nil {
-			return nil, err
-		}
-		if err = tx.Commit(ctx); err != nil {
-			return nil, err
-		}
-		return nil, nil
-	}
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err = cleanup(`SELECT id,retention_identity_sha256 FROM recording_presentation_v2_probe_tasks WHERE account_id=$1 AND node_id=$2 AND initial_disposition='retained' AND retention_state='active' AND attempt_count>=$3 AND (state='pending' OR (state='leased' AND lease_expires_at<=now())) ORDER BY next_attempt_at,id LIMIT 16 FOR UPDATE SKIP LOCKED`, "unavailable", "probe_unavailable", p.AccountID, p.NodeID, presentationV2MaxAttempts); err != nil {
 		return nil, err
 	}
 	var out presentationV2ClaimedTask
@@ -719,7 +760,10 @@ func (s *Server) handleRecordingPresentationV2ReleaseAck(w http.ResponseWriter, 
 	if _, ok := decodePresentationV2(w, r, 1024, &req); !ok {
 		return
 	}
-	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// The release authorization row and deferred task validator provide the
+	// fence. READ COMMITTED lets concurrent byte-identical ACKs converge after
+	// the first commit instead of turning an idempotent replay into 40001.
+	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		util.WriteError(w, 500, "begin release ack")
 		return

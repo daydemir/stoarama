@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/db"
@@ -124,7 +125,9 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 		 r.stream_url,s.source_url,s.source_page_url,s.provider,s.external_id,s.source_family,s.capture_type,
 		 s.execution_class,$2,'source_copy','first_optional')::text,'UTF8')),'hex'),
 		 s.provider,s.external_id,s.source_family,s.capture_type,s.execution_class,'source_copy','first_optional',
-		 'continuous-source-presentation-edge-v2','presentation-probe-v2',repeat('a',64),now()+interval '14 minutes'
+		 'continuous-source-presentation-edge-v2','presentation-probe-v2',
+		 recording_presentation_v2_tool_identity('8.1','8.1','62','62','60',repeat('b',64),'mov','h264','aac','presentation-probe-v2'),
+		 now()+interval '14 minutes'
 		FROM recordings r JOIN recording_jobs j ON j.recording_id=r.id JOIN streams s ON s.id=r.stream_id JOIN nodes n ON n.id=$3
 		WHERE r.id=$4 AND j.id=$5`, admission, revisionID, nodeID, recordingID, jobID); err != nil {
 		t.Fatal(err)
@@ -142,6 +145,44 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 		t.Fatal(err)
 	}
 	return presentationV2Fixture{accountID: accountID, nodeID: nodeID, recordingID: recordingID, streamID: streamID, jobID: jobID, destinationID: destinationID, admissionID: admission, attemptID: attempt, leaseToken: lease, taskID: task}
+}
+
+func addPresentationV2Task(t *testing.T, pool *pgxpool.Pool, f presentationV2Fixture, sequence int64, mode string) uuid.UUID {
+	t.Helper()
+	if mode != "ready" && mode != "expired" && mode != "exhausted" {
+		t.Fatalf("invalid presentation task fixture mode %q", mode)
+	}
+	ctx := context.Background()
+	intent, task := uuid.New(), uuid.New()
+	var clipID int64
+	name := fmt.Sprintf("extra-%s-%d.mp4", f.taskID.String()[:8], sequence)
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) SELECT $1,$2,$3,id,endpoint,bucket,$4,$4,'video/mp4',4096,'consumed',now()+interval '1 hour' FROM storage_destinations WHERE id=$5`, intent, f.recordingID, f.jobID, name, f.destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,audio_present,fire_at,clip_start_at,clip_end_at,capture_lease_token,capture_sequence) SELECT $1,$2,id,endpoint,bucket,$3,$3,'video/mp4','mp4',1024,'etag',repeat('e',64),60000,'h264',false,now(),now(),now()+interval '1 minute',$4,$5 FROM storage_destinations WHERE id=$6 RETURNING id`, f.recordingID, f.jobID, name, f.leaseToken, sequence, f.destinationID).Scan(&clipID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_presentation_v2_probe_tasks(id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,staging_identity_sha256,staging_method,request_sha256,response_sha256,initial_disposition,state,retention_state,absolute_deadline_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1024,repeat('e',64),repeat('f',64),repeat('1',64),'hardlink',repeat('2',64),encode(sha256(convert_to('task:'||$1::text||':'||$8::text||':awaiting_retention','UTF8')),'hex'),'retained','awaiting_retention','awaiting',CASE WHEN $13 THEN now()-interval '1 minute' ELSE now()+interval '8 minutes' END,CASE WHEN $13 THEN now()-interval '2 minutes' ELSE now() END)`, task, f.admissionID, f.attemptID, f.accountID, f.recordingID, f.streamID, f.jobID, clipID, intent, f.leaseToken, f.nodeID, sequence, mode == "expired"); err != nil {
+		t.Fatal(err)
+	}
+	if mode == "expired" {
+		return task
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_presentation_v2_probe_tasks SET state='pending',retention_state='active',retention_identity_sha256=staging_identity_sha256,retention_method=staging_method,revision=revision+1 WHERE id=$1`, task); err != nil {
+		t.Fatal(err)
+	}
+	if mode == "exhausted" {
+		for i := 0; i < presentationV2MaxAttempts; i++ {
+			token := uuid.New()
+			if _, err := pool.Exec(ctx, `UPDATE recording_presentation_v2_probe_tasks SET state='leased',claim_token=$2,lease_expires_at=now()+interval '1 minute',attempt_count=attempt_count+1,revision=revision+1 WHERE id=$1`, task, token); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE recording_presentation_v2_probe_tasks SET state='pending',claim_token=NULL,lease_expires_at=NULL,revision=revision+1 WHERE id=$1`, task); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return task
 }
 
 func TestRecordingPresentationV2IngestAmbiguousReplayAndUnavailablePostgres(t *testing.T) {
@@ -230,7 +271,8 @@ func TestRecordingPresentationV2CampaignProtectionFencePostgres(t *testing.T) {
 	pool, cleanup := testPresentationV2Pool(t)
 	defer cleanup()
 	f := seedPresentationV2Task(t, pool, 11, 47111)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	var actor, track int64
 	if err := pool.QueryRow(ctx, `INSERT INTO users(email,name,is_operator) VALUES($1,'presentation operator',true) RETURNING id`, fmt.Sprintf("presentation-operator-%d@example.test", time.Now().UnixNano())).Scan(&actor); err != nil {
 		t.Fatal(err)
@@ -241,36 +283,45 @@ func TestRecordingPresentationV2CampaignProtectionFencePostgres(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,repeat('a',64),'primary',1,'protect',ARRAY['test'],now(),now(),now(),repeat('b',64),$4)`, track, f.recordingID, f.streamID, actor); err != nil {
 		t.Fatal(err)
 	}
+	raceJob := f.jobID + 1_000_000
+	raceLease, raceAdmission := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES($1,$2,now(),now(),60,'leased',$3,now()+interval '1 hour',$4,$5,'continuous_window',now()+interval '1 hour')`, raceJob, f.recordingID, fmt.Sprintf("node:%d", f.nodeID), raceLease, fmt.Sprintf("race-admission-%d", time.Now().UnixNano())); err != nil {
+		t.Fatal(err)
+	}
+	insertAdmission := func(tx pgx.Tx, target presentationV2Fixture, admission uuid.UUID, jobID int64, lease uuid.UUID) error {
+		_, insertErr := tx.Exec(ctx, `INSERT INTO recording_presentation_v2_admissions(id,account_id,recording_id,stream_id,recording_job_id,lease_token,node_id,source_revision_id,recording_stream_url_sha256,stream_source_url_sha256,stream_source_page_url_sha256,source_snapshot_sha256,provider,external_id,source_family,capture_type,execution_class,capture_mode,audio_selection,policy_version,parser_schema,capture_tool_identity_sha256,deadline_at)
+		SELECT $1,r.account_id,r.id,r.stream_id,j.id,j.lease_token,n.id,(SELECT max(id) FROM stream_source_revisions WHERE stream_id=s.id),encode(sha256(convert_to(r.stream_url,'UTF8')),'hex'),encode(sha256(convert_to(s.source_url,'UTF8')),'hex'),encode(sha256(convert_to(s.source_page_url,'UTF8')),'hex'),encode(sha256(convert_to(jsonb_build_array(r.account_id,r.id,r.stream_id,j.id,j.lease_token,n.id,r.stream_url,s.source_url,s.source_page_url,s.provider,s.external_id,s.source_family,s.capture_type,s.execution_class,COALESCE((SELECT max(id) FROM stream_source_revisions WHERE stream_id=s.id),0),'source_copy','first_optional')::text,'UTF8')),'hex'),s.provider,s.external_id,s.source_family,s.capture_type,s.execution_class,'source_copy','first_optional','continuous-source-presentation-edge-v2','presentation-probe-v2',recording_presentation_v2_tool_identity('8.1','8.1','62','62','60',repeat('b',64),'mov','h264','aac','presentation-probe-v2'),now()+interval '14 minutes' FROM recordings r JOIN streams s ON s.id=r.stream_id JOIN recording_jobs j ON j.recording_id=r.id JOIN nodes n ON n.id=$2 WHERE r.id=$3 AND j.id=$4`, admission, target.nodeID, target.recordingID, jobID)
+		return insertErr
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	var protected bool
-	if err = tx.QueryRow(ctx, `SELECT lock_recording_campaign_protection($1,$2)`, f.accountID, f.recordingID).Scan(&protected); err != nil || protected {
-		t.Fatalf("pre-protection lock protected=%v err=%v", protected, err)
+	if err = insertAdmission(tx, f, raceAdmission, raceJob, raceLease); err != nil {
+		t.Fatalf("race admission insert: %v", err)
 	}
-	blocked, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = blocked.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = blocked.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['protect'], $2,now())`, track, actor); err == nil || !strings.Contains(err.Error(), "lock timeout") {
-		t.Fatalf("campaign protection mutation did not share admission fence: %v", err)
-	}
-	blocked.Rollback(ctx)
+	protectStarted, protectResult := make(chan struct{}), make(chan error, 1)
+	go func() {
+		close(protectStarted)
+		_, protectErr := pool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['protect'],$2,now())`, track, actor)
+		protectResult <- protectErr
+	}()
+	<-protectStarted
 	if err = tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['protect'],$2,now())`, track, actor); err != nil {
-		t.Fatalf("protection transition after admission lock: %v", err)
+	if err = <-protectResult; err != nil {
+		t.Fatalf("protection transition after actual admission commit: %v", err)
+	}
+	var admissionCount int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM recording_presentation_v2_admissions WHERE id=$1`, raceAdmission).Scan(&admissionCount); err != nil || admissionCount != 1 {
+		t.Fatalf("admission-first race count=%d err=%v", admissionCount, err)
 	}
 	if _, err = pool.Exec(ctx, `
 		WITH fresh AS (SELECT gen_random_uuid() id)
 		INSERT INTO recording_presentation_v2_attempts(id,admission_id,account_id,recording_id,stream_id,recording_job_id,lease_token,node_id,idempotency_key,ffmpeg_version,ffprobe_version,libavformat_version,libavcodec_version,libavutil_version,build_flags_sha256,demuxer_name,video_decoder_name,audio_decoder_name,parser_schema,request_sha256,response_sha256)
-		SELECT fresh.id,admission_id,account_id,recording_id,stream_id,recording_job_id,lease_token,node_id,'protected-late','8.1','8.1','62','62','60',repeat('c',64),'mov','h264','aac','presentation-probe-v2',repeat('d',64),encode(sha256(convert_to('attempt:'||fresh.id::text,'UTF8')),'hex')
+		SELECT fresh.id,admission_id,account_id,recording_id,stream_id,recording_job_id,lease_token,node_id,'protected-late','8.1','8.1','62','62','60',repeat('b',64),'mov','h264','aac','presentation-probe-v2',repeat('d',64),encode(sha256(convert_to('attempt:'||fresh.id::text,'UTF8')),'hex')
 		FROM recording_presentation_v2_attempts CROSS JOIN fresh WHERE admission_id=$1 LIMIT 1`, f.admissionID); err == nil {
 		t.Fatal("attempt admitted after recording became campaign protected")
 	}
@@ -280,6 +331,55 @@ func TestRecordingPresentationV2CampaignProtectionFencePostgres(t *testing.T) {
 		SELECT fresh.id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,staging_identity_sha256,staging_method,request_sha256,encode(sha256(convert_to('task:'||fresh.id::text||':'||clip_id::text||':'||state,'UTF8')),'hex'),initial_disposition,state,retention_state,unavailable_reason,retention_identity_sha256,retention_method,revision,attempt_count,claim_token,terminal_claim_token,lease_expires_at,next_attempt_at,absolute_deadline_at,created_at,updated_at
 		FROM recording_presentation_v2_probe_tasks CROSS JOIN fresh WHERE recording_presentation_v2_probe_tasks.id=$1`, f.taskID); err == nil {
 		t.Fatal("ingest task admitted after recording became campaign protected")
+	}
+
+	// Opposite commit order: protection becomes authoritative first, so an
+	// actual later admission insert must fail closed.
+	protectedFirst := seedPresentationV2Task(t, pool, 12, 47112)
+	var protectedTrack int64
+	if err = pool.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id) VALUES($1,$2,'presentation fence protected first',now()+interval '1 day',1,'GOOD',0,$3) RETURNING id`, protectedFirst.accountID, fmt.Sprintf("presentation-fence-first-%d", time.Now().UnixNano()), actor).Scan(&protectedTrack); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,repeat('c',64),'primary',1,'protect',ARRAY['test'],now(),now(),now(),repeat('d',64),$4)`, protectedTrack, protectedFirst.recordingID, protectedFirst.streamID, actor); err != nil {
+		t.Fatal(err)
+	}
+	protectTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer protectTx.Rollback(ctx)
+	if _, err = protectTx.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['protect'],$2,now())`, protectedTrack, actor); err != nil {
+		t.Fatal(err)
+	}
+	protectedJob := protectedFirst.jobID + 1_000_000
+	protectedLease := uuid.New()
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES($1,$2,now(),now(),60,'leased',$3,now()+interval '1 hour',$4,$5,'continuous_window',now()+interval '1 hour')`, protectedJob, protectedFirst.recordingID, fmt.Sprintf("node:%d", protectedFirst.nodeID), protectedLease, fmt.Sprintf("protected-first-%d", time.Now().UnixNano())); err != nil {
+		t.Fatal(err)
+	}
+	lateStarted, lateResult := make(chan struct{}), make(chan error, 1)
+	go func() {
+		lateTx, beginErr := pool.Begin(ctx)
+		if beginErr != nil {
+			lateResult <- beginErr
+			return
+		}
+		defer lateTx.Rollback(ctx)
+		close(lateStarted)
+		insertErr := insertAdmission(lateTx, protectedFirst, uuid.New(), protectedJob, protectedLease)
+		if insertErr == nil {
+			insertErr = lateTx.Commit(ctx)
+		}
+		lateResult <- insertErr
+	}()
+	<-lateStarted
+	if err = protectTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-lateResult; err == nil {
+		t.Fatal("admission committed after campaign protection won race")
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM recording_presentation_v2_admissions WHERE recording_job_id=$1`, protectedJob).Scan(&admissionCount); err != nil || admissionCount != 0 {
+		t.Fatalf("protection-first race admission count=%d err=%v", admissionCount, err)
 	}
 }
 
@@ -335,7 +435,29 @@ func TestRecordingPresentationV2DisabledClaimAndFencedLifecyclePostgres(t *testi
 	attemptBody := presentationV2AttemptRequest{
 		AdmissionID: first.admissionID.String(), IdempotencyKey: "ambiguous-attempt",
 		FFmpegVersion: "8.1", FFprobeVersion: "8.1", Libavformat: "62", Libavcodec: "62", Libavutil: "60",
-		BuildFlagsSHA256: strings.Repeat("4", 64), Demuxer: "mov", VideoDecoder: "h264", AudioDecoder: "aac", ParserSchema: "presentation-probe-v2",
+		BuildFlagsSHA256: strings.Repeat("b", 64), Demuxer: "mov", VideoDecoder: "h264", AudioDecoder: "aac", ParserSchema: "presentation-probe-v2",
+	}
+	var databaseToolIdentity string
+	if err := pool.QueryRow(context.Background(), `SELECT recording_presentation_v2_tool_identity($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		attemptBody.FFmpegVersion, attemptBody.FFprobeVersion, attemptBody.Libavformat, attemptBody.Libavcodec,
+		attemptBody.Libavutil, attemptBody.BuildFlagsSHA256, attemptBody.Demuxer, attemptBody.VideoDecoder,
+		attemptBody.AudioDecoder, attemptBody.ParserSchema).Scan(&databaseToolIdentity); err != nil {
+		t.Fatal(err)
+	}
+	if applicationToolIdentity := presentationV2ToolIdentity(attemptBody); applicationToolIdentity != databaseToolIdentity {
+		t.Fatalf("semantic tool identity differs application=%s database=%s", applicationToolIdentity, databaseToolIdentity)
+	}
+	unicodeTool := attemptBody
+	unicodeTool.FFmpegVersion = "FFmpeg 8.1 猫\n"
+	unicodeTool.FFprobeVersion = "<8.1>&"
+	if err := pool.QueryRow(context.Background(), `SELECT recording_presentation_v2_tool_identity($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		unicodeTool.FFmpegVersion, unicodeTool.FFprobeVersion, unicodeTool.Libavformat, unicodeTool.Libavcodec,
+		unicodeTool.Libavutil, unicodeTool.BuildFlagsSHA256, unicodeTool.Demuxer, unicodeTool.VideoDecoder,
+		unicodeTool.AudioDecoder, unicodeTool.ParserSchema).Scan(&databaseToolIdentity); err != nil {
+		t.Fatal(err)
+	}
+	if applicationToolIdentity := presentationV2ToolIdentity(unicodeTool); applicationToolIdentity != databaseToolIdentity {
+		t.Fatalf("unicode semantic tool identity differs application=%s database=%s", applicationToolIdentity, databaseToolIdentity)
 	}
 	rec := httptest.NewRecorder()
 	s.handleRecordingPresentationV2Attempt(rec, presentationAttemptRequest(first, attemptBody))
@@ -360,6 +482,16 @@ func TestRecordingPresentationV2DisabledClaimAndFencedLifecyclePostgres(t *testi
 	s.handleRecordingPresentationV2Attempt(rec, presentationAttemptRequest(first, attemptBody))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("different attempt replay status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	attemptBody.IdempotencyKey = "different-tool-new-key"
+	rec = httptest.NewRecorder()
+	s.handleRecordingPresentationV2Attempt(rec, presentationAttemptRequest(first, attemptBody))
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "semantic tool identity") {
+		t.Fatalf("unadmitted semantic tool status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	forgedAttempt := uuid.New()
+	if _, err := pool.Exec(context.Background(), `INSERT INTO recording_presentation_v2_attempts(id,admission_id,account_id,recording_id,stream_id,recording_job_id,lease_token,node_id,idempotency_key,ffmpeg_version,ffprobe_version,libavformat_version,libavcodec_version,libavutil_version,build_flags_sha256,demuxer_name,video_decoder_name,audio_decoder_name,parser_schema,request_sha256,response_sha256) SELECT $1,admission_id,account_id,recording_id,stream_id,recording_job_id,lease_token,node_id,'direct-forged-tool','forged',ffprobe_version,libavformat_version,libavcodec_version,libavutil_version,build_flags_sha256,demuxer_name,video_decoder_name,audio_decoder_name,parser_schema,repeat('a',64),encode(sha256(convert_to('attempt:'||$1::text,'UTF8')),'hex') FROM recording_presentation_v2_attempts WHERE admission_id=$2 LIMIT 1`, forgedAttempt, first.admissionID); err == nil {
+		t.Fatal("direct SQL forged semantic tool identity was accepted")
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/presentation-probes/claim", nil)
@@ -408,10 +540,25 @@ func TestRecordingPresentationV2DisabledClaimAndFencedLifecyclePostgres(t *testi
 	if err := pool.QueryRow(context.Background(), `SELECT binding_sha256 FROM recording_presentation_v2_release_authorizations WHERE task_id=$1`, first.taskID).Scan(&binding); err != nil {
 		t.Fatal(err)
 	}
-	rec = httptest.NewRecorder()
-	s.handleRecordingPresentationV2ReleaseAck(rec, presentationTaskRequest(first.taskID, map[string]any{"release_version": 1, "binding_sha256": binding}, principal))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("release ack status=%d body=%s", rec.Code, rec.Body.String())
+	if _, err := pool.Exec(context.Background(), `INSERT INTO recording_presentation_v2_release_acknowledgements(task_id,release_version,node_id,binding_sha256) VALUES($1,1,$2,$3)`, first.taskID, first.nodeID, binding); err == nil {
+		t.Fatal("direct release acknowledgement without released state committed")
+	}
+	ackStart := make(chan struct{})
+	ackResults := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() {
+			<-ackStart
+			out := httptest.NewRecorder()
+			s.handleRecordingPresentationV2ReleaseAck(out, presentationTaskRequest(first.taskID, map[string]any{"release_version": 1, "binding_sha256": binding}, principal))
+			ackResults <- out
+		}()
+	}
+	close(ackStart)
+	for range 2 {
+		out := <-ackResults
+		if out.Code != http.StatusOK {
+			t.Fatalf("concurrent release ack status=%d body=%s", out.Code, out.Body.String())
+		}
 	}
 	if _, err := pool.Exec(context.Background(), `UPDATE recording_presentation_v2_authored_facts SET authored_status='partial' WHERE task_id=$1`, first.taskID); err == nil {
 		t.Fatal("append-only fact update succeeded")
@@ -492,5 +639,59 @@ func TestRecordingPresentationV2DisabledClaimAndFencedLifecyclePostgres(t *testi
 	s.handleRecordingPresentationV2Complete(rec, presentationTaskRequest(third.taskID, completeBody, thirdPrincipal))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("typed complete fact status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRecordingPresentationV2ClaimSkipsStaleBacklogAndFencesConcurrentCallersPostgres(t *testing.T) {
+	pool, cleanup := testPresentationV2Pool(t)
+	defer cleanup()
+	f := seedPresentationV2Task(t, pool, 31, 47331)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE recording_presentation_v2_probe_tasks SET state='pending',retention_state='active',retention_identity_sha256=staging_identity_sha256,retention_method=staging_method,revision=revision+1 WHERE id=$1`, f.taskID); err != nil {
+		t.Fatal(err)
+	}
+	for sequence := int64(2); sequence <= 11; sequence++ {
+		addPresentationV2Task(t, pool, f, sequence, "expired")
+	}
+	for sequence := int64(12); sequence <= 21; sequence++ {
+		addPresentationV2Task(t, pool, f, sequence, "exhausted")
+	}
+	s := &Server{pool: pool}
+	principal := nodePrincipal{NodeID: f.nodeID, AccountID: f.accountID, NodeType: nodeTypeRelay}
+	claimed, err := s.claimRecordingPresentationV2(ctx, principal)
+	if err != nil || claimed == nil || claimed.ID != f.taskID {
+		t.Fatalf("eligible task starved behind stale backlog: claimed=%+v err=%v", claimed, err)
+	}
+	var expiredReleases, exhaustedReleases int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE terminal_state='expired'),count(*) FILTER(WHERE terminal_state='unavailable') FROM recording_presentation_v2_release_authorizations WHERE node_id=$1`, f.nodeID).Scan(&expiredReleases, &exhaustedReleases); err != nil || expiredReleases != 10 || exhaustedReleases != 10 {
+		t.Fatalf("bounded stale cleanup expired=%d exhausted=%d err=%v", expiredReleases, exhaustedReleases, err)
+	}
+
+	concurrentA := addPresentationV2Task(t, pool, f, 22, "ready")
+	concurrentB := addPresentationV2Task(t, pool, f, 23, "ready")
+	type result struct {
+		task *presentationV2ClaimedTask
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			task, claimErr := s.claimRecordingPresentationV2(ctx, principal)
+			results <- result{task: task, err: claimErr}
+		}()
+	}
+	close(start)
+	got := map[uuid.UUID]bool{}
+	for range 2 {
+		result := <-results
+		if result.err != nil || result.task == nil {
+			t.Fatalf("concurrent claim result=%+v err=%v", result.task, result.err)
+		}
+		got[result.task.ID] = true
+	}
+	if !got[concurrentA] || !got[concurrentB] || len(got) != 2 {
+		t.Fatalf("concurrent claim ids=%v want %s,%s", got, concurrentA, concurrentB)
 	}
 }

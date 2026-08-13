@@ -62,6 +62,27 @@ CREATE TRIGGER recording_campaign_track_presentation_fence
 BEFORE UPDATE ON recording_campaign_tracks FOR EACH ROW
 EXECUTE FUNCTION fence_recording_campaign_track_protection();
 
+-- Cross-language semantic-tool identity v2. Every field is UTF-8 encoded as
+-- its decimal octet length, a colon, its exact bytes, and a newline. The
+-- domain tag prevents reuse by another digest contract.
+CREATE FUNCTION recording_presentation_v2_tool_identity(
+  p_ffmpeg TEXT,p_ffprobe TEXT,p_avformat TEXT,p_avcodec TEXT,p_avutil TEXT,
+  p_build_sha TEXT,p_demuxer TEXT,p_video_decoder TEXT,p_audio_decoder TEXT,p_parser TEXT)
+RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT AS $$
+  SELECT encode(sha256(convert_to(
+    'presentation-semantic-tool-v2'||chr(10)||
+    octet_length(p_ffmpeg)::text||':'||p_ffmpeg||chr(10)||
+    octet_length(p_ffprobe)::text||':'||p_ffprobe||chr(10)||
+    octet_length(p_avformat)::text||':'||p_avformat||chr(10)||
+    octet_length(p_avcodec)::text||':'||p_avcodec||chr(10)||
+    octet_length(p_avutil)::text||':'||p_avutil||chr(10)||
+    octet_length(p_build_sha)::text||':'||p_build_sha||chr(10)||
+    octet_length(p_demuxer)::text||':'||p_demuxer||chr(10)||
+    octet_length(p_video_decoder)::text||':'||p_video_decoder||chr(10)||
+    octet_length(p_audio_decoder)::text||':'||p_audio_decoder||chr(10)||
+    octet_length(p_parser)::text||':'||p_parser||chr(10),'UTF8')),'hex')
+$$;
+
 CREATE TABLE recording_presentation_v2_admissions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
@@ -187,6 +208,13 @@ BEGIN
   END IF;
   IF NEW.response_sha256 IS DISTINCT FROM encode(sha256(convert_to('attempt:'||NEW.id::text,'UTF8')),'hex') THEN
     RAISE EXCEPTION 'presentation attempt response binding mismatch';
+  END IF;
+  IF NEW.build_flags_sha256 IS DISTINCT FROM lower(NEW.build_flags_sha256)
+     OR a.capture_tool_identity_sha256 IS DISTINCT FROM recording_presentation_v2_tool_identity(
+       NEW.ffmpeg_version,NEW.ffprobe_version,NEW.libavformat_version,NEW.libavcodec_version,
+       NEW.libavutil_version,NEW.build_flags_sha256,NEW.demuxer_name,NEW.video_decoder_name,
+       COALESCE(NEW.audio_decoder_name,''),NEW.parser_schema) THEN
+    RAISE EXCEPTION 'presentation attempt semantic tool identity mismatch';
   END IF;
   IF lock_recording_campaign_protection(NEW.account_id,NEW.recording_id) THEN
     RAISE EXCEPTION 'campaign-protected recording cannot start presentation attempt';
@@ -736,7 +764,9 @@ BEGIN
   IF t.initial_disposition='unavailable' AND (auth_count<>0 OR fact_count<>0) THEN RAISE EXCEPTION 'initial unavailable task cannot have release or fact'; END IF;
   IF t.state='completed' AND fact_count<>1 THEN RAISE EXCEPTION 'completed presentation task requires exact fact'; END IF;
   IF t.initial_disposition='retained' AND t.state IN('completed','expired','unavailable') AND auth_count<>1 THEN RAISE EXCEPTION 'retained terminal task requires release authorization'; END IF;
-  IF t.retention_state='released' AND ack_count<>1 THEN RAISE EXCEPTION 'released task requires acknowledgement'; END IF;
+  IF (t.retention_state='released') IS DISTINCT FROM (ack_count=1) THEN
+    RAISE EXCEPTION 'presentation release state and acknowledgement must be atomic';
+  END IF;
   RETURN NULL;
 END $$;
 CREATE CONSTRAINT TRIGGER recording_presentation_v2_task_terminal_validate AFTER INSERT OR UPDATE ON recording_presentation_v2_probe_tasks DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_presentation_v2_task_terminal();
