@@ -12,6 +12,7 @@ import (
 )
 
 var expectedKernelFirewallRules = []string{
+	"v4|-P OUTPUT ACCEPT",
 	"v4|-A OUTPUT -j STOARAMA_EGRESS",
 	"v4|-A STOARAMA_EGRESS -d 10.0.0.0/8 -j REJECT",
 	"v4|-A STOARAMA_EGRESS -d 100.64.0.0/10 -j REJECT",
@@ -25,6 +26,7 @@ var expectedKernelFirewallRules = []string{
 	"v4|-A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN",
 	"v4|-N STOARAMA_EGRESS",
 	"v6|-A OUTPUT -j STOARAMA_EGRESS",
+	"v6|-P OUTPUT ACCEPT",
 	"v6|-A STOARAMA_EGRESS -d ::1/128 -j REJECT",
 	"v6|-A STOARAMA_EGRESS -d ::1/128 -p tcp -m tcp --dport 53 -j RETURN",
 	"v6|-A STOARAMA_EGRESS -d ::1/128 -p udp -m udp --dport 53 -j RETURN",
@@ -208,7 +210,26 @@ func DeriveKernelFirewallPolicy(v4, v6 []byte) (string, error) {
 		if strings.ContainsRune(string(input.body), '\x00') || strings.ContainsRune(string(input.body), '\r') {
 			return "", fmt.Errorf("kernel firewall output is not canonical ASCII")
 		}
+		outputHookSeen := false
+		outputPolicySeen := false
 		for _, line := range strings.Split(strings.TrimSuffix(string(input.body), "\n"), "\n") {
+			if line == "-P OUTPUT ACCEPT" {
+				if outputPolicySeen {
+					return "", fmt.Errorf("kernel OUTPUT default policy is duplicated")
+				}
+				outputPolicySeen = true
+				actual = append(actual, input.family+"|"+line)
+				continue
+			}
+			if strings.HasPrefix(line, "-P OUTPUT ") {
+				return "", fmt.Errorf("kernel OUTPUT default policy differs from contract")
+			}
+			if strings.HasPrefix(line, "-A OUTPUT ") {
+				if outputHookSeen || line != "-A OUTPUT -j STOARAMA_EGRESS" {
+					return "", fmt.Errorf("kernel OUTPUT hook is not the first and only output rule")
+				}
+				outputHookSeen = true
+			}
 			if !strings.Contains(line, "STOARAMA_EGRESS") {
 				continue
 			}
@@ -221,6 +242,9 @@ func DeriveKernelFirewallPolicy(v4, v6 []byte) (string, error) {
 				}
 			}
 			actual = append(actual, input.family+"|"+strings.Join(fields, " "))
+		}
+		if !outputPolicySeen || !outputHookSeen {
+			return "", fmt.Errorf("kernel OUTPUT policy/hook is absent")
 		}
 	}
 	sort.Strings(actual)
