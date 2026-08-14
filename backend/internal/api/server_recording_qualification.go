@@ -33,6 +33,8 @@ func invalidQualification(format string, args ...any) error {
 
 type sceneAttestRequest struct {
 	RecordingID   int64  `json:"recording_id"`
+	StreamID      int64  `json:"stream_id"`
+	AuthorityCode string `json:"authority_code"`
 	FrameID       int64  `json:"frame_id"`
 	SceneIdentity string `json:"scene_identity"`
 }
@@ -76,20 +78,34 @@ func (s *Server) handleAccountRecordingSceneAttest(w http.ResponseWriter, r *htt
 		return
 	}
 	identity, err := normalizeSceneIdentity(req.SceneIdentity)
-	if err != nil || req.RecordingID <= 0 || req.FrameID <= 0 {
-		util.WriteError(w, http.StatusBadRequest, "recording_id, frame_id, and valid scene_identity are required")
+	if err != nil || req.FrameID <= 0 || (req.RecordingID <= 0) == (req.StreamID <= 0) {
+		util.WriteError(w, http.StatusBadRequest, "exactly one of recording_id or stream_id, plus frame_id and valid scene_identity, is required")
 		return
+	}
+	if req.StreamID > 0 {
+		req.AuthorityCode = strings.TrimSpace(req.AuthorityCode)
+		if principal.SessionID == nil || principal.Role != accountRoleAdmin || !strings.EqualFold(strings.TrimSpace(principal.Email), strings.TrimSpace(s.cfg.DropletPoolOperatorEmail)) {
+			util.WriteError(w, http.StatusForbidden, "candidate scene attestation requires the exact operator browser session")
+			return
+		}
+		var permitted bool
+		if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_campaign_authority_decisions WHERE code=$1 AND $2=ANY(permitted_stream_ids))`, req.AuthorityCode, req.StreamID).Scan(&permitted); err != nil || !permitted {
+			util.WriteError(w, http.StatusConflict, "candidate stream is not covered by an immutable Deniz authority decision")
+			return
+		}
 	}
 	sceneHash := sha256Hex([]byte("stoarama-scene-identity-v1\n" + identity))
 	var evidenceID int64
 	var evidenceHash string
 	err = s.pool.QueryRow(r.Context(), `
-		WITH authoritative AS (
-		 SELECT rec.stream_id,f.raw_media_object_id,f.captured_at,lower(m.sha256) frame_sha
-		 FROM recordings rec JOIN frames f ON f.id=$3 AND f.stream_id=rec.stream_id
+		WITH selected_stream AS (
+		 SELECT rec.stream_id FROM recordings rec WHERE $2>0 AND rec.id=$2 AND rec.account_id=$1 AND rec.status IN('active','completed')
+		 UNION ALL SELECT s.id FROM streams s WHERE $6>0 AND s.id=$6 AND s.deleted_at IS NULL
+	), authoritative AS (
+		 SELECT selected_stream.stream_id,f.raw_media_object_id,f.captured_at,lower(m.sha256) frame_sha
+		 FROM selected_stream JOIN frames f ON f.id=$3 AND f.stream_id=selected_stream.stream_id
 		 JOIN media_objects m ON m.id=f.raw_media_object_id
-		 WHERE rec.id=$2 AND rec.account_id=$1 AND rec.status='active'
-		   AND f.capture_status='success' AND f.captured_at>=now()-interval '24 hours'
+		 WHERE f.capture_status='success' AND f.captured_at BETWEEN transaction_timestamp()-interval '6 hours' AND transaction_timestamp()
 	), inserted AS (
 		 INSERT INTO recording_scene_frame_evidence(account_id,stream_id,frame_id,media_object_id,captured_at,frame_sha256,scene_identity_sha256,verification_method,verified_by_user_id)
 		 SELECT $1,stream_id,$3,raw_media_object_id,captured_at,frame_sha,$4,'operator_visual',$5 FROM authoritative
@@ -100,17 +116,17 @@ func (s *Server) handleAccountRecordingSceneAttest(w http.ResponseWriter, r *htt
 	SELECT e.id,e.evidence_sha256 FROM recording_scene_frame_evidence e
 	WHERE e.account_id=$1 AND e.frame_id=$3 AND e.scene_identity_sha256=$4 AND e.verified_by_user_id=$5
 	LIMIT 1
-	`, principal.AccountID, req.RecordingID, req.FrameID, sceneHash, principal.UserID).Scan(&evidenceID, &evidenceHash)
+	`, principal.AccountID, req.RecordingID, req.FrameID, sceneHash, principal.UserID, req.StreamID).Scan(&evidenceID, &evidenceHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "frame is not a current authoritative successful frame, or it was attested differently")
 		return
 	}
 	if err != nil {
-		log.Printf("scene attestation failed account_id=%d recording_id=%d: %v", principal.AccountID, req.RecordingID, err)
+		log.Printf("scene attestation failed account_id=%d recording_id=%d stream_id=%d: %v", principal.AccountID, req.RecordingID, req.StreamID, err)
 		util.WriteError(w, http.StatusInternalServerError, "store scene attestation")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": req.RecordingID, "frame_id": req.FrameID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": req.RecordingID, "stream_id": req.StreamID, "frame_id": req.FrameID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
 }
 
 type qualificationBuildRequest struct {

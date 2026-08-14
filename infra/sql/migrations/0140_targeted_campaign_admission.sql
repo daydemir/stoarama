@@ -1,4 +1,33 @@
--- Exact, operator-authorized campaign admission. This migration reserves an
+-- Exact, user-authorized campaign admission. The reviewed decision rows below
+-- are migration-owned: an operator session may execute a decision, but cannot
+-- invent or widen Deniz's approved stream set.
+CREATE TABLE recording_campaign_authority_decisions (
+  code TEXT PRIMARY KEY,
+  authority_principal_snapshot TEXT NOT NULL,
+  authority_source_snapshot TEXT NOT NULL,
+  approved_at TIMESTAMPTZ NOT NULL,
+  failure_domain_tag TEXT,
+  permitted_stream_ids BIGINT[] NOT NULL,
+  subset_allowed BOOLEAN NOT NULL,
+  min_entries INTEGER NOT NULL,
+  max_entries INTEGER NOT NULL,
+  decision_sha256 TEXT NOT NULL CHECK(decision_sha256~'^[0-9a-f]{64}$'),
+  CHECK(cardinality(permitted_stream_ids)>0 AND min_entries>0 AND max_entries>=min_entries AND max_entries<=cardinality(permitted_stream_ids)),
+  CHECK((subset_allowed AND min_entries<=max_entries) OR (NOT subset_allowed AND min_entries=max_entries AND max_entries=cardinality(permitted_stream_ids)))
+);
+
+INSERT INTO recording_campaign_authority_decisions(
+  code,authority_principal_snapshot,authority_source_snapshot,approved_at,
+  failure_domain_tag,permitted_stream_ids,subset_allowed,min_entries,max_entries,decision_sha256
+) VALUES
+  ('deniz_fd_restore_20260814','Deniz','explicit user instruction in the 2026-08-14 campaign operations thread',
+   TIMESTAMPTZ '2026-08-14 00:00:00+00','FD',ARRAY[78,94,158,175,178,179,182,195,293,295,415,469,487,2666,2667,2674,2675,2676,2677,2678,2680,2681,2693,2708,2713,2717,2718,2720,2726,2740,2747,2757,2963,2964,2965,2971,2973,2975,2994,2996,2997,3001,3002,3006,3007,3018,3021,3022,3023,3025,3027,3039,3040,3049,12672,12725,14303,14478,14554,14782,17186,17216,17219,17233,17234,17235,17237,17238,17239,17240,17241,17242,17243,17244,17245,17246,17247,17248,17249,17342,17343,17344,17345]::bigint[],true,1,83,
+   'd3c5f257acc5e79cfd8ba50a011fbaf0b7430ab3b7fd530946f32e44e90251f1'),
+  ('deniz_scene_approval_20260814','Deniz','explicit user instruction in the 2026-08-14 campaign operations thread',
+   TIMESTAMPTZ '2026-08-14 00:00:00+00',NULL,ARRAY[16843,17200,17223]::bigint[],false,3,3,
+   encode(sha256(convert_to('deniz_scene_approval_20260814|Deniz|2026-08-14|none|16843,17200,17223|exact:3','UTF8')),'hex'));
+
+-- This migration reserves an approved physical scene before probes begin,
 -- approved physical scene before probes begin, accepts evidence only from a
 -- fresh authenticated managed DO recorder, and seals scheduling + roster
 -- protection in one transaction.
@@ -8,11 +37,12 @@ CREATE TABLE recording_campaign_admission_approvals (
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   actor_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   actor_email_snapshot TEXT NOT NULL,
-  authority_code TEXT NOT NULL CHECK(authority_code IN('deniz_fd_restore_20260814','deniz_scene_approval_20260814')),
+  authority_code TEXT NOT NULL REFERENCES recording_campaign_authority_decisions(code) ON DELETE RESTRICT,
   failure_domain_tag TEXT,
   deadline_at TIMESTAMPTZ NOT NULL,
   entries JSONB NOT NULL CHECK(jsonb_typeof(entries)='array' AND jsonb_array_length(entries) BETWEEN 1 AND 32),
   schedule_spec JSONB NOT NULL CHECK(jsonb_typeof(schedule_spec)='object'),
+  request_sha256 TEXT NOT NULL CHECK(request_sha256~'^[0-9a-f]{64}$'),
   schedule_sha256 TEXT NOT NULL CHECK(schedule_sha256~'^[0-9a-f]{64}$'),
   approval_sha256 TEXT NOT NULL CHECK(approval_sha256~'^[0-9a-f]{64}$'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
@@ -58,15 +88,71 @@ CREATE TABLE recording_campaign_admission_source_fence_events (
 );
 CREATE INDEX recording_campaign_admission_source_fence_stream ON recording_campaign_admission_source_fence_events(stream_id,occurred_at);
 
+CREATE TABLE recording_targeted_probe_orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id UUID NOT NULL,
+  approval_id UUID NOT NULL REFERENCES recording_campaign_admission_approvals(id) ON DELETE RESTRICT,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  stream_id BIGINT NOT NULL REFERENCES streams(id) ON DELETE RESTRICT,
+  requested_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  desired_attempts INTEGER NOT NULL DEFAULT 2 CHECK(desired_attempts=2),
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  UNIQUE(account_id,request_id),
+  UNIQUE(approval_id,stream_id)
+);
+
+CREATE TABLE recording_targeted_provider_attestations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+  recorder_droplet_id BIGINT NOT NULL REFERENCES recorder_droplets(id) ON DELETE RESTRICT,
+  do_droplet_id BIGINT NOT NULL,
+  project_id_sha256 TEXT NOT NULL CHECK(project_id_sha256~'^[0-9a-f]{64}$'),
+  firewall_id_sha256 TEXT NOT NULL CHECK(firewall_id_sha256~'^[0-9a-f]{64}$'),
+  region TEXT NOT NULL,
+  build_sha TEXT NOT NULL CHECK(build_sha~'^[0-9a-f]{40}$'),
+  observed_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  attestation_sha256 TEXT NOT NULL CHECK(attestation_sha256~'^[0-9a-f]{64}$'),
+  UNIQUE(node_id,observed_at)
+);
+
+CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_order()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; bound BOOLEAN;
+BEGIN
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''queue'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s)
+    INTO authorized USING NEW.approval_id,NEW.account_id,NEW.requested_by_user_id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_approvals a JOIN %I.recording_campaign_admission_reservations r ON r.approval_id=a.id WHERE a.id=$1 AND a.account_id=$2 AND a.deadline_at>transaction_timestamp() AND r.stream_id=$3)',s,s)
+    INTO bound USING NEW.approval_id,NEW.account_id,NEW.stream_id;
+  IF authorized IS DISTINCT FROM true OR bound IS DISTINCT FROM true OR NEW.requested_at IS DISTINCT FROM transaction_timestamp() THEN
+    RAISE EXCEPTION 'targeted probe order requires an exact live approval and typed operator authorization';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_targeted_probe_order_validate BEFORE INSERT ON recording_targeted_probe_orders FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_order();
+
+CREATE OR REPLACE FUNCTION validate_recording_targeted_provider_attestation()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE expected TEXT;
+BEGIN
+  expected:=encode(sha256(convert_to(jsonb_build_object('node_id',NEW.node_id,'recorder_droplet_id',NEW.recorder_droplet_id,'do_droplet_id',NEW.do_droplet_id,'project_id_sha256',NEW.project_id_sha256,'firewall_id_sha256',NEW.firewall_id_sha256,'region',NEW.region,'build_sha',NEW.build_sha,'observed_at_epoch',extract(epoch from NEW.observed_at))::text,'UTF8')),'hex');
+  IF NEW.observed_at IS DISTINCT FROM transaction_timestamp() OR NEW.attestation_sha256<>expected THEN
+    RAISE EXCEPTION 'managed DO provider attestation must be exact and database-timed';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_targeted_provider_attestation_validate BEFORE INSERT ON recording_targeted_provider_attestations FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_provider_attestation();
+
 CREATE TABLE recording_targeted_probe_attempts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   request_id UUID NOT NULL,
+  order_id UUID NOT NULL REFERENCES recording_targeted_probe_orders(id) ON DELETE RESTRICT,
   approval_id UUID NOT NULL REFERENCES recording_campaign_admission_approvals(id) ON DELETE RESTRICT,
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   stream_id BIGINT NOT NULL REFERENCES streams(id) ON DELETE RESTRICT,
   attempt_no INTEGER NOT NULL CHECK(attempt_no BETWEEN 1 AND 8),
   node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
   recorder_droplet_id BIGINT NOT NULL REFERENCES recorder_droplets(id) ON DELETE RESTRICT,
+  provider_attestation_id UUID NOT NULL REFERENCES recording_targeted_provider_attestations(id) ON DELETE RESTRICT,
   do_droplet_id BIGINT NOT NULL,
   region TEXT NOT NULL,
   probe_build_sha TEXT NOT NULL CHECK(probe_build_sha~'^[0-9a-f]{40}$'),
@@ -75,6 +161,10 @@ CREATE TABLE recording_targeted_probe_attempts (
   source_page_url_sha256 TEXT NOT NULL CHECK(source_page_url_sha256~'^[0-9a-f]{64}$'),
   source_updated_at TIMESTAMPTZ NOT NULL,
   challenge TEXT NOT NULL CHECK(challenge~'^[0-9a-f]{64}$'),
+  media_object_key TEXT NOT NULL UNIQUE CHECK(media_object_key~'^quarantine/campaign-probe/[0-9a-f-]{36}/media\.zip$'),
+  frame_object_key TEXT NOT NULL UNIQUE CHECK(frame_object_key~'^quarantine/campaign-probe/[0-9a-f-]{36}/frame\.jpg$'),
+  media_max_size_bytes BIGINT NOT NULL CHECK(media_max_size_bytes BETWEEN 1 AND 134217728),
+  frame_max_size_bytes BIGINT NOT NULL CHECK(frame_max_size_bytes BETWEEN 1 AND 8388608),
   started_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
   expires_at TIMESTAMPTZ NOT NULL,
   UNIQUE(account_id,request_id),
@@ -102,13 +192,38 @@ CREATE TABLE recording_targeted_probe_evidence (
   video_width INTEGER,
   video_height INTEGER,
   actual_fps DOUBLE PRECISION,
+  media_size_bytes BIGINT CHECK(media_size_bytes IS NULL OR media_size_bytes BETWEEN 1 AND 134217728),
+  media_etag TEXT CHECK(media_etag IS NULL OR length(media_etag) BETWEEN 1 AND 256),
+  media_version_id TEXT CHECK(media_version_id IS NULL OR length(media_version_id) BETWEEN 1 AND 512),
+  frame_size_bytes BIGINT CHECK(frame_size_bytes IS NULL OR frame_size_bytes BETWEEN 1 AND 8388608),
+  frame_etag TEXT CHECK(frame_etag IS NULL OR length(frame_etag) BETWEEN 1 AND 256),
+  frame_version_id TEXT CHECK(frame_version_id IS NULL OR length(frame_version_id) BETWEEN 1 AND 512),
   detail TEXT NOT NULL CHECK(length(detail)<=1024 AND detail~'^(resolve_failed|image_source|ssrf_guard_rejected|temporary_storage_unavailable|parent_context_cancelled|valid_ratio=[0-9]+\.[0-9]{3} segments=[0-9]+ native_signature_stable=(true|false) frame=(true|false)( capture_exit=(network_cut|source_down|other))?)$'),
   observed_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
   evidence_sha256 TEXT NOT NULL CHECK(evidence_sha256~'^[0-9a-f]{64}$'),
   CHECK(result<>'ok' OR (valid_ratio>=0.95 AND duration_ms>=120000 AND segment_count>=2 AND
     frame_sha256 IS NOT NULL AND media_sha256 IS NOT NULL AND native_signature_sha256 IS NOT NULL AND challenge_proof_sha256 IS NOT NULL AND
     lower(video_codec)='h264' AND video_width BETWEEN 1 AND 16384 AND video_height BETWEEN 1 AND 16384 AND actual_fps>0 AND actual_fps<=240 AND
+    media_size_bytes IS NOT NULL AND media_etag IS NOT NULL AND frame_size_bytes IS NOT NULL AND frame_etag IS NOT NULL AND
     audio_present IS NOT NULL AND ((audio_present AND length(btrim(COALESCE(audio_codec,'')))>0) OR (NOT audio_present AND btrim(COALESCE(audio_codec,''))=''))))
+);
+
+CREATE TABLE recording_targeted_probe_scene_reviews (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id UUID NOT NULL,
+  approval_id UUID NOT NULL REFERENCES recording_campaign_admission_approvals(id) ON DELETE RESTRICT,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  stream_id BIGINT NOT NULL REFERENCES streams(id) ON DELETE RESTRICT,
+  probe_evidence_id UUID NOT NULL UNIQUE REFERENCES recording_targeted_probe_evidence(id) ON DELETE RESTRICT,
+  probe_frame_sha256 TEXT NOT NULL CHECK(probe_frame_sha256~'^[0-9a-f]{64}$'),
+  scene_frame_evidence_id BIGINT NOT NULL,
+  scene_identity_sha256 TEXT NOT NULL CHECK(scene_identity_sha256~'^[0-9a-f]{64}$'),
+  reviewed_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  reviewed_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  review_sha256 TEXT NOT NULL CHECK(review_sha256~'^[0-9a-f]{64}$'),
+  UNIQUE(account_id,request_id),
+  FOREIGN KEY(scene_frame_evidence_id,account_id,stream_id,scene_identity_sha256)
+    REFERENCES recording_scene_frame_evidence(id,account_id,stream_id,scene_identity_sha256) ON DELETE RESTRICT
 );
 
 CREATE TABLE recording_campaign_admission_results (
@@ -144,7 +259,7 @@ CREATE TABLE recording_campaign_admission_commits (
 CREATE TABLE recording_campaign_admission_tx_authorizations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   transaction_id BIGINT NOT NULL,
-  action TEXT NOT NULL CHECK(action IN('approve','attempt','evidence','admit')),
+  action TEXT NOT NULL CHECK(action IN('approve','queue','review','attempt','evidence','admit')),
   approval_id UUID REFERENCES recording_campaign_admission_approvals(id) ON DELETE RESTRICT,
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   actor_user_id BIGINT REFERENCES users(id) ON DELETE RESTRICT,
@@ -153,7 +268,7 @@ CREATE TABLE recording_campaign_admission_tx_authorizations (
   node_token_id BIGINT REFERENCES node_tokens(id) ON DELETE RESTRICT,
   authorized_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
   UNIQUE(transaction_id,action,account_id),
-  CHECK((action IN('approve','admit') AND actor_user_id IS NOT NULL AND account_session_id IS NOT NULL AND node_id IS NULL AND node_token_id IS NULL) OR
+  CHECK((action IN('approve','queue','review','admit') AND actor_user_id IS NOT NULL AND account_session_id IS NOT NULL AND node_id IS NULL AND node_token_id IS NULL) OR
         (action IN('attempt','evidence') AND actor_user_id IS NULL AND account_session_id IS NULL AND node_id IS NOT NULL AND node_token_id IS NOT NULL)),
   CHECK((action='approve' AND approval_id IS NULL) OR (action<>'approve' AND approval_id IS NOT NULL))
 );
@@ -163,21 +278,42 @@ RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; valid BOOLEAN;
 BEGIN
   IF NEW.transaction_id<>txid_current() OR NEW.authorized_at IS DISTINCT FROM transaction_timestamp() THEN RAISE EXCEPTION 'campaign authorization must be bound to the current database transaction'; END IF;
-  IF NEW.action IN('approve','admit') THEN
-    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.account_sessions sess JOIN %I.users u ON u.id=sess.user_id JOIN %I.accounts o ON o.id=$3 JOIN %I.memberships m ON m.user_id=u.id AND m.org_id=$3 AND m.accepted_at IS NOT NULL WHERE sess.id=$1 AND sess.user_id=$2 AND sess.current_org_id=$3 AND sess.revoked_at IS NULL AND sess.expires_at>transaction_timestamp() AND o.status=''active'' AND u.is_operator AND m.role IN(''owner'',''admin''))',s,s,s,s)
+  IF NEW.action IN('approve','queue','review','admit') THEN
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.account_sessions sess JOIN %I.users u ON u.id=sess.user_id JOIN %I.accounts o ON o.id=$3 JOIN %I.memberships m ON m.user_id=u.id AND m.org_id=$3 AND m.accepted_at IS NOT NULL WHERE sess.id=$1 AND sess.user_id=$2 AND sess.current_org_id=$3 AND sess.revoked_at IS NULL AND sess.expires_at>transaction_timestamp() AND o.status=''active'' AND u.is_operator AND m.role IN(''owner'',''admin'') FOR SHARE OF sess,u,o,m)',s,s,s,s)
       INTO valid USING NEW.account_session_id,NEW.actor_user_id,NEW.account_id;
     IF valid AND NEW.action='admit' THEN
-      EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_approvals WHERE id=$1 AND account_id=$2 AND actor_user_id=$3 AND deadline_at>transaction_timestamp())',s)
+      EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_approvals WHERE id=$1 AND account_id=$2 AND actor_user_id=$3 AND deadline_at>transaction_timestamp() FOR SHARE)',s)
         INTO valid USING NEW.approval_id,NEW.account_id,NEW.actor_user_id;
     END IF;
   ELSE
-    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.node_tokens tok JOIN %I.nodes n ON n.id=tok.node_id JOIN %I.accounts o ON o.id=n.account_id JOIN %I.recorder_droplets d ON d.node_id=n.id WHERE tok.id=$1 AND tok.node_id=$2 AND tok.revoked_at IS NULL AND n.account_id=$3 AND o.status=''active'' AND n.node_type=''local_recorder'' AND n.status=''active'' AND d.state=''active'' AND d.last_seen_at>=transaction_timestamp()-interval ''120 seconds'')',s,s,s,s)
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.node_tokens tok JOIN %I.nodes n ON n.id=tok.node_id JOIN %I.accounts o ON o.id=n.account_id JOIN %I.recorder_droplets d ON d.node_id=n.id WHERE tok.id=$1 AND tok.node_id=$2 AND tok.revoked_at IS NULL AND n.account_id=$3 AND o.status=''active'' AND n.node_type=''local_recorder'' AND n.status=''active'' AND d.state=''active'' AND d.last_seen_at>=transaction_timestamp()-interval ''120 seconds'' FOR SHARE OF tok,n,o,d)',s,s,s,s)
       INTO valid USING NEW.node_token_id,NEW.node_id,NEW.account_id;
   END IF;
   IF valid IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign authorization principal is not current and exact'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_campaign_tx_authorization_validate BEFORE INSERT ON recording_campaign_admission_tx_authorizations FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_tx_authorization();
+CREATE CONSTRAINT TRIGGER recording_campaign_tx_authorization_commit_seal AFTER INSERT ON recording_campaign_admission_tx_authorizations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_tx_authorization();
+
+CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_scene_review()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; e RECORD; reservation RECORD; scene_fresh BOOLEAN; expected TEXT;
+BEGIN
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''review'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s)
+    INTO authorized USING NEW.approval_id,NEW.account_id,NEW.reviewed_by_user_id;
+  EXECUTE format('SELECT approval_id,account_id,stream_id,result,frame_sha256 FROM %I.recording_targeted_probe_evidence WHERE id=$1 FOR SHARE',s)
+    INTO e USING NEW.probe_evidence_id;
+  EXECUTE format('SELECT scene_frame_evidence_id,scene_identity_sha256 FROM %I.recording_campaign_admission_reservations WHERE approval_id=$1 AND account_id=$2 AND stream_id=$3 FOR SHARE',s)
+    INTO reservation USING NEW.approval_id,NEW.account_id,NEW.stream_id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_scene_frame_evidence WHERE id=$1 AND account_id=$2 AND stream_id=$3 AND scene_identity_sha256=$4 AND captured_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp() AND verified_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp() FOR SHARE)',s)
+    INTO scene_fresh USING NEW.scene_frame_evidence_id,NEW.account_id,NEW.stream_id,NEW.scene_identity_sha256;
+  expected:=encode(sha256(convert_to(jsonb_build_object('request_id',NEW.request_id,'approval_id',NEW.approval_id,'account_id',NEW.account_id,'stream_id',NEW.stream_id,'probe_evidence_id',NEW.probe_evidence_id,'probe_frame_sha256',NEW.probe_frame_sha256,'scene_frame_evidence_id',NEW.scene_frame_evidence_id,'scene_identity_sha256',NEW.scene_identity_sha256,'reviewed_by_user_id',NEW.reviewed_by_user_id,'reviewed_at_epoch',extract(epoch from NEW.reviewed_at))::text,'UTF8')),'hex');
+  IF authorized IS DISTINCT FROM true OR e.approval_id<>NEW.approval_id OR e.account_id<>NEW.account_id OR e.stream_id<>NEW.stream_id OR e.result<>'ok' OR e.frame_sha256<>NEW.probe_frame_sha256 OR
+     reservation.scene_frame_evidence_id<>NEW.scene_frame_evidence_id OR reservation.scene_identity_sha256<>NEW.scene_identity_sha256 OR scene_fresh IS DISTINCT FROM true OR
+     NEW.reviewed_at IS DISTINCT FROM transaction_timestamp() OR NEW.review_sha256<>expected THEN RAISE EXCEPTION 'targeted probe scene review is not exact, fresh, and authorized'; END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_targeted_probe_scene_review_validate BEFORE INSERT ON recording_targeted_probe_scene_reviews FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_scene_review();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_commit()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
@@ -223,7 +359,7 @@ CREATE CONSTRAINT TRIGGER recording_campaign_admission_result_commit AFTER INSER
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_approval()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; entry JSONB; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; stream_provider TEXT; stream_external TEXT; stream_label TEXT; stream_timezone TEXT; expected_timezone TEXT; tags TEXT[]; latest_revision BIGINT; scene_bound BOOLEAN; recording_account BIGINT; recording_stream BIGINT; recording_status TEXT; expected_schedule TEXT; expected_approval TEXT; prior_stream BIGINT:=0;
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; entry JSONB; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; stream_provider TEXT; stream_external TEXT; stream_label TEXT; stream_timezone TEXT; expected_timezone TEXT; tags TEXT[]; latest_revision BIGINT; scene_bound BOOLEAN; recording_account BIGINT; recording_stream BIGINT; recording_status TEXT; expected_schedule TEXT; expected_approval TEXT; prior_stream BIGINT:=0; decision RECORD; requested_ids BIGINT[];
 BEGIN
   EXECUTE format('SELECT u.is_operator AND lower(u.email)=lower($2) FROM %I.users u WHERE u.id=$1',s)
     INTO authorized USING NEW.actor_user_id,NEW.actor_email_snapshot;
@@ -232,6 +368,16 @@ BEGIN
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign approval requires typed transaction authorization'; END IF;
   EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING NEW.account_id;
   IF NEW.created_at IS DISTINCT FROM transaction_timestamp() THEN RAISE EXCEPTION 'campaign approval time is database-authored'; END IF;
+  EXECUTE format('SELECT code,failure_domain_tag,permitted_stream_ids,subset_allowed,min_entries,max_entries FROM %I.recording_campaign_authority_decisions WHERE code=$1',s)
+    INTO decision USING NEW.authority_code;
+  SELECT array_agg((value->>'stream_id')::bigint ORDER BY (value->>'stream_id')::bigint)
+    INTO requested_ids FROM jsonb_array_elements(NEW.entries) value;
+  IF decision.code IS NULL OR NEW.failure_domain_tag IS DISTINCT FROM decision.failure_domain_tag OR
+     cardinality(requested_ids) NOT BETWEEN decision.min_entries AND decision.max_entries OR
+     NOT(requested_ids<@decision.permitted_stream_ids) OR
+     (NOT decision.subset_allowed AND requested_ids<>decision.permitted_stream_ids) THEN
+    RAISE EXCEPTION 'campaign approval does not exactly implement an immutable Deniz authority decision';
+  END IF;
   IF NOT(NEW.schedule_spec ?& ARRAY['target_account_id','stream_ids','stream_timezones','naming_profile','mode','cron_expr','clip_duration_sec','daily_window_start','daily_window_end','active_weekdays','target_fps','start_at','end_at','storage_destination_id','delivery_storage_destination_id','delivery','dry_run','required_relay_slots','campaign_admission_approval_id']) OR
      (SELECT count(*) FROM jsonb_object_keys(NEW.schedule_spec))<>19 OR
      jsonb_typeof(NEW.schedule_spec->'target_account_id')<>'number' OR (NEW.schedule_spec->>'target_account_id')!~'^[1-9][0-9]*$' OR (NEW.schedule_spec->>'target_account_id')::bigint<>NEW.account_id OR
@@ -286,7 +432,7 @@ BEGIN
     END IF;
     IF (entry->>'stream_id')::bigint<=prior_stream THEN RAISE EXCEPTION 'campaign approval entries must be sorted by stream id'; END IF;
     prior_stream:=(entry->>'stream_id')::bigint;
-    EXECUTE format('SELECT encode(sha256(convert_to(source_url,''UTF8'')),''hex''),encode(sha256(convert_to(COALESCE(source_page_url,''''),''UTF8'')),''hex''),updated_at,COALESCE(provider,''''),COALESCE(external_id,''''),lower(regexp_replace(name,''[^[:alnum:]]'','''',''g'')),COALESCE(local_timezone,''''),tags,(SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=st.id) FROM %I.streams st WHERE id=$1 AND deleted_at IS NULL FOR UPDATE',s,s)
+    EXECUTE format('SELECT encode(sha256(convert_to(source_url,''UTF8'')),''hex''),encode(sha256(convert_to(COALESCE(source_page_url,''''),''UTF8'')),''hex''),updated_at,COALESCE(provider,''''),COALESCE(external_id,''''),COALESCE(NULLIF(regexp_replace(lower(name),''[^a-z0-9]'','''',''g''),''''),''stream''||id::text),COALESCE(local_timezone,''''),tags,(SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=st.id) FROM %I.streams st WHERE id=$1 AND deleted_at IS NULL FOR UPDATE',s,s)
       INTO source_hash,page_hash,source_updated,stream_provider,stream_external,stream_label,stream_timezone,tags,latest_revision USING (entry->>'stream_id')::bigint;
     SELECT value->>'timezone' INTO expected_timezone FROM jsonb_array_elements(NEW.schedule_spec->'stream_timezones') value WHERE (value->>'stream_id')::bigint=(entry->>'stream_id')::bigint;
     IF source_hash IS NULL OR source_hash<>(entry->>'source_url_sha256') OR page_hash<>(entry->>'source_page_url_sha256') OR
@@ -294,7 +440,7 @@ BEGIN
        stream_provider<>(entry->>'provider') OR stream_external<>(entry->>'external_id') OR stream_label<>(entry->>'normalized_label') OR stream_timezone<>expected_timezone OR
        COALESCE(latest_revision,0)<>(entry->>'source_revision_id')::bigint THEN RAISE EXCEPTION 'campaign approval source fence mismatch'; END IF;
     IF NEW.failure_domain_tag IS NOT NULL AND NOT(NEW.failure_domain_tag=ANY(tags)) THEN RAISE EXCEPTION 'campaign approval stream is outside required failure domain'; END IF;
-    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_scene_frame_evidence WHERE id=$1 AND account_id=$2 AND stream_id=$3 AND scene_identity_sha256=$4 AND verified_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp())',s)
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_scene_frame_evidence WHERE id=$1 AND account_id=$2 AND stream_id=$3 AND scene_identity_sha256=$4 AND captured_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp() AND verified_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp())',s)
       INTO scene_bound USING (entry->>'scene_frame_evidence_id')::bigint,NEW.account_id,(entry->>'stream_id')::bigint,entry->>'scene_identity_sha256';
     IF scene_bound IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign approval scene is not bound to fresh authoritative frame evidence'; END IF;
     IF (entry->>'recording_id')::bigint>0 THEN
@@ -315,7 +461,7 @@ DECLARE s TEXT:=TG_TABLE_SCHEMA; entry JSONB; collision BOOLEAN;
 BEGIN
   EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING NEW.account_id;
   FOR entry IN SELECT value FROM jsonb_array_elements(NEW.entries) LOOP
-    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recordings r LEFT JOIN %I.streams active_stream ON active_stream.id=r.stream_id WHERE r.account_id=$1 AND r.status<>''canceled'' AND NOT(r.id=NULLIF($4,0) AND r.status=''completed'') AND (r.stream_id=$2 OR encode(sha256(convert_to(active_stream.source_url,''UTF8'')),''hex'')=$5 OR (NULLIF(active_stream.provider,'''') IS NOT NULL AND active_stream.provider=$6 AND NULLIF(active_stream.external_id,'''') IS NOT NULL AND active_stream.external_id=$7) OR lower(regexp_replace(active_stream.name,''[^[:alnum:]]'','''',''g''))=$8) UNION ALL SELECT 1 FROM %I.recording_campaign_roster_entries e JOIN %I.recording_campaign_tracks t ON t.id=e.track_id JOIN %I.streams protected_stream ON protected_stream.id=e.stream_id WHERE t.account_id=$1 AND t.state IN(''active'',''complete'') AND e.status IN(''protect'',''probation'') AND (e.stream_id=$2 OR e.scene_identity_sha256=$3 OR encode(sha256(convert_to(protected_stream.source_url,''UTF8'')),''hex'')=$5 OR (NULLIF(protected_stream.provider,'''') IS NOT NULL AND protected_stream.provider=$6 AND NULLIF(protected_stream.external_id,'''') IS NOT NULL AND protected_stream.external_id=$7) OR lower(regexp_replace(protected_stream.name,''[^[:alnum:]]'','''',''g''))=$8) UNION ALL SELECT 1 FROM %I.recording_campaign_admission_reservations pending JOIN %I.recording_campaign_admission_approvals approval ON approval.id=pending.approval_id WHERE pending.account_id=$1 AND approval.deadline_at>transaction_timestamp() AND (pending.stream_id=$2 OR pending.scene_identity_sha256=$3 OR pending.recording_id=NULLIF($4,0) OR pending.source_url_sha256=$5 OR (NULLIF(pending.provider,'''') IS NOT NULL AND pending.provider=$6 AND NULLIF(pending.external_id,'''') IS NOT NULL AND pending.external_id=$7) OR pending.normalized_label=$8) LIMIT 1)',s,s,s,s,s,s,s)
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recordings r LEFT JOIN %I.streams active_stream ON active_stream.id=r.stream_id WHERE r.account_id=$1 AND r.status<>''canceled'' AND NOT(r.id=NULLIF($4,0) AND r.status=''completed'') AND (r.stream_id=$2 OR encode(sha256(convert_to(active_stream.source_url,''UTF8'')),''hex'')=$5 OR (NULLIF(active_stream.provider,'''') IS NOT NULL AND active_stream.provider=$6 AND NULLIF(active_stream.external_id,'''') IS NOT NULL AND active_stream.external_id=$7) OR COALESCE(NULLIF(regexp_replace(lower(active_stream.name),''[^a-z0-9]'','''',''g''),''''),''stream''||active_stream.id::text)=$8) UNION ALL SELECT 1 FROM %I.recording_campaign_roster_entries e JOIN %I.recording_campaign_tracks t ON t.id=e.track_id JOIN %I.streams protected_stream ON protected_stream.id=e.stream_id WHERE t.account_id=$1 AND t.state IN(''active'',''complete'') AND e.status IN(''protect'',''probation'') AND (e.stream_id=$2 OR e.scene_identity_sha256=$3 OR encode(sha256(convert_to(protected_stream.source_url,''UTF8'')),''hex'')=$5 OR (NULLIF(protected_stream.provider,'''') IS NOT NULL AND protected_stream.provider=$6 AND NULLIF(protected_stream.external_id,'''') IS NOT NULL AND protected_stream.external_id=$7) OR COALESCE(NULLIF(regexp_replace(lower(protected_stream.name),''[^a-z0-9]'','''',''g''),''''),''stream''||protected_stream.id::text)=$8) UNION ALL SELECT 1 FROM %I.recording_campaign_admission_reservations pending JOIN %I.recording_campaign_admission_approvals approval ON approval.id=pending.approval_id WHERE pending.account_id=$1 AND approval.deadline_at>transaction_timestamp() AND (pending.stream_id=$2 OR pending.scene_identity_sha256=$3 OR pending.recording_id=NULLIF($4,0) OR pending.source_url_sha256=$5 OR (NULLIF(pending.provider,'''') IS NOT NULL AND pending.provider=$6 AND NULLIF(pending.external_id,'''') IS NOT NULL AND pending.external_id=$7) OR pending.normalized_label=$8) LIMIT 1)',s,s,s,s,s,s,s)
       INTO collision USING NEW.account_id,(entry->>'stream_id')::bigint,entry->>'scene_identity_sha256',(entry->>'recording_id')::bigint,entry->>'source_url_sha256',entry->>'provider',entry->>'external_id',entry->>'normalized_label';
     IF collision THEN RAISE EXCEPTION 'campaign approval collides with active/protected occupancy'; END IF;
     EXECUTE format('INSERT INTO %I.recording_campaign_admission_reservations(approval_id,account_id,stream_id,recording_id,source_revision_id,source_url_sha256,source_page_url_sha256,source_updated_at,provider,external_id,normalized_label,scene_frame_evidence_id,scene_identity_sha256) VALUES($1,$2,$3,NULLIF($4,0),NULLIF($5,0),$6,$7,TIMESTAMPTZ ''epoch''+$8*interval ''1 microsecond'',$9,$10,$11,$12,$13)',s)
@@ -360,9 +506,25 @@ CREATE TRIGGER recording_campaign_admission_source_fence_audit
 AFTER UPDATE OF source_url,source_page_url,provider,external_id,name,local_timezone,tags,deleted_at,updated_at ON streams
 FOR EACH ROW EXECUTE FUNCTION audit_recording_campaign_reserved_source_mutation();
 
+CREATE OR REPLACE FUNCTION audit_recording_campaign_reserved_revision_mutation()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE s TEXT:=TG_TABLE_SCHEMA; sid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.stream_id ELSE NEW.stream_id END; reserved BOOLEAN; prior_hash TEXT; next_hash TEXT;
+BEGIN
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations WHERE stream_id=$1)',s) INTO reserved USING sid;
+  IF reserved THEN
+    prior_hash:=encode(sha256(convert_to(jsonb_build_array(TG_OP,CASE WHEN TG_OP='INSERT' THEN NULL ELSE to_jsonb(OLD) END)::text,'UTF8')),'hex');
+    next_hash:=encode(sha256(convert_to(jsonb_build_array(TG_OP,CASE WHEN TG_OP='DELETE' THEN NULL ELSE to_jsonb(NEW) END)::text,'UTF8')),'hex');
+    EXECUTE format('INSERT INTO %I.recording_campaign_admission_source_fence_events(stream_id,prior_fence_sha256,next_fence_sha256) VALUES($1,$2,$3)',s) USING sid,prior_hash,next_hash;
+  END IF;
+  RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+END $$;
+CREATE TRIGGER recording_campaign_admission_revision_fence_audit
+AFTER INSERT OR UPDATE OR DELETE ON stream_source_revisions
+FOR EACH ROW EXECUTE FUNCTION audit_recording_campaign_reserved_revision_mutation();
+
 CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_attempt()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_deadline TIMESTAMPTZ; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_reserved TIMESTAMPTZ; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; d_node BIGINT; d_do BIGINT; d_region TEXT; d_build TEXT; d_state TEXT; d_seen TIMESTAMPTZ; expected_attempt INTEGER; prior_completed TIMESTAMPTZ;
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_deadline TIMESTAMPTZ; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_reserved TIMESTAMPTZ; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; d_node BIGINT; d_do BIGINT; d_region TEXT; d_build TEXT; d_state TEXT; d_seen TIMESTAMPTZ; order_valid BOOLEAN; provider_valid BOOLEAN; expected_attempt INTEGER; prior_completed TIMESTAMPTZ;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''attempt'' AND approval_id=$1 AND account_id=$2 AND node_id=$3)',s) INTO authorized USING NEW.approval_id,NEW.account_id,NEW.node_id;
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'targeted attempt requires typed node transaction authorization'; END IF;
@@ -372,6 +534,8 @@ BEGIN
   EXECUTE format('SELECT (SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=st.id),encode(sha256(convert_to(st.source_url,''UTF8'')),''hex''),encode(sha256(convert_to(COALESCE(st.source_page_url,''''),''UTF8'')),''hex''),st.updated_at FROM %I.streams st WHERE id=$1 AND deleted_at IS NULL FOR SHARE',s,s)
     INTO current_revision,current_source,current_page,current_updated USING NEW.stream_id;
   EXECUTE format('SELECT node_id,do_droplet_id,region,build_sha,state,last_seen_at FROM %I.recorder_droplets WHERE id=$1 FOR SHARE',s) INTO d_node,d_do,d_region,d_build,d_state,d_seen USING NEW.recorder_droplet_id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_probe_orders WHERE id=$1 AND approval_id=$2 AND account_id=$3 AND stream_id=$4)',s) INTO order_valid USING NEW.order_id,NEW.approval_id,NEW.account_id,NEW.stream_id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_provider_attestations WHERE id=$1 AND node_id=$2 AND recorder_droplet_id=$3 AND do_droplet_id=$4 AND region=$5 AND build_sha=$6 AND observed_at=transaction_timestamp())',s) INTO provider_valid USING NEW.provider_attestation_id,NEW.node_id,NEW.recorder_droplet_id,NEW.do_droplet_id,NEW.region,NEW.probe_build_sha;
   EXECUTE format('SELECT COALESCE(max(attempt_no),0)+1 FROM %I.recording_targeted_probe_attempts WHERE approval_id=$1 AND stream_id=$2',s) INTO expected_attempt USING NEW.approval_id,NEW.stream_id;
   IF expected_attempt>1 THEN
     EXECUTE format('SELECT e.observed_at FROM %I.recording_targeted_probe_attempts a JOIN %I.recording_targeted_probe_evidence e ON e.attempt_id=a.id WHERE a.approval_id=$1 AND a.stream_id=$2 AND a.attempt_no=$3 - 1',s,s) INTO prior_completed USING NEW.approval_id,NEW.stream_id,expected_attempt;
@@ -380,7 +544,8 @@ BEGIN
      r_source IS NULL OR r_revision IS DISTINCT FROM NEW.source_revision_id OR r_source<>NEW.source_url_sha256 OR r_page<>NEW.source_page_url_sha256 OR r_updated<>NEW.source_updated_at OR
      current_revision IS DISTINCT FROM r_revision OR current_source<>r_source OR current_page<>r_page OR current_updated<>r_updated OR
      d_node<>NEW.node_id OR d_do<>NEW.do_droplet_id OR d_region<>NEW.region OR d_build<>NEW.probe_build_sha OR d_state<>'active' OR d_seen<transaction_timestamp()-interval '120 seconds' OR
-     source_clean IS DISTINCT FROM true OR NEW.attempt_no<>expected_attempt OR (expected_attempt>1 AND prior_completed IS NULL) THEN RAISE EXCEPTION 'targeted attempt is not a fresh server-issued managed-recorder/source challenge'; END IF;
+     source_clean IS DISTINCT FROM true OR order_valid IS DISTINCT FROM true OR provider_valid IS DISTINCT FROM true OR NEW.attempt_no<>expected_attempt OR
+     (expected_attempt>1 AND (prior_completed IS NULL OR prior_completed>transaction_timestamp()-interval '60 seconds')) THEN RAISE EXCEPTION 'targeted attempt is not a fresh server-issued managed-recorder/source challenge'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_targeted_probe_attempt_validate BEFORE INSERT ON recording_targeted_probe_attempts FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_attempt();
@@ -397,8 +562,8 @@ BEGIN
   EXECUTE format('SELECT NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_source_fence_events f JOIN %I.recording_campaign_admission_reservations r ON r.stream_id=f.stream_id WHERE r.approval_id=$1 AND r.stream_id=$2 AND f.occurred_at>=r.reserved_at)',s,s) INTO source_clean USING NEW.approval_id,NEW.stream_id;
   native_text:=format(E'v1\nvideo=%s\naudio=%s\naudio_present=%s\nwidth=%s\nheight=%s\nfps=%s\n',lower(btrim(COALESCE(NEW.video_codec,''))),lower(btrim(COALESCE(NEW.audio_codec,''))),COALESCE(NEW.audio_present,false)::text,COALESCE(NEW.video_width,0)::text,COALESCE(NEW.video_height,0)::text,COALESCE(NEW.actual_fps::text,''));
   native_hash:=encode(sha256(convert_to(length(native_text)::text||':'||native_text,'UTF8')),'hex');
-  proof_hash:=encode(sha256(convert_to(length(a.challenge)::text||':'||a.challenge||length(COALESCE(NEW.media_sha256,''))::text||':'||COALESCE(NEW.media_sha256,'')||length(COALESCE(NEW.frame_sha256,''))::text||':'||COALESCE(NEW.frame_sha256,'')||length(native_hash)::text||':'||native_hash,'UTF8')),'hex');
-  expected_evidence:=encode(sha256(convert_to(jsonb_build_object('attempt_id',NEW.attempt_id,'approval_id',NEW.approval_id,'account_id',NEW.account_id,'stream_id',NEW.stream_id,'result',NEW.result,'valid_ratio',NEW.valid_ratio,'duration_ms',NEW.duration_ms,'segment_count',NEW.segment_count,'frame_sha256',NEW.frame_sha256,'media_sha256',NEW.media_sha256,'native_signature_sha256',native_hash,'challenge_proof_sha256',proof_hash,'video_codec',lower(btrim(COALESCE(NEW.video_codec,''))),'audio_codec',lower(btrim(COALESCE(NEW.audio_codec,''))),'audio_present',NEW.audio_present,'video_width',NEW.video_width,'video_height',NEW.video_height,'actual_fps',NEW.actual_fps,'detail',NEW.detail)::text,'UTF8')),'hex');
+  proof_hash:=encode(sha256(convert_to(length(a.challenge)::text||':'||a.challenge||length(a.id::text)::text||':'||a.id::text||length(NEW.media_etag)::text||':'||NEW.media_etag||length(COALESCE(NEW.media_version_id,''))::text||':'||COALESCE(NEW.media_version_id,'')||length(NEW.frame_etag)::text||':'||NEW.frame_etag||length(COALESCE(NEW.frame_version_id,''))::text||':'||COALESCE(NEW.frame_version_id,'')||length(COALESCE(NEW.media_sha256,''))::text||':'||COALESCE(NEW.media_sha256,'')||length(COALESCE(NEW.frame_sha256,''))::text||':'||COALESCE(NEW.frame_sha256,'')||length(native_hash)::text||':'||native_hash,'UTF8')),'hex');
+  expected_evidence:=encode(sha256(convert_to(jsonb_build_object('attempt_id',NEW.attempt_id,'approval_id',NEW.approval_id,'account_id',NEW.account_id,'stream_id',NEW.stream_id,'result',NEW.result,'valid_ratio',NEW.valid_ratio,'duration_ms',NEW.duration_ms,'segment_count',NEW.segment_count,'frame_sha256',NEW.frame_sha256,'media_sha256',NEW.media_sha256,'native_signature_sha256',native_hash,'challenge_proof_sha256',proof_hash,'video_codec',lower(btrim(COALESCE(NEW.video_codec,''))),'audio_codec',lower(btrim(COALESCE(NEW.audio_codec,''))),'audio_present',NEW.audio_present,'video_width',NEW.video_width,'video_height',NEW.video_height,'actual_fps',NEW.actual_fps,'detail',NEW.detail,'media_size_bytes',NEW.media_size_bytes,'media_etag',NEW.media_etag,'media_version_id',NEW.media_version_id,'frame_size_bytes',NEW.frame_size_bytes,'frame_etag',NEW.frame_etag,'frame_version_id',NEW.frame_version_id)::text,'UTF8')),'hex');
   IF a.id IS NULL OR a.approval_id<>NEW.approval_id OR a.account_id<>NEW.account_id OR a.stream_id<>NEW.stream_id OR transaction_timestamp()>a.expires_at OR NEW.observed_at IS DISTINCT FROM transaction_timestamp() OR
      source_clean IS DISTINCT FROM true OR current_revision IS DISTINCT FROM a.source_revision_id OR current_source<>a.source_url_sha256 OR current_page<>a.source_page_url_sha256 OR current_updated<>a.source_updated_at OR
      NEW.native_signature_sha256<>native_hash OR NEW.challenge_proof_sha256<>proof_hash THEN RAISE EXCEPTION 'targeted evidence is not bound to the server challenge and current source fence'; END IF;
@@ -409,7 +574,7 @@ CREATE TRIGGER recording_targeted_probe_evidence_validate BEFORE INSERT ON recor
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_result()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_actor BIGINT; a_schedule TEXT; a_deadline TIMESTAMPTZ; a_tag TEXT; r_stream BIGINT; r_recording BIGINT; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_scene BIGINT; r_scene_hash TEXT; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; current_tags TEXT[]; t_account BIGINT; e_recording BIGINT; e_stream BIGINT; e_actor BIGINT; e_scene TEXT; config_ok BOOLEAN; scene_fresh BOOLEAN; current_config_sha TEXT; p1 RECORD; p2 RECORD;
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_actor BIGINT; a_schedule TEXT; a_deadline TIMESTAMPTZ; a_tag TEXT; r_stream BIGINT; r_recording BIGINT; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_scene BIGINT; r_scene_hash TEXT; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; current_tags TEXT[]; t_account BIGINT; e_recording BIGINT; e_stream BIGINT; e_actor BIGINT; e_scene TEXT; config_ok BOOLEAN; scene_fresh BOOLEAN; reviews_valid BOOLEAN; current_config_sha TEXT; newer_attempt BOOLEAN; p1 RECORD; p2 RECORD;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s) INTO authorized USING NEW.approval_id,NEW.account_id,NEW.actor_user_id;
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign admission result requires typed transaction authorization'; END IF;
@@ -420,22 +585,26 @@ BEGIN
     INTO current_revision,current_source,current_page,current_updated,current_tags USING NEW.stream_id;
   EXECUTE format('SELECT account_id FROM %I.recording_campaign_tracks WHERE id=$1',s) INTO t_account USING NEW.track_id;
   EXECUTE format('SELECT recording_id,stream_id,updated_by_user_id,scene_identity_sha256 FROM %I.recording_campaign_roster_entries WHERE id=$1 AND track_id=$2',s) INTO e_recording,e_stream,e_actor,e_scene USING NEW.roster_entry_id,NEW.track_id;
-  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_scene_frame_evidence WHERE id=$1 AND account_id=$2 AND stream_id=$3 AND scene_identity_sha256=$4 AND verified_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp())',s)
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_scene_frame_evidence WHERE id=$1 AND account_id=$2 AND stream_id=$3 AND scene_identity_sha256=$4 AND captured_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp() AND verified_at BETWEEN transaction_timestamp()-interval ''6 hours'' AND transaction_timestamp())',s)
     INTO scene_fresh USING r_scene,NEW.account_id,NEW.stream_id,r_scene_hash;
-  EXECUTE format('SELECT e.approval_id,e.account_id,e.stream_id,e.result,e.observed_at,e.frame_sha256,e.native_signature_sha256,a.source_revision_id,a.source_url_sha256,a.source_page_url_sha256,a.source_updated_at,a.challenge FROM %I.recording_targeted_probe_evidence e JOIN %I.recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.id=$1',s,s) INTO p1 USING NEW.first_probe_evidence_id;
-  EXECUTE format('SELECT e.approval_id,e.account_id,e.stream_id,e.result,e.observed_at,e.frame_sha256,e.native_signature_sha256,a.source_revision_id,a.source_url_sha256,a.source_page_url_sha256,a.source_updated_at,a.challenge FROM %I.recording_targeted_probe_evidence e JOIN %I.recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.id=$1',s,s) INTO p2 USING NEW.second_probe_evidence_id;
+  EXECUTE format('SELECT e.approval_id,e.account_id,e.stream_id,e.result,e.observed_at,e.frame_sha256,e.media_sha256,e.native_signature_sha256,a.source_revision_id,a.source_url_sha256,a.source_page_url_sha256,a.source_updated_at,a.challenge,a.attempt_no FROM %I.recording_targeted_probe_evidence e JOIN %I.recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.id=$1',s,s) INTO p1 USING NEW.first_probe_evidence_id;
+  EXECUTE format('SELECT e.approval_id,e.account_id,e.stream_id,e.result,e.observed_at,e.frame_sha256,e.media_sha256,e.native_signature_sha256,a.source_revision_id,a.source_url_sha256,a.source_page_url_sha256,a.source_updated_at,a.challenge,a.attempt_no FROM %I.recording_targeted_probe_evidence e JOIN %I.recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.id=$1',s,s) INTO p2 USING NEW.second_probe_evidence_id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_probe_scene_reviews r1 JOIN %I.recording_targeted_probe_scene_reviews r2 ON r2.probe_evidence_id=$2 WHERE r1.probe_evidence_id=$1 AND r1.approval_id=$3 AND r2.approval_id=$3 AND r1.scene_frame_evidence_id=$4 AND r2.scene_frame_evidence_id=$4 AND r1.scene_identity_sha256=$5 AND r2.scene_identity_sha256=$5 AND r1.probe_frame_sha256=$6 AND r2.probe_frame_sha256=$7 AND r1.reviewed_at>=transaction_timestamp()-interval ''6 hours'' AND r2.reviewed_at>=transaction_timestamp()-interval ''6 hours'')',s,s)
+    INTO reviews_valid USING NEW.first_probe_evidence_id,NEW.second_probe_evidence_id,NEW.approval_id,r_scene,r_scene_hash,p1.frame_sha256,p2.frame_sha256;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_probe_attempts WHERE approval_id=$1 AND stream_id=$2 AND attempt_no>$3)',s) INTO newer_attempt USING NEW.approval_id,NEW.stream_id,p2.attempt_no;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_approvals a JOIN %I.recordings r ON r.id=$2 JOIN %I.streams st ON st.id=r.stream_id WHERE a.id=$1 AND r.account_id=a.account_id AND r.stream_id=$3 AND r.name=st.name||'' [''||st.id::text||'']'' AND r.stream_url=st.source_url AND r.source_kind=CASE WHEN lower(st.source_url) LIKE ''%%.m3u8%%'' OR lower(st.source_url) LIKE ''%%!hls%%'' THEN ''hls_live'' ELSE ''ffmpeg_direct'' END AND r.status=''active'' AND r.paused_at IS NULL AND r.capture_via=''cloud'' AND r.target_fps IS NULL AND r.mode=a.schedule_spec->>''mode'' AND COALESCE(r.cron_expr,'''')=COALESCE(a.schedule_spec->>''cron_expr'','''') AND r.cron_timezone=(SELECT value->>''timezone'' FROM jsonb_array_elements(a.schedule_spec->''stream_timezones'') value WHERE (value->>''stream_id'')::bigint=$3) AND r.clip_duration_sec=(a.schedule_spec->>''clip_duration_sec'')::int AND COALESCE(to_char(r.daily_window_start,''HH24:MI''),'''')=COALESCE(a.schedule_spec->>''daily_window_start'','''') AND COALESCE(to_char(r.daily_window_end,''HH24:MI''),'''')=COALESCE(a.schedule_spec->>''daily_window_end'','''') AND to_jsonb(r.active_weekdays)=a.schedule_spec->''active_weekdays'' AND r.start_at=(a.schedule_spec->>''start_at'')::timestamptz AND r.end_at=(a.schedule_spec->>''end_at'')::timestamptz AND ((a.schedule_spec->>''storage_destination_id'')::bigint>0 AND r.storage_destination_id=(a.schedule_spec->>''storage_destination_id'')::bigint AND r.delivery_storage_destination_id IS NULL OR (a.schedule_spec->>''delivery_storage_destination_id'')::bigint>0 AND r.delivery_storage_destination_id=(a.schedule_spec->>''delivery_storage_destination_id'')::bigint AND r.storage_destination_id IS NULL) AND r.delivery=a.schedule_spec->>''delivery'' AND r.naming_profile=a.schedule_spec->>''naming_profile'' AND r.folder_name=''recordings'' AND r.naming_metadata_jsonb=''{}''::jsonb AND r.storage_retention_tier=''monthly'')',s,s,s)
     INTO config_ok USING NEW.approval_id,NEW.recording_id,NEW.stream_id;
   EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''account_id'',r.account_id,''stream_id'',r.stream_id,''name'',r.name,''stream_url'',r.stream_url,''source_kind'',r.source_kind,''mode'',r.mode,''cron_expr'',r.cron_expr,''cron_timezone'',r.cron_timezone,''clip_duration_sec'',r.clip_duration_sec,''daily_window_start'',r.daily_window_start,''daily_window_end'',r.daily_window_end,''active_weekdays'',r.active_weekdays,''target_fps'',r.target_fps,''start_at'',r.start_at,''end_at'',r.end_at,''storage_destination_id'',r.storage_destination_id,''delivery_storage_destination_id'',r.delivery_storage_destination_id,''delivery'',r.delivery,''capture_via'',r.capture_via,''naming_profile'',r.naming_profile,''folder_name'',r.folder_name,''naming_metadata_jsonb'',r.naming_metadata_jsonb,''storage_retention_tier'',r.storage_retention_tier)::text,''UTF8'')),''hex'') FROM %I.recordings r WHERE id=$1',s)
     INTO current_config_sha USING NEW.recording_id;
   IF a_account<>NEW.account_id OR a_schedule<>NEW.schedule_sha256 OR transaction_timestamp()>=a_deadline OR t_account<>NEW.account_id OR
-     a_actor<>NEW.actor_user_id OR config_ok IS DISTINCT FROM true OR scene_fresh IS DISTINCT FROM true OR source_clean IS DISTINCT FROM true OR
+     a_actor<>NEW.actor_user_id OR config_ok IS DISTINCT FROM true OR scene_fresh IS DISTINCT FROM true OR reviews_valid IS DISTINCT FROM true OR source_clean IS DISTINCT FROM true OR
      r_stream<>NEW.stream_id OR (r_recording IS NOT NULL AND r_recording<>NEW.recording_id) OR e_recording<>NEW.recording_id OR e_stream<>NEW.stream_id OR e_actor<>NEW.actor_user_id OR e_scene<>r_scene_hash OR
      current_revision IS DISTINCT FROM r_revision OR current_source<>r_source OR current_page<>r_page OR current_updated<>r_updated OR (a_tag IS NOT NULL AND NOT(a_tag=ANY(current_tags))) OR
      p1.approval_id<>NEW.approval_id OR p2.approval_id<>NEW.approval_id OR p1.account_id<>NEW.account_id OR p2.account_id<>NEW.account_id OR
      p1.stream_id<>NEW.stream_id OR p2.stream_id<>NEW.stream_id OR p1.result<>'ok' OR p2.result<>'ok' OR
-     p2.observed_at<=p1.observed_at OR p1.observed_at<transaction_timestamp()-interval '6 hours' OR p2.observed_at<transaction_timestamp()-interval '6 hours' OR
-     p1.challenge=p2.challenge OR
+     p2.attempt_no<>p1.attempt_no+1 OR newer_attempt OR
+     p2.observed_at<p1.observed_at+interval '60 seconds' OR p1.observed_at<transaction_timestamp()-interval '6 hours' OR p2.observed_at<transaction_timestamp()-interval '6 hours' OR
+     p1.challenge=p2.challenge OR p1.frame_sha256=p2.frame_sha256 OR p1.media_sha256=p2.media_sha256 OR
      (p1.native_signature_sha256,p1.source_revision_id,p1.source_url_sha256,p1.source_page_url_sha256,p1.source_updated_at) IS DISTINCT FROM
      (p2.native_signature_sha256,p2.source_revision_id,p2.source_url_sha256,p2.source_page_url_sha256,p2.source_updated_at) OR
      (p2.source_revision_id,p2.source_url_sha256,p2.source_page_url_sha256,p2.source_updated_at) IS DISTINCT FROM
@@ -451,7 +620,11 @@ DECLARE s TEXT:=TG_TABLE_SCHEMA; approval UUID; authorized BOOLEAN;
 BEGIN
   IF NEW.status='active' AND (TG_OP='INSERT' OR OLD.status<>'active') THEN
     EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING NEW.account_id;
-    EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar JOIN %I.recording_campaign_admission_approvals a ON a.id=ar.approval_id JOIN %I.streams candidate ON candidate.id=$3 LEFT JOIN %I.recording_campaign_admission_results admitted ON admitted.approval_id=ar.approval_id AND admitted.stream_id=ar.stream_id WHERE ar.account_id=$1 AND a.deadline_at>transaction_timestamp() AND admitted.id IS NULL AND (ar.recording_id=$2 OR ar.stream_id=$3 OR ar.source_url_sha256=encode(sha256(convert_to(candidate.source_url,''UTF8'')),''hex'')) ORDER BY ar.reserved_at DESC LIMIT 1',s,s,s,s,s) INTO approval USING NEW.account_id,NEW.id,NEW.stream_id;
+    IF NEW.stream_id IS NULL THEN
+      EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations WHERE account_id=$1)',s) INTO authorized USING NEW.account_id;
+      IF authorized THEN RAISE EXCEPTION 'active recording with NULL stream cannot bypass campaign occupancy'; END IF;
+    END IF;
+    EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar LEFT JOIN %I.streams candidate ON candidate.id=$3 LEFT JOIN %I.recording_campaign_admission_results admitted ON admitted.approval_id=ar.approval_id AND admitted.stream_id=ar.stream_id WHERE ar.account_id=$1 AND admitted.id IS NULL AND (ar.recording_id=$2 OR ar.stream_id=$3 OR (candidate.id IS NOT NULL AND (ar.source_url_sha256=encode(sha256(convert_to(candidate.source_url,''UTF8'')),''hex'') OR (NULLIF(ar.provider,'''') IS NOT NULL AND ar.provider=COALESCE(candidate.provider,'''') AND NULLIF(ar.external_id,'''') IS NOT NULL AND ar.external_id=COALESCE(candidate.external_id,'''')) OR ar.normalized_label=COALESCE(NULLIF(regexp_replace(lower(candidate.name),''[^a-z0-9]'','''',''g''),''''),''stream''||candidate.id::text)))) ORDER BY ar.reserved_at DESC LIMIT 1',s,s,s,s) INTO approval USING NEW.account_id,NEW.id,NEW.stream_id;
     IF approval IS NOT NULL THEN
       EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s) INTO authorized USING approval,NEW.account_id;
       IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'reserved recording/stream requires typed campaign admission'; END IF;
@@ -466,7 +639,7 @@ RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; approval UUID; sealed BOOLEAN;
 BEGIN
   IF NEW.status='active' AND (TG_OP='INSERT' OR OLD.status<>'active') THEN
-    EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar JOIN %I.recording_campaign_admission_approvals a ON a.id=ar.approval_id JOIN %I.streams candidate ON candidate.id=$3 WHERE ar.account_id=$1 AND a.deadline_at>transaction_timestamp() AND (ar.recording_id=$2 OR ar.stream_id=$3 OR ar.source_url_sha256=encode(sha256(convert_to(candidate.source_url,''UTF8'')),''hex'')) ORDER BY ar.reserved_at DESC LIMIT 1',s,s,s) INTO approval USING NEW.account_id,NEW.id,NEW.stream_id;
+    EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar LEFT JOIN %I.streams candidate ON candidate.id=$3 WHERE ar.account_id=$1 AND (ar.recording_id=$2 OR ar.stream_id=$3 OR (candidate.id IS NOT NULL AND (ar.source_url_sha256=encode(sha256(convert_to(candidate.source_url,''UTF8'')),''hex'') OR (NULLIF(ar.provider,'''') IS NOT NULL AND ar.provider=COALESCE(candidate.provider,'''') AND NULLIF(ar.external_id,'''') IS NOT NULL AND ar.external_id=COALESCE(candidate.external_id,'''')) OR ar.normalized_label=COALESCE(NULLIF(regexp_replace(lower(candidate.name),''[^a-z0-9]'','''',''g''),''''),''stream''||candidate.id::text)))) ORDER BY ar.reserved_at DESC LIMIT 1',s,s) INTO approval USING NEW.account_id,NEW.id,NEW.stream_id;
     IF approval IS NOT NULL THEN
       EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results WHERE approval_id=$1 AND recording_id=$2)',s) INTO sealed USING approval,NEW.id;
       IF sealed IS DISTINCT FROM true THEN RAISE EXCEPTION 'reserved activation must commit its immutable admission result'; END IF;
@@ -499,7 +672,7 @@ BEGIN
   IF NEW.status NOT IN('protect','probation') THEN RETURN NEW; END IF;
   EXECUTE format('SELECT account_id FROM %I.recording_campaign_tracks WHERE id=$1',s) INTO account USING NEW.track_id;
   EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING account;
-  EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar JOIN %I.recording_campaign_admission_approvals a ON a.id=ar.approval_id JOIN %I.streams candidate ON candidate.id=$2 LEFT JOIN %I.recording_campaign_admission_results admitted ON admitted.approval_id=ar.approval_id AND admitted.stream_id=ar.stream_id WHERE ar.account_id=$1 AND a.deadline_at>transaction_timestamp() AND admitted.id IS NULL AND (ar.stream_id=$2 OR ar.scene_identity_sha256=$3 OR ar.source_url_sha256=encode(sha256(convert_to(candidate.source_url,''UTF8'')),''hex'')) ORDER BY ar.reserved_at DESC LIMIT 1',s,s,s,s) INTO approval USING account,NEW.stream_id,NEW.scene_identity_sha256;
+  EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar LEFT JOIN %I.streams candidate ON candidate.id=$2 LEFT JOIN %I.recording_campaign_admission_results admitted ON admitted.approval_id=ar.approval_id AND admitted.stream_id=ar.stream_id WHERE ar.account_id=$1 AND admitted.id IS NULL AND (ar.stream_id=$2 OR ar.scene_identity_sha256=$3 OR (candidate.id IS NOT NULL AND (ar.source_url_sha256=encode(sha256(convert_to(candidate.source_url,''UTF8'')),''hex'') OR (NULLIF(ar.provider,'''') IS NOT NULL AND ar.provider=COALESCE(candidate.provider,'''') AND NULLIF(ar.external_id,'''') IS NOT NULL AND ar.external_id=COALESCE(candidate.external_id,'''')) OR ar.normalized_label=COALESCE(NULLIF(regexp_replace(lower(candidate.name),''[^a-z0-9]'','''',''g''),''''),''stream''||candidate.id::text)))) ORDER BY ar.reserved_at DESC LIMIT 1',s,s,s) INTO approval USING account,NEW.stream_id,NEW.scene_identity_sha256;
   IF approval IS NOT NULL THEN
     EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s) INTO authorized USING approval,account;
     IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'reserved stream/scene requires typed campaign admission roster'; END IF;
@@ -540,7 +713,7 @@ BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results WHERE stream_id=$1)',s) INTO admitted USING sid;
   IF admitted IS DISTINCT FROM true THEN RETURN NULL; END IF;
   IF TG_OP='DELETE' THEN RAISE EXCEPTION 'admitted stream is immutable without a typed release'; END IF;
-  EXECUTE format('SELECT bool_and((SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=st.id) IS NOT DISTINCT FROM r.source_revision_id AND encode(sha256(convert_to(st.source_url,''UTF8'')),''hex'')=r.source_url_sha256 AND encode(sha256(convert_to(COALESCE(st.source_page_url,''''),''UTF8'')),''hex'')=r.source_page_url_sha256 AND st.updated_at=r.source_updated_at AND (a.failure_domain_tag IS NULL OR a.failure_domain_tag=ANY(st.tags))) FROM %I.recording_campaign_admission_results ar JOIN %I.recording_campaign_admission_reservations r ON r.approval_id=ar.approval_id AND r.stream_id=ar.stream_id JOIN %I.recording_campaign_admission_approvals a ON a.id=ar.approval_id JOIN %I.streams st ON st.id=ar.stream_id WHERE ar.stream_id=$1',s,s,s,s,s)
+  EXECUTE format('SELECT bool_and((SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=st.id) IS NOT DISTINCT FROM r.source_revision_id AND encode(sha256(convert_to(st.source_url,''UTF8'')),''hex'')=r.source_url_sha256 AND encode(sha256(convert_to(COALESCE(st.source_page_url,''''),''UTF8'')),''hex'')=r.source_page_url_sha256 AND st.updated_at=r.source_updated_at AND COALESCE(st.provider,'''')=r.provider AND COALESCE(st.external_id,'''')=r.external_id AND COALESCE(NULLIF(regexp_replace(lower(st.name),''[^a-z0-9]'','''',''g''),''''),''stream''||st.id::text)=r.normalized_label AND st.local_timezone=(SELECT value->>''timezone'' FROM jsonb_array_elements(a.schedule_spec->''stream_timezones'') value WHERE (value->>''stream_id'')::bigint=st.id) AND (a.failure_domain_tag IS NULL OR a.failure_domain_tag=ANY(st.tags)) AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_source_fence_events f WHERE f.stream_id=st.id AND f.occurred_at>=r.reserved_at)) FROM %I.recording_campaign_admission_results ar JOIN %I.recording_campaign_admission_reservations r ON r.approval_id=ar.approval_id AND r.stream_id=ar.stream_id JOIN %I.recording_campaign_admission_approvals a ON a.id=ar.approval_id JOIN %I.streams st ON st.id=ar.stream_id WHERE ar.stream_id=$1',s,s,s,s,s,s)
     INTO bound USING sid;
   IF bound IS DISTINCT FROM true THEN RAISE EXCEPTION 'admitted stream source/FD inverse seal mismatch'; END IF;
   RETURN NULL;
@@ -553,7 +726,7 @@ DECLARE s TEXT:=TG_TABLE_SCHEMA; sid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.s
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results WHERE stream_id=$1)',s) INTO admitted USING sid;
   IF admitted IS DISTINCT FROM true THEN RETURN NULL; END IF;
-  EXECUTE format('SELECT bool_and((SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=$1) IS NOT DISTINCT FROM r.source_revision_id) FROM %I.recording_campaign_admission_results ar JOIN %I.recording_campaign_admission_reservations r ON r.approval_id=ar.approval_id AND r.stream_id=ar.stream_id WHERE ar.stream_id=$1',s,s,s)
+  EXECUTE format('SELECT bool_and((SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=$1) IS NOT DISTINCT FROM r.source_revision_id AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_source_fence_events f WHERE f.stream_id=$1 AND f.occurred_at>=r.reserved_at)) FROM %I.recording_campaign_admission_results ar JOIN %I.recording_campaign_admission_reservations r ON r.approval_id=ar.approval_id AND r.stream_id=ar.stream_id WHERE ar.stream_id=$1',s,s,s,s)
     INTO bound USING sid;
   IF bound IS DISTINCT FROM true THEN RAISE EXCEPTION 'admitted stream source revision inverse seal mismatch'; END IF;
   RETURN NULL;
@@ -569,5 +742,9 @@ CREATE TRIGGER recording_campaign_admission_results_immutable BEFORE UPDATE OR D
 CREATE TRIGGER recording_campaign_admission_commits_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_admission_commits FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_admission_authorizations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_admission_tx_authorizations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_admission_source_fence_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_admission_source_fence_events FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
+CREATE TRIGGER recording_campaign_authority_decisions_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_authority_decisions FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
+CREATE TRIGGER recording_targeted_probe_orders_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_targeted_probe_orders FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
+CREATE TRIGGER recording_targeted_provider_attestations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_targeted_provider_attestations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
+CREATE TRIGGER recording_targeted_probe_scene_reviews_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_targeted_probe_scene_reviews FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 
-REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON recording_campaign_admission_approvals,recording_campaign_admission_reservations,recording_targeted_probe_attempts,recording_targeted_probe_evidence,recording_campaign_admission_results,recording_campaign_admission_commits,recording_campaign_admission_tx_authorizations,recording_campaign_admission_source_fence_events FROM PUBLIC;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON recording_campaign_authority_decisions,recording_campaign_admission_approvals,recording_campaign_admission_reservations,recording_targeted_probe_orders,recording_targeted_provider_attestations,recording_targeted_probe_attempts,recording_targeted_probe_evidence,recording_targeted_probe_scene_reviews,recording_campaign_admission_results,recording_campaign_admission_commits,recording_campaign_admission_tx_authorizations,recording_campaign_admission_source_fence_events FROM PUBLIC;

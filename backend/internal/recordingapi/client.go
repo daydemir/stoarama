@@ -17,6 +17,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/recordability"
 	"github.com/daydemir/stoarama/backend/internal/survey"
 )
 
@@ -119,6 +120,37 @@ type RecordingJob struct {
 	Kind                       string     `json:"kind"`
 	WindowEndAt                *time.Time `json:"window_end_at"`
 	TimestampContractSupported bool       `json:"timestamp_contract_supported"`
+}
+
+type TargetedProbeLease struct {
+	Target     *recordability.Target `json:"target"`
+	ApprovalID string                `json:"approval_id"`
+	RequestID  string                `json:"request_id"`
+	OrderID    string                `json:"order_id"`
+}
+
+func (c *Client) LeaseTargetedProbe(ctx context.Context) (*TargetedProbeLease, error) {
+	var out TargetedProbeLease
+	if err := c.postJSON(ctx, "/api/v1/recording/campaign-admission/lease", map[string]any{}, &out); err != nil {
+		return nil, err
+	}
+	if out.Target == nil {
+		return nil, nil
+	}
+	if out.Target.ID <= 0 || strings.TrimSpace(out.Target.AttemptID) == "" || strings.TrimSpace(out.Target.Challenge) == "" || strings.TrimSpace(out.ApprovalID) == "" || strings.TrimSpace(out.RequestID) == "" {
+		return nil, fmt.Errorf("targeted probe lease response is incomplete")
+	}
+	return &out, nil
+}
+
+func (c *Client) SubmitTargetedProbeEvidence(ctx context.Context, lease TargetedProbeLease, evidence recordability.TargetedEvidence) error {
+	return c.postJSON(ctx, "/api/v1/recording/campaign-admission/evidence", map[string]any{
+		"approval_id": lease.ApprovalID,
+		"stream_id":   lease.Target.ID,
+		"attempt_id":  lease.Target.AttemptID,
+		"request_id":  lease.RequestID,
+		"evidence":    evidence,
+	}, nil)
 }
 
 // RecordingCanarySpec is the canonical, account-scoped source returned to an
