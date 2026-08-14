@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
@@ -63,6 +65,7 @@ type batchScheduleRequest struct {
 	Delivery                     string                `json:"delivery"`
 	DryRun                       bool                  `json:"dry_run"`
 	RequiredRelaySlots           int                   `json:"required_relay_slots"`
+	CampaignAdmissionApprovalID  string                `json:"campaign_admission_approval_id"`
 }
 
 type batchStream struct {
@@ -70,6 +73,9 @@ type batchStream struct {
 	name, sourceURL, provider, timezone, captureVia string
 	timezoneMissing                                 bool
 	namingDefaults                                  catalogNamingDefaults
+	admissionEvidenceID, admissionEvidenceID2       string
+	sceneIdentity, evidenceSHA, scheduleSHA         string
+	evidenceObservedAt                              time.Time
 }
 
 func batchCaptureVia(sourceURL, provider, existing string) string {
@@ -97,6 +103,8 @@ type batchScheduleResponse struct {
 	RelayStreams       int                 `json:"relay_streams"`
 	OnlineRelaySlots   int                 `json:"online_relay_slots"`
 	RequiredRelaySlots int                 `json:"required_relay_slots"`
+	CampaignTrackID    int64               `json:"campaign_track_id,omitempty"`
+	AdmissionApproval  string              `json:"campaign_admission_approval_id,omitempty"`
 }
 
 func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +145,20 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	var admissionApprovalID uuid.UUID
+	admissionRequested := strings.TrimSpace(req.CampaignAdmissionApprovalID) != ""
+	var admissionDeadline time.Time
+	if admissionRequested {
+		if principal.UserID == 0 || principal.SessionID == nil || principal.Role != accountRoleAdmin || (principal.MemberRole != "owner" && principal.MemberRole != "admin") {
+			util.WriteError(w, http.StatusForbidden, "campaign admission requires an account owner/admin browser session")
+			return
+		}
+		admissionApprovalID, err = uuid.Parse(strings.TrimSpace(req.CampaignAdmissionApprovalID))
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, "campaign_admission_approval_id must be a UUID")
+			return
+		}
 	}
 	mode, err := parseBatchScheduleMode(req.Mode)
 	if err != nil {
@@ -241,6 +263,9 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 
 	txOptions := pgx.TxOptions{}
+	if admissionRequested {
+		txOptions.IsoLevel = pgx.Serializable
+	}
 	if req.DryRun {
 		txOptions.AccessMode = pgx.ReadOnly
 	}
@@ -250,6 +275,15 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if !req.DryRun {
+		// Campaign admission, ordinary batch scheduling, and roster occupancy all
+		// serialize account -> stream -> recording so neither commit order can
+		// bypass a pending scene reservation.
+		if _, err := tx.Exec(r.Context(), `SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE`, accountID); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "lock account scheduling occupancy")
+			return
+		}
+	}
 	streamLock := "FOR UPDATE"
 	if req.DryRun {
 		streamLock = ""
@@ -316,6 +350,43 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		if mode == batchSampled {
 			if err := recsched.ValidateCronForCreate(cronExpr, st.timezone, s.cfg.RecSchedMinIntervalSec, clipDuration); err != nil {
 				util.WriteError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+	}
+	if admissionRequested {
+		approvedSchedule := req
+		approvedSchedule.CampaignAdmissionApprovalID = ""
+		approvedSchedule.DryRun = false
+		approvedSchedule.TargetAccountID = accountID
+		scheduleSpec, marshalErr := json.Marshal(approvedSchedule)
+		if marshalErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, "encode exact campaign admission schedule")
+			return
+		}
+		var replayJSON []byte
+		replayErr := tx.QueryRow(r.Context(), `SELECT c.response_json FROM recording_campaign_admission_commits c JOIN recording_campaign_admission_approvals a ON a.id=c.approval_id WHERE c.approval_id=$1 AND c.account_id=$2 AND a.schedule_sha256=encode(sha256(convert_to($3::jsonb::text,'UTF8')),'hex')`, admissionApprovalID, accountID, scheduleSpec).Scan(&replayJSON)
+		if replayErr == nil {
+			var replay batchScheduleResponse
+			if err := json.Unmarshal(replayJSON, &replay); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "decode sealed campaign admission replay")
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, replay)
+			return
+		}
+		if !errors.Is(replayErr, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, "load sealed campaign admission replay")
+			return
+		}
+		admissionDeadline, err = bindCampaignAdmissionEvidence(r.Context(), tx, admissionApprovalID, accountID, principal.UserID, streams, endAt, s.cfg.DropletPoolBuildSHA, scheduleSpec, !req.DryRun)
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if !req.DryRun {
+			if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,actor_user_id,account_session_id) VALUES(txid_current(),'admit',$1,$2,$3,$4)`, admissionApprovalID, accountID, principal.UserID, *principal.SessionID); err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "bind campaign admission transaction")
 				return
 			}
 		}
@@ -542,14 +613,33 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		})
 		return
 	}
+	var campaignTrackID int64
+	response := batchScheduleResponse{
+		Items: items, Created: created, Updated: updated,
+		RelayStreams: relayStreams, OnlineRelaySlots: onlineRelaySlots, RequiredRelaySlots: requiredRelaySlots,
+	}
+	if admissionRequested {
+		campaignTrackID, err = persistCampaignAdmission(r.Context(), tx, admissionApprovalID, accountID, principal.UserID, admissionDeadline, streams, items)
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		response.CampaignTrackID, response.AdmissionApproval = campaignTrackID, req.CampaignAdmissionApprovalID
+		responseJSON, marshalErr := json.Marshal(response)
+		if marshalErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, "encode sealed campaign admission response")
+			return
+		}
+		if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_commits(approval_id,account_id,actor_user_id,track_id,schedule_sha256,response_json,response_sha256) SELECT $1,$2,$3,$4,schedule_sha256,$5::jsonb,encode(sha256(convert_to($5::jsonb::text,'UTF8')),'hex') FROM recording_campaign_admission_approvals WHERE id=$1 AND account_id=$2`, admissionApprovalID, accountID, principal.UserID, campaignTrackID, responseJSON); err != nil {
+			util.WriteError(w, http.StatusConflict, "seal campaign admission replay response")
+			return
+		}
+	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit batch schedule")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, batchScheduleResponse{
-		Items: items, Created: created, Updated: updated,
-		RelayStreams: relayStreams, OnlineRelaySlots: onlineRelaySlots, RequiredRelaySlots: requiredRelaySlots,
-	})
+	util.WriteJSON(w, http.StatusOK, response)
 }
 
 func availableRelayCapacity(ctx context.Context, q interface {

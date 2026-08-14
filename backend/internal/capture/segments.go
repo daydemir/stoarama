@@ -1397,6 +1397,13 @@ func extractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentT
 	}, nil
 }
 
+// ExtractSegmentThumbnail returns a bounded decoded-frame proof from finalized
+// bytes. Callers own the returned file and must remove it with their probe temp
+// directory. Capture bytes are never changed.
+func ExtractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentThumbnail, error) {
+	return extractSegmentThumbnail(ctx, segmentPath)
+}
+
 type ffprobeMeta struct {
 	DurationMs   int64
 	ActualFPS    *float64

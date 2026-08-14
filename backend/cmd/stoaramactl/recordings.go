@@ -18,7 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | approve-admission | schedule-batch | campaign-postflight | capture-health | repair-source | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -26,6 +26,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if args[0] == "schedule-batch" {
 		runRecordingScheduleBatch(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] == "approve-admission" {
+		runRecordingApproveAdmission(ctx, args[1:])
 		return
 	}
 	if args[0] == "campaign-postflight" {
@@ -389,6 +393,7 @@ type recordingBatchSpec struct {
 	Delivery                     recordingDeliveryMode    `json:"delivery"`
 	DryRun                       bool                     `json:"dry_run"`
 	RequiredRelaySlots           int                      `json:"required_relay_slots"`
+	CampaignAdmissionApprovalID  string                   `json:"campaign_admission_approval_id"`
 }
 
 type recordingBatchResult struct {
@@ -398,12 +403,14 @@ type recordingBatchResult struct {
 		Action      string `json:"action"`
 		Timezone    string `json:"timezone"`
 	} `json:"items"`
-	Created            int  `json:"created"`
-	Updated            int  `json:"updated"`
-	DryRun             bool `json:"dry_run"`
-	RelayStreams       int  `json:"relay_streams"`
-	OnlineRelaySlots   int  `json:"online_relay_slots"`
-	RequiredRelaySlots int  `json:"required_relay_slots"`
+	Created            int    `json:"created"`
+	Updated            int    `json:"updated"`
+	DryRun             bool   `json:"dry_run"`
+	RelayStreams       int    `json:"relay_streams"`
+	OnlineRelaySlots   int    `json:"online_relay_slots"`
+	RequiredRelaySlots int    `json:"required_relay_slots"`
+	CampaignTrackID    int64  `json:"campaign_track_id"`
+	AdmissionApproval  string `json:"campaign_admission_approval_id"`
 }
 
 func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
@@ -488,6 +495,7 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 	jsonOutput := fs.Bool("json", false, "print the complete JSON response for campaign postflight")
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
+	sessionCookiePath := fs.String("session-cookie-file", "", "member-session cookie file (required for protected admission)")
 	_ = fs.Parse(args)
 	if strings.TrimSpace(*specPath) == "" {
 		log.Fatal("--spec is required")
@@ -511,7 +519,17 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 		spec.DryRun = dryRun.value
 	}
 	var result recordingBatchResult
-	if err := postJSONWithToken(ctx, *backendAPIURL, *apiToken, "/api/v1/account/recordings/batch-schedule", spec, &result); err != nil {
+	if strings.TrimSpace(spec.CampaignAdmissionApprovalID) != "" {
+		cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		generic := postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/batch-schedule", spec)
+		raw, _ := json.Marshal(generic)
+		if err := json.Unmarshal(raw, &result); err != nil {
+			log.Fatalf("decode protected schedule response: %v", err)
+		}
+	} else if err := postJSONWithToken(ctx, *backendAPIURL, *apiToken, "/api/v1/account/recordings/batch-schedule", spec, &result); err != nil {
 		log.Fatalf("schedule recordings: %v", err)
 	}
 	if *jsonOutput {
@@ -522,11 +540,52 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 		fmt.Println(string(out))
 		return
 	}
-	fmt.Printf("dry_run=%t created=%d updated=%d relay_streams=%d online_relay_slots=%d required_relay_slots=%d\n",
-		result.DryRun, result.Created, result.Updated, result.RelayStreams, result.OnlineRelaySlots, result.RequiredRelaySlots)
+	fmt.Printf("dry_run=%t created=%d updated=%d relay_streams=%d online_relay_slots=%d required_relay_slots=%d campaign_track_id=%d approval_id=%s\n",
+		result.DryRun, result.Created, result.Updated, result.RelayStreams, result.OnlineRelaySlots, result.RequiredRelaySlots, result.CampaignTrackID, result.AdmissionApproval)
 	for _, item := range result.Items {
 		fmt.Printf("stream_id=%d recording_id=%d action=%s timezone=%s\n", item.StreamID, item.RecordingID, item.Action, item.Timezone)
 	}
+}
+
+func runRecordingApproveAdmission(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("recordings approve-admission", flag.ExitOnError)
+	specPath := fs.String("spec", "", "strict JSON approval envelope")
+	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	_ = fs.Parse(args)
+	if strings.TrimSpace(*specPath) == "" {
+		log.Fatal("--spec is required")
+	}
+	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := os.Open(*specPath)
+	if err != nil {
+		log.Fatalf("open --spec: %v", err)
+	}
+	defer f.Close()
+	payload, err := decodeCampaignAdmissionSpec(f)
+	if err != nil {
+		log.Fatalf("decode --spec: %v", err)
+	}
+	printJSON(postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/approvals", payload))
+}
+
+func decodeCampaignAdmissionSpec(r io.Reader) (json.RawMessage, error) {
+	dec := json.NewDecoder(io.LimitReader(r, 1<<20))
+	var payload json.RawMessage
+	if err := dec.Decode(&payload); err != nil {
+		return nil, err
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("approval spec must contain one JSON object")
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("approval spec must contain exactly one JSON object")
+	}
+	return payload, nil
 }
 
 func runRecordingNamingPreview(args []string) {
