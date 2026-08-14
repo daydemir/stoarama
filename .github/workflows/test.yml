@@ -79,11 +79,12 @@ jobs:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: |
           set -o pipefail
-          go test ./internal/db ./internal/api ./internal/recordability -run 'Test(RecordingCampaignAdmissionMigrationFencesAndSealsActivation|CampaignAdmissionHandlersPersistReplayAndSealExactBatch|CampaignAdmissionApprovalRequiresExactOperatorSession|NormalizeCampaignAdmissionEntriesCanonicalAndExact|TargetedEvidenceReplayComparisonExact|VerifyTargetedQuarantineUsesExactMediaBytesAndRetainsVersions|NativeSegmentSignatureBindsAllStoredMediaFacts|TargetedChallengeProofCannotReplayAcrossAttempts)' -count=1 -json | tee /tmp/campaign-admission-pg.json
+          go test ./internal/db ./internal/api ./internal/recordability -run 'Test(RecordingCampaignAdmissionMigrationFencesAndSealsActivation|RecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses|CampaignAdmissionHandlersPersistReplayAndSealExactBatch|CampaignAdmissionApprovalRequiresExactOperatorSession|NormalizeCampaignAdmissionEntriesCanonicalAndExact|TargetedEvidenceReplayComparisonExact|VerifyTargetedQuarantineUsesExactMediaBytesAndRetainsVersions|NativeSegmentSignatureBindsAllStoredMediaFacts|TargetedChallengeProofCannotReplayAcrossAttempts)' -count=1 -json | tee /tmp/campaign-admission-pg.json
           ! grep -F '"Action":"skip"' /tmp/campaign-admission-pg.json
           ! grep -F 'testing: warning: no tests to run' /tmp/campaign-admission-pg.json
           for test_name in \
             TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation \
+            TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses \
             TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch \
             TestCampaignAdmissionApprovalRequiresExactOperatorSession \
             TestNormalizeCampaignAdmissionEntriesCanonicalAndExact \

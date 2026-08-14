@@ -194,3 +194,43 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		t.Fatalf("A-B-A source mutation did not append two permanent fence events: count=%d err=%v", fenceEvents, err)
 	}
 }
+
+func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0140_targeted_campaign_admission.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"hashtextextended('campaign-admission-capacity-v1',0)",
+		"GRANT INSERT ON TABLE %I.recording_campaign_tracks,%I.recording_campaign_roster_entries,%I.recording_campaign_roster_events,%I.recording_campaign_track_events",
+		"GRANT UPDATE ON TABLE %I.recording_campaign_tracks",
+		"recording_campaign_roster_events_id_seq",
+		"recording_campaign_track_events_id_seq",
+		"JOIN %I.recording_campaign_admission_approvals approval ON approval.id=$5 AND approval.account_id=$3",
+		"campaign capacity witness differs from authority rows",
+		"campaign NAS witness differs from authority rows",
+		"recording_targeted_probe_scene_presentations",
+		"presentation.presented_at<recording_campaign_now()-interval '30 minutes'",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("0140 omitted reviewed cross-boundary closure %q", required)
+		}
+	}
+	if strings.Contains(sql, "campaign_admission_capacity_v1") {
+		t.Fatal("0140 retained a second advisory-lock namespace")
+	}
+	if strings.Contains(sql, "AND n.account_id=requested_account") || strings.Contains(sql, "AND n.account_id=$3") {
+		t.Fatal("0140 still binds infrastructure cloud nodes to the customer account")
+	}
+	if strings.Contains(sql, "admitted.id IS NULL") {
+		t.Fatal("0140 lets completed admissions disappear from reciprocal occupancy fencing")
+	}
+	renderRaw, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(renderRaw), "key: STOARAMA_ADMISSION_EXECUTOR_ROLE\n        value: stoarama_admission_executor") {
+		t.Fatal("Render API blueprint omits the reviewed executor role identity")
+	}
+}

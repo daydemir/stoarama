@@ -307,6 +307,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/campaign-tracks", s.handleAccountRecordingCampaignTracks)
 			account.Post("/recordings/campaign-admission/approvals", s.handleAccountCampaignAdmissionApprovalCreate)
 			account.Post("/recordings/campaign-admission/probe-orders", s.handleAccountCampaignAdmissionProbeOrderCreate)
+			account.Get("/recordings/campaign-admission/scene-presentations/{evidenceId}", s.handleAccountCampaignAdmissionScenePresentationGet)
 			account.Post("/recordings/campaign-admission/scene-reviews", s.handleAccountCampaignAdmissionSceneReviewCreate)
 			account.Post("/recordings/qualification/scene-attest", s.handleAccountRecordingSceneAttest)
 			account.Post("/recordings/qualification/build", s.handleAccountRecordingQualificationBuild)

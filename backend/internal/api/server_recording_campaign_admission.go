@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -553,6 +554,7 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 type campaignAdmissionSceneReviewRequest struct {
 	ApprovalID      string `json:"approval_id"`
 	ProbeEvidenceID string `json:"probe_evidence_id"`
+	PresentationID  string `json:"presentation_id"`
 	RequestID       string `json:"request_id"`
 }
 
@@ -574,13 +576,14 @@ func (s *Server) handleAccountCampaignAdmissionSceneReviewCreate(w http.Response
 	}
 	approvalID, approvalErr := uuid.Parse(strings.TrimSpace(req.ApprovalID))
 	evidenceID, evidenceErr := uuid.Parse(strings.TrimSpace(req.ProbeEvidenceID))
+	presentationID, presentationErr := uuid.Parse(strings.TrimSpace(req.PresentationID))
 	requestID, requestErr := uuid.Parse(strings.TrimSpace(req.RequestID))
-	if approvalErr != nil || evidenceErr != nil || requestErr != nil {
-		util.WriteError(w, http.StatusBadRequest, "approval_id, probe_evidence_id, and request_id must be UUIDs")
+	if approvalErr != nil || evidenceErr != nil || presentationErr != nil || requestErr != nil {
+		util.WriteError(w, http.StatusBadRequest, "approval_id, probe_evidence_id, presentation_id, and request_id must be UUIDs")
 		return
 	}
 	var replayID, replaySHA string
-	replayErr := s.pool.QueryRow(r.Context(), `SELECT id::text,review_sha256 FROM recording_targeted_probe_scene_reviews WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND probe_evidence_id=$4 AND reviewed_by_user_id=$5`, p.AccountID, requestID, approvalID, evidenceID, p.UserID).Scan(&replayID, &replaySHA)
+	replayErr := s.pool.QueryRow(r.Context(), `SELECT id::text,review_sha256 FROM recording_targeted_probe_scene_reviews WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND probe_evidence_id=$4 AND presentation_id=$5 AND reviewed_by_user_id=$6`, p.AccountID, requestID, approvalID, evidenceID, presentationID, p.UserID).Scan(&replayID, &replaySHA)
 	if replayErr == nil {
 		util.WriteJSON(w, http.StatusCreated, map[string]any{"scene_review_id": replayID, "review_sha256": replaySHA, "probe_evidence_id": evidenceID})
 		return
@@ -589,12 +592,56 @@ func (s *Server) handleAccountCampaignAdmissionSceneReviewCreate(w http.Response
 		util.WriteError(w, http.StatusInternalServerError, "load targeted scene review replay")
 		return
 	}
-	err := s.admissionPool.QueryRow(r.Context(), `SELECT review_id::text,review_sha256 FROM recording_campaign_review_probe_scene($1,$2,$3,$4,$5,$6,$7)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, evidenceID).Scan(&replayID, &replaySHA)
+	err := s.admissionPool.QueryRow(r.Context(), `SELECT review_id::text,review_sha256 FROM recording_campaign_review_probe_scene($1,$2,$3,$4,$5,$6,$7,$8)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, evidenceID, presentationID).Scan(&replayID, &replaySHA)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted scene review is not exact or fresh")
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"scene_review_id": replayID, "review_sha256": replaySHA, "probe_evidence_id": evidenceID})
+}
+
+func (s *Server) handleAccountCampaignAdmissionScenePresentationGet(w http.ResponseWriter, r *http.Request) {
+	p, ok := accountPrincipalFromContext(r.Context())
+	store := s.campaignProbeObjects()
+	if !ok || p.UserID == 0 || p.SessionID == nil || p.Role != accountRoleAdmin ||
+		!strings.EqualFold(strings.TrimSpace(p.Email), strings.TrimSpace(s.cfg.DropletPoolOperatorEmail)) || store == nil {
+		util.WriteError(w, http.StatusForbidden, "targeted scene presentation requires Deniz's exact operator browser session")
+		return
+	}
+	evidenceID, evidenceErr := uuid.Parse(strings.TrimSpace(chi.URLParam(r, "evidenceId")))
+	requestID, requestErr := uuid.Parse(strings.TrimSpace(r.URL.Query().Get("request_id")))
+	if evidenceErr != nil || requestErr != nil {
+		util.WriteError(w, http.StatusBadRequest, "evidenceId and request_id must be UUIDs")
+		return
+	}
+	var approvalID uuid.UUID
+	var key, etag, version, wantSHA string
+	var size int64
+	if err := s.pool.QueryRow(r.Context(), `SELECT approval_id,frame_archive_object_key,frame_archive_etag,COALESCE(frame_archive_version_id,''),frame_archive_sha256,frame_size_bytes FROM recording_targeted_probe_evidence WHERE id=$1 AND account_id=$2 AND result='ok'`, evidenceID, p.AccountID).Scan(&approvalID, &key, &etag, &version, &wantSHA, &size); err != nil {
+		util.WriteError(w, http.StatusNotFound, "targeted scene evidence was not found")
+		return
+	}
+	body, err := readExactObjectBounded(r.Context(), store.OpenExact, key, etag, version, size, targetedProbeFrameMaxBytes)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "protected targeted frame is unavailable or changed")
+		return
+	}
+	sum := sha256.Sum256(body)
+	if hex.EncodeToString(sum[:]) != wantSHA {
+		util.WriteError(w, http.StatusConflict, "protected targeted frame digest changed")
+		return
+	}
+	var presentationID, presentationSHA string
+	if err := s.admissionPool.QueryRow(r.Context(), `SELECT presentation_id::text,presentation_sha256 FROM recording_campaign_present_probe_scene($1,$2,$3,$4,$5,$6,$7)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, evidenceID).Scan(&presentationID, &presentationSHA); err != nil {
+		util.WriteError(w, http.StatusConflict, "targeted scene presentation was not sealed")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{
+		"presentation_id": presentationID, "presentation_sha256": presentationSHA,
+		"approval_id": approvalID, "probe_evidence_id": evidenceID,
+		"frame_sha256": wantSHA, "content_type": "image/jpeg",
+		"frame_base64": base64.StdEncoding.EncodeToString(body),
+	})
 }
 
 func (s *Server) handleAccountCampaignAdmissionProbeOrderCreate(w http.ResponseWriter, r *http.Request) {
@@ -716,7 +763,7 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 	// approval, or source freshness. A committed response must remain replayable
 	// after any of those live prerequisites expire.
 	var replayID, replaySHA, replayResult, replayDetail string
-	replayErr := s.pool.QueryRow(r.Context(), `SELECT e.id::text,e.evidence_sha256,e.result,e.detail FROM recording_targeted_probe_evidence e JOIN recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.attempt_id=$1 AND a.request_id=$2 AND e.approval_id=$3 AND e.stream_id=$4 AND e.account_id=$5 AND a.node_id=$6`, attemptID, requestID, approvalID, req.StreamID, p.AccountID, p.NodeID).Scan(&replayID, &replaySHA, &replayResult, &replayDetail)
+	replayErr := s.pool.QueryRow(r.Context(), `SELECT e.id::text,e.evidence_sha256,e.result,e.detail FROM recording_targeted_probe_evidence e JOIN recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.attempt_id=$1 AND a.request_id=$2 AND e.approval_id=$3 AND e.stream_id=$4 AND a.node_id=$5`, attemptID, requestID, approvalID, req.StreamID, p.NodeID).Scan(&replayID, &replaySHA, &replayResult, &replayDetail)
 	if replayErr == nil {
 		if replayResult != req.Evidence.Result || (replayResult != recordability.ResultOK && replayDetail != req.Evidence.Detail) {
 			util.WriteError(w, http.StatusConflict, "targeted evidence request idempotency conflict")
@@ -729,9 +776,10 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 		util.WriteError(w, http.StatusInternalServerError, "load targeted evidence replay")
 		return
 	}
+	var targetAccountID int64
 	var challenge, mediaKey, frameKey string
 	var mediaMax, frameMax int64
-	err = s.pool.QueryRow(r.Context(), `SELECT challenge,media_object_key,frame_object_key,media_max_size_bytes,frame_max_size_bytes FROM recording_targeted_probe_attempts WHERE id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND account_id=$5 AND node_id=$6`, attemptID, requestID, approvalID, req.StreamID, p.AccountID, p.NodeID).Scan(&challenge, &mediaKey, &frameKey, &mediaMax, &frameMax)
+	err = s.pool.QueryRow(r.Context(), `SELECT account_id,challenge,media_object_key,frame_object_key,media_max_size_bytes,frame_max_size_bytes FROM recording_targeted_probe_attempts WHERE id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND node_id=$5`, attemptID, requestID, approvalID, req.StreamID, p.NodeID).Scan(&targetAccountID, &challenge, &mediaKey, &frameKey, &mediaMax, &frameMax)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted attempt identity does not match")
 		return
@@ -785,7 +833,7 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 	}
 	var evidenceID string
 	var evidenceSHA string
-	err = s.admissionPool.QueryRow(r.Context(), `SELECT evidence_id::text,evidence_sha256 FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, attemptID, requestID, approvalID, p.AccountID, req.StreamID, observationJSON).Scan(&evidenceID, &evidenceSHA)
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT evidence_id::text,evidence_sha256 FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, attemptID, requestID, approvalID, targetAccountID, req.StreamID, observationJSON).Scan(&evidenceID, &evidenceSHA)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted evidence failed server/DB attestation")
 		return

@@ -2,9 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,13 +21,15 @@ import (
 
 func runRecordability(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recordability <run-once|run-targeted|review-targeted> ...")
+		log.Fatalf("usage: stoaramactl recordability <run-once|run-targeted|present-targeted|review-targeted> ...")
 	}
 	switch args[0] {
 	case "run-once":
 		runRecordabilityRunOnce(ctx, cfg, args[1:])
 	case "run-targeted":
 		runRecordabilityTargeted(ctx, cfg, args[1:])
+	case "present-targeted":
+		runRecordabilityTargetedPresent(ctx, cfg, args[1:])
 	case "review-targeted":
 		runRecordabilityTargetedReview(ctx, cfg, args[1:])
 	default:
@@ -33,6 +41,7 @@ func runRecordabilityTargetedReview(ctx context.Context, cfg config.Config, args
 	fs := flag.NewFlagSet("recordability review-targeted", flag.ExitOnError)
 	approvalRaw := fs.String("approval-id", "", "exact immutable campaign approval UUID")
 	evidenceRaw := fs.String("probe-evidence-ids", "", "exact comma-separated server-derived probe evidence UUIDs reviewed against the approved scene")
+	presentationRaw := fs.String("presentation-receipt-ids", "", "exact comma-separated protected presentation receipt UUIDs, in evidence order")
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
 	asJSON := fs.Bool("json", false, "print JSON")
@@ -56,19 +65,105 @@ func runRecordabilityTargetedReview(ctx context.Context, cfg config.Config, args
 		seen[id] = true
 		evidenceIDs = append(evidenceIDs, id)
 	}
+	rawPresentationIDs := strings.Split(strings.TrimSpace(*presentationRaw), ",")
+	if len(rawPresentationIDs) != len(evidenceIDs) || strings.TrimSpace(*presentationRaw) == "" {
+		log.Fatal("--presentation-receipt-ids must contain one receipt for each probe evidence ID")
+	}
+	presentationIDs := make([]uuid.UUID, 0, len(rawPresentationIDs))
+	for _, raw := range rawPresentationIDs {
+		id, parseErr := uuid.Parse(strings.TrimSpace(raw))
+		if parseErr != nil {
+			log.Fatalf("--presentation-receipt-ids must contain UUIDs: %v", parseErr)
+		}
+		presentationIDs = append(presentationIDs, id)
+	}
 	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	results := make([]map[string]any, 0, len(evidenceIDs))
-	for _, evidenceID := range evidenceIDs {
-		results = append(results, postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/scene-reviews", map[string]any{"approval_id": approvalID, "probe_evidence_id": evidenceID, "request_id": uuid.New()}))
+	for i, evidenceID := range evidenceIDs {
+		results = append(results, postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/scene-reviews", map[string]any{"approval_id": approvalID, "probe_evidence_id": evidenceID, "presentation_id": presentationIDs[i], "request_id": uuid.New()}))
 	}
 	if *asJSON {
 		printJSON(map[string]any{"approval_id": approvalID, "scene_reviews": results})
 		return
 	}
 	fmt.Printf("approval_id=%s reviewed=%d\n", approvalID, len(results))
+}
+
+func runRecordabilityTargetedPresent(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordability present-targeted", flag.ExitOnError)
+	evidenceRaw := fs.String("probe-evidence-ids", "", "exact comma-separated server-derived probe evidence UUIDs")
+	outputDir := fs.String("output-dir", "", "existing private directory for protected review frames")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
+	_ = fs.Parse(args)
+	_ = cfg
+	if strings.TrimSpace(*outputDir) == "" {
+		log.Fatal("--output-dir is required")
+	}
+	info, err := os.Stat(*outputDir)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		log.Fatal("--output-dir must be an existing private directory (mode 0700)")
+	}
+	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var receipts []map[string]any
+	seen := map[uuid.UUID]bool{}
+	for _, raw := range strings.Split(strings.TrimSpace(*evidenceRaw), ",") {
+		evidenceID, parseErr := uuid.Parse(strings.TrimSpace(raw))
+		if parseErr != nil || seen[evidenceID] {
+			log.Fatalf("--probe-evidence-ids must contain unique UUIDs: %v", parseErr)
+		}
+		seen[evidenceID] = true
+		requestID := uuid.New()
+		path := fmt.Sprintf("/api/v1/account/recordings/campaign-admission/scene-presentations/%s?request_id=%s", evidenceID, requestID)
+		presentation := getRecordingSessionJSON(ctx, *backendAPIURL, cookie, path)
+		encoded, ok := presentation["frame_base64"].(string)
+		if !ok {
+			log.Fatal("scene presentation omitted protected frame bytes")
+		}
+		frame, decodeErr := base64.StdEncoding.DecodeString(encoded)
+		if decodeErr != nil || len(frame) == 0 || len(frame) > recordability.TargetedFrameMaxBytes {
+			log.Fatal("scene presentation returned invalid frame bytes")
+		}
+		file := filepath.Join(*outputDir, evidenceID.String()+".jpg")
+		if writeErr := os.WriteFile(file, frame, 0o600); writeErr != nil {
+			log.Fatalf("write protected scene frame: %v", writeErr)
+		}
+		delete(presentation, "frame_base64")
+		presentation["local_frame"] = file
+		receipts = append(receipts, presentation)
+	}
+	printJSON(map[string]any{"presentations": receipts})
+}
+
+func getRecordingSessionJSON(ctx context.Context, baseURL, cookie, path string) map[string]any {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+path, nil)
+	if err != nil {
+		log.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Cookie", cookie)
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		log.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(recordability.TargetedFrameMaxBytes*4/3)+(1<<20)))
+	if err != nil {
+		log.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Fatalf("request failed status=%d body=%q", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		log.Fatalf("decode response status=%d: %v", resp.StatusCode, err)
+	}
+	return out
 }
 
 func runRecordabilityTargeted(ctx context.Context, cfg config.Config, args []string) {

@@ -308,6 +308,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		return dropletpool.ProviderAttestation{DropletID: dropletID, Name: name, Region: "nyc1", Status: "active"}, nil
 	}
 	userID, accountID := seedUserOrg(t, pool, "deniz@example.test", true)
+	_, infrastructureAccountID := seedUserOrg(t, pool, "cloud-infrastructure@example.test", false)
 	const rawSession = "campaign-admission-session"
 	insertSession(t, pool, accountID, userID, rawSession)
 	ctx := context.Background()
@@ -335,7 +336,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO recording_scene_frame_evidence(account_id,stream_id,frame_id,media_object_id,captured_at,frame_sha256,scene_identity_sha256,verification_method,verified_by_user_id,evidence_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,'operator_visual',$8,$9) RETURNING id`, accountID, streamID, frameID, mediaID, capturedAt, frameSHA, sceneSHA, userID, strings.Repeat("0", 64)).Scan(&sceneEvidenceID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,'worker-test','local_recorder','active',now(),1) RETURNING id`, accountID).Scan(&nodeID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,'worker-test','local_recorder','active',now(),1) RETURNING id`, infrastructureAccountID).Scan(&nodeID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'campaign01',$2)`, nodeID, hashSecret("node-token")); err != nil {
@@ -345,7 +346,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var standbyNodeID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,'worker-standby','local_recorder','active',now(),1) RETURNING id`, accountID).Scan(&standbyNodeID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,'worker-standby','local_recorder','active',now(),1) RETURNING id`, infrastructureAccountID).Scan(&standbyNodeID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'campaign02',$2)`, standbyNodeID, hashSecret("standby-node-token")); err != nil {
@@ -465,7 +466,22 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		if replayed.Code != http.StatusCreated || replayed.Body.String() != evidence.Body.String() {
 			t.Fatalf("evidence replay %d changed: first=%s second=%s", attemptIndex+1, evidence.Body.String(), replayed.Body.String())
 		}
-		reviewBody, _ := json.Marshal(campaignAdmissionSceneReviewRequest{ApprovalID: approvalResponse.ApprovalID, ProbeEvidenceID: evidenceResponse.EvidenceID, RequestID: uuid.NewString()})
+		presentationRequestID := uuid.NewString()
+		presentationReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/campaign-admission/scene-presentations/"+evidenceResponse.EvidenceID+"?request_id="+presentationRequestID, nil)
+		presentationReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+		presentationRec := httptest.NewRecorder()
+		router.ServeHTTP(presentationRec, presentationReq)
+		if presentationRec.Code != http.StatusOK {
+			t.Fatalf("scene presentation %d status=%d body=%s", attemptIndex+1, presentationRec.Code, presentationRec.Body.String())
+		}
+		var presentationResponse struct {
+			PresentationID string `json:"presentation_id"`
+			FrameBase64    string `json:"frame_base64"`
+		}
+		if err := json.Unmarshal(presentationRec.Body.Bytes(), &presentationResponse); err != nil || presentationResponse.PresentationID == "" || presentationResponse.FrameBase64 == "" {
+			t.Fatalf("decode protected scene presentation %d: err=%v body=%s", attemptIndex+1, err, presentationRec.Body.String())
+		}
+		reviewBody, _ := json.Marshal(campaignAdmissionSceneReviewRequest{ApprovalID: approvalResponse.ApprovalID, ProbeEvidenceID: evidenceResponse.EvidenceID, PresentationID: presentationResponse.PresentationID, RequestID: uuid.NewString()})
 		review := postOperator("/api/v1/account/recordings/campaign-admission/scene-reviews", reviewBody)
 		if review.Code != http.StatusCreated {
 			t.Fatalf("scene review %d status=%d body=%s", attemptIndex+1, review.Code, review.Body.String())

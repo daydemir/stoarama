@@ -38,7 +38,7 @@ func main() {
 		log.Fatalf("open db: %v", err)
 	}
 	defer pool.Close()
-	admissionPool, err := db.OpenCampaignExecutor(ctx, cfg.AdmissionDatabaseURL, "stoarama_admission_executor", "stoarama_admission_authority")
+	admissionPool, err := db.OpenCampaignExecutor(ctx, cfg.AdmissionDatabaseURL, cfg.AdmissionExecutorRole, cfg.AdmissionAuthorityRole)
 	if err != nil {
 		log.Fatalf("open admission executor db: %v", err)
 	}

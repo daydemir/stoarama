@@ -47,6 +47,8 @@ services:
         value: runtime
       - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
         value: stoarama_admission_authority
+      - key: STOARAMA_ADMISSION_EXECUTOR_ROLE
+        value: stoarama_admission_executor
       - key: R2_ACCOUNT_ID
         sync: false
       - key: R2_ACCESS_KEY_ID
