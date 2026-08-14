@@ -51,7 +51,7 @@ func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
 			t.Fatalf("droplet lock SQL missing %q", want)
 		}
 	}
-	for _, want := range []string{"live.lease_owner = $1", "live.lease_expires_at > now()", ") < $5"} {
+	for _, want := range []string{"live.lease_owner = $1", "live.lease_expires_at > now()", ") < $5", "j.handoff_owner=$1 AND j.handoff_until>now()", "retry_alternate.name<>$1"} {
 		if !strings.Contains(cloudRecordingJobsLeaseSQL, want) {
 			t.Fatalf("lease SQL missing %q", want)
 		}

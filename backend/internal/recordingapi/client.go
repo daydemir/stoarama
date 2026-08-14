@@ -119,6 +119,7 @@ type RecordingJob struct {
 	Kind                       string     `json:"kind"`
 	WindowEndAt                *time.Time `json:"window_end_at"`
 	TimestampContractSupported bool       `json:"timestamp_contract_supported"`
+	SurrenderTransportVersion  int        `json:"surrender_transport_version,omitempty"`
 }
 
 // RecordingCanarySpec is the canonical, account-scoped source returned to an
@@ -172,6 +173,63 @@ type ClipUploadIntent struct {
 	AlreadyIngested bool      `json:"already_ingested"`
 }
 
+// CaptureProducer is the server-sealed identity of one ffmpeg producer. It is
+// reserved before ffmpeg can create bytes; every artifact produced by that
+// invocation is subsequently sealed against ProducerID.
+type CaptureProducer struct {
+	ProducerID     string `json:"producer_id"`
+	CaptureOrdinal int64  `json:"capture_ordinal"`
+}
+
+type ClipIngestResult struct {
+	ClipID         int64  `json:"clip_id"`
+	HeadVersion    int64  `json:"head_version,omitempty"`
+	UploadIntentID string `json:"head_upload_intent_id,omitempty"`
+}
+
+type SurrenderRequest struct {
+	AttemptID            string
+	Reason               SurrenderReason
+	ErrorText            string
+	ExpectedHeadVersion  int64
+	ExpectedUploadIntent string
+	ExpectedClipID       int64
+	SpoolCount           int
+	SpoolBytes           int64
+	InFlightCount        int
+}
+
+type SurrenderResult struct {
+	Result                string    `json:"result"`
+	HandoffUntil          time.Time `json:"handoff_until,omitempty"`
+	NextRetryAt           time.Time `json:"next_retry_at,omitempty"`
+	HadClips              bool      `json:"had_clips,omitempty"`
+	AlternateAvailable    bool      `json:"alternate_available,omitempty"`
+	CurrentHeadVersion    int64     `json:"current_head_version"`
+	CurrentUploadIntentID string    `json:"current_upload_intent_id,omitempty"`
+	CurrentClipID         int64     `json:"current_clip_id,omitempty"`
+}
+
+type RecoveryArtifact struct {
+	IntentID        string `json:"intent_id"`
+	CaptureSequence int64  `json:"capture_sequence"`
+	SegmentStartMs  int64  `json:"segment_start_ms"`
+	SizeBytes       int64  `json:"size_bytes"`
+	SHA256          string `json:"sha256"`
+	Result          string `json:"result,omitempty"`
+}
+
+type RecoveryStatus struct {
+	ProducerID          string             `json:"producer_id"`
+	JobID               int64              `json:"job_id"`
+	LeaseToken          string             `json:"lease_token"`
+	ExpiresAt           time.Time          `json:"expires_at"`
+	Authority           string             `json:"authority"`
+	ProducerResult      string             `json:"producer_result,omitempty"`
+	NextCaptureSequence int64              `json:"next_capture_sequence"`
+	Artifacts           []RecoveryArtifact `json:"artifacts"`
+}
+
 // IngestClipRequest carries the captured clip's metadata to the ingest endpoint.
 type IngestClipRequest struct {
 	IntentID                string
@@ -223,6 +281,16 @@ func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
 // object-key derivation to the server and keeps the request compatible with an
 // older API during a rollback.
 func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, leaseToken, mimeType, sha256 string, segmentStartMs int64) (ClipUploadIntent, error) {
+	return c.ReserveClipUploadV1(ctx, jobID, leaseToken, mimeType, sha256, segmentStartMs, "", 0, 0)
+}
+
+// ReserveClipUploadV1 seals a finalized artifact against its pre-reserved
+// producer. Empty producerID preserves the rollback-compatible legacy request.
+func (c *Client) ReserveClipUploadV1(ctx context.Context, jobID int64, leaseToken, mimeType, sha256 string, segmentStartMs int64, producerID string, captureSequence, sizeBytes int64) (ClipUploadIntent, error) {
+	return c.reserveClipUploadV1(ctx, jobID, leaseToken, mimeType, sha256, segmentStartMs, producerID, captureSequence, sizeBytes, nil)
+}
+
+func (c *Client) reserveClipUploadV1(ctx context.Context, jobID int64, leaseToken, mimeType, sha256 string, segmentStartMs int64, producerID string, captureSequence, sizeBytes int64, extraHeaders map[string]string) (ClipUploadIntent, error) {
 	payload := map[string]any{"job_id": jobID, "mime_type": strings.TrimSpace(mimeType)}
 	// Only generation-aware servers understand the hash preflight field. If a
 	// freshly rolled worker briefly reaches the previous API during deployment,
@@ -235,13 +303,47 @@ func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, leaseToken,
 		payload["segment_start_ms"] = segmentStartMs
 		idemKey = fmt.Sprintf("recording-seg-%d-%d", jobID, segmentStartMs)
 	}
+	if producerID = strings.TrimSpace(producerID); producerID != "" {
+		payload["producer_id"] = producerID
+		payload["capture_sequence"] = captureSequence
+		payload["size_bytes"] = sizeBytes
+	}
 	headers := leaseTokenHeaders(leaseToken)
+	for key, value := range extraHeaders {
+		headers[key] = value
+	}
 	headers["Idempotency-Key"] = idemKey
 	var out ClipUploadIntent
 	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/upload-intents", payload, headers, &out); err != nil {
 		return ClipUploadIntent{}, err
 	}
 	return out, nil
+}
+
+func recoveryHeaders(producerID, secret string) map[string]string {
+	return map[string]string{
+		"X-Stoarama-Recording-Recovery-Producer": strings.TrimSpace(producerID),
+		"X-Stoarama-Recording-Recovery-Secret":   strings.TrimSpace(secret),
+	}
+}
+
+func (c *Client) ReserveClipUploadRecovery(ctx context.Context, jobID int64, leaseToken, mimeType, sha256 string, segmentStartMs int64, producerID, recoverySecret string, captureSequence, sizeBytes int64) (ClipUploadIntent, error) {
+	return c.reserveClipUploadV1(ctx, jobID, leaseToken, mimeType, sha256, segmentStartMs, producerID, captureSequence, sizeBytes, recoveryHeaders(producerID, recoverySecret))
+}
+
+func (c *Client) ReserveCaptureProducer(ctx context.Context, jobID int64, leaseToken, producerID, recoverySecretSHA256 string, captureOrdinal int64, sealedIntentLimit int) (CaptureProducer, error) {
+	var out CaptureProducer
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-producers", jobID), map[string]any{
+		"producer_id": producerID, "capture_ordinal": captureOrdinal,
+		"sealed_intent_limit": sealedIntentLimit, "recovery_secret_sha256": recoverySecretSHA256,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) FinishCaptureProducer(ctx context.Context, jobID int64, leaseToken, producerID, result, detailClass string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-producers/%s/finish", jobID, url.PathEscape(producerID)), map[string]any{
+		"result": result, "detail_class": detailClass,
+	}, leaseTokenHeaders(leaseToken), nil)
 }
 
 // UploadFile streams a local file to a presigned PUT URL with an explicit
@@ -252,6 +354,15 @@ func (c *Client) UploadFile(ctx context.Context, uploadURL, path, mimeType strin
 
 // IngestClip records the uploaded clip and returns the new clip id.
 func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, error) {
+	result, err := c.IngestClipWithResult(ctx, req)
+	return result.ClipID, err
+}
+
+func (c *Client) IngestClipWithResult(ctx context.Context, req IngestClipRequest) (ClipIngestResult, error) {
+	return c.ingestClipWithHeaders(ctx, req, nil)
+}
+
+func (c *Client) ingestClipWithHeaders(ctx context.Context, req IngestClipRequest, extraHeaders map[string]string) (ClipIngestResult, error) {
 	payload := map[string]any{
 		"intent_id":     strings.TrimSpace(req.IntentID),
 		"job_id":        req.JobID,
@@ -282,13 +393,29 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 			payload["timestamp_contract_reason"] = req.TimestampContractReason
 		}
 	}
-	var out struct {
-		ClipID int64 `json:"clip_id"`
+	var out ClipIngestResult
+	headers := leaseTokenHeaders(req.LeaseToken)
+	for key, value := range extraHeaders {
+		headers[key] = value
 	}
-	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/clips/ingest", payload, leaseTokenHeaders(req.LeaseToken), &out); err != nil {
-		return 0, err
+	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/clips/ingest", payload, headers, &out); err != nil {
+		return ClipIngestResult{}, err
 	}
-	return out.ClipID, nil
+	return out, nil
+}
+
+func (c *Client) IngestClipRecovery(ctx context.Context, req IngestClipRequest, producerID, recoverySecret string) (ClipIngestResult, error) {
+	return c.ingestClipWithHeaders(ctx, req, recoveryHeaders(producerID, recoverySecret))
+}
+
+func (c *Client) RecordingRecoveryStatus(ctx context.Context, producerID, recoverySecret string) (RecoveryStatus, error) {
+	var out RecoveryStatus
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/recovery/producers/%s/status", url.PathEscape(producerID)), map[string]any{}, recoveryHeaders(producerID, recoverySecret), &out)
+	return out, err
+}
+
+func (c *Client) FinishRecordingRecovery(ctx context.Context, producerID, recoverySecret, result string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/recovery/producers/%s/finish", url.PathEscape(producerID)), map[string]any{"result": result, "detail_class": ""}, recoveryHeaders(producerID, recoverySecret), nil)
 }
 
 // HeartbeatRecordingJob extends the lease. It returns cancel=true when the
@@ -332,6 +459,19 @@ func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, leaseTo
 		"reason":     reason,
 		"error_text": strings.TrimSpace(errorText),
 	}, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) SurrenderRecordingJobV1(ctx context.Context, jobID int64, leaseToken string, req SurrenderRequest) (SurrenderResult, error) {
+	var out SurrenderResult
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{
+		"transport_version": 1, "attempt_id": strings.TrimSpace(req.AttemptID),
+		"reason": req.Reason, "error_text": strings.TrimSpace(req.ErrorText),
+		"expected_head_version":     req.ExpectedHeadVersion,
+		"expected_upload_intent_id": strings.TrimSpace(req.ExpectedUploadIntent),
+		"expected_clip_id":          req.ExpectedClipID,
+		"spool_count":               req.SpoolCount, "spool_bytes": req.SpoolBytes, "in_flight_count": req.InFlightCount,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
 }
 
 func leaseTokenHeaders(token string) map[string]string {

@@ -37,6 +37,25 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+const dropletHasCaptureAuthoritySQL = `
+	SELECT EXISTS (
+	  SELECT 1 FROM recording_jobs
+	  WHERE lease_owner=$1 AND status='leased' AND lease_expires_at>transaction_timestamp()
+	  UNION ALL
+	  SELECT 1
+	  FROM recording_job_recovery_grants grant_row
+	  JOIN recording_capture_producers producer ON producer.id=grant_row.producer_id
+	  WHERE producer.worker_id=$1 AND grant_row.revoked_at IS NULL
+	    AND grant_row.upload_grace_until>transaction_timestamp()
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+	  UNION ALL
+	  SELECT 1
+	  FROM recording_capture_producers producer
+	  WHERE producer.worker_id=$1
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+	)
+`
+
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
@@ -223,6 +242,9 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
+		return false, err
+	}
 
 	var name, state string
 	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
@@ -235,7 +257,7 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, nil
 	}
 	var busy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM recording_jobs WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now())`, name).Scan(&busy); err != nil {
+	if err := tx.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&busy); err != nil {
 		return false, err
 	}
 	if busy {
@@ -265,6 +287,9 @@ func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
+		return false, err
+	}
 	var name, state string
 	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
 		return false, err
@@ -273,13 +298,62 @@ func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, nil
 	}
 	var busy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM recording_jobs WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now())`, name).Scan(&busy); err != nil {
+	if err := tx.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&busy); err != nil {
 		return false, err
 	}
 	if busy {
 		return false, nil
 	}
 	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='draining', drain_started_at=now(), updated_at=now() WHERE id=$1`, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BeginForcedDestroyAfterDrainTimeout preserves the historical bounded-drain
+// behavior for an ordinary expired/stuck lease, but never tears down the only
+// host holding bytes covered by an active upload-recovery capability. The
+// global fence serializes this proof with expiry reclamation/grant creation.
+func (s *Store) BeginForcedDestroyAfterDrainTimeout(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
+		return false, err
+	}
+	var name, state string
+	if err := tx.QueryRow(ctx, `SELECT name,state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
+		return false, err
+	}
+	if state == "destroying" {
+		return true, tx.Commit(ctx)
+	}
+	if state != "draining" {
+		return false, nil
+	}
+	var recoveryBusy bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM recording_job_recovery_grants grant_row
+		JOIN recording_capture_producers producer ON producer.id=grant_row.producer_id
+		WHERE producer.worker_id=$1 AND grant_row.revoked_at IS NULL
+		  AND grant_row.upload_grace_until>transaction_timestamp()
+		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+		UNION ALL
+		SELECT 1 FROM recording_capture_producers producer
+		WHERE producer.worker_id=$1
+		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+	)`, name).Scan(&recoveryBusy); err != nil {
+		return false, err
+	}
+	if recoveryBusy {
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='destroying',updated_at=transaction_timestamp() WHERE id=$1`, id); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -422,16 +496,12 @@ func (s *Store) SetIdleSince(ctx context.Context, id int64, idle bool) error {
 }
 
 // HasInflightJob reports whether the named droplet currently holds a live leased
-// job. It is authoritative on the lease ledger and tolerant of expired leases
-// (D-isdrained): a job whose lease has expired does not count as in-flight.
+// job or an unexpired upload-only recovery producer. An expired lease alone is
+// not busy, but its fenced local-byte grace keeps the host alive until recovery
+// seals or honestly terminates that producer.
 func (s *Store) HasInflightJob(ctx context.Context, name string) (bool, error) {
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM recording_jobs
-			WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now()
-		)
-	`, name).Scan(&exists); err != nil {
+	if err := s.pool.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check inflight job: %w", err)
 	}
 	return exists, nil
@@ -441,12 +511,7 @@ func (s *Store) HasInflightJob(ctx context.Context, name string) (bool, error) {
 // runs this at the top of its tick only when the scheduler is not running on the
 // same service (the scheduler owns reclaim otherwise).
 func (s *Store) ReclaimExpiredLeases(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, `
-		UPDATE recording_jobs
-		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, lease_token=NULL,
-		    relay_fairness_started_at=NULL, updated_at=now()
-		WHERE status='leased' AND lease_expires_at < now()
-	`); err != nil {
+	if _, err := s.pool.Exec(ctx, `SELECT recording_surrender_reclaim_expired()`); err != nil {
 		return fmt.Errorf("reclaim expired leases: %w", err)
 	}
 	return nil

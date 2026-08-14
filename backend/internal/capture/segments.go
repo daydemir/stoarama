@@ -635,6 +635,13 @@ func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duratio
 	return finalizeSegmentWithTimestampContract(ctx, path, fallbackSpan, false)
 }
 
+// RecoverContinuousSegment reconstructs the exact finalized-media metadata a
+// recorder needs to finish an upload-only recovery grant after its capture
+// process crashed. It never launches ffmpeg or opens a source URL.
+func RecoverContinuousSegment(ctx context.Context, path string, fallbackSpan time.Duration) (Segment, error) {
+	return finalizeSegmentWithTimestampContract(ctx, path, fallbackSpan, true)
+}
+
 func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fallbackSpan time.Duration, timestampContractEnabled bool) (Segment, error) {
 	startAt, err := parseSegmentStart(filepath.Base(path))
 	if err != nil {

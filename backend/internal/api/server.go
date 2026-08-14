@@ -498,8 +498,6 @@ func (s *Server) router() http.Handler {
 
 			rec.Post("/recording/jobs/lease", s.handleRecordingJobsLease)
 			rec.Post("/recording/jobs/{id}/presentation-attempts", s.handleRecordingPresentationV2Attempt)
-			rec.Post("/recording/upload-intents", s.handleRecordingUploadIntent)
-			rec.Post("/recording/clips/ingest", s.handleRecordingClipIngest)
 			rec.Get("/recording/presentation-probes/{taskId}", s.handleRecordingPresentationV2Status)
 			rec.Post("/recording/presentation-probes/{taskId}/retention/activate", s.handleRecordingPresentationV2Activate)
 			rec.Post("/recording/presentation-probes/claim", s.handleRecordingPresentationV2Claim)
@@ -509,9 +507,23 @@ func (s *Server) router() http.Handler {
 			rec.Post("/recording/presentation-probes/{taskId}/release-ack", s.handleRecordingPresentationV2ReleaseAck)
 			rec.Post("/recording/droplets/heartbeat", s.handleRecordingDropletHeartbeat)
 			rec.Post("/recording/jobs/{id}/heartbeat", s.handleRecordingJobHeartbeat)
+			rec.Post("/recording/jobs/{id}/capture-producers", s.handleRecordingCaptureProducerReserve)
+			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/finish", s.handleRecordingCaptureProducerFinish)
 			rec.Post("/recording/jobs/{id}/complete", s.handleRecordingJobComplete)
 			rec.Post("/recording/jobs/{id}/surrender", s.handleRecordingJobSurrender)
 			rec.Post("/recording/jobs/{id}/fail", s.handleRecordingJobFail)
+		})
+
+		// Upload-only crash recovery accepts either the ordinary recorder principal
+		// or one exact, expiring producer capability. The capability middleware is
+		// mounted only on these four byte-preservation/recovery operations; it cannot lease,
+		// heartbeat, capture, complete, fail, or surrender a job.
+		api.Group(func(upload chi.Router) {
+			upload.Use(s.requireRecorderOrRecoveryAuth)
+			upload.Post("/recording/upload-intents", s.handleRecordingUploadIntent)
+			upload.Post("/recording/clips/ingest", s.handleRecordingClipIngest)
+			upload.Post("/recording/recovery/producers/{producerId}/status", s.handleRecordingRecoveryStatus)
+			upload.Post("/recording/recovery/producers/{producerId}/finish", s.handleRecordingRecoveryFinish)
 		})
 
 		api.Group(func(worker chi.Router) {

@@ -80,10 +80,16 @@ func (s *Scheduler) tick(ctx context.Context) error {
 		return fmt.Errorf("begin scheduler tick: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Capacity/grant authority is always the first lock in the scheduler
+	// transaction. autoStopExpiredRecordings locks recording and job rows, so
+	// reclaiming afterward would invert the cloud claim order (global -> job).
+	if err := s.reclaimExpiredRecordingJobs(ctx, tx); err != nil {
+		return err
+	}
 	if err := s.autoStopExpiredRecordings(ctx, tx); err != nil {
 		return err
 	}
-	if err := s.EnqueueDueRecordingJobs(ctx, tx); err != nil {
+	if err := s.enqueueDueRecordingJobs(ctx, tx, false); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -175,8 +181,13 @@ func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) er
 	if _, err := tx.Exec(ctx, `
 		UPDATE recording_jobs
 		SET status='canceled', updated_at=now()
-		WHERE status IN ('pending','leased')
-		  AND recording_id IN (SELECT id FROM recordings WHERE status='completed')
+		WHERE recording_id IN (SELECT id FROM recordings WHERE status='completed')
+		  AND (status='pending' OR (status='leased' AND NOT EXISTS(
+		    SELECT 1 FROM recording_capture_producers producer
+		    WHERE producer.recording_job_id=recording_jobs.id
+		      AND producer.lease_token=recording_jobs.lease_token
+		      AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+		  )))
 	`); err != nil {
 		return fmt.Errorf("cancel jobs for completed recordings: %w", err)
 	}
@@ -203,6 +214,25 @@ type activeRecording struct {
 // Each recording's enqueue runs in its own savepoint so one bad recording cannot
 // abort the whole tick.
 func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) error {
+	return s.enqueueDueRecordingJobs(ctx, tx, true)
+}
+
+func (s *Scheduler) reclaimExpiredRecordingJobs(ctx context.Context, tx pgx.Tx) error {
+	// Reclaim first: the surrender transport authority takes its global capacity
+	// fence before any job row. Taking recording rows first here would invert that
+	// order against cloud claims.
+	if _, err := tx.Exec(ctx, `SELECT recording_surrender_reclaim_expired()`); err != nil {
+		return fmt.Errorf("reclaim expired recording leases: %w", err)
+	}
+	return nil
+}
+
+func (s *Scheduler) enqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx, reclaim bool) error {
+	if reclaim {
+		if err := s.reclaimExpiredRecordingJobs(ctx, tx); err != nil {
+			return err
+		}
+	}
 	// Recording updates always precede job updates across the API and migrations.
 	// Preserve that lock order here so a schedule cutover cannot deadlock a tick.
 	if _, err := tx.Exec(ctx, `
@@ -217,16 +247,6 @@ func (s *Scheduler) EnqueueDueRecordingJobs(ctx context.Context, tx pgx.Tx) erro
 		FOR UPDATE OF rec
 	`); err != nil {
 		return fmt.Errorf("lock scheduler recordings: %w", err)
-	}
-
-	// (a) reclaim expired leases.
-	if _, err := tx.Exec(ctx, `
-		UPDATE recording_jobs
-		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, lease_token=NULL,
-		    relay_fairness_started_at=NULL, updated_at=now()
-		WHERE status='leased' AND lease_expires_at < now()
-	`); err != nil {
-		return fmt.Errorf("reclaim expired recording leases: %w", err)
 	}
 
 	// (a2) schedule-integrity freshness deadline: mark any pending job that can no

@@ -1122,6 +1122,35 @@ func TestEnsureCaptureTempDirRecreatesMissingRoot(t *testing.T) {
 	}
 }
 
+func TestEnsureCaptureTempDirRepairsPermissionsAndRejectsLinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	insecure := filepath.Join(base, "insecure")
+	if err := os.Mkdir(insecure, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Worker{cfg: Config{CaptureTempDir: insecure}}).ensureCaptureTempDir(); err != nil {
+		t.Fatalf("repair capture spool permissions: %v", err)
+	}
+	info, err := os.Stat(insecure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("capture spool mode=%v", info.Mode().Perm())
+	}
+	private := filepath.Join(base, "private")
+	if err := os.Mkdir(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(base, "linked")
+	if err := os.Symlink(private, linked); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Worker{cfg: Config{CaptureTempDir: linked}}).ensureCaptureTempDir(); err == nil {
+		t.Fatal("symlinked capture spool was accepted")
+	}
+}
+
 func TestRelayDiagnosticsSnapshotRedactsURLs(t *testing.T) {
 	d := &RelayDiagnostics{}
 	for i := int64(6); i > 0; i-- {

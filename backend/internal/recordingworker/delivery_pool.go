@@ -72,10 +72,10 @@ type segmentDeliveryResult struct {
 // off that goroutine, onto a fixed set of workers.
 //
 // Finalized media stays in the attempt directory until delivery is acknowledged.
-// Submit therefore queues only small descriptors and never blocks the capture
-// sweep on a stalled object store. The worker's independent free-space monitor is
-// the authoritative spool bound: it stops ffmpeg before local media can consume
-// the recorder's reserve, while close drains every descriptor already accepted.
+// Submit queues only small descriptors, but pauses at the exact producer seal
+// limit. The server ledger and local spool therefore share one hard outstanding
+// bound; the disk monitor remains a second host-wide safety fence while close
+// drains every descriptor already accepted.
 type segmentDeliveryPool struct {
 	wg      sync.WaitGroup
 	deliver func(capture.Segment) error
@@ -90,6 +90,7 @@ type segmentDeliveryPool struct {
 	err          error
 	submitted    int
 	inFlight     int
+	maxInFlight  int
 	ingested     bool
 	closed       bool
 	onQueueDepth func(int)
@@ -102,9 +103,14 @@ func startSegmentDeliveryPool(workers int, abort context.CancelFunc, deliver fun
 	if workers <= 0 {
 		workers = 1
 	}
+	sealedIntentLimit := workers
+	if sealedIntentLimit > 8 {
+		sealedIntentLimit = 8
+	}
 	p := &segmentDeliveryPool{
-		deliver: deliver,
-		abort:   abort,
+		deliver:     deliver,
+		abort:       abort,
+		maxInFlight: sealedIntentLimit,
 	}
 	if len(queueObserver) > 0 {
 		p.onQueueDepth = queueObserver[0]
@@ -166,11 +172,15 @@ func (p *segmentDeliveryPool) take() (capture.Segment, bool) {
 // through CaptureContinuous and still drives the supervisor's reconnect/backoff
 // path rather than being swallowed by a worker goroutine.
 //
-// It is called only from the capture goroutine and queues no media bytes. Keeping
-// it non-blocking is what lets window cancellation reach ffmpeg during a storage
-// outage; local media growth is bounded independently by the disk monitor.
+// It is called only from the capture goroutine and queues no media bytes. The
+// hard outstanding bound matches the capture producer's server-side sealed
+// intent limit. When all delivery slots are occupied, backpressure pauses the
+// capture callback until an upload is acknowledged or the attempt fails.
 func (p *segmentDeliveryPool) Submit(seg capture.Segment) error {
 	p.mu.Lock()
+	for p.err == nil && !p.closed && p.inFlight >= p.maxInFlight {
+		p.ready.Wait()
+	}
 	if p.err != nil {
 		p.mu.Unlock()
 		return p.err
@@ -203,6 +213,7 @@ func (p *segmentDeliveryPool) fail(err error) {
 	if p.err == nil {
 		p.err = err
 	}
+	p.ready.Broadcast()
 	p.mu.Unlock()
 	if p.abort != nil {
 		p.abort()
@@ -213,6 +224,7 @@ func (p *segmentDeliveryPool) acknowledge(uniqueIngest bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.inFlight--
+	p.ready.Broadcast()
 	if uniqueIngest {
 		p.ingested = true
 	}

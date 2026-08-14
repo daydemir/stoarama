@@ -337,6 +337,7 @@ write_files:
       export RECORDING_WORKER_CONCURRENCY='{{.Capacity}}'
       export RECORDING_WORKER_HEARTBEAT_SEC='{{.HeartbeatSec}}'
       export RECORDING_WORKER_POLL_SEC='{{.PollSec}}'
+      export RECORDING_CAPTURE_TEMP_DIR='/var/lib/stoarama/recording-spool'
 
   - path: /usr/local/sbin/stoarama-egress-firewall.sh
     permissions: "0755"
@@ -440,6 +441,7 @@ write_files:
 
 runcmd:
   - mkdir -p /opt /opt/stoarama/bin
+  - install -d -m 0700 -o root -g root /var/lib/stoarama/recording-spool
   - /usr/local/sbin/stoarama-egress-firewall.sh
   - |
     clone_url='{{.RepoURL}}'

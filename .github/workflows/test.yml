@@ -108,6 +108,13 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run 'Test(RecordingJobsLease(RespectsDropletCapacityOne|RefusesDrainingDroplet)|RecordingJobCompleteRejectsZeroClipContinuous|RecordingHeartbeat(CapsContinuousWindowDrain|HandlerCancelsAfterContinuousDrainCap)|RelayGroupLeaseCapConcurrent|CloudSurrenderExcludesPriorOwnerAndPreservesClips|RelaySurrenderHandsJobToDifferentOwner|PropagateStreamSourceUpdatesOnlyActiveRelayRecordings)' -count=1 -v
+      - name: Test surrender transport fencing and crash recovery
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: |
+          set -o pipefail
+          go test ./internal/api -run '^TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery$' -count=1 -json | tee /tmp/surrender-transport-pg.json
+          grep -F '"Action":"pass"' /tmp/surrender-transport-pg.json | grep -F '"Test":"TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery"'
       - name: Test provisioning teardown lease safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
