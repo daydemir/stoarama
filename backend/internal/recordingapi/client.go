@@ -341,12 +341,18 @@ type SurveyLease struct {
 
 // LeaseRecordingJob leases one due job, or returns (nil, nil) when none is due.
 func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
+	return c.LeaseRecordingJobWithSurrenderTransport(ctx, true)
+}
+
+func (c *Client) LeaseRecordingJobWithSurrenderTransport(ctx context.Context, enabled bool) (*RecordingJob, error) {
 	var out struct {
 		Job *RecordingJob `json:"job"`
 	}
-	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/jobs/lease", map[string]any{}, map[string]string{
-		leaseTokenSupportedHeader: "true",
-	}, &out); err != nil {
+	headers := map[string]string{}
+	if enabled {
+		headers[leaseTokenSupportedHeader] = "true"
+	}
+	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/jobs/lease", map[string]any{}, headers, &out); err != nil {
 		return nil, err
 	}
 	return out.Job, nil

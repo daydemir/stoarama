@@ -190,17 +190,22 @@ func (w *Worker) Run(ctx context.Context) error {
 	// recovery attempt may remain pending (for example while the API is down), but
 	// beginActiveSurrenderJob must already see that authority and refuse to start a
 	// second capture generation over bytes from the first one.
-	if err := w.recoverProducerJournals(ctx); err != nil {
-		return err
+	transportEnabled := w.surrenderTransportEnabled()
+	if transportEnabled {
+		if err := w.recoverProducerJournals(ctx); err != nil {
+			return err
+		}
 	}
 
 	sem := make(chan struct{}, w.cfg.Concurrency)
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		w.recoveryLoop(ctx)
-	}()
+	if transportEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.recoveryLoop(ctx)
+		}()
+	}
 
 	// Independent droplet-heartbeat ticker (SRE-drain-liveness): touch droplet
 	// liveness every HeartbeatSec regardless of whether a job is held, so an idle
@@ -279,7 +284,7 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			<-sem
 			return
 		}
-		job, err := w.cfg.Client.LeaseRecordingJob(ctx)
+		job, err := w.cfg.Client.LeaseRecordingJobWithSurrenderTransport(ctx, w.surrenderTransportEnabled())
 		if err != nil {
 			if w.cfg.LeaseGate != nil {
 				w.cfg.LeaseGate.RUnlock()

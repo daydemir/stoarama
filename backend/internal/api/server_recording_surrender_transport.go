@@ -60,6 +60,8 @@ func (s *Server) requireRecorderOrRecoveryAuth(next http.Handler) http.Handler {
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
 		}
 		principal, err := s.authenticateNodeRequest(r)
 		nodeType := strings.TrimSpace(principal.NodeType)
@@ -106,8 +108,7 @@ func (s *Server) authenticateRecordingRecovery(r *http.Request) (recordingRecove
 		JOIN recording_capture_producers p ON p.id=g.producer_id
 		JOIN nodes n ON n.id=p.node_id
 		WHERE g.upload_intent_id=$1 AND g.recovery_secret_sha256=$2
-		  AND ((g.revoked_at IS NULL AND g.upload_grace_until>transaction_timestamp())
-		       OR g.revoke_reason='recovery_completed')
+		  AND g.revoked_at IS NULL AND g.upload_grace_until>transaction_timestamp()
 	`, intentID, hex.EncodeToString(secretHash[:])).Scan(&out.GrantID, &out.IntentID, &out.ProducerID, &out.JobID, &out.LeaseToken, &out.WorkerID, &out.NodeID, &out.AccountID, &out.ExpiresAt)
 	if err != nil {
 		return recordingRecoveryPrincipal{}, err

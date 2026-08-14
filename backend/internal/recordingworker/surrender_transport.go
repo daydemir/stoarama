@@ -883,6 +883,19 @@ func (w *Worker) surrenderJournalRoot() string {
 	return filepath.Join(root, ".stoarama-surrender-v1")
 }
 
+func (w *Worker) surrenderTransportEnabled() bool {
+	root := strings.TrimSpace(w.cfg.CaptureTempDir)
+	if root == "" {
+		return false
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	temp, err := filepath.Abs(os.TempDir())
+	return err == nil && abs != temp
+}
+
 func ensurePrivateSurrenderJournalRoot(root string) error {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
