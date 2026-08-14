@@ -129,6 +129,16 @@ jobs:
           grep -q -- '^--- PASS: TestRecorderRolloutV2SharedClaimFenceBlocksExclusiveSwitchPostgres' <<<"$output"
           grep -q -- '^--- PASS: TestRecorderRolloutV2DrainClaimFenceAndAppendOnlyFactsPostgres' <<<"$output"
           if grep -q -- '^--- SKIP:' <<<"$output"; then exit 1; fi
+      - name: Test recorder rollout heartbeat authority
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          output="$(go test ./internal/api -run '^TestRecorderRollout(HeartbeatAppendsOnlyBoundLive|CloudLeaseAndHeartbeatFence)Postgres$' -count=1 -v)"
+          printf '%s\n' "$output"
+          grep -q -- '^--- PASS: TestRecorderRolloutHeartbeatAppendsOnlyBoundLivePostgres' <<<"$output"
+          grep -q -- '^--- PASS: TestRecorderRolloutCloudLeaseAndHeartbeatFencePostgres' <<<"$output"
+          if grep -q -- '^--- SKIP:' <<<"$output"; then exit 1; fi
       # Backtested against the Zanzibar drift; DB-backed, so it needs naming here
       # or it silently skips like the rest of this suite did.
       - name: Test clip timestamp drift signal
