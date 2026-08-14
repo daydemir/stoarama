@@ -429,8 +429,8 @@ CREATE TABLE recording_campaign_capacity_reservations (
   FOREIGN KEY(observation_id,account_id,approval_id) REFERENCES recording_campaign_capacity_observations(id,account_id,approval_id) ON DELETE RESTRICT
 );
 
--- Authority-side eight-day peak. Admission schedules are continuous daily
--- windows; any other cloud mode is conservatively charged as permanently live.
+-- Authority-side governed-horizon peak. Admission schedules are continuous
+-- daily windows; any other cloud mode is conservatively charged as permanently live.
 -- This is recomputed after the candidate rows are active while the shared
 -- scheduler fence is held, so no executor forecast can increase authority.
 CREATE FUNCTION recording_campaign_forecast_peak_slots(p_account_id BIGINT)
@@ -443,7 +443,7 @@ RETURNS INTEGER LANGUAGE sql STABLE SET search_path=pg_catalog AS $$
   ), days AS (
     SELECT c.id,c.cron_timezone,c.daily_window_start,c.daily_window_end,c.active_weekdays,c.start_at,c.end_at,
       generate_series((recording_campaign_now() AT TIME ZONE c.cron_timezone)::date-1,
-        (recording_campaign_now() AT TIME ZONE c.cron_timezone)::date+8,interval '1 day') day
+        (recording_campaign_now() AT TIME ZONE c.cron_timezone)::date+60,interval '1 day') day
     FROM configs c WHERE c.mode='continuous' AND c.daily_window_start IS NOT NULL AND c.daily_window_end IS NOT NULL
   ), windows AS (
     SELECT ((day::date+daily_window_start)::timestamp AT TIME ZONE cron_timezone) start_at,
@@ -485,7 +485,10 @@ LANGUAGE sql STABLE SET search_path=pg_catalog AS $$
     -- This intentionally does not collapse to the off-window due-job count.
     SELECT count(*)::integer AS value FROM recordings r
     WHERE r.account_id=p_account_id AND r.capture_via='relay' AND r.status='active'
-      AND r.start_at<=recording_campaign_now() AND (r.end_at IS NULL OR r.end_at>recording_campaign_now())
+      -- Count every governed active schedule whose interval has not ended,
+      -- including a future-start window. Admission is a campaign-horizon
+      -- promise, not a point-in-time utilization check.
+      AND (r.end_at IS NULL OR r.end_at>recording_campaign_now())
   ), totals AS (
     SELECT count(*)::integer AS domains,COALESCE(sum(capacity),0)::integer AS capacity,
       COALESCE(sum(capacity)-max(capacity),0)::integer AS remaining FROM domains
@@ -540,6 +543,7 @@ CREATE TABLE recording_campaign_admission_results (
   action TEXT NOT NULL CHECK(action IN('created','reactivated')),
   schedule_sha256 TEXT NOT NULL CHECK(schedule_sha256~'^[0-9a-f]{64}$'),
   recording_config_sha256 TEXT NOT NULL CHECK(recording_config_sha256~'^[0-9a-f]{64}$'),
+  roster_entry_sha256 TEXT NOT NULL DEFAULT repeat('0',64) CHECK(roster_entry_sha256~'^[0-9a-f]{64}$'),
   admitted_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now(),
   UNIQUE(approval_id,stream_id),
   UNIQUE(track_id,roster_entry_id),
@@ -980,6 +984,8 @@ BEGIN
     END IF;
     approval_id:=existing.id; approval_sha256:=existing.approval_sha256; RETURN NEXT; RETURN;
   END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+  PERFORM 1 FROM accounts WHERE id=p_account_id FOR UPDATE;
   PERFORM recording_campaign_authorize_account('approve',NULL,p_account_id,p_user_id,p_session_id,p_credential_sha256);
   RETURN QUERY SELECT created.id,created.approval_sha256
   FROM recording_campaign_create_approval(p_request_id,p_account_id,p_user_id,p_actor_email,
@@ -1002,6 +1008,8 @@ BEGIN
     IF existing.actor_user_id<>p_user_id THEN RAISE EXCEPTION 'campaign expiration idempotency conflict'; END IF;
     event_sha256:=existing.event_sha256; RETURN NEXT; RETURN;
   END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+  PERFORM 1 FROM accounts WHERE id=p_account_id FOR UPDATE;
   PERFORM recording_campaign_authorize_account('expire',p_approval_id,p_account_id,p_user_id,p_session_id,p_credential_sha256);
   SELECT * INTO approval FROM recording_campaign_admission_approvals
     WHERE id=p_approval_id AND account_id=p_account_id FOR UPDATE;
@@ -1391,11 +1399,11 @@ BEGIN
     RETURN recording_campaign_replay(p_approval_id,p_account_id,p_credential_sha256);
   END IF;
 
-  PERFORM recording_campaign_authorize_account('admit',p_approval_id,p_account_id,p_actor_user_id,p_session_id,p_credential_sha256);
   -- This is deliberately the same global fence used by ordinary batch
   -- scheduling.  A spelling variant here would make the two writers race.
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
   PERFORM 1 FROM accounts WHERE id=p_account_id FOR UPDATE;
+  PERFORM recording_campaign_authorize_account('admit',p_approval_id,p_account_id,p_actor_user_id,p_session_id,p_credential_sha256);
   SELECT a.* INTO approval FROM recording_campaign_admission_approvals a
     JOIN recording_campaign_authority_decisions decision ON decision.code=a.authority_code
     WHERE a.id=p_approval_id AND a.account_id=p_account_id AND a.actor_user_id=p_actor_user_id
@@ -1752,6 +1760,37 @@ END $$;
 CREATE TRIGGER recording_campaign_tx_authorization_validate BEFORE INSERT ON recording_campaign_admission_tx_authorizations FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_tx_authorization();
 CREATE CONSTRAINT TRIGGER recording_campaign_tx_authorization_commit_seal AFTER INSERT ON recording_campaign_admission_tx_authorizations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_tx_authorization();
 
+-- Terminalizing an expired reservation is authority, not a projection bit an
+-- owner can mint directly. Validate it both before insertion and again at
+-- commit so same-transaction approval/commit/attempt changes cannot release a
+-- reservation without the exact typed expiration operation.
+CREATE OR REPLACE FUNCTION validate_recording_campaign_reservation_terminal_event()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; approval RECORD; expected TEXT; has_inflight BOOLEAN; has_commit BOOLEAN;
+BEGIN
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''expire'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s)
+    INTO authorized USING NEW.approval_id,NEW.account_id,NEW.actor_user_id;
+  EXECUTE format('SELECT id,account_id,deadline_at FROM %I.recording_campaign_admission_approvals WHERE id=$1 FOR SHARE',s)
+    INTO approval USING NEW.approval_id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_commits WHERE approval_id=$1)',s)
+    INTO has_commit USING NEW.approval_id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_probe_attempts attempt LEFT JOIN %I.recording_targeted_probe_evidence evidence ON evidence.attempt_id=attempt.id LEFT JOIN %I.recording_targeted_probe_attempt_terminal_events terminal ON terminal.attempt_id=attempt.id WHERE attempt.approval_id=$1 AND evidence.id IS NULL AND terminal.attempt_id IS NULL AND attempt.expires_at>recording_campaign_now())',s,s,s)
+    INTO has_inflight USING NEW.approval_id;
+  expected:=encode(sha256(convert_to(jsonb_build_object(
+    'approval_id',NEW.approval_id,'account_id',NEW.account_id,'request_id',NEW.request_id,
+    'result','expired_unadmitted','actor_user_id',NEW.actor_user_id,
+    'observed_at',NEW.observed_at)::text,'UTF8')),'hex');
+  IF authorized IS DISTINCT FROM true OR approval.id IS NULL OR approval.account_id<>NEW.account_id OR
+     approval.deadline_at>recording_campaign_now() OR has_commit OR has_inflight OR
+     NEW.result<>'expired_unadmitted' OR NEW.observed_at IS DISTINCT FROM recording_campaign_now() OR
+     NEW.event_sha256<>expected THEN
+    RAISE EXCEPTION 'campaign reservation terminal event lacks exact expired-unadmitted authority';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_campaign_reservation_terminal_validate BEFORE INSERT ON recording_campaign_admission_reservation_terminal_events FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_reservation_terminal_event();
+CREATE CONSTRAINT TRIGGER recording_campaign_reservation_terminal_commit_seal AFTER INSERT ON recording_campaign_admission_reservation_terminal_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_reservation_terminal_event();
+
 CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_scene_presentation()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; e RECORD; expected TEXT;
@@ -2028,6 +2067,7 @@ CREATE OR REPLACE FUNCTION reserve_recording_campaign_admission_entries()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; entry JSONB; collision BOOLEAN;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
   EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING NEW.account_id;
   FOR entry IN SELECT value FROM jsonb_array_elements(NEW.entries) LOOP
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recordings r LEFT JOIN %I.streams active_stream ON active_stream.id=r.stream_id WHERE r.account_id=$1 AND r.status<>''canceled'' AND NOT(r.id=NULLIF($4,0) AND r.status=''completed'') AND (r.stream_id=$2 OR encode(sha256(convert_to(active_stream.source_url,''UTF8'')),''hex'')=$5 OR (NULLIF(active_stream.provider,'''') IS NOT NULL AND active_stream.provider=$6 AND NULLIF(active_stream.external_id,'''') IS NOT NULL AND active_stream.external_id=$7) OR COALESCE(NULLIF(regexp_replace(lower(active_stream.name),''[^a-z0-9]'','''',''g''),''''),''stream''||active_stream.id::text)=$8) UNION ALL SELECT 1 FROM %I.recording_campaign_roster_entries e JOIN %I.recording_campaign_tracks t ON t.id=e.track_id JOIN %I.streams protected_stream ON protected_stream.id=e.stream_id WHERE t.account_id=$1 AND t.state IN(''active'',''complete'') AND e.status IN(''protect'',''probation'') AND (e.stream_id=$2 OR e.scene_identity_sha256=$3 OR encode(sha256(convert_to(protected_stream.source_url,''UTF8'')),''hex'')=$5 OR (NULLIF(protected_stream.provider,'''') IS NOT NULL AND protected_stream.provider=$6 AND NULLIF(protected_stream.external_id,'''') IS NOT NULL AND protected_stream.external_id=$7) OR COALESCE(NULLIF(regexp_replace(lower(protected_stream.name),''[^a-z0-9]'','''',''g''),''''),''stream''||protected_stream.id::text)=$8) UNION ALL SELECT 1 FROM %I.recording_campaign_admission_reservations pending WHERE pending.account_id=$1 AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=pending.approval_id) AND (pending.stream_id=$2 OR pending.scene_identity_sha256=$3 OR pending.recording_id=NULLIF($4,0) OR pending.source_url_sha256=$5 OR (NULLIF(pending.provider,'''') IS NOT NULL AND pending.provider=$6 AND NULLIF(pending.external_id,'''') IS NOT NULL AND pending.external_id=$7) OR pending.normalized_label=$8) LIMIT 1)',s,s,s,s,s,s,s)
@@ -2064,8 +2104,8 @@ BEGIN
      IS NOT DISTINCT FROM
      (OLD.source_url,OLD.source_page_url,OLD.provider,OLD.external_id,OLD.name,OLD.local_timezone,OLD.tags,OLD.deleted_at,OLD.updated_at) THEN RETURN NEW; END IF;
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
-  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations WHERE stream_id=$1)',s) INTO reserved USING NEW.id;
-  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations r WHERE r.stream_id<>$1 AND (r.source_url_sha256=encode(sha256(convert_to($2,''UTF8'')),''hex'') OR (NULLIF(r.provider,'''') IS NOT NULL AND r.provider=COALESCE($3,'''') AND NULLIF(r.external_id,'''') IS NOT NULL AND r.external_id=COALESCE($4,'''')) OR r.normalized_label=COALESCE(NULLIF(regexp_replace(lower($5),''[^a-z0-9]'','''',''g''),''''),''stream''||$1::text)))',s)
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations r WHERE r.stream_id=$1 AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=r.approval_id))',s,s) INTO reserved USING NEW.id;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations r WHERE r.stream_id<>$1 AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=r.approval_id) AND (r.source_url_sha256=encode(sha256(convert_to($2,''UTF8'')),''hex'') OR (NULLIF(r.provider,'''') IS NOT NULL AND r.provider=COALESCE($3,'''') AND NULLIF(r.external_id,'''') IS NOT NULL AND r.external_id=COALESCE($4,'''')) OR r.normalized_label=COALESCE(NULLIF(regexp_replace(lower($5),''[^a-z0-9]'','''',''g''),''''),''stream''||$1::text)))',s,s)
     INTO collides USING NEW.id,NEW.source_url,NEW.provider,NEW.external_id,NEW.name;
   IF collides THEN RAISE EXCEPTION 'stream identity mutation collides with protected campaign occupancy'; END IF;
   IF reserved THEN
@@ -2083,7 +2123,7 @@ CREATE OR REPLACE FUNCTION audit_recording_campaign_reserved_revision_mutation()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; sid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.stream_id ELSE NEW.stream_id END; reserved BOOLEAN; prior_hash TEXT; next_hash TEXT;
 BEGIN
-  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations WHERE stream_id=$1)',s) INTO reserved USING sid;
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations r WHERE r.stream_id=$1 AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=r.approval_id))',s,s) INTO reserved USING sid;
   IF reserved THEN
     prior_hash:=encode(sha256(convert_to(jsonb_build_array(TG_OP,CASE WHEN TG_OP='INSERT' THEN NULL ELSE to_jsonb(OLD) END)::text,'UTF8')),'hex');
     next_hash:=encode(sha256(convert_to(jsonb_build_array(TG_OP,CASE WHEN TG_OP='DELETE' THEN NULL ELSE to_jsonb(NEW) END)::text,'UTF8')),'hex');
@@ -2148,7 +2188,7 @@ CREATE TRIGGER recording_targeted_probe_evidence_validate BEFORE INSERT ON recor
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_result()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_actor BIGINT; a_schedule TEXT; a_deadline TIMESTAMPTZ; a_tag TEXT; r_stream BIGINT; r_recording BIGINT; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_scene BIGINT; r_scene_hash TEXT; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; current_tags TEXT[]; t_account BIGINT; e_recording BIGINT; e_stream BIGINT; e_actor BIGINT; e_scene TEXT; config_ok BOOLEAN; scene_fresh BOOLEAN; reviews_valid BOOLEAN; current_config_sha TEXT; newer_attempt BOOLEAN; p1 RECORD; p2 RECORD;
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_actor BIGINT; a_schedule TEXT; a_deadline TIMESTAMPTZ; a_tag TEXT; r_stream BIGINT; r_recording BIGINT; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_scene BIGINT; r_scene_hash TEXT; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; current_tags TEXT[]; t_account BIGINT; e_recording BIGINT; e_stream BIGINT; e_actor BIGINT; e_scene TEXT; config_ok BOOLEAN; scene_fresh BOOLEAN; reviews_valid BOOLEAN; current_config_sha TEXT; current_roster_sha TEXT; newer_attempt BOOLEAN; p1 RECORD; p2 RECORD;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s) INTO authorized USING NEW.approval_id,NEW.account_id,NEW.actor_user_id;
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign admission result requires typed transaction authorization'; END IF;
@@ -2170,6 +2210,12 @@ BEGIN
     INTO config_ok USING NEW.approval_id,NEW.recording_id,NEW.stream_id;
   EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''account_id'',r.account_id,''stream_id'',r.stream_id,''name'',r.name,''stream_url'',r.stream_url,''source_kind'',r.source_kind,''mode'',r.mode,''cron_expr'',r.cron_expr,''cron_timezone'',r.cron_timezone,''clip_duration_sec'',r.clip_duration_sec,''daily_window_start'',r.daily_window_start,''daily_window_end'',r.daily_window_end,''active_weekdays'',r.active_weekdays,''target_fps'',r.target_fps,''start_at'',r.start_at,''end_at'',r.end_at,''storage_destination_id'',r.storage_destination_id,''delivery_storage_destination_id'',r.delivery_storage_destination_id,''delivery'',r.delivery,''capture_via'',r.capture_via,''naming_profile'',r.naming_profile,''folder_name'',r.folder_name,''naming_metadata_jsonb'',r.naming_metadata_jsonb,''storage_retention_tier'',r.storage_retention_tier)::text,''UTF8'')),''hex'') FROM %I.recordings r WHERE id=$1',s)
     INTO current_config_sha USING NEW.recording_id;
+  -- Seal the full 0129 roster row, including decision/evidence timestamps and
+  -- every optional source-provenance field. A later typed lifecycle extension
+  -- must create a new authority event; generic audited row edits cannot rewrite
+  -- admitted provenance.
+  EXECUTE format('SELECT encode(sha256(convert_to(to_jsonb(e)::text,''UTF8'')),''hex'') FROM %I.recording_campaign_roster_entries e WHERE id=$1',s)
+    INTO current_roster_sha USING NEW.roster_entry_id;
   IF a_account<>NEW.account_id OR a_schedule<>NEW.schedule_sha256 OR recording_campaign_now()>=a_deadline OR t_account<>NEW.account_id OR
      a_actor<>NEW.actor_user_id OR config_ok IS DISTINCT FROM true OR scene_fresh IS DISTINCT FROM true OR reviews_valid IS DISTINCT FROM true OR source_clean IS DISTINCT FROM true OR
      r_stream<>NEW.stream_id OR (r_recording IS NOT NULL AND r_recording<>NEW.recording_id) OR e_recording<>NEW.recording_id OR e_stream<>NEW.stream_id OR e_actor<>NEW.actor_user_id OR e_scene<>r_scene_hash OR
@@ -2184,9 +2230,27 @@ BEGIN
      (p2.source_revision_id,p2.source_url_sha256,p2.source_page_url_sha256,p2.source_updated_at) IS DISTINCT FROM
      (r_revision,r_source,r_page,r_updated) THEN RAISE EXCEPTION 'campaign admission result evidence/binding mismatch'; END IF;
   NEW.recording_config_sha256:=current_config_sha;
+  NEW.roster_entry_sha256:=current_roster_sha;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_campaign_admission_result_validate BEFORE INSERT ON recording_campaign_admission_results FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_admission_result();
+
+-- Direct SQL and supported writers that do not pre-lock product rows still
+-- enter the global admission order before PostgreSQL selects/locks any target
+-- recording row. Supported writers that pre-lock account/stream/job rows call
+-- the same advisory fence explicitly before those locks.
+CREATE OR REPLACE FUNCTION recording_campaign_admission_statement_fence()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER recording_campaign_admission_insert_fence BEFORE INSERT ON recordings FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_admission_statement_fence();
+CREATE TRIGGER recording_campaign_admission_demand_update_fence BEFORE UPDATE OF
+  status,stream_id,stream_url,source_kind,mode,cron_expr,cron_timezone,clip_duration_sec,
+  daily_window_start,daily_window_end,active_weekdays,target_fps,start_at,end_at,
+  storage_destination_id,delivery_storage_destination_id,delivery,capture_via,preferred_relay_group_id
+ON recordings FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_admission_statement_fence();
 
 CREATE OR REPLACE FUNCTION guard_reserved_completed_recording_activation()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
@@ -2194,22 +2258,39 @@ DECLARE
   s TEXT:=TG_TABLE_SCHEMA; approval UUID; authorized BOOLEAN; active_count INTEGER; active_cloud INTEGER;
   has_campaign BOOLEAN; expected_build TEXT; expected_size TEXT; expected_pool TEXT; expected_project TEXT; expected_firewall TEXT; observed_expires TIMESTAMPTZ;
   current_total INTEGER; current_largest INTEGER; usable_slots INTEGER; nas_free BIGINT; required_free BIGINT; nas_connection BIGINT;
-  relay_demand INTEGER; relay_domains INTEGER; relay_after_loss INTEGER;
+  relay_demand INTEGER; relay_domains INTEGER; relay_after_loss INTEGER; identity_collision BOOLEAN;
+  activation_change BOOLEAN:=TG_OP='INSERT'; identity_change BOOLEAN:=false; demand_change BOOLEAN:=false;
 BEGIN
-  IF NEW.status='active' AND (TG_OP='INSERT' OR OLD.status<>'active' OR
-       (NEW.stream_id,NEW.stream_url,NEW.name,NEW.capture_via) IS DISTINCT FROM
-       (OLD.stream_id,OLD.stream_url,OLD.name,OLD.capture_via)) THEN
+  IF TG_OP='UPDATE' THEN
+    activation_change:=OLD.status<>'active';
+    identity_change:=(NEW.stream_id,NEW.stream_url,NEW.source_kind) IS DISTINCT FROM (OLD.stream_id,OLD.stream_url,OLD.source_kind);
+    demand_change:=(NEW.mode,NEW.cron_expr,NEW.cron_timezone,NEW.clip_duration_sec,NEW.daily_window_start,
+      NEW.daily_window_end,NEW.active_weekdays,NEW.target_fps,NEW.start_at,NEW.end_at,
+      NEW.storage_destination_id,NEW.delivery_storage_destination_id,NEW.delivery,NEW.capture_via,NEW.preferred_relay_group_id) IS DISTINCT FROM
+      (OLD.mode,OLD.cron_expr,OLD.cron_timezone,OLD.clip_duration_sec,OLD.daily_window_start,
+      OLD.daily_window_end,OLD.active_weekdays,OLD.target_fps,OLD.start_at,OLD.end_at,
+      OLD.storage_destination_id,OLD.delivery_storage_destination_id,OLD.delivery,OLD.capture_via,OLD.preferred_relay_group_id);
+  END IF;
+  IF NEW.status='active' AND (activation_change OR identity_change OR demand_change) THEN
     PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
     EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING NEW.account_id;
     IF NEW.stream_id IS NULL THEN
       EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations WHERE account_id=$1)',s) INTO authorized USING NEW.account_id;
       IF authorized THEN RAISE EXCEPTION 'active recording with NULL stream cannot bypass campaign occupancy'; END IF;
     END IF;
-    EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar LEFT JOIN %I.streams candidate ON candidate.id=$3 WHERE ar.account_id=$1 AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=ar.approval_id) AND (ar.recording_id=$2 OR ar.stream_id=$3 OR (candidate.id IS NOT NULL AND (ar.source_url_sha256=encode(sha256(convert_to(candidate.source_url,''UTF8'')),''hex'') OR (NULLIF(ar.provider,'''') IS NOT NULL AND ar.provider=COALESCE(candidate.provider,'''') AND NULLIF(ar.external_id,'''') IS NOT NULL AND ar.external_id=COALESCE(candidate.external_id,'''')) OR ar.normalized_label=COALESCE(NULLIF(regexp_replace(lower(candidate.name),''[^a-z0-9]'','''',''g''),''''),''stream''||candidate.id::text)))) ORDER BY ar.reserved_at DESC LIMIT 1',s,s,s) INTO approval USING NEW.account_id,NEW.id,NEW.stream_id;
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recordings other LEFT JOIN %I.streams occupied ON occupied.id=other.stream_id LEFT JOIN %I.streams candidate ON candidate.id=$3 WHERE other.account_id=$1 AND other.status=''active'' AND other.id<>COALESCE($2,0) AND (other.stream_id=$3 OR encode(sha256(convert_to(other.stream_url,''UTF8'')),''hex'')=encode(sha256(convert_to($4,''UTF8'')),''hex'') OR (candidate.id IS NOT NULL AND NULLIF(candidate.provider,'''') IS NOT NULL AND candidate.provider=COALESCE(occupied.provider,'''') AND NULLIF(candidate.external_id,'''') IS NOT NULL AND candidate.external_id=COALESCE(occupied.external_id,'''')) OR (candidate.id IS NOT NULL AND COALESCE(NULLIF(regexp_replace(lower(candidate.name),''[^a-z0-9]'','''',''g''),''''),''stream''||candidate.id::text)=COALESCE(NULLIF(regexp_replace(lower(occupied.name),''[^a-z0-9]'','''',''g''),''''),''stream''||occupied.id::text))) UNION ALL SELECT 1 FROM %I.recording_campaign_roster_entries entry JOIN %I.recording_campaign_tracks track ON track.id=entry.track_id JOIN %I.streams occupied ON occupied.id=entry.stream_id LEFT JOIN %I.streams candidate ON candidate.id=$3 WHERE track.account_id=$1 AND track.state IN(''active'',''complete'') AND entry.status IN(''protect'',''probation'') AND entry.recording_id<>COALESCE($2,0) AND (entry.stream_id=$3 OR encode(sha256(convert_to(occupied.source_url,''UTF8'')),''hex'')=encode(sha256(convert_to($4,''UTF8'')),''hex'') OR (candidate.id IS NOT NULL AND NULLIF(candidate.provider,'''') IS NOT NULL AND candidate.provider=COALESCE(occupied.provider,'''') AND NULLIF(candidate.external_id,'''') IS NOT NULL AND candidate.external_id=COALESCE(occupied.external_id,'''')) OR (candidate.id IS NOT NULL AND COALESCE(NULLIF(regexp_replace(lower(candidate.name),''[^a-z0-9]'','''',''g''),''''),''stream''||candidate.id::text)=COALESCE(NULLIF(regexp_replace(lower(occupied.name),''[^a-z0-9]'','''',''g''),''''),''stream''||occupied.id::text))) LIMIT 1)',s,s,s,s,s,s,s)
+      INTO identity_collision USING NEW.account_id,NEW.id,NEW.stream_id,NEW.stream_url;
+    IF identity_collision THEN RAISE EXCEPTION 'active recording identity collides with active or protected campaign occupancy'; END IF;
+    EXECUTE format('SELECT ar.approval_id FROM %I.recording_campaign_admission_reservations ar LEFT JOIN %I.streams candidate ON candidate.id=$3 WHERE ar.account_id=$1 AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=ar.approval_id) AND (ar.recording_id=$2 OR ar.stream_id=$3 OR ar.source_url_sha256=encode(sha256(convert_to($4,''UTF8'')),''hex'') OR (candidate.id IS NOT NULL AND ((NULLIF(ar.provider,'''') IS NOT NULL AND ar.provider=COALESCE(candidate.provider,'''') AND NULLIF(ar.external_id,'''') IS NOT NULL AND ar.external_id=COALESCE(candidate.external_id,'''')) OR ar.normalized_label=COALESCE(NULLIF(regexp_replace(lower(candidate.name),''[^a-z0-9]'','''',''g''),''''),''stream''||candidate.id::text)))) ORDER BY ar.reserved_at DESC LIMIT 1',s,s,s) INTO approval USING NEW.account_id,NEW.id,NEW.stream_id,NEW.stream_url;
     IF approval IS NOT NULL THEN
       EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s) INTO authorized USING approval,NEW.account_id;
       IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'reserved recording/stream requires typed campaign admission'; END IF;
     END IF;
+    -- Source identity repair is occupancy-neutral and remains supported after
+    -- the campaign begins. Admitted identities are separately sealed; all
+    -- active/protected/reserved collisions were rejected above. Only a new
+    -- activation or demand-affecting edit consumes fresh N+1/NAS authority.
+    IF NOT activation_change AND NOT demand_change THEN RETURN NEW; END IF;
     -- Once the account has a sealed campaign, every later activation remains
     -- under the permanent roster/N+1/NAS policy; serialization alone is not a
     -- capacity predicate.
@@ -2218,6 +2299,18 @@ BEGIN
     IF active_count>=60 THEN RAISE EXCEPTION 'campaign roster cap is permanently enforced'; END IF;
     EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_commits WHERE account_id=$1)',s)
       INTO has_campaign USING NEW.account_id;
+    -- After the first sealed campaign commit, every new activation or active
+    -- demand change must use the typed admission transaction. This is the
+    -- permanent reciprocal capacity/NAS fence: an ordinary writer cannot add
+    -- demand after the last measured runway reservation and merely compare
+    -- against that stale byte threshold.
+    IF has_campaign THEN
+      EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND account_id=$1 AND ($2::uuid IS NULL OR approval_id=$2))',s)
+        INTO authorized USING NEW.account_id,approval;
+      IF authorized IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'campaign account additions require typed admission capacity and NAS recomputation';
+      END IF;
+    END IF;
     EXECUTE format('SELECT o.build_sha,o.size_slug,o.pool_identity_sha256,o.provider_project_sha256,o.provider_firewall_sha256,o.expires_at FROM %I.recording_campaign_capacity_observations o JOIN %I.recording_campaign_admission_commits c ON c.approval_id=o.approval_id WHERE c.account_id=$1 ORDER BY o.observed_at DESC,o.id DESC LIMIT 1',s,s)
       INTO expected_build,expected_size,expected_pool,expected_project,expected_firewall,observed_expires USING NEW.account_id;
     EXECUTE format('SELECT count(*) FROM %I.recordings WHERE account_id=$1 AND status=''active'' AND capture_via=''cloud'' AND id<>COALESCE($2,0)',s)
@@ -2296,6 +2389,83 @@ BEGIN
 END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_recording_inverse AFTER INSERT OR UPDATE OR DELETE ON recordings DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_admitted_recording_inverse_seal();
 
+-- Supersede the 0129 transition with the admission lock order and a complete
+-- draft->active occupancy recheck. A draft roster is not protected occupancy;
+-- therefore its final activation must compete atomically with reservations and
+-- already-active/protected identities.
+CREATE OR REPLACE FUNCTION recording_campaign_assert_track_activation_occupancy(p_track BIGINT,p_account BIGINT)
+RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE entry RECORD; collision BOOLEAN;
+BEGIN
+  FOR entry IN
+    SELECT e.recording_id,e.stream_id,e.scene_identity_sha256,
+      encode(sha256(convert_to(st.source_url,'UTF8')),'hex') source_hash,
+      COALESCE(st.provider,'') provider,COALESCE(st.external_id,'') external_id,
+      COALESCE(NULLIF(regexp_replace(lower(st.name),'[^a-z0-9]','','g'),''),'stream'||st.id::text) normalized_label
+    FROM recording_campaign_roster_entries e JOIN streams st ON st.id=e.stream_id
+    WHERE e.track_id=p_track AND e.status IN('protect','probation') ORDER BY e.stream_id
+  LOOP
+    SELECT EXISTS(
+      SELECT 1 FROM recordings r LEFT JOIN streams occupied ON occupied.id=r.stream_id
+      WHERE r.account_id=p_account AND r.status='active' AND r.id<>entry.recording_id AND
+        (r.stream_id=entry.stream_id OR encode(sha256(convert_to(occupied.source_url,'UTF8')),'hex')=entry.source_hash OR
+         (NULLIF(entry.provider,'') IS NOT NULL AND entry.provider=COALESCE(occupied.provider,'') AND NULLIF(entry.external_id,'') IS NOT NULL AND entry.external_id=COALESCE(occupied.external_id,'')) OR
+         entry.normalized_label=COALESCE(NULLIF(regexp_replace(lower(occupied.name),'[^a-z0-9]','','g'),''),'stream'||occupied.id::text))
+      UNION ALL
+      SELECT 1 FROM recording_campaign_roster_entries other JOIN recording_campaign_tracks other_track ON other_track.id=other.track_id JOIN streams occupied ON occupied.id=other.stream_id
+      WHERE other.track_id<>p_track AND other_track.account_id=p_account AND other_track.state IN('active','complete') AND other.status IN('protect','probation') AND
+        (other.stream_id=entry.stream_id OR other.scene_identity_sha256=entry.scene_identity_sha256 OR encode(sha256(convert_to(occupied.source_url,'UTF8')),'hex')=entry.source_hash OR
+         (NULLIF(entry.provider,'') IS NOT NULL AND entry.provider=COALESCE(occupied.provider,'') AND NULLIF(entry.external_id,'') IS NOT NULL AND entry.external_id=COALESCE(occupied.external_id,'')) OR
+         entry.normalized_label=COALESCE(NULLIF(regexp_replace(lower(occupied.name),'[^a-z0-9]','','g'),''),'stream'||occupied.id::text))
+      UNION ALL
+      SELECT 1 FROM recording_campaign_admission_reservations pending
+      WHERE pending.account_id=p_account AND NOT EXISTS(SELECT 1 FROM recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=pending.approval_id) AND
+        NOT EXISTS(SELECT 1 FROM recording_campaign_admission_tx_authorizations witness WHERE witness.transaction_id=txid_current() AND witness.action='admit' AND witness.approval_id=pending.approval_id AND witness.account_id=p_account) AND
+        (pending.stream_id=entry.stream_id OR pending.scene_identity_sha256=entry.scene_identity_sha256 OR pending.recording_id=entry.recording_id OR pending.source_url_sha256=entry.source_hash OR
+         (NULLIF(entry.provider,'') IS NOT NULL AND pending.provider=entry.provider AND NULLIF(entry.external_id,'') IS NOT NULL AND pending.external_id=entry.external_id) OR pending.normalized_label=entry.normalized_label)
+      LIMIT 1
+    ) INTO collision;
+    IF collision THEN RAISE EXCEPTION 'campaign track activation collides with active/protected/reserved occupancy'; END IF;
+  END LOOP;
+END $$;
+
+CREATE OR REPLACE FUNCTION guard_recording_campaign_track_activation_occupancy()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+BEGIN
+  IF OLD.state='draft' AND NEW.state='active' THEN
+    PERFORM recording_campaign_assert_track_activation_occupancy(NEW.id,NEW.account_id);
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_campaign_track_state_fence BEFORE UPDATE OF state ON recording_campaign_tracks FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_admission_statement_fence();
+CREATE TRIGGER recording_campaign_track_activation_occupancy BEFORE UPDATE OF state ON recording_campaign_tracks FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_track_activation_occupancy();
+
+CREATE OR REPLACE FUNCTION transition_recording_campaign_track(p_track BIGINT,p_to TEXT,p_reasons TEXT[],p_actor BIGINT,p_decided TIMESTAMPTZ)
+RETURNS VOID LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+DECLARE old_state TEXT; expected_count INTEGER; actual_count INTEGER; track_account BIGINT; first_account BIGINT; authorized BOOLEAN;
+BEGIN
+  SELECT account_id INTO first_account FROM recording_campaign_tracks WHERE id=p_track;
+  IF first_account IS NULL THEN RAISE EXCEPTION 'track transition requires track, reasons, and decision time'; END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+  PERFORM 1 FROM accounts WHERE id=first_account FOR UPDATE;
+  SELECT state,target_count,account_id INTO old_state,expected_count,track_account FROM recording_campaign_tracks WHERE id=p_track FOR UPDATE;
+  IF track_account IS DISTINCT FROM first_account OR p_decided IS NULL OR cardinality(p_reasons)=0 THEN RAISE EXCEPTION 'track transition requires stable track, reasons, and decision time'; END IF;
+  IF NOT ((old_state='draft' AND p_to='active') OR (old_state='active' AND p_to='complete') OR (old_state IN ('draft','active','complete') AND p_to='retired')) THEN RAISE EXCEPTION 'invalid campaign track transition'; END IF;
+  SELECT (u.is_operator OR EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.org_id=track_account AND m.accepted_at IS NOT NULL AND m.role IN ('owner','admin'))) INTO authorized FROM users u WHERE u.id=p_actor;
+  IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign transition actor is not an account owner/operator'; END IF;
+  IF p_to IN ('active','complete') THEN
+    SELECT count(*) INTO actual_count FROM recording_campaign_roster_entries WHERE track_id=p_track AND role='primary' AND status IN ('protect','probation');
+    IF actual_count<>expected_count THEN RAISE EXCEPTION 'active track requires exact target primary roster'; END IF;
+  END IF;
+  IF old_state='draft' AND p_to='active' THEN
+    PERFORM recording_campaign_assert_track_activation_occupancy(p_track,track_account);
+  END IF;
+  PERFORM set_config('stoarama.campaign_transition','1',true);
+  UPDATE recording_campaign_tracks SET state=p_to,updated_at=recording_campaign_now() WHERE id=p_track;
+  PERFORM set_config('stoarama.campaign_transition','0',true);
+  INSERT INTO recording_campaign_track_events(track_id,from_state,to_state,reason_codes,actor_user_id,decided_at) VALUES(p_track,old_state,p_to,p_reasons,p_actor,p_decided);
+END $$;
+
 CREATE OR REPLACE FUNCTION guard_reserved_campaign_roster_occupancy()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; account BIGINT; approval UUID; authorized BOOLEAN;
@@ -2315,13 +2485,17 @@ CREATE TRIGGER recording_campaign_admission_roster_guard BEFORE INSERT OR UPDATE
 
 CREATE OR REPLACE FUNCTION enforce_admitted_roster_inverse_seal()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE s TEXT:=TG_TABLE_SCHEMA; eid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.id ELSE NEW.id END; admitted BOOLEAN; bound BOOLEAN;
+DECLARE s TEXT:=TG_TABLE_SCHEMA; eid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.id ELSE NEW.id END; admitted BOOLEAN; bound BOOLEAN; expected TEXT; actual TEXT;
 BEGIN
-  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results WHERE roster_entry_id=$1)',s) INTO admitted USING eid;
+  EXECUTE format('SELECT roster_entry_sha256 FROM %I.recording_campaign_admission_results WHERE roster_entry_id=$1',s) INTO expected USING eid;
+  admitted:=expected IS NOT NULL;
   IF admitted IS DISTINCT FROM true THEN RETURN NULL; END IF;
+  IF TG_OP='DELETE' THEN RAISE EXCEPTION 'admitted roster entry is immutable without a typed release'; END IF;
+  EXECUTE format('SELECT encode(sha256(convert_to(to_jsonb(e)::text,''UTF8'')),''hex'') FROM %I.recording_campaign_roster_entries e WHERE id=$1',s)
+    INTO actual USING eid;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results ar JOIN %I.recording_campaign_tracks t ON t.id=ar.track_id JOIN %I.recording_campaign_roster_entries e ON e.id=ar.roster_entry_id AND e.track_id=t.id JOIN %I.recording_campaign_admission_reservations r ON r.approval_id=ar.approval_id AND r.stream_id=ar.stream_id JOIN %I.recording_targeted_probe_evidence evidence ON evidence.id=ar.second_probe_evidence_id WHERE ar.roster_entry_id=$1 AND t.state=''active'' AND e.recording_id=ar.recording_id AND e.stream_id=ar.stream_id AND e.scene_identity_sha256=r.scene_identity_sha256 AND e.role=''primary'' AND e.rank=1+(SELECT count(*) FROM %I.recording_campaign_admission_results prior WHERE prior.approval_id=ar.approval_id AND prior.stream_id<ar.stream_id) AND e.status=''probation'' AND e.reason_codes=ARRAY[''deniz_approved'',''targeted_do_two_pass'',''source_fenced'']::text[] AND e.effective_at=e.decision_at AND e.evidence_observed_at=evidence.observed_at AND e.evidence_sha256=evidence.media_sha256 AND e.updated_by_user_id=ar.actor_user_id)',s,s,s,s,s,s)
     INTO bound USING eid;
-  IF bound IS DISTINCT FROM true THEN RAISE EXCEPTION 'admitted roster entry is immutable without a typed release'; END IF;
+  IF bound IS DISTINCT FROM true OR actual IS DISTINCT FROM expected THEN RAISE EXCEPTION 'admitted roster entry is immutable without a typed release'; END IF;
   RETURN NULL;
 END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_roster_inverse AFTER UPDATE OR DELETE ON recording_campaign_roster_entries DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_admitted_roster_inverse_seal();
@@ -2337,6 +2511,52 @@ BEGIN
   RETURN NULL;
 END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_track_inverse AFTER UPDATE OR DELETE ON recording_campaign_tracks DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_admitted_track_inverse_seal();
+
+-- Worker lifecycle changes use the same claim -> cloud-capacity order as probe
+-- leasing. A live server-owned probe is capture authority: no controller,
+-- operator force-drain, direct SQL, or claim-head rotation may strand it.
+CREATE OR REPLACE FUNCTION recording_campaign_worker_lifecycle_statement_fence()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0));
+  RETURN NULL;
+END $$;
+CREATE OR REPLACE FUNCTION guard_recording_campaign_worker_probe_lifecycle()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  IF (NEW.state,NEW.node_id) IS DISTINCT FROM (OLD.state,OLD.node_id) AND OLD.node_id IS NOT NULL AND
+     recording_worker_targeted_probe_occupancy(OLD.node_id)>0 THEN
+    RAISE EXCEPTION 'managed recorder has live targeted probe capture authority';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_campaign_droplet_lifecycle_fence BEFORE UPDATE OF state,node_id ON recorder_droplets FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_worker_lifecycle_statement_fence();
+CREATE TRIGGER recording_campaign_droplet_probe_guard BEFORE UPDATE OF state,node_id ON recorder_droplets FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_worker_probe_lifecycle();
+
+CREATE OR REPLACE FUNCTION guard_recording_campaign_node_probe_lifecycle()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  IF (NEW.status,NEW.node_type,NEW.account_id) IS DISTINCT FROM (OLD.status,OLD.node_type,OLD.account_id) AND
+     recording_worker_targeted_probe_occupancy(OLD.id)>0 THEN
+    RAISE EXCEPTION 'managed recorder node has live targeted probe capture authority';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_campaign_node_lifecycle_fence BEFORE UPDATE OF status,node_type,account_id ON nodes FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_worker_lifecycle_statement_fence();
+CREATE TRIGGER recording_campaign_node_probe_guard BEFORE UPDATE OF status,node_type,account_id ON nodes FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_node_probe_lifecycle();
+
+CREATE OR REPLACE FUNCTION guard_recording_campaign_claim_head_probe_lifecycle()
+RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+BEGIN
+  IF (NEW.generation,NEW.claim_token_id,NEW.state) IS DISTINCT FROM (OLD.generation,OLD.claim_token_id,OLD.state) AND
+     recording_worker_targeted_probe_occupancy(OLD.node_id)>0 THEN
+    RAISE EXCEPTION 'claim authority cannot rotate or block while targeted probe is live';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_campaign_claim_head_lifecycle_fence BEFORE UPDATE OF generation,claim_token_id,state ON recording_worker_claim_heads FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_worker_lifecycle_statement_fence();
+CREATE TRIGGER recording_campaign_claim_head_probe_guard BEFORE UPDATE OF generation,claim_token_id,state ON recording_worker_claim_heads FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_claim_head_probe_lifecycle();
 
 CREATE OR REPLACE FUNCTION enforce_admitted_stream_inverse_seal()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
@@ -2435,6 +2655,7 @@ BEGIN
     'validate_recording_targeted_probe_attempt_terminal_event()',
     'validate_recording_targeted_provider_attestation()',
     'validate_recording_campaign_tx_authorization()',
+    'validate_recording_campaign_reservation_terminal_event()',
     'validate_recording_targeted_probe_scene_presentation()',
     'validate_recording_targeted_probe_scene_review()',
     'validate_recording_campaign_capacity_observation()',
@@ -2451,12 +2672,20 @@ BEGIN
     'validate_recording_targeted_probe_attempt()',
     'validate_recording_targeted_probe_evidence()',
     'validate_recording_campaign_admission_result()',
+    'recording_campaign_admission_statement_fence()',
+    'recording_campaign_assert_track_activation_occupancy(bigint,bigint)',
+    'guard_recording_campaign_track_activation_occupancy()',
     'guard_reserved_completed_recording_activation()',
     'enforce_reserved_activation_has_result()',
     'enforce_admitted_recording_inverse_seal()',
+    'transition_recording_campaign_track(bigint,text,text[],bigint,timestamp with time zone)',
     'guard_reserved_campaign_roster_occupancy()',
     'enforce_admitted_roster_inverse_seal()',
     'enforce_admitted_track_inverse_seal()',
+    'recording_campaign_worker_lifecycle_statement_fence()',
+    'guard_recording_campaign_worker_probe_lifecycle()',
+    'guard_recording_campaign_node_probe_lifecycle()',
+    'guard_recording_campaign_claim_head_probe_lifecycle()',
     'enforce_admitted_stream_inverse_seal()',
     'enforce_admitted_revision_inverse_seal()',
     'reject_campaign_admission_evidence_mutation()'
@@ -2467,7 +2696,7 @@ END
 $pin_recording_campaign_admission_search_path$;
 
 REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON recording_campaign_authority_decisions,recording_campaign_admission_approvals,recording_campaign_admission_reservations,recording_campaign_admission_reservation_terminal_events,recording_targeted_probe_orders,recording_targeted_provider_attestations,recording_targeted_probe_attempts,recording_targeted_probe_attempt_terminal_events,recording_targeted_probe_evidence,recording_targeted_probe_scene_presentations,recording_targeted_probe_scene_reviews,recording_campaign_baseline_scene_presentations,recording_campaign_capacity_observations,recording_campaign_capacity_reservations,recording_campaign_storage_observations,recording_campaign_storage_reservations,recording_campaign_admission_results,recording_campaign_admission_commits,recording_campaign_admission_tx_authorizations,recording_campaign_admission_source_fence_events FROM PUBLIC;
-REVOKE ALL ON FUNCTION validate_recording_targeted_probe_order(),validate_recording_targeted_probe_attempt_terminal_event(),validate_recording_targeted_provider_attestation(),validate_recording_campaign_tx_authorization(),validate_recording_targeted_probe_scene_presentation(),validate_recording_targeted_probe_scene_review(),validate_recording_campaign_capacity_observation(),validate_recording_campaign_capacity_reservation(),validate_recording_campaign_storage_observation(),validate_recording_campaign_storage_reservation(),validate_recording_campaign_admission_commit(),enforce_recording_campaign_result_has_commit(),validate_recording_campaign_admission_approval(),reserve_recording_campaign_admission_entries(),validate_recording_campaign_admission_reservation(),audit_recording_campaign_reserved_source_mutation(),audit_recording_campaign_reserved_revision_mutation(),validate_recording_targeted_probe_attempt(),validate_recording_targeted_probe_evidence(),validate_recording_campaign_admission_result(),guard_reserved_completed_recording_activation(),enforce_reserved_activation_has_result(),enforce_admitted_recording_inverse_seal(),guard_reserved_campaign_roster_occupancy(),enforce_admitted_roster_inverse_seal(),enforce_admitted_track_inverse_seal(),enforce_admitted_stream_inverse_seal(),enforce_admitted_revision_inverse_seal(),reject_campaign_admission_evidence_mutation() FROM PUBLIC;
+REVOKE ALL ON FUNCTION validate_recording_targeted_probe_order(),validate_recording_targeted_probe_attempt_terminal_event(),validate_recording_targeted_provider_attestation(),validate_recording_campaign_tx_authorization(),validate_recording_campaign_reservation_terminal_event(),validate_recording_targeted_probe_scene_presentation(),validate_recording_targeted_probe_scene_review(),validate_recording_campaign_capacity_observation(),validate_recording_campaign_capacity_reservation(),validate_recording_campaign_storage_observation(),validate_recording_campaign_storage_reservation(),validate_recording_campaign_admission_commit(),enforce_recording_campaign_result_has_commit(),validate_recording_campaign_admission_approval(),reserve_recording_campaign_admission_entries(),validate_recording_campaign_admission_reservation(),audit_recording_campaign_reserved_source_mutation(),audit_recording_campaign_reserved_revision_mutation(),validate_recording_targeted_probe_attempt(),validate_recording_targeted_probe_evidence(),validate_recording_campaign_admission_result(),recording_campaign_admission_statement_fence(),recording_campaign_assert_track_activation_occupancy(BIGINT,BIGINT),guard_recording_campaign_track_activation_occupancy(),guard_reserved_completed_recording_activation(),enforce_reserved_activation_has_result(),enforce_admitted_recording_inverse_seal(),guard_reserved_campaign_roster_occupancy(),enforce_admitted_roster_inverse_seal(),enforce_admitted_track_inverse_seal(),recording_campaign_worker_lifecycle_statement_fence(),guard_recording_campaign_worker_probe_lifecycle(),guard_recording_campaign_node_probe_lifecycle(),guard_recording_campaign_claim_head_probe_lifecycle(),enforce_admitted_stream_inverse_seal(),enforce_admitted_revision_inverse_seal(),reject_campaign_admission_evidence_mutation() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_campaign_authorize_account(TEXT,UUID,BIGINT,BIGINT,BIGINT,TEXT),recording_campaign_authorize_node(TEXT,UUID,BIGINT,BIGINT,BIGINT,BIGINT,TEXT) FROM PUBLIC;
 
 -- Structural role split. The migration-only login supplies these settings and
@@ -2528,17 +2757,21 @@ DECLARE
     'recording_campaign_replay(uuid,bigint,text)',
     'recording_campaign_replay_approval(bigint,uuid,text,text)',
     'validate_recording_targeted_probe_order()','validate_recording_targeted_probe_attempt_terminal_event()','validate_recording_targeted_provider_attestation()',
-    'validate_recording_campaign_tx_authorization()','validate_recording_targeted_probe_scene_presentation()','validate_recording_targeted_probe_scene_review()',
+    'validate_recording_campaign_tx_authorization()','validate_recording_campaign_reservation_terminal_event()','validate_recording_targeted_probe_scene_presentation()','validate_recording_targeted_probe_scene_review()',
     'validate_recording_campaign_capacity_observation()','validate_recording_campaign_capacity_reservation()',
     'validate_recording_campaign_storage_observation()','validate_recording_campaign_storage_reservation()',
     'validate_recording_campaign_admission_commit()','enforce_recording_campaign_result_has_commit()',
     'validate_recording_campaign_admission_approval()','reserve_recording_campaign_admission_entries()',
     'validate_recording_campaign_admission_reservation()','audit_recording_campaign_reserved_source_mutation()',
     'audit_recording_campaign_reserved_revision_mutation()','validate_recording_targeted_probe_attempt()',
-    'validate_recording_targeted_probe_evidence()','validate_recording_campaign_admission_result()',
+    'validate_recording_targeted_probe_evidence()','validate_recording_campaign_admission_result()','recording_campaign_admission_statement_fence()',
+    'recording_campaign_assert_track_activation_occupancy(bigint,bigint)','guard_recording_campaign_track_activation_occupancy()',
     'guard_reserved_completed_recording_activation()','enforce_reserved_activation_has_result()',
     'enforce_admitted_recording_inverse_seal()','guard_reserved_campaign_roster_occupancy()',
     'enforce_admitted_roster_inverse_seal()','enforce_admitted_track_inverse_seal()',
+    'recording_campaign_worker_lifecycle_statement_fence()','guard_recording_campaign_worker_probe_lifecycle()',
+    'guard_recording_campaign_node_probe_lifecycle()',
+    'guard_recording_campaign_claim_head_probe_lifecycle()',
     'enforce_admitted_stream_inverse_seal()','enforce_admitted_revision_inverse_seal()',
     'reject_campaign_admission_evidence_mutation()'
   ];
@@ -2569,6 +2802,7 @@ BEGIN
   EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM PUBLIC,%I,%I',install_schema,runtime_role,executor_role);
   EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I',install_schema,runtime_role);
   EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I',install_schema,executor_role);
+  EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I',install_schema,authority_role);
   FOREACH object_name IN ARRAY authority_tables LOOP
     EXECUTE format('ALTER TABLE %I.%I OWNER TO %I',install_schema,object_name,authority_role);
     EXECUTE format('REVOKE ALL ON TABLE %I.%I FROM PUBLIC,%I,%I',install_schema,object_name,runtime_role,executor_role);
@@ -2577,6 +2811,7 @@ BEGIN
   EXECUTE format('ALTER FUNCTION %I.recording_worker_targeted_probe_occupancy(bigint) SET search_path=%I,pg_catalog,pg_temp',install_schema,install_schema);
   EXECUTE format('REVOKE ALL ON FUNCTION %I.recording_worker_targeted_probe_occupancy(bigint) FROM PUBLIC,%I,%I',install_schema,runtime_role,executor_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_worker_targeted_probe_occupancy(bigint) TO %I',install_schema,runtime_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_worker_targeted_probe_occupancy(bigint) TO %I',install_schema,authority_role);
   SELECT encode(sha256(convert_to(string_agg(c.relname,E'\n' ORDER BY c.relname)||E'\n','UTF8')),'hex')
     INTO product_manifest_sha256
   FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace

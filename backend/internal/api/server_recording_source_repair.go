@@ -69,6 +69,10 @@ func (s *Server) handleAdminRecordingSourceRepair(w http.ResponseWriter, r *http
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockCampaignAdmissionFence(r.Context(), tx); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock campaign admission capacity")
+		return
+	}
 	var jobStatus string
 	var jobRecordingID int64
 	var jobKind string

@@ -348,7 +348,8 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'campaign01',$2)`, nodeID, hashSecret("node-token")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recorder_droplets(name,node_id,do_droplet_id,region,size,capacity,state,last_seen_at,build_sha) VALUES('worker-test',$1,999,'nyc1','s-2vcpu-4gb',5,'active',now(),$2)`, nodeID, buildSHA); err != nil {
+	var recorderDropletID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO recorder_droplets(name,node_id,do_droplet_id,region,size,capacity,state,last_seen_at,build_sha) VALUES('worker-test',$1,999,'nyc1','s-2vcpu-4gb',5,'active',now(),$2) RETURNING id`, nodeID, buildSHA).Scan(&recorderDropletID); err != nil {
 		t.Fatal(err)
 	}
 	var standbyNodeID int64
@@ -457,6 +458,40 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		router.ServeHTTP(rec, req)
 		return rec
 	}
+	// Lifecycle-first commit order: the state writer owns the exact claim ->
+	// cloud-capacity fences while the lease request starts on another pool
+	// connection. The request must resume only after commit and observe the
+	// worker as ineligible; it can never cross the drain with a live attempt.
+	lifecycleTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lifecycleTx.Exec(ctx, `UPDATE recorder_droplets SET state='draining' WHERE node_id=$1`, nodeID); err != nil {
+		_ = lifecycleTx.Rollback(ctx)
+		t.Fatalf("stage lifecycle-first drain: %v", err)
+	}
+	lifecycleLease := make(chan *httptest.ResponseRecorder, 1)
+	go func() { lifecycleLease <- postNode("/api/v1/recording/campaign-admission/lease", map[string]any{}) }()
+	select {
+	case early := <-lifecycleLease:
+		_ = lifecycleTx.Rollback(ctx)
+		t.Fatalf("probe lease crossed uncommitted lifecycle fence: status=%d body=%s", early.Code, early.Body.String())
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := lifecycleTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case afterDrain := <-lifecycleLease:
+		if afterDrain.Code != http.StatusOK || !strings.Contains(afterDrain.Body.String(), `"target":null`) {
+			t.Fatalf("lifecycle-first probe lease was not rejected: status=%d body=%s", afterDrain.Code, afterDrain.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe lease did not resume after lifecycle commit")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET state='active',last_seen_at=now() WHERE node_id=$1`, nodeID); err != nil {
+		t.Fatal(err)
+	}
 	var footageFirstJobID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key) VALUES($1,now()-interval '1 second',now()-interval '1 second',60,'pending',$2) RETURNING id`, baselineRecordingID, "campaign-probe-footage-first").Scan(&footageFirstJobID); err != nil {
 		t.Fatal(err)
@@ -508,6 +543,22 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		}
 		if leaseResponse.Target.ID != streamID || leaseResponse.Target.AttemptID == "" || leaseResponse.Target.Challenge == "" || !strings.Contains(leaseResponse.Target.MediaUploadURL, "/quarantine/campaign-probe/") || !strings.Contains(leaseResponse.Target.FrameUploadURL, "/quarantine/campaign-probe/") {
 			t.Fatalf("lease did not return exact server-owned quarantine intents: %#v", leaseResponse.Target)
+		}
+		// Probe-first commit order: both the supported Store path and direct SQL
+		// lifecycle/claim-head writers must observe the durable attempt occupancy.
+		// Force-drain may override recording leases, never qualification evidence.
+		drained, drainErr := dropletpool.NewStore(pool).MarkDrainingIfIdle(ctx, recorderDropletID)
+		if drainErr != nil || drained {
+			t.Fatalf("probe-first supported drain crossed occupancy: drained=%v err=%v", drained, drainErr)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET state='draining' WHERE node_id=$1`, nodeID); err == nil {
+			t.Fatal("probe-first direct lifecycle update crossed occupancy")
+		}
+		if _, err := pool.Exec(ctx, `UPDATE nodes SET status='disabled' WHERE id=$1`, nodeID); err == nil {
+			t.Fatal("probe-first direct node disable crossed occupancy")
+		}
+		if _, err := pool.Exec(ctx, `UPDATE recording_worker_claim_heads SET state='recovery_blocked',blocked_at=now(),block_reason='durable_recovery' WHERE node_id=$1`, nodeID); err == nil {
+			t.Fatal("probe-first claim-head rotation crossed occupancy")
 		}
 		mediaArchive, frame := buildCampaignProbeArchive(t, colorName)
 		mediaKey := fmt.Sprintf("quarantine/campaign-probe/%s/media.zip", leaseResponse.Target.AttemptID)
@@ -654,8 +705,20 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE recording_campaign_roster_entries SET role='backup' WHERE recording_id=$1`, admittedRecordingID); err == nil {
 		t.Fatal("runtime direct SQL rewrote admitted roster provenance")
 	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_campaign_roster_entries SET effective_at=decision_at+interval '1 second',decision_at=decision_at+interval '1 second',source_window_end_at=now(),source_health_recording_id=$1 WHERE recording_id=$1`, admittedRecordingID); err == nil {
+		t.Fatal("runtime direct SQL rewrote admitted roster time/source provenance")
+	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_campaign_tracks SET grade_floor='ACCEPTABLE' WHERE id=(SELECT track_id FROM recording_campaign_roster_entries WHERE recording_id=$1)`, admittedRecordingID); err == nil {
 		t.Fatal("runtime direct SQL weakened the governing 14-window GOOD/GREAT qualification policy")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET clip_duration_sec=120 WHERE id=$1`, baselineRecordingID); err == nil {
+		t.Fatal("ordinary active schedule mutation bypassed typed campaign capacity/NAS recomputation")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET stream_url='https://baseline.example/repaired.m3u8',source_kind='hls_live' WHERE id=$1`, baselineRecordingID); err != nil {
+		t.Fatalf("occupancy-neutral supported source repair was overblocked: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET stream_id=$2,stream_url=(SELECT stream_url FROM streams WHERE id=$2) WHERE id=$1`, baselineRecordingID, streamID); err == nil {
+		t.Fatal("ordinary active identity rebind collided with protected campaign occupancy")
 	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=1,nas_storage_reported_at=now(),last_seen_at=now() WHERE id=$1`, nasConnectionID); err != nil {
 		t.Fatal(err)

@@ -62,6 +62,12 @@ const dropletHasCaptureAuthoritySQL = `
 	    ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
 	  WHERE generation.lease_owner=$1
 	    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
+	  UNION ALL
+	  SELECT 1
+	  FROM recorder_droplets probe_droplet
+	  WHERE probe_droplet.name=$1
+	    AND probe_droplet.node_id IS NOT NULL
+	    AND recording_worker_targeted_probe_occupancy(probe_droplet.node_id)>0
 	)
 `
 
@@ -224,6 +230,9 @@ func (s *Store) RevokeNodeToken(ctx context.Context, nodeTokenID, nodeID *int64)
 				  ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
 				WHERE lease.node_id=$2 AND plan.origin_claim_generation=$3
 				  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)
+				UNION ALL
+				SELECT 1
+				WHERE recording_worker_targeted_probe_occupancy($2)>0
 			)`, *nodeTokenID, tokenNode, generation).Scan(&busy); err != nil {
 				return fmt.Errorf("prove recorder token drained: %w", err)
 			}
@@ -310,6 +319,9 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return false, err
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
 		return false, err
 	}
@@ -355,6 +367,9 @@ func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return false, err
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
 		return false, err
 	}
@@ -391,6 +406,9 @@ func (s *Store) BeginForcedDestroyAfterDrainTimeout(ctx context.Context, id int6
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return false, err
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
 		return false, err
 	}

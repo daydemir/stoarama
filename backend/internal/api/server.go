@@ -829,6 +829,10 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockCampaignAdmissionFence(r.Context(), tx); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock campaign admission capacity")
+		return
+	}
 	current, err := s.loadStreamForAssignmentTx(r.Context(), tx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1094,6 +1098,16 @@ func (s *Server) reconcileStreamRecordingAssignments(
 		return result, status, nil
 	}
 	return nil, 0, nil
+}
+
+// lockCampaignAdmissionFence is the common first lock for every supported
+// writer that may create, activate, or alter active recording demand/identity.
+// The database statement trigger is the direct-SQL backstop; callers that lock
+// account/stream/job rows before issuing their UPDATE must take this first to
+// preserve the admission global -> account -> stream -> recording order.
+func lockCampaignAdmissionFence(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0))`)
+	return err
 }
 
 // propagateStreamSourceToActiveRelayRecordingsTx updates the source snapshot used

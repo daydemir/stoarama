@@ -976,6 +976,10 @@ func (s *Server) handleAccountRecordingsCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockCampaignAdmissionFence(r.Context(), tx); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock campaign admission capacity")
+		return
+	}
 	if catalogStreamID > 0 {
 		var currentTimezone string
 		if err := tx.QueryRow(r.Context(), `SELECT local_timezone FROM streams WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, catalogStreamID).Scan(&currentTimezone); err != nil {
@@ -1461,6 +1465,10 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockCampaignAdmissionFence(r.Context(), tx); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock campaign admission capacity")
+		return
+	}
 	if _, err := tx.Exec(r.Context(), `SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE`, principal.AccountID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "lock account scheduling occupancy")
 		return
@@ -2377,6 +2385,10 @@ func (s *Server) setRecordingStatus(w http.ResponseWriter, r *http.Request, from
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockCampaignAdmissionFence(r.Context(), tx); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock campaign admission capacity")
+		return
+	}
 
 	ct, err := tx.Exec(r.Context(), `
 		UPDATE recordings

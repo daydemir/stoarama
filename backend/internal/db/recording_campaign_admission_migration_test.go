@@ -139,12 +139,23 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	`, accountID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := migrator.Exec(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,stream_id,source_kind,mode,cron_expr,cron_timezone,clip_duration_sec,status,start_at,end_at,capture_via,next_fire_at) VALUES($1,$2,'off-window relay demand','https://relay.example/live.m3u8',$3,'hls_live','sampled','0 23 * * *','UTC',60,'active',recording_campaign_now()-interval '1 day',recording_campaign_now()+interval '1 day','relay',recording_campaign_now()+interval '12 hours')`, accountID, destinationID, relayStreamID); err != nil {
+	if _, err := migrator.Exec(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,stream_id,source_kind,mode,cron_expr,cron_timezone,clip_duration_sec,status,start_at,end_at,capture_via,next_fire_at) VALUES($1,$2,'future relay demand','https://relay.example/live.m3u8',$3,'hls_live','sampled','0 23 * * *','UTC',60,'active',recording_campaign_now()+interval '6 hours',recording_campaign_now()+interval '1 day','relay',recording_campaign_now()+interval '12 hours')`, accountID, destinationID, relayStreamID); err != nil {
 		t.Fatal(err)
 	}
 	var relayDemand, relayDomains, relayCapacity, relayAfterLoss int
 	if err := migrator.QueryRow(ctx, `SELECT active_demand,failure_domains,effective_capacity,usable_after_largest_loss FROM recording_campaign_relay_failure_capacity($1)`, accountID).Scan(&relayDemand, &relayDomains, &relayCapacity, &relayAfterLoss); err != nil || relayDemand != 1 || relayDomains != 2 || relayCapacity != 7 || relayAfterLoss != 3 {
-		t.Fatalf("off-window relay schedule peak was not fenced: demand=%d domains=%d capacity=%d after_loss=%d err=%v", relayDemand, relayDomains, relayCapacity, relayAfterLoss, err)
+		t.Fatalf("future relay schedule peak was not fenced: demand=%d domains=%d capacity=%d after_loss=%d err=%v", relayDemand, relayDomains, relayCapacity, relayAfterLoss, err)
+	}
+	var futureCloudStreamID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone) VALUES('cloud-fixture','future-cloud','Future cloud','future-cloud','https://cloud.example/live.m3u8','https://cloud.example/page','hls','video_manifest','video_live','continuous_video',30,'UTC') RETURNING id`).Scan(&futureCloudStreamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Exec(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,stream_id,source_kind,mode,cron_timezone,clip_duration_sec,daily_window_start,daily_window_end,active_weekdays,status,start_at,end_at,capture_via,next_fire_at) VALUES($1,$2,'future cloud demand','https://cloud.example/live.m3u8',$3,'hls_live','continuous','UTC',60,'06:00','18:00',127,'active',recording_campaign_now()+interval '10 days',recording_campaign_now()+interval '20 days','cloud',recording_campaign_now()+interval '10 days')`, accountID, destinationID, futureCloudStreamID); err != nil {
+		t.Fatal(err)
+	}
+	var cloudPeak int
+	if err := migrator.QueryRow(ctx, `SELECT recording_campaign_forecast_peak_slots($1)`, accountID).Scan(&cloudPeak); err != nil || cloudPeak < 1 {
+		t.Fatalf("future cloud schedule peak was not fenced: peak=%d err=%v", cloudPeak, err)
 	}
 	if err := migrator.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone,tags) VALUES('publisher','fd-17235','FD scene','fd-scene-17235','https://source.example/live.m3u8','https://source.example/page','hls','video_manifest','video_live','continuous_video',30,'Europe/Berlin',ARRAY['FD']) RETURNING id`).Scan(&streamID); err != nil {
 		t.Fatal(err)
@@ -206,6 +217,29 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if approvalID == uuid.Nil || len(approvalSHA) != 64 {
 		t.Fatalf("invalid approval result id=%s sha=%q", approvalID, approvalSHA)
 	}
+	var draftTrackID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id,reporting_grade_floor,reporting_required_consecutive_windows) VALUES($1,$2,'reservation collision fixture',recording_campaign_now()+interval '3 days',1,'GOOD',14,$3,'ACCEPTABLE',14) RETURNING id`, accountID, "draft-collision-"+uuid.NewString(), userID).Scan(&draftTrackID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,$4,'primary',1,'probation',ARRAY['fixture'],recording_campaign_now(),recording_campaign_now(),recording_campaign_now(),$5,$6)`, draftTrackID, recordingID, streamID, sceneSHA, frameSHA, userID); err != nil {
+		t.Fatal(err)
+	}
+	forgedTrackTx, err := migrator.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = forgedTrackTx.Exec(ctx, `SELECT set_config('stoarama.campaign_transition','1',true)`); err != nil {
+		_ = forgedTrackTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err = forgedTrackTx.Exec(ctx, `UPDATE recording_campaign_tracks SET state='active' WHERE id=$1`, draftTrackID); err == nil || !strings.Contains(err.Error(), "collides") {
+		_ = forgedTrackTx.Rollback(ctx)
+		t.Fatalf("forged transition GUC bypassed track occupancy guard: %v", err)
+	}
+	_ = forgedTrackTx.Rollback(ctx)
+	if _, err := migrator.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['fixture'],$2,recording_campaign_now())`, draftTrackID, userID); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("draft roster activation crossed pending reservation: %v", err)
+	}
 	if _, err := runtimePool.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, recordingID); err == nil || !strings.Contains(err.Error(), "typed campaign admission") {
 		t.Fatalf("generic completed activation bypassed reservation: %v", err)
 	}
@@ -234,8 +268,109 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	}
 	expireRequestID := uuid.New()
 	var terminalSHA string
-	if err := executorPool.QueryRow(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, expireRequestID, approvalID, accountID, userID, expireSessionID, expireCredentialSHA).Scan(&terminalSHA); err != nil || len(terminalSHA) != 64 {
-		t.Fatalf("typed expired-reservation terminal failed: sha=%q err=%v", terminalSHA, err)
+	if _, err := migrator.Exec(ctx, `INSERT INTO recording_campaign_admission_reservation_terminal_events(approval_id,account_id,request_id,result,actor_user_id,event_sha256) VALUES($1,$2,$3,'expired_unadmitted',$4,repeat('0',64))`, approvalID, accountID, uuid.New(), userID); err == nil {
+		t.Fatal("direct SQL forged a reservation terminal event")
+	}
+	// Genuine two-connection, both-order serialization. First the ordinary
+	// activation owns the global fence: it deterministically rejects the live
+	// reservation while expiration waits. Then expiration owns the fence with
+	// its terminal row still uncommitted: a second activation waits and succeeds
+	// only after the terminal event commits.
+	activationFirst, err := runtimePool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := activationFirst.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0))`); err != nil {
+		t.Fatal(err)
+	}
+	expireTx, err := executorPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expireDone := make(chan error, 1)
+	go func() {
+		expireDone <- expireTx.QueryRow(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, expireRequestID, approvalID, accountID, userID, expireSessionID, expireCredentialSHA).Scan(&terminalSHA)
+	}()
+	select {
+	case err := <-expireDone:
+		_ = activationFirst.Rollback(ctx)
+		_ = expireTx.Rollback(ctx)
+		t.Fatalf("expiration crossed activation-first fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := activationFirst.Exec(ctx, `SAVEPOINT track_activation_first`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := activationFirst.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['fixture'],$2,recording_campaign_now())`, draftTrackID, userID); err == nil || !strings.Contains(err.Error(), "collides") {
+		_ = activationFirst.Rollback(ctx)
+		_ = expireTx.Rollback(ctx)
+		t.Fatalf("track-activation-first reservation guard failed: %v", err)
+	}
+	if _, err := activationFirst.Exec(ctx, `ROLLBACK TO SAVEPOINT track_activation_first`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := activationFirst.Exec(ctx, `SAVEPOINT recording_activation_first`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := activationFirst.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, recordingID); err == nil || !strings.Contains(err.Error(), "typed campaign admission") {
+		_ = activationFirst.Rollback(ctx)
+		_ = expireTx.Rollback(ctx)
+		t.Fatalf("activation-first reservation guard failed: %v", err)
+	}
+	if _, err := activationFirst.Exec(ctx, `ROLLBACK TO SAVEPOINT recording_activation_first`); err != nil {
+		t.Fatal(err)
+	}
+	_ = activationFirst.Rollback(ctx)
+	select {
+	case err := <-expireDone:
+		if err != nil || len(terminalSHA) != 64 {
+			_ = expireTx.Rollback(ctx)
+			t.Fatalf("typed expired-reservation terminal failed: sha=%q err=%v", terminalSHA, err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = expireTx.Rollback(ctx)
+		t.Fatal("expiration did not acquire the released activation fence")
+	}
+	activationAfterTerminal := make(chan error, 1)
+	go func() {
+		_, err := runtimePool.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, recordingID)
+		activationAfterTerminal <- err
+	}()
+	trackAfterTerminal := make(chan error, 1)
+	go func() {
+		_, err := migrator.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['terminal_release'],$2,recording_campaign_now())`, draftTrackID, userID)
+		trackAfterTerminal <- err
+	}()
+	select {
+	case err := <-activationAfterTerminal:
+		_ = expireTx.Rollback(ctx)
+		t.Fatalf("activation crossed uncommitted reservation terminal: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case err := <-trackAfterTerminal:
+		_ = expireTx.Rollback(ctx)
+		t.Fatalf("track activation crossed uncommitted reservation terminal: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := expireTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-activationAfterTerminal:
+		if err != nil {
+			t.Fatalf("typed terminal did not release expired reservation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("activation did not resume after reservation terminal commit")
+	}
+	select {
+	case err := <-trackAfterTerminal:
+		if err != nil {
+			t.Fatalf("terminal reservation did not release draft roster activation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("track activation did not resume after reservation terminal commit")
 	}
 	if _, err := migrator.Exec(ctx, `UPDATE account_sessions SET revoked_at=recording_campaign_now() WHERE id=$1`, expireSessionID); err != nil {
 		t.Fatal(err)
@@ -247,15 +382,12 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := executorPool.Exec(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, uuid.New(), approvalID, accountID, userID, expireSessionID, expireCredentialSHA); err == nil {
 		t.Fatal("expired approval accepted a second terminal event")
 	}
-	if _, err := runtimePool.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, recordingID); err != nil {
-		t.Fatalf("typed terminal did not release expired reservation: %v", err)
-	}
 	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/changed.m3u8' WHERE id=$1; UPDATE streams SET source_url='https://source.example/live.m3u8' WHERE id=$1`, streamID); err != nil {
 		t.Fatal(err)
 	}
 	var fenceEvents int
-	if err := migrator.QueryRow(ctx, `SELECT count(*) FROM recording_campaign_admission_source_fence_events WHERE stream_id=$1`, streamID).Scan(&fenceEvents); err != nil || fenceEvents != 2 {
-		t.Fatalf("A-B-A source mutation did not append two permanent fence events: count=%d err=%v", fenceEvents, err)
+	if err := migrator.QueryRow(ctx, `SELECT count(*) FROM recording_campaign_admission_source_fence_events WHERE stream_id=$1`, streamID).Scan(&fenceEvents); err != nil || fenceEvents != 0 {
+		t.Fatalf("terminal reservation still fenced source lineage: count=%d err=%v", fenceEvents, err)
 	}
 }
 
@@ -293,7 +425,19 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"approval.schedule_spec->>'delivery'<>'nas_pull'",
 		"recording_campaign_replay(p_approval_id,p_account_id,p_credential_sha256)",
 		"recording_campaign_admission_reservation_terminal_events",
+		"recording_campaign_reservation_terminal_validate",
+		"recording_campaign_reservation_terminal_commit_seal",
 		"recording_worker_targeted_probe_occupancy",
+		"recording_campaign_worker_lifecycle_statement_fence",
+		"recording_campaign_node_probe_guard",
+		"recording_campaign_claim_head_probe_guard",
+		"campaign account additions require typed admission capacity and NAS recomputation",
+		"active recording identity collides with active or protected campaign occupancy",
+		"campaign track activation collides with active/protected/reserved occupancy",
+		"recording_campaign_assert_track_activation_occupancy",
+		"recording_campaign_track_state_fence",
+		"recording_campaign_track_activation_occupancy",
+		"to_jsonb(e)::text",
 		"submission_request_sha256",
 		"authority_member_count<>1",
 		"reservation.observation_id",
@@ -327,6 +471,28 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 			if strings.Contains(line, "s.pool.") && (strings.Contains(line, "recording_campaign_") || strings.Contains(line, "recording_targeted_")) {
 				t.Fatalf("ordinary runtime pool reads admission authority at %s:%d", source, lineNo+1)
 			}
+		}
+	}
+	for source, minimum := range map[string]int{
+		"../api/server.go":                         2, // stream patch + common helper
+		"../api/server_recordings.go":              3, // create + schedule + status
+		"../api/server_recording_source_repair.go": 1,
+	} {
+		rawSource, readErr := os.ReadFile(source)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if got := strings.Count(string(rawSource), "lockCampaignAdmissionFence("); got < minimum {
+			t.Fatalf("supported recording writer %s has %d campaign pre-fences, want at least %d", source, got, minimum)
+		}
+	}
+	recorderControl, readErr := os.ReadFile(filepath.Join("..", "..", "cmd", "stoaramactl", "recorder_control.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, required := range []string{"recording-worker-claim-v1", "recording-surrender-cloud-capacity-v1", "recording_worker_targeted_probe_occupancy"} {
+		if !strings.Contains(string(recorderControl), required) {
+			t.Fatalf("supported recorder drain omitted probe lifecycle fence %q", required)
 		}
 	}
 	renderRaw, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
