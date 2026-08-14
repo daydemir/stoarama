@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -411,9 +412,37 @@ func (c *Client) AckCaptureSetStop(ctx context.Context, jobID int64, leaseToken,
 	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/stop-ack", jobID, url.PathEscape(setID)), ack, leaseTokenHeaders(leaseToken), nil)
 }
 
+func openDirectoryNoFollow(path string) (int, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil || filepath.Clean(absolute) != absolute {
+		return -1, fmt.Errorf("invalid absolute directory path")
+	}
+	if runtime.GOOS == "darwin" {
+		if absolute == "/var" || strings.HasPrefix(absolute, "/var/") || absolute == "/tmp" || strings.HasPrefix(absolute, "/tmp/") {
+			absolute = "/private" + absolute
+		}
+	}
+	fd, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(absolute, string(filepath.Separator)), string(filepath.Separator)) {
+		if component == "" {
+			continue
+		}
+		next, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		_ = unix.Close(fd)
+		if openErr != nil {
+			return -1, openErr
+		}
+		fd = next
+	}
+	return fd, nil
+}
+
 func (c *Client) UploadRecoveryArtifact(ctx context.Context, intentID, recoverySecret, sessionID, path string, expectedDevice, expectedInode uint64) error {
 	directory, leaf := filepath.Split(path)
-	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	directoryFD, err := openDirectoryNoFollow(filepath.Clean(directory))
 	if err != nil {
 		return err
 	}
@@ -650,7 +679,7 @@ func (c *Client) UploadFileExact(ctx context.Context, uploadURL, path, mimeType 
 	if directory == "" || leaf == "" || expectedDevice == 0 || expectedInode == 0 || expectedSize <= 0 {
 		return fmt.Errorf("invalid exact upload identity")
 	}
-	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	directoryFD, err := openDirectoryNoFollow(filepath.Clean(directory))
 	if err != nil {
 		return err
 	}

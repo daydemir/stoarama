@@ -1780,7 +1780,12 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 	var rootHex string
 	var firstSequence int64
 	var artifactCount int
-	err = tx.QueryRow(r.Context(), `
+	scanAuthority := func(row pgx.Row) error {
+		return row.Scan(&stopEventID, &set.AccountID, &set.RecordingID, &set.JobID, &set.LeaseToken,
+			&set.OriginClaimGeneration, &set.ProducerID, &set.SnapshotSHA256,
+			&set.DestinationNamingSHA256, &artifactCount, &rootHex, &firstSequence)
+	}
+	err = scanAuthority(tx.QueryRow(r.Context(), `
 		SELECT stop.id,plan.account_id,plan.recording_id,plan.recording_job_id,plan.lease_token,
 		       COALESCE(plan.origin_claim_generation,0),plan.producer_id,plan.source_snapshot_sha256,
 		       plan.destination_naming_sha256,capture_set.artifact_count,capture_set.merkle_root_sha256,
@@ -1797,10 +1802,44 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=stop.id)
 		ORDER BY stop.required_at,stop.id LIMIT 1
 		FOR UPDATE OF stop,capture_set,plan,job,token
-	`, setID, jobID, leaseToken, recorderWorkerID(principal), principal.NodeTokenID, principal.NodeID).Scan(
-		&stopEventID, &set.AccountID, &set.RecordingID, &set.JobID, &set.LeaseToken,
-		&set.OriginClaimGeneration, &set.ProducerID, &set.SnapshotSHA256,
-		&set.DestinationNamingSHA256, &artifactCount, &rootHex, &firstSequence)
+	`, setID, jobID, leaseToken, recorderWorkerID(principal), principal.NodeTokenID, principal.NodeID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// A stop ACK is fsynced locally before its request. If that response is
+		// lost and the lease expires, the exact set recovery grant and immutable
+		// origin generation remain authority to replay the inventory. The current
+		// same-node successor token may service the old fence, but no other node,
+		// set, generation, or expired grant can author an ACK.
+		err = scanAuthority(tx.QueryRow(r.Context(), `
+			SELECT stop.id,plan.account_id,plan.recording_id,plan.recording_job_id,plan.lease_token,
+			       COALESCE(plan.origin_claim_generation,0),plan.producer_id,plan.source_snapshot_sha256,
+			       plan.destination_naming_sha256,capture_set.artifact_count,capture_set.merkle_root_sha256,
+			       plan.first_capture_sequence
+			FROM recording_capture_producer_stop_events stop
+			JOIN recording_capture_reservation_sets capture_set ON capture_set.id=stop.set_id
+			JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+			JOIN recording_capture_set_grants set_grant ON set_grant.set_id=capture_set.id
+			JOIN recording_job_lease_generations lease_generation
+			  ON lease_generation.recording_job_id=plan.recording_job_id
+			 AND lease_generation.lease_token=plan.lease_token
+			JOIN recording_worker_claim_heads head ON head.node_id=lease_generation.node_id
+			JOIN node_tokens origin_token
+			  ON origin_token.node_id=lease_generation.node_id
+			 AND origin_token.recording_claim_generation=plan.origin_claim_generation
+			JOIN node_tokens presented_token ON presented_token.id=$4
+			WHERE capture_set.id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
+			  AND lease_generation.node_id=$5
+			  AND set_grant.origin_claim_generation IS NOT DISTINCT FROM plan.origin_claim_generation
+			  AND set_grant.recovery_block_generation=plan.origin_claim_generation
+			  AND set_grant.upload_grace_until>transaction_timestamp()
+			  AND head.generation>=set_grant.recovery_block_generation
+			  AND head.state IN('recovery_blocked','successor_pending','enabled')
+			  AND recording_surrender_token_can_access_lease(
+			        presented_token.id,lease_generation.node_id,origin_token.id,plan.origin_claim_generation)
+			  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=stop.id)
+			ORDER BY stop.required_at,stop.id LIMIT 1
+			FOR UPDATE OF stop,capture_set,plan,set_grant,lease_generation,head,origin_token,presented_token
+		`, setID, jobID, leaseToken, principal.NodeTokenID, principal.NodeID))
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exact bool
 		if replayErr := tx.QueryRow(r.Context(), `

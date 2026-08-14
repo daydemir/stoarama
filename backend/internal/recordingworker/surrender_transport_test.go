@@ -22,7 +22,9 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 )
 
 func TestCaptureProducerReservationResponseLossReplaysSameDurableIdentity(t *testing.T) {
@@ -185,6 +187,149 @@ func TestRecoveryReplaysDurableStopAckBeforeAnyFurtherAuthority(t *testing.T) {
 	}
 	if len(calls) != 1 || !strings.HasSuffix(calls[0], "/stop-ack") {
 		t.Fatalf("calls=%v", calls)
+	}
+}
+
+func TestDescriptorWalkPinsAncestorAcrossParentSwap(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "capture-root")
+	original := filepath.Join(parent, "capture-continuous-original")
+	if err := os.MkdirAll(original, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := openDirectoryNoFollow(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	moved := parent + ".moved"
+	if err = os.Rename(parent, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(filepath.Join(parent, "capture-continuous-original"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	childFD, err := unix.Openat(fd, "capture-continuous-original", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(childFD)
+	var got unix.Stat_t
+	if err = unix.Fstat(childFD, &got); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(moved, "capture-continuous-original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := infoSyscallStat(info)
+	if !ok {
+		t.Fatal("missing original directory identity")
+	}
+	if uint64(got.Dev) != uint64(stat.Dev) || uint64(got.Ino) != uint64(stat.Ino) {
+		t.Fatalf("descriptor escaped swapped parent: got=(%d,%d) want=(%d,%d)", got.Dev, got.Ino, stat.Dev, stat.Ino)
+	}
+}
+
+func TestZeroByteStoppedLeafRecoversAsNoBytes(t *testing.T) {
+	root := t.TempDir()
+	outDir, err := os.MkdirTemp(root, "capture-continuous-zero.retained-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(outDir, "seg-20260814-120000.mp4")
+	if err = os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := listCaptureArtifactPaths(outDir)
+	if err != nil || len(paths) != 1 || paths[0].Size != 0 {
+		t.Fatalf("zero-byte inventory=%+v err=%v", paths, err)
+	}
+	planAt := time.Now().UTC().Truncate(time.Microsecond)
+	canonical, err := surrenderplan.Build(planAt, planAt.Add(5*time.Second), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planID, setID, producerID, leaseToken := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	plan := recordingapi.CaptureSetPlan{
+		PlanID: planID.String(), SetID: setID.String(), ProducerID: producerID.String(), CaptureOrdinal: 1,
+		FirstCaptureSequence: 1, AccountID: 1, RecordingID: 2, JobID: 3, LeaseToken: leaseToken.String(),
+		OriginClaimGeneration: 1, SourceSnapshotSHA256: strings.Repeat("a", 64), DestinationNamingSHA256: strings.Repeat("b", 64),
+		PlanAt: planAt, WindowEndAt: planAt.Add(5 * time.Second), DurationMicroseconds: canonical.DurationMicro,
+		ClipDurationSeconds: 5, ArtifactCount: canonical.ArtifactCount, SegmentTimesArgument: canonical.SplitTimesArgument,
+		MaxArtifactBytes: surrenderplan.RecoveryArtifactMaxBytes,
+	}
+	identity, err := captureSetIdentity(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := sha256.Sum256([]byte("zero-byte-open-before-first-write"))
+	tree, err := surrenderplan.BuildTree(seed, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived, err := surrenderplan.DeriveArtifact(seed, identity, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := tree.Proof(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofHex := make([]string, len(proof.Siblings))
+	for i := range proof.Siblings {
+		proofHex[i] = hex.EncodeToString(proof.Siblings[i][:])
+	}
+	ack := recordingapi.CaptureStopAck{AckID: uuid.NewString(), RetainedDirectoryDevice: paths[0].Device, RetainedDirectoryInode: paths[0].Inode + 1,
+		Members: []recordingapi.CaptureStopAckMember{{Ordinal: 1, ArtifactID: derived.ID.String(), CaptureSequence: 1,
+			RecoverySecretSHA256: hex.EncodeToString(derived.RecoverySecretHash[:]), Proof: proofHex,
+			Device: paths[0].Device, Inode: paths[0].Inode, RelativeName: filepath.Base(path)}}}
+	ack.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reported atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/stop-ack") || strings.Contains(r.URL.Path, "/materialize"):
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"cancel": true})
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"intent_id": derived.ID.String(), "producer_id": producerID.String(), "job_id": 3,
+				"lease_token": leaseToken.String(), "authority": "capture_set_grant", "expires_at": time.Now().Add(time.Minute),
+				"artifacts": []any{map[string]any{"intent_id": derived.ID.String(), "capture_sequence": 1}}})
+		case strings.HasSuffix(r.URL.Path, "/report"):
+			var report recordingapi.CaptureRecoveryReport
+			if decodeErr := json.NewDecoder(r.Body).Decode(&report); decodeErr != nil || report.ReportType != "no_bytes" || report.SizeBytes != nil || report.SHA256 != "" {
+				http.Error(w, "not exact no_bytes", http.StatusBadRequest)
+				return
+			}
+			reported.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootHash := tree.Root()
+	journal := &captureProducerJournal{JobID: 3, LeaseToken: leaseToken.String(), ProducerID: producerID.String(), CaptureOrdinal: 1,
+		OutputDir: outDir, ClipDurationSec: 5, CaptureSet: &captureSetJournal{PlanID: planID.String(), SetID: setID.String(),
+			Seed: hex.EncodeToString(seed[:]), FirstCaptureSequence: 1, Plan: &plan, MerkleRootSHA256: hex.EncodeToString(rootHash[:]), Committed: true, StopAck: &ack}}
+	done, recoverErr := worker.recoverProducerJournal(context.Background(), journal)
+	if recoverErr != nil || !done || !reported.Load() {
+		t.Fatalf("done=%v reported=%v err=%v", done, reported.Load(), recoverErr)
+	}
+	if _, err = os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("zero-byte retained leaf not cleaned after no_bytes seal: %v", err)
 	}
 }
 

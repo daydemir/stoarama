@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,6 +59,40 @@ func captureUnixMicro(value time.Time) int64 {
 	return value.Unix()*int64(time.Second/time.Microsecond) + int64(value.Nanosecond())/int64(time.Microsecond)
 }
 
+// openDirectoryNoFollow resolves every component beneath a held descriptor.
+// O_NOFOLLOW on only the final component is insufficient: an ancestor can be
+// exchanged for a symlink between pathname validation and the final open.
+func openDirectoryNoFollow(path string) (int, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil || filepath.Clean(absolute) != absolute {
+		return -1, fmt.Errorf("invalid absolute directory path")
+	}
+	// Darwin exposes /var and /tmp as immutable system aliases beneath
+	// /private. Canonicalize only those OS-owned roots; every task-owned
+	// component below them is still opened with O_NOFOLLOW.
+	if runtime.GOOS == "darwin" {
+		if absolute == "/var" || strings.HasPrefix(absolute, "/var/") || absolute == "/tmp" || strings.HasPrefix(absolute, "/tmp/") {
+			absolute = "/private" + absolute
+		}
+	}
+	fd, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(absolute, string(filepath.Separator)), string(filepath.Separator)) {
+		if component == "" {
+			continue
+		}
+		next, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		_ = unix.Close(fd)
+		if openErr != nil {
+			return -1, openErr
+		}
+		fd = next
+	}
+	return fd, nil
+}
+
 func hashRetainedArtifact(path string, expectedDevice, expectedInode uint64) (int64, string, error) {
 	file, stat, err := openRetainedArtifact(path, expectedDevice, expectedInode)
 	if err != nil {
@@ -77,7 +112,7 @@ func openRetainedArtifact(path string, expectedDevice, expectedInode uint64) (*o
 	if directory == "" || !captureSegmentLeafRE.MatchString(leaf) {
 		return nil, unix.Stat_t{}, fmt.Errorf("invalid retained artifact path")
 	}
-	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	directoryFD, err := openDirectoryNoFollow(filepath.Clean(directory))
 	if err != nil {
 		return nil, unix.Stat_t{}, err
 	}
@@ -87,7 +122,7 @@ func openRetainedArtifact(path string, expectedDevice, expectedInode uint64) (*o
 		return nil, unix.Stat_t{}, err
 	}
 	var stat unix.Stat_t
-	if err = unix.Fstat(fileFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > surrenderplan.RecoveryArtifactMaxBytes || (expectedDevice != 0 && uint64(stat.Dev) != expectedDevice) || (expectedInode != 0 && uint64(stat.Ino) != expectedInode) {
+	if err = unix.Fstat(fileFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size < 0 || stat.Size > surrenderplan.RecoveryArtifactMaxBytes || (expectedDevice != 0 && uint64(stat.Dev) != expectedDevice) || (expectedInode != 0 && uint64(stat.Ino) != expectedInode) {
 		_ = unix.Close(fileFD)
 		return nil, unix.Stat_t{}, fmt.Errorf("retained artifact identity changed")
 	}
@@ -103,10 +138,11 @@ type captureArtifactPath struct {
 	Path   string
 	Device uint64
 	Inode  uint64
+	Size   int64
 }
 
 func listCaptureArtifactPaths(path string) ([]captureArtifactPath, error) {
-	fd, err := unix.Open(filepath.Clean(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := openDirectoryNoFollow(filepath.Clean(path))
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) {
 		return nil, nil
 	}
@@ -143,10 +179,10 @@ func listCaptureArtifactPaths(path string) ([]captureArtifactPath, error) {
 		var stat unix.Stat_t
 		statErr := unix.Fstat(artifactFD, &stat)
 		_ = unix.Close(artifactFD)
-		if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > surrenderplan.RecoveryArtifactMaxBytes {
+		if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size < 0 || stat.Size > surrenderplan.RecoveryArtifactMaxBytes {
 			return nil, fmt.Errorf("capture artifact identity is unsafe")
 		}
-		result = append(result, captureArtifactPath{Path: filepath.Join(path, entry.Name()), Device: uint64(stat.Dev), Inode: uint64(stat.Ino)})
+		result = append(result, captureArtifactPath{Path: filepath.Join(path, entry.Name()), Device: uint64(stat.Dev), Inode: uint64(stat.Ino), Size: stat.Size})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
 	return result, nil
@@ -175,7 +211,7 @@ func removeRetainedArtifact(path string, expectedDevice, expectedInode uint64) e
 		return err
 	}
 	directory, leaf := filepath.Split(filepath.Clean(path))
-	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	directoryFD, err := openDirectoryNoFollow(filepath.Clean(directory))
 	if err != nil {
 		return err
 	}
@@ -200,7 +236,7 @@ func removeEmptyRetainedDirectory(path string) error {
 	if parent == "" || leaf == "" || leaf == "." || leaf == string(filepath.Separator) {
 		return fmt.Errorf("invalid retained directory path")
 	}
-	parentFD, err := unix.Open(filepath.Clean(parent), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	parentFD, err := openDirectoryNoFollow(filepath.Clean(parent))
 	if err != nil {
 		return err
 	}
@@ -241,7 +277,7 @@ func removeCaptureNamespaceSentinel(path string) error {
 	if parent == "" || leaf == "" {
 		return fmt.Errorf("invalid capture sentinel path")
 	}
-	parentFD, err := unix.Open(filepath.Clean(parent), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	parentFD, err := openDirectoryNoFollow(filepath.Clean(parent))
 	if err != nil {
 		return err
 	}
@@ -269,7 +305,7 @@ type acceptedUniqueHead struct {
 }
 
 func openPrivateDirectory(path string) (int, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := openDirectoryNoFollow(path)
 	if err != nil {
 		return -1, err
 	}
@@ -415,7 +451,7 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 		if pathErr != nil || rootErr != nil || relErr != nil || rel == "." || strings.Contains(rel, string(filepath.Separator)) || !strings.HasPrefix(rel, "capture-continuous-") {
 			return nil, fmt.Errorf("capture producer output path is outside its private root")
 		}
-		outputFD, outputErr := unix.Open(outputDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		outputFD, outputErr := openDirectoryNoFollow(outputDir)
 		if outputErr == nil {
 			_ = unix.Close(outputFD)
 		} else if !errors.Is(outputErr, unix.ENOENT) && !errors.Is(outputErr, unix.ENOTDIR) {
@@ -440,10 +476,15 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 				if pathErr != nil || filepath.Dir(absolutePath) != outputDir || !captureSegmentLeafRE.MatchString(filepath.Base(absolutePath)) || artifact.Device == 0 || artifact.Inode == 0 {
 					return nil, fmt.Errorf("invalid capture artifact local path")
 				}
-				file, _, identityErr := openRetainedArtifact(absolutePath, artifact.Device, artifact.Inode)
+				file, stat, identityErr := openRetainedArtifact(absolutePath, artifact.Device, artifact.Inode)
 				if identityErr != nil {
 					return nil, fmt.Errorf("capture artifact local identity changed")
 				}
+				if artifact.LocalSize != 0 && artifact.LocalSize != stat.Size {
+					_ = file.Close()
+					return nil, fmt.Errorf("capture artifact local size changed")
+				}
+				artifact.LocalSize = stat.Size
 				if err := file.Close(); err != nil {
 					return nil, err
 				}
@@ -1000,7 +1041,7 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 			if (artifact.Device != 0 && artifact.Device != identity.Device) || (artifact.Inode != 0 && artifact.Inode != identity.Inode) {
 				return false, fmt.Errorf("capture artifact identity changed before recovery")
 			}
-			artifact.LocalPath, artifact.Device, artifact.Inode = identity.Path, identity.Device, identity.Inode
+			artifact.LocalPath, artifact.Device, artifact.Inode, artifact.LocalSize = identity.Path, identity.Device, identity.Inode, identity.Size
 		}
 	}
 	if journal.CaptureSet != nil {
@@ -1094,7 +1135,7 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 		}
 		path := captureArtifactPath{}
 		if artifact.Segment != nil {
-			path = captureArtifactPath{Path: artifact.Segment.Path, Device: artifact.Device, Inode: artifact.Inode}
+			path = captureArtifactPath{Path: artifact.Segment.Path, Device: artifact.Device, Inode: artifact.Inode, Size: artifact.LocalSize}
 		}
 		if path.Path == "" && pathIndex < len(unboundPaths) {
 			path = unboundPaths[pathIndex]
@@ -1190,16 +1231,20 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 		if _, exists := bound[path.Path]; exists {
 			continue
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		segment, probeErr := w.recoverContinuousSegmentExact(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
-		cancel()
+		var segment capture.Segment
+		var probeErr error
+		if path.Size > 0 {
+			probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			segment, probeErr = w.recoverContinuousSegmentExact(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
+			cancel()
+		}
 		artifact, _, deriveErr := deriveCaptureSetArtifact(journal, nextSequence)
 		if deriveErr != nil {
 			return false, deriveErr
 		}
 		artifact.LocalPath = path.Path
-		artifact.Device, artifact.Inode = path.Device, path.Inode
-		if probeErr == nil {
+		artifact.Device, artifact.Inode, artifact.LocalSize = path.Device, path.Inode, path.Size
+		if path.Size > 0 && probeErr == nil {
 			segment.CaptureSequence = nextSequence
 			artifact.Segment = &segment
 		}
@@ -1208,11 +1253,11 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 	}
 	for index := range journal.Artifacts {
 		artifact := &journal.Artifacts[index]
-		if artifact.Segment != nil || artifact.LocalPath == "" {
+		if artifact.Segment != nil || artifact.LocalPath == "" || artifact.LocalSize == 0 {
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		segment, probeErr := w.recoverContinuousSegmentExact(probeCtx, captureArtifactPath{Path: artifact.LocalPath, Device: artifact.Device, Inode: artifact.Inode}, time.Duration(journal.ClipDurationSec)*time.Second)
+		segment, probeErr := w.recoverContinuousSegmentExact(probeCtx, captureArtifactPath{Path: artifact.LocalPath, Device: artifact.Device, Inode: artifact.Inode, Size: artifact.LocalSize}, time.Duration(journal.ClipDurationSec)*time.Second)
 		cancel()
 		if probeErr == nil {
 			segment.CaptureSequence = artifact.CaptureSequence
@@ -1326,6 +1371,28 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 			}
 			continue
 		}
+		if artifact.Segment == nil && artifact.LocalPath != "" && artifact.LocalSize == 0 {
+			file, stat, openErr := openRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode)
+			if openErr != nil || stat.Size != 0 {
+				if file != nil {
+					_ = file.Close()
+				}
+				return false, fmt.Errorf("zero-byte capture artifact identity changed")
+			}
+			_ = file.Close()
+			report := recordingapi.CaptureRecoveryReport{ReportID: reportID, ReportType: "no_bytes", LocalObservedAt: time.Now().UTC()}
+			if err = w.cfg.Client.ReportRecoveryArtifact(ctx, artifact.IntentID, artifact.RecoverySecret, report); err != nil {
+				return false, err
+			}
+			if err = removeRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode); err != nil {
+				return false, err
+			}
+			artifact.Done, artifact.LocalPath = true, ""
+			if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+				return false, err
+			}
+			continue
+		}
 		if artifact.Segment == nil {
 			size, partialSHA, hashErr := hashRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode)
 			if hashErr != nil {
@@ -1339,7 +1406,7 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 		}
 		segment := *artifact.Segment
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		probed, probeErr := w.recoverContinuousSegmentExact(probeCtx, captureArtifactPath{Path: segment.Path, Device: artifact.Device, Inode: artifact.Inode}, time.Duration(journal.ClipDurationSec)*time.Second)
+		probed, probeErr := w.recoverContinuousSegmentExact(probeCtx, captureArtifactPath{Path: segment.Path, Device: artifact.Device, Inode: artifact.Inode, Size: artifact.LocalSize}, time.Duration(journal.ClipDurationSec)*time.Second)
 		cancel()
 		if probeErr != nil || probed.SizeBytes != segment.SizeBytes || probed.SHA256 != segment.SHA256 {
 			size := segment.SizeBytes
@@ -1426,7 +1493,7 @@ func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *
 		}
 		path := captureArtifactPath{}
 		if artifact.Segment != nil {
-			path = captureArtifactPath{Path: artifact.Segment.Path, Device: artifact.Device, Inode: artifact.Inode}
+			path = captureArtifactPath{Path: artifact.Segment.Path, Device: artifact.Device, Inode: artifact.Inode, Size: artifact.LocalSize}
 		}
 		if path.Path == "" && pathIndex < len(unboundPaths) {
 			path = unboundPaths[pathIndex]
@@ -1542,6 +1609,7 @@ type captureArtifactJournal struct {
 	LocalPath            string           `json:"local_path,omitempty"`
 	Device               uint64           `json:"device,omitempty"`
 	Inode                uint64           `json:"inode,omitempty"`
+	LocalSize            int64            `json:"local_size,omitempty"`
 	Done                 bool             `json:"done,omitempty"`
 	RecoveryRevision     int              `json:"recovery_revision,omitempty"`
 }
@@ -1641,20 +1709,20 @@ func (n *retainedCaptureNamespace) close() {
 	}
 }
 
-func (n *retainedCaptureNamespace) artifactIdentity(name string) (uint64, uint64, error) {
+func (n *retainedCaptureNamespace) artifactIdentity(name string) (uint64, uint64, int64, error) {
 	if n == nil || n.fd < 0 || !captureSegmentLeafRE.MatchString(name) {
-		return 0, 0, fmt.Errorf("invalid retained capture leaf")
+		return 0, 0, 0, fmt.Errorf("invalid retained capture leaf")
 	}
 	fd, err := unix.Openat(n.fd, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer unix.Close(fd)
 	var stat unix.Stat_t
 	if err = unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Ino == 0 {
-		return 0, 0, fmt.Errorf("retained capture leaf identity is unsafe")
+		return 0, 0, 0, fmt.Errorf("retained capture leaf identity is unsafe")
 	}
-	return uint64(stat.Dev), uint64(stat.Ino), nil
+	return uint64(stat.Dev), uint64(stat.Ino), stat.Size, nil
 }
 
 // isolateCaptureNamespace keeps the original directory inode open while it is
@@ -1670,7 +1738,7 @@ func isolateCaptureNamespace(outputDir string) (*retainedCaptureNamespace, error
 	if leaf == "." || leaf == string(filepath.Separator) || strings.ContainsRune(leaf, filepath.Separator) {
 		return nil, fmt.Errorf("invalid capture output namespace")
 	}
-	parentFD, err := unix.Open(parentPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	parentFD, err := openDirectoryNoFollow(parentPath)
 	if err != nil {
 		return nil, err
 	}
@@ -1724,7 +1792,7 @@ func isolateCaptureNamespace(outputDir string) (*retainedCaptureNamespace, error
 		if !captureSegmentLeafRE.MatchString(entry.Name()) {
 			return fail(fmt.Errorf("retained capture namespace contains an unauthorized leaf"))
 		}
-		if _, _, err = (&retainedCaptureNamespace{fd: dirFD}).artifactIdentity(entry.Name()); err != nil {
+		if _, _, _, err = (&retainedCaptureNamespace{fd: dirFD}).artifactIdentity(entry.Name()); err != nil {
 			return fail(err)
 		}
 		names = append(names, entry.Name())
@@ -1752,7 +1820,7 @@ func (w *Worker) captureSetStopBarrier(job recordingapi.RecordingJob, producer *
 		artifacts := make([]captureArtifactJournal, 0, len(retained.names))
 		for index, name := range retained.names {
 			path := filepath.Join(retained.path, name)
-			device, inode, identityErr := retained.artifactIdentity(name)
+			device, inode, size, identityErr := retained.artifactIdentity(name)
 			if identityErr != nil {
 				return "", identityErr
 			}
@@ -1762,7 +1830,7 @@ func (w *Worker) captureSetStopBarrier(job recordingapi.RecordingJob, producer *
 				return "", deriveErr
 			}
 			artifact.LocalPath = path
-			artifact.Device, artifact.Inode = device, inode
+			artifact.Device, artifact.Inode, artifact.LocalSize = device, inode, size
 			artifacts = append(artifacts, artifact)
 			members = append(members, recordingapi.CaptureStopAckMember{
 				Ordinal: artifact.Ordinal, ArtifactID: artifact.IntentID, CaptureSequence: artifact.CaptureSequence,

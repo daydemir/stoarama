@@ -823,24 +823,12 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ackBody, _ := json.Marshal(ack)
-	ackRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(ackBody))
-	ackRequest.Header.Set(recordingLeaseTokenHeader, lease.LeaseToken.String())
-	ackRequest = ackRequest.WithContext(context.WithValue(ackRequest.Context(), nodePrincipalContextKey, principal))
-	ackRoute := chi.NewRouteContext()
-	ackRoute.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
-	ackRoute.URLParams.Add("setId", setID.String())
-	ackRequest = ackRequest.WithContext(context.WithValue(ackRequest.Context(), chi.RouteCtxKey, ackRoute))
-	ackResponse := httptest.NewRecorder()
-	server.handleRecordingCaptureSetStopAck(ackResponse, ackRequest)
-	if ackResponse.Code != http.StatusNoContent {
-		t.Fatalf("stop ack=%d body=%s", ackResponse.Code, ackResponse.Body.String())
-	}
 	peerNodeID := fixture.nodeID + 500000
 	if _, err = pool.Exec(ctx, `INSERT INTO nodes(id,account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,$2,'r10-relay-peer','relay','active',transaction_timestamp(),4)`, peerNodeID, fixture.accountID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-peer',repeat('7',64))`, peerNodeID); err != nil {
+	var peerTokenID int64
+	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-peer',repeat('7',64)) RETURNING id`, peerNodeID).Scan(&peerTokenID); err != nil {
 		t.Fatal(err)
 	}
 	// Keep unrelated exact predecessor fences live before recovery blocks new
@@ -888,6 +876,37 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	var alternate bool
 	if err = pool.QueryRow(ctx, `SELECT alternate_available FROM recording_job_lease_expiry_events WHERE recording_job_id=$1 AND lease_token=$2`, fixture.jobID, lease.LeaseToken).Scan(&alternate); err != nil || !alternate {
 		t.Fatalf("relay alternate=%v err=%v", alternate, err)
+	}
+	// Model the worker crash after fsyncing the stop ACK but before receiving
+	// its response. The lease has now expired and been reclaimed, so replay must
+	// be authorized by the exact set grant and immutable origin generation—not
+	// by mutable current job ownership.
+	ackBody, _ := json.Marshal(ack)
+	wrongPrincipal := principal
+	wrongPrincipal.NodeID, wrongPrincipal.NodeTokenID = peerNodeID, peerTokenID
+	wrongRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(ackBody))
+	wrongRequest.Header.Set(recordingLeaseTokenHeader, lease.LeaseToken.String())
+	wrongRequest = wrongRequest.WithContext(context.WithValue(wrongRequest.Context(), nodePrincipalContextKey, wrongPrincipal))
+	wrongRoute := chi.NewRouteContext()
+	wrongRoute.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
+	wrongRoute.URLParams.Add("setId", setID.String())
+	wrongRequest = wrongRequest.WithContext(context.WithValue(wrongRequest.Context(), chi.RouteCtxKey, wrongRoute))
+	wrongResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetStopAck(wrongResponse, wrongRequest)
+	if wrongResponse.Code != http.StatusConflict {
+		t.Fatalf("cross-node post-expiry stop ack=%d body=%s", wrongResponse.Code, wrongResponse.Body.String())
+	}
+	ackRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(ackBody))
+	ackRequest.Header.Set(recordingLeaseTokenHeader, lease.LeaseToken.String())
+	ackRequest = ackRequest.WithContext(context.WithValue(ackRequest.Context(), nodePrincipalContextKey, principal))
+	ackRoute := chi.NewRouteContext()
+	ackRoute.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
+	ackRoute.URLParams.Add("setId", setID.String())
+	ackRequest = ackRequest.WithContext(context.WithValue(ackRequest.Context(), chi.RouteCtxKey, ackRoute))
+	ackResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetStopAck(ackResponse, ackRequest)
+	if ackResponse.Code != http.StatusNoContent {
+		t.Fatalf("post-expiry stop ack=%d body=%s", ackResponse.Code, ackResponse.Body.String())
 	}
 	newRaw := "sin_" + strings.Repeat("n", 48)
 	newHash := sha256.Sum256([]byte(newRaw))
