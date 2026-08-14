@@ -467,6 +467,35 @@ const cloudRecordingJobsLeaseSQL = `
 	          rec.target_fps, j.kind, j.window_end_at, j.lease_token
 `
 
+func (s *Server) leaseCloudRecordingJob(ctx context.Context, principal nodePrincipal, workerID string, billingDisabled bool, margin int, tokenSupported bool) (recordingLeaseResponse, error) {
+	var resp recordingLeaseResponse
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return resp, fmt.Errorf("begin cloud lease: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var capacity int
+	if _, err = tx.Exec(ctx, cloudRecorderPoolSharedFenceSQL); err != nil {
+		return resp, err
+	}
+	if err = tx.QueryRow(ctx, cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity); err != nil {
+		return resp, err
+	}
+	err = tx.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
+		workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported).Scan(
+		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
+		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
+		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt, &resp.LeaseToken,
+	)
+	if err != nil {
+		return resp, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return resp, err
+	}
+	return resp, nil
+}
+
 // handleRecordingJobsLease leases at most one due recording job for the calling
 // recorder. Cloud leases lock the authenticated droplet row in a separate statement
 // before counting active leases, so concurrent requests see the preceding commit and
@@ -498,28 +527,7 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 	} else {
 		// The operator-owned cloud pool intentionally serves every account.
 		// $1=workerID, $2=billingDisabled, $3=margin, $4=freshnessGrace, $5=capacity.
-		tx, beginErr := s.pool.Begin(r.Context())
-		if beginErr != nil {
-			err = fmt.Errorf("begin cloud lease: %w", beginErr)
-		} else {
-			defer func() { _ = tx.Rollback(r.Context()) }()
-			var capacity int
-			_, err = tx.Exec(r.Context(), cloudRecorderPoolSharedFenceSQL)
-			if err == nil {
-				err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
-			}
-			if err == nil {
-				err = tx.QueryRow(r.Context(), cloudRecordingJobsLeaseSQL,
-					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported).Scan(
-					&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
-					&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
-					&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt, &resp.LeaseToken,
-				)
-			}
-			if err == nil {
-				err = tx.Commit(r.Context())
-			}
-		}
+		resp, err = s.leaseCloudRecordingJob(r.Context(), principal, workerID, billingDisabled, margin, tokenSupported)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"job": nil})
@@ -536,7 +544,11 @@ func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, node
 	_, err := s.pool.Exec(ctx, `
 		UPDATE recorder_droplets
 		SET last_seen_at=now(),
-		    build_sha=CASE WHEN $3 <> '' THEN $3 ELSE build_sha END,
+		    build_sha=CASE WHEN $3 <> '' AND NOT EXISTS(
+		      SELECT 1 FROM recorder_pool_rollouts r
+		      WHERE r.generation=recorder_droplets.rollout_generation
+		        AND r.status IN ('running','stopping')
+		    ) THEN $3 ELSE build_sha END,
 		    first_seen_at=COALESCE(first_seen_at, now()),
 		    activated_at=COALESCE(activated_at, CASE WHEN state='active' THEN now() END)
 		WHERE name=$1 AND node_id=$2
@@ -545,6 +557,29 @@ func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, node
 }
 
 func (s *Server) recordDropletRolloutObservation(ctx context.Context, workerID string, nodeID int64, facts recordingapi.DropletRolloutFacts) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, cloudRecorderPoolSharedFenceSQL); err != nil {
+		return err
+	}
+	var dropletID int64
+	var rolloutBound bool
+	if err = tx.QueryRow(ctx, `SELECT d.id,EXISTS(SELECT 1 FROM recorder_pool_rollouts r WHERE r.generation=d.rollout_generation AND r.status IN ('running','stopping')) FROM recorder_droplets d WHERE d.name=$1 AND d.node_id=$2 FOR UPDATE`, workerID, nodeID).Scan(&dropletID, &rolloutBound); err != nil {
+		return err
+	}
+	build := strings.ToLower(strings.TrimSpace(facts.ExecutableBuildSHA))
+	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(build) {
+		build = ""
+	}
+	if !rolloutBound {
+		if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=now(),build_sha=CASE WHEN $3<>'' THEN $3 ELSE build_sha END,first_seen_at=COALESCE(first_seen_at,now()),activated_at=COALESCE(activated_at,CASE WHEN state='active' THEN now() END) WHERE id=$1 AND node_id=$2`, dropletID, nodeID, build); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
 	validated, err := dropletpool.ValidateWorkerRolloutFacts(dropletpool.WorkerRolloutFacts{
 		ExecutableBuildSHA: facts.ExecutableBuildSHA,
 		Capacity:           facts.Capacity,
@@ -557,23 +592,14 @@ func (s *Server) recordDropletRolloutObservation(ctx context.Context, workerID s
 	if err != nil {
 		return err
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	var dropletID int64
-	if err = tx.QueryRow(ctx, `SELECT id FROM recorder_droplets WHERE name=$1 AND node_id=$2 FOR UPDATE`, workerID, nodeID).Scan(&dropletID); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=now(),build_sha=$3,first_seen_at=COALESCE(first_seen_at,now()),activated_at=COALESCE(activated_at,CASE WHEN state='active' THEN now() END) WHERE id=$1 AND node_id=$2`, dropletID, nodeID, validated.ExecutableBuildSHA); err != nil {
-		return err
-	}
-	// Identical facts are intentionally appended on each managed heartbeat. The
+	// Identical facts are intentionally appended on each rollout heartbeat. The
 	// immutable digest proves semantic equality, while observed_at proves current
 	// possession of the exact running/host state; deduplicating by digest would
 	// make an unchanged healthy worker go stale after ninety seconds.
 	if _, err = tx.Exec(ctx, `INSERT INTO recorder_worker_rollout_observations(droplet_id,node_id,worker_id,executable_build_sha,capacity,heartbeat_sec,poll_sec,backend_api_origin,host_firewall_script_sha256,kernel_firewall_policy_sha256,observation_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, dropletID, nodeID, workerID, validated.ExecutableBuildSHA, validated.Capacity, validated.HeartbeatSec, validated.PollSec, validated.BackendAPIURL, validated.HostFirewallScriptSHA256, validated.KernelFirewallPolicySHA256, validated.ObservationSHA256); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=now(),build_sha=$3,first_seen_at=COALESCE(first_seen_at,now()),activated_at=COALESCE(activated_at,CASE WHEN state='active' THEN now() END) WHERE id=$1 AND node_id=$2`, dropletID, nodeID, validated.ExecutableBuildSHA); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -1384,10 +1410,27 @@ const recordingJobHeartbeatSQL = `
 func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrincipal, jobID int64, workerID string, leaseToken *uuid.UUID) (time.Time, error) {
 	var leaseExpiresAt time.Time
 	if principal.NodeType != nodeTypeRelay {
-		err := s.pool.QueryRow(ctx, recordingJobHeartbeatSQL,
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return leaseExpiresAt, err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		// Renewals and initial claims share the same rollout fence. This keeps an
+		// already-owned job from being extended across the exclusive old/new
+		// admission switch and preserves fence-before-row lock order.
+		if _, err = tx.Exec(ctx, cloudRecorderPoolSharedFenceSQL); err != nil {
+			return leaseExpiresAt, err
+		}
+		err = tx.QueryRow(ctx, recordingJobHeartbeatSQL,
 			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken,
 			recordingContinuousPostWindowLeaseSec).Scan(&leaseExpiresAt)
-		return leaseExpiresAt, err
+		if err != nil {
+			return leaseExpiresAt, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return leaseExpiresAt, err
+		}
+		return leaseExpiresAt, nil
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

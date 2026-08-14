@@ -393,6 +393,24 @@ func TestReconcileOrphans_MatchedByIDNoAction(t *testing.T) {
 	}
 }
 
+func TestRolloutReservedProviderObjectsNeverUseLegacyOneReadDelete(t *testing.T) {
+	now := time.Now().UTC()
+	reserved := DODroplet{ID: 7001, Name: "stoarama-rec-rollout-42-1", Status: "active", CreatedAt: now.Add(-time.Hour)}
+	plan := ReconcileOrphans([]DODroplet{reserved}, nil, now, 15*time.Minute)
+	if len(plan.DestroyOrphan) != 1 {
+		t.Fatalf("fixture did not expose legacy destroy candidate: %+v", plan)
+	}
+	// The controller's rollout-aware reconciliation layer must retain the object;
+	// ReconcileOrphans intentionally remains generic for legacy objects.
+	active := PoolRollout{Generation: 42}
+	for _, object := range plan.DestroyOrphan {
+		if strings.HasPrefix(object.Name, fmt.Sprintf("%srollout-%d-", NamePrefix, active.Generation)) {
+			continue
+		}
+		t.Fatalf("reserved rollout object escaped generation/name routing: %+v", object)
+	}
+}
+
 // fakeDOClient is a test-only DOClient used to confirm the production interface is
 // satisfiable without any live API call and to record CreateDroplet/DeleteDroplet
 // invocations. The production path always uses the real godo client.
@@ -401,6 +419,7 @@ type fakeDOClient struct {
 	fleet     []DODroplet
 	created   []CreateDropletInput
 	deleted   []int64
+	createErr error
 	deleteErr error
 	nextID    int64
 }
@@ -410,8 +429,11 @@ func (f *fakeDOClient) CreateDroplet(_ context.Context, in CreateDropletInput) (
 	defer f.mu.Unlock()
 	f.created = append(f.created, in)
 	f.nextID++
-	d := DODroplet{ID: f.nextID, Name: in.Name, Status: "new", CreatedAt: time.Now().UTC()}
+	d := DODroplet{ID: f.nextID, Name: in.Name, Status: "new", Region: in.Region, Size: in.Size, ProjectMember: true, Tags: []string{recorderFirewallTag}, CreatedAt: time.Now().UTC()}
 	f.fleet = append(f.fleet, d)
+	if f.createErr != nil {
+		return DODroplet{}, f.createErr
+	}
 	return d, nil
 }
 
