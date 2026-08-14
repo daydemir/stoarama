@@ -231,6 +231,35 @@ func removeRetainedArtifact(path string, expectedDevice, expectedInode uint64) e
 	return unix.Unlinkat(directoryFD, leaf, 0)
 }
 
+func removeRetainedArtifactIfPresent(path string, expectedDevice, expectedInode uint64, expectedSize int64) error {
+	directory, leaf := filepath.Split(filepath.Clean(path))
+	if directory == "" || !captureSegmentLeafRE.MatchString(leaf) || expectedDevice == 0 || expectedInode == 0 || expectedSize < 0 {
+		return fmt.Errorf("invalid retained artifact cleanup authority")
+	}
+	directoryFD, err := openDirectoryNoFollow(filepath.Clean(directory))
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directoryFD)
+	fileFD, err := unix.Openat(directoryFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var stat unix.Stat_t
+	statErr := unix.Fstat(fileFD, &stat)
+	_ = unix.Close(fileFD)
+	if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || uint64(stat.Dev) != expectedDevice || uint64(stat.Ino) != expectedInode || stat.Size != expectedSize {
+		return fmt.Errorf("retained artifact changed before idempotent cleanup")
+	}
+	if err = unix.Unlinkat(directoryFD, leaf, 0); err != nil {
+		return err
+	}
+	return unix.Fsync(directoryFD)
+}
+
 func removeEmptyRetainedDirectory(path string) error {
 	parent, leaf := filepath.Split(filepath.Clean(path))
 	if parent == "" || leaf == "" || leaf == "." || leaf == string(filepath.Separator) {
@@ -468,6 +497,17 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 			if seg != nil && localPath == "" {
 				localPath = seg.Path
 			}
+			pendingNoBytes := false
+			if artifact.TerminalNoBytesCleanupPending {
+				var stopAck *recordingapi.CaptureStopAck
+				if journal.CaptureSet != nil {
+					stopAck = journal.CaptureSet.StopAck
+				}
+				_, pendingNoBytes = stoppedZeroByteMember(stopAck, artifact)
+				if !pendingNoBytes || artifact.Done || seg != nil {
+					return nil, fmt.Errorf("invalid pending terminal zero-byte cleanup")
+				}
+			}
 			if intentErr != nil || intentID.String() != strings.ToLower(strings.TrimSpace(artifact.IntentID)) || artifact.CaptureSequence <= 0 || len(secret) != 32 || secretErr != nil || hex.EncodeToString(hash[:]) != artifact.RecoverySecretSHA256 {
 				return nil, fmt.Errorf("invalid capture producer artifact journal")
 			}
@@ -478,15 +518,18 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 				}
 				file, stat, identityErr := openRetainedArtifact(absolutePath, artifact.Device, artifact.Inode)
 				if identityErr != nil {
-					return nil, fmt.Errorf("capture artifact local identity changed")
-				}
-				if artifact.LocalSize != 0 && artifact.LocalSize != stat.Size {
-					_ = file.Close()
-					return nil, fmt.Errorf("capture artifact local size changed")
-				}
-				artifact.LocalSize = stat.Size
-				if err := file.Close(); err != nil {
-					return nil, err
+					if !pendingNoBytes || (!errors.Is(identityErr, unix.ENOENT) && !errors.Is(identityErr, unix.ENOTDIR)) {
+						return nil, fmt.Errorf("capture artifact local identity changed")
+					}
+				} else {
+					if artifact.LocalSize != 0 && artifact.LocalSize != stat.Size {
+						_ = file.Close()
+						return nil, fmt.Errorf("capture artifact local size changed")
+					}
+					artifact.LocalSize = stat.Size
+					if err := file.Close(); err != nil {
+						return nil, err
+					}
 				}
 			}
 			if seg != nil {
@@ -528,7 +571,7 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 						continue
 					}
 					member, exists := members[artifact.Ordinal]
-					if !exists || member.Device != artifact.Device || member.Inode != artifact.Inode || member.RelativeName != filepath.Base(artifact.LocalPath) {
+					if !exists || member.Device != artifact.Device || member.Inode != artifact.Inode || member.SizeBytes != artifact.LocalSize || member.RelativeName != filepath.Base(artifact.LocalPath) {
 						return nil, fmt.Errorf("capture stop inventory differs from local artifact")
 					}
 				}
@@ -1213,9 +1256,29 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 	if err != nil {
 		return false, err
 	}
-	currentNoBytes := make(map[int]struct{}, len(stopResult.NoBytesOrdinals))
-	for _, ordinal := range stopResult.NoBytesOrdinals {
-		currentNoBytes[ordinal] = struct{}{}
+	cleanupMarked, err := markAcknowledgedNoBytesCleanup(journal, stopResult)
+	if err != nil {
+		return false, err
+	}
+	if cleanupMarked {
+		// This fsync is the crash boundary: after it succeeds, a missing exact
+		// inode means cleanup already happened and is safe to replay.
+		if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+			return false, err
+		}
+	}
+	cleanupFinished, err := finishAcknowledgedNoBytesCleanup(journal)
+	if err != nil {
+		return false, err
+	}
+	if cleanupFinished {
+		if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+			return false, err
+		}
+		paths, err = listCaptureArtifactPaths(journal.OutputDir)
+		if err != nil {
+			return false, err
+		}
 	}
 	bound := make(map[string]struct{}, len(journal.Artifacts))
 	nextSequence := journal.CaptureSet.FirstCaptureSequence
@@ -1308,25 +1371,6 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 			return false, err
 		}
 		if currentLease {
-			_, acknowledgedNoBytes := currentNoBytes[artifact.Ordinal]
-			if _, zero := stoppedZeroByteMember(journal.CaptureSet.StopAck, *artifact); acknowledgedNoBytes && zero {
-				file, stat, openErr := openRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode)
-				if openErr != nil || stat.Size != 0 {
-					if file != nil {
-						_ = file.Close()
-					}
-					return false, fmt.Errorf("acknowledged zero-byte capture artifact identity changed")
-				}
-				_ = file.Close()
-				if err = removeRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode); err != nil {
-					return false, err
-				}
-				artifact.Done, artifact.LocalPath = true, ""
-				if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
-					return false, err
-				}
-				continue
-			}
 			if artifact.Segment == nil {
 				continue
 			}
@@ -1625,18 +1669,19 @@ type captureSetJournal struct {
 }
 
 type captureArtifactJournal struct {
-	Ordinal              int              `json:"ordinal,omitempty"`
-	IntentID             string           `json:"intent_id"`
-	RecoverySecret       string           `json:"recovery_secret"`
-	RecoverySecretSHA256 string           `json:"recovery_secret_sha256"`
-	CaptureSequence      int64            `json:"capture_sequence"`
-	Segment              *capture.Segment `json:"segment,omitempty"`
-	LocalPath            string           `json:"local_path,omitempty"`
-	Device               uint64           `json:"device,omitempty"`
-	Inode                uint64           `json:"inode,omitempty"`
-	LocalSize            int64            `json:"local_size,omitempty"`
-	Done                 bool             `json:"done,omitempty"`
-	RecoveryRevision     int              `json:"recovery_revision,omitempty"`
+	Ordinal                       int              `json:"ordinal,omitempty"`
+	IntentID                      string           `json:"intent_id"`
+	RecoverySecret                string           `json:"recovery_secret"`
+	RecoverySecretSHA256          string           `json:"recovery_secret_sha256"`
+	CaptureSequence               int64            `json:"capture_sequence"`
+	Segment                       *capture.Segment `json:"segment,omitempty"`
+	LocalPath                     string           `json:"local_path,omitempty"`
+	Device                        uint64           `json:"device,omitempty"`
+	Inode                         uint64           `json:"inode,omitempty"`
+	LocalSize                     int64            `json:"local_size,omitempty"`
+	TerminalNoBytesCleanupPending bool             `json:"terminal_no_bytes_cleanup_pending,omitempty"`
+	Done                          bool             `json:"done,omitempty"`
+	RecoveryRevision              int              `json:"recovery_revision,omitempty"`
 }
 
 func deriveCaptureSetArtifact(producer *captureProducerJournal, sequence int64) (captureArtifactJournal, []string, error) {
@@ -1752,6 +1797,9 @@ func (n *retainedCaptureNamespace) artifactIdentity(name string) (uint64, uint64
 
 func (n *retainedCaptureNamespace) removeArtifact(name string, device, inode uint64, size int64) error {
 	actualDevice, actualInode, actualSize, err := n.artifactIdentity(name)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
 	if err != nil || actualDevice != device || actualInode != inode || actualSize != size {
 		return fmt.Errorf("retained capture leaf identity changed")
 	}
@@ -1774,6 +1822,61 @@ func stoppedZeroByteMember(ack *recordingapi.CaptureStopAck, artifact captureArt
 		}
 	}
 	return recordingapi.CaptureStopAckMember{}, false
+}
+
+func markAcknowledgedNoBytesCleanup(journal *captureProducerJournal, result recordingapi.CaptureStopAckResult) (bool, error) {
+	if journal == nil || journal.CaptureSet == nil || journal.CaptureSet.StopAck == nil {
+		if len(result.NoBytesOrdinals) != 0 {
+			return false, fmt.Errorf("zero-byte result lacks a durable stop inventory")
+		}
+		return false, nil
+	}
+	changed := false
+	for _, ordinal := range result.NoBytesOrdinals {
+		found := false
+		for index := range journal.Artifacts {
+			artifact := &journal.Artifacts[index]
+			if artifact.Ordinal != ordinal {
+				continue
+			}
+			found = true
+			if artifact.Done {
+				break
+			}
+			if _, zero := stoppedZeroByteMember(journal.CaptureSet.StopAck, *artifact); !zero {
+				return false, fmt.Errorf("server zero-byte result differs from the durable stop inventory")
+			}
+			if !artifact.TerminalNoBytesCleanupPending {
+				artifact.TerminalNoBytesCleanupPending = true
+				changed = true
+			}
+			break
+		}
+		if !found {
+			return false, fmt.Errorf("server zero-byte result lacks a durable artifact")
+		}
+	}
+	return changed, nil
+}
+
+func finishAcknowledgedNoBytesCleanup(journal *captureProducerJournal) (bool, error) {
+	changed := false
+	for index := range journal.Artifacts {
+		artifact := &journal.Artifacts[index]
+		if !artifact.TerminalNoBytesCleanupPending {
+			continue
+		}
+		if _, zero := stoppedZeroByteMember(journal.CaptureSet.StopAck, *artifact); !zero {
+			return false, fmt.Errorf("pending zero-byte cleanup differs from the durable stop inventory")
+		}
+		if err := removeRetainedArtifactIfPresent(artifact.LocalPath, artifact.Device, artifact.Inode, artifact.LocalSize); err != nil {
+			return false, err
+		}
+		artifact.TerminalNoBytesCleanupPending = false
+		artifact.Done, artifact.LocalPath = true, ""
+		changed = true
+	}
+	return changed, nil
 }
 
 // isolateCaptureNamespace keeps the original directory inode open while it is
@@ -1931,21 +2034,35 @@ func (w *Worker) captureSetStopBarrier(job recordingapi.RecordingJob, producer *
 		if stopErr != nil {
 			return "", stopErr
 		}
-		currentNoBytes := make(map[int]struct{}, len(stopResult.NoBytesOrdinals))
-		for _, ordinal := range stopResult.NoBytesOrdinals {
-			currentNoBytes[ordinal] = struct{}{}
+		state.mu.Lock()
+		cleanupMarked, markErr := markAcknowledgedNoBytesCleanup(producer, stopResult)
+		if markErr != nil {
+			state.mu.Unlock()
+			return "", markErr
+		}
+		if cleanupMarked {
+			err = persistProducerJournal(w.surrenderJournalRoot(), producer)
+		}
+		state.mu.Unlock()
+		if err != nil {
+			return "", fmt.Errorf("persist acknowledged zero-byte cleanup authority: %w", err)
 		}
 		state.mu.Lock()
 		for index := range producer.Artifacts {
 			artifact := &producer.Artifacts[index]
-			member, zero := stoppedZeroByteMember(&ack, *artifact)
-			if _, acknowledged := currentNoBytes[artifact.Ordinal]; !zero || !acknowledged {
+			if !artifact.TerminalNoBytesCleanupPending {
 				continue
+			}
+			member, zero := stoppedZeroByteMember(&ack, *artifact)
+			if !zero {
+				state.mu.Unlock()
+				return "", fmt.Errorf("pending zero-byte cleanup differs from the durable stop inventory")
 			}
 			if err = retained.removeArtifact(member.RelativeName, member.Device, member.Inode, member.SizeBytes); err != nil {
 				state.mu.Unlock()
 				return "", fmt.Errorf("remove acknowledged zero-byte capture artifact: %w", err)
 			}
+			artifact.TerminalNoBytesCleanupPending = false
 			artifact.Done, artifact.LocalPath = true, ""
 		}
 		err = persistProducerJournal(w.surrenderJournalRoot(), producer)

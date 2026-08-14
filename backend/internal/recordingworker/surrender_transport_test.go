@@ -426,6 +426,147 @@ func TestSourceStopOpenBeforeFirstByteTerminalizesOnCurrentFence(t *testing.T) {
 	}
 }
 
+func TestCurrentFenceNoBytesCleanupRestartsAtEveryDurableBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		pending         bool
+		alreadyUnlinked bool
+	}{
+		{name: "ack_before_pending_state"},
+		{name: "pending_state_before_unlink", pending: true},
+		{name: "unlink_before_final_state", pending: true, alreadyUnlinked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			outDir, err := os.MkdirTemp(root, "capture-continuous-zero-crash.retained-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(outDir, "seg-20260814-120000.mp4")
+			if err = os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			paths, err := listCaptureArtifactPaths(outDir)
+			if err != nil || len(paths) != 1 || paths[0].Size != 0 {
+				t.Fatalf("paths=%+v err=%v", paths, err)
+			}
+			planAt := time.Now().UTC().Truncate(time.Microsecond)
+			canonical, err := surrenderplan.Build(planAt, planAt.Add(5*time.Second), 5)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planID, setID, producerID, leaseToken := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			plan := recordingapi.CaptureSetPlan{
+				PlanID: planID.String(), SetID: setID.String(), ProducerID: producerID.String(), CaptureOrdinal: 1,
+				FirstCaptureSequence: 1, AccountID: 1, RecordingID: 2, JobID: 3, LeaseToken: leaseToken.String(),
+				OriginClaimGeneration: 1, SourceSnapshotSHA256: strings.Repeat("a", 64), DestinationNamingSHA256: strings.Repeat("b", 64),
+				PlanAt: planAt, WindowEndAt: planAt.Add(5 * time.Second), DurationMicroseconds: canonical.DurationMicro,
+				ClipDurationSeconds: 5, ArtifactCount: canonical.ArtifactCount, SegmentTimesArgument: canonical.SplitTimesArgument,
+				MaxArtifactBytes: surrenderplan.RecoveryArtifactMaxBytes,
+			}
+			identity, err := captureSetIdentity(plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seed := sha256.Sum256([]byte("zero-byte-crash-" + tc.name))
+			tree, err := surrenderplan.BuildTree(seed, identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			artifact, err := surrenderplan.DeriveArtifact(seed, identity, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof, err := tree.Proof(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proofValues := make([]string, len(proof.Siblings))
+			for index := range proof.Siblings {
+				proofValues[index] = hex.EncodeToString(proof.Siblings[index][:])
+			}
+			ack := recordingapi.CaptureStopAck{
+				AckID: uuid.NewString(), RetainedDirectoryDevice: paths[0].Device, RetainedDirectoryInode: paths[0].Inode + 1,
+				Members: []recordingapi.CaptureStopAckMember{{
+					Ordinal: 1, ArtifactID: artifact.ID.String(), CaptureSequence: 1,
+					RecoverySecretSHA256: hex.EncodeToString(artifact.RecoverySecretHash[:]), Proof: proofValues,
+					Device: paths[0].Device, Inode: paths[0].Inode, SizeBytes: 0, RelativeName: filepath.Base(path),
+				}},
+			}
+			ack.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(ack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rootHash := tree.Root()
+			journal := &captureProducerJournal{
+				JobID: 3, LeaseToken: leaseToken.String(), ProducerID: producerID.String(), CaptureOrdinal: 1,
+				OutputDir: outDir, ClipDurationSec: 5,
+				Artifacts: []captureArtifactJournal{{
+					Ordinal: 1, IntentID: artifact.ID.String(), RecoverySecret: hex.EncodeToString(artifact.RecoverySecret[:]),
+					RecoverySecretSHA256: hex.EncodeToString(artifact.RecoverySecretHash[:]), CaptureSequence: 1,
+					LocalPath: path, Device: paths[0].Device, Inode: paths[0].Inode, LocalSize: 0,
+					TerminalNoBytesCleanupPending: tc.pending,
+				}},
+				CaptureSet: &captureSetJournal{
+					PlanID: planID.String(), SetID: setID.String(), Seed: hex.EncodeToString(seed[:]), FirstCaptureSequence: 1,
+					Plan: &plan, MerkleRootSHA256: hex.EncodeToString(rootHash[:]), Committed: true, StopAck: &ack,
+				},
+			}
+			var stopACKs, heartbeats, finishes, forbidden atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/stop-ack"):
+					stopACKs.Add(1)
+					_ = json.NewEncoder(w).Encode(recordingapi.CaptureStopAckResult{NoBytesOrdinals: []int{1}})
+				case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+					heartbeats.Add(1)
+					_ = json.NewEncoder(w).Encode(map[string]any{"cancel": false, "lease_expires_at": time.Now().Add(time.Minute)})
+				case strings.HasSuffix(r.URL.Path, "/finish"):
+					finishes.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					forbidden.Add(1)
+					http.Error(w, "unexpected recovery or claim authority", http.StatusConflict)
+				}
+			}))
+			defer server.Close()
+			client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = persistProducerJournal(worker.surrenderJournalRoot(), journal); err != nil {
+				t.Fatal(err)
+			}
+			journalPath := journal.path
+			if tc.alreadyUnlinked {
+				if err = removeRetainedArtifactIfPresent(path, paths[0].Device, paths[0].Inode, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			loaded, loadErr := loadCaptureProducerJournals(worker.surrenderJournalRoot())
+			if loadErr != nil || len(loaded) != 1 {
+				t.Fatalf("startup inventory=%d err=%v", len(loaded), loadErr)
+			}
+			if err = worker.recoverProducerJournals(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if stopACKs.Load() != 1 || heartbeats.Load() != 1 || finishes.Load() != 1 || forbidden.Load() != 0 {
+				t.Fatalf("ack=%d heartbeat=%d finish=%d forbidden=%d", stopACKs.Load(), heartbeats.Load(), finishes.Load(), forbidden.Load())
+			}
+			if _, err = os.Stat(journalPath); !os.IsNotExist(err) {
+				t.Fatalf("terminal journal was not retired: %v", err)
+			}
+			if state, stateErr := loadClaimSuccessorState(worker.surrenderJournalRoot()); stateErr != nil || state != nil {
+				t.Fatalf("zero-byte cleanup requested credential rotation: state=%+v err=%v", state, stateErr)
+			}
+		})
+	}
+}
+
 func TestRecoveryRotationRequirementSurvivesCrashesBeforeAndAfterJournalRetirement(t *testing.T) {
 	root := filepath.Join(t.TempDir(), ".stoarama-surrender-v1")
 	if err := ensurePrivateSurrenderJournalRoot(root); err != nil {
