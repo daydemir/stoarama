@@ -47,7 +47,7 @@ func TestRecordingPresentationV2MigrationRunsThroughMigrateUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	if err = MigrateUp(ctx, pool, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
+	if err = migrateUpForDBTest(ctx, pool, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
 		t.Fatalf("MigrateUp with presentation v2 C1: %v", err)
 	}
 	var enumSchema, enumLabels string

@@ -12,6 +12,13 @@ import (
 )
 
 func MigrateUp(ctx context.Context, pool *pgxpool.Pool, migrationDir string) error {
+	return MigrateUpWithCampaignRoles(ctx, pool, migrationDir, "", "", "")
+}
+
+// MigrateUpWithCampaignRoles applies migrations while exposing only the two
+// reviewed role names to migrations that transfer security-sensitive object
+// ownership. Empty role names preserve legacy migrations but 0140 fails closed.
+func MigrateUpWithCampaignRoles(ctx context.Context, pool *pgxpool.Pool, migrationDir, runtimeRole, executorRole, authorityRole string) error {
 	if migrationDir == "" {
 		migrationDir = resolveMigrationDir()
 	}
@@ -58,6 +65,10 @@ func MigrateUp(ctx context.Context, pool *pgxpool.Pool, migrationDir string) err
 		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("set lock_timeout for %s: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT set_config('stoarama.campaign_runtime_role',$1,true),set_config('stoarama.campaign_executor_role',$2,true),set_config('stoarama.campaign_authority_role',$3,true)`, runtimeRole, executorRole, authorityRole); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("set campaign migration roles for %s: %w", name, err)
 		}
 		if _, err := tx.Exec(ctx, string(body)); err != nil {
 			_ = tx.Rollback(ctx)

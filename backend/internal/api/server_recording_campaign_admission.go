@@ -145,43 +145,6 @@ func bindCampaignAdmissionEvidence(ctx context.Context, tx pgx.Tx, approvalID uu
 	return deadline.UTC(), nil
 }
 
-func persistCampaignAdmission(ctx context.Context, tx pgx.Tx, approvalID uuid.UUID, accountID, actorUserID int64, deadline time.Time, streams []batchStream, items []batchScheduleItem) (int64, error) {
-	recordingByStream := make(map[int64]int64, len(items))
-	for _, item := range items {
-		recordingByStream[item.StreamID] = item.RecordingID
-	}
-	var trackID int64
-	err := tx.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id) VALUES($1,$2,$3,$4,$5,'GOOD',0,$6) RETURNING id`,
-		accountID, "targeted-admission-"+approvalID.String(), "Approved targeted admission "+approvalID.String()[:8], deadline, len(streams), actorUserID).Scan(&trackID)
-	if err != nil {
-		return 0, fmt.Errorf("create protected campaign track: %w", err)
-	}
-	for rank, stream := range streams {
-		recordingID := recordingByStream[stream.id]
-		if recordingID <= 0 {
-			return 0, fmt.Errorf("stream %d has no scheduled recording", stream.id)
-		}
-		var rosterID int64
-		err = tx.QueryRow(ctx, `
-			INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id)
-			VALUES($1,$2,$3,$4,'primary',$5,'probation',ARRAY['deniz_approved','targeted_do_two_pass','source_fenced'],transaction_timestamp(),transaction_timestamp(),$6,$7,$8)
-			RETURNING id`, trackID, recordingID, stream.id, stream.sceneIdentity, rank+1, stream.evidenceObservedAt, stream.evidenceSHA, actorUserID).Scan(&rosterID)
-		if err != nil {
-			return 0, fmt.Errorf("protect admitted stream %d: %w", stream.id, err)
-		}
-		_, err = tx.Exec(ctx, `
-			INSERT INTO recording_campaign_admission_results(approval_id,first_probe_evidence_id,second_probe_evidence_id,account_id,track_id,roster_entry_id,stream_id,recording_id,actor_user_id,schedule_sha256,recording_config_sha256)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, approvalID, stream.admissionEvidenceID, stream.admissionEvidenceID2, accountID, trackID, rosterID, stream.id, recordingID, actorUserID, stream.scheduleSHA, strings.Repeat("0", 64))
-		if err != nil {
-			return 0, fmt.Errorf("seal admitted stream %d: %w", stream.id, err)
-		}
-	}
-	if _, err := tx.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['deniz_approved','targeted_do_two_pass','atomic_schedule_protection'],$2,transaction_timestamp())`, trackID, actorUserID); err != nil {
-		return 0, fmt.Errorf("activate protected campaign track: %w", err)
-	}
-	return trackID, nil
-}
-
 type campaignAdmissionApprovalRequest struct {
 	RequestID        string                           `json:"request_id"`
 	DeadlineAt       time.Time                        `json:"deadline_at"`
@@ -308,6 +271,14 @@ func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWri
 		util.WriteError(w, http.StatusBadRequest, "approved schedule must be native, non-dry-run, and not self-referential")
 		return
 	}
+	if req.Schedule.Delivery != string(deliveryManaged) && req.Schedule.Delivery != string(deliveryNASPull) {
+		util.WriteError(w, http.StatusBadRequest, "campaign admission supports only managed or nas_pull delivery")
+		return
+	}
+	if req.Schedule.StorageDestinationID <= 0 || req.Schedule.DeliveryStorageDestinationID != 0 {
+		util.WriteError(w, http.StatusBadRequest, "campaign admission requires one server-owned managed capture destination")
+		return
+	}
 	if req.Schedule.StartAt == nil || req.Schedule.EndAt == nil || !req.Schedule.EndAt.After(req.Schedule.StartAt.UTC()) || req.Schedule.EndAt.After(req.DeadlineAt.UTC()) || len(req.Schedule.ActiveWeekdays) == 0 {
 		util.WriteError(w, http.StatusBadRequest, "approved schedule requires explicit bounded start/end/weekdays within the approval deadline")
 		return
@@ -367,10 +338,6 @@ func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWri
 	defer tx.Rollback(r.Context())
 	if _, err := tx.Exec(r.Context(), `SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE`, p.AccountID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "lock campaign admission occupancy")
-		return
-	}
-	if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,account_id,actor_user_id,account_session_id) VALUES(txid_current(),'approve',$1,$2,$3)`, p.AccountID, p.UserID, *p.SessionID); err != nil {
-		util.WriteError(w, http.StatusForbidden, "campaign approval session authorization failed")
 		return
 	}
 	storedEntries := make([]campaignAdmissionStoredEntry, 0, len(entries))
@@ -463,23 +430,14 @@ func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWri
 		util.WriteError(w, http.StatusInternalServerError, "encode campaign admission schedule")
 		return
 	}
-	var id, digest string
-	err = tx.QueryRow(r.Context(), `
-		WITH payload AS (SELECT $1::bigint account_id,$2::bigint actor_user_id,$3::text actor_email,$4::text authority_code,NULLIF($5::text,'') failure_domain_tag,$6::timestamptz deadline_at,$7::jsonb entries,$8::jsonb schedule_spec),
-		hashed AS (SELECT *,encode(sha256(convert_to(schedule_spec::text,'UTF8')),'hex') schedule_sha256 FROM payload)
-		INSERT INTO recording_campaign_admission_approvals(request_id,account_id,actor_user_id,actor_email_snapshot,authority_code,failure_domain_tag,deadline_at,entries,schedule_spec,request_sha256,schedule_sha256,approval_sha256)
-		SELECT $9,account_id,actor_user_id,actor_email,authority_code,failure_domain_tag,deadline_at,entries,schedule_spec,$10,schedule_sha256,
-		       encode(sha256(convert_to(jsonb_build_object('account_id',account_id,'actor_user_id',actor_user_id,'actor_email',lower(actor_email),'authority_code',authority_code,'failure_domain_tag',failure_domain_tag,'deadline_epoch',extract(epoch from deadline_at),'entries',entries,'schedule_sha256',schedule_sha256)::text,'UTF8')),'hex')
-		FROM hashed ON CONFLICT DO NOTHING RETURNING id::text,approval_sha256`, p.AccountID, p.UserID, strings.ToLower(strings.TrimSpace(p.Email)), req.AuthorityCode, req.FailureDomainTag, req.DeadlineAt.UTC(), rawEntries, rawSchedule, requestID, requestSHA).Scan(&id, &digest)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err = tx.QueryRow(r.Context(), `SELECT id::text,approval_sha256 FROM recording_campaign_admission_approvals WHERE account_id=$1 AND request_id=$2 AND request_sha256=$3 AND actor_user_id=$4 AND actor_email_snapshot=$5 AND authority_code=$6 AND failure_domain_tag IS NOT DISTINCT FROM NULLIF($7,'') AND deadline_at=$8 AND entries=$9::jsonb AND schedule_spec=$10::jsonb`, p.AccountID, requestID, requestSHA, p.UserID, strings.ToLower(strings.TrimSpace(p.Email)), req.AuthorityCode, req.FailureDomainTag, req.DeadlineAt.UTC(), rawEntries, rawSchedule).Scan(&id, &digest)
-	}
-	if err != nil {
-		util.WriteError(w, http.StatusConflict, "campaign admission approval was not persisted")
+	if err := tx.Rollback(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "release campaign approval preflight")
 		return
 	}
-	if err = tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusConflict, "commit campaign admission approval")
+	var id, digest string
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT approval_id::text,approval_sha256 FROM recording_campaign_approve($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12)`, requestID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, strings.ToLower(strings.TrimSpace(p.Email)), req.AuthorityCode, req.FailureDomainTag, req.DeadlineAt.UTC(), rawEntries, rawSchedule, requestSHA).Scan(&id, &digest)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "campaign admission approval was not persisted")
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"approval_id": id, "approval_sha256": digest, "stream_ids": campaignAdmissionStreamIDs(entries)})
@@ -510,6 +468,86 @@ type campaignAdmissionProbeOrderRequest struct {
 	ApprovalID string `json:"approval_id"`
 	StreamID   int64  `json:"stream_id"`
 	RequestID  string `json:"request_id"`
+}
+
+type campaignCloudCapacityObservation struct {
+	ObservedAt            time.Time
+	ReadyWorkers          int
+	TotalSlots            int
+	LargestWorkerSlots    int
+	UsableAfterWorkerLoss int
+	LargestRegion         string
+	LargestRegionSlots    int
+	FactsSHA256           string
+}
+
+func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignCloudCapacityObservation, error) {
+	if s.campaignDOAttest == nil || strings.TrimSpace(s.cfg.DropletPoolBuildSHA) == "" {
+		return campaignCloudCapacityObservation{}, fmt.Errorf("managed cloud capacity attestation is unavailable")
+	}
+	type worker struct {
+		ID, NodeID, DOID    int64
+		Name, Region, Build string
+		Capacity            int
+	}
+	rows, err := s.pool.Query(ctx, `SELECT d.id,d.node_id,d.do_droplet_id,d.name,d.region,d.build_sha,d.capacity FROM recorder_droplets d JOIN nodes n ON n.id=d.node_id WHERE d.state='active' AND n.status='active' AND n.node_type='local_recorder' AND d.last_seen_at BETWEEN transaction_timestamp()-interval '120 seconds' AND transaction_timestamp()+interval '30 seconds' AND d.build_sha=$1 ORDER BY d.id`, strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)))
+	if err != nil {
+		return campaignCloudCapacityObservation{}, fmt.Errorf("load current-build cloud capacity: %w", err)
+	}
+	defer rows.Close()
+	var workers []worker
+	for rows.Next() {
+		var item worker
+		if err := rows.Scan(&item.ID, &item.NodeID, &item.DOID, &item.Name, &item.Region, &item.Build, &item.Capacity); err != nil {
+			return campaignCloudCapacityObservation{}, err
+		}
+		if item.DOID > 0 && item.Capacity > 0 {
+			workers = append(workers, item)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return campaignCloudCapacityObservation{}, err
+	}
+	type fact struct {
+		DropletID int64  `json:"droplet_id"`
+		NodeID    int64  `json:"node_id"`
+		Region    string `json:"region"`
+		Capacity  int    `json:"capacity"`
+		BuildSHA  string `json:"build_sha"`
+	}
+	observation := campaignCloudCapacityObservation{ObservedAt: time.Now().UTC()}
+	regionSlots := map[string]int{}
+	facts := make([]fact, 0, len(workers))
+	for _, item := range workers {
+		attestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		provider, attestErr := s.campaignDOAttest(attestCtx, item.DOID, item.Name)
+		cancel()
+		if attestErr != nil || provider.DropletID != item.DOID || provider.Name != item.Name || provider.Region != item.Region || provider.Status != "active" {
+			continue
+		}
+		observation.ReadyWorkers++
+		observation.TotalSlots += item.Capacity
+		if item.Capacity > observation.LargestWorkerSlots {
+			observation.LargestWorkerSlots = item.Capacity
+		}
+		regionSlots[item.Region] += item.Capacity
+		facts = append(facts, fact{DropletID: item.DOID, NodeID: item.NodeID, Region: item.Region, Capacity: item.Capacity, BuildSHA: item.Build})
+	}
+	for region, slots := range regionSlots {
+		if slots > observation.LargestRegionSlots || (slots == observation.LargestRegionSlots && region < observation.LargestRegion) {
+			observation.LargestRegion, observation.LargestRegionSlots = region, slots
+		}
+	}
+	observation.UsableAfterWorkerLoss = observation.TotalSlots - observation.LargestWorkerSlots
+	rawFacts, err := json.Marshal(facts)
+	if err != nil {
+		return campaignCloudCapacityObservation{}, err
+	}
+	observation.FactsSHA256 = hashSecret(string(rawFacts))
+	if observation.ReadyWorkers < 2 || observation.UsableAfterWorkerLoss <= 0 || !lowerSHA256(observation.FactsSHA256) {
+		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity cannot survive one worker loss")
+	}
+	return observation, nil
 }
 
 type campaignAdmissionSceneReviewRequest struct {
@@ -551,41 +589,9 @@ func (s *Server) handleAccountCampaignAdmissionSceneReviewCreate(w http.Response
 		util.WriteError(w, http.StatusInternalServerError, "load targeted scene review replay")
 		return
 	}
-	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "begin targeted scene review")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	if _, err := tx.Exec(r.Context(), `SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE`, p.AccountID); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "lock targeted scene review")
-		return
-	}
-	if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,actor_user_id,account_session_id) VALUES(txid_current(),'review',$1,$2,$3,$4)`, approvalID, p.AccountID, p.UserID, *p.SessionID); err != nil {
-		util.WriteError(w, http.StatusForbidden, "targeted scene review authorization failed")
-		return
-	}
-	err = tx.QueryRow(r.Context(), `
-		WITH facts AS (
-		  SELECT $1::uuid request_id,e.approval_id,e.account_id,e.stream_id,e.id probe_evidence_id,e.frame_sha256,r.scene_frame_evidence_id,r.scene_identity_sha256,$2::bigint reviewer,transaction_timestamp() reviewed_at
-		  FROM recording_targeted_probe_evidence e
-		  JOIN recording_campaign_admission_reservations r ON r.approval_id=e.approval_id AND r.stream_id=e.stream_id
-		  WHERE e.id=$3 AND e.approval_id=$4 AND e.account_id=$5 AND e.result='ok'
-		), hashed AS (
-		  SELECT *,encode(sha256(convert_to(jsonb_build_object('request_id',request_id,'approval_id',approval_id,'account_id',account_id,'stream_id',stream_id,'probe_evidence_id',probe_evidence_id,'probe_frame_sha256',frame_sha256,'scene_frame_evidence_id',scene_frame_evidence_id,'scene_identity_sha256',scene_identity_sha256,'reviewed_by_user_id',reviewer,'reviewed_at_epoch',extract(epoch from reviewed_at))::text,'UTF8')),'hex') digest FROM facts
-		)
-		INSERT INTO recording_targeted_probe_scene_reviews(request_id,approval_id,account_id,stream_id,probe_evidence_id,probe_frame_sha256,scene_frame_evidence_id,scene_identity_sha256,reviewed_by_user_id,reviewed_at,review_sha256)
-		SELECT request_id,approval_id,account_id,stream_id,probe_evidence_id,frame_sha256,scene_frame_evidence_id,scene_identity_sha256,reviewer,reviewed_at,digest FROM hashed
-		ON CONFLICT DO NOTHING RETURNING id::text,review_sha256`, requestID, p.UserID, evidenceID, approvalID, p.AccountID).Scan(&replayID, &replaySHA)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err = tx.QueryRow(r.Context(), `SELECT id::text,review_sha256 FROM recording_targeted_probe_scene_reviews WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND probe_evidence_id=$4 AND reviewed_by_user_id=$5`, p.AccountID, requestID, approvalID, evidenceID, p.UserID).Scan(&replayID, &replaySHA)
-	}
+	err := s.admissionPool.QueryRow(r.Context(), `SELECT review_id::text,review_sha256 FROM recording_campaign_review_probe_scene($1,$2,$3,$4,$5,$6,$7)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, evidenceID).Scan(&replayID, &replaySHA)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted scene review is not exact or fresh")
-		return
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusConflict, "commit targeted scene review")
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"scene_review_id": replayID, "review_sha256": replaySHA, "probe_evidence_id": evidenceID})
@@ -608,20 +614,9 @@ func (s *Server) handleAccountCampaignAdmissionProbeOrderCreate(w http.ResponseW
 		util.WriteError(w, http.StatusBadRequest, "approval_id, request_id, and stream_id are required")
 		return
 	}
-	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "begin targeted probe order")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	if _, err := tx.Exec(r.Context(), `SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE`, p.AccountID); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "lock targeted probe order")
-		return
-	}
 	var orderID string
-	replayErr := tx.QueryRow(r.Context(), `SELECT id::text FROM recording_targeted_probe_orders WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND requested_by_user_id=$5`, p.AccountID, requestID, approvalID, req.StreamID, p.UserID).Scan(&orderID)
+	replayErr := s.pool.QueryRow(r.Context(), `SELECT id::text FROM recording_targeted_probe_orders WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND requested_by_user_id=$5`, p.AccountID, requestID, approvalID, req.StreamID, p.UserID).Scan(&orderID)
 	if replayErr == nil {
-		_ = tx.Commit(r.Context())
 		util.WriteJSON(w, http.StatusOK, map[string]any{"order_id": orderID, "approval_id": approvalID, "stream_id": req.StreamID, "desired_attempts": 2})
 		return
 	}
@@ -629,17 +624,9 @@ func (s *Server) handleAccountCampaignAdmissionProbeOrderCreate(w http.ResponseW
 		util.WriteError(w, http.StatusConflict, "load targeted probe order replay")
 		return
 	}
-	if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,actor_user_id,account_session_id) VALUES(txid_current(),'queue',$1,$2,$3,$4)`, approvalID, p.AccountID, p.UserID, *p.SessionID); err != nil {
-		util.WriteError(w, http.StatusForbidden, "targeted probe order authorization failed")
-		return
-	}
-	err = tx.QueryRow(r.Context(), `INSERT INTO recording_targeted_probe_orders(request_id,approval_id,account_id,stream_id,requested_by_user_id) VALUES($1,$2,$3,$4,$5) RETURNING id::text`, requestID, approvalID, p.AccountID, req.StreamID, p.UserID).Scan(&orderID)
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT order_id::text FROM recording_campaign_queue_probe($1,$2,$3,$4,$5,$6,$7)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, req.StreamID).Scan(&orderID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted probe order was not persisted")
-		return
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusConflict, "commit targeted probe order")
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"order_id": orderID, "approval_id": approvalID, "stream_id": req.StreamID, "desired_attempts": 2})
@@ -647,7 +634,8 @@ func (s *Server) handleAccountCampaignAdmissionProbeOrderCreate(w http.ResponseW
 
 func (s *Server) handleRecordingCampaignAdmissionProbeLease(w http.ResponseWriter, r *http.Request) {
 	p, ok := nodePrincipalFromContext(r.Context())
-	if !ok || p.NodeType != nodeTypeLocalRecorder || p.TokenID <= 0 || s.r2 == nil {
+	store := s.campaignProbeObjects()
+	if !ok || p.NodeType != nodeTypeLocalRecorder || p.NodeTokenID <= 0 || p.NodeClaimGeneration <= 0 || p.NodeClaimPurpose != "claim_current" || store == nil {
 		util.WriteError(w, http.StatusUnauthorized, "managed recorder node token required")
 		return
 	}
@@ -665,99 +653,34 @@ func (s *Server) handleRecordingCampaignAdmissionProbeLease(w http.ResponseWrite
 		util.WriteError(w, http.StatusConflict, "current DigitalOcean project/firewall attestation failed")
 		return
 	}
-	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "begin targeted probe lease")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	var orderID, approvalID string
-	var accountID, streamID int64
-	err = tx.QueryRow(r.Context(), `
-		SELECT o.id::text,o.approval_id::text,o.account_id,o.stream_id
-		FROM recording_targeted_probe_orders o
-		JOIN recording_campaign_admission_approvals a ON a.id=o.approval_id
-		WHERE a.deadline_at>transaction_timestamp()
-		  AND (SELECT count(*) FROM recording_targeted_probe_attempts pa WHERE pa.order_id=o.id)<o.desired_attempts
-		  AND NOT EXISTS(SELECT 1 FROM recording_targeted_probe_attempts pa LEFT JOIN recording_targeted_probe_evidence pe ON pe.attempt_id=pa.id WHERE pa.order_id=o.id AND pe.id IS NULL)
-		  AND COALESCE((SELECT max(pe.observed_at) FROM recording_targeted_probe_attempts pa JOIN recording_targeted_probe_evidence pe ON pe.attempt_id=pa.id WHERE pa.order_id=o.id),TIMESTAMPTZ '-infinity')<=transaction_timestamp()-interval '60 seconds'
-		ORDER BY o.requested_at,o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1`).Scan(&orderID, &approvalID, &accountID, &streamID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		_ = tx.Commit(r.Context())
-		util.WriteJSON(w, http.StatusOK, map[string]any{"target": nil})
-		return
-	}
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "select targeted probe order")
-		return
-	}
-	if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,node_id,node_token_id) VALUES(txid_current(),'attempt',$1,$2,$3,$4)`, approvalID, accountID, p.NodeID, p.TokenID); err != nil {
-		util.WriteError(w, http.StatusForbidden, "targeted probe lease authorization failed")
-		return
-	}
-	var providerID string
-	err = tx.QueryRow(r.Context(), `
-		WITH a AS (SELECT $1::bigint node_id,$2::bigint recorder_droplet_id,$3::bigint do_droplet_id,$4::text project_hash,$5::text firewall_hash,$6::text region,$7::text build_sha),
-		h AS (SELECT *,encode(sha256(convert_to(jsonb_build_object('node_id',node_id,'recorder_droplet_id',recorder_droplet_id,'do_droplet_id',do_droplet_id,'project_id_sha256',project_hash,'firewall_id_sha256',firewall_hash,'region',region,'build_sha',build_sha,'observed_at_epoch',extract(epoch from transaction_timestamp()))::text,'UTF8')),'hex') digest FROM a)
-		INSERT INTO recording_targeted_provider_attestations(node_id,recorder_droplet_id,do_droplet_id,project_id_sha256,firewall_id_sha256,region,build_sha,attestation_sha256)
-		SELECT node_id,recorder_droplet_id,do_droplet_id,project_hash,firewall_hash,region,build_sha,digest FROM h RETURNING id::text`, p.NodeID, dbDroplet.ID, dbDroplet.DODropletID, hashSecret(s.cfg.DropletPoolProjectID), hashSecret(s.cfg.DropletPoolFirewallID), dbDroplet.Region, dbDroplet.BuildSHA).Scan(&providerID)
-	if err != nil {
-		util.WriteError(w, http.StatusConflict, "persist current provider attestation")
-		return
-	}
 	var target recordability.Target
-	var revisionID *int64
-	var sourceHash, pageHash string
-	var sourceUpdated time.Time
-	err = tx.QueryRow(r.Context(), `SELECT s.id,COALESCE(s.provider,''),s.source_url,COALESCE(s.source_page_url,''),r.source_revision_id,r.source_url_sha256,r.source_page_url_sha256,r.source_updated_at FROM recording_campaign_admission_reservations r JOIN streams s ON s.id=r.stream_id WHERE r.approval_id=$1 AND r.stream_id=$2 AND NOT EXISTS(SELECT 1 FROM recording_campaign_admission_source_fence_events f WHERE f.stream_id=r.stream_id AND f.occurred_at>=r.reserved_at) FOR UPDATE OF r`, approvalID, streamID).Scan(&target.ID, &target.Provider, &target.SourceURL, &target.SourcePageURL, &revisionID, &sourceHash, &pageHash, &sourceUpdated)
-	if err != nil {
-		util.WriteError(w, http.StatusConflict, "targeted source fence changed")
-		return
-	}
 	attemptID, requestID := uuid.New(), uuid.New()
 	mediaObjectKey := fmt.Sprintf("quarantine/campaign-probe/%s/media.zip", attemptID)
 	frameObjectKey := fmt.Sprintf("quarantine/campaign-probe/%s/frame.jpg", attemptID)
 	challenge := hashSecret(attemptID.String() + "\n" + requestID.String() + "\n" + mediaObjectKey + "\n" + frameObjectKey + "\n" + uuid.NewString())
-	err = tx.QueryRow(r.Context(), `
-		INSERT INTO recording_targeted_probe_attempts(id,request_id,order_id,approval_id,account_id,stream_id,attempt_no,node_id,recorder_droplet_id,provider_attestation_id,do_droplet_id,region,probe_build_sha,source_revision_id,source_url_sha256,source_page_url_sha256,source_updated_at,challenge,media_object_key,frame_object_key,media_max_size_bytes,frame_max_size_bytes,expires_at)
-		SELECT $1,$2,$3,$4,$5,$6,COALESCE(max(attempt_no),0)+1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,transaction_timestamp()+interval '15 minutes' FROM recording_targeted_probe_attempts WHERE approval_id=$4 AND stream_id=$6 RETURNING id::text,challenge`, attemptID, requestID, orderID, approvalID, accountID, streamID, p.NodeID, dbDroplet.ID, providerID, dbDroplet.DODropletID, dbDroplet.Region, dbDroplet.BuildSHA, revisionID, sourceHash, pageHash, sourceUpdated, challenge, mediaObjectKey, frameObjectKey, targetedProbeMediaMaxBytes, targetedProbeFrameMaxBytes).Scan(&target.AttemptID, &target.Challenge)
-	if err != nil {
-		util.WriteError(w, http.StatusConflict, "create provider-attested targeted attempt")
-		return
-	}
-	target.MediaUploadURL, err = s.r2.PresignPut(r.Context(), mediaObjectKey, "application/zip", s.cfg.R2SignPutTTL)
+	target.MediaUploadURL, err = store.PresignPut(r.Context(), mediaObjectKey, "application/zip", s.cfg.R2SignPutTTL)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "reserve targeted media quarantine object")
 		return
 	}
-	target.FrameUploadURL, err = s.r2.PresignPut(r.Context(), frameObjectKey, "image/jpeg", s.cfg.R2SignPutTTL)
+	target.FrameUploadURL, err = store.PresignPut(r.Context(), frameObjectKey, "image/jpeg", s.cfg.R2SignPutTTL)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "reserve targeted frame quarantine object")
 		return
 	}
-	target.MediaMaxSizeBytes = targetedProbeMediaMaxBytes
-	target.FrameMaxSizeBytes = targetedProbeFrameMaxBytes
-	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusConflict, "commit targeted probe lease")
+	var orderID, approvalID string
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT order_id::text,approval_id::text,stream_id,COALESCE(provider,''),source_url,COALESCE(source_page_url,''),attempt_id::text,challenge FROM recording_campaign_lease_probe($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, dbDroplet.ID, dbDroplet.DODropletID, dbDroplet.Region, dbDroplet.BuildSHA, hashSecret(s.cfg.DropletPoolProjectID), hashSecret(s.cfg.DropletPoolFirewallID), attemptID, requestID, challenge, hashSecret(store.Bucket()), mediaObjectKey, frameObjectKey, targetedProbeMediaMaxBytes, targetedProbeFrameMaxBytes).Scan(&orderID, &approvalID, &target.ID, &target.Provider, &target.SourceURL, &target.SourcePageURL, &target.AttemptID, &target.Challenge)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"target": nil})
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"target": target, "approval_id": approvalID, "request_id": requestID, "order_id": orderID})
-}
-
-func (s *Server) loadManagedProbeRecorder(ctx context.Context, tx pgx.Tx, p nodePrincipal) (managedProbeRecorder, error) {
-	if p.NodeType != nodeTypeLocalRecorder {
-		return managedProbeRecorder{}, fmt.Errorf("targeted campaign probes require a managed DO recorder")
-	}
-	var d managedProbeRecorder
-	var qualified bool
-	err := tx.QueryRow(ctx, `SELECT id,do_droplet_id,region,build_sha,state='active' AND last_seen_at BETWEEN transaction_timestamp()-interval '120 seconds' AND transaction_timestamp()+interval '30 seconds' FROM recorder_droplets WHERE node_id=$1 AND name=$2 FOR SHARE`, p.NodeID, strings.TrimSpace(p.DisplayName)).Scan(&d.ID, &d.DODropletID, &d.Region, &d.BuildSHA, &qualified)
 	if err != nil {
-		return managedProbeRecorder{}, err
+		util.WriteError(w, http.StatusConflict, "create provider-attested targeted attempt")
+		return
 	}
-	if !qualified || d.DODropletID <= 0 || d.BuildSHA != strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)) {
-		return managedProbeRecorder{}, fmt.Errorf("managed DO recorder attestation is stale or not on the exact server build")
-	}
-	return d, nil
+	target.MediaMaxSizeBytes = targetedProbeMediaMaxBytes
+	target.FrameMaxSizeBytes = targetedProbeFrameMaxBytes
+	util.WriteJSON(w, http.StatusOK, map[string]any{"target": target, "approval_id": approvalID, "request_id": requestID, "order_id": orderID})
 }
 
 func (s *Server) handleRecordingCampaignAdmissionTargets(w http.ResponseWriter, r *http.Request) {
@@ -765,101 +688,6 @@ func (s *Server) handleRecordingCampaignAdmissionTargets(w http.ResponseWriter, 
 	// deployed recorder loop through /lease; accepting a caller-selected bearer
 	// here would recreate the manual-token execution bypass.
 	util.WriteError(w, http.StatusGone, "targeted probes must use the provider-attested worker lease queue")
-	return
-	/*
-		p, ok := nodePrincipalFromContext(r.Context())
-		if !ok {
-			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		var req campaignAdmissionTargetsRequest
-		if err := util.DecodeJSON(r, &req); err != nil {
-			util.WriteError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		approvalID, err := uuid.Parse(strings.TrimSpace(req.ApprovalID))
-		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "approval_id must be a UUID")
-			return
-		}
-		ids, err := uniqueBatchStreamIDs(req.StreamIDs)
-		requestID, requestErr := uuid.Parse(strings.TrimSpace(req.RequestID))
-		if err != nil || requestErr != nil || len(ids) != 1 {
-			util.WriteError(w, http.StatusBadRequest, "exactly one unique stream_id and a UUID request_id are required")
-			return
-		}
-		tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, "begin targeted probe target load")
-			return
-		}
-		defer tx.Rollback(r.Context())
-		droplet, err := s.loadManagedProbeRecorder(r.Context(), tx, p)
-		if err != nil {
-			util.WriteError(w, http.StatusConflict, err.Error())
-			return
-		}
-		if p.TokenID <= 0 {
-			util.WriteError(w, http.StatusUnauthorized, "targeted attempt requires an authenticated node token identity")
-			return
-		}
-		if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,node_id,node_token_id) VALUES(txid_current(),'attempt',$1,$2,$3,$4)`, approvalID, p.AccountID, p.NodeID, p.TokenID); err != nil {
-			util.WriteError(w, http.StatusForbidden, "targeted attempt node authorization failed")
-			return
-		}
-		var target recordability.Target
-		var revisionID *int64
-		var sourceHash, pageHash string
-		var sourceUpdated time.Time
-		err = tx.QueryRow(r.Context(), `
-			SELECT s.id,COALESCE(s.provider,''),s.source_url,COALESCE(s.source_page_url,''),ar.source_revision_id,ar.source_url_sha256,ar.source_page_url_sha256,ar.source_updated_at
-			FROM recording_campaign_admission_approvals a
-			JOIN recording_campaign_admission_reservations ar ON ar.approval_id=a.id
-			JOIN streams s ON s.id=ar.stream_id
-			WHERE a.id=$1 AND a.account_id=$3 AND a.deadline_at>transaction_timestamp() AND ar.stream_id=$2
-			  AND ar.source_revision_id IS NOT DISTINCT FROM (SELECT max(id) FROM stream_source_revisions WHERE stream_id=s.id)
-			  AND ar.source_url_sha256=encode(sha256(convert_to(s.source_url,'UTF8')),'hex')
-			  AND ar.source_page_url_sha256=encode(sha256(convert_to(COALESCE(s.source_page_url,''),'UTF8')),'hex')
-			  AND ar.source_updated_at=s.updated_at
-			  AND NOT EXISTS(SELECT 1 FROM recording_campaign_admission_source_fence_events f WHERE f.stream_id=ar.stream_id AND f.occurred_at>=ar.reserved_at)
-			FOR UPDATE OF ar`, approvalID, ids[0], p.AccountID).Scan(&target.ID, &target.Provider, &target.SourceURL, &target.SourcePageURL, &revisionID, &sourceHash, &pageHash, &sourceUpdated)
-		if err != nil {
-			util.WriteError(w, http.StatusConflict, "requested stream set does not exactly match a live source-fenced approval")
-			return
-		}
-		replayErr := tx.QueryRow(r.Context(), `SELECT id::text,challenge FROM recording_targeted_probe_attempts WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND node_id=$5 AND probe_build_sha=$6`, p.AccountID, requestID, approvalID, target.ID, p.NodeID, droplet.BuildSHA).Scan(&target.AttemptID, &target.Challenge)
-		if replayErr == nil {
-			if err := tx.Commit(r.Context()); err != nil {
-				util.WriteError(w, http.StatusConflict, "commit targeted attempt replay")
-				return
-			}
-			util.WriteJSON(w, http.StatusOK, map[string]any{"approval_id": approvalID, "targets": []recordability.Target{target}})
-			return
-		}
-		if !errors.Is(replayErr, pgx.ErrNoRows) {
-			util.WriteError(w, http.StatusConflict, "load targeted attempt replay")
-			return
-		}
-		challenge := hashSecret(uuid.NewString())
-		err = tx.QueryRow(r.Context(), `
-			INSERT INTO recording_targeted_probe_attempts(request_id,approval_id,account_id,stream_id,attempt_no,node_id,recorder_droplet_id,do_droplet_id,region,probe_build_sha,source_revision_id,source_url_sha256,source_page_url_sha256,source_updated_at,challenge,expires_at)
-			SELECT $1,$2,$3,$4,COALESCE(max(attempt_no),0)+1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,transaction_timestamp()+interval '15 minutes'
-			FROM recording_targeted_probe_attempts WHERE approval_id=$2 AND stream_id=$4
-			ON CONFLICT(account_id,request_id) DO NOTHING
-			RETURNING id::text,challenge`, requestID, approvalID, p.AccountID, target.ID, p.NodeID, droplet.ID, droplet.DODropletID, droplet.Region, droplet.BuildSHA, revisionID, sourceHash, pageHash, sourceUpdated, challenge).Scan(&target.AttemptID, &target.Challenge)
-		if errors.Is(err, pgx.ErrNoRows) {
-			err = tx.QueryRow(r.Context(), `SELECT id::text,challenge FROM recording_targeted_probe_attempts WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND node_id=$5 AND probe_build_sha=$6`, p.AccountID, requestID, approvalID, target.ID, p.NodeID, droplet.BuildSHA).Scan(&target.AttemptID, &target.Challenge)
-		}
-		if err != nil {
-			util.WriteError(w, http.StatusConflict, "targeted attempt replay did not match the exact request")
-			return
-		}
-		if err := tx.Commit(r.Context()); err != nil {
-			util.WriteError(w, http.StatusConflict, "commit targeted attempt")
-			return
-		}
-		util.WriteJSON(w, http.StatusOK, map[string]any{"approval_id": approvalID, "targets": []recordability.Target{target}})
-	*/
 }
 
 func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter, r *http.Request) {
@@ -880,16 +708,20 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 		util.WriteError(w, http.StatusBadRequest, "invalid approval, stream, or evidence shape")
 		return
 	}
-	if p.TokenID <= 0 {
+	if p.NodeTokenID <= 0 || p.NodeClaimGeneration <= 0 || p.NodeClaimPurpose != "claim_current" {
 		util.WriteError(w, http.StatusUnauthorized, "targeted evidence requires an authenticated node token identity")
 		return
 	}
 	// Terminal replay is deliberately resolved before mutable worker, attempt,
 	// approval, or source freshness. A committed response must remain replayable
 	// after any of those live prerequisites expire.
-	var replayID, replaySHA string
-	replayErr := s.pool.QueryRow(r.Context(), `SELECT e.id::text,e.evidence_sha256 FROM recording_targeted_probe_evidence e JOIN recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.attempt_id=$1 AND a.request_id=$2 AND e.approval_id=$3 AND e.stream_id=$4 AND e.account_id=$5 AND a.node_id=$6`, attemptID, requestID, approvalID, req.StreamID, p.AccountID, p.NodeID).Scan(&replayID, &replaySHA)
+	var replayID, replaySHA, replayResult, replayDetail string
+	replayErr := s.pool.QueryRow(r.Context(), `SELECT e.id::text,e.evidence_sha256,e.result,e.detail FROM recording_targeted_probe_evidence e JOIN recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.attempt_id=$1 AND a.request_id=$2 AND e.approval_id=$3 AND e.stream_id=$4 AND e.account_id=$5 AND a.node_id=$6`, attemptID, requestID, approvalID, req.StreamID, p.AccountID, p.NodeID).Scan(&replayID, &replaySHA, &replayResult, &replayDetail)
 	if replayErr == nil {
+		if replayResult != req.Evidence.Result || (replayResult != recordability.ResultOK && replayDetail != req.Evidence.Detail) {
+			util.WriteError(w, http.StatusConflict, "targeted evidence request idempotency conflict")
+			return
+		}
 		util.WriteJSON(w, http.StatusCreated, map[string]any{"evidence_id": replayID, "attempt_id": attemptID, "evidence_sha256": replaySHA})
 		return
 	}
@@ -927,52 +759,35 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 		req.Evidence.VideoHeight = 0
 		req.Evidence.ActualFPS = nil
 	}
-	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "begin targeted evidence insert")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	droplet, err := s.loadManagedProbeRecorder(r.Context(), tx, p)
-	if err != nil {
-		util.WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,node_id,node_token_id) VALUES(txid_current(),'evidence',$1,$2,$3,$4)`, approvalID, p.AccountID, p.NodeID, p.TokenID); err != nil {
-		util.WriteError(w, http.StatusForbidden, "targeted evidence node authorization failed")
-		return
-	}
-	var accountID int64
-	var lockedChallenge, lockedMediaKey, lockedFrameKey string
-	err = tx.QueryRow(r.Context(), `SELECT account_id,challenge,media_object_key,frame_object_key FROM recording_targeted_probe_attempts WHERE id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND account_id=$5 AND node_id=$6 AND recorder_droplet_id=$7 AND probe_build_sha=$8 AND expires_at>=transaction_timestamp() FOR UPDATE`, attemptID, requestID, approvalID, req.StreamID, p.AccountID, p.NodeID, droplet.ID, droplet.BuildSHA).Scan(&accountID, &lockedChallenge, &lockedMediaKey, &lockedFrameKey)
-	if err != nil || lockedChallenge != challenge || lockedMediaKey != mediaKey || lockedFrameKey != frameKey {
-		util.WriteError(w, http.StatusConflict, "campaign approval is missing, expired, or does not reserve this stream")
-		return
-	}
 	nativeSignature := req.Evidence.NativeSignatureSHA256
 	challengeProof := req.Evidence.ChallengeProofSHA256
-	actualFPS := any(nil)
-	if req.Evidence.ActualFPS != nil {
-		actualFPS = *req.Evidence.ActualFPS
+	observationJSON, err := json.Marshal(map[string]any{
+		"result": req.Evidence.Result, "valid_ratio": req.Evidence.ValidRatio,
+		"duration_ms": req.Evidence.DurationMs, "segment_count": req.Evidence.SegmentCount,
+		"frame_sha256": req.Evidence.FrameSHA256, "media_sha256": req.Evidence.MediaSHA256,
+		"native_signature_sha256": nativeSignature, "challenge_proof_sha256": challengeProof,
+		"video_codec": req.Evidence.VideoCodec, "audio_codec": req.Evidence.AudioCodec,
+		"audio_present": req.Evidence.AudioPresent, "video_width": req.Evidence.VideoWidth,
+		"video_height": req.Evidence.VideoHeight, "actual_fps": req.Evidence.ActualFPS,
+		"detail": req.Evidence.Detail, "media_size_bytes": observation.MediaSizeBytes,
+		"media_etag": observation.MediaETag, "media_version_id": observation.MediaVersionID,
+		"frame_size_bytes": observation.FrameSizeBytes, "frame_etag": observation.FrameETag,
+		"frame_version_id": observation.FrameVersionID, "archive_bucket_sha256": observation.ArchiveBucketSHA256,
+		"media_archive_object_key": observation.MediaArchiveKey, "media_archive_sha256": observation.MediaArchiveSHA256,
+		"media_archive_etag": observation.MediaArchiveETag, "media_archive_version_id": observation.MediaArchiveVersion,
+		"frame_archive_object_key": observation.FrameArchiveKey, "frame_archive_sha256": observation.FrameArchiveSHA256,
+		"frame_archive_etag": observation.FrameArchiveETag, "frame_archive_version_id": observation.FrameArchiveVersion,
+		"evidence_sha256": strings.Repeat("0", 64),
+	})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "encode targeted evidence observation")
+		return
 	}
 	var evidenceID string
 	var evidenceSHA string
-	err = tx.QueryRow(r.Context(), `
-		INSERT INTO recording_targeted_probe_evidence(attempt_id,approval_id,account_id,stream_id,result,valid_ratio,duration_ms,segment_count,frame_sha256,media_sha256,native_signature_sha256,challenge_proof_sha256,video_codec,audio_codec,audio_present,video_width,video_height,actual_fps,detail,media_size_bytes,media_etag,media_version_id,frame_size_bytes,frame_etag,frame_version_id,evidence_sha256)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,''),NULLIF($10,''),NULLIF($11,''),NULLIF($12,''),NULLIF($13,''),NULLIF($14,''),$15,NULLIF($16,0),NULLIF($17,0),$18,$19,NULLIF($20,0),NULLIF($21,''),NULLIF($22,''),NULLIF($23,0),NULLIF($24,''),NULLIF($25,''),$26)
-		ON CONFLICT(attempt_id) DO NOTHING
-		RETURNING id::text,evidence_sha256`, attemptID, approvalID, accountID, req.StreamID, req.Evidence.Result, req.Evidence.ValidRatio, req.Evidence.DurationMs, req.Evidence.SegmentCount, req.Evidence.FrameSHA256, req.Evidence.MediaSHA256, nativeSignature, challengeProof,
-		req.Evidence.VideoCodec, req.Evidence.AudioCodec, req.Evidence.AudioPresent, req.Evidence.VideoWidth, req.Evidence.VideoHeight, actualFPS, req.Evidence.Detail,
-		observation.MediaSizeBytes, observation.MediaETag, observation.MediaVersionID, observation.FrameSizeBytes, observation.FrameETag, observation.FrameVersionID, strings.Repeat("0", 64)).Scan(&evidenceID, &evidenceSHA)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err = tx.QueryRow(r.Context(), `SELECT id::text,evidence_sha256 FROM recording_targeted_probe_evidence WHERE attempt_id=$1`, attemptID).Scan(&evidenceID, &evidenceSHA)
-	}
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT evidence_id::text,evidence_sha256 FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, attemptID, requestID, approvalID, p.AccountID, req.StreamID, observationJSON).Scan(&evidenceID, &evidenceSHA)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted evidence failed server/DB attestation")
-		return
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusConflict, "commit targeted evidence")
 		return
 	}
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"evidence_id": evidenceID, "attempt_id": attemptID, "evidence_sha256": evidenceSHA})
@@ -1019,24 +834,34 @@ func canonicalizeTargetedFrameEvidence(e *recordability.TargetedEvidence) error 
 }
 
 type targetedQuarantineObservation struct {
-	Evidence       recordability.TargetedEvidence
-	MediaSizeBytes int64
-	MediaETag      string
-	MediaVersionID string
-	FrameSizeBytes int64
-	FrameETag      string
-	FrameVersionID string
+	Evidence            recordability.TargetedEvidence
+	MediaSizeBytes      int64
+	MediaETag           string
+	MediaVersionID      string
+	FrameSizeBytes      int64
+	FrameETag           string
+	FrameVersionID      string
+	ArchiveBucketSHA256 string
+	MediaArchiveKey     string
+	MediaArchiveSHA256  string
+	MediaArchiveETag    string
+	MediaArchiveVersion string
+	FrameArchiveKey     string
+	FrameArchiveSHA256  string
+	FrameArchiveETag    string
+	FrameArchiveVersion string
 }
 
 func (s *Server) verifyTargetedQuarantine(ctx context.Context, attemptID, challenge, mediaKey, frameKey string, mediaMax, frameMax int64) (targetedQuarantineObservation, error) {
-	if s.r2 == nil || mediaMax <= 0 || frameMax <= 0 {
+	store := s.campaignProbeObjects()
+	if store == nil || mediaMax <= 0 || frameMax <= 0 {
 		return targetedQuarantineObservation{}, fmt.Errorf("targeted quarantine storage is unavailable")
 	}
-	mediaHead, err := s.r2.Head(ctx, mediaKey)
+	mediaHead, err := store.Head(ctx, mediaKey)
 	if err != nil || mediaHead.SizeBytes <= 0 || mediaHead.SizeBytes > mediaMax || strings.TrimSpace(mediaHead.ETag) == "" {
 		return targetedQuarantineObservation{}, fmt.Errorf("targeted media quarantine object is missing or out of bounds")
 	}
-	frameHead, err := s.r2.Head(ctx, frameKey)
+	frameHead, err := store.Head(ctx, frameKey)
 	if err != nil || frameHead.SizeBytes <= 0 || frameHead.SizeBytes > frameMax || strings.TrimSpace(frameHead.ETag) == "" {
 		return targetedQuarantineObservation{}, fmt.Errorf("targeted frame quarantine object is missing or out of bounds")
 	}
@@ -1046,10 +871,10 @@ func (s *Server) verifyTargetedQuarantine(ctx context.Context, attemptID, challe
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 	archivePath := filepath.Join(tmpDir, "media.zip")
-	if err := copyExactObjectToFile(ctx, s.r2.OpenExact, mediaKey, mediaHead.ETag, mediaHead.VersionID, archivePath, mediaHead.SizeBytes, mediaMax); err != nil {
+	if err := copyExactObjectToFile(ctx, store.OpenExact, mediaKey, mediaHead.ETag, mediaHead.VersionID, archivePath, mediaHead.SizeBytes, mediaMax); err != nil {
 		return targetedQuarantineObservation{}, err
 	}
-	frameBody, err := readExactObjectBounded(ctx, s.r2.OpenExact, frameKey, frameHead.ETag, frameHead.VersionID, frameHead.SizeBytes, frameMax)
+	frameBody, err := readExactObjectBounded(ctx, store.OpenExact, frameKey, frameHead.ETag, frameHead.VersionID, frameHead.SizeBytes, frameMax)
 	if err != nil {
 		return targetedQuarantineObservation{}, err
 	}
@@ -1124,7 +949,54 @@ func (s *Server) verifyTargetedQuarantine(ctx context.Context, attemptID, challe
 	evidence.NativeSignatureSHA256 = recordability.TargetedNativeSignatureSHA256(evidence)
 	evidence.ChallengeProofSHA256 = recordability.TargetedObjectChallengeProofSHA256(challenge, attemptID, mediaHead.ETag, mediaHead.VersionID, frameHead.ETag, frameHead.VersionID, evidence)
 	evidence.Detail = fmt.Sprintf("valid_ratio=%.3f segments=%d native_signature_stable=true frame=true", evidence.ValidRatio, evidence.SegmentCount)
-	return targetedQuarantineObservation{Evidence: evidence, MediaSizeBytes: mediaHead.SizeBytes, MediaETag: mediaHead.ETag, MediaVersionID: mediaHead.VersionID, FrameSizeBytes: frameHead.SizeBytes, FrameETag: frameHead.ETag, FrameVersionID: frameHead.VersionID}, nil
+	mediaArchiveKey := fmt.Sprintf("protected/campaign-probe/%s/media.zip", attemptID)
+	frameArchiveKey := fmt.Sprintf("protected/campaign-probe/%s/frame.jpg", attemptID)
+	mediaArchiveSHA, err := sha256File(archivePath)
+	if err != nil {
+		return targetedQuarantineObservation{}, fmt.Errorf("hash targeted media archive: %w", err)
+	}
+	archiveFile, err := os.Open(archivePath)
+	if err != nil {
+		return targetedQuarantineObservation{}, fmt.Errorf("open targeted media archive for retention: %w", err)
+	}
+	mediaArchiveETag, putErr := store.PutReader(ctx, mediaArchiveKey, "application/zip", archiveFile)
+	closeErr := archiveFile.Close()
+	if putErr != nil || closeErr != nil {
+		return targetedQuarantineObservation{}, fmt.Errorf("retain targeted media evidence")
+	}
+	frameArchiveETag, err := store.PutBytes(ctx, frameArchiveKey, "image/jpeg", frameBody)
+	if err != nil {
+		return targetedQuarantineObservation{}, fmt.Errorf("retain targeted frame evidence")
+	}
+	mediaArchiveHead, err := store.Head(ctx, mediaArchiveKey)
+	if err != nil || mediaArchiveHead.ETag != mediaArchiveETag || mediaArchiveHead.SizeBytes != mediaHead.SizeBytes {
+		return targetedQuarantineObservation{}, fmt.Errorf("verify retained targeted media evidence")
+	}
+	frameArchiveHead, err := store.Head(ctx, frameArchiveKey)
+	if err != nil || frameArchiveHead.ETag != frameArchiveETag || frameArchiveHead.SizeBytes != frameHead.SizeBytes {
+		return targetedQuarantineObservation{}, fmt.Errorf("verify retained targeted frame evidence")
+	}
+	return targetedQuarantineObservation{
+		Evidence: evidence, MediaSizeBytes: mediaHead.SizeBytes, MediaETag: mediaHead.ETag, MediaVersionID: mediaHead.VersionID,
+		FrameSizeBytes: frameHead.SizeBytes, FrameETag: frameHead.ETag, FrameVersionID: frameHead.VersionID,
+		ArchiveBucketSHA256: hashSecret(store.Bucket()), MediaArchiveKey: mediaArchiveKey, MediaArchiveSHA256: mediaArchiveSHA,
+		MediaArchiveETag: mediaArchiveHead.ETag, MediaArchiveVersion: mediaArchiveHead.VersionID,
+		FrameArchiveKey: frameArchiveKey, FrameArchiveSHA256: frameEvidence.FrameSHA256,
+		FrameArchiveETag: frameArchiveHead.ETag, FrameArchiveVersion: frameArchiveHead.VersionID,
+	}, nil
+}
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 type exactObjectOpener func(context.Context, string, string, string) (io.ReadCloser, error)

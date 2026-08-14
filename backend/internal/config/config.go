@@ -13,6 +13,7 @@ import (
 type Config struct {
 	Port                             int
 	DatabaseURL                      string
+	AdmissionDatabaseURL             string
 	APIToken                         string
 	ServiceToken                     string
 	BootstrapAdminEmail              string
@@ -162,6 +163,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		Port:                             intEnv("PORT", 8080),
 		DatabaseURL:                      os.Getenv("DATABASE_URL"),
+		AdmissionDatabaseURL:             os.Getenv("ADMISSION_DATABASE_URL"),
 		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
@@ -329,6 +331,9 @@ func validSharedRecordingsSlug(slug string) bool {
 }
 
 func (c Config) ValidateAPI() error {
+	if strings.TrimSpace(c.AdmissionDatabaseURL) == "" || strings.TrimSpace(c.AdmissionDatabaseURL) == strings.TrimSpace(c.DatabaseURL) {
+		return fmt.Errorf("ADMISSION_DATABASE_URL must be present and distinct from DATABASE_URL")
+	}
 	if err := c.ValidateR2(); err != nil {
 		return err
 	}

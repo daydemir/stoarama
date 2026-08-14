@@ -34,11 +34,16 @@ const (
 )
 
 type nodePrincipal struct {
-	NodeID      int64
-	NodeTokenID int64
-	AccountID   int64
-	NodeType    string
-	DisplayName string
+	NodeID              int64
+	NodeTokenID         int64
+	NodeClaimGeneration int64
+	NodeClaimPurpose    string
+	AccountID           int64
+	NodeType            string
+	DisplayName         string
+	// credentialSHA256 is a one-way request proof. Raw bearer credentials never
+	// cross into SQL arguments or loggable principal state.
+	credentialSHA256 string
 }
 
 type nodeContextKey string
@@ -139,7 +144,7 @@ func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal
 	var principal nodePrincipal
 	var tokenID int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT n.id, n.account_id, n.node_type, n.display_name, t.id
+		SELECT n.id, n.account_id, n.node_type, n.display_name, t.id, COALESCE(t.recording_claim_generation,0), t.recording_claim_purpose
 		FROM node_tokens t
 		JOIN nodes n ON n.id=t.node_id
 		JOIN accounts a ON a.id=n.account_id
@@ -147,11 +152,12 @@ func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal
 		  AND t.revoked_at IS NULL
 		  AND n.status = ANY($2::text[])
 		  AND a.status='active'
-	`, hash, nodeTokenAllowedStatuses()).Scan(&principal.NodeID, &principal.AccountID, &principal.NodeType, &principal.DisplayName, &tokenID)
+	`, hash, nodeTokenAllowedStatuses()).Scan(&principal.NodeID, &principal.AccountID, &principal.NodeType, &principal.DisplayName, &tokenID, &principal.NodeClaimGeneration, &principal.NodeClaimPurpose)
 	if err != nil {
 		return nodePrincipal{}, err
 	}
 	principal.NodeTokenID = tokenID
+	principal.credentialSHA256 = hash
 	_, _ = s.pool.Exec(ctx, `UPDATE node_tokens SET last_used_at=now() WHERE id=$1`, tokenID)
 	return principal, nil
 }

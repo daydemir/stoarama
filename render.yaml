@@ -10,7 +10,7 @@ services:
     name: stoarama-api
     env: go
     rootDir: backend
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     # Vendor a linux ffmpeg into bin/ during build. Render env:go has no ffmpeg
     # on PATH, and the recorder create-time reachability probe shells to
     # $FFMPEG_BIN. We use the BtbN gpl build: the johnvansickle static build
@@ -36,11 +36,17 @@ services:
     preDeployCommand: ./bin/stoarama-api validate-recorder-bindings
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false # Render-managed unprivileged stoarama_runtime URL; never the owner URL.
+      - key: ADMISSION_DATABASE_URL
+        sync: false # API-only stoarama_admission_executor URL; never shared with workers/crons.
       - key: AUTO_MIGRATE
-        value: "true"
+        value: "false"
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: R2_ACCOUNT_ID
         sync: false
       - key: R2_ACCESS_KEY_ID
@@ -158,6 +164,29 @@ services:
       # ceiling. Read the live values before trusting this file (AGENTS.md, "Render
       # Operator Access").
 
+  # Migration-only surface. Deployment orchestration triggers an exact-build
+  # one-off job from this service and waits for success before deploying any
+  # runtime service. Neither privileged URL is present on API/workers/crons.
+  # The daily idempotent run is a safety net, never the deploy ordering signal.
+  - type: cron
+    name: stoarama-db-migrate
+    env: go
+    rootDir: backend
+    plan: starter
+    schedule: "17 4 * * *"
+    autoDeployTrigger: off
+    buildCommand: go build -o bin/stoarama-db-migrate ./cmd/stoarama-db-migrate
+    startCommand: ./bin/stoarama-db-migrate
+    envVars:
+      - key: MIGRATION_DATABASE_URL
+        sync: false
+      - key: RUNTIME_DATABASE_URL
+        sync: false
+      - key: ADMISSION_DATABASE_URL
+        sync: false
+      - key: MIGRATION_DIR
+        value: ../infra/sql/migrations
+
   # Hourly completed-window coverage/gap/layout sweep and summary refresh.
   # Keep this as a dedicated fixed schedule: inferring the scheduled minute
   # from process start time can skip a full sweep when a cron starts late.
@@ -167,14 +196,18 @@ services:
     rootDir: backend
     plan: starter
     schedule: "30 * * * *"
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: go build -o bin/stoaramactl ./cmd/stoaramactl
     startCommand: ./bin/stoaramactl recording-health run --freshness-min 5
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -195,14 +228,18 @@ services:
     rootDir: backend
     plan: starter
     schedule: "0,5,10,15,20,25,35,40,45,50,55 * * * *"
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: go build -o bin/stoaramactl ./cmd/stoaramactl
     startCommand: ./bin/stoaramactl recording-health run --live-only --freshness-min 5
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -222,14 +259,18 @@ services:
     rootDir: backend
     plan: starter
     schedule: "7 */8 * * *"
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: go build -o bin/stoaramactl ./cmd/stoaramactl
     startCommand: ./bin/stoaramactl recording-health summary
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -253,7 +294,7 @@ services:
     rootDir: backend
     plan: starter
     schedule: "3,13,23,33,43,53 * * * *"
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoaramactl ./cmd/stoaramactl
@@ -265,9 +306,13 @@ services:
     startCommand: ./bin/stoaramactl recording-preopen run --concurrency 4 --probe-sec 20
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -297,7 +342,7 @@ services:
     rootDir: backend
     plan: starter
     schedule: "15 4 * * *"
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoaramactl ./cmd/stoaramactl
@@ -311,9 +356,13 @@ services:
     startCommand: ./bin/stoaramactl recording-health run --verify-media
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: STORAGE_CRED_KEY
         sync: false
       - key: FFPROBE_BIN
@@ -340,14 +389,18 @@ services:
     rootDir: backend
     plan: starter
     schedule: "* * * * *"
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: go build -o bin/stoaramactl ./cmd/stoaramactl
     startCommand: ./bin/stoaramactl relay-connectivity run
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -371,16 +424,20 @@ services:
     rootDir: backend
     plan: starter
     numInstances: 1
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoaramactl ./cmd/stoaramactl
     startCommand: ./bin/stoaramactl recorder-control run
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: stoarama-db
-          property: connectionString
+        sync: false
+      - key: STOARAMA_DATABASE_RUNTIME_ROLE
+        value: stoarama_runtime
+      - key: STOARAMA_DATABASE_ROLE_KIND
+        value: runtime
+      - key: STOARAMA_ADMISSION_AUTHORITY_ROLE
+        value: stoarama_admission_authority
       - key: SERVICE_TOKEN
         sync: false
       - key: APP_BASE_URL

@@ -38,11 +38,14 @@ func main() {
 		log.Fatalf("open db: %v", err)
 	}
 	defer pool.Close()
+	admissionPool, err := db.OpenCampaignExecutor(ctx, cfg.AdmissionDatabaseURL, "stoarama_admission_executor", "stoarama_admission_authority")
+	if err != nil {
+		log.Fatalf("open admission executor db: %v", err)
+	}
+	defer admissionPool.Close()
 
 	if cfg.AutoMigrate {
-		if err := db.MigrateUp(ctx, pool, cfg.MigrationDir); err != nil {
-			log.Fatalf("migrate up: %v", err)
-		}
+		log.Fatal("AUTO_MIGRATE is forbidden on the runtime database login; use the dedicated stoarama-db-migrate job")
 	}
 	if len(os.Args) == 2 && os.Args[1] == "validate-recorder-bindings" {
 		if err := dropletpool.NewStore(pool).ValidateLiveBindings(ctx); err != nil {
@@ -74,7 +77,7 @@ func main() {
 		log.Fatalf("init email sender: %v", err)
 	}
 
-	router, err := api.NewRouter(cfg, pool, r2c, mailer)
+	router, err := api.NewRouterWithAdmissionPool(cfg, pool, admissionPool, r2c, mailer)
 	if err != nil {
 		log.Fatalf("build router: %v", err)
 	}

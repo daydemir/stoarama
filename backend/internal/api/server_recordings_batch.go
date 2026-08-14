@@ -148,7 +148,6 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	var admissionApprovalID uuid.UUID
 	admissionRequested := strings.TrimSpace(req.CampaignAdmissionApprovalID) != ""
-	var admissionDeadline time.Time
 	if admissionRequested {
 		if principal.UserID == 0 || principal.SessionID == nil || principal.Role != accountRoleAdmin || (principal.MemberRole != "owner" && principal.MemberRole != "admin") {
 			util.WriteError(w, http.StatusForbidden, "campaign admission requires an account owner/admin browser session")
@@ -173,6 +172,14 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	delivery, err := parseDeliveryMode(strings.TrimSpace(req.Delivery))
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if admissionRequested && delivery != deliveryManaged && delivery != deliveryNASPull {
+		util.WriteError(w, http.StatusBadRequest, "campaign admission supports only managed or nas_pull delivery")
+		return
+	}
+	if admissionRequested && (req.StorageDestinationID <= 0 || req.DeliveryStorageDestinationID != 0) {
+		util.WriteError(w, http.StatusBadRequest, "campaign admission requires one server-owned managed capture destination")
 		return
 	}
 	if delivery == deliveryNASPull && req.DeliveryStorageDestinationID > 0 {
@@ -261,6 +268,14 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		}
 		timezoneByID[item.StreamID] = zone
 	}
+	var admissionCloudCapacity campaignCloudCapacityObservation
+	if admissionRequested {
+		admissionCloudCapacity, err = s.observeCampaignCloudCapacity(r.Context())
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, "campaign admission lacks fresh one-worker-loss cloud capacity")
+			return
+		}
+	}
 
 	txOptions := pgx.TxOptions{}
 	if admissionRequested {
@@ -276,6 +291,10 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	if !req.DryRun {
+		if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0))`); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "lock global campaign capacity")
+			return
+		}
 		// Campaign admission, ordinary batch scheduling, and roster occupancy all
 		// serialize account -> stream -> recording so neither commit order can
 		// bypass a pending scene reservation.
@@ -379,16 +398,10 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusInternalServerError, "load sealed campaign admission replay")
 			return
 		}
-		admissionDeadline, err = bindCampaignAdmissionEvidence(r.Context(), tx, admissionApprovalID, accountID, principal.UserID, streams, endAt, s.cfg.DropletPoolBuildSHA, scheduleSpec, !req.DryRun)
+		_, err = bindCampaignAdmissionEvidence(r.Context(), tx, admissionApprovalID, accountID, principal.UserID, streams, endAt, s.cfg.DropletPoolBuildSHA, scheduleSpec, !req.DryRun)
 		if err != nil {
 			util.WriteError(w, http.StatusConflict, err.Error())
 			return
-		}
-		if !req.DryRun {
-			if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,actor_user_id,account_session_id) VALUES(txid_current(),'admit',$1,$2,$3,$4)`, admissionApprovalID, accountID, principal.UserID, *principal.SessionID); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, "bind campaign admission transaction")
-				return
-			}
 		}
 	}
 	relayStreams := 0
@@ -412,7 +425,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("campaign requires %d relay slots, but only %d are available", requiredRelaySlots, onlineRelaySlots))
 		return
 	}
+	cloudForecastPeak := 0
 	ceiling := s.cfg.DropletPoolMax * s.cfg.DropletPoolCapacity
+	if admissionRequested {
+		ceiling = admissionCloudCapacity.UsableAfterWorkerLoss
+	}
 	if ceiling > 0 {
 		candidates := make([]dropletpool.ForecastCandidate, 0, len(streams))
 		excluded := make([]int64, 0, len(streams))
@@ -431,6 +448,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusInternalServerError, "forecast batch capacity")
 			return
 		}
+		cloudForecastPeak = peak
 		if peak > ceiling {
 			util.WriteError(w, http.StatusConflict, fmt.Sprintf("this schedule peaks at %d concurrent streams, above the recorder limit of %d", peak, ceiling))
 			return
@@ -498,6 +516,109 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusBadRequest, "NAS pull recordings require Stoarama-managed staging")
 			return
 		}
+	}
+
+	if admissionRequested {
+		if s.admissionPool == nil || principal.SessionID == nil || !lowerSHA256(principal.credentialSHA256) {
+			util.WriteError(w, http.StatusServiceUnavailable, "campaign admission executor is unavailable")
+			return
+		}
+		type admissionNextFire struct {
+			StreamID   int64     `json:"stream_id"`
+			NextFireAt time.Time `json:"next_fire_at"`
+		}
+		nextFires := make([]admissionNextFire, 0, len(streams))
+		now := time.Now().UTC()
+		startAt = effectiveRecordingStart(req.StartAt, now)
+		for _, st := range streams {
+			next, nextErr := recsched.NextWindowOpenUTCOn(st.timezone, dailyStart, weekdays, startAt, timeOrZero(endAt), now)
+			if nextErr != nil || next.IsZero() {
+				util.WriteError(w, http.StatusConflict, fmt.Sprintf("stream %d has no next complete approved window", st.id))
+				return
+			}
+			nextFires = append(nextFires, admissionNextFire{StreamID: st.id, NextFireAt: next.UTC()})
+		}
+		var currentActive int
+		if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM recordings WHERE account_id=$1 AND status='active'`, accountID).Scan(&currentActive); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load campaign roster head")
+			return
+		}
+		activeRosterAfter := currentActive + len(streams)
+		if activeRosterAfter > 60 {
+			util.WriteError(w, http.StatusConflict, "campaign admission exceeds the reviewed roster cap")
+			return
+		}
+		var connectionID, nasTotalBytes, nasFreeBytes, measured24hBytes int64
+		var nasReportedAt time.Time
+		var measuredStreams int
+		if err := tx.QueryRow(r.Context(), `SELECT id,nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE account_id=$1 AND kind='nas_pull' AND nas_capacity_blocked=false AND last_seen_at>=transaction_timestamp()-interval '5 minutes' AND nas_storage_reported_at>=transaction_timestamp()-interval '5 minutes' ORDER BY nas_storage_reported_at DESC,id DESC LIMIT 1 FOR SHARE`, accountID).Scan(&connectionID, &nasTotalBytes, &nasFreeBytes, &nasReportedAt); err != nil {
+			util.WriteError(w, http.StatusConflict, "campaign admission requires fresh healthy NAS capacity telemetry")
+			return
+		}
+		if err := tx.QueryRow(r.Context(), `SELECT COALESCE(sum(c.size_bytes),0),count(DISTINCT c.recording_id)::int FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE r.account_id=$1 AND c.created_at>=transaction_timestamp()-interval '24 hours' AND c.purged_at IS NULL`, accountID).Scan(&measured24hBytes, &measuredStreams); err != nil || measured24hBytes <= 0 || measuredStreams <= 0 {
+			util.WriteError(w, http.StatusConflict, "campaign admission lacks a measured 24-hour NAS runway baseline")
+			return
+		}
+		campaignDaysWithReserve := int((endAt.UTC().Sub(now)+24*time.Hour-1)/(24*time.Hour)) + 7
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if campaignDaysWithReserve < 8 || campaignDaysWithReserve > 60 || measured24hBytes > maxInt64/int64(activeRosterAfter)/125 {
+			util.WriteError(w, http.StatusConflict, "campaign admission storage projection is invalid")
+			return
+		}
+		projectionNumerator := measured24hBytes * int64(activeRosterAfter) * 125
+		projectionDenominator := int64(measuredStreams) * 100
+		projectedDailyBytes := (projectionNumerator + projectionDenominator - 1) / projectionDenominator
+		if projectedDailyBytes <= 0 || projectedDailyBytes > maxInt64/int64(campaignDaysWithReserve) {
+			util.WriteError(w, http.StatusConflict, "campaign admission storage projection is invalid")
+			return
+		}
+		requiredFreeBytes := projectedDailyBytes * int64(campaignDaysWithReserve)
+		if requiredFreeBytes > nasFreeBytes {
+			util.WriteError(w, http.StatusConflict, "campaign admission would violate NAS campaign-plus-7d runway")
+			return
+		}
+		projectedFreeAfterBytes := nasFreeBytes - requiredFreeBytes
+		warningThresholdBytes := (nasTotalBytes + 9) / 10
+		capacityJSON, marshalErr := json.Marshal(map[string]any{
+			"observed_at": admissionCloudCapacity.ObservedAt.UTC(), "build_sha": strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)),
+			"ready_workers": admissionCloudCapacity.ReadyWorkers, "total_slots": admissionCloudCapacity.TotalSlots,
+			"largest_worker_slots": admissionCloudCapacity.LargestWorkerSlots, "usable_after_worker_loss": admissionCloudCapacity.UsableAfterWorkerLoss,
+			"largest_region": admissionCloudCapacity.LargestRegion, "largest_region_slots": admissionCloudCapacity.LargestRegionSlots,
+			"provider_project_sha256": hashSecret(s.cfg.DropletPoolProjectID), "provider_firewall_sha256": hashSecret(s.cfg.DropletPoolFirewallID),
+			"facts_sha256": admissionCloudCapacity.FactsSHA256, "forecast_peak_slots": cloudForecastPeak,
+		})
+		storageJSON, storageMarshalErr := json.Marshal(map[string]any{
+			"connection_id": connectionID, "nas_reported_at": nasReportedAt.UTC(), "nas_total_bytes": nasTotalBytes,
+			"nas_free_bytes": nasFreeBytes, "measured_24h_bytes": measured24hBytes, "measured_streams": measuredStreams,
+			"projected_daily_bytes": projectedDailyBytes, "campaign_days_with_reserve": campaignDaysWithReserve,
+			"required_free_bytes": requiredFreeBytes, "projected_free_after_bytes": projectedFreeAfterBytes,
+			"warning_threshold_bytes": warningThresholdBytes, "warning_after_reservation": projectedFreeAfterBytes < warningThresholdBytes,
+		})
+		nextFireJSON, nextMarshalErr := json.Marshal(nextFires)
+		if marshalErr != nil || storageMarshalErr != nil || nextMarshalErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, "encode campaign admission executor request")
+			return
+		}
+		// Release every ordinary-runtime lock before entering the single executor
+		// statement. The definer function reacquires the canonical global/account/
+		// stream order and revalidates all preflight facts under those locks.
+		if err := tx.Rollback(r.Context()); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "release campaign admission preflight")
+			return
+		}
+		var sealedResponse []byte
+		err = s.admissionPool.QueryRow(r.Context(), `SELECT recording_campaign_admit($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb)`, admissionApprovalID, accountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, nextFireJSON, capacityJSON, storageJSON).Scan(&sealedResponse)
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, "campaign admission atomic executor rejected the transition")
+			return
+		}
+		var response batchScheduleResponse
+		if err := json.Unmarshal(sealedResponse, &response); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "decode DB-canonical campaign admission response")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, response)
+		return
 	}
 
 	items := make([]batchScheduleItem, 0, len(streams))
@@ -613,27 +734,9 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		})
 		return
 	}
-	var campaignTrackID int64
 	response := batchScheduleResponse{
 		Items: items, Created: created, Updated: updated,
 		RelayStreams: relayStreams, OnlineRelaySlots: onlineRelaySlots, RequiredRelaySlots: requiredRelaySlots,
-	}
-	if admissionRequested {
-		campaignTrackID, err = persistCampaignAdmission(r.Context(), tx, admissionApprovalID, accountID, principal.UserID, admissionDeadline, streams, items)
-		if err != nil {
-			util.WriteError(w, http.StatusConflict, err.Error())
-			return
-		}
-		response.CampaignTrackID, response.AdmissionApproval = campaignTrackID, req.CampaignAdmissionApprovalID
-		responseJSON, marshalErr := json.Marshal(response)
-		if marshalErr != nil {
-			util.WriteError(w, http.StatusInternalServerError, "encode sealed campaign admission response")
-			return
-		}
-		if _, err := tx.Exec(r.Context(), `INSERT INTO recording_campaign_admission_commits(approval_id,account_id,actor_user_id,track_id,schedule_sha256,response_json,response_sha256) SELECT $1,$2,$3,$4,schedule_sha256,$5::jsonb,encode(sha256(convert_to($5::jsonb::text,'UTF8')),'hex') FROM recording_campaign_admission_approvals WHERE id=$1 AND account_id=$2`, admissionApprovalID, accountID, principal.UserID, campaignTrackID, responseJSON); err != nil {
-			util.WriteError(w, http.StatusConflict, "seal campaign admission replay response")
-			return
-		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit batch schedule")

@@ -19,7 +19,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
@@ -63,7 +62,7 @@ func testPresentationV2Pool(t *testing.T) (*pgxpool.Pool, func()) {
 		admin.Close()
 		t.Fatal(err)
 	}
-	if err = db.MigrateUp(ctx, pool, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
+	if err = migrateAPITestSchema(ctx, pool, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
 		pool.Close()
 		admin.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE")
 		admin.Close()

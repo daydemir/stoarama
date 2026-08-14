@@ -56,7 +56,7 @@ func TestRecordingCanaryPreopenMigrationRunsThroughMigrateUp(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(dir, "0134_recording_canary_preopen_evidence.sql"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err = MigrateUp(ctx, pool, dir); err != nil {
+	if err = migrateUpForDBTest(ctx, pool, dir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = pool.Exec(ctx, `INSERT INTO accounts VALUES(3); INSERT INTO nodes VALUES(2); INSERT INTO recordings VALUES(1); INSERT INTO recording_canary_reservations(id,recording_id,node_id,expires_at,window_start_at,preopen_stage) VALUES(gen_random_uuid(),1,2,now()+interval '3 minutes',now()+interval '90 minutes','early')`); err != nil {

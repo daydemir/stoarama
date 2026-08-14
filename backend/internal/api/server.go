@@ -44,7 +44,9 @@ import (
 type Server struct {
 	cfg                     config.Config
 	pool                    *pgxpool.Pool
+	admissionPool           *pgxpool.Pool
 	r2                      *r2.Client
+	campaignProbeStore      campaignProbeObjectStore
 	secrets                 *secretbox.Cipher
 	recoveryStorageFactory  func(context.Context, r2.Config) (recordingRecoveryObjectStore, error)
 	mailer                  email.Sender
@@ -65,6 +67,25 @@ type Server struct {
 	authLinkLimiter         *authLinkLimiter
 	sharedRecordingsLimiter *sharedRecordingsLimiter
 	campaignDOAttest        func(context.Context, int64, string) (dropletpool.ProviderAttestation, error)
+}
+
+type campaignProbeObjectStore interface {
+	Bucket() string
+	PresignPut(context.Context, string, string, time.Duration) (string, error)
+	Head(context.Context, string) (r2.ObjectHead, error)
+	OpenExact(context.Context, string, string, string) (io.ReadCloser, error)
+	PutReader(context.Context, string, string, io.Reader) (string, error)
+	PutBytes(context.Context, string, string, []byte) (string, error)
+}
+
+func (s *Server) campaignProbeObjects() campaignProbeObjectStore {
+	if s.campaignProbeStore != nil {
+		return s.campaignProbeStore
+	}
+	if s.r2 != nil {
+		return s.r2
+	}
+	return nil
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -124,6 +145,14 @@ type frameExportRow struct {
 }
 
 func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer email.Sender) (http.Handler, error) {
+	return NewRouterWithAdmissionPool(cfg, pool, pool, r2c, mailer)
+}
+
+// NewRouterWithAdmissionPool keeps the ordinary product role and the
+// API-exclusive admission executor credential structurally separate. Tests
+// may use NewRouter's single-pool compatibility surface only before the role
+// split migration is installed.
+func NewRouterWithAdmissionPool(cfg config.Config, pool, admissionPool *pgxpool.Pool, r2c *r2.Client, mailer email.Sender) (http.Handler, error) {
 	streamsHTML, err := loadStreamsHTML()
 	if err != nil {
 		return nil, err
@@ -159,6 +188,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	s := &Server{
 		cfg:                     cfg,
 		pool:                    pool,
+		admissionPool:           admissionPool,
 		r2:                      r2c,
 		mailer:                  mailer,
 		streamsHTML:             injectShell(streamsHTML, "streams"),
