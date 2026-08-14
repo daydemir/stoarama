@@ -77,3 +77,16 @@ func TestDecodeRecordingBatchSpecLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeCampaignAdmissionSpecStrictSingleObject(t *testing.T) {
+	valid := `{"request_id":"00000000-0000-0000-0000-000000000001","entries":[]}`
+	got, err := decodeCampaignAdmissionSpec(strings.NewReader(valid))
+	if err != nil || string(got) != valid {
+		t.Fatalf("decode valid approval: got=%s err=%v", got, err)
+	}
+	for _, invalid := range []string{`[]`, `null`, `{}` + `{}`, ``} {
+		if _, err := decodeCampaignAdmissionSpec(strings.NewReader(invalid)); err == nil {
+			t.Fatalf("accepted invalid approval envelope %q", invalid)
+		}
+	}
+}

@@ -1461,9 +1461,13 @@ func (s *Server) handleAccountRecordingSchedule(w http.ResponseWriter, r *http.R
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err := tx.Exec(r.Context(), `SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE`, principal.AccountID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock account scheduling occupancy")
+		return
+	}
 
 	// Lock catalog metadata before the recording. Batch scheduling uses the same
-	// stream -> recording -> jobs order, so concurrent single and batch edits
+	// account -> stream -> recording -> jobs order, so concurrent single and batch edits
 	// cannot deadlock. The recording is re-read under lock below.
 	var linkedStreamID int64
 	if err := tx.QueryRow(r.Context(), `
