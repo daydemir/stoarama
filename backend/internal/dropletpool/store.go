@@ -215,10 +215,15 @@ func (s *Store) SetDropletID(ctx context.Context, id, doDropletID int64, ip stri
 	if _, err = tx.Exec(ctx, rolloutFenceSQL); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		UPDATE recorder_droplets SET do_droplet_id=$2, ip_address=$3, updated_at=now() WHERE id=$1
-	`, id, doDropletID, strings.TrimSpace(ip)); err != nil {
+		  AND state='provisioning' AND (do_droplet_id IS NULL OR do_droplet_id=$2)
+	`, id, doDropletID, strings.TrimSpace(ip))
+	if err != nil {
 		return fmt.Errorf("set droplet id: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("set droplet id: row is not a compatible provisioning reservation")
 	}
 	return tx.Commit(ctx)
 }
@@ -459,6 +464,31 @@ func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, 
 		return nil, fmt.Errorf("iterate droplets: %w", err)
 	}
 	return out, nil
+}
+
+// FindByNameAnyState resolves immutable rollout reservations even after their
+// lifecycle is terminal. It is deliberately not restricted to billable/live
+// states because a provider create can become visible after revocation.
+func (s *Store) FindByNameAnyState(ctx context.Context, name string) (*Droplet, error) {
+	var d Droplet
+	err := s.pool.QueryRow(ctx, `
+		SELECT id,name,node_id,do_droplet_id,region,size,capacity,state,
+		       ip_address,build_sha,last_seen_at,idle_since,drain_started_at,created_at,
+		       COALESCE(desired_build_sha,''),COALESCE(desired_common_policy_sha256,''),
+		       COALESCE(observed_build_sha,''),COALESCE(observed_common_policy_sha256,''),
+		       COALESCE(firewall_fingerprint,''),firewall_verified_at,rollout_generation,replacement_for_id,lease_admission_enabled
+		FROM recorder_droplets WHERE name=$1
+	`, name).Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
+		&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt,
+		&d.DesiredBuildSHA, &d.DesiredCommonPolicySHA256, &d.ObservedBuildSHA, &d.ObservedCommonPolicySHA256,
+		&d.FirewallFingerprint, &d.FirewallVerifiedAt, &d.RolloutGeneration, &d.ReplacementForID, &d.LeaseAdmissionEnabled)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find droplet by name: %w", err)
+	}
+	return &d, nil
 }
 
 // FindByDODropletID returns the droplet row for a DO droplet id, or (nil) if no

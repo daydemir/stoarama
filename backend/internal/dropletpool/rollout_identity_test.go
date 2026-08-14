@@ -1,9 +1,23 @@
 package dropletpool
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
+
+func renderedKernelPolicyFixtures() ([]byte, []byte) {
+	var v4, v6 []string
+	for _, rule := range expectedKernelFirewallRules {
+		family, line, _ := strings.Cut(rule, "|")
+		if family == "v4" {
+			v4 = append(v4, line)
+		} else {
+			v6 = append(v6, line)
+		}
+	}
+	return []byte(strings.Join(v4, "\n") + "\n"), []byte(strings.Join(v6, "\n") + "\n")
+}
 
 func testCommonPolicy(t *testing.T) (CommonPolicyIdentity, string) {
 	t.Helper()
@@ -45,17 +59,29 @@ func TestWorkerRolloutFactsAreServerDerivedAndBounded(t *testing.T) {
 	}
 }
 
-func TestDeriveKernelFirewallPolicyRejectsMissingAndExtraRules(t *testing.T) {
-	var v4, v6 []string
-	for _, rule := range expectedKernelFirewallRules {
-		family, line, _ := strings.Cut(rule, "|")
-		if family == "v4" {
-			v4 = append(v4, line)
-		} else {
-			v6 = append(v6, line)
-		}
+func TestDeriveKernelFirewallPolicyRejectsPrecedingOutputBypass(t *testing.T) {
+	v4, v6 := renderedKernelPolicyFixtures()
+	v4 = bytes.Replace(v4, []byte("-A OUTPUT -j STOARAMA_EGRESS"), []byte("-A OUTPUT -d 0.0.0.0/0 -j ACCEPT\n-A OUTPUT -j STOARAMA_EGRESS"), 1)
+	if _, err := DeriveKernelFirewallPolicy(v4, v6); err == nil {
+		t.Fatal("accepted an OUTPUT ACCEPT before the Stoarama hook")
 	}
-	valid, err := DeriveKernelFirewallPolicy([]byte(strings.Join(v4, "\n")+"\n"), []byte(strings.Join(v6, "\n")+"\n"))
+	v4, v6 = renderedKernelPolicyFixtures()
+	v6 = bytes.Replace(v6, []byte("-A OUTPUT -j STOARAMA_EGRESS"), []byte("-A OUTPUT -j ACCEPT\n-A OUTPUT -j STOARAMA_EGRESS"), 1)
+	if _, err := DeriveKernelFirewallPolicy(v4, v6); err == nil {
+		t.Fatal("accepted an IPv6 OUTPUT ACCEPT before the Stoarama hook")
+	}
+	v4, v6 = renderedKernelPolicyFixtures()
+	v4 = bytes.Replace(v4, []byte("-P OUTPUT ACCEPT\n"), nil, 1)
+	if _, err := DeriveKernelFirewallPolicy(v4, v6); err == nil {
+		t.Fatal("accepted a missing IPv4 OUTPUT default policy")
+	}
+}
+
+func TestDeriveKernelFirewallPolicyRejectsMissingAndExtraRules(t *testing.T) {
+	v4Bytes, v6Bytes := renderedKernelPolicyFixtures()
+	v4 := strings.Split(strings.TrimSuffix(string(v4Bytes), "\n"), "\n")
+	v6 := strings.Split(strings.TrimSuffix(string(v6Bytes), "\n"), "\n")
+	valid, err := DeriveKernelFirewallPolicy(v4Bytes, v6Bytes)
 	if err != nil || valid != strings.Join(sortedExpectedKernelFirewallRules(), "\n")+"\n" {
 		t.Fatalf("derive valid policy: %q %v", valid, err)
 	}
@@ -81,6 +107,11 @@ func TestValidateRolloutProviderFactsRequiresExactTagCoverageAndHeadroom(t *test
 	}
 	if err := validateRolloutProviderFacts(facts, facts.FirewallID, facts.FirewallRulesSHA256, recorderFirewallTag, 8, 1); err != nil {
 		t.Fatalf("valid facts: %v", err)
+	}
+	changed := append([]DODroplet(nil), facts.NonPoolDroplets...)
+	changed[0].Name = "replacement-with-same-provider-id"
+	if nonPoolSetDigest(changed) == nonPoolSetDigest(facts.NonPoolDroplets) {
+		t.Fatal("frozen non-pool identity ignored canonical object fields")
 	}
 	for name, mutate := range map[string]func(*RolloutProviderFacts){
 		"explicit ids instead of tag": func(f *RolloutProviderFacts) {

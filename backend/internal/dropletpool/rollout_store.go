@@ -269,12 +269,17 @@ func (s *Store) BeginUnswitchedRolloutDestroy(ctx context.Context, id int64, min
 	return true, tx.Commit(ctx)
 }
 
-func nonPoolSetDigest(ids []int64) string {
-	fields := []string{strconv.Itoa(len(ids))}
-	for _, id := range ids {
-		fields = append(fields, strconv.FormatInt(id, 10))
+func nonPoolSetDigest(objects []DODroplet) string {
+	objects = append([]DODroplet(nil), objects...)
+	sort.Slice(objects, func(i, j int) bool { return objects[i].ID < objects[j].ID })
+	fields := []string{strconv.Itoa(len(objects))}
+	for _, object := range objects {
+		tags := append([]string(nil), object.Tags...)
+		sort.Strings(tags)
+		fields = append(fields, strconv.FormatInt(object.ID, 10), object.Name, object.Region, object.Size,
+			object.Status, strconv.FormatBool(object.ProjectMember), strings.Join(tags, ","))
 	}
-	return typedDigest("stoarama-recorder-pool-nonpool-set-v1", fields...)
+	return typedDigest("stoarama-recorder-pool-nonpool-objects-v2", fields...)
 }
 
 func rolloutTargetDigest(cfg Config, commonPolicySHA256, frozenNonPoolSHA256 string) string {
@@ -297,7 +302,7 @@ func (s *Store) EnsureRollout(ctx context.Context, cfg Config, commonPolicySHA25
 	if err := validateProviderTargetObjects(facts, cfg); err != nil {
 		return PoolRollout{}, err
 	}
-	frozenNonPoolSHA := nonPoolSetDigest(facts.NonPoolDropletIDs)
+	frozenNonPoolSHA := nonPoolSetDigest(facts.NonPoolDroplets)
 	targetSHA := rolloutTargetDigest(cfg, commonPolicySHA256, frozenNonPoolSHA)
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -376,11 +381,14 @@ func (s *Store) AppendProviderObservation(ctx context.Context, generation int64,
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, rolloutFenceSQL); err != nil {
+		return 0, err
+	}
 	var expectedNonPool string
 	if err = tx.QueryRow(ctx, `SELECT frozen_nonpool_set_sha256 FROM recorder_pool_rollouts WHERE generation=$1`, generation).Scan(&expectedNonPool); err != nil {
 		return 0, err
 	}
-	if expectedNonPool != nonPoolSetDigest(facts.NonPoolDropletIDs) {
+	if expectedNonPool != nonPoolSetDigest(facts.NonPoolDroplets) {
 		return 0, fmt.Errorf("non-pool inventory drift")
 	}
 	digest := providerFactsDigest(facts)
@@ -483,7 +491,7 @@ func (s *Store) MarkRolloutStandbyReady(ctx context.Context, id int64) (bool, er
 	if _, err = tx.Exec(ctx, rolloutFenceSQL); err != nil {
 		return false, err
 	}
-	result, err := tx.Exec(ctx, `UPDATE recorder_droplets d SET state='standby_ready',lease_admission_enabled=false,observed_build_sha=d.desired_build_sha,observed_common_policy_sha256=r.common_policy_sha256 FROM recorder_pool_rollouts r WHERE d.id=$1 AND r.generation=d.rollout_generation AND r.status='running' AND d.state IN ('provisioning','standby_ready') AND d.do_droplet_id IS NOT NULL AND EXISTS(SELECT 1 FROM recorder_rollout_provider_observations p JOIN recorder_rollout_provider_objects po ON po.observation_id=p.id WHERE p.rollout_generation=d.rollout_generation AND p.observed_at>now()-interval '60 seconds' AND po.is_pool AND po.provider_droplet_id=d.do_droplet_id AND po.name=d.name AND po.region=d.region AND po.size_slug=d.size AND po.status='active' AND po.project_member AND po.pool_tag_present) AND EXISTS(SELECT 1 FROM recorder_worker_rollout_observations wo WHERE wo.droplet_id=d.id AND wo.observed_at>now()-interval '90 seconds' AND wo.executable_build_sha=d.desired_build_sha AND wo.capacity=r.worker_capacity AND wo.heartbeat_sec=r.heartbeat_sec AND wo.poll_sec=r.poll_sec AND wo.backend_api_origin=r.backend_api_origin AND wo.host_firewall_script_sha256=r.host_firewall_script_sha256 AND wo.kernel_firewall_policy_sha256=r.kernel_firewall_policy_sha256)`, id)
+	result, err := tx.Exec(ctx, `WITH candidate AS (SELECT d.id,latest.executable_build_sha,r.common_policy_sha256 FROM recorder_droplets d JOIN recorder_pool_rollouts r ON r.generation=d.rollout_generation AND r.status='running' CROSS JOIN LATERAL (SELECT wo.* FROM recorder_worker_rollout_observations wo WHERE wo.droplet_id=d.id ORDER BY wo.observed_at DESC,wo.id DESC LIMIT 1) latest WHERE d.id=$1 AND d.state IN ('provisioning','standby_ready') AND d.do_droplet_id IS NOT NULL AND EXISTS(SELECT 1 FROM recorder_rollout_provider_observations p JOIN recorder_rollout_provider_objects po ON po.observation_id=p.id WHERE p.rollout_generation=d.rollout_generation AND p.observed_at>=transaction_timestamp()-interval '60 seconds' AND p.observed_at<=transaction_timestamp() AND po.is_pool AND po.provider_droplet_id=d.do_droplet_id AND po.name=d.name AND po.region=d.region AND po.size_slug=d.size AND po.status='active' AND po.project_member AND po.pool_tag_present) AND latest.observed_at>=transaction_timestamp()-interval '90 seconds' AND latest.observed_at<=transaction_timestamp() AND latest.executable_build_sha=d.desired_build_sha AND latest.capacity=r.worker_capacity AND latest.heartbeat_sec=r.heartbeat_sec AND latest.poll_sec=r.poll_sec AND latest.backend_api_origin=r.backend_api_origin AND latest.host_firewall_script_sha256=r.host_firewall_script_sha256 AND latest.kernel_firewall_policy_sha256=r.kernel_firewall_policy_sha256) UPDATE recorder_droplets d SET state='standby_ready',lease_admission_enabled=false,observed_build_sha=c.executable_build_sha,observed_common_policy_sha256=c.common_policy_sha256 FROM candidate c WHERE d.id=c.id`, id)
 	if err != nil {
 		return false, err
 	}
@@ -558,7 +566,7 @@ func (s *Store) SwitchRolloutReplacement(ctx context.Context, replacementID, pro
 	if capacity-oldCapacity+newCapacity < minimumCapacity {
 		return false, fmt.Errorf("atomic switch would reduce claimable capacity below %d", minimumCapacity)
 	}
-	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET state='rollout_draining',lease_admission_enabled=false,drain_started_at=now(),rollout_generation=$2,rollout_ordinal=0,replacement_for_id=NULL WHERE id=$1`, oldID, generation); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET state='rollout_draining',lease_admission_enabled=false,drain_started_at=now(),rollout_generation=$2,rollout_ordinal=0,replacement_for_id=NULL,desired_build_sha=$3,desired_common_policy_sha256=$4 WHERE id=$1`, oldID, generation, targetBuild, targetPolicy); err != nil {
 		return false, err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET state='active',lease_admission_enabled=true,idle_since=NULL WHERE id=$1`, replacementID); err != nil {
@@ -631,9 +639,6 @@ func (s *Store) FailAbsentRolloutReservation(ctx context.Context, id int64, olde
 			return nil, nil, false, err
 		}
 	}
-	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET state='failed',lease_admission_enabled=false,provision_error='provider object absent after bounded recovery' WHERE id=$1`, id); err != nil {
-		return nil, nil, false, err
-	}
 	if tokenID != nil {
 		if _, err = tx.Exec(ctx, `UPDATE node_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE id=$1`, *tokenID); err != nil {
 			return nil, nil, false, err
@@ -643,6 +648,9 @@ func (s *Store) FailAbsentRolloutReservation(ctx context.Context, id int64, olde
 		if _, err = tx.Exec(ctx, `UPDATE nodes SET status='disabled' WHERE id=$1`, *nodeID); err != nil {
 			return nil, nil, false, err
 		}
+	}
+	if _, err = tx.Exec(ctx, `UPDATE recorder_droplets SET state='failed',lease_admission_enabled=false,provision_error='provider object absent after bounded recovery' WHERE id=$1`, id); err != nil {
+		return nil, nil, false, err
 	}
 	return nodeID, tokenID, true, tx.Commit(ctx)
 }
@@ -656,7 +664,7 @@ func (s *Store) CompleteRollout(ctx context.Context, generation int64) (bool, er
 	if _, err = tx.Exec(ctx, rolloutFenceSQL); err != nil {
 		return false, err
 	}
-	result, err := tx.Exec(ctx, `UPDATE recorder_pool_rollouts r SET status='complete',completed_at=now() WHERE generation=$1 AND status='running' AND EXISTS(SELECT 1 FROM recorder_rollout_provider_observations p WHERE p.rollout_generation=r.generation AND p.phase='post_delete' AND p.observed_at>now()-interval '60 seconds' AND p.pool_droplet_count=8 AND p.account_droplet_count=10) AND NOT EXISTS(SELECT 1 FROM recorder_droplets d WHERE d.state IN ('provisioning','standby_ready','rollout_draining','destroying') OR (d.state='active' AND d.lease_admission_enabled AND (d.observed_build_sha<>r.to_build_sha OR d.observed_common_policy_sha256<>r.common_policy_sha256)))`, generation)
+	result, err := tx.Exec(ctx, `UPDATE recorder_pool_rollouts r SET status='complete',completed_at=transaction_timestamp() WHERE generation=$1 AND status='running' AND EXISTS(SELECT 1 FROM recorder_rollout_provider_observations p WHERE p.rollout_generation=r.generation AND p.phase='post_delete' AND p.observed_at>=transaction_timestamp()-interval '60 seconds' AND p.observed_at<=transaction_timestamp() AND p.pool_droplet_count=r.steady_workers AND p.account_droplet_count=r.steady_account_droplets) AND (SELECT count(*) FROM recorder_droplets WHERE state IN ('provisioning','standby_ready','active','rollout_draining','draining','destroying'))=r.steady_workers AND NOT EXISTS(SELECT 1 FROM recorder_droplets d WHERE d.state IN ('provisioning','standby_ready','rollout_draining','draining','destroying') OR (d.state='active' AND (NOT d.lease_admission_enabled OR d.rollout_generation IS DISTINCT FROM r.generation OR d.observed_build_sha IS DISTINCT FROM r.to_build_sha OR d.observed_common_policy_sha256 IS DISTINCT FROM r.common_policy_sha256)) OR (d.state='active' AND d.lease_admission_enabled AND NOT EXISTS(SELECT 1 FROM LATERAL (SELECT o.* FROM recorder_worker_rollout_observations o WHERE o.droplet_id=d.id ORDER BY o.observed_at DESC,o.id DESC LIMIT 1) latest WHERE latest.observed_at>=transaction_timestamp()-interval '90 seconds' AND latest.observed_at<=transaction_timestamp() AND latest.executable_build_sha=r.to_build_sha AND latest.capacity=r.worker_capacity AND latest.heartbeat_sec=r.heartbeat_sec AND latest.poll_sec=r.poll_sec AND latest.backend_api_origin=r.backend_api_origin AND latest.host_firewall_script_sha256=r.host_firewall_script_sha256 AND latest.kernel_firewall_policy_sha256=r.kernel_firewall_policy_sha256)))`, generation)
 	if err != nil {
 		return false, err
 	}
@@ -769,7 +777,7 @@ func (s *Store) FinalizeAbsentRolloutWorker(ctx context.Context, id int64, minim
 
 func (s *Store) NextReplacementIdentity(ctx context.Context, rollout PoolRollout) (name string, err error) {
 	var ordinal int
-	if err = s.pool.QueryRow(ctx, `SELECT count(*)+1 FROM recorder_droplets WHERE rollout_generation=$1`, rollout.Generation).Scan(&ordinal); err != nil {
+	if err = s.pool.QueryRow(ctx, `SELECT COALESCE(max(rollout_ordinal) FILTER(WHERE rollout_ordinal>0),0)+1 FROM recorder_droplets WHERE rollout_generation=$1`, rollout.Generation).Scan(&ordinal); err != nil {
 		return "", err
 	}
 	name = fmt.Sprintf("%srollout-%d-%d", NamePrefix, rollout.Generation, ordinal)
