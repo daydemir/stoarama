@@ -282,6 +282,7 @@ func (s *Server) router() http.Handler {
 		})
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
+		api.Post("/recordings/campaign-admission/replay", s.handleRecordingCampaignAdmissionReplay)
 		api.Route("/account", func(account chi.Router) {
 			account.Use(s.requireAccountAuth)
 			// Confine a 'stoarama.pull'-scoped key to the 4 NAS pull endpoints; a
@@ -310,6 +311,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/campaign-admission/scene-presentations/{evidenceId}", s.handleAccountCampaignAdmissionScenePresentationGet)
 			account.Post("/recordings/campaign-admission/scene-reviews", s.handleAccountCampaignAdmissionSceneReviewCreate)
 			account.Post("/recordings/qualification/scene-attest", s.handleAccountRecordingSceneAttest)
+			account.Get("/recordings/qualification/scene-presentations/{frameId}", s.handleAccountRecordingBaselineScenePresentation)
 			account.Post("/recordings/qualification/build", s.handleAccountRecordingQualificationBuild)
 			account.Get("/recordings.csv", s.handleAccountRecordingsCSV)
 			account.Post("/recordings", s.handleAccountRecordingsCreate)

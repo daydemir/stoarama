@@ -461,6 +461,36 @@ func TestUpdateDrainRefusesNewLeases(t *testing.T) {
 	}
 }
 
+func TestTargetedProbeCannotPreemptOrdinaryLeasePoll(t *testing.T) {
+	var pathsMu sync.Mutex
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathsMu.Lock()
+		paths = append(paths, r.URL.Path)
+		pathsMu.Unlock()
+		if r.URL.Path == "/api/v1/recording/jobs/lease" {
+			http.Error(w, "stop after authoritative footage poll", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "targeted probe polled before footage", http.StatusConflict)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.drain(context.Background(), make(chan struct{}, 1), &sync.WaitGroup{})
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+	if len(paths) != 1 || paths[0] != "/api/v1/recording/jobs/lease" {
+		t.Fatalf("lease order = %v, want footage poll only", paths)
+	}
+}
+
 func TestUpdateDrainStopsStalledContinuousCapture(t *testing.T) {
 	oldInterval := continuousUpdateDrainPollInterval
 	continuousUpdateDrainPollInterval = time.Millisecond

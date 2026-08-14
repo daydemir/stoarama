@@ -69,7 +69,10 @@ func (f *campaignProbeStoreFixture) OpenExact(_ context.Context, key, etag, vers
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	object, ok := f.objects[key]
-	if !ok || object.etag != etag || object.version != version {
+	// Legacy frame evidence predates object-version persistence. Its immutable
+	// media row still seals the exact ETag, while targeted probe evidence seals
+	// both ETag and version. Keep the fixture faithful to both production paths.
+	if !ok || object.etag != etag || (version != "" && object.version != version) {
 		return nil, fmt.Errorf("fixture exact object mismatch")
 	}
 	return io.NopCloser(bytes.NewReader(append([]byte(nil), object.body...))), nil
@@ -300,12 +303,16 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	s.cfg = config.Config{
 		DropletPoolOperatorEmail: "deniz@example.test", DropletPoolBuildSHA: buildSHA,
 		DropletPoolProjectID: "project-test", DropletPoolFirewallID: "firewall-test",
-		DropletPoolMax: 9, DropletPoolCapacity: 5, R2SignPutTTL: time.Minute,
+		DropletPoolMax: 9, DropletPoolCapacity: 5, DropletPoolSize: "s-2vcpu-4gb", R2SignPutTTL: time.Minute,
 	}
 	store := &campaignProbeStoreFixture{}
 	s.campaignProbeStore = store
 	s.campaignDOAttest = func(_ context.Context, dropletID int64, name string) (dropletpool.ProviderAttestation, error) {
-		return dropletpool.ProviderAttestation{DropletID: dropletID, Name: name, Region: "nyc1", Status: "active"}, nil
+		region := "nyc1"
+		if dropletID == 1000 {
+			region = "sfo3"
+		}
+		return dropletpool.ProviderAttestation{DropletID: dropletID, Name: name, Region: region, SizeSlug: "s-2vcpu-4gb", Status: "active"}, nil
 	}
 	userID, accountID := seedUserOrg(t, pool, "deniz@example.test", true)
 	_, infrastructureAccountID := seedUserOrg(t, pool, "cloud-infrastructure@example.test", false)
@@ -324,16 +331,15 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var frameID, mediaID int64
-	frameSHA := strings.Repeat("1", 64)
-	sceneSHA := strings.Repeat("2", 64)
-	if err := pool.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256) VALUES('r2','admission','scene.jpg','image/jpeg',1,$1) RETURNING id`, frameSHA).Scan(&mediaID); err != nil {
+	baselineFrame := []byte("exact reviewed baseline frame bytes")
+	frameETag := store.put("scene.jpg", "image/jpeg", baselineFrame)
+	frameSHA := sha256Hex(baselineFrame)
+	sceneSHA := sha256Hex([]byte("stoarama-scene-identity-v1\napproved scene"))
+	if err := pool.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,etag,sha256) VALUES('r2','admission','scene.jpg','image/jpeg',$1,$2,$3) RETURNING id`, len(baselineFrame), frameETag, frameSHA).Scan(&mediaID); err != nil {
 		t.Fatal(err)
 	}
 	capturedAt := time.Now().UTC().Add(-time.Minute)
 	if err := pool.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,$2,$3,'success','live') RETURNING id`, streamID, capturedAt, mediaID).Scan(&frameID); err != nil {
-		t.Fatal(err)
-	}
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_scene_frame_evidence(account_id,stream_id,frame_id,media_object_id,captured_at,frame_sha256,scene_identity_sha256,verification_method,verified_by_user_id,evidence_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,'operator_visual',$8,$9) RETURNING id`, accountID, streamID, frameID, mediaID, capturedAt, frameSHA, sceneSHA, userID, strings.Repeat("0", 64)).Scan(&sceneEvidenceID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,'worker-test','local_recorder','active',now(),1) RETURNING id`, infrastructureAccountID).Scan(&nodeID); err != nil {
@@ -342,7 +348,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'campaign01',$2)`, nodeID, hashSecret("node-token")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recorder_droplets(name,node_id,do_droplet_id,region,size,capacity,state,last_seen_at,build_sha) VALUES('worker-test',$1,999,'nyc1','s-1vcpu-1gb',5,'active',now(),$2)`, nodeID, buildSHA); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recorder_droplets(name,node_id,do_droplet_id,region,size,capacity,state,last_seen_at,build_sha) VALUES('worker-test',$1,999,'nyc1','s-2vcpu-4gb',5,'active',now(),$2)`, nodeID, buildSHA); err != nil {
 		t.Fatal(err)
 	}
 	var standbyNodeID int64
@@ -352,7 +358,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'campaign02',$2)`, standbyNodeID, hashSecret("standby-node-token")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recorder_droplets(name,node_id,do_droplet_id,region,size,capacity,state,last_seen_at,build_sha) VALUES('worker-standby',$1,1000,'sfo3','s-1vcpu-1gb',5,'active',now(),$2)`, standbyNodeID, buildSHA); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recorder_droplets(name,node_id,do_droplet_id,region,size,capacity,state,last_seen_at,build_sha) VALUES('worker-standby',$1,1000,'sfo3','s-2vcpu-4gb',5,'active',now(),$2)`, standbyNodeID, buildSHA); err != nil {
 		t.Fatal(err)
 	}
 	var nasKeyID, nasConnectionID, baselineRecordingID int64
@@ -375,9 +381,33 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	}
 	start := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	end := start.Add(24 * time.Hour)
-	schedule := batchScheduleRequest{TargetAccountID: accountID, StreamIDs: []int64{streamID}, StreamTimezones: []streamTimezoneInput{{StreamID: streamID, Timezone: "Europe/Berlin"}}, NamingProfile: "stoarama_v1", Mode: "continuous", ClipDurationSec: 60, DailyWindowStart: "06:00", DailyWindowEnd: "18:00", ActiveWeekdays: []int{1, 2, 3, 4, 5, 6, 7}, StartAt: &start, EndAt: &end, StorageDestinationID: destinationID, Delivery: "managed"}
-	approvalBody, _ := json.Marshal(campaignAdmissionApprovalRequest{RequestID: uuid.NewString(), DeadlineAt: end, AuthorityCode: "deniz_fd_restore_20260814", FailureDomainTag: "FD", Entries: []campaignAdmissionApprovalEntry{{StreamID: streamID, SourceRevisionID: revisionID, SourceURL: "https://source.example/live.m3u8", SourcePageURL: "https://source.example/page", Provider: "publisher", ExternalID: "scene-1", NormalizedLabel: "approvedscene", SceneFrameEvidenceID: sceneEvidenceID, SceneIdentitySHA256: sceneSHA}}, Schedule: schedule})
 	router := s.router()
+	presentationRequestID := uuid.NewString()
+	presentationReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/account/recordings/qualification/scene-presentations/%d?stream_id=%d&authority_code=deniz_fd_restore_20260814&request_id=%s", frameID, streamID, presentationRequestID), nil)
+	presentationReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	presentationRec := httptest.NewRecorder()
+	router.ServeHTTP(presentationRec, presentationReq)
+	if presentationRec.Code != http.StatusOK || presentationRec.Header().Get("X-Content-SHA256") != frameSHA {
+		t.Fatalf("baseline presentation status=%d headers=%v body=%s", presentationRec.Code, presentationRec.Header(), presentationRec.Body.String())
+	}
+	presentationID := presentationRec.Header().Get("X-Stoarama-Presentation-ID")
+	attestBody, _ := json.Marshal(sceneAttestRequest{StreamID: streamID, AuthorityCode: "deniz_fd_restore_20260814", FrameID: frameID, PresentationID: presentationID, SceneIdentity: "Approved Scene"})
+	attestReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", bytes.NewReader(attestBody))
+	attestReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	attestRec := httptest.NewRecorder()
+	router.ServeHTTP(attestRec, attestReq)
+	if attestRec.Code != http.StatusOK {
+		t.Fatalf("baseline attest status=%d body=%s", attestRec.Code, attestRec.Body.String())
+	}
+	var baselineEvidence struct {
+		EvidenceID int64 `json:"evidence_id"`
+	}
+	if err := json.Unmarshal(attestRec.Body.Bytes(), &baselineEvidence); err != nil || baselineEvidence.EvidenceID <= 0 {
+		t.Fatalf("decode baseline evidence: err=%v body=%s", err, attestRec.Body.String())
+	}
+	sceneEvidenceID = baselineEvidence.EvidenceID
+	schedule := batchScheduleRequest{TargetAccountID: accountID, StreamIDs: []int64{streamID}, StreamTimezones: []streamTimezoneInput{{StreamID: streamID, Timezone: "Europe/Berlin"}}, NamingProfile: "stoarama_v1", Mode: "continuous", ClipDurationSec: 60, DailyWindowStart: "06:00", DailyWindowEnd: "18:00", ActiveWeekdays: []int{1, 2, 3, 4, 5, 6, 7}, StartAt: &start, EndAt: &end, StorageDestinationID: destinationID, Delivery: "nas_pull"}
+	approvalBody, _ := json.Marshal(campaignAdmissionApprovalRequest{RequestID: uuid.NewString(), DeadlineAt: end, AuthorityCode: "deniz_fd_restore_20260814", FailureDomainTag: "FD", Entries: []campaignAdmissionApprovalEntry{{StreamID: streamID, SourceRevisionID: revisionID, SourceURL: "https://source.example/live.m3u8", SourcePageURL: "https://source.example/page", Provider: "publisher", ExternalID: "scene-1", NormalizedLabel: "approvedscene", SceneFrameEvidenceID: sceneEvidenceID, SceneIdentitySHA256: sceneSHA}}, Schedule: schedule})
 	postApproval := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/campaign-admission/approvals", bytes.NewReader(approvalBody))
 		req.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
@@ -412,7 +442,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatalf("probe order status=%d body=%s", order.Code, order.Body.String())
 	}
 	orderReplay := postOperator("/api/v1/account/recordings/campaign-admission/probe-orders", probeOrderBody)
-	if orderReplay.Code != http.StatusOK || orderReplay.Body.String() != order.Body.String() {
+	if orderReplay.Code != http.StatusCreated || orderReplay.Body.String() != order.Body.String() {
 		t.Fatalf("probe-order replay changed: first=%s second=%s", order.Body.String(), orderReplay.Body.String())
 	}
 	postNode := func(path string, body any) *httptest.ResponseRecorder {
@@ -517,9 +547,37 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if firstSchedule.Code != http.StatusOK {
 		t.Fatalf("complete server-observed evidence did not activate schedule: status=%d body=%s", firstSchedule.Code, firstSchedule.Body.String())
 	}
-	secondSchedule := postSchedule()
+	var sealedBatch batchScheduleResponse
+	if err := json.Unmarshal(firstSchedule.Body.Bytes(), &sealedBatch); err != nil || sealedBatch.CapacityObservation == "" || sealedBatch.StorageObservation == "" || sealedBatch.ForecastPeakSlots <= 0 || sealedBatch.UsableAfterLoss <= 0 || sealedBatch.RequiredFreeBytes <= 0 || sealedBatch.ProjectedFreeBytes < 0 {
+		t.Fatalf("DB-canonical capacity/NAS authority missing: err=%v response=%+v", err, sealedBatch)
+	}
+	var admittedRecordingID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active'`, accountID, streamID).Scan(&admittedRecordingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET next_fire_at=NULL WHERE id=$1`, admittedRecordingID); err == nil {
+		t.Fatal("runtime direct SQL cleared the sealed next-fire schedule")
+	}
+	var aliasStreamID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone) VALUES('other','other-scene','Other Scene','other-scene','https://other.example/live.m3u8','https://other.example/page','hls','video_manifest','video_live','continuous_video',30,'UTC') RETURNING id`).Scan(&aliasStreamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET stream_id=$2,stream_url='https://other.example/live.m3u8',name='Other Scene' WHERE id=$1`, admittedRecordingID, aliasStreamID); err == nil {
+		t.Fatal("runtime direct SQL rebound an admitted active recording")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET provider='mutated-provider' WHERE id=$1`, streamID); err == nil {
+		t.Fatal("runtime direct SQL mutated the admitted source identity")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE account_sessions SET revoked_at=now() WHERE session_hash=$1; UPDATE recorder_droplets SET state='draining' WHERE node_id IN($2,$3)`, hashSecret(rawSession), nodeID, standbyNodeID); err != nil {
+		t.Fatal(err)
+	}
+	replayBody, _ := json.Marshal(campaignAdmissionReplayRequest{ApprovalID: approvalResponse.ApprovalID, TargetAccountID: accountID})
+	replayReq := httptest.NewRequest(http.MethodPost, "/api/v1/recordings/campaign-admission/replay", bytes.NewReader(replayBody))
+	replayReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	secondSchedule := httptest.NewRecorder()
+	router.ServeHTTP(secondSchedule, replayReq)
 	if secondSchedule.Code != http.StatusOK || secondSchedule.Body.String() != firstSchedule.Body.String() {
-		t.Fatalf("sealed admission replay changed: first=%s second=%s", firstSchedule.Body.String(), secondSchedule.Body.String())
+		t.Fatalf("sealed admission replay after session/provider revocation changed: first=%s second=%s", firstSchedule.Body.String(), secondSchedule.Body.String())
 	}
 	var recordings, attempts, evidenceRows, results, commits int
 	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM recordings WHERE account_id=$1 AND stream_id=$2),(SELECT count(*) FROM recording_targeted_probe_attempts WHERE account_id=$1 AND stream_id=$2),(SELECT count(*) FROM recording_targeted_probe_evidence WHERE account_id=$1 AND stream_id=$2),(SELECT count(*) FROM recording_campaign_admission_results WHERE account_id=$1)`, accountID, streamID).Scan(&recordings, &attempts, &evidenceRows, &results); err != nil {

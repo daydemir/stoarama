@@ -293,11 +293,23 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			<-sem
 			return
 		}
-		if !w.cfg.SkipDropletHeartbeat {
+		// Footage always wins the slot. A targeted qualification probe may be
+		// claimed only after the ordinary lease endpoint has authoritatively said
+		// that no recording job is due for this worker.
+		job, err := w.cfg.Client.LeaseRecordingJobWithSurrenderTransport(ctx, w.surrenderTransportEnabled())
+		if err != nil {
+			if w.cfg.LeaseGate != nil {
+				w.cfg.LeaseGate.RUnlock()
+			}
+			<-sem
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("recording worker lease error: %v", err)
+			}
+			return
+		}
+		if job == nil && !w.cfg.SkipDropletHeartbeat {
 			probe, probeErr := w.cfg.Client.LeaseTargetedProbe(ctx)
 			if probeErr != nil && !errors.Is(probeErr, context.Canceled) {
-				// Provider attestation or an empty queue must never prevent ordinary
-				// recording work from being leased.
 				log.Printf("recording worker targeted probe lease error: %v", probeErr)
 			}
 			if probe != nil {
@@ -312,17 +324,6 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 				}(*probe)
 				continue
 			}
-		}
-		job, err := w.cfg.Client.LeaseRecordingJobWithSurrenderTransport(ctx, w.surrenderTransportEnabled())
-		if err != nil {
-			if w.cfg.LeaseGate != nil {
-				w.cfg.LeaseGate.RUnlock()
-			}
-			<-sem
-			if !errors.Is(err, context.Canceled) {
-				log.Printf("recording worker lease error: %v", err)
-			}
-			return
 		}
 		if job == nil {
 			if w.cfg.LeaseGate != nil {

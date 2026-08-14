@@ -12,11 +12,13 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/util"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -32,11 +34,12 @@ func invalidQualification(format string, args ...any) error {
 }
 
 type sceneAttestRequest struct {
-	RecordingID   int64  `json:"recording_id"`
-	StreamID      int64  `json:"stream_id"`
-	AuthorityCode string `json:"authority_code"`
-	FrameID       int64  `json:"frame_id"`
-	SceneIdentity string `json:"scene_identity"`
+	RecordingID    int64  `json:"recording_id"`
+	StreamID       int64  `json:"stream_id"`
+	AuthorityCode  string `json:"authority_code"`
+	FrameID        int64  `json:"frame_id"`
+	PresentationID string `json:"presentation_id,omitempty"`
+	SceneIdentity  string `json:"scene_identity"`
 }
 
 func decodeQualificationJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -88,15 +91,24 @@ func (s *Server) handleAccountRecordingSceneAttest(w http.ResponseWriter, r *htt
 			util.WriteError(w, http.StatusForbidden, "candidate scene attestation requires the exact operator browser session")
 			return
 		}
-		var permitted bool
-		if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_campaign_authority_decisions WHERE code=$1 AND $2=ANY(permitted_stream_ids))`, req.AuthorityCode, req.StreamID).Scan(&permitted); err != nil || !permitted {
-			util.WriteError(w, http.StatusConflict, "candidate stream is not covered by an immutable Deniz authority decision")
-			return
-		}
 	}
 	sceneHash := sha256Hex([]byte("stoarama-scene-identity-v1\n" + identity))
 	var evidenceID int64
 	var evidenceHash string
+	if req.StreamID > 0 {
+		presentationID, parseErr := uuid.Parse(strings.TrimSpace(req.PresentationID))
+		if parseErr != nil || s.admissionPool == nil || principal.SessionID == nil {
+			util.WriteError(w, http.StatusBadRequest, "candidate scene attestation requires an exact baseline presentation_id")
+			return
+		}
+		err = s.admissionPool.QueryRow(r.Context(), `SELECT evidence_id,evidence_sha256 FROM recording_campaign_attest_baseline_scene($1,$2,$3,$4,$5,$6,$7)`, presentationID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, req.FrameID, sceneHash).Scan(&evidenceID, &evidenceHash)
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, "baseline presentation/source fence changed")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": int64(0), "stream_id": req.StreamID, "frame_id": req.FrameID, "presentation_id": presentationID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
+		return
+	}
 	err = s.pool.QueryRow(r.Context(), `
 		WITH selected_stream AS (
 		 SELECT rec.stream_id FROM recordings rec WHERE $2>0 AND rec.id=$2 AND rec.account_id=$1 AND rec.status IN('active','completed')
@@ -127,6 +139,52 @@ func (s *Server) handleAccountRecordingSceneAttest(w http.ResponseWriter, r *htt
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": req.RecordingID, "stream_id": req.StreamID, "frame_id": req.FrameID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
+}
+
+func (s *Server) handleAccountRecordingBaselineScenePresentation(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	store := s.campaignProbeObjects()
+	if !ok || principal.UserID == 0 || principal.SessionID == nil || principal.Role != accountRoleAdmin ||
+		!strings.EqualFold(strings.TrimSpace(principal.Email), strings.TrimSpace(s.cfg.DropletPoolOperatorEmail)) || store == nil || s.admissionPool == nil {
+		util.WriteError(w, http.StatusForbidden, "exact operator session and evidence store required")
+		return
+	}
+	frameID, ok := parseInt64Path(w, r, "frameId")
+	if !ok {
+		return
+	}
+	streamID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("stream_id")), 10, 64)
+	requestID, requestErr := uuid.Parse(strings.TrimSpace(r.URL.Query().Get("request_id")))
+	authorityCode := strings.TrimSpace(r.URL.Query().Get("authority_code"))
+	if err != nil || requestErr != nil || streamID <= 0 || authorityCode == "" {
+		util.WriteError(w, http.StatusBadRequest, "stream_id, authority_code, and request_id are required")
+		return
+	}
+	var presentationID uuid.UUID
+	var frameSHA, key, etag string
+	var size int64
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT frame_sha256,media_object_key,media_etag,media_size_bytes FROM recording_campaign_read_baseline_scene($1,$2,$3,$4,$5,$6,$7)`, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, authorityCode, streamID, frameID).Scan(&frameSHA, &key, &etag, &size)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "baseline frame is not current and decision-authorized")
+		return
+	}
+	body, err := readExactObjectBounded(r.Context(), store.OpenExact, key, etag, "", size, targetedProbeFrameMaxBytes)
+	if err != nil || sha256Hex(body) != frameSHA {
+		util.WriteError(w, http.StatusConflict, "baseline frame bytes are unavailable or changed")
+		return
+	}
+	var sealedSHA, sealedKey, sealedETag string
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT presentation_id,frame_sha256,media_object_key,media_etag FROM recording_campaign_present_baseline_scene($1,$2,$3,$4,$5,$6,$7,$8)`, requestID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, authorityCode, streamID, frameID).Scan(&presentationID, &sealedSHA, &sealedKey, &sealedETag)
+	if err != nil || sealedSHA != frameSHA || sealedKey != key || sealedETag != etag {
+		util.WriteError(w, http.StatusConflict, "baseline frame/source changed before presentation receipt")
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("X-Stoarama-Presentation-ID", presentationID.String())
+	w.Header().Set("X-Content-SHA256", frameSHA)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 type qualificationBuildRequest struct {

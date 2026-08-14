@@ -55,97 +55,6 @@ type campaignAdmissionStoredEntry struct {
 	SceneIdentitySHA256    string `json:"scene_identity_sha256"`
 }
 
-func bindCampaignAdmissionEvidence(ctx context.Context, tx pgx.Tx, approvalID uuid.UUID, accountID int64, actorUserID int64, streams []batchStream, endAt *time.Time, currentBuildSHA string, scheduleSpec []byte, lock bool) (time.Time, error) {
-	lockSQL := ""
-	if lock {
-		lockSQL = " FOR UPDATE OF a"
-	}
-	var deadline time.Time
-	var approvalActor int64
-	var scheduleSHA string
-	err := tx.QueryRow(ctx, `SELECT deadline_at,actor_user_id,schedule_sha256 FROM recording_campaign_admission_approvals a WHERE id=$1 AND account_id=$2 AND schedule_sha256=encode(sha256(convert_to($3::jsonb::text,'UTF8')),'hex')`+lockSQL, approvalID, accountID, scheduleSpec).Scan(&deadline, &approvalActor, &scheduleSHA)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("load exact campaign approval: %w", err)
-	}
-	now := time.Now().UTC()
-	if !deadline.After(now) || endAt == nil || endAt.After(deadline) {
-		return time.Time{}, fmt.Errorf("campaign admission schedule requires end_at no later than the live approval deadline")
-	}
-	if approvalActor <= 0 || actorUserID <= 0 {
-		return time.Time{}, fmt.Errorf("campaign admission actor binding is missing")
-	}
-	rows, err := tx.Query(ctx, `
-		SELECT first_e.id::text,second_e.id::text,ar.stream_id,ar.scene_identity_sha256,second_e.media_sha256,second_e.observed_at
-		FROM recording_campaign_admission_approvals a
-		JOIN recording_campaign_admission_reservations ar ON ar.approval_id=a.id
-		JOIN streams s ON s.id=ar.stream_id AND s.deleted_at IS NULL
-		JOIN LATERAL (SELECT e.*,pa.probe_build_sha,pa.source_revision_id,pa.source_url_sha256,pa.source_page_url_sha256,pa.source_updated_at,pa.challenge,pa.attempt_no FROM recording_targeted_probe_attempts pa LEFT JOIN recording_targeted_probe_evidence e ON e.attempt_id=pa.id WHERE pa.approval_id=a.id AND pa.stream_id=ar.stream_id ORDER BY pa.attempt_no DESC LIMIT 1 OFFSET 1) first_e ON true
-		JOIN LATERAL (SELECT e.*,pa.probe_build_sha,pa.source_revision_id,pa.source_url_sha256,pa.source_page_url_sha256,pa.source_updated_at,pa.challenge,pa.attempt_no FROM recording_targeted_probe_attempts pa LEFT JOIN recording_targeted_probe_evidence e ON e.attempt_id=pa.id WHERE pa.approval_id=a.id AND pa.stream_id=ar.stream_id ORDER BY pa.attempt_no DESC LIMIT 1) second_e ON true
-		JOIN recording_targeted_probe_scene_reviews first_review ON first_review.probe_evidence_id=first_e.id
-		JOIN recording_targeted_probe_scene_reviews second_review ON second_review.probe_evidence_id=second_e.id
-		WHERE a.id=$1 AND a.account_id=$2
-		  AND (a.failure_domain_tag IS NULL OR a.failure_domain_tag=ANY(s.tags))
-		  AND first_e.probe_build_sha=$3 AND second_e.probe_build_sha=$3
-		  AND first_e.result='ok' AND second_e.result='ok'
-		  AND second_e.attempt_no=first_e.attempt_no+1
-		  AND second_e.observed_at>=first_e.observed_at+interval '60 seconds'
-		  AND first_e.observed_at>=transaction_timestamp()-interval '6 hours'
-		  AND second_e.observed_at>=transaction_timestamp()-interval '6 hours'
-		  AND first_e.challenge<>second_e.challenge
-		  AND first_e.frame_sha256<>second_e.frame_sha256
-		  AND first_e.media_sha256<>second_e.media_sha256
-		  AND first_review.approval_id=a.id AND second_review.approval_id=a.id
-		  AND first_review.scene_frame_evidence_id=ar.scene_frame_evidence_id AND second_review.scene_frame_evidence_id=ar.scene_frame_evidence_id
-		  AND first_review.scene_identity_sha256=ar.scene_identity_sha256 AND second_review.scene_identity_sha256=ar.scene_identity_sha256
-		  AND first_review.probe_frame_sha256=first_e.frame_sha256 AND second_review.probe_frame_sha256=second_e.frame_sha256
-		  AND first_review.reviewed_at>=transaction_timestamp()-interval '6 hours' AND second_review.reviewed_at>=transaction_timestamp()-interval '6 hours'
-		  AND (first_e.native_signature_sha256,first_e.source_revision_id,first_e.source_url_sha256,first_e.source_page_url_sha256,first_e.source_updated_at) IS NOT DISTINCT FROM
-		      (second_e.native_signature_sha256,second_e.source_revision_id,second_e.source_url_sha256,second_e.source_page_url_sha256,second_e.source_updated_at)
-		  AND ar.source_revision_id IS NOT DISTINCT FROM second_e.source_revision_id
-		  AND ar.source_updated_at=second_e.source_updated_at
-		  AND ar.source_url_sha256=encode(sha256(convert_to(s.source_url,'UTF8')),'hex')
-		  AND ar.source_page_url_sha256=encode(sha256(convert_to(COALESCE(s.source_page_url,''),'UTF8')),'hex')
-		  AND NOT EXISTS(SELECT 1 FROM recording_campaign_admission_source_fence_events f WHERE f.stream_id=ar.stream_id AND f.occurred_at>=ar.reserved_at)
-		ORDER BY ar.stream_id
-	`, approvalID, accountID, strings.ToLower(strings.TrimSpace(currentBuildSHA)))
-	if err != nil {
-		return time.Time{}, fmt.Errorf("load targeted campaign evidence: %w", err)
-	}
-	defer rows.Close()
-	type evidenceBinding struct {
-		first, second, scene, media string
-		observed                    time.Time
-	}
-	byStream := make(map[int64]evidenceBinding, len(streams))
-	for rows.Next() {
-		var firstID, secondID, scene, mediaSHA string
-		var streamID int64
-		var observed time.Time
-		if err := rows.Scan(&firstID, &secondID, &streamID, &scene, &mediaSHA, &observed); err != nil {
-			return time.Time{}, fmt.Errorf("scan targeted campaign evidence: %w", err)
-		}
-		byStream[streamID] = evidenceBinding{first: firstID, second: secondID, scene: scene, media: mediaSHA, observed: observed.UTC()}
-	}
-	if err := rows.Err(); err != nil {
-		return time.Time{}, fmt.Errorf("iterate targeted campaign evidence: %w", err)
-	}
-	if len(byStream) != len(streams) {
-		return time.Time{}, fmt.Errorf("every approved stream requires fresh complete current-build DO evidence")
-	}
-	for i := range streams {
-		evidence, ok := byStream[streams[i].id]
-		if !ok {
-			return time.Time{}, fmt.Errorf("stream %d is not exactly approved with fresh evidence", streams[i].id)
-		}
-		if batchCaptureVia(streams[i].sourceURL, streams[i].provider, streams[i].captureVia) != "cloud" {
-			return time.Time{}, fmt.Errorf("stream %d is not cloud-native and cannot use targeted DO admission", streams[i].id)
-		}
-		streams[i].admissionEvidenceID, streams[i].admissionEvidenceID2 = evidence.first, evidence.second
-		streams[i].sceneIdentity, streams[i].evidenceSHA, streams[i].evidenceObservedAt, streams[i].scheduleSHA = evidence.scene, evidence.media, evidence.observed, scheduleSHA
-	}
-	return deadline.UTC(), nil
-}
-
 type campaignAdmissionApprovalRequest struct {
 	RequestID        string                           `json:"request_id"`
 	DeadlineAt       time.Time                        `json:"deadline_at"`
@@ -219,6 +128,10 @@ func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWri
 		util.WriteError(w, http.StatusForbidden, "campaign admission approval requires Deniz's exact operator browser session")
 		return
 	}
+	if s.admissionPool == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "campaign admission executor is unavailable")
+		return
+	}
 	var req campaignAdmissionApprovalRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -272,8 +185,8 @@ func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWri
 		util.WriteError(w, http.StatusBadRequest, "approved schedule must be native, non-dry-run, and not self-referential")
 		return
 	}
-	if req.Schedule.Delivery != string(deliveryManaged) && req.Schedule.Delivery != string(deliveryNASPull) {
-		util.WriteError(w, http.StatusBadRequest, "campaign admission supports only managed or nas_pull delivery")
+	if req.Schedule.Delivery != string(deliveryNASPull) {
+		util.WriteError(w, http.StatusBadRequest, "campaign admission supports only nas_pull delivery")
 		return
 	}
 	if req.Schedule.StorageDestinationID <= 0 || req.Schedule.DeliveryStorageDestinationID != 0 {
@@ -299,7 +212,7 @@ func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWri
 	requestSHA := hashSecret(string(canonicalRequest))
 	var replayID, replayDigest string
 	var replayEntriesJSON []byte
-	replayErr := s.pool.QueryRow(r.Context(), `SELECT id::text,approval_sha256,entries FROM recording_campaign_admission_approvals WHERE account_id=$1 AND request_id=$2 AND request_sha256=$3`, p.AccountID, requestID, requestSHA).Scan(&replayID, &replayDigest, &replayEntriesJSON)
+	replayErr := s.admissionPool.QueryRow(r.Context(), `SELECT approval_id::text,approval_sha256,entries FROM recording_campaign_replay_approval($1,$2,$3,$4)`, p.AccountID, requestID, requestSHA, p.credentialSHA256).Scan(&replayID, &replayDigest, &replayEntriesJSON)
 	if replayErr == nil {
 		var replayEntries []campaignAdmissionStoredEntry
 		if err := json.Unmarshal(replayEntriesJSON, &replayEntries); err != nil {
@@ -315,15 +228,6 @@ func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWri
 	}
 	if !errors.Is(replayErr, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusInternalServerError, "load campaign approval replay")
-		return
-	}
-	var requestIDCollision bool
-	if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_campaign_admission_approvals WHERE account_id=$1 AND request_id=$2)`, p.AccountID, requestID).Scan(&requestIDCollision); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "check campaign approval replay")
-		return
-	}
-	if requestIDCollision {
-		util.WriteError(w, http.StatusConflict, "campaign approval request_id already has a different canonical request")
 		return
 	}
 	now := time.Now().UTC()
@@ -479,6 +383,8 @@ type campaignCloudCapacityObservation struct {
 	UsableAfterWorkerLoss int
 	LargestRegion         string
 	LargestRegionSlots    int
+	SizeSlug              string
+	PoolIdentitySHA256    string
 	FactsSHA256           string
 }
 
@@ -487,11 +393,11 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 		return campaignCloudCapacityObservation{}, fmt.Errorf("managed cloud capacity attestation is unavailable")
 	}
 	type worker struct {
-		ID, NodeID, DOID    int64
-		Name, Region, Build string
-		Capacity            int
+		ID, NodeID, DOID, ClaimTokenID, ClaimGeneration int64
+		Name, Region, Size, Build                       string
+		Capacity                                        int
 	}
-	rows, err := s.pool.Query(ctx, `SELECT d.id,d.node_id,d.do_droplet_id,d.name,d.region,d.build_sha,d.capacity FROM recorder_droplets d JOIN nodes n ON n.id=d.node_id WHERE d.state='active' AND n.status='active' AND n.node_type='local_recorder' AND d.last_seen_at BETWEEN transaction_timestamp()-interval '120 seconds' AND transaction_timestamp()+interval '30 seconds' AND d.build_sha=$1 ORDER BY d.id`, strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)))
+	rows, err := s.pool.Query(ctx, `SELECT d.id,d.node_id,d.do_droplet_id,d.name,d.region,d.size,d.build_sha,d.capacity,head.claim_token_id,head.generation FROM recorder_droplets d JOIN nodes n ON n.id=d.node_id JOIN recording_worker_claim_heads head ON head.node_id=n.id JOIN node_tokens tok ON tok.id=head.claim_token_id WHERE d.state='active' AND n.status='active' AND n.node_type='local_recorder' AND d.last_seen_at BETWEEN transaction_timestamp()-interval '120 seconds' AND transaction_timestamp()+interval '30 seconds' AND d.build_sha=$1 AND head.state='enabled' AND tok.revoked_at IS NULL AND tok.recording_claim_purpose='claim_current' AND tok.recording_claim_generation=head.generation ORDER BY d.id`, strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)))
 	if err != nil {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("load current-build cloud capacity: %w", err)
 	}
@@ -499,7 +405,7 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 	var workers []worker
 	for rows.Next() {
 		var item worker
-		if err := rows.Scan(&item.ID, &item.NodeID, &item.DOID, &item.Name, &item.Region, &item.Build, &item.Capacity); err != nil {
+		if err := rows.Scan(&item.ID, &item.NodeID, &item.DOID, &item.Name, &item.Region, &item.Size, &item.Build, &item.Capacity, &item.ClaimTokenID, &item.ClaimGeneration); err != nil {
 			return campaignCloudCapacityObservation{}, err
 		}
 		if item.DOID > 0 && item.Capacity > 0 {
@@ -510,11 +416,14 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 		return campaignCloudCapacityObservation{}, err
 	}
 	type fact struct {
-		DropletID int64  `json:"droplet_id"`
-		NodeID    int64  `json:"node_id"`
-		Region    string `json:"region"`
-		Capacity  int    `json:"capacity"`
-		BuildSHA  string `json:"build_sha"`
+		DropletID       int64  `json:"droplet_id"`
+		NodeID          int64  `json:"node_id"`
+		Region          string `json:"region"`
+		Size            string `json:"size"`
+		Capacity        int    `json:"capacity"`
+		BuildSHA        string `json:"build_sha"`
+		ClaimGeneration int64  `json:"claim_generation"`
+		ClaimTokenID    int64  `json:"claim_token_id"`
 	}
 	observation := campaignCloudCapacityObservation{ObservedAt: time.Now().UTC()}
 	regionSlots := map[string]int{}
@@ -523,16 +432,22 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 		attestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		provider, attestErr := s.campaignDOAttest(attestCtx, item.DOID, item.Name)
 		cancel()
-		if attestErr != nil || provider.DropletID != item.DOID || provider.Name != item.Name || provider.Region != item.Region || provider.Status != "active" {
+		if attestErr != nil || provider.DropletID != item.DOID || provider.Name != item.Name || provider.Region != item.Region || provider.SizeSlug != item.Size || provider.Status != "active" {
 			continue
 		}
 		observation.ReadyWorkers++
+		if observation.SizeSlug == "" {
+			observation.SizeSlug = item.Size
+		}
+		if observation.SizeSlug != item.Size {
+			return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity spans an unreviewed size class")
+		}
 		observation.TotalSlots += item.Capacity
 		if item.Capacity > observation.LargestWorkerSlots {
 			observation.LargestWorkerSlots = item.Capacity
 		}
 		regionSlots[item.Region] += item.Capacity
-		facts = append(facts, fact{DropletID: item.DOID, NodeID: item.NodeID, Region: item.Region, Capacity: item.Capacity, BuildSHA: item.Build})
+		facts = append(facts, fact{DropletID: item.DOID, NodeID: item.NodeID, Region: item.Region, Size: item.Size, Capacity: item.Capacity, BuildSHA: item.Build, ClaimGeneration: item.ClaimGeneration, ClaimTokenID: item.ClaimTokenID})
 	}
 	for region, slots := range regionSlots {
 		if slots > observation.LargestRegionSlots || (slots == observation.LargestRegionSlots && region < observation.LargestRegion) {
@@ -540,11 +455,15 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 		}
 	}
 	observation.UsableAfterWorkerLoss = observation.TotalSlots - observation.LargestWorkerSlots
-	rawFacts, err := json.Marshal(facts)
-	if err != nil {
-		return campaignCloudCapacityObservation{}, err
+	observation.PoolIdentitySHA256 = hashSecret(strings.Join([]string{observation.SizeSlug, strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)), fmt.Sprint(s.cfg.DropletPoolCapacity), hashSecret(s.cfg.DropletPoolProjectID), hashSecret(s.cfg.DropletPoolFirewallID)}, "\n"))
+	factLines := make([]string, 0, len(facts))
+	for _, item := range facts {
+		factLines = append(factLines, strings.Join([]string{
+			fmt.Sprint(item.DropletID), fmt.Sprint(item.NodeID), item.Region, item.Size,
+			fmt.Sprint(item.Capacity), item.BuildSHA, fmt.Sprint(item.ClaimGeneration), fmt.Sprint(item.ClaimTokenID),
+		}, "\x1f"))
 	}
-	observation.FactsSHA256 = hashSecret(string(rawFacts))
+	observation.FactsSHA256 = hashSecret(strings.Join(factLines, "\n") + "\n")
 	if observation.ReadyWorkers < 2 || observation.UsableAfterWorkerLoss <= 0 || !lowerSHA256(observation.FactsSHA256) {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity cannot survive one worker loss")
 	}
@@ -583,15 +502,6 @@ func (s *Server) handleAccountCampaignAdmissionSceneReviewCreate(w http.Response
 		return
 	}
 	var replayID, replaySHA string
-	replayErr := s.pool.QueryRow(r.Context(), `SELECT id::text,review_sha256 FROM recording_targeted_probe_scene_reviews WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND probe_evidence_id=$4 AND presentation_id=$5 AND reviewed_by_user_id=$6`, p.AccountID, requestID, approvalID, evidenceID, presentationID, p.UserID).Scan(&replayID, &replaySHA)
-	if replayErr == nil {
-		util.WriteJSON(w, http.StatusCreated, map[string]any{"scene_review_id": replayID, "review_sha256": replaySHA, "probe_evidence_id": evidenceID})
-		return
-	}
-	if !errors.Is(replayErr, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusInternalServerError, "load targeted scene review replay")
-		return
-	}
 	err := s.admissionPool.QueryRow(r.Context(), `SELECT review_id::text,review_sha256 FROM recording_campaign_review_probe_scene($1,$2,$3,$4,$5,$6,$7,$8)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, evidenceID, presentationID).Scan(&replayID, &replaySHA)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted scene review is not exact or fresh")
@@ -617,7 +527,7 @@ func (s *Server) handleAccountCampaignAdmissionScenePresentationGet(w http.Respo
 	var approvalID uuid.UUID
 	var key, etag, version, wantSHA string
 	var size int64
-	if err := s.pool.QueryRow(r.Context(), `SELECT approval_id,frame_archive_object_key,frame_archive_etag,COALESCE(frame_archive_version_id,''),frame_archive_sha256,frame_size_bytes FROM recording_targeted_probe_evidence WHERE id=$1 AND account_id=$2 AND result='ok'`, evidenceID, p.AccountID).Scan(&approvalID, &key, &etag, &version, &wantSHA, &size); err != nil {
+	if err := s.admissionPool.QueryRow(r.Context(), `SELECT approval_id,frame_archive_object_key,frame_archive_etag,COALESCE(frame_archive_version_id,''),frame_archive_sha256,frame_size_bytes FROM recording_campaign_read_probe_scene($1,$2,$3,$4,$5)`, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, evidenceID).Scan(&approvalID, &key, &etag, &version, &wantSHA, &size); err != nil {
 		util.WriteError(w, http.StatusNotFound, "targeted scene evidence was not found")
 		return
 	}
@@ -662,15 +572,6 @@ func (s *Server) handleAccountCampaignAdmissionProbeOrderCreate(w http.ResponseW
 		return
 	}
 	var orderID string
-	replayErr := s.pool.QueryRow(r.Context(), `SELECT id::text FROM recording_targeted_probe_orders WHERE account_id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND requested_by_user_id=$5`, p.AccountID, requestID, approvalID, req.StreamID, p.UserID).Scan(&orderID)
-	if replayErr == nil {
-		util.WriteJSON(w, http.StatusOK, map[string]any{"order_id": orderID, "approval_id": approvalID, "stream_id": req.StreamID, "desired_attempts": 2})
-		return
-	}
-	if !errors.Is(replayErr, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusConflict, "load targeted probe order replay")
-		return
-	}
 	err = s.admissionPool.QueryRow(r.Context(), `SELECT order_id::text FROM recording_campaign_queue_probe($1,$2,$3,$4,$5,$6,$7)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, req.StreamID).Scan(&orderID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "targeted probe order was not persisted")
@@ -687,8 +588,8 @@ func (s *Server) handleRecordingCampaignAdmissionProbeLease(w http.ResponseWrite
 		return
 	}
 	var dbDroplet managedProbeRecorder
-	var dbName string
-	err := s.pool.QueryRow(r.Context(), `SELECT id,name,do_droplet_id,region,build_sha FROM recorder_droplets WHERE node_id=$1 AND name=$2 AND state='active' AND last_seen_at BETWEEN transaction_timestamp()-interval '120 seconds' AND transaction_timestamp()+interval '30 seconds'`, p.NodeID, strings.TrimSpace(p.DisplayName)).Scan(&dbDroplet.ID, &dbName, &dbDroplet.DODropletID, &dbDroplet.Region, &dbDroplet.BuildSHA)
+	var dbName, dbSize string
+	err := s.pool.QueryRow(r.Context(), `SELECT d.id,d.name,d.do_droplet_id,d.region,d.size,d.build_sha FROM recorder_droplets d JOIN recording_worker_claim_heads head ON head.node_id=d.node_id JOIN node_tokens tok ON tok.id=head.claim_token_id WHERE d.node_id=$1 AND d.name=$2 AND d.state='active' AND d.last_seen_at BETWEEN transaction_timestamp()-interval '120 seconds' AND transaction_timestamp()+interval '30 seconds' AND head.state='enabled' AND head.claim_token_id=$3 AND head.generation=$4 AND tok.revoked_at IS NULL AND tok.recording_claim_purpose='claim_current'`, p.NodeID, strings.TrimSpace(p.DisplayName), p.NodeTokenID, p.NodeClaimGeneration).Scan(&dbDroplet.ID, &dbName, &dbDroplet.DODropletID, &dbDroplet.Region, &dbSize, &dbDroplet.BuildSHA)
 	if err != nil || dbDroplet.DODropletID <= 0 || dbDroplet.BuildSHA != strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)) || s.campaignDOAttest == nil {
 		util.WriteError(w, http.StatusConflict, "managed recorder is not eligible for targeted probes")
 		return
@@ -696,7 +597,7 @@ func (s *Server) handleRecordingCampaignAdmissionProbeLease(w http.ResponseWrite
 	attestCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	provider, err := s.campaignDOAttest(attestCtx, dbDroplet.DODropletID, dbName)
 	cancel()
-	if err != nil || provider.DropletID != dbDroplet.DODropletID || provider.Name != dbName || provider.Region != dbDroplet.Region || provider.Status != "active" {
+	if err != nil || provider.DropletID != dbDroplet.DODropletID || provider.Name != dbName || provider.Region != dbDroplet.Region || provider.SizeSlug != dbSize || provider.Status != "active" {
 		util.WriteError(w, http.StatusConflict, "current DigitalOcean project/firewall attestation failed")
 		return
 	}
@@ -716,7 +617,8 @@ func (s *Server) handleRecordingCampaignAdmissionProbeLease(w http.ResponseWrite
 		return
 	}
 	var orderID, approvalID string
-	err = s.admissionPool.QueryRow(r.Context(), `SELECT order_id::text,approval_id::text,stream_id,COALESCE(provider,''),source_url,COALESCE(source_page_url,''),attempt_id::text,challenge FROM recording_campaign_lease_probe($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, dbDroplet.ID, dbDroplet.DODropletID, dbDroplet.Region, dbDroplet.BuildSHA, hashSecret(s.cfg.DropletPoolProjectID), hashSecret(s.cfg.DropletPoolFirewallID), attemptID, requestID, challenge, hashSecret(store.Bucket()), mediaObjectKey, frameObjectKey, targetedProbeMediaMaxBytes, targetedProbeFrameMaxBytes).Scan(&orderID, &approvalID, &target.ID, &target.Provider, &target.SourceURL, &target.SourcePageURL, &target.AttemptID, &target.Challenge)
+	poolIdentity := hashSecret(strings.Join([]string{dbSize, dbDroplet.BuildSHA, fmt.Sprint(s.cfg.DropletPoolCapacity), hashSecret(s.cfg.DropletPoolProjectID), hashSecret(s.cfg.DropletPoolFirewallID)}, "\n"))
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT order_id::text,approval_id::text,stream_id,COALESCE(provider,''),source_url,COALESCE(source_page_url,''),attempt_id::text,challenge FROM recording_campaign_lease_probe($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, dbDroplet.ID, dbDroplet.DODropletID, dbDroplet.Region, dbDroplet.BuildSHA, hashSecret(s.cfg.DropletPoolProjectID), hashSecret(s.cfg.DropletPoolFirewallID), dbSize, poolIdentity, attemptID, requestID, challenge, hashSecret(store.Bucket()), mediaObjectKey, frameObjectKey, targetedProbeMediaMaxBytes, targetedProbeFrameMaxBytes).Scan(&orderID, &approvalID, &target.ID, &target.Provider, &target.SourceURL, &target.SourcePageURL, &target.AttemptID, &target.Challenge)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, http.StatusOK, map[string]any{"target": nil})
 		return
@@ -762,26 +664,22 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 	// Terminal replay is deliberately resolved before mutable worker, attempt,
 	// approval, or source freshness. A committed response must remain replayable
 	// after any of those live prerequisites expire.
-	var replayID, replaySHA, replayResult, replayDetail string
-	replayErr := s.pool.QueryRow(r.Context(), `SELECT e.id::text,e.evidence_sha256,e.result,e.detail FROM recording_targeted_probe_evidence e JOIN recording_targeted_probe_attempts a ON a.id=e.attempt_id WHERE e.attempt_id=$1 AND a.request_id=$2 AND e.approval_id=$3 AND e.stream_id=$4 AND a.node_id=$5`, attemptID, requestID, approvalID, req.StreamID, p.NodeID).Scan(&replayID, &replaySHA, &replayResult, &replayDetail)
-	if replayErr == nil {
-		if replayResult != req.Evidence.Result || (replayResult != recordability.ResultOK && replayDetail != req.Evidence.Detail) {
-			util.WriteError(w, http.StatusConflict, "targeted evidence request idempotency conflict")
-			return
-		}
-		util.WriteJSON(w, http.StatusCreated, map[string]any{"evidence_id": replayID, "attempt_id": attemptID, "evidence_sha256": replaySHA})
-		return
-	}
-	if !errors.Is(replayErr, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusInternalServerError, "load targeted evidence replay")
-		return
-	}
+	var replayID, replaySHA, replayResult, replayDetail *string
+	var terminal bool
 	var targetAccountID int64
 	var challenge, mediaKey, frameKey string
 	var mediaMax, frameMax int64
-	err = s.pool.QueryRow(r.Context(), `SELECT account_id,challenge,media_object_key,frame_object_key,media_max_size_bytes,frame_max_size_bytes FROM recording_targeted_probe_attempts WHERE id=$1 AND request_id=$2 AND approval_id=$3 AND stream_id=$4 AND node_id=$5`, attemptID, requestID, approvalID, req.StreamID, p.NodeID).Scan(&targetAccountID, &challenge, &mediaKey, &frameKey, &mediaMax, &frameMax)
-	if err != nil {
-		util.WriteError(w, http.StatusConflict, "targeted attempt identity does not match")
+	stateErr := s.admissionPool.QueryRow(r.Context(), `SELECT account_id,challenge,media_object_key,frame_object_key,media_max_size_bytes,frame_max_size_bytes,terminal,evidence_id::text,evidence_sha256,result,detail FROM recording_campaign_read_probe_attempt($1,$2,$3,$4,$5,$6,$7,$8)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, attemptID, requestID, approvalID, req.StreamID).Scan(&targetAccountID, &challenge, &mediaKey, &frameKey, &mediaMax, &frameMax, &terminal, &replayID, &replaySHA, &replayResult, &replayDetail)
+	if stateErr != nil {
+		util.WriteError(w, http.StatusConflict, "targeted attempt identity or current node authority does not match")
+		return
+	}
+	if terminal {
+		if replayID == nil || replaySHA == nil || replayResult == nil || *replayResult != req.Evidence.Result || (*replayResult != recordability.ResultOK && (replayDetail == nil || *replayDetail != req.Evidence.Detail)) {
+			util.WriteError(w, http.StatusConflict, "targeted evidence request idempotency conflict")
+			return
+		}
+		util.WriteJSON(w, http.StatusCreated, map[string]any{"evidence_id": *replayID, "attempt_id": attemptID, "evidence_sha256": *replaySHA})
 		return
 	}
 	var observation targetedQuarantineObservation

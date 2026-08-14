@@ -96,15 +96,61 @@ type batchScheduleItem struct {
 }
 
 type batchScheduleResponse struct {
-	Items              []batchScheduleItem `json:"items"`
-	Created            int                 `json:"created"`
-	Updated            int                 `json:"updated"`
-	DryRun             bool                `json:"dry_run"`
-	RelayStreams       int                 `json:"relay_streams"`
-	OnlineRelaySlots   int                 `json:"online_relay_slots"`
-	RequiredRelaySlots int                 `json:"required_relay_slots"`
-	CampaignTrackID    int64               `json:"campaign_track_id,omitempty"`
-	AdmissionApproval  string              `json:"campaign_admission_approval_id,omitempty"`
+	Items               []batchScheduleItem `json:"items"`
+	Created             int                 `json:"created"`
+	Updated             int                 `json:"updated"`
+	DryRun              bool                `json:"dry_run"`
+	RelayStreams        int                 `json:"relay_streams"`
+	OnlineRelaySlots    int                 `json:"online_relay_slots"`
+	RequiredRelaySlots  int                 `json:"required_relay_slots"`
+	CampaignTrackID     int64               `json:"campaign_track_id,omitempty"`
+	AdmissionApproval   string              `json:"campaign_admission_approval_id,omitempty"`
+	CapacityObservation string              `json:"campaign_capacity_observation_id,omitempty"`
+	StorageObservation  string              `json:"campaign_storage_observation_id,omitempty"`
+	ForecastPeakSlots   int                 `json:"forecast_peak_slots,omitempty"`
+	UsableAfterLoss     int                 `json:"usable_after_worker_loss,omitempty"`
+	RelayActiveDemand   int                 `json:"relay_active_demand,omitempty"`
+	RelayFailureDomains int                 `json:"relay_failure_domains,omitempty"`
+	RelayEffectiveSlots int                 `json:"relay_effective_capacity,omitempty"`
+	RelayAfterLoss      int                 `json:"relay_usable_after_largest_loss,omitempty"`
+	RequiredFreeBytes   int64               `json:"required_free_bytes,omitempty"`
+	ProjectedFreeBytes  int64               `json:"projected_free_after_bytes,omitempty"`
+}
+
+type campaignAdmissionReplayRequest struct {
+	ApprovalID      string `json:"approval_id"`
+	TargetAccountID int64  `json:"target_account_id"`
+}
+
+// A committed response remains retrievable with the exact historical browser
+// session secret after logout/revocation. This endpoint cannot mutate or reveal
+// anything beyond that already-sealed response, and only a credential hash is
+// sent to PostgreSQL.
+func (s *Server) handleRecordingCampaignAdmissionReplay(w http.ResponseWriter, r *http.Request) {
+	if s.admissionPool == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "campaign admission executor is unavailable")
+		return
+	}
+	var req campaignAdmissionReplayRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	approvalID, err := uuid.Parse(strings.TrimSpace(req.ApprovalID))
+	cookie, cookieErr := r.Cookie(accountSessionCookie)
+	if err != nil || cookieErr != nil || req.TargetAccountID <= 0 || strings.TrimSpace(cookie.Value) == "" {
+		util.WriteError(w, http.StatusUnauthorized, "exact historical admission replay credential required")
+		return
+	}
+	var replayJSON []byte
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT recording_campaign_replay($1,$2,$3)`, approvalID, req.TargetAccountID, hashSecret(strings.TrimSpace(cookie.Value))).Scan(&replayJSON)
+	if err != nil || len(replayJSON) == 0 {
+		util.WriteError(w, http.StatusUnauthorized, "sealed admission replay credential does not match")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(replayJSON)
 }
 
 func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +165,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		return
 	}
 	accountID := principal.AccountID
+	var err error
 	if req.TargetAccountID < 0 {
 		util.WriteError(w, http.StatusBadRequest, "target_account_id must be non-negative")
 		return
@@ -128,6 +175,41 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusForbidden, "target_account_id requires platform operator access")
 			return
 		}
+		accountID = req.TargetAccountID
+	}
+	var admissionApprovalID uuid.UUID
+	var admissionScheduleSpec []byte
+	admissionRequested := strings.TrimSpace(req.CampaignAdmissionApprovalID) != ""
+	if admissionRequested {
+		if s.admissionPool == nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "campaign admission executor is unavailable")
+			return
+		}
+		if principal.UserID == 0 || principal.SessionID == nil || principal.Role != accountRoleAdmin || (principal.MemberRole != "owner" && principal.MemberRole != "admin") {
+			util.WriteError(w, http.StatusForbidden, "campaign admission requires an account owner/admin browser session")
+			return
+		}
+		admissionApprovalID, err = uuid.Parse(strings.TrimSpace(req.CampaignAdmissionApprovalID))
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, "campaign_admission_approval_id must be a UUID")
+			return
+		}
+		// Resolve a sealed terminal response before account/source/provider/capacity
+		// freshness. The approval UUID is the immutable request identity.
+		var replayJSON []byte
+		replayErr := s.admissionPool.QueryRow(r.Context(), `SELECT recording_campaign_replay($1,$2,$3)`, admissionApprovalID, accountID, principal.credentialSHA256).Scan(&replayJSON)
+		if replayErr == nil && len(replayJSON) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(replayJSON)
+			return
+		}
+		if replayErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load sealed campaign admission replay")
+			return
+		}
+	}
+	if req.TargetAccountID > 0 {
 		var status string
 		if err := s.pool.QueryRow(r.Context(), `SELECT status FROM accounts WHERE id=$1`, req.TargetAccountID).Scan(&status); errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusBadRequest, "target account not found")
@@ -139,25 +221,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusBadRequest, "target account is not active")
 			return
 		}
-		accountID = req.TargetAccountID
 	}
 	ids, err := uniqueBatchStreamIDs(req.StreamIDs)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	var admissionApprovalID uuid.UUID
-	admissionRequested := strings.TrimSpace(req.CampaignAdmissionApprovalID) != ""
-	if admissionRequested {
-		if principal.UserID == 0 || principal.SessionID == nil || principal.Role != accountRoleAdmin || (principal.MemberRole != "owner" && principal.MemberRole != "admin") {
-			util.WriteError(w, http.StatusForbidden, "campaign admission requires an account owner/admin browser session")
-			return
-		}
-		admissionApprovalID, err = uuid.Parse(strings.TrimSpace(req.CampaignAdmissionApprovalID))
-		if err != nil {
-			util.WriteError(w, http.StatusBadRequest, "campaign_admission_approval_id must be a UUID")
-			return
-		}
 	}
 	mode, err := parseBatchScheduleMode(req.Mode)
 	if err != nil {
@@ -174,8 +242,8 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if admissionRequested && delivery != deliveryManaged && delivery != deliveryNASPull {
-		util.WriteError(w, http.StatusBadRequest, "campaign admission supports only managed or nas_pull delivery")
+	if admissionRequested && delivery != deliveryNASPull {
+		util.WriteError(w, http.StatusBadRequest, "campaign admission supports only nas_pull delivery")
 		return
 	}
 	if admissionRequested && (req.StorageDestinationID <= 0 || req.DeliveryStorageDestinationID != 0) {
@@ -378,29 +446,10 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		approvedSchedule.CampaignAdmissionApprovalID = ""
 		approvedSchedule.DryRun = false
 		approvedSchedule.TargetAccountID = accountID
-		scheduleSpec, marshalErr := json.Marshal(approvedSchedule)
+		var marshalErr error
+		admissionScheduleSpec, marshalErr = json.Marshal(approvedSchedule)
 		if marshalErr != nil {
 			util.WriteError(w, http.StatusInternalServerError, "encode exact campaign admission schedule")
-			return
-		}
-		var replayJSON []byte
-		replayErr := tx.QueryRow(r.Context(), `SELECT c.response_json FROM recording_campaign_admission_commits c JOIN recording_campaign_admission_approvals a ON a.id=c.approval_id WHERE c.approval_id=$1 AND c.account_id=$2 AND a.schedule_sha256=encode(sha256(convert_to($3::jsonb::text,'UTF8')),'hex')`, admissionApprovalID, accountID, scheduleSpec).Scan(&replayJSON)
-		if replayErr == nil {
-			var replay batchScheduleResponse
-			if err := json.Unmarshal(replayJSON, &replay); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, "decode sealed campaign admission replay")
-				return
-			}
-			util.WriteJSON(w, http.StatusOK, replay)
-			return
-		}
-		if !errors.Is(replayErr, pgx.ErrNoRows) {
-			util.WriteError(w, http.StatusInternalServerError, "load sealed campaign admission replay")
-			return
-		}
-		_, err = bindCampaignAdmissionEvidence(r.Context(), tx, admissionApprovalID, accountID, principal.UserID, streams, endAt, s.cfg.DropletPoolBuildSHA, scheduleSpec, !req.DryRun)
-		if err != nil {
-			util.WriteError(w, http.StatusConflict, err.Error())
 			return
 		}
 	}
@@ -585,6 +634,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			"largest_worker_slots": admissionCloudCapacity.LargestWorkerSlots, "usable_after_worker_loss": admissionCloudCapacity.UsableAfterWorkerLoss,
 			"largest_region": admissionCloudCapacity.LargestRegion, "largest_region_slots": admissionCloudCapacity.LargestRegionSlots,
 			"provider_project_sha256": hashSecret(s.cfg.DropletPoolProjectID), "provider_firewall_sha256": hashSecret(s.cfg.DropletPoolFirewallID),
+			"size_slug": admissionCloudCapacity.SizeSlug, "pool_identity_sha256": admissionCloudCapacity.PoolIdentitySHA256,
 			"facts_sha256": admissionCloudCapacity.FactsSHA256, "forecast_peak_slots": cloudForecastPeak,
 		})
 		storageJSON, storageMarshalErr := json.Marshal(map[string]any{
@@ -607,7 +657,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			return
 		}
 		var sealedResponse []byte
-		err = s.admissionPool.QueryRow(r.Context(), `SELECT recording_campaign_admit($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb)`, admissionApprovalID, accountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, nextFireJSON, capacityJSON, storageJSON).Scan(&sealedResponse)
+		err = s.admissionPool.QueryRow(r.Context(), `SELECT recording_campaign_admit($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb)`, admissionApprovalID, accountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, admissionScheduleSpec, nextFireJSON, capacityJSON, storageJSON).Scan(&sealedResponse)
 		if err != nil {
 			util.WriteError(w, http.StatusConflict, "campaign admission atomic executor rejected the transition")
 			return
@@ -617,7 +667,9 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusInternalServerError, "decode DB-canonical campaign admission response")
 			return
 		}
-		util.WriteJSON(w, http.StatusOK, response)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(sealedResponse)
 		return
 	}
 

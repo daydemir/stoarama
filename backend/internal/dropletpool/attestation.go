@@ -16,6 +16,7 @@ type ProviderAttestation struct {
 	DropletID int64
 	Name      string
 	Region    string
+	SizeSlug  string
 	Status    string
 }
 
@@ -31,7 +32,7 @@ func AttestManagedDroplet(ctx context.Context, token, projectID, firewallID stri
 	if err != nil {
 		return ProviderAttestation{}, fmt.Errorf("get DigitalOcean droplet: %w", err)
 	}
-	if d.ID != int(dropletID) || d.Name != strings.TrimSpace(expectedName) || d.Status != "active" || d.Region == nil || strings.TrimSpace(d.Region.Slug) == "" {
+	if d.ID != int(dropletID) || d.Name != strings.TrimSpace(expectedName) || d.Status != "active" || d.Region == nil || strings.TrimSpace(d.Region.Slug) == "" || strings.TrimSpace(d.SizeSlug) == "" {
 		return ProviderAttestation{}, fmt.Errorf("DigitalOcean droplet identity/status mismatch")
 	}
 	resources, _, err := c.Projects.ListResources(ctx, strings.TrimSpace(projectID), &godo.ListOptions{PerPage: 200})
@@ -63,5 +64,5 @@ func AttestManagedDroplet(ctx context.Context, token, projectID, firewallID stri
 	if !hasFirewall {
 		return ProviderAttestation{}, fmt.Errorf("DigitalOcean droplet lacks the exact succeeded recorder firewall")
 	}
-	return ProviderAttestation{DropletID: dropletID, Name: d.Name, Region: d.Region.Slug, Status: d.Status}, nil
+	return ProviderAttestation{DropletID: dropletID, Name: d.Name, Region: d.Region.Slug, SizeSlug: d.SizeSlug, Status: d.Status}, nil
 }

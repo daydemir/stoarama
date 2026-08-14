@@ -17,7 +17,9 @@ var campaignAuthorityTables = []string{
 	"recording_campaign_admission_reservations", "recording_campaign_admission_source_fence_events",
 	"recording_targeted_probe_orders", "recording_targeted_provider_attestations",
 	"recording_targeted_probe_attempts", "recording_targeted_probe_evidence",
+	"recording_targeted_probe_attempt_terminal_events",
 	"recording_targeted_probe_scene_presentations", "recording_targeted_probe_scene_reviews", "recording_campaign_capacity_observations",
+	"recording_campaign_baseline_scene_presentations",
 	"recording_campaign_capacity_reservations", "recording_campaign_storage_observations",
 	"recording_campaign_storage_reservations", "recording_campaign_admission_results",
 	"recording_campaign_admission_commits", "recording_campaign_admission_tx_authorizations",
@@ -29,24 +31,46 @@ var campaignRuntimeFunctions = []string{
 	"recording_campaign_authorize_node(text,uuid,bigint,bigint,bigint,bigint,text)",
 	"recording_campaign_create_approval(uuid,bigint,bigint,text,text,text,timestamp with time zone,jsonb,jsonb,text)",
 	"recording_campaign_create_probe_order(uuid,uuid,bigint,bigint,bigint)",
-	"recording_campaign_create_provider_attestation(bigint,bigint,bigint,text,text,text,text)",
+	"recording_campaign_create_provider_attestation(bigint,bigint,bigint,text,text,text,text,text,text)",
 	"recording_campaign_create_probe_attempt(uuid,uuid,uuid,uuid,bigint,bigint,bigint,bigint,uuid,bigint,text,text,bigint,text,text,timestamp with time zone,text,text,text,text,bigint,bigint)",
-	"recording_campaign_lease_probe(bigint,bigint,bigint,text,bigint,bigint,text,text,text,text,uuid,uuid,text,text,text,text,bigint,bigint)",
+	"recording_campaign_lease_probe(bigint,bigint,bigint,text,bigint,bigint,text,text,text,text,text,text,uuid,uuid,text,text,text,text,bigint,bigint)",
 	"recording_campaign_create_probe_evidence(uuid,uuid,bigint,bigint,text,double precision,bigint,integer,text,text,text,text,text,text,boolean,integer,integer,double precision,text,bigint,text,text,bigint,text,text,text,text,text,text,text,text,text,text,text,text)",
 	"recording_campaign_submit_probe_evidence(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint,bigint,jsonb)",
+	"recording_campaign_read_probe_attempt(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint)",
 	"recording_campaign_create_scene_presentation(uuid,bigint,uuid,uuid,bigint)",
 	"recording_campaign_create_scene_review(uuid,bigint,uuid,uuid,uuid,bigint)",
 	"recording_campaign_approve(uuid,bigint,bigint,bigint,text,text,text,text,timestamp with time zone,jsonb,jsonb,text)",
 	"recording_campaign_queue_probe(uuid,uuid,bigint,bigint,bigint,text,bigint)",
 	"recording_campaign_present_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid)",
 	"recording_campaign_review_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid,uuid)",
-	"recording_campaign_create_capacity_observation(uuid,bigint,timestamp with time zone,text,integer,integer,integer,integer,text,integer,text,text,text)",
+	"recording_campaign_read_probe_scene(bigint,bigint,bigint,text,uuid)",
+	"recording_campaign_read_baseline_scene(bigint,bigint,bigint,text,text,bigint,bigint)",
+	"recording_campaign_present_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint)",
+	"recording_campaign_attest_baseline_scene(uuid,bigint,bigint,bigint,text,bigint,text)",
+	"recording_campaign_create_capacity_observation(uuid,bigint,timestamp with time zone,text,text,text,integer,integer,integer,integer,text,integer,integer,integer,integer,integer,text,text,text)",
 	"recording_campaign_create_capacity_reservation(uuid,bigint,uuid,integer,integer)",
+	"recording_campaign_forecast_peak_slots(bigint)",
+	"recording_campaign_relay_failure_capacity(bigint)",
 	"recording_campaign_create_storage_observation(uuid,bigint,bigint,timestamp with time zone,bigint,bigint,bigint,integer,integer,bigint,integer,bigint,bigint,bigint,boolean)",
 	"recording_campaign_create_storage_reservation(uuid,bigint,uuid,bigint,timestamp with time zone)",
 	"recording_campaign_create_admission_result(uuid,uuid,uuid,bigint,bigint,bigint,bigint,bigint,bigint,text,text,text)",
 	"recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)",
-	"recording_campaign_admit(uuid,bigint,bigint,bigint,text,jsonb,jsonb,jsonb)",
+	"recording_campaign_admit(uuid,bigint,bigint,bigint,text,jsonb,jsonb,jsonb,jsonb)",
+	"recording_campaign_replay(uuid,bigint,text)",
+	"recording_campaign_replay_approval(bigint,uuid,text,text)",
+}
+
+var campaignRuntimeProductFunctions = []string{
+	"recording_surrender_source_snapshot(bigint)",
+	"recording_surrender_destination_snapshot(bigint)",
+	"recording_surrender_capture_config_snapshot(bigint,bigint,uuid)",
+	"recording_surrender_token_can_access_lease(bigint,bigint,bigint,bigint)",
+	"recording_surrender_reconcile_expired_upload_sessions()",
+	"recording_surrender_expire_set_plans()",
+	"recording_surrender_reclaim_expired()",
+	"recording_surrender_request_sha(uuid,text,text,bigint,uuid,bigint,integer,bigint,integer)",
+	"recording_surrender_relay_candidate_eligible(bigint,bigint)",
+	"recording_surrender_relay_alternate(bigint,text)",
 }
 
 var campaignExecutorFunctions = []string{
@@ -54,9 +78,16 @@ var campaignExecutorFunctions = []string{
 	"recording_campaign_queue_probe(uuid,uuid,bigint,bigint,bigint,text,bigint)",
 	"recording_campaign_present_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid)",
 	"recording_campaign_review_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid,uuid)",
-	"recording_campaign_lease_probe(bigint,bigint,bigint,text,bigint,bigint,text,text,text,text,uuid,uuid,text,text,text,text,bigint,bigint)",
+	"recording_campaign_read_probe_scene(bigint,bigint,bigint,text,uuid)",
+	"recording_campaign_read_baseline_scene(bigint,bigint,bigint,text,text,bigint,bigint)",
+	"recording_campaign_present_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint)",
+	"recording_campaign_attest_baseline_scene(uuid,bigint,bigint,bigint,text,bigint,text)",
+	"recording_campaign_lease_probe(bigint,bigint,bigint,text,bigint,bigint,text,text,text,text,text,text,uuid,uuid,text,text,text,text,bigint,bigint)",
+	"recording_campaign_read_probe_attempt(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint)",
 	"recording_campaign_submit_probe_evidence(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint,bigint,jsonb)",
-	"recording_campaign_admit(uuid,bigint,bigint,bigint,text,jsonb,jsonb,jsonb)",
+	"recording_campaign_admit(uuid,bigint,bigint,bigint,text,jsonb,jsonb,jsonb,jsonb)",
+	"recording_campaign_replay(uuid,bigint,text)",
+	"recording_campaign_replay_approval(bigint,uuid,text,text)",
 }
 
 // BootstrapCampaignRoles creates only the NOLOGIN admission owner. The runtime
@@ -111,7 +142,7 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 	}
 	var sessionUser, currentUser string
 	var super, member, ownsObjects, schemaCreate, migrationApplied bool
-	var invalidTables, invalidProductTables, authoritySequences, executableFunctions int
+	var invalidTables, invalidProductTables, authoritySequences, executableFunctions, missingProductFunctions int
 	var productManifestSHA256 string
 	err := pool.QueryRow(ctx, `
 		SELECT session_user,current_user,r.rolsuper,
@@ -121,7 +152,7 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		       (SELECT count(*) FROM unnest($3::text[]) name
 		          LEFT JOIN pg_class c ON c.relname=name
 		          LEFT JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname=current_schema()
-		         WHERE c.oid IS NULL OR pg_get_userbyid(c.relowner)<>$2 OR
+		         WHERE c.oid IS NULL OR pg_get_userbyid(c.relowner)<>$2 OR has_table_privilege(current_user,c.oid,'SELECT') OR
 		               has_table_privilege(current_user,c.oid,'INSERT') OR has_table_privilege(current_user,c.oid,'UPDATE') OR
 		               has_table_privilege(current_user,c.oid,'DELETE') OR has_table_privilege(current_user,c.oid,'TRUNCATE')),
 		       (SELECT encode(sha256(convert_to(string_agg(c.relname,E'\n' ORDER BY c.relname)||E'\n','UTF8')),'hex')
@@ -137,12 +168,15 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		       (SELECT count(*) FROM unnest($4::text[]) signature
 		          LEFT JOIN pg_proc p ON p.oid=to_regprocedure(format('%I.%s',current_schema(),signature))
 		         WHERE p.oid IS NOT NULL AND has_function_privilege(current_user,p.oid,'EXECUTE')),
+		       (SELECT count(*) FROM unnest($5::text[]) signature
+		          LEFT JOIN pg_proc p ON p.oid=to_regprocedure(format('%I.%s',current_schema(),signature))
+		         WHERE p.oid IS NULL OR NOT has_function_privilege(current_user,p.oid,'EXECUTE')),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &authoritySequences, &executableFunctions, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions, campaignRuntimeProductFunctions).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &authoritySequences, &executableFunctions, &missingProductFunctions, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign runtime privileges: %w", err)
 	}
-	if sessionUser != runtimeRole || currentUser != runtimeRole || super || member || ownsObjects || schemaCreate || invalidTables != 0 || productManifestSHA256 != campaignProductTableManifestSHA256 || invalidProductTables != 0 || authoritySequences != 0 || executableFunctions != 0 || !migrationApplied {
+	if sessionUser != runtimeRole || currentUser != runtimeRole || super || member || ownsObjects || schemaCreate || invalidTables != 0 || productManifestSHA256 != campaignProductTableManifestSHA256 || invalidProductTables != 0 || authoritySequences != 0 || executableFunctions != 0 || missingProductFunctions != 0 || !migrationApplied {
 		return fmt.Errorf("campaign runtime database privilege boundary is not exact")
 	}
 	return nil
@@ -181,6 +215,10 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 	}
 	if sessionUser != executorRole || currentUser != executorRole || super || member || ownsObjects || schemaCreate || tablePrivileges != 0 || invalidFunctions != 0 || !migrationApplied {
 		return fmt.Errorf("campaign executor database privilege boundary is not exact")
+	}
+	var productFunctionExec int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM unnest($1::text[]) signature LEFT JOIN pg_proc p ON p.oid=to_regprocedure(format('%I.%s',current_schema(),signature)) WHERE p.oid IS NOT NULL AND has_function_privilege(current_user,p.oid,'EXECUTE')`, campaignRuntimeProductFunctions).Scan(&productFunctionExec); err != nil || productFunctionExec != 0 {
+		return fmt.Errorf("campaign executor must not inherit recorder runtime function authority")
 	}
 	return nil
 }

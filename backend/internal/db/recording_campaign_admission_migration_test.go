@@ -212,6 +212,22 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"campaign NAS witness differs from authority rows",
 		"recording_targeted_probe_scene_presentations",
 		"presentation.presented_at<recording_campaign_now()-interval '30 minutes'",
+		"campaign_key='delivery30-2026q3'",
+		"recording_targeted_probe_attempt_terminal_events",
+		"expired_without_evidence",
+		"head.state='enabled'",
+		"pool_identity_sha256",
+		"recording_campaign_read_probe_attempt",
+		"recording_campaign_read_probe_scene",
+		"recording_campaign_read_baseline_scene",
+		"campaign activation requires a fresh typed capacity observation",
+		"campaign one-worker-loss capacity head is permanently enforced",
+		"recording_campaign_relay_failure_capacity",
+		"campaign largest-relay-domain-loss capacity head is permanently enforced",
+		"relay_usable_after_largest_loss",
+		"admitted recording next-fire must advance by one exact scheduled window",
+		"approval.schedule_spec->>'delivery'<>'nas_pull'",
+		"recording_campaign_replay(p_approval_id,p_account_id,p_credential_sha256)",
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("0140 omitted reviewed cross-boundary closure %q", required)
@@ -225,6 +241,21 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 	}
 	if strings.Contains(sql, "admitted.id IS NULL") {
 		t.Fatal("0140 lets completed admissions disappear from reciprocal occupancy fencing")
+	}
+	for _, source := range []string{
+		"../api/server_recording_campaign_admission.go",
+		"../api/server_recording_qualification.go",
+		"../api/server_recordings_batch.go",
+	} {
+		rawSource, readErr := os.ReadFile(source)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		for lineNo, line := range strings.Split(string(rawSource), "\n") {
+			if strings.Contains(line, "s.pool.") && (strings.Contains(line, "recording_campaign_") || strings.Contains(line, "recording_targeted_")) {
+				t.Fatalf("ordinary runtime pool reads admission authority at %s:%d", source, lineNo+1)
+			}
+		}
 	}
 	renderRaw, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
 	if err != nil {
