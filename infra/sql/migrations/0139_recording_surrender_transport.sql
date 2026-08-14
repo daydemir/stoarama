@@ -1050,14 +1050,14 @@ BEGIN
     FROM recording_capture_artifact_intents artifact
     JOIN recording_capture_producers producer ON producer.id=artifact.producer_id
     WHERE producer.recording_job_id=OLD.id AND producer.lease_token=OLD.lease_token
-      AND NOT EXISTS(SELECT 1 FROM recording_capture_artifact_results result WHERE result.upload_intent_id=artifact.upload_intent_id);
+      AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id);
     IF nonterminal>0 THEN
       SELECT count(*) INTO granted
       FROM recording_capture_artifact_intents artifact
       JOIN recording_capture_producers producer ON producer.id=artifact.producer_id
       JOIN recording_job_recovery_grants grant_row ON grant_row.upload_intent_id=artifact.upload_intent_id
       WHERE producer.recording_job_id=OLD.id AND producer.lease_token=OLD.lease_token
-        AND NOT EXISTS(SELECT 1 FROM recording_capture_artifact_results result WHERE result.upload_intent_id=artifact.upload_intent_id)
+        AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
         AND grant_row.revoked_at IS NULL AND grant_row.upload_grace_until>transaction_timestamp();
       IF granted<>nonterminal OR NOT EXISTS(
         SELECT 1 FROM recording_job_lease_expiry_events event
@@ -1115,7 +1115,8 @@ BEGIN
   -- Expired upload-only capabilities close honestly. No later main-token or
   -- worker action may turn missing bytes into accepted footage.
   FOR p IN
-    SELECT grant_row.id,grant_row.recording_job_id,grant_row.producer_id,grant_row.upload_intent_id
+    SELECT grant_row.id,grant_row.recording_job_id,grant_row.producer_id,grant_row.upload_intent_id,
+           COALESCE((SELECT result.result FROM recording_capture_artifact_results result WHERE result.upload_intent_id=grant_row.upload_intent_id),'') AS artifact_result
     FROM recording_job_recovery_grants grant_row
     WHERE grant_row.revoked_at IS NULL AND grant_row.upload_grace_until<=transaction_timestamp()
     ORDER BY grant_row.recording_job_id,grant_row.id
@@ -1126,11 +1127,17 @@ BEGIN
         AND grant_row.upload_grace_until<=transaction_timestamp()
       FOR UPDATE;
     IF NOT FOUND THEN CONTINUE; END IF;
-    INSERT INTO recording_capture_artifact_results(upload_intent_id,result)
-    VALUES(p.upload_intent_id,'host_unreachable_unrecoverable') ON CONFLICT DO NOTHING;
-    UPDATE recording_job_recovery_grants
-    SET revoked_at=transaction_timestamp(),revoke_reason='recovery_grace_expired'
-    WHERE id=p.id;
+	IF p.artifact_result IN('accepted_unique','exact_replay','abandoned_unsealed','unrecoverable_partial') THEN
+	  UPDATE recording_job_recovery_grants
+	  SET revoked_at=transaction_timestamp(),revoke_reason='recovery_completed'
+	  WHERE id=p.id;
+	ELSE
+	  INSERT INTO recording_capture_artifact_results(upload_intent_id,result)
+	  VALUES(p.upload_intent_id,'host_unreachable_unrecoverable') ON CONFLICT DO NOTHING;
+	  UPDATE recording_job_recovery_grants
+	  SET revoked_at=transaction_timestamp(),revoke_reason='recovery_grace_expired'
+	  WHERE id=p.id;
+	END IF;
     IF NOT EXISTS(
       SELECT 1 FROM recording_capture_artifact_intents artifact
       WHERE artifact.producer_id=p.producer_id
@@ -1179,7 +1186,7 @@ BEGIN
       FROM recording_capture_producers producer
       JOIN recording_capture_artifact_intents artifact ON artifact.producer_id=producer.id
       WHERE producer.recording_job_id=j.id AND producer.lease_token=j.lease_token
-	    AND NOT EXISTS(SELECT 1 FROM recording_capture_artifact_results result WHERE result.upload_intent_id=artifact.upload_intent_id)
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
 	  ORDER BY producer.capture_ordinal,artifact.capture_sequence
     LOOP
       grant_id:=gen_random_uuid();

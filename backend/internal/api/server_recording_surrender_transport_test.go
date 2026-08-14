@@ -241,19 +241,19 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	if err = pool.QueryRow(ctx, `SELECT count(*) FROM recording_surrender_transport_episode_events WHERE recording_job_id=$1 AND lease_token=$2 AND event_type='opened' AND reason='expired_reclaim'`, cloud.jobID, cloudLease).Scan(&episodes); err != nil {
 		t.Fatal(err)
 	}
-	if grants != 2 || expiryEvents != 1 || observations != 1 || episodes != 1 {
+	if grants != 4 || expiryEvents != 1 || observations != 1 || episodes != 1 {
 		t.Fatalf("grants=%d expiry=%d observations=%d episodes=%d", grants, expiryEvents, observations, episodes)
 	}
 
-	for index, intentID := range intentIDs[2:] {
+	for index, intentID := range intentIDs {
 		request := httptest.NewRequest(http.MethodPost, "/", nil)
 		request.Header.Set(recordingRecoveryIntentHeader, intentID.String())
-		request.Header.Set(recordingRecoverySecretHeader, secrets[index+2])
+		request.Header.Set(recordingRecoverySecretHeader, secrets[index])
 		recovery, authErr := server.authenticateRecordingRecovery(request)
 		if authErr != nil || recovery.IntentID != intentID || recovery.ProducerID != producerID {
 			t.Fatalf("intent=%s recovery=%+v err=%v", intentID, recovery, authErr)
 		}
-		request.Header.Set(recordingRecoveryIntentHeader, intentIDs[3-index].String())
+		request.Header.Set(recordingRecoveryIntentHeader, intentIDs[(index+1)%len(intentIDs)].String())
 		if _, authErr = server.authenticateRecordingRecovery(request); authErr == nil {
 			t.Fatal("one artifact secret authenticated a different intent")
 		}

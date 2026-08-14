@@ -171,7 +171,7 @@ func (s *Server) handleRecordingRecoveryFinish(w http.ResponseWriter, r *http.Re
 	var req struct {
 		Result string `json:"result"`
 	}
-	if err := util.DecodeJSON(r, &req); err != nil || (req.Result != "abandoned_unsealed" && req.Result != "unrecoverable_partial") {
+	if err := util.DecodeJSON(r, &req); err != nil || (req.Result != "abandoned_unsealed" && req.Result != "unrecoverable_partial" && req.Result != "acknowledged_terminal") {
 		util.WriteError(w, http.StatusBadRequest, "invalid reserved-unsealed recovery result")
 		return
 	}
@@ -197,7 +197,7 @@ func (s *Server) handleRecordingRecoveryFinish(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusConflict, "recovery capability is unavailable")
 		return
 	}
-	if priorReason == "recovery_completed" && priorResult == req.Result {
+	if priorReason == "recovery_completed" && (priorResult == req.Result || (req.Result == "acknowledged_terminal" && priorResult != "")) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -205,13 +205,20 @@ func (s *Server) handleRecordingRecoveryFinish(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusConflict, "recovery capability expired before finish")
 		return
 	}
-	if _, err = tx.Exec(r.Context(), `
-		INSERT INTO recording_capture_artifact_results(upload_intent_id,result)
-		SELECT $1,$2 WHERE NOT EXISTS(SELECT 1 FROM recording_capture_artifact_seals WHERE upload_intent_id=$1)
-		ON CONFLICT(upload_intent_id) DO NOTHING
-	`, intentID, req.Result); err != nil {
-		util.WriteError(w, http.StatusConflict, "finish reserved-unsealed recovery intent")
-		return
+	if req.Result == "acknowledged_terminal" {
+		if priorResult != "accepted_unique" && priorResult != "exact_replay" && priorResult != "abandoned_unsealed" && priorResult != "unrecoverable_partial" {
+			util.WriteError(w, http.StatusConflict, "recovery acknowledgment lacks a terminal artifact result")
+			return
+		}
+	} else {
+		if _, err = tx.Exec(r.Context(), `
+			INSERT INTO recording_capture_artifact_results(upload_intent_id,result)
+			SELECT $1,$2 WHERE NOT EXISTS(SELECT 1 FROM recording_capture_artifact_seals WHERE upload_intent_id=$1)
+			ON CONFLICT(upload_intent_id) DO NOTHING
+		`, intentID, req.Result); err != nil {
+			util.WriteError(w, http.StatusConflict, "finish reserved-unsealed recovery intent")
+			return
+		}
 	}
 	if _, err = tx.Exec(r.Context(), `UPDATE recording_job_recovery_grants SET revoked_at=transaction_timestamp(),revoke_reason='recovery_completed' WHERE id=$1 AND revoked_at IS NULL`, recovery.GrantID); err != nil {
 		util.WriteError(w, http.StatusConflict, "close recovery intent capability")

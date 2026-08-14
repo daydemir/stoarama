@@ -457,6 +457,67 @@ func TestRecoveryCapabilityCannotCrossIntent(t *testing.T) {
 	}
 }
 
+func TestRecoveryCapabilityAcknowledgesAcceptedArtifactBeforeLocalCleanup(t *testing.T) {
+	producerID, leaseToken, intentID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	secret := strings.Repeat("3c", 32)
+	root := t.TempDir()
+	outDir, err := os.MkdirTemp(root, "capture-continuous-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(outDir, "seg-20260814-120000.mp4")
+	if err = os.WriteFile(path, []byte("already-safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var acknowledged atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Stoarama-Recording-Recovery-Intent") != intentID || r.Header.Get("X-Stoarama-Recording-Recovery-Secret") != secret {
+			http.Error(w, "exact recovery required", http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"intent_id": intentID, "producer_id": producerID, "job_id": 44, "lease_token": leaseToken, "expires_at": time.Now().Add(time.Minute), "artifacts": []any{map[string]any{"intent_id": intentID, "capture_sequence": 1, "result": "accepted_unique"}}})
+		case strings.HasSuffix(r.URL.Path, "/finish"):
+			var body struct {
+				Result string `json:"result"`
+			}
+			if decodeErr := json.NewDecoder(r.Body).Decode(&body); decodeErr != nil || body.Result != "acknowledged_terminal" {
+				http.Error(w, "wrong acknowledgment", http.StatusBadRequest)
+				return
+			}
+			if _, statErr := os.Stat(path); statErr != nil {
+				t.Errorf("local bytes were removed before server acknowledgment: %v", statErr)
+			}
+			acknowledged.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "revoked-main-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretBytes, _ := hex.DecodeString(secret)
+	secretHash := sha256.Sum256(secretBytes)
+	segment := capture.Segment{Path: path, CaptureSequence: 1, SizeBytes: 12, SHA256: strings.Repeat("a", 64), StartAt: time.Now().UTC()}
+	journal := &captureProducerJournal{JobID: 44, LeaseToken: leaseToken, ProducerID: producerID, CaptureOrdinal: 1, OutputDir: outDir, ClipDurationSec: 60,
+		Artifacts: []captureArtifactJournal{{IntentID: intentID, RecoverySecret: secret, RecoverySecretSHA256: hex.EncodeToString(secretHash[:]), CaptureSequence: 1, Segment: &segment}}}
+	done, err := w.recoverProducerJournal(context.Background(), journal)
+	if err != nil || !done || !acknowledged.Load() {
+		t.Fatalf("done=%v acknowledged=%v err=%v", done, acknowledged.Load(), err)
+	}
+	if _, err = os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("acknowledged local replay still exists: %v", err)
+	}
+}
+
 func TestPersistProducerJournalIgnoresAbandonedTemporarySibling(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {

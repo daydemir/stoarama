@@ -375,6 +375,9 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 			if serverArtifact.Result == "unrecoverable_partial" {
 				return false, fmt.Errorf("partial capture bytes retained for operator recovery")
 			}
+			if err := w.cfg.Client.FinishRecordingRecovery(ctx, artifact.IntentID, artifact.RecoverySecret, "acknowledged_terminal"); err != nil {
+				return false, err
+			}
 			if artifact.Segment != nil {
 				capture.RemoveSegmentFile(*artifact.Segment)
 			}
