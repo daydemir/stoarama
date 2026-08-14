@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -128,6 +132,12 @@ const relayLeaseSQL = `
 	    AND n.status = 'active'
 	    AND n.last_heartbeat_at >= now() - interval '120 seconds'
 	  WHERE j.status = 'pending'
+	    AND (NOT $5 OR EXISTS (
+	          SELECT 1 FROM recording_worker_claim_heads claim
+	          JOIN node_tokens claim_token ON claim_token.id=claim.claim_token_id
+	          WHERE claim.node_id=$1 AND claim.state='enabled' AND claim.claim_token_id=$6
+	            AND claim_token.revoked_at IS NULL AND claim_token.recording_claim_generation=claim.generation
+	            AND claim_token.recording_claim_purpose='claim_current'))
 	    AND j.scheduled_for <= now()
 	    AND ((j.kind = 'continuous_window' AND j.window_end_at > now())
 	         OR (j.kind <> 'continuous_window'
@@ -312,6 +322,9 @@ const relayLeaseSQL = `
 	    handoff_until = NULL,
 	    attempt_count = attempt_count + 1,
 	    lease_token = CASE WHEN $5 THEN gen_random_uuid() ELSE NULL END,
+	    lease_node_token_id = CASE WHEN $5 THEN $6 ELSE NULL END,
+	    lease_claim_generation = CASE WHEN $5 THEN (SELECT generation FROM recording_worker_claim_heads WHERE node_id=$1 AND claim_token_id=$6 AND state='enabled') ELSE NULL END,
+	    lease_credential_state = CASE WHEN $5 THEN 'exact' ELSE 'legacy_unknown' END,
 	    updated_at = now()
 	FROM cte, recordings rec
 	LEFT JOIN streams st ON st.id = rec.stream_id
@@ -329,6 +342,9 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 		return resp, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return resp, err
+	}
 	var accountID int64
 	if err := tx.QueryRow(ctx, `SELECT id FROM accounts WHERE id=$1 FOR UPDATE`, principal.AccountID).Scan(&accountID); err != nil {
 		return resp, err
@@ -362,7 +378,7 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 		return resp, err
 	}
 	err = tx.QueryRow(ctx, relayLeaseSQL,
-		principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec, tokenSupported).Scan(
+		principal.NodeID, billingDisabled, margin, recordingFreshnessGraceSec, tokenSupported, principal.NodeTokenID).Scan(
 		&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
 		&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
 		&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt, &resp.LeaseToken,
@@ -431,6 +447,12 @@ const cloudRecordingJobsLeaseSQL = `
 	            AND live.lease_owner = $1
 	            AND live.lease_expires_at > now()
 	        ) < $5
+	    AND (NOT $6 OR EXISTS (
+	          SELECT 1 FROM recording_worker_claim_heads claim
+	          JOIN node_tokens claim_token ON claim_token.id=claim.claim_token_id
+	          WHERE claim.node_id=$8 AND claim.state='enabled' AND claim.claim_token_id=$7
+	            AND claim_token.revoked_at IS NULL AND claim_token.recording_claim_generation=claim.generation
+	            AND claim_token.recording_claim_purpose='claim_current'))
 	    AND j.status = 'pending'
 	    AND (j.scheduled_for <= now()
 	         OR (j.handoff_owner=$1 AND j.handoff_until>now()
@@ -474,6 +496,9 @@ const cloudRecordingJobsLeaseSQL = `
 	    handoff_until = NULL,
 	    attempt_count = attempt_count + 1,
 	    lease_token = CASE WHEN $6 THEN gen_random_uuid() ELSE NULL END,
+	    lease_node_token_id = CASE WHEN $6 THEN $7 ELSE NULL END,
+	    lease_claim_generation = CASE WHEN $6 THEN (SELECT generation FROM recording_worker_claim_heads WHERE node_id=$8 AND claim_token_id=$7 AND state='enabled') ELSE NULL END,
+	    lease_credential_state = CASE WHEN $6 THEN 'exact' ELSE 'legacy_unknown' END,
 	    updated_at = now()
 	FROM cte, recordings rec
 	LEFT JOIN streams st ON st.id = rec.stream_id
@@ -521,13 +546,16 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		} else {
 			defer func() { _ = tx.Rollback(r.Context()) }()
 			var capacity int
-			_, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`)
+			_, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`)
+			if err == nil {
+				_, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`)
+			}
 			if err == nil {
 				err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
 			}
 			if err == nil {
 				err = tx.QueryRow(r.Context(), cloudRecordingJobsLeaseSQL,
-					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported).Scan(
+					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported, principal.NodeTokenID, principal.NodeID).Scan(
 					&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
 					&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
 					&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt, &resp.LeaseToken,
@@ -581,8 +609,11 @@ type recordingCaptureArtifactSealRequest struct {
 	ProducerID      string `json:"producer_id"`
 	CaptureSequence int64  `json:"capture_sequence"`
 	SegmentStartMs  int64  `json:"segment_start_ms"`
+	SegmentStartUS  int64  `json:"segment_start_microseconds"`
 	SizeBytes       int64  `json:"size_bytes"`
 	SHA256          string `json:"sha256"`
+	SetID           string `json:"set_id,omitempty"`
+	Ordinal         int    `json:"ordinal,omitempty"`
 }
 
 type recordingUploadIntentStatus string
@@ -859,6 +890,10 @@ func (s *Server) handleRecordingCaptureArtifactSeal(w http.ResponseWriter, r *ht
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if strings.TrimSpace(req.SetID) != "" || req.Ordinal != 0 || req.SegmentStartUS != 0 {
+		s.handleRecordingCaptureSetArtifactSeal(w, r, principal, intentID, req)
+		return
+	}
 	recovery, recovering := recordingRecoveryFromContext(r.Context())
 	leaseToken, tokenErr := recordingLeaseToken(r)
 	if recovering {
@@ -947,6 +982,190 @@ func (s *Server) handleRecordingCaptureArtifactSeal(w http.ResponseWriter, r *ht
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"intent_id": intentID.String(), "upload_url": uploadURL, "object_key": objectKey, "bucket": bucket, "endpoint": endpoint, "content_type": mimeType, "max_size_bytes": maxSize, "expires_at": time.Now().UTC().Add(s.cfg.R2SignPutTTL)})
+}
+
+func captureArtifactSemanticSHA(setID uuid.UUID, ordinal int, sourceSHA, namingSHA string, startUS, size int64, sha string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte("stoarama.recording.capture-artifact-semantic.v1\x00"))
+	for _, value := range []string{setID.String(), strconv.Itoa(ordinal), sourceSHA, namingSHA, strconv.FormatInt(startUS, 10), strconv.FormatInt(size, 10), sha} {
+		_, _ = fmt.Fprintf(h, "%d:%s\n", len(value), value)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (s *Server) handleRecordingCaptureSetArtifactSeal(w http.ResponseWriter, r *http.Request, principal nodePrincipal, artifactID uuid.UUID, req recordingCaptureArtifactSealRequest) {
+	if _, recovering := recordingRecoveryFromContext(r.Context()); recovering {
+		util.WriteError(w, http.StatusConflict, "capture set recovery requires the bounded recovery upload endpoint")
+		return
+	}
+	setID, setErr := uuid.Parse(strings.TrimSpace(req.SetID))
+	leaseToken, leaseErr := recordingLeaseToken(r)
+	sha := strings.ToLower(strings.TrimSpace(req.SHA256))
+	if setErr != nil || leaseErr != nil || leaseToken == nil || req.JobID <= 0 || req.Ordinal <= 0 || req.CaptureSequence <= 0 || req.SegmentStartUS <= 0 || req.SizeBytes <= 0 || req.SizeBytes > surrenderplan.RecoveryArtifactMaxBytes || !validLowerSHA256(sha) {
+		util.WriteError(w, http.StatusBadRequest, "invalid capture set artifact seal")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin capture set artifact seal")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock capture set artifact authority")
+		return
+	}
+	var recordingID, destinationID int64
+	var endpoint, region, bucket, keyPrefix, cronTimezone, namingProfile, folderName, sourceSHA, namingSHA string
+	var namingMetadata, secretEnc []byte
+	var accessKeyID string
+	var expectedSequence int64
+	var tokenValid, leaseCurrent, destinationCurrent bool
+	err = tx.QueryRow(r.Context(), `
+		SELECT plan.recording_id,(plan.destination_naming_snapshot->>'destination_id')::bigint,
+		       plan.destination_naming_snapshot->>'endpoint',plan.destination_naming_snapshot->>'region',
+		       plan.destination_naming_snapshot->>'bucket',plan.destination_naming_snapshot->>'key_prefix',
+		       plan.destination_naming_snapshot->>'cron_timezone',plan.destination_naming_snapshot->>'naming_profile',
+		       plan.destination_naming_snapshot->>'folder_name',plan.destination_naming_snapshot->'naming_metadata',
+		       plan.source_snapshot_sha256,plan.destination_naming_sha256,
+		       plan.first_capture_sequence+$3-1,
+		       token.id=job.lease_node_token_id AND token.recording_claim_generation=job.lease_claim_generation
+		         AND token.recording_claim_purpose IN('claim_current','existing_fence_only') AND token.revoked_at IS NULL,
+		       job.status='leased' AND job.lease_owner=$7 AND job.lease_token=$4
+		         AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact',
+		       destination.endpoint=plan.destination_naming_snapshot->>'endpoint'
+		         AND destination.region=plan.destination_naming_snapshot->>'region'
+		         AND destination.bucket=plan.destination_naming_snapshot->>'bucket'
+		         AND destination.key_prefix=plan.destination_naming_snapshot->>'key_prefix',
+		       destination.access_key_id,destination.secret_access_key_enc
+		FROM recording_capture_materialized_artifacts artifact
+		JOIN recording_capture_reservation_sets reservation ON reservation.id=artifact.set_id
+		JOIN recording_capture_set_plans plan ON plan.id=reservation.plan_id
+		JOIN recording_jobs job ON job.id=plan.recording_job_id
+		JOIN node_tokens token ON token.id=$5 AND token.node_id=$6
+		JOIN storage_destinations destination ON destination.id=(plan.destination_naming_snapshot->>'destination_id')::bigint
+		WHERE artifact.set_id=$1 AND artifact.ordinal=$3 AND artifact.artifact_id=$2
+		  AND artifact.capture_sequence=$8 AND plan.recording_job_id=$9 AND plan.lease_token=$4
+		FOR UPDATE OF artifact,reservation,plan,job,token,destination
+	`, setID, artifactID, req.Ordinal, leaseToken, principal.NodeTokenID, principal.NodeID, recorderWorkerID(principal), req.CaptureSequence, req.JobID).Scan(
+		&recordingID, &destinationID, &endpoint, &region, &bucket, &keyPrefix, &cronTimezone, &namingProfile,
+		&folderName, &namingMetadata, &sourceSHA, &namingSHA, &expectedSequence, &tokenValid, &leaseCurrent,
+		&destinationCurrent, &accessKeyID, &secretEnc)
+	if err != nil || !tokenValid || !leaseCurrent || !destinationCurrent || expectedSequence != req.CaptureSequence {
+		util.WriteError(w, http.StatusConflict, "capture set artifact authority is stale")
+		return
+	}
+	profile, err := recordingnaming.ParseProfile(namingProfile)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "capture naming profile is invalid")
+		return
+	}
+	metadata, err := recordingnaming.ParseMetadata(namingMetadata)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "capture naming metadata is invalid")
+		return
+	}
+	clipStart := time.Unix(0, req.SegmentStartUS*int64(time.Microsecond)).UTC()
+	displayPath, err := recordingnaming.BuildDisplayPath(recordingnaming.Policy{
+		Profile: profile, JobKind: recordingnaming.JobKindContinuousWindow, FolderName: folderName,
+		Metadata: metadata, RecordingID: recordingID, JobID: req.JobID, CronTimezone: cronTimezone, ClipStartedAt: clipStart,
+	})
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "derive frozen capture destination")
+		return
+	}
+	objectKey := storageObjectKey(keyPrefix, displayPath)
+	semanticSHA := captureArtifactSemanticSHA(setID, req.Ordinal, sourceSHA, namingSHA, req.SegmentStartUS, req.SizeBytes, sha)
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-object-key-v1:'||$1::text||':'||$2||':'||$3,0))`, destinationID, bucket, objectKey); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock capture destination key")
+		return
+	}
+	rootID := uuid.New()
+	tag, err := tx.Exec(r.Context(), `
+		INSERT INTO recording_object_key_roots(id,storage_destination_id,bucket,object_key,owner_kind,owner_identity,semantic_identity_sha256)
+		VALUES($1,$2,$3,$4,'capture_artifact',$5,$6) ON CONFLICT(storage_destination_id,bucket,object_key) DO NOTHING
+	`, rootID, destinationID, bucket, objectKey, setID.String()+":"+strconv.Itoa(req.Ordinal)+":"+artifactID.String(), semanticSHA)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "reserve capture destination key")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		var ownerKind, ownerIdentity, existingSemantic string
+		if err = tx.QueryRow(r.Context(), `SELECT id,owner_kind,owner_identity,semantic_identity_sha256 FROM recording_object_key_roots WHERE storage_destination_id=$1 AND bucket=$2 AND object_key=$3 FOR UPDATE`, destinationID, bucket, objectKey).Scan(&rootID, &ownerKind, &ownerIdentity, &existingSemantic); err != nil || ownerKind != "capture_artifact" || ownerIdentity != setID.String()+":"+strconv.Itoa(req.Ordinal)+":"+artifactID.String() || existingSemantic != semanticSHA {
+			util.WriteError(w, http.StatusConflict, "capture destination key is owned by another artifact")
+			return
+		}
+	}
+	expiresAt := time.Now().UTC().Add(s.cfg.R2SignPutTTL)
+	if _, err = tx.Exec(r.Context(), `
+		INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,'video/mp4',$9,'pending',$10)
+		ON CONFLICT(id) DO NOTHING
+	`, artifactID, recordingID, req.JobID, destinationID, endpoint, bucket, objectKey, displayPath, surrenderplan.RecoveryArtifactMaxBytes, expiresAt); err != nil {
+		util.WriteError(w, http.StatusConflict, "create capture upload identity")
+		return
+	}
+	var uploadStatus recordingUploadIntentStatus
+	var uploadExact bool
+	if err = tx.QueryRow(r.Context(), `
+		SELECT recording_id=$2 AND recording_job_id=$3 AND storage_destination_id=$4
+		 AND endpoint=$5 AND bucket=$6 AND object_key=$7 AND display_path=$8
+		 AND mime_type='video/mp4' AND max_size_bytes=$9,status
+		FROM recording_upload_intents WHERE id=$1 FOR UPDATE
+	`, artifactID, recordingID, req.JobID, destinationID, endpoint, bucket, objectKey, displayPath, surrenderplan.RecoveryArtifactMaxBytes).Scan(&uploadExact, &uploadStatus); err != nil || !uploadExact {
+		util.WriteError(w, http.StatusConflict, "capture upload identity replay differs")
+		return
+	}
+	tag, err = tx.Exec(r.Context(), `
+		INSERT INTO recording_capture_materialized_artifact_seals(set_id,ordinal,artifact_id,capture_sequence,segment_start_microseconds,size_bytes,sha256,storage_destination_id,object_key_root_id)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(set_id,ordinal) DO NOTHING
+	`, setID, req.Ordinal, artifactID, req.CaptureSequence, req.SegmentStartUS, req.SizeBytes, sha, destinationID, rootID)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "seal capture artifact")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		var exact bool
+		if err = tx.QueryRow(r.Context(), `SELECT artifact_id=$3 AND capture_sequence=$4 AND segment_start_microseconds=$5 AND size_bytes=$6 AND sha256=$7 AND storage_destination_id=$8 AND object_key_root_id=$9 FROM recording_capture_materialized_artifact_seals WHERE set_id=$1 AND ordinal=$2`, setID, req.Ordinal, artifactID, req.CaptureSequence, req.SegmentStartUS, req.SizeBytes, sha, destinationID, rootID).Scan(&exact); err != nil || !exact {
+			util.WriteError(w, http.StatusConflict, "capture artifact seal replay differs")
+			return
+		}
+	}
+	if uploadStatus != recordingUploadIntentPending && uploadStatus != recordingUploadIntentExpired && uploadStatus != recordingUploadIntentConsumed {
+		util.WriteError(w, http.StatusConflict, "capture upload identity is unavailable")
+		return
+	}
+	if uploadStatus == recordingUploadIntentExpired {
+		if _, err = tx.Exec(r.Context(), `UPDATE recording_upload_intents SET status='pending',expires_at=$2 WHERE id=$1 AND status='expired'`, artifactID, expiresAt); err != nil {
+			util.WriteError(w, http.StatusConflict, "refresh capture upload identity")
+			return
+		}
+		uploadStatus = recordingUploadIntentPending
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit capture artifact seal")
+		return
+	}
+	if uploadStatus == recordingUploadIntentConsumed {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"intent_id": artifactID.String(), "already_ingested": true})
+		return
+	}
+	secret, err := s.secrets.Decrypt(secretEnc)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "decrypt destination secret")
+		return
+	}
+	client, err := r2.New(r.Context(), r2.Config{AccessKey: accessKeyID, SecretKey: string(secret), Region: region, Bucket: bucket, Endpoint: endpoint})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "build destination client")
+		return
+	}
+	uploadURL, err := client.PresignPut(r.Context(), objectKey, "video/mp4", s.cfg.R2SignPutTTL)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "presign capture artifact")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"intent_id": artifactID.String(), "upload_url": uploadURL, "object_key": objectKey, "bucket": bucket, "endpoint": endpoint, "content_type": "video/mp4", "max_size_bytes": surrenderplan.RecoveryArtifactMaxBytes, "expires_at": expiresAt})
 }
 
 func sealRecordingCaptureArtifact(ctx context.Context, tx pgx.Tx, req recordingCaptureArtifactSealRequest, intentID uuid.UUID, leaseToken *uuid.UUID, workerID string) error {
@@ -1208,6 +1427,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	if leaseToken != nil {
+		if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "lock clip ingest claim authority")
+			return
+		}
 		if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, recordingSurrenderJobLockKey(req.JobID)); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, "lock clip ingest generation")
 			return
@@ -1249,7 +1472,12 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		JOIN storage_destinations sd ON sd.id = ui.storage_destination_id
 		WHERE ui.id=$1 AND ui.status='pending' AND (
 		  (NOT $4 AND j.status='leased' AND j.lease_owner=$2
-		    AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > transaction_timestamp())
+		    AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > transaction_timestamp()
+		    AND (j.lease_credential_state='legacy_unknown' OR
+		         (j.lease_credential_state='exact' AND j.lease_node_token_id=$8
+		          AND EXISTS(SELECT 1 FROM node_tokens token WHERE token.id=$8 AND token.node_id=$9
+		            AND token.recording_claim_generation=j.lease_claim_generation
+		            AND token.recording_claim_purpose IN('claim_current','existing_fence_only') AND token.revoked_at IS NULL))))
 			  OR ($4 AND EXISTS(
 			    SELECT 1 FROM recording_job_recovery_grants grant_row
 			    WHERE grant_row.upload_intent_id=ui.id AND grant_row.id=$6
@@ -1260,7 +1488,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		-- clip commits before surrender computes had_clips; if surrender wins, this
 		-- rechecks the lease after waiting and rejects the old generation.
 		FOR UPDATE OF ui, j
-	`, intentID, workerID, leaseToken, recovering, recovery.LeaseToken, recovery.GrantID, recovery.ProducerID).Scan(
+	`, intentID, workerID, leaseToken, recovering, recovery.LeaseToken, recovery.GrantID, recovery.ProducerID, principal.NodeTokenID, principal.NodeID).Scan(
 		&recordingID, &jobID, &destID, &endpoint, &region,
 		&bucket, &objectKey, &displayPath, &mimeType, &maxSize, &fireAt,
 		&jobKind, &windowEndAt, &clipDurationSec, &recordingStatus,
@@ -1316,6 +1544,8 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	// generation head. Lock it after the job+intent rows and before any clip
 	// insertion; surrender takes the same job -> head order.
 	v1Head := false
+	var captureSetID *uuid.UUID
+	var captureSetOrdinal *int
 	var headVersion int64
 	err = tx.QueryRow(r.Context(), `
 		SELECT h.version
@@ -1330,6 +1560,25 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusInternalServerError, "lock accepted-unique head")
 		return
+	}
+	if !v1Head {
+		var setID uuid.UUID
+		var ordinal int
+		err = tx.QueryRow(r.Context(), `
+			SELECT seal.set_id,seal.ordinal,h.version
+			FROM recording_capture_materialized_artifact_seals seal
+			JOIN recording_capture_reservation_sets capture_set ON capture_set.id=seal.set_id
+			JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+			JOIN recording_job_unique_heads h ON h.recording_job_id=plan.recording_job_id AND h.lease_token=plan.lease_token
+			WHERE seal.artifact_id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
+			FOR UPDATE OF h
+		`, intentID, jobID, captureLeaseToken).Scan(&setID, &ordinal, &headVersion)
+		if err == nil {
+			v1Head, captureSetID, captureSetOrdinal = true, &setID, &ordinal
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, "lock capture set accepted-unique head")
+			return
+		}
 	}
 
 	// Ingest sanity check (log only, never reject): a clip whose start lands far outside
@@ -1510,9 +1759,16 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 			util.WriteError(w, http.StatusInternalServerError, "advance accepted-unique head")
 			return
 		}
-		if _, err := tx.Exec(r.Context(), `INSERT INTO recording_capture_artifact_results(upload_intent_id,result,clip_id,head_version) VALUES($1,'accepted_unique',$2,$3)`, intentID, clipID, headVersion); err != nil {
-			util.WriteError(w, http.StatusConflict, "seal accepted capture artifact result")
-			return
+		if captureSetID != nil && captureSetOrdinal != nil {
+			if _, err := tx.Exec(r.Context(), `INSERT INTO recording_capture_artifact_grant_results(set_id,ordinal,result,clip_id) VALUES($1,$2,'accepted_unique',$3)`, captureSetID, captureSetOrdinal, clipID); err != nil {
+				util.WriteError(w, http.StatusConflict, "seal accepted capture set artifact result")
+				return
+			}
+		} else {
+			if _, err := tx.Exec(r.Context(), `INSERT INTO recording_capture_artifact_results(upload_intent_id,result,clip_id,head_version) VALUES($1,'accepted_unique',$2,$3)`, intentID, clipID, headVersion); err != nil {
+				util.WriteError(w, http.StatusConflict, "seal accepted capture artifact result")
+				return
+			}
 		}
 		if recovering {
 			if _, err := tx.Exec(r.Context(), `UPDATE recording_job_recovery_grants SET revoked_at=transaction_timestamp(),revoke_reason='recovery_completed' WHERE id=$1 AND upload_intent_id=$2 AND revoked_at IS NULL`, recovery.GrantID, intentID); err != nil {
@@ -1638,6 +1894,12 @@ const recordingJobHeartbeatSQL = `
 	    ), updated_at = now()
 	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 	  AND j.lease_token IS NOT DISTINCT FROM $4 AND j.lease_expires_at > now()
+	  AND (j.lease_credential_state='legacy_unknown'
+	       OR (j.lease_credential_state='exact' AND j.lease_node_token_id=$6
+	           AND EXISTS(SELECT 1 FROM node_tokens token WHERE token.id=$6 AND token.node_id=$7
+	             AND token.recording_claim_generation=j.lease_claim_generation
+	             AND token.recording_claim_purpose IN('claim_current','existing_fence_only')
+	             AND token.revoked_at IS NULL)))
 	  AND (j.kind<>'continuous_window'
 	       OR (j.window_end_at IS NOT NULL
 	           AND j.window_end_at + make_interval(secs => $5) > now()))
@@ -1645,30 +1907,45 @@ const recordingJobHeartbeatSQL = `
 `
 
 func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrincipal, jobID int64, workerID string, leaseToken *uuid.UUID) (time.Time, error) {
+	expires, _, err := s.heartbeatRecordingJobState(ctx, principal, jobID, workerID, leaseToken)
+	return expires, err
+}
+
+func (s *Server) heartbeatRecordingJobState(ctx context.Context, principal nodePrincipal, jobID int64, workerID string, leaseToken *uuid.UUID) (time.Time, bool, error) {
 	var leaseExpiresAt time.Time
-	if principal.NodeType != nodeTypeRelay {
-		err := s.pool.QueryRow(ctx, recordingJobHeartbeatSQL,
-			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken,
-			recordingContinuousPostWindowLeaseSec).Scan(&leaseExpiresAt)
-		return leaseExpiresAt, err
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return leaseExpiresAt, err
+		return leaseExpiresAt, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := lockRelayNodeAndGroup(ctx, tx, principal); err != nil {
-		return leaseExpiresAt, err
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return leaseExpiresAt, false, err
+	}
+	if principal.NodeType == nodeTypeRelay {
+		if err := lockRelayNodeAndGroup(ctx, tx, principal); err != nil {
+			return leaseExpiresAt, false, err
+		}
 	}
 	if err := tx.QueryRow(ctx, recordingJobHeartbeatSQL,
 		jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken,
-		recordingContinuousPostWindowLeaseSec).Scan(&leaseExpiresAt); err != nil {
-		return leaseExpiresAt, err
+		recordingContinuousPostWindowLeaseSec, principal.NodeTokenID, principal.NodeID).Scan(&leaseExpiresAt); err != nil {
+		return leaseExpiresAt, false, err
+	}
+	var stopRequired bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+		 SELECT 1 FROM recording_capture_producer_stop_events stop
+		 JOIN recording_capture_reservation_sets capture_set ON capture_set.id=stop.set_id
+		 JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+		 WHERE plan.recording_job_id=$1 AND plan.lease_token=$2
+		   AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=stop.id))
+	`, jobID, leaseToken).Scan(&stopRequired); err != nil {
+		return leaseExpiresAt, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return leaseExpiresAt, err
+		return leaseExpiresAt, false, err
 	}
-	return leaseExpiresAt, nil
+	return leaseExpiresAt, stopRequired, nil
 }
 
 // handleRecordingJobHeartbeat extends the lease (and touches the droplet
@@ -1692,7 +1969,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	leaseExpiresAt, err := s.heartbeatRecordingJob(r.Context(), principal, id, workerID, leaseToken)
+	leaseExpiresAt, stopRequired, err := s.heartbeatRecordingJobState(r.Context(), principal, id, workerID, leaseToken)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Not owned / not leased anymore (canceled, reclaimed, or completed).
 		util.WriteJSON(w, http.StatusConflict, map[string]any{"cancel": true})
@@ -1704,7 +1981,7 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 	}
 	// Touch the droplet liveness row if this worker is a managed droplet.
 	_ = s.touchDropletLiveness(r.Context(), workerID, principal.NodeID, "")
-	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"cancel": false, "lease_expires_at": leaseExpiresAt, "stop_required": stopRequired})
 }
 
 // handleRecordingDropletHeartbeat records droplet liveness independent of any

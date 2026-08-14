@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/google/uuid"
 )
 
@@ -893,7 +894,7 @@ while :; do sleep 0.1; done
 			deliveredAttemptIDs = append(deliveredAttemptIDs, seg.CaptureAttemptID)
 			cancel()
 			return nil
-		}, "", time.Second, 5*time.Second, true,
+		}, "", time.Second, 5*time.Second, true, nil,
 	)
 	if err != nil {
 		t.Fatalf("capture malformed-audio fallback: %v", err)
@@ -1098,6 +1099,24 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 	wantTail := []string{"-f", "segment", "-segment_time", "60", "-reset_timestamps", "1", "-segment_format", "mp4", "-strftime", "1", "/out/seg-%Y%m%d-%H%M%S.mp4"}
 	if got := args[len(args)-len(wantTail):]; !slices.Equal(got, wantTail) {
 		t.Fatalf("legacy mux tail=%q want exact %q", got, wantTail)
+	}
+}
+
+func TestApplyFiniteContinuousPlanPinsCardinalityAndPTSOrigin(t *testing.T) {
+	start := time.Date(2026, 8, 14, 7, 0, 0, 500000000, time.UTC)
+	plan, err := surrenderplan.Build(start, start.Add(3*time.Minute+250*time.Millisecond), 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := buildFFmpegContinuousArgs("https://example.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4", time.Minute, "", nil)
+	joined := strings.Join(applyFiniteContinuousPlan(args, plan), "\n")
+	for _, want := range []string{"-copyts\n-start_at_zero\n-i", "-segment_times\n60,120,180", "-t\n180.25", "-reset_timestamps\n1"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("finite args missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "-segment_time\n") {
+		t.Fatalf("open-ended segment_time survived finite plan:\n%s", joined)
 	}
 }
 

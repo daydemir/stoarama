@@ -12,6 +12,465 @@ CREATE UNIQUE INDEX uq_recording_clips_capture_sha256
   ON recording_clips(recording_job_id,capture_lease_token,sha256)
   WHERE capture_lease_token IS NOT NULL AND sha256<>'' AND surrender_transport_version=0;
 
+-- R10 claim credentials split new-claim authority from heartbeat and already-
+-- fenced media authority. Existing live jobs are intentionally legacy_unknown:
+-- their historical authenticating token was never persisted and is not guessed.
+ALTER TABLE node_tokens
+  ADD COLUMN recording_claim_generation BIGINT,
+  ADD COLUMN recording_claim_purpose TEXT NOT NULL DEFAULT 'legacy_full'
+    CHECK(recording_claim_purpose IN('legacy_full','claim_current','existing_fence_only'));
+ALTER TABLE recording_jobs
+  ADD COLUMN lease_node_token_id BIGINT REFERENCES node_tokens(id) ON DELETE RESTRICT,
+  ADD COLUMN lease_claim_generation BIGINT,
+  ADD COLUMN lease_credential_state TEXT NOT NULL DEFAULT 'legacy_unknown'
+    CHECK(lease_credential_state IN('legacy_unknown','exact'));
+
+ALTER TABLE recording_jobs ADD CONSTRAINT recording_jobs_lease_credential_identity_chk CHECK(
+  (lease_credential_state='legacy_unknown' AND lease_node_token_id IS NULL AND lease_claim_generation IS NULL)
+  OR (lease_credential_state='exact' AND lease_token IS NOT NULL
+      AND lease_node_token_id IS NOT NULL AND lease_claim_generation>0)
+);
+
+CREATE TABLE recording_worker_claim_heads (
+  node_id BIGINT PRIMARY KEY REFERENCES nodes(id) ON DELETE RESTRICT,
+  generation BIGINT NOT NULL CHECK(generation>0),
+  claim_token_id BIGINT NOT NULL UNIQUE REFERENCES node_tokens(id) ON DELETE RESTRICT,
+  state TEXT NOT NULL CHECK(state IN('enabled','recovery_blocked','successor_pending')),
+  blocked_at TIMESTAMPTZ,
+  block_reason TEXT CHECK(block_reason IS NULL OR block_reason IN('durable_recovery','security_incident')),
+  CHECK((state='enabled' AND blocked_at IS NULL AND block_reason IS NULL)
+     OR (state<>'enabled' AND blocked_at IS NOT NULL AND block_reason IS NOT NULL))
+);
+
+CREATE TABLE recording_worker_claim_generation_events (
+  node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+  generation BIGINT NOT NULL CHECK(generation>0),
+  predecessor_generation BIGINT,
+  claim_token_id BIGINT NOT NULL REFERENCES node_tokens(id) ON DELETE RESTRICT,
+  event_type TEXT NOT NULL CHECK(event_type IN('baseline','recovery_blocked','successor_proposed','enabled','retired','host_lost')),
+  event_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  facts_sha256 TEXT NOT NULL CHECK(facts_sha256~'^[0-9a-f]{64}$'),
+  PRIMARY KEY(node_id,generation,event_type),
+  CHECK((generation=1 AND predecessor_generation IS NULL) OR (generation>1 AND predecessor_generation=generation-1))
+);
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT node_id FROM node_tokens WHERE revoked_at IS NULL
+    GROUP BY node_id HAVING count(*)<>1
+  ) THEN
+    RAISE EXCEPTION 'recording claim credential migration requires exactly one live token per enrolled node';
+  END IF;
+END $$;
+
+UPDATE node_tokens
+SET recording_claim_generation=1,recording_claim_purpose='claim_current'
+WHERE revoked_at IS NULL;
+
+INSERT INTO recording_worker_claim_heads(node_id,generation,claim_token_id,state)
+SELECT node_id,1,id,'enabled' FROM node_tokens WHERE revoked_at IS NULL;
+
+INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
+SELECT node_id,1,NULL,id,'baseline',
+       encode(sha256(convert_to('recording-worker-claim-baseline-v1'||chr(0)||node_id::text||chr(0)||id::text,'UTF8')),'hex')
+FROM node_tokens WHERE revoked_at IS NULL;
+
+CREATE FUNCTION recording_surrender_normalize_lease_credential() RETURNS trigger
+LANGUAGE plpgsql SET search_path=pg_catalog,public AS $$
+BEGIN
+  IF NEW.lease_token IS NULL THEN
+    NEW.lease_node_token_id:=NULL;
+    NEW.lease_claim_generation:=NULL;
+    NEW.lease_credential_state:='legacy_unknown';
+  ELSIF NEW.lease_token IS DISTINCT FROM OLD.lease_token
+        AND (NEW.lease_node_token_id IS NULL OR NEW.lease_claim_generation IS NULL) THEN
+    NEW.lease_node_token_id:=NULL;
+    NEW.lease_claim_generation:=NULL;
+    NEW.lease_credential_state:='legacy_unknown';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER recording_surrender_normalize_lease_credential_trg
+BEFORE UPDATE OF lease_token,lease_node_token_id,lease_claim_generation,lease_credential_state ON recording_jobs
+FOR EACH ROW EXECUTE FUNCTION recording_surrender_normalize_lease_credential();
+
+-- One server-authored plan has one append-only outcome. The split-list digest
+-- and integer-microsecond facts are independent of session TimeZone/DateStyle.
+CREATE TABLE recording_capture_set_plans (
+  id UUID PRIMARY KEY,
+  set_id UUID NOT NULL UNIQUE,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE RESTRICT,
+  recording_job_id BIGINT NOT NULL REFERENCES recording_jobs(id) ON DELETE RESTRICT,
+  lease_token UUID NOT NULL,
+  origin_claim_generation BIGINT,
+  producer_id UUID NOT NULL,
+  capture_ordinal BIGINT NOT NULL CHECK(capture_ordinal>0),
+  first_capture_sequence BIGINT NOT NULL CHECK(first_capture_sequence>0),
+  snapshot_generation BIGINT NOT NULL CHECK(snapshot_generation>0),
+  source_snapshot JSONB NOT NULL,
+  source_snapshot_sha256 TEXT NOT NULL CHECK(source_snapshot_sha256~'^[0-9a-f]{64}$'),
+  destination_naming_snapshot JSONB NOT NULL,
+  destination_naming_sha256 TEXT NOT NULL CHECK(destination_naming_sha256~'^[0-9a-f]{64}$'),
+  plan_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  window_end_at TIMESTAMPTZ NOT NULL,
+  duration_microseconds BIGINT NOT NULL CHECK(duration_microseconds>0),
+  clip_duration_seconds INTEGER NOT NULL CHECK(clip_duration_seconds BETWEEN 5 AND 900),
+  artifact_count INTEGER NOT NULL CHECK(artifact_count BETWEEN 1 AND 12288),
+  segment_times_argument TEXT NOT NULL CHECK(octet_length(segment_times_argument)<=65536),
+  segment_times_sha256 TEXT NOT NULL CHECK(segment_times_sha256~'^[0-9a-f]{64}$'),
+  max_artifact_bytes BIGINT NOT NULL CHECK(max_artifact_bytes=33554432),
+  expires_at TIMESTAMPTZ NOT NULL,
+  UNIQUE(recording_job_id,lease_token,capture_ordinal),
+  CHECK(window_end_at>plan_at AND duration_microseconds=(extract(epoch FROM(window_end_at-plan_at))*1000000)::bigint),
+  CHECK(expires_at=plan_at+interval '30 seconds')
+);
+
+CREATE TABLE recording_capture_set_plan_results (
+  plan_id UUID PRIMARY KEY REFERENCES recording_capture_set_plans(id) ON DELETE RESTRICT,
+  result TEXT NOT NULL CHECK(result IN('accepted_set','expired_no_bytes','abandoned_no_bytes')),
+  set_id UUID,
+  result_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  CHECK((result='accepted_set' AND set_id IS NOT NULL) OR (result<>'accepted_set' AND set_id IS NULL))
+);
+
+CREATE TABLE recording_capture_reservation_sets (
+  id UUID PRIMARY KEY,
+  plan_id UUID NOT NULL UNIQUE REFERENCES recording_capture_set_plans(id) ON DELETE RESTRICT,
+  merkle_root_sha256 TEXT NOT NULL CHECK(merkle_root_sha256~'^[0-9a-f]{64}$'),
+  artifact_count INTEGER NOT NULL CHECK(artifact_count BETWEEN 1 AND 12288),
+  committed_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  UNIQUE(id,artifact_count)
+);
+
+CREATE TABLE recording_capture_producer_stop_events (
+  id UUID PRIMARY KEY,
+  set_id UUID NOT NULL REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  old_snapshot_generation BIGINT NOT NULL CHECK(old_snapshot_generation>0),
+  new_snapshot_generation BIGINT NOT NULL CHECK(new_snapshot_generation>old_snapshot_generation),
+  required_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  UNIQUE(set_id,new_snapshot_generation)
+);
+
+CREATE TABLE recording_capture_producer_stop_acks (
+  id UUID PRIMARY KEY,
+  stop_event_id UUID NOT NULL UNIQUE REFERENCES recording_capture_producer_stop_events(id) ON DELETE RESTRICT,
+  set_id UUID NOT NULL REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  inventory_sha256 TEXT NOT NULL CHECK(inventory_sha256~'^[0-9a-f]{64}$'),
+  retained_directory_device BIGINT NOT NULL CHECK(retained_directory_device>=0),
+  retained_directory_inode BIGINT NOT NULL CHECK(retained_directory_inode>0),
+  acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp()
+);
+
+CREATE FUNCTION recording_surrender_append_stream_stop_events() RETURNS trigger
+LANGUAGE plpgsql SET search_path=pg_catalog,public AS $$
+BEGIN
+  IF (OLD.source_url,OLD.source_page_url,OLD.provider,OLD.external_id,OLD.source_family,
+      OLD.capture_type,OLD.execution_class,OLD.execution_config_jsonb)
+     IS NOT DISTINCT FROM
+     (NEW.source_url,NEW.source_page_url,NEW.provider,NEW.external_id,NEW.source_family,
+      NEW.capture_type,NEW.execution_class,NEW.execution_config_jsonb) THEN
+    RETURN NEW;
+  END IF;
+  INSERT INTO recording_capture_producer_stop_events(id,set_id,old_snapshot_generation,new_snapshot_generation)
+  SELECT gen_random_uuid(),capture_set.id,plan.snapshot_generation,
+         plan.snapshot_generation+1+COALESCE((SELECT count(*) FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id),0)
+  FROM recording_capture_reservation_sets capture_set
+  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+  WHERE (plan.source_snapshot->>'stream_id')::bigint=NEW.id
+    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
+    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id
+                   AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=prior.id));
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER recording_surrender_append_stream_stop_events_trg
+AFTER UPDATE OF source_url,source_page_url,provider,external_id,source_family,capture_type,execution_class,execution_config_jsonb ON streams
+FOR EACH ROW EXECUTE FUNCTION recording_surrender_append_stream_stop_events();
+
+CREATE TABLE recording_capture_stop_ack_members (
+  stop_ack_id UUID NOT NULL REFERENCES recording_capture_producer_stop_acks(id) ON DELETE RESTRICT,
+  ordinal INTEGER NOT NULL CHECK(ordinal>0),
+  artifact_id UUID NOT NULL,
+  device BIGINT NOT NULL CHECK(device>=0),
+  inode BIGINT NOT NULL CHECK(inode>0),
+  relative_name TEXT NOT NULL CHECK(relative_name~'^seg-[0-9]{8}-[0-9]{6}\.mp4$'),
+  PRIMARY KEY(stop_ack_id,ordinal),
+  UNIQUE(stop_ack_id,artifact_id),
+  UNIQUE(stop_ack_id,device,inode)
+);
+
+CREATE TABLE recording_capture_set_grants (
+  id UUID PRIMARY KEY,
+  set_id UUID NOT NULL UNIQUE REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  origin_claim_generation BIGINT,
+  recovery_block_generation BIGINT NOT NULL CHECK(recovery_block_generation>0),
+  granted_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  upload_grace_until TIMESTAMPTZ NOT NULL,
+  CHECK(upload_grace_until=granted_at+interval '30 minutes')
+);
+
+CREATE TABLE recording_capture_materialized_artifacts (
+  set_id UUID NOT NULL REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  ordinal INTEGER NOT NULL CHECK(ordinal>0),
+  artifact_id UUID NOT NULL UNIQUE,
+  recovery_secret_sha256 TEXT NOT NULL CHECK(recovery_secret_sha256~'^[0-9a-f]{64}$'),
+  capture_sequence BIGINT NOT NULL CHECK(capture_sequence>0),
+  proof JSONB NOT NULL,
+  proof_sha256 TEXT NOT NULL CHECK(proof_sha256~'^[0-9a-f]{64}$'),
+  materialized_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  PRIMARY KEY(set_id,ordinal),
+  UNIQUE(set_id,capture_sequence)
+);
+
+CREATE TABLE recording_capture_materialized_artifact_seals (
+  set_id UUID NOT NULL,
+  ordinal INTEGER NOT NULL,
+  artifact_id UUID NOT NULL UNIQUE,
+  capture_sequence BIGINT NOT NULL CHECK(capture_sequence>0),
+  segment_start_microseconds BIGINT NOT NULL,
+  size_bytes BIGINT NOT NULL CHECK(size_bytes BETWEEN 1 AND 33554432),
+  sha256 TEXT NOT NULL CHECK(sha256~'^[0-9a-f]{64}$'),
+  storage_destination_id BIGINT NOT NULL REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  object_key_root_id UUID NOT NULL UNIQUE,
+  sealed_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  PRIMARY KEY(set_id,ordinal),
+  FOREIGN KEY(set_id,ordinal) REFERENCES recording_capture_materialized_artifacts(set_id,ordinal) ON DELETE RESTRICT,
+  FOREIGN KEY(artifact_id) REFERENCES recording_upload_intents(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE recording_capture_recovery_reports (
+  id UUID PRIMARY KEY,
+  set_id UUID NOT NULL,
+  ordinal INTEGER NOT NULL,
+  report_type TEXT NOT NULL CHECK(report_type IN('no_bytes','partial_bytes','sealed_bytes')),
+  size_bytes BIGINT,
+  sha256 TEXT,
+  local_observed_at TIMESTAMPTZ NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  FOREIGN KEY(set_id,ordinal) REFERENCES recording_capture_materialized_artifacts(set_id,ordinal) ON DELETE RESTRICT,
+  CHECK((report_type='no_bytes' AND size_bytes IS NULL AND sha256 IS NULL)
+     OR (report_type<>'no_bytes' AND size_bytes>0 AND sha256~'^[0-9a-f]{64}$'))
+);
+
+CREATE TABLE recording_capture_artifact_grant_results (
+  set_id UUID NOT NULL,
+  ordinal INTEGER NOT NULL,
+  result TEXT NOT NULL CHECK(result IN('accepted_unique','exact_replay','abandoned_no_bytes','unrecoverable_partial','host_unreachable','security_revoked')),
+  report_id UUID REFERENCES recording_capture_recovery_reports(id) ON DELETE RESTRICT,
+  clip_id BIGINT REFERENCES recording_clips(id) ON DELETE RESTRICT,
+  security_event_id UUID,
+  result_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  PRIMARY KEY(set_id,ordinal),
+  FOREIGN KEY(set_id,ordinal) REFERENCES recording_capture_materialized_artifacts(set_id,ordinal) ON DELETE RESTRICT
+);
+
+CREATE TABLE recording_capture_set_results (
+  set_id UUID PRIMARY KEY REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  result TEXT NOT NULL CHECK(result IN('completed','host_unreachable','security_revoked')),
+  coverage_ranges JSONB NOT NULL,
+  coverage_sha256 TEXT NOT NULL CHECK(coverage_sha256~'^[0-9a-f]{64}$'),
+  result_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp()
+);
+
+CREATE TABLE recording_capture_security_events (
+  id UUID PRIMARY KEY,
+  set_id UUID NOT NULL REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  ordinal INTEGER,
+  actor_user_id BIGINT REFERENCES users(id) ON DELETE RESTRICT,
+  reason TEXT NOT NULL CHECK(reason IN('suspected_capability_compromise','suspected_seed_compromise','host_lost')),
+  idempotency_key UUID NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  CHECK(ordinal IS NULL OR ordinal>0)
+);
+
+CREATE TABLE recording_object_key_roots (
+  id UUID PRIMARY KEY,
+  storage_destination_id BIGINT NOT NULL REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  bucket TEXT NOT NULL,
+  object_key TEXT NOT NULL,
+  owner_kind TEXT NOT NULL CHECK(owner_kind IN('legacy_intent','legacy_clip','capture_artifact')),
+  owner_identity TEXT NOT NULL,
+  semantic_identity_sha256 TEXT NOT NULL CHECK(semantic_identity_sha256~'^[0-9a-f]{64}$'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  UNIQUE(storage_destination_id,bucket,object_key)
+);
+
+ALTER TABLE recording_capture_materialized_artifact_seals
+  ADD CONSTRAINT recording_capture_materialized_artifact_seals_key_root_fk
+  FOREIGN KEY(object_key_root_id) REFERENCES recording_object_key_roots(id) ON DELETE RESTRICT;
+
+-- Freeze every legacy writer while reconstructing global destination ownership.
+-- A consumed intent and its exact clip are one lifecycle owner; ambiguity is a
+-- migration error and is never guessed from SHA or object key alone.
+LOCK TABLE recording_upload_intents,recording_clips IN SHARE ROW EXCLUSIVE MODE;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT intent.id
+    FROM recording_upload_intents intent
+    WHERE intent.status='consumed'
+      AND (SELECT count(*) FROM recording_clips clip
+           WHERE clip.recording_id=intent.recording_id
+             AND clip.recording_job_id=intent.recording_job_id
+             AND clip.storage_destination_id=intent.storage_destination_id
+             AND clip.endpoint=intent.endpoint AND clip.bucket=intent.bucket
+             AND clip.object_key=intent.object_key)<>1
+  ) THEN
+    RAISE EXCEPTION 'consumed recording intent has ambiguous historical clip identity';
+  END IF;
+  IF EXISTS (
+    SELECT clip.id
+    FROM recording_clips clip
+    WHERE (SELECT count(*) FROM recording_upload_intents intent
+           WHERE intent.status='consumed' AND intent.recording_id=clip.recording_id
+             AND intent.recording_job_id=clip.recording_job_id
+             AND intent.storage_destination_id=clip.storage_destination_id
+             AND intent.endpoint=clip.endpoint AND intent.bucket=clip.bucket
+             AND intent.object_key=clip.object_key)>1
+  ) THEN
+    RAISE EXCEPTION 'historical clip has ambiguous consumed intent identity';
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT storage_destination_id,bucket,object_key
+    FROM (
+      SELECT intent.storage_destination_id,intent.bucket,intent.object_key
+      FROM recording_upload_intents intent
+      UNION ALL
+      SELECT clip.storage_destination_id,clip.bucket,clip.object_key
+      FROM recording_clips clip
+      WHERE NOT EXISTS(
+        SELECT 1 FROM recording_upload_intents intent
+        WHERE intent.status='consumed' AND intent.recording_id=clip.recording_id
+          AND intent.recording_job_id=clip.recording_job_id
+          AND intent.storage_destination_id=clip.storage_destination_id
+          AND intent.endpoint=clip.endpoint AND intent.bucket=clip.bucket AND intent.object_key=clip.object_key)
+    ) owner
+    GROUP BY storage_destination_id,bucket,object_key HAVING count(*)<>1
+  ) THEN
+    RAISE EXCEPTION 'historical recording destination ownership is ambiguous';
+  END IF;
+END $$;
+
+WITH owners AS (
+  SELECT intent.storage_destination_id,intent.bucket,intent.object_key,
+         CASE WHEN intent.status='consumed' THEN 'legacy_clip' ELSE 'legacy_intent' END owner_kind,
+         CASE WHEN intent.status='consumed'
+              THEN 'intent:'||intent.id::text||':clip:'||clip.id::text
+              ELSE 'intent:'||intent.id::text END owner_identity
+  FROM recording_upload_intents intent
+  LEFT JOIN recording_clips clip ON intent.status='consumed'
+    AND clip.recording_id=intent.recording_id AND clip.recording_job_id=intent.recording_job_id
+    AND clip.storage_destination_id=intent.storage_destination_id
+    AND clip.endpoint=intent.endpoint AND clip.bucket=intent.bucket AND clip.object_key=intent.object_key
+  UNION ALL
+  SELECT clip.storage_destination_id,clip.bucket,clip.object_key,'legacy_clip','clip:'||clip.id::text
+  FROM recording_clips clip
+  WHERE NOT EXISTS(
+    SELECT 1 FROM recording_upload_intents intent
+    WHERE intent.status='consumed' AND intent.recording_id=clip.recording_id
+      AND intent.recording_job_id=clip.recording_job_id
+      AND intent.storage_destination_id=clip.storage_destination_id
+      AND intent.endpoint=clip.endpoint AND intent.bucket=clip.bucket AND intent.object_key=clip.object_key)
+)
+INSERT INTO recording_object_key_roots(id,storage_destination_id,bucket,object_key,owner_kind,owner_identity,semantic_identity_sha256)
+SELECT gen_random_uuid(),storage_destination_id,bucket,object_key,owner_kind,owner_identity,
+       encode(sha256(convert_to('recording-object-key-owner-v1'||chr(0)||owner_kind||chr(0)||owner_identity,'UTF8')),'hex')
+FROM owners;
+
+CREATE FUNCTION recording_surrender_reserve_legacy_intent_key() RETURNS trigger
+LANGUAGE plpgsql SET search_path=pg_catalog,public AS $$
+DECLARE root RECORD; expected_identity TEXT:='intent:'||NEW.id::text;
+BEGIN
+  IF TG_OP='UPDATE' THEN
+    IF (NEW.id,NEW.storage_destination_id,NEW.bucket,NEW.object_key)
+       IS DISTINCT FROM (OLD.id,OLD.storage_destination_id,OLD.bucket,OLD.object_key) THEN
+      RAISE EXCEPTION 'recording upload destination identity is immutable';
+    END IF;
+    RETURN NEW;
+  END IF;
+  SELECT * INTO root FROM recording_object_key_roots
+  WHERE storage_destination_id=NEW.storage_destination_id AND bucket=NEW.bucket AND object_key=NEW.object_key
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    INSERT INTO recording_object_key_roots(id,storage_destination_id,bucket,object_key,owner_kind,owner_identity,semantic_identity_sha256)
+    VALUES(gen_random_uuid(),NEW.storage_destination_id,NEW.bucket,NEW.object_key,'legacy_intent',expected_identity,
+      encode(sha256(convert_to('recording-object-key-owner-v1'||chr(0)||'legacy_intent'||chr(0)||expected_identity,'UTF8')),'hex'));
+  ELSIF NOT ((root.owner_kind='legacy_intent' AND root.owner_identity=expected_identity)
+          OR (root.owner_kind='legacy_clip' AND root.owner_identity LIKE expected_identity||':clip:%')
+          OR (root.owner_kind='capture_artifact' AND root.owner_identity LIKE '%:'||NEW.id::text)) THEN
+    RAISE EXCEPTION 'recording destination key belongs to another artifact';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER recording_upload_intents_key_root_trg
+BEFORE INSERT OR UPDATE OF id,storage_destination_id,bucket,object_key ON recording_upload_intents
+FOR EACH ROW EXECUTE FUNCTION recording_surrender_reserve_legacy_intent_key();
+
+CREATE FUNCTION recording_surrender_validate_clip_key_root() RETURNS trigger
+LANGUAGE plpgsql SET search_path=pg_catalog,public AS $$
+DECLARE root RECORD; intent_id UUID;
+BEGIN
+  IF TG_OP='UPDATE' THEN
+    IF (NEW.storage_destination_id,NEW.bucket,NEW.object_key)
+       IS DISTINCT FROM (OLD.storage_destination_id,OLD.bucket,OLD.object_key) THEN
+      RAISE EXCEPTION 'recording clip destination identity is immutable';
+    END IF;
+    RETURN NEW;
+  END IF;
+  SELECT * INTO root FROM recording_object_key_roots
+  WHERE storage_destination_id=NEW.storage_destination_id AND bucket=NEW.bucket AND object_key=NEW.object_key
+  FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'recording clip lacks destination key authority'; END IF;
+  SELECT id INTO intent_id FROM recording_upload_intents
+  WHERE recording_id=NEW.recording_id AND recording_job_id=NEW.recording_job_id
+    AND storage_destination_id=NEW.storage_destination_id AND endpoint=NEW.endpoint
+    AND bucket=NEW.bucket AND object_key=NEW.object_key AND status='pending'
+  ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE;
+  IF NOT FOUND OR NOT ((root.owner_kind='legacy_intent' AND root.owner_identity='intent:'||intent_id::text)
+                    OR (root.owner_kind='legacy_clip' AND root.owner_identity LIKE 'intent:'||intent_id::text||':clip:%')
+                    OR (root.owner_kind='capture_artifact' AND root.owner_identity LIKE '%:'||intent_id::text)) THEN
+    RAISE EXCEPTION 'recording clip destination key authority differs';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER recording_clips_key_root_trg
+BEFORE INSERT OR UPDATE OF storage_destination_id,bucket,object_key ON recording_clips
+FOR EACH ROW EXECUTE FUNCTION recording_surrender_validate_clip_key_root();
+
+CREATE TABLE recording_recovery_upload_sessions (
+  id UUID PRIMARY KEY,
+  set_id UUID NOT NULL,
+  ordinal INTEGER NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  declared_bytes BIGINT NOT NULL CHECK(declared_bytes BETWEEN 1 AND 33554432),
+  quarantine_key TEXT NOT NULL UNIQUE,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  deadline_at TIMESTAMPTZ NOT NULL,
+  UNIQUE(set_id,ordinal,revision),
+  FOREIGN KEY(set_id,ordinal) REFERENCES recording_capture_materialized_artifacts(set_id,ordinal) ON DELETE RESTRICT,
+  CHECK(deadline_at<=started_at+interval '5 minutes')
+);
+
+CREATE TABLE recording_recovery_upload_session_results (
+  session_id UUID PRIMARY KEY REFERENCES recording_recovery_upload_sessions(id) ON DELETE RESTRICT,
+  result TEXT NOT NULL CHECK(result IN('quarantined','promoted','disconnect','slow','timeout','hash_mismatch','storage_5xx','response_ambiguous','aborted')),
+  observed_size BIGINT,
+  observed_sha256 TEXT,
+  result_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+  CHECK(observed_sha256 IS NULL OR observed_sha256~'^[0-9a-f]{64}$')
+);
+
 CREATE TABLE recording_job_lease_generations (
   recording_job_id BIGINT NOT NULL REFERENCES recording_jobs(id) ON DELETE RESTRICT,
   lease_token UUID NOT NULL,
@@ -269,6 +728,26 @@ BEGIN
   RAISE EXCEPTION 'recording surrender authority is append-only';
 END $$;
 
+DO $freeze_r10_authority$
+DECLARE table_name TEXT;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY[
+    'recording_worker_claim_generation_events','recording_capture_set_plans',
+    'recording_capture_set_plan_results','recording_capture_reservation_sets',
+    'recording_capture_producer_stop_events','recording_capture_producer_stop_acks',
+    'recording_capture_stop_ack_members','recording_capture_set_grants',
+    'recording_capture_materialized_artifacts','recording_capture_materialized_artifact_seals',
+    'recording_capture_recovery_reports','recording_capture_artifact_grant_results',
+    'recording_capture_set_results','recording_capture_security_events',
+    'recording_object_key_roots','recording_recovery_upload_sessions',
+    'recording_recovery_upload_session_results'
+  ] LOOP
+    EXECUTE format('CREATE TRIGGER %I_freeze BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION recording_surrender_freeze_rows()',table_name,table_name);
+    EXECUTE format('CREATE TRIGGER %I_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION recording_surrender_freeze_rows()',table_name,table_name);
+  END LOOP;
+END
+$freeze_r10_authority$;
+
 CREATE TRIGGER recording_job_lease_generations_freeze BEFORE UPDATE OR DELETE ON recording_job_lease_generations FOR EACH ROW EXECUTE FUNCTION recording_surrender_freeze_rows();
 CREATE TRIGGER recording_job_lease_generations_no_truncate BEFORE TRUNCATE ON recording_job_lease_generations FOR EACH STATEMENT EXECUTE FUNCTION recording_surrender_freeze_rows();
 CREATE TRIGGER recording_capture_producers_freeze BEFORE UPDATE OR DELETE ON recording_capture_producers FOR EACH ROW EXECUTE FUNCTION recording_surrender_freeze_rows();
@@ -332,6 +811,12 @@ BEGIN
       JOIN recording_capture_producers producer ON producer.id=artifact.producer_id
       WHERE producer.recording_job_id=NEW.recording_job_id
         AND result.result='accepted_unique' AND result.result_at=transaction_timestamp()
+	  UNION ALL
+	  SELECT 1 FROM recording_capture_artifact_grant_results result
+	  JOIN recording_capture_reservation_sets capture_set ON capture_set.id=result.set_id
+	  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+	  WHERE plan.recording_job_id=NEW.recording_job_id
+	    AND result.result='accepted_unique' AND result.result_at=transaction_timestamp()
     ) INTO matching_ingest;
     IF OLD.state<>'open' OR NEW.lease_token<>OLD.lease_token OR NEW.reason<>OLD.reason
        OR NEW.resolved_at IS DISTINCT FROM transaction_timestamp() OR NOT matching_ingest THEN
@@ -860,6 +1345,20 @@ BEGIN
     AND seal.capture_sequence=NEW.capture_sequence AND seal.size_bytes=NEW.size_bytes AND seal.sha256=NEW.sha256
     AND intent.storage_destination_id=NEW.storage_destination_id AND intent.endpoint=NEW.endpoint
     AND intent.bucket=NEW.bucket AND intent.object_key=NEW.object_key;
+	IF matches=0 THEN
+	  SELECT count(*) INTO matches
+	  FROM recording_capture_artifact_grant_results result
+	  JOIN recording_capture_materialized_artifact_seals seal
+	    ON seal.set_id=result.set_id AND seal.ordinal=result.ordinal
+	  JOIN recording_capture_reservation_sets capture_set ON capture_set.id=seal.set_id
+	  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+	  JOIN recording_upload_intents intent ON intent.id=seal.artifact_id
+	  WHERE result.clip_id=NEW.id AND result.result IN('accepted_unique','exact_replay')
+	    AND plan.recording_job_id=NEW.recording_job_id AND plan.lease_token=NEW.capture_lease_token
+	    AND seal.capture_sequence=NEW.capture_sequence AND seal.size_bytes=NEW.size_bytes AND seal.sha256=NEW.sha256
+	    AND intent.storage_destination_id=NEW.storage_destination_id AND intent.endpoint=NEW.endpoint
+	    AND intent.bucket=NEW.bucket AND intent.object_key=NEW.object_key;
+	END IF;
   IF matches<>1 THEN RAISE EXCEPTION 'typed surrender clip lacks exact artifact provenance'; END IF;
   RETURN NULL;
 END $$;
@@ -1237,6 +1736,10 @@ DECLARE install_schema TEXT:=current_schema(); signature TEXT;
 BEGIN
   FOREACH signature IN ARRAY ARRAY[
     'recording_surrender_freeze_rows()',
+	'recording_surrender_normalize_lease_credential()',
+	'recording_surrender_append_stream_stop_events()',
+	'recording_surrender_reserve_legacy_intent_key()',
+	'recording_surrender_validate_clip_key_root()',
     'recording_surrender_validate_grant_update()',
 	'recording_surrender_validate_bound_upload_intent()',
     'recording_surrender_validate_grant_insert()',
@@ -1274,6 +1777,10 @@ $pin_recording_surrender_search_path$;
 REVOKE ALL ON FUNCTION recording_surrender_revoke_recovery_grant(UUID,TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_reclaim_expired() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_freeze_rows() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_normalize_lease_credential() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_append_stream_stop_events() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_reserve_legacy_intent_key() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_validate_clip_key_root() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_grant_update() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_bound_upload_intent() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_grant_insert() FROM PUBLIC;

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/google/uuid"
 )
 
@@ -300,14 +301,25 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 }
 
 func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), false)
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), false, nil)
 }
 
 func CaptureContinuousWithTimestampContract(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
 	if targetFPS != nil {
 		return fmt.Errorf("timestamp contract requires native source-copy capture")
 	}
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), true)
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), true, nil)
+}
+
+// CaptureContinuousWithFinitePlan preserves the one-process source-copy capture
+// path while replacing the open-ended segment cadence with the exact finite
+// split plan accepted by the server. The plan bounds file cardinality before
+// exec; it never changes codec selection.
+func CaptureContinuousWithFinitePlan(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, timestampContract bool, plan surrenderplan.Plan) error {
+	if targetFPS != nil && timestampContract {
+		return fmt.Errorf("timestamp contract requires native source-copy capture")
+	}
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), timestampContract, &plan)
 }
 
 func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) time.Duration {
@@ -319,10 +331,10 @@ func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) tim
 }
 
 func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration) error {
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false)
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, nil)
 }
 
-func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool) error {
+func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool, finitePlan *surrenderplan.Plan) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
@@ -338,7 +350,12 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 	if startupTimeout <= 0 || progressTimeout <= 0 {
 		return fmt.Errorf("continuous watchdog timeouts must be > 0")
 	}
-	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract)
+	if finitePlan != nil {
+		if finitePlan.ClipDurationSecond != int(clipDuration/time.Second) || finitePlan.ArtifactCount < 1 || finitePlan.ArtifactCount > surrenderplan.MaxArtifacts || finitePlan.DurationMicro <= 0 || len(finitePlan.SplitTimesArgument) > surrenderplan.MaxSegmentTimesArgumentLen {
+			return fmt.Errorf("finite capture plan differs from capture parameters")
+		}
+	}
+	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract, finitePlan)
 	if !isMalformedAudioMuxError(err) {
 		return err
 	}
@@ -361,10 +378,10 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 	// write that track and exits before producing any video. Retry once without
 	// audio; video remains a lossless stream copy and healthy audio is preserved
 	// on every source that did not hit this exact muxer failure.
-	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract)
+	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract, finitePlan)
 }
 
-func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool) error {
+func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool, finitePlan *surrenderplan.Plan) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -375,6 +392,13 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 		captureAttemptID = uuid.NewString()
 	}
 	args := buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, includeAudio, timestampContract)
+	if finitePlan != nil {
+		args = applyFiniteContinuousPlan(args, *finitePlan)
+		argMax, err := platformExecArgumentLimit()
+		if err != nil || !surrenderplan.ExecFits(ffmpegBin(), args, os.Environ(), argMax) {
+			return fmt.Errorf("finite capture plan does not fit the platform exec argument limit")
+		}
+	}
 	cmd := exec.Command(ffmpegBin(), args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -507,6 +531,24 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 			}
 		}
 	}
+}
+
+var readExecArgumentLimit = func() (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/bin/getconf", "ARG_MAX").Output()
+	if err != nil || len(output) > 32 {
+		return 0, fmt.Errorf("read ARG_MAX")
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("invalid ARG_MAX")
+	}
+	return value, nil
+}
+
+func platformExecArgumentLimit() (int, error) {
+	return readExecArgumentLimit()
 }
 
 func isMalformedAudioMuxError(err error) bool {
@@ -850,6 +892,36 @@ func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string,
 		outPattern,
 	)
 	return args
+}
+
+func applyFiniteContinuousPlan(args []string, plan surrenderplan.Plan) []string {
+	bounded := make([]string, 0, len(args)+4)
+	insertedTimestampOrigin := false
+	for index := 0; index < len(args); index++ {
+		if args[index] == "-segment_time" && index+1 < len(args) {
+			bounded = append(bounded, "-segment_times", plan.SplitTimesArgument)
+			index++
+			continue
+		}
+		if !insertedTimestampOrigin && args[index] == "-i" {
+			bounded = append(bounded, "-copyts", "-start_at_zero")
+			insertedTimestampOrigin = true
+		}
+		if index == len(args)-1 {
+			bounded = append(bounded, "-t", canonicalMicroseconds(plan.DurationMicro))
+		}
+		bounded = append(bounded, args[index])
+	}
+	return bounded
+}
+
+func canonicalMicroseconds(value int64) string {
+	seconds, micros := value/1_000_000, value%1_000_000
+	if micros == 0 {
+		return strconv.FormatInt(seconds, 10)
+	}
+	fraction := strings.TrimRight(fmt.Sprintf("%06d", micros), "0")
+	return strconv.FormatInt(seconds, 10) + "." + fraction
 }
 
 // appendHLSLiveEdgeInputArgs keeps a restarted continuous recorder at the live

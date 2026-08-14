@@ -11,14 +11,17 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/google/uuid"
 )
 
@@ -27,6 +30,12 @@ const surrenderTransportRetryBudget = time.Minute
 const maxCaptureProducerJournalBytes = 1 << 20
 
 var surrenderAttemptNamespace = uuid.MustParse("3cc7341c-d96b-4f38-b7de-cc47229837f9")
+var captureSegmentLeafRE = regexp.MustCompile(`^seg-[0-9]{8}-[0-9]{6}\.mp4$`)
+
+func captureUnixMicro(value time.Time) int64 {
+	value = value.UTC()
+	return value.Unix()*int64(time.Second/time.Microsecond) + int64(value.Nanosecond())/int64(time.Microsecond)
+}
 
 type acceptedUniqueHead struct {
 	Version        int64
@@ -48,8 +57,11 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 	}
 	journals := make([]*captureProducerJournal, 0, len(entries))
 	for _, entry := range entries {
-		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.Name() == filepath.Base(surrenderTransportObservationPath(root)) {
 			continue
+		}
+		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || !entry.Type().IsRegular() {
+			return nil, fmt.Errorf("ambiguous surrender recovery inventory entry")
 		}
 		path := filepath.Join(root, entry.Name())
 		raw, err := os.ReadFile(path)
@@ -68,6 +80,20 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 		if producerErr != nil || leaseErr != nil || journal.JobID <= 0 || journal.CaptureOrdinal <= 0 || journal.ClipDurationSec <= 0 || strings.TrimSpace(journal.OutputDir) == "" || len(journal.Artifacts) > 2048 {
 			return nil, fmt.Errorf("invalid capture producer journal identity")
 		}
+		captureRoot := filepath.Dir(root)
+		outputDir, pathErr := filepath.Abs(journal.OutputDir)
+		captureRoot, rootErr := filepath.Abs(captureRoot)
+		rel, relErr := filepath.Rel(captureRoot, outputDir)
+		if pathErr != nil || rootErr != nil || relErr != nil || rel == "." || strings.Contains(rel, string(filepath.Separator)) || !strings.HasPrefix(rel, "capture-continuous-") {
+			return nil, fmt.Errorf("capture producer output path is outside its private root")
+		}
+		if info, pathErr := os.Lstat(outputDir); pathErr == nil {
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("capture producer output path is not a real directory")
+			}
+		} else if !os.IsNotExist(pathErr) {
+			return nil, pathErr
+		}
 		seenIntents := make(map[string]struct{}, len(journal.Artifacts))
 		seenSequences := make(map[int64]struct{}, len(journal.Artifacts))
 		for _, artifact := range journal.Artifacts {
@@ -79,8 +105,14 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 				return nil, fmt.Errorf("invalid capture producer artifact journal")
 			}
 			if seg != nil {
-				if strings.TrimSpace(seg.Path) == "" || seg.CaptureSequence != artifact.CaptureSequence || seg.SizeBytes <= 0 || seg.StartAt.IsZero() || len(seg.SHA256) != 64 || strings.ToLower(seg.SHA256) != seg.SHA256 {
+				segmentPath, segmentErr := filepath.Abs(seg.Path)
+				if segmentErr != nil || filepath.Dir(segmentPath) != outputDir || !captureSegmentLeafRE.MatchString(filepath.Base(segmentPath)) || seg.CaptureSequence != artifact.CaptureSequence || seg.SizeBytes <= 0 || seg.StartAt.IsZero() || len(seg.SHA256) != 64 || strings.ToLower(seg.SHA256) != seg.SHA256 {
 					return nil, fmt.Errorf("invalid sealed capture producer artifact journal")
+				}
+				info, statErr := os.Lstat(segmentPath)
+				stat, statOK := infoSyscallStat(info)
+				if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !statOK || stat.Nlink != 1 {
+					return nil, fmt.Errorf("capture artifact path identity is unsafe")
 				}
 				if _, err := hex.DecodeString(seg.SHA256); err != nil {
 					return nil, fmt.Errorf("invalid capture producer artifact digest")
@@ -95,6 +127,11 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 			seenIntents[intentID.String()] = struct{}{}
 			seenSequences[artifact.CaptureSequence] = struct{}{}
 		}
+		if journal.CaptureSet != nil {
+			if err := validateCaptureSetJournal(&journal); err != nil {
+				return nil, err
+			}
+		}
 		journal.ProducerID = producerID.String()
 		journal.LeaseToken = leaseToken.String()
 		journal.path = path
@@ -103,12 +140,85 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 	return journals, nil
 }
 
+func infoSyscallStat(info os.FileInfo) (*syscall.Stat_t, bool) {
+	if info == nil {
+		return nil, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return stat, ok
+}
+
+func captureSetIdentity(plan recordingapi.CaptureSetPlan) (surrenderplan.SetIdentity, error) {
+	setID, setErr := uuid.Parse(strings.TrimSpace(plan.SetID))
+	lease, leaseErr := uuid.Parse(strings.TrimSpace(plan.LeaseToken))
+	producer, producerErr := uuid.Parse(strings.TrimSpace(plan.ProducerID))
+	if setErr != nil || leaseErr != nil || producerErr != nil {
+		return surrenderplan.SetIdentity{}, fmt.Errorf("invalid capture set plan identity")
+	}
+	set := surrenderplan.SetIdentity{
+		SetID: setID, AccountID: plan.AccountID, RecordingID: plan.RecordingID, JobID: plan.JobID,
+		LeaseToken: lease, OriginClaimGeneration: plan.OriginClaimGeneration, ProducerID: producer,
+		SnapshotSHA256: plan.SourceSnapshotSHA256, DestinationNamingSHA256: plan.DestinationNamingSHA256,
+		ArtifactCount: plan.ArtifactCount, MIME: "video/mp4", MaxBytes: plan.MaxArtifactBytes,
+	}
+	return set, set.Validate()
+}
+
+func validateCaptureSetJournal(journal *captureProducerJournal) error {
+	setJournal := journal.CaptureSet
+	if setJournal == nil {
+		return nil
+	}
+	planID, planErr := uuid.Parse(strings.TrimSpace(setJournal.PlanID))
+	setID, setErr := uuid.Parse(strings.TrimSpace(setJournal.SetID))
+	seedBytes, seedErr := hex.DecodeString(strings.TrimSpace(setJournal.Seed))
+	if planErr != nil || setErr != nil || len(seedBytes) != 32 || seedErr != nil || setJournal.FirstCaptureSequence <= 0 {
+		return fmt.Errorf("invalid capture set journal identity")
+	}
+	if setJournal.Plan == nil {
+		if setJournal.Committed || setJournal.MerkleRootSHA256 != "" {
+			return fmt.Errorf("capture set journal claims commitment without a plan")
+		}
+		return nil
+	}
+	plan := *setJournal.Plan
+	if plan.PlanID != planID.String() || plan.SetID != setID.String() || plan.ProducerID != journal.ProducerID || plan.JobID != journal.JobID || plan.LeaseToken != journal.LeaseToken || plan.CaptureOrdinal != journal.CaptureOrdinal || plan.FirstCaptureSequence != setJournal.FirstCaptureSequence {
+		return fmt.Errorf("capture set plan differs from durable identity")
+	}
+	canonicalPlan, err := surrenderplan.Build(plan.PlanAt, plan.WindowEndAt, plan.ClipDurationSeconds)
+	if err != nil || canonicalPlan.DurationMicro != plan.DurationMicroseconds || canonicalPlan.ArtifactCount != plan.ArtifactCount || canonicalPlan.SplitTimesArgument != plan.SegmentTimesArgument || plan.MaxArtifactBytes != surrenderplan.RecoveryArtifactMaxBytes {
+		return fmt.Errorf("capture set plan is not canonical")
+	}
+	set, err := captureSetIdentity(plan)
+	if err != nil {
+		return err
+	}
+	var seed [32]byte
+	copy(seed[:], seedBytes)
+	tree, err := surrenderplan.BuildTree(seed, set)
+	if err != nil {
+		return err
+	}
+	rootValue := tree.Root()
+	root := hex.EncodeToString(rootValue[:])
+	if setJournal.MerkleRootSHA256 != "" && setJournal.MerkleRootSHA256 != root {
+		return fmt.Errorf("capture set root differs from durable seed")
+	}
+	if setJournal.Committed && setJournal.MerkleRootSHA256 == "" {
+		return fmt.Errorf("committed capture set has no root")
+	}
+	setJournal.tree = tree
+	return nil
+}
+
 func (w *Worker) recoveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		w.flushSurrenderTransportObservations(ctx)
-		w.recoverProducerJournals(ctx)
+		if err := w.recoverProducerJournals(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("recording worker recovery journal error: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -249,11 +359,10 @@ func surrenderTransportErrorClass(err error) string {
 	return "transport_error"
 }
 
-func (w *Worker) recoverProducerJournals(ctx context.Context) {
+func (w *Worker) recoverProducerJournals(ctx context.Context) error {
 	journals, err := loadCaptureProducerJournals(w.surrenderJournalRoot())
 	if err != nil {
-		log.Printf("recording worker recovery journal error: %v", err)
-		return
+		return fmt.Errorf("validate surrender recovery inventory: %w", err)
 	}
 	for _, journal := range journals {
 		done, err := w.recoverProducerJournalV2(ctx, journal)
@@ -265,6 +374,7 @@ func (w *Worker) recoverProducerJournals(ctx context.Context) {
 			_ = os.RemoveAll(journal.OutputDir)
 		}
 	}
+	return nil
 }
 
 func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureProducerJournal) (bool, error) {
@@ -555,23 +665,107 @@ func recoveryIngestRequest(journal *captureProducerJournal, seg capture.Segment,
 }
 
 type captureProducerJournal struct {
-	JobID           int64                    `json:"job_id"`
-	LeaseToken      string                   `json:"lease_token"`
-	ProducerID      string                   `json:"producer_id"`
-	CaptureOrdinal  int64                    `json:"capture_ordinal"`
-	OutputDir       string                   `json:"output_dir"`
-	ClipDurationSec int                      `json:"clip_duration_sec"`
-	Artifacts       []captureArtifactJournal `json:"artifacts,omitempty"`
-	path            string
+	JobID               int64                    `json:"job_id"`
+	LeaseToken          string                   `json:"lease_token"`
+	ProducerID          string                   `json:"producer_id"`
+	CaptureOrdinal      int64                    `json:"capture_ordinal"`
+	OutputDir           string                   `json:"output_dir"`
+	ClipDurationSec     int                      `json:"clip_duration_sec"`
+	Artifacts           []captureArtifactJournal `json:"artifacts,omitempty"`
+	CaptureSet          *captureSetJournal       `json:"capture_set,omitempty"`
+	HadAcceptedArtifact bool                     `json:"had_accepted_artifact,omitempty"`
+	path                string
+}
+
+type captureSetJournal struct {
+	PlanID               string                       `json:"plan_id"`
+	SetID                string                       `json:"set_id"`
+	Seed                 string                       `json:"seed"`
+	FirstCaptureSequence int64                        `json:"first_capture_sequence"`
+	Plan                 *recordingapi.CaptureSetPlan `json:"plan,omitempty"`
+	MerkleRootSHA256     string                       `json:"merkle_root_sha256,omitempty"`
+	Committed            bool                         `json:"committed,omitempty"`
+	tree                 *surrenderplan.Tree
 }
 
 type captureArtifactJournal struct {
+	Ordinal              int              `json:"ordinal,omitempty"`
 	IntentID             string           `json:"intent_id"`
 	RecoverySecret       string           `json:"recovery_secret"`
 	RecoverySecretSHA256 string           `json:"recovery_secret_sha256"`
 	CaptureSequence      int64            `json:"capture_sequence"`
 	Segment              *capture.Segment `json:"segment,omitempty"`
 	Done                 bool             `json:"done,omitempty"`
+}
+
+func (w *Worker) materializeCaptureSetArtifact(ctx context.Context, job recordingapi.RecordingJob, producer *captureProducerJournal, sequence int64) (*captureArtifactJournal, error) {
+	if producer == nil || producer.CaptureSet == nil || !producer.CaptureSet.Committed || producer.CaptureSet.Plan == nil {
+		return nil, fmt.Errorf("capture set is not committed")
+	}
+	setJournal := producer.CaptureSet
+	ordinal64 := sequence - setJournal.FirstCaptureSequence + 1
+	if ordinal64 < 1 || ordinal64 > int64(setJournal.Plan.ArtifactCount) {
+		return nil, fmt.Errorf("capture sequence is outside committed set")
+	}
+	ordinal := int(ordinal64)
+	if setJournal.tree == nil {
+		if err := validateCaptureSetJournal(producer); err != nil {
+			return nil, err
+		}
+	}
+	seedBytes, _ := hex.DecodeString(setJournal.Seed)
+	var seed [32]byte
+	copy(seed[:], seedBytes)
+	set, err := captureSetIdentity(*setJournal.Plan)
+	if err != nil {
+		return nil, err
+	}
+	derived, err := surrenderplan.DeriveArtifact(seed, set, ordinal)
+	if err != nil {
+		return nil, err
+	}
+	proof, err := setJournal.tree.Proof(ordinal)
+	if err != nil {
+		return nil, err
+	}
+	proofHex := make([]string, len(proof.Siblings))
+	for index := range proof.Siblings {
+		proofHex[index] = hex.EncodeToString(proof.Siblings[index][:])
+	}
+	secretHex := hex.EncodeToString(derived.RecoverySecret[:])
+	secretHashHex := hex.EncodeToString(derived.RecoverySecretHash[:])
+	artifact := captureArtifactJournal{Ordinal: ordinal, IntentID: derived.ID.String(), RecoverySecret: secretHex, RecoverySecretSHA256: secretHashHex, CaptureSequence: sequence}
+	state := w.surrenderState(job.JobID)
+	state.mu.Lock()
+	found := false
+	for index := range producer.Artifacts {
+		if producer.Artifacts[index].CaptureSequence == sequence {
+			existing := &producer.Artifacts[index]
+			if existing.Ordinal != ordinal || existing.IntentID != artifact.IntentID || existing.RecoverySecret != artifact.RecoverySecret || existing.RecoverySecretSHA256 != artifact.RecoverySecretSHA256 {
+				state.mu.Unlock()
+				return nil, fmt.Errorf("materialized capture artifact replay differs")
+			}
+			artifact = *existing
+			found = true
+			break
+		}
+	}
+	if !found {
+		producer.Artifacts = append(producer.Artifacts, artifact)
+		if err := persistProducerJournal(w.surrenderJournalRoot(), producer); err != nil {
+			producer.Artifacts = producer.Artifacts[:len(producer.Artifacts)-1]
+			state.mu.Unlock()
+			return nil, err
+		}
+	}
+	state.mu.Unlock()
+
+	if err := w.cfg.Client.MaterializeCaptureArtifact(ctx, job.JobID, job.LeaseToken, setJournal.SetID, ordinal, recordingapi.CaptureArtifactMaterialization{
+		ArtifactID: artifact.IntentID, CaptureSequence: sequence, RecoverySecretSHA256: secretHashHex, Proof: proofHex,
+	}); err != nil {
+		return nil, err
+	}
+	return &artifact, nil
 }
 
 type surrenderJobState struct {
@@ -669,8 +863,13 @@ func (w *Worker) acknowledgeProducerArtifact(jobID int64, producer *captureProdu
 		if artifact.Segment == nil || artifact.Segment.Path != path {
 			continue
 		}
-		producer.Artifacts[index].Done = true
-		producer.Artifacts[index].Segment = nil
+		if producer.CaptureSet != nil {
+			producer.HadAcceptedArtifact = true
+			producer.Artifacts = append(producer.Artifacts[:index], producer.Artifacts[index+1:]...)
+		} else {
+			producer.Artifacts[index].Done = true
+			producer.Artifacts[index].Segment = nil
+		}
 		return persistProducerJournal(w.surrenderJournalRoot(), producer)
 	}
 	return nil
@@ -828,6 +1027,112 @@ func (w *Worker) reserveCaptureProducer(ctx context.Context, job recordingapi.Re
 	}
 }
 
+func (w *Worker) reserveCaptureSet(ctx context.Context, job recordingapi.RecordingJob, captureOrdinal, firstCaptureSequence int64, outputDir string) (*captureProducerJournal, surrenderplan.Plan, error) {
+	if strings.TrimSpace(job.LeaseToken) == "" || job.SurrenderTransportVersion != 1 {
+		return nil, surrenderplan.Plan{}, nil
+	}
+	state := w.surrenderState(job.JobID)
+	state.mu.Lock()
+	producer := state.producer
+	if producer == nil {
+		seed := make([]byte, 32)
+		if _, err := rand.Read(seed); err != nil {
+			state.mu.Unlock()
+			return nil, surrenderplan.Plan{}, err
+		}
+		producer = &captureProducerJournal{
+			JobID: job.JobID, LeaseToken: job.LeaseToken, ProducerID: uuid.NewString(), CaptureOrdinal: captureOrdinal,
+			OutputDir: outputDir, ClipDurationSec: job.ClipDurationSec,
+			CaptureSet: &captureSetJournal{PlanID: uuid.NewString(), SetID: uuid.NewString(), Seed: hex.EncodeToString(seed), FirstCaptureSequence: firstCaptureSequence},
+		}
+		if err := persistProducerJournal(w.surrenderJournalRoot(), producer); err != nil {
+			state.mu.Unlock()
+			return nil, surrenderplan.Plan{}, fmt.Errorf("persist pending capture set identity: %w", err)
+		}
+		state.producer = producer
+	} else if producer.CaptureOrdinal != captureOrdinal || producer.JobID != job.JobID || producer.LeaseToken != job.LeaseToken || producer.CaptureSet == nil || producer.CaptureSet.FirstCaptureSequence != firstCaptureSequence {
+		state.mu.Unlock()
+		return nil, surrenderplan.Plan{}, fmt.Errorf("capture set replay differs from durable producer")
+	}
+	state.mu.Unlock()
+
+	deadline := time.Now().Add(surrenderTransportRetryBudget)
+	if producer.CaptureSet.Plan == nil {
+		var plan recordingapi.CaptureSetPlan
+		var lastErr error
+		for attempt := 0; ; attempt++ {
+			callCtx, cancel, bounded := surrenderTransportCallContext(ctx, deadline)
+			if !bounded {
+				return nil, surrenderplan.Plan{}, errors.Join(lastErr, context.DeadlineExceeded)
+			}
+			plan, lastErr = w.cfg.Client.PlanCaptureSet(callCtx, job.JobID, job.LeaseToken, producer.CaptureSet.PlanID, producer.CaptureSet.SetID, producer.ProducerID, captureOrdinal, firstCaptureSequence)
+			cancel()
+			if lastErr == nil {
+				break
+			}
+			if !retryableTransportError(ctx, lastErr) || !waitSurrenderRetry(ctx, deadline, attempt) {
+				return nil, surrenderplan.Plan{}, lastErr
+			}
+		}
+		producer.CaptureSet.Plan = &plan
+		if err := validateCaptureSetJournal(producer); err != nil {
+			return nil, surrenderplan.Plan{}, err
+		}
+		root := producer.CaptureSet.tree.Root()
+		producer.CaptureSet.MerkleRootSHA256 = hex.EncodeToString(root[:])
+		if err := persistProducerJournal(w.surrenderJournalRoot(), producer); err != nil {
+			return nil, surrenderplan.Plan{}, fmt.Errorf("persist server-authored capture plan: %w", err)
+		}
+	}
+	if producer.CaptureSet.tree == nil {
+		if err := validateCaptureSetJournal(producer); err != nil {
+			return nil, surrenderplan.Plan{}, err
+		}
+	}
+	if !producer.CaptureSet.Committed {
+		var lastErr error
+		for attempt := 0; ; attempt++ {
+			callCtx, cancel, bounded := surrenderTransportCallContext(ctx, deadline)
+			if !bounded {
+				return nil, surrenderplan.Plan{}, errors.Join(lastErr, context.DeadlineExceeded)
+			}
+			lastErr = w.cfg.Client.CommitCaptureSet(callCtx, job.JobID, job.LeaseToken, producer.CaptureSet.PlanID, producer.CaptureSet.MerkleRootSHA256)
+			cancel()
+			if lastErr == nil {
+				break
+			}
+			if !retryableTransportError(ctx, lastErr) || !waitSurrenderRetry(ctx, deadline, attempt) {
+				return nil, surrenderplan.Plan{}, lastErr
+			}
+		}
+		producer.CaptureSet.Committed = true
+		if err := persistProducerJournal(w.surrenderJournalRoot(), producer); err != nil {
+			return nil, surrenderplan.Plan{}, fmt.Errorf("persist accepted capture set: %w", err)
+		}
+	}
+	plan := producer.CaptureSet.Plan
+	return producer, surrenderplan.Plan{
+		PlanAt: plan.PlanAt, WindowEnd: plan.WindowEndAt, ClipDurationSecond: plan.ClipDurationSeconds,
+		DurationMicro: plan.DurationMicroseconds, ArtifactCount: plan.ArtifactCount, SplitTimesArgument: plan.SegmentTimesArgument,
+	}, nil
+}
+
+func waitSurrenderRetry(ctx context.Context, deadline time.Time, attempt int) bool {
+	delays := []time.Duration{time.Second, 2 * time.Second, 5 * time.Second}
+	delay := delays[min(attempt, len(delays)-1)]
+	if time.Now().Add(delay).After(deadline) {
+		return false
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func captureArtifactReservationCount(job recordingapi.RecordingJob, now time.Time) (int, error) {
 	if job.WindowEndAt == nil || job.ClipDurationSec <= 0 || !now.Before(job.WindowEndAt.UTC()) {
 		return 0, fmt.Errorf("capture window has no bounded remaining artifact horizon")
@@ -924,6 +1229,9 @@ func captureArtifactForSequence(producer *captureProducerJournal, sequence int64
 
 func captureProducerTerminalResult(producer *captureProducerJournal) string {
 	if producer != nil {
+		if producer.HadAcceptedArtifact {
+			return "completed"
+		}
 		for _, artifact := range producer.Artifacts {
 			if artifact.Done {
 				return "completed"
@@ -966,7 +1274,11 @@ func (w *Worker) finishCaptureProducer(ctx context.Context, job recordingapi.Rec
 			}
 			return context.DeadlineExceeded
 		}
-		lastErr = w.cfg.Client.FinishCaptureProducer(callCtx, job.JobID, job.LeaseToken, producer.ProducerID, result, detail)
+		if producer.CaptureSet != nil {
+			lastErr = w.cfg.Client.FinishCaptureSet(callCtx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID)
+		} else {
+			lastErr = w.cfg.Client.FinishCaptureProducer(callCtx, job.JobID, job.LeaseToken, producer.ProducerID, result, detail)
+		}
 		cancel()
 		if lastErr == nil {
 			state := w.surrenderState(job.JobID)

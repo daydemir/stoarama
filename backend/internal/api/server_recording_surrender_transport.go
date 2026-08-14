@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -283,6 +285,512 @@ func validLowerSHA256(v string) bool {
 	}
 	_, err := hex.DecodeString(v)
 	return err == nil
+}
+
+type recordingCaptureSetPlanRequest struct {
+	PlanID               string `json:"plan_id"`
+	SetID                string `json:"set_id"`
+	ProducerID           string `json:"producer_id"`
+	CaptureOrdinal       int64  `json:"capture_ordinal"`
+	FirstCaptureSequence int64  `json:"first_capture_sequence"`
+}
+
+type recordingCaptureSetPlanResponse struct {
+	PlanID                  uuid.UUID `json:"plan_id"`
+	SetID                   uuid.UUID `json:"set_id"`
+	ProducerID              uuid.UUID `json:"producer_id"`
+	CaptureOrdinal          int64     `json:"capture_ordinal"`
+	FirstCaptureSequence    int64     `json:"first_capture_sequence"`
+	AccountID               int64     `json:"account_id"`
+	RecordingID             int64     `json:"recording_id"`
+	JobID                   int64     `json:"job_id"`
+	LeaseToken              uuid.UUID `json:"lease_token"`
+	OriginClaimGeneration   int64     `json:"origin_claim_generation"`
+	SnapshotGeneration      int64     `json:"snapshot_generation"`
+	SourceSnapshotSHA256    string    `json:"source_snapshot_sha256"`
+	DestinationNamingSHA256 string    `json:"destination_naming_sha256"`
+	PlanAt                  time.Time `json:"plan_at"`
+	WindowEndAt             time.Time `json:"window_end_at"`
+	DurationMicroseconds    int64     `json:"duration_microseconds"`
+	ClipDurationSeconds     int       `json:"clip_duration_seconds"`
+	ArtifactCount           int       `json:"artifact_count"`
+	SegmentTimesArgument    string    `json:"segment_times_argument"`
+	MaxArtifactBytes        int64     `json:"max_artifact_bytes"`
+	ExpiresAt               time.Time `json:"expires_at"`
+}
+
+func scanRecordingCaptureSetPlan(row pgx.Row, out *recordingCaptureSetPlanResponse) error {
+	return row.Scan(&out.PlanID, &out.SetID, &out.ProducerID, &out.CaptureOrdinal, &out.FirstCaptureSequence, &out.AccountID, &out.RecordingID,
+		&out.JobID, &out.LeaseToken, &out.OriginClaimGeneration, &out.SnapshotGeneration,
+		&out.SourceSnapshotSHA256, &out.DestinationNamingSHA256, &out.PlanAt, &out.WindowEndAt,
+		&out.DurationMicroseconds, &out.ClipDurationSeconds, &out.ArtifactCount, &out.SegmentTimesArgument,
+		&out.MaxArtifactBytes, &out.ExpiresAt)
+}
+
+const recordingCaptureSetPlanSelect = `
+	SELECT id,set_id,producer_id,capture_ordinal,first_capture_sequence,account_id,recording_id,recording_job_id,lease_token,
+	       COALESCE(origin_claim_generation,0),snapshot_generation,source_snapshot_sha256,destination_naming_sha256,
+	       plan_at,window_end_at,duration_microseconds,clip_duration_seconds,artifact_count,
+	       segment_times_argument,max_artifact_bytes,expires_at
+	FROM recording_capture_set_plans WHERE id=$1`
+
+func (s *Server) handleRecordingCaptureSetPlan(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok || principal.NodeTokenID <= 0 {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	jobID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	leaseToken, err := recordingLeaseToken(r)
+	var req recordingCaptureSetPlanRequest
+	if err != nil || leaseToken == nil || util.DecodeJSON(r, &req) != nil || req.CaptureOrdinal <= 0 || req.FirstCaptureSequence <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "invalid capture set plan request")
+		return
+	}
+	planID, planErr := uuid.Parse(strings.TrimSpace(req.PlanID))
+	setID, setErr := uuid.Parse(strings.TrimSpace(req.SetID))
+	producerID, producerErr := uuid.Parse(strings.TrimSpace(req.ProducerID))
+	if planErr != nil || setErr != nil || producerErr != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid capture set plan identity")
+		return
+	}
+
+	// Discover tenant before row locks. The authoritative reselect occurs after
+	// accounts are locked in ascending identity order.
+	var workerAccountID, targetAccountID int64
+	if err = s.pool.QueryRow(r.Context(), `SELECT $2::bigint,recording.account_id FROM recording_jobs job JOIN recordings recording ON recording.id=job.recording_id WHERE job.id=$1`, jobID, principal.AccountID).Scan(&workerAccountID, &targetAccountID); err != nil {
+		util.WriteError(w, http.StatusConflict, "capture set plan job is unavailable")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin capture set plan")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock capture claim authority")
+		return
+	}
+	lo, hi := workerAccountID, targetAccountID
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if _, err = tx.Exec(r.Context(), `SELECT id FROM accounts WHERE id=ANY($1::bigint[]) ORDER BY id FOR SHARE`, []int64{lo, hi}); err != nil {
+		util.WriteError(w, http.StatusConflict, "lock capture set accounts")
+		return
+	}
+	var tokenValid bool
+	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM node_tokens token JOIN nodes node ON node.id=token.node_id WHERE token.id=$1 AND token.node_id=$2 AND token.revoked_at IS NULL AND node.status=ANY($3::text[]))`, principal.NodeTokenID, principal.NodeID, nodeTokenAllowedStatuses()).Scan(&tokenValid); err != nil || !tokenValid {
+		util.WriteError(w, http.StatusUnauthorized, "capture credential is stale")
+		return
+	}
+	var existing recordingCaptureSetPlanResponse
+	err = scanRecordingCaptureSetPlan(tx.QueryRow(r.Context(), recordingCaptureSetPlanSelect, planID), &existing)
+	if err == nil {
+		if existing.SetID != setID || existing.ProducerID != producerID || existing.CaptureOrdinal != req.CaptureOrdinal || existing.FirstCaptureSequence != req.FirstCaptureSequence || existing.JobID != jobID || existing.LeaseToken != *leaseToken {
+			util.WriteError(w, http.StatusConflict, "capture set plan replay differs")
+			return
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "commit capture set plan replay")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, existing)
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusInternalServerError, "load capture set plan replay")
+		return
+	}
+	var recordingID, accountID, streamID, destinationID int64
+	var clipDuration int
+	var windowEnd, dbNow time.Time
+	var originGeneration *int64
+	var credentialState string
+	var sourceSnapshot, destinationSnapshot []byte
+	err = tx.QueryRow(r.Context(), `
+		SELECT recording.id,recording.account_id,recording.stream_id,recording.storage_destination_id,
+		       job.clip_duration_sec,job.window_end_at,transaction_timestamp(),job.lease_claim_generation,
+		       job.lease_credential_state,
+		       jsonb_build_object('schema','recording-source-snapshot-v1','account_id',recording.account_id,
+		         'recording_id',recording.id,'stream_id',stream.id,'recording_stream_url',recording.stream_url,
+		         'capture_via',recording.capture_via,'mode',recording.mode,'source_kind',recording.source_kind,
+		         'target_fps',recording.target_fps,'stream_source_url',stream.source_url,
+		         'source_page_url',stream.source_page_url,'provider',stream.provider,'external_id',stream.external_id,
+		         'source_family',stream.source_family,'capture_type',stream.capture_type,'execution_class',stream.execution_class,
+		         'execution_config',COALESCE(stream.execution_config_jsonb,'{}'::jsonb),
+		         'revision',COALESCE((SELECT to_jsonb(revision) FROM stream_source_revisions revision WHERE revision.stream_id=stream.id ORDER BY revision.id DESC LIMIT 1),'null'::jsonb)),
+		       jsonb_build_object('schema','recording-destination-naming-v1','destination_id',destination.id,
+		         'endpoint',destination.endpoint,'region',destination.region,'bucket',destination.bucket,'key_prefix',destination.key_prefix,
+		         'naming_profile',recording.naming_profile,'folder_name',recording.folder_name,
+		         'naming_metadata',recording.naming_metadata_jsonb,'cron_timezone',recording.cron_timezone)
+		FROM recording_jobs job
+		JOIN recordings recording ON recording.id=job.recording_id
+		JOIN streams stream ON stream.id=recording.stream_id
+		JOIN storage_destinations destination ON destination.id=recording.storage_destination_id
+		WHERE job.id=$1 AND job.status='leased' AND job.lease_owner=$2 AND job.lease_token=$3
+		  AND job.lease_expires_at>transaction_timestamp() AND job.kind='continuous_window'
+		  AND job.window_end_at>transaction_timestamp() AND recording.account_id=$4
+		FOR UPDATE OF job,recording,stream,destination
+	`, jobID, recorderWorkerID(principal), leaseToken, targetAccountID).Scan(&recordingID, &accountID, &streamID, &destinationID, &clipDuration, &windowEnd, &dbNow, &originGeneration, &credentialState, &sourceSnapshot, &destinationSnapshot)
+	if err != nil || credentialState != "exact" || originGeneration == nil {
+		util.WriteError(w, http.StatusConflict, "capture set requires an exact current lease credential")
+		return
+	}
+	plan, err := surrenderplan.Build(dbNow, windowEnd, clipDuration)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "capture set plan is unsupported")
+		return
+	}
+	sourceHash := sha256.Sum256(sourceSnapshot)
+	destinationHash := sha256.Sum256(destinationSnapshot)
+	snapshotGeneration := int64(1)
+	if err = tx.QueryRow(r.Context(), `SELECT COALESCE(max(id),0)+1 FROM stream_source_revisions WHERE stream_id=$1`, streamID).Scan(&snapshotGeneration); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load source snapshot generation")
+		return
+	}
+	segmentHash := sha256.Sum256([]byte(plan.SplitTimesArgument))
+	_, err = tx.Exec(r.Context(), `
+		INSERT INTO recording_capture_set_plans(id,set_id,account_id,recording_id,recording_job_id,lease_token,
+		 origin_claim_generation,producer_id,capture_ordinal,first_capture_sequence,snapshot_generation,source_snapshot,source_snapshot_sha256,
+		 destination_naming_snapshot,destination_naming_sha256,plan_at,window_end_at,duration_microseconds,
+		 clip_duration_seconds,artifact_count,segment_times_argument,segment_times_sha256,max_artifact_bytes,expires_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$16+interval '30 seconds')
+	`, planID, setID, accountID, recordingID, jobID, leaseToken, originGeneration, producerID, req.CaptureOrdinal,
+		req.FirstCaptureSequence, snapshotGeneration, sourceSnapshot, hex.EncodeToString(sourceHash[:]), destinationSnapshot, hex.EncodeToString(destinationHash[:]),
+		dbNow, windowEnd, plan.DurationMicro, clipDuration, plan.ArtifactCount, plan.SplitTimesArgument,
+		hex.EncodeToString(segmentHash[:]), surrenderplan.RecoveryArtifactMaxBytes)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "create capture set plan")
+		return
+	}
+	if err = scanRecordingCaptureSetPlan(tx.QueryRow(r.Context(), recordingCaptureSetPlanSelect, planID), &existing); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load capture set plan")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit capture set plan")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, existing)
+}
+
+func (s *Server) handleRecordingCaptureSetCommit(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	jobID, jobOK := parseInt64Path(w, r, "id")
+	planID, planErr := uuid.Parse(strings.TrimSpace(chiURLParam(r, "planId")))
+	leaseToken, leaseErr := recordingLeaseToken(r)
+	var req struct {
+		MerkleRootSHA256 string `json:"merkle_root_sha256"`
+	}
+	if !ok || principal.NodeTokenID <= 0 || !jobOK || planErr != nil || leaseErr != nil || leaseToken == nil || util.DecodeJSON(r, &req) != nil || !validLowerSHA256(req.MerkleRootSHA256) {
+		util.WriteError(w, http.StatusBadRequest, "invalid capture set commitment")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin capture set commitment")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock capture set commitment")
+		return
+	}
+	var setID uuid.UUID
+	var count int
+	var exact bool
+	var priorResult string
+	err = tx.QueryRow(r.Context(), `
+		SELECT plan.set_id,plan.artifact_count,
+		 job.id=$2 AND job.status='leased' AND job.lease_token=$3 AND job.lease_owner=$4
+		 AND job.lease_expires_at>transaction_timestamp() AND plan.expires_at>transaction_timestamp()
+		 AND job.lease_node_token_id=$5 AND job.lease_claim_generation=token.recording_claim_generation
+		 AND job.lease_credential_state='exact' AND token.node_id=$6 AND token.revoked_at IS NULL
+		 AND token.recording_claim_purpose IN('claim_current','existing_fence_only')
+		 AND plan.source_snapshot=jsonb_build_object('schema','recording-source-snapshot-v1','account_id',recording.account_id,
+		   'recording_id',recording.id,'stream_id',stream.id,'recording_stream_url',recording.stream_url,
+		   'capture_via',recording.capture_via,'mode',recording.mode,'source_kind',recording.source_kind,
+		   'target_fps',recording.target_fps,'stream_source_url',stream.source_url,
+		   'source_page_url',stream.source_page_url,'provider',stream.provider,'external_id',stream.external_id,
+		   'source_family',stream.source_family,'capture_type',stream.capture_type,'execution_class',stream.execution_class,
+		   'execution_config',COALESCE(stream.execution_config_jsonb,'{}'::jsonb),
+		   'revision',COALESCE((SELECT to_jsonb(revision) FROM stream_source_revisions revision WHERE revision.stream_id=stream.id ORDER BY revision.id DESC LIMIT 1),'null'::jsonb))
+		 AND plan.destination_naming_snapshot=jsonb_build_object('schema','recording-destination-naming-v1','destination_id',destination.id,
+		   'endpoint',destination.endpoint,'region',destination.region,'bucket',destination.bucket,'key_prefix',destination.key_prefix,
+		   'naming_profile',recording.naming_profile,'folder_name',recording.folder_name,
+		   'naming_metadata',recording.naming_metadata_jsonb,'cron_timezone',recording.cron_timezone),
+		 COALESCE(result.result,'')
+		FROM recording_capture_set_plans plan
+		JOIN recording_jobs job ON job.id=plan.recording_job_id
+		JOIN recordings recording ON recording.id=job.recording_id
+		JOIN streams stream ON stream.id=recording.stream_id
+		JOIN storage_destinations destination ON destination.id=recording.storage_destination_id
+		JOIN node_tokens token ON token.id=$5
+		LEFT JOIN recording_capture_set_plan_results result ON result.plan_id=plan.id
+		WHERE plan.id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
+		FOR UPDATE OF plan,job,recording,stream,destination,token
+	`, planID, jobID, leaseToken, recorderWorkerID(principal), principal.NodeTokenID, principal.NodeID).Scan(&setID, &count, &exact, &priorResult)
+	if err != nil || !exact {
+		util.WriteError(w, http.StatusConflict, "capture set plan is stale")
+		return
+	}
+	if priorResult != "" {
+		var priorRoot string
+		if priorResult != "accepted_set" || tx.QueryRow(r.Context(), `SELECT merkle_root_sha256 FROM recording_capture_reservation_sets WHERE plan_id=$1`, planID).Scan(&priorRoot) != nil || priorRoot != req.MerkleRootSHA256 {
+			util.WriteError(w, http.StatusConflict, "capture set commitment replay differs")
+			return
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "commit capture set replay")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `INSERT INTO recording_capture_reservation_sets(id,plan_id,merkle_root_sha256,artifact_count) VALUES($1,$2,$3,$4)`, setID, planID, req.MerkleRootSHA256, count); err == nil {
+		_, err = tx.Exec(r.Context(), `INSERT INTO recording_capture_set_plan_results(plan_id,result,set_id) VALUES($1,'accepted_set',$2)`, planID, setID)
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "commit capture set")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit capture set transaction")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func parseCaptureMerkleProof(values []string, ordinal int) (surrenderplan.Proof, string, error) {
+	proof := surrenderplan.Proof{Ordinal: ordinal, Siblings: make([][32]byte, len(values))}
+	h := sha256.New()
+	_, _ = h.Write([]byte("stoarama.recording.capture-artifact-proof.v1\x00"))
+	for index, value := range values {
+		if !validLowerSHA256(value) {
+			return surrenderplan.Proof{}, "", fmt.Errorf("invalid proof hash")
+		}
+		decoded, _ := hex.DecodeString(value)
+		copy(proof.Siblings[index][:], decoded)
+		_, _ = h.Write(decoded)
+	}
+	return proof, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (s *Server) handleRecordingCaptureArtifactMaterialize(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	jobID, jobOK := parseInt64Path(w, r, "id")
+	setID, setErr := uuid.Parse(strings.TrimSpace(chiURLParam(r, "setId")))
+	ordinal64, ordinalErr := strconv.ParseInt(strings.TrimSpace(chiURLParam(r, "ordinal")), 10, 32)
+	leaseToken, leaseErr := recordingLeaseToken(r)
+	var req recordingapiCaptureArtifactMaterialization
+	if !ok || principal.NodeTokenID <= 0 || !jobOK || setErr != nil || ordinalErr != nil || ordinal64 <= 0 || leaseErr != nil || leaseToken == nil || util.DecodeJSON(r, &req) != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid capture artifact materialization")
+		return
+	}
+	artifactID, artifactErr := uuid.Parse(strings.TrimSpace(req.ArtifactID))
+	secretBytes, secretErr := hex.DecodeString(strings.TrimSpace(req.RecoverySecretSHA256))
+	ordinal := int(ordinal64)
+	proof, proofSHA, proofErr := parseCaptureMerkleProof(req.Proof, ordinal)
+	if artifactErr != nil || secretErr != nil || len(secretBytes) != sha256.Size || !validLowerSHA256(req.RecoverySecretSHA256) || req.CaptureSequence <= 0 || proofErr != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid capture artifact proof")
+		return
+	}
+	var secretHash [32]byte
+	copy(secretHash[:], secretBytes)
+
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin capture artifact materialization")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock capture artifact authority")
+		return
+	}
+	var set surrenderplan.SetIdentity
+	var rootHex string
+	var firstSequence int64
+	var tokenValid, leaseCurrent bool
+	err = tx.QueryRow(r.Context(), `
+		SELECT plan.account_id,plan.recording_id,plan.recording_job_id,plan.lease_token,
+		       COALESCE(plan.origin_claim_generation,0),plan.producer_id,plan.source_snapshot_sha256,
+		       plan.destination_naming_sha256,reservation.artifact_count,reservation.merkle_root_sha256,
+		       plan.first_capture_sequence,
+		       token.id=job.lease_node_token_id AND token.recording_claim_generation=job.lease_claim_generation
+		         AND token.recording_claim_purpose IN('claim_current','existing_fence_only') AND token.revoked_at IS NULL,
+		       job.status='leased' AND job.lease_owner=$5 AND job.lease_token=$4
+		         AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact'
+		FROM recording_capture_reservation_sets reservation
+		JOIN recording_capture_set_plans plan ON plan.id=reservation.plan_id
+		JOIN recording_jobs job ON job.id=plan.recording_job_id
+		JOIN node_tokens token ON token.id=$6 AND token.node_id=$7
+		WHERE reservation.id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
+		FOR UPDATE OF reservation,plan,job,token
+	`, setID, jobID, leaseToken, leaseToken, recorderWorkerID(principal), principal.NodeTokenID, principal.NodeID).Scan(
+		&set.AccountID, &set.RecordingID, &set.JobID, &set.LeaseToken, &set.OriginClaimGeneration,
+		&set.ProducerID, &set.SnapshotSHA256, &set.DestinationNamingSHA256, &set.ArtifactCount,
+		&rootHex, &firstSequence, &tokenValid, &leaseCurrent)
+	if err != nil || !tokenValid || !leaseCurrent || ordinal > set.ArtifactCount || req.CaptureSequence != firstSequence+int64(ordinal-1) {
+		util.WriteError(w, http.StatusConflict, "capture artifact authority is stale")
+		return
+	}
+	set.SetID, set.MIME, set.MaxBytes = setID, "video/mp4", surrenderplan.RecoveryArtifactMaxBytes
+	rootBytes, _ := hex.DecodeString(rootHex)
+	var root [32]byte
+	copy(root[:], rootBytes)
+	if len(rootBytes) != sha256.Size || !surrenderplan.VerifyCommittedProof(root, set, ordinal, artifactID, secretHash, proof) {
+		util.WriteError(w, http.StatusConflict, "capture artifact proof does not match committed set")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `
+		INSERT INTO recording_capture_materialized_artifacts(set_id,ordinal,artifact_id,recovery_secret_sha256,capture_sequence,proof,proof_sha256)
+		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(set_id,ordinal) DO NOTHING
+	`, setID, ordinal, artifactID, req.RecoverySecretSHA256, req.CaptureSequence, req.Proof, proofSHA)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "materialize capture artifact")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		var exact bool
+		if err = tx.QueryRow(r.Context(), `SELECT artifact_id=$3 AND recovery_secret_sha256=$4 AND capture_sequence=$5 AND proof_sha256=$6 FROM recording_capture_materialized_artifacts WHERE set_id=$1 AND ordinal=$2`, setID, ordinal, artifactID, req.RecoverySecretSHA256, req.CaptureSequence, proofSHA).Scan(&exact); err != nil || !exact {
+			util.WriteError(w, http.StatusConflict, "capture artifact replay differs")
+			return
+		}
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit capture artifact materialization")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type recordingapiCaptureArtifactMaterialization struct {
+	ArtifactID           string   `json:"artifact_id"`
+	CaptureSequence      int64    `json:"capture_sequence"`
+	RecoverySecretSHA256 string   `json:"recovery_secret_sha256"`
+	Proof                []string `json:"proof"`
+}
+
+func captureSetUnusedRanges(count int, materialized []int) [][2]int {
+	used := make(map[int]struct{}, len(materialized))
+	for _, ordinal := range materialized {
+		used[ordinal] = struct{}{}
+	}
+	var ranges [][2]int
+	for ordinal := 1; ordinal <= count; {
+		if _, ok := used[ordinal]; ok {
+			ordinal++
+			continue
+		}
+		start := ordinal
+		for ordinal <= count {
+			if _, ok := used[ordinal]; ok {
+				break
+			}
+			ordinal++
+		}
+		ranges = append(ranges, [2]int{start, ordinal - 1})
+	}
+	return ranges
+}
+
+func (s *Server) handleRecordingCaptureSetFinish(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	jobID, jobOK := parseInt64Path(w, r, "id")
+	setID, setErr := uuid.Parse(strings.TrimSpace(chiURLParam(r, "setId")))
+	leaseToken, leaseErr := recordingLeaseToken(r)
+	if !ok || principal.NodeTokenID <= 0 || !jobOK || setErr != nil || leaseErr != nil || leaseToken == nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid capture set finish")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin capture set finish")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock capture set finish")
+		return
+	}
+	var artifactCount int
+	var exact bool
+	err = tx.QueryRow(r.Context(), `
+		SELECT capture_set.artifact_count,
+		       job.id=$2 AND job.lease_token=$3 AND job.lease_owner=$4
+		         AND job.lease_node_token_id=$5 AND job.lease_claim_generation=token.recording_claim_generation
+		         AND job.lease_credential_state='exact' AND token.node_id=$6 AND token.revoked_at IS NULL
+		         AND token.recording_claim_purpose IN('claim_current','existing_fence_only')
+		FROM recording_capture_reservation_sets capture_set
+		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+		JOIN recording_jobs job ON job.id=plan.recording_job_id
+		JOIN node_tokens token ON token.id=$5
+		WHERE capture_set.id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
+		FOR UPDATE OF capture_set,plan,job,token
+	`, setID, jobID, leaseToken, recorderWorkerID(principal), principal.NodeTokenID, principal.NodeID).Scan(&artifactCount, &exact)
+	if err != nil || !exact {
+		util.WriteError(w, http.StatusConflict, "capture set finish authority is stale")
+		return
+	}
+	rows, err := tx.Query(r.Context(), `
+		SELECT artifact.ordinal,result.result
+		FROM recording_capture_materialized_artifacts artifact
+		LEFT JOIN recording_capture_artifact_grant_results result
+		  ON result.set_id=artifact.set_id AND result.ordinal=artifact.ordinal
+		WHERE artifact.set_id=$1 ORDER BY artifact.ordinal FOR UPDATE OF artifact
+	`, setID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load capture set coverage")
+		return
+	}
+	var materialized []int
+	for rows.Next() {
+		var ordinal int
+		var result *string
+		if err = rows.Scan(&ordinal, &result); err != nil {
+			rows.Close()
+			util.WriteError(w, http.StatusInternalServerError, "scan capture set coverage")
+			return
+		}
+		if result == nil || (*result != "accepted_unique" && *result != "exact_replay") {
+			rows.Close()
+			util.WriteError(w, http.StatusConflict, "capture set has a nonterminal materialized artifact")
+			return
+		}
+		materialized = append(materialized, ordinal)
+	}
+	rows.Close()
+	coverage := struct {
+		ArtifactCount int      `json:"artifact_count"`
+		Materialized  []int    `json:"materialized_ordinals"`
+		Unused        [][2]int `json:"unused_ranges"`
+	}{artifactCount, materialized, captureSetUnusedRanges(artifactCount, materialized)}
+	coverageJSON, _ := json.Marshal(coverage)
+	coverageHash := sha256.Sum256(coverageJSON)
+	coverageSHA := hex.EncodeToString(coverageHash[:])
+	tag, err := tx.Exec(r.Context(), `INSERT INTO recording_capture_set_results(set_id,result,coverage_ranges,coverage_sha256) VALUES($1,'completed',$2,$3) ON CONFLICT(set_id) DO NOTHING`, setID, coverageJSON, coverageSHA)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "seal capture set result")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		var replay bool
+		if err = tx.QueryRow(r.Context(), `SELECT result='completed' AND coverage_sha256=$2 FROM recording_capture_set_results WHERE set_id=$1`, setID, coverageSHA).Scan(&replay); err != nil || !replay {
+			util.WriteError(w, http.StatusConflict, "capture set finish replay differs")
+			return
+		}
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit capture set finish")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func surrenderRequestSHA(req recordingJobSurrenderRequest) string {

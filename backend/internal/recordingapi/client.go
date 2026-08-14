@@ -254,6 +254,60 @@ type CaptureArtifactReservationInput struct {
 	CaptureSequence      int64  `json:"capture_sequence"`
 }
 
+type CaptureSetPlan struct {
+	PlanID                  string    `json:"plan_id"`
+	SetID                   string    `json:"set_id"`
+	ProducerID              string    `json:"producer_id"`
+	CaptureOrdinal          int64     `json:"capture_ordinal"`
+	FirstCaptureSequence    int64     `json:"first_capture_sequence"`
+	AccountID               int64     `json:"account_id"`
+	RecordingID             int64     `json:"recording_id"`
+	JobID                   int64     `json:"job_id"`
+	LeaseToken              string    `json:"lease_token"`
+	OriginClaimGeneration   int64     `json:"origin_claim_generation"`
+	SnapshotGeneration      int64     `json:"snapshot_generation"`
+	SourceSnapshotSHA256    string    `json:"source_snapshot_sha256"`
+	DestinationNamingSHA256 string    `json:"destination_naming_sha256"`
+	PlanAt                  time.Time `json:"plan_at"`
+	WindowEndAt             time.Time `json:"window_end_at"`
+	DurationMicroseconds    int64     `json:"duration_microseconds"`
+	ClipDurationSeconds     int       `json:"clip_duration_seconds"`
+	ArtifactCount           int       `json:"artifact_count"`
+	SegmentTimesArgument    string    `json:"segment_times_argument"`
+	MaxArtifactBytes        int64     `json:"max_artifact_bytes"`
+	ExpiresAt               time.Time `json:"expires_at"`
+}
+
+func (c *Client) PlanCaptureSet(ctx context.Context, jobID int64, leaseToken, planID, setID, producerID string, captureOrdinal, firstCaptureSequence int64) (CaptureSetPlan, error) {
+	var out CaptureSetPlan
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-set-plans", jobID), map[string]any{
+		"plan_id": planID, "set_id": setID, "producer_id": producerID, "capture_ordinal": captureOrdinal,
+		"first_capture_sequence": firstCaptureSequence,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) CommitCaptureSet(ctx context.Context, jobID int64, leaseToken, planID, merkleRootSHA256 string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-set-plans/%s/commit", jobID, url.PathEscape(planID)), map[string]any{
+		"merkle_root_sha256": strings.TrimSpace(merkleRootSHA256),
+	}, leaseTokenHeaders(leaseToken), nil)
+}
+
+type CaptureArtifactMaterialization struct {
+	ArtifactID           string   `json:"artifact_id"`
+	CaptureSequence      int64    `json:"capture_sequence"`
+	RecoverySecretSHA256 string   `json:"recovery_secret_sha256"`
+	Proof                []string `json:"proof"`
+}
+
+func (c *Client) MaterializeCaptureArtifact(ctx context.Context, jobID int64, leaseToken, setID string, ordinal int, artifact CaptureArtifactMaterialization) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/artifacts/%d/materialize", jobID, url.PathEscape(setID), ordinal), artifact, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) FinishCaptureSet(ctx context.Context, jobID int64, leaseToken, setID string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/finish", jobID, url.PathEscape(setID)), map[string]any{}, leaseTokenHeaders(leaseToken), nil)
+}
+
 // IngestClipRequest carries the captured clip's metadata to the ingest endpoint.
 type IngestClipRequest struct {
 	IntentID                string
@@ -342,6 +396,16 @@ func (c *Client) SealCaptureArtifact(ctx context.Context, jobID int64, leaseToke
 	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/upload-intents/%s/seal", url.PathEscape(intentID)), map[string]any{
 		"job_id": jobID, "producer_id": producerID, "capture_sequence": captureSequence,
 		"segment_start_ms": segmentStartMs, "size_bytes": sizeBytes, "sha256": sha,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) SealCaptureSetArtifact(ctx context.Context, jobID int64, leaseToken, setID string, ordinal int, artifactID, producerID string, captureSequence, segmentStartMicroseconds, sizeBytes int64, sha string) (ClipUploadIntent, error) {
+	var out ClipUploadIntent
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/upload-intents/%s/seal", url.PathEscape(artifactID)), map[string]any{
+		"job_id": jobID, "producer_id": producerID, "set_id": setID, "ordinal": ordinal,
+		"capture_sequence": captureSequence, "segment_start_microseconds": segmentStartMicroseconds,
+		"size_bytes": sizeBytes, "sha256": sha,
 	}, leaseTokenHeaders(leaseToken), &out)
 	return out, err
 }
@@ -451,27 +515,39 @@ func (c *Client) FinishRecordingRecovery(ctx context.Context, intentID, recovery
 // HeartbeatRecordingJob extends the lease. It returns cancel=true when the
 // server signals (409) that the job was canceled or is no longer owned.
 func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64, leaseToken string) (cancel bool, leaseExpiresAt time.Time, err error) {
+	state, err := c.HeartbeatRecordingJobState(ctx, jobID, leaseToken)
+	return state.Cancel, state.LeaseExpiresAt, err
+}
+
+type RecordingHeartbeatState struct {
+	Cancel         bool
+	LeaseExpiresAt time.Time
+	StopRequired   bool
+}
+
+func (c *Client) HeartbeatRecordingJobState(ctx context.Context, jobID int64, leaseToken string) (RecordingHeartbeatState, error) {
 	path := fmt.Sprintf("/api/v1/recording/jobs/%d/heartbeat", jobID)
 	status, body, err := c.postRawWithHeaders(ctx, path, map[string]any{}, leaseTokenHeaders(leaseToken))
 	if err != nil {
-		return false, time.Time{}, err
+		return RecordingHeartbeatState{}, err
 	}
 	if status == http.StatusConflict {
-		return true, time.Time{}, nil
+		return RecordingHeartbeatState{Cancel: true}, nil
 	}
 	if status < 200 || status >= 300 {
-		return false, time.Time{}, fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
+		return RecordingHeartbeatState{}, fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
 	}
 	var out struct {
 		LeaseExpiresAt time.Time `json:"lease_expires_at"`
+		StopRequired   bool      `json:"stop_required"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return false, time.Time{}, fmt.Errorf("decode heartbeat: %w", err)
+		return RecordingHeartbeatState{}, fmt.Errorf("decode heartbeat: %w", err)
 	}
 	if out.LeaseExpiresAt.IsZero() {
-		return false, time.Time{}, fmt.Errorf("heartbeat response missing lease_expires_at")
+		return RecordingHeartbeatState{}, fmt.Errorf("heartbeat response missing lease_expires_at")
 	}
-	return false, out.LeaseExpiresAt, nil
+	return RecordingHeartbeatState{LeaseExpiresAt: out.LeaseExpiresAt, StopRequired: out.StopRequired}, nil
 }
 
 // CompleteRecordingJob marks the job done (no reschedule).

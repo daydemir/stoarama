@@ -190,7 +190,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	// recovery attempt may remain pending (for example while the API is down), but
 	// beginActiveSurrenderJob must already see that authority and refuse to start a
 	// second capture generation over bytes from the first one.
-	w.recoverProducerJournals(ctx)
+	if err := w.recoverProducerJournals(ctx); err != nil {
+		return err
+	}
 
 	sem := make(chan struct{}, w.cfg.Concurrency)
 	var wg sync.WaitGroup
@@ -537,7 +539,13 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		segmentCtx, segmentCancel := continuousSegmentDeliveryContext(jobCtx, job.WindowEndAt, time.Now())
 		defer segmentCancel()
 		alreadyIngested := false
-		artifact, artifactErr := captureArtifactForSequence(producer, seg.CaptureSequence)
+		var artifact *captureArtifactJournal
+		var artifactErr error
+		if producer != nil && producer.CaptureSet != nil {
+			artifact, artifactErr = w.materializeCaptureSetArtifact(segmentCtx, job, producer, seg.CaptureSequence)
+		} else {
+			artifact, artifactErr = captureArtifactForSequence(producer, seg.CaptureSequence)
+		}
 		if artifactErr != nil {
 			return artifactErr
 		}
@@ -554,7 +562,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 					if journalErr := w.recordProducerArtifact(job.JobID, producer, seg, artifact.IntentID); journalErr != nil {
 						return recordingapi.ClipUploadIntent{}, journalErr
 					}
-					reserved, err = w.cfg.Client.SealCaptureArtifact(segmentCtx, job.JobID, job.LeaseToken, artifact.IntentID, producer.ProducerID, seg.CaptureSequence, segStartMs, seg.SizeBytes, seg.SHA256)
+					if producer.CaptureSet != nil {
+						reserved, err = w.cfg.Client.SealCaptureSetArtifact(segmentCtx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, artifact.Ordinal, artifact.IntentID, producer.ProducerID, seg.CaptureSequence, captureUnixMicro(seg.StartAt), seg.SizeBytes, seg.SHA256)
+					} else {
+						reserved, err = w.cfg.Client.SealCaptureArtifact(segmentCtx, job.JobID, job.LeaseToken, artifact.IntentID, producer.ProducerID, seg.CaptureSequence, segStartMs, seg.SizeBytes, seg.SHA256)
+					}
 				} else {
 					reserved, err = w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, segStartMs)
 				}
@@ -749,7 +761,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			producerOrdinal = jobState.producer.CaptureOrdinal
 		}
 		jobState.mu.Unlock()
-		producer, producerErr := w.reserveCaptureProducer(jobCtx, job, producerOrdinal, outDir)
+		producer, finitePlan, producerErr := w.reserveCaptureSet(jobCtx, job, producerOrdinal, captureSequence+1, outDir)
 		if producerErr != nil {
 			w.cfg.RelayDiagnostics.Error(job.JobID, "capture_producer_reserve_failed", producerErr)
 			// Reservation response loss is ambiguous: the server may already have
@@ -759,18 +771,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			cancel()
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", producerErr)
 			return
-		}
-		if producer != nil && len(producer.Artifacts) == 0 {
-			reservationCount, countErr := captureArtifactReservationCount(job, time.Now())
-			if countErr == nil {
-				countErr = w.reserveCaptureArtifactSlots(jobCtx, job, producer, captureSequence+1, reservationCount)
-			}
-			if countErr != nil {
-				w.cfg.RelayDiagnostics.Error(job.JobID, "capture_artifact_prereserve_failed", countErr)
-				cancel()
-				w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", countErr)
-				return
-			}
 		}
 		if producer != nil && producer.CaptureOrdinal > captureOrdinal {
 			captureOrdinal = producer.CaptureOrdinal
@@ -831,7 +831,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if captureContinuous == nil {
 			captureContinuous = continuousCaptureForJob(job)
 		}
-		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
+		var captureErr error
+		if producer != nil && producer.CaptureSet != nil {
+			captureErr = capture.CaptureContinuousWithFinitePlan(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders, job.TimestampContractSupported, finitePlan)
+		} else {
+			captureErr = captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
+		}
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
@@ -1525,7 +1530,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 				return
 			case <-ticker.C:
 				heartbeatCtx, heartbeatCancel := context.WithDeadline(ctx, leaseExpiresAt)
-				cancelSignal, renewedUntil, err := w.cfg.Client.HeartbeatRecordingJob(heartbeatCtx, jobID, leaseToken)
+				heartbeat, err := w.cfg.Client.HeartbeatRecordingJobState(heartbeatCtx, jobID, leaseToken)
 				heartbeatCancel()
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
@@ -1533,12 +1538,12 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 					}
 					continue
 				}
-				if cancelSignal {
+				if heartbeat.Cancel || heartbeat.StopRequired {
 					log.Printf("recording worker job=%d received cancel signal", jobID)
 					markCanceled()
 					return
 				}
-				leaseExpiresAt = renewedUntil
+				leaseExpiresAt = heartbeat.LeaseExpiresAt
 				if !leaseTimer.Stop() {
 					select {
 					case <-leaseTimer.C:

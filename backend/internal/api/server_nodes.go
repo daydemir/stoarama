@@ -35,6 +35,7 @@ const (
 
 type nodePrincipal struct {
 	NodeID      int64
+	NodeTokenID int64
 	AccountID   int64
 	NodeType    string
 	DisplayName string
@@ -150,6 +151,7 @@ func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal
 	if err != nil {
 		return nodePrincipal{}, err
 	}
+	principal.NodeTokenID = tokenID
 	_, _ = s.pool.Exec(ctx, `UPDATE node_tokens SET last_used_at=now() WHERE id=$1`, tokenID)
 	return principal, nil
 }

@@ -536,10 +536,11 @@ func TestPersistProducerJournalIgnoresAbandonedTemporarySibling(t *testing.T) {
 }
 
 func TestProducerJournalCarriesMaximumPreByteIntentSetWithinHardBounds(t *testing.T) {
-	root := filepath.Join(t.TempDir(), ".surrender")
+	captureRoot := t.TempDir()
+	root := filepath.Join(captureRoot, ".stoarama-surrender-v1")
 	journal := &captureProducerJournal{
 		JobID: 82, LeaseToken: uuid.NewString(), ProducerID: uuid.NewString(), CaptureOrdinal: 1,
-		OutputDir: filepath.Join(root, "capture"), ClipDurationSec: 60,
+		OutputDir: filepath.Join(captureRoot, "capture-continuous-test"), ClipDurationSec: 60,
 		Artifacts: make([]captureArtifactJournal, 2048),
 	}
 	for index := range journal.Artifacts {
@@ -697,6 +698,46 @@ func TestRunRegistersRecoveryJournalBeforeFirstLeasePoll(t *testing.T) {
 	defer state.mu.Unlock()
 	if state.producer == nil || state.producer.ProducerID != journal.ProducerID {
 		t.Fatal("failed recovery did not retain the producer admission fence")
+	}
+}
+
+func TestRunFailsClosedBeforeLeasePollOnMixedCorruptRecoveryInventory(t *testing.T) {
+	root := t.TempDir()
+	journalRoot := filepath.Join(root, ".stoarama-surrender-v1")
+	secretBytes := bytes.Repeat([]byte{0x2a}, 32)
+	secretHash := sha256.Sum256(secretBytes)
+	journal := &captureProducerJournal{
+		JobID: 92, LeaseToken: uuid.NewString(), ProducerID: uuid.NewString(), CaptureOrdinal: 1,
+		OutputDir: filepath.Join(root, "capture-continuous-valid"), ClipDurationSec: 60,
+		Artifacts: []captureArtifactJournal{{IntentID: uuid.NewString(), RecoverySecret: hex.EncodeToString(secretBytes), RecoverySecretSHA256: hex.EncodeToString(secretHash[:]), CaptureSequence: 1}},
+	}
+	if err := persistProducerJournal(journalRoot, journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(journalRoot, "job-93-corrupt.json"), []byte("{\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var leaseCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/recording/jobs/lease" {
+			leaseCalls.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root, SkipDropletHeartbeat: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = worker.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "validate surrender recovery inventory") {
+		t.Fatalf("Run error=%v", err)
+	}
+	if leaseCalls.Load() != 0 {
+		t.Fatalf("lease calls=%d", leaseCalls.Load())
 	}
 }
 
