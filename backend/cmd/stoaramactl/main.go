@@ -187,6 +187,7 @@ func usage() {
 	  stoaramactl recordability run-targeted --approval-id UUID --stream-ids IDS --session-cookie-file FILE [--json]
 	  stoaramactl recordability present-targeted --probe-evidence-ids UUIDS --output-dir PRIVATE_DIR --session-cookie-file FILE
 	  stoaramactl recordability review-targeted --approval-id UUID --probe-evidence-ids UUIDS --presentation-receipt-ids UUIDS --session-cookie-file FILE [--json]
+	  stoaramactl recordability expire-targeted --approval-id UUID --request-id UUID --session-cookie-file FILE
 	  stoaramactl recorder-control run
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]

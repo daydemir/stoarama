@@ -21,7 +21,7 @@ import (
 
 func runRecordability(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recordability <run-once|run-targeted|present-targeted|review-targeted> ...")
+		log.Fatalf("usage: stoaramactl recordability <run-once|run-targeted|present-targeted|review-targeted|expire-targeted> ...")
 	}
 	switch args[0] {
 	case "run-once":
@@ -32,9 +32,31 @@ func runRecordability(ctx context.Context, cfg config.Config, args []string) {
 		runRecordabilityTargetedPresent(ctx, cfg, args[1:])
 	case "review-targeted":
 		runRecordabilityTargetedReview(ctx, cfg, args[1:])
+	case "expire-targeted":
+		runRecordabilityTargetedExpire(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown recordability subcommand: %s", args[0])
 	}
+}
+
+func runRecordabilityTargetedExpire(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordability expire-targeted", flag.ExitOnError)
+	approvalRaw := fs.String("approval-id", "", "exact expired immutable campaign approval UUID")
+	requestRaw := fs.String("request-id", "", "stable idempotency UUID")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
+	_ = fs.Parse(args)
+	_ = cfg
+	approvalID, approvalErr := uuid.Parse(strings.TrimSpace(*approvalRaw))
+	requestID, requestErr := uuid.Parse(strings.TrimSpace(*requestRaw))
+	if approvalErr != nil || requestErr != nil {
+		log.Fatal("--approval-id and --request-id must be UUIDs")
+	}
+	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printJSON(postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/expire", map[string]any{"approval_id": approvalID, "request_id": requestID}))
 }
 
 func runRecordabilityTargetedReview(ctx context.Context, cfg config.Config, args []string) {

@@ -75,6 +75,20 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if err := ValidateCampaignExecutorPrivileges(ctx, executorPool, "stoarama_test_admission_executor", "stoarama_test_admission_authority"); err != nil {
 		t.Fatalf("executor privilege manifest: %v", err)
 	}
+	unreviewedRole := fmt.Sprintf("campaign_unreviewed_%d", time.Now().UnixNano())
+	unreviewedIdentifier := pgx.Identifier{unreviewedRole}.Sanitize()
+	if _, err := admin.Exec(ctx, `CREATE ROLE `+unreviewedIdentifier+`; GRANT stoarama_test_admission_authority TO `+unreviewedIdentifier); err != nil {
+		t.Fatalf("seed unreviewed authority member: %v", err)
+	}
+	defer func() {
+		_, _ = admin.Exec(context.Background(), `REVOKE stoarama_test_admission_authority FROM `+unreviewedIdentifier+`; DROP ROLE IF EXISTS `+unreviewedIdentifier)
+	}()
+	if err := ValidateCampaignRuntimePrivileges(ctx, runtimePool, "stoarama_test_runtime", "stoarama_test_admission_authority"); err == nil {
+		t.Fatal("runtime startup accepted an unreviewed authority-role member")
+	}
+	if _, err := admin.Exec(ctx, `REVOKE stoarama_test_admission_authority FROM `+unreviewedIdentifier+`; DROP ROLE `+unreviewedIdentifier); err != nil {
+		t.Fatalf("remove unreviewed authority member fixture: %v", err)
+	}
 	if _, err := executorPool.Exec(ctx, `SELECT count(*) FROM recording_campaign_admission_approvals`); err == nil {
 		t.Fatal("executor read an authority table directly")
 	}
@@ -89,6 +103,9 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	}
 	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_now()`); err == nil {
 		t.Fatal("executor invoked the authority clock directly")
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE recording_campaign_authority_decisions SET decision_sha256=repeat('0',64) WHERE code='deniz_fd_restore_20260814'`); err == nil {
+		t.Fatal("migration authority mutated the semantic Deniz decision digest")
 	}
 
 	var accountID, userID, sessionID, destinationID, streamID, revisionID, mediaID, frameID, sceneID, recordingID int64
@@ -108,6 +125,26 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	}
 	if err := migrator.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,access_key_id,secret_access_key_enc,status,managed) VALUES($1,'campaign','s3_compatible','https://storage.example.test','auto','campaign','key',decode('00','hex'),'verified',true) RETURNING id`, accountID).Scan(&destinationID); err != nil {
 		t.Fatal(err)
+	}
+	var relayStreamID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone) VALUES('relay-fixture','off-window-relay','Off-window relay','off-window-relay','https://relay.example/live.m3u8','https://relay.example/page','hls','video_manifest','video_live','continuous_video',30,'UTC') RETURNING id`).Scan(&relayStreamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Exec(ctx, `
+		WITH groups AS (
+		  INSERT INTO relay_groups(account_id,name,max_streams) VALUES($1,'domain-a',4),($1,'domain-b',3) RETURNING id,name
+		)
+		INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams,relay_group_id)
+		SELECT $1,'relay-'||name,'relay','active',recording_campaign_now(),CASE WHEN name='domain-a' THEN 4 ELSE 3 END,id FROM groups
+	`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Exec(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,stream_id,source_kind,mode,cron_expr,cron_timezone,clip_duration_sec,status,start_at,end_at,capture_via,next_fire_at) VALUES($1,$2,'off-window relay demand','https://relay.example/live.m3u8',$3,'hls_live','sampled','0 23 * * *','UTC',60,'active',recording_campaign_now()-interval '1 day',recording_campaign_now()+interval '1 day','relay',recording_campaign_now()+interval '12 hours')`, accountID, destinationID, relayStreamID); err != nil {
+		t.Fatal(err)
+	}
+	var relayDemand, relayDomains, relayCapacity, relayAfterLoss int
+	if err := migrator.QueryRow(ctx, `SELECT active_demand,failure_domains,effective_capacity,usable_after_largest_loss FROM recording_campaign_relay_failure_capacity($1)`, accountID).Scan(&relayDemand, &relayDomains, &relayCapacity, &relayAfterLoss); err != nil || relayDemand != 1 || relayDomains != 2 || relayCapacity != 7 || relayAfterLoss != 3 {
+		t.Fatalf("off-window relay schedule peak was not fenced: demand=%d domains=%d capacity=%d after_loss=%d err=%v", relayDemand, relayDomains, relayCapacity, relayAfterLoss, err)
 	}
 	if err := migrator.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone,tags) VALUES('publisher','fd-17235','FD scene','fd-scene-17235','https://source.example/live.m3u8','https://source.example/page','hls','video_manifest','video_live','continuous_video',30,'Europe/Berlin',ARRAY['FD']) RETURNING id`).Scan(&streamID); err != nil {
 		t.Fatal(err)
@@ -186,6 +223,33 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := executorPool.Exec(ctx, `SELECT approval_id FROM recording_campaign_approve($1,$2,$3,$4,$5,$6,'deniz_fd_restore_20260814','FD',$7,$8::jsonb,$9::jsonb,$10)`, requestID, accountID, userID, sessionID, credentialSHA, "deniz@example.test", endAt, entryJSON, scheduleJSON, strings.Repeat("b", 64)); err == nil || !strings.Contains(err.Error(), "idempotency conflict") {
 		t.Fatalf("mismatched approval replay was accepted: %v", err)
 	}
+	if _, err := migrator.Exec(ctx, `CREATE OR REPLACE FUNCTION recording_campaign_now() RETURNS timestamptz LANGUAGE sql STABLE SET search_path=pg_catalog AS $$ SELECT transaction_timestamp()+interval '2 days' $$`); err != nil {
+		t.Fatalf("advance isolated campaign authority clock: %v", err)
+	}
+	expireSessionRaw := "campaign-expire-session"
+	expireCredentialSHA := hashText(expireSessionRaw)
+	var expireSessionID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO account_sessions(account_id,session_hash,expires_at,last_used_at,user_id,current_org_id) VALUES($1,$2,recording_campaign_now()+interval '1 day',recording_campaign_now(),$3,$1) RETURNING id`, accountID, expireCredentialSHA, userID).Scan(&expireSessionID); err != nil {
+		t.Fatal(err)
+	}
+	expireRequestID := uuid.New()
+	var terminalSHA string
+	if err := executorPool.QueryRow(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, expireRequestID, approvalID, accountID, userID, expireSessionID, expireCredentialSHA).Scan(&terminalSHA); err != nil || len(terminalSHA) != 64 {
+		t.Fatalf("typed expired-reservation terminal failed: sha=%q err=%v", terminalSHA, err)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE account_sessions SET revoked_at=recording_campaign_now() WHERE id=$1`, expireSessionID); err != nil {
+		t.Fatal(err)
+	}
+	var terminalReplaySHA string
+	if err := executorPool.QueryRow(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, expireRequestID, approvalID, accountID, userID, expireSessionID, expireCredentialSHA).Scan(&terminalReplaySHA); err != nil || terminalReplaySHA != terminalSHA {
+		t.Fatalf("typed expiration replay changed: first=%q replay=%q err=%v", terminalSHA, terminalReplaySHA, err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, uuid.New(), approvalID, accountID, userID, expireSessionID, expireCredentialSHA); err == nil {
+		t.Fatal("expired approval accepted a second terminal event")
+	}
+	if _, err := runtimePool.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, recordingID); err != nil {
+		t.Fatalf("typed terminal did not release expired reservation: %v", err)
+	}
 	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/changed.m3u8' WHERE id=$1; UPDATE streams SET source_url='https://source.example/live.m3u8' WHERE id=$1`, streamID); err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +292,14 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"admitted recording next-fire must advance by one exact scheduled window",
 		"approval.schedule_spec->>'delivery'<>'nas_pull'",
 		"recording_campaign_replay(p_approval_id,p_account_id,p_credential_sha256)",
+		"recording_campaign_admission_reservation_terminal_events",
+		"recording_worker_targeted_probe_occupancy",
+		"submission_request_sha256",
+		"authority_member_count<>1",
+		"reservation.observation_id",
+		"qualification_required_consecutive_windows",
+		"reporting_required_consecutive_windows",
+		"Admission-only; qualification requires 14 consecutive GOOD/GREAT",
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("0140 omitted reviewed cross-boundary closure %q", required)
