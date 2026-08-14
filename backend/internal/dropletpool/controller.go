@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -325,9 +326,38 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 		return err
 	}
 	plan := ReconcileOrphans(fleet, liveRows, now, c.cfg.ProvisionTimeout)
+	activeRollout, hasActiveRollout, err := c.store.ActiveRollout(ctx)
+	if err != nil {
+		return err
+	}
 	presentDropletIDs := make(map[int64]struct{}, len(fleet))
 	for _, d := range fleet {
 		presentDropletIDs[d.ID] = struct{}{}
+	}
+	// The generation/ordinal namespace is permanently reserved, including after
+	// a rollout is terminal. A late provider object is never a legacy orphan.
+	for _, object := range fleet {
+		generation, reserved := rolloutGenerationFromName(object.Name)
+		if !reserved {
+			continue
+		}
+		row, lookupErr := c.store.FindByNameAnyState(ctx, object.Name)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if row == nil || row.RolloutGeneration == nil || *row.RolloutGeneration != generation ||
+			(row.DODropletID != nil && *row.DODropletID != object.ID) {
+			if hasActiveRollout && activeRollout.Generation == generation {
+				_ = c.store.RequestRolloutStop(ctx, activeRollout.Generation, "duplicate_provider_object")
+			}
+			log.Printf("droplet pool: CRITICAL reserved rollout provider object id=%d name=%s lacks exact immutable reservation; retained", object.ID, object.Name)
+			continue
+		}
+		if row.DODropletID == nil && row.State == "provisioning" {
+			if err := c.store.SetDropletID(ctx, row.ID, object.ID, object.IP); err != nil {
+				log.Printf("droplet pool: reserved rollout response-loss adoption %s: %v", object.Name, err)
+			}
+		}
 	}
 
 	// Adopt: bind a DO id to an existing write-ahead row that lost its id, or
@@ -336,6 +366,9 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 	// the timeout is left for a later tick (it will either gain its id via the
 	// in-flight create or age into DestroyOrphan).
 	for _, d := range plan.AdoptByName {
+		if _, reserved := rolloutGenerationFromName(d.Name); reserved {
+			continue
+		}
 		row, lookupErr := c.findRowByName(ctx, d.Name)
 		if lookupErr != nil {
 			log.Printf("droplet pool: adopt lookup %s: %v", d.Name, lookupErr)
@@ -353,6 +386,17 @@ func (c *Controller) reconcile(ctx context.Context, now time.Time) error {
 
 	// Destroy genuinely-leaked prefixed droplets (no DB row, past timeout).
 	for _, d := range plan.DestroyOrphan {
+		if generation, reserved := rolloutGenerationFromName(d.Name); reserved {
+			// A response-loss create in the reserved rollout namespace must
+			// never fall through legacy one-read deletion. Without the exact
+			// preregistered row/token binding, stop convergence and retain the
+			// provider object for explicit crash reconciliation.
+			if hasActiveRollout && activeRollout.Generation == generation {
+				_ = c.store.RequestRolloutStop(ctx, activeRollout.Generation, "duplicate_provider_object")
+			}
+			log.Printf("droplet pool: CRITICAL reserved rollout provider object name=%s has no exact preregistered row; retained and rollout stopped", d.Name)
+			continue
+		}
 		log.Printf("droplet pool: destroying orphan droplet name=%s do_id=%d", d.Name, d.ID)
 		if err := c.do.DeleteDroplet(ctx, d.ID); err != nil {
 			log.Printf("droplet pool: destroy orphan %s: %v", d.Name, err)
@@ -640,7 +684,36 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 
 func (c *Controller) rolloutBuildV2(ctx context.Context, now time.Time, requiredCapacity int) (bool, error) {
 	rolloutCapacity := recorderRolloutSteadyWorkers * recorderRolloutWorkerCapacity
-	if !c.cfg.RolloutEnabled || requiredCapacity > rolloutCapacity {
+	forceLossRecovery := false
+	if active, ok, activeErr := c.store.ActiveRollout(ctx); activeErr != nil {
+		return true, activeErr
+	} else if ok && active.Kind == "loss_recovery" {
+		// Once a loss-recovery generation exists, stopping it would preserve a
+		// phantom completed head or strand an already-restored head. Finish and
+		// seal the exact baseline eight first; ordinary autoscaling follows.
+		forceLossRecovery = true
+	}
+	if c.cfg.RolloutEnabled && requiredCapacity > rolloutCapacity && !forceLossRecovery {
+		commonSHA, commonErr := (CommonPolicyIdentity{BuildSHA: c.cfg.BuildSHA, Capacity: c.cfg.Capacity, HeartbeatSec: c.cfg.HeartbeatSec, PollSec: c.cfg.PollSec, BackendAPIURL: c.cfg.BackendAPIURL, FirewallID: c.cfg.FirewallID, FirewallRulesSHA256: c.cfg.FirewallRulesSHA256, FirewallTag: c.cfg.FirewallTag, HostFirewallScriptSHA256: c.cfg.HostFirewallSHA256, KernelFirewallPolicySHA256: c.cfg.KernelPolicySHA256}).Digest()
+		if commonErr != nil {
+			return true, commonErr
+		}
+		facts, inspectErr := c.do.InspectRollout(ctx, c.cfg.ProjectID, c.cfg.FirewallID, c.cfg.FirewallTag)
+		if inspectErr != nil {
+			return true, inspectErr
+		}
+		if len(facts.PoolDropletIDs) == recorderRolloutSteadyWorkers-1 {
+			if validateErr := validateRolloutProviderFacts(facts, c.cfg.FirewallID, c.cfg.FirewallRulesSHA256, c.cfg.FirewallTag, recorderRolloutSteadyWorkers, c.cfg.RolloutMaxSurge); validateErr != nil {
+				return true, validateErr
+			}
+			recovery, ensureErr := c.store.EnsureRollout(ctx, c.cfg, commonSHA, facts)
+			if ensureErr != nil {
+				return true, ensureErr
+			}
+			forceLossRecovery = recovery.Kind == "loss_recovery"
+		}
+	}
+	if (!c.cfg.RolloutEnabled || requiredCapacity > rolloutCapacity) && !forceLossRecovery {
 		rollout, ok, err := c.store.ActiveRollout(ctx)
 		if err != nil || !ok {
 			return ok, err
@@ -756,13 +829,25 @@ func (c *Controller) rolloutBuildV2(ctx context.Context, now time.Time, required
 	if _, err = c.store.AppendProviderObservation(ctx, rollout.Generation, "reconcile", facts); err != nil {
 		return true, fmt.Errorf("append provider observation: %w", err)
 	}
-	workers, err := c.store.ListByStates(ctx, "provisioning", "standby_ready", "active", "rollout_draining", "destroying")
+	workers, err := c.store.ListByStates(ctx, "provisioning", "standby_ready", "active", "rollout_draining", "destroying", "destroyed")
 	if err != nil {
 		return true, err
 	}
 	providerIDs := make(map[int64]struct{}, len(facts.PoolDropletIDs))
 	for _, id := range facts.PoolDropletIDs {
 		providerIDs[id] = struct{}{}
+	}
+	boundProviderObjects := make(map[int64]string, len(workers))
+	for _, worker := range workers {
+		if worker.DODropletID != nil {
+			boundProviderObjects[*worker.DODropletID] = worker.Name
+		}
+	}
+	for _, object := range facts.PoolDroplets {
+		if name, ok := boundProviderObjects[object.ID]; !ok || name != object.Name {
+			_ = c.store.RequestRolloutStop(ctx, rollout.Generation, "duplicate_provider_object")
+			return true, fmt.Errorf("provider rollout object id=%d name=%s lacks exact live DB reservation", object.ID, object.Name)
+		}
 	}
 	for _, worker := range workers {
 		if worker.RolloutGeneration == nil || *worker.RolloutGeneration != rollout.Generation || worker.DODropletID == nil || worker.State == "active" {
@@ -862,7 +947,7 @@ func (c *Controller) rolloutBuildV2(ctx context.Context, now time.Time, required
 				return true, observeErr
 			}
 			minimum := rolloutCapacity
-			if requiredCapacity > minimum {
+			if rollout.Kind != "loss_recovery" && requiredCapacity > minimum {
 				minimum = requiredCapacity
 			}
 			switched, switchErr := c.store.SwitchRolloutReplacement(ctx, worker.ID, observationID, minimum)
@@ -875,9 +960,12 @@ func (c *Controller) rolloutBuildV2(ctx context.Context, now time.Time, required
 			return true, nil
 		}
 	}
-	stale := false
+	stale := rollout.Kind == "loss_recovery"
 	for _, worker := range workers {
-		if worker.State == "active" && worker.LeaseAdmissionEnabled && (firstNonemptyBuild(worker.ObservedBuildSHA, worker.BuildSHA) != c.cfg.BuildSHA || worker.ObservedCommonPolicySHA256 != commonSHA) {
+		if rollout.Kind == "loss_recovery" && worker.RolloutGeneration != nil && *worker.RolloutGeneration == rollout.Generation && worker.State == "active" && worker.LeaseAdmissionEnabled {
+			stale = false
+		}
+		if worker.State == "active" && worker.LeaseAdmissionEnabled && (firstNonemptyBuild(worker.ObservedBuildSHA, worker.BuildSHA) != c.cfg.BuildSHA || worker.ObservedCommonPolicySHA256 != commonSHA || worker.RolloutGeneration == nil || *worker.RolloutGeneration != rollout.Generation) {
 			stale = true
 			break
 		}
@@ -1153,4 +1241,24 @@ func (c *Controller) findRowByName(ctx context.Context, name string) (*Droplet, 
 		}
 	}
 	return nil, nil
+}
+
+func rolloutGenerationFromName(name string) (int64, bool) {
+	prefix := NamePrefix + "rollout-"
+	if !strings.HasPrefix(name, prefix) {
+		return 0, false
+	}
+	parts := strings.Split(strings.TrimPrefix(name, prefix), "-")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return 0, true
+	}
+	generation, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || generation <= 0 {
+		return 0, true
+	}
+	ordinal, err := strconv.ParseInt(parts[1], 10, 32)
+	if err != nil || ordinal <= 0 {
+		return 0, true
+	}
+	return generation, true
 }

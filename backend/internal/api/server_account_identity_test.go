@@ -13,12 +13,170 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/email"
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
+
+func TestRecorderRolloutHeartbeatAppendsOnlyBoundLivePostgres(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	var accountID, nodeID, dropletID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO accounts(email,name,role,status) VALUES($1,'Heartbeat operator','admin','active') RETURNING id`, fmt.Sprintf("rollout-heartbeat-%d@example.com", time.Now().UnixNano())).Scan(&accountID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,node_type,display_name,platform,status,enrolled_at,last_heartbeat_at) VALUES($1,'local_recorder','stoarama-rec-heartbeat','digitalocean','active',now(),now()) RETURNING id`, accountID).Scan(&nodeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recorder_droplets(name,node_id,region,size,capacity,state,lease_admission_enabled) VALUES('stoarama-rec-heartbeat',$1,'nyc1','s-2vcpu-4gb',5,'active',true) RETURNING id`, nodeID).Scan(&dropletID); err != nil {
+		t.Fatal(err)
+	}
+	invalid := recordingapi.DropletRolloutFacts{ExecutableBuildSHA: strings.Repeat("a", 40), Capacity: 5, HeartbeatSec: 15, PollSec: 5, BackendAPIURL: "https://api.stoarama.example", HostFirewallScript: "invalid", KernelPolicy: "invalid"}
+	if err := s.recordDropletRolloutObservation(ctx, "stoarama-rec-heartbeat", nodeID, invalid); err != nil {
+		t.Fatalf("ordinary liveness was coupled to rollout attestation: %v", err)
+	}
+	var observations int
+	var seen bool
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recorder_worker_rollout_observations WHERE droplet_id=$1`, dropletID).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT last_seen_at IS NOT NULL FROM recorder_droplets WHERE id=$1`, dropletID).Scan(&seen); err != nil || observations != 0 || !seen {
+		t.Fatalf("ordinary heartbeat observations=%d seen=%v err=%v", observations, seen, err)
+	}
+}
+
+func TestRecorderRolloutCloudLeaseAndHeartbeatFencePostgres(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	var accountID, nodeID, destinationID, streamID, recordingID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO accounts(email,name,role,status) VALUES($1,'Rollout fence','admin','active') RETURNING id`, fmt.Sprintf("rollout-fence-%d@example.com", time.Now().UnixNano())).Scan(&accountID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,verified_at,managed,shared) VALUES($1,'rollout-fence','r2_managed','https://storage.example.test','auto','rollout','','access',decode('00','hex'),'verified',now(),true,false) RETURNING id`, accountID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,recording_state) VALUES('test',$1,$1,$1,'https://source.example.test/live.m3u8','https://source.example.test/page','hls','video_manifest','video_live','continuous_video',30,'on') RETURNING id`, fmt.Sprintf("rollout-fence-%d", time.Now().UnixNano())).Scan(&streamID); err != nil {
+		t.Fatal(err)
+	}
+	workerID := fmt.Sprintf("stoarama-rec-fence-%d", time.Now().UnixNano())
+	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,node_type,display_name,platform,status,enrolled_at,last_heartbeat_at) VALUES($1,'local_recorder',$2,'digitalocean','active',now(),now()) RETURNING id`, accountID, workerID).Scan(&nodeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recorder_droplets(name,node_id,region,size,capacity,state,lease_admission_enabled) VALUES($1,$2,'nyc1','s-2vcpu-4gb',5,'active',true)`, workerID, nodeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,stream_id,source_kind,cron_timezone,clip_duration_sec,mode,daily_window_start,daily_window_end,active_weekdays,target_fps,status,start_at,capture_via) VALUES($1,$2,'rollout-fence','https://source.example.test/live.m3u8',$3,'hls_live','UTC',60,'continuous','08:00','20:00',127,NULL,'active',now()-interval '1 hour','cloud') RETURNING id`, accountID, destinationID, streamID).Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	insertPending := func(key string) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at) VALUES($1,now(),now(),60,'pending',$2,'continuous_window',now()+interval '1 hour') RETURNING id`, recordingID, key).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	principal := nodePrincipal{NodeID: nodeID, AccountID: accountID, NodeType: nodeTypeLocalRecorder, DisplayName: workerID}
+
+	// Claim-first: the production lease transaction acquires the shared rollout
+	// fence before it reaches a deliberately blocked job row. An exclusive
+	// switch cannot cross it.
+	jobID := insertPending("rollout-fence-claim-first")
+	jobBlock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = jobBlock.Exec(ctx, `SELECT id FROM recording_jobs WHERE id=$1 FOR UPDATE`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	claimResult := make(chan error, 1)
+	go func() {
+		_, claimErr := s.leaseCloudRecordingJob(ctx, principal, workerID, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, true)
+		claimResult <- claimErr
+	}()
+	time.Sleep(50 * time.Millisecond)
+	exclusive, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = exclusive.Exec(ctx, `SET lock_timeout='200ms'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = exclusive.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('stoarama-recorder-pool-rollout-v1',0))`); err == nil {
+		t.Fatal("exclusive rollout switch crossed an active production cloud claim")
+	}
+	exclusive.Release()
+	if err = jobBlock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-claimResult; err != nil {
+		t.Fatalf("production cloud claim after blocker release: %v", err)
+	}
+
+	// Switch-first: an exclusive rollout fence prevents the next production
+	// claim from entering. Once the switch commits, the claim observes the
+	// current droplet state and proceeds coherently.
+	insertPending("rollout-fence-switch-first")
+	switchTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = switchTx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('stoarama-recorder-pool-rollout-v1',0))`); err != nil {
+		t.Fatal(err)
+	}
+	claimResult = make(chan error, 1)
+	go func() {
+		_, claimErr := s.leaseCloudRecordingJob(ctx, principal, workerID, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, true)
+		claimResult <- claimErr
+	}()
+	select {
+	case err = <-claimResult:
+		t.Fatalf("production cloud claim crossed exclusive rollout switch: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err = switchTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-claimResult; err != nil {
+		t.Fatalf("production cloud claim after switch commit: %v", err)
+	}
+
+	// A production cloud renewal uses the same shared-before-job order.
+	var leasedJobID int64
+	var leaseToken uuid.UUID
+	if err = pool.QueryRow(ctx, `SELECT id,lease_token FROM recording_jobs WHERE lease_owner=$1 AND status='leased' ORDER BY id DESC LIMIT 1`, workerID).Scan(&leasedJobID, &leaseToken); err != nil {
+		t.Fatal(err)
+	}
+	heartbeatBlock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = heartbeatBlock.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('stoarama-recorder-pool-rollout-v1',0))`); err != nil {
+		t.Fatal(err)
+	}
+	heartbeatResult := make(chan error, 1)
+	go func() {
+		_, heartbeatErr := s.heartbeatRecordingJob(ctx, principal, leasedJobID, workerID, &leaseToken)
+		heartbeatResult <- heartbeatErr
+	}()
+	select {
+	case err = <-heartbeatResult:
+		t.Fatalf("production heartbeat crossed exclusive readiness transition: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err = heartbeatBlock.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-heartbeatResult; err != nil {
+		t.Fatalf("production heartbeat after readiness fence: %v", err)
+	}
+}
 
 // captureMailer is a no-op email.Sender for tests that exercise the invite path.
 type captureMailer struct{ sent int }
